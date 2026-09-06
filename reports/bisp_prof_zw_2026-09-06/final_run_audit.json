@@ -1,0 +1,573 @@
+[
+  {
+    "system": "MoS2",
+    "run": "02_parent_static",
+    "steps": [
+      [
+        "lx-Xg4-011821-1202334-5158",
+        "1"
+      ]
+    ],
+    "eqp1": false,
+    "failure_signatures": [
+      "driver.rank0.log: Traceback (most recent call last):",
+      "driver.rank3.log: Traceback (most recent call last):",
+      "driver.rank1.log: Traceback (most recent call last):",
+      "driver.rank2.log: Traceback (most recent call last):"
+    ]
+  },
+  {
+    "system": "MoS2",
+    "run": "03_fixed_static",
+    "steps": [],
+    "eqp1": false,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "04_parent_units",
+    "steps": [
+      [
+        "lx-Xg4-012535-1263108-7463",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "05_fixed_units",
+    "steps": [
+      [
+        "lx-Xg4-013223-1306959-6243",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "06_parent_static",
+    "steps": [
+      [
+        "lx-Xg4-012024-1218242-6951",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "07_fixed_static",
+    "steps": [
+      [
+        "lx-Xg4-012412-1251362-6346",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "08_restore_ablation",
+    "steps": [
+      [
+        "lx-Xg4-013500-1326885-7821",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "09_parent_zeta",
+    "steps": [
+      [
+        "lx-Xg4-013859-1352582-8047",
+        "0"
+      ]
+    ],
+    "eqp1": false,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "10_fixed_zeta",
+    "steps": [
+      [
+        "lx-Xg4-014103-1371100-7581",
+        "0"
+      ]
+    ],
+    "eqp1": false,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "11_chi_shape_ablation",
+    "steps": [
+      [
+        "lx-Xg4-014352-1399430-3018",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "12_zeta_tail_ablation",
+    "steps": [
+      [
+        "lx-Xg4-014750-1427817-6542",
+        "0"
+      ]
+    ],
+    "eqp1": false,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "17_parent_bare",
+    "steps": [
+      [
+        "lx-Xg4-015056-1447137-8575",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "18_fixed_bare",
+    "steps": [
+      [
+        "lx-Xg4-015056-1447137-8575",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "19_parent_dynamic",
+    "steps": [
+      [
+        "lx-Xg4-015056-1447137-8575",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "20_fixed_dynamic",
+    "steps": [
+      [
+        "lx-Xg4-015056-1447137-8575",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "21_restore_source",
+    "steps": [
+      [
+        "lx-Xg4-020725-1591215-3890",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "22_chi_source",
+    "steps": [
+      [
+        "lx-Xg4-021236-1630539-3473",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "23_cpu_gates",
+    "steps": [
+      [
+        "lx-Xg0-021609-1656988-8320",
+        "0"
+      ]
+    ],
+    "eqp1": false,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "24_zeta_source",
+    "steps": [
+      [
+        "lx-Xg4-021818-1673870-3826",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "25_fresh_reference",
+    "steps": [
+      [
+        "lx-Xg4-021818-1673870-3826",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "26_after_units",
+    "steps": [
+      [
+        "lx-Xg4-022703-1727110-4335",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "29_after_bare",
+    "steps": [
+      [
+        "lx-Xg4-023501-1779986-4088",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "30_after_dynamic",
+    "steps": [
+      [
+        "lx-Xg4-023737-1798141-4536",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "31_cpu_zeta",
+    "steps": [
+      [
+        "lx-Xg0-025019-1899125-1232",
+        "0"
+      ]
+    ],
+    "eqp1": false,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "33_fixed_dynamic_replay",
+    "steps": [
+      [
+        "lx-Xg4-024121-1830616-2423",
+        "1"
+      ]
+    ],
+    "eqp1": false,
+    "failure_signatures": [
+      "driver.rank0.log: Traceback (most recent call last):",
+      "driver.rank3.log: Traceback (most recent call last):",
+      "driver.rank1.log: Traceback (most recent call last):",
+      "driver.rank2.log: Traceback (most recent call last):"
+    ]
+  },
+  {
+    "system": "MoS2",
+    "run": "34_fixed_dyson",
+    "steps": [
+      [
+        "lx-Xg4-024231-1845178-7018",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "35_parent_dyson",
+    "steps": [
+      [
+        "lx-Xg4-024435-1858899-4547",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "36_parent_fit_boundaries",
+    "steps": [
+      [
+        "lx-Xg4-025057-1902256-9775",
+        "0"
+      ]
+    ],
+    "eqp1": false,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "37_fixed_fit_boundaries",
+    "steps": [
+      [
+        "lx-Xg4-025229-1912766-5738",
+        "0"
+      ]
+    ],
+    "eqp1": false,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "40_parent_dynamic_common",
+    "steps": [
+      [
+        "lx-Xg4-030750-2008903-9194",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "41_fixed_dynamic_common",
+    "steps": [
+      [
+        "lx-Xg4-031136-2194473-3936",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "42_resident_ablation",
+    "steps": [
+      [
+        "lx-Xg4-025407-1922380-6988",
+        "143"
+      ]
+    ],
+    "eqp1": false,
+    "failure_signatures": [
+      "driver.rank0.log: Traceback (most recent call last):",
+      "driver.rank0.log: Traceback (most recent call last):",
+      "driver.rank3.log: Traceback (most recent call last):",
+      "driver.rank3.log: Traceback (most recent call last):",
+      "driver.rank1.log: Traceback (most recent call last):",
+      "driver.rank1.log: Traceback (most recent call last):",
+      "driver.rank2.log: Traceback (most recent call last):",
+      "driver.rank2.log: Traceback (most recent call last):"
+    ]
+  },
+  {
+    "system": "MoS2",
+    "run": "43_parent_solve_units",
+    "steps": [
+      [
+        "lx-Xg4-025755-1947913-6796",
+        "0"
+      ]
+    ],
+    "eqp1": false,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "44_fixed_solve_units",
+    "steps": [
+      [
+        "lx-Xg4-025921-1956174-1436",
+        "0"
+      ]
+    ],
+    "eqp1": false,
+    "failure_signatures": []
+  },
+  {
+    "system": "MoS2",
+    "run": "45_resident_ablation",
+    "steps": [
+      [
+        "lx-Xg4-025733-1945656-2585",
+        "143"
+      ]
+    ],
+    "eqp1": false,
+    "failure_signatures": [
+      "driver.rank0.log: Traceback (most recent call last):",
+      "driver.rank3.log: Traceback (most recent call last):",
+      "driver.rank1.log: Traceback (most recent call last):",
+      "driver.rank2.log: Traceback (most recent call last):"
+    ]
+  },
+  {
+    "system": "MoS2",
+    "run": "46_resident_ablation",
+    "steps": [
+      [
+        "lx-Xg4-030157-1973270-9283",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "Si",
+    "run": "00_environment",
+    "steps": [],
+    "eqp1": false,
+    "failure_signatures": []
+  },
+  {
+    "system": "Si",
+    "run": "13_parent_gn",
+    "steps": [
+      [
+        "lx-Xg4-015056-1447137-8575",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "Si",
+    "run": "14_fixed_gn",
+    "steps": [
+      [
+        "lx-Xg4-015056-1447137-8575",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "Si",
+    "run": "15_parent_cohsex",
+    "steps": [
+      [
+        "lx-Xg4-015056-1447137-8575",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "Si",
+    "run": "16_fixed_cohsex",
+    "steps": [
+      [
+        "lx-Xg4-015056-1447137-8575",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "Si",
+    "run": "27_after_gn",
+    "steps": [
+      [
+        "lx-Xg4-023200-1761689-4535",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "Si",
+    "run": "28_after_cohsex",
+    "steps": [
+      [
+        "lx-Xg4-023338-1770882-8474",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "Si",
+    "run": "32_fixed_gn_replay",
+    "steps": [
+      [
+        "lx-Xg4-024030-1820432-7200",
+        "1"
+      ]
+    ],
+    "eqp1": false,
+    "failure_signatures": [
+      "driver.rank0.log: Traceback (most recent call last):",
+      "driver.rank3.log: Traceback (most recent call last):",
+      "driver.rank1.log: Traceback (most recent call last):",
+      "driver.rank2.log: Traceback (most recent call last):"
+    ]
+  },
+  {
+    "system": "Si",
+    "run": "38_parent_gn_common",
+    "steps": [
+      [
+        "lx-Xg4-030517-1994260-5532",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  },
+  {
+    "system": "Si",
+    "run": "39_fixed_gn_common",
+    "steps": [
+      [
+        "lx-Xg4-030652-2002797-2728",
+        "0"
+      ]
+    ],
+    "eqp1": true,
+    "failure_signatures": []
+  }
+]
