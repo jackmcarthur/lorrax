@@ -1,6 +1,6 @@
-# BISP-PROF-ZW — heavy investigation, blocked before GPU profiling
+# BISP-PROF-ZW — heavy investigation, measurements in progress
 
-On branch `perf/bisp-prof-zw-2026-09-06`, unmerged. Baseline P is exactly `9f569c4bf75bad40e4f5895946874b4c503e4410`; fixed-main F is exactly `e1559a071e244b4f049c924781b668d9e1560739`. Production source is unchanged. This is a source audit and checkpoint harvest, **not a completed performance investigation or a proposed fix**.
+On branch `perf/bisp-prof-zw-2026-09-06`, unmerged. Baseline P is exactly `9f569c4bf75bad40e4f5895946874b4c503e4410`; fixed-main F is exactly `e1559a071e244b4f049c924781b668d9e1560739`. Production source is unchanged. Pinned P/F measurements and strict-identity ablations are recorded in the live checkpoint sections below; the initial allocation-blocked audit is retained as preregistration history. No production fix has been adopted yet.
 
 ## Objective and preregistered candidates
 
@@ -135,3 +135,64 @@ The renewed dispatch authorized one new allocation attempt. At 07:45–07:50 UTC
 Prepared two new **unrun** full-static arms inside this worktree at `runs/MoS2/41_bisp_parent_route_2026-09-05/prof_zw/{02_parent_static,03_fixed_static}/`. Both copy the exact same parent73 deck and entire tmp; SHA256 receipts match. The deck retains restart=false and existing ζ reuse, so these arms measure screening, not fresh ζ fitting. Source-tree hashes refuse drift from P9f569c4b/Fe1559a07 while allowing documentary commits; actual HEAD is printed in each rank. BFC@0.85, cache-off, P4, source wrappers, manifests, artifact checks and a single pre-launch-expiry retry are prepared. Shell syntax passed; no runtime or science validation is claimed. `01_prepare/prepare.py` refuses existing arm directories, so rerunning it cannot mutate a completed run. Preparation writes only this lane's worktree.
 
 Architecture candidates are now explicit above, with source-count ceilings and byte lower bounds distinguished from missing measurements. Pinned measurements, native captures, ablations, fixes and science gates remain outstanding.
+
+## Live measurement checkpoint — pool57966610 authorized
+
+
+Branch perf/bisp-prof-zw-2026-09-06, unmerged; production src/services unchanged from9f569c4b.
+P4, BFC@0.85, JID57966610, lx-Xg4-012024-1218242-6951 exit0,209s launch.
+Artifact: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_zw/06_parent_static/driver.rank0.log.
+Screening31.21s; Sigma150.16s; total201.36s. Rank0 compiler receipt1712 compiles/148.01s.
+EQP1 90/90 printed digits equal parent73, tools/eqp_ab.py tolerance0.
+Not yet a P/F comparison; cumulative compiler work is not a wall partition.
+
+### P/F baseline, claim998
+
+
+P4 BFC@0.85; sequential JID57966610 steps P lx-Xg4-012024-1218242-6951 exit0, F lx-Xg4-012412-1251362-6346 exit0.
+On branch perf/bisp-prof-zw-2026-09-06 unmerged, production source9f569c4b, versus fixed-main e1559a07 read-only.
+Artifacts runs/MoS2/41_bisp_parent_route_2026-09-05/prof_zw/{06_parent_static,07_fixed_static}/driver.rank0.log.
+
+| quantity | P | F |
+|---|---:|---:|
+| screening s |31.21|12.90|
+| Sigma s |150.16|18.12|
+| total s |201.36|51.24|
+| rank0 XLA compiles |1712|597|
+| rank0 compiler work s |148.01|27.65|
+
+Same copied tmp and dipole; zeta reused, no new fit measured. EQP1 via tools/eqp_ab.py:82/90 exact, max0.001micro-eV; tolerance0 comparison FAIL. Cross-source comparison is not the fix identity gate. No attribution to individual kernels until unit receipts.
+
+### Unit attribution before changes — MoS2 full static
+
+P04 lx-Xg4-012535-1263108-7463 exit0 and F05 lx-Xg4-013223-1306959-6243 exit0, JID57966610, sequential P4 BFC@0.85. `prof_zw/{04_parent_units,05_fixed_units}/` contains unit_timings.rank*.json, native Nsight CSV, nsys_rank0.nsys-rep, optimized HLO and analyzer/census JSON. These runs repeat each chi block once, return the first result, and require exact equality with the repeat. Nsight captures only the warm (1,1) block. Full-run walls with HLO/Nsight are **not** baseline performance walls.
+
+| measured quantity | P | F |
+|---|---:|---:|
+| sixteen cold chi public calls, s |31.823|8.855|
+| compile count inside those calls |144|43|
+| compiler work inside those calls, s |27.473|7.005|
+| sixteen warm chi public calls, s |0.411|0.419|
+| warm new compilations |0|0|
+| warm TT compiled module, ms |22.971|23.792|
+| warm TT tau-body median, ms |2.069|2.120|
+| two Green GEMMs/block projected sum, ms |21.275|22.105|
+
+Both TT blocks have11 identical nodes/weights, digest7cb9e8744c3d6d41cd322d2bcbdd1ed1d79214408cde742b97c9fd272602ce3a. P parent current face shape=(3,4,100,80); full K=9. P's16 blocks reuse the same charge/current plan identities, and every warm public call adds zero compiles. HLO nevertheless contains16 distinct vertex integrator modules, not32 for orientations: P0464…1169. TT P0686 has20,736,109-byte per-rank compiler peak and zero explicit HLO collectives. Its actual body contains the family gather/phase and dense four-spinor GEMM inside an11-iteration while; XLA did not hoist them. Both endpoint spin actions fuse into one batched GEMM,11 launches/block. The printed P/F cold regression is real; **a warm chi slowdown is not seen in this capture**.
+
+Native rank0 CUDA kernel-duration sums for the TT block: face gather/phase/concatenate0.045024ms (11 kernels), spin GEMM0.145472ms (11 kernels), Green GEMM arithmetic2.417981ms (396 kernels), NCCL Broadcast7.935001ms (792 kernels), FFT kernels0.283360ms (46 kernels), FFT scales0.136064ms (23 kernels), Green-layout transposes0.296128ms (22 kernels). HLO labels and native NVTX scopes own these classes; sums are not additive with their containing projected ranges. Both Green GEMMs use the full9 k rows in P and F; the parent route does not reduce that contraction here.
+
+Restore host attribution in P04: V16 outputs32.567s/120 compiles/28.677 compiler seconds; W16 outputs32.735s/116 compiles/28.748 compiler seconds; W-V16 outputs32.885s/116 compiles/29.050 compiler seconds. The fresh zero and addition factories recompile through all three consumers. These98.187s are measured in the instrumented run; do not subtract them from unprofiled P06. Restores are charged to Sigma, not screening.
+
+Architectural ranking update: restore executable reuse and fewer chi shape specializations target measured tens of compiler seconds. On this TT gate, even eliminating all repeated face gather and rotation saves only0.190496ms of kernel time/block (0.83% of its22.971ms projected span); two2x2 spin actions can save at most half the0.145472ms spin arithmetic, before new launch/layout costs. Full-family residency and a new spin-action representation therefore rank below compilation fixes. This is a measured bound on this deck, not a claim of a large-deck/P16 speedup. Green/FFT reuse across Lorentz blocks remains a worthwhile structural candidate because the containing GEMMs dominate the device unit.
+
+### Restore executable reuse ablation, claim1004
+
+
+On branch perf/bisp-prof-zw-2026-09-06, unmerged; production unchanged9f569c4b.
+Run-local ablation08: JID57966610, lx-Xg4-013500-1326885-7821 exit0, P4 BFC@0.85.
+Artifacts runs/MoS2/41_bisp_parent_route_2026-09-05/prof_zw/08_restore_ablation/{unit_timings.rank0.json,eqp0_ab.txt,eqp1_ab.txt,sectors.csv}.
+EQP0/1 each90/90 printed-digit identity and all sigCC/sigTT/sigCT rows exact versus P06.
+V/W/W-V restore passes:120/16/16 compiles,20.143760/0.773553/0.833868s; zero factories remain per output.
+Whole driver161.02s, final1520 XLA compiles/116.71s compiler work. BaselineP06:201.36s,1712/148.01s.
+Ablation adds warm chi repeats, so uninstrumented after-source repetition remains owed. No source implementation accepted yet.

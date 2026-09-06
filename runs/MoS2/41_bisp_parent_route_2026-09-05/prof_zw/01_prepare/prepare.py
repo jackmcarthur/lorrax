@@ -33,6 +33,7 @@ for name, source, pin in arms:
     dest.mkdir(exist_ok=False)
     shutil.copy2(source_run / "cohsex.in", dest / "cohsex.in")
     shutil.copytree(source_run / "tmp", dest / "tmp")
+    shutil.copy2(source_run / "dipole.h5", dest / "dipole.h5")
     checksums = {str(p.relative_to(dest)): digest(p)
                  for p in sorted((dest / "tmp").rglob("*")) if p.is_file()}
     (dest / "input_checksums.json").write_text(json.dumps(checksums, indent=2) + "\n")
@@ -80,7 +81,7 @@ system: MoS2
 pipeline: lorrax_only
 platform: perlmutter
 variant_of: 73_parent_full_static
-reuse_from_parent: [cohsex.in, tmp]
+reuse_from_parent: [cohsex.in, tmp, dipole.h5]
 overrides: {{debug_print: true, source: {pin}}}
 source:
   checkout: {source}
