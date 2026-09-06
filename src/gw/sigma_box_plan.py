@@ -242,7 +242,7 @@ def make_sigma_box_spec(
 
 def _rule_cache_lookup(
     directory, box, eps, relative, *, noise_amplification_cap,
-    reduction_steps=None,
+    reduction_steps=None, state_pad_ry=0.0,
 ):
     """Return the smallest compatible rule plus any unreadable-path warnings.
 
@@ -250,6 +250,13 @@ def _rule_cache_lookup(
     under a deterministic step budget and one reduced under the wall clock
     are different rules for the same box, and a deck that names a step
     budget must never be served a clock-reduced entry (or vice versa).
+
+    Nearby certificates also bound oversized cache hits: a broader rule may
+    use at most 1.25 times the cheapest compatible nearby rule's nodes. The nearby
+    box extends each requested edge by ``state_pad_ry`` (Ry), solely for
+    this cost comparison; a returned rule still needs certified containment.
+    Exact/nearby hits are preserved: a tiny nested window is not evidence
+    that a rule for the entire requested box can be made cheaper.
     """
     if directory is None:
         return None, ()
@@ -265,6 +272,10 @@ def _rule_cache_lookup(
             f"path={path} error={type(exc).__name__}: {exc}")
         return None, tuple(warnings)
     best = None
+    nearby_node_count = None
+    pad = float(state_pad_ry)
+    nearby_box = (box[0] - pad, box[1] + pad,
+                  box[2] - pad, box[3] + pad)
     for name in names:
         path = os.path.abspath(os.path.join(directory, name))
         try:
@@ -292,6 +303,11 @@ def _rule_cache_lookup(
                         or float(data["sup_error"]) > eps):
                     continue
                 cached_box = tuple(float(value) for value in data["box"])
+                if _box_contains(nearby_box, cached_box):
+                    count = int(np.asarray(data["times"]).size)
+                    if count > 0:
+                        nearby_node_count = (count if nearby_node_count is None
+                                             else min(nearby_node_count, count))
                 contains = _box_contains(cached_box, box)
                 if not contains:
                     # P1/P4 pole fits can differ at ~1e-11 Ry. This bound
@@ -333,6 +349,12 @@ def _rule_cache_lookup(
                 "WARNING sigma quadrature cache entry is unreadable and "
                 "will not be used: "
                 f"path={path} error={type(exc).__name__}: {exc}")
+    if (best is not None and nearby_node_count is not None
+            and not _box_contains(nearby_box, best[0].box)
+            and best[0].node_count > 1.25 * nearby_node_count):
+        # A broad hit can cost more on every Sigma sweep than a fresh fit.
+        # Na's 126-node valence box otherwise inherited 199 conduction nodes.
+        best = None
     return best, tuple(warnings)
 
 
@@ -458,7 +480,9 @@ def _fit_rule(
     cached, cache_lookup_warnings = _rule_cache_lookup(
         cache_dir, requested_box, eps, relative,
         noise_amplification_cap=noise_amplification_cap,
-        reduction_steps=reduction_steps)
+        reduction_steps=reduction_steps,
+        state_pad_ry=float(np.max(sc_state_pad_ev(
+            np.asarray(spec["states"]) * RYD_TO_EV))) / RYD_TO_EV)
     if cached is not None:
         rule, cache_name = cached
         cache_status = f"hit:{cache_name}"
