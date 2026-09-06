@@ -667,3 +667,5 @@ completed Hartree band matrices unfold. The transverse DFT parent bundle
 rotates with the same iteration U/E as charge and reaches bare TT exchange.
 `rho_from_wfns` accepts `sym` alongside `sym_perm` because scalar grid
 pullbacks alone cannot project a vector current.
+
+2026-09-05 BISP-ORCH: raw-parent transport no longer evaluates the former hardware/band-count profitability score. `parent_k_contraction_profitable` and `_resolve_parent_green_admission` are removed; exact typed transport is the required route under the one-order decision. Final carrier deletion is tracked by the bispinor parent-route report.

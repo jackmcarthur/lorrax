@@ -13,9 +13,7 @@ from common.grouped_layout import build_square_grouped_shard_layout
 from gw.centroid_k_unfold import (
     CentroidKUnfoldPlan,
     build_centroid_k_unfold_plan,
-    parent_k_contraction_profitable,
 )
-from gw.gw_init import _resolve_parent_green_admission
 from gw.wavefunction_bundle import (
     BandSlices,
     attach_parent_green_carrier,
@@ -52,33 +50,6 @@ def _symmetry_fixture():
         kirr_fullids=np.asarray([0, 2], dtype=np.int32),
         spinor_action=spinor_action,
     )
-
-
-def test_parent_k_profitability_uses_measured_small_band_envelope():
-    assert parent_k_contraction_profitable(
-        n_full=64, n_parent=8, n_bands=4)
-    assert not parent_k_contraction_profitable(
-        n_full=64, n_parent=8, n_bands=3)
-    assert not parent_k_contraction_profitable(
-        n_full=64, n_parent=40, n_bands=256)
-    assert not parent_k_contraction_profitable(
-        n_full=64, n_parent=64, n_bands=1024)
-
-
-def test_bispinor_parent_k_candidate_uses_four_spinor_unfold():
-    """Four-spinor parent faces use the same admission envelope as scalar faces."""
-    cfg = SimpleNamespace(
-        bispinor=True, memory=SimpleNamespace(low_mem_bands=True),
-        compute_mode=SimpleNamespace(needs_screening=True),
-        screening=SimpleNamespace(diagrams="w_rpa"), qp_solver="one_shot_dft")
-    meta = SimpleNamespace(nk_tot=64, nspinor=4)
-    records = []
-    admitted, work_ok = _resolve_parent_green_admission(
-        cfg, meta, SimpleNamespace(nkpts=8), SimpleNamespace(nb_full=4),
-        backend="gpu", print_fn=records.append)
-    assert work_ok
-    assert admitted
-    assert records == []
 
 
 def test_plan_packs_raw_parent_faces_and_unfolds_their_operator():

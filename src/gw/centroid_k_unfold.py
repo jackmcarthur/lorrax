@@ -38,40 +38,6 @@ from symmetry_maps import (
 )
 
 
-# P=4 A100 crossover after the fixed-size spin action was made dot-free and
-# canonicalization was postponed to one completed chi operator.  This is an
-# internal scheduling policy, not a user-tunable physics/runtime knob.  The
-# lower boundary is the measured 64->8, four-band case; require a separate 2x
-# k-reduction floor so an almost-unreduced grid cannot satisfy the scalar work
-# proxy merely by carrying many bands.
-_MIN_AVOIDED_BAND_WORK = 3.5
-_MIN_PARENT_K_REDUCTION = 2.0
-
-
-def parent_k_contraction_profitable(
-    *, n_full: int, n_parent: int, n_bands: int,
-) -> bool:
-    """Conservative automatic admission for parent-k Green contractions.
-
-    The saved band contraction is proportional to
-    ``n_bands * (1 - n_parent/n_full)``; the required full-k operator
-    transport is not.  On the real Si P=4 64->8 geometry, the dot-free
-    transport kept complete eight-node chi builds faster at 4, 8 and 16
-    bands.  Four bands gives the boundary score 3.5.  A distinct 2x reduction
-    floor prevents extrapolation to grids with almost no symmetry reduction.
-    Callers additionally restrict this measured policy to GPU execution.
-    """
-    full = int(n_full)
-    parent = int(n_parent)
-    bands = int(n_bands)
-    if full < 1 or parent < 1 or parent >= full or bands < 1:
-        return False
-    if full / parent < _MIN_PARENT_K_REDUCTION:
-        return False
-    avoided = bands * (full - parent) / full
-    return avoided >= _MIN_AVOIDED_BAND_WORK
-
-
 def _readonly(value, dtype) -> np.ndarray:
     out = np.array(value, dtype=dtype, copy=True)
     out.setflags(write=False)
@@ -454,5 +420,4 @@ __all__ = [
     "RealGridOrbitTiles",
     "build_centroid_k_unfold_plan",
     "build_real_grid_orbit_tiles",
-    "parent_k_contraction_profitable",
 ]

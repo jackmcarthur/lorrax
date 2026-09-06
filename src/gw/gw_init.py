@@ -3137,30 +3137,6 @@ def _parents_only_consumer_blockers(cfg) -> list:
 	return blockers
 
 
-def _resolve_parent_green_admission(
-	cfg, meta, wfn, band_slices, *, backend, print_fn=print,
-):
-	"""Admit a typed parent Green contraction within the measured work envelope."""
-	from .centroid_k_unfold import parent_k_contraction_profitable
-
-	work_ok = parent_k_contraction_profitable(
-		n_full=int(meta.nk_tot), n_parent=int(wfn.nkpts),
-		n_bands=int(band_slices.nb_full))
-	rpa = (
-		str(getattr(cfg.screening.diagrams, 'value',
-		            cfg.screening.diagrams)) == 'w_rpa')
-	common_candidate = (
-		bool(cfg.memory.low_mem_bands)
-		and bool(cfg.compute_mode.needs_screening)
-		and rpa
-		and str(getattr(cfg.qp_solver, 'value', cfg.qp_solver))
-			!= 'self_consistent'
-		and int(wfn.nkpts) < int(meta.nk_tot)
-		and str(backend) == 'gpu'
-		and work_ok)
-	return common_candidate and int(meta.nspinor) in (1, 2, 4), work_ok
-
-
 def _prepare_parent_wavefunction_plan(
 	cfg, meta, wfn, band_slices, *, sym, centroid_indices, mesh_xy,
 	print_fn=print,
@@ -3175,14 +3151,10 @@ def _prepare_parent_wavefunction_plan(
 	plan : CentroidKUnfoldPlan or None
 	    Exact transport in the run's centroid basis, or the named full-k fallback.
 	green_candidate : bool
-	    Whether Green contraction meets its measured hardware/work policy.
+	    Whether the plan exists and every consumer supports parent storage.
 	parents_only_wanted : bool
 	    Whether every wavefunction consumer can use raw-parent storage.
 	"""
-	green_candidate, work_ok = (
-		_resolve_parent_green_admission(
-			cfg, meta, wfn, band_slices,
-			backend=jax.default_backend(), print_fn=print_fn))
 	can_use_parents = (
 		bool(cfg.memory.low_mem_bands) and int(meta.nspinor) in (1, 2, 4))
 	# Parents-only ψ storage: when every wavefunction consumer of
@@ -3198,20 +3170,6 @@ def _prepare_parent_wavefunction_plan(
 	if can_use_parents and blockers:
 		print_fn("  ψ storage: full-k faces kept because "
 		       + "; ".join(blockers) + ".")
-	if (bool(cfg.memory.low_mem_bands)
-			and bool(cfg.compute_mode.needs_screening)
-			and int(wfn.nkpts) < int(meta.nk_tot)
-			and not work_ok
-			and not parents_only_wanted):
-		avoided = (int(band_slices.nb_full)
-			* (int(meta.nk_tot) - int(wfn.nkpts))
-			/ int(meta.nk_tot))
-		print_fn(
-			"  Parent-k Green contraction inactive: shape "
-			f"(full k={int(meta.nk_tot)}, parent k={int(wfn.nkpts)}, "
-			f"bands={int(band_slices.nb_full)}, avoided-band score="
-			f"{avoided:.1f}) is outside the measured safe envelope "
-			"(at least 2x k reduction and score >= 3.5); using full k.")
 	plan = None
 	if can_use_parents:
 		from .centroid_k_unfold import build_centroid_k_unfold_plan
