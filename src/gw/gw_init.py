@@ -1786,6 +1786,7 @@ class _CoupledMu123ZqCoordinator:
 		self._turn = 1
 		self._solve_inputs = {}
 		self._stacked_solve_inputs = None
+		self._stacked_factor_ready = False
 		self._final_ready = set()
 		self._final_turn = 1
 
@@ -1845,7 +1846,7 @@ class _CoupledMu123ZqCoordinator:
 			self._release_prepared = True
 			self._cv.notify_all()
 
-	def stacked_solve_inputs(self):
+	def stacked_solve_inputs(self, *, factorize=None):
 		with self._cv:
 			if not self._release_prepared:
 				raise RuntimeError(
@@ -1853,6 +1854,9 @@ class _CoupledMu123ZqCoordinator:
 			if self._stacked_solve_inputs is None:
 				raise RuntimeError(
 					"coupled transaction did not register stacked solve inputs")
+			if factorize is not None and not self._stacked_factor_ready:
+				self._stacked_solve_inputs = factorize(*self._stacked_solve_inputs)
+				self._stacked_factor_ready = True
 			return self._stacked_solve_inputs
 
 	def _acquire_channel_stack(self, mu, chunk_idx, builder):
@@ -2469,7 +2473,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 						if coordinator is not None else None),
 					_spill_coupled_gflat_to_host=bool(
 						coordinator is not None),
-					_stack_coupled_solve_inputs=False,
+					_stack_coupled_solve_inputs=coordinator is not None,
 					print_fn=print_fn,
 				)
 			_gate_fresh_zeta_rank_findings(
