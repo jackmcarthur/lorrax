@@ -1,0 +1,83 @@
+{
+  "scope": "synchronized host boundaries; outer stage is nested, never sum it with children",
+  "groups": [
+    {
+      "label": "sigma_restore",
+      "term": "V",
+      "head": false,
+      "calls": 16,
+      "compiles": 24,
+      "compile_s": 1.1443049999361392,
+      "host_s": 1.7087451799889095,
+      "cold_calls": 4,
+      "cold_median_ms": 390.4401335021248,
+      "warm_calls": 12,
+      "warm_median_ms": 16.3920085033169
+    },
+    {
+      "label": "sigma_factory",
+      "term": "",
+      "head": false,
+      "calls": 48,
+      "compiles": 86,
+      "compile_s": 5.487994983093813,
+      "host_s": 6.498401966877282,
+      "cold_calls": 4,
+      "cold_median_ms": 1601.3429529848509,
+      "warm_calls": 44,
+      "warm_median_ms": 0.05278699973132461
+    },
+    {
+      "label": "sigma_block",
+      "term": "",
+      "head": false,
+      "calls": 48,
+      "compiles": 16,
+      "compile_s": 5.590021392039489,
+      "host_s": 7.57445398895652,
+      "cold_calls": 16,
+      "cold_median_ms": 454.0915654943092,
+      "warm_calls": 32,
+      "warm_median_ms": 3.556212002877146
+    },
+    {
+      "label": "sigma_restore",
+      "term": "W",
+      "head": false,
+      "calls": 16,
+      "compiles": 0,
+      "compile_s": 0.0,
+      "host_s": 0.18385326597490348,
+      "cold_calls": 0,
+      "cold_median_ms": null,
+      "warm_calls": 16,
+      "warm_median_ms": 15.81141198403202
+    },
+    {
+      "label": "sigma_restore",
+      "term": "W-V",
+      "head": false,
+      "calls": 16,
+      "compiles": 4,
+      "compile_s": 0.13611611499800347,
+      "host_s": 0.40418445502291434,
+      "cold_calls": 4,
+      "cold_median_ms": 50.39183850749396,
+      "warm_calls": 12,
+      "warm_median_ms": 20.443006011191756
+    },
+    {
+      "label": "sigma_static_stage",
+      "term": "",
+      "head": false,
+      "calls": 1,
+      "compiles": 172,
+      "compile_s": 14.348193256155355,
+      "host_s": 19.531278636015486,
+      "cold_calls": 1,
+      "cold_median_ms": 19531.278636015486,
+      "warm_calls": 0,
+      "warm_median_ms": null
+    }
+  ]
+}
