@@ -3309,9 +3309,32 @@ def _z_q_face_parent(
 				vertices = [_gamma_perm_phase_mu(mu) for mu in (1, 2, 3)]
 				perms = jnp.stack([vertex[0] for vertex in vertices])
 				phases = jnp.stack([vertex[1] for vertex in vertices])
-				_, channels = jax.lax.scan(
-					lambda carry, vertex: (carry, channel_tail(*vertex)), 0,
-					(perms, phases, perms, phases), unroll=1)
+				output_pairs = (perms[:, :, None] * ns + perms[:, None, :]).reshape(3, -1)
+				output_phases = (phases[:, :, None] * phases[:, None, :]).reshape(3, -1)
+				sources = jnp.asarray(source_pairs)
+				counts = jnp.asarray(source_counts)
+
+				def spin_channels(acc, pair):
+					"""Share the left child projector across the three current channels."""
+					left = local_ifftn3(unfold_block(
+						D_l_, coefficients[pair], sources[pair], counts[pair]).reshape(
+							nkx, nky, nkz, mu_loc, r_loc), axes=(0, 1, 2), norm='forward')
+					def channel(carry, args):
+						"""Accumulate one canonical vertex in its original spin-pair order."""
+						value, target, phase = args
+						right = local_ifftn3(unfold_block(
+							D_r_, coefficients[target], sources[target], counts[target]).reshape(
+								nkx, nky, nkz, mu_loc, r_loc), axes=(0, 1, 2), norm='forward')
+						return carry, value + jnp.conj(left) * (phase * right)
+					_, result = jax.lax.scan(channel, 0,
+						(acc, output_pairs[:, pair], output_phases[:, pair]), unroll=1)
+					return result, None
+
+				initial = jnp.zeros((3, nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128)
+				result, _ = jax.lax.scan(spin_channels, initial, jnp.arange(ns * ns), unroll=1)
+				_, channels = jax.lax.scan(lambda carry, value: (carry,
+					local_fftn3(value, axes=(0, 1, 2), norm='forward').reshape(nk, mu_loc, r_loc)),
+					0, result, unroll=1)
 				return channels
 			identity = (jnp.arange(ns), jnp.ones(ns))
 			left = identity if gamma_L == 0 else _gamma_perm_phase_mu(gamma_L)
