@@ -192,17 +192,19 @@ def check_sigma_sx_chain_matches_dense(
     V_q_packed = _put(V_q_np, mesh, (None, "x", "y"))
     W_q_packed = 2.0 * V_q_packed
     from full_photon_head_sigma_gate import _bundle
+    from common.gamma_matrices import gamma_perm_phase
     parent = _bundle(mesh, psi_np, enk_np, np.zeros_like(enk_np), slices)
     photon_block = _make_photon_static_block_kernel(
-        mesh, kgrid, nk, parent, parent, vertex_pair=(mu_L, nu_L))
+        mesh, kgrid, nk, parent, parent)
+    vertices = (gamma_perm_phase(mu_L), gamma_perm_phase(nu_L))
     weights = np.zeros((nk, nb_full), dtype=np.complex128)
     weights[:, :nb_sigma] = f_np
     weights = _put(weights, mesh, (None, None))
     photon_x = photon_block(parent.green_parent, parent.green_parent,
-        weights, V_q_packed, 1.0)
+        weights, V_q_packed, 1.0, vertices)
     photon_x.block_until_ready()
     photon_sx = photon_block(parent.green_parent, parent.green_parent,
-        weights, W_q_packed, 1.0)
+        weights, W_q_packed, 1.0, vertices)
     photon_sx.block_until_ready()
     r_photon_x = _rel(_gather(photon_x), got_face_full)
     r_photon_sx = _rel(_gather(photon_sx), 2.0 * got_face_full)
