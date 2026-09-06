@@ -716,6 +716,13 @@ def _sc_padded_box_spec(spec, eta, *, reserve_zero_side=False):
     if spec["kind"] == "sign_definite_positive" and support_box[0] > 0.0:
         box[0] = max(box[0], 0.5 * support_box[0])
         box[0] = min(box[0], support_box[0])
+    # Prospective grid growth can move a pole from the tail into the
+    # resonant channel. Do not pre-fit that nonexistent crossing in the
+    # tail: its actual appearance uses the normal reported escape path.
+    if spec["kind"] == "sign_definite_negative" and support_box[1] >= 0.0:
+        box[1] = 0.5 * spec["box"][1]
+    if spec["kind"] == "sign_definite_positive" and support_box[0] <= 0.0:
+        box[0] = 0.5 * spec["box"][0]
     if reserve_zero_side and "sc_support_frequencies" in spec:
         # SC pole membership may change before a state leaves its reserved
         # external support. Reserve the sign-definite channel down to eta
