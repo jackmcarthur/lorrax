@@ -2370,7 +2370,10 @@ def nonlocal_velocity_lift(setup: VNLSetup):
 
     Returns ``f(psi_2, gvecs_int, kvecs_frac, ngk_valid, channel)`` mapping
     a k-batched two-component ψ ``(n_k, nb, 2, ngkmax)`` to the
-    Rydberg-velocity ket the channel-``a`` small component needs,
+    Rydberg-velocity ket the channel-``a`` small component needs
+    (``channel=0`` returns all three, ``(3, n_k, nb, 2, ngkmax)``, from ONE
+    projector build per k -- the one-pass lift ``WfnLoader.lift_many``
+    takes),
 
         sum_b sigma^b (dV_SR/dk_b psi_L)  +  sigma^a (dV_SO/dk_a psi_L)
 
@@ -2418,28 +2421,42 @@ def nonlocal_velocity_lift(setup: VNLSetup):
         v_sr = apply_vnl_velocity_to_ket(
             psi_k, kdata.Z, kdata.dZ, E_SR)                # (3, nb, 2, ngkmax)
         ket = sigma_dot_cartesian_kets(v_sr)
+        mask = gmask.astype(ket.dtype)
+        if int(channel) == 0:
+            # All three channels from this one Z/dZ build: the SR ket is
+            # shared, only sigma^a (dV_SO/dk_a psi) differs.
+            if not has_so:
+                return jnp.stack([ket * mask] * 3)
+            v_so = apply_vnl_velocity_to_ket(
+                psi_k, kdata.Z, kdata.dZ, E_SO)            # (3, nb, 2, ngkmax)
+            return jnp.stack([
+                (ket + jnp.einsum("ij,bjg->big", _PAULI_JNP[a], v_so[a],
+                                  optimize=True)) * mask
+                for a in range(3)])
         if has_so:
             a = int(channel) - 1
             v_so_a = apply_vnl_velocity_to_ket(
                 psi_k, kdata.Z, kdata.dZ[a:a + 1], E_SO)[0]  # (nb, 2, ngkmax)
             ket = ket + jnp.einsum(
                 "ij,bjg->big", _PAULI_JNP[a], v_so_a, optimize=True)
-        return ket * gmask.astype(ket.dtype)
+        return ket * mask
 
     @functools.partial(jax.jit, static_argnames=("channel",))
     def _batch(psi_2, gvecs_int, kvecs_frac, ngk_valid, *, channel):
         channel = int(channel)
-        if channel not in (1, 2, 3):
+        if channel not in (0, 1, 2, 3):
             raise ValueError(
-                f"nonlocal_velocity_lift: channel must be 1, 2 or 3; got "
-                f"{channel}")
+                f"nonlocal_velocity_lift: channel must be 1, 2 or 3 (0 = all "
+                f"three); got {channel}")
         psi_L = jnp.asarray(psi_2)[:, :, :2, :]
-        return jax.lax.map(
+        out = jax.lax.map(
             lambda args: _one_k(*args, channel),
             (psi_L,
              jnp.asarray(gvecs_int, dtype=jnp.int32),
              jnp.asarray(kvecs_frac, dtype=jnp.float64),
              jnp.asarray(ngk_valid, dtype=jnp.int32)))
+        # channel 0: (n_k, 3, ...) from the map -> channel-major (3, n_k, ...)
+        return jnp.moveaxis(out, 1, 0) if channel == 0 else out
 
     return _batch
 
@@ -2487,6 +2504,10 @@ class NonlocalVelocityLift:
     def __call__(self, psi_2, gvecs_int, kvecs_frac, ngk_valid, *, channel):
         return self.batch(psi_2, gvecs_int, kvecs_frac, ngk_valid,
                           channel=channel)
+
+    def all_channels(self, psi_2, gvecs_int, kvecs_frac, ngk_valid):
+        """The three channel kets ``(3, n_k, nb, 2, ngkmax)`` from one pass."""
+        return self.batch(psi_2, gvecs_int, kvecs_frac, ngk_valid, channel=0)
 
 
 @jax.jit

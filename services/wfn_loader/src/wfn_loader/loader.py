@@ -2043,6 +2043,22 @@ class WfnLoader:
             sigma_vnl_velocity_ry=sigma_vnl,
         )
 
+    def _velocity_hook_or_refuse(self, representation: str):
+        """The attached ``nonlocal_velocity_lift``, or the one refusal."""
+        fn = self.nonlocal_velocity_lift
+        if fn is None:
+            raise ValueError(
+                "GATE bispinor_velocity_lift_needs_projectors: "
+                f"bispinor_lift={str(representation)!r} was requested but "
+                "this loader has no nonlocal velocity attached.\n"
+                "  want: loader.nonlocal_velocity_lift = "
+                "psp.vnl_ops.nonlocal_velocity_lift(setup) before the load "
+                "(gw_jax and psp.get_dipole_mtxels do this from the deck's "
+                "pseudopotentials)\n"
+                "  why:  the small component needs dV_NL/dk, which lives in "
+                "the run's projectors, not in WFN.h5.")
+        return fn
+
     def _sigma_vnl_velocity(self, psi_2, gvecs_int, kvecs_frac, ngk_valid,
                             *, representation: str):
         """``sum_a sigma^a (dV_NL/dk_a psi_L)`` for the velocity lift, else None.
@@ -2056,18 +2072,7 @@ class WfnLoader:
         channel = velocity_lift_channel(representation)
         if channel is None:
             return None
-        fn = self.nonlocal_velocity_lift
-        if fn is None:
-            raise ValueError(
-                "GATE bispinor_velocity_lift_needs_projectors: "
-                f"bispinor_lift={str(representation)!r} was requested but "
-                "this loader has no nonlocal velocity attached.\n"
-                "  want: loader.nonlocal_velocity_lift = "
-                "psp.vnl_ops.nonlocal_velocity_lift(setup) before the load "
-                "(gw_jax and psp.get_dipole_mtxels do this from the deck's "
-                "pseudopotentials)\n"
-                "  why:  the small component needs dV_NL/dk, which lives in "
-                "the run's projectors, not in WFN.h5.")
+        fn = self._velocity_hook_or_refuse(representation)
         return fn(
             psi_2,
             jnp.asarray(np.asarray(gvecs_int), dtype=jnp.int32),
@@ -2102,6 +2107,57 @@ class WfnLoader:
         return self._apply_bispinor_lift(
             psi_2, k=k, sharding=sharding,
             representation=str(bispinor_lift).strip().lower())
+
+    def lift_many(self, psi_2: jax.Array, *, k: KSpec = "full_bz",
+                  bispinor_lifts, sharding: NamedSharding | None = None
+                  ) -> tuple:
+        """Several carriers of one two-spinor window from ONE projector pass.
+
+        ``lift`` once per carrier rebuilds the projector tables Z and dZ at
+        every k for every carrier; only the ``sigma^a dV_SO/dk_a`` term
+        differs between the three velocity channels.  This asks the hook
+        for all three kets at once (``channel=0``) and pays one ``sigma.p``
+        kernel per requested lift.  Each output equals ``lift(psi_2, k=k,
+        bispinor_lift=l)`` to rounding.  (The three-load setup of the
+        velocity carrier was ~6 min on CrI3 6x6x1 at P16, 2026-09-05.)
+        """
+        if int(self.nspinor) != 2:
+            raise ValueError(
+                "WfnLoader.lift_many requires a 2-spinor WFN; file has "
+                f"nspinor={int(self.nspinor)}.")
+        psi_2 = jnp.asarray(psi_2)
+        if psi_2.ndim != 4 or int(psi_2.shape[2]) != 2:
+            raise ValueError(
+                "WfnLoader.lift_many expects psi_2 of shape (n_k, nb, 2, "
+                f"ngkmax); got {tuple(psi_2.shape)}")
+        from common.bispinor_init import velocity_lift_channel
+        lifts = tuple(str(l).strip().lower() for l in bispinor_lifts)
+        gvecs = np.asarray(self.gvecs(k=k))
+        kvecs_np = self.kvecs(k=k)
+        bvec_cart_bohr = (
+            float(self.blat) * np.asarray(self.bvec, dtype=np.float64))
+        sigma_all = None
+        velocity_lifts = [l for l in lifts if velocity_lift_channel(l)]
+        if velocity_lifts:
+            fn = self._velocity_hook_or_refuse(velocity_lifts[0])
+            sigma_all = fn(
+                psi_2,
+                jnp.asarray(gvecs, dtype=jnp.int32),
+                jnp.asarray(np.asarray(kvecs_np, dtype=np.float64)),
+                jnp.asarray(np.asarray(self.ngk_valid(k=k)), dtype=jnp.int32),
+                channel=0)                       # (3, n_k, nb, 2, ngkmax)
+        out = []
+        for lift in lifts:
+            a = velocity_lift_channel(lift)
+            out.append(_bispinor_lift_kernel(
+                psi_2,
+                jnp.asarray(gvecs, dtype=jnp.float64),
+                jnp.asarray(kvecs_np),
+                jnp.asarray(bvec_cart_bohr),
+                sharding=sharding, representation=lift,
+                sigma_vnl_velocity_ry=None if a is None else sigma_all[a - 1],
+            ))
+        return tuple(out)
 
     # ------------------------------------------------------------------
     # Eager unfold core

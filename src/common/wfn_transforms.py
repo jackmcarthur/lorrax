@@ -2347,12 +2347,19 @@ def load_centroids_band_chunked(
     k_chunk_size: int | None = None,
     *,
     psi_G_flat: jax.Array | None = None,
-    bispinor_lift: str = "raw",
+    bispinor_lift: "str | tuple[str, ...]" = "raw",
     k_domain: str = "full_bz",
     return_ibz_parents: bool = False,
 ) -> tuple[jax.Array, ...]:
     """
     Load centroid-sampled wavefunctions using band AND k-point chunking.
+
+    ``bispinor_lift`` may be a TUPLE of lifts (``bispinor=True`` only): the
+    streamed pass then reads each WFN tile once, lifts it to every carrier
+    through ``WfnLoader.lift_many`` (one projector build per k) and samples
+    each four-spinor at the centroids in turn, returning one
+    ``(psi_Y, psi_X)`` pair per lift in order.  A single lift keeps the
+    historical fused path and return byte for byte.
 
     Memory-safe version that loops over band chunks (and optionally k-point
     chunks) to avoid OOM when loading all bands/k-points at once for FFT.
@@ -2426,6 +2433,19 @@ def load_centroids_band_chunked(
         raise ValueError(
             "load_centroids_band_chunked: psi_G_flat is a full-BZ reuse "
             "carrier and cannot be paired with k_domain='ibz'.")
+    multi_lift = not isinstance(bispinor_lift, str)
+    lifts = (tuple(str(l).strip().lower() for l in bispinor_lift)
+             if multi_lift else (str(bispinor_lift),))
+    if multi_lift:
+        if not bispinor or len(lifts) < 2 or psi_G_flat is not None \
+                or bool(return_ibz_parents):
+            raise ValueError(
+                "load_centroids_band_chunked: a tuple of bispinor_lift values "
+                "needs bispinor=True, at least two lifts, no preloaded "
+                f"psi_G_flat and no parent retention; got lifts={lifts}, "
+                f"bispinor={bispinor}, psi_G_flat={psi_G_flat is not None}, "
+                f"return_ibz_parents={bool(return_ibz_parents)}")
+        bispinor_lift = lifts[0]
     return_parents = bool(return_ibz_parents)
     if return_parents and domain != "full_bz":
         raise ValueError(
@@ -2504,6 +2524,16 @@ def load_centroids_band_chunked(
         and (return_parents or k_stream_requested
              or requested_band_tile < nb_total)
     )
+    if multi_lift and not stream_tiles:
+        # The bulk path lifts inside the loader's own load; nothing to
+        # share there, so it is one call per carrier.
+        return tuple(
+            load_centroids_band_chunked(
+                wfn, None, meta, centroid_indices, bispinor, mesh_xy,
+                band_range, band_chunk_size=band_chunk_size,
+                k_chunk_size=k_chunk_size, bispinor_lift=lift,
+                k_domain=k_domain)
+            for lift in lifts)
     k_tile = min(nk_tot, requested_k_tile) if stream_tiles else nk_tot
     band_tile = nb_total
     if stream_tiles:
@@ -2787,6 +2817,7 @@ def load_centroids_band_chunked(
             return acc_y, acc_x
 
         psi_rmu_all, psi_rmuT_all = _zero_faces()
+        faces = [_zero_faces() for _ in lifts] if multi_lift else None
         psi_parent_y = psi_parent_x = None
         if return_parents:
             psi_parent_y, psi_parent_x = _zero_parent_faces()
@@ -2837,6 +2868,26 @@ def load_centroids_band_chunked(
                             kvecs_parent[int(parent)])
 
                     for child, g_index_one in child_indices:
+                        if multi_lift:
+                            # One raw unfold, every carrier from one
+                            # projector pass, sampled one at a time.
+                            with timing.section("load_centroids.parent_unfold"):
+                                child_2 = loader.unfold_parent_to_full_k(
+                                    parent_psi, parent=int(parent),
+                                    full_k=child, bispinor=False,
+                                    bispinor_lift="raw")
+                                tiles = loader.lift_many(
+                                    child_2, k=[int(child)],
+                                    bispinor_lifts=lifts,
+                                    sharding=child_2.sharding)
+                                jax.block_until_ready(tiles)
+                                del child_2
+                            for i, tile in enumerate(tiles):
+                                faces[i] = _sample_and_insert_one(
+                                    *faces[i], tile, g_index_one, child,
+                                    b_rel, kvecs_frac_full[child])
+                            del tiles
+                            continue
                         with timing.section("load_centroids.parent_unfold"):
                             psi_G_tile = loader.unfold_parent_to_full_k(
                                 parent_psi, parent=int(parent), full_k=child,
@@ -2859,6 +2910,43 @@ def load_centroids_band_chunked(
                 for k0 in range(0, nk_tot, k_tile):
                     k1 = min(k0 + k_tile, nk_tot)
                     k_ids = list(range(k0, k1))
+                    if multi_lift:
+                        k_req = (k_ids if domain == "full_bz"
+                                 else IBZRows(tuple(k_ids)))
+                        with timing.section("load_centroids.loader_load"):
+                            tile_2 = load_psi_gflat_padded(
+                                loader, band_window, mesh_xy=mesh_xy,
+                                bispinor=False, pad_to=band_tile, k=k_req,
+                                sharding=sharding_load, bispinor_lift="raw")
+                            if tile_2 is None:
+                                continue
+                            tiles = loader.lift_many(
+                                tile_2, k=k_req, bispinor_lifts=lifts,
+                                sharding=NamedSharding(mesh_xy, sharding_load))
+                            jax.block_until_ready(tiles)
+                            del tile_2
+                        g_index_tile = pad_axis(
+                            g_index_full[k0:k1], k_tile, axis=0).array
+                        kvecs_tile = pad_axis(
+                            jnp.asarray(kvecs_frac_full[k0:k1]),
+                            k_tile, axis=0).array
+                        for i, tile in enumerate(tiles):
+                            tile = pad_axis(tile, k_tile, axis=0).array
+                            with timing.section("load_centroids.gflat_to_rmu"):
+                                psi_rmu_band = gflat_to_rmu(
+                                    tile, g_index_tile, centroid_idx_np,
+                                    mesh=mesh_xy, fft_grid=meta.fft_grid,
+                                    kvecs_frac=kvecs_tile, norm="ortho",
+                                    chunk_size=cs)
+                                jax.block_until_ready(psi_rmu_band)
+                            with timing.section("load_centroids.reshard_insert"):
+                                faces[i] = _insert_tile(
+                                    *faces[i], psi_rmu_band,
+                                    jnp.int32(k0), jnp.int32(b_rel))
+                                jax.block_until_ready(faces[i])
+                            del psi_rmu_band
+                        del tiles, g_index_tile, kvecs_tile
+                        continue
                     with timing.section("load_centroids.loader_load"):
                         psi_G_tile = load_psi_gflat_padded(
                             loader, band_window, mesh_xy=mesh_xy,
@@ -2898,6 +2986,9 @@ def load_centroids_band_chunked(
                     del psi_rmu_band
 
         gc.collect()
+        if multi_lift:
+            return tuple(_finish_faces(acc_y, acc_x, nk_tot)
+                         for acc_y, acc_x in faces)
         full_faces = _finish_faces(psi_rmu_all, psi_rmuT_all, nk_tot)
         if not return_parents:
             return full_faces

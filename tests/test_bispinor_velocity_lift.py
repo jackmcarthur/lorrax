@@ -355,3 +355,107 @@ def test_q0_current_identity_kinetic_gives_momentum_velocity_gives_dH_dk():
         assert checked > 0
     finally:
         loader.close()
+
+
+# ---------------------------------------------------------------------------
+# One-pass lift: the three channel carriers from one projector build
+# ---------------------------------------------------------------------------
+
+def test_hook_channel_zero_stacks_the_three_channel_kets():
+    """``channel=0`` builds Z/dZ once and returns the three kets the
+    per-channel calls return (to rounding: one apply of dV_SO over all three
+    components against three single-component applies)."""
+    _fixture_or_skip()
+    from psp import vnl_ops
+    loader, sym, setup = _open_loader_with_setup()
+    try:
+        nb = min(4, int(loader.nbands))
+        psi_2 = loader.load(bands=(0, nb), k="full_bz")
+        gv = jnp.asarray(np.asarray(loader.gvecs(k="full_bz")), dtype=jnp.int32)
+        kv = jnp.asarray(np.asarray(loader.kvecs(k="full_bz"), dtype=np.float64))
+        ngk = jnp.asarray(np.asarray(loader.ngk_valid(k="full_bz")), dtype=jnp.int32)
+        hook = vnl_ops.nonlocal_velocity_lift(setup)
+        all3 = np.asarray(hook(psi_2, gv, kv, ngk, channel=0))
+        assert all3.shape == (3,) + tuple(np.asarray(psi_2).shape)
+        for a in (1, 2, 3):
+            one = np.asarray(hook(psi_2, gv, kv, ngk, channel=a))
+            scale = max(float(np.max(np.abs(one))), 1e-300)
+            np.testing.assert_allclose(all3[a - 1], one, rtol=0.0,
+                                       atol=1e-13 * scale)
+        assert float(np.max(np.abs(all3[0] - all3[1]))) > 1e-6 * float(
+            np.max(np.abs(all3[0]))), "channels must differ (SOC is on)"
+    finally:
+        loader.close()
+
+
+def test_lift_many_matches_the_per_channel_lifts():
+    _fixture_or_skip()
+    from psp import vnl_ops
+    loader, sym, setup = _open_loader_with_setup()
+    try:
+        loader.nonlocal_velocity_lift = vnl_ops.nonlocal_velocity_lift(setup)
+        nb = min(4, int(loader.nbands))
+        psi_2 = loader.load(bands=(0, nb), k="full_bz")
+        lifts = ("velocity_1", "velocity_2", "velocity_3", "raw")
+        many = loader.lift_many(psi_2, k="full_bz", bispinor_lifts=lifts)
+        assert len(many) == 4
+        for lift, got in zip(lifts, many):
+            want = np.asarray(loader.lift(psi_2, k="full_bz", bispinor_lift=lift))
+            got = np.asarray(got)
+            scale = max(float(np.max(np.abs(want))), 1e-300)
+            np.testing.assert_allclose(got, want, rtol=0.0, atol=1e-13 * scale)
+        # the raw member is exact: no projector term enters it
+        np.testing.assert_array_equal(
+            np.asarray(many[3]), np.asarray(loader.lift(psi_2, k="full_bz")))
+    finally:
+        loader.close()
+
+
+@pytest.mark.parametrize("k_chunk_size", [1, None])
+def test_tuple_lift_centroid_load_matches_three_single_loads(k_chunk_size):
+    """The one-pass streamed centroid load (parent route with k_chunk_size=1,
+    direct band tiles with None) returns, per lift, what three single-lift
+    loads return."""
+    _fixture_or_skip()
+    from jax.sharding import Mesh
+    from common import Meta
+    from common.wfn_transforms import load_centroids_band_chunked
+    from psp import vnl_ops
+    from wfn_loader import WfnLoader
+    from psp.pseudos import load_pseudopotentials
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    loader = WfnLoader(str(WFN_PATH), mesh=mesh)
+    try:
+        if int(loader.nspinor) != 2:
+            pytest.skip("test requires a 2-spinor WFN")
+        sym = loader.symmetry()
+        setup = vnl_ops.build_vnl_setup(
+            loader, sym, None, load_pseudopotentials(str(FIXTURE_DIR)),
+            nspinor=2, print_fn=lambda *a, **k: None)
+        loader.nonlocal_velocity_lift = vnl_ops.nonlocal_velocity_lift(setup)
+        nb = min(4, int(loader.nbands))
+        nx, ny, nz = (int(s) for s in loader.fft_grid)
+        r_mu = jnp.asarray([[0, 0, 0], [1 % nx, 2 % ny, 3 % nz],
+                            [2 % nx, 1 % ny, 4 % nz]], dtype=jnp.int32)
+        meta = Meta.from_system(loader, sym, nval=2, ncond=nb - 2, nband=nb,
+                                n_rmu=int(r_mu.shape[0]), bispinor=True)
+        meta.memory_per_device_gb = 1000.0
+        lifts = ("velocity_1", "velocity_2", "velocity_3")
+        with mesh:
+            many = load_centroids_band_chunked(
+                loader, sym, meta, r_mu, True, mesh, (0, nb),
+                band_chunk_size=2, k_chunk_size=k_chunk_size,
+                bispinor_lift=lifts)
+            assert len(many) == 3
+            for lift, (got_y, got_x) in zip(lifts, many):
+                ref_y, ref_x = load_centroids_band_chunked(
+                    loader, sym, meta, r_mu, True, mesh, (0, nb),
+                    band_chunk_size=2, k_chunk_size=k_chunk_size,
+                    bispinor_lift=lift)
+                for got, ref in ((got_y, ref_y), (got_x, ref_x)):
+                    got = np.asarray(got); ref = np.asarray(ref)
+                    scale = max(float(np.max(np.abs(ref))), 1e-300)
+                    np.testing.assert_allclose(got, ref, rtol=0.0,
+                                               atol=1e-12 * scale)
+    finally:
+        loader.close()

@@ -853,23 +853,25 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 	# the three Lorentz labels share one carrier (one load, as before);
 	# under the per-channel velocity balance each label has its own lift
 	# and its own sample set (three loads of the same window).
-	# ponytail: three WFN passes; lift once per carrier from one
-	# two-spinor pass through WfnLoader.lift when the transverse sampling
-	# cost shows on a production deck.
+	# One streamed pass for every distinct carrier: the WFN tiles are read
+	# once and the projector tables built once per k (the three-pass
+	# version cost ~6 min of setup on CrI3 6x6x1 at P16, 2026-09-05).  One
+	# carrier keeps the historical single call byte for byte.
 	lifts = tuple(representation.current_lift_for(a) or "raw"
 	              for a in (1, 2, 3))
+	distinct = tuple(dict.fromkeys(lifts))
+	with timing.section("gw_jax.load_centroid_wfns_current"):
+		faces = load_centroids_band_chunked(
+			wfn, sym, meta_T, cent_T_idx, True, mesh_xy,
+			band_range=band_slices.full_range,
+			band_chunk_size=int(band_chunk_size),
+			k_chunk_size=k_chunk_size,
+			bispinor_lift=distinct[0] if len(distinct) == 1 else distinct,
+		)
+	if len(distinct) == 1:
+		faces = (faces,)
 	samples_by_lift = {}
-	for lift in lifts:
-		if lift in samples_by_lift:
-			continue
-		with timing.section("gw_jax.load_centroid_wfns_current"):
-			psi_Y, psi_X = load_centroids_band_chunked(
-				wfn, sym, meta_T, cent_T_idx, True, mesh_xy,
-				band_range=band_slices.full_range,
-				band_chunk_size=int(band_chunk_size),
-				k_chunk_size=k_chunk_size,
-				bispinor_lift=lift,
-			)
+	for lift, (psi_Y, psi_X) in zip(distinct, faces):
 		psi_mun = None
 		psi_nmu = None
 		if cfg.memory.low_mem_bands:
