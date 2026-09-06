@@ -8,4 +8,6 @@ pool: 57982945
 geometry: CPU one process four emulated devices
 steps:
   pytest:
-    state: pending
+    state: failed
+
+completion_receipt: '[lx] step lx-Xg0-114509-284511-9392 exit 1 in 52 s'

@@ -9,4 +9,6 @@ pool: 57982945
 geometry: P4 one rank per GPU
 steps:
   sigma:
-    state: pending
+    state: complete
+
+completion_receipt: '[lx] step lx-Xg4-120230-406775-1906 exit 0 in 108 s'

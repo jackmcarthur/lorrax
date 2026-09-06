@@ -1,0 +1,34 @@
+[
+  {
+    "shape_class": "CC",
+    "program": 1014,
+    "projected_ms": 0.100767,
+    "kernel_sum_ms": 0.100671,
+    "memory": "Total bytes used: 102216140 (97.48MiB)",
+    "explicit_collectives": {}
+  },
+  {
+    "shape_class": "CT",
+    "program": 1078,
+    "projected_ms": 0.295871,
+    "kernel_sum_ms": 0.296991,
+    "memory": "Total bytes used: 156985180 (149.71MiB)",
+    "explicit_collectives": {}
+  },
+  {
+    "shape_class": "TC",
+    "program": 1144,
+    "projected_ms": 0.308607,
+    "kernel_sum_ms": 0.309343,
+    "memory": "Total bytes used: 173863260 (165.81MiB)",
+    "explicit_collectives": {}
+  },
+  {
+    "shape_class": "TT",
+    "program": 1208,
+    "projected_ms": 1.198396,
+    "kernel_sum_ms": 1.199099,
+    "memory": "Total bytes used: 139388796 (132.93MiB)",
+    "explicit_collectives": {}
+  }
+]

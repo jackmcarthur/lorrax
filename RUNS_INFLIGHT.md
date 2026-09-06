@@ -6,4 +6,4 @@
 
 This register is worktree-local under the explicit modify-only-this-worktree instruction.
 
-| BISP-PROF-S scan6x6 | perf/bisp-prof-s-2026-09-06 | RUNNING on authorized57982945; rebase pin71ae0bde | runs/MoS2/42_bisp_scale_2026-09-06/prof_s/; reports/bisp_prof_s_2026-09-06/report.md |
+| BISP-PROF-S scan6x6 | perf/bisp-prof-s-2026-09-06 | COMPLETE P4: scan1b81c9cc and producer d994f90d pushed, exact static/dynamic gates; P16 unrun (LX-POOLFULL after1800s); rebase pin71ae0bde | runs/MoS2/42_bisp_scale_2026-09-06/prof_s/; reports/bisp_prof_s_2026-09-06/report.md |

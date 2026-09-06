@@ -1,0 +1,13 @@
+run_id: 31_cpu_baseline_rules
+system: DEV
+pipeline: rule census
+platform: perlmutter
+variant_of: 30_cpu_repository_gate
+reused: source temporarily pinned to71ae0bde for P16 baseline
+pool: 57982945
+geometry: CPU one process
+steps:
+  rule_census:
+    state: failed
+
+completion_receipt: '[lx] step lx-Xg0-124825-635859-6424 exit 1 in 7 s'

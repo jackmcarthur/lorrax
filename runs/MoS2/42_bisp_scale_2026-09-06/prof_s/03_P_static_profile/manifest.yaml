@@ -7,4 +7,6 @@ reused: private tmp and canonical input links
 source_pin: 71ae0bde
 geometry: {nodes: 1, gpus: 4, ranks: 4}
 steps:
-  lorrax: {state: pending}
+  lorrax: {state: complete}
+
+completion_receipt: '[lx] step lx-Xg4-113635-230722-5731 exit 0 in 198 s'
