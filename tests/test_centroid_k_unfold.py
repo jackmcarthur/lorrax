@@ -32,6 +32,8 @@ def _mesh_2x2():
 
 
 def _symmetry_fixture():
+    from types import MethodType
+    from symmetry_maps import SymMaps
     identity = np.eye(3, dtype=np.int32)
     swap_xy = np.asarray([[0, 1, 0], [1, 0, 0], [0, 0, 1]],
                          dtype=np.int32)
@@ -42,8 +44,9 @@ def _symmetry_fixture():
             np.eye(nspinor, dtype=np.complex128),
             rows.shape + (nspinor, nspinor)).copy()
 
-    return SimpleNamespace(
+    sym = SimpleNamespace(
         sym_matrices=np.stack([identity, swap_xy]),
+        sym_mats_k=np.stack([identity, swap_xy]),
         translations=np.zeros((2, 3), dtype=np.float64),
         irr_idx_k=np.asarray([0, 0, 1], dtype=np.int32),
         sym_idx_k=np.asarray([0, 1, 0], dtype=np.int32),
@@ -52,6 +55,8 @@ def _symmetry_fixture():
         kirr_fullids=np.asarray([0, 2], dtype=np.int32),
         spinor_action=spinor_action,
     )
+    sym.operation_rows = MethodType(SymMaps.operation_rows, sym)
+    return sym
 
 
 def test_plan_packs_raw_parent_faces_and_unfolds_their_operator():

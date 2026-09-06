@@ -603,6 +603,7 @@ def _compute_invalid_static_sigma(
     bands must enter with their fractional weights.
     """
     from common.collectives import gather_to_host
+    from symmetry_maps import unfold_file_wedge_band_operator
     from .cohsex_sigma import build_Gij, _occ_diag_full
     from .greens_function_kernel import build_G
 
@@ -643,7 +644,9 @@ def _compute_invalid_static_sigma(
                         k_unfold_plan=k_unfold_plan)
         sig_sx = spatial.conv_project(psi_xr, psi_yn, G_occ, W_prep)
         sx_host = np.asarray(strip_sigma_window(
-            gather_to_host(sig_sx), nb_real), dtype=np.complex128)
+            unfold_file_wedge_band_operator(
+                k_unfold_plan.sym, gather_to_host(sig_sx),
+                trs_rule="transpose"), nb_real), dtype=np.complex128)
         del G_occ, sig_sx
 
         mask = g_carrier.band_mask(s.sigma_sum).astype(jnp.complex128)
@@ -652,7 +655,9 @@ def _compute_invalid_static_sigma(
                        k_unfold_plan=k_unfold_plan)
         sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
         ri_host = np.asarray(strip_sigma_window(
-            gather_to_host(sig_ri), nb_real), dtype=np.complex128)
+            unfold_file_wedge_band_operator(
+                k_unfold_plan.sym, gather_to_host(sig_ri),
+                trs_rule="transpose"), nb_real), dtype=np.complex128)
         del G_ri, sig_ri
 
     # shared_conv(G_RI, W_static) = -<G_RI.W_static>, while static COH is
@@ -705,6 +710,7 @@ def _invalid_static_coh_by_bracket(
     by the same rule that turns the Σ_c brackets into band counts.
     """
     from common.collectives import gather_to_host
+    from symmetry_maps import unfold_file_wedge_band_operator
     from .greens_function_kernel import build_G
 
     face_kwargs = sigma_face_kernel_kwargs(wfns)
@@ -736,7 +742,9 @@ def _invalid_static_coh_by_bracket(
                            k_unfold_plan=k_unfold_plan)
             sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
             ri_host = np.asarray(strip_sigma_window(
-                gather_to_host(sig_ri), nb_real), dtype=np.complex128)
+                unfold_file_wedge_band_operator(
+                    k_unfold_plan.sym, gather_to_host(sig_ri),
+                    trs_rule="transpose"), nb_real), dtype=np.complex128)
             out.append(-0.5 * ri_host)
             del G_ri, sig_ri
     return np.stack(out, axis=0)
