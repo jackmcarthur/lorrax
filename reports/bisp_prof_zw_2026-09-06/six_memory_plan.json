@@ -1,0 +1,34 @@
+[
+  {
+    "mu_left": 600,
+    "mu_right": 600,
+    "one_G_bytes_P4": 829440000,
+    "two_G_bytes_P4": 1658880000,
+    "one_full_q_chi_bytes_P4": 51840000,
+    "one_q_ibz_chi_bytes_P4": 10080000
+  },
+  {
+    "mu_left": 600,
+    "mu_right": 196,
+    "one_G_bytes_P4": 270950400,
+    "two_G_bytes_P4": 541900800,
+    "one_full_q_chi_bytes_P4": 16934400,
+    "one_q_ibz_chi_bytes_P4": 3292800
+  },
+  {
+    "mu_left": 196,
+    "mu_right": 600,
+    "one_G_bytes_P4": 270950400,
+    "two_G_bytes_P4": 541900800,
+    "one_full_q_chi_bytes_P4": 16934400,
+    "one_q_ibz_chi_bytes_P4": 3292800
+  },
+  {
+    "mu_left": 196,
+    "mu_right": 196,
+    "one_G_bytes_P4": 88510464,
+    "two_G_bytes_P4": 177020928,
+    "one_full_q_chi_bytes_P4": 5531904,
+    "one_q_ibz_chi_bytes_P4": 1075648
+  }
+]
