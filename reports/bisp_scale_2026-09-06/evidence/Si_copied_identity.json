@@ -1,0 +1,12 @@
+{
+  "eqp0.dat": {
+    "returncode": 0,
+    "report": "A            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_scale_scalar_2026-09-06/04_bisp_tip_copied/eqp0.dat\nB            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_scale_scalar_2026-09-06/05_main_copied/eqp0.dat\nrows         224 over 8 k-points\nidentical    224/224 E_qp rows agree to the printed digit\nmax|dE_DFT|  0.000 ueV   (must be 0 for two arms of one deck)\nmax|dE_qp|   0.000 ueV   at None\nVERDICT      PASS  (tolerance 0.0 ueV)\n",
+    "max_uev": 0.0
+  },
+  "eqp1.dat": {
+    "returncode": 0,
+    "report": "A            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_scale_scalar_2026-09-06/04_bisp_tip_copied/eqp1.dat\nB            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_scale_scalar_2026-09-06/05_main_copied/eqp1.dat\nrows         224 over 8 k-points\nidentical    224/224 E_qp rows agree to the printed digit\nmax|dE_DFT|  0.000 ueV   (must be 0 for two arms of one deck)\nmax|dE_qp|   0.000 ueV   at None\nVERDICT      PASS  (tolerance 0.0 ueV)\n",
+    "max_uev": 0.0
+  }
+}

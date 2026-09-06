@@ -50,7 +50,7 @@
 
 | Scalar non-regression | P source | F source | Class | State | Run |
 |---|---|---|---|---|---|
-| Si leg20 P4 | fe2a6937 | d3d4b03a | own-fit numeric residual reported; exact requested | detached queued | runs/Si/100_bisp_scale_scalar_2026-09-06/03_pair |
+| Si leg20 P4 | fe2a6937 | d3d4b03a | copied ζ: exact PASS; own-fit control running | measured copied pair | runs/Si/100_bisp_scale_scalar_2026-09-06/03_pair |
 | Na8×8×8 P16 | fe2a6937 | d3d4b03a | own-fit numeric residual reported; exact requested | detached queued | runs/Na/16_bisp_scale_scalar_2026-09-06/03_pair |
 
 | 9×9 arm | P/F total s | Screening P/F s | Sigma P/F s | Compiles P/F | Class | Step / path |
@@ -99,3 +99,14 @@
 | Na historical03 P16 |19.43|screening176.31|33.90|391.73 /29.65|675.15|reference receipt|reference|runs/Na/15_psi_irr_parents_only_2026-09-05/03_p16_packed_order|
 | Na historical04 P16 |19.24|screening173.79|34.50|383.90 /28.49|672.65|461|reference|57955934/lx-Xg4-165800-844150-6998; runs/Na/15_psi_irr_parents_only_2026-09-05/04_p16_repro_coord_ade4fc66|
 | Si planner attribution |—|—|cache12→18 files; rank0 compile agreement201.708s|—|—|gw.sigma_box_plan._rule_cache_lookup / plan_sigma_windows|causation vs current main pending|runs/Si/100_bisp_scale_scalar_2026-09-06/01_bisp_tip_fresh/driver.rank0.log; identity_leg20_freshP.json|
+
+| Si P4 copied ζ, exact | P fe2a6937 | F d3d4b03a | Verdict / scope |
+|---|---:|---:|---|
+| EQP0 / EQP1 printed digits |0 difference|reference|PASS; identity_copied.json|
+| Compile events / compiler s |438 /28.19|438 /28.21|parity|
+| χ0 / W s |4.41 /3.92|4.35 /3.89|combined8.33/8.24, +1.1%|
+| τ / other Σ s |14.53 /20.90|14.27 /21.28|combined35.43/35.55, −0.3%|
+| Rule planning s |609.99|0.61|cold rebuild versus compatible30-step cache; not a source timing comparison|
+| Whole wall s |672.77|62.53|excluded from source-speed verdict because rule-cache states differ|
+| Step / artifact |57988457/lx-Xg4-144241-1236696-5495 exit0|zero GPU overlaps|runs/Si/100_bisp_scale_scalar_2026-09-06/{04_bisp_tip_copied,05_main_copied}; claim below|
+| Legacy rule-cache incompatibility |12 entries stamped−1|deck requests30|sigma_box_plan.py:271–277 correctly rejects both sources; KNOWN_SANDBOX_ERRORS.md; D/scalar_rule_cache_delta.json|
