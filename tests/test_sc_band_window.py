@@ -39,10 +39,11 @@ class _RecordingWfn:
         self.calls = []
         self.nk = nk
         self.ngkmax = ngkmax
+        self.domain = "ibz"
 
     def load(self, *, bands, k, sharding=None, bispinor=False,
              bispinor_lift="raw"):
-        assert k == "ibz"
+        assert k == self.domain
         del sharding, bispinor, bispinor_lift
         self.calls.append((int(bands[0]), int(bands[1])))
         nb = int(bands[1]) - int(bands[0])
@@ -50,7 +51,7 @@ class _RecordingWfn:
             (self.nk, nb, 1, self.ngkmax), dtype=jax.numpy.complex128)
 
     def box_index(self, *, k):
-        assert k == "ibz"
+        assert k == self.domain
         return np.zeros((self.nk, self.ngkmax, 3), dtype=np.int32)
 
     def box_index_dev(self, *, k, mesh):
@@ -62,6 +63,7 @@ class _Inputs:
     def __init__(self, band_slices, nb_carry, nk=2):
         self.band_slices = band_slices
         self.wfn = _RecordingWfn(nk=nk)
+        self.sym = types.SimpleNamespace(parent_k_domain="ibz")
         self.mesh_xy = object()
         self.config = types.SimpleNamespace(
             bispinor=False, bispinor_gw=None)
@@ -142,3 +144,14 @@ def test_run_sc_driver_refuses_b0_nonzero():
             material_class="insulator",
             tensors_filename="unused-before-b0-refusal.h5",
             enk_dft=np.zeros((2, 32)), print_fn=lambda *a, **k: None)
+
+
+def test_psi_sphere_cache_separates_raw_and_unreduced_parent_domains():
+    """The same loader must reload full-k states when the computational group becomes trivial."""
+    sc_iteration._PSI_G_CACHE.clear()
+    inp = _Inputs(_slices(0, 8), nb_carry=8)
+    sc_iteration._dft_psi_sphere(inp)
+    inp.sym.parent_k_domain = inp.wfn.domain = "full_bz"
+    sc_iteration._dft_psi_sphere(inp)
+    assert inp.wfn.calls == [(0, 8), (0, 8)]
+    sc_iteration._PSI_G_CACHE.clear()

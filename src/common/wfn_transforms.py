@@ -2105,7 +2105,7 @@ def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=None):
     band_lo = int(bandrange[0])
     band_hi = int(bandrange[1])
     nb = band_hi - band_lo
-    irk_to_k = np.asarray(sym.irr_idx_k)
+    irk_to_k = np.asarray(wfn.symmetry().irr_idx_k)
     # Handle file-short case (band_hi > nbnd in WFN.h5): read what's
     # available, sentinel-fill the rest so f_n=step(E_F-e)=0 for padded
     # bands.  Using a finite "max(real e) + 1 Ry" instead of ∞ keeps

@@ -2276,6 +2276,41 @@ def unfold_psi(
 
 
 class SymMaps:
+    def trivial_view(self):
+        """Restrict the computational group to identity over loader-unfolded full-k parents."""
+        from copy import copy
+        identity = np.flatnonzero(
+            np.all(self.sym_matrices == np.eye(3, dtype=int), axis=(1, 2))
+            & np.all(np.isclose(self.translations, 0, atol=1e-12), axis=1))
+        if identity.size != 1:
+            raise ValueError("SymMaps trivial view requires one authenticated identity row")
+        row = int(identity[0])
+        spatial = len(self.sym_matrices)
+        view = copy(self)
+        for name in ("sym_matrices", "translations", "R_grid", "Rinv_grid", "U_spinor"):
+            setattr(view, name, np.asarray(getattr(self, name))[[row]].copy())
+        for name in ("sym_mats_k", "R_cart"):
+            setattr(view, name, np.asarray(getattr(self, name))[[row, row + spatial]].copy())
+        view.active_symmetry_rows = np.array([0], dtype=np.int32)
+        view._sym_row_ids_search = view.active_symmetry_rows.copy()
+        view._sym_mats_k_search = view.sym_mats_k[:1].copy()
+        # The source object's measured verdict is unchanged; this view selects no TR action.
+        view.trs_allowed = False
+        view.qe_operation_antiunitary = np.array([False])
+        view.qe_antiunitary_rows = np.empty(0, dtype=np.int32)
+        rows = np.arange(self.nk_tot, dtype=np.int32)
+        view.irr_idx_k = rows.copy()
+        view.kirr_fullids = rows.copy()
+        view.sym_idx_k = np.zeros_like(rows)
+        view.nk_red = self.nk_tot
+        view.irr_idx_q = rows.copy()
+        view.q_irr_full_idx = rows.copy()
+        view.sym_idx_q = np.zeros_like(rows)
+        view.q_irr_kgrid_int = self.kvecs_asints.copy()
+        view.kq_map = self.kqfull_map.copy()
+        view.parent_k_domain = "full_bz"
+        return view
+
     def __init__(self, wfn, *, allow_trs=None):
         """
         Initialize symmetry mappings for a given WFN file.
@@ -2327,6 +2362,7 @@ class SymMaps:
                 "explicit boolean from WfnLoader; got "
                 f"{verdict!r}. Missing verdicts no longer default to True.")
         self.trs_allowed = bool(verdict)
+        self.parent_k_domain = "ibz"
 
         # WFN.h5 omits QE's per-operation antiunitary bit.  WfnLoader
         # attaches a receipt only after a nearby QE schema has matched the

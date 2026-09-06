@@ -226,7 +226,7 @@ def _result_matrix_diag(results: GWResults, name: str):
 
 
 def sigma_table_to_file_wedge(
-    sym, table, *, source_kset: str, k_axis: int = 0,
+    sym, table, *, source_kset: str, k_axis: int = 0, file_sym=None,
 ) -> np.ndarray:
     """Put a tagged Sigma/result table on the WFN file wedge.
 
@@ -247,7 +247,8 @@ def sigma_table_to_file_wedge(
     elif source_kset != SIGMA_KSET_FULL_BZ:
         raise ValueError(
             f"sigma_table_to_file_wedge: unknown k-set {source_kset!r}")
-    values = np.asarray(reduce_full_bz_to_file_wedge(sym, values))
+    values = np.asarray(reduce_full_bz_to_file_wedge(
+        sym if file_sym is None else file_sym, values))
     return np.moveaxis(values, 0, k_axis) if k_axis else values
 
 
@@ -745,6 +746,7 @@ def write_freq_debug(
     head_sigma_diag_w_kn_ry,
     omega_grid_ry,
     sym,
+    file_sym=None,
     e_eval_ev=None,
     print_fn=print,
 ):
@@ -991,13 +993,14 @@ def write_freq_debug(
     from symmetry_maps import reduce_full_bz_to_file_wedge
     _cols = [
         (name, sigma_table_to_file_wedge(
-            sym, arr, source_kset=results.sigma_kset))
+            sym, arr, source_kset=results.sigma_kset, file_sym=file_sym))
         for name, arr in _cols
     ]
     write_sigma_freq_debug_table(
         config.debug.sigma_freq_debug_file, _cols,
         kpoints_crys=np.asarray(reduce_full_bz_to_file_wedge(
-            sym, np.asarray(sym.unfolded_kpts, dtype=np.float64))),
+            sym if file_sym is None else file_sym,
+            np.asarray(sym.unfolded_kpts, dtype=np.float64))),
         metadata=_photon_head_metadata)
     print_fn(f"  Sigma freq debug: {config.debug.sigma_freq_debug_file}")
 
@@ -1638,7 +1641,7 @@ def write_results(
     def _wedge(a):
         """The result's tagged k-set -> file wedge, through the service."""
         return sigma_table_to_file_wedge(
-            sym, a, source_kset=results.sigma_kset)
+            sym, a, source_kset=results.sigma_kset, file_sym=wfn.symmetry())
 
     def _wedge_sectors(a):
         """Apply the canonical k reduction to each Lorentz sector."""
@@ -1648,7 +1651,7 @@ def write_results(
     # reduction, so the coordinates and the rows cannot disagree about
     # which k they are: one selection applied twice.
     kpts_irr = np.asarray(reduce_full_bz_to_file_wedge(
-        sym, np.asarray(sym.unfolded_kpts, dtype=np.float64)))
+        wfn.symmetry(), np.asarray(sym.unfolded_kpts, dtype=np.float64)))
 
     # ── THE STAR SPREAD IS MEASURED HERE, BECAUSE HERE IS WHERE IT EXISTS ─
     # ``_star_spread`` (tests/harness.py) is the worst per-band
@@ -1977,9 +1980,9 @@ def write_results(
             kpoints_crys=np.asarray(sym.unfolded_kpts, dtype=np.float64),
             nkx=nkx, nky=nky, nkz=nkz,
             kpoints_reduced=kpts_irr,
-            kirr_to_kfull=np.asarray(sym.kirr_fullids, dtype=np.int32),
+            kirr_to_kfull=np.asarray(wfn.symmetry().kirr_fullids, dtype=np.int32),
             k_storage=str(qp_rotations_k_storage),
-            star_tables=_sm.star_tables_of(sym),
+            star_tables=_sm.star_tables_of(wfn.symmetry()),
             source_wfn=wfn,
             print_fn=print_fn,
             **provenance,

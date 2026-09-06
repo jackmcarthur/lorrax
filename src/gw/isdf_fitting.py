@@ -972,7 +972,7 @@ def fit_zeta_to_h5(
         # Parent route: the r-chunk kernel contracts on the WFN's raw rows
         # and never needs a full-k ψ(G) or ψ(r); the store is 1/(nk/n_parent)
         # of its full-k size and so is the hoisted ψ(r) cache below.
-        k_domain="ibz",
+        k_domain=k_unfold_plan.sym.parent_k_domain,
     )
     # The parent route streams orbit-closed real-grid TILES, not contiguous
     # slabs; every tile has one static width <= the planner's chunk_r, so the

@@ -842,13 +842,17 @@ def _unfold_bse_parent_faces(faces, restart_file, input_file, mesh_xy):
     path = str(params.get("centroids_file", "centroids_frac.txt"))
     if not os.path.isabs(path):
         path = os.path.join(os.path.dirname(os.path.abspath(input_file)), path)
-    idx = load_centroid_basis(path, wfn.fft_grid, sym=sym).centroid_indices
+    centroids = load_centroid_basis(path, wfn.fft_grid, sym=sym)
+    idx = centroids.centroid_indices
     if digest != centroid_table_md5(idx):
         raise ValueError("BSE parent restart centroid content does not match its deck")
+    if not centroids.orbit_closed or (
+            np.array_equal(rows, np.arange(sym.nk_tot)) and sym.nk_red != sym.nk_tot):
+        sym = sym.trivial_view()
     basis = PackedCentroidBasis.build(idx, sym, wfn.fft_grid, mesh_xy)
     plan = build_centroid_k_unfold_plan(
         sym, idx, wfn.fft_grid, mesh_xy, nspinor=faces[0].shape[2],
-        parent_k_frac=wfn.kpoints, layout=basis.layout)
+        parent_k_frac=wfn.kvecs(k=sym.parent_k_domain), layout=basis.layout)
     if not np.array_equal(rows, plan.parent_full_rows):
         raise ValueError("BSE parent restart rows do not match the authenticated file wedge")
     spec = P(None, None, None, "x")

@@ -598,14 +598,18 @@ The test-only `LORRAX_EXTRA_MU_PAD` knob still sizes the canonical carrier
 `PackedCentroidBasis.solve_axis` supplies the solve receipt; the loader and
 q-table construction consume that basis's extent without padding it again.
 Bispinor charge and current families now use the same orbit-packed owner.
-The mandatory parent plan requires centroid closure under its typed actions;
-an identity packing layout does not waive that requirement. The former
-full-k fallback for non-closed sets was deleted with the full-k carrier.
-This removes support for the historical non-closed 60-centroid COHSEX
-fixture: final landing claim1282 refuses before fitting, whereas fixed-main
-and scalar ade4fc66 controls pass unchanged. This is an open compatibility
-limitation, not numerical agreement or a reason to refreeze that oracle.
-Trivial typed actions remain valid on an identity layout.
+The mandatory parent plan requires closure under its computational typed actions.
+For a nonclosed charge or current centroid set, the driver selects one
+`SymMaps.trivial_view()` before building either packed basis or q policy.
+The same parent kernels then consume loader-unfolded full-k states as parents
+(`n_parent = nk`), and every q row is unreduced. A warning names the original
+centroid file and recommends orbit-closed kmeans. The original loader keeps
+its authenticated symmetry for G-sphere unfolding, file energies and file-wedge
+serialization; the computational view does not change the WFN's physical
+symmetry verdict. Historical centroid sets are not regenerated. The deleted
+full-k kernels remain deleted. This owner ruling supersedes the earlier
+nonclosed-centroid refusal (claims1282/1300); measured restoration is tracked
+in the bispinor parent-route report.
 
 ## 2026-08-18 — ζ band chunks default to 16; zero opts into the planner
 

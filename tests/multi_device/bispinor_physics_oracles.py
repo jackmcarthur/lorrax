@@ -186,11 +186,11 @@ def test_all_16_chi_blocks_nonzero_ct_literal_both_orientations(monkeypatch):
     for a in range(4):
         for b in range(4):
             kernel = _get_chi_minimax_kernel(mesh, (3,3,1), layout='face',
-                face_shape=(9,4,4,4), right_face_shape=(9,4,6,4), vertex_pair=(a,b))
+                face_shape=(9,4,4,4), right_face_shape=(9,4,6,4), vertex_pairs=((a,b),))
             actual = kernel(nodes, mun, nmu, jnp.asarray(energies < 0),
                 jnp.asarray(energies > 0), jnp.asarray(energies), jnp.array(-.7), jnp.array(.4),
-                (jnp.argmax(jnp.abs(gamma[a]),axis=1), jnp.conj(jnp.sum(gamma[a],axis=1)),
-                 jnp.argmax(jnp.abs(gamma[b]),axis=1), jnp.conj(jnp.sum(gamma[b],axis=1))))
+                ((jnp.argmax(jnp.abs(gamma[a]),axis=1), jnp.conj(jnp.sum(gamma[a],axis=1)),
+                 jnp.argmax(jnp.abs(gamma[b]),axis=1), jnp.conj(jnp.sum(gamma[b],axis=1))),))[0]
             np.testing.assert_allclose(actual, expected[a,b], rtol=3e-12, atol=3e-12,
                                        err_msg=f'Lorentz block {(a,b)}')
 
@@ -228,7 +228,7 @@ def _literal_children(parent, plan):
 def test_parent_sigma_all_vertices_q_convolution_and_projection(monkeypatch):
     """Production parent Sigma equals literal -sum_q Gamma_A G(k-q) Gamma_B D_AB/Nk."""
     from gw.wavefunction_bundle import ParentGreenCarrier
-    from gw.photon_sigma import _make_photon_static_block_kernel
+    from gw.photon_sigma import _make_photon_static_class_kernel
     from common.gamma_matrices import gamma_perm_phase
     _cpu_algebra(monkeypatch)
     mesh = _mesh()
@@ -254,20 +254,31 @@ def test_parent_sigma_all_vertices_q_convolution_and_projection(monkeypatch):
         for q, qv in enumerate(np.ndindex(3,3,1)):
             km = np.ravel_multi_index((np.array(kv)-qv)%[3,3,1],(3,3,1))
             bare[k] -= green[km]*interaction[q][None,:,None,:]/9
-    for a in range(4):
-        for b in range(4):
-            sigma = np.einsum('ac,kcmdv,db->kambv',gamma[a],bare,gamma[b])
-            full = np.einsum('kiam,kambv,kjbv->kij',child.conj(),sigma,child)
-            kernel = _make_photon_static_block_kernel(mesh,(3,3,1),9,wfns,wfns)
-            actual = kernel(carrier,carrier,jnp.asarray(weight),
-                            put(interaction,P(None,'x','y')),jnp.array(1.),
-                            (gamma_perm_phase(a),gamma_perm_phase(b)))
-            np.testing.assert_allclose(actual,full[plan.parent_full_rows],
-                                       rtol=3e-12,atol=3e-12,err_msg=f'Sigma {(a,b)}')
-            coh = kernel(carrier,carrier,jnp.asarray(weight),
-                        put(interaction,P(None,'x','y')),jnp.array(-.5),
-                        (gamma_perm_phase(a),gamma_perm_phase(b)))
-            np.testing.assert_allclose(coh,-.5*full[plan.parent_full_rows],rtol=3e-12,atol=3e-12)
+    for aa, bb in (((0,), (0,)), ((0,), (1,2,3)), ((1,2,3), (0,)), ((1,2,3), (1,2,3))):
+        keys = [(a,b) for a in aa for b in bb]
+        full = np.zeros((9,4,4), complex)
+        head_full = np.zeros_like(full)
+        blocks, heads = [], []
+        for a,b in keys:
+            scale = (1+.2*a-.1*b) + .3j*(a-b)
+            blocks.append(scale*interaction)
+            head = np.zeros_like(interaction)
+            head[0] = scale*interaction[0]
+            heads.append(head)
+            sigma = np.einsum('ac,kcmdv,db->kambv',gamma[a],scale*bare,gamma[b])
+            full += np.einsum('kiam,kambv,kjbv->kij',child.conj(),sigma,child)
+            hs = np.einsum('ac,kcmdv,db->kambv',gamma[a],
+                -green*head[0][None,None,:,None,:]/9,gamma[b])
+            head_full += np.einsum('kiam,kambv,kjbv->kij',child.conj(),hs,child)
+        kernel = _make_photon_static_class_kernel(mesh,(3,3,1),9,wfns,wfns,with_head=True)
+        vertices = jax.tree.map(lambda *x:jnp.stack(x),
+            *((gamma_perm_phase(a),gamma_perm_phase(b)) for a,b in keys))
+        for factor in (1.,-.5):
+            actual, actual_head = kernel(carrier,carrier,jnp.asarray(weight),
+                put(np.array(blocks),P(None,None,'x','y')),jnp.array(factor),vertices,
+                put(np.array(heads),P(None,None,'x','y')))
+            np.testing.assert_allclose(actual,factor*full[plan.parent_full_rows],rtol=3e-12,atol=3e-12,err_msg=f'Sigma {keys}')
+            np.testing.assert_allclose(actual_head,factor*head_full[plan.parent_full_rows],rtol=3e-12,atol=3e-12)
 
 
 def test_bare_tiles_metric_sign_and_complex_hermitian_companions(monkeypatch):
@@ -405,7 +416,12 @@ def test_q_star_unfold_all_blocks_ward_contact_and_daggers():
     packed = pack_photon_operator(lambda a,b:jnp.asarray(d[:,a*nmu:(a+1)*nmu,b*nmu:(b+1)*nmu]),nq,layout,mesh)
     response = StaticPhotonResponse(layout,packed,packed,'none','toy',qgrid_policy=policy,family_plans=(plan,plan))
     keys = [(a,b) for a in range(4) for b in range(4)]
-    restored = dict(photon_blocks_full_q(response,keys,term='W'))
+    restored = {}
+    for a,b in ((0,0),(0,1),(1,0),(1,1)):
+        selected = [key for key in keys if tuple(map(bool,key)) == (bool(a),bool(b))]
+        if selected:
+            restored.update(photon_blocks_full_q(response.W_packed,selected,layout=response.layout,
+                family_plans=response.family_plans,qgrid_policy=response.qgrid_policy))
     qfrac = bgw_integer_q_to_fractional(sym.q_irr_kgrid_int,(3,3,1))
     for q,(p,row) in enumerate(zip(sym.irr_idx_q,policy.unfold_sym_idx)):
         perm = plan.sym_perm[row]
@@ -443,22 +459,27 @@ def test_parent_chi_equals_literal_full_k_for_all_16_blocks(monkeypatch):
         alpha=jnp.array([-np.exp(-.2*1.1)],dtype=jnp.complex128))
     mun = jax.device_put(parent.transpose(0,2,3,1),NamedSharding(mesh,P(None,None,'x','y')))
     nmu = jax.device_put(parent,NamedSharding(mesh,P(None,'x',None,'y')))
-    for a in range(4):
-        for b in range(4):
-            shape = (plan.n_parent,4,plan.n_centroid_packed,4)
-            kernel = _get_chi_minimax_kernel(mesh,(3,3,1),layout='face',face_shape=shape,
-                right_face_shape=shape,vertex_pair=(a,b),k_unfold_plan=(plan,plan))
-            actual = kernel(nodes,mun,nmu,jnp.asarray(energy<0),jnp.asarray(energy>0),
-                            jnp.asarray(energy),jnp.array(-.7),jnp.array(.4),
-                            (jnp.argmax(jnp.abs(_gamma()[0][a]),axis=1), jnp.conj(jnp.sum(_gamma()[0][a],axis=1)),
-                             jnp.argmax(jnp.abs(_gamma()[0][b]),axis=1), jnp.conj(jnp.sum(_gamma()[0][b],axis=1))))
-            np.testing.assert_allclose(actual,expected[a,b],rtol=3e-12,atol=3e-12)
+    gamma = _gamma()[0]
+    for left_vertices in ((0,), (1, 2, 3)):
+        for right_vertices in ((0,), (1, 2, 3)):
+            pairs = tuple((a, b) for a in left_vertices for b in right_vertices)
+            shape = (plan.n_parent, 4, plan.n_centroid_packed, 4)
+            kernel = _get_chi_minimax_kernel(mesh, (3, 3, 1), layout='face', face_shape=shape,
+                right_face_shape=shape, vertex_pairs=pairs, k_unfold_plan=(plan, plan))
+            operands = tuple((jnp.argmax(jnp.abs(gamma[a]), axis=1),
+                              jnp.conj(jnp.sum(gamma[a], axis=1)),
+                              jnp.argmax(jnp.abs(gamma[b]), axis=1),
+                              jnp.conj(jnp.sum(gamma[b], axis=1))) for a, b in pairs)
+            actual = kernel(nodes, mun, nmu, jnp.asarray(energy < 0), jnp.asarray(energy > 0),
+                            jnp.asarray(energy), jnp.array(-.7), jnp.array(.4), operands)
+            for (a, b), block in zip(pairs, actual):
+                np.testing.assert_allclose(block, expected[a, b], rtol=3e-12, atol=3e-12)
 
 
 def test_full_band_unfold_matches_literal_sigma_on_symmetric_complete_toy(monkeypatch):
     """A complete occupied toy gives a covariant, non-diagonal band Sigma on every child."""
     from gw.wavefunction_bundle import ParentGreenCarrier
-    from gw.photon_sigma import _make_photon_static_block_kernel
+    from gw.photon_sigma import _make_photon_static_class_kernel
     from common.gamma_matrices import gamma_perm_phase
     from symmetry_maps import unfold_file_wedge_band_operator
     _cpu_algebra(monkeypatch)
@@ -482,9 +503,9 @@ def test_full_band_unfold_matches_literal_sigma_on_symmetric_complete_toy(monkey
     child = _literal_children(raw,plan)
     parent_sigma = None
     for a,scale in ((1,-1.),(2,-1.),(3,-2.)):
-        kernel = _make_photon_static_block_kernel(mesh,(3,3,1),9,wfns,wfns)
-        value = kernel(carrier,carrier,jnp.ones((9,nb)),put(scale*interaction,P(None,'x','y')),jnp.array(1.),
-                       (gamma_perm_phase(a),gamma_perm_phase(a)))
+        kernel = _make_photon_static_class_kernel(mesh,(3,3,1),9,wfns,wfns)
+        value = kernel(carrier,carrier,jnp.ones((9,nb)),put(scale*interaction[None],P(None,None,'x','y')),jnp.array(1.),
+                       jax.tree.map(lambda x:x[None],(gamma_perm_phase(a),gamma_perm_phase(a))))
         parent_sigma = value if parent_sigma is None else parent_sigma+value
     actual = unfold_file_wedge_band_operator(plan.sym,parent_sigma,trs_rule='transpose')
     # G=identity on the complete occupied spin/centroid space; alpha_i^2=I.
@@ -597,6 +618,8 @@ def test_sigma_oracle_rejects_transposed_gamma2(monkeypatch):
     def wrong(value, perm, phase, *, axis):
         return original(value, perm, jnp.conj(phase), axis=axis)
     monkeypatch.setattr(gamma, 'gamma_apply', wrong)
+    from gw.cohsex_sigma import _static_convolution_cache
+    _static_convolution_cache.clear()
     with pytest.raises(AssertionError,match='Sigma'):
         test_parent_sigma_all_vertices_q_convolution_and_projection(monkeypatch)
 
@@ -646,7 +669,7 @@ def test_wrapper_selects_v_w_difference_fractional_occupations_and_sum_window(mo
             assert head is None and l is left.green_parent and r is right.green_parent
             return jnp.sum(interaction)*jnp.sum(weights*jnp.array([2.,3.,5.,7.]))*factor
         return kernel
-    monkeypatch.setattr(owner,'_make_photon_static_block_kernel',factory)
+    monkeypatch.setattr(owner,'_make_photon_static_class_kernel',factory)
     qfrac = bgw_integer_q_to_fractional(plan.sym.q_irr_kgrid_int,(3,3,1))
     keys = [(0,0),(0,2),(2,0),(1,3)]
     for term, source in enumerate((v,w,w-v)):
@@ -660,7 +683,7 @@ def test_wrapper_selects_v_w_difference_fractional_occupations_and_sum_window(mo
             np.testing.assert_array_equal(weights,expected_weights)
             assert factor == (1.,1.,-.5)[term]
             for index,(perm,phase) in zip((a,b),vertices):
-                np.testing.assert_array_equal(np.asarray(phase)[:,None]*np.eye(4)[np.asarray(perm)],gamma[index])
+                np.testing.assert_array_equal(np.asarray(phase)[0,:,None]*np.eye(4)[np.asarray(perm)[0]],gamma[index])
             expected = full[:,a*nmu:(a+1)*nmu,b*nmu:(b+1)*nmu].sum()*np.sum(expected_weights*[2.,3.,5.,7.])*(1.,1.,-.5)[term]
             np.testing.assert_allclose(actual,expected,rtol=3e-12,atol=3e-12)
 
