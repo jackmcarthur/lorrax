@@ -24,3 +24,7 @@ BISP-PROF-S candidate manifests inherit the donor source.commit and sometimes it
 ### 2026-09-06 BISP-PROF-S shape scan: allocation discovery timed out
 
 The authorized named fallback `LX_ALLOC_MATCH=lx-alloc-jackm-BISP-PROF-S LX_ALLOC_NAME=lx-alloc-jackm-BISP-PROF-S lx alloc -N 1 --time 04:00:00` exited3 before allocation: Slurm `squeue --me ...` timed out three times at15s. This is not a QOS refusal. Evidence: `runs/MoS2/42_bisp_scale_2026-09-06/prof_s/allocation_retry_01.log`; the existing P4 scan leg remains queued on authorized57982945. Retrying the named allocation only; another lane's pool is not used.
+
+### 2026-09-06 BISP-PROF-S: native gate wrapper permission (corrected in a new variant)
+
+`prof_s/10_P_scan_oracles` copied a non-executable `driver.sh` from the older gate but invoked it directly through rankwrap. JID57982945 step `lx-Xg4-120420-417822-9746` exited126 before Python ran. Evidence: `runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/driver.1.log`. New variant12 invokes the payload explicitly with bash; failed10 is preserved.

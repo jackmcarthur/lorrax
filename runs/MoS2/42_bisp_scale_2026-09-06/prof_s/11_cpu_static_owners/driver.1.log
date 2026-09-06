@@ -1,0 +1,12 @@
+[lx] using named allocation JID 57982945 [--jid]
+[lxrun] JID 57982945 · 4 nodes · 2:00:56 left · 0/16 GPUs free · incoming: lx-?
+  1  nid001064 [0/4 gpu]  busy   lx-Xg4-115145-274730-9627 6m     started 11:51  ← starting lx-?
+  2  nid001065 [0/4 gpu]  busy   lx-Xg4-115721-363470-4113 (+1) 43s    started 11:57
+        └ lx-Xg4-115721-277816-1303    43s    started 11:57
+  3  nid001068 [0/4 gpu]  busy   lx-Xg4-115727-360762-3502 36s    started 11:57
+  4  nid001128 [0/4 gpu]  busy   lx-Xg4-115742-274518-7011 24s    started 11:57
+[lx] zero-GPU step: --gres=none, no GPU selector, and this leg is charged 0 GPUs by the pool, so it does not queue behind GPU work. Set JAX_PLATFORMS=cpu in the payload if it uses JAX.
+[lx] source tree: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src  [cwd checkout]
+[lx] runtime import origin: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py  [PYTHONPATH head; runtime.bootstrap attests the actual import]
+[rankwrap] rank=0 host=nid001064 src=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+[lx] step lx-Xg0-115808-380235-8363 exit 0 in 19 s
