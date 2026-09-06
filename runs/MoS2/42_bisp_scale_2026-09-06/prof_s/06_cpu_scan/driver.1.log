@@ -1,0 +1,16 @@
+[lx] using named allocation JID 57982945 [--jid]
+lx_pool: timeout running squeue -j 57982945 --noheader -o '%i|%j|%N|%L' (attempt 1/3)
+lx_pool: timeout running squeue -j 57982945 --noheader -o '%i|%j|%N|%L' (attempt 2/3)
+[lxrun] JID 57982945 · 4 nodes · 2:13:57 left · 0/16 GPUs free · incoming: lx-?
+  1  nid001064 [0/4 gpu]  busy   lx-Xg4-114116-198027-8038 3m     started 11:41  ← starting lx-?
+  2  nid001065 [0/4 gpu]  busy   lx-Xg4-114116-198027-8038 3m     started 11:41
+  3  nid001068 [0/4 gpu]  busy   lx-Xg4-114116-198027-8038 3m     started 11:41
+  4  nid001128 [0/4 gpu]  busy   lx-Xg4-114116-198027-8038 3m     started 11:41
+[lx] zero-GPU step: --gres=none, no GPU selector, and this leg is charged 0 GPUs by the pool, so it does not queue behind GPU work. Set JAX_PLATFORMS=cpu in the payload if it uses JAX.
+[lx] source tree: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src  [cwd checkout]
+[lx] runtime import origin: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py  [PYTHONPATH head; runtime.bootstrap attests the actual import]
+[rankwrap] rank=0 host=nid001064 src=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+srun: error: nid001064: task 0: Exited with exit code 1
+srun: Terminating StepId=57982945.144
+[lx] step lx-Xg0-114509-284511-9392 exit 1 in 52 s
+[lx] nonzero exit — judge by artifacts, not the code (rc=134 has been seen on runs whose outputs were correct)
