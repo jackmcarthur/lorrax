@@ -1,7 +1,7 @@
 ==============================================================================
 LORRAX GW CALCULATION
 ==============================================================================
-Input          : /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/mpa_sc1.in
+Input          : /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/mpa_sc1.in
 Method         : mpa / self_consistent
   [config provenance] mpa_sampling_alpha = 1 (deck)
 [config provenance] linalg = local (deck)
@@ -42,7 +42,7 @@ CRYSTAL SYMMETRY AND BRILLOUIN-ZONE SAMPLING
 --------------------------------------------
 Real-space action: r' = R^-1 r + tau
 Spatial group   : 2 operations; 0 with fractional translations
-QE schema      : FOUND data-file-schema.xml at /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/data-file-schema.xml
+QE schema      : FOUND data-file-schema.xml at /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/data-file-schema.xml
 QE schema hash : SHA256 4f472860e747
 Stored QE type : 2 unitary; 0 composed with time reversal
 Active op rows : 2 unitary; 2 TR-composed
@@ -73,80 +73,78 @@ Loaded ISDF psi: 1-7
 Band carrier    : 1-8 (1 zero-pad rows)
 zeta fit       : left 1-3; right 1-8
   SC: mode=mpa, max_iter=2, tol=5.0e-01 eV, accel=linear, exact_degeneracy_tol=1.0e-04 eV, tail_fit=frontier, buffer=0/edge, buffer_mode=diagonal, α=1.00
-  SC map 0 (identity, mu-anchored) partition: protected at all k bands=[1, 2]; protected 2/3 (k,state)
-  SC map 0 (identity, mu-anchored) partition k=0: protected identities=[1, 2], sorted columns=[1, 2]; scissored sorted columns=[3]
-  SC fixed quadrature: iteration=1, initialized=True, rebuilds_this_iteration=0, rebuilds_total=0, pair_cost=23, initial_pair_cost=23, max_state_pad=3.498 eV (energy-proportional), pole_pad=10.0%
-    SC fixed window: ω≥E_F cond:pole_tail: n_tau=6, nodes=85ebee211265281a, cache=init:hit:rule_bdfc6eef4b28725b.npz, box=(-57.71507340645424, -10.336030727673881, 0.25019299323562044, 14.967081683355612) eV, padded_box=(-63.98060556104214, -8.67611072172882, 0.25017369391205835, 16.438789851691176) eV, sup=0.000975068/0.001 (relative), kappa_max=1.55276, noise=9.31345e-08/5e-05
-    SC fixed window: ω≥E_F val:bulk: n_tau=6, nodes=1ed04a2cab0b3e92, cache=init:hit:rule_2b6c14c096908363.npz, box=(22.78569524760494, 46.782182889970095, 0.25019299323562044, 14.967081683355612) eV, padded_box=(21.12577524165988, 50.799392444902686, 0.25017369391205835, 16.438789851691176) eV, sup=0.00072791/0.001 (relative), kappa_max=1.77095, noise=1.06313e-07/5e-05
-    SC fixed window: ω<E_F cond:bulk: n_tau=6, nodes=6dd7ea00cf60d850, cache=init:hit:rule_6459192b9c9d9407.npz, box=(-69.69507340645424, -23.356030727673883, 0.25019299323562044, 14.967081683355612) eV, padded_box=(-75.96060556104213, -21.69611072172882, 0.25017369391205835, 16.438789851691176) eV, sup=0.000922606/0.001 (relative), kappa_max=1.51331, noise=9.07933e-08/5e-05
-    SC fixed window: ω<E_F val:pole_tail: n_tau=5, nodes=49cd776d653987de, cache=init:hit:rule_e0beb496ca1c5ecb.npz, box=(10.805695247604943, 33.76218288997009, 0.25019299323562044, 14.967081683355612) eV, padded_box=(9.145775241659882, 37.77939244490268, 0.25017369391205835, 16.438789851691176) eV, sup=0.000808253/0.001 (relative), kappa_max=1.51501, noise=9.09382e-08/5e-05
-Started Sigma tau sweep at 22:34:18.
-[ 22:34:19 | ░░░░░░░░░░ |   4% ] tau node  1 / 23 · ETA 9 s
-[ 22:34:19 | █░░░░░░░░░ |   9% ] tau node  2 / 23 · ETA 5 s
-[ 22:34:19 | █░░░░░░░░░ |  13% ] tau node  3 / 23 · ETA 3 s
-[ 22:34:19 | ██░░░░░░░░ |  17% ] tau node  4 / 23 · ETA 2 s
-[ 22:34:19 | ███░░░░░░░ |  26% ] tau node  6 / 23 · ETA 1 s
-[ 22:34:19 | ███░░░░░░░ |  30% ] tau node  7 / 23 · ETA 1 s
-[ 22:34:19 | ███░░░░░░░ |  35% ] tau node  8 / 23 · ETA 1 s
-[ 22:34:19 | ████░░░░░░ |  39% ] tau node  9 / 23 · ETA 1 s
-[ 22:34:19 | ████░░░░░░ |  43% ] tau node 10 / 23 · ETA 1 s
-[ 22:34:19 | █████░░░░░ |  48% ] tau node 11 / 23 · ETA 0 s
-[ 22:34:19 | ██████░░░░ |  57% ] tau node 13 / 23 · ETA 0 s
-[ 22:34:19 | ██████░░░░ |  61% ] tau node 14 / 23 · ETA 0 s
-[ 22:34:19 | ███████░░░ |  65% ] tau node 15 / 23 · ETA 0 s
-[ 22:34:19 | ███████░░░ |  70% ] tau node 16 / 23 · ETA 0 s
-[ 22:34:19 | ███████░░░ |  74% ] tau node 17 / 23 · ETA 0 s
-[ 22:34:19 | ████████░░ |  78% ] tau node 18 / 23 · ETA 0 s
-[ 22:34:19 | █████████░ |  87% ] tau node 20 / 23 · ETA 0 s
-[ 22:34:19 | █████████░ |  91% ] tau node 21 / 23 · ETA 0 s
-[ 22:34:19 | ██████████ |  96% ] tau node 22 / 23 · ETA 0 s
-[ 22:34:19 | ██████████ | 100% ] tau node 23 / 23 · ETA 0 s
-Finished Sigma tau sweep at 22:34:19.  Elapsed: 1 s.
-SC identity: max |dE| by overlap = 3.640626335e+00 eV (sorted-index value 3.640626335e+00 eV; 0 reassignments at k=0; total=0)
-  SC map energies: /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/eqp0_iter0000.dat
-  SC map eqp1: /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/eqp1_iter0000.dat
-    SC iteration: call=0000 role=linear gap=13.558829513 eV max|dE|=3.640626335e+00 eV active=1-3 protected=1-2 in_range=1-2
-    SC convergence: max|dE| = 3.640626 eV over 2 non-scissored bands (CRITERION, cutoff 0.500000 eV; worst k=0 band=0) | RMS_nonscissored = 3.008113 eV, RMS_all(3) = 2.456114 eV (diagnostics, NOT the criterion) | not converged
-  SC map 1 (identity, mu-anchored) partition: protected at all k bands=[1, 2]; protected 2/3 (k,state)
-  SC map 1 (identity, mu-anchored) partition k=0: protected identities=[1, 2], sorted columns=[1, 2]; scissored sorted columns=[3]
-  SC fixed quadrature: iteration=2, initialized=False, rebuilds_this_iteration=6, rebuilds_total=6, pair_cost=42, initial_pair_cost=23, max_state_pad=3.498 eV (energy-proportional), pole_pad=10.0%
-    SC fixed window: ω≥E_F cond:resonant: n_tau=6, nodes=48765c7fce0ab3c3, cache=rebuild:sc-fixed, box=(-22.108073158586897, -7.113921486413951, 1.8270200045621328, 10.212267859753876) eV, padded_box=(-24.833689132002206, -6.100061482879989, 1.6693180041059195, 11.208494645729262) eV, sup=0.000860472/0.001 (relative), kappa_max=1.5175, noise=9.1086e-08/5e-05
-    SC fixed window: ω≥E_F cond:state_tail: n_tau=5, nodes=70611c671bdf9311, cache=rebuild:sc-fixed, box=(-42.71618612970441, -10.788574405786658, 1.8270200045621328, 10.212267859753876) eV, padded_box=(-47.470049053978116, -9.774714402252696, 1.6693180041059195, 11.208494645729262) eV, sup=0.000891438/0.001 (relative), kappa_max=1.58122, noise=9.48706e-08/5e-05
-    SC fixed window: ω≥E_F cond:pole_tail: n_tau=6, nodes=85ebee211265281a, cache=hit:sc-fixed, box=(-54.5136698593655, -11.205067893676228, 0.2516458662001729, 11.558711779627467) eV, padded_box=(-63.98060556104214, -8.67611072172882, 0.25017369391205835, 16.438789851691176) eV, sup=0.000975068/0.001 (relative), kappa_max=1.55276, noise=9.31345e-08/5e-05
-    SC fixed window: ω≥E_F val:bulk: n_tau=5, nodes=eb159b85b3e4053b, cache=rebuild:sc-fixed, box=(13.040966293216725, 40.07688123940178, 0.2516458662001729, 11.558711779627467) eV, padded_box=(12.003949052617354, 43.399378020898574, 0.25148127958015565, 12.689582957590215) eV, sup=0.00076726/0.001 (relative), kappa_max=1.45783, noise=8.7431e-08/5e-05
-    SC fixed window: ω<E_F cond:bulk: n_tau=5, nodes=95d538a99994890c, cache=rebuild:sc-fixed, box=(-66.58638296070056, -19.496699725588194, 0.2516458662001729, 11.558711779627467) eV, padded_box=(-72.52126497531006, -18.45968248498882, 0.25148127958015565, 12.689582957590215) eV, sup=0.00094515/0.001 (relative), kappa_max=1.43265, noise=8.59899e-08/5e-05
-    SC fixed window: ω<E_F val:resonant: n_tau=7, nodes=fee8ba356f95854f, cache=rebuild:sc-fixed, box=(1.2925386638708045, 15.24669033604375, 1.8270200045621328, 10.212267859753876) eV, padded_box=(0.6462693319354023, 17.388168027204742, 1.6693180041059195, 11.208494645729262) eV, sup=0.000915407/0.001 (relative), kappa_max=1.45892, noise=8.75314e-08/5e-05
-    SC fixed window: ω<E_F val:pole_tail: n_tau=8, nodes=420fc6f9d84ad6ca, cache=rebuild:sc-fixed, box=(5.789334461304757, 26.964168138066718, 0.2516458662001729, 11.558711779627467) eV, padded_box=(4.279480403896584, 30.295936229697016, 0.25148127958015565, 12.689582957590215) eV, sup=0.000886333/0.001 (relative), kappa_max=1.76173, noise=1.05688e-07/5e-05
-Started Sigma tau sweep at 22:34:23.
-[ 22:34:23 | ░░░░░░░░░░ |   2% ] tau node  1 / 42 · ETA 0 s
-[ 22:34:23 | █░░░░░░░░░ |   7% ] tau node  3 / 42 · ETA 0 s
-[ 22:34:23 | █░░░░░░░░░ |  12% ] tau node  5 / 42 · ETA 0 s
-[ 22:34:23 | ██░░░░░░░░ |  17% ] tau node  7 / 42 · ETA 0 s
-[ 22:34:23 | ██░░░░░░░░ |  24% ] tau node 10 / 42 · ETA 0 s
-[ 22:34:23 | ███░░░░░░░ |  29% ] tau node 12 / 42 · ETA 0 s
-[ 22:34:23 | ███░░░░░░░ |  33% ] tau node 14 / 42 · ETA 0 s
-[ 22:34:23 | ████░░░░░░ |  38% ] tau node 16 / 42 · ETA 0 s
-[ 22:34:23 | ████░░░░░░ |  43% ] tau node 18 / 42 · ETA 0 s
-[ 22:34:23 | █████░░░░░ |  48% ] tau node 20 / 42 · ETA 0 s
-[ 22:34:23 | █████░░░░░ |  55% ] tau node 23 / 42 · ETA 0 s
-[ 22:34:23 | ██████░░░░ |  60% ] tau node 25 / 42 · ETA 0 s
-[ 22:34:23 | ██████░░░░ |  64% ] tau node 27 / 42 · ETA 0 s
-[ 22:34:23 | ███████░░░ |  69% ] tau node 29 / 42 · ETA 0 s
-[ 22:34:23 | ███████░░░ |  74% ] tau node 31 / 42 · ETA 0 s
-[ 22:34:23 | ████████░░ |  79% ] tau node 33 / 42 · ETA 0 s
-[ 22:34:24 | █████████░ |  86% ] tau node 36 / 42 · ETA 0 s
-[ 22:34:24 | █████████░ |  90% ] tau node 38 / 42 · ETA 0 s
-[ 22:34:24 | ██████████ |  95% ] tau node 40 / 42 · ETA 0 s
-[ 22:34:24 | ██████████ | 100% ] tau node 42 / 42 · ETA 0 s
-Finished Sigma tau sweep at 22:34:24.  Elapsed: 0 s.
-SC identity: max |dE| by overlap = 3.476362983e-01 eV (sorted-index value 3.476362983e-01 eV; 0 reassignments at k=0; total=0)
-  SC map energies: /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/eqp0_iter0001.dat
-  SC map eqp1: /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/eqp1_iter0001.dat
-SC map gain: max |dSigma_on-shell| / max |dE_in| = 0.185133 (worst k=0 band=1: dSigma=674.000394 meV / dE=3640.626335 meV)
-    SC iteration: call=0001 role=linear gap=13.218830797 eV max|dE|=3.476362983e-01 eV active=1-3 protected=1-2 in_range=1-2
-    SC convergence: max|dE| = 0.347636 eV over 2 non-scissored bands (CRITERION, cutoff 0.500000 eV; worst k=0 band=0) | RMS_nonscissored = 0.245875 eV, RMS_all(3) = 0.200756 eV (diagnostics, NOT the criterion) | CONVERGED
-  SC verdict: CONVERGED after 2 GW map calls; max|dE| = 0.347636 eV over 2 non-scissored bands (CRITERION, cutoff 0.500000 eV; worst k=0 band=0) | RMS_nonscissored = 0.245875 eV, RMS_all(3) = 0.200756 eV (diagnostics, NOT the criterion) | CONVERGED
-  SC done: 2 GW map calls, final RMS ΔE = 2.0076e-01 eV
+SC partition: protected=2/3, in_range=2, escaped=0; sorted columns differ at k=[]; map=0; sampled=[-12.000000, +12.000000] eV
+  SC fixed quadrature: iteration=1, initialized=True, rebuilds_this_iteration=0, rebuilds_total=0, pair_cost=64, initial_pair_cost=64, max_state_pad=2.138 eV (energy-proportional), pole_pad=10.0%
+    SC fixed window: ω≥E_F cond:pole_tail: n_tau=17, nodes=e9ae52f4ec85ca02, cache=init:miss, box=(-43.83726137923625, -10.60814468899188, 0.25019299323562044, 14.967081683355612) eV, padded_box=(-65.14222372723415, -0.25, 0.25017369391205835, 16.438789851691176) eV, sup=0.000844828/0.001 (relative), kappa_max=1.49854, noise=8.99394e-08/5e-05
+    SC fixed window: ω≥E_F val:bulk: n_tau=15, nodes=5afdb27776724b95, cache=init:miss, box=(22.78569524760494, 46.782182889970095, 0.25019299323562044, 14.967081683355612) eV, padded_box=(0.25, 55.199392444902685, 0.25017369391205835, 16.438789851691176) eV, sup=0.000983603/0.001 (relative), kappa_max=1.74698, noise=1.04822e-07/5e-05
+    SC fixed window: ω<E_F cond:bulk: n_tau=17, nodes=e9ae52f4ec85ca02, cache=init:miss, box=(-55.81726137923624, -23.62814468899188, 0.25019299323562044, 14.967081683355612) eV, padded_box=(-65.14222372723415, -0.25, 0.25017369391205835, 16.438789851691176) eV, sup=0.000844828/0.001 (relative), kappa_max=1.49854, noise=8.99394e-08/5e-05
+    SC fixed window: ω<E_F val:pole_tail: n_tau=15, nodes=5afdb27776724b95, cache=init:miss, box=(10.805695247604943, 33.76218288997009, 0.25019299323562044, 14.967081683355612) eV, padded_box=(0.25, 55.199392444902685, 0.25017369391205835, 16.438789851691176) eV, sup=0.000983603/0.001 (relative), kappa_max=1.74698, noise=1.04822e-07/5e-05
+Started Sigma tau sweep at 03:27:12.
+[ 03:27:12 | ░░░░░░░░░░ |   2% ] tau node  1 / 64 · ETA 27 s
+[ 03:27:12 | █░░░░░░░░░ |   6% ] tau node  4 / 64 · ETA 6 s
+[ 03:27:12 | █░░░░░░░░░ |  12% ] tau node  8 / 64 · ETA 3 s
+[ 03:27:12 | ██░░░░░░░░ |  17% ] tau node 11 / 64 · ETA 2 s
+[ 03:27:12 | ██░░░░░░░░ |  22% ] tau node 14 / 64 · ETA 2 s
+[ 03:27:12 | ███░░░░░░░ |  28% ] tau node 18 / 64 · ETA 1 s
+[ 03:27:12 | ███░░░░░░░ |  33% ] tau node 21 / 64 · ETA 1 s
+[ 03:27:12 | ████░░░░░░ |  38% ] tau node 24 / 64 · ETA 1 s
+[ 03:27:12 | ████░░░░░░ |  44% ] tau node 28 / 64 · ETA 1 s
+[ 03:27:12 | █████░░░░░ |  48% ] tau node 31 / 64 · ETA 0 s
+[ 03:27:12 | █████░░░░░ |  53% ] tau node 34 / 64 · ETA 0 s
+[ 03:27:12 | ██████░░░░ |  58% ] tau node 37 / 64 · ETA 0 s
+[ 03:27:13 | ██████░░░░ |  64% ] tau node 41 / 64 · ETA 0 s
+[ 03:27:13 | ███████░░░ |  69% ] tau node 44 / 64 · ETA 0 s
+[ 03:27:13 | ███████░░░ |  73% ] tau node 47 / 64 · ETA 0 s
+[ 03:27:13 | ████████░░ |  80% ] tau node 51 / 64 · ETA 0 s
+[ 03:27:13 | ████████░░ |  84% ] tau node 54 / 64 · ETA 0 s
+[ 03:27:13 | █████████░ |  89% ] tau node 57 / 64 · ETA 0 s
+[ 03:27:13 | ██████████ |  95% ] tau node 61 / 64 · ETA 0 s
+[ 03:27:13 | ██████████ | 100% ] tau node 64 / 64 · ETA 0 s
+Finished Sigma tau sweep at 03:27:13.  Elapsed: 1 s.
+SC identity: max |dE| by overlap = 3.640408923e+00 eV (sorted-index value 3.640408923e+00 eV; 0 reassignments at k=0; total=0)
+  SC map energies: /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/eqp0_iter0000.dat
+  SC map eqp1: /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/eqp1_iter0000.dat
+    SC iteration: call=0000 role=linear gap=13.559035875 eV max|dE|=3.640408923e+00 eV active=1-3 protected=1-2 in_range=1-2
+    SC convergence: max|dE| = 3.640409 eV over 2 non-scissored bands (CRITERION, cutoff 0.500000 eV; worst k=0 band=0) | RMS_nonscissored = 3.007978 eV, RMS_all(3) = 2.456003 eV (diagnostics, NOT the criterion) | not converged
+SC partition: protected=2/3, in_range=2, escaped=0; sorted columns differ at k=[]; map=1; sampled=[-12.000000, +12.000000] eV
+  SC fixed quadrature: iteration=2, initialized=False, rebuilds_this_iteration=0, rebuilds_total=0, pair_cost=113, initial_pair_cost=64, max_state_pad=2.358 eV (energy-proportional), pole_pad=10.0%
+    SC fixed window: ω≥E_F cond:resonant: n_tau=17, nodes=e9ae52f4ec85ca02, cache=hit:sc-fixed, box=(-22.10828463960184, -7.114013855332822, 1.8272507824558368, 10.212764143826494) eV, padded_box=(-65.14222372723415, -0.25, 0.25017369391205835, 16.438789851691176) eV, sup=0.000844828/0.001 (relative), kappa_max=1.49854, noise=8.99394e-08/5e-05
+    SC fixed window: ω≥E_F cond:state_tail: n_tau=17, nodes=e9ae52f4ec85ca02, cache=hit:sc-fixed, box=(-31.083356980237582, -11.016776876870807, 1.8272507824558368, 10.212764143826494) eV, padded_box=(-65.14222372723415, -0.25, 0.25017369391205835, 16.438789851691176) eV, sup=0.000844828/0.001 (relative), kappa_max=1.49854, noise=8.99394e-08/5e-05
+    SC fixed window: ω≥E_F cond:pole_tail: n_tau=17, nodes=e9ae52f4ec85ca02, cache=hit:sc-fixed, box=(-42.88077171454966, -11.433306382722355, 0.2516453534219634, 11.55802629974572) eV, padded_box=(-65.14222372723415, -0.25, 0.25017369391205835, 16.438789851691176) eV, sup=0.000844828/0.001 (relative), kappa_max=1.49854, noise=8.99394e-08/5e-05
+    SC fixed window: ω≥E_F val:bulk: n_tau=15, nodes=5afdb27776724b95, cache=hit:sc-fixed, box=(13.041288463015643, 40.077252866400016, 0.2516453534219634, 11.55802629974572) eV, padded_box=(0.25, 55.199392444902685, 0.25017369391205835, 16.438789851691176) eV, sup=0.000983603/0.001 (relative), kappa_max=1.74698, noise=1.04822e-07/5e-05
+    SC fixed window: ω<E_F cond:bulk: n_tau=17, nodes=e9ae52f4ec85ca02, cache=hit:sc-fixed, box=(-54.953485716846515, -19.724892265582927, 0.2516453534219634, 11.55802629974572) eV, padded_box=(-65.14222372723415, -0.25, 0.25017369391205835, 16.438789851691176) eV, sup=0.000844828/0.001 (relative), kappa_max=1.49854, noise=8.99394e-08/5e-05
+    SC fixed window: ω<E_F val:resonant: n_tau=15, nodes=5afdb27776724b95, cache=hit:sc-fixed, box=(1.2928594941524771, 15.247130278421494, 1.8272507824558368, 10.212764143826494) eV, padded_box=(0.25, 55.199392444902685, 0.25017369391205835, 16.438789851691176) eV, sup=0.000983603/0.001 (relative), kappa_max=1.74698, noise=1.04822e-07/5e-05
+    SC fixed window: ω<E_F val:pole_tail: n_tau=15, nodes=5afdb27776724b95, cache=hit:sc-fixed, box=(5.78970258015507, 26.964538864103165, 0.2516453534219634, 11.55802629974572) eV, padded_box=(0.25, 55.199392444902685, 0.25017369391205835, 16.438789851691176) eV, sup=0.000983603/0.001 (relative), kappa_max=1.74698, noise=1.04822e-07/5e-05
+Started Sigma tau sweep at 03:27:16.
+[ 03:27:16 | ░░░░░░░░░░ |   1% ] tau node   1 / 113 · ETA 1 s
+[ 03:27:16 | █░░░░░░░░░ |   6% ] tau node   7 / 113 · ETA 0 s
+[ 03:27:16 | █░░░░░░░░░ |  12% ] tau node  13 / 113 · ETA 0 s
+[ 03:27:16 | ██░░░░░░░░ |  17% ] tau node  19 / 113 · ETA 0 s
+[ 03:27:16 | ██░░░░░░░░ |  22% ] tau node  25 / 113 · ETA 0 s
+[ 03:27:16 | ███░░░░░░░ |  27% ] tau node  30 / 113 · ETA 0 s
+[ 03:27:17 | ███░░░░░░░ |  32% ] tau node  36 / 113 · ETA 0 s
+[ 03:27:17 | ████░░░░░░ |  37% ] tau node  42 / 113 · ETA 0 s
+[ 03:27:17 | ████░░░░░░ |  42% ] tau node  48 / 113 · ETA 0 s
+[ 03:27:17 | █████░░░░░ |  48% ] tau node  54 / 113 · ETA 0 s
+[ 03:27:17 | █████░░░░░ |  53% ] tau node  60 / 113 · ETA 0 s
+[ 03:27:17 | ██████░░░░ |  58% ] tau node  66 / 113 · ETA 0 s
+[ 03:27:17 | ██████░░░░ |  64% ] tau node  72 / 113 · ETA 0 s
+[ 03:27:17 | ███████░░░ |  69% ] tau node  78 / 113 · ETA 0 s
+[ 03:27:17 | ███████░░░ |  74% ] tau node  84 / 113 · ETA 0 s
+[ 03:27:17 | ████████░░ |  79% ] tau node  89 / 113 · ETA 0 s
+[ 03:27:17 | ████████░░ |  84% ] tau node  95 / 113 · ETA 0 s
+[ 03:27:17 | █████████░ |  89% ] tau node 101 / 113 · ETA 0 s
+[ 03:27:17 | █████████░ |  95% ] tau node 107 / 113 · ETA 0 s
+[ 03:27:17 | ██████████ | 100% ] tau node 113 / 113 · ETA 0 s
+Finished Sigma tau sweep at 03:27:17.  Elapsed: 0 s.
+SC identity: max |dE| by overlap = 3.476857625e-01 eV (sorted-index value 3.476857625e-01 eV; 0 reassignments at k=0; total=0)
+  SC map energies: /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/eqp0_iter0001.dat
+  SC map eqp1: /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/eqp1_iter0001.dat
+SC map gain: max |dSigma_on-shell| / max |dE_in| = 0.185233 (worst k=0 band=1: dSigma=674.323602 meV / dE=3640.408923 meV)
+    SC iteration: call=0001 role=linear gap=13.218984501 eV max|dE|=3.476857625e-01 eV active=1-3 protected=1-2 in_range=1-2
+    SC convergence: max|dE| = 0.347686 eV over 2 non-scissored bands (CRITERION, cutoff 0.500000 eV; worst k=0 band=0) | RMS_nonscissored = 0.245910 eV, RMS_all(3) = 0.200785 eV (diagnostics, NOT the criterion) | CONVERGED
+  SC verdict: CONVERGED after 2 GW map calls; max|dE| = 0.347686 eV over 2 non-scissored bands (CRITERION, cutoff 0.500000 eV; worst k=0 band=0) | RMS_nonscissored = 0.245910 eV, RMS_all(3) = 0.200785 eV (diagnostics, NOT the criterion) | CONVERGED
+  SC done: 2 GW map calls, final RMS ΔE = 2.0078e-01 eV
 
 DYNAMIC SIGMA ENERGY COVERAGE
 -----------------------------
@@ -161,27 +159,27 @@ Band tail      : OFF | estimator=spectral_shell | brackets=total_fractions
 FUNDAMENTAL GAP
 ---------------
 DFT gap        : 14.99870 eV
-Full-matrix effective-H gap: 13.21883 eV (insulating)
-Gap correction : -1.77987 eV relative to DFT
+Full-matrix effective-H gap: 13.21898 eV (insulating)
+Gap correction : -1.77971 eV relative to DFT
 State energies  : written to the EQP files listed below
 
 MAJOR-STAGE TIMING
 ------------------
   stage                    wall (s)     fraction
-  runtime bring-up             4.57      16.53%
-  pre-main + imports           0.31       1.10%
-  input + run setup            0.08       0.30%
-  restart load                 1.78       6.44%
-  ISDF setup + I/O             0.01       0.05%
-  minimax quadrature           0.11       0.41%
-  Sigma rule plan              0.71       2.57%
-  Sigma tau sweep              1.09       3.92%
-  Sigma other                 18.64      67.34%
-  mean-field load              0.06       0.20%
-  QP solve + diagonalize       0.19       0.67%
-  result writes                0.02       0.08%
-  other driver work            0.11       0.39%
-  total run                   27.68     100.00%
+  runtime bring-up             3.58       9.22%
+  pre-main + imports           0.27       0.69%
+  input + run setup            0.08       0.21%
+  restart load                 1.81       4.65%
+  ISDF setup + I/O             0.01       0.03%
+  minimax quadrature           0.11       0.29%
+  Sigma rule plan             13.96      35.91%
+  Sigma tau sweep              1.20       3.09%
+  Sigma other                 17.48      44.98%
+  mean-field load              0.05       0.14%
+  QP solve + diagonalize       0.18       0.47%
+  result writes                0.02       0.06%
+  other driver work            0.10       0.27%
+  total run                   38.87     100.00%
 
 WARNINGS
 --------
@@ -192,19 +190,19 @@ WARNINGS
 OUTPUT FILES AND INPUTS
 -----------------------
   role                     state       path
-  input deck               read        /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/mpa_sc1.in
-  DFT wavefunctions        read        /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/WFN.h5
-  ISDF centroids           read        /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/centroids_frac_13.txt
-  mean-field Hamiltonian   read        /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/kin_ion.h5
-  long-wave dipoles        read        /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/dipole.h5
-  parallel transport       absent      /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/parallel_transport.h5
-  ISDF restart tensors     present     /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/tmp/isdf_tensors_13.h5
-  self-energy table        written     /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/mpa_sc1_sigma.dat
-  fixed-DFT-state diagonal zeroth-order energies written     /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/mpa_sc1_eqp0.dat
-  fixed-DFT-state diagonal Z-linearized energies written     /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/mpa_sc1_eqp1.dat
-  full-matrix effective-H rotations written     /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/qp_wfn_rotations.h5
-  matched full-matrix QP wavefunctions written     /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/WFN_qp.h5
-  dynamic Sigma spectrum   written     /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/mpa_sc1_sigma.h5
+  input deck               read        /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/mpa_sc1.in
+  DFT wavefunctions        read        /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/WFN.h5
+  ISDF centroids           read        /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/centroids_frac_13.txt
+  mean-field Hamiltonian   read        /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/kin_ion.h5
+  long-wave dipoles        read        /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/dipole.h5
+  parallel transport       absent      /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/parallel_transport.h5
+  ISDF restart tensors     present     /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/tmp/isdf_tensors_13.h5
+  self-energy table        written     /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/mpa_sc1_sigma.dat
+  fixed-DFT-state diagonal zeroth-order energies written     /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/mpa_sc1_eqp0.dat
+  fixed-DFT-state diagonal Z-linearized energies written     /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/mpa_sc1_eqp1.dat
+  full-matrix effective-H rotations written     /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/qp_wfn_rotations.h5
+  matched full-matrix QP wavefunctions written     /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/WFN_qp.h5
+  dynamic Sigma spectrum   written     /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/mpa_sc1_sigma.h5
 
 LORRAX GW calculation completed.
-Report written to /pscratch/sd/j/jackm/wt_codex_partition/.pytest_core_runs/B-jqcfx_3m/B/mpa_sc1.out
+Report written to /pscratch/sd/j/jackm/wt_codex_reviewfix/.pytest_core_runs/B-pbrop0li/B/mpa_sc1.out
