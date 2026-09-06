@@ -886,6 +886,13 @@ def _fit_fixed_sc_rules(
             for name, candidate in candidates:
                 if candidate["conjugate"] != bool(spec["conjugate"]):
                     continue
+                # A sign-definite window needs the relative criterion.
+                # Borrowing a broad peak-relative crossing rule here both
+                # changes its error criterion and can multiply its cost
+                # (Na: a small resonant window inherited 198 nodes).
+                relative = spec["kind"] != "crossing"
+                if candidate["fit"]["relative"] != relative:
+                    continue
                 if not _box_contains(candidate["fit"]["rule_box"], spec["box"]):
                     continue
                 try:

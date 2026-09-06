@@ -302,7 +302,10 @@ reserving unsampled support toward zero can turn a sign-definite pole tail
 into an expensive crossing rule. Genuine new pole channels follow the
 reported rebuild-on-escape path.
 Contained initial certificates of the same causal type share their nodes. A
-near-boundary cache request is accepted only after re-auditing the unchanged
+replacement certificate must also use the same relative or peak-relative
+error criterion; a small sign-definite window must not inherit a large
+crossing rule just because its box is contained. A near-boundary cache
+request is accepted only after re-auditing the unchanged
 nodes on the union box at the same sup-error and runtime-noise limits; the
 small boundary threshold selects audits, never relaxes a certificate.
 Interior holes still require an explicit patch. Quadrature
