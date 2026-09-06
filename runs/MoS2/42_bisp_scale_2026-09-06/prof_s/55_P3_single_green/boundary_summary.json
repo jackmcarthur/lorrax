@@ -1,0 +1,18 @@
+{
+  "scope": "synchronized host boundaries; outer stage is nested, never sum it with children",
+  "groups": [
+    {
+      "label": "sigma_tau",
+      "term": "",
+      "head": false,
+      "calls": 115,
+      "compiles": 1,
+      "compile_s": 0.1502872119890526,
+      "host_s": 13.660588161990745,
+      "cold_calls": 1,
+      "cold_median_ms": 191.32558902492747,
+      "warm_calls": 114,
+      "warm_median_ms": 28.471987490775064
+    }
+  ]
+}
