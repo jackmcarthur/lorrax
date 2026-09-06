@@ -1609,9 +1609,11 @@ def _z_q_face_parent(
 	cache_spec = P(None, None, ('x', 'y'), None, None)
 
 	cache_key = (
-		'z_q_face_parent', id(mesh_xy), id(psi_G_store), id(plan),
+		'z_q_face_parent', id(mesh_xy), id(plan),
+		(None if use_psi_r_cache else id(psi_G_store)),
+		local_band_chunk_shape, fft_grid,
 		n_parent, ns, mu_pk, nb_face, R_t, nkx, nky, nkz, bcr,
-		use_psi_r_cache, gamma_L, gamma_R, bool(coupled_mu123),
+		use_psi_r_cache, bool(gamma_L), bool(gamma_R), bool(coupled_mu123),
 		(None if psi_r_cache is None
 		 else tuple(int(s) for s in psi_r_cache.shape)),
 	)
@@ -1695,9 +1697,10 @@ def _z_q_face_parent(
 
 		@partial(shard_map, mesh=mesh_xy,
 		         in_specs=(pair_spec, pair_spec, P(None, None),
-		                   P(None, None, None)),
+		                   P(None, None, None), (P(None), P(None)),
+		                   (P(None), P(None))),
 		         out_specs=out_spec, check_vma=False)
-		def _tile_tail(D_l_, D_r_, local_perm_r_, wraps_r_):
+		def _tile_tail(D_l_, D_r_, local_perm_r_, wraps_r_, vertex_l, vertex_r):
 			def unfold_block(D_, coef, sources, source_count):
 				"""One full-k output spin block of P = conj(U D U†)."""
 				def source_spin(acc, slot):
@@ -1782,24 +1785,25 @@ def _z_q_face_parent(
 					local_fftn3(value, axes=(0, 1, 2), norm='forward').reshape(nk, mu_loc, r_loc)),
 					0, result, unroll=1)
 				return channels
-			identity = (jnp.arange(ns), jnp.ones(ns))
-			left = identity if gamma_L == 0 else _gamma_perm_phase_mu(gamma_L)
-			right = identity if gamma_R == 0 else _gamma_perm_phase_mu(gamma_R)
-			return channel_tail(*left, *right)
+			return channel_tail(*vertex_l, *vertex_r)
 
 		@jax.jit
 		def fn(psi_mun_, w_l_, w_r_, r_index_, local_perm_r_, wraps_r_,
-		        g_index_, kvecs_frac_, psi_r_cache_):
+		        g_index_, kvecs_frac_, psi_r_cache_, vertex_l, vertex_r):
 			D_l, D_r = _projectors(
 				psi_mun_, w_l_, w_r_, r_index_, g_index_, kvecs_frac_,
 				psi_r_cache_)
-			return _tile_tail(D_l, D_r, local_perm_r_, wraps_r_)
+			return _tile_tail(D_l, D_r, local_perm_r_, wraps_r_, vertex_l, vertex_r)
 
 		_pair_pipeline_sm_cache[cache_key] = fn
 
 	if psi_r_cache is None:
 		psi_r_cache = jnp.zeros(
 			(1, 1, P_total, 1, 1), dtype=jnp.complex128)
+	left = ((jnp.arange(ns), jnp.ones(ns)) if gamma_L == 0
+	        else _gamma_perm_phase_mu(gamma_L))
+	right = ((jnp.arange(ns), jnp.ones(ns)) if gamma_R == 0
+	         else _gamma_perm_phase_mu(gamma_R))
 	return _pair_pipeline_sm_cache[cache_key](
 		psi_mun_parent,
 		jnp.asarray(weight_l, dtype=jnp.float64),
@@ -1807,7 +1811,7 @@ def _z_q_face_parent(
 		jnp.asarray(tile_r_index, dtype=jnp.int32),
 		jnp.asarray(tile_local_perm, dtype=jnp.int32),
 		jnp.asarray(tile_wraps, dtype=jnp.float64),
-		psi_G_store.g_index, psi_G_store.kvecs_frac, psi_r_cache)
+		psi_G_store.g_index, psi_G_store.kvecs_frac, psi_r_cache, left, right)
 
 
 # Backward-compat shim removed — old z_q_from_psi_sm signature
