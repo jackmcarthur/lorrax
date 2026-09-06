@@ -181,9 +181,11 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         raise ValueError(
             "four-current vertex chi requires the canonical face "
             "wavefunction layout")
+    vertex_class = (None if vertex_pair is None else
+                    tuple(v == 0 for v in vertex_pair))
     cache_key = (id(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
-                 vertex_pair, (tuple(id(p) for p in k_unfold_plan)
+                 vertex_class, (tuple(id(p) for p in k_unfold_plan)
                                if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)))
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
@@ -659,18 +661,17 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                 NamedSharding(mesh_xy, _rep0))
 
     if vertex_pair:
-        from common.gamma_matrices import gamma_perm_phase
-        perm_l, phase_l = gamma_perm_phase(vertex_pair[0])
-        perm_r, phase_r = gamma_perm_phase(vertex_pair[1])
-        # The Green pair is conjugated; transpose both Hermitian vertices for ψ†Γψ.
-        operands = (perm_l, jnp.conj(phase_l), perm_r, jnp.conj(phase_r))
+        vertex_shard = tuple(NamedSharding(mesh_xy, P()) for _ in range(4))
 
-        @partial(jax.jit, in_shardings=_base_in, out_shardings=_chi_R_shard)
+        @partial(jax.jit, in_shardings=(*_base_in, vertex_shard),
+                 out_shardings=_chi_R_shard)
         def minimax_tau_integrate_chi_vertex(
             nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
+            vertex_operands,
         ):
+            """Contract runtime canonical vertices through one family shape class."""
             return _single_impl(nodes, psi_mun, psi_nmu, mask_v, mask_c,
-                                enk_full, vmax, cmin, operands)
+                                enk_full, vmax, cmin, vertex_operands)
         return minimax_tau_integrate_chi_vertex
 
     @partial(jax.jit, in_shardings=_base_in, out_shardings=_chi_R_shard)
@@ -1905,7 +1906,12 @@ def compute_no_pair_dirac_current_block(
     args = (nodes, left.psi_mun, right.psi_nmu, mask_v, mask_c,
             left.enk - jnp.asarray(eref, dtype=left.enk.dtype),
             jnp.asarray(vmax, dtype=jnp.float64), jnp.asarray(cmin, dtype=jnp.float64))
-    full = kernel(*args)
+    from common.gamma_matrices import gamma_perm_phase
+    perm_l, phase_l = gamma_perm_phase(A)
+    perm_r, phase_r = gamma_perm_phase(B)
+    # Conjugated Green pairs require the transposed Hermitian vertex tables.
+    vertices = (perm_l, jnp.conj(phase_l), perm_r, jnp.conj(phase_r))
+    full = kernel(*args, vertices)
     return jnp.take(full, jnp.asarray(left.plan.sym.q_irr_full_idx), axis=0)
 
 
