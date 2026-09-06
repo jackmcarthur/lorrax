@@ -596,9 +596,16 @@ and any
 The test-only `LORRAX_EXTRA_MU_PAD` knob still sizes the canonical carrier
 (I/O staging) and no longer changes the orbit-packed runtime extent.
 `PackedCentroidBasis.solve_axis` supplies the solve receipt; the loader and
-q-table construction consume that basis's extent without padding it again.  Bispinor decks, trivial
-groups and non-closed centroid sets take the identity layout, so their
-behaviour is the pre-2026-09-05 canonical one.
+q-table construction consume that basis's extent without padding it again.
+Bispinor charge and current families now use the same orbit-packed owner.
+The mandatory parent plan requires centroid closure under its typed actions;
+an identity packing layout does not waive that requirement. The former
+full-k fallback for non-closed sets was deleted with the full-k carrier.
+This removes support for the historical non-closed 60-centroid COHSEX
+fixture: final landing claim1282 refuses before fitting, whereas fixed-main
+and scalar ade4fc66 controls pass unchanged. This is an open compatibility
+limitation, not numerical agreement or a reason to refreeze that oracle.
+Trivial typed actions remain valid on an identity layout.
 
 ## 2026-08-18 — ζ band chunks default to 16; zero opts into the planner
 
