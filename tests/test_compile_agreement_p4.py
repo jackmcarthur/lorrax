@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -23,6 +25,7 @@ def _require_mesh4():
 
 
 def _run(kind: str, tmp_path):
+    """Use each existing Slurm rank for one probe child, preserving refusals."""
     env = dict(os.environ)
     env["PYTHONPATH"] = str(REPO_ROOT / "src") + (
         os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
@@ -30,6 +33,29 @@ def _run(kind: str, tmp_path):
     env["ISDF_JAX_CACHE_DIR"] = ""
     argv = [sys.executable,
             str(REPO_ROOT / "tests" / "_compile_agreement_probe.py"), kind]
+    from runtime import _resolve_proc_count
+    if _resolve_proc_count() == 4:
+        from core.rank_session import exchange
+        exchange(kind)
+        started = time.monotonic()
+        try:
+            proc = subprocess.run(argv, cwd=tmp_path, env=env, timeout=30,
+                                  capture_output=True, text=True, check=False)
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or b""
+            stderr = exc.stderr or b""
+            proc = subprocess.CompletedProcess(
+                argv, 124, stdout.decode() if isinstance(stdout, bytes) else stdout,
+                (stderr.decode() if isinstance(stderr, bytes) else stderr) + str(exc))
+        (tmp_path / f"{kind}.log").write_text(proc.stdout + "\n" + proc.stderr)
+        rows = exchange({"returncode": proc.returncode, "stdout": proc.stdout,
+                         "stderr": proc.stderr, "wall_s": time.monotonic() - started})
+        return mesh_launch.Mesh4Result(
+            mode=mesh_launch.SRUN, argv=argv,
+            returncodes=[row["returncode"] for row in rows], per_rank=rows,
+            stdout="\n".join(row["stdout"] for row in rows),
+            stderr="\n".join(row["stderr"] for row in rows),
+            wall_s=max(row["wall_s"] for row in rows))
     return mesh_launch.run_mesh4(
         argv, cwd=tmp_path, env=env, timeout=30, mode=_require_mesh4())
 
