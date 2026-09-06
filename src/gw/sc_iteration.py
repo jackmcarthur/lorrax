@@ -4648,6 +4648,7 @@ def _run_linear_mixing(
         state = SCState(
             H_qp_dft=state.H_qp_dft,
             iteration=state.iteration,
+            role="accepted",
             partition=state.partition,
             occupation_state=state.occupation_state,
             head_surface_weight_kn=state.head_surface_weight_kn,
@@ -4682,6 +4683,7 @@ def _run_linear_mixing(
         state_next = SCState(
             H_qp_dft=H_next,
             iteration=state_map.iteration,
+            role="accepted",
             partition=_state_partition(state_map, inputs),
             occupation_state=state_map.occupation_state,
             head_surface_weight_kn=state_map.head_surface_weight_kn,
@@ -4944,11 +4946,10 @@ def _run_rcrop(
         _last_input_H[0] = H
         E_in = np.asarray(eigvalsh_kshard(H)) * RYD_TO_EV
         # DROP ITERATION i-1's SigmaResult BEFORE BUILDING ITERATION i's.
-        # ``gw_iteration_map`` reads ``state.iteration`` and
-        # ``state.H_qp_dft`` and nothing else, so the previous result was
-        # passed in and held in this cell for the whole call for no
-        # reader.  Its ``sigma_c_omega_kij_ry`` is the largest object on
-        # the SC path and, on the explicit ``sigma_omega_layout =
+        # ``gw_iteration_map`` reads only the small carry/control fields,
+        # not the previous Sigma result, which was held in this cell for
+        # the whole call for no reader. Its ``sigma_c_omega_kij_ry`` is the
+        # largest object on the SC path and, on the explicit ``sigma_omega_layout =
         # "replicated"`` control, does not shrink with P: 2751 MB/rank at
         # nb=512
         # (``gw_config.py``), so holding two generations was a
@@ -5573,12 +5574,6 @@ def run_sc_driver(
         is completed inside this function so its W body and head samples
         cannot be separated at the caller boundary.
     """
-    # Restart skips zeta fitting, so validate the active edge independently
-    # before entering the loop, with the same strict owner as a fresh fit.
-    from common.band_degeneracy import check_band_window
-    check_band_window(np.asarray(wfn.energies[0]), int(band_slices.b0),
-                      int(band_slices.b3), mode="strict",
-                      where="SC nval/ncond active window (fresh or restart)")
     import dataclasses
 
     # THE b0 == 0 ASSUMPTION, MADE EXPLICIT.  Every occupancy in this
@@ -5606,6 +5601,14 @@ def run_sc_driver(
             f"is implemented.  Restore an active window beginning at band 0, "
             f"or use qp_solver = one_shot_dft.  Changing nval cannot fix "
             f"this: nval moves b1, not b0.")
+
+    # Restart skips zeta fitting, so validate the active edge independently
+    # before entering the loop, with the same strict owner as a fresh fit.
+    # The unsupported-origin refusal above must precede all WFN reads.
+    from common.band_degeneracy import check_band_window
+    check_band_window(np.asarray(wfn.energies[0]), int(band_slices.b0),
+                      int(band_slices.b3), mode="strict",
+                      where="SC nval/ncond active window (fresh or restart)")
 
     e_dft_active_kn_ry = jnp.asarray(np.asarray(enk_dft, dtype=np.float64))
     nb_active = e_dft_active_kn_ry.shape[1]
