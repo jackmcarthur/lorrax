@@ -369,3 +369,61 @@ def test_the_verdict_is_present_on_both_paths():
         assert isinstance(res.verdict, CentroidClosureVerdict)
         assert res.verdict.n_centroids > 0
         assert res.verdict.residual_by_op.shape == (res.n_sym_spatial,)
+
+
+def test_selected_centroid_actions_keep_canonical_trs_rows():
+    """TRS duplicates the spatial pullback; an unused mirror has no centroid action."""
+    cent = np.array([[0, 0, 0], [1, 0, 1]], dtype=np.int32)
+    ops = np.array([np.eye(3, dtype=int), np.diag([1, 1, -1])])
+    with pytest.raises(RuntimeError, match="closure"):
+        centroid_source_map_and_wrap(cent, ops, np.zeros((2, 3)), (4, 4, 4))
+    perm, wraps = centroid_source_map_and_wrap(
+        cent, ops, np.zeros((2, 3)), (4, 4, 4),
+        extend_trs=True, required_rows=np.array([0, 2]))
+    np.testing.assert_array_equal(perm, [[0, 1], [-1, -1], [0, 1], [-1, -1]])
+    np.testing.assert_array_equal(wraps, np.zeros((4, 2, 3)))
+    with pytest.raises(RuntimeError, match="closure"):
+        centroid_source_map_and_wrap(
+            cent, ops, np.zeros((2, 3)), (4, 4, 4),
+            extend_trs=True, validate=False, required_rows=np.array([3]))
+
+
+def test_selected_centroid_actions_preserve_available_unused_rows():
+    """Selecting identity leaves a valid mirror and its TRS partner unchanged."""
+    cent = np.array([[0, 0, 0], [1, 0, 1], [1, 0, 3]], dtype=np.int32)
+    ops = np.array([np.eye(3, dtype=int), np.diag([1, 1, -1])])
+    original = centroid_source_map_and_wrap(
+        cent, ops, np.zeros((2, 3)), (4, 4, 4), extend_trs=True)
+    selected = centroid_source_map_and_wrap(
+        cent, ops, np.zeros((2, 3)), (4, 4, 4),
+        extend_trs=True, required_rows=np.array([0]))
+    for before, after in zip(original, selected):
+        np.testing.assert_array_equal(after, before)
+
+
+def test_selected_centroid_actions_refuse_out_of_range_rows():
+    """Canonical row validation precedes spatial-row normalization."""
+    with pytest.raises(ValueError, match="canonical centroid action"):
+        centroid_source_map_and_wrap(
+            np.array([[0, 0, 0]]), np.eye(3, dtype=int)[None],
+            np.zeros((1, 3)), (4, 4, 4), extend_trs=True,
+            required_rows=np.array([2]))
+
+
+def test_selected_qgrid_resolution_names_measured_spatial_subset():
+    """The closure verdict names its subset while the action table retains four rows."""
+    cent = np.array([[0, 0, 0], [1, 0, 1]], dtype=np.int32)
+    ops = np.array([np.eye(3, dtype=int), np.diag([1, 1, -1])])
+    res = resolve_qgrid_symmetry(
+        cent, ops, tnp=np.zeros((2, 3)), fft_grid=(4, 4, 4),
+        required_rows=np.array([0, 2]))
+    assert res.use_ibz
+    assert res.n_sym_spatial == 2
+    assert res.verdict.n_sym == 1
+    assert "spatial_rows=[0]" in res.verdict.as_attr()
+    np.testing.assert_array_equal(res.sym_perm, [[0, 1], [-1, -1], [0, 1], [-1, -1]])
+    refused = resolve_qgrid_symmetry(
+        cent, ops, tnp=np.zeros((2, 3)), fft_grid=(4, 4, 4),
+        required_rows=np.array([3]))
+    assert not refused.use_ibz
+    assert "spatial_rows=[1]" in refused.verdict.as_attr()

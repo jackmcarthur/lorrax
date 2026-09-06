@@ -776,6 +776,7 @@ def centroid_source_map_and_wrap(
     *,
     validate: bool = True,
     extend_trs: bool = False,
+    required_rows=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build (α_s, L_s) for the BGW-convention r-action ``r' = inv(mtrx)·r + τ``.
 
@@ -827,6 +828,10 @@ def centroid_source_map_and_wrap(
         If True, asserts every row of the result is a permutation
         ``[0, n_rmu)``.  Set False only for offline diagnostics where
         the closure failure is the thing you want to inspect.
+    required_rows
+        Optional canonical action rows whose centroid permutations must exist.
+        Other unavailable rows are wholly -1 with zero wraps; row IDs and
+        the spatial/TRS split are preserved. None requires every row.
     extend_trs
         If True, return a ``(2·n_sym, n_rmu)`` table whose rows
         ``[n_sym:]`` duplicate rows ``[:n_sym]``.  This is the
@@ -924,8 +929,18 @@ def centroid_source_map_and_wrap(
 
     sym_perm = flat_to_mu[img_flat]                              # (n_sym, n_rmu)
 
-    if validate:
+    required = np.arange(n_sym, dtype=np.int32)
+    if required_rows is not None:
+        rows = np.asarray(required_rows)
+        n_rows = n_sym * (2 if extend_trs else 1)
+        if (rows.ndim != 1 or rows.dtype.kind not in "iu" or not rows.size
+                or np.any(rows < 0) or np.any(rows >= n_rows)):
+            raise ValueError("required_rows must name canonical centroid action rows")
+        required = np.unique(rows % n_sym)
+
+    if validate or required_rows is not None:
         bad = (sym_perm < 0)
+        bad[np.setdiff1d(np.arange(n_sym), required)] = False
         if bad.any():
             bad_s, bad_mu = np.where(bad)
             ex_s, ex_mu = int(bad_s[0]), int(bad_mu[0])
@@ -940,7 +955,7 @@ def centroid_source_map_and_wrap(
                 f"back to identity-only sym."
             )
         # Each row should be a permutation.  Cheap O(n_sym · n_rmu) check.
-        for s in range(n_sym):
+        for s in required:
             if np.unique(sym_perm[s]).size != n_rmu:
                 raise RuntimeError(
                     f"centroid_source_map_and_wrap: sym_perm[{s}] is not a "
@@ -950,6 +965,10 @@ def centroid_source_map_and_wrap(
                     f"collides with a different centroid.  Check "
                     f"``validate_atomic_symmetries`` on the WFN.")
 
+    if required_rows is not None:
+        available = np.all(np.sort(sym_perm, axis=1) == np.arange(n_rmu), axis=1)
+        sym_perm[~available] = -1
+        L_wrap[~available] = 0
     sym_perm = sym_perm.astype(np.int32)
     if extend_trs:
         # TRS keeps r fixed; the augmented rows duplicate the spatial
@@ -1569,6 +1588,7 @@ def resolve_qgrid_symmetry(
     extend_trs: bool = True,
     tol: float = CLOSURE_TOL_DEFAULT,
     context: str = "",
+    required_rows=None,
 ) -> QgridSymmetryResolution:
     """Resolve the q-grid reduction ONCE: verdict → mode → tables.
 
@@ -1631,6 +1651,11 @@ def resolve_qgrid_symmetry(
         Closure tolerance; see :data:`CLOSURE_TOL_DEFAULT`.
     context
         Names the call site for the announcement.
+    required_rows
+        Optional canonical centroid action rows required by the consumer.
+        If full closure fails, measure their spatial subset; verdict op
+        indices refer to the explicit spatial_rows list in its metric.
+        Returned tables always retain the original canonical row IDs.
 
     Returns
     -------
@@ -1662,6 +1687,21 @@ def resolve_qgrid_symmetry(
     verdict = verify_centroid_orbit_closure(
         cent_frac, S, tnp=tnp, tau=tau, tol=tol)
 
+    if required_rows is not None:
+        rows = np.asarray(required_rows)
+        n_rows = n_sym_spatial * (2 if extend_trs else 1)
+        if (rows.ndim != 1 or rows.dtype.kind not in "iu" or not rows.size
+                or np.any(rows < 0) or np.any(rows >= n_rows)):
+            raise ValueError("required_rows must name canonical centroid action rows")
+        spatial_rows = np.unique(rows % n_sym_spatial)
+        if not verdict.closed:
+            verdict = verify_centroid_orbit_closure(
+                cent_frac, S[spatial_rows],
+                tnp=None if tnp is None else np.asarray(tnp)[spatial_rows],
+                tau=None if tau is None else np.asarray(tau)[spatial_rows], tol=tol)
+            verdict = dataclasses.replace(
+                verdict, metric=verdict.metric + ";spatial_rows=" + str(spatial_rows.tolist()))
+
     if not verdict.closed:
         head = verdict.describe().splitlines()[0]
         return QgridSymmetryResolution(
@@ -1679,6 +1719,7 @@ def resolve_qgrid_symmetry(
             fft_grid=grid.astype(np.int32),
             validate=True,
             extend_trs=extend_trs,
+            required_rows=required_rows,
         )
     except RuntimeError as exc:
         first = (str(exc.args[0]).splitlines()[0] if exc.args else str(exc))
