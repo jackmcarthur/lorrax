@@ -1,27 +1,8 @@
-"""Algebra parity: the raw-parent ζ-fit kernels against the full-k face route.
+"""Parent Cq/Zq match direct NumPy q and band sums on typed full-k children.
 
-``isdf.core._z_q_face_parent`` builds the pair-density RHS ``Z_q(mu, r)`` on
-one orbit-closed real-grid tile from the raw WFN parents only and transports
-the completed projector to full k through ``symmetry_maps``;
-``isdf.core._c_q_face_parent`` does the same for the CCT Gram.  Their claim is
-the identity the design brief names decisive:
-
-    contract(unfold ψ) == unfold(contract ψ)
-
-so the fixture is a full-k wavefunction set GENERATED from raw parents by
-the typed action (spatial source map + lattice-wrap Bloch phase, spinor
-rotation, complex conjugation on the antiunitary rows), a real-space grid
-group with a nonsymmorphic glide ({E, σ_xy | (½,½,0)} on a 4x4x4 box) that
-gives a genuine k reduction (k1 ↔ k2 on the 2x2x1 grid), a time-reversed row
-(k3), and two-component spinors with a non-diagonal SU(2) action.  The
-established full-k face kernels then see the children, the parent kernels see
-only the parents, and the two must agree at floating-point noise on every
-tile slot; pad slots must be exactly zero.  Every symmetry table comes from
-the service (``centroid_source_map_and_wrap``, ``spinor_rotation_for_sym_row``)
-— the test derives no convention of its own.
-
-Runs in a CPU subprocess with four emulated devices on a 2x2 mesh, exactly as
-``tests/test_isdf_zq_face_parity.py`` does; no GPU and no ``lx run`` needed.
+The nonsymmorphic glide, spin mixing and antiunitary rows come from the
+symmetry service; the reference sums k and k+q explicitly without the
+production projector FFT tail, sharding, store reader or parent kernel.
 """
 from __future__ import annotations
 
@@ -42,6 +23,15 @@ _CASES = (
     ("ns4_current2", dict(ns=4, seed=13, vertex=2)),
     ("ns4_current3", dict(ns=4, seed=13, vertex=3)),
 )
+_CASES += (
+    ("ns1_multi_upper", dict(ns=1, seed=21, nb=36, left=(0, 21), right=(9, 36))),
+    ("ns1_multi_lower", dict(ns=1, seed=22, nb=36, left=(5, 30), right=(0, 36))),
+    ("ns2_multi", dict(ns=2, seed=23, nb=36, left=(0, 21), right=(9, 36))),
+) + tuple(
+    (f"ns4_multi_{left}{right}", dict(ns=4, seed=40+4*left+right, nb=36,
+     left=(0, 21), right=(9, 36), vertex=left, vertex_right=right))
+    for left in range(4) for right in range(4) if (left, right) != (0, 0)
+)
 _CASES_BY_NAME = dict(_CASES)
 
 
@@ -50,7 +40,33 @@ def _crand(rng, *shape):
             + 1j * rng.standard_normal(shape)).astype("complex128")
 
 
-def _worker(case_name: str) -> int:
+def _dense_pair_rhs(psi, centroids, kgrid, weight_l, weight_r, vertex, vertex_right=None):
+    """Sum conjugate left and vertex-weighted right projectors at k and k+q."""
+    import numpy as np
+    from common.gamma_matrices import gamma_perm_phase
+
+    nk, _, ns, nr = psi.shape
+    matrices = []
+    for channel in (vertex, vertex if vertex_right is None else vertex_right):
+        matrix = np.eye(ns, dtype=np.complex128)
+        if channel:
+            perm, phase = gamma_perm_phase(channel)
+            matrix = np.asarray(phase)[:, None] * matrix[np.asarray(perm)]
+        matrices.append(matrix)
+    bra = psi[:, :, :, centroids].conj()
+    left = np.einsum("knam,knbr,n->kabmr", bra, psi, weight_l)
+    right = np.einsum("ac,kncm,bd,kndr,n->kabmr",
+                      matrices[0], bra, matrices[1], psi, weight_r)
+    result = np.zeros((nk, len(centroids), nr), dtype=np.complex128)
+    for q, qvec in enumerate(np.ndindex(kgrid)):
+        for k, kvec in enumerate(np.ndindex(kgrid)):
+            shifted = (np.asarray(kvec) + qvec) % np.asarray(kgrid)
+            kq = np.ravel_multi_index(tuple(shifted), kgrid)
+            result[q] += np.einsum("abmr,abmr->mr", left[k].conj(), right[kq])
+    return result
+
+
+def _worker(case_name: str, *, mesh_shape=(2, 2), return_arrays=False):
     import numpy as np
     import jax
     import jax.numpy as jnp
@@ -66,12 +82,11 @@ def _worker(case_name: str) -> int:
     case = _CASES_BY_NAME[case_name]
     ns = int(case["ns"])
     vertex = int(case.get("vertex", 0))
-    from common.gamma_matrices import gamma_perm_phase
-    gamma = None if vertex == 0 else gamma_perm_phase(vertex)
+    vertex_right = int(case.get("vertex_right", vertex))
     rng = np.random.default_rng(int(case["seed"]))
 
     devs = jax.devices()
-    PX = PY = 2
+    PX, PY = mesh_shape
     if len(devs) < PX * PY:
         print(json.dumps({"skip": f"only {len(devs)} devices (<{PX*PY})"}))
         return 0
@@ -119,8 +134,9 @@ def _worker(case_name: str) -> int:
     x_frac = grid_pts / np.asarray(fft_grid, dtype=np.float64)
 
     # ---- parents on the grid, children by the typed action --------------
-    nb_full = 8
-    l_range, r_range = (0, 5), (2, 8)
+    nb_full = int(case.get("nb", 8))
+    l_range = case.get("left", (0, 5))
+    r_range = case.get("right", (2, 8))
     psi_parent = _crand(rng, n_parent, nb_full, ns, n_rtot)
     psi_full = np.empty((nk, nb_full, ns, n_rtot), dtype=np.complex128)
     for k in range(nk):
@@ -158,10 +174,6 @@ def _worker(case_name: str) -> int:
     pack = plan.layout.axis.pack_host
     mun_sh = NamedSharding(mesh, P(None, None, "x", "y"))
     nmu_sh = NamedSharding(mesh, P(None, "x", None, "y"))
-    psi_mun_full = jax.device_put(jnp.asarray(pack(
-        psi_full[:, :, :, cent_flat].transpose(0, 2, 3, 1), axis=2)), mun_sh)
-    psi_nmu_full = jax.device_put(jnp.asarray(pack(
-        psi_full[:, :, :, cent_flat], axis=3)), nmu_sh)
     psi_nmu_pk = jax.device_put(jnp.asarray(pack(
         psi_parent[:, :, :, cent_flat], axis=3)), nmu_sh)
     psi_mun_pk = jax.device_put(jnp.asarray(pack(
@@ -175,7 +187,7 @@ def _worker(case_name: str) -> int:
         return np.fft.fftn(box, axes=(-3, -2, -1), norm="ortho").reshape(
             *u.shape[:3], n_rtot)
 
-    band_chunk_ranges = ((0, nb_full),)
+    band_chunk_ranges = ((0, 24), (24, 36)) if nb_full == 36 else ((0, nb_full),)
 
     class _MeshStore:
         def __init__(self, psi_G, kvecs):
@@ -183,7 +195,7 @@ def _worker(case_name: str) -> int:
             self._psi_G = psi_G
             self._py = PY
             self.band_chunk_ranges = band_chunk_ranges
-            self._bpd_max = nb_full // (PX * PY)
+            self._bpd_max = max(hi-lo for lo, hi in band_chunk_ranges) // (PX * PY)
             self.meta = SimpleNamespace(
                 fft_grid=fft_grid, nk_tot=nrows, nspinor=ns)
             g_index = np.broadcast_to(
@@ -197,9 +209,10 @@ def _worker(case_name: str) -> int:
 
         def read_local_band_chunk(self, x_idx, y_idx, bc_idx):
             r = int(x_idx) * self._py + int(y_idx)
-            bpd = self._bpd_max
+            lo, hi = band_chunk_ranges[int(bc_idx)]
+            bpd = (hi - lo) // (PX * PY)
             out = np.zeros(self._per_rank_shape, dtype=np.complex128)
-            out[:, :bpd] = self._psi_G[:, r * bpd:(r + 1) * bpd]
+            out[:, :bpd] = self._psi_G[:, lo + r * bpd:lo + (r + 1) * bpd]
             return out
 
         def _slice_local_tile_bc(self, x_idx, y_idx, bc_idx):
@@ -221,23 +234,15 @@ def _worker(case_name: str) -> int:
         def kvecs_frac(self):
             return self._k
 
-    full_store = _MeshStore(_coeffs(psi_full, kfrac), kfrac)
     parent_store = _MeshStore(_coeffs(psi_parent, parent_k), parent_k)
 
     idx = np.arange(nb_full)
     w_l = jnp.asarray(np.where((idx >= l_range[0]) & (idx < l_range[1]), 1.0, 0.0))
     w_r = jnp.asarray(np.where((idx >= r_range[0]) & (idx < r_range[1]), 1.0, 0.0))
 
-    # ---- reference: the established full-k face kernel on the whole grid --
-    Z_face = np.asarray(jax.block_until_ready(z_q_from_psi_sm(
-        psi_G_store=full_store, psi_r_cache=None,
-        band_chunk_ranges=band_chunk_ranges,
-        r_start_dyn=0, r_chunk_size=n_rtot,
-        kgrid=kgrid, mesh_xy=mesh, layout="face",
-        psi_mun=psi_mun_full, weight_l=w_l, weight_r=w_r,
-        cache_face_y_blocks=True, gamma_L=gamma, gamma_R=gamma)))               # (nk, mu_pk, 64)
-    # both routes run in the packed order; compare in canonical rows
-    Z_face = plan.layout.axis.unpack_host(Z_face, axis=1)   # (nk, 8, 64)
+    # Explicit q and band sums are independent of both production kernels.
+    Z_face = _dense_pair_rhs(psi_full, cent_flat, kgrid, np.asarray(w_l),
+                             np.asarray(w_r), vertex, vertex_right)
 
     # ---- parent route, both ψ(r) sources, every tile -------------------
     parent_cache = jax.block_until_ready(
@@ -245,6 +250,7 @@ def _worker(case_name: str) -> int:
     scale = float(np.max(np.abs(Z_face)))
     max_rel = 0.0
     max_pad = 0.0
+    reconstructed = np.zeros_like(Z_face)
     for t in range(tiles.n_tiles):
         local_perm, wraps = tiles.source_tables(t)
         r_index = tiles.r_index[t]
@@ -253,14 +259,13 @@ def _worker(case_name: str) -> int:
             Z_pk = z_q_from_psi_sm(
                 psi_G_store=parent_store, psi_r_cache=cache,
                 band_chunk_ranges=band_chunk_ranges,
-                r_start_dyn=0, r_chunk_size=tiles.width,
-                kgrid=kgrid, mesh_xy=mesh, layout="face",
+                kgrid=kgrid, mesh_xy=mesh,
                 psi_mun=psi_mun_pk, weight_l=w_l, weight_r=w_r,
-                k_unfold_plan=plan, gamma_L=vertex, gamma_R=vertex,
+                k_unfold_plan=plan, gamma_L=vertex, gamma_R=vertex_right,
                 tile_r_index=jnp.asarray(r_index, dtype=jnp.int32),
                 tile_local_perm=jnp.asarray(local_perm),
                 tile_wraps=jnp.asarray(wraps))
-            if vertex and cache is not None:
+            if vertex == vertex_right and vertex and cache is not None:
                 from isdf.core import _z_q_face_parent
                 coupled = _z_q_face_parent(
                     psi_mun_pk, parent_store, cache, w_l, w_r,
@@ -274,6 +279,7 @@ def _worker(case_name: str) -> int:
             Z_can = plan.layout.axis.unpack_host(
                 np.asarray(jax.block_until_ready(Z_pk)), axis=1)  # (nk, 8, width)
             assert Z_can.shape == (nk, 8, tiles.width), Z_can.shape
+            reconstructed[:, :, r_index[active]] = Z_can[:, :, active]
             diff = Z_can[:, :, active] - Z_face[:, :, r_index[active]]
             max_rel = max(max_rel, float(np.max(np.abs(diff))) / scale)
             if np.any(~active):
@@ -283,26 +289,19 @@ def _worker(case_name: str) -> int:
     def _local_gemm(a, b):
         return jnp.einsum("qmk,qkn->qmn", a, b, optimize=True)
 
-    C_face = np.asarray(jax.block_until_ready(c_q_from_psi_sm(
-        kgrid=kgrid, mesh_xy=mesh, layout="face",
-        psi_mun=psi_mun_full, psi_nmu=psi_nmu_full,
-        weight_l=w_l, weight_r=w_r, gemm=_local_gemm,
-        gamma_L=gamma, gamma_R=gamma)))
+    C_face = pack(pack(Z_face[:, :, cent_flat], axis=1), axis=2)
     C_parent = np.asarray(jax.block_until_ready(c_q_from_psi_sm(
         kgrid=kgrid, mesh_xy=mesh, layout="face",
         psi_mun=psi_mun_pk, psi_nmu=psi_nmu_pk,
         weight_l=w_l, weight_r=w_r, gemm=_local_gemm,
-        k_unfold_plan=plan, gamma_L=vertex, gamma_R=vertex)))
+        k_unfold_plan=plan, gamma_L=vertex, gamma_R=vertex_right)))
     c_rel = float(np.max(np.abs(C_parent - C_face))) / float(np.max(np.abs(C_face)))
 
     current_c_rel = None
     if ns == 4:
-        from common.gamma_matrices import gamma_perm_phase
-        C_current = np.asarray(jax.block_until_ready(c_q_from_psi_sm(
-            kgrid=kgrid, mesh_xy=mesh, layout="face",
-            psi_mun=psi_mun_full, psi_nmu=psi_nmu_full,
-            gamma_L=gamma_perm_phase(1), gamma_R=gamma_perm_phase(1),
-            weight_l=w_l, weight_r=w_r, gemm=_local_gemm)))
+        current_rhs = _dense_pair_rhs(psi_full, cent_flat, kgrid,
+                                       np.asarray(w_l), np.asarray(w_r), 1)
+        C_current = pack(pack(current_rhs[:, :, cent_flat], axis=1), axis=2)
         C_no_vertex = np.asarray(jax.block_until_ready(c_q_from_psi_sm(
             kgrid=kgrid, mesh_xy=mesh, layout="face",
             psi_mun=psi_mun_pk, psi_nmu=psi_nmu_pk,
@@ -312,12 +311,31 @@ def _worker(case_name: str) -> int:
     # The children are NOT trivially the parents: a route that forgot the
     # symmetry action entirely must be visibly wrong on this fixture.
     naive = float(np.max(np.abs(psi_full[[0, 1, 2, 3]] - psi_parent[irr])))
+    if return_arrays:
+        return reconstructed
     print(json.dumps({
         "max_rel": max_rel, "max_pad": max_pad, "c_rel": c_rel,
         "current_c_without_vertex_relative_difference": current_c_rel,
         "n_tiles": int(tiles.n_tiles), "width": int(tiles.width),
         "naive_child_parent_gap": naive / float(np.max(np.abs(psi_full))),
     }))
+    return 0
+
+
+def _cross_mesh_worker():
+    """Preserve short chunks across square meshes and refuse rectangular GW meshes."""
+    import numpy as np
+
+    reference = _worker("ns2_multi", mesh_shape=(1, 1), return_arrays=True)
+    worst = 0.0
+    for shape in ((2, 2),):
+        value = _worker("ns2_multi", mesh_shape=shape, return_arrays=True)
+        worst = max(worst, float(np.linalg.norm(value-reference)
+                                 / np.linalg.norm(reference)))
+    for shape in ((1, 2), (1, 3), (2, 3)):
+        with pytest.raises(ValueError, match="requires the GW square mesh"):
+            _worker("ns2_multi", mesh_shape=shape, return_arrays=True)
+    print(json.dumps({"worst_zq": worst, "meshes": 2, "refused_rectangles": 3}))
     return 0
 
 
@@ -345,17 +363,41 @@ def _run_worker(case_name: str, ndev: int = 4, timeout: int = 600):
 
 
 @pytest.mark.parametrize("name", [c[0] for c in _CASES])
-def test_parent_zq_and_cq_match_the_full_k_face_route(name):
+def test_parent_zq_and_cq_match_direct_full_k_sums(name):
     out = _run_worker(name)
     if "skip" in out:
         pytest.skip(f"parent ζ-fit parity: {out['skip']}")
     assert out["naive_child_parent_gap"] > 0.1, out
-    assert out["max_rel"] < _TOL, f"Z_q parent vs face: {out}"
+    assert out["max_rel"] < _TOL, f"Z_q parent vs direct sum: {out}"
     assert out["max_pad"] == 0.0, f"tile pad slots must be exactly zero: {out}"
-    assert out["c_rel"] < _TOL, f"C_q parent vs face: {out}"
+    assert out["c_rel"] < _TOL, f"C_q parent vs direct sum: {out}"
+
+
+def test_parent_short_band_chunks_are_mesh_invariant():
+    out = _run_worker("cross_mesh", ndev=6)
+    assert out["meshes"] == 2
+    assert out["refused_rectangles"] == 3
+    assert out["worst_zq"] < 1e-9, out
+
+
+
+def test_band_chunks_must_complete_before_pair_product():
+    """Negative oracle: per-chunk products omit cross-band-chunk terms."""
+    import numpy as np
+
+    left = np.asarray([1.0 + 2.0j, -0.5 + 0.25j])
+    right = np.asarray([0.75 - 0.5j, 2.0 + 1.5j])
+    completed_then_product = np.conj(left.sum()) * right.sum()
+    product_per_chunk = np.sum(np.conj(left) * right)
+    cross_terms = (np.conj(left[0]) * right[1]
+                   + np.conj(left[1]) * right[0])
+    np.testing.assert_allclose(
+        completed_then_product - product_per_chunk, cross_terms,
+        rtol=0.0, atol=1e-15)
+    assert not np.isclose(completed_then_product, product_per_chunk)
 
 
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "worker":
-        sys.exit(_worker(sys.argv[2]))
+        sys.exit(_cross_mesh_worker() if sys.argv[2] == "cross_mesh" else _worker(sys.argv[2]))
     raise SystemExit("usage: python test_isdf_zq_parent_parity.py worker <case>")

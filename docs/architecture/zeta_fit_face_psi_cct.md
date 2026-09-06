@@ -125,8 +125,9 @@ parents and projects through typed scalar/polar actions. Neither requires a
 persistent full-k GW wavefunction carrier. Unsupported non-RPA consumers
 and old full-face GW restart stores refuse explicitly.
 
-Old core Zq/full-face Cq implementations currently remain only as temporary
-independent test references pending their deletion concern. The legacy
+The GW Zq entry requires typed parents and orbit-tile tables; its old full-k
+kernels are deleted. Full-face Cq remains temporarily for a separate oracle
+migration and deletion concern. The legacy
 rectangular Cq implementation has a live downfold consumer and remains a
 shared service. Galerkin's BSE/htransform fit and generic sample loaders
 are separate and retained.
@@ -134,7 +135,7 @@ are separate and retained.
 ## Verification scope
 
 `tests/test_isdf_zq_parent_parity.py` exercises glide, k reduction,
-antiunitary rows and spin mixing against the independent full-face kernels;
+antiunitary rows and spin mixing against direct NumPy q/band sums, with all Lorentz pairs and short band chunks;
 `tests/test_parent_projector_unfold_oracle.py` compares typed projector
 transport to the wavefunction loader. Fresh physical fits and canonical
 processor-grid round trips are distinct gates from these algebra tests.

@@ -23,14 +23,13 @@ def test_z_q_phase_keeps_full_numerical_kernel_before_external_selection(
         kgrid=(5, 1, 1), fft_grid=(1, 1, 1),
     )
     fn = core._make_fit_one_rchunk_kernel(
-        mesh, meta, ((0, 1),), (0, 1), (0, 1), (0, 1), 6, 1,
+        mesh, meta, ((0, 1),), 1,
         object(), q_irr_full_idx=np.asarray([0, 3], dtype=np.int32),
-        layout="face")
+        k_unfold_plan=object())
     got = fn.z_q_phase(
-        None, None, jnp.ones((1,)), jnp.ones((1,)), jnp.int32(0),
-        jnp.zeros((1,), dtype=jnp.int32), jnp.ones((1,)), None,
+        None,
         jnp.zeros((1, 1, 4, 1), dtype=jnp.complex128),
-        jnp.ones((1,)), jnp.ones((1,)))
+        jnp.ones((1,)), jnp.ones((1,)), None, None, None)
 
     assert got.shape == (5, 4, 6)
     assert np.array_equal(np.asarray(got), np.asarray(full))

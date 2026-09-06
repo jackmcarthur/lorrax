@@ -109,30 +109,21 @@ def test_native_contract_names_fallback_and_rejects_aliasing():
     assert "kAxisMax = 24" in source
 
 
-def test_rchunk_gamma_attributes_are_captured_before_jit_trace():
-    source = (Path(__file__).resolve().parents[1]
-              / "src/isdf/core.py").read_text()
-    assert (
-        "gamma_static = None if is_charge else "
-        "_gamma_perm_phase_mu(vertex_mu_L)" in source)
-    assert "gamma_mu = gamma_static" in source
-    assert "int(vertex_mu_L)," in source
-
-
-def test_cq_and_zq_both_enter_the_shared_conv_plan():
+def test_rchunk_vertex_is_captured_before_jit_trace():
     import inspect
-    # Both public names are now thin ``layout=`` dispatchers (CCT half:
-    # c_q_from_psi_sm/_c_q_legacy/_c_q_face; r-chunk half:
-    # z_q_from_psi_sm/_z_q_legacy/_z_q_face -- see
-    # docs/architecture/zeta_fit_face_psi_cct.md).  ``_conv_kpair_setup``
-    # is called from the LEGACY body, not the dispatcher's own source
-    # (the face body never takes the native pair_kernel arm -- see
-    # _c_q_face's/_z_q_face's own docstrings for why); check the legacy
-    # bodies directly rather than the wrapper that merely routes to them.
-    from isdf.core import _c_q_legacy, _z_q_legacy
+    from isdf.core import _make_fit_one_rchunk_kernel, fit_one_rchunk
+
+    factory = inspect.getsource(_make_fit_one_rchunk_kernel)
+    assert "vertex_mu_L = int(vertex_mu_L)" in factory
+    assert "gamma_L=vertex_mu_L, gamma_R=vertex_mu_L" in factory
+    assert "int(vertex_mu_L)," in inspect.getsource(fit_one_rchunk)
+
+
+def test_shared_downfold_cq_enters_the_conv_plan():
+    import inspect
+    from isdf.core import _c_q_legacy
 
     assert "_conv_kpair_setup(" in inspect.getsource(_c_q_legacy)
-    assert "_conv_kpair_setup(" in inspect.getsource(_z_q_legacy)
 
 
 def test_ns2_setup_forwards_monomial_gamma_to_native_factory(monkeypatch):
