@@ -275,8 +275,8 @@ def compute_static_photon_sigma(
 
     @jax.jit
     def finish(value):
-        full = unfold_file_wedge_band_operator(sym, value, trs_rule="transpose")
-        return _replicate_band_sigma(full, mesh_xy)[:, :nb, :nb]
+        parent = _replicate_band_sigma(value, mesh_xy)[:, :nb, :nb]
+        return unfold_file_wedge_band_operator(sym, parent, trs_rule="transpose")
     sig_x, sig_sx, sig_coh = (finish(value) for value in totals)
     zero = jnp.zeros_like(totals[0])
     sectors = jnp.stack([finish(
