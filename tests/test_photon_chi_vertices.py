@@ -19,7 +19,9 @@ def test_current_chi_matches_literal_hermitian_density(monkeypatch):
         return gemm
 
     monkeypatch.setattr(distrib_la, "gemm_plan", local_gemm_plan)
-    mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ('x', 'y'))
+    side = 2 if len(jax.devices()) >= 4 else 1
+    mesh = Mesh(np.asarray(jax.devices()[:side * side]).reshape(side, side),
+                ('x', 'y'))
     rng = np.random.default_rng(84)
     left = rng.normal(size=(4, 4, 4)) + 1j * rng.normal(size=(4, 4, 4))
     right = rng.normal(size=(4, 4, 6)) + 1j * rng.normal(size=(4, 4, 6))
