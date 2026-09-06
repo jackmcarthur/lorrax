@@ -1,0 +1,10 @@
+run_id: MoS2_bisp_prof_zw_prepare_2026-09-06
+system: MoS2
+pipeline: lorrax_only
+platform: perlmutter
+source:
+  production_pin: 9f569c4bf75bad40e4f5895946874b4c503e4410
+steps:
+  preparation: {state: complete}
+  allocation: {state: failed, reason: QOSMaxSubmitJobPerUserLimit}
+  00_lorrax: {state: pending}
