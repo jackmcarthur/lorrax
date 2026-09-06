@@ -596,3 +596,137 @@ def test_sigma_oracle_rejects_transposed_gamma2(monkeypatch):
     monkeypatch.setattr(gamma, 'gamma_apply', wrong)
     with pytest.raises(AssertionError,match='Sigma'):
         test_parent_sigma_all_vertices_q_convolution_and_projection(monkeypatch)
+
+def _literal_q_restore(values, plan, rows, qfrac):
+    """Apply the explicit centroid and Lorentz matrices to each supplied q-parent block."""
+    out = []
+    for p, row in zip(plan.sym.irr_idx_q, rows):
+        phase = np.exp(2j*np.pi*(plan.L_table[row] @ qfrac[p]))
+        centroid = np.diag(phase) @ np.eye(plan.n_centroid_packed)[plan.sym_perm[row]]
+        action = np.kron(plan.sym.lorentz_action(np.array([row]))[0], centroid)
+        source = values[p]
+        if row >= plan.n_sym_spatial:
+            action, source = action.conj(), source.conj()
+        out.append(action @ source @ action.conj().T)
+    return np.array(out)
+
+
+def test_wrapper_selects_v_w_difference_fractional_occupations_and_sum_window(monkeypatch):
+    """The real wrapper restores V/W/W−V and sends occupied or sum weights with factors 1/1/−1/2."""
+    from gw import photon_sigma as owner
+    from gw.photon_layout import PhotonBasisLayout, pack_photon_operator
+    from gw.w_isdf import StaticPhotonResponse
+    from gw.qgrid_symmetry import qgrid_trs_policy_for
+    from symmetry_maps import bgw_integer_q_to_fractional
+    mesh, gamma = _mesh(), _gamma()[0]
+    plan = _toy_plan(mesh)
+    nmu, nq = plan.n_centroid_packed, len(plan.sym.q_irr_full_idx)
+    policy = qgrid_trs_policy_for(sym=plan.sym,irr_idx_q=plan.sym.irr_idx_q,
+        sym_idx_q=plan.sym.sym_idx_q,kgrid=(3,3,1),n_sym_spatial=2,context='wrapper oracle')
+    layout = PhotonBasisLayout.from_centroid_extents(nmu,nmu,mesh)
+    rng = np.random.default_rng(119)
+    v = rng.normal(size=(nq,4*nmu,4*nmu))+1j*rng.normal(size=(nq,4*nmu,4*nmu))
+    w = 2*v + np.eye(4*nmu)[None]
+    pack = lambda a: pack_photon_operator(lambda i,j:jnp.asarray(a[:,i*nmu:(i+1)*nmu,j*nmu:(j+1)*nmu]),nq,layout,mesh)
+    response = StaticPhotonResponse(layout,pack(v),pack(w),'none','toy',qgrid_policy=policy,family_plans=(plan,plan))
+    slices = SimpleNamespace(nb_sigma=2,nb_full=4,sigma_sum=slice(1,4))
+    masks = (np.array([0.,1.,1.,1.]),np.array([0.,1.,1.,0.]))
+    families = tuple(SimpleNamespace(green_parent=SimpleNamespace(plan=plan),slices=slices,
+        band_mask=lambda window,m=m:jnp.asarray(m)) for m in masks)
+    occ = np.array([[.25+.01*k,.75-.02*k] for k in range(9)])
+    gij = jnp.asarray([np.diag(row) for row in occ])
+    calls = []
+    def factory(mesh_arg,kgrid,nk,left,right,*,with_head):
+        assert not with_head and mesh_arg is mesh and nk == 9
+        def kernel(l,r,weights,interaction,factor,vertices,head):
+            calls.append((left,right,np.array(weights),float(factor),vertices))
+            assert head is None and l is left.green_parent and r is right.green_parent
+            return jnp.sum(interaction)*jnp.sum(weights*jnp.array([2.,3.,5.,7.]))*factor
+        return kernel
+    monkeypatch.setattr(owner,'_make_photon_static_block_kernel',factory)
+    qfrac = bgw_integer_q_to_fractional(plan.sym.q_irr_kgrid_int,(3,3,1))
+    keys = [(0,0),(0,2),(2,0),(1,3)]
+    for term, source in enumerate((v,w,w-v)):
+        full = _literal_q_restore(source,plan,policy.unfold_sym_idx,qfrac)
+        got = list(owner.contract_lorentz_blocks(keys,families=families,term=term,response=response,
+            Gij=gij,meta=SimpleNamespace(nk_tot=9,kgrid=(3,3,1)),mesh_xy=mesh))
+        for (a,b),actual,head in got:
+            left,right,weights,factor,vertices = calls.pop(0)
+            expected_weights = np.pad(occ,((0,0),(0,2))) if term < 2 else np.broadcast_to(masks[bool(a)],(9,4))
+            assert left is families[bool(a)] and right is families[bool(b)] and head is None
+            np.testing.assert_array_equal(weights,expected_weights)
+            assert factor == (1.,1.,-.5)[term]
+            for index,(perm,phase) in zip((a,b),vertices):
+                np.testing.assert_array_equal(np.asarray(phase)[:,None]*np.eye(4)[np.asarray(perm)],gamma[index])
+            expected = full[:,a*nmu:(a+1)*nmu,b*nmu:(b+1)*nmu].sum()*np.sum(expected_weights*[2.,3.,5.,7.])*(1.,1.,-.5)[term]
+            np.testing.assert_allclose(actual,expected,rtol=3e-12,atol=3e-12)
+
+
+@pytest.mark.parametrize('screened', [False, True])
+def test_dynamic_dispatch_books_static_current_once_in_x(tmp_path, monkeypatch, screened):
+    """Dynamic dispatch sends scalar X plus current SX+COH to finalization, with no extra bare current X."""
+    from gw import sigma_dispatch as dispatch, cohsex_sigma, photon_sigma, ppm_pipeline
+    from gw.gw_config import LorraxConfig, ComputeMode
+    path = tmp_path/'dynamic.in'
+    path.write_text('[cohsex]\nnval=2\nncond=2\nnband=10\nmemory_per_device_gb=4\n'
+        'bispinor=true\nbispinor_gw=bare_transverse\nsys_dim=2\nqp_solver=one_shot_dft\n'
+        'low_mem_bands=true\nlinalg=distributed\nrestart=false\nhead_correction=full\n'
+        'use_ppm_sigma=true\nppm_omega_p=2\nuse_band_extrapolation=false\ncompute_mode=gn_ppm\n')
+    config = LorraxConfig.from_input_file(str(path),print_fn=lambda *a:None)
+    charge = jnp.array([[[2.,1j],[-1j,3.]]])
+    bare = jnp.array([[[5.,2j],[-2j,7.]]])
+    sx = jnp.array([[[11.,3j],[-3j,13.]]]) if screened else bare
+    coh = jnp.array([[[17.,4j],[-4j,19.]]]) if screened else jnp.zeros_like(bare)
+    occupations, response, wfns, transverse = object(), object(), object(), object()
+    monkeypatch.setattr(cohsex_sigma,'_resolve_Gij',lambda *a:jnp.eye(2)[None])
+    def scalar(*args,**kw):
+        assert kw['wfns_transverse'] is None and kw['bispinor_v_q_path'] is None
+        return charge
+    monkeypatch.setattr(cohsex_sigma,'compute_sigma_x',scalar)
+    sectors = jnp.stack([jnp.zeros_like(bare),sx+coh,jnp.zeros_like(bare)])
+    def currents(**kw):
+        assert kw['blocks'] == photon_sigma.PHOTON_BLOCKS_CURRENT
+        assert kw['wfns_charge'] is wfns and kw['wfns_transverse'] is transverse
+        assert kw['response'] is response and not kw['head_diagnostics']
+        return bare,sx,coh,None,SimpleNamespace(components_skij_ry=sectors)
+    monkeypatch.setattr(photon_sigma,'compute_static_photon_sigma',currents)
+    fields = ('sigma_c_body_omega','head_sigma_diag_w_kn_ry','band_axis','band_extrapolation',
+        'sigma_c_body_omega_unextrap','sigma_c_odd_body_omega','probe_hermiticity_residual','odd_even_residue_ratio')
+    monkeypatch.setattr(ppm_pipeline,'compute_ppm_sigma_pipeline',lambda **kw:SimpleNamespace(**dict.fromkeys(fields)))
+    monkeypatch.setattr(dispatch,'finalize_dynamic_sigma',lambda *a,**kw:kw)
+    got = dispatch.compute_sigma_xc(ComputeMode.GN_PPM,wfns=wfns,V_q=None,W_by_role={'probe':None},
+        e_qp_ev=np.zeros((1,2)),static_head_terms=None,head_resolver=None,quad=None,config=config,
+        meta=None,mesh_xy=_mesh(),sym=None,wfn=None,band_slices=None,input_dir=str(tmp_path),
+        wfns_transverse=transverse,photon_response=response,occupation_state=occupations,
+        material_class='insulator',omit_v_h=True,print_fn=None)
+    expected = np.array([[[30.,8j],[-8j,35.]]]) if screened else np.array([[[7.,3j],[-3j,10.]]])
+    np.testing.assert_array_equal(got['sig_x'],expected)
+    np.testing.assert_array_equal(got['sigma_lorentz_static_skij_ry'],sectors)
+    assert got['photon_head_sigma_diag_tskn_ry'] is None
+
+
+def test_signed_current_z_host_store_fft_cancels_in_normal_solve():
+    """Actual parent host-store and k FFT tails give C=-Q and Z=-RHS for Gamma2, which cancel in the solve."""
+    import importlib.util
+    path = Path(__file__).resolve().parents[1] / 'test_isdf_zq_parent_parity.py'
+    spec = importlib.util.spec_from_file_location('parent_z_oracle', path)
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    data = fixture._worker('ns4_current2', return_fit_data=True)
+    psi, centroids, grid = data['psi'], data['centroids'], data['kgrid']
+    wl, wr = data['weights']
+    gamma = _gamma()[0][2]
+    physical = np.zeros_like(data['Z'])
+    for q, qvec in enumerate(np.ndindex(grid)):
+        for k, kvec in enumerate(np.ndindex(grid)):
+            kq = np.ravel_multi_index((np.asarray(kvec)+qvec)%grid, grid)
+            pair = np.einsum('nar,ab,mbr->nmr',psi[k].conj(),gamma,psi[kq])
+            physical[q] += np.einsum('nmu,nmr,n,m->ur',
+                pair[:,:,centroids].conj(),pair,wl,wr)
+    gram = physical[:,:,centroids]
+    np.testing.assert_allclose(data['Z'],-physical,rtol=3e-12,atol=3e-10)
+    np.testing.assert_allclose(data['C'],-gram,rtol=3e-12,atol=3e-10)
+    actual = np.linalg.solve(data['C'], data['Z'])
+    expected = np.linalg.solve(gram, physical)
+    np.testing.assert_allclose(actual,expected,rtol=3e-11,atol=3e-11)
+    assert np.max(np.abs(np.linalg.solve(data['C'],physical)-expected)) > .1

@@ -66,7 +66,7 @@ def _dense_pair_rhs(psi, centroids, kgrid, weight_l, weight_r, vertex, vertex_ri
     return result
 
 
-def _worker(case_name: str, *, mesh_shape=(2, 2), return_arrays=False):
+def _worker(case_name: str, *, mesh_shape=(2, 2), return_arrays=False, return_fit_data=False):
     import numpy as np
     import jax
     import jax.numpy as jnp
@@ -311,6 +311,11 @@ def _worker(case_name: str, *, mesh_shape=(2, 2), return_arrays=False):
     # The children are NOT trivially the parents: a route that forgot the
     # symmetry action entirely must be visibly wrong on this fixture.
     naive = float(np.max(np.abs(psi_full[[0, 1, 2, 3]] - psi_parent[irr])))
+    if return_fit_data:
+        return dict(Z=reconstructed, C=plan.layout.axis.unpack_host(
+            plan.layout.axis.unpack_host(C_parent, axis=1), axis=2),
+            psi=psi_full, centroids=cent_flat, weights=(np.asarray(w_l), np.asarray(w_r)),
+            kgrid=kgrid)
     if return_arrays:
         return reconstructed
     print(json.dumps({
