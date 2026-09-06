@@ -2578,17 +2578,8 @@ _PARENT_UNFOLD_SPECS = (P(None), P(None), P(None, None), P(None, None, None),
 _CHILD_FACE_KERNELS: dict = {}
 
 
-def iter_parent_children_faces(carrier, mesh_xy, *, slices):
-    """Yield ``(rows, child_bundle)`` per parent star of a
-    :class:`gw.wavefunction_bundle.ParentGreenCarrier`: the full-k rows that
-    are the children of one raw parent and a face bundle holding THEIR two
-    faces, built by the one-endpoint typed action
-    (``symmetry_maps.unfold_wavefunction_local``) from the packed parent
-    faces.  For consumers that need ψ itself at every k but only as a sum
-    over k (the q→0 head wings): one star is resident at a time, never a
-    full-k face.  ``child_bundle`` carries ``layout='face'``, ``psi_mun``/
-    ``psi_nmu`` at the star's rows, the parent's energies/occupations on
-    those rows, and ``slices``."""
+def iter_parent_children_faces(carrier, mesh_xy, *, slices, by_parent=True):
+    """Yield typed child faces in parent order, optionally as one full-k batch."""
     from types import SimpleNamespace
     from common.shard_map import shard_map
     from ffi import _services
@@ -2619,8 +2610,10 @@ def iter_parent_children_faces(carrier, mesh_xy, *, slices):
         return hit
 
     rep = lambda spec: NamedSharding(mesh_xy, spec)
-    for parent in range(int(plan.n_parent)):
-        rows = np.flatnonzero(irr_np == parent)
+    groups = [np.flatnonzero(irr_np == parent) for parent in range(int(plan.n_parent))]
+    if not by_parent:
+        groups = [np.concatenate(groups)]
+    for rows in groups:
         if rows.size == 0:
             continue
         r = jnp.asarray(rows, dtype=jnp.int32)
@@ -2636,8 +2629,8 @@ def iter_parent_children_faces(carrier, mesh_xy, *, slices):
                                  perm_y, L_y)
         yield rows, SimpleNamespace(
             layout="face", psi_mun=mun, psi_nmu=nmu, slices=slices,
-            enk=jnp.broadcast_to(carrier.enk[parent][None], (rows.size,) + carrier.enk.shape[1:]),
-            occ=jnp.broadcast_to(carrier.occ[parent][None], (rows.size,) + carrier.occ.shape[1:]))
+            enk=jnp.take(carrier.enk, irr_np[rows], axis=0),
+            occ=jnp.take(carrier.occ, irr_np[rows], axis=0))
 
 
 def _unfold_tables_from_operands(irr, sym, kfrac, U, perm_x, L_x, perm_y, L_y,
