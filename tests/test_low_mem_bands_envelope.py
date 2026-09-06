@@ -275,8 +275,8 @@ def test_gij_none_under_low_mem_bands_is_the_positive_twin(tmp_path):
     off = _config(tmp_path, "", name="lmb_off.in")
     refuse_explicit_gij_under_low_mem_bands(on, None)    # must not raise
     refuse_explicit_gij_under_low_mem_bands(off, None)   # must not raise
-    refuse_explicit_gij_under_low_mem_bands(               # must not raise
-        off, "an explicit Gij is FINE under low_mem_bands=false")
+    with pytest.raises(ValueError, match="explicit_gij_unported"):
+        refuse_explicit_gij_under_low_mem_bands(off, "explicit dense Gij")
 
 
 def test_compute_sigma_xc_checks_the_gij_row_before_any_kernel():
@@ -303,7 +303,7 @@ def test_compute_sigma_xc_checks_the_gij_row_before_any_kernel():
 def test_the_docs_name_the_live_gij_refusal():
     """The input reference must name the one live low-memory refusal."""
     page = (_REPO / "docs" / "input_reference.md").read_text()
-    assert "low_mem_bands = true` envelope" in page
+    assert "Raw-parent GW" in page
     assert "low_mem_bands_explicit_gij_unported" in page
 
 

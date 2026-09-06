@@ -10,6 +10,8 @@ import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.grouped_layout import build_square_grouped_shard_layout
+from common.centroid_basis import PackedCentroidBasis
+from gw.gw_init import _prepare_parent_wavefunction_plan
 from gw.centroid_k_unfold import (
     CentroidKUnfoldPlan,
     build_centroid_k_unfold_plan,
@@ -362,3 +364,37 @@ def test_four_spinor_face_vertex_follows_unfold_without_collectives():
     hlo = fn.lower(face).compile().as_text().lower()
     assert 'all-to-all(' not in hlo
     assert 'all-gather(' not in hlo
+
+
+def test_parent_plan_keeps_the_unreduced_one_band_case():
+    """An unreduced k table uses typed parents even with only one band."""
+    mesh = _mesh_2x2()
+    sym = _symmetry_fixture()
+    sym.sym_matrices = np.eye(3, dtype=np.int32)[None]
+    sym.translations = np.zeros((1, 3))
+    sym.irr_idx_k = np.arange(3, dtype=np.int32)
+    sym.sym_idx_k = np.zeros(3, dtype=np.int32)
+    sym.kirr_fullids = np.arange(3, dtype=np.int32)
+    centroids = np.asarray([[0, 0, 0], [1, 0, 0]], dtype=np.int32)
+    basis = PackedCentroidBasis.build(centroids, sym, (2, 2, 1), mesh)
+    meta = SimpleNamespace(nspinor=4, fft_grid=(2, 2, 1), mu_basis=basis)
+    cfg = SimpleNamespace(compute_mode=SimpleNamespace(needs_screening=True),
+                          screening=SimpleNamespace(diagrams="w_rpa"))
+    wfn = SimpleNamespace(kvecs=lambda *, k: sym.unfolded_kpts)
+    plan, green, storage = _prepare_parent_wavefunction_plan(
+        cfg, meta, wfn, SimpleNamespace(nb_full=1), sym=sym,
+        centroid_indices=centroids, mesh_xy=mesh)
+    assert plan.n_parent == plan.n_full == 3
+    assert green and storage
+    np.testing.assert_array_equal(plan.irr_idx, [0, 1, 2])
+    np.testing.assert_array_equal(plan.spin_action_full,
+                                  np.broadcast_to(np.eye(4), (3, 4, 4)))
+
+
+def test_non_rpa_consumer_refuses_before_parent_loading():
+    """Unported screening cannot retain a hidden full-k wavefunction carrier."""
+    cfg = SimpleNamespace(compute_mode=SimpleNamespace(needs_screening=True),
+                          screening=SimpleNamespace(diagrams="w_bse"))
+    with pytest.raises(ValueError, match="parent_screening_diagrams.*w_bse"):
+        _prepare_parent_wavefunction_plan(
+            cfg, None, None, None, sym=None, centroid_indices=None, mesh_xy=None)

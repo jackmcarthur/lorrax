@@ -3118,76 +3118,25 @@ def build_wavefunction_bundle(
 	return wfns
 
 
-def _parents_only_consumer_blockers(cfg) -> list:
-	"""Consumers of this run that still read FULL-k centroid faces.
-
-	Empty means every wavefunction consumer is parent-capable and the run
-	may store raw parents only (``gw_init`` parents-only storage).  Each
-	entry is the log line's reason. Non-RPA diagrams are not on the
-	parent χ0 route; SC rotates parents and rebuilds density on the IBZ.  Fractional occupations and the q→0 head wings are
-	parent-capable (the contour χ0 rides the Green transport, the pair
-	scans unfold band tiles from the packed parents, the wings stream the
-	children of one parent at a time; the velocity is on file at every k).
-	"""
-	blockers = []
-	if (bool(cfg.compute_mode.needs_screening)
-			and str(getattr(cfg.screening.diagrams, 'value',
-			                cfg.screening.diagrams)) != 'w_rpa'):
-		blockers.append("non-RPA screening diagrams")
-	return blockers
-
-
 def _prepare_parent_wavefunction_plan(
 	cfg, meta, wfn, band_slices, *, sym, centroid_indices, mesh_xy,
 	print_fn=print,
 ):
-	"""Build the shared parent plan before fit-specific memory planning.
+	"""Require exact typed parent transport for every supported GW consumer."""
+	from .centroid_k_unfold import build_centroid_k_unfold_plan
 
-	``centroid_indices`` is the host canonical ``(n_mu, 3)`` integer FFT-grid
-	table. The returned plan acts on the mesh-sharded packed runtime basis.
-
-	Returns
-	-------
-	plan : CentroidKUnfoldPlan or None
-	    Exact transport in the run's centroid basis, or the named full-k fallback.
-	green_candidate : bool
-	    Whether the plan exists and every consumer supports parent storage.
-	parents_only_wanted : bool
-	    Whether every wavefunction consumer can use raw-parent storage.
-	"""
-	can_use_parents = (
-		bool(cfg.memory.low_mem_bands) and int(meta.nspinor) in (1, 2, 4))
-	# Parents-only ψ storage: when every wavefunction consumer of
-	# this run is parent-capable, the full-k centroid faces are
-	# never formed and the raw parents are the run's only ψ.  Each
-	# consumer that still reads full-k faces keeps the run on full k
-	# and is named in the log.
-	blockers = (
-		_parents_only_consumer_blockers(cfg)
-		if can_use_parents else [])
-	parents_only_wanted = (
-		can_use_parents and not blockers)
-	if can_use_parents and blockers:
-		print_fn("  ψ storage: full-k faces kept because "
-		       + "; ".join(blockers) + ".")
-	plan = None
-	if can_use_parents:
-		from .centroid_k_unfold import build_centroid_k_unfold_plan
-		try:
-			plan = build_centroid_k_unfold_plan(
-				sym, centroid_indices, meta.fft_grid, mesh_xy,
-				nspinor=int(meta.nspinor),
-				parent_k_frac=wfn.kvecs(k='ibz'),
-				layout=meta.mu_basis.layout)
-		except (ValueError, RuntimeError) as plan_error:
-			# The symmetry service raises RuntimeError on a set that is not
-			# orbit-closed; both refusals mean the same thing here: full k.
-			print_fn(
-				"  Parent-k contraction inactive (Green and ζ fit): "
-				"the centroid basis cannot form an exact orbit-local "
-				f"plan ({plan_error}); using the full-k path.")
-			plan = None
-	return plan, bool(plan is not None and parents_only_wanted), parents_only_wanted
+	if (bool(cfg.compute_mode.needs_screening)
+			and str(getattr(cfg.screening.diagrams, 'value',
+			                cfg.screening.diagrams)) != 'w_rpa'):
+		raise ValueError(
+			"GATE parent_screening_diagrams: screening_diagrams = "
+			f"{getattr(cfg.screening.diagrams, 'value', cfg.screening.diagrams)} "
+			"has not been ported to raw parents; use screening_diagrams = w_rpa.")
+	plan = build_centroid_k_unfold_plan(
+		sym, centroid_indices, meta.fft_grid, mesh_xy,
+		nspinor=int(meta.nspinor), parent_k_frac=wfn.kvecs(k='ibz'),
+		layout=meta.mu_basis.layout)
+	return plan, True, True
 
 
 def prepare_isdf_and_wavefunctions(
@@ -3882,6 +3831,11 @@ def prepare_isdf_and_wavefunctions(
 		with timing.section(
 				"gw_jax.restart_load", announce=True,
 				label="restart load (metadata, SlabIO tensors, wedge, reshard)"):
+			with h5py.File(tensors_filename, 'r') as header:
+				if 'psi_parent_y' not in header or 'psi_parent_y_mun' not in header:
+					raise ValueError(
+						"GW restart requires raw-parent wavefunctions; this file stores "
+						"the retired full-k carrier. Rerun with restart = false.")
 			rs = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices,
 				n_rmu_logical=int(meta.n_rmu),
@@ -4004,23 +3958,11 @@ def prepare_isdf_and_wavefunctions(
 					# faces (k_irr rows) and no full-k ψ.  Rebuild the plan
 					# and the carrier; every consumer must be parent-capable,
 					# exactly as when the file was written.
-					_blockers = _parents_only_consumer_blockers(cfg)
-					if _blockers:
-						raise ValueError(
-							f"restart: {tensors_filename} stores raw-parent ψ "
-							"faces only (psi_parent_y), but this deck has "
-							"consumers that read full-k faces: "
-							+ "; ".join(_blockers)
-							+ ".  Rerun with restart = false, or drop those "
-							"consumers.")
-					from .centroid_k_unfold import build_centroid_k_unfold_plan
-					from .wavefunction_bundle import (
-						build_packed_parent_green_carrier)
-					_restart_plan = build_centroid_k_unfold_plan(
-						sym, centroid_indices, meta.fft_grid, mesh_xy,
-						nspinor=int(meta.nspinor),
-						parent_k_frac=wfn.kvecs(k='ibz'),
-						layout=meta.mu_basis.layout)
+					from .wavefunction_bundle import build_packed_parent_green_carrier
+					_restart_plan, _, _ = _prepare_parent_wavefunction_plan(
+						cfg, meta, wfn, band_slices, sym=sym,
+						centroid_indices=centroid_indices, mesh_xy=mesh_xy,
+						print_fn=print0)
 					if (_restart_plan.parent_full_rows is None
 							or not np.array_equal(
 								np.asarray(_restart_plan.parent_full_rows),
@@ -4188,9 +4130,10 @@ def prepare_isdf_and_wavefunctions(
 						enk_full=rs.enk_full, slices=band_slices,
 						mesh_xy=mesh_xy, basis_receipt=transverse_basis_receipt)
 					if rs.psi_nmu_parent_transverse is not None:
-						plan_T = build_centroid_k_unfold_plan(
-							sym, _cent_T_idx_now, meta.fft_grid, mesh_xy, nspinor=4,
-							parent_k_frac=wfn.kvecs(k='ibz'), layout=basis_T.layout)
+						plan_T, _, _ = _prepare_parent_wavefunction_plan(
+							cfg, meta_restart_transverse, wfn, band_slices, sym=sym,
+							centroid_indices=_cent_T_idx_now, mesh_xy=mesh_xy,
+							print_fn=print0)
 						carrier_T = build_packed_parent_green_carrier(
 							wfns_transverse,
 							_to_run_order(rs.psi_nmu_parent_transverse, (3,), basis_T),

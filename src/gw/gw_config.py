@@ -1902,7 +1902,7 @@ _DEFAULTS = {
     # reports/gwjax_low_mem_bands_audit_2026-08-22/report.md §6); an
     # unsupported combination refuses by name rather than silently
     # falling back to legacy.
-    "low_mem_bands": False,
+    "low_mem_bands": True,
     # ISDF
     # Which of the TWO W Dyson plans solves A·W = V, A = (1 - Vχ₀):
     #   local (default; auto is an alias)
@@ -4009,25 +4009,8 @@ def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
 
 
 def refuse_explicit_gij_under_low_mem_bands(config, Gij) -> None:
-    """Refuse an explicit dense ``Gij`` operand under ``low_mem_bands = true``.
-
-    This cannot be a deck-key refusal: an explicit ``Gij`` is a keyword-only
-    Python parameter of
-    ``compute_sigma_xc`` / ``compute_cohsex_sigma`` that every shipped
-    driver call site (``gw_jax.py``, ``sc_iteration.py``) leaves at its
-    ``None`` default — ``cohsex_sigma._resolve_Gij``'s docstring names the
-    caller this guards, the SC-COHSEX loop iterating on its own projector.
-    No deck-resolution point ever sees the value, so this is called from
-    ``compute_sigma_xc`` at entry instead, before any Gij-dependent
-    allocation (``build_Gij`` / the dense band-matrix contract) — the one
-    seam that ever sees both ``low_mem_bands`` and a live ``Gij`` operand
-    together.
-
-    NO-OP for ``Gij is None`` (every production call today) or
-    ``low_mem_bands = false``, so this feature existing changes nothing for
-    the vastly more common calls that never touch either axis.
-    """
-    if Gij is None or not bool(config.memory.low_mem_bands):
+    """Require diagonal occupation data for the parent Green contraction."""
+    if Gij is None:
         return
     raise ValueError(
         "GATE low_mem_bands_explicit_gij_unported: "
@@ -4036,8 +4019,7 @@ def refuse_explicit_gij_under_low_mem_bands(config, Gij) -> None:
         "band-space occupation projector)\n"
         "  want: Gij = None (the standard occupation_state path)\n"
         "  fix:  do not pass an explicit Gij under low_mem_bands = true — "
-        "the occupation_state argument already builds one — or set "
-        "low_mem_bands = false\n"
+        "use the occupation_state argument for diagonal weights\n"
         "  why:  cohsex_sigma.build_Gij returns a fully replicated dense "
         "(nk, nb_sigma, nb_sigma) array; under face psi, G and the "
         "Hartree/exchange projection need a face-sharded band-matrix "
@@ -5536,6 +5518,10 @@ class LorraxConfig:
             accelerator=str(_g("eqp2_accelerator")).strip().lower(),
             history_depth=int(_g("eqp2_history_depth")),
         )
+        if not bool(_g("low_mem_bands")):
+            print_fn(
+                "WARNING: low_mem_bands = false: the full-k carrier no longer "
+                "exists; proceeding on raw parents.")
         memory = MemoryConfig(
             per_device_gb=memory_per_device_gb,
             chunk_target_utilization=chunk_utilization,
@@ -5543,7 +5529,7 @@ class LorraxConfig:
             r_chunk_override=int(_g("r_chunk_size")),
             gflat_chunk_size=int(_g("gflat_chunk_size")),
             vq_g_chunk_size=int(_g("vq_g_chunk_size")),
-            low_mem_bands=bool(_g("low_mem_bands")),
+            low_mem_bands=True,
             low_mem_bands_provenance=(
                 "deck" if "low_mem_bands" in _named_keys else "default"),
         )
@@ -5769,54 +5755,6 @@ class LorraxConfig:
                 "never selected from mere presence; set restart = true "
                 "explicitly to enter the authenticated restart loader "
                 "(docs/input_reference.md, restart)")
-        # ``low_mem_bands`` is derived for the packed screened mode because
-        # its sixteen-block kernel has only the face carrier.  ``linalg`` is
-        # never derived here: its global default is local, and packed modes
-        # must explicitly select the distributed layout they require.
-        # Promote only when EVERY OTHER envelope row already passes: a deck
-        # that is outside the envelope for some other reason must still see
-        # that reason, not a low_mem_bands refusal it never asked for.  An
-        # explicitly named conflicting value is left alone and refused by
-        # the envelope (rule 13: refuse rather than ignore).
-        # ONE derivation site for every packed route.  Applicability and the
-        # derived-key names come from ``packed_static_envelope``; this code
-        # knows only how to set a named field.  Explicit conflicts survive
-        # and are refused (screened mode) or select the incumbent route
-        # (bare mode), never overwritten.
-        _packed_candidate = (
-            bool(resolved.bispinor)
-            and (resolved.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX
-                 or (resolved.bispinor_gw
-                     is BispinorGWMode.BARE_TRANSVERSE
-                     and int(resolved.sys_dim) == 2)))
-        if _packed_candidate:
-            _screened = (
-                resolved.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX)
-            _unmet = [row for row in packed_static_envelope(
-                resolved, screened=_screened) if not row[0]]
-            if _unmet and all(row[5] for row in _unmet):
-                _promotions = {"low_mem_bands": ("memory", True)}
-                for row in _unmet:
-                    key = row[5]
-                    if key in _named_keys:
-                        continue
-                    group, value = _promotions[key]
-                    resolved = _dc_replace(resolved, **{group: _dc_replace(
-                        getattr(resolved, group), **{key: value})})
-                    if key == "low_mem_bands":
-                        resolved = _dc_replace(
-                            resolved,
-                            memory=_dc_replace(
-                                resolved.memory,
-                                low_mem_bands_provenance=(
-                                    "derived for packed static envelope")))
-                    print_fn(
-                        "  [config provenance] packed_static_envelope "
-                        f"(bispinor_gw = {resolved.bispinor_gw.value}): "
-                        f"{key} was not named; setting "
-                        f"{key} = {value} (the packed response is written "
-                        "against this derived layout/plan; "
-                        "docs/input_reference.md, bispinor_gw)")
         # CROSS-KEY, and therefore after the record exists: the w_bse
         # refusals read resolved axes (compute_mode / qp_solver fold in the
         # legacy flags), and the honest way to ask which mode a deck chose

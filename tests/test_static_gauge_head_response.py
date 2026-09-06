@@ -421,7 +421,7 @@ def test_packed_runtime_refuses_a_config_less_call_before_opening_a_body():
     mesh = _mesh()
     with pytest.raises(ValueError, match="requires the run config"):
         compute_static_photon_response(
-            None, None, None, None, None, mesh, screen_current=True,
+            None, None, None, None, None, mesh, screen_current=True, mu_bases=None,
             config=None)
 
 
@@ -433,7 +433,7 @@ def test_packed_runtime_refuses_no_local_fields_before_opening_a_body():
     )
     with pytest.raises(ValueError, match="head_correction=full"):
         compute_static_photon_response(
-            None, None, None, None, None, mesh, screen_current=True,
+            None, None, None, None, None, mesh, screen_current=True, mu_bases=None,
             config=config)
 
 
@@ -580,20 +580,21 @@ def test_mode_required_settings_are_derived_from_the_envelope_table(tmp_path):
     assert config.memory.low_mem_bands is True
     assert str(config.backend.linalg) == "distributed"
     assert uses_static_photon_response(config)
-    assert any("low_mem_bands was not named" in ln for ln in lines), lines
+    assert not any("WARNING" in ln for ln in lines), lines
     assert not any("linalg was not named" in ln for ln in lines), lines
 
 
-def test_an_explicit_conflicting_value_is_still_refused_not_overridden(
-        tmp_path):
-    """Rule 13: derive what the deck left unsaid, refuse what it said."""
+def test_retired_full_carrier_key_warns_and_uses_parents(tmp_path):
+    """The temporary compatibility ruling accepts false with an explicit warning."""
     deck = _packed_deck().replace(
         "low_mem_bands = true", "low_mem_bands = false")
-    with pytest.raises(ValueError) as exc:
-        _parse(tmp_path, deck)
-    message = str(exc.value)
-    assert "static_bispinor_photon_envelope" in message
-    assert "low_mem_bands = false" in message
+    path = tmp_path / "retired.in"
+    path.write_text(deck)
+    lines = []
+    config = LorraxConfig.from_input_file(str(path), print_fn=lines.append)
+    assert config.memory.low_mem_bands is True
+    assert uses_static_photon_response(config)
+    assert any("WARNING: low_mem_bands = false" in line for line in lines)
 
 
 def test_a_deck_outside_the_envelope_still_sees_its_own_reason(tmp_path):

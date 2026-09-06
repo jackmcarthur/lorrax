@@ -64,10 +64,10 @@ page has to read it from.
 | `gamma_contract_mode` | `"take"` | HLO variant of the gamma-tilde double contraction: take (default) | einsum | scan; math-identical. |
 | `memory_per_device_gb` | `0.0` | Per-device memory budget for the chunk planners; 0 = auto-detect. |
 | `r_chunk_size` | `0` | Real-space columns per zeta-fit chunk; 0 = auto from the memory model. |
-| `low_mem_bands` | `false` | Boolean band-carrier choice and capacity escape hatch. `true` uses the two-face, two-axis-sharded wavefunction carrier and automatic band chunks (currently requested as 16, then mesh-rounded and capped at the logical zeta window); it saves memory but takes longer. Dynamic MPA/PPM Sigma pays three distributed band GEMMs for every tau dispatch in this layout, so multi-node runs must keep the default `false` whenever the full-band legacy carrier fits. `mpa_pole_batch_size` changes the dispatch count but does not remove those distributed contractions. The numeric `band_chunk_size` deck key is retired. The startup report prints the resolved boolean with provenance and, when true, the actual automatic chunk warning. The packed screened-current envelope may derive an unnamed value to true because that kernel has only the face carrier; an explicit false refuses. |
+| `low_mem_bands` | `true` | Temporary compatibility key: `true` is the raw-parent route; `false` prints a WARNING and proceeds on parents. Full-k wavefunction carrier selection is retired. Refusal of the key itself remains an owner ruling. |
 | `zeta_cutoff` | None | Zeta-sphere G-cutoff (Ry) for per-q zeta_q_G writes; None = ecutwfc; must be >= bare_coulomb_cutoff. |
 
-**`low_mem_bands = true` envelope at `34228021`.** The former mode-wide refusal table is empty. Parsing and `gw.gw_init.prepare_isdf_and_wavefunctions` still re-run the support checks, while an explicit keyword-only `Gij` is checked at `compute_sigma_xc`, the only seam that sees both operands. Dynamic modes use the face carrier; MPA additionally requires its sharded Sigma executor and a Sigma band window divisible by the mesh axes.
+**Raw-parent GW.** Exact typed centroid transport is mandatory; a nonclosed required centroid action refuses rather than selecting full-k storage. Unported non-RPA screening refuses by name. GW restart requires raw-parent datasets; regenerate older full-k files with `restart = false`. An explicit dense `Gij` remains refused; pass diagonal occupations through `occupation_state`.
 
 | combination | status | rule id / lift condition |
 |---|---|---|

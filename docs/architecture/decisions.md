@@ -669,3 +669,8 @@ rotates with the same iteration U/E as charge and reaches bare TT exchange.
 pullbacks alone cannot project a vector current.
 
 2026-09-05 BISP-ORCH: raw-parent transport no longer evaluates the former hardware/band-count profitability score. `parent_k_contraction_profitable` and `_resolve_parent_green_admission` are removed; exact typed transport is the required route under the one-order decision. Final carrier deletion is tracked by the bispinor parent-route report.
+
+GW admission requires typed parent transport even for unreduced one-band decks.
+`low_mem_bands` defaults to true; an explicit false prints a warning and uses
+parents. Refusal-by-name remains pending. Non-RPA screening and old full-k
+restart carriers refuse before sampling/loading; neither selects a fallback.
