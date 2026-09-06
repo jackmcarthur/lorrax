@@ -1343,8 +1343,10 @@ The final antiunitary band transpose is also proved for complex dynamic
 frequency sums by `test_deferred_band_unfold_preserves_complex_frequency_weighted_tau`:
 three complex nodes, two complex frequency weights, non-Hermitian off-diagonal
 outputs, and a wrong-conjugation red twin. The transpose follows the frequency
-sum. Actual Si/Mo tau executables have zero explicit HLO collectives after the
-typed Green partner placement repair; native distributed GEMM traffic remains.
+sum. Historical Si/Mo tau captures had zero explicit HLO collectives after
+the typed Green partner placement repair. The final route unfolds endpoint
+faces before one Green GEMM and deletes that partner branch; native distributed
+GEMM traffic remains, with the final capture recorded in the campaign report.
 
 The production self-energy audit flag is complemented by matched-store,
 matched-native-rule Si/Mo parent versus fixed-main gates (claims1239–1247),

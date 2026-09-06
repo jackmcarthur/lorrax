@@ -708,7 +708,7 @@ GW tau and static-limit spatial factories require the typed parent plan and cano
 
 ### 2026-09-06 — head attribution is opt-in
 
-The existing `sigma_freq_debug_output` switch alone enables head-attribution diagnostics and their output. Physical Γ completion is independent of that switch. Each enabled Lorentz-block contraction reuses its body Green function for the Γ-only attribution, retaining one full-q interaction at a time. This follows the final parent-route plan §7 performance ruling.
+The existing `sigma_freq_debug_output` switch alone enables head-attribution diagnostics and their output. Physical Γ completion is independent of that switch. Each enabled endpoint-family class reuses its body Green function for the Γ-only attribution. The subsequently required S phase-2 producer materializes its class interaction stack before the compiled vertex scan; the earlier one-full-q-block residency statement no longer describes that consumer.
 
 
 ### 2026-09-06 — fresh GW fits require raw parents
@@ -732,3 +732,8 @@ Dynamic band projection returns raw parent rows. The complex-linear band transpo
 ### 2026-09-06 — BSE consumes raw-parent GW restart faces
 
 The full landing gate exposed a downstream reader left behind by the GW carrier deletion. `bse_loading._unfold_bse_parent_faces` authenticates the WFN source, centroid content and parent-row mapping, then uses the existing packed basis and typed parent unfold for the selected valence/conduction bands. BSE receives its established full-k selected-band inputs; GW neither stores nor restores a full-k carrier. Legacy full-k files retain their reader. This consumer helper is a gate-driven correction to the frozen deletion list, not a second symmetry implementation. The parent seam uses the existing square-mesh plan; the single-device reference uses its existing local mesh.
+
+
+### 2026-09-06 — adopted S phase-2 class residency
+
+The ordered phase-2 integration adopts one compiled Sigma scan and one restore producer per endpoint-family class. The producer returns 1 CC, 3 CT/TC or 9 TT full-q blocks, with centroid axes distributed over all P ranks. This is a correction to the original one-full-q-block residency contract: a TT stack uses `9 * nk_tot * M_T_packed**2 * sizeof(complex128) / P` bytes per rank. It is transient per class, not an interaction cache; each executable shares one Green. Classes are submitted without intervening host fences, so a globally single-class memory lifetime does not follow from this source structure. The campaign report records the measured whole-process allocator peak and the lane gate supporting this explicitly requested integration.

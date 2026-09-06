@@ -505,7 +505,7 @@ there is the dynamic model's, not the packed completion's.
 | object | producer | shape | sharding | route |
 |---|---|---|---|---|
 | sixteen-block `Σ_X`, `Σ_SX`, `Σ_COH` (fifteen non-CC blocks for `blocks="current"`) | `photon_sigma.compute_static_photon_sigma` | `(nk, nb_sigma, nb_sigma)` after parent-sector sum and typed band unfold | replicated only at the band-output boundary | P |
-| one full-q interaction | `w_isdf.photon_blocks_full_q` | `(nk_tot, n_left, n_right)` | `P(None,'x','y')`; q-IBZ source stays packed | both |
+| full-q interaction class | `photon_sigma._make_photon_class_restore`, using `w_isdf.photon_blocks_full_q` | `(n_block, nk_tot, n_left, n_right)`, n_block = 1, 3 or 9 | `P(None,None,'x','y')`; q-IBZ source stays packed | both |
 | Green function | `greens_function_kernel.build_G` | `(nk, ns, μ_L, ns, μ_R)` | `P(None,None,'x',None,'y')` | both |
 | head-attribution block | `photon_layout.photon_q0_low_rank_block` | `(1, p_A, p_B)` | `P(None,'x','y')` | P |
 | bare transverse exchange | `sigma_x_bispinor.compute_sigma_x_bispinor` calls `photon_sigma.contract_lorentz_blocks` with nine TT keys and X term | parent-band sum, then full-k band operator | all-P projection; replicated output window | B |
@@ -514,8 +514,9 @@ there is the dynamic model's, not the packed completion's.
 `contract_lorentz_blocks` is the shared X/SX/COH block consumer. It chooses
 raw-parent endpoint families, unfolds each endpoint through its typed plan,
 and applies the requested vertex afterward inside the static kernel. The
-outer projection uses unvertexed parent faces. Each interaction and head
-block completes before the next is requested. CC, CT+TC, and TT sums are
+outer projection uses unvertexed parent faces. Endpoint-family classes are
+submitted in sequence without a host fence between them; each full-q
+interaction stack is an input to its compiled vertex scan. CC, CT+TC, and TT sums are
 formed on parents before band unfold: an individual Lorentz block is not
 covariant. `GATE photon_head_sigma_sector_closure` checks the diagnostic sum
 against the independently accumulated total. The former
@@ -710,8 +711,9 @@ contact subtracts the Γ row at q-IBZ before Dyson, then follows typed star
 transport. It preserves the proxy model while correcting its covariance.
 
 V and W stay packed at q-IBZ. `photon_blocks_full_q(response, keys, term=...)`
-restores V, W or W−V one requested Lorentz block at a time. It uses the measured
-q-grid policy and family plans retained by `StaticPhotonResponse`; Γ remains
+yields V, W or W−V one requested Lorentz block at a time. The static Sigma
+class producer stacks those yields for its compiled scan; this is not
+one-block residency at the consumer. It uses the measured q-grid policy and family plans retained by `StaticPhotonResponse`; Γ remains
 row zero. The V reader and literal-G=0 vectors enter packed centroid order at
 the file seam, using the existing C/T bases returned by ISDF preparation.
 
@@ -737,7 +739,7 @@ the head mechanism. Older packed files missing the factors refuse by name.
 
 The head attribution flag controls diagnostics only: both packed dispatch paths pass it to `compute_static_photon_sigma`, and `contract_lorentz_blocks` reuses each body Green tensor for the optional Γ-only contraction. Physical Γ completion and ordinary `Sigma blocks` output remain independent of this switch.
 
-The Gamma completion transports rank-four factor pairs over the authenticated active group and averages their products through `_photon_q0_factor_orbit`; physical updates and optional head attribution share that owner. The carrier stores the original factor pairs plus family-plan metadata, not a dense group projector. Dynamic tau projection accumulates file-wedge band rows and applies `unfold_file_wedge_band_operator(..., trs_rule="transpose")` after the frequency sum. Its Green endpoint transpose may be supplied directly by the sole planned Green GEMM, with unchanged complex-time weights; the typed symmetry service owns its placement and transport. See the 2026-09-06 decision for this interface correction.
+The Gamma completion transports rank-four factor pairs over the authenticated active group and averages their products through `_photon_q0_factor_orbit`; physical updates and optional head attribution share that owner. The carrier stores the original factor pairs plus family-plan metadata, not a dense group projector. Dynamic tau projection accumulates file-wedge band rows and applies `unfold_file_wedge_band_operator(..., trs_rule="transpose")` after the frequency sum. Its Green contraction unfolds both endpoint faces through the typed symmetry plan before one planned GEMM, with unchanged complex-time weights. See the 2026-09-06 decision for this interface correction.
 
 BSE restart reads select valence/conduction bands from canonical `psi_parent_y`, authenticate their WFN/centroid/parent-row provenance, and pack/unfold/unpack through the same typed parent plan before entering existing BSE contractions. Legacy `psi_full_y` files remain readable. This boundary expands only the requested BSE bands and does not add a GW full-k carrier.
 
