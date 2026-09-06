@@ -553,14 +553,17 @@ class GWProductionReport:
             return total(selected)
 
         isdf_total = top_level("gw_jax.isdf")
-        zeta = outer_prefixed(
-            "gw_jax.zeta_fit_chunked", within="gw_jax.isdf")
+        zeta = total(lambda r: r["name"] == "gw_jax.zeta_fit_chunked"
+                     and tuple(r.get("path", ()))[:1] == ("gw_jax.isdf",))
+        zeta_transverse = outer_prefixed(
+            "gw_jax.zeta_fit_transverse", within="gw_jax.isdf")
         v_q = total(lambda r: r["name"] == "gw_jax.V_q_compute"
                     and tuple(r.get("path", ()))[:1] == ("gw_jax.isdf",))
         restart_load = total(
             lambda r: r["name"] == "gw_jax.restart_load"
             and tuple(r.get("path", ()))[:1] == ("gw_jax.isdf",))
-        isdf_support = max(isdf_total - zeta - v_q - restart_load, 0.0)
+        isdf_support = max(
+            isdf_total - zeta - zeta_transverse - v_q - restart_load, 0.0)
 
         screening_total = top_level("gw_jax.screening")
         chi0 = outer_prefixed("chi.", within="gw_jax.screening")
@@ -582,6 +585,7 @@ class GWProductionReport:
             ("pre-main + imports", top_level("gw_jax.imports")),
             ("input + run setup", top_level("gw_jax.startup")),
             ("zeta", zeta),
+            ("zeta transverse", zeta_transverse),
             ("V(q)", v_q),
             ("restart load", restart_load),
             ("ISDF setup + I/O", isdf_support),

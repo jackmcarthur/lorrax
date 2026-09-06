@@ -345,6 +345,34 @@ def test_timing_report_hides_sub_display_precision_residuals(tmp_path):
     assert "other driver work            0.50" in text
 
 
+def test_transverse_timing_counts_outer_wall_once(tmp_path):
+    """Overlapping current workers contribute their enclosing wall interval once."""
+    path = tmp_path / "gwjax.out"
+    report = GWProductionReport(
+        str(path), runtime=_runtime(), debug=False, stdout=lambda line: None)
+    report.timings([
+        {"name": "gw_jax.isdf", "path": ("gw_jax.isdf",), "inclusive": 8.0},
+        {"name": "gw_jax.zeta_fit_chunked",
+         "path": ("gw_jax.isdf", "gw_jax.zeta_fit_chunked"), "inclusive": 1.0},
+        {"name": "gw_jax.zeta_fit_transverse",
+         "path": ("gw_jax.isdf", "gw_jax.zeta_fit_transverse"), "inclusive": 4.0},
+        {"name": "gw_jax.zeta_fit_chunked_mu1",
+         "path": ("gw_jax.zeta_fit_chunked_mu1",), "inclusive": 3.0},
+        {"name": "gw_jax.zeta_fit_chunked_mu2",
+         "path": ("gw_jax.zeta_fit_chunked_mu2",), "inclusive": 3.0},
+        {"name": "gw_jax.zeta_fit_chunked_mu3",
+         "path": ("gw_jax.zeta_fit_chunked_mu3",), "inclusive": 3.0},
+        {"name": "gw_jax.V_q_compute",
+         "path": ("gw_jax.isdf", "gw_jax.V_q_compute"), "inclusive": 1.0},
+    ], wall=10.0)
+    report.finish()
+    text = path.read_text()
+    assert "zeta                         1.00" in text
+    assert "zeta transverse              4.00" in text
+    assert "ISDF setup + I/O             2.00" in text
+    assert "other driver work            2.00" in text
+
+
 def test_report_collapses_minimax_catalog_receipts(tmp_path):
     path = tmp_path / "gwjax.out"
     report = GWProductionReport(
@@ -397,7 +425,7 @@ def test_local_linalg_warning_has_dense_matrix_numbers(tmp_path):
     assert "[config provenance] low_mem_bands = false (default)" in text
 
 
-def test_low_mem_bands_warning_has_automatic_chunk_number(tmp_path):
+def test_parent_carrier_description_has_automatic_chunk_number(tmp_path):
     path = tmp_path / "gwjax.out"
     config = _config()
     config.memory.low_mem_bands = True
@@ -412,10 +440,9 @@ def test_low_mem_bands_warning_has_automatic_chunk_number(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert "[config provenance] low_mem_bands = true (deck)" in text
     assert (
-        "low_mem_bands = true is a capacity escape hatch: saves memory "
-        "(band chunks of 24) but takes longer; set false whenever the "
-        "full-band carrier fits, especially for multi-node dynamic Sigma "
-        "sweeps" in text)
+        "low_mem_bands = true: the two-face wavefunction carrier (band "
+        "chunks of 24); required for the raw-parent (k_irr) route" in text)
+    assert "set false" not in text
 
 
 def test_distributed_linalg_reports_2d_layout(tmp_path):
