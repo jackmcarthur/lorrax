@@ -66,3 +66,17 @@ def test_lorentz_mixer_tt_identity_and_rectangular_ct():
     for j in (1, 2, 3):
         np.testing.assert_allclose(mixed[0, j], action[:, j-1, 1, None, None] * ct,
                                    atol=1e-14)
+
+
+def test_selected_lorentz_output_matches_complete_sector():
+    """Selecting one rectangular sector output avoids allocating its sibling blocks."""
+    sym = SymMaps(read_deck("si_bse_debug"))
+    rows = np.arange(96)
+    mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ('x', 'y'))
+    values = jnp.arange(96 * 6 * 4, dtype=jnp.float64).reshape(96, 6, 4)
+    blocks = {(0, 1): values, (0, 2): values * 2, (0, 3): values * -3}
+    complete = mix_lorentz_blocks(blocks, sym=sym, sym_idx=rows, mesh_xy=mesh)
+    selected = mix_lorentz_blocks(blocks, sym=sym, sym_idx=rows,
+                                  mesh_xy=mesh, keys=((0, 2), (1, 1)))
+    assert set(selected) == {(0, 2)}
+    np.testing.assert_allclose(selected[0, 2], complete[0, 2], atol=1e-12)

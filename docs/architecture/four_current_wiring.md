@@ -699,3 +699,17 @@ uphold when editing, not as something the tree checks for you.
 | Γ-cell quadrature ownership and the remaining scalar-versus-packed insertion distinction | [Four-current heads and frequency](../theory/four-current-head-corrections.md) §3.6 — both routes use the Wigner–Seitz polygon cubature; insertion is still route-specific |
 | what freezing the current blocks at ω = 0 inside a dynamic run costs (1.2 × 10⁻⁸ eV on MoS2 3×3, and it bounds the neglected frequency dependence from above) | [Four-current heads and frequency](../theory/four-current-head-corrections.md) §2.2 |
 | the narrative introduction, for a reader rather than an editor | `manual/08_bispinor/` (repo only, not in this site) |
+
+### Raw-parent photon body (2026-09-05)
+
+Both endpoint families carry raw four-spinor parent faces in their own packed
+centroid orders. The current-response kernel takes `(plan_left, plan_right)`
+and integer `(A,B)` vertices. Typed face transport precedes the vertex trace;
+the completed χ block is selected on the q-IBZ rows. The experimental TT
+contact subtraction remains the same model.
+
+V and W stay packed at q-IBZ. `photon_blocks_full_q(response, keys, term=...)`
+restores V, W or W−V one requested Lorentz block at a time. It uses the measured
+q-grid policy and family plans retained by `StaticPhotonResponse`; Γ remains
+row zero. The V reader and literal-G=0 vectors enter packed centroid order at
+the file seam, using the existing C/T bases returned by ISDF preparation.

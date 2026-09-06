@@ -974,9 +974,13 @@ def read_tensor(
     require_persisted: bool = True,
     expect_centroid_hash: str | None = None,
     expect_table_hash: str | None = None,
+    metadata_only: bool = False,
     mode: str = "r",
 ):
     """Read ``name``, unfolding to the full BZ when it is stored on a wedge.
+
+    ``metadata_only=True`` validates the same receipts and returns ``(None, header)``
+    without reading or unfolding the tensor payload.
 
     Returns ``(array, header)``.  The header is not optional decoration:
     ``header.data_ready`` is the persisted flag, ``header.q_storage`` says
@@ -1048,7 +1052,7 @@ def read_tensor(
                     f"PARTIAL stamp is not, because the missing half is "
                     f"exactly what would say whether the shape means what "
                     f"it looks like.")
-            return ds[()], QirrHeader(
+            return (None if metadata_only else ds[()]), QirrHeader(
                 q_storage="full", format_version=None,
                 n_q_on_disk=int(ds.shape[0]), n_q_full=None,
                 n_mu=int(ds.shape[-1]) if ds.ndim >= 1 else None,
@@ -1145,6 +1149,8 @@ def read_tensor(
                 f"written.  Pass require_persisted=False only to inspect "
                 f"the placeholder deliberately.")
 
+        if metadata_only:
+            return None, header
         raw = ds[()]
 
     if not unfold or shape_says == "full":

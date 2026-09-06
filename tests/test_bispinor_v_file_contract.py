@@ -43,6 +43,19 @@ def _write_tile_stage(path):
                 dtype=np.complex128,
             )
 
+    from symmetry_maps import QirrTables, stamp_qirr_tensor, verify_centroid_orbit_closure
+    for a, b in UNIQUE_TILES:
+        nmu = N_C if a == 0 else N_T
+        points = np.zeros((nmu, 3))
+        points[:, 0] = np.arange(nmu) / nmu
+        verdict = verify_centroid_orbit_closure(
+            points, np.eye(3, dtype=int)[None], tau=np.zeros((1, 3)))
+        tables = QirrTables(np.arange(2), np.zeros(2, dtype=int),
+            np.asarray([[0., 0., 0.], [.5, 0., 0.]]),
+            np.tile(np.arange(nmu), (2, 1)), np.zeros((2, nmu, 3), dtype=int), 1)
+        stamp_qirr_tensor(path, tile_dataset_name(a, b), tables=tables,
+                           closure_verdict=verdict, n_rmu_logical=nmu)
+
 
 def _publish_tile_stage(path):
     with h5py.File(path, "a") as f:
@@ -205,3 +218,41 @@ def test_reader_accepts_complete_certified_file(tmp_path, monkeypatch):
         assert reader.n_rmu_T == N_T
 
     assert opened == [(path, "r", mesh)]
+
+
+def test_reader_refuses_unstamped_full_q_file(tmp_path, monkeypatch):
+    path = tmp_path / "legacy_full_q.h5"
+    _write_complete_file(path)
+    with h5py.File(path, "a") as f:
+        f[tile_dataset_name(0, 0)].attrs.clear()
+    opened = _refusing_collective(monkeypatch)
+    with pytest.raises(ValueError, match="rerun with restart=false"):
+        BispinorVqReader(path, object())
+    assert not opened
+
+
+def test_reader_refuses_disagreeing_current_family_tables(tmp_path, monkeypatch):
+    from symmetry_maps import QIRR_TABLE_SUFFIX
+    path = tmp_path / "torn_current_family.h5"
+    _write_complete_file(path)
+    with h5py.File(path, "a") as f:
+        f[tile_dataset_name(2, 3) + QIRR_TABLE_SUFFIX]["L_table"][0, 0, 0] = 1
+    opened = _refusing_collective(monkeypatch)
+    with pytest.raises(ValueError, match="torn V tiles"):
+        BispinorVqReader(path, object())
+    assert not opened
+
+
+@pytest.mark.parametrize("attribute,value", [
+    ("qirr_format_version", 999), ("qirr_table_hash", "corrupted"),
+    ("qirr_data_ready", False),
+])
+def test_reader_authenticates_each_tile_receipt(tmp_path, monkeypatch, attribute, value):
+    path = tmp_path / "corrupt_receipt.h5"
+    _write_complete_file(path)
+    with h5py.File(path, "a") as f:
+        f[tile_dataset_name(1, 2)].attrs[attribute] = value
+    opened = _refusing_collective(monkeypatch)
+    with pytest.raises(ValueError, match="torn V tiles"):
+        BispinorVqReader(path, object())
+    assert not opened

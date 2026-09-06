@@ -131,8 +131,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             complex_contour: bool = False,
                             layout: str = "legacy", face_shape=None,
                             right_face_shape=None,
-                            vertex_pair: bool = False,
-                            vertex_identity=(False, False),
+                            vertex_pair=None,
                             k_unfold_plan=None):
     """Build chi0 kernel with device-local FFTs.  Returns flat-q χ₀(nq, μ, μ).
 
@@ -170,10 +169,10 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         raise ValueError(
             f"_get_chi_minimax_kernel: layout must be 'legacy' or 'face', "
             f"got {layout!r}")
-    vertex_pair = bool(vertex_pair)
-    vertex_identity = tuple(bool(x) for x in vertex_identity)
-    if len(vertex_identity) != 2:
-        raise ValueError("vertex_identity must be (left_identity,right_identity)")
+    if vertex_pair is not None:
+        vertex_pair = tuple(int(v) for v in vertex_pair)
+        if len(vertex_pair) != 2 or any(v not in range(4) for v in vertex_pair):
+            raise ValueError("vertex_pair must contain two Lorentz indices in 0..3.")
     if vertex_pair and n_out != 1:
         raise ValueError(
             "four-current vertex chi currently supports one static output "
@@ -184,7 +183,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             "wavefunction layout")
     cache_key = (id(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
-                 vertex_pair, vertex_identity, id(k_unfold_plan))
+                 vertex_pair, (tuple(id(p) for p in k_unfold_plan)
+                               if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)))
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -200,7 +200,6 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
             right_face_shape=right_face_shape,
             vertex_pair=vertex_pair,
-            vertex_identity=vertex_identity,
             k_unfold_plan=k_unfold_plan)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
@@ -416,8 +415,7 @@ def _get_chi_minimax_kernel_legacy(mesh_xy, kgrid, nk, n_out, complex_contour):
 
 def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                                  face_shape, *, right_face_shape=None,
-                                 vertex_pair=False,
-                                 vertex_identity=(False, False),
+                                 vertex_pair=None,
                                  k_unfold_plan=None):
     """Face-layout sibling of :func:`_get_chi_minimax_kernel_legacy`.
 
@@ -452,36 +450,22 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
         right_face_shape = face_shape
     nk_right, nb_right, n_rmu_right, ns_right = (
         int(v) for v in right_face_shape)
-    expected_input_nk = (
-        nk if k_unfold_plan is None else int(k_unfold_plan.n_parent))
-    if nk_shape != expected_input_nk:
-        raise ValueError(
-            f"_get_chi_minimax_kernel_face: face_shape nk={nk_shape} does "
-            f"not match expected input k extent {expected_input_nk}")
-    if (nk_right, nb_right, ns_right) != (
-            expected_input_nk, nb_full, ns):
-        raise ValueError(
-            "_get_chi_minimax_kernel_face: left/right endpoint bundles "
-            "must share (nk, nb_full, nspinor); got "
-            f"{face_shape} and {right_face_shape}")
-    if k_unfold_plan is not None:
-        if int(k_unfold_plan.n_full) != nk:
-            raise ValueError(
-                "_get_chi_minimax_kernel_face: parent plan full-k extent "
-                f"{k_unfold_plan.n_full} != prod(kgrid)={nk}.")
-        if vertex_pair or n_rmu_left != n_rmu_right:
-            raise ValueError(
-                "_get_chi_minimax_kernel_face: parent-k bring-up owns the "
-                "ordinary square charge response only; rectangular/four-"
-                "current blocks remain on full k.")
-        # Keep every per-node Green function in the orbit-packed basis.  Its
-        # parent->full symmetry action is then process-local; canonicalize the
-        # accumulated chi only once after the complete tau sweep.
-        n_rmu_out_left = int(k_unfold_plan.n_centroid_packed)
-        n_rmu_out_right = n_rmu_out_left
-    else:
-        n_rmu_out_left = n_rmu_left
-        n_rmu_out_right = n_rmu_right
+    plans = (k_unfold_plan if isinstance(k_unfold_plan, tuple)
+             else (k_unfold_plan, k_unfold_plan))
+    left_plan, right_plan = plans
+    expected_input_nk = nk if left_plan is None else left_plan.n_parent
+    if (nk_shape, nk_right, nb_right, ns_right) != (
+            expected_input_nk, expected_input_nk, nb_full, ns):
+        raise ValueError("chi endpoints must share parent k, band and spin extents.")
+    if any(p is not None and p.n_full != nk for p in plans):
+        raise ValueError("chi parent plan full-k extent disagrees with kgrid.")
+    if (left_plan is None) != (right_plan is None):
+        raise ValueError("Both chi endpoints must carry parent plans together.")
+    n_rmu_out_left, n_rmu_out_right = n_rmu_left, n_rmu_right
+    paired = isinstance(k_unfold_plan, tuple)
+    if paired and any(not np.array_equal(getattr(left_plan, name), getattr(right_plan, name))
+                      for name in ("irr_idx", "sym_idx", "k_parent_frac", "spin_action_full")):
+        raise ValueError("chi family plans disagree on the raw-parent k action.")
 
     _Gv_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
     _Gc_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
@@ -500,7 +484,18 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     # "hoist this call out of every per-k/per-tau loop" instruction.
     g_plan = gemm_plan(
         mesh_xy, m=n_rmu_left * ns, k=nb_full,
-        n=n_rmu_right * ns, nq=expected_input_nk, dtype=jnp.complex128)
+        n=n_rmu_right * ns, nq=nk if paired else expected_input_nk,
+        dtype=jnp.complex128)
+    if paired:
+        from common.shard_map import shard_map
+        def unfold_pair(psi_left, psi_right):
+            return (left_plan.unfold_face(psi_left, spin_axis=1, mu_axis=2,
+                                         mesh_axis="x"),
+                    right_plan.unfold_face(psi_right, spin_axis=2, mu_axis=3,
+                                          mesh_axis="y"))
+        unfold_pair = shard_map(unfold_pair, mesh=mesh_xy,
+            in_specs=(_psi_mun_spec, _psi_nmu_spec),
+            out_specs=(_psi_mun_spec, _psi_nmu_spec), check_vma=False)
 
     @partial(jax.jit,
              in_shardings=(_psi_mun_shard, _psi_nmu_shard,
@@ -514,18 +509,24 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     def _build_Gv_Gc(psi_mun_left, psi_nmu_right,
                     mask_v, mask_c, enk_full,
                     tau_scalar, vmax, cmin):
+        if paired:
+            psi_mun_left, psi_nmu_right = unfold_pair(
+                psi_mun_left, psi_nmu_right)
+            rows = jnp.asarray(left_plan.irr_idx)
+            mask_v, mask_c, enk_full = (jnp.take(v, rows, axis=0)
+                                       for v in (mask_v, mask_c, enk_full))
         t_c = jnp.conj(tau_scalar) if complex_contour else tau_scalar
         Gv_k = jax.lax.with_sharding_constraint(
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        -tau_scalar, e_ref=vmax,
                        mask=mask_v, layout="face", gemm=g_plan,
-                       k_unfold_plan=k_unfold_plan),
+                       k_unfold_plan=None if paired else k_unfold_plan),
             _G_k_shard)
         Gc_k = jax.lax.with_sharding_constraint(
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        t_c, e_ref=cmin,
                        mask=mask_c, layout="face", gemm=g_plan,
-                       k_unfold_plan=k_unfold_plan),
+                       k_unfold_plan=None if paired else k_unfold_plan),
             _G_k_shard)
         return jnp.conj(Gv_k), jnp.conj(Gc_k)
 
@@ -583,7 +584,8 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
     if vertex_pair:
         from common.gamma_matrices import gamma_double_contract
-    left_identity, right_identity = vertex_identity
+    left_identity, right_identity = (True, True) if vertex_pair is None else tuple(
+        v == 0 for v in vertex_pair)
 
     def _single_impl(
         nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
@@ -657,18 +659,18 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                 NamedSharding(mesh_xy, _rep0))
 
     if vertex_pair:
-        @partial(jax.jit,
-                 in_shardings=_base_in + tuple(
-                     NamedSharding(mesh_xy, _rep1) for _ in range(4)),
-                 out_shardings=_chi_R_shard)
+        from common.gamma_matrices import gamma_perm_phase
+        perm_l, phase_l = gamma_perm_phase(vertex_pair[0])
+        perm_r, phase_r = gamma_perm_phase(vertex_pair[1])
+        # The Green pair is conjugated; transpose both Hermitian vertices for ψ†Γψ.
+        operands = (perm_l, jnp.conj(phase_l), perm_r, jnp.conj(phase_r))
+
+        @partial(jax.jit, in_shardings=_base_in, out_shardings=_chi_R_shard)
         def minimax_tau_integrate_chi_vertex(
             nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
-            perm_l, phase_l, perm_r, phase_r,
         ):
-            return _single_impl(
-                nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full,
-                vmax, cmin, (perm_l, phase_l, perm_r, phase_r))
-
+            return _single_impl(nodes, psi_mun, psi_nmu, mask_v, mask_c,
+                                enk_full, vmax, cmin, operands)
         return minimax_tau_integrate_chi_vertex
 
     @partial(jax.jit, in_shardings=_base_in, out_shardings=_chi_R_shard)
@@ -1862,12 +1864,11 @@ def compute_no_pair_dirac_current_block(
             "chi endpoint bundles must share band slices and energy-table "
             f"shape; got left={wfns_left.slices}/{wfns_left.enk.shape}, "
             f"right={wfns_right.slices}/{wfns_right.enk.shape}")
-    ns_left = int(wfns_left.psi_mun.shape[1])
-    ns_right = int(wfns_right.psi_nmu.shape[2])
-    if ns_left != 4 or ns_right != 4:
-        raise ValueError(
-            "four-current gamma vertices require four-component bispinors; "
-            f"got endpoint spinor extents ({ns_left},{ns_right})")
+    left, right = wfns_left.green_parent, wfns_right.green_parent
+    if left is None or right is None:
+        raise ValueError("Four-current response requires two raw-parent carriers.")
+    if left.psi_mun.shape[1] != 4 or right.psi_nmu.shape[2] != 4:
+        raise ValueError("Four-current vertices require four spin components.")
 
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
@@ -1892,27 +1893,20 @@ def compute_no_pair_dirac_current_block(
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
     )
 
-    from .wavefunction_bundle import face_kernel_kwargs
-    left_shape = face_kernel_kwargs(wfns_left)["face_shape"]
-    right_shape = face_kernel_kwargs(wfns_right)["face_shape"]
+    from .wavefunction_bundle import green_face_kernel_kwargs
+    left_shape = green_face_kernel_kwargs(wfns_left)["face_shape"]
+    right_shape = green_face_kernel_kwargs(wfns_right)["face_shape"]
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, layout="face", face_shape=left_shape,
-        right_face_shape=right_shape, vertex_pair=True,
-        vertex_identity=(A == 0, B == 0))
-    mask_v = wfns_left.band_mask(s.val)
-    mask_c = wfns_left.band_mask(s.cond)
-    enk_full = wfns_left.enk - jnp.asarray(
-        eref, dtype=wfns_left.enk.dtype)
-    args = (
-        nodes, wfns_left.psi_mun, wfns_right.psi_nmu,
-        mask_v, mask_c, enk_full,
-        jnp.asarray(vmax, dtype=jnp.float64),
-        jnp.asarray(cmin, dtype=jnp.float64),
-    )
-    from common.gamma_matrices import gamma_perm_phase
-    perm_l, phase_l = gamma_perm_phase(A)
-    perm_r, phase_r = gamma_perm_phase(B)
-    return kernel(*args, perm_l, phase_l, perm_r, phase_r)
+        right_face_shape=right_shape, vertex_pair=(A, B),
+        k_unfold_plan=(left.plan, right.plan))
+    mask_v = left.plan.parent_rows(wfns_left.band_mask(s.val))
+    mask_c = left.plan.parent_rows(wfns_left.band_mask(s.cond))
+    args = (nodes, left.psi_mun, right.psi_nmu, mask_v, mask_c,
+            left.enk - jnp.asarray(eref, dtype=left.enk.dtype),
+            jnp.asarray(vmax, dtype=jnp.float64), jnp.asarray(cmin, dtype=jnp.float64))
+    full = kernel(*args)
+    return jnp.take(full, jnp.asarray(left.plan.sym.q_irr_full_idx), axis=0)
 
 
 _WARD_SUBTRACTED_NO_PAIR = "ward_subtracted_no_pair"
@@ -1922,12 +1916,7 @@ STATIC_PHOTON_NO_PAIR_MODEL = NO_PAIR_DIRAC_CURRENT_MODEL
 
 @partial(jax.jit, donate_argnums=(0,))
 def _subtract_static_tt_contact(chi_tt):
-    """Bring-up Ward proxy ``Pi_para(q)-Pi_para(q=0)`` for one TT block.
-
-    Full flat-q uses the production C-order convention with Gamma at index
-    zero (the same body convention consumed by ``qsgw_head.py``'s
-    ``finalize_iteration_head_samples``); this is not a second q lookup.
-    """
+    """Subtract the Γ contact on q-IBZ before its typed star transport."""
     corrected = chi_tt - chi_tt[0:1]
     # Make the q=0 cancellation structural rather than roundoff-dependent.
     return corrected.at[0].set(jnp.zeros_like(corrected[0]))
@@ -1957,15 +1946,16 @@ def compute_experimental_no_pair_photon_chi0(
             "full four-current response requires layout='face' for both "
             "charge and transverse endpoint bundles (low_mem_bands=true); "
             f"got {wfns_charge.layout!r}/{wfns_transverse.layout!r}")
-    n_c = int(wfns_charge.psi_mun.shape[2])
-    n_t = int(wfns_transverse.psi_mun.shape[2])
+    from .wavefunction_bundle import padded_centroid_extent
+    n_c = padded_centroid_extent(wfns_charge)
+    n_t = padded_centroid_extent(wfns_transverse)
     if (n_c != layout.carrier_extent(0) or
             n_t != layout.carrier_extent(1)):
         raise ValueError(
             "photon layout padded extents do not match wavefunction "
             f"bundles: layout C/T=({layout.carrier_extent(0)},"
             f"{layout.carrier_extent(1)}), wfns C/T=({n_c},{n_t})")
-    nq = int(meta.nk_tot)
+    nq = len(wfns_charge.green_parent.plan.sym.q_irr_full_idx)
     families = (wfns_charge, wfns_transverse,
                 wfns_transverse, wfns_transverse)
 
@@ -2006,6 +1996,53 @@ class StaticPhotonResponse:
     approximation: str
     head_completion: object | None = None
     current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
+    qgrid_policy: object = None
+    family_plans: tuple = ()
+
+
+def photon_blocks_full_q(response, keys, *, term="W"):
+    """Restore one packed Lorentz block by centroid transport followed by Λ⊗Λ mixing."""
+    from symmetry_maps import unfold_isdf_operator, mix_lorentz_blocks
+    from .photon_layout import photon_block_view
+    from symmetry_maps import bgw_integer_q_to_fractional
+
+    left_C, left_T = response.family_plans
+    sym, mesh = left_C.sym, left_C.mesh_xy
+    policy = response.qgrid_policy
+    qfrac = bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, policy.kgrid)
+    if term not in ("V", "W", "W-V"):
+        raise ValueError(f"Unknown photon operator {term!r}.")
+    for A, B in keys:
+        left, right = (left_T if A else left_C), (left_T if B else left_C)
+        shape = (len(sym.irr_idx_q), left.n_centroid_packed, right.n_centroid_packed)
+        spec = NamedSharding(mesh, P(None, "x", "y"))
+        acc = jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=spec)()
+        for C in ((1, 2, 3) if A else (0,)):
+            for D in ((1, 2, 3) if B else (0,)):
+                source = photon_block_view(
+                    response.V_packed if term == "V" else response.W_packed,
+                    response.layout, C, D, mesh)
+                if term == "W-V":
+                    source = source - photon_block_view(
+                        response.V_packed, response.layout, C, D, mesh)
+
+                @partial(jax.jit, donate_argnums=(0,), out_shardings=spec)
+                def add(accumulator, parent):
+                    full = unfold_isdf_operator(
+                        parent, irr_idx=sym.irr_idx_q, sym_idx=policy.unfold_sym_idx,
+                        sym_perm=left.sym_perm, L_table=left.L_table,
+                        right_sym_perm=right.sym_perm, right_L_table=right.L_table,
+                        q_irr_frac=qfrac, mesh_xy=mesh, n_sym_spatial=policy.n_sym_spatial,
+                        axis_local_sym_perm=left.centroid_local_perm,
+                        right_axis_local_sym_perm=right.centroid_local_perm)
+                    mixed = mix_lorentz_blocks(
+                        {(C, D): full}, sym=sym, sym_idx=policy.unfold_sym_idx,
+                        mesh_xy=mesh, keys=((A, B),))
+                    return accumulator + mixed[A, B]
+                acc = add(acc, source)
+                del source
+        yield (A, B), acc
+        del acc
 
 
 def _load_static_photon_hall(
@@ -2073,6 +2110,7 @@ def compute_static_photon_response(
     wfns_charge, wfns_transverse, quad, bispinor_v_q_path,
     meta, mesh_xy, *,
     screen_current: bool,
+    mu_bases,
     W_charge=None,
     wfn=None,
     config=None,
@@ -2236,22 +2274,44 @@ def compute_static_photon_response(
             "  ==========================================================\n",
             flush=True)
 
-    with BispinorVqReader(bispinor_v_q_path, mesh_xy) as reader:
-        if int(reader.n_q_total) != int(meta.nk_tot):
-            raise ValueError(
-                "full photon response requires full-BZ body blocks: "
-                f"V reader has nq={reader.n_q_total}, meta.nk_tot={meta.nk_tot}")
+    plans = (wfns_charge.green_parent.plan, wfns_transverse.green_parent.plan)
+    sym = plans[0].sym
+    from .qgrid_symmetry import qgrid_trs_policy_for
+    policy = qgrid_trs_policy_for(
+        sym=sym, irr_idx_q=sym.irr_idx_q, sym_idx_q=sym.sym_idx_q,
+        kgrid=tuple(meta.kgrid), n_sym_spatial=plans[0].n_sym_spatial,
+        context="packed photon response")
+    nq = len(sym.q_irr_full_idx)
+    from symmetry_maps import bgw_integer_q_to_fractional
+    qfrac = bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, meta.kgrid)
+    with BispinorVqReader(bispinor_v_q_path, mesh_xy, mu_bases=mu_bases) as reader:
+        if reader.n_q_total != nq:
+            raise ValueError("Photon V and response disagree on q-IBZ extent.")
+        for family, (plan, basis) in enumerate(zip(plans, mu_bases)):
+            table = reader.q_tables[family]
+            from symmetry_maps import verify_centroid_orbit_closure
+            closure = verify_centroid_orbit_closure(
+                basis.canonical_indices / np.asarray(plan.fft_grid),
+                plan.spatial_ops, tau=plan.translations, fft_grid=plan.fft_grid)
+            if reader.q_headers[family].centroid_hash != closure.centroid_hash:
+                raise ValueError("Photon V centroid set differs from the run; rerun restart=false.")
+            perm, wraps = basis.pack_tables(table.sym_perm, table.L_table)
+            if not (np.array_equal(table.q_irr_frac, qfrac)
+                    and np.array_equal(table.irr_idx_q, sym.irr_idx_q)
+                    and np.array_equal(table.sym_idx_q, policy.unfold_sym_idx)
+                    and np.array_equal(perm, plan.sym_perm)
+                    and np.array_equal(wraps, plan.L_table)):
+                raise ValueError("Photon V tables differ from the authenticated run; rerun restart=false.")
         layout = PhotonBasisLayout.from_centroid_extents(
-            reader.n_rmu_C, reader.n_rmu_T, mesh_xy)
-        V_packed = pack_photon_operator(
-            reader.get_tile, reader.n_q_total, layout, mesh_xy)
+            plans[0].n_centroid_packed, plans[1].n_centroid_packed, mesh_xy)
+        V_packed = pack_photon_operator(reader.get_tile, nq, layout, mesh_xy)
 
     if jax.process_index() == 0:
         # MEASURED at the site, per lane C's design note: the packed body is
         # the resident carrier of BOTH modes and is new to the bare route.
         n_packed = int(layout.packed_extent)
         n_ranks = max(int(jax.process_count()), 1)
-        body_bytes = 16.0 * int(meta.nk_tot) * n_packed * n_packed / n_ranks
+        body_bytes = 16.0 * nq * n_packed * n_packed / n_ranks
         print_fn(
             "  [photon response] DECLARED no-pair model "
             "Psi=(Psi_L,(alpha_FS/2)*sigma.p*Psi_L), "
@@ -2266,7 +2326,7 @@ def compute_static_photon_response(
         print_fn(
             f"  [photon response] packed body N_packed={n_packed} "
             f"(n_C={layout.carrier_extent(0)} + 3*n_T="
-            f"{layout.carrier_extent(1)}), nq={int(meta.nk_tot)}: "
+            f"{layout.carrier_extent(1)}), nq={nq}: "
             f"{body_bytes / 1e9:.4f} GB/rank resident for EACH of V and W",
             flush=True)
     if screen_current:
@@ -2306,8 +2366,9 @@ def compute_static_photon_response(
                 "photon layout padded extents do not match wavefunction "
                 f"bundles: layout C/T=({layout.carrier_extent(0)},"
                 f"{layout.carrier_extent(1)}), wfns C/T=({n_c},{n_t})")
-        W_cc = jnp.asarray(W_charge)
-        expected_cc = layout.block_shape(int(meta.nk_tot), 0, 0)
+        W_cc = jnp.take(jnp.asarray(W_charge),
+                        jnp.asarray(sym.q_irr_full_idx), axis=0)
+        expected_cc = layout.block_shape(nq, 0, 0)
         if tuple(W_cc.shape) != expected_cc:
             raise ValueError(
                 "the packed bare-transverse route needs the incumbent scalar "
@@ -2328,7 +2389,7 @@ def compute_static_photon_response(
             return photon_block_view(V_packed, layout, A, B, mesh_xy)
 
         W_packed = pack_photon_operator(
-            _bare_W_block, int(meta.nk_tot), layout, mesh_xy)
+            _bare_W_block, nq, layout, mesh_xy)
         W_packed.block_until_ready()
         del W_cc
     # This packed path bypasses screening._gate_w, so apply its two valid
@@ -2400,6 +2461,7 @@ def compute_static_photon_response(
         return StaticPhotonResponse(
             layout=layout, V_packed=V_packed, W_packed=W_packed,
             current_contact=current_contact,
+            qgrid_policy=policy, family_plans=plans,
             head_completion=head_completion,
             current_model=STATIC_PHOTON_NO_PAIR_MODEL,
             approximation=(
@@ -2410,6 +2472,7 @@ def compute_static_photon_response(
     return StaticPhotonResponse(
         layout=layout, V_packed=V_packed, W_packed=W_packed,
         current_contact=STATIC_PHOTON_BARE_CURRENT_CONTACT,
+        qgrid_policy=policy, family_plans=plans,
         head_completion=head_completion,
         current_model=STATIC_PHOTON_BARE_CURRENT_MODEL,
         approximation=(

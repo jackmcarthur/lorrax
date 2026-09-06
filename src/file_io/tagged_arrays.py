@@ -1939,7 +1939,9 @@ def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
             return None
         ds_shape = tuple(int(s) for s in f[name].shape)
         ds_dtype = f[name].dtype
-        wedge_tables = _qirr_wedge_tables(f)
+        from symmetry_maps import dataset_q_storage, read_tables
+        tables = (read_tables(f, name)
+                  if dataset_q_storage(f[name]) == "ibz" else None)
 
     n_rmu_disk = int(ds_shape[-1] if n_rmu_logical is None else n_rmu_logical)
     mu_tag = padded_mu_axis(n_rmu_disk, mesh_xy)
@@ -1955,7 +1957,7 @@ def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
     authenticate_axis(
         arr, mu_tag, axis=-1,
         where=f"read_munu_tensor_from_h5 dataset {name!r}")
-    return _unfold_wedge(arr, wedge_tables.get(name), n_rmu_pad, mesh_xy)
+    return _unfold_wedge(arr, tables, n_rmu_pad, mesh_xy)
 
 
 def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,

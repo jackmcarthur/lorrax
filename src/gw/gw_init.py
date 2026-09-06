@@ -2803,7 +2803,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 
 	if bispinor_ready:
 		from .v_q_bispinor import (
-			BispinorVqReader, tile_dataset_name,
+			tile_dataset_name,
 		)
 		from file_io.centroids import load_centroids as _load_centroids
 
@@ -2907,9 +2907,9 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# coupled head; headless modes release the transverse three immediately.
 		# The TT tiles stay on disk; Σ_X^B / Σ_H^B will consume them
 		# via BispinorVqReader once those paths land.
-		with BispinorVqReader(bispinor_h5_path, mesh_xy,
-		                      ) as reader:
-			V_q_raw = reader.get_tile(0, 0)
+		from file_io.tagged_arrays import read_munu_tensor_from_h5
+		V_q_raw = read_munu_tensor_from_h5(
+			bispinor_h5_path, tile_dataset_name(0, 0), mesh_xy)
 		G0_all = photon_g0_vectors[0]
 		if not uses_coupled_photon_head(cfg):
 			photon_g0_vectors = None
@@ -3286,6 +3286,7 @@ def prepare_isdf_and_wavefunctions(
 	photon_g0_vectors = None
 	green_parent_carrier = None
 	sigma_parent_carrier = None
+	basis_T = None
 
 	# THE I/O SEAM.  Files keep the canonical centroid order (grid-agnostic);
 	# everything in memory is in the run's packed order (common.centroid_basis).
@@ -3664,6 +3665,9 @@ def prepare_isdf_and_wavefunctions(
 					       f"transverse centroids (face layout; "
 					       f"low_mem_bands=true)")
 
+			basis_T = (None if transverse_wfn_data is None
+			           else transverse_wfn_data["meta"].mu_basis)
+
 			# P4 — pre-V_q.  Whatever's still in HBM after fit_zeta
 			# returns forms the persistent baseline that V_q's transient
 			# peak stacks on top of.  Same env gate as the ζ-fit probes
@@ -3675,6 +3679,10 @@ def prepare_isdf_and_wavefunctions(
 				mem_est=mem_est, print_fn=print0,
 				bgw_v_grid_fn=bgw_v_grid_fn,
 				sym=sym, centroid_indices=centroid_indices)
+			if photon_g0_vectors is not None:
+				photon_g0_vectors = tuple(
+					(meta.mu_basis if channel == 0 else basis_T).pack_axis(vector, -1)
+					for channel, vector in enumerate(photon_g0_vectors))
 			# P5 — post-V_q.  V_q's transient peak just happened inside
 			# compute_V_q; this probe captures what survives (V_qmunu,
 			# G0) plus anything held over from ζ-fit.  Combined with P4
@@ -4272,6 +4280,7 @@ def prepare_isdf_and_wavefunctions(
 		V_qmunu=V_qmunu,
 		wf_bundle=wfns,
 		wf_bundle_transverse=wfns_transverse,
+		mu_bases=(meta.mu_basis, basis_T),
 		# Raw-parent, orbit-packed ψ is a screening-only acceleration carrier,
 		# deliberately separate from the primary Wavefunctions pytree so head,
 		# Sigma, density and output kernels cannot inherit unused large inputs.

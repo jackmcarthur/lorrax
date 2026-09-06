@@ -130,9 +130,11 @@ def _validate_unique_tile_datasets(
     """Validate every physical tile without opening a collective reader."""
     expected = _expected_unique_tile_inventory(
         n_q_total=n_q_total, n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T)
+    from symmetry_maps import QIRR_TABLE_SUFFIX
     expected_names = {tile["name"] for tile in expected["tiles"]}
     actual_names = {
-        name for name in h5_file.keys() if name.startswith("V_qmunu_")
+        name for name in h5_file.keys()
+        if name.startswith("V_qmunu_") and not name.endswith(QIRR_TABLE_SUFFIX)
     }
     if actual_names != expected_names:
         missing = sorted(expected_names - actual_names)
@@ -448,48 +450,28 @@ def compute_V_q_bispinor_g_flat_to_h5(
         raise ValueError(
             f"zeta_T_loaders must be length 3 (μ_L=1,2,3); "
             f"got {len(zeta_T_loaders)}.")
-    nq_total = int(np.prod(kgrid))
+    # Each family stores its canonical q parents with its own centroid tables.
+    from .v_q_g_flat import _resolve_ibz_q_list
 
-    # File creation + metadata (rank-0 + collective sync via SlabIO).
-    with SlabIO(output_h5_path, mode="w", mesh=mesh_xy,
-) as io:
+    if not use_ibz or sym is None:
+        raise ValueError("Bispinor V requires q-IBZ storage; rerun with symmetry enabled.")
+    _ibz_C = _resolve_ibz_q_list(
+        sym=sym, centroid_indices=centroid_C_idx, kgrid=kgrid, fft_grid=fft_grid,
+        context="bispinor charge V", return_resolution=True)
+    _ibz_T = _resolve_ibz_q_list(
+        sym=sym, centroid_indices=centroid_T_idx, kgrid=kgrid, fft_grid=fft_grid,
+        context="bispinor current V", return_resolution=True)
+    _use_ibz_C, _use_ibz_T = _ibz_C[6], _ibz_T[6]
+    if not (_use_ibz_C and _use_ibz_T):
+        raise ValueError("Bispinor V requires two orbit-closed centroid families.")
+    nq_total = len(_ibz_C[1])
+    if len(_ibz_T[1]) != nq_total:
+        raise ValueError("Bispinor V families disagree on q-IBZ rows.")
+    with SlabIO(output_h5_path, mode="w", mesh=mesh_xy) as io:
         io.write_attr("kgrid", np.asarray(kgrid, dtype=np.int64))
         io.write_attr("n_rmu_C", np.int64(n_rmu_C))
         io.write_attr("n_rmu_T", np.int64(n_rmu_T))
         io.write_attr("n_q_total", np.int64(nq_total))
-
-    # ------------------------------------------------------------------
-    # IBZ cascade plumbing.  When ``use_ibz=True`` the bispinor ζ̃ files
-    # were written IBZ-only (see ``gw_init.fit_zeta`` and
-    # ``isdf_fitting.fit_zeta_to_h5``); the per-tile kernel iterates the
-    # parent IBZ q-list and unfolds post-loop via ``unfold_isdf_operator``.
-    # Two centroid sets ⇒ two orbit-closure checks (CC ↔ charge, TT ↔
-    # transverse); they may diverge in principle but in practice are
-    # generated together by the user's ``kmeans_cli --orbit-aware`` run.
-    # If either set's closure check fails, the corresponding tiles fall
-    # back to full-BZ.  See derivation §A5.
-    #
-    # THE FALLBACK IS ANNOUNCED IN ONE PLACE, and it is not here.  This
-    # block used to print its own second wording of the same fact, behind
-    # ``verbose`` — so a bispinor production run with verbose off degraded
-    # both channels silently.  ``gw.qgrid_symmetry`` now speaks once per
-    # centroid SET, which is what makes the charge and transverse cases
-    # two distinct lines instead of one line printed twice.
-    # ------------------------------------------------------------------
-    from .v_q_g_flat import _resolve_ibz_q_list
-
-    def _ibz_tables_for(centroid_idx, label):
-        if not use_ibz or sym is None or centroid_idx is None:
-            return None, False
-        tables = _resolve_ibz_q_list(
-            sym=sym, centroid_indices=np.asarray(centroid_idx, dtype=np.int32),
-            kgrid=kgrid, fft_grid=fft_grid,
-            context=f"bispinor g-flat, {label} centroids")
-        (_, _, _, _, _sym_perm, _L_table, _ok) = tables
-        return tables, _ok
-
-    _ibz_C, _use_ibz_C = _ibz_tables_for(centroid_C_idx, 'charge')
-    _ibz_T, _use_ibz_T = _ibz_tables_for(centroid_T_idx, 'transverse')
 
     # ONE measured q-row policy for every bispinor consumer: CC, TT operator
     # mixing and all four one-leg vectors.  In particular, a ferromagnet's
@@ -507,16 +489,6 @@ def compute_V_q_bispinor_g_flat_to_h5(
             context="bispinor V / one-leg",
         )
 
-    # Buffer the 6 unique TT tiles post-unfold so we can apply the 3×3
-    # Lorentz mixing across them before writing.  CC tile streams straight
-    # to disk — no mixing.  Decision: write-time mixing keeps the on-disk
-    # format identical to the existing post-mix tiles (downstream Σ^B
-    # reads them unchanged via BispinorVqReader.get_tile).  Alternative
-    # (read-time mixing inside the reader) would require all 9 TT tiles
-    # to be in memory for any single get_tile(i, j) call — write-time
-    # mixing keeps the reader's per-tile contract clean.  See derivation
-    # §A5 (the algebraic identity for V^{i,j}_full[q]).
-    tt_buffer: dict[tuple[int, int], jax.Array] = {}
     tt_g0 = None
     g0_by_channel: list[jax.Array | None] = [None, None, None, None]
 
@@ -608,82 +580,26 @@ def compute_V_q_bispinor_g_flat_to_h5(
         if same_zeta and g0_acc is not None:
             g0_by_channel[mu_L] = g0_acc
 
-        if is_CC or not _use_ibz_T:
-            # Two cases stream straight to disk per-tile:
-            #   * CC tile — never Lorentz-mixed (γ̃^0 = I is invariant).
-            #   * TT tiles when the transverse IBZ cascade is off — the
-            #     unfold inside ``_compute_V_q_g_flat_one_tile`` was a
-            #     no-op (full-BZ path), no mixing needed.  Buffering all
-            #     6 TT tiles would inflate peak memory; we preserve the
-            #     pre-IBZ "free between tiles" behaviour exactly.
-            name = tile_dataset_name(mu_L, nu_L)
-            v_logical_shape = _tile_logical_shape(
-                mu_L, nu_L, n_q_total=nq_total,
-                n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T)
-            _require_tile_carrier(
-                V_acc, name=name, logical_shape=v_logical_shape)
-            with SlabIO(output_h5_path, mode='a', mesh=mesh_xy,
-) as tile_io:
-                tile_io.create_dataset(
-                    name, shape=v_logical_shape, dtype=V_QMUNU_TILE_DTYPE)
-                tile_io.write_slab(name, V_acc)
-            del V_acc, g0_acc
-        else:
-            # Buffer for post-loop Lorentz mixing (IBZ cascade active on
-            # the transverse centroid set).
-            tt_buffer[(mu_L, nu_L)] = V_acc
-            del g0_acc
-
-    # ------------------------------------------------------------------
-    # Lorentz mixing on the TT block.  Only runs when the transverse IBZ
-    # cascade is active — the 3×3 mixing is a no-op on full-BZ data
-    # because the per-q sym op is identity there.  See derivation §A5.
-    # ------------------------------------------------------------------
-    if _use_ibz_T and sym is not None and tt_buffer:
-        from ffi import _services
-        _services.ensure_on_path()
-        from symmetry_maps import mix_channels_by_proper_rotation
-
-        # Synthesise the 3 Hermitian-redundant tiles (j, i) for i < j from
-        # the stored upper-triangle.  These are needed as INPUTS to the
-        # 3×3 contraction; we write only the 6 unique upper-triangle outputs.
-        tt_full_in: dict[tuple[int, int], jax.Array] = dict(tt_buffer)
-        for (j, i), (i_src, j_src) in HERMITIAN_PAIRS.items():
-            tt_full_in[(j, i)] = jnp.conj(
-                jnp.swapaxes(tt_buffer[(i_src, j_src)], -1, -2))
-
-        tt_mixed = mix_channels_by_proper_rotation(
-            tt_full_in,
-            sym=sym,
-            sym_idx=np.asarray(
-                qgrid_policy.unfold_sym_idx, dtype=np.int32),
-            mesh_xy=mesh_xy,
-        )
-
-        # Write the 6 unique upper-triangle TT tiles post-mix.
-        for (mu_L, nu_L) in UNIQUE_TILES:
-            if mu_L == 0 and nu_L == 0:
-                continue
-            V_mix = tt_mixed[(mu_L, nu_L)]
-            name = tile_dataset_name(mu_L, nu_L)
-            v_logical_shape = _tile_logical_shape(
-                mu_L, nu_L, n_q_total=nq_total,
-                n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T)
-            _require_tile_carrier(
-                V_mix, name=name, logical_shape=v_logical_shape)
-            with SlabIO(output_h5_path, mode='a', mesh=mesh_xy,
-) as tile_io:
-                tile_io.create_dataset(
-                    name, shape=v_logical_shape, dtype=V_QMUNU_TILE_DTYPE)
-                tile_io.write_slab(name, V_mix)
-                if mu_L == nu_L:
-                    if tt_g0 is None:
-                        raise RuntimeError(
-                            "bispinor transverse IBZ one-leg accumulation "
-                            "is missing despite three diagonal source tiles.")
-                    g0_by_channel[mu_L] = tt_g0[mu_L - 1]
-        del tt_full_in, tt_mixed
-    del tt_buffer, tt_g0
+        name = tile_dataset_name(mu_L, nu_L)
+        v_logical_shape = _tile_logical_shape(
+            mu_L, nu_L, n_q_total=nq_total, n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T)
+        _require_tile_carrier(V_acc, name=name, logical_shape=v_logical_shape)
+        with SlabIO(output_h5_path, mode="a", mesh=mesh_xy) as tile_io:
+            tile_io.create_dataset(name, shape=v_logical_shape, dtype=V_QMUNU_TILE_DTYPE)
+            tile_io.write_slab(name, V_acc)
+        del V_acc, g0_acc
+        barrier("bispinor_V_tile_closed")
+        if jax.process_index() == 0:
+            from symmetry_maps import QirrTables, stamp_qirr_tensor
+            table = _ibz_C if is_CC else _ibz_T
+            stamp_qirr_tensor(output_h5_path, name,
+                tables=QirrTables(table[2], qgrid_policy.unfold_sym_idx, table[1],
+                                  table[4], table[5], qgrid_policy.n_sym_spatial),
+                closure_verdict=table[7].verdict, n_rmu_logical=n_rmu_L)
+        barrier("bispinor_V_tile_stamped")
+    if tt_g0 is not None:
+        g0_by_channel[1:] = [tt_g0[i] for i in range(3)]
+    del tt_g0
 
     # Format, canonical inventory and readiness receipt — rank-0 post-close
     # write so BispinorVqReader can reject a torn file without rank
@@ -727,12 +643,14 @@ class BispinorVqReader:
     Caller manages the lifecycle (use as a context manager).
     """
 
-    def __init__(self, filename: Path | str, mesh_xy: Mesh,
-):
+    def __init__(self, filename: Path | str, mesh_xy: Mesh, *, mu_bases=None):
         from file_io.slab_io import SlabIO
         import h5py
         self._filename = Path(filename)
         self._mesh = mesh_xy
+        self._mu_bases = mu_bases
+        self.q_tables = {}
+        self.q_headers = {}
 
         # Small metadata scalars are written via SlabIO.write_attr (which
         # creates a dataset in the file).  Read them via h5py — every rank
@@ -766,10 +684,6 @@ class BispinorVqReader:
             self.n_rmu_C = int(_read_scalar("n_rmu_C"))
             self.n_rmu_T = int(_read_scalar("n_rmu_T"))
             self.n_q_total = int(_read_scalar("n_q_total"))
-            if self.n_q_total != int(np.prod(self.kgrid)):
-                raise ValueError(
-                    f"{self._filename}: n_q_total={self.n_q_total} does "
-                    f"not match kgrid product {int(np.prod(self.kgrid))}.")
             ready_dataset = f.get(V_QMUNU_DATA_READY_DATASET)
             if (ready_dataset is None or ready_dataset.shape != ()
                     or np.dtype(ready_dataset.dtype) != np.dtype(np.bool_)
@@ -799,6 +713,27 @@ class BispinorVqReader:
                 f, filename=self._filename,
                 n_q_total=self.n_q_total, n_rmu_C=self.n_rmu_C,
                 n_rmu_T=self.n_rmu_T)
+            from symmetry_maps import read_tensor, read_tables, QIRR_VERSION_ATTR
+            for pair in UNIQUE_TILES:
+                name = tile_dataset_name(*pair)
+                try:
+                    if QIRR_VERSION_ATTR not in f[name].attrs:
+                        raise ValueError("Missing q-IBZ format stamp.")
+                    _, header = read_tensor(f, name, metadata_only=True)
+                    tables = read_tables(f, name)
+                    family = int(pair[0] != 0)
+                    if (family in self.q_tables and
+                            self.q_tables[family].digest() != tables.digest()):
+                        raise ValueError("V tiles disagree on their family symmetry tables.")
+                    self.q_tables[family] = tables
+                    self.q_headers[family] = header
+                except (KeyError, ValueError) as exc:
+                    raise ValueError(
+                        f"{self._filename}: unstamped or torn V tiles; "
+                        "legacy full-q files require rerun with restart=false.") from exc
+                if (tables.n_q_ibz != self.n_q_total or
+                        tables.n_q_full != int(np.prod(self.kgrid))):
+                    raise ValueError("Bispinor V q-IBZ tables disagree with its geometry.")
 
         self._io = SlabIO(self._filename, mode="r", mesh=mesh_xy)
         self._io.__enter__()
@@ -845,42 +780,29 @@ class BispinorVqReader:
                 padded_mu_axis(int(n_R), self._mesh).carrier)
 
     def get_tile(self, mu_L: int, nu_L: int) -> jax.Array:
-        """Return V^{μ_L, ν_L}_q as a sharded JAX array (n_q, n_L_padded,
-        n_R_padded) c128.  When n_L/n_R aren't divisible by the mesh axis
-        size, the trailing μ rows are zero-padded — mirrors the write-side
-        μ padding in ``gw.v_q_g_flat._compute_V_q_g_flat_one_tile`` and
-        lets Σ^B run at any process count without a runtime divisibility
-        error."""
+        """Read one q-IBZ tile and pack its two centroid families at the file boundary."""
         if not (0 <= mu_L <= 3 and 0 <= nu_L <= 3):
-            raise ValueError(f"Lorentz indices must be in {{0..3}}; got "
-                             f"({mu_L}, {nu_L}).")
+            raise ValueError(f"Lorentz indices must be in 0..3; got {(mu_L, nu_L)}.")
         if (mu_L, nu_L) in ZERO_TILES:
-            return self._zero_tile(mu_L, nu_L)
-        spec = P(None, 'x', 'y')
-        if (mu_L, nu_L) in HERMITIAN_PAIRS:
-            companion = HERMITIAN_PAIRS[(mu_L, nu_L)]
-            n_L_c, n_R_c = self._tile_shape(*companion)[1:]
-            n_L_p, n_R_p = self._padded_shape_LR(n_L_c, n_R_c)
-            # Read the companion with its two centroid axes reversed so the
-            # physical Hermitian transpose below lands directly on this
-            # reader's canonical P(None, 'x', 'y') contract.  Reading in the
-            # ordinary orientation and then swapping would return
-            # P(None, 'y', 'x') and force every consumer to repair it.
-            V_companion = self._io.read_slab(
-                tile_dataset_name(*companion),
-                shape=(self.n_q_total, n_L_p, n_R_p),
-                mesh=self._mesh, partition_spec=P(None, 'y', 'x'),
+            tile = self._zero_tile(mu_L, nu_L)
+        else:
+            transpose = (mu_L, nu_L) in HERMITIAN_PAIRS
+            source = HERMITIAN_PAIRS.get((mu_L, nu_L), (mu_L, nu_L))
+            n_L, n_R = self._tile_shape(*source)[1:]
+            n_L_p, n_R_p = self._padded_shape_LR(n_L, n_R)
+            tile = self._io.read_slab(
+                tile_dataset_name(*source),
+                shape=(self.n_q_total, n_L_p, n_R_p), mesh=self._mesh,
+                partition_spec=P(None, 'y', 'x') if transpose else P(None, 'x', 'y'),
                 dtype=jnp.complex128)
-            # Hermitian: V[j,i](q,μ,ν) = V[i,j](q,ν,μ)*
-            return jnp.conj(jnp.swapaxes(V_companion, -1, -2))
-        # Direct read (member of UNIQUE_TILES)
-        n_L, n_R = self._tile_shape(mu_L, nu_L)[1:]
-        n_L_p, n_R_p = self._padded_shape_LR(n_L, n_R)
-        return self._io.read_slab(
-            tile_dataset_name(mu_L, nu_L),
-            shape=(self.n_q_total, n_L_p, n_R_p),
-            mesh=self._mesh, partition_spec=spec,
-            dtype=jnp.complex128)
+            if transpose:
+                tile = jnp.conj(jnp.swapaxes(tile, -1, -2))
+        if self._mu_bases is not None:
+            left = self._mu_bases[int(mu_L != 0)]
+            right = self._mu_bases[int(nu_L != 0)]
+            tile = left.pack_axis(tile, -2)
+            tile = right.pack_axis(tile, -1)
+        return tile
 
     @property
     def filename(self) -> Path:

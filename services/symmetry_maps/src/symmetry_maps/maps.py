@@ -1848,7 +1848,7 @@ def _get_unfold_isdf_one_leg_jit(
     return _do_unfold
 
 
-def mix_lorentz_blocks(blocks, *, sym, sym_idx, mesh_xy):
+def mix_lorentz_blocks(blocks, *, sym, sym_idx, mesh_xy, keys=None):
     """Mix each rectangular charge/current sector by Λ⊗Λ, with absent source blocks zero."""
     if isinstance(sym_idx, (jax.Array, jax.core.Tracer)):
         raise TypeError("mix_lorentz_blocks: sym_idx is host metadata.")
@@ -1856,6 +1856,15 @@ def mix_lorentz_blocks(blocks, *, sym, sym_idx, mesh_xy):
     if rows.ndim != 1:
         raise ValueError("mix_lorentz_blocks: sym_idx must be rank one.")
     action = np.asarray(sym.lorentz_action(rows), dtype=np.float64)
+    if keys is not None:
+        spec = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+        return {(a, b): jax.lax.with_sharding_constraint(sum(
+            jnp.asarray(action[:, a, c] * action[:, b, d])[:, None, None] * value
+            for (c, d), value in blocks.items()
+            if (a == 0) == (c == 0) and (b == 0) == (d == 0)), spec)
+            for a, b in keys
+            if any((a == 0) == (c == 0) and (b == 0) == (d == 0)
+                   for c, d in blocks)}
     out = {}
     for left in ((0,), (1, 2, 3)):
         for right in ((0,), (1, 2, 3)):

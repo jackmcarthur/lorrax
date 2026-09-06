@@ -659,7 +659,7 @@ compressible would move physics.
 | `isdf_tensors.h5` `psi_full_y` | **full BZ, no option** | and the option is NOT a gather — see below |
 | `qp_wfn_rotations.h5` | **file wedge when the writer can prove it**, stamped | `qp_rotations_k_storage` default `"auto"`; the writer runs the reader's round trip and keeps the wedge only if it reproduces the arrays |
 | `dipole.h5` | **full BZ** | NOT convertible by a gather — measured, below |
-| `v_q_bispinor.h5` | **full BZ always** | unfolds before writing; wedge move DEFERRED 2026-08-16 — scoped at 300-500 lines, see below |
+| `v_q_bispinor.h5` | **q-IBZ**, per-dataset stamps | seven unique tiles, two centroid families; `photon_blocks_full_q` restores one Lorentz block |
 
 ### The three rows that are NOT one operation
 
@@ -764,48 +764,23 @@ convention is under audit would confound both efforts. The measurement above
 is offered to that audit as a second, independent data point on a
 non-bispinor quantity.
 
-### `v_q_bispinor.h5` — hold lifted, move DEFERRED on cost and on coverage
+### `v_q_bispinor.h5` — q parents and two centroid families
 
-The bispinor unfolding audit finished 2026-08-16 and cleared the correctness
-question (`reports/bispinor_unfolding_audit_2026-08-16/report.md`): unfolding
-is implemented, live and correct, including the component mixing, the
-improper-operation sign and the time-reversal sign. LORRAX never rotates a
-bispinor — it unfolds the two-component large part with the existing machinery
-and re-derives the small part from the already-rotated `(k+G)`.
+The writer persists seven unique q-IBZ tiles in canonical centroid order.
+Each dataset has its own `QirrTables` and closure verdict: CC uses the charge
+family, TT the current family. The existing format service already supports
+per-dataset table groups. Unstamped legacy full-q V files require a fresh run.
+`BispinorVqReader` packs each endpoint at the file seam and returns q parents.
 
-The move was scoped anyway and **not taken**. Two reasons, in order:
-
-1. **It is a 300-500 line change, not the ~50 the shape suggests.**
-   `v_q_bispinor.py` never sees a wedge: the unfold is one line down in
-   `v_q_g_flat.py:599`, the capture hook beside it is hard-gated to
-   `timing_label == "CC"` at `:591`, and **no bispinor tile ever matches that
-   literal** — the writer passes `V_qmunu_CC` / `V_qmunu_TT_ij`. So nothing is
-   offered to the capture sink today. The work is a per-tile wedge escape for
-   **7 datasets across TWO centroid sets with two independent closure
-   verdicts** (`n_rmu_C` charge, `n_rmu_T` transverse — and on
-   `bispinor_debug` the charge set is non-closed while the transverse one is
-   closed), a stamping layer `stamp_qirr_tensor` cannot serve as-is because it
-   assumes one `QirrTables` per file. Literal-G=0 channel vectors are now
-   derived in memory at the shared V projection seam and are not a second
-   persisted dataset. Then unfold **and then** mix inside
-   `BispinorVqReader.get_tile`, where the full-BZ q extent is hard-coded into
-   the requested slab shape at `:529`/`:538`, threading `sym` through
-   `compute_sigma_x_bispinor` → `cohsex_sigma.py:371`/`:450` → `gw_jax`.
-
-2. **The gate that would guard it is blind on the only deck that can run it.**
-   Moving storage promotes `mix_channels_by_proper_rotation` from a write-time
-   convenience to a load-bearing read path, and the audit measured that on
-   `bispinor_debug` every selected q-row has an identity axial action, so its mixing
-   counterfactual is **0.000e+00** — the same blindness `gnppm_debug` has, for
-   the same reason (two trivial ops). An ordering or transpose slip in a
-   read-time mix preserves shapes, Hermiticity and plausible spectra, so the
-   new arm would pass on a wrong implementation. The audit's own
-   recommendation 3 — a transverse centroid set for `cohsex_debug`, the one
-   deck that rejects all four candidate errors at 1.73-2.00 — is the
-   prerequisite, and it has not landed.
-
-A conversion that makes an untested-at-pipeline-level path load-bearing for
-stored data is worse than leaving one artifact on the full BZ.
+The photon body and Dyson solve keep the leading q-IBZ axis.
+`StaticPhotonResponse` retains the measured `QgridTrsPolicy` and both family
+plans. `photon_blocks_full_q` transports source centroid blocks through the
+scalar symmetry service, then applies `mix_lorentz_blocks` with the polar,
+time-odd Lorentz action. A selected output avoids a nine-block full-q result.
+The Si SOC P4 V gate resolves eight parents to64 q rows: worst TT difference
+from full-q main is3.34e-13; omitting the Lorentz mix gives0.46–2.0.
+Evidence: sandbox `runs/Si/100_bisp_parent_route_2026-09-05/30_v_lorentz_restore_p4`.
+The W, Sigma and portable-restart gates remain part of the campaign acceptance.
 
 ### `absent ⇒ full` — re-measured, and the range is wider than recorded
 

@@ -24,8 +24,8 @@ Math:
     V_q[μ, ν] = Σ_G  conj(ζ̃_{q,μ}(G)) · v(q+G) · ζ̃_{q,ν}(G)
     g0_μ(q)   = ζ̃_{q,μ}(G=0)               # = ζ̃[μ, 0] by sphere convention
 
-IBZ unfold runs post-loop through the symmetry service for both the bilinear
-``V_q`` and the one-leg literal-``G=0`` coefficient.  The latter must inspect
+The tile builder retains q parents; the scalar consumer unfolds ``V_q``.
+The one-leg literal-``G=0`` coefficient unfolds after the tile loop.  The latter must inspect
 the parent G table: a star operation can map a nonzero parent G onto the
 full-zone literal G=0.  The V_q output sharding ``P(None, 'x', 'y')`` matches.
 """
@@ -382,19 +382,7 @@ def _compute_V_q_g_flat_one_tile(
     timing_label: str,
     verbose: bool,
 ) -> tuple[jax.Array, jax.Array | None]:
-    """Compute one bispinor / scalar (μ_L, ν_L) tile end-to-end.
-
-    Loops q-by-q over the IBZ (or full BZ), reads ζ_L (and ζ_R if
-    distinct) from G-flat disk, contracts via the per-q + G-chunked
-    kernel into a single ``(n_q_ibz, n_rmu_L_padded, n_rmu_R_padded)``
-    buffer, and post-loop unfolds IBZ → full-BZ via the existing
-    centroid double-permute (V_q is bilinear in ζ; no τ phase).
-
-    Returns ``(V_qmunu_full_BZ, g0_or_None)``.  A scalar one-leg result is
-    sharded ``P(None, 'x')``.  Under the polar action an IBZ tile returns
-    this streamed source component's three target-channel contributions as
-    ``(3,n_q_full,n_mu)`` under ``P(None,None,'x')``.
-    """
+    """Contract one q-parent V tile and its separately transported full-q G=0 leg."""
     same_zeta = (zeta_R_loader is None) or (zeta_R_loader is zeta_L_loader)
     # ``n_rmu_*`` is the logical centroid count for each side — read off the
     # loader so callers don't repeat themselves.
@@ -413,7 +401,7 @@ def _compute_V_q_g_flat_one_tile(
 
     from ffi import _services
     _services.ensure_on_path()
-    from symmetry_maps import unfold_isdf_one_leg, unfold_isdf_operator
+    from symmetry_maps import unfold_isdf_one_leg
 
     # ---- IBZ list + per-tile v(q+G) -----------------------------------
     (_q_int, q_irr_frac,
@@ -490,7 +478,7 @@ def _compute_V_q_g_flat_one_tile(
               f"ngkmax={ngkmax}, g_chunk={g_chunk} ({n_chunks}/q), "
               f"n_rmu_L={n_rmu_L}→{n_rmu_L_padded}, "
               f"n_rmu_R={n_rmu_R}→{n_rmu_R_padded}, "
-              f"unfold={'IBZ→full' if use_ibz else 'full-BZ'}",
+              f"storage={'q-IBZ' if use_ibz else 'full-BZ'}",
               flush=True)
 
     # ---- Accumulators + v_q on device --------------------------------
@@ -667,10 +655,6 @@ def _compute_V_q_g_flat_one_tile(
                 q_irr_frac=q_irr_frac, irr_idx_q=full_to_irr_idx,
                 sym_idx_q=unfold_sym, sym_perm=sym_perm,
                 L_table=L_table, n_sym_spatial=n_sym_spatial)
-        V_acc = unfold_isdf_operator(
-            V_acc, irr_idx=full_to_irr_idx, sym_idx=unfold_sym,
-            sym_perm=sym_perm, L_table=L_table, q_irr_frac=q_irr_frac,
-            mesh_xy=mesh_xy, n_sym_spatial=n_sym_spatial)
 
     V_qmunu = jax.lax.with_sharding_constraint(V_acc, V_sh)
     if write_g0:
@@ -767,7 +751,7 @@ def compute_all_V_q_g_flat(
                 v[qi] = np.where(v_at_sphere != 0.0, v_at_sphere, v[qi])
         return v.astype(np.complex128)
 
-    return _compute_V_q_g_flat_one_tile(
+    V_q, g0 = _compute_V_q_g_flat_one_tile(
         zeta_loader, None,
         v_per_G_builder=_bare_v_per_G,
         kgrid=kgrid, fft_grid=fft_grid,
@@ -780,6 +764,21 @@ def compute_all_V_q_g_flat(
         timing_label='CC',
         verbose=verbose,
     )
+
+    from symmetry_maps import unfold_isdf_operator
+    from .qgrid_symmetry import qgrid_trs_policy_for
+    _, q_frac, irr, rows, perm, wraps, reduced = _resolve_ibz_q_list(
+        sym=sym, centroid_indices=centroid_indices,
+        kgrid=kgrid, fft_grid=fft_grid)
+    if reduced:
+        policy = qgrid_trs_policy_for(
+            sym=sym, irr_idx_q=irr, sym_idx_q=rows, kgrid=kgrid,
+            n_sym_spatial=len(perm) // 2, context="scalar V consumer")
+        V_q = unfold_isdf_operator(
+            V_q, irr_idx=irr, sym_idx=policy.unfold_sym_idx,
+            sym_perm=perm, L_table=wraps, q_irr_frac=q_frac,
+            mesh_xy=mesh_xy, n_sym_spatial=policy.n_sym_spatial)
+    return V_q, g0
 
 
 def compute_head_channel_zeta(
