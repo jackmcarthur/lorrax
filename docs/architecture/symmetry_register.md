@@ -1322,3 +1322,15 @@ The verbatim PHYS table above describes its audit base. The end-to-end Z host-st
 `head_correction._photon_q0_factor_orbit` now transports each complete rank-four factor pair through `SymMaps.active_symmetry_rows` and averages its outer products. The typed Lorentz action mixes charge/current indices; `apply_band_matrix_symmetry` owns antiunitary conjugation; centroid pullbacks come from the parent plans. At Gamma no Bloch return phase remains. Averaging factors separately is wrong and has an explicit negative oracle. Both physical insertion and opt-in attribution consume the same factor orbits. The carrier retains original factors plus family-plan metadata, never a second centroid-square body.
 
 MoS2 actual TT completion covariance improves0.556871776 to2.30561e-11; the strict1e-11 probe remains failed, while the supplied Cartesian orthogonality defect is2.695311e-11. This input-precision limit is stated rather than hidden. Bare/screened CC were also noncovariant at1.1094e-6/1.1021e-6; projection brings them below6e-16. Claim1201 prices this change at max4.647µeV and spread6.471µeV in both QP files versus labelled incumbent fixed-main. Full Ward/gauge completeness and omitted current head terms remain model limitations.
+
+The PHYS fixed-positive-ridge limitation is repaired for the equal-current
+fit schedule: `_transverse_lu_ridge` owns sign(Re tr C)δ in all four local/
+distributed, hoisted/fused preparations, preserving C=sQ and Z=sRHS together.
+The extended `positive_ridge_moves_negative_gram_toward_zero` oracle retains
+the legacy6.0 red value and verifies the corrected0.54545 positive-Gram
+solution for both input signs. Default `resolve_linalg` selects ridge for
+both local and distributed layouts; charge `zeta_ridge` is separate. The
+existing LU conditioning refusal is still applied to the corrected factor.
+Fresh Mo202/Si235 match all90/256 QP and printed sector rows to their
+Gamma-only/Si controls; CPU233 passes24tests. No general-indefinite
+regularization or full gauge-completeness claim follows.

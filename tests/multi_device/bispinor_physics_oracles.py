@@ -571,7 +571,7 @@ def test_signed_isdf_rhs_cancels_in_unregularized_fit():
 
 
 def test_positive_ridge_moves_negative_gram_toward_zero():
-    """The retained positive ridge anti-regularizes the signed Gamma2 normal matrix."""
+    """A fixed positive ridge moves the negative Gram toward zero; the paired-sign regularizer moves it away."""
     from isdf.core import _transverse_lu_math,_TRANSVERSE_LU_RIDGE
     from jax.scipy.linalg import lu_solve
     physical = np.diag([1.,6e-13]).astype(complex)
@@ -582,9 +582,12 @@ def test_positive_ridge_moves_negative_gram_toward_zero():
     ridge = _TRANSVERSE_LU_RIDGE*abs(np.trace(signed))/2
     desired = np.linalg.solve(physical+ridge*np.eye(2),rhs)
     legacy = np.linalg.solve(physical-ridge*np.eye(2),rhs)
-    np.testing.assert_allclose(actual,legacy,rtol=3e-13,atol=3e-13)
-    assert abs(actual[1]) > 5 and abs(desired[1]) < 1
-    print(f'GAMMA2_RIDGE legacy={actual[1]} positive_gram={desired[1]} ridge={ridge}')
+    np.testing.assert_allclose(actual,desired,rtol=3e-13,atol=3e-13)
+    assert abs(legacy[1]) > 5 and abs(actual[1]) < 1
+    positive_lu, positive_piv = _transverse_lu_math(jnp.asarray(physical),2)
+    positive = np.asarray(lu_solve((positive_lu,positive_piv),jnp.asarray(rhs)))
+    np.testing.assert_allclose(actual,positive,rtol=3e-13,atol=3e-13)
+    print(f'GAMMA2_RIDGE legacy={legacy[1]} fixed={actual[1]} positive_gram={desired[1]} ridge={ridge}')
 
 
 def test_sigma_oracle_rejects_transposed_gamma2(monkeypatch):

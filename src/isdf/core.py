@@ -3557,54 +3557,22 @@ def _factor_c_q_replicated_qparallel(
 # The service owns each provider's pivot dtype and rank-private layout;
 # this physics module never sees or reshards a pivot vector.
 
-# The per-q diagonal ridge for the indefinite transverse LU:
-# eps·|tr(C_log)|/n_log lifts TRS-paired near-zero modes above the
-# partial-pivoting stability floor without perturbing well-conditioned
-# ones.  Module constant so the hoisted factor stage and solve_zeta's
-# fused fallback paths cannot drift.
+# Equal-current C and Z carry the same signed-Gram convention; the shared
+# ridge owner preserves that sign in every hoisted and fused LU preparation.
 _TRANSVERSE_LU_RIDGE = 1e-12
 
 _transverse_lu_cache: dict = {}      # hoisted local LU factor kernels
 _transverse_distributed_lu_cache: dict = {}  # ridged inputs to service getrf
 
 
+def _transverse_lu_ridge(trace, n_log):
+    """Preserve the shared C/Z Gram sign so (sQ+sδI)⁻¹(sZ)=(Q+δI)⁻¹Z."""
+    return _TRANSVERSE_LU_RIDGE * jnp.sign(jnp.real(trace)) * jnp.abs(trace) / n_log
+
+
 def _transverse_lu_math(C_log: jax.Array, n_log: int):
-    """Per-q hoisted transverse LU arithmetic — ONE kernel shared by the
-    all-ranks and q-parallel executions (bit-identity contract, same role
-    as ``_charge_factor_math``).
-
-    ``C_log``: one whole REPLICATED logical tile ``(n_log, n_log)``.
-    Returns ``(lu, piv)`` with ``lu`` the packed L/U factors and ``piv``
-    the int32 LAPACK pivots — the pair ``jnp.linalg.solve`` computes
-    internally (``lax.linalg.lu``), so ``jax.scipy.linalg.lu_solve((lu,
-    piv), Z)`` at solve time runs the identical
-    ``lu_pivots_to_permutation`` + ``lax_linalg.lu_solve`` arithmetic and
-    reproduces the fused ``jnp.linalg.solve(C_reg, Z)`` to the bit.  The
-    ridge uses ``jnp.trace`` on the replicated tile — the same
-    expression (same reduction order, same bits) the fused
-    ``_ridge_indef_solve`` used.
-
-    WHAT THE RIDGE IS AND IS NOT — the docstring claim that was REFUTED.
-    The transverse CCT is Hermitian **INDEFINITE**: both signs of λ are
-    physical (TRS in a non-magnetic ground state puts near-null
-    transverse-current modes at both signs).  ``C + εI`` shifts EVERY
-    eigenvalue the same way, so it pushes the NEGATIVE ones toward zero.
-    A positive ridge is therefore not a regularizer here, and above
-    κ ~ 1e12 it is measured actively harmful (register ``bispinor``, job
-    7885987).  It is retained as the default only because flipping a
-    production default is a physics ruling with a measurement attached,
-    and no production-deck measurement of the truncated route
-    (``transverse_zeta_solve = rank_truncate``, which cuts on ``|λ|`` and
-    is the correct scheme for an indefinite operator) exists yet.
-
-    What it may NOT be is uninstrumented.  :func:`_certify_transverse_ridge`
-    reads a κ LOWER BOUND off ``|diag U|`` of this factor — O(n) after a
-    factorization that already happened — and refuses above
-    ``rank_criterion.KAPPA_INDEFINITE_MAX``.  A lower bound is the right
-    direction for a gate that fires when the number is LARGE.  See
-    ``docs/dev/rank_truncation_policy.md`` §4.
-    """
-    ridge = _TRANSVERSE_LU_RIDGE * jnp.abs(jnp.trace(C_log)) / n_log
+    """Factor the logical signed Gram with its sign-aware ridge before the unchanged RHS solve."""
+    ridge = _transverse_lu_ridge(jnp.trace(C_log), n_log)
     C_reg = C_log + ridge * jnp.eye(n_log, dtype=C_log.dtype)
     lu, piv, _perm = jax.lax.linalg.lu(C_reg)
     return lu, piv.astype(jnp.int32)
@@ -3663,7 +3631,7 @@ def _certify_transverse_ridge(LU_q: jax.Array, *, n_log: int,
     if jax.process_index() == 0:
         print(f"  [{where}] conditioning: kappa_lb = max|u_ii|/min|u_ii| of "
               f"the pivoted LU, worst over q = {k_max:.3e} at q={q_at} "
-              f"(ridge {_TRANSVERSE_LU_RIDGE:.1e}*|tr C|/n; ceiling "
+              f"(ridge sign(tr C)*{_TRANSVERSE_LU_RIDGE:.1e}*|tr C|/n; ceiling "
               f"{ceiling:.1e}).  This is a LOWER BOUND on kappa — above the "
               f"ceiling it refuses, below it certifies NOTHING.", flush=True)
     if not (k_max > ceiling):
@@ -3920,8 +3888,7 @@ def _factor_c_q_transverse_distributed_lu(
             # modes — ROOT_CAUSE.md 2026-07-08) and add the per-q ridge.
             C_log = jax.lax.with_sharding_constraint(
                 C[:, :n_log, :n_log], xy_shard)
-            ridge = (_TRANSVERSE_LU_RIDGE
-                     * jnp.abs(trace) / n_log)[:, None, None]
+            ridge = _transverse_lu_ridge(trace, n_log)[:, None, None]
             eye_n = jnp.eye(n_log, dtype=C.dtype)[None, :, :]
             return jax.lax.with_sharding_constraint(
                 C_log + ridge * eye_n, xy_shard)
@@ -4924,10 +4891,10 @@ def solve_zeta(
     (``L y = Z`` then ``L^H ζ = y``).  This is the historical fast
     path — bit-identical to the previous implementation.
 
-    For ``vertex_mu_L != 0`` the transverse CCT^μ is Hermitian but
-    indefinite — γ̃^i ⊗ γ̃^i has both signs of eigenvalue, so Cholesky is
-    invalid and the factor is a pivoted LU with a small diagonal ridge
-    ``ε·|tr(C_log)|/n_log`` (ε = :data:`_TRANSVERSE_LU_RIDGE`).  Since
+    For ``vertex_mu_L != 0`` the equal-current CCT is a signed Gram;
+    Gamma2 carries the negative sign shared by its RHS.  Pivoted LU uses
+    :func:`_transverse_lu_ridge` so regularization preserves the paired sign.
+    Since
     the 2026-08 hoist ``factor_c_q`` computes that LU ONCE per channel on
     the local plan (including provider selection with ``batch_reshard``):
     ``L_q`` carries the packed factors and
@@ -5163,10 +5130,9 @@ def solve_zeta(
             # MoS2 3×3 bispinor).  Both the trace and the denominator
             # must be LOGICAL quantities or the ridge (hence ζ) depends
             # on the pad extent.
-            LU_RIDGE = 1e-12
             trace_per_q = (cct_trace_per_q if cct_trace_per_q is not None
                            else jnp.einsum('qii->q', L_log))
-            ridge = (LU_RIDGE * jnp.abs(trace_per_q) / n_log)[:, None, None]
+            ridge = _transverse_lu_ridge(trace_per_q, n_log)[:, None, None]
             eye_n = jnp.eye(n_log, dtype=L_log.dtype)[None, :, :]
             return _lu_plan.batched(L_log + ridge * eye_n, Z_log)
 
@@ -5207,18 +5173,8 @@ def solve_zeta(
     # independent of the particular transverse gamma; the outer r-chunk
     # factory may still specialize that gamma for an FFI attribute.
     use_lu = (solver_kind == 'lu')
-    # ``use_lu`` selects a pivoted-LU back-solve for transverse channels
-    # (γ̃^i, i∈{1,2,3}).  CCT^μ for those channels is Hermitian but
-    # indefinite (γ̃^i ⊗ γ̃^i has both signs of eigenvalue), so Cholesky
-    # is invalid.  Bunch-Kaufman LDL^T would be the natural fit for
-    # Hermitian indefinite, but JAX doesn't expose it; ``jnp.linalg.solve``
-    # uses LU with partial pivoting which handles indefinite matrices
-    # correctly as long as they aren't actually singular.  We keep a
-    # small ridge ``LU_RIDGE·trace/n_rmu`` on the diagonal to lift any
-    # near-zero modes from TRS-paired band cancellations safely above
-    # the LU stability floor — small enough not to perturb the
-    # well-conditioned modes.
-    LU_RIDGE = _TRANSVERSE_LU_RIDGE
+    # Current normal inputs retain their common C/Z sign; both hoisted and
+    # fused solves use the same trace-directed shift at the logical extent.
 
     # HOISTED transverse back-solve: factor_c_q already ran the pivoted
     # LU (once per channel) and handed us (LU factors, permutation).
@@ -5279,19 +5235,9 @@ def solve_zeta(
     piv_rep_shard = NamedSharding(mesh_xy, P(None, None))
 
     def _ridge_indef_solve(L: jax.Array, Z: jax.Array) -> jax.Array:
-        """Solve (L + ε·tr(L)/n · I) · ζ = Z via pivoted LU at the
-        LOGICAL μ extent (slice/zero-refill via ``solve_at_logical`` —
-        load-bearing: LU at the identity-padded extent yields a
-        different, per-extent-deterministic ζ_T, amplified O(1) in the
-        near-null transverse modes; ROOT_CAUSE.md 2026-07-08).
-
-        ε = ``LU_RIDGE`` (1e-12) on the logical trace/denominator: well
-        below any physically meaningful eigenvalue but above the
-        partial-pivoting floor, so LU stays stable on TRS-paired
-        near-zero modes without perturbing the rest of the spectrum.
-        """
+        """Solve the paired-sign regularized system at the logical centroid extent."""
         def _ridged_lu(L_log, Z_log):
-            ridge = LU_RIDGE * jnp.abs(jnp.trace(L_log)) / n_log
+            ridge = _transverse_lu_ridge(jnp.trace(L_log), n_log)
             L_reg = L_log + ridge * jnp.eye(n_log, dtype=L.dtype)
             return jnp.linalg.solve(L_reg, Z_log)
         return solve_at_logical(_ridged_lu, n_log, (L,), Z)
