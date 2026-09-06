@@ -91,3 +91,11 @@
 |---|---|
 | SUMMA payload | Complex128 panels16(m/p)(k/p) and16(k/p)(n/p), p=sqrt(P), p broadcasts per panel per q. Actual NCCL wire/link replication is not measured. Shapes authenticated by native/HLO66–75; counts agree with native census. |
 | Static body | Same formulas with G q=36 on both routes. F head-attribution adds two calls; their payload is excluded from this τ-only table. |
+
+| Scalar completed arm | ζ s | χ0 / W s | Rule plan s | τ / other Σ s | Total s | Compile events / s | EQP0 / EQP1 vs historical reference µeV | Scope / step |
+|---|---:|---|---:|---|---:|---|---|---|
+| Si P4 fe2a6937 own ζ |12.18|4.37 /4.20|627.45|14.93 /22.36|707.74|503 /35.65|8.135 /15.091 vs leg20|own ζ; scalar exact FAIL against historical reference; current-main comparison pending;57988457/lx-Xg4-143444-1183016-5007 P arm complete, pair running|
+| Si historical leg20 |11.48|3.45 /3.81|10.50|15.67 /22.14|88.22|not emitted in retained log|reference|runs/Si/99_psi_irr_zeta_2026-09-05/20_g0w0_packed_order|
+| Na historical03 P16 |19.43|screening176.31|33.90|391.73 /29.65|675.15|reference receipt|reference|runs/Na/15_psi_irr_parents_only_2026-09-05/03_p16_packed_order|
+| Na historical04 P16 |19.24|screening173.79|34.50|383.90 /28.49|672.65|461|reference|57955934/lx-Xg4-165800-844150-6998; runs/Na/15_psi_irr_parents_only_2026-09-05/04_p16_repro_coord_ade4fc66|
+| Si planner attribution |—|—|cache12→18 files; rank0 compile agreement201.708s|—|—|gw.sigma_box_plan._rule_cache_lookup / plan_sigma_windows|causation vs current main pending|runs/Si/100_bisp_scale_scalar_2026-09-06/01_bisp_tip_fresh/driver.rank0.log; identity_leg20_freshP.json|
