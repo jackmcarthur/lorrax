@@ -296,7 +296,8 @@ the growth pad and grid rounding, without evaluating those samples at map 0.
 Padding intermediate states alone does not cover external-frequency growth.
 Changed product-window membership, state support or pole drift can still
 require a rebuild. Each frequency branch reserves both growth increments
-on its own interval, without importing the entire unused opposite half.
+on its own interval within its physical frequency half; samples crossing
+zero are assigned to the other branch by the branch factory.
 Contained initial certificates of the same causal type share their nodes.
 Interior holes still require an explicit patch. Quadrature
 nodes remain frozen while their certified boxes cover the map.
