@@ -1,0 +1,102 @@
+[
+  {
+    "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/21_P_gn_fixed_rules",
+    "step": "[lx] step lx-Xg4-034834-61698-3797 exit 0 in 61 s",
+    "timing": {
+      "batch": 4,
+      "executor_census": "production_progress_exact_tau_total",
+      "launcher_log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/21_P_gn_fixed_rules/evidence/science_lx_run.log",
+      "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/21_P_gn_fixed_rules/gwjax.out",
+      "logical_windows": null,
+      "plan": "box",
+      "planned_distinct_tau": null,
+      "planned_window_tau_pairs": null,
+      "pole_batches": 1,
+      "poles": 1,
+      "seconds_per_tau_dispatch": 0.1403448275862069,
+      "sigma_other_seconds": 23.28,
+      "sigma_rule_plan_seconds": 0.08,
+      "sigma_tau_sweep_seconds": 4.07,
+      "sigma_wall_seconds": 27.43,
+      "sweeps": null,
+      "tau": 29,
+      "total_wall_seconds": 56.35,
+      "window_census_status": "not emitted by minimal production reporter; requires an artifact-bound planner receipt"
+    }
+  },
+  {
+    "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/22_F_gn_fixed_rules",
+    "step": "[lx] step lx-Xg4-034939-69635-6718 exit 0 in 57 s",
+    "timing": {
+      "batch": 4,
+      "executor_census": "production_progress_exact_tau_total",
+      "launcher_log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/22_F_gn_fixed_rules/evidence/science_lx_run.log",
+      "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/22_F_gn_fixed_rules/gwjax.out",
+      "logical_windows": null,
+      "plan": "box",
+      "planned_distinct_tau": null,
+      "planned_window_tau_pairs": null,
+      "pole_batches": 1,
+      "poles": 1,
+      "seconds_per_tau_dispatch": 0.14689655172413793,
+      "sigma_other_seconds": 20.1,
+      "sigma_rule_plan_seconds": 0.08,
+      "sigma_tau_sweep_seconds": 4.26,
+      "sigma_wall_seconds": 24.44,
+      "sweeps": null,
+      "tau": 29,
+      "total_wall_seconds": 52.1,
+      "window_census_status": "not emitted by minimal production reporter; requires an artifact-bound planner receipt"
+    }
+  },
+  {
+    "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/43_P_dynamic_fixed_rules",
+    "step": "[lx] step lx-Xg4-035039-75083-7226 exit 0 in 95 s",
+    "timing": {
+      "batch": 4,
+      "executor_census": "production_progress_exact_tau_total",
+      "launcher_log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/43_P_dynamic_fixed_rules/evidence/science_lx_run.log",
+      "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/43_P_dynamic_fixed_rules/gwjax.out",
+      "logical_windows": null,
+      "plan": "box",
+      "planned_distinct_tau": null,
+      "planned_window_tau_pairs": null,
+      "pole_batches": 1,
+      "poles": 1,
+      "seconds_per_tau_dispatch": 0.04358208955223881,
+      "sigma_other_seconds": 29.82,
+      "sigma_rule_plan_seconds": 0.12,
+      "sigma_tau_sweep_seconds": 2.92,
+      "sigma_wall_seconds": 32.86,
+      "sweeps": null,
+      "tau": 67,
+      "total_wall_seconds": 88.93,
+      "window_census_status": "not emitted by minimal production reporter; requires an artifact-bound planner receipt"
+    }
+  },
+  {
+    "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/44_F_dynamic_fixed_rules",
+    "step": "[lx] step lx-Xg4-035215-84573-5805 exit 0 in 71 s",
+    "timing": {
+      "batch": 4,
+      "executor_census": "production_progress_exact_tau_total",
+      "launcher_log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/44_F_dynamic_fixed_rules/evidence/science_lx_run.log",
+      "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/44_F_dynamic_fixed_rules/gwjax.out",
+      "logical_windows": null,
+      "plan": "box",
+      "planned_distinct_tau": null,
+      "planned_window_tau_pairs": null,
+      "pole_batches": 1,
+      "poles": 1,
+      "seconds_per_tau_dispatch": 0.03671641791044776,
+      "sigma_other_seconds": 26.5,
+      "sigma_rule_plan_seconds": 0.11,
+      "sigma_tau_sweep_seconds": 2.46,
+      "sigma_wall_seconds": 29.07,
+      "sweeps": null,
+      "tau": 67,
+      "total_wall_seconds": 65.75,
+      "window_census_status": "not emitted by minimal production reporter; requires an artifact-bound planner receipt"
+    }
+  }
+]
