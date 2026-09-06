@@ -292,3 +292,15 @@ The private kernel parameter changes from `vertex_pair` to `vertex_pairs` and re
 Pool continuation: own authorized fallback allocation57986810 succeeded (00_environment/allocation_attempt1.log). Waiting shared-pool probe51 was cancelled before it created a driver or science step; replacement61 and cached baseline62 run sequentially on the owned node. Shared57982945 remains the optional P16 pool.
 
 Publication: the rebased continuation is published as `perf/bisp-prof-zw-green-reuse-2026-09-06` to preserve the campaign's no-force-push rule; the earlier published profiling branch remains intact. The assigned worktree/local branch is unchanged.
+
+### First class implementation: exact and faster warm, but cold compilation regresses
+
+Owned pool57986810. Cached baseline62 `lx-Xg4-115421-357311-4476` exit0: screening25.98s,total60.68s,562 compiles/33.89 compiler seconds. Candidate64 `lx-Xg4-115931-388157-6151` exit0: screening27.75s,total58.77s,562/36.75. Both EQP files210/210 and all CC/TT/CT rows are exact. The total-wall drop includes unrelated bring-up variation; **screening itself is1.77s slower cold**, not a stage speedup.
+
+Profile61 `lx-Xg4-115151-325927-9809` and65 `lx-Xg4-120037-396487-6986` exit0, with three synchronized warm repeats. Baseline mean complete16-block sweep2.724131s; four classes≈1.0425s, a substantial steady-state reduction. The T-T class's nine blocks take a native136.267897ms versus107.428298ms for one original T-T block. Both use the identical11-node/weight SHA256 `2a101e324c7ee44477a03066bdd54b4f6e04395416d15e00dd5aa4f6912cf872`.
+
+Optimized HLO65 contains four vertex-class modules, each with exactly two distributed Green GEMM calls inside the tau body, zero explicit collectives, and2+n_vertices static FFT calls (two Green FFTs per tau plus each final q FFT). Peaks CC2,606,656,548B; CT1,179,007,644B; TC908,057,756B; TT407,508,828B. These include compiler temporaries beyond the payload model; all centroid-quadratic operands retain both mesh axes. No extra family Green pairs appear when n_vertices=9.
+
+The first implementation unrolls the class's vertex contractions. First-call compiler work rises from9.247814s for the original sixteen calls to12.533002s for the four class calls in the instrumented comparison. The next bounded ablation replaces that unrolling with a small vertex loop while keeping the shared Green pair and ordered per-block tau sums. This preserves the measured warm benefit's data flow and targets the observed cold regression.
+
+CPU63 passes13 focused tests, including all four classes against literal complex densities, parent glide/TR transport and scalar contour kernels. Its fresh-file comparison uses `compare_zeta_h5.py --rtol0`: charge maximum absolute3.563056e-4/normalized6.340472e-7; current1 7.412283e-9/1.018844e-11; current2 8.466901e-6/1.020736e-8; current3 5.300709e-9/7.176702e-12; every file finite, none bit-identical across P/F. Fresh cross-source EQP0/1 each12/210 printed exact, maximum4.470 micro-eV. These cross-source results are not substituted for the exact same-source class acceptance gate.

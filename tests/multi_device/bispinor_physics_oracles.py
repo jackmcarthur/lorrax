@@ -186,11 +186,11 @@ def test_all_16_chi_blocks_nonzero_ct_literal_both_orientations(monkeypatch):
     for a in range(4):
         for b in range(4):
             kernel = _get_chi_minimax_kernel(mesh, (3,3,1), layout='face',
-                face_shape=(9,4,4,4), right_face_shape=(9,4,6,4), vertex_pair=(a,b))
+                face_shape=(9,4,4,4), right_face_shape=(9,4,6,4), vertex_pairs=((a,b),))
             actual = kernel(nodes, mun, nmu, jnp.asarray(energies < 0),
                 jnp.asarray(energies > 0), jnp.asarray(energies), jnp.array(-.7), jnp.array(.4),
-                (jnp.argmax(jnp.abs(gamma[a]),axis=1), jnp.conj(jnp.sum(gamma[a],axis=1)),
-                 jnp.argmax(jnp.abs(gamma[b]),axis=1), jnp.conj(jnp.sum(gamma[b],axis=1))))
+                ((jnp.argmax(jnp.abs(gamma[a]),axis=1), jnp.conj(jnp.sum(gamma[a],axis=1)),
+                 jnp.argmax(jnp.abs(gamma[b]),axis=1), jnp.conj(jnp.sum(gamma[b],axis=1))),))[0]
             np.testing.assert_allclose(actual, expected[a,b], rtol=3e-12, atol=3e-12,
                                        err_msg=f'Lorentz block {(a,b)}')
 
@@ -443,16 +443,21 @@ def test_parent_chi_equals_literal_full_k_for_all_16_blocks(monkeypatch):
         alpha=jnp.array([-np.exp(-.2*1.1)],dtype=jnp.complex128))
     mun = jax.device_put(parent.transpose(0,2,3,1),NamedSharding(mesh,P(None,None,'x','y')))
     nmu = jax.device_put(parent,NamedSharding(mesh,P(None,'x',None,'y')))
-    for a in range(4):
-        for b in range(4):
-            shape = (plan.n_parent,4,plan.n_centroid_packed,4)
-            kernel = _get_chi_minimax_kernel(mesh,(3,3,1),layout='face',face_shape=shape,
-                right_face_shape=shape,vertex_pair=(a,b),k_unfold_plan=(plan,plan))
-            actual = kernel(nodes,mun,nmu,jnp.asarray(energy<0),jnp.asarray(energy>0),
-                            jnp.asarray(energy),jnp.array(-.7),jnp.array(.4),
-                            (jnp.argmax(jnp.abs(_gamma()[0][a]),axis=1), jnp.conj(jnp.sum(_gamma()[0][a],axis=1)),
-                             jnp.argmax(jnp.abs(_gamma()[0][b]),axis=1), jnp.conj(jnp.sum(_gamma()[0][b],axis=1))))
-            np.testing.assert_allclose(actual,expected[a,b],rtol=3e-12,atol=3e-12)
+    gamma = _gamma()[0]
+    for left_vertices in ((0,), (1, 2, 3)):
+        for right_vertices in ((0,), (1, 2, 3)):
+            pairs = tuple((a, b) for a in left_vertices for b in right_vertices)
+            shape = (plan.n_parent, 4, plan.n_centroid_packed, 4)
+            kernel = _get_chi_minimax_kernel(mesh, (3, 3, 1), layout='face', face_shape=shape,
+                right_face_shape=shape, vertex_pairs=pairs, k_unfold_plan=(plan, plan))
+            operands = tuple((jnp.argmax(jnp.abs(gamma[a]), axis=1),
+                              jnp.conj(jnp.sum(gamma[a], axis=1)),
+                              jnp.argmax(jnp.abs(gamma[b]), axis=1),
+                              jnp.conj(jnp.sum(gamma[b], axis=1))) for a, b in pairs)
+            actual = kernel(nodes, mun, nmu, jnp.asarray(energy < 0), jnp.asarray(energy > 0),
+                            jnp.asarray(energy), jnp.array(-.7), jnp.array(.4), operands)
+            for (a, b), block in zip(pairs, actual):
+                np.testing.assert_allclose(block, expected[a, b], rtol=3e-12, atol=3e-12)
 
 
 def test_full_band_unfold_matches_literal_sigma_on_symmetric_complete_toy(monkeypatch):
