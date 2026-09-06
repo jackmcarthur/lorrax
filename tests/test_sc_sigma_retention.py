@@ -16,8 +16,8 @@ iteration"); the only consumers are ``dump_sigma_omega_h5_final`` and
 survives.
 
 That "nothing reads it" is the load-bearing claim, so it is the
-assertion: ``gw_iteration_map`` may touch ``state.iteration`` and
-``state.H_qp_dft`` and nothing else.  A later change that made the map
+assertion: ``gw_iteration_map`` may touch only the small carry and control
+fields enumerated below. A later change that made the map
 depend on the previous Σ would silently make the drop wrong, and would
 fail here first.
 
@@ -64,8 +64,10 @@ def _state_attrs(fn, var="state"):
 # the map solves its own occupations from the spectrum of the H it is
 # handed, so neither correctness nor the head consumes the carry;
 # head_surface_weight_kn is carried for continuity but never read here.
+# The current call's role controls accepted-only partition/grid updates;
+# it is a control flag, never a retained Sigma payload or stale map output.
 _CARRY_KEYS = {
-    "iteration", "H_qp_dft", "partition", "occupation_state",
+    "iteration", "H_qp_dft", "partition", "occupation_state", "role",
 }
 
 # What a bare INPUT SCState is constructed with in the drivers: the read
@@ -83,11 +85,11 @@ def test_gw_iteration_map_reads_only_the_carry_and_the_counter():
 
 @pytest.mark.parametrize("driver", ["_run_rcrop", "_run_linear_mixing"])
 def test_no_driver_feeds_a_stale_sigma_result_into_the_map(driver):
-    """Every ``SCState(...)`` built as a map ARGUMENT carries H and i only.
+    """Every map argument contains only the declared small carry/control set.
 
     The finalize state at the end of ``_run_rcrop`` legitimately carries
     the last ``SCOutputs``, so the check is on the constructions whose
-    keywords are exactly the two fields the map reads — there must be at
+    keywords are exactly the declared input fields — there must be at
     least one — and on every other construction still naming ``outputs``.
     """
     fn = _func(driver)

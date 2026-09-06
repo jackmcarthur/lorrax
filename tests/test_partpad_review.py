@@ -221,9 +221,10 @@ def test_restart_active_window_edge_is_checked_before_loop(restart):
     # run before either fresh/restart path enters the SC machinery.
     kw = {name: None for name, p in inspect.signature(run_sc_driver).parameters.items()
           if p.default is inspect.Parameter.empty}
+    from gw.wavefunction_bundle import BandSlices
     kw.update(config=SimpleNamespace(restart=restart),
               wfn=SimpleNamespace(energies=np.array([[[-1., 1., 1., 3.]]]) / RYD_TO_EV),
-              band_slices=SimpleNamespace(b0=0, b3=2))
+              band_slices=BandSlices.from_band_edges(0, 0, 0, 2, 2))
     with pytest.raises(BandWindowDegeneracyError, match='nval/ncond'):
         run_sc_driver(**kw)
 
