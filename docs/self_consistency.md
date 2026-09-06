@@ -295,9 +295,12 @@ Certificates reserve this prospective external-frequency extent, including
 the growth pad and grid rounding, without evaluating those samples at map 0.
 Padding intermediate states alone does not cover external-frequency growth.
 Changed product-window membership, state support or pole drift can still
-require a rebuild. Each frequency branch reserves both growth increments
-on its own interval within its physical frequency half; samples crossing
-zero are assigned to the other branch by the branch factory.
+require a rebuild. Each frequency branch reserves outward growth only:
+negative frequencies toward the prospective lower extent, nonnegative
+frequencies toward the upper extent. Its inner endpoint remains unchanged;
+reserving unsampled support toward zero can turn a sign-definite pole tail
+into an expensive crossing rule. Genuine new pole channels follow the
+reported rebuild-on-escape path.
 Contained initial certificates of the same causal type share their nodes. A
 near-boundary cache request is accepted only after re-auditing the unchanged
 nodes on the union box at the same sup-error and runtime-noise limits; the
