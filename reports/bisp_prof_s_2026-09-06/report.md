@@ -37,19 +37,19 @@ Prepared local evidence directories:
 - `runs/Si/100_bisp_parent_route_2026-09-05/prof_s/01_P_cohsex_baseline/`, `02_F_cohsex_baseline/`, `03_P_gn_baseline/`, `04_F_gn_baseline/`.
 - `runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/05_P_full_static_baseline/`, `06_F_full_static_baseline/`, `07_P_packed_bare_baseline/`, `08_F_packed_bare_baseline/`, `09_P_dynamic_eps5_baseline/`, `10_F_dynamic_eps5_baseline/`.
 
-Each has `manifest.yaml`, `cohsex.in`, `rankwrap.sh`, `driver.sh`, `run.sh`, copied `tmp/`, and `inputs.sha256`. None has run. `run.sh JID` pins every dispatch explicitly and refuses to overwrite an attempt. Source checks compare `src/services` against the code pin inside each rank. Host baselines should precede separately copied profiler variants; Nsight instrumentation walls are not baseline timing evidence.
+Each has `manifest.yaml`, `cohsex.in`, `rankwrap.sh`, `driver.sh`, `run.sh`, copied `tmp/`, and `inputs.sha256`. All ten baseline arms have completed on authorized pool 57966610. `run.sh JID` pins every dispatch explicitly and refuses to overwrite an attempt. Source checks compare `src/services` against the code pin inside each rank. Host baselines should precede separately copied profiler variants; Nsight instrumentation walls are not baseline timing evidence.
 
 ## Valid rank-0 device captures
 
-**Pending; no device timing or kernel-class census claimed.** Use PERF2's `cudaProfilerStart/Stop` inside `runtime.run_main_and_finalize`, with `jax.effects_barrier()` before stop. The prior installed nsys path is `/opt/nvidia/hpc_sdk/Linux_x86_64/26.5/profilers/13.2/Nsight_Systems/bin/nsys`; its availability in this allocation is untested. Capture rank0 while all four ranks execute the same science. Export `nvtx_gpu_proj_sum`, `nvtx_kern_sum`, `cuda_gpu_kern_sum`; verify actual CUDA records, then isolate one warm static block and one warm tau node. Native kernel sums and projected spans must remain separate; no nested-range summation.
+Static captures are complete; their reduced receipts appear below. Dynamic captures are running with common certified schedules. We use PERF2's `cudaProfilerStart/Stop` inside `runtime.run_main_and_finalize`, with `jax.effects_barrier()` before stop. The prior installed nsys path is `/opt/nvidia/hpc_sdk/Linux_x86_64/26.5/profilers/13.2/Nsight_Systems/bin/nsys`; it is available and produced valid CUDA captures in this allocation. Capture rank0 while all four ranks execute the same science. Export `nvtx_gpu_proj_sum`, `nvtx_kern_sum`, `cuda_gpu_kern_sum`; verify actual CUDA records, then isolate one warm static block and one warm tau node. Native kernel sums and projected spans must remain separate; no nested-range summation.
 
 ## Saved Sigma device profile
 
-Pending for both P/F: G GEMMs, face gather/permutation and spin action, convolution FFTs, projection GEMMs, parent-row gather, band unfold, W restore and Lorentz mixing, seam pack/unpack, NCCL kernels. No first-vs-warm ms or compile seconds invented from Python call counts.
+Static P/F native timings and kernel classes are reported below; dynamic reduction is pending. Fused spin/gather costs are bounded by their enclosing native range, not presented as separately measured kernels.
 
 ### HLO collective census per stage
 
-Pending optimized rank0 dumps and `tools/hlo/analyze_hlo_dump.py`. Count async starts once and identify loop multipliers. HLO-zero does not establish communication-free distributed GEMM FFI. The parent orchestrator report explicitly says the literal final-psum-only criterion is not met; this lane has not disproved it. In particular, do not relabel transposed antiunitary transport as an ordinary local gather without inspecting the generated program.
+Static optimized dumps have been analyzed with `tools/hlo/analyze_hlo_dump.py` and PERF2's collective census; results below. Count async starts once and identify loop multipliers. HLO-zero does not establish communication-free distributed GEMM FFI. The parent orchestrator report explicitly says the literal final-psum-only criterion is not met; this lane has not disproved it. In particular, do not relabel transposed antiunitary transport as an ordinary local gather without inspecting the generated program.
 
 ## Owner's boundary-accounting table
 
@@ -145,17 +145,13 @@ speedup or an integration recommendation.
 
 ## Ablations
 
-Not run. A first priority is a restore-only compilation-lifetime ablation preserving the exact C,D accumulation order and the existing typed symmetry helpers. Follow with static vertex-shape specialization and body/head G reuse only if traces justify them. The open-spin dynamic operator route must be measured independently; static child-face duplication is not evidence for a dynamic-node change.
+Completed run-local arithmetic-preserving experiments appear in the unprofiled accounting table below. Production source is still pinned while the dynamic captures run. Failed experiment M13 initialized JAX before the communicator; it is retained as a failed variant, registered in KNOWN_SANDBOX_ERRORS.md, and corrected in M19.
 
-## Final verification and disposition
+## Verification and current disposition
 
-Incomplete: no new P/F drivers, Nsight capture, HLO census, ablation, source edit, printed-digit parity gate, or combined P4 test has run. There are no source commits for the orchestrator to adopt. The checkpoint accounting and prepared arms are useful preparation, not completion of the requested profiling/fix.
+All ten pinned baseline arms and both static captures completed. Static captures and successful ablations pass tolerance-zero eqp0/eqp1 and all 90 complete printed state rows in sigma_diag.dat, including CC/TT/CT. Dynamic capture and production implementation gates are pending; no production fix is recommended for adoption yet.
 
-One prescribed allocation attempt failed with `QOSMaxSubmitJobPerUserLimit`; artifact `runs/Si/100_bisp_parent_route_2026-09-05/prof_s/00_allocation/alloc.log`. No allocation JID was issued. `scontrol show job 57955075` reports invalid job id (saved alongside allocation log). Other visible pools were not used. User input requested: authorized JID or permission for another allocation attempt after capacity clears. No GPU test was substituted with login-node compute.
-
-Writes, including this report and local run/issue registers, stay in the assigned worktree under the explicit modify-only-worktree restriction. Shared sandbox ledgers remain read-only. The legacy `~/lorrax_service_phase/BUILD_NOTES.md` and `~/lorrax_bse_perf_2026-08-08/INDEX.md` were not present at the two explicit home aliases checked; no recursive home/shared-root search was performed. Current Perlmutter contract, PERF2 report/capture recipe, and supplied completed wrappers were read instead.
-
-Preparation verification: all five P/F copied `tmp/` SHA256 lists are identical; `bash -n` passes all30 launcher scripts. These are file/shell checks, not CPU/GPU science gates. Large copied inputs remain ignored; committed checksums and the bounded `00_allocation/prepare_baselines.py` preserve their reconstruction recipe.
+Pool 57966610 is explicitly authorized by the user and shared with this campaign. Every arm uses one node sequentially. The earlier failed allocation is historical infrastructure evidence, not a current blocker. All writes, including local run/issue/claim registers, stay within this worktree; shared sandbox ledgers are read-only under the lane's explicit scope.
 
 ## Authorized measurements — 2026-09-06
 
@@ -210,8 +206,8 @@ The body boundary records33 compilation events for32 cold body calls: one
 additional supporting executable is included; **64 contraction bodies** is the
 32 body +32 head specialization count, not a relabelling of65 boundary events.
 All48 restores compile, including W and W−V passes. P's X/SX weights are
-(nk,nb); COH weights are (nb,), explaining the second specialization per
-vertex/head identity. The exact same cached object is reused for SX.
+(nk,nb); COH weights are (nb,), coinciding with the second specialization per
+vertex/head identity. Shape alone is not a sufficient explanation: ablation16 broadcasts the COH weights and still produces64 modules. Sharding or another operand property remains to be isolated. The exact same cached object is reused for SX.
 
 The remainder between the static caller and restore/block measurements is NOT
 assigned a guessed cause or cost. Source inspection identifies eager plan
@@ -219,14 +215,13 @@ construction as a candidate: every one of32 factory misses creates a projector
 (two eagerly warmed GEMM plans) and one Green GEMM plan, versus four factories
 in F. New14/15 unprofiled instruments time the factory itself. Ablation17
 reuses these unchanged plans by shape, ablation16 normalizes the small weight
-operand shape, and ablation13 reuses restore callables across terms. They are
-prepared but unrun; none changes production source.
+operand shape, and ablation13 reuses restore callables across terms. They have now run; results below. None changes production source.
 
 Artifacts are `11_P_full_static_profile/boundary.jsonl`,
 `12_F_full_static_profile/boundary.jsonl`, their `boundary_summary.json`,
 `nsys_rank0.nsys-rep`, `stats_nvtx_gpu_proj_sum.csv`, and
 `stats_nvtx_kern_sum.csv` under the local MoS2 prof_s root. Native ms and
-HLO census remain to be reduced before any device claim.
+HLO census are reduced in the following section.
 
 ### Native warm TT unit and collective census
 
@@ -279,3 +274,36 @@ Evidence: P11/F12 `census.json`, optimized dumps, native CSVs and
 Canonical analyzers are the sandbox HLO tool and PERF2 collective census; the
 single-occurrence extension is registered in `skills/profile_bisp_sigma/SKILL.md`.
 P11 eqp0/eqp1 each pass tolerance0 against P05 (90/90 printed rows).
+
+### Complete pinned baseline table
+
+All arms are unprofiled P4, BFC@0.85, JID57966610, exit0. Compiler receipts cover the whole driver, not Sigma alone. Paths are the numbered baseline directories listed above; each owns gwjax.out, driver.rank0.log and driver.1.log. Exact step identifiers are also retained in baseline_steps.txt.
+
+| deck | P rule / tau / other s | F rule / tau / other s | P/F run s | P/F rank0 compiles | P/F compiler s |
+|---|---:|---:|---:|---:|---:|
+| Si COHSEX I01/I02 | — / — /47.29 | — / — /11.44 |74.21 /38.91|676 /412|47.26 /18.53|
+| Si GN I03/I04 |0.09 /4.00 /56.30|6.25 /4.33 /20.64|86.86 /58.64|816 /539|57.35 /27.33|
+| MoS2 full static M05/M06 |— /— /150.63|— /— /18.24|204.16 /55.13|1712 /597|147.90 /27.74|
+| MoS2 packed bare M07/M08 |— /— /150.61|— /— /19.04|184.39 /54.44|1613 /598|136.65 /27.26|
+| MoS2 GN eps5 M09/M10 |0.14 /3.00 /158.16|48.97 /2.50 /27.15|218.30 /116.72|1896 /790|161.28 /39.81|
+
+Both dynamic pairs finish at29/67 nodes, but their selected digests differ despite copied caches. F domains differ at roughly7e-13 Ry at a containment boundary, miss cached rules and rebuild. Equal total node counts do not certify the same nodes. Capture preparation step lx-Xg0-020534-1575957-9680 selects an existing immutable certificate covering the hull of both actual domains through the production lookup guards. Both capture arms replay exactly those certificates (29 and67 nodes); no certificate is enlarged or tolerance loosened. Preparation and replay scripts are in M00_tools and replay_rules/replay.json in each capture arm.
+
+### Unprofiled boundary attribution and isolated ablations
+
+The **static caller** below is compute_static_photon_sigma, nested within the driver's Sigma stage. Do not add its wall to child boundaries or confuse F's11.45s caller with its18.24s whole Sigma stage. These are synchronized host boundaries with compile-counter deltas, without Nsight or HLO dumping. M14/P and M15/F reproduce pinned arithmetic. M16 normalizes weights only; M17 reuses unchanged GEMM/projector plans by endpoint shape; M18 separates centroid restore compilation from canonical Lorentz mixing. All five pass eqp0/eqp1 tolerance0 and90 complete printed Sigma rows against their same-source baselines.
+
+| boundary | P M14 host / compiler s (events) | F M15 host / compiler s (events) | plan reuse M17 host / compiler s (events) | restore shape M18 host / compiler s (events) |
+|---|---:|---:|---:|---:|
+| restore, all3 terms |64.945 /51.527 (356)|absent|62.610 /49.543 (356)|5.830 /3.986 (85)|
+| factory, body+head |54.071 /45.712 (674)|6.281 /5.360 (86)|6.296 /5.366 (86)|52.363 /44.217 (674)|
+| contraction, body+head |29.123 /21.485 (65)|2.136 /1.637 (4)|27.923 /20.736 (65)|27.927 /20.814 (65)|
+| enclosing static caller |151.373 /120.740 (1135)|11.448 /9.024 (141)|99.935 /77.598 (547)|89.260 /70.986 (864)|
+
+Factory cold median P body/head1719.3/1726.5ms versus F1559.3ms per shape; warm factory lookups are about0.06ms. The difference is primarily **32 versus4 factories**, each building three eagerly warmed GEMM plans, not an intrinsically slower GEMM plan. M17 reduces96 plans to12 with no new resident face or mu-square data. Static executable count remains64.
+
+M16 shape-only normalization still has1135 enclosing compilation events and64 contraction bodies; caller146.783s versus151.373s control is not accepted as a speedup. It leaves the measured cause unresolved and is rejected for production. Remaining specialization must be checked against sharding and other input metadata before a new normalization is proposed.
+
+M18 retains existing C,D accumulation order and all SymMaps rules. It compiles four family transports per term, retains only local callable metadata, and streams source→full→mixed→accumulator. Additional live scalar full-q temporaries are bounded by two block payloads while Python references survive, unlike a16-output cache. For the largest CC block this bound is2,654,208 bytes/rank (2×16×9×192²/4); TT is720,000 bytes/rank. G and interaction objects remain sharded across all P ranks. Actual peak after source integration still requires HLO measurement.
+
+These results rank **shape-class restore compilation** and **shape-only GEMM plan reuse** first for implementation. Their isolated caller savings are62.114s and51.438s respectively; adding isolated savings is only a prediction until the combined gate runs. Resident family faces can remove at most the sampled pre-G32us per body/head TT unit (about3ms over96 similar calls), far below these host costs. The current dense spin action is fused in that bound; a new two-block action is not justified by this capture.

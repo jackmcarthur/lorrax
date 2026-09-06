@@ -1,0 +1,1 @@
+PASS: 90 complete printed state rows identical to 05_P_full_static_baseline, including sigCC/sigTT/sigCT.

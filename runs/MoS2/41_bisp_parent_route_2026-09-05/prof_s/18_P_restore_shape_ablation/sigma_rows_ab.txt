@@ -1,0 +1,1 @@
+PASS: 90 complete printed state rows identical to P05, including sigCC/sigTT/sigCT.

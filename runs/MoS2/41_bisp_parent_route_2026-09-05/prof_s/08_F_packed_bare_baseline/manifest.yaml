@@ -12,4 +12,5 @@ source:
 allocator: BFC@0.85
 geometry: {nodes: 1, gpus: 4, ranks: 4}
 steps:
-  00_lorrax: {state: pending}
+  00_lorrax: {state: complete}
+completion_receipt: "[lx] step lx-Xg4-014329-1395453-6054 exit 0 in 60 s"

@@ -1,0 +1,183 @@
+==============================================================================
+LORRAX GW CALCULATION
+==============================================================================
+Input          : /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline/cohsex.in
+Method         : cohsex / one_shot_dft
+Photon route   : incumbent charge-screened W + Sigma^B (gw.sigma_x_bispinor) with the scalar band-diagonal q->0 head -- sys_dim = 3 (the packed bare route wants sys_dim = 2)
+Photon head    : DEBUG: no Gamma-cell head at all (head_correction=off on the incumbent route); NOT a production calculation
+  [config provenance] mpa_sampling_alpha = 1 (default for nonmetal)
+[config provenance] linalg = local (deck)
+linalg = local: fastest, but each task holds ceil(N_q_irr/P) complete N_mu x N_mu dense matrices (here ceil(8/4) x 480^2 x 16 B = 7.03 MiB per task, complex128) plus their factor workspace; on large systems where that is a large fraction of memory per task, set linalg = distributed
+[config provenance] low_mem_bands = true (deck)
+low_mem_bands = true is a capacity escape hatch: saves memory (band chunks of 16) but takes longer; set false whenever the full-band carrier fits, especially for multi-node dynamic Sigma sweeps
+
+CONFIGURATION PROVENANCE
+------------------------
+[config provenance] this deck names 1 LEGACY self-energy-axis key(s); they are honored, and the canonical axes resolved to compute_mode = cohsex, qp_solver = one_shot_dft.
+
+PROCESSOR ARCHITECTURE
+----------------------
+MPI ranks      : 4
+Accelerators   : 4 GPU devices (NVIDIA A100-SXM4-40GB, 1 per rank)
+Processor mesh : 2 x 2  (centroid axes X x Y)
+CPU allocation : 32 cores per rank
+Host threads   : OPENBLAS_NUM_THREADS=16 (auto: physical cores of the affinity mask; applied to libscipy_openblas64_-61654e39.so)
+
+METHOD AND PHYSICAL PATHWAYS
+----------------------------
+Self-energy    : static screened exchange + Coulomb hole; one-shot full-matrix effective Hamiltonian; Sigma evaluated at E_DFT with QSGW Hermitian symmetrization (distinct from fixed-DFT-state diagonal G0W0)
+QP consistency  : one_shot_dft | other options: fixed_point (diagonal on-shell), self_consistent (rebuild G/W/Sigma)
+EQP2 treatment  : off (set write_eqp2=true for fixed-Sigma eigenvalue self-consistency)
+Screening      : RPA Dyson series; minimax imaginary-axis quadrature
+Long wavelength: head=off; source=s_tensor
+Coulomb system : 3D bulk; Hartree=live G-space
+Spin channels  : charge + transverse current (bispinor)
+Degenerate sets: averaged at 1.36057e-05 eV
+ISDF state     : fresh fit requested
+
+NUMERICAL ENVIRONMENT
+---------------------
+JAX/JAXLIB     : 0.9.1 / 0.9.1 | FP64 / complex128 | NCCL collectives
+Wavefunctions  : phdf5 reader
+Dense linalg   : local layout
+LORRAX_BANDS_GEMM_FFI      = NATIVE : right-GEMM contraction forming G(tau) (native XLA dot lowering)
+LORRAX_FFT_FFI             = ON     : flat-k FFTs for ISDF, chi0 and Sigma (cuFFT flat-k FFI)
+LORRAX_FFT_FFI_FUSED       = ON     : fused tau-domain convolution (cuFFT fused-convolution FFI)
+LORRAX_CONV_KPAIR_FFI      = ON     : pair-density convolution forming V(q) (cuFFT pair-convolution FFI)
+
+CRYSTAL SYMMETRY AND BRILLOUIN-ZONE SAMPLING
+--------------------------------------------
+Real-space action: r' = R^-1 r + tau
+Spatial group   : 48 operations; 36 with fractional translations
+QE schema      : NOT FOUND (no nearby data-file-schema.xml candidate was found)
+Stored QE type : unknown for all 48 operations; WFN.h5 omits each time_reversal bit
+Active op rows : 48 unitary; 48 TR-composed
+Inversion      : present at S25 (QE-TR=unknown; used=unitary+TR)
+DFT 2c TRS     : CONSISTENT (spatial-conditional; occupied-density residual=2.78775e-08; coverage=100.00%; raw-pair=0, spatial-pair=5, trim=3)
+Global TRS     : enabled from the two-component reference check
+  op   QE time-reversal status       R^-1 and fractional translation
+  S01  QE-TR=unknown active=unitary+TR R^-1=[ 1  0  0;  0  1  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S02  QE-TR=unknown active=unitary+TR R^-1=[-1 -1 -1;  0  0  1;  0  1  0]  tau=( 0.500  0.000  0.000)
+  S03  QE-TR=unknown active=unitary+TR R^-1=[ 0  1  0;  1  0  0; -1 -1 -1]  tau=( 0.000  0.000  0.500)
+  S04  QE-TR=unknown active=unitary+TR R^-1=[ 0  0  1; -1 -1 -1;  1  0  0]  tau=( 0.000  0.500  0.000)
+  S05  QE-TR=unknown active=unitary+TR R^-1=[ 1  1  1;  0 -1  0;  0  0 -1]  tau=(-0.500  0.000  0.000)
+  S06  QE-TR=unknown active=unitary+TR R^-1=[-1  0  0;  0  0 -1;  0 -1  0]  tau=( 0.000  0.000  0.000)
+  S07  QE-TR=unknown active=unitary+TR R^-1=[ 0 -1  0;  1  1  1; -1  0  0]  tau=( 0.000  0.500  0.000)
+  S08  QE-TR=unknown active=unitary+TR R^-1=[ 0  0 -1; -1  0  0;  1  1  1]  tau=( 0.000  0.000 -0.500)
+  S09  QE-TR=unknown active=unitary+TR R^-1=[-1  0  0;  0 -1  0;  1  1  1]  tau=( 0.000  0.000  0.500)
+  S10  QE-TR=unknown active=unitary+TR R^-1=[ 0 -1  0; -1  0  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S11  QE-TR=unknown active=unitary+TR R^-1=[ 0  0 -1;  1  1  1;  0 -1  0]  tau=( 0.000 -0.500  0.000)
+  S12  QE-TR=unknown active=unitary+TR R^-1=[ 1  1  1;  0  0 -1; -1  0  0]  tau=(-0.500  0.000  0.000)
+  S13  QE-TR=unknown active=unitary+TR R^-1=[-1  0  0;  1  1  1;  0  0 -1]  tau=( 0.000 -0.500  0.000)
+  S14  QE-TR=unknown active=unitary+TR R^-1=[ 0  0 -1;  0 -1  0; -1  0  0]  tau=( 0.000  0.000  0.000)
+  S15  QE-TR=unknown active=unitary+TR R^-1=[ 0 -1  0;  0  0 -1;  1  1  1]  tau=( 0.000  0.000 -0.500)
+  S16  QE-TR=unknown active=unitary+TR R^-1=[ 1  1  1; -1  0  0;  0 -1  0]  tau=( 0.500  0.000  0.000)
+  S17  QE-TR=unknown active=unitary+TR R^-1=[ 0  0  1;  1  0  0;  0  1  0]  tau=( 0.000  0.000  0.000)
+  S18  QE-TR=unknown active=unitary+TR R^-1=[-1 -1 -1;  0  1  0;  1  0  0]  tau=( 0.500  0.000  0.000)
+  S19  QE-TR=unknown active=unitary+TR R^-1=[ 1  0  0;  0  0  1; -1 -1 -1]  tau=( 0.000  0.000  0.500)
+  S20  QE-TR=unknown active=unitary+TR R^-1=[ 0  1  0; -1 -1 -1;  0  0  1]  tau=( 0.000  0.500  0.000)
+  S21  QE-TR=unknown active=unitary+TR R^-1=[ 0  1  0;  0  0  1;  1  0  0]  tau=( 0.000  0.000  0.000)
+  S22  QE-TR=unknown active=unitary+TR R^-1=[-1 -1 -1;  1  0  0;  0  0  1]  tau=( 0.500  0.000  0.000)
+  S23  QE-TR=unknown active=unitary+TR R^-1=[ 0  0  1;  0  1  0; -1 -1 -1]  tau=( 0.000  0.000  0.500)
+  S24  QE-TR=unknown active=unitary+TR R^-1=[ 1  0  0; -1 -1 -1;  0  1  0]  tau=( 0.000  0.500  0.000)
+  S25  QE-TR=unknown active=unitary+TR R^-1=[-1  0  0;  0 -1  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S26  QE-TR=unknown active=unitary+TR R^-1=[ 1  1  1;  0  0 -1;  0 -1  0]  tau=(-0.500  0.000  0.000)
+  S27  QE-TR=unknown active=unitary+TR R^-1=[ 0 -1  0; -1  0  0;  1  1  1]  tau=( 0.000  0.000  0.500)
+  S28  QE-TR=unknown active=unitary+TR R^-1=[ 0  0 -1;  1  1  1; -1  0  0]  tau=( 0.000 -0.500  0.000)
+  S29  QE-TR=unknown active=unitary+TR R^-1=[-1 -1 -1;  0  1  0;  0  0  1]  tau=( 0.500  0.000  0.000)
+  S30  QE-TR=unknown active=unitary+TR R^-1=[ 1  0  0;  0  0  1;  0  1  0]  tau=( 0.000  0.000  0.000)
+  S31  QE-TR=unknown active=unitary+TR R^-1=[ 0  1  0; -1 -1 -1;  1  0  0]  tau=( 0.000  0.500  0.000)
+  S32  QE-TR=unknown active=unitary+TR R^-1=[ 0  0  1;  1  0  0; -1 -1 -1]  tau=( 0.000  0.000  0.500)
+  S33  QE-TR=unknown active=unitary+TR R^-1=[ 1  0  0;  0  1  0; -1 -1 -1]  tau=( 0.000  0.000  0.500)
+  S34  QE-TR=unknown active=unitary+TR R^-1=[ 0  1  0;  1  0  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S35  QE-TR=unknown active=unitary+TR R^-1=[ 0  0  1; -1 -1 -1;  0  1  0]  tau=( 0.000  0.500  0.000)
+  S36  QE-TR=unknown active=unitary+TR R^-1=[-1 -1 -1;  0  0  1;  1  0  0]  tau=( 0.500  0.000  0.000)
+  S37  QE-TR=unknown active=unitary+TR R^-1=[ 1  0  0; -1 -1 -1;  0  0  1]  tau=( 0.000  0.500  0.000)
+  S38  QE-TR=unknown active=unitary+TR R^-1=[ 0  0  1;  0  1  0;  1  0  0]  tau=( 0.000  0.000  0.000)
+  S39  QE-TR=unknown active=unitary+TR R^-1=[ 0  1  0;  0  0  1; -1 -1 -1]  tau=( 0.000  0.000  0.500)
+  S40  QE-TR=unknown active=unitary+TR R^-1=[-1 -1 -1;  1  0  0;  0  1  0]  tau=( 0.500  0.000  0.000)
+  S41  QE-TR=unknown active=unitary+TR R^-1=[ 0  0 -1; -1  0  0;  0 -1  0]  tau=( 0.000  0.000  0.000)
+  S42  QE-TR=unknown active=unitary+TR R^-1=[ 1  1  1;  0 -1  0; -1  0  0]  tau=( 0.500  0.000  0.000)
+  S43  QE-TR=unknown active=unitary+TR R^-1=[-1  0  0;  0  0 -1;  1  1  1]  tau=( 0.000  0.000 -0.500)
+  S44  QE-TR=unknown active=unitary+TR R^-1=[ 0 -1  0;  1  1  1;  0  0 -1]  tau=( 0.000 -0.500  0.000)
+  S45  QE-TR=unknown active=unitary+TR R^-1=[ 0 -1  0;  0  0 -1; -1  0  0]  tau=( 0.000  0.000  0.000)
+  S46  QE-TR=unknown active=unitary+TR R^-1=[ 1  1  1; -1  0  0;  0  0 -1]  tau=(-0.500  0.000  0.000)
+  S47  QE-TR=unknown active=unitary+TR R^-1=[ 0  0 -1;  0 -1  0;  1  1  1]  tau=( 0.000  0.000 -0.500)
+  S48  QE-TR=unknown active=unitary+TR R^-1=[-1  0  0;  1  1  1;  0 -1  0]  tau=( 0.000  0.500  0.000)
+Full BZ grid   : 64 k points | mesh 4 x 4 x 4 | shift (0.00000, 0.00000, 0.00000)
+Stored IBZ     : 8 k points
+  ik        kx        ky        kz     weight
+    1   0.00000   0.00000   0.00000   0.01562
+    2   0.00000   0.00000   0.25000   0.12500
+    3   0.00000   0.00000   0.50000   0.06250
+    4   0.00000   0.25000   0.25000   0.09375
+    5   0.00000   0.25000   0.50000   0.37500
+    6   0.00000   0.25000   0.75000   0.18750
+    7   0.00000   0.50000   0.50000   0.04688
+    8   0.25000   0.50000   0.75000   0.09375
+Centroid orbit: CLOSED : 48/48 spatial operations preserve 480 sites (tol=1.00000e-05)
+TRS pathways   : automatic from SymMaps.trs_allowed=true; no input override
+
+BAND SPACES AND ENERGY COVERAGE
+-------------------------------
+Electrons      : 8.00000; occupied-band boundary = 8
+Occupied bands : 1-8
+QP valence     : 1-8
+QP conduction  : 9-32
+QP matrix      : 1-32
+chi0/W sum     : 1-32
+Sigma sum      : 1-32
+Loaded ISDF psi: 1-32
+zeta fit       : left 1-32; right 1-32
+Started screening (chi0 -> W) at 01:37:20.
+[ 01:37:26 | ██████████ | 100% ] W role 1 / 1 · ETA 0 s
+Finished screening (chi0 -> W) at 01:37:26.  Elapsed: 5 s.
+Sigma blocks   : CC max|diag|=1.112974e+01 eV, mean|diag|=7.075060e+00 eV; CT+TC max|diag|=0.000000e+00 eV, mean|diag|=0.000000e+00 eV; TT max|diag|=4.947514e-04 eV, mean|diag|=2.846913e-04 eV
+Head Sigma     : Gamma-cell contribution; CC max|diag|=0.000000e+00 eV, mean|diag|=0.000000e+00 eV; CT+TC max|diag|=0.000000e+00 eV, mean|diag|=0.000000e+00 eV; TT max|diag|=0.000000e+00 eV, mean|diag|=0.000000e+00 eV
+
+FUNDAMENTAL GAP
+---------------
+DFT gap        : 0.67666 eV
+Full-matrix effective-H gap: 0.72191 eV (insulating)
+Gap correction : +0.04524 eV relative to DFT
+State energies  : written to the EQP files listed below
+
+MAJOR-STAGE TIMING
+------------------
+  stage                    wall (s)     fraction
+  runtime bring-up             6.24      16.05%
+  pre-main + imports           1.79       4.59%
+  input + run setup            0.24       0.61%
+  V(q)                         5.20      13.36%
+  ISDF setup + I/O             6.32      16.25%
+  minimax quadrature           0.14       0.37%
+  chi0                         2.24       5.77%
+  W                            3.15       8.09%
+  screening support            0.04       0.10%
+  W persist + q0 head          0.15       0.37%
+  Sigma other                 11.44      29.39%
+  mean-field load              0.09       0.23%
+  QP solve + diagonalize       0.38       0.97%
+  result writes                0.12       0.31%
+  other driver work            1.38       3.55%
+  total run                   38.91     100.00%
+
+OUTPUT FILES AND INPUTS
+-----------------------
+  role                     state       path
+  input deck               read        /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline/cohsex.in
+  DFT wavefunctions        read        /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/02_preprocess/WFN.h5
+  ISDF centroids           read        /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/02_preprocess/centroids_charge.txt
+  current centroids        read        /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/02_preprocess/centroids_current.txt
+  mean-field Hamiltonian   read        /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/02_preprocess/kin_ion.h5
+  long-wave dipoles        absent      /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline/dipole.h5
+  parallel transport       absent      /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline/parallel_transport.h5
+  ISDF restart tensors     present     /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline/tmp/isdf_tensors_480.h5
+  self-energy table        written     /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline/sigma_diag.dat
+  fixed-DFT-state diagonal zeroth-order energies written     /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline/eqp0.dat
+  fixed-DFT-state diagonal Z-linearized energies written     /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline/eqp1.dat
+  full-matrix effective-H rotations written     /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline/qp_wfn_rotations.h5
+  matched full-matrix QP wavefunctions absent      /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline/WFN_qp.h5
+
+LORRAX GW calculation completed.
+Report written to /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline/gwjax.out
