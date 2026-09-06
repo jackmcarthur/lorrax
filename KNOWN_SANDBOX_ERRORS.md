@@ -28,3 +28,5 @@ The authorized named fallback `LX_ALLOC_MATCH=lx-alloc-jackm-BISP-PROF-S LX_ALLO
 ### 2026-09-06 BISP-PROF-S: native gate wrapper permission (corrected in a new variant)
 
 `prof_s/10_P_scan_oracles` copied a non-executable `driver.sh` from the older gate but invoked it directly through rankwrap. JID57982945 step `lx-Xg4-120420-417822-9746` exited126 before Python ran. Evidence: `runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/driver.1.log`. New variant12 invokes the payload explicitly with bash; failed10 is preserved.
+
+2026-09-06 phase3: GATES.md, INVARIANTS.md and TASTE.md are sandbox-owned; reading them at the LORRAX worktree root fails. Resolved from the known sandbox root. Common-basis arms104–107 likewise live under the sandbox runs root, not this worktree. No shared files changed.

@@ -1,0 +1,109 @@
+{
+  "scope": "synchronized host boundaries; outer stage is nested, never sum it with children",
+  "groups": [
+    {
+      "label": "sigma_restore",
+      "term": "V",
+      "head": false,
+      "calls": 16,
+      "compiles": 24,
+      "compile_s": 1.1476313799794298,
+      "host_s": 1.684283170994604,
+      "cold_calls": 4,
+      "cold_median_ms": 391.80313250108156,
+      "warm_calls": 12,
+      "warm_median_ms": 16.349647004972212
+    },
+    {
+      "label": "sigma_factory",
+      "term": "",
+      "head": false,
+      "calls": 48,
+      "compiles": 86,
+      "compile_s": 5.39465268899221,
+      "host_s": 6.344367735116975,
+      "cold_calls": 4,
+      "cold_median_ms": 1579.9251534917857,
+      "warm_calls": 44,
+      "warm_median_ms": 0.04420599725563079
+    },
+    {
+      "label": "sigma_block",
+      "term": "",
+      "head": false,
+      "calls": 48,
+      "compiles": 16,
+      "compile_s": 5.047020874044392,
+      "host_s": 6.807064401858952,
+      "cold_calls": 16,
+      "cold_median_ms": 414.9114869942423,
+      "warm_calls": 32,
+      "warm_median_ms": 1.880401003290899
+    },
+    {
+      "label": "sigma_factory",
+      "term": "",
+      "head": true,
+      "calls": 48,
+      "compiles": 0,
+      "compile_s": 0.0,
+      "host_s": 0.005636684916680679,
+      "cold_calls": 0,
+      "cold_median_ms": null,
+      "warm_calls": 48,
+      "warm_median_ms": 0.06187449616845697
+    },
+    {
+      "label": "sigma_block",
+      "term": "",
+      "head": true,
+      "calls": 48,
+      "compiles": 16,
+      "compile_s": 5.363997363980161,
+      "host_s": 7.243430749949766,
+      "cold_calls": 16,
+      "cold_median_ms": 438.2704460003879,
+      "warm_calls": 32,
+      "warm_median_ms": 1.8305239791516215
+    },
+    {
+      "label": "sigma_restore",
+      "term": "W",
+      "head": false,
+      "calls": 16,
+      "compiles": 0,
+      "compile_s": 0.0,
+      "host_s": 0.18101334603852592,
+      "cold_calls": 0,
+      "cold_median_ms": null,
+      "warm_calls": 16,
+      "warm_median_ms": 15.760833004605956
+    },
+    {
+      "label": "sigma_restore",
+      "term": "W-V",
+      "head": false,
+      "calls": 16,
+      "compiles": 4,
+      "compile_s": 0.13902408003923483,
+      "host_s": 0.4116151629714295,
+      "cold_calls": 4,
+      "cold_median_ms": 52.83182751736604,
+      "warm_calls": 12,
+      "warm_median_ms": 20.37642900540959
+    },
+    {
+      "label": "sigma_static_stage",
+      "term": "",
+      "head": false,
+      "calls": 1,
+      "compiles": 188,
+      "compile_s": 19.083077469171258,
+      "host_s": 25.88641861799988,
+      "cold_calls": 1,
+      "cold_median_ms": 25886.41861799988,
+      "warm_calls": 0,
+      "warm_median_ms": null
+    }
+  ]
+}

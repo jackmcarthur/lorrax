@@ -1,0 +1,90 @@
+Total bytes used: 27382117 (26.11MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+  19.07MiB( 73%);    7.04MiB; allocation 14: size 19.07MiB, preallocated-temp:
+  20.17MiB( 77%);    5.94MiB; allocation 0: size 1.10MiB, parameter 0, shape |c128[9,40,4,50]| at ShapeIndex {}:
+  21.27MiB( 81%);    4.84MiB; allocation 1: size 1.10MiB, parameter 2, shape |c128[9,4,50,40]| at ShapeIndex {}:
+  22.37MiB( 86%);    3.74MiB; allocation 2: size 1.10MiB, parameter 3, shape |c128[9,40,4,50]| at ShapeIndex {}:
+  23.47MiB( 90%);    2.64MiB; allocation 3: size 1.10MiB, parameter 1, shape |c128[9,4,50,40]| at ShapeIndex {}:
+  24.35MiB( 93%);    1.76MiB; allocation 4: size 900.0KiB, maybe-live-out:
+  25.23MiB( 97%);   907.8KiB; allocation 5: size 900.0KiB, maybe-live-out:
+  25.57MiB( 98%);   556.3KiB; allocation 6: size 351.6KiB, parameter 5, shape |c128[9,50,50]| at ShapeIndex {}:
+  25.91MiB( 99%);   204.7KiB; allocation 7: size 351.6KiB, parameter 6, shape |c128[9,50,50]| at ShapeIndex {}:
+  26.04MiB(100%);    78.2KiB; allocation 8: size 126.6KiB, parameter 4, shape |c128[9,30,30]| at ShapeIndex {}:
+  26.08MiB(100%);    39.1KiB; allocation 9: size 39.1KiB, parameter 7, shape |c128[1,50,50]| at ShapeIndex {}:
+  26.11MiB(100%);        36B; allocation 10: size 39.1KiB, parameter 8, shape |c128[1,50,50]| at ShapeIndex {}:
+  26.11MiB(100%);        20B; allocation 12: size 16B, constant:
+  26.11MiB(100%);         4B; allocation 13: size 16B, output shape is |(c128[9,80,80], c128[9,80,80])|, maybe-live-out:
+  26.11MiB(100%);         0B; allocation 11: size 4B, parameter 9, shape |s32[]| at ShapeIndex {}:
+
+
+Allocations sorted by size with their values:
+allocation 14: size 19.07MiB, preallocated-temp:
+
+	cumulative_size;       size;       offset; used_by_n_values; shapes_list
+	------------------------------------------------------------
+	  5.49MiB( 23%);    5.49MiB;     11525120;                6; c128[9,50,4,40], c128[9,50,4,50,4], 2×c128[9,4,50,4,50], 2×c128[9,40,200]
+	 10.99MiB( 45%);    5.49MiB;      5765120;               11; 2×c128[9,4,50,4,50], 2×c128[9,40,200], 3×c128[9,50,4,50,4], 4×c128[9,200,200]
+	 16.48MiB( 68%);    5.49MiB;         5120;                8; u32[], 2×c128[9,4,50,4,50], 2×c128[9,40,50,4], 3×c128[9,80,80]
+	 17.58MiB( 72%);    1.10MiB;     13829120;                1; c128[9,50,4,40]
+	 18.68MiB( 77%);    1.10MiB;     14981120;                3; c128[40,9,40], 2×c128[9,40,200]
+	 19.78MiB( 81%);    1.10MiB;      1157120;                2; 2×c128[9,50,4,40]
+	 20.87MiB( 86%);    1.10MiB;     18437120;                1; c128[9,40,50,4]
+	 21.97MiB( 90%);    1.10MiB;     12677120;                2; c128[40,9,40], c128[9,40,50,4]
+	 23.07MiB( 95%);    1.10MiB;     17285120;                2; 2×c128[9,40,200]
+	 23.51MiB( 97%);   450.0KiB;       926720;                2; 2×c128[40,9,80]
+	 23.85MiB( 98%);   351.6KiB;     19589120;                3; 3×c128[9,50,50]
+	 24.07MiB( 99%);   225.0KiB;     15211520;                1; c128[40,9,40]
+	 24.29MiB(100%);   225.0KiB;     12907520;                1; c128[40,9,40]
+	 24.33MiB(100%);    39.1KiB;     19949312;                3; 3×c128[1,50,50]
+	 24.34MiB(100%);     5.6KiB;     19995392;                1; c128[9,40]
+	 24.34MiB(100%);     5.6KiB;     19989504;                1; c128[9,40]
+	 24.34MiB(100%);        80B;         4864;                1; (c128[9,40,4,50], c128[9,40], c128[9,4,50,40], c128[9,40,4,50], s32[], /*index=5*/c128[9,50,50], c128[1,50,50], c128[9,50,50], c128[1,50,50], c128[9,4,50,40])
+	 24.34MiB(100%);        72B;            0;                1; (c128[9,40,4,50], c128[9,40], c128[9,4,50,40], c128[9,40,4,50], c128[9,50,50], /*index=5*/c128[9,50,50], c128[9,4,50,40], c128[1,50,50], c128[1,50,50])
+	 24.34MiB(100%);        16B;         3072;                1; ((c128[9,40,40], c128[9,40,40]), (c128[9,40,80], c128[9,40,80]))
+	 24.34MiB(100%);        16B;         3328;                1; (c128[9,40,40], c128[9,40,40])
+	 24.34MiB(100%);        16B;         3584;                1; (c128[9,40,80], c128[9,40,80])
+	 24.34MiB(100%);        16B;         3840;                1; (c128[9,40,80], c128[9,40,80])
+	 24.34MiB(100%);        16B;         4096;                1; ((c128[9,40,80], c128[9,40,80]), (c128[9,80,80], c128[9,80,80]))
+	 24.34MiB(100%);        16B;         4352;                1; (c128[9,40,80], c128[9,40,80])
+	 24.34MiB(100%);        16B;         4608;                1; (c128[9,80,80], c128[9,80,80])
+	 24.34MiB(100%);        16B;         1024;                1; (c128[9,50,50], c128[1,50,50])
+	 24.34MiB(100%);        16B;         1280;                1; ((c128[9,40,40], c128[9,40,40]), (c128[9,40,80], c128[9,40,80]))
+	 24.34MiB(100%);        16B;         1536;                1; (c128[9,40,40], c128[9,40,40])
+	 24.34MiB(100%);        16B;         1792;                1; (c128[9,40,80], c128[9,40,80])
+	 24.34MiB(100%);        16B;         2048;                1; (c128[9,40,80], c128[9,40,80])
+	 24.34MiB(100%);        16B;         2304;                1; ((c128[9,40,80], c128[9,40,80]), (c128[9,80,80], c128[9,80,80]))
+	 24.34MiB(100%);        16B;         2560;                1; (c128[9,40,80], c128[9,40,80])
+	 24.34MiB(100%);        16B;         2816;                1; (c128[9,80,80], c128[9,80,80])
+	 24.34MiB(100%);        16B;          256;                1; (c128[9,15], c128[9,15])
+	 24.34MiB(100%);        16B;          768;                3; 3×(c128[9,50,50], c128[1,50,50])
+	 24.34MiB(100%);        16B;          512;                3; 3×(c128[9,80,80], c128[9,80,80])
+	 24.34MiB(100%);         1B;     20001280;                1; pred[]
+
+allocation 0: size 1.10MiB, parameter 0, shape |c128[9,40,4,50]| at ShapeIndex {}:
+allocation 1: size 1.10MiB, parameter 2, shape |c128[9,4,50,40]| at ShapeIndex {}:
+allocation 2: size 1.10MiB, parameter 3, shape |c128[9,40,4,50]| at ShapeIndex {}:
+allocation 3: size 1.10MiB, parameter 1, shape |c128[9,4,50,40]| at ShapeIndex {}:
+allocation 4: size 900.0KiB, maybe-live-out:
+
+	cumulative_size;       size;       offset; used_by_n_values; shapes_list
+	------------------------------------------------------------
+	 900.0KiB(100%);   900.0KiB;            0;               11; c128[9,15], 2×c128[9,40,80], 4×c128[9,40,40], 4×c128[9,80,80]
+
+allocation 5: size 900.0KiB, maybe-live-out:
+
+	cumulative_size;       size;       offset; used_by_n_values; shapes_list
+	------------------------------------------------------------
+	 900.0KiB(100%);   900.0KiB;            0;               16; c128[15,9,1,1], c128[9,50,50], c128[9,80,80], pred[], 2×c128[40,9,80], 2×c128[9,40,80], 4×c128[9,40,40], 4×f64[9,50,4,40]
+
+allocation 6: size 351.6KiB, parameter 5, shape |c128[9,50,50]| at ShapeIndex {}:
+allocation 7: size 351.6KiB, parameter 6, shape |c128[9,50,50]| at ShapeIndex {}:
+allocation 8: size 126.6KiB, parameter 4, shape |c128[9,30,30]| at ShapeIndex {}:
+allocation 9: size 39.1KiB, parameter 7, shape |c128[1,50,50]| at ShapeIndex {}:
+allocation 10: size 39.1KiB, parameter 8, shape |c128[1,50,50]| at ShapeIndex {}:
+allocation 12: size 16B, constant:
+allocation 13: size 16B, output shape is |(c128[9,80,80], c128[9,80,80])|, maybe-live-out:
+allocation 11: size 4B, parameter 9, shape |s32[]| at ShapeIndex {}:

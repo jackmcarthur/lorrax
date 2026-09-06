@@ -168,8 +168,8 @@ def _photon_head_pairs(response, term, mesh_xy):
     pairs = (factors.bare_pair,) if term == _TERM_X else factors.screened_pairs
     bare = (factors.bare_pair,) if term == _TERM_COH else ()
     def expand(pairs):
-        return tuple((jax.device_put(images[0][i], NamedSharding(mesh_xy, P(None, 'x'))),
-                      jax.device_put(images[1][i], NamedSharding(mesh_xy, P(None, 'y'))))
+        return tuple((device_put_process_local(images[0][i], NamedSharding(mesh_xy, P(None, 'x'))),
+                      device_put_process_local(images[1][i], NamedSharding(mesh_xy, P(None, 'y'))))
             for pair in pairs for images in (_photon_q0_factor_orbit(
                 *pair, layout=response.layout, plans=factors.family_plans, mesh_xy=mesh_xy),)
             for i in range(images[0].shape[0]))

@@ -1,0 +1,4 @@
+[lx] no usable allocation — salloc 1 node(s), 04:00:00, gpu (lx-alloc-jackm-BISP-PROF-S)
+lx_pool: salloc failed (rc=1):
+  salloc: error: QOSMaxSubmitJobPerUserLimit
+  salloc: error: Job submit/allocate failed: Job violates accounting/QOS policy (job submit limit, user's size and/or time limits)

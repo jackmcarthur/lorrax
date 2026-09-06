@@ -1,0 +1,7 @@
+run_id: 42_cpu_gates
+system: synthetic
+pipeline: focused_pytest
+platform: perlmutter
+geometry: {nodes: 1, gpus: 0, ranks: 1, emulated_devices: 4}
+steps:
+  pytest: {state: pending}

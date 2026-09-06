@@ -1,0 +1,23 @@
+diff --git a/src/gw/photon_sigma.py b/src/gw/photon_sigma.py
+index 24ca802c..b054a545 100644
+--- a/src/gw/photon_sigma.py
++++ b/src/gw/photon_sigma.py
+@@ -123,10 +123,14 @@ def _make_photon_static_block_kernel(
+     key = (id(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, ffi_dial_key(), vertex_pair, q0_only)
+     if key in _photon_sigma_kernel_cache:
+         return _photon_sigma_kernel_cache[key]
+-    project = contract_bands_block_reshard(mesh_xy, layout="face",
+-        face_shape=shapes[0], right_face_shape=shapes[1])
+-    g_plan = gemm_plan(mesh_xy, m=shapes[0][2]*shapes[0][3], k=shapes[0][1],
+-        n=shapes[1][2]*shapes[1][3], nq=nk_tot, dtype=jnp.complex128)
++    plan_key = ("plans", id(mesh_xy), tuple(kgrid), nk_tot, shapes, ffi_dial_key())
++    if plan_key not in _photon_sigma_kernel_cache:
++        project = contract_bands_block_reshard(mesh_xy, layout="face",
++            face_shape=shapes[0], right_face_shape=shapes[1])
++        g_plan = gemm_plan(mesh_xy, m=shapes[0][2]*shapes[0][3], k=shapes[0][1],
++            n=shapes[1][2]*shapes[1][3], nq=nk_tot, dtype=jnp.complex128)
++        _photon_sigma_kernel_cache[plan_key] = project, g_plan
++    project, g_plan = _photon_sigma_kernel_cache[plan_key]
+     convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=q0_only)
+     rows = np.asarray(plans[0].parent_full_rows)
+     specs = (P(None,None,"x","y"), P(None,"x",None,"y"))

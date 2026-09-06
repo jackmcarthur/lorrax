@@ -1,0 +1,431 @@
+diff --git a/src/gw/cohsex_sigma.py b/src/gw/cohsex_sigma.py
+index 259af2b9..46851d30 100644
+--- a/src/gw/cohsex_sigma.py
++++ b/src/gw/cohsex_sigma.py
+@@ -196,73 +196,65 @@ _static_convolution_cache: dict[tuple[object, ...], object] = {}
+ 
+ 
+ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
+-                             nk_tot: int, *, q0_only: bool = False):
+-    """Build the one flat-k convolution shared by every static Sigma block.
+-
+-    Scalar COHSEX and photon blocks differ only in their endpoint centroid
+-    extents.  Those are the independently sharded trailing axes of the
+-    canonical FFT specs, so the same convolution serves square and
+-    rectangular operators without another FFT service or convention.
+-    """
++                             nk_tot: int, *, q0_only=False, lorentz=False):
++    """Own the normalized flat-k convolution for scalar and streamed Lorentz sums."""
+     from ffi import ffi_dial_key
+-    cache_key = (
+-        id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(), int(nk_tot),
+-        bool(q0_only))
+-    if cache_key in _static_convolution_cache:
+-        return _static_convolution_cache[cache_key]
+-
+-    if q0_only:
+-        # Closed form of the SAME normalized flat-k convolution when the
+-        # interaction is structurally zero except at q=0:
+-        #   -1/Nk sum_q G(k-q)V(q) = -G(k)V(0)/Nk.
+-        # This branch is used only for retained head factors and avoids three
+-        # extra full-q FFT convolutions per Lorentz block.
++    from ffi.mklfft import fused_fft_ffi_enabled
++    from common.fft_helpers import make_flat_k_gw_conv
++    key = (id(mesh_xy), tuple(kgrid), ffi_dial_key(), int(nk_tot), q0_only, lorentz)
++    if key in _static_convolution_cache:
++        return _static_convolution_cache[key]
++    scale = -1.0 / (float(nk_tot) if q0_only else np.sqrt(float(nk_tot)))
++    if lorentz:
++        convolve = _make_lorentz_convolution(mesh_xy, kgrid, scale, q0_only)
++    elif q0_only:
++        @jax.jit
++        def convolve(G_k, interaction, prefactor):
++            return prefactor * G_k * interaction[0][None, None, :, None, :] * scale
++    elif fused_fft_ffi_enabled():
++        # The fused owner bounds the exposed Green lifetime on large scalar decks.
++        fused = make_flat_k_gw_conv(mesh_xy, kgrid, G_FFT7D_SPEC, V_FFT5D_SPEC,
++                                    norm='ortho', mult=scale)
+         @jax.jit
+-        def _convolve(G_k, V_or_W, prefactor):
+-            V0 = V_or_W[0][None, None, :, None, :]
+-            return prefactor * G_k * V0 * (-1.0 / float(nk_tot))
++        def convolve(G_k, interaction, prefactor):
++            return prefactor * fused(G_k, interaction)
+     else:
+-        from common.fft_helpers import (
+-            make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn)
+-        from ffi.mklfft import fused_fft_ffi_enabled
+-
+-        _inv_sqrt_nk = -1.0 / jnp.sqrt(float(nk_tot))
+-        if fused_fft_ffi_enabled():
+-            # Use the same certified k-leading convolution owner as dynamic
+-            # Sigma.  Keeping IFFT(G), IFFT(V), their product and FFT(GV)
+-            # inside one handler is load-bearing for the face carrier: at
+-            # Bi's P36 c2070 shape, exposing those R-space tensors to one
+-            # compiled XLA heap made a 45.11-GiB executable on 40-GB GPUs.
+-            # The prefactor remains outside because SX/COH/photon callers
+-            # share this factory with different scalar coefficients.
+-            _gw_conv = make_flat_k_gw_conv(
+-                mesh_xy, kgrid, G_FFT7D_SPEC, V_FFT5D_SPEC,
+-                norm='ortho', mult=_inv_sqrt_nk)
+-
+-            @jax.jit
+-            def _convolve(G_k, V_or_W, prefactor):
+-                """Sigma^k = pref * FFT[G(R) V(R) / sqrt(Nk)]."""
+-                return prefactor * _gw_conv(G_k, V_or_W)
+-        else:
+-            # Explicit LORRAX_FFT_FFI_FUSED=0 control.  The three transforms
+-            # remain on the required flat-k FFT service; only their fused
+-            # lifetime is disabled.
+-            _G_ifftn = make_flat_k_ifftn(
+-                mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+-            _G_fftn = make_flat_k_fftn(
+-                mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+-            _V_ifftn = make_flat_k_ifftn(
+-                mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
+-
+-            @jax.jit
+-            def _convolve(G_k, V_or_W, prefactor):
+-                """Sigma^k = pref * FFT[G(R) V(R) / sqrt(Nk)]."""
+-                G_R = _G_ifftn(G_k)
+-                V_R = _V_ifftn(V_or_W)[:, None, :, None, :]
+-                return prefactor * _G_fftn(G_R * V_R * _inv_sqrt_nk)
+-
+-    _static_convolution_cache[cache_key] = _convolve
+-    return _convolve
++        from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
++        inverse_g = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
++        forward_g = make_flat_k_fftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
++        inverse_v = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
++        @jax.jit
++        def convolve(G_k, interaction, prefactor):
++            return prefactor * forward_g(
++                inverse_g(G_k) * inverse_v(interaction)[:, None, :, None, :] * scale)
++    _static_convolution_cache[key] = convolve
++    return convolve
++
++
++def _make_lorentz_convolution(mesh_xy, kgrid, scale, q0_only):
++    """Transform one Green tensor and stream vertex-weighted interactions into one sum."""
++    from common.gamma_matrices import gamma_apply
++    from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
++    if not q0_only:
++        inverse_g = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
++        forward_g = make_flat_k_fftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
++        inverse_v = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
++
++    @jax.jit
++    def convolve(G_k, interactions, prefactor, vertices):
++        green = G_k if q0_only else inverse_g(G_k)
++
++        def add(total, block):
++            interaction, (left, right) = block
++            value = gamma_apply(green, *left, axis=1)
++            value = gamma_apply(value, right[0], jnp.conj(right[1]), axis=3)
++            weight = (interaction[0][None, None, :, None, :] if q0_only else
++                      inverse_v(interaction)[:, None, :, None, :])
++            return total + value * weight, None
++
++        sigma, _ = jax.lax.scan(add, jnp.zeros_like(green), (interactions, vertices))
++        return prefactor * (sigma if q0_only else forward_g(sigma)) * scale
++    return convolve
+ 
+ 
+ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
+diff --git a/src/gw/photon_sigma.py b/src/gw/photon_sigma.py
+index f0181200..bdbbc47b 100644
+--- a/src/gw/photon_sigma.py
++++ b/src/gw/photon_sigma.py
+@@ -106,12 +106,11 @@ def _require_packed_operator(name, packed, mesh_xy):
+             "placed on fewer than all ranks.")
+ 
+ 
+-def _make_photon_static_block_kernel(
++def _make_photon_static_class_kernel(
+     mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, *, with_head=False,
+ ):
+-    """Unfold each endpoint before its vertex, then build G and project Σ on parents."""
++    """Share unfolded endpoints, G, transforms and projection across one Lorentz class."""
+     from common.shard_map import shard_map
+-    from common.gamma_matrices import gamma_apply
+     from ffi import ffi_dial_key
+     from common.contract_bands import contract_bands_block_reshard
+     from distrib_la import gemm_plan
+@@ -132,84 +131,88 @@ def _make_photon_static_block_kernel(
+             n=shapes[1][2]*shapes[1][3], nq=nk_tot, dtype=jnp.complex128)
+         _photon_sigma_kernel_cache[plan_key] = project, g_plan
+     project, g_plan = _photon_sigma_kernel_cache[plan_key]
+-    convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=False)
+-    head_convolve = (_make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=True)
++    convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=False, lorentz=True)
++    head_convolve = (_make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=True, lorentz=True)
+                      if with_head else None)
+     rows = np.asarray(plans[0].parent_full_rows)
+     specs = (P(None,None,"x","y"), P(None,"x",None,"y"))
+ 
+-    def unfold(psi_mun, psi_nmu, vertices):
++    def unfold(psi_mun, psi_nmu):
+         direct = plans[0].unfold_face(psi_mun, spin_axis=1, mu_axis=2, mesh_axis="x")
+         conjugated = plans[1].unfold_face(psi_nmu, spin_axis=2, mu_axis=3, mesh_axis="y")
+-        return (gamma_apply(direct, *vertices[0], axis=1),
+-                gamma_apply(conjugated, *vertices[1], axis=2))
+-    unfold = shard_map(unfold, mesh=mesh_xy, in_specs=(*specs, ((P(), P()), (P(), P()))),
++        return direct, conjugated
++    unfold = shard_map(unfold, mesh=mesh_xy, in_specs=specs,
+                        out_specs=specs, check_vma=False)
+ 
+     @jax.jit
+-    def contract_block(left, right, weights, interaction, factor, vertices, head_interaction=None):
+-        direct, conjugated = unfold(left.psi_mun, right.psi_nmu, vertices)
++    def contract_class(left, right, weights, interaction, factor, vertices, head_interaction=None):
++        direct, conjugated = unfold(left.psi_mun, right.psi_nmu)
+         G = build_G(direct, conjugated, phases=weights, layout="face", gemm=g_plan)
+-        sigma = convolve(G, interaction, factor)
++        sigma = convolve(G, interaction, factor, vertices)
+         result = project(left.psi_nmu, jnp.take(sigma, jnp.asarray(rows), axis=0), right.psi_mun)
+         if with_head:
+-            head_sigma = head_convolve(G, head_interaction, factor)
++            head_sigma = head_convolve(G, head_interaction, factor, vertices)
+             head = project(left.psi_nmu, jnp.take(head_sigma, jnp.asarray(rows), axis=0), right.psi_mun)
+             return result, head
+         return result
+-    _photon_sigma_kernel_cache[key] = contract_block
+-    return contract_block
++    _photon_sigma_kernel_cache[key] = contract_class
++    return contract_class
++
++
++def _photon_head_pairs(response, term, mesh_xy):
++    """Prepare covariant Gamma factors once per term using their canonical orbit owner."""
++    from .head_correction import _photon_q0_factor_orbit
++    factors = response.head_completion.q0_factors
++    pairs = (factors.bare_pair,) if term == _TERM_X else factors.screened_pairs
++    bare = (factors.bare_pair,) if term == _TERM_COH else ()
++    def expand(pairs):
++        return tuple((jax.device_put(images[0][i], NamedSharding(mesh_xy, P(None, 'x'))),
++                      jax.device_put(images[1][i], NamedSharding(mesh_xy, P(None, 'y'))))
++            for pair in pairs for images in (_photon_q0_factor_orbit(
++                *pair, layout=response.layout, plans=factors.family_plans, mesh_xy=mesh_xy),)
++            for i in range(images[0].shape[0]))
++    return expand(pairs), expand(bare)
+ 
+ 
+ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh_xy,
+                             head_diagnostics=False):
+-    """Yield one parent-band Σ block after consuming and releasing one full-q interaction."""
++    """Yield one parent-band sum per endpoint class while retaining one resident Green."""
+     from .w_isdf import photon_blocks_full_q
+     from .cohsex_sigma import _occ_diag_full
+     from .photon_layout import photon_q0_low_rank_block
+-    from .head_correction import _photon_q0_factor_orbit
+     from common.gamma_matrices import gamma_perm_phase
+     if tuple(f.green_parent.plan for f in families) != response.family_plans:
+         raise ValueError("Photon interaction and wavefunctions use different parent plans.")
+     if term not in (_TERM_X, _TERM_SX, _TERM_COH):
+         raise ValueError(f"Unknown static Sigma term {term}.")
+     operator = ("V", "W", "W-V")[term]
+-    factors = (response.head_completion.q0_factors
+-               if head_diagnostics and response.head_completion is not None else None)
+-    for key, interaction in photon_blocks_full_q(response, blocks, term=operator):
+-        A, B = key
+-        left, right = families[int(A != 0)], families[int(B != 0)]
++    with_head = head_diagnostics and response.head_completion is not None
++    pairs, bare = _photon_head_pairs(response, term, mesh_xy) if with_head else ((), ())
++    for a, b in ((0, 0), (0, 1), (1, 0), (1, 1)):
++        keys = tuple((A, B) for A, B in blocks if bool(A) == bool(a) and bool(B) == bool(b))
++        if not keys:
++            continue
++        left, right = families[a], families[b]
+         slices = left.slices
+         weights = (_occ_diag_full(Gij, slices.nb_sigma, slices.nb_full)
+                    if term != _TERM_COH else left.band_mask(slices.sigma_sum).astype(jnp.complex128))
+         weights = jax.lax.with_sharding_constraint(
+             jnp.broadcast_to(weights, (meta.nk_tot, slices.nb_full)), NamedSharding(mesh_xy, P()))
+-        factor = -0.5 if term == _TERM_COH else 1.0
+-        head_block = None
+-        if factors is not None:
+-            pairs = (factors.bare_pair,) if term == _TERM_X else factors.screened_pairs
+-            pairs = tuple((jax.device_put(images[0][i], NamedSharding(mesh_xy, P(None, 'x'))),
+-                           jax.device_put(images[1][i], NamedSharding(mesh_xy, P(None, 'y'))))
+-                for pair in pairs for images in (_photon_q0_factor_orbit(
+-                    *pair, layout=response.layout, plans=factors.family_plans, mesh_xy=mesh_xy),)
+-                for i in range(images[0].shape[0]))
+-            head_block = photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
+-            if term == _TERM_COH:
+-                head_block = head_block - photon_q0_low_rank_block(
+-                    tuple((jax.device_put(images[0][i], NamedSharding(mesh_xy, P(None, 'x'))),
+-                           jax.device_put(images[1][i], NamedSharding(mesh_xy, P(None, 'y'))))
+-                        for images in (_photon_q0_factor_orbit(*factors.bare_pair,
+-                            layout=response.layout, plans=factors.family_plans, mesh_xy=mesh_xy),)
+-                        for i in range(images[0].shape[0])),
+-                    response.layout, A, B, mesh_xy)
+-        kernel = _make_photon_static_block_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
+-            left, right, with_head=factors is not None)
+-        vertices = (gamma_perm_phase(A), gamma_perm_phase(B))
+-        value = kernel(left.green_parent, right.green_parent, weights, interaction, factor, vertices, head_block)
+-        result, head = value if factors is not None else (value, None)
++        interactions = jnp.stack([value for _, value in photon_blocks_full_q(response, keys, term=operator)])
++        head_blocks = None
++        if with_head:
++            head_blocks = jnp.stack([photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
++                - (photon_q0_low_rank_block(bare, response.layout, A, B, mesh_xy) if bare else 0)
++                for A, B in keys])
++        vertices = jax.tree.map(lambda *v: jnp.stack(v),
++                               *((gamma_perm_phase(A), gamma_perm_phase(B)) for A, B in keys))
++        kernel = _make_photon_static_class_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
++                                                  left, right, with_head=with_head)
++        value = kernel(left.green_parent, right.green_parent, weights, interactions,
++                       -0.5 if term == _TERM_COH else 1.0, vertices, head_blocks)
++        result, head = value if with_head else (value, None)
+         jax.block_until_ready((result, head))
+-        del interaction, head_block
+-        yield key, result, head
++        yield keys[0], result, head
+ 
+ 
+ def compute_static_photon_sigma(
+@@ -248,9 +251,8 @@ def compute_static_photon_sigma(
+                 old = heads[term][sector]
+                 heads[term][sector] = head if old is None else old + head
+                 head_totals[term] = head if head_totals[term] is None else head_totals[term] + head
+-            totals[term].block_until_ready()
+             if verbose and jax.process_index() == 0:
+-                print_fn(f"  packed photon Sigma term {term} block {key} complete")
++                print_fn(f"  packed photon Sigma term {term} class {key} complete")
+     sym = wfns_charge.green_parent.plan.sym
+     nb = wfns_charge.slices.nb_sigma
+ 
+diff --git a/tests/multi_device/bispinor_physics_oracles.py b/tests/multi_device/bispinor_physics_oracles.py
+index d2bf79b4..d6c2d11b 100644
+--- a/tests/multi_device/bispinor_physics_oracles.py
++++ b/tests/multi_device/bispinor_physics_oracles.py
+@@ -228,7 +228,7 @@ def _literal_children(parent, plan):
+ def test_parent_sigma_all_vertices_q_convolution_and_projection(monkeypatch):
+     """Production parent Sigma equals literal -sum_q Gamma_A G(k-q) Gamma_B D_AB/Nk."""
+     from gw.wavefunction_bundle import ParentGreenCarrier
+-    from gw.photon_sigma import _make_photon_static_block_kernel
++    from gw.photon_sigma import _make_photon_static_class_kernel
+     from common.gamma_matrices import gamma_perm_phase
+     _cpu_algebra(monkeypatch)
+     mesh = _mesh()
+@@ -254,20 +254,31 @@ def test_parent_sigma_all_vertices_q_convolution_and_projection(monkeypatch):
+         for q, qv in enumerate(np.ndindex(3,3,1)):
+             km = np.ravel_multi_index((np.array(kv)-qv)%[3,3,1],(3,3,1))
+             bare[k] -= green[km]*interaction[q][None,:,None,:]/9
+-    for a in range(4):
+-        for b in range(4):
+-            sigma = np.einsum('ac,kcmdv,db->kambv',gamma[a],bare,gamma[b])
+-            full = np.einsum('kiam,kambv,kjbv->kij',child.conj(),sigma,child)
+-            kernel = _make_photon_static_block_kernel(mesh,(3,3,1),9,wfns,wfns)
+-            actual = kernel(carrier,carrier,jnp.asarray(weight),
+-                            put(interaction,P(None,'x','y')),jnp.array(1.),
+-                            (gamma_perm_phase(a),gamma_perm_phase(b)))
+-            np.testing.assert_allclose(actual,full[plan.parent_full_rows],
+-                                       rtol=3e-12,atol=3e-12,err_msg=f'Sigma {(a,b)}')
+-            coh = kernel(carrier,carrier,jnp.asarray(weight),
+-                        put(interaction,P(None,'x','y')),jnp.array(-.5),
+-                        (gamma_perm_phase(a),gamma_perm_phase(b)))
+-            np.testing.assert_allclose(coh,-.5*full[plan.parent_full_rows],rtol=3e-12,atol=3e-12)
++    for aa, bb in (((0,), (0,)), ((0,), (1,2,3)), ((1,2,3), (0,)), ((1,2,3), (1,2,3))):
++        keys = [(a,b) for a in aa for b in bb]
++        full = np.zeros((9,4,4), complex)
++        head_full = np.zeros_like(full)
++        blocks, heads = [], []
++        for a,b in keys:
++            scale = (1+.2*a-.1*b) + .3j*(a-b)
++            blocks.append(scale*interaction)
++            head = np.zeros_like(interaction)
++            head[0] = scale*interaction[0]
++            heads.append(head)
++            sigma = np.einsum('ac,kcmdv,db->kambv',gamma[a],scale*bare,gamma[b])
++            full += np.einsum('kiam,kambv,kjbv->kij',child.conj(),sigma,child)
++            hs = np.einsum('ac,kcmdv,db->kambv',gamma[a],
++                -green*head[0][None,None,:,None,:]/9,gamma[b])
++            head_full += np.einsum('kiam,kambv,kjbv->kij',child.conj(),hs,child)
++        kernel = _make_photon_static_class_kernel(mesh,(3,3,1),9,wfns,wfns,with_head=True)
++        vertices = jax.tree.map(lambda *x:jnp.stack(x),
++            *((gamma_perm_phase(a),gamma_perm_phase(b)) for a,b in keys))
++        for factor in (1.,-.5):
++            actual, actual_head = kernel(carrier,carrier,jnp.asarray(weight),
++                put(np.array(blocks),P(None,None,'x','y')),jnp.array(factor),vertices,
++                put(np.array(heads),P(None,None,'x','y')))
++            np.testing.assert_allclose(actual,factor*full[plan.parent_full_rows],rtol=3e-12,atol=3e-12)
++            np.testing.assert_allclose(actual_head,factor*head_full[plan.parent_full_rows],rtol=3e-12,atol=3e-12)
+ 
+ 
+ def test_bare_tiles_metric_sign_and_complex_hermitian_companions(monkeypatch):
+@@ -458,7 +469,7 @@ def test_parent_chi_equals_literal_full_k_for_all_16_blocks(monkeypatch):
+ def test_full_band_unfold_matches_literal_sigma_on_symmetric_complete_toy(monkeypatch):
+     """A complete occupied toy gives a covariant, non-diagonal band Sigma on every child."""
+     from gw.wavefunction_bundle import ParentGreenCarrier
+-    from gw.photon_sigma import _make_photon_static_block_kernel
++    from gw.photon_sigma import _make_photon_static_class_kernel
+     from common.gamma_matrices import gamma_perm_phase
+     from symmetry_maps import unfold_file_wedge_band_operator
+     _cpu_algebra(monkeypatch)
+@@ -482,9 +493,9 @@ def test_full_band_unfold_matches_literal_sigma_on_symmetric_complete_toy(monkey
+     child = _literal_children(raw,plan)
+     parent_sigma = None
+     for a,scale in ((1,-1.),(2,-1.),(3,-2.)):
+-        kernel = _make_photon_static_block_kernel(mesh,(3,3,1),9,wfns,wfns)
+-        value = kernel(carrier,carrier,jnp.ones((9,nb)),put(scale*interaction,P(None,'x','y')),jnp.array(1.),
+-                       (gamma_perm_phase(a),gamma_perm_phase(a)))
++        kernel = _make_photon_static_class_kernel(mesh,(3,3,1),9,wfns,wfns)
++        value = kernel(carrier,carrier,jnp.ones((9,nb)),put(scale*interaction[None],P(None,None,'x','y')),jnp.array(1.),
++                       jax.tree.map(lambda x:x[None],(gamma_perm_phase(a),gamma_perm_phase(a))))
+         parent_sigma = value if parent_sigma is None else parent_sigma+value
+     actual = unfold_file_wedge_band_operator(plan.sym,parent_sigma,trs_rule='transpose')
+     # G=identity on the complete occupied spin/centroid space; alpha_i^2=I.
+@@ -646,7 +657,7 @@ def test_wrapper_selects_v_w_difference_fractional_occupations_and_sum_window(mo
+             assert head is None and l is left.green_parent and r is right.green_parent
+             return jnp.sum(interaction)*jnp.sum(weights*jnp.array([2.,3.,5.,7.]))*factor
+         return kernel
+-    monkeypatch.setattr(owner,'_make_photon_static_block_kernel',factory)
++    monkeypatch.setattr(owner,'_make_photon_static_class_kernel',factory)
+     qfrac = bgw_integer_q_to_fractional(plan.sym.q_irr_kgrid_int,(3,3,1))
+     keys = [(0,0),(0,2),(2,0),(1,3)]
+     for term, source in enumerate((v,w,w-v)):
+@@ -660,7 +671,7 @@ def test_wrapper_selects_v_w_difference_fractional_occupations_and_sum_window(mo
+             np.testing.assert_array_equal(weights,expected_weights)
+             assert factor == (1.,1.,-.5)[term]
+             for index,(perm,phase) in zip((a,b),vertices):
+-                np.testing.assert_array_equal(np.asarray(phase)[:,None]*np.eye(4)[np.asarray(perm)],gamma[index])
++                np.testing.assert_array_equal(np.asarray(phase)[0,:,None]*np.eye(4)[np.asarray(perm)[0]],gamma[index])
+             expected = full[:,a*nmu:(a+1)*nmu,b*nmu:(b+1)*nmu].sum()*np.sum(expected_weights*[2.,3.,5.,7.])*(1.,1.,-.5)[term]
+             np.testing.assert_allclose(actual,expected,rtol=3e-12,atol=3e-12)
+ 
+diff --git a/tests/multi_device/bispinor_transverse_vertex_face_gate.py b/tests/multi_device/bispinor_transverse_vertex_face_gate.py
+index 252eac8f..2e371ac7 100644
+--- a/tests/multi_device/bispinor_transverse_vertex_face_gate.py
++++ b/tests/multi_device/bispinor_transverse_vertex_face_gate.py
+@@ -128,7 +128,7 @@ def check_sigma_sx_chain_matches_dense(
+         nb_sigma=5, nk=2):
+     from gw.cohsex_sigma import _make_cohsex_kernels
+     from gw.photon_sigma import (
+-        _TERM_SX, _TERM_X, _make_photon_static_block_kernel)
++        _TERM_SX, _TERM_X, _make_photon_static_class_kernel)
+     from gw.wavefunction_bundle import (
+         BandSlices, Wavefunctions, PSI_MUN_SPEC, PSI_NMU_SPEC)
+ 
+@@ -194,17 +194,17 @@ def check_sigma_sx_chain_matches_dense(
+     from full_photon_head_sigma_gate import _bundle
+     from common.gamma_matrices import gamma_perm_phase
+     parent = _bundle(mesh, psi_np, enk_np, np.zeros_like(enk_np), slices)
+-    photon_block = _make_photon_static_block_kernel(
++    photon_block = _make_photon_static_class_kernel(
+         mesh, kgrid, nk, parent, parent)
+-    vertices = (gamma_perm_phase(mu_L), gamma_perm_phase(nu_L))
++    vertices = tuple(tuple(x[None] for x in gamma_perm_phase(v)) for v in (mu_L, nu_L))
+     weights = np.zeros((nk, nb_full), dtype=np.complex128)
+     weights[:, :nb_sigma] = f_np
+     weights = _put(weights, mesh, (None, None))
+     photon_x = photon_block(parent.green_parent, parent.green_parent,
+-        weights, V_q_packed, 1.0, vertices)
++        weights, V_q_packed[None], 1.0, vertices)
+     photon_x.block_until_ready()
+     photon_sx = photon_block(parent.green_parent, parent.green_parent,
+-        weights, W_q_packed, 1.0, vertices)
++        weights, W_q_packed[None], 1.0, vertices)
+     photon_sx.block_until_ready()
+     r_photon_x = _rel(_gather(photon_x), got_face_full)
+     r_photon_sx = _rel(_gather(photon_sx), 2.0 * got_face_full)

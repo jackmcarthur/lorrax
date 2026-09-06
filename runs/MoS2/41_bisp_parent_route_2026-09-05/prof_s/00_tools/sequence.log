@@ -1,0 +1,20 @@
+START runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/11_P_full_static_profile 2026-09-06T08:23:46Z
+RESULT runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/11_P_full_static_profile 0 2026-09-06T08:32:51Z
+START runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/12_F_full_static_profile 2026-09-06T08:32:51Z
+RESULT runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/12_F_full_static_profile 0 2026-09-06T08:35:36Z
+START runs/Si/100_bisp_parent_route_2026-09-05/prof_s/01_P_cohsex_baseline 2026-09-06T08:35:36Z
+RESULT runs/Si/100_bisp_parent_route_2026-09-05/prof_s/01_P_cohsex_baseline 0 2026-09-06T08:36:57Z
+START runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline 2026-09-06T08:36:57Z
+RESULT runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline 0 2026-09-06T08:37:41Z
+START runs/Si/100_bisp_parent_route_2026-09-05/prof_s/03_P_gn_baseline 2026-09-06T08:37:41Z
+RESULT runs/Si/100_bisp_parent_route_2026-09-05/prof_s/03_P_gn_baseline 0 2026-09-06T08:39:12Z
+START runs/Si/100_bisp_parent_route_2026-09-05/prof_s/04_F_gn_baseline 2026-09-06T08:39:12Z
+RESULT runs/Si/100_bisp_parent_route_2026-09-05/prof_s/04_F_gn_baseline 0 2026-09-06T08:40:16Z
+START runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/07_P_packed_bare_baseline 2026-09-06T08:40:16Z
+RESULT runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/07_P_packed_bare_baseline 0 2026-09-06T08:43:27Z
+START runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/08_F_packed_bare_baseline 2026-09-06T08:43:27Z
+RESULT runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/08_F_packed_bare_baseline 0 2026-09-06T08:44:30Z
+START runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/09_P_dynamic_eps5_baseline 2026-09-06T08:44:30Z
+RESULT runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/09_P_dynamic_eps5_baseline 0 2026-09-06T08:48:13Z
+START runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/10_F_dynamic_eps5_baseline 2026-09-06T08:48:13Z
+RESULT runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/10_F_dynamic_eps5_baseline 0 2026-09-06T08:50:17Z

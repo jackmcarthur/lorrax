@@ -1,0 +1,85 @@
+{
+  "vertex_g_00": {
+    "legacy": 1.3443921812763631e-16,
+    "face": 1.4581980568605165e-16
+  },
+  "vertex_g_11": {
+    "legacy": 1.4354775855376983e-16,
+    "face": 1.4391117868485369e-16
+  },
+  "vertex_g_12": {
+    "legacy": 1.34185026328826e-16,
+    "face": 2.6036403849362313e-16
+  },
+  "vertex_g_23": {
+    "legacy": 1.3201963618820442e-16,
+    "face": 1.3375192666967546e-16
+  },
+  "vertex_g_31": {
+    "legacy": 1.1641117676072947e-16,
+    "face": 1.1634974220005934e-16
+  },
+  "sigma_sx_chain_00": {
+    "face_vs_legacy": 4.705023221606725e-16,
+    "photon_x_vs_v": 0.0,
+    "photon_sx_vs_2v": 0.0,
+    "photon_kernel_cache_size": 1
+  },
+  "sigma_sx_chain_11": {
+    "face_vs_legacy": 2.2169580318003343e-16,
+    "photon_x_vs_v": 0.0,
+    "photon_sx_vs_2v": 0.0,
+    "photon_kernel_cache_size": 1
+  },
+  "sigma_sx_chain_12": {
+    "face_vs_legacy": 3.609980593506123e-16,
+    "photon_x_vs_v": 0.0,
+    "photon_sx_vs_2v": 0.0,
+    "photon_kernel_cache_size": 1
+  },
+  "sigma_sx_chain_23": {
+    "face_vs_legacy": 4.580364534563798e-16,
+    "photon_x_vs_v": 0.0,
+    "photon_sx_vs_2v": 0.0,
+    "photon_kernel_cache_size": 1
+  },
+  "sigma_sx_chain_31": {
+    "face_vs_legacy": 6.407391892674237e-16,
+    "photon_x_vs_v": 0.0,
+    "photon_sx_vs_2v": 0.0,
+    "photon_kernel_cache_size": 1
+  },
+  "four_current_ordered_pair_all16": {
+    "all16_worst_rel": 6.626565614257272e-16,
+    "combined_hermiticity": 1.2704697233480586e-16,
+    "q_reciprocity": 0.0,
+    "distinct_cc_bit_equal": true
+  },
+  "head_hall_twins": {
+    "material_kgrid": [
+      3,
+      3,
+      1
+    ],
+    "cell_volume": 702.2012292060782,
+    "sigma_Hz": 0.00012426426458529008,
+    "numpy_4x4_oracle_max_abs": 4.547473508864641e-13,
+    "block_oracle_max_abs": 7.843525091574821e-18,
+    "sigma_closure_max_abs": 1.1469313594125713e-13,
+    "bare_v_hermiticity_max_abs": 1.6965550061683365e-17,
+    "internal_closure_max_abs": 2.8421709430519617e-14,
+    "cttc_sigma_signal": 0.0009075942155441696,
+    "cttc_sx_signal": 0.00042305949806037066,
+    "cttc_coh_signal": 0.0008375206307146927,
+    "cttc_sigma_zero_background": 0.0,
+    "cttc_sigma_sign_error": 0.0,
+    "q0_block_executables": 2,
+    "rotated_diagonal_oracle_max_abs": 7.021666937153402e-16,
+    "receipt_checks": {
+      "full_receipt": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/29_combined_regression/sigma_freq_debug.dat",
+      "zero_receipt": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/29_combined_regression/sigma_freq_debug.zero.dat",
+      "writer_max_abs_ev": 4.79398067909643e-07,
+      "zero_receipt_leak_ev": 0.0
+    }
+  }
+}

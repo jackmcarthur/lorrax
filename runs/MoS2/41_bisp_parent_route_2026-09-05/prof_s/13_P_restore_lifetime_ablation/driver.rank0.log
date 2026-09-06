@@ -1,0 +1,43 @@
+[lorrax source closure] {"mode":"source","root":"/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906","runtime":"src/runtime/__init__.py","services":{"distrib-la":"services/distrib_la/src/distrib_la/__init__.py","lxkit":"services/lxkit/src/lxkit/__init__.py","minimax":"services/minimax/src/minimax/__init__.py","symmetry-maps":"services/symmetry_maps/src/symmetry_maps/__init__.py","vcoul":"services/vcoul/src/vcoul/__init__.py","wfn-loader":"services/wfn_loader/src/wfn_loader/__init__.py","zeta-loader":"services/zeta_loader/src/zeta_loader/__init__.py"}}
+Traceback (most recent call last):
+  File "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/13_P_restore_lifetime_ablation/restore_lifetime_ablation.py", line 20, in <module>
+    import profile_driver
+  File "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/13_P_restore_lifetime_ablation/profile_driver.py", line 8, in <module>
+    from gw import gw_jax, photon_sigma, w_isdf
+  File "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/gw_jax.py", line 77, in <module>
+    RUNTIME = initialize_communicator_stack(print_fn=debug_print)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py", line 1736, in initialize_communicator_stack
+    bootstrap(platform=platform)
+  File "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py", line 248, in bootstrap
+    init_jax_distributed()
+  File "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py", line 1300, in init_jax_distributed
+    jax.distributed.initialize(
+  File "/global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/distributed.py", line 327, in initialize
+    raise RuntimeError("jax.distributed.initialize() must be called before "
+RuntimeError: jax.distributed.initialize() must be called before any JAX calls that might initialise the XLA backend. This includes any computation, but also calls to jax.devices, jax.device_put, and others.
+
+*** LORRAX FAIL-FAST: rank 0/4 died with RuntimeError: jax.distributed.initialize() must be called before any JAX calls that might initialise the XLA backend. This includes any computation, but also calls to jax.devices, jax.device_put, and others.
+*** Exiting rc=1 WITHOUT teardown so this failure reaches the job's exit code.  Peer ranks are blocked in a collective this rank will never join; srun will now kill the step.  (Disable with LORRAX_FAILFAST=0.)
+
+Traceback (most recent call last):
+  File "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/13_P_restore_lifetime_ablation/restore_lifetime_ablation.py", line 20, in <module>
+    import profile_driver
+  File "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/13_P_restore_lifetime_ablation/profile_driver.py", line 8, in <module>
+    from gw import gw_jax, photon_sigma, w_isdf
+  File "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/gw_jax.py", line 77, in <module>
+    RUNTIME = initialize_communicator_stack(print_fn=debug_print)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py", line 1736, in initialize_communicator_stack
+    bootstrap(platform=platform)
+  File "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py", line 248, in bootstrap
+    init_jax_distributed()
+  File "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py", line 1300, in init_jax_distributed
+    jax.distributed.initialize(
+  File "/global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/distributed.py", line 327, in initialize
+    raise RuntimeError("jax.distributed.initialize() must be called before "
+RuntimeError: jax.distributed.initialize() must be called before any JAX calls that might initialise the XLA backend. This includes any computation, but also calls to jax.devices, jax.device_put, and others.
+
+*** LORRAX FAIL-FAST: rank 0/4 died with RuntimeError: jax.distributed.initialize() must be called before any JAX calls that might initialise the XLA backend. This includes any computation, but also calls to jax.devices, jax.device_put, and others.
+*** Exiting rc=1 WITHOUT teardown so this failure reaches the job's exit code.  Peer ranks are blocked in a collective this rank will never join; srun will now kill the step.  (Disable with LORRAX_FAILFAST=0.)
+

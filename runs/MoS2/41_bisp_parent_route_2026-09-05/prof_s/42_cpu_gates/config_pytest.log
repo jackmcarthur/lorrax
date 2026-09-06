@@ -1,0 +1,10 @@
+[fixtures] made 72 regression fixture file(s) read-only (see harness.protect_fixtures)
+gate: CENSUS (explicit path(s)) — full suite, KNOWN_FAILURES.md accounting applies
+...........                                                              [100%]
+=============================== warnings summary ===============================
+tests/test_bispinor_dynamic_packed_route.py::test_gn_ppm_bispinor_takes_the_packed_route
+  /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/shard_map.py:178: DeprecationWarning: jax.experimental.shard_map is deprecated in v0.8.0. Used jax.shard_map instead.
+    has_experimental = hasattr(_exp, "shard_map")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+11 passed, 1 warning in 2.75s

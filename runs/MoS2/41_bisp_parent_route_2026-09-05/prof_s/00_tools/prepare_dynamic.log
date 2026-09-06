@@ -1,0 +1,24 @@
+[lx] using named allocation JID 57966610 [--jid]
+[lxrun] JID 57966610 · 4 nodes · 2:38:05 left · 12/16 GPUs free · incoming: lx-?
+  1  nid001168 [4/4 gpu]  free   —                —      —  ← starting lx-?  runs/MoS2/41_bisp_parent
+  2  nid001169 [4/4 gpu]  free   —                —      —
+  3  nid001172 [0/4 gpu]  busy   lx-Xg4-014817-1431804-9810 2m     started 01:48
+  4  nid001173 [4/4 gpu]  free   —                —      —
+[lx] zero-GPU step: --gres=none, no GPU selector, and this leg is charged 0 GPUs by the pool, so it does not queue behind GPU work. Set JAX_PLATFORMS=cpu in the payload if it uses JAX.
+[lx] source tree: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src  [cwd checkout]
+[lx] runtime import origin: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py  [PYTHONPATH head; runtime.bootstrap attests the actual import]
+[rankwrap] rank=0 host=nid001168 src=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+[lorrax source closure] {"mode":"source","root":"/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906","runtime":"src/runtime/__init__.py","services":{"distrib-la":"services/distrib_la/src/distrib_la/__init__.py","lxkit":"services/lxkit/src/lxkit/__init__.py","minimax":"services/minimax/src/minimax/__init__.py","symmetry-maps":"services/symmetry_maps/src/symmetry_maps/__init__.py","vcoul":"services/vcoul/src/vcoul/__init__.py","wfn-loader":"services/wfn_loader/src/wfn_loader/__init__.py","zeta-loader":"services/zeta_loader/src/zeta_loader/__init__.py"}}
+Traceback (most recent call last):
+  File "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/00_tools/prepare_dynamic.py", line 34, in <module>
+    shutil.copy2(src/item,out/item)
+  File "/global/common/software/nersc/pe/conda-envs/26.1.0/python-3.12/nersc-python/lib/python3.12/shutil.py", line 475, in copy2
+    copyfile(src, dst, follow_symlinks=follow_symlinks)
+  File "/global/common/software/nersc/pe/conda-envs/26.1.0/python-3.12/nersc-python/lib/python3.12/shutil.py", line 260, in copyfile
+    with open(src, 'rb') as fsrc:
+         ^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/03_P_gn_baseline/dipole.h5'
+srun: error: nid001168: task 0: Exited with exit code 1
+srun: Terminating StepId=57966610.59
+[lx] step lx-Xg0-015048-1445882-7419 exit 1 in 4 s
+[lx] nonzero exit — judge by artifacts, not the code (rc=134 has been seen on runs whose outputs were correct)

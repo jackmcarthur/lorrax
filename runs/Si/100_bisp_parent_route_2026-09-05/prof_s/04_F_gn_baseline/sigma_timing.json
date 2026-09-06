@@ -1,0 +1,21 @@
+{
+  "batch": 4,
+  "executor_census": "production_progress_exact_tau_total",
+  "launcher_log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/04_F_gn_baseline/evidence/science_lx_run.log",
+  "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/04_F_gn_baseline/gwjax.out",
+  "logical_windows": null,
+  "plan": "box",
+  "planned_distinct_tau": null,
+  "planned_window_tau_pairs": null,
+  "pole_batches": 1,
+  "poles": 1,
+  "seconds_per_tau_dispatch": 0.1493103448275862,
+  "sigma_other_seconds": 20.64,
+  "sigma_rule_plan_seconds": 6.25,
+  "sigma_tau_sweep_seconds": 4.33,
+  "sigma_wall_seconds": 31.22,
+  "sweeps": null,
+  "tau": 29,
+  "total_wall_seconds": 58.64,
+  "window_census_status": "not emitted by minimal production reporter; requires an artifact-bound planner receipt"
+}

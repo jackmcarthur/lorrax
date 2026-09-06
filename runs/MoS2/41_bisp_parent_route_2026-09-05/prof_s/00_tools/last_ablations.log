@@ -1,0 +1,4 @@
+START runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/22_P_combined_signature_ablation 2026-09-06T09:28:40Z
+RESULT runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/22_P_combined_signature_ablation 0 2026-09-06T09:30:28Z
+START runs/Si/100_bisp_parent_route_2026-09-05/prof_s/17_P_spin_elementwise_profile 2026-09-06T09:30:28Z
+RESULT runs/Si/100_bisp_parent_route_2026-09-05/prof_s/17_P_spin_elementwise_profile 0 2026-09-06T09:34:32Z

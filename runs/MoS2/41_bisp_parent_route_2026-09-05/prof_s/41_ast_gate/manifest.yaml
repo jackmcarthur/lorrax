@@ -1,0 +1,10 @@
+run_id: BISP-PROF-S-41
+system: DEV
+pipeline: source_ast_gate
+platform: perlmutter
+variant_of: 42_cpu_gates
+reused: runtime_wrapper
+steps:
+  gate0:
+    state: failed
+completion_receipt: "[lx] step lx-Xg0-035328-91325-4986 exit 1 in 67 s"

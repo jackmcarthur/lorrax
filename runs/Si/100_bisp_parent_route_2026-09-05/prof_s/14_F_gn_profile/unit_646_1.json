@@ -1,0 +1,162 @@
+{
+  "program": 646,
+  "occurrence": 1,
+  "occurrences": 9,
+  "label": "XlaModule:#hlo_module=jit_sigma_sx,program_id=646#",
+  "host_range_ms": 22.949391,
+  "projected_ms": 31.702557,
+  "kernel_count": 1429,
+  "kernel_sum_ms": 25.451934,
+  "kernels": [
+    {
+      "name": "loop_broadcast_fusion",
+      "count": 1,
+      "sum_ms": 0.11664
+    },
+    {
+      "name": "loop_gather_fusion",
+      "count": 1,
+      "sum_ms": 0.002848
+    },
+    {
+      "name": "loop_transpose_fusion_1",
+      "count": 1,
+      "sum_ms": 0.0136
+    },
+    {
+      "name": "input_transpose_fusion",
+      "count": 2,
+      "sum_ms": 0.018624
+    },
+    {
+      "name": "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "count": 768,
+      "sum_ms": 19.256318
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_tensorop_z884gemm_32x16_16x3_nn_align1>(T1::Params)",
+      "count": 384,
+      "sum_ms": 2.83824
+    },
+    {
+      "name": "loop_transpose_fusion",
+      "count": 1,
+      "sum_ms": 0.223904
+    },
+    {
+      "name": "void regular_fft<(unsigned int)4, EPT<(unsigned int)4>, (unsigned int)128, (unsigned int)12, (padding_t)6, (twiddle_t)0, (loadstore_modifier_t)2, (layout_t)1, unsigned int, double, HostConfigPlaceholder>(kernel_arguments_t<T9>)",
+      "count": 9,
+      "sum_ms": 1.785664
+    },
+    {
+      "name": "lrx_gw_mult_c128",
+      "count": 1,
+      "sum_ms": 0.174048
+    },
+    {
+      "name": "wrapped_transpose",
+      "count": 1,
+      "sum_ms": 0.223456
+    },
+    {
+      "name": "wrapped_transpose_1",
+      "count": 1,
+      "sum_ms": 0.015104
+    },
+    {
+      "name": "loop_broadcast_fusion_1",
+      "count": 1,
+      "sum_ms": 0.009216
+    },
+    {
+      "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, double2, double2, double2, double2, (bool)0, double2, double2, double2, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)",
+      "count": 256,
+      "sum_ms": 0.769888
+    },
+    {
+      "name": "loop_broadcast_fusion_2",
+      "count": 1,
+      "sum_ms": 0.00208
+    },
+    {
+      "name": "wrapped_transpose_2",
+      "count": 1,
+      "sum_ms": 0.002304
+    }
+  ],
+  "thunks": [
+    {
+      "name": "Thunk:#hlo_op=command_buffer_1#",
+      "kernels": 4,
+      "projected_ms": 0.148128,
+      "kernel_sum_ms": 0.14192
+    },
+    {
+      "name": "Thunk:#name=jit(sigma_sx)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.12#",
+      "kernels": 384,
+      "projected_ms": 7.120191,
+      "kernel_sum_ms": 4.129536
+    },
+    {
+      "name": "Thunk:#name=jit(sigma_sx)/transpose,hlo_op=loop_transpose_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.223904,
+      "kernel_sum_ms": 0.223904
+    },
+    {
+      "name": "Thunk:#name=jit(sigma_sx)/jit(_convolve)/shard_map/ffi_call,hlo_op=ffi_call.13#",
+      "kernels": 10,
+      "projected_ms": 1.974464,
+      "kernel_sum_ms": 1.959712
+    },
+    {
+      "name": "Thunk:#name=jit(sigma_sx)/transpose,hlo_op=wrapped_transpose#",
+      "kernels": 1,
+      "projected_ms": 0.223456,
+      "kernel_sum_ms": 0.223456
+    },
+    {
+      "name": "Thunk:#name=jit(sigma_sx)/transpose,hlo_op=wrapped_transpose.1#",
+      "kernels": 1,
+      "projected_ms": 0.015104,
+      "kernel_sum_ms": 0.015104
+    },
+    {
+      "name": "Thunk:#name=jit(sigma_sx)/jit(_local)/shard_map,hlo_op=loop_broadcast_fusion.1#",
+      "kernels": 1,
+      "projected_ms": 0.009216,
+      "kernel_sum_ms": 0.009216
+    },
+    {
+      "name": "Thunk:#name=jit(sigma_sx)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.14#",
+      "kernels": 512,
+      "projected_ms": 14.570526,
+      "kernel_sum_ms": 12.925182
+    },
+    {
+      "name": "Thunk:#name=jit(sigma_sx),hlo_op=input_transpose_fusion.1#",
+      "kernels": 1,
+      "projected_ms": 0.009792,
+      "kernel_sum_ms": 0.009792
+    },
+    {
+      "name": "Thunk:#name=jit(sigma_sx)/jit(_local)/shard_map,hlo_op=loop_broadcast_fusion.2#",
+      "kernels": 1,
+      "projected_ms": 0.00208,
+      "kernel_sum_ms": 0.00208
+    },
+    {
+      "name": "Thunk:#name=jit(sigma_sx)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.15#",
+      "kernels": 512,
+      "projected_ms": 7.35568,
+      "kernel_sum_ms": 5.809728
+    },
+    {
+      "name": "Thunk:#name=jit(sigma_sx)/jit(_local)/shard_map/transpose,hlo_op=wrapped_transpose.2#",
+      "kernels": 1,
+      "projected_ms": 0.002304,
+      "kernel_sum_ms": 0.002304
+    }
+  ],
+  "scope": "Native launch-correlation projection; nested thunk ranges must not be summed"
+}

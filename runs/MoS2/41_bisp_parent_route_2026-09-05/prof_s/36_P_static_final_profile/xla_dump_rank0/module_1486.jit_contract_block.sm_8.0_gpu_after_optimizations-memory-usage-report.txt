@@ -1,0 +1,83 @@
+Total bytes used: 50119937 (47.80MiB)
+
+Allocations sorted by size:
+
+cumulative_size; total_size - cumulative_size; allocation
+------------------------------------------------------------------------------
+  43.39MiB( 91%);    4.41MiB; allocation 22: size 43.39MiB, preallocated-temp:
+  44.65MiB( 93%);    3.15MiB; allocation 0: size 1.27MiB, parameter 5, shape |c128[9,96,96]| at ShapeIndex {}:
+  45.35MiB( 95%);    2.44MiB; allocation 1: size 720.0KiB, parameter 0, shape |c128[3,40,4,96]| at ShapeIndex {}:
+  46.06MiB( 96%);    1.74MiB; allocation 2: size 720.0KiB, parameter 2, shape |c128[3,40,4,96]| at ShapeIndex {}:
+  46.76MiB( 98%);    1.04MiB; allocation 3: size 720.0KiB, parameter 1, shape |c128[3,4,96,40]| at ShapeIndex {}:
+  47.46MiB( 99%);   341.5KiB; allocation 4: size 720.0KiB, parameter 3, shape |c128[3,4,96,40]| at ShapeIndex {}:
+  47.60MiB(100%);   197.5KiB; allocation 5: size 144.0KiB, parameter 11, shape |c128[1,96,96]| at ShapeIndex {}:
+  47.68MiB(100%);   122.5KiB; allocation 6: size 75.0KiB, maybe-live-out:
+  47.75MiB(100%);    47.5KiB; allocation 7: size 75.0KiB, maybe-live-out:
+  47.78MiB(100%);    20.5KiB; allocation 8: size 27.0KiB, constant:
+  47.79MiB(100%);     9.3KiB; allocation 9: size 11.2KiB, parameter 4, shape |c128[9,80]| at ShapeIndex {}:
+  47.79MiB(100%);     2.5KiB; allocation 10: size 6.8KiB, constant:
+  47.80MiB(100%);       257B; allocation 11: size 2.2KiB, constant:
+  47.80MiB(100%);       193B; allocation 12: size 64B, parameter 8, shape |c128[4]| at ShapeIndex {}:
+  47.80MiB(100%);       129B; allocation 13: size 64B, parameter 10, shape |c128[4]| at ShapeIndex {}:
+  47.80MiB(100%);        93B; allocation 14: size 36B, constant:
+  47.80MiB(100%);        77B; allocation 15: size 16B, output shape is |(c128[3,40,40], c128[3,40,40])|, maybe-live-out:
+  47.80MiB(100%);        61B; allocation 17: size 16B, constant:
+  47.80MiB(100%);        45B; allocation 18: size 16B, parameter 7, shape |s32[4]| at ShapeIndex {}:
+  47.80MiB(100%);        29B; allocation 19: size 16B, parameter 9, shape |s32[4]| at ShapeIndex {}:
+  47.80MiB(100%);        17B; allocation 21: size 12B, constant:
+  47.80MiB(100%);         8B; allocation 20: size 9B, constant:
+  47.80MiB(100%);         0B; allocation 16: size 8B, parameter 6, shape |f64[]| at ShapeIndex {}:
+
+
+Allocations sorted by size with their values:
+allocation 22: size 43.39MiB, preallocated-temp:
+
+	cumulative_size;       size;       offset; used_by_n_values; shapes_list
+	------------------------------------------------------------
+	 20.25MiB( 33%);   20.25MiB;     21234432;                3; c128[1,9,40,96,4], 2×c128[9,4,96,4,96]
+	 40.50MiB( 67%);   20.25MiB;          768;                4; c128[3,1,4,96,4,96], c128[9,7680,4], 2×c128[9,384,384]
+	 47.25MiB( 78%);    6.75MiB;      7078656;                1; c128[3,1,4,96,4,96]
+	 51.47MiB( 85%);    4.22MiB;      4424448;                1; c128[9,7680,4]
+	 55.47MiB( 92%);    4.00MiB;      8848128;                1; s8[4194304]
+	 57.58MiB( 95%);    2.11MiB;     23446272;                1; c128[1,9,96,4,40]
+	 58.28MiB( 96%);   720.0KiB;     42468096;                1; c128[3,96,4,40]
+	 58.98MiB( 98%);   720.0KiB;     43205376;                1; c128[3,40,96,4]
+	 59.69MiB( 99%);   720.0KiB;     44679936;                2; 2×c128[3,40,384]
+	 60.39MiB(100%);   720.0KiB;     43942656;                2; 2×c128[3,40,384]
+	 60.46MiB(100%);    75.0KiB;     45417216;                2; 2×c128[3,40,40]
+	 60.46MiB(100%);        16B;          512;                1; (c128[9,7680,4], s8[4194304])
+	 60.46MiB(100%);        16B;          256;                1; (c128[3,40,384], c128[3,40,384])
+	 60.46MiB(100%);        16B;            0;                1; (c128[3,40,40], c128[3,40,40])
+
+allocation 0: size 1.27MiB, parameter 5, shape |c128[9,96,96]| at ShapeIndex {}:
+allocation 1: size 720.0KiB, parameter 0, shape |c128[3,40,4,96]| at ShapeIndex {}:
+allocation 2: size 720.0KiB, parameter 2, shape |c128[3,40,4,96]| at ShapeIndex {}:
+allocation 3: size 720.0KiB, parameter 1, shape |c128[3,4,96,40]| at ShapeIndex {}:
+allocation 4: size 720.0KiB, parameter 3, shape |c128[3,4,96,40]| at ShapeIndex {}:
+allocation 5: size 144.0KiB, parameter 11, shape |c128[1,96,96]| at ShapeIndex {}:
+allocation 6: size 75.0KiB, maybe-live-out:
+
+	cumulative_size;       size;       offset; used_by_n_values; shapes_list
+	------------------------------------------------------------
+	  75.0KiB(100%);    75.0KiB;            0;                2; c128[3,40,40], u32[]
+
+allocation 7: size 75.0KiB, maybe-live-out:
+
+	cumulative_size;       size;       offset; used_by_n_values; shapes_list
+	------------------------------------------------------------
+	  75.0KiB(100%);    75.0KiB;            0;                3; 3×c128[3,40,40]
+
+allocation 8: size 27.0KiB, constant:
+allocation 9: size 11.2KiB, parameter 4, shape |c128[9,80]| at ShapeIndex {}:
+allocation 10: size 6.8KiB, constant:
+allocation 11: size 2.2KiB, constant:
+allocation 12: size 64B, parameter 8, shape |c128[4]| at ShapeIndex {}:
+allocation 13: size 64B, parameter 10, shape |c128[4]| at ShapeIndex {}:
+allocation 14: size 36B, constant:
+allocation 15: size 16B, output shape is |(c128[3,40,40], c128[3,40,40])|, maybe-live-out:
+allocation 17: size 16B, constant:
+allocation 18: size 16B, parameter 7, shape |s32[4]| at ShapeIndex {}:
+allocation 19: size 16B, parameter 9, shape |s32[4]| at ShapeIndex {}:
+allocation 21: size 12B, constant:
+allocation 20: size 9B, constant:
+allocation 16: size 8B, parameter 6, shape |f64[]| at ShapeIndex {}:

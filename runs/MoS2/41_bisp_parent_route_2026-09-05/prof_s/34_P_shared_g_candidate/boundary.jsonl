@@ -1,0 +1,145 @@
+{"label": "sigma_restore", "host_ms": 352.22759301541373, "compiles": 6, "compile_s": 0.2502403189719189, "key": [0, 0], "term": "V"}
+{"label": "sigma_factory", "host_ms": 1573.010144988075, "compiles": 23, "compile_s": 1.3043754559475929, "options": {"vertex_pair": [0, 0], "with_head": true}}
+{"label": "sigma_block", "host_ms": 448.91401898348704, "compiles": 1, "compile_s": 0.34076878399355337, "options": {"vertex_pair": [0, 0], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 388.33471800899133, "compiles": 6, "compile_s": 0.29762782601756044, "key": [0, 1], "term": "V"}
+{"label": "sigma_factory", "host_ms": 1572.3924330086447, "compiles": 21, "compile_s": 1.3387139180849772, "options": {"vertex_pair": [0, 1], "with_head": true}}
+{"label": "sigma_block", "host_ms": 475.7807099958882, "compiles": 1, "compile_s": 0.34037090599304065, "options": {"vertex_pair": [0, 1], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 6.529898993903771, "compiles": 0, "compile_s": 0.0, "key": [0, 2], "term": "V"}
+{"label": "sigma_factory", "host_ms": 0.21337202633731067, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 2], "with_head": true}}
+{"label": "sigma_block", "host_ms": 493.21724197943695, "compiles": 1, "compile_s": 0.33965793999959715, "options": {"vertex_pair": [0, 2], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 6.44972498412244, "compiles": 0, "compile_s": 0.0, "key": [0, 3], "term": "V"}
+{"label": "sigma_factory", "host_ms": 0.21707898122258484, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 3], "with_head": true}}
+{"label": "sigma_block", "host_ms": 448.27272099792026, "compiles": 1, "compile_s": 0.3391848760074936, "options": {"vertex_pair": [0, 3], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 392.5455489952583, "compiles": 6, "compile_s": 0.2962748749414459, "key": [1, 0], "term": "V"}
+{"label": "sigma_factory", "host_ms": 1629.6757609816268, "compiles": 21, "compile_s": 1.3969616949907504, "options": {"vertex_pair": [1, 0], "with_head": true}}
+{"label": "sigma_block", "host_ms": 493.29677000059746, "compiles": 1, "compile_s": 0.3713527630025055, "options": {"vertex_pair": [1, 0], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 411.7013869981747, "compiles": 6, "compile_s": 0.300161980005214, "key": [1, 1], "term": "V"}
+{"label": "sigma_factory", "host_ms": 1719.068509992212, "compiles": 21, "compile_s": 1.4479439140704926, "options": {"vertex_pair": [1, 1], "with_head": true}}
+{"label": "sigma_block", "host_ms": 459.2691120051313, "compiles": 1, "compile_s": 0.34958917601034045, "options": {"vertex_pair": [1, 1], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 16.657795989885926, "compiles": 0, "compile_s": 0.0, "key": [1, 2], "term": "V"}
+{"label": "sigma_factory", "host_ms": 0.21523601026274264, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 2], "with_head": true}}
+{"label": "sigma_block", "host_ms": 445.3168190084398, "compiles": 1, "compile_s": 0.34225413302192464, "options": {"vertex_pair": [1, 2], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 16.474592994200066, "compiles": 0, "compile_s": 0.0, "key": [1, 3], "term": "V"}
+{"label": "sigma_factory", "host_ms": 0.21320200175978243, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 3], "with_head": true}}
+{"label": "sigma_block", "host_ms": 448.5481289739255, "compiles": 1, "compile_s": 0.3479394309979398, "options": {"vertex_pair": [1, 3], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 6.236303015612066, "compiles": 0, "compile_s": 0.0, "key": [2, 0], "term": "V"}
+{"label": "sigma_factory", "host_ms": 0.2194239932578057, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 0], "with_head": true}}
+{"label": "sigma_block", "host_ms": 484.92653699941, "compiles": 1, "compile_s": 0.37718359200516716, "options": {"vertex_pair": [2, 0], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 16.396210994571447, "compiles": 0, "compile_s": 0.0, "key": [2, 1], "term": "V"}
+{"label": "sigma_factory", "host_ms": 0.21081700106151402, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 1], "with_head": true}}
+{"label": "sigma_block", "host_ms": 444.97291499283165, "compiles": 1, "compile_s": 0.3410019649891183, "options": {"vertex_pair": [2, 1], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 16.72185998177156, "compiles": 0, "compile_s": 0.0, "key": [2, 2], "term": "V"}
+{"label": "sigma_factory", "host_ms": 0.2088430046569556, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 2], "with_head": true}}
+{"label": "sigma_block", "host_ms": 486.09193702577613, "compiles": 1, "compile_s": 0.3489178699965123, "options": {"vertex_pair": [2, 2], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 17.59242097614333, "compiles": 0, "compile_s": 0.0, "key": [2, 3], "term": "V"}
+{"label": "sigma_factory", "host_ms": 0.2633290132507682, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 3], "with_head": true}}
+{"label": "sigma_block", "host_ms": 466.85513100237586, "compiles": 1, "compile_s": 0.34500065600150265, "options": {"vertex_pair": [2, 3], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 6.667605019174516, "compiles": 0, "compile_s": 0.0, "key": [3, 0], "term": "V"}
+{"label": "sigma_factory", "host_ms": 0.2068089961539954, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 0], "with_head": true}}
+{"label": "sigma_block", "host_ms": 483.98601097869687, "compiles": 1, "compile_s": 0.37339645001338795, "options": {"vertex_pair": [3, 0], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 21.672550006769598, "compiles": 0, "compile_s": 0.0, "key": [3, 1], "term": "V"}
+{"label": "sigma_factory", "host_ms": 0.21637798636220396, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 1], "with_head": true}}
+{"label": "sigma_block", "host_ms": 444.53030001022853, "compiles": 1, "compile_s": 0.34293969700229354, "options": {"vertex_pair": [3, 1], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 16.149164002854377, "compiles": 0, "compile_s": 0.0, "key": [3, 2], "term": "V"}
+{"label": "sigma_factory", "host_ms": 0.21420398843474686, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 2], "with_head": true}}
+{"label": "sigma_block", "host_ms": 448.4051930194255, "compiles": 1, "compile_s": 0.34649350901599973, "options": {"vertex_pair": [3, 2], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 16.387806012062356, "compiles": 0, "compile_s": 0.0, "key": [3, 3], "term": "V"}
+{"label": "sigma_factory", "host_ms": 0.20389401470310986, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 3], "with_head": true}}
+{"label": "sigma_block", "host_ms": 447.3447659984231, "compiles": 1, "compile_s": 0.34396964398911223, "options": {"vertex_pair": [3, 3], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 3.5693829995580018, "compiles": 0, "compile_s": 0.0, "key": [0, 0], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.10850897524505854, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 0], "with_head": true}}
+{"label": "sigma_block", "host_ms": 4.728069994598627, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 0], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 6.63101498503238, "compiles": 0, "compile_s": 0.0, "key": [0, 1], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.07115700282156467, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 1], "with_head": true}}
+{"label": "sigma_block", "host_ms": 4.021105007268488, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 1], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 6.246281991479918, "compiles": 0, "compile_s": 0.0, "key": [0, 2], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.055267009884119034, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 2], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.8396250165533274, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 2], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 5.531220987904817, "compiles": 0, "compile_s": 0.0, "key": [0, 3], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.04128000000491738, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 3], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.8116209907457232, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 3], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 5.582059005973861, "compiles": 0, "compile_s": 0.0, "key": [1, 0], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.06998499156907201, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 0], "with_head": true}}
+{"label": "sigma_block", "host_ms": 4.505621007410809, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 0], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 17.039033002220094, "compiles": 0, "compile_s": 0.0, "key": [1, 1], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.06864199531264603, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 1], "with_head": true}}
+{"label": "sigma_block", "host_ms": 4.998412012355402, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 1], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 16.770815011113882, "compiles": 0, "compile_s": 0.0, "key": [1, 2], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.05030698957853019, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 2], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.1981259817257524, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 2], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 16.062617010902613, "compiles": 0, "compile_s": 0.0, "key": [1, 3], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.04558800719678402, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 3], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.196303005097434, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 3], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 5.492274998687208, "compiles": 0, "compile_s": 0.0, "key": [2, 0], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.04468701081350446, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 0], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.745391994016245, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 0], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 15.899993013590574, "compiles": 0, "compile_s": 0.0, "key": [2, 1], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.04279299173504114, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 1], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.147909010294825, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 1], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 15.765222982736304, "compiles": 0, "compile_s": 0.0, "key": [2, 2], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.04185098805464804, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 2], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.0819610110484064, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 2], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 15.857600985327736, "compiles": 0, "compile_s": 0.0, "key": [2, 3], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.04094900214113295, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 3], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.1096040038391948, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 3], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 5.526391993043944, "compiles": 0, "compile_s": 0.0, "key": [3, 0], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.0426019832957536, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 0], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.663363982923329, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 0], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 15.921134006930515, "compiles": 0, "compile_s": 0.0, "key": [3, 1], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.04302299930714071, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 1], "with_head": true}}
+{"label": "sigma_block", "host_ms": 18.97911899141036, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 1], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 15.958686999510974, "compiles": 0, "compile_s": 0.0, "key": [3, 2], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.0462489842902869, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 2], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.1313459912780672, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 2], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 15.999536000890657, "compiles": 0, "compile_s": 0.0, "key": [3, 3], "term": "W"}
+{"label": "sigma_factory", "host_ms": 0.04308400093577802, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 3], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.127939999103546, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 3], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 45.595136005431414, "compiles": 1, "compile_s": 0.034043008025037125, "key": [0, 0], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.0640439975541085, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 0], "with_head": true}}
+{"label": "sigma_block", "host_ms": 4.598319006618112, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 0], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 50.29357899911702, "compiles": 1, "compile_s": 0.033973082987358794, "key": [0, 1], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.0671599991619587, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 1], "with_head": true}}
+{"label": "sigma_block", "host_ms": 5.586797982687131, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 1], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 7.997534004971385, "compiles": 0, "compile_s": 0.0, "key": [0, 2], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.05588799831457436, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 2], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.6632939882110804, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 2], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 7.163923990447074, "compiles": 0, "compile_s": 0.0, "key": [0, 3], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.04899498890154064, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 3], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.6614900163840503, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 3], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 50.4900980158709, "compiles": 1, "compile_s": 0.03416927199577913, "key": [1, 0], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.07010498666204512, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 0], "with_head": true}}
+{"label": "sigma_block", "host_ms": 15.002791013102978, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 0], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 63.80454800091684, "compiles": 1, "compile_s": 0.03393075198982842, "key": [1, 1], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.06688898429274559, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 1], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.183136024745181, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 1], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 20.893806009553373, "compiles": 0, "compile_s": 0.0, "key": [1, 2], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.0444859906565398, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 2], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.0311429873108864, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 2], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 20.41882902267389, "compiles": 0, "compile_s": 0.0, "key": [1, 3], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.04245198215357959, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 3], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.0182480113580823, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 3], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 7.00881500961259, "compiles": 0, "compile_s": 0.0, "key": [2, 0], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.04308301140554249, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 0], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.5748929949477315, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 0], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 20.763245003763586, "compiles": 0, "compile_s": 0.0, "key": [2, 1], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.0419309944845736, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 1], "with_head": true}}
+{"label": "sigma_block", "host_ms": 16.482988983625546, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 1], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 20.636078988900408, "compiles": 0, "compile_s": 0.0, "key": [2, 2], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.04366401117295027, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 2], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.021414013346657, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 2], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 20.7007139979396, "compiles": 0, "compile_s": 0.0, "key": [2, 3], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.042100989958271384, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 3], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.0025679734535515, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 3], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 7.171278004534543, "compiles": 0, "compile_s": 0.0, "key": [3, 0], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.042903004214167595, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 0], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.5375310108065605, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 0], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 20.49771198653616, "compiles": 0, "compile_s": 0.0, "key": [3, 1], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.041890976717695594, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 1], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.068466001423076, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 1], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 20.281974982935935, "compiles": 0, "compile_s": 0.0, "key": [3, 2], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.040839018765836954, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 2], "with_head": true}}
+{"label": "sigma_block", "host_ms": 3.01597299403511, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 2], "with_head": true}}
+{"label": "sigma_restore", "host_ms": 20.46718299970962, "compiles": 0, "compile_s": 0.0, "key": [3, 3], "term": "W-V"}
+{"label": "sigma_factory", "host_ms": 0.04012702265754342, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 3], "with_head": true}}
+{"label": "sigma_block", "host_ms": 2.9911059828009456, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 3], "with_head": true}}
+{"label": "sigma_static_stage", "host_ms": 19531.278636015486, "compiles": 172, "compile_s": 14.348193256155355}

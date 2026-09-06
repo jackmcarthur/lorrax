@@ -1,0 +1,1455 @@
+[lorrax source closure] {"mode":"source","root":"/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906","runtime":"src/runtime/__init__.py","services":{"distrib-la":"services/distrib_la/src/distrib_la/__init__.py","lxkit":"services/lxkit/src/lxkit/__init__.py","minimax":"services/minimax/src/minimax/__init__.py","symmetry-maps":"services/symmetry_maps/src/symmetry_maps/__init__.py","vcoul":"services/vcoul/src/vcoul/__init__.py","wfn-loader":"services/wfn_loader/src/wfn_loader/__init__.py","zeta-loader":"services/zeta_loader/src/zeta_loader/__init__.py"}}
+  [compile-cache] cross-rank compile agreement enabled before backend compile with no deadline (rank 0 names a missing rank every 60 s).
+[stage 01:51:01] -> collective_warmup
+[stage 01:51:02] <- collective_warmup  1.2 s
+[lorrax native] LEGACY-UNSEALED origin=/global/common/software/m4598/jackm/lorrax_cuda13_runtime/ffi_build_phdf5/liblorrax_ffi.so sha256=cad78d947a953949 pair/private-closure unattested; developer migration only
+[fft_ffi] flat-k 3-D FFTs -> cuFFT strided CUDA FFI handler (lorrax_mklfft_flat_k): cufftPlanMany64 advanced layout (istride=T, idist=1 — the stride-descriptor analog) reading the dot-layout tile in place; jnp.fft norm scales applied by a fused device kernel.
+[conv_kminor] auto -> ON: the fused k-minor conv kernel (lorrax_cufft_conv_kminor) serves this run's rung.  CUDA mesh, handler present.  Callers whose k-grid is too large for one resident k-row still take the XLA chain for that call, silently and correctly.
+[LORRAX_CONV_KLEAD_FFI] =0: k-leading fused-convolution candidate disabled; no production Sigma caller yet.
+[conv_kpair] auto -> ON: the ISDF post-pair CUDA accelerator (lorrax_cufft_conv_kpair) is available; the plan selected its measured-fast resident/device arm from mirrored byte arithmetic.
+  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR="" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory.
+==============================================================================
+  LORRAX runtime — resolved startup configuration
+==============================================================================
+  This is rank 0 of 4, and it addresses 1 of the 4 devices in the job.
+  jax.distributed.initialize() took its explicit form with coordinator_address='nid001168:22060', num_processes=4 and local_device_ids=[0].
+  The JAX platform resolved to 'gpu' on devices of kind 'NVIDIA A100-SXM4-40GB', from JAX_PLATFORMS='cuda,cpu', under jax 0.9.1 / jaxlib 0.9.1 with 64-bit values enabled.
+  Default matmul precision is pinned to 'highest', so f32 and complex64 dots run at fp32 rather than TensorFloat32; f64/c128 is unaffected either way.
+  XLA GPU autotuning resolved to level '0' from LORRAX default (runtime.set_default_env); the complete resolved XLA_FLAGS value is '--xla_gpu_autotune_level=0'.
+  The run's device mesh is 2x2 over axes ('x', 'y'), and its communicator cliques were warmed before the first physics jit.
+  Bringing this stack up took 4.7 s in total: 0.7 s to import jax itself, 2.5 s for the environment, jax.distributed and backend init, 1.4 s to build the mesh and warm its communicators, 0.0 s to arm the compile cache and 0.1 s to measure everything in this block.
+  Demotions listed above are this rank's; a demotion that happened only on another rank is announced in that rank's own output and does not appear here.
+  Cross-process collectives run on NCCL because this is a GPU platform, so JAX_CPU_COLLECTIVES_IMPLEMENTATION does not apply.
+  The XLA memory pool, read from jax.local_devices()[0].memory_stats() and not from os.environ, reports a limit of 36.04 GB with 0.00 GB in use and a peak of 0.00 GB so far.
+  XLA_PYTHON_CLIENT_PREALLOCATE resolved to false (raw 'false') and XLA_PYTHON_CLIENT_ALLOCATOR resolved to 'bfc' (raw 'bfc') — NOT LORRAX's canonical pair, which is preallocate=false with the allocator left unset (BFC); a caller overrode it.
+  The XLA client memory fraction is 0.85 from XLA_PYTHON_CLIENT_MEM_FRACTION.
+  The CUDA FFI library loaded from /global/common/software/m4598/jackm/lorrax_cuda13_runtime/ffi_build_phdf5/liblorrax_ffi.so, selected by LORRAX_FFI_SO.
+  FFI build provenance: /global/common/software/m4598/jackm/lorrax_cuda13_runtime/ffi_build_phdf5/liblorrax_ffi.so | LEGACY-UNSEALED | recorded-rev bb6422eaad04 | recorded-sha cad78d947a953949 | actual 6755720 bytes sha cad78d947a953949
+  The LORRAX_BANDS_GEMM_FFI dial is unset and resolved to on, so the contract_bands right-GEMM contraction rides the platform's native lowering — the dial exists on cpu only and this run's backend is 'gpu', where startup enforcement skips it by the gate's declared platform policy (the native lowering IS the required path there).
+  The LORRAX_FFT_FFI dial is unset and resolved to on, so the flat-k 3-D FFT helper path is routed through the FFI handler (the required layer).
+  The LORRAX_FFT_FFI_FUSED dial is unset and resolved to on, so the fused IFFT-multiply-FFT tau kernel is routed through the FFI handler (the required layer).
+  The LORRAX_CONV_KMINOR_FFI dial is unset and resolved to auto, so the fused k-MINOR ifft-multiply-fft conv (the BSE ladder-W rung; accelerator) is routed through the FFI handler WHERE AVAILABLE and through the caller's XLA ifft/multiply/fft chain otherwise (capability: the mesh is CUDA, the loaded device library exports CufftConvKMinorCudaFfi, and the k-grid's row fits a block's shared memory).
+  The LORRAX_CONV_KLEAD_FFI dial is unset and resolved to off, so the direct fused k-LEADING IFFT(G)-IFFT(W)-FFT conv (Sigma; accelerator, default off) keeps the certified plan-based k-leading gw_conv handler — this dial is OPT-IN and off is its certified state.
+  The LORRAX_CONV_KPAIR_FFI dial is unset and resolved to auto, so the fused post-pair convolution used to form the ISDF Coulomb operator is routed through the FFI handler WHERE AVAILABLE and through the ISDF XLA IFFT/conjugate/gamma/FFT reference chain otherwise (capability: the mesh is CUDA, the loaded device library exports CufftConvKPairCudaFfi, the runtime axes are in [1,24], and the shape is in the measured native-fast region).
+  The distributed backends available for eigh on this mesh are cusolvermp, distributed, native; which one runs is the input-file key, not an environment variable.
+  The distributed backends available for cholesky on this mesh are cusolvermp, native, native2d; which one runs is the input-file key, not an environment variable.
+  The distributed backends available for solve_lu on this mesh are cusolvermp, distributed, native; which one runs is the input-file key, not an environment variable.
+  This process is pinned to 32 schedulable CPUs, with OMP_NUM_THREADS=None, MKL_NUM_THREADS=None and OPENBLAS_NUM_THREADS='16 (auto: physical cores of the affinity mask; applied to libscipy_openblas64_-61654e39.so)'.
+  Inside the FFI handlers the BLAS team size is LORRAX_MKLBLAS_THREADS=None for the batched GEMM, where unset means the ambient thread count, and LORRAX_SCALAPACK_MKL_THREADS=None for the ScaLAPACK handlers, where unset means a cap of 4 because pzheevd measured 11.28 s per q at 14 MKL threads against 0.463 s at 4.
+  The JAX persistent compile cache is OFF, so every rank compiles every module in this run; set ISDF_JAX_CACHE_DIR to a rank-visible directory to turn it on, or leave it unset and let the resolution order pick one — LORRAX_RUN_DIR/.lorrax_jax_cache first, then $SCRATCH/lorrax_jax_cache, then the home cache (docs/dev/env_vars.md).
+  The cache key includes every array shape, so a system size this machine has not run before misses every entry no matter how warm the cache looks.
+  Cross-rank module-compile agreement is ON with no deadline (rank 0 names a missing rank every 60 s); each backend compile is fingerprinted before XLA execution.
+  The fail-fast excepthook is installed, so an uncaught exception on any rank exits the step non-zero instead of leaving its peers blocked in a collective that rank will never join.
+  glibc malloc tuning is in force with M_MMAP_THRESHOLD=1 MB and M_TRIM_THRESHOLD=128 MB, which is the mitigation for the per-r-chunk RSS ramp on long XLA:CPU runs.
+==============================================================================
+  [config provenance] this deck names 1 LEGACY self-energy-axis key(s); they are honored, and the canonical axes resolved to compute_mode = cohsex, qp_solver = one_shot_dft.
+    do_screened -> write compute_mode = x_only | cohsex | gn_ppm | hl_ppm | mpa instead
+==============================================================================
+LORRAX GW CALCULATION
+==============================================================================
+Input          : /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/cohsex.in
+Method         : cohsex / one_shot_dft
+  Head policy: head_correction=full; screening_diagrams=w_rpa; direct diagnostic source=s_tensor. macroscopic W, local fields exactly once
+  Bispinor GW policy: bispinor_gw=full_static_cohsex (packed no-pair 4x4 static response with the Gamma-cell completion: bare <D> into V, charge S00/wing head into W, Hall CT/TC from static_gauge_hall_file when present)
+Photon route   : packed screened static photon operator (sixteen response and Sigma blocks; coupled 4x4 Dyson solve; Gamma-cell completion carries charge, mixed, and transverse heads)
+  [hdf5-probe startup] libhdf5 2 core mapped: libhdf5-9e18f0c6.so.320.0.0, libhdf5_parallel_gnu.so.310.3.0 (+1 companion: libhdf5_hl-69da89c9.so.320.0.0); HDF5_USE_FILE_LOCKING=FALSE; policy=measure
+  [hdf5-probe startup] no path opened through both stacks so far
+  [WfnLoader] read backend = phdf5 (auto, 4 processes) — collective MPI-IO read through the phdf5 FFI .so
+[2c-TRS] WFN.h5: CONSISTENT (spatial-conditional, residual=1.65e-08, coverage=33%, raw-pair=0, spatial-pair=1, trim=1) | 0.03s (io 0.00 + overlap 0.02)
+  [config provenance] mpa_sampling_alpha = 1 (default for nonmetal)
+  Material class: insulator (inferred from WFN occupations)
+  ISDF basis: 192 centroids
+  FFT grid: 24×24×80   Cell volume: 702.20 a.u.³
+
+[config provenance] linalg = distributed (deck)
+linalg = distributed: dense N_mu x N_mu matrices are 2D distributed across the process mesh (N_mu = 192)
+[config provenance] low_mem_bands = true (deck)
+low_mem_bands = true: the two-face wavefunction carrier (band chunks of 16); required for the raw-parent (k_irr) route, which contracts G and the ISDF pair densities on the WFN's own k rows.  On an unreduced k grid the four-copy carrier (false) is faster when it fits.
+
+CONFIGURATION PROVENANCE
+------------------------
+[config provenance] this deck names 1 LEGACY self-energy-axis key(s); they are honored, and the canonical axes resolved to compute_mode = cohsex, qp_solver = one_shot_dft.
+
+PROCESSOR ARCHITECTURE
+----------------------
+MPI ranks      : 4
+Accelerators   : 4 GPU devices (NVIDIA A100-SXM4-40GB, 1 per rank)
+Processor mesh : 2 x 2  (centroid axes X x Y)
+CPU allocation : 32 cores per rank
+Host threads   : OPENBLAS_NUM_THREADS=16 (auto: physical cores of the affinity mask; applied to libscipy_openblas64_-61654e39.so)
+
+METHOD AND PHYSICAL PATHWAYS
+----------------------------
+Self-energy    : static screened exchange + Coulomb hole; one-shot full-matrix effective Hamiltonian; Sigma evaluated at E_DFT with QSGW Hermitian symmetrization (distinct from fixed-DFT-state diagonal G0W0)
+QP consistency  : one_shot_dft | other options: fixed_point (diagonal on-shell), self_consistent (rebuild G/W/Sigma)
+EQP2 treatment  : off (set write_eqp2=true for fixed-Sigma eigenvalue self-consistency)
+Screening      : RPA Dyson series; minimax imaginary-axis quadrature
+Long wavelength: head=full; source=s_tensor
+Coulomb system : 2D slab; Hartree=live G-space
+Spin channels  : charge + transverse current (bispinor)
+Degenerate sets: averaged at 1.36057e-05 eV
+ISDF state     : fresh fit requested
+  centroid order: orbit-packed, 16 orbits on 2 shards of 96 slots (192 centroids, 0 pad slots, canonical carrier 192)
+  band counts: chi = sigma = 80; ISDF zeta fit sized for 80 bands (the two counts are TIED, so the band sums are the same window)
+    chi0/W band sum edge 80 clean: min gap 15.3 meV.
+    Sigma band sum edge 80 clean: min gap 15.3 meV.
+
+NUMERICAL ENVIRONMENT
+---------------------
+JAX/JAXLIB     : 0.9.1 / 0.9.1 | FP64 / complex128 | NCCL collectives
+Wavefunctions  : phdf5 reader
+Dense linalg   : distributed layout
+LORRAX_BANDS_GEMM_FFI      = NATIVE : right-GEMM contraction forming G(tau) (native XLA dot lowering)
+LORRAX_FFT_FFI             = ON     : flat-k FFTs for ISDF, chi0 and Sigma (cuFFT flat-k FFI)
+LORRAX_FFT_FFI_FUSED       = ON     : fused tau-domain convolution (cuFFT fused-convolution FFI)
+LORRAX_CONV_KPAIR_FFI      = ON     : pair-density convolution forming V(q) (cuFFT pair-convolution FFI)
+
+CRYSTAL SYMMETRY AND BRILLOUIN-ZONE SAMPLING
+--------------------------------------------
+Real-space action: r' = R^-1 r + tau
+Spatial group   : 12 operations; 0 with fractional translations
+QE schema      : FOUND data-file-schema.xml at /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/01_qe_fullgroup/qe/nscf/MoS2.save/data-file-schema.xml
+QE schema hash : SHA256 4379ca15ae2f
+Stored QE type : 12 unitary; 0 composed with time reversal
+Active op rows : 12 unitary; 12 TR-composed
+Inversion      : absent
+DFT 2c TRS     : CONSISTENT (spatial-conditional; occupied-density residual=1.65314e-08; coverage=33.33%; raw-pair=0, spatial-pair=1, trim=1)
+Global TRS     : enabled from the two-component reference check
+  op   QE time-reversal status       R^-1 and fractional translation
+  S01  QE-TR=no      active=unitary+TR R^-1=[ 1  0  0;  0  1  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S02  QE-TR=no      active=unitary+TR R^-1=[-1  1  0;  0  1  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S03  QE-TR=no      active=unitary+TR R^-1=[-1  1  0; -1  0  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S04  QE-TR=no      active=unitary+TR R^-1=[ 0 -1  0;  1 -1  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S05  QE-TR=no      active=unitary+TR R^-1=[ 0 -1  0; -1  0  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S06  QE-TR=no      active=unitary+TR R^-1=[ 1  0  0;  1 -1  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S07  QE-TR=no      active=unitary+TR R^-1=[ 1  0  0;  0  1  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S08  QE-TR=no      active=unitary+TR R^-1=[-1  1  0;  0  1  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S09  QE-TR=no      active=unitary+TR R^-1=[ 0 -1  0;  1 -1  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S10  QE-TR=no      active=unitary+TR R^-1=[-1  1  0; -1  0  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S11  QE-TR=no      active=unitary+TR R^-1=[ 1  0  0;  1 -1  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S12  QE-TR=no      active=unitary+TR R^-1=[ 0 -1  0; -1  0  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+Full BZ grid   : 9 k points | mesh 3 x 3 x 1 | shift (0.00000, 0.00000, 0.00000)
+Stored IBZ     : 3 k points
+  ik        kx        ky        kz     weight
+    1   0.00000   0.00000   0.00000   0.11111
+    2   0.00000   0.33333   0.00000   0.66667
+    3   0.33333   0.33333   0.00000   0.22222
+Centroid orbit: CLOSED : 12/12 spatial operations preserve 192 sites (tol=1.00000e-05)
+TRS pathways   : automatic from SymMaps.trs_allowed=true; no input override
+
+BAND SPACES AND ENERGY COVERAGE
+-------------------------------
+Electrons      : 26.00000; occupied-band boundary = 26
+Occupied bands : 1-26
+QP valence     : 23-26
+QP conduction  : 27-30
+QP matrix      : 1-30
+chi0/W sum     : 1-80
+Sigma sum      : 1-80
+Loaded ISDF psi: 1-80
+zeta fit       : left 1-30; right 23-80
+[stage 01:51:02] -> ISDF basis + wavefunctions
+    ζ-fit physical window top 80 bands (logical band sums reach chi 80, sigma 80; the max is set by tied)
+    ζ band-window closure: edge 22 min gap 80.7 meV, edge 30 min gap 173 meV, edge 80 min gap 15.3 meV
+    cutoffs: zeta = 30.0 Ry, bare-Coulomb = 30.0 Ry  (ecutwfc=30.0, ecutrho=120.0)
+[stage 01:51:02]   -> gw_jax.load_centroid_wfns
+[load_centroids planner] existing=0.00, persistent=0.00, scan_budget=33.52 GiB/device, peak_copies=9, cs=12, stream=on, k_domain=ibz, retain_parents=no, k_tile=3, band_tile=16
+[stage 01:51:03]     -> load_centroids.loader_load
+  [SlabIO.phdf5_ffi] WFN.h5 mode=r bytes=15585784 file stripe layout=UNKNOWN (lfs unavailable or not Lustre); collective read aggregation cannot be predicted
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/02_preprocess/WFN.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 1
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 1
+  romio_filesystem_type                    = CRAY ADIO:
+  [shard_map] using jax.shard_map (jax 0.9.1)
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=753792  prev_h2d_wait=0.01  pin+zero=1.74  spaces=0.01  select=0.03  read=3.70  h2d_setup=0.06  total=5.55 (ms)  [selected_elts=93232]
+  [wfn_loader] shard_map via jax.shard_map (jax 0.9.1)
+[stage 01:51:03]     <- load_centroids.loader_load  0.3 s
+[stage 01:51:03]     -> load_centroids.gflat_to_rmu
+[stage 01:51:03]     <- load_centroids.gflat_to_rmu  0.4 s
+[stage 01:51:03]     -> load_centroids.reshard_insert
+[stage 01:51:05]     <- load_centroids.reshard_insert  1.9 s
+[stage 01:51:05]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=753792  prev_h2d_wait=0.01  pin+zero=0.05  spaces=0.01  select=0.01  read=2.90  h2d_setup=0.06  total=3.03 (ms)  [selected_elts=93232]
+[stage 01:51:05]     <- load_centroids.loader_load  0.0 s
+[stage 01:51:05]     -> load_centroids.gflat_to_rmu
+[stage 01:51:05]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 01:51:05]     -> load_centroids.reshard_insert
+[stage 01:51:05]     <- load_centroids.reshard_insert  0.0 s
+[stage 01:51:05]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=753792  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.01  select=0.01  read=1.61  h2d_setup=0.05  total=1.70 (ms)  [selected_elts=93232]
+[stage 01:51:05]     <- load_centroids.loader_load  0.0 s
+[stage 01:51:05]     -> load_centroids.gflat_to_rmu
+[stage 01:51:05]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 01:51:05]     -> load_centroids.reshard_insert
+[stage 01:51:05]     <- load_centroids.reshard_insert  0.0 s
+[stage 01:51:05]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=753792  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.01  read=1.44  h2d_setup=0.05  total=1.52 (ms)  [selected_elts=93232]
+[stage 01:51:05]     <- load_centroids.loader_load  0.0 s
+[stage 01:51:05]     -> load_centroids.gflat_to_rmu
+[stage 01:51:05]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 01:51:05]     -> load_centroids.reshard_insert
+[stage 01:51:05]     <- load_centroids.reshard_insert  0.0 s
+[stage 01:51:05]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=753792  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.01  read=1.48  h2d_setup=0.05  total=1.56 (ms)  [selected_elts=93232]
+[stage 01:51:05]     <- load_centroids.loader_load  0.0 s
+[stage 01:51:05]     -> load_centroids.gflat_to_rmu
+[stage 01:51:05]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 01:51:05]     -> load_centroids.reshard_insert
+[stage 01:51:05]     <- load_centroids.reshard_insert  0.0 s
+[stage 01:51:05]   <- gw_jax.load_centroid_wfns  2.8 s
+  ψ storage: parents only -- no full-k centroid face was formed; 3 raw WFN parents stand in for 9 full k rows in the ζ fit, screening and Σ through the typed local unfold.
+
+  ====================================================================
+  REUSING the existing ζ at /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/zeta_q.h5 — FIT SKIPPED.
+  ...and the three transverse ζ at zeta_q_mu{1,2,3}.h5.
+  isdf_header/zeta_is_done is True, the centroid table
+  matches, and fit_provenance is identical to this run's
+  inputs (band windows, cutoffs, solver knobs, source WFN).
+  Set LORRAX_FORCE_REFIT=1 to refit unconditionally.
+  ====================================================================
+
+  [bispinor] re-sampling ψ at the 98 transverse centroids for σ^B (the ζ_T fit is skipped, but Σ^B still needs ψ(r_{μ_T})).
+[stage 01:51:05]   -> gw_jax.load_centroid_wfns_current
+[load_centroids planner] existing=0.00, persistent=0.00, scan_budget=33.52 GiB/device, peak_copies=9, cs=12, stream=on, k_domain=ibz, retain_parents=no, k_tile=3, band_tile=16
+[stage 01:51:06]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=753792  prev_h2d_wait=0.01  pin+zero=0.05  spaces=0.01  select=0.01  read=1.84  h2d_setup=0.06  total=1.99 (ms)  [selected_elts=93232]
+[stage 01:51:06]     <- load_centroids.loader_load  0.0 s
+[stage 01:51:06]     -> load_centroids.gflat_to_rmu
+[stage 01:51:06]     <- load_centroids.gflat_to_rmu  0.3 s
+[stage 01:51:06]     -> load_centroids.reshard_insert
+[stage 01:51:06]     <- load_centroids.reshard_insert  0.1 s
+[stage 01:51:06]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=753792  prev_h2d_wait=0.01  pin+zero=0.05  spaces=0.02  select=0.01  read=1.65  h2d_setup=0.05  total=1.80 (ms)  [selected_elts=93232]
+[stage 01:51:06]     <- load_centroids.loader_load  0.0 s
+[stage 01:51:06]     -> load_centroids.gflat_to_rmu
+[stage 01:51:06]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 01:51:06]     -> load_centroids.reshard_insert
+[stage 01:51:06]     <- load_centroids.reshard_insert  0.0 s
+[stage 01:51:06]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=753792  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.01  read=1.49  h2d_setup=0.05  total=1.57 (ms)  [selected_elts=93232]
+[stage 01:51:06]     <- load_centroids.loader_load  0.0 s
+[stage 01:51:06]     -> load_centroids.gflat_to_rmu
+[stage 01:51:06]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 01:51:06]     -> load_centroids.reshard_insert
+[stage 01:51:06]     <- load_centroids.reshard_insert  0.0 s
+[stage 01:51:06]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=753792  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.00  read=1.42  h2d_setup=0.05  total=1.50 (ms)  [selected_elts=93232]
+[stage 01:51:06]     <- load_centroids.loader_load  0.0 s
+[stage 01:51:06]     -> load_centroids.gflat_to_rmu
+[stage 01:51:06]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 01:51:06]     -> load_centroids.reshard_insert
+[stage 01:51:06]     <- load_centroids.reshard_insert  0.0 s
+[stage 01:51:06]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=753792  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.00  read=1.47  h2d_setup=0.05  total=1.55 (ms)  [selected_elts=93232]
+[stage 01:51:06]     <- load_centroids.loader_load  0.0 s
+[stage 01:51:06]     -> load_centroids.gflat_to_rmu
+[stage 01:51:06]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 01:51:06]     -> load_centroids.reshard_insert
+[stage 01:51:06]     <- load_centroids.reshard_insert  0.0 s
+[stage 01:51:06]   <- gw_jax.load_centroid_wfns_current  0.6 s
+[stage 01:51:06]   -> gw_jax.wavefunction_setup
+[stage 01:51:06]   <- gw_jax.wavefunction_setup  0.0 s
+  Parent-k Sigma route ready: G contracted on 3 raw WFN parents and Σ_k projected on their bands, broadcast to 9 full k rows by the typed band-index unfold.
+  Parent-k Green contraction ready: 3 raw WFN parents -> 9 full k rows.  Full-k FFTs and observables remain unchanged.
+  Wavefunctions built (b0:b4=80 bands, face layout: no full-k faces (parents-only storage); low_mem_bands=true) — V_q's baseline is the face floor alone, no fit-input carryover
+[stage 01:51:06]   -> gw_jax.wavefunction_setup
+[stage 01:51:06]   <- gw_jax.wavefunction_setup  0.0 s
+  [bispinor] σ^B-side Wfns built on n_rmu_T=98 transverse centroids (face layout; low_mem_bands=true)
+[mem_probe pre_v_q] in_use=0.00 GB  peak=0.14 GB  live_count=46 live_total=0.01 GB  nvsmi=3.02 GB nvsmi_peak=3.02 GB
+[mem_probe pre_v_q]   complex128 (3, 4, 100, 80) x 2 = 0.00 GB
+[mem_probe pre_v_q]   complex128 (3, 80, 4, 100) x 2 = 0.00 GB
+[mem_probe pre_v_q]   complex128 (3, 4, 192, 80) x 1 = 0.00 GB
+[mem_probe pre_v_q]   complex128 (3, 80, 4, 192) x 1 = 0.00 GB
+[mem_probe pre_v_q]   int32 (3, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe pre_v_q]   float64 (9, 80) x 6 = 0.00 GB
+[mem_probe pre_v_q]   float64 (9, 320) x 1 = 0.00 GB
+[mem_probe pre_v_q]   float64 (9, 120) x 1 = 0.00 GB
+[mem_probe pre_v_q]   float64 (3, 80) x 4 = 0.00 GB
+[mem_probe pre_v_q]   float64 (9, 30) x 1 = 0.00 GB
+    V_q bare cutoff: 30.0 Ry
+    V_q budget:    30.00 GB
+
+  [bispinor] V_q^{μ_L,ν_L} → /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/v_q_bispinor.h5
+[stage 01:51:06]   -> gw_jax.V_q_compute
+  [SlabIO.phdf5_ffi] zeta_q.h5 mode=r bytes=22288277 file stripe_count=16 stripe_size=4194304 B cb_nodes=4/4 (the file's inode, not write policy).
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/zeta_q.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 16
+  striping_unit                            = 4194304
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+  [SlabIO.phdf5_ffi] zeta_q_mu1.h5 mode=r bytes=13431167 file stripe_count=16 stripe_size=4194304 B cb_nodes=4/4 (the file's inode, not write policy).
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/zeta_q_mu1.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 16
+  striping_unit                            = 4194304
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+  [SlabIO.phdf5_ffi] zeta_q_mu2.h5 mode=r bytes=13431167 file stripe_count=16 stripe_size=4194304 B cb_nodes=4/4 (the file's inode, not write policy).
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/zeta_q_mu2.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 16
+  striping_unit                            = 4194304
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+  [SlabIO.phdf5_ffi] zeta_q_mu3.h5 mode=r bytes=13431167 file stripe_count=16 stripe_size=4194304 B cb_nodes=4/4 (the file's inode, not write policy).
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/zeta_q_mu3.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 16
+  striping_unit                            = 4194304
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+  [SlabIO.phdf5_ffi] v_q_bispinor.h5 mode=w ranks=4 stripe_count=4 stripe_unit=1048576 B (policy; LORRAX_PHDF5_STRIPE_COUNT/_SIZE_FS override)
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/v_q_bispinor.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639681] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.04  select=0.00  write=1.21  total=1.26 (ms)  0 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (no queued data); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+q-grid TRS policy [bispinor V / one-leg]: time reversal MEASURED to hold; 1 of 9 q rows use a TRS-composed partner so q and -q share one spatial realization, and 1 self-negative q rows carry the one-element TRS projector.
+  [bispinor g-flat] tile 1/7 (μ_L=0, ν_L=0)  n_rmu_L=192 n_rmu_R=192  same_zeta=True  use_ibz=True
+  V_q g-flat [V_qmunu_CC]: n_q_ibz=3, ngkmax=1963, g_chunk=1963 (1/q), n_rmu_L=192→192, n_rmu_R=192→192, storage=q-IBZ
+    [V_qmunu_CC] pre-read all 3 IBZ ζ̃ slabs (1 batched call): 0.04s
+    [V_qmunu_CC] q=0/3: kernel=0.12s
+    [V_qmunu_CC] q=1/3: kernel=0.00s
+    [V_qmunu_CC] q=2/3: kernel=0.00s
+  sanity[V_q[CC] IBZ parents]: parent point-group covariance = 2.847e-07 (11/11 little-group ops over 1 parent(s)).  fixed-q TRS projector removed 9.466e-17 (relative).
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/v_q_bispinor.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639683] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.03  select=0.00  write=0.35  total=0.39 (ms)  0 MB/s
+[ffi-debug proc=0] name=V_qmunu_CC shape=(3, 192, 192) dtype=complex128 spec=P(None, 'x', 'y') offset=(0, 0, 0) valid_shape=(3, 192, 192) gshape=(3, 192, 192) local_shapes=[(3, 96, 96)]
+  [SlabIO.close] draining 1 pending writes for v_q_bispinor.h5 …
+[phdf5-write rank=0 ds=/V_qmunu_CC id=360287970189639684] extent=[3,192,192] offset=[0,0,0] count=[3,96,96] mem_dims=[3,96,96] base=[0,0,0] valid=[3,192,192] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/V_qmunu_CC bytes/rank=442368 coll=1 empty=0  d2h_wait=0.01  spaces=0.02  select=0.00  write=2.79  total=2.83 (ms)  158 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (0.00 GB at 74 MB/s); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+  [bispinor g-flat] tile 2/7 (μ_L=1, ν_L=1)  n_rmu_L=98 n_rmu_R=98  same_zeta=True  use_ibz=True
+  V_q g-flat [V_qmunu_TT_11]: n_q_ibz=3, ngkmax=1963, g_chunk=1963 (1/q), n_rmu_L=98→100, n_rmu_R=98→100, storage=q-IBZ
+    [V_qmunu_TT_11] pre-read all 3 IBZ ζ̃ slabs (1 batched call): 0.03s
+    [V_qmunu_TT_11] q=0/3: kernel=0.10s
+    [V_qmunu_TT_11] q=1/3: kernel=0.00s
+    [V_qmunu_TT_11] q=2/3: kernel=0.00s
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/v_q_bispinor.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639686] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.04  select=0.00  write=0.55  total=0.59 (ms)  0 MB/s
+[ffi-debug proc=0] name=V_qmunu_TT_11 shape=(3, 100, 100) dtype=complex128 spec=P(None, 'x', 'y') offset=(0, 0, 0) valid_shape=(3, 98, 98) gshape=(3, 98, 98) local_shapes=[(3, 50, 50)]
+  [SlabIO.close] draining 1 pending writes for v_q_bispinor.h5 …
+[phdf5-write rank=0 ds=/V_qmunu_TT_11 id=360287970189639687] extent=[3,98,98] offset=[0,0,0] count=[3,50,50] mem_dims=[3,50,50] base=[0,0,0] valid=[3,98,98] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/V_qmunu_TT_11 bytes/rank=120000 coll=1 empty=0  d2h_wait=0.01  spaces=0.03  select=0.00  write=1.16  total=1.20 (ms)  103 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (0.00 GB at 21 MB/s); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+  [bispinor g-flat] tile 3/7 (μ_L=2, ν_L=2)  n_rmu_L=98 n_rmu_R=98  same_zeta=True  use_ibz=True
+  V_q g-flat [V_qmunu_TT_22]: n_q_ibz=3, ngkmax=1963, g_chunk=1963 (1/q), n_rmu_L=98→100, n_rmu_R=98→100, storage=q-IBZ
+    [V_qmunu_TT_22] pre-read all 3 IBZ ζ̃ slabs (1 batched call): 0.01s
+    [V_qmunu_TT_22] q=0/3: kernel=0.00s
+    [V_qmunu_TT_22] q=1/3: kernel=0.00s
+    [V_qmunu_TT_22] q=2/3: kernel=0.00s
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/v_q_bispinor.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639689] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.04  select=0.00  write=0.69  total=0.74 (ms)  0 MB/s
+[ffi-debug proc=0] name=V_qmunu_TT_22 shape=(3, 100, 100) dtype=complex128 spec=P(None, 'x', 'y') offset=(0, 0, 0) valid_shape=(3, 98, 98) gshape=(3, 98, 98) local_shapes=[(3, 50, 50)]
+  [SlabIO.close] draining 1 pending writes for v_q_bispinor.h5 …
+[phdf5-write rank=0 ds=/V_qmunu_TT_22 id=360287970189639690] extent=[3,98,98] offset=[0,0,0] count=[3,50,50] mem_dims=[3,50,50] base=[0,0,0] valid=[3,98,98] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/V_qmunu_TT_22 bytes/rank=120000 coll=1 empty=0  d2h_wait=0.00  spaces=0.02  select=0.00  write=1.32  total=1.34 (ms)  91 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (0.00 GB at 268 MB/s); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+  [bispinor g-flat] tile 4/7 (μ_L=3, ν_L=3)  n_rmu_L=98 n_rmu_R=98  same_zeta=True  use_ibz=True
+  V_q g-flat [V_qmunu_TT_33]: n_q_ibz=3, ngkmax=1963, g_chunk=1963 (1/q), n_rmu_L=98→100, n_rmu_R=98→100, storage=q-IBZ
+    [V_qmunu_TT_33] pre-read all 3 IBZ ζ̃ slabs (1 batched call): 0.01s
+    [V_qmunu_TT_33] q=0/3: kernel=0.00s
+    [V_qmunu_TT_33] q=1/3: kernel=0.00s
+    [V_qmunu_TT_33] q=2/3: kernel=0.00s
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/v_q_bispinor.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639692] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.04  select=0.00  write=0.56  total=0.62 (ms)  0 MB/s
+[ffi-debug proc=0] name=V_qmunu_TT_33 shape=(3, 100, 100) dtype=complex128 spec=P(None, 'x', 'y') offset=(0, 0, 0) valid_shape=(3, 98, 98) gshape=(3, 98, 98) local_shapes=[(3, 50, 50)]
+  [SlabIO.close] draining 1 pending writes for v_q_bispinor.h5 …
+[phdf5-write rank=0 ds=/V_qmunu_TT_33 id=360287970189639693] extent=[3,98,98] offset=[0,0,0] count=[3,50,50] mem_dims=[3,50,50] base=[0,0,0] valid=[3,98,98] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/V_qmunu_TT_33 bytes/rank=120000 coll=1 empty=0  d2h_wait=0.01  spaces=0.02  select=0.00  write=1.21  total=1.23 (ms)  99 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (0.00 GB at 291 MB/s); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+  [bispinor g-flat] tile 5/7 (μ_L=1, ν_L=2)  n_rmu_L=98 n_rmu_R=98  same_zeta=False  use_ibz=True
+  V_q g-flat [V_qmunu_TT_12]: n_q_ibz=3, ngkmax=1963, g_chunk=1963 (1/q), n_rmu_L=98→100, n_rmu_R=98→100, storage=q-IBZ
+    [V_qmunu_TT_12] pre-read all 3 IBZ ζ̃ slabs (1 batched call): 0.01s
+    [V_qmunu_TT_12] q=0/3: kernel=0.10s
+    [V_qmunu_TT_12] q=1/3: kernel=0.00s
+    [V_qmunu_TT_12] q=2/3: kernel=0.00s
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/v_q_bispinor.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639694] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.02  spaces=0.04  select=0.00  write=0.69  total=0.75 (ms)  0 MB/s
+[ffi-debug proc=0] name=V_qmunu_TT_12 shape=(3, 100, 100) dtype=complex128 spec=P(None, 'x', 'y') offset=(0, 0, 0) valid_shape=(3, 98, 98) gshape=(3, 98, 98) local_shapes=[(3, 50, 50)]
+  [SlabIO.close] draining 1 pending writes for v_q_bispinor.h5 …
+[phdf5-write rank=0 ds=/V_qmunu_TT_12 id=360287970189639695] extent=[3,98,98] offset=[0,0,0] count=[3,50,50] mem_dims=[3,50,50] base=[0,0,0] valid=[3,98,98] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/V_qmunu_TT_12 bytes/rank=120000 coll=1 empty=0  d2h_wait=0.01  spaces=0.02  select=0.00  write=1.24  total=1.27 (ms)  96 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (0.00 GB at 281 MB/s); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+  [bispinor g-flat] tile 6/7 (μ_L=1, ν_L=3)  n_rmu_L=98 n_rmu_R=98  same_zeta=False  use_ibz=True
+  V_q g-flat [V_qmunu_TT_13]: n_q_ibz=3, ngkmax=1963, g_chunk=1963 (1/q), n_rmu_L=98→100, n_rmu_R=98→100, storage=q-IBZ
+    [V_qmunu_TT_13] pre-read all 3 IBZ ζ̃ slabs (1 batched call): 0.01s
+    [V_qmunu_TT_13] q=0/3: kernel=0.00s
+    [V_qmunu_TT_13] q=1/3: kernel=0.00s
+    [V_qmunu_TT_13] q=2/3: kernel=0.00s
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/v_q_bispinor.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639696] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.04  select=0.00  write=0.97  total=1.03 (ms)  0 MB/s
+[ffi-debug proc=0] name=V_qmunu_TT_13 shape=(3, 100, 100) dtype=complex128 spec=P(None, 'x', 'y') offset=(0, 0, 0) valid_shape=(3, 98, 98) gshape=(3, 98, 98) local_shapes=[(3, 50, 50)]
+  [SlabIO.close] draining 1 pending writes for v_q_bispinor.h5 …
+[phdf5-write rank=0 ds=/V_qmunu_TT_13 id=360287970189639697] extent=[3,98,98] offset=[0,0,0] count=[3,50,50] mem_dims=[3,50,50] base=[0,0,0] valid=[3,98,98] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/V_qmunu_TT_13 bytes/rank=120000 coll=1 empty=0  d2h_wait=0.01  spaces=0.02  select=0.00  write=1.06  total=1.08 (ms)  113 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (0.00 GB at 312 MB/s); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+  [bispinor g-flat] tile 7/7 (μ_L=2, ν_L=3)  n_rmu_L=98 n_rmu_R=98  same_zeta=False  use_ibz=True
+  V_q g-flat [V_qmunu_TT_23]: n_q_ibz=3, ngkmax=1963, g_chunk=1963 (1/q), n_rmu_L=98→100, n_rmu_R=98→100, storage=q-IBZ
+    [V_qmunu_TT_23] pre-read all 3 IBZ ζ̃ slabs (1 batched call): 0.01s
+    [V_qmunu_TT_23] q=0/3: kernel=0.00s
+    [V_qmunu_TT_23] q=1/3: kernel=0.00s
+    [V_qmunu_TT_23] q=2/3: kernel=0.00s
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/v_q_bispinor.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639698] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.04  select=0.00  write=0.36  total=0.42 (ms)  0 MB/s
+[ffi-debug proc=0] name=V_qmunu_TT_23 shape=(3, 100, 100) dtype=complex128 spec=P(None, 'x', 'y') offset=(0, 0, 0) valid_shape=(3, 98, 98) gshape=(3, 98, 98) local_shapes=[(3, 50, 50)]
+  [SlabIO.close] draining 1 pending writes for v_q_bispinor.h5 …
+[phdf5-write rank=0 ds=/V_qmunu_TT_23 id=360287970189639699] extent=[3,98,98] offset=[0,0,0] count=[3,50,50] mem_dims=[3,50,50] base=[0,0,0] valid=[3,98,98] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/V_qmunu_TT_23 bytes/rank=120000 coll=1 empty=0  d2h_wait=0.01  spaces=0.02  select=0.00  write=1.30  total=1.33 (ms)  92 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (0.00 GB at 269 MB/s); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/v_q_bispinor.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639700] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.03  select=0.00  write=0.40  total=0.44 (ms)  0 MB/s
+[ffi-debug proc=0] name=photon_g0_vectors_0 shape=(1, 192) dtype=complex128 spec=P(None, 'x') offset=(0, 0) valid_shape=(1, 192) gshape=(1, 192) local_shapes=[(1, 96)]
+[phdf5-write rank=0 ds=/photon_g0_vectors_0 id=360287970189639701] extent=[1,192] offset=[0,0] count=[1,96] mem_dims=[1,96] base=[0,0] valid=[1,192] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/photon_g0_vectors_0 bytes/rank=1536 coll=1 empty=0  d2h_wait=0.01  spaces=0.04  select=0.00  write=0.41  total=0.46 (ms)  4 MB/s
+  [SlabIO.flush] v_q_bispinor.h5: 0.00 GB written in 0.0 s (0 MB/s) before creating 'photon_g0_vectors_1'
+[ffi-debug proc=0] name=photon_g0_vectors_1 shape=(1, 100) dtype=complex128 spec=P(None, 'x') offset=(0, 0) valid_shape=(1, 98) gshape=(1, 98) local_shapes=[(1, 50)]
+[phdf5-write rank=0 ds=/photon_g0_vectors_1 id=360287970189639702] extent=[1,98] offset=[0,0] count=[1,50] mem_dims=[1,50] base=[0,0] valid=[1,98] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/photon_g0_vectors_1 bytes/rank=800 coll=1 empty=0  d2h_wait=0.01  spaces=0.04  select=0.00  write=0.34  total=0.39 (ms)  2 MB/s
+  [SlabIO.flush] v_q_bispinor.h5: 0.00 GB written in 0.0 s (0 MB/s) before creating 'photon_g0_vectors_2'
+[ffi-debug proc=0] name=photon_g0_vectors_2 shape=(1, 100) dtype=complex128 spec=P(None, 'x') offset=(0, 0) valid_shape=(1, 98) gshape=(1, 98) local_shapes=[(1, 50)]
+[phdf5-write rank=0 ds=/photon_g0_vectors_2 id=360287970189639703] extent=[1,98] offset=[0,0] count=[1,50] mem_dims=[1,50] base=[0,0] valid=[1,98] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/photon_g0_vectors_2 bytes/rank=800 coll=1 empty=0  d2h_wait=0.01  spaces=0.02  select=0.00  write=0.24  total=0.26 (ms)  3 MB/s
+  [SlabIO.flush] v_q_bispinor.h5: 0.00 GB written in 0.0 s (2 MB/s) before creating 'photon_g0_vectors_3'
+[ffi-debug proc=0] name=photon_g0_vectors_3 shape=(1, 100) dtype=complex128 spec=P(None, 'x') offset=(0, 0) valid_shape=(1, 98) gshape=(1, 98) local_shapes=[(1, 50)]
+  [SlabIO.close] draining 1 pending writes for v_q_bispinor.h5 …
+[phdf5-write rank=0 ds=/photon_g0_vectors_3 id=360287970189639704] extent=[1,98] offset=[0,0] count=[1,50] mem_dims=[1,50] base=[0,0] valid=[1,98] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/photon_g0_vectors_3 bytes/rank=800 coll=1 empty=0  d2h_wait=0.01  spaces=0.02  select=0.00  write=0.16  total=0.19 (ms)  5 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (0.00 GB at 3 MB/s); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+  [SlabIO.close] Python dispatch drained in 0.0 s (no queued data); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+  [SlabIO.close] Python dispatch drained in 0.0 s (no queued data); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+  [SlabIO.close] Python dispatch drained in 0.0 s (no queued data); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+  [SlabIO.close] Python dispatch drained in 0.0 s (no queued data); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+[stage 01:51:10]   <- gw_jax.V_q_compute  3.9 s
+  [SlabIO.phdf5_ffi] v_q_bispinor.h5 mode=r bytes=5174681 file stripe_count=4 stripe_size=1048576 B cb_nodes=4/4 (the file's inode, not write policy).
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/v_q_bispinor.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+  [SlabIO.close] Python dispatch drained in 0.0 s (no queued data); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+  [shard_map] using jax.shard_map (jax 0.9.1)
+
+  V_q computed:
+    Shape: (9, 192, 192)
+    V_q=0 trace: 49013530.3529
+[mem_probe post_v_q] in_use=0.01 GB  peak=0.14 GB  live_count=71 live_total=0.02 GB  nvsmi=3.22 GB nvsmi_peak=3.22 GB
+[mem_probe post_v_q]   complex128 (9, 192, 192) x 1 = 0.01 GB
+[mem_probe post_v_q]   complex128 (3, 4, 100, 80) x 2 = 0.00 GB
+[mem_probe post_v_q]   complex128 (3, 80, 4, 100) x 2 = 0.00 GB
+[mem_probe post_v_q]   complex128 (3, 4, 192, 80) x 1 = 0.00 GB
+[mem_probe post_v_q]   complex128 (3, 80, 4, 192) x 1 = 0.00 GB
+[mem_probe post_v_q]   complex128 (3, 192, 192) x 1 = 0.00 GB
+[mem_probe post_v_q]   complex128 (9, 96, 96) x 1 = 0.00 GB
+[mem_probe post_v_q]   int32 (3, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe post_v_q]   complex128 (9, 100) x 3 = 0.00 GB
+[mem_probe post_v_q]   int32 (24, 192) x 2 = 0.00 GB
+  [restart_write] restart_q_storage=auto -> ibz (centroid set is orbit-closed (worst residual 1.624e-16 at tol 1.0e-05) and the q path reduced)
+  [SlabIO.phdf5_ffi] isdf_tensors_192.h5 mode=w ranks=4 stripe_count=4 stripe_unit=1048576 B (policy; LORRAX_PHDF5_STRIPE_COUNT/_SIZE_FS override)
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/isdf_tensors_192.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639706] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.03  select=0.00  write=0.94  total=0.99 (ms)  0 MB/s
+[ffi-debug proc=0] name=V_qmunu shape=(3, 192, 192) dtype=complex128 spec=P(None, 'x', 'y') offset=(0, 0, 0) valid_shape=(3, 192, 192) gshape=(3, 192, 192) local_shapes=[(3, 96, 96)]
+  [restart_write] V_qmunu (3, 192, 192) 0.00 GB QUEUED in 0.0 s (transfer time and rate: see the SlabIO.close drain line)
+[phdf5-write rank=0 ds=/V_qmunu id=360287970189639707] extent=[3,192,192] offset=[0,0,0] count=[3,96,96] mem_dims=[3,96,96] base=[0,0,0] valid=[3,192,192] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/V_qmunu bytes/rank=442368 coll=1 empty=0  d2h_wait=0.01  spaces=0.02  select=0.00  write=2.61  total=2.64 (ms)  170 MB/s
+  [SlabIO.flush] isdf_tensors_192.h5: 0.00 GB written in 0.0 s (564 MB/s) before creating 'G0_mu_nu'
+[ffi-debug proc=0] name=G0_mu_nu shape=(192,) dtype=complex128 spec=P(None,) offset=(0,) valid_shape=(192,) gshape=(192,) local_shapes=[(192,)]
+  [restart_write] G0_mu_nu (192,) 0.00 GB QUEUED in 0.0 s (transfer time and rate: see the SlabIO.close drain line)
+[phdf5-write rank=0 ds=/G0_mu_nu id=360287970189639708] extent=[192] offset=[0] count=[192] mem_dims=[192] base=[0] valid=[192] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/G0_mu_nu bytes/rank=3072 coll=1 empty=0  d2h_wait=0.01  spaces=0.02  select=0.00  write=0.25  total=0.28 (ms)  12 MB/s
+  [SlabIO.flush] isdf_tensors_192.h5: 0.00 GB written in 0.0 s (0 MB/s) before creating 'enk_full'
+[ffi-debug proc=0] name=enk_full shape=(9, 80) dtype=float64 spec=P(None, None) offset=(0, 0) valid_shape=(9, 80) gshape=(9, 80) local_shapes=[(9, 80)]
+  [restart_write] enk_full (9, 80) 0.00 GB QUEUED in 0.0 s (transfer time and rate: see the SlabIO.close drain line)
+[phdf5-write rank=0 ds=/enk_full id=360287970189639709] extent=[9,80] offset=[0,0] count=[9,80] mem_dims=[9,80] base=[0,0] valid=[9,80] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/enk_full bytes/rank=5760 coll=1 empty=0  d2h_wait=0.01  spaces=0.02  select=0.00  write=0.22  total=0.25 (ms)  26 MB/s
+  [SlabIO.flush] isdf_tensors_192.h5: 0.00 GB written in 0.0 s (0 MB/s) before creating 'W0_qmunu'
+  [restart_write] W0_qmunu placeholder ALLOCATED (3, 192, 192) 0.00 GB in 0.0 s (no data written)
+  [SlabIO.close] Python dispatch drained in 0.0 s (no queued data); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/isdf_tensors_192.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639711] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.03  select=0.00  write=1.95  total=1.99 (ms)  0 MB/s
+[ffi-debug proc=0] name=psi_parent_y shape=(3, 80, 4, 192) dtype=complex128 spec=P(None, 'x', None, 'y') offset=(0, 0, 0, 0) valid_shape=(3, 80, 4, 192) gshape=(3, 80, 4, 192) local_shapes=[(3, 40, 4, 96)]
+  [restart_write] psi_parent_y (3, 80, 4, 192) 0.00 GB QUEUED in 0.0 s (transfer time and rate: see the SlabIO.close drain line)
+[phdf5-write rank=0 ds=/psi_parent_y id=360287970189639712] extent=[3,80,4,192] offset=[0,0,0,0] count=[3,40,4,96] mem_dims=[3,40,4,96] base=[0,0,0,0] valid=[3,80,4,192] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/psi_parent_y bytes/rank=737280 coll=1 empty=0  d2h_wait=0.02  spaces=0.02  select=0.00  write=2.98  total=3.03 (ms)  247 MB/s
+  [SlabIO.flush] isdf_tensors_192.h5: 0.00 GB written in 0.0 s (115 MB/s) before creating 'psi_parent_y_mun'
+[ffi-debug proc=0] name=psi_parent_y_mun shape=(3, 4, 192, 80) dtype=complex128 spec=P(None, None, 'x', 'y') offset=(0, 0, 0, 0) valid_shape=(3, 4, 192, 80) gshape=(3, 4, 192, 80) local_shapes=[(3, 4, 96, 40)]
+  [restart_write] psi_parent_y_mun (3, 4, 192, 80) 0.00 GB QUEUED in 0.0 s (transfer time and rate: see the SlabIO.close drain line)
+[phdf5-write rank=0 ds=/psi_parent_y_mun id=360287970189639713] extent=[3,4,192,80] offset=[0,0,0,0] count=[3,4,96,40] mem_dims=[3,4,96,40] base=[0,0,0,0] valid=[3,4,192,80] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/psi_parent_y_mun bytes/rank=737280 coll=1 empty=0  d2h_wait=0.02  spaces=0.02  select=0.00  write=3.25  total=3.30 (ms)  227 MB/s
+  [SlabIO.flush] isdf_tensors_192.h5: 0.00 GB written in 0.0 s (135 MB/s) before creating 'psi_parent_y_transverse'
+[ffi-debug proc=0] name=psi_parent_y_transverse shape=(3, 80, 4, 100) dtype=complex128 spec=P(None, 'x', None, 'y') offset=(0, 0, 0, 0) valid_shape=(3, 80, 4, 98) gshape=(3, 80, 4, 98) local_shapes=[(3, 40, 4, 50)]
+  [restart_write] psi_parent_y_transverse (3, 80, 4, 98) 0.00 GB QUEUED in 0.0 s (transfer time and rate: see the SlabIO.close drain line)
+[phdf5-write rank=0 ds=/psi_parent_y_transverse id=360287970189639714] extent=[3,80,4,98] offset=[0,0,0,0] count=[3,40,4,50] mem_dims=[3,40,4,50] base=[0,0,0,0] valid=[3,80,4,98] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/psi_parent_y_transverse bytes/rank=384000 coll=1 empty=0  d2h_wait=0.01  spaces=0.02  select=0.00  write=2.13  total=2.17 (ms)  180 MB/s
+  [SlabIO.flush] isdf_tensors_192.h5: 0.00 GB written in 0.0 s (97 MB/s) before creating 'psi_parent_y_transverse_mun'
+[ffi-debug proc=0] name=psi_parent_y_transverse_mun shape=(3, 4, 100, 80) dtype=complex128 spec=P(None, None, 'x', 'y') offset=(0, 0, 0, 0) valid_shape=(3, 4, 98, 80) gshape=(3, 4, 98, 80) local_shapes=[(3, 4, 50, 40)]
+  [restart_write] psi_parent_y_transverse_mun (3, 4, 98, 80) 0.00 GB QUEUED in 0.0 s (transfer time and rate: see the SlabIO.close drain line)
+  [SlabIO.close] draining 1 pending writes for isdf_tensors_192.h5 …
+[phdf5-write rank=0 ds=/psi_parent_y_transverse_mun id=360287970189639715] extent=[3,4,98,80] offset=[0,0,0,0] count=[3,4,50,40] mem_dims=[3,4,50,40] base=[0,0,0,0] valid=[3,4,98,80] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/psi_parent_y_transverse_mun bytes/rank=384000 coll=1 empty=0  d2h_wait=0.01  spaces=0.02  select=0.00  write=2.53  total=2.56 (ms)  152 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (0.00 GB at 95 MB/s); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+  Chunked ISDF path complete
+[stage 01:51:13] <- ISDF basis + wavefunctions  10.5 s
+[stage 01:51:13] -> minimax tau-axis
+  Minimax static window: x=[1.249525e-01, 6.336169e+00] Ry, R=50.71, nodes=11, fit_err~3.093e-07  [shipped noncrossing/noncrossing_R_92p361895_eps_6p9em08.npz sha256:af400c601bd42568 gen unrecorded (catalog schema v1) backend unrecorded (catalog schema v1) UNCERTIFIED]/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/services/minimax/src/minimax/door.py:449: RuntimeWarning: minimax: served noncrossing/inverse R=50.7086 target 1e-07 -> 11 nodes, max_err 3.86e-08, kappa0 unrecorded | shipped noncrossing/noncrossing_R_92p361895_eps_6p9em08.npz sha256:af400c601bd42568 gen unrecorded (catalog schema v1) backend unrecorded (catalog schema v1) UNCERTIFIED
+
+  return lookup(family=family, target=target,
+[stage 01:51:13] <- minimax tau-axis  0.2 s
+[stage 01:51:13] -> screening (chi0 -> W)
+  [photon head] Hall term: sigma_H = 0 (no static_gauge_hall_file named).  For a Chern-trivial insulator the static Hall coefficient is exactly zero; supply the artifact from get_dipole_mtxels --static-gauge-hall-only to include a measured value.
+q-grid TRS policy [packed photon response]: time reversal MEASURED to hold; 1 of 9 q rows use a TRS-composed partner so q and -q share one spatial realization, and 1 self-negative q rows carry the one-element TRS projector.
+q-grid TRS policy [photon V reader]: time reversal MEASURED to hold; 1 of 9 q rows use a TRS-composed partner so q and -q share one spatial realization, and 1 self-negative q rows carry the one-element TRS projector.
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/v_q_bispinor.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+  [SlabIO.close] Python dispatch drained in 0.0 s (no queued data); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+  [photon response] DECLARED no-pair model Psi=(Psi_L,(alpha_FS/2)*sigma.p*Psi_L), j=c*Psi^dagger*alpha*Psi; bubble-screened Breit; current_contact=ward_subtracted_no_pair; head_correction=full
+  [photon response] packed body N_packed=492 (n_C=192 + 3*n_T=100), nq=3: 0.0029 GB/rank resident for EACH of V and W
+  [distrib_la] shard_map via jax.shard_map (jax 0.9.1)
+[lorrax cusolverMp] library 0.9.1, NCCL 2.29.3, comm path: NCCL, grid: 2x2 (row-major)
+[lorrax cuBLASMp] library 1.0.0, comm path: NCCL
+[cufft_flat_k] flat_k first call: nk=(3,3,1) T=147456 fwd=1 scale=3.333333e-01 inplace=1
+[cufft_flat_k] plan dims=(3,3,1) stride=147456 batch=147456 workspace=0.0 MB
+[cufft_flat_k] workspace arena -> 0.0 MB
+[cufft_flat_k] NVRTC kernels compiled for sm_80 (20200 B cubin, device 0)
+[cufft_flat_k] plan dims=(3,3,1) stride=9216 batch=9216 workspace=0.0 MB
+[cufft_flat_k] plan dims=(3,3,1) stride=76800 batch=76800 workspace=0.0 MB
+[cufft_flat_k] plan dims=(3,3,1) stride=4800 batch=4800 workspace=0.0 MB
+[cufft_flat_k] plan dims=(3,3,1) stride=40000 batch=40000 workspace=0.0 MB
+[cufft_flat_k] plan dims=(3,3,1) stride=2500 batch=2500 workspace=0.0 MB
+  [W solve] w_dyson_solver=distributed -> solve_lu: 'distributed' -> cusolvermp (ONE tile over the 2x2 mesh at P('x','y'), n=492); batched 'auto' -> backend_batched
+  [collective chunk] W Dyson A-build (GEMM): nq=3 q_block=3 (1 executions) max collective/exec = 5.8 MB (cap 134.2 MB, unchunked would be 0.006 GB)
+  dipole.h5 provenance OK (WFN ab4204335c50…, window nval=4 ncond=4 nband=80, bispinor=True, vnl_velocity_sign=+1.0)
+[mem_probe qsgw_head.build_dft_head_response.post_response] in_use=0.01 GB  peak=0.15 GB  live_count=190 live_total=0.04 GB  nvsmi=10.69 GB nvsmi_peak=10.69 GB
+[mem_probe qsgw_head.build_dft_head_response.post_response]   complex128 (3, 492, 492) x 2 = 0.02 GB
+[mem_probe qsgw_head.build_dft_head_response.post_response]   complex128 (9, 192, 192) x 1 = 0.01 GB
+[mem_probe qsgw_head.build_dft_head_response.post_response]   complex128 (3, 4, 192, 80) x 1 = 0.00 GB
+[mem_probe qsgw_head.build_dft_head_response.post_response]   complex128 (3, 80, 4, 192) x 1 = 0.00 GB
+[mem_probe qsgw_head.build_dft_head_response.post_response]   complex128 (3, 246, 246) x 1 = 0.00 GB
+[mem_probe qsgw_head.build_dft_head_response.post_response]   complex128 (3, 4, 100, 80) x 1 = 0.00 GB
+[mem_probe qsgw_head.build_dft_head_response.post_response]   complex128 (3, 80, 4, 100) x 1 = 0.00 GB
+[mem_probe qsgw_head.build_dft_head_response.post_response]   complex128 (9, 96, 96) x 1 = 0.00 GB
+[mem_probe qsgw_head.build_dft_head_response.post_response]   int32 (3, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe qsgw_head.build_dft_head_response.post_response]   float64 (9, 80, 80) x 1 = 0.00 GB
+  [photon head] Gamma-cell completion applied: bare <D> into V, charge S00/wing head into W; hall_source=none: sigma_H = 0 (no static_gauge_hall_file); ward=0.000e+00, hermiticity=2.191e-17, dyson_forward_bound=6.733e-15
+  static photon route: full_static_cohsex (sixteen chi blocks, one packed Dyson solve)
+  static photon response: approximation=gamma_completed_no_pair_static_photon_v1, current_model=positive_energy_kinetic_balance_dirac_current_v1, current_contact=ward_subtracted_no_pair, packed_extent=492
+Photon Sigma   : static packed route -- all sixteen Lorentz blocks contracted once; Sigma_xc = Sigma_SX + Sigma_COH and the per-state CC / CT+TC / TT split is written to sigma_diag.dat.
+Photon head    : Gamma-cell completion applied (bare <D> into V, charge S00/wing head into W); hall_source=none: sigma_H = 0 (no static_gauge_hall_file); sigma_H=[0.0, 0.0, 0.0] bohr^-1; ward=0.000e+00; hermiticity=2.191e-17; dyson_forward_bound=6.733e-15; cubature_orders=(16, 24, 32)
+Photon WS cert : orders=(16, 24, 32); nodes=(1536, 3456, 6144); final_error_ratio=3.678e-02; max_dyson_backward_residual=4.095e-17
+[stage 01:51:45] <- screening (chi0 -> W)  31.7 s
+  Parent-k Green carrier detached from the screening view (the Sigma view keeps it).
+[stage 01:51:45] -> gw_jax.sigma
+[boundary] {"label": "sigma_restore", "host_ms": 295.57626001769677, "compiles": 3, "compile_s": 0.22492710503865965, "key": [0, 0], "term": "V"}
+[fft_ffi] flat-k 3-D FFTs -> cuFFT strided CUDA FFI handler (lorrax_mklfft_gw_conv): cufftPlanMany64 advanced layout (istride=T, idist=1 — the stride-descriptor analog) reading the dot-layout tile in place; jnp.fft norm scales applied by a fused device kernel.
+[boundary] {"label": "sigma_factory", "host_ms": 1568.1718989799265, "compiles": 23, "compile_s": 1.317409117036732, "options": {"vertex_pair": [0, 0]}}
+[cufft_flat_k] gw_conv first call: nk=(3,3,1) G trail (a=4,mx=96,b=4,my=96) Tg=147456 Tv=9216 scale_i=3.333333e-01 scale_f=-1.111111e-01 aliased=1 vr_arena=1.3 MB
+[cufft_flat_k] V_R arena -> 1.3 MB
+[boundary] {"label": "sigma_block", "host_ms": 419.8380339948926, "compiles": 1, "compile_s": 0.32160318599198945, "options": {"vertex_pair": [0, 0]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1476.9767319958191, "compiles": 21, "compile_s": 1.2567240150819998, "options": {"vertex_pair": [0, 0], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 437.6547819992993, "compiles": 1, "compile_s": 0.3280338470067363, "options": {"vertex_pair": [0, 0], "q0_only": true}}
+  packed photon Sigma term 0 block (0, 0) complete
+[boundary] {"label": "sigma_restore", "host_ms": 681.5395430021454, "compiles": 5, "compile_s": 0.5411413459805772, "key": [0, 1], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1612.519507005345, "compiles": 21, "compile_s": 1.3461385628615972, "options": {"vertex_pair": [0, 1]}}
+[boundary] {"label": "sigma_block", "host_ms": 425.0185939890798, "compiles": 1, "compile_s": 0.3137537070142571, "options": {"vertex_pair": [0, 1]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1587.7493959851563, "compiles": 21, "compile_s": 1.3581161140755285, "options": {"vertex_pair": [0, 1], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 468.88213499914855, "compiles": 1, "compile_s": 0.3294324449962005, "options": {"vertex_pair": [0, 1], "q0_only": true}}
+  packed photon Sigma term 0 block (0, 1) complete
+[boundary] {"label": "sigma_restore", "host_ms": 624.298851005733, "compiles": 4, "compile_s": 0.5014704750210512, "key": [0, 2], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1574.695421004435, "compiles": 21, "compile_s": 1.3449139149743132, "options": {"vertex_pair": [0, 2]}}
+[boundary] {"label": "sigma_block", "host_ms": 421.3274370122235, "compiles": 1, "compile_s": 0.30999902699841186, "options": {"vertex_pair": [0, 2]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1588.8883209845517, "compiles": 21, "compile_s": 1.354795879975427, "options": {"vertex_pair": [0, 2], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 449.15873499121517, "compiles": 1, "compile_s": 0.32981182998628356, "options": {"vertex_pair": [0, 2], "q0_only": true}}
+  packed photon Sigma term 0 block (0, 2) complete
+[boundary] {"label": "sigma_restore", "host_ms": 620.3200870077126, "compiles": 4, "compile_s": 0.5035783250059467, "key": [0, 3], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1587.5169150240254, "compiles": 21, "compile_s": 1.3562611670058686, "options": {"vertex_pair": [0, 3]}}
+[boundary] {"label": "sigma_block", "host_ms": 416.967786004534, "compiles": 1, "compile_s": 0.31313243400654756, "options": {"vertex_pair": [0, 3]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1588.8387659797445, "compiles": 21, "compile_s": 1.3522703899361659, "options": {"vertex_pair": [0, 3], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 454.0489249920938, "compiles": 1, "compile_s": 0.33079378100228496, "options": {"vertex_pair": [0, 3], "q0_only": true}}
+  packed photon Sigma term 0 block (0, 3) complete
+[boundary] {"label": "sigma_restore", "host_ms": 697.8344350063708, "compiles": 5, "compile_s": 0.5458014000614639, "key": [1, 0], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1635.0934859947301, "compiles": 21, "compile_s": 1.4036384390492458, "options": {"vertex_pair": [1, 0]}}
+[boundary] {"label": "sigma_block", "host_ms": 456.09622899792157, "compiles": 1, "compile_s": 0.3456525910005439, "options": {"vertex_pair": [1, 0]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1652.356853010133, "compiles": 21, "compile_s": 1.3970851019839756, "options": {"vertex_pair": [1, 0], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 479.91654998622835, "compiles": 1, "compile_s": 0.36367864499334246, "options": {"vertex_pair": [1, 0], "q0_only": true}}
+  packed photon Sigma term 0 block (1, 0) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1908.5573320044205, "compiles": 11, "compile_s": 1.5489327159593813, "key": [1, 1], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1714.6161629934795, "compiles": 21, "compile_s": 1.4601909529883415, "options": {"vertex_pair": [1, 1]}}
+[boundary] {"label": "sigma_block", "host_ms": 442.42015699273907, "compiles": 1, "compile_s": 0.33919036798761226, "options": {"vertex_pair": [1, 1]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1727.597468008753, "compiles": 21, "compile_s": 1.459265587036498, "options": {"vertex_pair": [1, 1], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 450.4599549982231, "compiles": 1, "compile_s": 0.34706762101268396, "options": {"vertex_pair": [1, 1], "q0_only": true}}
+  packed photon Sigma term 0 block (1, 1) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1893.2490419829264, "compiles": 10, "compile_s": 1.4916210769442841, "key": [1, 2], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1758.933781995438, "compiles": 21, "compile_s": 1.4734972240694333, "options": {"vertex_pair": [1, 2]}}
+[boundary] {"label": "sigma_block", "host_ms": 425.3890519903507, "compiles": 1, "compile_s": 0.32144020101986825, "options": {"vertex_pair": [1, 2]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1726.429044996621, "compiles": 21, "compile_s": 1.474350284988759, "options": {"vertex_pair": [1, 2], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 450.99705501343124, "compiles": 1, "compile_s": 0.35053780098678544, "options": {"vertex_pair": [1, 2], "q0_only": true}}
+  packed photon Sigma term 0 block (1, 2) complete
+[boundary] {"label": "sigma_restore", "host_ms": 2029.2011990095489, "compiles": 10, "compile_s": 1.4987920519779436, "key": [1, 3], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1739.5459239778575, "compiles": 21, "compile_s": 1.4790328930539545, "options": {"vertex_pair": [1, 3]}}
+[boundary] {"label": "sigma_block", "host_ms": 424.94739600806497, "compiles": 1, "compile_s": 0.32315376901533455, "options": {"vertex_pair": [1, 3]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1732.723082008306, "compiles": 21, "compile_s": 1.4737318709958345, "options": {"vertex_pair": [1, 3], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 521.7092820093967, "compiles": 1, "compile_s": 0.3426467910176143, "options": {"vertex_pair": [1, 3], "q0_only": true}}
+  packed photon Sigma term 0 block (1, 3) complete
+[boundary] {"label": "sigma_restore", "host_ms": 643.4156959876418, "compiles": 4, "compile_s": 0.5054579340212513, "key": [2, 0], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1676.047874003416, "compiles": 21, "compile_s": 1.4207846368954051, "options": {"vertex_pair": [2, 0]}}
+[boundary] {"label": "sigma_block", "host_ms": 475.1717729959637, "compiles": 1, "compile_s": 0.36895235601696186, "options": {"vertex_pair": [2, 0]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1714.6541450056247, "compiles": 21, "compile_s": 1.4130053879634943, "options": {"vertex_pair": [2, 0], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 470.4708110075444, "compiles": 1, "compile_s": 0.362710159010021, "options": {"vertex_pair": [2, 0], "q0_only": true}}
+  packed photon Sigma term 0 block (2, 0) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1957.8423800121527, "compiles": 10, "compile_s": 1.611691365018487, "key": [2, 1], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1878.0929240165278, "compiles": 21, "compile_s": 1.5555134189780802, "options": {"vertex_pair": [2, 1]}}
+[boundary] {"label": "sigma_block", "host_ms": 423.177830001805, "compiles": 1, "compile_s": 0.32342521302052774, "options": {"vertex_pair": [2, 1]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1742.8001750085969, "compiles": 21, "compile_s": 1.4796556410146877, "options": {"vertex_pair": [2, 1], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 463.6295750096906, "compiles": 1, "compile_s": 0.34949066300760023, "options": {"vertex_pair": [2, 1], "q0_only": true}}
+  packed photon Sigma term 0 block (2, 1) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1853.0142160016112, "compiles": 10, "compile_s": 1.4902267370198388, "key": [2, 2], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1764.1089830140118, "compiles": 21, "compile_s": 1.4744615220406558, "options": {"vertex_pair": [2, 2]}}
+[boundary] {"label": "sigma_block", "host_ms": 430.2547930274159, "compiles": 1, "compile_s": 0.3288307700131554, "options": {"vertex_pair": [2, 2]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1737.5560500076972, "compiles": 21, "compile_s": 1.4728706409514416, "options": {"vertex_pair": [2, 2], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 452.01767099206336, "compiles": 1, "compile_s": 0.3454980220121797, "options": {"vertex_pair": [2, 2], "q0_only": true}}
+  packed photon Sigma term 0 block (2, 2) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1857.7261450118385, "compiles": 10, "compile_s": 1.5004956270277034, "key": [2, 3], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1750.594673998421, "compiles": 21, "compile_s": 1.479513119062176, "options": {"vertex_pair": [2, 3]}}
+[boundary] {"label": "sigma_block", "host_ms": 424.0400879934896, "compiles": 1, "compile_s": 0.3239144649996888, "options": {"vertex_pair": [2, 3]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1742.6884539891034, "compiles": 21, "compile_s": 1.4823140110820532, "options": {"vertex_pair": [2, 3], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 465.715705009643, "compiles": 1, "compile_s": 0.3458529250056017, "options": {"vertex_pair": [2, 3], "q0_only": true}}
+  packed photon Sigma term 0 block (2, 3) complete
+[boundary] {"label": "sigma_restore", "host_ms": 637.8338060167152, "compiles": 4, "compile_s": 0.5056117150234058, "key": [3, 0], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1680.737077986123, "compiles": 21, "compile_s": 1.4053134240675718, "options": {"vertex_pair": [3, 0]}}
+[boundary] {"label": "sigma_block", "host_ms": 457.25063400459476, "compiles": 1, "compile_s": 0.3480507410131395, "options": {"vertex_pair": [3, 0]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1678.9281549863517, "compiles": 21, "compile_s": 1.4060373940155841, "options": {"vertex_pair": [3, 0], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 473.62977798911743, "compiles": 1, "compile_s": 0.3684438579948619, "options": {"vertex_pair": [3, 0], "q0_only": true}}
+  packed photon Sigma term 0 block (3, 0) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1839.4599629973527, "compiles": 10, "compile_s": 1.491991480026627, "key": [3, 1], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1741.3266579969786, "compiles": 21, "compile_s": 1.4680889139999636, "options": {"vertex_pair": [3, 1]}}
+[boundary] {"label": "sigma_block", "host_ms": 426.54938698979095, "compiles": 1, "compile_s": 0.32314058698830195, "options": {"vertex_pair": [3, 1]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1726.5608769957907, "compiles": 21, "compile_s": 1.4694673600315582, "options": {"vertex_pair": [3, 1], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 446.37591700302437, "compiles": 1, "compile_s": 0.34389347000978887, "options": {"vertex_pair": [3, 1], "q0_only": true}}
+  packed photon Sigma term 0 block (3, 1) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1919.459385011578, "compiles": 10, "compile_s": 1.5580366550129838, "key": [3, 2], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1761.2415189796593, "compiles": 21, "compile_s": 1.4765564449771773, "options": {"vertex_pair": [3, 2]}}
+[boundary] {"label": "sigma_block", "host_ms": 432.4105359846726, "compiles": 1, "compile_s": 0.32498624999425374, "options": {"vertex_pair": [3, 2]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1734.3664609943517, "compiles": 21, "compile_s": 1.4752511540427804, "options": {"vertex_pair": [3, 2], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 451.46623300388455, "compiles": 1, "compile_s": 0.34597133300849237, "options": {"vertex_pair": [3, 2], "q0_only": true}}
+  packed photon Sigma term 0 block (3, 2) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1828.4876469988376, "compiles": 10, "compile_s": 1.4820745770120993, "key": [3, 3], "term": "V"}
+[boundary] {"label": "sigma_factory", "host_ms": 1724.035085993819, "compiles": 21, "compile_s": 1.463150871975813, "options": {"vertex_pair": [3, 3]}}
+[boundary] {"label": "sigma_block", "host_ms": 427.0206890068948, "compiles": 1, "compile_s": 0.3229844549787231, "options": {"vertex_pair": [3, 3]}}
+[boundary] {"label": "sigma_factory", "host_ms": 1740.7123679877259, "compiles": 21, "compile_s": 1.4628075829823501, "options": {"vertex_pair": [3, 3], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 448.593190027168, "compiles": 1, "compile_s": 0.3491759480093606, "options": {"vertex_pair": [3, 3], "q0_only": true}}
+  packed photon Sigma term 0 block (3, 3) complete
+[boundary] {"label": "sigma_restore", "host_ms": 217.26766499341466, "compiles": 2, "compile_s": 0.16919115497148596, "key": [0, 0], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.0665989937260747, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 0]}}
+[boundary] {"label": "sigma_block", "host_ms": 2.8535059827845544, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 0]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06881399895064533, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 0], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 4.105239000637084, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 0], "q0_only": true}}
+  packed photon Sigma term 1 block (0, 0) complete
+[boundary] {"label": "sigma_restore", "host_ms": 637.907317985082, "compiles": 4, "compile_s": 0.5082700419879984, "key": [0, 1], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06511600804515183, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 1]}}
+[boundary] {"label": "sigma_block", "host_ms": 5.186321999644861, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 1]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.07003502105362713, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 1], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 2.3144209990277886, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 1], "q0_only": true}}
+  packed photon Sigma term 1 block (0, 1) complete
+[boundary] {"label": "sigma_restore", "host_ms": 667.1816930174828, "compiles": 4, "compile_s": 0.5136014340096153, "key": [0, 2], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.16387697542086244, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 2]}}
+[boundary] {"label": "sigma_block", "host_ms": 28.166899021016434, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 2]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.0623510277364403, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 2], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 2.134643989847973, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 2], "q0_only": true}}
+  packed photon Sigma term 1 block (0, 2) complete
+[boundary] {"label": "sigma_restore", "host_ms": 659.2300960037392, "compiles": 4, "compile_s": 0.5059996359923389, "key": [0, 3], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06346299778670073, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 3]}}
+[boundary] {"label": "sigma_block", "host_ms": 2.471915999194607, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 3]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.04347399226389825, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 3], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 2.1115890122018754, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 3], "q0_only": true}}
+  packed photon Sigma term 1 block (0, 3) complete
+[boundary] {"label": "sigma_restore", "host_ms": 798.7129860266577, "compiles": 4, "compile_s": 0.5863525339809712, "key": [1, 0], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.0749850005377084, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 0]}}
+[boundary] {"label": "sigma_block", "host_ms": 18.368857010500506, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 0]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.0779910187702626, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 0], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 20.581101009156555, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 0], "q0_only": true}}
+  packed photon Sigma term 1 block (1, 0) complete
+[boundary] {"label": "sigma_restore", "host_ms": 2441.723385010846, "compiles": 10, "compile_s": 1.9571553060377482, "key": [1, 1], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06380400736816227, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 1]}}
+[boundary] {"label": "sigma_block", "host_ms": 64.39111099462025, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 1]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06593801663257182, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 1], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 43.40102698188275, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 1], "q0_only": true}}
+  packed photon Sigma term 1 block (1, 1) complete
+[boundary] {"label": "sigma_restore", "host_ms": 2634.2422690067906, "compiles": 10, "compile_s": 1.7959122529719025, "key": [1, 2], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.062431005062535405, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 2]}}
+[boundary] {"label": "sigma_block", "host_ms": 57.39493400324136, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 2]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.05657898145727813, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 2], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 2.2725810122210532, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 2], "q0_only": true}}
+  packed photon Sigma term 1 block (1, 2) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1859.6112020022701, "compiles": 10, "compile_s": 1.4861868229636457, "key": [1, 3], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.08366198744624853, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 3]}}
+[boundary] {"label": "sigma_block", "host_ms": 2.149881998775527, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 3]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.046640983782708645, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 3], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 1.8542610050644726, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 3], "q0_only": true}}
+  packed photon Sigma term 1 block (1, 3) complete
+[boundary] {"label": "sigma_restore", "host_ms": 656.1522060073912, "compiles": 4, "compile_s": 0.5049198439810425, "key": [2, 0], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06407400360330939, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 0]}}
+[boundary] {"label": "sigma_block", "host_ms": 70.25302099646069, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 0]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.043153995648026466, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 0], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 69.80907099205069, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 0], "q0_only": true}}
+  packed photon Sigma term 1 block (2, 0) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1915.7565560017247, "compiles": 10, "compile_s": 1.4892046650056727, "key": [2, 1], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.0636629993095994, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 1]}}
+[boundary] {"label": "sigma_block", "host_ms": 67.40941500174813, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 1]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.04404500941745937, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 1], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 69.69042101991363, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 1], "q0_only": true}}
+  packed photon Sigma term 1 block (2, 1) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1867.2922050172929, "compiles": 10, "compile_s": 1.5196761669940315, "key": [2, 2], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.07294100942090154, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 2]}}
+[boundary] {"label": "sigma_block", "host_ms": 2.1635890007019043, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 2]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.052952003898099065, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 2], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 1.8846989842131734, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 2], "q0_only": true}}
+  packed photon Sigma term 1 block (2, 2) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1823.1828860007226, "compiles": 10, "compile_s": 1.494069122010842, "key": [2, 3], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06429501809179783, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 3]}}
+[boundary] {"label": "sigma_block", "host_ms": 3.586854989407584, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 3]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.04184100544080138, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 3], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 2.507575001800433, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 3], "q0_only": true}}
+  packed photon Sigma term 1 block (2, 3) complete
+[boundary] {"label": "sigma_restore", "host_ms": 629.0485559729859, "compiles": 4, "compile_s": 0.5036404469574336, "key": [3, 0], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.07377300062216818, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 0]}}
+[boundary] {"label": "sigma_block", "host_ms": 2.45207900297828, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 0]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.043503998313099146, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 0], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 2.1073700045235455, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 0], "q0_only": true}}
+  packed photon Sigma term 1 block (3, 0) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1994.0733700059354, "compiles": 10, "compile_s": 1.6457987650064752, "key": [3, 1], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06347298040054739, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 1]}}
+[boundary] {"label": "sigma_block", "host_ms": 12.672898999881, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 1]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.043494015699252486, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 1], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 1.819913974031806, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 1], "q0_only": true}}
+  packed photon Sigma term 1 block (3, 1) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1957.1295159985311, "compiles": 10, "compile_s": 1.542608138959622, "key": [3, 2], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06327297887764871, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 2]}}
+[boundary] {"label": "sigma_block", "host_ms": 2.608199982205406, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 2]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.04228201578371227, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 2], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 2.157918002922088, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 2], "q0_only": true}}
+  packed photon Sigma term 1 block (3, 2) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1845.8076940150931, "compiles": 10, "compile_s": 1.4682113149901852, "key": [3, 3], "term": "W"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06391401984728873, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 3]}}
+[boundary] {"label": "sigma_block", "host_ms": 3.8559259846806526, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 3]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.03999701584689319, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 3], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 1.7592969816178083, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 3], "q0_only": true}}
+  packed photon Sigma term 1 block (3, 3) complete
+[boundary] {"label": "sigma_restore", "host_ms": 261.71399699524045, "compiles": 3, "compile_s": 0.2037675750325434, "key": [0, 0], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06686901906505227, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 0]}}
+[boundary] {"label": "sigma_block", "host_ms": 470.8698939939495, "compiles": 2, "compile_s": 0.34733434300869703, "options": {"vertex_pair": [0, 0]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.0661080121062696, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 0], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 437.3158240050543, "compiles": 1, "compile_s": 0.34499886102275923, "options": {"vertex_pair": [0, 0], "q0_only": true}}
+  packed photon Sigma term 2 block (0, 0) complete
+[boundary] {"label": "sigma_restore", "host_ms": 664.3392779806163, "compiles": 5, "compile_s": 0.5356710769701749, "key": [0, 1], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.0656970078125596, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 1]}}
+[boundary] {"label": "sigma_block", "host_ms": 410.7345049851574, "compiles": 1, "compile_s": 0.3034857189923059, "options": {"vertex_pair": [0, 1]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.07078697672113776, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 1], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 487.37112601520494, "compiles": 1, "compile_s": 0.32183330500265583, "options": {"vertex_pair": [0, 1], "q0_only": true}}
+  packed photon Sigma term 2 block (0, 1) complete
+[boundary] {"label": "sigma_restore", "host_ms": 638.4983330208343, "compiles": 4, "compile_s": 0.5050114640034735, "key": [0, 2], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.0633730087429285, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 2]}}
+[boundary] {"label": "sigma_block", "host_ms": 429.06657099956647, "compiles": 1, "compile_s": 0.3088017230038531, "options": {"vertex_pair": [0, 2]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06373401265591383, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 2], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 437.4468669993803, "compiles": 1, "compile_s": 0.3229907770000864, "options": {"vertex_pair": [0, 2], "q0_only": true}}
+  packed photon Sigma term 2 block (0, 2) complete
+[boundary] {"label": "sigma_restore", "host_ms": 650.546481978381, "compiles": 4, "compile_s": 0.5069902040122543, "key": [0, 3], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06254101754166186, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 3]}}
+[boundary] {"label": "sigma_block", "host_ms": 410.0013049901463, "compiles": 1, "compile_s": 0.30698388200835325, "options": {"vertex_pair": [0, 3]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.061408994952216744, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [0, 3], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 458.07034097379074, "compiles": 1, "compile_s": 0.32505480299005285, "options": {"vertex_pair": [0, 3], "q0_only": true}}
+  packed photon Sigma term 2 block (0, 3) complete
+[boundary] {"label": "sigma_restore", "host_ms": 679.6048779797275, "compiles": 5, "compile_s": 0.5384420129994396, "key": [1, 0], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06782097625546157, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 0]}}
+[boundary] {"label": "sigma_block", "host_ms": 454.87846998730674, "compiles": 1, "compile_s": 0.34603811299894005, "options": {"vertex_pair": [1, 0]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06648799171671271, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 0], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 469.87171200453304, "compiles": 1, "compile_s": 0.36568941400037147, "options": {"vertex_pair": [1, 0], "q0_only": true}}
+  packed photon Sigma term 2 block (1, 0) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1937.330490007298, "compiles": 11, "compile_s": 1.5229706059326418, "key": [1, 1], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.09863098966889083, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 1]}}
+[boundary] {"label": "sigma_block", "host_ms": 419.47965798317455, "compiles": 1, "compile_s": 0.31549043400445953, "options": {"vertex_pair": [1, 1]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06801099516451359, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 1], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 439.15572701371275, "compiles": 1, "compile_s": 0.33974017802393064, "options": {"vertex_pair": [1, 1], "q0_only": true}}
+  packed photon Sigma term 2 block (1, 1) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1869.408531987574, "compiles": 10, "compile_s": 1.5028603360406123, "key": [1, 2], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06336299702525139, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 2]}}
+[boundary] {"label": "sigma_block", "host_ms": 434.91980401449837, "compiles": 1, "compile_s": 0.3362427139945794, "options": {"vertex_pair": [1, 2]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.060335994930937886, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 2], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 438.3275840082206, "compiles": 1, "compile_s": 0.3386080930067692, "options": {"vertex_pair": [1, 2], "q0_only": true}}
+  packed photon Sigma term 2 block (1, 2) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1880.488269001944, "compiles": 10, "compile_s": 1.4903731019876432, "key": [1, 3], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.060937978560104966, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 3]}}
+[boundary] {"label": "sigma_block", "host_ms": 424.9691180011723, "compiles": 1, "compile_s": 0.31969803699757904, "options": {"vertex_pair": [1, 3]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.060085993027314544, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [1, 3], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 438.4217660117429, "compiles": 1, "compile_s": 0.3409456890076399, "options": {"vertex_pair": [1, 3], "q0_only": true}}
+  packed photon Sigma term 2 block (1, 3) complete
+[boundary] {"label": "sigma_restore", "host_ms": 629.8548380145803, "compiles": 4, "compile_s": 0.5063861889648251, "key": [2, 0], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.070957001298666, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 0]}}
+[boundary] {"label": "sigma_block", "host_ms": 473.0162729974836, "compiles": 1, "compile_s": 0.34041372800129466, "options": {"vertex_pair": [2, 0]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06256101187318563, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 0], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 484.92104597971775, "compiles": 1, "compile_s": 0.3637362899899017, "options": {"vertex_pair": [2, 0], "q0_only": true}}
+  packed photon Sigma term 2 block (2, 0) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1844.4230339955539, "compiles": 10, "compile_s": 1.5004707220359705, "key": [2, 1], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.07167801959440112, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 1]}}
+[boundary] {"label": "sigma_block", "host_ms": 442.87917800829746, "compiles": 1, "compile_s": 0.320961963996524, "options": {"vertex_pair": [2, 1]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06293199840001762, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 1], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 451.880798995262, "compiles": 1, "compile_s": 0.3455656150181312, "options": {"vertex_pair": [2, 1], "q0_only": true}}
+  packed photon Sigma term 2 block (2, 1) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1880.4898109810892, "compiles": 10, "compile_s": 1.5227723430434708, "key": [2, 2], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06284099072217941, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 2]}}
+[boundary] {"label": "sigma_block", "host_ms": 422.35827300464734, "compiles": 1, "compile_s": 0.3218752419925295, "options": {"vertex_pair": [2, 2]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06110899266786873, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 2], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 450.3359369991813, "compiles": 1, "compile_s": 0.3420393980049994, "options": {"vertex_pair": [2, 2], "q0_only": true}}
+  packed photon Sigma term 2 block (2, 2) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1848.0341469985433, "compiles": 10, "compile_s": 1.5062427609809674, "key": [2, 3], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06298199878074229, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 3]}}
+[boundary] {"label": "sigma_block", "host_ms": 430.3057820070535, "compiles": 1, "compile_s": 0.32066885600215755, "options": {"vertex_pair": [2, 3]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06367298192344606, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [2, 3], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 451.8534459930379, "compiles": 1, "compile_s": 0.3486431440105662, "options": {"vertex_pair": [2, 3], "q0_only": true}}
+  packed photon Sigma term 2 block (2, 3) complete
+[boundary] {"label": "sigma_restore", "host_ms": 659.0686159906909, "compiles": 4, "compile_s": 0.5122060459689237, "key": [3, 0], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.0668589782435447, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 0]}}
+[boundary] {"label": "sigma_block", "host_ms": 453.06851898203604, "compiles": 1, "compile_s": 0.344430587021634, "options": {"vertex_pair": [3, 0]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06019702414050698, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 0], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 474.97889402438886, "compiles": 1, "compile_s": 0.3661091350077186, "options": {"vertex_pair": [3, 0], "q0_only": true}}
+  packed photon Sigma term 2 block (3, 0) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1868.0054980213754, "compiles": 10, "compile_s": 1.5003255149931647, "key": [3, 1], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06261098315007985, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 1]}}
+[boundary] {"label": "sigma_block", "host_ms": 458.5270780080464, "compiles": 1, "compile_s": 0.3244702359952498, "options": {"vertex_pair": [3, 1]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.11996200191788375, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 1], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 444.41364900558256, "compiles": 1, "compile_s": 0.34026298800017685, "options": {"vertex_pair": [3, 1], "q0_only": true}}
+  packed photon Sigma term 2 block (3, 1) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1904.762973979814, "compiles": 10, "compile_s": 1.5007818159647286, "key": [3, 2], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06682000821456313, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 2]}}
+[boundary] {"label": "sigma_block", "host_ms": 422.66940500121564, "compiles": 1, "compile_s": 0.32249946097726934, "options": {"vertex_pair": [3, 2]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06143900100141764, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 2], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 447.61552900308743, "compiles": 1, "compile_s": 0.3496791899960954, "options": {"vertex_pair": [3, 2], "q0_only": true}}
+  packed photon Sigma term 2 block (3, 2) complete
+[boundary] {"label": "sigma_restore", "host_ms": 1836.7596050084103, "compiles": 10, "compile_s": 1.4788233860163018, "key": [3, 3], "term": "W-V"}
+[boundary] {"label": "sigma_factory", "host_ms": 0.06529601523652673, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 3]}}
+[boundary] {"label": "sigma_block", "host_ms": 421.9462039764039, "compiles": 1, "compile_s": 0.322066612978233, "options": {"vertex_pair": [3, 3]}}
+[boundary] {"label": "sigma_factory", "host_ms": 0.05874401540495455, "compiles": 0, "compile_s": 0.0, "options": {"vertex_pair": [3, 3], "q0_only": true}}
+[boundary] {"label": "sigma_block", "host_ms": 441.8197159830015, "compiles": 1, "compile_s": 0.3425487630011048, "options": {"vertex_pair": [3, 3], "q0_only": true}}
+  packed photon Sigma term 2 block (3, 3) complete
+[boundary] {"label": "sigma_static_stage", "host_ms": 151373.49056298262, "compiles": 1135, "compile_s": 120.73990720917936}
+  V_H: exact FFT-grid matrix built live in G-space (ρ: one psum; Poisson: replicated; matrix elements: two-axis band sharded; star broadcast stays on device).
+[stage 01:54:16]   -> vh_collective_bootstrap
+[stage 01:54:16]   <- vh_collective_bootstrap  0.0 s
+
+Building valence density from 26 occupied bands (P=4, 9 k-points)...
+[stage 01:54:16]   -> vh_rho
+    rho + signed J/c sweep: 18 (k, band-chunk) items over P=4 ranks; this rank has 5
+    rho: item 1/5 (k=1/9, bands [0,13))...
+[stage 01:54:17]     -> vh_rho_psum
+[stage 01:54:17]     <- vh_rho_psum  0.0 s
+[stage 01:54:17]   <- vh_rho  0.7 s
+    Dirac-current G=0 diagnostic (J=j/c; gauged V_NL current is absent): ||J0||=1.626803e-13, ||J||=9.621199e-12, ratio=1.690853e-02; periodic TT sets G=0 to zero
+    Dirac-current symmetry projection: rows=24 (antiunitary=12), movement=1.000000e+00, residual=3.713324e-17 <= 2.729417e-11 (delta_R=2.695311e-11 + floating=3.410605e-13); alpha.A matrix remains on the authenticated star wedge
+[stage 01:54:17]   -> vh_transverse_field
+[stage 01:54:21]   <- vh_transverse_field  3.9 s
+    rho symmetrisation: 12 space-group operations, max|Δρ|/max|ρ| = 5.447e-11
+    rho normalisation: ∫ρ d³r = 26.000787 e (expected 26.000000, rel err 3.03e-05)
+    Hartree Coulomb: 2D slab-truncated (Ismail-Beigi)
+    Hartree energy (½∫ρV_H) = 436.787959 Ry
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=1507584  prev_h2d_wait=0.02  pin+zero=0.10  spaces=0.02  select=0.01  read=2.97  h2d_setup=0.09  total=3.21 (ms)  [selected_elts=186464]
+
+⟨mk|V_H|nk⟩ + <m|sum_i alpha_i A_i|n>: one k-scan over 3 STAR-WEDGE k-points (broadcast to 9 full-BZ k), 32 bands sharded over P=4; charge nspinor=4...
+[stage 01:54:23]   -> vh_matrix
+[stage 01:54:23]     -> mtxel.sweep
+[stage 01:54:23]     <- mtxel.sweep  0.4 s
+[stage 01:54:23]   <- vh_matrix  0.6 s
+[stage 01:54:23]   -> vh_transverse_matrix_boundary
+[stage 01:54:23]   <- vh_transverse_matrix_boundary  0.0 s
+[stage 01:54:23] <- gw_jax.sigma  158.5 s
+  Bare Σ_X diagonal (eV), k=0: -40.9724  -40.9724  -31.4175  -31.4175  -30.3326  -30.3326  -31.8619  -31.8619
+  kin_ion: pristine T+V_loc+V_NL; Hartree is built live in G-space.
+  [SlabIO.phdf5_ffi] kin_ion.h5 mode=r bytes=315248 file stripe_count=1 stripe_size=1048576 B cb_nodes=1/4 (the file's inode, not write policy). WARNING: one-stripe inode forces cb_nodes=1 and a single read aggregator at every rank count; create the destination directory with the intended layout before producing the file or make a separately authenticated migrated copy
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/02_preprocess/kin_ion.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 1
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 1
+  romio_filesystem_type                    = CRAY ADIO:
+  [SlabIO.close] Python dispatch drained in 0.0 s (no queued data); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+[stage 01:54:24] -> gw_jax.solve_qp
+[stage 01:54:24] <- gw_jax.solve_qp  0.0 s
+[stage 01:54:24] -> gw_jax.qp_eigh
+[stage 01:54:24] <- gw_jax.qp_eigh  0.3 s
+  QP WFN (one-shot): skipped — Σ on 9 k-points but WFN carries 3 (IBZ); the one-shot dump only supports IBZ-Σ. Set debug.write_wfn_h5=false to silence.
+  Sigma freq debug: sigma_freq_debug.dat
+  H0 check: implied Vxc = E_DFT - (kin_ion + V_H[exact, live G-space]) in [-25.521, -12.859] eV over 90 (k,n)
+  qp_wfn_rotations: k_storage='auto' -> FULL BZ; the full-BZ rows are not the unfold of the wedge rows (E_qp_nk_hartree max|Δ| = 3.108624e-15, E_qp_nk_rydberg max|Δ| = 6.217249e-15, U_mnk max|Δ| = 7.204759e-01).
+
+  Sigma diag:   /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/sigma_diag.dat
+  BGW eqp0:     /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/eqp0.dat
+  BGW eqp1:     /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/eqp1.dat
+  Restart:      /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/isdf_tensors_192.h5
+
+--- Timing ---
+Total recorded: 207.313 s
+Section                                            Count    Total[s]     Self[s]      %
+gw_jax.startup                                         1       0.116       0.116    0.1
+gw_jax.isdf                                            1      10.485       3.206    5.1
+  gw_jax.load_centroid_wfns                            1       2.843       0.143    1.4
+    load_centroids.loader_load                         5       0.358       0.358    0.2
+    load_centroids.gflat_to_rmu                        5       0.417       0.417    0.2
+    load_centroids.reshard_insert                      5       1.925       1.925    0.9
+  gw_jax.load_centroid_wfns_current                    1       0.562       0.115    0.3
+    load_centroids.loader_load                         5       0.021       0.021    0.0
+    load_centroids.gflat_to_rmu                        5       0.318       0.318    0.2
+    load_centroids.reshard_insert                      5       0.107       0.107    0.1
+  gw_jax.wavefunction_setup                            2       0.002       0.002    0.0
+  gw_jax.V_q_compute                                   1       3.872       3.872    1.9
+gw_jax.minimax_quadrature                              1       0.153       0.153    0.1
+gw_jax.screening                                       1      31.741      31.741   15.3
+gw_jax.sigma                                           1     158.535     153.324   76.5
+  vh_collective_bootstrap                              1       0.026       0.026    0.0
+  vh_rho                                               1       0.690       0.689    0.3
+    vh_rho_psum                                        1       0.001       0.001    0.0
+  vh_transverse_field                                  1       3.905       3.905    1.9
+  vh_matrix                                            1       0.588       0.236    0.3
+    mtxel.sweep                                        1       0.352       0.352    0.2
+  vh_transverse_matrix_boundary                        1       0.002       0.002    0.0
+gw_jax.kin_ion_load                                    1       0.048       0.048    0.0
+gw_jax.solve_qp                                        1       0.001       0.001    0.0
+gw_jax.qp_eigh                                         1       0.285       0.285    0.1
+gw_jax.output                                          1       0.101       0.101    0.0
+gw_jax.runtime_stack.compile_cache                     1       0.000       0.000    0.0
+gw_jax.runtime_stack.env_and_distributed               1       2.540       2.540    1.2
+gw_jax.runtime_stack.jax_import                        1       0.677       0.677    0.3
+gw_jax.runtime_stack.measurement                       1       0.102       0.102    0.0
+gw_jax.runtime_stack.mesh_and_warmup                   1       1.370       1.370    0.7
+gw_jax.imports                                         1       1.161       1.161    0.6
+(untimed)                                                      0.921       0.921    0.4
+TOTAL (wall)                                                 208.234              100.0
+Sigma blocks   : CC max|diag|=2.924304e+01 eV, mean|diag|=1.764213e+01 eV; CT+TC max|diag|=8.704799e-15 eV, mean|diag|=2.637072e-15 eV; TT max|diag|=3.846400e-03 eV, mean|diag|=1.729824e-03 eV
+Head Sigma     : Gamma-cell contribution; CC max|diag|=2.401538e+00 eV, mean|diag|=2.106904e+00 eV; CT+TC max|diag|=4.609542e-17 eV, mean|diag|=6.452850e-18 eV; TT max|diag|=2.236530e-04 eV, mean|diag|=9.384827e-05 eV
+
+FUNDAMENTAL GAP
+---------------
+DFT gap        : 1.70007 eV
+Full-matrix effective-H gap: 2.84276 eV (insulating)
+Gap correction : +1.14269 eV relative to DFT
+State energies  : written to the EQP files listed below
+
+MAJOR-STAGE TIMING
+------------------
+  stage                    wall (s)     fraction
+  runtime bring-up             4.69       2.25%
+  pre-main + imports           1.16       0.56%
+  input + run setup            0.12       0.06%
+  V(q)                         3.87       1.86%
+  ISDF setup + I/O             6.61       3.18%
+  minimax quadrature           0.15       0.07%
+  screening support           31.74      15.24%
+  Sigma other                158.54      76.13%
+  mean-field load              0.05       0.02%
+  QP solve + diagonalize       0.29       0.14%
+  result writes                0.10       0.05%
+  other driver work            0.92       0.44%
+  total run                  208.23     100.00%
+
+OUTPUT FILES AND INPUTS
+-----------------------
+  role                     state       path
+  input deck               read        /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/cohsex.in
+  DFT wavefunctions        read        /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/02_preprocess/WFN.h5
+  ISDF centroids           read        /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/02_preprocess/centroids_charge.txt
+  current centroids        read        /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/02_preprocess/centroids_current.txt
+  mean-field Hamiltonian   read        /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/02_preprocess/kin_ion.h5
+  long-wave dipoles        read        /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/dipole.h5
+  parallel transport       absent      /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/parallel_transport.h5
+  ISDF restart tensors     present     /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/tmp/isdf_tensors_192.h5
+  self-energy table        written     /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/sigma_diag.dat
+  fixed-DFT-state diagonal zeroth-order energies written     /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/eqp0.dat
+  fixed-DFT-state diagonal Z-linearized energies written     /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/eqp1.dat
+  full-matrix effective-H rotations written     /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/qp_wfn_rotations.h5
+  matched full-matrix QP wavefunctions absent      /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/WFN_qp.h5
+
+LORRAX GW calculation completed.
+Report written to /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/gwjax.out
+  [SlabIO.close] Python dispatch drained in 0.0 s (no queued data); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+  [compile-cache] rank 0/4 summary: xla_compiles=1712 (154.01s)  compile_agreement=1712 (1.444s fingerprint + 4.579s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False
+[runtime] filtered 6 exact known-benign JAX runtime notice line(s) on rank 0; all other stderr was forwarded unchanged.
+[runtime] process finalized explicitly (effects barrier, distributed shutdown, atexit hooks) and ending with os._exit: the interpreter-teardown destruction of the XLA:CPU client is skipped deliberately — it deadlocks in pool shutdown after cold-compile storms (jobs 7884928/7884989).

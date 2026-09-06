@@ -1,0 +1,30 @@
+runs/Si/100_bisp_parent_route_2026-09-05/prof_s/01_P_cohsex_baseline
+[lx] step lx-Xg4-013538-1331059-6092 exit 0 in 78 s
+runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline
+[lx] step lx-Xg4-013658-1341294-4845 exit 0 in 44 s
+runs/Si/100_bisp_parent_route_2026-09-05/prof_s/03_P_gn_baseline
+[lx] step lx-Xg4-013742-1346770-1840 exit 0 in 89 s
+runs/Si/100_bisp_parent_route_2026-09-05/prof_s/04_F_gn_baseline
+[lx] step lx-Xg4-013914-1354270-8743 exit 0 in 62 s
+runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/05_P_full_static_baseline
+[lx] step lx-Xg4-011831-1203588-3371 exit 0 in 207 s
+runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/06_F_full_static_baseline
+[lx] step lx-Xg4-012232-1236210-4898 exit 0 in 60 s
+runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/07_P_packed_bare_baseline
+[lx] step lx-Xg4-014017-1364925-8655 exit 0 in 190 s
+runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/08_F_packed_bare_baseline
+[lx] step lx-Xg4-014329-1395453-6054 exit 0 in 60 s
+runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/09_P_dynamic_eps5_baseline
+[lx] step lx-Xg4-014430-1403518-1126 exit 0 in 222 s
+runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/10_F_dynamic_eps5_baseline
+[lx] step lx-Xg4-014814-1431424-9108 exit 0 in 122 s
+runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary
+[lx] step lx-Xg4-015056-1446736-4655 exit 0 in 211 s
+runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/15_F_host_boundary
+[lx] step lx-Xg4-015429-1477910-4785 exit 0 in 55 s
+runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/16_P_weight_shape_ablation
+[lx] step lx-Xg4-015537-1491412-7992 exit 0 in 206 s
+runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/17_P_plan_reuse_ablation
+[lx] step lx-Xg4-015906-1518571-4099 exit 0 in 161 s
+runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/18_P_restore_shape_ablation
+[lx] step lx-Xg4-020153-1543034-2507 exit 0 in 151 s
