@@ -1127,6 +1127,7 @@ class StaticPhotonQ0FactorCarrier:
 
     bare_pair: tuple[jax.Array, jax.Array]
     screened_pairs: tuple[tuple[jax.Array, jax.Array], ...]
+    family_plans: tuple = ()
 
     def __post_init__(self) -> None:
         if len(self.bare_pair) != 2:
@@ -1340,6 +1341,49 @@ def _require_static_photon_numerical_certificate(
     return max_forward_error_bound
 
 
+@functools.partial(jax.jit, static_argnames=('layout', 'plans', 'mesh_xy'))
+def _photon_q0_factor_orbit(left, right, *, layout, plans, mesh_xy):
+    """Transport both rank-four Γ factors through every typed little-group row before averaging their products."""
+    from common.shard_map import shard_map
+    from symmetry_maps import apply_band_matrix_symmetry
+    from .photon_layout import _q0_local_factor_piece
+    if not plans:
+        return (jax.lax.with_sharding_constraint(left[None], NamedSharding(mesh_xy, P(None, None, 'x'))),
+                jax.lax.with_sharding_constraint(right[None], NamedSharding(mesh_xy, P(None, None, 'y'))))
+    sym = plans[0].sym
+    rows = np.asarray(sym.active_symmetry_rows, dtype=np.int32)
+    anti = sym.operation_rows(rows)[2]
+    action = np.asarray(sym.lorentz_action(rows))
+
+    def transform(factor, axis):
+        spec = P(None, axis)
+        @functools.partial(shard_map, mesh=mesh_xy, in_specs=spec,
+                 out_specs=P(None, None, axis), check_vma=False)
+        def local(value):
+            pieces = []
+            for family, channels in enumerate(((0,), (1, 2, 3))):
+                plan = plans[family]
+                extent = layout.carrier_extent(channels[0]) // layout.mesh_side
+                table = jnp.asarray(plan.centroid_local_perm[rows])
+                perm = jax.lax.dynamic_slice_in_dim(
+                    table, jax.lax.axis_index(axis) * extent, extent, axis=1)
+                data = jnp.stack([_q0_local_factor_piece(value,
+                    axis_name=axis, local_extent=extent,
+                    local_offset=layout.local_offset(channel),
+                    logical_extent=layout.logical_extent(channel))
+                    for channel in channels])
+                gathered = jnp.take_along_axis(data[None],
+                    perm[:, None, None, :], axis=-1)
+                mixed = apply_band_matrix_symmetry(gathered,
+                    antiunitary=jnp.asarray(anti),
+                    component_mix=jnp.asarray(action[:, channels, :][:, :, channels]),
+                    component_axis=1)
+                pieces.extend(mixed[:, i] for i in range(len(channels)))
+            return jnp.concatenate(pieces, axis=-1)
+        return local(factor)
+    return transform(left, 'x'), transform(right, 'y') / len(rows)
+
+
 def complete_static_slab_photon_q0(
     V_packed: jax.Array,
     W_packed: jax.Array,
@@ -1349,6 +1393,7 @@ def complete_static_slab_photon_q0(
     cubature_receipt,
     *,
     mesh_xy: Mesh,
+    family_plans: tuple = (),
 ) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
     r"""Complete bare and screened packed photon operators in the Γ cell.
 
@@ -1361,8 +1406,9 @@ def complete_static_slab_photon_q0(
     source for the completion.  Each sample first solves the coupled
     four-field head Dyson equation; only its ``(1,qx,qy)`` moments survive.
     The packed body is then updated by one bare and nine screened rank-four
-    outer products.  No sample-by-centroid tensor or second photon packing
-    convention exists.
+    outer products, each averaged over the authenticated Gamma little group
+    through its rank-four factors.  No sample-by-centroid tensor or second
+    photon packing convention exists.
     """
     from .photon_layout import (
         MAX_Q0_UPDATE_RANK, add_photon_q0_low_rank)
@@ -1529,9 +1575,14 @@ def complete_static_slab_photon_q0(
                 "AB,Bj->Aj", jnp.asarray(D_mean, dtype=dtype), g0_Y,
                 optimize=True) / volume,
             sh_y)
-    V_packed = add_photon_q0_low_rank(
-        V_packed, layout, mesh_xy,
-        left_rows_X=left_bare, right_rows_Y=right_bare)
+    images = _photon_q0_factor_orbit(
+        left_bare, right_bare, layout=layout, plans=family_plans, mesh_xy=mesh_xy)
+    for image in range(images[0].shape[0]):
+        left_rows, right_rows = images[0][image], images[1][image]
+        V_packed = add_photon_q0_low_rank(
+            V_packed, layout, mesh_xy,
+            left_rows_X=jax.device_put(left_rows, sh_x),
+            right_rows_Y=jax.device_put(right_rows, sh_y))
 
     left_basis = (
         left_bare,
@@ -1549,9 +1600,14 @@ def complete_static_slab_photon_q0(
                         jnp.asarray(moments_mean[u, v], dtype=dtype),
                         right_basis[v], optimize=True) / volume,
                     sh_y)
-            W_packed = add_photon_q0_low_rank(
-                W_packed, layout, mesh_xy,
-                left_rows_X=left_basis[u], right_rows_Y=right_rows)
+            images = _photon_q0_factor_orbit(left_basis[u], right_rows,
+                layout=layout, plans=family_plans, mesh_xy=mesh_xy)
+            for image in range(images[0].shape[0]):
+                left_image, right_image = images[0][image], images[1][image]
+                W_packed = add_photon_q0_low_rank(
+                    W_packed, layout, mesh_xy,
+                    left_rows_X=jax.device_put(left_image, sh_x),
+                    right_rows_Y=jax.device_put(right_image, sh_y))
             screened_pairs.append((left_basis[u], right_rows))
 
     evidence = StaticSlabPhotonHeadCompletion(
@@ -1574,7 +1630,7 @@ def complete_static_slab_photon_q0(
         hall_source=str(response.hall_source),
         q0_factors=StaticPhotonQ0FactorCarrier(
             bare_pair=(left_bare, right_bare),
-            screened_pairs=tuple(screened_pairs)),
+            screened_pairs=tuple(screened_pairs), family_plans=family_plans),
     )
     return V_packed, W_packed, evidence
 

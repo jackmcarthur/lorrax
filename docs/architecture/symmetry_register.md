@@ -1314,3 +1314,11 @@ PROVED means equality at the explicitly tested seam/fixture within the tolerance
 | Hall −iεσ and CT/TC conjugate pairing | head_correction:162 | PROVED declared model | existing photon_head_sign_oracle, rerun final leg |
 | Head S+YWZ/Ω, WZ transpose and YW orientation | head_correction:1343,1526–1556 | PROVED local declared formulas | existing head-sign/moment suite; shared sampler limitation |
 | Full Ward/gauge completeness, missing current head terms | static_gauge_response module | FLAGGED model limitation | not supplied by the no-pair paramagnetic approximation |
+
+### Integration closures (2026-09-06)
+
+The verbatim PHYS table above describes its audit base. The end-to-end Z host-store/FFT flag is closed by `test_signed_current_z_host_store_fft_cancels_in_normal_solve`: literal pair sums prove both signed normal inputs and their cancellation. The wrapper and dynamic-X flags are closed at their actual assembly/dispatch boundaries by the additional literal oracles; these do not replace whole-driver gates.
+
+`head_correction._photon_q0_factor_orbit` now transports each complete rank-four factor pair through `SymMaps.active_symmetry_rows` and averages its outer products. The typed Lorentz action mixes charge/current indices; `apply_band_matrix_symmetry` owns antiunitary conjugation; centroid pullbacks come from the parent plans. At Gamma no Bloch return phase remains. Averaging factors separately is wrong and has an explicit negative oracle. Both physical insertion and opt-in attribution consume the same factor orbits. The carrier retains original factors plus family-plan metadata, never a second centroid-square body.
+
+MoS2 actual TT completion covariance improves0.556871776 to2.30561e-11; the strict1e-11 probe remains failed, while the supplied Cartesian orthogonality defect is2.695311e-11. This input-precision limit is stated rather than hidden. Bare/screened CC were also noncovariant at1.1094e-6/1.1021e-6; projection brings them below6e-16. Claim1201 prices this change at max4.647µeV and spread6.471µeV in both QP files versus labelled incumbent fixed-main. Full Ward/gauge completeness and omitted current head terms remain model limitations.

@@ -705,6 +705,47 @@ def test_dynamic_dispatch_books_static_current_once_in_x(tmp_path, monkeypatch, 
     assert got['photon_head_sigma_diag_tskn_ry'] is None
 
 
+def test_gamma_factor_average_is_covariant_with_nonzero_mixed_blocks():
+    """Average transported rank-four products, including antiunitary conjugation on both factors, at Gamma."""
+    from gw.head_correction import _photon_q0_factor_orbit
+    from gw.photon_layout import PhotonBasisLayout, pack_photon_channel_vectors
+    mesh = _mesh()
+    plan = _toy_plan(mesh)
+    nmu = plan.n_centroid_packed
+    layout = PhotonBasisLayout.from_centroid_extents(nmu, nmu, mesh)
+    rng = np.random.default_rng(122)
+    left = rng.normal(size=(4,4,nmu))+1j*rng.normal(size=(4,4,nmu))
+    right = rng.normal(size=(4,4,nmu))+1j*rng.normal(size=(4,4,nmu))
+    def pack(value, axis):
+        parts = tuple(jax.device_put(v, NamedSharding(mesh,P(None,axis))) for v in value)
+        return pack_photon_channel_vectors(parts, layout, mesh, axis_name=axis).sum(axis=1)
+    images = _photon_q0_factor_orbit(pack(left,'x'), pack(right,'y'),
+        layout=layout, plans=(plan,plan), mesh_xy=mesh)
+    # Read rank-four factors in the declared mesh-interleaved channel order.
+    ids = np.array([[shard*4*(nmu//2)+a*(nmu//2)+i
+                    for shard in range(2) for i in range(nmu//2)] for a in range(4)])
+    got_l, got_r = (np.asarray(value)[:,:,ids].transpose(0,2,1,3) for value in images)
+    actual = np.einsum('garu,gbrv->abuv',got_l,got_r)
+    rows = plan.sym.active_symmetry_rows
+    expected = np.zeros_like(actual)
+    for row in rows:
+        anti = plan.sym.operation_rows(np.array([row]))[2][0]
+        lam = plan.sym.lorentz_action(np.array([row]))[0]
+        l = np.einsum('ac,cru->aru',lam,left[:,:,plan.sym_perm[row]])
+        r = np.einsum('ac,cru->aru',lam,right[:,:,plan.sym_perm[row]])
+        expected += np.einsum('aru,brv->abuv',l.conj() if anti else l,r.conj() if anti else r)/len(rows)
+    np.testing.assert_allclose(actual,expected,atol=3e-13,rtol=3e-13)
+    assert np.max(np.abs(expected[0,1:])) > .1
+    for row in rows:
+        anti = plan.sym.operation_rows(np.array([row]))[2][0]
+        lam = plan.sym.lorentz_action(np.array([row]))[0]
+        value = expected[:,:,plan.sym_perm[row]][:,:,:,plan.sym_perm[row]]
+        restored = np.einsum('ac,bd,cduv->abuv',lam,lam,value.conj() if anti else value)
+        np.testing.assert_allclose(restored,expected,atol=3e-13,rtol=3e-13)
+    wrong = np.einsum('aru,brv->abuv',got_l.mean(axis=0),got_r.sum(axis=0))
+    assert np.max(np.abs(wrong-expected)) > .1
+
+
 def test_signed_current_z_host_store_fft_cancels_in_normal_solve():
     """Actual parent host-store and k FFT tails give C=-Q and Z=-RHS for Gamma2, which cancel in the solve."""
     import importlib.util

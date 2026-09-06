@@ -1884,7 +1884,7 @@ def compute_static_photon_response(
         V_packed, W_packed, head_completion = (
             complete_static_slab_photon_q0(
                 V_packed, W_packed, response, g0_X, g0_Y, cubature,
-                mesh_xy=mesh_xy))
+                mesh_xy=mesh_xy, family_plans=plans))
         jax.block_until_ready((V_packed, W_packed))
         sanity.refuse_nonfinite(
             "Gamma-completed static photon V", V_packed)

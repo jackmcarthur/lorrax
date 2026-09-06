@@ -167,6 +167,7 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
     from .w_isdf import photon_blocks_full_q
     from .cohsex_sigma import _occ_diag_full
     from .photon_layout import photon_q0_low_rank_block
+    from .head_correction import _photon_q0_factor_orbit
     from common.gamma_matrices import gamma_perm_phase
     if tuple(f.green_parent.plan for f in families) != response.family_plans:
         raise ValueError("Photon interaction and wavefunctions use different parent plans.")
@@ -187,10 +188,20 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
         head_block = None
         if factors is not None:
             pairs = (factors.bare_pair,) if term == _TERM_X else factors.screened_pairs
+            pairs = tuple((jax.device_put(images[0][i], NamedSharding(mesh_xy, P(None, 'x'))),
+                           jax.device_put(images[1][i], NamedSharding(mesh_xy, P(None, 'y'))))
+                for pair in pairs for images in (_photon_q0_factor_orbit(
+                    *pair, layout=response.layout, plans=factors.family_plans, mesh_xy=mesh_xy),)
+                for i in range(images[0].shape[0]))
             head_block = photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
             if term == _TERM_COH:
                 head_block = head_block - photon_q0_low_rank_block(
-                    (factors.bare_pair,), response.layout, A, B, mesh_xy)
+                    tuple((jax.device_put(images[0][i], NamedSharding(mesh_xy, P(None, 'x'))),
+                           jax.device_put(images[1][i], NamedSharding(mesh_xy, P(None, 'y'))))
+                        for images in (_photon_q0_factor_orbit(*factors.bare_pair,
+                            layout=response.layout, plans=factors.family_plans, mesh_xy=mesh_xy),)
+                        for i in range(images[0].shape[0])),
+                    response.layout, A, B, mesh_xy)
         kernel = _make_photon_static_block_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
             left, right, with_head=factors is not None)
         vertices = (gamma_perm_phase(A), gamma_perm_phase(B))
