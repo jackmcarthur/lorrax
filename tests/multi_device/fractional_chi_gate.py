@@ -15,10 +15,8 @@ from common.collectives import process_count, process_rank, resolve_mesh
 from gw.w_isdf import compute_chi0, compute_chi0_contour_fractional
 from gw.wavefunction_bundle import (
     BandSlices,
-    PSI_XN_SPEC,
-    PSI_XR_SPEC,
-    PSI_YN_SPEC,
-    PSI_YR_SPEC,
+    PSI_MUN_SPEC,
+    PSI_NMU_SPEC,
     Wavefunctions,
 )
 
@@ -81,13 +79,12 @@ def main():
     ])
     slices = BandSlices.from_band_edges(0, 0, 2, nb, nb)
     wfns = Wavefunctions(
-        psi_xn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_XN_SPEC),
-        psi_xr=_put(psi, mesh, PSI_XR_SPEC),
-        psi_yr=_put(psi, mesh, PSI_YR_SPEC),
-        psi_yn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_YN_SPEC),
+        psi_mun=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_MUN_SPEC),
+        psi_nmu=_put(psi, mesh, PSI_NMU_SPEC),
         enk=_put(enk, mesh, P(None, None)),
         occ=_put(occ, mesh, P(None, None)),
         slices=slices,
+        layout="face",
     )
     time = np.array([0.13, 0.41, 0.79])
     z = np.array([0.32 + 0.18j, 0.77 + 0.24j])
@@ -130,9 +127,13 @@ def main():
     surface = np.asarray(jax.device_get(
         efermi.mp1_negative_derivative(enk, mu, width)))
     wfns_mp1 = Wavefunctions(
-        psi_xn=wfns.psi_xn, psi_xr=wfns.psi_xr, psi_yr=wfns.psi_yr,
-        psi_yn=wfns.psi_yn, enk=wfns.enk,
-        occ=_put(occ_mp1, mesh, P(None, None)), slices=slices)
+        psi_mun=wfns.psi_mun,
+        psi_nmu=wfns.psi_nmu,
+        enk=wfns.enk,
+        occ=_put(occ_mp1, mesh, P(None, None)),
+        slices=slices,
+        layout="face",
+    )
     state = SimpleNamespace(
         f_kn=occ_mp1, mu_ry=mu, smearing_family="mp1",
         smearing_width_ry=width)
@@ -209,10 +210,13 @@ def main():
     occ_i = np.concatenate((
         np.ones((nk, nv)), np.zeros((nk, nb - nv))), axis=1)
     wfns_i = Wavefunctions(
-        psi_xn=wfns.psi_xn, psi_xr=wfns.psi_xr,
-        psi_yr=wfns.psi_yr, psi_yn=wfns.psi_yn,
+        psi_mun=wfns.psi_mun,
+        psi_nmu=wfns.psi_nmu,
         enk=_put(enk_i, mesh, P(None, None)),
-        occ=_put(occ_i, mesh, P(None, None)), slices=slices)
+        occ=_put(occ_i, mesh, P(None, None)),
+        slices=slices,
+        layout="face",
+    )
     got_i = np.asarray(multihost_utils.process_allgather(
         compute_chi0(
             wfns_i,

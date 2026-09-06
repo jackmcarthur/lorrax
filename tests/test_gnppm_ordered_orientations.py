@@ -41,10 +41,8 @@ from gw.ppm_sigma import _residue_for_space  # noqa: E402
 from gw.screening import assert_probe_chi_reuse_supported  # noqa: E402
 from gw.wavefunction_bundle import (  # noqa: E402
     BandSlices,
-    PSI_XN_SPEC,
-    PSI_XR_SPEC,
-    PSI_YN_SPEC,
-    PSI_YR_SPEC,
+    PSI_MUN_SPEC,
+    PSI_NMU_SPEC,
     Wavefunctions,
 )
 
@@ -96,6 +94,12 @@ def _mesh_xy():
 
 def _put(a, mesh, spec):
     return jax.device_put(jnp.asarray(a), NamedSharding(mesh, spec))
+
+
+def _local_gemm_plan(mesh, **kwargs):
+    gemm = lambda a, b: jnp.einsum("qmk,qkn->qmn", a, b)
+    gemm.mesh = mesh
+    return gemm
 
 
 def _emulated_flat_k_fftn(mesh, kgrid, spec, *, norm="ortho",
@@ -194,13 +198,12 @@ def _toy_bundle(mesh, rng):
     occ = np.tile(np.array([1.0, 1.0, 0.0, 0.0]), (nk, 1))
     slices = BandSlices.from_band_edges(0, 0, nv, nb, nb)
     wfns = Wavefunctions(
-        psi_xn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_XN_SPEC),
-        psi_xr=_put(psi, mesh, PSI_XR_SPEC),
-        psi_yr=_put(psi, mesh, PSI_YR_SPEC),
-        psi_yn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_YN_SPEC),
+        psi_mun=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_MUN_SPEC),
+        psi_nmu=_put(psi, mesh, PSI_NMU_SPEC),
         enk=_put(enk, mesh, P(None, None)),
         occ=_put(occ, mesh, P(None, None)),
         slices=slices,
+        layout="face",
     )
     return psi, enk, slices, wfns
 
@@ -246,6 +249,8 @@ def _exact_ordered_chi0_flat_q(psi, enk, slices, z):
 def test_ordered_route_reproduces_the_exact_chi0_through_the_production_kernel(
         monkeypatch):
     import common.fft_helpers as fft_helpers
+    import distrib_la
+    monkeypatch.setattr(distrib_la, "gemm_plan", _local_gemm_plan)
     from symmetry_maps import q_negation_index
 
     monkeypatch.setattr(fft_helpers, "make_flat_k_fftn", _emulated_flat_k_fftn)
@@ -296,6 +301,8 @@ def _herm_split_flat(a):
 
 def test_ordered_route_refuses_a_quadrature_without_the_odd_kernel(monkeypatch):
     import common.fft_helpers as fft_helpers
+    import distrib_la
+    monkeypatch.setattr(distrib_la, "gemm_plan", _local_gemm_plan)
     from symmetry_maps import q_negation_index
 
     monkeypatch.setattr(fft_helpers, "make_flat_k_fftn", _emulated_flat_k_fftn)
@@ -318,6 +325,8 @@ def test_ordered_contour_route_reproduces_exact_imaginary_chi0_in_one_sweep(
     a second response sweep would violate the route's scaling contract.
     """
     import common.fft_helpers as fft_helpers
+    import distrib_la
+    monkeypatch.setattr(distrib_la, "gemm_plan", _local_gemm_plan)
     from symmetry_maps import q_negation_index
 
     monkeypatch.setattr(fft_helpers, "make_flat_k_fftn", _emulated_flat_k_fftn)

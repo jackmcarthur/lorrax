@@ -14,10 +14,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 from gw import w_isdf  # noqa: E402
 from gw.wavefunction_bundle import (  # noqa: E402
     BandSlices,
-    PSI_XN_SPEC,
-    PSI_XR_SPEC,
-    PSI_YN_SPEC,
-    PSI_YR_SPEC,
+    PSI_MUN_SPEC,
+    PSI_NMU_SPEC,
     Wavefunctions,
 )
 
@@ -35,6 +33,12 @@ def _mesh_xy():
 
 def _put(a, mesh, spec):
     return jax.device_put(jnp.asarray(a), NamedSharding(mesh, spec))
+
+
+def _local_gemm_plan(mesh, **kwargs):
+    gemm = lambda a, b: jnp.einsum("qmk,qkn->qmn", a, b)
+    gemm.mesh = mesh
+    return gemm
 
 
 def _emulated_flat_k_fftn(mesh, kgrid, spec, *, norm="ortho",
@@ -62,13 +66,12 @@ def _toy(mesh):
     ])
     slices = BandSlices.from_band_edges(0, 0, nv, nv + nc, nv + nc)
     wfns = Wavefunctions(
-        psi_xn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_XN_SPEC),
-        psi_xr=_put(psi, mesh, PSI_XR_SPEC),
-        psi_yr=_put(psi, mesh, PSI_YR_SPEC),
-        psi_yn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_YN_SPEC),
+        psi_mun=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_MUN_SPEC),
+        psi_nmu=_put(psi, mesh, PSI_NMU_SPEC),
         enk=_put(enk, mesh, P(None, None)),
         occ=_put(np.zeros_like(enk), mesh, P(None, None)),
         slices=slices,
+        layout="face",
     )
     return psi, enk, slices, wfns
 
@@ -110,6 +113,8 @@ def test_static_insulator_matches_the_integer_limit_of_the_ordered_pair_ssot(
     any time-reversal gauge assumption.
     """
     import common.fft_helpers as fft_helpers
+    import distrib_la
+    monkeypatch.setattr(distrib_la, "gemm_plan", _local_gemm_plan)
 
     monkeypatch.setattr(
         fft_helpers, "make_flat_k_fftn", _emulated_flat_k_fftn)
@@ -129,13 +134,12 @@ def test_static_insulator_matches_the_integer_limit_of_the_ordered_pair_ssot(
         np.ones((nk, nv)), np.zeros((nk, nc))), axis=1)
     slices = BandSlices.from_band_edges(0, 0, nv, nb, nb)
     wfns = Wavefunctions(
-        psi_xn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_XN_SPEC),
-        psi_xr=_put(psi, mesh, PSI_XR_SPEC),
-        psi_yr=_put(psi, mesh, PSI_YR_SPEC),
-        psi_yn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_YN_SPEC),
+        psi_mun=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_MUN_SPEC),
+        psi_nmu=_put(psi, mesh, PSI_NMU_SPEC),
         enk=_put(enk, mesh, P(None, None)),
         occ=_put(occ, mesh, P(None, None)),
         slices=slices,
+        layout="face",
     )
     meta = SimpleNamespace(nkx=nk, nky=1, nkz=1, nk_tot=nk)
     quad = SimpleNamespace(tau=np.asarray([0.0]), alpha=np.asarray([1.0]))
@@ -146,8 +150,8 @@ def test_static_insulator_matches_the_integer_limit_of_the_ordered_pair_ssot(
     # degenerate pairs have df=0 and an exactly-zero supplied surface limit.
     pair_kernel = w_isdf._get_chi_fractional_q_kernel(
         mesh, nb_logical=nb, pair_tile=nb, n_z=1)
-    psi_x = wfns.psi_xn
-    psi_y = wfns.psi_yn
+    psi_x = _put(psi.transpose(0, 2, 3, 1), mesh, P(None, None, 'x', None))
+    psi_y = _put(psi.transpose(0, 2, 3, 1), mesh, P(None, None, 'y', None))
     surface = jnp.zeros_like(wfns.enk)
     rows = []
     for q in range(nk):
@@ -171,6 +175,8 @@ def test_static_insulator_matches_the_integer_limit_of_the_ordered_pair_ssot(
 
 def test_complex_contour_matches_direct_k_minus_q_sum(monkeypatch):
     import common.fft_helpers as fft_helpers
+    import distrib_la
+    monkeypatch.setattr(distrib_la, "gemm_plan", _local_gemm_plan)
 
     monkeypatch.setattr(
         fft_helpers, "make_flat_k_fftn", _emulated_flat_k_fftn)
@@ -248,6 +254,8 @@ def test_fractional_contour_matches_kubo_on_oriented_three_point_grid(
 ):
     """Finite occupations preserve the explicit q and -q orientations."""
     import common.fft_helpers as fft_helpers
+    import distrib_la
+    monkeypatch.setattr(distrib_la, "gemm_plan", _local_gemm_plan)
 
     monkeypatch.setattr(
         fft_helpers, "make_flat_k_fftn", _emulated_flat_k_fftn)
@@ -270,13 +278,12 @@ def test_fractional_contour_matches_kubo_on_oriented_three_point_grid(
     ])
     slices = BandSlices.from_band_edges(0, 0, 2, nb, nb)
     wfns = Wavefunctions(
-        psi_xn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_XN_SPEC),
-        psi_xr=_put(psi, mesh, PSI_XR_SPEC),
-        psi_yr=_put(psi, mesh, PSI_YR_SPEC),
-        psi_yn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_YN_SPEC),
+        psi_mun=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_MUN_SPEC),
+        psi_nmu=_put(psi, mesh, PSI_NMU_SPEC),
         enk=_put(enk, mesh, P(None, None)),
         occ=_put(occ, mesh, P(None, None)),
         slices=slices,
+        layout="face",
     )
     time = np.array([0.13, 0.41, 0.79])
     z = np.array([0.32 + 0.18j, 0.77 + 0.24j])
@@ -339,13 +346,12 @@ def test_static_fractional_gamma_matches_divided_difference():
         [0.02, 0.37, 0.28, -0.01],
     ])
     wfns = Wavefunctions(
-        psi_xn=base.psi_xn,
-        psi_xr=base.psi_xr,
-        psi_yr=base.psi_yr,
-        psi_yn=base.psi_yn,
+        psi_mun=base.psi_mun,
+        psi_nmu=base.psi_nmu,
         enk=base.enk,
         occ=_put(occ, mesh, P(None, None)),
         slices=slices,
+        layout="face",
     )
     got = w_isdf.compute_chi0_static_fractional_gamma(
         wfns,
@@ -450,13 +456,12 @@ def test_static_fractional_finite_q_matches_divided_difference():
     occ, surface = _mp1_tables(enk, mu, width)
     slices = BandSlices.from_band_edges(0, 0, 2, nb, nb)
     wfns = Wavefunctions(
-        psi_xn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_XN_SPEC),
-        psi_xr=_put(psi, mesh, PSI_XR_SPEC),
-        psi_yr=_put(psi, mesh, PSI_YR_SPEC),
-        psi_yn=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_YN_SPEC),
+        psi_mun=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_MUN_SPEC),
+        psi_nmu=_put(psi, mesh, PSI_NMU_SPEC),
         enk=_put(enk, mesh, P(None, None)),
         occ=_put(occ, mesh, P(None, None)),
         slices=slices,
+        layout="face",
     )
     state = SimpleNamespace(
         f_kn=occ, mu_ry=mu, smearing_family="mp1", smearing_width_ry=width)
