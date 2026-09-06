@@ -763,17 +763,58 @@ def _fit_fixed_sc_rules(
         padded = [_sc_padded_box_spec(spec, eta, reserve_zero_side=True)
                   if bool(spec["conjugate"]) not in crossing_causal else pad
                   for spec, pad in zip(rows, padded)]
-        fits, fit_rows = fit_sigma_box_specs(
-            padded, eta, eps=eps, reduction_seconds=reduction_seconds,
-            cache_dir=cache_dir, cache_build_widen=False,
-            reduction_steps=reduction_steps)
+        # Fit containing certificates first and share their immutable
+        # nodes with contained windows of the same causal sign/currency.
+        # This also avoids different rules for nested views of one support.
+        owners, selected = {}, []
+        order = sorted(range(len(padded)), key=lambda i: (
+            -(padded[i]["box"][1] - padded[i]["box"][0])
+            * (padded[i]["box"][3] - padded[i]["box"][2]), i))
+        for i in order:
+            owner = next((j for j in selected
+                          if padded[j]["conjugate"] == padded[i]["conjugate"]
+                          and padded[j]["kind"] == padded[i]["kind"]
+                          and _box_contains(padded[j]["box"], padded[i]["box"])), None)
+            if owner is None:
+                selected.append(i)
+                owner = i
+            owners[i] = owner
+        selected_fits, fit_rows = fit_sigma_box_specs(
+            [padded[i] for i in selected], eta, eps=eps,
+            reduction_seconds=reduction_seconds, cache_dir=cache_dir,
+            cache_build_widen=False, reduction_steps=reduction_steps)
+        fitted = dict(zip(selected, selected_fits))
+        fits, refit = [], []
+        for i, spec in enumerate(rows):
+            fit = fitted[owners[i]]
+            if owners[i] == i:
+                fits.append(dict(fit))
+                continue
+            try:
+                reused = _fixed_fit_for_spec({"fit": fit}, spec)
+            except RuntimeError:
+                # Containment alone does not bound executor factor growth.
+                # A window with unsafe shared factors still gets its own fit.
+                refit.append(i)
+                reused = None
+            if reused is not None:
+                reused["cache_status"] = fit["cache_status"]
+            fits.append(reused)
+        if refit:
+            extra, extra_rows = fit_sigma_box_specs(
+                [padded[i] for i in refit], eta, eps=eps,
+                reduction_seconds=reduction_seconds, cache_dir=cache_dir,
+                cache_build_widen=False, reduction_steps=reduction_steps)
+            fit_rows.extend(extra_rows)
+            for i, fit in zip(refit, extra):
+                fits[i] = fit
         rules = {}
         for spec, padded_spec, fit in zip(rows, padded, fits):
             frozen = dict(fit)
             frozen["cache_status"] = f"init:{fit['cache_status']}"
             rules[spec["name"]] = {
                 "fit": frozen,
-                "padded_box": tuple(padded_spec["box"]),
+                "padded_box": tuple(fit["rule_box"]),
                 "initial_box": tuple(spec["box"]),
                 "conjugate": bool(spec["conjugate"]),
             }
@@ -849,7 +890,7 @@ def _fit_fixed_sc_rules(
             rebuilt["cache_status"] = "rebuild:sc-fixed"
             rules[spec["name"]] = {
                 "fit": rebuilt,
-                "padded_box": tuple(padded_spec["box"]),
+                "padded_box": tuple(fit["rule_box"]),
                 "initial_box": tuple(spec["box"]),
                 "conjugate": bool(spec["conjugate"]),
                 "rebuilt_at_iteration": iteration,
@@ -1042,9 +1083,13 @@ def plan_sigma_windows(
                 pole_sign=pole_sign, eta_ry=eta)
             if fixed_rule_session is not None and "external_support_ev" in fixed_rule_session:
                 support = np.asarray(fixed_rule_session["external_support_ev"]) / RYD_TO_EV
+                # Reserve growth at BOTH ends of this branch's interval.
+                # Giving each half the entire opposite-sign interval creates
+                # crossing boxes for frequencies that it never evaluates.
+                growth_lo = max(0.0, float(np.min(omega_grid) - support[0]))
+                growth_hi = max(0.0, float(support[1] - np.max(omega_grid)))
                 spec["sc_support_frequencies"] = np.asarray([
-                    min(frequencies[0], support[0]),
-                    max(frequencies[-1], support[1])])
+                    np.min(frequencies) - growth_lo, np.max(frequencies) + growth_hi])
             spec.update({
                 "branch": branch,
                 "state_indices": flat_indices[local],

@@ -295,7 +295,10 @@ Certificates reserve this prospective external-frequency extent, including
 the growth pad and grid rounding, without evaluating those samples at map 0.
 Padding intermediate states alone does not cover external-frequency growth.
 Changed product-window membership, state support or pole drift can still
-require a rebuild. Interior holes still require an explicit patch. Quadrature
+require a rebuild. Each frequency branch reserves both growth increments
+on its own interval, without importing the entire unused opposite half.
+Contained initial certificates of the same causal type share their nodes.
+Interior holes still require an explicit patch. Quadrature
 nodes remain frozen while their certified boxes cover the map.
 
 **17. The active-window scissor law stays frozen at map 0.** States inside
