@@ -264,3 +264,31 @@ Checkpoint scope: 23 focused CPU tests in23 and6 parent-Z/C_q parity tests in31 
 CFS archive: `/global/cfs/cdirs/m4598/jackm/lorrax_evidence/bisp_prof_zw_2026-09-06/evidence.tar`; 17,601 files, 348,641,280 archive bytes, SHA256 `6ad595eda36bb279ae454ac0f99b140ab4c857b231eb2b40563630dffe91d2f0`. Every member was verified against `manifest.json`; `verification.json` reports17,601 verified,0 missing,0 mismatched. The archive retains native Nsight captures, named rank-zero optimized HLO/memory reports, all driver/step receipts, selected canonical zeta/rules, exact source snapshots and parser owners. Full WFN inputs and other-rank HLO remain in their original run locations. `archive_receipt.json` beside this report gives the bounded scope. The final report is also copied beside the CFS archive after closure.
 
 Cherry-pick `87a2bfaa`, then `0f8fbc3e`, then `f811f734`; the later report-only commit requires no production adoption. All source changes are pushed on `perf/bisp-prof-zw-2026-09-06`, unmerged; the final branch-status check fetches origin and confirms the source tip is not an ancestor of origin/main. Production source bytes are restored to the gated tip after38–41. No live lane steps remain, and the shared campaign pool is left allocated for its owner.
+
+## Chi Green reuse and fresh zeta on 6x6
+
+Active follow-up, 2026-09-06. Rebased production source is exactly orchestrator71ae0bde (covariant Gamma, sign-aware transverse ridge, tau exchange removal and integrated chi/zeta fixes); historical sections above remain pinned to their original sources. Fresh unprofiled P/F arms47/48 copy BISP-SCALE02/03 inputs under runs/MoS2/42_bisp_scale_2026-09-06/prof_zw. Candidate: one Green/FFT pair per tau and C-C/C-T/T-C/T-T class, with1/3/3/9 ordered vertex contractions; unchanged q-IBZ output, Ward contact and Dyson. Baseline source is frozen while these runs execute. P4 pool57982945; optional P16 only if all four nodes are available.
+
+### Rebased P4 baselines and preregistered class memory
+
+Claim1256: P47 step `lx-Xg4-113113-163792-9427` and F52 `lx-Xg4-113511-221323-6412`, JID57982945, exit0. All physical input checksums match. F48 failed on the supplied unsupported `sigma_quadrature_reduction_steps` key; replacement52 omits only that inactive static-Sigma setting. No reference deck was edited.
+
+| fresh full driver | P47, production71ae0bde | F52,e1559a07 |
+|---|---:|---:|
+| charge zeta s |17.74|13.75|
+| transverse zeta s |18.21|inside ISDF setup bucket; separate orchestration timing follows|
+| ISDF setup/I/O s |9.09|24.19 (includes transverse fit)|
+| screening s |30.94|17.37|
+| Sigma s |21.27|21.28|
+| total s |109.51|89.70|
+| rank0 compiles / compiler s |849 /55.74|782 /46.66|
+
+The gate has K36,7 raw parents/q-IBZ rows,80 bands,ns4, logical C/T597/194 and P4 carriers600/196;11 minimax nodes. Baseline source performs352 Green builds and352 Green FFTs over sixteen blocks. The proposed four-class sweep performs88 of each, preserving all16 forward/reverse vertex completions and16 final q FFTs.
+
+One Green has16 K ns² M_A M_B/P bytes: P4 CC829,440,000; CT/TC270,950,400; TT88,510,464. Two are live per class, independent of the number of tau nodes. Nine TT R-space accumulators require49,787,136B/rank versus5,531,904B for a singleton; q-IBZ outputs require9,680,832B for that class. Packing retains the existing all-rank accumulator39,517,632B, with one class consumed before the next is built. These are payload estimates pending optimized HLO, not an allocator-peak claim. Actual P16 carriers and measured peaks will be recorded separately; at unchanged extents the payload divides by four.
+
+The private kernel parameter changes from `vertex_pair` to `vertex_pairs` and returns a tuple of class outputs. The established public singleton function delegates to the plural class entry. The sole photon packer accepts an explicit block order so C-C,C-T,T-C,T-T residency is enforceable without a second packer, symmetry owner or dispatch layer. Ward subtraction remains at the existing TT q-IBZ consumer, and the Dyson is untouched.
+
+Pool continuation: own authorized fallback allocation57986810 succeeded (00_environment/allocation_attempt1.log). Waiting shared-pool probe51 was cancelled before it created a driver or science step; replacement61 and cached baseline62 run sequentially on the owned node. Shared57982945 remains the optional P16 pool.
+
+Publication: the rebased continuation is published as `perf/bisp-prof-zw-green-reuse-2026-09-06` to preserve the campaign's no-force-push rule; the earlier published profiling branch remains intact. The assigned worktree/local branch is unchanged.
