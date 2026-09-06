@@ -205,7 +205,6 @@ def fit_zeta_to_h5(
     zeta_cutoff_ry: float | None = None,
     cache_psi_r: bool = True,
     cache_face_y_blocks: bool = False,
-    face_y_cache_r_tile: int = 0,
     bispinor_lift: str = "raw",
     _coupled_mu123_coordinator=None,
     _coupled_rank_gate=None,
