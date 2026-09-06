@@ -8,8 +8,7 @@ that each of the 7 unique tiles written to disk matches a hand-rolled
 einsum reference V^{μ_L, ν_L}_q[μ, ν] = Σ_G conj(ζ_L) · v_q · ζ_R
 on the per-q sphere.
 
-Single-device mesh, full BZ (no IBZ reduction — the bispinor writer
-always emits full-BZ ζ files in production via gw_init.fit_zeta).
+Single-device mesh, identity-group q-IBZ: all four q rows are parents.
 """
 from __future__ import annotations
 
@@ -49,7 +48,7 @@ def single_device_mesh():
 
 def _build_g_flat_zeta(tmp_path, name, *, fft_grid, kgrid, bvec, cutoff,
                         n_rmu, sys_dim, seed):
-    """Synthesise one full-BZ G-flat zeta file (writer convention)."""
+    """Synthesise all identity-group parent rows in canonical G-flat order."""
     nkx, nky, nkz = kgrid
     n_q_full = nkx * nky * nkz
     q_int = np.array(
@@ -93,6 +92,19 @@ def _build_g_flat_zeta(tmp_path, name, *, fft_grid, kgrid, bvec, cutoff,
     with h5py.File(out_path, 'a') as f:
         f.create_dataset('zeta_q_G', data=zeta_q_G)
     return out_path, zeta_q_G, q_frac, gvec_components, ngk_per_q
+
+
+def _identity_symmetry(kgrid):
+    """Use authenticated identity actions with every grid row retained as a parent."""
+    from types import SimpleNamespace
+    from symmetry_maps import SymMaps
+    points = np.stack(np.meshgrid(
+        *[np.arange(n) / n for n in kgrid], indexing="ij"), -1).reshape(-1, 3)
+    return SymMaps(SimpleNamespace(
+        kgrid=np.asarray(kgrid), kpoints=points, nkpts=len(points),
+        shift=np.zeros(3), ntran=1, sym_matrices=np.eye(3, dtype=int)[None],
+        translations=np.zeros((1, 3)), avec=np.eye(3),
+        atom_types=np.array([1]), atom_crys=np.zeros((1, 3)), trs_holds=False))
 
 
 def _ref_tile_V(zeta_L_disk, zeta_R_disk, q_frac, gvec_components, ngk_per_q,
@@ -178,6 +190,9 @@ def test_bispinor_7_tiles_match_einsum_reference(tmp_path, single_device_mesh):
             _, g0_by_channel = compute_V_q_bispinor_g_flat_to_h5(
                 zeta_C_loader=zC,
                 zeta_T_loaders=(zT1, zT2, zT3),
+                sym=_identity_symmetry(kgrid), use_ibz=True,
+                centroid_C_idx=zC.r_mu_fft_idx,
+                centroid_T_idx=zT1.r_mu_fft_idx,
                 output_h5_path=str(out_path),
                 mesh_xy=single_device_mesh,
                 kgrid=kgrid, fft_grid=fft_grid,
@@ -282,6 +297,9 @@ def test_bispinor_CC_tile_matches_charge_orchestrator(
             _, g0_by_channel = compute_V_q_bispinor_g_flat_to_h5(
                 zeta_C_loader=zC,
                 zeta_T_loaders=(zT1, zT2, zT3),
+                sym=_identity_symmetry(kgrid), use_ibz=True,
+                centroid_C_idx=zC.r_mu_fft_idx,
+                centroid_T_idx=zT1.r_mu_fft_idx,
                 output_h5_path=str(out_path),
                 mesh_xy=single_device_mesh,
                 kgrid=kgrid, fft_grid=fft_grid,

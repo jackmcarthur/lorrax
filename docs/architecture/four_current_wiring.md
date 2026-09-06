@@ -736,3 +736,5 @@ the head mechanism. Older packed files missing the factors refuse by name.
 
 
 The head attribution flag controls diagnostics only: both packed dispatch paths pass it to `compute_static_photon_sigma`, and `contract_lorentz_blocks` reuses each body Green tensor for the optional Γ-only contraction. Physical Γ completion and ordinary `Sigma blocks` output remain independent of this switch.
+
+The Gamma completion transports rank-four factor pairs over the authenticated active group and averages their products through `_photon_q0_factor_orbit`; physical updates and optional head attribution share that owner. The carrier stores the original factor pairs plus family-plan metadata, not a dense group projector. Dynamic tau projection accumulates file-wedge band rows and applies `unfold_file_wedge_band_operator(..., trs_rule="transpose")` after the frequency sum. Its Green endpoint transpose may be supplied directly by the sole planned Green GEMM, with unchanged complex-time weights; the typed symmetry service owns its placement and transport. See the 2026-09-06 decision for this interface correction.

@@ -774,3 +774,35 @@ def test_signed_current_z_host_store_fft_cancels_in_normal_solve():
     expected = np.linalg.solve(gram, physical)
     np.testing.assert_allclose(actual,expected,rtol=3e-11,atol=3e-11)
     assert np.max(np.abs(np.linalg.solve(data['C'],physical)-expected)) > .1
+
+
+def test_complex_time_parent_green_keeps_time_under_antiunitary_action(monkeypatch):
+    """At complex time TR transposes the orbital projector but never conjugates its signed time weight."""
+    from gw.greens_function_kernel import build_G_tau
+    import distrib_la
+    _cpu_algebra(monkeypatch)
+    mesh = _mesh()
+    plan = _toy_plan(mesh)
+    anti = plan.sym.operation_rows(plan.sym_idx)[2]
+    assert anti.any() and (~anti).any()
+    rng = np.random.default_rng(140)
+    raw = (rng.normal(size=(plan.n_parent,4,4,plan.n_centroid_packed))
+           +1j*rng.normal(size=(plan.n_parent,4,4,plan.n_centroid_packed)))/3
+    raw[...,plan.layout.axis.packed_to_canonical < 0] = 0
+    energy = np.arange(plan.n_parent)[:,None]/10 + np.array([-.8,-.2,.4,1.1])
+    signed = np.broadcast_to([1.,-.4,.7,0.],energy.shape)
+    mask = np.broadcast_to([True,True,False,True],energy.shape)
+    t, reference = .3+.7j, -.15
+    phase = np.exp(-t*(energy-reference))*signed*mask
+    put = lambda a,p:jax.device_put(a,NamedSharding(mesh,p))
+    actual = build_G_tau(put(raw.transpose(0,2,3,1),P(None,None,'x','y')),
+        put(raw,P(None,'x',None,'y')),jnp.asarray(energy),t,e_ref=reference,
+        band_weight=jnp.asarray(signed),mask=jnp.asarray(mask),
+        gemm=distrib_la.gemm_plan(mesh),k_unfold_plan=plan)
+    child = _literal_children(raw,plan)
+    expected = np.einsum('knam,kn,knbv->kambv',child,phase[plan.irr_idx],child.conj())
+    np.testing.assert_allclose(actual,expected,rtol=3e-13,atol=3e-13)
+    wrong_phase = phase[plan.irr_idx].copy()
+    wrong_phase[anti] = wrong_phase[anti].conj()
+    wrong = np.einsum('knam,kn,knbv->kambv',child,wrong_phase,child.conj())
+    assert np.max(np.abs(expected[anti]-wrong[anti])) > .1

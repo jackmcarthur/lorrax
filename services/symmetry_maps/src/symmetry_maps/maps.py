@@ -871,7 +871,11 @@ def unfold_isdf_operator(
         left_local_perm_arr=left_local_perm,
         right_local_perm_arr=right_local_perm,
         mesh_xy=mesh_xy)
-    return fn(V_q_ibz, pair_source) if pair_source is not None else fn(V_q_ibz)
+    if pair_source is not None:
+        pair_source = jax.device_put(
+            pair_source, NamedSharding(mesh_xy, P(None, 'y', 'x')))
+        return fn(V_q_ibz, pair_source)
+    return fn(V_q_ibz)
 
 
 def _permute_isdf_operator_axes_local(
@@ -1300,7 +1304,9 @@ def _get_unfold_isdf_operator_jit(
         return V_full_local
 
     if pair_transpose:
-        partner_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+        # Preserve a producer's reversed-axis placement; transposing an
+        # already oriented partner must not first reshard it back to X/Y.
+        partner_sh = NamedSharding(mesh_xy, P(None, "y", "x"))
 
         @partial(jax.jit, in_shardings=(V_sh, partner_sh), out_shardings=V_sh)
         def _do_unfold(V_ibz, pair_ibz):
@@ -1379,6 +1385,7 @@ def unfold_spin_centroid_operator(
     mesh_xy,
     logical_centroid_extent=None,
     axis_local=False,
+    operator_transpose=None,
 ):
     r"""Unfold an open-spin centroid operator from k parents to full k.
 
@@ -1396,6 +1403,11 @@ def unfold_spin_centroid_operator(
     ``Theta G(t) Theta^-1`` uses ``G(t)^T``; ``conj(G(t))`` would silently
     reverse ``t``.  The underlying ``pair_transpose`` rule also owns the
     nonsymmorphic lattice-wrap phase.
+
+    ``operator_transpose`` optionally supplies the same operator with its
+    complete endpoints already transposed, produced directly on X/Y shards.
+    The pair action retains its transpose rule and consumes that placement
+    without a processor-axis exchange.
 
     ``axis_local=True`` is accepted only when the supplied packed global
     source maps prove that every endpoint gather stays within its X/Y shard.
@@ -1465,6 +1477,13 @@ def unfold_spin_centroid_operator(
                 "unfold_spin_centroid_operator: merged endpoint extent "
                 f"{n_left * ns} is not divisible by X={px}.")
         local_perm = np.where(perm_ms < 0, -1, perm_ms % ((n_left * ns) // px))
+    pair = None
+    if operator_transpose is not None:
+        if operator_transpose.shape != operator_ibz.shape:
+            raise ValueError("operator_transpose must match the parent shape")
+        transposed_flat = jnp.transpose(
+            operator_transpose, (0, 2, 1, 4, 3)).reshape(flat.shape)
+        pair = jnp.swapaxes(transposed_flat, -2, -1)
     flat_full = unfold_isdf_operator(
         flat,
         irr_idx=irr_idx,
@@ -1475,6 +1494,7 @@ def unfold_spin_centroid_operator(
         mesh_xy=mesh_xy,
         n_sym_spatial=n_sym_spatial,
         trs_rule="pair_transpose",
+        trs_pair_q_ibz=pair,
         left_logical_extent=logical_mu * ns,
         right_logical_extent=logical_mu * ns,
         axis_local_sym_perm=local_perm,

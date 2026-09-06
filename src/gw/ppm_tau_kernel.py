@@ -104,7 +104,7 @@ def _make_project_ri_reduce_scatter(
     layout: str = "face", face_shape=None, face_band_extent=None,
     k_unfold_plan=None,
 ) -> Callable[..., jax.Array]:
-    """Select raw-parent rows, project there, and unfold band matrices with the typed transpose action."""
+    """Project raw-parent rows; the completed frequency sum owns the band unfold."""
     from common.contract_bands import contract_bands_block_reshard
 
     if k_unfold_plan is None or face_shape is None:
@@ -113,23 +113,15 @@ def _make_project_ri_reduce_scatter(
         raise ValueError(
             "_make_project_ri_reduce_scatter(k_unfold_plan=...) requires the "
             "face layout and the merged single-complex projection chain.")
-    from ffi import _services
-    _services.ensure_on_path()
-    from symmetry_maps import unfold_file_wedge_band_operator
     inner = contract_bands_block_reshard(
         mesh_xy, channels="none", layout="face",
         face_shape=(k_unfold_plan.n_parent, *face_shape[1:]),
         face_band_extent=face_band_extent)
     k_rows = np.asarray(k_unfold_plan.parent_full_rows, dtype=np.int32)
-    sym = k_unfold_plan.sym
 
     def project(psi_xr, sigma_k, psi_yn):
         sigma_parent = jnp.take(sigma_k, jnp.asarray(k_rows), axis=0)
-        # Σ transforms like G: the band matrix is TRANSPOSED on antiunitary
-        # rows (unfold_file_wedge_band_operator's derivation), never
-        # conjugated.
-        return unfold_file_wedge_band_operator(
-            sym, inner(psi_xr, sigma_parent, psi_yn), trs_rule="transpose")
+        return inner(psi_xr, sigma_parent, psi_yn)
 
     return project
 

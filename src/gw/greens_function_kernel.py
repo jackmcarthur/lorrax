@@ -168,6 +168,17 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
         mask = jnp.reshape(mask, enk.shape)
         phases = jnp.where(mask, phases,
                            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+    if k_unfold_plan is not None:
+        anti = k_unfold_plan.sym.operation_rows(k_unfold_plan.sym_idx)[2]
+        if anti.any():
+            # Equal endpoint faces give G^T = psi* f psi^T at the SAME
+            # complex time; conjugating f would reverse the lifetime.
+            parent = build_G(psi_xn, psi_yr, phases=phases,
+                             layout=layout, gemm=gemm)
+            transposed = build_G(jnp.conj(psi_xn), jnp.conj(psi_yr),
+                                 phases=phases, layout=layout, gemm=gemm)
+            return k_unfold_plan.unfold_operator(
+                parent, operator_transpose=transposed)
     return build_G(
         psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
         k_unfold_plan=k_unfold_plan)

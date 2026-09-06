@@ -272,7 +272,7 @@ def _integrate_sigma_batches(
     psi_proj_yn = pad_to_axis(
         psi_proj_yn, sigma_axis, axis=3)
     spatial_shape = (
-        int(meta.nk_tot), sigma_axis.carrier, sigma_axis.carrier)
+        int(k_unfold_plan.n_parent), sigma_axis.carrier, sigma_axis.carrier)
     face_kwargs["face_band_extent"] = sigma_axis.carrier
     if bracketed:
         shape = (len(brackets), omega.size, *spatial_shape)
@@ -467,6 +467,14 @@ def _integrate_sigma_batches(
         raise SystemExit(0)
 
     sigma = accumulator.finalize()
+    from symmetry_maps import unfold_file_wedge_band_operator
+    k_axis = 2 if bracketed else 1
+    # Transpose is complex-linear, so transport follows the complete omega
+    # fold without conjugating quadrature coefficients or storing tau tiles.
+    sigma = jax.jit(lambda value: jnp.moveaxis(
+        unfold_file_wedge_band_operator(
+            k_unfold_plan.sym, jnp.moveaxis(value, k_axis, 0),
+            trs_rule="transpose"), 0, k_axis))(sigma)
     if bracketed:
         sigma = jax.jit(
             lambda values: jnp.cumsum(values, axis=0),
