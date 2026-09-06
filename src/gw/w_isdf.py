@@ -2444,7 +2444,7 @@ def _fractional_pair_scan_face(
         """(nk, s, mu_X_loc, tile) un-conjugated, present on every rank —
         masked-gather + psum('y') from psi_mun's local shard (bands on
         'y').  psi_mun's own axis order (nk, s, mu, n) already matches
-        PSI_XN_SPEC's (nk, s, mu_X, n) -- no reorder needed."""
+        the direct endpoint (nk, s, mu_X, n) -- no reorder needed."""
         p = jnp.arange(tile, dtype=jnp.int32)
         global_band = g_lo + p
         owner = global_band // shard_w_y
@@ -2461,7 +2461,7 @@ def _fractional_pair_scan_face(
         'x'), then a LOCAL (no-comm, bounded-size — this tile is `tile`
         bands wide, not nb_full) axis reorder: psi_nmu stores (nk, n, s,
         mu), band axis SECOND, so the post-gather (nk, tile, s, mu_Y_loc)
-        needs one transpose to match PSI_YN_SPEC's (nk, s, mu, n) order."""
+        needs one transpose to match the band-last endpoint (nk, s, mu, n) order."""
         p = jnp.arange(tile, dtype=jnp.int32)
         global_band = g_lo + p
         owner = global_band // shard_w_x

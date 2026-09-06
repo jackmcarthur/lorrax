@@ -46,8 +46,7 @@ def _gather(a):
 
 
 def _host_inputs(rng, nk, nb, ns, nmu):
-    """(psi_rmu_Y, psi_rmuT_X) -- see wavefunction_bundle.build_wavefunctions'
-    docstring for the exact convention each carries."""
+    """Return direct Y samples and the conjugated, centroid-first X samples."""
     psi = (rng.standard_normal((nk, nb, ns, nmu))
            + 1j * rng.standard_normal((nk, nb, ns, nmu)))
     psi_rmuT_X = np.conj(psi).transpose(0, 3, 1, 2)

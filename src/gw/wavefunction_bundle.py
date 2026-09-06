@@ -1,51 +1,4 @@
-"""Canonical wavefunction storage for ISDF-basis GW calculations.
-
-``Wavefunctions`` carries a static ``layout`` tag (pytree aux/meta data —
-NOT a traced value) that selects one of two mutually exclusive
-representations.  ``low_mem_bands = false`` (the deck default) resolves to
-``layout = "legacy"`` on the exact construction path this module has
-always used; ``low_mem_bands = true`` resolves to ``layout = "face"``, a
-different set of fields entirely.  A jit that closes over a ``Wavefunctions``
-compiles a SEPARATE specialization per layout (the tag is meta, so it is
-part of the pytree treedef), never a value branch inside one kernel — see
-``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md`` §5.
-
-``layout = "legacy"`` — four device-distributed copies of ψ_nk(r_μ), one
-for each combination of {device axis} × {memory layout}:
-
-  psi_xn : (nk, s, μ_X, n)  bands fast, μ on X  →  G/χ₀ LHS (conj)
-  psi_xr : (nk, n, s, μ_X)  centroids fast, μ on X  →  Σ projection LHS (conj)
-  psi_yr : (nk, n, s, μ_Y)  centroids fast, μ on Y  →  G/χ₀ RHS
-  psi_yn : (nk, s, μ_Y, n)  bands fast, μ on Y  →  Σ projection RHS
-
-In all four layouts the spinor index s sits adjacent to the centroid
-index μ, so contractions that sum over (s, μ) pairs sweep contiguous memory.
-All four copies store the *un-conjugated* ψ; consumers that need ψ*
-apply :func:`jnp.conj` themselves.  Per-rank residency:
-``2·S/Px + 2·S/Py`` where ``S = 16·nk·nspinor·nb·nmu`` (one global
-complex128 ψ image) — see :func:`PSI_XN_SPEC` and its three siblings.
-
-``layout = "face"`` — exactly TWO copies, both 2-D sharded on the full
-(X, Y) mesh, both un-conjugated:
-
-  psi_nmu : (nk, n, s, μ)  P(None, 'x', None, 'y')  →  the (n, (s,μ)) face
-  psi_mun : (nk, s, μ, n)  P(None, None, 'x', 'y')  →  the ((s,μ), n) face
-
-Flattening ``(s, μ)`` only at the GEMM seam gives the two ``P(None,'x','y')``
-matrices every ``N,N`` cuBLASMp multiplication needs — see the audit's
-verdict for why ONE 2-D-sharded orientation is not enough (transposing a
-``P('x','y')`` array changes its physical orientation, and multi-rank
-cuBLASMp refuses transpose modes).  Per-rank residency: ``2·S/(Px·Py)`` —
-a ``2·√P`` reduction against legacy on a square mesh.  Legacy consumers
-that read ``psi_xn``/``psi_xr``/``psi_yr``/``psi_yn`` directly are not
-ported here; the four accessor METHODS below (``.xn()``/``.xr()``/
-``.yr()``/``.yn()``) refuse by name under ``layout = "face"`` rather than
-silently rebuilding a legacy replica.  Raw field access on the four legacy
-arrays under ``layout = "face"`` gets ``None`` (an unported consumer's
-``AttributeError`` on it is the correctness backstop, not the intended
-refusal path — the intended one is the deck-level envelope that keeps such
-a consumer from ever being reached under ``low_mem_bands = true``).
-"""
+"""Store raw-parent wavefunctions and transient two-face children with their band metadata."""
 from __future__ import annotations
 
 import dataclasses
@@ -218,12 +171,8 @@ class BandSlices:
 
 
 # ---------------------------------------------------------------------------
-# Sharding specs for the four ψ copies (2-D mesh with axes 'x', 'y').
+# Canonical face specs are shared with the ISDF and band-contraction owners.
 # ---------------------------------------------------------------------------
-PSI_XN_SPEC = P(None, None, 'x', None)   # (nk, s, μ_X, n)
-PSI_XR_SPEC = P(None, None, None, 'x')   # (nk, n, s, μ_X)
-PSI_YR_SPEC = P(None, None, None, 'y')   # (nk, n, s, μ_Y)
-PSI_YN_SPEC = P(None, None, 'y', None)   # (nk, s, μ_Y, n)
 
 # The two FACE specs are imported from ``common.wfn_layout`` and re-exported
 # here for the established GW public API.  See the module docstring and
@@ -268,7 +217,7 @@ CHI_R_SPEC = P(None, 'x', 'y')
 
 #: Valid ``Wavefunctions.layout`` tags.  Anything else refuses at
 #: construction (:meth:`Wavefunctions.__post_init__`).
-_LAYOUTS = ('legacy', 'face')
+_LAYOUTS = ('face',)
 
 
 @dataclass
@@ -306,129 +255,28 @@ jax.tree_util.register_dataclass(
 
 @dataclass
 class Wavefunctions:
-    """ψ_nk(r_μ) spanning [b0, b4), in ONE of two mutually exclusive
-    representations selected by the static ``layout`` tag.  See the module
-    docstring for the full field/spec table of each.
-
-    ``layout = "legacy"`` (default — ``low_mem_bands = false``) populates
-    ``psi_xn``/``psi_xr``/``psi_yr``/``psi_yn``; ``psi_nmu``/``psi_mun``
-    are ``None``.  ``layout = "face"`` (``low_mem_bands = true``) is the
-    reverse.  Construct through :func:`build_wavefunctions` (legacy) or
-    :func:`build_wavefunctions_face` (face) rather than this dataclass
-    directly — both name every field explicitly, including the ``None``
-    half, so a caller cannot omit the layout tag's inverse by accident.
-
-    Under ``layout = "face"`` BOTH faces are also ``None`` when the run
-    stores raw parents only (``gw_init`` parents-only storage): the
-    ``green_parent`` carrier is then every ψ the run has, and
-    :func:`face_extents` reads the full-k extents from it.
-    """
+    """Keep raw-parent storage or transient child faces beside replicated band metadata."""
 
     enk: jax.Array       # (nk, nb_full) replicated
-    #: (nk, nb_full) float64 replicated.  Storage is a WEIGHT, but only ρ
-    #: (``qsgw_density.rho_from_wfns``) consumes it as one today.  χ₀ takes
-    #: its val/cond split from a BAND-INDEX CUT (``minimax_screening.py``
-    #: :943-944, ``s.val``/``s.cond``) and the one Σ site that does read
-    #: this array thresholds it (``ppm_sigma.py``:181, ``occ_full > 0.5``).
-    #: So a fractional-occupation port must change those as well: filling
-    #: ``occ`` alone leaves χ₀ and Σ on a step function while ρ alone is
-    #: smeared, and nothing would flag the disagreement.  **Static Σ_x/Σ_SX
-    #: and V_H are DONE (2026-08-15):** they read the carried
-    #: ``OccupationState`` through ``cohsex_sigma.build_Gij``'s ``diag(f)``
-    #: branch, not this array, and fall back to the integer projector
-    #: bit-for-bit when no state is carried.
+    #: Full-k occupation metadata; parent weights reside with the parent faces.
     occ: jax.Array
     slices: BandSlices
-    # ---- legacy (four single-axis copies); None under layout="face" ----
-    psi_xn: jax.Array | None = None   # (nk, s, μ_X, n)
-    psi_xr: jax.Array | None = None   # (nk, n, s, μ_X)
-    psi_yr: jax.Array | None = None   # (nk, n, s, μ_Y)
-    psi_yn: jax.Array | None = None   # (nk, s, μ_Y, n)
-    # ---- face (two 2-D-sharded copies); None under layout="legacy" -----
     psi_nmu: jax.Array | None = None  # (nk, n_X, s, μ_Y)
     psi_mun: jax.Array | None = None  # (nk, s, μ_X, n_Y)
     #: Raw-parent faces in the same packed centroid order as every operator.
     #: They are the only stored faces when all consumers support parents.
     green_parent: ParentGreenCarrier | None = None
-    #: STATIC (pytree meta, never traced).  "legacy" | "face".
-    layout: str = "legacy"
+    #: The canonical face layout is static pytree metadata.
+    layout: str = "face"
     def __post_init__(self) -> None:
         if self.layout not in _LAYOUTS:
             raise ValueError(
                 f"Wavefunctions: layout={self.layout!r} not in {_LAYOUTS}.")
 
-    def _require_legacy(self, accessor: str) -> None:
-        """Refuse BY NAME rather than silently rebuild a legacy replica.
-
-        Called at the top of each ``.xn()``/``.xr()``/``.yr()``/``.yn()``
-        accessor body.  ``self.layout`` is pytree META (a Python string,
-        never a traced value) so this branch resolves at jax TRACE time:
-        under ``layout="legacy"`` it costs nothing (dead code eliminated
-        before any op is emitted, so the legacy jaxpr this accessor
-        produces is exactly what it always was); under ``layout="face"``
-        it raises before any op is emitted, which surfaces to the caller
-        as a normal Python exception out of the ``jax.jit`` call.
-        """
-        if self.layout != 'legacy':
-            raise ValueError(
-                f"Wavefunctions.{accessor}() is a legacy-layout accessor "
-                f"and refuses under layout={self.layout!r}: this bundle "
-                f"does not store psi_{accessor}.  Face layout stores "
-                f"psi_nmu/psi_mun (both 2-D sharded, P(None,'x','y') at "
-                f"the (s,μ) GEMM seam) — read those directly, or route "
-                f"through the layout-dispatching G/projection kernel "
-                f"rather than reconstructing a legacy view.")
-
-    # Slice accessors — bands is a Python ``slice`` (hashable in 3.12+) so
-    # jit can take it as static_argname.  Without these jits each accessor
-    # call (used heavily by chi/W/Σ) emits a fresh eager-pjit ``gather``,
-    # producing a tail of cache misses (~17/run on Si 4×4×4).
-    @functools.partial(jax.jit, static_argnames=('bands',))
-    def xn(self, bands: slice) -> jax.Array:
-        self._require_legacy('xn')
-        return self.psi_xn[:, :, :, bands]
-
-    @functools.partial(jax.jit, static_argnames=('bands',))
-    def xr(self, bands: slice) -> jax.Array:
-        self._require_legacy('xr')
-        return self.psi_xr[:, bands, :, :]
-
-    @functools.partial(jax.jit, static_argnames=('bands',))
-    def yr(self, bands: slice) -> jax.Array:
-        self._require_legacy('yr')
-        return self.psi_yr[:, bands, :, :]
-
-    @functools.partial(jax.jit, static_argnames=('bands',))
-    def yn(self, bands: slice) -> jax.Array:
-        self._require_legacy('yn')
-        return self.psi_yn[:, :, :, bands]
 
     @functools.partial(jax.jit, static_argnames=('bands',))
     def band_mask(self, bands: slice) -> jax.Array:
-        """Boolean ``(nk, nb_full)`` band-identity mask, True inside
-        ``bands`` — the face-layout bring-up path for band windows
-        (report §3, obstacle 3).  ``psi_nmu``/``psi_mun`` span the FULL
-        loaded [b0,b4) range and cannot legally be sliced to an arbitrary
-        logical window (the band axis is mesh-sharded on one face or the
-        other, and a window need not be mesh-divisible).  A window is
-        instead expressed as a WEIGHT that is exactly zero outside it —
-        this mask is that weight's boolean form, meant for
-        ``greens_function_kernel.build_G_tau``'s ``mask=`` under
-        ``layout='face'`` (the SAME parameter legacy Σ already uses for
-        its own band-identity selector, ``mask_A``).
-
-        COST, named rather than hidden: every masked face call pays the
-        FULL nb_full GEMM, not the windowed one — the bring-up path
-        "repeats full-band GEMM work for val/cond and for every Sigma
-        bracket" (report §3's own words).
-
-        Legal under EITHER layout (only ``self.enk``'s shape is read),
-        but only a face caller needs it — a legacy accessor already
-        returns the exact physical slice and has no residual bands to
-        zero.  Zero-weighted bands are NOT automatically safe for an
-        eigensolve or an occupation sum fed by this mask's caller; this
-        helper only guarantees the G/Σ *contraction* ignores them.
-        """
+        """Select the logical band interval without slicing a mesh-sharded face."""
         nb_full = int(self.enk.shape[1])
         lo = int(bands.start or 0)
         hi = int(bands.stop if bands.stop is not None else nb_full)
@@ -444,81 +292,9 @@ class Wavefunctions:
 # treedef, and a compiled carrier round-trip cannot silently discard one.
 jax.tree_util.register_dataclass(
     Wavefunctions,
-    data_fields=['psi_xn', 'psi_xr', 'psi_yr', 'psi_yn',
-                 'psi_nmu', 'psi_mun', 'green_parent', 'enk', 'occ'],
+    data_fields=['psi_nmu', 'psi_mun', 'green_parent', 'enk', 'occ'],
     meta_fields=['slices', 'layout'],
 )
-
-
-@functools.partial(
-    jax.jit, static_argnames=("state_bands", "projection_bands"))
-def projected_state_amplitude_envelope(
-    wfns: Wavefunctions,
-    *,
-    state_bands: slice,
-    projection_bands: slice,
-) -> jax.Array:
-    """State weights from the actual Sigma band-projection carriers.
-
-    For one intermediate state ``n``, the ISDF Green function contains the
-    outer product of that state's left/right centroid wavefunctions.  The
-    final Sigma element contains the corresponding left/right projection
-    carriers from the requested output subspace
-    (``docs/theory/physics.md``, section 5).  Cauchy--Schwarz gives the
-    per-k state-side projected matrix-element envelope
-
-    ``A_kn = ||psi^L_kn|| ||psi^R_kn||
-             max_i||psi^L_ki|| max_j||psi^R_kj||``.
-
-    The state factors are returned for ``state_bands``; the projection maxima
-    are measured on ``projection_bands``.  All four legacy carriers, or both
-    orientations of the face carrier, therefore enter with their actual
-    values instead of assuming the nominally equivalent copies are identical.
-    Thus planner mass follows the real requested matrix-element projection
-    instead of assigning unit amplitude to every state.  It remains an
-    operator envelope: spatial pole phases and cancellation are deliberately
-    not converted into a claim of physical relative Sigma accuracy.
-
-    Parameters
-    ----------
-    wfns : Wavefunctions
-        Canonical wavefunction carrier in either legacy or face layout.
-    state_bands : slice
-        Intermediate-state band range used by the Green function.
-    projection_bands : slice
-        Requested Sigma output band range.
-
-    Returns
-    -------
-    jax.Array, shape (nk, n_state_bands)
-        Nonnegative projected state-amplitude envelopes.  Reductions over
-        centroid axes retain the carrier's named sharding semantics.
-    """
-    if wfns.layout == "legacy":
-        state_left = jnp.sqrt(jnp.sum(
-            jnp.abs(wfns.xn(state_bands)) ** 2, axis=(1, 2)))
-        state_right = jnp.sqrt(jnp.sum(
-            jnp.abs(wfns.yr(state_bands)) ** 2, axis=(2, 3)))
-        projection_left = jnp.max(jnp.sqrt(jnp.sum(
-            jnp.abs(wfns.xr(projection_bands)) ** 2, axis=(2, 3))), axis=1)
-        projection_right = jnp.max(jnp.sqrt(jnp.sum(
-            jnp.abs(wfns.yn(projection_bands)) ** 2, axis=(1, 2))), axis=1)
-        return (state_left * state_right
-                * projection_left[:, None] * projection_right[:, None])
-
-    # Face-layout ψ cannot be sliced at an arbitrary band boundary.  Reduce
-    # its full two orientations first, use the canonical small band mask for
-    # the projection maximum, and slice only the resulting (nk, nb) weights.
-    left_norm = jnp.sqrt(jnp.sum(jnp.abs(wfns.psi_mun) ** 2, axis=(1, 2)))
-    right_norm = jnp.sqrt(jnp.sum(jnp.abs(wfns.psi_nmu) ** 2, axis=(2, 3)))
-    projection_mask = wfns.band_mask(projection_bands)
-    projection_left = jnp.max(
-        jnp.where(projection_mask, right_norm, 0.0), axis=1)
-    projection_right = jnp.max(
-        jnp.where(projection_mask, left_norm, 0.0), axis=1)
-    state_weight = (left_norm * right_norm
-                    * projection_left[:, None] * projection_right[:, None])
-    return state_weight[:, state_bands]
 
 
 @dataclass(frozen=True)
@@ -574,32 +350,13 @@ def face_extents(wfns: "Wavefunctions") -> tuple[int, int, int]:
 
 
 def face_kernel_kwargs(wfns: "Wavefunctions", wfns_right=None) -> dict:
-    """``{}`` under ``layout='legacy'``; ``{"layout": "face", "face_shape":
-    (nk, nb_full, n_rmu, nspinor)}`` under ``layout='face'``.  With a
-    distinct right endpoint, also returns ``right_face_shape`` when its
-    centroid extent differs.
-
-    THE single source of truth for the layout/face_shape kwargs every
-    layout-dispatching kernel factory in this codebase needs
-    (``common.contract_bands.contract_bands_block_reshard``,
-    ``gw.cohsex_sigma._make_cohsex_kernels``, ``gw.ppm_tau_kernel``'s
-    kij/spatial/tau kernel factories, ``gw.mpa.sigma``'s shared tau
-    kernel call) — read off ``wfns.psi_mun``'s own shape rather than
-    threaded in by every call site, since the bundle already carries it.
-    Originally ``cohsex_sigma._face_kwargs`` (2026-08-22 COHSEX face
-    port); moved here and generalised the same day so the dynamic PPM/MPA
-    Σ_c(τ) port could reuse it rather than re-deriving the same 4-tuple
-    a second time (TASTE microservice rule: a routine used in 2+ places
-    gets one owner).
-    """
+    """Read canonical endpoint face shapes from parent or transient child carriers."""
     if wfns_right is None:
         wfns_right = wfns
     if wfns.layout != wfns_right.layout:
         raise ValueError(
             "face_kernel_kwargs: endpoint layouts differ: "
             f"{wfns.layout!r} vs {wfns_right.layout!r}")
-    if wfns.layout != "face":
-        return {}
     nk, s, mu = face_extents(wfns)
     nk_r, s_r, mu_r = face_extents(wfns_right)
     left_shape = (nk, wfns.slices.nb_full, mu, s)
@@ -696,8 +453,7 @@ def build_packed_parent_green_carrier(
     """Bind raw-parent faces to the full-k bundle's scalar tables."""
     if wfns.layout != "face":
         raise ValueError(
-            "build_packed_parent_green_carrier requires layout='face'; "
-            "the legacy bundle retains its established full-k local GEMMs.")
+            "build_packed_parent_green_carrier requires canonical face layout.")
     expected_nmu = (
         int(plan.n_parent), int(wfns.slices.nb_full), int(plan.nspinor),
         int(plan.n_centroid_packed))
@@ -748,76 +504,20 @@ def attach_parent_green_carrier(
         wfns, psi_nmu, psi_mun, plan=plan, mesh_xy=mesh_xy)
 
 
-# ---------------------------------------------------------------------------
-# Bispinor Σ^B: γ̃ vertex insertion — representation-aware, bundle-owned
-# (census row "Bispinor transverse exchange",
-# reports/gwjax_low_mem_bands_audit_2026-08-22/report.md).  Both
-# consumers below used to live in gw.sigma_x_bispinor, hard-coded to the
-# legacy field names; moved here so a caller gets the right field for
-# WHICHEVER layout its bundle carries, without re-deriving the mapping.
-# ---------------------------------------------------------------------------
-
 def psi_field_names(layout: str) -> tuple[str, ...]:
-    """The populated ψ field names for ``layout`` — ``('psi_xn', 'psi_xr',
-    'psi_yr', 'psi_yn')`` for ``'legacy'``, ``('psi_nmu', 'psi_mun')`` for
-    ``'face'``.  One place naming which fields are live per layout, so
-    :func:`bundle_bytes_per_rank` and any future per-field consumer read
-    the same list rather than re-deriving it."""
-    if layout == "legacy":
-        return ("psi_xn", "psi_xr", "psi_yr", "psi_yn")
-    if layout == "face":
-        return ("psi_nmu", "psi_mun")
-    raise ValueError(f"psi_field_names: unknown layout {layout!r}")
+    """Name the two canonical face orientations for residency accounting."""
+    if layout != "face":
+        raise ValueError(f"psi_field_names: unknown layout {layout!r}")
+    return ("psi_nmu", "psi_mun")
 
 
 def padded_centroid_extent(wfns: "Wavefunctions") -> int:
-    """PADDED centroid (μ) extent of ``wfns``, whichever field carries it.
-
-    ``psi_yr``'s trailing axis under ``'legacy'``, ``psi_mun``'s μ axis
-    (index 2) under ``'face'`` — the SAME logical quantity
-    (``load_centroids_band_chunked``'s mesh-padded ``n_rmu``), carried by a
-    different field per layout.  The ONE owner of that read: the packed
-    photon response, the sixteen-block photon Σ and the bare Σ^B all pad
-    their on-disk V tiles up to this extent and must agree on it.
-    """
-    if wfns.layout == "legacy":
-        return int(wfns.psi_yr.shape[-1])
-    if wfns.layout == "face":
-        return face_extents(wfns)[2]
-    raise ValueError(
-        f"padded_centroid_extent: unknown layout {wfns.layout!r}")
+    """Read the packed centroid extent from the parent or transient face carrier."""
+    return face_extents(wfns)[2]
 
 
 def bundle_bytes_per_rank(wfns: "Wavefunctions") -> dict:
-    """MEASURED (never modeled) per-rank byte residency of this bundle's
-    ψ fields, read off each array's OWN ``.addressable_shards`` — the
-    same instrument ``docs/architecture/zeta_fit_face_psi_cct.md``'s own
-    verification section prefers over a sharding-blind global-shape read
-    (``KNOWN_LORRAX_ISSUES.md``'s ``mem_probe`` row: a global shape
-    cannot tell a genuinely 2-D-sharded array from a same-shape
-    single-axis one).
-
-    Returns ``{field: bytes, ..., 'total': bytes}`` over
-    :func:`psi_field_names` for this bundle's own ``layout``.  When a
-    raw-parent Green carrier is attached, its two ψ faces are included under
-    ``green_parent.psi_nmu``/``green_parent.psi_mun``; the small replicated
-    energy/occupation tables follow the established convention and are not
-    part of this ψ inventory.
-
-    Named consumer: the bispinor Σ^B transverse-centroid bundle DOUBLES
-    whichever psi inventory a run already carries — a second, independent
-    :class:`Wavefunctions` on a different (usually smaller) centroid set.
-    This module's own docstring states the closed form
-    (``2·S/Px + 2·S/Py`` legacy, ``2·S/(Px·Py)`` face) but
-    ``gw.gflat_memory_model`` never prices it — that planner's own scope
-    note is Stages A-F, the ISDF fit through the V_q tensor write, and
-    explicitly NOT the post-fit Σ-stage bundle a second call to
-    :func:`build_wavefunction_bundle`/:func:`build_wavefunctions_face`
-    produces.  Measuring the REAL bundle here, after construction, is
-    simpler and strictly more trustworthy than adding a second, parallel
-    model of the same number; see ``gw.sigma_x_bispinor``'s disclosure
-    print for the call site.
-    """
+    """Count addressable bytes of stored parent and transient child faces on this rank."""
     out: dict = {}
     for f in psi_field_names(wfns.layout):
         arr = getattr(wfns, f)
@@ -862,88 +562,11 @@ def _build_occ(enk_full, slices, efermi):
     return jnp.asarray(occ)
 
 
-def build_wavefunctions(
-    psi_rmu_Y, psi_rmuT_X, *, enk_full, slices, mesh_xy, efermi=None,
-    basis_receipt=None,
-) -> Wavefunctions:
-    """Assemble the four-copy ``Wavefunctions`` bundle from the two
-    centroid-sampled arrays produced by ``load_centroids_band_chunked``.
-
-    Both inputs cover the full band range [b0, b4).
-
-    ``psi_rmu_Y``   (nk, nb, ns, n_rmu)   P(None, None, None, 'y')
-                    un-conjugated ψ.
-    ``psi_rmuT_X``  (nk, n_rmu, nb, ns)   P(None, 'x', None, None)
-                    conjugated ψ* (layout picked by the ISDF pair-density
-                    kernel); a single :func:`jnp.conj` here undoes that
-                    convention to match the bundle-wide un-conjugated
-                    storage.
-
-    No cross-device reshards are emitted: the y-sharded copies are
-    derived from ``psi_rmu_Y`` and the x-sharded copies from
-    ``psi_rmuT_X``.  Each transpose preserves the μ axis's sharding.
-    """
-    with mesh_xy:
-        # y-sharded copies — both from psi_rmu_Y.
-        psi_yr = jax.lax.with_sharding_constraint(
-            psi_rmu_Y, NamedSharding(mesh_xy, PSI_YR_SPEC))
-        psi_yn = jax.lax.with_sharding_constraint(
-            psi_rmu_Y.transpose(0, 2, 3, 1),
-            NamedSharding(mesh_xy, PSI_YN_SPEC))
-
-        # x-sharded copies — conj to undo the pair-density kernel's ψ*.
-        psi_X = jnp.conj(psi_rmuT_X)
-        psi_xn = jax.lax.with_sharding_constraint(
-            psi_X.transpose(0, 3, 1, 2),    # (nk, ns, μ_X, nb)
-            NamedSharding(mesh_xy, PSI_XN_SPEC))
-        psi_xr = jax.lax.with_sharding_constraint(
-            psi_X.transpose(0, 2, 3, 1),    # (nk, nb, ns, μ_X)
-            NamedSharding(mesh_xy, PSI_XR_SPEC))
-
-        occ_full = _build_occ(enk_full, slices, efermi)
-        rep2 = NamedSharding(mesh_xy, P(None, None))
-        enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
-        occ_full = jax.lax.with_sharding_constraint(occ_full, rep2)
-
-    wfns = Wavefunctions(
-        psi_xn=psi_xn, psi_xr=psi_xr, psi_yr=psi_yr, psi_yn=psi_yn,
-        enk=enk_full, occ=occ_full, slices=slices)
-    if basis_receipt is not None:
-        basis_receipt.assert_matches_carrier(
-            wfns, where="build_wavefunctions")
-    return wfns
-
-
 def build_wavefunctions_face(
     psi_rmu_Y, psi_rmuT_X, *, enk_full, slices, mesh_xy, efermi=None,
     basis_receipt=None,
 ) -> Wavefunctions:
-    """Assemble the ``layout="face"`` ``Wavefunctions`` bundle
-    (``low_mem_bands = true``) from the SAME two centroid-sampled arrays
-    :func:`build_wavefunctions` consumes — ``psi_rmu_Y``/``psi_rmuT_X`` as
-    produced by ``load_centroids_band_chunked`` / the ISDF fit's pair-density
-    kernel.  See that function's docstring for their shapes/specs.
-
-    Both faces are FREE resharding constraints, no transpose collective and
-    no gather, for the same reason the four legacy copies are free (see
-    :func:`build_wavefunctions`'s docstring): the band axis n is fully
-    REPLICATED in both inputs, so placing it on a mesh axis the array does
-    not already use is a local per-rank slice, not communication.
-
-      psi_nmu = psi_rmu_Y, band axis n moved onto 'x'.  ``psi_rmu_Y``'s own
-                axis order (nk, n, s, μ) already equals ``PSI_NMU_SPEC``'s
-                — no transpose, just the constraint.
-      psi_mun = conj(psi_rmuT_X), transposed (nk,μ,n,s) -> (nk,s,μ,n) to
-                match ``PSI_MUN_SPEC``'s axis order, band axis n moved
-                onto 'y'.
-
-    Per-rank residency after this call is ``2·S/(Px·Py)`` against
-    :func:`build_wavefunctions`'s ``2·S/Px + 2·S/Py`` — the memory result
-    ``low_mem_bands`` exists for.  Callers on the fresh-fit path should
-    drop their reference to ``psi_rmu_Y``/``psi_rmuT_X`` immediately after
-    this returns (``del``) so the single-axis fit copies do not sit
-    resident alongside the face copies through V/W/Σ.
-    """
+    """Assemble canonical faces from direct Y samples and conjugated X samples."""
     with mesh_xy:
         psi_nmu = jax.lax.with_sharding_constraint(
             psi_rmu_Y, NamedSharding(mesh_xy, PSI_NMU_SPEC))
@@ -1243,35 +866,12 @@ def _rotate_parent_carrier(carrier, U_placed, *, a_lo, nb_active, nb_full,
 # the AOT memory model) operate at the bundle's seam.
 # ---------------------------------------------------------------------------
 
-def project(psi_xr, psi_yn, sigma_k, *, layout='legacy', mesh_xy=None,
+def project(psi_xr, psi_yn, sigma_k, *, layout='face', mesh_xy=None,
            face_shape=None, right_face_shape=None, face_project_fn=None):
-    """Σ(nk, s, μ, s, μ) → Σ(nk, m, n) in band basis.
-
-    ``layout='legacy'`` (default): the exact body this function has always
-    had — ``psi_xr``/``psi_yn`` are the legacy bundle fields.  UNCHANGED
-    by this parameter's addition (dead code eliminated at trace time for
-    every existing caller, none of which pass ``layout``).
-
-    ``layout='face'``: this is the "older COHSEX facade" the audit report
-    names (§5) — it now ROUTES rather than re-implements, through
-    ``common.contract_bands.contract_bands_block_reshard(layout='face')``,
-    the single owner of both the legacy and face band projection.
-    ``psi_xr``/``psi_yn`` are then actually ``psi_nmu``/``psi_mun`` (same
-    two argument SLOTS, same meaning across layouts: first operand
-    conjugated inside, second used as-is — see that module's docstring).
-    Pass a pre-built ``face_project_fn`` (from the SAME factory call, e.g.
-    built once inside a kernel factory alongside ``_Gv_fftn`` et al.) to
-    avoid rebuilding — and re-warming — two ``distrib_la.gemm_plan``s on
-    every call; ``mesh_xy``/``face_shape`` are the fallback that builds
-    one inline (correct but wasteful if called repeatedly).
-    """
-    if layout == 'legacy':
-        left = jnp.einsum('kmsx,ksxty->kmty',
-                          jnp.conj(psi_xr), sigma_k, optimize=True)
-        return jnp.einsum('kmty,ktyn->kmn', left, psi_yn, optimize=True)
+    """Project a centroid operator through the shared canonical face contraction."""
     if layout != 'face':
         raise ValueError(
-            f"project: layout must be 'legacy' or 'face', got {layout!r}")
+            f"project: layout must be 'face', got {layout!r}")
     fn = face_project_fn
     if fn is None:
         if mesh_xy is None or face_shape is None:
@@ -1284,18 +884,3 @@ def project(psi_xr, psi_yn, sigma_k, *, layout='legacy', mesh_xy=None,
             mesh_xy, layout='face', face_shape=face_shape,
             right_face_shape=right_face_shape)
     return fn(psi_xr, sigma_k, psi_yn)
-
-
-def project_ri(psi_xr, psi_yn, sigma_k):
-    """Σ(nk, s, μ, s, μ) → (2, nk, m, n) with [Re, Im] channels.
-
-    Used by the windowed PPM Σ^c(ω) τ-loop, where the crossing window
-    keeps only ``Im[coeff·σ^τ]`` so σ^τ has to carry both channels.
-    A sharded reduce-scatter variant lives in ``ppm_sigma`` for the
-    multi-device path.
-    """
-    sigma_ri = jnp.stack((jnp.real(sigma_k), jnp.imag(sigma_k)), axis=0)
-    left = jnp.einsum('kmsx,cksxty->ckmty',
-                      jnp.conj(psi_xr), sigma_ri, optimize=True)
-    return jnp.einsum('ckmty,ktyn->ckmn',
-                      left, psi_yn, optimize=True).astype(jnp.complex128)

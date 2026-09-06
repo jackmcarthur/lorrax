@@ -686,3 +686,8 @@ and the internal screening probe's full-q oracle remain shared functionality.
 ### 2026-09-06 — parent-only dynamic Sigma contraction
 
 GW tau and static-limit spatial factories require the typed parent plan and canonical face shapes. Band brackets use masks over those resident parents. The retired full-k/split-channel projection wrappers and slicing loops have no production caller; the shared `common.contract_bands` primitive remains for BSE and its direct tests. Bracketed stage-timing remains explicitly unsupported.
+
+
+### 2026-09-06 — remove the four-copy GW carrier
+
+`Wavefunctions` no longer has psi_xn/psi_xr/psi_yr/psi_yn, their accessors or the old builder. Its persistent GW samples reside in `ParentGreenCarrier`. The two optional face fields remain for bounded head-star children and independent numerical oracles; `gw_init` does not populate full-k faces. Receipts inspect the two supported orientations and parent samples. The unused amplitude envelope and real/imaginary projection wrapper are retired; BSE/htransform shared raw-array services remain. The obsolete full-k persistence gate is replaced by `bispinor_parent_faces_gate.py` and `bispinor_parent_restart_gate.py`.

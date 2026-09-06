@@ -323,9 +323,9 @@ def fit_zeta_to_h5(
 
     The centroid wavefunctions are inputs, not outputs — the caller is
     expected to hold the single ``load_centroids_band_chunked`` result and
-    reuse it for :func:`gw.wavefunction_bundle.build_wavefunctions` (or,
-    under ``low_mem_bands``, the pre-built face carrier via
-    :func:`gw.wavefunction_bundle.wavefunctions_face_from_restart`) after
+    reuse it for :func:`gw.wavefunction_bundle.parent_faces` or
+    the pre-built face carrier via
+    :func:`gw.wavefunction_bundle.wavefunctions_face_from_restart` after
     the fit completes.
     """
     if low_mem_bands:

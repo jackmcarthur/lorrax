@@ -496,8 +496,7 @@ def _sx_fixture():
     occ = np.zeros((1, _SX_NB))
     occ[0, :_SX_NELEC] = 1.0
     wfns = Wavefunctions(
-        psi_xn=jnp.asarray(psi_xn), psi_xr=jnp.asarray(psi_xr),
-        psi_yr=jnp.asarray(psi_yr), psi_yn=jnp.asarray(psi_yn),
+        psi_mun=jnp.asarray(psi_xn), psi_nmu=jnp.asarray(psi_yr),
         enk=jnp.asarray(enk), occ=jnp.asarray(occ), slices=slices)
     meta = SimpleNamespace(nk_tot=1, nb_sigma=_SX_NB, nelec=_SX_NELEC,
                            kgrid=(1, 1, 1), nspin=1, nspinor=2)
@@ -553,9 +552,9 @@ def _sx_parent_bundle(wfns, mesh):
         (3, 1, 1), mesh, nspinor=1)
     carrier = ParentGreenCarrier(
         psi_mun=jax.device_put(
-            wfns.psi_xn, NamedSharding(mesh, P(None, None, "x", "y"))),
+            wfns.psi_mun, NamedSharding(mesh, P(None, None, "x", "y"))),
         psi_nmu=jax.device_put(
-            wfns.psi_yr, NamedSharding(mesh, P(None, "x", None, "y"))),
+            wfns.psi_nmu, NamedSharding(mesh, P(None, "x", None, "y"))),
         enk=wfns.enk, occ=wfns.occ, plan=plan)
     return Wavefunctions(enk=wfns.enk, occ=wfns.occ, slices=wfns.slices,
                          green_parent=carrier, layout="face")

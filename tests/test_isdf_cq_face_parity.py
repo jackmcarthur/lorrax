@@ -132,8 +132,7 @@ def check_cq_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full, l_range,
     # psi_full[k, n(band), s(spin), mu] -- raw, un-conjugated ground truth.
     psi_full = _crand(rng, nk, nb_full, ns, n_rmu)
 
-    # The loader's documented convention (wavefunction_bundle.
-    # build_wavefunctions's own docstring): psi_rmu_Y is raw psi;
+    # The loader's convention: psi_rmu_Y is raw psi;
     # psi_rmuT_X is ALREADY psi* (conjugated), transposed to (k, mu, n, s).
     psi_rmu_Y_loaded = psi_full
     psi_rmuT_X_loaded = np.conj(psi_full).transpose(0, 3, 1, 2)

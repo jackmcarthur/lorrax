@@ -1970,8 +1970,7 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
 
       V_qmunu, S_qmunu, V0_noG0_munu, G0_mu_nu, enk_full
       psi_rmu_Y   (nk, nb, ns, n_rmu)   P(None, None, None, 'y')
-                  un-conjugated ψ, for :func:`gw.wavefunction_bundle.
-                  build_wavefunctions`.
+                  un-conjugated ψ for raw centroid-sample consumers.
       psi_rmuT_X  (nk, n_rmu, nb, ns)   P(None, 'x', None, None)
                   conjugated ψ* (matches the pair-density convention
                   ``load_centroids_band_chunked`` uses).  Derived from

@@ -45,7 +45,7 @@ def centroid_table_md5(centroid_fft_idx) -> str:
 class WavefunctionBasisReceipt:
     """Immutable identity of psi sampled at one ordered centroid table.
 
-    This host-only receipt deliberately excludes the legacy/face carrier
+    This host-only receipt deliberately excludes the numerical carrier
     layout.  It includes both the full-Bloch transform convention and the
     optional kinetic-balance lift, because a scalar two-spinor carrier and a
     four-component bispinor carrier can originate from the same WFN file,
@@ -368,8 +368,6 @@ class WavefunctionBasisReceipt:
         parent_faces = (() if parent is None else
                         ((parent.psi_nmu, 3, 2), (parent.psi_mun, 2, 1)))
         for value, mu_axis, spin_axis in (
-                (carrier.psi_xn, 2, 1), (carrier.psi_xr, 3, 2),
-                (carrier.psi_yr, 3, 2), (carrier.psi_yn, 2, 1),
                 (carrier.psi_nmu, 3, 2), (carrier.psi_mun, 2, 1),
                 *parent_faces):
             if value is not None:
