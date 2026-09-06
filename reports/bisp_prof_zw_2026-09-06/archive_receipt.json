@@ -1,0 +1,9 @@
+{
+  "destination": "/global/cfs/cdirs/m4598/jackm/lorrax_evidence/bisp_prof_zw_2026-09-06",
+  "archive": "/global/cfs/cdirs/m4598/jackm/lorrax_evidence/bisp_prof_zw_2026-09-06/evidence.tar",
+  "sha256": "6ad595eda36bb279ae454ac0f99b140ab4c857b231eb2b40563630dffe91d2f0",
+  "files": 17601,
+  "payload_bytes": 317541804,
+  "archive_bytes": 348641280,
+  "scope": "named lane logs/manifests/scripts/native captures; rank-zero optimized HLO and memory reports; selected zeta/rules; source snapshots and parser owners; no full WFN inputs or other-rank HLO"
+}
