@@ -469,3 +469,9 @@ Run provenance correction: candidate manifests retain donor `source.commit`/inst
 **Final executor attribution isolates two pole packs at0.152215s and one0.123126s compilation, with exact science** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0.
 
 Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/47_P_executor_seams; [lx] step lx-Xg4-040611-162030-1739 exit 0 in 95 s.
+
+## Shape-class scan on 6x6
+
+Preregistered baseline: orchestrator71ae0bde, fetched and rebased before implementation. Source is compared byte-for-byte against that pin. The optional prior block-spin change is not on the orchestrator pin and is excluded from this experiment. Pool57982945 is authorized; sequential P4 legs precede any available P16 leg. Decks/immutable inputs come from MoS2/42_bisp_scale_2026-09-06, with private copied tmp/rules.
+
+Plan: four ordered endpoint classes; one unvertexed G and its transform per class/term. Distinct W_AB prevents reusing one block's convolution result. Stream canonical gamma-weighted products through a compiled scan, then perform the shared inverse operation/projection on the class sum; do not stack Green tensors. Preserve the existing FFT normalization owner and symmetry actions. Compare printed outputs before accepting changed summation placement. Attribute factories, synchronization fences, restore dispatch and outer Python work before source changes.
