@@ -78,7 +78,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             complex_contour: bool = False,
                             layout: str = "face", face_shape=None,
                             right_face_shape=None,
-                            vertex_pair=None,
+                            vertex_pairs=None,
                             k_unfold_plan=None):
     """Build the face or parent minimax response with vertices applied after unfold."""
     nkx, nky, nkz = kgrid
@@ -94,19 +94,18 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         raise ValueError(
             f"_get_chi_minimax_kernel: layout must be 'face', "
             f"got {layout!r}")
-    if vertex_pair is not None:
-        vertex_pair = tuple(int(v) for v in vertex_pair)
-        if len(vertex_pair) != 2 or any(v not in range(4) for v in vertex_pair):
-            raise ValueError("vertex_pair must contain two Lorentz indices in 0..3.")
-    if vertex_pair and n_out != 1:
-        raise ValueError(
-            "four-current vertex chi currently supports one static output "
-            "per tau sweep")
-    vertex_class = (None if vertex_pair is None else
-                    tuple(v == 0 for v in vertex_pair))
+    vertex_classes = None
+    if vertex_pairs is not None:
+        vertex_pairs = tuple(tuple(int(v) for v in pair) for pair in vertex_pairs)
+        if not vertex_pairs or any(len(pair) != 2 or any(v not in range(4) for v in pair)
+                                   for pair in vertex_pairs):
+            raise ValueError("vertex_pairs must name nonempty Lorentz pairs in 0..3.")
+        vertex_classes = tuple(tuple(v == 0 for v in pair) for pair in vertex_pairs)
+        if len(set(vertex_classes)) != 1 or n_out != 1:
+            raise ValueError("Vertex outputs must share one family pair and one static rule.")
     cache_key = (id(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
-                 vertex_class, (tuple(id(p) for p in k_unfold_plan)
+                 vertex_classes, (tuple(id(p) for p in k_unfold_plan)
                                if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)))
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
@@ -118,15 +117,44 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     kernel = _get_chi_minimax_kernel_face(
         mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
         right_face_shape=right_face_shape,
-        vertex_pair=vertex_pair,
+        vertex_pairs=vertex_pairs,
         k_unfold_plan=k_unfold_plan)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
 
+def _contract_chi_vertices(Gv_R, Gc_R, operands, identities, complex_contour):
+    """Contract Hermitian endpoint vertices and complete their ordered orientations."""
+    from common.gamma_matrices import gamma_double_contract
+    left_identity, right_identity = identities
+    reverse = None
+    if operands is None or (left_identity and right_identity):
+        forward = jnp.einsum('Rambn,Rambn->Rmn', Gc_R, jnp.conj(Gv_R), optimize=True)
+    else:
+        perm_l, phase_l, perm_r, phase_r = operands
+        forward = gamma_double_contract(
+            jnp.conj(Gv_R), Gc_R,
+            perm_L=None if left_identity else perm_l,
+            phase_L=None if left_identity else phase_l,
+            perm_R=None if right_identity else perm_r,
+            phase_R=None if right_identity else jnp.conj(phase_r),
+            spin_axes=(1, 3))
+        Gv_R_ba = jnp.transpose(Gv_R, (0, 3, 4, 1, 2))
+        Gc_R_ba = jnp.transpose(Gc_R, (0, 3, 4, 1, 2))
+        reverse = gamma_double_contract(
+            jnp.conj(Gv_R_ba), Gc_R_ba,
+            perm_L=None if right_identity else perm_r,
+            phase_L=None if right_identity else jnp.conj(phase_r),
+            perm_R=None if left_identity else perm_l,
+            phase_R=None if left_identity else phase_l,
+            spin_axes=(1, 3))
+    return (forward if complex_contour else
+            _complete_static_vertex_orientations(forward, reverse))
+
+
 def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                                  face_shape, *, right_face_shape=None,
-                                 vertex_pair=None,
+                                 vertex_pairs=None,
                                  k_unfold_plan=None):
     """Build masked valence/conduction Green functions and integrate both response orientations."""
     from common.fft_helpers import make_flat_k_fftn
@@ -278,74 +306,36 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
         return minimax_tau_integrate_chi_multi
 
-    if vertex_pair:
-        from common.gamma_matrices import gamma_double_contract
-    left_identity, right_identity = (True, True) if vertex_pair is None else tuple(
-        v == 0 for v in vertex_pair)
+    identities = ((True, True) if vertex_pairs is None else
+                  tuple(v == 0 for v in vertex_pairs[0]))
+    n_vertices = 1 if vertex_pairs is None else len(vertex_pairs)
 
     def _single_impl(
         nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
         vertex_operands,
     ):
-        chi_R_zero = jax.lax.with_sharding_constraint(
+        zero = jax.lax.with_sharding_constraint(
             jnp.zeros((nk, n_rmu_out_left, n_rmu_out_right),
                       dtype=jnp.complex128), _chi_R_shard)
 
-        def _body(chi_R_acc, xs):
+        def _body(accumulators, xs):
             t_scalar, alpha_scalar = xs
             tau_kernel = (t_scalar if complex_contour else
                           jnp.real(t_scalar).astype(jnp.float64))
             Gv_k, Gc_k = _build_Gv_Gc(psi_mun, psi_nmu, mask_v, mask_c,
                                       enk_full, tau_kernel, vmax, cmin)
-            Gv_R = _Gv_fftn(Gv_k)
-            Gc_R = _Gc_fftn(Gc_k)
-            reverse_tau_raw = None
-            if vertex_operands is None or (left_identity and right_identity):
-                chi_tau_raw = jnp.einsum(
-                    'Rambn,Rambn->Rmn',
-                    Gc_R, jnp.conj(Gv_R), optimize=True)
-            else:
-                perm_l, phase_l, perm_r, phase_r = vertex_operands
-                chi_tau_raw = gamma_double_contract(
-                    jnp.conj(Gv_R), Gc_R,
-                    perm_L=None if left_identity else perm_l,
-                    phase_L=None if left_identity else phase_l,
-                    # Right endpoint orientation: the trace uses
-                    # Gamma_B[c,d], whereas the helper's row form is
-                    # Gamma_B[d,c].  Canonical alpha matrices are Hermitian
-                    # monomials, so conjugating the row phase transposes it.
-                    perm_R=None if right_identity else perm_r,
-                    phase_R=(None if right_identity else jnp.conj(phase_r)),
-                    spin_axes=(1, 3))
-                # The reverse ordered transition has natural endpoint axes
-                # (mu_B,mu_A) and swapped Lorentz labels (B,A).  The local
-                # transposes are views of the SAME two Green tensors: no
-                # second G build or FFT is required.  Only the orientation
-                # owner below applies its dagger back to (mu_A,mu_B).
-                Gv_R_ba = jnp.transpose(Gv_R, (0, 3, 4, 1, 2))
-                Gc_R_ba = jnp.transpose(Gc_R, (0, 3, 4, 1, 2))
-                reverse_tau_raw = gamma_double_contract(
-                    jnp.conj(Gv_R_ba), Gc_R_ba,
-                    perm_L=None if right_identity else perm_r,
-                    # Taking the natural BA endpoint adjoint conjugates
-                    # both Hermitian vertex tables.  On the left that is
-                    # the conjugated row phase; on the helper's transposed
-                    # right convention the two conjugations cancel.
-                    phase_L=(None if right_identity
-                             else jnp.conj(phase_r)),
-                    perm_R=None if left_identity else perm_l,
-                    phase_R=None if left_identity else phase_l,
-                    spin_axes=(1, 3))
-            chi_tau = jax.lax.with_sharding_constraint(
-                chi_tau_raw, _chi_R_shard)
-            if not complex_contour:
-                chi_tau = _complete_static_vertex_orientations(
-                    chi_tau, reverse_tau_raw)
-            return chi_R_acc + alpha_scalar * chi_tau, None
+            Gv_R, Gc_R = _Gv_fftn(Gv_k), _Gc_fftn(Gc_k)
+            outputs = []
+            for acc, operands in zip(accumulators, vertex_operands):
+                chi_tau = _contract_chi_vertices(
+                    Gv_R, Gc_R, operands, identities, complex_contour)
+                chi_tau = jax.lax.with_sharding_constraint(chi_tau, _chi_R_shard)
+                outputs.append(acc + alpha_scalar * chi_tau)
+            return tuple(outputs), None
 
         final_R, _ = jax.lax.scan(
-            _body, chi_R_zero, (nodes.t, nodes.alpha), unroll=1)
-        return _finish_chi(final_R)
+            _body, (zero,) * n_vertices, (nodes.t, nodes.alpha), unroll=1)
+        return tuple(_finish_chi(value) for value in final_R)
 
     _base_in = (_nodes_shard, _psi_mun_shard, _psi_nmu_shard,
                 NamedSharding(mesh_xy, _rep2),
@@ -354,16 +344,17 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                 NamedSharding(mesh_xy, _rep0),
                 NamedSharding(mesh_xy, _rep0))
 
-    if vertex_pair:
-        vertex_shard = tuple(NamedSharding(mesh_xy, P()) for _ in range(4))
+    if vertex_pairs is not None:
+        vertex_shard = tuple(tuple(NamedSharding(mesh_xy, P()) for _ in range(4))
+                             for _ in vertex_pairs)
 
         @partial(jax.jit, in_shardings=(*_base_in, vertex_shard),
-                 out_shardings=_chi_R_shard)
+                 out_shardings=(_chi_R_shard,) * n_vertices)
         def minimax_tau_integrate_chi_vertex(
             nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
             vertex_operands,
         ):
-            """Contract runtime canonical vertices through one family shape class."""
+            """Share each Green/FFT pair across the ordered vertices of one family class."""
             return _single_impl(nodes, psi_mun, psi_nmu, mask_v, mask_c,
                                 enk_full, vmax, cmin, vertex_operands)
         return minimax_tau_integrate_chi_vertex
@@ -374,7 +365,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     ):
         return _single_impl(
             nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full,
-            vmax, cmin, None)
+            vmax, cmin, (None,))[0]
 
     return minimax_tau_integrate_chi
 
@@ -1274,39 +1265,15 @@ def compute_no_pair_dirac_current_block(
     wfns_left, wfns_right, quad, meta, mesh_xy, *,
     vertex_left: int, vertex_right: int, energy_reference=0.0,
 ):
-    """Compute one raw no-pair Dirac-current response block ``chi_AB``.
+    """Return one paramagnetic no-pair block without a Ward contact."""
+    return compute_no_pair_dirac_current_blocks(
+        wfns_left, wfns_right, quad, meta, mesh_xy,
+        vertex_pairs=((vertex_left, vertex_right),),
+        energy_reference=energy_reference)[0]
 
-    Returns ``(nq, mu_left, mu_right)`` at ``P(None,'x','y')``.  Endpoint
-    Green functions are built by the same :func:`build_G_tau` path as scalar
-    charge response; only its two centroid operands may have different
-    extents.  The final open-spin trace routes through the canonical
-    :func:`common.gamma_matrices.gamma_double_contract` for a non-scalar
-    vertex pair.  This is the exact paramagnetic component selected by
-    :data:`common.bispinor_init.NO_PAIR_DIRAC_CURRENT_MODEL`: it contains no
-    diamagnetic/seagull contact, gauged nonlocal-pseudopotential term, Hall
-    coefficient, or negative-energy/downfolded completion.  Consumers must not
-    label this block gauge-complete merely because its four-spinor contraction
-    is algebraically closed.
 
-    ``quad.tau`` and ``quad.alpha`` approximate either 1/x (static) or
-    x/(x²+ωp²) (imaginary-frequency) on [x_min, x_max] where x = E_c - E_v.
-    The physical static χ₀ is::
-
-        χ₀_AB(q) = -Σ_ℓ α_ℓ [F_AB(q,τ_ℓ)
-                              + F_BA(-q,τ_ℓ)^dagger]
-
-    The two ordered orientations meet in R space before the final q FFT.
-    They are not two copies of ``F_AB`` on a complex broken-TR deck.
-
-    A uniform energy shift via ``energy_reference`` is applied to both
-    valence and conduction energies before building the minimax factors.
-    Because only differences enter, this is algebraically invariant; the
-    knob lets callers align the global zero (e.g. midgap, VBM, CBM).
-    """
-    A, B = int(vertex_left), int(vertex_right)
-    if not (0 <= A <= 3 and 0 <= B <= 3):
-        raise ValueError(
-            f"chi Lorentz vertices must be in {{0,1,2,3}}; got ({A},{B})")
+def _require_current_chi_endpoints(wfns_left, wfns_right):
+    """Authenticate the paired raw-parent face, spin and band extents."""
     if wfns_left.layout != wfns_right.layout:
         raise ValueError(
             "compute_no_pair_dirac_current_block endpoint layouts differ: "
@@ -1326,7 +1293,15 @@ def compute_no_pair_dirac_current_block(
         raise ValueError("Four-current response requires two raw-parent carriers.")
     if left.psi_mun.shape[1] != 4 or right.psi_nmu.shape[2] != 4:
         raise ValueError("Four-current vertices require four spin components.")
+    return left, right
 
+
+def compute_no_pair_dirac_current_blocks(
+    wfns_left, wfns_right, quad, meta, mesh_xy, *,
+    vertex_pairs, energy_reference=0.0,
+):
+    """Integrate one centroid-family class with shared Greens and return q-IBZ blocks."""
+    left, right = _require_current_chi_endpoints(wfns_left, wfns_right)
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 
@@ -1355,7 +1330,7 @@ def compute_no_pair_dirac_current_block(
     right_shape = green_face_kernel_kwargs(wfns_right)["face_shape"]
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, layout="face", face_shape=left_shape,
-        right_face_shape=right_shape, vertex_pair=(A, B),
+        right_face_shape=right_shape, vertex_pairs=vertex_pairs,
         k_unfold_plan=(left.plan, right.plan))
     mask_v = left.plan.parent_rows(wfns_left.band_mask(s.val))
     mask_c = left.plan.parent_rows(wfns_left.band_mask(s.cond))
@@ -1363,12 +1338,14 @@ def compute_no_pair_dirac_current_block(
             left.enk - jnp.asarray(eref, dtype=left.enk.dtype),
             jnp.asarray(vmax, dtype=jnp.float64), jnp.asarray(cmin, dtype=jnp.float64))
     from common.gamma_matrices import gamma_perm_phase
-    perm_l, phase_l = gamma_perm_phase(A)
-    perm_r, phase_r = gamma_perm_phase(B)
-    # Conjugated Green pairs require the transposed Hermitian vertex tables.
-    vertices = (perm_l, jnp.conj(phase_l), perm_r, jnp.conj(phase_r))
-    full = kernel(*args, vertices)
-    return jnp.take(full, jnp.asarray(left.plan.sym.q_irr_full_idx), axis=0)
+    vertices = []
+    for A, B in vertex_pairs:
+        perm_l, phase_l = gamma_perm_phase(A)
+        perm_r, phase_r = gamma_perm_phase(B)
+        vertices.append((perm_l, jnp.conj(phase_l), perm_r, jnp.conj(phase_r)))
+    full = kernel(*args, tuple(vertices))
+    rows = jnp.asarray(left.plan.sym.q_irr_full_idx)
+    return tuple(jnp.take(block, rows, axis=0) for block in full)
 
 
 _WARD_SUBTRACTED_NO_PAIR = "ward_subtracted_no_pair"
@@ -1391,9 +1368,8 @@ def compute_experimental_no_pair_photon_chi0(
 ):
     """Build all sixteen no-pair blocks with an experimental TT proxy.
 
-    Only one response block and the donated packed accumulator are live at a
-    time.  The three transverse channels reuse ``wfns_transverse`` and differ
-    only by their gamma vertex; no T1/T2/T3 wavefunction copies are made.
+    One family class and the donated packed accumulator are resident at a
+    time; its vertices share the same Green/FFT pair at each tau node.
     """
     from .photon_layout import pack_photon_operator
 
@@ -1420,19 +1396,25 @@ def compute_experimental_no_pair_photon_chi0(
     nq = len(wfns_charge.green_parent.plan.sym.q_irr_full_idx)
     families = (wfns_charge, wfns_transverse,
                 wfns_transverse, wfns_transverse)
+    classes = tuple(tuple((A, B) for A in left for B in right)
+                    for left in ((0,), (1, 2, 3)) for right in ((0,), (1, 2, 3)))
+    pending_classes = iter(classes)
+    blocks = {}
 
     def get_block(A, B):
-        chi_ab = compute_no_pair_dirac_current_block(
-            families[A], families[B], quad, meta, mesh_xy,
-            vertex_left=A, vertex_right=B,
-            energy_reference=energy_reference)
+        if not blocks:
+            pairs = next(pending_classes)
+            values = compute_no_pair_dirac_current_blocks(
+                families[A], families[B], quad, meta, mesh_xy,
+                vertex_pairs=pairs, energy_reference=energy_reference)
+            blocks.update(zip(pairs, values))
+        chi_ab = blocks.pop((A, B))
         if A and B:
-            # Experimental no-pair Ward completion: TT only.  CC/CT/TC are
-            # left untouched and no diamagnetic contact is invented.
             return _subtract_static_tt_contact(chi_ab)
         return chi_ab
 
-    return pack_photon_operator(get_block, nq, layout, mesh_xy)
+    order = tuple(pair for pairs in classes for pair in pairs)
+    return pack_photon_operator(get_block, nq, layout, mesh_xy, block_order=order)
 
 
 #: Provenance of the unscreened-current packed body.  The bare-transverse
