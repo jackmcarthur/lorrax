@@ -1,0 +1,8 @@
+{
+  "destination": "/global/cfs/cdirs/m4598/jackm/lorrax_evidence/bisp_prof_zw_6x6_2026-09-06",
+  "archive": "/global/cfs/cdirs/m4598/jackm/lorrax_evidence/bisp_prof_zw_6x6_2026-09-06/evidence.tar",
+  "files": 6746,
+  "archive_bytes": 1304565760,
+  "sha256": "3af4b6f04af224bf8a69fa1e27a400bb825e2a8fa3b8fede67f66e15985c973c",
+  "scope": "six-by-six lane step/science/parser receipts, rank-zero optimized HLO and native captures, canonical P47/F52 zeta, pinned source snapshots; excludes full WFN and other-rank HLO"
+}
