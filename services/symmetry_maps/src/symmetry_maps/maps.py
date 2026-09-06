@@ -888,20 +888,7 @@ def _permute_isdf_operator_axes_local(
     left_local_source_map=None,
     right_local_source_map=None,
 ):
-    """Apply two source maps without ever replicating an operator axis.
-
-    This is the single device backend for both the canonical symmetry action
-    in :func:`unfold_isdf_operator` and a pure basis reorder.  Its input and
-    output are one local tile of a global ``P(None,'x','y')`` operator.
-    A nonlocal map uses a volume-preserving all-to-all round trip: the other
-    endpoint is split while this endpoint is concatenated, the permutation
-    is applied, and the original 2-D sharding is restored.  Consequently no
-    intermediate is larger than the input tile on any rank.
-
-    ``right_source_map=None`` together with ``right_local_source_map=None``
-    means the right endpoint keeps its order: only the left map is applied
-    and the y-axis round trip is skipped entirely.
-    """
+    """Fuse owner-local maps and use volume-preserving all-to-all for distributed maps."""
     n_left_local = int(operator_local.shape[1])
     n_right_local = int(operator_local.shape[2])
     x_idx = jax.lax.axis_index('x')
@@ -911,6 +898,15 @@ def _permute_isdf_operator_axes_local(
         local_left = jax.lax.dynamic_slice_in_dim(
             left_local_source_map, x_idx * n_left_local, n_left_local,
             axis=1)
+        if right_local_source_map is not None:
+            local_right = jax.lax.dynamic_slice_in_dim(
+                right_local_source_map, y_idx * n_right_local, n_right_local,
+                axis=1)
+            source = local_left[:, :, None] * n_right_local + local_right[:, None, :]
+            rows = int(operator_local.shape[0])
+            return jnp.take_along_axis(
+                operator_local.reshape(rows, -1), source.reshape(rows, -1),
+                axis=1, mode='promise_in_bounds').reshape(operator_local.shape)
         permuted_left = jnp.take_along_axis(
             operator_local, local_left[:, :, None], axis=1,
             mode='promise_in_bounds')
