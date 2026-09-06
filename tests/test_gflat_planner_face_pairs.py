@@ -247,3 +247,14 @@ def test_run158_cliff_uses_two_41472_tiles_and_prices_compact_redistribution():
     assert tiled.peak_breakdown["C_face_y_cache_build"] == 23_699_800_800
     assert tiled.peak_breakdown["C_face_tile_concat"] == 7_310_858_976
     assert tiled.hwm_bytes == 28_990_135_008
+
+
+def test_parent_open_spin_projectors_are_in_the_transverse_live_set():
+    """Five four-spinor parents on 668 centroids need both open-spin projectors live."""
+    from gw.gflat_memory_model import _stage_C_face_terms
+    dimensions = dict(nk=9, ns=4, mu=668, face_nb=80, slots=8,
+                      p_x=2, p_y=2, p_xy=4, band_chunk=16, n_band_chunks=5)
+    full = _stage_C_face_terms(**dimensions)
+    parent = _stage_C_face_terms(
+        **dimensions, parent_route=dict(n_parent=5, parents_only=True))
+    assert parent['pair_arena_slope'] - full['pair_arena_slope'] == 427520

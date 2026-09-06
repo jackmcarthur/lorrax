@@ -2105,6 +2105,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				meta=_meta_T, cfg=cfg, band_slices=band_slices,
 				mesh_xy=mesh_xy, is_bispinor=True,
 				n_q_selected=_n_q_selected_T,
+				parent_route=dict(n_parent=int(np.asarray(sym.kirr_fullids).size),
+				                  parents_only=True),
 				face_current_vertex=True, print_fn=print_fn)
 	_coupled_mu123_enabled = False
 	_transverse_batched_route = str(
