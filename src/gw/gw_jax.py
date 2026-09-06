@@ -1120,6 +1120,8 @@ def main(argv=None):
 		                    label="self-consistent QSGW driver"):
 			sc_result = run_sc_driver(
 				wfns, V_q, kin_ion,
+				wfns_transverse=wfns_transverse,
+				bispinor_v_q_path=bispinor_v_q_path,
 				head_channel=getattr(isdf, 'head_channel', None),
 				wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
 				charge_zeta_identity=isdf.charge_zeta_identity,

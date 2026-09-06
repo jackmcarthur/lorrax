@@ -406,6 +406,8 @@ class SCInputs:
     #: comes from an FFT over the k-grid — then crosses the map's one output
     #: seam (decisions.md, TRS veto scope).
     kstar: object | None = None
+    wfns_transverse: Wavefunctions | None = None
+    bispinor_v_q_path: str | None = None
     #: Validated, device-resident nearest-neighbour links + exact DFT
     #: velocity.  None preserves the historical fixed-DFT head path exactly.
     parallel_transport: object | None = None
@@ -3064,6 +3066,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         active_slice=inputs.band_slices.sigma,
     )
 
+    wfns_transverse_qp = None
+    if inputs.wfns_transverse is not None:
+        wfns_transverse_qp = rotate_wavefunctions(
+            inputs.wfns_transverse, U_full,
+            enk_active_new=E_full, enk_base=enk_base, efermi=float(efermi_ry),
+            mesh_xy=inputs.mesh_xy, active_slice=inputs.band_slices.sigma)
+
     # (``entry_occ_state`` was solved above, before the tail scissor that
     # feeds ``enk_base`` — see the block after ``E_full``.)
 
@@ -3338,6 +3347,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         inputs.config.compute_mode,
         occupation_state=metal_occ_state,
         wfns=wfns_qp, V_q=inputs.V_q, W_by_role=W_by_role,
+        wfns_transverse=wfns_transverse_qp,
+        bispinor_v_q_path=inputs.bispinor_v_q_path,
         # FULL-BZ E, for the same reason as hartree_basis_rotation above:
         # every operand compute_sigma_xc sees is on the full BZ.
         e_qp_ev=np.asarray(E_full) * RYD_TO_EV,
@@ -5426,6 +5437,8 @@ def run_sc_driver(
     V_q: jax.Array,
     kin_ion: jax.Array,
     *,
+    wfns_transverse=None,
+    bispinor_v_q_path=None,
     head_channel=None,
     wfn_fingerprint_binding=None,
     charge_zeta_identity=None,
@@ -5628,6 +5641,7 @@ def run_sc_driver(
 
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
+        wfns_transverse=wfns_transverse, bispinor_v_q_path=bispinor_v_q_path,
         head_channel=head_channel,
         quad=quad, e_ref=e_ref,
         static_head_terms=static_head_terms,
