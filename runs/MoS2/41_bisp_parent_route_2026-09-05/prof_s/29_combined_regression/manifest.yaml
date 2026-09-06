@@ -1,0 +1,9 @@
+run_id: 29_combined_regression
+system: MoS2
+pipeline: focused_sigma_regression
+platform: perlmutter
+variant_of: pinned_parent_route
+geometry: {nodes: 1, gpus: 4, ranks: 4}
+steps:
+  gate: {state: complete}
+completion_receipt: "[lx] step lx-Xg4-033906-2358773-6017 exit 0 in 51 s"

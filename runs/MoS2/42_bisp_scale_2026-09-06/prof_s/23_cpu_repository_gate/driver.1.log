@@ -1,0 +1,14 @@
+[lx] using named allocation JID 57982945 [--jid]
+[lxrun] JID 57982945 · 4 nodes · 1:38:27 left · 3/16 GPUs free · incoming: lx-?
+  1  nid001064 [0/4 gpu]  busy   lx-Xg4-121945-492096-8000 51s    started 12:19
+  2  nid001065 [3/4 gpu]  busy   lx-Xg1-120056-398674-7698 19m    started 12:00  ← starting lx-?
+  3  nid001068 [0/4 gpu]  busy   lx-Xg4-122009-494687-9237 22s    started 12:20
+  4  nid001128 [0/4 gpu]  busy   lx-Xg4-121613-477248-1321 4m     started 12:16
+[lx] zero-GPU step: --gres=none, no GPU selector, and this leg is charged 0 GPUs by the pool, so it does not queue behind GPU work. Set JAX_PLATFORMS=cpu in the payload if it uses JAX.
+[lx] source tree: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src  [cwd checkout]
+[lx] runtime import origin: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py  [PYTHONPATH head; runtime.bootstrap attests the actual import]
+[rankwrap] rank=0 host=nid001065 src=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+srun: error: nid001065: task 0: Exited with exit code 1
+srun: Terminating StepId=57982945.198
+[lx] step lx-Xg0-122036-497348-5531 exit 1 in 70 s
+[lx] nonzero exit — judge by artifacts, not the code (rc=134 has been seen on runs whose outputs were correct)

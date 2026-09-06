@@ -1,0 +1,82 @@
+[
+  {
+    "box": [
+      -0.6287274175174019,
+      -0.010293852313980034,
+      0.01837465441237269,
+      0.01837465441237269
+    ],
+    "count": 8,
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/09_P_dynamic_eps5_baseline/tmp/sigma_quadrature_rules/rule_dc4d4199505b65ae.npz"
+  },
+  {
+    "box": [
+      -2.206444584556922,
+      -0.3169681333751827,
+      0.01837465441237269,
+      0.01837465441237269
+    ],
+    "count": 6,
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/09_P_dynamic_eps5_baseline/tmp/sigma_quadrature_rules/rule_facb773c4d99fb6e.npz"
+  },
+  {
+    "box": [
+      -7.855580400367099,
+      -0.06367766006586106,
+      0.01837465441237269,
+      0.01837465441237269
+    ],
+    "count": 10,
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/10_F_dynamic_eps5_baseline/tmp/sigma_quadrature_rules/rule_438f3f8d1233fbbc.npz"
+  },
+  {
+    "box": [
+      0.21608998173255406,
+      10.841755776166934,
+      0.01837465441237269,
+      0.01837465441237269
+    ],
+    "count": 9,
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/09_P_dynamic_eps5_baseline/tmp/sigma_quadrature_rules/rule_e7f0205ef58b2a46.npz"
+  },
+  {
+    "box": [
+      -8.149630150234648,
+      -0.26753901408719766,
+      0.01837465441237269,
+      0.01837465441237269
+    ],
+    "count": 8,
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/09_P_dynamic_eps5_baseline/tmp/sigma_quadrature_rules/rule_d9061f258e1be15a.npz"
+  },
+  {
+    "box": [
+      0.010293852313979956,
+      0.549792325375322,
+      0.01837465441237269,
+      0.01837465441237269
+    ],
+    "count": 8,
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/09_P_dynamic_eps5_baseline/tmp/sigma_quadrature_rules/rule_afe355af3590a3e4.npz"
+  },
+  {
+    "box": [
+      0.19789439302162928,
+      4.82354360699833,
+      0.01837465441237269,
+      0.01837465441237269
+    ],
+    "count": 7,
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/09_P_dynamic_eps5_baseline/tmp/sigma_quadrature_rules/rule_e750463e955bb49a.npz"
+  },
+  {
+    "box": [
+      0.06367766006586102,
+      10.471267463943915,
+      0.01837465441237269,
+      0.01837465441237269
+    ],
+    "count": 11,
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/10_F_dynamic_eps5_baseline/tmp/sigma_quadrature_rules/rule_68eb4b1b8a38dba3.npz"
+  }
+]

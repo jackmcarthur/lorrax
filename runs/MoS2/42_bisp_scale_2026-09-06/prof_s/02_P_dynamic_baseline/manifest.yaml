@@ -1,0 +1,12 @@
+run_id: 02_P_dynamic_baseline
+system: MoS2
+pipeline: lorrax_only
+platform: perlmutter
+variant_of: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/07_P_dynamic_P4_copied_zeta
+reused: private tmp and canonical input links
+source_pin: 71ae0bde
+geometry: {nodes: 1, gpus: 4, ranks: 4}
+steps:
+  lorrax: {state: complete}
+
+completion_receipt: '[lx] step lx-Xg4-113441-218949-9472 exit 0 in 111 s'

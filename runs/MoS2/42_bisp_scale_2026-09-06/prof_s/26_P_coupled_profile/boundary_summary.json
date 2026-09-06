@@ -1,0 +1,57 @@
+{
+  "scope": "synchronized host boundaries; outer stage is nested, never sum it with children",
+  "groups": [
+    {
+      "label": "sigma_restore",
+      "term": "",
+      "head": false,
+      "calls": 12,
+      "compiles": 4,
+      "compile_s": 3.4364549790043384,
+      "host_s": 3.8034780269372277,
+      "cold_calls": 4,
+      "cold_median_ms": 878.1050574907567,
+      "warm_calls": 8,
+      "warm_median_ms": 1.0795705020427704
+    },
+    {
+      "label": "sigma_factory",
+      "term": "",
+      "head": false,
+      "calls": 12,
+      "compiles": 84,
+      "compile_s": 15.2581820069463,
+      "host_s": 16.224892518977867,
+      "cold_calls": 4,
+      "cold_median_ms": 4062.3747420031577,
+      "warm_calls": 8,
+      "warm_median_ms": 0.05539249104913324
+    },
+    {
+      "label": "sigma_class",
+      "term": "",
+      "head": false,
+      "calls": 12,
+      "compiles": 4,
+      "compile_s": 2.609617588954279,
+      "host_s": 3.421799912059214,
+      "cold_calls": 4,
+      "cold_median_ms": 817.3258470051223,
+      "warm_calls": 8,
+      "warm_median_ms": 19.868525516358204
+    },
+    {
+      "label": "sigma_static_stage",
+      "term": "",
+      "head": false,
+      "calls": 1,
+      "compiles": 113,
+      "compile_s": 24.154624826885993,
+      "host_s": 26.567234401009046,
+      "cold_calls": 1,
+      "cold_median_ms": 26567.234401009046,
+      "warm_calls": 0,
+      "warm_median_ms": null
+    }
+  ]
+}

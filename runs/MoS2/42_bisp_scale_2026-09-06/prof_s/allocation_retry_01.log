@@ -1,0 +1,4 @@
+lx_pool: timeout running squeue --me -h -t RUNNING -o '%i|%j|%N|%L' (attempt 1/3)
+lx_pool: timeout running squeue --me -h -t RUNNING -o '%i|%j|%N|%L' (attempt 2/3)
+lx_pool: timeout running squeue --me -h -t RUNNING -o '%i|%j|%N|%L' (attempt 3/3)
+lx_pool: SLURM control plane did not answer: squeue did not answer in 3 attempts of 15 s

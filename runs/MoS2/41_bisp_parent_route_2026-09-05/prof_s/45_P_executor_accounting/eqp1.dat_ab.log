@@ -1,0 +1,7 @@
+A            runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/43_P_dynamic_fixed_rules/eqp1.dat
+B            runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/45_P_executor_accounting/eqp1.dat
+rows         90 over 3 k-points
+identical    90/90 E_qp rows agree to the printed digit
+max|dE_DFT|  0.000 ueV   (must be 0 for two arms of one deck)
+max|dE_qp|   0.000 ueV   at None
+VERDICT      PASS  (tolerance 0.0 ueV)

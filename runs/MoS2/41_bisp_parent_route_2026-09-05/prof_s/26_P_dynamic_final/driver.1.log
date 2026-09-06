@@ -1,0 +1,18 @@
+[lx] using named allocation JID 57966610 [--jid]
+[lxrun] JID 57966610 · 4 nodes · 51:25 left · 16/16 GPUs free · incoming: lx-?
+  1  nid001168 [4/4 gpu]  free   —                —      —  ← starting lx-?  ./rankwrap.sh ./driver.s
+  2  nid001169 [4/4 gpu]  busy   lx-Xg0-033720-2346976-7514 5s     started 03:37
+  3  nid001172 [4/4 gpu]  free   —                —      —
+  4  nid001173 [4/4 gpu]  free   —                —      —
+[lx] 4 GPU(s) x 4 rank(s) per node: select_gpu.sh pins ONE GPU per rank, so each rank sees ONE device's memory, not 4. For a single process across all 4 devices use `-G 4 -n 1`.
+[lx] source tree: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src  [cwd checkout]
+[lx] runtime import origin: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py  [PYTHONPATH head; runtime.bootstrap attests the actual import]
+[select_gpu] nid001168 local rank 0 -> CUDA_VISIBLE_DEVICES=0 (from CUDA_VISIBLE_DEVICES)
+[select_gpu] nid001168 local rank 1 -> CUDA_VISIBLE_DEVICES=1 (from CUDA_VISIBLE_DEVICES)
+[select_gpu] nid001168 local rank 2 -> CUDA_VISIBLE_DEVICES=2 (from CUDA_VISIBLE_DEVICES)
+[select_gpu] nid001168 local rank 3 -> CUDA_VISIBLE_DEVICES=3 (from CUDA_VISIBLE_DEVICES)
+[rankwrap] rank=3 host=nid001168 src=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+[rankwrap] rank=1 host=nid001168 src=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+[rankwrap] rank=2 host=nid001168 src=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+[rankwrap] rank=0 host=nid001168 src=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+[lx] step lx-Xg4-033729-2348577-9137 exit 0 in 95 s

@@ -1,0 +1,37 @@
+{"label": "sigma_restore", "host_ms": 425.200087018311, "compiles": 1, "compile_s": 0.3431231429858599, "keys": [[0, 0]]}
+{"label": "sigma_factory", "host_ms": 4032.36444000504, "compiles": 21, "compile_s": 3.7967705429764464, "options": {"with_head": false}}
+{"label": "sigma_class", "host_ms": 819.6536320028827, "compiles": 1, "compile_s": 0.6240965939941816, "options": {"with_head": false}}
+{"label": "sigma_restore", "host_ms": 811.4176370145287, "compiles": 1, "compile_s": 0.7249527889944147, "keys": [[0, 1], [0, 2], [0, 3]]}
+{"label": "sigma_factory", "host_ms": 4103.350097982911, "compiles": 21, "compile_s": 3.8710603719518986, "options": {"with_head": false}}
+{"label": "sigma_class", "host_ms": 817.7167469984852, "compiles": 1, "compile_s": 0.6624650519806892, "options": {"with_head": false}}
+{"label": "sigma_restore", "host_ms": 974.0294740186073, "compiles": 1, "compile_s": 0.8896939330152236, "keys": [[1, 0], [2, 0], [3, 0]]}
+{"label": "sigma_factory", "host_ms": 4063.5203430138063, "compiles": 21, "compile_s": 3.8296155440039, "options": {"with_head": false}}
+{"label": "sigma_class", "host_ms": 830.5107860069256, "compiles": 1, "compile_s": 0.672017873992445, "options": {"with_head": false}}
+{"label": "sigma_restore", "host_ms": 1590.3239600011148, "compiles": 1, "compile_s": 1.453734230977716, "keys": [[1, 1], [1, 2], [1, 3], [2, 1], [2, 2], [2, 3], [3, 1], [3, 2], [3, 3]]}
+{"label": "sigma_factory", "host_ms": 4031.5373599878512, "compiles": 21, "compile_s": 3.790508656995371, "options": {"with_head": false}}
+{"label": "sigma_class", "host_ms": 778.9922889787704, "compiles": 1, "compile_s": 0.6423831319843885, "options": {"with_head": false}}
+{"label": "sigma_restore", "host_ms": 0.6946329958736897, "compiles": 0, "compile_s": 0.0, "keys": [[0, 0]]}
+{"label": "sigma_factory", "host_ms": 0.05539701669476926, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_class", "host_ms": 32.948489009868354, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_restore", "host_ms": 1.014692010357976, "compiles": 0, "compile_s": 0.0, "keys": [[0, 1], [0, 2], [0, 3]]}
+{"label": "sigma_factory", "host_ms": 0.04107999848201871, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_class", "host_ms": 18.147560011129826, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_restore", "host_ms": 0.980847020400688, "compiles": 0, "compile_s": 0.0, "keys": [[1, 0], [2, 0], [3, 0]]}
+{"label": "sigma_factory", "host_ms": 0.0395159877371043, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_class", "host_ms": 17.6953149784822, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_restore", "host_ms": 1.8340260139666498, "compiles": 0, "compile_s": 0.0, "keys": [[1, 1], [1, 2], [1, 3], [2, 1], [2, 2], [2, 3], [3, 1], [3, 2], [3, 3]]}
+{"label": "sigma_factory", "host_ms": 0.04008700489066541, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_class", "host_ms": 11.228691990254447, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_restore", "host_ms": 0.4615320067387074, "compiles": 0, "compile_s": 0.0, "keys": [[0, 0]]}
+{"label": "sigma_factory", "host_ms": 0.05955499364063144, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_class", "host_ms": 32.435486995382234, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_restore", "host_ms": 0.5367769917938858, "compiles": 0, "compile_s": 0.0, "keys": [[0, 1], [0, 2], [0, 3]]}
+{"label": "sigma_factory", "host_ms": 0.04325402551330626, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_class", "host_ms": 17.582086991751567, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_restore", "host_ms": 0.5955020023975521, "compiles": 0, "compile_s": 0.0, "keys": [[1, 0], [2, 0], [3, 0]]}
+{"label": "sigma_factory", "host_ms": 0.060758000472560525, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_class", "host_ms": 17.39867200376466, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_restore", "host_ms": 1.4759539917577058, "compiles": 0, "compile_s": 0.0, "keys": [[1, 1], [1, 2], [1, 3], [2, 1], [2, 2], [2, 3], [3, 1], [3, 2], [3, 3]]}
+{"label": "sigma_factory", "host_ms": 0.049605994718149304, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_class", "host_ms": 10.844467993592843, "compiles": 0, "compile_s": 0.0, "options": {"with_head": false}}
+{"label": "sigma_static_stage", "host_ms": 26543.50833798526, "compiles": 113, "compile_s": 24.13659228582401}

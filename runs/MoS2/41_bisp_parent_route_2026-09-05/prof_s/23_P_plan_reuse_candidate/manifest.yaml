@@ -1,0 +1,16 @@
+run_id: 23_P_plan_reuse_candidate
+system: MoS2
+pipeline: lorrax_only
+platform: perlmutter
+variant_of: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/73_parent_full_static
+reuse_from_parent: [/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/73_parent_full_static/tmp]
+overrides: {debug_print: true, matched_tmp_donor: P}
+source:
+  checkout: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+  commit: 9f569c4bf75bad40e4f5895946874b4c503e4410
+  based_on: 9f569c4bf75bad40e4f5895946874b4c503e4410
+allocator: BFC@0.85
+geometry: {nodes: 1, gpus: 4, ranks: 4}
+steps:
+  00_lorrax: {state: pending}
+candidate_source: source.diff and source_head.txt

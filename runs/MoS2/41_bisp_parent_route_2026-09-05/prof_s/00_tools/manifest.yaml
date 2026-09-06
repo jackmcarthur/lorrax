@@ -1,0 +1,8 @@
+run_id: bisp_s_profile_tools
+system: MoS2
+pipeline: lorrax_only
+platform: perlmutter
+variant_of: prof_s_baselines
+reuse_from_parent: [matched_decks_and_tmp]
+steps:
+  measurements: {state: running, pool: 57966610, geometry: P4_sequential}

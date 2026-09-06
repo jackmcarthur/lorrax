@@ -1,0 +1,14 @@
+run_id: 24_P_coupled_static
+system: MoS2
+pipeline: gwjax
+platform: perlmutter
+variant_of: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/01_P_static_baseline
+reused: copied tmp zeta and rule caches; immutable WFN, centroids, kin_ion, dipole
+source: source_head.txt plus source.diff
+pool: 57982945
+geometry: P4 one rank per GPU
+steps:
+  sigma:
+    state: complete
+
+completion_receipt: '[lx] step lx-Xg4-122808-536158-1837 exit 0 in 70 s'

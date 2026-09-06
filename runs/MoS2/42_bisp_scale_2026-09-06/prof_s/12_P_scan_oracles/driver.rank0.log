@@ -1,0 +1,80 @@
+[lorrax source closure] {"mode":"source","root":"/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906","runtime":"src/runtime/__init__.py","services":{"distrib-la":"services/distrib_la/src/distrib_la/__init__.py","lxkit":"services/lxkit/src/lxkit/__init__.py","minimax":"services/minimax/src/minimax/__init__.py","symmetry-maps":"services/symmetry_maps/src/symmetry_maps/__init__.py","vcoul":"services/vcoul/src/vcoul/__init__.py","wfn-loader":"services/wfn_loader/src/wfn_loader/__init__.py","zeta-loader":"services/zeta_loader/src/zeta_loader/__init__.py"}}
+  [compile-cache] cross-rank compile agreement enabled before backend compile with no deadline (rank 0 names a missing rank every 60 s).
+[stage 12:05:20] -> collective_warmup
+[stage 12:05:21] <- collective_warmup  1.2 s
+[lorrax native] LEGACY-UNSEALED origin=/global/common/software/m4598/jackm/lorrax_cuda13_runtime/ffi_build_phdf5/liblorrax_ffi.so sha256=cad78d947a953949 pair/private-closure unattested; developer migration only
+[fft_ffi] flat-k 3-D FFTs -> cuFFT strided CUDA FFI handler (lorrax_mklfft_flat_k): cufftPlanMany64 advanced layout (istride=T, idist=1 — the stride-descriptor analog) reading the dot-layout tile in place; jnp.fft norm scales applied by a fused device kernel.
+[conv_kminor] auto -> ON: the fused k-minor conv kernel (lorrax_cufft_conv_kminor) serves this run's rung.  CUDA mesh, handler present.  Callers whose k-grid is too large for one resident k-row still take the XLA chain for that call, silently and correctly.
+[LORRAX_CONV_KLEAD_FFI] =0: k-leading fused-convolution candidate disabled; no production Sigma caller yet.
+[conv_kpair] auto -> ON: the ISDF post-pair CUDA accelerator (lorrax_cufft_conv_kpair) is available; the plan selected its measured-fast resident/device arm from mirrored byte arithmetic.
+  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR="" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory.
+==============================================================================
+  LORRAX runtime — resolved startup configuration
+==============================================================================
+  This is rank 0 of 4, and it addresses 1 of the 4 devices in the job.
+  jax.distributed.initialize() took its explicit form with coordinator_address='nid001064:22176', num_processes=4 and local_device_ids=[0].
+  The JAX platform resolved to 'gpu' on devices of kind 'NVIDIA A100-SXM4-40GB', from JAX_PLATFORMS='cuda,cpu', under jax 0.9.1 / jaxlib 0.9.1 with 64-bit values enabled.
+  Default matmul precision is pinned to 'highest', so f32 and complex64 dots run at fp32 rather than TensorFloat32; f64/c128 is unaffected either way.
+  XLA GPU autotuning resolved to level '0' from LORRAX default (runtime.set_default_env); the complete resolved XLA_FLAGS value is '--xla_gpu_autotune_level=0'.
+  The run's device mesh is 2x2 over axes ('x', 'y'), and its communicator cliques were warmed before the first physics jit.
+  Bringing this stack up took 5.6 s in total: 0.7 s to import jax itself, 3.4 s for the environment, jax.distributed and backend init, 1.4 s to build the mesh and warm its communicators, 0.0 s to arm the compile cache and 0.1 s to measure everything in this block.
+  Demotions listed above are this rank's; a demotion that happened only on another rank is announced in that rank's own output and does not appear here.
+  Cross-process collectives run on NCCL because this is a GPU platform, so JAX_CPU_COLLECTIVES_IMPLEMENTATION does not apply.
+  The XLA memory pool, read from jax.local_devices()[0].memory_stats() and not from os.environ, reports a limit of 36.04 GB with 0.00 GB in use and a peak of 0.00 GB so far.
+  XLA_PYTHON_CLIENT_PREALLOCATE resolved to false (raw 'false') and XLA_PYTHON_CLIENT_ALLOCATOR resolved to 'bfc' (raw 'bfc') — NOT LORRAX's canonical pair, which is preallocate=false with the allocator left unset (BFC); a caller overrode it.
+  The XLA client memory fraction is 0.85 from XLA_PYTHON_CLIENT_MEM_FRACTION.
+  The CUDA FFI library loaded from /global/common/software/m4598/jackm/lorrax_cuda13_runtime/ffi_build_phdf5/liblorrax_ffi.so, selected by LORRAX_FFI_SO.
+  FFI build provenance: /global/common/software/m4598/jackm/lorrax_cuda13_runtime/ffi_build_phdf5/liblorrax_ffi.so | LEGACY-UNSEALED | recorded-rev bb6422eaad04 | recorded-sha cad78d947a953949 | actual 6755720 bytes sha cad78d947a953949
+  The LORRAX_BANDS_GEMM_FFI dial is unset and resolved to on, so the contract_bands right-GEMM contraction rides the platform's native lowering — the dial exists on cpu only and this run's backend is 'gpu', where startup enforcement skips it by the gate's declared platform policy (the native lowering IS the required path there).
+  The LORRAX_FFT_FFI dial is unset and resolved to on, so the flat-k 3-D FFT helper path is routed through the FFI handler (the required layer).
+  The LORRAX_FFT_FFI_FUSED dial is unset and resolved to on, so the fused IFFT-multiply-FFT tau kernel is routed through the FFI handler (the required layer).
+  The LORRAX_CONV_KMINOR_FFI dial is unset and resolved to auto, so the fused k-MINOR ifft-multiply-fft conv (the BSE ladder-W rung; accelerator) is routed through the FFI handler WHERE AVAILABLE and through the caller's XLA ifft/multiply/fft chain otherwise (capability: the mesh is CUDA, the loaded device library exports CufftConvKMinorCudaFfi, and the k-grid's row fits a block's shared memory).
+  The LORRAX_CONV_KLEAD_FFI dial is unset and resolved to off, so the direct fused k-LEADING IFFT(G)-IFFT(W)-FFT conv (Sigma; accelerator, default off) keeps the certified plan-based k-leading gw_conv handler — this dial is OPT-IN and off is its certified state.
+  The LORRAX_CONV_KPAIR_FFI dial is unset and resolved to auto, so the fused post-pair convolution used to form the ISDF Coulomb operator is routed through the FFI handler WHERE AVAILABLE and through the ISDF XLA IFFT/conjugate/gamma/FFT reference chain otherwise (capability: the mesh is CUDA, the loaded device library exports CufftConvKPairCudaFfi, the runtime axes are in [1,24], and the shape is in the measured native-fast region).
+  The distributed backends available for eigh on this mesh are cusolvermp, distributed, native; which one runs is the input-file key, not an environment variable.
+  The distributed backends available for cholesky on this mesh are cusolvermp, native, native2d; which one runs is the input-file key, not an environment variable.
+  The distributed backends available for solve_lu on this mesh are cusolvermp, distributed, native; which one runs is the input-file key, not an environment variable.
+  This process is pinned to 32 schedulable CPUs, with OMP_NUM_THREADS=None, MKL_NUM_THREADS=None and OPENBLAS_NUM_THREADS='16 (auto: physical cores of the affinity mask; applied to libscipy_openblas64_-61654e39.so)'.
+  Inside the FFI handlers the BLAS team size is LORRAX_MKLBLAS_THREADS=None for the batched GEMM, where unset means the ambient thread count, and LORRAX_SCALAPACK_MKL_THREADS=None for the ScaLAPACK handlers, where unset means a cap of 4 because pzheevd measured 11.28 s per q at 14 MKL threads against 0.463 s at 4.
+  The JAX persistent compile cache is OFF, so every rank compiles every module in this run; set ISDF_JAX_CACHE_DIR to a rank-visible directory to turn it on, or leave it unset and let the resolution order pick one — LORRAX_RUN_DIR/.lorrax_jax_cache first, then $SCRATCH/lorrax_jax_cache, then the home cache (docs/dev/env_vars.md).
+  The cache key includes every array shape, so a system size this machine has not run before misses every entry no matter how warm the cache looks.
+  Cross-rank module-compile agreement is ON with no deadline (rank 0 names a missing rank every 60 s); each backend compile is fingerprinted before XLA execution.
+  The fail-fast excepthook is installed, so an uncaught exception on any rank exits the step non-zero instead of leaving its peers blocked in a collective that rank will never join.
+  glibc malloc tuning is in force with M_MMAP_THRESHOLD=1 MB and M_TRIM_THRESHOLD=128 MB, which is the mitigation for the per-r-chunk RSS ramp on long XLA:CPU runs.
+==============================================================================
+  [distrib_la] shard_map via jax.shard_map (jax 0.9.1)[lorrax cusolverMp] library 0.9.1, NCCL 2.29.3, comm path: NCCL, grid: 2x2 (row-major)
+
+[lorrax cuBLASMp] library 1.0.0, comm path: NCCL
+PASS vertex_g_00: {'face': 1.4581980568605165e-16}
+PASS vertex_g_11: {'face': 1.4391117868485369e-16}
+PASS vertex_g_12: {'face': 2.6036403849362313e-16}
+PASS vertex_g_23: {'face': 1.3375192666967546e-16}
+PASS vertex_g_31: {'face': 1.1634974220005934e-16}
+[fft_ffi] flat-k 3-D FFTs -> cuFFT strided CUDA FFI handler (lorrax_mklfft_gw_conv): cufftPlanMany64 advanced layout (istride=T, idist=1 — the stride-descriptor analog) reading the dot-layout tile in place; jnp.fft norm scales applied by a fused device kernel.
+  [shard_map] using jax.shard_map (jax 0.9.1)
+[cufft_flat_k] gw_conv first call: nk=(2,1,1) G trail (a=4,mx=4,b=4,my=4) Tg=256 Tv=16 scale_i=7.071068e-01 scale_f=-5.000000e-01 aliased=1 vr_arena=0.0 MB
+[cufft_flat_k] V_R arena -> 0.0 MB
+[cufft_flat_k] plan dims=(2,1,1) stride=16 batch=16 workspace=0.0 MB
+[cufft_flat_k] plan dims=(2,1,1) stride=256 batch=256 workspace=0.0 MB
+[cufft_flat_k] workspace arena -> 0.0 MB
+[cufft_flat_k] NVRTC kernels compiled for sm_80 (20200 B cubin, device 0)
+/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/services/symmetry_maps/src/symmetry_maps/maps.py:2345: RuntimeWarning: SYMMETRY PROVENANCE WARNING: no authenticated QE data-file-schema.xml is available at SymMaps initialization (the WFN-shaped input carries no QE schema receipt). WFN.h5 does not record which operations are composed with time reversal. LORRAX is using the legacy all-spatial header interpretation plus the global DFT-reference TRS verdict. RESULTS WILL BE WRONG if time reversal is broken and QE used an antiunitary magnetic-space-group operation. Co-stage the WFN-generating QE *.save directory or pass WfnLoader(..., qe_schema=...).
+  _warnings.warn(
+[cufft_flat_k] flat_k first call: nk=(2,1,1) T=256 fwd=0 scale=7.071068e-01 inplace=1
+PASS sigma_sx_chain_00: {'face_vs_dense': 2.155794259359295e-15, 'photon_x_vs_v': 3.441289563780798e-16, 'photon_sx_vs_2v': 3.441289563780798e-16, 'photon_kernel_cache_size': 1}
+PASS sigma_sx_chain_11: {'face_vs_dense': 1.4186551621718585e-15, 'photon_x_vs_v': 2.0078159434249959e-16, 'photon_sx_vs_2v': 2.0078159434249959e-16, 'photon_kernel_cache_size': 1}
+PASS sigma_sx_chain_12: {'face_vs_dense': 1.2017348744478737e-15, 'photon_x_vs_v': 3.045117516246799e-16, 'photon_sx_vs_2v': 3.045117516246799e-16, 'photon_kernel_cache_size': 1}
+PASS sigma_sx_chain_23: {'face_vs_dense': 1.87386677674045e-15, 'photon_x_vs_v': 3.6953777096480237e-16, 'photon_sx_vs_2v': 3.6953777096480237e-16, 'photon_kernel_cache_size': 1}
+PASS sigma_sx_chain_31: {'face_vs_dense': 2.2261730843134724e-15, 'photon_x_vs_v': 3.4605048790694917e-16, 'photon_sx_vs_2v': 3.4605048790694917e-16, 'photon_kernel_cache_size': 1}
+[cufft_flat_k] plan dims=(3,1,1) stride=256 batch=256 workspace=0.0 MB
+[cufft_flat_k] plan dims=(3,1,1) stride=16 batch=16 workspace=0.0 MB
+  [shard_map] using jax.shard_map (jax 0.9.1)
+PASS four_current_ordered_pair_all16: {'all16_worst_rel': 6.628684504965578e-16, 'combined_hermiticity': 1.2704697233480586e-16, 'q_reciprocity': 1.1526523434992832e-16, 'distinct_cc_bit_equal': True}
+[2c-TRS] WFN.h5: CONSISTENT (spatial-conditional, residual=1.65e-08, coverage=33%, raw-pair=0, spatial-pair=1, trim=1) | 0.03s (io 0.00 + overlap 0.02)
+q-grid TRS policy [synthetic identity photon head]: the DFT reference check says GLOBAL TIME REVERSAL IS BROKEN for this WFN.  Every full-BZ q row keeps the typed QE parent it was solved from (0 rows use operation-specific antiunitary actions); no arbitrary q/-q composition and no fixed-q TRS projector is applied.  q<->-q reciprocity of V/W is still gated — on this deck it is an independent measurement rather than an identity of the unfold.
+[cufft_flat_k] plan dims=(2,1,1) stride=64 batch=64 workspace=0.0 MB
+[cufft_flat_k] plan dims=(2,1,1) stride=4 batch=4 workspace=0.0 MB
+COMBINED_SIGMA_GATE_PASS
+  [compile-cache] rank 0/4 summary: xla_compiles=350 (17.31s)  compile_agreement=350 (0.129s fingerprint + 0.490s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False
+[runtime] filtered 3 exact known-benign JAX runtime notice line(s) on rank 0; all other stderr was forwarded unchanged.
+[runtime] process finalized explicitly (effects barrier, distributed shutdown, atexit hooks) and ending with os._exit: the interpreter-teardown destruction of the XLA:CPU client is skipped deliberately — it deadlocks in pool shutdown after cold-compile storms (jobs 7884928/7884989).

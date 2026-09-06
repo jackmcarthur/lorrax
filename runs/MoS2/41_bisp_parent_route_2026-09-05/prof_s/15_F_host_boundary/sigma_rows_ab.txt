@@ -1,0 +1,1 @@
+PASS: 90 complete printed state rows identical to 06_F_full_static_baseline, including sigCC/sigTT/sigCT.

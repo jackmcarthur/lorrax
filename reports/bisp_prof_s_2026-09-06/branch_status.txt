@@ -1,0 +1,126 @@
+Unmerged against origin/main:
+
+  BRANCH                                                 AHEAD  UPSTREAM                     LAST COMMIT
+  audit/bispinor-head-physics-2026-08-25                   255  origin/audit/bispinor-head-physics-2026-08-25 12 days ago
+  fix/legacy-zeta-rchunk-tail-2026-08-25                   211  origin/fix/legacy-zeta-rchunk-tail-2026-08-25 12 days ago
+  audit/qp-state-consumer-hardening-2026-08-25             209  origin/audit/qp-state-consumer-hardening-2026-08-25 12 days ago
+  fix/htransform-qp-state-contract-2026-08-25              202  -- NOT PUSHED --             12 days ago
+  review/htransform-qp-state-2026-08-25                    202  origin/review/htransform-qp-state-2026-08-25 12 days ago
+  feat/pm-magnetic-operator-infra-2026-08-25               190  -- NOT PUSHED --             12 days ago
+  integ/static-gauge-vnl-sigmap-2026-08-25                 190  origin/integ/static-gauge-vnl-sigmap-2026-08-25 12 days ago
+  fix/static-head-ssot-review-2026-08-25                   186  -- NOT PUSHED --             12 days ago
+  review/bispinor-current-ssot-2026-08-24                  155  origin/review/bispinor-current-ssot-2026-08-24 12 days ago
+  refactor/numerical-pivot-ssot-2026-08-24                 154  -- NOT PUSHED --             13 days ago
+  chore/cull-per-artifact-unfold-tests-2026-08-17           41  origin/chore/cull-per-artifact-unfold-tests-2026-08-17 3 weeks ago
+  fix/wedge-unfold-irr-labels-2026-08-17                    41  origin/fix/wedge-unfold-irr-labels-2026-08-17 3 weeks ago
+  feat/wedge-storage-migration-2026-08-16                   40  origin/feat/wedge-storage-migration-2026-08-16 3 weeks ago
+  rescue/wt-wedgestore-post-2026-08-24                      39  origin/rescue/wt-wedgestore-post-2026-08-24 3 weeks ago
+  feat/bisp-parent-route-2026-09-05                         36  origin/feat/bisp-parent-route-2026-09-05 2 minutes ago
+  fix/bi-p16-fit-reuse-head-skip-2026-09-03                 34  origin/fix/bi-p16-fit-reuse-head-skip-2026-09-03 2 days ago
+  refactor/eqp-ibz-2026-08-15                               31  origin/refactor/eqp-ibz-2026-08-15 3 weeks ago
+  feat/bispinor-velocity-lift-2026-09-04                    29  origin/feat/bispinor-velocity-lift-2026-09-04 6 hours ago
+  perf/bisp-prof-s-2026-09-06                               29  origin/perf/bisp-prof-s-2026-09-06 14 minutes ago
+  audit/bisp-head-2026-09-06                                27  origin/audit/bisp-head-2026-09-06 2 hours ago
+  audit/bisp-phys-2026-09-06                                26  origin/audit/bisp-phys-2026-09-06 2 hours ago
+  diag/bisp-c256-kernel-2026-09-06                          26  -- NOT PUSHED --             2 hours ago
+  integ/photon-budget-fused-2026-09-02                      26  origin/integ/photon-budget-fused-2026-09-02 4 days ago
+  measure/ae2-mpa-bracket-current-main-2026-08-17           25  origin/measure/ae2-mpa-bracket-current-main-2026-08-17 3 weeks ago
+  perf/fused-photon-chi-response-2026-09-02                 24  origin/perf/fused-photon-chi-response-2026-09-02 4 days ago
+  feat/htransform-basis-only-scalapack-p4-2026-09-01        23  origin/feat/htransform-basis-only-scalapack-p4-2026-09-01 5 days ago
+  perf/bisp-prof-zw-2026-09-06                              23  origin/perf/bisp-prof-zw-2026-09-06 27 minutes ago
+  fix/cpu-photon-budget-2026-09-02                          22  origin/fix/cpu-photon-budget-2026-09-02 4 days ago
+  fix/trs-report-root-broadcast-ost0-2026-09-01             21  origin/fix/trs-report-root-broadcast-ost0-2026-09-01 5 days ago
+  perf/chi0-gemm-batch-reshard-2026-09-01                   21  origin/perf/chi0-gemm-batch-reshard-2026-09-01 4 days ago
+  feat/htransform-basis-only-yonly-scalapack-2026-09-01     20  -- NOT PUSHED --             5 days ago
+  fix/static-photon-progress-2026-09-01                     20  origin/fix/static-photon-progress-2026-09-01 5 days ago
+  feat/htransform-basis-only-yonly-2026-09-01               19  origin/feat/htransform-basis-only-yonly-2026-09-01 5 days ago
+  fix/trs-report-root-broadcast-2026-09-01                  19  origin/fix/trs-report-root-broadcast-2026-09-01 5 days ago
+  feat/intraband-crossing-block-wp3a5-2026-08-17            18  origin/feat/intraband-crossing-block-wp3a5-2026-08-17 3 weeks ago
+  test/scalapack-p4-hardening-2026-09-01                    18  origin/test/scalapack-p4-hardening-2026-09-01 5 days ago
+  fix/galerkin-centroid-y-only-2026-09-01                   17  origin/fix/galerkin-centroid-y-only-2026-09-01 5 days ago
+  fix/scalapack-auto-cpu-gate-2026-09-01-v2                 17  origin/fix/scalapack-auto-cpu-gate-2026-09-01-v2 5 days ago
+  perf/ibz-tt-streaming-2026-09-01                          17  origin/perf/ibz-tt-streaming-2026-09-01 5 days ago
+  run/cpu-end2end-robust-p64-2026-09-01                     17  origin/run/cpu-end2end-robust-p64-2026-09-01 5 days ago
+  feat/intraband-crossing-block-wp3a4-2026-08-17            16  origin/feat/intraband-crossing-block-wp3a4-2026-08-17 3 weeks ago
+  fix/scalapack-auto-cpu-gate-2026-09-01                    16  -- NOT PUSHED --             5 days ago
+  fix/scalapack-gemm-portability-contract-2026-09-01        16  origin/fix/scalapack-gemm-portability-contract-2026-09-01 5 days ago
+  run/cpu-photon-lowmem-p36-2026-09-01                      16  origin/run/cpu-photon-lowmem-p36-2026-09-01 5 days ago
+  feat/bispinor-vq-cache-2026-09-01                         15  -- NOT PUSHED --             5 days ago
+  feat/intraband-crossing-block-wp3a3-2026-08-17            15  origin/feat/intraband-crossing-block-wp3a3-2026-08-17 3 weeks ago
+  integ/scalapack-reverse-clique-main-2026-09-01            14  origin/integ/scalapack-reverse-clique-main-2026-09-01 5 days ago
+  run/bi-eta025-compare-2026-09-04                          13  origin/run/bi-eta025-compare-2026-09-04 2 days ago
+  feat/intraband-crossing-block-wp3a2-2026-08-17            12  origin/feat/intraband-crossing-block-wp3a2-2026-08-17 3 weeks ago
+  run/cpu-photon-baseline-2026-09-01                        12  origin/run/cpu-photon-baseline-2026-09-01 5 days ago
+  fix/bi-metal-mpa-production-2026-09-03                     9  origin/fix/bi-metal-mpa-production-2026-09-03 3 days ago
+  fix/bi-metal-mpa-progress-2026-09-03                       8  origin/fix/bi-metal-mpa-progress-2026-09-03 3 days ago
+  rescue/wt-mpa-thiele-uncommitted-2026-08-24                8  origin/rescue/wt-mpa-thiele-uncommitted-2026-08-24 12 days ago
+  bench/na-mpa-p16-current-2026-08-18                        7  origin/bench/na-mpa-p16-current-2026-08-18 3 weeks ago
+  feat/intraband-crossing-block-wp3a-2026-08-17              7  origin/feat/intraband-crossing-block-wp3a-2026-08-17 3 weeks ago
+  feat/mpa-thiele-na-2026-08-18                              7  origin/feat/mpa-thiele-na-2026-08-18 3 weeks ago
+  feat/se-eval-type-wire-2026-08-16                          7  origin/feat/se-eval-type-wire-2026-08-16 3 weeks ago
+  audit/psi-irr-packed-order-2026-09-05                      6  origin/audit/psi-irr-packed-order-2026-09-05 14 hours ago
+  feat/gwjax-evsc-eqp2-scissor-2026-08-26                    6  origin/feat/gwjax-evsc-eqp2-scissor-2026-08-26 11 days ago
+  feat/vi3-orbmag-htransform-symmetry-2026-09-05             6  origin/feat/vi3-orbmag-htransform-symmetry-2026-09-05 14 hours ago
+  fix/bi-metal-sigma-noise-2026-09-03                        6  -- NOT PUSHED --             3 days ago
+  perf/photon-spin-pair-stream-2026-09-01                    6  origin/perf/photon-spin-pair-stream-2026-09-01 5 days ago
+  run/vi3-bispinor-velocity-2026-09-04                       6  origin/run/vi3-bispinor-velocity-2026-09-04 19 hours ago
+  feat/gwjax-evsc-eqp2-2026-08-26                            5  origin/feat/gwjax-evsc-eqp2-2026-08-26 11 days ago
+  feat/tier0-internal-ff-2026-08-18                          5  origin/feat/tier0-internal-ff-2026-08-18 3 weeks ago
+  control/main-de8dcfbc-minimal-fixes-2026-09-05             4  origin/control/main-de8dcfbc-minimal-fixes-2026-09-05 5 hours ago
+  feat/gwjax-run-experience-2026-08-26                       4  origin/feat/gwjax-run-experience-2026-08-26 11 days ago
+  feat/mini-p4-coverage-2026-09-05                           4  origin/feat/mini-p4-coverage-2026-09-05 2 hours ago
+  fix/mpa-centroid-padding-2026-09-03                        4  origin/fix/mpa-centroid-padding-2026-09-03 3 days ago
+  perf/charge-cct-spin-stream-2026-08-31                     4  origin/perf/charge-cct-spin-stream-2026-08-31 6 days ago
+  perf/head-manifold-fusion-2026-08-30                       4  origin/perf/head-manifold-fusion-2026-08-30 7 days ago
+  perf/run-local-jax-cache-2026-08-27                        4  origin/perf/run-local-jax-cache-2026-08-27 10 days ago
+  feat/bgw-metal-vcoul-file-2026-08-16                       3  origin/feat/bgw-metal-vcoul-file-2026-08-16 3 weeks ago
+  feat/bisp-orch-controls-2026-09-05                         3  origin/feat/bisp-orch-controls-2026-09-05 10 hours ago
+  feat/intraband-crossing-block-wp35-2026-08-17              3  origin/feat/intraband-crossing-block-wp35-2026-08-17 3 weeks ago
+  fix/dipole-callsite-gate-sign-2026-08-17                   3  origin/fix/dipole-callsite-gate-sign-2026-08-17 3 weeks ago
+  fix/general-bug-batch-2026-08-27                           3  origin/fix/general-bug-batch-2026-08-27 10 days ago
+  fix/hall-radial-stale-names-2026-08-31                     3  origin/fix/hall-radial-stale-names-2026-08-31 6 days ago
+  staging-backup-pre-rebase                                  3  -- NOT PUSHED --             3 weeks ago
+  cleanup/retire-hgl-2026-09-05                              2  origin/cleanup/retire-hgl-2026-09-05 17 hours ago
+  fix/kin-ion-star-wedge-2026-08-17                          2  origin/fix/kin-ion-star-wedge-2026-08-17 3 weeks ago
+  fix/kmeans-explicit-feature-window-2026-08-31              2  origin/fix/kmeans-explicit-feature-window-2026-08-31 6 days ago
+  fix/sc-final-output-owner-2026-08-30                       2  origin/fix/sc-final-output-owner-2026-08-30 7 days ago
+  fix/wfn-trs-safety-main-2026-08-30                         2  origin/main                  7 days ago
+  fix/zeta-guard-logical-edge-2026-08-18                     2  origin/fix/zeta-guard-logical-edge-2026-08-18 3 weeks ago
+  perf/psi-irr-packed-order-profiling-2026-09-05             2  origin/perf/psi-irr-packed-order-profiling-2026-09-05 14 hours ago
+  perf/psi-irr-parent-route-profiling-2026-09-05             2  origin/perf/psi-irr-parent-route-profiling-2026-09-05 18 hours ago
+  run/si85-old-charge-selector-qp16-replay-2026-08-31        2  origin/run/si85-old-charge-selector-qp16-replay-2026-08-31 6 days ago
+  evidence/run80-eta-preserving-sine-minimax-2026-09-05      1  origin/evidence/run80-eta-preserving-sine-minimax-2026-09-05 18 hours ago
+  exp/run86-seeded-uniform-recompression-2026-09-05          1  origin/exp/run86-seeded-uniform-recompression-2026-09-05 16 hours ago
+  feat/bisp-parent-k2-2026-09-05                             1  -- NOT PUSHED --             11 hours ago
+  feat/centroid-timing-observability-2026-08-31              1  origin/feat/centroid-timing-observability-2026-08-31 5 days ago
+  feat/conduction-energy-brackets-2026-08-19                 1  origin/feat/conduction-energy-brackets-2026-08-19 3 weeks ago
+  feat/htransform-basis-only-2026-09-01                      1  origin/feat/htransform-basis-only-2026-09-01 5 days ago
+  feat/intraband-crossing-block-wp12-2026-08-17              1  origin/feat/intraband-crossing-block-wp12-2026-08-17 3 weeks ago
+  feat/mpa-companion-solve-2026-08-18                        1  origin/feat/mpa-companion-solve-2026-08-18 3 weeks ago
+  feat/run83-logical-sigma-mask-20260905                     1  origin/feat/run83-logical-sigma-mask-20260905 16 hours ago
+  feat/staged-sc-2026-08-14                                  1  origin/feat/staged-sc-2026-08-14 3 weeks ago
+  feat/staged-sc-2026-08-15                                  1  origin/feat/staged-sc-2026-08-15 3 weeks ago
+  feat/transverse-centroid-orbit-block-2026-08-31            1  origin/feat/transverse-centroid-orbit-block-2026-08-31 5 days ago
+  fix/fft-workspace-production-ifft-2026-08-24               1  origin/fix/fft-workspace-production-ifft-2026-08-24 12 days ago
+  fix/ppm-invalid-static-spatial-2026-08-19                  1  origin/fix/ppm-invalid-static-spatial-2026-08-19 3 weeks ago
+  fix/pt-ownership-2026-08-17                                1  origin/fix/pt-ownership-2026-08-17 3 weeks ago
+  fix/qe-schema-active-ops-2026-08-30                        1  origin/fix/qe-schema-active-ops-2026-08-30 6 days ago
+  fix/qsgw-lowval-fermi-rigid-2026-08-19                     1  origin/fix/qsgw-lowval-fermi-rigid-2026-08-19 3 weeks ago
+  fix/scalar-v-reciprocity-2026-08-17                        1  -- NOT PUSHED --             3 weeks ago
+  fix/scalar-v-reciprocity-2026-08-17-foreign-merge          1  origin/fix/scalar-v-reciprocity-2026-08-17 3 weeks ago
+  fix/wfn-density-cache-strict-2026-08-30                    1  origin/fix/wfn-density-cache-strict-2026-08-30 7 days ago
+  perf/mpa-one-shot-fastpath-2026-09-05                      1  origin/perf/mpa-one-shot-fastpath-2026-09-05 25 hours ago
+  perf/mpa-one-shot-fastpath-run79-2026-09-05                1  origin/perf/mpa-one-shot-fastpath-run79-2026-09-05 20 hours ago
+  perf/orbmag-device-spin-reduction-2026-08-30               1  origin/perf/orbmag-device-spin-reduction-2026-08-30 7 days ago
+  perf/polar-projection-device-2026-08-30                    1  origin/perf/polar-projection-device-2026-08-30 7 days ago
+  perf/psi-irr-parent-tail-conv-kpair-2026-09-05             1  origin/perf/psi-irr-parent-tail-conv-kpair-2026-09-05 11 hours ago
+  perf/sc-sharded-carry-2026-08-30                           1  origin/perf/sc-sharded-carry-2026-08-30 7 days ago
+  perf/vnl-bounded-ordinary-2026-08-30                       1  origin/perf/vnl-bounded-ordinary-2026-08-30 7 days ago
+  perf/vnl-streamed-z-2026-08-30                             1  -- NOT PUSHED --             7 days ago
+  probe/star-relation-freshness-2026-08-17                   1  origin/probe/star-relation-freshness-2026-08-17 3 weeks ago
+  run/centroid-conditioning-spectra-2026-08-31               1  -- NOT PUSHED --             6 days ago
+  run/si84-old-charge-selector-2026-08-31                    1  origin/run/si84-old-charge-selector-2026-08-31 6 days ago
+  run/si85-old-charge-selector-qp16-2026-08-31               1  -- NOT PUSHED --             6 days ago
+
+120 branch(es) unmerged; 15 of them have NO UPSTREAM and exist only on this disk.
+Push them: git push -u origin <branch>. The owner merges to main; you never do.

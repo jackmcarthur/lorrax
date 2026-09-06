@@ -1,0 +1,1802 @@
+{
+  "11_P_full_static_profile": {
+    "blocks": [
+      {
+        "module": "module_1476.jit_contract_block",
+        "peak_bytes": 46869073,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1476#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "5595291",
+            "Total Range Time (ns)": "5877032",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2797645.5",
+            "Proj Med (ns)": "2797645.5",
+            "Proj Min (ns)": "2466014",
+            "Proj Max (ns)": "3129277",
+            "Proj StdDev (ns)": "468997.8",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_1528.jit_contract_block",
+        "peak_bytes": 31681105,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1528#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4608093",
+            "Total Range Time (ns)": "4793876",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2304046.5",
+            "Proj Med (ns)": "2304046.5",
+            "Proj Min (ns)": "2236126",
+            "Proj Max (ns)": "2371967",
+            "Proj StdDev (ns)": "96054.1",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_1588.jit_contract_block",
+        "peak_bytes": 25195697,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1588#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4470077",
+            "Total Range Time (ns)": "5147501",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2235038.5",
+            "Proj Med (ns)": "2235038.5",
+            "Proj Min (ns)": "2184958",
+            "Proj Max (ns)": "2285119",
+            "Proj StdDev (ns)": "70824.5",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_1640.jit_contract_block",
+        "peak_bytes": 17208497,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1640#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4259485",
+            "Total Range Time (ns)": "4799757",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2129742.5",
+            "Proj Med (ns)": "2129742.5",
+            "Proj Min (ns)": "2087838",
+            "Proj Max (ns)": "2171647",
+            "Proj StdDev (ns)": "59261.9",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_1700.jit_contract_block",
+        "peak_bytes": 25195761,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1700#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4407996",
+            "Total Range Time (ns)": "5081493",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2203998.0",
+            "Proj Med (ns)": "2203998.0",
+            "Proj Min (ns)": "2158046",
+            "Proj Max (ns)": "2249950",
+            "Proj StdDev (ns)": "64985.9",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_1750.jit_contract_block",
+        "peak_bytes": 17208561,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1750#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "5199548",
+            "Total Range Time (ns)": "5896079",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2599774.0",
+            "Proj Med (ns)": "2599774.0",
+            "Proj Min (ns)": "2166814",
+            "Proj Max (ns)": "3032734",
+            "Proj StdDev (ns)": "612297.9",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_1808.jit_contract_block",
+        "peak_bytes": 25195761,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1808#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4483836",
+            "Total Range Time (ns)": "5098286",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2241918.0",
+            "Proj Med (ns)": "2241918.0",
+            "Proj Min (ns)": "2223934",
+            "Proj Max (ns)": "2259902",
+            "Proj StdDev (ns)": "25433.2",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_1858.jit_contract_block",
+        "peak_bytes": 17208561,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1858#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4174270",
+            "Total Range Time (ns)": "4733650",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2087135.0",
+            "Proj Med (ns)": "2087135.0",
+            "Proj Min (ns)": "2072095",
+            "Proj Max (ns)": "2102175",
+            "Proj StdDev (ns)": "21269.8",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_1918.jit_contract_block",
+        "peak_bytes": 25195697,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1918#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4339773",
+            "Total Range Time (ns)": "5110560",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2169886.5",
+            "Proj Med (ns)": "2169886.5",
+            "Proj Min (ns)": "2133118",
+            "Proj Max (ns)": "2206655",
+            "Proj StdDev (ns)": "51998.5",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_1970.jit_contract_block",
+        "peak_bytes": 17208497,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1970#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4226590",
+            "Total Range Time (ns)": "4909880",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2113295.0",
+            "Proj Med (ns)": "2113295.0",
+            "Proj Min (ns)": "2110847",
+            "Proj Max (ns)": "2115743",
+            "Proj StdDev (ns)": "3462.0",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2042.jit_contract_block",
+        "peak_bytes": 13524977,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2042#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4455036",
+            "Total Range Time (ns)": "5214179",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2227518.0",
+            "Proj Med (ns)": "2227518.0",
+            "Proj Min (ns)": "2219902",
+            "Proj Max (ns)": "2235134",
+            "Proj StdDev (ns)": "10770.7",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2094.jit_contract_block",
+        "peak_bytes": 9748977,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2094#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4081533",
+            "Total Range Time (ns)": "4782363",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2040766.5",
+            "Proj Med (ns)": "2040766.5",
+            "Proj Min (ns)": "2008286",
+            "Proj Max (ns)": "2073247",
+            "Proj StdDev (ns)": "45934.4",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2164.jit_contract_block",
+        "peak_bytes": 13525041,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2164#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4296732",
+            "Total Range Time (ns)": "5021106",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2148366.0",
+            "Proj Med (ns)": "2148366.0",
+            "Proj Min (ns)": "2109406",
+            "Proj Max (ns)": "2187326",
+            "Proj StdDev (ns)": "55097.8",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2214.jit_contract_block",
+        "peak_bytes": 9749041,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2214#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "3958910",
+            "Total Range Time (ns)": "4560576",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "1979455.0",
+            "Proj Med (ns)": "1979455.0",
+            "Proj Min (ns)": "1965695",
+            "Proj Max (ns)": "1993215",
+            "Proj StdDev (ns)": "19459.6",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2284.jit_contract_block",
+        "peak_bytes": 13525057,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2284#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4280732",
+            "Total Range Time (ns)": "4980767",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2140366.0",
+            "Proj Med (ns)": "2140366.0",
+            "Proj Min (ns)": "2121598",
+            "Proj Max (ns)": "2159134",
+            "Proj StdDev (ns)": "26542.0",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2334.jit_contract_block",
+        "peak_bytes": 9749057,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2334#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4023997",
+            "Total Range Time (ns)": "4650258",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2011998.5",
+            "Proj Med (ns)": "2011998.5",
+            "Proj Min (ns)": "1988415",
+            "Proj Max (ns)": "2035582",
+            "Proj StdDev (ns)": "33352.1",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2392.jit_contract_block",
+        "peak_bytes": 25195761,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2392#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4340316",
+            "Total Range Time (ns)": "5013160",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2170158.0",
+            "Proj Med (ns)": "2170158.0",
+            "Proj Min (ns)": "2160574",
+            "Proj Max (ns)": "2179742",
+            "Proj StdDev (ns)": "13553.8",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2442.jit_contract_block",
+        "peak_bytes": 17208561,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2442#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4146108",
+            "Total Range Time (ns)": "4647082",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2073054.0",
+            "Proj Med (ns)": "2073054.0",
+            "Proj Min (ns)": "2063422",
+            "Proj Max (ns)": "2082686",
+            "Proj StdDev (ns)": "13621.7",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2512.jit_contract_block",
+        "peak_bytes": 13525041,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2512#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4220700",
+            "Total Range Time (ns)": "4952994",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2110350.0",
+            "Proj Med (ns)": "2110350.0",
+            "Proj Min (ns)": "2062078",
+            "Proj Max (ns)": "2158622",
+            "Proj StdDev (ns)": "68266.9",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2562.jit_contract_block",
+        "peak_bytes": 9749041,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2562#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4064542",
+            "Total Range Time (ns)": "4653755",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2032271.0",
+            "Proj Med (ns)": "2032271.0",
+            "Proj Min (ns)": "2026303",
+            "Proj Max (ns)": "2038239",
+            "Proj StdDev (ns)": "8440.0",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2632.jit_contract_block",
+        "peak_bytes": 13525041,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2632#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4357660",
+            "Total Range Time (ns)": "5070642",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2178830.0",
+            "Proj Med (ns)": "2178830.0",
+            "Proj Min (ns)": "2163582",
+            "Proj Max (ns)": "2194078",
+            "Proj StdDev (ns)": "21563.9",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2682.jit_contract_block",
+        "peak_bytes": 9749041,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2682#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4000446",
+            "Total Range Time (ns)": "4663674",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2000223.0",
+            "Proj Med (ns)": "2000223.0",
+            "Proj Min (ns)": "1955999",
+            "Proj Max (ns)": "2044447",
+            "Proj StdDev (ns)": "62542.2",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2752.jit_contract_block",
+        "peak_bytes": 13525121,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2752#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4191996",
+            "Total Range Time (ns)": "4898798",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2095998.0",
+            "Proj Med (ns)": "2095998.0",
+            "Proj Min (ns)": "2090110",
+            "Proj Max (ns)": "2101886",
+            "Proj StdDev (ns)": "8326.9",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2802.jit_contract_block",
+        "peak_bytes": 9749121,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2802#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "3982269",
+            "Total Range Time (ns)": "4570384",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "1991134.5",
+            "Proj Med (ns)": "1991134.5",
+            "Proj Min (ns)": "1982815",
+            "Proj Max (ns)": "1999454",
+            "Proj StdDev (ns)": "11765.5",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2860.jit_contract_block",
+        "peak_bytes": 25195761,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2860#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4302365",
+            "Total Range Time (ns)": "5121640",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2151182.5",
+            "Proj Med (ns)": "2151182.5",
+            "Proj Min (ns)": "2116414",
+            "Proj Max (ns)": "2185951",
+            "Proj StdDev (ns)": "49170.1",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2910.jit_contract_block",
+        "peak_bytes": 17208561,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2910#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4034140",
+            "Total Range Time (ns)": "4548942",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2017070.0",
+            "Proj Med (ns)": "2017070.0",
+            "Proj Min (ns)": "1980414",
+            "Proj Max (ns)": "2053726",
+            "Proj StdDev (ns)": "51839.4",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_2980.jit_contract_block",
+        "peak_bytes": 13525057,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=2980#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4100893",
+            "Total Range Time (ns)": "4749730",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2050446.5",
+            "Proj Med (ns)": "2050446.5",
+            "Proj Min (ns)": "2037727",
+            "Proj Max (ns)": "2063166",
+            "Proj StdDev (ns)": "17988.1",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_3030.jit_contract_block",
+        "peak_bytes": 9749057,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3030#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "3895389",
+            "Total Range Time (ns)": "4449959",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "1947694.5",
+            "Proj Med (ns)": "1947694.5",
+            "Proj Min (ns)": "1909375",
+            "Proj Max (ns)": "1986014",
+            "Proj StdDev (ns)": "54192.0",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_3100.jit_contract_block",
+        "peak_bytes": 13525121,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3100#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4160605",
+            "Total Range Time (ns)": "4810057",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2080302.5",
+            "Proj Med (ns)": "2080302.5",
+            "Proj Min (ns)": "2072670",
+            "Proj Max (ns)": "2087935",
+            "Proj StdDev (ns)": "10794.0",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_3150.jit_contract_block",
+        "peak_bytes": 9749121,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3150#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "3966302",
+            "Total Range Time (ns)": "4549133",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "1983151.0",
+            "Proj Med (ns)": "1983151.0",
+            "Proj Min (ns)": "1945151",
+            "Proj Max (ns)": "2021151",
+            "Proj StdDev (ns)": "53740.1",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_3220.jit_contract_block",
+        "peak_bytes": 13525041,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3220#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "4118462",
+            "Total Range Time (ns)": "4779229",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "2059231.0",
+            "Proj Med (ns)": "2059231.0",
+            "Proj Min (ns)": "2050815",
+            "Proj Max (ns)": "2067647",
+            "Proj StdDev (ns)": "11902.0",
+            "Total GPU Ops": "270",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_3270.jit_contract_block",
+        "peak_bytes": 9749041,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3270#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "3896766",
+            "Total Range Time (ns)": "5393406",
+            "Range Instances": "2",
+            "Proj Avg (ns)": "1948383.0",
+            "Proj Med (ns)": "1948383.0",
+            "Proj Min (ns)": "1903839",
+            "Proj Max (ns)": "1992927",
+            "Proj StdDev (ns)": "62994.7",
+            "Total GPU Ops": "256",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 120
+        }
+      },
+      {
+        "module": "module_3528.jit_contract_block",
+        "peak_bytes": 46863297,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3528#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2367455",
+            "Total Range Time (ns)": "2479368",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2367455.0",
+            "Proj Med (ns)": "2367455.0",
+            "Proj Min (ns)": "2367455",
+            "Proj Max (ns)": "2367455",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3540.jit_contract_block",
+        "peak_bytes": 31675329,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3540#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2290366",
+            "Total Range Time (ns)": "2425213",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2290366.0",
+            "Proj Med (ns)": "2290366.0",
+            "Proj Min (ns)": "2290366",
+            "Proj Max (ns)": "2290366",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3558.jit_contract_block",
+        "peak_bytes": 25189921,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3558#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2144031",
+            "Total Range Time (ns)": "2475179",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2144031.0",
+            "Proj Med (ns)": "2144031.0",
+            "Proj Min (ns)": "2144031",
+            "Proj Max (ns)": "2144031",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3568.jit_contract_block",
+        "peak_bytes": 17202721,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3568#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2089598",
+            "Total Range Time (ns)": "2443598",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2089598.0",
+            "Proj Med (ns)": "2089598.0",
+            "Proj Min (ns)": "2089598",
+            "Proj Max (ns)": "2089598",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3584.jit_contract_block",
+        "peak_bytes": 25189985,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3584#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2165535",
+            "Total Range Time (ns)": "2475821",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2165535.0",
+            "Proj Med (ns)": "2165535.0",
+            "Proj Min (ns)": "2165535",
+            "Proj Max (ns)": "2165535",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3592.jit_contract_block",
+        "peak_bytes": 17202785,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3592#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2108862",
+            "Total Range Time (ns)": "2431846",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2108862.0",
+            "Proj Med (ns)": "2108862.0",
+            "Proj Min (ns)": "2108862",
+            "Proj Max (ns)": "2108862",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3608.jit_contract_block",
+        "peak_bytes": 25189985,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3608#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2149726",
+            "Total Range Time (ns)": "2521369",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2149726.0",
+            "Proj Med (ns)": "2149726.0",
+            "Proj Min (ns)": "2149726",
+            "Proj Max (ns)": "2149726",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3616.jit_contract_block",
+        "peak_bytes": 17202785,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3616#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2141855",
+            "Total Range Time (ns)": "2459910",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2141855.0",
+            "Proj Med (ns)": "2141855.0",
+            "Proj Min (ns)": "2141855",
+            "Proj Max (ns)": "2141855",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3636.jit_contract_block",
+        "peak_bytes": 25189921,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3636#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2193310",
+            "Total Range Time (ns)": "2517842",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2193310.0",
+            "Proj Med (ns)": "2193310.0",
+            "Proj Min (ns)": "2193310",
+            "Proj Max (ns)": "2193310",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3646.jit_contract_block",
+        "peak_bytes": 17202721,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3646#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2052447",
+            "Total Range Time (ns)": "2399363",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2052447.0",
+            "Proj Med (ns)": "2052447.0",
+            "Proj Min (ns)": "2052447",
+            "Proj Max (ns)": "2052447",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3676.jit_contract_block",
+        "peak_bytes": 13519201,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3676#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2050015",
+            "Total Range Time (ns)": "2426966",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2050015.0",
+            "Proj Med (ns)": "2050015.0",
+            "Proj Min (ns)": "2050015",
+            "Proj Max (ns)": "2050015",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3686.jit_contract_block",
+        "peak_bytes": 9743201,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3686#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2014782",
+            "Total Range Time (ns)": "2401217",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2014782.0",
+            "Proj Med (ns)": "2014782.0",
+            "Proj Min (ns)": "2014782",
+            "Proj Max (ns)": "2014782",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3714.jit_contract_block",
+        "peak_bytes": 13519265,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3714#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2060223",
+            "Total Range Time (ns)": "2437437",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2060223.0",
+            "Proj Med (ns)": "2060223.0",
+            "Proj Min (ns)": "2060223",
+            "Proj Max (ns)": "2060223",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3722.jit_contract_block",
+        "peak_bytes": 9743265,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3722#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2037887",
+            "Total Range Time (ns)": "2423068",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2037887.0",
+            "Proj Med (ns)": "2037887.0",
+            "Proj Min (ns)": "2037887",
+            "Proj Max (ns)": "2037887",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3750.jit_contract_block",
+        "peak_bytes": 13519281,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3750#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2124607",
+            "Total Range Time (ns)": "2521710",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2124607.0",
+            "Proj Med (ns)": "2124607.0",
+            "Proj Min (ns)": "2124607",
+            "Proj Max (ns)": "2124607",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3758.jit_contract_block",
+        "peak_bytes": 9743281,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3758#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2089598",
+            "Total Range Time (ns)": "2538141",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2089598.0",
+            "Proj Med (ns)": "2089598.0",
+            "Proj Min (ns)": "2089598",
+            "Proj Max (ns)": "2089598",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3774.jit_contract_block",
+        "peak_bytes": 25189985,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3774#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2129023",
+            "Total Range Time (ns)": "2455972",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2129023.0",
+            "Proj Med (ns)": "2129023.0",
+            "Proj Min (ns)": "2129023",
+            "Proj Max (ns)": "2129023",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3782.jit_contract_block",
+        "peak_bytes": 17202785,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3782#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2069375",
+            "Total Range Time (ns)": "2400455",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2069375.0",
+            "Proj Med (ns)": "2069375.0",
+            "Proj Min (ns)": "2069375",
+            "Proj Max (ns)": "2069375",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3810.jit_contract_block",
+        "peak_bytes": 13519265,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3810#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2238750",
+            "Total Range Time (ns)": "2639217",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2238750.0",
+            "Proj Med (ns)": "2238750.0",
+            "Proj Min (ns)": "2238750",
+            "Proj Max (ns)": "2238750",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3818.jit_contract_block",
+        "peak_bytes": 9743265,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3818#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2003295",
+            "Total Range Time (ns)": "2391598",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2003295.0",
+            "Proj Med (ns)": "2003295.0",
+            "Proj Min (ns)": "2003295",
+            "Proj Max (ns)": "2003295",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3846.jit_contract_block",
+        "peak_bytes": 13519265,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3846#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2029503",
+            "Total Range Time (ns)": "2480741",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2029503.0",
+            "Proj Med (ns)": "2029503.0",
+            "Proj Min (ns)": "2029503",
+            "Proj Max (ns)": "2029503",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3854.jit_contract_block",
+        "peak_bytes": 9743265,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3854#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2021759",
+            "Total Range Time (ns)": "2405064",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2021759.0",
+            "Proj Med (ns)": "2021759.0",
+            "Proj Min (ns)": "2021759",
+            "Proj Max (ns)": "2021759",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3882.jit_contract_block",
+        "peak_bytes": 13519345,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3882#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2115775",
+            "Total Range Time (ns)": "2519415",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2115775.0",
+            "Proj Med (ns)": "2115775.0",
+            "Proj Min (ns)": "2115775",
+            "Proj Max (ns)": "2115775",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3890.jit_contract_block",
+        "peak_bytes": 9743345,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3890#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2029086",
+            "Total Range Time (ns)": "2424532",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2029086.0",
+            "Proj Med (ns)": "2029086.0",
+            "Proj Min (ns)": "2029086",
+            "Proj Max (ns)": "2029086",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3906.jit_contract_block",
+        "peak_bytes": 25189985,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3906#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2179518",
+            "Total Range Time (ns)": "2532190",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2179518.0",
+            "Proj Med (ns)": "2179518.0",
+            "Proj Min (ns)": "2179518",
+            "Proj Max (ns)": "2179518",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3914.jit_contract_block",
+        "peak_bytes": 17202785,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3914#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2074686",
+            "Total Range Time (ns)": "2446263",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2074686.0",
+            "Proj Med (ns)": "2074686.0",
+            "Proj Min (ns)": "2074686",
+            "Proj Max (ns)": "2074686",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3942.jit_contract_block",
+        "peak_bytes": 13519281,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3942#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2105694",
+            "Total Range Time (ns)": "2497914",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2105694.0",
+            "Proj Med (ns)": "2105694.0",
+            "Proj Min (ns)": "2105694",
+            "Proj Max (ns)": "2105694",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3950.jit_contract_block",
+        "peak_bytes": 9743281,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3950#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2005214",
+            "Total Range Time (ns)": "2402529",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2005214.0",
+            "Proj Med (ns)": "2005214.0",
+            "Proj Min (ns)": "2005214",
+            "Proj Max (ns)": "2005214",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3978.jit_contract_block",
+        "peak_bytes": 13519345,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3978#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2052671",
+            "Total Range Time (ns)": "2457435",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2052671.0",
+            "Proj Med (ns)": "2052671.0",
+            "Proj Min (ns)": "2052671",
+            "Proj Max (ns)": "2052671",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_3986.jit_contract_block",
+        "peak_bytes": 9743345,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=3986#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2039551",
+            "Total Range Time (ns)": "2463937",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2039551.0",
+            "Proj Med (ns)": "2039551.0",
+            "Proj Min (ns)": "2039551",
+            "Proj Max (ns)": "2039551",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_4014.jit_contract_block",
+        "peak_bytes": 13519265,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=4014#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2172511",
+            "Total Range Time (ns)": "2888109",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2172511.0",
+            "Proj Med (ns)": "2172511.0",
+            "Proj Min (ns)": "2172511",
+            "Proj Max (ns)": "2172511",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "135",
+            "Avg GPU Ops": "135.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      },
+      {
+        "module": "module_4022.jit_contract_block",
+        "peak_bytes": 9743265,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=4022#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "2057503",
+            "Total Range Time (ns)": "2457264",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "2057503.0",
+            "Proj Med (ns)": "2057503.0",
+            "Proj Min (ns)": "2057503",
+            "Proj Max (ns)": "2057503",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "128",
+            "Avg GPU Ops": "128.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "11.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 60
+        }
+      }
+    ],
+    "restore_modules": 300,
+    "restore_collectives": [],
+    "restore_projected_sum_ms": 6.607031,
+    "restore_kernel_sum_ms": 1.673695
+  },
+  "12_F_full_static_profile": {
+    "blocks": [
+      {
+        "module": "module_0802.jit_contract_block",
+        "peak_bytes": 78962020,
+        "static_collectives": {
+          "all-gather": 4
+        },
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=802#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "26014351",
+            "Total Range Time (ns)": "22494009",
+            "Range Instances": "3",
+            "Proj Avg (ns)": "8671450.3",
+            "Proj Med (ns)": "8034715.0",
+            "Proj Min (ns)": "8033915",
+            "Proj Max (ns)": "9945721",
+            "Proj StdDev (ns)": "1103550.8",
+            "Total GPU Ops": "1193",
+            "Avg GPU Ops": "397.7",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "7.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 540,
+          "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 6,
+          "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)": 3
+        }
+      },
+      {
+        "module": "module_0893.jit_contract_block",
+        "peak_bytes": 46871653,
+        "static_collectives": {
+          "all-gather": 4
+        },
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=893#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "62119449",
+            "Total Range Time (ns)": "55988029",
+            "Range Instances": "9",
+            "Proj Avg (ns)": "6902161.0",
+            "Proj Med (ns)": "6903676.0",
+            "Proj Min (ns)": "6833116",
+            "Proj Max (ns)": "7021724",
+            "Proj StdDev (ns)": "57793.6",
+            "Total GPU Ops": "3576",
+            "Avg GPU Ops": "397.3",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "7.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 1620,
+          "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 18,
+          "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9
+        }
+      },
+      {
+        "module": "module_0963.jit_contract_block",
+        "peak_bytes": 46871653,
+        "static_collectives": {
+          "all-gather": 4
+        },
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=963#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "60994304",
+            "Total Range Time (ns)": "55068816",
+            "Range Instances": "9",
+            "Proj Avg (ns)": "6777144.9",
+            "Proj Med (ns)": "6758109.0",
+            "Proj Min (ns)": "6660061",
+            "Proj Max (ns)": "6842716",
+            "Proj StdDev (ns)": "60978.8",
+            "Total GPU Ops": "3576",
+            "Avg GPU Ops": "397.3",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "7.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 1620,
+          "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 18,
+          "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9
+        }
+      },
+      {
+        "module": "module_1019.jit_contract_block",
+        "peak_bytes": 27382117,
+        "static_collectives": {
+          "all-gather": 4
+        },
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1019#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "171974239",
+            "Total Range Time (ns)": "172157345",
+            "Range Instances": "27",
+            "Proj Avg (ns)": "6369416.3",
+            "Proj Med (ns)": "6471484.0",
+            "Proj Min (ns)": "5819452",
+            "Proj Max (ns)": "6771133",
+            "Proj StdDev (ns)": "263050.5",
+            "Total GPU Ops": "10728",
+            "Avg GPU Ops": "397.3",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "7.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 4860,
+          "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 54,
+          "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)": 27
+        }
+      }
+    ],
+    "restore_modules": 0,
+    "restore_collectives": [],
+    "restore_projected_sum_ms": 0,
+    "restore_kernel_sum_ms": 0
+  }
+}

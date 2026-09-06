@@ -1,0 +1,164 @@
+[
+  {
+    "run": "01_P_static_baseline",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-113321-195974-2219 exit 0 in 76 s",
+    "source_head": "38b328db3f2b4f7b03141f475a3dfb4ef0d6133f"
+  },
+  {
+    "run": "02_P_dynamic_baseline",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-113441-218949-9472 exit 0 in 111 s",
+    "source_head": "38b328db3f2b4f7b03141f475a3dfb4ef0d6133f"
+  },
+  {
+    "run": "03_P_static_profile",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-113635-230722-5731 exit 0 in 198 s",
+    "source_head": "38b328db3f2b4f7b03141f475a3dfb4ef0d6133f"
+  },
+  {
+    "run": "04_P_host_baseline",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-114002-258518-9170 exit 0 in 73 s",
+    "source_head": "38b328db3f2b4f7b03141f475a3dfb4ef0d6133f"
+  },
+  {
+    "run": "05_P_scan_static",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-115721-277816-1303 exit 0 in 78 s",
+    "source_head": "a2ab0e78e4e5409bfd8e4c5fffd809c8cdd868d1"
+  },
+  {
+    "run": "06_cpu_scan",
+    "state": "failed",
+    "receipt": "[lx] step lx-Xg0-114509-284511-9392 exit 1 in 52 s",
+    "source_head": "38b328db3f2b4f7b03141f475a3dfb4ef0d6133f"
+  },
+  {
+    "run": "07_cpu_scan",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg0-114716-304836-4320 exit 0 in 26 s",
+    "source_head": "38b328db3f2b4f7b03141f475a3dfb4ef0d6133f"
+  },
+  {
+    "run": "08_P_scan_profile",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-115900-384535-8939 exit 0 in 204 s",
+    "source_head": "a2ab0e78e4e5409bfd8e4c5fffd809c8cdd868d1"
+  },
+  {
+    "run": "09_P_scan_dynamic",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-120230-406775-1906 exit 0 in 108 s",
+    "source_head": "a2ab0e78e4e5409bfd8e4c5fffd809c8cdd868d1"
+  },
+  {
+    "run": "10_P_scan_oracles",
+    "state": "failed",
+    "receipt": "[lx] step lx-Xg4-120420-417822-9746 exit 126 in 4 s",
+    "source_head": null
+  },
+  {
+    "run": "11_cpu_static_owners",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg0-115808-380235-8363 exit 0 in 19 s",
+    "source_head": "a2ab0e78e4e5409bfd8e4c5fffd809c8cdd868d1"
+  },
+  {
+    "run": "12_P_scan_oracles",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-120509-421689-1824 exit 0 in 44 s",
+    "source_head": "a2ab0e78e4e5409bfd8e4c5fffd809c8cdd868d1"
+  },
+  {
+    "run": "13_P_restore_static",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-120912-441486-5686 exit 0 in 73 s",
+    "source_head": "1b81c9ccabb23d576c40e1a594681d1b3f4b6c20"
+  },
+  {
+    "run": "14_cpu_restore",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg0-121001-446209-4352 exit 0 in 21 s",
+    "source_head": "1b81c9ccabb23d576c40e1a594681d1b3f4b6c20"
+  },
+  {
+    "run": "15_P_restore_profile",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-121202-456270-6121 exit 0 in 193 s",
+    "source_head": "1b81c9ccabb23d576c40e1a594681d1b3f4b6c20"
+  },
+  {
+    "run": "16_P_restore_dynamic",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-121517-471916-2792 exit 0 in 103 s",
+    "source_head": "1b81c9ccabb23d576c40e1a594681d1b3f4b6c20"
+  },
+  {
+    "run": "17_P_restore_host",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-121702-480390-2853 exit 0 in 72 s",
+    "source_head": "1b81c9ccabb23d576c40e1a594681d1b3f4b6c20"
+  },
+  {
+    "run": "18_P_restore_oracles",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-121816-484589-4806 exit 0 in 33 s",
+    "source_head": "1b81c9ccabb23d576c40e1a594681d1b3f4b6c20"
+  },
+  {
+    "run": "23_cpu_repository_gate",
+    "state": "failed",
+    "receipt": "[lx] step lx-Xg0-122036-497348-5531 exit 1 in 70 s",
+    "source_head": "1b81c9ccabb23d576c40e1a594681d1b3f4b6c20"
+  },
+  {
+    "run": "24_P_coupled_static",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-122808-536158-1837 exit 0 in 70 s",
+    "source_head": "d994f90d892c9ff9f10a79ce315f82e3bd968e9d"
+  },
+  {
+    "run": "25_cpu_coupled",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg0-123016-544917-4456 exit 0 in 23 s",
+    "source_head": "d994f90d892c9ff9f10a79ce315f82e3bd968e9d"
+  },
+  {
+    "run": "26_P_coupled_profile",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-123055-548742-9340 exit 0 in 196 s",
+    "source_head": "d994f90d892c9ff9f10a79ce315f82e3bd968e9d"
+  },
+  {
+    "run": "27_P_coupled_dynamic",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-123412-568024-9639 exit 0 in 102 s",
+    "source_head": "d994f90d892c9ff9f10a79ce315f82e3bd968e9d"
+  },
+  {
+    "run": "28_P_coupled_host",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-123600-575295-5784 exit 0 in 72 s",
+    "source_head": "d994f90d892c9ff9f10a79ce315f82e3bd968e9d"
+  },
+  {
+    "run": "29_P_coupled_oracles",
+    "state": "complete",
+    "receipt": "[lx] step lx-Xg4-123714-581890-9106 exit 0 in 36 s",
+    "source_head": "d994f90d892c9ff9f10a79ce315f82e3bd968e9d"
+  },
+  {
+    "run": "30_cpu_repository_gate",
+    "state": "failed",
+    "receipt": "[lx] step lx-Xg0-123242-556936-6542 exit 1 in 65 s",
+    "source_head": "d994f90d892c9ff9f10a79ce315f82e3bd968e9d"
+  },
+  {
+    "run": "31_cpu_baseline_rules",
+    "state": "failed",
+    "receipt": "[lx] step lx-Xg0-124825-635859-6424 exit 1 in 7 s",
+    "source_head": null
+  }
+]

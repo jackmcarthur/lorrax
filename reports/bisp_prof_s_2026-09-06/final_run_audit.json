@@ -1,0 +1,671 @@
+{
+  "scope": "Final run metadata audit. Inherited manifest source.commit is the donor pin; actual candidate source is source_head plus source.diff and the driver guard. Failed startup/CPU scaffolding legs remain failed evidence, not numerical verdicts.",
+  "runs": [
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/00_tools",
+      "step_receipts": [],
+      "runtime_source_head": null,
+      "source_diff_sha256": null,
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/00_tools/driver.sh",
+      "eqp0_exists": false,
+      "eqp1_exists": false,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/05_P_full_static_baseline",
+      "step_receipts": [
+        "[lx] step lx-Xg4-011831-1203588-3371 exit 0 in 207 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/05_P_full_static_baseline/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/06_F_full_static_baseline",
+      "step_receipts": [
+        "[lx] step lx-Xg4-012232-1236210-4898 exit 0 in 60 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/06_F_full_static_baseline/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/07_P_packed_bare_baseline",
+      "step_receipts": [
+        "[lx] step lx-Xg4-014017-1364925-8655 exit 0 in 190 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/07_P_packed_bare_baseline/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/08_F_packed_bare_baseline",
+      "step_receipts": [
+        "[lx] step lx-Xg4-014329-1395453-6054 exit 0 in 60 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/08_F_packed_bare_baseline/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/09_P_dynamic_eps5_baseline",
+      "step_receipts": [
+        "[lx] step lx-Xg4-014430-1403518-1126 exit 0 in 222 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/09_P_dynamic_eps5_baseline/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/10_F_dynamic_eps5_baseline",
+      "step_receipts": [
+        "[lx] step lx-Xg4-014814-1431424-9108 exit 0 in 122 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/10_F_dynamic_eps5_baseline/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/11_P_full_static_profile",
+      "step_receipts": [
+        "[lx] step lx-Xg4-012347-1245192-7444 exit 0 in 543 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/11_P_full_static_profile/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": 101749500
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/12_F_full_static_profile",
+      "step_receipts": [
+        "[lx] step lx-Xg4-013253-1309401-8544 exit 0 in 163 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/12_F_full_static_profile/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": 32847879
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/13_P_restore_lifetime_ablation",
+      "step_receipts": [
+        "[lx] step lx-Xg4-015529-1489973-3747 exit 1 in 7 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/13_P_restore_lifetime_ablation/driver.sh",
+      "eqp0_exists": false,
+      "eqp1_exists": false,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary",
+      "step_receipts": [
+        "[lx] step lx-Xg4-015056-1446736-4655 exit 0 in 211 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/14_P_host_boundary/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/15_F_host_boundary",
+      "step_receipts": [
+        "[lx] step lx-Xg4-015429-1477910-4785 exit 0 in 55 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/15_F_host_boundary/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/16_P_weight_shape_ablation",
+      "step_receipts": [
+        "[lx] step lx-Xg4-015537-1491412-7992 exit 0 in 206 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/16_P_weight_shape_ablation/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/17_P_plan_reuse_ablation",
+      "step_receipts": [
+        "[lx] step lx-Xg4-015906-1518571-4099 exit 0 in 161 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/17_P_plan_reuse_ablation/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/18_P_restore_shape_ablation",
+      "step_receipts": [
+        "[lx] step lx-Xg4-020153-1543034-2507 exit 0 in 151 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/18_P_restore_shape_ablation/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/19_P_restore_lifetime_ablation",
+      "step_receipts": [
+        "[lx] step lx-Xg4-020613-1580223-4143 exit 0 in 166 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/19_P_restore_lifetime_ablation/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/20_P_dynamic_profile",
+      "step_receipts": [
+        "[lx] step lx-Xg4-021533-1652166-6689 exit 0 in 576 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/20_P_dynamic_profile/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": 110936042
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/21_F_dynamic_profile",
+      "step_receipts": [
+        "[lx] step lx-Xg4-022510-1717630-1363 exit 0 in 204 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/21_F_dynamic_profile/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": 44230240
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/22_P_combined_signature_ablation",
+      "step_receipts": [
+        "[lx] step lx-Xg4-022841-1740347-8485 exit 0 in 107 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/22_P_combined_signature_ablation/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/23_P_plan_reuse_candidate",
+      "step_receipts": [
+        "[lx] step lx-Xg4-024713-1877307-4058 exit 0 in 156 s"
+      ],
+      "runtime_source_head": "17ec44019cc7c168468dcc79500df3b49871773f",
+      "source_diff_sha256": "529aaf89b1368ec0bb188d3ad0c404ea760eb619a29b3d11554e90a7f77b417f",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/23_P_plan_reuse_candidate/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/24_P_restore_candidate",
+      "step_receipts": [
+        "[lx] step lx-Xg4-025324-1917331-9182 exit 0 in 98 s"
+      ],
+      "runtime_source_head": "5dd1c7757bedd18224569a5d1c75739fd6285326",
+      "source_diff_sha256": "8410b4371f03ee3c0e372fe806e988581d0528e1fdc981995f7e656a35a109f7",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/24_P_restore_candidate/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/25_P_packed_bare_final",
+      "step_receipts": [
+        "[lx] step lx-Xg4-033626-2339875-4951 exit 0 in 60 s"
+      ],
+      "runtime_source_head": "ebc989180dcd8638d57660960d5ca019e2628806",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/25_P_packed_bare_final/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/26_P_dynamic_final",
+      "step_receipts": [
+        "[lx] step lx-Xg4-033729-2348577-9137 exit 0 in 95 s"
+      ],
+      "runtime_source_head": "ebc989180dcd8638d57660960d5ca019e2628806",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/26_P_dynamic_final/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/29_combined_regression",
+      "step_receipts": [
+        "[lx] step lx-Xg4-033906-2358773-6017 exit 0 in 51 s"
+      ],
+      "runtime_source_head": "ebc989180dcd8638d57660960d5ca019e2628806",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/29_combined_regression/driver.sh",
+      "eqp0_exists": false,
+      "eqp1_exists": false,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/30_P_shared_g_ablation",
+      "step_receipts": [
+        "[lx] step lx-Xg4-023435-1777974-1803 exit 0 in 91 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/30_P_shared_g_ablation/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/31_P_weight_layout_ablation",
+      "step_receipts": [
+        "[lx] step lx-Xg4-023659-1792520-6809 exit 0 in 91 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/31_P_weight_layout_ablation/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/32_P_restore_owner_cache_ablation",
+      "step_receipts": [
+        "[lx] step lx-Xg4-024405-1855550-1971 exit 0 in 88 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/32_P_restore_owner_cache_ablation/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/33_P_weight_candidate",
+      "step_receipts": [
+        "[lx] step lx-Xg4-025650-1941125-7057 exit 0 in 88 s"
+      ],
+      "runtime_source_head": "ebb18981134a3da7883735474586b4d6679822ed",
+      "source_diff_sha256": "f2be3e1fa533a877c2089d74b349cb3e18e8daf97cda3fa6ff2ffedbbc45eaaf",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/33_P_weight_candidate/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/34_P_shared_g_candidate",
+      "step_receipts": [
+        "[lx] step lx-Xg4-030030-1963321-6918 exit 0 in 83 s"
+      ],
+      "runtime_source_head": "1beb57116014e7e198d54da3b106450c49685674",
+      "source_diff_sha256": "8400d6d9bbba683600cac81bcfaa447756a8259bbb37710eb01c0bbfb2cda849",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/34_P_shared_g_candidate/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/35_P_full_static_final",
+      "step_receipts": [
+        "[lx] step lx-Xg4-033420-2328417-3557 exit 0 in 74 s"
+      ],
+      "runtime_source_head": "5093d98d5ab97b883ca65733231c3dd64fabbb71",
+      "source_diff_sha256": "12522702d9b0e14c8f1be21f47d63b1d2581ced6ded07c1bcbc6a7c637e86389",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/35_P_full_static_final/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/36_P_static_final_profile",
+      "step_receipts": [
+        "[lx] step lx-Xg4-033958-7856-6832 exit 0 in 241 s"
+      ],
+      "runtime_source_head": "ebc989180dcd8638d57660960d5ca019e2628806",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/36_P_static_final_profile/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": 42299984
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/37_P_shape_class_candidate",
+      "step_receipts": [
+        "[lx] step lx-Xg4-030620-1999625-3851 exit 0 in 71 s"
+      ],
+      "runtime_source_head": "fd5ba099c795232e937fb915da44b8328861d8d3",
+      "source_diff_sha256": "ae601c17680b646829634b95c5ca9c4e7de5a4e6c7986ccc494c5bbee9582d01",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/37_P_shape_class_candidate/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/38_P_dynamic_final_profile",
+      "step_receipts": [
+        "[lx] step lx-Xg4-034411-36368-8022 exit 0 in 260 s"
+      ],
+      "runtime_source_head": "ebc989180dcd8638d57660960d5ca019e2628806",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/38_P_dynamic_final_profile/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": 53545852
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/40_cpu_gates",
+      "step_receipts": [
+        "[lx] step lx-Xg0-031725-2232478-2895 exit 127 in 1 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": null,
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/40_cpu_gates/driver.sh",
+      "eqp0_exists": false,
+      "eqp1_exists": false,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/41_ast_gate",
+      "step_receipts": [
+        "[lx] step lx-Xg0-035328-91325-4986 exit 1 in 67 s"
+      ],
+      "runtime_source_head": "ebc989180dcd8638d57660960d5ca019e2628806",
+      "source_diff_sha256": null,
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/41_ast_gate/driver.sh",
+      "eqp0_exists": false,
+      "eqp1_exists": false,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/42_cpu_gates",
+      "step_receipts": [
+        "[lx] step lx-Xg0-031951-2245813-3760 exit 0 in 16 s"
+      ],
+      "runtime_source_head": "5093d98d5ab97b883ca65733231c3dd64fabbb71",
+      "source_diff_sha256": "12522702d9b0e14c8f1be21f47d63b1d2581ced6ded07c1bcbc6a7c637e86389",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/42_cpu_gates/driver.sh",
+      "eqp0_exists": false,
+      "eqp1_exists": false,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/43_P_dynamic_fixed_rules",
+      "step_receipts": [
+        "[lx] step lx-Xg4-035039-75083-7226 exit 0 in 95 s"
+      ],
+      "runtime_source_head": "ebc989180dcd8638d57660960d5ca019e2628806",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/43_P_dynamic_fixed_rules/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/44_F_dynamic_fixed_rules",
+      "step_receipts": [
+        "[lx] step lx-Xg4-035215-84573-5805 exit 0 in 71 s"
+      ],
+      "runtime_source_head": "e1559a071e244b4f049c924781b668d9e1560739",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/44_F_dynamic_fixed_rules/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/45_P_executor_accounting",
+      "step_receipts": [
+        "[lx] step lx-Xg4-035937-127855-7695 exit 0 in 96 s"
+      ],
+      "runtime_source_head": "ebc989180dcd8638d57660960d5ca019e2628806",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/45_P_executor_accounting/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/46_F_executor_accounting",
+      "step_receipts": [
+        "[lx] step lx-Xg4-040115-137387-6633 exit 0 in 71 s"
+      ],
+      "runtime_source_head": "e1559a071e244b4f049c924781b668d9e1560739",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/46_F_executor_accounting/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/47_P_executor_seams",
+      "step_receipts": [
+        "[lx] step lx-Xg4-040611-162030-1739 exit 0 in 95 s"
+      ],
+      "runtime_source_head": "ebc989180dcd8638d57660960d5ca019e2628806",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/47_P_executor_seams/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/00_allocation",
+      "step_receipts": [],
+      "runtime_source_head": null,
+      "source_diff_sha256": null,
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/00_allocation/driver.sh",
+      "eqp0_exists": false,
+      "eqp1_exists": false,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/01_P_cohsex_baseline",
+      "step_receipts": [
+        "[lx] step lx-Xg4-013538-1331059-6092 exit 0 in 78 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/01_P_cohsex_baseline/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline",
+      "step_receipts": [
+        "[lx] step lx-Xg4-013658-1341294-4845 exit 0 in 44 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/02_F_cohsex_baseline/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/03_P_gn_baseline",
+      "step_receipts": [
+        "[lx] step lx-Xg4-013742-1346770-1840 exit 0 in 89 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/03_P_gn_baseline/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/04_F_gn_baseline",
+      "step_receipts": [
+        "[lx] step lx-Xg4-013914-1354270-8743 exit 0 in 62 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/04_F_gn_baseline/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/11_P_gn_profile",
+      "step_receipts": [],
+      "runtime_source_head": null,
+      "source_diff_sha256": null,
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/11_P_gn_profile/driver.sh",
+      "eqp0_exists": false,
+      "eqp1_exists": false,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/13_P_gn_profile",
+      "step_receipts": [
+        "[lx] step lx-Xg4-020900-1601333-9185 exit 0 in 235 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/13_P_gn_profile/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": 43288384
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/14_F_gn_profile",
+      "step_receipts": [
+        "[lx] step lx-Xg4-021256-1633929-6025 exit 0 in 154 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/14_F_gn_profile/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": 40321663
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/15_P_cohsex_final",
+      "step_receipts": [
+        "[lx] step lx-Xg4-033536-2335119-7259 exit 0 in 46 s"
+      ],
+      "runtime_source_head": "ebc989180dcd8638d57660960d5ca019e2628806",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/15_P_cohsex_final/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/16_P_gn_final",
+      "step_receipts": [
+        "[lx] step lx-Xg4-031053-2192152-1429 exit 0 in 65 s"
+      ],
+      "runtime_source_head": "5093d98d5ab97b883ca65733231c3dd64fabbb71",
+      "source_diff_sha256": "12522702d9b0e14c8f1be21f47d63b1d2581ced6ded07c1bcbc6a7c637e86389",
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/16_P_gn_final/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/17_P_spin_elementwise_profile",
+      "step_receipts": [
+        "[lx] step lx-Xg4-023029-1750964-3779 exit 0 in 242 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/17_P_spin_elementwise_profile/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": 46249597
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/18_P_spin_blocks_profile",
+      "step_receipts": [
+        "[lx] step lx-Xg4-023900-1806127-2920 exit 0 in 244 s"
+      ],
+      "runtime_source_head": null,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/18_P_spin_blocks_profile/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": 45983623
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/20_P_gn_final_profile",
+      "step_receipts": [
+        "[lx] step lx-Xg4-033145-2312576-9256 exit 0 in 154 s"
+      ],
+      "runtime_source_head": "5093d98d5ab97b883ca65733231c3dd64fabbb71",
+      "source_diff_sha256": "12522702d9b0e14c8f1be21f47d63b1d2581ced6ded07c1bcbc6a7c637e86389",
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/20_P_gn_final_profile/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": 27840156
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/21_P_gn_fixed_rules",
+      "step_receipts": [
+        "[lx] step lx-Xg4-034834-61698-3797 exit 0 in 61 s"
+      ],
+      "runtime_source_head": "ebc989180dcd8638d57660960d5ca019e2628806",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/21_P_gn_fixed_rules/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    },
+    {
+      "run": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/22_F_gn_fixed_rules",
+      "step_receipts": [
+        "[lx] step lx-Xg4-034939-69635-6718 exit 0 in 57 s"
+      ],
+      "runtime_source_head": "e1559a071e244b4f049c924781b668d9e1560739",
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "driver_source_guard": "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/22_F_gn_fixed_rules/driver.sh",
+      "eqp0_exists": true,
+      "eqp1_exists": true,
+      "nsys_capture_bytes": null
+    }
+  ]
+}

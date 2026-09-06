@@ -1,0 +1,44 @@
+{
+  "scope": "synchronized host boundaries; outer stage is nested, never sum it with children",
+  "groups": [
+    {
+      "label": "sigma_restore",
+      "term": "V",
+      "head": false,
+      "calls": 9,
+      "compiles": 91,
+      "compile_s": 29.218559710949194,
+      "host_s": 33.6702207379567,
+      "cold_calls": 9,
+      "cold_median_ms": 3708.906924002804,
+      "warm_calls": 0,
+      "warm_median_ms": null
+    },
+    {
+      "label": "sigma_block",
+      "term": "",
+      "head": false,
+      "calls": 9,
+      "compiles": 9,
+      "compile_s": 3.991559835994849,
+      "host_s": 5.259686337027233,
+      "cold_calls": 9,
+      "cold_median_ms": 572.4237250105944,
+      "warm_calls": 0,
+      "warm_median_ms": null
+    },
+    {
+      "label": "sigma_tau",
+      "term": "",
+      "head": false,
+      "calls": 29,
+      "compiles": 1,
+      "compile_s": 0.14701852700090967,
+      "host_s": 1.0693994030589238,
+      "cold_calls": 1,
+      "cold_median_ms": 192.36536699463613,
+      "warm_calls": 28,
+      "warm_median_ms": 31.341558991698548
+    }
+  ]
+}

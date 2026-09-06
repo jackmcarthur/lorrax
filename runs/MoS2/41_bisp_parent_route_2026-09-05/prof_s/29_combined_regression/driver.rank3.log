@@ -1,0 +1,7 @@
+[lorrax native] LEGACY-UNSEALED origin=/global/common/software/m4598/jackm/lorrax_cuda13_runtime/ffi_build_phdf5/liblorrax_ffi.so sha256=cad78d947a953949 pair/private-closure unattested; developer migration only
+[rank 3] [LORRAX_CONV_KLEAD_FFI] =0: k-leading fused-convolution candidate disabled; no production Sigma caller yet.
+  [distrib_la] shard_map via jax.shard_map (jax 0.9.1)
+/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/services/symmetry_maps/src/symmetry_maps/maps.py:2305: RuntimeWarning: SYMMETRY PROVENANCE WARNING: no authenticated QE data-file-schema.xml is available at SymMaps initialization (the WFN-shaped input carries no QE schema receipt). WFN.h5 does not record which operations are composed with time reversal. LORRAX is using the legacy all-spatial header interpretation plus the global DFT-reference TRS verdict. RESULTS WILL BE WRONG if time reversal is broken and QE used an antiunitary magnetic-space-group operation. Co-stage the WFN-generating QE *.save directory or pass WfnLoader(..., qe_schema=...).
+  _warnings.warn(
+  [shard_map] using jax.shard_map (jax 0.9.1)
+  [compile-cache] rank 3/4 summary: xla_compiles=439 (23.49s)  compile_agreement=439 (0.180s fingerprint + 1.129s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False

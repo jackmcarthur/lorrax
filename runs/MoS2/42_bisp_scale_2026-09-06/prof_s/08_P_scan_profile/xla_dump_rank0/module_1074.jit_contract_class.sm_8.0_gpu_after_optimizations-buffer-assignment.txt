@@ -1,0 +1,518 @@
+BufferAssignment:
+allocation 0: size 51840000, parameter 5, shape |c128[1,36,300,300]| at ShapeIndex {}:
+ value: <308 param.34 @0> (size=51840000,offset=0): c128[1,36,300,300]{3,2,1,0}
+allocation 1: size 5376000, parameter 0, shape |c128[7,40,4,300]| at ShapeIndex {}:
+ value: <278 param.25 @0> (size=5376000,offset=0): c128[7,40,4,300]{3,2,1,0}
+allocation 2: size 5376000, parameter 2, shape |c128[7,40,4,300]| at ShapeIndex {}:
+ value: <287 param.30 @0> (size=5376000,offset=0): c128[7,40,4,300]{3,2,1,0}
+allocation 3: size 5376000, parameter 1, shape |c128[7,4,300,40]| at ShapeIndex {}:
+ value: <290 param.29 @0> (size=5376000,offset=0): c128[7,4,300,40]{3,2,1,0}
+allocation 4: size 5376000, parameter 3, shape |c128[7,4,300,40]| at ShapeIndex {}:
+ value: <319 param.35 @0> (size=5376000,offset=0): c128[7,4,300,40]{3,2,1,0}
+allocation 5: size 345600, constant:
+ value: <284 constant_397_0 @0> (size=345600,offset=0): c128[36,600]{1,0}
+allocation 6: size 179200, output shape is |c128[7,40,40]|, maybe-live-out:
+ value: <282 loop_complex_fusion @0> (size=64,offset=0): c128[1,4]{1,0}
+ value: <286 loop_dynamic_slice_fusion @0> (size=172800,offset=0): c128[36,300]{1,0}
+ value: <325 wrapped_transpose.1 @0> (size=179200,offset=0): c128[7,40,40]{2,1,0}
+allocation 7: size 86400, constant:
+ value: <291 constant_335_0 @0> (size=86400,offset=0): s32[1,36,600]{2,1,0}
+allocation 8: size 46080, parameter 4, shape |c128[36,80]| at ShapeIndex {}:
+ value: <300 param.31 @0> (size=46080,offset=0): c128[36,80]{1,0}
+allocation 9: size 9216, constant:
+ value: <296 constant_346_0 @0> (size=9216,offset=0): c128[36,4,4]{2,1,0}
+allocation 10: size 144, constant:
+ value: <288 constant_339_0 @0> (size=144,offset=0): s32[36,1]{1,0}
+allocation 11: size 64, parameter 10, shape |c128[1,4]| at ShapeIndex {}:
+ value: <281 param.33 @0> (size=64,offset=0): c128[1,4]{1,0}
+allocation 12: size 64, parameter 8, shape |c128[1,4]| at ShapeIndex {}:
+ value: <283 param.32 @0> (size=64,offset=0): c128[1,4]{1,0}
+allocation 13: size 36, constant:
+ value: <294 constant_326_0 @0> (size=36,offset=0): pred[36]{0}
+allocation 14: size 28, constant:
+ value: <280 constant_291_0 @0> (size=28,offset=0): s32[7,1]{1,0}
+allocation 15: size 8, parameter 6, shape |f64[]| at ShapeIndex {}:
+ value: <317 param.26 @0> (size=8,offset=0): f64[]
+allocation 16: size 16, constant:
+ value: <301 constant_287_0 @0> (size=16,offset=0): u32[4]{0}
+allocation 17: size 16, parameter 9, shape |s32[1,4]| at ShapeIndex {}:
+ value: <311 param.27 @0> (size=16,offset=0): s32[1,4]{1,0}
+allocation 18: size 16, parameter 7, shape |s32[1,4]| at ShapeIndex {}:
+ value: <313 param.28 @0> (size=16,offset=0): s32[1,4]{1,0}
+allocation 19: size 1710720516, preallocated-temp:
+ value: <279 input_transpose_fusion.1 @0> (size=5376000,offset=256): c128[7,300,4,40]{3,2,1,0}
+ value: <285 axis_index.22.0 @0> (size=4,offset=114786560): u32[]
+ value: <289 loop_dynamic_slice_fusion.1 @0> (size=172800,offset=55296256): c128[36,300]{1,0}
+ value: <292 loop_and_fusion @0> (size=10800,offset=55469056): pred[1,36,300]{2,1,0}
+ value: <293 loop_and_fusion.1 @0> (size=10800,offset=55480064): pred[1,36,300]{2,1,0}
+ value: <295 input_concatenate_fusion @0> (size=55296000,offset=256): c128[36,24000,4]{2,1,0}
+ value: <297 custom-call.1{} @0> (size=16,offset=0): (c128[36,24000,4]{2,1,0}, s8[4194304]{0})
+ value: <298 custom-call.1{0} @0> (size=55296000,offset=55296256): c128[36,24000,4]{2,1,0}
+ value: <299 custom-call.1{1} @0> (size=4194304,offset=110592256): s8[4194304]{0}
+ value: <302 loop_multiply_fusion.1 @0> (size=27648000,offset=829440256): c128[36,40,300,4]{3,2,1,0}
+ value: <303 input_transpose_fusion @0> (size=27648000,offset=857088256): c128[36,1200,40]{2,1,0}
+ value: <304 loop_broadcast_fusion.1 @0> (size=829440000,offset=256): c128[36,1200,1200]{2,1,0}
+ value: <305 ffi_call.19 @0> (size=829440000,offset=256): c128[36,1200,1200]{2,1,0}
+ value: <306 loop_transpose_fusion @0> (size=829440000,offset=829440256): c128[36,4,300,4,300]{4,3,2,1,0}
+ value: <307 ffi_call.20 @0> (size=829440000,offset=829440256): c128[36,4,300,4,300]{4,3,2,1,0}
+ value: <309 copy.51 @0> (size=51840000,offset=1658880256): c128[1,36,300,300]{3,2,1,0}
+ value: <310 ffi_call.24 @0> (size=51840000,offset=1658880256): c128[36,300,300]{2,1,0}
+ value: <312 loop_and_fusion.2 @0> (size=4,offset=1710720256): pred[4,1]{1,0}
+ value: <314 loop_and_fusion.3 @0> (size=4,offset=1710720512): pred[4,1]{1,0}
+ value: <315 loop_multiply_fusion @0> (size=829440000,offset=256): c128[1,36,4,300,4,300]{5,4,3,2,1,0}
+ value: <316 ffi_call.21 @0> (size=829440000,offset=256): c128[36,4,300,4,300]{4,3,2,1,0}
+ value: <318 loop_gather_fusion @0> (size=161280000,offset=829440256): c128[7,1,4,300,4,300]{2,3,4,5,0,1}
+ value: <320 wrapped_transpose @0> (size=5376000,offset=256): c128[7,40,300,4]{3,2,1,0}
+ value: <321 loop_broadcast_fusion.2 @0> (size=5376000,offset=5376256): c128[7,40,1200]{2,1,0}
+ value: <322 ffi_call.22 @0> (size=5376000,offset=5376256): c128[7,40,1200]{2,1,0}
+ value: <323 loop_broadcast_fusion @0> (size=179200,offset=10752256): c128[7,40,40]{2,1,0}
+ value: <324 ffi_call.23 @0> (size=179200,offset=10752256): c128[7,40,40]{2,1,0}
+
+Total bytes used: 1784731404 (1.66GiB)
+
+Used values:
+<278 param.25 @0>
+ positions:
+  param.25
+ uses:
+  input_transpose_fusion.1, operand 0
+ from instruction: %param.25 = c128[7,40,4,300]{3,2,1,0} parameter(0), sharding={devices=[1,2,1,2]<=[4]}, metadata={op_name="left.psi_nmu"}
+<279 input_transpose_fusion.1 @0>
+ positions:
+  input_transpose_fusion.1
+  bitcast.38.0
+ uses:
+  bitcast.38.0, operand 0
+  ffi_call.23, operand 0
+ from instruction: %input_transpose_fusion.1 = c128[7,300,4,40]{3,2,1,0} fusion(%param.25), kind=kInput, calls=%fused_transpose.2, metadata={op_name="jit(contract_class)/complex" stack_frame_id=13}
+<280 constant_291_0 @0>
+ positions:
+  constant_291_0
+ uses:
+  loop_gather_fusion, operand 0
+ from instruction: %constant_291_0 = s32[7,1]{1,0} constant({ {0}, {1}, {2}, {3}, {7}, {8}, {14} })
+<281 param.33 @0>
+ positions:
+  param.33
+ uses:
+  loop_complex_fusion, operand 0
+ from instruction: %param.33 = c128[1,4]{1,0} parameter(10), sharding={replicated}, metadata={op_name="vertices[1][1]"}
+<282 loop_complex_fusion @0>
+ positions:
+  loop_complex_fusion
+ uses:
+  loop_multiply_fusion, operand 0
+ from instruction: %loop_complex_fusion = c128[1,4]{1,0} fusion(%param.33), kind=kLoop, calls=%fused_complex, metadata={op_name="jit(contract_class)/jit(convolve)/while/body/closed_call/complex" stack_frame_id=103}
+<283 param.32 @0>
+ positions:
+  param.32
+ uses:
+  loop_multiply_fusion, operand 1
+ from instruction: %param.32 = c128[1,4]{1,0} parameter(8), sharding={replicated}, metadata={op_name="vertices[0][1]"}
+<284 constant_397_0 @0>
+ positions:
+  constant_397_0
+ uses:
+  loop_dynamic_slice_fusion.1, operand 0
+  loop_dynamic_slice_fusion, operand 0
+ from instruction: %constant_397_0 = c128[36,600]{1,0} constant({...}), metadata={op_name="jit(contract_class)/shard_map/exp" stack_frame_id=34}
+<285 axis_index.22.0 @0>
+ positions:
+  axis_index.22.0
+ uses:
+  loop_dynamic_slice_fusion.1, operand 1
+  loop_and_fusion.1, operand 1
+  loop_multiply_fusion.1, operand 3
+  loop_dynamic_slice_fusion, operand 1
+  loop_and_fusion, operand 1
+  input_concatenate_fusion, operand 9
+ from instruction: %axis_index.22.0 = u32[] partition-id(), metadata={op_name="jit(contract_class)/shard_map/axis_index" stack_frame_id=29}
+<286 loop_dynamic_slice_fusion @0>
+ positions:
+  loop_dynamic_slice_fusion
+ uses:
+  input_concatenate_fusion, operand 0
+ from instruction: %loop_dynamic_slice_fusion = c128[36,300]{1,0} fusion(%constant_397_0, %axis_index.22.0), kind=kLoop, calls=%fused_dynamic_slice, metadata={op_name="jit(contract_class)/shard_map/dynamic_slice" stack_frame_id=53}
+<287 param.30 @0>
+ positions:
+  param.30
+ uses:
+  input_concatenate_fusion, operand 1
+ from instruction: %param.30 = c128[7,40,4,300]{3,2,1,0} parameter(2), sharding={devices=[1,2,1,2]<=[4]}, metadata={op_name="right.psi_nmu"}
+<288 constant_339_0 @0>
+ positions:
+  constant_339_0
+ uses:
+  input_concatenate_fusion, operand 2
+ from instruction: %constant_339_0 = s32[36,1]{1,0} constant({...}), metadata={op_name="jit(contract_class)/shard_map/jit(_take)/broadcast_in_dim"}
+<289 loop_dynamic_slice_fusion.1 @0>
+ positions:
+  loop_dynamic_slice_fusion.1
+ uses:
+  input_concatenate_fusion, operand 3
+ from instruction: %loop_dynamic_slice_fusion.1 = c128[36,300]{1,0} fusion(%constant_397_0, %axis_index.22.0), kind=kLoop, calls=%fused_dynamic_slice.1, metadata={op_name="jit(contract_class)/shard_map/dynamic_slice" stack_frame_id=35}
+<290 param.29 @0>
+ positions:
+  param.29
+ uses:
+  input_concatenate_fusion, operand 4
+ from instruction: %param.29 = c128[7,4,300,40]{3,2,1,0} parameter(1), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="left.psi_mun"}
+<291 constant_335_0 @0>
+ positions:
+  constant_335_0
+ uses:
+  loop_and_fusion.1, operand 0
+  loop_and_fusion, operand 0
+  input_concatenate_fusion, operand 8
+ from instruction: %constant_335_0 = s32[1,36,600]{2,1,0} constant({...}), metadata={op_name="jit(contract_class)/shard_map/jit(_take)/gather"}
+<292 loop_and_fusion @0>
+ positions:
+  loop_and_fusion
+ uses:
+  input_concatenate_fusion, operand 5
+ from instruction: %loop_and_fusion = pred[1,36,300]{2,1,0} fusion(%constant_335_0, %axis_index.22.0), kind=kLoop, calls=%fused_and, metadata={op_name="jit(contract_class)/shard_map/jit(take_along_axis)/and"}
+<293 loop_and_fusion.1 @0>
+ positions:
+  loop_and_fusion.1
+ uses:
+  input_concatenate_fusion, operand 6
+ from instruction: %loop_and_fusion.1 = pred[1,36,300]{2,1,0} fusion(%constant_335_0, %axis_index.22.0), kind=kLoop, calls=%fused_and.1, metadata={op_name="jit(contract_class)/shard_map/jit(take_along_axis)/and"}
+<294 constant_326_0 @0>
+ positions:
+  constant_326_0
+ uses:
+  input_concatenate_fusion, operand 7
+ from instruction: %constant_326_0 = pred[36]{0} constant({...}), metadata={op_name="jit(contract_class)/shard_map/ge" stack_frame_id=28}
+<295 input_concatenate_fusion @0>
+ positions:
+  input_concatenate_fusion
+ uses:
+  custom-call.1, operand 0
+ from instruction: %input_concatenate_fusion = c128[36,24000,4]{2,1,0} fusion(%loop_dynamic_slice_fusion, %param.30, %constant_339_0, %loop_dynamic_slice_fusion.1, %param.29, /*index=5*/%loop_and_fusion, %loop_and_fusion.1, %constant_326_0, %constant_335_0, %axis_index.22.0), kind=kInput, calls=%fused_concatenate, metadata={op_name="jit(contract_class)/shard_map/transpose" stack_frame_id=41}
+<296 constant_346_0 @0>
+ positions:
+  constant_346_0
+ uses:
+  custom-call.1, operand 1
+ from instruction: %constant_346_0 = c128[36,4,4]{2,1,0} constant({...}), metadata={op_name="jit(contract_class)/shard_map" stack_frame_id=25}
+<297 custom-call.1{} @0>
+ positions:
+  custom-call.1 {}
+ uses:
+  get-tuple-element.59.0, operand 0 {}
+ from instruction: %custom-call.1 = (c128[36,24000,4]{2,1,0}, s8[4194304]{0}) custom-call(%input_concatenate_fusion, %constant_346_0), custom_call_target="__cublas$gemm", metadata={op_name="jit(contract_class)/shard_map/qac,q...c->q...a/dot_general" stack_frame_id=42}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"gemm_backend_config":{"alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":["2"],"rhs_contracting_dimensions":["1"],"lhs_batch_dimensions":["0"],"rhs_batch_dimensions":["0"]},"alpha_imag":0,"precision_config":{"operand_precision":["HIGHEST","HIGHEST"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"96000","rhs_stride":"16","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<298 custom-call.1{0} @0>
+ positions:
+  custom-call.1 {0}
+  get-tuple-element.59.0
+ uses:
+  loop_multiply_fusion.1, operand 0
+  input_transpose_fusion, operand 0
+ from instruction: %custom-call.1 = (c128[36,24000,4]{2,1,0}, s8[4194304]{0}) custom-call(%input_concatenate_fusion, %constant_346_0), custom_call_target="__cublas$gemm", metadata={op_name="jit(contract_class)/shard_map/qac,q...c->q...a/dot_general" stack_frame_id=42}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"gemm_backend_config":{"alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":["2"],"rhs_contracting_dimensions":["1"],"lhs_batch_dimensions":["0"],"rhs_batch_dimensions":["0"]},"alpha_imag":0,"precision_config":{"operand_precision":["HIGHEST","HIGHEST"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"96000","rhs_stride":"16","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<299 custom-call.1{1} @0>
+ positions:
+  custom-call.1 {1}
+ uses:
+ from instruction: %custom-call.1 = (c128[36,24000,4]{2,1,0}, s8[4194304]{0}) custom-call(%input_concatenate_fusion, %constant_346_0), custom_call_target="__cublas$gemm", metadata={op_name="jit(contract_class)/shard_map/qac,q...c->q...a/dot_general" stack_frame_id=42}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"gemm_backend_config":{"alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":["2"],"rhs_contracting_dimensions":["1"],"lhs_batch_dimensions":["0"],"rhs_batch_dimensions":["0"]},"alpha_imag":0,"precision_config":{"operand_precision":["HIGHEST","HIGHEST"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"96000","rhs_stride":"16","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<300 param.31 @0>
+ positions:
+  param.31
+ uses:
+  loop_multiply_fusion.1, operand 1
+ from instruction: %param.31 = c128[36,80]{1,0} parameter(4), sharding={replicated}, metadata={op_name="weights"}
+<301 constant_287_0 @0>
+ positions:
+  constant_287_0
+ uses:
+  loop_multiply_fusion.1, operand 2
+ from instruction: %constant_287_0 = u32[4]{0} constant({0, 1, 0, 1}), metadata={op_name="jit(contract_class)/mul" stack_frame_id=64}
+<302 loop_multiply_fusion.1 @0>
+ positions:
+  loop_multiply_fusion.1
+  bitcast.137.0
+ uses:
+  bitcast.137.0, operand 0
+  ffi_call.19, operand 0
+ from instruction: %loop_multiply_fusion.1 = c128[36,40,300,4]{3,2,1,0} fusion(%get-tuple-element.59.0, %param.31, %constant_287_0, %axis_index.22.0), kind=kLoop, calls=%fused_multiply.1, metadata={op_name="jit(contract_class)/mul" stack_frame_id=64}
+<303 input_transpose_fusion @0>
+ positions:
+  input_transpose_fusion
+ uses:
+  ffi_call.19, operand 1
+ from instruction: %input_transpose_fusion = c128[36,1200,40]{2,1,0} fusion(%get-tuple-element.59.0), kind=kInput, calls=%fused_transpose.1, metadata={op_name="jit(contract_class)/complex" stack_frame_id=69}
+<304 loop_broadcast_fusion.1 @0>
+ positions:
+  loop_broadcast_fusion.1
+ uses:
+  ffi_call.19, operand 2
+ from instruction: %loop_broadcast_fusion.1 = c128[36,1200,1200]{2,1,0} fusion(), kind=kLoop, calls=%fused_broadcast.1, metadata={op_name="jit(contract_class)/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=85}
+<305 ffi_call.19 @0>
+ positions:
+  ffi_call.19
+ uses:
+  loop_transpose_fusion, operand 0
+ from instruction: %ffi_call.19 = c128[36,1200,1200]{2,1,0} custom-call(%bitcast.137.0, %input_transpose_fusion, %loop_broadcast_fusion.1), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[36,40,1200]{2,1,0}, c128[36,1200,40]{2,1,0}, c128[36,1200,1200]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_class)/jit(_local)/shard_map/ffi_call" stack_frame_id=86}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 94297104118272 : i64, k = 80 : i64, lld_a = 1200 : i64, lld_b = 40 : i64, lld_c = 1200 : i64, m = 2400 : i64, mb_a = 1200 : i64, mb_b = 40 : i64, mb_c = 1200 : i64, n = 2400 : i64, nb_a = 40 : i64, nb_b = 1200 : i64, nb_c = 1200 : i64, nq = 36 : i64, transa = 0 : i64, transb = 0 : i64}
+<306 loop_transpose_fusion @0>
+ positions:
+  loop_transpose_fusion
+ uses:
+  ffi_call.20, operand 0
+ from instruction: %loop_transpose_fusion = c128[36,4,300,4,300]{4,3,2,1,0} fusion(%ffi_call.19), kind=kLoop, calls=%fused_transpose, metadata={op_name="jit(contract_class)/transpose" stack_frame_id=90}
+<307 ffi_call.20 @0>
+ positions:
+  ffi_call.20
+ uses:
+  loop_multiply_fusion, operand 2
+ from instruction: %ffi_call.20 = c128[36,4,300,4,300]{4,3,2,1,0} custom-call(%loop_transpose_fusion), custom_call_target="lorrax_mklfft_flat_k", operand_layout_constraints={c128[36,4,300,4,300]{4,3,2,1,0}}, output_to_operand_aliasing={{}: (0, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_class)/jit(convolve)/shard_map/ffi_call" stack_frame_id=96}, backend_config={forward = 0 : i64, nkx = 6 : i64, nky = 6 : i64, nkz = 1 : i64, scale = 0.16666666666666666 : f64}
+<308 param.34 @0>
+ positions:
+  param.34
+ uses:
+  copy.51, operand 0
+ from instruction: %param.34 = c128[1,36,300,300]{3,2,1,0} parameter(5), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="interaction"}
+<309 copy.51 @0>
+ positions:
+  copy.51
+  bitcast.30.0
+ uses:
+  bitcast.30.0, operand 0
+  ffi_call.24, operand 0
+ from instruction: %copy.51 = c128[1,36,300,300]{3,2,1,0} copy(%param.34)
+<310 ffi_call.24 @0>
+ positions:
+  ffi_call.24
+ uses:
+  loop_multiply_fusion, operand 3
+ from instruction: %ffi_call.24 = c128[36,300,300]{2,1,0} custom-call(%bitcast.30.0), custom_call_target="lorrax_mklfft_flat_k", operand_layout_constraints={c128[36,300,300]{2,1,0}}, output_to_operand_aliasing={{}: (0, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_class)/jit(convolve)/while/body/closed_call/shard_map/ffi_call" stack_frame_id=96}, backend_config={forward = 0 : i64, nkx = 6 : i64, nky = 6 : i64, nkz = 1 : i64, scale = 0.16666666666666666 : f64}
+<311 param.27 @0>
+ positions:
+  param.27
+ uses:
+  loop_and_fusion.2, operand 0
+  loop_multiply_fusion, operand 6
+ from instruction: %param.27 = s32[1,4]{1,0} parameter(9), sharding={replicated}, metadata={op_name="vertices[1][0]"}
+<312 loop_and_fusion.2 @0>
+ positions:
+  loop_and_fusion.2
+ uses:
+  loop_multiply_fusion, operand 4
+ from instruction: %loop_and_fusion.2 = pred[4,1]{1,0} fusion(%param.27), kind=kLoop, calls=%fused_and.2, metadata={op_name="jit(contract_class)/jit(convolve)/while/body/closed_call/jit(_take)/and" deduplicated_name="loop_and_fusion.2"}
+<313 param.28 @0>
+ positions:
+  param.28
+ uses:
+  loop_and_fusion.3, operand 0
+  loop_multiply_fusion, operand 7
+ from instruction: %param.28 = s32[1,4]{1,0} parameter(7), sharding={replicated}, metadata={op_name="vertices[0][0]"}
+<314 loop_and_fusion.3 @0>
+ positions:
+  loop_and_fusion.3
+ uses:
+  loop_multiply_fusion, operand 5
+ from instruction: %loop_and_fusion.3 = pred[4,1]{1,0} fusion(%param.28), kind=kLoop, calls=%fused_and.3, metadata={op_name="jit(contract_class)/jit(convolve)/while/body/closed_call/jit(_take)/and" deduplicated_name="loop_and_fusion.2"}
+<315 loop_multiply_fusion @0>
+ positions:
+  loop_multiply_fusion
+  bitcast.156.0
+ uses:
+  bitcast.156.0, operand 0
+  ffi_call.21, operand 0
+ from instruction: %loop_multiply_fusion = c128[1,36,4,300,4,300]{5,4,3,2,1,0} fusion(%loop_complex_fusion, %param.32, %ffi_call.20, %ffi_call.24, %loop_and_fusion.2, /*index=5*/%loop_and_fusion.3, %param.27, %param.28), kind=kLoop, calls=%fused_multiply, metadata={op_name="jit(contract_class)/jit(convolve)/while/body/closed_call/mul" stack_frame_id=108}
+<316 ffi_call.21 @0>
+ positions:
+  ffi_call.21
+ uses:
+  loop_gather_fusion, operand 1
+ from instruction: %ffi_call.21 = c128[36,4,300,4,300]{4,3,2,1,0} custom-call(%bitcast.156.0), custom_call_target="lorrax_mklfft_flat_k", operand_layout_constraints={c128[36,4,300,4,300]{4,3,2,1,0}}, output_to_operand_aliasing={{}: (0, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_class)/jit(convolve)/shard_map/ffi_call" stack_frame_id=96}, backend_config={forward = 1 : i64, nkx = 6 : i64, nky = 6 : i64, nkz = 1 : i64, scale = 0.16666666666666666 : f64}
+<317 param.26 @0>
+ positions:
+  param.26
+ uses:
+  loop_gather_fusion, operand 2
+ from instruction: %param.26 = f64[] parameter(6), sharding={replicated}, metadata={op_name="factor"}
+<318 loop_gather_fusion @0>
+ positions:
+  loop_gather_fusion
+  bitcast.166.0
+ uses:
+  bitcast.166.0, operand 0
+  ffi_call.22, operand 0
+ from instruction: %loop_gather_fusion = c128[7,1,4,300,4,300]{2,3,4,5,0,1} fusion(%constant_291_0, %ffi_call.21, %param.26), kind=kLoop, calls=%fused_gather, metadata={op_name="jit(contract_class)/jit(_take)/gather"}
+<319 param.35 @0>
+ positions:
+  param.35
+ uses:
+  wrapped_transpose, operand 0
+ from instruction: %param.35 = c128[7,4,300,40]{3,2,1,0} parameter(3), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="right.psi_mun"}
+<320 wrapped_transpose @0>
+ positions:
+  wrapped_transpose
+  bitcast.170.0
+ uses:
+  bitcast.170.0, operand 0
+  ffi_call.22, operand 1
+ from instruction: %wrapped_transpose = c128[7,40,300,4]{3,2,1,0} fusion(%param.35), kind=kLoop, calls=%wrapped_transpose_computation, metadata={op_name="jit(contract_class)/transpose" stack_frame_id=121}
+<321 loop_broadcast_fusion.2 @0>
+ positions:
+  loop_broadcast_fusion.2
+ uses:
+  ffi_call.22, operand 2
+ from instruction: %loop_broadcast_fusion.2 = c128[7,40,1200]{2,1,0} fusion(), kind=kLoop, calls=%fused_broadcast.2, metadata={op_name="jit(contract_class)/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=85}
+<322 ffi_call.22 @0>
+ positions:
+  ffi_call.22
+ uses:
+  ffi_call.23, operand 1
+ from instruction: %ffi_call.22 = c128[7,40,1200]{2,1,0} custom-call(%bitcast.166.0, %bitcast.170.0, %loop_broadcast_fusion.2), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[7,1200,1200]{2,1,0}, c128[7,40,1200]{2,1,0}, c128[7,40,1200]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_class)/jit(_local)/shard_map/ffi_call" stack_frame_id=86}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 94297104118272 : i64, k = 2400 : i64, lld_a = 1200 : i64, lld_b = 1200 : i64, lld_c = 1200 : i64, m = 2400 : i64, mb_a = 1200 : i64, mb_b = 1200 : i64, mb_c = 1200 : i64, n = 80 : i64, nb_a = 1200 : i64, nb_b = 40 : i64, nb_c = 40 : i64, nq = 7 : i64, transa = 0 : i64, transb = 0 : i64}
+<323 loop_broadcast_fusion @0>
+ positions:
+  loop_broadcast_fusion
+ uses:
+  ffi_call.23, operand 2
+ from instruction: %loop_broadcast_fusion = c128[7,40,40]{2,1,0} fusion(), kind=kLoop, calls=%fused_broadcast, metadata={op_name="jit(contract_class)/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=85}
+<324 ffi_call.23 @0>
+ positions:
+  ffi_call.23
+ uses:
+  wrapped_transpose.1, operand 0
+ from instruction: %ffi_call.23 = c128[7,40,40]{2,1,0} custom-call(%bitcast.38.0, %ffi_call.22, %loop_broadcast_fusion), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[7,1200,40]{2,1,0}, c128[7,40,1200]{2,1,0}, c128[7,40,40]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_class)/jit(_local)/shard_map/ffi_call" stack_frame_id=86}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 94297104118272 : i64, k = 2400 : i64, lld_a = 40 : i64, lld_b = 1200 : i64, lld_c = 40 : i64, m = 80 : i64, mb_a = 40 : i64, mb_b = 1200 : i64, mb_c = 40 : i64, n = 80 : i64, nb_a = 1200 : i64, nb_b = 40 : i64, nb_c = 40 : i64, nq = 7 : i64, transa = 0 : i64, transb = 0 : i64}
+<325 wrapped_transpose.1 @0>
+ positions:
+  wrapped_transpose.1
+ uses:
+ from instruction: %wrapped_transpose.1 = c128[7,40,40]{2,1,0} fusion(%ffi_call.23), kind=kInput, calls=%wrapped_transpose_computation.1, metadata={op_name="jit(contract_class)/jit(_local)/shard_map/transpose" stack_frame_id=87}
+
+
+HloLiveRange (max 53):
+  InstructionSequence:
+    0:axis_index.22.0
+    1:constant_397_0
+    2:loop_dynamic_slice_fusion
+    3:loop_dynamic_slice_fusion.1
+    4:constant_335_0
+    5:loop_and_fusion
+    6:loop_and_fusion.1
+    7:constant_326_0
+    8:constant_339_0
+    9:param.29
+    10:param.30
+    11:input_concatenate_fusion
+    12:constant_346_0
+    13:custom-call.1
+    14:get-tuple-element.59.0
+    15:constant_287_0
+    16:param.31
+    17:loop_multiply_fusion.1
+    18:bitcast.137.0
+    19:input_transpose_fusion
+    20:loop_broadcast_fusion.1
+    21:ffi_call.19
+    22:loop_transpose_fusion
+    23:ffi_call.20
+    24:param.34
+    25:copy.51
+    26:bitcast.30.0
+    27:ffi_call.24
+    28:param.33
+    29:loop_complex_fusion
+    30:param.27
+    31:loop_and_fusion.2
+    32:param.28
+    33:loop_and_fusion.3
+    34:param.32
+    35:loop_multiply_fusion
+    36:bitcast.156.0
+    37:ffi_call.21
+    38:constant_291_0
+    39:param.26
+    40:loop_gather_fusion
+    41:bitcast.166.0
+    42:param.35
+    43:wrapped_transpose
+    44:bitcast.170.0
+    45:loop_broadcast_fusion.2
+    46:ffi_call.22
+    47:param.25
+    48:input_transpose_fusion.1
+    49:bitcast.38.0
+    50:loop_broadcast_fusion
+    51:ffi_call.23
+    52:wrapped_transpose.1
+  BufferLiveRange:
+    param.25{}:0-53
+    input_transpose_fusion.1{}:48-51
+    constant_291_0{}:38-40
+    param.33{}:0-53
+    loop_complex_fusion{}:29-35
+    param.32{}:0-53
+    constant_397_0{}:1-3
+    axis_index.22.0{}:0-17
+    loop_dynamic_slice_fusion{}:2-11
+    param.30{}:0-53
+    constant_339_0{}:8-11
+    loop_dynamic_slice_fusion.1{}:3-11
+    param.29{}:0-53
+    constant_335_0{}:4-11
+    loop_and_fusion{}:5-11
+    loop_and_fusion.1{}:6-11
+    constant_326_0{}:7-11
+    input_concatenate_fusion{}:11-13
+    constant_346_0{}:12-13
+    custom-call.1{}:13-14
+    custom-call.1{0}:13-19
+    custom-call.1{1}:13-13
+    param.31{}:0-53
+    constant_287_0{}:15-17
+    loop_multiply_fusion.1{}:17-21
+    input_transpose_fusion{}:19-21
+    loop_broadcast_fusion.1{}:20-21
+    ffi_call.19{}:21-22
+    loop_transpose_fusion{}:22-23
+    ffi_call.20{}:23-35
+    param.34{}:0-53
+    copy.51{}:25-27
+    ffi_call.24{}:27-35
+    param.27{}:0-53
+    loop_and_fusion.2{}:31-35
+    param.28{}:0-53
+    loop_and_fusion.3{}:33-35
+    loop_multiply_fusion{}:35-37
+    ffi_call.21{}:37-40
+    param.26{}:0-53
+    loop_gather_fusion{}:40-46
+    param.35{}:0-53
+    wrapped_transpose{}:43-46
+    loop_broadcast_fusion.2{}:45-46
+    ffi_call.22{}:46-51
+    loop_broadcast_fusion{}:50-51
+    ffi_call.23{}:51-52
+    wrapped_transpose.1{}:52-53
+  Live ranges at 22 (peak):
+    ffi_call.19{}: 829440000 bytes (cumulative: 829440000 bytes)
+    loop_transpose_fusion{}: 829440000 bytes (cumulative: 1658880000 bytes)
+    param.34{}: 51840000 bytes (cumulative: 1710720000 bytes)
+    param.25{}: 5376000 bytes (cumulative: 1716096000 bytes)
+    param.29{}: 5376000 bytes (cumulative: 1721472000 bytes)
+    param.30{}: 5376000 bytes (cumulative: 1726848000 bytes)
+    param.35{}: 5376000 bytes (cumulative: 1732224000 bytes)
+    param.31{}: 46080 bytes (cumulative: 1732270080 bytes)
+    param.32{}: 64 bytes (cumulative: 1732270144 bytes)
+    param.33{}: 64 bytes (cumulative: 1732270208 bytes)
+    param.27{}: 16 bytes (cumulative: 1732270224 bytes)
+    param.28{}: 16 bytes (cumulative: 1732270240 bytes)
+    param.26{}: 8 bytes (cumulative: 1732270248 bytes)
+  Stack trace breakdown for peak usage: 1 732 270 248 bytes
+    main.10_spmd (100.0%, total: 1 732 270 248 bytes, current: 0 bytes, remaining: 1 732 270 248 bytes)
+      ├── jit(contract_class)/jit(_local)/shard_map/ffi_call (47.9%, total: 829 440 000 bytes, current: 829 440 000 bytes, remaining: 902 830 248 bytes)
+      ├── jit(contract_class)/transpose (47.9%, total: 829 440 000 bytes, current: 829 440 000 bytes, remaining: 73 390 248 bytes)
+      ├── interaction (3.0%, total: 51 840 000 bytes, current: 51 840 000 bytes, remaining: 21 550 248 bytes)
+      ├── left.psi_mun (0.3%, total: 5 376 000 bytes, current: 5 376 000 bytes, remaining: 16 174 248 bytes)
+      ├── left.psi_nmu (0.3%, total: 5 376 000 bytes, current: 5 376 000 bytes, remaining: 10 798 248 bytes)
+      ├── right.psi_mun (0.3%, total: 5 376 000 bytes, current: 5 376 000 bytes, remaining: 5 422 248 bytes)
+      ├── right.psi_nmu (0.3%, total: 5 376 000 bytes, current: 5 376 000 bytes, remaining: 46 248 bytes)
+      ├── weights (0.0%, total: 46 080 bytes, current: 46 080 bytes, remaining: 168 bytes)
+      ├── vertices[0][1] (0.0%, total: 64 bytes, current: 64 bytes, remaining: 104 bytes)
+      ├── vertices[1][1] (0.0%, total: 64 bytes, current: 64 bytes, remaining: 40 bytes)
+      ├── vertices[0][0] (0.0%, total: 16 bytes, current: 16 bytes, remaining: 24 bytes)
+      ├── vertices[1][0] (0.0%, total: 16 bytes, current: 16 bytes, remaining: 8 bytes)
+      └── factor (0.0%, total: 8 bytes, current: 8 bytes, remaining: 0 bytes)

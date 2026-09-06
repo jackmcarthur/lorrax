@@ -1,0 +1,42 @@
+{
+  "baseline": {
+    "B4-no-device-put bse/bse_densify.py": 1,
+    "B4-no-device-put bse/bse_loading.py": 3,
+    "B4-no-device-put bse/exciton_bands.py": 4,
+    "B4-no-device-put bse/vq_interp.py": 1,
+    "B4-no-device-put bse/w_ladder_freq.py": 1,
+    "B4-no-device-put gw/head_correction.py": 4,
+    "B4-no-device-put gw/photon_sigma.py": 4,
+    "B4b-no-bulk-h5-to-device bse/bse_loading.py": 8,
+    "  a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.\n  B4b-no-bulk-h5-to-device bse/bse_window.py": 1,
+    "  a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.\n  B4b-no-bulk-h5-to-device bse/exciton_bands.py": 2,
+    "  a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.\n  B4b-no-bulk-h5-to-device file_io/tagged_arrays.py": 3,
+    "  a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.\n  B4b-no-bulk-h5-to-device gw/downfold_run.py": 2,
+    "  a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.\n  B4b-no-bulk-h5-to-device gw/head_correction.py": 1,
+    "  a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.\n  B4b-no-bulk-h5-to-device postprocess/rotate_wfn_to_qp.py": 1,
+    "  a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.\n  S1-replicated-3d-out-spec gw/downfold.py": 1,
+    "S1-replicated-3d-out-spec gw/qsgw_head.py": 1,
+    "S2-scan-explicit-unroll bse/bse_stack_matvec.py": 3
+  },
+  "candidate": {
+    "B4-no-device-put bse/bse_densify.py": 1,
+    "B4-no-device-put bse/bse_loading.py": 3,
+    "B4-no-device-put bse/exciton_bands.py": 4,
+    "B4-no-device-put bse/vq_interp.py": 1,
+    "B4-no-device-put bse/w_ladder_freq.py": 1,
+    "B4-no-device-put gw/head_correction.py": 4,
+    "B4-no-device-put gw/photon_sigma.py": 2,
+    "B4b-no-bulk-h5-to-device bse/bse_loading.py": 8,
+    "  a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.\n  B4b-no-bulk-h5-to-device bse/bse_window.py": 1,
+    "  a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.\n  B4b-no-bulk-h5-to-device bse/exciton_bands.py": 2,
+    "  a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.\n  B4b-no-bulk-h5-to-device file_io/tagged_arrays.py": 3,
+    "  a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.\n  B4b-no-bulk-h5-to-device gw/downfold_run.py": 2,
+    "  a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.\n  B4b-no-bulk-h5-to-device gw/head_correction.py": 1,
+    "  a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.\n  B4b-no-bulk-h5-to-device postprocess/rotate_wfn_to_qp.py": 1,
+    "  a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.\n  S1-replicated-3d-out-spec gw/downfold.py": 1,
+    "S1-replicated-3d-out-spec gw/qsgw_head.py": 1,
+    "S2-scan-explicit-unroll bse/bse_stack_matvec.py": 3
+  },
+  "added": [],
+  "increased": {}
+}
