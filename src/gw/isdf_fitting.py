@@ -591,7 +591,14 @@ def fit_zeta_to_h5(
                  f"replicated (nq,μ,μ) gather would be {_gather_gb:.2f} GB/rank; "
                  f"per-q tile {_tile_gb:.3f} GB (×nq executions/r-chunk); "
                  f"distributed tier gathers NO (μ,μ) object")
-        if int(vertex_mu_L) != 0:
+        _coupled_factor = bool(
+            _coupled_mu123_coordinator is not None
+            and _stack_coupled_solve_inputs
+            and _resolved_solver_kind in ('cusolvermp_lu', 'scalapack_lu'))
+        if _coupled_factor:
+            L_q, lu_piv = C_q_flat, None
+            print_fn("  Deferring current factor to one coupled LU factor")
+        elif int(vertex_mu_L) != 0:
             # Transverse: the factor stage is HOISTED (2026-08) — one
             # pivoted LU per q per CHANNEL instead of per r-chunk.
             # factor_c_q returns (factor, piv): (LU, perm) on the local
@@ -626,7 +633,9 @@ def fit_zeta_to_h5(
     # hoisted routes the ridge is baked into the factor, so the trace
     # (and its per-r-chunk all-reduce, 17 s of GPU stream at MoS2 3×3
     # bispinor) is gone.
-    if (int(vertex_mu_L) != 0 and lu_piv is None
+    if _coupled_factor:
+        cct_trace_per_q = factor_trace_per_q
+    elif (int(vertex_mu_L) != 0 and lu_piv is None
             and not isinstance(L_q, FactorToken)
             and _resolved_solver_kind not in (
                 'transverse_rank_truncate',
@@ -651,18 +660,8 @@ def fit_zeta_to_h5(
     else:
         cct_trace_per_q = None
 
-    # The coupled batch-reshard route can flatten all three (mu,q) stacks
-    # into one canonical solve_zeta call.  Register only raw-array
-    # distributed-LU inputs: tokens already own a provider factor and local
-    # hoisted LU owns separate pivots, neither can be concatenated safely.
-    _coupled_stacked_solve = bool(
-        _coupled_mu123_coordinator is not None
-        and _stack_coupled_solve_inputs
-        and str(distrib_la_batched_route).strip().lower() == "batch_reshard"
-        and _resolved_solver_kind in ("cusolvermp_lu", "scalapack_lu")
-        and not isinstance(L_q, FactorToken)
-        and lu_piv is None
-        and cct_trace_per_q is not None)
+    # Stack raw current Grams before their one factor, retaining its native pivot carrier.
+    _coupled_stacked_solve = _coupled_factor
     _coupled_solve_inputs = (
         (L_q, cct_trace_per_q) if _coupled_stacked_solve else None)
 
@@ -1237,9 +1236,18 @@ def fit_zeta_to_h5(
                                 Z_mu_q = Z_mu_q[:, jnp.asarray(
                                     np.asarray(
                                         q_irr_full_idx, dtype=np.int32))]
-                        L_mu_q, trace_mu_q = (
+                        def factorize(C, trace):
+                            return factor_c_q(
+                                C, mesh_xy, vertex_mu_L=1,
+                                n_rmu_logical=n_rmu_solve,
+                                solver_kind=_resolved_solver_kind,
+                                zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
+                                transverse_zeta_rcond=transverse_zeta_rcond,
+                                distrib_la_batched_route=distrib_la_batched_route,
+                                transverse_trace_per_q=trace)
+                        L_mu_q, piv_mu_q = (
                             _coupled_mu123_coordinator.
-                            stacked_solve_inputs())
+                            stacked_solve_inputs(factorize=factorize))
                         n_q_solve = int(Z_mu_q.shape[1])
                         Z_flat = Z_mu_q.reshape(
                             3 * n_q_solve, n_rmu_padded,
@@ -1250,7 +1258,7 @@ def fit_zeta_to_h5(
                                 L_mu_q, Z_flat, mesh_xy, q_chunk_size,
                                 vertex_mu_L=1,
                                 solver_kind=_resolved_solver_kind,
-                                cct_trace_per_q=trace_mu_q,
+                                lu_piv=piv_mu_q,
                                 n_rmu_logical=n_rmu_solve,
                                 zeta_gather=_resolved_zeta_gather,
                                 distrib_la_batched_route=(
