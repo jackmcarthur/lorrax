@@ -2531,9 +2531,7 @@ _PARENT_UNFOLD_OPERANDS = {}
 
 
 def _parent_face_unfold_operands(plan, mesh_xy):
-    """The eight placed table operands the parent pair scans take, cached per
-    plan: rows/operations/parent k/spin action replicated, the centroid
-    offset and wrap tables sharded on the axis of the face they serve."""
+    """Place the eight typed parent-unfold tables from host data on their declared mesh axes."""
     key = (id(plan), id(mesh_xy))
     hit = _PARENT_UNFOLD_OPERANDS.get(key)
     if hit is not None:
@@ -2542,14 +2540,14 @@ def _parent_face_unfold_operands(plan, mesh_xy):
     from common.collectives import device_put_process_local
     rep = lambda spec: NamedSharding(mesh_xy, spec)
     ops = (
-        device_put_process_local(jnp.asarray(t["irr_idx"], jnp.int32), rep(P(None))),
-        device_put_process_local(jnp.asarray(t["sym_idx"], jnp.int32), rep(P(None))),
-        device_put_process_local(jnp.asarray(t["k_irr_frac"], jnp.float64), rep(P(None, None))),
-        device_put_process_local(jnp.asarray(t["spin_action_full"], jnp.complex128), rep(P(None, None, None))),
-        device_put_process_local(jnp.asarray(t["local_perm"], jnp.int32), rep(P(None, "x"))),
-        device_put_process_local(jnp.asarray(t["L_table"], jnp.float64), rep(P(None, "x", None))),
-        device_put_process_local(jnp.asarray(t["local_perm"], jnp.int32), rep(P(None, "y"))),
-        device_put_process_local(jnp.asarray(t["L_table"], jnp.float64), rep(P(None, "y", None))),
+        device_put_process_local(np.asarray(t["irr_idx"], np.int32), rep(P(None))),
+        device_put_process_local(np.asarray(t["sym_idx"], np.int32), rep(P(None))),
+        device_put_process_local(np.asarray(t["k_irr_frac"], np.float64), rep(P(None, None))),
+        device_put_process_local(np.asarray(t["spin_action_full"], np.complex128), rep(P(None, None, None))),
+        device_put_process_local(np.asarray(t["local_perm"], np.int32), rep(P(None, "x"))),
+        device_put_process_local(np.asarray(t["L_table"], np.float64), rep(P(None, "x", None))),
+        device_put_process_local(np.asarray(t["local_perm"], np.int32), rep(P(None, "y"))),
+        device_put_process_local(np.asarray(t["L_table"], np.float64), rep(P(None, "y", None))),
     )
     hit = (ops, int(t["n_sym_spatial"]))
     _PARENT_UNFOLD_OPERANDS[key] = hit
@@ -2576,6 +2574,7 @@ def iter_parent_children_faces(carrier, mesh_xy, *, slices, by_parent=True):
     ops, n_sym_spatial = _parent_face_unfold_operands(plan, mesh_xy)
     irr, sym_rows, kfrac, U, perm_x, L_x, perm_y, L_y = ops
     irr_np = np.asarray(plan.irr_idx)
+    host_tables = plan.wavefunction_unfold_tables()
 
     def _kernel(spec, spin_axis, mu_axis, perm_spec, L_spec, n_rows):
         key = (plan, id(mesh_xy), spec, spin_axis, mu_axis, int(n_rows))
@@ -2602,11 +2601,13 @@ def iter_parent_children_faces(carrier, mesh_xy, *, slices, by_parent=True):
     for rows in groups:
         if rows.size == 0:
             continue
-        r = jnp.asarray(rows, dtype=jnp.int32)
-        irr_r = jax.lax.with_sharding_constraint(jnp.take(irr, r), rep(P(None)))
-        sym_r = jax.lax.with_sharding_constraint(jnp.take(sym_rows, r), rep(P(None)))
-        U_r = jax.lax.with_sharding_constraint(
-            jnp.take(U, r, axis=0), rep(P(None, None, None)))
+        irr_r = device_put_process_local(
+            np.asarray(host_tables["irr_idx"], np.int32)[rows], rep(P(None)))
+        sym_r = device_put_process_local(
+            np.asarray(host_tables["sym_idx"], np.int32)[rows], rep(P(None)))
+        U_r = device_put_process_local(
+            np.asarray(host_tables["spin_action_full"], np.complex128)[rows],
+            rep(P(None, None, None)))
         mun = _kernel(PSI_MUN_SPEC, 1, 2, P(None, "x"), P(None, "x", None),
                       rows.size)(carrier.psi_mun, irr_r, sym_r, kfrac, U_r,
                                  perm_x, L_x)
