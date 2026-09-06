@@ -1384,6 +1384,18 @@ def _photon_q0_factor_orbit(left, right, *, layout, plans, mesh_xy):
     return transform(left, 'x'), transform(right, 'y') / len(rows)
 
 
+@functools.partial(jax.jit, static_argnames=("mesh_xy",))
+def _fold_photon_q0_response(S_direct, Y_x, W_gamma, Z_y, volume, *, mesh_xy):
+    """Fold four coordinate pairs in order through one resident distributed body."""
+    def pair(S_effective, index):
+        a, b = index // 2, index % 2
+        folded = fold_small_head_wings_sharded(
+            S_direct[a, b], Y_x[a], W_gamma, Z_y[b], volume, mesh_xy=mesh_xy)
+        return S_effective.at[a, b].set(folded), None
+    S_effective, _ = jax.lax.scan(pair, S_direct, jnp.arange(4), unroll=1)
+    return canonicalize_static_gauge_q2_tensor(S_effective)
+
+
 def complete_static_slab_photon_q0(
     V_packed: jax.Array,
     W_packed: jax.Array,
@@ -1433,19 +1445,10 @@ def complete_static_slab_photon_q0(
         cubature_receipt)
     cell_volume = float(cubature_receipt.cell_volume)
 
-    # The headless Gamma body remains resident and 2-D sharded.  Four calls
-    # reuse the sole bounded Schur-fold graph; broadcasting W over the two
-    # coordinate axes would create four body views in one executable.
     W_gamma = W_packed[0]
-    S_effective = response.S_direct
-    for a in range(2):
-        for b in range(2):
-            folded = fold_small_head_wings_sharded(
-                response.S_direct[a, b],
-                response.Y_x[a], W_gamma, response.Z_y[b],
-                float(cell_volume), mesh_xy=mesh_xy)
-            S_effective = S_effective.at[a, b].set(folded)
-    S_effective = canonicalize_static_gauge_q2_tensor(S_effective)
+    S_effective = _fold_photon_q0_response(
+        response.S_direct, response.Y_x, W_gamma, response.Z_y,
+        float(cell_volume), mesh_xy=mesh_xy)
     YW_y, WZ_x = small_head_wing_halves_sharded(
         response.Y_x, W_gamma, response.Z_y, mesh_xy=mesh_xy)
     jax.block_until_ready((S_effective, YW_y, WZ_x))
