@@ -58,3 +58,16 @@
 | Prior static P4 |70.10 /69.03|29.14 /21.89|21.40 /23.60|641 /606|copied ζ: exact FAIL0.766µeV|57988457/lx-Xg4-131617-747058-1237; R124/125|
 | Current static/dynamic P4 |queued|—|—|—|copied ζ: exact|R204_speed_9x9_P4/05_matrix|
 | Current static/dynamic P16 |queued|—|—|—|copied ζ: exact|R216_speed_9x9_P16/05_matrix|
+
+| Unit compile events (captured families) | P4 P/F | P16 P/F | Module / scope | Mapping |
+|---|---:|---:|---|---|
+| χ ordered vertex families |4/4|4/4|jit_minimax_tau_integrate_chi_vertex|inherent full-child sum; equal compile families|
+| Static contraction families |4/4|4/4|jit_contract_block, static capture|mapped family sharing|
+| τ incl. projection/seams |1/1|1/1|jit__tau, dynamic capture|one executable each; extra parent G is inside it|
+| Packed Dyson A assembly |1/2|1/2|jit__a_chunk, static capture|different q-tail shapes|
+| Packed Dyson solve |1/1|1/1|jit__solve, static capture|mapped Q/K solve class|
+| Typed restores |7/4|7/4|jit__do_unfold, static capture; dynamic8/5|inherent extra parent/operator families|
+| Separate restore mixing |0/1|0/1|jit__do_mix|parent mixing not a separate executable|
+| Γ completion |1/0|1/0|jit__photon_q0_factor_orbit|inherent additional covariance work|
+| Head attribution |inside block|inside block|F extra GEMMs inside four contraction modules|defect in F diagnostic flag handling|
+| ζ fit-only total |see per-module receipts|221/296|137/138 instrumented captures; timings excluded|tile/route-dependent, not whole-driver parity|
