@@ -299,6 +299,27 @@ def test_new_product_name_reuses_an_existing_certificate(monkeypatch):
     assert geometry['sc_fixed_rebuilds_this_iteration'] == 0
 
 
+def test_relative_window_does_not_borrow_a_crossing_certificate(monkeypatch):
+    from gw import sigma_box_plan as boxes
+    from test_sigma_box_plan import _fake_rule
+    monkeypatch.setattr(boxes, 'build_uniform_rule', _fake_rule)
+    args = dict(states=np.array([1.]), pole_stats=[(.5, .5, .1, .1)],
+                pole_sign=1., eta_ry=.1)
+    crossing = boxes.make_sigma_box_spec(
+        name='crossing', frequencies=np.array([0., 2.]), **args)
+    relative = boxes.make_sigma_box_spec(
+        name='new-relative', frequencies=np.array([0., .2]), **args)
+    session = {}
+    kwargs = dict(eps=1e-4, reduction_seconds=20., cache_dir=None, session=session)
+    boxes._fit_fixed_sc_rules([crossing], .1, **kwargs)
+    assert boxes._box_contains(session['rules']['crossing']['fit']['rule_box'],
+                               relative['box'])
+    fits, _, _ = boxes._fit_fixed_sc_rules([relative], .1, **kwargs)
+    assert fits[0]['relative']
+    assert session['rebuild_count'] == 1
+    assert fits[0]['cache_status'] == 'rebuild:sc-fixed'
+
+
 def test_initial_sc_zero_side_reservation_keeps_the_causal_sign():
     from gw.sigma_box_plan import make_sigma_box_spec, _sc_padded_box_spec
     for sign in (-1., 1.):
