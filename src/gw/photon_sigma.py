@@ -108,12 +108,11 @@ def _require_packed_operator(name, packed, mesh_xy):
             "placed on fewer than all ranks.")
 
 
-def _make_photon_static_block_kernel(
+def _make_photon_static_class_kernel(
     mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, *, with_head=False,
 ):
-    """Unfold each endpoint before its vertex, then build G and project Σ on parents."""
+    """Share unfolded endpoints, G, transforms and projection across one Lorentz class."""
     from common.shard_map import shard_map
-    from common.gamma_matrices import gamma_apply
     from ffi import ffi_dial_key
     from common.contract_bands import contract_bands_block_reshard
     from distrib_la import gemm_plan
@@ -134,84 +133,104 @@ def _make_photon_static_block_kernel(
             n=shapes[1][2]*shapes[1][3], nq=nk_tot, dtype=jnp.complex128)
         _photon_sigma_kernel_cache[plan_key] = project, g_plan
     project, g_plan = _photon_sigma_kernel_cache[plan_key]
-    convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=False)
-    head_convolve = (_make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=True)
+    convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=False, lorentz=True)
+    head_convolve = (_make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=True, lorentz=True)
                      if with_head else None)
     rows = np.asarray(plans[0].parent_full_rows)
     specs = (P(None,None,"x","y"), P(None,"x",None,"y"))
 
-    def unfold(psi_mun, psi_nmu, vertices):
+    def unfold(psi_mun, psi_nmu):
         direct = plans[0].unfold_face(psi_mun, spin_axis=1, mu_axis=2, mesh_axis="x")
         conjugated = plans[1].unfold_face(psi_nmu, spin_axis=2, mu_axis=3, mesh_axis="y")
-        return (gamma_apply(direct, *vertices[0], axis=1),
-                gamma_apply(conjugated, *vertices[1], axis=2))
-    unfold = shard_map(unfold, mesh=mesh_xy, in_specs=(*specs, ((P(), P()), (P(), P()))),
+        return direct, conjugated
+    unfold = shard_map(unfold, mesh=mesh_xy, in_specs=specs,
                        out_specs=specs, check_vma=False)
 
     @jax.jit
-    def contract_block(left, right, weights, interaction, factor, vertices, head_interaction=None):
-        direct, conjugated = unfold(left.psi_mun, right.psi_nmu, vertices)
+    def contract_class(left, right, weights, interaction, factor, vertices, head_interaction=None):
+        direct, conjugated = unfold(left.psi_mun, right.psi_nmu)
         G = build_G(direct, conjugated, phases=weights, layout="face", gemm=g_plan)
-        sigma = convolve(G, interaction, factor)
+        sigma = convolve(G, interaction, factor, vertices)
         result = project(left.psi_nmu, jnp.take(sigma, jnp.asarray(rows), axis=0), right.psi_mun)
         if with_head:
-            head_sigma = head_convolve(G, head_interaction, factor)
+            head_sigma = head_convolve(G, head_interaction, factor, vertices)
             head = project(left.psi_nmu, jnp.take(head_sigma, jnp.asarray(rows), axis=0), right.psi_mun)
             return result, head
         return result
-    _photon_sigma_kernel_cache[key] = contract_block
-    return contract_block
+    _photon_sigma_kernel_cache[key] = contract_class
+    return contract_class
+
+
+def _photon_head_pairs(response, term, mesh_xy):
+    """Prepare covariant Gamma factors once per term using their canonical orbit owner."""
+    from .head_correction import _photon_q0_factor_orbit
+    factors = response.head_completion.q0_factors
+    pairs = (factors.bare_pair,) if term == _TERM_X else factors.screened_pairs
+    bare = (factors.bare_pair,) if term == _TERM_COH else ()
+    def expand(pairs):
+        return tuple((device_put_process_local(images[0][i], NamedSharding(mesh_xy, P(None, 'x'))),
+                      device_put_process_local(images[1][i], NamedSharding(mesh_xy, P(None, 'y'))))
+            for pair in pairs for images in (_photon_q0_factor_orbit(
+                *pair, layout=response.layout, plans=factors.family_plans, mesh_xy=mesh_xy),)
+            for i in range(images[0].shape[0]))
+    return expand(pairs), expand(bare)
+
+
+def _make_photon_class_restore(response, keys):
+    """Compile one canonical full-q producer per class without caching interaction arrays."""
+    from .w_isdf import photon_blocks_full_q
+    from common.gamma_matrices import gamma_perm_phase
+    layout, plans, policy = response.layout, response.family_plans, response.qgrid_policy
+    key = ("restore", id(layout), tuple(map(id, plans)), id(policy), keys)
+    if key not in _photon_sigma_kernel_cache:
+        @jax.jit
+        def restore(packed):
+            interactions = jnp.stack([value for _, value in photon_blocks_full_q(
+                packed, keys, layout=layout, family_plans=plans, qgrid_policy=policy)])
+            vertices = jax.tree.map(lambda *v: jnp.stack(v),
+                *((gamma_perm_phase(A), gamma_perm_phase(B)) for A, B in keys))
+            return interactions, vertices
+        _photon_sigma_kernel_cache[key] = restore
+    return _photon_sigma_kernel_cache[key]
 
 
 def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh_xy,
                             head_diagnostics=False):
-    """Yield one parent-band Σ block after consuming and releasing one full-q interaction."""
-    from .w_isdf import photon_blocks_full_q
+    """Yield one parent-band sum per endpoint class while retaining one resident Green."""
     from .cohsex_sigma import _occ_diag_full
     from .photon_layout import photon_q0_low_rank_block
-    from .head_correction import _photon_q0_factor_orbit
-    from common.gamma_matrices import gamma_perm_phase
     if tuple(f.green_parent.plan for f in families) != response.family_plans:
         raise ValueError("Photon interaction and wavefunctions use different parent plans.")
     if term not in (_TERM_X, _TERM_SX, _TERM_COH):
         raise ValueError(f"Unknown static Sigma term {term}.")
-    operator = ("V", "W", "W-V")[term]
-    factors = (response.head_completion.q0_factors
-               if head_diagnostics and response.head_completion is not None else None)
-    for key, interaction in photon_blocks_full_q(response, blocks, term=operator):
-        A, B = key
-        left, right = families[int(A != 0)], families[int(B != 0)]
+    packed = response.V_packed if term == _TERM_X else response.W_packed
+    if term == _TERM_COH:
+        packed = packed - response.V_packed
+    with_head = head_diagnostics and response.head_completion is not None
+    pairs, bare = _photon_head_pairs(response, term, mesh_xy) if with_head else ((), ())
+    for a, b in ((0, 0), (0, 1), (1, 0), (1, 1)):
+        keys = tuple((A, B) for A, B in blocks if bool(A) == bool(a) and bool(B) == bool(b))
+        if not keys:
+            continue
+        left, right = families[a], families[b]
         slices = left.slices
         weights = (_occ_diag_full(Gij, slices.nb_sigma, slices.nb_full)
                    if term != _TERM_COH else left.band_mask(slices.sigma_sum).astype(jnp.complex128))
         weights = jax.lax.with_sharding_constraint(
             jnp.broadcast_to(weights, (meta.nk_tot, slices.nb_full)), NamedSharding(mesh_xy, P()))
-        factor = -0.5 if term == _TERM_COH else 1.0
-        head_block = None
-        if factors is not None:
-            pairs = (factors.bare_pair,) if term == _TERM_X else factors.screened_pairs
-            pairs = tuple((device_put_process_local(images[0][i], NamedSharding(mesh_xy, P(None, 'x'))),
-                           device_put_process_local(images[1][i], NamedSharding(mesh_xy, P(None, 'y'))))
-                for pair in pairs for images in (_photon_q0_factor_orbit(
-                    *pair, layout=response.layout, plans=factors.family_plans, mesh_xy=mesh_xy),)
-                for i in range(images[0].shape[0]))
-            head_block = photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
-            if term == _TERM_COH:
-                head_block = head_block - photon_q0_low_rank_block(
-                    tuple((device_put_process_local(images[0][i], NamedSharding(mesh_xy, P(None, 'x'))),
-                           device_put_process_local(images[1][i], NamedSharding(mesh_xy, P(None, 'y'))))
-                        for images in (_photon_q0_factor_orbit(*factors.bare_pair,
-                            layout=response.layout, plans=factors.family_plans, mesh_xy=mesh_xy),)
-                        for i in range(images[0].shape[0])),
-                    response.layout, A, B, mesh_xy)
-        kernel = _make_photon_static_block_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
-            left, right, with_head=factors is not None)
-        vertices = (gamma_perm_phase(A), gamma_perm_phase(B))
-        value = kernel(left.green_parent, right.green_parent, weights, interaction, factor, vertices, head_block)
-        result, head = value if factors is not None else (value, None)
+        interactions, vertices = _make_photon_class_restore(response, keys)(packed)
+        head_blocks = None
+        if with_head:
+            head_blocks = jnp.stack([photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
+                - (photon_q0_low_rank_block(bare, response.layout, A, B, mesh_xy) if bare else 0)
+                for A, B in keys])
+        kernel = _make_photon_static_class_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
+                                                  left, right, with_head=with_head)
+        value = kernel(left.green_parent, right.green_parent, weights, interactions,
+                       -0.5 if term == _TERM_COH else 1.0, vertices, head_blocks)
+        result, head = value if with_head else (value, None)
         jax.block_until_ready((result, head))
-        del interaction, head_block
-        yield key, result, head
+        yield keys[0], result, head
 
 
 def compute_static_photon_sigma(
@@ -250,9 +269,8 @@ def compute_static_photon_sigma(
                 old = heads[term][sector]
                 heads[term][sector] = head if old is None else old + head
                 head_totals[term] = head if head_totals[term] is None else head_totals[term] + head
-            totals[term].block_until_ready()
             if verbose and jax.process_index() == 0:
-                print_fn(f"  packed photon Sigma term {term} block {key} complete")
+                print_fn(f"  packed photon Sigma term {term} class {key} complete")
     sym = wfns_charge.green_parent.plan.sym
     nb = wfns_charge.slices.nb_sigma
 

@@ -196,73 +196,65 @@ _static_convolution_cache: dict[tuple[object, ...], object] = {}
 
 
 def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
-                             nk_tot: int, *, q0_only: bool = False):
-    """Build the one flat-k convolution shared by every static Sigma block.
-
-    Scalar COHSEX and photon blocks differ only in their endpoint centroid
-    extents.  Those are the independently sharded trailing axes of the
-    canonical FFT specs, so the same convolution serves square and
-    rectangular operators without another FFT service or convention.
-    """
+                             nk_tot: int, *, q0_only=False, lorentz=False):
+    """Own the normalized flat-k convolution for scalar and streamed Lorentz sums."""
     from ffi import ffi_dial_key
-    cache_key = (
-        id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(), int(nk_tot),
-        bool(q0_only))
-    if cache_key in _static_convolution_cache:
-        return _static_convolution_cache[cache_key]
-
-    if q0_only:
-        # Closed form of the SAME normalized flat-k convolution when the
-        # interaction is structurally zero except at q=0:
-        #   -1/Nk sum_q G(k-q)V(q) = -G(k)V(0)/Nk.
-        # This branch is used only for retained head factors and avoids three
-        # extra full-q FFT convolutions per Lorentz block.
+    from ffi.mklfft import fused_fft_ffi_enabled
+    from common.fft_helpers import make_flat_k_gw_conv
+    key = (id(mesh_xy), tuple(kgrid), ffi_dial_key(), int(nk_tot), q0_only, lorentz)
+    if key in _static_convolution_cache:
+        return _static_convolution_cache[key]
+    scale = -1.0 / (float(nk_tot) if q0_only else np.sqrt(float(nk_tot)))
+    if lorentz:
+        convolve = _make_lorentz_convolution(mesh_xy, kgrid, scale, q0_only)
+    elif q0_only:
         @jax.jit
-        def _convolve(G_k, V_or_W, prefactor):
-            V0 = V_or_W[0][None, None, :, None, :]
-            return prefactor * G_k * V0 * (-1.0 / float(nk_tot))
+        def convolve(G_k, interaction, prefactor):
+            return prefactor * G_k * interaction[0][None, None, :, None, :] * scale
+    elif fused_fft_ffi_enabled():
+        # The fused owner bounds the exposed Green lifetime on large scalar decks.
+        fused = make_flat_k_gw_conv(mesh_xy, kgrid, G_FFT7D_SPEC, V_FFT5D_SPEC,
+                                    norm='ortho', mult=scale)
+        @jax.jit
+        def convolve(G_k, interaction, prefactor):
+            return prefactor * fused(G_k, interaction)
     else:
-        from common.fft_helpers import (
-            make_flat_k_fftn, make_flat_k_gw_conv, make_flat_k_ifftn)
-        from ffi.mklfft import fused_fft_ffi_enabled
+        from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
+        inverse_g = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+        forward_g = make_flat_k_fftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+        inverse_v = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
+        @jax.jit
+        def convolve(G_k, interaction, prefactor):
+            return prefactor * forward_g(
+                inverse_g(G_k) * inverse_v(interaction)[:, None, :, None, :] * scale)
+    _static_convolution_cache[key] = convolve
+    return convolve
 
-        _inv_sqrt_nk = -1.0 / jnp.sqrt(float(nk_tot))
-        if fused_fft_ffi_enabled():
-            # Use the same certified k-leading convolution owner as dynamic
-            # Sigma.  Keeping IFFT(G), IFFT(V), their product and FFT(GV)
-            # inside one handler is load-bearing for the face carrier: at
-            # Bi's P36 c2070 shape, exposing those R-space tensors to one
-            # compiled XLA heap made a 45.11-GiB executable on 40-GB GPUs.
-            # The prefactor remains outside because SX/COH/photon callers
-            # share this factory with different scalar coefficients.
-            _gw_conv = make_flat_k_gw_conv(
-                mesh_xy, kgrid, G_FFT7D_SPEC, V_FFT5D_SPEC,
-                norm='ortho', mult=_inv_sqrt_nk)
 
-            @jax.jit
-            def _convolve(G_k, V_or_W, prefactor):
-                """Sigma^k = pref * FFT[G(R) V(R) / sqrt(Nk)]."""
-                return prefactor * _gw_conv(G_k, V_or_W)
-        else:
-            # Explicit LORRAX_FFT_FFI_FUSED=0 control.  The three transforms
-            # remain on the required flat-k FFT service; only their fused
-            # lifetime is disabled.
-            _G_ifftn = make_flat_k_ifftn(
-                mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
-            _G_fftn = make_flat_k_fftn(
-                mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
-            _V_ifftn = make_flat_k_ifftn(
-                mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
+def _make_lorentz_convolution(mesh_xy, kgrid, scale, q0_only):
+    """Transform one Green tensor and stream vertex-weighted interactions into one sum."""
+    from common.gamma_matrices import gamma_apply
+    from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
+    if not q0_only:
+        inverse_g = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+        forward_g = make_flat_k_fftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
+        inverse_v = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
 
-            @jax.jit
-            def _convolve(G_k, V_or_W, prefactor):
-                """Sigma^k = pref * FFT[G(R) V(R) / sqrt(Nk)]."""
-                G_R = _G_ifftn(G_k)
-                V_R = _V_ifftn(V_or_W)[:, None, :, None, :]
-                return prefactor * _G_fftn(G_R * V_R * _inv_sqrt_nk)
+    @jax.jit
+    def convolve(G_k, interactions, prefactor, vertices):
+        green = G_k if q0_only else inverse_g(G_k)
 
-    _static_convolution_cache[cache_key] = _convolve
-    return _convolve
+        def add(total, block):
+            interaction, (left, right) = block
+            value = gamma_apply(green, *left, axis=1)
+            value = gamma_apply(value, right[0], jnp.conj(right[1]), axis=3)
+            weight = (interaction[0][None, None, :, None, :] if q0_only else
+                      inverse_v(interaction)[:, None, :, None, :])
+            return total + value * weight, None
+
+        sigma, _ = jax.lax.scan(add, jnp.zeros_like(green), (interactions, vertices), unroll=1)
+        return prefactor * (sigma if q0_only else forward_g(sigma)) * scale
+    return convolve
 
 
 def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
