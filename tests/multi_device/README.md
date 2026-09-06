@@ -35,19 +35,13 @@ If it ever fails, read each rank's OWN stderr file: the writer's diagnostic is
 lost from the merged log under srun+apptainer at teardown, which is precisely
 why the original failure went unattributed for a day.
 
-Sharded-U ψ rotation gate: `wfn_rotate_gate.py`, any square P (2×2 is the
-standard leg). Certifies `gw.wavefunction_bundle.rotate_wavefunctions` against
-the replicated-U path it replaces AND against an explicit host rotation with a
-transposed-U negative control — the transpose of a unitary is also unitary and
-also mixes only within the occupied block, so no invariance check can see it.
-Also reports the per-rank U residency and a collective census (kind, result
-bytes, replica-group size) of the compiled kernel, which is where the claim
-"the band sum reduces along ONE mesh axis" is actually checked.
-
-    srun -n 4 python3 -m wfn_rotate_gate      # WR_NK/NB/NS/NMU/NACT/NOCC
-
-Harness: `/scratch2/08271/jackmc/wfn_rotate/wrgate.sbatch` (N=2, n=4, live
-tree). Green at job 7889407.
+Wavefunction rotation: `tests/test_qsgw_rotate_face_parity.py` runs on P4
+against an explicit NumPy column rotation, including a transposed-U negative
+control, inactive bands, occupations, and four-spinor inputs.
+`tests/test_sigma_parent_projection.py` also gates typed parent rotation.
+The former four-copy `wfn_rotate_gate.py` and its private kernels are retired;
+its historical residency and collective measurements do not describe the
+current two-face parent kernel.
 
 Σ_c(ω) layout A/B gate: `sigma_omega_layout_ab.py`, the launcher-agnostic
 compare step for two full driver runs of the SAME deck that differ only in

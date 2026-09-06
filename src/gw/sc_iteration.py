@@ -2690,7 +2690,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # ``rotate_bands`` takes this layout as-is (measured 115.7 ms
             # against 117.6 ms replicated, same three collectives, argument
             # 41 MiB against 44 MiB — job 7889424), and
-            # ``rotate_wavefunctions`` reshards to ``band_mix_spec``
+            # ``rotate_wavefunctions`` places the two-face band rotation
             # whichever it gets.  ``_rotate_to_dft_basis`` contracts in
             # this layout directly and no longer gathers it.
             # Process-local placement — see the H_qp_dft note above (same
@@ -2738,7 +2738,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # is a device-side rotation that either wants
         # ``band_rotation_spec`` outright (``qsgw_density.rotate_bands``)
         # or reshards from whatever it is given (``rotate_wavefunctions``
-        # → ``band_mix_spec``), and the two matrix rotations
+        # for its two-face GEMMs), and the two matrix rotations
         # (``_rotate_to_dft_basis`` and ``sigma_dispatch``'s V_H basis
         # change) contract in this layout through
         # ``qsgw_density.rotate_band_matrix``.  Per-rank U drops by px·py

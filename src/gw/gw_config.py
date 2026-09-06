@@ -3321,27 +3321,10 @@ def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
 #: separately by :func:`refuse_explicit_gij_under_low_mem_bands`, called
 #: from ``compute_sigma_xc`` at the one seam that ever sees both operands
 #: together.
-    # LIFTED 2026-08-23 (feat/qsgw-face-rotations-2026-08-23) per this row's
-    # own recorded lift condition: rotate_wavefunctions now dispatches on
-    # wfns_dft.layout and routes layout='face' through
-    # wavefunction_bundle._rotate_wavefunctions_face (two planned
-    # distrib_la.gemm_plan N,N GEMMs -- U^T @ psi_nmu, psi_mun @ U -- against
-    # a block-embedded U rather than a sliced ψ; see wavefunction_bundle
-    # ._face_rotate_kernel/._face_embed_active_U).  sc_iteration.py:1753
-    # needed NO change: it already calls rotate_wavefunctions(inputs.
-    # wfns_dft, ...), and the dispatch reads wfns_dft.layout, not a
-    # call-site flag.  Gated: real 4-rank CUDA algebra parity vs legacy
-    # (tests/test_qsgw_rotate_face_parity.py, U from a REAL small eigh —
-    # ns=1/ns=2, default AND offset active windows — 3/3 PASS, max relative
-    # diff ~1e-16..2e-16); a real end-to-end MoS2 k6_c50 compute_mode=
-    # gn_ppm head_correction=full qp_solver=self_consistent (3 iterations)
-    # leg, face vs legacy — see this session's CLAIMS.md row for job id and
-    # measured tolerances.  ``head_wings_sharded``'s own consumer,
-    # ``build_iteration_head_response`` (qsgw_head.py), needed NO change
-    # either: it treats ``wfns_qp`` opaquely (no direct psi_* field access)
-    # and forwards it to the already layout-dispatching wing kernels; the
-    # ONLY reason it read as "still legacy-only" before this session is
-    # that its sole producer, rotate_wavefunctions, had no face arm.
+    # SC rotation uses the two-face GEMMs in rotate_wavefunctions; the
+    # four-copy rotation chain is retired. The explicit column-rotation
+    # oracle is tests/test_qsgw_rotate_face_parity.py; parent transport is
+    # covered by tests/test_sigma_parent_projection.py.
     # LIFTED 2026-08-23 (fix/mpa-head-status-line-2026-08-23): the metal
     # row was the LAST entry.  Both of its originally-named blockers were
     # already ported+gated (metallic chi0 response; the MPA executor), and

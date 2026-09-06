@@ -71,7 +71,7 @@ session, none of them in ``gw.mpa.sigma``'s own code).
 face-rotations-2026-08-23), same shape as the ``head_correction=full`` lift
 above: ``wavefunction_bundle.rotate_wavefunctions`` now dispatches on
 ``wfns_dft.layout`` and routes ``layout='face'`` through
-``_rotate_wavefunctions_face`` — two planned ``distrib_la.gemm_plan`` N,N
+``rotate_wavefunctions`` — two planned ``distrib_la.gemm_plan`` N,N
 GEMMs (``U^T @ psi_nmu``, ``psi_mun @ U``) against a block-embedded U
 rather than a sliced ψ.  ``sc_iteration.py:1753`` needed no change.  Gated
 on real 4-rank CUDA algebra parity (``tests/test_qsgw_rotate_face_parity.py``
@@ -206,7 +206,7 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
     "compute_mode = gn_ppm\nqp_solver = fixed_point\n",
     # qp_solver=self_consistent, LIFTED 2026-08-23 (feat/qsgw-face-
     # rotations-2026-08-23): rotate_wavefunctions now dispatches on
-    # wfns_dft.layout (wavefunction_bundle._rotate_wavefunctions_face) --
+    # wfns_dft.layout (wavefunction_bundle.rotate_wavefunctions) --
     # gated on real 4-rank CUDA algebra parity (tests/
     # test_qsgw_rotate_face_parity.py) and a real end-to-end MoS2 k6_c50
     # compute_mode=gn_ppm head_correction=full qp_solver=self_consistent
