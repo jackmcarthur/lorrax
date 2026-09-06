@@ -108,6 +108,12 @@ def test_map_readout_freezes_output_reference_and_does_not_change_carry(monkeypa
     history = {}
     v0, _ = sc._sc_identity_for_call(inputs, state, e, e, history, cutoff_ev=.01)
     assert v0.converged
+    reference_device = history['u_device']
+    original_put = sc.jax.device_put
+    def refuse_reference_reupload(value, *args, **kwargs):
+        assert value is not history['u'], 'fixed reference uploaded again'
+        return original_put(value, *args, **kwargs)
+    monkeypatch.setattr(sc.jax, 'device_put', refuse_reference_reupload)
     output_rotation[0] = u[:, :, [0, 2, 1]]
     verdict, updated = sc._sc_identity_for_call(
         inputs, state, e, e, history, cutoff_ev=.01)
@@ -115,6 +121,8 @@ def test_map_readout_freezes_output_reference_and_does_not_change_carry(monkeypa
     assert verdict.rms_all_ev == 0.  # explicitly the legacy sorted diagnostic
     assert updated.H_qp_dft is state.H_qp_dft
     np.testing.assert_array_equal(history['u'], u)
+    assert history['u_device'] is reference_device
+    np.testing.assert_array_equal(history['u_device'], u)
     np.testing.assert_array_equal(updated.outputs.identity['motion_ev'], [[0., 2., -2.]])
     assert 'sorted-index value 0.000000000e+00' in logs[-1]
 

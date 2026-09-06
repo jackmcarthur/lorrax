@@ -4061,7 +4061,11 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
         # never cuts one in the input spectrum).
         # Validate whole trusted reference multiplets using the established
         # readout, then fill the rest without changing those assignments.
-        initial_overlap = overlap_on_host(u_in, u_out)
+        u_out_device = jax.device_put(u_out, getattr(u_in, "sharding", None))
+        if hasattr(inputs, "print_fn"):
+            inputs.print_fn(f"SC identity reference upload: bytes={u_out.nbytes}; "
+                            "cached on device for later maps")
+        initial_overlap = overlap_on_host(u_in, u_out_device)
         assign_qp_identity(None, e_input_ev, None, e_output_ev, mask,
                            overlap_weights=initial_overlap, **kw)
         slot, _, blocks0, _ = assign_qp_identity(
@@ -4081,8 +4085,11 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
             for block in np.unique(blocks0[k][blocks0[k] >= 0]):
                 members = slot[k, blocks0[k] == block]
                 e_ref[k, members] = e_ref[k, members].mean()
-        history.update(u=u_out.copy(), e=e_ref, mask=mask.copy(),
-                       labels=labels, slot=slot, previous=None)
+        # The reference is immutable. Retain its device copy so later
+        # readouts do not upload the full complex rotation every map.
+        history.update(u=u_out.copy(), u_device=u_out_device,
+                       e=e_ref, mask=mask.copy(), labels=labels,
+                       slot=slot, previous=None)
     slot = history['slot']
     found = slot >= 0
     rows = np.arange(slot.shape[0])[:, None]
@@ -4100,7 +4107,7 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
         priority_mask=history['labels'], **kw)
     input_overlap = (np.swapaxes(initial_overlap, -1, -2)
                      if initial_overlap is not None else
-                     overlap_on_host(history['u'], u_in))
+                     overlap_on_host(history['u_device'], u_in))
     in_index, in_e, _, _ = assign_qp_identity(
         None, history['e'], None, e_input_ev, np.ones(mask.shape, dtype=bool),
         priority_mask=history['labels'], overlap_weights=input_overlap, **kw)
