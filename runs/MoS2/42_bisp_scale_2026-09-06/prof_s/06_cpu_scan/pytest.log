@@ -1,0 +1,32 @@
+gate: CENSUS (explicit path(s)) — full suite, KNOWN_FAILURES.md accounting applies
+...............F......                                                   [100%]
+=================================== FAILURES ===================================
+_________________ test_sigma_oracle_rejects_transposed_gamma2 __________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fd604242a80>
+
+    def test_sigma_oracle_rejects_transposed_gamma2(monkeypatch):
+        """A deliberate Gamma2 transpose is rejected by the mixed-vertex Sigma oracle."""
+        import common.gamma_matrices as gamma
+        original = gamma.gamma_apply
+        def wrong(value, perm, phase, *, axis):
+            return original(value, perm, jnp.conj(phase), axis=axis)
+        monkeypatch.setattr(gamma, 'gamma_apply', wrong)
+>       with pytest.raises(AssertionError,match='Sigma'):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE AssertionError
+
+../../../../../tests/multi_device/bispinor_physics_oracles.py:611: Failed
+=============================== warnings summary ===============================
+tests/multi_device/bispinor_physics_oracles.py::test_literal_gamma_lift_and_all_96_spatial_trs_rows
+  /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/shard_map.py:178: DeprecationWarning: jax.experimental.shard_map is deprecated in v0.8.0. Used jax.shard_map instead.
+    has_experimental = hasattr(_exp, "shard_map")
+
+tests/multi_device/bispinor_physics_oracles.py: 12 warnings
+  /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/services/symmetry_maps/src/symmetry_maps/maps.py:2345: RuntimeWarning: SYMMETRY PROVENANCE WARNING: no authenticated QE data-file-schema.xml is available at SymMaps initialization (the WFN-shaped input carries no QE schema receipt). WFN.h5 does not record which operations are composed with time reversal. LORRAX is using the legacy all-spatial header interpretation plus the global DFT-reference TRS verdict. RESULTS WILL BE WRONG if time reversal is broken and QE used an antiunitary magnetic-space-group operation. Co-stage the WFN-generating QE *.save directory or pass WfnLoader(..., qe_schema=...).
+    _warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED ../../../../../tests/multi_device/bispinor_physics_oracles.py::test_sigma_oracle_rejects_transposed_gamma2
+1 failed, 21 passed, 13 warnings in 19.27s
