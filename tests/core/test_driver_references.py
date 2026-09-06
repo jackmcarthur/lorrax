@@ -1,6 +1,7 @@
 """One cached run of each GW route on only the two tiny systems."""
 from __future__ import annotations
 
+import ast
 import re
 import shutil
 
@@ -96,6 +97,17 @@ def test_b_mpa_one_update_matches_references(core_fixtures):
                 atol=MPA_EQP_ATOL_EV)
 
     _run(run_b, "mpa_sc1.in", allow_runtime_solve=True)
+    report = (run_b / "mpa_sc1.out").read_text(encoding="utf-8")
+    reference_report = (source_b / "mpa_sc1.out").read_text(encoding="utf-8")
+    # Pin the physical state support itself. A lucky cached rule can hide
+    # storage-only bands in EQP numbers, but not in this denominator box.
+    def conduction_box(text):
+        line = next(line for line in text.splitlines()
+                    if "SC fixed window: ω≥E_F cond:pole_tail" in line)
+        return ast.literal_eval(re.search(r"box=(\([^)]*\)) eV", line)[1])
+    np.testing.assert_allclose(conduction_box(report),
+                               conduction_box(reference_report),
+                               rtol=0., atol=1e-8)
     _assert_eqp(run_b / "mpa_sc1_eqp0.dat", source_b / "mpa_sc1_eqp0.dat",
                 atol=EQP_ATOL_EV)
     _assert_eqp(run_b / "mpa_sc1_eqp1.dat", source_b / "mpa_sc1_eqp1.dat",
@@ -105,7 +117,6 @@ def test_b_mpa_one_update_matches_references(core_fixtures):
     for name in ("eqp0_iter0000.dat", "eqp0_iter0001.dat",
                  "eqp1_iter0000.dat", "eqp1_iter0001.dat"):
         _assert_eqp(run_b / name, source_b / name, atol=EQP_ATOL_EV)
-    report = (run_b / "mpa_sc1.out").read_text(encoding="utf-8")
     residuals = [float(value) for value in re.findall(
         r"SC iteration: call=\d+ role=linear .*?max\|dE\|=([0-9.e+-]+)",
         report,
