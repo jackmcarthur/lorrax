@@ -1,0 +1,27 @@
+{
+  "a": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/05_P_static_P4_copied_zeta",
+  "b": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/14_P_static_P4_restore_resident",
+  "eqp": {
+    "eqp0.dat": {
+      "rc": 0,
+      "output": "A            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/05_P_static_P4_copied_zeta/eqp0.dat\nB            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/14_P_static_P4_restore_resident/eqp0.dat\nrows         210 over 7 k-points\nidentical    210/210 E_qp rows agree to the printed digit\nmax|dE_DFT|  0.000 ueV   (must be 0 for two arms of one deck)\nmax|dE_qp|   0.000 ueV   at None\nVERDICT      PASS  (tolerance 0.0 ueV)\n"
+    },
+    "eqp1.dat": {
+      "rc": 0,
+      "output": "A            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/05_P_static_P4_copied_zeta/eqp1.dat\nB            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/14_P_static_P4_restore_resident/eqp1.dat\nrows         210 over 7 k-points\nidentical    210/210 E_qp rows agree to the printed digit\nmax|dE_DFT|  0.000 ueV   (must be 0 for two arms of one deck)\nmax|dE_qp|   0.000 ueV   at None\nVERDICT      PASS  (tolerance 0.0 ueV)\n"
+    }
+  },
+  "sectors": {
+    "shape_a": [
+      210,
+      7
+    ],
+    "shape_b": [
+      210,
+      7
+    ],
+    "exact": true,
+    "max_abs": 0.0
+  },
+  "passed": true
+}

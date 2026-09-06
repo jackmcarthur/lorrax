@@ -1,0 +1,27 @@
+{
+  "a": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/02_P_static_P4_fresh",
+  "b": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/04_F_static_P4_fresh_compatible",
+  "eqp": {
+    "eqp0.dat": {
+      "rc": 1,
+      "output": "A            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/02_P_static_P4_fresh/eqp0.dat\nB            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/04_F_static_P4_fresh_compatible/eqp0.dat\nrows         210 over 7 k-points\nidentical    12/210 E_qp rows agree to the printed digit\nmax|dE_DFT|  0.000 ueV   (must be 0 for two arms of one deck)\nmax|dE_qp|   4.470 ueV   at (3, 1, 27, 0.444502224, 0.444506694)\nVERDICT      FAIL  (tolerance 0.0 ueV)\n"
+    },
+    "eqp1.dat": {
+      "rc": 1,
+      "output": "A            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/02_P_static_P4_fresh/eqp1.dat\nB            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/04_F_static_P4_fresh_compatible/eqp1.dat\nrows         210 over 7 k-points\nidentical    12/210 E_qp rows agree to the printed digit\nmax|dE_DFT|  0.000 ueV   (must be 0 for two arms of one deck)\nmax|dE_qp|   4.470 ueV   at (3, 1, 27, 0.444502224, 0.444506694)\nVERDICT      FAIL  (tolerance 0.0 ueV)\n"
+    }
+  },
+  "sectors": {
+    "shape_a": [
+      210,
+      7
+    ],
+    "shape_b": [
+      210,
+      7
+    ],
+    "exact": false,
+    "max_abs": 3.9999999999996635e-06
+  },
+  "passed": false
+}
