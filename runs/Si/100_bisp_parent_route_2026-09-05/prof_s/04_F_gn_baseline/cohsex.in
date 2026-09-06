@@ -1,0 +1,30 @@
+[cohsex]
+wfn_file = /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/02_preprocess/WFN.h5
+kin_ion_file = /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/02_preprocess/kin_ion.h5
+centroids_file = /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/02_preprocess/centroids_charge.txt
+centroids_file_current = /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/02_preprocess/centroids_current.txt
+bispinor = true
+bispinor_gw = bare_transverse
+sys_dim = 3
+nval = 8
+ncond = 24
+number_bands = 32
+compute_mode = gn_ppm
+head_correction = off
+low_mem_bands = true
+linalg = local
+restart = false
+fermi_reference = midgap
+memory_per_device_gb = 30
+# Main de8dcfbc predates deterministic reduction_steps.
+# Uses its supported 120-second reduction default; lane arm uses steps=0.
+use_band_extrapolation = false
+zeta_rcond = 1e-10
+qp_solver = one_shot_dft
+screening_method = minimax
+do_screened = true
+sigma_omega_min_ev = -4.0
+sigma_omega_max_ev = 4.0
+sigma_omega_step_ev = 1.0
+sigma_regularization_ev = 0.25
+sigma_diag_file = sigma_diag.dat

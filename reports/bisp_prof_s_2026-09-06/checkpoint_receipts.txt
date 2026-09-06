@@ -1,0 +1,90 @@
+
+### /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/66_parent_cohsex_binding
+  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR="" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory.
+  Sigma other                 47.41      63.82%
+  total run                   74.29     100.00%
+[lx] step lx-Xg4-211207-2283249-4810 exit 0 in 77 s
+tmp children: zeta_q_mu3.h5, zeta_q.h5, zeta_q_mu2.h5, isdf_tensors_480.h5, zeta_q_mu1.h5, v_q_bispinor.h5
+
+### /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/49_fixed_main_cohsex
+  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR="" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory.
+  Sigma other                 11.35      20.16%
+  total run                   56.32     100.00%
+[lx] step lx-Xg4-200631-1862494-2046 exit 0 in 61 s
+tmp children: zeta_q_mu3.h5, zeta_q.h5, zeta_q_mu2.h5, isdf_tensors_480.h5, zeta_q_mu1.h5, v_q_bispinor.h5
+
+### /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/56_parent_gn
+  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR="" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory.
+Started Sigma tau sweep at 20:38:20.
+Finished Sigma tau sweep at 20:38:23.  Elapsed: 3 s.
+  Sigma rule plan              6.14       6.71%
+  Sigma tau sweep              4.01       4.38%
+  Sigma other                 55.90      61.12%
+  total run                   91.46     100.00%
+  WARNING sigma quadrature cache lookup failed; rules will be rebuilt in memory: path=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/56_parent_gn/tmp/sigma_quadrature_rules error=FileNotFoundError: [Errno 2] No such file or directory: '/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/56_parent_gn/tmp/sigma_quadrature_rules'
+[lx] step lx-Xg4-203651-2042362-1297 exit 0 in 98 s
+tmp children: zeta_q_mu3.h5, zeta_q.h5, sigma_quadrature_rules, zeta_q_mu2.h5, mpa, isdf_tensors_480.h5, zeta_q_mu1.h5, v_q_bispinor.h5
+
+### /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/48_fixed_main_gn
+  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR="" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory.
+Started Sigma tau sweep at 20:05:55.
+Finished Sigma tau sweep at 20:05:58.  Elapsed: 3 s.
+  Sigma rule plan              6.32       8.21%
+  Sigma tau sweep              4.84       6.29%
+  Sigma other                 20.96      27.22%
+  total run                   76.97     100.00%
+  WARNING sigma quadrature cache lookup failed; rules will be rebuilt in memory: path=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/48_fixed_main_gn/tmp/sigma_quadrature_rules error=FileNotFoundError: [Errno 2] No such file or directory: '/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/48_fixed_main_gn/tmp/sigma_quadrature_rules'
+[lx] step lx-Xg4-200444-1853904-8909 exit 0 in 80 s
+tmp children: zeta_q_mu3.h5, zeta_q.h5, sigma_quadrature_rules, zeta_q_mu2.h5, mpa, isdf_tensors_480.h5, zeta_q_mu1.h5, v_q_bispinor.h5
+
+### /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/73_parent_full_static
+  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR="" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory.
+  Sigma other                150.14      75.58%
+  total run                  198.64     100.00%
+[lx] step lx-Xg4-203505-2030774-8671 exit 0 in 202 s
+tmp children: zeta_q_mu3.h5, zeta_q.h5, zeta_q_mu2.h5, zeta_q_mu1.h5, isdf_tensors_192.h5, v_q_bispinor.h5
+
+### /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/11_fixed_main_full_static
+  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR="" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory.
+  Sigma other                 18.40      25.93%
+  total run                   70.98     100.00%
+[lx] step lx-Xg4-200418-1851221-8871 exit 0 in 78 s
+tmp children: zeta_q_mu3.h5, zeta_q.h5, zeta_q_mu2.h5, zeta_q_mu1.h5, isdf_tensors_192.h5, v_q_bispinor.h5
+
+### /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/74_parent_packed_bare
+  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR="" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory.
+  Sigma other                149.95      82.09%
+  total run                  182.66     100.00%
+[lx] step lx-Xg4-204419-2081026-7329 exit 0 in 188 s
+tmp children: zeta_q_mu3.h5, zeta_q.h5, zeta_q_mu2.h5, zeta_q_mu1.h5, isdf_tensors_192.h5, v_q_bispinor.h5
+
+### /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/12_fixed_main_packed_bare
+  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR="" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory.
+  Sigma other                 18.58      21.81%
+  total run                   85.17     100.00%
+[lx] step lx-Xg4-200532-1857555-6507 exit 0 in 93 s
+tmp children: zeta_q_mu3.h5, zeta_q.h5, zeta_q_mu2.h5, zeta_q_mu1.h5, isdf_tensors_192.h5, v_q_bispinor.h5
+
+### /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/80_parent_dynamic_eps5
+  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR="" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory.
+Started Sigma tau sweep at 21:13:01.
+Finished Sigma tau sweep at 21:13:02.  Elapsed: 1 s.
+  Sigma rule plan             77.76      22.94%
+  Sigma tau sweep              3.14       0.93%
+  Sigma other                185.40      54.69%
+  total run                  338.98     100.00%
+  WARNING sigma quadrature cache lookup failed; rules will be rebuilt in memory: path=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/80_parent_dynamic_eps5/tmp/sigma_quadrature_rules error=FileNotFoundError: [Errno 2] No such file or directory: '/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/80_parent_dynamic_eps5/tmp/sigma_quadrature_rules'
+[lx] step lx-Xg4-210723-2245574-4379 exit 0 in 345 s
+tmp children: zeta_q_mu3.h5, zeta_q.h5, sigma_quadrature_rules, zeta_q_mu2.h5, mpa, zeta_q_mu1.h5, isdf_tensors_192.h5, v_q_bispinor.h5
+
+### /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/79_fixed_main_dynamic_eps5
+  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR="" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory.
+Started Sigma tau sweep at 21:10:10.
+Finished Sigma tau sweep at 21:10:12.  Elapsed: 1 s.
+  Sigma rule plan             84.57      50.99%
+  Sigma tau sweep              2.65       1.60%
+  Sigma other                 27.46      16.55%
+  total run                  165.86     100.00%
+  WARNING sigma quadrature cache lookup failed; rules will be rebuilt in memory: path=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/79_fixed_main_dynamic_eps5/tmp/sigma_quadrature_rules error=FileNotFoundError: [Errno 2] No such file or directory: '/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/79_fixed_main_dynamic_eps5/tmp/sigma_quadrature_rules'
+[lx] step lx-Xg4-210725-2246074-4013 exit 0 in 172 s
+tmp children: zeta_q_mu3.h5, zeta_q.h5, sigma_quadrature_rules, zeta_q_mu2.h5, mpa, zeta_q_mu1.h5, isdf_tensors_192.h5, v_q_bispinor.h5
