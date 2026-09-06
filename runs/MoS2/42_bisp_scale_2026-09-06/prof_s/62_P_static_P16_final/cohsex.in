@@ -1,0 +1,26 @@
+[cohsex]
+wfn_file = WFN.h5
+kin_ion_file = kin_ion.h5
+centroids_file = centroids_charge.txt
+centroids_file_current = centroids_current.txt
+bispinor = true
+bispinor_gw = full_static_cohsex
+sys_dim = 2
+nval = 4
+ncond = 4
+number_bands = 80
+compute_mode = cohsex
+head_correction = full
+low_mem_bands = true
+linalg = distributed
+restart = false
+fermi_reference = midgap
+memory_per_device_gb = 30
+sigma_quadrature_reduction_steps = 0
+use_band_extrapolation = false
+qp_solver = one_shot_dft
+screening_method = minimax
+do_screened = true
+sigma_diag_file = sigma_diag.dat
+sigma_freq_debug_output = false
+sigma_quadrature_eps = 1e-5

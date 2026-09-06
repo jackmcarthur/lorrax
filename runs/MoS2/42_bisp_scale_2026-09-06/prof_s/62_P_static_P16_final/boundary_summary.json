@@ -1,0 +1,18 @@
+{
+  "scope": "synchronized host boundaries; outer stage is nested, never sum it with children",
+  "groups": [
+    {
+      "label": "_make_photon_static_class_kernel",
+      "term": "",
+      "head": false,
+      "calls": 12,
+      "compiles": 4,
+      "compile_s": 1.6968676469987258,
+      "host_s": 4.426419223978883,
+      "cold_calls": 4,
+      "cold_median_ms": 689.8437249910785,
+      "warm_calls": 8,
+      "warm_median_ms": 189.61686399416067
+    }
+  ]
+}

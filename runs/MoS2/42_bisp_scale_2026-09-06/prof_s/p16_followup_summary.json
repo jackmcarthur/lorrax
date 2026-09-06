@@ -1,0 +1,123 @@
+[
+  {
+    "run": "62_P_static_P16_final",
+    "step": "[lx] step lx-Xg4-152905-1423784-7552 exit 0 in 81 s",
+    "events": 474,
+    "compiler_backend_seconds": 28.666695887426613,
+    "identity": "PASS: 210 complete printed state rows identical, including sigCC/sigTT/sigCT.",
+    "timing": {
+      "total_wall_seconds": 77.12,
+      "sigma_wall_seconds": 17.26
+    },
+    "warm_units": {
+      "scope": "synchronized host boundaries; outer stage is nested, never sum it with children",
+      "groups": [
+        {
+          "label": "_make_photon_static_class_kernel",
+          "term": "",
+          "head": false,
+          "calls": 12,
+          "compiles": 4,
+          "compile_s": 1.6968676469987258,
+          "host_s": 4.426419223978883,
+          "cold_calls": 4,
+          "cold_median_ms": 689.8437249910785,
+          "warm_calls": 8,
+          "warm_median_ms": 189.61686399416067
+        }
+      ]
+    }
+  },
+  {
+    "run": "64_P_dynamic_P16_final",
+    "step": "[lx] step lx-Xg4-153139-1509986-9665 exit 0 in 124 s",
+    "events": 675,
+    "compiler_backend_seconds": 42.26998026104411,
+    "identity": "PASS: 210 complete printed state rows identical, including sigCC/sigTT/sigCT.",
+    "timing": {
+      "batch": 4,
+      "executor_census": "production_progress_exact_tau_total",
+      "launcher_log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/64_P_dynamic_P16_final/evidence/science_lx_run.log",
+      "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/64_P_dynamic_P16_final/gwjax.out",
+      "logical_windows": null,
+      "plan": "box",
+      "planned_distinct_tau": null,
+      "planned_window_tau_pairs": null,
+      "pole_batches": 1,
+      "poles": 1,
+      "seconds_per_tau_dispatch": 0.1708695652173913,
+      "sigma_other_seconds": 27.11,
+      "sigma_rule_plan_seconds": 0.13,
+      "sigma_tau_sweep_seconds": 19.65,
+      "sigma_wall_seconds": 46.89,
+      "sweeps": null,
+      "tau": 115,
+      "total_wall_seconds": 118.25,
+      "window_census_status": "not emitted by minimal production reporter; requires an artifact-bound planner receipt"
+    },
+    "warm_units": {
+      "scope": "synchronized host boundaries; outer stage is nested, never sum it with children",
+      "groups": [
+        {
+          "label": "sigma_tau",
+          "term": "",
+          "head": false,
+          "calls": 115,
+          "compiles": 1,
+          "compile_s": 0.03830771701177582,
+          "host_s": 16.664749114279402,
+          "cold_calls": 1,
+          "cold_median_ms": 207.9772110155318,
+          "warm_calls": 114,
+          "warm_median_ms": 135.4870515060611
+        }
+      ]
+    }
+  },
+  {
+    "run": "65_F_dynamic_P16_final",
+    "step": "[lx] step lx-Xg4-153519-1519234-9727 exit 0 in 145 s",
+    "events": 825,
+    "compiler_backend_seconds": 43.57876023094286,
+    "identity": "PASS: 210 complete printed state rows identical, including sigCC/sigTT/sigCT.",
+    "timing": {
+      "batch": 4,
+      "executor_census": "production_progress_exact_tau_total",
+      "launcher_log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/65_F_dynamic_P16_final/evidence/science_lx_run.log",
+      "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/65_F_dynamic_P16_final/gwjax.out",
+      "logical_windows": null,
+      "plan": "box",
+      "planned_distinct_tau": null,
+      "planned_window_tau_pairs": null,
+      "pole_batches": 1,
+      "poles": 1,
+      "seconds_per_tau_dispatch": 0.22243478260869565,
+      "sigma_other_seconds": 41.99,
+      "sigma_rule_plan_seconds": 0.16,
+      "sigma_tau_sweep_seconds": 25.58,
+      "sigma_wall_seconds": 67.73,
+      "sweeps": null,
+      "tau": 115,
+      "total_wall_seconds": 141.07,
+      "window_census_status": "not emitted by minimal production reporter; requires an artifact-bound planner receipt"
+    },
+    "warm_units": {
+      "scope": "synchronized host boundaries; outer stage is nested, never sum it with children",
+      "groups": [
+        {
+          "label": "sigma_tau",
+          "term": "",
+          "head": false,
+          "calls": 115,
+          "compiles": 1,
+          "compile_s": 0.03722909698262811,
+          "host_s": 22.655605016771005,
+          "cold_calls": 1,
+          "cold_median_ms": 256.91147000179626,
+          "warm_calls": 114,
+          "warm_median_ms": 196.52676800615154
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,11 @@
+run_id: 67_F_static_P16_timing_fixed
+system: MoS2
+pipeline: gwjax
+platform: perlmutter
+variant_of: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/52_F_static_P16
+reused: copied zeta and rule caches; immutable input links
+pool: 57988457
+geometry: P16 one rank per GPU
+steps:
+  sigma:
+    state: pending

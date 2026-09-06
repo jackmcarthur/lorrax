@@ -1,0 +1,42 @@
+[
+  {
+    "extents": [
+      608,
+      608
+    ],
+    "calls": 3,
+    "cold_median_ms": 717.911504994845,
+    "warm_median_ms": 281.4028205029899,
+    "compiler_seconds": 0.4218097899865825
+  },
+  {
+    "extents": [
+      608,
+      224
+    ],
+    "calls": 3,
+    "cold_median_ms": 661.775944987312,
+    "warm_median_ms": 210.27466299710795,
+    "compiler_seconds": 0.4415620600047987
+  },
+  {
+    "extents": [
+      224,
+      608
+    ],
+    "calls": 3,
+    "cold_median_ms": 796.702342981007,
+    "warm_median_ms": 138.15317099215463,
+    "compiler_seconds": 0.45041074001346715
+  },
+  {
+    "extents": [
+      224,
+      224
+    ],
+    "calls": 3,
+    "cold_median_ms": 646.9465219997801,
+    "warm_median_ms": 171.7108000157168,
+    "compiler_seconds": 0.3830850569938775
+  }
+]

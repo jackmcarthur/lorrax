@@ -1,0 +1,30 @@
+[
+  {
+    "shape_class": "CC",
+    "source_blocks": 1,
+    "parent_stack_bytes_per_rank": 10080000,
+    "restored_stack_bytes_per_rank": 51840000,
+    "rule": "complex128; replicated block/q axes and centroid axes distributed over all P=4 ranks"
+  },
+  {
+    "shape_class": "CT",
+    "source_blocks": 3,
+    "parent_stack_bytes_per_rank": 10281600,
+    "restored_stack_bytes_per_rank": 52876800,
+    "rule": "complex128; replicated block/q axes and centroid axes distributed over all P=4 ranks"
+  },
+  {
+    "shape_class": "TC",
+    "source_blocks": 3,
+    "parent_stack_bytes_per_rank": 10281600,
+    "restored_stack_bytes_per_rank": 52876800,
+    "rule": "complex128; replicated block/q axes and centroid axes distributed over all P=4 ranks"
+  },
+  {
+    "shape_class": "TT",
+    "source_blocks": 9,
+    "parent_stack_bytes_per_rank": 10487232,
+    "restored_stack_bytes_per_rank": 53934336,
+    "rule": "complex128; replicated block/q axes and centroid axes distributed over all P=4 ranks"
+  }
+]

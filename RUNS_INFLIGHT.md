@@ -10,4 +10,6 @@ This register is worktree-local under the explicit modify-only-this-worktree ins
 
 | BISP-PROF-S phase3 | perf/bisp-prof-s-2026-09-06 | COMPLETE: source fixes through b0b4a205 pushed; exact P4/P16 gates, compile-event parity, one-G native capture, coupled-current zeta gate. Finished-G transpose rejected; compiler-seconds and P16 static whole-run targets remain unmet. Pools57988457/57992641; no steps active | runs/MoS2/42_bisp_scale_2026-09-06/prof_s/; reports/bisp_prof_s_2026-09-06/report.md |
 
-| BISP-PROF-S follow-up | perf/bisp-prof-s-2026-09-06 | ACTIVE: compiler seconds, Sigma copies, P16; own pool 57992641 and campaign 57988457; worktree wt_bisp_prof_s_codex_20260906 |
+| BISP-PROF-S follow-up | perf/bisp-prof-s-2026-09-06 | CLOSED: see final COMPLETE row; compiler seconds, Sigma copies, P16; own pool 57992641 and campaign 57988457; worktree wt_bisp_prof_s_codex_20260906 |
+
+| BISP-PROF-S final close-out | perf/bisp-prof-s-2026-09-06, wt_bisp_prof_s_codex_20260906 | COMPLETE on owner instruction: fixes integrated on feature tip d4fc26eb; final P16 dynamic identity passed, static retry canceled before launch; no active steps; own pool57992641 released at close, campaign57988457 retained. |

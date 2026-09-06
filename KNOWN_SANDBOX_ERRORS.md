@@ -44,3 +44,7 @@ The authorized named fallback `LX_ALLOC_MATCH=lx-alloc-jackm-BISP-PROF-S LX_ALLO
 - 2026-09-06 PROF-S: INVARIANTS.md is sandbox-owned, absent from source worktree; read sandbox root file. Rebase onto b1d8b8f1 requires restoring lane evidence omitted by orchestrator cherry-picks.
 
 - PROF-S run60: instrumentation preparation used a worktree-relative path while cwd was the run directory and failed; detached gate launched without HLO/warm wrapper. Receipts and identity valid, isolated warm time unavailable.
+
+- 2026-09-06 PROF-S: `lx status --jid 57988457` is rejected by lx_pool; --jid is a run flag, not a status selector. No allocation or step affected.
+
+- 2026-09-06 PROF-S run63 P16 fixed-main: timing wrapper treated present-but-None green_parent as a carrier, causing AttributeError before the first static block. Scientific source unchanged; retry in fresh67 uses green_parent or the full-k bundle.
