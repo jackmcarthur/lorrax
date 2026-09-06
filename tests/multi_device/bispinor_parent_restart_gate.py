@@ -23,19 +23,28 @@ def main():
     parser = argparse.ArgumentParser()
     for name in ("wfn", "charge", "current"):
         parser.add_argument("--" + name, required=True)
+    parser.add_argument("--input")
+    parser.add_argument("--bands", type=int, default=8)
     args = parser.parse_args()
     mesh = runtime.mesh
-    assert mesh.size == 4
+    assert mesh.size in (4, 16)
     wfn = WfnLoader(args.wfn, mesh=mesh)
     sym = wfn.symmetry()
     bases, packed, disk = [], [], []
-    for path in (args.charge, args.current):
+    incoming = (None if args.input is None else
+                read_restart_state_from_h5(args.input, mesh, low_mem_bands=True))
+    for family, path in enumerate((args.charge, args.current)):
         _, points, count = load_centroids(path, wfn.fft_grid)
         basis = PackedCentroidBasis.build(points, sym, wfn.fft_grid, mesh)
-        meta = Meta.from_system(wfn, sym, 8, 0, 8, count, True, mesh_xy=mesh, mu_basis=basis)
-        faces = parent_faces(*load_centroids_band_chunked(
-            wfn, sym, meta, points, True, mesh, band_range=(0, 8),
-            band_chunk_size=4, k_domain="ibz", bispinor_lift="raw"), mesh_xy=mesh)
+        if incoming is None:
+            meta = Meta.from_system(wfn, sym, 8, 0, args.bands, count, True,
+                                    mesh_xy=mesh, mu_basis=basis)
+            faces = parent_faces(*load_centroids_band_chunked(
+                wfn, sym, meta, points, True, mesh, band_range=(0, args.bands),
+                band_chunk_size=args.bands, k_domain="ibz", bispinor_lift="raw"), mesh_xy=mesh)
+        else:
+            source = incoming[13:15] if family == 0 else incoming[16:18]
+            faces = tuple(basis.pack_axis(value, axis) for value, axis in zip(source, (3, 2)))
         bases.append(basis)
         packed.append(faces)
         disk.append(tuple(basis.unpack_axis(face, axis) for face, axis in zip(faces, (3, 2))))
