@@ -1233,6 +1233,8 @@ def star_stability(keep_idx, sym_perm) -> StarStability:
     """
     keep = np.unique(np.asarray(keep_idx, dtype=np.int64))
     perm = np.asarray(sym_perm, dtype=np.int64)
+    if np.any(perm < 0):
+        raise ValueError("downfold requires every centroid action; unavailable rows are unsupported")
     if perm.ndim != 2:
         raise ValueError(
             f"downfold.star_stability: sym_perm must be (n_sym, n_rmu); got "
@@ -1286,6 +1288,8 @@ def orbit_complete_keep(keep_idx, sym_perm) -> np.ndarray:
     the cells that measure what completion would have cost.
     """
     perm = np.asarray(sym_perm, dtype=np.int64)
+    if np.any(perm < 0):
+        raise ValueError("downfold requires every centroid action; unavailable rows are unsupported")
     cur = set(int(v) for v in np.asarray(keep_idx, dtype=np.int64))
     while True:
         idx = np.fromiter(cur, dtype=np.int64, count=len(cur))

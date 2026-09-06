@@ -420,6 +420,7 @@ def test_selected_qgrid_resolution_names_measured_spatial_subset():
     assert res.use_ibz
     assert res.n_sym_spatial == 2
     assert res.verdict.n_sym == 1
+    assert "available centroid actions only" in res.announcement()
     assert "spatial_rows=[0]" in res.verdict.as_attr()
     np.testing.assert_array_equal(res.sym_perm, [[0, 1], [-1, -1], [0, 1], [-1, -1]])
     refused = resolve_qgrid_symmetry(

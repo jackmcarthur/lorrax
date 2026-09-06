@@ -103,11 +103,7 @@ class PackedCentroidBasis:
     @classmethod
     def build(cls, centroid_indices, sym, fft_grid, mesh_xy: Mesh, *,
               identity: bool = False) -> "PackedCentroidBasis":
-        """Orbits of ``centroid_indices`` under ``sym``'s spatial operations
-        (time reversal extended).  A set that is not orbit-closed, a trivial
-        group, or ``identity=True`` gives the identity layout: the packed
-        order IS the canonical suffix-padded order and every conversion is a
-        no-op."""
+        """Pack orbits of available centroid actions without changing the physical group."""
         idx = np.array(jax.device_get(centroid_indices), dtype=np.int32,
                        order="C", copy=True)
         idx.setflags(write=False)
@@ -121,8 +117,10 @@ class PackedCentroidBasis:
                 perm, _ = centroid_source_map_and_wrap(
                     idx, np.asarray(sym.sym_matrices)[:n_spatial],
                     np.asarray(sym.translations)[:n_spatial],
-                    np.asarray(fft_grid, dtype=np.int32), extend_trs=True)
-                groups = permutation_orbit_labels(perm)
+                    np.asarray(fft_grid, dtype=np.int32), extend_trs=True, validate=False)
+                available = np.all(np.sort(perm, axis=1) == np.arange(idx.shape[0]), axis=1)
+                if np.any(available):
+                    groups = permutation_orbit_labels(perm[available])
             except (ValueError, RuntimeError):
                 # not orbit-closed: nothing to pack, keep the canonical order
                 groups = None

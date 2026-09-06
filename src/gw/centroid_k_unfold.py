@@ -92,8 +92,8 @@ class CentroidKUnfoldPlan:
         manual-mode local unfold gathers with.  Same reduction
         :func:`unfold_spin_centroid_operator` performs for ``axis_local``.
         """
-        return (self.sym_perm % int(self.layout.axis_shard_size)).astype(
-            np.int32)
+        return np.where(self.sym_perm < 0, -1,
+                        self.sym_perm % int(self.layout.axis_shard_size)).astype(np.int32)
 
     def wavefunction_unfold_tables(self) -> dict:
         """Host tables for ``symmetry_maps.unfold_wavefunction_local`` on a
@@ -240,16 +240,18 @@ def build_centroid_k_unfold_plan(
         np.asarray(sym.sym_matrices)[:n_spatial],
         np.asarray(sym.translations)[:n_spatial],
         np.asarray(fft_grid, dtype=np.int32),
-        extend_trs=True,
+        extend_trs=True, required_rows=np.asarray(sym.sym_idx_k),
     )
-    groups = permutation_orbit_labels(sym_perm)
+    available = np.all(sym_perm >= 0, axis=1)
+    groups = permutation_orbit_labels(sym_perm[available])
     if layout is None:
         layout = build_square_grouped_shard_layout(groups, shape)
     elif int(layout.axis.n_logical) != int(sym_perm.shape[-1]):
         raise ValueError(
             "build_centroid_k_unfold_plan: the run's centroid layout holds "
             f"{layout.axis.n_logical} centroids, the table {sym_perm.shape[-1]}.")
-    packed_perm = layout.axis.pack_permutations_host(sym_perm)
+    packed_perm = np.full((sym_perm.shape[0], layout.axis.n_padded), -1, dtype=np.int32)
+    packed_perm[available] = layout.axis.pack_permutations_host(sym_perm[available])
     packed_wraps = layout.axis.pack_host(wraps, axis=1, fill_value=0)
 
     irr = np.asarray(sym.irr_idx_k, dtype=np.int32)

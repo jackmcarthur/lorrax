@@ -287,6 +287,7 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
                 tail = np.broadcast_to(
                     np.arange(n_rmu_log, n_rmu_pad, dtype=sym_perm.dtype),
                     (sym_perm.shape[0], n_rmu_pad - n_rmu_log))
+                tail = np.where(np.all(sym_perm == -1, axis=1)[:, None], -1, tail)
                 sym_perm = np.concatenate([sym_perm, tail], axis=-1)
                 L_table = np.concatenate(
                     [L_table,

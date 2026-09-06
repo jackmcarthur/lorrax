@@ -1559,6 +1559,12 @@ class QgridSymmetryResolution:
         :attr:`announce_key`.
         """
         if self.use_ibz:
+            missing = np.flatnonzero(np.all(self.sym_perm == -1, axis=1))
+            if missing.size:
+                return (f"  q-grid centroid actions [{self.context}]: required transport is closed; "
+                        f"unavailable canonical rows {missing.tolist()}. "
+                        "Covariance diagnostics cover available centroid actions only; "
+                        f"the physical symmetry group is unchanged. {self.verdict.as_attr()}")
             return None
         where = self.context or "q-grid symmetry reduction"
         return (

@@ -1823,3 +1823,12 @@ def test_downfold_is_mesh_invariant(ndev):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "worker":
         print(json.dumps(_mesh_invariance_payload()))
+
+
+def test_offline_downfold_refuses_unavailable_centroid_actions():
+    """Offline full-group orbit completion must never add the -1 sentinel to its keep set."""
+    perm = np.array([[0, 1], [-1, -1]])
+    with pytest.raises(ValueError, match="unavailable rows are unsupported"):
+        downfold.orbit_complete_keep(np.array([0]), perm)
+    with pytest.raises(ValueError, match="unavailable rows are unsupported"):
+        downfold.child_unfold_tables(np.array([0]), perm, np.zeros((2, 2, 3)))

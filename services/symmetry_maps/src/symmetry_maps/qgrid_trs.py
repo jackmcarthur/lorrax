@@ -434,6 +434,8 @@ def little_group_covariance_residual(
         raise ValueError(
             "little_group_covariance_residual: centroid source/wrap tables "
             "do not cover every active symmetry row.")
+    if np.any(np.sort(perm[active], axis=1) != np.arange(perm.shape[1])):
+        raise ValueError("little_group_covariance_residual: requested centroid action is unavailable or not bijective")
     S = S_all[active]
 
     if int(V_ibz.shape[0]) != int(reps.size):
@@ -581,14 +583,17 @@ class QgridTrsPolicy:
         TR plus those rows generates the antiunitary half, and the separate
         fixed-q statistic measures the pure-TR residual.  When global TR is
         broken, the sweep instead uses the exact schema-authorized mixed
-        unitary/antiunitary row set, including conjugation.
+        unitary/antiunitary row set, including conjugation. Only available
+        centroid actions enter this diagnostic; the closure announcement
+        identifies partial-group coverage, without changing the physical group.
         """
         kwargs.setdefault("kgrid", self.kgrid)
         kwargs.setdefault("n_sym_spatial", self.n_sym_spatial)
         covariance_rows = (
             np.arange(self.n_sym_spatial, dtype=np.int32)
             if self.trs_measured else self._active_symmetry_rows)
-        kwargs.setdefault("active_symmetry_rows", covariance_rows)
+        available = np.all(np.asarray(kwargs["sym_perm"]) >= 0, axis=1)
+        kwargs.setdefault("active_symmetry_rows", covariance_rows[available[covariance_rows]])
         return little_group_covariance_residual(V_ibz, **kwargs)
 
     def announcement(self) -> str:

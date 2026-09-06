@@ -398,3 +398,23 @@ def test_non_rpa_consumer_refuses_before_parent_loading():
     with pytest.raises(ValueError, match="parent_screening_diagrams.*w_bse"):
         _prepare_parent_wavefunction_plan(
             cfg, None, None, None, sym=None, centroid_indices=None, mesh_xy=None)
+
+
+def test_parent_plan_requires_only_consumed_canonical_actions():
+    """An unused mirror stays unavailable while canonical TRS row2 remains row2."""
+    mesh = _mesh_2x2()
+    sym = _symmetry_fixture()
+    sym.sym_matrices = np.array([np.eye(3, dtype=int), np.diag([1, 1, -1])])
+    sym.sym_idx_k = np.array([0, 2, 0], dtype=np.int32)
+    centroids = np.array([[0, 0, 0], [1, 0, 1]], dtype=np.int32)
+    basis = PackedCentroidBasis.build(centroids, sym, (4, 4, 4), mesh)
+    plan = build_centroid_k_unfold_plan(
+        sym, centroids, (4, 4, 4), mesh, nspinor=4, layout=basis.layout)
+    assert plan.n_sym_spatial == 2
+    np.testing.assert_array_equal(plan.sym_idx, [0, 2, 0])
+    assert np.all(plan.sym_perm[[1, 3]] == -1)
+    assert np.all(plan.centroid_local_perm[[1, 3]] == -1)
+    sym.sym_idx_k = np.array([0, 3, 0], dtype=np.int32)
+    with pytest.raises(RuntimeError, match="closure"):
+        build_centroid_k_unfold_plan(
+            sym, centroids, (4, 4, 4), mesh, nspinor=4, layout=basis.layout)

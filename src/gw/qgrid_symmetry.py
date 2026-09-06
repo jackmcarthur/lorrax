@@ -122,6 +122,7 @@ def resolve_qgrid_symmetry_tables(
         tnp=tnp[:n_tran],
         fft_grid=np.asarray(fft_grid, dtype=np.int32),
         extend_trs=True,
+        required_rows=np.asarray(sym.sym_idx_q),
         context=context,
     )
     msg = res.announcement() if announce_fallback else None
