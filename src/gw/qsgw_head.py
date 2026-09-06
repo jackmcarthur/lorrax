@@ -1402,13 +1402,10 @@ def _head_wings_sharded_face(
     body_bra_wfns=None,
     body_ket_wfns=None,
 ):
-    """Stream parent children and pad response tables to the canonical face band extent."""
+    """Batch parent children and pad response tables to the canonical face band extent."""
     if (getattr(wfns, "layout", None) == "face" and wfns.psi_mun is None
             and getattr(wfns, "green_parent", None) is not None):
-        # Parents-only storage: the wings are a sum over k, so stream the
-        # children of one raw parent at a time (w_isdf.iter_parent_children_
-        # faces) and accumulate; no full-k face is ever resident.  The
-        # velocity has already been restored by the typed polar action.
+        # The linear-size child faces share one head-wing contraction.
         if body_bra_wfns is not None or body_ket_wfns is not None:
             raise ValueError(
                 "head_wings_sharded(layout='face'): separately supplied "
@@ -1421,7 +1418,7 @@ def _head_wings_sharded_face(
                  else jnp.asarray(surface_weight_kn, dtype=jnp.float64))
         Y_x = Z_y = None
         for rows, child in iter_parent_children_faces(
-                wfns.green_parent, mesh, slices=wfns.slices):
+                wfns.green_parent, mesh, slices=wfns.slices, by_parent=False):
             r = jnp.asarray(rows, dtype=jnp.int32)
             y, z = _head_wings_sharded_face(
                 jnp.take(v_all, r, axis=1), child, jnp.take(e_all, r, axis=0),
@@ -1633,7 +1630,7 @@ def _static_head_wings_sharded_face(
         from gw.w_isdf import iter_parent_children_faces
         left = right = None
         for rows, child in iter_parent_children_faces(
-                wfns.green_parent, mesh, slices=wfns.slices):
+                wfns.green_parent, mesh, slices=wfns.slices, by_parent=False):
             r = jnp.asarray(rows, dtype=jnp.int32)
             a, b = _static_head_wings_sharded_face(
                 child, jnp.take(surface, r, axis=0), mesh=mesh,
