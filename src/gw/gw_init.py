@@ -4260,6 +4260,27 @@ def prepare_isdf_and_wavefunctions(
 				       f"n_rmu_T={int(rs.n_rmu_transverse_disk)} "
 				       f"transverse centroids)")
 
+		# Recompute the head from canonical one-leg factors, never file padding.
+		if uses_coupled_photon_head(cfg):
+			from file_io.slab_io import SlabIO
+			from jax.sharding import PartitionSpec
+			head_path = os.path.join(tmp_dir, "v_q_bispinor.h5")
+			with h5py.File(head_path, "r") as header:
+				for channel in range(4):
+					basis = meta.mu_basis if channel == 0 else basis_T
+					name = f"photon_g0_vectors_{channel}"
+					if name not in header or header[name].shape != (1, basis.n_logical):
+						raise ValueError(
+							"Packed photon restart requires canonical Gamma vectors; "
+							"rerun restart=false to write the current schema.")
+			with SlabIO(head_path, mode="r", mesh=mesh_xy) as head_io:
+				photon_g0_vectors = tuple(
+					_to_run_order(head_io.read_slab(
+						f"photon_g0_vectors_{channel}",
+						shape=(1, basis.n_canonical),
+						partition_spec=PartitionSpec(None, "x"), dtype=jnp.complex128),
+						(1,), basis)
+					for channel, basis in enumerate((meta.mu_basis, basis_T, basis_T, basis_T)))
 
 	if green_parent_carrier is not None:
 		wfns = replace(wfns, green_parent=green_parent_carrier)

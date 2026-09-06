@@ -601,6 +601,16 @@ def compute_V_q_bispinor_g_flat_to_h5(
         g0_by_channel[1:] = [tt_g0[i] for i in range(3)]
     del tt_g0
 
+    if any(vector is None for vector in g0_by_channel):
+        raise RuntimeError("bispinor literal-G=0 projection did not produce four channels")
+    with SlabIO(output_h5_path, mode="a", mesh=mesh_xy) as head_io:
+        for channel, vector in enumerate(g0_by_channel):
+            name = f"photon_g0_vectors_{channel}"
+            logical_mu = n_rmu_C if channel == 0 else n_rmu_T
+            head_io.create_dataset(name, shape=(1, logical_mu), dtype=V_QMUNU_TILE_DTYPE)
+            head_io.write_slab(name, vector[:1])
+    barrier("bispinor_Gamma_vectors_closed")
+
     # Format, canonical inventory and readiness receipt — rank-0 post-close
     # write so BispinorVqReader can reject a torn file without rank
     # coordination.  data_ready=True is deliberately the final mutation.
@@ -614,12 +624,6 @@ def compute_V_q_bispinor_g_flat_to_h5(
                 spatial_current_representation=(
                     spatial_current_representation))
     barrier("v_q_bispinor_g_flat_tile_layout_meta")
-    if any(vector is None for vector in g0_by_channel):
-        missing = [i for i, vector in enumerate(g0_by_channel)
-                   if vector is None]
-        raise RuntimeError(
-            "bispinor literal-G=0 projection did not produce channels "
-            f"{missing}")
     return output_h5_path, tuple(g0_by_channel)
 
 

@@ -726,3 +726,10 @@ completed Hartree band matrices unfold through the band-operator service.
 Each map rotates both charge and transverse parent bundles from their DFT
 references with the same U/E, then passes the transverse bundle and its
 authenticated V file/bases to `compute_sigma_xc`.
+
+Packed restart stores the four literal Gamma one-leg factors as
+`photon_g0_vectors_0` through `_3` in `v_q_bispinor.h5`, each `(1,n_mu)`
+in its canonical logical centroid order. The reader pads for the current
+mesh and packs at the file boundary. The coupled head is recomputed from
+these factors and authenticated parent wavefunctions; restart never changes
+the head mechanism. Older packed files missing the factors refuse by name.

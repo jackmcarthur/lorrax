@@ -680,23 +680,14 @@ def test_the_driver_replays_config_provenance_into_the_production_report():
     assert "report.emit(line.strip())" in src
 
 
-def test_restart_may_not_swap_the_head_mechanism_on_a_slab_cohsex_deck(
-        tmp_path):
-    """restart = true used to move a slab bispinor COHSEX deck from the
-    packed Gamma-cell completion to the incumbent scalar head, silently,
-    for 5.7 meV plus the whole transverse head."""
+def test_restart_preserves_the_packed_head_mechanism(tmp_path):
+    """A copied parent restart uses the same coupled Gamma completion as fresh GW."""
     deck = (_INCUMBENT_DECK
             .replace("sys_dim = 3", "sys_dim = 2")
             .replace("restart = false", "restart = true"))
-    with pytest.raises(ValueError) as exc:
-        _parse(tmp_path, deck)
-    message = str(exc.value)
-    assert ("bispinor_slab_cohsex_restart_changes_the_head_mechanism"
-            in message)
-    # it must NAME BOTH mechanisms, not just say "unsupported"
-    assert "Wigner-Seitz" in message and "StaticHeadTerms" in message
-    assert "5.72 meV" in message
-    assert "IMPLEMENTATION LIMIT" in message
+    config = _parse(tmp_path, deck)
+    assert config.restart
+    assert uses_static_photon_response(config)
 
 
 def test_an_unnamed_restart_uses_the_fresh_physics_default(tmp_path):

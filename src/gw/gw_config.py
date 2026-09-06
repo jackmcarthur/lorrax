@@ -3630,15 +3630,6 @@ def packed_static_envelope(config, *, screened: bool):
            "heads are always on with bispinors and 'off' is the announced "
            "DEBUG skip (owner ruling 2026-09-01, "
            "docs/architecture/decisions.md; TASTE.md row 20)", None)
-    yield (not bool(config.restart), "restart = true", "restart = false",
-           _ENV_IMPL,
-           "there is no photon restart storage: the packed V/W and the "
-           "Gamma-cell completion are not in the restart schema, so a "
-           "restarted deck would silently fall back to a different q->0 "
-           "head mechanism.  On a slab COHSEX deck this row is normally "
-           "unreachable: GATE "
-           "bispinor_slab_cohsex_restart_changes_the_head_mechanism refuses "
-           "at parse time, naming both mechanisms", None)
     yield (str(config.backend.linalg) == "distributed",
            f"linalg = {config.backend.linalg}",
            "linalg = distributed", _ENV_IMPL,
@@ -3861,42 +3852,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "never choose a route (lane J section 2/3.d).  Bispinor heads "
             "are on by default and 'off' is the announced DEBUG skip.\n"
             "  doc:  docs/input_reference.md, head_correction.")
-    # A DECK KEY THAT IS NOT A HEAD DIAL MUST NOT CHANGE THE HEAD.  On a
-    # bispinor slab COHSEX deck, flipping ``restart`` alone used to move the
-    # calculation from the packed Gamma-cell completion to the incumbent
-    # scalar band-diagonal head -- silently, with no run-record difference
-    # beyond the routing reason, and worth 5.7 meV on an occupied state's
-    # SX+COH (lane J section 4.2: the two quadratures measured on the SAME
-    # head function, exact Wigner-Seitz vs the production Sobol draw), plus
-    # the whole transverse q=Gamma head.  Photon restart storage is not
-    # built, so the honest answer is to refuse, not to route.
-    if (bool(config.bispinor)
-            and config.compute_mode is ComputeMode.COHSEX
-            and int(config.sys_dim) == 2
-            and bool(config.restart)):
-        raise ValueError(
-            "GATE bispinor_slab_cohsex_restart_changes_the_head_mechanism: "
-            "restart = true is refused on a bispinor slab static-COHSEX "
-            "deck.\n"
-            f"  got:  bispinor = true, compute_mode = cohsex, sys_dim = "
-            f"{config.sys_dim}, restart = true\n"
-            "  want: restart = false, or leave restart unnamed (an unnamed "
-            "restart is set to false for this deck class at parse time, "
-            "with a [config provenance] line)\n"
-            "  why:  IMPLEMENTATION LIMIT.  There is no photon restart "
-            "storage: neither the packed 4x4 V/W nor the Gamma-cell "
-            "completion is in the restart schema.  A restarted deck would "
-            "therefore silently swap ONE q->0 head mechanism for ANOTHER -- "
-            "from the packed completion (exact slab Wigner-Seitz cubature "
-            "of the coupled 4x4 Dyson equation: charge CC q^2 head, charge "
-            "wings, the bare <D_TT> transverse head, optional Hall CT/TC) "
-            "to the incumbent one (a Sobol mini-BZ <v>/W_h inserted band "
-            "diagonally by gw.head_correction's StaticHeadTerms, and NO "
-            "transverse head at all).  Measured difference on MoS2 3x3: "
-            "+5.72 meV on an occupied state's SX+COH from the quadrature "
-            "alone (reports/bisp_j_architecture_review_2026-09-01 section "
-            "4.2), before the missing transverse head.\n"
-            "  doc:  docs/input_reference.md, bispinor_gw / restart.")
     if (bool(config.bispinor)
             and config.qp_solver is QPSolver.SELF_CONSISTENT
             and not bool(config.density_self_consistent)):
