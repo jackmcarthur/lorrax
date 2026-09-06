@@ -133,3 +133,9 @@
 | P dynamic fe2a6937 |123.83|22.22|10.57|12.50|36.56|854 /60.73|copied ζ: exact FAIL8.668µeV; independently selected rules|
 | F dynamic e1559a07 |176.15|19.92|69.20|11.70|36.68|813 /48.89|different rule policy; not a matched-node speedup|
 | Step / audit |57988457/lx-Xg4-145514-1252010-5546 exit0|.107 overlaps.106 for60s during first static startup|—|—|—|D/gpu_overlap_audit.json|matched rules: D12_nine_common_rules; P4 follow-up R208; P16 R216 uses same certificates|
+
+| Na P16 completed arm | ζ s | Screening s | Rule plan s | τ / other Σ s | Total s | Compile events / s | Identity / scope |
+|---|---:|---:|---:|---|---:|---|---|
+| P fe2a6937 own ζ |22.68|196.70|0.50|474.32 /30.41|753.07|454 /39.83|EQP0/EQP1 exact vs historical04; current main pending; interval audit pending|
+| Warm τ node |—|—|—|193.965ms median;204.334ms mean|2231 warm /2232 calls|one first-call compile|unit_summary_P.json; host synchronized observer on both sources|
+| Step / artifact |57988457/lx-Xg4-150412-1355239-5472 running|—|—|—|—|—|runs/Na/16_bisp_scale_scalar_2026-09-06/{summary.json,identity_historical04_P.json,unit_summary_P.json}|
