@@ -1,6 +1,6 @@
 # BISP-PROF-S — parent-route Sigma profiling
 
-Heavy investigation; **incomplete, awaiting an authorized compute allocation**. Branch `perf/bisp-prof-s-2026-09-06`, unmerged. Production source remains unchanged at P=`9f569c4bf75bad40e4f5895946874b4c503e4410`; F is read-only `wt_main_de8dcfbc_fixed` at `e1559a071e244b4f049c924781b668d9e1560739`. No performance fix or adoption recommendation has passed a gate.
+Heavy investigation; **measurements in progress on authorized campaign pool 57966610**. Branch `perf/bisp-prof-s-2026-09-06`, unmerged. Production source remains unchanged at P=`9f569c4bf75bad40e4f5895946874b4c503e4410`; F is read-only `wt_main_de8dcfbc_fixed` at `e1559a071e244b4f049c924781b668d9e1560739`. No performance fix or adoption recommendation has passed a gate.
 
 ## Objective and preregistered candidates
 
@@ -156,3 +156,33 @@ One prescribed allocation attempt failed with `QOSMaxSubmitJobPerUserLimit`; art
 Writes, including this report and local run/issue registers, stay in the assigned worktree under the explicit modify-only-worktree restriction. Shared sandbox ledgers remain read-only. The legacy `~/lorrax_service_phase/BUILD_NOTES.md` and `~/lorrax_bse_perf_2026-08-08/INDEX.md` were not present at the two explicit home aliases checked; no recursive home/shared-root search was performed. Current Perlmutter contract, PERF2 report/capture recipe, and supplied completed wrappers were read instead.
 
 Preparation verification: all five P/F copied `tmp/` SHA256 lists are identical; `bash -n` passes all30 launcher scripts. These are file/shell checks, not CPU/GPU science gates. Large copied inputs remain ignored; committed checksums and the bounded `00_allocation/prepare_baselines.py` preserve their reconstruction recipe.
+
+## Authorized measurements — 2026-09-06
+
+User authorized BISP-orch pool57966610. Arms run sequentially, one P4 node each,
+BFC@0.85, source arithmetic pinned as above. No production edits yet.
+
+| unprofiled full-static MoS2 | P05 | F06 |
+|---|---:|---:|
+| Sigma other s |150.63|18.24|
+| screening support s |31.55|13.86|
+| whole run s |204.16|55.13|
+| rank0 XLA compile count |1712|597|
+| rank0 compiler work s |147.90|27.74|
+| step, both exit0 |lx-Xg4-011831-1203588-3371|lx-Xg4-012232-1236210-4898|
+
+Evidence: local `runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/`
+`05_P_full_static_baseline` and `06_F_full_static_baseline`, each `gwjax.out`,
+`driver.rank0.log` and `driver.1.log`. The compiler receipts cover the **whole
+run**, not Sigma alone; no elapsed-wall subtraction is claimed as steady state.
+Profile variants11/12 add boundary-specific compile-counter deltas and synchronized
+block receipts plus rank0 native Nsight capture; their walls will not replace
+unprofiled stage timing. F/P are cross-source performance controls, not the
+same-source printed-digit gate used to accept a fix.
+
+Static parser limitation is registered in local KNOWN_SANDBOX_ERRORS.md: the
+provided parser demands dynamic rule/tau rows even on a completed COHSEX report.
+The static table above is transcribed directly from each production artifact.
+
+ZW's report confirms photon_blocks_full_q has only Sigma-side consumers; all
+restore/mix costs here belong to Sigma. It remains unmodified in this lane.
