@@ -10,6 +10,9 @@ The runner requires four processes, one GPU per process, and a 2×2 mesh.
 It uses one runtime for the whole sequence and calls the production entry
 points directly. No pytest collection, xdist, nested MPI launches, or QE runs
 are part of the timed command. The ordinary core and full tiers are separate.
+Service primitives run before the physics drivers to catch transport or algebra
+failures early. The primitive eigensolve/Cholesky/LU cell omits backend and route
+overrides, and records the service's selected plans in `summary.json`.
 
 Every invocation creates a new output directory, retains each rank's logs,
 and updates `summary.json` after each check. An existing directory refuses.
@@ -39,7 +42,8 @@ The default coverage is:
 | Three fresh COHSEX calculations | Local/high, distributed/low, local/low band memory; symmetry unfolding, zeta, Coulomb, screening, Sigma, QP output |
 | One COHSEX restart | Distributed/high band memory from a copy of local/high's completed restart state; real loader invocation, no refitting, fresh/restart numerical parity |
 | Fresh scalar MPA | Existing helium fixture B, 7 active bands, 13 centroids, 2 poles, frequency-dependent Sigma, frozen quadrature rules |
-| Existing dense-algebra bodies | Real cuSolverMp/cuBLASMp and local operations, hostile extents, factor/solve residuals, route refusals |
+| SlabIO primitives | Real parallel HDF5; complex 5×7 data, two-axis and product-axis sharding, empty padded rank, zero padding, append/offset updates, packed reads, metadata, invalid-extent refusals |
+| Existing dense-algebra bodies | Default-plan eigensolve/Cholesky/LU with a ragged five-matrix batch, plus real cuSolverMp/cuBLASMp, hostile extents, factor/solve residuals and route refusals |
 
 The four COHSEX results must agree with one another and with hashed numerical
 references: all 27 k/band rows, all printed Sigma components, and EQPs within

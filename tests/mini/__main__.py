@@ -51,7 +51,7 @@ def main():
                    "source_commit": subprocess.check_output(
                        ["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
                    "mini_sources_sha256": {name: hashlib.sha256((HERE / name).read_bytes()).hexdigest()
-                                            for name in ("__main__.py", "routes.py", "checks.py")},
+                                            for name in ("__main__.py", "routes.py", "checks.py", "slab_io.py")},
                    "persistent_compile_cache": os.environ.get("ISDF_JAX_CACHE_DIR"),
                    "jobid": os.environ.get("SLURM_JOB_ID"),
                    "stepid": os.environ.get("SLURM_STEP_ID"), "checks": []}
@@ -148,6 +148,28 @@ def main():
 
         check("fixture", authenticate)
 
+        def slab_io():
+            from tests.mini.slab_io import check_slab_io
+            return check_slab_io(runtime.mesh, output / "slab_io.h5")
+
+        check("slab_io", slab_io)
+
+        # These are the service's existing numerical bodies, not another LA oracle.
+        def algebra():
+            from services.distrib_la.tests import test_distrib_la_multiproc as la
+            from tests.core.distrib_la_p4 import CORE_CELLS
+            cells = [row for row in la._CLI_CELLS if row[0] in CORE_CELLS]
+            assert {row[0] for row in cells} == CORE_CELLS
+            results = {}
+            for name, _, fn in cells:
+                if name == "batch_reshard_local_ops":
+                    results[name] = la.check_batch_reshard_local_ops(
+                        runtime.mesh, "complex128", backend=None)
+                else:
+                    results[name] = str(fn(runtime.mesh, "complex128"))
+            return results
+
+        check("dense_algebra", algebra)
         def select(density, orbit, count):
             from centroid.kmeans_cli import main as kmeans
             suffix = "_current" if density == "current" else ("" if orbit else "_literal")
@@ -293,18 +315,6 @@ fermi_reference = midgap
 
         check("mpa", mpa)
 
-        # These are the service's existing numerical bodies, not another LA oracle.
-        def algebra():
-            from services.distrib_la.tests import test_distrib_la_multiproc as la
-            from tests.core.distrib_la_p4 import CORE_CELLS
-            cells = [row for row in la._CLI_CELLS if row[0] in CORE_CELLS]
-            assert {row[0] for row in cells} == CORE_CELLS
-            results = {}
-            for name, _, fn in cells:
-                results[name] = str(fn(runtime.mesh, "complex128"))
-            return results
-
-        check("dense_algebra", algebra)
         receipt["status"] = "passed"
         save()
         if receipt["elapsed_seconds"] > args.budget_seconds:

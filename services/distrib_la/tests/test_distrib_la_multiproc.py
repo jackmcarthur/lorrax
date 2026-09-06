@@ -574,13 +574,14 @@ def check_batched_eigh_dispatch(mesh, dtype="complex128", nq=6, n=64):
 
 
 def check_batch_reshard_local_ops(mesh, dtype="complex128", nq=5, n=64,
-                                  nrhs=32):
+                                  nrhs=32, *, backend="off"):
     """Route (c), all array-returning ops, including a ragged batch.
 
     This body is shared by pytest's 1x1 smoke and the real P=4 CLI matrix.
     On the latter ``nq=5`` is deliberately not divisible by four, so the
     op-safe pad/drop path is load-bearing.  Every result is checked at the
     ordinary Plan.batched output layout before the test-only host readback.
+    ``backend=None`` exercises the public plan defaults, with the same oracle.
     """
     from jax.sharding import PartitionSpec as P
 
@@ -591,12 +592,12 @@ def check_batch_reshard_local_ops(mesh, dtype="complex128", nq=5, n=64,
             f"padding this gate claims to cover is vacuous")
     rng = np.random.default_rng(20260815)
     out = {}
+    options = {} if backend is None else {
+        "backend": backend, "batched_route": D.ROUTE_BATCH_RESHARD}
 
     A_eigh = _herm(rng, nq, n, dtype)
-    W, Z = D.plan(
-        "eigh", mesh, backend="off", n=n,
-        batched_route=D.ROUTE_BATCH_RESHARD,
-    ).batched(_put(A_eigh, mesh, (None, "x", "y")))
+    eigh_plan = D.plan("eigh", mesh, n=n, **options)
+    W, Z = eigh_plan.batched(_put(A_eigh, mesh, (None, "x", "y")))
     assert W.sharding.is_fully_replicated
     assert Z.sharding.spec == P(None, "x", "y")
     W_np, Z_np = _gather(W), _gather(Z)
@@ -607,10 +608,8 @@ def check_batch_reshard_local_ops(mesh, dtype="complex128", nq=5, n=64,
     assert out["eigh_residual"] < RTOL
 
     A_chol = _hpd(rng, nq, n, dtype)
-    L = D.plan(
-        "cholesky", mesh, backend="off", n=n,
-        batched_route=D.ROUTE_BATCH_RESHARD,
-    ).batched(_put(A_chol, mesh, (None, "x", "y")), block_size=17)
+    chol_plan = D.plan("cholesky", mesh, n=n, **options)
+    L = chol_plan.batched(_put(A_chol, mesh, (None, "x", "y")), block_size=17)
     assert L.sharding.spec == P(None, "x", "y")
     L_np = _gather(L)
     out["cholesky"] = _rel(L_np, np.linalg.cholesky(A_chol))
@@ -621,17 +620,17 @@ def check_batch_reshard_local_ops(mesh, dtype="complex128", nq=5, n=64,
 
     A_lu = _hpd(rng, nq, n, dtype)
     B_lu = _rng_mat(rng, (nq, n, nrhs), dtype)
-    X = D.plan(
-        "solve_lu", mesh, backend="off", n=n,
-        batched_route=D.ROUTE_BATCH_RESHARD,
-    ).batched(_put(A_lu, mesh, (None, "x", "y")),
-              _put(B_lu, mesh, (None, "x", "y")))
+    lu_plan = D.plan("solve_lu", mesh, n=n, **options)
+    X = lu_plan.batched(_put(A_lu, mesh, (None, "x", "y")),
+                        _put(B_lu, mesh, (None, "x", "y")))
     assert X.sharding.spec == P(None, "x", "y")
     X_np = _gather(X)
     out["solve"] = _rel(X_np, np.linalg.solve(A_lu, B_lu))
     out["solve_residual"] = _resid(A_lu, X_np, B_lu)
     assert out["solve"] < RTOL
     assert out["solve_residual"] < 1e-10
+    out["plans"] = [{"op": p.op, "backend": p.backend, "route": p.batched_route}
+                    for p in (eigh_plan, chol_plan, lu_plan)]
     return out
 
 
