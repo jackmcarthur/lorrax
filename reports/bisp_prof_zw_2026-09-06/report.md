@@ -400,3 +400,22 @@ Final validation scope: all same-source P4 science gates are printed exact,13 CP
 
 
 Six-by-six durable archive: `/global/cfs/cdirs/m4598/jackm/lorrax_evidence/bisp_prof_zw_6x6_2026-09-06/evidence.tar`; 6746 files, 1304565760 bytes, SHA256 `3af4b6f04af224bf8a69fa1e27a400bb825e2a8fa3b8fede67f66e15985c973c`. Every member verified: 6746 checked, zero missing/mismatched. The archive retains this follow-up's native captures, rank-zero optimized HLO, original canonical P/F zeta, step/parser receipts and exact source snapshots. The final report and archive receipt are also copied beside it after closure. Owned pool57986810 was released after confirming that only its extern step remained (`D/six_pool_release.log`); shared57982945 remains its owner's allocation.
+
+
+## Phase 3: zeta tile table and screening attribution on 6x6
+
+Active, production base ORCH443e95be plus this lane’s rebased chi Green reuse (32fc693a,00efb049). No new source change yet. Original P4 zeta carrier C597/T194 is kept distinct from SCALE’s common P4/P16 carrier C597/T200; fixed-main refuses T194 atP16. P16 static/dynamic P/F80–83 reuse one canonical P zeta copy and the matched certified dynamic-rule schedule. Shared authorized pool57988457, sequential arms. The earlier P/F zeta difference verdict is reopened for an input/operator/solver decomposition; finite output alone is not a numerical explanation.
+
+
+### Phase3 P16 baseline matrix before source changes
+
+Claim1302; authorized pool57988457, all four steps exit0. [lx] step lx-Xg4-130452-691599-3051 exit 0 in 82 s; [lx] step lx-Xg4-130616-707933-7813 exit 0 in 102 s; [lx] step lx-Xg4-130800-715299-4243 exit 0 in 117 s; [lx] step lx-Xg4-131001-721896-8573 exit 0 in 210 s. Source dc7fd463 is the rebased continuation of the phase2 accepted source on443e95be.
+
+| P16 arm | screening s | Sigma s | total s | rank0 compiles / compiler seconds |
+|---|---:|---:|---:|---:|
+|80 parent static|31.63|22.31|75.86|646 /34.03|
+|81 fixed static|39.43|33.92|96.46|604 /28.85|
+|82 parent dynamic|37.19|44.90|112.37|897 /52.55|
+|83 fixed dynamic|111.15|66.84|203.57|825 /43.27|
+
+Screening sums chi0,W,screening-support buckets; dynamic W persist/head is separately0.84/0.36s. Sigma includes rule planning,tau andother work. Fresh fit is excluded: allfour private tmp directories start from90_P_static_P16_baseline/tmp, and dynamic arms preserve the matching replay certificates. Logical C597/T200 differs from phase2'sC597/T194; no cross-carrier gain is claimed. P/F numerical comparison and complete screening attribution follow. Native/HLO arm85 stalled after the warm Dyson capture; it is preserved as incomplete and replaced by a host-only profile.
