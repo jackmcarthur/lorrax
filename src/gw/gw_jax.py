@@ -1392,7 +1392,7 @@ def main(argv=None):
 	# sigma_diag.dat.  The packed diagnostic owns CC/CT+TC/TT for its static
 	# completion; the dynamic scalar owner contributes the X and C charge head.
 	head_sigma_split_skn_ry = None
-	if config.bispinor:
+	if config.bispinor and config.debug.sigma_freq_debug_output:
 		head_sigma_split_skn_ry = np.asarray(
 			photon_head_sigma_diag_tskn_ry[1]
 			+ photon_head_sigma_diag_tskn_ry[2]).copy()

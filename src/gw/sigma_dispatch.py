@@ -1108,6 +1108,7 @@ def compute_sigma_xc(
             response=photon_response,
             meta=meta,
             mesh_xy=mesh_xy,
+            head_diagnostics=config.debug.sigma_freq_debug_output,
             diagnostic_basis_rotation=hartree_basis_rotation,
             diagnostic_input_basis=(
                 "qp" if hartree_basis_rotation is not None else "dft"),
@@ -1183,6 +1184,7 @@ def compute_sigma_xc(
             meta=meta,
             mesh_xy=mesh_xy,
             blocks=PHOTON_BLOCKS_CURRENT,
+            head_diagnostics=config.debug.sigma_freq_debug_output,
             diagnostic_basis_rotation=hartree_basis_rotation,
             diagnostic_input_basis=(
                 "qp" if hartree_basis_rotation is not None else "dft"),

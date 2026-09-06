@@ -691,3 +691,8 @@ GW tau and static-limit spatial factories require the typed parent plan and cano
 ### 2026-09-06 — remove the four-copy GW carrier
 
 `Wavefunctions` no longer has psi_xn/psi_xr/psi_yr/psi_yn, their accessors or the old builder. Its persistent GW samples reside in `ParentGreenCarrier`. The two optional face fields remain for bounded head-star children and independent numerical oracles; `gw_init` does not populate full-k faces. Receipts inspect the two supported orientations and parent samples. The unused amplitude envelope and real/imaginary projection wrapper are retired; BSE/htransform shared raw-array services remain. The obsolete full-k persistence gate is replaced by `bispinor_parent_faces_gate.py` and `bispinor_parent_restart_gate.py`.
+
+
+### 2026-09-06 — head attribution is opt-in
+
+The existing `sigma_freq_debug_output` switch alone enables head-attribution diagnostics and their output. Physical Γ completion is independent of that switch. Each enabled Lorentz-block contraction reuses its body Green function for the Γ-only attribution, retaining one full-q interaction at a time. This follows the final parent-route plan §7 performance ruling.

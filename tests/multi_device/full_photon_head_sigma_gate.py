@@ -223,6 +223,10 @@ def _write_and_check_receipts(plus, nk, nb, output_dir):
             sym=sym,
             print_fn=lambda *_args, **_kwargs: None,
         )
+        if not explicit:
+            if os.path.exists(path):
+                raise AssertionError(f"disabled diagnostic emitted a receipt: {path}")
+            return None
         if not os.path.isfile(path):
             raise AssertionError(f"canonical Sigma receipt was not emitted: {path}")
         header, rows = _read_debug_table(path)
@@ -231,8 +235,9 @@ def _write_and_check_receipts(plus, nk, nb, output_dir):
             raise AssertionError(f"Sigma receipt lacks columns {missing}")
         return path, header, rows
 
+    assert emit("disabled.dat", plus["components"], True, False) is None
     full_path, header, rows = emit(
-        "sigma_freq_debug.dat", plus["components"], True, False)
+        "sigma_freq_debug.dat", plus["components"], True, True)
     with open(full_path, "r", encoding="utf-8") as stream:
         full_receipt_text = stream.read()
     required_metadata = (
@@ -490,8 +495,18 @@ def _run_gate(mesh, wfn, output_dir):
             meta=meta,
             mesh_xy=mesh,
             diagnostic_input_basis="dft",
+            head_diagnostics=True,
             verbose=False,
         )
+        off = compute_static_photon_sigma(
+            wfns_charge=wfns_c, wfns_transverse=wfns_t, Gij=Gij,
+            response=StaticPhotonResponse(layout, V, W, "none", "test",
+                head_completion=completion, qgrid_policy=policy,
+                family_plans=(plan, wfns_t.green_parent.plan)),
+            meta=meta, mesh_xy=mesh, verbose=False)
+        assert off[3] is None
+        for on_value, off_value in zip((sig_x, sig_sx, sig_coh), off[:3]):
+            np.testing.assert_array_equal(_gather(on_value), _gather(off_value))
         aggregate = tuple(_gather(x) for x in (sig_x, sig_sx, sig_coh))
         components = _gather(diagnostics.components_tskn_ry)
         sigma_components = _gather(sigma_diagnostics.components_skij_ry)

@@ -107,7 +107,7 @@ def _require_packed_operator(name, packed, mesh_xy):
 
 
 def _make_photon_static_block_kernel(
-    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, *, vertex_pair, q0_only=False,
+    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, *, vertex_pair,
 ):
     """Unfold each endpoint before its vertex, then build G and project Σ on parents."""
     from common.shard_map import shard_map
@@ -120,14 +120,15 @@ def _make_photon_static_block_kernel(
     plans = (left.plan, right.plan)
     shapes = tuple((p.n_parent, c.psi_nmu.shape[1], p.n_centroid_packed, p.nspinor)
                    for c, p in zip((left, right), plans))
-    key = (id(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, ffi_dial_key(), vertex_pair, q0_only)
+    key = (id(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, ffi_dial_key(), vertex_pair)
     if key in _photon_sigma_kernel_cache:
         return _photon_sigma_kernel_cache[key]
     project = contract_bands_block_reshard(mesh_xy, layout="face",
         face_shape=shapes[0], right_face_shape=shapes[1])
     g_plan = gemm_plan(mesh_xy, m=shapes[0][2]*shapes[0][3], k=shapes[0][1],
         n=shapes[1][2]*shapes[1][3], nq=nk_tot, dtype=jnp.complex128)
-    convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=q0_only)
+    convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot)
+    convolve_head = _make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=True)
     rows = np.asarray(plans[0].parent_full_rows)
     specs = (P(None,None,"x","y"), P(None,"x",None,"y"))
 
@@ -140,16 +141,22 @@ def _make_photon_static_block_kernel(
                        out_specs=specs, check_vma=False)
 
     @jax.jit
-    def contract_block(left, right, weights, interaction, factor):
+    def contract_block(left, right, weights, interaction, factor, head_interaction=None):
         direct, conjugated = unfold(left.psi_mun, right.psi_nmu)
         G = build_G(direct, conjugated, phases=weights, layout="face", gemm=g_plan)
         sigma = convolve(G, interaction, factor)
-        return project(left.psi_nmu, jnp.take(sigma, jnp.asarray(rows), axis=0), right.psi_mun)
+        result = project(left.psi_nmu, jnp.take(sigma, jnp.asarray(rows), axis=0), right.psi_mun)
+        if head_interaction is None:
+            return result
+        head = convolve_head(G, head_interaction, factor)
+        return result, project(left.psi_nmu,
+            jnp.take(head, jnp.asarray(rows), axis=0), right.psi_mun)
     _photon_sigma_kernel_cache[key] = contract_block
     return contract_block
 
 
-def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh_xy):
+def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh_xy,
+                            head_diagnostics=False):
     """Yield one parent-band Σ block after consuming and releasing one full-q interaction."""
     from .w_isdf import photon_blocks_full_q
     from .cohsex_sigma import _occ_diag_full
@@ -159,7 +166,8 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
     if term not in (_TERM_X, _TERM_SX, _TERM_COH):
         raise ValueError(f"Unknown static Sigma term {term}.")
     operator = ("V", "W", "W-V")[term]
-    factors = None if response.head_completion is None else response.head_completion.q0_factors
+    factors = (response.head_completion.q0_factors
+               if head_diagnostics and response.head_completion is not None else None)
     for key, interaction in photon_blocks_full_q(response, blocks, term=operator):
         A, B = key
         left, right = families[int(A != 0)], families[int(B != 0)]
@@ -169,28 +177,25 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
         factor = -0.5 if term == _TERM_COH else 1.0
         kernel = _make_photon_static_block_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
             left, right, vertex_pair=key)
-        result = kernel(left.green_parent, right.green_parent, weights, interaction, factor)
-        result.block_until_ready()
-        del interaction
-        head = None
+        head_block = None
         if factors is not None:
             pairs = (factors.bare_pair,) if term == _TERM_X else factors.screened_pairs
             head_block = photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
             if term == _TERM_COH:
                 head_block = head_block - photon_q0_low_rank_block(
                     (factors.bare_pair,), response.layout, A, B, mesh_xy)
-            head_kernel = _make_photon_static_block_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
-                left, right, vertex_pair=key, q0_only=True)
-            head = head_kernel(left.green_parent, right.green_parent, weights, head_block, factor)
-            head.block_until_ready()
-            del head_block
+        value = kernel(left.green_parent, right.green_parent, weights,
+                       interaction, factor, head_block)
+        result, head = (value, None) if head_block is None else value
+        jax.block_until_ready((result, head))
+        del interaction, head_block
         yield key, result, head
 
 
 def compute_static_photon_sigma(
     *, wfns_charge, wfns_transverse, Gij, response, meta, mesh_xy,
     blocks=PHOTON_BLOCKS_ALL, diagnostic_basis_rotation=None,
-    diagnostic_input_basis=None, print_fn=print, verbose=True,
+    diagnostic_input_basis=None, head_diagnostics=False, print_fn=print, verbose=True,
 ):
     """Sum X/SX/COH Lorentz sectors on parents before their band-operator unfold."""
     from symmetry_maps import unfold_file_wedge_band_operator
@@ -200,7 +205,7 @@ def compute_static_photon_sigma(
     families = (wfns_charge, wfns_transverse)
     if wfns_charge.slices != wfns_transverse.slices:
         raise ValueError("Photon endpoint band windows differ.")
-    if response.head_completion is not None:
+    if head_diagnostics and response.head_completion is not None:
         if diagnostic_input_basis not in ("dft", "qp") or (
                 (diagnostic_input_basis == "qp") != (diagnostic_basis_rotation is not None)):
             raise ValueError("Photon head diagnostic basis/rotation mismatch.")
@@ -213,7 +218,8 @@ def compute_static_photon_sigma(
     totals, head_totals = [None]*3, [None]*3
     for term in range(3):
         for key, value, head in contract_lorentz_blocks(keys, families=families,
-                term=term, response=response, Gij=Gij, meta=meta, mesh_xy=mesh_xy):
+                term=term, response=response, Gij=Gij, meta=meta, mesh_xy=mesh_xy,
+                head_diagnostics=head_diagnostics):
             sector = _head_sector(*key)
             old = sector_values[term][sector]
             sector_values[term][sector] = value if old is None else old + value
@@ -241,7 +247,7 @@ def compute_static_photon_sigma(
     if residual > limit:
         raise ValueError(f"GATE photon_sigma_sector_closure: {residual} > {limit}")
     diagnostics = StaticPhotonSigmaDiagnostics(sectors, residual)
-    if response.head_completion is None:
+    if not head_diagnostics or response.head_completion is None:
         return sig_x, sig_sx, sig_coh, None, diagnostics
     head_components = jnp.stack([jnp.stack([_diagnostic_diagonal(
         finish(zero if value is None else value), diagnostic_basis_rotation, mesh_xy)

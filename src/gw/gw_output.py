@@ -763,13 +763,11 @@ def write_freq_debug(
     and either ``sig_c_head(Edft)`` (PPM) or ``sex_head/coh_head``
     (static, screened mode).
 
-    No-op unless ``config.debug.sigma_freq_debug_output`` is set or an actual
-    coupled-photon q=0 completion is present.  Packed completion therefore
-    always leaves this canonical parseable receipt; ordinary modes retain the
-    established opt-in behavior and write exact-zero photon-sector columns.
+    No-op unless ``config.debug.sigma_freq_debug_output`` is set.
+    Physical head completion does not enable diagnostic output.
     """
     _has_photon_head = results.photon_head_sigma_basis is not None
-    if not (config.debug.sigma_freq_debug_output or _has_photon_head):
+    if not config.debug.sigma_freq_debug_output:
         return
     from file_io import write_sigma_freq_debug_table
     from .eqp_bgw import (
