@@ -1,0 +1,114 @@
+{
+  "runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/11_P_full_static_profile": {
+    "carrier_seam_unattributed": {
+      "modules": [
+        "module_0306.jit__lambda"
+      ],
+      "calls": 1,
+      "projected_ms": 0.322624,
+      "kernel_ms": 0.220512,
+      "static_collectives": {
+        "all-to-all": 4
+      }
+    },
+    "startup": {
+      "modules": [
+        "module_0335.jit__lambda",
+        "module_0337.jit__lambda",
+        "module_0339.jit__lambda",
+        "module_0341.jit__lambda",
+        "module_0347.jit__lambda",
+        "module_0349.jit__lambda",
+        "module_0351.jit__lambda",
+        "module_0353.jit__lambda"
+      ],
+      "calls": 10,
+      "projected_ms": 1.654749,
+      "kernel_ms": 0.586366,
+      "static_collectives": {
+        "all-to-all": 16
+      }
+    },
+    "screening": {
+      "modules": [
+        "module_0382.jit__lambda",
+        "module_0384.jit__lambda",
+        "module_0396.jit__lambda",
+        "module_0398.jit__lambda",
+        "module_0408.jit__lambda",
+        "module_0410.jit__lambda",
+        "module_0416.jit__lambda",
+        "module_0418.jit__lambda"
+      ],
+      "calls": 32,
+      "projected_ms": 3.953467,
+      "kernel_ms": 1.395839,
+      "static_collectives": {
+        "all-to-all": 16
+      }
+    },
+    "band_unfold": {
+      "modules": [
+        "module_4030.jit__f"
+      ],
+      "calls": 18,
+      "projected_ms": 1.543712,
+      "kernel_ms": 0.237376,
+      "static_collectives": {}
+    }
+  },
+  "runs/Si/100_bisp_parent_route_2026-09-05/prof_s/13_P_gn_profile": {
+    "carrier_seam_unattributed": {
+      "modules": [
+        "module_0312.jit__lambda",
+        "module_0502.jit__lambda",
+        "module_0504.jit__lambda",
+        "module_1758.jit__lambda",
+        "module_1854.jit__lambda"
+      ],
+      "calls": 7,
+      "projected_ms": 18.575128,
+      "kernel_ms": 18.399608,
+      "static_collectives": {
+        "all-to-all": 20
+      }
+    },
+    "startup": {
+      "modules": [
+        "module_0339.jit__lambda",
+        "module_0341.jit__lambda",
+        "module_0347.jit__lambda",
+        "module_0349.jit__lambda",
+        "module_0351.jit__lambda",
+        "module_0353.jit__lambda"
+      ],
+      "calls": 6,
+      "projected_ms": 3.8225890000000007,
+      "kernel_ms": 3.4503009999999996,
+      "static_collectives": {
+        "all-to-all": 12
+      }
+    },
+    "bare_Sigma": {
+      "modules": [
+        "module_0591.jit__lambda",
+        "module_0593.jit__lambda"
+      ],
+      "calls": 32,
+      "projected_ms": 4.186365,
+      "kernel_ms": 2.471006,
+      "static_collectives": {
+        "all-to-all": 4
+      }
+    },
+    "band_unfold": {
+      "modules": [
+        "module_1248.jit__f"
+      ],
+      "calls": 1,
+      "projected_ms": 0.002624,
+      "kernel_ms": 0.002624,
+      "static_collectives": {}
+    }
+  }
+}

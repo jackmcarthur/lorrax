@@ -1,0 +1,5203 @@
+{
+  "scope": "Optimized instruction census; async starts counted once, done instructions excluded. Complements the unchanged canonical analyzer.",
+  "modules": [
+    {
+      "file": "module_0001.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0003.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0005.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 1
+      },
+      "instructions": [
+        {
+          "line": 5,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (f64[2,2]{1,0}, f64[8,2]{1,0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0007.jit__lorrax_canonical_shard_slice.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0009.jit_sum.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 55,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[] all-reduce-start(%bitcast.1), channel_id=3, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.0.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0012.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0014.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 1
+      },
+      "instructions": [
+        {
+          "line": 5,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (f64[2]{0}, f64[8]{0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0016.jit__lorrax_canonical_shard_slice.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0018.jit_sum.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 55,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[] all-reduce-start(%bitcast.1), channel_id=1, replica_groups=[2,2]<=[2,2]T(1,0), use_global_device_ids=true, to_apply=%region_0.0.clone"
+        }
+      ]
+    },
+    {
+      "file": "module_0021.jit_sum.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 55,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[] all-reduce-start(%bitcast.1), channel_id=1, replica_groups=[2,2]<=[4], use_global_device_ids=true, to_apply=%region_0.0.clone"
+        }
+      ]
+    },
+    {
+      "file": "module_0024.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 1
+      },
+      "instructions": [
+        {
+          "line": 5,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (s64[1]{0}, s64[4]{0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0026.jit__zero_faces.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0028.jit__psum.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 59,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = u8[4096]{0} all-reduce-start(%bitcast.1), channel_id=1, replica_groups=[1,4]<=[4], use_global_device_ids=true, to_apply=%region_0.0.clone"
+        }
+      ]
+    },
+    {
+      "file": "module_0031.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0033.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0035.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0037.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0039.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0041.jit__kernel.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0043.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0045.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0047.jit_gather.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0049.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0051.jit__kernel.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0053.jit__insert_tile.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 2,
+        "collective-permute": 1,
+        "all-gather": 2
+      },
+      "instructions": [
+        {
+          "line": 112,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.3 = c128[4,8,4,2,240]{4,2,1,0,3} all-to-all(%param_0.24), channel_id=3, replica_groups=[2,2]<=[4], dimensions={3}"
+        },
+        {
+          "line": 117,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.1.1 = c128[4,8,4,2,240]{4,2,1,0,3} all-to-all(%param_0.25), channel_id=5, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={3}"
+        },
+        {
+          "line": 129,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start = (c128[4,4,4,480]{3,2,0,1}, c128[4,4,4,480]{3,2,0,1}) collective-permute-start(%bitcast.82.0), channel_id=1, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}"
+        },
+        {
+          "line": 131,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[4,4,4,480]{3,2,0,1}, c128[4,8,4,480]{3,2,0,1}) all-gather-start(%collective-permute-done), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true"
+        },
+        {
+          "line": 141,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (c128[4,4,4,480]{3,2,0,1}, c128[4,8,4,480]{3,2,0,1}) all-gather-start(%bitcast.82.0), channel_id=4, replica_groups=[2,2]<=[4], dimensions={1}, use_global_device_ids=true"
+        }
+      ]
+    },
+    {
+      "file": "module_0055.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0057.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0059.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0061.jit_conjugate.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0063.jit_transpose.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0065.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0067.jit__zero_faces.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0069.jit__kernel.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0071.jit__insert_tile.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 2,
+        "collective-permute": 1,
+        "all-gather": 2
+      },
+      "instructions": [
+        {
+          "line": 128,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.3 = c128[4,8,4,2,96]{4,2,1,0,3} all-to-all(%param_0.27), channel_id=3, replica_groups=[2,2]<=[4], dimensions={3}"
+        },
+        {
+          "line": 133,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.1.1 = c128[4,8,4,2,96]{4,2,1,0,3} all-to-all(%param_0.28), channel_id=5, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={3}"
+        },
+        {
+          "line": 141,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start = (c128[4,4,4,192]{3,2,0,1}, c128[4,4,4,192]{3,2,0,1}) collective-permute-start(%bitcast.87.0), channel_id=1, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}"
+        },
+        {
+          "line": 143,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[4,4,4,192]{3,2,0,1}, c128[4,8,4,192]{3,2,0,1}) all-gather-start(%collective-permute-done), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true"
+        },
+        {
+          "line": 153,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (c128[4,4,4,192]{3,2,0,1}, c128[4,8,4,192]{3,2,0,1}) all-gather-start(%bitcast.87.0), channel_id=4, replica_groups=[2,2]<=[4], dimensions={1}, use_global_device_ids=true"
+        }
+      ]
+    },
+    {
+      "file": "module_0073.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0075.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0077.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0079.jit_conjugate.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0081.jit_transpose.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0083.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0085.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0087.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0089.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0091.jit__take.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0096.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0098.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0100.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0102.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 1
+      },
+      "instructions": [
+        {
+          "line": 5,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (u32[1]{0}, u32[4]{0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0104.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0106.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0108.jit__psum.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 60,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = u8[4096]{0} all-reduce-start(%bitcast.1), channel_id=1, replica_groups=[1,4]<=[4], use_global_device_ids=true, to_apply=%region_0.0.clone"
+        }
+      ]
+    },
+    {
+      "file": "module_0111.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 1
+      },
+      "instructions": [
+        {
+          "line": 5,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (u32[1]{0}, u32[4]{0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0113.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0115.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 1
+      },
+      "instructions": [
+        {
+          "line": 5,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (u8[1,4096]{1,0}, u8[4,4096]{1,0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0117.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0119.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0121.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0123.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0125.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "collective-permute": 1,
+        "all-gather": 2
+      },
+      "instructions": [
+        {
+          "line": 134,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start = (c128[120,588]{1,0}, c128[120,588]{1,0}) collective-permute-start(%bitcast.3), channel_id=2, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}"
+        },
+        {
+          "line": 136,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (c128[120,588]{1,0}, c128[240,588]{1,0}) all-gather-start(%collective-permute-done), channel_id=3, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={0}, use_global_device_ids=true"
+        },
+        {
+          "line": 138,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[120,588]{1,0}, c128[240,588]{1,0}) all-gather-start(%bitcast.3), channel_id=1, replica_groups=[2,2]<=[4], dimensions={0}, use_global_device_ids=true"
+        }
+      ]
+    },
+    {
+      "file": "module_0127.jit__do_unfold.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "collective-permute": 1,
+        "all-gather": 1,
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 224,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start = (c128[64,120]{0,1}, c128[64,120]{0,1}) collective-permute-start(%bitcast.80.0), channel_id=6, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}"
+        },
+        {
+          "line": 226,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[64,120]{0,1}, c128[64,240]{0,1}) all-gather-start(%collective-permute-done), channel_id=7, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true"
+        },
+        {
+          "line": 229,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = c128[64,240]{1,0} all-reduce-start(%loop_select_fusion), channel_id=9, replica_groups=[2,2]<=[4], use_global_device_ids=true, to_apply=%add.1.clone"
+        }
+      ]
+    },
+    {
+      "file": "module_0160.jit_abs.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0162.jit__reduce_max.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 78,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[] all-reduce-start(%input_reduce_fusion.1), channel_id=3, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.0.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0165.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0167.jit_exp.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0169.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0171.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "collective-permute": 2,
+        "all-gather": 2,
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 209,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start.1 = ((s32[240,1]{1,0}, pred[240]{0}), (s32[240,1]{1,0}, pred[240]{0})) collective-permute-start(%bitcast.56, %bitcast.1.0), channel_id=13, source_target_pairs={{0,0},{2,1},{1,2},{3,3}}, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 217,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[240,240]{1,0}, c128[480,240]{1,0}) all-gather-start(%bitcast.2.0), channel_id=17, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={0}, use_global_device_ids=true"
+        },
+        {
+          "line": 221,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (c128[240,240]{0,1}, c128[240,480]{0,1}) all-gather-start(%bitcast.45.0), channel_id=30, replica_groups=[2,2]<=[4], dimensions={1}, use_global_device_ids=true"
+        },
+        {
+          "line": 226,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start = (c128[240]{0}, c128[240]{0}) collective-permute-start(%loop_complex_fusion), channel_id=31, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}"
+        },
+        {
+          "line": 231,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[] all-reduce-start(%input_reduce_fusion.1), channel_id=34, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.1.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0192.jit__lorrax_canonical_shard_slice.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0194.jit__lorrax_canonical_shard_slice.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0196.jit_reshape.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0198.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 150,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=6, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_1.2.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0201.jit_conjugate.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0203.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0205.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0207.jit__where.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0209.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0211.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0213.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0215.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0217.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0219.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0221.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "collective-permute": 1,
+        "all-gather": 2
+      },
+      "instructions": [
+        {
+          "line": 134,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start = (c128[42,588]{1,0}, c128[42,588]{1,0}) collective-permute-start(%bitcast.3), channel_id=2, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}"
+        },
+        {
+          "line": 136,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (c128[42,588]{1,0}, c128[84,588]{1,0}) all-gather-start(%collective-permute-done), channel_id=3, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={0}, use_global_device_ids=true"
+        },
+        {
+          "line": 138,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[42,588]{1,0}, c128[84,588]{1,0}) all-gather-start(%bitcast.3), channel_id=1, replica_groups=[2,2]<=[4], dimensions={0}, use_global_device_ids=true"
+        }
+      ]
+    },
+    {
+      "file": "module_0223.jit__do_unfold.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "collective-permute": 1,
+        "all-gather": 1,
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 238,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start = (c128[64,42]{0,1}, c128[64,42]{0,1}) collective-permute-start(%bitcast.84.0), channel_id=6, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}"
+        },
+        {
+          "line": 240,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[64,42]{0,1}, c128[64,84]{0,1}) all-gather-start(%collective-permute-done), channel_id=7, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true"
+        },
+        {
+          "line": 243,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = c128[64,84]{1,0} all-reduce-start(%loop_select_fusion), channel_id=9, replica_groups=[2,2]<=[4], use_global_device_ids=true, to_apply=%add.1.clone"
+        }
+      ]
+    },
+    {
+      "file": "module_0256.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0258.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0260.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0262.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0264.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0266.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0268.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0270.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0272.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0274.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0276.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "collective-permute": 1,
+        "all-gather": 2
+      },
+      "instructions": [
+        {
+          "line": 154,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start = (c128[42,588]{1,0}, c128[42,588]{1,0}) collective-permute-start(%bitcast.2.0), channel_id=2, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}"
+        },
+        {
+          "line": 156,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (c128[42,588]{1,0}, c128[84,588]{1,0}) all-gather-start(%collective-permute-done), channel_id=3, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={0}, use_global_device_ids=true"
+        },
+        {
+          "line": 158,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[42,588]{1,0}, c128[84,588]{1,0}) all-gather-start(%bitcast.4), channel_id=1, replica_groups=[2,2]<=[4], dimensions={0}, use_global_device_ids=true"
+        }
+      ]
+    },
+    {
+      "file": "module_0278.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0280.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0282.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0284.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0286.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0288.jit_gather.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0290.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0292.jit_gather.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0294.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0296.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0298.jit_gather.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0300.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0302.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0304.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 1
+      },
+      "instructions": [
+        {
+          "line": 5,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (u8[1,4096]{1,0}, u8[4,4096]{1,0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0306.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0308.jit__do_unfold.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 4
+      },
+      "instructions": [
+        {
+          "line": 236,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.52.1 = c128[64,240,240]{1,0,2} all-to-all(%param_0.50), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}"
+        },
+        {
+          "line": 241,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.56.1 = c128[64,480,120]{2,0,1} all-to-all(%param_0.51), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={1}"
+        },
+        {
+          "line": 246,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.60.1 = c128[64,240,240]{2,0,1} all-to-all(%param_0.52), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={1}"
+        },
+        {
+          "line": 251,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.64.1 = c128[64,120,480]{1,0,2} all-to-all(%param_0.53), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={2}"
+        }
+      ]
+    },
+    {
+      "file": "module_0310.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 1
+      },
+      "instructions": [
+        {
+          "line": 18,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[64,240]{0,1}, c128[64,480]{0,1}) all-gather-start(%bitcast.10.0), channel_id=1, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0312.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 4
+      },
+      "instructions": [
+        {
+          "line": 60,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.52.1 = c128[64,240,240]{1,0,2} all-to-all(%param_0.13), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}"
+        },
+        {
+          "line": 65,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.56.1 = c128[64,480,120]{2,0,1} all-to-all(%param_0.14), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={1}"
+        },
+        {
+          "line": 70,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.60.1 = c128[64,240,240]{2,0,1} all-to-all(%param_0.15), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={1}"
+        },
+        {
+          "line": 75,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.64.1 = c128[64,120,480]{1,0,2} all-to-all(%param_0.16), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={2}"
+        }
+      ]
+    },
+    {
+      "file": "module_0314.jit_gather.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0316.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0318.jit_trace.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 93,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = c128[] all-reduce-start(%input_reduce_fusion.1), channel_id=3, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.1.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0321.jit_real.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0323.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 2
+      },
+      "instructions": [
+        {
+          "line": 181,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[] all-reduce-start(%input_reduce_fusion.3), channel_id=9, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_2.3.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":false,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 189,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.1 = s64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=8, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_1.2.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0327.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "collective-permute": 1,
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 146,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start = (c128[240,240]{0,1}, c128[240,240]{0,1}) collective-permute-start(%bitcast.26.0), channel_id=1, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}"
+        },
+        {
+          "line": 157,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=7, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_1.0.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0330.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 145,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=6, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_1.2.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0339.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 2
+      },
+      "instructions": [
+        {
+          "line": 70,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.26.1 = c128[64,240,240]{1,0,2} all-to-all(%param_0.6), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}"
+        },
+        {
+          "line": 75,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.30.1 = c128[64,480,120]{2,0,1} all-to-all(%param_0.7), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={1}"
+        }
+      ]
+    },
+    {
+      "file": "module_0341.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 2
+      },
+      "instructions": [
+        {
+          "line": 66,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.26.1 = c128[64,240,240]{2,0,1} all-to-all(%param_0.7), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={1}"
+        },
+        {
+          "line": 71,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.30.1 = c128[64,120,480]{1,0,2} all-to-all(%param_0.8), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={2}"
+        }
+      ]
+    },
+    {
+      "file": "module_0343.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0345.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0347.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 2
+      },
+      "instructions": [
+        {
+          "line": 66,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.26.1 = c128[8,16,4,240]{3,2,0,1} all-to-all(%param_0.7), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={1}"
+        },
+        {
+          "line": 71,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.30.1 = c128[8,8,4,480]{2,1,0,3} all-to-all(%param_0.8), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={3}"
+        }
+      ]
+    },
+    {
+      "file": "module_0349.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 2
+      },
+      "instructions": [
+        {
+          "line": 66,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.26.1 = c128[8,4,240,16]{2,1,0,3} all-to-all(%param_0.7), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={3}"
+        },
+        {
+          "line": 71,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.30.1 = c128[8,4,480,8]{3,1,0,2} all-to-all(%param_0.8), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}"
+        }
+      ]
+    },
+    {
+      "file": "module_0351.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 2
+      },
+      "instructions": [
+        {
+          "line": 70,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.26.1 = c128[8,16,4,96]{3,2,0,1} all-to-all(%param_0.12), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={1}"
+        },
+        {
+          "line": 75,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.30.1 = c128[8,8,4,192]{2,1,0,3} all-to-all(%param_0.13), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={3}"
+        }
+      ]
+    },
+    {
+      "file": "module_0353.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 2
+      },
+      "instructions": [
+        {
+          "line": 70,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.26.1 = c128[8,4,96,16]{2,1,0,3} all-to-all(%param_0.12), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={3}"
+        },
+        {
+          "line": 75,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.30.1 = c128[8,4,192,8]{3,1,0,2} all-to-all(%param_0.13), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}"
+        }
+      ]
+    },
+    {
+      "file": "module_0355.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0357.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0359.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0361.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0363.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0365.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0367.jit_gather.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0369.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0371.jit_gather.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0373.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0375.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0377.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0379.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0381.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0383.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0385.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0387.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0389.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0391.jit_band_mask.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0393.jit_band_mask.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0395.jit_subtract.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0397.jit_minimax_tau_integrate_chi.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0399.jit_less.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0401.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0403.jit_select_n.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0405.jit__broadcast_arrays.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0407.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0409.jit_gather.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0417.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0419.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0421.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0423.jit__solve_w.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 6
+      },
+      "instructions": [
+        {
+          "line": 265,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.7 = c128[2,4,240,240]{3,2,1,0} all-to-all(%param_0.32), channel_id=1, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={0}"
+        },
+        {
+          "line": 270,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.1.1 = c128[1,2,2,480,240]{4,3,2,0,1} all-to-all(%param_0.33), channel_id=2, replica_groups=[2,2]<=[4], dimensions={1}"
+        },
+        {
+          "line": 275,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.2.1 = c128[2,4,240,240]{3,2,1,0} all-to-all(%param_0.34), channel_id=3, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={0}"
+        },
+        {
+          "line": 280,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.3.1 = c128[1,2,2,480,240]{4,3,2,0,1} all-to-all(%param_0.35), channel_id=4, replica_groups=[2,2]<=[4], dimensions={1}"
+        },
+        {
+          "line": 285,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.4.1 = c128[1,2,480,2,240]{4,2,1,0,3} all-to-all(%param_0.36), channel_id=5, replica_groups=[2,2]<=[4], dimensions={3}"
+        },
+        {
+          "line": 290,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.5.1 = c128[4,2,240,240]{3,2,0,1} all-to-all(%param_0.37), channel_id=6, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}"
+        }
+      ]
+    },
+    {
+      "file": "module_0425.jit_abs.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0427.jit__reduce_max.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 73,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[] all-reduce-start(%input_reduce_fusion.1), channel_id=3, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.0.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0430.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0432.jit_exp.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0434.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0436.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "collective-permute": 2,
+        "all-gather": 2,
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 207,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start.1 = ((s32[240,1]{1,0}, pred[240]{0}), (s32[240,1]{1,0}, pred[240]{0})) collective-permute-start(%bitcast.56, %bitcast.1.0), channel_id=13, source_target_pairs={{0,0},{2,1},{1,2},{3,3}}, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 215,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[240,240]{1,0}, c128[480,240]{1,0}) all-gather-start(%bitcast.2.0), channel_id=17, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={0}, use_global_device_ids=true"
+        },
+        {
+          "line": 219,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (c128[240,240]{0,1}, c128[240,480]{0,1}) all-gather-start(%bitcast.45.0), channel_id=30, replica_groups=[2,2]<=[4], dimensions={1}, use_global_device_ids=true"
+        },
+        {
+          "line": 224,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start = (c128[240]{0}, c128[240]{0}) collective-permute-start(%loop_complex_fusion), channel_id=31, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}"
+        },
+        {
+          "line": 229,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[] all-reduce-start(%input_reduce_fusion.1), channel_id=34, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.1.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0457.jit__lorrax_canonical_shard_slice.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0459.jit__lorrax_canonical_shard_slice.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0461.jit_reshape.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0463.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 148,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=6, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_1.2.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0466.jit_conjugate.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0468.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0470.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0472.jit__where.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0474.jit__do_unfold.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 4
+      },
+      "instructions": [
+        {
+          "line": 232,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.52.1 = c128[64,240,240]{1,0,2} all-to-all(%param_0.50), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}"
+        },
+        {
+          "line": 237,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.56.1 = c128[64,480,120]{2,0,1} all-to-all(%param_0.51), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={1}"
+        },
+        {
+          "line": 242,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.60.1 = c128[64,240,240]{2,0,1} all-to-all(%param_0.52), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={1}"
+        },
+        {
+          "line": 247,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.64.1 = c128[64,120,480]{1,0,2} all-to-all(%param_0.53), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={2}"
+        }
+      ]
+    },
+    {
+      "file": "module_0476.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 2
+      },
+      "instructions": [
+        {
+          "line": 184,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[] all-reduce-start(%input_reduce_fusion.3), channel_id=9, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_2.3.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":false,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 192,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.1 = s64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=8, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_1.2.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0480.jit_gather.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0482.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0484.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "collective-permute": 1,
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 149,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start = (c128[240,240]{0,1}, c128[240,240]{0,1}) collective-permute-start(%bitcast.26.0), channel_id=1, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}"
+        },
+        {
+          "line": 160,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=7, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_1.0.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0487.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 148,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=6, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_1.2.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0496.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0498.jit_minimax_tau_integrate_chi.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0500.jit__solve_w.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 6
+      },
+      "instructions": [
+        {
+          "line": 265,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.7 = c128[2,32,240,240]{3,2,1,0} all-to-all(%param_0.32), channel_id=1, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={0}"
+        },
+        {
+          "line": 270,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.1.1 = c128[1,2,16,480,240]{4,3,2,0,1} all-to-all(%param_0.33), channel_id=2, replica_groups=[2,2]<=[4], dimensions={1}"
+        },
+        {
+          "line": 275,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.2.1 = c128[2,32,240,240]{3,2,1,0} all-to-all(%param_0.34), channel_id=3, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={0}"
+        },
+        {
+          "line": 280,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.3.1 = c128[1,2,16,480,240]{4,3,2,0,1} all-to-all(%param_0.35), channel_id=4, replica_groups=[2,2]<=[4], dimensions={1}"
+        },
+        {
+          "line": 285,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.4.1 = c128[1,16,480,2,240]{4,2,1,0,3} all-to-all(%param_0.36), channel_id=5, replica_groups=[2,2]<=[4], dimensions={3}"
+        },
+        {
+          "line": 290,
+          "op": "all-to-all",
+          "instruction": "ROOT %all-to-all.5.1 = c128[32,2,240,240]{3,2,0,1} all-to-all(%param_0.37), channel_id=6, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}"
+        }
+      ]
+    },
+    {
+      "file": "module_0502.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 4
+      },
+      "instructions": [
+        {
+          "line": 60,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.52.1 = c128[64,240,240]{1,0,2} all-to-all(%param_0.13), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}"
+        },
+        {
+          "line": 65,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.56.1 = c128[64,480,120]{2,0,1} all-to-all(%param_0.14), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={1}"
+        },
+        {
+          "line": 70,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.60.1 = c128[64,240,240]{2,0,1} all-to-all(%param_0.15), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={1}"
+        },
+        {
+          "line": 75,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.64.1 = c128[64,120,480]{1,0,2} all-to-all(%param_0.16), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={2}"
+        }
+      ]
+    },
+    {
+      "file": "module_0504.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 4
+      },
+      "instructions": [
+        {
+          "line": 60,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.52.1 = c128[8,240,240]{1,0,2} all-to-all(%param_0.13), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}"
+        },
+        {
+          "line": 65,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.56.1 = c128[8,480,120]{2,0,1} all-to-all(%param_0.14), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={1}"
+        },
+        {
+          "line": 70,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.60.1 = c128[8,240,240]{2,0,1} all-to-all(%param_0.15), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={1}"
+        },
+        {
+          "line": 75,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.64.1 = c128[8,120,480]{1,0,2} all-to-all(%param_0.16), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={2}"
+        }
+      ]
+    },
+    {
+      "file": "module_0506.jit__psum.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 57,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = u8[4096]{0} all-reduce-start(%bitcast.1), channel_id=1, replica_groups=[1,4]<=[4], use_global_device_ids=true, to_apply=%region_0.0.clone"
+        }
+      ]
+    },
+    {
+      "file": "module_0509.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 1
+      },
+      "instructions": [
+        {
+          "line": 5,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (u8[1,4096]{1,0}, u8[4,4096]{1,0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0511.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 1
+      },
+      "instructions": [
+        {
+          "line": 5,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (u32[1]{0}, u32[4]{0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0513.jit_sqrt.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0515.jit_true_divide.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0517.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0519.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0521.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0523.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0525.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0527.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0529.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0531.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0533.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0535.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0537.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0539.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0541.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0543.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0545.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0547.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0549.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0551.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0553.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0555.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0557.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0559.jit_sigma_sx.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0585.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 2
+      },
+      "instructions": [
+        {
+          "line": 24,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[64,16,16]{1,0,2}, c128[64,16,32]{1,0,2}) all-gather-start(%bitcast.19.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 28,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (c128[64,16,32]{2,0,1}, c128[64,32,32]{2,0,1}) all-gather-start(%bitcast.23.0), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_0587.jit_zeros.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0589.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0591.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 2
+      },
+      "instructions": [
+        {
+          "line": 78,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.26.1 = c128[8,96,84]{1,0,2} all-to-all(%param_0.9), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}"
+        },
+        {
+          "line": 83,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.30.1 = c128[8,192,42]{2,0,1} all-to-all(%param_0.10), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={1}"
+        }
+      ]
+    },
+    {
+      "file": "module_0593.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 2
+      },
+      "instructions": [
+        {
+          "line": 78,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.26.1 = c128[8,96,96]{2,0,1} all-to-all(%param_0.9), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={1}"
+        },
+        {
+          "line": 83,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.30.1 = c128[8,48,192]{1,0,2} all-to-all(%param_0.10), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={2}"
+        }
+      ]
+    },
+    {
+      "file": "module_0595.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0597.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0599.jit_insert.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0601.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0603.jit_swapaxes.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0605.jit_conjugate.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0607.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0609.jit_view_local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0611.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0613.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0615.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0617.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0619.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0621.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0623.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0625.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0627.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0629.jit_diagonal.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0634.jit__pad.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0636.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0638.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0640.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0642.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0644.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0646.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0648.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0650.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0652.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0654.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0656.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0658.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0660.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0662.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0664.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0666.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0668.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0670.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0672.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0674.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0676.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0678.jit_contract_block.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0686.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0688.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0690.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0692.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0694.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0696.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0698.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0700.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0702.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0704.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0706.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0708.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0710.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0712.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0714.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0716.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0718.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0720.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0722.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0724.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0726.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0728.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0730.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0732.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0734.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0736.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0738.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0740.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0742.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0744.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0746.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0748.jit_contract_block.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0756.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0758.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0760.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0762.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0764.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0766.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0768.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0770.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0772.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0774.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0776.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0778.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0780.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0782.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0784.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0786.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0788.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0790.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0792.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0794.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0796.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0798.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0800.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0802.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0804.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0806.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0808.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0810.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0812.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0814.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0816.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0818.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0820.jit_contract_block.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0828.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0830.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0832.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0834.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0836.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0838.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0840.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0842.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0844.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0846.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0848.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0850.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0852.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0854.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0856.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0858.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0860.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0862.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0864.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0866.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0868.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0870.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0872.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0874.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0876.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0878.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0880.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0882.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0884.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0886.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0888.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0890.jit_contract_block.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0898.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0900.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0902.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0904.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0906.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0908.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0910.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0912.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0914.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0916.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0918.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0920.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0922.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0924.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0926.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0928.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0930.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0932.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0934.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0936.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0938.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0940.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0942.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0944.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0946.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0948.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0950.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0952.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0954.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0956.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0958.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0960.jit_contract_block.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0968.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0970.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0972.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0974.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0976.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0978.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0980.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0982.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0984.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0986.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0988.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0990.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0992.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0994.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0996.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_0998.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1000.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1002.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1004.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1006.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1008.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1010.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1012.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1014.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1016.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1018.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1020.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1022.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1024.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1026.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1028.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1030.jit_contract_block.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1038.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1040.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1042.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1044.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1046.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1048.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1050.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1052.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1054.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1056.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1058.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1060.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1062.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1064.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1066.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1068.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1070.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1072.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1074.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1076.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1078.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1080.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1082.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1084.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1086.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1088.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1090.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1092.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1094.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1096.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1098.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1100.jit_contract_block.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1108.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1110.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1112.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1114.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1116.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1118.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1120.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1122.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1124.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1126.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1128.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1130.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1132.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1134.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1136.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1138.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1140.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1142.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1144.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1146.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1148.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1150.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1152.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1154.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1156.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1158.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1160.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1162.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1164.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1166.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1168.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1170.jit_contract_block.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1178.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1180.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1182.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1184.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1186.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1188.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1190.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1192.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1194.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1196.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1198.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1200.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1202.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1204.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1206.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1208.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1210.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1212.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1214.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1216.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1218.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1220.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1222.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1224.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1226.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1228.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1230.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1232.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1234.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1236.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1238.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1240.jit_contract_block.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1248.jit__f.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1256.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1258.jit_subtract.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1260.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1262.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1264.jit_concatenate.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1266.jit__body.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 58,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[4,24,24,24]{3,2,1,0} all-reduce-start(%bitcast.1), channel_id=1, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.0"
+        }
+      ]
+    },
+    {
+      "file": "module_1269.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1271.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1273.jit__kernel.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1275.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1277.jit_squeeze.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1279.jit__valence_density_kernel.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1281.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1283.jit_iota.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1285.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1287.jit_remainder.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1289.jit_subtract.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1291.jit_true_divide.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1293.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1295.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1297.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1299.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1301.jit_dynamic_slice.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1303.jit_squeeze.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1305.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1307.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1309.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1311.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1313.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1315.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1317.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1319.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1321.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1323.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1325.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1327.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1329.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1331.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1333.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1335.jit_iota.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1337.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1339.jit_equal.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1341.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1343.jit_equal.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1345.jit_bitwise_and.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1347.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1349.jit_equal.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1351.jit_bitwise_and.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1353.jit__where.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1355.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1357.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1359.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1361.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1363.jit__broadcast_arrays.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1365.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1367.jit_concatenate.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1369.jit__moveaxis.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1371.jit_fft.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1373.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1375.jit__reduce_prod.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1377.jit_sqrt.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1379.jit_true_divide.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1381.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1383.jit__moveaxis.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1385.jit__moveaxis.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1387.jit__moveaxis.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1389.jit__moveaxis.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1391.jit_greater.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1393.jit__where.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1395.jit_reshape.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1397.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1399.jit__reduce_sum.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1401.jit_true_divide.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1403.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1405.jit_subtract.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1407.jit__moveaxis.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1409.jit__moveaxis.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1411.jit_bitwise_not.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1413.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1415.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1417.jit__where.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1419.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1421.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1423.jit_true_divide.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1425.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1427.jit_concatenate.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1429.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1431.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1433.jit__squeeze.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1435.jit_scatter.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1437.jit__moveaxis.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1439.jit_fft.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1441.jit_real.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1443.jit_reshape.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1445.jit_less.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1447.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1449.jit_select_n.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1451.jit__broadcast_arrays.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1453.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1455.jit_gather.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1457.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1459.jit__mean.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1461.jit_reshape.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1463.jit_abs.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1465.jit__reduce_max.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1467.jit_subtract.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1469.jit__reduce_sum.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1471.jit__moveaxis.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1473.jit_fft.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1475.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1477.jit__moveaxis.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1479.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1481.jit_true_divide.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1483.jit__squeeze.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1485.jit_scatter.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1487.jit__moveaxis.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1489.jit_fft.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1491.jit_real.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1493.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1495.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1497.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1499.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1501.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1503.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1505.jit__kernel.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1507.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1509.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1511.jit_true_divide.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1513.jit_sqrt.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1515.jit_true_divide.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1517.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1519.jit_dynamic_slice.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1521.jit_squeeze.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1523.jit_dynamic_slice.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1525.jit_squeeze.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1527.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1529.jit_reshape.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1531.jit__run.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "collective-permute": 1,
+        "all-gather": 2
+      },
+      "instructions": [
+        {
+          "line": 293,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start = (c128[2,1,8,4,588]{4,3,0,2,1}, c128[2,1,8,4,588]{4,3,0,2,1}) collective-permute-start(%bitcast.137.0), channel_id=3, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}"
+        },
+        {
+          "line": 296,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[2,8,4,588]{3,2,0,1}, c128[2,16,4,588]{3,2,0,1}) all-gather-start(%bitcast.141.0), channel_id=4, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true"
+        },
+        {
+          "line": 303,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (c128[8,4,588]{2,1,0}, c128[16,4,588]{2,1,0}) all-gather-start(%bitcast.23.0), channel_id=5, replica_groups=[2,2]<=[4], dimensions={0}, use_global_device_ids=true, frontend_attributes={trivially_pipelineable=\"\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1563.jit_gather.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1565.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1567.jit__f.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1575.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1577.jit_subtract.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1579.jit__gn_ppm_fit_kernel.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "collective-permute": 1,
+        "all-reduce": 3
+      },
+      "instructions": [
+        {
+          "line": 255,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start = (pred[240]{0}, pred[240]{0}) collective-permute-start(%param.3), channel_id=1, source_target_pairs={{0,0},{2,1},{1,2},{3,3}}"
+        },
+        {
+          "line": 273,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.2 = f64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=11, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_1.2.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 281,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[] all-reduce-start(%input_reduce_fusion), channel_id=10, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.1.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":false,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 286,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.1 = f64[] all-reduce-start(%input_reduce_fusion.3), channel_id=12, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_2.3.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1584.jit__lorrax_canonical_shard_slice.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1586.jit_maximum.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1588.jit_true_divide.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1590.jit_reshape.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1592.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1594.jit__coarsen_gn_ppm_extreme_tails.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 11,
+        "collective-permute": 2,
+        "all-gather": 5
+      },
+      "instructions": [
+        {
+          "line": 338,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = s64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=44, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_5.5.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 1077,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.1 = s64[] all-reduce-start(%input_reduce_fusion.13), channel_id=45, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.0.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 1090,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.2 = s64[] all-reduce-start(%input_reduce_fusion.18), channel_id=46, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_1.2.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 1095,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.3 = s64[] all-reduce-start(%input_reduce_fusion.19), channel_id=47, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_2.3.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 1112,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.9 = s64[2]{0} all-reduce-start(%wrapped_concatenate.1), channel_id=49, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_8.9.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 1134,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start = ((pred[64,240,240]{2,0,1}, pred[64,240,240]{2,0,1}), (pred[64,240,240]{2,0,1}, pred[64,240,240]{2,0,1})) collective-permute-start(%bitcast.474.0, %bitcast.446.0), channel_id=27, source_target_pairs={{0,0},{1,2},{2,1},{3,3}}, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 1143,
+          "op": "collective-permute-start",
+          "instruction": "%collective-permute-start.1 = ((pred[64,240,240]{1,0,2}, pred[64,240,240]{2,0,1}), (pred[64,240,240]{1,0,2}, pred[64,240,240]{2,0,1})) collective-permute-start(%bitcast.478.0, %bitcast.450.0), channel_id=28, source_target_pairs={{0,0},{2,1},{1,2},{3,3}}, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 1147,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (pred[64,240,240]{1,0,2}, pred[64,240,480]{1,0,2}) all-gather-start(%bitcast.442.0), channel_id=13, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true"
+        },
+        {
+          "line": 1151,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.2 = (pred[64,240,240]{1,0,2}, pred[64,240,480]{1,0,2}) all-gather-start(%bitcast.470.0), channel_id=22, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true"
+        },
+        {
+          "line": 1155,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (pred[64,240,480]{2,0,1}, pred[64,480,480]{2,0,1}) all-gather-start(%bitcast.430.0), channel_id=14, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true"
+        },
+        {
+          "line": 1157,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.3 = ((pred[64,240,240]{1,0,2}, pred[64,480,240]{1,0,2}, pred[64,240,240]{1,0,2}), (pred[64,240,480]{1,0,2}, pred[64,480,480]{1,0,2}, pred[64,240,480]{1,0,2})) all-gather-start(%bitcast.462.0, %bitcast.533, %bitcast.434.0), channel_id=24, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={2}, use_global_device_ids=true"
+        },
+        {
+          "line": 1167,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.4 = ((pred[64,240,480]{2,0,1}, pred[64,240,480]{2,0,1}), (pred[64,480,480]{2,0,1}, pred[64,480,480]{2,0,1})) all-gather-start(%bitcast.466.0, %bitcast.438.0), channel_id=25, replica_groups=[2,2]<=[4], dimensions={1}, use_global_device_ids=true"
+        },
+        {
+          "line": 1181,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.10 = s64[2]{0} all-reduce-start(%wrapped_concatenate.2), channel_id=53, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_12.13.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 1193,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.5 = f64[] all-reduce-start(%input_reduce_fusion.21), channel_id=51, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_10.11.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":false,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 1196,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.4 = pred[] all-reduce-start(%input_reduce_fusion.20), channel_id=50, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_9.10.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":false,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 1199,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.6 = f64[] all-reduce-start(%input_reduce_fusion.23), channel_id=52, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_11.12.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 1212,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.8 = f64[] all-reduce-start(%input_reduce_fusion.22), channel_id=56, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_15.16.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":false,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 1215,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.7 = f64[] all-reduce-start(%input_reduce_fusion.24), channel_id=55, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_14.15.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":false,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1619.jit_reshape.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1621.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1623.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1625.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1627.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1629.jit__prepare_sigma_state.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 259,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = s64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=5, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_3.4.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1632.jit__reduce_sum.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 70,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = s64[64]{0} all-reduce-start(%input_reduce_fusion.1), channel_id=3, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.0.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1635.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1637.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1639.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1641.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1643.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1645.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1647.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1649.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1651.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1653.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1655.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1657.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1659.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1661.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1663.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1665.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1667.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1669.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1671.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1673.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1675.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1677.jit__where.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1679.jit_prep_w.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1681.jit__take.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1686.jit_swapaxes.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1688.jit_reshape.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1690.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1692.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1694.jit_conjugate.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1696.jit_swapaxes.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1698.jit_reshape.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1700.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1702.jit_reshape.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1704.jit_swapaxes.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1706.jit_reshape.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1708.jit_swapaxes.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1710.jit_transpose.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1712.jit_reshape.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1714.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1716.jit__do_unfold.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1718.jit_reshape.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1720.jit_transpose.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1722.jit_optimization_barrier.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1724.jit_conjugate.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1726.jit__einsum.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1728.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1730.jit_conv_project.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1744.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 2
+      },
+      "instructions": [
+        {
+          "line": 24,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[64,16,16]{1,0,2}, c128[64,16,32]{1,0,2}) all-gather-start(%bitcast.19.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 28,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (c128[64,16,32]{2,0,1}, c128[64,32,32]{2,0,1}) all-gather-start(%bitcast.23.0), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1746.jit_band_mask.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1748.jit_convert_element_type.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1750.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1752.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1754.jit__lorrax_canonical_shard_slice.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1756.jit__ppm_as_one_pole_store_fields.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1758.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 4
+      },
+      "instructions": [
+        {
+          "line": 60,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.52.1 = c128[1,64,240,240]{2,1,0,3} all-to-all(%param_0.13), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={3}"
+        },
+        {
+          "line": 65,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.56.1 = c128[1,64,480,120]{3,1,0,2} all-to-all(%param_0.14), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}"
+        },
+        {
+          "line": 70,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.60.1 = c128[1,64,240,240]{3,1,0,2} all-to-all(%param_0.15), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={2}"
+        },
+        {
+          "line": 75,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.64.1 = c128[1,64,120,480]{2,1,0,3} all-to-all(%param_0.16), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={3}"
+        }
+      ]
+    },
+    {
+      "file": "module_1760.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1762.jit_real.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1764.jit_isfinite.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1766.jit_imag.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1768.jit_bitwise_and.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1770.jit_abs.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1772.jit_greater.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1774.jit_less_equal.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1776.jit_bitwise_or.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1778.jit_bitwise_not.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1780.jit__reduce_sum.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 74,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = s64[] all-reduce-start(%input_reduce_fusion.1), channel_id=3, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.0.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1783.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1785.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1787.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1789.jit_isfinite.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1791.jit__reduce_all.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 75,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = pred[] all-reduce-start(%input_reduce_fusion.1), channel_id=3, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.0.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1794.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1796.jit_concatenate.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1798.jit__pole_refusal_counts.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 170,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = s64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=5, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.0.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1801.jit__stats_all_poles.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 3
+      },
+      "instructions": [
+        {
+          "line": 291,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.2 = f64[2]{0} all-reduce-start(%wrapped_concatenate.1), channel_id=13, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_2.3.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 301,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = s64[1]{0} all-reduce-start(%bitcast.7.0), channel_id=11, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.0.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":false,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 303,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.1 = f64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=12, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_1.2.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1806.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 1
+      },
+      "instructions": [
+        {
+          "line": 5,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (s32[1]{0}, s32[4]{0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1808.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 1
+      },
+      "instructions": [
+        {
+          "line": 5,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (u8[1,1535]{1,0}, u8[4,1535]{1,0}) all-gather-start(%param), channel_id=1, replica_groups=[1,4]<=[4], dimensions={0}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1810.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1812.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1814.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1816.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1818.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1820.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1822.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1824.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1826.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1828.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1830.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1832.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1834.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1836.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1838.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1840.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1842.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1844.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1846.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1848.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1850.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1852.jit__local.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1854.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-to-all": 4
+      },
+      "instructions": [
+        {
+          "line": 60,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.52.1 = c128[1,64,240,240]{2,1,0,3} all-to-all(%param_0.13), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={3}"
+        },
+        {
+          "line": 65,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.56.1 = c128[1,64,480,120]{3,1,0,2} all-to-all(%param_0.14), channel_id=1, replica_groups={{0,2},{1,3}}, dimensions={2}"
+        },
+        {
+          "line": 70,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.60.1 = c128[1,64,240,240]{3,1,0,2} all-to-all(%param_0.15), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={2}"
+        },
+        {
+          "line": 75,
+          "op": "all-to-all",
+          "instruction": "ROOT %all_to_all.64.1 = c128[1,64,120,480]{2,1,0,3} all-to-all(%param_0.16), channel_id=1, replica_groups={{0,1},{2,3}}, dimensions={3}"
+        }
+      ]
+    },
+    {
+      "file": "module_1856.jit__take.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1861.jit__take.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1863.jit__tau.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1877.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1879.jit__lorrax_canonical_shard_slice.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1881.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1883.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1885.jit__lambda.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1887.jit__add_diag.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1889.jit__diag_sharded.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 140,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = c128[9,64,32]{2,1,0} all-reduce-start(%bitcast.8.0), channel_id=1, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.1"
+        }
+      ]
+    },
+    {
+      "file": "module_1892.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1894.jit__ev_tensors.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1896.jit_multiply.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1898.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 2
+      },
+      "instructions": [
+        {
+          "line": 24,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[64,16,16]{1,0,2}, c128[64,16,32]{1,0,2}) all-gather-start(%bitcast.19.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 28,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (c128[64,16,32]{2,0,1}, c128[64,32,32]{2,0,1}) all-gather-start(%bitcast.23.0), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1900.jit_gather.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1902.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1904.jit__take.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1912.jit__take.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1917.jit__take.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1925.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 2
+      },
+      "instructions": [
+        {
+          "line": 24,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[8,16,16]{1,0,2}, c128[8,16,32]{1,0,2}) all-gather-start(%bitcast.19.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 28,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (c128[8,16,32]{2,0,1}, c128[8,32,32]{2,0,1}) all-gather-start(%bitcast.23.0), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1927.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1929.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1931.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1933.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1935.jit__kernel.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 2
+      },
+      "instructions": [
+        {
+          "line": 489,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[64,16,16]{1,0,2}, c128[64,16,32]{1,0,2}) all-gather-start(%bitcast.222.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true"
+        },
+        {
+          "line": 493,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (c128[64,16,32]{2,0,1}, c128[64,32,32]{2,0,1}) all-gather-start(%bitcast.226.0), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true"
+        }
+      ]
+    },
+    {
+      "file": "module_1961.jit_gather.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1963.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1965.jit__squeeze.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1967.jit_scatter.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1969.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1971.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 2
+      },
+      "instructions": [
+        {
+          "line": 169,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = f64[] all-reduce-start(%input_reduce_fusion), channel_id=9, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_2.3.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":false,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        },
+        {
+          "line": 177,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start.1 = s64[2]{0} all-reduce-start(%wrapped_concatenate), channel_id=8, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_1.2.clone, backend_config={\"operation_queue_id\":\"0\",\"wait_on_operation_queues\":[],\"collective_backend_config\":{\"is_sync\":true,\"is_pipelined\":false,\"backend\":\"DEFAULT\"},\"force_earliest_schedule\":false,\"reification_cost\":[],\"device_type\":\"DEVICE_TYPE_INVALID\"}"
+        }
+      ]
+    },
+    {
+      "file": "module_1975.jit__per_rank.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1977.jit__f.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1982.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1984.jit_broadcast_in_dim.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1986.jit__identity_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1988.jit__diag_sharded.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-reduce": 1
+      },
+      "instructions": [
+        {
+          "line": 139,
+          "op": "all-reduce-start",
+          "instruction": "%all-reduce-start = c128[1,64,32]{2,1,0} all-reduce-start(%bitcast.8.0), channel_id=1, replica_groups={{0,1,2,3}}, use_global_device_ids=true, to_apply=%region_0.1"
+        }
+      ]
+    },
+    {
+      "file": "module_1991.jit__set_diag.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1993.jit_gather.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1995.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1997.jit_swapaxes.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_1999.jit_conjugate.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_2001.jit_add.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {
+        "all-gather": 3
+      },
+      "instructions": [
+        {
+          "line": 65,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start = (c128[64,16,16]{1,0,2}, c128[64,16,32]{1,0,2}) all-gather-start(%bitcast.38.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true"
+        },
+        {
+          "line": 69,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.2 = ((c128[64,16,16]{2,0,1}, c128[64,16,32]{2,0,1}), (c128[64,32,16]{2,0,1}, c128[64,32,32]{2,0,1})) all-gather-start(%bitcast.61, %bitcast.42.0), channel_id=3, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true"
+        },
+        {
+          "line": 76,
+          "op": "all-gather-start",
+          "instruction": "%all-gather-start.1 = (c128[64,16,32]{2,0,1}, c128[64,32,32]{2,0,1}) all-gather-start(%bitcast.50.0), channel_id=4, replica_groups=[2,2]<=[4], dimensions={1}, use_global_device_ids=true"
+        }
+      ]
+    },
+    {
+      "file": "module_2003.jit_eigh.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    },
+    {
+      "file": "module_2005.jit_fn.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    }
+  ]
+}

@@ -252,7 +252,7 @@ is0.004416ms. No separate dense4×4 GEMM occurs in this sampled pre-G range.
 
 Optimized HLO: all64 P contract_block modules contain zero explicit
 collectives; all4 F modules contain4 all-gathers statically across their
-conditional branches. The selected F execution runs2 native all-gathers plus
+conditional branches plus one collective-permute start (the canonical analyzer omitted that async opcode; the supplementary census repairs it). The selected F execution runs2 native all-gathers plus
 1 SendRecv. P's broadcasts live inside GEMM FFI and are invisible to HLO.
 P body/head TT peak HLO bytes/rank are13,524,977 /9,748,977.
 
@@ -307,3 +307,45 @@ M16 shape-only normalization still has1135 enclosing compilation events and64 co
 M18 retains existing C,D accumulation order and all SymMaps rules. It compiles four family transports per term, retains only local callable metadata, and streams source→full→mixed→accumulator. Additional live scalar full-q temporaries are bounded by two block payloads while Python references survive, unlike a16-output cache. For the largest CC block this bound is2,654,208 bytes/rank (2×16×9×192²/4); TT is720,000 bytes/rank. G and interaction objects remain sharded across all P ranks. Actual peak after source integration still requires HLO measurement.
 
 These results rank **shape-class restore compilation** and **shape-only GEMM plan reuse** first for implementation. Their isolated caller savings are62.114s and51.438s respectively; adding isolated savings is only a prediction until the combined gate runs. Resident family faces can remove at most the sampled pre-G32us per body/head TT unit (about3ms over96 similar calls), far below these host costs. The current dense spin action is fused in that bound; a new two-block action is not justified by this capture.
+
+### Dynamic warm nodes on common certified schedules
+
+Both pins are unchanged. All four captures completed on JID57966610, sequential P4. Exact step IDs and reduced native/host/HLO receipts are in dynamic_profile_receipts.json; raw files live in Si I13/I14 and MoS2 M20/M21. Both arms use identical selected certificate files per window and29/67 nodes. Certificate replay is a **performance control**: against Si's original selected rules it changes eqp0 by up to0.518ueV, so it is not an identity gate against the original schedule. A source-change gate uses the same selected schedule on both sides.
+
+| one tau unit | Si P I13 | Si F I14 | MoS2 P M20 | MoS2 F M21 |
+|---|---:|---:|---:|---:|
+| node count |29|29|67|67|
+| compiled complete tau modules |1|1|1|1|
+| timed-call compilation events / seconds |1 /0.142032|1 /0.139448|1 /0.151560|1 /0.144964|
+| first timed host call ms |194.154|242.957|169.407|163.294|
+| warm host median ms |39.503|92.061|2.485|5.418|
+| second node projected GPU ms |38.633553|91.150714|1.974432|4.942591|
+| second node native kernel sum ms |37.893873|85.287356|1.561376|4.200191|
+| HLO peak bytes/rank |2,020,215,829|2,068,595,829|52,074,838|52,901,645|
+| explicit HLO collectives/node |0|0|2 collective-permute starts|0|
+
+**The alleged bispinor steady-node inversion is not reproduced.** P is faster on both gate decks. The original stage regression is dominated by static/bare caller compilation and eager planning, with rule-cache misses additionally distorting dynamic totals. The complete tau module does not recompile per node or plan identity. First-call compilation here does not include the separately prewarmed spatial/planning graph; that work belongs to Sigma other.
+
+Si P spends0.970592ms in its parent Green GEMM,16.913465ms in the full-k convolution,4.507422/0.843488ms in its two parent-band projection GEMMs,0.231776ms selecting parent rows and0.002688ms unfolding bands. F spends10.016735ms in full-k Green,16.892479ms in convolution and49.944957/8.946687ms in projection. Both convolve on full K; P saves parent GEMM and projection work. Native NCCL broadcasts/node are96 versus768, summing4.845150 versus56.587261ms.
+
+P's extra open-spin transport range is14.938586ms. Its two dense spin GEMMs sum9.646109ms and three surrounding operator layout kernels sum5.147709ms. This is distinct from the static face spin action's32us enclosing bound: dynamic transport acts on O(K s² M_C²/P) elements. A generic elementwise application of the **same supplied spin matrix** is now under ablation at the existing symmetry owner; it requires no determinant or block-diagonal rule in Sigma.
+
+MoS2 P's corresponding transport range is0.360832ms, including0.225312ms of dense spin GEMMs. Parent Green is0.359424ms, convolution0.108160ms, projection0.624992/0.276832ms and parent-row gather0.016160ms. Two antiunitary transposes are explicit collectives: operator payload7,077,888 bytes/rank at0.031808ms and band payload32,400 bytes/rank at0.006944ms. The literal final-psum-only invariant is **not satisfied by this pre-existing dynamic route**. It is registered, not hidden or bypassed. The optimizations must not introduce another collective.
+
+### Seam accounting and corrected async census
+
+The canonical HLO analyzer omits collective-permute-start. Its unmodified results remain on disk; M00_tools/census_async_starts.py counts optimized async starts once and excludes done operations. Static P's64 contraction and300 restore modules are still collective-free at HLO level under this corrected census. F static modules each have4 all-gathers across branches and1 collective-permute; the selected native execution runs2 all-gathers and1 SendRecv. FFI GEMM broadcasts are additional native communication in both pins.
+
+seam_receipts.json maps exact compiled modules to source contexts. MoS2 static band unfold executes18 times,1.543712ms projected total /0.237376ms native kernel sum, peak537,901 bytes/rank. It has one collective-permute per invocation, with18 native SendRecv kernels; this is the small band seam after parent contraction. There is no per-Lorentz-block band unfold in that static loop.
+
+MoS2's known startup family conversions execute10 times (1.654749ms projected); screening's file-to-packed TT conversions execute32 times (3.953467ms projected), attributed to ZW rather than Sigma. One additional carrier module has insufficient caller metadata for a stage assignment (0.322624ms). Si's bare Sigma input conversions execute32 times through2 compiled modules (4.186365ms projected /2.471006ms kernel sum); each executable has2 all-to-all instructions. Six startup calls cost3.822589ms, and7 calls lacking outer caller metadata cost18.575128ms across the complete driver. These unattributed calls are not silently assigned to Sigma or screening. F's canonical carrier needs no packed-basis conversion.
+
+This bounds the measured seam/device opportunity well below the tens of seconds recovered by compiler lifetime. A writer/reshard fusion would need a new capacity/scaling gate; no seam rule or canonical file order is changed here.
+
+### Further isolated ablations
+
+M22 combines plan reuse and family restore compilation: static caller42.946s,276 compilation events, with exact90-row identity. M30 additionally shares body/head G (without weight normalization):29.662s,244 events,32 contraction modules and48 combined calls; warm combined host median3.269ms. M31 instead normalizes both weight shape **and replicated placement**:29.491s,245 events,32 contraction modules with separate body/head, and32 warm calls per output mode. Each passes eqp0/eqp1 tolerance0 and all90 printed state rows.
+
+M22 input_signatures.jsonl identifies the otherwise identical TT COH call's differing leaf: occupied weights use NamedSharding(P()), while COH weights use SingleDeviceSharding. Shape-only broadcasting cannot unify those signatures. M31 applies an explicit replicated constraint to this small(nk,nb) operand, avoiding a second specialization. It does not replicate any mu-square object.
+
+Si I17's generic elementwise4c rotation preserves eqp0/eqp1 and all256 state rows against the common-certificate I13 control, but its warm native unit is39.206614ms versus38.633553ms. It is rejected as a speedup. A following block-structure ablation validates exact zero off-diagonal2x2 blocks in the supplied typed spin action before omitting zero products; it does not reconstruct determinant or rotation signs.
