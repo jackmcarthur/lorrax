@@ -1,0 +1,122 @@
+[
+  {
+    "system": "Si",
+    "mode": "03_gn_ppm",
+    "channel": 1,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/Si_03_gn_ppm_zeta_mu1.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(8, 168, 588) dtype=complex128 tiles=8 values=790272 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  },
+  {
+    "system": "Si",
+    "mode": "03_gn_ppm",
+    "channel": 2,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/Si_03_gn_ppm_zeta_mu2.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(8, 168, 588) dtype=complex128 tiles=8 values=790272 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  },
+  {
+    "system": "Si",
+    "mode": "03_gn_ppm",
+    "channel": 3,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/Si_03_gn_ppm_zeta_mu3.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(8, 168, 588) dtype=complex128 tiles=8 values=790272 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  },
+  {
+    "system": "Si",
+    "mode": "04_cohsex",
+    "channel": 1,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/Si_04_cohsex_zeta_mu1.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(8, 168, 588) dtype=complex128 tiles=8 values=790272 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  },
+  {
+    "system": "Si",
+    "mode": "04_cohsex",
+    "channel": 2,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/Si_04_cohsex_zeta_mu2.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(8, 168, 588) dtype=complex128 tiles=8 values=790272 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  },
+  {
+    "system": "Si",
+    "mode": "04_cohsex",
+    "channel": 3,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/Si_04_cohsex_zeta_mu3.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(8, 168, 588) dtype=complex128 tiles=8 values=790272 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  },
+  {
+    "system": "MoS2",
+    "mode": "03_full_static_cohsex",
+    "channel": 1,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/MoS2_03_full_static_cohsex_zeta_mu1.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(3, 98, 1963) dtype=complex128 tiles=3 values=577122 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  },
+  {
+    "system": "MoS2",
+    "mode": "03_full_static_cohsex",
+    "channel": 2,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/MoS2_03_full_static_cohsex_zeta_mu2.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(3, 98, 1963) dtype=complex128 tiles=3 values=577122 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  },
+  {
+    "system": "MoS2",
+    "mode": "03_full_static_cohsex",
+    "channel": 3,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/MoS2_03_full_static_cohsex_zeta_mu3.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(3, 98, 1963) dtype=complex128 tiles=3 values=577122 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  },
+  {
+    "system": "MoS2",
+    "mode": "04_packed_bare_transverse",
+    "channel": 1,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/MoS2_04_packed_bare_transverse_zeta_mu1.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(3, 98, 1963) dtype=complex128 tiles=3 values=577122 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  },
+  {
+    "system": "MoS2",
+    "mode": "04_packed_bare_transverse",
+    "channel": 2,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/MoS2_04_packed_bare_transverse_zeta_mu2.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(3, 98, 1963) dtype=complex128 tiles=3 values=577122 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  },
+  {
+    "system": "MoS2",
+    "mode": "04_packed_bare_transverse",
+    "channel": 3,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/MoS2_04_packed_bare_transverse_zeta_mu3.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(3, 98, 1963) dtype=complex128 tiles=3 values=577122 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  },
+  {
+    "system": "MoS2",
+    "mode": "05_dynamic_packed_gn_ppm",
+    "channel": 1,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/MoS2_05_dynamic_packed_gn_ppm_zeta_mu1.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(3, 98, 1963) dtype=complex128 tiles=3 values=577122 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  },
+  {
+    "system": "MoS2",
+    "mode": "05_dynamic_packed_gn_ppm",
+    "channel": 2,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/MoS2_05_dynamic_packed_gn_ppm_zeta_mu2.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(3, 98, 1963) dtype=complex128 tiles=3 values=577122 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  },
+  {
+    "system": "MoS2",
+    "mode": "05_dynamic_packed_gn_ppm",
+    "channel": 3,
+    "rc": 0,
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/111_bisp_orch_codex_2026-09-05/sub_02_controls/MoS2_05_dynamic_packed_gn_ppm_zeta_mu3.txt",
+    "summary": "ZETA_SUMMARY dataset=/zeta_q_G shape=(3, 98, 1963) dtype=complex128 tiles=3 values=577122 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=1.00000000000000003e-13 status=PASS"
+  }
+]

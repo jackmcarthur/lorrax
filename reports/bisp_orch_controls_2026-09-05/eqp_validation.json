@@ -1,0 +1,19 @@
+{
+  "eqp0.dat": {
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/04_cohsex/main/eqp0.dat",
+    "kpoints": 8,
+    "rows": 256,
+    "finite": true
+  },
+  "eqp1.dat": {
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/04_cohsex/main/eqp1.dat",
+    "kpoints": 8,
+    "rows": 256,
+    "finite": true
+  },
+  "sectors": {
+    "rows": 256,
+    "max_closure_error_ev": 1.7763568394002505e-15
+  },
+  "scope": "Single-arm disk validation only; no main/lane QP comparison possible; combined lx step exit1."
+}
