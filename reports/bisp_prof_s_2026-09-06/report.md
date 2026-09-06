@@ -77,6 +77,72 @@ Pending optimized rank0 dumps and `tools/hlo/analyze_hlo_dump.py`. Count async s
 
 `w_isdf.py:2003` owns implementation, but calls from `photon_sigma.contract_lorentz_blocks` occur during Sigma. Charge **those invocations once to Sigma**, including restore/mix compilation there. Screening's own invocations, if present, remain screening. ZW should read this section; this lane has not edited `w_isdf.py` or any screening file. A prospective restore-lifetime fix needs an ownership agreement before either lane edits the shared function.
 
+## Architectural proposals
+
+This ranking is **provisional, by removable invocation count and implementation
+complexity**, not measured speedup. No candidate is accepted for production until
+baseline device and compile receipts exist. Boundary ms and allocator peaks are
+still unknown. The historical MoS2 full-static Sigma wall, 150.14 s at BFC@0.85/P4,
+is only a trivial upper bound on any single Sigma optimization's elapsed saving;
+it cannot be divided among source calls to manufacture per-call timings.
+
+All candidates retain canonical P-independent files and typed SymMaps actions.
+All mu-square intermediates must remain distributed on both mesh axes. The
+final-psum-only requirement is a gate to establish, not an invariant certified by
+this source inspection. Acceptance requires eqp0/eqp1 tolerance zero, printed
+sigCC/sigTT/sigCT identity, optimized HLO payload/collective checks and the combined
+P4 leg. Changed summation order is not excused by a loose cross-source tolerance.
+
+| priority / candidate | boundary and numerical work bound | proposed flow, deletion, and disposition |
+|---|---|---|
+| 1. Restore callable lifetime | 300 restore/add JIT creations plus 48 zero initializers for full static | Reuse compiled restore/add work at its existing owner across terms, preserving C,D order and streaming one output. Deletes loop-local callable creation. No extra resident dense output required. Coordinate implementation in w_isdf.py with ZW; pending measurement and ownership agreement. |
+| 2. Share body/head G | 96 G builds become 48 in a full-static run with heads; 192 face unfolds become 96 | Build G once per block/term and feed body and q0 convolutions before releasing it. Deletes separate G construction in q0-only path. Prefer one compiled call returning two small band operators so G lifetime need not escape the kernel. Bounded 50% reduction in G work, not 50% of Sigma wall. Pending measured head cost. |
+| 3. Resident family faces | 192 endpoint unfolds become 12 for two faces per family per term, if vertices are applied after canonical unfolding | Unfold four unvertexed faces once at term entry; apply the canonical gamma vertex at each block consumer. Delete in-block repeated child transport. This requires separating the existing plan method's transport and vertex at their current owners, never reproducing their rules in Sigma. Up to 93.75% fewer face-unfold invocations with heads. Pending memory/trace evidence; families and occupations are not assumed interchangeable. |
+| 4. Shape-class contraction | 16 body identities plus 16 head identities versus at most four ordered C/T shape classes per output mode | Stream a scan over vertex pairs within a shape class and accumulate band outputs, rather than materializing 16 G tensors. Delete vertex-specialized Python kernel loop/cache entries. A scan only helps if restores and canonical vertex application fit the same ownership boundary. Potential 32 to 8 callable identities is not a compile-count measurement. Reject literal all-G stacking; defer scan until costs of priorities 1–3 are isolated. |
+| 5. Two 2x2 spin actions / fused gather | Dense 4x4 has 16 coefficients; two 2x2 blocks have 8 | Consume the two diagonal blocks of the typed action already built by SymMaps; do not recompute parity/det in Sigma. Replace the dense application at the symmetry service owner, shared by consumers. At most halves rotation multiply-add work, with unchanged face bytes; compiler may already eliminate structural zeros. Defer until device capture proves residual dense work and symmetry-owner coordination is established. |
+| 6. Restore each block once per run | Current 300 source restores include repeated source blocks across output mixing and terms | A full completed-output cache needs 16 outputs per interaction instead of one. An alternative term-interleaved consumer restores one output's V and W, consumes X/SX/COH consecutively, then frees both; W−V restoration order must preserve printed digits. Deletes repeated term traversal, but source-wise versus completed-output subtraction changes rounding. Defer; reject unbounded full-run cache absent peak-memory proof. |
+| 7. Fuse seam with reshard/writer | Seam invocation and ms counts unmeasured; existing PackedCentroidBasis conversion is already compiled | Extend the adjacent existing compiled consumer/writer boundary to consume its permutation once; delete the separate conversion invocation. Keep files canonical and the single basis-map owner. No new layout registry. Defer until HLO establishes an actual redundant copy/reshard and attributes it to Sigma. |
+| 8. Change four-spinor face layout | At most removes measured transpose/copy bytes, currently unknown | Retain a single agreed face layout from producer through gamma action and G GEMM; eliminate explicit adapters instead of retaining old/new carriers. May conflict with the projection GEMM's preferred layout. No shape-only argument establishes a speedup. Defer until layout copies are visible in optimized HLO and native ranges. |
+| ZW-owned. Coupled three-current zeta kernel | Three channels could share one unfolded face pair and C_q; at most two of three repeated shared constructions disappear | Scan or batch current vertices inside the existing fitting kernel, preserving tiled mu-square storage and one symmetry owner. Deletes per-channel repeated setup. No Sigma implementation proposed: send the bounded candidate through this report for ZW's measurements and gate. |
+
+### Memory bounds for proposal selection
+
+Let K=nk, Q=n_parent, N=nb carrier, s=ns, M_C/M_T=packed family
+extents, and P=p_x p_y. For complex128, both resident faces for both
+families require `32 K N s (M_C+M_T)/P` bytes/rank; the corresponding
+parent carriers require `32 Q N s (M_C+M_T)/P`. Keeping parents for
+projection adds the full child amount to their lifetime, not just the difference.
+The child-face storage is independent of the Lorentz-block count; retaining vertex
+variants would multiply it and is excluded from this proposal.
+
+The historical MoS2 gate log records K=9, Q=3, N=80 and P=4
+(`73_parent_full_static/driver.rank0.log`, checkpoint step
+`lx-Xg4-203505-2030774-8671`). With s=4 and **illustrative packed**
+M_C=M_T=192, parent faces are 2,949,120 bytes/rank, children add
+8,847,360 bytes/rank, and combined carriers are 11,796,480 bytes/rank.
+192 is the logged logical centroid count; actual packed extents and padded band
+carriers must be read from the new runtime receipt before treating these numbers
+as actual allocation sizes. These are payload estimates, not peak-memory measurements.
+
+One G body costs `16 K s² M_left M_right/P` bytes/rank
+(21,233,664 bytes in that illustrative case); 16 simultaneously live bodies cost
+339,738,624 bytes/rank. Body/head reuse should retain one G, while batched
+contraction must stream rather than multiply that footprint. One scalar full-q
+interaction block costs `16 K M_left M_right/P` bytes/rank
+(1,327,104 illustrative bytes). Sixteen completed blocks of equal extent cost
+21,233,664 bytes/rank per interaction, or 42,467,328 for V and W. A two-block
+term-interleaved consumer instead needs 2,654,208 bytes/rank before convolution
+scratch. Distinct family extents replace 16 M² by `(M_C+3 M_T)²`.
+These figures grow quadratically in centroids, so a small-deck fit cannot justify
+an all-block cache for large systems. Spin-action specialization leaves face
+payload unchanged; seam fusion and layout changes have no certified allocator
+savings until alias/copy lifetimes are measured. Coupled zeta memory depends on
+its real-grid tile and belongs in ZW's accounting.
+
+No larger-deck/P16 result exists here. Therefore no remaining slowdown is labelled
+inherent to tiny decks, and none of these work bounds is presented as a measured
+speedup or an integration recommendation.
+
 ## Ablations
 
 Not run. A first priority is a restore-only compilation-lifetime ablation preserving the exact C,D accumulation order and the existing typed symmetry helpers. Follow with static vertex-shape specialization and body/head G reuse only if traces justify them. The open-spin dynamic operator route must be measured independently; static child-face duplication is not evidence for a dynamic-node change.
