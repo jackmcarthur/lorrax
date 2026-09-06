@@ -129,6 +129,16 @@ def expected(label: str) -> dict:
             "htransform_bse_exciton":
                 "1fc5cb8f2b974a14ac1c5f97f5c9d7ee2be274b0",
         }
+    if label == "B":
+        # MPA one-shot / one-update references regenerated under the
+        # energy-proportional SC pad and per-k identity partition: band 3
+        # (9.2 eV, outside the requested +-12 eV grid) is evaluated on the
+        # padded support instead of clamped to the scissor (eqp0 -3.97 meV,
+        # eqp1 -10.32 meV; bands 1-2 unchanged to 0.07 meV).
+        result["additional_reference_source_commits"] = {
+            "mpa_sc_pad_identity":
+                "0262d4833c470ef5768270ca048de1faaaf06a9b",
+        }
     return result
 
 
