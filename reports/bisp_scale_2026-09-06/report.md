@@ -101,3 +101,11 @@ Dedicated pool57988457/lx-Xg4-124919-641781-9910 exits0 in927s; zero GPU overlap
 All four prototype EQP0/EQP1 and sector gates PASS exactly against the corresponding P baseline. P/F gates FAIL: static max0.895µeV, dynamic EQP1 max0.675µeV, sectors1µeV. These are diagnostic performance comparisons. Baseline P dynamic is10.6% lower wall time; its tau sweep11.63s versus27.35s is57.5% lower. Direct zeros reduce the parent dynamic total to118.79s (16.8% below F), but the later placement arm takes123.46s despite fewer modules. Do not claim that every eliminated compile improves total wall independently.
 
 The P16 module-count target is met by both compile prototypes; P4 still needs the remaining11 static/5 dynamic events addressed. The dedicated pool is now also occupied by a ZW lane step beginning13:04:52, after this matrix ended13:04:46. Follow-up surface and9x9 arms wait for capacity and remain subject to interval audit.
+
+## Surface-table and clean9x9 follow-ups (claims1303/1304)
+
+Step57988457/lx-Xg4-131335-724532-5279 exits0 in161s, no GPU overlap. Direct placement of the absent surface table removes five further P4 modules: static12162.11s/584 compiles; dynamic12291.69s/772. EQP0/EQP1 and sectors exact against104/106. Dynamic now matches fixed-main772; static remains six above578.
+
+Step57988457/lx-Xg4-131617-747058-1237 exits0 in146s, no GPU overlap. On81 full k/12 parents with same copiedζ, runs124/125 yield P/F70.10/69.03s, Σ21.40/23.60s, screening29.14/21.89s, compiles641/606 and compiler37.47/31.56s. EQP max0.766µeV fails printed-digit identity. Cold P4 remains compiler-heavy even at9x9; no crossover is certified.
+
+The four common-basis P4 profiles72–75 finish under57982945/lx-Xg4-130807-715734-2513 exit0 in926s, with zero GPU overlap. Each matches its own unprofiled source baseline exactly in EQP0/EQP1 and all sectors. Warm repeated χ and Dyson calls have their own exact gates. Parent warm packed Dyson host167.376ms versus fixed820.453ms; χ warm medians112.892/109.074ms, demonstrating the unchanged full-k χ workload alongside the parent-axis Dyson reduction. HLO and native census artifacts are in each run directory.
