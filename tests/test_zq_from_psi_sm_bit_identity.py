@@ -112,6 +112,14 @@ class _MockPsiGStore:
         return out
 
     @property
+    def local_band_chunk_shape(self):
+        # Mirrors PsiGStore.local_band_chunk_shape: the per-device host
+        # callback shape (nk, b_local, ns, ngkmax) that the r-chunk sources
+        # read instead of the private _bpd_max/_per_rank_shape.
+        nk, _, ns, ngkmax = self._per_rank_shape
+        return (int(nk), int(self._bpd_max), int(ns), int(ngkmax))
+
+    @property
     def g_index(self):
         return self._g_index_dev
 
