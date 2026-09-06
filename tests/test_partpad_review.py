@@ -204,8 +204,8 @@ def test_both_external_growth_directions_are_reserved(monkeypatch):
         session = {'external_support_ev': (-20., 20.)}
         _, geometry = _plan(monkeypatch, _branch(negative=negative),
                              fixed_rule_session=session)
-        # Every initialized receipt must cover prospective growth on BOTH
-        # sides, even if its evaluated frequencies occupy just one half.
+        # Both session directions are carried regardless of the branch's
+        # causal flag; state/pole padding still expands both box edges.
         for entry in session['rules'].values():
             assert entry['fit']['rule_box'][0] < entry['initial_box'][0]
             assert entry['fit']['rule_box'][1] > entry['initial_box'][1]
@@ -299,7 +299,7 @@ def test_initial_sc_zero_side_reservation_keeps_the_causal_sign():
 
 
 @pytest.mark.parametrize('positive_frequencies', [(.2, .5), (0.,)])
-def test_two_sided_reservation_does_not_import_the_unused_frequency_half(
+def test_outward_reservation_keeps_the_physical_half_inner_edge(
         monkeypatch, positive_frequencies):
     from gw import sigma_box_plan as boxes
     from gw.ppm_windows import _SigmaBranch
@@ -321,8 +321,8 @@ def test_two_sided_reservation_does_not_import_the_unused_frequency_half(
         np.array([-.5, -.2, *positive_frequencies]), .1, eps=1e-4,
         reduction_seconds=20., cache_dir=None, print_fn=lambda _: None,
         fixed_rule_session={'external_support_ev': np.array([-.8, .9]) * RYD_TO_EV})
-    np.testing.assert_allclose(seen['negative'], [-.8, 0.])
-    np.testing.assert_allclose(seen['positive'], [0., .9])
+    np.testing.assert_allclose(seen['negative'], [-.8, -.2])
+    np.testing.assert_allclose(seen['positive'], [min(positive_frequencies), .9])
 
 
 def test_near_boundary_cache_hit_reaudits_the_same_nodes(tmp_path):
