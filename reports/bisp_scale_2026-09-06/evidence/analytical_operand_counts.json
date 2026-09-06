@@ -1,0 +1,217 @@
+{
+  "scope": "Leading real-FLOP arithmetic and logical application bytes, not measured vendor wire bytes; beta/packing/head tails excluded. Sigma projection stored band width assumed30 at P4; verify P16 storage before using numeric projection entries. Source71ae0bde executes TWO parent Green GEMMs on antiunitary decks, hence four distributed GEMMs per tau; the old PERF2 class had three.",
+  "rows": [
+    {
+      "route": "P",
+      "P": 4,
+      "K": 36,
+      "Q": 7,
+      "nb": 80,
+      "ns": 4,
+      "M_C": 600,
+      "M_T": 204,
+      "packed": 1212,
+      "operator_bytes_rank": 41130432,
+      "resident_restored_sources_bytes_rank": 211527936,
+      "restored_output_bytes_per_term_rank": 854509824,
+      "packed_dyson_leading_real_flops_rank": 58158430848.00001,
+      "blocks": {
+        "CC": {
+          "G_static_flops_rank": 33177600000.0,
+          "G_tau_flops_rank": 12902400000.0,
+          "projection_two_gemm_flops_rank": 2449440000.0,
+          "G_full_carrier_bytes_rank": 829440000.0,
+          "operator_full_carrier_bytes_rank": 51840000.0,
+          "SUMMA_broadcasts_static": 200,
+          "SUMMA_broadcasts_tau": 112
+        },
+        "CT": {
+          "G_static_flops_rank": 11280384000.0,
+          "G_tau_flops_rank": 4386816000.0,
+          "projection_two_gemm_flops_rank": 832809600.0,
+          "G_full_carrier_bytes_rank": 282009600.0,
+          "operator_full_carrier_bytes_rank": 17625600.0,
+          "SUMMA_broadcasts_static": 200,
+          "SUMMA_broadcasts_tau": 112
+        },
+        "TC": {
+          "G_static_flops_rank": 11280384000.0,
+          "G_tau_flops_rank": 4386816000.0,
+          "projection_two_gemm_flops_rank": 852768000.0,
+          "G_full_carrier_bytes_rank": 282009600.0,
+          "operator_full_carrier_bytes_rank": 17625600.0,
+          "SUMMA_broadcasts_static": 200,
+          "SUMMA_broadcasts_tau": 112
+        },
+        "TT": {
+          "G_static_flops_rank": 3835330560.0,
+          "G_tau_flops_rank": 1491517440.0,
+          "projection_two_gemm_flops_rank": 289941120.0,
+          "G_full_carrier_bytes_rank": 95883264.0,
+          "operator_full_carrier_bytes_rank": 5992704.0,
+          "SUMMA_broadcasts_static": 200,
+          "SUMMA_broadcasts_tau": 112
+        }
+      }
+    },
+    {
+      "route": "F",
+      "P": 4,
+      "K": 36,
+      "Q": 36,
+      "nb": 80,
+      "ns": 4,
+      "M_C": 600,
+      "M_T": 200,
+      "packed": 1200,
+      "operator_bytes_rank": 207360000,
+      "resident_restored_sources_bytes_rank": 207360000,
+      "restored_output_bytes_per_term_rank": 829440000,
+      "packed_dyson_leading_real_flops_rank": 290304000000.0,
+      "blocks": {
+        "CC": {
+          "G_static_flops_rank": 33177600000.0,
+          "G_tau_flops_rank": 33177600000.0,
+          "projection_two_gemm_flops_rank": 12597120000.0,
+          "G_full_carrier_bytes_rank": 829440000.0,
+          "operator_full_carrier_bytes_rank": 51840000.0,
+          "SUMMA_broadcasts_static": 432,
+          "SUMMA_broadcasts_tau": 432
+        },
+        "CT": {
+          "G_static_flops_rank": 11059200000.0,
+          "G_tau_flops_rank": 11059200000.0,
+          "projection_two_gemm_flops_rank": 4199040000.0,
+          "G_full_carrier_bytes_rank": 276480000.0,
+          "operator_full_carrier_bytes_rank": 17280000.0,
+          "SUMMA_broadcasts_static": 432,
+          "SUMMA_broadcasts_tau": 432
+        },
+        "TC": {
+          "G_static_flops_rank": 11059200000.0,
+          "G_tau_flops_rank": 11059200000.0,
+          "projection_two_gemm_flops_rank": 4302720000.0,
+          "G_full_carrier_bytes_rank": 276480000.0,
+          "operator_full_carrier_bytes_rank": 17280000.0,
+          "SUMMA_broadcasts_static": 432,
+          "SUMMA_broadcasts_tau": 432
+        },
+        "TT": {
+          "G_static_flops_rank": 3686400000.0,
+          "G_tau_flops_rank": 3686400000.0,
+          "projection_two_gemm_flops_rank": 1434240000.0,
+          "G_full_carrier_bytes_rank": 92160000.0,
+          "operator_full_carrier_bytes_rank": 5760000.0,
+          "SUMMA_broadcasts_static": 432,
+          "SUMMA_broadcasts_tau": 432
+        }
+      }
+    },
+    {
+      "route": "P",
+      "P": 16,
+      "K": 36,
+      "Q": 7,
+      "nb": 80,
+      "ns": 4,
+      "M_C": 608,
+      "M_T": 224,
+      "packed": 1280,
+      "operator_bytes_rank": 11468800,
+      "resident_restored_sources_bytes_rank": 58982400,
+      "restored_output_bytes_per_term_rank": 247873536,
+      "packed_dyson_leading_real_flops_rank": 17126741333.333336,
+      "blocks": {
+        "CC": {
+          "G_static_flops_rank": 8517058560.0,
+          "G_tau_flops_rank": 3312189440.0,
+          "projection_two_gemm_flops_rank": 628696320.0,
+          "G_full_carrier_bytes_rank": 212926464.0,
+          "operator_full_carrier_bytes_rank": 13307904.0,
+          "SUMMA_broadcasts_static": 400,
+          "SUMMA_broadcasts_tau": 224
+        },
+        "CT": {
+          "G_static_flops_rank": 3137863680.0,
+          "G_tau_flops_rank": 1220280320.0,
+          "projection_two_gemm_flops_rank": 231624960.0,
+          "G_full_carrier_bytes_rank": 78446592.0,
+          "operator_full_carrier_bytes_rank": 4902912.0,
+          "SUMMA_broadcasts_static": 400,
+          "SUMMA_broadcasts_tau": 224
+        },
+        "TC": {
+          "G_static_flops_rank": 3137863680.0,
+          "G_tau_flops_rank": 1220280320.0,
+          "projection_two_gemm_flops_rank": 236463360.0,
+          "G_full_carrier_bytes_rank": 78446592.0,
+          "operator_full_carrier_bytes_rank": 4902912.0,
+          "SUMMA_broadcasts_static": 400,
+          "SUMMA_broadcasts_tau": 224
+        },
+        "TT": {
+          "G_static_flops_rank": 1156055040.0,
+          "G_tau_flops_rank": 449576960.0,
+          "projection_two_gemm_flops_rank": 87118080.0,
+          "G_full_carrier_bytes_rank": 28901376.0,
+          "operator_full_carrier_bytes_rank": 1806336.0,
+          "SUMMA_broadcasts_static": 400,
+          "SUMMA_broadcasts_tau": 224
+        }
+      }
+    },
+    {
+      "route": "F",
+      "P": 16,
+      "K": 36,
+      "Q": 36,
+      "nb": 80,
+      "ns": 4,
+      "M_C": 608,
+      "M_T": 208,
+      "packed": 1232,
+      "operator_bytes_rank": 54641664,
+      "resident_restored_sources_bytes_rank": 54641664,
+      "restored_output_bytes_per_term_rank": 221414400,
+      "packed_dyson_leading_real_flops_rank": 78538285056.0,
+      "blocks": {
+        "CC": {
+          "G_static_flops_rank": 8517058560.0,
+          "G_tau_flops_rank": 8517058560.0,
+          "projection_two_gemm_flops_rank": 3233295360.0,
+          "G_full_carrier_bytes_rank": 212926464.0,
+          "operator_full_carrier_bytes_rank": 13307904.0,
+          "SUMMA_broadcasts_static": 864,
+          "SUMMA_broadcasts_tau": 864
+        },
+        "CT": {
+          "G_static_flops_rank": 2913730560.0,
+          "G_tau_flops_rank": 2913730560.0,
+          "projection_two_gemm_flops_rank": 1106127360.0,
+          "G_full_carrier_bytes_rank": 72843264.0,
+          "operator_full_carrier_bytes_rank": 4552704.0,
+          "SUMMA_broadcasts_static": 864,
+          "SUMMA_broadcasts_tau": 864
+        },
+        "TC": {
+          "G_static_flops_rank": 2913730560.0,
+          "G_tau_flops_rank": 2913730560.0,
+          "projection_two_gemm_flops_rank": 1132047360.0,
+          "G_full_carrier_bytes_rank": 72843264.0,
+          "operator_full_carrier_bytes_rank": 4552704.0,
+          "SUMMA_broadcasts_static": 864,
+          "SUMMA_broadcasts_tau": 864
+        },
+        "TT": {
+          "G_static_flops_rank": 996802560.0,
+          "G_tau_flops_rank": 996802560.0,
+          "projection_two_gemm_flops_rank": 387279360.0,
+          "G_full_carrier_bytes_rank": 24920064.0,
+          "operator_full_carrier_bytes_rank": 1557504.0,
+          "SUMMA_broadcasts_static": 864,
+          "SUMMA_broadcasts_tau": 864
+        }
+      }
+    }
+  ]
+}
