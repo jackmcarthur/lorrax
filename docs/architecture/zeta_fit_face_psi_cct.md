@@ -126,8 +126,7 @@ persistent full-k GW wavefunction carrier. Unsupported non-RPA consumers
 and old full-face GW restart stores refuse explicitly.
 
 The GW Zq entry requires typed parents and orbit-tile tables; its old full-k
-kernels are deleted. Full-face Cq remains temporarily for a separate oracle
-migration and deletion concern. The legacy
+kernels and full-face Cq are deleted. The legacy
 rectangular Cq implementation has a live downfold consumer and remains a
 shared service. Galerkin's BSE/htransform fit and generic sample loaders
 are separate and retained.

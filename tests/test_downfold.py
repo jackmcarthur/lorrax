@@ -1115,38 +1115,20 @@ def test_qirr_red_twin_a_symmetry_broken_selection_is_refused():
     assert "orbit-closed" in str(exc.value)
 
 
-def test_qirr_red_twin_a_symmetry_broken_selection_really_is_wrong():
-    """(c2) THE REFUSAL IS LOAD-BEARING, not decoration.
-
-    Force the broken selection through with the closure check bypassed — by
-    handing the child unfold a table built the way an unguarded
-    implementation would build it, ``pos[]`` of the images that DO land
-    inside the kept set and an arbitrary slot for the ones that do not.  The
-    result must miss the full-BZ answer by order one.  A refusal that only
-    ever guarded agreeing numbers would be worth deleting.
-    """
+def test_qirr_red_twin_a_forged_child_action_is_refused():
+    """Typed unfolding rejects nonbijective actions even after bypassing orbit admission."""
     mesh = resolve_mesh()
     sym_perm, L_table = _qirr_tables()
     S_ibz, W_ibz = _qirr_parent(mesh)
-    S_full = _qirr_unfold(S_ibz, mesh, sym_perm, L_table)
-    W_full = _qirr_unfold(W_ibz, mesh, sym_perm, L_table)
     keep = QIRR_KEEP_BROKEN
-
-    pos = np.full(QIRR_MU, 0, dtype=np.int64)     # the arbitrary slot
+    pos = np.full(QIRR_MU, 0, dtype=np.int64)
     pos[keep] = np.arange(keep.size, dtype=np.int64)
     child_perm = pos[sym_perm[:, keep]]
     child_L = L_table[:, keep]
-
-    _T_i, W_S_ibz, _r = _qirr_downfold(S_ibz, W_ibz, keep, mesh)
-    _T_f, W_S_full, _r2 = _qirr_downfold(S_full, W_full, keep, mesh)
-    got = np.asarray(jax.device_get(
-        _qirr_unfold(W_S_ibz, mesh, child_perm, child_L)))
-    want = np.asarray(jax.device_get(W_S_full))
-    rel = np.max(np.abs(got - want)) / np.max(np.abs(want))
-    assert rel > 0.1, (
-        f"a selection that breaks star symmetry unfolded to within "
-        f"{rel:.3e} of the right answer — if that is real, the closure "
-        f"refusal is guarding nothing and should be reconsidered, not kept")
+    assert any(np.unique(row).size < keep.size for row in child_perm)
+    _transfer, W_S_ibz, _receipt = _qirr_downfold(S_ibz, W_ibz, keep, mesh)
+    with pytest.raises(ValueError, match="selected centroid action is unavailable or not bijective"):
+        _qirr_unfold(W_S_ibz, mesh, child_perm, child_L)
 
 
 def test_qirr_the_cur_selection_is_not_star_stable_by_default():

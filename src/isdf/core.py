@@ -1101,52 +1101,7 @@ def c_q_from_psi_sm(
 	gemm=None,
 	k_unfold_plan=None,
 ) -> jax.Array:
-	"""C_q, the ζ fit's CCT Gram (band contraction + IFFT/γ̃/FFT over k).
-
-	``layout='legacy'`` (default, ``low_mem_bands=False``) — UNCHANGED
-	body: psi is single-axis-sharded, the band contraction is a rank-local
-	einsum (bands replicated per rank), and everything (pair density +
-	IFFT + γ̃·γ̃ + FFT) runs fused inside one Manual-mode shard_map.
-
-	    psi_l_X, psi_r_X : (nk, n_rmu, nb, ns) sharded ``P(None, 'x', None, None)``
-	    psi_l_Y, psi_r_Y : (nk, nb, ns, n_col) sharded ``P(None, None, None, 'y')``
-	    gamma_L, gamma_R : ``(perm, phase)`` tuples or ``None`` (= γ̃^0 = I).
-
-	``layout='face'`` (``low_mem_bands=True``) — the band-contraction axis
-	is mesh-sharded on BOTH faces (``gw.wavefunction_bundle``'s
-	``psi_mun``/``psi_nmu``, both un-conjugated, both spanning the fit's
-	FULL loaded band range), so the contraction is a genuinely distributed
-	SUMMA GEMM (``distrib_la.gemm_plan``) rather than a local einsum — see
-	``gw.isdf_fitting.fit_zeta_to_h5`` and
-	``docs/architecture/zeta_fit_face_psi_cct.md``.  The bispinor
-	transverse channel (``gamma_L``/``gamma_R`` not ``None``) IS supported
-	here (2026-08-23, ``feat/transverse-zeta-face-2026-08-23``): the γ̃
-	vertex is folded into the appropriate psi ENDPOINT
-	(``psi_mun``/``psi_nmu``, mirroring ``gw.wavefunction_bundle.
-	with_lorentz_vertices``'s field/axis table) before the band GEMM
-	rather than at ``_c_q_legacy``'s post-IFFT ``gamma_double_contract``
-	step — see ``docs/architecture/zeta_fit_face_psi_cct.md``'s vertex
-	section for the derivation and its conjugation-convention correction.
-
-	    psi_mun  : (nk, s, μ, n)  P(None, None, 'x', 'y')
-	    psi_nmu  : (nk, n, s, μ)  P(None, 'x', None, 'y')
-	    weight_l, weight_r : (nb,) real, 1.0 inside the L/R band window and
-	                          0.0 outside (``nb`` = ``psi_mun``'s own band
-	                          extent).  Zero-weighted bands contribute
-	                          EXACTLY zero to the band sum (bilinear in ψ),
-	                          so no window-divisibility pad is needed — the
-	                          ONLY divisibility requirement is ``nb`` itself
-	                          (the array's own extent, already mesh-
-	                          divisible: ``BandSlices.b4`` is padded to the
-	                          world size).
-	    gemm     : one ``distrib_la.GemmPlan`` (``m=n=n_rmu``, ``k=nb``,
-	               ``nq=nk``), built ONCE by the caller and reused for both
-	               P_l and P_r — only the weight differs between them.
-
-	Output (either layout):
-	    C_q : (nq, n_rmu, n_col) sharded ``P(None, 'x', 'y')``.
-	    ``n_col == n_rmu`` for CCT (square centroid).
-	"""
+	"""Build the parent GW Gram or the shared rectangular downfold Gram."""
 	if layout == "legacy":
 		if psi_l_X is None or psi_l_Y is None or psi_r_X is None or psi_r_Y is None:
 			raise ValueError(
@@ -1163,17 +1118,14 @@ def c_q_from_psi_sm(
 			"c_q_from_psi_sm(layout='face') requires psi_mun=, psi_nmu=, "
 			"weight_l=, weight_r=, gemm= (see gw.isdf_fitting.fit_zeta_to_h5"
 			").")
-	if k_unfold_plan is not None:
-		# Raw-parent contraction: psi_mun/psi_nmu are the plan's PACKED
-		# parent faces and ``gemm`` is planned at nq = n_parent.
-		return _c_q_face_parent(
-			psi_mun, psi_nmu, weight_l, weight_r,
-			k_unfold_plan=k_unfold_plan, kgrid=kgrid, mesh_xy=mesh_xy,
-			gemm=gemm, gamma_L=0 if gamma_L is None else int(gamma_L),
-			gamma_R=0 if gamma_R is None else int(gamma_R))
-	return _c_q_face(psi_mun, psi_nmu, weight_l, weight_r,
-	                 gamma_L, gamma_R,
-	                 kgrid=kgrid, mesh_xy=mesh_xy, gemm=gemm)
+	if k_unfold_plan is None:
+		raise ValueError("c_q_from_psi_sm face operands require a typed parent plan")
+	return _c_q_face_parent(
+		psi_mun, psi_nmu, weight_l, weight_r,
+		k_unfold_plan=k_unfold_plan, kgrid=kgrid, mesh_xy=mesh_xy,
+		gemm=gemm, gamma_L=0 if gamma_L is None else int(gamma_L),
+		gamma_R=0 if gamma_R is None else int(gamma_R))
+
 
 
 def _c_q_legacy(
@@ -1187,9 +1139,7 @@ def _c_q_legacy(
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
 ) -> jax.Array:
-	"""The exact pre-``layout=`` body of :func:`c_q_from_psi_sm`.  UNTOUCHED
-	— do not edit this function to add face-layout behaviour; it has its
-	own sibling, :func:`_c_q_face`, below."""
+	"""Contract the shared rectangular downfold Gram through the local pair-convolution owner."""
 	nkx, nky, nkz = kgrid
 	nk = int(psi_l_X.shape[0])
 	n_rmu = int(psi_l_X.shape[1])
@@ -1312,179 +1262,6 @@ def _c_q_legacy(
 # window does not cover.  See docs/architecture/zeta_fit_face_psi_cct.md.
 # ============================================================================
 
-def _c_q_face(
-	psi_mun: jax.Array,
-	psi_nmu: jax.Array,
-	weight_l: jax.Array,
-	weight_r: jax.Array,
-	gamma_L: tuple[jax.Array, jax.Array] | None = None,
-	gamma_R: tuple[jax.Array, jax.Array] | None = None,
-	*,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-	gemm,
-) -> jax.Array:
-	"""Face-layout C_q: ONE planned N,N band GEMM per side (SUMMA-
-	distributed over the mesh-sharded band contraction axis) producing the
-	open-spin pair density at (μ_X, ν_Y), then the SAME THREE PRIMITIVES
-	:func:`_c_q_legacy` uses for its own IFFT -> γ̃-double-contract -> FFT
-	tail (:func:`common.fft_helpers.local_ifftn3`/``local_fftn3``,
-	:func:`common.gamma_matrices.gamma_double_contract`), in this path's
-	OWN axis order (a=s, μ, b=s', ν — no 'karmb' transpose: no FFI
-	pair_kernel constrains the trailing axis order here, since the face
-	path always takes the XLA IFFT/FFT fallback, and that transpose would
-	be a real μ²-scale buffer, not a bitcast).
-
-	ONE OUTER ``jax.jit``, NOT THREE SEPARATE DISPATCHES.  Both GEMM calls
-	(``gemm(A_l, B)``, ``gemm(A_r, B)`` — trace-safe, per
-	``distrib_la.gemm_plan``'s own contract) and the IFFT/γ̃/FFT tail's
-	``shard_map`` are traced into ONE compiled program, mirroring
-	``gw.w_isdf._get_chi_minimax_kernel_face``'s own ``_build_Gv_Gc``
-	(one outer jit wrapping two calls into the SAME ``g_plan``) rather
-	than calling the plan, then a second top-level jit, then a third.
-	MEASURED, not a style preference: three separate top-level dispatches
-	— each its own compiled executable with no cross-executable buffer
-	reuse — OOM'd at MoS2 6x6x1/626b/mu=5282/P16
-	(`RESOURCE_EXHAUSTED ... 11.28GiB` at `C_q.block_until_ready()`);
-	folding into one outer jit, where XLA's buffer assignment sees the
-	WHOLE graph and can alias/reuse the P_l/P_r-scale buffers the way
-	`_c_q_legacy`'s own single fused shard_map already does, fixed it
-	with no other change (same fix that motivated dropping the 'karmb'
-	transpose above — both are instances of "an extra top-level
-	buffer this design does not need").
-
-	The GEMM seam (``common.contract_bands.merge_spin_centroid`` /
-	``split_spin_centroid``) and the weighted-band convention
-	(``gemm(A * weight, B)``) are EXACTLY ``gw.greens_function_kernel.
-	_build_G_face``'s pattern, reused rather than re-derived — same
-	merge positions (1,2) and (2,3), same "conjugate the μ/row operand,
-	leave the ν/col operand un-conjugated" convention as
-	:func:`pair_density`'s own docstring (the X-form is pre-conjugated by
-	its caller in the legacy path; here the conjugate is applied
-	explicitly since the face carrier stores un-conjugated ψ throughout).
-
-	γ̃ VERTEX (``gamma_L``/``gamma_R`` not ``None``, 2026-08-23) — endpoint
-	application, NOT ``_c_q_legacy``'s post-IFFT ``gamma_double_contract``.
-	``_c_q_legacy`` inserts γ̃ by calling ``gamma_apply`` TWICE on ``P_r``
-	alone (once per spin axis) — ``P_l`` (only conjugated, never
-	γ̃-transformed) is untouched; see
-	``docs/architecture/zeta_fit_face_psi_cct.md``'s vertex section for the
-	full derivation.  This path reproduces that exactly by transforming the
-	psi ENDPOINTS that feed ``P_r``'s own GEMM, mirroring
-	``gw.wavefunction_bundle.with_lorentz_vertices``'s field/axis table
-	(``_G_VERTEX_FIELDS``: ``psi_mun`` axis 1 for the mu_L/left vertex,
-	``psi_nmu`` axis 2 for the nu_L/right vertex) — ``P_l`` keeps using the
-	RAW ``psi_mun``/``psi_nmu``, ``P_r`` uses gamma-transformed copies:
-
-	* ``psi_mun`` plays CCT's CONJUGATED (μ/row) operand — the OPPOSITE
-	  conjugation role from the G-build, where ``psi_mun`` is the
-	  UNCONJUGATED direct operand (``greens_function_kernel._build_G_face``
-	  conjugates ``psi_nmu``, not ``psi_mun``).  So γ̃_L is applied to
-	  ``jnp.conj(psi_mun)`` (conjugate FIRST — commutes with the merge, a
-	  pure reshape) using the ORIGINAL, uncompensated ``phase_L``: applying
-	  γ̃ to an ALREADY-conjugated array needs no phase conjugate, whereas
-	  applying it BEFORE the conjugate would (``conj(gamma_apply(X,phase))
-	  == gamma_apply(conj(X), conj(phase))`` — this path takes the
-	  conjugate-first branch of that identity to avoid the correction).
-	* ``psi_nmu`` plays CCT's UNCONJUGATED (ν/col) operand — SAME role as
-	  the G-build's own ``psi_nmu`` argument slot except THAT one gets
-	  conjugated internally by ``_build_G_face`` and this one never is — so
-	  γ̃_R applies directly, original phase, no compensation needed either
-	  way.
-
-	``mu_L == 0`` / ``nu_L == 0`` (``gamma_L``/``gamma_R is None``) skip
-	the corresponding transform — ``P_r`` then equals ``P_l``'s own
-	construction (weight aside), and the tail's ``gamma_double_contract``
-	call runs with no perm/phase, byte-identical to the pre-vertex code.
-	"""
-	nk, s_, mu_full, nb = psi_mun.shape
-	nkx, nky, nkz = kgrid
-	if nk != nkx * nky * nkz:
-		raise ValueError(
-			f"_c_q_face: psi_mun k-axis {nk} != prod(kgrid)={nkx*nky*nkz}")
-	n_col_full = mu_full  # square centroid: n_rmu on both faces
-	px = int(mesh_xy.shape['x'])
-	py = int(mesh_xy.shape['y'])
-	mu_loc = mu_full // px
-	col_loc = n_col_full // py
-	lhs_id = gamma_L is None
-	rhs_id = gamma_R is None
-
-	in_mun = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
-	in_nmu = NamedSharding(mesh_xy, P(None, 'x', None, 'y'))
-	w_rep = NamedSharding(mesh_xy, P(None))
-	out_C = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-	pair_spec = P(None, None, 'x', None, 'y')
-
-	@partial(jax.jit,
-	         in_shardings=(in_mun, in_nmu, w_rep, w_rep,
-	                       w_rep, w_rep, w_rep, w_rep),
-	         out_shardings=out_C)
-	def _fused(psi_mun_, psi_nmu_, w_l, w_r, perm_L_, phase_L_, perm_R_, phase_R_):
-		def _pair(psi_mun_conj_: jax.Array, psi_nmu_use: jax.Array,
-		          w: jax.Array) -> jax.Array:
-			A = merge_spin_centroid(psi_mun_conj_, 1, 2)        # (nk, mu*s, nb)  x-major
-			A = A * w[None, None, :].astype(A.dtype)
-			B = merge_spin_centroid(psi_nmu_use, 2, 3)          # (nk, nb, nu*s)  y-major
-			D = gemm(A, B)                                      # (nk, mu*s, nu*s)  P(_,'x','y')
-			Pp = split_spin_centroid(D, 1, s_, mu_full)         # (nk, s, mu, nu*s)
-			return split_spin_centroid(Pp, 3, s_, n_col_full)   # (nk, s, mu, s', nu)
-
-		psi_mun_conj = jnp.conj(psi_mun_)
-		P_l = _pair(psi_mun_conj, psi_nmu_, w_l)
-		if lhs_id and rhs_id:
-			P_r = _pair(psi_mun_conj, psi_nmu_, w_r)
-		else:
-			# Endpoint γ̃ insertion -- ONLY for P_r's own construction
-			# (mirrors _c_q_legacy's gamma_apply(P_r, ...) calls, which
-			# never touch P_l).  Both transforms act on the REPLICATED
-			# spin axis: local permute+phase, zero collectives.
-			psi_mun_conj_r = (psi_mun_conj if lhs_id else
-			                  gamma_apply(psi_mun_conj, perm_L_, phase_L_, axis=1))
-			psi_nmu_r = (psi_nmu_ if rhs_id else
-			            gamma_apply(psi_nmu_, perm_R_, phase_R_, axis=2))
-			P_r = _pair(psi_mun_conj_r, psi_nmu_r, w_r)
-
-		@partial(shard_map, mesh=mesh_xy, in_specs=(pair_spec, pair_spec),
-		         out_specs=P(None, 'x', 'y'), check_vma=False)
-		def _tail(P_l_, P_r_):
-			P_l_3d = P_l_.reshape(nkx, nky, nkz, s_, mu_loc, s_, col_loc)
-			P_r_3d = P_r_.reshape(nkx, nky, nkz, s_, mu_loc, s_, col_loc)
-			P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
-			P_l_R_conj = jnp.conj(P_l_R)
-			del P_l_3d, P_l_R
-			P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
-			del P_r_3d
-			# Spin axes at (3, 5) in THIS (k,a,mu,b,nu) order -- NOT
-			# legacy's (3, 6), which is 'karmb' (k,a,col,mu,b).  The γ̃
-			# vertex is ALREADY baked into P_r (above), so this call is
-			# always the plain identity contraction (a trace over spin)
-			# -- no perm/phase args, in either channel.
-			C_R = gamma_double_contract(P_l_R_conj, P_r_R, spin_axes=(3, 5))
-			del P_l_R_conj, P_r_R
-			C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
-			# Already (kx, ky, kz, mu_loc, col_loc): the γ̃ contraction
-			# dropped the two spin axes it sat between, leaving mu then
-			# col in that order already -- no output transpose.
-			return C_q_3d.reshape(nkx * nky * nkz, mu_loc, col_loc)
-
-		return _tail(P_l, P_r)
-
-	if lhs_id:
-		perm_L = jnp.arange(s_, dtype=jnp.int32)
-		phase_L = jnp.ones(s_, dtype=jnp.complex128)
-	else:
-		perm_L, phase_L = gamma_L
-	if rhs_id:
-		perm_R = jnp.arange(s_, dtype=jnp.int32)
-		phase_R = jnp.ones(s_, dtype=jnp.complex128)
-	else:
-		perm_R, phase_R = gamma_R
-
-	return _fused(psi_mun, psi_nmu,
-	             jnp.asarray(weight_l, dtype=jnp.float64),
-	             jnp.asarray(weight_r, dtype=jnp.float64),
-	             perm_L, phase_L, perm_R, phase_R)
 
 
 def _c_q_face_parent(
@@ -1500,34 +1277,7 @@ def _c_q_face_parent(
 	gamma_L: int = 0,
 	gamma_R: int = 0,
 ) -> jax.Array:
-	"""Face-layout C_q contracted on raw WFN parents only.
-
-	The band contraction of the CCT Gram is the whole of its cost.  On a
-	symmetry-reduced grid it need not be repeated on every child k: the pair
-	projector at a child is the typed symmetry image of the projector at its
-	raw parent.  So this kernel forms the Green-oriented projector
-
-	    D^A_kbar[a, mu, b, nu] = sum_n w^A_n psi_{n kbar a}(mu) conj(psi_{n kbar b}(nu))
-
-	with ONE planned GEMM per side on the ``n_parent`` raw rows (the same
-	``merge_spin_centroid``/``gemm``/``split_spin_centroid`` seam as
-	:func:`_c_q_face` and ``greens_function_kernel._build_G_face``), hands the
-	completed operator to the plan's typed, collective-free unfold
-	(:meth:`gw.centroid_k_unfold.CentroidKUnfoldPlan.unfold_operator`, the
-	route the screening Green function already takes), and only then runs the
-	UNCHANGED k-IFFT / spin-trace / k-FFT tail of :func:`_c_q_face`.  The
-	incumbent tail consumes ``P = conj(D)``; the elementwise conjugate is
-	taken after the unfold so that no second spin or phase convention is
-	written here.  Both centroid endpoints are in the run's orbit-packed
-	order, like every other operator.
-
-	Fixed Lorentz vertices act on the unfolded projector's output spin axes.
-
-	    psi_mun_parent : (n_parent, s, mu_pk, nb)  P(None,None,'x','y'), packed
-	    psi_nmu_parent : (n_parent, nb, s, mu_pk)  P(None,'x',None,'y'), packed
-	    gemm           : GemmPlan with m = n = mu_pk*s, k = nb, nq = n_parent
-	Returns ``C_q`` (nk_full, n_rmu_canonical, n_rmu_canonical) P(None,'x','y').
-	"""
+	"""Contract raw-parent band projectors and apply fixed vertices after typed unfolding."""
 	n_parent, s_, mu_pk, nb = (int(v) for v in psi_mun_parent.shape)
 	nkx, nky, nkz = kgrid
 	nk = nkx * nky * nkz
