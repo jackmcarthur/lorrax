@@ -1,0 +1,9 @@
+run_id: 39_cpu_P3_faces_ablation
+system: synthetic
+pipeline: pytest
+platform: perlmutter
+pool: 57988457
+source: run-local tau_candidate.py loaded in place of gw.ppm_tau_kernel; production baseline unchanged
+steps:
+  gate:
+    state: pending

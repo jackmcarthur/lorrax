@@ -1,0 +1,9 @@
+run_id: 41_cpu_P3_zero_probe
+system: synthetic
+pipeline: compile_probe
+platform: perlmutter
+pool: 57988457
+geometry: CPU four emulated devices
+steps:
+  gate:
+    state: pending

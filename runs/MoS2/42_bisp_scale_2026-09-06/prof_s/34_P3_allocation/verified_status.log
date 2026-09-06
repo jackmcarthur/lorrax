@@ -1,0 +1,13 @@
+[lx] --verify: sampling step activity over 6 s...
+[lx] --verify: sstat returned nothing for JID 57988457; the activity column will read 'unknown'. (sstat only reports steps of a job you own, on a cluster with job accounting enabled.)
+[lxrun] JID 57988457 · 4 nodes · 2:54:29 left · gpu · 0/16 GPUs free
+  1  nid001112 [0/4 gpu]  busy   lx-Xg4-132155-757259-3784 23m    started 13:21  [activity: unknown]
+  2  nid001113 [0/4 gpu]  busy   lx-Xg4-132155-757259-3784 23m    started 13:21  [activity: unknown]
+  3  nid001116 [0/4 gpu]  busy   lx-Xg4-132155-757259-3784 23m    started 13:21  [activity: unknown]
+  4  nid001117 [0/4 gpu]  busy   lx-Xg4-132155-757259-3784 23m    started 13:21  [activity: unknown]
+[lx] --verify: no user steps in JID 57982945 to measure.
+[lxrun] JID 57982945 · 4 nodes · 13:25 left · gpu · 16/16 GPUs free
+  1  nid001064 [4/4 gpu]  free   —                —      —
+  2  nid001065 [4/4 gpu]  free   —                —      —
+  3  nid001068 [4/4 gpu]  free   —                —      —
+  4  nid001128 [4/4 gpu]  free   —                —      —

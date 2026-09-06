@@ -1,0 +1,8 @@
+run_id: 34_P3_allocation
+system: MoS2
+pipeline: profiling
+platform: perlmutter
+steps:
+  allocation:
+    state: failed
+    reason: QOSMaxSubmitJobPerUserLimit

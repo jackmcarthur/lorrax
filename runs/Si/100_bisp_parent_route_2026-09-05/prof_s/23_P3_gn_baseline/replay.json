@@ -1,0 +1,62 @@
+[
+  {
+    "box": [
+      -3.8692837464287577,
+      -0.3095840567836642,
+      0.01837465441237269,
+      0.01837465441237269
+    ],
+    "count": 6,
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/04_F_gn_baseline/tmp/sigma_quadrature_rules/rule_21356a69eaeb5e63.npz"
+  },
+  {
+    "box": [
+      0.6224805766229238,
+      3.3825773412997937,
+      0.01837465441237269,
+      0.01837465441237269
+    ],
+    "count": 4,
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/04_F_gn_baseline/tmp/sigma_quadrature_rules/rule_551f34e072614dc1.npz"
+  },
+  {
+    "box": [
+      0.636516519559102,
+      2.4834406159755065,
+      0.01837465441237269,
+      0.01837465441237269
+    ],
+    "count": 4,
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/03_P_gn_baseline/tmp/sigma_quadrature_rules/rule_a38df15b936679af.npz"
+  },
+  {
+    "box": [
+      -4.161192709312459,
+      -0.7099394208090036,
+      0.01837465441237269,
+      0.01837465441237269
+    ],
+    "count": 5,
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/04_F_gn_baseline/tmp/sigma_quadrature_rules/rule_2b4585fe7c39673b.npz"
+  },
+  {
+    "box": [
+      -2.481970643622519,
+      -0.7114851095615825,
+      0.01837465441237269,
+      0.01837465441237269
+    ],
+    "count": 5,
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/03_P_gn_baseline/tmp/sigma_quadrature_rules/rule_90c6c85eb9c44536.npz"
+  },
+  {
+    "box": [
+      0.3263605070646663,
+      3.01368478209765,
+      0.01837465441237269,
+      0.01837465441237269
+    ],
+    "count": 5,
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/04_F_gn_baseline/tmp/sigma_quadrature_rules/rule_79fea2ee4bc151de.npz"
+  }
+]

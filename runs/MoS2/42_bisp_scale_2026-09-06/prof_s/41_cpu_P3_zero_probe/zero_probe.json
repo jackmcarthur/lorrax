@@ -1,0 +1,14 @@
+[
+  {
+    "name": "incumbent",
+    "calls": 10,
+    "compiles": 10,
+    "compiler_seconds": 0.24086816897033714
+  },
+  {
+    "name": "hoisted",
+    "calls": 10,
+    "compiles": 1,
+    "compiler_seconds": 0.02111536799930036
+  }
+]
