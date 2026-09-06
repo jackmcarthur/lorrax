@@ -1,0 +1,7 @@
+# BISP-PROF-S local issue register
+
+Unmerged branch perf/bisp-prof-s-2026-09-06; source inspection only, quantitative impact unverified.
+
+- `src/gw/w_isdf.py:2029`: `photon_blocks_full_q` defines a fresh jitted `add` inside each C,D/output/term iteration (300 creations for all16 blocks ×3 terms). Candidate compiler lifetime defect; implementation owned by screening lane ZW, consumption here charged to Sigma. See reports/bisp_prof_s_2026-09-06/report.md.
+- `src/gw/photon_sigma.py:123`: static factory specializes by `(A,B)` in addition to family plans/shapes, unlike F's shape-class cache. Quantitative compilation cost unmeasured.
+- `src/gw/photon_sigma.py:180`: separate q0 head kernel rebuilds G and unfolds both faces that the body just consumed. Candidate duplicated work; no change without profiling/parity gate.
