@@ -822,7 +822,7 @@ Four non-closed sets remain, deliberately. **Do not re-open the sweep.**
 | `si_cohsex_debug/centroids_frac_960.txt` | 1.318e-01 | `test_qgrid_symmetry_resolution.py`'s `_OPEN_SET`, paired against the 144 set as `_CLOSED_SET` — the pair *is* the thing under test |
 | `si_bse_debug/centroids_frac_480.txt` | 1.718e-01 | measured specimen pinned by `test_symmetry_maps_closure.py` and `..._qgrid_resolution.py` (47/48 ops); the deck itself already uses the closed twin |
 | `cohsex_debug/centroids_frac_60.txt` | 2.762e-01 | `test_star_offdiag_gate.py` asserts its consequence as a fact; also the deck behind ~12 test files incl. `conftest.py` |
-| `bispinor_debug/centroids_frac_256.txt` | 1.436e-01 | the documented full-BZ fallback the bispinor fixture exercises; regenerating changes a frozen reference — **open owner question** |
+| `bispinor_debug/centroids_frac_256.txt` | 1.436e-01 | owner ruling: KEEP unchanged; the same parent route uses a trivial `SymMaps` view and loader-unfolded full-k parents; regenerating would change the frozen reference |
 
 These are what the closure machinery is *tested against*: deleting them deletes
 the tests that establish closure behaviour.
