@@ -128,7 +128,7 @@ def check_sigma_sx_chain_matches_dense(
         nb_sigma=5, nk=2):
     from gw.cohsex_sigma import _make_cohsex_kernels
     from gw.photon_sigma import (
-        _TERM_SX, _TERM_X, _make_photon_static_block_kernel)
+        _TERM_SX, _TERM_X, _make_photon_static_class_kernel)
     from gw.wavefunction_bundle import (
         BandSlices, Wavefunctions, PSI_MUN_SPEC, PSI_NMU_SPEC)
 
@@ -194,17 +194,17 @@ def check_sigma_sx_chain_matches_dense(
     from full_photon_head_sigma_gate import _bundle
     from common.gamma_matrices import gamma_perm_phase
     parent = _bundle(mesh, psi_np, enk_np, np.zeros_like(enk_np), slices)
-    photon_block = _make_photon_static_block_kernel(
+    photon_block = _make_photon_static_class_kernel(
         mesh, kgrid, nk, parent, parent)
-    vertices = (gamma_perm_phase(mu_L), gamma_perm_phase(nu_L))
+    vertices = tuple(tuple(x[None] for x in gamma_perm_phase(v)) for v in (mu_L, nu_L))
     weights = np.zeros((nk, nb_full), dtype=np.complex128)
     weights[:, :nb_sigma] = f_np
     weights = _put(weights, mesh, (None, None))
     photon_x = photon_block(parent.green_parent, parent.green_parent,
-        weights, V_q_packed, 1.0, vertices)
+        weights, V_q_packed[None], 1.0, vertices)
     photon_x.block_until_ready()
     photon_sx = photon_block(parent.green_parent, parent.green_parent,
-        weights, W_q_packed, 1.0, vertices)
+        weights, W_q_packed[None], 1.0, vertices)
     photon_sx.block_until_ready()
     r_photon_x = _rel(_gather(photon_x), got_face_full)
     r_photon_sx = _rel(_gather(photon_sx), 2.0 * got_face_full)

@@ -1,0 +1,38 @@
+[
+  {
+    "shape_class": "CC",
+    "blocks": 1,
+    "mu_left": 600,
+    "mu_right": 600,
+    "green_bytes_p4": 829440000,
+    "interaction_bytes_p4": 51840000,
+    "face_pair_bytes_p4": 55296000
+  },
+  {
+    "shape_class": "CT",
+    "blocks": 3,
+    "mu_left": 600,
+    "mu_right": 196,
+    "green_bytes_p4": 270950400,
+    "interaction_bytes_p4": 50803200,
+    "face_pair_bytes_p4": 36679680
+  },
+  {
+    "shape_class": "TC",
+    "blocks": 3,
+    "mu_left": 196,
+    "mu_right": 600,
+    "green_bytes_p4": 270950400,
+    "interaction_bytes_p4": 50803200,
+    "face_pair_bytes_p4": 36679680
+  },
+  {
+    "shape_class": "TT",
+    "blocks": 9,
+    "mu_left": 196,
+    "mu_right": 196,
+    "green_bytes_p4": 88510464,
+    "interaction_bytes_p4": 49787136,
+    "face_pair_bytes_p4": 18063360
+  }
+]

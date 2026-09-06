@@ -1,0 +1,30 @@
+[lx] using named allocation JID 57982945 [--jid]
+[lxrun] JID 57982945 · 4 nodes · 1:54:44 left · 11/16 GPUs free · incoming: lx-?
+  1  nid001064 [0/4 gpu]  busy   lx-Xg0-120221-406339-5559 (+1) 1m     started 12:02
+        └ lx-Xg4-120221-406350-5513    1m     started 12:02
+  2  nid001065 [3/4 gpu]  busy   lx-Xg1-120056-398674-7698 3m     started 12:00
+  3  nid001068 [4/4 gpu]  free   —                —      —  ← starting lx-?  ./rankwrap.sh ./driver.s
+  4  nid001128 [4/4 gpu]  free   —                —      —
+[lx] 4 GPU(s) x 4 rank(s) per node: select_gpu.sh pins ONE GPU per rank, so each rank sees ONE device's memory, not 4. For a single process across all 4 devices use `-G 4 -n 1`.
+[lx] source tree: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src  [cwd checkout]
+[lx] runtime import origin: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py  [PYTHONPATH head; runtime.bootstrap attests the actual import]
+[select_gpu] nid001068 local rank 1 -> CUDA_VISIBLE_DEVICES=1 (from CUDA_VISIBLE_DEVICES)
+[select_gpu] nid001068 local rank 3 -> CUDA_VISIBLE_DEVICES=3 (from CUDA_VISIBLE_DEVICES)
+[select_gpu] nid001068 local rank 2 -> CUDA_VISIBLE_DEVICES=2 (from CUDA_VISIBLE_DEVICES)
+[select_gpu] nid001068 local rank 0 -> CUDA_VISIBLE_DEVICES=0 (from CUDA_VISIBLE_DEVICES)
+[rankwrap] rank=1 host=nid001068 src=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+[rankwrap] rank=3 host=nid001068 src=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+[rankwrap] rank=2 host=nid001068 src=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/rankwrap.sh: line 15: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/driver.sh: Permission denied
+/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/rankwrap.sh: line 15: exec: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/driver.sh: cannot execute: Permission denied
+[rankwrap] rank=0 host=nid001068 src=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/rankwrap.sh: line 15: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/driver.sh: Permission denied
+/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/rankwrap.sh: line 15: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/driver.sh: Permission denied
+/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/rankwrap.sh: line 15: exec: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/driver.sh: cannot execute: Permission denied
+/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/rankwrap.sh: line 15: exec: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/driver.sh: cannot execute: Permission denied
+/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/rankwrap.sh: line 15: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/driver.sh: Permission denied
+/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/rankwrap.sh: line 15: exec: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/driver.sh: cannot execute: Permission denied
+srun: error: nid001068: tasks 0-3: Exited with exit code 126
+srun: Terminating StepId=57982945.175
+[lx] step lx-Xg4-120420-417822-9746 exit 126 in 4 s
+[lx] nonzero exit — judge by artifacts, not the code (rc=134 has been seen on runs whose outputs were correct)

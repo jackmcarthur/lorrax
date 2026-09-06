@@ -1,0 +1,12 @@
+run_id: 10_P_scan_oracles
+system: MoS2
+pipeline: native vertex, scalar-face, parent Sigma and Hall-head oracles
+platform: perlmutter
+variant_of: prof_s/29_combined_regression (3x3 gate)
+reused: canonical multi-device gates and immutable WFN
+source: source_head.txt plus source.diff
+pool: 57982945
+geometry: P4 one rank per GPU
+steps:
+  physics_gate:
+    state: pending
