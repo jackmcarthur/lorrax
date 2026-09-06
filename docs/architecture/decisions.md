@@ -596,9 +596,16 @@ and any
 The test-only `LORRAX_EXTRA_MU_PAD` knob still sizes the canonical carrier
 (I/O staging) and no longer changes the orbit-packed runtime extent.
 `PackedCentroidBasis.solve_axis` supplies the solve receipt; the loader and
-q-table construction consume that basis's extent without padding it again.  Bispinor decks, trivial
-groups and non-closed centroid sets take the identity layout, so their
-behaviour is the pre-2026-09-05 canonical one.
+q-table construction consume that basis's extent without padding it again.
+Bispinor charge and current families now use the same orbit-packed owner.
+The mandatory parent plan requires centroid closure under its typed actions;
+an identity packing layout does not waive that requirement. The former
+full-k fallback for non-closed sets was deleted with the full-k carrier.
+This removes support for the historical non-closed 60-centroid COHSEX
+fixture: final landing claim1282 refuses before fitting, whereas fixed-main
+and scalar ade4fc66 controls pass unchanged. This is an open compatibility
+limitation, not numerical agreement or a reason to refreeze that oracle.
+Trivial typed actions remain valid on an identity layout.
 
 ## 2026-08-18 — ζ band chunks default to 16; zero opts into the planner
 
@@ -717,3 +724,7 @@ The owner requires the Gamma completion itself to obey the full authenticated li
 Complex-time weights are unchanged by the typed pair-transpose action. `build_G_tau` can produce the transposed parent directly with the same Green GEMM and conjugated endpoint faces. `CentroidKUnfoldPlan.unfold_operator(..., operator_transpose=...)` forwards that optional operand to the symmetry owner; the low-level pair input is explicitly placed on Y/X, so the typed endpoint transpose consumes it locally. This is an interface correction required by the actual MoS2 HLO census, not a second Green builder. Both parent operators remain distributed over all P ranks; no full-k face or Lorentz-block cache is restored.
 
 Dynamic band projection returns raw parent rows. The complex-linear band transpose follows the complete omega accumulation, once per result, rather than once per tau. Static invalid-pole completion uses the same typed unfold after its existing host gather. Quadrature weights are never conjugated. The nontrivial complex-time oracle rejects conjugating them. Numerical, communication and memory acceptance is recorded in the campaign report; the former identity-only tau fixture is insufficient for antiunitary communication claims.
+
+### 2026-09-06 — BSE consumes raw-parent GW restart faces
+
+The full landing gate exposed a downstream reader left behind by the GW carrier deletion. `bse_loading._unfold_bse_parent_faces` authenticates the WFN source, centroid content and parent-row mapping, then uses the existing packed basis and typed parent unfold for the selected valence/conduction bands. BSE receives its established full-k selected-band inputs; GW neither stores nor restores a full-k carrier. Legacy full-k files retain their reader. This consumer helper is a gate-driven correction to the frozen deletion list, not a second symmetry implementation. The parent seam uses the existing square-mesh plan; the single-device reference uses its existing local mesh.

@@ -806,3 +806,64 @@ def test_complex_time_parent_green_keeps_time_under_antiunitary_action(monkeypat
     wrong_phase[anti] = wrong_phase[anti].conj()
     wrong = np.einsum('knam,kn,knbv->kambv',child,wrong_phase,child.conj())
     assert np.max(np.abs(expected[anti]-wrong[anti])) > .1
+
+
+def _literal_complex_tau(child, energy, residue, pole, time):
+    """Sum every intermediate band and q transfer with unchanged complex evolution weights."""
+    green = np.einsum('knam,kn,knbv->kambv',child,
+        np.exp(-1j*energy*time),child.conj())
+    interaction = residue*np.exp(-1j*pole*time)
+    output = np.zeros((9,child.shape[1],child.shape[1]),complex)
+    for k,kv in enumerate(np.ndindex(3,3,1)):
+        sigma = np.zeros_like(green[0])
+        for q,qv in enumerate(np.ndindex(3,3,1)):
+            km = np.ravel_multi_index((np.array(kv)-qv)%[3,3,1],(3,3,1))
+            sigma -= green[km]*interaction[q][None,:,None,:]/9
+        output[k] = np.einsum('iam,ambv,jbv->ij',child[k].conj(),sigma,child[k])
+    return output
+
+
+def test_deferred_band_unfold_preserves_complex_frequency_weighted_tau(monkeypatch):
+    """Complex tau sums on parents unfold by transpose without conjugating non-Hermitian frequency weights."""
+    from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
+    from symmetry_maps import unfold_file_wedge_band_operator
+    _cpu_algebra(monkeypatch)
+    mesh = _mesh()
+    plan = _toy_plan(mesh)
+    nmu,nb = plan.n_centroid_packed,4*plan.n_centroid_packed
+    rng = np.random.default_rng(141)
+    raw = np.array([np.linalg.qr(rng.normal(size=(nb,nb))+1j*rng.normal(size=(nb,nb)))[0].T.reshape(nb,4,nmu)
+                    for _ in range(plan.n_parent)])
+    child = _literal_children(raw,plan)
+    site = np.mean([np.arange(1,nmu+1)[perm] for perm in plan.sym_perm],axis=0)
+    residue = np.broadcast_to(np.diag(site),(9,nmu,nmu)).astype(complex)
+    pole = np.full_like(residue,1.1-.2j,dtype=complex)
+    energy = np.full((plan.n_parent,nb),.3)
+    put = lambda a,p:jax.device_put(a,NamedSharding(mesh,p))
+    mun = put(raw.transpose(0,2,3,1),P(None,None,'x','y'))
+    nmu_face = put(raw,P(None,'x',None,'y'))
+    kernel = get_shared_sigma_tau_kernel(mesh_xy=mesh,kgrid=(3,3,1),brackets=None,
+        face_shape=(9,nb,nmu,4),k_unfold_plan=plan)
+    parents, full = [], []
+    for time in (.15+.07j,.31-.04j,.55+.11j):
+        value = kernel(mun,nmu_face,nmu_face,mun,jnp.asarray(energy),jnp.ones_like(jnp.asarray(energy)),
+            put(residue[None],P(None,None,'x','y')),put(pole[None],P(None,None,'x','y')),
+            jnp.array([0]),jnp.array([[0.,np.inf,-np.inf,-np.inf,np.inf,np.inf]]),
+            jnp.array([False]),jnp.array(0.),jnp.array(0.),jnp.array(time))
+        reference = _literal_complex_tau(child,energy[plan.irr_idx],residue,pole,time)
+        assert value.shape == (plan.n_parent,nb,nb)
+        np.testing.assert_allclose(value,reference[plan.parent_full_rows],rtol=3e-12,atol=3e-12)
+        parents.append(value)
+        full.append(reference)
+    weights = np.array([[.7+.2j,-.3+.4j,.1-.8j],[.2-.6j,.5+.3j,-.4+.1j]])
+    parent_sum = np.einsum('wt,tkij->wkij',weights,np.asarray(parents))
+    expected = np.einsum('wt,tkij->wkij',weights,np.asarray(full))
+    actual = np.array([unfold_file_wedge_band_operator(plan.sym,jnp.asarray(value),trs_rule='transpose')
+                       for value in parent_sum])
+    np.testing.assert_allclose(actual,expected,rtol=3e-12,atol=3e-12)
+    assert np.max(np.abs(expected-expected.conj().swapaxes(-1,-2))) > .1
+    assert np.max(np.abs(expected[:,:,0,1])) > .01
+    anti = plan.sym.operation_rows(plan.sym_idx)[2]
+    wrong = parent_sum[:,plan.irr_idx].copy()
+    wrong[:,anti] = wrong[:,anti].conj()
+    assert np.max(np.abs(wrong[:,anti]-expected[:,anti])) > .1

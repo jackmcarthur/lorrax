@@ -815,6 +815,50 @@ def _slabio_read_psi(io, name, psi_shape, band_indices, axis, mesh_xy,
                         mesh=mesh_xy, partition_spec=spec)
 
 
+def _unfold_bse_parent_faces(faces, restart_file, input_file, mesh_xy):
+    """Authenticate canonical parent faces and unfold only the selected BSE bands."""
+    from common.centroid_basis import PackedCentroidBasis
+    from common.shard_map import shard_map
+    from file_io.centroids import load_centroid_basis
+    from file_io.qp_wfn import authenticate_restart_qp_state_source_for_wfn
+    from file_io.wfn_basis import centroid_table_md5
+    from gw.centroid_k_unfold import build_centroid_k_unfold_plan
+    from wfn_loader import WfnLoader
+
+    with h5py.File(restart_file, "r") as f:
+        if "psi_full_y" in f:
+            return faces
+        rows = np.asarray(f["psi_parent_k_rows"])
+        digest = f.attrs.get("centroids_charge_md5")
+    if any(face.shape[0] != len(rows) for face in faces):
+        raise ValueError("BSE parent face extent does not match its saved parent rows")
+    if input_file is None:
+        raise ValueError("BSE parent restart requires input_file for its typed symmetry action")
+    wfn = WfnLoader(_parse_wfn_path(input_file))
+    authenticate_restart_qp_state_source_for_wfn(
+        wfn=wfn, state_artifact_path=restart_file, where="BSE parent reader")
+    sym = wfn.symmetry()
+    params = _read_lorrax_input_quietly(input_file)
+    path = str(params.get("centroids_file", "centroids_frac.txt"))
+    if not os.path.isabs(path):
+        path = os.path.join(os.path.dirname(os.path.abspath(input_file)), path)
+    idx = load_centroid_basis(path, wfn.fft_grid, sym=sym).centroid_indices
+    if digest != centroid_table_md5(idx):
+        raise ValueError("BSE parent restart centroid content does not match its deck")
+    basis = PackedCentroidBasis.build(idx, sym, wfn.fft_grid, mesh_xy)
+    plan = build_centroid_k_unfold_plan(
+        sym, idx, wfn.fft_grid, mesh_xy, nspinor=faces[0].shape[2],
+        parent_k_frac=wfn.kpoints, layout=basis.layout)
+    if not np.array_equal(rows, plan.parent_full_rows):
+        raise ValueError("BSE parent restart rows do not match the authenticated file wedge")
+    spec = P(None, None, None, "x")
+    unfold = jax.jit(shard_map(
+        lambda a: plan.unfold_face(a, spin_axis=2, mu_axis=3, mesh_axis="x"),
+        mesh=mesh_xy, in_specs=spec, out_specs=spec, check_vma=False))
+    return tuple(basis.unpack_axis(unfold(basis.pack_axis(a, 3, spec=spec)),
+                                   3, spec=spec) for a in faces)
+
+
 def _read_bse_tensors(
     restart_file: str,
     *,
@@ -850,11 +894,9 @@ def _read_bse_tensors(
     """
     if not _bse_slabio_usable(log_fn=log_fn):
         with h5py.File(restart_file, "r") as f:
-            from file_io.tagged_arrays import require_full_k_psi
-            require_full_k_psi(f, where="BSE restart-file ψ reader")
             vq_dset = f[vq_key]
             wq_dset = f[wq_key]
-            psi_dset = f["psi_full_y"]
+            psi_dset = f["psi_full_y" if "psi_full_y" in f else "psi_parent_y"]
             psi_v_X = _read_psi_mu_sharded(psi_dset, val_indices, mu_per_x,
                                            "x", mesh_xy, n_rmu_pad, trim=False)
             psi_c_X = _read_psi_mu_sharded(psi_dset, cond_indices, mu_per_x,
@@ -869,6 +911,8 @@ def _read_bse_tensors(
             V_q_full = (_read_wq_sharded(vq_dset, mu_per_x, nu_per_y, mesh_xy,
                                          n_rmu_pad, trim=False, kgrid=kgrid)
                         if load_v_full else None)
+        psi_v_X, psi_c_X = _unfold_bse_parent_faces(
+            (psi_v_X, psi_c_X), restart_file, input_file, mesh_xy)
         return psi_v_X, psi_c_X, V_q0, W_q, V_q_full
 
     from file_io.slab_io import SlabIO
@@ -879,6 +923,7 @@ def _read_bse_tensors(
     # byte path they always had.
     with h5py.File(restart_file, "r") as _f:
         _wedge = _qirr_wedge_tables(_f)
+        psi_name = "psi_full_y" if "psi_full_y" in _f else "psi_parent_y"
     vq_plan = _MunuSlabPlan(vq_shape, kgrid, wedge_tables=_wedge.get(vq_key))
     wq_plan = _MunuSlabPlan(wq_shape, kgrid, wedge_tables=_wedge.get(wq_key))
     if vq_plan.is_wedge or wq_plan.is_wedge:
@@ -889,15 +934,17 @@ def _read_bse_tensors(
     log_fn(f"BSE-sharded: restart tensors via SlabIO "
            f"({os.path.basename(restart_file)})")
     with SlabIO(restart_file, mode="r", mesh=mesh_xy) as io:
-        psi_v_X = _slabio_read_psi(io, "psi_full_y", psi_shape, val_indices,
+        psi_v_X = _slabio_read_psi(io, psi_name, psi_shape, val_indices,
                                    "x", mesh_xy, n_rmu_pad)
-        psi_c_X = _slabio_read_psi(io, "psi_full_y", psi_shape, cond_indices,
+        psi_c_X = _slabio_read_psi(io, psi_name, psi_shape, cond_indices,
                                    "x", mesh_xy, n_rmu_pad)
         V_q0 = _slabio_read_munu(io, vq_key, vq_plan, mesh_xy, n_rmu_pad,
                                  q_index=0)
         W_q = _slabio_read_munu(io, wq_key, wq_plan, mesh_xy, n_rmu_pad)
         V_q_full = (_slabio_read_munu(io, vq_key, vq_plan, mesh_xy, n_rmu_pad)
                     if load_v_full else None)
+    psi_v_X, psi_c_X = _unfold_bse_parent_faces(
+        (psi_v_X, psi_c_X), restart_file, input_file, mesh_xy)
     return psi_v_X, psi_c_X, V_q0, W_q, V_q_full
 
 
@@ -986,12 +1033,13 @@ def load_bse_data_from_restart_sharded(
             # ``None`` key would mean "no W dataset" rather than "W is bare V".
             wq_key = vq_key
             wq_dset = vq_dset
-        if "psi_full_y" not in f or "enk_full" not in f:
+        psi_name = "psi_full_y" if "psi_full_y" in f else "psi_parent_y"
+        if psi_name not in f or "enk_full" not in f:
             raise ValueError(
-                f"{restart_file} is missing canonical psi_full_y/enk_full datasets. "
+                f"{restart_file} is missing canonical wavefunction/enk_full datasets. "
                 "Regenerate restart tensors with current gw_jax."
             )
-        psi_full_dset = f["psi_full_y"]
+        psi_full_dset = f[psi_name]
         enk_full = np.asarray(f["enk_full"][:])
 
         # The same three on-disk layouts ``_resolve_munu_reader`` shims, asked
@@ -1324,12 +1372,13 @@ def _load_ring_subset(
         vhead_restart = complex(f["vhead"][()]) if "vhead" in f else None
         whead_restart = (jnp.asarray(f["whead"][:], dtype=jnp.complex128)
                          if "whead" in f else None)
-        if "psi_full_y" not in f or "enk_full" not in f:
+        psi_name = "psi_full_y" if "psi_full_y" in f else "psi_parent_y"
+        if psi_name not in f or "enk_full" not in f:
             raise ValueError(
-                f"{restart_file} is missing canonical psi_full_y/enk_full datasets. "
+                f"{restart_file} is missing canonical wavefunction/enk_full datasets. "
                 "Regenerate restart tensors with current gw_jax."
             )
-        psi_full = jnp.asarray(f["psi_full_y"][:])
+        psi_full = jnp.asarray(f[psi_name][:])
         enk_full_np = np.asarray(f["enk_full"][:])
         # k=0 only (see _logical_nband_total: the pad is uniform across k).
         # Cheap here regardless: this reader already materialises the whole
@@ -1403,6 +1452,9 @@ def _load_ring_subset(
 
     psi_v = psi_full[:, val_indices, :, :]
     psi_c = psi_full[:, cond_indices, :, :]
+    from common.collectives import single_device_mesh
+    psi_v, psi_c = _unfold_bse_parent_faces(
+        (psi_v, psi_c), restart_file, input_file, single_device_mesh())
     eps_v = enk_full[:, val_indices]
     eps_c = enk_full[:, cond_indices]
 

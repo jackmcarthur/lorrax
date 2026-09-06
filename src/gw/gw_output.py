@@ -446,7 +446,7 @@ def restart_tensor_writes_enabled(config, tensors_filename: str) -> bool:
         ("write_restart_tensors", "off", tensors_filename),
         f"  [restart_write] write_restart_tensors = false — SKIPPING "
         f"{os.path.basename(tensors_filename)} entirely (V_qmunu, G0_mu_nu, "
-        f"enk_full, psi_full_y, W0_qmunu, head scalars).  Nothing in the GW "
+        f"enk_full, psi_parent_y, W0_qmunu, head scalars).  Nothing in the GW "
         f"driver reads these back; a BSE run against this directory will "
         f"refuse on the missing file.",
         scope="rank0")

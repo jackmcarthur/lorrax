@@ -45,6 +45,11 @@ not the current Gram. The C tail uses `gamma_double_contract`; the Z tail
 uses the canonical vertex's output-index permutation and phase. Stored
 parent faces are never vertex-folded.
 
+The equal-current solve preserves the paired signed C/Z convention when
+regularizing. `_transverse_lu_ridge` owns the shift for all four local or
+distributed, hoisted or fused preparations; its literal oracle and default
+mode are recorded in the [convention register](symmetry_register.md#integration-closures-2026-09-06).
+
 C_q uses one planned parent-row GEMM per endpoint followed by the typed
 operator unfold and IFFT/product/FFT tail. Z_q accumulates parent projectors
 across bounded band chunks, then streams output-spin blocks through the

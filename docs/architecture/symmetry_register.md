@@ -660,8 +660,9 @@ compressible would move physics.
 | `zeta_q.h5` | **q-IBZ** by default | no `q_storage` attr — basis inferred from shape |
 | `mpa_*.h5` | **q-IBZ** always | most complete stamping in the tree (rank-checked v2) |
 | `WFN.h5` / `WFN_qp.h5` | **IBZ** | BGW's own header *is* the declaration |
-| `isdf_tensors.h5` `V_qmunu`/`W0_qmunu` | **q-IBZ by default**, stamped | `restart_q_storage` default moved `"full"` → `"auto"` 2026-08-16; `full` survives as the escape hatch and the A/B control |
-| `isdf_tensors.h5` `psi_full_y` | **full BZ, no option** | and the option is NOT a gather — see below |
+| `isdf_tensors.h5` `V_qmunu`/`W0_qmunu` | **computed q parents**, stamped | The parent route retires explicit `restart_q_storage=full`; naturally unreduced q sets and historical full-q readers remain |
+| `isdf_tensors.h5` `psi_parent_y` and `_mun` | **raw file parents**, canonical logical centroids | `psi_parent_k_rows` authenticates the row map; transverse counterparts carry the second centroid family |
+| Historical `isdf_tensors.h5` `psi_full_y` | **full BZ** | Legacy consumers may read it; current GW does not write it. Parent-to-child transport is not a row gather |
 | `qp_wfn_rotations.h5` | **file wedge when the writer can prove it**, stamped | `qp_rotations_k_storage` default `"auto"`; the writer runs the reader's round trip and keeps the wedge only if it reproduces the arrays |
 | `dipole.h5` | **full BZ** | NOT convertible by a gather — measured, below |
 | `v_q_bispinor.h5` | **q-IBZ**, per-dataset stamps | seven unique tiles, two centroid families; `photon_blocks_full_q` restores one Lorentz block |
@@ -673,7 +674,7 @@ which is a **pure row gather plus `conj` on the time-reversed rows**. That
 works because they are SCALAR operators: each commutes with every space-group
 operation and with time reversal, so a star holds one matrix.
 
-The three artifacts still on the full BZ are not scalars, and each fails the
+The historical full-BZ forms of these artifacts are not scalars, and each fails the
 gather in its own way. **Measured 2026-08-16** on the committed fixtures
 (`reports/wedge_storage_migration_2026-08-16/artifacts/probe_star_relation.py`):
 
@@ -757,7 +758,9 @@ option is not a gather". The two follow-up hypotheses tried in the same probe
 **inconclusive rather than negative**: the only `sym_perm` on that file is the
 **q**-wedge table from `V_qmunu__qirr`, addressed by `sym_idx_q`, and the
 probe addressed it by `sym_idx_k`. A fair test needs the k-side centroid
-permutation, which nothing in the tree currently builds.
+permutation, which that historical probe did not build. The current
+`CentroidKUnfoldPlan` supplies it through the symmetry service; BSE selected
+parent-face reads use that plan after WFN/centroid/row authentication.
 
 **`cohsex_debug` does not reproduce this** (spatial rows 5.317e-02, TRS rows
 2.759753) and is **not** evidence against the rule: that deck's own
@@ -1334,3 +1337,23 @@ existing LU conditioning refusal is still applied to the corrected factor.
 Fresh Mo202/Si235 match all90/256 QP and printed sector rows to their
 Gamma-only/Si controls; CPU233 passes24tests. No general-indefinite
 regularization or full gauge-completeness claim follows.
+
+
+The final antiunitary band transpose is also proved for complex dynamic
+frequency sums by `test_deferred_band_unfold_preserves_complex_frequency_weighted_tau`:
+three complex nodes, two complex frequency weights, non-Hermitian off-diagonal
+outputs, and a wrong-conjugation red twin. The transpose follows the frequency
+sum. Actual Si/Mo tau executables have zero explicit HLO collectives after the
+typed Green partner placement repair; native distributed GEMM traffic remains.
+
+The production self-energy audit flag is complemented by matched-store,
+matched-native-rule Si/Mo parent versus fixed-main gates (claims1239–1247),
+with covariant contact and Gamma-completion prices separated in the campaign
+report. P16 fresh/restart and exact seven-file replay are claims1254/1257/1258.
+These do not certify the flagged complete-SCF or omitted-current model terms.
+
+BSE selected-face transport is a file-boundary consumer of the same action:
+claim1275 compares every P4 X/Y selected-face shard to the P1 canonical
+reference bit-for-bit, including399-to400 zero padding. V/W remain distributed
+on both processor axes. Full parent-row coverage does not imply an identity
+action: the authenticated file may still use time-reversed rows.

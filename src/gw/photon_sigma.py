@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from common.collectives import device_put_process_local
+
 import jax
 import numpy as np
 import jax.numpy as jnp
@@ -188,16 +190,16 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
         head_block = None
         if factors is not None:
             pairs = (factors.bare_pair,) if term == _TERM_X else factors.screened_pairs
-            pairs = tuple((jax.device_put(images[0][i], NamedSharding(mesh_xy, P(None, 'x'))),
-                           jax.device_put(images[1][i], NamedSharding(mesh_xy, P(None, 'y'))))
+            pairs = tuple((device_put_process_local(images[0][i], NamedSharding(mesh_xy, P(None, 'x'))),
+                           device_put_process_local(images[1][i], NamedSharding(mesh_xy, P(None, 'y'))))
                 for pair in pairs for images in (_photon_q0_factor_orbit(
                     *pair, layout=response.layout, plans=factors.family_plans, mesh_xy=mesh_xy),)
                 for i in range(images[0].shape[0]))
             head_block = photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
             if term == _TERM_COH:
                 head_block = head_block - photon_q0_low_rank_block(
-                    tuple((jax.device_put(images[0][i], NamedSharding(mesh_xy, P(None, 'x'))),
-                           jax.device_put(images[1][i], NamedSharding(mesh_xy, P(None, 'y'))))
+                    tuple((device_put_process_local(images[0][i], NamedSharding(mesh_xy, P(None, 'x'))),
+                           device_put_process_local(images[1][i], NamedSharding(mesh_xy, P(None, 'y'))))
                         for images in (_photon_q0_factor_orbit(*factors.bare_pair,
                             layout=response.layout, plans=factors.family_plans, mesh_xy=mesh_xy),)
                         for i in range(images[0].shape[0])),
