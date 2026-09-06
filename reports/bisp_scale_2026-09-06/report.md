@@ -15,7 +15,7 @@ Lane weight: heavy. Branch `perf/bisp-scale-2026-09-06`, unmerged. Measurement i
 | family faces/current channels | n/a | n/a | pending | pending | C/T endpoint classes; coupled three-current ζ. |
 | packed Dyson | n/a | n/a | pending | pending | Bispinor-only coupled (M_C+3M_T) solve. |
 | Γ completion | n/a | n/a | pending | pending | Integration tip changes incumbent physics; exact P/F gate must be checked. |
-| head attribution | n/a | n/a | disabled | disabled | sigma_freq_debug_output=false; physical head stays full. |
+| head attribution | n/a | n/a | P disabled; F still active | same source behavior | Fixed photon_sigma.py:380-423 ignores the false diagnostic flag when q0 factors exist; price this extra work. |
 
 Charge references are harvested evidence, not this lane's measurements: sandbox `reports/psi_irr_perf2_2026-09-05/report.md`, JID57941637, and CLAIMS row842 (its separate claims/0842.md is missing). PERF2 used cuda_async@0.85; this lane uses BFC@0.85. Charge cross-source comparisons were not printed-digit identical. These reference ratios cannot establish bispinor identity or absolute timing across allocators.
 
@@ -23,7 +23,7 @@ Source provenance: started at S tip4a691b67, cherry-picked ZW0f8fbc3e/f811f734 a
 
 QE evidence: `runs/MoS2/42_bisp_scale_2026-09-06/00_qe_6x6/`, pool57982945. NSCF reports12 spatial operations and7 stored k points. Both SCF/NSCF use6x6x1 and82 bands. wfn2hdf step lx-Xg0-105033-2302113-3374 exits0. Claim1214. Preprocessing requests600 charge/200 current orbit centroids. The inherited GW window remains80 bands with82 QE bands to witness the upper multiplet boundary.
 
-Experiments are preregistered, not implemented: (a) restore16 source blocks once per term, retain only if exact and faster, with memory refusal tied to existing memory_per_device_gb; (b) enumerate actual module compile excess and share only shape-identical programs, with exact source-change gates. For complex128, heterogeneous resident sources occupy16*K*(M_C+3*M_T)^2/P bytes/rank, bounded by256*K*max(M_C,M_T)^2/P; this is carrier storage, not an allocator peak. At K36, M_C600, M_T200 the nominal resident carrier is829,440,000 bytes/P (207,360,000 at P4;51,840,000 at P16). It scales linearly in K, quadratically in centroids, independently of nb/ns, and cannot be treated as a fixed-size optimization.
+Experiments (measured below): (a) restore16 source blocks once per term, retain only if exact and faster, with memory refusal tied to existing memory_per_device_gb; (b) enumerate actual module compile excess and share only shape-identical programs, with exact source-change gates. For complex128, heterogeneous resident sources occupy16*K*(M_C+3*M_T)^2/P bytes/rank, bounded by256*K*max(M_C,M_T)^2/P; this is carrier storage, not an allocator peak. At K36, M_C600, M_T200 the nominal resident carrier is829,440,000 bytes/P (207,360,000 at P4;51,840,000 at P16). It scales linearly in K, quadratically in centroids, independently of nb/ns, and cannot be treated as a fixed-size optimization.
 
 Outstanding: GW source arms/fresh ζ, identity, P4/P16 stage/unit/compile tables, native/HLO census, both experiments, final verdict. No unrun cell is treated as zero or inherited speedup.
 
@@ -52,4 +52,12 @@ Compile candidate: existing `services/distrib_la/src/distrib_la/matmul.py::_zero
 
 The F Sigma wall changes substantially between fresh and copied arms, so one copied pair cannot establish a stable whole-run gain. Parent ζ stage15.68s plus transverse17.38s; F reports charge13.76s and includes its transverse fit inside23.84s ISDF setup/I/O, requiring timed-stage reconciliation rather than subtracting totals. Both P/F gates FAIL: fresh max4.470µeV; copied max4.467µeV, sectors4µeV (claim1220). Fixed-main remains an incumbent physics control, never a passing exact control.
 
-Full parent profile12 completes267s under Nsight (not a baseline wall), JID57982945/lx-Xg4-105913-2356430-4328. Rank0 HLO/Nsight and PERF2 census are on disk. Fixed full profile13 fails at cuSOLVERMp external workspace cudaMallocAsync OOM; no timing claim derives from its missing completion. Scope27 copies completed fixed-main tmp and profiles static restart to avoid that workspace. Initial dynamic copied cache selects different nodes (116 P versus85 F); the matched arms use PERF2's guarded single-rule lookup, leaving containment/error/noise guards unchanged.
+Full parent profile12 completes267s under Nsight (not a baseline wall), JID57982945/lx-Xg4-105913-2356430-4328. Rank0 HLO/Nsight and PERF2 census are on disk. Fixed full profile13 fails at cuSOLVERMp external workspace cudaMallocAsync OOM; no timing claim derives from its missing completion. Scope27 static restart is refused by the incumbent config gate. Scope28 profiles copied zeta with restart=false and completes; exact against06. Initial dynamic copied cache selects different nodes (116 P versus85 F); the matched arms use PERF2's guarded single-rule lookup, leaving containment/error/noise guards unchanged.
+
+## Common-rule dynamic P4 (claim1255) and P16 compatibility
+
+New union-box certificates preserve all error/containment/noise guards; the eight schedules are identical (115 nodes). Runs25/26: total112.83/102.73s P/F, tau7.47/9.64s, screen28.50/23.96s. EQP0/1 max4.468/3.374µeV and sectors4µeV: exact FAIL. Profiles29/30 are exact against their own baseline. Their NCCL-trace captures perturb parent native timings substantially; CUDA-only repeat is in progress and no perturbed native ratio is treated as unprofiled speedup.
+
+P16 parent09 finishes94s step wall (lx-Xg4-112718-6609-6855),646 compile events/34.26s rank0; parent dynamic23 finishes133s (lx-Xg4-112855-174741-8396),892 events/52.91s. Fixed10/24 refuse logical transverse194 at P16 in core.py:3407. A common whole-orbit logical200 set is being built for a compatible P4/P16 matrix; old and new centroid measurements will remain separate.
+
+Hourly fetch found integration71ae0bde (after af85d474), which removes both antiunitary collective permutes from each parent tau and defers band unfolding until after the frequency sum. Existing captures retain their af85d474 provenance; new-tip measurements will be separately labeled.
