@@ -174,18 +174,36 @@ def _photon_head_pairs(response, term, mesh_xy):
     return expand(pairs), expand(bare)
 
 
+def _make_photon_class_restore(response, keys):
+    """Compile one canonical full-q producer per class without caching interaction arrays."""
+    from .w_isdf import photon_blocks_full_q
+    from common.gamma_matrices import gamma_perm_phase
+    layout, plans, policy = response.layout, response.family_plans, response.qgrid_policy
+    key = ("restore", id(layout), tuple(map(id, plans)), id(policy), keys)
+    if key not in _photon_sigma_kernel_cache:
+        @jax.jit
+        def restore(packed):
+            interactions = jnp.stack([value for _, value in photon_blocks_full_q(
+                packed, keys, layout=layout, family_plans=plans, qgrid_policy=policy)])
+            vertices = jax.tree.map(lambda *v: jnp.stack(v),
+                *((gamma_perm_phase(A), gamma_perm_phase(B)) for A, B in keys))
+            return interactions, vertices
+        _photon_sigma_kernel_cache[key] = restore
+    return _photon_sigma_kernel_cache[key]
+
+
 def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh_xy,
                             head_diagnostics=False):
     """Yield one parent-band sum per endpoint class while retaining one resident Green."""
-    from .w_isdf import photon_blocks_full_q
     from .cohsex_sigma import _occ_diag_full
     from .photon_layout import photon_q0_low_rank_block
-    from common.gamma_matrices import gamma_perm_phase
     if tuple(f.green_parent.plan for f in families) != response.family_plans:
         raise ValueError("Photon interaction and wavefunctions use different parent plans.")
     if term not in (_TERM_X, _TERM_SX, _TERM_COH):
         raise ValueError(f"Unknown static Sigma term {term}.")
-    operator = ("V", "W", "W-V")[term]
+    packed = response.V_packed if term == _TERM_X else response.W_packed
+    if term == _TERM_COH:
+        packed = packed - response.V_packed
     with_head = head_diagnostics and response.head_completion is not None
     pairs, bare = _photon_head_pairs(response, term, mesh_xy) if with_head else ((), ())
     for a, b in ((0, 0), (0, 1), (1, 0), (1, 1)):
@@ -198,14 +216,12 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
                    if term != _TERM_COH else left.band_mask(slices.sigma_sum).astype(jnp.complex128))
         weights = jax.lax.with_sharding_constraint(
             jnp.broadcast_to(weights, (meta.nk_tot, slices.nb_full)), NamedSharding(mesh_xy, P()))
-        interactions = jnp.stack([value for _, value in photon_blocks_full_q(response, keys, term=operator)])
+        interactions, vertices = _make_photon_class_restore(response, keys)(packed)
         head_blocks = None
         if with_head:
             head_blocks = jnp.stack([photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
                 - (photon_q0_low_rank_block(bare, response.layout, A, B, mesh_xy) if bare else 0)
                 for A, B in keys])
-        vertices = jax.tree.map(lambda *v: jnp.stack(v),
-                               *((gamma_perm_phase(A), gamma_perm_phase(B)) for A, B in keys))
         kernel = _make_photon_static_class_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
                                                   left, right, with_head=with_head)
         value = kernel(left.green_parent, right.green_parent, weights, interactions,

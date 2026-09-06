@@ -1,0 +1,7 @@
+A            runs/MoS2/42_bisp_scale_2026-09-06/prof_s/01_P_static_baseline/eqp1.dat
+B            runs/MoS2/42_bisp_scale_2026-09-06/prof_s/17_P_restore_host/eqp1.dat
+rows         210 over 7 k-points
+identical    210/210 E_qp rows agree to the printed digit
+max|dE_DFT|  0.000 ueV   (must be 0 for two arms of one deck)
+max|dE_qp|   0.000 ueV   at None
+VERDICT      PASS  (tolerance 0.0 ueV)
