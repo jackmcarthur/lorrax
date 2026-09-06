@@ -1,0 +1,36 @@
+001: kPartitionId	
+002: kKernel     	, kernel = loop_dynamic_slice_fusion_2, profile_annotation = loop_dynamic_slice_fusion.2, launch dimensions = blocks: {85, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+003: kKernel     	, kernel = loop_and_fusion_2, profile_annotation = loop_and_fusion.2, launch dimensions = blocks: {85, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+004: kKernel     	, kernel = loop_and_fusion_3, profile_annotation = loop_and_fusion.3, launch dimensions = blocks: {29, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+005: kKernel     	, kernel = input_concatenate_fusion, profile_annotation = input_concatenate_fusion, launch dimensions = blocks: {3375, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+006: kGemm       	
+007: kKernel     	, kernel = loop_multiply_fusion, profile_annotation = loop_multiply_fusion, launch dimensions = blocks: {1148, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+008: kKernel     	, kernel = input_transpose_fusion, profile_annotation = input_transpose_fusion, launch dimensions = blocks: {2736, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+009: kKernel     	, kernel = loop_broadcast_fusion_1, profile_annotation = loop_broadcast_fusion.1, launch dimensions = blocks: {34425, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+010: kCustomCall 	
+011: kKernel     	, kernel = loop_transpose_fusion, profile_annotation = loop_transpose_fusion, launch dimensions = blocks: {34425, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+012: kCustomCall 	
+013: kKernel     	, kernel = loop_broadcast_fusion, profile_annotation = loop_broadcast_fusion, launch dimensions = blocks: {34425, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+014: kCopy       	
+024: kWhile      	  
+condition:
+    015: kKernel	, kernel = loop_compare_fusion, profile_annotation = loop_compare_fusion, launch dimensions = blocks: {1, 1, 1}, threads/block: {1, 1, 1}, cluster_dim = nullopt
+  body:
+    016: kKernel    	, kernel = loop_and_fusion, profile_annotation = loop_and_fusion, launch dimensions = blocks: {1, 1, 1}, threads/block: {4, 1, 1}, cluster_dim = nullopt
+    017: kKernel    	, kernel = loop_and_fusion, profile_annotation = loop_and_fusion.1, launch dimensions = blocks: {1, 1, 1}, threads/block: {4, 1, 1}, cluster_dim = nullopt
+    018: kCopy      	
+    019: kCustomCall	
+    020: kKernel    	, kernel = loop_complex_fusion, profile_annotation = loop_complex_fusion, launch dimensions = blocks: {1, 1, 1}, threads/block: {4, 1, 1}, cluster_dim = nullopt
+    021: kCopy      	
+    022: kKernel    	, kernel = loop_add_fusion, profile_annotation = loop_add_fusion, launch dimensions = blocks: {34425, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+    023: kKernel    	, kernel = loop_add_fusion_1, profile_annotation = loop_add_fusion.1, launch dimensions = blocks: {1, 1, 1}, threads/block: {1, 1, 1}, cluster_dim = nullopt
+
+027: kCustomCall 	
+028: kKernel     	, kernel = loop_gather_fusion, profile_annotation = loop_gather_fusion, launch dimensions = blocks: {6694, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+029: kKernel     	, kernel = wrapped_transpose, profile_annotation = wrapped_transpose, launch dimensions = blocks: {657, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+030: kKernel     	, kernel = loop_broadcast_fusion_2, profile_annotation = loop_broadcast_fusion.2, launch dimensions = blocks: {893, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+031: kCustomCall 	
+032: kKernel     	, kernel = input_transpose_fusion_1, profile_annotation = input_transpose_fusion.1, launch dimensions = blocks: {224, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+033: kKernel     	, kernel = loop_broadcast_fusion_3, profile_annotation = loop_broadcast_fusion.3, launch dimensions = blocks: {88, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
+034: kCustomCall 	
+035: kKernel     	, kernel = wrapped_transpose_1, profile_annotation = wrapped_transpose.1, launch dimensions = blocks: {28, 1, 1}, threads/block: {128, 1, 1}, cluster_dim = nullopt
