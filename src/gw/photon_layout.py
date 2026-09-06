@@ -480,8 +480,10 @@ def _q0_local_outer(left_rows, right_rows):
     return jnp.einsum("ai,aj->ij", left_rows, right_rows)
 
 
-def _validate_q0_factor_pair(left, right, layout, mesh_xy, *, dtype, label):
+def _validate_q0_factor_pair(left, right, layout, mesh_xy, *, dtype, label, stacked=False):
     factor_shape = (MAX_Q0_UPDATE_RANK, layout.packed_extent)
+    if stacked:
+        factor_shape = (int(left.shape[0]),) + factor_shape
     if tuple(left.shape) != factor_shape or tuple(right.shape) != factor_shape:
         raise ValueError(
             f"{label} q=0 factor pair must have two {factor_shape} arrays; "
@@ -492,8 +494,8 @@ def _validate_q0_factor_pair(left, right, layout, mesh_xy, *, dtype, label):
             f"{label} q=0 factors must have dtype {np.dtype(dtype)}; got "
             f"{left.dtype}/{right.dtype}")
     for array, name, spec in (
-        (left, "left_rows_X", P(None, "x")),
-        (right, "right_rows_Y", P(None, "y")),
+        (left, "left_rows_X", P(*((None,) * (left.ndim - 1)), "x")),
+        (right, "right_rows_Y", P(*((None,) * (right.ndim - 1)), "y")),
     ):
         wanted = NamedSharding(mesh_xy, spec)
         sharding = getattr(array, "sharding", None)
@@ -504,17 +506,17 @@ def _validate_q0_factor_pair(left, right, layout, mesh_xy, *, dtype, label):
                 f"{sharding}. Refusing an implicit factor reshard.")
 
 
-def _q0_update_program(layout, mesh_xy, nq, dtype):
+def _q0_update_program(layout, mesh_xy, nq, dtype, factor_ndim=2):
     """One shape-stable local graph per padded q=0 update geometry."""
     key = (id(mesh_xy), tuple(layout.carrier_extents), int(nq),
-           np.dtype(dtype).str)
+           np.dtype(dtype).str, factor_ndim)
     if key in _q0_update_cache:
         return _q0_update_cache[key]
     from common.shard_map import shard_map
 
     packed_spec = P(None, 'x', 'y')
-    left_spec = P(None, 'x')
-    right_spec = P(None, 'y')
+    left_spec = P(*((None,) * (factor_ndim - 1)), 'x')
+    right_spec = P(*((None,) * (factor_ndim - 1)), 'y')
     logical_spec = P(None)
     packed_sharding = NamedSharding(mesh_xy, packed_spec)
     left_sharding = NamedSharding(mesh_xy, left_spec)
@@ -525,22 +527,27 @@ def _q0_update_program(layout, mesh_xy, nq, dtype):
              in_specs=(packed_spec, left_spec, right_spec, logical_spec),
              out_specs=packed_spec, check_vma=False)
     def add_local(packed, left_rows, right_rows, logical_extents):
-        left_pieces = []
-        right_pieces = []
-        for channel in range(N_LORENTZ):
-            local = layout.carrier_extent(channel) // layout.mesh_side
-            left_pieces.append(_q0_local_factor_piece(
-                left_rows, axis_name="x", local_extent=local,
-                local_offset=layout.local_offset(channel),
-                logical_extent=logical_extents[channel]))
-            right_pieces.append(_q0_local_factor_piece(
-                right_rows, axis_name="y", local_extent=local,
-                local_offset=layout.local_offset(channel),
-                logical_extent=logical_extents[channel]))
-        delta_q0 = _q0_local_outer(
-            jnp.concatenate(tuple(left_pieces), axis=1),
-            jnp.concatenate(tuple(right_pieces), axis=1))
-        return packed.at[0, :, :].add(delta_q0)
+        def one(packed, pair):
+            left_rows, right_rows = pair
+            left_pieces = []
+            right_pieces = []
+            for channel in range(N_LORENTZ):
+                local = layout.carrier_extent(channel) // layout.mesh_side
+                left_pieces.append(_q0_local_factor_piece(
+                    left_rows, axis_name="x", local_extent=local,
+                    local_offset=layout.local_offset(channel),
+                    logical_extent=logical_extents[channel]))
+                right_pieces.append(_q0_local_factor_piece(
+                    right_rows, axis_name="y", local_extent=local,
+                    local_offset=layout.local_offset(channel),
+                    logical_extent=logical_extents[channel]))
+            delta_q0 = _q0_local_outer(
+                jnp.concatenate(tuple(left_pieces), axis=1),
+                jnp.concatenate(tuple(right_pieces), axis=1))
+            return packed.at[0, :, :].add(delta_q0), None
+        if factor_ndim == 2:
+            return one(packed, (left_rows, right_rows))[0]
+        return jax.lax.scan(one, packed, (left_rows, right_rows), unroll=1)[0]
 
     @partial(jax.jit,
              in_shardings=(packed_sharding, left_sharding, right_sharding,
@@ -596,7 +603,7 @@ def add_photon_q0_low_rank(
             f"packed photon operator shape {packed.shape} != {packed_shape}")
     _validate_q0_factor_pair(
         left_rows_X, right_rows_Y, layout, mesh_xy, dtype=packed.dtype,
-        label="packed update")
+        label="packed update", stacked=left_rows_X.ndim == 3)
     wanted_packed = NamedSharding(mesh_xy, P(None, "x", "y"))
     if (getattr(packed, "sharding", None) is None
             or not packed.sharding.is_equivalent_to(wanted_packed, 3)):
@@ -606,7 +613,7 @@ def add_photon_q0_low_rank(
             "packed-body reshard.")
 
     updated = _q0_update_program(
-        layout, mesh_xy, packed_shape[0], packed.dtype)(
+        layout, mesh_xy, packed_shape[0], packed.dtype, left_rows_X.ndim)(
             packed, left_rows_X, right_rows_Y,
             jnp.asarray(layout.logical_extents, dtype=jnp.int32))
     # Repeated bounded updates reuse the donated accumulator.  This explicit
