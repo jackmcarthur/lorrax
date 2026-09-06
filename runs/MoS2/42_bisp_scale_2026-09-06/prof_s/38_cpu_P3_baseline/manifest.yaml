@@ -1,0 +1,9 @@
+run_id: 38_cpu_P3_baseline
+system: synthetic
+pipeline: pytest
+platform: perlmutter
+pool: 57988457
+geometry: CPU four emulated devices
+steps:
+  gate:
+    state: pending

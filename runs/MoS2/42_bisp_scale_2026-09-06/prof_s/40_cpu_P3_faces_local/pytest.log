@@ -1,0 +1,10 @@
+[lorrax source closure] {"mode":"source","root":"/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906","runtime":"src/runtime/__init__.py","services":{"distrib-la":"services/distrib_la/src/distrib_la/__init__.py","lxkit":"services/lxkit/src/lxkit/__init__.py","minimax":"services/minimax/src/minimax/__init__.py","symmetry-maps":"services/symmetry_maps/src/symmetry_maps/__init__.py","vcoul":"services/vcoul/src/vcoul/__init__.py","wfn-loader":"services/wfn_loader/src/wfn_loader/__init__.py","zeta-loader":"services/zeta_loader/src/zeta_loader/__init__.py"}}
+gate: CENSUS (explicit path(s)) — full suite, KNOWN_FAILURES.md accounting applies
+.......................                                                  [100%]
+=============================== warnings summary ===============================
+tests/multi_device/bispinor_physics_oracles.py: 13 warnings
+  /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/services/symmetry_maps/src/symmetry_maps/maps.py:2345: RuntimeWarning: SYMMETRY PROVENANCE WARNING: no authenticated QE data-file-schema.xml is available at SymMaps initialization (the WFN-shaped input carries no QE schema receipt). WFN.h5 does not record which operations are composed with time reversal. LORRAX is using the legacy all-spatial header interpretation plus the global DFT-reference TRS verdict. RESULTS WILL BE WRONG if time reversal is broken and QE used an antiunitary magnetic-space-group operation. Co-stage the WFN-generating QE *.save directory or pass WfnLoader(..., qe_schema=...).
+    _warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+23 passed, 13 warnings in 19.61s

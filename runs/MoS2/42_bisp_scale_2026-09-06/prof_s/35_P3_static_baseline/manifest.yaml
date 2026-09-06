@@ -1,0 +1,11 @@
+run_id: 35_P3_static_baseline
+system: MoS2
+pipeline: gwjax
+platform: perlmutter
+variant_of: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/104_P_static_P4_baseline
+reused: copied zeta and rule caches; immutable input links
+pool: 57988457
+geometry: P4 one rank per GPU
+steps:
+  sigma:
+    state: pending
