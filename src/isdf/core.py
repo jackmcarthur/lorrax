@@ -1312,11 +1312,14 @@ def _c_q_face_parent(
 	cache_key = ('c_q_face_parent', mesh_xy, plan, gemm, tuple(kgrid),
 	             tuple(psi_mun_parent.shape), tuple(psi_nmu_parent.shape),
 	             str(psi_mun_parent.dtype), str(psi_nmu_parent.dtype),
-	             int(gamma_L), int(gamma_R))
+	             bool(gamma_L), bool(gamma_R))
 	if cache_key not in _isdf_pipeline_cache:
-		@partial(jax.jit, in_shardings=(in_mun, in_nmu, w_rep, w_rep),
+		left_spec = tuple(None if value is None else w_rep for value in left_gamma)
+		right_spec = tuple(None if value is None else w_rep for value in right_gamma)
+		@partial(jax.jit, in_shardings=(in_mun, in_nmu, w_rep, w_rep,
+		                                 left_spec, right_spec),
 		         out_shardings=out_C)
-		def _fused(psi_mun_, psi_nmu_, w_l, w_r):
+		def _fused(psi_mun_, psi_nmu_, w_l, w_r, vertex_l, vertex_r):
 			def _projector(w):
 				A = merge_spin_centroid(psi_mun_, 1, 2)            # (p, mu*s, nb)
 				A = A * w[None, None, :].astype(A.dtype)
@@ -1344,7 +1347,7 @@ def _c_q_face_parent(
 				P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
 				del P_r_3d
 				C_R = gamma_double_contract(
-					P_l_R_conj, P_r_R, *left_gamma, *right_gamma, spin_axes=(3, 5))
+					P_l_R_conj, P_r_R, *vertex_l, *vertex_r, spin_axes=(3, 5))
 				del P_l_R_conj, P_r_R
 				C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
 				return C_q_3d.reshape(nk, mu_loc, col_loc)
@@ -1355,7 +1358,7 @@ def _c_q_face_parent(
 
 	return _isdf_pipeline_cache[cache_key](psi_mun_parent, psi_nmu_parent,
 	             jnp.asarray(weight_l, dtype=jnp.float64),
-	             jnp.asarray(weight_r, dtype=jnp.float64))
+	             jnp.asarray(weight_r, dtype=jnp.float64), left_gamma, right_gamma)
 
 
 def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
