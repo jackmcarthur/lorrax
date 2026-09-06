@@ -1366,3 +1366,7 @@ causes an out-of-bounds file-energy/Hartree read or inconsistent rotation
 metadata; file-output reductions explicitly use the loader's map. This is
 a restriction of the computational group, not a revised physical TRS
 measurement. See [the binding admission ruling](decisions.md).
+
+| Convention | Measured class | Evidence |
+|---|---|---|
+| Fresh-fit mesh regrouping | Same-source P4/P16 canonical C192, distributed rank truncation at rcond1e-8 and ridge0: C_q first differs by4.3368225e-19, C+ by0.18697155, and ζ by1.70111944e-10 normalized (strict1e-13 FAIL). QP maximum0.001000004µeV; all90 sector rows printed exact. Class: floating-point normal-equation/factor regrouping, with amplification in the factor. Changed-C amplification and eigensolver grouping are not separately isolated; this is not sole-eigensolver attribution. | Sandbox claim1339; JID57988457 lx-Xg4-142358-1108522-5997 / lx-Xg4-142601-1133511-9005; DEV111/sub_12_acceptance_p16/charge_C_q.txt, charge_C_pinv.txt, charge_zeta.txt. |
