@@ -314,9 +314,12 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
         nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
         vertex_operands,
     ):
+        stack_shard = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
         zero = jax.lax.with_sharding_constraint(
-            jnp.zeros((nk, n_rmu_out_left, n_rmu_out_right),
-                      dtype=jnp.complex128), _chi_R_shard)
+            jnp.zeros((n_vertices, nk, n_rmu_out_left, n_rmu_out_right),
+                      dtype=jnp.complex128), stack_shard)
+        tables = (None if vertex_pairs is None else
+                  tuple(jnp.stack(values) for values in zip(*vertex_operands)))
 
         def _body(accumulators, xs):
             t_scalar, alpha_scalar = xs
@@ -325,17 +328,21 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             Gv_k, Gc_k = _build_Gv_Gc(psi_mun, psi_nmu, mask_v, mask_c,
                                       enk_full, tau_kernel, vmax, cmin)
             Gv_R, Gc_R = _Gv_fftn(Gv_k), _Gc_fftn(Gc_k)
-            outputs = []
-            for acc, operands in zip(accumulators, vertex_operands):
+
+            def vertex_step(index, acc):
+                operands = None if tables is None else tuple(table[index] for table in tables)
                 chi_tau = _contract_chi_vertices(
                     Gv_R, Gc_R, operands, identities, complex_contour)
                 chi_tau = jax.lax.with_sharding_constraint(chi_tau, _chi_R_shard)
-                outputs.append(acc + alpha_scalar * chi_tau)
-            return tuple(outputs), None
+                previous = jax.lax.dynamic_index_in_dim(acc, index, axis=0, keepdims=False)
+                value = previous + alpha_scalar * chi_tau
+                return jax.lax.dynamic_update_index_in_dim(acc, value, index, axis=0)
+
+            return jax.lax.fori_loop(0, n_vertices, vertex_step, accumulators, unroll=1), None
 
         final_R, _ = jax.lax.scan(
-            _body, (zero,) * n_vertices, (nodes.t, nodes.alpha), unroll=1)
-        return tuple(_finish_chi(value) for value in final_R)
+            _body, zero, (nodes.t, nodes.alpha), unroll=1)
+        return tuple(_finish_chi(final_R[index]) for index in range(n_vertices))
 
     _base_in = (_nodes_shard, _psi_mun_shard, _psi_nmu_shard,
                 NamedSharding(mesh_xy, _rep2),
