@@ -63,7 +63,6 @@ __all__ = ["deprecated_alias", "RENAMES", "RETIREMENT_GATE"]
 #: the gate that says so out loud.
 RENAMES = {
     "unfold_v_q": "unfold_isdf_operator",
-    "unfold_v_q_bispinor_lorentz": "mix_channels_by_proper_rotation",
     "trs_augment_U": "spinor_rotation_for_sym_row",
     "compute_centroid_sym_perm": "centroid_source_map_and_wrap",
     "compute_rgrid_sym_perm": "fft_grid_pullback_perm",
@@ -74,7 +73,6 @@ RENAMES = {
 #: of the new-name-primary / old-name-alias-at-both-levels policy.
 RENAME_HOME = {
     "unfold_isdf_operator": "symmetry_maps.maps",
-    "mix_channels_by_proper_rotation": "symmetry_maps.maps",
     "spinor_rotation_for_sym_row": "symmetry_maps.maps",
     "centroid_source_map_and_wrap": "symmetry_maps.orbit_syms",
     "fft_grid_pullback_perm": "symmetry_maps.orbit_syms",

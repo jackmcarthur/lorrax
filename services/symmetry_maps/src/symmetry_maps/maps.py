@@ -1856,6 +1856,8 @@ def mix_lorentz_blocks(blocks, *, sym, sym_idx, mesh_xy, keys=None):
     if rows.ndim != 1:
         raise ValueError("mix_lorentz_blocks: sym_idx must be rank one.")
     action = np.asarray(sym.lorentz_action(rows), dtype=np.float64)
+    if action.shape != (rows.size, 4, 4):
+        raise ValueError("mix_lorentz_blocks: typed Lorentz actions must have shape (n_q,4,4).")
     if keys is not None:
         spec = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         return {(a, b): jax.lax.with_sharding_constraint(sum(
@@ -1886,123 +1888,6 @@ def mix_lorentz_blocks(blocks, *, sym, sym_idx, mesh_xy, keys=None):
                         for j, b in enumerate(right)})
     return out
 
-
-def mix_channels_by_proper_rotation(
-    V_tt_per_channel,
-    *,
-    sym,
-    sym_idx,
-    mesh_xy,
-):
-    """Mix the two Pauli-vector indices on bispinor TT tiles.
-
-    Each index requests the canonical axial, time-odd action from ``sym``.
-    The two antiunitary signs cancel while :func:`unfold_isdf_operator` owns
-    the single complex conjugation.  Keeping the action typed here prevents
-    callers from choosing a transpose, determinant sign, or TR convention.
-
-    Parameters
-    ----------
-    V_tt_per_channel : dict[(i, j) -> jax.Array]
-        Dict keyed by ``(i, j)`` with ``i, j ∈ {1, 2, 3}`` (9 entries).
-        Each value is ``(n_q_full, μ, ν)`` complex128 already at full-BZ
-        shape, sharded ``P(None, 'x', 'y')``.  Callers may pass the 6
-        unique tiles + the 3 Hermitian-redundant tiles synthesised via
-        ``conj(swapaxes(V[i,j], -1, -2))``.
-    sym_idx : numpy.ndarray
-        Host ``(n_q_full,)`` integer metadata from ``SymMaps.sym_idx_q``.
-        Device arrays and tracers are refused before the compiled tile path.
-    sym : SymMaps
-        Canonical operation and representation source.
-    mesh_xy : jax.sharding.Mesh
-        Device mesh (used to lock the output sharding).
-
-    Returns
-    -------
-    dict[(i, j) -> jax.Array]
-        Same keys, same shapes, sharded ``P(None, 'x', 'y')``.
-    """
-    if isinstance(sym_idx, (jax.Array, jax.core.Tracer)):
-        raise TypeError(
-            "mix_channels_by_proper_rotation: sym_idx is host metadata; "
-            "pass a NumPy array, not a JAX array or tracer.")
-    sym_raw = np.asarray(sym_idx)
-    if sym_raw.ndim != 1:
-        raise ValueError(
-            "mix_channels_by_proper_rotation: sym_idx must be rank one; "
-            f"got {sym_raw.shape}.")
-    R_per_q = np.asarray(sym.cartesian_action(
-        sym_raw, axial=True, time_odd=True), dtype=np.float64)
-    if R_per_q.shape != (sym_raw.size, 3, 3):
-        raise ValueError(
-            "mix_channels_by_proper_rotation: typed Cartesian actions must "
-            f"have shape {(sym_raw.size, 3, 3)}; got {R_per_q.shape}.")
-
-    # Build the 9×9 source array V_in[α, β] at full-BZ shape, contract,
-    # write back into the same 6 unique slots (plus 3 redundants).
-    keys_in = [(i, j) for i in (1, 2, 3) for j in (1, 2, 3)]
-    for k in keys_in:
-        if k not in V_tt_per_channel:
-            raise ValueError(
-                f"mix_channels_by_proper_rotation: missing TT tile {k}; "
-                f"caller must supply all 9 (i, j) ∈ {{1,2,3}}² "
-                f"(use ``conj(swapaxes(.., -1, -2))`` to synthesise the "
-                f"Hermitian-redundant entries).")
-    sample = V_tt_per_channel[(1, 1)]
-    V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    fn = _get_mix_channels_jit(
-        V_shape=tuple(int(s) for s in sample.shape),
-        R_per_q_arr=R_per_q,
-        mesh_xy=mesh_xy,
-    )
-    # Stack input tiles in (α, β, q, μ, ν) layout; contract via einsum
-    # and unstack into the output dict.
-    V_in = jnp.stack(
-        [jnp.stack([V_tt_per_channel[(a, b)] for b in (1, 2, 3)], axis=0)
-         for a in (1, 2, 3)],
-        axis=0,
-    )                                                       # (3, 3, n_q, μ, ν)
-    V_out = fn(V_in)                                        # (3, 3, n_q, μ, ν)
-    return {
-        (i, j): jax.lax.with_sharding_constraint(V_out[i - 1, j - 1], V_sh)
-        for i in (1, 2, 3) for j in (1, 2, 3)
-    }
-
-
-_MIX_CHANNELS_JIT_CACHE: dict = {}
-
-
-def _get_mix_channels_jit(*, V_shape, R_per_q_arr, mesh_xy):
-    """Cache the inner Lorentz-mix jit by (shape, R-table content).
-
-    Same content-keyed caching strategy as
-    :func:`_get_unfold_isdf_operator_jit`: the R table is baked into the jit
-    closure as a constant so XLA can fold it into the HLO.  The cache key is
-    the bytes-hash of the table plus the V shape plus the mesh identity.
-    """
-    key = (
-        V_shape,
-        R_per_q_arr.shape, R_per_q_arr.tobytes(),
-        id(mesh_xy),
-    )
-    hit = _MIX_CHANNELS_JIT_CACHE.get(key)
-    if hit is not None:
-        return hit
-
-    R_per_q_j = jnp.asarray(R_per_q_arr)                    # (n_q_full, 3, 3)
-    V_sh = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-    in_sh = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
-
-    @partial(jax.jit, in_shardings=in_sh, out_shardings=V_sh)
-    def _do_mix(V_in):
-        # V_in: (3, 3, n_q, μ, ν); R is the forward action [q,out,in].
-        return jnp.einsum(
-            'qia,qjb,abqmn->ijqmn',
-            R_per_q_j, R_per_q_j, V_in,
-        )
-
-    _MIX_CHANNELS_JIT_CACHE[key] = _do_mix
-    return _do_mix
 
 
 # i·σ_y (time-reversal spinor factor in the SOC convention T = iσ_y K).
@@ -4232,9 +4117,6 @@ class KStarMap:
 
 #: DEPRECATED — :func:`unfold_isdf_operator`.
 unfold_v_q = deprecated_alias(unfold_isdf_operator, "unfold_v_q")
-#: DEPRECATED — :func:`mix_channels_by_proper_rotation`.
-unfold_v_q_bispinor_lorentz = deprecated_alias(
-    mix_channels_by_proper_rotation, "unfold_v_q_bispinor_lorentz")
 #: DEPRECATED — :func:`spinor_rotation_for_sym_row`.
 trs_augment_U = deprecated_alias(
     spinor_rotation_for_sym_row, "trs_augment_U")

@@ -227,14 +227,13 @@ from symmetry_maps.maps import (
     open_spin_block_coefficient,
     unfold_spin_centroid_operator,
     unfold_isdf_one_leg,
-    mix_channels_by_proper_rotation, mix_lorentz_blocks,
+    mix_lorentz_blocks,
 )
 # Pre-sweep spellings.  Imported from the modules that define them, so
 # the door and the module bind the SAME object and cannot drift apart.
 from symmetry_maps.maps import (              # noqa: F401  (compat surface)
     trs_augment_U,
     unfold_v_q,
-    unfold_v_q_bispinor_lorentz,
 )
 from symmetry_maps.qirr_store import (
     QIRR_FORMAT_VERSION,
@@ -330,7 +329,7 @@ __all__ = [
     "slice_q_full_to_ibz", "unfold_isdf_operator",
     "unfold_operator_local", "open_spin_block_coefficient",
     "unfold_spin_centroid_operator", "unfold_isdf_one_leg",
-    "mix_channels_by_proper_rotation", "mix_lorentz_blocks",
+    "mix_lorentz_blocks",
     # psi unfold / antiunitary rule
     "unfold_psi", "spinor_rotation_for_sym_row", "apply_spinor_rotation",
     "tau_phase_row", "tau_phase_row_jax", "unfold_reciprocal_carriers",
@@ -384,7 +383,7 @@ __all__ = [
     # that ``from symmetry_maps import *`` drops is a name a consumer
     # discovers is missing at run time rather than at import time, and
     # the whole point of the alias is that nothing discovers anything.
-    "unfold_v_q", "unfold_v_q_bispinor_lorentz", "trs_augment_U",
+    "unfold_v_q", "trs_augment_U",
     "compute_centroid_sym_perm", "compute_rgrid_sym_perm",
     "build_real_space_syms",
     "RENAMES", "RETIREMENT_GATE",

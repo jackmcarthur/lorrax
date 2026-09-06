@@ -8,7 +8,6 @@ from jax.sharding import Mesh
 
 from _deck_stub import read_deck
 from symmetry_maps import (SymMaps, mix_lorentz_blocks,
-                           mix_channels_by_proper_rotation,
                            spinor_rotation_for_sym_row)
 from common.gamma_matrices import gamma_perm_phase
 
@@ -56,10 +55,14 @@ def test_lorentz_mixer_tt_identity_and_rectangular_ct():
     rng = np.random.default_rng(71)
     tt = {(a, b): jnp.asarray(rng.normal(size=(len(rows), 4, 4)))
           for a in (1, 2, 3) for b in (1, 2, 3)}
-    old = mix_channels_by_proper_rotation(tt, sym=sym, sym_idx=rows, mesh_xy=mesh)
+    axial = jnp.asarray(sym.cartesian_action(rows, axial=True, time_odd=True))
+    values = jnp.stack([jnp.stack([tt[a, b] for b in (1, 2, 3)])
+                        for a in (1, 2, 3)])
+    old = jax.jit(lambda v: jnp.einsum(
+        "qia,qjb,abqmn->ijqmn", axial, axial, v))(values)
     new = mix_lorentz_blocks(tt, sym=sym, sym_idx=rows, mesh_xy=mesh)
     for key in tt:
-        np.testing.assert_array_equal(new[key], old[key])
+        np.testing.assert_array_equal(new[key], old[key[0]-1, key[1]-1])
     ct = jnp.asarray(rng.normal(size=(len(rows), 6, 4)))
     mixed = mix_lorentz_blocks({(0, 2): ct}, sym=sym, sym_idx=rows, mesh_xy=mesh)
     action = sym.cartesian_action(rows, axial=False, time_odd=True)
