@@ -1323,19 +1323,7 @@ def _get_unfold_isdf_operator_jit(
 
 
 def _rotate_open_spin_centroid_operator(spatial, spin):
-    """Apply ``U O U†`` without routing the fixed 2c case through GEMM.
-
-    The generic two-sided einsum is mathematically compact, but on CUDA XLA
-    lowers its two length-two contractions to two enormous skinny cuBLAS
-    GEMMs with a complete operator transpose on each side.  For ``ns=2``
-    the contraction is a fixed four-scalar block action.  Writing that block
-    explicitly keeps it in one elementwise fusion and avoids all four
-    full-operator layout moves used by a valence/conduction Green pair.
-
-    Other spin extents retain the generic expression.  This helper owns only
-    the spin representation; centroid permutation, nonsymmorphic phases and
-    the antiunitary endpoint rule remain in :func:`unfold_isdf_operator`.
-    """
+    """Apply ``U O U†`` using the supplied static action's exact small-block structure."""
     U = jnp.asarray(spin)
     ns = int(spatial.shape[1])
     if int(spatial.shape[3]) != ns or tuple(U.shape[1:]) != (ns, ns):
@@ -1345,6 +1333,14 @@ def _rotate_open_spin_centroid_operator(spatial, spin):
     if ns == 1:
         factor = U[:, 0, 0] * jnp.conj(U[:, 0, 0])
         return spatial * factor[:, None, None, None, None]
+    if (ns == 4 and isinstance(spin, np.ndarray)
+            and not np.any(spin[:, :2, 2:]) and not np.any(spin[:, 2:, :2])):
+        left = jnp.stack([sum(U[:, a, c, None, None, None] * spatial[:, c]
+                             for c in range(2*(a//2), 2*(a//2)+2))
+                         for a in range(ns)], axis=1)
+        return jnp.stack([sum(left[:, :, :, d, :] * jnp.conj(U[:, b, d, None, None, None])
+                              for d in range(2*(b//2), 2*(b//2)+2))
+                          for b in range(ns)], axis=3)
     if ns != 2:
         return jnp.einsum(
             'kac,kcmdn,kbd->kambn', U, spatial, jnp.conj(U),

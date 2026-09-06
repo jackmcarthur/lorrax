@@ -438,6 +438,34 @@ def test_two_spin_operator_rotation_is_explicit_and_matches_dense_reference():
     assert 'dot(' not in hlo
 
 
+def test_four_spin_block_rotation_preserves_cross_block_signs():
+    """The supplied lower-block sign survives the full rectangular operator action."""
+    import jax
+    import jax.numpy as jnp
+    from symmetry_maps.maps import _rotate_open_spin_centroid_operator
+
+    rng = np.random.default_rng(2026090601)
+    spatial = (rng.standard_normal((2, 4, 6, 4, 10))
+               + 1j*rng.standard_normal((2, 4, 6, 4, 10)))
+    u = np.array([[0.8, 0.6j], [0.6j, 0.8]], dtype=complex)
+    spin = np.zeros((2, 4, 4), dtype=complex)
+    spin[:, :2, :2], spin[:, 2:, 2:] = u, -u
+    expected = np.einsum('kac,kcmdn,kbd->kambn', spin, spatial, spin.conj())
+    got = _rotate_open_spin_centroid_operator(jnp.asarray(spatial), spin)
+    np.testing.assert_allclose(np.asarray(got), expected, rtol=2e-13, atol=2e-13)
+    wrong = spin.copy()
+    wrong[:, 2:, 2:] = u
+    twin = np.einsum('kac,kcmdn,kbd->kambn', wrong, spatial, wrong.conj())
+    assert np.max(np.abs(expected-twin)) > 1.0
+    hlo = jax.jit(lambda x: _rotate_open_spin_centroid_operator(x, spin)).lower(
+        jnp.asarray(spatial)).compiler_ir(dialect='hlo').as_hlo_text().lower()
+    assert 'dot(' not in hlo
+    spin[:, 0, 2] = 0.25j
+    generic = _rotate_open_spin_centroid_operator(jnp.asarray(spatial), spin)
+    np.testing.assert_allclose(np.asarray(generic), np.einsum(
+        'kac,kcmdn,kbd->kambn', spin, spatial, spin.conj()), rtol=2e-13, atol=2e-13)
+
+
 def test_scalar_operator_rotation_is_explicit_and_matches_dense_reference():
     """Scalar parent-k transport has the same dot-free lowering contract."""
     import jax
