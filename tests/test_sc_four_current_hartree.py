@@ -352,3 +352,15 @@ def test_live_gspace_hartree_cannot_cross_the_host_gather_boundary():
                     if kw.arg == "return_sharded"), None)
     assert keyword is not None
     assert isinstance(keyword.value, ast.Constant) and keyword.value.value is True
+
+
+def test_reduced_current_requires_the_typed_vector_action():
+    """Scalar FFT pullbacks cannot substitute for the polar current action."""
+    with pytest.raises(ValueError, match="requires SymMaps"):
+        rho_from_wfns(
+            jnp.zeros((2, 4, 4, 1), dtype=jnp.complex128),
+            np.ones((2, 4)), np.asarray([0.25, 0.75]),
+            mesh=None, box_index=np.zeros((2, 1, 1, 1), dtype=np.int32),
+            fft_grid=(1, 1, 1), cell_volume=1.0, spin_degeneracy=1.0,
+            sym_perm=np.zeros((1, 1), dtype=np.int32),
+            include_dirac_current=True, charge_nspinor=2)

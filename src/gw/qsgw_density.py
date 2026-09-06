@@ -1,10 +1,8 @@
 """ρ(r) and ρ(G) from rotated orbitals with per-state occupations.
 
-The piece that turns the fixed-density QSGW loop into a density-updating
-one.  ``sc_iteration`` today rotates V_H as a BASIS CHANGE (U†V_H U) and
-leaves ρ at its DFT value; this rebuilds ρ from the rotated orbitals, so
-the Hartree potential of iteration n+1 comes from iteration n's density
-rather than from the DFT one.
+The SC map rebuilds scalar and current Hartree fields from the iteration
+orbitals on raw IBZ rows. File k weights and typed symmetry projection
+complete the density; full-BZ inputs remain available for numerical controls.
 
 STRUCTURE: ONE SCAN, U NEVER REPLICATED
 ---------------------------------------
