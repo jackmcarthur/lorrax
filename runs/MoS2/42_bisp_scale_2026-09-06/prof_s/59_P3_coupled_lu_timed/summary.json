@@ -1,0 +1,12 @@
+{
+  "before_three_warm_solve_ms": 40.97927997645456,
+  "after_coupled_warm_solve_ms": 34.24788700067438,
+  "before_factor_ms": 1151.2019999790937,
+  "after_factor_ms": 689.7815089905635,
+  "before_factor_compiles": 4,
+  "after_factor_compiles": 3,
+  "factor_payload_bytes_per_rank": 3226944,
+  "concat_temporary_bytes_per_rank": 3226944,
+  "gate": "four zeta files rtol=0; default batch_reshard local-JAX LU; provider-auto path not separately exercised",
+  "timing_correction": "57 solve timer included queued Z build;59 synchronizes RHS before timing, input wait781.5ms recorded separately"
+}

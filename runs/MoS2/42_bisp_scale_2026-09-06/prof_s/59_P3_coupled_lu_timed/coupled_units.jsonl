@@ -1,0 +1,9 @@
+{"input_wait_ms": 0.0003699969965964556, "label": "factor_c_q", "vertex": 0, "batch": 7, "ms": 3176.7704700178, "compiles": 4, "compile_s": 1.2373399610223714}
+{"input_wait_ms": 0.011130992788821459, "label": "solve_zeta", "vertex": 0, "batch": 7, "ms": 672.7223320049234, "compiles": 15, "compile_s": 0.5362880009342916}
+{"input_wait_ms": 0.01364698982797563, "label": "solve_zeta", "vertex": 0, "batch": 7, "ms": 14.78766999207437, "compiles": 0, "compile_s": 0.0}
+{"input_wait_ms": 0.013084994861856103, "label": "solve_zeta", "vertex": 0, "batch": 7, "ms": 14.927601005183533, "compiles": 0, "compile_s": 0.0}
+{"input_wait_ms": 0.015129015082493424, "label": "solve_zeta", "vertex": 0, "batch": 7, "ms": 15.107317973161116, "compiles": 0, "compile_s": 0.0}
+{"input_wait_ms": 0.0007510243449360132, "label": "factor_c_q", "vertex": 1, "batch": 21, "ms": 689.7815089905635, "compiles": 3, "compile_s": 0.6344677409797441}
+{"input_wait_ms": 0.2829480217769742, "label": "solve_zeta", "vertex": 1, "batch": 21, "ms": 446.73672001226805, "compiles": 6, "compile_s": 0.3614201839955058}
+{"input_wait_ms": 781.6426130011678, "label": "solve_zeta", "vertex": 1, "batch": 21, "ms": 34.01326297898777, "compiles": 0, "compile_s": 0.0}
+{"input_wait_ms": 781.43188598915, "label": "solve_zeta", "vertex": 1, "batch": 21, "ms": 34.482511022360995, "compiles": 0, "compile_s": 0.0}
