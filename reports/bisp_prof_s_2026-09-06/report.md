@@ -1,7 +1,8 @@
 # BISP-PROF-S — parent-route Sigma profiling
 
-Heavy investigation; **measurements in progress on authorized campaign pool 57966610**. Branch `perf/bisp-prof-s-2026-09-06`, unmerged. Production source remains unchanged at P=`9f569c4bf75bad40e4f5895946874b4c503e4410`; F is read-only `wt_main_de8dcfbc_fixed` at `e1559a071e244b4f049c924781b668d9e1560739`. The first production plan-reuse fix has passed its same-deck P4 gate; subsequent changes and combined verification are in progress.
+Branch `perf/bisp-prof-s-2026-09-06`, unmerged. Five production fixes are pushed through `5093d98d`; the sixth, symmetry-owned block-spin application, is undergoing its fixed-schedule gate. All measurements use authorized campaign pool57966610. Original P is `9f569c4bf75bad40e4f5895946874b4c503e4410`; read-only F is `e1559a071e244b4f049c924781b668d9e1560739`.
 
+The principal regression is compilation and eager planning in static/bare Sigma. The instrumented MoS2 static caller falls from151.373s to13.542s (F11.448s); compilation events fall1135→160 and compiler work120.740→9.988s. These caller scopes exclude surrounding Sigma work. Native baseline P is already faster than F for the selected warm static block and dynamic node. Final complete-deck tables follow once their gates finish.
 ## Objective and preregistered candidates
 
 Reproduce PERF2's host/device separation for the five supplied bispinor comparisons, then change only measured Sigma bottlenecks. Measurements use P4, one rank/GPU, BFC@0.85, cold persistent compile cache, `LORRAX_DEBUG_PRINT=1`, identical copied P-donor `tmp/` within each P/F pair. Original deck `restart=false` is retained; every copied input has a SHA256 receipt. Actual selected quadrature nodes and digests must agree before comparing dynamic execution. A copied cache alone is not proof of an identical schedule.
@@ -41,11 +42,11 @@ Each has `manifest.yaml`, `cohsex.in`, `rankwrap.sh`, `driver.sh`, `run.sh`, cop
 
 ## Valid rank-0 device captures
 
-Static captures are complete; their reduced receipts appear below. Dynamic captures are running with common certified schedules. We use PERF2's `cudaProfilerStart/Stop` inside `runtime.run_main_and_finalize`, with `jax.effects_barrier()` before stop. The prior installed nsys path is `/opt/nvidia/hpc_sdk/Linux_x86_64/26.5/profilers/13.2/Nsight_Systems/bin/nsys`; it is available and produced valid CUDA captures in this allocation. Capture rank0 while all four ranks execute the same science. Export `nvtx_gpu_proj_sum`, `nvtx_kern_sum`, `cuda_gpu_kern_sum`; verify actual CUDA records, then isolate one warm static block and one warm tau node. Native kernel sums and projected spans must remain separate; no nested-range summation.
+Static and dynamic paired captures are complete; their reduced receipts appear below. Dynamic pairs use common certified schedules. We use PERF2's `cudaProfilerStart/Stop` inside `runtime.run_main_and_finalize`, with `jax.effects_barrier()` before stop. The prior installed nsys path is `/opt/nvidia/hpc_sdk/Linux_x86_64/26.5/profilers/13.2/Nsight_Systems/bin/nsys`; it is available and produced valid CUDA captures in this allocation. Capture rank0 while all four ranks execute the same science. Export `nvtx_gpu_proj_sum`, `nvtx_kern_sum`, `cuda_gpu_kern_sum`; verify actual CUDA records, then isolate one warm static block and one warm tau node. Native kernel sums and projected spans must remain separate; no nested-range summation.
 
 ## Saved Sigma device profile
 
-Static P/F native timings and kernel classes are reported below; dynamic reduction is pending. Fused spin/gather costs are bounded by their enclosing native range, not presented as separately measured kernels.
+Static and dynamic P/F native timings and kernel classes are reported below. Fused spin/gather costs are bounded by their enclosing native range, not presented as separately measured kernels.
 
 ### HLO collective census per stage
 
@@ -53,7 +54,7 @@ Static optimized dumps have been analyzed with `tools/hlo/analyze_hlo_dump.py` a
 
 ## Owner's boundary-accounting table
 
-**Source census at the pinned P/F trees, not measured module or kernel counts.** Let B be selected Lorentz outputs, T=3 terms, H=1 when head diagnostics are active (otherwise 0), K=nk_full, Q=n_parent, N=nb, s=ns, M_C/M_T=packed endpoint extents and p_x p_y=P. A source-level call may be optimized away or fused; the requested ms/unit and seconds/run columns remain unmeasured.
+**Preregistered source census at the pinned P/F trees, not measured module or kernel counts.** Let B be selected Lorentz outputs, T=3 terms, H=1 when head diagnostics are active (otherwise 0), K=nk_full, Q=n_parent, N=nb, s=ns, M_C/M_T=packed endpoint extents and p_x p_y=P. A source-level call may be optimized away or fused; the measured costs are reported in the native and host tables below; these source counts remain the pre-change reference.
 
 | boundary | F | P source count | cost/scaling and measurement owed |
 |---|---|---|---|
@@ -75,88 +76,44 @@ Static optimized dumps have been analyzed with `tools/hlo/analyze_hlo_dump.py` a
 
 ### Restore attribution shared with BISP-PROF-ZW
 
-`w_isdf.py:2003` owns implementation, but calls from `photon_sigma.contract_lorentz_blocks` occur during Sigma. Charge **those invocations once to Sigma**, including restore/mix compilation there. Screening's own invocations, if present, remain screening. ZW should read this section; this lane has not edited `w_isdf.py` or any screening file. A prospective restore-lifetime fix needs an ownership agreement before either lane edits the shared function.
+`photon_blocks_full_q` is consumed by Sigma; ZW's report confirms this attribution. Charge its restores and mixing once to Sigma. This lane changes only that helper in `w_isdf.py`, reusing the symmetry service's existing executable cache. Screening and zeta implementations remain ZW-owned. No cross-lane file edits are requested; ZW can integrate findings from this report.
 
 ## Architectural proposals
 
-This ranking is **provisional, by removable invocation count and implementation
-complexity**, not measured speedup. No candidate is accepted for production until
-baseline device and compile receipts exist. Boundary ms and allocator peaks are
-still unknown. The historical MoS2 full-static Sigma wall, 150.14 s at BFC@0.85/P4,
-is only a trivial upper bound on any single Sigma optimization's elapsed saving;
-it cannot be divided among source calls to manufacture per-call timings.
+The ranking below uses measured host savings or explicit device bounds per added complexity. Gates and raw step receipts are in the production and native tables below. Let K=nk, Q=n_parent, N=nb, s=ns and P=p_x p_y. The MoS2 gate has K9,Q3,N80,s4,M_C192,M_T100 (logical T98),P4. All payload figures are complex128 bytes/rank; allocator peaks are identified separately.
 
-All candidates retain canonical P-independent files and typed SymMaps actions.
-All mu-square intermediates must remain distributed on both mesh axes. The
-final-psum-only requirement is a gate to establish, not an invariant certified by
-this source inspection. Acceptance requires eqp0/eqp1 tolerance zero, printed
-sigCC/sigTT/sigCT identity, optimized HLO payload/collective checks and the combined
-P4 leg. Changed summation order is not excused by a loose cross-source tolerance.
+1. **Accept: reuse GEMM plans and existing restore executables.** These remove factory planning54.071s and restore closure compilation51.527s in the original instrumented caller. Reuse existing cache entries by endpoint shape and mesh; stream each restored/mixed output through the existing symmetry owners in unchanged C,D order. Delete eager per-vertex GEMM construction, loop-local restore JITs and zero initializers. Production caller151.373→97.582→39.204s. Additional retained mu-square data:0 bytes; only callable/plan metadata lives longer. One G remains `16 K s² M_left M_right/P` (max21,233,664 bytes); one full-q scalar block remains `16 K M_left M_right/P` (max1,327,104). Direct owner-cache reuse wins over the separate full-output cache ablation. Gates M23/M24: exact90 rows and both EQP files.
 
-| priority / candidate | boundary and numerical work bound | proposed flow, deletion, and disposition |
-|---|---|---|
-| 1. Restore callable lifetime | 300 restore/add JIT creations plus 48 zero initializers for full static | Reuse compiled restore/add work at its existing owner across terms, preserving C,D order and streaming one output. Deletes loop-local callable creation. No extra resident dense output required. Coordinate implementation in w_isdf.py with ZW; pending measurement and ownership agreement. |
-| 2. Share body/head G | 96 G builds become 48 in a full-static run with heads; 192 face unfolds become 96 | Build G once per block/term and feed body and q0 convolutions before releasing it. Deletes separate G construction in q0-only path. Prefer one compiled call returning two small band operators so G lifetime need not escape the kernel. Bounded 50% reduction in G work, not 50% of Sigma wall. Pending measured head cost. |
-| 3. Resident family faces | 192 endpoint unfolds become 12 for two faces per family per term, if vertices are applied after canonical unfolding | Unfold four unvertexed faces once at term entry; apply the canonical gamma vertex at each block consumer. Delete in-block repeated child transport. This requires separating the existing plan method's transport and vertex at their current owners, never reproducing their rules in Sigma. Up to 93.75% fewer face-unfold invocations with heads. Pending memory/trace evidence; families and occupations are not assumed interchangeable. |
-| 4. Shape-class contraction | 16 body identities plus 16 head identities versus at most four ordered C/T shape classes per output mode | Stream a scan over vertex pairs within a shape class and accumulate band outputs, rather than materializing 16 G tensors. Delete vertex-specialized Python kernel loop/cache entries. A scan only helps if restores and canonical vertex application fit the same ownership boundary. Potential 32 to 8 callable identities is not a compile-count measurement. Reject literal all-G stacking; defer scan until costs of priorities 1–3 are isolated. |
-| 5. Two 2x2 spin actions / fused gather | Dense 4x4 has 16 coefficients; two 2x2 blocks have 8 | Consume the two diagonal blocks of the typed action already built by SymMaps; do not recompute parity/det in Sigma. Replace the dense application at the symmetry service owner, shared by consumers. At most halves rotation multiply-add work, with unchanged face bytes; compiler may already eliminate structural zeros. Defer until device capture proves residual dense work and symmetry-owner coordination is established. |
-| 6. Restore each block once per run | Current 300 source restores include repeated source blocks across output mixing and terms | A full completed-output cache needs 16 outputs per interaction instead of one. An alternative term-interleaved consumer restores one output's V and W, consumes X/SX/COH consecutively, then frees both; W−V restoration order must preserve printed digits. Deletes repeated term traversal, but source-wise versus completed-output subtraction changes rounding. Defer; reject unbounded full-run cache absent peak-memory proof. |
-| 7. Fuse seam with reshard/writer | Seam invocation and ms counts unmeasured; existing PackedCentroidBasis conversion is already compiled | Extend the adjacent existing compiled consumer/writer boundary to consume its permutation once; delete the separate conversion invocation. Keep files canonical and the single basis-map owner. No new layout registry. Defer until HLO establishes an actual redundant copy/reshard and attributes it to Sigma. |
-| 8. Change four-spinor face layout | At most removes measured transpose/copy bytes, currently unknown | Retain a single agreed face layout from producer through gamma action and G GEMM; eliminate explicit adapters instead of retaining old/new carriers. May conflict with the projection GEMM's preferred layout. No shape-only argument establishes a speedup. Defer until layout copies are visible in optimized HLO and native ranges. |
-| ZW-owned. Coupled three-current zeta kernel | Three channels could share one unfolded face pair and C_q; at most two of three repeated shared constructions disappear | Scan or batch current vertices inside the existing fitting kernel, preserving tiled mu-square storage and one symmetry owner. Deletes per-channel repeated setup. No Sigma implementation proposed: send the bounded candidate through this report for ZW's measurements and gate. |
+2. **Accept: one executable per endpoint class, with canonical weight placement.** Occupied and COH weights differed in sharding despite identical shape; normalizing the small(K,N) operand avoids COH retracing. Pass canonical gamma permutation/phase arrays as operands so C/C,C/T,T/C,T/T each compile once. The Python loop streams48 combined calls; it does not stack G. The original64 core executables become4. Weight normalization39.204→25.644s; after shared-G, vertex reuse19.531→13.542s. Extra replicated weights at most16KN=11,520 bytes/rank; carrier/G payload unchanged. Delete vertex-specialized cache keys and separate weight layouts. M33/M37 exact gates. **Reject literal sixteen-G batching:** heterogeneous all-G payload139,428,864 bytes/rank versus maximum single21,233,664, scaling `16 K s² (M_C+3M_T)²/P`. No measured dispatch saving justifies that lifetime; shape reuse obtains the compilation benefit without it.
 
-### Memory bounds for proposal selection
+3. **Accept: share G between body and head.** Original warm TT Green ranges cost1.055104 and1.040000ms separately. Feed both convolutions/projections from one G within the same compiled call, returning two small band operators. Delete the separate q0 kernel and duplicate face unfolds. G builds96→48; face unfolds192→96 for16 blocks×3 terms with heads. Production caller25.644→19.531s. One G payload before/after21,233,664 bytes max; two parent band outputs require at most2×16QN²/P=153,600 bytes/rank, subject to actual output sharding. M34 exact gate; native post-change allocator peak is measured separately.
 
-Let K=nk, Q=n_parent, N=nb carrier, s=ns, M_C/M_T=packed family
-extents, and P=p_x p_y. For complex128, both resident faces for both
-families require `32 K N s (M_C+M_T)/P` bytes/rank; the corresponding
-parent carriers require `32 Q N s (M_C+M_T)/P`. Keeping parents for
-projection adds the full child amount to their lifetime, not just the difference.
-The child-face storage is independent of the Lorentz-block count; retaining vertex
-variants would multiply it and is excluded from this proposal.
+4. **Accept subject to final gate: two supplied2×2 spin blocks.** Si's dynamic open-spin transport costs14.938586ms, including9.646109ms dense spin GEMMs and5.147709ms surrounding layout kernels. At the symmetry owner, inspect the supplied static4×4 action for exact off-block zeros, then apply its two blocks; the action already contains the lower-block determinant sign. Generic4×4 actions retain the dense path. Delete dense application only for this structurally proven case; do not reconstruct a symmetry rule. Ablation38.633553→30.433975ms/node (21.2%). **Peak memory rises2,020,215,829→2,487,859,989 bytes/rank**, +467,644,160, approximately half a full Si G, scaling O(Ks²M_C²/P); face payload is unchanged. This is an explicit speed/memory tradeoff, not a memory reduction. CPU42 tests the negative lower-block sign, a red twin and generic off-block fallback; fixed-certificate I13/I20 is the production identity gate. Generic elementwise4×4 ablation is rejected:39.206614ms/node.
 
-The historical MoS2 gate log records K=9, Q=3, N=80 and P=4
-(`73_parent_full_static/driver.rank0.log`, checkpoint step
-`lx-Xg4-203505-2030774-8671`). With s=4 and **illustrative packed**
-M_C=M_T=192, parent faces are 2,949,120 bytes/rank, children add
-8,847,360 bytes/rank, and combined carriers are 11,796,480 bytes/rank.
-192 is the logged logical centroid count; actual packed extents and padded band
-carriers must be read from the new runtime receipt before treating these numbers
-as actual allocation sizes. These are payload estimates, not peak-memory measurements.
+5. **Reject for this implementation: resident family child faces once per term.** The original TT pre-G range containing both unfolds, spin/gamma and G initialization is0.032032ms, versus about1.05ms for the G it feeds. Even multiplying that enclosing range by96 original G calls yields only3.075072ms/run; this is a TT-class extrapolation, not a measured all-class total. After body/head sharing the invocation opportunity halves. Keeping parents requires2,242,560 bytes/rank; children add6,727,680, combined8,970,240, scaling `32(Q+K)Ns(M_C+M_T)/P`. Flow would unfold four unvertexed family faces once per term and apply canonical gamma at each streamed consumer; it deletes repeated transport, but requires additional operand/lifetime changes for little measured device opportunity. No larger-deck benefit is asserted without a new gate.
 
-One G body costs `16 K s² M_left M_right/P` bytes/rank
-(21,233,664 bytes in that illustrative case); 16 simultaneously live bodies cost
-339,738,624 bytes/rank. Body/head reuse should retain one G, while batched
-contraction must stream rather than multiply that footprint. One scalar full-q
-interaction block costs `16 K M_left M_right/P` bytes/rank
-(1,327,104 illustrative bytes). Sixteen completed blocks of equal extent cost
-21,233,664 bytes/rank per interaction, or 42,467,328 for V and W. A two-block
-term-interleaved consumer instead needs 2,654,208 bytes/rank before convolution
-scratch. Distinct family extents replace 16 M² by `(M_C+3 M_T)²`.
-These figures grow quadratically in centroids, so a small-deck fit cannot justify
-an all-block cache for large systems. Spin-action specialization leaves face
-payload unchanged; seam fusion and layout changes have no certified allocator
-savings until alias/copy lifetimes are measured. Coupled zeta memory depends on
-its real-grid tile and belongs in ZW's accounting.
+6. **Reject full-run dense restore caching; retain streaming plus owner cache.** Original300 restores/mixes cost6.607031ms projected GPU in total, versus95.0077s profiled compiler work. Caching all V/W outputs would retain17,428,608 bytes/rank versus one scalar output max1,327,104 (temporary overlap can add another block), scaling `32 K(M_C+3M_T)²/P`. Term-interleaved V/W streaming could bound retained data at2,654,208 bytes, but changes subtraction/accumulation ordering and would need a fresh printed-digit gate. It does not attack the remaining dominant compiler/setup work after owner reuse. Delete no data path now; do not add a second restore cache.
 
-No larger-deck/P16 result exists here. Therefore no remaining slowdown is labelled
-inherent to tiny decks, and none of these work bounds is presented as a measured
-speedup or an integration recommendation.
+7. **Defer seam fusion and alternative face layout.** Measured Sigma bare-input packing is32 calls/4.186365ms projected on Si; MoS2 band unfold18 calls/1.543712ms, outside the block kernel. MoS2 pre-convolution layout is0.013216ms per selected body. A fused consumer/writer would consume the existing basis permutation at its adjacent reshard and delete the standalone conversion; a new face layout must delete both replaced adapters and preserve the GEMM operand contract. Payload before/after remains `32QNs(M_C+M_T)/P` for parent faces and O(KN²) for band seams; no allocator saving is proven. The observed per-unit millisecond opportunity does not justify a new carrier contract in this lane. Canonical files stay P-independent. Unattributed seam calls remain unattributed, not charged to Sigma.
+
+8. **ZW-owned coupled three-current zeta tail: defer to ZW's measurements.** Flow would share one unfolded face pair and C_q across three canonical gamma channels inside the existing tile kernel; remove two repeated common constructions, at most2/3 of that common work. This lane has no isolated zeta device-ms or tile-peak measurement, so a numerical speedup or byte claim would be fabricated. Face payload would remain O(KNsM_T/P); three concurrent outputs add a factor3 to the tiled output, whereas streaming avoids it. ZW must supply tile dimensions, current-channel identity and peak/HLO gate before adoption; this lane does not edit its fitting kernel.
+
+Every implemented change retains mu-square distribution on all P ranks, canonical P-agnostic files and one owner per symmetry rule. **The pre-existing MoS2 dynamic kernel still has two collective-permute starts**, detailed below; the literal final-psum-only requirement remains unmet. Static parent core/restores have no explicit HLO collectives, but distributed GEMM FFI broadcasts remain native communication. No additional collective is permitted by these changes. No remaining slowdown is called inherent to a small deck: the larger Si dynamic case is measured, but no P16 result exists under the one-node authorization.
 
 ## Ablations
 
-Completed run-local arithmetic-preserving experiments appear in the unprofiled accounting table below. Production source is still pinned while the dynamic captures run. Failed experiment M13 initialized JAX before the communicator; it is retained as a failed variant, registered in KNOWN_SANDBOX_ERRORS.md, and corrected in M19.
+Completed run-local arithmetic-preserving experiments appear in the unprofiled accounting table below. These experiments preceded production changes; their run-local patches and pinned source checks remain on disk. Failed experiment M13 initialized JAX before the communicator; it is retained as a failed variant, registered in KNOWN_SANDBOX_ERRORS.md, and corrected in M19.
 
 ## Verification and current disposition
 
-All ten pinned baseline arms and both static captures completed. Static captures and successful ablations pass tolerance-zero eqp0/eqp1 and all 90 complete printed state rows in sigma_diag.dat, including CC/TT/CT. Dynamic capture and production implementation gates are pending; no production fix is recommended for adoption yet.
+All ten pinned baseline arms and both static captures completed. Static captures and successful ablations pass tolerance-zero eqp0/eqp1 and all 90 complete printed state rows in sigma_diag.dat, including CC/TT/CT. Dynamic captures are complete. Five production fixes have passed their incremental gates and are pushed; final combined verification and block-spin gating are in progress.
 
 Pool 57966610 is explicitly authorized by the user and shared with this campaign. Every arm uses one node sequentially. The earlier failed allocation is historical infrastructure evidence, not a current blocker. All writes, including local run/issue/claim registers, stay within this worktree; shared sandbox ledgers are read-only under the lane's explicit scope.
 
 ## Authorized measurements — 2026-09-06
 
 User authorized BISP-orch pool57966610. Arms run sequentially, one P4 node each,
-BFC@0.85, source arithmetic pinned as above. No production edits yet.
+BFC@0.85, source arithmetic pinned as above. This section records the before-change measurements.
 
 | unprofiled full-static MoS2 | P05 | F06 |
 |---|---:|---:|
@@ -328,7 +285,7 @@ Both pins are unchanged. All four captures completed on JID57966610, sequential 
 
 Si P spends0.970592ms in its parent Green GEMM,16.913465ms in the full-k convolution,4.507422/0.843488ms in its two parent-band projection GEMMs,0.231776ms selecting parent rows and0.002688ms unfolding bands. F spends10.016735ms in full-k Green,16.892479ms in convolution and49.944957/8.946687ms in projection. Both convolve on full K; P saves parent GEMM and projection work. Native NCCL broadcasts/node are96 versus768, summing4.845150 versus56.587261ms.
 
-P's extra open-spin transport range is14.938586ms. Its two dense spin GEMMs sum9.646109ms and three surrounding operator layout kernels sum5.147709ms. This is distinct from the static face spin action's32us enclosing bound: dynamic transport acts on O(K s² M_C²/P) elements. A generic elementwise application of the **same supplied spin matrix** is now under ablation at the existing symmetry owner; it requires no determinant or block-diagonal rule in Sigma.
+P's extra open-spin transport range is14.938586ms. Its two dense spin GEMMs sum9.646109ms and three surrounding operator layout kernels sum5.147709ms. This is distinct from the static face spin action's32us enclosing bound: dynamic transport acts on O(K s² M_C²/P) elements. The generic and structurally block-diagonal ablations are reported below; both consume the same supplied spin matrix at the existing symmetry owner.
 
 MoS2 P's corresponding transport range is0.360832ms, including0.225312ms of dense spin GEMMs. Parent Green is0.359424ms, convolution0.108160ms, projection0.624992/0.276832ms and parent-row gather0.016160ms. Two antiunitary transposes are explicit collectives: operator payload7,077,888 bytes/rank at0.031808ms and band payload32,400 bytes/rank at0.006944ms. The literal final-psum-only invariant is **not satisfied by this pre-existing dynamic route**. It is registered, not hidden or bypassed. The optimizations must not introduce another collective.
 
@@ -371,3 +328,9 @@ Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/34_P_shared_g_candida
 **Production Lorentz vertices share one executable per endpoint class.** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0. Static caller 13.542s; 160 compilation events, 9.988s compiler work.
 
 Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/37_P_shape_class_candidate; [lx] step lx-Xg4-030620-1999625-3851 exit 0 in 71 s.
+
+**Production supplied block-spin action passes fixed-certificate identity; Si warm tau ablation38.634→30.434ms with peak+467644160 bytes/rank** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 256 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0.
+
+Evidence: runs/Si/100_bisp_parent_route_2026-09-05/prof_s/20_P_gn_final_profile; [lx] step lx-Xg4-033145-2312576-9256 exit 0 in 154 s.
+
+CPU42 verification: [lx] step lx-Xg0-031951-2245813-3760 exit 0 in 16 s. Three symmetry rotation tests and eleven bispinor route configuration tests pass; only the existing JAX shard_map deprecation warning appears. Artifacts: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/42_cpu_gates/spin_pytest.log and config_pytest.log. This is a focused CPU emulated-mesh gate, not the combined P4 physics gate.
