@@ -1,0 +1,22 @@
+&input_pw2bgw
+   prefix = 'mini_h2_screw'
+   real_or_complex = 2
+   wfng_flag = .true.
+   wfng_file = 'WFN'
+   rhog_flag = .false.
+   vxc_flag = .false.
+   vxc_file = 'vxc.dat'
+   vxc_diag_nmin = 1
+   vxc_diag_nmax = 9
+   kih_flag = .false.
+   kih_file = 'kih.dat'
+   vscg_flag = .false.
+   vkbg_flag = .false.
+   wfng_kgrid = .true.
+   wfng_nk1 = 5
+   wfng_nk2 = 5
+   wfng_nk3 = 1
+   wfng_dk1 = 0.0
+   wfng_dk2 = 0.0
+   wfng_dk3 = 0.0
+/

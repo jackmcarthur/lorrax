@@ -1,0 +1,18 @@
+{
+  "source_job": "57950660 / lx-Xg0-172014-989339-7994",
+  "files": {
+    "H.upf": "8272fc45fbee2b45a490830c61ef9b2f2b894591b2c9a310fe4af152b76502a6",
+    "WFN.h5": "fc3c6e8403c44d271d75aaa4d61abcc7cc2e39611b6175645c664945fe792b12",
+    "data-file-schema.xml": "ee8d56171dafd704501d26cb3b2185f83933fdc317590ae26ef06a8a203f1a3f",
+    "nscf.in": "5c3058543b2da477c0665bbeebe2c1d1326338e7f783a36c970a33e4d99905cb",
+    "pw2bgw.in": "a8463fd7f4634e787224c93ca6fb518addd3f573fc4c373fcddc85d2b9aa5334",
+    "scf.in": "f4d8d9bd595a7fd6afde393e24276e3d97093505b71989d868982ec38ea783d2",
+    "scf_receipt.json": "25916c98958d1939f836c26845f519c0b783688f0ac0ad766922d711d3bf9a0a",
+    "scf-schema.xml": "07a52e37f5e3d87cc02696a979ede58c234adac427f5903ef2b5eff98f13c80b",
+    "reference_eqp0.dat": "c5f1fbc0d67a3442dd303afdb141d9ca4017400739b1199b425e5cfc092942ba",
+    "reference_eqp1.dat": "c5f1fbc0d67a3442dd303afdb141d9ca4017400739b1199b425e5cfc092942ba",
+    "reference_sigma_diag.dat": "c7598063cad45c3604d62a3897b3949e544f0cae92ec13cf3b168910a4d56d93"
+  },
+  "reference_job": "57950660.87 / lx-Xg4-173629-1085966-8628",
+  "reference_source_commit": "de8dcfbc"
+}

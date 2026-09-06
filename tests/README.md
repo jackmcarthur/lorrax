@@ -1,5 +1,8 @@
 # LORRAX test suite
 
+For the explicit four-process integration mini suite and its measured budget,
+see [tests/mini/README.md](mini/README.md).
+
 ## Core, core-extended, and full
 
 The default suite is the two-minute core tier. It combines the cached tiny
