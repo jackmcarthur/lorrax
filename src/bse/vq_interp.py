@@ -560,7 +560,7 @@ def load_zeta_coarse(restart_file: str, zeta_file: str, *,
     # ── q LABELS FOR A FULL-BZ ζ WRITTEN FROM A SYMMETRY-REDUCED WFN ──────
     # ``mf_header`` is copied verbatim from the WFN, so ``kpoints/rk`` holds
     # the WFN's k-list — the IBZ when the mean-field run used symmetry.  The ζ
-    # writer, under ``LORRAX_FORCE_FULL_BZ=1``, writes the FULL BZ:
+    # historical full-BZ ζ writer stored:
     # ``_bgw_wrap_q(sym.kvecs_asints) / kgrid`` (gw/isdf_fitting.py, the
     # ``q_irr_frac is None`` branch).  On the MoS2 4x4 deck that is 16 ζ tiles
     # against a 10-row ``rk``, and ``qraw[:nq]`` silently returned 10 rows —

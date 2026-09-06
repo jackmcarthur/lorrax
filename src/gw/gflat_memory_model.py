@@ -1319,8 +1319,8 @@ def plan_gflat_chunks(
     # the full-BZ ``Z_q (nq, μ, cr) P(None,'x','y')`` it just built to
     # ``solve_phase`` as a live input: the solve's Z_col reshard targets a
     # DIFFERENT sharding, so donation cannot alias and Z_q coexists with
-    # the solve's two RHS stacks.  Whether full q storage is forced
-    # (LORRAX_FORCE_FULL_BZ) or the 81-q mesh is naturally unreduced,
+    # the solve's two RHS stacks.  In the historical forced-full measurement
+    # or when the 81-q mesh is naturally unreduced,
     # Z_q is built at the full BZ (z_q_from_psi_sm's contract) — the two
     # measured escapes this seam-charge closes are JID 57269074 step
     # lx-Xg4-005932 (forced 8x8) and JID 57281385 step .28 (natural 9x9).

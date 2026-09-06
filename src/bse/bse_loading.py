@@ -724,7 +724,7 @@ class _MunuSlabPlan:
                         "non-identity operation (a rotation, a non-zero "
                         "lattice wrap, or time reversal), so V_q0 is not one "
                         "hyperslab here.  Read the full q axis, which "
-                        "unfolds, or re-run with restart_q_storage=full.")
+                        "unfolds.")
                 row = g
             offset[self.lead] = row
             shape.append(1)
