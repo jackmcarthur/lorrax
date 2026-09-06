@@ -1166,14 +1166,11 @@ def c_q_from_psi_sm(
 	if k_unfold_plan is not None:
 		# Raw-parent contraction: psi_mun/psi_nmu are the plan's PACKED
 		# parent faces and ``gemm`` is planned at nq = n_parent.
-		if gamma_L is not None or gamma_R is not None:
-			raise ValueError(
-				"c_q_from_psi_sm(k_unfold_plan=...): the parent-k route "
-				"owns the charge vertex only.")
 		return _c_q_face_parent(
 			psi_mun, psi_nmu, weight_l, weight_r,
 			k_unfold_plan=k_unfold_plan, kgrid=kgrid, mesh_xy=mesh_xy,
-			gemm=gemm)
+			gemm=gemm, gamma_L=0 if gamma_L is None else int(gamma_L),
+			gamma_R=0 if gamma_R is None else int(gamma_R))
 	return _c_q_face(psi_mun, psi_nmu, weight_l, weight_r,
 	                 gamma_L, gamma_R,
 	                 kgrid=kgrid, mesh_xy=mesh_xy, gemm=gemm)
@@ -1500,6 +1497,8 @@ def _c_q_face_parent(
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
 	gemm,
+	gamma_L: int = 0,
+	gamma_R: int = 0,
 ) -> jax.Array:
 	"""Face-layout C_q contracted on raw WFN parents only.
 
@@ -1522,8 +1521,7 @@ def _c_q_face_parent(
 	written here.  Both centroid endpoints are in the run's orbit-packed
 	order, like every other operator.
 
-	Charge channel only: a current vertex needs the Cartesian action the plan
-	does not own (``gw.gw_init._resolve_parent_green_admission``).
+	Fixed Lorentz vertices act on the unfolded projector's output spin axes.
 
 	    psi_mun_parent : (n_parent, s, mu_pk, nb)  P(None,None,'x','y'), packed
 	    psi_nmu_parent : (n_parent, nb, s, mu_pk)  P(None,'x',None,'y'), packed
@@ -1548,6 +1546,8 @@ def _c_q_face_parent(
 		raise ValueError(
 			"_c_q_face_parent: psi_nmu_parent shape "
 			f"{tuple(psi_nmu_parent.shape)} != {(n_parent, nb, s_, mu_pk)}.")
+	left_gamma = (None, None) if gamma_L == 0 else _gamma_perm_phase_mu(gamma_L)
+	right_gamma = (None, None) if gamma_R == 0 else _gamma_perm_phase_mu(gamma_R)
 	px = int(mesh_xy.shape['x'])
 	py = int(mesh_xy.shape['y'])
 	mu_loc = mu_pk // px
@@ -1588,7 +1588,8 @@ def _c_q_face_parent(
 			del P_l_3d, P_l_R
 			P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
 			del P_r_3d
-			C_R = gamma_double_contract(P_l_R_conj, P_r_R, spin_axes=(3, 5))
+			C_R = gamma_double_contract(
+				P_l_R_conj, P_r_R, *left_gamma, *right_gamma, spin_axes=(3, 5))
 			del P_l_R_conj, P_r_R
 			C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
 			return C_q_3d.reshape(nk, mu_loc, col_loc)
@@ -1759,18 +1760,15 @@ def z_q_from_psi_sm(
 				"z_q_from_psi_sm(k_unfold_plan=...) requires tile_r_index=, "
 				"tile_local_perm= and tile_wraps= (gw.centroid_k_unfold."
 				"RealGridOrbitTiles.source_tables).")
-		if gamma_L is not None or gamma_R is not None:
-			raise ValueError(
-				"z_q_from_psi_sm(k_unfold_plan=...): the parent-k route "
-				"owns the charge vertex only; current vertices need the "
-				"Cartesian action (gw.gw_init._resolve_parent_green_admission).")
 		return _z_q_face_parent(
 			psi_mun, psi_G_store, psi_r_cache, weight_l, weight_r,
 			k_unfold_plan=k_unfold_plan,
 			tile_r_index=tile_r_index, tile_local_perm=tile_local_perm,
 			tile_wraps=tile_wraps,
 			band_chunk_ranges=band_chunk_ranges,
-			kgrid=kgrid, mesh_xy=mesh_xy)
+			kgrid=kgrid, mesh_xy=mesh_xy,
+			gamma_L=0 if gamma_L is None else int(gamma_L),
+			gamma_R=0 if gamma_R is None else int(gamma_R))
 	return _z_q_face(
 		psi_mun, psi_G_store, psi_r_cache, weight_l, weight_r,
 		gamma_L, gamma_R,
@@ -2992,6 +2990,9 @@ def _z_q_face_parent(
 	weight_r: jax.Array,
 	*,
 	k_unfold_plan,
+	gamma_L: int = 0,
+	gamma_R: int = 0,
+	coupled_mu123: bool = False,
 	tile_r_index: jax.Array,
 	tile_local_perm: jax.Array,
 	tile_wraps: jax.Array,
@@ -3055,7 +3056,7 @@ def _z_q_face_parent(
 	    tile_wraps     : (2·n_sym, R_t, 3) lattice wraps of the r sources
 	Returns ``Z_q`` (nk_full, mu_pk, R_t) P(None,'x','y'): centroids in the
 	run's packed order, r in the tile's slot order, pad slots exactly zero.
-	Charge channel only (see :func:`_c_q_face_parent`).
+	Fixed vertices select output spin indices only after typed unfolding.
 	"""
 	from common.wfn_transforms import to_rpoints_inner
 	from ffi import _services
@@ -3144,17 +3145,27 @@ def _z_q_face_parent(
 	left_L_np = np.asarray(plan.L_table, dtype=np.float64)
 	spin_np = np.asarray(plan.spin_action_full, dtype=np.complex128)
 	n_sym_spatial = int(plan.n_sym_spatial)
+	# Skip exact structural zeros in the service-provided spin action.
+	spin_support = np.any(spin_np != 0, axis=0)
+	source_pairs = [np.flatnonzero(
+		(spin_support[a, :, None] & spin_support[b, None, :]).reshape(-1))
+		for a in range(ns) for b in range(ns)]
+	max_sources = max(len(pairs) for pairs in source_pairs)
+	source_counts = np.asarray([len(pairs) for pairs in source_pairs])
+	source_pairs = np.asarray([np.pad(pairs, (0, max_sources - len(pairs)),
+		constant_values=int(pairs[0])) for pairs in source_pairs], dtype=np.int32)
 
 	mun_spec = P(None, None, 'x', 'y')
 	pair_spec = P(None, None, 'x', None, 'y')
-	out_spec = P(None, 'x', 'y')
+	out_spec = (P(None, None, 'x', 'y') if coupled_mu123
+	            else P(None, 'x', 'y'))
 	w_spec = P(None)
 	cache_spec = P(None, None, ('x', 'y'), None, None)
 
 	cache_key = (
 		'z_q_face_parent', id(mesh_xy), id(psi_G_store), id(plan),
 		n_parent, ns, mu_pk, nb_face, R_t, nkx, nky, nkz, bcr,
-		use_psi_r_cache,
+		use_psi_r_cache, gamma_L, gamma_R, bool(coupled_mu123),
 		(None if psi_r_cache is None
 		 else tuple(int(s) for s in psi_r_cache.shape)),
 	)
@@ -3241,47 +3252,71 @@ def _z_q_face_parent(
 		                   P(None, None, None)),
 		         out_specs=out_spec, check_vma=False)
 		def _tile_tail(D_l_, D_r_, local_perm_r_, wraps_r_):
-			def unfold_block(D_, coef):
+			def unfold_block(D_, coef, sources, source_count):
 				"""One full-k output spin block of P = conj(U D U†)."""
-				acc = None
-				for c in range(ns):
-					for d in range(ns):
-						S = unfold_operator_local(
-							D_[:, c, :, d, :],
-							irr_idx=irr_idx_np, sym_idx=sym_idx_np,
-							q_irr_frac=k_parent_np,
-							left_local_perm=left_local_perm_np,
-							left_L_table=left_L_np,
-							right_local_perm=local_perm_r_,
-							right_L_table=wraps_r_,
-							n_sym_spatial=n_sym_spatial)
-						term = coef[:, c, d][:, None, None] * S
-						acc = term if acc is None else acc + term
-				return jnp.conj(acc)             # (nk, mu_loc, r_loc)
+				def source_spin(acc, slot):
+					pair = sources[slot]
+					c, d = pair // ns, pair % ns
+					block = unfold_operator_local(
+						D_[:, c, :, d, :],
+						irr_idx=irr_idx_np, sym_idx=sym_idx_np,
+						q_irr_frac=k_parent_np,
+						left_local_perm=left_local_perm_np,
+						left_L_table=left_L_np,
+						right_local_perm=local_perm_r_,
+						right_L_table=wraps_r_, n_sym_spatial=n_sym_spatial)
+					return acc + jnp.where(slot < source_count,
+						coef[:, c, d][:, None, None] * block, 0), None
 
-			# A scan keeps one output spin block live, rather than unrolling
-			# four full-k IFFT pairs into the same executable/live set.
+				acc, _ = jax.lax.scan(source_spin,
+					jnp.zeros((nk, mu_loc, r_loc), dtype=D_.dtype),
+					jnp.arange(max_sources), unroll=1)
+				return jnp.conj(acc)
+
 			coefficients = jnp.stack([
 				open_spin_block_coefficient(spin_np, a, b)
 				for a in range(ns) for b in range(ns)])
 
-			def spin_body(Z_R, coef):
-				P_l_R = local_ifftn3(
-					unfold_block(D_l_, coef).reshape(
-						nkx, nky, nkz, mu_loc, r_loc),
-					axes=(0, 1, 2), norm='forward')
-				P_r_R = local_ifftn3(
-					unfold_block(D_r_, coef).reshape(
-						nkx, nky, nkz, mu_loc, r_loc),
-					axes=(0, 1, 2), norm='forward')
-				return Z_R + jnp.conj(P_l_R) * P_r_R, None
+			def channel_tail(perm_L, phase_L, perm_R, phase_R):
+				"""Apply fixed vertices to child output indices of the unfolded P_r."""
+				output_pairs = (perm_L[:, None] * ns + perm_R[None, :]).reshape(-1)
+				output_phases = (phase_L[:, None] * phase_R[None, :]).reshape(-1)
+				coefficients_r = coefficients[output_pairs]
+				sources = jnp.asarray(source_pairs)
+				counts = jnp.asarray(source_counts)
 
-			Z_R, _ = jax.lax.scan(
-				spin_body, jnp.zeros(
-					(nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128),
-				coefficients, unroll=1)
-			Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
-			return Z_q_3d.reshape(nk, mu_loc, r_loc)
+				def spin_body(Z_R, pair):
+					coef_l, coef_r, src_l, src_r, count_l, count_r, phase = pair
+					P_l_R = local_ifftn3(
+						unfold_block(D_l_, coef_l, src_l, count_l).reshape(
+							nkx, nky, nkz, mu_loc, r_loc),
+						axes=(0, 1, 2), norm='forward')
+					P_r_R = local_ifftn3(
+						unfold_block(D_r_, coef_r, src_r, count_r).reshape(
+							nkx, nky, nkz, mu_loc, r_loc),
+						axes=(0, 1, 2), norm='forward')
+					return Z_R + jnp.conj(P_l_R) * (phase * P_r_R), None
+
+				Z_R, _ = jax.lax.scan(
+					spin_body, jnp.zeros(
+						(nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128),
+					(coefficients, coefficients_r, sources, sources[output_pairs],
+					 counts, counts[output_pairs], output_phases), unroll=1)
+				Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
+				return Z_q_3d.reshape(nk, mu_loc, r_loc)
+
+			if coupled_mu123:
+				vertices = [_gamma_perm_phase_mu(mu) for mu in (1, 2, 3)]
+				perms = jnp.stack([vertex[0] for vertex in vertices])
+				phases = jnp.stack([vertex[1] for vertex in vertices])
+				_, channels = jax.lax.scan(
+					lambda carry, vertex: (carry, channel_tail(*vertex)), 0,
+					(perms, phases, perms, phases), unroll=1)
+				return channels
+			identity = (jnp.arange(ns), jnp.ones(ns))
+			left = identity if gamma_L == 0 else _gamma_perm_phase_mu(gamma_L)
+			right = identity if gamma_R == 0 else _gamma_perm_phase_mu(gamma_R)
+			return channel_tail(*left, *right)
 
 		@jax.jit
 		def fn(psi_mun_, w_l_, w_r_, r_index_, local_perm_r_, wraps_r_,
@@ -3319,6 +3354,10 @@ def _z_q_face_coupled_mu123(
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
 	cache_y_r_tile: int = 0,
+	k_unfold_plan=None,
+	tile_r_index=None,
+	tile_local_perm=None,
+	tile_wraps=None,
 ) -> jax.Array:
 	"""Private prototype returning ``Z_q[mu123,q,mu_X,r_Y]``.
 
@@ -3331,6 +3370,13 @@ def _z_q_face_coupled_mu123(
 	if int(psi_mun.shape[1]) != 4:
 		raise ValueError(
 			"_z_q_face_coupled_mu123 requires a four-spinor face carrier")
+	if k_unfold_plan is not None:
+		return _z_q_face_parent(
+			psi_mun, psi_G_store, psi_r_cache, weight_l, weight_r,
+			k_unfold_plan=k_unfold_plan, coupled_mu123=True,
+			tile_r_index=tile_r_index, tile_local_perm=tile_local_perm,
+			tile_wraps=tile_wraps, band_chunk_ranges=band_chunk_ranges,
+			kgrid=kgrid, mesh_xy=mesh_xy)
 	_gamma_mu123 = tuple(_gamma_perm_phase_mu(mu) for mu in (1, 2, 3))
 	perm_mu123 = jnp.stack(tuple(gamma[0] for gamma in _gamma_mu123))
 	phase_mu123 = jnp.stack(tuple(gamma[1] for gamma in _gamma_mu123))
@@ -7337,6 +7383,7 @@ def _make_fit_one_rchunk_kernel(
                 layout="face", psi_mun=psi_mun,
                 weight_l=weight_l, weight_r=weight_r,
                 k_unfold_plan=k_unfold_plan,
+                gamma_L=vertex_mu_L, gamma_R=vertex_mu_L,
                 tile_r_index=tile_r_index,
                 tile_local_perm=tile_local_perm,
                 tile_wraps=tile_wraps,

@@ -37,6 +37,10 @@ _TOL = 1.0e-10
 _CASES = (
     ("ns1_scalar", dict(ns=1, seed=11)),
     ("ns2_spinor", dict(ns=2, seed=12)),
+    ("ns4_charge", dict(ns=4, seed=13)),
+    ("ns4_current1", dict(ns=4, seed=13, vertex=1)),
+    ("ns4_current2", dict(ns=4, seed=13, vertex=2)),
+    ("ns4_current3", dict(ns=4, seed=13, vertex=3)),
 )
 _CASES_BY_NAME = dict(_CASES)
 
@@ -61,6 +65,9 @@ def _worker(case_name: str) -> int:
 
     case = _CASES_BY_NAME[case_name]
     ns = int(case["ns"])
+    vertex = int(case.get("vertex", 0))
+    from common.gamma_matrices import gamma_perm_phase
+    gamma = None if vertex == 0 else gamma_perm_phase(vertex)
     rng = np.random.default_rng(int(case["seed"]))
 
     devs = jax.devices()
@@ -87,7 +94,7 @@ def _worker(case_name: str) -> int:
     sym = np.asarray([0, 0, 1, n_tran + 0], dtype=np.int32)
     parent_k = kfrac[[0, 1, 3]]
     n_parent = 3
-    if ns == 2:
+    if ns in (2, 4):
         theta = 0.7
         U1 = np.asarray([[np.cos(theta), -1j * np.sin(theta)],
                          [-1j * np.sin(theta), np.cos(theta)]])
@@ -97,7 +104,7 @@ def _worker(case_name: str) -> int:
 
     def spinor_action(rows, *, nspinor):
         return spinor_rotation_for_sym_row(
-            U_spatial, np.asarray(rows), n_tran, nspinor=nspinor)
+            U_spatial, np.asarray(rows), n_tran, nspinor=nspinor, R_cart=ops)
 
     sym_fx = SimpleNamespace(
         sym_matrices=ops, translations=tnp,
@@ -228,7 +235,7 @@ def _worker(case_name: str) -> int:
         r_start_dyn=0, r_chunk_size=n_rtot,
         kgrid=kgrid, mesh_xy=mesh, layout="face",
         psi_mun=psi_mun_full, weight_l=w_l, weight_r=w_r,
-        cache_face_y_blocks=True)))               # (nk, mu_pk, 64)
+        cache_face_y_blocks=True, gamma_L=gamma, gamma_R=gamma)))               # (nk, mu_pk, 64)
     # both routes run in the packed order; compare in canonical rows
     Z_face = plan.layout.axis.unpack_host(Z_face, axis=1)   # (nk, 8, 64)
 
@@ -249,10 +256,21 @@ def _worker(case_name: str) -> int:
                 r_start_dyn=0, r_chunk_size=tiles.width,
                 kgrid=kgrid, mesh_xy=mesh, layout="face",
                 psi_mun=psi_mun_pk, weight_l=w_l, weight_r=w_r,
-                k_unfold_plan=plan,
+                k_unfold_plan=plan, gamma_L=vertex, gamma_R=vertex,
                 tile_r_index=jnp.asarray(r_index, dtype=jnp.int32),
                 tile_local_perm=jnp.asarray(local_perm),
                 tile_wraps=jnp.asarray(wraps))
+            if vertex and cache is not None:
+                from isdf.core import _z_q_face_coupled_mu123
+                coupled = _z_q_face_coupled_mu123(
+                    psi_mun_pk, parent_store, cache, w_l, w_r,
+                    band_chunk_ranges=band_chunk_ranges,
+                    r_start_dyn=0, r_chunk_size=tiles.width,
+                    kgrid=kgrid, mesh_xy=mesh, k_unfold_plan=plan,
+                    tile_r_index=jnp.asarray(r_index),
+                    tile_local_perm=jnp.asarray(local_perm), tile_wraps=jnp.asarray(wraps))
+                np.testing.assert_allclose(np.asarray(coupled[vertex - 1]),
+                                           np.asarray(Z_pk), rtol=1e-13, atol=1e-11)
             Z_can = plan.layout.axis.unpack_host(
                 np.asarray(jax.block_until_ready(Z_pk)), axis=1)  # (nk, 8, width)
             assert Z_can.shape == (nk, 8, tiles.width), Z_can.shape
@@ -268,19 +286,35 @@ def _worker(case_name: str) -> int:
     C_face = np.asarray(jax.block_until_ready(c_q_from_psi_sm(
         kgrid=kgrid, mesh_xy=mesh, layout="face",
         psi_mun=psi_mun_full, psi_nmu=psi_nmu_full,
-        weight_l=w_l, weight_r=w_r, gemm=_local_gemm)))
+        weight_l=w_l, weight_r=w_r, gemm=_local_gemm,
+        gamma_L=gamma, gamma_R=gamma)))
     C_parent = np.asarray(jax.block_until_ready(c_q_from_psi_sm(
         kgrid=kgrid, mesh_xy=mesh, layout="face",
         psi_mun=psi_mun_pk, psi_nmu=psi_nmu_pk,
         weight_l=w_l, weight_r=w_r, gemm=_local_gemm,
-        k_unfold_plan=plan)))
+        k_unfold_plan=plan, gamma_L=vertex, gamma_R=vertex)))
     c_rel = float(np.max(np.abs(C_parent - C_face))) / float(np.max(np.abs(C_face)))
+
+    current_c_rel = None
+    if ns == 4:
+        from common.gamma_matrices import gamma_perm_phase
+        C_current = np.asarray(jax.block_until_ready(c_q_from_psi_sm(
+            kgrid=kgrid, mesh_xy=mesh, layout="face",
+            psi_mun=psi_mun_full, psi_nmu=psi_nmu_full,
+            gamma_L=gamma_perm_phase(1), gamma_R=gamma_perm_phase(1),
+            weight_l=w_l, weight_r=w_r, gemm=_local_gemm)))
+        C_no_vertex = np.asarray(jax.block_until_ready(c_q_from_psi_sm(
+            kgrid=kgrid, mesh_xy=mesh, layout="face",
+            psi_mun=psi_mun_pk, psi_nmu=psi_nmu_pk,
+            weight_l=w_l, weight_r=w_r, gemm=_local_gemm, k_unfold_plan=plan)))
+        current_c_rel = float(np.max(np.abs(C_no_vertex - C_current))) / float(np.max(np.abs(C_current)))
 
     # The children are NOT trivially the parents: a route that forgot the
     # symmetry action entirely must be visibly wrong on this fixture.
     naive = float(np.max(np.abs(psi_full[[0, 1, 2, 3]] - psi_parent[irr])))
     print(json.dumps({
         "max_rel": max_rel, "max_pad": max_pad, "c_rel": c_rel,
+        "current_c_without_vertex_relative_difference": current_c_rel,
         "n_tiles": int(tiles.n_tiles), "width": int(tiles.width),
         "naive_child_parent_gap": naive / float(np.max(np.abs(psi_full))),
     }))

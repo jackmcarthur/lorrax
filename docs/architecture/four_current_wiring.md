@@ -293,6 +293,13 @@ by Coulomb gauge (`ZERO_TILES`, `v_q_bispinor.py:67-70`); three `(j,i)` with
 (`UNIQUE_TILES`, `:60-65`). Format stamp `bispinor_lorentz_v2` (`:80`),
 artifact path `gw_init.py:2786`.
 
+The raw-parent ζ route uses a separate orbit-packed current basis and its
+four-spinor `ParentGreenCarrier`. `_fit_transverse_channel` passes that
+carrier's plan and both faces into `fit_zeta_to_h5`. C_q and Z_q contract
+raw-parent bands, unfold the open-spin projector through the symmetry
+service, then apply the fixed output-spin vertices. Coupled mu123 shares
+the parent projector build; each saved ζ file remains canonical and q-IBZ.
+
 **The coupled ζ schedule.** The Y-side face transform and the full-spin X
 broadcast are channel-independent, so μ_L = 1,2,3 share one
 built-once-per-r-chunk `[3, q, μ, r]` `Z_q` stack instead of repeating it

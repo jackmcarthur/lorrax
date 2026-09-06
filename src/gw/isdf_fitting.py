@@ -388,18 +388,14 @@ def fit_zeta_to_h5(
     # full k by the plan's typed, collective-free unfold
     # (``isdf.core._c_q_face_parent`` / ``_z_q_face_parent``).  The two
     # packed parent faces replace the full-k faces as the fit's ψ input; the
-    # full-k faces are not read here at all.  Charge channel, face layout,
-    # no pseudobands: the plan owns exactly that representation.
+    # full-k faces are not read here. Fixed current vertices act on the
+    # unfolded projector, with no change to the raw-parent representation.
     parent_route = k_unfold_plan is not None
     if parent_route:
         if not low_mem_bands:
             raise ValueError(
                 "fit_zeta_to_h5: k_unfold_plan requires low_mem_bands=True "
                 "(the parent faces are face-layout carriers).")
-        if int(vertex_mu_L) != 0:
-            raise ValueError(
-                "fit_zeta_to_h5: k_unfold_plan owns the charge vertex only; "
-                f"got vertex_mu_L={int(vertex_mu_L)}.")
         if psi_nmu_parent is None or psi_mun_parent is None:
             raise ValueError(
                 "fit_zeta_to_h5: k_unfold_plan requires psi_nmu_parent= and "
@@ -799,7 +795,8 @@ def fit_zeta_to_h5(
                     kgrid=kgrid, mesh_xy=mesh_xy, layout='face',
                     psi_mun=psi_mun_parent, psi_nmu=psi_nmu_parent,
                     weight_l=weight_l_face, weight_r=weight_r_face,
-                    gemm=_face_gemm, k_unfold_plan=k_unfold_plan)
+                    gemm=_face_gemm, k_unfold_plan=k_unfold_plan,
+                    gamma_L=int(vertex_mu_L), gamma_R=int(vertex_mu_L))
             else:
                 C_q = c_q_from_psi_sm(
                     kgrid=kgrid, mesh_xy=mesh_xy, layout='face',
@@ -1685,13 +1682,17 @@ def fit_zeta_to_h5(
                             "coupled mu123 Zq requires a valid bounded "
                             "face-Y cache tile")
                     return _z_q_face_coupled_mu123(
-                        psi_mun_fresh, psi_G_store, psi_r_cache,
-                        weight_l_face, weight_r_face,
+                        psi_mun_parent if parent_route else psi_mun_fresh,
+                        psi_G_store, psi_r_cache, weight_l_face, weight_r_face,
                         band_chunk_ranges=band_chunk_ranges,
                         r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
                         r_chunk_size=actual_n_rchunk,
                         kgrid=kgrid, mesh_xy=mesh_xy,
-                        cache_y_r_tile=_cache_tile)
+                        cache_y_r_tile=_cache_tile,
+                        k_unfold_plan=k_unfold_plan,
+                        tile_r_index=_tile_args.get("tile_r_index"),
+                        tile_local_perm=_tile_args.get("tile_local_perm"),
+                        tile_wraps=_tile_args.get("tile_wraps"))
 
                 if _coupled_stacked_solve:
                     def _build_coupled_zeta():

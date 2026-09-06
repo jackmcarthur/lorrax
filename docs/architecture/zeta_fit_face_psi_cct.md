@@ -372,11 +372,22 @@ side on `n_parent` rows, `plan.unfold_operator`, conj, the `_c_q_face`
 tail.
 
 Admission (`gw.gw_init.prepare_isdf_and_wavefunctions`): `low_mem_bands`,
-`bispinor = false`, one- or two-component spinors, `wfn.nkpts < nk_tot`,
-an orbit-closed centroid set, and a fresh charge fit.  No deck key; a run announces
-`C_q on raw parents` / `Z_q on raw parents` with the tile census.  The
-charge vertex only: a current vertex needs the Cartesian action the plan
-does not own.  Parity gates: `tests/test_isdf_zq_parent_parity.py`
+one-, two-, or four-component spinors, `wfn.nkpts < nk_tot`, and an
+orbit-closed centroid set. Charge and current families have independent
+`PackedCentroidBasis` instances and parent carriers. No deck key is added;
+a run announces `C_q on raw parents` / `Z_q on raw parents` with the tile census.
+
+For a current channel, fixed Lorentz vertices act on the output spin indices
+of the unfolded projector, before the spin reduction. This is algebraically
+vertices after wavefunction unfolding while retaining the parent band sum.
+Both C_q and Z_q need these vertices: ns=4 alone is not the current Gram
+(the explicit four-spinor fixture differs by 0.427 without them). The C tail
+uses `gamma_double_contract`; the Z tail selects the corresponding output
+spin blocks and phases. No vertex acts on stored parent faces. Coupled
+mu123 reuses the parent projectors and scans its three output channels;
+source-spin scans skip only exact zeros in the service-provided spin action.
+
+Parity gates: `tests/test_isdf_zq_parent_parity.py`
 (children generated from parents by the typed action, glide + k
 reduction + TR row + SU(2) mixing; parent Z_q on every tile and parent C_q
 equal the full-k face kernels at <1e-10) and

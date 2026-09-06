@@ -2444,6 +2444,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		# read the two fields back out here.
 		psi_mun_fresh_T = transverse_wfn_data['psi_mun_fresh']
 		psi_nmu_fresh_T = transverse_wfn_data['psi_nmu_fresh']
+		parent_T = transverse_wfn_data['green_parent']
 		if cfg.memory.low_mem_bands:
 			print_fn("  [bispinor] ψ_T face conversion (low_mem_bands): "
 			         "psi_nmu_T/psi_mun_T built from the transverse "
@@ -2498,6 +2499,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					low_mem_bands=bool(cfg.memory.low_mem_bands),
 					psi_mun_fresh=psi_mun_fresh_T,
 					psi_nmu_fresh=psi_nmu_fresh_T,
+					k_unfold_plan=(None if parent_T is None else parent_T.plan),
+					psi_nmu_parent=(None if parent_T is None else parent_T.psi_nmu),
+					psi_mun_parent=(None if parent_T is None else parent_T.psi_mun),
 					band_chunk_size=_chunks_T['band_chunk'],
 					q_chunk_size=_chunks_T['q_chunk'],
 					bispinor=True,
