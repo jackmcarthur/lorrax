@@ -1,6 +1,6 @@
 # BISP-PROF-S — parent-route Sigma profiling
 
-Heavy investigation; **measurements in progress on authorized campaign pool 57966610**. Branch `perf/bisp-prof-s-2026-09-06`, unmerged. Production source remains unchanged at P=`9f569c4bf75bad40e4f5895946874b4c503e4410`; F is read-only `wt_main_de8dcfbc_fixed` at `e1559a071e244b4f049c924781b668d9e1560739`. No performance fix or adoption recommendation has passed a gate.
+Heavy investigation; **measurements in progress on authorized campaign pool 57966610**. Branch `perf/bisp-prof-s-2026-09-06`, unmerged. Production source remains unchanged at P=`9f569c4bf75bad40e4f5895946874b4c503e4410`; F is read-only `wt_main_de8dcfbc_fixed` at `e1559a071e244b4f049c924781b668d9e1560739`. The first production plan-reuse fix has passed its same-deck P4 gate; subsequent changes and combined verification are in progress.
 
 ## Objective and preregistered candidates
 
@@ -349,3 +349,9 @@ M22 combines plan reuse and family restore compilation: static caller42.946s,276
 M22 input_signatures.jsonl identifies the otherwise identical TT COH call's differing leaf: occupied weights use NamedSharding(P()), while COH weights use SingleDeviceSharding. Shape-only broadcasting cannot unify those signatures. M31 applies an explicit replicated constraint to this small(nk,nb) operand, avoiding a second specialization. It does not replicate any mu-square object.
 
 Si I17's generic elementwise4c rotation preserves eqp0/eqp1 and all256 state rows against the common-certificate I13 control, but its warm native unit is39.206614ms versus38.633553ms. It is rejected as a speedup. A following block-structure ablation validates exact zero off-diagonal2x2 blocks in the supplied typed spin action before omitting zero products; it does not reconstruct determinant or rotation signs.
+
+## Production changes and gates
+
+**Production Sigma GEMM plan reuse passes.** On branch perf/bisp-prof-s-2026-09-06, unmerged. Same-source eqp0/eqp1 and90 complete Sigma rows are identical; static caller97.582s, compiler77.376s and547 events. Existing cache shares plans by mesh, k extent and endpoint shapes; no resident face or operator is added.
+
+Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/23_P_plan_reuse_candidate; [lx] step lx-Xg4-024713-1877307-4058 exit 0 in 156 s.
