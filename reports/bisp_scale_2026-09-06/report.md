@@ -120,4 +120,8 @@
 | Rule plan s |627.45|592.86|both rebuilt incompatible historical cache; host/planning variation|
 | Total s |707.74|671.46|+5.4%, primarily planner; no warm whole-driver claim|
 | Compile count / s |503 /35.65|509 /34.84|six fewer modules; compiler seconds+2.3%|
-| Step / evidence |57988457/lx-Xg4-143444-1183016-5007 exit0|zero GPU overlaps|runs/Si/100_bisp_scale_scalar_2026-09-06/{identity.json,summary.json}; no repeated baseline needed|
+| Step / evidence |57988457/lx-Xg4-143444-1183016-5007 exit0|CONTAMINATED startup: steps.93/.95 overlap74/89s|runs/Si/100_bisp_scale_scalar_2026-09-06/{identity.json,summary.json}; no repeated baseline needed|
+
+| Audit correction | Effect | Evidence |
+|---|---|---|
+| Claim1360 clean-interval assertion withdrawn | Own-ζ EQP identity remains exact; own-ζ timing comparisons above are diagnostic, excluded from non-regression verdict. Copied-ζ pair remains clean. | D/gpu_overlap_audit.json:57988457.94 overlaps.93/.95 on nid001112; claim correction below |
