@@ -1,0 +1,84 @@
+{
+  "module_1920.jit__tau": {
+    "memory": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/55_P3_single_green/xla_dump_rank0/module_1920.jit__tau.sm_8.0_gpu_after_optimizations-memory-usage-report.txt",
+      "total_bytes": 1781847793,
+      "allocations": [
+        {
+          "size": 1653562408,
+          "rest": "preallocated-temp:"
+        },
+        {
+          "size": 51841597,
+          "rest": "parameter 6, shape |c128[1,36,300,300]| at ShapeIndex {}:"
+        },
+        {
+          "size": 51841597,
+          "rest": "parameter 7, shape |c128[1,36,300,300]| at ShapeIndex {}:"
+        },
+        {
+          "size": 5379194,
+          "rest": "parameter 1, shape |c128[7,40,4,300]| at ShapeIndex {}:"
+        },
+        {
+          "size": 5379194,
+          "rest": "parameter 0, shape |c128[7,4,300,40]| at ShapeIndex {}:"
+        },
+        {
+          "size": 4026531,
+          "rest": "parameter 2, shape |c128[7,30,4,300]| at ShapeIndex {}:"
+        },
+        {
+          "size": 4026531,
+          "rest": "parameter 3, shape |c128[7,4,300,30]| at ShapeIndex {}:"
+        },
+        {
+          "size": 345600,
+          "rest": "constant:"
+        },
+        {
+          "size": 86425,
+          "rest": "constant:"
+        },
+        {
+          "size": 25190,
+          "rest": "output shape is |c128[1,7,15,15]|, maybe-live-out:"
+        },
+        {
+          "size": 9216,
+          "rest": "constant:"
+        }
+      ]
+    },
+    "hlo": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/55_P3_single_green/xla_dump_rank0/module_1920.jit__tau.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": [],
+      "custom_calls": {
+        "__cublas$gemm": 1,
+        "lorrax_cublasmp_batched_gemm": 3,
+        "lorrax_mklfft_gw_conv": 1
+      },
+      "remats": [],
+      "layout_ops": {
+        "bitcast": {
+          "count": 47,
+          "max_bytes": 829440000,
+          "max_source": ""
+        },
+        "transpose": {
+          "count": 7,
+          "max_bytes": 829440000,
+          "max_source": ""
+        }
+      }
+    },
+    "buffer": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/55_P3_single_green/xla_dump_rank0/module_1920.jit__tau.sm_8.0_gpu_after_optimizations-buffer-assignment.txt",
+      "remats": []
+    },
+    "sig": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/55_P3_single_green/xla_dump_rank0/module_1920.jit__tau.before_optimizations.txt",
+      "entry_sig": "psi_coh_xn.1: c128[7,4,600,80], psi_coh_yr.1: c128[7,80,4,600], psi_proj_xr.1: c128[7,30,4,600], psi_proj_yn.1: c128[7,4,600,30], E_A.1: f64[7,80], mask_A.1: pred[7,80], B_poles.1: c128[1,36,600,600], Omega_poles.1: c128[1,36,600,600], pole_indices.1: s32[1], bounds.1: f64[1,6], phase_real.1: pred[1], E_ref_A.1: f64[], E_ref_B.1: f64[], t_node.1: c128[]"
+    }
+  }
+}
