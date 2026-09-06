@@ -15,6 +15,8 @@ routes.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import hashlib
 import json
 import os
@@ -40,6 +42,7 @@ from minimax import (
     box_samples,
     build_uniform_rule,
     rule_roundoff_amplification,
+    rule_sup_error,
 )
 
 
@@ -289,11 +292,16 @@ def _rule_cache_lookup(
                         or float(data["sup_error"]) > eps):
                     continue
                 cached_box = tuple(float(value) for value in data["box"])
-                if not (cached_box[0] <= box[0]
-                        and cached_box[1] >= box[1]
-                        and cached_box[2] <= box[2]
-                        and cached_box[3] >= box[3]):
-                    continue
+                contains = _box_contains(cached_box, box)
+                if not contains:
+                    # P1/P4 pole fits can differ at ~1e-11 Ry. This bound
+                    # only selects candidates for a NEW audit; it is never
+                    # a tolerance on certificate acceptance.
+                    slack = 1e-10 * max(1.0, *map(abs, cached_box), *map(abs, box))
+                    if not _box_contains(
+                            (cached_box[0] - slack, cached_box[1] + slack,
+                             cached_box[2] - slack, cached_box[3] + slack), box):
+                        continue
                 rule = UniformRule(
                     times=np.asarray(data["times"]),
                     weights=np.asarray(data["weights"]),
@@ -302,8 +310,24 @@ def _rule_cache_lookup(
                     rank=int(data["rank"]),
                     sup_error=float(data["sup_error"]),
                     kappa_max=float(data["kappa_max"]), seconds=0.0)
+                receipt_name = name
+                if not contains:
+                    union = (min(cached_box[0], box[0]), max(cached_box[1], box[1]),
+                             min(cached_box[2], box[2]), max(cached_box[3], box[3]))
+                    cloud = box_samples(*union, per_unit=8.0, n_im=48)
+                    rho = np.abs(cloud) if relative else union[2]
+                    sup, kappa = rule_sup_error(rule.times, rule.weights, cloud, rho)
+                    noise = rule_roundoff_amplification(
+                        rule.times, rule.weights, cloud, rho)
+                    if (not np.all(np.isfinite([sup, kappa, noise]))
+                            or sup > eps or noise > noise_amplification_cap):
+                        continue
+                    rule = replace(rule, box=union,
+                                   sup_error=max(rule.sup_error, sup),
+                                   kappa_max=max(rule.kappa_max, kappa))
+                    receipt_name += ":boundary-audit"
                 if best is None or rule.node_count < best[0].node_count:
-                    best = (rule, name)
+                    best = (rule, receipt_name)
         except (EOFError, OSError, KeyError, ValueError) as exc:
             warnings.append(
                 "WARNING sigma quadrature cache entry is unreadable and "

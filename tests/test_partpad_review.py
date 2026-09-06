@@ -323,3 +323,32 @@ def test_two_sided_reservation_does_not_import_the_unused_frequency_half(
         fixed_rule_session={'external_support_ev': np.array([-.8, .9]) * RYD_TO_EV})
     np.testing.assert_allclose(seen['negative'], [-.8, 0.])
     np.testing.assert_allclose(seen['positive'], [0., .9])
+
+
+def test_near_boundary_cache_hit_reaudits_the_same_nodes(tmp_path):
+    from gw.sigma_box_plan import _rule_cache_lookup, _rule_cache_store
+    from minimax import build_uniform_rule, box_samples, rule_roundoff_amplification
+    box = (1., 2., .1, .2)
+    rule = build_uniform_rule(box, 1e-3, time_budget=1.)
+    cloud = box_samples(*box, per_unit=8., n_im=48)
+    noise = rule_roundoff_amplification(rule.times, rule.weights, cloud, np.abs(cloud))
+    assert _rule_cache_store(str(tmp_path), rule, noise) is None
+    request = (1., 2., .1, .2 + 5e-12)
+    hit, warnings = _rule_cache_lookup(str(tmp_path), request, 1e-3, True,
+                                      noise_amplification_cap=100.)
+    assert not warnings and hit is not None
+    audited, name = hit
+    assert name.endswith(':boundary-audit')
+    np.testing.assert_array_equal(audited.times, rule.times)
+    np.testing.assert_array_equal(audited.weights, rule.weights)
+    assert audited.box[3] >= request[3]
+    assert audited.sup_error <= 1e-3
+    # A stored success stamp is not enough when the expanded box is audited.
+    path = next(tmp_path.glob('*.npz'))
+    with np.load(path) as data:
+        payload = {key: data[key] for key in data.files}
+    payload['weights'] = np.zeros_like(payload['weights'])
+    np.savez(path, **payload)
+    hit, _ = _rule_cache_lookup(str(tmp_path), request, 1e-3, True,
+                               noise_amplification_cap=100.)
+    assert hit is None
