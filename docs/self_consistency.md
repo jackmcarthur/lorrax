@@ -298,7 +298,10 @@ Changed product-window membership, state support or pole drift can still
 require a rebuild. Each frequency branch reserves both growth increments
 on its own interval within its physical frequency half; samples crossing
 zero are assigned to the other branch by the branch factory.
-Contained initial certificates of the same causal type share their nodes.
+Contained initial certificates of the same causal type share their nodes. A
+near-boundary cache request is accepted only after re-auditing the unchanged
+nodes on the union box at the same sup-error and runtime-noise limits; the
+small boundary threshold selects audits, never relaxes a certificate.
 Interior holes still require an explicit patch. Quadrature
 nodes remain frozen while their certified boxes cover the map.
 
