@@ -200,6 +200,7 @@ def test_a_gapped_deck_never_reaches_the_thresholded_line_at_all():
         # branches run over.  Omitting ``full`` makes this cell fail loudly if
         # ``_branches`` ever reads the loaded extent again.
         sigma_sum = slice(0, 4)
+        nb_sigma_sum = nb_full_logical = 4
 
     class _Wfns:
         enk = jnp.asarray([[-0.6, -0.2, 0.3, 0.9]])
@@ -459,6 +460,7 @@ def test_the_mpa_branch_supports_honour_the_threshold_end_to_end():
         # ``sigma_sum``, not ``full`` -- see the note on the gapped-deck stub
         # above and tests/test_mpa_sigma.py.
         sigma_sum = slice(0, 5)
+        nb_sigma_sum = nb_full_logical = 5
 
     wfns = SimpleNamespace(
         enk=jnp.asarray([[-0.6, -0.2, 0.0, 0.2, 0.9]]),
@@ -619,7 +621,7 @@ def test_the_gn_ppm_sigma_driver_has_no_occupancy_to_threshold():
     from gw.wavefunction_bundle import _build_occ
 
     state_src = inspect.getsource(ppm_sigma._prepare_sigma_state)
-    assert "occ_mask = occ_full > 0.5" in state_src
+    assert "occ_mask = (occ_full > 0.5) & live" in state_src
     assert "TODO(metal-greens)" in state_src, (
         "the step-occupation gap lost its marker")
     assert "(enk_host <= float(efermi))" in inspect.getsource(_build_occ)

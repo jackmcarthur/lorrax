@@ -687,10 +687,10 @@ def _sc_padded_box_spec(spec, eta):
         support_frequencies, spec["states"], spec["pole_stats"],
         spec["pole_sign"], eta)
     if spec["kind"] == "sign_definite_negative" and support_box[1] < 0.0:
-        box[1] = min(box[1], 0.5 * spec["box"][1])
+        box[1] = min(box[1], 0.5 * support_box[1])
         box[1] = max(box[1], support_box[1])
     if spec["kind"] == "sign_definite_positive" and support_box[0] > 0.0:
-        box[0] = max(box[0], 0.5 * spec["box"][0])
+        box[0] = max(box[0], 0.5 * support_box[0])
         box[0] = min(box[0], support_box[0])
     padded = dict(spec)
     padded["box"] = tuple(float(value) for value in box)
@@ -733,9 +733,9 @@ def _fit_fixed_sc_rules(
 ):
     """Fit one padded SC rule set, then reuse those exact nodes.
 
-    Later boxes are checked against their iteration-1 certificates; a
-    window that escapes, or a name that did not exist at iteration 1, gets
-    its rule rebuilt on the same padded policy and the rebuild is counted
+    Later boxes are checked against the existing certificates. A new or
+    escaped window first uses any covering rule with safe executor factors;
+    otherwise its rule is rebuilt under the same padded policy and counted
     in the receipt.  Windows that stay inside their certificate reuse the
     exact iteration-1 nodes.
     """
@@ -758,6 +758,7 @@ def _fit_fixed_sc_rules(
                 "fit": frozen,
                 "padded_box": tuple(padded_spec["box"]),
                 "initial_box": tuple(spec["box"]),
+                "conjugate": bool(spec["conjugate"]),
             }
         session["rules"] = rules
         session["initial_window_tau_pairs"] = int(sum(
@@ -779,20 +780,38 @@ def _fit_fixed_sc_rules(
     # contribution from this map; if it reappears, the same containment and
     # node-identity checks below apply.
     #
-    # A genuinely new window name, or a box that escaped its padded
-    # certificate, gets its rule REBUILT on the same padded policy as
-    # iteration 1 and is counted in the receipt.  Measured 2026-09-03 on
-    # production decks (Si 80 bands / 836 centroids, MoS2 ncond=20): the
-    # first QP map moves states by 1-3 eV, so a 2 eV certificate taken at
-    # the DFT map can be escaped once, and the window set itself changes
-    # with the partition.  Refusing there made QSGW unreachable; rebuilding
-    # one window's nodes costs one fit and is exactly what the un-frozen
-    # loop did every map.  ponytail: rebuilds are unbounded; cap them if a
-    # loop is ever seen rebuilding every map.
+    # Reuse any existing certificate that contains the product box and
+    # passes the factor-growth check, even when its product name differs.
+    # Only uncovered support needs a fresh fit on the same padded policy.
     rebuild = []
     reasons = {}
     for spec in rows:
         entry = rules.get(spec["name"])
+        if entry is None or not _box_contains(entry["fit"]["rule_box"], spec["box"]):
+            # A product-window name is not a quadrature currency. Pole drift
+            # can split a window without leaving an already certified box.
+            # Reuse the cheapest covering rule before spending a new fit;
+            # executor factor growth is checked for this window's references.
+            candidates = sorted(rules.items(), key=lambda item: (
+                item[1]["fit"]["node_count"], item[0]))
+            for name, candidate in candidates:
+                if candidate["conjugate"] != bool(spec["conjugate"]):
+                    continue
+                if not _box_contains(candidate["fit"]["rule_box"], spec["box"]):
+                    continue
+                try:
+                    fit = _fixed_fit_for_spec(candidate, spec)
+                except RuntimeError:
+                    continue  # this certificate's factors exceed the cap
+                entry = {
+                    "fit": fit,
+                    "padded_box": tuple(fit["rule_box"]),
+                    "initial_box": tuple(spec["box"]),
+                    "conjugate": bool(spec["conjugate"]),
+                    "reused_from_window": name,
+                }
+                rules[spec["name"]] = entry
+                break
         if entry is None:
             rebuild.append(spec)
             reasons[spec["name"]] = "absent from iteration 1"
@@ -815,6 +834,7 @@ def _fit_fixed_sc_rules(
                 "fit": rebuilt,
                 "padded_box": tuple(padded_spec["box"]),
                 "initial_box": tuple(spec["box"]),
+                "conjugate": bool(spec["conjugate"]),
                 "rebuilt_at_iteration": iteration,
                 "rebuild_reason": reasons[spec["name"]],
             }

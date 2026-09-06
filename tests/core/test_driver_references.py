@@ -138,6 +138,9 @@ def test_b_retained_escape_grows_grid_in_the_same_map(core_fixtures):
             "sigma_omega_patches_ev = -12:0, 1:12",
             "sigma_omega_patches_ev = -12:0, 0.1:9.4")
         text = text.replace("sigma_omega_step_ev = 1", "sigma_omega_step_ev = 0.1")
+        # The classification change forbids convergence on the growth map;
+        # leave a third map to verify the stable partition before final I/O.
+        text = text.replace("sc_max_iter = 2", "sc_max_iter = 3")
         deck.write_text(text)
         return target
 
@@ -147,8 +150,12 @@ def test_b_retained_escape_grows_grid_in_the_same_map(core_fixtures):
     report = (run / "mpa_sc1.out").read_text()
     first, second = report.split("SC iteration: call=0000 role=linear", 1)
     assert "SC sampled-support growth" not in first
-    growth = second.index("SC sampled-support growth: band=2, k=0")
+    growth = second.index("SC partition:")
     assert growth < second.index("Started Sigma tau sweep")
+    growth_receipt = next(line for line in second.splitlines()
+                          if "SC fixed quadrature:" in line)
+    assert "rebuilds_this_iteration=0" in growth_receipt
+    assert "SC sampled-support growth:" not in report
     assert "protected=1-2 in_range=1" in second
     from file_io.sigma_output import read_eqp_assembly_receipt
     receipt = read_eqp_assembly_receipt(str(run / "mpa_sc1_sigma.h5"))

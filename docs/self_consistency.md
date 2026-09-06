@@ -210,8 +210,8 @@ is richer. Bi (bispinor) and Na are the pending cases.
 **12. Quadrature rules are frozen across maps** (2026-09-03). The first map
 plans and certifies one rule per product window on the window's box padded by
 `sc` state padding; later maps reuse the rule (`cache=hit:sc-fixed`) and, when
-a state leaves its padded box or a window appears that iteration 1 did not
-have, rebuild that rule on the escaped box with the same padding
+no existing certificate with the same causal conjugation covers a window,
+rebuild that rule on the escaped box with the same padding
 (`rebuild:sc-fixed`, counted in the geometry receipt and printed per map;
 main 0cfaf059). One-shot results are bit-identical with and without the
 freeze. The eqp1 file is written from the converged map.

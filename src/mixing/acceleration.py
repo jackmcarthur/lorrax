@@ -949,7 +949,7 @@ def rcrop_nojit(
         if metric is None:
             return v
         weights = jnp.asarray(metric)
-        if weights.shape == shape[:-1]:
+        if len(shape) >= 2 and shape[-2] == shape[-1] and weights.shape == shape[:-1]:
             weights = weights[..., :, None] * weights[..., None, :]
         return v * weights
 
