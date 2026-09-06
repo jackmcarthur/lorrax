@@ -1,0 +1,454 @@
+[
+  {
+    "system": "Si",
+    "mode": "cohsex",
+    "arm": "P",
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/66_parent_cohsex_binding",
+    "times": {
+      "runtime bring-up": 5.67,
+      "pre-main + imports": 1.14,
+      "input + run setup": 0.28,
+      "V(q)": 4.29,
+      "ISDF setup + I/O": 6.46,
+      "minimax quadrature": 0.14,
+      "chi0": 3.14,
+      "W": 3.14,
+      "screening support": 0.04,
+      "W persist + q0 head": 0.56,
+      "Sigma other": 47.41,
+      "mean-field load": 0.09,
+      "QP solve + diagonalize": 0.37,
+      "result writes": 0.12,
+      "other driver work": 1.43,
+      "total run": 74.29
+    },
+    "step": [
+      "[lx] using named allocation JID 57960444 [--jid]",
+      "[lxrun] JID 57960444 \u00b7 4 nodes \u00b7 3:16:15 left \u00b7 12/16 GPUs free \u00b7 incoming: lx-?",
+      "[lx] step lx-Xg4-211207-2283249-4810 exit 0 in 77 s"
+    ],
+    "commits": [
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe"
+    ],
+    "nodes": [],
+    "allocator": [
+      "export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 XLA_PYTHON_CLIENT_ALLOCATOR=bfc"
+    ],
+    "log_sha256": "bce7b616dc0b87754c58f44e80337ed14455076857b1b98c6f99097e5c8bfe54",
+    "compile_receipts": [
+      "  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory."
+    ]
+  },
+  {
+    "system": "Si",
+    "mode": "cohsex",
+    "arm": "F",
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/49_fixed_main_cohsex",
+    "times": {
+      "runtime bring-up": 5.2,
+      "pre-main + imports": 0.99,
+      "input + run setup": 0.19,
+      "zeta": 7.6,
+      "V(q)": 5.09,
+      "ISDF setup + I/O": 18.38,
+      "minimax quadrature": 0.15,
+      "chi0": 2.03,
+      "W": 3.18,
+      "screening support": 0.04,
+      "W persist + q0 head": 0.09,
+      "Sigma other": 11.35,
+      "mean-field load": 0.08,
+      "QP solve + diagonalize": 0.38,
+      "result writes": 0.15,
+      "other driver work": 1.41,
+      "total run": 56.32
+    },
+    "step": [
+      "[lx] using named allocation JID 57955075 [--jid]",
+      "[lxrun] JID 57955075 \u00b7 4 nodes \u00b7 11:25 left \u00b7 8/16 GPUs free \u00b7 incoming: lx-?",
+      "[lx] step lx-Xg4-200631-1862494-2046 exit 0 in 61 s"
+    ],
+    "commits": [
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e",
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e",
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e",
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e"
+    ],
+    "nodes": [],
+    "allocator": [
+      "export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 XLA_PYTHON_CLIENT_ALLOCATOR=bfc"
+    ],
+    "log_sha256": "dc04619e92406191a7a37ac3759d19deb1d5cd59b39b6a1f45ba0ca830c78ed5",
+    "compile_receipts": [
+      "  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory."
+    ]
+  },
+  {
+    "system": "Si",
+    "mode": "gn",
+    "arm": "P",
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/56_parent_gn",
+    "times": {
+      "runtime bring-up": 4.0,
+      "pre-main + imports": 0.73,
+      "input + run setup": 0.26,
+      "V(q)": 3.86,
+      "ISDF setup + I/O": 6.29,
+      "minimax quadrature": 0.14,
+      "chi0": 4.07,
+      "W": 3.37,
+      "screening support": 0.13,
+      "W persist + q0 head": 0.55,
+      "Sigma rule plan": 6.14,
+      "Sigma tau sweep": 4.01,
+      "Sigma other": 55.9,
+      "mean-field load": 0.09,
+      "QP solve + diagonalize": 0.34,
+      "result writes": 0.1,
+      "other driver work": 1.46,
+      "total run": 91.46
+    },
+    "step": [
+      "[lx] using named allocation JID 57957188 [--jid]",
+      "[lxrun] JID 57957188 \u00b7 1 nodes \u00b7 1:03:54 left \u00b7 4/4 GPUs free \u00b7 incoming: lx-?",
+      "[lx] step lx-Xg4-203651-2042362-1297 exit 0 in 98 s"
+    ],
+    "commits": [
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe"
+    ],
+    "nodes": [
+      "RuntimeWarning: minimax: UNCERTIFIED SOLVE noncrossing_imag/inverse_imag R=51.8401 target 5e-08 n_max=64 -> 6 nodes, max_err 3.043e-08, sum|w| 12.91, kappa0 28 | cache /global/homes/j/jackm/.cache/lorrax/minimax_quadratures/noncrossing_imag_v2_44a3fa9a34006a23a43532d6a7cae996e97afdbd9a9ea735d891e803893416d6.npz sha256:19951f8ada5be764 gen n/a (solved in-process) backend cpu:numpy-2.5.2/scipy-1.18.1/x86_64 UNCERTIFIED -- UNCERTIFIED, NOT REPRODUCIBLE ACROSS HOSTS. No shipped table matched this request, so the rule was computed in-process by a SciPy optimiser whose answer depends on this machine's LAPACK (three hosts, three answers, kappa0 varying by 900x -- survey section 2.4). LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE=0 makes this a refusal instead."
+    ],
+    "allocator": [
+      "export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 XLA_PYTHON_CLIENT_ALLOCATOR=bfc"
+    ],
+    "log_sha256": "67d3fc965639d9008dff0178672bd603fbcc9099bc70ffb12ab727564e9bc9ea",
+    "compile_receipts": [
+      "  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory."
+    ]
+  },
+  {
+    "system": "Si",
+    "mode": "gn",
+    "arm": "F",
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/48_fixed_main_gn",
+    "times": {
+      "runtime bring-up": 5.06,
+      "pre-main + imports": 1.06,
+      "input + run setup": 0.26,
+      "zeta": 7.35,
+      "V(q)": 5.11,
+      "ISDF setup + I/O": 17.43,
+      "minimax quadrature": 0.13,
+      "chi0": 2.75,
+      "W": 3.44,
+      "screening support": 0.2,
+      "W persist + q0 head": 0.09,
+      "Sigma rule plan": 6.32,
+      "Sigma tau sweep": 4.84,
+      "Sigma other": 20.96,
+      "mean-field load": 0.09,
+      "QP solve + diagonalize": 0.33,
+      "result writes": 0.14,
+      "other driver work": 1.42,
+      "total run": 76.97
+    },
+    "step": [
+      "[lx] using named allocation JID 57955075 [--jid]",
+      "[lxrun] JID 57955075 \u00b7 4 nodes \u00b7 13:11 left \u00b7 12/16 GPUs free \u00b7 incoming: lx-?",
+      "[lx] step lx-Xg4-200444-1853904-8909 exit 0 in 80 s"
+    ],
+    "commits": [
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e",
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e",
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e",
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e"
+    ],
+    "nodes": [
+      "RuntimeWarning: minimax: UNCERTIFIED SOLVE noncrossing_imag/inverse_imag R=51.8401 target 5e-08 n_max=64 -> 6 nodes, max_err 3.043e-08, sum|w| 12.91, kappa0 28 | cache /global/homes/j/jackm/.cache/lorrax/minimax_quadratures/noncrossing_imag_v2_44a3fa9a34006a23a43532d6a7cae996e97afdbd9a9ea735d891e803893416d6.npz sha256:19951f8ada5be764 gen n/a (solved in-process) backend cpu:numpy-2.5.2/scipy-1.18.1/x86_64 UNCERTIFIED -- UNCERTIFIED, NOT REPRODUCIBLE ACROSS HOSTS. No shipped table matched this request, so the rule was computed in-process by a SciPy optimiser whose answer depends on this machine's LAPACK (three hosts, three answers, kappa0 varying by 900x -- survey section 2.4). LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE=0 makes this a refusal instead."
+    ],
+    "allocator": [
+      "export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 XLA_PYTHON_CLIENT_ALLOCATOR=bfc"
+    ],
+    "log_sha256": "2f7d3a58d9dfb76983e8c1bd22107070aaf54b57298370aecc9b1b4fbb7f0b1c",
+    "compile_receipts": [
+      "  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory."
+    ]
+  },
+  {
+    "system": "MoS2",
+    "mode": "full_static",
+    "arm": "P",
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/73_parent_full_static",
+    "times": {
+      "runtime bring-up": 4.49,
+      "pre-main + imports": 0.7,
+      "input + run setup": 0.12,
+      "V(q)": 3.43,
+      "ISDF setup + I/O": 6.42,
+      "minimax quadrature": 0.14,
+      "screening support": 31.93,
+      "Sigma other": 150.14,
+      "mean-field load": 0.04,
+      "QP solve + diagonalize": 0.29,
+      "result writes": 0.12,
+      "other driver work": 0.82,
+      "total run": 198.64
+    },
+    "step": [
+      "[lx] using named allocation JID 57960444 [--jid]",
+      "[lxrun] JID 57960444 \u00b7 4 nodes \u00b7 3:53:17 left \u00b7 16/16 GPUs free \u00b7 incoming: lx-?",
+      "[lx] step lx-Xg4-203505-2030774-8671 exit 0 in 202 s"
+    ],
+    "commits": [
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe"
+    ],
+    "nodes": [
+      "Minimax quadrature: 1 catalog entries used (11 nodes); requested tolerance 1.00000e-07; worst reported error 3.86000e-08. Catalog generator/backend provenance is UNCERTIFIED."
+    ],
+    "allocator": [
+      "export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 XLA_PYTHON_CLIENT_ALLOCATOR=bfc"
+    ],
+    "log_sha256": "e644f0a711e66403a24482a405b19781ab9f50ba3a2c0916e0fbbb0a037d8611",
+    "compile_receipts": [
+      "  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory."
+    ]
+  },
+  {
+    "system": "MoS2",
+    "mode": "full_static",
+    "arm": "F",
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/11_fixed_main_full_static",
+    "times": {
+      "runtime bring-up": 5.48,
+      "pre-main + imports": 1.67,
+      "input + run setup": 0.23,
+      "zeta": 8.2,
+      "V(q)": 3.94,
+      "ISDF setup + I/O": 19.15,
+      "minimax quadrature": 0.13,
+      "screening support": 12.65,
+      "Sigma other": 18.4,
+      "mean-field load": 0.04,
+      "QP solve + diagonalize": 0.28,
+      "result writes": 0.13,
+      "other driver work": 0.69,
+      "total run": 70.98
+    },
+    "step": [
+      "[lx] using named allocation JID 57955075 [--jid]",
+      "[lxrun] JID 57955075 \u00b7 4 nodes \u00b7 13:39 left \u00b7 16/16 GPUs free \u00b7 incoming: lx-?",
+      "[lx] step lx-Xg4-200418-1851221-8871 exit 0 in 78 s"
+    ],
+    "commits": [
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e",
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e",
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e",
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e"
+    ],
+    "nodes": [
+      "Minimax quadrature: 1 catalog entries used (11 nodes); requested tolerance 1.00000e-07; worst reported error 3.86000e-08. Catalog generator/backend provenance is UNCERTIFIED."
+    ],
+    "allocator": [
+      "export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 XLA_PYTHON_CLIENT_ALLOCATOR=bfc"
+    ],
+    "log_sha256": "740de3b449dc32abf14f4e8d93508a0a988bcccff9fed73cf63bddf1e1e7e98e",
+    "compile_receipts": [
+      "  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory."
+    ]
+  },
+  {
+    "system": "MoS2",
+    "mode": "packed_bare",
+    "arm": "P",
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/74_parent_packed_bare",
+    "times": {
+      "runtime bring-up": 5.18,
+      "pre-main + imports": 0.9,
+      "input + run setup": 0.12,
+      "V(q)": 3.67,
+      "ISDF setup + I/O": 5.37,
+      "minimax quadrature": 0.14,
+      "chi0": 1.85,
+      "W": 3.72,
+      "screening support": 10.62,
+      "Sigma other": 149.95,
+      "mean-field load": 0.04,
+      "QP solve + diagonalize": 0.28,
+      "result writes": 0.1,
+      "other driver work": 0.73,
+      "total run": 182.66
+    },
+    "step": [
+      "[lx] using named allocation JID 57960444 [--jid]",
+      "[lxrun] JID 57960444 \u00b7 4 nodes \u00b7 3:44:03 left \u00b7 16/16 GPUs free \u00b7 incoming: lx-?",
+      "[lx] step lx-Xg4-204419-2081026-7329 exit 0 in 188 s"
+    ],
+    "commits": [
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe"
+    ],
+    "nodes": [
+      "Minimax quadrature: 1 catalog entries used (11 nodes); requested tolerance 1.00000e-07; worst reported error 3.86000e-08. Catalog generator/backend provenance is UNCERTIFIED."
+    ],
+    "allocator": [
+      "export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 XLA_PYTHON_CLIENT_ALLOCATOR=bfc"
+    ],
+    "log_sha256": "d99d5eb5821817bd47a92915c130613d20786fa1784d7d9741647f1402934d5d",
+    "compile_receipts": [
+      "  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory."
+    ]
+  },
+  {
+    "system": "MoS2",
+    "mode": "packed_bare",
+    "arm": "F",
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/12_fixed_main_packed_bare",
+    "times": {
+      "runtime bring-up": 12.42,
+      "pre-main + imports": 3.77,
+      "input + run setup": 0.19,
+      "zeta": 8.14,
+      "V(q)": 3.96,
+      "ISDF setup + I/O": 20.29,
+      "minimax quadrature": 0.33,
+      "chi0": 1.22,
+      "W": 3.74,
+      "screening support": 11.46,
+      "Sigma other": 18.58,
+      "mean-field load": 0.04,
+      "QP solve + diagonalize": 0.28,
+      "result writes": 0.12,
+      "other driver work": 0.65,
+      "total run": 85.17
+    },
+    "step": [
+      "[lx] using named allocation JID 57955075 [--jid]",
+      "[lxrun] JID 57955075 \u00b7 4 nodes \u00b7 12:23 left \u00b7 8/16 GPUs free \u00b7 incoming: lx-?",
+      "[lx] step lx-Xg4-200532-1857555-6507 exit 0 in 93 s"
+    ],
+    "commits": [
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e",
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e",
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e",
+      "de8dcfbc5505bb67ff31b86d4e78151ea2af4f9e"
+    ],
+    "nodes": [
+      "Minimax quadrature: 1 catalog entries used (11 nodes); requested tolerance 1.00000e-07; worst reported error 3.86000e-08. Catalog generator/backend provenance is UNCERTIFIED."
+    ],
+    "allocator": [
+      "export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 XLA_PYTHON_CLIENT_ALLOCATOR=bfc"
+    ],
+    "log_sha256": "b9ecf606496823f003132fc16be51ddd9aefb57215ee8c7245b5cf3261494913",
+    "compile_receipts": [
+      "  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory."
+    ]
+  },
+  {
+    "system": "MoS2",
+    "mode": "dynamic_eps5",
+    "arm": "P",
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/80_parent_dynamic_eps5",
+    "times": {
+      "runtime bring-up": 12.79,
+      "pre-main + imports": 3.65,
+      "input + run setup": 0.67,
+      "V(q)": 3.79,
+      "ISDF setup + I/O": 6.22,
+      "minimax quadrature": 0.38,
+      "chi0": 2.54,
+      "W": 4.42,
+      "screening support": 27.26,
+      "W persist + q0 head": 0.6,
+      "Sigma rule plan": 77.76,
+      "Sigma tau sweep": 3.14,
+      "Sigma other": 185.4,
+      "mean-field load": 0.04,
+      "QP solve + diagonalize": 0.26,
+      "result writes": 0.08,
+      "other driver work": 10.0,
+      "total run": 338.98
+    },
+    "step": [
+      "[lx] using named allocation JID 57960444 [--jid]",
+      "[lxrun] JID 57960444 \u00b7 4 nodes \u00b7 3:21:00 left \u00b7 12/16 GPUs free \u00b7 incoming: lx-?",
+      "[lx] step lx-Xg4-210723-2245574-4379 exit 0 in 345 s"
+    ],
+    "commits": [
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe",
+      "fc7825a8612f4a56a043a58c429ea95eaf5ec3fe"
+    ],
+    "nodes": [
+      "Minimax quadrature: 1 catalog entries used (11 nodes); requested tolerance 1.00000e-07; worst reported error 3.86000e-08. Catalog generator/backend provenance is UNCERTIFIED.",
+      "RuntimeWarning: minimax: UNCERTIFIED SOLVE noncrossing_imag/inverse_imag R=50.7086 target 1e-07 n_max=64 -> 8 nodes, max_err 5.537e-08, sum|w| 9.498e+04, kappa0 6.51e+04 | cache /global/homes/j/jackm/.cache/lorrax/minimax_quadratures/noncrossing_imag_v2_7768352162b69f56117909acffce423669b83eb31e653ded398d8ea9dcab559d.npz sha256:f232a056f9434ed2 gen n/a (solved in-process) backend cpu:numpy-2.5.2/scipy-1.18.1/x86_64 UNCERTIFIED -- UNCERTIFIED, NOT REPRODUCIBLE ACROSS HOSTS. No shipped table matched this request, so the rule was computed in-process by a SciPy optimiser whose answer depends on this machine's LAPACK (three hosts, three answers, kappa0 varying by 900x -- survey section 2.4). LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE=0 makes this a refusal instead."
+    ],
+    "allocator": [
+      "export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 XLA_PYTHON_CLIENT_ALLOCATOR=bfc"
+    ],
+    "log_sha256": "b7208b2ade302eae43e017eeee17094a6d6bc60e2d19f49efe2a579c73b875e2",
+    "compile_receipts": [
+      "  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory."
+    ]
+  },
+  {
+    "system": "MoS2",
+    "mode": "dynamic_eps5",
+    "arm": "F",
+    "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/41_bisp_parent_route_2026-09-05/79_fixed_main_dynamic_eps5",
+    "times": {
+      "runtime bring-up": 12.14,
+      "pre-main + imports": 1.81,
+      "input + run setup": 0.64,
+      "V(q)": 4.11,
+      "ISDF setup + I/O": 8.93,
+      "minimax quadrature": 0.18,
+      "chi0": 2.11,
+      "W": 4.4,
+      "screening support": 10.74,
+      "W persist + q0 head": 0.29,
+      "Sigma rule plan": 84.57,
+      "Sigma tau sweep": 2.65,
+      "Sigma other": 27.46,
+      "mean-field load": 0.04,
+      "QP solve + diagonalize": 0.24,
+      "result writes": 0.1,
+      "other driver work": 5.44,
+      "total run": 165.86
+    },
+    "step": [
+      "[lx] using named allocation JID 57960444 [--jid]",
+      "[lxrun] JID 57960444 \u00b7 4 nodes \u00b7 3:20:57 left \u00b7 12/16 GPUs free \u00b7 incoming: lx-?",
+      "[lx] step lx-Xg4-210725-2246074-4013 exit 0 in 172 s"
+    ],
+    "commits": [
+      "afeab2d0c779f2bb12600f523f30ace9e8ca4e61",
+      "afeab2d0c779f2bb12600f523f30ace9e8ca4e61",
+      "afeab2d0c779f2bb12600f523f30ace9e8ca4e61",
+      "afeab2d0c779f2bb12600f523f30ace9e8ca4e61"
+    ],
+    "nodes": [
+      "Minimax quadrature: 1 catalog entries used (11 nodes); requested tolerance 1.00000e-07; worst reported error 3.86000e-08. Catalog generator/backend provenance is UNCERTIFIED.",
+      "RuntimeWarning: minimax: UNCERTIFIED SOLVE noncrossing_imag/inverse_imag R=50.7086 target 1e-07 n_max=64 -> 8 nodes, max_err 5.537e-08, sum|w| 9.498e+04, kappa0 6.51e+04 | cache /global/homes/j/jackm/.cache/lorrax/minimax_quadratures/noncrossing_imag_v2_7768352162b69f56117909acffce423669b83eb31e653ded398d8ea9dcab559d.npz sha256:f232a056f9434ed2 gen n/a (solved in-process) backend cpu:numpy-2.5.2/scipy-1.18.1/x86_64 UNCERTIFIED -- UNCERTIFIED, NOT REPRODUCIBLE ACROSS HOSTS. No shipped table matched this request, so the rule was computed in-process by a SciPy optimiser whose answer depends on this machine's LAPACK (three hosts, three answers, kappa0 varying by 900x -- survey section 2.4). LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE=0 makes this a refusal instead."
+    ],
+    "allocator": [
+      "export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 XLA_PYTHON_CLIENT_ALLOCATOR=bfc"
+    ],
+    "log_sha256": "99cfbd0b8f91c54df0bf2a91b1844f996ad969cda64ffebaf6804c5a22ff6be8",
+    "compile_receipts": [
+      "  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR=\"\" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory."
+    ]
+  }
+]
