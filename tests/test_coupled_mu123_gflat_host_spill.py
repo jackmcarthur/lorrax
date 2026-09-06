@@ -70,7 +70,7 @@ def test_host_spill_is_automatic_and_only_threads_through_coupled_route():
     call = source.index("_spill_coupled_gflat_to_host=")
     assert "coordinator is not None" in source[call:call + 180]
     solve_call = source.index("_stack_coupled_solve_inputs=")
-    assert "False" in source[solve_call:solve_call + 80]
+    assert "coordinator is not None" in source[solve_call:solve_call + 80]
 
 
 def test_auto_route_prefers_local_then_distributed_then_sequential():
