@@ -100,3 +100,9 @@ src/ffi/cpp/build_host_cloud/
 
 # Shared, retained P4 pytest driver staging and rendezvous.
 .pytest_core_runs/
+
+# BISP-PROF-S runtime captures; reports retain reduced timing evidence.
+/runs/**/prof_s/**/xla_dump_rank*/
+/runs/**/prof_s/**/*.nsys-rep
+/runs/**/prof_s/**/*.sqlite
+/runs/**/prof_s/**/qp_wfn_rotations.h5

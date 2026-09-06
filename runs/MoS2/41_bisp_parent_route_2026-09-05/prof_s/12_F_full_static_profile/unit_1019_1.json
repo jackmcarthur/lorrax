@@ -1,0 +1,327 @@
+{
+  "program": 1019,
+  "occurrence": 1,
+  "occurrences": 27,
+  "label": "XlaModule:#hlo_module=jit_contract_block,program_id=1019#",
+  "host_range_ms": 6.76404,
+  "projected_ms": 6.757437,
+  "kernel_count": 303,
+  "kernel_sum_ms": 4.131166,
+  "kernels": [
+    {
+      "name": "loop_gather_fusion",
+      "count": 1,
+      "sum_ms": 0.002624
+    },
+    {
+      "name": "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "count": 1,
+      "sum_ms": 0.00912
+    },
+    {
+      "name": "loop_dynamic_slice_fusion",
+      "count": 1,
+      "sum_ms": 0.001952
+    },
+    {
+      "name": "loop_broadcast_fusion_6",
+      "count": 1,
+      "sum_ms": 0.001664
+    },
+    {
+      "name": "loop_compare_fusion_1",
+      "count": 1,
+      "sum_ms": 0.001824
+    },
+    {
+      "name": "input_transpose_fusion_5",
+      "count": 2,
+      "sum_ms": 0.009312
+    },
+    {
+      "name": "input_transpose_fusion_4",
+      "count": 2,
+      "sum_ms": 0.007904
+    },
+    {
+      "name": "loop_broadcast_fusion",
+      "count": 1,
+      "sum_ms": 0.008896
+    },
+    {
+      "name": "loop_multiply_fusion",
+      "count": 1,
+      "sum_ms": 0.003968
+    },
+    {
+      "name": "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "count": 180,
+      "sum_ms": 2.812799
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_tensorop_z884gemm_32x16_16x3_nn_align1>(T1::Params)",
+      "count": 90,
+      "sum_ms": 1.061536
+    },
+    {
+      "name": "loop_transpose_fusion",
+      "count": 1,
+      "sum_ms": 0.01344
+    },
+    {
+      "name": "loop_compare_fusion",
+      "count": 1,
+      "sum_ms": 0.001632
+    },
+    {
+      "name": "void regular_fft<(unsigned int)3, EPT<(unsigned int)3>, (unsigned int)256, (unsigned int)6, (padding_t)6, (twiddle_t)0, (loadstore_modifier_t)2, (layout_t)1, unsigned int, double, HostConfigPlaceholder>(kernel_arguments_t<T9>)",
+      "count": 6,
+      "sum_ms": 0.030463
+    },
+    {
+      "name": "lrx_gw_mult_c128",
+      "count": 1,
+      "sum_ms": 0.007648
+    },
+    {
+      "name": "wrapped_transpose_3",
+      "count": 1,
+      "sum_ms": 0.012576
+    },
+    {
+      "name": "loop_broadcast_fusion_1",
+      "count": 1,
+      "sum_ms": 0.002208
+    },
+    {
+      "name": "wrapped_transpose",
+      "count": 1,
+      "sum_ms": 0.003904
+    },
+    {
+      "name": "loop_broadcast_fusion_2",
+      "count": 1,
+      "sum_ms": 0.001856
+    },
+    {
+      "name": "wrapped_transpose_1",
+      "count": 2,
+      "sum_ms": 0.004416
+    },
+    {
+      "name": "loop_transpose_fusion_4",
+      "count": 1,
+      "sum_ms": 0.014368
+    },
+    {
+      "name": "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "count": 2,
+      "sum_ms": 0.106208
+    },
+    {
+      "name": "input_transpose_fusion_1",
+      "count": 2,
+      "sum_ms": 0.005664
+    },
+    {
+      "name": "loop_transpose_fusion_5",
+      "count": 2,
+      "sum_ms": 0.005184
+    }
+  ],
+  "thunks": [
+    {
+      "name": "Thunk:#name=jit(contract_block),hlo_op=loop_gather_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.002624,
+      "kernel_sum_ms": 0.002624
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/jit(_pad)/pad,hlo_op=collective-permute-start#",
+      "kernels": 1,
+      "projected_ms": 0.00912,
+      "kernel_sum_ms": 0.00912
+    },
+    {
+      "name": "Thunk:#hlo_op=command_buffer_4#",
+      "kernels": 3,
+      "projected_ms": 0.010144,
+      "kernel_sum_ms": 0.00544
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond,hlo_op=conditional.3#",
+      "kernels": 296,
+      "projected_ms": 6.625821,
+      "kernel_sum_ms": 4.108798
+    },
+    {
+      "name": "Thunk:#hlo_op=conditional.3_branch_region_1.16_spmd#",
+      "kernels": 296,
+      "projected_ms": 6.625821,
+      "kernel_sum_ms": 4.108798
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun,hlo_op=input_transpose_fusion.11#",
+      "kernels": 1,
+      "projected_ms": 0.00496,
+      "kernel_sum_ms": 0.00496
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun,hlo_op=input_transpose_fusion.10#",
+      "kernels": 1,
+      "projected_ms": 0.003904,
+      "kernel_sum_ms": 0.003904
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map,hlo_op=loop_broadcast_fusion.3#",
+      "kernels": 1,
+      "projected_ms": 0.008896,
+      "kernel_sum_ms": 0.008896
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/mul,hlo_op=loop_multiply_fusion.1#",
+      "kernels": 1,
+      "projected_ms": 0.003968,
+      "kernel_sum_ms": 0.003968
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.42#",
+      "kernels": 54,
+      "projected_ms": 1.211744,
+      "kernel_sum_ms": 0.458176
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/transpose,hlo_op=loop_transpose_fusion.3#",
+      "kernels": 1,
+      "projected_ms": 0.01344,
+      "kernel_sum_ms": 0.01344
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/eq,hlo_op=loop_compare_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.001632,
+      "kernel_sum_ms": 0.001632
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_convolve)/shard_map/ffi_call,hlo_op=ffi_call.43#",
+      "kernels": 7,
+      "projected_ms": 0.050111,
+      "kernel_sum_ms": 0.038111
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/transpose,hlo_op=wrapped_transpose.3#",
+      "kernels": 1,
+      "projected_ms": 0.012576,
+      "kernel_sum_ms": 0.012576
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map,hlo_op=loop_broadcast_fusion.4#",
+      "kernels": 1,
+      "projected_ms": 0.002208,
+      "kernel_sum_ms": 0.002208
+    },
+    {
+      "name": "Thunk:#hlo_op=wrapped_transpose.4#",
+      "kernels": 1,
+      "projected_ms": 0.003904,
+      "kernel_sum_ms": 0.003904
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.44#",
+      "kernels": 54,
+      "projected_ms": 1.245184,
+      "kernel_sum_ms": 1.096576
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun,hlo_op=input_transpose_fusion.9#",
+      "kernels": 1,
+      "projected_ms": 0.004352,
+      "kernel_sum_ms": 0.004352
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun,hlo_op=input_transpose_fusion.8#",
+      "kernels": 1,
+      "projected_ms": 0.004,
+      "kernel_sum_ms": 0.004
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map,hlo_op=loop_broadcast_fusion.5#",
+      "kernels": 1,
+      "projected_ms": 0.001856,
+      "kernel_sum_ms": 0.001856
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.45#",
+      "kernels": 54,
+      "projected_ms": 1.197535,
+      "kernel_sum_ms": 0.631776
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/transpose,hlo_op=wrapped_transpose.5#",
+      "kernels": 1,
+      "projected_ms": 0.00224,
+      "kernel_sum_ms": 0.00224
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun,hlo_op=loop_transpose_fusion.4#",
+      "kernels": 1,
+      "projected_ms": 0.014368,
+      "kernel_sum_ms": 0.014368
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.46#",
+      "kernels": 54,
+      "projected_ms": 1.238879,
+      "kernel_sum_ms": 1.085919
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.47#",
+      "kernels": 54,
+      "projected_ms": 1.178656,
+      "kernel_sum_ms": 0.601888
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/transpose,hlo_op=wrapped_transpose.6#",
+      "kernels": 1,
+      "projected_ms": 0.002176,
+      "kernel_sum_ms": 0.002176
+    },
+    {
+      "name": "Thunk:#hlo_op=all-gather-start.2#",
+      "kernels": 1,
+      "projected_ms": 0.049664,
+      "kernel_sum_ms": 0.049664
+    },
+    {
+      "name": "Thunk:#hlo_op=input_transpose_fusion.7#",
+      "kernels": 1,
+      "projected_ms": 0.002816,
+      "kernel_sum_ms": 0.002816
+    },
+    {
+      "name": "Thunk:#hlo_op=input_transpose_fusion.6#",
+      "kernels": 1,
+      "projected_ms": 0.002848,
+      "kernel_sum_ms": 0.002848
+    },
+    {
+      "name": "Thunk:#hlo_op=all-gather-start.3#",
+      "kernels": 1,
+      "projected_ms": 0.056544,
+      "kernel_sum_ms": 0.056544
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond,hlo_op=loop_transpose_fusion.5#",
+      "kernels": 1,
+      "projected_ms": 0.002752,
+      "kernel_sum_ms": 0.002752
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/cond,hlo_op=loop_transpose_fusion.6#",
+      "kernels": 1,
+      "projected_ms": 0.002432,
+      "kernel_sum_ms": 0.002432
+    }
+  ],
+  "scope": "Native launch-correlation projection; nested thunk ranges must not be summed"
+}
