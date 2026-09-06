@@ -703,6 +703,13 @@ the scalar-operator star relation but is not stored. Production consumers now
 obtain this matrix as `cartesian_action(..., axial=False, time_odd=True)`;
 they do not choose the transpose or sign independently.
 
+The one-shot scalar and packed head consumer,
+`qsgw_head.read_authenticated_dipole_velocity`, reads only `kirr_fullids`
+and the active chi band window after authenticating the existing full-BZ
+file. `unfold_file_wedge_polar_matrix` restores the velocity for the shared
+head and parent-star wing kernels. The file indexing and provenance stay
+unchanged; no `deltaE` payload is read by this consumer.
+
 #### …and the SAME sign applies to the QSGW velocity — derived 2026-08-22
 
 The row above measured the parity of the **bare** term. The head lane
@@ -1257,3 +1264,53 @@ fake green, worse than no check. It is therefore measured upstream on the
 full-BZ arrays and recorded into the wedge file's header, **per band**, because
 the band scope belongs to the consumer (the comparison's fixture) and not to the
 producer (the deck's sigma window).
+
+## Bispinor convention audit (PHYS, source b8e036a8)
+
+The following table is adopted verbatim from the independent PHYS report; its source locations and statuses are as-of that audit. Integration closures and changed conventions are recorded below the table.
+
+
+PROVED means equality at the explicitly tested seam/fixture within the tolerance above. FLAGGED means source-derived, model-limited, or missing an independent numerical witness. Oracle names below omit the `test_` prefix and refer to the new module unless marked existing.
+
+| Convention | Site at b8e036a8 | Status | Oracle / remaining scope |
+|---|---|---|---|
+| Raw/isometric hσ·p lift; positive h | bispinor_init:237 | PROVED | literal_gamma_lift_and_all_96_spatial_trs_rows |
+| Γ² Hermitian but Γ²ᵀ=−Γ²; other Γ transpose signs | gamma_matrices | PROVED | literal_gamma_lift_and_all_96_spatial_trs_rows; independent Pauli |
+| det(S) on small block | maps:1913 | PROVED | all96 row oracle |
+| iσ_y K on both blocks; conjugated U†ΓU for TR | maps:1913 | PROVED | all96 row oracle |
+| Current polar/time-odd; charge even | maps:3090,3115 | PROVED | all96 rows; nonzero_ct_covariance_recomputed_from_spinors |
+| Local +k·L phase and K acting on phase | maps:1051 | PROVED | vertex_after_unfold_equals_mixed_vertices_before_unfold; parent χ/Σ glide |
+| Reciprocal exp(−iSG·tnp), sphere/local gauge | maps:2061 | FLAGGED | existing parent-face gate only; no new sphere oracle |
+| Vertex after unfold and complex coefficient conjugation | centroid_k_unfold:121 | PROVED | vertex_after_unfold_equals_mixed_vertices_before_unfold |
+| Pair ψ†Γψ and signed C²=−Q² | core:1593 | PROVED (signed) | isdf_current_signed_normal_matrix_against_literal_pair_gram |
+| Same C/Z sign cancels | gamma_double_contract; core:3280 | PROVED at algebra seam | signed_isdf_rhs_cancels_in_unregularized_fit |
+| Full Z host-store/FFT sign cancellation | core:2985,3280–3315 | FLAGGED | end-to-end Z oracle missing |
+| Positive ridge becomes Q−δI for Γ² | core:5148 | PROVED limitation | positive_ridge_moves_negative_gram_toward_zero; public certification/deck effect unpriced |
+| χ left/right conjugation, Γ not Γᵀ, k±q order | w_isdf:416,661–666 | PROVED | all_16_chi_blocks_nonzero_ct_literal_both_orientations |
+| Reverse χ ordered orientation, not 2×forward | w_isdf:98,1815 | PROVED | same non-TR χ oracle |
+| Raw1/√Nₖ and downstream spin/file prefactor | w_isdf raw kernel, solve_w | PROVED for nspin1/file2 | χ + packed_dyson_order_prefactor_hermiticity_and_bare_limit; other caller conventions source-only |
+| Parent χ equals explicit full children | w_isdf parent face kernel | PROVED on toy | parent_chi_equals_literal_full_k_for_all_16_blocks |
+| TT Π(q)−Π(0), exact zero at Γ | w_isdf:1918 | PROVED subtraction | q_star_unfold_all_blocks_ward_contact_and_daggers |
+| Γ little-group completeness of contact | w_isdf contact placement; head_correction:1343 | FLAGGED | BISP-HEAD obligation |
+| Single negative TT metric and transverse projector | v_q_bispinor:270,335 | PROVED | bare_tiles_metric_sign_and_complex_hermitian_companions |
+| Scalar v/Ω and full ζ†vζ tile pipeline | v_q_bispinor builder/accumulator | FLAGGED whole pipeline | per-G tensor proved; scalar quadrature/full tile accumulation shared by existing references |
+| Reverse stored tile = conjugate centroid transpose | v_q_bispinor:815,831 | PROVED | complex reader companion oracle |
+| Packed matrix permutation and I−Dχ order | photon_layout; w_isdf:1345,1548 | PROVED | noncommuting packed Dyson oracle; CPU LU backend |
+| W_AB†=W_BA, including complex CT | solve_w; photon_blocks_full_q | PROVED | packed Dyson and q-star oracles |
+| Scalar unfold conjugates once; Λ⊗Λ does not conjugate | w_isdf:2003; maps:1867 | PROVED | q_star_unfold_all_blocks_ward_contact_and_daggers |
+| Nonzero CT/TC polar/TR covariance | maps:1867,3115 | PROVED | nonzero_ct_covariance_recomputed_from_spinors |
+| G=ψ f ψ†; right Γ not Γᵀ | greens_function_kernel:176 | PROVED | parent_sigma_all_vertices_q_convolution_and_projection; transpose red twin |
+| Σ convolution minus, k−q and1/Nₖ | cohsex_sigma:233 | PROVED | all16 parent Sigma oracle |
+| COH factor −0.5 multiplies already-negative convolution | photon_sigma:182 | PROVED at kernel seam | all16 Sigma factor oracle |
+| Wrapper V/W/W−V and occupied/sum windows | photon_sigma:161–182 | FLAGGED numerical assembly | source-consistent; independent complete wrapper test missing |
+| Bare TT W=D gives X=SX, COH=0 | solve_w; cohsex_sigma:747–748 | PROVED limit + source assembly | packed bare-limit oracle; physical static total SX+COH |
+| Dynamic current correction reported in X | sigma_dispatch:1190–1204 | FLAGGED dynamic route | source audit only, no dynamic driver oracle |
+| Parent-band bra conjugated, ket unconjugated | photon_sigma:111 | PROVED | all16 parent Sigma literal projection |
+| Final antiunitary band transpose after sector sum | maps:3872; photon_sigma:235 | PROVED static toy | full_band_unfold_matches_literal_sigma_on_symmetric_complete_toy |
+| Screened production parent/full-k self-energy | complete driver | FLAGGED | no new fixed-main comparison |
+| Density signed weights, real ψ†Γψ, TR signs | get_DFT_mtxels:165,263 | PROVED local density | density_all_currents_signed_weights_and_time_reversal |
+| Density caller Ω/k factors, complete SCF feedback | qsgw_density:361 and callers | FLAGGED | local density proof does not cover every caller |
+| Periodic direct TT −8πP_T/G², G0=0 | dft_operators:174; kin_ion_io:893 | PROVED | periodic_transverse_hartree_sign_projector_and_zero_mode |
+| Hall −iεσ and CT/TC conjugate pairing | head_correction:162 | PROVED declared model | existing photon_head_sign_oracle, rerun final leg |
+| Head S+YWZ/Ω, WZ transpose and YW orientation | head_correction:1343,1526–1556 | PROVED local declared formulas | existing head-sign/moment suite; shared sampler limitation |
+| Full Ward/gauge completeness, missing current head terms | static_gauge_response module | FLAGGED model limitation | not supplied by the no-pair paramagnetic approximation |
