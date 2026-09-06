@@ -50,7 +50,7 @@
 
 | Scalar non-regression | P source | F source | Class | State | Run |
 |---|---|---|---|---|---|
-| Si leg20 P4 | fe2a6937 | d3d4b03a | copied ζ: exact PASS; own-fit control running | measured copied pair | runs/Si/100_bisp_scale_scalar_2026-09-06/03_pair |
+| Si leg20 P4 | fe2a6937 | d3d4b03a | copied ζ: exact PASS; own ζ: exact PASS | measured copied pair | runs/Si/100_bisp_scale_scalar_2026-09-06/03_pair |
 | Na8×8×8 P16 | fe2a6937 | d3d4b03a | own-fit numeric residual reported; exact requested | detached queued | runs/Na/16_bisp_scale_scalar_2026-09-06/03_pair |
 
 | 9×9 arm | P/F total s | Screening P/F s | Sigma P/F s | Compiles P/F | Class | Step / path |
@@ -110,3 +110,14 @@
 | Whole wall s |672.77|62.53|excluded from source-speed verdict because rule-cache states differ|
 | Step / artifact |57988457/lx-Xg4-144241-1236696-5495 exit0|zero GPU overlaps|runs/Si/100_bisp_scale_scalar_2026-09-06/{04_bisp_tip_copied,05_main_copied}; claim below|
 | Legacy rule-cache incompatibility |12 entries stamped−1|deck requests30|sigma_box_plan.py:271–277 correctly rejects both sources; KNOWN_SANDBOX_ERRORS.md; D/scalar_rule_cache_delta.json|
+
+| Si P4 own ζ, current-source pair | P fe2a6937 | F d3d4b03a | Acceptance / scope |
+|---|---:|---:|---|
+| EQP0 / EQP1 |exact|reference|PASS; own ζ is identical here, stronger than µeV-class|
+| ζ s |12.18|12.44|−2.1%|
+| χ0+W s |8.57|8.17|+4.9%; copied-input comparison was+1.1%|
+| τ+other Σ s |37.29|36.73|+1.5%|
+| Rule plan s |627.45|592.86|both rebuilt incompatible historical cache; host/planning variation|
+| Total s |707.74|671.46|+5.4%, primarily planner; no warm whole-driver claim|
+| Compile count / s |503 /35.65|509 /34.84|six fewer modules; compiler seconds+2.3%|
+| Step / evidence |57988457/lx-Xg4-143444-1183016-5007 exit0|zero GPU overlaps|runs/Si/100_bisp_scale_scalar_2026-09-06/{identity.json,summary.json}; no repeated baseline needed|
