@@ -1,50 +1,4 @@
-"""Real 4-rank CUDA gate: algebra parity for the face-layout G builder and
-band projector against BOTH the legacy code path AND a NumPy reference.
-
-Guide: reports/gwjax_low_mem_bands_audit_2026-08-22/report.md, census rows
-2/3/4 and sections 3/4/5 — the task this file certifies.
-
-WHY REAL CUDA, NOT EMULATED.  Every face-layout numeric path added by this
-task routes through ``distrib_la.gemm_plan`` (build_G and the two-GEMM
-projector) — a cuBLASMp-only surface that refuses on
-any non-CUDA mesh by construction (``gemm_plan``'s own docstring, and the
-sibling ``feat/distrib-la-planned-gemm-2026-08-22`` branch this builds on).
-So there is no emulated-CPU leg for these checks to fall back to; this file
-IS the certification.  What CAN and DOES run on an emulated CPU mesh —
-refusal-path coverage and the (s,mu) GEMM-seam merge/split reshape's own
-correctness-and-no-collective claim — lives in
-``tests/test_windowed_exp_iEt.py``, ``tests/test_contract_bands.py``,
-``tests/test_wavefunction_bundle_face_carrier.py`` and
-``tests/test_cohsex_sigma_face.py``.
-
-SAME ψ, EVERY REPRESENTATION.  Every check below builds ONE host NumPy ψ
-array and derives every legacy/face copy from it by pure reshape/
-transpose — never independent random data per copy — because that is
-exactly how the real bundle builders work (``wavefunction_bundle.
-build_wavefunctions``/``build_wavefunctions_face``, and the carrier's own
-``test_face_matches_legacy_same_psi``): psi_xr/psi_yr/psi_nmu are the SAME
-un-conjugated ψ values, only differently sharded, and psi_xn/psi_yn/
-psi_mun are the same values with the band axis moved last.  A NumPy
-reference computed straight from the physics formula is the ground truth
-every check compares BOTH layouts against — not just each other, since two
-implementations can agree and both be wrong.
-
-Checks:
-  1. G, identity weight (ns=1 and ns=2) — build_G(phases=None).
-  2. G, diagonal band weight (ns=1 and ns=2) — build_G(phases=w).
-  3. G, HOSTILE logical pad — a val/cond-style window boundary that does
-     NOT divide the mesh (report obstacle #3's bring-up path: legacy
-     physically slices the window, face carries the FULL extent and a
-     band-identity mask that is zero outside it) — build_G_tau.
-  4. G, dense Gij REFUSES by name under layout='face', even with a real
-     gemm plan in hand (obstacle #4's named escape hatch).
-  5. Projection — contract_bands_block_reshard(layout='face') against
-     layout='legacy' and a NumPy einsum, ns=1 and ns=2.
-Run:
-    lx run -G 4 -n 4 env PYTHONPATH=... python3 -u \\
-        tests/multi_device/low_mem_bands_g_projection_hartree_gate.py \\
-        --mesh 2x2
-"""
+"""P4 canonical Green functions versus NumPy, plus shared BSE projection-layout checks."""
 from __future__ import annotations
 
 import argparse
@@ -129,8 +83,6 @@ def check_g_weighted(mesh, dtype="complex128", *, ns=2, mu=8, nb=6, nk=2,
 
     # legacy: psi_xn = psi_np transposed to (nk,s,mu,n); psi_yr = psi_np as-is
     psi_xn_np = psi_np.transpose(0, 2, 3, 1)
-    psi_xn = _put(psi_xn_np, mesh, (None, None, "x", None))
-    psi_yr = _put(psi_np, mesh, (None, None, None, "y"))
 
     # face: psi_mun = same transpose as psi_xn; psi_nmu = same as psi_yr
     psi_mun = _put(psi_xn_np, mesh, (None, None, "x", "y"))
@@ -141,7 +93,6 @@ def check_g_weighted(mesh, dtype="complex128", *, ns=2, mu=8, nb=6, nk=2,
 
     plan = gemm_plan(mesh, m=mu * ns, k=nb, n=mu * ns, nq=nk, dtype=dtype)
 
-    G_legacy = build_G(psi_xn, psi_yr, phases=w, layout="legacy")
     G_face = build_G(psi_mun, psi_nmu, phases=w, layout="face", gemm=plan)
 
     if weighted:
@@ -151,11 +102,9 @@ def check_g_weighted(mesh, dtype="complex128", *, ns=2, mu=8, nb=6, nk=2,
         want = np.einsum("ksxn,knty->ksxty", psi_xn_np, np.conj(psi_np),
                          optimize=True)
 
-    r_legacy = _rel(_gather(G_legacy), want)
     r_face = _rel(_gather(G_face), want)
-    assert r_legacy < RTOL, f"legacy G rel err {r_legacy:.3e}"
     assert r_face < RTOL, f"face G rel err {r_face:.3e}"
-    return {"legacy": r_legacy, "face": r_face}
+    return {"face": r_face}
 
 
 # ---------------------------------------------------------------------------
@@ -164,12 +113,7 @@ def check_g_weighted(mesh, dtype="complex128", *, ns=2, mu=8, nb=6, nk=2,
 
 def check_g_hostile_pad(mesh, dtype="complex128", *, ns=2, mu=8, nb_full=8,
                         nk=2, lo=0, hi=3):
-    """``hi - lo = 3`` on a 2x2 mesh: a physically-legal legacy slice, but
-    NOT the shape a face GEMM could ever tile (report obstacle #3's whole
-    reason for existing).  ``nb_full=8`` IS mesh-divisible — the GEMM's
-    contracted axis stays at the padded full extent; only the LOGICAL
-    window is hostile, expressed as a band-identity mask (obstacle #3's
-    bring-up path)."""
+    """Mask an uneven logical band window on the mesh-divisible resident faces."""
     from gw.greens_function_kernel import build_G_tau
     from distrib_la import gemm_plan
 
@@ -181,12 +125,6 @@ def check_g_hostile_pad(mesh, dtype="complex128", *, ns=2, mu=8, nb_full=8,
     t = 0.37 + 0.0j
     enk_win = enk_np[:, lo:hi]
     e_ref = float(np.max(enk_win))
-
-    psi_xn_win = _put(psi_xn_np[:, :, :, lo:hi], mesh, (None, None, "x", None))
-    psi_yr_win = _put(psi_np[:, lo:hi], mesh, (None, None, None, "y"))
-    enk_win_dev = _put(enk_win, mesh, (None, None))
-    G_legacy = build_G_tau(psi_xn_win, psi_yr_win, enk_win_dev, t,
-                           e_ref=e_ref, layout="legacy")
 
     psi_mun = _put(psi_xn_np, mesh, (None, None, "x", "y"))
     psi_nmu = _put(psi_np, mesh, (None, "x", None, "y"))
@@ -204,11 +142,9 @@ def check_g_hostile_pad(mesh, dtype="complex128", *, ns=2, mu=8, nb_full=8,
     want = np.einsum("ksxn,kn,knty->ksxty", psi_xn_np, phase_win,
                      np.conj(psi_np), optimize=True)
 
-    r_legacy = _rel(_gather(G_legacy), want)
     r_face = _rel(_gather(G_face), want)
-    assert r_legacy < RTOL, f"legacy hostile-pad rel err {r_legacy:.3e}"
     assert r_face < RTOL, f"face hostile-pad rel err {r_face:.3e}"
-    return {"legacy": r_legacy, "face": r_face, "window": f"[{lo},{hi})"}
+    return {"face": r_face, "window": f"[{lo},{hi})"}
 
 
 # ---------------------------------------------------------------------------

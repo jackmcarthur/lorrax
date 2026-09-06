@@ -213,14 +213,24 @@ def test_where_returns_exact_zero_where_the_multiply_would_give_nan():
 
 # --------------------------------------------- build_G_tau is an exact no-op
 
-def _build_G_tau_pre_refactor(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None):
-    """Verbatim body as of d25d8d6a, kept as the parity reference."""
+@pytest.fixture
+def gemm():
+    """Isolate phase and selector algebra from the native distributed GEMM backend."""
+    import jax
+    from jax.sharding import Mesh
+    plan = lambda left, right: left @ right
+    plan.mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    return plan
+
+
+def _build_G_tau_pre_refactor(psi_xn, psi_yr, enk, t, *, gemm, e_ref=0.0, mask=None):
+    """Materialize the phase and identity mask before the same canonical contraction."""
     phases = jnp.exp(-t * (enk - e_ref))
     if mask is not None:
         mask = jnp.reshape(mask, enk.shape)
         phases = jnp.where(mask, phases,
                            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
-    return build_G(psi_xn, psi_yr, phases=phases)
+    return build_G(psi_xn, psi_yr, phases=phases, gemm=gemm)
 
 
 @pytest.fixture(scope="module")
@@ -235,33 +245,33 @@ def psis():
 
 
 @pytest.mark.parametrize("tag,t", TIMES[:2], ids=[x[0] for x in TIMES[:2]])
-def test_build_G_tau_unmasked_is_a_bit_exact_no_op(psis, enk, tag, t):
+def test_build_G_tau_unmasked_is_a_bit_exact_no_op(psis, enk, tag, t, gemm):
     """chi0's call signature."""
     xn, yr = psis
-    new = build_G_tau(xn, yr, enk, t, e_ref=0.5)
-    old = _build_G_tau_pre_refactor(xn, yr, enk, t, e_ref=0.5)
+    new = build_G_tau(xn, yr, enk, t, gemm=gemm, e_ref=0.5)
+    old = _build_G_tau_pre_refactor(xn, yr, enk, t, gemm=gemm, e_ref=0.5)
     assert np.array_equal(np.asarray(new), np.asarray(old))
 
 
 @pytest.mark.parametrize("tag,t", TIMES[:2], ids=[x[0] for x in TIMES[:2]])
-def test_build_G_tau_band_identity_mask_is_a_bit_exact_no_op(psis, enk, tag, t):
+def test_build_G_tau_band_identity_mask_is_a_bit_exact_no_op(psis, enk, tag, t, gemm):
     """Σ's ``mask_A`` call signature, and the ``(1,nk,nb)`` 1×1-mesh reshape
     path (the nspin axis a 2×2 mesh squeezes and a 1×1 mesh does not — an
     unreshaped mask broadcast phases to 3-D and crashed GN-PPM on one GPU)."""
     xn, yr = psis
     rng = np.random.default_rng(5)
     mA = jnp.asarray(rng.random((NK, NB)) > 0.4)
-    old = _build_G_tau_pre_refactor(xn, yr, enk, t, e_ref=0.5, mask=mA)
+    old = _build_G_tau_pre_refactor(xn, yr, enk, t, gemm=gemm, e_ref=0.5, mask=mA)
     assert np.array_equal(
-        np.asarray(build_G_tau(xn, yr, enk, t, e_ref=0.5, mask=mA)),
+        np.asarray(build_G_tau(xn, yr, enk, t, gemm=gemm, e_ref=0.5, mask=mA)),
         np.asarray(old))
     assert np.array_equal(
-        np.asarray(build_G_tau(xn, yr, enk, t, e_ref=0.5,
+        np.asarray(build_G_tau(xn, yr, enk, t, gemm=gemm, e_ref=0.5,
                                mask=jnp.reshape(mA, (1, NK, NB)))),
         np.asarray(old))
 
 
-def test_build_G_tau_zero_weight_gates_an_overflowing_unselected_band():
+def test_build_G_tau_zero_weight_gates_an_overflowing_unselected_band(gemm):
     """Sparse delivered selectors cannot turn an excluded overflow into NaN."""
     energies = jnp.asarray([[0.1, 1000.0]])
     weight = jnp.asarray([[1.0, 0.0]])
@@ -269,33 +279,21 @@ def test_build_G_tau_zero_weight_gates_an_overflowing_unselected_band():
     psi_yr = jnp.ones((1, 2, 1, 1), dtype=jnp.complex128)
 
     got = np.asarray(build_G_tau(
-        psi_xn, psi_yr, energies, -1.0, band_weight=weight))
+        psi_xn, psi_yr, energies, -1.0, band_weight=weight, gemm=gemm))
 
     assert np.all(np.isfinite(got))
     np.testing.assert_allclose(got, np.exp(0.1), rtol=1.0e-15, atol=0.0)
 
 
 @pytest.mark.parametrize("tag,t", TIMES[:2], ids=[x[0] for x in TIMES[:2]])
-def test_build_G_tau_bounds_route_equals_the_materialised_mask_route(psis, enk, tag, t):
+def test_build_G_tau_bounds_route_equals_the_materialised_mask_route(psis, enk, tag, t, gemm):
     """The conversion itself: E_min/E_max reproduces the mask array it replaces."""
     xn, yr = psis
-    new = build_G_tau(xn, yr, enk, t, e_ref=0.5, E_min=E_MIN, E_max=E_MAX)
-    old = _build_G_tau_pre_refactor(xn, yr, enk, t, e_ref=0.5,
+    new = build_G_tau(xn, yr, enk, t, gemm=gemm, e_ref=0.5, E_min=E_MIN, E_max=E_MAX)
+    old = _build_G_tau_pre_refactor(xn, yr, enk, t, gemm=gemm, e_ref=0.5,
                                     mask=((enk > E_MIN) & (enk <= E_MAX)))
     assert np.array_equal(np.asarray(new), np.asarray(old))
 
-
-# ---------------------------------------------------------------------------
-# Face layout (low_mem_bands) — refusal ladder.  build_G/build_G_tau's
-# ``layout='face'`` numeric path needs a real distrib_la.GemmPlan (cuBLASMp,
-# CUDA-only today), so its algebra parity against layout='legacy' is
-# certified on the real 4-rank CUDA gate
-# (tests/multi_device/low_mem_bands_g_projection_hartree_gate.py), not here.
-# What IS certified on plain CPU, with no mesh and no gemm plan at all: the
-# static-layout dispatch refuses cleanly before ever touching one, and the
-# legacy default (``layout='legacy'``, exercised by every test above this
-# section) is untouched by the parameter's addition.
-# ---------------------------------------------------------------------------
 
 def test_build_G_rejects_unknown_layout():
     with pytest.raises(ValueError, match="layout"):
@@ -334,7 +332,7 @@ def test_build_G_tau_forwards_layout_and_gemm_to_build_G():
                    enk, 1.0, layout="face")
 
 
-def test_build_G_and_tau_apply_parent_unfold_after_the_only_contraction():
+def test_build_G_and_tau_apply_parent_unfold_after_the_only_contraction(gemm):
     class ParentRows:
         @staticmethod
         def unfold_operator(operator):
@@ -344,14 +342,14 @@ def test_build_G_and_tau_apply_parent_unfold_after_the_only_contraction():
                      + 1j)
     yr = jnp.asarray(np.arange(2 * 3 * 1 * 2).reshape(2, 3, 1, 2)
                      - 2j)
-    parent = build_G(xn, yr)
-    got = build_G(xn, yr, k_unfold_plan=ParentRows())
+    parent = build_G(xn, yr, gemm=gemm)
+    got = build_G(xn, yr, gemm=gemm, k_unfold_plan=ParentRows())
     np.testing.assert_array_equal(np.asarray(got),
                                   np.asarray(parent)[[1, 0, 1]])
 
     energy = jnp.asarray([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
-    parent_tau = build_G_tau(xn, yr, energy, 0.7)
+    parent_tau = build_G_tau(xn, yr, energy, 0.7, gemm=gemm)
     got_tau = build_G_tau(
-        xn, yr, energy, 0.7, k_unfold_plan=ParentRows())
+        xn, yr, energy, 0.7, gemm=gemm, k_unfold_plan=ParentRows())
     np.testing.assert_array_equal(np.asarray(got_tau),
                                   np.asarray(parent_tau)[[1, 0, 1]])

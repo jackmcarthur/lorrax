@@ -76,8 +76,7 @@ def _gamma_full(mu_L: int) -> np.ndarray:
 def check_vertex_build_g(mesh, dtype="complex128", *, mu_L, nu_L, ns=4,
                          mu=8, nb=6, nk=2):
     from gw.wavefunction_bundle import (
-        BandSlices, Wavefunctions, PSI_XN_SPEC, PSI_YR_SPEC,
-        PSI_MUN_SPEC, PSI_NMU_SPEC)
+        BandSlices, Wavefunctions, PSI_MUN_SPEC, PSI_NMU_SPEC)
     from gw.greens_function_kernel import build_G
     from distrib_la import gemm_plan
 
@@ -87,27 +86,17 @@ def check_vertex_build_g(mesh, dtype="complex128", *, mu_L, nu_L, ns=4,
     slices = BandSlices.from_band_edges(0, 0, 2, nb, nb)
     rep2 = _put(np.zeros((nk, nb)), mesh, (None, None))
 
-    wfns_legacy = Wavefunctions(
-        psi_xn=_put(psi_band_last, mesh, PSI_XN_SPEC),
-        psi_yr=_put(psi_np, mesh, PSI_YR_SPEC),
-        enk=rep2, occ=rep2, slices=slices,
-    )
     wfns_face = Wavefunctions(
         psi_mun=_put(psi_band_last, mesh, PSI_MUN_SPEC),
         psi_nmu=_put(psi_np, mesh, PSI_NMU_SPEC),
         enk=rep2, occ=rep2, slices=slices, layout="face",
     )
 
-    wfns_legacy_v = replace(wfns_legacy,
-        psi_xn=jnp.einsum("ab,kbxn->kaxn", _gamma_full(mu_L), wfns_legacy.psi_xn),
-        psi_yr=jnp.einsum("ab,knbx->knax", _gamma_full(nu_L), wfns_legacy.psi_yr))
     wfns_face_v = replace(wfns_face,
         psi_mun=jnp.einsum("ab,kbxn->kaxn", _gamma_full(mu_L), wfns_face.psi_mun),
         psi_nmu=jnp.einsum("ab,knbx->knax", _gamma_full(nu_L), wfns_face.psi_nmu))
 
     plan = gemm_plan(mesh, m=mu * ns, k=nb, n=mu * ns, nq=nk, dtype=dtype)
-    G_legacy = build_G(wfns_legacy_v.psi_xn, wfns_legacy_v.psi_yr,
-                       layout="legacy")
     G_face = build_G(wfns_face_v.psi_mun, wfns_face_v.psi_nmu,
                      layout="face", gemm=plan)
 
@@ -124,18 +113,14 @@ def check_vertex_build_g(mesh, dtype="complex128", *, mu_L, nu_L, ns=4,
     want = np.einsum("ksxn,knty->ksxty", psi_direct_ref,
                      np.conj(psi_conj_ref), optimize=True)
 
-    r_legacy = _rel(_gather(G_legacy), want)
     r_face = _rel(_gather(G_face), want)
-    assert r_legacy < RTOL, (
-        f"legacy vertex+G rel err {r_legacy:.3e} (mu_L={mu_L}, nu_L={nu_L})")
     assert r_face < RTOL, (
         f"face vertex+G rel err {r_face:.3e} (mu_L={mu_L}, nu_L={nu_L})")
-    return {"legacy": r_legacy, "face": r_face}
+    return {"face": r_face}
 
 
 # ---------------------------------------------------------------------------
-# 2. Full sigma_sx chain (build_G -> convolve -> project), legacy vs face,
-#    exactly compute_sigma_x_bispinor's own per-tile mechanism.
+# 2. Static Sigma chain versus literal NumPy q/band sums.
 # ---------------------------------------------------------------------------
 
 def check_sigma_sx_chain_matches_dense(
