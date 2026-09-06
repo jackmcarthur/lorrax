@@ -1,8 +1,10 @@
 # BISP-PROF-ZW — measured compilation and coupled-current fixes
 
+**6x6 follow-up:** source commits `6effddb5` + `9e31a1a7` are pushed on `perf/bisp-prof-zw-green-reuse-2026-09-06`, unmerged, on orchestrator production pin71ae0bde. One Green/FFT pair per family class reduces P4 warm chi2.724→1.092s and cached screening25.98→24.67s; EQP0/1 and all sectors are printed exact. Fresh common current-fit transaction P/F17.332/16.760s; fresh files are finite but not identical. See [Chi Green reuse and fresh zeta on6x6](#chi-green-reuse-and-fresh-zeta-on-6x6) for the new evidence, memory and pool scope. The sections preceding that follow-up describe the earlier3x3/Si task and its historical commit pins.
+
 Measured disposition on branch `perf/bisp-prof-zw-2026-09-06`, **unmerged**. Pinned before-change P=`9f569c4bf75bad40e4f5895946874b4c503e4410`; fixed-main F=`e1559a071e244b4f049c924781b668d9e1560739`. Adoptable pushed fixes: restore executable reuse `87a2bfaa`, chi vertex shape classes `0f8fbc3e`, coupled-current tail sharing `f811f734`. MoS2 full-static screening31.21→18.59s; total201.36→146.56s; EQP0/1 and every CC/TT/CT row exact. Coupled-current tail sharing now passes its production fresh-fit and downstream identity gate; its warm tile is39.31ms versus51.00ms before.
 
-All new science uses authorized campaign pool **57966610**, `--wait 1800`, one P4 node at a time, one rank/GPU, BFC@0.85, persistent compilation cache OFF and `LORRAX_DEBUG_PRINT=1`. F and P are sequential. No Sigma source was edited. Restore execution is charged to the Sigma consumer, not screening. Paths below are relative to the sandbox unless prefixed `reports/`; M=`runs/MoS2/41_bisp_parent_route_2026-09-05/prof_zw/`, S=`runs/Si/100_bisp_parent_route_2026-09-05/prof_zw/`, D=`runs/DEV/112_bisp_prof_zw_codex_2026-09-06/`.
+The initial investigation uses authorized campaign pool **57966610**, `--wait 1800`, one P4 node at a time, one rank/GPU, BFC@0.85, persistent compilation cache OFF and `LORRAX_DEBUG_PRINT=1`. F and P are sequential. No Sigma source was edited. Restore execution is charged to the Sigma consumer, not screening. Paths below are relative to the sandbox unless prefixed `reports/`; M=`runs/MoS2/41_bisp_parent_route_2026-09-05/prof_zw/`, S=`runs/Si/100_bisp_parent_route_2026-09-05/prof_zw/`, D=`runs/DEV/112_bisp_prof_zw_codex_2026-09-06/`.
 
 ## Objective and preregistered candidates
 
@@ -340,3 +342,61 @@ Tile profiles49/50 use the same46080 grid points but the automatic tile widths d
 P first charge tiles4613.039/991.086/990.294/990.744ms, first current2495.195/874.512/873.988ms; F first charge4117.258/2846.232ms, first current2261.911/944.132/1129.117ms. Shape changes explain the F remainder compilation. Native representative current tile P874.449030ms/884 GPU operations versus F948.829273ms/1313 operations; optimized peak7,024,623,572 versus7,885,377,476 bytes. Each HLO has one static all-to-all, all-gather and all-reduce outside the streamed parent tail; these site counts are not dynamic launch counts.
 
 All four canonical files were compared in63 using compare_zeta_h5.py; the numerical differences and finite counts above are the fresh P/F result. No fresh-fit identity is claimed. The exact acceptance gate for the chi source change uses the same copied P zeta files and11-node schedule.
+
+
+### Native kernel accounting and remaining fit cost
+
+Native receipts in61/72 (`stats_cuda_gpu_kern_sum.csv`, `stats_nvtx_gpu_proj_sum.csv`) separate service communication from explicit HLO collectives. Kernel durations below are sums over the captured rank-zero range, not additive wall-time partitions; ranges may overlap and module projections include idle gaps.
+
+| kernel class, summed ms | old single TT block61 | new nine-block TT class72 |
+|---|---:|---:|
+| NCCL service kernels |53.769|48.119|
+| GEMMs including spin action |17.127|17.121|
+| FFTs and normalization |8.886|9.069|
+| transpose fusions |9.113|49.239|
+| dynamic accumulator updates |0|1.428|
+| other kernels/fusions |1.420|2.414|
+
+The two endpoint Green service ranges project42.627+42.532ms before and40.482+39.951ms after. Each range executes11 times, not99. Both captures have3168 NCCL launches and1595 GEMM launches across the range: retaining nine outputs does not multiply distributed Green construction. The smaller dense spin GEMM executes11 times and totals≈1.05ms. Its phase/gather/transposes are fused; no independent seam or spin-only time is invented from a generic fusion name. Streaming adds99 accumulator-update launches,1.428ms; the new vertex input transpose totals44.997ms. This is the measured tradeoff for the reduction352→88 Green builds/Green FFTs per sweep. Warm64/65 versus72 isolates the compile/vertex-loop tradeoff described above.
+
+Fresh current tiles49/50 remain bounded by different layouts and tile widths. Across each captured range, transpose-fusion kernel sums P545.361ms/F67.590ms, GEMMs24.266/384.874ms, FFT+normalization85.384/118.527ms, dynamic updates67.323/48.798ms, NCCL4.580/27.039ms. These labels are generated-kernel classes, not a new attribution of every transpose to spin transport. P's reduced GEMM work does not imply a faster same-grid fit: the full warm-tile sums and common transaction walls show the remaining cost. No zeta source change is proposed from this unequal-tile capture alone.
+
+Follow-up comparison73 (`lx-Xg0-122412-518038-2249`, JID57986810, exit0) runs compare_zeta_h5.py against every file produced by the common transaction timers68/69. All four are finite and reproduce the same maximum differences as63. A zero-tolerance comparison fails for each P/F pair; that numerical result is retained rather than treating the comparison process exit0 as identity.
+
+The baseline71ae0bde and accepted-source sandbox gate0 logs are byte-identical (`D/gate0_six_pinned.log`, `D/gate0_six_after.log`): AST suites pass; the aggregate fails on inherited rule-allowlist findings and twelve pre-existing ledger rows. This is a scoped before/after check, not a claim of a clean repository-wide gate.
+
+
+### Fixed-main warm screening control
+
+Claim1283: fresh F75 `lx-Xg4-122636-528904-3333`, JID57986810, exit0; both EQP files210/210 and CC/TT/CT rows are exact to unprofiled F52. Supplemental cached F74 was refused by the fixed-main slab-COHSEX restart gate (step `lx-Xg4-122512-523232-8565`, exit1); its artifacts are preserved and the harness limitation is registered.75 uses the supported fresh path, with no source/gate bypass.
+
+| synchronized chi unit | F75 | P baseline61 | P accepted72 |
+|---|---:|---:|---:|
+| first complete sweep s |11.337390|14.169094|12.627803|
+| first compile events / compiler s |39 /7.814892|48 /9.247814|48 /9.499476|
+| warm CC sweep ms |441.704|449.675|437.134|
+| warm CT sweep ms |600.504|627.431|244.984|
+| warm TC sweep ms |601.011|628.755|242.692|
+| warm TT sweep ms |976.076|1018.269|167.394|
+| warm complete sweep s |2.619295|2.724131|1.092205|
+| warm compile events |0|0|0|
+
+Parent Green reuse now beats fixed-main's unchanged singleton loop in steady state. Native F TT one-block projection103.312531ms/6464 GPU operations, versus P old107.428298ms/6462 and P nine-block class148.173355ms/7297. F HLO peaks CC2,706,078,096B; CT939,855,392; TC939,854,880; TT325,283,968. P baseline -> accepted peaks CC2,606,656,548 ->2,606,656,548; CT874,187,764 ->949,829,044; TC874,187,252 ->949,828,532; TT292,797,140 ->386,840,612. The largest chi executable remains CC; the TT class's extra outputs increase its own peak without exceeding CC.
+
+Residual cold gap: the uninstrumented parent cached screening24.67s is still above F fresh17.37s, with different supported fresh/restart setup paths. The direct first-call chi sweep remains1.290s slower than F, while warmed chi is1.527s faster. This measurement justifies the class change but does not attribute the entire screening-stage remainder to chi or claim a full-driver speedup against F. Per-stage buckets and their support work must stay separate from the isolated unit receipts.
+
+Tile-capture provenance:49 `lx-Xg4-113659-233239-8665`,50 `lx-Xg4-113936-250273-5479`, shared JID57982945, both successful intentional post-zeta runs. CPU63 is `lx-Xg0-115754-378712-4689`, owned JID57986810. The bounded six_run_audit.json records every launch, artifact scope and failed/unlaunched variant; reports/instruments and six_*_receipts retain the parser inputs.
+
+
+### Follow-up disposition and integration
+
+Claim1284. Adopt source commits `6effddb5` and `9e31a1a7`, in that order, from pushed branch `perf/bisp-prof-zw-green-reuse-2026-09-06` (unmerged). The second commit replaces the first commit's unrolled vertex contractions with the measured streamed loop. Both are based on orchestrator71ae0bde; no Sigma source change or new symmetry rule is included. The historical87a2bfaa restore patch is not part of this follow-up recommendation; orchestrator already owns the newer restore implementation.
+
+The accepted data flow is two Green tensors and their FFTs per family pair per tau, then1/3/3/9 ordered vertex contractions into per-class distributed accumulators. The public singleton wrapper uses the same owner. The old per-block Green path and duplicated packer lifetime are replaced, not retained as selectable production paths. Green payload scales16 K ns² M_A M_B/P per endpoint, and the class accumulators/output scale16 n_vertices K M_A M_B/P. Band count and parent count enter the endpoint face payload16 n_parent ns M_A nb/P and the Green build work, not the quadratic Green storage. No centroid-quadratic object is replicated onto fewer than all ranks; files remain canonical/P-agnostic; typed symmetry actions, q-IBZ output, ordered orientation, Ward contact and packed Dyson stay with their existing owners.
+
+P16 was requested in66 with `--jid57982945 --wait1800 -N4 -G4 -n16`. After approximately ten minutes queued, the shared pool had7/16 GPUs free across its four nodes (`D/shared_pool_p16_final_status.log`); this lane's waiting client was cancelled before it launched a science step. The owned fallback57986810 has one node. Thus P16 before/after, measured P16 carrier extents and P16 peaks are **unrun**, not inferred from P4. The baseline pin was restored to the accepted source in a finally block; git diff HEAD -- src services tests is empty and p16_source_restored.txt records restoration. No shared pool or other lane job was cancelled.
+
+Final validation scope: all same-source P4 science gates are printed exact,13 CPU cases pass, fresh P/F zeta comparisons explicitly retain nonzero differences, native captures are valid, and before/after sandbox gate0 has identical inherited findings. Failed48/74 and unlaunched51/66 remain preserved. The warm chi penalty is removed on the6x6 deck; the common fresh zeta transaction is still slower on P, and cold screening retains support/compilation overhead outside the isolated chi improvement. No inherent tiny-system explanation or unmeasured P16 speedup is asserted.
+
+
+Six-by-six durable archive: `/global/cfs/cdirs/m4598/jackm/lorrax_evidence/bisp_prof_zw_6x6_2026-09-06/evidence.tar`; 6746 files, 1304565760 bytes, SHA256 `3af4b6f04af224bf8a69fa1e27a400bb825e2a8fa3b8fede67f66e15985c973c`. Every member verified: 6746 checked, zero missing/mismatched. The archive retains this follow-up's native captures, rank-zero optimized HLO, original canonical P/F zeta, step/parser receipts and exact source snapshots. The final report and archive receipt are also copied beside it after closure. Owned pool57986810 was released after confirming that only its extern step remained (`D/six_pool_release.log`); shared57982945 remains its owner's allocation.

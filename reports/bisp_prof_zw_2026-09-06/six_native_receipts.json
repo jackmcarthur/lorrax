@@ -1,0 +1,2132 @@
+{
+  "49_P6_fresh_units": {
+    "kernel_classes": {
+      "transpose fusion": {
+        "kernel_ms": 545.3612629999999,
+        "launches": 582
+      },
+      "dynamic update": {
+        "kernel_ms": 67.32271899999999,
+        "launches": 51
+      },
+      "FFT and normalization": {
+        "kernel_ms": 85.383509,
+        "launches": 134
+      },
+      "other fusion/kernel": {
+        "kernel_ms": 113.10023199999999,
+        "launches": 1619
+      },
+      "GEMM": {
+        "kernel_ms": 24.265578,
+        "launches": 10
+      },
+      "collective service (NCCL)": {
+        "kernel_ms": 4.580195,
+        "launches": 15
+      }
+    },
+    "ranges": [
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_fn,program_id=536#",
+        "projected_ms": 874.44903,
+        "instances": 1,
+        "gpu_ops": 884
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=while.82#",
+        "projected_ms": 827.55092,
+        "instances": 1,
+        "gpu_ops": 800
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.82_body#",
+        "projected_ms": 827.496968,
+        "instances": 16,
+        "gpu_ops": 800
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=while.85#",
+        "projected_ms": 590.923071,
+        "instances": 16,
+        "gpu_ops": 576
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.85_body#",
+        "projected_ms": 590.816448,
+        "instances": 48,
+        "gpu_ops": 576
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=while.84#",
+        "projected_ms": 380.070651,
+        "instances": 48,
+        "gpu_ops": 192
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_66#",
+        "projected_ms": 379.844445,
+        "instances": 192,
+        "gpu_ops": 192
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.84_body#",
+        "projected_ms": 379.844445,
+        "instances": 192,
+        "gpu_ops": 192
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=while.83#",
+        "projected_ms": 126.63218,
+        "instances": 16,
+        "gpu_ops": 64
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_43#",
+        "projected_ms": 126.556756,
+        "instances": 64,
+        "gpu_ops": 64
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.83_body#",
+        "projected_ms": 126.556756,
+        "instances": 64,
+        "gpu_ops": 64
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/while/body/closed_call/jit(fft)/fft,hlo_op=fft.21.0#",
+        "projected_ms": 91.649578,
+        "instances": 48,
+        "gpu_ops": 144
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_dynamic_update_slice_fusion.1#",
+        "projected_ms": 65.242189,
+        "instances": 48,
+        "gpu_ops": 48
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/while/body/closed_call,hlo_op=input_transpose_fusion.4#",
+        "projected_ms": 31.89964,
+        "instances": 48,
+        "gpu_ops": 48
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.74#",
+        "projected_ms": 30.553507,
+        "instances": 1,
+        "gpu_ops": 65
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.74_body#",
+        "projected_ms": 30.548803,
+        "instances": 5,
+        "gpu_ops": 65
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/jit(fft)/fft,hlo_op=fft.20.0#",
+        "projected_ms": 30.528965,
+        "instances": 16,
+        "gpu_ops": 48
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=copy.92#",
+        "projected_ms": 30.022118,
+        "instances": 16,
+        "gpu_ops": 16
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_59#",
+        "projected_ms": 21.322078,
+        "instances": 48,
+        "gpu_ops": 48
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_broadcast_fusion.1#",
+        "projected_ms": 20.660834,
+        "instances": 16,
+        "gpu_ops": 16
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/kamn,knbr->kambr/dot_general,hlo_op=cublas-batch-gemm.5#",
+        "projected_ms": 12.134165,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/kamn,knbr->kambr/dot_general,hlo_op=cublas-batch-gemm.4#",
+        "projected_ms": 12.131413,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call,hlo_op=loop_multiply_fusion.2#",
+        "projected_ms": 10.67667,
+        "instances": 16,
+        "gpu_ops": 16
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call,hlo_op=input_transpose_fusion.5#",
+        "projected_ms": 10.606429,
+        "instances": 16,
+        "gpu_ops": 16
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=while.78#",
+        "projected_ms": 7.814096,
+        "instances": 1,
+        "gpu_ops": 15
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.78_body#",
+        "projected_ms": 7.811888,
+        "instances": 3,
+        "gpu_ops": 15
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_35#",
+        "projected_ms": 7.133394,
+        "instances": 16,
+        "gpu_ops": 16
+      },
+      {
+        "range": "NCCL:ncclGroupEnd",
+        "projected_ms": 4.580195,
+        "instances": 15,
+        "gpu_ops": 15
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_1#",
+        "projected_ms": 4.071911,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/jit(fft)/fft,hlo_op=fft.19.0#",
+        "projected_ms": 3.832457,
+        "instances": 3,
+        "gpu_ops": 6
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/all_gather,hlo_op=all-gather-start#",
+        "projected_ms": 2.856494,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_dynamic_update_slice_fusion#",
+        "projected_ms": 2.08053,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while,hlo_op=input_transpose_fusion.6#",
+        "projected_ms": 1.904468,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_dynamic_slice_fusion#",
+        "projected_ms": 1.882453,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/all_to_all,hlo_op=all_to_all.22.1#",
+        "projected_ms": 1.365815,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_broadcast_fusion.5#",
+        "projected_ms": 1.288792,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_27#",
+        "projected_ms": 1.254616,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_select_fusion.1#",
+        "projected_ms": 0.7655,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call,hlo_op=loop_complex_fusion#",
+        "projected_ms": 0.445373,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=all-reduce-start#",
+        "projected_ms": 0.357886,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/all_to_all,hlo_op=loop_transpose_fusion#",
+        "projected_ms": 0.319582,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/while/body,hlo_op=loop_multiply_fusion.1#",
+        "projected_ms": 0.134751,
+        "instances": 48,
+        "gpu_ops": 48
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_add_fusion.4#",
+        "projected_ms": 0.105118,
+        "instances": 48,
+        "gpu_ops": 48
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_dynamic_slice_fusion.8#",
+        "projected_ms": 0.050943,
+        "instances": 16,
+        "gpu_ops": 16
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_add_fusion.5#",
+        "projected_ms": 0.037663,
+        "instances": 16,
+        "gpu_ops": 16
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_select_fusion.2#",
+        "projected_ms": 0.01936,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_multiply_fusion#",
+        "projected_ms": 0.01376,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_select_fusion#",
+        "projected_ms": 0.012864,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_add_fusion#",
+        "projected_ms": 0.012832,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(convert_element_type)/convert_element_type,hlo_op=wrapped_convert#",
+        "projected_ms": 0.012352,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_convert_element_type,program_id=534#",
+        "projected_ms": 0.012352,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_and_fusion#",
+        "projected_ms": 0.011903,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_add_fusion.1#",
+        "projected_ms": 0.006528,
+        "instances": 3,
+        "gpu_ops": 3
+      }
+    ]
+  },
+  "50_F6_fresh_units": {
+    "kernel_classes": {
+      "GEMM": {
+        "kernel_ms": 384.87379,
+        "launches": 320
+      },
+      "other fusion/kernel": {
+        "kernel_ms": 297.05231699999996,
+        "launches": 1660
+      },
+      "FFT and normalization": {
+        "kernel_ms": 118.526904,
+        "launches": 134
+      },
+      "transpose fusion": {
+        "kernel_ms": 67.58991700000001,
+        "launches": 72
+      },
+      "dynamic update": {
+        "kernel_ms": 48.798438000000004,
+        "launches": 51
+      },
+      "collective service (NCCL)": {
+        "kernel_ms": 27.038968,
+        "launches": 15
+      }
+    },
+    "ranges": [
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_fn,program_id=594#",
+        "projected_ms": 948.829273,
+        "instances": 1,
+        "gpu_ops": 1313
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=while.89#",
+        "projected_ms": 887.27114,
+        "instances": 1,
+        "gpu_ops": 1216
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.89_body#",
+        "projected_ms": 887.221861,
+        "instances": 16,
+        "gpu_ops": 1216
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=while.92#",
+        "projected_ms": 694.87133,
+        "instances": 16,
+        "gpu_ops": 768
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.92_body#",
+        "projected_ms": 694.834146,
+        "instances": 48,
+        "gpu_ops": 768
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=while.91#",
+        "projected_ms": 330.268626,
+        "instances": 48,
+        "gpu_ops": 240
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_69#",
+        "projected_ms": 329.824854,
+        "instances": 240,
+        "gpu_ops": 240
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.91_body#",
+        "projected_ms": 329.824854,
+        "instances": 240,
+        "gpu_ops": 240
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/while/body/closed_call/jit(fft)/fft,hlo_op=fft.21.0#",
+        "projected_ms": 127.094074,
+        "instances": 48,
+        "gpu_ops": 144
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_add_fusion.5#",
+        "projected_ms": 116.78701,
+        "instances": 48,
+        "gpu_ops": 48
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=while.90#",
+        "projected_ms": 110.320444,
+        "instances": 16,
+        "gpu_ops": 320
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.90_body#",
+        "projected_ms": 110.244605,
+        "instances": 80,
+        "gpu_ops": 320
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/while/body/closed_call/kmn,knr->krm/dot_general,hlo_op=cublas-batch-gemm.5#",
+        "projected_ms": 96.261076,
+        "instances": 80,
+        "gpu_ops": 80
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_dynamic_update_slice_fusion.3#",
+        "projected_ms": 45.865394,
+        "instances": 48,
+        "gpu_ops": 48
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/while/body/closed_call/while,hlo_op=wrapped_transpose.2#",
+        "projected_ms": 44.625399,
+        "instances": 48,
+        "gpu_ops": 48
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/jit(fft)/fft,hlo_op=fft.20.0#",
+        "projected_ms": 42.366525,
+        "instances": 16,
+        "gpu_ops": 48
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=while.75#",
+        "projected_ms": 38.287918,
+        "instances": 1,
+        "gpu_ops": 45
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.75_body#",
+        "projected_ms": 38.283278,
+        "instances": 5,
+        "gpu_ops": 45
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_broadcast_fusion#",
+        "projected_ms": 29.121745,
+        "instances": 48,
+        "gpu_ops": 48
+      },
+      {
+        "range": "NCCL:ncclGroupEnd",
+        "projected_ms": 27.038968,
+        "instances": 15,
+        "gpu_ops": 15
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/all_gather,hlo_op=all-gather-start#",
+        "projected_ms": 18.259034,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/while,hlo_op=wrapped_transpose.1#",
+        "projected_ms": 14.873287,
+        "instances": 16,
+        "gpu_ops": 16
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call,hlo_op=loop_complex_fusion#",
+        "projected_ms": 14.761288,
+        "instances": 16,
+        "gpu_ops": 16
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_dynamic_slice_fusion.4#",
+        "projected_ms": 13.121836,
+        "instances": 80,
+        "gpu_ops": 80
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=while.85#",
+        "projected_ms": 11.112438,
+        "instances": 1,
+        "gpu_ops": 15
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.85_body#",
+        "projected_ms": 11.110294,
+        "instances": 3,
+        "gpu_ops": 15
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_46#",
+        "projected_ms": 9.819515,
+        "instances": 16,
+        "gpu_ops": 16
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/all_to_all,hlo_op=all_to_all.14.1#",
+        "projected_ms": 8.321984,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/jit(fft)/fft,hlo_op=fft.19.0#",
+        "projected_ms": 5.303052,
+        "instances": 3,
+        "gpu_ops": 6
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_dynamic_slice_fusion.1#",
+        "projected_ms": 3.36245,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=conditional.1.clone#",
+        "projected_ms": 3.227157,
+        "instances": 5,
+        "gpu_ops": 10
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=loop_transpose_fusion.1#",
+        "projected_ms": 3.14258,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=conditional.1.clone_branch_region_1.1_spmd#",
+        "projected_ms": 3.137173,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_dynamic_slice_fusion#",
+        "projected_ms": 3.137173,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_dynamic_update_slice_fusion.2#",
+        "projected_ms": 2.933044,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_dynamic_slice_fusion.2#",
+        "projected_ms": 2.857558,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_dynamic_update_slice_fusion#",
+        "projected_ms": 2.840886,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while,hlo_op=input_transpose_fusion#",
+        "projected_ms": 2.736117,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/all_to_all,hlo_op=loop_transpose_fusion#",
+        "projected_ms": 2.180503,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_broadcast_fusion.4#",
+        "projected_ms": 1.967769,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_broadcast_fusion.2#",
+        "projected_ms": 1.804409,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_broadcast_fusion.3#",
+        "projected_ms": 1.785785,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.76#",
+        "projected_ms": 0.599294,
+        "instances": 1,
+        "gpu_ops": 25
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.76_body#",
+        "projected_ms": 0.594718,
+        "instances": 5,
+        "gpu_ops": 25
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=all-reduce-start#",
+        "projected_ms": 0.45795,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_multiply_fusion.2#",
+        "projected_ms": 0.384703,
+        "instances": 80,
+        "gpu_ops": 80
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_add_fusion.4#",
+        "projected_ms": 0.20576,
+        "instances": 80,
+        "gpu_ops": 80
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_dynamic_slice_fusion.5#",
+        "projected_ms": 0.143295,
+        "instances": 48,
+        "gpu_ops": 48
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=copy.78#",
+        "projected_ms": 0.109375,
+        "instances": 48,
+        "gpu_ops": 48
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_add_fusion.6#",
+        "projected_ms": 0.108831,
+        "instances": 48,
+        "gpu_ops": 48
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/while/body/closed_call/iota,hlo_op=wrapped_iota.6#",
+        "projected_ms": 0.10064,
+        "instances": 48,
+        "gpu_ops": 48
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_1#",
+        "projected_ms": 0.059456,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_select_fusion.1#",
+        "projected_ms": 0.039552,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_add_fusion.7#",
+        "projected_ms": 0.037024,
+        "instances": 16,
+        "gpu_ops": 16
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/while/body/closed_call/iota,hlo_op=wrapped_iota.4#",
+        "projected_ms": 0.033472,
+        "instances": 16,
+        "gpu_ops": 16
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=wrapped_transpose#",
+        "projected_ms": 0.032031,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_dynamic_update_slice_fusion.1#",
+        "projected_ms": 0.021088,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=copy.1#",
+        "projected_ms": 0.020704,
+        "instances": 12,
+        "gpu_ops": 12
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=loop_dynamic_slice_fusion#",
+        "projected_ms": 0.013152,
+        "instances": 6,
+        "gpu_ops": 6
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_and_fusion.2#",
+        "projected_ms": 0.012704,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_add_fusion#",
+        "projected_ms": 0.01232,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_and_compare_fusion#",
+        "projected_ms": 0.011328,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_add_fusion.1#",
+        "projected_ms": 0.00816,
+        "instances": 5,
+        "gpu_ops": 5
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map,hlo_op=loop_add_fusion.2#",
+        "projected_ms": 0.006592,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_dynamic_slice,program_id=392#",
+        "projected_ms": 0.006592,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_dynamic_slice,program_id=388#",
+        "projected_ms": 0.00656,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_squeeze,program_id=390#",
+        "projected_ms": 0.005632,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_broadcast_in_dim,program_id=586#",
+        "projected_ms": 0.005152,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_broadcast_in_dim,program_id=590#",
+        "projected_ms": 0.00496,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_squeeze,program_id=394#",
+        "projected_ms": 0.00496,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(concatenate)/concatenate,hlo_op=wrapped_concatenate#",
+        "projected_ms": 0.003648,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=copy.61#",
+        "projected_ms": 0.0024,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/iota,hlo_op=wrapped_iota#",
+        "projected_ms": 0.00224,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/iota,hlo_op=wrapped_iota.1#",
+        "projected_ms": 0.002176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(fn)/shard_map/iota,hlo_op=wrapped_iota.2#",
+        "projected_ms": 0.002176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_concatenate,program_id=588#",
+        "projected_ms": 0.001984,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=copy.49#",
+        "projected_ms": 0.00176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_concatenate,program_id=592#",
+        "projected_ms": 0.001664,
+        "instances": 1,
+        "gpu_ops": 1
+      }
+    ]
+  },
+  "61_P6_chi_before_units": {
+    "kernel_classes": {
+      "collective service (NCCL)": {
+        "kernel_ms": 53.769371,
+        "launches": 3168
+      },
+      "GEMM": {
+        "kernel_ms": 17.126873,
+        "launches": 1595
+      },
+      "FFT and normalization": {
+        "kernel_ms": 8.886235000000001,
+        "launches": 69
+      },
+      "transpose fusion": {
+        "kernel_ms": 9.1133,
+        "launches": 44
+      },
+      "other fusion/kernel": {
+        "kernel_ms": 1.41977,
+        "launches": 70
+      }
+    },
+    "ranges": [
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=355#",
+        "projected_ms": 107.428298,
+        "instances": 1,
+        "gpu_ops": 6462
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.8#",
+        "projected_ms": 107.328362,
+        "instances": 1,
+        "gpu_ops": 6457
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.8_body#",
+        "projected_ms": 107.303082,
+        "instances": 11,
+        "gpu_ops": 6457
+      },
+      {
+        "range": "NCCL:ncclGroupEnd",
+        "projected_ms": 56.780815,
+        "instances": 1584,
+        "gpu_ops": 3168
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.17#",
+        "projected_ms": 42.627015,
+        "instances": 11,
+        "gpu_ops": 3168
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.15#",
+        "projected_ms": 42.531719,
+        "instances": 11,
+        "gpu_ops": 3168
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=input_transpose_fusion#",
+        "projected_ms": 4.868012,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/shard_map/ffi_call,hlo_op=ffi_call.18#",
+        "projected_ms": 4.505037,
+        "instances": 11,
+        "gpu_ops": 33
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/shard_map/ffi_call,hlo_op=ffi_call.16#",
+        "projected_ms": 4.436781,
+        "instances": 11,
+        "gpu_ops": 33
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_4#",
+        "projected_ms": 4.256524,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc),hlo_op=loop_transpose_fusion#",
+        "projected_ms": 1.945046,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc),hlo_op=loop_transpose_fusion.1#",
+        "projected_ms": 1.933142,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.19#",
+        "projected_ms": 0.027136,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=copy.1#",
+        "projected_ms": 0.025408,
+        "instances": 15,
+        "gpu_ops": 15
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/add,hlo_op=loop_add_fusion#",
+        "projected_ms": 0.025119,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=loop_dynamic_slice_fusion#",
+        "projected_ms": 0.01312,
+        "instances": 6,
+        "gpu_ops": 6
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/broadcast_in_dim,hlo_op=loop_broadcast_fusion.1#",
+        "projected_ms": 0.0088,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_convert_element_type,program_id=1#",
+        "projected_ms": 0.00464,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(_take),hlo_op=loop_select_fusion#",
+        "projected_ms": 0.00416,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit__take,program_id=191#",
+        "projected_ms": 0.00416,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_dynamic_slice,program_id=197#",
+        "projected_ms": 0.004,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_dynamic_slice,program_id=201#",
+        "projected_ms": 0.004,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_broadcast_in_dim,program_id=63#",
+        "projected_ms": 0.003712,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:Thunk:#name=,hlo_op=loop_broadcast_fusion#",
+        "projected_ms": 0.003488,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_convert_element_type,program_id=61#",
+        "projected_ms": 0.003392,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_squeeze,program_id=199#",
+        "projected_ms": 0.003328,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_convert_element_type,program_id=173#",
+        "projected_ms": 0.003296,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_squeeze,program_id=203#",
+        "projected_ms": 0.003296,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(conjugate),hlo_op=loop_complex_fusion#",
+        "projected_ms": 0.003264,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_conjugate,program_id=205#",
+        "projected_ms": 0.003264,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=loop_select_fusion#",
+        "projected_ms": 0.00304,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit__take,program_id=390#",
+        "projected_ms": 0.00304,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_gather,program_id=119#",
+        "projected_ms": 0.002624,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_gather,program_id=123#",
+        "projected_ms": 0.002496,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(subtract)/sub,hlo_op=loop_subtract_fusion#",
+        "projected_ms": 0.002176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_subtract,program_id=195#",
+        "projected_ms": 0.002176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_broadcast_in_dim,program_id=125#",
+        "projected_ms": 0.00192,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_broadcast_in_dim,program_id=121#",
+        "projected_ms": 0.001824,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=copy.53#",
+        "projected_ms": 0.00176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=jit(band_mask),hlo_module=jit_band_mask,program_id=301#",
+        "projected_ms": 0.00176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=jit(band_mask),hlo_module=jit_band_mask,program_id=299#",
+        "projected_ms": 0.001728,
+        "instances": 1,
+        "gpu_ops": 1
+      }
+    ]
+  },
+  "65_P6_class_units": {
+    "kernel_classes": {
+      "collective service (NCCL)": {
+        "kernel_ms": 53.394728,
+        "launches": 3168
+      },
+      "GEMM": {
+        "kernel_ms": 17.129274000000002,
+        "launches": 1595
+      },
+      "transpose fusion": {
+        "kernel_ms": 37.408789,
+        "launches": 143
+      },
+      "FFT and normalization": {
+        "kernel_ms": 9.108568,
+        "launches": 93
+      },
+      "other fusion/kernel": {
+        "kernel_ms": 1.944827,
+        "launches": 302
+      }
+    },
+    "ranges": [
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=403#",
+        "projected_ms": 136.267897,
+        "instances": 1,
+        "gpu_ops": 6475
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.24#",
+        "projected_ms": 135.891899,
+        "instances": 1,
+        "gpu_ops": 6446
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.24_body#",
+        "projected_ms": 135.871259,
+        "instances": 11,
+        "gpu_ops": 6446
+      },
+      {
+        "range": "NCCL:ncclGroupEnd",
+        "projected_ms": 56.539256,
+        "instances": 1584,
+        "gpu_ops": 3168
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.41#",
+        "projected_ms": 42.8404,
+        "instances": 11,
+        "gpu_ops": 3168
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.39#",
+        "projected_ms": 42.229138,
+        "instances": 11,
+        "gpu_ops": 3168
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_34#",
+        "projected_ms": 33.17542,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_4#",
+        "projected_ms": 4.591499,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/shard_map/ffi_call,hlo_op=ffi_call.42#",
+        "projected_ms": 4.52539,
+        "instances": 11,
+        "gpu_ops": 33
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/shard_map/ffi_call,hlo_op=ffi_call.40#",
+        "projected_ms": 4.435499,
+        "instances": 11,
+        "gpu_ops": 33
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc),hlo_op=loop_transpose_fusion#",
+        "projected_ms": 1.945116,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc),hlo_op=loop_transpose_fusion.1#",
+        "projected_ms": 1.928222,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/broadcast_in_dim,hlo_op=loop_broadcast_fusion.1#",
+        "projected_ms": 0.103807,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=copy.1#",
+        "projected_ms": 0.077312,
+        "instances": 47,
+        "gpu_ops": 47
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=loop_dynamic_slice_fusion#",
+        "projected_ms": 0.072352,
+        "instances": 38,
+        "gpu_ops": 38
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_dynamic_slice,program_id=201#",
+        "projected_ms": 0.034368,
+        "instances": 18,
+        "gpu_ops": 18
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_dynamic_slice,program_id=197#",
+        "projected_ms": 0.032672,
+        "instances": 18,
+        "gpu_ops": 18
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=loop_select_fusion#",
+        "projected_ms": 0.032448,
+        "instances": 9,
+        "gpu_ops": 9
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit__take,program_id=630#",
+        "projected_ms": 0.032448,
+        "instances": 9,
+        "gpu_ops": 9
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_squeeze,program_id=199#",
+        "projected_ms": 0.029888,
+        "instances": 18,
+        "gpu_ops": 18
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(conjugate),hlo_op=loop_complex_fusion#",
+        "projected_ms": 0.029088,
+        "instances": 18,
+        "gpu_ops": 18
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_conjugate,program_id=205#",
+        "projected_ms": 0.029088,
+        "instances": 18,
+        "gpu_ops": 18
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_squeeze,program_id=203#",
+        "projected_ms": 0.028544,
+        "instances": 18,
+        "gpu_ops": 18
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.43#",
+        "projected_ms": 0.028384,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.45#",
+        "projected_ms": 0.027552,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.48#",
+        "projected_ms": 0.027392,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.49#",
+        "projected_ms": 0.027296,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.51#",
+        "projected_ms": 0.027264,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.44#",
+        "projected_ms": 0.027135,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.47#",
+        "projected_ms": 0.027072,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.50#",
+        "projected_ms": 0.027072,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.46#",
+        "projected_ms": 0.02704,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_convert_element_type,program_id=1#",
+        "projected_ms": 0.00464,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(_take),hlo_op=loop_select_fusion#",
+        "projected_ms": 0.00416,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit__take,program_id=191#",
+        "projected_ms": 0.00416,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_broadcast_in_dim,program_id=63#",
+        "projected_ms": 0.00368,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:Thunk:#name=,hlo_op=loop_broadcast_fusion#",
+        "projected_ms": 0.00352,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_convert_element_type,program_id=61#",
+        "projected_ms": 0.00352,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_convert_element_type,program_id=173#",
+        "projected_ms": 0.003296,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_gather,program_id=119#",
+        "projected_ms": 0.002816,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_gather,program_id=123#",
+        "projected_ms": 0.002496,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(subtract)/sub,hlo_op=loop_subtract_fusion#",
+        "projected_ms": 0.002176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_subtract,program_id=195#",
+        "projected_ms": 0.002176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_broadcast_in_dim,program_id=125#",
+        "projected_ms": 0.00192,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=copy.133#",
+        "projected_ms": 0.001856,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_broadcast_in_dim,program_id=121#",
+        "projected_ms": 0.001824,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=jit(band_mask),hlo_module=jit_band_mask,program_id=323#",
+        "projected_ms": 0.00176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=jit(band_mask),hlo_module=jit_band_mask,program_id=325#",
+        "projected_ms": 0.00176,
+        "instances": 1,
+        "gpu_ops": 1
+      }
+    ]
+  },
+  "72_P6_streamed_units": {
+    "kernel_classes": {
+      "collective service (NCCL)": {
+        "kernel_ms": 48.119397,
+        "launches": 3168
+      },
+      "transpose fusion": {
+        "kernel_ms": 49.238523,
+        "launches": 132
+      },
+      "GEMM": {
+        "kernel_ms": 17.120711999999997,
+        "launches": 1595
+      },
+      "FFT and normalization": {
+        "kernel_ms": 9.069167,
+        "launches": 93
+      },
+      "dynamic update": {
+        "kernel_ms": 1.427798,
+        "launches": 99
+      },
+      "other fusion/kernel": {
+        "kernel_ms": 2.4135249999999995,
+        "launches": 513
+      }
+    },
+    "ranges": [
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=355#",
+        "projected_ms": 148.173355,
+        "instances": 1,
+        "gpu_ops": 7297
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.25#",
+        "projected_ms": 147.747469,
+        "instances": 1,
+        "gpu_ops": 7260
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.25_body#",
+        "projected_ms": 147.729037,
+        "instances": 11,
+        "gpu_ops": 7260
+      },
+      {
+        "range": "NCCL:ncclGroupEnd",
+        "projected_ms": 51.163955,
+        "instances": 1584,
+        "gpu_ops": 3168
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.24#",
+        "projected_ms": 49.865143,
+        "instances": 11,
+        "gpu_ops": 792
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.24_body#",
+        "projected_ms": 49.719959,
+        "instances": 99,
+        "gpu_ops": 792
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=input_transpose_fusion#",
+        "projected_ms": 44.997042,
+        "instances": 99,
+        "gpu_ops": 99
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.41#",
+        "projected_ms": 40.482087,
+        "instances": 11,
+        "gpu_ops": 3168
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.39#",
+        "projected_ms": 39.950956,
+        "instances": 11,
+        "gpu_ops": 3168
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/shard_map/ffi_call,hlo_op=ffi_call.42#",
+        "projected_ms": 4.51284,
+        "instances": 11,
+        "gpu_ops": 33
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/shard_map/ffi_call,hlo_op=ffi_call.40#",
+        "projected_ms": 4.433576,
+        "instances": 11,
+        "gpu_ops": 33
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_11#",
+        "projected_ms": 4.193866,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc),hlo_op=loop_transpose_fusion#",
+        "projected_ms": 1.944405,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc),hlo_op=loop_transpose_fusion.1#",
+        "projected_ms": 1.92879,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/while/body/closed_call,hlo_op=loop_dynamic_update_slice_fusion#",
+        "projected_ms": 1.427798,
+        "instances": 99,
+        "gpu_ops": 99
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/while/body/closed_call,hlo_op=loop_dynamic_slice_fusion.1#",
+        "projected_ms": 1.138938,
+        "instances": 99,
+        "gpu_ops": 99
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/while/body/closed_call,hlo_op=loop_and_fusion.1#",
+        "projected_ms": 0.201726,
+        "instances": 99,
+        "gpu_ops": 99
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/while/body/closed_call,hlo_op=loop_complex_fusion#",
+        "projected_ms": 0.190527,
+        "instances": 99,
+        "gpu_ops": 99
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/while/body/closed_call,hlo_op=loop_dynamic_slice_fusion#",
+        "projected_ms": 0.183808,
+        "instances": 99,
+        "gpu_ops": 99
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/while/body/closed_call,hlo_op=loop_and_fusion#",
+        "projected_ms": 0.181951,
+        "instances": 99,
+        "gpu_ops": 99
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/while/body/add,hlo_op=loop_add_fusion#",
+        "projected_ms": 0.152736,
+        "instances": 99,
+        "gpu_ops": 99
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=copy.1#",
+        "projected_ms": 0.077695,
+        "instances": 47,
+        "gpu_ops": 47
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=loop_dynamic_slice_fusion#",
+        "projected_ms": 0.071744,
+        "instances": 38,
+        "gpu_ops": 38
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_1#",
+        "projected_ms": 0.063968,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_dynamic_slice,program_id=201#",
+        "projected_ms": 0.034016,
+        "instances": 18,
+        "gpu_ops": 18
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_dynamic_slice,program_id=197#",
+        "projected_ms": 0.032576,
+        "instances": 18,
+        "gpu_ops": 18
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=loop_select_fusion#",
+        "projected_ms": 0.030656,
+        "instances": 9,
+        "gpu_ops": 9
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit__take,program_id=390#",
+        "projected_ms": 0.030656,
+        "instances": 9,
+        "gpu_ops": 9
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_squeeze,program_id=199#",
+        "projected_ms": 0.030048,
+        "instances": 18,
+        "gpu_ops": 18
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(conjugate),hlo_op=loop_complex_fusion#",
+        "projected_ms": 0.029056,
+        "instances": 18,
+        "gpu_ops": 18
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_conjugate,program_id=205#",
+        "projected_ms": 0.029056,
+        "instances": 18,
+        "gpu_ops": 18
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_squeeze,program_id=203#",
+        "projected_ms": 0.028576,
+        "instances": 18,
+        "gpu_ops": 18
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.44#",
+        "projected_ms": 0.02512,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.43#",
+        "projected_ms": 0.025088,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.48#",
+        "projected_ms": 0.024928,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.51#",
+        "projected_ms": 0.024928,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.46#",
+        "projected_ms": 0.024864,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.50#",
+        "projected_ms": 0.024736,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.47#",
+        "projected_ms": 0.024672,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.45#",
+        "projected_ms": 0.024671,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.49#",
+        "projected_ms": 0.024544,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/dynamic_slice,hlo_op=wrapped_dynamic-slice#",
+        "projected_ms": 0.020768,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=copy.93#",
+        "projected_ms": 0.02064,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc)/shard_map/axis_index,hlo_op=axis_index.22.0#",
+        "projected_ms": 0.01488,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/slice,hlo_op=wrapped_slice.4#",
+        "projected_ms": 0.014816,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/slice,hlo_op=wrapped_slice.3#",
+        "projected_ms": 0.014176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/slice,hlo_op=wrapped_slice#",
+        "projected_ms": 0.014112,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/slice,hlo_op=wrapped_slice.5#",
+        "projected_ms": 0.013472,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/slice,hlo_op=wrapped_slice.2#",
+        "projected_ms": 0.012832,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/slice,hlo_op=wrapped_slice.6#",
+        "projected_ms": 0.0128,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/slice,hlo_op=wrapped_slice.1#",
+        "projected_ms": 0.012768,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/slice,hlo_op=wrapped_slice.7#",
+        "projected_ms": 0.012,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/slice,hlo_op=wrapped_slice.8#",
+        "projected_ms": 0.01024,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_convert_element_type,program_id=1#",
+        "projected_ms": 0.00464,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(_take),hlo_op=loop_select_fusion#",
+        "projected_ms": 0.00416,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit__take,program_id=191#",
+        "projected_ms": 0.00416,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_broadcast_in_dim,program_id=63#",
+        "projected_ms": 0.00368,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_convert_element_type,program_id=61#",
+        "projected_ms": 0.003616,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:Thunk:#name=,hlo_op=loop_broadcast_fusion#",
+        "projected_ms": 0.003488,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_convert_element_type,program_id=173#",
+        "projected_ms": 0.003392,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_gather,program_id=119#",
+        "projected_ms": 0.002688,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_gather,program_id=123#",
+        "projected_ms": 0.002464,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(subtract)/sub,hlo_op=loop_subtract_fusion#",
+        "projected_ms": 0.002176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_subtract,program_id=195#",
+        "projected_ms": 0.002176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_broadcast_in_dim,program_id=125#",
+        "projected_ms": 0.001919,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_broadcast_in_dim,program_id=121#",
+        "projected_ms": 0.001824,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=jit(band_mask),hlo_module=jit_band_mask,program_id=301#",
+        "projected_ms": 0.00176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=jit(band_mask),hlo_module=jit_band_mask,program_id=299#",
+        "projected_ms": 0.001728,
+        "instances": 1,
+        "gpu_ops": 1
+      }
+    ]
+  },
+  "75_F6_chi_units": {
+    "kernel_classes": {
+      "collective service (NCCL)": {
+        "kernel_ms": 54.080785,
+        "launches": 3168
+      },
+      "GEMM": {
+        "kernel_ms": 15.995742,
+        "launches": 1584
+      },
+      "FFT and normalization": {
+        "kernel_ms": 8.921821999999999,
+        "launches": 69
+      },
+      "transpose fusion": {
+        "kernel_ms": 8.819844,
+        "launches": 35
+      },
+      "other fusion/kernel": {
+        "kernel_ms": 1.685464,
+        "launches": 78
+      }
+    },
+    "ranges": [
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=1106#",
+        "projected_ms": 103.312531,
+        "instances": 1,
+        "gpu_ops": 6464
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.8#",
+        "projected_ms": 103.195091,
+        "instances": 1,
+        "gpu_ops": 6457
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=while.8_body#",
+        "projected_ms": 103.176723,
+        "instances": 11,
+        "gpu_ops": 6457
+      },
+      {
+        "range": "NCCL:ncclGroupEnd",
+        "projected_ms": 56.16583,
+        "instances": 1584,
+        "gpu_ops": 3168
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.17#",
+        "projected_ms": 41.22635,
+        "instances": 11,
+        "gpu_ops": 3168
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.15#",
+        "projected_ms": 40.983022,
+        "instances": 11,
+        "gpu_ops": 3168
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=input_transpose_fusion#",
+        "projected_ms": 4.907984,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/shard_map/ffi_call,hlo_op=ffi_call.18#",
+        "projected_ms": 4.474895,
+        "instances": 11,
+        "gpu_ops": 33
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/shard_map/ffi_call,hlo_op=ffi_call.16#",
+        "projected_ms": 4.470031,
+        "instances": 11,
+        "gpu_ops": 33
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=command_buffer_6#",
+        "projected_ms": 3.103349,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc),hlo_op=loop_transpose_fusion#",
+        "projected_ms": 1.939929,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/closed_call/jit(_build_Gv_Gc),hlo_op=loop_transpose_fusion.1#",
+        "projected_ms": 1.935003,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/shard_map/ffi_call,hlo_op=ffi_call.19#",
+        "projected_ms": 0.027648,
+        "instances": 1,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=copy.1#",
+        "projected_ms": 0.025888,
+        "instances": 15,
+        "gpu_ops": 15
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while/body/add,hlo_op=loop_add_fusion#",
+        "projected_ms": 0.025216,
+        "instances": 11,
+        "gpu_ops": 11
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while,hlo_op=wrapped_transpose#",
+        "projected_ms": 0.020896,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/while,hlo_op=wrapped_transpose.1#",
+        "projected_ms": 0.016032,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=loop_dynamic_slice_fusion#",
+        "projected_ms": 0.013344,
+        "instances": 6,
+        "gpu_ops": 6
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(minimax_tau_integrate_chi_vertex)/broadcast_in_dim,hlo_op=loop_broadcast_fusion.1#",
+        "projected_ms": 0.00848,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_convert_element_type,program_id=1#",
+        "projected_ms": 0.004672,
+        "instances": 3,
+        "gpu_ops": 3
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_dynamic_slice,program_id=378#",
+        "projected_ms": 0.004064,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_dynamic_slice,program_id=374#",
+        "projected_ms": 0.003872,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_squeeze,program_id=376#",
+        "projected_ms": 0.003744,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_convert_element_type,program_id=420#",
+        "projected_ms": 0.003552,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:Thunk:#name=,hlo_op=loop_broadcast_fusion#",
+        "projected_ms": 0.00352,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_broadcast_in_dim,program_id=422#",
+        "projected_ms": 0.00352,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_squeeze,program_id=380#",
+        "projected_ms": 0.003328,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_convert_element_type,program_id=985#",
+        "projected_ms": 0.003264,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(conjugate),hlo_op=loop_complex_fusion#",
+        "projected_ms": 0.003232,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_conjugate,program_id=1007#",
+        "projected_ms": 0.003232,
+        "instances": 2,
+        "gpu_ops": 2
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_gather,program_id=945#",
+        "projected_ms": 0.002784,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_gather,program_id=949#",
+        "projected_ms": 0.002624,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#name=jit(subtract)/sub,hlo_op=loop_subtract_fusion#",
+        "projected_ms": 0.002016,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#hlo_module=jit_subtract,program_id=1005#",
+        "projected_ms": 0.002016,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_broadcast_in_dim,program_id=951#",
+        "projected_ms": 0.001952,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:Thunk:#hlo_op=copy.35#",
+        "projected_ms": 0.001856,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=args[0],hlo_module=jit_broadcast_in_dim,program_id=947#",
+        "projected_ms": 0.001856,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=jit(band_mask),hlo_module=jit_band_mask,program_id=1067#",
+        "projected_ms": 0.00176,
+        "instances": 1,
+        "gpu_ops": 1
+      },
+      {
+        "range": "TSL:XlaModule:#prefix=jit(band_mask),hlo_module=jit_band_mask,program_id=1069#",
+        "projected_ms": 0.00176,
+        "instances": 1,
+        "gpu_ops": 1
+      }
+    ]
+  }
+}

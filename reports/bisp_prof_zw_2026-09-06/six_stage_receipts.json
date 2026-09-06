@@ -1,4 +1,315 @@
 {
+  "75_F6_chi_units": {
+    "stages": {
+      "runtime bring-up": 8.29,
+      "pre-main + imports": 0.56,
+      "input + run setup": 0.14,
+      "zeta": 21.13,
+      "V(q)": 10.13,
+      "ISDF setup + I/O": 40.2,
+      "minimax quadrature": 0.36,
+      "screening support": 46.17,
+      "Sigma other": 45.22,
+      "mean-field load": 0.14,
+      "QP solve + diagonalize": 0.68,
+      "result writes": 0.22,
+      "other driver work": 1.24,
+      "total run": 174.49
+    },
+    "z_build_solve_ms": [
+      [
+        2633,
+        1026
+      ],
+      [
+        2119,
+        733
+      ],
+      [
+        178,
+        941
+      ],
+      [
+        2,
+        15
+      ],
+      [
+        2,
+        16
+      ],
+      [
+        2,
+        16
+      ],
+      [
+        2,
+        16
+      ],
+      [
+        1,
+        15
+      ],
+      [
+        176,
+        891
+      ],
+      [
+        1,
+        6
+      ],
+      [
+        1,
+        6
+      ]
+    ],
+    "tile_fit_write_total_ms": [
+      [
+        4103,
+        1950,
+        6054
+      ],
+      [
+        2855,
+        429,
+        3283
+      ],
+      [
+        1279,
+        1960,
+        3239
+      ],
+      [
+        22,
+        7,
+        29
+      ],
+      [
+        21,
+        6,
+        27
+      ],
+      [
+        19,
+        7,
+        26
+      ],
+      [
+        21,
+        7,
+        28
+      ],
+      [
+        20,
+        7,
+        27
+      ],
+      [
+        1070,
+        412,
+        1482
+      ],
+      [
+        11,
+        6,
+        17
+      ],
+      [
+        10,
+        7,
+        17
+      ]
+    ],
+    "arena_gb": [
+      "14.07"
+    ],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=794 (109.42s)  compile_agreement=794 (0.239s fingerprint + 1.372s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False",
+      "[compile-cache] rank 0/4 summary: xla_compiles=794 (109.42s)  compile_agreement=794 (0.239s fingerprint + 1.372s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "61_P6_chi_before_units": {
+    "stages": {
+      "runtime bring-up": 8.92,
+      "pre-main + imports": 0.92,
+      "input + run setup": 0.57,
+      "restart load": 6.06,
+      "ISDF setup + I/O": 0.67,
+      "minimax quadrature": 0.36,
+      "screening support": 70.45,
+      "Sigma other": 44.23,
+      "mean-field load": 0.14,
+      "QP solve + diagonalize": 0.65,
+      "result writes": 0.2,
+      "other driver work": 1.25,
+      "total run": 134.42
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=569 (79.06s)  compile_agreement=569 (0.346s fingerprint + 0.800s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False",
+      "[compile-cache] rank 0/4 summary: xla_compiles=570 (79.10s)  compile_agreement=570 (0.346s fingerprint + 0.806s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "65_P6_class_units": {
+    "stages": {
+      "runtime bring-up": 7.89,
+      "pre-main + imports": 0.54,
+      "input + run setup": 0.17,
+      "restart load": 5.76,
+      "ISDF setup + I/O": 0.65,
+      "minimax quadrature": 0.35,
+      "screening support": 57.37,
+      "Sigma other": 43.72,
+      "mean-field load": 0.14,
+      "QP solve + diagonalize": 0.65,
+      "result writes": 0.19,
+      "other driver work": 1.27,
+      "total run": 118.7
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=569 (82.33s)  compile_agreement=569 (0.347s fingerprint + 0.756s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False",
+      "[compile-cache] rank 0/4 summary: xla_compiles=570 (82.36s)  compile_agreement=570 (0.347s fingerprint + 0.757s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "68_P6_zeta_transaction": {
+    "stages": {},
+    "z_build_solve_ms": [
+      [
+        2409,
+        616
+      ],
+      [
+        974,
+        16
+      ],
+      [
+        973,
+        16
+      ],
+      [
+        973,
+        16
+      ],
+      [
+        60,
+        408
+      ],
+      [
+        4,
+        13
+      ],
+      [
+        1,
+        13
+      ],
+      [
+        1,
+        13
+      ],
+      [
+        2,
+        13
+      ],
+      [
+        2,
+        12
+      ],
+      [
+        2,
+        13
+      ],
+      [
+        2,
+        13
+      ],
+      [
+        1,
+        12
+      ]
+    ],
+    "tile_fit_write_total_ms": [
+      [
+        3062,
+        871,
+        3933
+      ],
+      [
+        991,
+        7,
+        997
+      ],
+      [
+        990,
+        7,
+        997
+      ],
+      [
+        991,
+        7,
+        997
+      ],
+      [
+        510,
+        867,
+        1377
+      ],
+      [
+        18,
+        7,
+        25
+      ],
+      [
+        16,
+        8,
+        23
+      ],
+      [
+        16,
+        7,
+        23
+      ],
+      [
+        16,
+        6,
+        22
+      ],
+      [
+        15,
+        7,
+        23
+      ],
+      [
+        16,
+        7,
+        23
+      ],
+      [
+        16,
+        7,
+        23
+      ],
+      [
+        15,
+        6,
+        21
+      ]
+    ],
+    "arena_gb": [
+      "10.67"
+    ],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=265 (17.45s)  compile_agreement=265 (0.318s fingerprint + 0.547s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False",
+      "[compile-cache] rank 0/4 summary: xla_compiles=265 (17.45s)  compile_agreement=265 (0.318s fingerprint + 0.547s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
   "47_P6_fresh_before": {
     "stages": {
       "runtime bring-up": 4.99,
@@ -143,6 +454,315 @@
     ],
     "compile_receipt": [
       "[compile-cache] rank 0/4 summary: xla_compiles=849 (55.74s)  compile_agreement=849 (0.682s fingerprint + 2.142s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "72_P6_streamed_units": {
+    "stages": {
+      "runtime bring-up": 7.82,
+      "pre-main + imports": 0.63,
+      "input + run setup": 0.16,
+      "restart load": 5.75,
+      "ISDF setup + I/O": 0.63,
+      "minimax quadrature": 0.35,
+      "screening support": 54.41,
+      "Sigma other": 43.78,
+      "mean-field load": 0.14,
+      "QP solve + diagonalize": 0.69,
+      "result writes": 0.22,
+      "other driver work": 1.29,
+      "total run": 115.88
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=569 (78.99s)  compile_agreement=569 (0.344s fingerprint + 0.797s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False",
+      "[compile-cache] rank 0/4 summary: xla_compiles=570 (79.02s)  compile_agreement=570 (0.345s fingerprint + 0.798s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "71_P6_cached_streamed": {
+    "stages": {
+      "runtime bring-up": 5.6,
+      "pre-main + imports": 0.36,
+      "input + run setup": 0.17,
+      "restart load": 3.51,
+      "ISDF setup + I/O": 0.36,
+      "minimax quadrature": 0.13,
+      "screening support": 24.67,
+      "Sigma other": 20.67,
+      "mean-field load": 0.05,
+      "QP solve + diagonalize": 0.28,
+      "result writes": 0.1,
+      "other driver work": 0.95,
+      "total run": 56.85
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=562 (33.69s)  compile_agreement=562 (0.347s fingerprint + 1.154s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "62_P6_cached_before": {
+    "stages": {
+      "runtime bring-up": 7.13,
+      "pre-main + imports": 0.64,
+      "input + run setup": 0.22,
+      "restart load": 3.55,
+      "ISDF setup + I/O": 0.34,
+      "minimax quadrature": 0.13,
+      "screening support": 25.98,
+      "Sigma other": 21.31,
+      "mean-field load": 0.05,
+      "QP solve + diagonalize": 0.28,
+      "result writes": 0.1,
+      "other driver work": 0.94,
+      "total run": 60.68
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=562 (33.89s)  compile_agreement=562 (0.344s fingerprint + 1.425s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "50_F6_fresh_units": {
+    "stages": {},
+    "z_build_solve_ms": [
+      [
+        2631,
+        1035
+      ],
+      [
+        1506,
+        31
+      ],
+      [
+        2110,
+        734
+      ],
+      [
+        1071,
+        24
+      ],
+      [
+        180,
+        951
+      ],
+      [
+        2,
+        15
+      ],
+      [
+        2,
+        16
+      ],
+      [
+        2,
+        15
+      ],
+      [
+        2,
+        16
+      ],
+      [
+        2,
+        16
+      ],
+      [
+        175,
+        896
+      ],
+      [
+        1,
+        6
+      ],
+      [
+        1,
+        6
+      ]
+    ],
+    "tile_fit_write_total_ms": [
+      [
+        6180,
+        1954,
+        8134
+      ],
+      [
+        4458,
+        445,
+        4903
+      ],
+      [
+        1296,
+        2038,
+        3333
+      ],
+      [
+        23,
+        7,
+        30
+      ],
+      [
+        23,
+        7,
+        30
+      ],
+      [
+        19,
+        7,
+        26
+      ],
+      [
+        21,
+        7,
+        28
+      ],
+      [
+        21,
+        7,
+        28
+      ],
+      [
+        1074,
+        461,
+        1535
+      ],
+      [
+        11,
+        6,
+        17
+      ],
+      [
+        11,
+        7,
+        18
+      ]
+    ],
+    "arena_gb": [
+      "14.53"
+    ],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=280 (39.42s)  compile_agreement=280 (0.087s fingerprint + 0.402s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False",
+      "[compile-cache] rank 0/4 summary: xla_compiles=280 (39.42s)  compile_agreement=280 (0.087s fingerprint + 0.402s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "69_F6_zeta_transaction": {
+    "stages": {},
+    "z_build_solve_ms": [
+      [
+        2308,
+        408
+      ],
+      [
+        1783,
+        317
+      ],
+      [
+        62,
+        494
+      ],
+      [
+        2,
+        15
+      ],
+      [
+        2,
+        16
+      ],
+      [
+        2,
+        16
+      ],
+      [
+        2,
+        16
+      ],
+      [
+        2,
+        16
+      ],
+      [
+        61,
+        426
+      ],
+      [
+        1,
+        5
+      ],
+      [
+        1,
+        5
+      ]
+    ],
+    "tile_fit_write_total_ms": [
+      [
+        2846,
+        858,
+        3704
+      ],
+      [
+        2102,
+        335,
+        2437
+      ],
+      [
+        604,
+        876,
+        1480
+      ],
+      [
+        22,
+        7,
+        29
+      ],
+      [
+        22,
+        6,
+        28
+      ],
+      [
+        19,
+        7,
+        26
+      ],
+      [
+        21,
+        7,
+        27
+      ],
+      [
+        21,
+        8,
+        28
+      ],
+      [
+        490,
+        315,
+        805
+      ],
+      [
+        10,
+        6,
+        16
+      ],
+      [
+        10,
+        7,
+        17
+      ]
+    ],
+    "arena_gb": [
+      "14.07"
+    ],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=268 (17.72s)  compile_agreement=268 (0.085s fingerprint + 0.470s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False",
+      "[compile-cache] rank 0/4 summary: xla_compiles=268 (17.72s)  compile_agreement=268 (0.085s fingerprint + 0.470s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
     ],
     "rules": []
   },
@@ -296,6 +916,54 @@
       [
         974,
         15
+      ],
+      [
+        974,
+        14
+      ],
+      [
+        975,
+        15
+      ],
+      [
+        974,
+        15
+      ],
+      [
+        174,
+        895
+      ],
+      [
+        3,
+        13
+      ],
+      [
+        2,
+        13
+      ],
+      [
+        2,
+        12
+      ],
+      [
+        2,
+        13
+      ],
+      [
+        2,
+        13
+      ],
+      [
+        2,
+        12
+      ],
+      [
+        2,
+        13
+      ],
+      [
+        2,
+        12
       ]
     ],
     "tile_fit_write_total_ms": [
@@ -308,10 +976,94 @@
         1982,
         7,
         1989
+      ],
+      [
+        1981,
+        7,
+        1988
+      ],
+      [
+        1982,
+        7,
+        1989
+      ],
+      [
+        1235,
+        2014,
+        3248
+      ],
+      [
+        17,
+        8,
+        25
+      ],
+      [
+        16,
+        7,
+        24
+      ],
+      [
+        14,
+        7,
+        21
+      ],
+      [
+        16,
+        8,
+        24
+      ],
+      [
+        16,
+        8,
+        23
+      ],
+      [
+        15,
+        7,
+        22
+      ],
+      [
+        16,
+        7,
+        23
+      ],
+      [
+        15,
+        7,
+        22
       ]
     ],
+    "arena_gb": [
+      "10.94"
+    ],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=271 (37.31s)  compile_agreement=271 (0.317s fingerprint + 0.463s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False",
+      "[compile-cache] rank 0/4 summary: xla_compiles=271 (37.31s)  compile_agreement=271 (0.317s fingerprint + 0.463s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "64_P6_cached_class": {
+    "stages": {
+      "runtime bring-up": 4.6,
+      "pre-main + imports": 0.4,
+      "input + run setup": 0.17,
+      "restart load": 3.45,
+      "ISDF setup + I/O": 0.36,
+      "minimax quadrature": 0.13,
+      "screening support": 27.75,
+      "Sigma other": 20.53,
+      "mean-field load": 0.05,
+      "QP solve + diagonalize": 0.28,
+      "result writes": 0.1,
+      "other driver work": 0.96,
+      "total run": 58.77
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
     "arena_gb": [],
-    "compile_receipt": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=562 (36.75s)  compile_agreement=562 (0.343s fingerprint + 1.015s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
     "rules": []
   }
 }
