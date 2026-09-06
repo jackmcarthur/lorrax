@@ -608,11 +608,6 @@ def unfold_isdf_operator(
         and left_logical_extent is None and right_logical_extent is None
         and trs_pair_q_ibz is None and axis_local_sym_perm is None
         and right_axis_local_sym_perm is None)
-    if (square_defaults
-            and idx_np.shape[0] == int(V_q_ibz.shape[0])
-            and np.array_equal(idx_np, np.arange(idx_np.shape[0]))
-            and np.all(sym_np == 0)):
-        return V_q_ibz
 
     same_basis_tables = right_sym_perm is None and right_L_table is None
     if (right_sym_perm is None) != (right_L_table is None):
@@ -668,6 +663,11 @@ def unfold_isdf_operator(
             f"{n_sym_perm}/{n_sym_perm_right} rows.  Build them via "
             "``centroid_source_map_and_wrap(..., extend_trs=True)`` so they "
             "cover the TRS-augmented half of ``sym_mats_k``.")
+    if np.any(sym_np < 0):
+        raise ValueError("unfold_isdf_operator: negative action row")
+    for perm in (left_perm, right_perm):
+        if np.any(np.sort(perm[sym_np], axis=1) != np.arange(perm.shape[1])):
+            raise ValueError("unfold_isdf_operator: selected centroid action is unavailable or not bijective")
     requested_trs_rule = trs_rule
     if requested_trs_rule not in ("conj", "pair_transpose"):
         raise ValueError(
@@ -780,6 +780,7 @@ def unfold_isdf_operator(
         for label, global_perm, local_perm, chunk in (
                 ("left", fwd_perm, left_local_perm, left_chunk),
                 ("right", fwd_perm_right, right_local_perm, right_chunk)):
+            global_perm, local_perm = global_perm[sym_np], local_perm[sym_np]
             target_owner = np.arange(global_perm.shape[1]) // chunk
             source_owner = global_perm // chunk
             if not np.array_equal(
@@ -813,6 +814,12 @@ def unfold_isdf_operator(
                 f"unfold_isdf_operator: {label} source maps do not preserve "
                 f"the logical/padded split at {logical}/{padded}; regenerate "
                 "the authenticated centroid tables with an identity tail")
+
+    if (square_defaults
+            and idx_np.shape[0] == int(V_q_ibz.shape[0])
+            and np.array_equal(idx_np, np.arange(idx_np.shape[0]))
+            and np.all(sym_np == 0)):
+        return V_q_ibz
 
     pair_source = None
     if requested_trs_rule == "pair_transpose":
@@ -1425,11 +1432,17 @@ def unfold_spin_centroid_operator(
             f"shapes (n_sym,{n_left})/(n_sym,{n_left},3); got "
             f"{perm.shape}/{wraps.shape}.")
 
+    rows = np.asarray(sym_idx, dtype=np.int32)
+    if (np.any(rows < 0) or np.any(rows >= perm.shape[0])
+            or np.any(np.sort(perm[rows], axis=1) != np.arange(n_left))):
+        raise ValueError("unfold_spin_centroid_operator: selected centroid action is unavailable or not bijective")
+
     # Merge order is (mu, spin), so a source centroid alpha(mu) expands to
     # the contiguous source rows alpha(mu)*ns + spin.  L is spin-independent.
     spin_slot = np.arange(ns, dtype=np.int32)
     perm_ms = (perm[:, :, None] * ns + spin_slot[None, None, :]).reshape(
         perm.shape[0], n_left * ns)
+    perm_ms[np.all(perm == -1, axis=1)] = -1
     wraps_ms = np.repeat(wraps, ns, axis=1)
     logical_mu = (n_left if logical_centroid_extent is None else
                   int(logical_centroid_extent))
@@ -1451,7 +1464,7 @@ def unfold_spin_centroid_operator(
             raise ValueError(
                 "unfold_spin_centroid_operator: merged endpoint extent "
                 f"{n_left * ns} is not divisible by X={px}.")
-        local_perm = perm_ms % ((n_left * ns) // px)
+        local_perm = np.where(perm_ms < 0, -1, perm_ms % ((n_left * ns) // px))
     flat_full = unfold_isdf_operator(
         flat,
         irr_idx=irr_idx,
@@ -1665,6 +1678,9 @@ def unfold_isdf_one_leg(
         raise ValueError(
             "unfold_isdf_one_leg: L_table must have shape "
             f"{(S_all.shape[0], n_mu, 3)}; got {wraps.shape}.")
+
+    if np.any(np.sort(perm[rows], axis=1) != np.arange(n_mu)):
+        raise ValueError("unfold_isdf_one_leg: selected centroid action is unavailable or not bijective")
 
     # Literal target G=0 may be a nonzero parent G.  Build that exact
     # relabel once on the host from the service-owned star rows, then make
