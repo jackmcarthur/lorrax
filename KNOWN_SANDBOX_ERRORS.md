@@ -40,3 +40,7 @@ The authorized named fallback `LX_ALLOC_MATCH=lx-alloc-jackm-BISP-PROF-S LX_ALLO
 - 2026-09-06 BISP-PROF-S: parse_lorrax_sigma_run.py is dynamic-only for production tables; static50 has no rule/tau rows and refuses parsing. Use existing stage parser for static; no static parse verdict was recorded.
 
 - 2026-09-06 BISP-PROF-S: final compile-class writer initially assumed absent module classes had a count field; comparison receipts represent absence as an empty object. Corrected to count0; compile_class_dispositions.json now exists and is committed. No numerical result changed.
+
+- 2026-09-06 PROF-S: INVARIANTS.md is sandbox-owned, absent from source worktree; read sandbox root file. Rebase onto b1d8b8f1 requires restoring lane evidence omitted by orchestrator cherry-picks.
+
+- PROF-S run60: instrumentation preparation used a worktree-relative path while cwd was the run directory and failed; detached gate launched without HLO/warm wrapper. Receipts and identity valid, isolated warm time unavailable.

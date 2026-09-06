@@ -1462,17 +1462,22 @@ def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy):
     left, right = family_plans[a], family_plans[b]
     sym, mesh, policy = left.sym, left.mesh_xy, qgrid_policy
     qfrac = bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, policy.kgrid)
-    sources = {}
-    for C in ((1, 2, 3) if a else (0,)):
-        for D in ((1, 2, 3) if b else (0,)):
-            source = photon_block_view(packed, layout, C, D, mesh)
-            sources[C, D] = unfold_isdf_operator(
-                source, irr_idx=sym.irr_idx_q, sym_idx=policy.unfold_sym_idx,
-                sym_perm=left.sym_perm, L_table=left.L_table,
-                right_sym_perm=right.sym_perm, right_L_table=right.L_table,
-                q_irr_frac=qfrac, mesh_xy=mesh, n_sym_spatial=policy.n_sym_spatial,
-                axis_local_sym_perm=left.centroid_local_perm,
-                right_axis_local_sym_perm=right.centroid_local_perm)
+    pairs = tuple((C, D) for C in ((1, 2, 3) if a else (0,))
+                  for D in ((1, 2, 3) if b else (0,)))
+    parent_blocks = jnp.stack([photon_block_view(packed, layout, C, D, mesh)
+                               for C, D in pairs])
+
+    def restore(source):
+        return unfold_isdf_operator(
+            source, irr_idx=sym.irr_idx_q, sym_idx=policy.unfold_sym_idx,
+            sym_perm=left.sym_perm, L_table=left.L_table,
+            right_sym_perm=right.sym_perm, right_L_table=right.L_table,
+            q_irr_frac=qfrac, mesh_xy=mesh, n_sym_spatial=policy.n_sym_spatial,
+            axis_local_sym_perm=left.centroid_local_perm,
+            right_axis_local_sym_perm=right.centroid_local_perm)
+
+    restored = jax.lax.map(restore, parent_blocks)
+    sources = {pair: restored[i] for i, pair in enumerate(pairs)}
     yield from mix_lorentz_blocks(sources, sym=sym, sym_idx=policy.unfold_sym_idx,
                                  mesh_xy=mesh, keys=keys).items()
 
