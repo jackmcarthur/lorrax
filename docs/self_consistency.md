@@ -214,7 +214,11 @@ no existing certificate with the same causal conjugation covers a window,
 rebuild that rule on the escaped box with the same padding
 (`rebuild:sc-fixed`, counted in the geometry receipt and printed per map;
 main 0cfaf059). One-shot results are bit-identical with and without the
-freeze. The eqp1 file is written from the converged map.
+freeze. When no crossing certificate exists for a causal sign at initialization,
+its sign-definite rules reserve the zero-side channel down to eta; this covers
+newly live low poles while preserving the sign topology. The He growth gate
+requires zero rebuilds on its growth map. The eqp1 file is written from the
+converged map.
 
 **13. Map gain is a diagnostic, not a controller.** From map 2 onward the
 driver prints `SC map gain: max |dSigma_on-shell| / max |dE_in| = ...`, using

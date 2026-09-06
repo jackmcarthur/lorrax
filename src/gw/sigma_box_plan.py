@@ -641,7 +641,7 @@ def _box_escape_reasons(outer, inner):
     ]
 
 
-def _sc_padded_box_spec(spec, eta):
+def _sc_padded_box_spec(spec, eta, *, reserve_zero_side=False):
     """Return the iteration-1 SC certificate box required by policy.
 
     State drift uses the classification pad on the movable real edge(s).
@@ -692,6 +692,15 @@ def _sc_padded_box_spec(spec, eta):
     if spec["kind"] == "sign_definite_positive" and support_box[0] > 0.0:
         box[0] = max(box[0], 0.5 * support_box[0])
         box[0] = min(box[0], support_box[0])
+    if reserve_zero_side and "sc_support_frequencies" in spec:
+        # SC pole membership may change before a state leaves its reserved
+        # external support. Reserve the sign-definite channel down to eta
+        # so a newly live low pole can use the existing certificate. Keep
+        # the sign topology; actual crossings still require certification.
+        if box[0] > 0.0:
+            box[0] = min(box[0], float(eta))
+        elif box[1] < 0.0:
+            box[1] = max(box[1], -float(eta))
     padded = dict(spec)
     padded["box"] = tuple(float(value) for value in box)
     padded["kind"] = (
@@ -746,6 +755,14 @@ def _fit_fixed_sc_rules(
         session["eta_ry"] = float(eta)
         session["eps"] = float(eps)
         padded = [_sc_padded_box_spec(spec, eta) for spec in rows]
+        # An existing crossing certificate already reserves the zero-side
+        # channel. If none exists for this causal sign, reserve that channel
+        # in its sign-definite rules so newly live low poles need no refit.
+        crossing_causal = {bool(spec["conjugate"])
+                           for spec in padded if spec["kind"] == "crossing"}
+        padded = [_sc_padded_box_spec(spec, eta, reserve_zero_side=True)
+                  if bool(spec["conjugate"]) not in crossing_causal else pad
+                  for spec, pad in zip(rows, padded)]
         fits, fit_rows = fit_sigma_box_specs(
             padded, eta, eps=eps, reduction_seconds=reduction_seconds,
             cache_dir=cache_dir, cache_build_widen=False,

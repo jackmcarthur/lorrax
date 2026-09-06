@@ -280,3 +280,19 @@ def test_new_product_name_reuses_an_existing_certificate(monkeypatch):
     renamed = _branch(tag='new product family')
     _, geometry = _plan(monkeypatch, renamed, fixed_rule_session=session)
     assert geometry['sc_fixed_rebuilds_this_iteration'] == 0
+
+
+def test_initial_sc_zero_side_reservation_keeps_the_causal_sign():
+    from gw.sigma_box_plan import make_sigma_box_spec, _sc_padded_box_spec
+    for sign in (-1., 1.):
+        spec = make_sigma_box_spec(name='future pole channel',
+            frequencies=np.array([0., .1]), states=np.array([sign * 2.]),
+            pole_stats=[(3., 3., .1, .1)], pole_sign=sign, eta_ry=.1)
+        spec['sc_support_frequencies'] = np.array([-.2, .2])
+        narrow = _sc_padded_box_spec(spec, .1)
+        reserved = _sc_padded_box_spec(spec, .1, reserve_zero_side=True)
+        assert reserved['kind'] == narrow['kind']
+        if sign > 0:
+            assert reserved['box'][1] == -.1
+        else:
+            assert reserved['box'][0] == .1
