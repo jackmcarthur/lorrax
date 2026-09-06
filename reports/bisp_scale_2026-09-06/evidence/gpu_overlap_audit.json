@@ -1,0 +1,559 @@
+{
+  "01_preprocess": [
+    {
+      "step": "lx-Xg4-105132-2312896-3892",
+      "id": "57982945.46",
+      "start": "2026-09-06T10:51:34",
+      "end": "2026-09-06T10:52:38",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "02_P_static_P4_fresh": [
+    {
+      "step": "lx-Xg4-105322-2327180-5411",
+      "id": "57982945.48",
+      "start": "2026-09-06T10:53:23",
+      "end": "2026-09-06T10:55:08",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "04_F_static_P4_fresh_compatible": [
+    {
+      "step": "lx-Xg4-105423-2331309-4698",
+      "id": "57982945.50",
+      "start": "2026-09-06T10:54:25",
+      "end": "2026-09-06T10:55:59",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "05_P_static_P4_copied_zeta": [
+    {
+      "step": "lx-Xg4-105553-2340157-2872",
+      "id": "57982945.54",
+      "start": "2026-09-06T10:55:57",
+      "end": "2026-09-06T10:57:08",
+      "overlaps": [
+        {
+          "step": "lx-Xg1-105553-2340347-2190",
+          "id": "57982945.55",
+          "seconds": 11.0,
+          "nodes": [
+            "nid001068"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "06_F_static_P4_copied_zeta": [
+    {
+      "step": "lx-Xg4-105616-2342005-1256",
+      "id": "57982945.57",
+      "start": "2026-09-06T10:56:19",
+      "end": "2026-09-06T10:57:45",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-105616-2342006-3556",
+          "id": "57982945.56",
+          "seconds": 86.0,
+          "nodes": [
+            "nid001065"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "07_P_dynamic_P4_copied_zeta": [
+    {
+      "step": "lx-Xg4-105616-2342006-3556",
+      "id": "57982945.56",
+      "start": "2026-09-06T10:56:19",
+      "end": "2026-09-06T10:58:36",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-105616-2342005-1256",
+          "id": "57982945.57",
+          "seconds": 86.0,
+          "nodes": [
+            "nid001065"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "09_P_static_P16_copied_zeta": [
+    {
+      "step": "lx-Xg4-112718-6609-6855",
+      "id": "57982945.115",
+      "start": "2026-09-06T11:27:18",
+      "end": "2026-09-06T11:28:53",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "11_F_dynamic_P4_copied_rules_compatible": [
+    {
+      "step": "lx-Xg4-110524-30421-1513",
+      "id": "57982945.70",
+      "start": "2026-09-06T11:05:24",
+      "end": "2026-09-06T11:08:23",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-110524-30419-9275",
+          "id": "57982945.69",
+          "seconds": 121.0,
+          "nodes": [
+            "nid001064"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "12_P_static_P4_profile_fresh": [
+    {
+      "step": "lx-Xg4-105913-2356430-4328",
+      "id": "57982945.58",
+      "start": "2026-09-06T10:59:16",
+      "end": "2026-09-06T11:03:41",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "14_P_static_P4_restore_resident": [
+    {
+      "step": "lx-Xg4-110000-2359242-4220",
+      "id": "57982945.59",
+      "start": "2026-09-06T11:00:02",
+      "end": "2026-09-06T11:01:11",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "20_combined_experiments_P4": [
+    {
+      "step": "lx-Xg4-110752-42766-3793",
+      "id": "57982945.73",
+      "start": "2026-09-06T11:07:55",
+      "end": "2026-09-06T11:11:18",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "23_P_dynamic_P16_matched": [
+    {
+      "step": "lx-Xg4-112855-174741-8396",
+      "id": "57982945.117",
+      "start": "2026-09-06T11:28:55",
+      "end": "2026-09-06T11:31:08",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "25_P_dynamic_P4_union_rules": [
+    {
+      "step": "lx-Xg4-111841-89725-4618",
+      "id": "57982945.93",
+      "start": "2026-09-06T11:18:43",
+      "end": "2026-09-06T11:20:41",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-111841-89723-6505",
+          "id": "57982945.92",
+          "seconds": 107.0,
+          "nodes": [
+            "nid001065"
+          ]
+        },
+        {
+          "step": "lx-Xg4-111841-90300-7414",
+          "id": "57982945.94",
+          "seconds": 68.0,
+          "nodes": [
+            "nid001065"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "26_F_dynamic_P4_union_rules": [
+    {
+      "step": "lx-Xg4-111841-89723-6505",
+      "id": "57982945.92",
+      "start": "2026-09-06T11:18:43",
+      "end": "2026-09-06T11:20:30",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-111841-89725-4618",
+          "id": "57982945.93",
+          "seconds": 107.0,
+          "nodes": [
+            "nid001065"
+          ]
+        },
+        {
+          "step": "lx-Xg4-111841-90300-7414",
+          "id": "57982945.94",
+          "seconds": 68.0,
+          "nodes": [
+            "nid001065"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "28_F_static_P4_profile_copied_zeta": [
+    {
+      "step": "lx-Xg4-111941-95871-9092",
+      "id": "57982945.96",
+      "start": "2026-09-06T11:19:41",
+      "end": "2026-09-06T11:22:37",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "29_P_dynamic_P4_profile": [
+    {
+      "step": "lx-Xg4-112243-128143-9636",
+      "id": "57982945.104",
+      "start": "2026-09-06T11:22:45",
+      "end": "2026-09-06T11:27:16",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-112243-128144-6525",
+          "id": "57982945.105",
+          "seconds": 239.0,
+          "nodes": [
+            "nid001064"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "30_F_dynamic_P4_profile": [
+    {
+      "step": "lx-Xg4-112243-128144-6525",
+      "id": "57982945.105",
+      "start": "2026-09-06T11:22:45",
+      "end": "2026-09-06T11:26:44",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-112243-128143-9636",
+          "id": "57982945.104",
+          "seconds": 239.0,
+          "nodes": [
+            "nid001064"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "31_P_static_P4_zeros_profile": [
+    {
+      "step": "lx-Xg4-112421-142198-8306",
+      "id": "57982945.111",
+      "start": "2026-09-06T11:24:23",
+      "end": "2026-09-06T11:27:17",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "33_P_dynamic_P4_profile_cuda": [
+    {
+      "step": "lx-Xg4-113319-197930-7419",
+      "id": "57982945.123",
+      "start": "2026-09-06T11:33:24",
+      "end": "2026-09-06T11:37:41",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-113321-195974-2219",
+          "id": "57982945.122",
+          "seconds": 74.0,
+          "nodes": [
+            "nid001064"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "34_F_dynamic_P4_profile_cuda": [
+    {
+      "step": "lx-Xg4-113530-221212-1447",
+      "id": "57982945.130",
+      "start": "2026-09-06T11:35:32",
+      "end": "2026-09-06T11:39:32",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "35_P_static_P16_profile_fresh": [
+    {
+      "step": "lx-Xg4-114116-198027-8038",
+      "id": "57982945.142",
+      "start": "2026-09-06T11:41:21",
+      "end": "2026-09-06T11:46:42",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-114116-208015-3316",
+          "id": "57982945.140",
+          "seconds": 97.0,
+          "nodes": [
+            "nid001064",
+            "nid001065",
+            "nid001068",
+            "nid001128"
+          ]
+        },
+        {
+          "step": "lx-Xg4-114116-202380-4971",
+          "id": "57982945.141",
+          "seconds": 18.0,
+          "nodes": [
+            "nid001064",
+            "nid001065",
+            "nid001068",
+            "nid001128"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "39_P_dynamic_P4_integration71": [
+    {
+      "step": "lx-Xg4-113850-250343-9440",
+      "id": "57982945.136",
+      "start": "2026-09-06T11:38:55",
+      "end": "2026-09-06T11:40:42",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-113855-237399-5693",
+          "id": "57982945.137",
+          "seconds": 65.0,
+          "nodes": [
+            "nid001128"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "41_preprocess_9x9": [
+    {
+      "step": "lx-Xg4-113328-177939-4408",
+      "id": "57982945.124",
+      "start": "2026-09-06T11:33:35",
+      "end": "2026-09-06T11:34:40",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "43_F_static_P4_9x9_fresh": [
+    {
+      "step": "lx-Xg4-113755-240209-8497",
+      "id": "57982945.134",
+      "start": "2026-09-06T11:37:57",
+      "end": "2026-09-06T11:40:12",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-113750-240003-6976",
+          "id": "57982945.133",
+          "seconds": 39.0,
+          "nodes": [
+            "nid001064"
+          ]
+        },
+        {
+          "step": "lx-Xg4-113755-237257-1697",
+          "id": "57982945.135",
+          "seconds": 39.0,
+          "nodes": [
+            "nid001064"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "44_P_static_P4_9x9_copied": [
+    {
+      "step": "lx-Xg4-115149-275053-8583",
+      "id": "57982945.154",
+      "start": "2026-09-06T11:51:54",
+      "end": "2026-09-06T11:56:46",
+      "overlaps": [
+        {
+          "step": "lx-Xg1-115145-306646-3410",
+          "id": "57982945.151",
+          "seconds": 5.0,
+          "nodes": [
+            "nid001064"
+          ]
+        },
+        {
+          "step": "lx-Xg4-115141-274909-6649",
+          "id": "57982945.152",
+          "seconds": 164.0,
+          "nodes": [
+            "nid001064"
+          ]
+        },
+        {
+          "step": "lx-Xg4-115145-274730-9627",
+          "id": "57982945.156",
+          "seconds": 290.0,
+          "nodes": [
+            "nid001064"
+          ]
+        },
+        {
+          "step": "lx-Xg4-115145-274088-8418",
+          "id": "57982945.157",
+          "seconds": 290.0,
+          "nodes": [
+            "nid001064"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "51_centroids_common_P16": [
+    {
+      "step": "lx-Xg4-113504-221074-6989",
+      "id": "57982945.128",
+      "start": "2026-09-06T11:35:09",
+      "end": "2026-09-06T11:35:27",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "54_P_static_P16_common_copied": [
+    {
+      "step": "lx-Xg4-115145-274088-8418",
+      "id": "57982945.157",
+      "start": "2026-09-06T11:51:56",
+      "end": "2026-09-06T11:57:21",
+      "overlaps": [
+        {
+          "step": "lx-Xg1-115145-306646-3410",
+          "id": "57982945.151",
+          "seconds": 3.0,
+          "nodes": [
+            "nid001064"
+          ]
+        },
+        {
+          "step": "lx-Xg4-115141-274909-6649",
+          "id": "57982945.152",
+          "seconds": 162.0,
+          "nodes": [
+            "nid001064"
+          ]
+        },
+        {
+          "step": "lx-Xg4-115152-306359-5227",
+          "id": "57982945.153",
+          "seconds": 4.0,
+          "nodes": [
+            "nid001065"
+          ]
+        },
+        {
+          "step": "lx-Xg4-115149-275053-8583",
+          "id": "57982945.154",
+          "seconds": 290.0,
+          "nodes": [
+            "nid001064"
+          ]
+        },
+        {
+          "step": "lx-Xg4-115154-308913-4163",
+          "id": "57982945.155",
+          "seconds": 9.0,
+          "nodes": [
+            "nid001068"
+          ]
+        },
+        {
+          "step": "lx-Xg4-115145-274730-9627",
+          "id": "57982945.156",
+          "seconds": 325.0,
+          "nodes": [
+            "nid001064"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "55_F_static_P16_common_copied": [
+    {
+      "step": "lx-Xg4-114645-274286-4762",
+      "id": "57982945.148",
+      "start": "2026-09-06T11:46:48",
+      "end": "2026-09-06T11:51:28",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-114645-287164-3365",
+          "id": "57982945.146",
+          "seconds": 280.0,
+          "nodes": [
+            "nid001064",
+            "nid001065",
+            "nid001068",
+            "nid001128"
+          ]
+        },
+        {
+          "step": "lx-Xg4-114645-286901-1050",
+          "id": "57982945.147",
+          "seconds": 173.0,
+          "nodes": [
+            "nid001064"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ],
+  "56_P_static_P4_common_copied": [
+    {
+      "step": "lx-Xg4-115742-274518-7011",
+      "id": "57982945.163",
+      "start": "2026-09-06T11:57:43",
+      "end": "2026-09-06T11:58:54",
+      "overlaps": [],
+      "clean_gpu_interval": true
+    }
+  ],
+  "81_dynamic_common_rules_P4": [
+    {
+      "step": "lx-Xg4-115721-363470-4113",
+      "id": "57982945.159",
+      "start": "2026-09-06T11:57:24",
+      "end": "2026-09-06T12:00:40",
+      "overlaps": [
+        {
+          "step": "lx-Xg4-115721-277816-1303",
+          "id": "57982945.160",
+          "seconds": 76.0,
+          "nodes": [
+            "nid001065"
+          ]
+        }
+      ],
+      "clean_gpu_interval": false
+    }
+  ]
+}

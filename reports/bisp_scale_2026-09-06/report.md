@@ -1,3 +1,5 @@
+**Timing correction:** Slurm accounting proves overlapping full-GPU launches. The affected tables below are historical diagnostics, not valid scaling walls. See `runs/DEV/116_bisp_scale_codex_2026-09-06/gpu_overlap_audit.json`. Final audited intervals are being collected.
+
 Lane weight: heavy. Branch `perf/bisp-scale-2026-09-06`, unmerged. Measurement in progress; no 6x6 GW speedup or identity claim yet.
 
 | Unit | Charge PERF2 P/F (A/C) | Charge Na P16 claim 842 | Bispinor 6x6 P4 | Bispinor 6x6 P16 | Mapping / accounting scope |
@@ -56,7 +58,7 @@ Full parent profile12 completes267s under Nsight (not a baseline wall), JID57982
 
 ## Common-rule dynamic P4 (claim1255) and P16 compatibility
 
-New union-box certificates preserve all error/containment/noise guards; the eight schedules are identical (115 nodes). Runs25/26: total112.83/102.73s P/F, tau7.47/9.64s, screen28.50/23.96s. EQP0/1 max4.468/3.374µeV and sectors4µeV: exact FAIL. Profiles29/30 are exact against their own baseline. Their NCCL-trace captures perturb parent native timings substantially; CUDA-only repeat is in progress and no perturbed native ratio is treated as unprofiled speedup.
+New union-box certificates preserve all error/containment/noise guards; the eight schedules are identical (115 nodes). Runs25/26: total112.83/102.73s P/F, tau7.47/9.64s, screen28.50/23.96s. EQP0/1 max4.468/3.374µeV and sectors4µeV: exact FAIL. Profiles29/30 are exact against their own baseline. The overlap audit below invalidates their whole-wall/native timing comparison; trace-mode causation is NOT established.
 
 P16 parent09 finishes94s step wall (lx-Xg4-112718-6609-6855),646 compile events/34.26s rank0; parent dynamic23 finishes133s (lx-Xg4-112855-174741-8396),892 events/52.91s. Fixed10/24 refuse logical transverse194 at P16 in core.py:3407. A common whole-orbit logical200 set is being built for a compatible P4/P16 matrix; old and new centroid measurements will remain separate.
 

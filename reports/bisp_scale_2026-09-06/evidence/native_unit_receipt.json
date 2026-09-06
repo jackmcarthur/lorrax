@@ -1,0 +1,1643 @@
+{
+  "12_P_static_P4_profile_fresh": {
+    "run": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/12_P_static_P4_profile_fresh",
+    "units": [
+      {
+        "module": "module_0960.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 2606656548,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=960#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "727775082",
+            "Total Range Time (ns)": "730521060",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "727775082.0",
+            "Proj Med (ns)": "727775082.0",
+            "Proj Min (ns)": "727775082",
+            "Proj Max (ns)": "727775082",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "6466",
+            "Avg GPU Ops": "6466.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "4.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 3168
+        }
+      },
+      {
+        "module": "module_0993.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 874187764,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=993#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "743094922",
+            "Total Range Time (ns)": "667120820",
+            "Range Instances": "3",
+            "Proj Avg (ns)": "247698307.3",
+            "Proj Med (ns)": "236391772.0",
+            "Proj Min (ns)": "236313820",
+            "Proj Max (ns)": "270389330",
+            "Proj StdDev (ns)": "19651040.7",
+            "Total GPU Ops": "19390",
+            "Avg GPU Ops": "6463.3",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "4.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9504
+        }
+      },
+      {
+        "module": "module_1042.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 874187252,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=1042#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "695644627",
+            "Total Range Time (ns)": "583644462",
+            "Range Instances": "3",
+            "Proj Avg (ns)": "231881542.3",
+            "Proj Med (ns)": "231873956.0",
+            "Proj Min (ns)": "231615563",
+            "Proj Max (ns)": "232155108",
+            "Proj StdDev (ns)": "269852.5",
+            "Total GPU Ops": "19386",
+            "Avg GPU Ops": "6462.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "4.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9504
+        }
+      },
+      {
+        "module": "module_1087.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 292797140,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=1087#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "1148410130",
+            "Total Range Time (ns)": "987594259",
+            "Range Instances": "9",
+            "Proj Avg (ns)": "127601125.6",
+            "Proj Med (ns)": "125745773.0",
+            "Proj Min (ns)": "125606799",
+            "Proj Max (ns)": "142721512",
+            "Proj StdDev (ns)": "5670666.4",
+            "Total GPU Ops": "58162",
+            "Avg GPU Ops": "6462.4",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "4.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 28512
+        }
+      },
+      {
+        "module": "module_1427.jit__photon_q0_factor_orbit",
+        "peak_bytes": 2884140,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit__photon_q0_factor_orbit,program_id=1427#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "344544",
+            "Total Range Time (ns)": "1661672",
+            "Range Instances": "10",
+            "Proj Avg (ns)": "34454.4",
+            "Proj Med (ns)": "32496.0",
+            "Proj Min (ns)": "31648",
+            "Proj Max (ns)": "48768",
+            "Proj StdDev (ns)": "5354.1",
+            "Total GPU Ops": "10",
+            "Avg GPU Ops": "1.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "1.0"
+          }
+        ],
+        "nccl_kernel_counts": {}
+      },
+      {
+        "module": "module_1512.jit_contract_block",
+        "peak_bytes": 1732891144,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1512#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "102189232",
+            "Total Range Time (ns)": "32826615",
+            "Range Instances": "3",
+            "Proj Avg (ns)": "34063077.3",
+            "Proj Med (ns)": "33855984.0",
+            "Proj Min (ns)": "33843664",
+            "Proj Max (ns)": "34489584",
+            "Proj StdDev (ns)": "369417.0",
+            "Total GPU Ops": "1245",
+            "Avg GPU Ops": "415.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 600
+        }
+      },
+      {
+        "module": "module_1574.jit_contract_block",
+        "peak_bytes": 573907784,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1574#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "153848311",
+            "Total Range Time (ns)": "62927316",
+            "Range Instances": "9",
+            "Proj Avg (ns)": "17094256.8",
+            "Proj Med (ns)": "17070552.0",
+            "Proj Min (ns)": "17028791",
+            "Proj Max (ns)": "17320088",
+            "Proj StdDev (ns)": "86639.5",
+            "Total GPU Ops": "3735",
+            "Avg GPU Ops": "415.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 1800
+        }
+      },
+      {
+        "module": "module_1638.jit_contract_block",
+        "peak_bytes": 573907784,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1638#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "148568674",
+            "Total Range Time (ns)": "57467552",
+            "Range Instances": "9",
+            "Proj Avg (ns)": "16507630.4",
+            "Proj Med (ns)": "16510649.0",
+            "Proj Min (ns)": "16472633",
+            "Proj Max (ns)": "16523737",
+            "Proj StdDev (ns)": "18273.4",
+            "Total GPU Ops": "3735",
+            "Avg GPU Ops": "415.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 1800
+        }
+      },
+      {
+        "module": "module_1698.jit_contract_block",
+        "peak_bytes": 189953736,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1698#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "244025983",
+            "Total Range Time (ns)": "166216642",
+            "Range Instances": "27",
+            "Proj Avg (ns)": "9037999.4",
+            "Proj Med (ns)": "9013835.0",
+            "Proj Min (ns)": "8987786",
+            "Proj Max (ns)": "9575146",
+            "Proj StdDev (ns)": "108894.2",
+            "Total GPU Ops": "11205",
+            "Avg GPU Ops": "415.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 5400
+        }
+      }
+    ],
+    "thunks": [
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.12#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "297357923",
+        "Total Range Time (ns)": "212364527",
+        "Range Instances": "48",
+        "Proj Avg (ns)": "6194956.7",
+        "Proj Med (ns)": "4740117.0",
+        "Proj Min (ns)": "4679893",
+        "Proj Max (ns)": "12019779",
+        "Proj StdDev (ns)": "1997433.7",
+        "Total GPU Ops": "13824",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.14#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "152253654",
+        "Total Range Time (ns)": "41553653",
+        "Range Instances": "48",
+        "Proj Avg (ns)": "3171951.1",
+        "Proj Med (ns)": "2025307.0",
+        "Proj Min (ns)": "1967259",
+        "Proj Max (ns)": "8623179",
+        "Proj StdDev (ns)": "1733360.1",
+        "Total GPU Ops": "2688",
+        "Avg GPU Ops": "56.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/jit(_convolve)/shard_map/ffi_call,hlo_op=ffi_call.13#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "79690214",
+        "Total Range Time (ns)": "14497456",
+        "Range Instances": "48",
+        "Proj Avg (ns)": "1660212.8",
+        "Proj Med (ns)": "725694.5",
+        "Proj Min (ns)": "719326",
+        "Proj Max (ns)": "6783792",
+        "Proj StdDev (ns)": "1514387.4",
+        "Total GPU Ops": "336",
+        "Avg GPU Ops": "7.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.15#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "65549865",
+        "Total Range Time (ns)": "40704958",
+        "Range Instances": "48",
+        "Proj Avg (ns)": "1365622.2",
+        "Proj Med (ns)": "1059229.0",
+        "Proj Min (ns)": "1052574",
+        "Proj Max (ns)": "2291643",
+        "Proj StdDev (ns)": "538125.3",
+        "Total GPU Ops": "2688",
+        "Avg GPU Ops": "56.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      }
+    ]
+  },
+  "28_F_static_P4_profile_copied_zeta": {
+    "run": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/28_F_static_P4_profile_copied_zeta",
+    "units": [
+      {
+        "module": "module_0455.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 2706078096,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=455#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "793095913",
+            "Total Range Time (ns)": "793720450",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "793095913.0",
+            "Proj Med (ns)": "793095913.0",
+            "Proj Min (ns)": "793095913",
+            "Proj Max (ns)": "793095913",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "6468",
+            "Avg GPU Ops": "6468.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "6.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 3168
+        }
+      },
+      {
+        "module": "module_0471.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 939855392,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=471#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "707249000",
+            "Total Range Time (ns)": "632351494",
+            "Range Instances": "3",
+            "Proj Avg (ns)": "235749666.7",
+            "Proj Med (ns)": "231797336.0",
+            "Proj Min (ns)": "231026170",
+            "Proj Max (ns)": "244425494",
+            "Proj StdDev (ns)": "7523374.2",
+            "Total GPU Ops": "19396",
+            "Avg GPU Ops": "6465.3",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "6.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9504
+        }
+      },
+      {
+        "module": "module_0503.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 939854880,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=503#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "705333989",
+            "Total Range Time (ns)": "590472220",
+            "Range Instances": "3",
+            "Proj Avg (ns)": "235111329.7",
+            "Proj Med (ns)": "235034868.0",
+            "Proj Min (ns)": "234952249",
+            "Proj Max (ns)": "235346872",
+            "Proj StdDev (ns)": "208126.4",
+            "Total GPU Ops": "19392",
+            "Avg GPU Ops": "6464.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "6.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9504
+        }
+      },
+      {
+        "module": "module_0531.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 325283968,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=531#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "1161956992",
+            "Total Range Time (ns)": "998742792",
+            "Range Instances": "9",
+            "Proj Avg (ns)": "129106332.4",
+            "Proj Med (ns)": "127499826.0",
+            "Proj Min (ns)": "127386034",
+            "Proj Max (ns)": "142226285",
+            "Proj StdDev (ns)": "4920399.3",
+            "Total GPU Ops": "58180",
+            "Avg GPU Ops": "6464.4",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "6.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 28512
+        }
+      },
+      {
+        "module": "module_0764.jit_contract_block",
+        "peak_bytes": 2766694692,
+        "static_collectives": {
+          "all-gather": 4
+        },
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=764#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "386444070",
+            "Total Range Time (ns)": "140756735",
+            "Range Instances": "3",
+            "Proj Avg (ns)": "128814690.0",
+            "Proj Med (ns)": "128037241.0",
+            "Proj Min (ns)": "128029562",
+            "Proj Max (ns)": "130377267",
+            "Proj StdDev (ns)": "1353236.8",
+            "Total GPU Ops": "4433",
+            "Avg GPU Ops": "1477.7",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "7.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 2160,
+          "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 6,
+          "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)": 3
+        }
+      },
+      {
+        "module": "module_0855.jit_contract_block",
+        "peak_bytes": 946367780,
+        "static_collectives": {
+          "all-gather": 4
+        },
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=855#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "608768090",
+            "Total Range Time (ns)": "218154063",
+            "Range Instances": "9",
+            "Proj Avg (ns)": "67640898.9",
+            "Proj Med (ns)": "67642420.0",
+            "Proj Min (ns)": "67568950",
+            "Proj Max (ns)": "67779763",
+            "Proj StdDev (ns)": "67285.4",
+            "Total GPU Ops": "13299",
+            "Avg GPU Ops": "1477.7",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "7.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 6480,
+          "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 18,
+          "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9
+        }
+      },
+      {
+        "module": "module_0925.jit_contract_block",
+        "peak_bytes": 946367780,
+        "static_collectives": {
+          "all-gather": 4
+        },
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=925#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "577080199",
+            "Total Range Time (ns)": "222429415",
+            "Range Instances": "9",
+            "Proj Avg (ns)": "64120022.1",
+            "Proj Med (ns)": "64165055.0",
+            "Proj Min (ns)": "63979679",
+            "Proj Max (ns)": "64260735",
+            "Proj StdDev (ns)": "99692.9",
+            "Total GPU Ops": "13299",
+            "Avg GPU Ops": "1477.7",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "7.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 6480,
+          "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 18,
+          "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9
+        }
+      },
+      {
+        "module": "module_0981.jit_contract_block",
+        "peak_bytes": 326657700,
+        "static_collectives": {
+          "all-gather": 4
+        },
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=981#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "1027712605",
+            "Total Range Time (ns)": "634723259",
+            "Range Instances": "27",
+            "Proj Avg (ns)": "38063429.8",
+            "Proj Med (ns)": "36629892.0",
+            "Proj Min (ns)": "36516708",
+            "Proj Max (ns)": "56657200",
+            "Proj StdDev (ns)": "5043679.5",
+            "Total GPU Ops": "39897",
+            "Avg GPU Ops": "1477.7",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "7.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 19440,
+          "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)": 27,
+          "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 54
+        }
+      }
+    ],
+    "thunks": [
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.44#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "465175299",
+        "Total Range Time (ns)": "141421653",
+        "Range Instances": "32",
+        "Proj Avg (ns)": "14536728.1",
+        "Proj Med (ns)": "9584071.5",
+        "Proj Min (ns)": "9508200",
+        "Proj Max (ns)": "38535550",
+        "Proj StdDev (ns)": "7631126.7",
+        "Total GPU Ops": "9216",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.46#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "464802978",
+        "Total Range Time (ns)": "141524560",
+        "Range Instances": "32",
+        "Proj Avg (ns)": "14525093.1",
+        "Proj Med (ns)": "9593095.5",
+        "Proj Min (ns)": "9478920",
+        "Proj Max (ns)": "38450942",
+        "Proj StdDev (ns)": "7617205.4",
+        "Total GPU Ops": "9216",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.38#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "232921876",
+        "Total Range Time (ns)": "66572129",
+        "Range Instances": "16",
+        "Proj Avg (ns)": "14557617.3",
+        "Proj Med (ns)": "9577063.5",
+        "Proj Min (ns)": "9509448",
+        "Proj Max (ns)": "38500254",
+        "Proj StdDev (ns)": "7765090.8",
+        "Total GPU Ops": "4608",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.40#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "232222933",
+        "Total Range Time (ns)": "66487899",
+        "Range Instances": "16",
+        "Proj Avg (ns)": "14513933.3",
+        "Proj Med (ns)": "9569495.5",
+        "Proj Min (ns)": "9513896",
+        "Proj Max (ns)": "38427710",
+        "Proj StdDev (ns)": "7733935.5",
+        "Total GPU Ops": "4608",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.47#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "224789445",
+        "Total Range Time (ns)": "149073882",
+        "Range Instances": "32",
+        "Proj Avg (ns)": "7024670.2",
+        "Proj Med (ns)": "5431602.0",
+        "Proj Min (ns)": "5379635",
+        "Proj Max (ns)": "11905474",
+        "Proj StdDev (ns)": "2828168.1",
+        "Total GPU Ops": "9216",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.45#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "224362024",
+        "Total Range Time (ns)": "140329480",
+        "Range Instances": "32",
+        "Proj Avg (ns)": "7011313.3",
+        "Proj Med (ns)": "5406210.0",
+        "Proj Min (ns)": "5364179",
+        "Proj Max (ns)": "11879234",
+        "Proj StdDev (ns)": "2827798.6",
+        "Total GPU Ops": "9216",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.42#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "198690280",
+        "Total Range Time (ns)": "144781048",
+        "Range Instances": "32",
+        "Proj Avg (ns)": "6209071.3",
+        "Proj Med (ns)": "5229747.0",
+        "Proj Min (ns)": "4634709",
+        "Proj Max (ns)": "12027618",
+        "Proj StdDev (ns)": "1990111.6",
+        "Total GPU Ops": "9216",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.41#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "112942787",
+        "Total Range Time (ns)": "89281898",
+        "Range Instances": "16",
+        "Proj Avg (ns)": "7058924.2",
+        "Proj Med (ns)": "5478402.0",
+        "Proj Min (ns)": "5392691",
+        "Proj Max (ns)": "11890242",
+        "Proj StdDev (ns)": "2861744.0",
+        "Total GPU Ops": "4608",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.39#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "112110885",
+        "Total Range Time (ns)": "65773205",
+        "Range Instances": "16",
+        "Proj Avg (ns)": "7006930.3",
+        "Proj Med (ns)": "5410755.0",
+        "Proj Min (ns)": "5366162",
+        "Proj Max (ns)": "11852450",
+        "Proj StdDev (ns)": "2881438.0",
+        "Total GPU Ops": "4608",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.36#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "110900294",
+        "Total Range Time (ns)": "67972887",
+        "Range Instances": "16",
+        "Proj Avg (ns)": "6931268.4",
+        "Proj Med (ns)": "6146913.0",
+        "Proj Min (ns)": "4651956",
+        "Proj Max (ns)": "16635030",
+        "Proj StdDev (ns)": "3260665.1",
+        "Total GPU Ops": "4608",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_convolve)/shard_map/ffi_call,hlo_op=ffi_call.43#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "53256057",
+        "Total Range Time (ns)": "3843898",
+        "Range Instances": "32",
+        "Proj Avg (ns)": "1664251.8",
+        "Proj Med (ns)": "730030.0",
+        "Proj Min (ns)": "718942",
+        "Proj Max (ns)": "6822318",
+        "Proj StdDev (ns)": "1527945.7",
+        "Total GPU Ops": "224",
+        "Avg GPU Ops": "7.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_1_fun/jit(_convolve)/shard_map/ffi_call,hlo_op=ffi_call.37#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "26591006",
+        "Total Range Time (ns)": "599228",
+        "Range Instances": "16",
+        "Proj Avg (ns)": "1661937.9",
+        "Proj Med (ns)": "727214.0",
+        "Proj Min (ns)": "720094",
+        "Proj Max (ns)": "6790191",
+        "Proj StdDev (ns)": "1550353.4",
+        "Total GPU Ops": "112",
+        "Avg GPU Ops": "7.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/jit(_pad)/pad,hlo_op=collective-permute-start#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "25292066",
+        "Total Range Time (ns)": "2130615",
+        "Range Instances": "48",
+        "Proj Avg (ns)": "526918.0",
+        "Proj Med (ns)": "9856.0",
+        "Proj Min (ns)": "9344",
+        "Proj Max (ns)": "16673206",
+        "Proj StdDev (ns)": "2654780.7",
+        "Total GPU Ops": "48",
+        "Avg GPU Ops": "1.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      }
+    ]
+  },
+  "33_P_dynamic_P4_profile_cuda": {
+    "run": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/33_P_dynamic_P4_profile_cuda",
+    "units": [
+      {
+        "module": "module_0830.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 2606656548,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=830#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "427055451",
+            "Total Range Time (ns)": "357046134",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "427055451.0",
+            "Proj Med (ns)": "427055451.0",
+            "Proj Min (ns)": "427055451",
+            "Proj Max (ns)": "427055451",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "6462",
+            "Avg GPU Ops": "6462.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "4.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 3168
+        }
+      },
+      {
+        "module": "module_0863.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 874187764,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=863#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "599148851",
+            "Total Range Time (ns)": "536827105",
+            "Range Instances": "3",
+            "Proj Avg (ns)": "199716283.7",
+            "Proj Med (ns)": "194789138.0",
+            "Proj Min (ns)": "194734194",
+            "Proj Max (ns)": "209625519",
+            "Proj StdDev (ns)": "8581693.5",
+            "Total GPU Ops": "19390",
+            "Avg GPU Ops": "6463.3",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "4.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9504
+        }
+      },
+      {
+        "module": "module_0912.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 874187252,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=912#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "613538992",
+            "Total Range Time (ns)": "517100261",
+            "Range Instances": "3",
+            "Proj Avg (ns)": "204512997.3",
+            "Proj Med (ns)": "194616338.0",
+            "Proj Min (ns)": "194569394",
+            "Proj Max (ns)": "224353260",
+            "Proj StdDev (ns)": "17182187.5",
+            "Total GPU Ops": "19386",
+            "Avg GPU Ops": "6462.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "4.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9504
+        }
+      },
+      {
+        "module": "module_0957.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 292797140,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=957#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "925385866",
+            "Total Range Time (ns)": "849399176",
+            "Range Instances": "9",
+            "Proj Avg (ns)": "102820651.8",
+            "Proj Med (ns)": "97163769.0",
+            "Proj Min (ns)": "96942906",
+            "Proj Max (ns)": "132761253",
+            "Proj StdDev (ns)": "11774151.1",
+            "Total GPU Ops": "58162",
+            "Avg GPU Ops": "6462.4",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "4.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 28512
+        }
+      },
+      {
+        "module": "module_1143.jit__photon_q0_factor_orbit",
+        "peak_bytes": 2884140,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit__photon_q0_factor_orbit,program_id=1143#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "397694",
+            "Total Range Time (ns)": "3516245",
+            "Range Instances": "10",
+            "Proj Avg (ns)": "39769.4",
+            "Proj Med (ns)": "39103.5",
+            "Proj Min (ns)": "36352",
+            "Proj Max (ns)": "45664",
+            "Proj StdDev (ns)": "2942.3",
+            "Total GPU Ops": "10",
+            "Avg GPU Ops": "1.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "1.0"
+          }
+        ],
+        "nccl_kernel_counts": {}
+      },
+      {
+        "module": "module_1342.jit_contract_block",
+        "peak_bytes": 573907784,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1342#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "138064905",
+            "Total Range Time (ns)": "57969938",
+            "Range Instances": "9",
+            "Proj Avg (ns)": "15340545.0",
+            "Proj Med (ns)": "15200887.0",
+            "Proj Min (ns)": "14963319",
+            "Proj Max (ns)": "16255413",
+            "Proj StdDev (ns)": "528443.8",
+            "Total GPU Ops": "3735",
+            "Avg GPU Ops": "415.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 1800
+        }
+      },
+      {
+        "module": "module_1406.jit_contract_block",
+        "peak_bytes": 573907784,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1406#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "134252367",
+            "Total Range Time (ns)": "56175047",
+            "Range Instances": "9",
+            "Proj Avg (ns)": "14916929.7",
+            "Proj Med (ns)": "14741528.0",
+            "Proj Min (ns)": "14696920",
+            "Proj Max (ns)": "15953749",
+            "Proj StdDev (ns)": "406151.4",
+            "Total GPU Ops": "3735",
+            "Avg GPU Ops": "415.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 1800
+        }
+      },
+      {
+        "module": "module_1468.jit_contract_block",
+        "peak_bytes": 189953736,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1468#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "217241833",
+            "Total Range Time (ns)": "169196497",
+            "Range Instances": "27",
+            "Proj Avg (ns)": "8045993.8",
+            "Proj Med (ns)": "7883850.0",
+            "Proj Min (ns)": "7779915",
+            "Proj Max (ns)": "9172614",
+            "Proj StdDev (ns)": "370416.8",
+            "Total GPU Ops": "11205",
+            "Avg GPU Ops": "415.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "12.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 5400
+        }
+      },
+      {
+        "module": "module_2166.jit__tau",
+        "peak_bytes": 1787452481,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit__tau,program_id=2166#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "3654196737",
+            "Total Range Time (ns)": "347783803",
+            "Range Instances": "115",
+            "Proj Avg (ns)": "31775623.8",
+            "Proj Med (ns)": "31595752.0",
+            "Proj Min (ns)": "31522440",
+            "Proj Max (ns)": "34659260",
+            "Proj StdDev (ns)": "679395.6",
+            "Total GPU Ops": "24955",
+            "Avg GPU Ops": "217.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "18.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9660,
+          "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)": 230
+        }
+      }
+    ],
+    "thunks": [
+      {
+        "Range": "TSL:Thunk:#name=jit(_tau)/jit(kernel)/jit(conv_project)/shard_map/ffi_call,hlo_op=ffi_call.13#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "780099076",
+        "Total Range Time (ns)": "4488666",
+        "Range Instances": "115",
+        "Proj Avg (ns)": "6783470.2",
+        "Proj Med (ns)": "6787021.0",
+        "Proj Min (ns)": "6699084",
+        "Proj Max (ns)": "6821229",
+        "Proj StdDev (ns)": "20626.6",
+        "Total GPU Ops": "805",
+        "Avg GPU Ops": "7.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(_tau)/jit(kernel)/jit(conv_project)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.14#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "778378797",
+        "Total Range Time (ns)": "106947696",
+        "Range Instances": "115",
+        "Proj Avg (ns)": "6768511.3",
+        "Proj Med (ns)": "6839309.0",
+        "Proj Min (ns)": "5546896",
+        "Proj Max (ns)": "6914541",
+        "Proj StdDev (ns)": "258142.5",
+        "Total GPU Ops": "8050",
+        "Avg GPU Ops": "70.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.12#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "225857620",
+        "Total Range Time (ns)": "198392557",
+        "Range Instances": "45",
+        "Proj Avg (ns)": "5019058.2",
+        "Proj Med (ns)": "4229557.0",
+        "Proj Min (ns)": "3864342",
+        "Proj Max (ns)": "6961485",
+        "Proj StdDev (ns)": "1162814.0",
+        "Total GPU Ops": "12960",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(_tau)/jit(kernel)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.12#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "214699875",
+        "Total Range Time (ns)": "103207082",
+        "Range Instances": "115",
+        "Proj Avg (ns)": "1866955.4",
+        "Proj Med (ns)": "1848667.0",
+        "Proj Min (ns)": "1814683",
+        "Proj Max (ns)": "2202169",
+        "Proj StdDev (ns)": "73673.3",
+        "Total GPU Ops": "6440",
+        "Avg GPU Ops": "56.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(_tau)/jit(kernel)/jit(conv_project)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.15#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "118380978",
+        "Total Range Time (ns)": "104828285",
+        "Range Instances": "115",
+        "Proj Avg (ns)": "1029399.8",
+        "Proj Med (ns)": "1023837.0",
+        "Proj Min (ns)": "999581",
+        "Proj Max (ns)": "1121244",
+        "Proj StdDev (ns)": "21603.0",
+        "Total GPU Ops": "8050",
+        "Avg GPU Ops": "70.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.14#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "100868012",
+        "Total Range Time (ns)": "38194516",
+        "Range Instances": "45",
+        "Proj Avg (ns)": "2241511.4",
+        "Proj Med (ns)": "1633788.0",
+        "Proj Min (ns)": "1602588",
+        "Proj Max (ns)": "3884373",
+        "Proj StdDev (ns)": "804951.7",
+        "Total GPU Ops": "2520",
+        "Avg GPU Ops": "56.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(_tau)/jit(kernel)/jit(_do_unfold)/transpose,hlo_op=collective-permute-start#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "76184964",
+        "Total Range Time (ns)": "4152927",
+        "Range Instances": "115",
+        "Proj Avg (ns)": "662477.9",
+        "Proj Med (ns)": "628094.0",
+        "Proj Min (ns)": "626943",
+        "Proj Max (ns)": "1131100",
+        "Proj StdDev (ns)": "75039.6",
+        "Total GPU Ops": "115",
+        "Avg GPU Ops": "1.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/jit(_convolve)/shard_map/ffi_call,hlo_op=ffi_call.13#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "59811421",
+        "Total Range Time (ns)": "1920767",
+        "Range Instances": "45",
+        "Proj Avg (ns)": "1329142.7",
+        "Proj Med (ns)": "737502.0",
+        "Proj Min (ns)": "730974",
+        "Proj Max (ns)": "2224698",
+        "Proj StdDev (ns)": "735461.2",
+        "Total GPU Ops": "315",
+        "Avg GPU Ops": "7.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.15#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "53614126",
+        "Total Range Time (ns)": "37499914",
+        "Range Instances": "45",
+        "Proj Avg (ns)": "1191425.0",
+        "Proj Med (ns)": "942813.0",
+        "Proj Min (ns)": "910558",
+        "Proj Max (ns)": "2357306",
+        "Proj StdDev (ns)": "485434.8",
+        "Total GPU Ops": "2520",
+        "Avg GPU Ops": "56.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(_tau)/jit(kernel)/jit(conv_project)/jit(_f)/transpose,hlo_op=collective-permute-start.1#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "995710",
+        "Total Range Time (ns)": "3353969",
+        "Range Instances": "115",
+        "Proj Avg (ns)": "8658.3",
+        "Proj Med (ns)": "8512.0",
+        "Proj Min (ns)": "8287",
+        "Proj Max (ns)": "10816",
+        "Proj StdDev (ns)": "533.9",
+        "Total GPU Ops": "115",
+        "Avg GPU Ops": "1.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      }
+    ]
+  },
+  "34_F_dynamic_P4_profile_cuda": {
+    "run": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/34_F_dynamic_P4_profile_cuda",
+    "units": [
+      {
+        "module": "module_0597.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 2706078096,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=597#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "481145436",
+            "Total Range Time (ns)": "402375111",
+            "Range Instances": "1",
+            "Proj Avg (ns)": "481145436.0",
+            "Proj Med (ns)": "481145436.0",
+            "Proj Min (ns)": "481145436",
+            "Proj Max (ns)": "481145436",
+            "Proj StdDev (ns)": "0.0",
+            "Total GPU Ops": "6464",
+            "Avg GPU Ops": "6464.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "6.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 3168
+        }
+      },
+      {
+        "module": "module_0613.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 939855392,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=613#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "699810860",
+            "Total Range Time (ns)": "626565343",
+            "Range Instances": "3",
+            "Proj Avg (ns)": "233270286.7",
+            "Proj Med (ns)": "226931456.0",
+            "Proj Min (ns)": "226874624",
+            "Proj Max (ns)": "246004780",
+            "Proj StdDev (ns)": "11028431.3",
+            "Total GPU Ops": "19396",
+            "Avg GPU Ops": "6465.3",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "6.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9504
+        }
+      },
+      {
+        "module": "module_0645.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 939854880,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=645#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "692253788",
+            "Total Range Time (ns)": "579874232",
+            "Range Instances": "3",
+            "Proj Avg (ns)": "230751262.7",
+            "Proj Med (ns)": "230710339.0",
+            "Proj Min (ns)": "230690019",
+            "Proj Max (ns)": "230853430",
+            "Proj StdDev (ns)": "89060.9",
+            "Total GPU Ops": "19392",
+            "Avg GPU Ops": "6464.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "6.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9504
+        }
+      },
+      {
+        "module": "module_0673.jit_minimax_tau_integrate_chi_vertex",
+        "peak_bytes": 325283968,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_minimax_tau_integrate_chi_vertex,program_id=673#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "1136195411",
+            "Total Range Time (ns)": "977081984",
+            "Range Instances": "9",
+            "Proj Avg (ns)": "126243934.6",
+            "Proj Med (ns)": "124370635.0",
+            "Proj Min (ns)": "124254764",
+            "Proj Max (ns)": "141113628",
+            "Proj StdDev (ns)": "5577430.3",
+            "Total GPU Ops": "58180",
+            "Avg GPU Ops": "6464.4",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "6.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 28512
+        }
+      },
+      {
+        "module": "module_1006.jit_contract_block",
+        "peak_bytes": 946367780,
+        "static_collectives": {
+          "all-gather": 4
+        },
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1006#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "607611368",
+            "Total Range Time (ns)": "221545228",
+            "Range Instances": "9",
+            "Proj Avg (ns)": "67512374.2",
+            "Proj Med (ns)": "67516356.0",
+            "Proj Min (ns)": "67434981",
+            "Proj Max (ns)": "67586563",
+            "Proj StdDev (ns)": "44737.9",
+            "Total GPU Ops": "13299",
+            "Avg GPU Ops": "1477.7",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "7.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 6480,
+          "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 18,
+          "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9
+        }
+      },
+      {
+        "module": "module_1099.jit_contract_block",
+        "peak_bytes": 946367780,
+        "static_collectives": {
+          "all-gather": 4
+        },
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1099#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "576892158",
+            "Total Range Time (ns)": "222993303",
+            "Range Instances": "9",
+            "Proj Avg (ns)": "64099128.7",
+            "Proj Med (ns)": "64073557.0",
+            "Proj Min (ns)": "64011638",
+            "Proj Max (ns)": "64262805",
+            "Proj StdDev (ns)": "78356.4",
+            "Total GPU Ops": "13299",
+            "Avg GPU Ops": "1477.7",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "7.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 6480,
+          "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 18,
+          "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)": 9
+        }
+      },
+      {
+        "module": "module_1155.jit_contract_block",
+        "peak_bytes": 326657700,
+        "static_collectives": {
+          "all-gather": 4
+        },
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit_contract_block,program_id=1155#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "989663885",
+            "Total Range Time (ns)": "605025956",
+            "Range Instances": "27",
+            "Proj Avg (ns)": "36654218.0",
+            "Proj Med (ns)": "36659304.0",
+            "Proj Min (ns)": "36493288",
+            "Proj Max (ns)": "36756967",
+            "Proj StdDev (ns)": "52217.2",
+            "Total GPU Ops": "39897",
+            "Avg GPU Ops": "1477.7",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "7.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 19440,
+          "ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 54,
+          "ncclDevKernel_SendRecv(ncclDevKernelArgsStorage<(unsigned long)4096>)": 27
+        }
+      },
+      {
+        "module": "module_1805.jit__tau",
+        "peak_bytes": 1859482233,
+        "static_collectives": {},
+        "projected": [
+          {
+            "Range": "TSL:XlaModule:#hlo_module=jit__tau,program_id=1805#",
+            "Style": "PushPop",
+            "Total Proj Time (ns)": "7278087030",
+            "Total Range Time (ns)": "1645198734",
+            "Range Instances": "115",
+            "Proj Avg (ns)": "63287713.3",
+            "Proj Med (ns)": "63283455.0",
+            "Proj Min (ns)": "63198247",
+            "Proj Max (ns)": "63397055",
+            "Proj StdDev (ns)": "41204.9",
+            "Total GPU Ops": "117990",
+            "Avg GPU Ops": "1026.0",
+            "Avg Range Lvl": "0.0",
+            "Avg Num Child": "15.0"
+          }
+        ],
+        "nccl_kernel_counts": {
+          "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)": 49680
+        }
+      }
+    ],
+    "thunks": [
+      {
+        "Range": "TSL:Thunk:#name=jit(_tau)/jit(kernel)/jit(conv_project)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.14#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "3919251934",
+        "Total Range Time (ns)": "553398098",
+        "Range Instances": "115",
+        "Proj Avg (ns)": "34080451.6",
+        "Proj Med (ns)": "34074134.0",
+        "Proj Min (ns)": "34023642",
+        "Proj Max (ns)": "34177786",
+        "Proj StdDev (ns)": "25154.2",
+        "Total GPU Ops": "41400",
+        "Avg GPU Ops": "360.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(_tau)/jit(kernel)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.12#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "1383371523",
+        "Total Range Time (ns)": "518703074",
+        "Range Instances": "115",
+        "Proj Avg (ns)": "12029317.6",
+        "Proj Med (ns)": "12028274.0",
+        "Proj Min (ns)": "11941009",
+        "Proj Max (ns)": "12125713",
+        "Proj StdDev (ns)": "29606.1",
+        "Total GPU Ops": "33120",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(_tau)/jit(kernel)/jit(conv_project)/shard_map/ffi_call,hlo_op=ffi_call.13#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "782024849",
+        "Total Range Time (ns)": "4769175",
+        "Range Instances": "115",
+        "Proj Avg (ns)": "6800216.1",
+        "Proj Med (ns)": "6800677.0",
+        "Proj Min (ns)": "6771910",
+        "Proj Max (ns)": "6824486",
+        "Proj StdDev (ns)": "10979.9",
+        "Total GPU Ops": "805",
+        "Avg GPU Ops": "7.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(_tau)/jit(kernel)/jit(conv_project)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.15#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "597786959",
+        "Total Range Time (ns)": "550922056",
+        "Range Instances": "115",
+        "Proj Avg (ns)": "5198147.5",
+        "Proj Med (ns)": "5198988.0",
+        "Proj Min (ns)": "5164716",
+        "Proj Max (ns)": "5224779",
+        "Proj StdDev (ns)": "12261.8",
+        "Total GPU Ops": "41400",
+        "Avg GPU Ops": "360.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.44#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "387567375",
+        "Total Range Time (ns)": "128646084",
+        "Range Instances": "30",
+        "Proj Avg (ns)": "12918912.5",
+        "Proj Med (ns)": "9552120.0",
+        "Proj Min (ns)": "9468505",
+        "Proj Max (ns)": "20302667",
+        "Proj StdDev (ns)": "4465041.4",
+        "Total GPU Ops": "8640",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.46#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "387154991",
+        "Total Range Time (ns)": "127773404",
+        "Range Instances": "30",
+        "Proj Avg (ns)": "12905166.4",
+        "Proj Med (ns)": "9542248.5",
+        "Proj Min (ns)": "9476665",
+        "Proj Max (ns)": "20305739",
+        "Proj StdDev (ns)": "4469396.1",
+        "Total GPU Ops": "8640",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.47#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "201652218",
+        "Total Range Time (ns)": "125405037",
+        "Range Instances": "30",
+        "Proj Avg (ns)": "6721740.6",
+        "Proj Med (ns)": "5457273.5",
+        "Proj Min (ns)": "5391210",
+        "Proj Max (ns)": "11880623",
+        "Proj StdDev (ns)": "2602368.5",
+        "Total GPU Ops": "8640",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.45#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "201074519",
+        "Total Range Time (ns)": "126703498",
+        "Range Instances": "30",
+        "Proj Avg (ns)": "6702484.0",
+        "Proj Med (ns)": "5442346.0",
+        "Proj Min (ns)": "5376201",
+        "Proj Max (ns)": "11822094",
+        "Proj StdDev (ns)": "2583385.4",
+        "Total GPU Ops": "8640",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.38#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "194299064",
+        "Total Range Time (ns)": "64029583",
+        "Range Instances": "15",
+        "Proj Avg (ns)": "12953270.9",
+        "Proj Med (ns)": "9611384.0",
+        "Proj Min (ns)": "9520568",
+        "Proj Max (ns)": "20409132",
+        "Proj StdDev (ns)": "4554614.3",
+        "Total GPU Ops": "4320",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.40#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "193209147",
+        "Total Range Time (ns)": "64553127",
+        "Range Instances": "15",
+        "Proj Avg (ns)": "12880609.8",
+        "Proj Med (ns)": "9536984.0",
+        "Proj Min (ns)": "9453113",
+        "Proj Max (ns)": "20272172",
+        "Proj StdDev (ns)": "4545148.1",
+        "Total GPU Ops": "4320",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.42#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "172860335",
+        "Total Range Time (ns)": "131124264",
+        "Range Instances": "30",
+        "Proj Avg (ns)": "5762011.2",
+        "Proj Med (ns)": "4698172.5",
+        "Proj Min (ns)": "4655501",
+        "Proj Max (ns)": "7547425",
+        "Proj StdDev (ns)": "1349173.7",
+        "Total GPU Ops": "8640",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.41#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "101217979",
+        "Total Range Time (ns)": "64155779",
+        "Range Instances": "15",
+        "Proj Avg (ns)": "6747865.3",
+        "Proj Med (ns)": "5501673.0",
+        "Proj Min (ns)": "5391689",
+        "Proj Max (ns)": "11865006",
+        "Proj StdDev (ns)": "2624213.2",
+        "Total GPU Ops": "4320",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.39#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "100617853",
+        "Total Range Time (ns)": "63248480",
+        "Range Instances": "15",
+        "Proj Avg (ns)": "6707856.9",
+        "Proj Med (ns)": "5445481.0",
+        "Proj Min (ns)": "5375049",
+        "Proj Max (ns)": "11836334",
+        "Proj StdDev (ns)": "2650937.2",
+        "Total GPU Ops": "4320",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.36#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "86755672",
+        "Total Range Time (ns)": "65351421",
+        "Range Instances": "15",
+        "Proj Avg (ns)": "5783711.5",
+        "Proj Med (ns)": "4759180.0",
+        "Proj Min (ns)": "4647949",
+        "Proj Max (ns)": "7572352",
+        "Proj StdDev (ns)": "1372490.8",
+        "Total GPU Ops": "4320",
+        "Avg GPU Ops": "288.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_0_fun/jit(_convolve)/shard_map/ffi_call,hlo_op=ffi_call.43#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "39714361",
+        "Total Range Time (ns)": "1553822",
+        "Range Instances": "30",
+        "Proj Avg (ns)": "1323812.0",
+        "Proj Med (ns)": "730925.0",
+        "Proj Min (ns)": "720253",
+        "Proj Max (ns)": "2233718",
+        "Proj StdDev (ns)": "741851.1",
+        "Total GPU Ops": "210",
+        "Avg GPU Ops": "7.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/cond/branch_1_fun/jit(_convolve)/shard_map/ffi_call,hlo_op=ffi_call.37#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "19830479",
+        "Total Range Time (ns)": "626906",
+        "Range Instances": "15",
+        "Proj Avg (ns)": "1322031.9",
+        "Proj Med (ns)": "728541.0",
+        "Proj Min (ns)": "723133",
+        "Proj Max (ns)": "2224055",
+        "Proj StdDev (ns)": "755706.1",
+        "Total GPU Ops": "105",
+        "Avg GPU Ops": "7.0",
+        "Avg Range Lvl": "3.0",
+        "Avg Num Child": "0.0"
+      },
+      {
+        "Range": "TSL:Thunk:#name=jit(contract_block)/jit(_pad)/pad,hlo_op=collective-permute-start#",
+        "Style": "PushPop",
+        "Total Proj Time (ns)": "450208",
+        "Total Range Time (ns)": "1956945",
+        "Range Instances": "45",
+        "Proj Avg (ns)": "10004.6",
+        "Proj Med (ns)": "9888.0",
+        "Proj Min (ns)": "9536",
+        "Proj Max (ns)": "12800",
+        "Proj StdDev (ns)": "621.1",
+        "Total GPU Ops": "45",
+        "Avg GPU Ops": "1.0",
+        "Avg Range Lvl": "1.0",
+        "Avg Num Child": "0.0"
+      }
+    ]
+  }
+}
