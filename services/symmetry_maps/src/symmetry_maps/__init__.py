@@ -227,7 +227,7 @@ from symmetry_maps.maps import (
     open_spin_block_coefficient,
     unfold_spin_centroid_operator,
     unfold_isdf_one_leg,
-    mix_channels_by_proper_rotation,
+    mix_channels_by_proper_rotation, mix_lorentz_blocks,
 )
 # Pre-sweep spellings.  Imported from the modules that define them, so
 # the door and the module bind the SAME object and cannot drift apart.
@@ -330,7 +330,7 @@ __all__ = [
     "slice_q_full_to_ibz", "unfold_isdf_operator",
     "unfold_operator_local", "open_spin_block_coefficient",
     "unfold_spin_centroid_operator", "unfold_isdf_one_leg",
-    "mix_channels_by_proper_rotation",
+    "mix_channels_by_proper_rotation", "mix_lorentz_blocks",
     # psi unfold / antiunitary rule
     "unfold_psi", "spinor_rotation_for_sym_row", "apply_spinor_rotation",
     "tau_phase_row", "tau_phase_row_jax", "unfold_reciprocal_carriers",

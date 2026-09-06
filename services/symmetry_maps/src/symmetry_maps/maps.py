@@ -1848,6 +1848,36 @@ def _get_unfold_isdf_one_leg_jit(
     return _do_unfold
 
 
+def mix_lorentz_blocks(blocks, *, sym, sym_idx, mesh_xy):
+    """Mix each rectangular charge/current sector by Λ⊗Λ, with absent source blocks zero."""
+    if isinstance(sym_idx, (jax.Array, jax.core.Tracer)):
+        raise TypeError("mix_lorentz_blocks: sym_idx is host metadata.")
+    rows = np.asarray(sym_idx)
+    if rows.ndim != 1:
+        raise ValueError("mix_lorentz_blocks: sym_idx must be rank one.")
+    action = np.asarray(sym.lorentz_action(rows), dtype=np.float64)
+    out = {}
+    for left in ((0,), (1, 2, 3)):
+        for right in ((0,), (1, 2, 3)):
+            present = [blocks[a, b] for a in left for b in right if (a, b) in blocks]
+            if not present:
+                continue
+            sample = present[0]
+            if any(v.shape != sample.shape for v in present):
+                raise ValueError("mix_lorentz_blocks: inconsistent extents within a centroid family.")
+            zero = jnp.zeros_like(sample)
+            values = jnp.stack([jnp.stack([blocks.get((a, b), zero)
+                                for b in right]) for a in left])
+            L = jnp.asarray(action[:, left, :][:, :, left])
+            R = jnp.asarray(action[:, right, :][:, :, right])
+            spec = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
+            mixed = jax.jit(lambda l, r, v: jnp.einsum(
+                'qia,qjb,abqmn->ijqmn', l, r, v), out_shardings=spec)(L, R, values)
+            out.update({(a, b): mixed[i, j] for i, a in enumerate(left)
+                        for j, b in enumerate(right)})
+    return out
+
+
 def mix_channels_by_proper_rotation(
     V_tt_per_channel,
     *,
@@ -1971,92 +2001,30 @@ _I_SIGMA_Y = np.array([[0.0, 1.0], [-1.0, 0.0]], dtype=np.complex128)
 
 
 def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_tran, *,
-                                nspinor=2):
-    """Per-op spinor rotation matrix with the TRS augmentation baked in.
-
-    Single source of the ψ-unfold spinor rule (see :func:`unfold_psi`).
-    For a spatial sym row (``sym_idx < n_tran``) the spinor rotation is just
-    ``U_spinor_spatial[sym_idx]``.  For a TRS-augmented row
-    (``sym_idx >= n_tran``, op ``T∘{S|τ}`` with ``T = iσ_y K``) it is
-    ``iσ_y · conj(U_spinor_spatial[sym_idx − n_tran])``.
-
-    Works for a scalar ``sym_idx`` (host per-single-k path in
-    :func:`unfold_psi`) or a 1-D array of ``sym_idx`` (device per-full-BZ-k
-    table build in ``WfnLoader._ensure_phdf5_static``).
-
-    NON-SOC IS A DIFFERENT REPRESENTATION, NOT A DEGENERATE CASE OF THIS
-    ONE.  Everything above is the spin-1/2 (SU(2)) rule.  A scalar
-    wavefunction — ``nspinor = 1``, non-SOC — carries no spinor index at
-    all: a spatial op acts on it through the τ-phase and the G-relabel
-    alone, and its time reversal is ``Θ = K``, plain conjugation with
-    ``Θ² = +1``, NOT ``iσ_y K`` with ``Θ² = −1``.  So the effective factor
-    at ``nspinor = 1`` is the 1×1 identity on BOTH row kinds, spatial and
-    time-reversed, and this function returns exactly that.
-
-    RETURNING THE 2×2 ANYWAY IS NOT A HARMLESS OVER-APPROXIMATION.  Both
-    consumers contract this matrix against ψ's spinor axis, and both
-    ``numpy.einsum`` and ``jax.numpy.einsum`` BROADCAST a size-1 labelled
-    axis instead of raising.  A 2×2 fed a 1-component ψ therefore returns
-    a 2-component ψ holding ``(U[j,0] + U[j,1]) · ψ`` — wrong in value and
-    wrong in shape, and on the TRS rows it is ``iσ_y·conj(U)``'s two
-    off-diagonal entries doing the summing.  That is the registered
-    nspinor=1 loader defect (``tests/KNOWN_FAILURES.md``;
-    ``tests/regression/hbn_cohsex_debug/README.md``), fixed here on
-    2026-08-09.  ``nspinor`` defaults to 2 because that is what this
-    function was before the parameter existed and what every deck in this
-    tree is — it is the back-compatible spelling, not a claim that 2 is
-    the safe guess when the caller does not know.
-
-    Parameters
-    ----------
-    U_spinor_spatial : (n_tran, 2, 2) complex
-        Spatial-only spinor rotation matrices.  Ignored (they are SU(2)
-        objects with nothing to say about a scalar field) when
-        ``nspinor == 1``.
-    sym_idx : int or (nk,) int array
-        Row(s) in the TRS-augmented row space ``[0, 2·n_tran)``.
-    n_tran : int
-        Count of spatial-only sym ops.
-    nspinor : int, keyword-only, default 2
-        Spinor components ψ actually has.  ``2`` for SOC/bispinor decks,
-        ``1`` for scalar (non-SOC) wavefunctions.  Anything else is a
-        raise: the 4-component bispinor lift happens downstream of the
-        unfold (``WfnLoader.load(bispinor=True)``) and never reaches here.
-
-    Returns
-    -------
-    (ns, ns) or (nk, ns, ns) complex
-        Effective spinor rotation(s), ``ns = nspinor``.  Scalar
-        ``sym_idx`` → ``(ns, ns)``.
-    """
+                                nspinor=2, R_cart=None):
+    """Return the scalar, Pauli or parity-graded Dirac action, with iσy K on TR rows."""
     nspinor = int(nspinor)
-    if nspinor not in (1, 2):
+    if nspinor not in (1, 2, 4):
         raise ValueError(
-            f"spinor_rotation_for_sym_row: nspinor must be 1 (scalar/non-SOC) "
-            f"or 2 (SOC); got {nspinor}.  The 4-component bispinor lift is "
-            f"applied downstream of the unfold and does not come through "
-            f"here.")
-    U_spatial = np.asarray(U_spinor_spatial)
+            f"spinor_rotation_for_sym_row: nspinor must be 1, 2 or 4; got {nspinor}.")
     idx = np.asarray(sym_idx)
     scalar = idx.ndim == 0
     idx1 = np.atleast_1d(idx)
     if nspinor == 1:
-        # Scalar ψ: one factor, and it is 1, for spatial AND TRS rows
-        # alike (Θ = K carries no iσ_y).  Shaped (1, 1) / (nk, 1, 1) so the
-        # consumers' static application contracts a matching axis and is a
-        # true no-op rather than a silent broadcast.
         out = np.ones((idx1.size, 1, 1), dtype=np.complex128)
         return out[0] if scalar else out
-    # ``% n_tran`` folds a TRS row (idx ≥ n_tran) back to its spatial op;
-    # guard the degenerate no-symmetry case (n_tran == 0, single identity
-    # row) so it doesn't divide-by-zero — only idx == 0 is valid there and
-    # both spellings pick spatial op 0.
-    s_spatial = idx1 % (n_tran if n_tran else 1)
-    is_trs = idx1 >= n_tran
-    U_sp = U_spatial[s_spatial]                                    # (nk, 2, 2)
-    # iσ_y · conj(U_spatial[s_spatial]), broadcast over the leading axis.
-    U_trs = np.einsum('ij,kjl->kil', _I_SIGMA_Y, np.conj(U_sp))    # (nk, 2, 2)
-    out = np.where(is_trs[:, None, None], U_trs, U_sp)
+    spatial = idx1 % (n_tran if n_tran else 1)
+    U_sp = np.asarray(U_spinor_spatial)[spatial]
+    U_trs = np.einsum('ij,kjl->kil', _I_SIGMA_Y, np.conj(U_sp))
+    out = np.where((idx1 >= n_tran)[:, None, None], U_trs, U_sp)
+    if nspinor == 4:
+        if R_cart is None:
+            raise ValueError("spinor_rotation_for_sym_row: nspinor=4 requires R_cart for spatial parity.")
+        parity = np.linalg.det(np.asarray(R_cart)[spatial])
+        four = np.zeros((idx1.size, 4, 4), dtype=out.dtype)
+        four[:, :2, :2] = out
+        four[:, 2:, 2:] = parity[:, None, None] * out
+        out = four
     return out[0] if scalar else out
 
 
@@ -3234,12 +3202,20 @@ class SymMaps:
                 np.asarray(antiunitary)[..., None, None], -forward, forward)
         return forward
 
+    def lorentz_action(self, rows):
+        """Return diag(1, polar time-odd R) for charge and Dirac-current indices."""
+        current = self.cartesian_action(rows, axial=False, time_odd=True)
+        out = np.zeros(current.shape[:-2] + (4, 4), dtype=np.float64)
+        out[..., 0, 0] = 1.0
+        out[..., 1:, 1:] = current
+        return out
+
     def spinor_action(self, rows, *, nspinor):
         """Canonical unitary/antiunitary spinor factor for operation rows."""
         self.operation_rows(rows)  # validate against this instance
         n = int(np.asarray(self.sym_matrices).shape[0])
         return spinor_rotation_for_sym_row(
-            self.U_spinor, rows, n, nspinor=nspinor)
+            self.U_spinor, rows, n, nspinor=nspinor, R_cart=self.R_cart)
 
     def reciprocal_phase(self, row, carriers):
         """Nonsymmorphic phase for reciprocal carriers under one typed row."""

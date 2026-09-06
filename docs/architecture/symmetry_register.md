@@ -47,18 +47,20 @@ single-backend: `maps.py` `spinor_rotation_for_sym_row` (alias
 `sym_idx >= n_tran`. Two live callers: `unfold_psi` (host) and
 `wfn_loader/loader.py` (device). Both call; neither restates.
 
-**Bispinor (4-component) rotation does not exist.** `get_spinor_rotations`'s
-docstring promises 4×4 for four-component states; the code unconditionally
-allocates 2×2. **This is the upgrade path the register exists to protect**: the
-SU(2) construction and the TRS augmentation each have exactly one
-implementation, and both named unfolds share one backend, so adding a
-4-component branch is a change in a few named functions rather than a search.
+**Four-component raw-parent action.** `SymMaps.spinor_action(rows,
+nspinor=4)` returns `diag(U_2, det(R_cart) U_2)`, with `iσ_y K` on each
+block for antiunitary rows. `U_spinor` stays 2×2; the named helper receives
+`R_cart` explicitly because SU(2) alone has discarded spatial parity.
+`SymMaps.lorentz_action` supplies `diag(1, polar time-odd R)` for operator
+indices, and `mix_lorentz_blocks` applies its tensor product separately to
+rectangular CC/CT/TC/TT sectors. Missing source blocks are zero. Complex
+conjugation belongs to the scalar operator unfold, never the real mixer.
+The old TT mixer remains only until its V-writer caller moves to q-IBZ.
 
-**Bispinor is explicitly OUT OF SCOPE** (owner ruling, 2026-08-15). This entry
-is a note for whoever does that work, not a task. In particular
-`tests/regression/bispinor_debug/centroids_frac_256.txt` is **not** to be
-regenerated — it stays exactly as it is, keep-with-justification, recorded
-under the non-closed-set dispositions below.
+Gate: `services/symmetry_maps/tests/test_bispinor_actions.py` tests all
+96 Si SOC rows, including inversion and antiunitary current covariance,
+exact TT equality to the incumbent mixer, and rectangular CT transport.
+This action does not change any centroid fixture.
 
 ## 2. Cartesian and Pauli-vector actions
 
