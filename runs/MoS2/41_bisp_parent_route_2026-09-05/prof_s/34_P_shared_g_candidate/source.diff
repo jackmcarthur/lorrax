@@ -1,0 +1,83 @@
+diff --git a/src/gw/photon_sigma.py b/src/gw/photon_sigma.py
+index 5c429bb1..8f891073 100644
+--- a/src/gw/photon_sigma.py
++++ b/src/gw/photon_sigma.py
+@@ -107,7 +107,7 @@ def _require_packed_operator(name, packed, mesh_xy):
+ 
+ 
+ def _make_photon_static_block_kernel(
+-    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, *, vertex_pair, q0_only=False,
++    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, *, vertex_pair, with_head=False,
+ ):
+     """Unfold each endpoint before its vertex, then build G and project Σ on parents."""
+     from common.shard_map import shard_map
+@@ -120,7 +120,7 @@ def _make_photon_static_block_kernel(
+     plans = (left.plan, right.plan)
+     shapes = tuple((p.n_parent, c.psi_nmu.shape[1], p.n_centroid_packed, p.nspinor)
+                    for c, p in zip((left, right), plans))
+-    key = (id(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, ffi_dial_key(), vertex_pair, q0_only)
++    key = (id(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, ffi_dial_key(), vertex_pair, with_head)
+     if key in _photon_sigma_kernel_cache:
+         return _photon_sigma_kernel_cache[key]
+     plan_key = ("plans", id(mesh_xy), tuple(kgrid), nk_tot, shapes, ffi_dial_key())
+@@ -131,7 +131,9 @@ def _make_photon_static_block_kernel(
+             n=shapes[1][2]*shapes[1][3], nq=nk_tot, dtype=jnp.complex128)
+         _photon_sigma_kernel_cache[plan_key] = project, g_plan
+     project, g_plan = _photon_sigma_kernel_cache[plan_key]
+-    convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=q0_only)
++    convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=False)
++    head_convolve = (_make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=True)
++                     if with_head else None)
+     rows = np.asarray(plans[0].parent_full_rows)
+     specs = (P(None,None,"x","y"), P(None,"x",None,"y"))
+ 
+@@ -144,11 +146,16 @@ def _make_photon_static_block_kernel(
+                        out_specs=specs, check_vma=False)
+ 
+     @jax.jit
+-    def contract_block(left, right, weights, interaction, factor):
++    def contract_block(left, right, weights, interaction, factor, head_interaction=None):
+         direct, conjugated = unfold(left.psi_mun, right.psi_nmu)
+         G = build_G(direct, conjugated, phases=weights, layout="face", gemm=g_plan)
+         sigma = convolve(G, interaction, factor)
+-        return project(left.psi_nmu, jnp.take(sigma, jnp.asarray(rows), axis=0), right.psi_mun)
++        result = project(left.psi_nmu, jnp.take(sigma, jnp.asarray(rows), axis=0), right.psi_mun)
++        if with_head:
++            head_sigma = head_convolve(G, head_interaction, factor)
++            head = project(left.psi_nmu, jnp.take(head_sigma, jnp.asarray(rows), axis=0), right.psi_mun)
++            return result, head
++        return result
+     _photon_sigma_kernel_cache[key] = contract_block
+     return contract_block
+ 
+@@ -173,23 +180,19 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
+         weights = jax.lax.with_sharding_constraint(
+             jnp.broadcast_to(weights, (meta.nk_tot, slices.nb_full)), NamedSharding(mesh_xy, P()))
+         factor = -0.5 if term == _TERM_COH else 1.0
+-        kernel = _make_photon_static_block_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
+-            left, right, vertex_pair=key)
+-        result = kernel(left.green_parent, right.green_parent, weights, interaction, factor)
+-        result.block_until_ready()
+-        del interaction
+-        head = None
++        head_block = None
+         if factors is not None:
+             pairs = (factors.bare_pair,) if term == _TERM_X else factors.screened_pairs
+             head_block = photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
+             if term == _TERM_COH:
+                 head_block = head_block - photon_q0_low_rank_block(
+                     (factors.bare_pair,), response.layout, A, B, mesh_xy)
+-            head_kernel = _make_photon_static_block_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
+-                left, right, vertex_pair=key, q0_only=True)
+-            head = head_kernel(left.green_parent, right.green_parent, weights, head_block, factor)
+-            head.block_until_ready()
+-            del head_block
++        kernel = _make_photon_static_block_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
++            left, right, vertex_pair=key, with_head=factors is not None)
++        value = kernel(left.green_parent, right.green_parent, weights, interaction, factor, head_block)
++        result, head = value if factors is not None else (value, None)
++        jax.block_until_ready((result, head))
++        del interaction, head_block
+         yield key, result, head
+ 
+ 

@@ -363,3 +363,7 @@ Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/24_P_restore_candidat
 **Production occupied and COH weights share shape and placement.** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0. Static caller 25.644s; 188 compilation events, 19.008s compiler work.
 
 Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/33_P_weight_candidate; [lx] step lx-Xg4-025650-1941125-7057 exit 0 in 88 s.
+
+**Production body and head share one Green function.** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0. Static caller 19.531s; 172 compilation events, 14.348s compiler work.
+
+Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/34_P_shared_g_candidate; [lx] step lx-Xg4-030030-1963321-6918 exit 0 in 83 s.
