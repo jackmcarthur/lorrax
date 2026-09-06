@@ -51,7 +51,7 @@
 | Scalar non-regression | P source | F source | Class | State | Run |
 |---|---|---|---|---|---|
 | Si leg20 P4 | fe2a6937 | d3d4b03a | copied ζ: exact PASS; own ζ: exact PASS | measured copied pair | runs/Si/100_bisp_scale_scalar_2026-09-06/03_pair |
-| Na8×8×8 P16 | fe2a6937 | d3d4b03a | own-fit numeric residual reported; exact requested | detached queued | runs/Na/16_bisp_scale_scalar_2026-09-06/03_pair |
+| Na8×8×8 P16 | fe2a6937 | d3d4b03a | own-fit exact comparison requested | P complete; F finishing | runs/Na/16_bisp_scale_scalar_2026-09-06/03_pair |
 
 | 9×9 arm | P/F total s | Screening P/F s | Sigma P/F s | Compiles P/F | Class | Step / path |
 |---|---|---|---|---|---|---|
@@ -94,11 +94,11 @@
 
 | Scalar completed arm | ζ s | χ0 / W s | Rule plan s | τ / other Σ s | Total s | Compile events / s | EQP0 / EQP1 vs historical reference µeV | Scope / step |
 |---|---:|---|---:|---|---:|---|---|---|
-| Si P4 fe2a6937 own ζ |12.18|4.37 /4.20|627.45|14.93 /22.36|707.74|503 /35.65|8.135 /15.091 vs leg20|own ζ; scalar exact FAIL against historical reference; current-main comparison pending;57988457/lx-Xg4-143444-1183016-5007 P arm complete, pair running|
+| Si P4 fe2a6937 own ζ |12.18|4.37 /4.20|627.45|14.93 /22.36|707.74|503 /35.65|8.135 /15.091 vs leg20|own ζ; historical residual; current-main exact PASS below;57988457/lx-Xg4-143444-1183016-5007 exit0, contaminated startup|
 | Si historical leg20 |11.48|3.45 /3.81|10.50|15.67 /22.14|88.22|not emitted in retained log|reference|runs/Si/99_psi_irr_zeta_2026-09-05/20_g0w0_packed_order|
 | Na historical03 P16 |19.43|screening176.31|33.90|391.73 /29.65|675.15|reference receipt|reference|runs/Na/15_psi_irr_parents_only_2026-09-05/03_p16_packed_order|
 | Na historical04 P16 |19.24|screening173.79|34.50|383.90 /28.49|672.65|461|reference|57955934/lx-Xg4-165800-844150-6998; runs/Na/15_psi_irr_parents_only_2026-09-05/04_p16_repro_coord_ade4fc66|
-| Si planner attribution |—|—|cache12→18 files; rank0 compile agreement201.708s|—|—|gw.sigma_box_plan._rule_cache_lookup / plan_sigma_windows|causation vs current main pending|runs/Si/100_bisp_scale_scalar_2026-09-06/01_bisp_tip_fresh/driver.rank0.log; identity_leg20_freshP.json|
+| Si planner attribution |—|—|cache12→18 files; rank0 compile agreement201.708s|—|—|gw.sigma_box_plan._rule_cache_lookup / plan_sigma_windows|both sources rebuild legacy unstamped rules; copied-input kernels compared below|runs/Si/100_bisp_scale_scalar_2026-09-06/01_bisp_tip_fresh/driver.rank0.log; identity_leg20_freshP.json|
 
 | Si P4 copied ζ, exact | P fe2a6937 | F d3d4b03a | Verdict / scope |
 |---|---:|---:|---|
@@ -169,3 +169,14 @@
 | Analytic scope | Limitation |
 |---|---|
 | evidence/analytical_operand_counts.json; same native/HLO steps66–75 cited above | Leading arithmetic and logical carriers; packing, beta, allocator peaks and vendor wire replication excluded. No new timing measurement. |
+
+| Na P16 scalar pair | P fe2a6937 | F d3d4b03a | Verdict / scope |
+|---|---:|---:|---|
+| EQP0 / EQP1 |exact|reference|PASS; identity.json; parent also exact to historical Na04|
+| Compile events / compiler s |454 /39.83|461 /39.05|seven fewer events; compiler time diagnostic|
+| ζ / screening s |22.68 /196.70|20.32 /178.51|parent startup contaminated; not a regression verdict|
+| τ / other Σ s |474.32 /30.41|474.17 /30.56|sum504.73/504.73: no scalar Σ regression; both sweeps after overlap ended|
+| Warm τ median / mean ms |193.965 /204.334|192.650 /205.000|2231 warm calls each; median+0.68%, mean−0.33%|
+| Whole wall s |753.07|731.07|excluded: startup contention in P|
+| Step / audit |57988457/lx-Xg4-150412-1355239-5472 exit0|Slurm.118 overlaps.117 for110s|completed_receipts.json, identity.json, D/gpu_overlap_audit.json; Na04 parent-only repeat queued after9×9, main reference reused|
+| Phase pin / refresh |measured fe2a6937|origin/main d3d4b03a|hourly fetch22:28UTC sees ORCH b1d8b8f1; immutable phase pin preserved per speed protocol|
