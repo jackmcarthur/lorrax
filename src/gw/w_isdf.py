@@ -1899,7 +1899,7 @@ def compute_no_pair_dirac_current_block(
     from common.gamma_matrices import gamma_perm_phase
     perm_l, phase_l = gamma_perm_phase(A)
     perm_r, phase_r = gamma_perm_phase(B)
-    return kernel(*args, perm_l, phase_l, perm_r, phase_r)
+    return kernel(*args, perm_l, jnp.conj(phase_l), perm_r, jnp.conj(phase_r))
 
 
 _WARD_SUBTRACTED_NO_PAIR = "ward_subtracted_no_pair"
