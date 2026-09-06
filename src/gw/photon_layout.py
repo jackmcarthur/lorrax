@@ -227,33 +227,24 @@ def _insert(packed, block, layout, A, B, mesh_xy):
 
 def pack_photon_operator(
     get_block: Callable[[int, int], jax.Array | None], nq: int,
-    layout: PhotonBasisLayout, mesh_xy: Mesh, *, dtype=jnp.complex128,
+    layout: PhotonBasisLayout, mesh_xy: Mesh, *, dtype=jnp.complex128, block_order=None,
 ) -> jax.Array:
-    """Stream sixteen blocks into one packed ``P(None,'x','y')`` operator.
-
-    ``get_block(A,B)`` is called only when that block is about to be inserted.
-    Each insertion is completed before the next callback so the consumed
-    block's device buffer is released before another response block can be
-    allocated.  Peak residency is therefore the accumulator plus one block,
-    and T1/T2/T3 never imply wavefunction copies.
-    """
+    """Insert blocks in the requested order, synchronizing before releasing each input."""
     layout.assert_mesh(mesh_xy)
     packed = _empty(nq, layout, mesh_xy, dtype)
-    for A in range(N_LORENTZ):
-        for B in range(N_LORENTZ):
-            block = get_block(A, B)
-            # Missing physical channels are exact zero blocks.  Keeping this
-            # case in the sole packer avoids a second packing graph and a
-            # second body-sized zero accumulator.
-            if block is None:
-                continue
-            packed = _insert(packed, block, layout, A, B, mesh_xy)
-            # JAX dispatch is asynchronous.  The next get_block() is an
-            # independent, body-sized response build, so the accumulator
-            # dependency alone does not prevent two block outputs from being
-            # allocated at once.  This is the explicit one-block lifetime
-            # boundary promised by the streaming contract above.
-            packed.block_until_ready()
+    order = (tuple((A, B) for A in range(N_LORENTZ) for B in range(N_LORENTZ))
+             if block_order is None else block_order)
+    for A, B in order:
+        block = get_block(A, B)
+        # Missing physical channels are exact zero blocks.  Keeping this
+        # case in the sole packer avoids a second packing graph and a
+        # second body-sized zero accumulator.
+        if block is None:
+            continue
+        packed = _insert(packed, block, layout, A, B, mesh_xy)
+        # Finish the donated insert before the callback builds another class.
+        packed.block_until_ready()
+        del block
     return packed
 
 
