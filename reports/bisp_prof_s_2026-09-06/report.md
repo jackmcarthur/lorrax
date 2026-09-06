@@ -367,3 +367,7 @@ Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/33_P_weight_candidate
 **Production body and head share one Green function.** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0. Static caller 19.531s; 172 compilation events, 14.348s compiler work.
 
 Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/34_P_shared_g_candidate; [lx] step lx-Xg4-030030-1963321-6918 exit 0 in 83 s.
+
+**Production Lorentz vertices share one executable per endpoint class.** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0. Static caller 13.542s; 160 compilation events, 9.988s compiler work.
+
+Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/37_P_shape_class_candidate; [lx] step lx-Xg4-030620-1999625-3851 exit 0 in 71 s.
