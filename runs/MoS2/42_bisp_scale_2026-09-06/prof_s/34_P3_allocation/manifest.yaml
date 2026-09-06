@@ -4,5 +4,7 @@ pipeline: profiling
 platform: perlmutter
 steps:
   allocation:
-    state: failed
-    reason: QOSMaxSubmitJobPerUserLimit
+    state: complete
+    jobid: 57992641
+    attempts: 3
+    prior_failures: QOSMaxSubmitJobPerUserLimit
