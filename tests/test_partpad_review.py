@@ -298,7 +298,9 @@ def test_initial_sc_zero_side_reservation_keeps_the_causal_sign():
             assert reserved['box'][0] == .1
 
 
-def test_two_sided_reservation_does_not_import_the_unused_frequency_half(monkeypatch):
+@pytest.mark.parametrize('positive_frequencies', [(.2, .5), (0.,)])
+def test_two_sided_reservation_does_not_import_the_unused_frequency_half(
+        monkeypatch, positive_frequencies):
     from gw import sigma_box_plan as boxes
     from gw.ppm_windows import _SigmaBranch
     from test_sigma_box_plan import _branch, _summaries, _fake_rule
@@ -309,13 +311,15 @@ def test_two_sided_reservation_does_not_import_the_unused_frequency_half(monkeyp
         return original(spec, eta, **kwargs)
     monkeypatch.setattr(boxes, '_sc_padded_box_spec', capture)
     monkeypatch.setattr(boxes, 'build_uniform_rule', _fake_rule)
-    positive = _branch('positive')._replace(omega_idx=np.array([2, 3]))
+    positive = _branch('positive')._replace(
+        omega_abs=np.array(positive_frequencies),
+        omega_idx=np.arange(2, 2 + len(positive_frequencies)))
     negative = _SigmaBranch(tag='negative', E_A=positive.E_A,
         base_mask_A=positive.base_mask_A, space='cond', neg_omega_half=True,
         omega_abs=np.array([.5, .2]), omega_idx=np.array([0, 1]))
     boxes.plan_sigma_windows(_summaries(), [negative, positive],
-        np.array([-.5, -.2, .2, .5]), .1, eps=1e-4,
+        np.array([-.5, -.2, *positive_frequencies]), .1, eps=1e-4,
         reduction_seconds=20., cache_dir=None, print_fn=lambda _: None,
         fixed_rule_session={'external_support_ev': np.array([-.8, .9]) * RYD_TO_EV})
-    np.testing.assert_allclose(seen['negative'], [-.8, .2])
-    np.testing.assert_allclose(seen['positive'], [-.1, .9])
+    np.testing.assert_allclose(seen['negative'], [-.8, 0.])
+    np.testing.assert_allclose(seen['positive'], [0., .9])
