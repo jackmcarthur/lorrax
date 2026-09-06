@@ -1,0 +1,418 @@
+{
+  "module_1004.jit_contract_class": {
+    "memory": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1004.jit_contract_class.sm_8.0_gpu_after_optimizations-memory-usage-report.txt",
+      "total_bytes": 1784731404,
+      "allocations": [
+        {
+          "size": 1707249500,
+          "rest": "preallocated-temp:"
+        },
+        {
+          "size": 51841597,
+          "rest": "parameter 5, shape |c128[1,36,300,300]| at ShapeIndex {}:"
+        },
+        {
+          "size": 5379194,
+          "rest": "parameter 0, shape |c128[7,40,4,300]| at ShapeIndex {}:"
+        },
+        {
+          "size": 5379194,
+          "rest": "parameter 2, shape |c128[7,40,4,300]| at ShapeIndex {}:"
+        },
+        {
+          "size": 5379194,
+          "rest": "parameter 1, shape |c128[7,4,300,40]| at ShapeIndex {}:"
+        },
+        {
+          "size": 5379194,
+          "rest": "parameter 3, shape |c128[7,4,300,40]| at ShapeIndex {}:"
+        },
+        {
+          "size": 345600,
+          "rest": "constant:"
+        },
+        {
+          "size": 179200,
+          "rest": "output shape is |c128[7,40,40]|, maybe-live-out:"
+        },
+        {
+          "size": 86425,
+          "rest": "constant:"
+        },
+        {
+          "size": 46080,
+          "rest": "parameter 4, shape |c128[36,80]| at ShapeIndex {}:"
+        }
+      ]
+    },
+    "hlo": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1004.jit_contract_class.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": [],
+      "custom_calls": {
+        "__cublas$gemm": 1,
+        "lorrax_cublasmp_batched_gemm": 3,
+        "lorrax_mklfft_flat_k": 3
+      },
+      "remats": [],
+      "layout_ops": {
+        "bitcast": {
+          "count": 42,
+          "max_bytes": 829440000,
+          "max_source": ""
+        },
+        "transpose": {
+          "count": 7,
+          "max_bytes": 829440000,
+          "max_source": ""
+        },
+        "copy": {
+          "count": 1,
+          "max_bytes": 51840000,
+          "max_source": ""
+        }
+      }
+    },
+    "buffer": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1004.jit_contract_class.sm_8.0_gpu_after_optimizations-buffer-assignment.txt",
+      "remats": []
+    },
+    "sig": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1004.jit_contract_class.before_optimizations.txt",
+      "entry_sig": "left_psi_nmu.1: c128[7,80,4,600], left_psi_mun.1: c128[7,4,600,80], right_psi_nmu.1: c128[7,80,4,600], right_psi_mun.1: c128[7,4,600,80], weights.1: c128[36,80], interaction.1: c128[1,36,600,600], factor.1: f64[], vertices_0__0_.1: s32[1,4], vertices_0__1_.1: c128[1,4], vertices_1__0_.1: s32[1,4], vertices_1__1_.1: c128[1,4]"
+    }
+  },
+  "module_1034.jit_contract_class": {
+    "memory": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1034.jit_contract_class.sm_8.0_gpu_after_optimizations-memory-usage-report.txt",
+      "total_bytes": 649744660,
+      "allocations": [
+        {
+          "size": 581645107,
+          "rest": "preallocated-temp:"
+        },
+        {
+          "size": 52879687,
+          "rest": "parameter 5, shape |c128[3,36,300,102]| at ShapeIndex {}:"
+        },
+        {
+          "size": 5379194,
+          "rest": "parameter 0, shape |c128[7,40,4,300]| at ShapeIndex {}:"
+        },
+        {
+          "size": 5379194,
+          "rest": "parameter 1, shape |c128[7,4,300,40]| at ShapeIndex {}:"
+        },
+        {
+          "size": 1824522,
+          "rest": "parameter 2, shape |c128[7,40,4,102]| at ShapeIndex {}:"
+        },
+        {
+          "size": 1824522,
+          "rest": "parameter 3, shape |c128[7,4,102,40]| at ShapeIndex {}:"
+        },
+        {
+          "size": 345600,
+          "rest": "constant:"
+        },
+        {
+          "size": 179200,
+          "rest": "output shape is |c128[7,40,40]|, maybe-live-out:"
+        },
+        {
+          "size": 117555,
+          "rest": "constant:"
+        },
+        {
+          "size": 86425,
+          "rest": "constant:"
+        },
+        {
+          "size": 46080,
+          "rest": "parameter 4, shape |c128[36,80]| at ShapeIndex {}:"
+        },
+        {
+          "size": 29388,
+          "rest": "constant:"
+        }
+      ]
+    },
+    "hlo": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1034.jit_contract_class.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": [],
+      "custom_calls": {
+        "lorrax_mklfft_flat_k": 3,
+        "__cublas$gemm": 1,
+        "lorrax_cublasmp_batched_gemm": 3
+      },
+      "remats": [],
+      "layout_ops": {
+        "bitcast": {
+          "count": 40,
+          "max_bytes": 282009600,
+          "max_source": ""
+        },
+        "transpose": {
+          "count": 7,
+          "max_bytes": 282009600,
+          "max_source": ""
+        },
+        "copy": {
+          "count": 1,
+          "max_bytes": 0,
+          "max_source": ""
+        }
+      }
+    },
+    "buffer": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1034.jit_contract_class.sm_8.0_gpu_after_optimizations-buffer-assignment.txt",
+      "remats": []
+    },
+    "sig": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1034.jit_contract_class.before_optimizations.txt",
+      "entry_sig": "left_psi_nmu.1: c128[7,80,4,600], left_psi_mun.1: c128[7,4,600,80], right_psi_nmu.1: c128[7,80,4,204], right_psi_mun.1: c128[7,4,204,80], weights.1: c128[36,80], interaction.1: c128[3,36,600,204], factor.1: f64[], vertices_0__0_.1: s32[3,4], vertices_0__1_.1: c128[3,4], vertices_1__0_.1: s32[3,4], vertices_1__1_.1: c128[3,4]"
+    }
+  },
+  "module_1070.jit_contract_class": {
+    "memory": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1070.jit_contract_class.sm_8.0_gpu_after_optimizations-memory-usage-report.txt",
+      "total_bytes": 649744660,
+      "allocations": [
+        {
+          "size": 581645107,
+          "rest": "preallocated-temp:"
+        },
+        {
+          "size": 52879687,
+          "rest": "parameter 5, shape |c128[3,36,102,300]| at ShapeIndex {}:"
+        },
+        {
+          "size": 5379194,
+          "rest": "parameter 2, shape |c128[7,40,4,300]| at ShapeIndex {}:"
+        },
+        {
+          "size": 5379194,
+          "rest": "parameter 3, shape |c128[7,4,300,40]| at ShapeIndex {}:"
+        },
+        {
+          "size": 1824522,
+          "rest": "parameter 0, shape |c128[7,40,4,102]| at ShapeIndex {}:"
+        },
+        {
+          "size": 1824522,
+          "rest": "parameter 1, shape |c128[7,4,102,40]| at ShapeIndex {}:"
+        },
+        {
+          "size": 345600,
+          "rest": "constant:"
+        },
+        {
+          "size": 179200,
+          "rest": "output shape is |c128[7,40,40]|, maybe-live-out:"
+        },
+        {
+          "size": 117555,
+          "rest": "constant:"
+        },
+        {
+          "size": 86425,
+          "rest": "constant:"
+        },
+        {
+          "size": 46080,
+          "rest": "parameter 4, shape |c128[36,80]| at ShapeIndex {}:"
+        },
+        {
+          "size": 29388,
+          "rest": "constant:"
+        }
+      ]
+    },
+    "hlo": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1070.jit_contract_class.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": [],
+      "custom_calls": {
+        "lorrax_mklfft_flat_k": 3,
+        "__cublas$gemm": 1,
+        "lorrax_cublasmp_batched_gemm": 3
+      },
+      "remats": [],
+      "layout_ops": {
+        "bitcast": {
+          "count": 42,
+          "max_bytes": 282009600,
+          "max_source": ""
+        },
+        "transpose": {
+          "count": 7,
+          "max_bytes": 282009600,
+          "max_source": ""
+        },
+        "copy": {
+          "count": 1,
+          "max_bytes": 0,
+          "max_source": ""
+        }
+      }
+    },
+    "buffer": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1070.jit_contract_class.sm_8.0_gpu_after_optimizations-buffer-assignment.txt",
+      "remats": []
+    },
+    "sig": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1070.jit_contract_class.before_optimizations.txt",
+      "entry_sig": "left_psi_nmu.1: c128[7,80,4,204], left_psi_mun.1: c128[7,4,204,80], right_psi_nmu.1: c128[7,80,4,600], right_psi_mun.1: c128[7,4,600,80], weights.1: c128[36,80], interaction.1: c128[3,36,204,600], factor.1: f64[], vertices_0__0_.1: s32[3,4], vertices_0__1_.1: c128[3,4], vertices_1__0_.1: s32[3,4], vertices_1__1_.1: c128[3,4]"
+    }
+  },
+  "module_1098.jit_contract_class": {
+    "memory": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1098.jit_contract_class.sm_8.0_gpu_after_optimizations-memory-usage-report.txt",
+      "total_bytes": 259389012,
+      "allocations": [
+        {
+          "size": 197761433,
+          "rest": "preallocated-temp:"
+        },
+        {
+          "size": 53938749,
+          "rest": "parameter 5, shape |c128[9,36,102,102]| at ShapeIndex {}:"
+        },
+        {
+          "size": 1824522,
+          "rest": "parameter 0, shape |c128[7,40,4,102]| at ShapeIndex {}:"
+        },
+        {
+          "size": 1824522,
+          "rest": "parameter 2, shape |c128[7,40,4,102]| at ShapeIndex {}:"
+        },
+        {
+          "size": 1824522,
+          "rest": "parameter 1, shape |c128[7,4,102,40]| at ShapeIndex {}:"
+        },
+        {
+          "size": 1824522,
+          "rest": "parameter 3, shape |c128[7,4,102,40]| at ShapeIndex {}:"
+        },
+        {
+          "size": 179200,
+          "rest": "output shape is |c128[7,40,40]|, maybe-live-out:"
+        },
+        {
+          "size": 117555,
+          "rest": "constant:"
+        },
+        {
+          "size": 46080,
+          "rest": "parameter 4, shape |c128[36,80]| at ShapeIndex {}:"
+        },
+        {
+          "size": 29388,
+          "rest": "constant:"
+        },
+        {
+          "size": 9216,
+          "rest": "constant:"
+        }
+      ]
+    },
+    "hlo": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1098.jit_contract_class.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": [],
+      "custom_calls": {
+        "lorrax_mklfft_flat_k": 3,
+        "__cublas$gemm": 1,
+        "lorrax_cublasmp_batched_gemm": 3
+      },
+      "remats": [],
+      "layout_ops": {
+        "bitcast": {
+          "count": 42,
+          "max_bytes": 95883264,
+          "max_source": ""
+        },
+        "transpose": {
+          "count": 7,
+          "max_bytes": 95883264,
+          "max_source": ""
+        },
+        "copy": {
+          "count": 1,
+          "max_bytes": 0,
+          "max_source": ""
+        }
+      }
+    },
+    "buffer": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1098.jit_contract_class.sm_8.0_gpu_after_optimizations-buffer-assignment.txt",
+      "remats": []
+    },
+    "sig": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1098.jit_contract_class.before_optimizations.txt",
+      "entry_sig": "left_psi_nmu.1: c128[7,80,4,204], left_psi_mun.1: c128[7,4,204,80], right_psi_nmu.1: c128[7,80,4,204], right_psi_mun.1: c128[7,4,204,80], weights.1: c128[36,80], interaction.1: c128[9,36,204,204], factor.1: f64[], vertices_0__0_.1: s32[9,4], vertices_0__1_.1: c128[9,4], vertices_1__0_.1: s32[9,4], vertices_1__1_.1: c128[9,4]"
+    }
+  },
+  "module_1128.jit_finish": {
+    "memory": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1128.jit_finish.sm_8.0_gpu_after_optimizations-memory-usage-report.txt",
+      "total_bytes": 9915572,
+      "allocations": [
+        {
+          "size": 9216983,
+          "rest": "preallocated-temp:"
+        },
+        {
+          "size": 518348,
+          "rest": "output shape is |c128[36,30,30]|, maybe-live-out:"
+        }
+      ]
+    },
+    "hlo": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1128.jit_finish.sm_8.0_gpu_after_optimizations.txt",
+      "collectives": [
+        {
+          "line_no": 116,
+          "op": "all-gather-start",
+          "output_type": "(c128[36,40,40]{1,0,2}, c128[36,40,80]{1,0,2})",
+          "output_bytes": 2764800,
+          "source": ""
+        },
+        {
+          "line_no": 120,
+          "op": "all-gather-start",
+          "output_type": "((c128[36,40,40]{2,0,1}, c128[36,40,80]{2,0,1}), (c128[36,80,40]{2,0,1}, c128[36,80,80]{2,0,1}))",
+          "output_bytes": 8294400,
+          "source": ""
+        },
+        {
+          "line_no": 127,
+          "op": "all-gather-start",
+          "output_type": "(c128[36,40,80]{2,0,1}, c128[36,80,80]{2,0,1})",
+          "output_bytes": 5529600,
+          "source": ""
+        }
+      ],
+      "custom_calls": {},
+      "remats": [],
+      "layout_ops": {
+        "bitcast": {
+          "count": 10,
+          "max_bytes": 3686400,
+          "max_source": ""
+        },
+        "transpose": {
+          "count": 4,
+          "max_bytes": 1843200,
+          "max_source": ""
+        }
+      }
+    },
+    "buffer": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1128.jit_finish.sm_8.0_gpu_after_optimizations-buffer-assignment.txt",
+      "remats": []
+    },
+    "sig": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/module_1128.jit_finish.before_optimizations.txt",
+      "entry_sig": "value.1: c128[7,80,80]"
+    }
+  }
+}

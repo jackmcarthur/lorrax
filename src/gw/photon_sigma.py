@@ -229,7 +229,6 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
         value = kernel(left.green_parent, right.green_parent, weights, interactions,
                        -0.5 if term == _TERM_COH else 1.0, vertices, head_blocks)
         result, head = value if with_head else (value, None)
-        jax.block_until_ready((result, head))
         yield keys[0], result, head
 
 
@@ -270,10 +269,11 @@ def compute_static_photon_sigma(
                 heads[term][sector] = head if old is None else old + head
                 head_totals[term] = head if head_totals[term] is None else head_totals[term] + head
             if verbose and jax.process_index() == 0:
-                print_fn(f"  packed photon Sigma term {term} class {key} complete")
+                print_fn(f"  packed photon Sigma term {term} class {key} submitted")
     sym = wfns_charge.green_parent.plan.sym
     nb = wfns_charge.slices.nb_sigma
 
+    @jax.jit
     def finish(value):
         full = unfold_file_wedge_band_operator(sym, value, trs_rule="transpose")
         return _replicate_band_sigma(full, mesh_xy)[:, :nb, :nb]
