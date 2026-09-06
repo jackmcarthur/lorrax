@@ -179,10 +179,11 @@ def test_shared_tau_factory_forwards_the_band_partition(monkeypatch):
     monkeypatch.setattr(tau, "_get_sigma_kij_kernel", fake_spatial)
     tau._sigma_shared_tau_kernel_cache.clear()
     brackets = ((0, 3), (3, 7))
+    plan = object()
     tau.get_shared_sigma_tau_kernel(
         mesh_xy=_mesh(), kgrid=(1, 1, 1), brackets=brackets,
-        pack_brackets=False)
+        k_unfold_plan=plan)
     assert seen["brackets"] == brackets
     assert seen["merged_x"] is True
-    assert seen["pack_brackets"] is False
+    assert seen["k_unfold_plan"] is plan
     tau._sigma_shared_tau_kernel_cache.clear()

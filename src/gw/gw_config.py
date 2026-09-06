@@ -3448,8 +3448,8 @@ def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
         # now FIXED. gw.mpa.sigma._integrate_sigma_batches' sharded-output
         # tail (a split Sigma window, nb_sigma != nb_full -- the ORDINARY
         # case) is ported: strip_sigma_window gained a device-array arm
-        # that applies wavefunction_bundle.pack_band_window's OWN
-        # mechanism (jax.lax.slice_in_dim + jax.lax.with_sharding_
+        # that applies distributed slicing and resharding
+        # (jax.lax.slice_in_dim + jax.lax.with_sharding_
         # constraint) to Sigma_c's own trailing (m,n) axes -- reusing that
         # primitive's idiom rather than reworking psi_proj's INPUT width,
         # which would have desynced it from contract_bands.py's eagerly-

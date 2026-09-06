@@ -463,98 +463,10 @@ def _get_sigma_kij_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int], merged_x: bool = False,
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
     layout: str = "legacy", face_shape=None, face_band_extent=None,
-    pack_brackets: bool = True,
     energy_windows: bool = False,
     k_unfold_plan=None,
 ) -> Callable[..., jax.Array]:
-    """GN/MPA adapter that builds G and calls the shared spatial kernel.
-
-    ``k_unfold_plan`` (:class:`gw.centroid_k_unfold.CentroidKUnfoldPlan`,
-    face layout only): the ``psi_coh_*`` operands are the PACKED raw-parent
-    faces and ``E_A``/``mask_A`` are parent-row tables — ``build_G_tau``
-    contracts on ``n_parent`` rows and the plan transports the completed
-    operator to full k in the run's packed centroid order; the FFT convolution
-    runs against residues in that same order; the
-    ``psi_proj_*`` operands are the same parent faces and the spatial
-    kernel's projection tail selects, projects and broadcasts (see
-    :func:`_make_project_ri_reduce_scatter`).  Bracket packing is not
-    combined with the route (the mask loop serves every bracket count).
-
-    ``brackets``
-        ``None`` (the MPA/shared-multipole shape): one G(τ) over the whole
-        band axis, output shape exactly as it has always been.
-        A tuple of half-open ``(lo, hi)`` band ranges (the GN-PPM shape,
-        length 1 by default): one G(τ) PER BRACKET, each contracted against
-        the SAME ``prep_w(W_q)``, stacked on a new LEADING axis.
-
-    THE BRACKETS ARE STATIC SLICES, NOT MASKS — under ``layout='legacy'``.
-    A boolean mask would leave every bracket's ``build_G_tau`` einsum
-    contracting over all ``nb`` bands with two thirds of them multiplied by
-    zero — the band-side GEMM would cost 3× with nothing to show for it.
-    Slicing makes the partition real: each band's orbital outer product is
-    formed exactly once across the three brackets, so the G-build work is
-    the same total as one full-band run.  The bounds are Python ints baked
-    into the trace, so this is still ONE compiled program and ONE dispatch
-    per τ.
-
-    WHAT DOES NOT PARTITION, and why the feature is not free: ``G_k`` lives
-    in the ISDF centroid basis, whose extent is ``N_μ`` — independent of how
-    many bands went into it.  The FFT chain and the ψ projection that follow
-    therefore cost the same per bracket as they do for the full band range,
-    and three brackets pay them three times.  That 3× on the dominant term
-    is the accepted price of the feature; see :class:`SpatialKernel` for the
-    one part of it (``ifftn(W)``) that can be hoisted, and where it cannot.
-
-    ``layout='face'`` (2026-08-22): the two-face carrier's ``psi_mun``/
-    ``psi_nmu`` span the FULL [b0,b4) loaded extent and cannot legally be
-    SLICED to an arbitrary band sub-range — a legal face matrix must stay
-    mesh-divisible on both axes, and an arbitrary bracket edge is not
-    (report obstacle #3).  Two sibling bracket loops exist for this layout:
-
-    * :func:`_bracketed_face` (the ORIGINAL, 2026-08-22 bring-up) never
-      slices ψ — every bracket pays the FULL nb_full G-build and the
-      partition is expressed as a band-range MASK intersected into
-      ``mask_A`` instead ("weight, don't window", the same fix
-      ``build_G_tau``'s own ``mask``/``phases`` seam and
-      ``Wavefunctions.band_mask`` already use for this exact problem).
-      This is a NAMED extra cost over legacy's disjoint-slice partition
-      (bracket count × the full G-build instead of one full-band G-build
-      split into disjoint pieces).  KEPT as the fallback for windows where
-      packing cannot apply, and as the parity oracle every packed-vs-mask
-      test in this tree diffs against.
-    * :func:`_bracketed_face_packed` (2026-08-23, ``pack_brackets=True``,
-      the default) uses ``wavefunction_bundle.pack_band_window`` to
-      materialize each bracket's OWN compact ψ pair ONCE (a one-time
-      distributed repack, done by the CALLER before this kernel's first
-      per-τ dispatch — see that function's docstring), so each bracket's
-      G-build GEMM runs at its OWN padded width instead of the shared
-      full-``nb_full`` one.  Engaged only when there is more than one
-      bracket (``len(brackets) > 1``): the production
-      ``head=full``/``gn_ppm`` single-bracket deck already pays the
-      SAME one full-width G-build either way (``pack_band_window``'s own
-      trivial-window fast path returns the resident carrier unchanged),
-      so routing it through the packed calling convention would add a
-      new argument shape to the most-exercised, already-gated path for
-      zero benefit — deliberately scoped OUT of the packed convention
-      rather than unified for its own sake.  When packing applies,
-      ``psi_coh_xn``/``psi_coh_yr`` (the two slots this factory's callers
-      hand the "coh"/G-build ψ operands through) are TUPLES of length
-      ``len(brackets)`` instead of bare arrays — see
-      :func:`_bracketed_face_packed`'s own docstring for the contract.
-
-    Also builds this layout's own ``distrib_la.gemm_plan``(s) for the
-    G-build ONCE, here, at kernel-factory time — mirroring
-    ``cohsex_sigma._make_cohsex_kernels_face``'s identical G-plan
-    construction, never resolved inside the per-τ ``lax.scan``: ONE plan
-    at the full ``nb_full`` width (used by the trivial-bracket / MASK /
-    ``brackets is None`` paths), plus — when packing applies — one
-    ADDITIONAL plan per bracket, each sized at that bracket's own padded
-    width.  Plans are cheap to build eagerly relative to a Σ run (one
-    warmup call each, at factory time, amortized over every τ node the
-    returned kernel is later called for); building ``n_brackets`` of them
-    is the intended trade for shrinking every one of possibly hundreds of
-    per-τ G-build GEMMs from width ``nb_full`` to the bracket's own width.
-    """
+    """Build Green functions with band-range masks and contract each bracket against one prepared W."""
     if layout not in ("legacy", "face"):
         raise ValueError(
             f"_get_sigma_kij_kernel: layout must be 'legacy' or 'face', "
@@ -567,13 +479,9 @@ def _get_sigma_kij_kernel(
     if k_unfold_plan is not None and layout != "face":
         raise ValueError(
             "_get_sigma_kij_kernel(k_unfold_plan=...) requires layout='face'.")
-    if k_unfold_plan is not None:
-        # One G-build family per bracket count; the route's packed parent
-        # faces cannot be repacked per bracket without a second owner.
-        pack_brackets = False
     key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
            ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
-           face_band_extent, bool(pack_brackets), bool(energy_windows),
+           face_band_extent, bool(energy_windows),
            k_unfold_plan)
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
@@ -586,8 +494,6 @@ def _get_sigma_kij_kernel(
         face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan)
 
     g_plan = None
-    g_plans = None
-    use_packed = False
     if layout == "face":
         from distrib_la import gemm_plan
         g_shape = (face_shape if k_unfold_plan is None
@@ -596,33 +502,6 @@ def _get_sigma_kij_kernel(
         mu_s_f = n_rmu_f * ns_f
         g_plan = gemm_plan(mesh_xy, m=mu_s_f, k=nb_full_f, n=mu_s_f,
                            nq=nk_f, dtype=jnp.complex128)
-        use_packed = bool(pack_brackets) and brackets is not None \
-            and len(brackets) > 1
-        if use_packed:
-            from runtime.padding import padded_axis
-            px = int(mesh_xy.shape["x"])
-            py = int(mesh_xy.shape["y"])
-            if px != py:
-                raise ValueError(
-                    f"_get_sigma_kij_kernel(layout='face', pack_brackets="
-                    f"True): mesh is {px}x{py}, not square -- see "
-                    f"wavefunction_bundle.pack_band_window's identical "
-                    f"refusal.")
-            g_plans = []
-            for lo, hi in brackets:
-                hi_ = nb_full_f if hi is None else hi
-                width = hi_ - lo
-                w_pad = padded_axis(
-                    width, mesh_xy, name="PPM bracket band carrier",
-                    specs=((P(None, None, None, "x"), 3),
-                           (P(None, "y", None, None), 1))).carrier
-                if lo == 0 and hi_ == nb_full_f:
-                    g_plans.append(g_plan)   # identical shape -- reuse
-                else:
-                    g_plans.append(gemm_plan(
-                        mesh_xy, m=mu_s_f, k=w_pad, n=mu_s_f, nq=nk_f,
-                        dtype=jnp.complex128))
-
     def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t):
         # The A-side selector operand is dtype-dispatched (static at trace
         # time): bool = the incumbent band-identity mask, bit-exact; float =
@@ -683,84 +562,6 @@ def _get_sigma_kij_kernel(
                            else mask_A * in_range.astype(mask_A.dtype))
             G_k = build_g(psi_coh_xn, psi_coh_yr, E_A, mask_bracket,
                          E_min, E_max, E_ref_A, t_node)
-            prev = conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
-            outs.append(prev)
-        return _stack_channels(outs, mesh_xy)
-
-    def _g_from_selector_packed(
-        xn, yr, E, sel, E_min, E_max, ref, t, gemm,
-    ):
-        """Same dtype dispatch as :func:`_g_from_selector`, but ``gemm`` is
-        an explicit argument rather than the factory's shared ``g_plan``
-        closure — each bracket calls this with ITS OWN packed-width plan
-        (:func:`_bracketed_face_packed`)."""
-        if sel.dtype == jnp.bool_:
-            if energy_windows:
-                return build_G_tau(
-                    xn, yr, E, 1j * t, e_ref=ref, mask=sel,
-                    E_min=E_min, E_max=E_max, layout="face", gemm=gemm)
-            return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, mask=sel,
-                               layout="face", gemm=gemm)
-        if energy_windows:
-            return build_G_tau(
-                xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
-                E_min=E_min, E_max=E_max, layout="face", gemm=gemm)
-        return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
-                           layout="face", gemm=gemm)
-
-    def _bracketed_face_packed(psi_coh_xn, psi_coh_yr, psi_proj_xr,
-                               psi_proj_yn, E_A, mask_A, E_min, E_max,
-                               E_ref_A, t_node, W_prep, g_plans, conv):
-        """Packed sibling of :func:`_bracketed_face` — see this factory's
-        own docstring's ``layout='face'`` section for when this is used
-        instead of the mask loop.
-
-        ``psi_coh_xn``/``psi_coh_yr`` are TUPLES of length
-        ``len(brackets)``: the packed per-bracket ``(psi_mun_w, psi_nmu_w)``
-        pairs a caller built ONCE via
-        ``wavefunction_bundle.pack_band_window`` — one call per bracket, at
-        Sigma-procedure start (``ppm_sigma.compute_sigma_c_ppm_omega_grid``)
-        — and reused across every τ node / ω window this kernel is later
-        called for.  This function itself does NO packing and issues NO
-        collective; it only indexes into the tuples and slices the small
-        REPLICATED ``E_A``/``mask_A`` operands to match (a local per-rank
-        op, exactly like the mask sibling's own ``[:, lo:hi]``/``[...,
-        lo:hi]`` slices — the difference is that HERE ψ itself has already
-        been narrowed too, so the G-build GEMM below runs at the bracket's
-        own padded width via ``g_plans[i]`` instead of the shared
-        full-``nb_full`` plan every masked call pays).
-
-        Zero-pad columns beyond each bracket's true width are exact-zero ψ
-        (``pack_band_window``'s own contract), so the ``E_A``/``mask_A``
-        pad value below is arithmetically inert — matched to whatever
-        ``jnp.pad``'s zero fill gives (``False``/``0.0``) rather than
-        computed, for the same reason the ψ pad needs no special value.
-
-        Same ONE-G-at-a-time discipline as :func:`_bracketed_face`
-        (optimization barrier threading ``prev``), same output stacking.
-        """
-        nb_full = int(mask_A.shape[-1])
-        outs = []
-        prev = None
-        for i, (lo, hi) in enumerate(brackets):
-            if prev is not None:
-                (psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                 E_A, mask_A, W_prep, prev) = jax.lax.optimization_barrier(
-                    (psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                     E_A, mask_A, W_prep, prev))
-            hi_ = nb_full if hi is None else hi
-            width = hi_ - lo
-            w_pad = int(psi_coh_xn[i].shape[-1])
-            E_w = jax.lax.slice_in_dim(E_A, lo, hi_, axis=1)
-            sel_w = jax.lax.slice_in_dim(mask_A, lo, hi_, axis=mask_A.ndim - 1)
-            if w_pad != width:
-                E_w = jnp.pad(E_w, ((0, 0), (0, w_pad - width)))
-                sel_w = jnp.pad(
-                    sel_w,
-                    [(0, 0)] * (sel_w.ndim - 1) + [(0, w_pad - width)])
-            G_k = _g_from_selector_packed(
-                psi_coh_xn[i], psi_coh_yr[i], E_w, sel_w, E_min, E_max,
-                E_ref_A, t_node, g_plans[i])
             prev = conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
             outs.append(prev)
         return _stack_channels(outs, mesh_xy)
@@ -829,11 +630,6 @@ def _get_sigma_kij_kernel(
                                E_min, E_max, E_ref_A, t_node)
                 return spatial.conv_project(
                     psi_proj_xr, psi_proj_yn, G_k, W_prep)
-            if use_packed:
-                return _bracketed_face_packed(
-                    psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                    E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_prep,
-                    g_plans, spatial.conv_project)
             bracket_loop = _bracketed_face if layout == "face" else _bracketed
             return bracket_loop(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
@@ -958,24 +754,9 @@ def get_shared_sigma_tau_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
     layout: str = "legacy", face_shape=None, face_band_extent=None,
-    pack_brackets: bool = True,
     k_unfold_plan=None,
 ) -> Callable[..., jax.Array]:
-    """Return the GN tau kernel with a selected multipole W(tau) builder.
-
-    All spatial work is the established ``build_G_tau -> fused GW FFT ->
-    contract_bands`` path.  This wrapper changes only the scalar frequency
-    synthesis: several poles and compatible windows are summed into one W
-    tile before that unchanged convolution.  It always uses the single
-    complex projection carrier; HGL's missing sine arm is completed once by
-    :class:`gw.ppm_accumulators.DeviceOmegaAccumulator` after the tau sum.
-
-    This is the entry point ``gw.mpa.sigma`` calls for every dynamic pole
-    model.  ``brackets=None`` retains the ordinary MPA shape; a tuple asks the
-    same spatial kernel for a leading disjoint band-bracket axis.  ``layout``,
-    ``face_shape`` and ``pack_brackets`` forward to
-    :func:`_get_sigma_kij_kernel` unchanged.
-    """
+    """Build selected multipole W(tau) tiles for the shared complex Sigma contraction."""
     kgrid = tuple(int(x) for x in kgrid)
     if brackets is not None:
         brackets = tuple((int(lo), None if hi is None else int(hi))
@@ -984,7 +765,7 @@ def get_shared_sigma_tau_kernel(
 
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
            brackets, layout, face_shape, face_band_extent,
-           bool(pack_brackets), k_unfold_plan)
+           k_unfold_plan)
     if key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
@@ -995,7 +776,7 @@ def get_shared_sigma_tau_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
         brackets=brackets, layout=layout, face_shape=face_shape,
         face_band_extent=face_band_extent,
-        pack_brackets=pack_brackets, k_unfold_plan=k_unfold_plan)
+        k_unfold_plan=k_unfold_plan)
 
     @jax.jit
     def _build(B_poles, Omega_poles, pole_indices, bounds,

@@ -48,8 +48,7 @@ end-to-end gated then, so the row STAYED for ``compute_mode = mpa``.
 2026-08-23, ``claims/0443.md``), not narrowed further**: ``mpa/sigma.
 _integrate_sigma_batches``' own named gap (a split Σ window, ``nb_sigma
 != nb_full``) is fixed — ``strip_sigma_window`` gained a device-array arm
-reusing ``wavefunction_bundle.pack_band_window``'s slice+reshard
-mechanism on Σ_c's own trailing axes — and gated end to end (real 4-rank
+using distributed slicing and resharding on Σ_c's own trailing axes — and gated end to end (real 4-rank
 CUDA mesh-aware parity, ``tests/test_mpa_sigma_split_window_strip.py``,
 5/5 bit-exact; a real fresh one-shot insulating MPA leg with a genuine
 split window, eqp0/eqp1 max|dE_QP| 6.5e-5/8.6e-5 eV legacy-vs-face).
@@ -220,7 +219,7 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
     # gw.mpa.sigma._integrate_sigma_batches' named split-Sigma-window gap
     # (nb_sigma != nb_full, the ordinary case) is fixed --
     # strip_sigma_window's new mesh-aware device-array arm reuses
-    # wavefunction_bundle.pack_band_window's own slice+reshard mechanism
+    # distributed slicing and resharding
     # on Sigma_c's own trailing axes.  Gated on real 4-rank CUDA (mesh-
     # aware strip_sigma_window parity, tests/
     # test_mpa_sigma_split_window_strip.py, 5/5 bit-exact) and a real

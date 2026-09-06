@@ -267,7 +267,6 @@ def _integrate_sigma_batches(
     k_unfold_plan = wfns.green_parent.plan
     (psi_coh_xn, psi_coh_yr,
      psi_proj_xr, psi_proj_yn, _, _) = parent_sigma_operands(wfns)
-    pack_brackets = False
     psi_proj_xr = pad_to_axis(
         psi_proj_xr, sigma_axis, axis=1)
     psi_proj_yn = pad_to_axis(
@@ -294,7 +293,6 @@ def _integrate_sigma_batches(
         mesh_xy=mesh_xy,
         kgrid=kgrid,
         brackets=brackets,
-        pack_brackets=pack_brackets,
         **face_kwargs)
     small = NamedSharding(mesh_xy, P())
 
