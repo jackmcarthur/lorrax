@@ -71,3 +71,23 @@
 | Γ completion |1/0|1/0|jit__photon_q0_factor_orbit|inherent additional covariance work|
 | Head attribution |inside block|inside block|F extra GEMMs inside four contraction modules|defect in F diagnostic flag handling|
 | ζ fit-only total |see per-module receipts|221/296|137/138 instrumented captures; timings excluded|tile/route-dependent, not whole-driver parity|
+
+| CC τ SUMMA unit | P | Route | Calls/unit | A-panel bytes/call | B-panel bytes/call | Summed logical payload bytes/rank | Instances/τ |
+|---|---:|---|---:|---:|---:|---:|---:|
+|G (each)|4|P|28|768000|768000|21504000|2|
+|projection1|4|P|28|23040000|288000|326592000|1|
+|projection2|4|P|28|288000|288000|8064000|1|
+|G (each)|4|F|144|768000|768000|110592000|1|
+|projection1|4|F|144|23040000|288000|1679616000|1|
+|projection2|4|F|144|288000|288000|41472000|1|
+|G (each)|16|P|56|194560|194560|10895360|2|
+|projection1|16|P|56|5914624|77824|167788544|1|
+|projection2|16|P|56|77824|77824|4358144|1|
+|G (each)|16|F|288|194560|194560|56033280|1|
+|projection1|16|F|288|5914624|77824|862912512|1|
+|projection2|16|F|288|77824|77824|22413312|1|
+
+| Payload scope | Rule |
+|---|---|
+| SUMMA payload | Complex128 panels16(m/p)(k/p) and16(k/p)(n/p), p=sqrt(P), p broadcasts per panel per q. Actual NCCL wire/link replication is not measured. Shapes authenticated by native/HLO66–75; counts agree with native census. |
+| Static body | Same formulas with G q=36 on both routes. F head-attribution adds two calls; their payload is excluded from this τ-only table. |

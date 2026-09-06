@@ -1,0 +1,122 @@
+[
+  {
+    "P": 4,
+    "route": "P",
+    "unit": "G (each)",
+    "broadcast_count": 28,
+    "panel_A_bytes": 768000,
+    "panel_B_bytes": 768000,
+    "logical_payload_bytes": 21504000,
+    "instances_in_tau": 2
+  },
+  {
+    "P": 4,
+    "route": "P",
+    "unit": "projection1",
+    "broadcast_count": 28,
+    "panel_A_bytes": 23040000,
+    "panel_B_bytes": 288000,
+    "logical_payload_bytes": 326592000,
+    "instances_in_tau": 1
+  },
+  {
+    "P": 4,
+    "route": "P",
+    "unit": "projection2",
+    "broadcast_count": 28,
+    "panel_A_bytes": 288000,
+    "panel_B_bytes": 288000,
+    "logical_payload_bytes": 8064000,
+    "instances_in_tau": 1
+  },
+  {
+    "P": 4,
+    "route": "F",
+    "unit": "G (each)",
+    "broadcast_count": 144,
+    "panel_A_bytes": 768000,
+    "panel_B_bytes": 768000,
+    "logical_payload_bytes": 110592000,
+    "instances_in_tau": 1
+  },
+  {
+    "P": 4,
+    "route": "F",
+    "unit": "projection1",
+    "broadcast_count": 144,
+    "panel_A_bytes": 23040000,
+    "panel_B_bytes": 288000,
+    "logical_payload_bytes": 1679616000,
+    "instances_in_tau": 1
+  },
+  {
+    "P": 4,
+    "route": "F",
+    "unit": "projection2",
+    "broadcast_count": 144,
+    "panel_A_bytes": 288000,
+    "panel_B_bytes": 288000,
+    "logical_payload_bytes": 41472000,
+    "instances_in_tau": 1
+  },
+  {
+    "P": 16,
+    "route": "P",
+    "unit": "G (each)",
+    "broadcast_count": 56,
+    "panel_A_bytes": 194560,
+    "panel_B_bytes": 194560,
+    "logical_payload_bytes": 10895360,
+    "instances_in_tau": 2
+  },
+  {
+    "P": 16,
+    "route": "P",
+    "unit": "projection1",
+    "broadcast_count": 56,
+    "panel_A_bytes": 5914624,
+    "panel_B_bytes": 77824,
+    "logical_payload_bytes": 167788544,
+    "instances_in_tau": 1
+  },
+  {
+    "P": 16,
+    "route": "P",
+    "unit": "projection2",
+    "broadcast_count": 56,
+    "panel_A_bytes": 77824,
+    "panel_B_bytes": 77824,
+    "logical_payload_bytes": 4358144,
+    "instances_in_tau": 1
+  },
+  {
+    "P": 16,
+    "route": "F",
+    "unit": "G (each)",
+    "broadcast_count": 288,
+    "panel_A_bytes": 194560,
+    "panel_B_bytes": 194560,
+    "logical_payload_bytes": 56033280,
+    "instances_in_tau": 1
+  },
+  {
+    "P": 16,
+    "route": "F",
+    "unit": "projection1",
+    "broadcast_count": 288,
+    "panel_A_bytes": 5914624,
+    "panel_B_bytes": 77824,
+    "logical_payload_bytes": 862912512,
+    "instances_in_tau": 1
+  },
+  {
+    "P": 16,
+    "route": "F",
+    "unit": "projection2",
+    "broadcast_count": 288,
+    "panel_A_bytes": 77824,
+    "panel_B_bytes": 77824,
+    "logical_payload_bytes": 22413312,
+    "instances_in_tau": 1
+  }
+]
