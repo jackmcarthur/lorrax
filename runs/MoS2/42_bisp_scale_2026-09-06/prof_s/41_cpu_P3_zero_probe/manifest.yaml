@@ -6,4 +6,5 @@ pool: 57988457
 geometry: CPU four emulated devices
 steps:
   gate:
-    state: pending
+    state: complete
+receipt: "[lx] step lx-Xg0-134320-881449-7187 exit 0 in 4 s"

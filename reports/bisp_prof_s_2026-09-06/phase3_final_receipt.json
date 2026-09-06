@@ -1,0 +1,24 @@
+{
+  "source_commit": "b0b4a205",
+  "branch": "perf/bisp-prof-s-2026-09-06",
+  "source_clean": true,
+  "merged_in_origin_main": false,
+  "active_steps": [],
+  "completed_gates": [
+    "47",
+    "49",
+    "50",
+    "51",
+    "52",
+    "53",
+    "54",
+    "55",
+    "58",
+    "59"
+  ],
+  "superseded_instruments": [
+    "48 malformed edit, corrected49",
+    "56 unexercised distributed branch, corrected57",
+    "57 timing included upstream Z, corrected59"
+  ]
+}
