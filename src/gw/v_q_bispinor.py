@@ -834,8 +834,10 @@ class BispinorVqReader:
         if self._mu_bases is not None:
             left = self._mu_bases[int(mu_L != 0)]
             right = self._mu_bases[int(nu_L != 0)]
-            tile = left.pack_axis(tile, -2)
-            tile = right.pack_axis(tile, -1)
+            if left is right:
+                tile = left.pack_operator(tile)
+            else:
+                tile = right.pack_axis(left.pack_axis(tile, -2), -1)
         return tile
 
     @property

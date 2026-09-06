@@ -30,3 +30,11 @@ The authorized named fallback `LX_ALLOC_MATCH=lx-alloc-jackm-BISP-PROF-S LX_ALLO
 `prof_s/10_P_scan_oracles` copied a non-executable `driver.sh` from the older gate but invoked it directly through rankwrap. JID57982945 step `lx-Xg4-120420-417822-9746` exited126 before Python ran. Evidence: `runs/MoS2/42_bisp_scale_2026-09-06/prof_s/10_P_scan_oracles/driver.1.log`. New variant12 invokes the payload explicitly with bash; failed10 is preserved.
 
 2026-09-06 phase3: GATES.md, INVARIANTS.md and TASTE.md are sandbox-owned; reading them at the LORRAX worktree root fails. Resolved from the known sandbox root. Common-basis arms104–107 likewise live under the sandbox runs root, not this worktree. No shared files changed.
+
+2026-09-06 phase3 F37 diagnostic on JID57988457, step lx-Xg4-140021-988279-2173: ranks1/2 failed in fixed-main screening.compute_static_w:400 with RESOURCE_EXHAUSTED allocating2.42GiB; peer SIGKILL produced137. This is an incomplete diagnostic, not a timing verdict or proven source regression. Same BFC0.85 as common-basis107; preparing a fresh copy without HLO dumping to isolate diagnostic overhead. Evidence runs/MoS2/42_bisp_scale_2026-09-06/prof_s/37_F3_dynamic_receipts/driver.rank1.log.
+
+- 2026-09-06 BISP-PROF-S: attempted ZW backlog path DEV/114_bisp_prof_zw_codex_2026-09-06 did not exist; bounded DEV listing resolves the owner to DEV/112_bisp_prof_zw_codex_2026-09-06 (read-only).
+
+- 2026-09-06 BISP-PROF-S: phase3 seam command used nonexistent sandbox suffix2026-09-06; command never started; corrected to assigned2026-08-14 root.
+
+- 2026-09-06 BISP-PROF-S: parse_lorrax_sigma_run.py is dynamic-only for production tables; static50 has no rule/tau rows and refuses parsing. Use existing stage parser for static; no static parse verdict was recorded.
