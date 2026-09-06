@@ -186,3 +186,96 @@ The static table above is transcribed directly from each production artifact.
 
 ZW's report confirms photon_blocks_full_q has only Sigma-side consumers; all
 restore/mix costs here belong to Sigma. It remains unmodified in this lane.
+
+### Static capture receipts (11 P / 12 F)
+
+Both profiler legs completed exit0, with native nsys reports and CSV exports.
+The terminal wait during P capture was transient compile-agreement skew while
+rank0 flushed profiler work; it did not end in timeout or failure. Do not use
+profiled stage walls as unprofiled performance estimates.
+
+| host boundary in capture | P11 | F12 |
+|---|---:|---:|
+| contraction compiled bodies |64 (32 body +32 head)|4 combined body/head|
+| body calls / cold calls / warm calls |48 /32 /16|48 /4 /44 (combined)|
+| body cold median ms |570.739|640.200 (combined)|
+| body warm median ms |2.795|6.731 (combined)|
+| head cold / warm median ms |595.276 /2.532|included|
+| restore V calls / compiles / compiler s |16 /120 /31.382|absent|
+| restore W calls / compiles / compiler s |16 /116 /31.315|absent|
+| restore W−V calls / compiles / compiler s |16 /120 /32.311|absent|
+| complete static caller compile count / compiler s |1135 /254.837|141 /24.275|
+
+The body boundary records33 compilation events for32 cold body calls: one
+additional supporting executable is included; **64 contraction bodies** is the
+32 body +32 head specialization count, not a relabelling of65 boundary events.
+All48 restores compile, including W and W−V passes. P's X/SX weights are
+(nk,nb); COH weights are (nb,), explaining the second specialization per
+vertex/head identity. The exact same cached object is reused for SX.
+
+The remainder between the static caller and restore/block measurements is NOT
+assigned a guessed cause or cost. Source inspection identifies eager plan
+construction as a candidate: every one of32 factory misses creates a projector
+(two eagerly warmed GEMM plans) and one Green GEMM plan, versus four factories
+in F. New14/15 unprofiled instruments time the factory itself. Ablation17
+reuses these unchanged plans by shape, ablation16 normalizes the small weight
+operand shape, and ablation13 reuses restore callables across terms. They are
+prepared but unrun; none changes production source.
+
+Artifacts are `11_P_full_static_profile/boundary.jsonl`,
+`12_F_full_static_profile/boundary.jsonl`, their `boundary_summary.json`,
+`nsys_rank0.nsys-rep`, `stats_nvtx_gpu_proj_sum.csv`, and
+`stats_nvtx_kern_sum.csv` under the local MoS2 prof_s root. Native ms and
+HLO census remain to be reduced before any device claim.
+
+### Native warm TT unit and collective census
+
+P11 modules2042/2094, second invocation: TT(1,1) SX body/head;
+F12 module1019, second invocation: the same TT(1,1) SX combined call.
+The lane extension `extract_nsys_unit.py` correlates native CUDA launches inside
+the selected XLA-module NVTX range. Its aggregate ranges agree with native CSV
+counts; it refused a missing range during development rather than reporting zero
+work. Calls below are GPU projected spans, not host/compiler times.
+
+| operation | P body ms | P head ms | F combined ms |
+|---|---:|---:|---:|
+| complete unit |2.185950|2.043967|6.757437|
+| Green GEMM |1.055104|1.040000|1.211744 (shared)|
+| body convolution |0.051008|—|0.050111|
+| first band projection |0.394623|0.373151|1.245184 /1.238879 body/head|
+| second band projection |0.327680|0.323552|1.197535 /1.178656 body/head|
+| NCCL kernel count |60 broadcasts|60 broadcasts|180 broadcasts +2 all-gathers +1 SendRecv|
+| NCCL kernel-duration sum ms |0.733663|0.744159|2.928127|
+
+P's pre-G command-buffer range is0.032032ms (5 native kernels; summed
+kernel duration0.031903ms), enclosing both child face unfolds, their fused
+spin/vertex work and G-buffer setup. This is a **bound on spin-action cost**,
+not an isolated spinor einsum measurement. It is only3% of that unit's Green
+GEMM span, and cannot explain the132.39s unprofiled static-stage regression.
+G→convolution layout conversion is0.013216ms; parent-row selection plus scale
+is0.004416ms. No separate dense4×4 GEMM occurs in this sampled pre-G range.
+
+Optimized HLO: all64 P contract_block modules contain zero explicit
+collectives; all4 F modules contain4 all-gathers statically across their
+conditional branches. The selected F execution runs2 native all-gathers plus
+1 SendRecv. P's broadcasts live inside GEMM FFI and are invisible to HLO.
+P body/head TT peak HLO bytes/rank are13,524,977 /9,748,977.
+
+All **300** P restore/add modules are present in the optimized dump and contain
+zero explicit HLO collectives. Across300 calls their native projected spans
+sum to **6.607031ms**; native kernel-duration sums total **1.673695ms**.
+They nevertheless consume95.008s of compiler work in the enclosing restore
+boundaries. This justifies prioritizing executable lifetime over a resident
+full-q result cache. Native spans and kernel sums are deliberately kept separate.
+
+Actual MoS2 carriers in the new startup/memory receipts are
+Q=3,K=9,N=80,s=4,M_C=192,M_T=100,P=4. Thus both families' parent faces
+carry2,242,560 bytes/rank; retaining both child faces for both families adds
+6,727,680 bytes/rank, for8,970,240 bytes before scratch/aliases. This replaces
+the earlier explicitly illustrative equal192/192 estimate for this gate.
+
+Evidence: P11/F12 `census.json`, optimized dumps, native CSVs and
+`unit_2042_1.json`, `unit_2094_1.json`, `unit_1019_1.json`.
+Canonical analyzers are the sandbox HLO tool and PERF2 collective census; the
+single-occurrence extension is registered in `skills/profile_bisp_sigma/SKILL.md`.
+P11 eqp0/eqp1 each pass tolerance0 against P05 (90/90 printed rows).
