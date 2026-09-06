@@ -1,0 +1,20 @@
+{
+  "batch": 4,
+  "certificate": 1e-05,
+  "eta_ev": 0.25,
+  "executor_census": "shared_tau_kernel",
+  "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/20_P_dynamic_profile/driver.rank0.log",
+  "logical_windows": 8,
+  "plan": "box",
+  "plan_cache_status": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/20_P_dynamic_profile/tmp/sigma_quadrature_rules",
+  "planned_distinct_tau": 67,
+  "planned_window_tau_pairs": 67,
+  "poles": 1,
+  "quadrature_eps": 1e-05,
+  "sigma_self_seconds": 282.935,
+  "sigma_wall_seconds": 327.978,
+  "sweeps": 8,
+  "tau": 67,
+  "total_wall_seconds": 433.779,
+  "undispatched_tau": 0
+}

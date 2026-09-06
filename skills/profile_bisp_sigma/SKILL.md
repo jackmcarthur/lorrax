@@ -16,3 +16,11 @@ spans and host walls are different quantities; nested thunk spans overlap.
 
 Science identity remains owned by `tools/eqp_ab.py --tol-uev 0` and the printed
 Sigma rows; profiler analysis never substitutes for the P4 identity gate.
+
+The canonical analyzer omits collective-permute-start. Run
+prof_s/00_tools/census_async_starts.py RUN as a supplement, retaining both
+outputs. It counts optimized synchronous operations or async starts once and
+excludes done instructions. Native SendRecv is an independent cross-check.
+Use prof_s/00_tools/gate_candidate.py BASE CANDIDATE to invoke the canonical
+EQP parser and compare complete printed Sigma rows. Certificate-replay arms
+are gated against the same selected schedule, not an original alternate rule.

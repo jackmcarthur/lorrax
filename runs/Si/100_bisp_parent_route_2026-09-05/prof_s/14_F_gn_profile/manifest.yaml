@@ -1,0 +1,16 @@
+run_id: 14_F_gn_profile
+system: Si
+pipeline: lorrax_only
+platform: perlmutter
+variant_of: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/48_fixed_main_gn
+reuse_from_parent: [/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/100_bisp_parent_route_2026-09-05/56_parent_gn/tmp]
+overrides: {debug_print: true, matched_tmp_donor: P}
+source:
+  checkout: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_main_de8dcfbc_fixed
+  commit: e1559a071e244b4f049c924781b668d9e1560739
+  based_on: e1559a071e244b4f049c924781b668d9e1560739
+allocator: BFC@0.85
+geometry: {nodes: 1, gpus: 4, ranks: 4}
+steps:
+  00_lorrax: {state: pending}
+instrument: nsys_rank0_matched_certified_replay

@@ -1,0 +1,7 @@
+A            runs/Si/100_bisp_parent_route_2026-09-05/prof_s/03_P_gn_baseline/eqp0.dat
+B            runs/Si/100_bisp_parent_route_2026-09-05/prof_s/13_P_gn_profile/eqp0.dat
+rows         256 over 8 k-points
+identical    58/256 E_qp rows agree to the printed digit
+max|dE_DFT|  0.000 ueV   (must be 0 for two arms of one deck)
+max|dE_qp|   0.518 ueV   at (3, 1, 15, 15.497533279, 15.497532761)
+VERDICT      FAIL  (tolerance 0.0 ueV)
