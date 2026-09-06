@@ -6,10 +6,12 @@ from unittest.mock import patch
 @contextmanager
 def observe_routes(*, low_mem_bands):
     import distrib_la
+    import file_io
     from gw import isdf_fitting, w_isdf
 
-    events = {"zeta_fits": [], "algebra": [], "dyson": []}
+    events = {"zeta_fits": [], "restart_loads": [], "algebra": [], "dyson": []}
     fit = isdf_fitting.fit_zeta_to_h5
+    load_restart = file_io.load_restart_state_from_h5
     batched = distrib_la.Plan.batched
     single = distrib_la.Plan.__call__
 
@@ -20,6 +22,12 @@ def observe_routes(*, low_mem_bands):
             "distributed_zeta_solve": kwargs["distributed_zeta_solve"],
         })
         return fit(*args, **kwargs)
+
+    def observed_restart(*args, **kwargs):
+        assert kwargs["low_mem_bands"] is low_mem_bands
+        events["restart_loads"].append({"file": str(args[0]),
+                                       "low_mem_bands": kwargs["low_mem_bands"]})
+        return load_restart(*args, **kwargs)
 
     def record(plan, operand, kind):
         event = {"op": plan.op, "backend": plan.backend,
@@ -51,6 +59,7 @@ def observe_routes(*, low_mem_bands):
 
     with ExitStack() as patches:
         patches.enter_context(patch.object(isdf_fitting, "fit_zeta_to_h5", observed_fit))
+        patches.enter_context(patch.object(file_io, "load_restart_state_from_h5", observed_restart))
         patches.enter_context(patch.object(distrib_la.Plan, "batched", observed_batched))
         patches.enter_context(patch.object(distrib_la.Plan, "__call__", observed_single))
         for route in ("local", "distributed"):

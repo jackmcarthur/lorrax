@@ -36,7 +36,8 @@ The default coverage is:
 | Fresh current centroids | Magnetic spinors, current Gram, orbit closure, oversampling and pruning |
 | Literal charge centroids | Non-orbit path, no oversampling/pruning, 19 points |
 | Fresh kinetic/ionic preprocessing | Pseudopotential loader and parallel HDF5 writer |
-| Four fresh COHSEX calculations | Every combination of local/distributed algebra and low/high band memory, symmetry unfolding, zeta, Coulomb, screening, Sigma, QP output |
+| Three fresh COHSEX calculations | Local/high, distributed/low, local/low band memory; symmetry unfolding, zeta, Coulomb, screening, Sigma, QP output |
+| One COHSEX restart | Distributed/high band memory from a copy of local/high's completed restart state; real loader invocation, no refitting, fresh/restart numerical parity |
 | Fresh scalar MPA | Existing helium fixture B, 7 active bands, 13 centroids, 2 poles, frequency-dependent Sigma, frozen quadrature rules |
 | Existing dense-algebra bodies | Real cuSolverMp/cuBLASMp and local operations, hostile extents, factor/solve residuals, route refusals |
 
@@ -44,9 +45,13 @@ The four COHSEX results must agree with one another and with hashed numerical
 references: all 27 k/band rows, all printed Sigma components, and EQPs within
 0.02 meV. MPA uses the existing core reference's 0.2-meV tolerance, checks
 all 25 frequencies of its small Sigma tensor, and regenerates its fit/stores.
-The local/distributed and band
-memory choices are independent test axes; no mode is accepted by a skip or
-xfail. The GW calculation currently disables head completion and stochastic
+The distributed/high combination covers restart loading and downstream GW;
+its fresh-fit combination is deliberately omitted to fit restart coverage
+into the existing four runs. Each fresh arm must fit once and never load a
+restart; the restart arm must load once and never fit. Copied EQP/Sigma
+outputs are removed before the restart runs, so stale parent results cannot
+satisfy the comparison. No mode is accepted by a skip or xfail.
+The GW calculation currently disables head completion and stochastic
 body averaging to make the comparison deterministic. MPA temporarily uses
 the same development permission for runtime minimax solving as the core B
 test; this is not a certification of that setting for production.
@@ -54,8 +59,9 @@ test; this is not a certification of that setting for production.
 The magnetic case exercises 25 full / 9 stored k-points, 7 active bands,
 and 6 orbit-closed centroids; none is divisible by four. The literal selector's
 19 and MPA's 13 centroids additionally exercise odd extents on the 2×2 mesh.
-Numerical work is fresh in every GW arm; only the runtime's compiled executables
-are shared. No persistent compilation cache was used for the recorded runs.
+The restart arm uses its own writable copy of the completed local/high run's
+`tmp/` state, preserving the original run. All arms share the runtime's compiled
+executables. No persistent compilation cache was used for the recorded runs.
 
 GN/HL-PPM, SC, BSE, htransform, head/body corrections, and production-scale
 memory remain in the other tiers.

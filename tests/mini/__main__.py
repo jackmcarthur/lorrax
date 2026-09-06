@@ -87,12 +87,16 @@ def main():
                 print(f"MINI PASS {name} {elapsed:.3f}s", flush=True)
             return result
 
-        def stage(source, name):
+        def stage(source, name, *, restart=False):
             target = output / name
             if runtime.process_index == 0:
-                shutil.copytree(source, target)
-                from tests.harness import make_writable
-                make_writable(target)
+                from tests.harness import copy_fixture, make_writable
+                if restart:
+                    copy_fixture(source, target, tmp_from=source)
+                    (target / "gwjax.out").unlink(missing_ok=True)
+                else:
+                    shutil.copytree(source, target)
+                    make_writable(target)
             mh.sync_global_devices("mini-stage-" + name)
             return target
 
@@ -177,7 +181,7 @@ def main():
         check("current_centroids", lambda: select("current", True, 6))
         check("literal_centroids", lambda: select("scalar", False, 19))
         base_deck = """[cohsex]
-restart = false
+restart = {restart}
 centroids_file = {centroids}
 nval = 1
 ncond = 2
@@ -195,7 +199,7 @@ fermi_reference = midgap
 """
         if runtime.process_index == 0:
             (h2 / "cohsex.in").write_text(base_deck.format(
-                centroids=charge, linalg="local", low_mem="false"))
+                centroids=charge, linalg="local", low_mem="false", restart="false"))
         mh.sync_global_devices("mini-deck-written")
 
         def preprocess():
@@ -206,13 +210,15 @@ fermi_reference = midgap
 
         check("kin_ion", preprocess)
         arms = []
-        for layout, low in (("local", False), ("distributed", True),
-                            ("local", True), ("distributed", False)):
-            name = f"gw_{layout}_{'low' if low else 'high'}"
-            target = stage(h2, name)
+        for layout, low, restart in (("local", False, False), ("distributed", True, False),
+                                     ("local", True, False), ("distributed", False, True)):
+            name = f"gw_{layout}_{'low' if low else 'high'}" + ("_restart" if restart else "")
+            parent = output / "gw_local_high" if restart else h2
+            target = stage(parent, name, restart=restart)
             if runtime.process_index == 0:
                 (target / "cohsex.in").write_text(base_deck.format(
-                    centroids=charge, linalg=layout, low_mem=str(low).lower()))
+                    centroids=charge, linalg=layout, low_mem=str(low).lower(),
+                    restart=str(restart).lower()))
             mh.sync_global_devices("mini-deck-" + name)
 
             def gw():
@@ -221,10 +227,12 @@ fermi_reference = midgap
                 from tests.mini.routes import observe_routes
                 with observe_routes(low_mem_bands=low) as routes:
                     invoke(gwjax, ["-i", "cohsex.in"], target)
-                assert len(routes["zeta_fits"]) == 1, routes
+                assert len(routes["zeta_fits"]) == (0 if restart else 1), routes
+                assert len(routes["restart_loads"]) == (1 if restart else 0), routes
                 assert routes["dyson"] and {e["route"] for e in routes["dyson"]} == {layout}, routes
                 if layout == "distributed":
-                    assert routes["zeta_fits"][0]["distributed_zeta_solve"] == "distributed"
+                    if not restart:
+                        assert routes["zeta_fits"][0]["distributed_zeta_solve"] == "distributed"
                     assert any(e["backend"] == "cusolvermp" for e in routes["algebra"]), routes
                 eqp = eqp_column(target / "eqp1.dat")
                 sigma = parse_eqp_rows(target / "sigma_diag.dat")
@@ -239,7 +247,8 @@ fermi_reference = midgap
                 report = (target / "gwjax.out").read_text()
                 assert f"linalg = {layout} (deck)" in report
                 assert f"low_mem_bands = {str(low).lower()} (deck)" in report
-                return {"linalg": layout, "low_mem_bands": low, "restart": False,
+                return {"linalg": layout, "low_mem_bands": low, "restart": restart,
+                        "restart_from": parent.name if restart else None,
                         "max_eqp_delta_ev": float(np.max(np.abs(eqp - arms[0][0]))),
                         "executed_routes": routes}
 
