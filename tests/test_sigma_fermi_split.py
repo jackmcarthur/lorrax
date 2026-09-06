@@ -483,7 +483,7 @@ def _sx_fixture():
     # likewise psi_yn / psi_yr.  Build one of each pair and transpose, so the
     # fixture cannot accidentally test a bundle no loader could produce.
     psi_xn = _c(1, 1, _SX_NMU, _SX_NB)
-    psi_yn = _c(1, 1, _SX_NMU, _SX_NB)
+    psi_yn = psi_xn.copy()
     psi_xr = np.transpose(psi_xn, (0, 3, 1, 2)).copy()
     psi_yr = np.transpose(psi_yn, (0, 3, 1, 2)).copy()
 
@@ -531,6 +531,36 @@ def _sigma_x_dense_reference(f, psi_xn, psi_xr, psi_yr, psi_yn, V_q):
     return out
 
 
+def _sx_parent_bundle(wfns, mesh):
+    """The one-row fixture carries raw parents with the typed identity action."""
+    from functools import partial
+    from gw.centroid_k_unfold import build_centroid_k_unfold_plan
+    from gw.wavefunction_bundle import ParentGreenCarrier
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from symmetry_maps import spinor_rotation_for_sym_row
+
+    ops = np.eye(3, dtype=np.int32)[None]
+    sym = SimpleNamespace(
+        sym_matrices=ops, translations=np.zeros((1, 3)),
+        sym_mats_k=np.concatenate((ops, -ops)),
+        irr_idx_k=np.asarray([0]), sym_idx_k=np.asarray([0]),
+        kirr_fullids=np.asarray([0]), unfolded_kpts=np.zeros((1, 3)),
+        nk_red=1, nk_tot=1,
+        spinor_action=partial(spinor_rotation_for_sym_row,
+                              np.ones((1, 1, 1)), n_tran=1))
+    plan = build_centroid_k_unfold_plan(
+        sym, np.asarray([[0, 0, 0], [1, 0, 0], [2, 0, 0]]),
+        (3, 1, 1), mesh, nspinor=1)
+    carrier = ParentGreenCarrier(
+        psi_mun=jax.device_put(
+            wfns.psi_xn, NamedSharding(mesh, P(None, None, "x", "y"))),
+        psi_nmu=jax.device_put(
+            wfns.psi_yr, NamedSharding(mesh, P(None, "x", None, "y"))),
+        enk=wfns.enk, occ=wfns.occ, plan=plan)
+    return Wavefunctions(enk=wfns.enk, occ=wfns.occ, slices=wfns.slices,
+                         green_parent=carrier, layout="face")
+
+
 def test_invalid_static_shared_spatial_matches_legacy_dense_cohsex():
     """Mode-3 static fallback keeps the old SX+COH algebra at P=1.
 
@@ -553,7 +583,8 @@ def test_invalid_static_shared_spatial_matches_legacy_dense_cohsex():
             + sigma_coh_k(wfns, W_static, jnp.zeros_like(W_static))))
 
     got = _compute_invalid_static_sigma(
-        wfns, jnp.asarray(Wc0_q), jnp.asarray(invalid), meta, mesh)
+        _sx_parent_bundle(wfns, mesh), jnp.asarray(Wc0_q),
+        jnp.asarray(invalid), meta, mesh)
     scale = max(float(np.max(np.abs(legacy))), 1.0)
     np.testing.assert_allclose(got, legacy, rtol=2e-12,
                                atol=2e-12 * scale)
@@ -579,7 +610,8 @@ def test_invalid_static_brackets_match_legacy_dense_cohsex():
     legacy = np.stack(legacy)
 
     got = _invalid_static_coh_by_bracket(
-        wfns, jnp.asarray(Wc0_q), jnp.asarray(invalid), meta, mesh, brackets)
+        _sx_parent_bundle(wfns, mesh), jnp.asarray(Wc0_q),
+        jnp.asarray(invalid), meta, mesh, brackets)
     scale = max(float(np.max(np.abs(legacy))), 1.0)
     np.testing.assert_allclose(got, legacy, rtol=2e-12,
                                atol=2e-12 * scale)

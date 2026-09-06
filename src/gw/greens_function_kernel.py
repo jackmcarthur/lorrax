@@ -174,6 +174,12 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None):
         w = phases.astype(A.dtype)                  # (nk, n)
         A = A * w[:, None, :]
     B = merge_spin_centroid(jnp.conj(psi_nmu), 2, 3)  # (nk, n, mu*s) P(_,'x','y')
+    # Eager operations may erase singleton mesh axes before the GEMM boundary.
+    from jax import lax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    sharding = NamedSharding(gemm.mesh, P(None, 'x', 'y'))
+    A = lax.with_sharding_constraint(A, sharding)
+    B = lax.with_sharding_constraint(B, sharding)
     G_flat = gemm(A, B)                              # (nk, mu*s, mu*s) P(_,'x','y')
     # Undo BOTH merges, restoring legacy's rectangular
     # (k, s, μ_left_X, s', μ_right_Y) axis order.  The historical

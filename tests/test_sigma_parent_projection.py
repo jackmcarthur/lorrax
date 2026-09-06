@@ -64,7 +64,9 @@ def _worker() -> int:
     import distrib_la
 
     def _local_gemm_plan(_mesh, **_kwargs):
-        return lambda a, b: jnp.einsum("qmk,qkn->qmn", a, b, optimize=True)
+        gemm = lambda a, b: jnp.einsum("qmk,qkn->qmn", a, b, optimize=True)
+        gemm.mesh = _mesh
+        return gemm
 
     distrib_la.gemm_plan = _local_gemm_plan
 

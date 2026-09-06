@@ -141,7 +141,9 @@ def _emulated_flat_k_fftn(mesh, kgrid, spec, *, norm="ortho",
 
 
 def _local_gemm_plan(_mesh, **_kwargs):
-    return lambda a, b: jnp.einsum("qmk,qkn->qmn", a, b, optimize=True)
+    gemm = lambda a, b: jnp.einsum("qmk,qkn->qmn", a, b, optimize=True)
+    gemm.mesh = _mesh
+    return gemm
 
 
 def test_parent_carrier_matches_full_k_minimax_response(monkeypatch):

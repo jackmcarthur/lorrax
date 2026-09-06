@@ -13,7 +13,12 @@ def test_current_chi_matches_literal_hermitian_density(monkeypatch):
     from gw.w_isdf import _get_chi_minimax_kernel, MinimaxNodes
 
     monkeypatch.setattr(fft_helpers, "make_flat_k_fftn", lambda *a, **k: lambda x: x)
-    monkeypatch.setattr(distrib_la, "gemm_plan", lambda *a, **k: lambda x, y: x @ y)
+    def local_gemm_plan(mesh, **kwargs):
+        gemm = lambda x, y: x @ y
+        gemm.mesh = mesh
+        return gemm
+
+    monkeypatch.setattr(distrib_la, "gemm_plan", local_gemm_plan)
     mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ('x', 'y'))
     rng = np.random.default_rng(84)
     left = rng.normal(size=(4, 4, 4)) + 1j * rng.normal(size=(4, 4, 4))
