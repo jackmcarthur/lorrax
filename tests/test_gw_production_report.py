@@ -412,10 +412,8 @@ def test_low_mem_bands_warning_has_automatic_chunk_number(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert "[config provenance] low_mem_bands = true (deck)" in text
     assert (
-        "low_mem_bands = true is a capacity escape hatch: saves memory "
-        "(band chunks of 24) but takes longer; set false whenever the "
-        "full-band carrier fits, especially for multi-node dynamic Sigma "
-        "sweeps" in text)
+        "low_mem_bands = true: the two-face wavefunction carrier (band "
+        "chunks of 24); required for the raw-parent (k_irr) route" in text)
 
 
 def test_distributed_linalg_reports_2d_layout(tmp_path):
