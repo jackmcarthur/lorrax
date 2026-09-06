@@ -1,0 +1,70 @@
+Sun Sep  6 11:41:05 2026    runs/MoS2/42_bisp_scale_2026-09-06/prof_s/04_P_host_baseline/sigma_host.pstats
+
+         2059511 function calls (1983335 primitive calls) in 14.373 seconds
+
+   Ordered by: internal time
+   List reduced from 1883 to 35 due to restriction <35>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      138    9.853    0.071    9.853    0.071 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/compiler.py:312(backend_compile_and_load)
+       97    0.413    0.004    0.413    0.004 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/api.py:3096(try_to_block)
+      138    0.311    0.002    0.389    0.003 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py:571(make_ir_context)
+      414    0.182    0.000    0.183    0.000 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/jax_compile_cache.py:335(_wait_for_key)
+     1548    0.168    0.000    0.395    0.000 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/dispatch.py:84(apply_primitive)
+     50/1    0.130    0.003   14.396   14.396 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/04_P_host_baseline/profile_driver.py:30(call)
+      138    0.108    0.001    0.305    0.002 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/jax_compile_cache.py:1522(_agree_before_module_compile)
+      145    0.103    0.001    0.106    0.001 {built-in method _io.open}
+     1405    0.091    0.000    0.091    0.000 {method 'sub' of 're.Pattern' objects}
+      140    0.090    0.001    0.100    0.001 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py:1340(__call__)
+      300    0.078    0.000    1.486    0.005 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/services/symmetry_maps/src/symmetry_maps/maps.py:467(unfold_isdf_operator)
+      138    0.078    0.001    0.078    0.001 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py:564(__init__)
+     1193    0.077    0.000    1.025    0.001 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/numpy/ufunc_api.py:175(__call__)
+358924/356876    0.073    0.000    0.075    0.000 {built-in method builtins.isinstance}
+       60    0.063    0.001    2.653    0.044 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/services/distrib_la/src/distrib_la/matmul.py:187(_zeros)
+      138    0.056    0.000    0.154    0.001 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/jax_compile_cache.py:1399(_compile_module_identity)
+      138    0.055    0.000    1.376    0.010 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py:1196(lower_jaxpr_to_module)
+ 1635/303    0.045    0.000    0.680    0.002 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py:2113(_cached_lowering)
+  231/138    0.045    0.000    0.911    0.007 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py:1513(lower_jaxpr_to_fun)
+    38735    0.043    0.000    0.060    0.000 {method 'get' of 'dict' objects}
+21075/21011    0.042    0.000    0.067    0.000 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/util.py:267(wrapper)
+ 1212/296    0.041    0.000    0.659    0.002 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py:2174(_emit_lowering_rule_as_fun)
+  352/138    0.037    0.000    0.751    0.005 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py:1995(jaxpr_subcomp)
+      683    0.035    0.000    0.038    0.000 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py:235(batched_device_put)
+      507    0.035    0.000    0.057    0.000 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/named_sharding.py:339(build)
+      400    0.034    0.000    0.522    0.001 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_layout.py:288(photon_block_view)
+     3522    0.031    0.000    0.034    0.000 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py:464(_traceback_to_location)
+     3012    0.030    0.000    0.030    0.000 {method 'tobytes' of 'numpy.ndarray' objects}
+      354    0.029    0.000    0.295    0.001 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/pjit.py:2143(_sharding_constraint_impl)
+     6087    0.027    0.000    0.080    0.000 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py:194(_array_ir_types)
+    26452    0.026    0.000    0.247    0.000 {jaxlib.utils.safe_map}
+46062/18898    0.024    0.000    0.039    0.000 {built-in method builtins.hash}
+      145    0.023    0.000    0.023    0.000 {method '__exit__' of '_io._IOBase' objects}
+     1382    0.022    0.000    0.022    0.000 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/named_sharding.py:308(build)
+      608    0.022    0.000    0.024    0.000 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/centroid_k_unfold.py:86(centroid_local_perm)
+
+
+Sun Sep  6 11:41:05 2026    runs/MoS2/42_bisp_scale_2026-09-06/prof_s/04_P_host_baseline/sigma_host.pstats
+
+         2059511 function calls (1983335 primitive calls) in 14.373 seconds
+
+   Ordered by: cumulative time
+   List reduced from 1883 to 15 due to restriction <'photon_sigma|w_isdf|block_until_ready|gamma_perm_phase'>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.002    0.002   14.395   14.395 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py:215(compute_static_photon_sigma)
+       51    0.004    0.000   11.253    0.221 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py:164(contract_lorentz_blocks)
+       48    0.001    0.000    6.934    0.144 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py:109(_make_photon_static_block_kernel)
+       51    0.009    0.000    3.273    0.064 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/w_isdf.py:1465(photon_blocks_full_q)
+       97    0.000    0.000    0.414    0.004 /global/common/software/m4598/jackm/lorrax_cuda13_runtime/.venv/lib/python3.12/site-packages/jax/_src/api.py:3085(block_until_ready)
+        6    0.000    0.000    0.324    0.054 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py:257(finish)
+        4    0.000    0.000    0.317    0.079 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py:260(<genexpr>)
+        4    0.000    0.000    0.139    0.035 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py:149(contract_block)
+        4    0.000    0.000    0.084    0.021 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py:141(unfold)
+       96    0.000    0.000    0.082    0.001 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/gamma_matrices.py:147(gamma_perm_phase)
+      144    0.000    0.000    0.000    0.000 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py:122(<genexpr>)
+       48    0.000    0.000    0.000    0.000 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py:76(_head_sector)
+        2    0.000    0.000    0.000    0.000 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py:98(_require_packed_operator)
+        1    0.000    0.000    0.000    0.000 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py:68(__post_init__)
+        9    0.000    0.000    0.000    0.000 /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py:172(<genexpr>)
+
+

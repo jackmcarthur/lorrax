@@ -475,3 +475,37 @@ Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/47_P_executor_seams; 
 Preregistered baseline: orchestrator71ae0bde, fetched and rebased before implementation. Source is compared byte-for-byte against that pin. The optional prior block-spin change is not on the orchestrator pin and is excluded from this experiment. Pool57982945 is authorized; sequential P4 legs precede any available P16 leg. Decks/immutable inputs come from MoS2/42_bisp_scale_2026-09-06, with private copied tmp/rules.
 
 Plan: four ordered endpoint classes; one unvertexed G and its transform per class/term. Distinct W_AB prevents reusing one block's convolution result. Stream canonical gamma-weighted products through a compiled scan, then perform the shared inverse operation/projection on the class sum; do not stack Green tensors. Preserve the existing FFT normalization owner and symmetry actions. Compare printed outputs before accepting changed summation placement. Attribute factories, synchronization fences, restore dispatch and outer Python work before source changes.
+
+### Before-change accounting (6x6, P4)
+
+All source/services/tests equal orchestrator71ae0bde. New run root `runs/MoS2/42_bisp_scale_2026-09-06/prof_s/`; all steps use authorized JID57982945. Baseline01: `lx-Xg4-113321-195974-2219`, exit0, Sigma other21.73s, total73.20s, whole-run compiler674 events/40.89s. Dynamic02: `lx-Xg4-113441-218949-9472`, exit0,116 nodes across8 windows; six cache hits/two rebuilt windows (`parsed.json` and exact node receipts in driver.rank0.log). Capture03: `lx-Xg4-113635-230722-5731`, exit0, native CUDA records exported; EQP tolerance0 and210 complete sector rows identical to01. Python-profile04: `lx-Xg4-114002-258518-9170`, exit0. Profiled walls are not substituted for baseline walls.
+
+| synchronized boundary, 04 | calls | host s | compile events / s | warm median ms |
+|---|---:|---:|---:|---:|
+| factory |48|6.935026|86 /5.782593|0.079544|
+| contraction |48|2.903554|4 /1.590072|7.961281|
+| V restores |16|2.438699|24 /1.585057|23.962827|
+| W restores |16|0.289386|0 /0|25.205862|
+| W−V restores |16|0.548147|4 /0.138982|31.925751|
+| outer caller, nested |1|14.395089|138 /9.855657|—|
+
+The outer remainder after those children is1.280278s, including weights, band sums/unfold, closure and instrumentation. cProfile (`04/sigma_host_top.txt`) identifies Python loop own time0.006s, canonical gamma operand construction0.082s, six finish calls0.324s. Its97 `jax.block_until_ready` calls total0.414s; this includes instrument fences and overlaps contraction timing, so it is not an additive host-gap estimate. The48 warm factory lookups are negligible: the6.935s factory total is dominated by four first-use projection/GEMM plans. The300 canonical unfold calls total1.486s and400 block views0.522s, nested within restores. Thus the former2–4s host gap is dispatch/lowering/synchronization spread over these boundaries, not seconds of Python loop arithmetic. The scan removes36 contraction dispatches/term-loop repetitions and the duplicate48 outer sum fences; a subsequent separately gated restore change will target the300 source restores.
+
+Architectural proposal accepted for measurement: move the canonical monomial vertices through the linear transform, build G once/class/term, IFFT it once, scan distinct W_AB products, FFT/project the sum once. Keep head diagnostics in the same factory and prepare their covariant factor orbit once/term. Four class sizes1/3/3/9;12 calls/run rather than48. No Green block axis. The sole FFT normalization owner is extended, with its scalar fused path retained. Additional resident interactions are B_class scalar full-q blocks sharded on both centroid axes, plus one accumulated Sigma; optimized memory will gate the actual lifetime. Existing `SymMaps`, `gamma_apply`, Green and band-projection owners remain authoritative. Printed-digit equivalence and a complex dense class oracle gate the change in summation placement.
+
+### Native warm blocks and optimized HLO before the scan
+
+Capture03 `selected_units.json` owns the reduced figures below. Select the first SX call in each class (occurrences1/3/3/9), after the X calls compiled and warmed each executable. Native projected spans include launch gaps; disjoint CUDA kernel sums are separately classified. All four optimized contraction modules have **zero explicit collectives**, including async starts; NCCL broadcasts inside existing distributed GEMM FFI remain visible and are not called communication-free.
+
+| warm block | projected ms | kernel sum ms | GEMM / NCCL / FFT / other fused ms | optimized bytes/rank |
+|---|---:|---:|---|---:|
+| CC |29.184572|28.013724|5.777568 /11.611678 /5.379967 /5.244511|1,732,891,144|
+| CT |14.252446|13.309374|3.068447 /6.975008 /1.751743 /1.514176|573,907,784|
+| TC |14.025886|13.083103|3.055648 /6.756768 /1.755359 /1.515328|573,907,784|
+| TT |7.827103|6.251199|1.456032 /3.686367 /0.584832 /0.523968|189,953,736|
+
+The full-class baseline is1/3/3/9 times those per-block costs; this is a scaling estimate, not a measured batched execution. TT therefore offers70.444ms of projected block work per term before batching. Its Green GEMM and two band-projection FFI ranges cost2.866943/1.411616/0.768448ms in CUDA sums; the fused convolution0.715776ms. Canonical unfold, spin/gather and transposes share fused kernels and remain bounded by the non-GEMM/FFT bucket. No standalone spin-rotation latency is invented. The candidate's scan moves vertex gathers onto the Green tensor; their cost must be included in the after capture.
+
+The complex CPU gate passes22 tests on four emulated devices (`07_cpu_scan`, `lx-Xg0-114716-304836-4320`, JID57982945); this substitutes backend FFT/GEMM plumbing and does not certify native GPU execution. First gate06 passed21 but its deliberate Gamma2 mutation reused a previously compiled convolution and therefore did not exercise the mutation. The test now invalidates that executable before injecting the error, and the oracle rejects it. No production arithmetic was changed to satisfy that test.
+
+Allocation fallback01 exited3 after three Slurm query timeouts; fallback02 reached the controller but was refused with QOSMaxSubmitJobPerUserLimit. The P4 candidate remains queued on the authorized shared pool; the named fallback will be retried at ten-minute intervals after that refusal. No other lane's allocation is used.

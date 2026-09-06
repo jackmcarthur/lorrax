@@ -1,0 +1,11 @@
+run_id: 07_cpu_scan
+system: MoS2
+pipeline: pytest physics oracles
+platform: perlmutter
+variant_of: 06_cpu_scan (mutation test invalidates cached executable)
+reused: existing independent dense physics oracles
+pool: 57982945
+geometry: CPU one process four emulated devices
+steps:
+  pytest:
+    state: pending
