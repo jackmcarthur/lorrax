@@ -161,8 +161,9 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la._shard_map import shard_map
-from distrib_la.matmul import (_OP_CODE, _TARGETS, _mesh_shape, _zeros,
+from distrib_la.matmul import (_CUBLASMP_CACHE, _OP_CODE, _TARGETS, _mesh_shape, _zeros,
                                resolve_matmul_backend)
+from distrib_la.resolve import mesh_key
 
 __all__ = ["GemmPlan", "gemm_plan"]
 
@@ -266,6 +267,10 @@ def _build_kernel(mesh, *, px, py, nq, m, k, n, dtype, alpha, beta,
     one compiled program, not two.  See the module docstring "Output
     liveness".
     """
+    key = ("planned", mesh_key(mesh), px, py, nq, m, k, n, str(dtype),
+           alpha, beta, int(ctx_handle), with_c)
+    if key in _CUBLASMP_CACHE:
+        return _CUBLASMP_CACHE[key]
     attrs = _gemm_attrs(px=px, py=py, nq=nq, m=m, k=k, n=n, alpha=alpha,
                         beta=beta, ctx_handle=ctx_handle, with_c=with_c)
     out_t = jax.ShapeDtypeStruct((nq, n // py, m // px), dtype)
@@ -276,6 +281,7 @@ def _build_kernel(mesh, *, px, py, nq, m, k, n, dtype, alpha, beta,
         def _local(a, b, c):
             return _local_gemm_call(a, b, c, attrs=attrs, out_t=out_t,
                                     with_c=True)
+        _CUBLASMP_CACHE[key] = _local
         return _local
 
     @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),) * 2,
@@ -283,6 +289,7 @@ def _build_kernel(mesh, *, px, py, nq, m, k, n, dtype, alpha, beta,
     def _local(a, b):
         return _local_gemm_call(a, b, None, attrs=attrs, out_t=out_t,
                                 with_c=False)
+    _CUBLASMP_CACHE[key] = _local
     return _local
 
 
