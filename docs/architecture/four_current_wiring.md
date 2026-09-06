@@ -714,3 +714,15 @@ restores V, W or W−V one requested Lorentz block at a time. It uses the measur
 q-grid policy and family plans retained by `StaticPhotonResponse`; Γ remains
 row zero. The V reader and literal-G=0 vectors enter packed centroid order at
 the file seam, using the existing C/T bases returned by ISDF preparation.
+
+### Self-consistent density and transverse exchange
+
+`sc_iteration._dft_psi_sphere` caches the active global-band window on raw
+IBZ G-spheres and IBZ box indices. `rebuild_hartree_dft_basis` selects full-k
+U/E at the typed raw-parent rows, uses file k weights, and sends charge
+through scalar FFT pullbacks and current through `project_polar_fft_field`.
+The unrotated IBZ orbitals contract the common scalar/current potential;
+completed Hartree band matrices unfold through the band-operator service.
+Each map rotates both charge and transverse parent bundles from their DFT
+references with the same U/E, then passes the transverse bundle and its
+authenticated V file/bases to `compute_sigma_xc`.

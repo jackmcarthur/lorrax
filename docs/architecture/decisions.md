@@ -660,3 +660,10 @@ are raw parents, vertices follow typed endpoint transport, and sectors sum
 before band unfold. Distributed face GEMMs retain their necessary native
 communication; no-HLO-collective evidence certifies additional symmetry
 transport only, not absence of GEMM panel exchange.
+
+SC density uses raw WFN IBZ rows, file k weights, and the symmetry service
+for scalar-grid and polar-current projection. U/E select `kirr_fullids`; only
+completed Hartree band matrices unfold. The transverse DFT parent bundle
+rotates with the same iteration U/E as charge and reaches bare TT exchange.
+`rho_from_wfns` accepts `sym` alongside `sym_perm` because scalar grid
+pullbacks alone cannot project a vector current.

@@ -1135,6 +1135,8 @@ def main(argv=None):
 			# acts on it (wavefunction_bundle.rotate_wavefunctions).
 			sc_result = run_sc_driver(
 				wfns_sigma, V_q, kin_ion,
+				wfns_transverse=wfns_transverse,
+				bispinor_v_q_path=bispinor_v_q_path, mu_bases=isdf.mu_bases,
 				head_channel=getattr(isdf, 'head_channel', None),
 				wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
 				charge_zeta_identity=isdf.charge_zeta_identity,

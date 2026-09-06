@@ -3123,18 +3123,13 @@ def _parents_only_consumer_blockers(cfg) -> list:
 
 	Empty means every wavefunction consumer is parent-capable and the run
 	may store raw parents only (``gw_init`` parents-only storage).  Each
-	entry is the log line's reason.  The self-consistent map's density
-	rebuild loads ψ(G) on the full BZ; non-RPA diagrams are not on the
-	parent χ0 route.  Fractional occupations and the q→0 head wings are
+	entry is the log line's reason. Non-RPA diagrams are not on the
+	parent χ0 route; SC rotates parents and rebuilds density on the IBZ.  Fractional occupations and the q→0 head wings are
 	parent-capable (the contour χ0 rides the Green transport, the pair
 	scans unfold band tiles from the packed parents, the wings stream the
 	children of one parent at a time; the velocity is on file at every k).
 	"""
 	blockers = []
-	if str(getattr(cfg.qp_solver, 'value',
-	               cfg.qp_solver)) == 'self_consistent':
-		blockers.append(
-			"qp_solver = self_consistent (the map rotates the full-k bundle)")
 	if (bool(cfg.compute_mode.needs_screening)
 			and str(getattr(cfg.screening.diagrams, 'value',
 			                cfg.screening.diagrams)) != 'w_rpa'):

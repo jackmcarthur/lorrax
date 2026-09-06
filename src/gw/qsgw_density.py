@@ -362,7 +362,7 @@ def symmetrise_density(rho_r, sym_perm):
 @timing.timed("vh.rho", watch=True)
 def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                   fft_grid, cell_volume: float, spin_degeneracy: float,
-                  U=None, sym_perm=None, include_dirac_current: bool = False,
+                  U=None, sym_perm=None, sym=None, include_dirac_current: bool = False,
                   charge_nspinor: int | None = None,
                   return_spin_density_matrix: bool = False):
     """ρ(r) = Σ_k w_k f_spin Σ_{n,s} f_nk |ψ̃_nks(r)|², scanned over k.
@@ -392,7 +392,9 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     returns ``(rho,Jx,Jy,Jz)`` from the SAME inverse FFT and the SAME signed
     per-state occupations.  ``charge_nspinor`` may restrict only ``rho`` to
     a leading carrier block (the Pauli-reference model); all three currents
-    continue to use the full four-spinor.  The local contraction is shared
+    continue to use the full four-spinor. On reduced k sets, ``sym_perm``
+    projects charge and the required ``sym`` applies the typed polar current
+    projection; scalar pullbacks never rotate current components. The local contraction is shared
     with :func:`psp.get_DFT_mtxels.valence_density_from_kpoint`.
 
     ``return_spin_density_matrix=True`` requires two-component Pauli
@@ -434,6 +436,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     weights or not.
     """
     from common.fft_helpers import make_sharded_ifftn_3d
+    from psp.get_DFT_mtxels import density_components_from_psi_r
 
     grid = tuple(int(s) for s in fft_grid)
     ngrid = int(np.prod(grid))
@@ -453,12 +456,10 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
         raise ValueError(
             "rho_from_wfns: Dirac current requires four-component "
             f"bispinors; got nspinor={ns}")
-    if include_current and sym_perm is not None:
+    if include_current and sym_perm is not None and sym is None:
         raise ValueError(
-            "rho_from_wfns: sym_perm is a scalar-density projector and "
-            "cannot rotate a polar current. Build the full-BZ four-current "
-            "with uniform weights, then call "
-            "symmetry_maps.project_polar_fft_field on its spatial rows.")
+            "rho_from_wfns: reduced four-current density requires SymMaps "
+            "for the polar current projection as well as scalar sym_perm.")
     if return_spin_matrix and include_current:
         raise ValueError(
             "rho_from_wfns: return_spin_density_matrix and "
@@ -569,7 +570,6 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                     psi_t = psi_k[None]
                 box = _box_kernel(psi_t, bidx_k[None], ngkmax=ngkmax)
                 psi_r = ifftn(box) * scale
-                from psp.get_DFT_mtxels import density_components_from_psi_r
                 dens = density_components_from_psi_r(
                     psi_r[0], occ_k,
                     include_dirac_current=include_current,
@@ -585,7 +585,10 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
             rho, _ = jax.lax.scan(body, rho0, xs, unroll=1)
             rho = jax.lax.with_sharding_constraint(rho, rho_sharding)
             if sym_perm is not None:
-                rho = symmetrise_density(rho, sp_)
+                if include_current:
+                    rho = rho.at[0].set(symmetrise_density(rho[0], sp_))
+                else:
+                    rho = symmetrise_density(rho, sp_)
                 rho = jax.lax.with_sharding_constraint(rho, rho_sharding)
             return rho
         return fn
@@ -606,7 +609,12 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     # Same class as V_r baked in as a jit constant (audit 2026-08-05).
     sp_j = (jnp.zeros((1, 1), dtype=jnp.int32) if sym_perm is None
             else jnp.asarray(sym_perm, dtype=jnp.int32))
-    return fn(psi, U_j, occ_j, w_j, bidx_j, sp_j)
+    result = fn(psi, U_j, occ_j, w_j, bidx_j, sp_j)
+    if include_current and sym is not None:
+        from symmetry_maps import project_polar_fft_field
+        projected = project_polar_fft_field(np.asarray(result[1:]), sym)
+        result = result.at[1:].set(jnp.asarray(projected.field))
+    return result
 
 
 def rho_r_to_G(rho_r, *, mesh: Mesh):

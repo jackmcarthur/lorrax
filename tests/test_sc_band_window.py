@@ -42,14 +42,15 @@ class _RecordingWfn:
 
     def load(self, *, bands, k, sharding=None, bispinor=False,
              bispinor_lift="raw"):
-        del k, sharding, bispinor, bispinor_lift
+        assert k == "ibz"
+        del sharding, bispinor, bispinor_lift
         self.calls.append((int(bands[0]), int(bands[1])))
         nb = int(bands[1]) - int(bands[0])
         return jax.numpy.zeros(
             (self.nk, nb, 1, self.ngkmax), dtype=jax.numpy.complex128)
 
     def box_index(self, *, k):
-        del k
+        assert k == "ibz"
         return np.zeros((self.nk, self.ngkmax, 3), dtype=np.int32)
 
     def box_index_dev(self, *, k, mesh):

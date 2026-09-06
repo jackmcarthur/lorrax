@@ -406,6 +406,9 @@ class SCInputs:
     #: comes from an FFT over the k-grid — then crosses the map's one output
     #: seam (decisions.md, TRS veto scope).
     kstar: object | None = None
+    wfns_transverse: Wavefunctions | None = None
+    bispinor_v_q_path: str | None = None
+    mu_bases: tuple | None = None
     #: Validated, device-resident nearest-neighbour links + exact DFT
     #: velocity.  None preserves the historical fixed-DFT head path exactly.
     parallel_transport: object | None = None
@@ -2037,7 +2040,7 @@ def _dft_psi_sphere(inputs):
         with timing.section("vh.psi_load"):
             spec = band_sphere_spec()
             psi = inputs.wfn.load(
-                bands=(b_lo, b_hi), k="full_bz", sharding=spec,
+                bands=(b_lo, b_hi), k="ibz", sharding=spec,
                 bispinor=carrier_bispinor,
                 bispinor_lift=carrier_lift)
             # Use the loader's canonical resident index.  rho_from_wfns and
@@ -2046,7 +2049,7 @@ def _dft_psi_sphere(inputs):
             # made each SC map independently stage the same replicated
             # nk*Ngrid*i32 buffer.
             bidx = inputs.wfn.box_index_dev(
-                k="full_bz", mesh=inputs.mesh_xy)
+                k="ibz", mesh=inputs.mesh_xy)
         hit = (psi, bidx)
         _PSI_G_CACHE[key] = hit
     return hit
@@ -2135,7 +2138,10 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
 
     psi_G, bidx = _dft_psi_sphere(inputs)
     nk, nb = int(psi_G.shape[0]), int(psi_G.shape[1])
-    kweights = np.full(nk, 1.0 / nk)          # full BZ => uniform, no star
+    kweights = np.asarray(inputs.wfn.kweights, dtype=np.float64)
+    rows = jnp.asarray(inputs.sym.kirr_fullids, dtype=jnp.int32)
+    U_qp = jnp.take(U_qp, rows, axis=0)
+    E_qp_ry = jnp.take(E_qp_ry, rows, axis=0)
 
     # E stays on the device: both are jit kernels over ``E`` (``gw.efermi``
     # header) and only E_F and the degeneracy flag cross.
@@ -2177,7 +2183,8 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
         cell_volume=float(inputs.wfn.cell_volume),
         spin_degeneracy=f_spin,
         include_dirac_current=include_current,
-        charge_nspinor=charge_ns)
+        charge_nspinor=charge_ns, sym=inputs.sym,
+        sym_perm=inputs.sym.fft_grid_pullback(inputs.sym.active_symmetry_rows, grid))
     rho_r = fields[0] if include_current else fields
     expected_electrons = f_spin * occupied_band_count(occ, kweights)
     with timing.section("vh.poisson"):
@@ -2191,39 +2198,30 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
     if include_current:
         from ffi import _services
         _services.ensure_on_path()
-        from symmetry_maps import project_polar_fft_field
         from psp.dft_operators import transverse_potential_from_current
         from vcoul import COULOMB_GAUGE_TT_SIGN
 
-        current_raw = np.asarray(fields[1:], dtype=np.float64)
+        current_projected = np.asarray(fields[1:], dtype=np.float64)
         ngrid = int(np.prod(grid))
-        current_g0 = np.sum(current_raw, axis=(-3, -2, -1)) / np.sqrt(ngrid)
+        current_g0 = np.sum(current_projected, axis=(-3, -2, -1)) / np.sqrt(ngrid)
         current_scale = max(
-            float(np.linalg.norm(current_raw)), np.finfo(np.float64).tiny)
+            float(np.linalg.norm(current_projected)), np.finfo(np.float64).tiny)
         inputs.print_fn(
-            "    SC Dirac-current G=0 diagnostic (J=j/c): "
+            "    SC projected Dirac-current G=0 diagnostic (J=j/c): "
             f"||J0||={float(np.linalg.norm(current_g0)):.6e}, "
             f"||J||={current_scale:.6e}, "
             f"ratio={float(np.linalg.norm(current_g0)) / current_scale:.6e}; "
             "periodic TT sets G=0 to zero")
-        projection = project_polar_fft_field(current_raw, inputs.sym)
-        inputs.print_fn(
-            "    SC Dirac-current symmetry projection: "
-            f"rows={projection.n_symmetry_rows} "
-            f"(antiunitary={projection.n_antiunitary_rows}), "
-            f"movement={projection.relative_movement:.6e}, "
-            f"residual={projection.relative_residual:.6e} <= "
-            f"{projection.relative_residual_tolerance:.6e}")
         with timing.section("vh.transverse_field"):
             V_T_r = transverse_potential_from_current(
-                jnp.asarray(projection.field, dtype=jnp.float64),
+                jnp.asarray(current_projected, dtype=jnp.float64),
                 jnp.asarray(inputs.wfn.bdot, dtype=jnp.float64),
                 jnp.asarray(inputs.wfn.bvec, dtype=jnp.float64),
                 float(inputs.wfn.blat),
                 bool(getattr(inputs.config, "sys_dim", 3) == 2),
                 tt_metric_sign=float(COULOMB_GAUGE_TT_SIGN))
 
-    gtab = padded_gvectors(inputs.wfn, k="full_bz")
+    gtab = padded_gvectors(inputs.wfn, k="ibz")
     psi_charge = psi_G[:, :, :charge_ns, :]
     geom_matrix = SweepGeometry(
         mesh=inputs.mesh_xy, fft_grid=grid,
@@ -2250,6 +2248,11 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
             gvecs=gtab.gvecs, gmask=gtab.mask, box_index=bidx,
             kvecs=gtab.kvecs)
         H_transverse = None
+    from symmetry_maps import unfold_file_wedge_band_operator
+    H_scalar = unfold_file_wedge_band_operator(inputs.sym, H_scalar, trs_rule="conj")
+    if H_transverse is not None:
+        H_transverse = unfold_file_wedge_band_operator(
+            inputs.sym, H_transverse, trs_rule="conj")
     return SCExactHartree(
         scalar_dft=H_scalar,
         transverse_dft=H_transverse,
@@ -3064,6 +3067,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         active_slice=inputs.band_slices.sigma,
     )
 
+    wfns_transverse_qp = None
+    if inputs.wfns_transverse is not None:
+        wfns_transverse_qp = rotate_wavefunctions(
+            inputs.wfns_transverse, U_full,
+            enk_active_new=E_full, enk_base=enk_base, efermi=float(efermi_ry),
+            mesh_xy=inputs.mesh_xy, active_slice=inputs.band_slices.sigma)
+
     # (``entry_occ_state`` was solved above, before the tail scissor that
     # feeds ``enk_base`` — see the block after ``E_full``.)
 
@@ -3074,9 +3084,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # gate holds; bispinor QSGW config resolution enables the live path.
     exact_hartree_dft = None
     if bool(getattr(inputs.config, "density_self_consistent", False)):
-        # rho is built from FULL-BZ psi (uniform weights, no star sum),
-        # so it takes the broadcast U and E; the matrix it returns is
-        # selected to the IBZ to match delta_h_dft.
+        # The density owner selects raw-parent U/E, averages the fields
+        # by typed actions, and unfolds only the completed band matrices.
         exact_hartree_dft = rebuild_hartree_dft_basis(
             inputs, U_full, E_full)
         from common import sanity as _sanity
@@ -3338,6 +3347,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         inputs.config.compute_mode,
         occupation_state=metal_occ_state,
         wfns=wfns_qp, V_q=inputs.V_q, W_by_role=W_by_role,
+        wfns_transverse=wfns_transverse_qp,
+        bispinor_v_q_path=inputs.bispinor_v_q_path, mu_bases=inputs.mu_bases,
         # FULL-BZ E, for the same reason as hartree_basis_rotation above:
         # every operand compute_sigma_xc sees is on the full BZ.
         e_qp_ev=np.asarray(E_full) * RYD_TO_EV,
@@ -5427,6 +5438,9 @@ def run_sc_driver(
     kin_ion: jax.Array,
     *,
     head_channel=None,
+    wfns_transverse=None,
+    bispinor_v_q_path=None,
+    mu_bases=None,
     wfn_fingerprint_binding=None,
     charge_zeta_identity=None,
     quad,
@@ -5628,6 +5642,8 @@ def run_sc_driver(
 
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
+        wfns_transverse=wfns_transverse, bispinor_v_q_path=bispinor_v_q_path,
+        mu_bases=mu_bases,
         head_channel=head_channel,
         quad=quad, e_ref=e_ref,
         static_head_terms=static_head_terms,
