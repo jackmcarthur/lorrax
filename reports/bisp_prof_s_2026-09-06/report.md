@@ -355,3 +355,7 @@ Si I17's generic elementwise4c rotation preserves eqp0/eqp1 and all256 state row
 **Production Sigma GEMM plan reuse passes.** On branch perf/bisp-prof-s-2026-09-06, unmerged. Same-source eqp0/eqp1 and90 complete Sigma rows are identical; static caller97.582s, compiler77.376s and547 events. Existing cache shares plans by mesh, k extent and endpoint shapes; no resident face or operator is added.
 
 Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/23_P_plan_reuse_candidate; [lx] step lx-Xg4-024713-1877307-4058 exit 0 in 156 s.
+
+**Production full-q restore reuses its symmetry-owner cache.** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0. Static caller 39.204s; 219 compilation events, 29.386s compiler work.
+
+Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/24_P_restore_candidate; [lx] step lx-Xg4-025324-1917331-9182 exit 0 in 98 s.
