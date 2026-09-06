@@ -294,3 +294,9 @@ behind it, in [downfold.md](downfold.md).
 | `plan` | `"auto"` | `auto`/`local` = the local plan: no block-cyclic factorisation, no dependence on the process grid. `distributed` (mu tiled over a 2-D grid) is later work and REFUSES rather than demoting, because a different factorisation is a different numerical gauge. |
 | `report_residual` | true | Compute and print the per-q Pythagorean error bar `eps_W`. Two GEMMs at mu_L per q; leave it on — it is the only answer to "did this work" that needs no reference calculation. |
 | `residual_refuse_above` | None | Refuse to WRITE the small bundle when the worst-q `eps_W` exceeds this; empty = report and always write. A tripwire against a compression that has gone badly wrong, NOT a transferable statement about meV: the same 1% `eps_W` sat on 37 meV of exciton drift on one parent and 1.7 eV on another. |
+
+Non-orbit-closed charge or current centroid sets run unreduced on the same
+parent route. A WARNING names the set and recommends orbit-closed kmeans;
+`SymMaps.trivial_view()` selects loader-unfolded full-k parents, identity
+k actions and the full q grid. Centroid files are not changed. See the
+[admission ruling](architecture/decisions.md).
