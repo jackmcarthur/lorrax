@@ -5225,8 +5225,10 @@ class LorraxConfig:
         by the patch validation.  ``sigma_omega_min/max_ev`` are ignored
         then — the patches ARE the grid.
         """
-        if (self.qp_solver is QPSolver.SELF_CONSISTENT
+        if (getattr(self, "qp_solver", None) is QPSolver.SELF_CONSISTENT
                 and getattr(self, "sc_omega_grid_ev", None) is not None):
+            # The SC session's sampled support, grown only when a retained
+            # state escaped the requested window (extend_sc_omega_grid_ev).
             return np.asarray(self.sc_omega_grid_ev, dtype=np.float64)
         p = self.sigma
         patches = p.parsed_omega_patches_ev()
@@ -5247,17 +5249,11 @@ class LorraxConfig:
             raise ValueError(
                 "sigma_omega_patches_ev produced a non-increasing grid; "
                 "patches must be ascending and disjoint")
-        if self.qp_solver is QPSolver.SELF_CONSISTENT:
-            from .scissor import sc_padded_window_ev
-            lo, hi = sc_padded_window_ev(grid[0], grid[-1])
-            n_lower = int(np.ceil((grid[0] - lo) / p.omega_step_ev))
-            n_upper = int(np.ceil((hi - grid[-1]) / p.omega_step_ev))
-            # Preserve every requested sample exactly. Padding adds support;
-            # sigma.omega_min/max remain the classification window.
-            grid = np.concatenate((
-                grid[0] - p.omega_step_ev * np.arange(n_lower, 0, -1),
-                grid,
-                grid[-1] + p.omega_step_ev * np.arange(1, n_upper + 1)))
+        # The requested grid is the evaluation grid at map 0 for every
+        # state, so SC iteration 1 equals the one-shot and states outside
+        # the requested window keep the one-shot treatment.  The SC pad
+        # widens the quadrature support and the hysteresis bounds; the
+        # sampled grid grows only when a retained state escapes.
         return grid
 
     @property

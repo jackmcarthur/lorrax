@@ -97,23 +97,43 @@ def test_crossing_scissored_doublet_preserves_protected_identity_block():
     np.testing.assert_array_equal(sorted_result[1, 0, 1:3], [0., 0.])
 
 
-def test_sampled_grid_covers_entire_energy_dependent_hysteresis():
+def test_map0_grid_is_the_requested_grid_and_grows_only_on_escape():
+    # The requested grid is the evaluation grid at map 0 for every state
+    # (SC iteration 1 equals the one-shot; states outside the requested
+    # window keep the one-shot treatment).  The pad widens the quadrature
+    # support and the hysteresis bounds; the sampled grid grows only when
+    # a RETAINED state escapes, to E +/- pad(E), keeping every old sample.
     from types import SimpleNamespace
     from gw.gw_config import LorraxConfig, QPSolver
-    from gw.scissor import sc_padded_window_ev
+    from gw.scissor import extend_sc_omega_grid_ev, sc_padded_window_ev
     sigma = SimpleNamespace(omega_min_ev=-2., omega_max_ev=5.,
                             omega_step_ev=.25, parsed_omega_patches_ev=lambda: [])
-    cfg = SimpleNamespace(sigma=sigma, qp_solver=QPSolver.SELF_CONSISTENT)
-    sampled = LorraxConfig.omega_grid_ev.fget(cfg)
-    lo, hi = sc_padded_window_ev(-2., 5.)
-    assert lo == pytest.approx(-2.5 / .9)
-    assert hi == pytest.approx(5.5 / .9)
-    assert hi - sc_state_pad_ev(hi) == pytest.approx(5.)
-    assert sampled[0] <= lo and sampled[-1] >= hi
     original = -2. + .25 * np.arange(29)
-    np.testing.assert_array_equal(sampled[(sampled >= -2.) & (sampled <= 5.)], original)
-    cfg.qp_solver = QPSolver.ONE_SHOT_DFT
-    np.testing.assert_array_equal(LorraxConfig.omega_grid_ev.fget(cfg), original)
+    for solver in (QPSolver.SELF_CONSISTENT, QPSolver.ONE_SHOT_DFT):
+        cfg = SimpleNamespace(sigma=sigma, qp_solver=solver)
+        np.testing.assert_array_equal(LorraxConfig.omega_grid_ev.fget(cfg), original)
+    # a hand-built shim without qp_solver (the crossing-cost-law tests)
+    np.testing.assert_array_equal(
+        LorraxConfig.omega_grid_ev.fget(SimpleNamespace(sigma=sigma)), original)
+    # the session's grown support overrides the requested grid for SC only
+    grown = SimpleNamespace(sigma=sigma, qp_solver=QPSolver.SELF_CONSISTENT,
+                            sc_omega_grid_ev=tuple(original) + (5.25, 5.5))
+    assert LorraxConfig.omega_grid_ev.fget(grown)[-1] == 5.5
+    lo, hi = sc_padded_window_ev(-2., 5.)
+    assert lo == pytest.approx(-2.5 / .9) and hi == pytest.approx(5.5 / .9)
+    assert hi - sc_state_pad_ev(hi) == pytest.approx(5.)
+    # no retained escape: unchanged
+    energies = np.array([[-1., 0.5, 5.3, 9.]])
+    retained = np.array([True, True, False, False])
+    np.testing.assert_array_equal(
+        extend_sc_omega_grid_ev(original, energies, retained, .25), original)
+    # a retained state at 5.3 eV escaped the top: grow to E + pad(E), keep
+    # every old sample, do not grow the bottom
+    retained[2] = True
+    extended = extend_sc_omega_grid_ev(original, energies, retained, .25)
+    np.testing.assert_array_equal(extended[:29], original)
+    assert extended[-1] >= 5.3 + sc_state_pad_ev(5.3)
+    assert extended[0] == -2. and np.allclose(np.diff(extended), .25)
 
 
 def test_identity_priority_preserves_established_readout_assignment():

@@ -271,34 +271,34 @@ Classification runs on every map, including rCROP trials. An escape prints
 the band identity, k, energy and pad; the state is reclassified and the
 quadrature planner retains its existing rebuild-on-box-escape behavior.
 The quadrature state support uses the same pad; pole padding and certified
-acceptance are unchanged. The sampled omega grid includes the hysteresis
-region while the requested bounds remain the entry criterion. A retained
-state's energy therefore stays sampled beyond the requested window.
-If local multiplet promotion retains an energy beyond that support, only the
-outer sampled endpoints grow, to the escaped energy plus its same pad; old
-samples remain unchanged and the quadrature session retains the expanded
-support on later maps. Interior holes still require an explicit patch.
-Quadrature nodes remain frozen while their certified boxes cover the map.
+acceptance are unchanged. The sampled omega grid is the REQUESTED grid at
+map 0 for every state, so SC iteration 1 equals the one-shot and a state
+outside the requested window keeps the one-shot treatment (pre-padding the
+grid re-evaluated such states and moved the GN-PPM invariance fixture by
+0.28 eV, 2026-09-05). When a retained state drifts past the requested
+bounds, only the outer sampled endpoints grow, to the escaped energy plus
+its pad (`SC sampled-support growth: ...`); old samples remain unchanged and
+the quadrature session keeps the grown support on later maps, whose
+certified boxes already cover it. Interior holes still require an explicit
+patch. Quadrature nodes remain frozen while their certified boxes cover the
+map.
 
-**17. The active-window scissor freeze has a convergence comparison gate.**
-States inside the active Sigma band window but outside the
-retained self-consistent block follow the affine law fitted at map 0. The
-energy-dependent pad and per-k identity partition are being compared with a
-per-map refit: on the +21 eV Na P4 comparison, the conduction slope
-changes from 1.117004 at map 0 to 1.166066 at trial map 1. The trusted
-outputs initially agree within 0.0194 meV, but by trial map 3 their
-mean-aligned differences reach 40.19 meV on bands 5-10 and 131.05 meV on
-the full protected set 5-13. These moving trial outputs do not decide
-whether the freeze is needed at convergence. Compare the mean-aligned
-bands 5-10 accepted-pair tables at maps 12-16 and the band-5 shape after
-rigid alignment; the freeze stays only if those differ by more than 2 meV.
-Report the refitted law's per-map alpha/beta changes separately.
-`SCState.frozen_scissor_fits` and its capture/reuse remain pending that
-comparison. See sandbox
-`runs/DEV/150_sc_partition_pad_2026-09-05/evidence/na_comparison_map0003.json`
-(jobs 57950126.27/.28); this early-map comparison is not a convergence
-claim. The sum-band tail beyond the Sigma window keeps its per-map refit:
-freezing that distinct tail moved the Si b80/c504 gap by 22 meV at map 6.
+**17. The active-window scissor law stays frozen at map 0.** States inside
+the active Sigma band window but outside the retained self-consistent block
+follow the affine law fitted at map 0 (`SC scissor: frozen from map 0
+(...)`). Measured against a per-map refit at convergence, with the pad and
+per-k identity partition of pitfalls 16 and 18 (Na eta=0.5, +19 eV, trusted
+5-10, three arms to accepted map 16, sandbox claim 946): the refitted law
+drifts from alpha 1.051 to 1.140 and beta -1.23 to -1.72 eV over the loop,
+the refit arm converges more slowly (per-pair motion at 14->16 up to 19 meV
+against 7 meV frozen; residual 11.1 against 4.9 meV) and settles 127 meV
+away rigidly, with bands 5-8 up to 95 meV and bands 9-10 up to 411 meV apart
+after alignment, while the Fermi band's shape agrees to 5.8 meV. The far
+states' correction following the trusted block's stretch every map feeds
+back through the sum over states; one fixed correction, as in standard
+QSGW, is the closure. The sum-band tail beyond the Sigma window keeps its
+per-map refit: freezing that distinct tail moved the Si b80/c504 gap by 22
+meV at map 6.
 
 **18. Partition identities are per k, and Hamiltonian masks use the carry's
 basis.** Overlap assignment against reference DFT multiplets finds the sorted
@@ -340,11 +340,19 @@ its absolute position moves 41 meV when bands 11-13 join the set (bands
 5 alone and 5-10 agree to 2.5 meV). Bands 5-10 converge to about 1 meV per
 map by accepted map 22 and reach a 2 meV rCROP residual at map 28; 5-13 is
 still at 5-9 meV per map on bands 12-13 at map 26. Those measurements used `sigma_omega_max_ev = 21` to select 5-10.
-Under the all-k entry rule in pitfall 16 the same +21 eV request initially
-admits 5-13, because the inward margin has been removed; a window value no
-longer implies the old membership. Report the actual identity masks and
-the Fermi-window observables, and do not infer observable convergence from
-the rCROP L-infinity residual alone while Z >= 1 states walk. A
+Under the all-k entry rule in pitfall 16 the same +21 eV request admits
+5-12 and promotes 13, because the inward margin has been removed; that run
+then paces like the old +24 arm (bands 11-13 at 240-440 meV per accepted
+pair at map 10). A window value no longer implies the old membership: on
+Na, `sigma_omega_max_ev = 19` gives trusted 5-10 (band 11 tops out at
+20.92 eV absolute), and with that set the pad partition tracks the
+margin-based record map for map (aligned per-pair motion within a few meV
+from map 6 on, residual 4.9 meV at map 16 against 7.2, Fermi band shape
+within 2.1 meV at map 16 and 2.9 meV of the converged reference; sandbox
+claim 937). Production on Na is therefore `sigma_omega_max_ev = 19`,
+trusted 5-10. Report the actual identity masks and the Fermi-window
+observables, and do not infer observable convergence from the rCROP
+L-infinity residual alone while Z >= 1 states walk. A
 partition by quasiparticle well-definedness (Z below about 0.9 at every k
 at map 0) instead of by energy window is registered; in Na the multiplet
 chain linked bands 5-10 under global promotion; local per-k closure now

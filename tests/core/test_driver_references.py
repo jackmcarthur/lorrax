@@ -103,7 +103,7 @@ def test_b_mpa_one_update_matches_references(core_fixtures):
         r"SC iteration: call=\d+ role=linear .*?max\|dE\|=([0-9.e+-]+)",
         report,
     )]
-    assert residuals == pytest.approx([3.640626335, 0.3476364921], abs=2e-5)
+    assert residuals == pytest.approx([3.640626335, 0.3476362983], abs=2e-5)
     partitions = re.findall(
         r"SC iteration: call=\d+ role=linear .*?"
         r"active=(\S+) protected=(\S+) in_range=(\S+)", report,
