@@ -56,6 +56,7 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
         raise ValueError("build_G requires gemm=<distrib_la.GemmPlan> built outside the kernel.")
     if k_unfold_plan is not None:
         from common.shard_map import shard_map
+        from jax import jit
         from jax.sharding import PartitionSpec as P
         specs = (P(None, None, "x", "y"), P(None, "x", None, "y"))
         def unfold(left, right):
@@ -63,9 +64,9 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
                 left, spin_axis=1, mu_axis=2, mesh_axis="x"),
                     k_unfold_plan.unfold_face(
                 right, spin_axis=2, mu_axis=3, mesh_axis="y"))
-        psi_xn, psi_yr = shard_map(
+        psi_xn, psi_yr = jit(shard_map(
             unfold, mesh=gemm.mesh, in_specs=specs,
-            out_specs=specs, check_vma=False)(psi_xn, psi_yr)
+            out_specs=specs, check_vma=False))(psi_xn, psi_yr)
         if phases is not None:
             phases = jnp.take(phases, jnp.asarray(k_unfold_plan.irr_idx), axis=0)
     return _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases)
