@@ -1,0 +1,15 @@
+[lx] using named allocation JID 57966610 [--jid]
+[lxrun] JID 57966610 · 4 nodes · 1:11:28 left · 16/16 GPUs free · incoming: lx-?
+  1  nid001168 [4/4 gpu]  free   —                —      —  ← starting lx-?  ./rankwrap.sh bash ./dri
+  2  nid001169 [4/4 gpu]  free   —                —      —
+  3  nid001172 [4/4 gpu]  free   —                —      —
+  4  nid001173 [4/4 gpu]  free   —                —      —
+[lx] zero-GPU step: --gres=none, no GPU selector, and this leg is charged 0 GPUs by the pool, so it does not queue behind GPU work. Set JAX_PLATFORMS=cpu in the payload if it uses JAX.
+[lx] source tree: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src  [cwd checkout]
+[lx] runtime import origin: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py  [PYTHONPATH head; runtime.bootstrap attests the actual import]
+/global/u2/j/jackm/lorrax_A/src/ffi/cpp/in_container.sh: line 62: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/40_cpu_gates/rankwrap.sh: No such file or directory
+srun: error: nid001168: task 0: Exited with exit code 127
+srun: Terminating StepId=57966610.179
+[lx] step lx-Xg0-031725-2232478-2895 exit 127 in 1 s
+[lx] nonzero exit — judge by artifacts, not the code (rc=134 has been seen on runs whose outputs were correct)
+[lx] exit 127 is 'command not found' INSIDE the container, not a launch failure — check the binary exists on the image's PATH (`python3 -m <module>` is usually the portable form)

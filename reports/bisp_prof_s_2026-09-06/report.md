@@ -1,8 +1,8 @@
 # BISP-PROF-S — parent-route Sigma profiling
 
-Branch `perf/bisp-prof-s-2026-09-06`, unmerged. Five production fixes are pushed through `5093d98d`; the sixth, symmetry-owned block-spin application, is undergoing its fixed-schedule gate. All measurements use authorized campaign pool57966610. Original P is `9f569c4bf75bad40e4f5895946874b4c503e4410`; read-only F is `e1559a071e244b4f049c924781b668d9e1560739`.
+Branch `perf/bisp-prof-s-2026-09-06`, unmerged. Six production fixes are pushed through `ebc98918`; all pass their printed-digit gates and the combined P4 physics gate. All measurements use authorized campaign pool57966610. Original P is `9f569c4bf75bad40e4f5895946874b4c503e4410`; read-only F is `e1559a071e244b4f049c924781b668d9e1560739`.
 
-The principal regression is compilation and eager planning in static/bare Sigma. The instrumented MoS2 static caller falls from151.373s to13.542s (F11.448s); compilation events fall1135→160 and compiler work120.740→9.988s. These caller scopes exclude surrounding Sigma work. Native baseline P is already faster than F for the selected warm static block and dynamic node. Final complete-deck tables follow once their gates finish.
+The principal regression is compilation and eager planning in static/bare Sigma. The instrumented MoS2 static caller falls from151.373s to13.542s (F11.448s); compilation events fall1135→160 and compiler work120.740→9.988s. These caller scopes exclude surrounding Sigma work. Native baseline P is already faster than F for the selected warm static block and dynamic node. Complete-deck and fixed-rule after tables appear below.
 ## Objective and preregistered candidates
 
 Reproduce PERF2's host/device separation for the five supplied bispinor comparisons, then change only measured Sigma bottlenecks. Measurements use P4, one rank/GPU, BFC@0.85, cold persistent compile cache, `LORRAX_DEBUG_PRINT=1`, identical copied P-donor `tmp/` within each P/F pair. Original deck `restart=false` is retained; every copied input has a SHA256 receipt. Actual selected quadrature nodes and digests must agree before comparing dynamic execution. A copied cache alone is not proof of an identical schedule.
@@ -88,7 +88,7 @@ The ranking below uses measured host savings or explicit device bounds per added
 
 3. **Accept: share G between body and head.** Original warm TT Green ranges cost1.055104 and1.040000ms separately. Feed both convolutions/projections from one G within the same compiled call, returning two small band operators. Delete the separate q0 kernel and duplicate face unfolds. G builds96→48; face unfolds192→96 for16 blocks×3 terms with heads. Production caller25.644→19.531s. One G payload before/after21,233,664 bytes max; two parent band outputs require at most2×16QN²/P=153,600 bytes/rank, subject to actual output sharding. M34 exact gate; native post-change allocator peak is measured separately.
 
-4. **Accept subject to final gate: two supplied2×2 spin blocks.** Si's dynamic open-spin transport costs14.938586ms, including9.646109ms dense spin GEMMs and5.147709ms surrounding layout kernels. At the symmetry owner, inspect the supplied static4×4 action for exact off-block zeros, then apply its two blocks; the action already contains the lower-block determinant sign. Generic4×4 actions retain the dense path. Delete dense application only for this structurally proven case; do not reconstruct a symmetry rule. Ablation38.633553→30.433975ms/node (21.2%). **Peak memory rises2,020,215,829→2,487,859,989 bytes/rank**, +467,644,160, approximately half a full Si G, scaling O(Ks²M_C²/P); face payload is unchanged. This is an explicit speed/memory tradeoff, not a memory reduction. CPU42 tests the negative lower-block sign, a red twin and generic off-block fallback; fixed-certificate I13/I20 is the production identity gate. Generic elementwise4×4 ablation is rejected:39.206614ms/node.
+4. **Accept with measured memory tradeoff: two supplied2×2 spin blocks.** Si's dynamic open-spin transport costs14.938586ms, including9.646109ms dense spin GEMMs and5.147709ms surrounding layout kernels. At the symmetry owner, inspect the supplied static4×4 action for exact off-block zeros, then apply its two blocks; the action already contains the lower-block determinant sign. Generic4×4 actions retain the dense path. Delete dense application only for this structurally proven case; do not reconstruct a symmetry rule. Ablation38.633553→30.433975ms/node (21.2%). **Peak memory rises2,020,215,829→2,487,859,989 bytes/rank**, +467,644,160, approximately half a full Si G, scaling O(Ks²M_C²/P); face payload is unchanged. This is an explicit speed/memory tradeoff, not a memory reduction. CPU42 tests the negative lower-block sign, a red twin and generic off-block fallback; fixed-certificate I13/I20 is the production identity gate. Generic elementwise4×4 ablation is rejected:39.206614ms/node.
 
 5. **Reject for this implementation: resident family child faces once per term.** The original TT pre-G range containing both unfolds, spin/gamma and G initialization is0.032032ms, versus about1.05ms for the G it feeds. Even multiplying that enclosing range by96 original G calls yields only3.075072ms/run; this is a TT-class extrapolation, not a measured all-class total. After body/head sharing the invocation opportunity halves. Keeping parents requires2,242,560 bytes/rank; children add6,727,680, combined8,970,240, scaling `32(Q+K)Ns(M_C+M_T)/P`. Flow would unfold four unvertexed family faces once per term and apply canonical gamma at each streamed consumer; it deletes repeated transport, but requires additional operand/lifetime changes for little measured device opportunity. No larger-deck benefit is asserted without a new gate.
 
@@ -96,7 +96,7 @@ The ranking below uses measured host savings or explicit device bounds per added
 
 7. **Defer seam fusion and alternative face layout.** Measured Sigma bare-input packing is32 calls/4.186365ms projected on Si; MoS2 band unfold18 calls/1.543712ms, outside the block kernel. MoS2 pre-convolution layout is0.013216ms per selected body. A fused consumer/writer would consume the existing basis permutation at its adjacent reshard and delete the standalone conversion; a new face layout must delete both replaced adapters and preserve the GEMM operand contract. Payload before/after remains `32QNs(M_C+M_T)/P` for parent faces and O(KN²) for band seams; no allocator saving is proven. The observed per-unit millisecond opportunity does not justify a new carrier contract in this lane. Canonical files stay P-independent. Unattributed seam calls remain unattributed, not charged to Sigma.
 
-8. **ZW-owned coupled three-current zeta tail: defer to ZW's measurements.** Flow would share one unfolded face pair and C_q across three canonical gamma channels inside the existing tile kernel; remove two repeated common constructions, at most2/3 of that common work. This lane has no isolated zeta device-ms or tile-peak measurement, so a numerical speedup or byte claim would be fabricated. Face payload would remain O(KNsM_T/P); three concurrent outputs add a factor3 to the tiled output, whereas streaming avoids it. ZW must supply tile dimensions, current-channel identity and peak/HLO gate before adoption; this lane does not edit its fitting kernel.
+8. **Accept ZW's coupled-current tail; do not duplicate it here.** ZW now measures51.002→39.314ms/current tile, saving11.688ms (22.9%), with128 fewer transports and32 fewer transforms. Its existing tile kernel streams one left child projector/IFFT through three channel updates, deleting the repeated outer channel tail while preserving each channel's order. At real-grid tile R3844, three full-k outputs cost41,515,200 bytes/rank and solved q-IBZ outputs13,838,400; HLO peak452,208,158→452,172,878. Scaling is O(K M_T R/P). The three C_q/Gram factors remain distinct: current Gram payload120,000 bytes/rank/channel,360,000 for three. A coupled solve would require a new hoisted-factor/pivot contract and could save at most the entire9.683ms/tile current-solve budget; dispatch savings are smaller. Adopt ZW's `f811f734` after its prerequisites. Fresh-fit gate24/25, step `lx-Xg4-021818-1673870-3826` on57966610, proves four zeta files bit exact and downstream90 EQP/sector rows exact. This is **ZW's measurement**, from [its report](/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_zw_codex_20260906/reports/bisp_prof_zw_2026-09-06/report.md); local Sigma source does not implement a second tail.
 
 Every implemented change retains mu-square distribution on all P ranks, canonical P-agnostic files and one owner per symmetry rule. **The pre-existing MoS2 dynamic kernel still has two collective-permute starts**, detailed below; the literal final-psum-only requirement remains unmet. Static parent core/restores have no explicit HLO collectives, but distributed GEMM FFI broadcasts remain native communication. No additional collective is permitted by these changes. No remaining slowdown is called inherent to a small deck: the larger Si dynamic case is measured, but no P16 result exists under the one-node authorization.
 
@@ -106,7 +106,7 @@ Completed run-local arithmetic-preserving experiments appear in the unprofiled a
 
 ## Verification and current disposition
 
-All ten pinned baseline arms and both static captures completed. Static captures and successful ablations pass tolerance-zero eqp0/eqp1 and all 90 complete printed state rows in sigma_diag.dat, including CC/TT/CT. Dynamic captures are complete. Five production fixes have passed their incremental gates and are pushed; final combined verification and block-spin gating are in progress.
+All ten pinned baseline arms and both static captures completed. Static captures and successful ablations pass tolerance-zero eqp0/eqp1 and all 90 complete printed state rows in sigma_diag.dat, including CC/TT/CT. Dynamic captures are complete. All six production fixes have passed their incremental gates and are pushed. The combined P4 physics gate and fixed-rule block-spin gates pass. Repository bookkeeping checks are reported at closure.
 
 Pool 57966610 is explicitly authorized by the user and shared with this campaign. Every arm uses one node sequentially. The earlier failed allocation is historical infrastructure evidence, not a current blocker. All writes, including local run/issue/claim registers, stay within this worktree; shared sandbox ledgers are read-only under the lane's explicit scope.
 
@@ -334,3 +334,138 @@ Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/37_P_shape_class_cand
 Evidence: runs/Si/100_bisp_parent_route_2026-09-05/prof_s/20_P_gn_final_profile; [lx] step lx-Xg4-033145-2312576-9256 exit 0 in 154 s.
 
 CPU42 verification: [lx] step lx-Xg0-031951-2245813-3760 exit 0 in 16 s. Three symmetry rotation tests and eleven bispinor route configuration tests pass; only the existing JAX shard_map deprecation warning appears. Artifacts: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/42_cpu_gates/spin_pytest.log and config_pytest.log. This is a focused CPU emulated-mesh gate, not the combined P4 physics gate.
+
+**Final MoS2 full-static gate; Sigma150.63→20.66s** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0.
+
+Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/35_P_full_static_final; [lx] step lx-Xg4-033420-2328417-3557 exit 0 in 74 s.
+
+**Final Si COHSEX gate; Sigma47.29→13.36s** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 256 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0.
+
+Evidence: runs/Si/100_bisp_parent_route_2026-09-05/prof_s/15_P_cohsex_final; [lx] step lx-Xg4-033536-2335119-7259 exit 0 in 46 s.
+
+**Final MoS2 packed-bare gate; Sigma150.61→20.37s** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0.
+
+Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/25_P_packed_bare_final; [lx] step lx-Xg4-033626-2339875-4951 exit 0 in 60 s.
+
+**Final MoS2 dynamic eps5 gate; Sigma other158.16→29.83s** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0.
+
+Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/26_P_dynamic_final; [lx] step lx-Xg4-033729-2348577-9137 exit 0 in 95 s.
+
+**Combined P4 Sigma physics gate passes.** On branch perf/bisp-prof-s-2026-09-06, unmerged at ebc98918. Five vertex Green cases, five Sigma chains, all16 ordered current pairs and nonzero Hall head/zero/sign twins pass. Worst all16 relative error6.63e-16; Sigma closure1.15e-13; CT/TC zero-background and sign errors0.
+
+[lx] step lx-Xg4-033906-2358773-6017 exit 0 in 51 s; runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/29_combined_regression/combined_gate.json.
+
+## After-change stage and compiler tables
+
+All times below are unprofiled production tables in each run's `gwjax.out`; counts/seconds are the rank0 final `[compile-cache]` receipts. Compiler seconds are cumulative compiler work, **not elapsed stage time to subtract**. Static parser omission is registered; static rows are transcribed from the printed production table. Dynamic `timing.json` uses the canonical parser; its synthesized `launcher_log` field is not the actual evidence path.
+
+| deck / final run | P before rule/tau/other s | F before rule/tau/other s | P final rule/tau/other s | P before→final total s |
+|---|---:|---:|---:|---:|
+| Si COHSEX I15 |—/—/47.29|—/—/11.44|—/—/13.36|74.21→40.75|
+| Si GN I16 |0.09/4.00/56.30|6.25/4.33/20.64|6.23/3.89/22.97|86.86→62.45|
+| MoS2 full static M35 |—/—/150.63|—/—/18.24|—/—/20.66|204.16→70.68|
+| MoS2 packed bare M25 |—/—/150.61|—/—/19.04|—/—/20.37|184.39→53.88|
+| MoS2 GN eps5 M26 |0.14/3.00/158.16|48.97/2.50/27.15|0.15/2.92/29.83|218.30→88.79|
+
+| deck | P before count/compiler s | F count/compiler s | P final count/compiler s |
+|---|---:|---:|---:|
+| Si COHSEX |676/47.26|412/18.53|421/20.33|
+| Si GN |816/57.35|539/27.33|577/30.71|
+| MoS2 full static |1712/147.90|597/27.74|737/42.16|
+| MoS2 packed bare |1613/136.65|598/27.26|638/30.98|
+| MoS2 GN eps5 |1896/161.28|790/39.81|963/57.51|
+
+M35/I15/M25/M26 pass both EQP files at tolerance0 and every90/256 complete Sigma state row against their original P baseline. I16 differs from original I03 rules (max0.518ueV EQP0); its preserved failed comparator is `eqp0_vs_original_rules.log`. It matches I13's printed outputs, but its node digests differ, so **I16 is not used as the strict fixed-schedule source gate**. I20 replays I13's exact six certificate/node digests and passes both EQP files and all256 state rows; this is the Si GN source-change gate. New common-rule unprofiled controls below separate the cache-miss effect from final P/F performance.
+
+### Measured owner accounting after the fixes
+
+Host rows here are M14/M15/M37, one complete16-block×3-term static caller with heads; native rows are selected TT units, not an average over unequal endpoint classes. The static caller is nested around factories/restores/blocks: do not add it to its children. Plan factories additionally compile eager service support, so their counts are not contraction-module counts.
+
+| boundary | F before | P before | P after | frequency/scaling |
+|---|---:|---:|---:|---|
+| entire static caller host/compiler s; events |11.448/9.024;141|151.373/120.740;1135|13.542/9.988;160|one caller/run; O(BT) dispatch|
+| GEMM factory host/compiler s; events |6.281/5.360;86|54.071/45.712;674|6.302/5.367;86|F4 cold classes; P32→4 cold classes; plans scale with endpoint shape,K,Q,N,s,P|
+| block calls / core modules |48/4|96/64|48/4|B16,T3; body/head shared after; distinct plan identities remain separated|
+| block host/compiler s |2.136/1.637|29.123/21.485|1.983/1.385|cold plans excluded; original extra support compile makes boundary count65 versus64 cores|
+| pooled first/cold block host median ms |474.006|426.785 body;451.660 head|464.316 combined|unequal shape classes pooled; not a like-shape speed ratio|
+| pooled warm block host median ms |5.083|4.521 body;2.215 head|2.497 combined|P after44/48 calls warm; F44/48 warm|
+| restore host/compiler s |absent at Sigma entry|64.945/51.527|2.259/1.268|300 source contributions and48 outputs unchanged; O(K M_A M_B/P)×source multiplicity|
+| selected TT native body+head ms |6.757437 shared|2.185950+2.043967|3.001600 shared|one warm block; sums of separate original modules omit host gaps|
+| selected TT native G ms |1.211744 once|1.055104+1.040000|1.043456 once|O(KNs²M_A M_B/P); static G is fullK in both routes|
+| selected TT parent/full-band projection ms |1.245184+1.197535 body;1.238879+1.178656 head|0.394623+0.327680 body;0.373151+0.323552 head|0.505024+0.337824 body;0.496800+0.334688 head|P projectsQ vs F K; O(QNs²M_A M_B/P) contractions|
+| face transport enclosing native range ms |no parent transport|0.032032 per selected G|0.040832 per shared G|contains both faces, spin/gamma and initialization;192→96 unfolds/run, not a separately timed spin einsum|
+| static band unfold |absent|18calls/1.543712ms projected|same18 calls; no seam change|O(KN²), after summation; one CP/call|
+| bare Sigma input conversions (Si) |absent|32calls/4.186365ms projected|same input seam|two cached modules;2all-to-all instructions each, independent of tau count|
+
+Final static native class receipts M36: CC4.022591ms/50,119,937 peak bytes, CT3.415488/28,022,609, TC3.347616/27,316,049, TT3.001600/15,255,249. CC/CT/TC/TT execute3/9/9/27 times; selected SX occurrences are1/3/3/9 (zero-based). All four optimized parent core modules have **zero explicit collectives** under the corrected async census. Original TT body/head peaks were13,524,977/9,748,977 separately: sharing G saves execution, but the final combined module's peak is slightly higher than either separate module. These are per-executable HLO peaks, not whole-driver allocator usage.
+
+Final Si capture I20: warm dynamic node30.385825ms versus P38.633553/F91.150714, first host182.489ms, warm host median31.334ms,29calls/one complete tau compilation(0.139382s). Peak2,487,859,989 bytes/rank; zero explicit HLO collectives. Its spin/transport enclosing command-buffer range is6.477497ms versus14.938586 before. Bare TT contraction is one executable for9calls; selected warm TT12 takes12.681075ms versus F31.702557ms, peak314,901,208 bytes/rank and zero explicit HLO collectives. The canonical bare-input all-to-all seam remains outside that kernel.
+
+Receipts: M36/I20 `final_capture_receipt.json`, `unit_*.json`, `boundary_summary.json`, `xla_dump_rank0/hlo_summary.json` and `async_collectives.json`; every receipt contains its actual lx step. The native class comparisons are one selected warm unit per capture, not a repeated statistical claim about small differences.
+
+## Integration disposition and overlap
+
+Adopt S commits in order: `5dd1c775` (GEMM plans), `ebb18981` (restore owner cache), `1beb5711` (weight placement), `fd5ba099` (shared body/head G), `5093d98d` (vertex operands/shape classes), `ebc98918` (supplied spin blocks). All are pushed on `perf/bisp-prof-s-2026-09-06`, unmerged. The last commit has the explicit Si peak-memory tradeoff above; the first five do not require it.
+
+**One restore implementation must win during integration.** ZW independently pushed `87a2bfaa`, adding `_add_photon_block` and retaining100 vertex-specialized restore executables. S's `ebb18981` instead calls the existing symmetry-owner cache directly and deletes the loop-local zero/JIT, without a new helper. Prefer S's shorter owner-cache version for `photon_blocks_full_q`; skip ZW87a2bfaa when adopting its independent chi/tail fixes, or delete `_add_photon_block` while resolving that overlap. Do not retain both paths or add their reported restore savings: this is the same Sigma boundary. No ZW file was edited by this lane. Integration with ZW remains the orchestrator's combined gate, not a result certified by either separate branch.
+
+**Final static native capture verifies four collective-free parent cores and TT3.001600ms** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0. Static caller 31.361s; 160 compilation events, 27.604s compiler work.
+
+Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/36_P_static_final_profile; [lx] step lx-Xg4-033958-7856-6832 exit 0 in 241 s.
+
+**Final fixed-rule MoS2 capture verifies tau1.785888ms and preserves the two pre-existing collective permutes** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0. Static caller 25.036s; 126 compilation events, 21.810s compiler work.
+
+Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/38_P_dynamic_final_profile; [lx] step lx-Xg4-034411-36368-8022 exit 0 in 260 s.
+
+**Final unprofiled Si fixed-rule P gate; Sigma27.43s with29 identical nodes** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 256 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0.
+
+Evidence: runs/Si/100_bisp_parent_route_2026-09-05/prof_s/21_P_gn_fixed_rules; [lx] step lx-Xg4-034834-61698-3797 exit 0 in 61 s.
+
+Final MoS2 dynamic capture M38 (JID57966610, step lx-Xg4-034411-36368-8022 exit0): one tau executable/67 calls,0.143442s timed-call compilation; first host159.245ms, warm host median2.291017ms; native warm1.785888ms versus original P1.974432/F4.942591. Peak63,803,222 versus52,074,838 bytes/rank, +11,728,384. The two pre-existing collective-permute starts remain. All90 complete Sigma rows and both EQP files are exact against common-rule M20. Current static selection has three CT/TC/TT core executables; all are HLO-collective-free.
+
+Final M36 restore transport census: four symmetry-owner unfold modules1419/1502/1574/1644 execute3/27/27/243 times, respectively, for300 source contributions total. All four have zero explicit HLO collectives. Their projected native transport totals5.533920ms; this excludes separate Lorentz multiplies/additions and therefore is not directly compared to the original fused restore-plus-mix6.607031ms. Source-order restoration remains repeated, while its executable lifetime is fixed. Receipt: M36/restore_owner_native.json. The selected final TT block executes84 native NCCL broadcasts (1.770240ms kernel sum), versus120 across the original separate body/head; HLO-zero does not hide this FFI communication.
+
+## Final common-rule P/F controls and remaining costs
+
+These unprofiled arms use the same selected immutable certificates in both sources; all six Si and eight MoS2 printed node digests match (29/67 dispatches). Production certificate guards remain active. Verbatim receipts are in `final_rule_receipts.txt`; canonical parsed timings and actual step IDs are in `final_fixed_rule_timings.json`. P arms match pinned common-rule P outputs exactly; F arms match pinned common-rule F outputs exactly. Cross-source physics differences are not relaxed into a source-change gate.
+
+| common-rule deck / arms | P rule / tau / other s | F rule / tau / other s | P/F whole Sigma s | P/F whole run s | P/F whole-driver compiles / compiler s |
+|---|---:|---:|---:|---:|---:|
+| Si GN I21/I22 |0.08/4.07/23.28|0.08/4.26/20.10|27.43/24.44|56.35/52.10|577/31.58 vs539/27.31|
+| MoS2 GN M43/M44 |0.12/2.92/29.82|0.11/2.46/26.50|32.86/29.07|88.93/65.75|963/57.47 vs790/39.78|
+
+The final parent Sigma stage remains about3.0s slower on Si GN and3.8s slower on MoS2 GN under matched rules. The leading warm-node inversion is disproved, but whole-stage equality is not claimed. Static restore host work still costs2.259s/caller after fixing compilation; this nearly accounts for the static caller's2.093s residual over F. The dynamic `sigma.tau_sweep` scope includes `integrate_sigma_store` setup, residue reads and omega accumulation, not just the measured tau callable. On MoS2 the complete tau callable is faster while the enclosing sweep remains0.46s slower. The closing executor attribution below separates that residual into cold compilation, pole packing and accumulation; it is not blamed on the faster spin kernel. No inherent tiny-deck or unmeasured P16 limitation is asserted.
+
+## Verification closure
+
+Six production commits pass incremental printed-digit gates; final checks cover all five decks, with exact common-rule controls for both dynamic cases. Combined P4 step `lx-Xg4-033906-2358773-6017` passes the dense vertex/Sigma/all16-current and Hall-head sign/zero oracles. CPU step `lx-Xg0-031951-2245813-3760` passes14 focused tests. All science and captures use authorized57966610 sequentially, one P4 node/leg.
+
+**The full repository gate does not pass.** CPU step `lx-Xg0-035328-91325-4986` exits1: AST suites pass90+34+16=140 tests, but the shared rule allowlist flags13 files unchanged from pinned P, and shared CLAIMS contains12 rows without its evidence token. `41_ast_gate/rule_scope_diff.txt` is empty, proving those flagged files were not changed by these commits; `gate0.log` preserves every finding. Its separate test-evidence check accepts unrelated job57909062, so that check is not substituted for this lane's explicit CPU/P4 receipts. Shared allowlist/ledger files and the evidence guard remain untouched. This is a documented broad-gate failure, not an overall pass.
+
+Raw rank-zero Nsight/HLO artifacts remain under the cited run directories; reduced native units, selected HLO/memory receipts, scripts, canonical rules and load-bearing numerical outputs are committed on this branch. `branch_status.txt` records the checkpoint; `git merge-base --is-ancestor ebc98918 origin/main` returned1, confirming these fixes are unmerged. The orchestrator owns cross-lane integration and its combined gate.
+
+### Closing dynamic executor attribution
+
+Matched-rule M45/M46 synchronize the existing host boundaries without changing arithmetic; M47 additionally times the two in-executor pole packing calls. All three pass both EQP files at tolerance0 and all90 complete state rows against their respective fixed-rule control. JID57966610 steps: P45 `lx-Xg4-035937-127855-7695`, F46 `lx-Xg4-040115-137387-6633`, P47 `lx-Xg4-040611-162030-1739`, all exit0. Raw `boundary.jsonl` and reduced `boundary_summary.json` own these times; the enclosing executor is nested, not additive with its children.
+
+| executor boundary | P45 host s / compiles / compiler s | F46 host s / compiles / compiler s |
+|---|---:|---:|
+| full executor |3.135303 /32 /1.944396|2.740049 /30 /1.522628|
+| tau factory, one call |1.262467 /21 /0.981576|1.256108 /21 /0.980474|
+| pole batch read, one batch |0.006388 /0 /0|0.006360 /0 /0|
+| accumulator initialization |0.041789 /1 /0.032318|0.041794 /1 /0.032348|
+| accumulator precompile |0.051606 /1 /0.039940|0.057544 /1 /0.041988|
+| all67 complete tau calls |0.186073 /1 /0.032913|0.403052 /1 /0.034136|
+| all67 accumulator adds |0.019856 /0 /0|0.022975 /0 /0|
+|8 begin/end windows +finalize |0.000949 /0 /0|0.001023 /0 /0|
+| remaining setup/prewarm/window work, by subtraction |1.566176 /8 /0.857648|0.951193 /6 /0.433682|
+
+P47 isolates two `PackedCentroidBasis.pack_operator` calls inside that last bucket:0.152215s, one compilation/0.123126s compiler work. They run once per pole batch for B and Omega, not once per tau; F has no packed-basis seam. A fused reader/reshard could target this boundary, but the entire measured opportunity is0.152s on the gate and requires a wider I/O contract gate. Full-q B/Omega payload scales O(K M_C²/P), independent of band/spin count; at one MoS2 pole the complex128 B payload is1,327,104 bytes/rank (Omega's actual dtype controls its separate payload). No new fusion is justified here solely by these first-call milliseconds.
+
+The residual executor penalty is therefore cold compilation/setup outside the fast node call: P−F compiler work is0.421768s while the node calls save0.216979s. Factory planning and omega accumulation are essentially equal. The remaining setup bucket includes the explicit `.lower(...).compile()` prewarm and small selector/constant preparation; its pieces are not falsely reported as individually timed device kernels. There is no per-node compile storm. These receipts explain why an enclosing sweep may remain slower even after its steady node improves, without asserting that the residual is inherent to a tiny deck.
+
+Run provenance correction: candidate manifests retain donor `source.commit`/instrument fields. The authoritative runtime source is `source_head.txt` plus `source.diff` and `driver.sh`'s guard; `final_run_audit.json` records those artifacts explicitly. Completed science files are preserved. This copy-helper metadata issue is registered in KNOWN_SANDBOX_ERRORS.md.
+
+**Final executor attribution isolates two pole packs at0.152215s and one0.123126s compilation, with exact science** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0.
+
+Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/47_P_executor_seams; [lx] step lx-Xg4-040611-162030-1739 exit 0 in 95 s.

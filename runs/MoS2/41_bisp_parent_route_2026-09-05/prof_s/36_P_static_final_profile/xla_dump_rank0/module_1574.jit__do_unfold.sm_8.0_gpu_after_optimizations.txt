@@ -1,0 +1,183 @@
+HloModule jit__do_unfold, is_scheduled=true, entry_computation_layout={(c128[3,50,96]{2,1,0})->c128[9,50,96]{2,1,0}}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="de30507e231697e7210c51720de2d6bf"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/36_P_static_final_profile/profile_driver.py"
+2 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/gw_jax.py"
+3 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/sigma_dispatch.py"
+4 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py"
+5 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/w_isdf.py"
+6 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/services/symmetry_maps/src/symmetry_maps/maps.py"
+
+FunctionNames
+1 "captured_main"
+2 "main"
+3 "compute_sigma_xc"
+4 "measured.<locals>.call"
+5 "compute_static_photon_sigma"
+6 "contract_lorentz_blocks"
+7 "restored"
+8 "photon_blocks_full_q"
+9 "unfold_isdf_operator"
+10 "_get_unfold_isdf_operator_jit.<locals>._do_unfold"
+11 "_get_unfold_isdf_operator_jit.<locals>._kernel"
+12 "_apply_unfold_phase_and_trs_local"
+13 "_permute_isdf_operator_axes_local"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=72 end_line=72 column=15 end_column=15}
+2 {file_name_id=2 function_name_id=2 line=1024 end_line=1024 column=18 end_column=18}
+3 {file_name_id=3 function_name_id=3 line=1104 end_line=1104 column=37 end_column=37}
+4 {file_name_id=1 function_name_id=4 line=34 end_line=34 column=21 end_column=21}
+5 {file_name_id=4 function_name_id=5 line=227 end_line=227 column=32 end_column=32}
+6 {file_name_id=4 function_name_id=6 line=176 end_line=176 column=28 end_column=28}
+7 {file_name_id=1 function_name_id=7 line=56 end_line=56 column=33 end_column=33}
+8 {file_name_id=5 function_name_id=8 line=2027 end_line=2027 column=23 end_column=23}
+9 {file_name_id=6 function_name_id=9 line=867 end_line=867 column=68 end_column=68}
+10 {file_name_id=6 function_name_id=10 line=1306 end_line=1306 column=19 end_column=19}
+11 {file_name_id=6 function_name_id=11 line=1271 end_line=1271 column=18 end_column=18}
+12 {file_name_id=6 function_name_id=11 line=1276 end_line=1276 column=26 end_column=26}
+13 {file_name_id=6 function_name_id=11 line=1276 end_line=1276 column=12 end_column=12}
+14 {file_name_id=6 function_name_id=11 line=1275 end_line=1275 column=21 end_column=21}
+15 {file_name_id=6 function_name_id=11 line=1250 end_line=1250 column=16 end_column=16}
+16 {file_name_id=6 function_name_id=11 line=1280 end_line=1280 column=24 end_column=24}
+17 {file_name_id=6 function_name_id=11 line=1279 end_line=1279 column=19 end_column=19}
+18 {file_name_id=6 function_name_id=11 line=1283 end_line=1283 column=23 end_column=23}
+19 {file_name_id=6 function_name_id=12 line=964 end_line=964 column=20 end_column=20}
+20 {file_name_id=6 function_name_id=11 line=1246 end_line=1246 column=23 end_column=23}
+21 {file_name_id=6 function_name_id=11 line=1256 end_line=1256 column=23 end_column=23}
+22 {file_name_id=6 function_name_id=13 line=896 end_line=896 column=12 end_column=12}
+23 {file_name_id=6 function_name_id=13 line=901 end_line=901 column=35 end_column=35}
+24 {file_name_id=6 function_name_id=13 line=900 end_line=900 column=21 end_column=21}
+25 {file_name_id=6 function_name_id=13 line=897 end_line=897 column=12 end_column=12}
+26 {file_name_id=6 function_name_id=13 line=921 end_line=921 column=36 end_column=36}
+27 {file_name_id=6 function_name_id=13 line=920 end_line=920 column=22 end_column=22}
+28 {file_name_id=6 function_name_id=11 line=1273 end_line=1273 column=19 end_column=19}
+29 {file_name_id=6 function_name_id=11 line=1278 end_line=1278 column=26 end_column=26}
+30 {file_name_id=6 function_name_id=11 line=1278 end_line=1278 column=12 end_column=12}
+31 {file_name_id=6 function_name_id=11 line=1277 end_line=1277 column=22 end_column=22}
+32 {file_name_id=6 function_name_id=11 line=1251 end_line=1251 column=16 end_column=16}
+33 {file_name_id=6 function_name_id=11 line=1282 end_line=1282 column=25 end_column=25}
+34 {file_name_id=6 function_name_id=11 line=1281 end_line=1281 column=19 end_column=19}
+35 {file_name_id=6 function_name_id=12 line=965 end_line=965 column=22 end_column=22}
+36 {file_name_id=6 function_name_id=12 line=967 end_line=967 column=33 end_column=33}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=10 parent_frame_id=10}
+11 {file_location_id=11 parent_frame_id=1}
+12 {file_location_id=12 parent_frame_id=1}
+13 {file_location_id=13 parent_frame_id=1}
+14 {file_location_id=14 parent_frame_id=1}
+15 {file_location_id=15 parent_frame_id=1}
+16 {file_location_id=16 parent_frame_id=1}
+17 {file_location_id=17 parent_frame_id=1}
+18 {file_location_id=18 parent_frame_id=1}
+19 {file_location_id=19 parent_frame_id=19}
+20 {file_location_id=20 parent_frame_id=1}
+21 {file_location_id=21 parent_frame_id=1}
+22 {file_location_id=22 parent_frame_id=22}
+23 {file_location_id=23 parent_frame_id=22}
+24 {file_location_id=24 parent_frame_id=22}
+25 {file_location_id=25 parent_frame_id=22}
+26 {file_location_id=26 parent_frame_id=22}
+27 {file_location_id=27 parent_frame_id=22}
+28 {file_location_id=28 parent_frame_id=1}
+29 {file_location_id=29 parent_frame_id=1}
+30 {file_location_id=30 parent_frame_id=1}
+31 {file_location_id=31 parent_frame_id=1}
+32 {file_location_id=32 parent_frame_id=1}
+33 {file_location_id=33 parent_frame_id=1}
+34 {file_location_id=34 parent_frame_id=1}
+35 {file_location_id=35 parent_frame_id=19}
+36 {file_location_id=18 parent_frame_id=36}
+37 {file_location_id=35 parent_frame_id=37}
+38 {file_location_id=36 parent_frame_id=19}
+39 {file_location_id=18 parent_frame_id=39}
+40 {file_location_id=36 parent_frame_id=40}
+
+
+%fused_transpose (param_0.48: pred[9], param_1.50: c128[9,100], param_2.48: u32[], param_3.33: c128[9,192], param_4.37: s32[9,192], param_5.26: s32[9,100], param_6.21: c128[3,50,96], param_7.23: s32[9,1]) -> c128[9,50,96] {
+  %param_0.48 = pred[9]{0} parameter(0)
+  %broadcast_in_dim.18.1 = pred[9,50,96]{2,1,0} broadcast(%param_0.48), dimensions={0}, metadata={op_name="jit(_do_unfold)/shard_map/jit(_where)/broadcast_in_dim"}
+  %param_1.50 = c128[9,100]{1,0} parameter(1)
+  %constant_72_1 = s32[] constant(0), metadata={op_name="jit(_do_unfold)/shard_map"}
+  %param_2.48 = u32[] parameter(2)
+  %constant_73_1 = u32[] constant(1), metadata={op_name="jit(_do_unfold)/shard_map"}
+  %axis_index.45.1 = u32[] shift-right-logical(%param_2.48, %constant_73_1), metadata={op_name="jit(_do_unfold)/shard_map/axis_index" stack_frame_id=15}
+  %axis_index.46.2 = u32[] and(%axis_index.45.1, %constant_73_1), metadata={op_name="jit(_do_unfold)/shard_map/axis_index" stack_frame_id=15}
+  %axis_index.47.1 = s32[] convert(%axis_index.46.2), metadata={op_name="jit(_do_unfold)/shard_map/axis_index" stack_frame_id=15}
+  %constant_74_1 = s32[] constant(50), metadata={op_name="jit(_do_unfold)/shard_map"}
+  %mul.42.2 = s32[] multiply(%axis_index.47.1, %constant_74_1), metadata={op_name="jit(_do_unfold)/shard_map/mul" stack_frame_id=16}
+  %lt.12.2 = pred[] compare(%mul.42.2, %constant_72_1), direction=LT, metadata={op_name="jit(_do_unfold)/shard_map/lt" stack_frame_id=17}
+  %constant_75_1 = s32[] constant(100), metadata={op_name="jit(_do_unfold)/shard_map"}
+  %add.15.2 = s32[] add(%mul.42.2, %constant_75_1), metadata={op_name="jit(_do_unfold)/shard_map/add" stack_frame_id=17}
+  %select_n.19.1 = s32[] select(%lt.12.2, %add.15.2, %mul.42.2), metadata={op_name="jit(_do_unfold)/shard_map/select_n" stack_frame_id=17}
+  %dynamic_slice.12.1 = c128[9,50]{1,0} dynamic-slice(%param_1.50, %constant_72_1, %select_n.19.1), dynamic_slice_sizes={9,50}, metadata={op_name="jit(_do_unfold)/shard_map/dynamic_slice" stack_frame_id=17}
+  %broadcast.13.5 = c128[9,50,96]{2,1,0} broadcast(%dynamic_slice.12.1), dimensions={0,1}, metadata={op_name="jit(_do_unfold)/shard_map/mul" stack_frame_id=19}
+  %param_6.21 = c128[3,50,96]{2,1,0} parameter(6)
+  %param_7.23 = s32[9,1]{1,0} parameter(7)
+  %gather.16.3 = c128[9,1,50,96]{3,2,1,0} gather(%param_6.21, %param_7.23), offset_dims={1,2,3}, collapsed_slice_dims={}, start_index_map={0}, index_vector_dim=1, slice_sizes={1,50,96}, metadata={op_name="jit(_do_unfold)/shard_map/gather" stack_frame_id=20}
+  %bitcast.19 = c128[9,50,96]{2,1,0} bitcast(%gather.16.3), metadata={op_name="jit(_do_unfold)/shard_map/gather" stack_frame_id=20}
+  %iota.5 = s64[9,50,1]{2,1,0} iota(), iota_dimension=0
+  %param_5.26 = s32[9,100]{1,0} parameter(5)
+  %dynamic_slice.13.3 = s32[9,50]{1,0} dynamic-slice(%param_5.26, %constant_72_1, %select_n.19.1), dynamic_slice_sizes={9,50}, metadata={op_name="jit(_do_unfold)/shard_map/dynamic_slice" stack_frame_id=24}
+  %bitcast.1.5 = s32[9,50,1]{2,1,0} bitcast(%dynamic_slice.13.3), metadata={op_name="jit(_do_unfold)/shard_map/dynamic_slice" stack_frame_id=24}
+  %convert.4.5 = s64[9,50,1]{2,1,0} convert(%bitcast.1.5), metadata={op_name="jit(_do_unfold)/shard_map/jit(take_along_axis)/convert_element_type"}
+  %concatenate.5 = s64[9,50,2]{2,1,0} concatenate(%iota.5, %convert.4.5), dimensions={2}, metadata={op_name="jit(_do_unfold)/shard_map/jit(take_along_axis)/gather"}
+  %bitcast.2.7 = s64[450,2]{1,0} bitcast(%concatenate.5), metadata={op_name="jit(_do_unfold)/shard_map/jit(take_along_axis)/gather"}
+  %gather.17.7 = c128[450,1,1,96]{3,2,1,0} gather(%bitcast.19, %bitcast.2.7), offset_dims={1,2,3}, collapsed_slice_dims={}, start_index_map={0,1}, index_vector_dim=1, slice_sizes={1,1,96}, metadata={op_name="jit(_do_unfold)/shard_map/jit(take_along_axis)/gather"}
+  %bitcast.3.5 = c128[9,50,96]{2,1,0} bitcast(%gather.17.7), metadata={op_name="jit(_do_unfold)/shard_map/jit(take_along_axis)/gather"}
+  %iota.1.3 = s64[9,96,1]{2,1,0} iota(), iota_dimension=0
+  %param_4.37 = s32[9,192]{1,0} parameter(4)
+  %axis_index.48.9 = u32[] and(%param_2.48, %constant_73_1), metadata={op_name="jit(_do_unfold)/shard_map/axis_index" stack_frame_id=25}
+  %axis_index.49.9 = s32[] convert(%axis_index.48.9), metadata={op_name="jit(_do_unfold)/shard_map/axis_index" stack_frame_id=25}
+  %constant_77_1 = s32[] constant(96), metadata={op_name="jit(_do_unfold)/shard_map"}
+  %mul.44.9 = s32[] multiply(%axis_index.49.9, %constant_77_1), metadata={op_name="jit(_do_unfold)/shard_map/mul" stack_frame_id=26}
+  %lt.13.9 = pred[] compare(%mul.44.9, %constant_72_1), direction=LT, metadata={op_name="jit(_do_unfold)/shard_map/lt" stack_frame_id=27}
+  %constant_78_1 = s32[] constant(192), metadata={op_name="jit(_do_unfold)/shard_map"}
+  %add.17.9 = s32[] add(%mul.44.9, %constant_78_1), metadata={op_name="jit(_do_unfold)/shard_map/add" stack_frame_id=27}
+  %select_n.21.9 = s32[] select(%lt.13.9, %add.17.9, %mul.44.9), metadata={op_name="jit(_do_unfold)/shard_map/select_n" stack_frame_id=27}
+  %dynamic_slice.14.3 = s32[9,96]{1,0} dynamic-slice(%param_4.37, %constant_72_1, %select_n.21.9), dynamic_slice_sizes={9,96}, metadata={op_name="jit(_do_unfold)/shard_map/dynamic_slice" stack_frame_id=27}
+  %bitcast.4.5 = s32[9,96,1]{2,1,0} bitcast(%dynamic_slice.14.3), metadata={op_name="jit(_do_unfold)/shard_map/dynamic_slice" stack_frame_id=27}
+  %convert.5.5 = s64[9,96,1]{2,1,0} convert(%bitcast.4.5), metadata={op_name="jit(_do_unfold)/shard_map/jit(take_along_axis)/reshape"}
+  %concatenate.1.3 = s64[9,96,2]{2,1,0} concatenate(%iota.1.3, %convert.5.5), dimensions={2}, metadata={op_name="jit(_do_unfold)/shard_map/jit(take_along_axis)/gather"}
+  %bitcast.5.5 = s64[864,2]{1,0} bitcast(%concatenate.1.3), metadata={op_name="jit(_do_unfold)/shard_map/jit(take_along_axis)/gather"}
+  %gather.18.5 = c128[864,1,50,1]{3,2,1,0} gather(%bitcast.3.5, %bitcast.5.5), offset_dims={1,2,3}, collapsed_slice_dims={}, start_index_map={0,2}, index_vector_dim=1, slice_sizes={1,50,1}, metadata={op_name="jit(_do_unfold)/shard_map/jit(take_along_axis)/gather"}
+  %bitcast.6.3 = c128[9,96,50]{2,1,0} bitcast(%gather.18.5), metadata={op_name="jit(_do_unfold)/shard_map/jit(take_along_axis)/gather"}
+  %transpose.9.3 = c128[9,50,96]{2,1,0} transpose(%bitcast.6.3), dimensions={0,2,1}, metadata={op_name="jit(_do_unfold)/shard_map/jit(take_along_axis)/gather"}
+  %multiply.2.5 = c128[9,50,96]{2,1,0} multiply(%broadcast.13.5, %transpose.9.3), metadata={op_name="jit(_do_unfold)/shard_map/mul" stack_frame_id=19}
+  %param_3.33 = c128[9,192]{1,0} parameter(3)
+  %dynamic_slice.15.6 = c128[9,96]{1,0} dynamic-slice(%param_3.33, %constant_72_1, %select_n.21.9), dynamic_slice_sizes={9,96}, metadata={op_name="jit(_do_unfold)/shard_map/dynamic_slice" stack_frame_id=34}
+  %real.6.3 = f64[9,96]{1,0} real(%dynamic_slice.15.6), metadata={op_name="jit(_do_unfold)/shard_map/real" stack_frame_id=37}
+  %imag.6.5 = f64[9,96]{1,0} imag(%dynamic_slice.15.6), metadata={op_name="jit(_do_unfold)/shard_map/imag" stack_frame_id=37}
+  %neg.6.3 = f64[9,96]{1,0} negate(%imag.6.5), metadata={op_name="jit(_do_unfold)/shard_map/neg" stack_frame_id=37}
+  %complex.6.1 = c128[9,96]{1,0} complex(%real.6.3, %neg.6.3), metadata={op_name="jit(_do_unfold)/shard_map/complex" stack_frame_id=37}
+  %broadcast.14.3 = c128[9,50,96]{2,1,0} broadcast(%complex.6.1), dimensions={0,2}, metadata={op_name="jit(_do_unfold)/shard_map/mul" stack_frame_id=19}
+  %multiply.3.3 = c128[9,50,96]{2,1,0} multiply(%multiply.2.5, %broadcast.14.3), metadata={op_name="jit(_do_unfold)/shard_map/mul" stack_frame_id=19}
+  %real.7.1 = f64[9,50,96]{2,1,0} real(%multiply.3.3), metadata={op_name="jit(_do_unfold)/shard_map/real" stack_frame_id=40}
+  %imag.7.5 = f64[9,50,96]{2,1,0} imag(%multiply.3.3), metadata={op_name="jit(_do_unfold)/shard_map/imag" stack_frame_id=40}
+  %neg.7.3 = f64[9,50,96]{2,1,0} negate(%imag.7.5), metadata={op_name="jit(_do_unfold)/shard_map/neg" stack_frame_id=40}
+  %complex.7.1 = c128[9,50,96]{2,1,0} complex(%real.7.1, %neg.7.3), metadata={op_name="jit(_do_unfold)/shard_map/complex" stack_frame_id=40}
+  ROOT %select_n.22.1 = c128[9,50,96]{2,1,0} select(%broadcast_in_dim.18.1, %complex.7.1, %multiply.3.3), metadata={op_name="jit(_do_unfold)/shard_map/jit(_where)/select_n"}
+}
+
+ENTRY %main.2_spmd (param.9: c128[3,50,96]) -> c128[9,50,96] {
+  %axis_index.44.0 = u32[] partition-id(), metadata={op_name="jit(_do_unfold)/shard_map/axis_index" stack_frame_id=15}
+  %constant_128_0 = c128[9,192]{1,0} constant({...}), metadata={op_name="jit(_do_unfold)/shard_map/exp" stack_frame_id=31}
+  %constant_105_0 = s32[9,1]{1,0} constant({ {0}, {1}, {1}, {1}, {2}, {1}, {1}, {1}, {2} }), metadata={op_name="jit(_do_unfold)/shard_map/broadcast_in_dim" stack_frame_id=20}
+  %constant_104_0 = c128[9,100]{1,0} constant({...}), metadata={op_name="jit(_do_unfold)/shard_map/exp" stack_frame_id=14}
+  %constant_81_0 = pred[9]{0} constant({0, 0, 1, 1, 0, 0, 0, 1, 1}), metadata={op_name="jit(_do_unfold)/shard_map/jit(_where)/broadcast_in_dim"}
+  %param.9 = c128[3,50,96]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="V_ibz"}
+  %constant_63_0 = s32[9,192]{1,0} constant({...}), metadata={op_name="jit(_do_unfold)/shard_map" stack_frame_id=10}
+  %constant_62_0 = s32[9,100]{1,0} constant({...}), metadata={op_name="jit(_do_unfold)/shard_map" stack_frame_id=10}
+  ROOT %input_transpose_fusion = c128[9,50,96]{2,1,0} fusion(%constant_81_0, %constant_104_0, %axis_index.44.0, %constant_128_0, %constant_63_0, /*index=5*/%constant_62_0, %param.9, %constant_105_0), kind=kInput, calls=%fused_transpose, metadata={op_name="jit(_do_unfold)/shard_map/jit(_where)/select_n"}
+}
+
