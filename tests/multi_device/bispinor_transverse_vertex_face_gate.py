@@ -138,15 +138,14 @@ def check_vertex_build_g(mesh, dtype="complex128", *, mu_L, nu_L, ns=4,
 #    exactly compute_sigma_x_bispinor's own per-tile mechanism.
 # ---------------------------------------------------------------------------
 
-def check_sigma_sx_chain_face_matches_legacy(
+def check_sigma_sx_chain_matches_dense(
         mesh, dtype="complex128", *, mu_L, nu_L, ns=4, mu=8, nb_full=8,
         nb_sigma=5, nk=2):
     from gw.cohsex_sigma import _make_cohsex_kernels
     from gw.photon_sigma import (
         _TERM_SX, _TERM_X, _make_photon_static_block_kernel)
     from gw.wavefunction_bundle import (
-        BandSlices, Wavefunctions, PSI_XN_SPEC, PSI_XR_SPEC, PSI_YR_SPEC,
-        PSI_YN_SPEC, PSI_MUN_SPEC, PSI_NMU_SPEC)
+        BandSlices, Wavefunctions, PSI_MUN_SPEC, PSI_NMU_SPEC)
 
     rng = np.random.default_rng(2026082310 + 17 * mu_L + nu_L)
     psi_np = _rng_mat(rng, (nk, nb_full, ns, mu), dtype)   # (nk,n,s,mu)
@@ -166,15 +165,6 @@ def check_sigma_sx_chain_face_matches_legacy(
     kgrid = (nk, 1, 1)
     slices = BandSlices.from_band_edges(0, 0, 2, nb_sigma, nb_full)
 
-    wfns_legacy = Wavefunctions(
-        psi_xn=_put(psi_band_last, mesh, PSI_XN_SPEC),
-        psi_xr=_put(psi_np, mesh, PSI_XR_SPEC),
-        psi_yr=_put(psi_np, mesh, PSI_YR_SPEC),
-        psi_yn=_put(psi_band_last, mesh, PSI_YN_SPEC),
-        enk=_put(enk_np, mesh, (None, None)),
-        occ=_put(np.zeros_like(enk_np), mesh, (None, None)),
-        slices=slices,
-    )
     wfns_face = Wavefunctions(
         psi_nmu=_put(psi_np, mesh, PSI_NMU_SPEC),
         psi_mun=_put(psi_band_last, mesh, PSI_MUN_SPEC),
@@ -182,50 +172,33 @@ def check_sigma_sx_chain_face_matches_legacy(
         occ=_put(np.zeros_like(enk_np), mesh, (None, None)),
         slices=slices, layout="face",
     )
-    Gij_legacy = _put(Gij_np, mesh, (None, None, None))
     Gij_face = _put(Gij_np, mesh, (None, None, None))
-    V_q_legacy = _put(V_q_np, mesh, (None, None, None))
     V_q_face = _put(V_q_np, mesh, (None, None, None))
 
-    sigma_sx_legacy, _ = _make_cohsex_kernels(mesh, kgrid, nk,
-                                              layout="legacy")
     sigma_sx_face, _ = _make_cohsex_kernels(
         mesh, kgrid, nk, layout="face",
         face_shape=(nk, nb_full, mu, ns))
 
-    wfns_legacy_v = replace(wfns_legacy,
-        psi_xn=jnp.einsum("ab,kbxn->kaxn", _gamma_full(mu_L), wfns_legacy.psi_xn),
-        psi_yr=jnp.einsum("ab,knbx->knax", _gamma_full(nu_L), wfns_legacy.psi_yr))
     wfns_face_v = replace(wfns_face,
         psi_mun=jnp.einsum("ab,kbxn->kaxn", _gamma_full(mu_L), wfns_face.psi_mun),
         psi_nmu=jnp.einsum("ab,knbx->knax", _gamma_full(nu_L), wfns_face.psi_nmu))
 
-    # Legacy: The independent dense gamma oracle touches psi_xn/psi_yr (the
-    # G-build's two fields), leaving psi_xr/psi_yn (the projection's own
-    # two fields) untouched — so the single-argument call already keeps
-    # the outer projection bra/ket un-rotated, exactly what the physics
-    # requires (module docstring of gw.sigma_x_bispinor).
-    got_legacy = _gather(sigma_sx_legacy(wfns_legacy_v, Gij_legacy, V_q_legacy))
-    # Face: the two-array carrier serves BOTH roles, so the vertex-
-    # inserted bundle must be threaded through ONLY as wfns_g (the
-    # G-build operand); wfns_face itself (untouched) supplies the
-    # projection's bra/ket.  See _make_cohsex_kernels_face's own
-    # sigma_sx docstring for the derivation and the O(1) discrepancy
-    # this parameter exists to fix (found by an earlier version of THIS
-    # gate, before wfns_g existed).
     got_face_full = _gather(sigma_sx_face(wfns_face, Gij_face, V_q_face,
                                           wfns_g=wfns_face_v))
-    # Mirrors compute_sigma_x_bispinor's OWN gather-then-window step for
-    # layout='face' (its return contract: (nk, nb_sigma, nb_sigma) in
-    # EITHER layout).
-    got_face = got_face_full[:, :nb_sigma, :nb_sigma]
-
-    assert got_legacy.shape == got_face.shape, (
-        f"shape mismatch: legacy={got_legacy.shape} face={got_face.shape}")
-    r = _rel(got_face, got_legacy)
-    assert r < RTOL, (
-        f"sigma_sx chain face-vs-legacy rel err {r:.3e} "
-        f"(mu_L={mu_L}, nu_L={nu_L})")
+    left = np.einsum("st,kbtm->kbsm", _gamma_full(mu_L), psi_np)
+    right = np.einsum("st,kbtm->kbsm", _gamma_full(nu_L), psi_np)
+    reference = np.zeros((nk, nb_full, nb_full), complex)
+    for k in range(nk):
+        sigma = np.zeros((ns, mu, ns, mu), complex)
+        for q in range(nk):
+            kmq = (k - q) % nk
+            green = np.einsum("b,bsm,btn->smtn", f_np[kmq],
+                left[kmq, :nb_sigma], right[kmq, :nb_sigma].conj())
+            sigma -= green * V_q_np[q][None, :, None, :] / nk
+        reference[k] = np.einsum("asm,smtn,btn->ab",
+            psi_np[k].conj(), sigma, psi_np[k])
+    r = _rel(got_face_full, reference)
+    assert r < RTOL, f"static SX vs literal q/band sum: {r:.3e}"
 
     # The coupled photon path must evaluate X[V_packed] and SX[W_packed]
     # through the same Green/convolution/projector graph and one compiled
@@ -260,7 +233,7 @@ def check_sigma_sx_chain_face_matches_legacy(
         f"cache_size={cache_size}")
 
     return {
-        "face_vs_legacy": r,
+        "face_vs_dense": r,
         "photon_x_vs_v": r_photon_x,
         "photon_sx_vs_2v": r_photon_sx,
         "photon_kernel_cache_size": cache_size,
@@ -401,7 +374,7 @@ _CLI_CELLS = (
      for (mu_L, nu_L) in _LORENTZ_PAIRS]
     + [(f"sigma_sx_chain_{mu_L}{nu_L}",
         (lambda mesh, dt, mu_L=mu_L, nu_L=nu_L:
-         check_sigma_sx_chain_face_matches_legacy(
+         check_sigma_sx_chain_matches_dense(
              mesh, dt, mu_L=mu_L, nu_L=nu_L)))
        for (mu_L, nu_L) in _LORENTZ_PAIRS]
     + [("four_current_ordered_pair_all16",

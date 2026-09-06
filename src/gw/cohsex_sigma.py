@@ -1,34 +1,4 @@
-"""Static COHSEX self-energy pipeline.
-
-Builds Σ_SX and Σ_COH in the ISDF basis, using flat-k/flat-q sharding
-consistent with the rest of the GW stack.  Hartree is deliberately absent:
-the driver has one exact G-space implementation in :mod:`gw.kin_ion_io`.
-
-    Σ_SX(k)  = -project[ FFT[ G_occ(R) * W(R) / √Nk ] ]
-    Σ_COH(k) = +project[ FFT[ G_RI(R)  * (W − V)(R) / (2√Nk) ] ]
-The screening operand is W for the COHSEX channel and V for bare
-exchange — pass V as ``W_or_V_q`` to get Σ_X out of the same kernel.
-
-The driver entry :func:`compute_cohsex_sigma` builds both screened
-contributions from a wavefunction bundle and flat-q V / W and returns
-them as a dict.  Static head correction (q→0 band-diagonal terms) is
-optional and applied to SX/COH (and to the bare-X pass separately).
-
-Two-face carrier (``low_mem_bands = true``, ``wfns.layout == "face"``):
-:func:`_make_cohsex_kernels` dispatches to
-:func:`_make_cohsex_kernels_legacy` or :func:`_make_cohsex_kernels_face`,
-whose bodies retain their pre-existing algorithms and which build G via
-``greens_function_kernel.build_G(layout="face")``, projects via
-``common.contract_bands.contract_bands_block_reshard(layout="face")``
-(through ``wavefunction_bundle.project``).  Face kernels return the FULL
-nb_full×nb_full matrix — a
-legal face band axis cannot be sliced to the σ window (report §3) — so
-:func:`compute_cohsex_sigma`/:func:`compute_sigma_x` gather to
-replicated FIRST and window to nb_sigma second, the opposite order from
-legacy's own (window-then-gather) sequence; see the guide,
-``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md``, and
-``claims/0428.md`` for the real-CUDA parity gate.
-"""
+"""Contract static screened exchange and Coulomb hole on canonical parent wavefunctions."""
 from __future__ import annotations
 
 from functools import partial
@@ -216,12 +186,7 @@ def _occ_diag_full(Gij, nb_sigma, nb_full):
 
 
 def _face_kwargs(wfns) -> dict:
-    """``{}`` under ``layout='legacy'``; the ``layout='face'`` +
-    ``face_shape`` kwargs :func:`_make_cohsex_kernels` needs under
-    ``layout='face'``.  Thin alias for
-    :func:`gw.wavefunction_bundle.face_kernel_kwargs`, the shared owner
-    (2026-08-22) — kept under this name so this module's own call sites
-    below did not need to change."""
+    """Select the canonical Sigma face shapes and typed parent transport."""
     from .wavefunction_bundle import sigma_face_kernel_kwargs
     return sigma_face_kernel_kwargs(wfns)
 
@@ -301,35 +266,14 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
 
 
 def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
-                         nk_tot: int, *, layout: str = "legacy",
+                         nk_tot: int, *, layout: str = "face",
                          face_shape=None, k_unfold_plan=None):
-    """Cached factory returning the SX/COH kernels.
-
-    ``k_unfold_plan`` (:class:`gw.centroid_k_unfold.CentroidKUnfoldPlan`, face
-    layout only) makes the kernels read the bundle's parent carrier: G is
-    contracted on the raw parents and transported by the plan, Σ_k is
-    selected on the parents' rows, projected with the same parent
-    faces and broadcast back to full k.  Same outputs, no full-k ψ read.
-
-    Keyed on (id(mesh_xy), kgrid, ffi_dial_key(), layout, face_shape) —
-    same shape the chi0 / ppm_sigma kernel caches use, extended with the
-    two-face carrier's static layout tag (report §5: a static tag
-    SPECIALIZES a kernel build rather than branching a compiled one).
-    The ``ffi_dial_key()`` component is load-bearing: the
-    ``make_flat_k_*`` factories below read ``LORRAX_FFT_FFI`` at FACTORY
-    time, so without the dials in the key a mid-process flag flip would
-    serve a kernel built for the stale backend (the flat-k FFT service
-    contract, ``docs/dev/flat_k_fft_service.md``).  ``nk_tot`` is passed to
-    the convolution factory.
-
-    ``layout='face'`` requires ``face_shape=(nk, nb_full, n_rmu,
-    nspinor)`` so its distributed GEMM plans can be fixed eagerly.
-    """
-    if layout not in ("legacy", "face"):
+    """Build static SX/COH kernels on canonical faces with optional typed parent transport."""
+    if layout != "face":
         raise ValueError(
-            f"_make_cohsex_kernels: layout must be 'legacy' or 'face', "
+            f"_make_cohsex_kernels: layout must be 'face', "
             f"got {layout!r}")
-    if layout == "face" and face_shape is None:
+    if face_shape is None:
         raise ValueError(
             "_make_cohsex_kernels(layout='face') requires "
             "face_shape=(nk, nb_full, n_rmu, nspinor)")
@@ -338,99 +282,22 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     # as an unrelated FFI probe error from work that was about to be
     # thrown away anyway.
     from ffi import ffi_dial_key
-    if k_unfold_plan is not None and layout != "face":
-        raise ValueError(
-            "_make_cohsex_kernels(k_unfold_plan=...) requires layout='face'.")
     cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(),
                 layout, face_shape, k_unfold_plan)
     if cache_key in _cohsex_kernel_cache:
         return _cohsex_kernel_cache[cache_key]
 
     _convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot)
-    if layout == "legacy":
-        kernels = _make_cohsex_kernels_legacy(_convolve)
-    else:
-        kernels = _make_cohsex_kernels_face(
-            mesh_xy, face_shape, _convolve, k_unfold_plan=k_unfold_plan)
+    kernels = _make_cohsex_kernels_face(
+        mesh_xy, face_shape, _convolve, k_unfold_plan=k_unfold_plan)
 
     _cohsex_kernel_cache[cache_key] = kernels
     return kernels
 
 
-def _make_cohsex_kernels_legacy(_convolve):
-    """Legacy static kernels; SX/COH retain their pre-face bodies exactly."""
-
-    @jax.jit
-    def sigma_sx(wfns, Gij, W_q):
-        """Screened exchange:  Σ_SX = -project[ FFT[ G_occ(R) · W(R) / √Nk ] ].
-
-        Pass V_q in place of W_q to get bare exchange Σ_X.
-        """
-        s = wfns.slices
-        G_occ = build_G(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij=Gij)
-        return _project(wfns.xr(s.sigma), wfns.yn(s.sigma),
-                        _convolve(G_occ, W_q, 1.0))
-
-    @partial(jax.jit, static_argnames=("ri_bands",))
-    def sigma_coh(wfns, W_q, V_q, *, ri_bands=None):
-        """Coulomb-hole:  Σ_COH = +project[ FFT[ G_RI(R) · (W-V)(R) / (2·√Nk) ] ].
-
-        ``ri_bands`` RESTRICTS THE INTERMEDIATE-STATE SUM, and exists because
-        this term HAS one.  ``G_RI`` is a sum over every band in
-        ``s.sigma_sum`` with no occupation projector, i.e. the Coulomb hole's
-        slowly convergent unoccupied tail; ``None`` (the default, and the only
-        value any production caller passes) is ``s.sigma_sum`` -- the Σ band
-        sum, NOT the loaded extent ``s.full`` = max(chi, sigma), which is the
-        same slice on every unsplit deck.  A ``(lo, hi)`` half-open band
-        range restricts it, which is what lets a caller measure how much of
-        this term is band-truncation error rather than assert that it has
-        none — see ``gw.ppm_sigma._invalid_static_coh_by_bracket``.  An int
-        tuple rather than a ``slice`` because it is a jit static argument and
-        ``slice`` is not hashable before Python 3.12.
-        """
-        s = wfns.slices
-        # ``sigma_sum``, not ``full``: the Coulomb-hole resolution-of-identity
-        # G IS the Σ band sum, and ``full`` is the LOADED extent
-        # (= max(chi, sigma)).  They are the same slice on every unsplit deck.
-        bands = (s.sigma_sum if ri_bands is None
-                 else slice(int(ri_bands[0]), int(ri_bands[1])))
-        G_ri = build_G(wfns.xn(bands), wfns.yr(bands))
-        return _project(wfns.xr(s.sigma), wfns.yn(s.sigma),
-                        _convolve(G_ri, W_q - V_q, -0.5))
-
-    return sigma_sx, sigma_coh
-
-
 def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
                               k_unfold_plan=None):
-    """Face-layout kernel bodies.
-
-    With ``k_unfold_plan`` the G-build plan is sized at the PACKED parent
-    face (``n_parent`` rows) and ``build_G`` transports the operator to full
-    k through the plan; the projection plan uses the same parent
-    face, the operator is selected on the parents' rows first, and the band
-    matrix is broadcast by the typed band-index unfold.  ``wfns_g`` (the
-    bispinor vertex trick) is not combined with the route.
-
-    G and Σ-projection route through the two owning modules'
-    ``layout='face'`` branches (``greens_function_kernel.build_G``,
-    ``common.contract_bands.contract_bands_block_reshard`` via
-    ``wavefunction_bundle.project``).  Every GEMM plan is built by the
-    enclosing factory once, eagerly.
-
-    Neither kernel windows its own output to the σ band count:
-    ``psi_nmu``/``psi_mun`` cover the full loaded extent, and slicing a
-    2-D-sharded band axis to an arbitrary (non-mesh-divisible) window is
-    exactly the illegal operation report §3 names.  Each returns the FULL
-    (nk, nb_full, nb_full) matrix, still ``P(None,'x','y')``; the caller
-    (:func:`compute_cohsex_sigma` / :func:`compute_sigma_x`) gathers
-    it to replicated FIRST (legal at any size — the same gather legacy
-    already pays for its smaller ``nb_sigma``-windowed result) and only
-    THEN takes the ``[:nb_sigma, :nb_sigma]`` sub-block, a plain slice of
-    a replicated array with no divisibility constraint at all.  This is
-    the bring-up path's named cost (report §3): every face Σ call does
-    the FULL nb_full×nb_full GEMM work, not the windowed nb_sigma one.
-    """
+    """Contract static SX/COH and project before selecting the requested output band window."""
     from distrib_la import gemm_plan
     from common.contract_bands import contract_bands_block_reshard
 
@@ -481,35 +348,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
 
     @jax.jit
     def sigma_sx(wfns, Gij, W_q, *, wfns_g=None):
-        """``wfns_g``, when given, supplies the G-BUILD's two operands
-        (``psi_mun``/``psi_nmu``) INSTEAD of ``wfns``; the projection
-        step always reads ``wfns``'s own copies.  Defaults to ``wfns``
-        (every non-bispinor caller — identical to the pre-2026-08-23
-        body, since ``g = wfns_g or wfns`` then reproduces the exact
-        prior computation byte-for-byte).
-
-        THE REASON THIS PARAMETER EXISTS AT ALL, and not on the legacy
-        sibling: the two-face carrier stores exactly ONE (psi_mun,
-        psi_nmu) pair, reused for BOTH the G-build's internal band sum
-        and the outer band-basis projection — unlike the legacy
-        four-copy carrier, whose G-vertex fields (psi_xn/psi_yr) and
-        projection fields (psi_xr/psi_yn) are already four INDEPENDENT
-        arrays.  The bispinor Σ^B transverse-vertex trick
-        (``gw.sigma_x_bispinor``) needs γ̃ folded into the G-build's
-        INTERNAL band sum only — never into the OUTER projection bra/
-        ket (module docstring of ``gw.sigma_x_bispinor``: "the γ̃ vertex
-        sits on the build_G side of the kernel chain, not the
-        projection side").  On legacy that separation is already free
-        (``gw.wavefunction_bundle.with_lorentz_vertices`` only ever
-        touches psi_xn/psi_yr); on face, WITHOUT this parameter, the
-        SAME two arrays would have to serve both roles at once, and a
-        γ̃-inserted psi_mun/psi_nmu would corrupt the projection's outer
-        bra/ket along with the G-build — MEASURED: real 4-rank CUDA,
-        transverse (mu_L, nu_L) != (0,0) tiles disagreed with the
-        legacy reference by O(1) relative before this parameter existed
-        (tests/multi_device/bispinor_transverse_vertex_face_gate.py's
-        own bring-up).
-        """
+        """Build occupied Green functions from the selected endpoints and project with the original states."""
         s = wfns.slices
         g_mun, g_nmu, _ = _g_operands(wfns, wfns_g)
         phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
@@ -668,33 +507,15 @@ def compute_cohsex_sigma(
     with mesh_xy:
         sig_sx  = sigma_sx_k(wfns, Gij, W_q)
         sig_coh = sigma_coh_k(wfns, W_q, V_q)
-        if wfns.layout == "legacy":
-            # UNCHANGED — add the head to the kernel's own nb_sigma-sized
-            # result, THEN gather.  Do not reorder this branch.
-            sig_sx, sig_coh = _add_static_head(
-                sig_sx, sig_coh,
-                static_head_terms=static_head_terms,
-                meta=meta, mesh_xy=mesh_xy, do_screened=do_screened)
-            sig_sx  = _replicate_band_sigma(sig_sx, mesh_xy)
-            sig_coh = _replicate_band_sigma(sig_coh, mesh_xy)
-        else:
-            # Face kernels return the FULL nb_full x nb_full matrix, still
-            # 2-D sharded (_make_cohsex_kernels_face's docstring): gather
-            # to replicated FIRST (legal at any size), THEN window to
-            # nb_sigma (a plain slice of a replicated array — no
-            # divisibility constraint), THEN add the (nb_sigma-shaped)
-            # head.  Reversing legacy's order is required here, not a
-            # stylistic choice: adding an nb_sigma head to an nb_full
-            # array would be a shape error.
-            nb_sigma = wfns.slices.nb_sigma
-            sig_sx  = _replicate_band_sigma(sig_sx, mesh_xy)
-            sig_coh = _replicate_band_sigma(sig_coh, mesh_xy)
-            sig_sx  = sig_sx[:, :nb_sigma, :nb_sigma]
-            sig_coh = sig_coh[:, :nb_sigma, :nb_sigma]
-            sig_sx, sig_coh = _add_static_head(
-                sig_sx, sig_coh,
-                static_head_terms=static_head_terms,
-                meta=meta, mesh_xy=mesh_xy, do_screened=do_screened)
+        nb_sigma = wfns.slices.nb_sigma
+        sig_sx  = _replicate_band_sigma(sig_sx, mesh_xy)
+        sig_coh = _replicate_band_sigma(sig_coh, mesh_xy)
+        sig_sx  = sig_sx[:, :nb_sigma, :nb_sigma]
+        sig_coh = sig_coh[:, :nb_sigma, :nb_sigma]
+        sig_sx, sig_coh = _add_static_head(
+            sig_sx, sig_coh,
+            static_head_terms=static_head_terms,
+            meta=meta, mesh_xy=mesh_xy, do_screened=do_screened)
         sig_sx.block_until_ready()
         sig_coh.block_until_ready()
 
@@ -703,11 +524,8 @@ def compute_cohsex_sigma(
     if compute_bare_x:
         with mesh_xy:
             sig_x = sigma_sx_k(wfns, Gij, V_q)
-        if wfns.layout == "face":
-            # Gather + window BEFORE the (nb_sigma-shaped) head — see the
-            # same reasoning in the sig_sx/sig_coh block above.
-            sig_x = _replicate_band_sigma(sig_x, mesh_xy)
-            sig_x = sig_x[:, : wfns.slices.nb_sigma, : wfns.slices.nb_sigma]
+        sig_x = _replicate_band_sigma(sig_x, mesh_xy)
+        sig_x = sig_x[:, : wfns.slices.nb_sigma, : wfns.slices.nb_sigma]
         if static_head_terms is not None:
             x_head, _ = static_head_terms_to_kij(
                 static_head_terms, nk_tot=meta.nk_tot, do_screened=False)
@@ -795,9 +613,8 @@ def compute_sigma_x(
     with mesh_xy:
         sig_x = sigma_sx_k(wfns, Gij, V_q)
         sig_x = _replicate_band_sigma(sig_x, mesh_xy)
-        if wfns.layout == "face":
-            nb_sigma = wfns.slices.nb_sigma
-            sig_x = sig_x[:, :nb_sigma, :nb_sigma]
+        nb_sigma = wfns.slices.nb_sigma
+        sig_x = sig_x[:, :nb_sigma, :nb_sigma]
         sig_x.block_until_ready()
 
     if static_head_terms is not None:

@@ -458,7 +458,7 @@ def test_mpa_head_occupation_preflight_precedes_the_body_sweep():
 # this cell tests the occupation weighting and the projection, not the q-sum.
 # ---------------------------------------------------------------------------
 
-from gw.cohsex_sigma import _make_cohsex_kernels, _resolve_Gij
+from gw.cohsex_sigma import _face_kwargs, _make_cohsex_kernels, _resolve_Gij
 from gw.ppm_sigma import (
     _compute_invalid_static_sigma,
     _invalid_static_coh_by_bracket,
@@ -561,66 +561,54 @@ def _sx_parent_bundle(wfns, mesh):
                          green_parent=carrier, layout="face")
 
 
-def test_invalid_static_shared_spatial_matches_legacy_dense_cohsex():
-    """Mode-3 static fallback keeps the old SX+COH algebra at P=1.
-
-    This is deliberately a cross-implementation comparison: the reference is
-    the former decomposed static-COHSEX path, while the production result uses
-    the canonical fused spatial kernel and reduce-scatter projector.
-    """
-    wfns, meta, *_unused, Wc0_q = _sx_fixture()
+def test_invalid_static_shared_spatial_matches_dense_cohsex():
+    """The invalid static SX+COH tail equals independent occupied and identity band sums."""
+    wfns, meta, xn, xr, yr, yn, Wc0_q = _sx_fixture()
     mesh = _mesh_1x1()
     invalid = np.asarray([[[True, False, True],
                            [False, True, False],
                            [True, False, True]]])
-    W_static = jnp.where(jnp.asarray(invalid), jnp.asarray(Wc0_q), 0.0j)
-    sigma_sx_k, sigma_coh_k = _make_cohsex_kernels(
-        mesh, meta.kgrid, int(meta.nk_tot))
-    Gij = _resolve_Gij(None, meta, mesh, None)
-    with mesh:
-        legacy = np.asarray(jax.device_get(
-            sigma_sx_k(wfns, Gij, W_static)
-            + sigma_coh_k(wfns, W_static, jnp.zeros_like(W_static))))
-
+    W_static = np.where(invalid, Wc0_q, 0.0j)
+    reference = _sigma_x_dense_reference(
+        np.asarray([1.0, 1.0, 0.0]), xn, xr, yr, yn, W_static)
+    reference -= 0.5 * _sigma_x_dense_reference(
+        np.ones(3), xn, xr, yr, yn, W_static)
     got = _compute_invalid_static_sigma(
         _sx_parent_bundle(wfns, mesh), jnp.asarray(Wc0_q),
         jnp.asarray(invalid), meta, mesh)
-    scale = max(float(np.max(np.abs(legacy))), 1.0)
-    np.testing.assert_allclose(got, legacy, rtol=2e-12,
+    scale = max(float(np.max(np.abs(reference))), 1.0)
+    np.testing.assert_allclose(got, reference[None], rtol=2e-12,
                                atol=2e-12 * scale)
 
 
-def test_invalid_static_brackets_match_legacy_dense_cohsex():
-    """The memory-bounded bracket diagnostic preserves each disjoint COH part."""
-    wfns, meta, *_unused, Wc0_q = _sx_fixture()
+def test_invalid_static_brackets_match_dense_cohsex():
+    """Each disjoint static COH bracket equals its literal intermediate-state sum."""
+    wfns, meta, xn, xr, yr, yn, Wc0_q = _sx_fixture()
     mesh = _mesh_1x1()
     invalid = np.asarray([[[True, True, False],
                            [True, False, True],
                            [False, True, True]]])
-    brackets = ((0, 1), (1, _SX_NB))
-    W_static = jnp.where(jnp.asarray(invalid), jnp.asarray(Wc0_q), 0.0j)
-    _, sigma_coh_k = _make_cohsex_kernels(
-        mesh, meta.kgrid, int(meta.nk_tot))
-    legacy = []
-    with mesh:
-        for lo, hi in brackets:
-            legacy.append(np.asarray(jax.device_get(sigma_coh_k(
-                wfns, W_static, jnp.zeros_like(W_static),
-                ri_bands=(lo, hi)))))
-    legacy = np.stack(legacy)
-
+    brackets = ((0, 1), (1, 3))
+    W_static = np.where(invalid, Wc0_q, 0.0j)
+    reference = np.stack([
+        -0.5 * _sigma_x_dense_reference(
+            ((np.arange(3) >= lo) & (np.arange(3) < hi)).astype(float),
+            xn, xr, yr, yn, W_static)[None]
+        for lo, hi in brackets])
     got = _invalid_static_coh_by_bracket(
         _sx_parent_bundle(wfns, mesh), jnp.asarray(Wc0_q),
         jnp.asarray(invalid), meta, mesh, brackets)
-    scale = max(float(np.max(np.abs(legacy))), 1.0)
-    np.testing.assert_allclose(got, legacy, rtol=2e-12,
+    scale = max(float(np.max(np.abs(reference))), 1.0)
+    np.testing.assert_allclose(got, reference, rtol=2e-12,
                                atol=2e-12 * scale)
 
 
 def test_sigma_x_takes_diag_f_and_differs_from_the_integer_projector():
     wfns, meta, psi_xn, psi_xr, psi_yr, psi_yn, V_q = _sx_fixture()
     mesh = _mesh_1x1()
-    sigma_sx_k, _ = _make_cohsex_kernels(mesh, meta.kgrid, int(meta.nk_tot))
+    wfns = _sx_parent_bundle(wfns, mesh)
+    sigma_sx_k, _ = _make_cohsex_kernels(
+        mesh, meta.kgrid, int(meta.nk_tot), **_face_kwargs(wfns))
 
     f_int = np.asarray([1.0, 1.0, 0.0])
     f_frac = np.asarray([1.0, 0.625, 0.375])   # same 2 electrons, smeared
@@ -658,7 +646,9 @@ def test_sigma_x_step_occupations_reproduce_the_integer_projector_bitwise():
     """The insulating no-delta claim, at Σ_x rather than at the projector."""
     wfns, meta, *_unused, V_q = _sx_fixture()
     mesh = _mesh_1x1()
-    sigma_sx_k, _ = _make_cohsex_kernels(mesh, meta.kgrid, int(meta.nk_tot))
+    wfns = _sx_parent_bundle(wfns, mesh)
+    sigma_sx_k, _ = _make_cohsex_kernels(
+        mesh, meta.kgrid, int(meta.nk_tot), **_face_kwargs(wfns))
 
     Gij_int = _resolve_Gij(None, meta, mesh, None)
     Gij_step = _resolve_Gij(
