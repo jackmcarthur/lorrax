@@ -679,3 +679,5 @@ The bispinor parent route retires `LORRAX_FORCE_FULL_BZ` and explicit
 `restart_q_storage = full`. Storage follows the computed q parents; a
 naturally unreduced WFN still has a full q axis. Historical full-q readers
 and the internal screening probe's full-q oracle remain shared functionality.
+
+2026-09-06 BISP-ORCH: dynamic Sigma and invalid-mode static tails take their operands only from `parent_sigma_operands`; legacy/full-k and per-bracket carrier selection is retired. The Green GEMM boundary restores its declared two-axis sharding after eager arithmetic, including singleton meshes, without weakening the service guard. Scoped evidence: claims1036–1038 and1043; Mo dynamic selector regression is claim1025 (commit0b77e17c misnumbered it1024 but names the correct physical step). Broader carrier deletion remains tracked in the campaign report.
