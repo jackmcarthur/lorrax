@@ -107,10 +107,11 @@ def _require_packed_operator(name, packed, mesh_xy):
 
 
 def _make_photon_static_block_kernel(
-    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, *, vertex_pair, with_head=False,
+    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, *, with_head=False,
 ):
     """Unfold each endpoint before its vertex, then build G and project Σ on parents."""
     from common.shard_map import shard_map
+    from common.gamma_matrices import gamma_apply
     from ffi import ffi_dial_key
     from common.contract_bands import contract_bands_block_reshard
     from distrib_la import gemm_plan
@@ -120,7 +121,7 @@ def _make_photon_static_block_kernel(
     plans = (left.plan, right.plan)
     shapes = tuple((p.n_parent, c.psi_nmu.shape[1], p.n_centroid_packed, p.nspinor)
                    for c, p in zip((left, right), plans))
-    key = (id(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, ffi_dial_key(), vertex_pair, with_head)
+    key = (id(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, ffi_dial_key(), with_head)
     if key in _photon_sigma_kernel_cache:
         return _photon_sigma_kernel_cache[key]
     plan_key = ("plans", id(mesh_xy), tuple(kgrid), nk_tot, shapes, ffi_dial_key())
@@ -137,17 +138,17 @@ def _make_photon_static_block_kernel(
     rows = np.asarray(plans[0].parent_full_rows)
     specs = (P(None,None,"x","y"), P(None,"x",None,"y"))
 
-    def unfold(psi_mun, psi_nmu):
-        return (plans[0].unfold_face(psi_mun, vertex=vertex_pair[0],
-                    spin_axis=1, mu_axis=2, mesh_axis="x"),
-                plans[1].unfold_face(psi_nmu, vertex=vertex_pair[1],
-                    spin_axis=2, mu_axis=3, mesh_axis="y"))
-    unfold = shard_map(unfold, mesh=mesh_xy, in_specs=specs,
+    def unfold(psi_mun, psi_nmu, vertices):
+        direct = plans[0].unfold_face(psi_mun, spin_axis=1, mu_axis=2, mesh_axis="x")
+        conjugated = plans[1].unfold_face(psi_nmu, spin_axis=2, mu_axis=3, mesh_axis="y")
+        return (gamma_apply(direct, *vertices[0], axis=1),
+                gamma_apply(conjugated, *vertices[1], axis=2))
+    unfold = shard_map(unfold, mesh=mesh_xy, in_specs=(*specs, ((P(), P()), (P(), P()))),
                        out_specs=specs, check_vma=False)
 
     @jax.jit
-    def contract_block(left, right, weights, interaction, factor, head_interaction=None):
-        direct, conjugated = unfold(left.psi_mun, right.psi_nmu)
+    def contract_block(left, right, weights, interaction, factor, vertices, head_interaction=None):
+        direct, conjugated = unfold(left.psi_mun, right.psi_nmu, vertices)
         G = build_G(direct, conjugated, phases=weights, layout="face", gemm=g_plan)
         sigma = convolve(G, interaction, factor)
         result = project(left.psi_nmu, jnp.take(sigma, jnp.asarray(rows), axis=0), right.psi_mun)
@@ -165,6 +166,7 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
     from .w_isdf import photon_blocks_full_q
     from .cohsex_sigma import _occ_diag_full
     from .photon_layout import photon_q0_low_rank_block
+    from common.gamma_matrices import gamma_perm_phase
     if tuple(f.green_parent.plan for f in families) != response.family_plans:
         raise ValueError("Photon interaction and wavefunctions use different parent plans.")
     if term not in (_TERM_X, _TERM_SX, _TERM_COH):
@@ -188,8 +190,9 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
                 head_block = head_block - photon_q0_low_rank_block(
                     (factors.bare_pair,), response.layout, A, B, mesh_xy)
         kernel = _make_photon_static_block_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
-            left, right, vertex_pair=key, with_head=factors is not None)
-        value = kernel(left.green_parent, right.green_parent, weights, interaction, factor, head_block)
+            left, right, with_head=factors is not None)
+        vertices = (gamma_perm_phase(A), gamma_perm_phase(B))
+        value = kernel(left.green_parent, right.green_parent, weights, interaction, factor, vertices, head_block)
         result, head = value if factors is not None else (value, None)
         jax.block_until_ready((result, head))
         del interaction, head_block
