@@ -359,3 +359,7 @@ Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/23_P_plan_reuse_candi
 **Production full-q restore reuses its symmetry-owner cache.** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0. Static caller 39.204s; 219 compilation events, 29.386s compiler work.
 
 Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/24_P_restore_candidate; [lx] step lx-Xg4-025324-1917331-9182 exit 0 in 98 s.
+
+**Production occupied and COH weights share shape and placement.** On branch perf/bisp-prof-s-2026-09-06, unmerged. PASS: 90 complete printed state rows identical, including sigCC/sigTT/sigCT. Both EQP files pass tolerance0. Static caller 25.644s; 188 compilation events, 19.008s compiler work.
+
+Evidence: runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/33_P_weight_candidate; [lx] step lx-Xg4-025650-1941125-7057 exit 0 in 88 s.
