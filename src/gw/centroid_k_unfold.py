@@ -34,6 +34,7 @@ from symmetry_maps import (
     permutation_orbit_labels,
     real_space_orbit_labels,
     unfold_spin_centroid_operator,
+    unfold_wavefunction_local,
 )
 
 
@@ -142,6 +143,22 @@ class CentroidKUnfoldPlan:
             spin_action_full=self.spin_action_full,
             n_sym_spatial=int(self.n_sym_spatial))
 
+    def unfold_face(self, face, *, vertex=0, spin_axis, mu_axis,
+                    mesh_axis=None, tables=None):
+        """Unfold a raw-parent face by the typed action, then apply its Lorentz vertex."""
+        from common.gamma_matrices import gamma_apply, gamma_perm_phase
+
+        t = self.wavefunction_unfold_tables() if tables is None else tables
+        child = unfold_wavefunction_local(
+            face, irr_idx=t["irr_idx"], sym_idx=t["sym_idx"],
+            k_irr_frac=t["k_irr_frac"], local_perm=t["local_perm"],
+            L_table=t["L_table"], spin_action_full=t["spin_action_full"],
+            n_sym_spatial=t["n_sym_spatial"], spin_axis=spin_axis,
+            mu_axis=mu_axis, mesh_axis=mesh_axis)
+        if vertex:
+            child = gamma_apply(child, *gamma_perm_phase(vertex), axis=spin_axis)
+        return child
+
     def real_grid_tiles(self, *, target_width: int) -> "RealGridOrbitTiles":
         """Orbit-closed real-grid tiles for this plan's Y axis and group."""
         if self.spatial_ops is None or self.fft_grid is None:
@@ -247,12 +264,9 @@ def build_centroid_k_unfold_plan(
             "build_centroid_k_unfold_plan requires the GW square mesh; "
             f"got {shape}.")
     ns = int(nspinor)
-    if ns not in (1, 2):
+    if ns not in (1, 2, 4):
         raise ValueError(
-            "build_centroid_k_unfold_plan currently supports scalar and "
-            f"two-component spinor wavefunctions; got nspinor={ns}.  "
-            "Four-component kinetic-balance states require their exact "
-            "Dirac representation at this seam and remain on full k.")
+            f"build_centroid_k_unfold_plan: nspinor must be 1, 2 or 4; got {ns}.")
 
     n_spatial = int(np.asarray(sym.sym_matrices).shape[0])
     sym_perm, wraps = centroid_source_map_and_wrap(

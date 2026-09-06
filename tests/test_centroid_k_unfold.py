@@ -386,3 +386,37 @@ def test_sigma_spatial_cache_owns_plan_and_selects_each_plans_parent_rows(monkey
         None, None, jnp.asarray([10., 20., 30.]), None)), [10., 30.])
     np.testing.assert_array_equal(np.asarray(second.conv_project(
         None, None, jnp.asarray([10., 20., 30.]), None)), [20., 30.])
+
+
+def test_four_spinor_face_vertex_follows_unfold_without_collectives():
+    """Inversion anticommutes with α, so applying a vertex before unfold must fail."""
+    from dataclasses import replace
+    from common.gamma_matrices import gamma_apply, gamma_perm_phase
+    from common.shard_map import shard_map
+
+    mesh = _mesh_2x2()
+    centroids = np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]])
+    plan = build_centroid_k_unfold_plan(
+        _symmetry_fixture(), centroids, (2, 2, 1), mesh, nspinor=4)
+    spin = np.broadcast_to(np.eye(4), (3, 4, 4)).copy().astype(complex)
+    spin[1] = np.diag([1, 1, -1, -1])
+    plan = replace(plan, spin_action_full=spin)
+    rng = np.random.default_rng(92)
+    face = jnp.asarray(plan.layout.axis.pack_host(
+        rng.normal(size=(2, 4, 4, 4)) + 1j * rng.normal(size=(2, 4, 4, 4)), axis=2))
+    spec = P(None, None, 'x', 'y')
+    def body(value):
+        return plan.unfold_face(value, vertex=2, spin_axis=1, mu_axis=2, mesh_axis='x')
+    fn = jax.jit(shard_map(body, mesh=mesh, in_specs=spec, out_specs=spec,
+                          check_vma=False))
+    bare = jax.jit(shard_map(
+        lambda value: plan.unfold_face(value, spin_axis=1, mu_axis=2, mesh_axis='x'),
+        mesh=mesh, in_specs=spec, out_specs=spec, check_vma=False))
+    perm, phase = gamma_perm_phase(2)
+    expected = gamma_apply(bare(face), perm, phase, axis=1)
+    np.testing.assert_allclose(fn(face), expected, atol=1e-14)
+    wrong = bare(gamma_apply(face, perm, phase, axis=1))
+    assert np.max(np.abs(np.asarray(wrong - expected))) > 1
+    hlo = fn.lower(face).compile().as_text().lower()
+    assert 'all-to-all(' not in hlo
+    assert 'all-gather(' not in hlo

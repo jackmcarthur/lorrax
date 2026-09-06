@@ -3143,6 +3143,7 @@ def _fractional_pair_scan_face(
     psi_mun_a, psi_nmu_a, psi_mun_b, psi_nmu_b, energy_a, energy_b,
     occ_a, occ_b, surface_a, surface_b, z_values, *,
     nb_full, nb_logical, tile, unfold_x=None, unfold_y=None, roll_b=None,
+    k_unfold_plan=None,
 ):
     """Face-layout sibling of :func:`_fractional_pair_scan`.
 
@@ -3192,18 +3193,14 @@ def _fractional_pair_scan_face(
         raise ValueError(
             "_fractional_pair_scan_face: give unfold tables for BOTH faces "
             "or neither.")
-    if unfold_x is not None:
-        from ffi import _services
-        _services.ensure_on_path()
-        from symmetry_maps import unfold_wavefunction_local
 
     def _children(tile_psi, tables):
         """(n_parent, s, mu_loc, t) -> (nk, s, mu_loc, t) by the typed action;
         identity when the operand already spans full k."""
         if tables is None:
             return tile_psi
-        return unfold_wavefunction_local(
-            tile_psi, spin_axis=1, mu_axis=2, mesh_axis=None, **tables)
+        return k_unfold_plan.unfold_face(
+            tile_psi, spin_axis=1, mu_axis=2, tables=tables)
 
     def _roll(tile_psi):
         return tile_psi if roll_b is None else jnp.take(tile_psi, roll_b, axis=0)
@@ -3376,7 +3373,6 @@ def iter_parent_children_faces(carrier, mesh_xy, *, slices):
     from common.shard_map import shard_map
     from ffi import _services
     _services.ensure_on_path()
-    from symmetry_maps import unfold_wavefunction_local
     from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
 
     plan = carrier.plan
@@ -3385,15 +3381,15 @@ def iter_parent_children_faces(carrier, mesh_xy, *, slices):
     irr_np = np.asarray(plan.irr_idx)
 
     def _kernel(spec, spin_axis, mu_axis, perm_spec, L_spec, n_rows):
-        key = (id(mesh_xy), spec, spin_axis, mu_axis, int(n_rows))
+        key = (plan, id(mesh_xy), spec, spin_axis, mu_axis, int(n_rows))
         hit = _CHILD_FACE_KERNELS.get(key)
         if hit is None:
             def body(psi, irr_r, sym_r, kfrac_r, U_r, perm, L):
-                return unfold_wavefunction_local(
-                    psi, irr_idx=irr_r, sym_idx=sym_r, k_irr_frac=kfrac_r,
-                    spin_action_full=U_r, local_perm=perm, L_table=L,
-                    n_sym_spatial=n_sym_spatial, spin_axis=spin_axis,
-                    mu_axis=mu_axis, mesh_axis=None)
+                tables = dict(irr_idx=irr_r, sym_idx=sym_r, k_irr_frac=kfrac_r,
+                              spin_action_full=U_r, local_perm=perm, L_table=L,
+                              n_sym_spatial=n_sym_spatial)
+                return plan.unfold_face(
+                    psi, spin_axis=spin_axis, mu_axis=mu_axis, tables=tables)
             hit = jax.jit(shard_map(
                 body, mesh=mesh_xy,
                 in_specs=(spec, P(None), P(None), P(None, None),
@@ -3474,7 +3470,7 @@ def _get_chi_static_fractional_gamma_kernel_face(
                 occupations, occupations, surface_weight, surface_weight,
                 jnp.zeros((1,), dtype=jnp.complex128),
                 nb_full=nb_full, nb_logical=nb_logical, tile=tile,
-                unfold_x=unfold_x, unfold_y=unfold_y)
+                unfold_x=unfold_x, unfold_y=unfold_y, k_unfold_plan=k_unfold_plan)
         in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None, None), P(None, None),
                     P(None, None)) + _PARENT_UNFOLD_SPECS
 
@@ -3538,7 +3534,8 @@ def _get_chi_fractional_q_kernel_face(
                 psi_mun, psi_nmu, psi_mun, psi_nmu, energies, eb,
                 occupations, fb, surface_weight, sb, z_values,
                 nb_full=nb_full, nb_logical=nb_logical, tile=tile,
-                unfold_x=unfold_x, unfold_y=unfold_y, roll_b=kminq_idx)
+                unfold_x=unfold_x, unfold_y=unfold_y, roll_b=kminq_idx,
+                k_unfold_plan=k_unfold_plan)
         in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None), P(None, None),
                     P(None, None), P(None, None), P(None)) + _PARENT_UNFOLD_SPECS
 
