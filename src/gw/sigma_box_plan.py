@@ -1005,10 +1005,9 @@ def plan_sigma_windows(
                 pole_sign=pole_sign, eta_ry=eta)
             if fixed_rule_session is not None and "external_support_ev" in fixed_rule_session:
                 support = np.asarray(fixed_rule_session["external_support_ev"]) / RYD_TO_EV
-                spec["sc_support_frequencies"] = (
-                    np.asarray([min(frequencies[0], support[0]), frequencies[-1]])
-                    if branch.neg_omega_half else
-                    np.asarray([frequencies[0], max(frequencies[-1], support[1])]))
+                spec["sc_support_frequencies"] = np.asarray([
+                    min(frequencies[0], support[0]),
+                    max(frequencies[-1], support[1])])
             spec.update({
                 "branch": branch,
                 "state_indices": flat_indices[local],

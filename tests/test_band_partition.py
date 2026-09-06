@@ -160,4 +160,12 @@ def test_reanchored_partition_hysteresis_breaks_edge_band_two_cycle():
         band_offset=0, omega_min_abs_ev=-1.0, omega_max_abs_ev=1.0,
         previous_partition=previous, hysteresis_margin_ev=0.125,
         print_fn=lambda *_args: None)
-    np.testing.assert_array_equal(drifted.protected_mask, [[True, False]])
+    np.testing.assert_array_equal(drifted.protected_mask, [[True, True]])
+    assert drifted.changed
+    dropped = build_omega_band_partition(
+        np.asarray([[0.50, 1.20]]) / RYD_TO_EV,
+        np.asarray([[0.50, 1.20]]) / RYD_TO_EV,
+        band_offset=0, omega_min_abs_ev=-1.0, omega_max_abs_ev=1.0,
+        previous_partition=drifted, hysteresis_margin_ev=0.125,
+        print_fn=lambda *_args: None)
+    np.testing.assert_array_equal(dropped.protected_mask, [[True, False]])

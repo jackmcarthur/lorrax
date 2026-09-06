@@ -403,13 +403,10 @@ def test_fixed_sc_accepts_the_retry_when_it_meets_eps(monkeypatch):
 
 def test_sc_pad_keeps_a_sign_definite_support_sign_definite():
     from gw.sigma_box_plan import _sc_padded_box_spec
-    spec = {"kind": "sign_definite_negative", "box": (-2.0, -0.3, 0.05, 0.4),
-            "pole_extent": (-3.0, -0.05, 0.05, 0.4), "frequencies": np.asarray([0.0]),
-            "states": np.asarray([0.0]), "pole_sign": 1}
-    try:
-        padded = _sc_padded_box_spec(spec, 0.02)
-    except Exception as exc:  # the pole-box helper needs richer specs
-        pytest.skip(f"pad helper needs the full spec: {exc}")
+    spec = make_sigma_box_spec(
+        name="negative", frequencies=np.asarray([0.]), states=np.asarray([0.]),
+        pole_stats=[(.3, 2., .05, .4)], pole_sign=1., eta_ry=.02)
+    padded = _sc_padded_box_spec(spec, .02)
     assert padded["box"][1] < 0.0 and padded["box"][1] <= 0.5 * spec["box"][1]
 
 
