@@ -241,3 +241,13 @@ def test_an_all_zero_psi_file_falls_back_to_the_array_shape(tmp_path):
         str(path), n_val=100, n_cond=100, mesh_xy=_mesh_1x1(),
         n_occ=N_OCC, cell_volume=270.0)
     assert data["n_cond"] == NBAND_PADDED - N_OCC
+
+
+def test_parent_face_extent_must_match_saved_rows(tmp_path):
+    """A torn parent face is refused before a symmetry gather can select wrong rows."""
+    path = tmp_path / "parents.h5"
+    with h5py.File(path, "w") as f:
+        f["psi_parent_k_rows"] = np.array([0, 2])
+    faces = (np.ones((3, 1, 1, 4)), np.ones((3, 2, 1, 4)))
+    with pytest.raises(ValueError, match="face extent does not match"):
+        bse_loading._unfold_bse_parent_faces(faces, str(path), None, None)
