@@ -1309,44 +1309,51 @@ def _c_q_face_parent(
 	out_C = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 	pair_spec = P(None, None, 'x', None, 'y')
 
-	@partial(jax.jit, in_shardings=(in_mun, in_nmu, w_rep, w_rep),
-	         out_shardings=out_C)
-	def _fused(psi_mun_, psi_nmu_, w_l, w_r):
-		def _projector(w):
-			A = merge_spin_centroid(psi_mun_, 1, 2)            # (p, mu*s, nb)
-			A = A * w[None, None, :].astype(A.dtype)
-			B = merge_spin_centroid(jnp.conj(psi_nmu_), 2, 3)  # (p, nb, nu*s)
-			D = gemm(A, B)                                      # (p, mu*s, nu*s)
-			D = split_spin_centroid(D, 1, s_, mu_pk)
-			return split_spin_centroid(D, 3, s_, mu_pk)         # (p, s, mu, s, nu)
+	cache_key = ('c_q_face_parent', mesh_xy, plan, gemm, tuple(kgrid),
+	             tuple(psi_mun_parent.shape), tuple(psi_nmu_parent.shape),
+	             str(psi_mun_parent.dtype), str(psi_nmu_parent.dtype),
+	             int(gamma_L), int(gamma_R))
+	if cache_key not in _isdf_pipeline_cache:
+		@partial(jax.jit, in_shardings=(in_mun, in_nmu, w_rep, w_rep),
+		         out_shardings=out_C)
+		def _fused(psi_mun_, psi_nmu_, w_l, w_r):
+			def _projector(w):
+				A = merge_spin_centroid(psi_mun_, 1, 2)            # (p, mu*s, nb)
+				A = A * w[None, None, :].astype(A.dtype)
+				B = merge_spin_centroid(jnp.conj(psi_nmu_), 2, 3)  # (p, nb, nu*s)
+				D = gemm(A, B)                                      # (p, mu*s, nu*s)
+				D = split_spin_centroid(D, 1, s_, mu_pk)
+				return split_spin_centroid(D, 3, s_, mu_pk)         # (p, s, mu, s, nu)
 
-		# Parent contraction, then the plan's local typed transport: the
-		# full-k operator is a transient, never a stored carrier.
-		D_l_full = plan.unfold_operator(_projector(w_l))
-		D_r_full = plan.unfold_operator(_projector(w_r))
+			# Parent contraction, then the plan's local typed transport: the
+			# full-k operator is a transient, never a stored carrier.
+			D_l_full = plan.unfold_operator(_projector(w_l))
+			D_r_full = plan.unfold_operator(_projector(w_r))
 
-		@partial(shard_map, mesh=mesh_xy, in_specs=(pair_spec, pair_spec),
-		         out_specs=P(None, 'x', 'y'), check_vma=False)
-		def _tail(D_l_, D_r_):
-			# The incumbent ISDF tail is written for P = conj(D).
-			P_l_3d = jnp.conj(D_l_).reshape(
-				nkx, nky, nkz, s_, mu_loc, s_, col_loc)
-			P_r_3d = jnp.conj(D_r_).reshape(
-				nkx, nky, nkz, s_, mu_loc, s_, col_loc)
-			P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
-			P_l_R_conj = jnp.conj(P_l_R)
-			del P_l_3d, P_l_R
-			P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
-			del P_r_3d
-			C_R = gamma_double_contract(
-				P_l_R_conj, P_r_R, *left_gamma, *right_gamma, spin_axes=(3, 5))
-			del P_l_R_conj, P_r_R
-			C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
-			return C_q_3d.reshape(nk, mu_loc, col_loc)
+			@partial(shard_map, mesh=mesh_xy, in_specs=(pair_spec, pair_spec),
+			         out_specs=P(None, 'x', 'y'), check_vma=False)
+			def _tail(D_l_, D_r_):
+				# The incumbent ISDF tail is written for P = conj(D).
+				P_l_3d = jnp.conj(D_l_).reshape(
+					nkx, nky, nkz, s_, mu_loc, s_, col_loc)
+				P_r_3d = jnp.conj(D_r_).reshape(
+					nkx, nky, nkz, s_, mu_loc, s_, col_loc)
+				P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
+				P_l_R_conj = jnp.conj(P_l_R)
+				del P_l_3d, P_l_R
+				P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
+				del P_r_3d
+				C_R = gamma_double_contract(
+					P_l_R_conj, P_r_R, *left_gamma, *right_gamma, spin_axes=(3, 5))
+				del P_l_R_conj, P_r_R
+				C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
+				return C_q_3d.reshape(nk, mu_loc, col_loc)
 
-		return _tail(D_l_full, D_r_full)
+			return _tail(D_l_full, D_r_full)
 
-	return _fused(psi_mun_parent, psi_nmu_parent,
+		_isdf_pipeline_cache[cache_key] = _fused
+
+	return _isdf_pipeline_cache[cache_key](psi_mun_parent, psi_nmu_parent,
 	             jnp.asarray(weight_l, dtype=jnp.float64),
 	             jnp.asarray(weight_r, dtype=jnp.float64))
 
