@@ -16,7 +16,6 @@ from common import jax_profile
 from common.collectives import (
     device_put_process_local as _device_put_process_local,
 )
-from common.gamma_matrices import gamma_perm_phase as _gamma_perm_phase_mu
 from runtime import debug_print_enabled
 from runtime.padding import bounded_partition_tile
 
@@ -40,7 +39,6 @@ from isdf.core import (
     _z_q_face_parent,
     _resolve_solver_kind,
     _resolve_zeta_gather,
-    _band_norms_slice,
 )
 # The opaque distributed factor.  Re-exported through isdf.core rather than
 # imported from the door here: this module never CALLS distrib_la, it only
@@ -184,8 +182,6 @@ def fit_zeta_to_h5(
     mesh_xy: Mesh,
     chunk_r: int,
     output_file: str,
-    psi_rmu_Y: jax.Array,
-    psi_rmuT_X: jax.Array | None,
     band_chunk_size: int = 16,
     q_chunk_size: int = 1,
     bispinor: bool = False,
@@ -207,12 +203,9 @@ def fit_zeta_to_h5(
     gflat_chunk_size: int = 0,
     write_ibz_only: bool = True,
     zeta_cutoff_ry: float | None = None,
-    low_mem_bands: bool = False,
     cache_psi_r: bool = True,
     cache_face_y_blocks: bool = False,
     face_y_cache_r_tile: int = 0,
-    psi_nmu_fresh: jax.Array | None = None,
-    psi_mun_fresh: jax.Array | None = None,
     bispinor_lift: str = "raw",
     _coupled_mu123_coordinator=None,
     _coupled_rank_gate=None,
@@ -223,198 +216,20 @@ def fit_zeta_to_h5(
     psi_mun_parent: jax.Array | None = None,
     print_fn=print,
 ):
-    """
-    Full zeta fitting pipeline with r-chunk loop and HDF5 output.
-
-    For ``vertex_mu_L == 0`` (default) this is the standard spin-traced
-    path used by the charge-channel ISDF fit — bit-identical to the
-    pre-bispinor implementation.  For ``vertex_mu_L ∈ {1, 2, 3}`` the
-    pair-density helpers contract through the Lorentz vertex γ̃^{μ_L}
-    instead of the identity, and ``factor_c_q`` /
-    ``solve_zeta`` switch from Cholesky to LU because the
-    transverse-channel CCT is indefinite.  See
-    ``docs/BISPINOR_DHFB_DESIGN.md`` for the math.
-
-    Workflow:
-    1. Slice pre-loaded centroid wavefunctions into left/right halves.
-    2. Compute C_q from left/right pair density via FFT.
-    3. Compute L_q = chol(C_q) using 2D blocked algorithm.
-    4. For each r-chunk:
-       a. Compute psi_nk,a(r_chunk) via FFT
-       b. Compute left/right pair densities at r-chunk
-       c. Compute Z_q via ortho FFT with left/right cross-product
-       d. Solve zeta_q = L^{-H}(L^{-1} Z_q) (q-chunked)
-       e. Write zeta_q chunk to HDF5
-
-    Args:
-        wfn: WFNReader object
-        sym: SymMaps object
-        meta: Meta object with system info
-        centroid_indices: ISDF centroid indices
-        mesh_xy: 2D device mesh
-        chunk_r: Number of flattened r-points per chunk
-        output_file: Path to output HDF5 file
-        psi_rmu_Y:  Centroid wavefunctions for the full [b0, b4) band range,
-                    shape (nk, nb_full, ns, n_rmu), P(None, None, None, 'y'),
-                    un-conjugated ψ.  Produced by
-                    :func:`common.wfn_transforms.load_centroids_band_chunked`.
-        psi_rmuT_X: Same centroid data transposed/sharded for the pair-density
-                    kernel, shape (nk, n_rmu, nb_full, ns),
-                    P(None, 'x', None, None), conjugated ψ*.  Required when
-                    ``low_mem_bands=False``; MUST be None when
-                    ``low_mem_bands=True`` (STEP 6 reads psi_nmu_fresh/
-                    psi_mun_fresh instead -- see the ``low_mem_bands``
-                    entry below).
-        band_chunk_size: Bands to process at once when FFTing wavefunctions (with global r)
-        q_chunk_size: Q-points to solve C_q @ zeta_q = Z_q simultaneously
-        bispinor: Whether to use bispinor wavefunctions.  Default False —
-                    the SCALAR/spinor charge-channel fit; every production
-                    caller passes ``cfg.bispinor`` explicitly (gw_init), so
-                    the default only decides what a forgetful new caller
-                    gets, and the four-ζ bispinor pipeline is the wrong
-                    thing to get by accident.
-        band_range_left: (start, end) for left wfns. Default: (b0, b3)
-        band_range_right: (start, end) for right wfns. Default: (b0, b4)
-        low_mem_bands: When True (``low_mem_bands`` deck key), the CCT Gram
-                    (STEP 2) AND the r-chunk loop's band contraction
-                    (STEP 6) are both built from ``psi_nmu_fresh``/
-                    ``psi_mun_fresh`` -- the two-face, all-P-sharded
-                    carrier -- instead of from any single-axis ψ copy.
-                    STEP 2 uses one distributed SUMMA GEMM
-                    (``isdf.core._c_q_face``); STEP 6 reads a
-                    ``band_chunk_size``-bounded slab per band-chunk,
-                    per r-chunk, out of ``psi_mun_fresh`` via a masked
-                    gather + ``psum('y')`` (``isdf.core._z_q_face`` --
-                    see docs/architecture/zeta_fit_face_psi_cct.md's
-                    r-chunk section for why this, not a second SUMMA GEMM,
-                    is the design).  Both ``psi_rmu_Y`` AND ``psi_rmuT_X``
-                    MUST be None in this mode (neither single-axis form is
-                    ever built or held; the caller drops both before even
-                    calling this function -- see
-                    ``gw.gw_init.prepare_isdf_and_wavefunctions``).
-                    Supports charge and monomial transverse vertices;
-                    ``band_norms`` must be None and is refused by name
-                    otherwise.  Default False:
-                    bit-identical to the pre-existing path (``psi_nmu_fresh``/
-                    ``psi_mun_fresh`` are ignored).
-        cache_psi_r: Hoist all band/grid ψ(r) coefficients once when True.
-                    False uses the same z_q kernel's streamed band-chunk
-                    ψ(G)->ψ(r_chunk) route and keeps the host staging store
-                    open through the r loop.  The memory planner selects
-                    False only when a low-memory run cannot hold the cache.
-        cache_face_y_blocks: Internal face-kernel memory-plan decision.
-                    True reuses one bounded current-r Y cache across scalar
-                    spin pairs; False repeats the canonical transform as the
-                    large-band/ns=1 fallback.  Not a frontend/env knob.
-        face_y_cache_r_tile: Planner-owned global-r width of one internal
-                    cache transaction.  Equal to ``chunk_r`` for the original
-                    full-current-r cache; a smaller exact divisor tiles only
-                    the cache while preserving the outer solve chunk.
-        psi_nmu_fresh, psi_mun_fresh: the two-face carrier (see
-                    ``gw.wavefunction_bundle``'s ``PSI_NMU_SPEC``/
-                    ``PSI_MUN_SPEC``), spanning the SAME [b0, b4) range
-                    ``psi_rmuT_X`` does.  Required when ``low_mem_bands``;
-                    ignored otherwise.
-        print_fn: Status-output sink. Drivers pass the runtime rank-zero
-                  printer so deterministic progress is emitted once.
-
-    Returns:
-        peak_bytes:  GPU high-water mark (peak_bytes_in_use) during chunk loop
-
-    The centroid wavefunctions are inputs, not outputs — the caller is
-    expected to hold the single ``load_centroids_band_chunked`` result and
-    reuse it for :func:`gw.wavefunction_bundle.parent_faces` or
-    the pre-built face carrier via
-    :func:`gw.wavefunction_bundle.wavefunctions_face_from_restart` after
-    the fit completes.
-    """
-    if low_mem_bands:
-        # vertex_mu_L != 0 (transverse channels) is SUPPORTED here as of
-        # 2026-08-23 -- isdf.core._c_q_face/_z_q_face both accept
-        # gamma_L=gamma_R=gamma_mu, mirroring the legacy branches' own
-        # convention exactly (see the STEP 2/STEP 6 call sites below).
-        # The former low_mem_bands bispinor refusal was deleted when this
-        # face path gained the transverse endpoint vertices.
-        if band_norms is not None:
-            raise NotImplementedError(
-                "fit_zeta_to_h5: low_mem_bands=True with pseudobands "
-                "(band_norms is not None) is not supported this session -- "
-                "the face CCT path (isdf.core._c_q_face) has no weighted-"
-                "norms arm.  Set low_mem_bands=false, or drop pseudobands, "
-                "for this deck.  See KNOWN_LORRAX_ISSUES.md, \"zeta-fit "
-                "face CCT: pseudobands unported\".")
-        if ((psi_nmu_fresh is None or psi_mun_fresh is None)
-                and k_unfold_plan is None):
-            raise ValueError(
-                "fit_zeta_to_h5: low_mem_bands=True requires psi_nmu_fresh="
-                " and psi_mun_fresh= (the two-face carrier) unless a "
-                "k_unfold_plan with the packed parent faces is given -- see "
-                "gw.gw_init.prepare_isdf_and_wavefunctions.")
-        if psi_rmu_Y is not None:
-            raise ValueError(
-                "fit_zeta_to_h5: low_mem_bands=True expects psi_rmu_Y=None "
-                "-- the caller drops the single-axis Y-form before calling "
-                "(its only consumer, the CCT Gram, now reads "
-                "psi_nmu_fresh/psi_mun_fresh instead).  A non-None "
-                "psi_rmu_Y here means the caller kept a single-axis copy "
-                "alive the redesign exists to avoid; fix the caller rather "
-                "than silently ignoring it.")
-        if psi_rmuT_X is not None:
-            raise ValueError(
-                "fit_zeta_to_h5: low_mem_bands=True expects psi_rmuT_X="
-                "None -- the r-chunk loop (STEP 6) now reads its band-"
-                "contraction operand out of psi_mun_fresh (the persistent "
-                "face carrier), never a resident single-axis X-form (see "
-                "docs/architecture/zeta_fit_face_psi_cct.md's r-chunk "
-                "section).  A non-None psi_rmuT_X here means the caller "
-                "kept the single-axis X-form alive past the point where "
-                "psi_mun_fresh/psi_nmu_fresh were built -- fix the caller "
-                "(gw.gw_init.prepare_isdf_and_wavefunctions) rather than "
-                "silently ignoring it.")
-    else:
-        if psi_rmu_Y is None:
-            raise ValueError(
-                "fit_zeta_to_h5: psi_rmu_Y is required when "
-                "low_mem_bands=False (the legacy CCT path reads it in "
-                "STEP 1).")
-        if psi_rmuT_X is None:
-            raise ValueError(
-                "fit_zeta_to_h5: psi_rmuT_X is required when "
-                "low_mem_bands=False (the legacy r-chunk loop reads it in "
-                "STEP 1/STEP 6).")
-
-    # Raw-parent route (``k_unfold_plan``): the CCT Gram and every Z_q tile
-    # are contracted on the WFN's raw parent rows only and transported to
-    # full k by the plan's typed, collective-free unfold
-    # (``isdf.core._c_q_face_parent`` / ``_z_q_face_parent``).  The two
-    # packed parent faces replace the full-k faces as the fit's ψ input; the
-    # full-k faces are not read here. Fixed current vertices act on the
-    # unfolded projector, with no change to the raw-parent representation.
-    parent_route = k_unfold_plan is not None
-    if parent_route:
-        if not low_mem_bands:
-            raise ValueError(
-                "fit_zeta_to_h5: k_unfold_plan requires low_mem_bands=True "
-                "(the parent faces are face-layout carriers).")
-        if psi_nmu_parent is None or psi_mun_parent is None:
-            raise ValueError(
-                "fit_zeta_to_h5: k_unfold_plan requires psi_nmu_parent= and "
-                "psi_mun_parent= (the raw-parent faces, "
-                "gw.wavefunction_bundle.parent_faces).")
-        if (int(psi_mun_parent.shape[0]) != int(k_unfold_plan.n_parent)
-                or int(psi_mun_parent.shape[2])
-                != int(k_unfold_plan.n_centroid_packed)):
-            raise ValueError(
-                "fit_zeta_to_h5: psi_mun_parent "
-                f"{tuple(psi_mun_parent.shape)} is not the plan's "
-                f"(n_parent={k_unfold_plan.n_parent}, s, "
-                f"mu_packed={k_unfold_plan.n_centroid_packed}, nb) face.")
+    """Fit canonical q-IBZ ζ from raw-parent faces and orbit-closed real-grid tiles."""
+    if k_unfold_plan is None or psi_nmu_parent is None or psi_mun_parent is None:
+        raise ValueError("fit_zeta_to_h5 requires a typed plan and both raw-parent faces.")
+    if band_norms is not None:
+        raise NotImplementedError("Raw-parent zeta fitting does not support pseudobands.")
+    if (int(psi_mun_parent.shape[0]) != int(k_unfold_plan.n_parent)
+            or int(psi_mun_parent.shape[2]) != int(k_unfold_plan.n_centroid_packed)):
+        raise ValueError("fit_zeta_to_h5: parent face extent differs from its typed plan.")
     if (_coupled_mu123_coordinator is not None
-            and (not low_mem_bands or not cache_face_y_blocks
+            and (not cache_face_y_blocks
                  or int(vertex_mu_L) not in (1, 2, 3))):
         raise ValueError(
             "fit_zeta_to_h5: the private coupled-mu123 coordinator is "
-            "transverse-only and requires low_mem_bands=True with the "
+            "transverse-only and requires the "
             "planner-selected bounded face-Y cache")
     if ((_coupled_mu123_coordinator is None)
             != (_coupled_rank_gate is None)):
@@ -507,116 +322,6 @@ def fit_zeta_to_h5(
              f"{nb_full} bands ({nb_left} left + {nb_right} right)")
     print_fn(f"  Output: {output_file}")
 
-    # ========== STEP 1: Slice pre-loaded centroid ψ into left/right halves ==========
-    with timing.section("zeta_fit.slice_halves"):
-        # Band range arithmetic — left/right are sub-ranges of [b0, b4).
-        l_band_start = band_range_left[0] - band_range_full[0]
-        l_band_end = l_band_start + nb_left
-        r_band_start = band_range_right[0] - band_range_full[0]
-        r_band_end = r_band_start + nb_right
-
-        # The X-forms are built ONLY when low_mem_bands=False.  Under
-        # low_mem_bands=True, psi_rmuT_X is None (validated above) — STEP
-        # 6 now reads its band-contraction operand directly out of
-        # psi_mun_fresh (the persistent face carrier, already resident
-        # for the whole fit) via a bounded per-band-chunk gather, never
-        # a resident single-axis X-form slice (see this function's
-        # ``low_mem_bands`` docstring and
-        # docs/architecture/zeta_fit_face_psi_cct.md's r-chunk section).
-        #
-        # The Y-forms are the CCT Gram's ONLY consumer.  Under
-        # low_mem_bands, psi_rmu_Y is None (validated above) -- STEP 2
-        # reads the face carrier (psi_nmu_fresh/psi_mun_fresh) instead, so
-        # skipping this slice is not merely dead-code elimination: it is
-        # the point of the redesign (no single-axis Y-form is EVER
-        # resident under low_mem_bands=True, not even transiently).
-        if low_mem_bands:
-            psi_l_rmuT_X = psi_r_rmuT_X = None
-            psi_l_rmu_Y = psi_r_rmu_Y = None
-            print_fn(f"  X-forms: never built (low_mem_bands: STEP 6 reads "
-                     f"psi_mun_fresh directly, one band-chunk at a time; "
-                     f"CCT reads the face carrier, STEP 2 below)")
-            if debug_print_enabled() and jax.process_index() == 0:
-                # PER-RANK BYTES, not global shape (KNOWN_LORRAX_ISSUES.md's
-                # mem_probe row: two arrays with the same GLOBAL shape print
-                # the identical figure whether one is genuinely 2-D sharded
-                # or single-axis).  Sums this rank's OWN addressable shards
-                # -- the same measurement claims/0426.md's shard-level
-                # .nbytes check used to confirm the carrier's face arrays
-                # are genuinely 2*S/(Px*Py), not a same-shape single-axis
-                # replica.
-                if psi_nmu_fresh is not None:
-                    _nmu_b = sum(int(s.data.nbytes)
-                                 for s in psi_nmu_fresh.addressable_shards)
-                    _mun_b = sum(int(s.data.nbytes)
-                                 for s in psi_mun_fresh.addressable_shards)
-                    print_fn(f"  [face carrier, per-rank bytes] psi_nmu_fresh="
-                             f"{_nmu_b/1e9:.4f} GB  psi_mun_fresh={_mun_b/1e9:.4f} "
-                             f"GB  (2*S/(Px*Py) expected)")
-                else:
-                    # Parents-only storage: the packed parent faces are the
-                    # run's only ψ, n_parent/nk of the full-k face bytes.
-                    _nmu_b = sum(int(s.data.nbytes)
-                                 for s in psi_nmu_parent.addressable_shards)
-                    _mun_b = sum(int(s.data.nbytes)
-                                 for s in psi_mun_parent.addressable_shards)
-                    print_fn(f"  [parent face carrier, per-rank bytes] "
-                             f"psi_nmu_parent={_nmu_b/1e9:.4f} GB  "
-                             f"psi_mun_parent={_mun_b/1e9:.4f} GB  "
-                             "(no full-k face resident)")
-        else:
-            # Cheap views — the caller keeps the full arrays alive for the
-            # post-fit wfn bundle build, so we don't need independent
-            # copies.
-            psi_l_rmuT_X = psi_rmuT_X[:, :, l_band_start:l_band_end, :]
-            psi_r_rmuT_X = psi_rmuT_X[:, :, r_band_start:r_band_end, :]
-            psi_l_rmu_Y = psi_rmu_Y[:, l_band_start:l_band_end, :, :]
-            psi_r_rmu_Y = psi_rmu_Y[:, r_band_start:r_band_end, :, :]
-            print_fn(f"  Left wfns:  {psi_l_rmu_Y.shape}")
-            print_fn(f"  Right wfns: {psi_r_rmu_Y.shape}")
-
-        # Pseudobands: clamp weights to ``max(1, w_n)`` and apply them to
-        # the centroid copies used for CCT.  When band_norms is None the
-        # slices are jnp.ones → the *_fit values are identical to the
-        # *_rmu_Y / *_rmuT_X copies.  See _band_norms_slice for the why.
-        # (norms_l_jax/norms_r_jax are also STEP 6 inputs in every layout
-        # -- cheap either way, so built unconditionally.)
-        norms_l_jax = _band_norms_slice(band_norms, band_range_left, nb_left)
-        norms_r_jax = _band_norms_slice(band_norms, band_range_right, nb_right)
-        # psi shapes: Y=(nk, nb, ns, n_rmu), X=(nk, n_rmu, nb, ns)
-        #
-        # band_norms is None (no pseudobands -- the common/default case,
-        # and the ONLY case low_mem_bands=True accepts -- refused above
-        # otherwise): dividing by an all-ones array is bit-identical to
-        # the dividend (IEEE754 x/1.0 == x), so the *_fit computation used
-        # to allocate a second, fully-redundant single-axis buffer beside
-        # its own source for no numerical benefit -- one of the four "ψ
-        # centroid copies" gflat_memory_model.py's psi_copies term prices,
-        # doubled again.  ALIAS instead of computing: no new device
-        # buffer, and the `del ..._fit` cleanup below still frees the
-        # shared object once both names' refcounts drop (fresh-fit
-        # low-mem psi contract; see
-        # reports/gwjax_low_mem_bands_audit_2026-08-22/report.md census row
-        # "Fresh centroid load/liveness").
-        if band_norms is None:
-            psi_l_rmuT_X_fit = psi_l_rmuT_X
-            psi_r_rmuT_X_fit = psi_r_rmuT_X
-            psi_l_rmu_Y_fit = None if low_mem_bands else psi_l_rmu_Y
-            psi_r_rmu_Y_fit = None if low_mem_bands else psi_r_rmu_Y
-        else:
-            # low_mem_bands=True refuses band_norms is not None above, so
-            # psi_l_rmu_Y/psi_r_rmu_Y are real arrays here in every branch
-            # that reaches this line.
-            psi_l_rmu_Y_fit = psi_l_rmu_Y / norms_l_jax[None, :, None, None]
-            psi_l_rmuT_X_fit = psi_l_rmuT_X / norms_l_jax[None, None, :, None]
-            psi_r_rmu_Y_fit = psi_r_rmu_Y / norms_r_jax[None, :, None, None]
-            psi_r_rmuT_X_fit = psi_r_rmuT_X / norms_r_jax[None, None, :, None]
-        if band_norms is not None:
-            n_weighted = int(np.sum(band_norms > 1.01))
-            n_zero = int(np.sum(band_norms < 1e-10))
-            print_fn(f"  Pseudobands normalization: {n_weighted} weighted, "
-                     f"{n_zero} zero-weight (skipped)")
-
     # ========== STEP 2: Compute CCT (C_q) from left/right pair densities ==========
     # γ̃^0 = I_4 → vertex_mu_L=0 is the standard spin-traced path.  For
     # vertex_mu_L ∈ {1,2,3} the γ̃^μ vertex is folded into both P_l and
@@ -629,19 +334,6 @@ def fit_zeta_to_h5(
     # uses an SVD pseudoinverse with rcond cutoff to drop those null
     # modes instead of inverting through them — the unique min-norm LSQ
     # solution.
-    # (A ``vertex_mu_L != 0`` warm-import of ``common.gamma_matrices`` used to
-    # sit here.  Its stated reason was that module's
-    # ``gammas_sparse = [_to_sparse(g) for g in gammas]``, whose ``jnp.nonzero``
-    # has a data-dependent output shape and so raises ConcretizationTypeError
-    # if its first evaluation happens inside a jit trace.  ``gammas_sparse``
-    # was dead — defined and never read anywhere in the tree — and was deleted
-    # in the 2026-08-09 import audit, taking the hazard with it.  Nothing left
-    # in that module's body is trace-hostile: the remaining constants are
-    # ``jnp.asarray`` of numpy tables.  The line was also already inert here,
-    # because this file imports ``common.gamma_matrices`` at module scope
-    # (``_gamma_perm_phase_mu``, top of file), so the module was fully
-    # imported long before this function ran.)
-
     # ── Finalize write_ibz_only BEFORE any IBZ slicing (bug fix) ─────────
     # The IBZ cascade slices C_q/L_q to IBZ rows in STEP 2/3 below, and
     # slices Z_q to IBZ inside the per-r-chunk kernel; the two MUST agree.
@@ -700,120 +392,33 @@ def fit_zeta_to_h5(
         chan_label = ("charge γ̃^0=I" if vertex_mu_L == 0
                       else f"transverse γ̃^{vertex_mu_L}")
         print_fn(f"  Computing C_q via shard_map pipeline (open-spin, {chan_label})")
-        if low_mem_bands:
-            # Face path (report gwjax_low_mem_bands_audit_2026-08-22,
-            # docs/architecture/zeta_fit_face_psi_cct.md): the band
-            # contraction is a distributed SUMMA GEMM over the FULL
-            # [b0, b4) face carrier, band-WEIGHTED (not sliced) to the L/R
-            # window -- see isdf.core._c_q_face's docstring for why this
-            # sidesteps the sigma-window edge's (band_range_left[1],
-            # generally not mesh-divisible) own pad requirement.  ONE
-            # plan serves both P_l and P_r (mirrors greens_function_
-            # kernel._build_G_face's g_plan reuse across Gv/Gc).
-            with timing.section("zeta_fit.CCT.face_gemm_plan"):
-                from distrib_la import gemm_plan as _gemm_plan
-                # Face extents from whichever pair the fit reads: the packed
-                # parent faces on the parent route (the full-k faces may not
-                # exist at all), the fresh full-k faces otherwise.
-                _face_l, _face_r = (
-                    (psi_mun_parent, psi_nmu_parent) if parent_route
-                    else (psi_mun_fresh, psi_nmu_fresh))
-                _ns_face = int(_face_l.shape[1])
-                _nb_face = int(_face_l.shape[3])
-                if int(_face_r.shape[1]) != _nb_face:
-                    raise ValueError(
-                        f"fit_zeta_to_h5(low_mem_bands=True): psi_mun "
-                        f"band extent {_nb_face} != psi_nmu's "
-                        f"{int(_face_r.shape[1])}.")
-                if int(_face_r.shape[2]) != _ns_face:
-                    raise ValueError(
-                        f"fit_zeta_to_h5(low_mem_bands=True): psi_mun "
-                        f"spin extent {_ns_face} != psi_nmu's "
-                        f"{int(_face_r.shape[2])}.")
-                # GEMM-seam merge folds (s, μ) into ONE axis of size μ*ns
-                # (common.contract_bands.merge_spin_centroid) -- m/n must
-                # match that merged extent, exactly as
-                # greens_function_kernel's own g_plan does
-                # (``gemm_plan(mesh_xy, m=n_rmu*ns, k=nb_full, n=n_rmu*ns,
-                # ...)``).  Missing the ``*ns`` factor here is caught
-                # loudly by gemm_plan's own operand-shape check (a
-                # ValueError, not a silent wrong contraction) whenever
-                # ns > 1 -- verified 2026-08-22 on the MoS2 k6_c50 spinor
-                # deck (ns=2): "gemm_plan A: expected shape (36, 676, 76);
-                # got (36, 1352, 76)".
-                if parent_route:
-                    # Parent contraction: the GEMM runs on n_parent rows
-                    # over the plan's packed (per-owner padded) centroid
-                    # extent; the unfold and one canonical restore follow
-                    # inside _c_q_face_parent.
-                    _mu_gemm = int(k_unfold_plan.n_centroid_packed)
-                    _nq_gemm = int(k_unfold_plan.n_parent)
-                else:
-                    _mu_gemm = n_rmu_padded
-                    _nq_gemm = nk_tot
-                _face_gemm = _gemm_plan(
-                    mesh_xy, m=_mu_gemm * _ns_face, k=_nb_face,
-                    n=_mu_gemm * _ns_face,
-                    nq=_nq_gemm, dtype=jnp.complex128)
-                print_fn(f"  {_face_gemm.describe()}")
-                # Band-window WEIGHTS over the array's own [band_range_full)
-                # extent (matching STEP 1's l_band_start/r_band_start
-                # offset exactly -- psi_mun_fresh/psi_nmu_fresh are the
-                # SAME band indexing as psi_rmuT_X, just conj+transposed).
-                # Zero-weighted bands contribute EXACTLY zero to the band
-                # sum (bilinear in ψ); any trailing bands beyond
-                # band_range_full's own span (possible under zeta_nband
-                # narrowing) are zero in BOTH weights, contributing
-                # nothing regardless of nb_face's exact extent.
-                _off = int(band_range_full[0])
-                _idx = np.arange(_nb_face)
-                _w_l_np = np.where(
-                    (_idx >= band_range_left[0] - _off)
-                    & (_idx < band_range_left[1] - _off), 1.0, 0.0)
-                _w_r_np = np.where(
-                    (_idx >= band_range_right[0] - _off)
-                    & (_idx < band_range_right[1] - _off), 1.0, 0.0)
-                weight_l_face = jnp.asarray(_w_l_np, dtype=jnp.float64)
-                weight_r_face = jnp.asarray(_w_r_np, dtype=jnp.float64)
-            # gamma_mu_face: None for the charge channel, the SAME
-            # (perm, phase) tuple passed as BOTH gamma_L and gamma_R for
-            # a transverse channel -- identical convention to the legacy
-            # `else` branch below (isdf.core._c_q_face's own docstring,
-            # "γ̃ VERTEX", derives why one endpoint transform per field
-            # reproduces gamma_double_contract's P_r-only application).
-            gamma_mu_face = (
-                None if vertex_mu_L == 0 else _gamma_perm_phase_mu(vertex_mu_L))
-            if parent_route:
-                print_fn(
-                    f"  C_q on raw parents: {k_unfold_plan.n_parent} parent "
-                    f"k rows -> {nk_tot} full k by the typed unfold "
-                    f"(packed centroids {k_unfold_plan.n_centroid_packed}, "
-                    f"canonical {n_rmu_padded})")
-                C_q = c_q_from_psi_sm(
-                    kgrid=kgrid, mesh_xy=mesh_xy, layout='face',
-                    psi_mun=psi_mun_parent, psi_nmu=psi_nmu_parent,
-                    weight_l=weight_l_face, weight_r=weight_r_face,
-                    gemm=_face_gemm, k_unfold_plan=k_unfold_plan,
-                    gamma_L=int(vertex_mu_L), gamma_R=int(vertex_mu_L))
-            else:
-                C_q = c_q_from_psi_sm(
-                    kgrid=kgrid, mesh_xy=mesh_xy, layout='face',
-                    psi_mun=psi_mun_fresh, psi_nmu=psi_nmu_fresh,
-                    gamma_L=gamma_mu_face, gamma_R=gamma_mu_face,
-                    weight_l=weight_l_face, weight_r=weight_r_face,
-                    gemm=_face_gemm)
-        elif vertex_mu_L == 0:
-            C_q = c_q_from_psi_sm(
-                psi_l_rmuT_X_fit, psi_l_rmu_Y_fit,
-                psi_r_rmuT_X_fit, psi_r_rmu_Y_fit,
-                kgrid=kgrid, mesh_xy=mesh_xy)
-        else:
-            gamma_mu = _gamma_perm_phase_mu(vertex_mu_L)
-            C_q = c_q_from_psi_sm(
-                psi_l_rmuT_X_fit, psi_l_rmu_Y_fit,
-                psi_r_rmuT_X_fit, psi_r_rmu_Y_fit,
-                gamma_mu, gamma_mu,
-                kgrid=kgrid, mesh_xy=mesh_xy)
+        with timing.section("zeta_fit.CCT.face_gemm_plan"):
+            from distrib_la import gemm_plan as _gemm_plan
+            _ns_face, _nb_face = int(psi_mun_parent.shape[1]), int(psi_mun_parent.shape[3])
+            if (int(psi_nmu_parent.shape[1]) != _nb_face
+                    or int(psi_nmu_parent.shape[2]) != _ns_face):
+                raise ValueError("fit_zeta_to_h5: parent face band/spin extents differ.")
+            _mu_gemm = int(k_unfold_plan.n_centroid_packed)
+            _face_gemm = _gemm_plan(
+                mesh_xy, m=_mu_gemm * _ns_face, k=_nb_face,
+                n=_mu_gemm * _ns_face, nq=int(k_unfold_plan.n_parent),
+                dtype=jnp.complex128)
+            print_fn(f"  {_face_gemm.describe()}")
+            _off = int(band_range_full[0])
+            _idx = np.arange(_nb_face)
+            weight_l_face = jnp.asarray(np.where(
+                (_idx >= band_range_left[0] - _off)
+                & (_idx < band_range_left[1] - _off), 1.0, 0.0), dtype=jnp.float64)
+            weight_r_face = jnp.asarray(np.where(
+                (_idx >= band_range_right[0] - _off)
+                & (_idx < band_range_right[1] - _off), 1.0, 0.0), dtype=jnp.float64)
+        print_fn(f"  C_q on raw parents: {k_unfold_plan.n_parent} -> {nk_tot} k rows")
+        C_q = c_q_from_psi_sm(
+            kgrid=kgrid, mesh_xy=mesh_xy, layout='face',
+            psi_mun=psi_mun_parent, psi_nmu=psi_nmu_parent,
+            weight_l=weight_l_face, weight_r=weight_r_face,
+            gemm=_face_gemm, k_unfold_plan=k_unfold_plan,
+            gamma_L=int(vertex_mu_L), gamma_R=int(vertex_mu_L))
         # C_q: (nqx, nqy, nqz, n_rmu_padded, n_rmu_padded) with zero
         # pad rows/cols.
 
@@ -867,43 +472,7 @@ def fit_zeta_to_h5(
         # pure row selection, so the selected values are unchanged.
         C_q_flat.block_until_ready()
 
-    # Fresh-fit low-mem psi contract (low_mem_bands census row "Fresh
-    # centroid load/liveness"; report gwjax_low_mem_bands_audit_2026-08-22).
-    # The Y-form centroid copies (mu on 'y', single-axis-sharded, bands
-    # replicated -- psi_{l,r}_rmu_Y[_fit]) were consumed ONLY by the CCT
-    # contraction just above.  Neither Cholesky (STEP 3, reads C_q_flat,
-    # not psi) nor the r-chunk loop (STEP 6, fit_one_rchunk reads only
-    # psi_{l,r}_rmuT_X_fit) touches them again.  Left alive, they used to
-    # sit as dead Python references for the whole Stage-C r-chunk loop --
-    # gflat_memory_model._persistent_bytes's "psi_copies" term prices
-    # exactly this (2 Y-form + 2 X-form single-axis copies) as resident
-    # for every stage, Stage C included.  Free them HERE, before that loop
-    # opens, dropping Stage C's own psi floor to the two X-forms alone.
-    # The base (pre-normalization) X arrays are ALSO superseded once
-    # *_fit exists (band_norms is not None: a real second copy; band_norms
-    # is None: an alias of the same object per STEP 1 above, so this
-    # second `del` is a no-op refcount drop, not a second free) --
-    # deleting both names is what actually reaches zero refcount.
-    #
-    # low_mem_bands=True: psi_l_rmu_Y/psi_r_rmu_Y/*_fit AND
-    # psi_l_rmuT_X/psi_r_rmuT_X are already None (STEP 1 never built
-    # them -- CCT read the face carrier instead, and STEP 6 below reads
-    # psi_mun_fresh directly), so these two ``del``s are no-op name
-    # drops for that half.  The face GEMM PLAN is a real per-call object
-    # worth freeing here (it holds a cuBLASMp communicator + two
-    # compiled executables; CCT runs once per fit, so nothing downstream
-    # reuses it) -- but ``weight_l_face``/``weight_r_face`` are NOT
-    # freed: STEP 6's per-band-chunk gather (``isdf.core._z_q_face``)
-    # reuses them unchanged (same L/R window, same band_range_full
-    # indexing), and they are two tiny (nb_face,) float64 vectors, not
-    # worth rebuilding.  psi_mun_fresh/psi_nmu_fresh are NOT touched:
-    # they are the caller's own permanent face bundle
-    # (Wavefunctions.psi_mun/psi_nmu after this call returns), not a
-    # fit-local intermediate.
-    del psi_l_rmu_Y, psi_r_rmu_Y, psi_l_rmu_Y_fit, psi_r_rmu_Y_fit
-    del psi_l_rmuT_X, psi_r_rmuT_X
-    if low_mem_bands:
-        del _face_gemm
+    del _face_gemm
     gc.collect()
 
     # ========== STEP 3: Compute L_q from CCT ==========
@@ -1404,34 +973,32 @@ def fit_zeta_to_h5(
         # Parent route: the r-chunk kernel contracts on the WFN's raw rows
         # and never needs a full-k ψ(G) or ψ(r); the store is 1/(nk/n_parent)
         # of its full-k size and so is the hoisted ψ(r) cache below.
-        k_domain=('ibz' if parent_route else 'full_bz'),
+        k_domain="ibz",
     )
     # The parent route streams orbit-closed real-grid TILES, not contiguous
     # slabs; every tile has one static width <= the planner's chunk_r, so the
     # priced r extent still bounds each Z_q/solve transient.
-    real_grid_tiles = None
-    if parent_route:
-        real_grid_tiles = k_unfold_plan.real_grid_tiles(
-            target_width=int(chunk_r))
-        num_chunks = int(real_grid_tiles.n_tiles)
-        n_rchunk = int(real_grid_tiles.width)
-        if n_rchunk > int(chunk_r):
-            # A tile holds whole real-space orbits on each Y owner, so its
-            # width is bounded below by n_y x the largest orbit.  When the
-            # planner's chunk_r sits under that floor the tiles are WIDER
-            # than what was priced: say so, loudly, rather than OOM in
-            # silence (planner floor: KNOWN_LORRAX_ISSUES 2026-09-05).
-            print_fn(
-                f"  *** LORRAX SANITY: orbit-closed r tiles are {n_rchunk} "
-                f"slots wide but the memory plan priced chunk_r = "
-                f"{int(chunk_r)}; the Z_q / solve / zeta chunk live set is "
-                f"{n_rchunk / max(1, int(chunk_r)):.2f}x the planned one. ***")
+    real_grid_tiles = k_unfold_plan.real_grid_tiles(
+        target_width=int(chunk_r))
+    num_chunks = int(real_grid_tiles.n_tiles)
+    n_rchunk = int(real_grid_tiles.width)
+    if n_rchunk > int(chunk_r):
+        # A tile holds whole real-space orbits on each Y owner, so its
+        # width is bounded below by n_y x the largest orbit.  When the
+        # planner's chunk_r sits under that floor the tiles are WIDER
+        # than what was priced: say so, loudly, rather than OOM in
+        # silence (planner floor: KNOWN_LORRAX_ISSUES 2026-09-05).
         print_fn(
-            f"  Z_q on raw parents: {k_unfold_plan.n_parent} parent k rows "
-            f"-> {nk_tot} full k by the typed unfold on {num_chunks} "
-            f"orbit-closed real-grid tiles x {n_rchunk} slots "
-            f"(planned chunk_r {int(chunk_r)}; pad slots "
-            f"{num_chunks * n_rchunk - n_rtot})")
+            f"  *** LORRAX SANITY: orbit-closed r tiles are {n_rchunk} "
+            f"slots wide but the memory plan priced chunk_r = "
+            f"{int(chunk_r)}; the Z_q / solve / zeta chunk live set is "
+            f"{n_rchunk / max(1, int(chunk_r)):.2f}x the planned one. ***")
+    print_fn(
+        f"  Z_q on raw parents: {k_unfold_plan.n_parent} parent k rows "
+        f"-> {nk_tot} full k by the typed unfold on {num_chunks} "
+        f"orbit-closed real-grid tiles x {n_rchunk} slots "
+        f"(planned chunk_r {int(chunk_r)}; pad slots "
+        f"{num_chunks * n_rchunk - n_rtot})")
 
     # Hoist the full-grid ψ(G)->ψ(r) transforms when the memory plan admits
     # the cache.  Otherwise retain the SAME host staging store and let the
@@ -1453,7 +1020,7 @@ def fit_zeta_to_h5(
                      f"{_cache_local_bytes / 1e9:.2f} GB local")
         # Every io_callback has drained.  Release the host coefficient tiles,
         # but retain the store-owned box index and k vectors consumed by the
-        # cached face/legacy kernel ABI until the final close below.
+        # parent kernel metadata until the final close below.
         psi_G_store.release_host_tiles()
     elif jax.process_index() == 0:
         print_fn("  ψ(r) cache: disabled by the low-memory plan; streaming "
@@ -1510,9 +1077,6 @@ def fit_zeta_to_h5(
     r_progress = LoopProgress(
         num_chunks, print_fn, title="zeta fitting",
         item_name="r-chunk", max_updates=min(num_chunks, 20)).start()
-
-    # norms_l_jax / norms_r_jax were built in STEP 1 above — reuse them
-    # as the uniform-shape (nb,) inputs to the fit_one_rchunk jit.
 
     # ---- G-flat accumulator (zero-init, μ-sharded) ----
     # Persistent buffer: (n_q_disk, n_rmu_padded, ngkmax) c128 with
@@ -1624,45 +1188,29 @@ def fit_zeta_to_h5(
         for chunk_idx in range(num_chunks):
             _tile_args = {}
             _tile_r_indices_dev = None
-            if parent_route:
-                # One orbit-closed tile: its slot table and source maps are
-                # runtime operands of the one compiled kernel.  Pad slots
-                # (-1) become the G-flat scatter's drop sentinel n_rtot.
-                _tile_row = np.asarray(real_grid_tiles.r_index[chunk_idx])
-                _tile_perm, _tile_wraps = real_grid_tiles.source_tables(
-                    chunk_idx)
-                _rep = NamedSharding(mesh_xy, P())
-                _tile_args = dict(
-                    k_unfold_plan=k_unfold_plan,
-                    tile_r_index=_device_put_process_local(
-                        _tile_row.astype(np.int32), _rep),
-                    tile_local_perm=_device_put_process_local(
-                        _tile_perm.astype(np.int32), _rep),
-                    tile_wraps=_device_put_process_local(
-                        _tile_wraps.astype(np.int32), _rep),
-                )
-                # Each pad slot gets its OWN out-of-range sentinel so the
-                # scatter's unique-index promise holds with mode='drop'.
-                _tile_r_indices_dev = _device_put_process_local(
-                    np.where(
-                        _tile_row >= 0, _tile_row,
-                        n_rtot + np.arange(_tile_row.size)).astype(np.int32),
-                    _rep)
-                r_start = 0
-                r_end = n_rtot
-                logical_n_rchunk = actual_n_rchunk = int(real_grid_tiles.width)
-            else:
-                r_start = chunk_idx * chunk_r
-                r_end = min(r_start + chunk_r, n_rtot)
-                logical_n_rchunk = r_end - r_start
-                # Z shards r over mesh axis 'y' in both layouts, so its static
-                # width must divide p_y.  Only the carrier is rounded: the
-                # canonical r-slice zero-fills cells beyond the physical grid,
-                # the solve carries those inert RHS columns, and the slice below
-                # restores the exact logical slab before G-flat accumulation.
-                actual_n_rchunk = padded_axis(
-                    logical_n_rchunk, mesh_xy, name="zeta-fit real-space chunk",
-                    spec=P(None, None, "y"), axis=2).carrier
+            _tile_row = np.asarray(real_grid_tiles.r_index[chunk_idx])
+            _tile_perm, _tile_wraps = real_grid_tiles.source_tables(
+                chunk_idx)
+            _rep = NamedSharding(mesh_xy, P())
+            _tile_args = dict(
+                k_unfold_plan=k_unfold_plan,
+                tile_r_index=_device_put_process_local(
+                    _tile_row.astype(np.int32), _rep),
+                tile_local_perm=_device_put_process_local(
+                    _tile_perm.astype(np.int32), _rep),
+                tile_wraps=_device_put_process_local(
+                    _tile_wraps.astype(np.int32), _rep),
+            )
+            # Each pad slot gets its OWN out-of-range sentinel so the
+            # scatter's unique-index promise holds with mode='drop'.
+            _tile_r_indices_dev = _device_put_process_local(
+                np.where(
+                    _tile_row >= 0, _tile_row,
+                    n_rtot + np.arange(_tile_row.size)).astype(np.int32),
+                _rep)
+            r_start = 0
+            r_end = n_rtot
+            logical_n_rchunk = actual_n_rchunk = int(real_grid_tiles.width)
 
             _dbg_rchunk = debug_print_enabled()
             _rss0 = _host_rss_gb() if _dbg_rchunk else 0.0
@@ -1671,8 +1219,6 @@ def fit_zeta_to_h5(
             _prebuilt_zeta = None
             if _coupled_mu123_coordinator is not None:
                 def _build_coupled_Z_q():
-                    if not parent_route:
-                        raise ValueError("Coupled current zeta requires raw parent wavefunctions")
                     return _z_q_face_parent(
                         psi_mun_parent, psi_G_store, psi_r_cache,
                         weight_l_face, weight_r_face,
@@ -1733,11 +1279,7 @@ def fit_zeta_to_h5(
                     zeta_chunk = fit_one_rchunk(
                         psi_G_store=psi_G_store,
                         psi_r_cache=psi_r_cache,
-                        psi_l_rmuT_X_fit=psi_l_rmuT_X_fit,
-                        psi_r_rmuT_X_fit=psi_r_rmuT_X_fit,
                         L_q=L_q,
-                        norms_l=norms_l_jax,
-                        norms_r=norms_r_jax,
                         r_start_dyn=jnp.asarray(r_start, dtype=jnp.int32),
                         mesh_xy=mesh_xy,
                         meta=meta,
@@ -1755,12 +1297,10 @@ def fit_zeta_to_h5(
                         zeta_gather=_resolved_zeta_gather,
                         lu_piv=lu_piv,
                         distrib_la_batched_route=distrib_la_batched_route,
-                        layout=('face' if low_mem_bands else 'legacy'),
-                        psi_mun=(psi_mun_parent if parent_route
-                                 else psi_mun_fresh if low_mem_bands
-                                 else None),
-                        weight_l=(weight_l_face if low_mem_bands else None),
-                        weight_r=(weight_r_face if low_mem_bands else None),
+                        layout="face",
+                        psi_mun=psi_mun_parent,
+                        weight_l=weight_l_face,
+                        weight_r=weight_r_face,
                         cache_face_y_blocks=bool(cache_face_y_blocks),
                         face_y_cache_r_tile=int(face_y_cache_r_tile),
                         _prebuilt_Z_q=_prebuilt_Z_q,
@@ -1795,7 +1335,7 @@ def fit_zeta_to_h5(
                 gflat_acc = accumulate_rchunk_to_gflat(
                     rchunk=zeta_chunk, gflat_acc=gflat_acc,
                     fft_grid=meta.fft_grid,
-                    r0=(None if parent_route else r_start),
+                    r0=None,
                     r_indices=_tile_r_indices_dev,
                     sphere_idx=_gflat_sphere_idx_padded,
                     qvec_frac=_q_irr_frac_dev,

@@ -696,3 +696,8 @@ GW tau and static-limit spatial factories require the typed parent plan and cano
 ### 2026-09-06 — head attribution is opt-in
 
 The existing `sigma_freq_debug_output` switch alone enables head-attribution diagnostics and their output. Physical Γ completion is independent of that switch. Each enabled Lorentz-block contraction reuses its body Green function for the Γ-only attribution, retaining one full-q interaction at a time. This follows the final parent-route plan §7 performance ruling.
+
+
+### 2026-09-06 — fresh GW fits require raw parents
+
+`fit_zeta_to_h5` accepts only the typed parent plan and its two packed faces; full-k/single-axis fit operands and `low_mem_bands` dispatch are removed from the fit API. Charge reuse may omit fit-time inputs because it skips the fit. Shared downfold Cq and BSE/htransform Galerkin services remain separate. The outer `gw_jax.zeta_fit_transverse` interval measures current-fit wall time without summing overlapping channel timers.

@@ -846,9 +846,7 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 		None, None, enk_full=enk, slices=band_slices, mesh_xy=mesh_xy)
 	carrier = build_packed_parent_green_carrier(
 		wfns, nmu, mun, plan=plan, mesh_xy=mesh_xy)
-	return dict(psi_rmu_Y=psi_y, psi_rmuT_X=psi_x, meta=meta_T,
-	            centroid_indices=cent_T_idx, psi_nmu_fresh=nmu,
-	            psi_mun_fresh=mun, green_parent=carrier)
+	return dict(meta=meta_T, centroid_indices=cent_T_idx, green_parent=carrier)
 
 
 def resolve_zeta_fit_edge(band_slices, zeta_nband):
@@ -1972,43 +1970,10 @@ def _select_coupled_mu123_route(*, requested_route, base_hwm_bytes,
 
 
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
-             psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print,
-             psi_nmu_fresh=None, psi_mun_fresh=None,
+             chunks, print_fn=print,
              zeta_contract=None,
              k_unfold_plan=None, psi_nmu_parent=None, psi_mun_parent=None):
-	"""Fit ISDF interpolation vectors ζ and write to HDF5.
-
-	The caller supplies (a) the full-range centroid wavefunctions
-	(``psi_rmu_Y`` / ``psi_rmuT_X``, spanning [b0, b4) as returned by
-	``load_centroids_band_chunked``) and (b) the chunk plan dict from
-	:func:`gw.gflat_memory_model.plan_gflat_chunks`.  ``chunks`` may be
-	``None`` only when ``zeta_contract`` carries a completed canonical charge
-	reuse verdict, in which case no charge-fit planner state is consumed.
-	Transverse channels have independent reuse verdicts and use their own
-	channel-sized plan only when at least one must be fit.  Returns
-	``(zeta_h5_path, mem_est, transverse_wfn_data)``.
-
-	``psi_nmu_fresh``/``psi_mun_fresh``: the two-face carrier, required
-	(and BOTH ``psi_rmu_Y`` and ``psi_rmuT_X`` expected ``None``) when
-	``cfg.memory.low_mem_bands`` — see ``prepare_isdf_and_wavefunctions``,
-	which builds them right after the fresh load and drops both
-	single-axis copies before calling here (neither has a consumer left:
-	the CCT Gram build and the r-chunk loop's band contraction both read
-	the face carrier — see ``isdf.core._c_q_face``/``_z_q_face`` and
-	docs/architecture/zeta_fit_face_psi_cct.md).  Forwarded to the
-	charge-channel ``fit_zeta_to_h5`` call below.  The bispinor
-	transverse-channel calls build their OWN face carrier
-	(``psi_mun_fresh_T``/``psi_nmu_fresh_T``, from the transverse
-	centroid load, same ``PSI_MUN_SPEC``/``PSI_NMU_SPEC`` build path —
-	2026-08-23) rather than reusing this function's own
-	``psi_nmu_fresh``/``psi_mun_fresh`` parameters, since the two
-	centroid sets (charge μ, transverse μ_T) are different arrays.
-
-	``k_unfold_plan``/``psi_nmu_parent``/``psi_mun_parent``: the raw-parent
-	route for the CHARGE fit (``isdf.core._z_q_face_parent``): the plan's
-	packed parent faces are the fit's only ψ input and the full-k faces are
-	not read by the fit.  ``None`` keeps the established full-k face fit.
-	"""
+	"""Fit missing charge/current ζ channels from their typed parents, preserving independent reuse."""
 	from gw.isdf_fitting import fit_zeta_to_h5
 	from common.gamma_matrices import set_gamma_contract_mode
 	representation = resolve_four_current_representation(
@@ -2247,7 +2212,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				wfn=wfn, sym=sym, meta=meta,
 				centroid_indices=centroid_indices, mesh_xy=mesh_xy,
 				chunk_r=chunks['chunk_r'], output_file=zeta_h5_path,
-				psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
 				band_chunk_size=chunks['band_chunk'],
 				q_chunk_size=chunks['q_chunk'],
 				bispinor=bool(int(meta.nspinor) == 4),
@@ -2270,9 +2234,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				write_ibz_only=_write_ibz_only_charge,
 				zeta_cutoff_ry=_zeta_cutoff,
 				print_fn=print_fn,
-				low_mem_bands=True,
-				psi_nmu_fresh=psi_nmu_fresh,
-				psi_mun_fresh=psi_mun_fresh,
 				bispinor_lift=(representation.charge_lift or "raw"),
 				k_unfold_plan=k_unfold_plan,
 				psi_nmu_parent=psi_nmu_parent,
@@ -2426,25 +2387,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 				_chunks_T['centroid_k_chunk']
 				if _chunks_T is not None
 				else zeta_contract.loader_k_chunk))
-		psi_curr_rmu_Y = transverse_wfn_data['psi_rmu_Y']
-		psi_curr_rmuT_X = transverse_wfn_data['psi_rmuT_X']
-
-		# low_mem_bands = true: _transverse_wfn_data already converted
-		# psi_curr_rmu_Y/psi_curr_rmuT_X to the two-face carrier internally
-		# (SAME PSI_MUN_SPEC/PSI_NMU_SPEC build path the charge channel
-		# uses, not a fork) and set them to None -- ONE call site owns the
-		# conversion so this branch and the ζ-reuse early return
-		# (gw_init.fit_zeta's own "REUSING the existing ζ" path, which
-		# also calls _transverse_wfn_data) get an identically-built face
-		# carrier rather than each converting it their own way.  Just
-		# read the two fields back out here.
-		psi_mun_fresh_T = transverse_wfn_data['psi_mun_fresh']
-		psi_nmu_fresh_T = transverse_wfn_data['psi_nmu_fresh']
 		parent_T = transverse_wfn_data['green_parent']
-		print_fn("  [bispinor] ψ_T face conversion (low_mem_bands): "
-		         "psi_nmu_T/psi_mun_T built from the transverse "
-		         "centroid load; both single-axis copies dropped "
-		         "before the ζ_T fit.")
 
 		# Per-channel cache hygiene.  The 2026-05-04 bispinor branch needed
 		# ``jax.clear_caches()`` here because the original ζ-fit cached
@@ -2490,13 +2433,9 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					centroid_indices=cents_curr_idx,
 					mesh_xy=mesh_xy,
 					chunk_r=_chunks_T['chunk_r'], output_file=zeta_mu_path,
-					psi_rmu_Y=psi_curr_rmu_Y, psi_rmuT_X=psi_curr_rmuT_X,
-					low_mem_bands=True,
-					psi_mun_fresh=psi_mun_fresh_T,
-					psi_nmu_fresh=psi_nmu_fresh_T,
-					k_unfold_plan=(None if parent_T is None else parent_T.plan),
-					psi_nmu_parent=(None if parent_T is None else parent_T.psi_nmu),
-					psi_mun_parent=(None if parent_T is None else parent_T.psi_mun),
+					k_unfold_plan=parent_T.plan,
+					psi_nmu_parent=parent_T.psi_nmu,
+					psi_mun_parent=parent_T.psi_mun,
 					band_chunk_size=_chunks_T['band_chunk'],
 					q_chunk_size=_chunks_T['q_chunk'],
 					bispinor=True,
@@ -2560,53 +2499,54 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			if coordinator is not None:
 				coordinator.finish_channel(mu_L)
 
-		if _coupled_mu123_enabled:
-			print_fn(
-				"  [bispinor] coupled μ_L=1,2,3 transverse Zq: one "
-				"shared face transform per r chunk; the three solves, write, and "
-				"provenance remain ordered μ_L=1→2→3")
-			_drop_traced_caches()
-			_coordinator = _CoupledMu123ZqCoordinator()
-			_errors = {}
-			_errors_lock = threading.Lock()
+		with timing.section("gw_jax.zeta_fit_transverse"):
+			if _coupled_mu123_enabled:
+				print_fn(
+					"  [bispinor] coupled μ_L=1,2,3 transverse Zq: one "
+					"shared face transform per r chunk; the three solves, write, and "
+					"provenance remain ordered μ_L=1→2→3")
+				_drop_traced_caches()
+				_coordinator = _CoupledMu123ZqCoordinator()
+				_errors = {}
+				_errors_lock = threading.Lock()
 
-			def _run_coupled_channel(mu_L):
+				def _run_coupled_channel(mu_L):
+					try:
+						_fit_transverse_channel(mu_L, _coordinator)
+					except BaseException as exc:
+						with _errors_lock:
+							_errors.setdefault(mu_L, exc)
+						_coordinator.abort(exc)
+
+				_threads = []
+				_setup_exc = None
 				try:
-					_fit_transverse_channel(mu_L, _coordinator)
+					# Starting each successor only after its predecessor has
+					# reached the r-loop keeps all preparation collectives in the
+					# exact accepted μ order on every process.
+					for mu_L in (1, 2, 3):
+						_thread = threading.Thread(
+							target=_run_coupled_channel, args=(mu_L,),
+							name=f"lorrax-zq-mu{mu_L}", daemon=False)
+						_thread.start()
+						_threads.append(_thread)
+						_coordinator.wait_channel_prepared(mu_L)
+					_coordinator.release_channels()
 				except BaseException as exc:
-					with _errors_lock:
-						_errors.setdefault(mu_L, exc)
+					_setup_exc = exc
 					_coordinator.abort(exc)
-
-			_threads = []
-			_setup_exc = None
-			try:
-				# Starting each successor only after its predecessor has
-				# reached the r-loop keeps all preparation collectives in the
-				# exact accepted μ order on every process.
+				finally:
+					for _thread in _threads:
+						_thread.join()
+				if _errors:
+					raise _errors[min(_errors)]
+				if _setup_exc is not None:
+					raise _setup_exc
+			else:
 				for mu_L in (1, 2, 3):
-					_thread = threading.Thread(
-						target=_run_coupled_channel, args=(mu_L,),
-						name=f"lorrax-zq-mu{mu_L}", daemon=False)
-					_thread.start()
-					_threads.append(_thread)
-					_coordinator.wait_channel_prepared(mu_L)
-				_coordinator.release_channels()
-			except BaseException as exc:
-				_setup_exc = exc
-				_coordinator.abort(exc)
-			finally:
-				for _thread in _threads:
-					_thread.join()
-			if _errors:
-				raise _errors[min(_errors)]
-			if _setup_exc is not None:
-				raise _setup_exc
-		else:
-			for mu_L in (1, 2, 3):
-				if not _reuse_T[mu_L - 1]:
-					_drop_traced_caches()
-				_fit_transverse_channel(mu_L)
+					if not _reuse_T[mu_L - 1]:
+						_drop_traced_caches()
+					_fit_transverse_channel(mu_L)
 
 	return zeta_h5_path, mem_est, transverse_wfn_data
 
@@ -3232,7 +3172,6 @@ def prepare_isdf_and_wavefunctions(
 			from .wavefunction_bundle import parent_faces
 			_parent_green_faces = parent_faces(parent_y, parent_x, mesh_xy=mesh_xy)
 			del parent_y, parent_x
-			psi_rmu_Y = psi_rmuT_X = psi_nmu_fresh = psi_mun_fresh = None
 			print0("  ψ storage: parents only -- "
 			       f"{_candidate_plan.n_parent} raw WFN parents, "
 			       f"{_candidate_plan.n_full} full k rows through typed transport.")
@@ -3240,8 +3179,7 @@ def prepare_isdf_and_wavefunctions(
 			zeta_path, mem_est, transverse_wfn_data = fit_zeta(
 				wfn, sym, meta, centroid_indices, mesh_xy,
 				cfg, band_slices, tmp_dir,
-				psi_rmu_Y, psi_rmuT_X, chunks, print_fn=print0,
-				psi_nmu_fresh=psi_nmu_fresh, psi_mun_fresh=psi_mun_fresh,
+				chunks, print_fn=print0,
 				zeta_contract=zeta_contract,
 				k_unfold_plan=_parent_zeta_plan,
 				psi_nmu_parent=(
@@ -3304,7 +3242,7 @@ def prepare_isdf_and_wavefunctions(
 				(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
 			with timing.section("gw_jax.wavefunction_setup"):
 				wfns = wavefunctions_face_from_restart(
-					psi_nmu_fresh, psi_mun_fresh, enk_full=_enk_full_face,
+					None, None, enk_full=_enk_full_face,
 					slices=band_slices, mesh_xy=mesh_xy,
 					basis_receipt=charge_basis_receipt)
 			from .wavefunction_bundle import (
