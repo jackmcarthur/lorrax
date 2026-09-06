@@ -531,9 +531,6 @@ def test_zq_face_layout_matches_legacy(name, kwargs):
     assert out["cache_route_max_rel"] < _TOL, (
         "full-cache vs two-tile-cache vs repeated-route parity FAILED: "
         f"max relative diff {out['cache_route_max_rel']:.3e} (case {name})")
-    assert out["coupled_mu123_max_rel"] < _TOL, (
-        "coupled mu=1,2,3 vs independent accepted routes FAILED: "
-        f"max relative diff {out['coupled_mu123_max_rel']:.3e} (case {name})")
 
 
 def test_global_tile_concat_restores_outer_y_shard_order_complex128():

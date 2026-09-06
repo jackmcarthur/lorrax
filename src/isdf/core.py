@@ -2331,7 +2331,6 @@ def _z_q_face(
 	mesh_xy: Mesh,
 	cache_y_blocks: bool = False,
 	cache_y_r_tile: int = 0,
-	coupled_mu123: bool = False,
 ) -> jax.Array:
 	"""Face-layout Z_q: the same canonical io_callback/``psi_r_cache``
 	read, ``all_to_all('y')`` r-scatter + ``all_gather('x')`` band
@@ -2409,22 +2408,6 @@ def _z_q_face(
 	nk = int(psi_mun.shape[0])
 	ns = int(psi_mun.shape[1])
 	nb_face = int(psi_mun.shape[3])
-	if coupled_mu123:
-		if ns != 4 or gamma_L is None or gamma_R is None:
-			raise ValueError(
-				"_z_q_face(coupled_mu123=True) requires ns=4 and the stacked "
-				"mu=1,2,3 monomial endpoint tables.")
-		if (tuple(gamma_L[0].shape) != (3, 4)
-				or tuple(gamma_L[1].shape) != (3, 4)
-				or tuple(gamma_R[0].shape) != (3, 4)
-				or tuple(gamma_R[1].shape) != (3, 4)):
-			raise ValueError(
-				"_z_q_face(coupled_mu123=True) requires exactly three "
-				"four-spinor transverse endpoint tables.")
-		if not cache_y_blocks:
-			raise ValueError(
-				"_z_q_face(coupled_mu123=True) requires cache_y_blocks=True "
-				"so the canonical Y transform is shared across all channels.")
 	if nk != nkx * nky * nkz:
 		raise ValueError(
 			f"_z_q_face: psi_mun k-axis {nk} != prod(kgrid)={nkx*nky*nkz}")
@@ -2482,16 +2465,14 @@ def _z_q_face(
 				r_chunk_size=cache_y_r_tile,
 				kgrid=kgrid, mesh_xy=mesh_xy,
 				cache_y_blocks=True,
-				cache_y_r_tile=cache_y_r_tile,
-				coupled_mu123=coupled_mu123)
+				cache_y_r_tile=cache_y_r_tile)
 			for tile_idx in range(n_cache_tiles)
 		)
 		Z_q = jnp.concatenate(Z_q_tiles, axis=-1)
 		return jax.lax.with_sharding_constraint(
 			Z_q, NamedSharding(
 				mesh_xy,
-				P(None, None, 'x', 'y') if coupled_mu123
-				else P(None, 'x', 'y')))
+				P(None, 'x', 'y')))
 
 	bcr = tuple((int(lo), int(hi)) for (lo, hi) in band_chunk_ranges)
 	if not bcr:
@@ -2574,8 +2555,7 @@ def _z_q_face(
 		return psi_G_store.read_local_band_chunk(x_idx, y_idx, bc_idx)
 
 	mun_spec = P(None, None, 'x', 'y')
-	out_spec = (P(None, None, 'x', 'y') if coupled_mu123
-			else P(None, 'x', 'y'))
+	out_spec = P(None, 'x', 'y')
 	w_spec = P(None)
 	g_index_spec = P(None, None, None, None)
 	kvecs_frac_spec = P(None, None)
@@ -2586,7 +2566,7 @@ def _z_q_face(
 		'z_q_face_streaming', id(mesh_xy), id(psi_G_store),
 		nk, ns, nb_face, n_zchunk, nkx, nky, nkz,
 		bcr, use_psi_r_cache, bool(cache_y_blocks), cache_y_r_tile,
-		lhs_id, rhs_id, bool(coupled_mu123),
+		lhs_id, rhs_id,
 		(None if psi_r_cache is None
 		 else tuple(int(s) for s in psi_r_cache.shape)),
 	)
@@ -2643,18 +2623,6 @@ def _z_q_face(
 				assert psi_Y_bc.shape[3] == r_loc
 				return psi_Y_bc
 
-			def load_x_block_full(bc_idx):
-				"""One full-spin owner broadcast, shared by mu=1,2,3."""
-				p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
-				global_band = b_lo_rel_arr[bc_idx] + p_arr
-				owner_y = global_band // shard_w
-				local_idx = jnp.clip(
-					global_band - y_idx * shard_w, 0, shard_w - 1)
-				gathered = jnp.take(psi_mun_conj, local_idx, axis=3)
-				gathered = jnp.where(
-					(owner_y == y_idx)[None, None, None, :], gathered, 0)
-				return jax.lax.psum(gathered, 'y')
-
 			# The response is nonlinear in the completed band sums:
 			#   conj(sum_n P_l[n]) * sum_m P_r[m].
 			# Therefore the inner scan completes ALL band chunks for one raw
@@ -2663,19 +2631,8 @@ def _z_q_face(
 			# exact Frobenius spin sum into ns^2 scalar terms and retains only
 			# two rank-3 P carries instead of two rank-5 open-spin carries.
 			def accumulate_spin_pairs(
-					psi_Y_blocks, active_r_loc, psi_X_blocks=None,
-					channel_idx=None):
+					psi_Y_blocks, active_r_loc):
 				"""Complete every spin pair for one local-r cache transaction."""
-				if coupled_mu123:
-					perm_L_channel = perm_L_[channel_idx]
-					phase_L_channel = phase_L_[channel_idx]
-					perm_R_channel = perm_R_[channel_idx]
-					phase_R_channel = phase_R_[channel_idx]
-				else:
-					perm_L_channel = perm_L_
-					phase_L_channel = phase_L_
-					perm_R_channel = perm_R_
-					phase_R_channel = phase_R_
 				Z_R_init = jnp.zeros(
 					(nkx, nky, nkz, active_r_loc, mu_loc),
 					dtype=jnp.complex128)
@@ -2703,26 +2660,21 @@ def _z_q_face(
 						# are unchanged from the pre-streaming face kernel.
 						p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
 						global_band = b_lo_rel_arr[bc_idx] + p_arr
-						if coupled_mu123:
-							x_rows_bc = jnp.take(
-								psi_X_blocks[bc_idx],
-								jnp.stack((a, perm_L_channel[a])), axis=1)
+						owner_y = global_band // shard_w
+						owns = (owner_y == y_idx)
+						if lhs_id:
+							x_rows_local = jax.lax.dynamic_slice_in_dim(
+								psi_mun_conj, a, 1, axis=1)
 						else:
-							owner_y = global_band // shard_w
-							owns = (owner_y == y_idx)
-							if lhs_id:
-								x_rows_local = jax.lax.dynamic_slice_in_dim(
-									psi_mun_conj, a, 1, axis=1)
-							else:
-								x_rows_local = jnp.take(
-									psi_mun_conj,
-									jnp.stack((a, perm_L_channel[a])), axis=1)
-							local_idx = jnp.clip(
-								global_band - y_idx * shard_w, 0, shard_w - 1)
-							gathered = jnp.take(x_rows_local, local_idx, axis=3)
-							gathered = jnp.where(
-								owns[None, None, None, :], gathered, 0)
-							x_rows_bc = jax.lax.psum(gathered, 'y')
+							x_rows_local = jnp.take(
+								psi_mun_conj,
+								jnp.stack((a, perm_L_[a])), axis=1)
+						local_idx = jnp.clip(
+							global_band - y_idx * shard_w, 0, shard_w - 1)
+						gathered = jnp.take(x_rows_local, local_idx, axis=3)
+						gathered = jnp.where(
+							owns[None, None, None, :], gathered, 0)
+						x_rows_bc = jax.lax.psum(gathered, 'y')
 
 						# A short final chunk can extend past both its true edge and
 						# the face carrier.  Clip every take and zero the inert lanes
@@ -2743,10 +2695,10 @@ def _z_q_face(
 						y_l = jax.lax.dynamic_index_in_dim(
 							psi_Y_bc, b, axis=2, keepdims=False)
 						x_r = (x_l if lhs_id else x_rows_bc[:, 1, :, :])
-						x_r = phase_L_channel[a] * x_r
+						x_r = phase_L_[a] * x_r
 						y_r = jax.lax.dynamic_index_in_dim(
-							psi_Y_bc, perm_R_channel[b], axis=2, keepdims=False)
-						y_r = phase_R_channel[b] * y_r
+							psi_Y_bc, perm_R_[b], axis=2, keepdims=False)
+						y_r = phase_R_[b] * y_r
 
 						x_l = x_l * w_l_bc[None, None, :].astype(x_l.dtype)
 						x_r = x_r * w_r_bc[None, None, :].astype(x_r.dtype)
@@ -2774,104 +2726,6 @@ def _z_q_face(
 					jnp.arange(ns * ns, dtype=jnp.int32), unroll=1)
 				return Z_R
 
-			def accumulate_coupled_channels(
-					psi_Y_blocks, psi_X_blocks, active_r_loc):
-				"""Share the channel-independent left density across mu=1,2,3.
-
-				Only one right-channel density is live at a time.  Thus coupling
-				the arithmetic removes two redundant left contractions/IFFTs per
-				spin pair without introducing a three-channel P_r carrier.
-				"""
-				Z_R_init = jnp.zeros(
-					(3, nkx, nky, nkz, active_r_loc, mu_loc),
-					dtype=jnp.complex128)
-
-				def spin_pair_body(Z_R_acc, ab):
-					a = ab // ns
-					b = ab % ns
-					P_l_init = jnp.zeros(
-						(nk, active_r_loc, mu_loc), dtype=jnp.complex128)
-
-					def left_band_body(P_l_acc, bc_idx):
-						psi_Y_bc = psi_Y_blocks[bc_idx]
-						p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
-						global_band = b_lo_rel_arr[bc_idx] + p_arr
-						bc_valid = global_band < b_hi_rel_arr[bc_idx]
-						g_clamped = jnp.clip(global_band, 0, nb_face - 1)
-						w_l_bc = jnp.where(
-							bc_valid, jnp.take(w_l_, g_clamped), 0.0)
-						x_l = jax.lax.dynamic_index_in_dim(
-							psi_X_blocks[bc_idx], a, axis=1, keepdims=False)
-						y_l = jax.lax.dynamic_index_in_dim(
-							psi_Y_bc, b, axis=2, keepdims=False)
-						x_l = x_l * w_l_bc[None, None, :].astype(x_l.dtype)
-						delta_l = jnp.einsum(
-							'kmn,knr->krm', x_l, y_l, optimize=True)
-						return P_l_acc + delta_l, None
-
-					P_l, _ = jax.lax.scan(
-						left_band_body, P_l_init,
-						jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
-					P_l_R = local_ifftn3(
-						P_l.reshape(nkx, nky, nkz, active_r_loc, mu_loc),
-						axes=(0, 1, 2), norm='forward')
-					P_l_R_conj = jnp.conj(P_l_R)
-
-					def channel_body(Z_R_channels, channel_idx):
-						perm_L_channel = perm_L_[channel_idx]
-						phase_L_channel = phase_L_[channel_idx]
-						perm_R_channel = perm_R_[channel_idx]
-						phase_R_channel = phase_R_[channel_idx]
-						P_r_init = jnp.zeros(
-							(nk, active_r_loc, mu_loc), dtype=jnp.complex128)
-
-						def right_band_body(P_r_acc, bc_idx):
-							psi_Y_bc = psi_Y_blocks[bc_idx]
-							p_arr = jnp.arange(
-								bpd_max_global, dtype=jnp.int32)
-							global_band = b_lo_rel_arr[bc_idx] + p_arr
-							bc_valid = global_band < b_hi_rel_arr[bc_idx]
-							g_clamped = jnp.clip(
-								global_band, 0, nb_face - 1)
-							w_r_bc = jnp.where(
-								bc_valid, jnp.take(w_r_, g_clamped), 0.0)
-							x_r = jax.lax.dynamic_index_in_dim(
-								psi_X_blocks[bc_idx], perm_L_channel[a],
-								axis=1, keepdims=False)
-							x_r = phase_L_channel[a] * x_r
-							y_r = jax.lax.dynamic_index_in_dim(
-								psi_Y_bc, perm_R_channel[b],
-								axis=2, keepdims=False)
-							y_r = phase_R_channel[b] * y_r
-							x_r = x_r * w_r_bc[None, None, :].astype(x_r.dtype)
-							delta_r = jnp.einsum(
-								'kmn,knr->krm', x_r, y_r, optimize=True)
-							return P_r_acc + delta_r, None
-
-						P_r, _ = jax.lax.scan(
-							right_band_body, P_r_init,
-							jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
-						P_r_R = local_ifftn3(
-							P_r.reshape(
-								nkx, nky, nkz, active_r_loc, mu_loc),
-							axes=(0, 1, 2), norm='forward')
-						Z_R_channel = jax.lax.dynamic_index_in_dim(
-							Z_R_channels, channel_idx, axis=0, keepdims=False)
-						Z_R_channel = Z_R_channel + P_l_R_conj * P_r_R
-						Z_R_channels = jax.lax.dynamic_update_index_in_dim(
-							Z_R_channels, Z_R_channel, channel_idx, axis=0)
-						return Z_R_channels, None
-
-					Z_R_acc, _ = jax.lax.scan(
-						channel_body, Z_R_acc,
-						jnp.arange(3, dtype=jnp.int32), unroll=1)
-					return Z_R_acc, None
-
-				Z_R, _ = jax.lax.scan(
-					spin_pair_body, Z_R_init,
-					jnp.arange(ns * ns, dtype=jnp.int32), unroll=1)
-				return Z_R
-
 			if cache_y_blocks:
 				def build_y_block(_unused, bc_idx):
 					return _unused, load_y_block_full(bc_idx)
@@ -2879,31 +2733,6 @@ def _z_q_face(
 				_, psi_Y_blocks = jax.lax.scan(
 					build_y_block, jnp.zeros((), dtype=jnp.int32),
 					jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
-				if coupled_mu123:
-					def build_x_block(_unused, bc_idx):
-						return _unused, load_x_block_full(bc_idx)
-
-					_, psi_X_blocks = jax.lax.scan(
-						build_x_block, jnp.zeros((), dtype=jnp.int32),
-						jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
-
-					Z_R_channels = accumulate_coupled_channels(
-						psi_Y_blocks, psi_X_blocks, r_loc)
-
-					def channel_body(_unused, channel_idx):
-						Z_R_channel = Z_R_channels[channel_idx]
-						Z_q_3d_channel = local_fftn3(
-							Z_R_channel, axes=(0, 1, 2), norm='forward')
-						Z_q_channel = jnp.transpose(
-							Z_q_3d_channel.reshape(
-								nkx * nky * nkz, r_loc, mu_loc),
-							(0, 2, 1))
-						return _unused, Z_q_channel
-
-					_, Z_q_channels = jax.lax.scan(
-						channel_body, jnp.zeros((), dtype=jnp.int32),
-						jnp.arange(3, dtype=jnp.int32), unroll=1)
-					return Z_q_channels
 				# Original one-pass cache: one canonical transform per band
 				# chunk, then read-only reuse across every spin pair.
 				Z_R = accumulate_spin_pairs(psi_Y_blocks, r_loc)
@@ -2947,7 +2776,6 @@ def _z_q_face(
 		perm_L, phase_L, perm_R, phase_R,
 		r_start_arg, psi_G_store.g_index, psi_G_store.kvecs_frac,
 		psi_r_cache)
-
 
 def _band_chunk_compaction(bcr, bpd_max: int, P_total: int):
 	"""Per-chunk Y-side compaction table (and whether it is the identity).
