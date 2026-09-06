@@ -1,0 +1,907 @@
+{
+  "06_parent_static": {
+    "stages": {
+      "runtime bring-up": 8.06,
+      "pre-main + imports": 1.27,
+      "input + run setup": 0.15,
+      "V(q)": 3.68,
+      "ISDF setup + I/O": 5.34,
+      "minimax quadrature": 0.14,
+      "screening support": 31.21,
+      "Sigma other": 150.16,
+      "mean-field load": 0.07,
+      "QP solve + diagonalize": 0.28,
+      "result writes": 0.18,
+      "other driver work": 0.83,
+      "total run": 201.36
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=1712 (148.01s)  compile_agreement=1712 (1.418s fingerprint + 3.252s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "07_fixed_static": {
+    "stages": {
+      "runtime bring-up": 6.87,
+      "pre-main + imports": 1.11,
+      "input + run setup": 0.13,
+      "V(q)": 4.02,
+      "ISDF setup + I/O": 6.86,
+      "minimax quadrature": 0.17,
+      "screening support": 12.9,
+      "Sigma other": 18.12,
+      "mean-field load": 0.05,
+      "QP solve + diagonalize": 0.28,
+      "result writes": 0.12,
+      "other driver work": 0.6,
+      "total run": 51.24
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=597 (27.65s)  compile_agreement=597 (0.137s fingerprint + 0.984s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "13_parent_gn": {
+    "stages": {
+      "runtime bring-up": 4.82,
+      "pre-main + imports": 0.42,
+      "input + run setup": 0.29,
+      "V(q)": 4.19,
+      "ISDF setup + I/O": 6.58,
+      "minimax quadrature": 0.15,
+      "chi0": 4.33,
+      "W": 3.54,
+      "screening support": 0.12,
+      "W persist + q0 head": 0.58,
+      "Sigma rule plan": 0.09,
+      "Sigma tau sweep": 4.18,
+      "Sigma other": 59.46,
+      "mean-field load": 0.1,
+      "QP solve + diagonalize": 0.35,
+      "result writes": 0.08,
+      "other driver work": 1.5,
+      "total run": 90.78
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=816 (59.13s)  compile_agreement=816 (2.372s fingerprint + 2.286s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": [
+      [
+        "6",
+        "eb69139b52f4428f",
+        "hit:rule_fc3306537dc5a5ee.npz"
+      ],
+      [
+        "4",
+        "e78995690690d88a",
+        "hit:rule_a38df15b936679af.npz"
+      ],
+      [
+        "4",
+        "cdb424683c2fe96d",
+        "hit:rule_b8e0e8b77beda05c.npz"
+      ],
+      [
+        "5",
+        "7a1e2d679ce41c04",
+        "hit:rule_90c6c85eb9c44536.npz"
+      ],
+      [
+        "5",
+        "7a1e2d679ce41c04",
+        "hit:rule_90c6c85eb9c44536.npz"
+      ],
+      [
+        "5",
+        "3761a04cbf58e98c",
+        "hit:rule_49107a8da2ed8f67.npz"
+      ]
+    ]
+  },
+  "14_fixed_gn": {
+    "stages": {
+      "runtime bring-up": 3.76,
+      "pre-main + imports": 0.35,
+      "input + run setup": 0.21,
+      "V(q)": 5.33,
+      "ISDF setup + I/O": 6.71,
+      "minimax quadrature": 0.15,
+      "chi0": 3.13,
+      "W": 3.52,
+      "screening support": 0.14,
+      "W persist + q0 head": 0.15,
+      "Sigma rule plan": 6.4,
+      "Sigma tau sweep": 4.95,
+      "Sigma other": 21.71,
+      "mean-field load": 0.09,
+      "QP solve + diagonalize": 0.34,
+      "result writes": 0.13,
+      "other driver work": 1.45,
+      "total run": 58.51
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=539 (28.28s)  compile_agreement=539 (0.202s fingerprint + 2.472s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": [
+      [
+        "6",
+        "791e7cdb56c85776",
+        "miss"
+      ],
+      [
+        "4",
+        "2884905bb1100243",
+        "miss"
+      ],
+      [
+        "4",
+        "e78995690690d88a",
+        "hit:rule_a38df15b936679af.npz"
+      ],
+      [
+        "5",
+        "01b831b904eb3e16",
+        "miss"
+      ],
+      [
+        "5",
+        "7a1e2d679ce41c04",
+        "hit:rule_90c6c85eb9c44536.npz"
+      ],
+      [
+        "5",
+        "c04956ec246444b5",
+        "miss"
+      ]
+    ]
+  },
+  "15_parent_cohsex": {
+    "stages": {
+      "runtime bring-up": 4.02,
+      "pre-main + imports": 0.38,
+      "input + run setup": 0.28,
+      "V(q)": 4.14,
+      "ISDF setup + I/O": 6.67,
+      "minimax quadrature": 0.16,
+      "chi0": 3.05,
+      "W": 3.3,
+      "screening support": 0.04,
+      "W persist + q0 head": 0.58,
+      "Sigma other": 48.33,
+      "mean-field load": 0.09,
+      "QP solve + diagonalize": 0.37,
+      "result writes": 0.12,
+      "other driver work": 1.44,
+      "total run": 72.97
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=676 (48.44s)  compile_agreement=676 (2.080s fingerprint + 1.561s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "16_fixed_cohsex": {
+    "stages": {
+      "runtime bring-up": 6.83,
+      "pre-main + imports": 0.38,
+      "input + run setup": 0.19,
+      "V(q)": 5.24,
+      "ISDF setup + I/O": 7.24,
+      "minimax quadrature": 0.15,
+      "chi0": 2.58,
+      "W": 3.13,
+      "screening support": 0.04,
+      "W persist + q0 head": 0.14,
+      "Sigma other": 11.65,
+      "mean-field load": 0.09,
+      "QP solve + diagonalize": 0.37,
+      "result writes": 0.12,
+      "other driver work": 1.39,
+      "total run": 39.54
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=412 (18.63s)  compile_agreement=412 (0.172s fingerprint + 0.723s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "17_parent_bare": {
+    "stages": {
+      "runtime bring-up": 5.76,
+      "pre-main + imports": 0.42,
+      "input + run setup": 0.12,
+      "V(q)": 3.89,
+      "ISDF setup + I/O": 5.7,
+      "minimax quadrature": 0.14,
+      "chi0": 1.94,
+      "W": 4.08,
+      "screening support": 10.65,
+      "Sigma other": 150.6,
+      "mean-field load": 0.05,
+      "QP solve + diagonalize": 0.28,
+      "result writes": 0.11,
+      "other driver work": 0.75,
+      "total run": 184.49
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=1613 (137.11s)  compile_agreement=1613 (1.312s fingerprint + 2.729s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "18_fixed_bare": {
+    "stages": {
+      "runtime bring-up": 5.35,
+      "pre-main + imports": 0.35,
+      "input + run setup": 0.12,
+      "V(q)": 4.05,
+      "ISDF setup + I/O": 6.88,
+      "minimax quadrature": 0.15,
+      "chi0": 1.83,
+      "W": 4.06,
+      "screening support": 5.75,
+      "Sigma other": 18.61,
+      "mean-field load": 0.05,
+      "QP solve + diagonalize": 0.28,
+      "result writes": 0.1,
+      "other driver work": 0.62,
+      "total run": 48.2
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=598 (27.07s)  compile_agreement=598 (0.136s fingerprint + 0.961s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "19_parent_dynamic": {
+    "stages": {
+      "runtime bring-up": 5.6,
+      "pre-main + imports": 0.37,
+      "input + run setup": 0.13,
+      "V(q)": 3.57,
+      "ISDF setup + I/O": 5.77,
+      "minimax quadrature": 0.15,
+      "chi0": 2.5,
+      "W": 4.44,
+      "screening support": 25.86,
+      "W persist + q0 head": 0.57,
+      "Sigma rule plan": 0.12,
+      "Sigma tau sweep": 3.01,
+      "Sigma other": 158.79,
+      "mean-field load": 0.05,
+      "QP solve + diagonalize": 0.25,
+      "result writes": 0.07,
+      "other driver work": 6.29,
+      "total run": 217.54
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=1896 (161.08s)  compile_agreement=1896 (1.482s fingerprint + 4.141s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": [
+      [
+        "8",
+        "cea425ad1e257df6",
+        "hit:rule_dc4d4199505b65ae.npz"
+      ],
+      [
+        "6",
+        "29dea0e4ecce916c",
+        "hit:rule_facb773c4d99fb6e.npz"
+      ],
+      [
+        "10",
+        "763143b0c6012c28",
+        "hit:rule_e2ef791efa85250d.npz"
+      ],
+      [
+        "9",
+        "5bdef0ef45871743",
+        "hit:rule_e7f0205ef58b2a46.npz"
+      ],
+      [
+        "8",
+        "a0a52b44a8066b6e",
+        "hit:rule_d9061f258e1be15a.npz"
+      ],
+      [
+        "8",
+        "01339adfbee2319c",
+        "hit:rule_afe355af3590a3e4.npz"
+      ],
+      [
+        "7",
+        "5250da8cede1812f",
+        "hit:rule_e750463e955bb49a.npz"
+      ],
+      [
+        "11",
+        "a19f1bb07e220cae",
+        "hit:rule_c5fac33ef094b66b.npz"
+      ]
+    ]
+  },
+  "20_fixed_dynamic": {
+    "stages": {
+      "runtime bring-up": 5.93,
+      "pre-main + imports": 0.39,
+      "input + run setup": 0.14,
+      "V(q)": 4.05,
+      "ISDF setup + I/O": 7.16,
+      "minimax quadrature": 0.15,
+      "chi0": 2.18,
+      "W": 4.29,
+      "screening support": 10.11,
+      "W persist + q0 head": 0.28,
+      "Sigma rule plan": 49.18,
+      "Sigma tau sweep": 2.55,
+      "Sigma other": 26.97,
+      "mean-field load": 0.05,
+      "QP solve + diagonalize": 0.24,
+      "result writes": 0.11,
+      "other driver work": 2.59,
+      "total run": 116.34
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=790 (39.99s)  compile_agreement=790 (0.181s fingerprint + 50.542s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": [
+      [
+        "8",
+        "cea425ad1e257df6",
+        "hit:rule_dc4d4199505b65ae.npz"
+      ],
+      [
+        "6",
+        "29dea0e4ecce916c",
+        "hit:rule_facb773c4d99fb6e.npz"
+      ],
+      [
+        "10",
+        "5f5bc0f7fca33a8e",
+        "miss"
+      ],
+      [
+        "9",
+        "5bdef0ef45871743",
+        "hit:rule_e7f0205ef58b2a46.npz"
+      ],
+      [
+        "8",
+        "a0a52b44a8066b6e",
+        "hit:rule_d9061f258e1be15a.npz"
+      ],
+      [
+        "8",
+        "01339adfbee2319c",
+        "hit:rule_afe355af3590a3e4.npz"
+      ],
+      [
+        "7",
+        "5250da8cede1812f",
+        "hit:rule_e750463e955bb49a.npz"
+      ],
+      [
+        "11",
+        "bebf917d71d03406",
+        "miss"
+      ]
+    ]
+  },
+  "21_restore_source": {
+    "stages": {
+      "runtime bring-up": 5.5,
+      "pre-main + imports": 0.34,
+      "input + run setup": 0.12,
+      "V(q)": 3.92,
+      "ISDF setup + I/O": 5.52,
+      "minimax quadrature": 0.15,
+      "screening support": 30.73,
+      "Sigma other": 111.99,
+      "mean-field load": 0.05,
+      "QP solve + diagonalize": 0.3,
+      "result writes": 0.12,
+      "other driver work": 0.88,
+      "total run": 159.61
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=1512 (116.27s)  compile_agreement=1512 (1.005s fingerprint + 3.130s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "22_chi_source": {
+    "stages": {
+      "runtime bring-up": 4.58,
+      "pre-main + imports": 0.43,
+      "input + run setup": 0.14,
+      "V(q)": 4.12,
+      "ISDF setup + I/O": 5.45,
+      "minimax quadrature": 0.15,
+      "screening support": 18.59,
+      "Sigma other": 111.85,
+      "mean-field load": 0.06,
+      "QP solve + diagonalize": 0.3,
+      "result writes": 0.11,
+      "other driver work": 0.78,
+      "total run": 146.56
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=1416 (106.07s)  compile_agreement=1416 (0.909s fingerprint + 3.097s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "29_after_bare": {
+    "stages": {
+      "runtime bring-up": 5.68,
+      "pre-main + imports": 0.46,
+      "input + run setup": 0.13,
+      "V(q)": 4.11,
+      "ISDF setup + I/O": 5.39,
+      "minimax quadrature": 0.14,
+      "chi0": 1.83,
+      "W": 3.82,
+      "screening support": 10.55,
+      "Sigma other": 112.64,
+      "mean-field load": 0.06,
+      "QP solve + diagonalize": 0.29,
+      "result writes": 0.11,
+      "other driver work": 0.78,
+      "total run": 146.0
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=1413 (105.59s)  compile_agreement=1413 (0.898s fingerprint + 2.692s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "30_after_dynamic": {
+    "stages": {
+      "runtime bring-up": 5.43,
+      "pre-main + imports": 0.48,
+      "input + run setup": 0.14,
+      "V(q)": 4.17,
+      "ISDF setup + I/O": 5.53,
+      "minimax quadrature": 0.15,
+      "chi0": 2.4,
+      "W": 4.23,
+      "screening support": 13.21,
+      "W persist + q0 head": 0.57,
+      "Sigma rule plan": 0.14,
+      "Sigma tau sweep": 3.02,
+      "Sigma other": 118.83,
+      "mean-field load": 0.05,
+      "QP solve + diagonalize": 0.25,
+      "result writes": 0.08,
+      "other driver work": 6.21,
+      "total run": 164.88
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=1602 (118.91s)  compile_agreement=1602 (0.971s fingerprint + 2.752s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": [
+      [
+        "8",
+        "cea425ad1e257df6",
+        "hit:rule_dc4d4199505b65ae.npz"
+      ],
+      [
+        "6",
+        "29dea0e4ecce916c",
+        "hit:rule_facb773c4d99fb6e.npz"
+      ],
+      [
+        "10",
+        "763143b0c6012c28",
+        "hit:rule_e2ef791efa85250d.npz"
+      ],
+      [
+        "9",
+        "5bdef0ef45871743",
+        "hit:rule_e7f0205ef58b2a46.npz"
+      ],
+      [
+        "8",
+        "a0a52b44a8066b6e",
+        "hit:rule_d9061f258e1be15a.npz"
+      ],
+      [
+        "8",
+        "01339adfbee2319c",
+        "hit:rule_afe355af3590a3e4.npz"
+      ],
+      [
+        "7",
+        "5250da8cede1812f",
+        "hit:rule_e750463e955bb49a.npz"
+      ],
+      [
+        "11",
+        "a19f1bb07e220cae",
+        "hit:rule_c5fac33ef094b66b.npz"
+      ]
+    ]
+  },
+  "27_after_gn": {
+    "stages": {
+      "runtime bring-up": 5.96,
+      "pre-main + imports": 0.4,
+      "input + run setup": 0.27,
+      "V(q)": 4.56,
+      "ISDF setup + I/O": 8.36,
+      "minimax quadrature": 0.14,
+      "chi0": 4.12,
+      "W": 3.42,
+      "screening support": 0.14,
+      "W persist + q0 head": 0.56,
+      "Sigma rule plan": 0.1,
+      "Sigma tau sweep": 4.04,
+      "Sigma other": 57.37,
+      "mean-field load": 0.1,
+      "QP solve + diagonalize": 0.35,
+      "result writes": 0.08,
+      "other driver work": 1.48,
+      "total run": 91.44
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=816 (57.45s)  compile_agreement=816 (2.324s fingerprint + 1.667s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": [
+      [
+        "6",
+        "eb69139b52f4428f",
+        "hit:rule_fc3306537dc5a5ee.npz"
+      ],
+      [
+        "4",
+        "e78995690690d88a",
+        "hit:rule_a38df15b936679af.npz"
+      ],
+      [
+        "4",
+        "cdb424683c2fe96d",
+        "hit:rule_b8e0e8b77beda05c.npz"
+      ],
+      [
+        "5",
+        "7a1e2d679ce41c04",
+        "hit:rule_90c6c85eb9c44536.npz"
+      ],
+      [
+        "5",
+        "7a1e2d679ce41c04",
+        "hit:rule_90c6c85eb9c44536.npz"
+      ],
+      [
+        "5",
+        "3761a04cbf58e98c",
+        "hit:rule_49107a8da2ed8f67.npz"
+      ]
+    ]
+  },
+  "28_after_cohsex": {
+    "stages": {
+      "runtime bring-up": 5.24,
+      "pre-main + imports": 0.34,
+      "input + run setup": 0.25,
+      "V(q)": 4.33,
+      "ISDF setup + I/O": 6.58,
+      "minimax quadrature": 0.14,
+      "chi0": 2.94,
+      "W": 3.16,
+      "screening support": 0.04,
+      "W persist + q0 head": 0.56,
+      "Sigma other": 47.29,
+      "mean-field load": 0.09,
+      "QP solve + diagonalize": 0.39,
+      "result writes": 0.12,
+      "other driver work": 1.46,
+      "total run": 72.95
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=676 (47.36s)  compile_agreement=676 (2.016s fingerprint + 1.301s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": []
+  },
+  "38_parent_gn_common": {
+    "stages": {
+      "runtime bring-up": 4.47,
+      "pre-main + imports": 1.84,
+      "input + run setup": 0.31,
+      "V(q)": 4.28,
+      "ISDF setup + I/O": 6.03,
+      "minimax quadrature": 0.15,
+      "chi0": 4.31,
+      "W": 3.39,
+      "screening support": 0.16,
+      "W persist + q0 head": 0.55,
+      "Sigma rule plan": 0.08,
+      "Sigma tau sweep": 4.03,
+      "Sigma other": 55.99,
+      "mean-field load": 0.09,
+      "QP solve + diagonalize": 0.34,
+      "result writes": 0.09,
+      "other driver work": 1.49,
+      "total run": 87.6
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=816 (57.27s)  compile_agreement=816 (2.359s fingerprint + 1.617s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": [
+      [
+        "6",
+        "791e7cdb56c85776",
+        "hit:rule_21356a69eaeb5e63.npz"
+      ],
+      [
+        "4",
+        "2884905bb1100243",
+        "hit:rule_551f34e072614dc1.npz"
+      ],
+      [
+        "4",
+        "e78995690690d88a",
+        "hit:rule_a38df15b936679af.npz"
+      ],
+      [
+        "5",
+        "01b831b904eb3e16",
+        "hit:rule_2b4585fe7c39673b.npz"
+      ],
+      [
+        "5",
+        "7a1e2d679ce41c04",
+        "hit:rule_90c6c85eb9c44536.npz"
+      ],
+      [
+        "5",
+        "c04956ec246444b5",
+        "hit:rule_79fea2ee4bc151de.npz"
+      ]
+    ]
+  },
+  "39_fixed_gn_common": {
+    "stages": {
+      "runtime bring-up": 4.6,
+      "pre-main + imports": 1.62,
+      "input + run setup": 0.25,
+      "V(q)": 5.23,
+      "ISDF setup + I/O": 6.14,
+      "minimax quadrature": 0.14,
+      "chi0": 3.22,
+      "W": 3.4,
+      "screening support": 0.09,
+      "W persist + q0 head": 0.14,
+      "Sigma rule plan": 0.08,
+      "Sigma tau sweep": 4.27,
+      "Sigma other": 20.06,
+      "mean-field load": 0.09,
+      "QP solve + diagonalize": 0.33,
+      "result writes": 0.11,
+      "other driver work": 1.39,
+      "total run": 51.17
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=539 (27.35s)  compile_agreement=539 (0.201s fingerprint + 0.866s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": [
+      [
+        "6",
+        "791e7cdb56c85776",
+        "hit:rule_21356a69eaeb5e63.npz"
+      ],
+      [
+        "4",
+        "2884905bb1100243",
+        "hit:rule_551f34e072614dc1.npz"
+      ],
+      [
+        "4",
+        "e78995690690d88a",
+        "hit:rule_a38df15b936679af.npz"
+      ],
+      [
+        "5",
+        "01b831b904eb3e16",
+        "hit:rule_2b4585fe7c39673b.npz"
+      ],
+      [
+        "5",
+        "7a1e2d679ce41c04",
+        "hit:rule_90c6c85eb9c44536.npz"
+      ],
+      [
+        "5",
+        "c04956ec246444b5",
+        "hit:rule_79fea2ee4bc151de.npz"
+      ]
+    ]
+  },
+  "40_parent_dynamic_common": {
+    "stages": {
+      "runtime bring-up": 4.84,
+      "pre-main + imports": 2.32,
+      "input + run setup": 0.18,
+      "V(q)": 3.75,
+      "ISDF setup + I/O": 5.58,
+      "minimax quadrature": 0.15,
+      "chi0": 2.31,
+      "W": 4.2,
+      "screening support": 25.79,
+      "W persist + q0 head": 0.57,
+      "Sigma rule plan": 0.12,
+      "Sigma tau sweep": 3.0,
+      "Sigma other": 156.76,
+      "mean-field load": 0.05,
+      "QP solve + diagonalize": 0.25,
+      "result writes": 0.08,
+      "other driver work": 6.04,
+      "total run": 215.99
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=1896 (161.17s)  compile_agreement=1896 (1.492s fingerprint + 3.242s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": [
+      [
+        "8",
+        "cea425ad1e257df6",
+        "hit:rule_dc4d4199505b65ae.npz"
+      ],
+      [
+        "6",
+        "29dea0e4ecce916c",
+        "hit:rule_facb773c4d99fb6e.npz"
+      ],
+      [
+        "10",
+        "5f5bc0f7fca33a8e",
+        "hit:rule_438f3f8d1233fbbc.npz"
+      ],
+      [
+        "9",
+        "5bdef0ef45871743",
+        "hit:rule_e7f0205ef58b2a46.npz"
+      ],
+      [
+        "8",
+        "a0a52b44a8066b6e",
+        "hit:rule_d9061f258e1be15a.npz"
+      ],
+      [
+        "8",
+        "01339adfbee2319c",
+        "hit:rule_afe355af3590a3e4.npz"
+      ],
+      [
+        "7",
+        "5250da8cede1812f",
+        "hit:rule_e750463e955bb49a.npz"
+      ],
+      [
+        "11",
+        "bebf917d71d03406",
+        "hit:rule_68eb4b1b8a38dba3.npz"
+      ]
+    ]
+  },
+  "41_fixed_dynamic_common": {
+    "stages": {
+      "runtime bring-up": 4.53,
+      "pre-main + imports": 2.03,
+      "input + run setup": 0.18,
+      "V(q)": 4.01,
+      "ISDF setup + I/O": 6.24,
+      "minimax quadrature": 0.2,
+      "chi0": 1.89,
+      "W": 4.33,
+      "screening support": 9.93,
+      "W persist + q0 head": 0.28,
+      "Sigma rule plan": 0.13,
+      "Sigma tau sweep": 2.46,
+      "Sigma other": 26.21,
+      "mean-field load": 0.05,
+      "QP solve + diagonalize": 0.24,
+      "result writes": 0.09,
+      "other driver work": 2.6,
+      "total run": 65.39
+    },
+    "z_build_solve_ms": [],
+    "tile_fit_write_total_ms": [],
+    "arena_gb": [],
+    "compile_receipt": [
+      "[compile-cache] rank 0/4 summary: xla_compiles=790 (39.76s)  compile_agreement=790 (0.181s fingerprint + 1.315s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False"
+    ],
+    "rules": [
+      [
+        "8",
+        "cea425ad1e257df6",
+        "hit:rule_dc4d4199505b65ae.npz"
+      ],
+      [
+        "6",
+        "29dea0e4ecce916c",
+        "hit:rule_facb773c4d99fb6e.npz"
+      ],
+      [
+        "10",
+        "5f5bc0f7fca33a8e",
+        "hit:rule_438f3f8d1233fbbc.npz"
+      ],
+      [
+        "9",
+        "5bdef0ef45871743",
+        "hit:rule_e7f0205ef58b2a46.npz"
+      ],
+      [
+        "8",
+        "a0a52b44a8066b6e",
+        "hit:rule_d9061f258e1be15a.npz"
+      ],
+      [
+        "8",
+        "01339adfbee2319c",
+        "hit:rule_afe355af3590a3e4.npz"
+      ],
+      [
+        "7",
+        "5250da8cede1812f",
+        "hit:rule_e750463e955bb49a.npz"
+      ],
+      [
+        "11",
+        "bebf917d71d03406",
+        "hit:rule_68eb4b1b8a38dba3.npz"
+      ]
+    ]
+  }
+}

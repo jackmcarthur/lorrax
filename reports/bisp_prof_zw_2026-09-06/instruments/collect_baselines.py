@@ -1,6 +1,7 @@
 """Reuse PERF2's census on immutable driver logs through named analysis links."""
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 sandbox=Path(__file__).resolve().parents[3]
@@ -9,6 +10,7 @@ spec=importlib.util.spec_from_file_location('perf2_census',parser)
 module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
 paths=[sandbox/'runs/MoS2/41_bisp_parent_route_2026-09-05/prof_zw'/name for name in ('06_parent_static','07_fixed_static')]
 paths += [Path(p) for p in json.loads(Path('remaining_paths.json').read_text())]
+paths += [Path(p) for p in sys.argv[1:]]
 result={}
 for run in paths:
     view=Path('baseline_analysis')/run.name; view.mkdir(parents=True,exist_ok=True)
