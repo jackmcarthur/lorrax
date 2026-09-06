@@ -1,0 +1,5 @@
+# Copied science caches and future device captures remain run-local evidence.
+*/tmp/
+*/xla_dump*/
+*.nsys-rep
+*.sqlite
