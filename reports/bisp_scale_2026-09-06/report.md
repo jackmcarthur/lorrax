@@ -146,3 +146,26 @@
 | Resident scaling |16 K(M_C+3M_T)²/P bytes per retained term|all P ranks|Independent of nb/ns/Q; adds to parent O(QM²/P). Relative cost falls with nb/ns, not with K alone|run-local prototype only; no retained production residency change|
 | Compile-event parity, commit902d01ca |P4 static674→584 vs F578; dynamic894→772=F772; P16 static646→556<F604; dynamic897→775<F825|Five final arms130–135 exact to parent baselines|RETAIN branch change; P4 static still six extra events. Exact fe2a6937 speed-phase snapshot excludes this local patch|57988457/lx-Xg4-141411-1064403-7247 exit0 and lx-Xg4-135842-973036-7653 science artifacts; D/final_source_gates.json; claim1331|
 | Compile sites |64 static/96 dynamic zero-lambda events removed,21 typed-table placement events,5 surface-placement events|same source-change gates|distrib_la.matmul._zeros; host typed-map placement; absent surface/row table placement. No new cache or API|evidence/final_compile_module_delta.csv; source on perf/bisp-scale-2026-09-06, unmerged|
+
+| 6×6 leading counts/rank | P | Family | Static G GFLOP | τ G GFLOP | Two projections GFLOP | Full G bytes | Operator bytes |
+|---|---:|---|---:|---:|---:|---:|---:|
+|P|4|CC|33.177600|12.902400|2.449440|829440000|51840000|
+|P|4|CT|11.280384|4.386816|0.832810|282009600|17625600|
+|P|4|TC|11.280384|4.386816|0.852768|282009600|17625600|
+|P|4|TT|3.835331|1.491517|0.289941|95883264|5992704|
+|F|4|CC|33.177600|33.177600|12.597120|829440000|51840000|
+|F|4|CT|11.059200|11.059200|4.199040|276480000|17280000|
+|F|4|TC|11.059200|11.059200|4.302720|276480000|17280000|
+|F|4|TT|3.686400|3.686400|1.434240|92160000|5760000|
+|P|16|CC|8.517059|3.312189|0.671154|212926464|13307904|
+|P|16|CT|3.137864|1.220280|0.247267|78446592|4902912|
+|P|16|TC|3.137864|1.220280|0.252772|78446592|4902912|
+|P|16|TT|1.156055|0.449577|0.093127|28901376|1806336|
+|F|16|CC|8.517059|8.517059|3.451650|212926464|13307904|
+|F|16|CT|2.913731|2.913731|1.180828|72843264|4552704|
+|F|16|TC|2.913731|2.913731|1.210319|72843264|4552704|
+|F|16|TT|0.996803|0.996803|0.414056|24920064|1557504|
+
+| Analytic scope | Limitation |
+|---|---|
+| evidence/analytical_operand_counts.json; same native/HLO steps66–75 cited above | Leading arithmetic and logical carriers; packing, beta, allocator peaks and vendor wire replication excluded. No new timing measurement. |
