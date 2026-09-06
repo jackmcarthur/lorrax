@@ -2014,9 +2014,7 @@ def photon_blocks_full_q(response, keys, *, term="W"):
         raise ValueError(f"Unknown photon operator {term!r}.")
     for A, B in keys:
         left, right = (left_T if A else left_C), (left_T if B else left_C)
-        shape = (len(sym.irr_idx_q), left.n_centroid_packed, right.n_centroid_packed)
-        spec = NamedSharding(mesh, P(None, "x", "y"))
-        acc = jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=spec)()
+        acc = None
         for C in ((1, 2, 3) if A else (0,)):
             for D in ((1, 2, 3) if B else (0,)):
                 source = photon_block_view(
@@ -2026,21 +2024,18 @@ def photon_blocks_full_q(response, keys, *, term="W"):
                     source = source - photon_block_view(
                         response.V_packed, response.layout, C, D, mesh)
 
-                @partial(jax.jit, donate_argnums=(0,), out_shardings=spec)
-                def add(accumulator, parent):
-                    full = unfold_isdf_operator(
-                        parent, irr_idx=sym.irr_idx_q, sym_idx=policy.unfold_sym_idx,
-                        sym_perm=left.sym_perm, L_table=left.L_table,
-                        right_sym_perm=right.sym_perm, right_L_table=right.L_table,
-                        q_irr_frac=qfrac, mesh_xy=mesh, n_sym_spatial=policy.n_sym_spatial,
-                        axis_local_sym_perm=left.centroid_local_perm,
-                        right_axis_local_sym_perm=right.centroid_local_perm)
-                    mixed = mix_lorentz_blocks(
-                        {(C, D): full}, sym=sym, sym_idx=policy.unfold_sym_idx,
-                        mesh_xy=mesh, keys=((A, B),))
-                    return accumulator + mixed[A, B]
-                acc = add(acc, source)
-                del source
+                full = unfold_isdf_operator(
+                    source, irr_idx=sym.irr_idx_q, sym_idx=policy.unfold_sym_idx,
+                    sym_perm=left.sym_perm, L_table=left.L_table,
+                    right_sym_perm=right.sym_perm, right_L_table=right.L_table,
+                    q_irr_frac=qfrac, mesh_xy=mesh, n_sym_spatial=policy.n_sym_spatial,
+                    axis_local_sym_perm=left.centroid_local_perm,
+                    right_axis_local_sym_perm=right.centroid_local_perm)
+                mixed = mix_lorentz_blocks(
+                    {(C, D): full}, sym=sym, sym_idx=policy.unfold_sym_idx,
+                    mesh_xy=mesh, keys=((A, B),))
+                acc = mixed[A, B] if acc is None else acc + mixed[A, B]
+                del source, full, mixed
         yield (A, B), acc
         del acc
 
