@@ -119,3 +119,39 @@ def test_b_mpa_one_update_matches_references(core_fixtures):
     gain = float(re.search(r"SC map gain:.*? = ([0-9.e+-]+)", report)[1])
     assert gain == pytest.approx(0.185133, abs=1e-5)
     assert "SC done: 2 GW map calls" in report
+
+
+@pytest.mark.gpu
+def test_b_retained_escape_grows_grid_in_the_same_map(core_fixtures):
+    """He band 2 leaves the requested top but retains its live Sigma curve."""
+    if not harness.gpu_available():
+        pytest.skip("retained-state escape uses the GPU driver")
+
+    def prepare(source, target):
+        _stage(source, target)
+        # Map-zero band 2 is 7.499 eV above the fixed DFT midgap; its
+        # first QP output is 9.700 eV. Put the top 0.3 eV below that output.
+        deck = target / "mpa_sc1.in"
+        text = deck.read_text().replace(
+            "sigma_omega_patches_ev = -12:0, 1:12",
+            "sigma_omega_patches_ev = -12:0, 0.1:9.4")
+        text = text.replace("sigma_omega_step_ev = 1", "sigma_omega_step_ev = 0.1")
+        deck.write_text(text)
+        return target
+
+    run = rank_session.stage(core_fixtures / "B", prepare)
+    _run(run, "mpa.in", allow_runtime_solve=True)
+    _run(run, "mpa_sc1.in", allow_runtime_solve=True)
+    report = (run / "mpa_sc1.out").read_text()
+    first, second = report.split("SC iteration: call=0000 role=linear", 1)
+    assert "SC sampled-support growth" not in first
+    growth = second.index("SC sampled-support growth: band=2, k=0")
+    assert growth < second.index("Started Sigma tau sweep")
+    assert "protected=1-2 in_range=1" in second
+    from file_io.sigma_output import read_eqp_assembly_receipt
+    receipt = read_eqp_assembly_receipt(str(run / "mpa_sc1_sigma.h5"))
+    grid = np.asarray(receipt['omega_rel_ev'])
+    assert grid[-1] > 9.7
+    assert np.any(np.isclose(grid, 9.4))
+    # The final writer must retain the same grown support used by map 1.
+    assert np.max(receipt['eval_energies_rel_ev'][:, :2]) < grid[-1]

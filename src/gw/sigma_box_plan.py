@@ -658,8 +658,9 @@ def _sc_padded_box_spec(spec, eta):
         max(0.0, gamma_lo - frac * abs(gamma_lo)),
         gamma_hi + frac * abs(gamma_hi),
     ),)
+    support_frequencies = spec.get("sc_support_frequencies", spec["frequencies"])
     pole_box, _, _ = _box_for_window(
-        spec["frequencies"], spec["states"], padded_poles,
+        support_frequencies, spec["states"], padded_poles,
         spec["pole_sign"], eta)
     box = [
         min(spec["box"][0], pole_box[0]),
@@ -682,10 +683,15 @@ def _sc_padded_box_spec(spec, eta):
     # support has a 24-node rule at eps (lane QUADCHECK, 2026-09-05).  The
     # pad toward zero is capped at half the support's distance to zero; a
     # support that really crosses later is a box escape and rebuilds.
-    if spec["kind"] == "sign_definite_negative" and spec["box"][1] < 0.0:
+    support_box, _, _ = _box_for_window(
+        support_frequencies, spec["states"], spec["pole_stats"],
+        spec["pole_sign"], eta)
+    if spec["kind"] == "sign_definite_negative" and support_box[1] < 0.0:
         box[1] = min(box[1], 0.5 * spec["box"][1])
-    if spec["kind"] == "sign_definite_positive" and spec["box"][0] > 0.0:
+        box[1] = max(box[1], support_box[1])
+    if spec["kind"] == "sign_definite_positive" and support_box[0] > 0.0:
         box[0] = max(box[0], 0.5 * spec["box"][0])
+        box[0] = min(box[0], support_box[0])
     padded = dict(spec)
     padded["box"] = tuple(float(value) for value in box)
     padded["kind"] = (
@@ -997,6 +1003,12 @@ def plan_sigma_windows(
                 name=f"{branch.tag}:{name}", frequencies=frequencies,
                 states=states, pole_stats=pole_stats,
                 pole_sign=pole_sign, eta_ry=eta)
+            if fixed_rule_session is not None and "external_support_ev" in fixed_rule_session:
+                support = np.asarray(fixed_rule_session["external_support_ev"]) / RYD_TO_EV
+                spec["sc_support_frequencies"] = (
+                    np.asarray([min(frequencies[0], support[0]), frequencies[-1]])
+                    if branch.neg_omega_half else
+                    np.asarray([frequencies[0], max(frequencies[-1], support[1])]))
             spec.update({
                 "branch": branch,
                 "state_indices": flat_indices[local],

@@ -24,6 +24,26 @@ def test_pad_sizes(energy, pad):
     assert sc_state_pad_ev(-energy) == pytest.approx(pad)
 
 
+def test_certificate_covers_grown_external_samples_without_changing_evaluation():
+    from gw.sigma_box_plan import make_sigma_box_spec, _sc_padded_box_spec, _box_contains
+    from gw.scissor import extend_sc_omega_grid_ev, sc_padded_window_ev
+
+    grid = np.arange(41) * .25
+    args = dict(name="external-growth", states=np.array([5.]) / RYD_TO_EV,
+                pole_stats=[(1. / RYD_TO_EV, 1. / RYD_TO_EV, 0., 0.)],
+                pole_sign=1., eta_ry=.5 / RYD_TO_EV)
+    initial = make_sigma_box_spec(frequencies=grid / RYD_TO_EV, **args)
+    grown = extend_sc_omega_grid_ev(grid, [[10.1]], [[True]], .25)
+    later = make_sigma_box_spec(frequencies=grown / RYD_TO_EV, **args)
+    # Internal-state padding alone misses the added external frequencies.
+    assert not _box_contains(_sc_padded_box_spec(initial, args['eta_ry'])['box'], later['box'])
+    edges = sc_padded_window_ev(0., 10.)
+    support = extend_sc_omega_grid_ev(grid, [edges], [[True, True]], .25)
+    initial['sc_support_frequencies'] = support / RYD_TO_EV
+    assert _box_contains(_sc_padded_box_spec(initial, args['eta_ry'])['box'], later['box'])
+    np.testing.assert_array_equal(initial['frequencies'], grid / RYD_TO_EV)
+
+
 def test_hysteresis_enter_retain_escape():
     reference = np.array([[0.0, 4.9], [0.0, 5.1]])
     outside = _partition(reference, reference)
