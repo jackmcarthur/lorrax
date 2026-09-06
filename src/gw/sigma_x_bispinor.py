@@ -38,7 +38,6 @@ def compute_sigma_x_bispinor(
             families=(wfns_transverse,wfns_transverse), term=_TERM_X,
             response=response, Gij=Gij, meta=meta, mesh_xy=mesh_xy):
         sigma = value if sigma is None else sigma + value
-        sigma.block_until_ready()
     sigma = unfold_file_wedge_band_operator(sym, sigma, trs_rule="transpose")
     return _replicate_band_sigma(sigma, mesh_xy)[:, :wfns_transverse.slices.nb_sigma,
                                                 :wfns_transverse.slices.nb_sigma]
