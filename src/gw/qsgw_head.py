@@ -2050,7 +2050,7 @@ def _head_wings_sharded_face(
         # Parents-only storage: the wings are a sum over k, so stream the
         # children of one raw parent at a time (w_isdf.iter_parent_children_
         # faces) and accumulate; no full-k face is ever resident.  The
-        # velocity is on file at every k already (dipole.h5 covers nk_tot).
+        # velocity has already been restored by the typed polar action.
         if body_bra_wfns is not None or body_ket_wfns is not None:
             raise ValueError(
                 "head_wings_sharded(layout='face'): separately supplied "
@@ -3425,33 +3425,13 @@ def build_iteration_head_response(
     )
 
 
-def build_dft_head_response(
-    wfns,
-    omegas_ry,
-    *,
-    input_dir: str,
-    mesh: Mesh,
-    wfn,
-    meta,
-    config,
-    wfn_fingerprint_binding=None,
-) -> IterationHeadResponse:
-    """Build the one-shot DFT head on exactly the chi0 band manifold.
+def read_authenticated_dipole_velocity(
+    dipole_path, *, wfn, meta, config, wfn_fingerprint_binding=None,
+):
+    """Read file-wedge velocities and restore their polar time-odd full-k action."""
+    import h5py
+    from symmetry_maps import unfold_file_wedge_polar_matrix
 
-    This is the non-self-consistent entry to the same sharded direct-head and
-    wing kernels used by QSGW.  In particular, both ``S_direct`` and ``Y/Z``
-    use ``[b0,b4_chi)``; constructing the scalar from every band in a larger
-    dipole file while the body uses ``number_bands_chi`` is refused by shape
-    and slicing here rather than silently mixing transition manifolds.
-    """
-    import os
-    from common.chi_from_dipole import read_dipole_h5
-
-    dipole_path = os.path.join(input_dir, "dipole.h5")
-    if not os.path.exists(dipole_path):
-        raise FileNotFoundError(
-            "head_correction=full requires dipole.h5 to build the direct "
-            f"head and wings; missing {dipole_path}.")
     # Fail before the host read and every sharded head allocation.  Shape does
     # not identify a velocity artifact: in particular, a two-spinor dipole and
     # a kinetic-balance four-spinor dipole have the same (3,nk,nb,nb) shape.
@@ -3484,11 +3464,52 @@ def build_dft_head_response(
             "  want: dipole.h5 regenerated from this run's exact deck\n"
             "  why:  S_direct and the wings must use the same WFN and "
             "velocity operator as the finite-q charge response")
-    velocity_cart, _ = read_dipole_h5(dipole_path)
+    sym = wfn.symmetry()
+    b0, b4 = int(meta.b_id_0), int(meta.b_id_4_chi_user)
+    with h5py.File(dipole_path, "r") as h5:
+        velocity = h5["dipole_cart"]
+        if velocity.shape[1] != int(sym.nk_tot):
+            raise ValueError(
+                "dipole_cart must retain its full-BZ file indexing; "
+                f"got {velocity.shape[1]} rows, want {sym.nk_tot}")
+        parents = np.stack([
+            velocity[:, int(row), b0:b4, b0:b4]
+            for row in sym.kirr_fullids])
+    return np.moveaxis(unfold_file_wedge_polar_matrix(sym, parents), 1, 0)
+
+
+def build_dft_head_response(
+    wfns,
+    omegas_ry,
+    *,
+    input_dir: str,
+    mesh: Mesh,
+    wfn,
+    meta,
+    config,
+    wfn_fingerprint_binding=None,
+) -> IterationHeadResponse:
+    """Build the one-shot DFT head on exactly the chi0 band manifold.
+
+    This is the non-self-consistent entry to the same sharded direct-head and
+    wing kernels used by QSGW.  In particular, both ``S_direct`` and ``Y/Z``
+    use ``[b0,b4_chi)``; constructing the scalar from every band in a larger
+    dipole file while the body uses ``number_bands_chi`` is refused by shape
+    and slicing here rather than silently mixing transition manifolds.
+    """
+    import os
+
+    dipole_path = os.path.join(input_dir, "dipole.h5")
+    if not os.path.exists(dipole_path):
+        raise FileNotFoundError(
+            "head_correction=full requires dipole.h5 to build the direct "
+            f"head and wings; missing {dipole_path}.")
+    velocity_cart = read_authenticated_dipole_velocity(
+        dipole_path, wfn=wfn, meta=meta, config=config,
+        wfn_fingerprint_binding=wfn_fingerprint_binding)
     b0 = int(meta.b_id_0)
     b4 = int(meta.b_id_4_chi_user)
     nb_logical = b4 - b0
-    velocity_cart = np.asarray(velocity_cart)[:, :, b0:b4, b0:b4]
     energies = jnp.asarray(wfns.enk[:, :nb_logical])
     occupations = jnp.asarray(wfns.occ[:, :nb_logical])
     if velocity_cart.shape[1:] != (

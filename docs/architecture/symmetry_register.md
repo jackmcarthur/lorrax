@@ -701,6 +701,13 @@ the scalar-operator star relation but is not stored. Production consumers now
 obtain this matrix as `cartesian_action(..., axial=False, time_odd=True)`;
 they do not choose the transpose or sign independently.
 
+The one-shot scalar and packed head consumer,
+`qsgw_head.read_authenticated_dipole_velocity`, reads only `kirr_fullids`
+and the active chi band window after authenticating the existing full-BZ
+file. `unfold_file_wedge_polar_matrix` restores the velocity for the shared
+head and parent-star wing kernels. The file indexing and provenance stay
+unchanged; no `deltaE` payload is read by this consumer.
+
 #### …and the SAME sign applies to the QSGW velocity — derived 2026-08-22
 
 The row above measured the parity of the **bare** term. The head lane
