@@ -56,7 +56,7 @@
 | 9×9 arm | P/F total s | Screening P/F s | Sigma P/F s | Compiles P/F | Class | Step / path |
 |---|---|---|---|---|---|---|
 | Prior static P4 |70.10 /69.03|29.14 /21.89|21.40 /23.60|641 /606|copied ζ: exact FAIL0.766µeV|57988457/lx-Xg4-131617-747058-1237; R124/125|
-| Current static/dynamic P4 |queued|—|—|—|copied ζ: exact|R204_speed_9x9_P4/05_matrix|
+| Current static/dynamic P4 |initial matrix complete; matched dynamic queued|—|—|—|copied ζ: exact failures; unmatched dynamic rules|R204_speed_9x9_P4/05_matrix; matched R208_speed_9x9_P4_matched|
 | Current static/dynamic P16 |queued|—|—|—|copied ζ: exact|R216_speed_9x9_P16/05_matrix|
 
 | Unit compile events (captured families) | P4 P/F | P16 P/F | Module / scope | Mapping |
@@ -125,3 +125,11 @@
 | Audit correction | Effect | Evidence |
 |---|---|---|
 | Claim1360 clean-interval assertion withdrawn | Own-ζ EQP identity remains exact; own-ζ timing comparisons above are diagnostic, excluded from non-regression verdict. Copied-ζ pair remains clean. | D/gpu_overlap_audit.json:57988457.94 overlaps.93/.95 on nid001112; claim correction below |
+
+| 9×9 P4 initial arm | Total s | Screening support s | Rule plan s | τ s | Other Σ s | Compiles / s | Acceptance / timing scope |
+|---|---:|---:|---:|---:|---:|---|---|
+| P static fe2a6937 |75.57|28.29|—|—|22.62|616 /40.64|copied ζ: exact FAIL0.766µeV; startup overlaps another GPU step, no clean wall claim|
+| F static e1559a07 |72.68|22.94|—|—|24.52|606 /31.93|same pair; prior clean static124/125 retained|
+| P dynamic fe2a6937 |123.83|22.22|10.57|12.50|36.56|854 /60.73|copied ζ: exact FAIL8.668µeV; independently selected rules|
+| F dynamic e1559a07 |176.15|19.92|69.20|11.70|36.68|813 /48.89|different rule policy; not a matched-node speedup|
+| Step / audit |57988457/lx-Xg4-145514-1252010-5546 exit0|.107 overlaps.106 for60s during first static startup|—|—|—|D/gpu_overlap_audit.json|matched rules: D12_nine_common_rules; P4 follow-up R208; P16 R216 uses same certificates|
