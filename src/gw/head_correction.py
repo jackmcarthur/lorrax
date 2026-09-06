@@ -1581,8 +1581,8 @@ def complete_static_slab_photon_q0(
         left_rows, right_rows = images[0][image], images[1][image]
         V_packed = add_photon_q0_low_rank(
             V_packed, layout, mesh_xy,
-            left_rows_X=jax.device_put(left_rows, sh_x),
-            right_rows_Y=jax.device_put(right_rows, sh_y))
+            left_rows_X=device_put_process_local(left_rows, sh_x),
+            right_rows_Y=device_put_process_local(right_rows, sh_y))
 
     left_basis = (
         left_bare,
@@ -1606,8 +1606,8 @@ def complete_static_slab_photon_q0(
                 left_image, right_image = images[0][image], images[1][image]
                 W_packed = add_photon_q0_low_rank(
                     W_packed, layout, mesh_xy,
-                    left_rows_X=jax.device_put(left_image, sh_x),
-                    right_rows_Y=jax.device_put(right_image, sh_y))
+                    left_rows_X=device_put_process_local(left_image, sh_x),
+                    right_rows_Y=device_put_process_local(right_image, sh_y))
             screened_pairs.append((left_basis[u], right_rows))
 
     evidence = StaticSlabPhotonHeadCompletion(
