@@ -1422,7 +1422,8 @@ def _head_wings_sharded_face(
         Y_x = Z_y = None
         for rows, child in iter_parent_children_faces(
                 wfns.green_parent, mesh, slices=wfns.slices):
-            r = jnp.asarray(rows, dtype=jnp.int32)
+            r = device_put_process_local(
+                np.asarray(rows, np.int32), NamedSharding(mesh, P(None)))
             y, z = _head_wings_sharded_face(
                 jnp.take(v_all, r, axis=1), child, jnp.take(e_all, r, axis=0),
                 jnp.take(f_all, r, axis=0), omegas_ry, mesh=mesh,
@@ -1508,7 +1509,8 @@ def _head_wings_sharded_face(
     include_surface = surface_weight_kn is not None
     surface = (
         jnp.asarray(surface_weight_kn, dtype=jnp.float64)
-        if include_surface else jnp.zeros_like(e))
+        if include_surface else device_put_process_local(
+            np.zeros(e.shape, np.float64), NamedSharding(mesh, P(None, None))))
     if surface.shape != e.shape:
         raise ValueError(
             f"surface_weight_kn shape {surface.shape} does not match {e.shape}.")

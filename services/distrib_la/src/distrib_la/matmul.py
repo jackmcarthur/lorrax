@@ -185,8 +185,8 @@ def _validate_operands(A, B, C, transa: str, transb: str):
 
 
 def _zeros(shape, dtype, sharding):
-    return jax.jit(
-        lambda: jnp.zeros(shape, dtype=dtype), out_shardings=sharding)()
+    """Allocate a zero operand directly on the GEMM plan's declared sharding."""
+    return jnp.zeros(shape, dtype=dtype, device=sharding)
 
 
 def _cublasmp(mesh, A, B, C, *, alpha: complex, beta: complex,
