@@ -884,6 +884,7 @@ def test_get_enk_bandrange_default_nspinor_is_read_from_the_wfn():
     en = np.array([[[0.0, 1.0, 2.0, 3.0]]])       # (nspin=1, nk_irr=1, nb=4)
     wfn = SimpleNamespace(energies=en, efermi=1.5, nspinor=1)
     sym = SimpleNamespace(irr_idx_k=np.array([0, 0]))
+    wfn.symmetry = lambda: sym
 
     enk_d, w_d = get_enk_bandrange(wfn, sym, (0, 4), (1, 3))
     enk_1, w_1 = get_enk_bandrange(wfn, sym, (0, 4), (1, 3), nspinor=1)

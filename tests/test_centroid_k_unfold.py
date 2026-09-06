@@ -45,6 +45,7 @@ def _symmetry_fixture():
             rows.shape + (nspinor, nspinor)).copy()
 
     sym = SimpleNamespace(
+        parent_k_domain="ibz",
         sym_matrices=np.stack([identity, swap_xy]),
         sym_mats_k=np.stack([identity, swap_xy]),
         translations=np.zeros((2, 3), dtype=np.float64),

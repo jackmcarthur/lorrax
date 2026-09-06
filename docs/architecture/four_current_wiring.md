@@ -740,3 +740,8 @@ The head attribution flag controls diagnostics only: both packed dispatch paths 
 The Gamma completion transports rank-four factor pairs over the authenticated active group and averages their products through `_photon_q0_factor_orbit`; physical updates and optional head attribution share that owner. The carrier stores the original factor pairs plus family-plan metadata, not a dense group projector. Dynamic tau projection accumulates file-wedge band rows and applies `unfold_file_wedge_band_operator(..., trs_rule="transpose")` after the frequency sum. Its Green endpoint transpose may be supplied directly by the sole planned Green GEMM, with unchanged complex-time weights; the typed symmetry service owns its placement and transport. See the 2026-09-06 decision for this interface correction.
 
 BSE restart reads select valence/conduction bands from canonical `psi_parent_y`, authenticate their WFN/centroid/parent-row provenance, and pack/unfold/unpack through the same typed parent plan before entering existing BSE contractions. Legacy `psi_full_y` files remain readable. This boundary expands only the requested BSE bands and does not add a GW full-k carrier.
+
+For nonclosed centroid admission, both families share one computational
+`SymMaps.trivial_view()` and loader-unfolded full-k parents. The original
+loader symmetry still defines file-wedge output and authenticated head
+velocities. See [the parent-fit admission contract](zeta_fit_face_psi_cct.md#unreduced-admission-for-nonclosed-centroid-sets).

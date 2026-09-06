@@ -1357,3 +1357,12 @@ claim1275 compares every P4 X/Y selected-face shard to the P1 canonical
 reference bit-for-bit, including399-to400 zero padding. V/W remain distributed
 on both processor axes. Full parent-row coverage does not imply an identity
 action: the authenticated file may still use time-reversed rows.
+
+Nonclosed centroid admission uses the same parent route with the group
+restricted by `SymMaps.trivial_view()`. Its identity k/q tables describe the
+computational carrier, while the original `WfnLoader.symmetry()` describes
+raw file rows and their authenticated G-sphere action. Mixing those domains
+causes an out-of-bounds file-energy/Hartree read or inconsistent rotation
+metadata; file-output reductions explicitly use the loader's map. This is
+a restriction of the computational group, not a revised physical TRS
+measurement. See [the binding admission ruling](decisions.md).

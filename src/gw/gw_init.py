@@ -837,7 +837,7 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 			wfn, sym, meta_T, cent_T_idx, True, mesh_xy,
 			band_range=band_slices.full_range, band_chunk_size=int(band_chunk_size),
 			k_chunk_size=k_chunk_size, bispinor_lift=representation.current_lift,
-			k_domain="ibz")
+			k_domain=sym.parent_k_domain)
 	nmu, mun = parent_faces(psi_y, psi_x, mesh_xy=mesh_xy)
 	psi_y = psi_x = None
 	enk, _ = get_enk_bandrange(wfn, sym, band_slices.full_range,
@@ -3033,7 +3033,7 @@ def _prepare_parent_wavefunction_plan(
 			"has not been ported to raw parents; use screening_diagrams = w_rpa.")
 	plan = build_centroid_k_unfold_plan(
 		sym, centroid_indices, meta.fft_grid, mesh_xy,
-		nspinor=int(meta.nspinor), parent_k_frac=wfn.kvecs(k='ibz'),
+		nspinor=int(meta.nspinor), parent_k_frac=wfn.kvecs(k=sym.parent_k_domain),
 		layout=meta.mu_basis.layout)
 	return plan, True, True
 
@@ -3163,7 +3163,7 @@ def prepare_isdf_and_wavefunctions(
 					k_chunk_size=(chunks['centroid_k_chunk'] if chunks is not None
 					              else zeta_contract.loader_k_chunk),
 					bispinor_lift=(representation.charge_lift or "raw"),
-					k_domain="ibz")
+					k_domain=sym.parent_k_domain)
 			from .wavefunction_bundle import parent_faces
 			_parent_green_faces = parent_faces(parent_y, parent_x, mesh_xy=mesh_xy)
 			del parent_y, parent_x

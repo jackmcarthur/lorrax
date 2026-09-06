@@ -2029,7 +2029,7 @@ def _dft_psi_sphere(inputs):
     # prevents a later calculation in the same process from reusing a buffer
     # whose devices belong to an earlier runtime.
     key = (id(inputs.wfn), id(inputs.mesh_xy), b_lo, b_hi,
-           carrier_bispinor, carrier_lift)
+           carrier_bispinor, carrier_lift, inputs.sym.parent_k_domain)
     hit = _PSI_G_CACHE.get(key)
     if hit is None:
         # ONE-TIME ROW.  The section is entered every iteration but only
@@ -2040,7 +2040,7 @@ def _dft_psi_sphere(inputs):
         with timing.section("vh.psi_load"):
             spec = band_sphere_spec()
             psi = inputs.wfn.load(
-                bands=(b_lo, b_hi), k="ibz", sharding=spec,
+                bands=(b_lo, b_hi), k=inputs.sym.parent_k_domain, sharding=spec,
                 bispinor=carrier_bispinor,
                 bispinor_lift=carrier_lift)
             # Use the loader's canonical resident index.  rho_from_wfns and
@@ -2049,7 +2049,7 @@ def _dft_psi_sphere(inputs):
             # made each SC map independently stage the same replicated
             # nk*Ngrid*i32 buffer.
             bidx = inputs.wfn.box_index_dev(
-                k="ibz", mesh=inputs.mesh_xy)
+                k=inputs.sym.parent_k_domain, mesh=inputs.mesh_xy)
         hit = (psi, bidx)
         _PSI_G_CACHE[key] = hit
     return hit
@@ -2221,7 +2221,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
                 bool(getattr(inputs.config, "sys_dim", 3) == 2),
                 tt_metric_sign=float(COULOMB_GAUGE_TT_SIGN))
 
-    gtab = padded_gvectors(inputs.wfn, k="ibz")
+    gtab = padded_gvectors(inputs.wfn, k=inputs.sym.parent_k_domain)
     psi_charge = psi_G[:, :, :charge_ns, :]
     geom_matrix = SweepGeometry(
         mesh=inputs.mesh_xy, fft_grid=grid,
@@ -4277,7 +4277,7 @@ def _write_sc_eqp_snapshot(
 
     def _to_file_wedge(a):
         return np.asarray(
-            reduce_full_bz_to_file_wedge(sym, np.asarray(a)),
+            reduce_full_bz_to_file_wedge(inputs.wfn.symmetry(), np.asarray(a)),
             dtype=np.float64)
 
     def _loop_to_file_wedge(a):
@@ -6292,7 +6292,7 @@ def dump_qp_wfn_artifacts(
     # labels ``write_qp_wfn_h5`` writes are ``wfn.kpoints`` and this is the
     # selection that produces exactly those rows in exactly that order.
     enk_wfn_ry, U_wfn = (
-        np.asarray(reduce_full_bz_to_file_wedge(sym, np.asarray(a)))
+        np.asarray(reduce_full_bz_to_file_wedge(wfn.symmetry(), np.asarray(a)))
         for a in (enk_full_ry, U_full))
     nk_full = int(U_full.shape[0])
     nk_wfn_got, nk_wfn_want = int(U_wfn.shape[0]), int(wfn.nkpts)
@@ -6354,9 +6354,9 @@ def dump_qp_wfn_artifacts(
             kpoints_crys=np.asarray(sym.unfolded_kpts, dtype=np.float64),
             nkx=int(kgrid[0]), nky=int(kgrid[1]), nkz=int(kgrid[2]),
             kpoints_reduced=np.asarray(wfn.kpoints, dtype=np.float64),
-            kirr_to_kfull=np.asarray(sym.kirr_fullids, dtype=np.int32),
+            kirr_to_kfull=np.asarray(wfn.symmetry().kirr_fullids, dtype=np.int32),
             k_storage=str(qp_rotations_k_storage),
-            star_tables=_sm.star_tables_of(sym),
+            star_tables=_sm.star_tables_of(wfn.symmetry()),
             source_wfn=wfn,
             print_fn=print_fn,
         )

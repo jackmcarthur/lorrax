@@ -311,6 +311,8 @@ def _wedge_sweep_kspec(wfn, sym):
     deck cut at a true IBZ takes byte-for-byte the path it always took —
     same loader cache key, same read, same scan.
     """
+    if sym.parent_k_domain == "full_bz":
+        return "full_bz", wfn.kvecs(k="full_bz"), int(sym.nk_tot)
     rows, _ = star_wedge_rows(sym)
     kpts = np.asarray(wfn.kpoints, dtype=np.float64)
     n_red = int(wfn.nkpts)

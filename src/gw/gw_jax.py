@@ -434,6 +434,16 @@ def main(argv=None):
 	sym = wfn.symmetry()
 	centroid_basis = load_centroid_basis(
 		config.paths.centroids_file, wfn.fft_grid, sym=sym)
+	centroid_sets = [centroid_basis]
+	if config.bispinor and config.paths.centroids_file_current:
+		centroid_sets.append(load_centroid_basis(
+			config.paths.centroids_file_current, wfn.fft_grid, sym=sym))
+	nonclosed = [basis.path for basis in centroid_sets if not basis.orbit_closed]
+	if nonclosed:
+		print0("WARNING: non-orbit-closed centroid set(s): " + ", ".join(nonclosed)
+		       + "; using unreduced parents (n_parent = nk) and full q on the same "
+		       "parent route. Generate orbit-closed centroids with kmeans to restore reduction.")
+		sym = sym.trivial_view()
 	centroid_indices = centroid_basis.centroid_indices
 	n_rmu = centroid_basis.n_rmu
 	# This receipt is reporting evidence.  ``resolve_qgrid_symmetry_tables``
@@ -1513,7 +1523,7 @@ def main(argv=None):
 			omega_dft_rel_ev=omega_dft_rel_ev,
 			head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
 			omega_grid_ry=omega_grid_ry,
-			sym=sym,
+			sym=sym, file_sym=wfn.symmetry(),
 			e_eval_ev=e_eval_ev,
 			print_fn=print0,
 		)

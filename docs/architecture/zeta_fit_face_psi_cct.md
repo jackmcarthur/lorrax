@@ -147,3 +147,14 @@ The sandbox campaign report `reports/bisp_parent_route_2026-09-05/report.md`
 records their job IDs, strict array residuals, QP comparisons and open items.
 Historical face-route measurements remain in this page's git history;
 they are not evidence that a retired GW route remains selectable.
+
+## Unreduced admission for nonclosed centroid sets
+
+A nonclosed charge or current centroid set selects the service-owned
+`SymMaps.trivial_view()` before either family is packed. `parent_k_domain`
+then requests loader-unfolded full-k states for the same centroid and G-space
+stores; the existing plan has `n_parent = nk`, identity actions and every q
+row. The original loader remains authoritative for file energies and the
+G-sphere unfold. No deleted full-k Zq or Green kernel is reinstated. The
+binding admission ruling is in [decisions.md](decisions.md); the historical
+fixtures keep their original centroid coordinates and printed references.
