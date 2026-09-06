@@ -55,7 +55,8 @@ block for antiunitary rows. `U_spinor` stays 2×2; the named helper receives
 indices, and `mix_lorentz_blocks` applies its tensor product separately to
 rectangular CC/CT/TC/TT sectors. Missing source blocks are zero. Complex
 conjugation belongs to the scalar operator unfold, never the real mixer.
-The old TT mixer remains only as a test oracle pending the final deletion gate.
+The old TT mixer and its private cache/export are deleted. Explicit numerical
+fixtures retain the former TT rule as an independent oracle.
 `CentroidKUnfoldPlan.unfold_face` owns the GW endpoint seam; static photon
 and bare TT Sigma apply their vertices after that typed transport and sum
 Lorentz sectors on parents before `unfold_file_wedge_band_operator`.
@@ -68,9 +69,10 @@ This action does not change any centroid fixture.
 ## 2. Cartesian and Pauli-vector actions
 
 `SymMaps.cartesian_action` owns forward orientation, polar/axial parity, and
-time parity. The bispinor TT mixer requests an axial, time-odd action per
-Pauli index; its two TR signs cancel. A future charge-current tile must request
-one polar, time-odd index rather than reuse the two-index TT rule.
+time parity. `SymMaps.lorentz_action` supplies the polar, time-odd current
+index used by `mix_lorentz_blocks`. TT carries two current indices; CT and
+TC carry one. Scalar centroid transport owns antiunitary conjugation.
+No caller derives a separate rotation or reuses a two-index TT rule for CT.
 
 ## 3. Wavefunction / orbital rotation
 
@@ -756,16 +758,12 @@ permutation, which nothing in the tree currently builds.
 the current symmetry map. Judge the rule on the two decks whose fixtures ARE
 star-consistent.
 
-**`dipole.h5` was NOT converted, and the reason is the standing HOLD, not the
-arithmetic.** The rule above is the same shape as the one the bispinor
-unfolding audit is deciding — an `R` on a component index plus a sign under
-time reversal — and §2 of this page records `mix_channels_by_proper_rotation`
-as carrying **exactly** that unresolved disagreement (the offline fixture is
-transposed row-for-row against live code, and its TRS half carries `−R` where
-live code carries `+R`). Building a second Cartesian-index unfold while the
-convention is under audit would confound both efforts. The measurement above
-is offered to that audit as a second, independent data point on a
-non-bispinor quantity.
+**Historical dipole scope.** The measurement above did not convert
+`dipole.h5`. Its original blocker was the then-unresolved TT rotation audit.
+The four-current action is now resolved by the typed service described in
+§§1–2; the deleted `mix_channels_by_proper_rotation` is no longer an owner.
+That resolution does not itself migrate dipole storage or certify its
+Cartesian-index unfold.
 
 ### `v_q_bispinor.h5` — q parents and two centroid families
 

@@ -13,11 +13,13 @@ Deck-key semantics are owned by the [input reference](../input_reference.md).
 Module one-liners are owned by [Codebase](codebase.md). Where those pages
 disagree with this one, they win — this page owns the *wiring* only.
 
-> **Pinned to integration tip `34228021` (2026-09-02).** The sole phase and
+> **Parent-route wiring updated 2026-09-06 on the BISP feature branch.**
+> Older line-number locators below refer to `34228021`; named owners and
+> the parent-route sections describe the current implementation. The sole phase and
 > coverage statement is on the
 > [theory page](../theory/four-current-head-corrections.md#four-current-phase-status).
-> Every source citation below was re-read at this tip: the line is a locator,
-> while the named function or gate is the durable owner.
+> Use the named function as the durable locator; historical line numbers
+> are not a claim about the current source position.
 
 ## The routes
 
@@ -47,13 +49,15 @@ It therefore remains on the incumbent bare-transverse Sigma route. The packed
 dynamic route's run-record line is `Photon Sigma`, beside `Photon route` and
 `Photon head`.
 
-**ONE envelope table at `34228021`.**
+**One envelope owner: `gw_config.packed_static_envelope`.**
 It used to be written twice — six conditions in
 `packed_bare_transverse_route` and seventeen in
 `refuse_unsupported_bispinor_gw`, five of them restated with separately
 formatted `got`/`want` strings. Both now walk
 `gw_config.packed_static_envelope(config, *, screened)` (`:3655`), which
-yields `(accepted, got, want, klass, why, derived_key)`:
+yields `(accepted, got, want, klass, why, derived_key)`. The table also
+shows configuration coercion and the downstream restart-file contract;
+those are not extra duplicate envelope predicates:
 
 | # | row | applies to | class |
 |---|---|---|---|
@@ -61,16 +65,14 @@ yields `(accepted, got, want, klass, why, derived_key)`:
 | 2 | `qp_solver = one_shot_dft` | both | IMPLEMENTATION LIMIT |
 | 3 | `screening_diagrams = w_rpa` | both | IMPLEMENTATION LIMIT |
 | 4 | `head_correction ∈ {full, off}` | both | PHYSICS/POLICY (row 20) |
-| 5 | `restart = false` | both | IMPLEMENTATION LIMIT — normally unreachable on a slab deck, which `GATE bispinor_slab_cohsex_restart_changes_the_head_mechanism` (`:3895`) refuses at parse time |
-| 6 | `low_mem_bands = true` | screened | IMPLEMENTATION LIMIT, **derived when unnamed** |
-| 7 | `linalg = distributed` | screened | IMPLEMENTATION LIMIT, **declared** |
+| 5 | authenticated parent restart, when requested | both | File readers require canonical parent faces and stored Γ factors; missing old-file factors refuse |
+| 6 | parent carrier | both | `low_mem_bands` defaults true; false warns and proceeds on parents |
+| 7 | `linalg = distributed` | both packed modes | IMPLEMENTATION LIMIT, **declared** |
 | 8 | no scalar q→0 head override named (`scalar_head_overrides_named`, `:3621`) | screened | IMPLEMENTATION LIMIT — ONE conjunct for the eight `use_bgw_vcoul` / `wcoul0_*` / `*head*` / `mc_average_placement*` keys, naming only the ones the deck set |
 
-Row 6 may be **derived when unnamed**: `LorraxConfig.from_input_file` sets it
-for `full_static_cohsex` with a `[config provenance]` line, promoting only
-when every other row already passes, so a deck outside the envelope for
-another reason still sees *that* reason. Row 7 is declared: the global
-`linalg` default remains `local`, and a packed route must explicitly request
+Row 6 is enforced at configuration parsing: both accepted spellings select
+parents, with a visible retirement warning for false. Refusal-by-name remains
+pending under the owner ruling. Row 7 is declared: packed routes require
 `distributed`. Material class is also outside the
 table: the driver infers it from the loaded WFN occupations, and
 `validate_material_inputs` refuses every fractional-occupation non-MPA run
@@ -277,14 +279,14 @@ the bulk reach the old envelope gave it.
 | charge centroid indices | `gw_jax.py:392-395` → `file_io/centroids.load_centroid_basis` (`:122-174`) | `(n_mu_C, 3)` i64 | host | both |
 | current centroid indices | `gw_init.py:1429-1441` (refusal `:1425-1428` if the key is unset) | `(n_mu_T, 3)` i32 | host until needed | both |
 | `meta_transverse` | `gw_init.py:1442-1447` | `Meta` with `n_rmu = n_mu_T`, `nspinor = 4`, `npol = 4`, `n_rmu_padded = padded_mu_extent(...)` | — | both |
-| four-spinor ψ | `common/bispinor_init.lift_to_4spinor` (`:234`) | `(n_k, nb, 4, ngkmax)` c128, `[ψ_L; ψ_S]` on the spinor axis | caller wraps; no sharding inside | both |
-| face ψ carriers | `common/wfn_layout.py:12-13`; transverse copies `gw_init.py:2412-2419` | `(nk, n_X, s, mu_Y)` / `(nk, s, mu_X, n_Y)` | `P(None,'x',None,'y')` / `P(None,None,'x','y')` | both |
+| four-spinor ψ | `common/bispinor_init.lift_to_4spinor` (`:234`) | `(n_parent, nb, 4, ngkmax)` c128, `[ψ_L; ψ_S]` on the spinor axis | caller wraps; no sharding inside | both |
+| raw-parent ψ carriers | `wavefunction_bundle.ParentGreenCarrier`; `gw_init` prepares separate C/T families | `(n_parent, n_X, 4, mu_Y)` / `(n_parent, 4, mu_X, n_Y)` | `P(None,'x',None,'y')` / `P(None,None,'x','y')` | both; child faces are transient |
 | charge ζ | `gw_init.py:2209-2239` → `isdf_fitting.fit_zeta_to_h5` | `tmp/zeta_q.h5`, `(n_q_disk, n_mu_C, ngkmax)` c128 | accumulator `(n_q_disk, n_mu_padded, ngkmax)` at `P(None,('x','y'),None)` (`isdf_fitting.py:1404-1409`) | both |
 | three transverse ζ | `gw_init.py:2448-2499` (`_fit_transverse_channel`, `vertex_mu_L = 1,2,3`) | `tmp/zeta_q_mu{1,2,3}.h5`, `(n_q_disk, n_mu_T, ngkmax)` c128 | same | both |
 | `C_q` (CCT Gram) | `isdf_fitting.py:743-751` | `(nq, n_mu_padded, n_mu_padded)` | `P(None,'x','y')` — layout contract `isdf/core.py:4960-4966` | both |
-| bare `D^{IJ}` tiles | `v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5` (`:261-581`) | `v_q_bispinor.h5`, 7 datasets `(n_q_total, n_mu_L, n_mu_R)` c128 | device buffer `P(None,'x','y')` (`v_q_g_flat.py:492-494`) | both |
+| bare `D^{IJ}` tiles | `v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5` (`:261-581`) | `v_q_bispinor.h5`, 7 datasets `(n_q_irr, n_mu_L, n_mu_R)` c128 | device buffer `P(None,'x','y')` (`v_q_g_flat.py:492-494`) | both |
 | tile reader | `v_q_bispinor.BispinorVqReader.get_tile` (`:682-716`) | `(n_q, n_L_padded, n_R_padded)` c128 | `P(None,'x','y')`; Hermitian companions read at `P(None,'y','x')` then conj-swapped (`:704-709`) | both |
-| `photon_g0_vectors` | `v_q_bispinor.py:575-581` | 4-tuple, each `(n_q_full, n_mu_padded)` c128 | `P(None,'x')` | released to `None` unless `uses_coupled_photon_head` (`gw_init.py:2862-2864`) — **P** |
+| `photon_g0_vectors` | `v_q_bispinor` writer/reader | four canonical `(1,n_mu)` datasets; padded/packed at read | `P(None,'x')` | authenticated Γ completion and restart — **P** |
 
 **Sixteen tiles, seven on disk.** Six `(0,i)`/`(i,0)` tiles are exactly zero
 by Coulomb gauge (`ZERO_TILES`, `v_q_bispinor.py:67-70`); three `(j,i)` with
@@ -300,18 +302,15 @@ raw-parent bands, unfold the open-spin projector through the symmetry
 service, then apply the fixed output-spin vertices. Coupled mu123 shares
 the parent projector build; each saved ζ file remains canonical and q-IBZ.
 
-**The coupled ζ schedule.** The Y-side face transform and the full-spin X
-broadcast are channel-independent, so μ_L = 1,2,3 share one
-built-once-per-r-chunk `[3, q, μ, r]` `Z_q` stack instead of repeating it
-three times (`isdf/core.py:2620-2626`). Entry `gw_init.py:2520-2550`
-(coordinator `:1745-1922`, route chooser `:1924-1947`, capacity block
-`:2082-2189`);
-kernel `isdf/core._z_q_face_coupled_mu123` (`:2795-2833`). The coupled
-out-spec is `P(None,None,'x','y')` against the scalar `P(None,'x','y')`
-(`isdf/core.py:2420-2421` vs `:2337-2340`). `distrib_la_batched_route` reaches
-this fit through `gw_init.py:2076-2077` → `:2465`, so the same key that
-governs generic batched linalg governs the transverse ζ schedule.
-Full design: [Face-ψ ζ fitting](zeta_fit_face_psi_cct.md).
+**The coupled ζ schedule.** `_z_q_face_parent(coupled_mu123=True)`
+shares raw-parent open-spin projectors and the transported left tail across
+three current channels. It builds one `[3,q,μ,r]` stack per orbit tile with
+`P(None,None,'x','y')`; each channel keeps its own vertex, solve and canonical
+q-IBZ output. `_z_q_face_coupled_mu123` and the full-k C/Z fallback kernels
+are deleted. The existing fit coordinator controls channel scheduling.
+The outer `gw_jax.zeta_fit_transverse` timer measures the current-fit wall
+interval; overlapping worker intervals must not be summed.
+Full design: [Parent ζ fitting](zeta_fit_face_psi_cct.md).
 
 **The bare TT head slot** (route B). ONE gate refuses it on either packed
 route now that the deck key is gone:
@@ -358,7 +357,7 @@ selects:
 
 Both modes then run **one** Γ-cell completion (§3b). The per-rank resident
 byte figure for the packed body is measured and printed at the site
-(`:2112-2134`, the print itself `:2129-2134`): `16·n_k·N_packed²/P` bytes each for `V_packed` and
+(`:2112-2134`, the print itself `:2129-2134`): `16·n_q_irr·N_packed²/P` bytes each for `V_packed` and
 `W_packed`. That carrier is **new to the bare route** — the incumbent route
 held one TT tile at a time — and is the same object the screened mode
 already held.
@@ -367,7 +366,7 @@ already held.
 |---|---|---|---|
 | one no-pair block `χ^{IJ}_0` | `w_isdf.compute_no_pair_dirac_current_block` (`:1665`) | `(nq, μ_L, μ_R)` c128 | `P(None,'x','y')` |
 | the sixteen blocks (`screen_current = True` only) | `compute_experimental_no_pair_photon_chi0` (`:1788`); T1/T2/T3 share one transverse bundle | — | — |
-| TT Ward subtraction | `_subtract_static_tt_contact` (`:1776`), applied inside the sixteen-block builder | `Π(q) − Π(0)` | in place, buffer donated |
+| TT Ward subtraction | `_subtract_static_tt_contact` (`:1776`), applied inside the sixteen-block builder | `Π(q_irr) − Π(Γ)` before Dyson/star unfold | covariant contact follows typed block transport |
 | packed `V`, `χ_0`, `W` | `photon_layout.pack_photon_operator` (`:219`), `w_isdf.solve_w` (`:1431`) | `(nq, N_packed, N_packed)` c128 | `P(None,'x','y')` |
 
 `N_packed` is `PhotonBasisLayout.packed_extent` (`photon_layout.py:107-109`),
@@ -707,7 +706,8 @@ Both endpoint families carry raw four-spinor parent faces in their own packed
 centroid orders. The current-response kernel takes `(plan_left, plan_right)`
 and integer `(A,B)` vertices. Typed face transport precedes the vertex trace;
 the completed χ block is selected on the q-IBZ rows. The experimental TT
-contact subtraction remains the same model.
+contact subtracts the Γ row at q-IBZ before Dyson, then follows typed star
+transport. It preserves the proxy model while correcting its covariance.
 
 V and W stay packed at q-IBZ. `photon_blocks_full_q(response, keys, term=...)`
 restores V, W or W−V one requested Lorentz block at a time. It uses the measured

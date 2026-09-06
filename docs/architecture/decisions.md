@@ -640,7 +640,7 @@ is inferred from the CUDA kernel's internal scratch alone.
 - Every performance claim carries a job id and an on-disk artifact.
 
 
-## 2026-09-05 — covariant four-current parent route (integrator ruling)
+## 2026-09-05 — covariant four-current parent route (owner-confirmed ruling)
 
 Four-spinor transport uses the symmetry service's `diag(U₂, det(S) U₂)` action;
 Lorentz blocks use its scalar centroid transport followed by `Λ ⊗ Λ`, with
@@ -648,10 +648,12 @@ Lorentz blocks use its scalar centroid transport followed by `Λ ⊗ Λ`, with
 The experimental TT Ward proxy subtracts the Γ row on q-IBZ before Dyson and
 star transport. Its full-q counterpart subtracts the transported contact, not
 a constant unphased Γ matrix. The incumbent-versus-covariant MoS2 QP/sector
-price remains an explicit acceptance measurement, subject to owner override.
+price remains an explicit acceptance measurement. The owner confirmed this
+placement and rejected a centroid-diagonal contact: real-space locality does
+not imply diagonality in the centroid representation.
 
-The integrator permits temporary `low_mem_bands` acceptance when the single
-parent carrier lands: false warns that the full-k carrier no longer exists and
+The owner permits temporary `low_mem_bands` acceptance on the single
+parent carrier: false warns that the full-k carrier no longer exists and
 proceeds on parents. Refusal-by-name remains the owner's pending ruling.
 
 The shared static Sigma consumer is `contract_lorentz_blocks`; packed X/SX/COH
