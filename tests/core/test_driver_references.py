@@ -96,8 +96,14 @@ def test_b_mpa_one_update_matches_references(core_fixtures):
                 atol=MPA_EQP_ATOL_EV)
 
     _run(run_b, "mpa_sc1.in", allow_runtime_solve=True)
-    _assert_eqp(run_b / "mpa_sc1_eqp0.dat", source_b / "mpa_sc1_eqp0.dat")
-    _assert_eqp(run_b / "mpa_sc1_eqp1.dat", source_b / "mpa_sc1_eqp1.dat")
+    # MPA tolerance, as for the one-shot references above: the SC window
+    # state set carries the padded active extent, so the certified rules
+    # (eps 1e-3) differ between P1 and P4 and the map output moves ~0.1 meV
+    # (registered on main, 2026-09-06; boxes differ by P on the base too).
+    _assert_eqp(run_b / "mpa_sc1_eqp0.dat", source_b / "mpa_sc1_eqp0.dat",
+                atol=MPA_EQP_ATOL_EV)
+    _assert_eqp(run_b / "mpa_sc1_eqp1.dat", source_b / "mpa_sc1_eqp1.dat",
+                atol=MPA_EQP_ATOL_EV)
     report = (run_b / "mpa_sc1.out").read_text(encoding="utf-8")
     residuals = [float(value) for value in re.findall(
         r"SC iteration: call=\d+ role=linear .*?max\|dE\|=([0-9.e+-]+)",
