@@ -1,7 +1,6 @@
 """Check finite-occupation response with nondivisible band windows and metallic tails.
 
-Gamma and direct-frequency comparisons retain the legacy pair oracle until its
-retirement; the contour reference is an independent NumPy band-pair sum.
+All three responses are compared with independent NumPy band-pair sums.
 The native four-rank CLI exercises the vendor FFT omitted by CPU workers.
 """
 from __future__ import annotations
@@ -39,6 +38,27 @@ _NB_LOGICAL_GAMMA = 17     # == e.shape[1] here: the Gamma kernel's full window
 _NB_LOGICAL_DIRECT = 19    # < nb_full=24: exercises the mask with no caller-pad
 
 
+def _direct_pairs(psi_x, psi_y, energies, occupations, surface, rows, z, nb):
+    """Evaluate the literal Kubo sum with its static coincident-energy limit."""
+    import numpy as np
+    out = np.zeros((len(z), len(rows), psi_x.shape[-1], psi_y.shape[-1]), complex)
+    for q, row in enumerate(rows):
+        for k, kmq in enumerate(row):
+            for a in range(nb):
+                for b in range(nb):
+                    de = energies[k, a] - energies[kmq, b]
+                    df = occupations[k, a] - occupations[kmq, b]
+                    dx = np.einsum("sm,sm->m", psi_x[k, a], psi_x[kmq, b].conj())
+                    dy = np.einsum("sn,sn->n", psi_y[k, a], psi_y[kmq, b].conj())
+                    for iz, freq in enumerate(z):
+                        if freq == 0 and de == 0:
+                            weight = -0.5 * (surface[k, a] + surface[kmq, b])
+                        else:
+                            weight = df / (de + freq)
+                        out[iz, q] += weight * np.outer(dx, dy.conj())
+    return out / np.sqrt(len(energies))
+
+
 def _direct_contour(psi_x, psi_y, energies, occupations, times, weights, z, grid):
     """Sum both oriented band-pair responses directly without Green functions or FFTs."""
     import numpy as np
@@ -71,7 +91,7 @@ def _worker(case_name: str) -> int:
     from jax.sharding import Mesh
 
     from gw.wavefunction_bundle import (
-        BandSlices, build_wavefunctions, build_wavefunctions_face,
+        BandSlices, build_wavefunctions_face,
     )
     from gw.w_isdf import (
         compute_chi0_contour_fractional,
@@ -123,9 +143,9 @@ def _worker(case_name: str) -> int:
     # window is applied -- see docs/architecture/
     # fractional_chi0_response_face.md for the mechanism this exercises.
     enk = rng.uniform(-1.0, 1.0, size=(nk, nb_full))
-    enk[0, 3] = enk[0, 2]
     enk[:, 0:3] = rng.uniform(-50.0, -40.0, size=(nk, 3))       # deep occupied
     enk[:, nb_full - 3:nb_full] = rng.uniform(40.0, 50.0, size=(nk, 3))  # deep empty
+    enk[0, 3:5] = -0.01  # Exact off-diagonal degeneracy survives the deep-tail setup.
     enk_full = jnp.asarray(enk, dtype=jnp.float64)
 
     mu = float(np.median(enk))
@@ -135,9 +155,6 @@ def _worker(case_name: str) -> int:
 
     slices = BandSlices.from_band_edges(0, 0, nb_full // 2, nb_full, nb_full)
 
-    wfns_legacy = build_wavefunctions(
-        psi_rmu_Y, psi_rmuT_X, enk_full=enk_full, slices=slices,
-        mesh_xy=mesh, efermi=None)
     wfns_face = build_wavefunctions_face(
         psi_rmu_Y, psi_rmuT_X, enk_full=enk_full, slices=slices,
         mesh_xy=mesh, efermi=None)
@@ -152,7 +169,7 @@ def _worker(case_name: str) -> int:
         A = a if isinstance(a, np.ndarray) else np.asarray(_mhu.process_allgather(a, tiled=True))
         B = np.asarray(_mhu.process_allgather(b, tiled=True))
         if A.shape != B.shape:
-            return {"error": f"shape mismatch: legacy={A.shape} face={B.shape}"}
+            return {"error": f"shape mismatch: reference={A.shape} face={B.shape}"}
         absdiff = np.abs(A - B)
         ref_scale = float(np.abs(A).max())
         max_abs = float(absdiff.max())
@@ -165,25 +182,27 @@ def _worker(case_name: str) -> int:
     e_narrow = enk_full[:, :_NB_NARROW]
     f_narrow = f_kn[:, :_NB_NARROW]
     s_narrow = surface[:, :_NB_NARROW]
-    gamma_legacy = jax.block_until_ready(compute_chi0_static_fractional_gamma(
-        wfns_legacy, e_narrow, f_narrow, s_narrow, meta, mesh,
-        nb_logical=_NB_LOGICAL_GAMMA))
+    psi_x = np.asarray(psi_rmuT_X).conj().transpose(0, 2, 3, 1)
+    psi_y = np.asarray(psi_rmu_Y)
+    gamma_reference = _direct_pairs(
+        psi_x, psi_y, np.asarray(e_narrow), np.asarray(f_narrow),
+        np.asarray(s_narrow), [np.arange(nk)], [0.0], _NB_LOGICAL_GAMMA)[0]
     gamma_face = jax.block_until_ready(compute_chi0_static_fractional_gamma(
         wfns_face, e_narrow, f_narrow, s_narrow, meta, mesh,
         nb_logical=_NB_LOGICAL_GAMMA))
-    out["gamma"] = _cmp(gamma_legacy, gamma_face)
+    out["gamma"] = _cmp(gamma_reference, gamma_face)
 
     # ---- Part B, finite-q/finite-z: z != 0, exercises the dynamic branch
     kminq_rows = np.stack([
         rng.permutation(nk).astype(np.int32) for _ in range(2)])
     z_direct = np.asarray([0.03 + 0.01j], dtype=np.complex128)
-    direct_legacy = jax.block_until_ready(compute_chi0_direct_fractional(
-        wfns_legacy, z_direct, meta, mesh, occupation_state=occ_state,
-        kminq_rows=kminq_rows, nb_logical=_NB_LOGICAL_DIRECT))
+    direct_reference = _direct_pairs(
+        psi_x, psi_y, np.asarray(enk_full), np.asarray(f_kn), np.asarray(surface),
+        kminq_rows, z_direct, _NB_LOGICAL_DIRECT)[0]
     direct_face = jax.block_until_ready(compute_chi0_direct_fractional(
         wfns_face, z_direct, meta, mesh, occupation_state=occ_state,
         kminq_rows=kminq_rows, nb_logical=_NB_LOGICAL_DIRECT))
-    out["direct"] = _cmp(direct_legacy, direct_face)
+    out["direct"] = _cmp(direct_reference, direct_face)
 
     # ---- Part A, fractional/contour kernel -----------------------------
     # Needs make_flat_k_fftn -> the FFTW3-ABI HOST FFI backend (the SAME

@@ -1082,7 +1082,7 @@ def _interband_degenerate_weight(
     caller's own MP1 Fermi-surface weight (:func:`gw.efermi.
     mp1_negative_derivative`) -- the SAME divided-difference-to-derivative
     limit :func:`gw.w_isdf.compute_chi0_direct_fractional`'s
-    ``_fractional_pair_scan`` already takes for its own ``z=0`` diagonal
+    ``_fractional_pair_scan_face`` already takes for its own ``z=0`` diagonal
     limit (``w_isdf.py`` ``diagonal_limit = -0.5*(sa+sb)``; the sign here
     is ``+`` rather than ``-`` because this module's ``f_diff`` is built
     ket-minus-bra where that scan's ``df`` is a-minus-b -- same physical

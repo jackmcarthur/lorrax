@@ -3,8 +3,8 @@
 > 2026-09-06 parent-route update: production minimax and fractional-contour
 > response factories now accept only canonical faces or typed raw parents;
 > their legacy four-copy factories and operand branches are deleted.
-> Contour validation uses independent band-pair sums. The static Γ/direct
-> pair legacy bodies below remain pending the next deletion concern.
+> All three response validations use independent band-pair sums. Static Γ/direct
+> pair legacy bodies and their public-wrapper branches are also deleted.
 > Historical port descriptions below are retained as derivation context,
 > not as current route-selection instructions; see [decisions](decisions.md).
 

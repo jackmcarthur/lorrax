@@ -148,16 +148,14 @@ def test_static_insulator_matches_the_integer_limit_of_the_ordered_pair_ssot(
 
     # Integer-occupation limit of the exact finite-q SSOT.  Same-side
     # degenerate pairs have df=0 and an exactly-zero supplied surface limit.
-    pair_kernel = w_isdf._get_chi_fractional_q_kernel(
-        mesh, nb_logical=nb, pair_tile=nb, n_z=1)
-    psi_x = _put(psi.transpose(0, 2, 3, 1), mesh, P(None, None, 'x', None))
-    psi_y = _put(psi.transpose(0, 2, 3, 1), mesh, P(None, None, 'y', None))
+    pair_kernel = w_isdf._get_chi_fractional_q_kernel_face(
+        mesh, nb_full=nb, nb_logical=nb, pair_tile=nb, n_z=1)
     surface = jnp.zeros_like(wfns.enk)
     rows = []
     for q in range(nk):
         kmq = jnp.asarray([(k - q) % nk for k in range(nk)])
         row = pair_kernel(
-            psi_x, psi_y, kmq, wfns.enk, wfns.occ, surface,
+            wfns.psi_mun, wfns.psi_nmu, kmq, wfns.enk, wfns.occ, surface,
             jnp.zeros((1,), dtype=jnp.complex128))
         rows.append(row[0])
     ordered = np.asarray(jax.device_get(jnp.stack(rows)))
