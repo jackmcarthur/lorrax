@@ -940,7 +940,7 @@ def fit_zeta_to_h5(
             mesh_xy, int(vertex_mu_L), solver_kind,
             distributed_cholesky=distributed_cholesky,
             distributed_lu=distributed_lu,
-            n_rmu=int(n_rmu), nq=int(C_q_flat.shape[0]),
+            n_rmu=n_rmu_solve, nq=int(C_q_flat.shape[0]),
             charge_zeta_solve=charge_zeta_solve,
             replicated_factor_used=(_resolved_zeta_gather != 'distributed'),
             transverse_zeta_solve=transverse_zeta_solve)

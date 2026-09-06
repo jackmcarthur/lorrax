@@ -1454,10 +1454,6 @@ def _resolve_zeta_fit_contract(
 		from runtime.padding import padded_mu_extent
 		_, cent_T_np, n_rmu_T = _load_cent_pf(
 			cfg.paths.centroids_file_current, meta.fft_grid)
-		solver_kind_T = _resolve_solver_kind_transverse(
-			mesh_xy, cfg.backend.distributed_lu,
-			n_rmu_logical=int(n_rmu_T),
-			transverse_zeta_solve=cfg.backend.transverse_zeta_solve)
 		# Keep the pre-fit contract on the host.  The centroid table becomes a
 		# device array only after the canonical all-channel reuse verdict says
 		# that a fit or downstream Sigma sampling is actually required.
@@ -1468,6 +1464,10 @@ def _resolve_zeta_fit_contract(
 		meta_transverse = replace(
 			meta, n_rmu=int(n_rmu_T), nspinor=4, npol=4, mu_basis=basis_T,
 			n_rmu_padded=basis_T.n_packed)
+		solver_kind_T = _resolve_solver_kind_transverse(
+			mesh_xy, cfg.backend.distributed_lu,
+			n_rmu_logical=meta_transverse.mu_solve_extent,
+			transverse_zeta_solve=cfg.backend.transverse_zeta_solve)
 		meta_transverse.sys_dim = meta.sys_dim
 		meta_transverse.bispinor = True
 		transverse_identity = {
