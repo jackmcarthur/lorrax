@@ -1107,20 +1107,18 @@ def plan_sigma_windows(
                 pole_sign=pole_sign, eta_ry=eta)
             if fixed_rule_session is not None and "external_support_ev" in fixed_rule_session:
                 support = np.asarray(fixed_rule_session["external_support_ev"]) / RYD_TO_EV
-                # Reserve growth at BOTH ends of this branch's interval.
-                # Giving each half the entire opposite-sign interval creates
-                # crossing boxes for frequencies that it never evaluates.
-                growth_lo = max(0.0, float(np.min(omega_grid) - support[0]))
-                growth_hi = max(0.0, float(support[1] - np.max(omega_grid)))
-                reserved_lo = float(np.min(frequencies) - growth_lo)
-                reserved_hi = float(np.max(frequencies) + growth_hi)
-                # The branch factory assigns new samples by their physical
-                # frequency sign. Growth through zero belongs to the other
-                # branch, not to this denominator box.
-                if np.min(frequencies) >= 0.0:
-                    reserved_lo = max(0.0, reserved_lo)
-                elif np.max(frequencies) <= 0.0:
-                    reserved_hi = min(0.0, reserved_hi)
+                # Reserve both session growth directions, each in its own
+                # physical frequency half. Moving the inner edge toward zero
+                # invents unsampled support and can turn a cheap pole tail
+                # into a crossing rule (coordinator ruling, 2026-09-06).
+                reserved_lo = float(np.min(frequencies))
+                reserved_hi = float(np.max(frequencies))
+                if reserved_lo >= 0.0:
+                    reserved_hi = max(reserved_hi, float(support[1]))
+                elif reserved_hi <= 0.0:
+                    reserved_lo = min(reserved_lo, float(support[0]))
+                else:
+                    raise ValueError("SC frequency branch spans both physical halves")
                 spec["sc_support_frequencies"] = np.asarray([
                     reserved_lo, reserved_hi])
             spec.update({
