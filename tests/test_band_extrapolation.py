@@ -88,44 +88,36 @@ def _skip_if_no_fft_handler(exc: Exception):
     raise exc
 
 
-def _operands(mesh, *, nk=8, nb=12, n_mu=8, rng=None):
-    """Randomised τ-kernel operands at the production shapes/shardings."""
+def _operands(mesh, *, kgrid=(2, 2, 2), nb=12, n_mu=8, rng=None):
+    """Use one logical wavefunction and a typed identity-group parent plan."""
+    from multi_device.full_photon_head_sigma_gate import _bundle
+    from gw.wavefunction_bundle import BandSlices, parent_sigma_operands, sigma_face_kernel_kwargs
     rng = rng or np.random.default_rng(20260815)
+    nk = int(np.prod(kgrid))
 
     def c(*shape):
         return (rng.standard_normal(shape)
                 + 1j * rng.standard_normal(shape)).astype(np.complex128)
 
-    # ψ carriers: (nk, s, μ_X, n) / (nk, n, s, μ_Y) / (nk, m, s, μ_X) /
-    # (nk, s, μ_Y, n) with nspin = 1, exactly as wavefunction_bundle emits.
-    psi_xn = jnp.asarray(c(nk, 1, n_mu, nb))
-    psi_yr = jnp.asarray(c(nk, nb, 1, n_mu))
-    m = 4                                    # QP window; divides both mesh axes
-    psi_xr = jnp.asarray(c(nk, m, 1, n_mu))
-    psi_yn = jnp.asarray(c(nk, 1, n_mu, m))
-    E_A = jnp.asarray(np.abs(rng.standard_normal((nk, nb))))
-    mask_A = jnp.asarray(rng.random((nk, nb)) > 0.3)
-    B_q = jnp.asarray(c(nk, n_mu, n_mu))
-    Omega_q = jnp.asarray(np.abs(rng.standard_normal((nk, n_mu, n_mu))) + 0.1)
-    mask_B = jnp.asarray(np.ones((nk, n_mu, n_mu), dtype=bool))
-    return dict(
-        psi_xn=jax.device_put(psi_xn, NamedSharding(mesh, P(None, None, 'x', None))),
-        psi_yr=jax.device_put(psi_yr, NamedSharding(mesh, P(None, None, None, 'y'))),
-        psi_xr=jax.device_put(psi_xr, NamedSharding(mesh, P(None, None, None, 'x'))),
-        psi_yn=jax.device_put(psi_yn, NamedSharding(mesh, P(None, None, 'y', None))),
-        E_A=jax.device_put(E_A, NamedSharding(mesh, P(None, None))),
-        mask_A=mask_A,
-        B_q=jax.device_put(B_q, NamedSharding(mesh, P(None, 'x', 'y'))),
-        Omega_q=jax.device_put(Omega_q, NamedSharding(mesh, P(None, 'x', 'y'))),
-        mask_B=jax.device_put(mask_B, NamedSharding(mesh, P(None, 'x', 'y'))),
-    )
+    psi = c(nk, nb, 1, n_mu)
+    energy = np.abs(rng.standard_normal((nk, nb)))
+    wfns = _bundle(mesh, psi, energy, np.zeros((nk, nb)),
+        BandSlices.from_band_edges(0, 0, 0, 4, nb), kgrid=kgrid)
+    xn, yr, xr, yn, energy, _ = parent_sigma_operands(wfns)
+    q_spec = NamedSharding(mesh, P(None, 'x', 'y'))
+    return dict(psi_xn=xn, psi_yr=yr, psi_xr=xr, psi_yn=yn, E_A=energy,
+        mask_A=jnp.asarray(rng.random((nk, nb)) > 0.3),
+        B_q=jax.device_put(c(nk, n_mu, n_mu), q_spec),
+        Omega_q=jax.device_put(np.abs(rng.standard_normal((nk, n_mu, n_mu))) + 0.1, q_spec),
+        mask_B=jax.device_put(np.ones((nk, n_mu, n_mu), dtype=bool), q_spec),
+        face_kwargs=sigma_face_kernel_kwargs(wfns))
 
 
 def _run_tau(mesh, op, brackets, *, kgrid=(2, 2, 2)):
     from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
     try:
         kern = get_shared_sigma_tau_kernel(
-            mesh_xy=mesh, kgrid=kgrid, brackets=brackets)
+            mesh_xy=mesh, kgrid=kgrid, brackets=brackets, **op["face_kwargs"])
     except Exception as exc:                       # noqa: BLE001 — see helper
         _skip_if_no_fft_handler(exc)
     with mesh:
@@ -187,9 +179,9 @@ def test_single_bracket_is_bit_identical_to_the_full_band_kernel():
             op['B_q'])
     try:
         k_none = _get_sigma_kij_kernel(
-            mesh_xy=mesh, kgrid=(2, 2, 2), merged_x=True, brackets=None)
+            mesh_xy=mesh, kgrid=(2, 2, 2), merged_x=True, brackets=None, **op["face_kwargs"])
         k_one = _get_sigma_kij_kernel(
-            mesh_xy=mesh, kgrid=(2, 2, 2), merged_x=True, brackets=((0, nb),))
+            mesh_xy=mesh, kgrid=(2, 2, 2), merged_x=True, brackets=((0, nb),), **op["face_kwargs"])
     except Exception as exc:                       # noqa: BLE001 — see helper
         _skip_if_no_fft_handler(exc)
     with mesh:
@@ -1198,7 +1190,7 @@ def test_mask_with_a_leading_nspin_axis_gives_the_same_bracketed_sum(brackets):
     # i.e. nk=64 against nb=20, so nk > nb is the condition that makes the
     # DEFAULT path observable.  Both arms must fail at base and pass here.
     # kgrid must multiply out to nk -- the gw_conv FFI checks it.
-    op = _operands(mesh, nk=16, nb=nb)
+    op = _operands(mesh, kgrid=(4, 2, 2), nb=nb)
     two_d = _run_tau(mesh, op, brackets, kgrid=(4, 2, 2))
 
     op3 = dict(op)

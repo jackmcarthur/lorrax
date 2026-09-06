@@ -681,3 +681,8 @@ naturally unreduced WFN still has a full q axis. Historical full-q readers
 and the internal screening probe's full-q oracle remain shared functionality.
 
 2026-09-06 BISP-ORCH: dynamic Sigma and invalid-mode static tails take their operands only from `parent_sigma_operands`; legacy/full-k and per-bracket carrier selection is retired. The Green GEMM boundary restores its declared two-axis sharding after eager arithmetic, including singleton meshes, without weakening the service guard. Scoped evidence: claims1036–1038 and1043; Mo dynamic selector regression is claim1025 (commit0b77e17c misnumbered it1024 but names the correct physical step). Broader carrier deletion remains tracked in the campaign report.
+
+
+### 2026-09-06 — parent-only dynamic Sigma contraction
+
+GW tau and static-limit spatial factories require the typed parent plan and canonical face shapes. Band brackets use masks over those resident parents. The retired full-k/split-channel projection wrappers and slicing loops have no production caller; the shared `common.contract_bands` primitive remains for BSE and its direct tests. Bracketed stage-timing remains explicitly unsupported.

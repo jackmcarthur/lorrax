@@ -89,7 +89,7 @@ def _xla_plan_dial(monkeypatch):
     """
     monkeypatch.setenv("LORRAX_BANDS_GEMM_FFI", "0")
 
-from gw.ppm_tau_kernel import _make_project_ri_reduce_scatter  # noqa: E402
+from common.contract_bands import contract_bands_block_reshard  # noqa: E402
 
 
 # Test dims (mirror wk_REL/check_channel_hermiticity.py stage p4): global
@@ -138,7 +138,8 @@ def _inputs(mesh):
 
 def _compiled_text(merged_x):
     mesh = _mesh()
-    proj = _make_project_ri_reduce_scatter(mesh, merged_x=merged_x)
+    proj = contract_bands_block_reshard(
+        mesh, channels="none" if merged_x else "split_reim")
     _, dev = _inputs(mesh)
     return jax.jit(proj).lower(*dev).compile().as_text()
 
@@ -196,7 +197,7 @@ def test_two_channel_hlo_and_parity():
         min_f64_dots=4)
 
     mesh = _mesh()
-    proj = _make_project_ri_reduce_scatter(mesh, merged_x=False)
+    proj = contract_bands_block_reshard(mesh, channels="split_reim")
     (psi_xr, sigma_k, psi_yn), dev = _inputs(mesh)
     s_r, s_i = jax.jit(proj)(*dev)
     s_r, s_i = np.asarray(s_r), np.asarray(s_i)
@@ -234,7 +235,7 @@ def test_merged_hlo_and_parity():
         min_f64_dots=0)
 
     mesh = _mesh()
-    proj = _make_project_ri_reduce_scatter(mesh, merged_x=True)
+    proj = contract_bands_block_reshard(mesh, channels="none")
     (psi_xr, sigma_k, psi_yn), dev = _inputs(mesh)
     x = np.asarray(jax.jit(proj)(*dev))
     ref = np.einsum("kmsx,ksxty,ktyn->kmn", np.conj(psi_xr), sigma_k,

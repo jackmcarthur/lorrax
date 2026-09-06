@@ -312,7 +312,7 @@ def _check_rotated_diagonal(mesh):
     )
 
 
-def _bundle(mesh, psi, enk, occ, slices):
+def _bundle(mesh, psi, enk, occ, slices, *, kgrid=None):
     """Synthetic identity-group parents use the production typed plan."""
     from symmetry_maps import SymMaps
     from common.centroid_basis import PackedCentroidBasis
@@ -320,8 +320,10 @@ def _bundle(mesh, psi, enk, occ, slices):
     from gw.wavefunction_bundle import (
         PSI_MUN_SPEC, PSI_NMU_SPEC, Wavefunctions, ParentGreenCarrier)
     nk, _, ns, mu = psi.shape
-    k = np.column_stack((np.arange(nk) / nk, np.zeros((nk, 2))))
-    stub = SimpleNamespace(kpoints=k, kgrid=np.array([nk, 1, 1]),
+    kgrid = (nk, 1, 1) if kgrid is None else tuple(kgrid)
+    k = np.asarray(list(np.ndindex(kgrid)), dtype=float) / np.asarray(kgrid)
+    assert len(k) == nk
+    stub = SimpleNamespace(kpoints=k, kgrid=np.asarray(kgrid),
         shift=np.zeros(3), nkpts=nk, ntran=1,
         sym_matrices=np.eye(3, dtype=int)[None], translations=np.zeros((1, 3)),
         avec=np.eye(3), atom_types=np.array([1]), atom_crys=np.zeros((1, 3)),
