@@ -304,3 +304,39 @@ Optimized HLO65 contains four vertex-class modules, each with exactly two distri
 The first implementation unrolls the class's vertex contractions. First-call compiler work rises from9.247814s for the original sixteen calls to12.533002s for the four class calls in the instrumented comparison. The next bounded ablation replaces that unrolling with a small vertex loop while keeping the shared Green pair and ordered per-block tau sums. This preserves the measured warm benefit's data flow and targets the observed cold regression.
 
 CPU63 passes13 focused tests, including all four classes against literal complex densities, parent glide/TR transport and scalar contour kernels. Its fresh-file comparison uses `compare_zeta_h5.py --rtol0`: charge maximum absolute3.563056e-4/normalized6.340472e-7; current1 7.412283e-9/1.018844e-11; current2 8.466901e-6/1.020736e-8; current3 5.300709e-9/7.176702e-12; every file finite, none bit-identical across P/F. Fresh cross-source EQP0/1 each12/210 printed exact, maximum4.470 micro-eV. These cross-source results are not substituted for the exact same-source class acceptance gate.
+
+
+### Streamed vertex loop: accepted P4 implementation
+
+Claim1280, owned JID57986810: CPU70 `lx-Xg0-120729-433343-6355`, cached71 `lx-Xg4-120925-443097-6650`, profile72 `lx-Xg4-121029-449406-2068`, all exit0. The small vertex loop shares the Green pair and preserves each block's tau accumulation order. Both EQP files remain210/210 exact and all CC/TT/CT rows match at the printed digit against62. The13 focused CPU oracle/contour tests pass.
+
+| cached P4 measurement | baseline62/61 | streamed71/72 |
+|---|---:|---:|
+| screening wall s |25.98|24.67|
+| total wall s |60.68|56.85|
+| whole-driver compiles / compiler work s |562 /33.89|562 /33.69|
+| first complete chi sweep s |14.169094|12.627803|
+| first-sweep compile events / compiler work s |48 /9.247814|48 /9.499476|
+| mean warm complete chi sweep s |2.724131|1.092205|
+| warm compilation events |0|0|
+
+The accepted version reduces warm chi time59.9% and cold screening5.0% on this deck. Compiler work is cumulative, not a quantity subtracted from stage wall. Instrumented and uninstrumented timings occupy separate rows. The unrolled candidate64/65 is retained as an ablation: it is slightly faster warm but loses on cold compilation.
+
+Warm complete class means, baseline singleton sums -> streamed class, in ms: CC449.675 ->437.134; CT627.431 ->244.984; TC628.755 ->242.692; TT1018.269 ->167.394. Three warm repeats per unit, including one captured TT repeat. Native rank-zero Nsight TT: original one block107.428298ms (6462 GPU operations), streamed nine blocks148.173355ms (7297 operations). The capture is a valid warm CUDA-profiler range; it is not nine times the singleton cost.
+
+Optimized HLO72 and census.json: four class modules, two distributed Green GEMMs and one dense parent spin action in each tau body, zero explicit HLO collectives; static FFT sites3/5/5/11. Distributed service collectives are not inferred absent from this HLO census. Per-rank executable peak bytes CC2,606,656,548; CT949,829,044; TC949,828,532; TT386,840,612. One class is consumed before the next; centroid-quadratic arrays retain both mesh axes. Ward placement, ordered orientation, q-IBZ and Dyson code remain unchanged.
+
+### Fresh P/F zeta at a common transaction boundary
+
+Claim1280, owned pool57986810: P68 `lx-Xg4-121237-460008-3992`, F69 `lx-Xg4-121327-464470-6651`, exit0 after intentional post-zeta stop. Inputs and empty private tmp stores are identical physically. Charge wraps fit_zeta_to_h5; transverse spans coupled-coordinator construction through finish_channel(mu=3), including all three writes and provenance. This avoids comparing F's historical stage bucket with P's separate bucket or adding overlapping thread timers.
+
+| fresh transaction | P68 wall s | F69 wall s | P/F compile events | P/F compiler work s |
+|---|---:|---:|---:|---:|
+| charge |15.769318|13.571303|86 /98|5.988780 /6.184606|
+| three current channels |17.331768|16.760236|105 /122|9.241678 /9.621647|
+
+Tile profiles49/50 use the same46080 grid points but the automatic tile widths differ. P charge: four11520-point tiles, warm990.394/989.531/989.731/989.700ms. F charge:26958/19122 points, warm1538.662/1097.658ms. P current: three15360-point coupled tiles, warm876.659/874.540/874.737ms. F current:21320/21320/3440 points, warm961.349/947.199/189.916ms. All warm tile repeats compile zero times. Total warm tile work is about3.959/2.636s (charge P/F),2.626/2.098s (current P/F); the shorter P current tile alone is not evidence of a fit speedup.
+
+P first charge tiles4613.039/991.086/990.294/990.744ms, first current2495.195/874.512/873.988ms; F first charge4117.258/2846.232ms, first current2261.911/944.132/1129.117ms. Shape changes explain the F remainder compilation. Native representative current tile P874.449030ms/884 GPU operations versus F948.829273ms/1313 operations; optimized peak7,024,623,572 versus7,885,377,476 bytes. Each HLO has one static all-to-all, all-gather and all-reduce outside the streamed parent tail; these site counts are not dynamic launch counts.
+
+All four canonical files were compared in63 using compare_zeta_h5.py; the numerical differences and finite counts above are the fresh P/F result. No fresh-fit identity is claimed. The exact acceptance gate for the chi source change uses the same copied P zeta files and11-node schedule.
