@@ -12,6 +12,7 @@ source:
 allocator: BFC@0.85
 geometry: {nodes: 1, gpus: 4, ranks: 4}
 steps:
-  00_lorrax: {state: pending}
+  00_lorrax: {state: complete}
 instrument: host_boundary_no_nsys_no_hlo_dump
 ablation: transport_shape_classes_separate_canonical_mix
+completion_receipt: "[lx] step lx-Xg4-020153-1543034-2507 exit 0 in 151 s"

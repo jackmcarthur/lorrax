@@ -57,7 +57,7 @@ def tau_factory(*args, **kwargs):
 ppm_tau_kernel.get_shared_sigma_tau_kernel = tau_factory
 mpa_sigma.get_shared_sigma_tau_kernel = tau_factory
 '''
-  instrument='import rule_replay\n'+instrument.replace('def captured_main():',additions+'\ndef captured_main():')
+  instrument='from gw import gw_jax\nimport rule_replay\n'+instrument.replace('def captured_main():',additions+'\ndef captured_main():')
   (out/'profile_driver.py').write_text(instrument)
   shutil.copy2(Path(__file__).parent/'rule_replay.py',out/'rule_replay.py')
   print(out, 'common nodes',sum(row['count'] for row in selected),flush=True)

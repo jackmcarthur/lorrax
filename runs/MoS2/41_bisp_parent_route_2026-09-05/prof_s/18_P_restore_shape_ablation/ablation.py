@@ -1,4 +1,5 @@
 """Compile centroid transport per family and keep Lorentz mixing outside that JIT."""
+from gw import gw_jax
 import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P

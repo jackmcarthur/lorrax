@@ -7,3 +7,5 @@
 - 2026-09-06: tools/parse_lorrax_sigma_run.py rejects completed COHSEX gwjax.out because _parse_production_report requires absent Sigma rule plan/tau sweep rows. Static evidence retained as the production table; no invented zero-time parser output. Run prof_s/05_P_full_static_baseline, step lx-Xg4-011831-1203588-3371.
 
 - 2026-09-06: first common-rule preparation incorrectly required optional Si dipole.h5; baseline has no such file. Step lx-Xg0-015048-1445882-7419 exit1 before science. Preserve partial Si11 directory; new prepared profiles use Si13/14 and copy optional dipole only when present.
+
+- 2026-09-06: ablation13 imported w_isdf before gw_jax initialized distributed runtime and failed at startup (driver.rank0.log). Preserve failed arm; ablation19 imports the canonical driver startup first. Apply the same ordering to unrun18 and common-rule profile preparation.
