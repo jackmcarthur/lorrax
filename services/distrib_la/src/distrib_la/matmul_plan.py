@@ -152,7 +152,7 @@ shape mismatch that keeps it on ``psum``, not GEMM.
 from __future__ import annotations
 
 import operator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Callable
 
@@ -358,8 +358,8 @@ class GemmPlan:
     in_sharding_b: NamedSharding
     out_sharding: NamedSharding
     ctx_handle: int
-    _fn_with_c: Callable
-    _fn_no_c: Callable | None
+    _fn_with_c: Callable = field(compare=False, hash=False)
+    _fn_no_c: Callable | None = field(compare=False, hash=False)
 
     def describe(self) -> str:
         """One line for a run banner: what resolved, and to what shape."""
