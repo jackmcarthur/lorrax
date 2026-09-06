@@ -1,0 +1,15 @@
+run_id: MoS2_bisp_prof_zw_02_parent_static_2026-09-06
+system: MoS2
+pipeline: lorrax_only
+platform: perlmutter
+variant_of: 73_parent_full_static
+reuse_from_parent: [cohsex.in, tmp]
+overrides: {debug_print: true, source: 9f569c4b}
+source:
+  checkout: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_zw_codex_20260906
+  commit: 996f030562003b27cb1456f1806d5394dd66589e
+  production_pin: 9f569c4bf75bad40e4f5895946874b4c503e4410
+allocator: BFC@0.85
+geometry: {nodes: 1, gpus_per_node: 4, ranks: 4}
+steps:
+  00_lorrax: {state: pending}

@@ -1,0 +1,8 @@
+Resumed dispatch, 2026-09-06 UTC. Tool-output transcript; no job/step launched.
+Command: LX_ALLOC_MATCH=lx-alloc-jackm-BISP-PROF-ZW LX_ALLOC_NAME=lx-alloc-jackm-BISP-PROF-ZW lx alloc -N 1 --time 04:00:00
+[lx] no usable allocation — salloc 1 node(s), 04:00:00, gpu (lx-alloc-jackm-BISP-PROF-ZW)
+lx_pool: salloc failed (rc=1):
+  salloc: error: QOSMaxSubmitJobPerUserLimit
+  salloc: error: Job submit/allocate failed: Job violates accounting/QOS policy (job submit limit, user's size and/or time limits)
+Fallback check: scontrol show job 57955075
+slurm_load_jobs error: Invalid job id specified
