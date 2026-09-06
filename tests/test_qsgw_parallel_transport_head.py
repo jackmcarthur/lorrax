@@ -677,9 +677,14 @@ def test_frequency_blocked_isdf_wings_match_direct_transition_sum():
         + 1j * rng.normal(size=(nk, ns, nmu, nb)))
     surface = rng.uniform(0.0, 0.4, (nk, nb))
     omegas = np.linspace(0.07, 0.93, nw) + 0.11j
+    psi_face = np.pad(psi, ((0, 0), (0, 0), (0, 0), (0, 1)))
     Y, Z = head_wings_sharded(
         velocity,
-        SimpleNamespace(psi_xn=jnp.asarray(psi), psi_yn=jnp.asarray(psi)),
+        SimpleNamespace(layout="face", slices=None,
+            enk=np.pad(energies, ((0, 0), (0, 1))),
+            occ=np.pad(occupations, ((0, 0), (0, 1))),
+            psi_mun=jnp.asarray(psi_face),
+            psi_nmu=jnp.asarray(psi_face.transpose(0, 3, 1, 2))),
         energies,
         occupations,
         omegas,
@@ -747,12 +752,14 @@ def test_head_wing_interband_sign_matches_direct_adler_wiser_density_jet():
     occupations = np.asarray([[0.0, 1.0]])
     P_head = np.zeros((3, 1, 2, 2), dtype=np.complex128)
     P_head[0, 0, 0, 1] = 1.0
-    body = np.ones((1, 1, 1, 2), dtype=np.complex128)
+    body = np.ones((1, 1, 2, 2), dtype=np.complex128)
     omega = np.asarray([0.0 + 0.0j])
 
     Y, Z = head_wings_sharded(
         P_head,
-        SimpleNamespace(psi_xn=jnp.asarray(body), psi_yn=jnp.asarray(body)),
+        SimpleNamespace(layout="face", slices=None, enk=energies, occ=occupations,
+            psi_mun=jnp.asarray(body),
+            psi_nmu=jnp.asarray(body.transpose(0, 3, 1, 2))),
         energies,
         occupations,
         omega,

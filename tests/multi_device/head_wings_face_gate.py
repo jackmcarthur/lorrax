@@ -1,46 +1,4 @@
-"""Real multi-rank CUDA gate: face-layout q-linear head/body wings and
-static metallic wings, parity vs legacy AND an independent NumPy oracle,
-plus a bounded-residency memory check.
-
-Guide: reports/gwjax_low_mem_bands_audit_2026-08-22/report.md, census
-rows 6/7 ("Full q->0 head/body wings", "Static metallic wings") — the
-task this file certifies.
-
-WHY REAL CUDA.  The emulated-mesh suite (``tests/test_qsgw_head_face_
-wings.py``) already proves correctness at small scale via
-``jax.lax.all_gather``/``ppermute``/``psum`` collectives, which run
-correctly under CPU emulation.  What only real hardware can show is (a)
-the SAME collectives actually execute correctly through NCCL, and (b) the
-claimed memory bound: that ``_head_wing_kernel_face``'s peak residency
-does not grow with the local mu count, only with ``_HEAD_WING_MU_BLOCK``
--- the entire point of the mu-blocked gather design (see that function's
-own docstring for the algebra).
-
-SAME psi, EVERY REPRESENTATION.  Every parity check builds ONE host psi
-array and derives legacy ``psi_xn``/``psi_yn`` and face ``psi_mun``/
-``psi_nmu`` from it via ``wavefunction_bundle.build_wavefunctions``/
-``build_wavefunctions_face`` -- the REAL production builders, not a
-hand-rolled transpose -- exactly ``tests/test_qsgw_head_face_wings.py``'s
-own approach, just on real devices.
-
-Checks:
-  1. dynamic_wings_ns1 / dynamic_wings_ns2 -- head_wings_sharded, legacy
-     vs face vs NumPy oracle.
-  2. static_wings_ns1 / static_wings_ns2 -- static_head_wings_sharded,
-     legacy vs face vs NumPy oracle.
-  3. bounded_residency -- run the face dynamic-wing kernel at two LOCAL
-     mu counts (same _HEAD_WING_MU_BLOCK) and assert the measured
-     allocator peak delta does NOT scale with the mu ratio -- the
-     positive claim this task exists to make, measured, not asserted by
-     construction.
-  4. lorentz_endpoints -- separate operator-applied face endpoints match
-     independent CC/TC/CT/TT host algebra, including endpoint order and
-     complex-conjugation signs, with the native Y_x/Z_y shardings.
-
-Run:
-    lx run -G 4 -n 4 env PYTHONPATH=... python3 -u \\
-        tests/multi_device/head_wings_face_gate.py --mesh 2x2
-"""
+"""Check canonical face head wings against independent NumPy transition sums."""
 from __future__ import annotations
 
 import argparse
@@ -87,9 +45,8 @@ def _host_inputs(rng, nk, nb, ns, nmu):
     return psi, psi_rmuT_X
 
 
-def _build_pair(rng, mesh, *, nk, nb, ns, nmu):
-    from gw.wavefunction_bundle import BandSlices, build_wavefunctions, \
-        build_wavefunctions_face
+def _build_face(rng, mesh, *, nk, nb, ns, nmu):
+    from gw.wavefunction_bundle import BandSlices, build_wavefunctions_face
     psi, psi_rmuT_X = _host_inputs(rng, nk, nb, ns, nmu)
     enk = np.sort(rng.standard_normal((nk, nb)), axis=1)
     occ_cut = nb // 2
@@ -101,12 +58,10 @@ def _build_pair(rng, mesh, *, nk, nb, ns, nmu):
     x_in = _put(psi_rmuT_X, mesh, (None, "x", None, None))
     enk_in = _put(enk, mesh, (None, None))
 
-    legacy = build_wavefunctions(
-        y_in, x_in, enk_full=enk_in, slices=slices, mesh_xy=mesh)
     face = build_wavefunctions_face(
         y_in, x_in, enk_full=enk_in, slices=slices, mesh_xy=mesh)
-    occ_used = _gather(legacy.occ)
-    return legacy, face, psi, enk, occ_used
+    occ_used = _gather(face.occ)
+    return face, psi, enk, occ_used
 
 
 def _numpy_wings(v, e, f, psi, *, nb_logical, nk_tot, nspin, nspinor,
@@ -168,7 +123,7 @@ def check_dynamic_wings(mesh, dtype="complex128", *, ns=2, nb=6, nk=2,
 
     rng = np.random.default_rng(2026082206 + ns)
     nb_logical, nk_tot, nspin, nspinor = nb, nk, 1, ns
-    legacy, face, psi, enk, occ = _build_pair(
+    face, psi, enk, occ = _build_face(
         rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
     v = (rng.standard_normal((3, nk, nb_logical, nb_logical))
          + 1j * rng.standard_normal((3, nk, nb_logical, nb_logical)))
@@ -177,10 +132,6 @@ def check_dynamic_wings(mesh, dtype="complex128", *, ns=2, nb=6, nk=2,
     e_slice = jnp.asarray(enk[:, :nb_logical])
     f_slice = jnp.asarray(occ[:, :nb_logical])
 
-    Y_l, Z_l = head_wings_sharded(
-        v, legacy, e_slice, f_slice, omega, mesh=mesh,
-        nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
-        nspinor=nspinor, eta_ry=eta)
     Y_f, Z_f = head_wings_sharded(
         v, face, e_slice, f_slice, omega, mesh=mesh,
         nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
@@ -189,14 +140,8 @@ def check_dynamic_wings(mesh, dtype="complex128", *, ns=2, nb=6, nk=2,
         v, enk, occ, psi, nb_logical=nb_logical, nk_tot=nk_tot,
         nspin=nspin, nspinor=nspinor, omega=omega, eta=eta)
 
-    Y_l, Z_l, Y_f, Z_f = (_gather(Y_l), _gather(Z_l),
-                          _gather(Y_f), _gather(Z_f))
-    r = {
-        "legacy_Y": _rel(Y_l, Y_ref), "legacy_Z": _rel(Z_l, Z_ref),
-        "face_Y": _rel(Y_f, Y_ref), "face_Z": _rel(Z_f, Z_ref),
-        "legacy_vs_face_Y": _rel(Y_l, Y_f),
-        "legacy_vs_face_Z": _rel(Z_l, Z_f),
-    }
+    Y_f, Z_f = _gather(Y_f), _gather(Z_f)
+    r = {"face_Y": _rel(Y_f, Y_ref), "face_Z": _rel(Z_f, Z_ref)}
     for k, val in r.items():
         assert val < RTOL, f"{k} rel err {val:.3e}"
     return r
@@ -208,13 +153,10 @@ def check_static_wings(mesh, dtype="complex128", *, ns=2, nb=6, nk=2,
 
     rng = np.random.default_rng(2026082207 + ns)
     nb_logical, nk_tot, nspin, nspinor = nb, nk, 1, ns
-    legacy, face, psi, enk, occ = _build_pair(
+    face, psi, enk, occ = _build_face(
         rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
     surface = np.abs(rng.standard_normal((nk, nb)))
 
-    l_left, l_right = static_head_wings_sharded(
-        legacy, surface, mesh=mesh, nb_logical=nb_logical, nk_tot=nk_tot,
-        nspin=nspin, nspinor=nspinor)
     f_left, f_right = static_head_wings_sharded(
         face, surface, mesh=mesh, nb_logical=nb_logical, nk_tot=nk_tot,
         nspin=nspin, nspinor=nspinor)
@@ -222,14 +164,8 @@ def check_static_wings(mesh, dtype="complex128", *, ns=2, nb=6, nk=2,
         psi, surface, nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
         nspinor=nspinor)
 
-    l_left, l_right, f_left, f_right = (
-        _gather(l_left), _gather(l_right), _gather(f_left), _gather(f_right))
-    r = {
-        "legacy_left": _rel(l_left, ref), "legacy_right": _rel(l_right, ref),
-        "face_left": _rel(f_left, ref), "face_right": _rel(f_right, ref),
-        "legacy_vs_face_left": _rel(l_left, f_left),
-        "legacy_vs_face_right": _rel(l_right, f_right),
-    }
+    f_left, f_right = _gather(f_left), _gather(f_right)
+    r = {"face_left": _rel(f_left, ref), "face_right": _rel(f_right, ref)}
     for k, val in r.items():
         assert val < RTOL, f"{k} rel err {val:.3e}"
     return r
@@ -246,7 +182,7 @@ def check_lorentz_endpoints(mesh, dtype="complex128"):
 
     rng = np.random.default_rng(20260827)
     nk, nb, ns, nmu = 2, 4, 4, 8
-    _legacy, face, psi, enk, occ = _build_pair(
+    face, psi, enk, occ = _build_face(
         rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
     v = (rng.standard_normal((3, nk, nb, nb))
          + 1j * rng.standard_normal((3, nk, nb, nb)))
@@ -363,7 +299,7 @@ def check_bounded_residency(mesh, dtype="complex128"):
         rng = np.random.default_rng(90210 + nmu)
         nb, ns, nk = 6, 1, 2
         nb_logical, nk_tot, nspin, nspinor = nb, nk, 1, ns
-        legacy, face, psi, enk, occ = _build_pair(
+        face, psi, enk, occ = _build_face(
             rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
         jax.block_until_ready((face.psi_mun, face.psi_nmu))
         peak_before = int(
@@ -381,7 +317,7 @@ def check_bounded_residency(mesh, dtype="complex128"):
         jax.block_until_ready((Y, Z))
         peak_after = int(
             jax.local_devices()[0].memory_stats().get("peak_bytes_in_use", -1))
-        del legacy, face, psi, Y, Z
+        del face, psi, Y, Z
         return max(0, peak_after - peak_before)
 
     peak_2 = _peak_delta(mu_2)

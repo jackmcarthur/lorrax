@@ -48,14 +48,7 @@ MODULO_EXCEPTIONS = {
         "reason": "cyclic source-rank address in a y-axis ring",
         "follow_up": "none; this selects a torus neighbour, not an extent",
     },
-    ("src/gw/qsgw_head.py", "_head_wing_kernel_legacy", "(i + 1) % px"): {
-        "reason": "cyclic x-axis ppermute destination",
-        "follow_up": "retire with the legacy head-wing kernel",
-    },
-    ("src/gw/qsgw_head.py", "_head_wing_kernel_legacy", "(i + 1) % py"): {
-        "reason": "cyclic y-axis ppermute destination",
-        "follow_up": "retire with the legacy head-wing kernel",
-    },
+
 
 }
 

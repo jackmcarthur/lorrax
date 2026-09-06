@@ -1,18 +1,4 @@
-"""Face-layout q-linear head/body wings and static metallic wings.
-
-Guide: reports/gwjax_low_mem_bands_audit_2026-08-22/report.md, census
-rows 6/7 ("Full q->0 head/body wings", "Static metallic wings").
-
-Emulated CPU mesh (unit-scope; the FOUR-GPU RULE exempts unit/CPU cells
-per QUALITY_PATTERNS.md).  Every legacy/face pair here is built from the
-SAME host ``psi`` array via ``build_wavefunctions``/``build_wavefunctions_
-face`` (the carrier's own "same psi, two faces" guarantee), so a
-legacy-vs-face mismatch cannot be explained by the two bundles secretly
-holding different physics -- and every case is ALSO checked against a
-third, independent NumPy oracle built straight from the documented
-formula (``head_wings_sharded``'s own docstring), so a bug shared by both
-kernels would still be caught.
-"""
+"""Check canonical face head wings against independent NumPy transition sums."""
 from __future__ import annotations
 
 import dataclasses
@@ -29,7 +15,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 
 from gw.wavefunction_bundle import (  # noqa: E402
     BandSlices,
-    build_wavefunctions,
     build_wavefunctions_face,
 )
 from common.gamma_matrices import gammas  # noqa: E402
@@ -69,9 +54,8 @@ def _host_inputs(rng, nk, nb, ns, nmu):
     return psi, psi_rmuT_X
 
 
-def _build_pair(rng, mesh, *, nk, nb, ns, nmu):
-    """Legacy and face ``Wavefunctions`` bundles built from the IDENTICAL
-    host psi, plus the raw host psi (nk,nb,ns,nmu) for the numpy oracle."""
+def _build_face(rng, mesh, *, nk, nb, ns, nmu):
+    """Build canonical faces and retain the host states for the independent oracle."""
     psi, psi_rmuT_X = _host_inputs(rng, nk, nb, ns, nmu)
     enk = np.sort(rng.standard_normal((nk, nb)), axis=1)
     occ_cut = nb // 2
@@ -83,14 +67,12 @@ def _build_pair(rng, mesh, *, nk, nb, ns, nmu):
     x_in = _put(psi_rmuT_X, mesh, P(None, "x", None, None))
     enk_in = _put(enk, mesh, P(None, None))
 
-    legacy = build_wavefunctions(
-        y_in, x_in, enk_full=enk_in, slices=slices, mesh_xy=mesh)
     face = build_wavefunctions_face(
         y_in, x_in, enk_full=enk_in, slices=slices, mesh_xy=mesh)
     # occ is derived from enk/efermi inside the builders; read it back so
     # the numpy oracle uses the SAME occupations both kernels consume.
-    occ_used = _gather(legacy.occ)
-    return legacy, face, psi, enk, occ_used
+    occ_used = _gather(face.occ)
+    return face, psi, enk, occ_used
 
 
 def _numpy_wings(v, e, f, psi, *, nb_logical, nk_tot, nspin, nspinor,
@@ -155,16 +137,16 @@ def _numpy_static_wings(psi, surface, *, nb_logical, nk_tot, nspin, nspinor):
 
 
 # ---------------------------------------------------------------------------
-# Dynamic wings: legacy vs face vs numpy oracle
+# Dynamic wings against the NumPy oracle
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("nb_logical,nb", [(6, 6), (4, 6)])
-def test_head_wings_face_matches_legacy_and_oracle(nb_logical, nb):
+def test_head_wings_face_matches_oracle(nb_logical, nb):
     mesh = _mesh_xy()
     rng = np.random.default_rng(20260822 + nb_logical)
     nk, ns, nmu = 2, 2, 10
     nk_tot, nspin, nspinor = nk, 1, ns
-    legacy, face, psi, enk, occ = _build_pair(
+    face, psi, enk, occ = _build_face(
         rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
 
     # Matches the real calling convention (gw_jax.build_dft_head_response):
@@ -178,10 +160,6 @@ def test_head_wings_face_matches_legacy_and_oracle(nb_logical, nb):
     e_slice = jnp.asarray(enk[:, :nb_logical])
     f_slice = jnp.asarray(occ[:, :nb_logical])
 
-    Y_legacy, Z_legacy = head_wings_sharded(
-        v, legacy, e_slice, f_slice, omega, mesh=mesh,
-        nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
-        nspinor=nspinor, eta_ry=eta)
     Y_face, Z_face = head_wings_sharded(
         v, face, e_slice, f_slice, omega, mesh=mesh,
         nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
@@ -191,28 +169,18 @@ def test_head_wings_face_matches_legacy_and_oracle(nb_logical, nb):
         v, enk, occ, psi, nb_logical=nb_logical, nk_tot=nk_tot,
         nspin=nspin, nspinor=nspinor, omega=omega, eta=eta)
 
-    Y_legacy, Z_legacy = _gather(Y_legacy), _gather(Z_legacy)
     Y_face, Z_face = _gather(Y_face), _gather(Z_face)
 
-    for name, got in (("legacy", (Y_legacy, Z_legacy)),
-                      ("face", (Y_face, Z_face))):
-        y_err = np.max(np.abs(got[0] - Y_ref)) / max(1.0e-300, np.max(np.abs(Y_ref)))
-        z_err = np.max(np.abs(got[1] - Z_ref)) / max(1.0e-300, np.max(np.abs(Z_ref)))
-        assert y_err < 1.0e-9, f"{name} Y_x vs numpy oracle rel err {y_err}"
-        assert z_err < 1.0e-9, f"{name} Z_y vs numpy oracle rel err {z_err}"
-
-    y_parity = np.max(np.abs(Y_legacy - Y_face))
-    z_parity = np.max(np.abs(Z_legacy - Z_face))
-    assert y_parity < 1.0e-10, f"legacy vs face Y_x parity {y_parity}"
-    assert z_parity < 1.0e-10, f"legacy vs face Z_y parity {z_parity}"
+    np.testing.assert_allclose(Y_face, Y_ref, rtol=1e-9, atol=1e-10)
+    np.testing.assert_allclose(Z_face, Z_ref, rtol=1e-9, atol=1e-10)
 
 
-def test_packed_vertex_wings_preserve_three_axis_bits_legacy_and_face():
+def test_packed_vertex_wings_preserve_three_axis_bits():
     """One n_vertex kernel serves Cartesian and packed (a,I) axes."""
     mesh = _mesh_xy()
     rng = np.random.default_rng(20260825)
     nk, nb, ns, nmu = 2, 4, 2, 8
-    legacy, face, psi, enk, occ = _build_pair(
+    face, psi, enk, occ = _build_face(
         rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
     v3 = (rng.standard_normal((3, nk, nb, nb))
           + 1j * rng.standard_normal((3, nk, nb, nb)))
@@ -223,33 +191,32 @@ def test_packed_vertex_wings_preserve_three_axis_bits_legacy_and_face():
         omegas_ry=np.asarray([0.19 + 0.03j]), mesh=mesh,
         nb_logical=nb, nk_tot=nk, nspin=1, nspinor=ns)
 
-    for wfns in (legacy, face):
-        y3, z3 = head_wings_sharded(v3, wfns, **kwargs)
-        y3_from_packed, z3_from_packed = head_wings_sharded(
-            v8[:3], wfns, **kwargs)
-        y8, z8 = head_wings_sharded(v8, wfns, **kwargs)
-        y3, z3, y3_from_packed, z3_from_packed, y8, z8 = map(
-            _gather,
-            (y3, z3, y3_from_packed, z3_from_packed, y8, z8),
-        )
-        np.testing.assert_array_equal(y3_from_packed, y3)
-        np.testing.assert_array_equal(z3_from_packed, z3)
+    y3, z3 = head_wings_sharded(v3, face, **kwargs)
+    y3_from_packed, z3_from_packed = head_wings_sharded(
+        v8[:3], face, **kwargs)
+    y8, z8 = head_wings_sharded(v8, face, **kwargs)
+    y3, z3, y3_from_packed, z3_from_packed, y8, z8 = map(
+        _gather,
+        (y3, z3, y3_from_packed, z3_from_packed, y8, z8),
+    )
+    np.testing.assert_array_equal(y3_from_packed, y3)
+    np.testing.assert_array_equal(z3_from_packed, z3)
 
-        y8_oracle, z8_oracle = _numpy_wings(
-            v8, enk, occ, psi,
-            nb_logical=nb, nk_tot=nk, nspin=1, nspinor=ns,
-            omega=np.asarray([0.19 + 0.03j]), eta=0.0)
-        scale = max(
-            1.0, float(np.max(np.abs(y8_oracle))),
-            float(np.max(np.abs(z8_oracle))))
-        assert max(
-            float(np.max(np.abs(y8 - y8_oracle))),
-            float(np.max(np.abs(z8 - z8_oracle))),
-        ) <= 64.0 * np.finfo(float).eps * scale
-        np.testing.assert_array_equal(y8[:, 3:], 0.0)
-        np.testing.assert_array_equal(z8[..., 3:], 0.0)
-        with pytest.raises(ValueError, match="canonical n_vertex"):
-            head_wings_sharded(v8[:4], wfns, **kwargs)
+    y8_oracle, z8_oracle = _numpy_wings(
+        v8, enk, occ, psi,
+        nb_logical=nb, nk_tot=nk, nspin=1, nspinor=ns,
+        omega=np.asarray([0.19 + 0.03j]), eta=0.0)
+    scale = max(
+        1.0, float(np.max(np.abs(y8_oracle))),
+        float(np.max(np.abs(z8_oracle))))
+    assert max(
+        float(np.max(np.abs(y8 - y8_oracle))),
+        float(np.max(np.abs(z8 - z8_oracle))),
+    ) <= 64.0 * np.finfo(float).eps * scale
+    np.testing.assert_array_equal(y8[:, 3:], 0.0)
+    np.testing.assert_array_equal(z8[..., 3:], 0.0)
+    with pytest.raises(ValueError, match="canonical n_vertex"):
+        head_wings_sharded(v8[:4], face, **kwargs)
 
 
 def test_head_wings_face_mu_blocking_exercised(monkeypatch):
@@ -262,7 +229,7 @@ def test_head_wings_face_mu_blocking_exercised(monkeypatch):
     rng = np.random.default_rng(99)
     nk, nb, ns, nmu = 2, 4, 1, 8  # mu=8, block=3 -> 3 blocks (3,3,2 padded)
     nk_tot, nspin, nspinor = nk, 1, 1
-    legacy, face, psi, enk, occ = _build_pair(
+    face, psi, enk, occ = _build_face(
         rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
 
     v = (rng.standard_normal((3, nk, nb, nb))
@@ -299,7 +266,7 @@ def test_head_wings_face_separate_lorentz_endpoints_preserve_order():
     mesh = _mesh_xy()
     rng = np.random.default_rng(20260827)
     nk, nb, ns, nmu = 2, 4, 4, 8
-    _legacy, face, psi, enk, occ = _build_pair(
+    face, psi, enk, occ = _build_face(
         rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
     v = (rng.standard_normal((3, nk, nb, nb))
          + 1j * rng.standard_normal((3, nk, nb, nb)))
@@ -368,22 +335,19 @@ def test_head_wings_face_separate_lorentz_endpoints_preserve_order():
 
 
 # ---------------------------------------------------------------------------
-# Static wings: legacy vs face vs numpy oracle
+# Static wings against the NumPy oracle
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("nb_logical,nb", [(6, 6), (4, 6)])
-def test_static_head_wings_face_matches_legacy_and_oracle(nb_logical, nb):
+def test_static_head_wings_face_matches_oracle(nb_logical, nb):
     mesh = _mesh_xy()
     rng = np.random.default_rng(555 + nb_logical)
     nk, ns, nmu = 2, 2, 8
     nk_tot, nspin, nspinor = nk, 1, ns
-    legacy, face, psi, enk, occ = _build_pair(
+    face, psi, enk, occ = _build_face(
         rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
     surface = np.abs(rng.standard_normal((nk, nb)))
 
-    left_legacy, right_legacy = static_head_wings_sharded(
-        legacy, surface, mesh=mesh, nb_logical=nb_logical, nk_tot=nk_tot,
-        nspin=nspin, nspinor=nspinor)
     left_face, right_face = static_head_wings_sharded(
         face, surface, mesh=mesh, nb_logical=nb_logical, nk_tot=nk_tot,
         nspin=nspin, nspinor=nspinor)
@@ -392,18 +356,10 @@ def test_static_head_wings_face_matches_legacy_and_oracle(nb_logical, nb):
         psi, surface, nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
         nspinor=nspinor)
 
-    left_legacy, right_legacy = _gather(left_legacy), _gather(right_legacy)
     left_face, right_face = _gather(left_face), _gather(right_face)
 
-    for name, (left, right) in (("legacy", (left_legacy, right_legacy)),
-                                 ("face", (left_face, right_face))):
-        l_err = np.max(np.abs(left - ref))
-        r_err = np.max(np.abs(right - ref))
-        assert l_err < 1.0e-10, f"{name} left vs oracle {l_err}"
-        assert r_err < 1.0e-10, f"{name} right vs oracle {r_err}"
-
-    assert np.max(np.abs(left_legacy - left_face)) < 1.0e-10
-    assert np.max(np.abs(right_legacy - right_face)) < 1.0e-10
+    np.testing.assert_allclose(left_face, ref, rtol=0, atol=1e-10)
+    np.testing.assert_allclose(right_face, ref, rtol=0, atol=1e-10)
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +417,7 @@ def test_head_wings_sharded_face_requires_face_psi_fields():
     mesh = _mesh_xy()
     rng = np.random.default_rng(1)
     nk, nb, ns, nmu = 1, 2, 1, 2
-    legacy, face, _psi, enk, occ = _build_pair(
+    face, _psi, enk, occ = _build_face(
         rng, mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
     broken = face.__class__(
         enk=face.enk, occ=face.occ, slices=face.slices, layout="face")
@@ -471,8 +427,8 @@ def test_head_wings_sharded_face_requires_face_psi_fields():
         head_wings_sharded(
             v, broken, jnp.asarray(enk), jnp.asarray(occ), omega,
             mesh=mesh, nb_logical=nb, nk_tot=nk, nspin=1, nspinor=1)
-    with pytest.raises(ValueError, match="face-layout only"):
+    with pytest.raises(ValueError, match="canonical face layout"):
         head_wings_sharded(
-            v, legacy, jnp.asarray(enk), jnp.asarray(occ), omega,
+            v, object(), jnp.asarray(enk), jnp.asarray(occ), omega,
             mesh=mesh, nb_logical=nb, nk_tot=nk, nspin=1, nspinor=1,
             body_bra_wfns=face)
