@@ -38,3 +38,5 @@ The authorized named fallback `LX_ALLOC_MATCH=lx-alloc-jackm-BISP-PROF-S LX_ALLO
 - 2026-09-06 BISP-PROF-S: phase3 seam command used nonexistent sandbox suffix2026-09-06; command never started; corrected to assigned2026-08-14 root.
 
 - 2026-09-06 BISP-PROF-S: parse_lorrax_sigma_run.py is dynamic-only for production tables; static50 has no rule/tau rows and refuses parsing. Use existing stage parser for static; no static parse verdict was recorded.
+
+- 2026-09-06 BISP-PROF-S: final compile-class writer initially assumed absent module classes had a count field; comparison receipts represent absence as an empty object. Corrected to count0; compile_class_dispositions.json now exists and is committed. No numerical result changed.
