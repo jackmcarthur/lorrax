@@ -131,6 +131,12 @@ def _config(tmp_path, extra="", name="low_mem_bands.in"):
         str(path), print_fn=lambda *a, **k: None)
 
 
+def test_full_q_storage_selection_refuses_at_parse_time(tmp_path):
+    """Explicit full-q storage cannot override the WFN's parent representation."""
+    with pytest.raises(ValueError, match="restart_q_storage='full'"):
+        _config(tmp_path, "restart_q_storage = full\n")
+
+
 def test_head_correction_full_is_lifted_on_the_bare_default():
     """head_correction=full (the shipping default) is PORTED for the face
     layout (feat/head-wings-face-port-2026-08-22): the wing kernels read

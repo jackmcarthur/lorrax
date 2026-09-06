@@ -1,56 +1,10 @@
-"""``restart_q_storage``: the deck's q-storage decision, taken in ONE place.
-
-WHAT THIS MODULE IS.  The deck key ``restart_q_storage = auto | full | ibz``
-and the two functions that turn it into an answer: :func:`closure_for_restart`
-— THE SEAM the writer gates on — and :func:`resolve_restart_q_storage`, which
-combines the seam's answer with the deck's request and the run's actual q path
-and returns a :class:`RestartQStorage` naming the mode and the reason.
-
-WHY A SEAM RATHER THAN A CALL.  The owner's stamp ruling
-(DESIGN_symmetry_restart_followup.md, "The stamp architecture", third point:
-there is ONE predicate) makes closure a GENERATION-TIME guarantee, verified
-where the set is born and carried as a stamp; runtime geometric re-derivation
-demotes to the legacy/debug arm.  Phase 2.5 has not landed, so today the
-answer comes from the geometric measurement the resolution point already took
-— and the whole point of routing it through one named function is that the
-swap is ONE LINE in ONE place when the stamp exists.  See
-:func:`closure_for_restart` for the exact line.
-
-WHY THE RESOLUTION IS ONE FUNCTION AND NOT A PREDICATE PER TENSOR.  V and W0
-must resolve TOGETHER.  ``tagged_arrays.write_restart_state_to_h5`` sizes the
-W0 placeholder from ``V_qmunu.shape``, so V's storage decision silently
-becomes W0's — a coupling that is fine while both are full-BZ and a trap the
-moment they need not be (the rule is written at that site, dbe3b4ec item 3).
-One resolution, passed to both writers, is what makes the coupling a decision
-somebody took rather than one inherited from an argument's shape.
-
-WHAT ``auto`` COSTS, AND WHO IT MOVES.  ``auto`` is the default and it flips a
-deck onto wedge storage exactly when that deck's centroid set is orbit-closed
-AND the run's q path already reduced to the IBZ — the two conditions under
-which the unfold is the identity the frontier measured.  On a non-closed set
-(today's Si production 960-centroid deck: 47 of 48 ops violating) it resolves
-``full`` and the bytes are what they were.  It DOES move ``si_bse_debug``,
-whose centroid set became orbit-closed at fb046e0c; that deck's on-disk
-restart format changes under the default, which is why it is an explicit arm
-of the Perlmutter validation script rather than something noticed later.
-"""
+"""Store producer q parents and retain the capture needed to authenticate their unfold."""
 from __future__ import annotations
 
 import dataclasses
 
-#: Legal values of the ``restart_q_storage`` input key.  Modelled on
-#: a tuple the config parser validates
-#: against at PARSE time, so a typo dies on the deck rather than 20 minutes
-#: into a 40-node run.
-#:
-#:   auto  — follow the closure answer: the wedge when the centroid set is
-#:           closed and the run's q path reduced, the full BZ otherwise.
-#:   full  — preserve today's bytes EXACTLY.  The escape hatch, and the
-#:           control arm of the A/B: it does not ask the closure question
-#:           at all, so it cannot be changed by the answer.
-#:   ibz   — REFUSE unless the wedge is genuinely storable.  For a deck that
-#:           believes it is closed and wants to be told when it stops being.
-RESTART_Q_STORAGE = ("auto", "full", "ibz")
+# Explicit full-q selection is retired; an unreduced WFN still stores all q.
+RESTART_Q_STORAGE = ("auto", "ibz")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -167,38 +121,7 @@ def closure_for_restart(resolution):
 
 
 def resolve_restart_q_storage(requested, resolution, *, context: str):
-    """Turn the deck key + the closure answer into ONE storage decision.
-
-    Parameters
-    ----------
-    requested
-        The deck's ``restart_q_storage`` value, already normalised by the
-        config parser to one of :data:`RESTART_Q_STORAGE`.
-    resolution
-        The ``QgridSymmetryResolution`` for the centroid set these tensors
-        were computed against, or ``None`` when the run never resolved one
-        (no symmetry information available at all).  ``full`` is the only
-        answer that survives ``None``, and ``ibz`` refuses on it.
-    context
-        Names the caller in the refusal, e.g. ``"V_q / W0 restart tensors"``.
-
-    Returns
-    -------
-    RestartQStorage
-
-    Notes
-    -----
-    THE TWO CONDITIONS, and why ``use_ibz`` is not implied by ``closed``.
-    Closure says the μ permutation α EXISTS.  ``use_ibz`` says the run
-    ACTUALLY computed on a wedge — a deck whose q-grid the group does not
-    reduce (ntran=1, or a Γ-only grid) has a closed centroid set and no
-    wedge to store, and ``symmetry_maps.validate_qirr_tables`` would label
-    that file ``"full"`` from its shape anyway.  Storing "the wedge" there
-    would be
-    storing the full BZ under a different attr, which is the
-    shape-versus-attr disagreement the format refuses on read.  So both are
-    required, and the ``ibz`` refusal distinguishes them by name.
-    """
+    """Store the computed q wedge, or the natural unreduced q axis, without an override."""
     req = str(requested).strip().lower()
     if req not in RESTART_Q_STORAGE:
         raise ValueError(
@@ -206,22 +129,13 @@ def resolve_restart_q_storage(requested, resolution, *, context: str):
             f"{RESTART_Q_STORAGE}.  This should have been caught at parse "
             f"time; see gw_config.")
 
-    # ``full`` NEVER ASKS.  That is what makes it the control arm of the
-    # A/B: an arm whose bytes could be moved by the closure answer is not a
-    # control.  It is also the arm a deck sets when it wants today's file
-    # regardless of what the centroid set does next week.
-    if req == "full":
-        return RestartQStorage(
-            mode="full", requested=req, resolution=None,
-            reason="the deck asked for full-BZ storage")
-
     if resolution is None:
         if req == "ibz":
             raise ValueError(
                 f"{context}: restart_q_storage=ibz, but this run resolved no "
                 f"q-grid symmetry at all — there is no centroid permutation "
                 f"and no wedge, so there is nothing to store.  Use auto (which "
-                f"falls back to full) or full.")
+                f"falls back to full) instead.")
         return RestartQStorage(
             mode="full", requested=req, resolution=None,
             reason="no q-grid symmetry resolution was taken on this run")
@@ -242,15 +156,14 @@ def resolve_restart_q_storage(requested, resolution, *, context: str):
                 f"to invert with and is silently unrecoverable.  Regenerate "
                 f"the centroid set orbit-closed, or set "
                 f"restart_q_storage=auto (which falls back to full and says "
-                f"so) or full.")
+                f"so) instead.")
         if not use_ibz:
             raise ValueError(
                 f"{context}: restart_q_storage=ibz, and the centroid set IS "
                 f"orbit-closed, but this run's q path did not reduce to a "
                 f"wedge ({resolution.reason or 'no reduction available'}).  "
                 f"There is no IBZ block to store — the tensor's q axis "
-                f"already is the full BZ.  Set restart_q_storage=auto or "
-                f"full.")
+                f"already is the full BZ.  Set restart_q_storage=auto.")
         return RestartQStorage(
             mode="ibz", requested=req, resolution=resolution,
             reason="the deck asked for wedge storage and the set is closed")
@@ -513,26 +426,7 @@ def resolve_restart_q_storage_for_run(config, *, sym, centroid_indices,
     a resolution the WRITER took, which is what makes
     :func:`assert_capture_matches` a real check rather than a tautology.
     """
-    # ``LORRAX_FORCE_FULL_BZ=1`` BYPASSES THE WEDGE IN COMPUTE, SO THERE IS
-    # NO WEDGE TO STORE.  The deposit that offers the pre-unfold block lives
-    # inside the IBZ cascade (``v_q_g_flat.py:592``, ``screening.py:479``);
-    # the bypass skips that branch entirely, while the closure question this
-    # function asks — is the centroid set orbit-closed, does the q grid
-    # reduce — is about the DECK and answers "yes" either way.  Resolving
-    # ``ibz`` there produces a decision with nothing captured, which
-    # ``write_restart_state_to_h5`` refuses by design rather than slicing the
-    # unfolded tensor.
-    #
-    # MEASURED 2026-08-16: with the default at ``auto`` this took
-    # ``test_invariance_gates::test_ibz_equals_full_bz`` red — its leg B is a
-    # fresh full pipeline under ``LORRAX_FORCE_FULL_BZ=1`` — and it is not a
-    # test-only path: any run using the bypass would have died at the writer.
-    # The demotion is the same principle as the rest of the key: storage
-    # follows what the run actually did.
     requested = str(getattr(config, "restart_q_storage_raw", "auto"))
-    from .gw_config import env_bool
-    if env_bool("LORRAX_FORCE_FULL_BZ", False) and requested != "ibz":
-        requested = "full"
     res = None
     if sym is not None and centroid_indices is not None:
         from .qgrid_symmetry import resolve_qgrid_symmetry_tables

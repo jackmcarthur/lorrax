@@ -251,55 +251,5 @@ def test_fixed_point_frozen_qp_rotations(gnppm_restart_baseline, tmp_path):
     np.testing.assert_allclose(e_qp_ry, e_ref_ry, rtol=0.0, atol=1e-6)
 
 
-# ===========================================================================
-#  IBZ cascade ≡ full-BZ-direct (the gate that catches a WRONG symmetry
-#  unfold — the TRS-blind-bug class; the frozen gates cannot, because their
-#  references were produced with the same unfold)
-# ===========================================================================
-
-@pytest.mark.regression
-def test_ibz_equals_full_bz(gnppm_session, tmp_path):
-    """Static COHSEX, IBZ cascade vs LORRAX_FORCE_FULL_BZ=1.
-
-    The IBZ leg runs from the session restart state (its V_q was built
-    through the IBZ cascade + unfold); the full-BZ leg is a FULL fresh
-    pipeline (ζ-fit → full-BZ V_q → full-BZ W).  Comparing across the two
-    therefore covers the ζ IBZ writes, the V_q unfold, AND the W-solve
-    unfold — not just the W stage.  Static COHSEX because its unfold is
-    purely algebraic (measured exactly equal at printed precision); the
-    dynamic path has a benign ~0.12 meV q-set path-dependence through the
-    nonlinear PPM fit.
-    """
-    labels = ("sigSX", "sigCOH", "sigTOT")
-    out_name = "sigma_diag_ibzgate.dat"
-
-    # Leg A — IBZ cascade, from restart (cheap: no ζ/V_q rebuild).
-    ibz_dir = copy_fixture(_GNPPM, tmp_path / "ibz",
-                           tmp_from=gnppm_session.run_dir)
-    mutate_input(ibz_dir / "cohsex_ibz_test.in",
-                 {"restart = false": "restart = true"})
-    res_a = run_gw_jax(ibz_dir, "cohsex_ibz_test.in",
-                       extra_env={"LORRAX_FORCE_FULL_BZ": "0"})
-    if res_a.returncode != 0:
-        pytest.fail(f"IBZ leg failed.\nstdout:\n{res_a.stdout}\n"
-                    f"stderr:\n{res_a.stderr}")
-    # The restart path must still take the IBZ decision for the W solve
-    # (timing sections only appear when the cascade slices/unfolds).
-    assert "Loaded restart tensors from H5." in res_a.stdout
-    assert "W.slice_to_ibz" in res_a.stdout, (
-        "restart static run skipped the IBZ W-solve cascade")
-    assert "W.unfold_to_full_bz" in res_a.stdout
-    assert "orbit closure failed" not in res_a.stdout
-
-    # Leg B — full-BZ-direct, FRESH full pipeline.
-    full_dir = copy_fixture(_GNPPM, tmp_path / "full")
-    res_b = run_gw_jax(full_dir, "cohsex_ibz_test.in",
-                       extra_env={"LORRAX_FORCE_FULL_BZ": "1"})
-    if res_b.returncode != 0:
-        pytest.fail(f"full-BZ leg failed.\nstdout:\n{res_b.stdout}\n"
-                    f"stderr:\n{res_b.stderr}")
-    assert "unfold=full-BZ" in res_b.stdout, (
-        "FORCE_FULL_BZ leg unexpectedly took the IBZ cascade")
-
-    _assert_rows_close(ibz_dir, full_dir, out_name, labels, 1e-6,
-                       "IBZ cascade Σ differs from full-BZ-direct")
+# The retired LORRAX_FORCE_FULL_BZ whole-driver A/B is tracked by the
+# fixed-main control campaign; algebraic unfold oracles remain in service tests.

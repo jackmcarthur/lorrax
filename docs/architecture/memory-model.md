@@ -405,22 +405,11 @@ Four points worth keeping straight:
   `V_at_irr` copy), which on Si 4×4×4 is ~1 MB and on CrI3 6×6 is
   ~30 MB.
 
-The cascade is gated on **centroid orbit closure** under the spatial
-sym ops.  Regenerate centroids without `--no-orbit` and ensure
-`compute_centroid_sym_perm(..., extend_trs=True)` raises no closure
-error to activate it.  When inactive (centroid orbit not closed,
-bispinor transverse path, or `LORRAX_FORCE_FULL_BZ=1`),
-`write_ibz_only_charge = False` and the runtime also uses
-`n_q^disk = n_k_tot`.
+The GW parent route requires exact centroid transport for the WFN symmetry.
+It writes the producer q wedge when reduced; an unreduced q grid naturally
+retains its full extent. The former `LORRAX_FORCE_FULL_BZ` override is retired.
+Shared readers still support historical canonical full-q stores.
 
-Trigger paths to be aware of:
-
-- `LORRAX_FORCE_FULL_BZ=1` env var bypasses the cascade entirely
-  (debugging only — useful for isolating residuals from `unfold_v_q`).
-- `sym is None` or `centroid_indices is None` — the cascade can't
-  activate; falls back to full-BZ iteration.
-- `compute_centroid_sym_perm` raises `RuntimeError` on orbit-closure
-  failure — falls back to full-BZ with a verbose warning.
 
 The full chain is in `gw/v_q_g_flat.py :: _resolve_ibz_q_list`.
 
@@ -718,7 +707,6 @@ To size a fresh system at a target `memory_per_device_gb` (cohsex.in):
    gap is now measured rather than assumed; the remainder is **not
    diagnosed**.  Treat `HWM` as an estimate, not a bound, until it is.
 8. **Escape hatches**, in order:
-   - `LORRAX_FORCE_FULL_BZ=1` — disables the IBZ cascade (debugging).
    - Grow the mesh.  All chunked terms shrink as `1/p_xy`; `M_cent`
      shrinks as `1/p_x + 1/p_y`.
 

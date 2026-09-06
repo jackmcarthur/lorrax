@@ -792,9 +792,8 @@ def require_zeta_for_interp(restart_file, vq_mode, kgrid) -> str:
            "beside the bundle, so a bundle without one was either written "
            "before that existed or has a PARENT whose zeta is stored on the "
            "q-IBZ wedge — which vq_interp refuses on the parent too, so "
-           "--vq-mode=interp was never available on this lineage.  Re-fit "
-           "the parent with LORRAX_FORCE_FULL_BZ=1 and re-run the "
-           "downfold.\n"
+           "--vq-mode=interp is unavailable on this lineage.  Use "
+           "--vq-mode=ongrid for the retained grid.\n"
            if prov is not None else
            "  The GW run that wrote this bundle left no zeta_q.h5 beside it "
            "(a moved tmp/, or a restart written without the fit).\n")

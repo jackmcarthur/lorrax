@@ -41,7 +41,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common import collectives, jax_profile
 import common.timing as timing
 from .gw_config import (
-    ComputeMode, ScreeningDiagrams, coerce_screening_diagrams, env_bool,
+    ComputeMode, ScreeningDiagrams, coerce_screening_diagrams,
 )
 
 
@@ -138,11 +138,6 @@ def screening_requests_for(
 # Static W with the IBZ fast path
 # ---------------------------------------------------------------------------
 
-# Per-process dedup for the LORRAX_FORCE_FULL_BZ announcement: one tagged
-# line per process per run, not one per role / SC iteration.
-_FORCE_FULL_BZ_ANNOUNCED = False
-
-
 def compute_static_w(
     wfns,
     V_q: jax.Array,
@@ -184,9 +179,7 @@ def compute_static_w(
     only on ``n_q_ibz`` blocks; W_q comes out at IBZ shape and is unfolded
     back to the full BZ via the SAME helper V_q uses (same physics — W is
     bilinear in centroids and rotates by centroid double-permute + L-phase
-    + TRS conj under sym).  Explicit-full-BZ debug bypass
-    (``LORRAX_FORCE_FULL_BZ=1``) matches the V_q gate and is ANNOUNCED
-    when it flips this decision; IBZ activation otherwise depends only on
+    + TRS conj under sym).  IBZ activation depends on
     orbit-closure of the centroid set, resolved and ANNOUNCED once per run
     in ``gw.qgrid_symmetry`` (reached through ``_resolve_ibz_q_list``).
     Until 2026-08-08 this site passed ``verbose=False`` into that helper
@@ -212,8 +205,7 @@ def compute_static_w(
         Label used in the announced cadence lines (``W[<role>] ...``).
     force_full_bz
         Skip the IBZ cascade unconditionally (the probe roles' deliberate
-        frozen-golden route).  Independent of the ``LORRAX_FORCE_FULL_BZ``
-        debug env bypass, which additionally forces the static role.
+        frozen-golden route).
     section
         Timing/trace node name — ``chi0_W`` (static) or ``chi0_W_probe``,
         so the two roles keep separate rows in the end-of-run stage table.
@@ -246,38 +238,7 @@ def compute_static_w(
         solve_w,
     )
 
-    # LORRAX_FORCE_FULL_BZ is a numerics-affecting debug bypass: it
-    # reroutes the W Dyson solve (and the V_q / gw_init IBZ writes, which
-    # read the same flag) from the IBZ wedge to the full BZ — a route with
-    # a documented ~0.1 meV path-dependence in the downstream PPM fit
-    # (see compute_screening's docstring).  Doctrine 5: env may grant
-    # capability but must not SILENTLY select policy — so engaging it
-    # announces loudly at this decision site.  Env state can differ per
-    # rank, so the affected process speaks, tagged with its rank id
-    # (audit fix/zq 2026-07-28; previously this read was fully silent —
-    # verbose=False below suppresses even the IBZ resolve's own print).
-    # ONE grammar, shared with the four other readers of this knob
-    # (``gw/gw_init.py`` x3, ``gw/v_q_g_flat.py``).  ``bool(int(...))``
-    # accepted decimal digits only, which for a knob whose whole purpose is
-    # to be typed by hand at a shell prompt meant ``=true``/``=on``/``=yes``
-    # raised ``invalid literal for int()`` from inside the W solve, and
-    # ``=2`` silently meant "on".  ``env_bool`` also ANNOUNCES an
-    # unrecognised token instead of resolving it in either direction
-    # silently, which matters here more than anywhere: this is the one
-    # numerics-affecting reader of the five.
-    _env_force_full_bz = env_bool('LORRAX_FORCE_FULL_BZ', False)
-    if _env_force_full_bz and not force_full_bz:
-        global _FORCE_FULL_BZ_ANNOUNCED
-        if not _FORCE_FULL_BZ_ANNOUNCED:
-            _FORCE_FULL_BZ_ANNOUNCED = True
-            print(
-                f"  [screening rank {jax.process_index()}] "
-                f"LORRAX_FORCE_FULL_BZ=1: BYPASSING the IBZ wedge — the "
-                f"static-W Dyson solve (and the V_q/gw_init IBZ writes) "
-                f"run on the FULL BZ.  Numerics scope: ~0.1 meV "
-                f"PPM-fit path-dependence vs the IBZ route; debug only.",
-                flush=True)
-    use_ibz_w_requested = not (force_full_bz or _env_force_full_bz)
+    use_ibz_w_requested = not force_full_bz
     if use_ibz_w_requested and getattr(sym, 'q_irr_full_idx', None) is not None:
         from .v_q_g_flat import _resolve_ibz_q_list
         (_, q_irr_frac, full_to_irr_idx, full_to_irr_sym,

@@ -674,3 +674,8 @@ GW admission requires typed parent transport even for unreduced one-band decks.
 `low_mem_bands` defaults to true; an explicit false prints a warning and uses
 parents. Refusal-by-name remains pending. Non-RPA screening and old full-k
 restart carriers refuse before sampling/loading; neither selects a fallback.
+
+The bispinor parent route retires `LORRAX_FORCE_FULL_BZ` and explicit
+`restart_q_storage = full`. Storage follows the computed q parents; a
+naturally unreduced WFN still has a full q axis. Historical full-q readers
+and the internal screening probe's full-q oracle remain shared functionality.

@@ -684,9 +684,7 @@ def fit_zeta_to_h5(
                     f"{_res.reason}.  Regenerate the transverse centroid "
                     f"file with ``centroid.kmeans_cli --density-mode "
                     f"current`` (orbit-aware by default for ntran>1) so the "
-                    f"set is closed under the spatial sym group, or bypass "
-                    f"the bispinor IBZ cascade with "
-                    f"``LORRAX_FORCE_FULL_BZ=1``.")
+                    f"set is closed under the spatial sym group.")
             write_ibz_only = False
 
     with timing.section("zeta_fit.CCT"):
@@ -1116,7 +1114,7 @@ def fit_zeta_to_h5(
     # ``zeta_chunk[q_irr_full_idx]`` before writing.
     #
     # When ``write_ibz_only=False`` (caller forced full-BZ writes via
-    # ``LORRAX_FORCE_FULL_BZ=1``), the full-BZ axis is preserved on
+    # an unreduced q grid), the full-BZ axis is preserved on
     # disk for back-compatibility.
     #
     # ``write_ibz_only`` was finalized above (before the C_q/L_q IBZ slice)

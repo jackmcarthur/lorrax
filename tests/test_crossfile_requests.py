@@ -498,19 +498,12 @@ def test_auditor_truncation_guard_can_fail():
 
 
 # ===========================================================================
-# R5 — LORRAX_FORCE_FULL_BZ has ONE grammar across all five sites
+# R5 — retired full-BZ selection has no runtime readers.
 # ===========================================================================
 
 _FFBZ = "LORRAX_FORCE_FULL_BZ"
-
-#: The modules that read it.  Enumerated rather than discovered so a NEW
-#: reader appearing with a hand-rolled parse fails this test.  gw_init
-#: went 3 → 2 on 2026-08-04: the transverse ζ IBZ gate is now DERIVED
-#: from the charge one (``_write_ibz_only_transverse = cfg.bispinor and
-#: _write_ibz_only_charge``) instead of re-reading the environment, so
-#: the ζ_T provenance stamp and the ζ_T fit call cannot disagree about
-#: what was requested.  Total is 4.
-_FFBZ_SITES = {"gw/gw_init.py": 2, "gw/screening.py": 1, "gw/v_q_g_flat.py": 1}
+_FFBZ_SITES = {"gw/gw_init.py": 0, "gw/screening.py": 0,
+               "gw/v_q_g_flat.py": 0, "gw/restart_q_storage.py": 0}
 
 
 def _audit_env_grammar(src, name, knob):
@@ -537,13 +530,8 @@ def _audit_env_grammar(src, name, knob):
     return good, bad
 
 
-def test_force_full_bz_has_one_grammar_at_every_site():
-    """R5.  All five were ``bool(int(os.environ.get(...)))``, which accepts
-    decimal digits ONLY: ``=true``/``=on``/``=yes`` raised a bare
-    ``invalid literal for int()`` from inside the ISDF / V_q / W paths, and
-    ``=2`` silently meant "on".  A previous agent deliberately fixed NONE of
-    them, on the grounds that a split grammar is worse than one wrong one —
-    so they had to move together."""
+def test_force_full_bz_has_no_runtime_readers():
+    """The retired debug override cannot select a second production route."""
     total, complaints = 0, []
     for relpath, expect in _FFBZ_SITES.items():
         good, bad = _audit_env_grammar(_read(relpath), relpath, _FFBZ)
@@ -553,7 +541,7 @@ def test_force_full_bz_has_one_grammar_at_every_site():
             % (relpath, good, _FFBZ, expect))
         total += good
     assert complaints == [], complaints
-    assert total == 4, total
+    assert total == 0, total
 
 
 def test_no_module_anywhere_reads_force_full_bz_by_hand():

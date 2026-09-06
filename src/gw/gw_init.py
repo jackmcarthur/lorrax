@@ -1408,9 +1408,7 @@ def _resolve_zeta_fit_contract(
 		zeta_h5_path, int(meta.n_rmu), print_fn, fft_grid=meta.fft_grid)
 	band_norms = getattr(wfn, "band_norms", None)
 
-	force_full_bz_fit = env_bool(
-		"LORRAX_FORCE_FULL_BZ", False, print_fn=print_fn)
-	write_ibz_only_charge = not force_full_bz_fit
+	write_ibz_only_charge = True
 
 	def _resolve_cutoff(val, label, hi):
 		if val is None:
@@ -2525,7 +2523,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					bispinor_lift=(representation.current_lift or "raw"),
 					# Transverse ζ IBZ-write activates whenever the
 					# bispinor V_q orchestrator iterates IBZ q's — same
-					# gate the charge ζ uses (LORRAX_FORCE_FULL_BZ off),
+					# gate the charge ζ uses,
 					# resolved once in the pre-flight so the provenance
 					# stamp and this call cannot disagree.
 					# Orbit-closure of the transverse centroid set is
@@ -2817,22 +2815,15 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 		# ANNOUNCES it once per centroid set — the charge and the
 		# transverse set are separate facts and get separate lines.
 		# It used to fall back SILENTLY; see gw/qgrid_symmetry.py.
-		_force_full_bz_v = env_bool(
-			'LORRAX_FORCE_FULL_BZ', False, print_fn=print_fn)
-		_use_ibz_bispinor = not _force_full_bz_v
-		if _use_ibz_bispinor:
-			_cents_curr_path = cfg.paths.centroids_file_current
-			_, _cent_T_idx_np, _ = _load_centroids(
-				_cents_curr_path, meta.fft_grid)
-			_cent_T_idx_for_orchestrator = np.asarray(
-				_cent_T_idx_np, dtype=np.int32)
-			_cent_C_idx_for_orchestrator = (
-				np.asarray(jax.device_get(centroid_indices),
-				           dtype=np.int32)
-				if centroid_indices is not None else None)
-		else:
-			_cent_T_idx_for_orchestrator = None
-			_cent_C_idx_for_orchestrator = None
+		_cents_curr_path = cfg.paths.centroids_file_current
+		_, _cent_T_idx_np, _ = _load_centroids(
+			_cents_curr_path, meta.fft_grid)
+		_cent_T_idx_for_orchestrator = np.asarray(
+			_cent_T_idx_np, dtype=np.int32)
+		_cent_C_idx_for_orchestrator = (
+			np.asarray(jax.device_get(centroid_indices),
+			           dtype=np.int32)
+			if centroid_indices is not None else None)
 
 		bispinor_h5_path = os.path.join(zeta_dir, "v_q_bispinor.h5")
 		print_fn(f"\n  [bispinor] V_q^{{μ_L,ν_L}} → {bispinor_h5_path}")
@@ -2886,10 +2877,10 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 						g_chunk=(int(cfg.memory.vq_g_chunk_size)
 						         if cfg.memory.vq_g_chunk_size > 0 else None),
 						print_fn=print_fn,
-						sym=sym if _use_ibz_bispinor else None,
+						sym=sym,
 						centroid_C_idx=_cent_C_idx_for_orchestrator,
 						centroid_T_idx=_cent_T_idx_for_orchestrator,
-						use_ibz=_use_ibz_bispinor,
+						use_ibz=True,
 						tt_head_correction=bool(
 							cfg.head.bispinor_tt_head_correction),
 						# No explicit-carrier stamp: both shipped

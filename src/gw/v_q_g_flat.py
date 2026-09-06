@@ -39,7 +39,6 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from .gw_config import env_bool
 
 if TYPE_CHECKING:                       # pragma: no cover — typing only
     # The DOOR, top-level name only.  No ``ensure_on_path()`` bootstrap is
@@ -256,24 +255,7 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
     sym_perm = None
     L_table = None
     res = None
-    # DEBUG: set LORRAX_FORCE_FULL_BZ=1 to bypass the IBZ cascade and
-    # compute V_q at all full-BZ q's directly.  Useful for isolating
-    # whether residuals come from unfold_isdf_operator vs the rest of the
-    # pipeline.
-    #
-    # ONE grammar for this knob, shared with the four other sites that read
-    # it (``gw/gw_init.py`` x3, ``gw/screening.py``).  The old
-    # ``bool(int(os.environ.get(...)))`` took decimal digits only, so
-    # ``=true``/``=on``/``=yes`` raised a bare ``invalid literal for int()``
-    # from deep inside the V_q cascade rather than doing what they say.
-    #
-    # This bypass is NOT the closure fallback and is not announced as one:
-    # it is a deliberate operator choice, announced at its own decision
-    # site in ``gw/screening.py``.  Conflating "you asked for the full BZ"
-    # with "your centroids cannot give you the IBZ" would put the loud
-    # closure line on a run that has no closure problem.
-    _force_full_bz = env_bool('LORRAX_FORCE_FULL_BZ', False)
-    if sym is not None and centroid_indices is not None and not _force_full_bz:
+    if sym is not None and centroid_indices is not None:
         from .qgrid_symmetry import resolve_qgrid_symmetry_tables
         res = resolve_qgrid_symmetry_tables(
             sym=sym, centroid_indices=centroid_indices, fft_grid=fft_grid,
