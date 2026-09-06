@@ -196,3 +196,42 @@ EQP0/1 each90/90 printed-digit identity and all sigCC/sigTT/sigCT rows exact ver
 V/W/W-V restore passes:120/16/16 compiles,20.143760/0.773553/0.833868s; zero factories remain per output.
 Whole driver161.02s, final1520 XLA compiles/116.71s compiler work. BaselineP06:201.36s,1712/148.01s.
 Ablation adds warm chi repeats, so uninstrumented after-source repetition remains owed. No source implementation accepted yet.
+
+### Chi shape-class ablation, claim1007
+
+
+Branch perf/bisp-prof-zw-2026-09-06 unmerged; production unchanged9f569c4b.
+P4 BFC@0.85 JID57966610, lx-Xg4-014352-1399430-3018 exit0.
+Artifacts runs/MoS2/41_bisp_parent_route_2026-09-05/prof_zw/11_chi_shape_ablation/.
+Runtime canonical vertex operands reuse four identity/nonidentity classes. Later TT vertices have0 new compiles.
+Screening19.62s versus baseline31.21s; Sigma150.84s unchanged within noise, total192.34s.
+EQP0/1 each90/90 exact printed digits; sigCC/sigTT/sigCT canonical parser rows identical.
+Uninstrumented source implementation and wider gates remain owed.
+
+### Coupled-current tile ablation
+
+P09/F10/candidate12 fresh fits use the same r_chunk_size=4096 request, empty private tmp, P4 BFC@0.85, JID57966610. P09 step lx-Xg4-013859-1352582-8047 exit0; F10 lx-Xg4-014103-1371100-7581 exit0; candidate12 lx-Xg4-014750-1427817-6542 exit0. These intentionally stop after all charge/current zeta files: no Sigma or EQP produced by these legs.
+
+| quantity | P09 | F10 | shared-left12 |
+|---|---:|---:|---:|
+| tiles |12|12|12|
+| first tile carrier R |3844|4096|3844|
+| charge fit first/warm median, ms |3003/35.21|2188/29.67|unchanged algorithm|
+| current Z first call, ms |1555|1241|see unit receipt|
+| current Z warm host median, ms |50.215|33.194|39.001|
+| captured current Z device span, ms |51.002|30.535|39.314|
+| current Z factory compiles over12 tiles |2|6|2|
+| repeat-call compiles |0|0|0|
+| current Z per-rank HLO peak bytes |452208158|pending census|452172878|
+| spin-source transports/current tile |384|different full-k schedule|256|
+| k FFT transforms/current tile |99|different full-k schedule|67|
+
+P uses whole-orbit tiles covering46080 real points (3844 carrier slots/tile); F uses contiguous4096-point tiles with a remainder. The table does not pretend the per-call amounts of work are equal. Reusing the left unfolded/IFFT projector while streaming three independent channel accumulators preserves each channel's spin reduction order and cuts128 source transports and32 transforms per tile. It adds no collectives. Both P variants retain five band-loop executions of one all-to-all, one all-gather and one psum; the parent tail itself is collective-free. Projector GEMM arithmetic remains1.3655/1.3653ms (10 kernels). The three dominant transport classes fall from16.203+8.942+5.293ms to10.715+6.036+3.460ms; new channel accumulator updates cost3.534ms. The complete unit improves22.9% by device span and22.3% by repeated host medians, with essentially unchanged peak memory.
+
+Canonical-file gate, executed inside the later authorized remaining-baselines P4 step: all four zeta files compare bit-exact via tools/compare_zeta_h5.py --rtol0. Charge1,130,688 values; each current577,122 values; nonfinite0 and max_abs0 throughout. Exact downstream EQP/sectors and source implementation remain owed. No repeated-C_q benefit is claimed: C_q/projectors were already shared before this change. No large-deck or P16 speedup is claimed.
+
+### Production gate21 — restore executable reuse
+
+JID57966610, step lx-Xg4-020725-1591215-3890 exit0, unprofiled P4. On branch perf/bisp-prof-zw-2026-09-06, unmerged. `prof_zw/21_restore_source/{source.diff,source.sha256,driver.rank0.log,eqp0_ab.txt,eqp1_ab.txt,sector_gate.txt}` records the actual candidate and gate. Both EQP files90/90 exact; every parsed sigCC/sigTT/sigCT row exact against pristine06. Screening30.73s; Sigma111.99s; total159.61s;1512 compilations/116.27 compiler seconds. Baseline06:31.21/150.16/201.36s;1712/148.01s. Only `w_isdf.photon_blocks_full_q` transport executable ownership changed; the source contributions and summation order are unchanged, and Sigma code is untouched. Existing one-block streaming and 2D sharding are preserved; no resident full-q cache is added.
+
+The before-change optimized HLO census identifies exactly300 restore addition modules by `jit(add)/jit(_do_unfold)` metadata (100 contributions ×3 consumers), all without explicit HLO collectives; largest per-rank peak1,804,081 bytes. Eighteen unrelated `jit_add` modules are excluded. The source helper now survives across consumers, removing200 executable recreations. Gate0 was already failing before source edits on inherited rule allowlist findings and twelve historical evidence-less CLAIMS rows (`runs/DEV/112_bisp_prof_zw_codex_2026-09-06/gate0_before.log`); it is not represented as passed.
