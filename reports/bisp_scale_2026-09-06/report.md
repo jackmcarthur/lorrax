@@ -139,3 +139,10 @@
 | P fe2a6937 own ζ |22.68|196.70|0.50|474.32 /30.41|753.07|454 /39.83|EQP0/EQP1 exact vs historical04; current main pending; interval audit pending|
 | Warm τ node |—|—|—|193.965ms median;204.334ms mean|2231 warm /2232 calls|one first-call compile|unit_summary_P.json; host synchronized observer on both sources|
 | Step / artifact |57988457/lx-Xg4-150412-1355239-5472 running|—|—|—|—|—|runs/Na/16_bisp_scale_scalar_2026-09-06/{summary.json,identity_historical04_P.json,unit_summary_P.json}|
+
+| Experiment | Before → after | Identity | Memory / disposition | Evidence |
+|---|---|---|---|---|
+| Restore each source once/term |300→48 restores/run; repeated total65.24→65.71s; Σ20.08→19.84s;674→674 compiles|EQP0/EQP1 and210 sector rows exact|REJECT: whole-wall win did not repeat. Retained sources203233536B/rank at P4 C600/T196; refusal above5% of30GB/device|57982945/lx-Xg4-110752-42766-3793 exit0; R17/18; D/restore_repeat_identity.json; claim1231|
+| Resident scaling |16 K(M_C+3M_T)²/P bytes per retained term|all P ranks|Independent of nb/ns/Q; adds to parent O(QM²/P). Relative cost falls with nb/ns, not with K alone|run-local prototype only; no retained production residency change|
+| Compile-event parity, commit902d01ca |P4 static674→584 vs F578; dynamic894→772=F772; P16 static646→556<F604; dynamic897→775<F825|Five final arms130–135 exact to parent baselines|RETAIN branch change; P4 static still six extra events. Exact fe2a6937 speed-phase snapshot excludes this local patch|57988457/lx-Xg4-141411-1064403-7247 exit0 and lx-Xg4-135842-973036-7653 science artifacts; D/final_source_gates.json; claim1331|
+| Compile sites |64 static/96 dynamic zero-lambda events removed,21 typed-table placement events,5 surface-placement events|same source-change gates|distrib_la.matmul._zeros; host typed-map placement; absent surface/row table placement. No new cache or API|evidence/final_compile_module_delta.csv; source on perf/bisp-scale-2026-09-06, unmerged|
