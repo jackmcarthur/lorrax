@@ -1,0 +1,190 @@
+{
+  "note": "Corrective run receipt inventory: initial copied manifests can retain stale run_id/step fields. Actual attempt logs and these harness hashes own the run identity. No completed run payload was rewritten to correct metadata.",
+  "runs": [
+    {
+      "directory": "runs/DEV/115_bisp_head_codex_2026-09-06/01_velocity_inventory",
+      "actual_receipts": [
+        "[lx] step lx-Xg0-014502-1406640-3994 exit 0 in 8 s"
+      ],
+      "sha256": {
+        "rankwrap.sh": "072ad776a889709fd4334115285d4a798cfd9d260daea7bb0dd72b8239d5f667",
+        "probe.py": "03c142cf27f29190841f7f5698686fc70ce8100d0d3267a38830875264436258"
+      }
+    },
+    {
+      "directory": "runs/DEV/115_bisp_head_codex_2026-09-06/02_cpu_gates",
+      "actual_receipts": [
+        "[lx] step lx-Xg0-014915-1439255-7426 exit 2 in 13 s"
+      ],
+      "sha256": {
+        "rankwrap.sh": "072ad776a889709fd4334115285d4a798cfd9d260daea7bb0dd72b8239d5f667",
+        "gates.sh": "92b98c3b6eb93c0f66a7726cba6d03640f9d4100eca88cfce545a1d169c004c3"
+      }
+    },
+    {
+      "directory": "runs/DEV/115_bisp_head_codex_2026-09-06/03_cpu_gates_env",
+      "actual_receipts": [
+        "[lx] step lx-Xg0-014955-1442499-4064 exit 1 in 12 s"
+      ],
+      "sha256": {
+        "rankwrap.sh": "072ad776a889709fd4334115285d4a798cfd9d260daea7bb0dd72b8239d5f667",
+        "gates.sh": "34dc39800121d95f385508e3e350460c10f1e40e7104a96dfaa10c11081c2000"
+      }
+    },
+    {
+      "directory": "runs/DEV/115_bisp_head_codex_2026-09-06/04_completion_compare",
+      "actual_receipts": [
+        "[lx] step lx-Xg0-015036-1445050-4260 exit 1 in 10 s"
+      ],
+      "sha256": {
+        "rankwrap.sh": "66314b2d9e4a5fbf15fd0fc7adf7e12d2577f8abda33c17db7d0e1c35b9ba416",
+        "probe.py": "9a95b10db0c30169f441ae1f286b3d5a669e2df15cf7875f960dd79dc5255b7f"
+      }
+    },
+    {
+      "directory": "runs/DEV/115_bisp_head_codex_2026-09-06/05_cpu_gates",
+      "actual_receipts": [
+        "[lx] step lx-Xg0-015148-1454206-7406 exit 0 in 11 s"
+      ],
+      "sha256": {
+        "rankwrap.sh": "072ad776a889709fd4334115285d4a798cfd9d260daea7bb0dd72b8239d5f667",
+        "gates.sh": "34dc39800121d95f385508e3e350460c10f1e40e7104a96dfaa10c11081c2000"
+      }
+    },
+    {
+      "directory": "runs/DEV/115_bisp_head_codex_2026-09-06/06_completion_compare",
+      "actual_receipts": [
+        "[lx] step lx-Xg0-015148-1454391-8291 exit 1 in 5 s"
+      ],
+      "sha256": {
+        "rankwrap.sh": "66314b2d9e4a5fbf15fd0fc7adf7e12d2577f8abda33c17db7d0e1c35b9ba416",
+        "probe.py": "a5cd92c7d831148c884690e3dd150e58c5a39e87180ddf56b4aef84c159e1ec5"
+      }
+    },
+    {
+      "directory": "runs/DEV/115_bisp_head_codex_2026-09-06/07_canonical_compare",
+      "actual_receipts": [
+        "[lx] step lx-Xg0-015355-1471730-3855 exit 0 in 4 s"
+      ],
+      "sha256": {
+        "rankwrap.sh": "66314b2d9e4a5fbf15fd0fc7adf7e12d2577f8abda33c17db7d0e1c35b9ba416",
+        "probe.py": "5e100e514e07d5480b72863c966e29a108f6bb113d6b2554bc2e8a99f072bd2f"
+      }
+    },
+    {
+      "directory": "runs/DEV/115_bisp_head_codex_2026-09-06/08_eqp_little_group",
+      "actual_receipts": [
+        "[lx] step lx-Xg0-015548-1492819-1023 exit 1 in 1 s"
+      ],
+      "sha256": {
+        "rankwrap.sh": "66314b2d9e4a5fbf15fd0fc7adf7e12d2577f8abda33c17db7d0e1c35b9ba416",
+        "probe.py": "8474636466247b23e0b46d85e6d630c61d1fbd419a8e29789fa848ecff0e0f60",
+        "gates.sh": "dbd1ef69a2ddfc05a2940491392819afa6679139e75a5a2cc55de50ea84e5a4d"
+      }
+    },
+    {
+      "directory": "runs/DEV/115_bisp_head_codex_2026-09-06/09_eqp_little_group",
+      "actual_receipts": [
+        "[lx] step lx-Xg0-015708-1502622-8984 exit 0 in 11 s"
+      ],
+      "sha256": {
+        "rankwrap.sh": "66314b2d9e4a5fbf15fd0fc7adf7e12d2577f8abda33c17db7d0e1c35b9ba416",
+        "probe.py": "8474636466247b23e0b46d85e6d630c61d1fbd419a8e29789fa848ecff0e0f60",
+        "gates.sh": "881bd8417a5a2e11627532a200f0bb7aa236e10767182866698c7005ee9efc50"
+      }
+    },
+    {
+      "directory": "runs/DEV/115_bisp_head_codex_2026-09-06/10_operator_covariance",
+      "actual_receipts": [
+        "[lx] step lx-Xg0-020008-1525909-9808 exit 0 in 9 s"
+      ],
+      "sha256": {
+        "rankwrap.sh": "66314b2d9e4a5fbf15fd0fc7adf7e12d2577f8abda33c17db7d0e1c35b9ba416",
+        "probe.py": "795a604566d822fa91fae3c02639b0382f92c58d7241851e07d8cef7b50331c2"
+      }
+    },
+    {
+      "directory": "runs/DEV/115_bisp_head_codex_2026-09-06/11_velocity_ab_dynamic",
+      "actual_receipts": [
+        "[lx] step lx-Xg0-020317-1556072-5242 exit 1 in 2 s"
+      ],
+      "sha256": {
+        "rankwrap.sh": "66314b2d9e4a5fbf15fd0fc7adf7e12d2577f8abda33c17db7d0e1c35b9ba416",
+        "probe.py": "90ca0ac491bad463d3a8ac3587ca93445c77baec5c886d6f1ed5fa7113a95144"
+      }
+    },
+    {
+      "directory": "runs/DEV/115_bisp_head_codex_2026-09-06/12_velocity_ab_dynamic",
+      "actual_receipts": [
+        "[lx] step lx-Xg0-020403-1563901-5283 exit 0 in 3 s"
+      ],
+      "sha256": {
+        "rankwrap.sh": "66314b2d9e4a5fbf15fd0fc7adf7e12d2577f8abda33c17db7d0e1c35b9ba416",
+        "probe.py": "06b8331916b48c0b6e486e8a620926f9ef3880394f8867c1bde4c3e89d1870f7"
+      }
+    },
+    {
+      "directory": "runs/DEV/115_bisp_head_codex_2026-09-06/13_rotated_cell_scalar_S",
+      "actual_receipts": [
+        "[lx] step lx-Xg0-020658-1587184-2094 exit 0 in 4 s"
+      ],
+      "sha256": {
+        "rankwrap.sh": "66314b2d9e4a5fbf15fd0fc7adf7e12d2577f8abda33c17db7d0e1c35b9ba416",
+        "probe.py": "561f94a259caba0b9fa62dde29d772a91bfd0f2007b2bb51a9e9b15418bd5164"
+      }
+    },
+    {
+      "directory": "runs/MoS2/41_bisp_parent_route_2026-09-05/head/01_parent_static",
+      "actual_receipts": [
+        "[lx] step lx-Xg4-014817-1431804-9810 exit 0 in 210 s"
+      ],
+      "sha256": {
+        "source.diff": "4ddd12b107f21bea047a7f4484db37f8cfa500bd1a6ea08bb39c399dee2007c9",
+        "rankwrap.sh": "072ad776a889709fd4334115285d4a798cfd9d260daea7bb0dd72b8239d5f667",
+        "driver.py": "5357b9addc0dd076c66c39842b7a4775674347fd8df2eb4d4214a683f8f03c40"
+      }
+    },
+    {
+      "directory": "runs/MoS2/41_bisp_parent_route_2026-09-05/head/02_fixed_main_static",
+      "actual_receipts": [
+        "[lx] step lx-Xg4-014817-1431800-8440 exit 0 in 57 s"
+      ],
+      "sha256": {
+        "source.diff": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "rankwrap.sh": "00ed5f4dcc84f8ed52fb960a25d45757b54b98e6b70d12883bb4a6c2f6cc9bac",
+        "driver.py": "5357b9addc0dd076c66c39842b7a4775674347fd8df2eb4d4214a683f8f03c40"
+      }
+    },
+    {
+      "directory": "runs/MoS2/41_bisp_parent_route_2026-09-05/head/03_parent_dynamic",
+      "actual_receipts": [
+        "[lx] step lx-Xg4-015315-1465075-9083 exit 0 in 225 s"
+      ],
+      "sha256": {
+        "source.diff": "4ddd12b107f21bea047a7f4484db37f8cfa500bd1a6ea08bb39c399dee2007c9",
+        "rankwrap.sh": "072ad776a889709fd4334115285d4a798cfd9d260daea7bb0dd72b8239d5f667",
+        "driver.py": "5357b9addc0dd076c66c39842b7a4775674347fd8df2eb4d4214a683f8f03c40"
+      }
+    },
+    {
+      "directory": "runs/MoS2/41_bisp_parent_route_2026-09-05/head/04_restart_p16",
+      "actual_receipts": [],
+      "sha256": {
+        "source.diff": "4ddd12b107f21bea047a7f4484db37f8cfa500bd1a6ea08bb39c399dee2007c9",
+        "rankwrap.sh": "072ad776a889709fd4334115285d4a798cfd9d260daea7bb0dd72b8239d5f667",
+        "driver.py": "5357b9addc0dd076c66c39842b7a4775674347fd8df2eb4d4214a683f8f03c40"
+      }
+    },
+    {
+      "directory": "runs/MoS2/41_bisp_parent_route_2026-09-05/head/05_parent_full_velocity",
+      "actual_receipts": [
+        "[lx] step lx-Xg4-015708-1502620-1294 exit 0 in 205 s"
+      ],
+      "sha256": {
+        "source.diff": "4ddd12b107f21bea047a7f4484db37f8cfa500bd1a6ea08bb39c399dee2007c9",
+        "rankwrap.sh": "072ad776a889709fd4334115285d4a798cfd9d260daea7bb0dd72b8239d5f667",
+        "driver.py": "12882c34eb619f8cba18cd551f66f92f0ae53321b1bcd618fcaa55fa867cb337"
+      }
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "pool": 57966610,
+  "waiting_launcher_pid": 1466581,
+  "prelaunch_elapsed_seconds": 1362,
+  "wrapper_exit": 143,
+  "compute_step": null,
+  "reason": "Insufficient capacity for four nodes; stopped only this lane waiting launcher",
+  "claim": 1040,
+  "artifact": "runs/MoS2/41_bisp_parent_route_2026-09-05/head/04_restart_p16/driver.1.log"
+}
