@@ -82,3 +82,22 @@ Step57982945/lx-Xg4-123003-543237-1984 exits0 in655s. Slurm accounting shows no 
 All four prototype arms preserve both printed EQP files and every sector row exactly against their P baseline. P/F remains FAIL; no equivalent-science speedup is certified. Prototype compilation remains11 static/5 dynamic modules above F. Cold end-to-end P is slower even after these changes.
 
 Dedicated four-node allocation57988457 succeeded on fallback attempt5 after four QOS refusals (`runs/DEV/116_bisp_scale_codex_2026-09-06/06_pool_fallback/allocation5.log`). Shared-pool queued master96 was cancelled before science. Dedicated master119 failed before science because its copied runner omitted preflight.py; corrected master120 preserves that attempt and is running. Future legs are pinned to our dedicated pool. Hourly fetch found ORCH443e95be; its additional head-factor placement changes are held separate until this71ae0bde matrix completes.
+
+## Audited common-basis P16 matrix (claim1296)
+
+Dedicated pool57988457/lx-Xg4-124919-641781-9910 exits0 in927s; zero GPU overlap in Slurm accounting. Same source and logical basis as the clean P4 matrix; physical carriers differ: P C608/T224 (packed1280), F C608/T208 (packed1232).
+
+| Arm | Total s | Compiles | Compiler s |
+|---|---:|---:|---:|
+|90 P static baseline|93.61|646|33.77|
+|91 F static baseline|94.37|604|28.78|
+|92 P dynamic baseline|127.64|897|52.34|
+|93 F dynamic baseline|142.84|825|43.34|
+|94 P static direct zeros|88.22|582|31.83|
+|95 P dynamic direct zeros|118.79|801|49.31|
+|99 P static plus host placement|87.35|561|31.44|
+|100 P dynamic plus host placement|123.46|780|49.07|
+
+All four prototype EQP0/EQP1 and sector gates PASS exactly against the corresponding P baseline. P/F gates FAIL: static max0.895µeV, dynamic EQP1 max0.675µeV, sectors1µeV. These are diagnostic performance comparisons. Baseline P dynamic is10.6% lower wall time; its tau sweep11.63s versus27.35s is57.5% lower. Direct zeros reduce the parent dynamic total to118.79s (16.8% below F), but the later placement arm takes123.46s despite fewer modules. Do not claim that every eliminated compile improves total wall independently.
+
+The P16 module-count target is met by both compile prototypes; P4 still needs the remaining11 static/5 dynamic events addressed. The dedicated pool is now also occupied by a ZW lane step beginning13:04:52, after this matrix ended13:04:46. Follow-up surface and9x9 arms wait for capacity and remain subject to interval audit.
