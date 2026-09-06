@@ -332,17 +332,17 @@ def test_build_G_tau_forwards_layout_and_gemm_to_build_G():
                    enk, 1.0, layout="face")
 
 
-def test_build_G_and_tau_apply_parent_unfold_after_the_only_contraction(gemm):
+def test_build_G_and_tau_unfold_faces_before_the_only_contraction(gemm):
     from types import SimpleNamespace
 
     class ParentRows:
-        sym_idx = np.zeros(3, dtype=np.int32)
+        irr_idx = np.array([1, 0, 1], dtype=np.int32)
         sym = SimpleNamespace(operation_rows=lambda rows: (
             None, None, np.zeros(len(rows), dtype=bool)))
 
         @staticmethod
-        def unfold_operator(operator):
-            return operator[jnp.asarray([1, 0, 1])]
+        def unfold_face(face, *, spin_axis, mu_axis, mesh_axis):
+            return face[jnp.asarray([1, 0, 1])]
 
     xn = jnp.asarray(np.arange(2 * 1 * 2 * 3).reshape(2, 1, 2, 3)
                      + 1j)

@@ -1,4 +1,4 @@
-"""Contract canonical centroid faces with one planned GEMM and optionally unfold the parent operator."""
+"""Contract typed child centroid faces with one planned Green GEMM."""
 import jax.numpy as jnp
 
 from common.contract_bands import merge_spin_centroid, split_spin_centroid
@@ -49,19 +49,26 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None):
 
 def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
            gemm=None, k_unfold_plan=None):
-    """Contract direct and conjugated faces, then apply the typed parent transport when supplied."""
+    """Unfold parent faces before contracting weights with the conjugated endpoint."""
     if layout != 'face':
         raise ValueError(f"build_G: layout must be 'face', got {layout!r}")
     if gemm is None:
         raise ValueError("build_G requires gemm=<distrib_la.GemmPlan> built outside the kernel.")
-    G = _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases)
     if k_unfold_plan is not None:
-        # The contraction above remains the sole Green-function builder.
-        # A CentroidKUnfoldPlan merely changes its k input from full children
-        # to raw parents and transports the completed two-endpoint operator
-        # to full k, in the run's packed centroid order.
-        G = k_unfold_plan.unfold_operator(G)
-    return G
+        from common.shard_map import shard_map
+        from jax.sharding import PartitionSpec as P
+        specs = (P(None, None, "x", "y"), P(None, "x", None, "y"))
+        def unfold(left, right):
+            return (k_unfold_plan.unfold_face(
+                left, spin_axis=1, mu_axis=2, mesh_axis="x"),
+                    k_unfold_plan.unfold_face(
+                right, spin_axis=2, mu_axis=3, mesh_axis="y"))
+        psi_xn, psi_yr = shard_map(
+            unfold, mesh=gemm.mesh, in_specs=specs,
+            out_specs=specs, check_vma=False)(psi_xn, psi_yr)
+        if phases is not None:
+            phases = jnp.take(phases, jnp.asarray(k_unfold_plan.irr_idx), axis=0)
+    return _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases)
 
 
 def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
@@ -168,17 +175,6 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
         mask = jnp.reshape(mask, enk.shape)
         phases = jnp.where(mask, phases,
                            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
-    if k_unfold_plan is not None:
-        anti = k_unfold_plan.sym.operation_rows(k_unfold_plan.sym_idx)[2]
-        if anti.any():
-            # Equal endpoint faces give G^T = psi* f psi^T at the SAME
-            # complex time; conjugating f would reverse the lifetime.
-            parent = build_G(psi_xn, psi_yr, phases=phases,
-                             layout=layout, gemm=gemm)
-            transposed = build_G(jnp.conj(psi_xn), jnp.conj(psi_yr),
-                                 phases=phases, layout=layout, gemm=gemm)
-            return k_unfold_plan.unfold_operator(
-                parent, operator_transpose=transposed)
     return build_G(
         psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
         k_unfold_plan=k_unfold_plan)

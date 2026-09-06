@@ -225,12 +225,10 @@ def check_g_parent_unfold(mesh, dtype="complex128", *, ns=2, mu=8, nb=8,
 
     full_gemm = gemm_plan(
         mesh, m=mu * ns, k=nb, n=mu * ns, nq=nk_full, dtype=dtype)
-    parent_gemm = gemm_plan(
-        mesh, m=mu * ns, k=nb, n=mu * ns, nq=nk_parent, dtype=dtype)
     got_full = build_G(
         full_mun, full_nmu, layout="face", gemm=full_gemm)
     got_parent = build_G(
-        parent_mun, parent_nmu, layout="face", gemm=parent_gemm,
+        parent_mun, parent_nmu, layout="face", gemm=full_gemm,
         k_unfold_plan=plan)
     jnp.asarray(got_parent).block_until_ready()
 

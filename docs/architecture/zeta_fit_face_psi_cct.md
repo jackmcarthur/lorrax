@@ -125,8 +125,8 @@ overlap and must not be summed as an isolated ζ_T wall time.
 
 The same parent carrier serves screening and Sigma. Completed parent band
 operators unfold through the typed band-operator action. Dynamic heads
-stream bounded child stars; the SC density rebuild loads IBZ G-sphere
-parents and projects through typed scalar/polar actions. Neither requires a
+batch typed child faces in parent order; the SC density rebuild loads its
+computational parent G-sphere domain and projects through typed scalar/polar actions. Neither requires a
 persistent full-k GW wavefunction carrier. Unsupported non-RPA consumers
 and old full-face GW restart stores refuse explicitly.
 

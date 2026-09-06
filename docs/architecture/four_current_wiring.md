@@ -745,3 +745,9 @@ For nonclosed centroid admission, both families share one computational
 `SymMaps.trivial_view()` and loader-unfolded full-k parents. The original
 loader symmetry still defines file-wedge output and authenticated head
 velocities. See [the parent-fit admission contract](zeta_fit_face_psi_cct.md#unreduced-admission-for-nonclosed-centroid-sets).
+
+Green weights contract child faces after the typed endpoint action, with one
+full-child Green GEMM for static and dynamic channels. The two transient
+complex128 faces occupy `32 * nk * nb * ns * M / P` bytes per rank; the
+quadratic Green result remains sharded over both mesh axes. Head wings batch
+the same typed children in parent order. Neither path persists those faces.
