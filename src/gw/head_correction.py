@@ -1577,12 +1577,9 @@ def complete_static_slab_photon_q0(
             sh_y)
     images = _photon_q0_factor_orbit(
         left_bare, right_bare, layout=layout, plans=family_plans, mesh_xy=mesh_xy)
-    for image in range(images[0].shape[0]):
-        left_rows, right_rows = images[0][image], images[1][image]
-        V_packed = add_photon_q0_low_rank(
-            V_packed, layout, mesh_xy,
-            left_rows_X=device_put_process_local(left_rows, sh_x),
-            right_rows_Y=device_put_process_local(right_rows, sh_y))
+    V_packed = add_photon_q0_low_rank(
+        V_packed, layout, mesh_xy,
+        left_rows_X=images[0], right_rows_Y=images[1])
 
     left_basis = (
         left_bare,
@@ -1602,12 +1599,9 @@ def complete_static_slab_photon_q0(
                     sh_y)
             images = _photon_q0_factor_orbit(left_basis[u], right_rows,
                 layout=layout, plans=family_plans, mesh_xy=mesh_xy)
-            for image in range(images[0].shape[0]):
-                left_image, right_image = images[0][image], images[1][image]
-                W_packed = add_photon_q0_low_rank(
-                    W_packed, layout, mesh_xy,
-                    left_rows_X=device_put_process_local(left_image, sh_x),
-                    right_rows_Y=device_put_process_local(right_image, sh_y))
+            W_packed = add_photon_q0_low_rank(
+                W_packed, layout, mesh_xy,
+                left_rows_X=images[0], right_rows_Y=images[1])
             screened_pairs.append((left_basis[u], right_rows))
 
     evidence = StaticSlabPhotonHeadCompletion(
