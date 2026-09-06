@@ -1923,9 +1923,8 @@ def head_wings_sharded(
     ``body_bra_wfns`` and ``body_ket_wfns`` are a face-layout-only seam for
     separately operator-applied endpoints.  Either omitted endpoint defaults
     to ``wfns``, preserving the incumbent charge-density algebra exactly.
-    Operator application belongs to
-    :func:`gw.wavefunction_bundle.with_lorentz_vertices`; this routine only
-    contracts the resulting canonical faces.  Supplying endpoint bundles to
+    Production current endpoints use the typed parent unfold before their
+    vertex; this test-oracle seam contracts already transformed faces.  Supplying endpoint bundles to
     the legacy layout refuses rather than reconstructing face replicas.
 
     Layout dispatch on ``wfns.layout`` (report §5, single owner): the body

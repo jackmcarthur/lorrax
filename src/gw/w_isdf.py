@@ -1974,7 +1974,7 @@ def compute_experimental_no_pair_photon_chi0(
 
 
 #: Provenance of the unscreened-current packed body.  The bare-transverse
-#: family declares NO current response model: the twelve current blocks of
+#: family declares NO current response model: the fifteen current blocks of
 #: chi are zero, not approximated.
 STATIC_PHOTON_BARE_CURRENT_MODEL = "bare_breit_no_current_response_v1"
 STATIC_PHOTON_BARE_CURRENT_CONTACT = "none: current channels unscreened"
@@ -2284,24 +2284,10 @@ def compute_static_photon_response(
     nq = len(sym.q_irr_full_idx)
     from symmetry_maps import bgw_integer_q_to_fractional
     qfrac = bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, meta.kgrid)
-    with BispinorVqReader(bispinor_v_q_path, mesh_xy, mu_bases=mu_bases) as reader:
+    with BispinorVqReader(bispinor_v_q_path, mesh_xy, mu_bases=mu_bases,
+                         family_plans=plans) as reader:
         if reader.n_q_total != nq:
             raise ValueError("Photon V and response disagree on q-IBZ extent.")
-        for family, (plan, basis) in enumerate(zip(plans, mu_bases)):
-            table = reader.q_tables[family]
-            from symmetry_maps import verify_centroid_orbit_closure
-            closure = verify_centroid_orbit_closure(
-                basis.canonical_indices / np.asarray(plan.fft_grid),
-                plan.spatial_ops, tau=plan.translations, fft_grid=plan.fft_grid)
-            if reader.q_headers[family].centroid_hash != closure.centroid_hash:
-                raise ValueError("Photon V centroid set differs from the run; rerun restart=false.")
-            perm, wraps = basis.pack_tables(table.sym_perm, table.L_table)
-            if not (np.array_equal(table.q_irr_frac, qfrac)
-                    and np.array_equal(table.irr_idx_q, sym.irr_idx_q)
-                    and np.array_equal(table.sym_idx_q, policy.unfold_sym_idx)
-                    and np.array_equal(perm, plan.sym_perm)
-                    and np.array_equal(wraps, plan.L_table)):
-                raise ValueError("Photon V tables differ from the authenticated run; rerun restart=false.")
         layout = PhotonBasisLayout.from_centroid_extents(
             plans[0].n_centroid_packed, plans[1].n_centroid_packed, mesh_xy)
         V_packed = pack_photon_operator(reader.get_tile, nq, layout, mesh_xy)
@@ -2350,7 +2336,7 @@ def compute_static_photon_response(
     else:
         # chi_TT = chi_CT = 0 makes the packed Dyson equation block diagonal:
         #     W_packed = diag((1 - D_00 chi_00)^-1 D_00, D_TT),  W_CT = 0.
-        # Neither the twelve current blocks of chi nor the (n_C + 3 n_T)^2
+        # Neither the fifteen current blocks of chi nor the (n_C + 3 n_T)^2
         # solve is built.  The CC block was solved by the incumbent scalar
         # owner at n_C; the rest of W is V, block for block, through the sole
         # packer -- one local write per block, no gather.

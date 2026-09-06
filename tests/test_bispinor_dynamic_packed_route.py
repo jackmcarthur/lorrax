@@ -185,7 +185,7 @@ def test_photon_sigma_block_selection_is_validated():
     with pytest.raises(ValueError) as exc:
         compute_static_photon_sigma(
             wfns_charge=None, wfns_transverse=None, Gij=None,
-            V_packed=None, W_packed=None, photon_layout=None, meta=None,
+            response=None, meta=None,
             mesh_xy=None, blocks="transverse")
     assert "block selection" in str(exc.value)
 
@@ -218,3 +218,15 @@ def test_this_file_grades_the_checkout_it_lives_in():
             offenders.append(f"{name} -> {origin}")
     assert not offenders, (
         f"these modules came from outside {repo}: " + "; ".join(offenders))
+
+
+def test_lorentz_contractor_refuses_different_parent_bindings():
+    """Equal-shaped families cannot borrow another centroid plan's interaction."""
+    from types import SimpleNamespace
+    from gw.photon_sigma import contract_lorentz_blocks
+    plans = (object(), object())
+    families = tuple(SimpleNamespace(green_parent=SimpleNamespace(plan=p)) for p in plans)
+    response = SimpleNamespace(family_plans=(plans[0], object()))
+    with pytest.raises(ValueError, match="different parent plans"):
+        next(contract_lorentz_blocks([(1, 1)], families=families, term=0,
+             response=response, Gij=None, meta=None, mesh_xy=None))

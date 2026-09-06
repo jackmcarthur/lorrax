@@ -256,3 +256,14 @@ def test_reader_authenticates_each_tile_receipt(tmp_path, monkeypatch, attribute
     with pytest.raises(ValueError, match="torn V tiles"):
         BispinorVqReader(path, object())
     assert not opened
+
+
+def test_reader_refuses_sibling_centroid_stamp_mismatch(tmp_path, monkeypatch):
+    path = tmp_path / "mixed_centroid_sets.h5"
+    _write_complete_file(path)
+    with h5py.File(path, "a") as f:
+        f[tile_dataset_name(1, 2)].attrs["qirr_centroid_hash"] = "f:" + "0" * 64
+    opened = _refusing_collective(monkeypatch)
+    with pytest.raises(ValueError, match="torn V tiles"):
+        BispinorVqReader(path, object())
+    assert not opened

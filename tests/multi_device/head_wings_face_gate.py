@@ -243,7 +243,6 @@ def check_lorentz_endpoints(mesh, dtype="complex128"):
     from common.gamma_matrices import gammas
     import gw.qsgw_head as qsgw_head
     from gw.qsgw_head import head_wings_sharded
-    from gw.wavefunction_bundle import with_lorentz_vertices
 
     rng = np.random.default_rng(20260827)
     nk, nb, ns, nmu = 2, 4, 4, 8
@@ -262,8 +261,10 @@ def check_lorentz_endpoints(mesh, dtype="complex128"):
     gamma2_psi = np.einsum(
         "st,kntm->knsm", np.asarray(jax.device_get(gammas[2])), psi,
         optimize=True)
-    left_T = with_lorentz_vertices(face, 1, 0)
-    right_T = with_lorentz_vertices(face, 0, 2)
+    from dataclasses import replace
+    from common.gamma_matrices import gamma_apply, gamma_perm_phase
+    left_T = replace(face, psi_mun=gamma_apply(face.psi_mun, *gamma_perm_phase(1), axis=1))
+    right_T = replace(face, psi_nmu=gamma_apply(face.psi_nmu, *gamma_perm_phase(2), axis=2))
     cases = (
         ("CC", {}, {}),
         ("TC", {"body_bra_wfns": left_T},

@@ -55,7 +55,10 @@ block for antiunitary rows. `U_spinor` stays 2×2; the named helper receives
 indices, and `mix_lorentz_blocks` applies its tensor product separately to
 rectangular CC/CT/TC/TT sectors. Missing source blocks are zero. Complex
 conjugation belongs to the scalar operator unfold, never the real mixer.
-The old TT mixer remains only until its V-writer caller moves to q-IBZ.
+The old TT mixer remains only as a test oracle pending the final deletion gate.
+`CentroidKUnfoldPlan.unfold_face` owns the GW endpoint seam; static photon
+and bare TT Sigma apply their vertices after that typed transport and sum
+Lorentz sectors on parents before `unfold_file_wedge_band_operator`.
 
 Gate: `services/symmetry_maps/tests/test_bispinor_actions.py` tests all
 96 Si SOC rows, including inversion and antiunitary current covariance,

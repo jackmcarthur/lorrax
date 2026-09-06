@@ -615,20 +615,7 @@ def main(argv=None):
 	# consumers keep the primary bundle.
 	sigma_parent_carrier = getattr(isdf, 'sigma_parent_carrier', None)
 	wfns_sigma = wfns
-	if sigma_parent_carrier is not None:
-		from dataclasses import replace as _dc_replace_sigma
-		wfns_sigma = _dc_replace_sigma(
-			wfns, green_parent=sigma_parent_carrier)
-	if green_parent_carrier is None:
-		wfns_screening = wfns
-	else:
-		# Keep the acceleration carrier out of the primary Wavefunctions
-		# pytree.  Only chi0's Green contraction sees these extra arrays; head,
-		# Sigma, density, output and restart kernels retain their established
-		# full-k argument trees.
-		from dataclasses import replace as _dc_replace
-		wfns_screening = _dc_replace(
-			wfns, green_parent=green_parent_carrier)
+	wfns_screening = wfns
 	oneshot_occupation_state = (
 		_oneshot_mpa_occupation_state(
 			config, wfn, wfns, material_class, mesh_xy=mesh_xy, print_fn=print0)
@@ -788,7 +775,7 @@ def main(argv=None):
 				_W_charge = None
 				if not _screens_current or _dynamic_packed:
 					W_by_role = compute_screening_model(
-						mode, wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
+						mode, wfns_screening, V_q, quad=quad, e_ref=e_ref, sym=sym,
 						centroid_indices=centroid_indices, config=config,
 						meta=meta, mesh_xy=mesh_xy,
 						run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
@@ -812,7 +799,7 @@ def main(argv=None):
 								"model returned no 'static' role.")
 				from .w_isdf import compute_static_photon_response
 				photon_response = compute_static_photon_response(
-					wfns, wfns_transverse, quad, bispinor_v_q_path,
+					wfns_screening, wfns_transverse, quad, bispinor_v_q_path,
 					meta, mesh_xy,
 					screen_current=_screens_current,
 					mu_bases=isdf.mu_bases,
@@ -843,7 +830,7 @@ def main(argv=None):
 					+ ("" if not _dynamic_packed else
 					   "; DYNAMIC packed route: the CC block carries "
 					   f"compute_mode = {mode.value} at every omega and the "
-					   "twelve current blocks are frozen at omega = 0"))
+					   "fifteen current blocks are frozen at omega = 0"))
 				print0(
 					"  static photon response: "
 					f"approximation={photon_response.approximation}, "
@@ -865,7 +852,7 @@ def main(argv=None):
 						"Photon Sigma   : dynamic packed route -- "
 						f"W_packed(omega) = diag(W_00(omega), W_TT, W_CT) with "
 						f"compute_mode = {mode.value} on the CHARGE block and "
-						"the twelve current blocks STATIC (omega = 0). The "
+						"the fifteen current blocks STATIC (omega = 0). The "
 						"charge q->0 head is the dynamic model's; the TT/CT "
 						"q->0 head is the packed Gamma-cell completion's. "
 						"Sigma^B is the TT block of the packed operator, not "
@@ -1045,7 +1032,7 @@ def main(argv=None):
 				sym=sym, wfn=wfn, band_slices=band_slices,
 				input_dir=input_dir,
 				wfns_transverse=wfns_transverse,
-				bispinor_v_q_path=bispinor_v_q_path,
+				bispinor_v_q_path=bispinor_v_q_path, mu_bases=isdf.mu_bases,
 				photon_response=photon_response,
 				occupation_state=oneshot_occupation_state,
 				material_class=material_class,

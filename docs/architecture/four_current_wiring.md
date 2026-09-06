@@ -30,7 +30,7 @@ There is one packed static photon **operator**. Two deck situations reach it:
 | route | selected by | current `χ` blocks | `Σ^B` contracted by | marked below |
 |---|---|---|---|---|
 | **packed, screened** | `bispinor_gw = full_static_cohsex` | all sixteen `χ^{IJ}` built, one packed Dyson solve | `gw.photon_sigma`, TT part of the sixteen-block `Σ_X` | **P** |
-| **packed, bare** | `bispinor_gw = bare_transverse` **and** the envelope below | twelve current blocks declared **zero**; packed solve skipped, CC screened by the scalar owner and spliced in, so `W_packed = diag(W_00, D_TT)` and `W_CT = 0` | the same `gw.photon_sigma` | **P** |
+| **packed, bare** | `bispinor_gw = bare_transverse` **and** the envelope below | fifteen current blocks declared **zero**; packed solve skipped, CC screened by the scalar owner and spliced in, so `W_packed = diag(W_00, D_TT)` and `W_CT = 0` | the same `gw.photon_sigma` | **P** |
 | **incumbent, bare** | `bispinor_gw = bare_transverse`, **outside** the envelope | none — the bare `D^{ij}` tiles are contracted directly | `gw.sigma_x_bispinor` | **B** |
 
 Orthogonally to *which* packed operator is built, `compute_mode` decides
@@ -132,7 +132,7 @@ common to every bispinor deck.
 `reports/bisp_c_bare_as_packed_2026-09-01`, claim 581): with the head off it is
 **byte-identical** to the incumbent route — `max|dE_qp| = 0.000 µeV`, every
 `sigma_diag.dat` data row identical — despite a completely different
-contraction order and operator packing. Declaring the twelve current `χ` blocks
+contraction order and operator packing. Declaring the fifteen current `χ` blocks
 zero costs **0.012 µeV** against the screened packed mode. The former head-on
 difference of **5.4 meV MAE / 11.9 meV max** compared different Γ-cell
 quadratures as well as different insertion rules. Both routes now use the
@@ -505,27 +505,28 @@ there is the dynamic model's, not the packed completion's.
 
 | object | producer | shape | sharding | route |
 |---|---|---|---|---|
-| sixteen-block `Σ_X`, `Σ_SX`, `Σ_COH` (twelve blocks under `blocks = "current"`) | `photon_sigma.compute_static_photon_sigma` (`:296`), called at `sigma_dispatch.py:871` (static) and `:946` (dynamic) | each `(nk, nb_sigma, nb_sigma)` | **replicated** `P(None,None,None)` at the output boundary | P |
-| per-block operands | `photon_layout.photon_block_view` (`:279`), fetched at `photon_sigma.py:401-402` | `(nk_tot, n_left, n_right)` | `P(None,'x','y')` — a `dynamic_slice`, never a gather | P |
-| Green function `G` | `greens_function_kernel.build_G`, face layout | `(nk, ns, μ_L, ns, μ_R)` | `P(None,None,'x',None,'y')` (`wavefunction_bundle.py:236`) | both |
-| head-attribution diagnostics | `photon_sigma.py:410-414` (accumulated at `:450-471`) via `photon_layout.photon_q0_low_rank_block` (`:676`) | one `(1, p_A, p_B)` block | `P(None,'x','y')` | P |
-| `Σ^B`, bare transverse — **incumbent route only** | `sigma_x_bispinor.compute_sigma_x_bispinor` (`:77`), nine `(i,j)` tiles at `:189-190`. Retained for six capability classes: bulk; restart; self-consistent; MPA; `x_only`/`no_local_fields`/resolvent; and explicit-local or one-GPU operation. (`no_local_fields` itself refuses on every bispinor deck, and one-GPU needs explicit `local`.) The eligible plasmon-pole pair reaches `Σ^B` through the packed operator instead | `(nk, nb_sigma, nb_sigma)` | replicated after a gather-then-window (`:221-235`) | B |
-| transverse Hartree | `sigma_dispatch._compute_live_hartree` (`:302-335`) → `kin_ion_io.compute_hartree_matrix` (`:759`) | `charge`, `transverse`, each `(nk_full, nb, nb)` Ry | `P(None,'x','y')` with `return_sharded=True` | **both** |
+| sixteen-block `Σ_X`, `Σ_SX`, `Σ_COH` (fifteen non-CC blocks for `blocks="current"`) | `photon_sigma.compute_static_photon_sigma` | `(nk, nb_sigma, nb_sigma)` after parent-sector sum and typed band unfold | replicated only at the band-output boundary | P |
+| one full-q interaction | `w_isdf.photon_blocks_full_q` | `(nk_tot, n_left, n_right)` | `P(None,'x','y')`; q-IBZ source stays packed | both |
+| Green function | `greens_function_kernel.build_G` | `(nk, ns, μ_L, ns, μ_R)` | `P(None,None,'x',None,'y')` | both |
+| head-attribution block | `photon_layout.photon_q0_low_rank_block` | `(1, p_A, p_B)` | `P(None,'x','y')` | P |
+| bare transverse exchange | `sigma_x_bispinor.compute_sigma_x_bispinor` calls `photon_sigma.contract_lorentz_blocks` with nine TT keys and X term | parent-band sum, then full-k band operator | all-P projection; replicated output window | B |
+| transverse Hartree | `sigma_dispatch._compute_live_hartree` → `kin_ion_io.compute_hartree_matrix` | scalar/current `(nk_full, nb, nb)` Ry | `P(None,'x','y')` | both |
 
-**The sixteen-block contraction** is a plain nested Python loop (`A` at
-`photon_sigma.py:385`, `B` at `:389`), not a `vmap`. The `blocks` selection
-is one `continue` inside it (`:390`) and appears nowhere else, so the static
-and dynamic routes share every kernel, every certificate and the sector
-closure gate. Per block the γ̃ vertices
-are folded into the two G-build operands only (`:355`, `:359`), and the same
-jitted kernel is called three times with a dynamic `term` selector for X, SX
-and COH (`:420-443`; COH uses `W − V` with prefactor `−0.5`). Each accumulator
-is `block_until_ready()`d before advancing (`:429`, `:439`, `:476`) — the
-source names this the lifetime boundary that prevents two W/G body tiles from
-coexisting (`:473-476`).
-`GATE photon_head_sigma_sector_closure` (`:515-520`) then checks that
-CC + (CT+TC) + TT closes on the direct sixteen-block total. The diagnostics
-record `StaticPhotonHeadSigmaDiagnostics` (`:62-75`) has three fields.
+`contract_lorentz_blocks` is the shared X/SX/COH block consumer. It chooses
+raw-parent endpoint families, unfolds each endpoint through its typed plan,
+and applies the requested vertex afterward inside the static kernel. The
+outer projection uses unvertexed parent faces. Each interaction and head
+block completes before the next is requested. CC, CT+TC, and TT sums are
+formed on parents before band unfold: an individual Lorentz block is not
+covariant. `GATE photon_head_sigma_sector_closure` checks the diagnostic sum
+against the independently accumulated total. The former
+`with_lorentz_vertices` bundle-copy helper and its field map are deleted.
+
+The static kernel currently performs its G band contraction at full k after
+local endpoint transport; parent-only persistent storage is distinct from
+parent-sized band work. Its distributed GEMMs use native communication, as
+the scalar route does. HLO-visible symmetry collectives and native GEMM
+traffic must be reported separately.
 
 **`Σ^B` enters twice, differently** — on the incumbent route. In
 `compute_cohsex_sigma` it is added to **both** `sig_x` and `sig_sx`

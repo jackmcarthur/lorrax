@@ -643,7 +643,8 @@ class BispinorVqReader:
     Caller manages the lifecycle (use as a context manager).
     """
 
-    def __init__(self, filename: Path | str, mesh_xy: Mesh, *, mu_bases=None):
+    def __init__(self, filename: Path | str, mesh_xy: Mesh, *, mu_bases=None,
+                 family_plans=None):
         from file_io.slab_io import SlabIO
         import h5py
         self._filename = Path(filename)
@@ -723,7 +724,8 @@ class BispinorVqReader:
                     tables = read_tables(f, name)
                     family = int(pair[0] != 0)
                     if (family in self.q_tables and
-                            self.q_tables[family].digest() != tables.digest()):
+                            (self.q_tables[family].digest() != tables.digest()
+                             or self.q_headers[family].centroid_hash != header.centroid_hash)):
                         raise ValueError("V tiles disagree on their family symmetry tables.")
                     self.q_tables[family] = tables
                     self.q_headers[family] = header
@@ -734,6 +736,34 @@ class BispinorVqReader:
                 if (tables.n_q_ibz != self.n_q_total or
                         tables.n_q_full != int(np.prod(self.kgrid))):
                     raise ValueError("Bispinor V q-IBZ tables disagree with its geometry.")
+
+        if family_plans is not None:
+            from symmetry_maps import (bgw_integer_q_to_fractional,
+                                       verify_centroid_orbit_closure)
+            from .qgrid_symmetry import qgrid_trs_policy_for
+            if mu_bases is None:
+                raise ValueError("V family authentication requires the run centroid bases.")
+            for family, plan in enumerate(family_plans):
+                if plan is None:
+                    continue
+                basis, sym = mu_bases[family], plan.sym
+                policy = qgrid_trs_policy_for(sym=sym, irr_idx_q=sym.irr_idx_q,
+                    sym_idx_q=sym.sym_idx_q, kgrid=self.kgrid,
+                    n_sym_spatial=plan.n_sym_spatial, context="photon V reader")
+                closure = verify_centroid_orbit_closure(
+                    basis.canonical_indices / np.asarray(plan.fft_grid),
+                    plan.spatial_ops, tnp=plan.translations)
+                if self.q_headers[family].centroid_hash != closure.centroid_hash:
+                    raise ValueError("Photon V centroid set differs from the run; rerun restart=false.")
+                table = self.q_tables[family]
+                perm, wraps = basis.pack_tables(table.sym_perm, table.L_table)
+                qfrac = bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, self.kgrid)
+                if not (np.array_equal(table.q_irr_frac, qfrac)
+                        and np.array_equal(table.irr_idx_q, sym.irr_idx_q)
+                        and np.array_equal(table.sym_idx_q, policy.unfold_sym_idx)
+                        and np.array_equal(perm, plan.sym_perm)
+                        and np.array_equal(wraps, plan.L_table)):
+                    raise ValueError("Photon V tables differ from the authenticated run; rerun restart=false.")
 
         self._io = SlabIO(self._filename, mode="r", mesh=mesh_xy)
         self._io.__enter__()

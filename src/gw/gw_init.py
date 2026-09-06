@@ -3189,9 +3189,7 @@ def _prepare_parent_wavefunction_plan(
 			cfg, meta, wfn, band_slices,
 			backend=jax.default_backend(), print_fn=print_fn))
 	can_use_parents = (
-		bool(cfg.memory.low_mem_bands)
-		and int(meta.nspinor) in (1, 2, 4)
-		and int(wfn.nkpts) < int(meta.nk_tot))
+		bool(cfg.memory.low_mem_bands) and int(meta.nspinor) in (1, 2, 4))
 	# Parents-only ψ storage: when every wavefunction consumer of
 	# this run is parent-capable, the full-k centroid faces are
 	# never formed and the raw parents are the run's only ψ.  Each
@@ -3236,7 +3234,7 @@ def _prepare_parent_wavefunction_plan(
 				"the centroid basis cannot form an exact orbit-local "
 				f"plan ({plan_error}); using the full-k path.")
 			plan = None
-	return plan, green_candidate, parents_only_wanted
+	return plan, bool(plan is not None and parents_only_wanted), parents_only_wanted
 
 
 def prepare_isdf_and_wavefunctions(
@@ -4268,6 +4266,8 @@ def prepare_isdf_and_wavefunctions(
 				       f"transverse centroids)")
 
 
+	if green_parent_carrier is not None:
+		wfns = replace(wfns, green_parent=green_parent_carrier)
 	from .wavefunction_bundle import AuthenticatedWavefunctions
 	charge_basis_binding = (
 		None if charge_basis_receipt is None else

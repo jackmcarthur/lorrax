@@ -3543,7 +3543,7 @@ _SCALAR_HEAD_OVERRIDES: tuple[tuple[str, object], ...] = (
 #: the phase-1 static mode (the packed operator owns the WHOLE Sigma); the
 #: two-point plasmon-pole pair is the phase-3 dynamic packed route, where the
 #: CHARGE block is dynamic (the ordinary scalar Sigma_c on the same ISDF
-#: W_00) and the twelve current blocks are frozen at omega = 0.
+#: W_00) and the fifteen current blocks are frozen at omega = 0.
 #:
 #: ``mpa`` is deliberately absent.  ``gw.screening.screening_requests_for``
 #: returns NO independent static role for it (its shared double-parallel
@@ -3590,7 +3590,7 @@ def packed_static_envelope(config, *, screened: bool):
     the promotion and the refusal read the same table instead of
     re-deriving each other.  ``screened`` selects the packed SCREENED mode
     (``full_static_cohsex``): the extra rows are the ones that only bite
-    when the twelve current ``chi`` blocks and the packed Dyson solve are
+    when the fifteen current ``chi`` blocks and the packed Dyson solve are
     actually built.  Material class is deliberately NOT a configuration
     row: it is inferred once from the loaded WFN occupations and
     :func:`validate_material_inputs` refuses every fractional-occupation
@@ -3611,7 +3611,7 @@ def packed_static_envelope(config, *, screened: bool):
            _ENV_IMPL,
            "the photon response is built once at omega = 0: cohsex is the "
            "static packed mode; the two-point plasmon-pole pair is the DYNAMIC "
-           "packed route (W_00(omega) on the charge block, the twelve current "
+           "packed route (W_00(omega) on the charge block, the fifteen current "
            "blocks frozen at omega = 0); mpa has no independent static-role W, "
            "so its CC block would have no owner and it refuses by name", None)
     yield (config.qp_solver is QPSolver.ONE_SHOT_DFT,
@@ -3663,7 +3663,7 @@ def packed_static_envelope(config, *, screened: bool):
 def packed_bare_transverse_route(config) -> tuple[bool, str]:
     """Is the bare-transverse family served by the packed photon path?
 
-    ``bare_transverse`` IS the packed static mode with the twelve current
+    ``bare_transverse`` IS the packed static mode with the fifteen current
     blocks of ``chi`` set to zero: the packed Dyson equation is then block
     diagonal, ``W_packed = diag(W_00, D_TT)`` with ``W_CT = 0``, and the
     sixteen-block Sigma consumer returns the screened charge COHSEX in CC,
@@ -3710,7 +3710,7 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
         return True, "bispinor slab one-shot static COHSEX"
     return True, (
         f"bispinor slab one-shot {config.compute_mode.value} -- the DYNAMIC "
-        "packed route: W_00(omega) on the charge block, the twelve current "
+        "packed route: W_00(omega) on the charge block, the fifteen current "
         "blocks frozen at omega = 0")
 
 
@@ -3752,7 +3752,7 @@ def packed_photon_replaces_charge_sigma(config) -> bool:
 
     False on the DYNAMIC packed route, where the charge block is the
     ordinary scalar ``Sigma_x + Sigma_c(omega)`` on the same ISDF ``W_00``
-    and the packed consumer contributes only the twelve current blocks
+    and the packed consumer contributes only the fifteen current blocks
     (``gw.photon_sigma`` ``blocks = "current"``).  Every driver seam that
     asks "may I skip the scalar charge machinery?" asks THIS, not
     :func:`uses_static_photon_response` -- the difference is exactly the

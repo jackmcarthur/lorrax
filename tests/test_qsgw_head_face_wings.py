@@ -31,7 +31,6 @@ from gw.wavefunction_bundle import (  # noqa: E402
     BandSlices,
     build_wavefunctions,
     build_wavefunctions_face,
-    with_lorentz_vertices,
 )
 from common.gamma_matrices import gammas  # noqa: E402
 import gw.qsgw_head as qsgw_head  # noqa: E402
@@ -291,8 +290,7 @@ def test_head_wings_face_mu_blocking_exercised(monkeypatch):
 def test_head_wings_face_separate_lorentz_endpoints_preserve_order():
     """The one face kernel must distinguish CC/TC/CT/TT endpoint algebra.
 
-    ``with_lorentz_vertices(A,0)`` owns the Y/bra face and
-    ``with_lorentz_vertices(0,B)`` owns the Z/ket face.  Gamma-2 makes the
+    The A vertex acts on the Y/bra face and the B vertex on the Z/ket face.  Gamma-2 makes the
     CT reference explicitly complex.  The phase twins below are the sharper
     placement discriminator: bra-only and ket-only multiplication by ``i``
     have opposite signs in both Y and Z, so an implementation that aliases
@@ -311,8 +309,10 @@ def test_head_wings_face_separate_lorentz_endpoints_preserve_order():
         mesh=mesh, nb_logical=nb, nk_tot=nk, nspin=1, nspinor=ns,
         eta_ry=0.01)
 
-    left_T = with_lorentz_vertices(face, 1, 0)
-    right_T = with_lorentz_vertices(face, 0, 2)
+    from dataclasses import replace
+    from common.gamma_matrices import gamma_apply, gamma_perm_phase
+    left_T = replace(face, psi_mun=gamma_apply(face.psi_mun, *gamma_perm_phase(1), axis=1))
+    right_T = replace(face, psi_nmu=gamma_apply(face.psi_nmu, *gamma_perm_phase(2), axis=2))
     gamma1_psi = _host_gamma_apply(1, psi)
     gamma2_psi = _host_gamma_apply(2, psi)
 

@@ -653,3 +653,10 @@ price remains an explicit acceptance measurement, subject to owner override.
 The integrator permits temporary `low_mem_bands` acceptance when the single
 parent carrier lands: false warns that the full-k carrier no longer exists and
 proceeds on parents. Refusal-by-name remains the owner's pending ruling.
+
+The shared static Sigma consumer is `contract_lorentz_blocks`; packed X/SX/COH
+and bare TT exchange call it with integer Lorentz indices. Persistent faces
+are raw parents, vertices follow typed endpoint transport, and sectors sum
+before band unfold. Distributed face GEMMs retain their necessary native
+communication; no-HLO-collective evidence certifies additional symmetry
+transport only, not absence of GEMM panel exchange.

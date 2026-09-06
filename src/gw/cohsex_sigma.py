@@ -612,6 +612,7 @@ def compute_cohsex_sigma(
     compute_bare_x: bool = True,
     wfns_transverse=None,
     bispinor_v_q_path=None,
+    mu_bases=None,
     occupation_state=None,
 ) -> dict:
     """Evaluate static COHSEX self-energy components.
@@ -739,7 +740,7 @@ def compute_cohsex_sigma(
                 sig_x_b = compute_sigma_x_bispinor(
                     wfns_transverse=wfns_transverse,
                     Gij=Gij,
-                    bispinor_v_q_path=bispinor_v_q_path,
+                    bispinor_v_q_path=bispinor_v_q_path, mu_bases=mu_bases,
                     meta=meta, mesh_xy=mesh_xy,
                 )
             sig_x_b.block_until_ready()
@@ -764,6 +765,7 @@ def compute_sigma_x(
     static_head_terms=None,
     wfns_transverse=None,
     bispinor_v_q_path=None,
+    mu_bases=None,
     occupation_state=None,
     return_transverse: bool = False,
 ):
@@ -817,7 +819,7 @@ def compute_sigma_x(
             sig_x_b = compute_sigma_x_bispinor(
                 wfns_transverse=wfns_transverse,
                 Gij=Gij,
-                bispinor_v_q_path=bispinor_v_q_path,
+                bispinor_v_q_path=bispinor_v_q_path, mu_bases=mu_bases,
                 meta=meta, mesh_xy=mesh_xy,
             )
         sig_x_b.block_until_ready()
