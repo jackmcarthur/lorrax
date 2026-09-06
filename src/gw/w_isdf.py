@@ -1736,7 +1736,9 @@ def compute_static_photon_response(
             raise ValueError("Photon V and response disagree on q-IBZ extent.")
         layout = PhotonBasisLayout.from_centroid_extents(
             plans[0].n_centroid_packed, plans[1].n_centroid_packed, mesh_xy)
-        V_packed = pack_photon_operator(reader.get_tile, nq, layout, mesh_xy)
+        V_packed = pack_photon_operator(
+            lambda A, B: None if (A, B) in ZERO_TILES else reader.get_tile(A, B),
+            nq, layout, mesh_xy)
 
     if jax.process_index() == 0:
         # MEASURED at the site, per lane C's design note: the packed body is
