@@ -273,6 +273,23 @@ def test_sign_preserving_pad_contains_the_reserved_support():
     assert padded['box'][1] < 0.
 
 
+@pytest.mark.parametrize('pole_sign', [-1., 1.])
+def test_prospective_crossing_does_not_reclassify_a_sign_definite_tail(pole_sign):
+    from gw.sigma_box_plan import make_sigma_box_spec, _sc_padded_box_spec, _box_contains
+    args = dict(name='future-tail', states=np.array([1.]),
+                pole_stats=[(2., 2., .1, .1)], pole_sign=pole_sign, eta_ry=.1)
+    frequencies = np.array([0., 1.]) if pole_sign == 1. else np.array([-1., 0.])
+    # For either causal sign, move only the outer sampled endpoint far
+    # enough to cross a currently sign-definite denominator support.
+    original = make_sigma_box_spec(frequencies=frequencies, **args)
+    assert original['kind'].startswith('sign_definite')
+    original['sc_support_frequencies'] = (np.array([0., 4.]) if pole_sign == 1.
+                                          else np.array([-4., 0.]))
+    padded = _sc_padded_box_spec(original, .1)
+    assert padded['kind'] == original['kind']
+    assert _box_contains(padded['box'], original['box'])
+
+
 def test_new_product_name_reuses_an_existing_certificate(monkeypatch):
     from test_sigma_box_plan import _branch, _plan
     session = {}
