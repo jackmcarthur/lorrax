@@ -1,0 +1,13 @@
+diff --git a/src/gw/photon_sigma.py b/src/gw/photon_sigma.py
+index b054a545..5c429bb1 100644
+--- a/src/gw/photon_sigma.py
++++ b/src/gw/photon_sigma.py
+@@ -170,6 +170,8 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
+         slices = left.slices
+         weights = (_occ_diag_full(Gij, slices.nb_sigma, slices.nb_full)
+                    if term != _TERM_COH else left.band_mask(slices.sigma_sum).astype(jnp.complex128))
++        weights = jax.lax.with_sharding_constraint(
++            jnp.broadcast_to(weights, (meta.nk_tot, slices.nb_full)), NamedSharding(mesh_xy, P()))
+         factor = -0.5 if term == _TERM_COH else 1.0
+         kernel = _make_photon_static_block_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
+             left, right, vertex_pair=key)
