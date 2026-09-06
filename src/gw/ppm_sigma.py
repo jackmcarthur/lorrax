@@ -608,23 +608,14 @@ def _compute_invalid_static_sigma(
 
     Gij = build_Gij(meta, mesh_xy, occupation_state)
     face_kwargs = sigma_face_kernel_kwargs(wfns)
-    k_unfold_plan = face_kwargs.get("k_unfold_plan")
+    k_unfold_plan = wfns.green_parent.plan
     spatial = get_sigma_spatial_kernel(
         mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
     s = wfns.slices
-    g_plan = (_face_g_plan(
-                  mesh_xy, face_kwargs["face_shape"] if k_unfold_plan is None
-                  else (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]))
-             if wfns.layout == "face" else None)
-    if k_unfold_plan is not None:
-        # Raw parents only: the same faces feed G and band projection;
-        # the spatial tail selects and broadcasts.
-        (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
-        g_carrier = wfns.green_parent
-    else:
-        g_mun, g_nmu = wfns.psi_mun, wfns.psi_nmu
-        proj_xr, proj_yn = wfns.psi_nmu, wfns.psi_mun
-        g_carrier = wfns
+    g_plan = _face_g_plan(
+        mesh_xy, (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]))
+    (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
+    g_carrier = wfns.green_parent
 
     with mesh_xy:
         W_static = jnp.where(
@@ -634,20 +625,9 @@ def _compute_invalid_static_sigma(
         )
         W_prep = spatial.prep_w(W_static)
 
-        if wfns.layout == "legacy":
-            psi_xr, psi_yn, nb_real = pad_sigma_window(
-                wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
-        else:
-            # Face: project over the FULL nb_full extent (report §3), then
-            # strip to nb_sigma below — same "weight, don't window" +
-            # late-window pattern as cohsex_sigma's own face kernels.
-            psi_xr, psi_yn = proj_xr, proj_yn
-            # The strip below consumes the band-window receipt, exactly as
-            # the legacy branch receives one from pad_sigma_window; its
-            # ``logical`` is nb_sigma and the face projection's wider nb_full
-            # matrix is the source it strips.
-            nb_real = sigma_band_axis(
-                int(s.nb_sigma), mesh_xy, ansatz="static face")
+        psi_xr, psi_yn = proj_xr, proj_yn
+        nb_real = sigma_band_axis(
+            int(s.nb_sigma), mesh_xy, ansatz="static face")
 
         # The shared spatial kernel returns -<G.W>.  Gather each tiny sharded
         # band tensor before building the next centroid-square G: this makes
@@ -655,28 +635,21 @@ def _compute_invalid_static_sigma(
         # free to overlap the occupied and RI contractions.  The production
         # fused-FFI route additionally keeps the R-space G tile inside its
         # bounded handler rather than materialising the decomposed FFT chain.
-        if wfns.layout == "legacy":
-            G_occ = build_G(wfns.xn(s.sigma), wfns.yr(s.sigma), Gij=Gij)
-        else:
-            nb_full = int(s.nb_full)
-            phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
-            if k_unfold_plan is not None:
-                phases = k_unfold_plan.parent_rows(phases)
-            G_occ = build_G(g_mun, g_nmu, phases=phases,
-                            layout="face", gemm=g_plan,
-                            k_unfold_plan=k_unfold_plan)
+        nb_full = int(s.nb_full)
+        phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
+        phases = k_unfold_plan.parent_rows(phases)
+        G_occ = build_G(g_mun, g_nmu, phases=phases,
+                        layout="face", gemm=g_plan,
+                        k_unfold_plan=k_unfold_plan)
         sig_sx = spatial.conv_project(psi_xr, psi_yn, G_occ, W_prep)
         sx_host = np.asarray(strip_sigma_window(
             gather_to_host(sig_sx), nb_real), dtype=np.complex128)
         del G_occ, sig_sx
 
-        if wfns.layout == "legacy":
-            G_ri = build_G(wfns.xn(s.sigma_sum), wfns.yr(s.sigma_sum))
-        else:
-            mask = g_carrier.band_mask(s.sigma_sum).astype(jnp.complex128)
-            G_ri = build_G(g_mun, g_nmu, phases=mask,
-                           layout="face", gemm=g_plan,
-                           k_unfold_plan=k_unfold_plan)
+        mask = g_carrier.band_mask(s.sigma_sum).astype(jnp.complex128)
+        G_ri = build_G(g_mun, g_nmu, phases=mask,
+                       layout="face", gemm=g_plan,
+                       k_unfold_plan=k_unfold_plan)
         sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
         ri_host = np.asarray(strip_sigma_window(
             gather_to_host(sig_ri), nb_real), dtype=np.complex128)
@@ -735,23 +708,14 @@ def _invalid_static_coh_by_bracket(
     from .greens_function_kernel import build_G
 
     face_kwargs = sigma_face_kernel_kwargs(wfns)
-    k_unfold_plan = face_kwargs.get("k_unfold_plan")
+    k_unfold_plan = wfns.green_parent.plan
     spatial = get_sigma_spatial_kernel(
         mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
     s = wfns.slices
-    g_plan = (_face_g_plan(
-                  mesh_xy, face_kwargs["face_shape"] if k_unfold_plan is None
-                  else (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]))
-             if wfns.layout == "face" else None)
-    if k_unfold_plan is not None:
-        # Raw parents only: the same faces feed G and band projection;
-        # the spatial tail selects and broadcasts.
-        (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
-        g_carrier = wfns.green_parent
-    else:
-        g_mun, g_nmu = wfns.psi_mun, wfns.psi_nmu
-        proj_xr, proj_yn = wfns.psi_nmu, wfns.psi_mun
-        g_carrier = wfns
+    g_plan = _face_g_plan(
+        mesh_xy, (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]))
+    (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
+    g_carrier = wfns.green_parent
 
     out = []
     with mesh_xy:
@@ -761,33 +725,15 @@ def _invalid_static_coh_by_bracket(
             jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
         )
         W_prep = spatial.prep_w(W_static)
-        if wfns.layout == "legacy":
-            psi_xr, psi_yn, nb_real = pad_sigma_window(
-                wfns.xr(s.sigma), wfns.yn(s.sigma), mesh_xy)
-        else:
-            psi_xr, psi_yn = proj_xr, proj_yn
-            # The strip below consumes the band-window receipt, exactly as
-            # the legacy branch receives one from pad_sigma_window; its
-            # ``logical`` is nb_sigma and the face projection's wider nb_full
-            # matrix is the source it strips.
-            nb_real = sigma_band_axis(
-                int(s.nb_sigma), mesh_xy, ansatz="static face")
+        psi_xr, psi_yn = proj_xr, proj_yn
+        nb_real = sigma_band_axis(
+            int(s.nb_sigma), mesh_xy, ansatz="static face")
         for lo, hi in brackets:
-            if wfns.layout == "legacy":
-                G_ri = build_G(
-                    wfns.xn(slice(int(lo), int(hi))),
-                    wfns.yr(slice(int(lo), int(hi))))
-            else:
-                # "Weight, don't window" — the SAME bracket-as-mask
-                # substitute the tau kernel's own _bracketed_face uses:
-                # psi_mun/psi_nmu cannot be sliced to an arbitrary band
-                # sub-range, so the bracket becomes a band-range mask
-                # applied as a phase weight instead.
-                mask = g_carrier.band_mask(
-                    slice(int(lo), int(hi))).astype(jnp.complex128)
-                G_ri = build_G(g_mun, g_nmu, phases=mask,
-                               layout="face", gemm=g_plan,
-                               k_unfold_plan=k_unfold_plan)
+            mask = g_carrier.band_mask(
+                slice(int(lo), int(hi))).astype(jnp.complex128)
+            G_ri = build_G(g_mun, g_nmu, phases=mask,
+                           layout="face", gemm=g_plan,
+                           k_unfold_plan=k_unfold_plan)
             sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
             ri_host = np.asarray(strip_sigma_window(
                 gather_to_host(sig_ri), nb_real), dtype=np.complex128)
