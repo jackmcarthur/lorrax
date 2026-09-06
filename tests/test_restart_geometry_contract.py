@@ -315,3 +315,31 @@ def test_noncanonical_padded_axis_receipt_refuses_before_slab_read(
     with pytest.raises(ValueError, match="expected 8"):
         tagged_arrays.read_restart_state_from_h5(str(path), object())
     assert opens == []
+
+
+def test_four_spinor_parent_families_round_trip(tmp_path, host_transport):
+    """Charge and current parent faces retain their distinct logical centroid axes."""
+    path = str(tmp_path / "parent_families.h5")
+    charge = np.arange(2 * 4 * 4 * 8).reshape(2, 4, 4, 8).astype(complex)
+    current = (3j + np.arange(2 * 4 * 4 * 6)).reshape(2, 4, 4, 6)
+    tagged_arrays.write_restart_state_to_h5(
+        path, n_rmu_logical=8, n_rmu_transverse_logical=6,
+        V_qmunu=np.zeros((1, 8, 8), complex),
+        psi_parent_y=charge, psi_parent_y_mun=charge.transpose(0, 2, 3, 1),
+        psi_parent_y_transverse=current,
+        psi_parent_y_transverse_mun=current.transpose(0, 2, 3, 1),
+        parent_k_rows=np.array([0, 3]), mesh=_mesh_product(1), mode="w")
+    result = tagged_arrays.read_restart_state_from_h5(
+        path, _mesh_product(1), low_mem_bands=True)
+    np.testing.assert_array_equal(result[13], charge)
+    np.testing.assert_array_equal(result[14], charge.transpose(0, 2, 3, 1))
+    np.testing.assert_array_equal(result[16], current)
+    np.testing.assert_array_equal(result[17], current.transpose(0, 2, 3, 1))
+    assert result[10] is None and result[11] is None
+    with h5py.File(path, "r+") as f:
+        del f["psi_parent_y_transverse_mun"]
+    opens_before = len(host_transport.opens)
+    with pytest.raises(ValueError, match="torn transverse parent faces"):
+        tagged_arrays.read_restart_state_from_h5(
+            path, _mesh_product(1), low_mem_bands=True)
+    assert len(host_transport.opens) == opens_before

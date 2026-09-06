@@ -65,46 +65,17 @@ def test_parent_k_profitability_uses_measured_small_band_envelope():
         n_full=64, n_parent=64, n_bands=1024)
 
 
-def test_bispinor_parent_k_candidate_falls_back_by_name():
-    """The production admission predicate cannot send current data to charge unfold."""
+def test_bispinor_parent_k_candidate_uses_four_spinor_unfold():
+    """Four-spinor parent faces use the same admission envelope as scalar faces."""
     cfg = SimpleNamespace(
-        bispinor=True,
-        memory=SimpleNamespace(low_mem_bands=True),
+        bispinor=True, memory=SimpleNamespace(low_mem_bands=True),
         compute_mode=SimpleNamespace(needs_screening=True),
-        screening=SimpleNamespace(diagrams="w_rpa"),
-        qp_solver="one_shot_dft",
-    )
+        screening=SimpleNamespace(diagrams="w_rpa"), qp_solver="one_shot_dft")
     meta = SimpleNamespace(nk_tot=64, nspinor=4)
-    wfn = SimpleNamespace(nkpts=8)
-    bands = SimpleNamespace(nb_full=4)
     records = []
-
     admitted, work_ok = _resolve_parent_green_admission(
-        cfg, meta, wfn, bands, backend="gpu", print_fn=records.append)
-
-    assert work_ok
-    assert not admitted
-    assert len(records) == 1
-    record = records[0]
-    for required in (
-        "GATE parent_k_green_bispinor_vector_unfold_unimplemented",
-        "bispinor = true",
-        "psi_nk_irr-only",
-        "full-k wavefunction-storage fallback",
-        "scalar charge operators",
-        "current vertices are Cartesian vectors",
-        "k and k-q current endpoints",
-        "q_stencil_orbit_table",
-        "apply_band_matrix_symmetry",
-        "set bispinor = false",
-    ):
-        assert required in record
-
-    cfg.bispinor = False
-    meta.nspinor = 2
-    records.clear()
-    admitted, work_ok = _resolve_parent_green_admission(
-        cfg, meta, wfn, bands, backend="gpu", print_fn=records.append)
+        cfg, meta, SimpleNamespace(nkpts=8), SimpleNamespace(nb_full=4),
+        backend="gpu", print_fn=records.append)
     assert work_ok
     assert admitted
     assert records == []

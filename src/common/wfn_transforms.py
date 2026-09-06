@@ -2573,11 +2573,6 @@ def load_centroids_band_chunked(
         raise ValueError(
             "load_centroids_band_chunked: return_ibz_parents needs the "
             "parent-major loader stream, not a pre-unfolded psi_G_flat.")
-    if return_parents and (bispinor or int(meta.nspinor) not in (1, 2)):
-        raise ValueError(
-            "load_centroids_band_chunked: raw-parent retention currently "
-            "supports scalar/two-component wavefunctions only; four-"
-            "component kinetic-balance transport remains on full k.")
     nk_tot = (int(meta.nk_tot) if domain == "full_bz"
               else int(wfn.nkpts))
     nspinor = int(meta.nspinor)
@@ -2982,10 +2977,19 @@ def load_centroids_band_chunked(
                         jax.block_until_ready(parent_psi)
 
                     if return_parents:
+                        retained_parent = parent_psi
+                        if bispinor:
+                            retained_parent = load_psi_gflat_padded(
+                                loader, band_window, mesh_xy=mesh_xy,
+                                bispinor=True, pad_to=band_tile,
+                                k=IBZRows((int(parent),)),
+                                sharding=sharding_load,
+                                bispinor_lift=bispinor_lift)
                         psi_parent_y, psi_parent_x = _sample_and_insert_one(
-                            psi_parent_y, psi_parent_x, parent_psi,
+                            psi_parent_y, psi_parent_x, retained_parent,
                             parent_index, int(parent), b_rel,
                             kvecs_parent[int(parent)])
+                        del retained_parent
 
                     for child, g_index_one in child_indices:
                         with timing.section("load_centroids.parent_unfold"):

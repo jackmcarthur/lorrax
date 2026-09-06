@@ -470,12 +470,11 @@ def main(argv=None):
 	              if config.qp_solver is QPSolver.SELF_CONSISTENT else 0)
 	# THE in-memory centroid order (common.centroid_basis): whole symmetry
 	# orbits per shard so every symmetry action is rank-local; files keep
-	# the canonical order and convert at the I/O seam.  A bispinor deck keeps
-	# the canonical order: its transverse channel has no packed layout yet.
+	# the canonical order and convert at the I/O seam.  Each current family has
+	# its own independently packed basis.
 	from common.centroid_basis import PackedCentroidBasis
 	mu_basis = PackedCentroidBasis.build(
-		centroid_indices, sym, wfn.fft_grid, mesh_xy,
-		identity=bool(config.bispinor))
+		centroid_indices, sym, wfn.fft_grid, mesh_xy)
 	print0(f"  {mu_basis.describe()}")
 	meta = Meta.from_system(wfn, sym,
 	                        int(config.nval) + _sc_buffer,

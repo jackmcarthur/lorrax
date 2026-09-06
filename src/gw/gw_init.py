@@ -824,62 +824,35 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 
 def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
                          band_slices, band_chunk_size, k_chunk_size=None):
-	"""Sample ψ at the TRANSVERSE centroid set and package it for σ^B.
-
-	This is the whole of ``transverse_wfn_data``: ψ at r_{μ_T} over the
-	full band window, plus the transverse ``meta`` and centroid table.
-	It is a pure function of (WFN.h5, symmetry, transverse centroids,
-	band window) — the ζ_T fit contributes NOTHING to it, which is why
-	the ζ-reuse path can rebuild it instead of refitting.
-
-	ONE call site per path (fit and reuse) on purpose: the reuse leg
-	must produce bit-identical ψ to the fit leg, and the cheapest way
-	to guarantee that is for both to run the same code.
-
-	``low_mem_bands = true`` (2026-08-23): ALSO converts to the two-face
-	carrier here, SAME ``PSI_MUN_SPEC``/``PSI_NMU_SPEC`` build path the
-	charge channel uses, and drops the single-axis copies -- once, in
-	this one function, so BOTH callers (the fresh-fit bispinor loop and
-	the ζ-reuse early return) get the face carrier identically instead
-	of each converting it their own way.  ``psi_rmu_Y``/``psi_rmuT_X``
-	are ``None`` in the returned dict in this case;
-	``psi_mun_fresh``/``psi_nmu_fresh`` carry the face arrays instead.
-	"""
-	from common.wfn_transforms import load_centroids_band_chunked
-	representation = resolve_four_current_representation(
-		cfg.bispinor, cfg.bispinor_gw)
+	"""Sample the current family's packed basis using the same raw-parent loader as charge."""
+	from common.wfn_transforms import load_centroids_band_chunked, get_enk_bandrange
+	from .wavefunction_bundle import (parent_faces, wavefunctions_face_from_restart,
+	                                 build_packed_parent_green_carrier)
+	representation = resolve_four_current_representation(cfg.bispinor, cfg.bispinor_gw)
+	plan, _, parents_only = _prepare_parent_wavefunction_plan(
+		cfg, meta_T, wfn, band_slices, sym=sym,
+		centroid_indices=cent_T_idx, mesh_xy=mesh_xy)
+	parents_only = parents_only and plan is not None
 	with timing.section("gw_jax.load_centroid_wfns_current"):
-		psi_curr_rmu_Y, psi_curr_rmuT_X = load_centroids_band_chunked(
+		psi_y, psi_x = load_centroids_band_chunked(
 			wfn, sym, meta_T, cent_T_idx, True, mesh_xy,
-			band_range=band_slices.full_range,
-			band_chunk_size=int(band_chunk_size),
-			k_chunk_size=k_chunk_size,
-			bispinor_lift=representation.current_lift,
-		)
-	psi_mun_fresh_T = None
-	psi_nmu_fresh_T = None
+			band_range=band_slices.full_range, band_chunk_size=int(band_chunk_size),
+			k_chunk_size=k_chunk_size, bispinor_lift=representation.current_lift,
+			k_domain="ibz" if parents_only else "full_bz")
+	nmu = mun = carrier = None
 	if cfg.memory.low_mem_bands:
-		from jax.sharding import NamedSharding
-		from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
-		with mesh_xy:
-			psi_nmu_fresh_T = jax.lax.with_sharding_constraint(
-				psi_curr_rmu_Y, NamedSharding(mesh_xy, PSI_NMU_SPEC))
-			psi_mun_fresh_T = jax.lax.with_sharding_constraint(
-				jnp.conj(psi_curr_rmuT_X).transpose(0, 3, 1, 2),
-				NamedSharding(mesh_xy, PSI_MUN_SPEC))
-		del psi_curr_rmu_Y, psi_curr_rmuT_X
-		psi_curr_rmu_Y = None
-		psi_curr_rmuT_X = None
-	# Keeping these arrays alive across the return is intentional —
-	# they are the only way the σ^B kernel can sample ψ at r_{μ_T}.
-	return {
-		'psi_rmu_Y':        psi_curr_rmu_Y,
-		'psi_rmuT_X':       psi_curr_rmuT_X,
-		'meta':             meta_T,
-		'centroid_indices': cent_T_idx,
-		'psi_mun_fresh':    psi_mun_fresh_T,
-		'psi_nmu_fresh':    psi_nmu_fresh_T,
-	}
+		nmu, mun = parent_faces(psi_y, psi_x, mesh_xy=mesh_xy)
+		psi_y = psi_x = None
+		if parents_only:
+			enk, _ = get_enk_bandrange(wfn, sym, band_slices.full_range,
+			                         (band_slices.b1, band_slices.b3), nspinor=4)
+			wfns = wavefunctions_face_from_restart(
+				None, None, enk_full=enk, slices=band_slices, mesh_xy=mesh_xy)
+			carrier = build_packed_parent_green_carrier(
+				wfns, nmu, mun, plan=plan, mesh_xy=mesh_xy)
+	return dict(psi_rmu_Y=psi_y, psi_rmuT_X=psi_x, meta=meta_T,
+	            centroid_indices=cent_T_idx, psi_nmu_fresh=nmu,
+	            psi_mun_fresh=mun, green_parent=carrier)
 
 
 def resolve_zeta_fit_edge(band_slices, zeta_nband):
@@ -1489,12 +1462,12 @@ def _resolve_zeta_fit_contract(
 		# device array only after the canonical all-channel reuse verdict says
 		# that a fit or downstream Sigma sampling is actually required.
 		centroids_transverse = np.asarray(cent_T_np, dtype=np.int32)
-		# The current channel has its own canonical table; it must not inherit
-		# the charge basis, which the loader would substitute for that table.
+		from common.centroid_basis import PackedCentroidBasis
+		basis_T = PackedCentroidBasis.build(
+			centroids_transverse, sym, meta.fft_grid, mesh_xy)
 		meta_transverse = replace(
-			meta, n_rmu=int(n_rmu_T), nspinor=4, npol=4, mu_basis=None,
-			n_rmu_padded=int(padded_mu_extent(int(n_rmu_T),
-			                                  int(jax.device_count()))))
+			meta, n_rmu=int(n_rmu_T), nspinor=4, npol=4, mu_basis=basis_T,
+			n_rmu_padded=basis_T.n_packed)
 		meta_transverse.sys_dim = meta.sys_dim
 		meta_transverse.bispinor = True
 		transverse_identity = {
@@ -3168,13 +3141,7 @@ def _parents_only_consumer_blockers(cfg) -> list:
 def _resolve_parent_green_admission(
 	cfg, meta, wfn, band_slices, *, backend, print_fn=print,
 ):
-	"""Resolve the raw-parent Green-function acceleration and its fallback.
-
-	The local unfold currently owns scalar charge operators only.  Keeping the
-	bispinor check here, in the same predicate that admits the acceleration,
-	prevents a four-current deck from reaching ``psi_nk_irr`` storage by an
-	accidental change to ``Meta.nspinor`` or another representation detail.
-	"""
+	"""Admit a typed parent Green contraction within the measured work envelope."""
 	from .centroid_k_unfold import parent_k_contraction_profitable
 
 	work_ok = parent_k_contraction_profitable(
@@ -3192,27 +3159,7 @@ def _resolve_parent_green_admission(
 		and int(wfn.nkpts) < int(meta.nk_tot)
 		and str(backend) == 'gpu'
 		and work_ok)
-	if common_candidate and bool(cfg.bispinor):
-		print_fn(
-			"  [GATE parent_k_green_bispinor_vector_unfold_unimplemented] "
-			"got bispinor = true on a deck otherwise eligible for "
-			"psi_nk_irr-only parent-k storage and local unfold; using the "
-			"full-k wavefunction-storage fallback.  The implemented unfold "
-			"transports scalar charge operators under the point group, but "
-			"current vertices are Cartesian vectors under the same rotations "
-			"and the transverse channel additionally needs both k and k-q "
-			"current endpoints.  A transverse implementation must use the "
-			"symmetry service's q_stencil_orbit_table and "
-			"apply_band_matrix_symmetry vector action.  Keep bispinor = true "
-			"for this automatic full-k fallback; set bispinor = false only "
-			"for charge-only physics to enable the psi_nk_irr-only path.")
-		return False, work_ok
-	return (
-		common_candidate
-		and not bool(cfg.bispinor)
-		and int(meta.nspinor) in (1, 2),
-		work_ok,
-	)
+	return common_candidate and int(meta.nspinor) in (1, 2, 4), work_ok
 
 
 def _prepare_parent_wavefunction_plan(
@@ -3239,8 +3186,7 @@ def _prepare_parent_wavefunction_plan(
 			backend=jax.default_backend(), print_fn=print_fn))
 	can_use_parents = (
 		bool(cfg.memory.low_mem_bands)
-		and not bool(cfg.bispinor)
-		and int(meta.nspinor) in (1, 2)
+		and int(meta.nspinor) in (1, 2, 4)
 		and int(wfn.nkpts) < int(meta.nk_tot))
 	# Parents-only ψ storage: when every wavefunction consumer of
 	# this run is parent-capable, the full-k centroid faces are
@@ -3342,18 +3288,18 @@ def prepare_isdf_and_wavefunctions(
 	# A reader packs, a writer unpacks, nothing in between converts.
 	_mu_basis = getattr(meta, 'mu_basis', None)
 
-	def _to_run_order(array, mu_axes):
-		if array is None or _mu_basis is None:
+	def _to_run_order(array, mu_axes, basis=_mu_basis):
+		if array is None or basis is None:
 			return array
 		for axis in mu_axes:
-			array = _mu_basis.pack_axis(array, axis)
+			array = basis.pack_axis(array, axis)
 		return array
 
-	def _to_file_order(array, mu_axes):
-		if array is None or _mu_basis is None:
+	def _to_file_order(array, mu_axes, basis=_mu_basis):
+		if array is None or basis is None:
 			return array
 		for axis in mu_axes:
-			array = _mu_basis.unpack_axis(array, axis)
+			array = basis.unpack_axis(array, axis)
 		return array
 
 	if not cfg.restart:
@@ -3694,13 +3640,21 @@ def prepare_isdf_and_wavefunctions(
 				# bands are a system property, not per-centroid-set --
 				# exactly what the legacy branch below does too).
 				if transverse_wfn_data is not None:
+					parent_T = transverse_wfn_data['green_parent']
 					with timing.section("gw_jax.wavefunction_setup"):
 						wfns_transverse = wavefunctions_face_from_restart(
+							None if parent_T is not None else
 							transverse_wfn_data['psi_nmu_fresh'],
+							None if parent_T is not None else
 							transverse_wfn_data['psi_mun_fresh'],
 							enk_full=_enk_full_face,
 							slices=band_slices, mesh_xy=mesh_xy,
 							basis_receipt=transverse_basis_receipt)
+					wfns_transverse = replace(
+						wfns_transverse, green_parent=parent_T)
+					if transverse_basis_receipt is not None:
+						transverse_basis_receipt.assert_matches_carrier(
+							wfns_transverse, where="fresh current parent faces")
 					print0(f"  [bispinor] σ^B-side Wfns built on "
 					       f"n_rmu_T={transverse_wfn_data['meta'].n_rmu} "
 					       f"transverse centroids (face layout; "
@@ -3859,6 +3813,8 @@ def prepare_isdf_and_wavefunctions(
 					# charge pair relies on), clipped at the TRANSVERSE
 					# centroid count.  SlabIO writes each face's owned
 					# shards directly; no reshard, no gather.
+					parent_T = None if wfns_transverse is None else wfns_transverse.green_parent
+					basis_T = None if transverse_wfn_data is None else transverse_wfn_data['meta'].mu_basis
 					write_restart_state_to_h5(
 						tensors_filename,
 						n_rmu_logical=int(meta.n_rmu),
@@ -3878,11 +3834,15 @@ def prepare_isdf_and_wavefunctions(
 							if _parents_only else None),
 						mesh=mesh_xy, mode="a",
 						psi_full_y_transverse=(
-							wfns_transverse.psi_nmu
+							_to_file_order(wfns_transverse.psi_nmu, (3,), basis_T)
 							if wfns_transverse is not None else None),
 						psi_full_y_transverse_mun=(
-							wfns_transverse.psi_mun
+							_to_file_order(wfns_transverse.psi_mun, (2,), basis_T)
 							if wfns_transverse is not None else None),
+						psi_parent_y_transverse=(
+							_to_file_order(parent_T.psi_nmu, (3,), basis_T) if parent_T is not None else None),
+						psi_parent_y_transverse_mun=(
+							_to_file_order(parent_T.psi_mun, (2,), basis_T) if parent_T is not None else None),
 						n_rmu_transverse_logical=(
 							int(transverse_wfn_data['meta'].n_rmu)
 							if transverse_wfn_data is not None else None),
@@ -4160,7 +4120,7 @@ def prepare_isdf_and_wavefunctions(
 			wfns_transverse = None
 			if cfg.bispinor:
 				_have_T_psi = (
-					getattr(rs, 'psi_nmu_transverse', None) is not None
+					(rs.psi_nmu_transverse is not None or rs.psi_nmu_parent_transverse is not None)
 					if cfg.memory.low_mem_bands
 					else getattr(rs, 'psi_rmu_Y_transverse', None)
 					is not None)
@@ -4203,12 +4163,12 @@ def prepare_isdf_and_wavefunctions(
 				# (audit fix/zq 2026-07-28; ``_stamped`` read above).
 				_have_t = _stamped.get('centroids_transverse_md5')
 				transverse_basis_receipt = None
-				_n_rmu_T_padded = (
-					int(rs.psi_nmu_transverse.shape[-1])
-					if cfg.memory.low_mem_bands else
-					int(rs.psi_rmu_Y_transverse.shape[-1]))
+				from common.centroid_basis import PackedCentroidBasis
+				basis_T = PackedCentroidBasis.build(
+					_cent_T_idx_now, sym, meta.fft_grid, mesh_xy)
+				_n_rmu_T_padded = basis_T.n_packed
 				meta_restart_transverse = replace(
-					meta, n_rmu=int(_n_rmu_curr_now), mu_basis=None,
+					meta, n_rmu=int(_n_rmu_curr_now), mu_basis=basis_T,
 					n_rmu_padded=_n_rmu_T_padded, nspinor=4, npol=4)
 				meta_restart_transverse.sys_dim = meta.sys_dim
 				meta_restart_transverse.bispinor = True
@@ -4259,14 +4219,25 @@ def prepare_isdf_and_wavefunctions(
 				if cfg.memory.low_mem_bands:
 					from .wavefunction_bundle import (
 						wavefunctions_face_from_restart)
-					sanity.check_finite(
-						"restart transverse ψ (psi_full_y_transverse, "
-						"face)", rs.psi_nmu_transverse, print_fn=print0)
 					wfns_transverse = wavefunctions_face_from_restart(
-						rs.psi_nmu_transverse, rs.psi_mun_transverse,
+						_to_run_order(rs.psi_nmu_transverse, (3,), basis_T),
+						_to_run_order(rs.psi_mun_transverse, (2,), basis_T),
 						enk_full=rs.enk_full, slices=band_slices,
-						mesh_xy=mesh_xy,
-						basis_receipt=transverse_basis_receipt)
+						mesh_xy=mesh_xy, basis_receipt=transverse_basis_receipt)
+					if rs.psi_nmu_parent_transverse is not None:
+						plan_T = build_centroid_k_unfold_plan(
+							sym, _cent_T_idx_now, meta.fft_grid, mesh_xy, nspinor=4,
+							parent_k_frac=wfn.kvecs(k='ibz'), layout=basis_T.layout)
+						carrier_T = build_packed_parent_green_carrier(
+							wfns_transverse,
+							_to_run_order(rs.psi_nmu_parent_transverse, (3,), basis_T),
+							_to_run_order(rs.psi_mun_parent_transverse, (2,), basis_T),
+							plan=plan_T, mesh_xy=mesh_xy)
+						wfns_transverse = replace(wfns_transverse, green_parent=carrier_T)
+						if transverse_basis_receipt is not None:
+							transverse_basis_receipt.assert_matches_carrier(
+								wfns_transverse, where="restart current parent faces")
+
 				else:
 					sanity.check_finite(
 						"restart transverse ψ (psi_full_y_transverse)",
