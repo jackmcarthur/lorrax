@@ -1,0 +1,11 @@
+[lx] using named allocation JID 57982945 [--jid]
+[lxrun] JID 57982945 · 4 nodes · 1:49:03 left · 11/16 GPUs free · incoming: lx-?
+  1  nid001064 [4/4 gpu]  free   —                —      —  ← starting lx-?  ./rankwrap.sh bash ./dri
+  2  nid001065 [3/4 gpu]  busy   lx-Xg1-120056-398674-7698 9m     started 12:00
+  3  nid001068 [4/4 gpu]  free   —                —      —
+  4  nid001128 [0/4 gpu]  busy   lx-Xg4-120912-441486-5686 45s    started 12:09
+[lx] zero-GPU step: --gres=none, no GPU selector, and this leg is charged 0 GPUs by the pool, so it does not queue behind GPU work. Set JAX_PLATFORMS=cpu in the payload if it uses JAX.
+[lx] source tree: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src  [cwd checkout]
+[lx] runtime import origin: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py  [PYTHONPATH head; runtime.bootstrap attests the actual import]
+[rankwrap] rank=0 host=nid001064 src=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+[lx] step lx-Xg0-121001-446209-4352 exit 0 in 21 s

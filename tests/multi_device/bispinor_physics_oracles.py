@@ -416,7 +416,12 @@ def test_q_star_unfold_all_blocks_ward_contact_and_daggers():
     packed = pack_photon_operator(lambda a,b:jnp.asarray(d[:,a*nmu:(a+1)*nmu,b*nmu:(b+1)*nmu]),nq,layout,mesh)
     response = StaticPhotonResponse(layout,packed,packed,'none','toy',qgrid_policy=policy,family_plans=(plan,plan))
     keys = [(a,b) for a in range(4) for b in range(4)]
-    restored = dict(photon_blocks_full_q(response,keys,term='W'))
+    restored = {}
+    for a,b in ((0,0),(0,1),(1,0),(1,1)):
+        selected = [key for key in keys if tuple(map(bool,key)) == (bool(a),bool(b))]
+        if selected:
+            restored.update(photon_blocks_full_q(response.W_packed,selected,layout=response.layout,
+                family_plans=response.family_plans,qgrid_policy=response.qgrid_policy))
     qfrac = bgw_integer_q_to_fractional(sym.q_irr_kgrid_int,(3,3,1))
     for q,(p,row) in enumerate(zip(sym.irr_idx_q,policy.unfold_sym_idx)):
         perm = plan.sym_perm[row]

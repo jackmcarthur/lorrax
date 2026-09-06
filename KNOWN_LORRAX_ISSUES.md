@@ -1,0 +1,14 @@
+# BISP-PROF-S local issue register
+
+All fixes below are on `perf/bisp-prof-s-2026-09-06`, unmerged. File:line references for replaced code refer to pinned P9f569c4b; current implementations and numerical gates are linked from reports/bisp_prof_s_2026-09-06/report.md.
+
+- Fixed by `ebb18981`: `src/gw/w_isdf.py:2029` created300 loop-local restore/add JITs per full-static run. M14 measured64.945 host seconds/51.527 compiler seconds at this boundary; final M37 has2.259/1.268. Existing symmetry-owner cache is reused; no new restore helper/cache. ZW87a2bfaa overlaps; integration must choose one implementation.
+- Fixed by `5dd1c775`: `src/gw/photon_sigma.py:127` rebuilt projector/Green GEMM plans per vertex/head specialization. Factory work54.071→6.302s; same4 shape classes as F.
+- Fixed by `1beb5711` and `5093d98d`: `src/gw/photon_sigma.py:123,167` vertex specialization plus weight shape/placement differences produced64 core executables. Final M36 has4; all four have zero explicit HLO collectives.
+- Fixed by `fd5ba099`: `src/gw/photon_sigma.py:180` rebuilt G and both child faces for q0 diagnostics. One G now feeds body and head, preserving all printed diagnostic rows.
+- Fixed with a memory tradeoff by `ebc98918`: `services/symmetry_maps/src/symmetry_maps/maps.py:1337` used dense4c spin GEMMs/layout moves. Final Si tau38.633553→30.385825ms; HLO peak2,020,215,829→2,487,859,989 bytes/rank. Supplied block action is used only after exact structural validation; generic actions retain the dense fallback.
+- **Remaining invariant gap:** `services/symmetry_maps/src/symmetry_maps/maps.py:1462` open-spin pair transpose and `maps.py:3856` band transpose require two collective-permute starts in the MoS2 dynamic parent tau module. Pinned payloads7,077,888 and32,400 bytes/rank cost31.808us and6.944us. Final M38 still has exactly two starts. They preserve the antiunitary rule but violate the literal final-psum-only requirement. Evidence JID57966610: M20 module4848/unit_4848_1.json and M38 module2658/final_capture_receipt.json. No rule is bypassed to hide these collectives.
+
+### 2026-09-06 BISP-PROF-S: fresh zero-initializer JIT during GEMM planning (unfixed)
+
+`services/distrib_la/src/distrib_la/matmul.py:187` creates a fresh `jax.jit(lambda: zeros(...))` on every `_zeros` call. In the pinned6x6 P4 Sigma caller the Python profile records60 calls and2.653s inclusive time, inside first-use GEMM/projection planning; this is not a warm lookup cost or a numerical defect. Evidence: JID57982945, step `lx-Xg4-114002-258518-9170`, `runs/MoS2/42_bisp_scale_2026-09-06/prof_s/04_P_host_baseline/sigma_host_top.txt`. A shared shape/sharding-aware initializer could remove redundant cold modules, but requires service-wide backend gates and is deferred from the Lorentz scan change. On branch perf/bisp-prof-s-2026-09-06, unmerged.

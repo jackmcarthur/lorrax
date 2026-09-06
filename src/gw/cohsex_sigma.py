@@ -252,7 +252,7 @@ def _make_lorentz_convolution(mesh_xy, kgrid, scale, q0_only):
                       inverse_v(interaction)[:, None, :, None, :])
             return total + value * weight, None
 
-        sigma, _ = jax.lax.scan(add, jnp.zeros_like(green), (interactions, vertices))
+        sigma, _ = jax.lax.scan(add, jnp.zeros_like(green), (interactions, vertices), unroll=1)
         return prefactor * (sigma if q0_only else forward_g(sigma)) * scale
     return convolve
 

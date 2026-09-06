@@ -1,0 +1,664 @@
+BufferAssignment:
+allocation 0: size 49787136, maybe-live-out:
+ value: <441 wrapped_slice @0> (size=1075648,offset=0): c128[7,98,98]{2,1,0}
+ value: <452 wrapped_slice.2 @0> (size=1075648,offset=0): c128[7,98,98]{2,1,0}
+ value: <458 wrapped_slice.4 @0> (size=1075648,offset=0): c128[7,98,98]{2,1,0}
+ value: <463 wrapped_slice.6 @0> (size=1075648,offset=0): c128[7,98,98]{2,1,0}
+ value: <465 wrapped_slice.7 @0> (size=1075648,offset=0): c128[7,98,98]{2,1,0}
+ value: <486 loop_concatenate_fusion @0> (size=49787136,offset=0): c128[9,36,98,98]{3,2,1,0}
+allocation 1: size 39517632, parameter 0, shape |c128[7,594,594]| at ShapeIndex {}:
+ value: <440 param.108 @0> (size=39517632,offset=0): c128[7,594,594]{2,1,0}
+allocation 2: size 112896, constant:
+ value: <437 constant_871_0 @0> (size=112896,offset=0): c128[36,196]{1,0}
+allocation 3: size 28224, constant:
+ value: <445 constant_685_0 @0> (size=28224,offset=0): s32[36,196]{1,0}
+allocation 4: size 576, maybe-live-out:
+ value: <493 copy.140 @0> (size=576,offset=0): c128[9,4]{1,0}
+allocation 5: size 576, maybe-live-out:
+ value: <495 copy.142 @0> (size=576,offset=0): c128[9,4]{1,0}
+allocation 6: size 576, constant:
+ value: <457 constant_705_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 7: size 576, constant:
+ value: <470 constant_708_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 8: size 576, constant:
+ value: <471 constant_707_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 9: size 576, constant:
+ value: <472 constant_704_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 10: size 576, constant:
+ value: <473 constant_703_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 11: size 576, constant:
+ value: <474 constant_695_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 12: size 576, constant:
+ value: <475 constant_702_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 13: size 576, constant:
+ value: <476 constant_701_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 14: size 576, constant:
+ value: <477 constant_692_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 15: size 576, constant:
+ value: <478 constant_694_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 16: size 576, constant:
+ value: <479 constant_690_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 17: size 576, constant:
+ value: <480 constant_682_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 18: size 576, constant:
+ value: <481 constant_706_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 19: size 576, constant:
+ value: <482 constant_699_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 20: size 576, constant:
+ value: <483 constant_698_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 21: size 576, constant:
+ value: <484 constant_700_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 22: size 576, constant:
+ value: <485 constant_697_0 @0> (size=576,offset=0): c128[36]{0}
+allocation 23: size 576, constant:
+ value: <488 constant_710_0 @0> (size=576,offset=0): c128[9,4]{1,0}
+allocation 24: size 576, constant:
+ value: <490 constant_712_0 @0> (size=576,offset=0): c128[9,4]{1,0}
+allocation 25: size 144, maybe-live-out:
+ value: <492 copy.139 @0> (size=144,offset=0): s32[9,4]{1,0}
+allocation 26: size 144, maybe-live-out:
+ value: <438 axis_index.396.0 @0> (size=4,offset=0): u32[]
+ value: <494 copy.141 @0> (size=144,offset=0): s32[9,4]{1,0}
+allocation 27: size 144, constant:
+ value: <442 constant_872_0 @0> (size=144,offset=0): s32[36,1]{1,0}
+allocation 28: size 144, constant:
+ value: <487 constant_709_0 @0> (size=144,offset=0): s32[9,4]{1,0}
+allocation 29: size 144, constant:
+ value: <489 constant_711_0 @0> (size=144,offset=0): s32[9,4]{1,0}
+allocation 30: size 40, output shape is |(c128[9,36,98,98], s32[9,4], c128[9,4], s32[9,4], c128[9,4])|, maybe-live-out:
+ value: <496 tuple.14{} @0> (size=40,offset=0): (c128[9,36,98,98]{3,2,1,0}, s32[9,4]{1,0}, c128[9,4]{1,0}, s32[9,4]{1,0}, c128[9,4]{1,0})
+allocation 31: size 36, constant:
+ value: <444 constant_848_0 @0> (size=36,offset=0): pred[36]{0}
+allocation 32: size 49930016, preallocated-temp:
+ value: <439 loop_complex_fusion @0> (size=56448,offset=49788416): c128[36,98]{1,0}
+ value: <443 loop_dynamic_slice_fusion.1 @0> (size=56448,offset=49844992): c128[36,98]{1,0}
+ value: <446 loop_dynamic_slice_fusion.2 @0> (size=14112,offset=49901568): s32[36,98]{1,0}
+ value: <447 loop_dynamic_slice_fusion @0> (size=14112,offset=49915904): s32[36,98]{1,0}
+ value: <448 wrapped_slice.1 @0> (size=1075648,offset=44256512): c128[7,98,98]{2,1,0}
+ value: <449 loop_transpose_fusion.4{} @0> (size=16,offset=256): (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0})
+ value: <450 loop_transpose_fusion.4{0} @0> (size=5531904,offset=33192704): c128[36,98,98]{2,1,0}
+ value: <451 loop_transpose_fusion.4{1} @0> (size=5531904,offset=38724608): c128[36,98,98]{2,1,0}
+ value: <453 wrapped_slice.3 @0> (size=1075648,offset=22128896): c128[7,98,98]{2,1,0}
+ value: <454 loop_transpose_fusion{} @0> (size=16,offset=512): (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0})
+ value: <455 loop_transpose_fusion{0} @0> (size=5531904,offset=11065088): c128[36,98,98]{2,1,0}
+ value: <456 loop_transpose_fusion{1} @0> (size=5531904,offset=16596992): c128[36,98,98]{2,1,0}
+ value: <459 wrapped_slice.5 @0> (size=1075648,offset=33192704): c128[7,98,98]{2,1,0}
+ value: <460 loop_transpose_fusion.1{} @0> (size=16,offset=768): (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0})
+ value: <461 loop_transpose_fusion.1{0} @0> (size=5531904,offset=22128896): c128[36,98,98]{2,1,0}
+ value: <462 loop_transpose_fusion.1{1} @0> (size=5531904,offset=27660800): c128[36,98,98]{2,1,0}
+ value: <464 loop_transpose_fusion.2 @0> (size=5531904,offset=44256512): c128[36,98,98]{2,1,0}
+ value: <466 wrapped_slice.8 @0> (size=1075648,offset=11065088): c128[7,98,98]{2,1,0}
+ value: <467 loop_transpose_fusion.3{} @0> (size=16,offset=1024): (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0})
+ value: <468 loop_transpose_fusion.3{0} @0> (size=5531904,offset=1280): c128[36,98,98]{2,1,0}
+ value: <469 loop_transpose_fusion.3{1} @0> (size=5531904,offset=5533184): c128[36,98,98]{2,1,0}
+ value: <491 tuple.12{} @0> (size=40,offset=0): (c128[9,36,98,98]{3,2,1,0}, s32[9,4]{1,0}, c128[9,4]{1,0}, s32[9,4]{1,0}, c128[9,4]{1,0})
+
+Total bytes used: 139388796 (132.93MiB)
+
+Used values:
+<437 constant_871_0 @0>
+ positions:
+  constant_871_0
+ uses:
+  loop_dynamic_slice_fusion.1, operand 0
+  loop_complex_fusion, operand 0
+ from instruction: %constant_871_0 = c128[36,196]{1,0} constant({...}), metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/exp" stack_frame_id=28}
+<438 axis_index.396.0 @0>
+ positions:
+  axis_index.396.0
+ uses:
+  loop_dynamic_slice_fusion.2, operand 1
+  loop_dynamic_slice_fusion, operand 1
+  loop_complex_fusion, operand 1
+  loop_dynamic_slice_fusion.1, operand 1
+ from instruction: %axis_index.396.0 = u32[] partition-id(), metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/axis_index" stack_frame_id=29}
+<439 loop_complex_fusion @0>
+ positions:
+  loop_complex_fusion
+ uses:
+  loop_transpose_fusion.4, operand 0
+  loop_transpose_fusion.3, operand 0
+  loop_transpose_fusion, operand 0
+  loop_transpose_fusion.2, operand 0
+  loop_transpose_fusion.1, operand 0
+ from instruction: %loop_complex_fusion = c128[36,98]{1,0} fusion(%constant_871_0, %axis_index.396.0), kind=kLoop, calls=%fused_complex, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/complex" stack_frame_id=51}
+<440 param.108 @0>
+ positions:
+  param.108
+ uses:
+  wrapped_slice.1, operand 0
+  wrapped_slice, operand 0
+  wrapped_slice.8, operand 0
+  wrapped_slice.7, operand 0
+  wrapped_slice.6, operand 0
+  wrapped_slice.5, operand 0
+  wrapped_slice.4, operand 0
+  wrapped_slice.3, operand 0
+  wrapped_slice.2, operand 0
+ from instruction: %param.108 = c128[7,594,594]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="packed"}
+<441 wrapped_slice @0>
+ positions:
+  wrapped_slice
+ uses:
+  loop_transpose_fusion.4, operand 1
+ from instruction: %wrapped_slice = c128[7,98,98]{2,1,0} fusion(%param.108), kind=kLoop, calls=%wrapped_slice_computation, metadata={op_name="jit(restore)/jit(view_local)/shard_map/dynamic_slice" stack_frame_id=23}
+<442 constant_872_0 @0>
+ positions:
+  constant_872_0
+ uses:
+  loop_transpose_fusion.4, operand 2
+  loop_transpose_fusion, operand 2
+  loop_transpose_fusion.3, operand 2
+  loop_transpose_fusion.1, operand 2
+  loop_transpose_fusion.2, operand 2
+ from instruction: %constant_872_0 = s32[36,1]{1,0} constant({...}), metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/broadcast_in_dim" stack_frame_id=34}
+<443 loop_dynamic_slice_fusion.1 @0>
+ positions:
+  loop_dynamic_slice_fusion.1
+ uses:
+  loop_transpose_fusion.4, operand 3
+  loop_transpose_fusion.3, operand 3
+  loop_transpose_fusion, operand 3
+  loop_transpose_fusion.2, operand 3
+  loop_transpose_fusion.1, operand 3
+ from instruction: %loop_dynamic_slice_fusion.1 = c128[36,98]{1,0} fusion(%constant_871_0, %axis_index.396.0), kind=kLoop, calls=%fused_dynamic_slice.1, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/dynamic_slice" stack_frame_id=31}
+<444 constant_848_0 @0>
+ positions:
+  constant_848_0
+ uses:
+  loop_transpose_fusion.1, operand 4
+  loop_transpose_fusion.4, operand 4
+  loop_transpose_fusion, operand 4
+  loop_transpose_fusion.3, operand 4
+  loop_transpose_fusion.2, operand 4
+ from instruction: %constant_848_0 = pred[36]{0} constant({...}), metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/jit(_where)/broadcast_in_dim"}
+<445 constant_685_0 @0>
+ positions:
+  constant_685_0
+ uses:
+  loop_dynamic_slice_fusion.2, operand 0
+  loop_dynamic_slice_fusion, operand 0
+ from instruction: %constant_685_0 = s32[36,196]{1,0} constant({...}), metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map" stack_frame_id=24}
+<446 loop_dynamic_slice_fusion.2 @0>
+ positions:
+  loop_dynamic_slice_fusion.2
+ uses:
+  loop_transpose_fusion.3, operand 5
+  loop_transpose_fusion.2, operand 5
+  loop_transpose_fusion.4, operand 5
+  loop_transpose_fusion.1, operand 5
+  loop_transpose_fusion, operand 5
+ from instruction: %loop_dynamic_slice_fusion.2 = s32[36,98]{1,0} fusion(%constant_685_0, %axis_index.396.0), kind=kLoop, calls=%fused_dynamic_slice.2, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/dynamic_slice" stack_frame_id=38}
+<447 loop_dynamic_slice_fusion @0>
+ positions:
+  loop_dynamic_slice_fusion
+ uses:
+  loop_transpose_fusion.3, operand 6
+  loop_transpose_fusion.2, operand 6
+  loop_transpose_fusion.4, operand 6
+  loop_transpose_fusion.1, operand 6
+  loop_transpose_fusion, operand 6
+ from instruction: %loop_dynamic_slice_fusion = s32[36,98]{1,0} fusion(%constant_685_0, %axis_index.396.0), kind=kLoop, calls=%fused_dynamic_slice, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/dynamic_slice" stack_frame_id=41}
+<448 wrapped_slice.1 @0>
+ positions:
+  wrapped_slice.1
+ uses:
+  loop_transpose_fusion.4, operand 7
+ from instruction: %wrapped_slice.1 = c128[7,98,98]{2,1,0} fusion(%param.108), kind=kLoop, calls=%wrapped_slice_computation.1, metadata={op_name="jit(restore)/jit(view_local)/shard_map/dynamic_slice" stack_frame_id=23}
+<449 loop_transpose_fusion.4{} @0>
+ positions:
+  loop_transpose_fusion.4 {}
+ uses:
+  get-tuple-element.4, operand 0 {}
+  get-tuple-element.6, operand 0 {}
+ from instruction: %loop_transpose_fusion.4 = (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0}) fusion(%loop_complex_fusion, %wrapped_slice, %constant_872_0, %loop_dynamic_slice_fusion.1, %constant_848_0, /*index=5*/%loop_dynamic_slice_fusion.2, %loop_dynamic_slice_fusion, %wrapped_slice.1), kind=kLoop, calls=%fused_transpose.4, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/jit(_where)/select_n" deduplicated_name="loop_transpose_fusion"}
+<450 loop_transpose_fusion.4{0} @0>
+ positions:
+  loop_transpose_fusion.4 {0}
+  get-tuple-element.4
+ uses:
+  loop_concatenate_fusion, operand 8
+ from instruction: %loop_transpose_fusion.4 = (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0}) fusion(%loop_complex_fusion, %wrapped_slice, %constant_872_0, %loop_dynamic_slice_fusion.1, %constant_848_0, /*index=5*/%loop_dynamic_slice_fusion.2, %loop_dynamic_slice_fusion, %wrapped_slice.1), kind=kLoop, calls=%fused_transpose.4, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/jit(_where)/select_n" deduplicated_name="loop_transpose_fusion"}
+<451 loop_transpose_fusion.4{1} @0>
+ positions:
+  loop_transpose_fusion.4 {1}
+  get-tuple-element.6
+ uses:
+  loop_concatenate_fusion, operand 0
+ from instruction: %loop_transpose_fusion.4 = (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0}) fusion(%loop_complex_fusion, %wrapped_slice, %constant_872_0, %loop_dynamic_slice_fusion.1, %constant_848_0, /*index=5*/%loop_dynamic_slice_fusion.2, %loop_dynamic_slice_fusion, %wrapped_slice.1), kind=kLoop, calls=%fused_transpose.4, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/jit(_where)/select_n" deduplicated_name="loop_transpose_fusion"}
+<452 wrapped_slice.2 @0>
+ positions:
+  wrapped_slice.2
+ uses:
+  loop_transpose_fusion, operand 1
+ from instruction: %wrapped_slice.2 = c128[7,98,98]{2,1,0} fusion(%param.108), kind=kLoop, calls=%wrapped_slice_computation.2, metadata={op_name="jit(restore)/jit(view_local)/shard_map/dynamic_slice" stack_frame_id=23}
+<453 wrapped_slice.3 @0>
+ positions:
+  wrapped_slice.3
+ uses:
+  loop_transpose_fusion, operand 7
+ from instruction: %wrapped_slice.3 = c128[7,98,98]{2,1,0} fusion(%param.108), kind=kLoop, calls=%wrapped_slice_computation.3, metadata={op_name="jit(restore)/jit(view_local)/shard_map/dynamic_slice" stack_frame_id=23}
+<454 loop_transpose_fusion{} @0>
+ positions:
+  loop_transpose_fusion {}
+ uses:
+  get-tuple-element.8, operand 0 {}
+  get-tuple-element.10, operand 0 {}
+ from instruction: %loop_transpose_fusion = (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0}) fusion(%loop_complex_fusion, %wrapped_slice.2, %constant_872_0, %loop_dynamic_slice_fusion.1, %constant_848_0, /*index=5*/%loop_dynamic_slice_fusion.2, %loop_dynamic_slice_fusion, %wrapped_slice.3), kind=kLoop, calls=%fused_transpose, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/jit(_where)/select_n" deduplicated_name="loop_transpose_fusion"}
+<455 loop_transpose_fusion{0} @0>
+ positions:
+  loop_transpose_fusion {0}
+  get-tuple-element.8
+ uses:
+  loop_concatenate_fusion, operand 1
+ from instruction: %loop_transpose_fusion = (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0}) fusion(%loop_complex_fusion, %wrapped_slice.2, %constant_872_0, %loop_dynamic_slice_fusion.1, %constant_848_0, /*index=5*/%loop_dynamic_slice_fusion.2, %loop_dynamic_slice_fusion, %wrapped_slice.3), kind=kLoop, calls=%fused_transpose, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/jit(_where)/select_n" deduplicated_name="loop_transpose_fusion"}
+<456 loop_transpose_fusion{1} @0>
+ positions:
+  loop_transpose_fusion {1}
+  get-tuple-element.10
+ uses:
+  loop_concatenate_fusion, operand 3
+ from instruction: %loop_transpose_fusion = (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0}) fusion(%loop_complex_fusion, %wrapped_slice.2, %constant_872_0, %loop_dynamic_slice_fusion.1, %constant_848_0, /*index=5*/%loop_dynamic_slice_fusion.2, %loop_dynamic_slice_fusion, %wrapped_slice.3), kind=kLoop, calls=%fused_transpose, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/jit(_where)/select_n" deduplicated_name="loop_transpose_fusion"}
+<457 constant_705_0 @0>
+ positions:
+  constant_705_0
+ uses:
+  loop_concatenate_fusion, operand 2
+ from instruction: %constant_705_0 = c128[36]{0} constant({...})
+<458 wrapped_slice.4 @0>
+ positions:
+  wrapped_slice.4
+ uses:
+  loop_transpose_fusion.1, operand 1
+ from instruction: %wrapped_slice.4 = c128[7,98,98]{2,1,0} fusion(%param.108), kind=kLoop, calls=%wrapped_slice_computation.4, metadata={op_name="jit(restore)/jit(view_local)/shard_map/dynamic_slice" stack_frame_id=23}
+<459 wrapped_slice.5 @0>
+ positions:
+  wrapped_slice.5
+ uses:
+  loop_transpose_fusion.1, operand 7
+ from instruction: %wrapped_slice.5 = c128[7,98,98]{2,1,0} fusion(%param.108), kind=kLoop, calls=%wrapped_slice_computation.5, metadata={op_name="jit(restore)/jit(view_local)/shard_map/dynamic_slice" stack_frame_id=23}
+<460 loop_transpose_fusion.1{} @0>
+ positions:
+  loop_transpose_fusion.1 {}
+ uses:
+  get-tuple-element.12, operand 0 {}
+  get-tuple-element.14, operand 0 {}
+ from instruction: %loop_transpose_fusion.1 = (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0}) fusion(%loop_complex_fusion, %wrapped_slice.4, %constant_872_0, %loop_dynamic_slice_fusion.1, %constant_848_0, /*index=5*/%loop_dynamic_slice_fusion.2, %loop_dynamic_slice_fusion, %wrapped_slice.5), kind=kLoop, calls=%fused_transpose.1, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/jit(_where)/select_n" deduplicated_name="loop_transpose_fusion"}
+<461 loop_transpose_fusion.1{0} @0>
+ positions:
+  loop_transpose_fusion.1 {0}
+  get-tuple-element.12
+ uses:
+  loop_concatenate_fusion, operand 4
+ from instruction: %loop_transpose_fusion.1 = (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0}) fusion(%loop_complex_fusion, %wrapped_slice.4, %constant_872_0, %loop_dynamic_slice_fusion.1, %constant_848_0, /*index=5*/%loop_dynamic_slice_fusion.2, %loop_dynamic_slice_fusion, %wrapped_slice.5), kind=kLoop, calls=%fused_transpose.1, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/jit(_where)/select_n" deduplicated_name="loop_transpose_fusion"}
+<462 loop_transpose_fusion.1{1} @0>
+ positions:
+  loop_transpose_fusion.1 {1}
+  get-tuple-element.14
+ uses:
+  loop_concatenate_fusion, operand 5
+ from instruction: %loop_transpose_fusion.1 = (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0}) fusion(%loop_complex_fusion, %wrapped_slice.4, %constant_872_0, %loop_dynamic_slice_fusion.1, %constant_848_0, /*index=5*/%loop_dynamic_slice_fusion.2, %loop_dynamic_slice_fusion, %wrapped_slice.5), kind=kLoop, calls=%fused_transpose.1, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/jit(_where)/select_n" deduplicated_name="loop_transpose_fusion"}
+<463 wrapped_slice.6 @0>
+ positions:
+  wrapped_slice.6
+ uses:
+  loop_transpose_fusion.2, operand 1
+ from instruction: %wrapped_slice.6 = c128[7,98,98]{2,1,0} fusion(%param.108), kind=kLoop, calls=%wrapped_slice_computation.6, metadata={op_name="jit(restore)/jit(view_local)/shard_map/dynamic_slice" stack_frame_id=23}
+<464 loop_transpose_fusion.2 @0>
+ positions:
+  loop_transpose_fusion.2
+ uses:
+  loop_concatenate_fusion, operand 6
+ from instruction: %loop_transpose_fusion.2 = c128[36,98,98]{2,1,0} fusion(%loop_complex_fusion, %wrapped_slice.6, %constant_872_0, %loop_dynamic_slice_fusion.1, %constant_848_0, /*index=5*/%loop_dynamic_slice_fusion.2, %loop_dynamic_slice_fusion), kind=kLoop, calls=%fused_transpose.2, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/jit(_where)/select_n"}
+<465 wrapped_slice.7 @0>
+ positions:
+  wrapped_slice.7
+ uses:
+  loop_transpose_fusion.3, operand 1
+ from instruction: %wrapped_slice.7 = c128[7,98,98]{2,1,0} fusion(%param.108), kind=kLoop, calls=%wrapped_slice_computation.7, metadata={op_name="jit(restore)/jit(view_local)/shard_map/dynamic_slice" stack_frame_id=23}
+<466 wrapped_slice.8 @0>
+ positions:
+  wrapped_slice.8
+ uses:
+  loop_transpose_fusion.3, operand 7
+ from instruction: %wrapped_slice.8 = c128[7,98,98]{2,1,0} fusion(%param.108), kind=kLoop, calls=%wrapped_slice_computation.8, metadata={op_name="jit(restore)/jit(view_local)/shard_map/dynamic_slice" stack_frame_id=23}
+<467 loop_transpose_fusion.3{} @0>
+ positions:
+  loop_transpose_fusion.3 {}
+ uses:
+  get-tuple-element, operand 0 {}
+  get-tuple-element.2, operand 0 {}
+ from instruction: %loop_transpose_fusion.3 = (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0}) fusion(%loop_complex_fusion, %wrapped_slice.7, %constant_872_0, %loop_dynamic_slice_fusion.1, %constant_848_0, /*index=5*/%loop_dynamic_slice_fusion.2, %loop_dynamic_slice_fusion, %wrapped_slice.8), kind=kLoop, calls=%fused_transpose.3, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/jit(_where)/select_n" deduplicated_name="loop_transpose_fusion"}
+<468 loop_transpose_fusion.3{0} @0>
+ positions:
+  loop_transpose_fusion.3 {0}
+  get-tuple-element
+ uses:
+  loop_concatenate_fusion, operand 7
+ from instruction: %loop_transpose_fusion.3 = (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0}) fusion(%loop_complex_fusion, %wrapped_slice.7, %constant_872_0, %loop_dynamic_slice_fusion.1, %constant_848_0, /*index=5*/%loop_dynamic_slice_fusion.2, %loop_dynamic_slice_fusion, %wrapped_slice.8), kind=kLoop, calls=%fused_transpose.3, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/jit(_where)/select_n" deduplicated_name="loop_transpose_fusion"}
+<469 loop_transpose_fusion.3{1} @0>
+ positions:
+  loop_transpose_fusion.3 {1}
+  get-tuple-element.2
+ uses:
+  loop_concatenate_fusion, operand 9
+ from instruction: %loop_transpose_fusion.3 = (c128[36,98,98]{2,1,0}, c128[36,98,98]{2,1,0}) fusion(%loop_complex_fusion, %wrapped_slice.7, %constant_872_0, %loop_dynamic_slice_fusion.1, %constant_848_0, /*index=5*/%loop_dynamic_slice_fusion.2, %loop_dynamic_slice_fusion, %wrapped_slice.8), kind=kLoop, calls=%fused_transpose.3, metadata={op_name="jit(restore)/jit(_do_unfold)/shard_map/jit(_where)/select_n" deduplicated_name="loop_transpose_fusion"}
+<470 constant_708_0 @0>
+ positions:
+  constant_708_0
+ uses:
+  loop_concatenate_fusion, operand 10
+ from instruction: %constant_708_0 = c128[36]{0} constant({...})
+<471 constant_707_0 @0>
+ positions:
+  constant_707_0
+ uses:
+  loop_concatenate_fusion, operand 11
+ from instruction: %constant_707_0 = c128[36]{0} constant({...})
+<472 constant_704_0 @0>
+ positions:
+  constant_704_0
+ uses:
+  loop_concatenate_fusion, operand 12
+ from instruction: %constant_704_0 = c128[36]{0} constant({...})
+<473 constant_703_0 @0>
+ positions:
+  constant_703_0
+ uses:
+  loop_concatenate_fusion, operand 13
+ from instruction: %constant_703_0 = c128[36]{0} constant({...})
+<474 constant_695_0 @0>
+ positions:
+  constant_695_0
+ uses:
+  loop_concatenate_fusion, operand 14
+ from instruction: %constant_695_0 = c128[36]{0} constant({...})
+<475 constant_702_0 @0>
+ positions:
+  constant_702_0
+ uses:
+  loop_concatenate_fusion, operand 15
+ from instruction: %constant_702_0 = c128[36]{0} constant({...})
+<476 constant_701_0 @0>
+ positions:
+  constant_701_0
+ uses:
+  loop_concatenate_fusion, operand 16
+ from instruction: %constant_701_0 = c128[36]{0} constant({...})
+<477 constant_692_0 @0>
+ positions:
+  constant_692_0
+ uses:
+  loop_concatenate_fusion, operand 17
+ from instruction: %constant_692_0 = c128[36]{0} constant({...})
+<478 constant_694_0 @0>
+ positions:
+  constant_694_0
+ uses:
+  loop_concatenate_fusion, operand 18
+ from instruction: %constant_694_0 = c128[36]{0} constant({...})
+<479 constant_690_0 @0>
+ positions:
+  constant_690_0
+ uses:
+  loop_concatenate_fusion, operand 19
+ from instruction: %constant_690_0 = c128[36]{0} constant({...})
+<480 constant_682_0 @0>
+ positions:
+  constant_682_0
+ uses:
+  loop_concatenate_fusion, operand 20
+ from instruction: %constant_682_0 = c128[36]{0} constant({...})
+<481 constant_706_0 @0>
+ positions:
+  constant_706_0
+ uses:
+  loop_concatenate_fusion, operand 21
+ from instruction: %constant_706_0 = c128[36]{0} constant({...})
+<482 constant_699_0 @0>
+ positions:
+  constant_699_0
+ uses:
+  loop_concatenate_fusion, operand 22
+ from instruction: %constant_699_0 = c128[36]{0} constant({...})
+<483 constant_698_0 @0>
+ positions:
+  constant_698_0
+ uses:
+  loop_concatenate_fusion, operand 23
+ from instruction: %constant_698_0 = c128[36]{0} constant({...})
+<484 constant_700_0 @0>
+ positions:
+  constant_700_0
+ uses:
+  loop_concatenate_fusion, operand 24
+ from instruction: %constant_700_0 = c128[36]{0} constant({...})
+<485 constant_697_0 @0>
+ positions:
+  constant_697_0
+ uses:
+  loop_concatenate_fusion, operand 25
+ from instruction: %constant_697_0 = c128[36]{0} constant({...})
+<486 loop_concatenate_fusion @0>
+ positions:
+  loop_concatenate_fusion
+  tuple.12 {0}
+  get-tuple-element.26
+  tuple.14 {0}
+ uses:
+  tuple.14, operand 0
+ from instruction: %loop_concatenate_fusion = c128[9,36,98,98]{3,2,1,0} fusion(%get-tuple-element.6, %get-tuple-element.8, %constant_705_0, %get-tuple-element.10, %get-tuple-element.12, /*index=5*/%get-tuple-element.14, %loop_transpose_fusion.2, %get-tuple-element, %get-tuple-element.4, %get-tuple-element.2, /*index=10*/%constant_708_0, %constant_707_0, %constant_704_0, %constant_703_0, %constant_695_0, /*index=15*/%constant_702_0, %constant_701_0, %constant_692_0, %constant_694_0, %constant_690_0, /*index=20*/%constant_682_0, %constant_706_0, %constant_699_0, %constant_698_0, %constant_700_0, /*index=25*/%constant_697_0), kind=kLoop, calls=%fused_concatenate, metadata={op_name="jit(restore)/concatenate" stack_frame_id=67}
+<487 constant_709_0 @0>
+ positions:
+  constant_709_0
+  tuple.12 {1}
+  get-tuple-element.28
+ uses:
+  copy.139, operand 0
+ from instruction: %constant_709_0 = s32[9,4]{1,0} constant({...})
+<488 constant_710_0 @0>
+ positions:
+  constant_710_0
+  tuple.12 {2}
+  get-tuple-element.30
+ uses:
+  copy.140, operand 0
+ from instruction: %constant_710_0 = c128[9,4]{1,0} constant({...})
+<489 constant_711_0 @0>
+ positions:
+  constant_711_0
+  tuple.12 {3}
+  get-tuple-element.32
+ uses:
+  copy.141, operand 0
+ from instruction: %constant_711_0 = s32[9,4]{1,0} constant({...})
+<490 constant_712_0 @0>
+ positions:
+  constant_712_0
+  tuple.12 {4}
+  get-tuple-element.34
+ uses:
+  copy.142, operand 0
+ from instruction: %constant_712_0 = c128[9,4]{1,0} constant({...})
+<491 tuple.12{} @0>
+ positions:
+  tuple.12 {}
+ uses:
+  get-tuple-element.26, operand 0 {}
+  get-tuple-element.28, operand 0 {}
+  get-tuple-element.30, operand 0 {}
+  get-tuple-element.32, operand 0 {}
+  get-tuple-element.34, operand 0 {}
+ from instruction: %tuple.12 = (c128[9,36,98,98]{3,2,1,0}, s32[9,4]{1,0}, c128[9,4]{1,0}, s32[9,4]{1,0}, c128[9,4]{1,0}) tuple(%loop_concatenate_fusion, %constant_709_0, %constant_710_0, %constant_711_0, %constant_712_0)
+<492 copy.139 @0>
+ positions:
+  copy.139
+  tuple.14 {1}
+ uses:
+  tuple.14, operand 1
+ from instruction: %copy.139 = s32[9,4]{1,0} copy(%get-tuple-element.28)
+<493 copy.140 @0>
+ positions:
+  copy.140
+  tuple.14 {2}
+ uses:
+  tuple.14, operand 2
+ from instruction: %copy.140 = c128[9,4]{1,0} copy(%get-tuple-element.30)
+<494 copy.141 @0>
+ positions:
+  copy.141
+  tuple.14 {3}
+ uses:
+  tuple.14, operand 3
+ from instruction: %copy.141 = s32[9,4]{1,0} copy(%get-tuple-element.32)
+<495 copy.142 @0>
+ positions:
+  copy.142
+  tuple.14 {4}
+ uses:
+  tuple.14, operand 4
+ from instruction: %copy.142 = c128[9,4]{1,0} copy(%get-tuple-element.34)
+<496 tuple.14{} @0>
+ positions:
+  tuple.14 {}
+ uses:
+ from instruction: %tuple.14 = (c128[9,36,98,98]{3,2,1,0}, s32[9,4]{1,0}, c128[9,4]{1,0}, s32[9,4]{1,0}, c128[9,4]{1,0}) tuple(%get-tuple-element.26, %copy.139, %copy.140, %copy.141, %copy.142)
+
+
+HloLiveRange (max 65):
+  InstructionSequence:
+    0:axis_index.396.0
+    1:constant_871_0
+    2:loop_complex_fusion
+    3:loop_dynamic_slice_fusion.1
+    4:constant_685_0
+    5:loop_dynamic_slice_fusion
+    6:loop_dynamic_slice_fusion.2
+    7:param.108
+    8:wrapped_slice.7
+    9:wrapped_slice.8
+    10:constant_848_0
+    11:constant_872_0
+    12:loop_transpose_fusion.3
+    13:get-tuple-element
+    14:wrapped_slice.2
+    15:wrapped_slice.3
+    16:loop_transpose_fusion
+    17:get-tuple-element.10
+    18:wrapped_slice.4
+    19:wrapped_slice.5
+    20:loop_transpose_fusion.1
+    21:get-tuple-element.12
+    22:get-tuple-element.14
+    23:get-tuple-element.2
+    24:get-tuple-element.8
+    25:wrapped_slice
+    26:wrapped_slice.1
+    27:loop_transpose_fusion.4
+    28:get-tuple-element.4
+    29:get-tuple-element.6
+    30:wrapped_slice.6
+    31:loop_transpose_fusion.2
+    32:constant_682_0
+    33:constant_690_0
+    34:constant_692_0
+    35:constant_694_0
+    36:constant_695_0
+    37:constant_697_0
+    38:constant_698_0
+    39:constant_699_0
+    40:constant_700_0
+    41:constant_701_0
+    42:constant_702_0
+    43:constant_703_0
+    44:constant_704_0
+    45:constant_705_0
+    46:constant_706_0
+    47:constant_707_0
+    48:constant_708_0
+    49:loop_concatenate_fusion
+    50:constant_710_0
+    51:constant_712_0
+    52:constant_709_0
+    53:constant_711_0
+    54:tuple.12
+    55:get-tuple-element.26
+    56:get-tuple-element.28
+    57:get-tuple-element.30
+    58:get-tuple-element.32
+    59:get-tuple-element.34
+    60:copy.139
+    61:copy.140
+    62:copy.141
+    63:copy.142
+    64:tuple.14
+  BufferLiveRange:
+    constant_871_0{}:1-3
+    axis_index.396.0{}:0-6
+    loop_complex_fusion{}:2-31
+    param.108{}:0-65
+    wrapped_slice{}:25-27
+    constant_872_0{}:11-31
+    loop_dynamic_slice_fusion.1{}:3-31
+    constant_848_0{}:10-31
+    constant_685_0{}:4-6
+    loop_dynamic_slice_fusion.2{}:6-31
+    loop_dynamic_slice_fusion{}:5-31
+    wrapped_slice.1{}:26-27
+    loop_transpose_fusion.4{}:27-29
+    loop_transpose_fusion.4{0}:27-49
+    loop_transpose_fusion.4{1}:27-49
+    wrapped_slice.2{}:14-16
+    wrapped_slice.3{}:15-16
+    loop_transpose_fusion{}:16-24
+    loop_transpose_fusion{0}:16-49
+    loop_transpose_fusion{1}:16-49
+    constant_705_0{}:45-49
+    wrapped_slice.4{}:18-20
+    wrapped_slice.5{}:19-20
+    loop_transpose_fusion.1{}:20-22
+    loop_transpose_fusion.1{0}:20-49
+    loop_transpose_fusion.1{1}:20-49
+    wrapped_slice.6{}:30-31
+    loop_transpose_fusion.2{}:31-49
+    wrapped_slice.7{}:8-12
+    wrapped_slice.8{}:9-12
+    loop_transpose_fusion.3{}:12-23
+    loop_transpose_fusion.3{0}:12-49
+    loop_transpose_fusion.3{1}:12-49
+    constant_708_0{}:48-49
+    constant_707_0{}:47-49
+    constant_704_0{}:44-49
+    constant_703_0{}:43-49
+    constant_695_0{}:36-49
+    constant_702_0{}:42-49
+    constant_701_0{}:41-49
+    constant_692_0{}:34-49
+    constant_694_0{}:35-49
+    constant_690_0{}:33-49
+    constant_682_0{}:32-49
+    constant_706_0{}:46-49
+    constant_699_0{}:39-49
+    constant_698_0{}:38-49
+    constant_700_0{}:40-49
+    constant_697_0{}:37-49
+    loop_concatenate_fusion{}:49-65
+    constant_709_0{}:52-60
+    constant_710_0{}:50-61
+    constant_711_0{}:53-62
+    constant_712_0{}:51-63
+    tuple.12{}:54-59
+    copy.139{}:60-65
+    copy.140{}:61-65
+    copy.141{}:62-65
+    copy.142{}:63-65
+    tuple.14{}:64-65
+  Live ranges at 50 (peak):
+    loop_concatenate_fusion{}: 49787136 bytes (cumulative: 49787136 bytes)
+    param.108{}: 39517632 bytes (cumulative: 89304768 bytes)
+    constant_710_0{}: 576 bytes (cumulative: 89305344 bytes)
+  Stack trace breakdown for peak usage: 89 305 344 bytes
+    main.19_spmd (100.0%, total: 89 305 344 bytes, current: 0 bytes, remaining: 89 305 344 bytes)
+      ├── jit(restore)/concatenate (55.7%, total: 49 787 136 bytes, current: 49 787 136 bytes, remaining: 39 518 208 bytes)
+      ├── packed (44.3%, total: 39 517 632 bytes, current: 39 517 632 bytes, remaining: 576 bytes)
+      └── constant_710_0 (0.0%, total: 576 bytes, current: 576 bytes, remaining: 0 bytes)

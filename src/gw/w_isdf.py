@@ -1462,44 +1462,30 @@ class StaticPhotonResponse:
     family_plans: tuple = ()
 
 
-def photon_blocks_full_q(response, keys, *, term="W"):
-    """Restore one packed Lorentz block by centroid transport followed by Λ⊗Λ mixing."""
+def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy):
+    """Restore each source once and apply the canonical Lorentz mixing for one class."""
     from symmetry_maps import unfold_isdf_operator, mix_lorentz_blocks
-    from .photon_layout import photon_block_view
     from symmetry_maps import bgw_integer_q_to_fractional
-
-    left_C, left_T = response.family_plans
-    sym, mesh = left_C.sym, left_C.mesh_xy
-    policy = response.qgrid_policy
+    from .photon_layout import photon_block_view
+    a, b = map(bool, keys[0])
+    if any((bool(A), bool(B)) != (a, b) for A, B in keys):
+        raise ValueError("A photon restore must contain one endpoint shape class.")
+    left, right = family_plans[a], family_plans[b]
+    sym, mesh, policy = left.sym, left.mesh_xy, qgrid_policy
     qfrac = bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, policy.kgrid)
-    if term not in ("V", "W", "W-V"):
-        raise ValueError(f"Unknown photon operator {term!r}.")
-    for A, B in keys:
-        left, right = (left_T if A else left_C), (left_T if B else left_C)
-        acc = None
-        for C in ((1, 2, 3) if A else (0,)):
-            for D in ((1, 2, 3) if B else (0,)):
-                source = photon_block_view(
-                    response.V_packed if term == "V" else response.W_packed,
-                    response.layout, C, D, mesh)
-                if term == "W-V":
-                    source = source - photon_block_view(
-                        response.V_packed, response.layout, C, D, mesh)
-
-                full = unfold_isdf_operator(
-                    source, irr_idx=sym.irr_idx_q, sym_idx=policy.unfold_sym_idx,
-                    sym_perm=left.sym_perm, L_table=left.L_table,
-                    right_sym_perm=right.sym_perm, right_L_table=right.L_table,
-                    q_irr_frac=qfrac, mesh_xy=mesh, n_sym_spatial=policy.n_sym_spatial,
-                    axis_local_sym_perm=left.centroid_local_perm,
-                    right_axis_local_sym_perm=right.centroid_local_perm)
-                mixed = mix_lorentz_blocks(
-                    {(C, D): full}, sym=sym, sym_idx=policy.unfold_sym_idx,
-                    mesh_xy=mesh, keys=((A, B),))
-                acc = mixed[A, B] if acc is None else acc + mixed[A, B]
-                del source, full, mixed
-        yield (A, B), acc
-        del acc
+    sources = {}
+    for C in ((1, 2, 3) if a else (0,)):
+        for D in ((1, 2, 3) if b else (0,)):
+            source = photon_block_view(packed, layout, C, D, mesh)
+            sources[C, D] = unfold_isdf_operator(
+                source, irr_idx=sym.irr_idx_q, sym_idx=policy.unfold_sym_idx,
+                sym_perm=left.sym_perm, L_table=left.L_table,
+                right_sym_perm=right.sym_perm, right_L_table=right.L_table,
+                q_irr_frac=qfrac, mesh_xy=mesh, n_sym_spatial=policy.n_sym_spatial,
+                axis_local_sym_perm=left.centroid_local_perm,
+                right_axis_local_sym_perm=right.centroid_local_perm)
+    yield from mix_lorentz_blocks(sources, sym=sym, sym_idx=policy.unfold_sym_idx,
+                                 mesh_xy=mesh, keys=keys).items()
 
 
 def _load_static_photon_hall(
