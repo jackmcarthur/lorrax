@@ -2,7 +2,8 @@
 
 Canonical files carry raw parent faces and logical centroid order. This module
 owns format admission, per-rank SlabIO reads, family selection and the single
-symmetry-service unfold. Consumers receive arrays, never HDF5 handles.
+symmetry-service unfold. Drivers request semantic payloads; HDF5 transports
+and stream-handle ownership stay in this module and its I/O services.
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ import json
 import os
 from types import SimpleNamespace
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import h5py
 import jax
@@ -31,6 +32,9 @@ from .tagged_arrays import (BAND_WINDOW_SCHEMA_DATASET, BAND_WINDOW_SCHEMA_VERSI
     _decode_charge_zeta_identity, _loaded_band_axis, _validate_shape_receipt,
     coulomb_policy_from_config, compare_coulomb_policy, parse_coulomb_policy,
     format_coulomb_policy)
+
+if TYPE_CHECKING:
+    from .isdf_header import IsdfHeader
 
 _REGENERATE = "regenerate with gwjax at main ≥ 891047f4"
 
@@ -4478,3 +4482,19 @@ def read_isdf_header(path: str | Path) -> IsdfHeader:
 def read_isdf_header_from_file(f: h5py.File) -> IsdfHeader:
     """Same as :func:`read_isdf_header` but operates on an open handle."""
     return _read_isdf_group(f)
+
+
+def pack_canonical_interaction(tensor, basis):
+    """Return canonical μν tiles in the consuming GW centroid order.
+
+    Parameters
+    ----------
+    tensor : jax.Array
+        Canonical interaction with trailing centroid axes, sharded on x/y.
+    basis : PackedCentroidBasis or None
+        The consumer's authenticated centroid basis. Existing axis kernels
+        perform both permutations without gathering the interaction.
+    """
+    if basis is None:
+        return tensor
+    return basis.pack_axis(basis.pack_axis(tensor, -2), -1)

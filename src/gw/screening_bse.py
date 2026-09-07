@@ -383,7 +383,7 @@ def _refuse_unusable_restart(config, meta, sym, centroid_indices,
     transfer -- audited, not copied: ``w_rpa_resolvent``'s matvec never
     reads the persisted ``W0_qmunu`` VALUE back (``ensure_W_R(include_W=
     False)`` is a placeholder), but the loader still needs the file to
-    carry written ``psi_full_y`` / ``enk_full`` / ``V_qmunu`` datasets,
+    carry raw parent faces, energies and the bare interaction,
     which only a ``write_restart_tensors = true`` run produces -- so the
     conclusion (refuse without the writes) holds for a different reason
     than the ladder's own "would read stale/absent W" one.
@@ -449,8 +449,8 @@ def _refuse_unusable_restart(config, meta, sym, centroid_indices,
                "(tests/test_bse_w0_ready_gate.py)."
                if include_w else
                " (unused by this rung-free operator, but the SAME loader "
-               "call also needs the file to carry written psi_full_y / "
-               "enk_full / V_qmunu, which write_restart_tensors = false "
+               "call also needs persisted parent faces, energies and bare "
+               "interaction, which write_restart_tensors = false "
                "never produced -- tests/test_bse_w0_ready_gate.py)."))
     if not os.path.exists(tensors_filename):
         raise ValueError(
@@ -885,6 +885,9 @@ def _assemble_full_bz_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
             "the RPA Dyson solve to the full BZ).  Use a closed centroid "
             "set, or keep screening_diagrams = w_rpa.")
 
+    from file_io.restart_bundle import pack_canonical_interaction
+    wc_wedge = pack_canonical_interaction(
+        wc_wedge, getattr(meta, "mu_basis", None))
     _nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     mu_target = int(np.asarray(sym_perm).shape[-1])
     V_wedge = slice_q_full_to_ibz(V_q, sym.q_irr_full_idx, out_sharding=_nat)

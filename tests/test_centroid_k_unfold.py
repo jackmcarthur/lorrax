@@ -395,7 +395,8 @@ def test_four_spinor_face_vertex_follows_unfold_without_collectives():
     assert 'all-gather(' not in hlo
 
 
-def test_parent_plan_keeps_the_unreduced_one_band_case():
+@pytest.mark.parametrize("diagrams", ["w_rpa", "w_bse"])
+def test_parent_plan_keeps_the_unreduced_one_band_case(diagrams):
     """An unreduced k table uses typed parents even with only one band."""
     mesh = _mesh_2x2()
     sym = _symmetry_fixture()
@@ -408,7 +409,7 @@ def test_parent_plan_keeps_the_unreduced_one_band_case():
     basis = PackedCentroidBasis.build(centroids, sym, (2, 2, 1), mesh)
     meta = SimpleNamespace(nspinor=4, fft_grid=(2, 2, 1), mu_basis=basis)
     cfg = SimpleNamespace(compute_mode=SimpleNamespace(needs_screening=True),
-                          screening=SimpleNamespace(diagrams="w_rpa"))
+                          screening=SimpleNamespace(diagrams=diagrams))
     wfn = SimpleNamespace(kvecs=lambda *, k: sym.unfolded_kpts)
     plan, green, storage = _prepare_parent_wavefunction_plan(
         cfg, meta, wfn, SimpleNamespace(nb_full=1), sym=sym,
@@ -418,15 +419,6 @@ def test_parent_plan_keeps_the_unreduced_one_band_case():
     np.testing.assert_array_equal(plan.irr_idx, [0, 1, 2])
     np.testing.assert_array_equal(plan.spin_action_full,
                                   np.broadcast_to(np.eye(4), (3, 4, 4)))
-
-
-def test_non_rpa_consumer_refuses_before_parent_loading():
-    """Unported screening cannot retain a hidden full-k wavefunction carrier."""
-    cfg = SimpleNamespace(compute_mode=SimpleNamespace(needs_screening=True),
-                          screening=SimpleNamespace(diagrams="w_bse"))
-    with pytest.raises(ValueError, match="parent_screening_diagrams.*w_bse"):
-        _prepare_parent_wavefunction_plan(
-            cfg, None, None, None, sym=None, centroid_indices=None, mesh_xy=None)
 
 
 def test_parent_plan_requires_only_consumed_canonical_actions():

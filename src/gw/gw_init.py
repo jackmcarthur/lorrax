@@ -2796,13 +2796,6 @@ def _prepare_parent_wavefunction_plan(
 	"""Require exact typed parent transport for every supported GW consumer."""
 	from .centroid_k_unfold import build_centroid_k_unfold_plan
 
-	if (bool(cfg.compute_mode.needs_screening)
-			and str(getattr(cfg.screening.diagrams, 'value',
-			                cfg.screening.diagrams)) != 'w_rpa'):
-		raise ValueError(
-			"GATE parent_screening_diagrams: screening_diagrams = "
-			f"{getattr(cfg.screening.diagrams, 'value', cfg.screening.diagrams)} "
-			"has not been ported to raw parents; use screening_diagrams = w_rpa.")
 	plan = build_centroid_k_unfold_plan(
 		sym, centroid_indices, meta.fft_grid, mesh_xy,
 		nspinor=int(meta.nspinor), parent_k_frac=wfn.kvecs(k=sym.parent_k_domain),
