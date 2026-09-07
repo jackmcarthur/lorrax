@@ -28,6 +28,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', required=True, type=Path)
     parser.add_argument('--weight', type=Path)
+    parser.add_argument('--parent-freeze', type=Path)
     parser.add_argument('--q', type=int, nargs='+', default=list(range(29)))
     parser.add_argument('--curves-only', action='store_true')
     args = parser.parse_args()
@@ -47,6 +48,15 @@ def main():
     assert sha(pin['path']) == pin['sha256']
     parent = json.loads(Path(pin['path']).read_text())
     model = parent['model']
+    if args.parent_freeze:
+        freeze = json.loads(args.parent_freeze.read_text())
+        assert freeze['status']=='COMPLETE' and freeze['all29_independently_constructed'] is True
+        contract = freeze['model_contract']
+        assert contract['coordinate']=='canonical_physical_Wc'
+        assert contract['q_parent_full_rows']==parent['q_parent_full_rows']
+        assert contract['eta_ev']==.25 and contract['fd_kT_ry']==.01
+        assert abs(contract['fd_mu_ry']-parent['occupation']['mu_ry'])<1e-13
+        model = dict(model,path=freeze['model_path'],sha256=freeze['model_sha256'],factor_shape=freeze['model_shape'])
     assert sha(model['path']) == model['sha256']
     ds = model['datasets']
     lowpath = S/'tmp/worktrees/wt_run101_conjugation_closed_physical_20260905/runs/frequency_integration_sandbox/216_na_allq_cubic_high_precision_actions_20260906/physical_receipt.json'
@@ -70,7 +80,8 @@ def main():
                        jobid=os.environ['SLURM_JOB_ID'], stepid=os.getenv('SLURM_STEP_ID'),
                        model_path=model['path'], model_sha256=model['sha256'],
                        script_sha256=sha(__file__), weight='unweighted' if args.weight is None else str(args.weight),
-                       eta_ev=.25, status='STARTED')
+                       eta_ev=.25, status='STARTED',
+                       parent_freeze=None if args.parent_freeze is None else dict(path=str(args.parent_freeze),sha256=sha(args.parent_freeze)))
         write(out/'receipt.json', receipt)
         print(json.dumps(receipt), flush=True)
         with SlabIO(model['path'], mode='r', mesh=mesh) as io:

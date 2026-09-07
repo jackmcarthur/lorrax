@@ -58,9 +58,11 @@ def reduce_models(a, B, C, balancing, context):
     cutoff=896*np.finfo(float).eps*max(float(ve[-1]),1.)
     active=np.flatnonzero(np.asarray(ve)>cutoff)
     whiten=adj(vu[:,active])/jnp.sqrt(ve[active])[:,None]
-    for budget in (224,448,896,1792):
+    targets=[(f'eps{eps:.0e}',int(np.count_nonzero(np.asarray(h)>eps*float(h[0]))),None,eps)
+             for eps in (1e-2,1e-3,1e-4)]
+    targets += [(f'K{k}',2*k,k,None) for k in (224,448,896) if 2*k<=len(a)]
+    for label,d,budget,epsilon in targets:
         started=time.monotonic()
-        d=2*budget
         invsqrt=1/jnp.sqrt(h[:d])
         T=(lp@adj(vh[:d]))*invsqrt[None,:]
         Ti=invsqrt[:,None]*(adj(u[:,:d])@adj(lq))
@@ -93,17 +95,17 @@ def reduce_models(a, B, C, balancing, context):
             modal_errors.append(np.linalg.norm(wm-direct)/np.linalg.norm(direct))
         if max(modal_errors)>1e-8:
             raise RuntimeError('Modal conversion lost reduced W')
-        path=out/f'K{budget}_model.npz'
+        path=out/f'{label}_model.npz'
         # W(z)=sum L[:,p] R[p,:]/(z-pole[p]); no implicit conjugation.
         np.savez(path,poles_ry=physical,residue_left=left,residue_right=1j*right,
                  q_parent=np.int32(receipt['q_full_row']))
         info=dict(q=receipt['q'],q_parent=receipt['q_full_row'],jobid=receipt['jobid'],stepid=receipt['stepid'],
-                  requested_positive_K=budget,state_order=d,positive_pole_K=int(positive.sum()),
+                  requested_positive_K=budget,relative_hsv_threshold=epsilon,model_label=label,state_order=d,positive_pole_K=int(positive.sum()),
                   J_positive=len(np.unique(physical[positive])),port_width=896,
                   modal_eigenvector_condition=float(np.linalg.cond(vr)),balanced_identity_error=identity,
                   W16_parent_relative_errors=errors,modal_roundtrip_max=float(max(modal_errors)),
                   full_balancing_W16_roundtrip_max=max(full_errors),
-                  damping_fraction_gt_0p1ev=float(np.mean(-physical[positive].imag*EV>.1)),
+                  damping_fraction_gt_0p1ev=float(np.mean(-physical[positive].imag*EV>.1)) if np.any(positive) else None,
                   negative_physical_damping_count=int(np.sum(physical.imag>1e-10)),
                   minimum_physical_gamma_ev=float(np.min(-physical.imag*EV)),
                   maximum_abs_real_pole_ev=float(np.max(np.abs(physical.real))*EV),
@@ -111,6 +113,7 @@ def reduce_models(a, B, C, balancing, context):
                   storage_bytes=int(physical.nbytes+left.nbytes+right.nbytes),
                   passivity=passivity,elapsed_seconds=time.monotonic()-started,
                   export_convention='W(z)=L diag(1/(z-poles_ry)) R; all signed poles, no conjugation of R',
-                  weight=receipt['weight'])
-        (out/f'K{budget}_receipt.json').write_text(json.dumps(info,indent=2)+'\n')
+                  weight=receipt['weight'],
+                  admissibility='REFUSED_PHYSICAL_UPPER_HALF_PLANE' if np.any(physical.imag>1e-10) else ('PASS_POINT_AND_POLES' if passivity['status']=='PASS' else 'REFUSED_POINT_PASSIVITY'))
+        (out/f'{label}_receipt.json').write_text(json.dumps(info,indent=2)+'\n')
         print(json.dumps(info),flush=True)

@@ -32,7 +32,7 @@ def main():
     mesh=single_device_mesh();rows=[]
     with SlabIO(model['path'],mode='r',mesh=mesh) as io:
         width=model['factor_shape'][2]
-        for q in (0,1,14):
+        for q in (0,27,28):
             c=io.read_slab(ds['factor'],shape=(1,896,width),offset=(q,0,0),partition_spec=P(None,'x','y'))[0]
             lam=io.read_slab(ds['poles2'],shape=(1,width),offset=(q,0),partition_spec=P(None,'y'))[0]
             mask=io.read_slab(ds['factor_mask'],shape=(1,width),offset=(q,0),partition_spec=P(None,'y'))[0]

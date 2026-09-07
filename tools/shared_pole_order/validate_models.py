@@ -5,7 +5,7 @@ import importlib.util
 import json
 import os
 import numpy as np
-from balance import S,F,EV,sha
+from balance import S,F,EV,sha,LOCATOR
 
 
 def main():
@@ -34,11 +34,23 @@ def main():
         assert float(ve[0])>0
         vh=(vu*jnp.sqrt(ve)[None,:])@vu.conj().T
         models={}
-        for k in (224,448,896,1792):
-            path=args.models/f'q{q:02d}'/f'K{k}_model.npz'
+        for k in ('eps1e-02','eps1e-03','eps1e-04','K224','K448','K896','K1792'):
+            path=args.models/f'q{q:02d}'/f'{k}_model.npz'
+            if not path.exists():continue
             with np.load(path) as f:
                 assert int(f['q_parent'])==low['parent_qrows'][q]
                 models[k]=(jnp.asarray(f['poles_ry']),jnp.asarray(f['residue_left']),jnp.asarray(f['residue_right']))
+        # Parent baseline distinguishes truncation loss from parent/bank mismatch.
+        pin=json.loads(LOCATOR.read_text())['reference']['green_function_binding']['parent_binding']
+        assert sha(pin['path'])==pin['sha256']
+        parent=json.loads(Path(pin['path']).read_text())['model'];ds=parent['datasets'];width=parent['factor_shape'][2]
+        assert sha(parent['path'])==parent['sha256']
+        with SlabIO(parent['path'],mode='r',mesh=mesh) as io:
+            pc=io.read_slab(ds['factor'],shape=(1,896,width),offset=(q,0,0),partition_spec=P(None,'x','y'))[0]
+            pl=io.read_slab(ds['poles2'],shape=(1,width),offset=(q,0),partition_spec=P(None,'y'))[0]
+            pm=io.read_slab(ds['factor_mask'],shape=(1,width),offset=(q,0),partition_spec=P(None,'y'))[0]
+        ids=np.flatnonzero(np.asarray(pm)>0);pom=jnp.sqrt(pl[ids]);pb=pc[:,ids]/jnp.sqrt(2*pom)[None,:]
+        models['R896_parent']=(jnp.concatenate([pom,-pom]),jnp.concatenate([pb,-pb],axis=1),jnp.tile(pb.conj().T,(2,1)))
         results={k:{} for k in models}
         for label,bank,eta in [('low',low,.25),('broadA',high,high['sampling_eta_ev'])]:
             item=bank['q_receipts'][q];path=Path(item['artifact']);assert sha(path)==item['artifact_sha256']
