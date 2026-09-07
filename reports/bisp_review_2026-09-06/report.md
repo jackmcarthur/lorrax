@@ -4,7 +4,7 @@
 
 | Item | Status |
 |---|---|
-| 1 — dead dispatch | Planner and direct Gram cuts pushed; live-consumer exceptions below |
+| 1 — dead dispatch | Two-layout planner restoration required by owner; direct Gram cut retained |
 | 2 — phase extraction | In progress; remaining functions above 120 lines are reported explicitly |
 | 3 — duplication | Canonical mesh cache keys and duplicate fit-price reuse pushed; plan authentication retained |
 | 4 — docstrings | Six modules below 3.2%; complete contracts relocated with executable AST identity |
@@ -12,11 +12,8 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/gflat_memory_model.py` | `_persistent_bytes` | 63 | 60 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/gflat_memory_model.py` | `plan_gflat_chunks` | 731 | 689 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/gflat_memory_model.py` | `plan_gflat_chunks._floor_at` | 38 | 36 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/gflat_memory_model.py` | `plan_gflat_chunks._band_candidate_fits` | 31 | 25 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/gflat_memory_model.py` | **File total** | 1451 | 1406 | Net -45 lines |
+| `src/gw/gflat_memory_model.py` | `plan_gflat_chunks` | 731 | 731 | Unchanged; target remains |
+| `src/gw/gflat_memory_model.py` | **File total** | 1451 | 1451 | Net +0 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -77,14 +74,13 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/gw_init.py` | `_plan_gflat_chunks_for_channel` | 136 | 135 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
 | `src/gw/gw_init.py` | `fit_zeta` | 576 | 56 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
 | `src/gw/gw_init.py` | `compute_V_q` | 398 | 22 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
 | `src/gw/gw_init.py` | `prepare_isdf_and_wavefunctions` | 742 | 742 | Unchanged; target remains |
 | `src/gw/gw_init.py` | `_report_zeta_chunk_plan` | 0 | 16 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_reuse_zeta_faces` | 0 | 27 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_plan_transverse_zeta` | 0 | 28 | New explicit phase/direct owner |
-| `src/gw/gw_init.py` | `_plan_coupled_zeta_fit` | 0 | 107 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_plan_coupled_zeta_fit` | 0 | 108 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_fit_charge_zeta_channel` | 0 | 74 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_report_zeta_fit_peak` | 0 | 33 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_transverse_zeta_channel_runner` | 0 | 80 | New explicit phase/direct owner |
@@ -98,8 +94,8 @@
 | `src/gw/gw_init.py` | `_compute_photon_vq` | 0 | 90 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_compute_scalar_vq` | 0 | 35 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_finalize_vq_views` | 0 | 23 | New explicit phase/direct owner |
-| `src/gw/gw_init.py` | Docstring lines / share | 504 / 13.31% | 504 / 14.20% | Owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
-| `src/gw/gw_init.py` | **File total** | 3786 | 3549 | Net -237 lines |
+| `src/gw/gw_init.py` | Docstring lines / share | 504 / 13.31% | 504 / 14.19% | Owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
+| `src/gw/gw_init.py` | **File total** | 3786 | 3551 | Net -235 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -330,8 +326,8 @@
 | `src/gw/gw_config.py` | `_report_remaining_retired_keys` | 0 | 68 | New explicit phase/direct owner |
 | `src/gw/gw_config.py` | `_refuse_unknown_input_keys` | 0 | 15 | New explicit phase/direct owner |
 | `src/gw/gw_config.py` | `_parse_input_kpoints` | 0 | 34 | New explicit phase/direct owner |
-| `src/gw/gw_config.py` | Docstring lines / share | 1002 / 17.94% | 111 / 2.40% | Owner: docs/architecture/decisions.md |
-| `src/gw/gw_config.py` | **File total** | 5586 | 4617 | Net -969 lines |
+| `src/gw/gw_config.py` | Docstring lines / share | 1002 / 17.94% | 116 / 2.51% | Owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | **File total** | 5586 | 4622 | Net -964 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -350,8 +346,8 @@
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_wavefunction_local` | 79 | 51 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `open_spin_block_coefficient` | 13 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `_get_unfold_isdf_operator_jit` | 172 | 165 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
-| `services/symmetry_maps/src/symmetry_maps/maps.py` | `_rotate_open_spin_centroid_operator` | 48 | 36 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
-| `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_spin_centroid_operator` | 137 | 111 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `_rotate_open_spin_centroid_operator` | 48 | 13 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_spin_centroid_operator` | 137 | 143 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_isdf_one_leg` | 283 | 212 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `_get_unfold_isdf_one_leg_jit` | 83 | 76 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `apply_spinor_rotation` | 48 | 30 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
@@ -397,13 +393,14 @@
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps._initialize_spatial_operators` | 0 | 98 | New explicit phase/direct owner |
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps._initialize_k_maps` | 0 | 96 | New explicit phase/direct owner |
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps._initialize_q_maps` | 0 | 41 | New explicit phase/direct owner |
-| `services/symmetry_maps/src/symmetry_maps/maps.py` | Docstring lines / share | 1172 / 27.97% | 86 / 2.75% | Owner: docs/architecture/symmetry_register.md |
-| `services/symmetry_maps/src/symmetry_maps/maps.py` | **File total** | 4190 | 3124 | Net -1066 lines |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | Docstring lines / share | 1172 / 27.97% | 111 / 3.54% | Owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | **File total** | 4190 | 3133 | Net -1057 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
 | `src/gw/w_isdf.py` | `_complete_static_vertex_orientations` | 24 | 6 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
 | `src/gw/w_isdf.py` | `_get_chi_minimax_kernel` | 48 | 48 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_get_chi_minimax_kernel_face` | 223 | 223 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
 | `src/gw/w_isdf.py` | `_get_chi_fractional_contour_kernel` | 28 | 28 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
 | `src/gw/w_isdf.py` | `_get_w_solve_fn_local` | 142 | 123 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
 | `src/gw/w_isdf.py` | `_get_w_solve_fn_distributed` | 201 | 151 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
@@ -490,9 +487,22 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
+| `src/gw/centroid_k_unfold.py` | `CentroidKUnfoldPlan.unfold_operator` | 21 | 24 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/centroid_k_unfold.py` | **File total** | 426 | 429 | Net +3 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
 | `src/gw/cohsex_sigma.py` | `_make_static_convolution` | 34 | 34 | Existing statements moved to named stages or dead selector removed |
 | `src/gw/cohsex_sigma.py` | `_make_cohsex_kernels` | 28 | 28 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/cohsex_sigma.py` | `_make_cohsex_kernels_face` | 77 | 77 | Existing statements moved to named stages or dead selector removed |
 | `src/gw/cohsex_sigma.py` | **File total** | 639 | 640 | Net +1 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
+| `src/gw/greens_function_kernel.py` | `_build_G_face` | 41 | 37 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/greens_function_kernel.py` | `build_G` | 23 | 22 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/greens_function_kernel.py` | `build_G_tau` | 30 | 30 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/greens_function_kernel.py` | **File total** | 181 | 180 | Net -1 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -506,8 +516,28 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/photon_sigma.py` | `_make_photon_static_class_kernel` | 51 | 51 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/photon_sigma.py` | **File total** | 302 | 303 | Net +1 lines |
+| `src/gw/photon_sigma.py` | `_make_photon_static_class_kernel` | 51 | 44 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/photon_sigma.py` | `_make_photon_static_class_kernel.unfold` | 4 | 0 | Deleted or renamed to direct owner |
+| `src/gw/photon_sigma.py` | `_make_photon_static_class_kernel.contract_class` | 10 | 12 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/photon_sigma.py` | **File total** | 302 | 296 | Net -6 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
+| `src/gw/ppm_sigma.py` | `_compute_invalid_static_sigma` | 107 | 107 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/ppm_sigma.py` | `_invalid_static_coh_by_bracket` | 83 | 83 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/ppm_sigma.py` | **File total** | 1005 | 1005 | Net +0 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
+| `src/gw/ppm_tau_kernel.py` | `_get_sigma_kij_kernel` | 159 | 138 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/ppm_tau_kernel.py` | `_get_sigma_kij_kernel.unfold` | 5 | 0 | Deleted or renamed to direct owner |
+| `src/gw/ppm_tau_kernel.py` | `_get_sigma_kij_kernel._g_from_selector` | 19 | 15 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/ppm_tau_kernel.py` | **File total** | 561 | 540 | Net -21 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
+| `src/gw/wavefunction_bundle.py` | `parent_sigma_operands` | 17 | 20 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/wavefunction_bundle.py` | **File total** | 886 | 889 | Net +3 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -522,9 +552,13 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `tests/test_centroid_fft_k_plan.py` | `_plan` | 22 | 21 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_centroid_fft_k_plan.py` | `test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner` | 86 | 94 | Existing statements moved to named stages or dead selector removed |
-| `tests/test_centroid_fft_k_plan.py` | **File total** | 164 | 171 | Net +7 lines |
+| `tests/test_centroid_fft_k_plan.py` | **File total** | 164 | 172 | Net +8 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
+| `tests/test_centroid_k_unfold.py` | `test_square_antiunitary_operator_uses_itself_as_transpose_partner` | 0 | 17 | New explicit phase/direct owner |
+| `tests/test_centroid_k_unfold.py` | **File total** | 428 | 447 | Net +19 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -545,18 +579,6 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `tests/test_gflat_planner_face_pairs.py` | `_synthetic_plan` | 11 | 11 | Existing statements moved to named stages or dead selector removed |
-| `tests/test_gflat_planner_face_pairs.py` | `_run50_plan` | 16 | 16 | Existing statements moved to named stages or dead selector removed |
-| `tests/test_gflat_planner_face_pairs.py` | `_profile_cliff_plan` | 11 | 11 | Existing statements moved to named stages or dead selector removed |
-| `tests/test_gflat_planner_face_pairs.py` | **File total** | 260 | 260 | Net +0 lines |
-
-| Module | Function | Lines before | Lines after | Deleted or moved; destination |
-|---|---|---|---|---|
-| `tests/test_gflat_planner_q_accounting.py` | `test_plan_receipt_distinguishes_full_K_from_selected_Q` | 20 | 20 | Existing statements moved to named stages or dead selector removed |
-| `tests/test_gflat_planner_q_accounting.py` | **File total** | 55 | 55 | Net +0 lines |
-
-| Module | Function | Lines before | Lines after | Deleted or moved; destination |
-|---|---|---|---|---|
 | `tests/test_isdf_cq_face_parity.py` | `check_shared_cq` | 31 | 31 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_isdf_cq_face_parity.py` | **File total** | 138 | 138 | Net +0 lines |
 
@@ -572,11 +594,6 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `tests/test_wavefunction_bundle_face_carrier.py` | `test_memory_model_prices_resolved_layout` | 19 | 11 | Existing statements moved to named stages or dead selector removed |
-| `tests/test_wavefunction_bundle_face_carrier.py` | **File total** | 204 | 196 | Net -8 lines |
-
-| Module | Function | Lines before | Lines after | Deleted or moved; destination |
-|---|---|---|---|---|
 | `tests/test_zeta_nband_decoupling.py` | `test_the_fit_window_travels_into_the_provenance_stamp` | 25 | 29 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_zeta_nband_decoupling.py` | **File total** | 412 | 416 | Net +4 lines |
 
@@ -587,7 +604,7 @@
 
 | Tree scope | Before | After | Net |
 |---|---|---|---|
-| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119482 | -5765 |
+| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119520 | -5727 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
@@ -603,22 +620,25 @@
 | 10 — use canonical mesh cache keys (37aa7db2) | 1406 | 452 passed, 2 skipped, 1 xfailed, 102 warnings in 177.23s (0:02:57) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-190804-191933-7526, lx-Xg4-190804-192105-9882; 19_owner_cache_keys/cpu/cpu.xml; 19_owner_cache_keys/p4/mos2/identity.json |
 | 11 — relocate long source contracts to architecture owners (14b6fb1d) | 1408 | 450 passed, 2 skipped, 1 xfailed, 102 warnings in 178.98s (0:02:58) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-191254-220724-5967, lx-Xg4-191254-220772-4165; 20_contract_docs/cpu/cpu.xml; 20_contract_docs/p4/mos2/identity.json |
 | 12 — separate input parsing from configuration envelopes (35b45dc6) | 1409 | 751 passed, 2 skipped, 1 xfailed, 116 warnings in 184.45s (0:03:04) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-192253-278495-2175, lx-Xg4-191743-249096-5555; 22_config_corrected/cpu/cpu.xml; 22_config_corrected/p4/mos2/identity.json |
-| 13 — extract bounded centroid loading stages (this commit) | 1410 | 458 passed, 2 skipped, 1 xfailed, 102 warnings in 176.27s (0:02:56) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-193204-329368-3760, lx-Xg4-192729-303163-2911; 31_centroid_guard/cpu/cpu.xml; 31_centroid_guard/p4/mos2/identity.json |
+| 13 — extract bounded centroid loading stages (7225ea43) | 1410 | 458 passed, 2 skipped, 1 xfailed, 102 warnings in 176.27s (0:02:56) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-193204-329368-3760, lx-Xg4-192729-303163-2911; 31_centroid_guard/cpu/cpu.xml; 31_centroid_guard/p4/mos2/identity.json |
+| 14 — restore low_mem_bands and two-layout planner dispatch (this commit) | 1413 | 474 passed, 2 skipped, 1 xfailed, 102 warnings in 187.73s (0:03:07) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-201643-544166-5522, lx-Xg4-201649-544831-8820; 34_restore_layout/cpu/cpu.xml; 34_restore_layout/p4/mos2/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|
 | Historical MoS2 run73 reference superseded | Owner instructed fresh untouched-tip references; expected covariant Gamma price maximum4.647 microeV is documented in sandbox claim1201; no tolerance relaxed |
-| Scalar reference incomplete | Two untouched-source attempts stopped after no post-screening output; first >16min, native stacks in CUDA/NCCL. `00_references/si_scalar_attempt01`, `si_scalar`, `stack_1606206.log`, `stop_retry.log`; allocation58001753. Source cause unisolated, registered in sandbox KNOWN_LORRAX_ISSUES.md |
+| Scalar reference unresolved after Green fix | Untouched ebee1467 also stalled after screening, stopped at 4m36s total; 33_green_references/si_scalar and stop/kill receipts, pool58006471, step lx-Xg4-201057-511760-9255. Si SOC and MoS2 references completed. Two original untouched-source attempts stopped after no post-screening output; first >16min, native stacks in CUDA/NCCL. `00_references/si_scalar_attempt01`, `si_scalar`, `stack_1606206.log`, `stop_retry.log`; allocation58001753. Source cause unisolated, registered in sandbox KNOWN_LORRAX_ISSUES.md |
 | Additional launch attempts | 07_gram_p4 and 07_gram_p4_retry refused pool occupancy; no numerical execution. Completed accepted leg:07_gram_p4_ready/mos2 |
 | Live rectangular Gram | Downfold uses this calculation; retain it under c_q_downfold and remove only the wrapper selector |
 | Live legacy band projector | BSE ring consumers and common/zeta_projection still call it; no blanket removal |
 | Live absent-plan Green seam | photon_sigma has already unfolded mixed endpoints before build_G; applying another plan would unfold twice |
 | Captured symmetry data in identity caches | Shape equality alone does not authenticate captured action tables; no unsafe shape-only replacement |
 | Strict-key legacy exemptions | read_lorrax_input includes _LEGACY_DECK_KEYS in _known; dropping only explicit refusals would silently accept retired keys |
-| First push parent synchronization | Fetched parent immediately before first push; still c2f69987, so no rebase needed. No rebases after first push |
+| Authorized Green-fix synchronization | Owner required one rebase onto ebee1467 on resume; completed, then cherry-picked aa0fdb6e as 7225ea43. Original-to-rebased commit mapping:32_green_rebase/commit_mapping.json. No further rebase permitted |
 | Reverted centroid-loader stage cut | 12_centroid_stages/verdict.txt: P4 exact; CPU1 failed/460 passed/2 skipped/1 xfailed because test_centroid_fft_k_plan requires in-entry calls. Initial source/contract relocation reverted; corrected extraction accepted in31_centroid_guard |
 | Reverted Sigma stage cut | 13_sigma_stages/verdict.txt: P4 exact; CPU9 failed/496 passed/2 skipped/3 xfailed: four nb=3 fixtures incompatible with CPU4 band sharding, four absent-host-FFI failures, one entry-body structural guard. Source/tests/contract relocation reverted |
 | Reverted initializer stage cut | 17_prepare_stages/verdict.txt: CPU476 passed/2 skipped/1 xfailed; P4 failed because the extracted fresh-carrier stage omitted _parent_green_faces. Source/tests/contract relocation reverted |
 | Configuration guard retry | 21_config_stages/verdict.txt: initial CPU750 pass/1 fail depended on a moved driver comment; reverted and reapplied with owner-based structural guard in22_config_corrected. Its P4 receipt is reused after exact production-diff comparison |
+| Restored low_mem_bands/layout dispatch | Owner amendment applied: gflat_memory_model restored byte-for-byte to c2f69987; both gw_init caller guards and planner tests restored. Config and Sigma flagged lines remain in extracted owners; 34_restore_layout/dispatch_audit.json records the mapping |
+| Writer extraction failed fresh-fit gate | 35_fresh_fit/mos2_6x6, step lx-Xg4-201745-548578-5869: _close_zeta_fit_output lacks nqx/nqy/nqz arguments; revert only writer extraction and rerun fresh fit. Original accepted copied-zeta evidence did not cover this branch |
 | Final CPU/core/P16/compile-event gates | Pending; no final-suite or performance claim |
 | CPU skips/xfail | Host FFT FFI unavailable; not WSL; existing CPU partitioned-max NaN xfail. Explicit scoped CPU logs own details |

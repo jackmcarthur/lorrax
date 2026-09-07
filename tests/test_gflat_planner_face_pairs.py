@@ -36,7 +36,7 @@ def _synthetic_plan(*, ns=4, face_nb=256, fit_nb=250, budget=80.0,
         ngkmax=30_000, n_q_disk=36, budget_gb=budget,
         target_utilization=0.80, band_chunk_override=16,
         r_chunk_override=r_override,
-        distributed_zeta_solve="distributed",
+        distributed_zeta_solve="distributed", low_mem_bands=True,
         face_current_vertex=current_vertex)
 
 
@@ -47,7 +47,7 @@ def _run50_plan():
         memory=SimpleNamespace(
             per_device_gb=60.0, chunk_target_utilization=0.0,
             band_chunk_size=16, r_chunk_override=0,
-            gflat_chunk_size=0),
+            gflat_chunk_size=0, low_mem_bands=True),
         backend=SimpleNamespace(distributed_zeta_solve="distributed"))
     bands = BandSlices.from_band_edges(0, 0, 130, 190, 256)
     mesh = SimpleNamespace(
@@ -67,7 +67,7 @@ def _profile_cliff_plan(r_chunk):
         ngkmax=76_551, n_q_disk=36, budget_gb=70.0,
         target_utilization=0.78, band_chunk_override=16,
         r_chunk_override=r_chunk,
-        distributed_zeta_solve="distributed",
+        distributed_zeta_solve="distributed", low_mem_bands=True,
         face_current_vertex=True)
 
 

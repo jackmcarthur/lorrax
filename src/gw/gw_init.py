@@ -1628,6 +1628,7 @@ def _plan_gflat_chunks_for_channel(
 		gflat_chunk_size_override=(int(mem.gflat_chunk_size)
 		                           if mem.gflat_chunk_size > 0 else None),
 		distributed_zeta_solve=str(cfg.backend.distributed_zeta_solve),
+		low_mem_bands=bool(mem.low_mem_bands),
 		face_current_vertex=bool(face_current_vertex),
 		parent_route=parent_route,
 		# Stage F writes per-rank hyperslabs; the planner therefore
@@ -2059,6 +2060,7 @@ def _plan_coupled_zeta_fit(
             "  [bispinor] partial transverse ζ reuse: fitting only missing "
             "channels on the sequential schedule.")
     if (cfg.bispinor and not any(_reuse_T)
+            and bool(cfg.memory.low_mem_bands)
             and bool(_chunks_T.get('cache_face_y_blocks', False))):
         from gw.gflat_memory_model import (
             _batch_reshard_operand_floor_bytes,
