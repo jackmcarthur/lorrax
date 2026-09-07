@@ -62,9 +62,14 @@
 |---|---|---|---|---|
 | `src/gw/gw_init.py` | `_plan_gflat_chunks_for_channel` | 136 | 135 | Existing statements moved to named stages or dead selector removed |
 | `src/gw/gw_init.py` | `fit_zeta` | 576 | 575 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/gw_init.py` | `compute_V_q` | 398 | 398 | Unchanged; target remains |
+| `src/gw/gw_init.py` | `compute_V_q` | 398 | 22 | Existing statements moved to named stages or dead selector removed |
 | `src/gw/gw_init.py` | `prepare_isdf_and_wavefunctions` | 742 | 742 | Unchanged; target remains |
-| `src/gw/gw_init.py` | **File total** | 3786 | 3784 | Net -2 lines |
+| `src/gw/gw_init.py` | `_vcoul_geometry_and_budget` | 0 | 19 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_vcoul_transverse_inputs` | 0 | 25 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_compute_photon_vq` | 0 | 90 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_compute_scalar_vq` | 0 | 35 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_finalize_vq_views` | 0 | 23 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | **File total** | 3786 | 3610 | Net -176 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -210,7 +215,7 @@
 
 | Tree scope | Before | After | Net |
 |---|---|---|---|
-| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 124936 | -311 |
+| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 124762 | -485 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
@@ -219,7 +224,8 @@
 | 3 — symmetry stages (c604c3d6) | 1397 | 445 passed,2 skipped,1 xfailed; centroid/parent/physics/symmetry | Si SOC GN exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-180057-2240310-9849, lx-Xg4-180106-2241405-3156; 09_symmetry_stages/cpu/cpu.xml; 09_symmetry_stages/p4/si_soc/identity.json |
 | 4 — driver/photon stages (76a1587d) | 1398 | 467 passed,2 skipped,1 xfailed; centroid/parent/photon/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-180746-2273070-8918, lx-Xg4-180754-2273585-4383; 10_photon_stages/cpu/cpu.xml; 10_photon_stages/p4/mos2/identity.json |
 | 5 — zeta stages (b3487462) | 1399 | 485 passed,2 skipped,1 xfailed; parent/factor-hoist/mesh-invariance/charge/refit/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-181422-2302374-7638, lx-Xg4-181430-2302826-9451; 11_zeta_stages/cpu/cpu.xml; 11_zeta_stages/p4/mos2/identity.json |
-| 6 — complete driver stages (this commit) | 1401 | 456 passed,2 skipped,1 xfailed; centroid closure/parent/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-183807-44846-3326, lx-Xg4-183816-45219-2050; 14_driver_stages/cpu/cpu.xml; 14_driver_stages/p4/mos2/identity.json |
+| 6 — complete driver stages (208ed323) | 1401 | 456 passed,2 skipped,1 xfailed; centroid closure/parent/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-183807-44846-3326, lx-Xg4-183816-45219-2050; 14_driver_stages/cpu/cpu.xml; 14_driver_stages/p4/mos2/identity.json |
+| 7 — Vq stages (this commit) | 1403 | 445 passed, 2 skipped, 1 xfailed; centroid/parent/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-184246-65473-4941, lx-Xg4-184258-66104-4580; 15_vq_stages/cpu/cpu.xml; 15_vq_stages/p4/mos2/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|

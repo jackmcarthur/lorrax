@@ -2617,404 +2617,230 @@ def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
 	return hc
 
 
+def _vcoul_geometry_and_budget(
+        cfg, mem_est, print_fn, wfn):
+    """Produce the existing Coulomb geometry, cutoff and memory allowance."""
+    bvec = CoulombGeometry.from_wfn(wfn).bvec
+    if mem_est is None:
+        mem_est = {}
+    budget_gb = float(mem_est.get('available_vcoul_gb', cfg.memory.per_device_gb))
+    try:
+        from common.gpu_utils import get_device_memory_info
+        budget_gb = min(budget_gb, float(get_device_memory_info().get('budget_gb', budget_gb)))
+    except Exception:
+        pass
+    if cfg.head.bare_coulomb_cutoff is None:
+        vcoul_cutoff_ry = float(wfn.ecutwfc)
+    else:
+        vcoul_cutoff_ry = float(cfg.head.bare_coulomb_cutoff)
+    print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry")
+    print_fn(f"    V_q budget:    {budget_gb:.2f} GB")
+    return bvec, vcoul_cutoff_ry
+
+
+def _vcoul_transverse_inputs(
+        cfg, zeta_h5_path):
+    """Produce the authenticated transverse zeta paths for Coulomb projection."""
+    zeta_dir = os.path.dirname(zeta_h5_path)
+    zeta_T_paths = [
+        os.path.join(zeta_dir, f"zeta_q_mu{mu_L}.h5") for mu_L in (1, 2, 3)
+    ]
+    bispinor_ready = (
+        cfg.bispinor and all(os.path.exists(p) for p in zeta_T_paths)
+    )
+    if cfg.bispinor and not bispinor_ready:
+        _missing = [p for p in zeta_T_paths if not os.path.exists(p)]
+        raise FileNotFoundError(
+            f"bispinor = true, but {len(_missing)} of 3 transverse ζ files "
+            f"are missing:\n  "
+            + "\n  ".join(_missing)
+            + f"\nRefusing to fall back to a scalar V_q: that would drop "
+            f"Σ^B and return non-bispinor physics from a bispinor deck "
+            f"with no symptom in any output.  Either the ζ fit did not run "
+            f"for the transverse channel (check that fit_zeta received "
+            f"cfg.centroids_file_current) or the files were removed after "
+            f"it did.  Re-run the fit, or set bispinor = false if a scalar "
+            f"run is what you want."
+        )
+    return zeta_dir, zeta_T_paths, bispinor_ready
+
+
+def _compute_photon_vq(
+        bvec, centroid_indices, cfg, mesh_xy, meta, print_fn, sym, vcoul_cutoff_ry, wfn,
+        zeta_T_paths, zeta_dir, zeta_h5_path):
+    """Produce the four-current Coulomb tiles and their charge and Gamma views."""
+    from .v_q_bispinor import (
+        tile_dataset_name,
+    )
+    from file_io.centroids import load_centroids as _load_centroids
+    _cents_curr_path = cfg.paths.centroids_file_current
+    _, _cent_T_idx_np, _ = _load_centroids(
+        _cents_curr_path, meta.fft_grid)
+    _cent_T_idx_for_orchestrator = np.asarray(
+        _cent_T_idx_np, dtype=np.int32)
+    _cent_C_idx_for_orchestrator = (
+        np.asarray(jax.device_get(centroid_indices),
+                   dtype=np.int32)
+        if centroid_indices is not None else None)
+    bispinor_h5_path = os.path.join(zeta_dir, "v_q_bispinor.h5")
+    print_fn(f"\n  [bispinor] V_q^{{μ_L,ν_L}} → {bispinor_h5_path}")
+    with ZetaLoader(zeta_T_paths[0]) as _z_T0:
+        n_rmu_T = int(_z_T0.n_rmu_disk)
+    n_rmu_C = int(meta.n_rmu)
+    with timing.section("gw_jax.V_q_compute"), \
+         jax_profile.trace_section("V_q_compute_bispinor"):
+        from .v_q_bispinor import compute_V_q_bispinor_g_flat_to_h5
+        with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
+                        ) as zc, \
+             ZetaLoader(zeta_T_paths[0], mesh=mesh_xy,
+                        ) as zt1, \
+             ZetaLoader(zeta_T_paths[1], mesh=mesh_xy,
+                        ) as zt2, \
+             ZetaLoader(zeta_T_paths[2], mesh=mesh_xy,
+                        ) as zt3:
+            with mesh_xy:
+                _, photon_g0_vectors = compute_V_q_bispinor_g_flat_to_h5(
+                    zeta_C_loader=zc,
+                    zeta_T_loaders=(zt1, zt2, zt3),
+                    output_h5_path=bispinor_h5_path,
+                    mesh_xy=mesh_xy, kgrid=meta.kgrid,
+                    fft_grid=meta.fft_grid, bvec=bvec,
+                    cell_volume=meta.cell_volume,
+                    sys_dim=meta.sys_dim,
+                    n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
+                    bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
+                    bdot=(np.asarray(wfn.bdot, dtype=np.float64)
+                           if meta.sys_dim == 0 else None),
+                    g_chunk=(int(cfg.memory.vq_g_chunk_size)
+                             if cfg.memory.vq_g_chunk_size > 0 else None),
+                    print_fn=print_fn,
+                    sym=sym,
+                    centroid_C_idx=_cent_C_idx_for_orchestrator,
+                    centroid_T_idx=_cent_T_idx_for_orchestrator,
+                    use_ibz=True,
+                    tt_head_correction=bool(
+                        cfg.head.bispinor_tt_head_correction),
+                    bispinor_gw_mode=None,
+                    charge_representation=None,
+                    spatial_current_representation=None,
+                )
+    from file_io.tagged_arrays import read_munu_tensor_from_h5
+    V_q_raw = read_munu_tensor_from_h5(
+        bispinor_h5_path, tile_dataset_name(0, 0), mesh_xy)
+    G0_all = photon_g0_vectors[0]
+    if not uses_coupled_photon_head(cfg):
+        photon_g0_vectors = None
+    if int(V_q_raw.shape[-1]) < int(meta.n_rmu_padded):
+        pad = int(meta.n_rmu_padded) - int(V_q_raw.shape[-1])
+        V_q_raw = jnp.pad(V_q_raw, ((0, 0), (0, pad), (0, pad)))
+    if G0_all is not None and int(G0_all.shape[-1]) < int(meta.n_rmu_padded):
+        G0_all = jnp.pad(G0_all,
+                         ((0, 0), (0, int(meta.n_rmu_padded) - int(G0_all.shape[-1]))))
+    head_channel = None
+    if str(getattr(cfg.head, 'mc_average_placement', 'off')) != 'off':
+        raise NotImplementedError(
+            "mc_average_placement is not implemented on the bispinor V_q "
+            "builder: v_q_bispinor.py passes no v_head_fn, so its CC tile "
+            "already carries a different G=0 slot from the scalar V_q at "
+            "every q != 0.  Deciding the placement for one builder and not "
+            "the other would make that divergence permanent.  Run with "
+            "bispinor = false, or land the bispinor v_head_fn first.")
+    if bool(getattr(cfg.head, 'uses_bgw_metal_q0shift', False)):
+        with ZetaLoader(zeta_h5_path, mesh=mesh_xy) as zeta_io:
+            with mesh_xy:
+                head_channel = _build_head_channel(
+                    zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,
+                    mesh_xy=mesh_xy, sym=sym,
+                    centroid_indices=_cent_C_idx_for_orchestrator,
+                    vcoul_cutoff_ry=vcoul_cutoff_ry,
+                    print_fn=print_fn)
+    return V_q_raw, G0_all, head_channel, photon_g0_vectors
+
+
+def _compute_scalar_vq(
+        bgw_v_grid_fn, bvec, centroid_indices, cfg, mesh_xy, meta, print_fn, sym,
+        vcoul_cutoff_ry, wfn, zeta_h5_path):
+    """Produce the scalar Coulomb operator and its live head views."""
+    from .compute_vcoul import compute_all_V_q
+    with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
+        with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
+                        ) as zeta_io:
+            _cent_idx_np = (
+                np.asarray(jax.device_get(centroid_indices),
+                           dtype=np.int32)
+                if centroid_indices is not None else None)
+            with mesh_xy:
+                V_q_raw, G0_all = compute_all_V_q(
+                    zeta_io,
+                    kgrid=meta.kgrid, fft_grid=meta.fft_grid,
+                    bvec=bvec, cell_volume=meta.cell_volume,
+                    mesh_xy=mesh_xy,
+                    sys_dim=meta.sys_dim,
+                    bdot=np.asarray(wfn.bdot, dtype=np.float64)
+                        if meta.sys_dim == 0 else None,
+                    mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
+                    bare_coulomb_cutoff=vcoul_cutoff_ry,
+                    bgw_v_grid_fn=bgw_v_grid_fn,
+                    sym=sym,
+                    centroid_indices=_cent_idx_np,
+                    g_chunk_size=int(cfg.memory.vq_g_chunk_size),
+                )
+                head_channel = _build_head_channel(
+                    zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,
+                    mesh_xy=mesh_xy, sym=sym,
+                    centroid_indices=_cent_idx_np,
+                    vcoul_cutoff_ry=vcoul_cutoff_ry,
+                    print_fn=print_fn)
+    return V_q_raw, G0_all, head_channel
+
+
+def _finalize_vq_views(
+        G0_all, V_q_raw, head_channel, meta, photon_g0_vectors, print_fn):
+    """Produce the packed Coulomb operator and validate its physical invariants."""
+    from common.collectives import gather_to_host as _gather_to_host
+    G0_gathered = _gather_to_host(G0_all)
+    V_qmunu = (meta.mu_basis.pack_operator(V_q_raw)
+               if getattr(meta, 'mu_basis', None) is not None else V_q_raw)
+    G0 = G0_gathered
+    while G0.ndim > 1:
+        G0 = G0[0]
+    print_fn(f"\n  V_q computed:")
+    print_fn(f"    Shape: {V_qmunu.shape}")
+    _vq0_trace = float(jnp.trace(V_q_raw[0]).real)
+    print_fn(f"    V_q=0 trace: {_vq0_trace:.4f}")
+    from common import sanity
+    sanity.check_finite("V_q", V_qmunu, print_fn=print_fn)
+    sanity.check_positive("V_q[q=0] trace", _vq0_trace, print_fn=print_fn)
+    sanity.check_hermitian("V_q[q=0]", V_q_raw[0], print_fn=print_fn)
+    sanity.check_q_conjugate_reciprocity(
+        "V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
+        print_fn=print_fn)
+    sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
+    return V_qmunu, G0, head_channel, photon_g0_vectors
+
+
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
-	"""Compute bare Coulomb V_qmunu and its in-memory G=0 view.
-
-	Returns (V_qmunu, G0, head_channel, photon_g0_vectors), where V_qmunu
-	has shape (nq, μ, μ)
-	(flat-q) and G0 is (n_rmu,) ζ_μ(G=0) at q=0.  ``head_channel`` is a
-	``gw.head_channel.HeadChannel`` when the deck sets
-	``mc_average_placement`` to something other than ``off``, and ``None``
-	otherwise — nothing is computed for it on the default path.  Downstream consumers that need
-	the 3-D-k form reshape inside ``common.fft_helpers.make_flat_k_fft``.
-
-	The legacy ``(1, npol, npol, …)`` leading axes are gone — bispinor
-	will introduce a structured ``V_q_bispinor`` NamedTuple (CC, CT, TT)
-	rather than packing all polarisation tiles into a uniform tensor,
-	because charge and transverse channels use different μ counts.
-	"""
+	"""Produce bare Coulomb and head views; see docs/architecture/four_current_wiring.md."""
 	from .compute_vcoul import compute_all_V_q
 	photon_g0_vectors = None
 
 	if jax.process_index() == 0:
 		os.sync()
 	barrier("zeta_flush")
-
-	# The Cartesian reciprocal ROWS come off the vcoul door's geometry, not
-	# from a hand-written product.  ``docs/services/vcoul.md`` says it in as
-	# many words — "Do not multiply ``wfn.blat * wfn.bvec`` at a call site" —
-	# and the reason is the one ``CoulombGeometry``'s own docstring gives: a
-	# product every caller has to remember to take is a footgun, because the
-	# day one of them passes ``wfn.bvec`` alone every number downstream is
-	# off by the lattice constant with no shape error to say so.
-	# ``from_wfn`` is duck-typed on ``blat``/``bvec``/``cell_volume``, all
-	# three of which ``WfnLoader`` binds off the mf_header.
-	#
-	# ONLY ``.bvec`` IS TAKEN.  ``meta.cell_volume`` below stays where it is:
-	# Ω sets the 1/Ω factor on every v(q+G), so swapping its source is a
-	# physics edit, not a plumbing one.  It happens that the two agree
-	# exactly — ``Meta.from_system`` and ``CoulombGeometry.from_wfn`` both
-	# read ``float(wfn.cell_volume)`` off this same loader, measured
-	# bit-identical — but "they agree" is the licence for a later swap, not
-	# a reason to make it in a commit about ``bvec``.
-	bvec = CoulombGeometry.from_wfn(wfn).bvec
-
-	# V_q memory budget (per rank) — informational only.  The live
-	# G-flat V_q path bounds its working set with ``vq_g_chunk_size``
-	# (per-q G-chunk) and mesh-sharded ζ slabs; there is no byte-budget
-	# chooser to feed any more.  Kept for the log line below.
-	if mem_est is None:
-		mem_est = {}
-	budget_gb = float(mem_est.get('available_vcoul_gb', cfg.memory.per_device_gb))
-	try:
-		from common.gpu_utils import get_device_memory_info
-		budget_gb = min(budget_gb, float(get_device_memory_info().get('budget_gb', budget_gb)))
-	except Exception:
-		pass
-
-	# Resolved earlier in :func:`fit_zeta` (line ~589) via the shared
-	# ``_resolve_cutoff`` helper — defaults to ``wfn.ecutwfc``, max
-	# ``wfn.ecutrho``, validated against the ζ-sphere cutoff.  Hoist
-	# the resolved value here rather than re-resolving so the two call
-	# sites stay in sync (this is the V_q half of the same number
-	# zeta_fit wrote into ``isdf_header/zeta_cutoff_ry``).
-	if cfg.head.bare_coulomb_cutoff is None:
-		vcoul_cutoff_ry = float(wfn.ecutwfc)
-	else:
-		vcoul_cutoff_ry = float(cfg.head.bare_coulomb_cutoff)
-	print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry")
-	print_fn(f"    V_q budget:    {budget_gb:.2f} GB")
-
-	from file_io.slab_io import SlabIO
-
-	# ── Bispinor branch ────────────────────────────────────────────────
-	# When cfg.bispinor is set AND the 4-channel ζ files were produced by
-	# fit_zeta (zeta_q.h5 + zeta_q_mu{1,2,3}.h5), dispatch to the
-	# 7-tile orchestrator that streams V^{μ_L,ν_L}_q to a dedicated
-	# HDF5 file.  The CC tile (μ_L = ν_L = 0) matches the scalar charge
-	# V_q — bit-identically for every sandbox bispinor system, which is
-	# sys_dim=2: there the G=0 body is regularised by the 2D truncation
-	# (f2d→0) and the mini-BZ head-average is a no-op, so the CC builder's
-	# omission of ``v_head_fn`` costs nothing.  In 3D with
-	# ``mc_average_vcoul_body`` enabled the two DO diverge, in the G=0 slot
-	# of every q≠0; that path is reachable, so a 3D bispinor deck must not
-	# assume the CC tile and the scalar V_q agree.  See the v_q_bispinor
-	# CC builder.  We
-	# read the CC tile back as the scalar V_qmunu / G0 the downstream
-	# restart_state writer expects.  Σ_X^B / Σ_H^B consumers will read
-	# the TT tiles directly via BispinorVqReader.
-	zeta_dir = os.path.dirname(zeta_h5_path)
-	zeta_T_paths = [
-		os.path.join(zeta_dir, f"zeta_q_mu{mu_L}.h5") for mu_L in (1, 2, 3)
-	]
-	bispinor_ready = (
-		cfg.bispinor and all(os.path.exists(p) for p in zeta_T_paths)
-	)
-	if cfg.bispinor and not bispinor_ready:
-		# REFUSE, do not demote.  This used to print the sentence below and
-		# carry on with a scalar V_q — i.e. silently return NON-BISPINOR
-		# physics from a deck that asked for bispinor, with Σ^B absent and
-		# no symptom in any output.  decisions.md 2026-08-01 rules that a
-		# missing capability is a refusal naming what is missing, never a
-		# demotion to a different compute path; this is the same class as
-		# the FFI entry and the same class as the restart regression
-		# 3d89885 fixed.
-		_missing = [p for p in zeta_T_paths if not os.path.exists(p)]
-		raise FileNotFoundError(
-			f"bispinor = true, but {len(_missing)} of 3 transverse ζ files "
-			f"are missing:\n  "
-			+ "\n  ".join(_missing)
-			+ f"\nRefusing to fall back to a scalar V_q: that would drop "
-			f"Σ^B and return non-bispinor physics from a bispinor deck "
-			f"with no symptom in any output.  Either the ζ fit did not run "
-			f"for the transverse channel (check that fit_zeta received "
-			f"cfg.centroids_file_current) or the files were removed after "
-			f"it did.  Re-run the fit, or set bispinor = false if a scalar "
-			f"run is what you want."
-		)
-
+	(bvec, vcoul_cutoff_ry) = _vcoul_geometry_and_budget(
+	    cfg, mem_est, print_fn, wfn)
+	(zeta_dir, zeta_T_paths, bispinor_ready) = _vcoul_transverse_inputs(
+	    cfg, zeta_h5_path)
 	if bispinor_ready:
-		from .v_q_bispinor import (
-			tile_dataset_name,
-		)
-		from file_io.centroids import load_centroids as _load_centroids
-
-		# Reload the transverse centroid indices for the bispinor IBZ
-		# cascade.  fit_zeta loaded them earlier but didn't surface them
-		# to compute_V_q's signature; reloading is cheap (a text file
-		# read) and keeps the bispinor IBZ wiring local to this branch.
-		# Orbit-closure of the C/T centroid sets is resolved inside
-		# ``_resolve_ibz_q_list`` (called per tile by the V_q
-		# orchestrator), which falls back to full-BZ on failure and
-		# ANNOUNCES it once per centroid set — the charge and the
-		# transverse set are separate facts and get separate lines.
-		# It used to fall back SILENTLY; see gw/qgrid_symmetry.py.
-		_cents_curr_path = cfg.paths.centroids_file_current
-		_, _cent_T_idx_np, _ = _load_centroids(
-			_cents_curr_path, meta.fft_grid)
-		_cent_T_idx_for_orchestrator = np.asarray(
-			_cent_T_idx_np, dtype=np.int32)
-		_cent_C_idx_for_orchestrator = (
-			np.asarray(jax.device_get(centroid_indices),
-			           dtype=np.int32)
-			if centroid_indices is not None else None)
-
-		bispinor_h5_path = os.path.join(zeta_dir, "v_q_bispinor.h5")
-		print_fn(f"\n  [bispinor] V_q^{{μ_L,ν_L}} → {bispinor_h5_path}")
-
-		# Charge-channel n_rmu (== meta.n_rmu).  Transverse n_rmu_T comes
-		# from the dataset shape on disk — read it from one of the ζ_T
-		# files.
-		# n_rmu_T from the transverse ζ dataset shape on disk
-		# (fit_zeta_to_h5 writes all ζ files in G-flat layout).
-		# HEADER-ONLY (``mesh=None``): no SlabIO handle, no phdf5 FFI, no
-		# collective — the same one serial-h5py open the raw
-		# ``f['zeta_q_G'].shape[1]`` here did, through the reader that owns
-		# the layout.  ``n_rmu_disk`` IS axis 1 in G-flat and axis 2 in
-		# r-space, which is the dispatch this line used to assume.  The
-		# loader's open-time refusals (zeta_is_done, header-vs-dataset μ,
-		# header-vs-dataset ngkmax) come along, and they are a strict
-		# SUBSET of what the ``ZetaLoader(zeta_T_paths[0], mesh=mesh_xy)``
-		# fifteen lines below already applies to this very file.
-		with ZetaLoader(zeta_T_paths[0]) as _z_T0:
-			n_rmu_T = int(_z_T0.n_rmu_disk)
-		n_rmu_C = int(meta.n_rmu)
-
-		with timing.section("gw_jax.V_q_compute"), \
-		     jax_profile.trace_section("V_q_compute_bispinor"):
-			# G-flat path: per-q + G-chunked, one orchestrator per
-			# four ζ files.  No legacy compute_V_q_tile chooser /
-			# μ × ν tiling / in-V_q FFT — see
-			# gw.v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5.
-			from .v_q_bispinor import compute_V_q_bispinor_g_flat_to_h5
-			with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
-			                ) as zc, \
-			     ZetaLoader(zeta_T_paths[0], mesh=mesh_xy,
-			                ) as zt1, \
-			     ZetaLoader(zeta_T_paths[1], mesh=mesh_xy,
-			                ) as zt2, \
-			     ZetaLoader(zeta_T_paths[2], mesh=mesh_xy,
-			                ) as zt3:
-				with mesh_xy:
-					_, photon_g0_vectors = compute_V_q_bispinor_g_flat_to_h5(
-						zeta_C_loader=zc,
-						zeta_T_loaders=(zt1, zt2, zt3),
-						output_h5_path=bispinor_h5_path,
-						mesh_xy=mesh_xy, kgrid=meta.kgrid,
-						fft_grid=meta.fft_grid, bvec=bvec,
-						cell_volume=meta.cell_volume,
-						sys_dim=meta.sys_dim,
-						n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
-						bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
-						bdot=(np.asarray(wfn.bdot, dtype=np.float64)
-						       if meta.sys_dim == 0 else None),
-						g_chunk=(int(cfg.memory.vq_g_chunk_size)
-						         if cfg.memory.vq_g_chunk_size > 0 else None),
-						print_fn=print_fn,
-						sym=sym,
-						centroid_C_idx=_cent_C_idx_for_orchestrator,
-						centroid_T_idx=_cent_T_idx_for_orchestrator,
-						use_ibz=True,
-						tt_head_correction=bool(
-							cfg.head.bispinor_tt_head_correction),
-						# No explicit-carrier stamp: both shipped
-						# bispinor_gw values ride the one raw
-						# kinetic-balance carrier.
-						bispinor_gw_mode=None,
-						charge_representation=None,
-						spatial_current_representation=None,
-					)
-
-		# Read only the CC tile back.  Its literal-G=0 vector is the in-memory
-		# view returned by the same projection that built V; it is deliberately
-		# absent from v_q_bispinor.h5 because zeta_q_G is the sole persisted
-		# source of truth.  The four small views stay resident only for a packed
-		# coupled head; headless modes release the transverse three immediately.
-		# The TT tiles stay on disk; Σ_X^B / Σ_H^B will consume them
-		# via BispinorVqReader once those paths land.
-		from file_io.tagged_arrays import read_munu_tensor_from_h5
-		V_q_raw = read_munu_tensor_from_h5(
-			bispinor_h5_path, tile_dataset_name(0, 0), mesh_xy)
-		G0_all = photon_g0_vectors[0]
-		if not uses_coupled_photon_head(cfg):
-			photon_g0_vectors = None
-		# V_q_raw is on disk at LOGICAL n_rmu (the orchestrator strips
-		# the V-tile pad before write).  In-memory ψ flows at PADDED
-		# n_rmu so the σ_X kernel can broadcast V across G's μ axis.
-		# Pad V_q_raw with zeros to match — pad rows of ψ are zero
-		# (Phase 3a invariant), so zero-padding V is exact.
-		if int(V_q_raw.shape[-1]) < int(meta.n_rmu_padded):
-			pad = int(meta.n_rmu_padded) - int(V_q_raw.shape[-1])
-			V_q_raw = jnp.pad(V_q_raw, ((0, 0), (0, pad), (0, pad)))
-		if G0_all is not None and int(G0_all.shape[-1]) < int(meta.n_rmu_padded):
-			G0_all = jnp.pad(G0_all,
-			                 ((0, 0), (0, int(meta.n_rmu_padded) - int(G0_all.shape[-1]))))
-		# ``mc_average_placement`` is refused on the bispinor builder, not
-		# silently skipped.  ``v_q_bispinor`` does not pass ``v_head_fn`` at
-		# all, so with ``mc_average_vcoul_body`` on in 3D the bispinor CC tile
-		# and the scalar V_q ALREADY diverge in the G=0 slot of every q != 0
-		# (see the note at the head of this file).  Adding a second, quieter
-		# copy of that divergence is exactly what COULOMB_AVG_ARCHITECTURE.md
-		# section 4.6(b) says not to do.
-		head_channel = None
-		if str(getattr(cfg.head, 'mc_average_placement', 'off')) != 'off':
-			raise NotImplementedError(
-				"mc_average_placement is not implemented on the bispinor V_q "
-				"builder: v_q_bispinor.py passes no v_head_fn, so its CC tile "
-				"already carries a different G=0 slot from the scalar V_q at "
-				"every q != 0.  Deciding the placement for one builder and not "
-				"the other would make that divergence permanent.  Run with "
-				"bispinor = false, or land the bispinor v_head_fn first.")
-		if bool(getattr(cfg.head, 'uses_bgw_metal_q0shift', False)):
-			# The BGW q0 mode does not rescale the bispinor V tile.  It needs
-			# only the charge-charge head vector at one finite q, which is
-			# carried by the ordinary charge ζ file even in a bispinor run.
-			with ZetaLoader(zeta_h5_path, mesh=mesh_xy) as zeta_io:
-				with mesh_xy:
-					head_channel = _build_head_channel(
-						zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,
-						mesh_xy=mesh_xy, sym=sym,
-						centroid_indices=_cent_C_idx_for_orchestrator,
-						vcoul_cutoff_ry=vcoul_cutoff_ry,
-						print_fn=print_fn)
+	    (V_q_raw, G0_all, head_channel, photon_g0_vectors) = _compute_photon_vq(
+	        bvec, centroid_indices, cfg, mesh_xy, meta, print_fn, sym, vcoul_cutoff_ry, wfn,
+	        zeta_T_paths, zeta_dir, zeta_h5_path)
 	else:
-		# Scalar (non-bispinor) path.  ``compute_all_V_q`` dispatches on
-		# the on-disk ζ layout: G-flat (the only thing fit_zeta writes)
-		# routes to ``v_q_g_flat.compute_all_V_q_g_flat``; any other
-		# layout raises.  ``ZetaLoader`` is the V_q reader of record —
-		# it serves the writer's per-q WFN.h5-style G-sphere directly.
-		with timing.section("gw_jax.V_q_compute"), jax_profile.trace_section("V_q_compute"):
-			with ZetaLoader(zeta_h5_path, mesh=mesh_xy,
-			                ) as zeta_io:
-				_cent_idx_np = (
-					np.asarray(jax.device_get(centroid_indices),
-					           dtype=np.int32)
-					if centroid_indices is not None else None)
-				with mesh_xy:
-					V_q_raw, G0_all = compute_all_V_q(
-						zeta_io,
-						kgrid=meta.kgrid, fft_grid=meta.fft_grid,
-						bvec=bvec, cell_volume=meta.cell_volume,
-						mesh_xy=mesh_xy,
-						sys_dim=meta.sys_dim,
-						bdot=np.asarray(wfn.bdot, dtype=np.float64)
-							if meta.sys_dim == 0 else None,
-						mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
-						bare_coulomb_cutoff=vcoul_cutoff_ry,
-						bgw_v_grid_fn=bgw_v_grid_fn,
-						sym=sym,
-						centroid_indices=_cent_idx_np,
-						g_chunk_size=int(cfg.memory.vq_g_chunk_size),
-					)
-					# The q != 0 head channel, for ``mc_average_placement``.
-					# Gated on the mode so the default path neither reads ζ a
-					# second time nor compiles a single extra kernel.  It sits
-					# INSIDE the loader scope because that is the only place
-					# ζ is open, and before ``V_q_raw`` is padded so the μ
-					# extents agree by construction.
-					head_channel = _build_head_channel(
-						zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,
-						mesh_xy=mesh_xy, sym=sym,
-						centroid_indices=_cent_idx_np,
-						vcoul_cutoff_ry=vcoul_cutoff_ry,
-						print_fn=print_fn)
-
-	# Keep G0 = ζ_μ(G=0) in memory for the current compute consumers.
-	# It is already the G=0 coefficient of canonical ``zeta_q_G`` (stored
-	# parent-q slot 0), so persisting ``g0_mu`` would create a second source
-	# of truth.  Full-BZ literal G=0 under IBZ symmetry is a derived unfolded
-	# view and likewise must not be persisted as a duplicate dataset.
-	# ``common.collectives.gather_to_host`` is the sanctioned L3 gather and
-	# is what ``_slab_io_allgather._to_host`` was a private copy of.  This
-	# import used to reach straight into the allgather backend, bypassing
-	# every one of the seven refusals that guarded that tier -- an eighth,
-	# ungated door.  G0 is (nq, mu), mu-class not mu^2-class, so the gather
-	# itself is not the doctrine violation; the unguarded private import
-	# was.  Same dispatch, public name.
-	from common.collectives import gather_to_host as _gather_to_host
-	G0_gathered = _gather_to_host(G0_all)
-
-	# Scalar V_qmunu is just (nq, μ, μ).  The (1, npol, npol) leading
-	# axes of the legacy 8-D layout were never used in scalar mode and
-	# have no place once bispinor switches to a structured tile container
-	# (CC + CT(3) + TT(3,3) NamedTuple) since the μ counts differ across
-	# polarisation tiles.  See agent/v_q_perf design discussion 2026-05-08.
-	# V was assembled from the canonical zeta FILE; every in-memory operator
-	# is in the run's packed centroid order.  Convert once, here.
-	V_qmunu = (meta.mu_basis.pack_operator(V_q_raw)
-	           if getattr(meta, 'mu_basis', None) is not None else V_q_raw)
-
-	G0 = G0_gathered
-	while G0.ndim > 1:
-		G0 = G0[0]
-
-	print_fn(f"\n  V_q computed:")
-	print_fn(f"    Shape: {V_qmunu.shape}")
-	# V_q_raw is now flat-q (nq, μ, μ); q=0 slab is V_q_raw[0].
-	_vq0_trace = float(jnp.trace(V_q_raw[0]).real)
-	print_fn(f"    V_q=0 trace: {_vq0_trace:.4f}")
-
-	# ── V_q stage gate ────────────────────────────────────────────────
-	# Three one-sweep invariants on the tensor every later stage (χ₀, W,
-	# Σ_x, Σ_c, the BSE kernel) is built from.  Historically this seam
-	# produced a 27 % shift in ``tr V_{q=0}`` between two runs whose V_q
-	# is band-window-independent and therefore *must* have been identical
-	# — a discrepancy that was only noticed days later, by hand, from log
-	# archaeology.  V is a positive-definite Gram matrix in the ISDF
-	# basis, so its q=0 trace is positive by construction and its tiles
-	# are Hermitian by construction; both are cheap to state.
-	from common import sanity
-	sanity.check_finite("V_q", V_qmunu, print_fn=print_fn)
-	sanity.check_positive("V_q[q=0] trace", _vq0_trace, print_fn=print_fn)
-	sanity.check_hermitian("V_q[q=0]", V_q_raw[0], print_fn=print_fn)
-	# Per-q hermiticity above is a NEIGHBOURING property, not the one the
-	# BSE kernel rests on.  That one is q↔−q conjugate reciprocity,
-	# V_q = conj(V_{−q}) (equivalently: ifft_q(V_q) is REAL), and it is
-	# independent of hermiticity in both directions.  V_q passes the
-	# hermiticity gate at 3.0e-16 on every fixture measured while failing
-	# the reciprocity at 5.7e-3 (armA_base480, 2026-08-07) -- and a q=0
-	# check could not have seen it either way, because -0 == 0 makes the
-	# condition collapse to "V[0] is real", which holds at 3.7e-16.
-	# V is the BARE Coulomb: static and analytic, no frequency dependence
-	# anywhere, so the dynamical/Kramers-Kronig caveat that applies to a
-	# real-axis W does not apply here at all.  Reciprocity is simply true.
-	# TOLERANCE from the MEASURED floor, not from eps: these tiles span
-	# |A| in [2.6, 4.7e6] and the residual is set by cancellation among
-	# large intermediates, not by eps*max|A| (= 1.0e-9 here).  The
-	# empirical floor is the orbit-closed IBZ arm: MEASURED 1.16e-7
-	# (armB_orbit504, 2026-08-07), with the per-element relative residual
-	# falling as |A| rises, which is the round-off signature.  The DIRECT
-	# arm instead sits at 1.5e-3 per-element relative and FLAT in |A| --
-	# systematic, not round-off.  1e-5 is ~90x above the floor and ~400x
-	# below that break.
-	#
-	# WHAT THAT FLOOR IS *NOT*.  This comment used to say that on the
-	# orbit-closed IBZ arm "the unfold builds V_{-q} from V_q by symmetry
-	# so reciprocity holds BY CONSTRUCTION", and read the 1.16e-7 as an
-	# arithmetic floor.  Both halves are false.  The unfold applies a
-	# SPATIAL operation; reciprocity is a statement about complex
-	# conjugation.  They coincide only if the finite ISDF zeta basis is
-	# point-group covariant -- an unstated assumption, and MEASURED FALSE
-	# by 1.240e-02 at Gamma on the Na 8x8x8 SOC c464 deck.  So 1.16e-7 is
-	# a measurement of zeta covariance on ONE deck, not a floor any deck
-	# inherits.
-	#
-	# AND THIS GATE IS BLIND WHERE THAT DEFECT IS LARGEST.  At a q with
-	# q == -q (Gamma, and every TRIM of an even mesh) the condition
-	# collapses to "V_q is real", which the analytic assembly satisfies at
-	# machine epsilon whatever the covariance does: 3.9e-17 at Gamma and
-	# 6.4e-17 at H on the deck whose covariance residual there is 1.2e-02
-	# and 2.4e-02.  The discriminating statistic is the little-group
-	# covariance of the IBZ PARENTS, measured at the unfold sites in
-	# ``v_q_g_flat``/``screening``/``screening_bse`` through
-	# ``QgridTrsPolicy.measure_covariance`` and reported by
-	# ``sanity.report_parent_covariance``.  Do NOT tighten the rtol here
-	# to compensate; this statistic is measuring a projection.
-	sanity.check_q_conjugate_reciprocity(
-		"V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
-		print_fn=print_fn)
-	sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
-	return V_qmunu, G0, head_channel, photon_g0_vectors
+	    (V_q_raw, G0_all, head_channel) = _compute_scalar_vq(
+	        bgw_v_grid_fn, bvec, centroid_indices, cfg, mesh_xy, meta, print_fn, sym,
+	        vcoul_cutoff_ry, wfn, zeta_h5_path)
+	return _finalize_vq_views(
+	    G0_all, V_q_raw, head_channel, meta, photon_g0_vectors, print_fn)
 
 
 
