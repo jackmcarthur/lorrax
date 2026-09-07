@@ -2775,15 +2775,9 @@ def read_authenticated_dipole_velocity(
             "velocity operator as the finite-q charge response")
     sym = wfn.symmetry()
     b0, b4 = int(meta.b_id_0), int(meta.b_id_4_chi_user)
-    with h5py.File(dipole_path, "r") as h5:
-        velocity = h5["dipole_cart"]
-        if velocity.shape[1] != int(sym.nk_tot):
-            raise ValueError(
-                "dipole_cart must retain its full-BZ file indexing; "
-                f"got {velocity.shape[1]} rows, want {sym.nk_tot}")
-        parents = np.stack([
-            velocity[:, int(row), b0:b4, b0:b4]
-            for row in sym.kirr_fullids])
+    from file_io.restart_bundle import read_dipole_parent_window
+    parents = read_dipole_parent_window(
+        dipole_path, sym.kirr_fullids, b0, b4, nk_full=sym.nk_tot)
     return np.moveaxis(unfold_file_wedge_polar_matrix(sym, parents), 1, 0)
 
 

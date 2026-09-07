@@ -13,17 +13,17 @@ from .hdf5_owner import STACK_H5PY, open_scope
 # names, the version integer, the two table names and the
 # "no attr means full" default all come from one module, and
 # :func:`kin_ion.read_star_map` is the one implementation that reads them.
-from .kin_ion import (                                      # noqa: F401
-	IRR_IDX_DATASET,
-	K_STORAGE_ATTR,
-	K_STORAGE_FULL,
-	K_STORAGE_IBZ,
-	K_STORAGE_VERSION,
-	K_STORAGE_VERSION_ATTR,
-	N_SYM_SPATIAL_ATTR,
-	SYM_IDX_DATASET,
-	read_star_map,
+from .kin_ion import (
+    IRR_IDX_DATASET,
+    K_STORAGE_ATTR,
+    K_STORAGE_FULL,
+    K_STORAGE_IBZ,
+    K_STORAGE_VERSION,
+    K_STORAGE_VERSION_ATTR,
+    N_SYM_SPATIAL_ATTR,
+    SYM_IDX_DATASET,
 )
+from file_io.restart_bundle import (read_star_map)
 
 #: Attr prefix under which the pre-extraction star-spread measurement is
 #: stamped.  Four numbers per dataset — see :func:`sigma_star_spread_stats`
@@ -1628,81 +1628,12 @@ def write_sigma_omega_h5(
 	return abs_path
 
 
-def _omega_metadata_from_open_h5(h5):
-	"""Return the small omega axis plus its optional reference stamps."""
-	if OMEGA_DATASET not in h5:
-		return None, None, None
-	ds = h5[OMEGA_DATASET]
-	omega = np.asarray(ds[()], dtype=np.float64)
-	if OMEGA_REFERENCE_ATTR not in ds.attrs:
-		return omega, None, None
-	ref = float(ds.attrs[OMEGA_REFERENCE_ATTR])
-	prov = ds.attrs.get(OMEGA_REFERENCE_PROVENANCE_ATTR, "unstated")
-	if isinstance(prov, bytes):
-		prov = prov.decode("utf-8")
-	return omega, ref, str(prov)
 
 
-def _eval_metadata_from_open_h5(h5):
-	"""Return the small evaluation-energy stamp from an already-open file."""
-	if SIGMA_EVAL_DATASET not in h5:
-		return None, None, None
-	ds = h5[SIGMA_EVAL_DATASET]
-	arr = np.asarray(ds[()], dtype=np.float64)
-	prov = ds.attrs.get(SIGMA_EVAL_PROVENANCE_ATTR, "unstated")
-	cov = None
-	if OMEGA_COVERAGE_N_ATTR in ds.attrs:
-		pol = ds.attrs.get(OMEGA_COVERAGE_POLICY_ATTR, "unstated")
-		cov = {
-			"n_uncovered": int(ds.attrs[OMEGA_COVERAGE_N_ATTR]),
-			"fraction_uncovered": float(
-				ds.attrs.get(OMEGA_COVERAGE_FRAC_ATTR, 0.0)),
-			"policy": (pol.decode("utf-8")
-			           if isinstance(pol, bytes) else str(pol)),
-		}
-	if isinstance(prov, bytes):
-		prov = prov.decode("utf-8")
-	return arr, str(prov), cov
 
 
-def read_omega_reference(filepath):
-	"""``(reference_ev, provenance)`` off a ``sigma_mnk.h5``, or ``(None, None)``.
-
-	THE ONE READER OF THE STAMP, so its location is stated once.  ``None``
-	means the file predates the stamp (audit A2) — not that its ω axis is
-	absolute.  A consumer that cannot tolerate a guess must REFUSE on
-	``None`` rather than substitute its own convention; that substitution,
-	made silently, is the defect the stamp exists to close.
-	"""
-	abs_path = os.path.abspath(filepath)
-	with open_scope(
-			abs_path, STACK_H5PY, "r", where="read_omega_reference"), \
-			h5py.File(abs_path, "r") as h5:
-		_omega, ref, prov = _omega_metadata_from_open_h5(h5)
-	return ref, prov
 
 
-def read_eval_energies(filepath):
-	"""``(eval_rel_ev, provenance, coverage)`` off a ``sigma_mnk.h5``.
-
-	``(None, None, None)`` means the file predates the stamp — NOT that the
-	cube was evaluated at E_DFT.  A consumer must treat the two differently:
-	the second is a fact it can act on, the first is an absence, and
-	collapsing them is exactly how ``make_eqp_bgw`` came to linearize a
-	self-consistent cube at E_DFT without saying so.
-
-	``coverage`` is ``{"n_uncovered", "fraction_uncovered", "policy"}`` when
-	the writer stamped it, else ``None``.
-
-	The array comes back on the file's OWN k rows (the star wedge when the
-	file carries one), like every other dataset here; the caller remaps
-	through the same ``k_irr_rows_for`` it uses for the cubes.
-	"""
-	abs_path = os.path.abspath(filepath)
-	with open_scope(
-			abs_path, STACK_H5PY, "r", where="read_eval_energies"), \
-			h5py.File(abs_path, "r") as h5:
-		return _eval_metadata_from_open_h5(h5)
 
 
 
@@ -2008,247 +1939,6 @@ def append_eqp_assembly_receipt_h5(
 	return abs_path
 
 
-def read_eqp_assembly_receipt(filepath):
-	"""Read and validate a v5 charge-only or v6 component-aware receipt.
-
-	No canonical/candidate dataset means a legacy artifact.  A candidate or
-	unknown/partial canonical schema refuses rather than falling back to raw.
-	v6 additionally authenticates aggregate ``Hdir`` against persisted scalar
-	``V_H`` and transverse ``H_T``; v5 refuses those companions entirely.
-	"""
-	abs_path = os.path.abspath(filepath)
-
-	def _text(value):
-		return value.decode("utf-8") if isinstance(value, bytes) else str(value)
-
-	with open_scope(
-			abs_path, STACK_H5PY, "r",
-			where="read_eqp_assembly_receipt"), \
-			h5py.File(abs_path, "r") as h5:
-		expected = (h5[EQP_ASSEMBLY_EXPECTED_DATASET][()]
-			if EQP_ASSEMBLY_EXPECTED_DATASET in h5 else None)
-		canonical_present = EQP_ASSEMBLY_DATASET in h5
-		curve_present = EQP_ASSEMBLY_C_OMEGA_DATASET in h5
-		components_present = EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET in h5
-		raw_component_present = any(
-			name in h5 for name in SIGMA_DIRECT_COMPONENT_DATASETS)
-		candidate_names = [name for name in (
-			EQP_ASSEMBLY_CANDIDATE_DATASET,
-			EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET,
-			EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET) if name in h5]
-		new_schema = bool(
-			expected is not None or canonical_present or curve_present
-			or components_present or raw_component_present or candidate_names)
-		present, bad = _raw_operator_stamp_errors(h5)
-		if new_schema:
-			# Every read that claims any new-schema state validates EVERY raw
-			# operator cube first.  A complete receipt never blesses a missing,
-			# unknown, or partially stamped operator payload.
-			if not present or bad:
-				raise ValueError(
-					f"{os.path.basename(abs_path)} has a new EQP schema but "
-					f"partial/unknown raw operator state on {bad or 'no cubes'}.")
-		else:
-			# New creating writers stamp every raw operator cube.  That state
-			# makes the receipt mandatory, so a crash between cube close and the
-			# output append refuses instead of masquerading as a legacy file.
-			tagged = [name for name in present if (
-				SIGMA_OPERATOR_STATE_ATTR in h5[name].attrs
-				or SIGMA_OPERATOR_STATE_VERSION_ATTR in h5[name].attrs)]
-			if tagged:
-				if bad:
-					raise ValueError(
-						f"{os.path.basename(abs_path)} has partial/unknown raw "
-						f"operator-state stamps on {bad}.")
-				raise ValueError(
-					f"{os.path.basename(abs_path)} is a new raw-operator artifact "
-					f"but {EQP_ASSEMBLY_DATASET} is missing; the run stopped "
-					"before its live EQP assembly receipt closed.")
-			return None
-		try:
-			expected_version = int(expected)
-		except (TypeError, ValueError):
-			expected_version = -1
-		valid_versions = (
-			EQP_ASSEMBLY_SCHEMA_VERSION,
-			EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION,
-		)
-		if expected is None or expected_version not in valid_versions:
-			raise ValueError(
-				f"{os.path.basename(abs_path)} has unknown/partial EQP receipt "
-				f"expectation {expected!r}; expected "
-				f"{valid_versions[0]} or {valid_versions[1]}.")
-		component_aware = (
-			expected_version == EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION)
-		raw_components = _validate_raw_direct_component_contract(
-			h5, required=component_aware)
-		if raw_components != component_aware:
-			raise ValueError(
-				f"schema-v{expected_version} receipt/raw component mismatch: "
-				f"raw component-aware={raw_components}.")
-		if candidate_names:
-			raise ValueError(
-				f"{os.path.basename(abs_path)} has an interrupted "
-				f"candidate write {candidate_names}; refusing a stale or "
-				"partial EQP reconstruction.")
-		if (not canonical_present or not curve_present
-				or components_present != component_aware):
-			missing = [name for name, there in (
-				(EQP_ASSEMBLY_DATASET, canonical_present),
-				(EQP_ASSEMBLY_C_OMEGA_DATASET, curve_present),
-				(EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET,
-				 components_present or not component_aware)) if not there]
-			extra = ([] if component_aware or not components_present else
-				[EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET])
-			raise ValueError(
-				f"{os.path.basename(abs_path)} expects an EQP assembly receipt "
-				f"but missing={missing}, unexpected={extra}.")
-		ds = h5[EQP_ASSEMBLY_DATASET]
-		if not isinstance(ds, h5py.Dataset):
-			raise ValueError(f"{EQP_ASSEMBLY_DATASET} is not an HDF5 dataset.")
-		required_attrs = (
-			EQP_ASSEMBLY_SCHEMA_VERSION_ATTR,
-			EQP_ASSEMBLY_STATE_ATTR,
-			EQP_ASSEMBLY_HX_BASIS_ATTR,
-			EQP_ASSEMBLY_C_BASIS_ATTR,
-			EQP_ASSEMBLY_K_STORAGE_ATTR,
-			EQP_ASSEMBLY_FILE_ROWS_ATTR,
-			EQP_ASSEMBLY_HARTREE_STATE_ATTR,
-			EQP_ASSEMBLY_BAND_START_ATTR,
-			EQP_ASSEMBLY_BAND_STOP_ATTR,
-			EQP_ASSEMBLY_DEGENERACY_POLICY_ATTR,
-			EQP_ASSEMBLY_DEGENERACY_TOL_ATTR,
-		)
-		missing_attrs = [name for name in required_attrs if name not in ds.attrs]
-		if missing_attrs:
-			raise ValueError(
-				f"partial {EQP_ASSEMBLY_DATASET}: missing attrs {missing_attrs}.")
-		version = int(ds.attrs[EQP_ASSEMBLY_SCHEMA_VERSION_ATTR])
-		state = _text(ds.attrs[EQP_ASSEMBLY_STATE_ATTR])
-		hx_basis = _text(ds.attrs[EQP_ASSEMBLY_HX_BASIS_ATTR])
-		c_basis = _text(ds.attrs[EQP_ASSEMBLY_C_BASIS_ATTR])
-		k_storage = _text(ds.attrs[EQP_ASSEMBLY_K_STORAGE_ATTR])
-		hartree_state = _text(ds.attrs[EQP_ASSEMBLY_HARTREE_STATE_ATTR])
-		policy = _text(ds.attrs[EQP_ASSEMBLY_DEGENERACY_POLICY_ATTR])
-		if version != expected_version:
-			raise ValueError(
-				f"{EQP_ASSEMBLY_DATASET} schema {version} disagrees with "
-				f"expected marker {expected_version}.")
-		if (state != EQP_ASSEMBLY_STATE_READY
-				or hx_basis != EQP_ASSEMBLY_DFT_BAND_BASIS
-				or c_basis != EQP_ASSEMBLY_DFT_BAND_BASIS
-				or k_storage != EQP_ASSEMBLY_K_STORAGE_WEDGE
-				or hartree_state != EQP_ASSEMBLY_HARTREE_STATE_LIVE_GSPACE
-				or policy not in EQP_ASSEMBLY_DEGENERACY_POLICIES):
-			raise ValueError(
-				f"unsupported {EQP_ASSEMBLY_DATASET} semantics: state={state!r}, "
-				f"H/X basis={hx_basis!r}, C basis={c_basis!r}, "
-				f"k_storage={k_storage!r}, "
-				f"hartree_state={hartree_state!r}, policy={policy!r}.")
-		values = np.asarray(ds[()], dtype=np.complex128)
-		c_omega = np.asarray(
-			h5[EQP_ASSEMBLY_C_OMEGA_DATASET][()], dtype=np.complex128)
-		h_components = (np.asarray(
-			h5[EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET][()],
-			dtype=np.complex128) if component_aware else None)
-		file_rows = np.asarray(
-			ds.attrs[EQP_ASSEMBLY_FILE_ROWS_ATTR], dtype=np.int64)
-		b0 = int(ds.attrs[EQP_ASSEMBLY_BAND_START_ATTR])
-		b1 = int(ds.attrs[EQP_ASSEMBLY_BAND_STOP_ATTR])
-		if (b0 < 0 or b1 <= b0 or values.ndim != 3 or values.shape[0] != 3
-				or values.shape[2] != b1 - b0):
-			raise ValueError(
-				f"malformed {EQP_ASSEMBLY_DATASET} shape {values.shape} "
-				f"for band window [{b0},{b1}).")
-		if not np.all(np.isfinite(values)):
-			raise ValueError(f"{EQP_ASSEMBLY_DATASET} contains non-finite values.")
-		if np.any(np.imag(values[:2]) != 0.0):
-			raise ValueError(
-				f"{EQP_ASSEMBLY_DATASET} H/X rows must be exactly real.")
-		if component_aware:
-			if (h_components.shape != (2,) + values.shape[1:]
-					or not np.all(np.isfinite(h_components))):
-				raise ValueError(
-					f"malformed {EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET} "
-					f"shape {h_components.shape}; expected "
-					f"{(2,) + values.shape[1:]}, or non-finite values.")
-			if np.any(np.imag(h_components) != 0.0):
-				raise ValueError(
-					f"{EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET} must be "
-					"exactly real.")
-			_assert_direct_field_sum(
-				np.real(values[0]), np.real(h_components[0]),
-				np.real(h_components[1]), where="persisted EQP receipt")
-		if (c_omega.ndim != 3 or c_omega.shape[1:] != values.shape[1:]
-				or not np.all(np.isfinite(c_omega))):
-			raise ValueError(
-				f"malformed {EQP_ASSEMBLY_C_OMEGA_DATASET} shape "
-				f"{c_omega.shape} for H/X/C {values.shape}, or non-finite values.")
-		omega_rel_ev, omega_reference_ev, omega_reference_provenance = (
-			_omega_metadata_from_open_h5(h5))
-		if omega_rel_ev is None or omega_rel_ev.shape != (c_omega.shape[0],):
-			raise ValueError(
-				f"{EQP_ASSEMBLY_C_OMEGA_DATASET} has {c_omega.shape[0]} omega "
-				f"rows but {OMEGA_DATASET!r} is absent or has shape "
-				f"{None if omega_rel_ev is None else omega_rel_ev.shape}.")
-		if (file_rows.ndim != 1 or file_rows.shape[0] != values.shape[1]
-				or (file_rows.size and np.min(file_rows) < 0)
-				or np.unique(file_rows).size != file_rows.size):
-			raise ValueError(
-				f"malformed {EQP_ASSEMBLY_FILE_ROWS_ATTR} {file_rows.tolist()} "
-				f"for {values.shape[1]} file-wedge rows.")
-		tol_ry = float(ds.attrs[EQP_ASSEMBLY_DEGENERACY_TOL_ATTR])
-		if not np.isfinite(tol_ry) or tol_ry < 0.0:
-			raise ValueError(
-				f"malformed {EQP_ASSEMBLY_DEGENERACY_TOL_ATTR}={tol_ry!r}.")
-		eval_rel_ev, eval_provenance, eval_coverage = (
-			_eval_metadata_from_open_h5(h5))
-		if eval_rel_ev is not None and eval_rel_ev.shape != values.shape[1:]:
-			# The stamp is on the star wedge (the cube writer put it there);
-			# the receipt is on the file wedge.  Pairing them would hand a
-			# star parent's evaluation energies to another member of that
-			# star, which k_irr_rows_for refuses, so this refuses and names
-			# which mismatch it is.
-			diagnosis = ""
-			nk_receipt, nk_eval = int(values.shape[1]), int(eval_rel_ev.shape[0])
-			if nk_eval != nk_receipt:
-				diagnosis = (
-					f"  The stamp has {nk_eval} k rows against the receipt's "
-					f"{nk_receipt}: the stamp is on the cube's STAR wedge and "
-					f"the receipt on the FILE wedge, and pairing them needs the "
-					f"star substitution this module refuses (k_irr_rows_for).  "
-					f"OPEN RULING for a deck whose two wedges differ — stamp "
-					f"the evaluation energies on the file wedge, or declare "
-					f"them star-invariant and unfold: "
-					f"docs/reports/INTEG_CHECKLIST_LANDINGS_2026-08-27.md.")
-			raise ValueError(
-				f"{SIGMA_EVAL_DATASET} has shape {eval_rel_ev.shape}; expected "
-				f"the receipt's file-wedge/window shape {values.shape[1:]}."
-				f"{diagnosis}")
-		return {
-			"hartree_diag_ev": np.real(values[0]),
-			"hartree_scalar_diag_ev": (
-				None if h_components is None else np.real(h_components[0])),
-			"hartree_transverse_diag_ev": (
-				None if h_components is None else np.real(h_components[1])),
-			"sigma_x_diag_ev": np.real(values[1]),
-			"sigma_c_at_dft_diag_ev": values[2],
-			"sigma_c_omega_diag_ev": c_omega,
-			"omega_rel_ev": omega_rel_ev,
-			"omega_reference_ev": omega_reference_ev,
-			"omega_reference_provenance": omega_reference_provenance,
-			"eval_energies_rel_ev": eval_rel_ev,
-			"eval_energies_provenance": eval_provenance,
-			"eval_coverage": eval_coverage,
-			"band_start": b0,
-			"band_stop": b1,
-			"file_wedge_full_bz_rows": file_rows,
-			"degeneracy_policy": policy,
-			"degeneracy_tol_ry": tol_ry,
-			"hartree_exchange_basis": hx_basis,
-			"correlation_basis": c_basis,
-			"schema_version": expected_version,
-		}
 
 
 # ===========================================================================

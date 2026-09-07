@@ -39,7 +39,8 @@ from .bse_ring_comm import (
     ring_matvec_correctness_check,
     ring_matvec_smoke_test,
 )
-from .bse_io import _find_restart_file, _load_ring_subset
+from .bse_io import (_load_ring_subset)
+from file_io.restart_bundle import (_find_restart_file)
 from .bse_serial import (
     apply_bse_hamiltonian_single_device,
     apply_bse_hamiltonian_single_device_jit,

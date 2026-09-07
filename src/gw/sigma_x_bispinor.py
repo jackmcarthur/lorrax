@@ -13,7 +13,7 @@ def compute_sigma_x_bispinor(
     from .cohsex_sigma import _replicate_band_sigma
     from .photon_layout import PhotonBasisLayout, pack_photon_operator
     from .photon_sigma import contract_lorentz_blocks, _TERM_X
-    from .v_q_bispinor import BispinorVqReader
+    from file_io.restart_bundle import (BispinorVqReader)
     from .w_isdf import StaticPhotonResponse
     from .qgrid_symmetry import qgrid_trs_policy_for
     plan = wfns_transverse.green_parent.plan

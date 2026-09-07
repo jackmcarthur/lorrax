@@ -35,8 +35,8 @@ from .bse_serial import compute_pair_amplitude
 from .bse_davidson_helpers import build_bse_exact_diagonal
 import common.timing as timing
 from common.units import RYD_TO_EV
-from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
-                     make_w_densifier, pad_zone_mask_np)
+from .bse_io import (load_bse_data_from_restart_sharded, make_w_densifier, pad_zone_mask_np)
+from file_io.restart_bundle import (_find_restart_file)
 
 jax.config.update("jax_enable_x64", True)
 

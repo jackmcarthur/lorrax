@@ -21,6 +21,8 @@ measure itself is covered in the plain suite.
 """
 from __future__ import annotations
 
+from file_io import restart_bundle
+
 import numpy as np
 import pytest
 
@@ -111,7 +113,7 @@ def _small_nontda_data(gnppm_session, *, n_val=2, n_cond=2):
     already known to satisfy."""
     from bse import bse_io
     input_path = str(gnppm_session.run_dir / gnppm_session.input_name)
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
     data = bse_io.load_bse_data_from_restart_sharded(
         restart, n_val=n_val, n_cond=n_cond, mesh_xy=mesh, input_file=input_path)

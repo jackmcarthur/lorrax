@@ -20,12 +20,17 @@ from file_io.kin_ion import (                                    # noqa: E402
     K_STORAGE_VERSION, K_STORAGE_VERSION_ATTR, N_SYM_SPATIAL_ATTR,
     SYM_IDX_DATASET,
 )
-from file_io.qp_wfn import (                                     # noqa: E402
-    QP_ENERGY_DEFINITION_ATTR, QP_ROT_FULL_BZ_DATASETS,
-    QP_ROT_K_DATASETS, QP_ROTATIONS_K_STORAGE, QP_SOLVER_ATTR,
-    authenticate_qp_rotations_source_wfn, qp_rotations_k_storage,
-    read_qp_rotations_full_bz, write_qp_rotations_h5,
+from file_io.qp_wfn import (
+    QP_ENERGY_DEFINITION_ATTR,
+    QP_ROT_FULL_BZ_DATASETS,
+    QP_ROT_K_DATASETS,
+    QP_ROTATIONS_K_STORAGE,
+    QP_SOLVER_ATTR,
+    authenticate_qp_rotations_source_wfn,
+    qp_rotations_k_storage,
+    write_qp_rotations_h5,
 )
+from file_io.restart_bundle import (read_qp_rotations_full_bz)
 from file_io.sigma_output import SIGMA_EVAL_PROVENANCE_ATTR       # noqa: E402
 
 

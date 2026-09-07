@@ -27,12 +27,13 @@ from file_io.mf_header import copy_mf_header
 from zeta_loader import ZetaLoader  # noqa: E402
 ZetaReader = ZetaLoader  # merged 2026-07-09; slab API lives on ZetaLoader
 from gw.v_q_bispinor import (
-    BispinorVqReader,
     V_QMUNU_FORMAT,
     compute_V_q_bispinor_g_flat_to_h5,
     _make_per_q_v_builder_for_tile,
-    UNIQUE_TILES, tile_dataset_name,
+    UNIQUE_TILES,
+    tile_dataset_name,
 )
+from file_io.restart_bundle import (BispinorVqReader)
 from tests.test_file_io import _make_fake_wfn
 
 

@@ -574,7 +574,7 @@ def test_restart_refuses_a_changed_chi_count_and_allows_a_changed_sigma():
     """
     h5py = pytest.importorskip("h5py")
     import tempfile
-    from file_io.tagged_arrays import assert_restart_window_matches
+    from file_io.restart_bundle import (assert_restart_window_matches)
 
     def _file(tmp, window, split):
         path = os.path.join(tmp, "restart.h5")

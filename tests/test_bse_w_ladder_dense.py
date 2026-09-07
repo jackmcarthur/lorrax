@@ -34,6 +34,8 @@ N = nc*nv*nk is a few tens, so the dense build and the 2N x 2N solve are trivial
 """
 from __future__ import annotations
 
+from file_io import restart_bundle
+
 import numpy as np
 import pytest
 
@@ -65,7 +67,7 @@ def ladder_payload(gnppm_session):
     ``V_qmunu[q]`` tiles ``build_finite_q_data`` swaps in.
     """
     input_path = str(gnppm_session.run_dir / gnppm_session.input_name)
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
     data = bse_io.load_bse_data_from_restart_sharded(
         restart, n_val=2, n_cond=2, mesh_xy=mesh, input_file=input_path,

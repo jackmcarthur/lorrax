@@ -34,8 +34,8 @@ from .bse_ring_comm import (build_bse_ring_matvec, build_bse_ring_matvec_full,
                             create_mesh_xy_from_flags, make_bse_shardings)
 from .bse_feast import (estimate_spectral_bounds_sharded,
                         _build_gmres_data_fp32, ensure_W_R)
-from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
-                     pad_zone_mask_np)
+from .bse_io import (load_bse_data_from_restart_sharded, pad_zone_mask_np)
+from file_io.restart_bundle import (_find_restart_file)
 import common.timing as timing
 from common.units import RYD_TO_EV
 

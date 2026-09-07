@@ -6,6 +6,8 @@ process, otherwise ``jnp.complex128`` silently degrades to complex64
 into one process, so the first import wins — set the env here.
 """
 
+from file_io import restart_bundle
+
 import json as _json
 import os
 import sys as _sys
@@ -959,7 +961,7 @@ def bse_dense_state(gnppm_session, tmp_path_factory):
         tmp_path_factory.mktemp("bse_dense") / "gnppm_debug",
         tmp_from=gnppm_session.run_dir)
     input_path = str(run_dir / "gnppm_test.in")
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     return bse_io._load_ring_subset(
         restart, n_val=2, n_cond=2, px=1, py=1, input_file=input_path)
 

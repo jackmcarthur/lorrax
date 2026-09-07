@@ -39,7 +39,8 @@ jax.config.update("jax_enable_x64", True)
 from common.fft_helpers import make_sharded_ifftn_3d
 from solvers.davidson import davidson, warmup_davidson_jit
 
-from bse.bse_io import _find_restart_file, load_bse_data_from_restart_sharded
+from bse.bse_io import (load_bse_data_from_restart_sharded)
+from file_io.restart_bundle import (_find_restart_file)
 from bse.bse_ring_comm import create_mesh_2d, make_bse_shardings
 from bse.bse_simple import build_bse_simple_matvec
 from bse.bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace

@@ -141,10 +141,8 @@ from common.progress import LoopProgress
 from common.provenance import lorrax_version, provenance_header
 from common.scientific_output import abs_path, band_range, policy
 from runtime.production_stream import ProductionStdout
-from .bse_io import (_find_restart_file, load_bse_data_from_restart_sharded,
-                     decimate_W_q_to_subgrid, make_w_densifier,
-                     build_w_head_channel, resolve_w_head_densify,
-                     _resolve_head_params, PAD_EPS_GUARD_RY)
+from .bse_io import (load_bse_data_from_restart_sharded, decimate_W_q_to_subgrid, make_w_densifier, build_w_head_channel, resolve_w_head_densify, _resolve_head_params, PAD_EPS_GUARD_RY)
+from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
 from .bse_serial import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
@@ -440,16 +438,15 @@ def build_head_dipole_operand(args, nk, nc_pad, nv_pad, n_val, n_cond,
     the tracked fixtures were re-cut on it, so the provenance stamp is read
     and logged rather than assumed.
     """
-    from .absorption_common import (build_dipole_vector_bse, load_dipole_h5,
-                                    slice_dipole_to_bse_window)
+    from .absorption_common import (build_dipole_vector_bse, slice_dipole_to_bse_window)
+    from file_io.restart_bundle import (load_dipole_h5)
     from .bse_io import resolve_n_occ
 
     path = args.dipole if getattr(args, "dipole", None) else \
         os.path.join(os.path.dirname(os.path.abspath(args.input)), "dipole.h5")
     dipole_cart, deltaE, attrs = load_dipole_h5(path)
-    with h5py.File(path, "r") as f:
-        sign = f.attrs.get("prov_vnl_velocity_sign", None)
-        skip_vnl = f.attrs.get("skip_vnl", None)
+    sign = attrs.get("prov_vnl_velocity_sign")
+    skip_vnl = attrs.get("skip_vnl")
     if int(attrs["nk"]) != int(nk):
         raise SystemExit(
             f"{path} has nk={attrs['nk']} but the BSE grid has nk={nk}.  The "
@@ -1389,12 +1386,10 @@ def _resolve_native_w_head(restart_file, input_file, wfn, *, log=print):
     case the caller runs the plain densifier and nothing is lost.
     """
     try:
-        import h5py
-        with h5py.File(restart_file, "r") as f:
-            whead_restart = (np.asarray(f["whead"][:], dtype=np.complex128)
-                             if "whead" in f else None)
-            w0_ready = bool(f["W0_qmunu"].attrs.get("W0_ready", False)
-                            if "W0_qmunu" in f else False)
+        from file_io.restart_bundle import read_metadata
+        header = read_metadata(restart_file)
+        whead_restart = header["screened_head"]
+        w0_ready = header["screened_ready"]
     except Exception as exc:
         log(f"[coarse-W] cannot read the restart's head ({exc}); "
             f"falling back to w_head_densify=legacy for this run")
@@ -1644,9 +1639,8 @@ def main(argv=None):
         refuse_eqp_on_a_qp_wfn(args.input, args.eqp)
         from .bse_io import (apply_eqp_and_reslice_bands, apply_eqp_corrections,
                              resolve_n_occ)
-        import h5py as _h5py
-        with _h5py.File(restart_file, "r") as _f:
-            _enk_dft_full = np.asarray(_f["enk_full"][:])
+        from file_io.restart_bundle import read_metadata
+        _enk_dft_full = read_metadata(restart_file)["energies"]
         n_occ_in = resolve_n_occ(_enk_dft_full, input_file=args.input)
         data["eps_v"], data["eps_c"], n_occ_qp = apply_eqp_and_reslice_bands(
             restart_file, args.eqp, args.input, n_val, n_cond, n_occ_in,

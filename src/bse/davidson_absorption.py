@@ -37,15 +37,11 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from solvers.davidson import davidson, warmup_davidson_jit
-from .absorption_common import (
-    exciton_dipole_projections, load_dipole_h5, slice_dipole_to_bse_window,
-    write_eigenvalues_dat,
-)
+from .absorption_common import (exciton_dipole_projections, slice_dipole_to_bse_window, write_eigenvalues_dat)
+from file_io.restart_bundle import (load_dipole_h5)
 from .bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace
-from .bse_io import (
-    _find_restart_file,
-    load_bse_data_from_restart_sharded, resolve_n_occ,
-)
+from .bse_io import (load_bse_data_from_restart_sharded, resolve_n_occ)
+from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_2d, make_bse_shardings
 from .bse_simple import build_bse_simple_matvec
 from common.collectives import gather_to_host

@@ -67,8 +67,8 @@ import jax.numpy as jnp                                         # noqa: E402
 
 from common.collectives import (process_count, process_rank,    # noqa: E402
                                 resolve_mesh, barrier)
-from file_io.tagged_arrays import (write_restart_state_to_h5,   # noqa: E402
-                                   load_restart_state_from_h5)
+from file_io.tagged_arrays import (write_restart_state_to_h5)
+from file_io.restart_bundle import (load_restart_state_from_h5)
 from runtime.padding import padded_mu_extent                    # noqa: E402
 
 NS = int(os.environ.get("RESTART_NS", "2"))

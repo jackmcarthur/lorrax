@@ -413,20 +413,6 @@ def compare_coulomb_policy(stamped: dict | None, running: dict) -> list:
             for k in keys if stamped.get(k, "<absent>") != running.get(k, "<absent>")]
 
 
-def read_coulomb_policy_from_h5(filename) -> dict | None:
-    """Read the stamp off a restart file with serial h5py; ``None`` if absent.
-
-    Scalar-class metadata, read the same way ``assert_restart_window_matches``
-    reads the band window — no SlabIO handle, no collective, safe to call on
-    any rank before the tensors move.
-    """
-    try:
-        with h5py.File(filename, "r") as f:
-            if COULOMB_POLICY_DATASET not in f:
-                return None
-            return parse_coulomb_policy(f[COULOMB_POLICY_DATASET][()])
-    except (OSError, KeyError):
-        return None
 
 
 #: The group ``gw.downfold_run`` stamps on a compressed bundle.  Named here,
@@ -437,95 +423,10 @@ def read_coulomb_policy_from_h5(filename) -> dict | None:
 DOWNFOLD_PROVENANCE_GROUP = "downfold_provenance"
 
 
-def read_downfold_provenance(filename) -> dict | None:
-    """The ``downfold_provenance`` group of a restart bundle; ``None`` if absent.
-
-    ``None`` means "natively fitted, as far as this file says" — a bundle
-    written by ``gw.gw_jax`` carries no such group, and so does one written
-    by a downfold predating the stamp.  Both are read as not-downfolded,
-    which is the safe direction: every consumer's existing behaviour is what
-    it gets.
-
-    WHY A READER LIVES HERE AT ALL.  A downfolded bundle is deliberately
-    indistinguishable from a natively fitted one BY SHAPE — that is what
-    makes it a drop-in for ``bse.bse_jax``.  But two facts about it are not
-    derivable from shape and are load-bearing for any consumer that has to
-    build something NEW in the same ISDF basis rather than only read the
-    stored tensors: which centroid table the parent basis came from, and
-    which of the parent's centroid rows survived.  ``bse.exciton_bands``
-    needs both (its htransform leg fits ψ in the PARENT basis and slices the
-    result to the kept rows), and this is the one place either is recorded.
-
-    Serial h5py, no SlabIO handle, no collective — the same contract as
-    :func:`read_coulomb_policy_from_h5`, so it is safe to call on any rank
-    before the tensors move.
-
-    Returns the group's attributes as a plain dict (bytes decoded to str),
-    plus ``keep_idx`` / ``retained_rank_per_q`` as numpy arrays when present.
-    """
-    try:
-        with h5py.File(filename, "r") as f:
-            if DOWNFOLD_PROVENANCE_GROUP not in f:
-                return None
-            g = f[DOWNFOLD_PROVENANCE_GROUP]
-            out = {}
-            for k, v in g.attrs.items():
-                out[k] = v.decode("utf-8") if isinstance(v, bytes) else v
-            for name in ("keep_idx", "retained_rank_per_q"):
-                if name in g:
-                    out[name] = np.asarray(g[name][:])
-            return out
-    except (OSError, KeyError):
-        return None
 
 
-def describe_coulomb_policy_stamp(filename) -> str:
-    """One line naming the Coulomb policy a restart file's tensors carry.
-
-    For readers that CONSUME W rather than rebuild V — the BSE, which by
-    its own note "does NOT compute W, it READS it off the GW restart".
-    They have no Coulomb config of their own to compare against, so the
-    honest disclosure is the stored policy itself, not a match verdict.
-    Without this line a BSE run's log has no record of which averaging
-    convention its screening was built under, which is exactly the gap
-    that made the cross-code residual arguable in the first place.
-    """
-    stamped = read_coulomb_policy_from_h5(filename)
-    if stamped is None:
-        return ("  [restart stamp] Coulomb-kernel policy: NOT STAMPED "
-                "(GW restart predates the stamp) - the screening in this "
-                "file was built under an unrecorded averaging convention.")
-    return ("  [restart stamp] screening built under Coulomb policy: "
-            + ";".join(f"{k}={v}" for k, v in stamped.items()))
 
 
-def describe_coulomb_policy_match(filename, cfg, meta=None) -> str:
-    """One line for a restart log: matched, mismatched, or legacy-unstamped.
-
-    Returns the text; the caller prints it, so this stays importable from
-    the BSE side (which reads the same file and owes the same disclosure)
-    without either side owning the other's print function.
-    """
-    running = coulomb_policy_from_config(cfg, meta)
-    stamped = read_coulomb_policy_from_h5(filename)
-    if stamped is None:
-        return ("  [restart stamp] Coulomb-kernel policy: NOT STAMPED "
-                "(file predates the stamp). Read as legacy — the stored V/W "
-                "were built under whatever averaging policy that run used, "
-                "and this run cannot tell which. Running policy is "
-                f"{format_coulomb_policy(running)}")
-    diffs = compare_coulomb_policy(stamped, running)
-    if not diffs:
-        return (f"  [restart stamp] Coulomb-kernel policy matches: "
-                f"{format_coulomb_policy(stamped)}")
-    detail = "; ".join(f"{k}: file={a!r} run={b!r}" for k, a, b in diffs)
-    return (
-        "  [restart stamp] WARNING - Coulomb-kernel policy MISMATCH between "
-        "this restart file and the running config. The restart reuses "
-        "V_qmunu verbatim and never re-runs compute_V_q, so the stored "
-        "tensors carry the FILE's policy and every other guard will pass. "
-        f"Differences -> {detail}. Rerun with restart = false if the "
-        "running policy is the one you meant.")
 
 
 def write_restart_state_to_h5(
@@ -533,10 +434,6 @@ def write_restart_state_to_h5(
     *,
     n_rmu_logical: int,
     V_qmunu=None,
-    psi_full_y=None,
-    psi_full_y_mun=None,
-    psi_full_y_transverse=None,
-    psi_full_y_transverse_mun=None,
     psi_parent_y=None,
     psi_parent_y_mun=None,
     psi_parent_y_transverse=None,
@@ -582,29 +479,11 @@ def write_restart_state_to_h5(
     placeholder.  Passing ``W0_qmunu`` directly flips ``W0_ready`` to
     True.
 
-    ``psi_full_y_mun`` (``low_mem_bands = true`` only) is the SECOND face
-    of the two-face carrier (``gw.wavefunction_bundle`` ``psi_mun``,
-    ``(nk, s, μ, n)``) — ADDITIVE to ``psi_full_y``, which under
-    ``low_mem_bands`` is sourced from the FIRST face (``psi_nmu``) rather
-    than the legacy ``psi_yr``.  Both share ``psi_full_y``'s on-disk μ
-    clip (``n_rmu_logical``); nothing else about the ``psi_full_y``
-    schema changes, so BSE/downfold — which read only ``psi_full_y`` at
-    the legacy y-only spec — are unaffected regardless of which layout
-    wrote it.  Writing two datasets instead of one buys the reader a
-    direct hyperslab for EACH face and therefore zero reshard collectives
-    on restart read (see ``file_io.load_restart_state_from_h5``,
-    ``low_mem_bands=True``); the cost is doubled ψ bytes on disk.
-
-    ``psi_full_y_transverse`` (bispinor only) is the σ^B-side ψ sampled
-    at the TRANSVERSE centroid set — the per-channel second ψ dataset
-    the bispinor restart round-trip needs.  Its μ axis is clipped by
-    ``n_rmu_transverse_logical`` (the transverse centroid count, which
-    differs from the charge ``n_rmu_logical``).  The count is also
-    stamped as the ``n_rmu_transverse_logical`` dataset:
-    ``read_restart_state_from_h5`` cross-checks it against the stored
-    dataset's μ extent at load (torn/hand-edited-file guard); the
-    loader itself re-pads from the dataset shape
-    (``load_restart_state_from_h5`` → ``n_rmu_transverse_disk``).
+    ``psi_parent_y`` and ``psi_parent_y_mun`` store the two raw-parent
+    orientations, (parent_k, band, spin, centroid) and
+    (parent_k, spin, centroid, band). Both memory layouts write these same
+    logical arrays. Current-family companions use their own centroid extent.
+    ``file_io.restart_bundle`` restores the requested sharding on read.
 
     ``qirr`` IS THE ONE RESOLUTION FOR BOTH TENSORS.  A
     ``gw.restart_q_storage.RestartQStorage`` whose ``.store_wedge`` is True
@@ -616,7 +495,7 @@ def write_restart_state_to_h5(
     full-BZ placeholder, no stamp, no table group.
 
     ``qp_state_source_record`` identifies the WFN whose matched
-    ``psi_full_y`` / ``enk_full`` state this restart stores.  Its format and
+    ``psi_parent_y`` / ``enk_full`` state this restart stores.  Its format and
     serialization belong only to :mod:`file_io.qp_wfn`; this writer transports
     the opaque bytes through the incumbent SlabIO metadata path on ``mode=w``.
     """
@@ -672,8 +551,7 @@ def write_restart_state_to_h5(
             loaded_band_tag.divisor, name=loaded_band_tag.name)
     elif mode != "w" and any(
             arr is not None for arr in (
-                psi_full_y, psi_full_y_mun, psi_full_y_transverse,
-                psi_full_y_transverse_mun, psi_parent_y, psi_parent_y_mun,
+                psi_parent_y, psi_parent_y_mun,
                 psi_parent_y_transverse, psi_parent_y_transverse_mun, enk_full)):
         # Append calls intentionally do not repeat band_slices.  A schema-2
         # file's band_window is logical, so it is sufficient to clip the later
@@ -697,9 +575,7 @@ def write_restart_state_to_h5(
                     mesh if mesh is not None else carrier_divisor)
         barrier("restart_band_receipt_after_read")
 
-    if ((psi_full_y_transverse is not None
-         or psi_full_y_transverse_mun is not None
-         or psi_parent_y_transverse is not None
+    if ((psi_parent_y_transverse is not None
          or psi_parent_y_transverse_mun is not None)
             and n_rmu_transverse_logical is None):
         raise ValueError(
@@ -747,8 +623,6 @@ def write_restart_state_to_h5(
     _plan("S_qmunu", S_qmunu, mu_axes=(-2, -1))
     _plan("V0_noG0_munu", V0_noG0_munu, mu_axes=(-2, -1))
     _plan("G0_mu_nu", G0_mu_nu, mu_axes=(-1,))
-    _plan("psi_full_y", psi_full_y, mu_axes=(-1,), band_axes=(1,))
-    _plan("psi_full_y_mun", psi_full_y_mun, mu_axes=(-2,), band_axes=(-1,))
     # Parents-only storage (gw_init): the raw-parent faces in CANONICAL
     # centroid order, n_parent = k_irr rows, and nothing on the full BZ.
     # ``psi_parent_k_rows`` names the full-k row each parent IS
@@ -772,10 +646,6 @@ def write_restart_state_to_h5(
     _plan("psi_parent_y_transverse_mun", psi_parent_y_transverse_mun,
           mu_axes=(-2,), n_logical=n_T, band_axes=(-1,))
     _plan("enk_full", enk_full, band_axes=(-1,))
-    _plan("psi_full_y_transverse", psi_full_y_transverse,
-          mu_axes=(-1,), n_logical=n_T, band_axes=(1,))
-    _plan("psi_full_y_transverse_mun", psi_full_y_transverse_mun,
-          mu_axes=(-2,), n_logical=n_T, band_axes=(-1,))
     _plan("W0_qmunu", W0_qmunu, mu_axes=(-2, -1))
 
     if init_W0 and W0_qmunu is None:
@@ -813,7 +683,7 @@ def write_restart_state_to_h5(
         # leave the attr unset; BSE falls back to reading WFN.
         if kgrid is not None and mode == "w":
             io.write_attr("kgrid", np.asarray(kgrid, dtype=np.int64))
-        # BAND-WINDOW PROVENANCE.  V_qmunu / psi_full_y / enk_full are all
+        # BAND-WINDOW PROVENANCE.  V_qmunu / psi_parent_y / enk_full are all
         # indexed by the band window they were BUILT under; a restart that
         # changes nval/ncond/nband re-reads them under a different window and
         # silently misindexes Sigma -- no crash, just wrong physics (job
@@ -890,10 +760,8 @@ def write_restart_state_to_h5(
         _write("S_qmunu", S_qmunu)
         _write("V0_noG0_munu", V0_noG0_munu)
         _write("G0_mu_nu", G0_mu_nu)
-        _write("psi_full_y", psi_full_y)
         # (nk, s, μ, n): μ is axis -2, not -1 — the mun face's axis order
         # differs from every other dataset this writer knows about.
-        _write("psi_full_y_mun", psi_full_y_mun)
         # Parents-only storage: the raw-parent faces (k_irr rows), same
         # two axis orders as the full-k pair above.
         _write("psi_parent_y", psi_parent_y)
@@ -904,17 +772,7 @@ def write_restart_state_to_h5(
         # logical extent (its own centroid count, not n_rmu_logical).
         _write("psi_parent_y_transverse", psi_parent_y_transverse)
         _write("psi_parent_y_transverse_mun", psi_parent_y_transverse_mun)
-        if psi_full_y_transverse is not None or psi_parent_y_transverse is not None:
-            _write("psi_full_y_transverse", psi_full_y_transverse)
-            # Face layout (low_mem_bands): the ADDITIVE second face of
-            # the transverse carrier, mirroring psi_full_y_mun exactly
-            # ((nk, s, μ_T, n) — μ at axis -2).  Written only when the
-            # caller holds a face-layout transverse bundle; a legacy
-            # caller passes None and the file stays byte-identical to
-            # the pre-face schema.
-            _write("psi_full_y_transverse_mun", psi_full_y_transverse_mun)
-            # Stamped for the load-time extent cross-check in
-            # read_restart_state_from_h5.
+        if psi_parent_y_transverse is not None:
             io.write_attr("n_rmu_transverse_logical", np.int64(n_T))
 
         # W0_qmunu: either write the real data or pre-allocate an
@@ -1214,848 +1072,35 @@ def write_head_scalars_to_h5(
     rank0_transaction(filename, stage="restart.head_scalars", write=_write_heads)
 
 
-def assert_restart_window_matches(filename, band_slices=None,
-                                 n_rmu_logical=None) -> None:
-    """Refuse a restart whose tensors were built under a DIFFERENT band
-    window or centroid count.
 
-    ``V_qmunu``, ``psi_full_y`` and ``enk_full`` are all indexed by the band
-    window in force when they were written.  Reusing them under a changed
-    ``nval``/``ncond``/``nband`` misindexes Sigma with no shape error and no
-    crash — job 7874375 reused window-70 tensors at window 80 and produced a
-    QP gap of -135 eV while every stage reported success.  This turns that
-    into a loud, actionable failure naming BOTH windows.
 
-    Files written before this attr existed carry no ``band_window``; those
-    are passed through with no check (back-compat), since refusing them would
-    strand existing restart files.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def write_parent_wavefunctions(filename, psi, *, n_rmu_logical, mesh):
+    """Persist an unreduced parent set in both canonical face orientations.
+
+    ``psi`` is (parent_k, band, spin, centroid) in canonical centroid order.
+    An unreduced downfold has every k as a parent and needs no new k action.
     """
-    with h5py.File(filename, "r") as f:
-        from .commit_state import assert_committed
-        assert_committed(f, path=filename)
-        stored_w = np.asarray(f["band_window"]).tolist() if "band_window" in f else None
-        stored_split = (np.asarray(f["band_window_split"]).tolist()
-                        if "band_window_split" in f else None)
-        stored_schema = (
-            int(np.asarray(f[BAND_WINDOW_SCHEMA_DATASET])[()])
-            if BAND_WINDOW_SCHEMA_DATASET in f else None)
-        stored_carrier = (
-            np.asarray(f[BAND_WINDOW_CARRIER_DATASET]).tolist()
-            if BAND_WINDOW_CARRIER_DATASET in f else None)
-        stored_mu = (int(np.asarray(f["n_rmu_logical"])[()])
-                     if "n_rmu_logical" in f else None)
-
-    if stored_schema is not None:
-        if stored_schema != BAND_WINDOW_SCHEMA_VERSION:
-            raise ValueError(
-                f"Restart file {filename} has unsupported band-window schema "
-                f"{stored_schema}; this reader supports "
-                f"{BAND_WINDOW_SCHEMA_VERSION}.")
-        if stored_w is None or stored_carrier is None or stored_split is None:
-            raise ValueError(
-                f"Restart file {filename} declares band-window schema "
-                f"{stored_schema} but is missing band_window, "
-                f"band_window_split, or {BAND_WINDOW_CARRIER_DATASET}. The "
-                "geometry receipt is torn.")
-        if len(stored_w) != 5 or len(stored_carrier) != 5:
-            raise ValueError(
-                f"Restart file {filename} has malformed band-window receipts: "
-                f"logical={stored_w}, carrier={stored_carrier}; expected two "
-                "five-edge windows.")
-        logical = tuple(int(v) for v in stored_w)
-        carrier = tuple(int(v) for v in stored_carrier)
-        if logical[:4] != carrier[:4] or carrier[4] < logical[4]:
-            raise ValueError(
-                f"Restart file {filename} has inconsistent logical/carrier "
-                f"band receipts: logical={logical}, carrier={carrier}. The "
-                "carrier may add only a zero-pad tail above the logical b4.")
-
-    # THE χ COUNT MUST MATCH; THE Σ COUNT NEED NOT, and the asymmetry is the
-    # point.  Every tensor in this file is a function of the SCREENING side or
-    # of the loaded extent: ``V_qmunu`` / ``W0_qmunu`` are built from the χ0
-    # band sum, ``psi_full_y`` / ``enk_full`` / ζ span [b0, b4) =
-    # max(chi, sigma) — which ``band_window``'s b4 already pins.  NOTHING on
-    # disk is a function of ``number_bands_sigma``: Σ slices [0, b4_sigma) out
-    # of tensors that already exist.
-    #
-    # So a Σ-count sweep at fixed χ reuses this file legitimately — which is
-    # the case the split exists to make cheap (χ at full bands, Σ short and
-    # extrapolated), and it is why this is a targeted check rather than a
-    # blanket "no restart under a split".  Changing χ is refused, for exactly
-    # the reason the 5-tuple check above exists.
-    if band_slices is not None:
-        want_b4_logical = int(
-            getattr(band_slices, "b4_logical", 0) or band_slices.b4)
-        want_split = (
-            min(int(band_slices.b4_chi), want_b4_logical),
-            min(int(band_slices.b4_sigma), want_b4_logical),
-        )
-        # Legacy split stamps carried the padded larger edge.  Keep their
-        # historical comparison exact: without schema 2 the file cannot prove
-        # whether rows between logical and carrier b4 were zeros or physical.
-        if stored_schema is None:
-            want_split = (int(band_slices.b4_chi),
-                          int(band_slices.b4_sigma))
-        if stored_split is None and stored_w is not None:
-            stored_split = [int(stored_w[4]), int(stored_w[4])]
-        if stored_split is not None and int(stored_split[0]) != want_split[0]:
-            raise ValueError(
-                f"Restart file {filename} was written with a chi0/W band sum "
-                f"topping out at band {int(stored_split[0])}, but this run "
-                f"has number_bands_chi -> band {want_split[0]}.  V_qmunu and "
-                f"W0_qmunu ARE the screening, so reusing them would run this "
-                f"deck's Sigma against the OTHER deck's W and report rc=0 "
-                f"(the same silent-misindex class as the band-window check "
-                f"below; see job 7874375).  Either restore the original "
-                f"number_bands_chi, or set restart=false.  Note that "
-                f"number_bands_SIGMA may be changed freely on a restart: no "
-                f"tensor in this file depends on it.")
-
-    if stored_w is not None and band_slices is not None:
-        want_b4 = int(band_slices.b4)
-        if stored_schema == BAND_WINDOW_SCHEMA_VERSION:
-            want_b4 = int(
-                getattr(band_slices, "b4_logical", 0) or band_slices.b4)
-        want = [int(band_slices.b0), int(band_slices.b1), int(band_slices.b2),
-                int(band_slices.b3), want_b4]
-        stored_stable = [int(stored_w[index]) for index in (0, 1, 2, 4)]
-        want_stable = [want[index] for index in (0, 1, 2, 4)]
-        if stored_stable != want_stable:
-            raise ValueError(
-                f"Restart file {filename} was written under stable restart "
-                f"window (b0,b1,b2,b4)={tuple(stored_stable)} but this run "
-                f"has {tuple(want_stable)}. V_qmunu / psi_full_y / enk_full "
-                f"are indexed by that window, so reusing them would MISINDEX "
-                f"Sigma silently (no crash, wrong QP energies -- see job "
-                f"7874375). Either restore the original nval and loaded/chi "
-                f"band extent, or set restart=false to rebuild the tensors. "
-                f"The Sigma-only b3 edge may change because no restart "
-                f"tensor depends on number_bands_sigma."
-            )
-    if stored_mu is not None and n_rmu_logical is not None:
-        if int(stored_mu) != int(n_rmu_logical):
-            raise ValueError(
-                f"Restart file {filename} was written with n_rmu={stored_mu} "
-                f"but this run has n_rmu={int(n_rmu_logical)}.  The ISDF basis "
-                f"differs, so V_qmunu / psi_full_y are not reusable.  Set "
-                f"restart=false (or point at the matching centroid file)."
-            )
-
-
-def _munu_slab_request(ds_shape, n_rmu_pad):
-    """``(offset, shape, spec)`` for a (…, μ, ν) restart tensor.
-
-    The μ/ν axes are ALWAYS the trailing two — that is the disk contract
-    for ``V_qmunu`` / ``S_qmunu`` / ``V0_noG0_munu`` / ``W0_qmunu``, and
-    it holds across all three historical layouts because the leading axes
-    only ever grew in front:
-
-      * 3-D flat-q ``(nq, μ, ν)``            — what the current pipeline writes
-      * 6-D transitional ``(1, npol, npol, nq, μ, ν)``
-      * 8-D legacy ``(1, npol, npol, nkx, nky, nkz, μ, ν)``
-
-    So one rule covers all three: shard the last two axes on ('x', 'y'),
-    replicate everything in front, and read the leading ``(1, npol, npol)``
-    block at index 0 with extent 1 — which is exactly the ``[0, 0, 0]``
-    the whole-file reader used to take AFTER materialising the array.
-
-    ``bse_io._resolve_munu_reader`` / ``_MunuSlabPlan`` state the same
-    three layouts for the BSE consumer, which additionally needs to
-    select a single q; this one never does, so it does not need the
-    kgrid.  If a third consumer appears, the layout fact should move here
-    (L3) rather than be stated a third time.
-    """
-    ndim = len(ds_shape)
-    if ndim < 2:
-        raise ValueError(
-            f"restart (μ, ν) tensor has rank {ndim} (shape "
-            f"{tuple(ds_shape)}); it must have at least the two trailing "
-            f"μ/ν axes.")
-    # ONLY the two legacy layouts carry the ``(1, npol, npol)`` prefix that
-    # has to be read at index 0.  Everything else -- 2-D ``V0_noG0_munu``,
-    # 3-D flat-q ``V_qmunu``, 5-D ``S_qmunu`` -- keeps every leading axis
-    # whole, so the rank does not need enumerating and a new leading axis
-    # does not need a code change.  (Enumerating it DID cost a bug: the
-    # first version of this listed 3/5/6/8 and refused the 2-D
-    # ``V0_noG0_munu``, caught by restart_sharded_parity at P=4.)
-    lead = 3 if ndim in (6, 8) else 0
-    offset = [0] * ndim
-    shape = [1] * lead + [int(v) for v in ds_shape[lead:-2]]
-    shape += [int(n_rmu_pad), int(n_rmu_pad)]
-    spec = P(*([None] * (ndim - 2) + ["x", "y"]))
-    return tuple(offset), tuple(shape), spec
-
-
-def _collapse_leading(A, ds_shape, mesh_xy):
-    """Drop the legacy ``(1, npol, npol)`` prefix, flattening q if present.
-
-    Local: the leading axes are extent-1 or replicated and μ/ν keep their
-    ('x', 'y') sharding across the reshape, so GSPMD moves nothing.  The
-    output sharding is PINNED rather than inferred — an inferred
-    resharding of an N_mu²-class object would be a silent all-to-all,
-    which is the one thing this reader must never do.  Same reasoning,
-    and the same spelling, as ``bse_io._slabio_read_munu``.
-
-    Only the 6-D/8-D legacy layouts reach the reshape at all; the 3-D
-    flat-q form the current pipeline writes passes straight through.
-    """
-    ndim = len(ds_shape)
-    if ndim not in (6, 8):            # 3-D flat-q, or S_qmunu's own 5-D
-        return A
-    mu, nu = int(A.shape[-2]), int(A.shape[-1])
-    return jax.jit(
-        lambda a: jnp.reshape(a, (-1, mu, nu)),
-        out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))(A)
-
-
-def _check_nspinor(nspinor: int, where: str) -> int:
-    """Gate the ψ spinor axis.  1 (scalar), 2 (spinor), 4 (bispinor).
-
-    THE GATE THE PAD AUDIT ASKED FOR.  The μ axis of every restart tensor
-    is padded to a mesh-divisible extent and the pad rows are exact zeros
-    by construction; the SPINOR axis is not padded by anything here and
-    must not be.  It is read at its on-disk extent and carried through
-    replicated, so a 2-component spinor restart and a 4-component
-    bispinor restart differ only in that extent.
-
-    The failure this refuses is a file whose spinor axis is neither —
-    which, unchecked, would sail through as a perfectly shardable
-    replicated axis and misindex every downstream ψ contraction with no
-    shape error.  ``nspinor`` is small and replicated, so there is no
-    cost to checking it.
-    """
-    ns = int(nspinor)
-    if ns not in (1, 2, 4):
-        raise ValueError(
-            f"{where}: ψ spinor axis has extent {ns}; expected 1 (scalar), "
-            f"2 (spinor) or 4 (bispinor).  The restart file is not one this "
-            f"pipeline wrote — regenerate it (restart = false).")
-    return ns
-
-
-def _qirr_wedge_tables(f):
-    """The unfold tables for each restart tensor stored on the IBZ q WEDGE.
-
-    Returns ``{dataset_name: QirrTables}``, empty for every restart file that
-    stores its tensors on the full BZ — which is every file written before
-    the q_irr format existed and every file a full-BZ run writes today.  An
-    empty answer means the reader below does nothing at all, so the byte path
-    for those files is the one they have always had.
-
-    THIS REPLACED A REFUSAL, and the refusal is worth remembering because it
-    is what the unfold has to be better than.  Until 2026-08-08 this reader
-    did not ask the question; a wedge file came back with a q axis of
-    ``n_q_ibz``, flowed through ``gw_init``'s restart branch untouched, and
-    met a ``W_q`` that screening HAD unfolded at ``gw/cohsex_sigma.py``'s
-    ``W_q - V_q``, dying as ``TypeError: sub got incompatible shapes for
-    broadcasting: (9, 399, 399), (5, 399, 399)``.  ``50db6299`` turned that
-    into a named refusal, deliberately NOT an unfold, because the sharded
-    reader was believed unable to redistribute.  Per the owner's ruling of
-    2026-08-08 ~13:20 the readers ALWAYS unfold, and the belief was measured
-    and found wrong — see :func:`_unfold_wedge`.
-
-    ASKED IN PASS 1, WHILE THE SERIAL HANDLE IS OPEN, and it costs kilobytes:
-    the tables are a permutation and a wrap table, not a tensor.  Doing it
-    here rather than inside the SlabIO block keeps the two handles from
-    overlapping, which is the same rule the geometry read above follows.
-
-    THE PROBE IS ``symmetry_maps.dataset_q_storage`` — the same one
-    ``bse_io.is_q_wedge`` wraps, called directly here because ``file_io``
-    must not import ``bse`` (that is uphill, and the layering ratchet says
-    so).  Two callers, in two layers, and
-    ``test_restart_qirr_consumers.py::test_the_probe_has_exactly_two_named_callers``
-    names both rather than letting a third appear unnoticed.
-    """
-    from symmetry_maps import read_tables, dataset_q_storage
-    return {name: read_tables(f, name)
-            for name in ("V_qmunu", "S_qmunu", "V0_noG0_munu", "W0_qmunu")
-            if name in f and dataset_q_storage(f[name]) == "ibz"}
-
-
-def _unfold_wedge(A, tables, n_rmu_pad, mesh_xy):
-    """IBZ wedge -> full BZ, with the tables the FILE itself carries.
-
-    ``tables is None`` (the full-BZ and legacy case) returns ``A`` untouched,
-    so this is a no-op on every restart file that is not a wedge.
-
-    THE SAME CALL THE PRODUCER MADE, ON THE SAME TABLES.  The format stores
-    the PRE-UNFOLD block, so ``unfold(stored)`` is the identity — the same
-    function on the same inputs the producing run itself used — rather than a
-    property that depends on the bit-frozen op-selection policy.  That is why
-    the tables come out of the file rather than being re-derived from this
-    run's ``sym``: a table that reconstructs the tensor must be the table
-    that deconstructed it.
-
-    A SHARDED UNFOLD IS AVAILABLE, and this is the point the tree used to say
-    the other way.  ``bse_io._MunuSlabPlan``'s refusal argues that a per-rank
-    (μ, ν) hyperslab cannot unfold because the unfold gathers across the very
-    axes it shards on.  The premise is true of SlabIO and the conclusion does
-    not follow: ``unfold_isdf_operator`` is a ``shard_map`` over four
-    ``lax.all_to_all`` collectives that redistribute those axes
-    volume-preservingly, never exceeding one tile per rank, and it takes and
-    returns ``P(None,'x','y')`` — exactly the spec ``_munu_slab_request``
-    produces.  The producer runs it on the real distributed mesh twice per
-    run.  MEASURED bit-identical against the single-device unfold at 2x2, 4x1
-    and 1x4 (DESIGN_restart_consolidation.md §1, element-wise on the
-    off-diagonals).  What SlabIO cannot do is unfold as a hyperslab OFFSET,
-    and nothing here asks it to: it reads the wedge exactly as it reads a
-    full-BZ tensor, and the collective happens afterwards, in jax.
-
-    THE PAD IS THIS READER'S, NEVER THE WRITER'S.  The file stores the
-    LOGICAL μ extent (SHARDING_RULES §2), so the tables are re-padded against
-    THIS process's device count with ``QirrTables.padded`` — identity tail on
-    the permutation, zero tail on the wrap, the same pure function the writer
-    inverted.  That is what makes a file written on four ranks read on eight,
-    and it is why the tables move to the tensor's extent rather than the
-    tensor being clipped to theirs.  ``unfold_isdf_operator`` additionally
-    REFUSES a μ extent not divisible by Px·Py; ``n_rmu_pad`` came from
-    ``padded_mu_extent`` two frames up and already satisfies it, which is
-    stated here so nobody later optimises the pad away.
-    """
-    if tables is None:
-        return A
-    from symmetry_maps import unfold_isdf_operator
-    t = tables.padded(int(n_rmu_pad))
-    return unfold_isdf_operator(
-        A, irr_idx=t.irr_idx_q, sym_idx=t.sym_idx_q, sym_perm=t.sym_perm,
-        L_table=t.L_table, q_irr_frac=t.q_irr_frac, mesh_xy=mesh_xy,
-        n_sym_spatial=int(t.n_sym_spatial))
-
-
-def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
-                               band_receipt=None, n_band_carrier=None):
-    """Read canonical restart state as PER-RANK TILES (restart format v2).
-
-    Returns arrays that are ALREADY sharded on ``mesh_xy`` and ALREADY at
-    the padded μ extent.  Nothing larger than one rank's tile is
-    materialised at any point, so this works at any process count.
-
-    WHAT THIS REPLACED, AND WHY IT MATTERS
-    --------------------------------------
-    Until 2026-08-06 this was a full-file reader — every dataset read with
-    ``[:]`` into one array on the calling process, ``V_qmunu`` and
-    ``S_qmunu`` at ``(nq, μ, μ)`` and ``V0_noG0_munu`` at ``(μ, μ)``, all
-    N_mu²-class, whole, on every rank — and it was GUARDED OFF above one
-    process with no replacement, which removed a capability that had
-    worked at deck scale.  The guard was correct about the cost and wrong
-    to be the end of the story: MEASURED at P=4 (job 56389339, MoS2 6x6,
-    N_mu=1496, nq=36) the old path cost **+1.53 GiB of VmHWM on every
-    rank** (0.95 → 2.47 GiB) and nothing warned; at the design envelope
-    (N_mu=20000, nq=64) the same read is **381.47 GiB per rank**
-    (CLAIMS 69).
-
-    The port follows ``bse_io.load_bse_data_from_restart_sharded``: read
-    the SHAPES and the small replicated metadata with serial h5py, close
-    that handle, then move the big tensors through SlabIO under
-    collective MPI-IO.  Two live handles on one file is a hazard nobody
-    needs, which is why the h5py block closes before SlabIO opens.
-
-    WHAT STAYS ON SERIAL h5py, AND WHY IT IS NOT A LOOPHOLE
-    -------------------------------------------------------
-    ``enk_full`` ``(nk, nb)``, ``G0_mu_nu`` ``(μ,)``, and the scalar
-    stamps.  These are μ-class or smaller — ``G0`` is 320 KB at the
-    envelope — and every rank needs all of them.  The doctrine forbids
-    materialising an N_mu²-class object, not reading a vector; sharding
-    ``G0`` would buy nothing and cost a reshard at every use, and
-    ``bse_io`` reads it exactly the same way.
-
-    PADDING.  Disk stores the LOGICAL μ extent so a restart written at
-    any device count re-reads at any other (SHARDING_RULES §2).  The
-    in-memory convention is ``padded_mu_extent(n_rmu, device_count)``,
-    and the pad rows are exact zeros.  Both facts are now enforced by the
-    same mechanism: SlabIO is asked for the PADDED shape and zero-fills
-    everything past the dataset, so the pad is the read, and there is no
-    ``jnp.pad`` and no ``with_sharding_constraint`` applied to an
-    already-resident global array.
-
-    THE q WEDGE IS UNFOLDED, ALWAYS, AND THE CALLER NEVER LEARNS OF IT.
-    A restart file whose V/W sit on the IBZ q wedge comes back on the FULL
-    BZ, at the same shape and the same sharding as a full-BZ file's, so
-    ``gw_init``'s restart branch reads ``rs.V_qmunu`` without asking which
-    q-set the bytes were on.  That is the owner's ruling of 2026-08-08
-    ~13:20 — storage follows the WFN's own symmetry and readers always
-    unfold — and it is what retires this reader's former refusal.  The
-    tables come out of the FILE (:func:`_qirr_wedge_tables`) and the unfold
-    is the producer's own call (:func:`_unfold_wedge`), so what comes back
-    is the same function of the same inputs the producing run used.  On
-    every full-BZ and legacy file nothing happens at all: the probe returns
-    an empty map and the read is the byte path it has always been.
-
-    SPINOR AND BISPINOR.  ``nspinor`` is read from the ψ dataset and
-    carried through as a replicated axis at its on-disk extent — 2 for a
-    spinor restart, 4 for a bispinor one — and gated by
-    :func:`_check_nspinor`.  It is never padded.  The bispinor
-    ``psi_full_y_transverse`` is read at its OWN μ extent (the transverse
-    centroid count differs from the charge one) with its own pad.
-
-    ``low_mem_bands=True`` reads the TWO 2-D-sharded faces
-    (``gw.wavefunction_bundle`` ``psi_nmu``/``psi_mun``) instead of the
-    legacy single-axis ``psi_full_y``: ``psi_nmu`` is a direct hyperslab
-    of the SAME "psi_full_y" dataset at the face partition spec (its axis
-    order (nk, n, s, μ) already matches, so this is not a different
-    dataset, only a different sharding of the same one); ``psi_mun`` is a
-    direct hyperslab of the ADDITIVE "psi_full_y_mun" dataset (axis order
-    (nk, s, μ, n)).  Neither derivation performs a reshard: each face is
-    exactly what its own hyperslab holds.  This is the "request both face
-    specs from SlabIO" branch of the restart audit (report §"Restart
-    write/read") rather than a one-face-plus-transpose branch — chosen
-    because it needs no new cross-mesh-axis collective to write or
-    verify, at the cost of the doubled on-disk ψ bytes.  Bispinor under
-    ``low_mem_bands`` (2026-08-23): the transverse pair rides the
-    identical two-hyperslab pattern — ``psi_full_y_transverse`` at the
-    nmu face spec plus the ADDITIVE ``psi_full_y_transverse_mun`` — at
-    the transverse mu extent; a file carrying only the legacy-written
-    nmu-order dataset refuses by name.
-    """
-    from .slab_io import SlabIO
-    from common.collectives import device_put_process_local
-
-    # ---- pass 1: geometry + the small replicated arrays, serial h5py ----
-    with h5py.File(filename, "r") as f:
-        has_full_psi = "psi_full_y" in f
-        has_parent_psi = "psi_parent_y" in f
-        if not has_full_psi and not has_parent_psi:
-            raise ValueError(
-                f"Restart file {filename} is missing canonical psi_full_y "
-                "dataset. Regenerate restart tensors with current gw_jax.")
-        if has_parent_psi and not (
-                "psi_parent_y_mun" in f and "psi_parent_k_rows" in f):
-            raise ValueError(
-                f"Restart file {filename} has psi_parent_y but not both "
-                "psi_parent_y_mun and psi_parent_k_rows: a torn parents-only "
-                "write.  Rerun with restart = false.")
-        parent_T = "psi_parent_y_transverse" in f
-        if parent_T != ("psi_parent_y_transverse_mun" in f) or (parent_T and not has_parent_psi):
-            raise ValueError("Restart has torn transverse parent faces; rerun with restart = false.")
-        transverse_name = "psi_parent_y_transverse" if parent_T else "psi_full_y_transverse"
-        parent_k_rows = (
-            np.asarray(f["psi_parent_k_rows"][()], dtype=np.int64)
-            if has_parent_psi else None)
-        # THE UNFOLD TABLES, while this handle is open and before any tensor
-        # bytes move.  Empty on every full-BZ and legacy file, which is what
-        # keeps those reads on the byte path they have always had.
-        wedge_tables = _qirr_wedge_tables(f)
-        shapes = {k: tuple(int(s) for s in f[k].shape)
-                  for k in ("V_qmunu", "S_qmunu", "V0_noG0_munu",
-                            "psi_full_y", "psi_full_y_mun",
-                            "psi_full_y_transverse",
-                            "psi_full_y_transverse_mun",
-                            "psi_parent_y", "psi_parent_y_mun",
-                            "psi_parent_y_transverse", "psi_parent_y_transverse_mun")
-                  if k in f}
-        if parent_T and shapes[transverse_name][0] != shapes["psi_parent_y"][0]:
-            raise ValueError("Restart parent-row count differs between charge and current families.")
-        dtypes = {k: f[k].dtype for k in shapes}
-        for name in shapes:
-            _validate_shape_receipt(name, f[name])
-        if (low_mem_bands and "psi_full_y_transverse" in shapes
-                and "psi_full_y_transverse_mun" not in shapes):
-            raise ValueError(
-                f"Restart file {filename} has 'psi_full_y_transverse' but "
-                f"no 'psi_full_y_transverse_mun' dataset: it was written "
-                f"by a legacy-layout run.  Read it with low_mem_bands = "
-                f"false, or rerun with restart = false so the transverse "
-                f"face pair is written.")
-        if low_mem_bands and has_full_psi and "psi_full_y_mun" not in shapes:
-            raise ValueError(
-                f"Restart file {filename} has no 'psi_full_y_mun' dataset "
-                "but low_mem_bands = true was requested.  Either this file "
-                "predates the two-face restart format (regenerate with "
-                "restart = false, low_mem_bands = true), or it was written "
-                "with low_mem_bands = false — restart under a DIFFERENT "
-                "low_mem_bands than the write is not supported.")
-        enk_full = (np.asarray(f["enk_full"][:]) if "enk_full" in f else None)
-        G0_mu_nu = (np.asarray(f["G0_mu_nu"][:]) if "G0_mu_nu" in f else None)
-        stored_T = (int(np.asarray(f["n_rmu_transverse_logical"])[()])
-                    if "n_rmu_transverse_logical" in f else None)
-        charge_zeta_identity = (
-            _decode_charge_zeta_identity(
-                f[CHARGE_ZETA_IDENTITY_DATASET][()],
-                where=f"Restart file {filename}")
-            if CHARGE_ZETA_IDENTITY_DATASET in f else None)
-
-    divisor = mesh_divisor(mesh_xy)
-    n_rmu_disk = int(shapes["V_qmunu"][-1])
-    mu_axis = padded_mu_axis(n_rmu_disk, divisor)
-    n_rmu_pad = mu_axis.carrier
-    nspinor = _check_nspinor(
-        shapes["psi_full_y" if has_full_psi else "psi_parent_y"][2],
-        f"read_restart_state_from_h5({filename})")
-
-    # Integrity cross-check of the stamped transverse extent against the
-    # dataset it describes (audit 2026-07-28: the stamp used to be
-    # write-only shadow metadata, QUALITY_PATTERNS #3 — a mismatch means a
-    # torn or hand-edited file and must refuse loudly rather than feed
-    # downstream re-padding, #7).  Checked on the SHAPE, before any bytes
-    # move, so a bad file costs nothing.
-    if transverse_name in shapes and stored_T is not None:
-        disk_T = int(shapes[transverse_name][-1])
-        if stored_T != disk_T:
-            raise ValueError(
-                f"Restart file {filename}: stamped "
-                f"n_rmu_transverse_logical={stored_T} does not match the "
-                f"psi_full_y_transverse μ extent on disk ({disk_T}).  The "
-                f"file is internally inconsistent (torn write or "
-                f"hand-edited) — regenerate the restart tensors "
-                f"(restart=false).")
-
-    # ---- pass 2: the N_mu²-class and ψ tensors, one tile per rank -------
-    psi_spec = P(None, None, None, "y")          # legacy: (nk, n, s, μ_Y)
     from common.wfn_layout import psi_specs
-    psi_nmu_spec, psi_mun_spec = psi_specs("face" if low_mem_bands else "axis")
-
-    def _read_munu(io, name):
-        if name not in shapes:
-            return None
-        off, shape, spec = _munu_slab_request(shapes[name], n_rmu_pad)
-        with timing.section(
-                f"gw_jax.restart.read.{name}", announce=True,
-                label=f"restart SlabIO read {name}"):
-            arr = io.read_slab(name, shape=shape, dtype=dtypes[name],
-                               offset=off, mesh=mesh_xy,
-                               partition_spec=spec)
-            jax.block_until_ready(arr)
-        with timing.section(
-                f"gw_jax.restart.wedge_transform.{name}", announce=True,
-                label=f"restart wedge transform {name}"):
-            arr = _collapse_leading(arr, shapes[name], mesh_xy)
-            authenticate_axis(
-                arr, mu_axis, axis=-2,
-                where=f"read_restart_state_from_h5 dataset {name!r}")
-            authenticate_axis(
-                arr, mu_axis, axis=-1,
-                where=f"read_restart_state_from_h5 dataset {name!r}")
-        # THE UNFOLD, AFTER THE READ AND BEFORE THE CALLER SEES IT.  The
-        # request above derives its q extent from the dataset shape, so a
-        # wedge simply arrives as (n_q_ibz, mu_pad, nu_pad) on the same spec
-        # the unfold takes and returns.  A no-op on every non-wedge file.
-            arr = _unfold_wedge(
-                arr, wedge_tables.get(name), n_rmu_pad, mesh_xy)
-            jax.block_until_ready(arr)
-        return arr
-
-    def _read_psi(io, name, n_mu_logical, *, spec, mu_axis=-1,
-                  spinor_axis=2, band_axis=1):
-        """One direct hyperslab of a ψ dataset, μ padded, at ``spec``.
-
-        ``mu_axis``/``spinor_axis`` default to the legacy/nmu axis order
-        (nk, n, s, μ); the mun face (nk, s, μ, n) passes both explicitly
-        — its μ is axis -2 and its spinor is axis 1, not axis -1/2.  NO
-        RESHARD happens here regardless of ``spec``: this is a straight
-        SlabIO hyperslab read, so a face spec costs exactly what the
-        legacy spec costs (one direct read), never a transpose collective.
-        """
-        if name not in shapes:
-            return None
-        ds = shapes[name]
-        _check_nspinor(ds[spinor_axis], f"{name} in {filename}")
-        mu_tag = padded_mu_axis(int(n_mu_logical), divisor)
-        shape = list(int(s) for s in ds)
-        mu_index = int(mu_axis) % len(shape)
-        shape[mu_index] = mu_tag.carrier
-        b_axis = int(band_axis) % len(shape)
-        band_tag = (band_receipt if band_receipt is not None else
-                    _loaded_band_axis(int(ds[b_axis]), mesh_xy))
-        if n_band_carrier is not None:
-            band_tag = authenticate_padded_axis(
-                band_tag.logical, int(n_band_carrier), band_tag.divisor,
-                name=band_tag.name)
-        shape[b_axis] = band_tag.carrier
-        with timing.section(
-                f"gw_jax.restart.read.{name}", announce=True,
-                label=f"restart SlabIO read {name}"):
-            arr = io.read_slab(
-                name, shape=tuple(shape), dtype=dtypes[name],
-                mesh=mesh_xy, partition_spec=spec)
-            jax.block_until_ready(arr)
-        authenticate_axis(
-            arr, mu_tag, axis=mu_index,
-            where=f"read_restart_state_from_h5 dataset {name!r}")
-        authenticate_axis(
-            arr, band_tag, axis=b_axis,
-            where=f"read_restart_state_from_h5 dataset {name!r}")
-        return arr
-
-    n_rmu_T_disk = (int(shapes[transverse_name][-1])
-                    if transverse_name in shapes else None)
-
-    with SlabIO(filename, mode="r", mesh=mesh_xy) as io:
-        V_qmunu = _read_munu(io, "V_qmunu")
-        S_qmunu = _read_munu(io, "S_qmunu")
-        V0_noG0_munu = _read_munu(io, "V0_noG0_munu")
-        psi_nmu_parent = None
-        psi_mun_parent = None
-        psi_nmu_parent_T = psi_mun_parent_T = None
-        if low_mem_bands or has_parent_psi:
-            psi_full_y = None
-            # ``_read_psi`` returns None for an absent dataset: a
-            # parents-only file has no full-k pair.
-            psi_nmu = _read_psi(io, "psi_full_y", n_rmu_disk,
-                                spec=psi_nmu_spec)
-            psi_mun = _read_psi(io, "psi_full_y_mun", n_rmu_disk,
-                                spec=psi_mun_spec, mu_axis=-2, spinor_axis=1,
-                                band_axis=-1)
-            # Raw-parent faces (canonical order, k_irr rows) at the SAME
-            # two face specs: one direct hyperslab each.
-            psi_nmu_parent = _read_psi(io, "psi_parent_y", n_rmu_disk,
-                                       spec=psi_nmu_spec)
-            psi_mun_parent = _read_psi(io, "psi_parent_y_mun", n_rmu_disk,
-                                       spec=psi_mun_spec, mu_axis=-2,
-                                       spinor_axis=1, band_axis=-1)
-            # Transverse (bispinor) faces: same two-hyperslab pattern at
-            # the transverse μ extent.  A file holding the nmu-order
-            # dataset WITHOUT the additive mun face was written by a
-            # legacy-layout run — refuse rather than derive the second
-            # face with an unowned x<->y transpose (the same
-            # request-both-specs ruling as the charge pair).
-            psi_full_y_transverse = None
-            if n_rmu_T_disk is not None:
-                # (missing-mun refusal fired in pass 1, before SlabIO)
-                psi_nmu_T = _read_psi(
-                    io, transverse_name, n_rmu_T_disk,
-                    spec=psi_nmu_spec)
-                psi_mun_T = _read_psi(
-                    io, transverse_name + "_mun", n_rmu_T_disk,
-                    spec=psi_mun_spec, mu_axis=-2, spinor_axis=1,
-                    band_axis=-1)
-            else:
-                psi_nmu_T = None
-                psi_mun_T = None
-            if parent_T:
-                psi_nmu_parent_T, psi_mun_parent_T = psi_nmu_T, psi_mun_T
-                psi_nmu_T = psi_mun_T = None
-        else:
-            psi_full_y = _read_psi(io, "psi_full_y", n_rmu_disk,
-                                   spec=psi_spec)
-            psi_nmu = None
-            psi_mun = None
-            psi_nmu_T = None
-            psi_mun_T = None
-            psi_full_y_transverse = (
-                _read_psi(io, "psi_full_y_transverse", n_rmu_T_disk,
-                          spec=psi_spec)
-                if n_rmu_T_disk is not None else None)
-
-    # G0: μ-class, read whole above.  Collapse a legacy 2-D (nqz, μ) store
-    # to its q=0 row, pad to the same in-memory μ extent as everything
-    # else, and pin it to the ν axis.  Done HERE so the reader's contract
-    # is uniform — every array it returns is padded and sharded — rather
-    # than leaving one straggler for the caller to remember.
-    if G0_mu_nu is not None:
-        if G0_mu_nu.ndim > 1:
-            G0_mu_nu = G0_mu_nu[0]
-        G0_mu_nu = np.asarray(pad_to_axis(
-            G0_mu_nu, mu_axis, axis=-1))
-        # ``device_put_process_local``, NOT ``jax.device_put`` (AA.1):
-        # G0 is host numpy read identically on every rank, and a plain
-        # device_put onto a multi-process NamedSharding fires a hidden
-        # assert_equal all-gather to prove exactly that.  The old reader
-        # used ``with_sharding_constraint`` here, which was only ever
-        # exercised at P=1 because the reader was refused above it -- so
-        # there was no proven multi-process spelling to inherit.
-        G0_mu_nu = device_put_process_local(
-            np.ascontiguousarray(G0_mu_nu),
-            NamedSharding(mesh_xy, P("y")))
-    if enk_full is not None:
-        n_disk_band = int(enk_full.shape[-1])
-        band_tag = (band_receipt if band_receipt is not None else
-                    _loaded_band_axis(n_disk_band, mesh_xy))
-        if n_band_carrier is not None:
-            band_tag = authenticate_padded_axis(
-                band_tag.logical, int(n_band_carrier), band_tag.divisor,
-                name=band_tag.name)
-        if band_tag.pad:
-            if enk_full.size == 0:
-                raise ValueError(
-                    "Restart enk_full is empty and cannot define the finite "
-                    "energy sentinel needed for band-carrier padding.")
-            sentinel = float(np.max(enk_full)) + 1.0
-            enk_full = np.asarray(pad_to_axis(
-                enk_full, band_tag, axis=-1, fill=sentinel))
-        enk_full = device_put_process_local(
-            np.ascontiguousarray(enk_full),
-            NamedSharding(mesh_xy, P(None, None)))
-
-    del nspinor  # gated above; the extent itself rides on the arrays
-    return (V_qmunu, S_qmunu, psi_full_y, enk_full, V0_noG0_munu, G0_mu_nu,
-            psi_full_y_transverse, n_rmu_T_disk, psi_nmu, psi_mun,
-            psi_nmu_T, psi_mun_T, charge_zeta_identity,
-            psi_nmu_parent, psi_mun_parent, parent_k_rows,
-            psi_nmu_parent_T, psi_mun_parent_T)
-
-
-def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
-    """Read ONE ``(…, μ, ν)`` restart tensor, sharded, wedge unfolded.
-
-    ``read_restart_state_from_h5`` reads the fixed set of tensors ``gw_init``
-    writes on its ``mode="w"`` pass and deliberately does not know about
-    ``W0_qmunu`` — W is written later, by a different function, once the
-    Dyson solve has produced it.  Every consumer that wants W back has
-    therefore had to re-derive the slab request, the legacy-layout collapse
-    and the wedge unfold for itself (``bse_io`` does, at its own scale).
-    This is that read, named once, on the same three private helpers the
-    canonical reader uses, so a fourth consumer does not spell it a fourth
-    way.
-
-    Returns ``None`` when the dataset is absent — which is the normal case
-    for ``V_qmunu_nohead`` / ``W0_qmunu_nohead``, an opt-in pair nothing
-    in-tree writes.  Callers that REQUIRE the tensor say so themselves; a
-    reader that raised here could not serve the optional ones.
-
-    Padding, sharding and the wedge follow the canonical reader exactly:
-    disk holds the LOGICAL μ extent, memory holds
-    ``padded_mu_extent(μ, device_count)`` with zero pad rows, output is
-    ``P(None,'x','y')``, and an IBZ-wedge dataset comes back on the FULL BZ
-    with the caller none the wiser.
-
-    ``n_rmu_logical`` overrides the μ extent read off the dataset — pass it
-    only when the dataset itself is the thing under suspicion.
-    """
-    from .slab_io import SlabIO
-
-    with h5py.File(filename, "r") as f:
-        if name not in f:
-            return None
-        ds_shape = tuple(int(s) for s in f[name].shape)
-        ds_dtype = f[name].dtype
-        from symmetry_maps import dataset_q_storage, read_tables
-        tables = (read_tables(f, name)
-                  if dataset_q_storage(f[name]) == "ibz" else None)
-
-    n_rmu_disk = int(ds_shape[-1] if n_rmu_logical is None else n_rmu_logical)
-    mu_tag = padded_mu_axis(n_rmu_disk, mesh_xy)
-    n_rmu_pad = mu_tag.carrier
-    off, shape, spec = _munu_slab_request(ds_shape, n_rmu_pad)
-    with SlabIO(filename, mode="r", mesh=mesh_xy) as io:
-        arr = io.read_slab(name, shape=shape, dtype=ds_dtype, offset=off,
-                           mesh=mesh_xy, partition_spec=spec)
-    arr = _collapse_leading(arr, ds_shape, mesh_xy)
-    authenticate_axis(
-        arr, mu_tag, axis=-2,
-        where=f"read_munu_tensor_from_h5 dataset {name!r}")
-    authenticate_axis(
-        arr, mu_tag, axis=-1,
-        where=f"read_munu_tensor_from_h5 dataset {name!r}")
-    return _unfold_wedge(arr, tables, n_rmu_pad, mesh_xy)
-
-
-def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
-                              n_rmu_logical=None, low_mem_bands=False):
-    """Load canonical restart state, in ONE of two mutually exclusive ψ
-    shapes selected by ``low_mem_bands`` (mirrors
-    ``gw.wavefunction_bundle.Wavefunctions``'s ``layout`` tag).
-
-    ``low_mem_bands=False`` (default) returns a ``SimpleNamespace`` with:
-
-      V_qmunu, S_qmunu, V0_noG0_munu, G0_mu_nu, enk_full
-      psi_rmu_Y   (nk, nb, ns, n_rmu)   P(None, None, None, 'y')
-                  un-conjugated ψ for raw centroid-sample consumers.
-      psi_rmuT_X  (nk, n_rmu, nb, ns)   P(None, 'x', None, None)
-                  conjugated ψ* (matches the pair-density convention
-                  ``load_centroids_band_chunked`` uses).  Derived from
-                  ``psi_rmu_Y`` with a single y→x all-to-all on the μ
-                  axis — this remains the ONLY reshard on the legacy
-                  restart path.
-
-    ``low_mem_bands=True`` skips that derivation entirely and instead
-    returns the two FACE arrays, each read as its own direct SlabIO
-    hyperslab (see :func:`read_restart_state_from_h5`'s docstring — this
-    is the "request both face specs" branch, not a one-face-plus-transpose
-    branch, so there is NO reshard collective on this path either):
-
-      psi_nmu  (nk, n, s, μ)   P(None, 'x', None, 'y')
-      psi_mun  (nk, s, μ, n)   P(None, None, 'x', 'y')
-
-      ``psi_rmu_Y``/``psi_rmuT_X`` are ``None`` in this mode; bispinor
-      transverse fields are always ``None`` (not supported under
-      ``low_mem_bands`` — refused by the caller before this is reached).
-    """
-    from types import SimpleNamespace
-    # Loud-fail BEFORE any tensor is trusted (see the function's docstring).
-    assert_restart_window_matches(filename, band_slices=band_slices,
-                                  n_rmu_logical=n_rmu_logical)
-    # Everything below arrives ALREADY sharded on mesh_xy and ALREADY at
-    # the padded μ extent.  What used to be here — an 8-D/6-D collapse, a
-    # ``jnp.pad`` on both μ axes of four tensors, and a
-    # ``with_sharding_constraint`` on each — all operated on arrays that
-    # were already resident whole on every rank, which is precisely why
-    # the reader had to be guarded off above one process.  The pad is now
-    # the read (SlabIO zero-fills past the dataset) and the sharding is
-    # the read (SlabIO returns the tile), so none of it survives here.
-    band_axis = None
-    if band_slices is not None:
-        n_band_logical = (
-            int(getattr(band_slices, "b4_logical", 0) or band_slices.b4)
-            - int(band_slices.b0))
-        band_axis = _loaded_band_axis(n_band_logical, mesh_xy)
-        authenticate_padded_axis(
-            band_axis.logical,
-            int(band_slices.b4) - int(band_slices.b0),
-            band_axis.divisor, name=band_axis.name)
-
-    (V_qmunu, S_qmunu, psi_rmu_Y, enk_full, V0_noG0_munu, G0_mu_nu,
-     psi_rmu_Y_T, n_rmu_T_disk, psi_nmu, psi_mun,
-     psi_nmu_T, psi_mun_T, charge_zeta_identity,
-     psi_nmu_parent, psi_mun_parent, parent_k_rows,
-     psi_nmu_parent_T, psi_mun_parent_T) = read_restart_state_from_h5(
-        filename, mesh_xy, low_mem_bands=bool(low_mem_bands),
-        band_receipt=band_axis)
-
-    if low_mem_bands or psi_nmu_parent is not None:
-        # No derivation, no reshard: both faces already arrived at their
-        # own spec.  Legacy psi_rmu_Y/psi_rmuT_X are not built at all.
-        # The transverse (bispinor) pair follows the identical pattern at
-        # its own mu extent; None on a scalar/spinor file.
-        return SimpleNamespace(
-            V_qmunu=V_qmunu, S_qmunu=S_qmunu, V0_noG0_munu=V0_noG0_munu,
-            G0_mu_nu=G0_mu_nu, enk_full=enk_full,
-            psi_rmu_Y=None, psi_rmuT_X=None,
-            psi_nmu=psi_nmu, psi_mun=psi_mun,
-            psi_rmu_Y_transverse=None, psi_rmuT_X_transverse=None,
-            psi_nmu_transverse=psi_nmu_T, psi_mun_transverse=psi_mun_T,
-            n_rmu_transverse_disk=n_rmu_T_disk,
-            charge_zeta_identity=charge_zeta_identity,
-            psi_nmu_parent=psi_nmu_parent, psi_mun_parent=psi_mun_parent,
-            psi_nmu_parent_transverse=psi_nmu_parent_T,
-            psi_mun_parent_transverse=psi_mun_parent_T,
-            parent_k_rows=parent_k_rows,
-            layout="face" if low_mem_bands else "axis",
-        )
-
-    x1_psi_X = NamedSharding(mesh_xy, P(None, "x", None, None))
-
-    # psi_rmuT_X: conj + transpose(nb↔μ) then y→x reshard on μ.  This is
-    # the ONLY reshard on the legacy restart path, and it is deliberate:
-    # the two ψ copies are what the pair-density contraction needs.
-    with timing.section(
-            "gw_jax.restart.final_reshard.charge", announce=True,
-            label="restart final charge-wavefunction reshard"):
-        psi_rmuT_X = jax.lax.with_sharding_constraint(
-            jnp.conj(psi_rmu_Y).transpose(0, 3, 1, 2), x1_psi_X)
-        jax.block_until_ready(psi_rmuT_X)
-
-    # Bispinor transverse ψ: same two-copy derivation as the charge ψ, at
-    # the TRANSVERSE μ extent (its own centroid count, its own pad, both
-    # already applied by the reader).
-    psi_rmuT_X_T = None
-    if psi_rmu_Y_T is not None:
-        with timing.section(
-                "gw_jax.restart.final_reshard.transverse", announce=True,
-                label="restart final transverse-wavefunction reshard"):
-            psi_rmuT_X_T = jax.lax.with_sharding_constraint(
-                jnp.conj(psi_rmu_Y_T).transpose(0, 3, 1, 2), x1_psi_X)
-            jax.block_until_ready(psi_rmuT_X_T)
-
-    return SimpleNamespace(
-        V_qmunu=V_qmunu, S_qmunu=S_qmunu, V0_noG0_munu=V0_noG0_munu,
-        G0_mu_nu=G0_mu_nu, enk_full=enk_full,
-        psi_rmu_Y=psi_rmu_Y, psi_rmuT_X=psi_rmuT_X,
-        psi_nmu=None, psi_mun=None,
-        psi_rmu_Y_transverse=psi_rmu_Y_T,
-        psi_rmuT_X_transverse=psi_rmuT_X_T,
-        psi_nmu_transverse=None, psi_mun_transverse=None,
-        n_rmu_transverse_disk=n_rmu_T_disk,
-        charge_zeta_identity=charge_zeta_identity,
-        psi_nmu_parent=None, psi_mun_parent=None, parent_k_rows=None,
-        psi_nmu_parent_transverse=None, psi_mun_parent_transverse=None,
-    )
+    nmu, mun = psi_specs("axis")
+    y = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh, nmu))(psi)
+    x = jax.jit(lambda a: a.transpose(0, 2, 3, 1),
+                out_shardings=NamedSharding(mesh, mun))(psi)
+    write_restart_state_to_h5(filename, n_rmu_logical=n_rmu_logical,
+        psi_parent_y=y, psi_parent_y_mun=x,
+        parent_k_rows=np.arange(psi.shape[0]), psi_layout="axis", mesh=mesh, mode="a")

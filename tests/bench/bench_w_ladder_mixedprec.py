@@ -35,6 +35,7 @@ against a c128 ``tol=1e-12`` oracle on the SAME operator.  The mixed engine
 never reports its inner projected residual.
 """
 from __future__ import annotations
+from file_io import restart_bundle
 
 import argparse
 import os
@@ -67,7 +68,7 @@ def _payload(run_dir, input_name, n_val=10**9, n_cond=10**9):
     from bse import bse_io
     from common.collectives import single_device_mesh
     input_path = os.path.join(run_dir, input_name)
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     mesh = single_device_mesh()
     data = bse_io.load_bse_data_from_restart_sharded(
         restart, n_val=n_val, n_cond=n_cond, mesh_xy=mesh,

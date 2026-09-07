@@ -639,8 +639,8 @@ def apply_eqp_and_reslice_bands(
 
     Returns ``(eps_v_padded, eps_c_padded, n_occ_eff)``.
     """
-    with h5py.File(restart_file, "r") as f:
-        enk_full_np = np.asarray(f["enk_full"][:])
+    from file_io.restart_bundle import read_metadata
+    enk_full_np = read_metadata(restart_file)["energies"]
     enk_full_np = apply_eqp_corrections(
         enk_full_np, eqp_file, input_file=input_file,
         state_artifact_path=restart_file)

@@ -138,8 +138,8 @@ def test_eqp_receipt_append_and_read_use_the_h5py_owner_door(tmp_path):
         SIGMA_OPERATOR_STATE_VERSION,
         SIGMA_OPERATOR_STATE_VERSION_ATTR,
         append_eqp_assembly_receipt_h5,
-        read_eqp_assembly_receipt,
     )
+    from file_io.restart_bundle import (read_eqp_assembly_receipt)
     from gw.eqp_bgw import assemble_eqp
 
     path = tmp_path / "sigma_mnk.h5"

@@ -36,6 +36,7 @@ Not collected by pytest (``tests/bench`` is in ``norecursedirs``); argv-driven
 per ``docs/architecture/layers.md`` §5.
 """
 from __future__ import annotations
+from file_io import restart_bundle
 
 import argparse
 import json
@@ -288,7 +289,7 @@ def mode_matvec(args, mesh):
 
     run_dir = Path(args.run_dir)
     input_path = str(run_dir / args.deck)
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     data = bse_io.load_bse_data_from_restart_sharded(
         restart, n_val=10**9, n_cond=10**9, mesh_xy=mesh,
         input_file=input_path, inject_head=False, load_v_full=True)

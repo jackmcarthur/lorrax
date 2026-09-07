@@ -33,11 +33,8 @@ from bse.bse_jax import (
     solve_bse,
     compute_pair_amplitude,
 )
-from bse.bse_io import (
-    _find_restart_file,
-    _load_ring_subset,
-    write_eigenvectors_stream,
-)
+from bse.bse_io import (_load_ring_subset, write_eigenvectors_stream)
+from file_io.restart_bundle import (_find_restart_file)
 
 
 def test_matvec(data, n_warmup=2, n_bench=10):

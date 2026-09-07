@@ -46,7 +46,7 @@ if TYPE_CHECKING:                       # pragma: no cover — typing only
     # module has ``from __future__ import annotations``, so the annotation
     # it feeds is a string), and a runtime path edit smuggled into a
     # typing-only block is how a "type-checking import" stops being one.
-    from zeta_loader import ZetaLoader
+    from file_io.restart_bundle import (open_zeta as ZetaLoader)
 
 
 # ---------------------------------------------------------------------------

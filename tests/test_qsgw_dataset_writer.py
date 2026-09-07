@@ -64,14 +64,14 @@ from file_io.sigma_output import (                              # noqa: E402
     extract_and_stamp_k_irr,
     k_irr_rows_for,
 )
-from file_io.kin_ion import (                                   # noqa: E402
+from file_io.kin_ion import (
     K_STORAGE_ATTR,
     K_STORAGE_IBZ,
     K_STORAGE_VERSION,
     K_STORAGE_VERSION_ATTR,
     N_SYM_SPATIAL_ATTR,
-    read_star_map,
 )
+from file_io.restart_bundle import (read_star_map)
 
 _REPO = pathlib.Path(__file__).resolve().parents[1]
 _SRC = _REPO / "src"

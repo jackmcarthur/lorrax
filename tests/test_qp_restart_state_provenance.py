@@ -21,7 +21,8 @@ def _wfn(path, *, qp: bool, fingerprint: str) -> None:
 
 def _record(path) -> dict:
     from common.parallel_transport import WFN_FINGERPRINT_SCHEME
-    from file_io.qp_wfn import QP_STATE_SOURCE_SCHEMA, read_qp_wfn_stamp
+    from file_io.qp_wfn import (QP_STATE_SOURCE_SCHEMA)
+    from file_io.restart_bundle import (read_qp_wfn_stamp)
 
     with h5py.File(path, "r") as h5:
         fingerprint = str(h5.attrs["test_fingerprint"])
@@ -97,10 +98,8 @@ def test_restart_qp_state_matrix(
 
 
 def test_record_roundtrip_and_malformed_refusal(tmp_path):
-    from file_io.qp_wfn import (
-        QP_STATE_SOURCE_DATASET,
-        read_qp_state_source_provenance,
-    )
+    from file_io.qp_wfn import (QP_STATE_SOURCE_DATASET)
+    from file_io.restart_bundle import (read_qp_state_source_provenance)
 
     wfn = tmp_path / "WFN.h5"
     restart = tmp_path / "restart.h5"

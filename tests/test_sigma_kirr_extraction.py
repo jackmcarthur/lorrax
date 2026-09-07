@@ -192,7 +192,7 @@ def test_star_select_is_a_take_and_nothing_else():
 def test_no_star_means_no_attr_means_full(tmp_path):
     """An unstamped file must stay readable as exactly what it was."""
     _need_slab_io()
-    from file_io.kin_ion import read_star_map
+    from file_io.restart_bundle import (read_star_map)
 
     path = _write(tmp_path, _cube(), None)
     with h5py.File(path, "r") as f:
@@ -210,7 +210,7 @@ def test_no_star_means_no_attr_means_full(tmp_path):
 
 def test_the_committed_fixture_still_reads_as_full_bz():
     """The fixture predates the stamp and must never be reinterpreted."""
-    from file_io.kin_ion import read_star_map
+    from file_io.restart_bundle import (read_star_map)
 
     p = os.path.join(_REPO, "tests", "regression", "cohsex_debug",
                      "sigma_mnk.h5")
@@ -227,7 +227,7 @@ def test_the_committed_fixture_still_reads_as_full_bz():
 def test_the_stamps_are_kin_ions_and_the_tables_are_filed_with_them(tmp_path):
     """One stamp vocabulary for both files, and one reader for it."""
     _need_slab_io()
-    from file_io.kin_ion import read_star_map
+    from file_io.restart_bundle import (read_star_map)
 
     rows, compact = compact_star_tables(_IRR)
     path = _write(tmp_path, _cube(), (_IRR, _SIDX, _NSS))

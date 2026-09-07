@@ -172,7 +172,7 @@ def _qp_provenance_attrs(*, qp_solver=None, qp_energy_definition=None,
             if present else {})
 
 #: Small top-level dataset carried by a restart bundle to say which WFN
-#: supplied its matched ``psi_full_y`` / ``enk_full`` state.  The payload is
+#: supplied its matched ``psi_parent_y`` / ``enk_full`` state.  The payload is
 #: JSON owned and parsed in this module; restart I/O only transports the
 #: opaque bytes through its incumbent SlabIO metadata path.
 QP_STATE_SOURCE_DATASET = "qp_state_source_provenance"
@@ -462,89 +462,8 @@ def qp_rotations_k_storage(h5_path: str, dataset: str = "U_mnk") -> str:
     return stored
 
 
-def read_qp_rotations_full_bz(h5_path: str, datasets=None) -> dict:
-    """``qp_wfn_rotations.h5``'s k-indexed arrays, ON THE FULL BZ.
-
-    THE unfolding option the wedge form owes its consumers, and the reason
-    the wedge form is safe to write at all: anything that wants the array
-    the old writer produced calls this and gets it, wedge-stored file or
-    not.  A full-BZ file is read verbatim — the unfold is not attempted,
-    because the tables are not there and the rows are not stars.
-
-    Reuses ``kin_ion.read_star_map`` for the stamp contract rather than
-    re-implementing it, so the version number, the table names and every
-    refusal have ONE definition across ``kin_ion.h5``, ``sigma_mnk.h5`` and
-    this file.
-    """
-    from .kin_ion import read_star_map
-    names = tuple(datasets) if datasets is not None else QP_ROT_K_DATASETS
-    star = read_star_map(h5_path, names[0])
-    out = {}
-    with h5py.File(h5_path, "r") as f:
-        for name in names:
-            if name not in f:
-                continue
-            arr = np.asarray(f[name][()])
-            out[name] = (arr if star is None
-                         else np.asarray(broadcast_ibz_to_full_bz(arr, *star)))
-    return out
 
 
-def read_qp_rotations_artifact(h5_path: str) -> dict:
-    """Read one complete ``qp_wfn_rotations.h5`` Hamiltonian artifact.
-
-    The physics arrays are unfolded through
-    :func:`read_qp_rotations_full_bz`, so wedge and full-BZ storage retain
-    one meaning.  The small identity datasets are read here as part of the
-    same public format contract rather than independently in every physics
-    driver.
-
-    Returns ``U_mnk`` and ``E_qp_nk_rydberg`` on the full BZ together with
-    ``band_range``, ``kpoints_crys``, ``kgrid`` and the optional legacy/source
-    WFN fingerprint pair.  A partial artifact is refused: a rotation without
-    its matched eigenvalues, band labels or k-set cannot define
-    ``H_QP = U diag(E_QP) U^H``; one fingerprint attribute without the other
-    cannot define which identity scheme was used.
-    """
-    path = os.fspath(h5_path)
-    arrays = read_qp_rotations_full_bz(
-        path, datasets=("U_mnk", "E_qp_nk_rydberg"))
-    missing = [name for name in ("U_mnk", "E_qp_nk_rydberg")
-               if name not in arrays]
-    with h5py.File(path, "r") as h5:
-        missing.extend(name for name in QP_ROT_METADATA_DATASETS
-                       if name not in h5)
-        if missing:
-            raise ValueError(
-                f"{os.path.basename(path)} is not a complete QP rotation "
-                f"artifact; missing {sorted(set(missing))}.")
-        arrays.update({
-            "band_range": np.asarray(h5["band_range"][()], dtype=np.int64),
-            "kpoints_crys": np.asarray(
-                h5["kpoints_crys"][()], dtype=np.float64),
-            "kgrid": np.asarray(h5["kgrid"][()], dtype=np.int64),
-        })
-        has_scheme = QP_ROT_WFN_FINGERPRINT_SCHEME_ATTR in h5.attrs
-        has_fingerprint = QP_ROT_WFN_FINGERPRINT_ATTR in h5.attrs
-        if has_scheme != has_fingerprint:
-            raise ValueError(
-                f"{os.path.basename(path)} has an incomplete source-WFN "
-                "identity: fingerprint and scheme attributes must appear "
-                "together.")
-        if has_fingerprint:
-            def _text(value):
-                return value.decode("ascii") if isinstance(value, bytes) \
-                    else str(value)
-            scheme = _text(h5.attrs[QP_ROT_WFN_FINGERPRINT_SCHEME_ATTR])
-            fingerprint = _text(h5.attrs[QP_ROT_WFN_FINGERPRINT_ATTR])
-            fingerprint = _require_wfn_fingerprint(
-                fingerprint,
-                where=(f"{os.path.basename(path)} source-WFN fingerprint"))
-        else:
-            scheme = fingerprint = None
-        arrays["source_wfn_fingerprint_scheme"] = scheme
-        arrays["source_wfn_fingerprint"] = fingerprint
-    return arrays
 
 
 def authenticate_qp_rotations_source_wfn(
@@ -742,52 +661,6 @@ def write_qp_wfn_h5(
 
 
 
-def read_qp_wfn_stamp(path) -> dict | None:
-    """Is ``path`` a LORRAX QP WFN?  ``None`` when the file does not say.
-
-    Returns the stamp written by :func:`write_qp_wfn_h5` — ``scheme``,
-    ``band_start``, ``band_stop``, ``source`` and optional method provenance
-    — or ``None``.
-
-    THREE OUTCOMES, AND ONLY ONE OF THEM IS "NO".  A missing file, an
-    unreadable one, and one with no stamp all return ``None``, which means
-    **unverifiable**: BerkeleyGW's ``pw2bgw`` output, every WFN.h5 written
-    before this stamp, and a QP WFN produced by some other tool are
-    indistinguishable here, and a consumer must not read ``None`` as proof
-    that the file is mean-field.  A consumer may only use a POSITIVE answer
-    to refuse; the absence licenses nothing (``TASTE.md``: an absence is a
-    claim about what was searched).
-
-    An unrecognised scheme string is returned as-is rather than mapped onto
-    the current one — a caller comparing it against
-    :data:`QP_WFN_SCHEME` can then say "this file was written by a different
-    version" instead of silently accepting it.
-    """
-    try:
-        with h5py.File(str(path), "r") as h5:
-            raw = h5.attrs.get(QP_WFN_ATTR)
-            if raw is None:
-                return None
-            scheme = raw.decode() if isinstance(raw, bytes) else str(raw)
-            def _get(name, default=None):
-                v = h5.attrs.get(name, default)
-                if isinstance(v, bytes):
-                    return v.decode()
-                return v
-            return {
-                "scheme": scheme,
-                "band_start": (None if _get("qp_wfn_band_start") is None
-                               else int(_get("qp_wfn_band_start"))),
-                "band_stop": (None if _get("qp_wfn_band_stop") is None
-                              else int(_get("qp_wfn_band_stop"))),
-                "source": _get("qp_wfn_source", "") or "",
-                "qp_solver": _get(QP_SOLVER_ATTR),
-                "qp_energy_definition": _get(QP_ENERGY_DEFINITION_ATTR),
-                "sigma_eval_provenance": _get(
-                    SIGMA_EVAL_PROVENANCE_ATTR),
-            }
-    except (OSError, KeyError):
-        return None
 
 
 def _validate_qp_state_source(record, *, path: str) -> dict:
@@ -825,22 +698,6 @@ def _validate_qp_state_source(record, *, path: str) -> dict:
     return record
 
 
-def read_qp_state_source_provenance(path) -> dict | None:
-    """Read a restart source-state record; ``None`` means legacy/unproven."""
-    try:
-        with h5py.File(str(path), "r") as h5:
-            if QP_STATE_SOURCE_DATASET not in h5:
-                return None
-            raw = h5[QP_STATE_SOURCE_DATASET][()]
-        payload = raw if isinstance(raw, bytes) else np.asarray(raw).tobytes()
-        record = json.loads(payload.decode("utf-8", "strict").rstrip("\x00"))
-    except (OSError, KeyError):
-        return None
-    except (TypeError, ValueError, UnicodeError) as exc:
-        raise ValueError(
-            f"{path}: {QP_STATE_SOURCE_DATASET} is not valid UTF-8 JSON") \
-            from exc
-    return _validate_qp_state_source(record, path=str(path))
 
 
 def qp_state_source_provenance(wfn) -> dict:
@@ -866,7 +723,7 @@ def qp_state_source_provenance_from_binding(
         "wfn_fingerprint": _require_wfn_fingerprint(
             fingerprint_from_binding(wfn_fingerprint_binding, wfn),
             where="QP restart provenance bound WFN fingerprint"),
-        "qp_wfn_stamp": read_qp_wfn_stamp(source_path),
+        "qp_wfn_stamp": _bundle.read_qp_wfn_stamp(source_path),
     }
 
 
@@ -930,12 +787,12 @@ def _refuse_conflicting_qp_state_sources(
             "the matched U_mnk,E_qp for H_QP = U diag(E_qp) U^H.  Select "
             "exactly one.")
     external = eqp_file or qp_rotations_file
-    wfn_stamp = read_qp_wfn_stamp(wfn_path)
+    wfn_stamp = _bundle.read_qp_wfn_stamp(wfn_path)
     stamp = wfn_stamp
     authenticated_restart_source = None
 
     if state_artifact_path is not None:
-        provenance = read_qp_state_source_provenance(state_artifact_path)
+        provenance = _bundle.read_qp_state_source_provenance(state_artifact_path)
         if provenance is None:
             if external or wfn_stamp is not None:
                 requested = (f"diagonal eqp override {eqp_file}"
@@ -947,7 +804,7 @@ def _refuse_conflicting_qp_state_sources(
                     f"{where}: {requested} cannot be combined with "
                     f"{state_artifact_path}: that restart predates "
                     f"{QP_STATE_SOURCE_DATASET} and cannot prove which WFN "
-                    "supplied its matched psi_full_y/enk_full state.  "
+                    "supplied its matched psi_parent_y/enk_full state.  "
                     "Regenerate the restart from the selected WFN.  A legacy "
                     "restart remains usable only without an external or "
                     "positively stamped QP state.")
@@ -1055,3 +912,5 @@ def authenticate_restart_qp_state_source_for_wfn(
         raise AssertionError(
             "restart source authentication returned a torn host binding")
     return record, binding
+
+from . import restart_bundle as _bundle

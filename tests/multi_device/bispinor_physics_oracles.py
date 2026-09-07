@@ -285,7 +285,8 @@ def test_parent_sigma_all_vertices_q_convolution_and_projection(monkeypatch):
 
 def test_bare_tiles_metric_sign_and_complex_hermitian_companions(monkeypatch):
     """The TT metric is negative once, and reversing Lorentz endpoints takes the centroid dagger."""
-    from gw.v_q_bispinor import _make_per_q_v_builder_for_tile, BispinorVqReader
+    from gw.v_q_bispinor import (_make_per_q_v_builder_for_tile)
+    from file_io.restart_bundle import (BispinorVqReader)
     import gw.compute_vcoul
     from vcoul import COULOMB_GAUGE_TT_SIGN
     monkeypatch.setattr(gw.compute_vcoul,'compute_v_q_per_G',lambda *a,**k: np.array([[2.,3.]]))

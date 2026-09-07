@@ -23,8 +23,8 @@ from file_io.sigma_output import (
     SIGMA_OPERATOR_STATE_VERSION,
     SIGMA_OPERATOR_STATE_VERSION_ATTR,
     append_eqp_assembly_receipt_h5,
-    read_eqp_assembly_receipt,
 )
+from file_io.restart_bundle import (read_eqp_assembly_receipt)
 from gw.eqp_bgw import assemble_eqp
 
 
@@ -378,11 +378,8 @@ def test_receipt_lands_on_the_real_gnppm_run(gnppm_session):
     """
     import os
 
-    from file_io.sigma_output import (
-        EQP_ASSEMBLY_DATASET,
-        EQP_ASSEMBLY_FILE_ROWS_ATTR,
-        read_eqp_assembly_receipt,
-    )
+    from file_io.sigma_output import (EQP_ASSEMBLY_DATASET, EQP_ASSEMBLY_FILE_ROWS_ATTR)
+    from file_io.restart_bundle import (read_eqp_assembly_receipt)
 
     path = os.path.join(str(gnppm_session.run_dir), "sigma_mnk.h5")
     assert os.path.isfile(path), f"the gnppm session wrote no {path}"

@@ -937,42 +937,7 @@ def _metallic_occupations(ifmax, occupations):
 # Orchestrator: read the run directory and emit eqp{0,1}.dat
 # ---------------------------------------------------------------------------
 
-def _read_eval_energies_ev(
-	path: str, *, kirr_to_kfull: np.ndarray, band_start: int, band_stop: int,
-) -> np.ndarray:
-	"""The IBZ × sigma-window energies (eV) a QP artifact carries.
-
-	Reads either of the two files a run writes its converged spectrum to,
-	because both are legitimate answers to "what did Σ get evaluated at"
-	and which one is on disk depends on the deck:
-
-	``qp_wfn_rotations.h5`` — ``E_qp_nk_rydberg``, ALREADY on the sigma
-	    window (its band axis is ``band_range``), so it is indexed by
-	    ``kirr_to_kfull`` and not sliced in bands.  It is read through
-	    ``file_io.qp_wfn.read_qp_rotations_full_bz`` because that array may
-	    be stored on the file wedge; ``kirr_to_kfull`` is always a full-BZ
-	    index, so the indexing below is unchanged either way.  A file with
-	    no ``k_storage`` attr comes back verbatim.
-	``WFN_qp.h5``           — ``mf_header/kpoints/el``, the WFN file's own
-	    k-set (the IBZ) and ALL bands, so it is sliced in bands and not
-	    in k.
-	"""
-	with h5py.File(path, "r") as f:
-		has_rot = "E_qp_nk_rydberg" in f
-	if has_rot:
-		from file_io.qp_wfn import read_qp_rotations_full_bz
-		e = np.asarray(read_qp_rotations_full_bz(
-			path, datasets=("E_qp_nk_rydberg",))["E_qp_nk_rydberg"],
-			dtype=np.float64)
-		return e[np.asarray(kirr_to_kfull, dtype=np.int64)] * RYD_TO_EV
-	with h5py.File(path, "r") as f:
-		if "mf_header/kpoints/el" in f:
-			e = np.asarray(f["mf_header/kpoints/el"], dtype=np.float64)
-			return e[0][:, int(band_start):int(band_stop)] * RYD_TO_EV
-	raise ValueError(
-		f"{os.path.basename(path)} carries neither 'E_qp_nk_rydberg' "
-		f"(qp_wfn_rotations.h5) nor 'mf_header/kpoints/el' (WFN_qp.h5); it "
-		f"cannot say what energies Sigma was evaluated at.")
+from file_io.restart_bundle import _read_eval_energies_ev
 
 
 def make_eqp_bgw(
@@ -1038,9 +1003,10 @@ def make_eqp_bgw(
 	nk_irr = kpoints_irr.shape[0]
 
 	# IBZ → full-BZ index map; band_range
-	with h5py.File(qp_rotations_path, "r") as qp:
-		band_range = np.asarray(qp["band_range"], dtype=np.int64)
-		kirr_to_kfull = np.asarray(qp["kirr_to_kfull"], dtype=np.int64)
+	from file_io.restart_bundle import read_qp_rotations_artifact
+	artifact = read_qp_rotations_artifact(qp_rotations_path)
+	band_range = artifact["band_range"]
+	kirr_to_kfull = artifact["kirr_to_kfull"]
 	band_start, band_stop = int(band_range[0]), int(band_range[1])
 	nb_window = band_stop - band_start
 	if kirr_to_kfull.size != nk_irr:
@@ -1059,7 +1025,7 @@ def make_eqp_bgw(
 
 	# Post-hoc assembly consumes the completed live-driver receipt.  Older
 	# raw cubes cannot prove that their Hartree column came from G-space.
-	from file_io.sigma_output import read_eqp_assembly_receipt
+	from file_io.restart_bundle import (read_eqp_assembly_receipt)
 	_receipt = read_eqp_assembly_receipt(sigma_mnk_path)
 	if _receipt is None:
 		raise ValueError(
@@ -1152,7 +1118,7 @@ def make_eqp_bgw(
 	# indices — an ``(nrk, nb, nb)`` array.  Imported lazily (as
 	# ``gw.sigma_dispatch`` does) so this module stays importable without
 	# pulling in the JAX-dependent file_io stack.
-	from file_io.kin_ion import read_full_bz_dataset, read_kin_ion_provenance
+	from file_io.restart_bundle import (read_full_bz_dataset, read_kin_ion_provenance)
 	if bool(read_kin_ion_provenance(kin_ion_path).get("has_hartree", False)):
 		raise ValueError(
 			"post-hoc EQP refuses a retired kin_ion with folded Hartree; "

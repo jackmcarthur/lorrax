@@ -74,7 +74,8 @@ def _mean_field_wfn(path):
 # ---------------------------------------------------------------------------
 
 def test_the_reader_identifies_a_stamped_qp_wfn(tmp_path):
-    from file_io.qp_wfn import QP_WFN_SCHEME, read_qp_wfn_stamp
+    from file_io.qp_wfn import (QP_WFN_SCHEME)
+    from file_io.restart_bundle import (read_qp_wfn_stamp)
 
     p = tmp_path / "WFN_qp.h5"
     _stamped_qp_wfn(p)
@@ -85,7 +86,7 @@ def test_the_reader_identifies_a_stamped_qp_wfn(tmp_path):
 
 
 def test_the_reader_exposes_additive_one_shot_method_provenance(tmp_path):
-    from file_io.qp_wfn import read_qp_wfn_stamp
+    from file_io.restart_bundle import (read_qp_wfn_stamp)
 
     p = tmp_path / "WFN_qp.h5"
     _stamped_qp_wfn(p, with_method_provenance=True)
@@ -102,7 +103,7 @@ def test_an_unstamped_wfn_is_unverifiable_not_mean_field(tmp_path):
     A pw2bgw WFN carries no stamp, and so does a QP WFN written before the
     stamp existed.  The reader must not pretend to tell them apart.
     """
-    from file_io.qp_wfn import read_qp_wfn_stamp
+    from file_io.restart_bundle import (read_qp_wfn_stamp)
 
     p = tmp_path / "WFN.h5"
     _mean_field_wfn(p)
@@ -112,7 +113,8 @@ def test_an_unstamped_wfn_is_unverifiable_not_mean_field(tmp_path):
 
 def test_a_foreign_scheme_is_reported_verbatim(tmp_path):
     """A future scheme must be visible as a different word, not mapped."""
-    from file_io.qp_wfn import QP_WFN_SCHEME, read_qp_wfn_stamp
+    from file_io.qp_wfn import (QP_WFN_SCHEME)
+    from file_io.restart_bundle import (read_qp_wfn_stamp)
 
     p = tmp_path / "WFN_qp.h5"
     _stamped_qp_wfn(p, scheme="lorrax-qp-wfn-v99")

@@ -23,19 +23,8 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from .absorption_common import (
-    RYD2EV,
-    exciton_dipole_projections,
-    jdos_from_transitions,
-    kramers_kronig_eps1,
-    load_dipole_h5,
-    load_eigenvectors_h5,
-    lorentzian_broaden,
-    slice_dipole_to_bse_window,
-    write_absorption_dat,
-    write_absorption_h5,
-    write_eigenvalues_dat,
-)
+from .absorption_common import (RYD2EV, exciton_dipole_projections, jdos_from_transitions, kramers_kronig_eps1, load_eigenvectors_h5, lorentzian_broaden, slice_dipole_to_bse_window, write_absorption_dat, write_absorption_h5, write_eigenvalues_dat)
+from file_io.restart_bundle import (load_dipole_h5)
 
 
 def compute_dipole_projections(A, d_alpha):

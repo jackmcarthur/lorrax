@@ -16,7 +16,7 @@ THE HEADLINE PROPERTY, and the thing to protect if anyone proposes changing
 this file: the output is a restart bundle in the **unchanged format** at a
 smaller mu.  Not a new bespoke layout, not a sidecar.  That is what makes
 every existing BSE consumer a zero-change drop-in —
-``bse_io.load_bse_data_from_restart_sharded`` reads it, ``_MunuSlabPlan``
+``bse_io.load_bse_data_from_restart_sharded`` reads it, ``file_io.restart_bundle``
 plans it, the ring and stack matvecs eat it, and none of them learns that a
 downfold happened.  If a reviewer proposes a bespoke ``.h5`` for downfolded
 objects, the answer is no.
@@ -36,7 +36,7 @@ built to serve.
 
 WHAT THE BAND AXIS DOES *NOT* DO, in stage 1.  The retained band window is
 the FIT window — it decides which pair densities the compression is faithful
-to.  It is NOT a truncation of the stored band axis: ``psi_full_y`` and
+to.  It is NOT a truncation of the stored band axis: ``psi_parent_y`` and
 ``enk_full`` are written with their band axis unchanged, and only mu is
 compressed.  That is deliberate.  Truncating bands would renumber every band
 index in the bundle, move the ``band_window`` stamp that
@@ -69,6 +69,7 @@ from file_io import (
     write_head_scalars_to_h5,
     write_restart_state_to_h5,
 )
+from file_io.restart_bundle import read_downfold_inputs, read_interaction_orbits
 from file_io.wfn_basis import centroid_table_md5 as _centroid_table_md5
 from gw.downfold import (
     BandWindow,
@@ -173,134 +174,8 @@ def resolve_restart_file(path: str) -> str:
     return os.path.abspath(cands[0])
 
 
-def _read_geometry(filename: str) -> dict:
-    """The small, replicated facts, read serially before any tensor moves."""
-    with h5py.File(filename, "r") as f:
-        psi_key = "psi_full_y" if "psi_full_y" in f else "psi_parent_y"
-        if psi_key not in f:
-            raise ValueError(f"downfold: {filename} has no centroid wavefunctions.")
-        if "V_qmunu" not in f:
-            raise ValueError(
-                f"downfold: {filename} has no V_qmunu.")
-        if "W0_qmunu" not in f:
-            raise ValueError(
-                f"downfold: {filename} has no W0_qmunu — the parent GW run "
-                f"wrote its V and psi but never got as far as persisting the "
-                f"screened interaction.  A downfold of V alone is a "
-                f"legitimate thing to want and is not what this driver does; "
-                f"finish the parent run first.")
-        if not bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
-            raise ValueError(
-                f"downfold: {filename} carries W0_qmunu but its W0_ready "
-                f"flag is FALSE — the dataset is the all-zeros PLACEHOLDER "
-                f"the writer pre-allocates, not screening.  Downfolding it "
-                f"would produce a small bundle full of zeros that every "
-                f"shape check passes; the flag exists because that happened "
-                f"once already.  Re-run the parent GW to completion.")
-        if not bool(f["V_qmunu"].attrs.get("V_ready", True)):
-            raise ValueError(
-                f"downfold: {filename} says V_ready = False.")
-        geom = {
-            "n_rmu_logical": (int(np.asarray(f["n_rmu_logical"])[()])
-                              if "n_rmu_logical" in f
-                              else int(f["V_qmunu"].shape[-1])),
-            "kgrid": (tuple(int(v) for v in np.asarray(f["kgrid"])[:])
-                      if "kgrid" in f else None),
-            "band_window": (np.asarray(f["band_window"])[:].astype(np.int64)
-                            if "band_window" in f else None),
-            "band_window_split": (
-                np.asarray(f["band_window_split"])[:].astype(np.int64)
-                if "band_window_split" in f else None),
-            "nb": int(f[psi_key].shape[1]),
-            "nk": int(f["psi_full_y" if "psi_full_y" in f else "enk_full"].shape[0]),
-            "nspinor": int(f[psi_key].shape[2]),
-            "vhead": (np.asarray(f["vhead"])[()] if "vhead" in f else None),
-            "whead": (np.asarray(f["whead"][:]) if "whead" in f else None),
-            "omega_grid": (np.asarray(f["whead"].attrs["omega_grid"])
-                           if "whead" in f and "omega_grid" in f["whead"].attrs
-                           else None),
-            # The head INTEGRAND's S tensor.  It rides through a downfold
-            # untouched for the same reason vhead/whead do: the head channel
-            # is a property of the cell and the screening, not of the ISDF
-            # basis the tensors were compressed into.  Dropping it would make
-            # a downfolded bundle silently unable to densify W (the child
-            # would have to rebuild S from dipole.h5, which a bundle-only
-            # consumer has no path to).
-            "S_cart": (np.asarray(f["S_cart_head"][:])
-                       if "S_cart_head" in f else None),
-            "centroids_charge_md5": f.attrs.get("centroids_charge_md5"),
-            "present": tuple(n for n in _MUNU_TENSORS if n in f),
-        }
-    if geom["kgrid"] is None:
-        raise ValueError(
-            f"downfold: {filename} carries no kgrid, so the q axis of "
-            f"V/W cannot be split into (nkx, nky, nkz).  The Gram build is a "
-            f"convolution over k and needs that split; there is no way to "
-            f"guess it from the flat q extent.  The bundle predates the "
-            f"kgrid stamp — regenerate it with a current gw_jax, or read the "
-            f"grid off the WFN the parent run used and note that this "
-            f"driver deliberately does not take a WFN (its whole premise is "
-            f"that a finished restart is self-describing).")
-    return geom
 
 
-def _read_parent_unfold_tables(src: str, mu_L: int, print_fn):
-    """The parent's ``QirrTables``, or ``None`` when it stores the full BZ.
-
-    THE TABLE IS READ, NOT RE-DERIVED, and that is the whole point.  Building
-    ``(α, L)`` from geometry needs the parent's symmetry ops, which live on a
-    WFN this driver deliberately does not open — and even if it did, a
-    second derivation of the permutation would be a second answer to a
-    question the parent's own file already answers.  ``qirr_store`` persists
-    the tables beside the tensor they deconstructed, so the selection is
-    closed under exactly the permutation the parent's wedge storage rests on.
-
-    Returns ``None`` — an ABSENCE, announced as one — when the parent's
-    ``V_qmunu`` is stored on the full BZ.  Nothing is wrong in that case; the
-    selection is point-granular, closure is unmeasured, and the child cannot
-    be wedge-stored because there is no wedge in its lineage to store it on.
-    """
-    from ffi import _services
-    _services.ensure_on_path()
-    from symmetry_maps import dataset_q_storage, read_tables
-
-    try:
-        with h5py.File(src, "r") as f:
-            storage = dataset_q_storage(f["V_qmunu"])
-        if storage != "ibz":
-            print_fn(
-                "  [downfold/star] the parent stores V_qmunu on the FULL BZ, "
-                "so it carries no centroid source map and this run's "
-                "selection is POINT-GRANULAR: orbit closure is UNMEASURED, "
-                "which is an absence and not a pass, and the child cannot be "
-                "wedge-stored (there is no wedge in its lineage).  Set the "
-                "PARENT run's restart_q_storage = auto to get both.")
-            return None
-        tables = read_tables(src, "V_qmunu")
-    except (KeyError, ValueError, OSError) as exc:
-        print_fn(
-            f"  [downfold/star] the parent's q_irr tables could not be read "
-            f"({type(exc).__name__}: {exc}).  Falling back to a "
-            f"POINT-GRANULAR selection with closure UNMEASURED — an absence, "
-            f"not a pass.")
-        return None
-
-    perm = np.asarray(tables.sym_perm)
-    if int(perm.shape[1]) < int(mu_L):
-        raise ValueError(
-            f"downfold: the parent's stored sym_perm describes "
-            f"{int(perm.shape[1])} centroids but the bundle declares "
-            f"mu_L={mu_L}.  The table and the tensor are not about the same "
-            f"centroid set, and selecting orbits against the wrong table "
-            f"would produce a child whose 'orbits' are arbitrary index "
-            f"classes.")
-    print_fn(
-        f"  [downfold/star] parent centroid source map read from its own "
-        f"q_irr tables: {int(perm.shape[0])} op rows "
-        f"({int(tables.n_sym_spatial)} spatial + TRS) over "
-        f"{int(perm.shape[1])} centroids, {int(np.asarray(tables.q_irr_frac).shape[0])} "
-        f"of {int(np.asarray(tables.irr_idx_q).shape[0])} q on the wedge.")
-    return tables
 
 
 def _wedge_q_slots(tables) -> np.ndarray:
@@ -748,34 +623,12 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
 
     with timing.section("downfold.load", announce=True,
                         label="parent restart bundle"):
-        geom = _read_geometry(src)
+        parent_input = getattr(cfg, "parent_input_file", "")
+        geom, rs, tensors = read_downfold_inputs(src, parent_input, mesh_xy)
         mu_L = int(geom["n_rmu_logical"])
         window = BandWindow(left=tuple(cfg.band_range_left),
                             right=tuple(cfg.band_range_right))
         window.validate(geom["nb"])
-        rs = load_restart_state_from_h5(src, mesh_xy)
-        if getattr(rs, "psi_nmu_parent", None) is not None:
-            from bse.bse_loading import _unfold_bse_parent_faces
-            parent_input = getattr(cfg, "parent_input_file", "")
-            if not parent_input:
-                run_dir = os.path.dirname(src)
-                if os.path.basename(run_dir) == "tmp":
-                    run_dir = os.path.dirname(run_dir)
-                parent_input = os.path.join(run_dir, "cohsex.in")
-            (psi,) = _unfold_bse_parent_faces(
-                (rs.psi_nmu_parent,), src, parent_input, mesh_xy)
-            rs.psi_rmu_Y = jax.lax.with_sharding_constraint(
-                psi, NamedSharding(mesh_xy, P(None, None, None, "y")))
-            rs.psi_rmuT_X = jax.lax.with_sharding_constraint(
-                jnp.conj(psi).transpose(0, 3, 1, 2),
-                NamedSharding(mesh_xy, P(None, "x", None, None)))
-            rs.psi_nmu_parent = rs.psi_mun_parent = None
-        tensors = {}
-        for name in geom["present"]:
-            if name == "V_qmunu":
-                tensors[name] = rs.V_qmunu
-            else:
-                tensors[name] = read_munu_tensor_from_h5(src, name, mesh_xy)
         n_q = int(tensors["V_qmunu"].shape[0])
         mu_L_pad = int(tensors["V_qmunu"].shape[-1])
 
@@ -822,7 +675,7 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
         # rests on.  With it, the selection runs in whole orbits and floors to
         # the user's point budget (owner ruling, 2026-08-10); without it, the
         # selection is point-granular and closure is an ABSENCE.
-        parent_tables = _read_parent_unfold_tables(src, mu_L, print_fn)
+        parent_tables = read_interaction_orbits(src, mu_L, print_fn)
         keep_idx, sel = select_cur_centroids(
             S_q0, cfg.mu_small, rcond=cfg.downfold_rcond,
             select_tol=cfg.downfold_select_tol, mesh_xy=mesh_xy,
@@ -1022,7 +875,7 @@ def _write_small_bundle(cfg, geom, small, g0_S, enk_full, psi_S, keep_idx,
                    if geom["band_window"] is not None else None)
     parent_file = resolve_restart_file(cfg.source_restart)
     policy = read_coulomb_policy_from_h5(parent_file)
-    from file_io.qp_wfn import read_qp_state_source_provenance
+    from file_io.restart_bundle import (read_qp_state_source_provenance)
 
     # THE COULOMB POLICY IS INHERITED VERBATIM, and stamped.  The congruence
     # is LINEAR and applied AFTER the Dyson solve, so the head convention
@@ -1039,9 +892,8 @@ def _write_small_bundle(cfg, geom, small, g0_S, enk_full, psi_S, keep_idx,
         qp_state_source_record=read_qp_state_source_provenance(parent_file),
         kgrid=tuple(int(v) for v in geom["kgrid"]),
         band_slices=band_slices, coulomb_policy=policy)
-    write_restart_state_to_h5(
-        out_file, n_rmu_logical=int(mu_S), psi_full_y=psi_S,
-        mesh=mesh_xy, mode="a")
+    from file_io.tagged_arrays import write_parent_wavefunctions
+    write_parent_wavefunctions(out_file, psi_S, n_rmu_logical=int(mu_S), mesh=mesh_xy)
 
     # The _nohead twins, when the parent had them.  Same congruence, same
     # writer; they are read-only opt-ins that nothing in-tree writes, so a
@@ -1322,7 +1174,7 @@ def write_downfolded_zeta(src_restart, out_file, T_x, keep_idx, mu_S, n_q,
             f"downfold read; transporting it would attach the wrong "
             f"interpolation vectors to the right numbers.")
 
-    from zeta_loader import ZetaLoader
+    from file_io.restart_bundle import (open_zeta as ZetaLoader)
     zl = ZetaLoader(src_zeta, mesh=None)
     try:
         nq_disk = int(np.asarray(zl.ngk_per_q).shape[0])

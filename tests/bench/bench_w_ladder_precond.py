@@ -32,6 +32,7 @@ that is a property of the method, not of the harness, and the driver says so
 rather than quietly timing something else.
 """
 from __future__ import annotations
+from file_io import restart_bundle
 
 import argparse
 import os
@@ -64,7 +65,7 @@ def _payload(run_dir: str, input_name: str):
     from bse import bse_io
     from common.collectives import single_device_mesh
     input_path = os.path.join(run_dir, input_name)
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     mesh = single_device_mesh()
     # FULL chi0 band window on both legs — band-window parity with the W_R
     # kernel, the same call w_ladder.compute_wc_qwedge makes.

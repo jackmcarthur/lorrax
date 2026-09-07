@@ -76,7 +76,8 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-from zeta_loader import ZetaLoader, probe_zeta_file              # noqa: E402
+from zeta_loader import (probe_zeta_file)
+from file_io.restart_bundle import (open_zeta as ZetaLoader)
 # The vcoul door, for the ONE thing this module needs from it: the
 # Cartesian reciprocal rows, taken as a geometry rather than written out as
 # ``blat * bvec`` at the V_q call site below.
@@ -2668,9 +2669,8 @@ def _compute_photon_vq(
                     charge_representation=None,
                     spatial_current_representation=None,
                 )
-    from file_io.tagged_arrays import read_munu_tensor_from_h5
-    V_q_raw = read_munu_tensor_from_h5(
-        bispinor_h5_path, tile_dataset_name(0, 0), mesh_xy)
+    from file_io.restart_bundle import read_photon_charge
+    V_q_raw = read_photon_charge(bispinor_h5_path, mesh_xy)
     G0_all = photon_g0_vectors[0]
     if not uses_coupled_photon_head(cfg):
         photon_g0_vectors = None
@@ -3101,16 +3101,6 @@ def _read_authenticated_restart(
         _to_run_order, band_slices, cfg, load_restart_state_from_h5, mesh_xy, meta, print0,
         tensors_filename):
     """Produce the validated stored tensors and their charge zeta identity."""
-    with h5py.File(tensors_filename, 'r') as header:
-    	names = ('psi_parent_y', 'psi_parent_y_mun')
-    	if cfg.bispinor:
-    		names += ('psi_parent_y_transverse', 'psi_parent_y_transverse_mun')
-    	if not all(name in header for name in names) or any(
-    			name in header for name in ('psi_full_y', 'psi_full_y_mun',
-    			'psi_full_y_transverse', 'psi_full_y_transverse_mun')):
-    		raise ValueError(
-    			"GW restart requires raw-parent wavefunctions; this file stores "
-    			"an incomplete or retired full-k carrier. Rerun with restart = false.")
     rs = load_restart_state_from_h5(
     	tensors_filename, mesh_xy, band_slices=band_slices,
     	n_rmu_logical=int(meta.n_rmu),
@@ -3139,11 +3129,10 @@ def _restart_charge_basis(
     """Produce the restart centroid stamps and authenticated charge basis receipt."""
     _stamped = {}
     try:
-    	with h5py.File(tensors_filename, 'r') as _f:
-    		for _a in ('centroids_charge_md5',
-    		           'centroids_transverse_md5'):
-    			if _a in _f.attrs:
-    				_stamped[_a] = str(_f.attrs[_a])
+        from file_io.restart_bundle import read_metadata
+        _hashes = read_metadata(tensors_filename)["centroid_hashes"]
+        _stamped = {"centroids_charge_md5": _hashes["charge"],
+                    "centroids_transverse_md5": _hashes["current"]}
     except Exception as exc:
     	print0(f"  [restart guard] could not read centroid hash "
     	       f"attrs from {tensors_filename} "
@@ -3370,25 +3359,11 @@ def _restart_gamma_vectors(
         _to_run_order, basis_T, cfg, mesh_xy, meta, photon_g0_vectors, tmp_dir):
     """Produce canonical Gamma vectors from the stored one-leg factors."""
     if uses_coupled_photon_head(cfg):
-    	from file_io.slab_io import SlabIO
-    	from jax.sharding import PartitionSpec
-    	head_path = os.path.join(tmp_dir, "v_q_bispinor.h5")
-    	with h5py.File(head_path, "r") as header:
-    		for channel in range(4):
-    			basis = meta.mu_basis if channel == 0 else basis_T
-    			name = f"photon_g0_vectors_{channel}"
-    			if name not in header or header[name].shape != (1, basis.n_logical):
-    				raise ValueError(
-    					"Packed photon restart requires canonical Gamma vectors; "
-    					"rerun restart=false to write the current schema.")
-    	with SlabIO(head_path, mode="r", mesh=mesh_xy) as head_io:
-    		photon_g0_vectors = tuple(
-    			_to_run_order(head_io.read_slab(
-    				f"photon_g0_vectors_{channel}",
-    				shape=(1, basis.n_canonical),
-    				partition_spec=PartitionSpec(None, "x"), dtype=jnp.complex128),
-    				(1,), basis)
-    			for channel, basis in enumerate((meta.mu_basis, basis_T, basis_T, basis_T)))
+        from file_io.restart_bundle import read_photon_gamma
+        bases = (meta.mu_basis, basis_T, basis_T, basis_T)
+        photon_g0_vectors = tuple(
+            _to_run_order(vector, (1,), basis)
+            for vector, basis in zip(read_photon_gamma(tmp_dir, mesh_xy, bases), bases))
     return (photon_g0_vectors)
 
 def _prepare_restart_isdf(

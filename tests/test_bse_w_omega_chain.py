@@ -11,6 +11,8 @@ converges monotonically with chain length, and that it emits the established
 ``(mu_X, nu_Y)`` tile.  Tolerances are tied to the measured convergence at the
 gate's chain length (PHASE2_LOG "W(omega) Lanczos-chain model").
 """
+
+from file_io import restart_bundle
 import numpy as np
 import pytest
 import jax
@@ -48,7 +50,7 @@ def _chain_rel(chain, data, snapshot, sh, z, w_oracle, cols, nlog, m_use=None):
 @pytest.mark.gpu
 def test_w_omega_chain_matches_oracle_q0(gnppm_session):
     input_path = str(gnppm_session.run_dir / gnppm_session.input_name)
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
     data = bse_io.load_bse_data_from_restart_sharded(
         restart, n_val=10**9, n_cond=10**9, mesh_xy=mesh,
@@ -97,7 +99,7 @@ def test_w_omega_chain_matches_oracle_q0(gnppm_session):
 @pytest.mark.gpu
 def test_w_omega_chain_matches_oracle_finite_q(gnppm_session):
     input_path = str(gnppm_session.run_dir / gnppm_session.input_name)
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
     data = bse_io.load_bse_data_from_restart_sharded(
         restart, n_val=10**9, n_cond=10**9, mesh_xy=mesh,

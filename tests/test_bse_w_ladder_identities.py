@@ -26,6 +26,8 @@ this feature and must stay green unchanged; nothing here imports from them.
 """
 from __future__ import annotations
 
+from file_io import restart_bundle
+
 import ast
 import inspect
 import re
@@ -56,7 +58,7 @@ from bse.w_ladder import (                                       # noqa: E402
 def ladder_payload(gnppm_session):
     """Head-less 2v2c BSE payload + 1x1 mesh (same shape as the dense gate's)."""
     input_path = str(gnppm_session.run_dir / gnppm_session.input_name)
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
     data = bse_io.load_bse_data_from_restart_sharded(
         restart, n_val=2, n_cond=2, mesh_xy=mesh, input_file=input_path,
@@ -319,7 +321,7 @@ def test_compute_wc_qwedge_end_to_end(gnppm_session):
 
     from common.collectives import single_device_mesh
     input_path = str(gnppm_session.run_dir / gnppm_session.input_name)
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     mesh = single_device_mesh()
     # BOUNDED PROBE CHUNK.  ``probe_chunk=None`` solves the whole padded basis
     # (399 columns on this fixture) as one block, which is the shape that made

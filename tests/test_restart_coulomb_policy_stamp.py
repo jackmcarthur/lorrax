@@ -33,15 +33,17 @@ if _SRC not in sys.path:
 
 h5py = pytest.importorskip("h5py")
 
-from file_io.tagged_arrays import (  # noqa: E402
+from file_io.tagged_arrays import (
     COULOMB_POLICY_DATASET,
     COULOMB_POLICY_KEYS,
     compare_coulomb_policy,
     coulomb_policy_from_config,
-    describe_coulomb_policy_match,
-    describe_coulomb_policy_stamp,
     format_coulomb_policy,
     parse_coulomb_policy,
+)
+from file_io.restart_bundle import (
+    describe_coulomb_policy_match,
+    describe_coulomb_policy_stamp,
     read_coulomb_policy_from_h5,
 )
 

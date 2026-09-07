@@ -1434,7 +1434,8 @@ def _read_static_photon_body(
     from .photon_layout import (
         PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
         pack_photon_operator)
-    from .v_q_bispinor import ZERO_TILES, BispinorVqReader
+    from .v_q_bispinor import (ZERO_TILES)
+    from file_io.restart_bundle import (BispinorVqReader)
     plans = (wfns_charge.green_parent.plan, wfns_transverse.green_parent.plan)
     sym = plans[0].sym
     from .qgrid_symmetry import qgrid_trs_policy_for
@@ -1493,7 +1494,8 @@ def _screen_static_photon_body(
     from .photon_layout import (
         PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
         pack_photon_operator)
-    from .v_q_bispinor import ZERO_TILES, BispinorVqReader
+    from .v_q_bispinor import (ZERO_TILES)
+    from file_io.restart_bundle import (BispinorVqReader)
     if screen_current:
         chi_packed = compute_experimental_no_pair_photon_chi0(
             wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,

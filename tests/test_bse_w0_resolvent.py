@@ -8,6 +8,8 @@ chain touched by the W(0) cross-check: ``inject_head=False`` loading, the
 ``screening=True`` B-block, ``ensure_W_R``, the probe generator/snapshot, and the
 [f; -f] / X+Y symplectic convention.
 """
+
+from file_io import restart_bundle
 import numpy as np
 import pytest
 import jax
@@ -24,7 +26,7 @@ from symmetry_maps import kgrid_shift_map                        # noqa: E402
 @pytest.mark.gpu
 def test_w0_resolvent_matches_restart(gnppm_session):
     input_path = str(gnppm_session.run_dir / gnppm_session.input_name)
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
 
     # FULL chi0 window (n_occ x n_cond), head-less bodies on both sides.
@@ -90,7 +92,7 @@ def test_wq_resolvent_matches_restart_finite_q(gnppm_session):
     (head-carrying) finite-q operator.  Compares each q vs its OWN tile (finite-q
     tiles are ~3% non-covariant under centroid permutation — never sym-unfold)."""
     input_path = str(gnppm_session.run_dir / gnppm_session.input_name)
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), axis_names=("x", "y"))
 
     data = bse_io.load_bse_data_from_restart_sharded(

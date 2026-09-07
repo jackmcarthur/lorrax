@@ -16,7 +16,8 @@ def main():
     from common.meta import Meta
     from common.wfn_transforms import load_centroids_band_chunked
     from file_io.centroids import load_centroids
-    from file_io.tagged_arrays import write_restart_state_to_h5, read_restart_state_from_h5
+    from file_io.tagged_arrays import (write_restart_state_to_h5)
+    from file_io.restart_bundle import (read_restart_state_from_h5)
     from gw.wavefunction_bundle import parent_faces
     from wfn_loader import WfnLoader
 
@@ -43,7 +44,7 @@ def main():
                 wfn, sym, meta, points, True, mesh, band_range=(0, args.bands),
                 band_chunk_size=args.bands, k_domain="ibz", bispinor_lift="raw"), mesh_xy=mesh)
         else:
-            source = incoming[13:15] if family == 0 else incoming[16:18]
+            source = (incoming.psi_nmu_parent, incoming.psi_mun_parent) if family == 0 else (incoming.psi_nmu_parent_transverse, incoming.psi_mun_parent_transverse)
             faces = tuple(basis.pack_axis(value, axis) for value, axis in zip(source, (3, 2)))
         bases.append(basis)
         packed.append(faces)
@@ -57,7 +58,7 @@ def main():
         parent_k_rows=sym.kirr_fullids, mesh=mesh, mode="w")
     read = read_restart_state_from_h5("parent_restart.h5", mesh, low_mem_bands=True)
     errors = []
-    for basis, faces, restored in zip(bases, packed, (read[13:15], read[16:18])):
+    for basis, faces, restored in zip(bases, packed, ((read.psi_nmu_parent, read.psi_mun_parent), (read.psi_nmu_parent_transverse, read.psi_mun_parent_transverse))):
         for face, value, axis in zip(faces, restored, (3, 2)):
             error = float(jnp.max(jnp.abs(face - basis.pack_axis(value, axis))))
             assert error == 0.0, error

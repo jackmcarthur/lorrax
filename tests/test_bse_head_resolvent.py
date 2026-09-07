@@ -30,6 +30,8 @@ Every cell is seconds on one device.
 """
 from __future__ import annotations
 
+from file_io import restart_bundle
+
 from typing import NamedTuple
 
 import numpy as np
@@ -534,7 +536,7 @@ def test_conditioning_on_the_real_gnppm_ladder_payload(gnppm_session, mesh):
     from bse import bse_io
 
     input_path = str(gnppm_session.run_dir / gnppm_session.input_name)
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     data = bse_io.load_bse_data_from_restart_sharded(
         restart, n_val=2, n_cond=2, mesh_xy=mesh, input_file=input_path,
         inject_head=False)

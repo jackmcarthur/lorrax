@@ -34,7 +34,8 @@ from .bse_ring_comm import (
     create_mesh_xy_from_flags,
     make_bse_shardings,
 )
-from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
+from .bse_io import (load_bse_data_from_restart_sharded)
+from file_io.restart_bundle import (_find_restart_file)
 from common.collectives import gather_to_host
 import common.timing as timing
 

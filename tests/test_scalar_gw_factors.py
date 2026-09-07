@@ -191,7 +191,7 @@ def test_kin_ion_validator_refuses_a_spin_structure_mismatch(tmp_path):
     a file built from an nspinor=2 WFN consumed by a scalar run puts a
     wrong-by-construction T+V_ion into a ~500 eV cancellation.  The
     refusal names both values."""
-    from file_io.kin_ion import validate_kin_ion_against_run
+    from file_io.restart_bundle import (validate_kin_ion_against_run)
     p = _write_min_kin_ion(tmp_path / "kin_ion.h5", nspinor=2)
     with pytest.raises(ValueError, match=r"nspinor=2.*nspinor=1"):
         validate_kin_ion_against_run(p, nspinor=1, expected_bispinor=False,
@@ -199,7 +199,7 @@ def test_kin_ion_validator_refuses_a_spin_structure_mismatch(tmp_path):
 
 
 def test_kin_ion_validator_green_and_legacy_twins(tmp_path):
-    from file_io.kin_ion import validate_kin_ion_against_run
+    from file_io.restart_bundle import (validate_kin_ion_against_run)
     # Green: matching stamp passes.
     p = _write_min_kin_ion(tmp_path / "kin_ion_match.h5", nspinor=2)
     validate_kin_ion_against_run(p, nspinor=2, expected_bispinor=False,

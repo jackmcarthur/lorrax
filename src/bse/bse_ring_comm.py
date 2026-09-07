@@ -24,7 +24,8 @@ from common.fft_helpers import (
     make_sharded_ifftn_3d,
 )
 from common.vma import mark_varying
-from .bse_io import _find_restart_file, _load_ring_subset, load_bse_data_from_restart_sharded
+from .bse_io import (_load_ring_subset, load_bse_data_from_restart_sharded)
+from file_io.restart_bundle import (_find_restart_file)
 from .bse_serial import apply_D, apply_bse_hamiltonian_single_device, compute_pair_amplitude
 
 

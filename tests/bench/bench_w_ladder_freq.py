@@ -25,6 +25,7 @@ convention (`build_finite_q_data`), engine built ONCE — the same discipline as
 ``w_ladder.sweep_q_wedge``.
 """
 from __future__ import annotations
+from file_io import restart_bundle
 
 import argparse
 import os
@@ -43,7 +44,7 @@ def _payload(run_dir: str, input_name: str):
     from bse import bse_io
     from common.collectives import single_device_mesh
     input_path = os.path.join(run_dir, input_name)
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     mesh = single_device_mesh()
     # FULL chi0 band window on both legs — band-window parity with the W_R
     # kernel, same reasoning as w_ladder.compute_wc_qwedge.

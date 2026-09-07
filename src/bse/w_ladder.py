@@ -874,8 +874,8 @@ def compute_wc_qwedge(
     _assert_pad_block_is_zero(wc, nlog)
     head_result = None
     if head_dipole_path is not None:
-        from .absorption_common import (
-            load_dipole_h5, slice_dipole_to_bse_window)
+        from .absorption_common import (slice_dipole_to_bse_window)
+        from file_io.restart_bundle import (load_dipole_h5)
         from .head_resolvent import (
             build_head_dipole, build_head_operator, solve_head_tensor)
 

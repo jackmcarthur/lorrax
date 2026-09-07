@@ -156,7 +156,7 @@ def test_b_retained_escape_grows_grid_in_the_same_map(core_fixtures):
     growth = second.index("SC sampled-support growth: band=2, k=0")
     assert growth < second.index("Started Sigma tau sweep")
     assert "protected=1-2 in_range=1" in second
-    from file_io.sigma_output import read_eqp_assembly_receipt
+    from file_io.restart_bundle import (read_eqp_assembly_receipt)
     receipt = read_eqp_assembly_receipt(str(run / "mpa_sc1_sigma.h5"))
     grid = np.asarray(receipt['omega_rel_ev'])
     assert grid[-1] > 9.7

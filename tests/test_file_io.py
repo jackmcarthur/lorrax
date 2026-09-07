@@ -1319,8 +1319,8 @@ def test_the_writers_stamp_survives_its_own_reader(tmp_path):
     and the reader refuses.
     """
     from file_io._slab_io_ffi import _apply_dataset_attrs
-    from file_io.kin_ion import (IRR_IDX_DATASET, SYM_IDX_DATASET,
-                                 read_star_map)
+    from file_io.kin_ion import (IRR_IDX_DATASET, SYM_IDX_DATASET)
+    from file_io.restart_bundle import (read_star_map)
 
     irr = np.array([0, 1, 1, 0], dtype=np.int32)
     sidx = np.array([0, 0, 3, 5], dtype=np.int32)

@@ -5,6 +5,8 @@ and eigensolves. This is entry-seam coverage, not a full numerical driver run.
 """
 from __future__ import annotations
 
+from file_io import restart_bundle
+
 import ast
 import hashlib
 import os
@@ -32,7 +34,7 @@ def resolve(request):
     assert len(calls) == 1, "each entry must resolve its restart once"
     namespace = {"__package__": "bse"}
     exec(compile(ast.Module(body=imports, type_ignores=[]), str(path), "exec"), namespace)
-    assert namespace["_find_restart_file"] is bse_loading._find_restart_file
+    assert namespace["_find_restart_file"] is restart_bundle._find_restart_file
     expression = compile(ast.Expression(body=calls[0]), str(path), "eval")
 
     def invoke(input_file):
@@ -101,7 +103,7 @@ def test_single_candidate_loads_the_same_tensor_values(tmp_path, nmu):
     import jax
 
     path = _bundle(tmp_path / f"isdf_tensors_{nmu}.h5", nmu)
-    resolved = bse_loading._find_restart_file(str(tmp_path / "cohsex.in"))
+    resolved = restart_bundle._find_restart_file(str(tmp_path / "cohsex.in"))
     # Host cell: the fixture validates file/discovery semantics, not sharding.
     with jax.default_device(jax.devices("cpu")[0]):
         expected = bse_loading._load_ring_subset(str(path), 1, 1, 1, 1, n_occ=1)

@@ -1002,10 +1002,8 @@ def resolve_qp_hamiltonian_state(
     if not os.path.isfile(path):
         raise FileNotFoundError(f"QP rotation artifact does not exist: {path}")
 
-    from file_io.qp_wfn import (
-        authenticate_qp_rotations_source_wfn,
-        read_qp_rotations_artifact,
-    )
+    from file_io.qp_wfn import (authenticate_qp_rotations_source_wfn)
+    from file_io.restart_bundle import (read_qp_rotations_artifact)
     artifact = read_qp_rotations_artifact(path)
     authenticate_qp_rotations_source_wfn(
         artifact, wfn, artifact_path=path)

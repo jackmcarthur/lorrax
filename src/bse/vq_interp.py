@@ -142,158 +142,14 @@ from common.sharding_fit import legal_spec as _legal_spec        # noqa: E402
 # The ζ file's DOOR.  TOP-LEVEL name only: ``zeta_loader.loader`` would be
 # a past-the-door edge and ``tests/test_layering.py`` fails on those.  The
 # ``ensure_on_path()`` above is what makes it resolvable in a bare launch.
-from zeta_loader import ZetaLoader                               # noqa: E402
+from file_io.restart_bundle import (open_zeta as ZetaLoader)
 
 
 # ===========================================================================
 # ζ transport — ONE reader for zeta_q.h5, TWO plans over it
 # ===========================================================================
-def _zeta_mesh_for_loader(mesh, log_fn=print):
-    """``(mesh_or_None, distributed)`` — the ζ transport decision, once.
-
-    ``ZetaLoader``'s data path is SlabIO, which REFUSES at open on a
-    stack whose phdf5 FFI is absent (``file_io.slab_io``'s module
-    docstring: there is one transport and nothing to demote to).  So the
-    decision of whether to hand the loader a mesh has to be taken BEFORE
-    constructing it, and it is taken here, once, and announced — because
-    "which transport ran" is the single most consequential fact about a
-    large run's I/O and a silent fallback is indistinguishable from a
-    hang (same reasoning, and the same probe, as
-    ``bse_io._bse_slabio_usable``).
-
-    Header-only (``None``) does NOT mean "no reader": the loader still
-    owns every metadata read on ``zeta_q.h5``.  It means the ζ TILES come
-    back through the local h5py plan, which INVARIANTS row 6 licenses as
-    the default — the defect that row records is a family with ONLY a
-    local plan, and after this change ``vq_interp`` has both.
-    """
-    if mesh is None:
-        return None, False
-    from file_io.slab_io import probe_availability
-    ok, stage, reason = probe_availability()
-    if not ok:
-        log_fn(f"  [vq_interp] SlabIO unavailable at probe stage '{stage}' "
-               f"({reason}); reading ζ with the local h5py q-hyperslab plan "
-               f"— memory-correct (one q-chunk per rank, no allgather) and "
-               f"un-sharded, so every rank reads the whole chunk.")
-        return None, False
-    return mesh, True
 
 
-class _ZetaGTiles:
-    """The lazy ``(nq, n_mu, ngkmax)`` ζ(G) stack, read through ONE owner.
-
-    ``zeta_q_G`` is 47.8 GB at the converged MoS2 reference and every
-    consumer slices it on q, so it is never materialised: this object is
-    a HANDLE, not an array.  It replaces the raw ``h5py`` dataset the
-    module used to stash in ``zx["ZG"]`` and keeps that dataset's
-    indexing surface (``.shape``, ``[q]``, ``[q0:q1]`` → host numpy) so
-    no consumer had to change, plus ONE new call that the h5py dataset
-    could not express:
-
-    * :meth:`read_q_slab` — the DISTRIBUTED plan.  ``ZetaLoader.load``
-      → ``SlabIO.read_slab`` hyperslabs **only this rank's shard** of the
-      q-chunk straight into the target sharding.  The call it replaces
-      (``device_put_process_local(ds[sl], qb3)``) read the WHOLE chunk
-      into host numpy on EVERY rank and then threw away all but its own
-      shard: at nq=144 / n_μ=2412 / ngkmax=8603 a 48-q chunk is 15.9 GB,
-      per rank.
-    * ``__getitem__`` — the LOCAL plan, unchanged in what it returns:
-      ``ZetaLoader.read_zeta_G_local(key)`` is the same h5py hyperslab,
-      the same host numpy, the same bytes.  It is ALSO the only plan when
-      the SlabIO probe declines.
-
-    The layout CONTRACT is read once, from the loader
-    (``gvec_components``/``ngk``/``ngkmax``, the sentinel Miller pad,
-    ``zeta_q_G[q, :, ngk[q]:] == 0``); this module no longer re-derives
-    any of it from raw datasets.  BOTH HANDLES BELONG TO THE LOADER now —
-    the collective SlabIO one and the local plan's serial h5py one — and
-    :meth:`close` ends them by closing it, instead of this object holding
-    a second ``h5py.File`` of its own and the convention that nobody
-    drops ``zx`` keeping the rest alive.
-
-    WHY ``__getitem__`` IS NOT A SlabIO READ, AND WHERE THAT NOW LIVES.
-    A SlabIO read is COLLECTIVE over the mesh and returns a ``jax.Array``
-    whose requested shape must be mesh-divisible under its
-    ``partition_spec``: a single-q ``(1, n_mu, ngkmax)`` read cannot be
-    q-sharded at all, a replicated one materialises the same bytes on
-    every rank plus a device round-trip, and putting a collective behind
-    ``ds[q]`` would turn any future rank-0-only diagnostic into a hang
-    instead of an error.  That argument is no longer this module's to
-    make: it is the documented contract of
-    :meth:`zeta_loader.ZetaLoader.read_zeta_G_local` — *local by design,
-    per-rank independent, do not make this collective* — because the plan
-    it describes moved INTO the door, where the one owner of the file can
-    hold it to that promise.  What stays here is the consequence: every
-    ``__getitem__`` caller in this module is a replicated host diagnostic
-    (``recon``, ``run_gates``, ``run_nulls``); those are the mirrors
-    ledger row 64 is about, and replacing them with on-device reductions
-    is a diagnostics rewrite, not a transport change.
-    """
-
-    def __init__(self, loader: ZetaLoader, *, path: str, distributed: bool):
-        self._loader = loader
-        self._distributed = bool(distributed)
-        if loader.zeta_layout != 'G_flat':
-            raise ValueError(
-                f"vq_interp needs a G-flat ζ ('zeta_q_G'); {path} has "
-                f"zeta_layout={loader.zeta_layout!r}.  Refit with the "
-                f"G-flat writer (gw.isdf_fitting).  There is no longer a "
-                f"read path for r-space ζ at all: ZetaLoader's disk→G FFT "
-                f"+ sphere gather was deleted on 2026-08-07 because no "
-                f"writer in the tree emits that layout.")
-        self.shape = (int(loader.n_q_on_disk), int(loader.n_rmu_disk),
-                      int(loader.n_G_sph_disk))
-        self.dtype = np.complex128
-        # The header-vs-dataset ngkmax agreement check is GONE from here, not
-        # dropped: ``ZetaLoader.__init__`` enforces it at OPEN, which is the
-        # only place that can, since BOTH plans that could disagree about
-        # ngkmax (header-sized collective, dataset-sized local) are its.
-
-    # -- local plan (host numpy, h5py hyperslab; unchanged semantics) ---
-    def __getitem__(self, key):
-        """``zeta_q_G[key]`` as host numpy — the loader's serial handle.
-
-        Delegation, not a re-implementation: ``read_zeta_G_local`` returns
-        exactly what ``dataset[key]`` returns for any h5py key, and the
-        service pins that byte-for-byte against a raw handle.  The
-        post-close refusal is the LOADER's now (this used to be a local
-        ``self._ds is None`` test with its own message), which is what
-        makes "closed" one fact about one owner instead of two objects
-        each with a private opinion.
-        """
-        return self._loader.read_zeta_G_local(key)
-
-    # -- distributed plan (per-rank hyperslab straight into `sharding`) -
-    def read_q_slab(self, q_offset: int, q_count: int, *, sharding):
-        """``(q_count, n_mu, ngkmax)`` on ``sharding``.
-
-        Distributed: ``ZetaLoader.load`` → ``SlabIO.read_slab`` with a
-        per-rank hyperslab.  Local: the h5py chunk placed with
-        ``device_put_process_local`` — bit-identical, since both plans
-        return the same on-disk elements and neither reduces.
-        """
-        q_offset, q_count = int(q_offset), int(q_count)
-        if self._distributed:
-            return self._loader.load(
-                q=np.arange(q_offset, q_offset + q_count, dtype=np.int32),
-                sharding=sharding.spec)
-        return device_put_process_local(
-            self[q_offset:q_offset + q_count], sharding)
-
-    # -- ownership -----------------------------------------------------
-    def close(self) -> None:
-        """Release the ζ handles.  Idempotent; post-close reads REFUSE.
-
-        Both handles are the loader's, so closing it is what ends them —
-        and the refusal a later ``ZG[q]`` gets is
-        ``ZetaLoader.read_zeta_G_local``'s ("…is closed; its local ζ reads
-        are no longer serviceable"), not this class's old private message.
-        ``close_zeta_coarse`` still calls ``loader.close()`` right after
-        this; ``ZetaLoader.close`` is idempotent, so the second call is a
-        no-op and the ownership statement stays true from either end.
-        """
-        self._loader.close()
 
 
 # ===========================================================================
@@ -471,72 +327,10 @@ def load_zeta_coarse(restart_file: str, zeta_file: str, *,
     runs, byte-identical.  It is optional so the host-only diagnostics and
     the fixture tests keep working on a bare checkout.
     """
-    # LAZY, and matching ``bse_io``'s own lazy ``from . import vq_interp``:
-    # the two modules reference each other and neither may be the one that
-    # forces the other at import time.
-    from . import bse_io
+    from file_io.restart_bundle import (read_coarse_interactions,
+        _zeta_mesh_for_loader, _ZetaGTiles)
     zx = {"restart_file": restart_file, "zeta_file": zeta_file}
-    # NOT a context manager: the handles outlive this call so the lazy
-    # reads below stay serviceable.  ``zx`` owns them; drop them with
-    # ``close_zeta_coarse(zx)``.
-    fr = h5py.File(restart_file, "r")
-    zx["_h5_restart"] = fr
-    from .bse_loading import _unfold_bse_parent_faces, _read_psi_mu_sharded
-    psi_ds = fr["psi_full_y" if "psi_full_y" in fr else "psi_parent_y"]
-    if "psi_full_y" in fr:
-        zx["psi"] = psi_ds[()]
-    else:
-        if mesh is None:
-            from common.collectives import resolve_mesh
-            mesh = resolve_mesh()
-        from runtime.padding import padded_mu_extent
-        n_mu_pad = padded_mu_extent(psi_ds.shape[-1], mesh)
-        face = _read_psi_mu_sharded(
-            psi_ds, np.arange(psi_ds.shape[1]), n_mu_pad // mesh.shape["x"],
-            "x", mesh, n_mu_pad, trim=False)
-        (full_face,) = _unfold_bse_parent_faces(
-            (face,), restart_file, input_file, mesh)
-        # Keep this reader's host-cache contract; replicate only one k row
-        # on device before the canonical host transfer, never the full face.
-        zx["psi"] = np.empty(full_face.shape[:-1] + (psi_ds.shape[-1],),
-                             dtype=psi_ds.dtype)
-        replicate_row = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh, P()))
-        for k in range(full_face.shape[0]):
-            zx["psi"][k] = _to_host(replicate_row(full_face[k, ..., :psi_ds.shape[-1]]))
-        del face, full_face
-    zx["kgrid"] = fr["kgrid"][()].astype(int)
-    # LAZY — disk tiles (gate reference) — UNLESS the file stores the q
-    # wedge, in which case the tiles do not exist on disk and the unfold
-    # runs once, here, through ``bse_io.restart_munu_full_bz`` (the one
-    # seam; see its docstring for why all-at-once is the design and not a
-    # shortcut).  On every legacy and full-BZ file this binds the h5py
-    # handle exactly as it always did, so the lazy read path is unchanged
-    # for every restart file that exists today.
-    zx["Vqmunu"] = (bse_io.restart_munu_full_bz(fr["V_qmunu"], "V_qmunu",
-                                                restart_file)
-                    if bse_io.is_q_wedge(fr["V_qmunu"]) else fr["V_qmunu"])
-    # PRESENCE IS NOT PERSISTENCE.  ``gw_init`` allocates a full-size ZERO
-    # ``W0_qmunu`` unconditionally (``tagged_arrays.write_restart_state_to_h5``
-    # with ``init_W0=True``), so ``"W0_qmunu" in fr`` is true on a run whose
-    # ``persist_w0`` never fired and the tiles handed to ``build_hdir`` are
-    # zeros of exactly the right shape.  That is the April all-zero-screening
-    # mechanism: a plausible excitonic spectrum out of a W that was never
-    # written, with every shape check green.  ``tagged_arrays`` already stamps
-    # ``W0_ready`` (False for the placeholder, True when real data lands) and
-    # ``bse_io`` already gates on it in both of its readers; this path asks
-    # the same question instead of asking whether the dataset exists.
-    if "W0_qmunu" in fr and bool(fr["W0_qmunu"].attrs.get("W0_ready", False)):
-        # Same wedge question as V above, and the GUARD IS UNTOUCHED on
-        # purpose: ``test_bse_w0_ready_gate``'s ratchet requires every
-        # ``if`` binding ``zx["W0"]`` to test the persisted flag, so the
-        # q-storage branch goes on the right-hand side (a conditional
-        # EXPRESSION, not a nested ``if``) where it cannot teach that
-        # matcher an exception it would then carry forever.
-        zx["W0"] = (bse_io.restart_munu_full_bz(fr["W0_qmunu"], "W0_qmunu",
-                                                restart_file)
-                    if bse_io.is_q_wedge(fr["W0_qmunu"])
-                    else fr["W0_qmunu"])   # LAZY — screened tiles (Hdir)
-    zx["enk"] = fr["enk_full"][()]            # (nk, nb) Ry
+    zx.update(read_coarse_interactions(restart_file, input_file, mesh))
     _mesh_for_loader, _distributed = _zeta_mesh_for_loader(mesh, log_fn=log_fn)
     zl = ZetaLoader(zeta_file, mesh=_mesh_for_loader)
     zx["_zeta_loader"] = zl
@@ -689,9 +483,6 @@ def close_zeta_coarse(zx: dict) -> None:
     loader = zx.pop("_zeta_loader", None)
     if loader is not None:
         loader.close()
-    fr = zx.pop("_h5_restart", None)
-    if fr is not None:
-        fr.close()
     zx.pop("Vqmunu", None)
     zx.pop("W0", None)
 
@@ -2299,7 +2090,7 @@ def build_hdir(zx, q0, nvw=3, ncw=3):
     # ``zx["W0"]`` is a lazy h5py dataset (see load_zeta_coarse) and the q
     # lookup below is an unsorted permutation, which h5py cannot fancy-index.
     # This diagnostic wants every q anyway, so materialise once here.
-    W0 = zx["W0"][()]
+    W0 = _to_host(zx["W0"])
     H = np.zeros((npair, npair), dtype=np.complex128)
     bs = ncw * nvw
     for k in range(zx["nk"]):
@@ -2505,8 +2296,7 @@ def refit_window_view(zx, band_range, log_fn=print,
             f"refit_window_view: window_mode={window_mode!r} is not 'zeta' "
             f"or 'bse'.")
     b_lo, b_hi = int(band_range[0]), int(band_range[1])
-    fr = zx.get("_h5_restart")
-    if fr is None or "band_window" not in fr:
+    if zx.get("band_window") is None:
         raise SystemExit(
             f"exciton_bands --refit-window={window_mode}: {zx.get('restart_file')} "
             f"carries no ``band_window`` stamp, so the deck's absolute band "
@@ -2517,7 +2307,7 @@ def refit_window_view(zx, band_range, log_fn=print,
             f"shape still matches.  The stamp is written by "
             f"tagged_arrays.write_restart_state_to_h5; re-run the GW to get a "
             f"bundle that carries one, or run --refit-window=zeta.")
-    bw = [int(v) for v in np.asarray(fr["band_window"]).ravel()]
+    bw = [int(v) for v in np.asarray(zx["band_window"]).ravel()]
     z_lo, z_hi = bw[0], bw[4]
     if (z_hi - z_lo) != int(zx["nb"]):
         raise SystemExit(

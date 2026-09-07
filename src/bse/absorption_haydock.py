@@ -52,17 +52,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.fft_helpers import make_sharded_ifftn_3d
 
-from .absorption_common import (
-    RYD2EV,
-    build_dipole_vector_bse,
-    jdos_from_transitions,
-    kramers_kronig_eps1,
-    load_dipole_h5,
-    slice_dipole_to_bse_window,
-    write_absorption_dat,
-    write_absorption_h5,
-)
-from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
+from .absorption_common import (RYD2EV, build_dipole_vector_bse, jdos_from_transitions, kramers_kronig_eps1, slice_dipole_to_bse_window, write_absorption_dat, write_absorption_h5)
+from file_io.restart_bundle import (load_dipole_h5)
+from .bse_io import (load_bse_data_from_restart_sharded)
+from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import build_bse_ring_matvec, create_mesh_2d, make_bse_shardings
 
 
@@ -171,8 +164,8 @@ def run_haydock(
     )
     # Resolve n_occ for the downstream dipole slice — same source as the
     # loader used (WFN.h5 ifmax → largest-gap fallback).
-    with h5py.File(restart_file, "r") as f:
-        enk_full_np = np.asarray(f["enk_full"][:])
+    from file_io.restart_bundle import read_metadata
+    enk_full_np = read_metadata(restart_file)["energies"]
     from .bse_io import resolve_n_occ
     n_occ = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)
     if eqp_file is not None:

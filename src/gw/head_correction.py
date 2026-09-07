@@ -331,12 +331,10 @@ def _check_dipole_coverage(
         return
     attrs_nb, attrs_nk = None, None
     try:
-        import h5py
-        with h5py.File(dipole_path, "r") as h5:
-            if "nbands" in h5.attrs:
-                attrs_nb = int(np.asarray(h5.attrs["nbands"]))
-            if "nk" in h5.attrs:
-                attrs_nk = int(np.asarray(h5.attrs["nk"]))
+        from file_io.restart_bundle import read_dipole_metadata
+        attrs = read_dipole_metadata(dipole_path)
+        attrs_nb = int(attrs["nbands"]) if "nbands" in attrs else None
+        attrs_nk = int(attrs["nk"]) if "nk" in attrs else None
     except (OSError, KeyError, ValueError) as exc:
         print_fn(f"  [dipole guard] could not read attrs from {dipole_path} "
                  f"({type(exc).__name__}: {exc})")
@@ -1322,14 +1320,13 @@ def resolve_head_S_cart(restart_file=None, *, input_file=None, wfn=None,
     """The ``S`` tensor behind the restart's ``whead`` — read it, or rebuild it; see docs/architecture/four_current_wiring.md."""
     if restart_file is not None:
         try:
-            import h5py
-            with h5py.File(restart_file, "r") as f:
-                if "S_cart_head" in f:
-                    S = np.asarray(f["S_cart_head"][:], dtype=np.complex128)
-                    if S.shape == (3, 3):
-                        return S, f"restart S_cart_head ({os.path.basename(restart_file)})"
-                    print_fn(f"BSE head: restart S_cart_head has shape "
-                             f"{S.shape}, expected (3,3); ignoring it")
+            from file_io.restart_bundle import read_metadata
+            stored = read_metadata(restart_file)["head_cartesian"]
+            if stored is not None:
+                S = np.asarray(stored, dtype=np.complex128)
+                if S.shape == (3, 3):
+                    return S, f"restart head tensor ({os.path.basename(restart_file)})"
+                print_fn(f"BSE head: restart head tensor has shape {S.shape}, expected (3,3); ignoring it")
         except Exception as exc:                    # never crash a load on this
             print_fn(f"BSE head: could not read S_cart_head ({exc})")
 

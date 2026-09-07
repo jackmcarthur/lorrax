@@ -21,7 +21,7 @@ def test_missing_dipole_names_its_producer(tmp_path):
     ``FileNotFoundError: Unable to synchronously open file`` instead — true,
     and useless: it names neither the producer nor ``--skip-vnl``.
     """
-    from bse.absorption_common import load_dipole_h5
+    from file_io.restart_bundle import (load_dipole_h5)
 
     missing = tmp_path / "dipole_p_only.h5"
     with pytest.raises(FileNotFoundError) as ei:
@@ -35,7 +35,7 @@ def test_missing_dipole_names_its_producer(tmp_path):
 def test_present_dipole_still_loads(tmp_path):
     """The preflight must not stand between a real file and its reader."""
     h5py = pytest.importorskip("h5py")
-    from bse.absorption_common import load_dipole_h5
+    from file_io.restart_bundle import (load_dipole_h5)
 
     p = tmp_path / "d.h5"
     nk, nb = 2, 3

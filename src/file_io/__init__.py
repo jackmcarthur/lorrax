@@ -29,7 +29,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                            # noqa: E402
-from zeta_loader import ZetaLoader                          # noqa: E402
+from file_io.restart_bundle import (open_zeta as ZetaLoader)
 
 # Back-compat alias: every active caller uses ``WFNReader(path)`` as a
 # pure-metadata accessor today.  ``WfnLoader`` covers that surface 1:1
@@ -43,18 +43,20 @@ from .tagged_arrays import (
     COULOMB_POLICY_DATASET,
     COULOMB_POLICY_KEYS,
     DOWNFOLD_PROVENANCE_GROUP,
-    read_downfold_provenance,
-    assert_restart_window_matches,
     compare_coulomb_policy,
     coulomb_policy_from_config,
-    describe_coulomb_policy_match,
-    describe_coulomb_policy_stamp,
     format_coulomb_policy,
     parse_coulomb_policy,
-    read_coulomb_policy_from_h5,
     write_restart_state_to_h5,
     write_w0_qmunu_to_h5,
     write_head_scalars_to_h5,
+)
+from .restart_bundle import (
+    read_downfold_provenance,
+    assert_restart_window_matches,
+    describe_coulomb_policy_match,
+    describe_coulomb_policy_stamp,
+    read_coulomb_policy_from_h5,
     read_restart_state_from_h5,
     read_munu_tensor_from_h5,
     load_restart_state_from_h5,
@@ -69,8 +71,6 @@ from .sigma_output import (
     compact_star_tables,
     extract_and_stamp_k_irr,
     k_irr_rows_for,
-    read_eqp_assembly_receipt,
-    read_eval_energies,
     sigma_star_spread_stats,
     star_select_k_irr,
     write_sigma_to_file,
@@ -89,6 +89,8 @@ from .kin_ion import (
     N_SYM_SPATIAL_ATTR,
     SYM_IDX_DATASET,
     broadcast_ibz_to_full_bz,
+)
+from file_io.restart_bundle import (
     read_full_bz_dataset,
     read_star_map,
     load_kin_ion_submatrix,
@@ -103,3 +105,5 @@ from .centroids import (
 )
 from .paths import resolve_input_paths
 from .read_bgw_vcoul import read_bgw_vcoul, fill_v_grid_for_q, BGWVcoulTable
+
+from .restart_bundle import read_eqp_assembly_receipt, read_eval_energies

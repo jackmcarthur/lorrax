@@ -57,7 +57,8 @@ from .bse_feast import (
     RY_TO_EV_DEFAULT, ensure_W_R, build_preconditioner_diagonal_sharded,
     _apply_shifted_matvec, _gmres_solve_core, matvec_operands,
 )
-from .bse_io import _find_restart_file, load_bse_data_from_restart_sharded
+from .bse_io import (load_bse_data_from_restart_sharded)
+from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import (
     build_bse_ring_matvec_full,
     build_realspace_random_transition_generator,

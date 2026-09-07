@@ -21,6 +21,7 @@ Scope of every number: single process, on the whole mesh ``lx run -G`` gave it
 before that date were one device wide however many the job held).
 """
 from __future__ import annotations
+from file_io import restart_bundle
 
 import argparse
 import importlib.util
@@ -207,7 +208,7 @@ def _wedge_setup(args):
               else tuple(int(s) for s in args.mesh.split(",")))
     mesh = create_mesh_xy_from_flags(px, py)
     input_path = os.path.join(args.run_dir, args.input)
-    restart = bse_io._find_restart_file(input_path)
+    restart = restart_bundle._find_restart_file(input_path)
     data = bse_io.load_bse_data_from_restart_sharded(
         restart, n_val=10**9, n_cond=10**9, mesh_xy=mesh,
         input_file=input_path, inject_head=False, load_v_full=True)

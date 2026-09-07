@@ -39,11 +39,16 @@ from symmetry_maps.maps import _star_row_order                  # noqa: E402
 
 h5py = pytest.importorskip("h5py")
 
-from file_io.kin_ion import (                                   # noqa: E402
-    IRR_IDX_DATASET, K_STORAGE_ATTR, K_STORAGE_IBZ,
-    K_STORAGE_VERSION, K_STORAGE_VERSION_ATTR, N_SYM_SPATIAL_ATTR,
-    SYM_IDX_DATASET, read_full_bz_dataset, read_star_map,
+from file_io.kin_ion import (
+    IRR_IDX_DATASET,
+    K_STORAGE_ATTR,
+    K_STORAGE_IBZ,
+    K_STORAGE_VERSION,
+    K_STORAGE_VERSION_ATTR,
+    N_SYM_SPATIAL_ATTR,
+    SYM_IDX_DATASET,
 )
+from file_io.restart_bundle import (read_full_bz_dataset, read_star_map)
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _REG = os.path.join(_REPO, "tests", "regression")

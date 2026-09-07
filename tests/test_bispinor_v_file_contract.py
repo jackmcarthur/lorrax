@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 
 from gw.v_q_bispinor import (
-    BispinorVqReader,
     UNIQUE_TILES,
     V_QMUNU_DATA_READY_DATASET,
     V_QMUNU_INVENTORY_DATASET,
@@ -16,6 +15,7 @@ from gw.v_q_bispinor import (
     _publish_unique_tile_inventory,
     tile_dataset_name,
 )
+from file_io.restart_bundle import (BispinorVqReader)
 
 
 KGRID = (2, 1, 1)

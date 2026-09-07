@@ -185,31 +185,7 @@ def load_eigenvectors_h5(path: str | Path):
     return eigvals_Ry, A.astype(np.complex128), params
 
 
-def load_dipole_h5(path: str | Path):
-    """Load dipole.h5 (psp.get_dipole_mtxels output).
 
-    Returns
-    -------
-    dipole_cart : (3, nk, nb, nb) complex128 — ⟨mk|v̂_α|nk⟩ (Ry), at the arm
-                  the file was built with (its ``prov_vnl_velocity_sign``).
-    deltaE      : (nk, nb, nb) float64       — E_b - E_b' (Ry).
-    attrs       : dict with ``nbands, nk``.
-    """
-    if not Path(path).is_file():
-        raise FileNotFoundError(
-            f"dipole file {path!s} not found.  This is a PRODUCED input, not a "
-            f"deck file that ships with the system: build it from the deck's "
-            f"WFN with\n"
-            f"    python3 -u -m psp.get_dipole_mtxels -i <deck>.in --skip-vnl "
-            f"--out {Path(path).name}\n"
-            f"``--skip-vnl`` writes the momentum operator only, which is the "
-            f"arm that matches BerkeleyGW's ``use_momentum``; drop it to get "
-            f"the full velocity including the nonlocal commutator.")
-    with h5py.File(str(path), "r") as f:
-        dipole_cart = np.asarray(f["dipole_cart"][:], dtype=np.complex128)
-        deltaE = np.asarray(f["deltaE"][:], dtype=np.float64)
-        attrs = {"nbands": int(f.attrs["nbands"]), "nk": int(f.attrs["nk"])}
-    return dipole_cart, deltaE, attrs
 
 
 def slice_dipole_to_bse_window(dipole_cart, deltaE, n_occ, n_val, n_cond):
@@ -383,7 +359,6 @@ __all__ = [
     "RYD2EV",
     "exciton_dipole_projections",
     "load_eigenvectors_h5",
-    "load_dipole_h5",
     "slice_dipole_to_bse_window",
     "build_dipole_vector_bse",
     "lorentzian_broaden",

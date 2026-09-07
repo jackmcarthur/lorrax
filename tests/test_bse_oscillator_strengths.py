@@ -78,7 +78,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from bse.absorption_common import load_dipole_h5, slice_dipole_to_bse_window
+from bse.absorption_common import (slice_dipole_to_bse_window)
+from file_io.restart_bundle import (load_dipole_h5)
 from bse.absorption_eigvecs import (compute_dipole_projections,
                                     compute_jdos_oscillators)
 

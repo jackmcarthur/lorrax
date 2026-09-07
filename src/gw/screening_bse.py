@@ -463,71 +463,10 @@ def _refuse_unusable_restart(config, meta, sym, centroid_indices,
         config, sym=sym, centroid_indices=centroid_indices,
         fft_grid=getattr(meta, "fft_grid", None), print_fn=print_fn,
         context=f"{diagram_name} ladder restart handoff")
-    if decision.store_wedge:
-        raise ValueError(
-            f"GATE {diagram_name}_needs_full_bz_restart: "
-            f"screening_diagrams = {diagram_name} "
-            f"requires restart_q_storage = full.\n"
-            f"  got:  restart_q_storage resolved to "
-            f"{decision.mode!r} (the IBZ q wedge)\n"
-            f"  want: a full-BZ W0_qmunu / V_qmunu on disk\n"
-            f"  fix:  set restart_q_storage = full in the deck\n"
-            f"  why:  the ladder facade loads its kernel through the "
-            f"SHARDED BSE loader, whose SlabIO hyperslab transport refuses "
-            f"a wedge by name (src/bse/bse_loading.py, _MunuSlabPlan) -- "
-            f"the unfold gathers across the mu/nu axes that plan shards "
-            f"on, and that cost has never been measured.  Refused here, "
-            f"before the chi0 build, rather than inside the loader after "
-            f"it.")
     return decision
 
 
-def _assert_restart_is_loadable(tensors_filename, *, include_w=True,
-                                print_fn=print):
-    """PRESENCE IS NOT PERSISTENCE -- check the flags, not the datasets.
-
-    ``gw_init`` allocates a full-size ZERO ``W0_qmunu`` unconditionally, so
-    a file whose persist never fired still answers "yes" to every presence
-    question.  The flags ``tagged_arrays`` stamps (``W0_ready`` on W0,
-    ``V_ready`` on V) are the ones that discriminate, and they are exactly
-    what ``bse_loading`` gates on before it falls back to bare V with a
-    banner.  This makes that fallback UNREACHABLE from this path instead of
-    merely unlikely.
-    """
-    import h5py
-
-    diagram_name = _resolvent_diagram_name(include_w)
-    with h5py.File(tensors_filename, "r") as f:
-        missing = [k for k in ("W0_qmunu", "V_qmunu", "psi_full_y",
-                               "enk_full") if k not in f]
-        if missing:
-            raise RuntimeError(
-                f"{diagram_name}: {tensors_filename} is missing "
-                f"{', '.join(missing)} after the W0 persist.  The BSE "
-                f"loader needs all four (psi/eps from psi_full_y+enk_full, "
-                f"the screening from W0_qmunu, the exchange from V_qmunu "
-                f"under load_v_full=True).")
-        if not bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
-            raise RuntimeError(
-                f"{diagram_name}: {tensors_filename} carries W0_qmunu but "
-                f"its W0_ready flag is False after the persist -- the "
-                f"dataset is the zero placeholder gw_init allocates, not a "
-                f"written W.  The loader would print the bare-V fallback "
-                f"banner"
-                + (" and the ladder would be built on no screening at all."
-                   if include_w else
-                   " -- harmless for this rung-free operator's OWN matvec, "
-                   "but the flag is still the only signal that the persist "
-                   "actually ran, so it is checked regardless."))
-        if not bool(f["V_qmunu"].attrs.get("V_ready", True)):
-            raise RuntimeError(
-                f"{diagram_name}: {tensors_filename} says V_ready = False; "
-                f"the resolvent needs the full exchange tensor "
-                f"(load_v_full=True).")
-    print_fn(
-        f"  {diagram_name}: restart handoff verified -- "
-        f"{os.path.basename(tensors_filename)} carries W0_ready + V_ready "
-        f"and the psi/eps datasets the ladder loader reads.")
+from file_io.restart_bundle import require_screened_bundle as _assert_restart_is_loadable
 
 
 # ---------------------------------------------------------------------------
