@@ -2905,7 +2905,7 @@ def _prepare_fitted_zeta(
 
 def _prepare_fresh_carriers(
         _parent_green_faces,
-        _candidate_plan, _parent_green_plan, band_slices, charge_basis_receipt, mesh_xy,
+        _candidate_plan, _parent_green_plan, band_slices, cfg, charge_basis_receipt, mesh_xy,
         meta, print0, sym, transverse_basis_receipt, transverse_wfn_data, wfn):
     """Produce charge and current wavefunction carriers from their fitted parents."""
     wfns_transverse = None
@@ -3082,7 +3082,7 @@ def _prepare_fresh_isdf(
             meta, print0, representation, sym, tmp_dir, wfn, zeta_contract)
         (wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T) = _prepare_fresh_carriers(
             _parent_green_faces,
-            _candidate_plan, _parent_green_plan, band_slices, charge_basis_receipt, mesh_xy, meta,
+            _candidate_plan, _parent_green_plan, band_slices, cfg, charge_basis_receipt, mesh_xy, meta,
             print0, sym, transverse_basis_receipt, transverse_wfn_data, wfn)
         (V_qmunu, G0, head_channel, photon_g0_vectors) = _prepare_fresh_coulomb(
             basis_T, bgw_v_grid_fn, centroid_indices, cfg, mem_est, mesh_xy, meta, print0, sym, wfn,
