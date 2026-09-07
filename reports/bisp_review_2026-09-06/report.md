@@ -8,7 +8,7 @@
 | 2 — phase extraction | In progress; remaining functions above 120 lines are reported explicitly |
 | 3 — duplication | Canonical mesh cache keys and duplicate fit-price reuse pushed; plan authentication retained |
 | 4 — docstrings | Six modules below 3.2%; complete contracts relocated with executable AST identity |
-| 5 — configuration | Strict-key/legacy exemptions inspected; parser separation pending |
+| 5 — configuration | Table-driven parsing and typed envelope stages gated; legacy refusals retained because strict-key exemptions still apply |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -242,52 +242,76 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/gw_config.py` | `env_float` | 35 | 22 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `active_zeta_truncating_knobs` | 12 | 8 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `ComputeMode.is_dynamic` | 12 | 4 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `ComputeMode.ppm_model` | 12 | 6 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `announce_legacy_sigma_axis_keys` | 22 | 16 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `SigmaChannel.label` | 14 | 8 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `coerce_compute_mode` | 24 | 12 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `coerce_screening_diagrams` | 20 | 13 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `refuse_unsupported_screening_diagrams` | 38 | 19 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `explain_missing_channels` | 15 | 10 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `refuse_unimplemented_compute_mode` | 18 | 10 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `normalize_w_dyson_solver` | 43 | 28 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `eigh_backend_choices` | 42 | 20 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `resolve_linalg` | 44 | 39 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `distrib_la_batched_route_choices` | 19 | 11 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `BandCounts.describe` | 34 | 14 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `resolve_band_counts` | 110 | 73 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `resolve_band_extrapolation` | 52 | 26 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `sigma_stage_modes` | 74 | 28 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `band_extrapolation_is_consumable` | 9 | 3 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `_deck_key_line` | 11 | 7 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `_print_deck_report` | 15 | 9 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `read_lorrax_input` | 378 | 374 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `_normalize_placement` | 13 | 4 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `scalar_head_overrides_named` | 14 | 9 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `packed_static_envelope` | 76 | 47 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `packed_bare_transverse_route` | 52 | 26 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `packed_photon_screens_current` | 12 | 5 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `uses_static_photon_response` | 12 | 7 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `packed_photon_replaces_charge_sigma` | 19 | 4 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `uses_dynamic_packed_photon_route` | 12 | 4 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `uses_coupled_photon_head` | 14 | 4 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `incumbent_bispinor_head_record` | 39 | 24 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `refuse_unsupported_bispinor_gw` | 122 | 116 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `refuse_unsupported_bispinor_tt_head_correction` | 57 | 35 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `DynamicSigmaConfig.parsed_omega_patches_ev` | 35 | 29 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `MPAConfig.sample_plan` | 24 | 19 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `_validate_occupation_smearing` | 50 | 41 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `resolve_mpa_sampling_alpha` | 28 | 24 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `LorraxConfig.occ_broadening_ry` | 37 | 5 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `LorraxConfig.compute_mode` | 49 | 32 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `LorraxConfig.qp_solver` | 48 | 29 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `LorraxConfig.omega_grid_ev` | 31 | 21 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | `LorraxConfig.from_input_file` | 584 | 574 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
-| `src/gw/gw_config.py` | Docstring lines / share | 1002 / 17.94% | 90 / 1.93% | Owner: docs/architecture/decisions.md |
-| `src/gw/gw_config.py` | **File total** | 5586 | 4674 | Net -912 lines |
+| `src/gw/gw_config.py` | `env_float` | 35 | 22 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `active_zeta_truncating_knobs` | 12 | 8 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `ComputeMode.is_dynamic` | 12 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `ComputeMode.ppm_model` | 12 | 6 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `announce_legacy_sigma_axis_keys` | 22 | 16 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `SigmaChannel.label` | 14 | 8 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `coerce_compute_mode` | 24 | 12 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `coerce_screening_diagrams` | 20 | 13 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `refuse_unsupported_screening_diagrams` | 38 | 19 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `explain_missing_channels` | 15 | 10 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `refuse_unimplemented_compute_mode` | 18 | 10 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `normalize_w_dyson_solver` | 43 | 28 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `eigh_backend_choices` | 42 | 20 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `resolve_linalg` | 44 | 39 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `distrib_la_batched_route_choices` | 19 | 11 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `BandCounts.describe` | 34 | 14 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `resolve_band_counts` | 110 | 73 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `resolve_band_extrapolation` | 52 | 26 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `sigma_stage_modes` | 74 | 28 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `band_extrapolation_is_consumable` | 9 | 3 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `_deck_key_line` | 11 | 7 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `_print_deck_report` | 15 | 9 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `read_lorrax_input` | 378 | 29 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `_normalize_placement` | 13 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `scalar_head_overrides_named` | 14 | 9 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `packed_static_envelope` | 76 | 47 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `packed_bare_transverse_route` | 52 | 26 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `packed_photon_screens_current` | 12 | 5 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `uses_static_photon_response` | 12 | 7 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `packed_photon_replaces_charge_sigma` | 19 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `uses_dynamic_packed_photon_route` | 12 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `uses_coupled_photon_head` | 14 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `incumbent_bispinor_head_record` | 39 | 24 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `refuse_unsupported_bispinor_gw` | 122 | 116 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `refuse_unsupported_bispinor_tt_head_correction` | 57 | 35 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `DynamicSigmaConfig.parsed_omega_patches_ev` | 35 | 29 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `MPAConfig.sample_plan` | 24 | 19 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `_validate_occupation_smearing` | 50 | 41 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `resolve_mpa_sampling_alpha` | 28 | 24 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `LorraxConfig.occ_broadening_ry` | 37 | 5 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `LorraxConfig.compute_mode` | 49 | 32 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `LorraxConfig.qp_solver` | 48 | 29 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `LorraxConfig.omega_grid_ev` | 31 | 21 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `LorraxConfig.from_input_file` | 584 | 41 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `LorraxConfig.from_input_file._g` | 2 | 0 | Deleted or renamed to direct owner |
+| `src/gw/gw_config.py` | `LorraxConfig.from_input_file._sc_env` | 9 | 0 | Deleted or renamed to direct owner |
+| `src/gw/gw_config.py` | `_input_key_type` | 0 | 15 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_normalize_input_string` | 0 | 3 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_parse_input_keys` | 0 | 20 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_resolve_input_memory` | 0 | 15 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_resolve_input_metal_policy` | 0 | 59 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_input_paths` | 0 | 20 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_input_head` | 0 | 50 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_input_response` | 0 | 92 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_input_iteration` | 0 | 47 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_input_iteration._sc_env` | 0 | 9 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_input_memory_group` | 0 | 19 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_input_backend` | 0 | 44 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_input_storage` | 0 | 38 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_input_band_windows` | 0 | 24 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_assemble_input_config` | 0 | 51 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_apply_input_envelope` | 0 | 26 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_locate_input_blocks` | 0 | 27 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_read_input_section` | 0 | 15 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_report_early_retired_keys` | 0 | 91 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_report_remaining_retired_keys` | 0 | 68 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_refuse_unknown_input_keys` | 0 | 15 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | `_parse_input_kpoints` | 0 | 34 | New explicit phase/direct owner |
+| `src/gw/gw_config.py` | Docstring lines / share | 1002 / 17.94% | 111 / 2.40% | Owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | **File total** | 5586 | 4617 | Net -969 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -522,8 +546,18 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
+| `tests/test_mpa_sampling_config.py` | `test_explicit_mpa_fit_reuse_gates_the_fresh_head_allocation` | 7 | 8 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_mpa_sampling_config.py` | **File total** | 717 | 719 | Net +2 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
 | `tests/test_wavefunction_bundle_face_carrier.py` | `test_memory_model_prices_resolved_layout` | 19 | 11 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_wavefunction_bundle_face_carrier.py` | **File total** | 204 | 196 | Net -8 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
+| `tests/test_zeta_nband_decoupling.py` | `test_the_fit_window_travels_into_the_provenance_stamp` | 25 | 29 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_zeta_nband_decoupling.py` | **File total** | 412 | 416 | Net +4 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -532,7 +566,7 @@
 
 | Tree scope | Before | After | Net |
 |---|---|---|---|
-| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119414 | -5833 |
+| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119357 | -5890 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
@@ -546,7 +580,8 @@
 | 8 — extract charge and current fit stages (36b46cb0) | 1404 | 453 passed, 2 skipped, 1 xfailed, 102 warnings in 177.56s (0:02:57) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-185204-112340-9401, lx-Xg4-185204-112565-5557; 16_fit_stages/cpu/cpu.xml; 16_fit_stages/p4/mos2/identity.json |
 | 9 — extract zeta writer and tile stages (48194876) | 1405 | 465 passed, 2 skipped, 1 xfailed, 102 warnings in 247.62s (0:04:07) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-190233-157458-4126, lx-Xg4-190235-157617-6713; 18_fit_writer_stages/cpu/cpu.xml; 18_fit_writer_stages/p4/mos2/identity.json |
 | 10 — use canonical mesh cache keys (37aa7db2) | 1406 | 452 passed, 2 skipped, 1 xfailed, 102 warnings in 177.23s (0:02:57) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-190804-191933-7526, lx-Xg4-190804-192105-9882; 19_owner_cache_keys/cpu/cpu.xml; 19_owner_cache_keys/p4/mos2/identity.json |
-| 11 — relocate long source contracts to architecture owners (this commit) | 1408 | 450 passed, 2 skipped, 1 xfailed, 102 warnings in 178.98s (0:02:58) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-191254-220724-5967, lx-Xg4-191254-220772-4165; 20_contract_docs/cpu/cpu.xml; 20_contract_docs/p4/mos2/identity.json |
+| 11 — relocate long source contracts to architecture owners (14b6fb1d) | 1408 | 450 passed, 2 skipped, 1 xfailed, 102 warnings in 178.98s (0:02:58) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-191254-220724-5967, lx-Xg4-191254-220772-4165; 20_contract_docs/cpu/cpu.xml; 20_contract_docs/p4/mos2/identity.json |
+| 12 — separate input parsing from configuration envelopes (this commit) | 1409 | 751 passed, 2 skipped, 1 xfailed, 116 warnings in 184.45s (0:03:04) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-192253-278495-2175, lx-Xg4-191743-249096-5555; 22_config_corrected/cpu/cpu.xml; 22_config_corrected/p4/mos2/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|
@@ -562,5 +597,6 @@
 | Reverted centroid-loader stage cut | 12_centroid_stages/verdict.txt: P4 exact; CPU1 failed/460 passed/2 skipped/1 xfailed because test_centroid_fft_k_plan requires in-entry calls. Source and contract relocation reverted |
 | Reverted Sigma stage cut | 13_sigma_stages/verdict.txt: P4 exact; CPU9 failed/496 passed/2 skipped/3 xfailed: four nb=3 fixtures incompatible with CPU4 band sharding, four absent-host-FFI failures, one entry-body structural guard. Source/tests/contract relocation reverted |
 | Reverted initializer stage cut | 17_prepare_stages/verdict.txt: CPU476 passed/2 skipped/1 xfailed; P4 failed because the extracted fresh-carrier stage omitted _parent_green_faces. Source/tests/contract relocation reverted |
+| Configuration guard retry | 21_config_stages/verdict.txt: initial CPU750 pass/1 fail depended on a moved driver comment; reverted and reapplied with owner-based structural guard in22_config_corrected. Its P4 receipt is reused after exact production-diff comparison |
 | Final CPU/core/P16/compile-event gates | Pending; no final-suite or performance claim |
 | CPU skips/xfail | Host FFT FFI unavailable; not WSL; existing CPU partitioned-max NaN xfail. Explicit scoped CPU logs own details |
