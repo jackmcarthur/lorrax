@@ -14,3 +14,4 @@
 | 5 | `src/ffi/fft.py:814`, `src/runtime/__init__.py:2243` | Fixed: independent parent FFI dial, startup enforcement and collision-free announcements. |
 | 6 | `src/ffi/fft.py:1031` | Fixed: shared planner probes the selected gate target; parent ns=4 uses two-stage above the portable floor; every shape decision is announced. |
 | 7 | `src/gw/{w_isdf,cohsex_sigma,photon_sigma,photon_layout}.py` | Fixed: seal service paths before module-scope distrib_la imports; bare-launch tests cover all four consumers. |
+| 8 | `tests/test_w_bse_wiring_closure.py:136`, `src/gw/gw_config.py:4323` | Fixed stale full request/default. Closure gate blocked on missing CPU FFTW3-ABI provider `liblorrax_ffi_host.so`; 4 setup errors before driver compute (`08_restart_q_contract/retry.log`). |

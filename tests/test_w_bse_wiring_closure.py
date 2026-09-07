@@ -105,10 +105,8 @@ def wbse_closure_run(tmp_path_factory):
 
     * ``compute_mode = cohsex`` — one W role, so the comparison is about
       the assembly and not about the probe leg.
-    * ``restart_q_storage = full`` — the sharded BSE loader's hyperslab
-      transport refuses a q wedge by name (``bse_loading._MunuSlabPlan``),
-      which is why ``screening_bse._refuse_unusable_restart`` demands the
-      full BZ before any compute.
+    * ``restart_q_storage = auto`` — canonical producer q storage;
+      the restart reader owns the stored q-parent unfold.
     * ``write_restart_tensors`` left on — the persist IS the handoff.
 
     The run is a plain ``w_rpa`` run: it produces the REFERENCE.  The
@@ -133,7 +131,7 @@ def wbse_closure_run(tmp_path_factory):
         "compute_mode = gn_ppm": "compute_mode = cohsex",
         "use_ppm_sigma = true": "use_ppm_sigma = false",
         "sigma_freq_debug_output = true": "sigma_freq_debug_output = false",
-    }, append="restart_q_storage = full\n")
+    }, append="restart_q_storage = auto\n")
     res = harness.run_gw_jax(run_dir, "gnppm_test.in",
                              extra_env=_single_device_env())
     if res.returncode != 0:                        # pragma: no cover
@@ -187,6 +185,9 @@ def _single_device_env():
     """
     import os
 
+    if os.environ.get("JAX_PLATFORMS") == "cpu":
+        return {"JAX_PLATFORMS": "cpu",
+                "XLA_FLAGS": "--xla_force_host_platform_device_count=1"}
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     ids = [d for d in visible.split(",") if d]
     if len(ids) <= 1:

@@ -4320,13 +4320,9 @@ class LorraxConfig:
     #: ``_DEFAULTS["write_qsgw_datasets"]`` for what each dataset is and
     #: which compute mode produces it.
     write_qsgw_datasets: bool
-    #: RAW ``restart_q_storage`` request — "full" (the default) | "auto" |
-    #: "ibz".  Validated at parse time, resolved LATE
-    #: (``gw.restart_q_storage``): ``auto``'s answer depends on the run's
-    #: centroid set, which does not exist yet here.  ``full`` needs no
-    #: resolution but still goes through the same seam, so there is one
-    #: resolution point rather than a fast path beside it.  Same ``_raw``
-    #: convention as ``compute_mode_raw``.
+    #: RAW ``restart_q_storage`` request — "auto" (the default) | "ibz".
+    #: Validated at parse time and resolved against the centroid set by
+    #: ``gw.restart_q_storage``; both requests use canonical q-IBZ storage.
     restart_q_storage_raw: str
     #: ``qp_rotations_k_storage`` — "auto" (the default) | "full" | "ibz".
     #: NOT a ``_raw``: unlike ``restart_q_storage`` there is nothing to

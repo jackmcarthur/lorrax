@@ -10,4 +10,5 @@ Evidence root: `/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/ru
 | 4 | `4fe7a147` | `04_transverse_finite/gate.log`: 2 CPU tests passed | PASS: each NaN transverse face refuses with its dataset named under strict sanity. |
 | 5 | `00f98a6f` | `05_parent_gate/cpu.log`: 25 passed; `mos2/driver.rank0.log`: parent startup ON | PASS; separate env, startup enforcement, announcements and rank fingerprints; MoS2 eqp identical. |
 | 6 | `d5e2150e` | `06_parent_admission/cpu.log`: 24 passed; `mos2/driver.rank0.log` | PASS: ns=4 two-stage plan above SMEM floor, parent-only target probe; nk=36 native resident; eqp0/1 identical. |
-| 7 | this commit | `07_service_bootstrap/gate.log`: 38 tests passed | PASS: bare-src imports of all four consumers and distrib_la bootstrap-order census. |
+| 7 | `0cca2900` | `07_service_bootstrap/gate.log`: 38 tests passed | PASS: bare-src imports of all four consumers and distrib_la bootstrap-order census. |
+| 8 | this commit | `08_restart_q_contract/parser.log`: auto/ibz PASS; `retry.log`: 4 collected, 4 setup errors | Parser/doc fix PASS; full closure gate BLOCKED: required CPU `liblorrax_ffi_host.so` absent. CPU fixture preserves its platform rather than attempting a hidden GPU run. |
