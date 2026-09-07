@@ -131,7 +131,15 @@ def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
     )
     assert ast.unparse(contract_k) == "loader_k_chunk"
 
-    loader = _function(wfn_tree, "load_centroids_band_chunked")
+    loader_entry = _function(wfn_tree, "load_centroids_band_chunked")
+    for stage in ("_centroid_stream_geometry", "_centroid_resident_bytes",
+                  "_load_streamed_centroid_faces"):
+        assert len(_calls(loader_entry, stage)) == 1
+    owners = {"_centroid_stream_geometry", "_centroid_resident_bytes",
+              "_sample_centroid_domain_tiles", "_centroid_fft_scan_chunk"}
+    loader = ast.Module(body=[n for n in wfn_tree.body
+                             if isinstance(n, ast.FunctionDef)
+                             and n.name in owners], type_ignores=[])
     gram = _function(pivot_tree, "build_gram_q0_via_loadwfns")
     assert len(_calls(loader, "worst_process_resident_bytes")) == 1
     assert len(_calls(gram, "worst_process_resident_bytes")) == 1
