@@ -26,9 +26,12 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None):
     B = merge_spin_centroid(jnp.conj(psi_nmu), 2, 3)  # (nk, n, mu*s) P(_,'x','y')
     # Eager operations may erase singleton mesh axes before the GEMM boundary.
     from jax import lax
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    A = lax.with_sharding_constraint(A, gemm.in_sharding_a)
-    B = lax.with_sharding_constraint(B, gemm.in_sharding_b)
+    in_sharding_a = getattr(gemm, "in_sharding_a", None)
+    in_sharding_b = getattr(gemm, "in_sharding_b", None)
+    if in_sharding_a is not None:
+        A = lax.with_sharding_constraint(A, in_sharding_a)
+    if in_sharding_b is not None:
+        B = lax.with_sharding_constraint(B, in_sharding_b)
     G_flat = gemm(A, B)                              # (nk, mu*s, mu*s) P(_,'x','y')
     G = split_spin_centroid(G_flat, 1, s_, mu_l_)
     G = split_spin_centroid(G, 3, s_, mu_r_)

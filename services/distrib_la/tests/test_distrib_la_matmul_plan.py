@@ -154,6 +154,16 @@ def _fake_plan(mesh, *, beta):
     )
 
 
+def test_gemm_plans_expose_operand_shardings():
+    """Both production layout plans carry the Green operand constraints."""
+    mesh = _mesh()
+    plans = (_fake_plan(mesh, beta=0),
+             D.local_gemm_plan(mesh, m=2, k=2, n=2, nq=1,
+                               dtype="complex128"))
+    for plan in plans:
+        assert plan.in_sharding_a is not None and plan.in_sharding_b is not None
+
+
 def _sharded(mesh, value, shape):
     """(nq,m,k)-shaped P(None,'x','y') operand -- ``_check_operand``
     refuses a plain ``jnp.zeros`` (single-device sharded), so every fake
@@ -217,6 +227,7 @@ def test_local_gemm_plan_contracts_random_complex_operands(reduction_axis):
     plan = D.local_gemm_plan(mesh, m=8, k=6, n=10, nq=2,
                             dtype="complex128", reduction_axis=reduction_axis)
     assert isinstance(plan, D.GemmPlan)
+    assert plan.in_sharding_a is not None and plan.in_sharding_b is not None
     result = plan(jax.device_put(a, plan.in_sharding_a),
                   jax.device_put(b, plan.in_sharding_b))
     np.testing.assert_allclose(np.asarray(result), a @ b, atol=1e-12, rtol=0)
