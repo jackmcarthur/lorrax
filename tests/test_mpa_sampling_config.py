@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -101,9 +102,10 @@ def test_mpa_fit_reuse_refuses_a_non_mpa_mode(tmp_path):
 
 def test_explicit_mpa_fit_reuse_gates_the_fresh_head_allocation():
     source = (Path(__file__).parents[1] / "src/gw/gw_jax.py").read_text()
-    plan_start = source.index("oneshot_mpa_plan = None")
-    screening_start = source.index("# SC solves W inside each map", plan_start)
-    head_setup = source[plan_start:screening_start]
+    stage = next(n for n in ast.parse(source).body
+                 if isinstance(n, ast.FunctionDef)
+                 and n.name == "_prepare_oneshot_response")
+    head_setup = ast.get_source_segment(source, stage)
     assert "config.mpa.fit_reuse_file is not None" in head_setup
     assert "if oneshot_omegas.size and not reused_mpa_fit_owns_head" in head_setup
 
