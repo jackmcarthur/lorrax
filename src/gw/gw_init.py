@@ -2795,7 +2795,9 @@ def _prepare_parent_wavefunction_plan(
 ):
 	"""Require exact typed parent transport for every supported GW consumer."""
 	from .centroid_k_unfold import build_centroid_k_unfold_plan
+	from file_io.restart_bundle import require_parent_screening_consumer
 
+	require_parent_screening_consumer(cfg)
 	plan = build_centroid_k_unfold_plan(
 		sym, centroid_indices, meta.fft_grid, mesh_xy,
 		nspinor=int(meta.nspinor), parent_k_frac=wfn.kvecs(k=sym.parent_k_domain),

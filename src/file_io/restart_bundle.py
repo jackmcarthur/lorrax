@@ -4484,17 +4484,18 @@ def read_isdf_header_from_file(f: h5py.File) -> IsdfHeader:
     return _read_isdf_group(f)
 
 
-def pack_canonical_interaction(tensor, basis):
-    """Return canonical μν tiles in the consuming GW centroid order.
+def require_parent_screening_consumer(config):
+    """Keep baseline admission for GW diagram consumers not ported to parents.
 
-    Parameters
-    ----------
-    tensor : jax.Array
-        Canonical interaction with trailing centroid axes, sharded on x/y.
-    basis : PackedCentroidBasis or None
-        The consumer's authenticated centroid basis. Existing axis kernels
-        perform both permutations without gathering the interaction.
+    Bundle consolidation changes storage ownership, not the set of admitted
+    screening algorithms. W_BSE must receive its own physics port and gate
+    before this baseline refusal can be removed.
     """
-    if basis is None:
-        return tensor
-    return basis.pack_axis(basis.pack_axis(tensor, -2), -1)
+    if not bool(config.compute_mode.needs_screening):
+        return
+    diagrams = getattr(config.screening.diagrams, "value", config.screening.diagrams)
+    if str(diagrams) != "w_rpa":
+        raise ValueError(
+            "GATE parent_screening_diagrams: screening_diagrams = "
+            f"{diagrams} has not been ported to raw parents; "
+            "use screening_diagrams = w_rpa.")

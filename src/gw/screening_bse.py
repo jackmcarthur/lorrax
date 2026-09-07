@@ -885,9 +885,6 @@ def _assemble_full_bz_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
             "the RPA Dyson solve to the full BZ).  Use a closed centroid "
             "set, or keep screening_diagrams = w_rpa.")
 
-    from file_io.restart_bundle import pack_canonical_interaction
-    wc_wedge = pack_canonical_interaction(
-        wc_wedge, getattr(meta, "mu_basis", None))
     _nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     mu_target = int(np.asarray(sym_perm).shape[-1])
     V_wedge = slice_q_full_to_ibz(V_q, sym.q_irr_full_idx, out_sharding=_nat)

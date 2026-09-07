@@ -50,7 +50,7 @@
 | Htransform + QP rotations | scalar (1; true; IBZ) | RED, registered | QRCP budget diagnostic reaches existing corrected-interior guard: corrected block ends at8, same as requested output endpoint8 | `01_scalar_true/{htransform_retry,htransform_fit}.rank0.log` |
 | Htransform + QP rotations | supplied SOC (4; true; IBZ) | PASS execution; reference obligation RED, registered | Initial fitted[0,20) omitted part of QP[0,32); ncond20 plus four guards includes full block and completes. Run74 reference is a separate DFT-only deck | `02_soc_true/{htransform_retry,htransform_fit}.rank0.log`, `htransform_fit.dat` |
 | Downfold CLI | scalar (1; true/false; IBZ), supplied SOC (4; true; IBZ) | PASS | Production CLI completes; children now write canonical parent-face pairs. `python -m gw.downfold_run` is a library import, excluded from execution evidence | `01_scalar_true`, `02_soc_true`, `04_scalar_false`: `downfold_final.rank0.log`, `child_v3/tmp` |
-| W_BSE historical decks | scalar COHSEX/GN (1; true; auto→IBZ requested) | RED, registered | Historical left-fit window ends12 and cuts a zero-gap multiplet. Clean ncond4 diagnostic now reaches the shared handoff; remaining ladder covariance and GN extrapolation failures are registered | `21_wbse_cohsex`, `22_wbse_gn`: `{wbse,clean_window}.rank0.log` |
+| W_BSE historical decks | scalar COHSEX/GN (1; true; auto→IBZ requested) | RED, registered | Historical left-fit window ends12 and cuts a zero-gap multiplet. Clean ncond4 controls on untouched baseline and the final branch both refuse parent_screening_diagrams; the interim ladder diagnostics are superseded by the baseline comparison below | `21_wbse_cohsex`, `22_wbse_gn`: `{wbse,clean_window}.rank0.log` |
 | kmeans producer → GW | scalar WFN | PASS | Requested192, orbit/block selection delivered168; GW explicitly consumes generated168-centroid file | `20_scalar_producers/kmeans.rank0.log`, `producer_gw_retry.rank0.log` |
 | dipole producer → GW | scalar WFN | PASS | Full VNL producer completes; generated dipole staged with consumer deck | `20_scalar_producers/dipole.rank0.log`, `dipole.out`, `producer_gw_retry.rank0.log` |
 | kin_ion producer → GW | scalar WFN | PASS | Eight-band kinetic/ionic producer completes and GW consumes its output | `20_scalar_producers/kin_ion.rank0.log`, `producer_gw_retry.rank0.log` |
@@ -69,7 +69,7 @@
 | Upstream centroids/WFN/PSP | N/A | Producers or source inputs, not gwjax bundle consumers; existing canonical source services |
 | Dynamic pole stores | `file_io.restart_bundle` | W-slab/header/column, pole/head, resume and fit readers moved out of mpa_store; writer and format helpers remain there. Quadrature rules retain their existing non-HDF5 service |
 
-| Deletion ledger module (cumulative versus891047f4; source/service code) | Lines removed | Lines added | Reader deletion / disposition |
+| Deletion ledger module (b05e586a versus891047f4; source/service code) | Lines removed | Lines added | Reader deletion / disposition |
 |---|---:|---:|---|
 | `services/zeta_loader/src/zeta_loader/loader.py` | 2 | 2 | Call sites/imports use the sole reader; no independent reader retained |
 | `src/bandstructure/htransform.py` | 101 | 3 | EQP parser moved; canonical rotation and energy readers used |
@@ -139,7 +139,7 @@
 | `read_kin_ion_full_bz` | Canonical full-k kinetic/ionic matrix for the consuming symmetry map |
 | `read_isdf_header`, `read_isdf_header_from_file` | The shared ISDF header decoder used by ζ service and bundle consumers |
 | `read_vq_payload`, `check_dipole_provenance` | VQ wavefunction/ζ metadata payload and source-identity validation |
-| `pack_canonical_interaction` | Canonical trailing μν axes converted to the consuming packed basis using existing axis kernels |
+| `require_parent_screening_consumer` | Baseline admission for GW screening consumers; unported non-RPA diagrams refuse before parent loading |
 | Policy and band-window validators | Existing provenance/refusal contracts, now beside payload reads |
 
 | Batch state | Evidence / limitation |
@@ -191,9 +191,9 @@
 | ζ header batch |80f2b2f6 pushed; claim1440 | Exact dynamic restart and canonical downfold-child BSE |
 
 
-| W_BSE order seam | Verdict | Evidence |
+| Superseded W_BSE diagnostic (before baseline-admission follow-up) | Verdict | Evidence |
 |---|---|---|
-| `pack_canonical_interaction` | Central backend converts BSE's canonical μν result to the GW packed basis before adding V; obsolete parent-screening preflight removed | Same axis kernels used by canonical restart restoration; no second symmetry unfold |
+| Interim W_BSE ordering change | WITHDRAWN: untouched baseline refuses this route before any ladder solve. Baseline admission restored and the unported ordering change removed | Historical diagnostics below are not evidence that those physics failures pre-existed on baseline |
 | Scalar COHSEX, clean4-conduction-band diagnostic |PASS execution; RED covariance remains | `21_wbse_cohsex/shared_order_fixed.rank0.log`: GMRES1.00e-6,201/300; covariance0.1230 vs1e-5 |
 | Ordering defect size |Max eqp0/1 correction225.665854486 eV; old covariance0.6837 | `21_wbse_cohsex/eqp*.order_fix_compare.txt`; compares the two diagnostic runs, not a historical physics reference |
 | Scalar GN, clean window |RED after shared handoff:400/512 states refuse spectral-shell extrapolation, counts14/18/20 | `22_wbse_gn/shared_order_fixed.rank2.log`; static/probe covariance0.1230/0.01103 also fails1e-5 |
@@ -217,3 +217,21 @@
 | GW layout batch |a63037cf pushed; claim1444; branch fix/restart-consumers-2026-09-07, unmerged |
 | Completion criterion |Every requested execution/reference obligation is green, N/A for non-consumers, or explicitly RED with an invocation and measured boundary in `KNOWN_LORRAX_ISSUES.md`. This is not an all-green compatibility certification |
 | Compute |One allocation58016040; P4 production legs, CPU tests with G0/four emulated devices; no native rebuild. Allocation released after closeout |
+
+
+| Baseline follow-up instrument | Contract / evidence |
+|---|---|
+| Untouched baseline | Detached `891047f4` at `tmp/worktrees/wt_restart_baseline_891047f4`; tracked and untracked status clean |
+| Matched runs | JID58021406, P4, one pool/node, BFC@0.85, cache off, same native provider; six deck pairs byte-identical in `30_tip_controls/deck_identity.json`; same argv in `controls.sh` |
+| Numerical extraction | Existing `_parse_eigenvalues` from `tests/test_bse_bgw_regression.py` and stamped `read_htransform`/`metrics` from sandbox `tools/compare_bgw_inteqp_htransform.py`; all values in `30_tip_controls/tip_comparison.json` |
+| Full-precision refit witness | `capture_refit.py` records the existing certificate's input arrays, then calls it unchanged. Both original module invocations also reproduce the refusal. Witness teardown noise follows the expected certificate failure and is excluded |
+| W_BSE interpretation | Baseline has no GMRES/covariance/extrapolation result for these decks: both stop earlier. Removing its admission guard was a behavior regression, not evidence of pre-existing solver failures. Restore the guard centrally and withdraw the unported ordering change |
+
+| RED-row tip control | Untouched891047f4 | Branch before admission correction | Final baseline/branch difference | Verdict | Evidence under `30_tip_controls` |
+|---|---|---|---|---|---|
+| W_BSE scalar COHSEX, clean4c | `parent_screening_diagrams` refusal before GMRES; residual/iterations/covariance unavailable | GMRES1e-6,201/300; covariance0.1230 vs1e-5; run completes | Final branch refuses with the identical gate/message on all4 ranks; solver physics remains unported | regression — admission fixed | `base/21_wbse_cohsex/control.rank0.log`; `branch/21_wbse_cohsex/{control,admission_fixed}.rank0.log`; original detailed solver receipt `../21_wbse_cohsex/shared_order_fixed.rank0.log` |
+| W_BSE scalar GN, clean window | Same early refusal; no states reach shell extrapolation |400/512 refusals at14/18/20; static/probe covariance0.1230/0.01103 | Final branch has the same baseline refusal on all4 ranks. Baseline did NOT refuse the same400 states: it never computed them | regression — admission fixed | `base/22_wbse_gn/control.rank0.log`; `branch/22_wbse_gn/control.rank2.log`, `admission_fixed.rank0.log`; original detailed covariance receipt `../22_wbse_gn/shared_order_fixed.rank0.log` |
+| ns2 GN finite-Q pure refit |0.6620023038539945 meV vs0.01 |0.6620023038539945 meV vs0.01 |Both refit/stored eigenvalue arrays max absolute/relative difference0; certificate relative difference0 ≤1e-6 | pre-existing | `{base,branch}/07_soc_ns2_gn/{control,refit_witness}.rank0.log`, `refit_certificate_inputs.json`; `tip_comparison.json` |
+| Htransform DFT vs run74 b5a58202 |Max0.05645288638657168 meV; RMS0.03751815584079322 |Same max/RMS |Tip max absolute/relative difference0 over4×16 values ≤1e-6 | pre-existing — reference drift | `{base,branch}/23_htransform_reference/{control.rank0.log,bandstructure.dat}`; `tip_comparison.json` |
+| Scalar8-band GN BSE lowest20 |2.48309532…2.79925695 eV |Same20 values |Max absolute0 eV; max relative0 ≤1e-6 | pre-existing — no tip regression | `{base,branch}/01_scalar_true/control.rank0.log`; all20 values in `tip_comparison.json` |
+| Supplied SOC ns4 GN BSE lowest20 |2.45655385…2.57529601 eV |Same20 values |Max absolute0 eV; max relative0 ≤1e-6 | pre-existing — no tip regression | `{base,branch}/02_soc_true/control.rank0.log`; all20 values in `tip_comparison.json` |
