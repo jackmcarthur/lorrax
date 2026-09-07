@@ -206,39 +206,59 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/common/wfn_transforms.py` | `_cached_gindex_dev` | 54 | 36 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `_resolve_gindex_dev` | 49 | 18 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `_box_kernel` | 29 | 22 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `_spec_of` | 16 | 9 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `_local_box_fft` | 15 | 8 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `_sharding_key` | 17 | 4 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `to_box` | 29 | 24 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `to_rbox` | 46 | 38 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `from_rbox` | 77 | 51 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `to_rmu` | 49 | 44 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `to_rchunk_inner` | 74 | 27 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `to_rpoints_inner` | 59 | 25 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `take_rchunk_padded` | 36 | 28 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `to_rchunk` | 102 | 86 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `gflat_to_rchunk_aot_memory` | 113 | 93 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `gflat_to_rchunk_aot_peak_bytes` | 22 | 17 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `to_rmu_inner` | 59 | 19 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `gflat_to_rmu` | 362 | 267 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `accumulate_rchunk_to_gflat` | 284 | 189 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `apply_bloch_phase` | 38 | 28 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `apply_bloch_phase_at` | 58 | 40 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `apply_bloch_phase_on_slice` | 35 | 14 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `_refuse_spinor_zero_fill` | 34 | 11 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `load_kpoint_fftbox_local` | 32 | 16 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `load_kpoint_fftbox` | 19 | 4 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `get_enk_bandrange` | 74 | 45 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `read_Gvecs_to_devices` | 45 | 30 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `load_psi_gflat_padded` | 52 | 32 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `prepare_rchunk_carrier` | 68 | 56 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `iter_psi_rchunk_bandwise` | 141 | 107 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | `load_centroids_band_chunked` | 683 | 624 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
-| `src/common/wfn_transforms.py` | Docstring lines / share | 833 / 26.38% | 36 / 1.52% | Owner: docs/architecture/zeta_fit_face_psi_cct.md |
-| `src/common/wfn_transforms.py` | **File total** | 3158 | 2361 | Net -797 lines |
+| `src/common/wfn_transforms.py` | `_cached_gindex_dev` | 54 | 36 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `_resolve_gindex_dev` | 49 | 18 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `_box_kernel` | 29 | 22 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `_spec_of` | 16 | 9 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `_local_box_fft` | 15 | 8 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `_sharding_key` | 17 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `to_box` | 29 | 24 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `to_rbox` | 46 | 38 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `from_rbox` | 77 | 51 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `to_rmu` | 49 | 44 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `to_rchunk_inner` | 74 | 27 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `to_rpoints_inner` | 59 | 25 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `take_rchunk_padded` | 36 | 28 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `to_rchunk` | 102 | 86 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `gflat_to_rchunk_aot_memory` | 113 | 93 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `gflat_to_rchunk_aot_peak_bytes` | 22 | 17 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `to_rmu_inner` | 59 | 19 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `gflat_to_rmu` | 362 | 267 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `accumulate_rchunk_to_gflat` | 284 | 189 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `apply_bloch_phase` | 38 | 28 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `apply_bloch_phase_at` | 58 | 40 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `apply_bloch_phase_on_slice` | 35 | 14 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `_refuse_spinor_zero_fill` | 34 | 11 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `load_kpoint_fftbox_local` | 32 | 16 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `load_kpoint_fftbox` | 19 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `get_enk_bandrange` | 74 | 45 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `read_Gvecs_to_devices` | 45 | 30 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `load_psi_gflat_padded` | 52 | 32 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `prepare_rchunk_carrier` | 68 | 56 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `iter_psi_rchunk_bandwise` | 141 | 107 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `load_centroids_band_chunked` | 683 | 51 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `load_centroids_band_chunked._reshard_centroid_tile` | 16 | 0 | Deleted or renamed to direct owner |
+| `src/common/wfn_transforms.py` | `load_centroids_band_chunked._finish_faces` | 25 | 0 | Deleted or renamed to direct owner |
+| `src/common/wfn_transforms.py` | `_centroid_sampling_geometry` | 0 | 44 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_centroid_sampling_shardings` | 0 | 42 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_centroid_stream_geometry` | 0 | 50 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_centroid_resident_bytes` | 0 | 102 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_centroid_fft_scan_chunk` | 0 | 54 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_centroid_sampling_indices` | 0 | 12 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_centroid_face_kernels` | 0 | 52 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_centroid_face_kernels._reshard_centroid_tile` | 0 | 16 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_centroid_face_kernels._finish_faces` | 0 | 25 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_centroid_stream_kernels` | 0 | 58 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_centroid_stream_kernels._zero_faces` | 0 | 9 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_centroid_stream_kernels._zero_parent_faces` | 0 | 9 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_centroid_stream_kernels._insert_tile` | 0 | 8 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_centroid_stream_kernels._sample_and_insert_one` | 0 | 19 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_sample_centroid_parent_groups` | 0 | 74 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_sample_centroid_domain_tiles` | 0 | 52 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_load_streamed_centroid_faces` | 0 | 32 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | `_load_bulk_centroid_faces` | 0 | 102 | New explicit phase/direct owner |
+| `src/common/wfn_transforms.py` | Docstring lines / share | 833 / 26.38% | 48 / 1.93% | Owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | **File total** | 3158 | 2486 | Net -672 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -503,7 +523,8 @@
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
 | `tests/test_centroid_fft_k_plan.py` | `_plan` | 22 | 21 | Existing statements moved to named stages or dead selector removed |
-| `tests/test_centroid_fft_k_plan.py` | **File total** | 164 | 163 | Net -1 lines |
+| `tests/test_centroid_fft_k_plan.py` | `test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner` | 86 | 94 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_centroid_fft_k_plan.py` | **File total** | 164 | 171 | Net +7 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -566,7 +587,7 @@
 
 | Tree scope | Before | After | Net |
 |---|---|---|---|
-| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119357 | -5890 |
+| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119482 | -5765 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
@@ -581,7 +602,8 @@
 | 9 — extract zeta writer and tile stages (48194876) | 1405 | 465 passed, 2 skipped, 1 xfailed, 102 warnings in 247.62s (0:04:07) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-190233-157458-4126, lx-Xg4-190235-157617-6713; 18_fit_writer_stages/cpu/cpu.xml; 18_fit_writer_stages/p4/mos2/identity.json |
 | 10 — use canonical mesh cache keys (37aa7db2) | 1406 | 452 passed, 2 skipped, 1 xfailed, 102 warnings in 177.23s (0:02:57) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-190804-191933-7526, lx-Xg4-190804-192105-9882; 19_owner_cache_keys/cpu/cpu.xml; 19_owner_cache_keys/p4/mos2/identity.json |
 | 11 — relocate long source contracts to architecture owners (14b6fb1d) | 1408 | 450 passed, 2 skipped, 1 xfailed, 102 warnings in 178.98s (0:02:58) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-191254-220724-5967, lx-Xg4-191254-220772-4165; 20_contract_docs/cpu/cpu.xml; 20_contract_docs/p4/mos2/identity.json |
-| 12 — separate input parsing from configuration envelopes (this commit) | 1409 | 751 passed, 2 skipped, 1 xfailed, 116 warnings in 184.45s (0:03:04) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-192253-278495-2175, lx-Xg4-191743-249096-5555; 22_config_corrected/cpu/cpu.xml; 22_config_corrected/p4/mos2/identity.json |
+| 12 — separate input parsing from configuration envelopes (35b45dc6) | 1409 | 751 passed, 2 skipped, 1 xfailed, 116 warnings in 184.45s (0:03:04) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-192253-278495-2175, lx-Xg4-191743-249096-5555; 22_config_corrected/cpu/cpu.xml; 22_config_corrected/p4/mos2/identity.json |
+| 13 — extract bounded centroid loading stages (this commit) | 1410 | 458 passed, 2 skipped, 1 xfailed, 102 warnings in 176.27s (0:02:56) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-193204-329368-3760, lx-Xg4-192729-303163-2911; 31_centroid_guard/cpu/cpu.xml; 31_centroid_guard/p4/mos2/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|
@@ -594,7 +616,7 @@
 | Captured symmetry data in identity caches | Shape equality alone does not authenticate captured action tables; no unsafe shape-only replacement |
 | Strict-key legacy exemptions | read_lorrax_input includes _LEGACY_DECK_KEYS in _known; dropping only explicit refusals would silently accept retired keys |
 | First push parent synchronization | Fetched parent immediately before first push; still c2f69987, so no rebase needed. No rebases after first push |
-| Reverted centroid-loader stage cut | 12_centroid_stages/verdict.txt: P4 exact; CPU1 failed/460 passed/2 skipped/1 xfailed because test_centroid_fft_k_plan requires in-entry calls. Source and contract relocation reverted |
+| Reverted centroid-loader stage cut | 12_centroid_stages/verdict.txt: P4 exact; CPU1 failed/460 passed/2 skipped/1 xfailed because test_centroid_fft_k_plan requires in-entry calls. Initial source/contract relocation reverted; corrected extraction accepted in31_centroid_guard |
 | Reverted Sigma stage cut | 13_sigma_stages/verdict.txt: P4 exact; CPU9 failed/496 passed/2 skipped/3 xfailed: four nb=3 fixtures incompatible with CPU4 band sharding, four absent-host-FFI failures, one entry-body structural guard. Source/tests/contract relocation reverted |
 | Reverted initializer stage cut | 17_prepare_stages/verdict.txt: CPU476 passed/2 skipped/1 xfailed; P4 failed because the extracted fresh-carrier stage omitted _parent_green_faces. Source/tests/contract relocation reverted |
 | Configuration guard retry | 21_config_stages/verdict.txt: initial CPU750 pass/1 fail depended on a moved driver comment; reverted and reapplied with owner-based structural guard in22_config_corrected. Its P4 receipt is reused after exact production-diff comparison |
