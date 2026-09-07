@@ -1,0 +1,10 @@
+run_id: 41_cpu_P3_zero_probe
+system: synthetic
+pipeline: compile_probe
+platform: perlmutter
+pool: 57988457
+geometry: CPU four emulated devices
+steps:
+  gate:
+    state: complete
+receipt: "[lx] step lx-Xg0-134320-881449-7187 exit 0 in 4 s"

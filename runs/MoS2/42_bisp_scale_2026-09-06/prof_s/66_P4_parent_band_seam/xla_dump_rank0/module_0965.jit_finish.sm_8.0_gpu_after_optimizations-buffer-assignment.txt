@@ -1,0 +1,131 @@
+BufferAssignment:
+allocation 0: size 518400, output shape is |c128[36,30,30]|, maybe-live-out:
+ value: <25 all-gather-start{1} @0> (size=358400,offset=0): c128[7,40,80]{1,0,2}
+ value: <30 input_transpose_fusion.1 @0> (size=518400,offset=0): c128[36,30,30]{2,1,0}
+allocation 1: size 179200, parameter 0, shape |c128[7,40,40]| at ShapeIndex {}:
+ value: <22 param @0> (size=179200,offset=0): c128[7,40,40]{2,1,0}
+allocation 2: size 144, constant:
+ value: <21 constant_9_0 @0> (size=144,offset=0): s32[36,1]{1,0}
+allocation 3: size 36, constant:
+ value: <29 constant_8_0 @0> (size=36,offset=0): pred[36]{0}
+allocation 4: size 1075712, preallocated-temp:
+ value: <23 wrapped_transpose @0> (size=179200,offset=512): c128[40,7,40]{2,1,0}
+ value: <24 all-gather-start{} @0> (size=16,offset=0): (c128[7,40,40]{1,0,2}, c128[7,40,80]{1,0,2})
+ value: <26 input_transpose_fusion @0> (size=358400,offset=717312): c128[40,7,80]{2,1,0}
+ value: <27 all-gather-start.1{} @0> (size=16,offset=256): (c128[7,40,80]{2,0,1}, c128[7,80,80]{2,0,1})
+ value: <28 all-gather-start.1{1} @0> (size=716800,offset=512): c128[7,80,80]{2,0,1}
+
+Total bytes used: 1773492 (1.69MiB)
+
+Used values:
+<21 constant_9_0 @0>
+ positions:
+  constant_9_0
+ uses:
+  input_transpose_fusion.1, operand 0
+ from instruction: %constant_9_0 = s32[36,1]{1,0} constant({...})
+<22 param @0>
+ positions:
+  param
+ uses:
+  wrapped_transpose, operand 0
+ from instruction: %param = c128[7,40,40]{2,1,0} parameter(0), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="value"}
+<23 wrapped_transpose @0>
+ positions:
+  wrapped_transpose
+  bitcast.31.0
+  all-gather-start {0}
+ uses:
+  bitcast.31.0, operand 0
+  all-gather-start, operand 0
+  all-gather-done, operand 0 {0}
+ from instruction: %wrapped_transpose = c128[40,7,40]{2,1,0} fusion(%param), kind=kInput, calls=%wrapped_transpose_computation, metadata={op_name="value"}
+<24 all-gather-start{} @0>
+ positions:
+  all-gather-start {}
+ uses:
+  all-gather-done, operand 0 {}
+ from instruction: %all-gather-start = (c128[7,40,40]{1,0,2}, c128[7,40,80]{1,0,2}) all-gather-start(%bitcast.31.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, metadata={op_name="jit(finish)/sharding_constraint" stack_frame_id=9}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<25 all-gather-start{1} @0>
+ positions:
+  all-gather-start {1}
+  all-gather-done
+ uses:
+  all-gather-done, operand 0 {1}
+  input_transpose_fusion, operand 0
+ from instruction: %all-gather-start = (c128[7,40,40]{1,0,2}, c128[7,40,80]{1,0,2}) all-gather-start(%bitcast.31.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, metadata={op_name="jit(finish)/sharding_constraint" stack_frame_id=9}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<26 input_transpose_fusion @0>
+ positions:
+  input_transpose_fusion
+  bitcast.35.0
+  all-gather-start.1 {0}
+ uses:
+  bitcast.35.0, operand 0
+  all-gather-start.1, operand 0
+  all-gather-done.1, operand 0 {0}
+ from instruction: %input_transpose_fusion = c128[40,7,80]{2,1,0} fusion(%all-gather-done), kind=kInput, calls=%fused_transpose, metadata={op_name="jit(finish)/sharding_constraint" stack_frame_id=9}
+<27 all-gather-start.1{} @0>
+ positions:
+  all-gather-start.1 {}
+ uses:
+  all-gather-done.1, operand 0 {}
+ from instruction: %all-gather-start.1 = (c128[7,40,80]{2,0,1}, c128[7,80,80]{2,0,1}) all-gather-start(%bitcast.35.0), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, metadata={op_name="jit(finish)/sharding_constraint" stack_frame_id=9}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<28 all-gather-start.1{1} @0>
+ positions:
+  all-gather-start.1 {1}
+  all-gather-done.1
+ uses:
+  all-gather-done.1, operand 0 {1}
+  input_transpose_fusion.1, operand 1
+ from instruction: %all-gather-start.1 = (c128[7,40,80]{2,0,1}, c128[7,80,80]{2,0,1}) all-gather-start(%bitcast.35.0), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, metadata={op_name="jit(finish)/sharding_constraint" stack_frame_id=9}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+<29 constant_8_0 @0>
+ positions:
+  constant_8_0
+ uses:
+  input_transpose_fusion.1, operand 2
+ from instruction: %constant_8_0 = pred[36]{0} constant({...})
+<30 input_transpose_fusion.1 @0>
+ positions:
+  input_transpose_fusion.1
+ uses:
+ from instruction: %input_transpose_fusion.1 = c128[36,30,30]{2,1,0} fusion(%constant_9_0, %all-gather-done.1, %constant_8_0), kind=kInput, calls=%fused_transpose.1, metadata={op_name="jit(finish)/jit(_f)/jit(_where)/select_n"}
+
+
+HloLiveRange (max 12):
+  InstructionSequence:
+    0:constant_9_0
+    1:param
+    2:constant_8_0
+    3:wrapped_transpose
+    4:bitcast.31.0
+    5:all-gather-start
+    6:all-gather-done
+    7:input_transpose_fusion
+    8:bitcast.35.0
+    9:all-gather-start.1
+    10:all-gather-done.1
+    11:input_transpose_fusion.1
+  BufferLiveRange:
+    constant_9_0{}:0-11
+    param{}:0-12
+    wrapped_transpose{}:3-6
+    all-gather-start{}:5-6
+    all-gather-start{1}:5-7
+    input_transpose_fusion{}:7-10
+    all-gather-start.1{}:9-10
+    all-gather-start.1{1}:9-11
+    constant_8_0{}:2-11
+    input_transpose_fusion.1{}:11-12
+  Live ranges at 11 (peak):
+    all-gather-start.1{1}: 716800 bytes (cumulative: 716800 bytes)
+    input_transpose_fusion.1{}: 518400 bytes (cumulative: 1235200 bytes)
+    param{}: 179200 bytes (cumulative: 1414400 bytes)
+    constant_9_0{}: 144 bytes (cumulative: 1414544 bytes)
+    constant_8_0{}: 36 bytes (cumulative: 1414580 bytes)
+  Stack trace breakdown for peak usage: 1 414 580 bytes
+    main.1_spmd (100.0%, total: 1 414 580 bytes, current: 0 bytes, remaining: 1 414 580 bytes)
+      ├── jit(finish)/sharding_constraint{1} (50.7%, total: 716 800 bytes, current: 716 800 bytes, remaining: 697 780 bytes)
+      ├── jit(finish)/jit(_f)/jit(_where)/select_n (36.6%, total: 518 400 bytes, current: 518 400 bytes, remaining: 179 380 bytes)
+      ├── value (12.7%, total: 179 200 bytes, current: 179 200 bytes, remaining: 180 bytes)
+      ├── constant_9_0 (0.0%, total: 144 bytes, current: 144 bytes, remaining: 36 bytes)
+      └── constant_8_0 (0.0%, total: 36 bytes, current: 36 bytes, remaining: 0 bytes)

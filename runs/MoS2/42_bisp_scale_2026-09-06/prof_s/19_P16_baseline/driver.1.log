@@ -1,0 +1,25 @@
+[lx] using named allocation JID 57982945 [--jid]
+[lxrun] JID 57982945 · 4 nodes · 1:14:48 left · 15/16 GPUs free · incoming: lx-?
+  1  nid001064 [4/4 gpu]  free   —                —      —
+  2  nid001065 [3/4 gpu]  busy   lx-Xg1-123850-589837-7313 5m     started 12:38
+  3  nid001068 [4/4 gpu]  free   —                —      —
+  4  nid001128 [4/4 gpu]  free   —                —      —
+
+[lxrun] insufficient capacity: need 4 node(s) with 4 free GPU(s) PER NODE (-G is per node), have 3 fitting node(s)
+
+  Options:
+    (a) Use an allocation you already own:
+          export SLURM_JOBID=57988457   # lx-alloc-jackm-BISP-scale, 4 nodes, 3:55:48 left
+    (b) Open another interactive allocation:
+          lxalloc 4
+    (c) Wait — oldest running step is lx-Xg1-123850-589837-7313 on nid001065 (started 12:38, running 5m)
+
++------------------------------------------------------------------------------+
+| REFUSED: LX-POOLFULL                                                         |
++------------------------------------------------------------------------------+
+| got    no node in JID 57982945 has 4 GPU(s) free                             |
+| want   4 node(s) with room (menu above)                                      |
+| fix    wait with `lx run --wait 120 ...`, watch with `lx status`, or add     |
+|        capacity with `lx alloc -N n`                                         |
+| doc    lx help --pool                                                        |
++------------------------------------------------------------------------------+

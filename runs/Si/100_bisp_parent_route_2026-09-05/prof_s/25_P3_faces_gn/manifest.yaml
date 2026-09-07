@@ -1,0 +1,12 @@
+run_id: 25_P3_faces_gn
+system: Si
+pipeline: gwjax
+platform: perlmutter
+variant_of: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/21_P_gn_fixed_rules
+reused: copied zeta and rule caches; immutable input links
+pool: 57988457
+geometry: P4 one rank per GPU
+steps:
+  sigma:
+    state: skipped
+disposition: latest gate requires MoS2 TRS rows; no duplicate Si leg

@@ -1,0 +1,16 @@
+diff --git a/src/gw/w_isdf.py b/src/gw/w_isdf.py
+index e05005a6..186ac783 100755
+--- a/src/gw/w_isdf.py
++++ b/src/gw/w_isdf.py
+@@ -1484,8 +1484,9 @@ def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy):
+                 q_irr_frac=qfrac, mesh_xy=mesh, n_sym_spatial=policy.n_sym_spatial,
+                 axis_local_sym_perm=left.centroid_local_perm,
+                 right_axis_local_sym_perm=right.centroid_local_perm)
+-    yield from mix_lorentz_blocks(sources, sym=sym, sym_idx=policy.unfold_sym_idx,
+-                                 mesh_xy=mesh, keys=keys).items()
++    mixed = mix_lorentz_blocks(sources, sym=sym, sym_idx=policy.unfold_sym_idx,
++                               mesh_xy=mesh)
++    yield from ((key, mixed[key]) for key in keys)
+ 
+ 
+ def _load_static_photon_hall(

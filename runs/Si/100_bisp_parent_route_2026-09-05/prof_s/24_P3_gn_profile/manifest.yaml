@@ -1,0 +1,12 @@
+run_id: 24_P3_gn_profile
+system: Si
+pipeline: gwjax
+platform: perlmutter
+variant_of: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/23_P3_gn_baseline
+reused: copied zeta and rule caches; immutable input links
+pool: 57988457
+geometry: P4 one rank per GPU
+steps:
+  sigma:
+    state: complete
+receipt: "[lx] step lx-Xg4-135417-946966-8718 exit 0 in 130 s"

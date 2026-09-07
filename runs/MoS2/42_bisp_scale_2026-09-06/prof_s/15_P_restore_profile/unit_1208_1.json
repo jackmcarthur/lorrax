@@ -1,0 +1,101 @@
+{
+  "program": 1208,
+  "occurrence": 1,
+  "occurrences": 3,
+  "label": "XlaModule:#hlo_module=jit_restore,program_id=1208#",
+  "host_range_ms": 0.489968,
+  "projected_ms": 1.198396,
+  "kernel_count": 19,
+  "kernel_sum_ms": 1.199099,
+  "kernels": [
+    {
+      "name": "loop_complex_fusion",
+      "count": 1,
+      "sum_ms": 0.002592
+    },
+    {
+      "name": "loop_dynamic_slice_fusion_1",
+      "count": 1,
+      "sum_ms": 0.001664
+    },
+    {
+      "name": "loop_dynamic_slice_fusion",
+      "count": 1,
+      "sum_ms": 0.002144
+    },
+    {
+      "name": "loop_dynamic_slice_fusion_2",
+      "count": 1,
+      "sum_ms": 0.001664
+    },
+    {
+      "name": "wrapped_slice_7",
+      "count": 1,
+      "sum_ms": 0.003391
+    },
+    {
+      "name": "wrapped_slice_8",
+      "count": 1,
+      "sum_ms": 0.003392
+    },
+    {
+      "name": "loop_transpose_fusion_3",
+      "count": 4,
+      "sum_ms": 0.073983
+    },
+    {
+      "name": "wrapped_slice_2",
+      "count": 1,
+      "sum_ms": 0.003744
+    },
+    {
+      "name": "wrapped_slice_3",
+      "count": 1,
+      "sum_ms": 0.003456
+    },
+    {
+      "name": "wrapped_slice_4",
+      "count": 1,
+      "sum_ms": 0.003744
+    },
+    {
+      "name": "wrapped_slice_5",
+      "count": 1,
+      "sum_ms": 0.003648
+    },
+    {
+      "name": "wrapped_slice",
+      "count": 1,
+      "sum_ms": 0.003744
+    },
+    {
+      "name": "wrapped_slice_1",
+      "count": 1,
+      "sum_ms": 0.003488
+    },
+    {
+      "name": "wrapped_slice_6",
+      "count": 1,
+      "sum_ms": 0.003616
+    },
+    {
+      "name": "loop_transpose_fusion_2",
+      "count": 1,
+      "sum_ms": 0.012224
+    },
+    {
+      "name": "loop_concatenate_fusion",
+      "count": 1,
+      "sum_ms": 1.072605
+    }
+  ],
+  "thunks": [
+    {
+      "name": "Thunk:#hlo_op=command_buffer_1#",
+      "kernels": 19,
+      "projected_ms": 1.198396,
+      "kernel_sum_ms": 1.199099
+    }
+  ],
+  "scope": "Native launch-correlation projection; nested thunk ranges must not be summed"
+}

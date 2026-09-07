@@ -1,0 +1,16 @@
+[lx] using named allocation JID 57982945 [--jid]
+[lxrun] JID 57982945 · 4 nodes · 2:11:48 left · 0/16 GPUs free · incoming: lx-?
+  1  nid001064 [0/4 gpu]  busy   lx-Xg4-114645-287164-3365 (+2) 30s    started 11:46  ← starting lx-?
+        └ lx-Xg4-114645-286901-1050    28s    started 11:46
+        └ lx-Xg4-114645-274286-4762    28s    started 11:46
+  2  nid001065 [0/4 gpu]  busy   lx-Xg4-114645-287164-3365 (+1) 30s    started 11:46
+        └ lx-Xg4-114645-274286-4762    28s    started 11:46
+  3  nid001068 [0/4 gpu]  busy   lx-Xg4-114645-287164-3365 (+1) 30s    started 11:46
+        └ lx-Xg4-114645-274286-4762    28s    started 11:46
+  4  nid001128 [0/4 gpu]  busy   lx-Xg4-114645-287164-3365 (+1) 30s    started 11:46
+        └ lx-Xg4-114645-274286-4762    28s    started 11:46
+[lx] zero-GPU step: --gres=none, no GPU selector, and this leg is charged 0 GPUs by the pool, so it does not queue behind GPU work. Set JAX_PLATFORMS=cpu in the payload if it uses JAX.
+[lx] source tree: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src  [cwd checkout]
+[lx] runtime import origin: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py  [PYTHONPATH head; runtime.bootstrap attests the actual import]
+[rankwrap] rank=0 host=nid001064 src=/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906
+[lx] step lx-Xg0-114716-304836-4320 exit 0 in 26 s

@@ -1,0 +1,7 @@
+[analyze_hlo_dump] 570 modules, peak-sum=21.51 GiB, 97 collectives, 0 remat warnings
+[analyze_hlo_dump] wrote /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/hlo_summary.md
+[analyze_hlo_dump] wrote /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/hlo_summary.json
+[analyze_hlo_dump] wrote /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/memory_details.txt
+[analyze_hlo_dump] wrote /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/collectives_details.txt
+[analyze_hlo_dump] wrote /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/remat_details.txt
+[analyze_hlo_dump] wrote /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/50_P3_sigma_seams/xla_dump_rank0/retrace_details.txt

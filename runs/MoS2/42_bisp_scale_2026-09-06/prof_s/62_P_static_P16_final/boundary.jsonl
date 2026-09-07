@@ -1,0 +1,12 @@
+{"label": "_make_photon_static_class_kernel", "options": {"shapes": [[7, 80, 4, 608], [7, 80, 4, 608]]}, "host_ms": 717.911504994845, "compiles": 1, "compile_s": 0.4218097899865825}
+{"label": "_make_photon_static_class_kernel", "options": {"shapes": [[7, 80, 4, 608], [7, 80, 4, 224]]}, "host_ms": 661.775944987312, "compiles": 1, "compile_s": 0.4415620600047987}
+{"label": "_make_photon_static_class_kernel", "options": {"shapes": [[7, 80, 4, 224], [7, 80, 4, 608]]}, "host_ms": 796.702342981007, "compiles": 1, "compile_s": 0.45041074001346715}
+{"label": "_make_photon_static_class_kernel", "options": {"shapes": [[7, 80, 4, 224], [7, 80, 4, 224]]}, "host_ms": 646.9465219997801, "compiles": 1, "compile_s": 0.3830850569938775}
+{"label": "_make_photon_static_class_kernel", "options": {"shapes": [[7, 80, 4, 608], [7, 80, 4, 608]]}, "host_ms": 328.6601589934435, "compiles": 0, "compile_s": 0.0}
+{"label": "_make_photon_static_class_kernel", "options": {"shapes": [[7, 80, 4, 608], [7, 80, 4, 224]]}, "host_ms": 286.610473995097, "compiles": 0, "compile_s": 0.0}
+{"label": "_make_photon_static_class_kernel", "options": {"shapes": [[7, 80, 4, 224], [7, 80, 4, 608]]}, "host_ms": 145.08824597578496, "compiles": 0, "compile_s": 0.0}
+{"label": "_make_photon_static_class_kernel", "options": {"shapes": [[7, 80, 4, 224], [7, 80, 4, 224]]}, "host_ms": 70.80941300955601, "compiles": 0, "compile_s": 0.0}
+{"label": "_make_photon_static_class_kernel", "options": {"shapes": [[7, 80, 4, 608], [7, 80, 4, 608]]}, "host_ms": 234.14548201253638, "compiles": 0, "compile_s": 0.0}
+{"label": "_make_photon_static_class_kernel", "options": {"shapes": [[7, 80, 4, 608], [7, 80, 4, 224]]}, "host_ms": 133.93885199911892, "compiles": 0, "compile_s": 0.0}
+{"label": "_make_photon_static_class_kernel", "options": {"shapes": [[7, 80, 4, 224], [7, 80, 4, 608]]}, "host_ms": 131.2180960085243, "compiles": 0, "compile_s": 0.0}
+{"label": "_make_photon_static_class_kernel", "options": {"shapes": [[7, 80, 4, 224], [7, 80, 4, 224]]}, "host_ms": 272.6121870218776, "compiles": 0, "compile_s": 0.0}

@@ -1,0 +1,346 @@
+{
+  "program": 1156,
+  "occurrence": 1,
+  "occurrences": 3,
+  "label": "XlaModule:#hlo_module=jit_contract_class,program_id=1156#",
+  "host_range_ms": 6.908715,
+  "projected_ms": 20.051494,
+  "kernel_count": 345,
+  "kernel_sum_ms": 19.015495,
+  "kernels": [
+    {
+      "name": "loop_dynamic_slice_fusion_2",
+      "count": 1,
+      "sum_ms": 0.00272
+    },
+    {
+      "name": "loop_and_fusion_2",
+      "count": 1,
+      "sum_ms": 0.002336
+    },
+    {
+      "name": "input_concatenate_fusion",
+      "count": 1,
+      "sum_ms": 0.058848
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_tensorop_z884gemm_32x16_16x3_nn_align1>(T1::Params)",
+      "count": 15,
+      "sum_ms": 1.196177
+    },
+    {
+      "name": "loop_multiply_fusion",
+      "count": 1,
+      "sum_ms": 0.05328
+    },
+    {
+      "name": "input_transpose_fusion",
+      "count": 1,
+      "sum_ms": 0.015104
+    },
+    {
+      "name": "loop_broadcast_fusion_1",
+      "count": 1,
+      "sum_ms": 0.262814
+    },
+    {
+      "name": "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "count": 200,
+      "sum_ms": 9.773327
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_tensorop_z884gemm_32x32_16x4_nn_align1>(T1::Params)",
+      "count": 86,
+      "sum_ms": 1.863661
+    },
+    {
+      "name": "loop_transpose_fusion",
+      "count": 1,
+      "sum_ms": 0.525276
+    },
+    {
+      "name": "void regular_fft<(unsigned int)6, EPT<(unsigned int)2, (unsigned int)3>, (unsigned int)32, (unsigned int)16, (padding_t)14, (twiddle_t)0, (loadstore_modifier_t)2, (layout_t)1, unsigned int, double, HostConfigPlaceholder>(kernel_arguments_t<T9>)",
+      "count": 10,
+      "sum_ms": 1.818454
+    },
+    {
+      "name": "lrx_scale_c128",
+      "count": 5,
+      "sum_ms": 0.85686
+    },
+    {
+      "name": "loop_broadcast_fusion",
+      "count": 1,
+      "sum_ms": 0.26307
+    },
+    {
+      "name": "loop_and_fusion",
+      "count": 6,
+      "sum_ms": 0.011904
+    },
+    {
+      "name": "loop_complex_fusion",
+      "count": 3,
+      "sum_ms": 0.006368
+    },
+    {
+      "name": "loop_add_fusion",
+      "count": 3,
+      "sum_ms": 2.156753
+    },
+    {
+      "name": "loop_add_fusion_1",
+      "count": 3,
+      "sum_ms": 0.006304
+    },
+    {
+      "name": "loop_gather_fusion",
+      "count": 1,
+      "sum_ms": 0.112671
+    },
+    {
+      "name": "loop_broadcast_fusion_2",
+      "count": 1,
+      "sum_ms": 0.009088
+    },
+    {
+      "name": "wrapped_transpose",
+      "count": 1,
+      "sum_ms": 0.005152
+    },
+    {
+      "name": "input_transpose_fusion_1",
+      "count": 1,
+      "sum_ms": 0.010592
+    },
+    {
+      "name": "loop_broadcast_fusion_3",
+      "count": 1,
+      "sum_ms": 0.001984
+    },
+    {
+      "name": "wrapped_transpose_1",
+      "count": 1,
+      "sum_ms": 0.002752
+    }
+  ],
+  "thunks": [
+    {
+      "name": "Thunk:#hlo_op=command_buffer_1#",
+      "kernels": 7,
+      "projected_ms": 0.768763,
+      "kernel_sum_ms": 0.769083
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.19#",
+      "kernels": 216,
+      "projected_ms": 7.510003,
+      "kernel_sum_ms": 6.928308
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/transpose,hlo_op=loop_transpose_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.525276,
+      "kernel_sum_ms": 0.525276
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/shard_map/ffi_call,hlo_op=ffi_call.20#",
+      "kernels": 3,
+      "projected_ms": 1.260153,
+      "kernel_sum_ms": 1.257977
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/broadcast_in_dim,hlo_op=loop_broadcast_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.26307,
+      "kernel_sum_ms": 0.26307
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while,hlo_op=while.12#",
+      "kernels": 24,
+      "projected_ms": 2.453649,
+      "kernel_sum_ms": 2.335153
+    },
+    {
+      "name": "Thunk:#hlo_op=while.12_body#",
+      "kernels": 8,
+      "projected_ms": 0.816251,
+      "kernel_sum_ms": 0.776539
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body,hlo_op=loop_and_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.002496,
+      "kernel_sum_ms": 0.002496
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body,hlo_op=loop_and_fusion.1#",
+      "kernels": 1,
+      "projected_ms": 0.001888,
+      "kernel_sum_ms": 0.001888
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body/closed_call/shard_map/ffi_call,hlo_op=ffi_call.18#",
+      "kernels": 3,
+      "projected_ms": 0.053568,
+      "kernel_sum_ms": 0.051264
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body,hlo_op=loop_complex_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.002016,
+      "kernel_sum_ms": 0.002016
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body,hlo_op=loop_add_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.716731,
+      "kernel_sum_ms": 0.716731
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body/add,hlo_op=loop_add_fusion.1#",
+      "kernels": 1,
+      "projected_ms": 0.002144,
+      "kernel_sum_ms": 0.002144
+    },
+    {
+      "name": "Thunk:#hlo_op=while.12_body#",
+      "kernels": 8,
+      "projected_ms": 0.813115,
+      "kernel_sum_ms": 0.775355
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body,hlo_op=loop_and_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.00208,
+      "kernel_sum_ms": 0.00208
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body,hlo_op=loop_and_fusion.1#",
+      "kernels": 1,
+      "projected_ms": 0.001664,
+      "kernel_sum_ms": 0.001664
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body/closed_call/shard_map/ffi_call,hlo_op=ffi_call.18#",
+      "kernels": 3,
+      "projected_ms": 0.053792,
+      "kernel_sum_ms": 0.05168
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body,hlo_op=loop_complex_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.002176,
+      "kernel_sum_ms": 0.002176
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body,hlo_op=loop_add_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.715675,
+      "kernel_sum_ms": 0.715675
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body/add,hlo_op=loop_add_fusion.1#",
+      "kernels": 1,
+      "projected_ms": 0.00208,
+      "kernel_sum_ms": 0.00208
+    },
+    {
+      "name": "Thunk:#hlo_op=while.12_body#",
+      "kernels": 8,
+      "projected_ms": 0.821979,
+      "kernel_sum_ms": 0.783259
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body,hlo_op=loop_and_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.00208,
+      "kernel_sum_ms": 0.00208
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body,hlo_op=loop_and_fusion.1#",
+      "kernels": 1,
+      "projected_ms": 0.001696,
+      "kernel_sum_ms": 0.001696
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body/closed_call/shard_map/ffi_call,hlo_op=ffi_call.18#",
+      "kernels": 3,
+      "projected_ms": 0.052928,
+      "kernel_sum_ms": 0.05088
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body,hlo_op=loop_complex_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.002176,
+      "kernel_sum_ms": 0.002176
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body,hlo_op=loop_add_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.724347,
+      "kernel_sum_ms": 0.724347
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/while/body/add,hlo_op=loop_add_fusion.1#",
+      "kernels": 1,
+      "projected_ms": 0.00208,
+      "kernel_sum_ms": 0.00208
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(convolve)/shard_map/ffi_call,hlo_op=ffi_call.21#",
+      "kernels": 3,
+      "projected_ms": 1.265625,
+      "kernel_sum_ms": 1.263513
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class),hlo_op=loop_gather_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.112671,
+      "kernel_sum_ms": 0.112671
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(_local)/shard_map/broadcast_in_dim,hlo_op=loop_broadcast_fusion.2#",
+      "kernels": 1,
+      "projected_ms": 0.009088,
+      "kernel_sum_ms": 0.009088
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/transpose,hlo_op=wrapped_transpose#",
+      "kernels": 1,
+      "projected_ms": 0.005152,
+      "kernel_sum_ms": 0.005152
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.22#",
+      "kernels": 42,
+      "projected_ms": 3.519146,
+      "kernel_sum_ms": 3.357098
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class),hlo_op=input_transpose_fusion.1#",
+      "kernels": 1,
+      "projected_ms": 0.010592,
+      "kernel_sum_ms": 0.010592
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(_local)/shard_map/broadcast_in_dim,hlo_op=loop_broadcast_fusion.3#",
+      "kernels": 1,
+      "projected_ms": 0.001984,
+      "kernel_sum_ms": 0.001984
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.23#",
+      "kernels": 42,
+      "projected_ms": 2.28389,
+      "kernel_sum_ms": 2.173778
+    },
+    {
+      "name": "Thunk:#name=jit(contract_class)/jit(_local)/shard_map/transpose,hlo_op=wrapped_transpose.1#",
+      "kernels": 1,
+      "projected_ms": 0.002752,
+      "kernel_sum_ms": 0.002752
+    }
+  ],
+  "scope": "Native launch-correlation projection; nested thunk ranges must not be summed"
+}

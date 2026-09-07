@@ -1,0 +1,32 @@
+ZETA_TILE reference_row=0 candidate_row=0 values=1172508 max_abs=0.00000000000000000e+00 max_ref=4.39800203307227775e+02
+ZETA_TILE reference_row=1 candidate_row=1 values=1172508 max_abs=0.00000000000000000e+00 max_ref=4.64545181505717778e+02
+ZETA_TILE reference_row=2 candidate_row=2 values=1172508 max_abs=0.00000000000000000e+00 max_ref=4.80019262382320449e+02
+ZETA_TILE reference_row=3 candidate_row=3 values=1172508 max_abs=0.00000000000000000e+00 max_ref=4.70569302415804884e+02
+ZETA_TILE reference_row=4 candidate_row=4 values=1172508 max_abs=0.00000000000000000e+00 max_ref=5.02586943415122278e+02
+ZETA_TILE reference_row=5 candidate_row=5 values=1172508 max_abs=0.00000000000000000e+00 max_ref=5.55743321463547090e+02
+ZETA_TILE reference_row=6 candidate_row=6 values=1172508 max_abs=0.00000000000000000e+00 max_ref=5.61954382513228097e+02
+ZETA_SUMMARY dataset=/zeta_q_G shape=(7, 597, 1964) dtype=complex128 tiles=7 values=8207556 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=0.00000000000000000e+00 status=PASS
+ZETA_TILE reference_row=0 candidate_row=0 values=381016 max_abs=0.00000000000000000e+00 max_ref=6.98817775671310073e+02
+ZETA_TILE reference_row=1 candidate_row=1 values=381016 max_abs=0.00000000000000000e+00 max_ref=6.93984472799779041e+02
+ZETA_TILE reference_row=2 candidate_row=2 values=381016 max_abs=0.00000000000000000e+00 max_ref=5.82704435459656111e+02
+ZETA_TILE reference_row=3 candidate_row=3 values=381016 max_abs=0.00000000000000000e+00 max_ref=5.32348661721508847e+02
+ZETA_TILE reference_row=4 candidate_row=4 values=381016 max_abs=0.00000000000000000e+00 max_ref=6.71820395189431679e+02
+ZETA_TILE reference_row=5 candidate_row=5 values=381016 max_abs=0.00000000000000000e+00 max_ref=6.28058033460762999e+02
+ZETA_TILE reference_row=6 candidate_row=6 values=381016 max_abs=0.00000000000000000e+00 max_ref=7.27518600654509328e+02
+ZETA_SUMMARY dataset=/zeta_q_G shape=(7, 194, 1964) dtype=complex128 tiles=7 values=2667112 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=0.00000000000000000e+00 status=PASS
+ZETA_TILE reference_row=0 candidate_row=0 values=381016 max_abs=0.00000000000000000e+00 max_ref=6.23105268334233301e+02
+ZETA_TILE reference_row=1 candidate_row=1 values=381016 max_abs=0.00000000000000000e+00 max_ref=6.95637239667823223e+02
+ZETA_TILE reference_row=2 candidate_row=2 values=381016 max_abs=0.00000000000000000e+00 max_ref=7.26798673534934096e+02
+ZETA_TILE reference_row=3 candidate_row=3 values=381016 max_abs=0.00000000000000000e+00 max_ref=7.00698846431380957e+02
+ZETA_TILE reference_row=4 candidate_row=4 values=381016 max_abs=0.00000000000000000e+00 max_ref=7.89923507797575326e+02
+ZETA_TILE reference_row=5 candidate_row=5 values=381016 max_abs=0.00000000000000000e+00 max_ref=8.29489622988204246e+02
+ZETA_TILE reference_row=6 candidate_row=6 values=381016 max_abs=0.00000000000000000e+00 max_ref=8.26802077023747870e+02
+ZETA_SUMMARY dataset=/zeta_q_G shape=(7, 194, 1964) dtype=complex128 tiles=7 values=2667112 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=0.00000000000000000e+00 status=PASS
+ZETA_TILE reference_row=0 candidate_row=0 values=381016 max_abs=0.00000000000000000e+00 max_ref=5.79293687431107401e+02
+ZETA_TILE reference_row=1 candidate_row=1 values=381016 max_abs=0.00000000000000000e+00 max_ref=6.24345487523363886e+02
+ZETA_TILE reference_row=2 candidate_row=2 values=381016 max_abs=0.00000000000000000e+00 max_ref=6.72242201262806475e+02
+ZETA_TILE reference_row=3 candidate_row=3 values=381016 max_abs=0.00000000000000000e+00 max_ref=6.66984186356180771e+02
+ZETA_TILE reference_row=4 candidate_row=4 values=381016 max_abs=0.00000000000000000e+00 max_ref=6.95137022489318610e+02
+ZETA_TILE reference_row=5 candidate_row=5 values=381016 max_abs=0.00000000000000000e+00 max_ref=7.38599565134789373e+02
+ZETA_TILE reference_row=6 candidate_row=6 values=381016 max_abs=0.00000000000000000e+00 max_ref=7.01491495697194296e+02
+ZETA_SUMMARY dataset=/zeta_q_G shape=(7, 194, 1964) dtype=complex128 tiles=7 values=2667112 nonfinite=0 max_abs=0.00000000000000000e+00 normalized_max_rel=0.00000000000000000e+00 rtol=0.00000000000000000e+00 status=PASS

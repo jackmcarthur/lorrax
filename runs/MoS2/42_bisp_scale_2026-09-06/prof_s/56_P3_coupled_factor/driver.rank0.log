@@ -1,0 +1,1678 @@
+[lorrax source closure] {"mode":"source","root":"/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906","runtime":"src/runtime/__init__.py","services":{"distrib-la":"services/distrib_la/src/distrib_la/__init__.py","lxkit":"services/lxkit/src/lxkit/__init__.py","minimax":"services/minimax/src/minimax/__init__.py","symmetry-maps":"services/symmetry_maps/src/symmetry_maps/__init__.py","vcoul":"services/vcoul/src/vcoul/__init__.py","wfn-loader":"services/wfn_loader/src/wfn_loader/__init__.py","zeta-loader":"services/zeta_loader/src/zeta_loader/__init__.py"}}
+  [compile-cache] cross-rank compile agreement enabled before backend compile with no deadline (rank 0 names a missing rank every 60 s).
+[stage 14:35:15] -> collective_warmup
+[stage 14:35:17] <- collective_warmup  1.2 s
+[lorrax native] LEGACY-UNSEALED origin=/global/common/software/m4598/jackm/lorrax_cuda13_runtime/ffi_build_phdf5/liblorrax_ffi.so sha256=cad78d947a953949 pair/private-closure unattested; developer migration only
+[fft_ffi] flat-k 3-D FFTs -> cuFFT strided CUDA FFI handler (lorrax_mklfft_flat_k): cufftPlanMany64 advanced layout (istride=T, idist=1 — the stride-descriptor analog) reading the dot-layout tile in place; jnp.fft norm scales applied by a fused device kernel.
+[conv_kminor] auto -> ON: the fused k-minor conv kernel (lorrax_cufft_conv_kminor) serves this run's rung.  CUDA mesh, handler present.  Callers whose k-grid is too large for one resident k-row still take the XLA chain for that call, silently and correctly.
+[LORRAX_CONV_KLEAD_FFI] =0: k-leading fused-convolution candidate disabled; no production Sigma caller yet.
+[conv_kpair] auto -> ON: the ISDF post-pair CUDA accelerator (lorrax_cufft_conv_kpair) is available; the plan selected its measured-fast resident/device arm from mirrored byte arithmetic.
+  [compile-cache] persistent compile cache OFF (ISDF_JAX_CACHE_DIR="" opt-out). JAX's in-process executable cache remains active. For reuse among sequential drivers or a deliberate restart campaign, set ISDF_JAX_CACHE_DIR to a rank-visible directory.
+==============================================================================
+  LORRAX runtime — resolved startup configuration
+==============================================================================
+  This is rank 0 of 4, and it addresses 1 of the 4 devices in the job.
+  jax.distributed.initialize() took its explicit form with coordinator_address='nid001128:22005', num_processes=4 and local_device_ids=[0].
+  The JAX platform resolved to 'gpu' on devices of kind 'NVIDIA A100-SXM4-40GB', from JAX_PLATFORMS='cuda,cpu', under jax 0.9.1 / jaxlib 0.9.1 with 64-bit values enabled.
+  Default matmul precision is pinned to 'highest', so f32 and complex64 dots run at fp32 rather than TensorFloat32; f64/c128 is unaffected either way.
+  XLA GPU autotuning resolved to level '0' from LORRAX default (runtime.set_default_env); the complete resolved XLA_FLAGS value is '--xla_gpu_autotune_level=0'.
+  The run's device mesh is 2x2 over axes ('x', 'y'), and its communicator cliques were warmed before the first physics jit.
+  Bringing this stack up took 4.5 s in total: 3.0 s for the environment, jax.distributed and backend init, 1.4 s to build the mesh and warm its communicators, 0.0 s to arm the compile cache and 0.1 s to measure everything in this block.
+  Demotions listed above are this rank's; a demotion that happened only on another rank is announced in that rank's own output and does not appear here.
+  Cross-process collectives run on NCCL because this is a GPU platform, so JAX_CPU_COLLECTIVES_IMPLEMENTATION does not apply.
+  The XLA memory pool, read from jax.local_devices()[0].memory_stats() and not from os.environ, reports a limit of 36.04 GB with 0.00 GB in use and a peak of 0.00 GB so far.
+  XLA_PYTHON_CLIENT_PREALLOCATE resolved to false (raw 'false') and XLA_PYTHON_CLIENT_ALLOCATOR resolved to 'bfc' (raw 'bfc') — NOT LORRAX's canonical pair, which is preallocate=false with the allocator left unset (BFC); a caller overrode it.
+  The XLA client memory fraction is 0.85 from XLA_PYTHON_CLIENT_MEM_FRACTION.
+  The CUDA FFI library loaded from /global/common/software/m4598/jackm/lorrax_cuda13_runtime/ffi_build_phdf5/liblorrax_ffi.so, selected by LORRAX_FFI_SO.
+  FFI build provenance: /global/common/software/m4598/jackm/lorrax_cuda13_runtime/ffi_build_phdf5/liblorrax_ffi.so | LEGACY-UNSEALED | recorded-rev bb6422eaad04 | recorded-sha cad78d947a953949 | actual 6755720 bytes sha cad78d947a953949
+  The LORRAX_BANDS_GEMM_FFI dial is unset and resolved to on, so the contract_bands right-GEMM contraction rides the platform's native lowering — the dial exists on cpu only and this run's backend is 'gpu', where startup enforcement skips it by the gate's declared platform policy (the native lowering IS the required path there).
+  The LORRAX_FFT_FFI dial is unset and resolved to on, so the flat-k 3-D FFT helper path is routed through the FFI handler (the required layer).
+  The LORRAX_FFT_FFI_FUSED dial is unset and resolved to on, so the fused IFFT-multiply-FFT tau kernel is routed through the FFI handler (the required layer).
+  The LORRAX_CONV_KMINOR_FFI dial is unset and resolved to auto, so the fused k-MINOR ifft-multiply-fft conv (the BSE ladder-W rung; accelerator) is routed through the FFI handler WHERE AVAILABLE and through the caller's XLA ifft/multiply/fft chain otherwise (capability: the mesh is CUDA, the loaded device library exports CufftConvKMinorCudaFfi, and the k-grid's row fits a block's shared memory).
+  The LORRAX_CONV_KLEAD_FFI dial is unset and resolved to off, so the direct fused k-LEADING IFFT(G)-IFFT(W)-FFT conv (Sigma; accelerator, default off) keeps the certified plan-based k-leading gw_conv handler — this dial is OPT-IN and off is its certified state.
+  The LORRAX_CONV_KPAIR_FFI dial is unset and resolved to auto, so the fused post-pair convolution used to form the ISDF Coulomb operator is routed through the FFI handler WHERE AVAILABLE and through the ISDF XLA IFFT/conjugate/gamma/FFT reference chain otherwise (capability: the mesh is CUDA, the loaded device library exports CufftConvKPairCudaFfi, the runtime axes are in [1,24], and the shape is in the measured native-fast region).
+  The distributed backends available for eigh on this mesh are cusolvermp, distributed, native; which one runs is the input-file key, not an environment variable.
+  The distributed backends available for cholesky on this mesh are cusolvermp, native, native2d; which one runs is the input-file key, not an environment variable.
+  The distributed backends available for solve_lu on this mesh are cusolvermp, distributed, native; which one runs is the input-file key, not an environment variable.
+  This process is pinned to 32 schedulable CPUs, with OMP_NUM_THREADS=None, MKL_NUM_THREADS=None and OPENBLAS_NUM_THREADS='16 (auto: physical cores of the affinity mask; applied to libscipy_openblas64_-61654e39.so)'.
+  Inside the FFI handlers the BLAS team size is LORRAX_MKLBLAS_THREADS=None for the batched GEMM, where unset means the ambient thread count, and LORRAX_SCALAPACK_MKL_THREADS=None for the ScaLAPACK handlers, where unset means a cap of 4 because pzheevd measured 11.28 s per q at 14 MKL threads against 0.463 s at 4.
+  The JAX persistent compile cache is OFF, so every rank compiles every module in this run; set ISDF_JAX_CACHE_DIR to a rank-visible directory to turn it on, or leave it unset and let the resolution order pick one — LORRAX_RUN_DIR/.lorrax_jax_cache first, then $SCRATCH/lorrax_jax_cache, then the home cache (docs/dev/env_vars.md).
+  The cache key includes every array shape, so a system size this machine has not run before misses every entry no matter how warm the cache looks.
+  Cross-rank module-compile agreement is ON with no deadline (rank 0 names a missing rank every 60 s); each backend compile is fingerprinted before XLA execution.
+  The fail-fast excepthook is installed, so an uncaught exception on any rank exits the step non-zero instead of leaving its peers blocked in a collective that rank will never join.
+  glibc malloc tuning is in force with M_MMAP_THRESHOLD=1 MB and M_TRIM_THRESHOLD=128 MB, which is the mitigation for the per-r-chunk RSS ramp on long XLA:CPU runs.
+==============================================================================
+  [config provenance] this deck names 1 LEGACY self-energy-axis key(s); they are honored, and the canonical axes resolved to compute_mode = cohsex, qp_solver = one_shot_dft.
+    do_screened -> write compute_mode = x_only | cohsex | gn_ppm | hl_ppm | mpa instead
+==============================================================================
+LORRAX GW CALCULATION
+==============================================================================
+Input          : /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/cohsex.in
+Method         : cohsex / one_shot_dft
+  Head policy: head_correction=full; screening_diagrams=w_rpa; direct diagnostic source=s_tensor. macroscopic W, local fields exactly once
+  Bispinor GW policy: bispinor_gw=full_static_cohsex (packed no-pair 4x4 static response with the Gamma-cell completion: bare <D> into V, charge S00/wing head into W, Hall CT/TC from static_gauge_hall_file when present)
+Photon route   : packed screened static photon operator (sixteen response and Sigma blocks; coupled 4x4 Dyson solve; Gamma-cell completion carries charge, mixed, and transverse heads)
+  [hdf5-probe startup] libhdf5 2 core mapped: libhdf5-9e18f0c6.so.320.0.0, libhdf5_parallel_gnu.so.310.3.0 (+1 companion: libhdf5_hl-69da89c9.so.320.0.0); HDF5_USE_FILE_LOCKING=FALSE; policy=measure
+  [hdf5-probe startup] no path opened through both stacks so far
+  [WfnLoader] read backend = phdf5 (auto, 4 processes) — collective MPI-IO read through the phdf5 FFI .so
+[2c-TRS] WFN.h5: CONSISTENT (spatial-conditional, residual=1.65e-08, coverage=33%, raw-pair=0, spatial-pair=2, trim=2) | 0.05s (io 0.01 + overlap 0.04)
+  [config provenance] mpa_sampling_alpha = 1 (default for nonmetal)
+  Material class: insulator (inferred from WFN occupations)
+  ISDF basis: 597 centroids
+  FFT grid: 24×24×80   Cell volume: 702.20 a.u.³
+
+[config provenance] linalg = distributed (deck)
+linalg = distributed: dense N_mu x N_mu matrices are 2D distributed across the process mesh (N_mu = 597)
+[config provenance] low_mem_bands = true (deck)
+low_mem_bands = true: the two-face wavefunction carrier (band chunks of 16); required for the raw-parent (k_irr) route, which contracts G and the ISDF pair densities on the WFN's own k rows.
+
+CONFIGURATION PROVENANCE
+------------------------
+[config provenance] this deck names 1 LEGACY self-energy-axis key(s); they are honored, and the canonical axes resolved to compute_mode = cohsex, qp_solver = one_shot_dft.
+
+PROCESSOR ARCHITECTURE
+----------------------
+MPI ranks      : 4
+Accelerators   : 4 GPU devices (NVIDIA A100-SXM4-40GB, 1 per rank)
+Processor mesh : 2 x 2  (centroid axes X x Y)
+CPU allocation : 32 cores per rank
+Host threads   : OPENBLAS_NUM_THREADS=16 (auto: physical cores of the affinity mask; applied to libscipy_openblas64_-61654e39.so)
+
+METHOD AND PHYSICAL PATHWAYS
+----------------------------
+Self-energy    : static screened exchange + Coulomb hole; one-shot full-matrix effective Hamiltonian; Sigma evaluated at E_DFT with QSGW Hermitian symmetrization (distinct from fixed-DFT-state diagonal G0W0)
+QP consistency  : one_shot_dft | other options: fixed_point (diagonal on-shell), self_consistent (rebuild G/W/Sigma)
+EQP2 treatment  : off (set write_eqp2=true for fixed-Sigma eigenvalue self-consistency)
+Screening      : RPA Dyson series; minimax imaginary-axis quadrature
+Long wavelength: head=full; source=s_tensor
+Coulomb system : 2D slab; Hartree=live G-space
+Spin channels  : charge + transverse current (bispinor)
+Degenerate sets: averaged at 1.36057e-05 eV
+ISDF state     : fresh fit requested
+  centroid order: orbit-packed, 55 orbits on 2 shards of 300 slots (597 centroids, 3 pad slots, canonical carrier 600)
+  band counts: chi = sigma = 80; ISDF zeta fit sized for 80 bands (the two counts are TIED, so the band sums are the same window)
+    chi0/W band sum edge 80 clean: min gap 15.4 meV.
+    Sigma band sum edge 80 clean: min gap 15.4 meV.
+
+NUMERICAL ENVIRONMENT
+---------------------
+JAX/JAXLIB     : 0.9.1 / 0.9.1 | FP64 / complex128 | NCCL collectives
+Wavefunctions  : phdf5 reader
+Dense linalg   : distributed layout
+LORRAX_BANDS_GEMM_FFI      = NATIVE : right-GEMM contraction forming G(tau) (native XLA dot lowering)
+LORRAX_FFT_FFI             = ON     : flat-k FFTs for ISDF, chi0 and Sigma (cuFFT flat-k FFI)
+LORRAX_FFT_FFI_FUSED       = ON     : fused tau-domain convolution (cuFFT fused-convolution FFI)
+LORRAX_CONV_KPAIR_FFI      = ON     : pair-density convolution forming V(q) (cuFFT pair-convolution FFI)
+
+CRYSTAL SYMMETRY AND BRILLOUIN-ZONE SAMPLING
+--------------------------------------------
+Real-space action: r' = R^-1 r + tau
+Spatial group   : 12 operations; 0 with fractional translations
+QE schema      : FOUND data-file-schema.xml at /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/MoS2/42_bisp_scale_2026-09-06/00_qe_6x6/qe/nscf/MoS2.save/data-file-schema.xml
+QE schema hash : SHA256 2f78cfdefa2f
+Stored QE type : 12 unitary; 0 composed with time reversal
+Active op rows : 12 unitary; 12 TR-composed
+Inversion      : absent
+DFT 2c TRS     : CONSISTENT (spatial-conditional; occupied-density residual=1.65314e-08; coverage=33.33%; raw-pair=0, spatial-pair=2, trim=2)
+Global TRS     : enabled from the two-component reference check
+  op   QE time-reversal status       R^-1 and fractional translation
+  S01  QE-TR=no      active=unitary+TR R^-1=[ 1  0  0;  0  1  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S02  QE-TR=no      active=unitary+TR R^-1=[-1  1  0;  0  1  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S03  QE-TR=no      active=unitary+TR R^-1=[-1  1  0; -1  0  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S04  QE-TR=no      active=unitary+TR R^-1=[ 0 -1  0;  1 -1  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S05  QE-TR=no      active=unitary+TR R^-1=[ 0 -1  0; -1  0  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S06  QE-TR=no      active=unitary+TR R^-1=[ 1  0  0;  1 -1  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S07  QE-TR=no      active=unitary+TR R^-1=[ 1  0  0;  0  1  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S08  QE-TR=no      active=unitary+TR R^-1=[-1  1  0;  0  1  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S09  QE-TR=no      active=unitary+TR R^-1=[ 0 -1  0;  1 -1  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S10  QE-TR=no      active=unitary+TR R^-1=[-1  1  0; -1  0  0;  0  0 -1]  tau=( 0.000  0.000  0.000)
+  S11  QE-TR=no      active=unitary+TR R^-1=[ 1  0  0;  1 -1  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+  S12  QE-TR=no      active=unitary+TR R^-1=[ 0 -1  0; -1  0  0;  0  0  1]  tau=( 0.000  0.000  0.000)
+Full BZ grid   : 36 k points | mesh 6 x 6 x 1 | shift (0.00000, 0.00000, 0.00000)
+Stored IBZ     : 7 k points
+  ik        kx        ky        kz     weight
+    1   0.00000   0.00000   0.00000   0.02778
+    2   0.00000   0.16667   0.00000   0.16667
+    3   0.00000   0.33333   0.00000   0.16667
+    4   0.00000  -0.50000   0.00000   0.08333
+    5   0.16667   0.16667   0.00000   0.16667
+    6   0.16667   0.33333   0.00000   0.33333
+    7   0.33333   0.33333   0.00000   0.05556
+Centroid orbit: CLOSED : 12/12 spatial operations preserve 597 sites (tol=1.00000e-05)
+TRS pathways   : automatic from SymMaps.trs_allowed=true; no input override
+
+BAND SPACES AND ENERGY COVERAGE
+-------------------------------
+Electrons      : 26.00000; occupied-band boundary = 26
+Occupied bands : 1-26
+QP valence     : 23-26
+QP conduction  : 27-30
+QP matrix      : 1-30
+chi0/W sum     : 1-80
+Sigma sum      : 1-80
+Loaded ISDF psi: 1-80
+zeta fit       : left 1-30; right 23-80
+[stage 14:35:17] -> ISDF basis + wavefunctions
+    ζ-fit physical window top 80 bands (logical band sums reach chi 80, sigma 80; the max is set by tied)
+    ζ band-window closure: edge 22 min gap 81 meV, edge 30 min gap 39.9 meV, edge 80 min gap 15.4 meV
+    cutoffs: zeta = 30.0 Ry, bare-Coulomb = 30.0 Ry  (ecutwfc=30.0, ecutrho=120.0)
+  [shard_map] using jax.shard_map (jax 0.9.1)
+
+  ISDF memory model — chunk plan + HWM estimate
+    psi layout    = face (0.011 GB/dev, ψ centroid copies)
+    Stage C/D ψ floor (post-CCT, face r-chunk incremental) = 0.220 GB/dev [included in face Stage-C peaks]
+    ψ(r) source   = hoisted all-band cache
+    face Y route  = current-r cache
+    face Y cache = 0.213 GB/dev
+    parent route  = 7 raw parents; psi terms at n_parent rows (parents-only storage: no full-k faces)
+    band_chunk    = 16
+    centroid FFT = k_tile 4, 16 local rows, 0.094 GB/dev
+    zeta FFT      = full-nk transform, 0.849 GB/dev
+    r_chunk       = 11876  (4 chunks)
+    q rows        = selected Q 7 / full-zone K 36
+    q_chunk       = 1
+    ζ solve memory = distributed (2-D-sharded factor)
+    gflat_cs      = 100
+    P_min (floor) = 1
+    budget        = 30.00 GB/dev  (util 0.78)
+    persistent    = 2.20 GB/dev
+    HWM estimate  = 12.91 GB/dev (43% of budget) [binder: C_fit_one_rchunk]
+    per-stage peaks (persistent + transient, GB/dev):
+      C_fit_one_rchunk....   12.91 <=
+      B_cct_chol..........    3.91
+      A_psi_r_cache_build.    3.05
+      D_accumulate........    2.55
+      C_face_y_cache_build    2.53
+      A_centroid_load.....    2.29
+      E_v_q...............    0.18
+      F_tensor_write......    0.10
+[stage 14:35:17]   -> gw_jax.load_centroid_wfns
+[load_centroids planner] existing=0.00, persistent=0.03, scan_budget=33.50 GiB/device, peak_copies=9, cs=16, stream=on, k_domain=ibz, retain_parents=no, k_tile=4, band_tile=16
+[stage 14:35:18]     -> load_centroids.loader_load
+  [SlabIO.phdf5_ffi] WFN.h5 mode=r bytes=36122756 file stripe layout=UNKNOWN (lfs unavailable or not Lustre); collective read aggregation cannot be predicted
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/WFN.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 1
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 1
+  romio_filesystem_type                    = CRAY ADIO:
+[phdf5 kchunk-union r0] n_k=4 bytes/rank=1005568  prev_h2d_wait=0.01  pin+zero=1.38  spaces=0.01  select=0.02  read=4.57  h2d_setup=0.07  total=6.07 (ms)  [selected_elts=125040]
+  [wfn_loader] shard_map via jax.shard_map (jax 0.9.1)
+[stage 14:35:18]     <- load_centroids.loader_load  0.4 s
+[stage 14:35:18]     -> load_centroids.gflat_to_rmu
+[stage 14:35:18]     <- load_centroids.gflat_to_rmu  0.3 s
+[stage 14:35:18]     -> load_centroids.reshard_insert
+[stage 14:35:19]     <- load_centroids.reshard_insert  1.0 s
+[stage 14:35:19]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=754176  prev_h2d_wait=0.01  pin+zero=0.05  spaces=0.01  select=0.01  read=2.19  h2d_setup=0.05  total=2.32 (ms)  [selected_elts=92816]
+[stage 14:35:20]     <- load_centroids.loader_load  0.4 s
+[stage 14:35:20]     -> load_centroids.gflat_to_rmu
+[stage 14:35:20]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:20]     -> load_centroids.reshard_insert
+[stage 14:35:20]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:20]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=4 bytes/rank=1005568  prev_h2d_wait=0.02  pin+zero=0.06  spaces=0.01  select=0.01  read=2.97  h2d_setup=0.07  total=3.14 (ms)  [selected_elts=125040]
+[stage 14:35:20]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:20]     -> load_centroids.gflat_to_rmu
+[stage 14:35:20]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:20]     -> load_centroids.reshard_insert
+[stage 14:35:20]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:20]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=754176  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.01  read=1.96  h2d_setup=0.05  total=2.04 (ms)  [selected_elts=92816]
+[stage 14:35:20]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:20]     -> load_centroids.gflat_to_rmu
+[stage 14:35:20]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:20]     -> load_centroids.reshard_insert
+[stage 14:35:20]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:20]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=4 bytes/rank=1005568  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.01  read=2.36  h2d_setup=0.06  total=2.46 (ms)  [selected_elts=125040]
+[stage 14:35:20]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:20]     -> load_centroids.gflat_to_rmu
+[stage 14:35:20]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:20]     -> load_centroids.reshard_insert
+[stage 14:35:20]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:20]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=754176  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.01  read=1.91  h2d_setup=0.05  total=1.99 (ms)  [selected_elts=92816]
+[stage 14:35:20]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:20]     -> load_centroids.gflat_to_rmu
+[stage 14:35:20]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:20]     -> load_centroids.reshard_insert
+[stage 14:35:20]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:20]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=4 bytes/rank=1005568  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.01  read=2.31  h2d_setup=0.06  total=2.41 (ms)  [selected_elts=125040]
+[stage 14:35:20]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:20]     -> load_centroids.gflat_to_rmu
+[stage 14:35:20]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:20]     -> load_centroids.reshard_insert
+[stage 14:35:20]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:20]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=754176  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.00  read=1.79  h2d_setup=0.05  total=1.87 (ms)  [selected_elts=92816]
+[stage 14:35:20]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:20]     -> load_centroids.gflat_to_rmu
+[stage 14:35:20]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:20]     -> load_centroids.reshard_insert
+[stage 14:35:20]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:20]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=4 bytes/rank=1005568  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.01  read=2.38  h2d_setup=0.06  total=2.48 (ms)  [selected_elts=125040]
+[stage 14:35:20]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:20]     -> load_centroids.gflat_to_rmu
+[stage 14:35:20]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:20]     -> load_centroids.reshard_insert
+[stage 14:35:20]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:20]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=754176  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.01  read=1.98  h2d_setup=0.07  total=2.08 (ms)  [selected_elts=92816]
+[stage 14:35:20]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:20]     -> load_centroids.gflat_to_rmu
+[stage 14:35:20]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:20]     -> load_centroids.reshard_insert
+[stage 14:35:20]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:20]   <- gw_jax.load_centroid_wfns  2.9 s
+  ψ storage: parents only -- 7 raw WFN parents, 36 full k rows through typed transport.
+
+  Chunked ISDF fitting:
+    Band chunks: 16
+    R chunks:    11876 (contiguous r-space)
+    Q chunks:    1
+    ψ(r) source: hoisted all-band cache
+    GFlat cs:    100
+    Zeta output: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q.h5
+
+  ISDF memory model — chunk plan + HWM estimate
+    psi layout    = face (0.004 GB/dev, ψ centroid copies)
+    Stage C/D ψ floor (post-CCT, face r-chunk incremental) = 0.302 GB/dev [included in face Stage-C peaks]
+    ψ(r) source   = hoisted all-band cache
+    face Y route  = current-r cache
+    face Y cache = 0.299 GB/dev
+    parent route  = 7 raw parents; psi terms at n_parent rows (parents-only storage: no full-k faces)
+    band_chunk    = 16
+    centroid FFT = k_tile 4, 16 local rows, 0.094 GB/dev
+    zeta FFT      = full-nk transform, 0.849 GB/dev
+    r_chunk       = 16698  (3 chunks)
+    q rows        = selected Q 7 / full-zone K 36
+    q_chunk       = 1
+    ζ solve memory = distributed (2-D-sharded factor)
+    gflat_cs      = 100
+    P_min (floor) = 1
+    budget        = 30.00 GB/dev  (util 0.78)
+    persistent    = 2.15 GB/dev
+    HWM estimate  = 12.93 GB/dev (43% of budget) [binder: C_fit_one_rchunk]
+    per-stage peaks (persistent + transient, GB/dev):
+      C_fit_one_rchunk....   12.93 <=
+      A_psi_r_cache_build.    3.00
+      C_face_y_cache_build    2.60
+      D_accumulate........    2.39
+      B_cct_chol..........    2.33
+      A_centroid_load.....    2.25
+      E_v_q...............    0.06
+      F_tensor_write......    0.03
+  [bispinor] coupled μ_L=1,2,3 schedule: solve_route=batch_reshard, device increment 5.22 GB, projected HWM 18.14 GB; three G-flat outputs use 0.23 GB host/rank, 0.94 GB/node.
+[stage 14:35:21]   -> gw_jax.zeta_fit_chunked
+[mem_probe zeta_fit_start] in_use=0.01 GB  peak=0.17 GB  live_count=32 live_total=0.04 GB  nvsmi=1.71 GB nvsmi_peak=1.71 GB
+[mem_probe zeta_fit_start]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe zeta_fit_start]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe zeta_fit_start]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe zeta_fit_start]   float64 (36, 120) x 1 = 0.00 GB
+[mem_probe zeta_fit_start]   float64 (36, 30) x 1 = 0.00 GB
+[mem_probe zeta_fit_start]   int32 (194, 3) x 1 = 0.00 GB
+[mem_probe zeta_fit_start]   complex128 (36, 2, 2) x 1 = 0.00 GB
+[mem_probe zeta_fit_start]   float64 (36, 3) x 2 = 0.00 GB
+[mem_probe zeta_fit_start]   complex128 (4, 4) x 6 = 0.00 GB
+[mem_probe zeta_fit_start]   int32 (36, 3, 3) x 1 = 0.00 GB
+  Charge pair training domain: ordered LR + RL (conjugation-closed normal equations)
+
+  Zeta fitting: 4 r-chunks x 11876 r-points, 80 bands (30 left + 58 right)
+  Output: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q.h5
+[stage 14:35:21]     -> zeta_fit.CCT
+  Computing C_q via shard_map pipeline (open-spin, charge γ̃^0=I)
+  [distrib_la] shard_map via jax.shard_map (jax 0.9.1)
+[lorrax cusolverMp] library 0.9.1, NCCL 2.29.3, comm path: NCCL, grid: 2x2 (row-major)
+[lorrax cuBLASMp] library 1.0.0, comm path: NCCL
+  gemm_plan: cublasmp N,N on 2x2, shape (nq=7, m=2400, k=80, n=2400), dtype=complex128, alpha=(1+0j), beta=0j
+  C_q on raw parents: 7 -> 36 k rows
+  [shard_map] using jax.shard_map (jax 0.9.1)
+[stage 14:35:23]     <- zeta_fit.CCT  2.8 s
+[stage 14:35:23]     -> zeta_fit.cholesky
+  [distrib_la.resolve] eigh backend 'cusolvermp' on the 2x2 mesh: HONORED (explicit requests are never demoted).  Cost notice, once per mesh geometry.  MEASURED: this route costs a FLAT ~1.55 s PER MATRIX at n=64..2048 on a 4-process 2x2 (Perlmutter jobid 56447670) -- 99.998% of it inside cusolverMpSyevd, so it is a floor and not a curve.  The replicated native path (backend 'off'/'auto') was faster at EVERY measured size: 1064x at n=64, 6.9x at n=4096.  You asked at n=600.  Break-even is EXTRAPOLATED to n ~ 1.9e4 -- 4.6x beyond the largest measured n (4096), from two fitted exponents, so trust the decade and not the digits.  'distributed' eigh is for CAPACITY (a tile too large for one device, or a multi-node mesh), not for speed -- and that regime is UNMEASURED: the investigation was one node, 4 ranks, n<=4096.  If this call is in the fits-on-one-device regime, 'off' is faster; if it is not, you are past where anyone has numbers.
+  Computing L_q = distributed rank-truncated pinv (2D-sharded C+)  [PSD, charge channel, path=distributed_rank_truncate]
+  Zeta back-solve tier: distributed (distributed_zeta_solve=distributed)  replicated (nq,μ,μ) gather would be 0.04 GB/rank; per-q tile 0.009 GB (×nq executions/r-chunk); distributed tier gathers NO (μ,μ) object
+[lorrax cusolverMp] library 0.9.1, NCCL 2.29.3, comm path: NCCL, grid: 2x2 (col-major)
+  [collective chunk] C+ formation (pinv): nq=7 q_block=7 (1 executions) max collective/exec = 20.2 MB (cap 134.2 MB, unchunked would be 0.020 GB)
+[zeta rank_truncate/distributed] n_pad=600 rcond=1.0e-08 n_keep/q=[598 599 599 599 599 599 599] lam_max/q=[0.01902072 0.01900096 0.0190074  0.0190452  0.01901725 0.01906432
+ 0.01910795] lam_min_kept/q=[5.92953964e-10 2.55570423e-10 3.32974686e-10 3.46735569e-10
+ 3.36886783e-10 3.63231887e-10 3.80705419e-10] kappa/q=[32077897.07743241 74347246.89897418 57083629.46989705 54927168.16742267
+ 56449973.09497339 52485256.90129044 50190899.87129495] ldrop_hi/q=[1.38953891e-10 1.38942004e-10 1.43706401e-10 1.46301918e-10
+ 1.42022515e-10 1.45713889e-10 1.48919245e-10] margin/q=[0.00334448 0.00166945 0.00166945 0.00166945 0.00166945 0.00166945
+ 0.00166945]
+  L_q: (7, 600, 600)
+[stage 14:35:27]     <- zeta_fit.cholesky  3.2 s
+[stage 14:35:27]     -> zeta_fit.gc_pre_chunk_loop
+[stage 14:35:27]     <- zeta_fit.gc_pre_chunk_loop  0.0 s
+  q-IBZ reduction: 7 IBZ q-points / 36 full-BZ (disk shrink 5.1×)
+  G-flat ζ sphere: ngkmax=1964, min ngk=1917, max ngk=1964 (4.262% of n_rtot)
+[stage 14:35:27]     -> zeta_fit.write_headers
+  [SlabIO.phdf5_ffi] zeta_q.h5 mode=w ranks=4 stripe_count=4 stripe_unit=1048576 B (policy; LORRAX_PHDF5_STRIPE_COUNT/_SIZE_FS override)
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639681] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.04  select=0.00  write=0.88  total=0.93 (ms)  0 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (no queued data); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+[stage 14:35:27]     <- zeta_fit.write_headers  0.1 s
+[stage 14:35:27]     -> zeta_fit.open_file
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639682] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.04  select=0.00  write=0.24  total=0.28 (ms)  0 MB/s
+[stage 14:35:27]     <- zeta_fit.open_file  0.0 s
+[stage 14:35:27]     -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.01  pin+zero=0.10  spaces=0.01  select=0.02  read=4.70  h2d_setup=0.10  total=4.94 (ms)  [selected_elts=217856]
+[stage 14:35:27]     <- psi_G_store.populate.loader_load  0.2 s
+[stage 14:35:27]     -> psi_G_store.populate.shard_to_host
+[stage 14:35:27]     <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:27]     -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.01  pin+zero=0.10  spaces=0.01  select=0.02  read=4.31  h2d_setup=0.10  total=4.55 (ms)  [selected_elts=217856]
+[stage 14:35:27]     <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:27]     -> psi_G_store.populate.shard_to_host
+[stage 14:35:27]     <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:27]     -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.00  pin+zero=0.04  spaces=0.00  select=0.01  read=4.06  h2d_setup=0.09  total=4.21 (ms)  [selected_elts=217856]
+[stage 14:35:27]     <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:27]     -> psi_G_store.populate.shard_to_host
+[stage 14:35:27]     <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:27]     -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.00  pin+zero=0.04  spaces=0.00  select=0.01  read=4.81  h2d_setup=0.09  total=4.96 (ms)  [selected_elts=217856]
+[stage 14:35:27]     <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:27]     -> psi_G_store.populate.shard_to_host
+[stage 14:35:27]     <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:27]     -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.00  pin+zero=0.04  spaces=0.00  select=0.01  read=4.04  h2d_setup=0.09  total=4.18 (ms)  [selected_elts=217856]
+[stage 14:35:27]     <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:27]     -> psi_G_store.populate.shard_to_host
+[stage 14:35:27]     <- psi_G_store.populate.shard_to_host  0.0 s
+  ψ(G-flat) host cache: 0.02 GB/process resident
+  Z_q on raw parents: 7 parent k rows -> 36 full k by the typed unfold on 4 orbit-closed real-grid tiles x 11520 slots (planned chunk_r 11876; pad slots 0)
+[stage 14:35:27]     -> zeta_fit.build_psi_r_cache
+[stage 14:35:28]     <- zeta_fit.build_psi_r_cache  0.5 s
+  ψ(r) cache: (5, 7, 16, 4, 46080), band-sharded over ('x','y'), 0.41 GB local
+Started zeta fitting at 14:35:28.
+  G-flat ζ accumulator: N=1050 rows/rank (n_q=7 × n_mu_local=150); chunk_size=100 → per-iter FFT box 0.07 GB/rank
+[mem_probe pre_rchunk_loop] in_use=0.48 GB  peak=3.38 GB  live_count=47 live_total=2.29 GB  nvsmi=8.35 GB nvsmi_peak=8.35 GB
+[mem_probe pre_rchunk_loop]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe pre_rchunk_loop]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 600, 1964) x 1 = 0.13 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 600, 600) x 1 = 0.04 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe pre_rchunk_loop]   complex128 (600, 600) x 1 = 0.01 GB
+[mem_probe pre_rchunk_loop]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe pre_rchunk_loop]   float64 (36, 120) x 1 = 0.00 GB
+[mem_probe pre_rchunk_loop]   float64 (36, 30) x 1 = 0.00 GB
+[stage 14:35:28]     -> zeta_fit.chunk_loop
+[mem_probe rchunk_start chunk=0] in_use=0.48 GB  peak=3.38 GB  live_count=51 live_total=2.29 GB  nvsmi=8.35 GB nvsmi_peak=8.35 GB
+[mem_probe rchunk_start chunk=0]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe rchunk_start chunk=0]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 600, 1964) x 1 = 0.13 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 600, 600) x 1 = 0.04 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=0]   complex128 (600, 600) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=0]   int32 (24, 11520, 3) x 1 = 0.00 GB
+[mem_probe rchunk_start chunk=0]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe rchunk_start chunk=0]   int32 (24, 11520) x 1 = 0.00 GB
+  [collective chunk] C+ back-solve (GEMM): nq=7 q_block=2 (4 executions) max collective/exec = 110.6 MB (cap 134.2 MB, unchunked would be 0.387 GB)
+[rchunk_dbg]   z_q_build=2473ms solve=653ms d_zq=+0.523GB d_solve=+0.018GB
+[mem_probe after_fit_one_rchunk chunk=0] in_use=0.75 GB  peak=10.67 GB  live_count=55 live_total=3.07 GB  nvsmi=24.35 GB nvsmi_peak=24.35 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 600, 11520) x 1 = 0.77 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 600, 1964) x 1 = 0.13 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 600, 600) x 1 = 0.04 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (600, 600) x 1 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=0]   int32 (24, 11520, 3) x 1 = 0.00 GB
+[mem_probe after_fit_one_rchunk chunk=0]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe after_accumulate chunk=0] in_use=0.48 GB  peak=10.67 GB  live_count=63 live_total=2.29 GB  nvsmi=24.35 GB nvsmi_peak=24.35 GB
+[mem_probe after_accumulate chunk=0]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe after_accumulate chunk=0]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 600, 1964) x 1 = 0.13 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 600, 600) x 1 = 0.04 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=0]   complex128 (600, 600) x 1 = 0.01 GB
+[mem_probe after_accumulate chunk=0]   int32 (24, 11520, 3) x 1 = 0.00 GB
+[mem_probe after_accumulate chunk=0]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe after_accumulate chunk=0]   int32 (24, 11520) x 1 = 0.00 GB
+[rchunk_dbg] chunk=1/4 r=[0,46080) fit=3166ms write=932ms total=4098ms rss=2.120GB live=2.291GB d_fit=+0.540 d_acc=+0.026 rss_trim=2.105GB
+[ 14:35:32 | ██░░░░░░░░ |  25% ] r-chunk 1 / 4 · ETA 13 s
+[mem_probe rchunk_start chunk=1] in_use=0.48 GB  peak=10.67 GB  live_count=63 live_total=2.29 GB  nvsmi=24.35 GB nvsmi_peak=24.35 GB
+[mem_probe rchunk_start chunk=1]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe rchunk_start chunk=1]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 600, 1964) x 1 = 0.13 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 600, 600) x 1 = 0.04 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=1]   complex128 (600, 600) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=1]   int32 (24, 11520, 3) x 1 = 0.00 GB
+[mem_probe rchunk_start chunk=1]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe rchunk_start chunk=1]   int32 (24, 11520) x 1 = 0.00 GB
+[rchunk_dbg]   z_q_build=975ms solve=15ms d_zq=+0.000GB d_solve=+0.000GB
+[mem_probe after_fit_one_rchunk chunk=1] in_use=0.75 GB  peak=10.67 GB  live_count=64 live_total=3.07 GB  nvsmi=24.35 GB nvsmi_peak=24.35 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 600, 11520) x 1 = 0.77 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 600, 1964) x 1 = 0.13 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 600, 600) x 1 = 0.04 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (600, 600) x 1 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=1]   int32 (24, 11520, 3) x 1 = 0.00 GB
+[mem_probe after_fit_one_rchunk chunk=1]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe after_accumulate chunk=1] in_use=0.48 GB  peak=10.67 GB  live_count=63 live_total=2.29 GB  nvsmi=24.35 GB nvsmi_peak=24.35 GB
+[mem_probe after_accumulate chunk=1]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe after_accumulate chunk=1]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 600, 1964) x 1 = 0.13 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 600, 600) x 1 = 0.04 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=1]   complex128 (600, 600) x 1 = 0.01 GB
+[mem_probe after_accumulate chunk=1]   int32 (24, 11520, 3) x 1 = 0.00 GB
+[mem_probe after_accumulate chunk=1]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe after_accumulate chunk=1]   int32 (24, 11520) x 1 = 0.00 GB
+[rchunk_dbg] chunk=2/4 r=[0,46080) fit=992ms write=7ms total=999ms rss=2.108GB live=2.291GB d_fit=-0.003 d_acc=+0.000 rss_trim=2.106GB
+[ 14:35:33 | █████░░░░░ |  50% ] r-chunk 2 / 4 · ETA 6 s
+[mem_probe rchunk_start chunk=2] in_use=0.48 GB  peak=10.67 GB  live_count=63 live_total=2.29 GB  nvsmi=24.35 GB nvsmi_peak=24.35 GB
+[mem_probe rchunk_start chunk=2]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe rchunk_start chunk=2]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 600, 1964) x 1 = 0.13 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 600, 600) x 1 = 0.04 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=2]   complex128 (600, 600) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=2]   int32 (24, 11520, 3) x 1 = 0.00 GB
+[mem_probe rchunk_start chunk=2]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe rchunk_start chunk=2]   int32 (24, 11520) x 1 = 0.00 GB
+[rchunk_dbg]   z_q_build=974ms solve=15ms d_zq=+0.000GB d_solve=+0.000GB
+[mem_probe after_fit_one_rchunk chunk=2] in_use=0.75 GB  peak=10.67 GB  live_count=64 live_total=3.07 GB  nvsmi=24.35 GB nvsmi_peak=24.35 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 600, 11520) x 1 = 0.77 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 600, 1964) x 1 = 0.13 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 600, 600) x 1 = 0.04 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (600, 600) x 1 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=2]   int32 (24, 11520, 3) x 1 = 0.00 GB
+[mem_probe after_fit_one_rchunk chunk=2]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe after_accumulate chunk=2] in_use=0.48 GB  peak=10.67 GB  live_count=63 live_total=2.29 GB  nvsmi=24.35 GB nvsmi_peak=24.35 GB
+[mem_probe after_accumulate chunk=2]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe after_accumulate chunk=2]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 600, 1964) x 1 = 0.13 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 600, 600) x 1 = 0.04 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=2]   complex128 (600, 600) x 1 = 0.01 GB
+[mem_probe after_accumulate chunk=2]   int32 (24, 11520, 3) x 1 = 0.00 GB
+[mem_probe after_accumulate chunk=2]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe after_accumulate chunk=2]   int32 (24, 11520) x 1 = 0.00 GB
+[rchunk_dbg] chunk=3/4 r=[0,46080) fit=991ms write=7ms total=998ms rss=2.108GB live=2.291GB d_fit=-0.003 d_acc=+0.000 rss_trim=2.106GB
+[ 14:35:34 | ████████░░ |  75% ] r-chunk 3 / 4 · ETA 2 s
+[mem_probe rchunk_start chunk=3] in_use=0.48 GB  peak=10.67 GB  live_count=63 live_total=2.29 GB  nvsmi=24.35 GB nvsmi_peak=24.35 GB
+[mem_probe rchunk_start chunk=3]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe rchunk_start chunk=3]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe rchunk_start chunk=3]   complex128 (7, 600, 1964) x 1 = 0.13 GB
+[mem_probe rchunk_start chunk=3]   complex128 (7, 600, 600) x 1 = 0.04 GB
+[mem_probe rchunk_start chunk=3]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=3]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=3]   complex128 (600, 600) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=3]   int32 (24, 11520, 3) x 1 = 0.00 GB
+[mem_probe rchunk_start chunk=3]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe rchunk_start chunk=3]   int32 (24, 11520) x 1 = 0.00 GB
+[rchunk_dbg]   z_q_build=974ms solve=16ms d_zq=+0.000GB d_solve=+0.000GB
+[mem_probe after_fit_one_rchunk chunk=3] in_use=0.75 GB  peak=10.67 GB  live_count=64 live_total=3.07 GB  nvsmi=24.35 GB nvsmi_peak=24.35 GB
+[mem_probe after_fit_one_rchunk chunk=3]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe after_fit_one_rchunk chunk=3]   complex128 (7, 600, 11520) x 1 = 0.77 GB
+[mem_probe after_fit_one_rchunk chunk=3]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe after_fit_one_rchunk chunk=3]   complex128 (7, 600, 1964) x 1 = 0.13 GB
+[mem_probe after_fit_one_rchunk chunk=3]   complex128 (7, 600, 600) x 1 = 0.04 GB
+[mem_probe after_fit_one_rchunk chunk=3]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=3]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=3]   complex128 (600, 600) x 1 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=3]   int32 (24, 11520, 3) x 1 = 0.00 GB
+[mem_probe after_fit_one_rchunk chunk=3]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe after_accumulate chunk=3] in_use=0.48 GB  peak=10.67 GB  live_count=63 live_total=2.29 GB  nvsmi=24.35 GB nvsmi_peak=24.35 GB
+[mem_probe after_accumulate chunk=3]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe after_accumulate chunk=3]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe after_accumulate chunk=3]   complex128 (7, 600, 1964) x 1 = 0.13 GB
+[mem_probe after_accumulate chunk=3]   complex128 (7, 600, 600) x 1 = 0.04 GB
+[mem_probe after_accumulate chunk=3]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=3]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=3]   complex128 (600, 600) x 1 = 0.01 GB
+[mem_probe after_accumulate chunk=3]   int32 (24, 11520, 3) x 1 = 0.00 GB
+[mem_probe after_accumulate chunk=3]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe after_accumulate chunk=3]   int32 (24, 11520) x 1 = 0.00 GB
+[rchunk_dbg] chunk=4/4 r=[0,46080) fit=992ms write=7ms total=998ms rss=2.109GB live=2.291GB d_fit=-0.003 d_acc=+0.000 rss_trim=2.105GB
+[ 14:35:36 | ██████████ | 100% ] r-chunk 4 / 4 · ETA 0 s
+[stage 14:35:36]     <- zeta_fit.chunk_loop  7.8 s
+Finished zeta fitting at 14:35:36.  Elapsed: 8 s.
+[stage 14:35:36]     -> zeta_fit.write_g_flat
+[ffi-debug proc=0] name=zeta_q_G shape=(7, 600, 1964) dtype=complex128 spec=P(None, ('x', 'y')) offset=(0, 0, 0) valid_shape=(7, 597, 1964) gshape=(7, 597, 1964) local_shapes=[(7, 150, 1964)]
+[stage 14:35:36]     <- zeta_fit.write_g_flat  0.7 s
+[stage 14:35:36]     -> zeta_fit.close_io
+  [SlabIO.close] draining 1 pending writes for zeta_q.h5 …
+[phdf5-write rank=0 ds=/zeta_q_G id=360287970189639683] extent=[7,597,1964] offset=[0,0,0] count=[7,150,1964] mem_dims=[7,150,1964] base=[0,0,0] valid=[7,597,1964] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/zeta_q_G bytes/rank=32995200 coll=1 empty=0  d2h_wait=1.25  spaces=0.05  select=0.00  write=103.14  total=104.44 (ms)  320 MB/s
+  [SlabIO.close] Python dispatch drained in 0.1 s (0.13 GB at 935 MB/s); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+[stage 14:35:37]     <- zeta_fit.close_io  0.2 s
+[stage 14:35:37]     -> zeta_fit.sync_global
+[stage 14:35:37]     <- zeta_fit.sync_global  0.0 s
+  Zeta output: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q.h5  shape: (n_q_disk=7 of 6·6·1=36 full-BZ, n_rtot=46080, n_rmu=597)
+  Timing (4 r-chunks, 7.9s total):
+    fit      6.14s  77.4%
+    H5       0.95s  12.0%
+[mem_probe zeta_fit_end] in_use=0.45 GB  peak=10.67 GB  live_count=59 live_total=2.16 GB  nvsmi=24.63 GB nvsmi_peak=24.63 GB
+[mem_probe zeta_fit_end]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe zeta_fit_end]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe zeta_fit_end]   complex128 (7, 600, 600) x 1 = 0.04 GB
+[mem_probe zeta_fit_end]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe zeta_fit_end]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe zeta_fit_end]   complex128 (600, 600) x 1 = 0.01 GB
+[mem_probe zeta_fit_end]   int32 (24, 11520, 3) x 1 = 0.00 GB
+[mem_probe zeta_fit_end]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe zeta_fit_end]   int32 (24, 11520) x 1 = 0.00 GB
+[mem_probe zeta_fit_end]   int32 (7, 1964) x 2 = 0.00 GB
+[stage 14:35:37]   <- gw_jax.zeta_fit_chunked  16.0 s
+    ζ rank-cut closure: ARMED (mode=snap, rtol=1.0e-06) and SILENT — no cut fell inside a degenerate block of C_q on any q.
+    ζ rank-cut certification: ARMED (mode=refuse, certified κ ceiling 1.0e+08 for the charge Gram, discarded-weight ceiling 1.0e-03) and SILENT — either the cut bound nothing, or it bound inside the certified regime.  The transverse channel is UNCERTIFIED and can only raise the weight finding.
+    GPU high-water mark: 10.67 GB / 30.00 GB budget (36%)  [source: XLA arena]
+
+  [bispinor] resolving ζ^{μ_L=1,2,3} on current-density centroids: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/centroids_current.txt
+[stage 14:35:37]   -> gw_jax.load_centroid_wfns_current
+[load_centroids planner] existing=0.01, persistent=0.01, scan_budget=33.50 GiB/device, peak_copies=9, cs=16, stream=on, k_domain=ibz, retain_parents=no, k_tile=4, band_tile=16
+[stage 14:35:37]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=4 bytes/rank=1005568  prev_h2d_wait=0.01  pin+zero=0.06  spaces=0.02  select=0.01  read=2.61  h2d_setup=0.07  total=2.77 (ms)  [selected_elts=125040]
+[stage 14:35:37]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:37]     -> load_centroids.gflat_to_rmu
+[stage 14:35:37]     <- load_centroids.gflat_to_rmu  0.3 s
+[stage 14:35:37]     -> load_centroids.reshard_insert
+[stage 14:35:37]     <- load_centroids.reshard_insert  0.1 s
+[stage 14:35:37]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=754176  prev_h2d_wait=0.01  pin+zero=0.05  spaces=0.01  select=0.01  read=2.22  h2d_setup=0.05  total=2.35 (ms)  [selected_elts=92816]
+[stage 14:35:37]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:37]     -> load_centroids.gflat_to_rmu
+[stage 14:35:37]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:37]     -> load_centroids.reshard_insert
+[stage 14:35:37]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:37]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=4 bytes/rank=1005568  prev_h2d_wait=0.00  pin+zero=0.03  spaces=0.01  select=0.01  read=2.26  h2d_setup=0.06  total=2.37 (ms)  [selected_elts=125040]
+[stage 14:35:37]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:37]     -> load_centroids.gflat_to_rmu
+[stage 14:35:37]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:37]     -> load_centroids.reshard_insert
+[stage 14:35:37]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:37]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=754176  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.00  read=1.89  h2d_setup=0.05  total=1.97 (ms)  [selected_elts=92816]
+[stage 14:35:37]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:37]     -> load_centroids.gflat_to_rmu
+[stage 14:35:37]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:37]     -> load_centroids.reshard_insert
+[stage 14:35:37]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:37]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=4 bytes/rank=1005568  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.01  read=2.21  h2d_setup=0.06  total=2.30 (ms)  [selected_elts=125040]
+[stage 14:35:37]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:37]     -> load_centroids.gflat_to_rmu
+[stage 14:35:37]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:37]     -> load_centroids.reshard_insert
+[stage 14:35:37]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:37]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=754176  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.00  read=1.76  h2d_setup=0.05  total=1.84 (ms)  [selected_elts=92816]
+[stage 14:35:37]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:37]     -> load_centroids.gflat_to_rmu
+[stage 14:35:37]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:37]     -> load_centroids.reshard_insert
+[stage 14:35:37]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:37]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=4 bytes/rank=1005568  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.01  read=2.22  h2d_setup=0.06  total=2.31 (ms)  [selected_elts=125040]
+[stage 14:35:37]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:37]     -> load_centroids.gflat_to_rmu
+[stage 14:35:37]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:37]     -> load_centroids.reshard_insert
+[stage 14:35:37]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:37]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=754176  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.00  read=1.77  h2d_setup=0.05  total=1.85 (ms)  [selected_elts=92816]
+[stage 14:35:37]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:37]     -> load_centroids.gflat_to_rmu
+[stage 14:35:37]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:37]     -> load_centroids.reshard_insert
+[stage 14:35:37]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:37]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=4 bytes/rank=1005568  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.01  read=2.23  h2d_setup=0.06  total=2.33 (ms)  [selected_elts=125040]
+[stage 14:35:37]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:37]     -> load_centroids.gflat_to_rmu
+[stage 14:35:37]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:37]     -> load_centroids.reshard_insert
+[stage 14:35:37]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:37]     -> load_centroids.loader_load
+[phdf5 kchunk-union r0] n_k=3 bytes/rank=754176  prev_h2d_wait=0.00  pin+zero=0.02  spaces=0.00  select=0.00  read=1.88  h2d_setup=0.05  total=1.96 (ms)  [selected_elts=92816]
+[stage 14:35:37]     <- load_centroids.loader_load  0.0 s
+[stage 14:35:37]     -> load_centroids.gflat_to_rmu
+[stage 14:35:37]     <- load_centroids.gflat_to_rmu  0.0 s
+[stage 14:35:37]     -> load_centroids.reshard_insert
+[stage 14:35:37]     <- load_centroids.reshard_insert  0.0 s
+[stage 14:35:37]   <- gw_jax.load_centroid_wfns_current  0.8 s
+[stage 14:35:38]   -> gw_jax.zeta_fit_transverse
+  [bispinor] coupled μ_L=1,2,3 transverse Zq: one shared face transform per r chunk; the three solves, write, and provenance remain ordered μ_L=1→2→3
+  [bispinor] μ_L=1 → /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu1.h5
+[stage 14:35:38] -> gw_jax.zeta_fit_chunked_mu1
+[mem_probe zeta_fit_start] in_use=0.02 GB  peak=10.67 GB  live_count=47 live_total=0.06 GB  nvsmi=24.63 GB nvsmi_peak=24.63 GB
+[mem_probe zeta_fit_start]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe zeta_fit_start]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe zeta_fit_start]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe zeta_fit_start]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe zeta_fit_start]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe zeta_fit_start]   int32 (7, 1964) x 2 = 0.00 GB
+[mem_probe zeta_fit_start]   float64 (36, 120) x 1 = 0.00 GB
+[mem_probe zeta_fit_start]   complex128 (7, 80) x 2 = 0.00 GB
+[mem_probe zeta_fit_start]   complex128 (7, 24) x 4 = 0.00 GB
+[mem_probe zeta_fit_start]   float64 (7, 80) x 2 = 0.00 GB
+
+  Zeta fitting: 3 r-chunks x 16698 r-points, 80 bands (30 left + 58 right)
+  Output: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu1.h5
+[stage 14:35:38]   -> zeta_fit.CCT
+  Computing C_q via shard_map pipeline (open-spin, transverse γ̃^1)
+[stage 14:35:38]     -> zeta_fit.CCT.face_gemm_plan
+  gemm_plan: cublasmp N,N on 2x2, shape (nq=7, m=784, k=80, n=784), dtype=complex128, alpha=(1+0j), beta=0j
+[stage 14:35:38]     <- zeta_fit.CCT.face_gemm_plan  0.5 s
+  C_q on raw parents: 7 -> 36 k rows
+[stage 14:35:40]   <- zeta_fit.CCT  2.2 s
+[stage 14:35:40]   -> zeta_fit.cholesky
+[stage 14:35:40]     -> zeta_fit.trace_L_q
+[stage 14:35:40]     <- zeta_fit.trace_L_q  0.1 s
+  Computing transverse factor = hoisted distributed getrf (block-cyclic, once per channel)  [γ̃^1 indefinite — path=cusolvermp_lu]
+  Zeta back-solve tier: per_q (distributed_zeta_solve=distributed)  replicated (nq,μ,μ) gather would be 0.00 GB/rank; per-q tile 0.001 GB (×nq executions/r-chunk); distributed tier gathers NO (μ,μ) object
+  [zeta transverse ridge] batch_reshard hoists the local-JAX LU: 7 factorization(s) once per channel; 0 factorizations/r-chunk; 7 lu_solve application(s)/r-chunk
+  [zeta transverse ridge (LU)] conditioning: kappa_lb = max|u_ii|/min|u_ii| of the pivoted LU, worst over q = 4.161e+03 at q=2 (ridge sign(tr C)*1.0e-12*|tr C|/n; ceiling 1.0e+12).  This is a LOWER BOUND on kappa — above the ceiling it refuses, below it certifies NOTHING.
+  L_q: (7, 196, 196)
+[stage 14:35:41]   <- zeta_fit.cholesky  0.8 s
+[stage 14:35:41]   -> zeta_fit.gc_pre_chunk_loop
+[stage 14:35:41]   <- zeta_fit.gc_pre_chunk_loop  0.0 s
+  q-IBZ reduction: 7 IBZ q-points / 36 full-BZ (disk shrink 5.1×)
+  G-flat ζ sphere: ngkmax=1964, min ngk=1917, max ngk=1964 (4.262% of n_rtot)
+[stage 14:35:41]   -> zeta_fit.write_headers
+  [SlabIO.phdf5_ffi] zeta_q_mu1.h5 mode=w ranks=4 stripe_count=4 stripe_unit=1048576 B (policy; LORRAX_PHDF5_STRIPE_COUNT/_SIZE_FS override)
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu1.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639684] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.04  select=0.00  write=0.99  total=1.04 (ms)  0 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (no queued data); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+[stage 14:35:41]   <- zeta_fit.write_headers  0.1 s
+[stage 14:35:41]   -> zeta_fit.open_file
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu1.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639685] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.00  spaces=0.02  select=0.00  write=0.20  total=0.23 (ms)  0 MB/s
+[stage 14:35:41]   <- zeta_fit.open_file  0.0 s
+[stage 14:35:41]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.01  pin+zero=0.10  spaces=0.01  select=0.02  read=3.88  h2d_setup=0.10  total=4.12 (ms)  [selected_elts=217856]
+[stage 14:35:41]   <- psi_G_store.populate.loader_load  0.2 s
+[stage 14:35:41]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:41]   <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:41]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.01  pin+zero=0.11  spaces=0.01  select=0.02  read=3.91  h2d_setup=0.09  total=4.14 (ms)  [selected_elts=217856]
+[stage 14:35:41]   <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:41]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:41]   <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:41]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.01  pin+zero=0.04  spaces=0.00  select=0.01  read=4.06  h2d_setup=0.09  total=4.21 (ms)  [selected_elts=217856]
+[stage 14:35:41]   <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:41]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:41]   <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:41]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.01  pin+zero=0.04  spaces=0.00  select=0.01  read=4.74  h2d_setup=0.09  total=4.89 (ms)  [selected_elts=217856]
+[stage 14:35:41]   <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:41]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:41]   <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:41]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.00  pin+zero=0.04  spaces=0.00  select=0.01  read=4.40  h2d_setup=0.09  total=4.54 (ms)  [selected_elts=217856]
+[stage 14:35:41]   <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:41]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:41]   <- psi_G_store.populate.shard_to_host  0.0 s
+  ψ(G-flat) host cache: 0.02 GB/process resident
+  Z_q on raw parents: 7 parent k rows -> 36 full k by the typed unfold on 3 orbit-closed real-grid tiles x 15360 slots (planned chunk_r 16698; pad slots 0)
+[stage 14:35:41]   -> zeta_fit.build_psi_r_cache
+[stage 14:35:42]   <- zeta_fit.build_psi_r_cache  0.5 s
+  ψ(r) cache: (5, 7, 16, 4, 46080), band-sharded over ('x','y'), 0.41 GB local
+Started zeta fitting at 14:35:42.
+  G-flat ζ accumulator: N=343 rows/rank (n_q=7 × n_mu_local=49); chunk_size=100 → per-iter FFT box 0.07 GB/rank
+[mem_probe pre_rchunk_loop] in_use=0.45 GB  peak=10.67 GB  live_count=64 live_total=2.17 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe pre_rchunk_loop]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe pre_rchunk_loop]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 196, 1964) x 1 = 0.04 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 196, 196) x 1 = 0.00 GB
+[mem_probe pre_rchunk_loop]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe pre_rchunk_loop]   complex128 (196, 196) x 1 = 0.00 GB
+[stage 14:35:42]   -> zeta_fit.gflat_spill_initial
+[stage 14:35:42]   <- zeta_fit.gflat_spill_initial  0.0 s
+  [bispinor] coupled G-flat host spill: 10778432 bytes/channel/rank, 32335296 bytes/rank with all three accumulators parked
+[mem_probe pre_rchunk_loop_host_spilled] in_use=0.43 GB  peak=10.67 GB  live_count=63 live_total=2.13 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 196, 196) x 1 = 0.00 GB
+[mem_probe pre_rchunk_loop_host_spilled]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (196, 196) x 1 = 0.00 GB
+[mem_probe pre_rchunk_loop_host_spilled]   int32 (7, 1964) x 2 = 0.00 GB
+  [bispinor] μ_L=2 → /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu2.h5
+[stage 14:35:42] -> gw_jax.zeta_fit_chunked_mu2
+[mem_probe zeta_fit_start] in_use=0.43 GB  peak=10.67 GB  live_count=63 live_total=2.13 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe zeta_fit_start]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe zeta_fit_start]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe zeta_fit_start]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe zeta_fit_start]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe zeta_fit_start]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe zeta_fit_start]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe zeta_fit_start]   complex128 (7, 196, 196) x 1 = 0.00 GB
+[mem_probe zeta_fit_start]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe zeta_fit_start]   complex128 (196, 196) x 1 = 0.00 GB
+[mem_probe zeta_fit_start]   int32 (7, 1964) x 2 = 0.00 GB
+
+  Zeta fitting: 3 r-chunks x 16698 r-points, 80 bands (30 left + 58 right)
+  Output: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu2.h5
+[stage 14:35:42]   -> zeta_fit.CCT
+  Computing C_q via shard_map pipeline (open-spin, transverse γ̃^2)
+[stage 14:35:42]     -> zeta_fit.CCT.face_gemm_plan
+  gemm_plan: cublasmp N,N on 2x2, shape (nq=7, m=784, k=80, n=784), dtype=complex128, alpha=(1+0j), beta=0j
+[stage 14:35:42]     <- zeta_fit.CCT.face_gemm_plan  0.0 s
+  C_q on raw parents: 7 -> 36 k rows
+[stage 14:35:43]   <- zeta_fit.CCT  1.0 s
+[stage 14:35:43]   -> zeta_fit.cholesky
+[stage 14:35:43]     -> zeta_fit.trace_L_q
+[stage 14:35:43]     <- zeta_fit.trace_L_q  0.0 s
+  Computing transverse factor = hoisted distributed getrf (block-cyclic, once per channel)  [γ̃^2 indefinite — path=cusolvermp_lu]
+  Zeta back-solve tier: per_q (distributed_zeta_solve=distributed)  replicated (nq,μ,μ) gather would be 0.00 GB/rank; per-q tile 0.001 GB (×nq executions/r-chunk); distributed tier gathers NO (μ,μ) object
+  [zeta transverse ridge] batch_reshard hoists the local-JAX LU: 7 factorization(s) once per channel; 0 factorizations/r-chunk; 7 lu_solve application(s)/r-chunk
+  [zeta transverse ridge (LU)] conditioning: kappa_lb = max|u_ii|/min|u_ii| of the pivoted LU, worst over q = 2.838e+03 at q=0 (ridge sign(tr C)*1.0e-12*|tr C|/n; ceiling 1.0e+12).  This is a LOWER BOUND on kappa — above the ceiling it refuses, below it certifies NOTHING.
+  L_q: (7, 196, 196)
+[stage 14:35:43]   <- zeta_fit.cholesky  0.2 s
+[stage 14:35:43]   -> zeta_fit.gc_pre_chunk_loop
+[stage 14:35:43]   <- zeta_fit.gc_pre_chunk_loop  0.1 s
+  q-IBZ reduction: 7 IBZ q-points / 36 full-BZ (disk shrink 5.1×)
+  G-flat ζ sphere: ngkmax=1964, min ngk=1917, max ngk=1964 (4.262% of n_rtot)
+[stage 14:35:43]   -> zeta_fit.write_headers
+  [SlabIO.phdf5_ffi] zeta_q_mu2.h5 mode=w ranks=4 stripe_count=4 stripe_unit=1048576 B (policy; LORRAX_PHDF5_STRIPE_COUNT/_SIZE_FS override)
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu2.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639687] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.04  select=0.00  write=1.79  total=1.84 (ms)  0 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (no queued data); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+[stage 14:35:43]   <- zeta_fit.write_headers  0.0 s
+[stage 14:35:43]   -> zeta_fit.open_file
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu2.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639688] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.02  select=0.00  write=0.27  total=0.29 (ms)  0 MB/s
+[stage 14:35:43]   <- zeta_fit.open_file  0.0 s
+[stage 14:35:43]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.01  pin+zero=0.11  spaces=0.01  select=0.02  read=3.84  h2d_setup=0.09  total=4.08 (ms)  [selected_elts=217856]
+[stage 14:35:43]   <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:43]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:43]   <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:43]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.00  pin+zero=0.06  spaces=0.01  select=0.01  read=4.56  h2d_setup=0.09  total=4.74 (ms)  [selected_elts=217856]
+[stage 14:35:43]   <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:43]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:43]   <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:43]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.00  pin+zero=0.04  spaces=0.00  select=0.01  read=3.86  h2d_setup=0.09  total=4.01 (ms)  [selected_elts=217856]
+[stage 14:35:43]   <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:43]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:43]   <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:43]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.00  pin+zero=0.04  spaces=0.00  select=0.01  read=4.47  h2d_setup=0.09  total=4.61 (ms)  [selected_elts=217856]
+[stage 14:35:43]   <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:43]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:43]   <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:43]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.00  pin+zero=0.04  spaces=0.00  select=0.01  read=3.81  h2d_setup=0.10  total=3.97 (ms)  [selected_elts=217856]
+[stage 14:35:43]   <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:43]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:43]   <- psi_G_store.populate.shard_to_host  0.0 s
+  ψ(G-flat) host cache: 0.02 GB/process resident
+  Z_q on raw parents: 7 parent k rows -> 36 full k by the typed unfold on 3 orbit-closed real-grid tiles x 15360 slots (planned chunk_r 16698; pad slots 0)
+[stage 14:35:44]   -> zeta_fit.build_psi_r_cache
+[stage 14:35:44]   <- zeta_fit.build_psi_r_cache  0.5 s
+  ψ(r) cache: (5, 7, 16, 4, 46080), band-sharded over ('x','y'), 0.41 GB local
+Started zeta fitting at 14:35:44.
+  G-flat ζ accumulator: N=343 rows/rank (n_q=7 × n_mu_local=49); chunk_size=100 → per-iter FFT box 0.07 GB/rank
+[mem_probe pre_rchunk_loop] in_use=0.86 GB  peak=10.67 GB  live_count=80 live_total=4.24 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe pre_rchunk_loop]   complex128 (5, 7, 16, 4, 46080) x 2 = 3.30 GB
+[mem_probe pre_rchunk_loop]   complex128 (5, 7, 4, 4, 46080) x 2 = 0.83 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 196, 1964) x 1 = 0.04 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 196, 196) x 2 = 0.01 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe pre_rchunk_loop]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe pre_rchunk_loop]   complex128 (196, 196) x 2 = 0.00 GB
+[stage 14:35:44]   -> zeta_fit.gflat_spill_initial
+[stage 14:35:44]   <- zeta_fit.gflat_spill_initial  0.0 s
+[mem_probe pre_rchunk_loop_host_spilled] in_use=0.85 GB  peak=10.67 GB  live_count=79 live_total=4.20 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (5, 7, 16, 4, 46080) x 2 = 3.30 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (5, 7, 4, 4, 46080) x 2 = 0.83 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 196, 196) x 2 = 0.01 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe pre_rchunk_loop_host_spilled]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (196, 196) x 2 = 0.00 GB
+[mem_probe pre_rchunk_loop_host_spilled]   int32 (7, 1964) x 2 = 0.00 GB
+  [bispinor] μ_L=3 → /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu3.h5
+[stage 14:35:44] -> gw_jax.zeta_fit_chunked_mu3
+[mem_probe zeta_fit_start] in_use=0.85 GB  peak=10.67 GB  live_count=79 live_total=4.20 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe zeta_fit_start]   complex128 (5, 7, 16, 4, 46080) x 2 = 3.30 GB
+[mem_probe zeta_fit_start]   complex128 (5, 7, 4, 4, 46080) x 2 = 0.83 GB
+[mem_probe zeta_fit_start]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe zeta_fit_start]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe zeta_fit_start]   complex128 (7, 196, 196) x 2 = 0.01 GB
+[mem_probe zeta_fit_start]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe zeta_fit_start]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe zeta_fit_start]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe zeta_fit_start]   complex128 (196, 196) x 2 = 0.00 GB
+[mem_probe zeta_fit_start]   int32 (7, 1964) x 2 = 0.00 GB
+
+  Zeta fitting: 3 r-chunks x 16698 r-points, 80 bands (30 left + 58 right)
+  Output: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu3.h5
+[stage 14:35:44]   -> zeta_fit.CCT
+  Computing C_q via shard_map pipeline (open-spin, transverse γ̃^3)
+[stage 14:35:44]     -> zeta_fit.CCT.face_gemm_plan
+  gemm_plan: cublasmp N,N on 2x2, shape (nq=7, m=784, k=80, n=784), dtype=complex128, alpha=(1+0j), beta=0j
+[stage 14:35:44]     <- zeta_fit.CCT.face_gemm_plan  0.0 s
+  C_q on raw parents: 7 -> 36 k rows
+[stage 14:35:45]   <- zeta_fit.CCT  1.0 s
+[stage 14:35:45]   -> zeta_fit.cholesky
+[stage 14:35:45]     -> zeta_fit.trace_L_q
+[stage 14:35:45]     <- zeta_fit.trace_L_q  0.0 s
+  Computing transverse factor = hoisted distributed getrf (block-cyclic, once per channel)  [γ̃^3 indefinite — path=cusolvermp_lu]
+  Zeta back-solve tier: per_q (distributed_zeta_solve=distributed)  replicated (nq,μ,μ) gather would be 0.00 GB/rank; per-q tile 0.001 GB (×nq executions/r-chunk); distributed tier gathers NO (μ,μ) object
+  [zeta transverse ridge] batch_reshard hoists the local-JAX LU: 7 factorization(s) once per channel; 0 factorizations/r-chunk; 7 lu_solve application(s)/r-chunk
+  [zeta transverse ridge (LU)] conditioning: kappa_lb = max|u_ii|/min|u_ii| of the pivoted LU, worst over q = 6.421e+03 at q=5 (ridge sign(tr C)*1.0e-12*|tr C|/n; ceiling 1.0e+12).  This is a LOWER BOUND on kappa — above the ceiling it refuses, below it certifies NOTHING.
+  L_q: (7, 196, 196)
+[stage 14:35:46]   <- zeta_fit.cholesky  0.2 s
+[stage 14:35:46]   -> zeta_fit.gc_pre_chunk_loop
+[stage 14:35:46]   <- zeta_fit.gc_pre_chunk_loop  0.1 s
+  q-IBZ reduction: 7 IBZ q-points / 36 full-BZ (disk shrink 5.1×)
+  G-flat ζ sphere: ngkmax=1964, min ngk=1917, max ngk=1964 (4.262% of n_rtot)
+[stage 14:35:46]   -> zeta_fit.write_headers
+  [SlabIO.phdf5_ffi] zeta_q_mu3.h5 mode=w ranks=4 stripe_count=4 stripe_unit=1048576 B (policy; LORRAX_PHDF5_STRIPE_COUNT/_SIZE_FS override)
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu3.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639690] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.04  select=0.00  write=1.00  total=1.06 (ms)  0 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (no queued data); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+[stage 14:35:46]   <- zeta_fit.write_headers  0.0 s
+[stage 14:35:46]   -> zeta_fit.open_file
+[phdf5.hints /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu3.h5] 24 hints retained by ROMIO:
+  romio_cb_pfr                             = disable
+  romio_cb_fr_types                        = aar
+  cb_align                                 = 2
+  cb_buffer_size                           = 16777216
+  romio_cb_fr_alignment                    = 1
+  romio_cb_ds_threshold                    = 0
+  romio_cb_alltoall                        = automatic
+  romio_cb_read                            = automatic
+  romio_cb_write                           = automatic
+  romio_no_indep_rw                        = false
+  romio_ds_write                           = automatic
+  ind_wr_buffer_size                       = 524288
+  romio_ds_read                            = disable
+  ind_rd_buffer_size                       = 4194304
+  direct_io                                = false
+  striping_factor                          = 4
+  striping_unit                            = 1048576
+  overstriping_factor                      = 0
+  romio_lustre_start_iodevice              = -1
+  aggregator_placement_stride              = -1
+  abort_on_rw_error                        = disable
+  cb_config_list                           = *:*
+  cb_nodes                                 = 4
+  romio_filesystem_type                    = CRAY ADIO:
+[ffi-debug proc=0] name=lorrax_io_committed shape=(4,) dtype=int32 spec=P(('x', 'y'),) offset=(0,) valid_shape=(1,) gshape=(1,) local_shapes=[(1,)]
+[phdf5-write rank=0 ds=/lorrax_io_committed id=360287970189639691] extent=[1] offset=[0] count=[1] mem_dims=[1] base=[0] valid=[1] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/lorrax_io_committed bytes/rank=4 coll=1 empty=0  d2h_wait=0.01  spaces=0.02  select=0.00  write=0.25  total=0.28 (ms)  0 MB/s
+[stage 14:35:46]   <- zeta_fit.open_file  0.0 s
+[stage 14:35:46]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.01  pin+zero=0.11  spaces=0.01  select=0.02  read=3.98  h2d_setup=0.09  total=4.21 (ms)  [selected_elts=217856]
+[stage 14:35:46]   <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:46]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:46]   <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:46]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.00  pin+zero=0.06  spaces=0.01  select=0.01  read=5.13  h2d_setup=0.09  total=5.30 (ms)  [selected_elts=217856]
+[stage 14:35:46]   <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:46]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:46]   <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:46]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.00  pin+zero=0.04  spaces=0.00  select=0.01  read=3.84  h2d_setup=0.09  total=3.99 (ms)  [selected_elts=217856]
+[stage 14:35:46]   <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:46]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:46]   <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:46]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.00  pin+zero=0.04  spaces=0.00  select=0.01  read=4.53  h2d_setup=0.09  total=4.68 (ms)  [selected_elts=217856]
+[stage 14:35:46]   <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:46]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:46]   <- psi_G_store.populate.shard_to_host  0.0 s
+[stage 14:35:46]   -> psi_G_store.populate.loader_load
+[phdf5 kchunk-union r0] n_k=7 bytes/rank=1759744  prev_h2d_wait=0.00  pin+zero=0.04  spaces=0.00  select=0.01  read=3.96  h2d_setup=0.09  total=4.11 (ms)  [selected_elts=217856]
+[stage 14:35:46]   <- psi_G_store.populate.loader_load  0.0 s
+[stage 14:35:46]   -> psi_G_store.populate.shard_to_host
+[stage 14:35:46]   <- psi_G_store.populate.shard_to_host  0.0 s
+  ψ(G-flat) host cache: 0.02 GB/process resident
+  Z_q on raw parents: 7 parent k rows -> 36 full k by the typed unfold on 3 orbit-closed real-grid tiles x 15360 slots (planned chunk_r 16698; pad slots 0)
+[stage 14:35:46]   -> zeta_fit.build_psi_r_cache
+[stage 14:35:46]   <- zeta_fit.build_psi_r_cache  0.4 s
+  ψ(r) cache: (5, 7, 16, 4, 46080), band-sharded over ('x','y'), 0.41 GB local
+Started zeta fitting at 14:35:46.
+  G-flat ζ accumulator: N=343 rows/rank (n_q=7 × n_mu_local=49); chunk_size=100 → per-iter FFT box 0.07 GB/rank
+[mem_probe pre_rchunk_loop] in_use=1.28 GB  peak=10.67 GB  live_count=96 live_total=6.31 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe pre_rchunk_loop]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe pre_rchunk_loop]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 196, 1964) x 1 = 0.04 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe pre_rchunk_loop]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe pre_rchunk_loop]   complex128 (196, 196) x 3 = 0.00 GB
+[mem_probe pre_rchunk_loop]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[stage 14:35:46]   -> zeta_fit.gflat_spill_initial
+[stage 14:35:46]   <- zeta_fit.gflat_spill_initial  0.0 s
+[mem_probe pre_rchunk_loop_host_spilled] in_use=1.26 GB  peak=10.67 GB  live_count=95 live_total=6.27 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe pre_rchunk_loop_host_spilled]   complex128 (196, 196) x 3 = 0.00 GB
+[mem_probe pre_rchunk_loop_host_spilled]   int32 (7, 24, 24, 80) x 1 = 0.00 GB
+[mem_probe pre_rchunk_loop_host_spilled]   int32 (7, 1964) x 2 = 0.00 GB
+[stage 14:35:47]   -> zeta_fit.chunk_loop
+[stage 14:35:47]   -> zeta_fit.chunk_loop
+[stage 14:35:47]   -> zeta_fit.chunk_loop
+[mem_probe rchunk_start chunk=0] in_use=1.27 GB  peak=10.67 GB  live_count=101 live_total=6.27 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe rchunk_start chunk=0]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe rchunk_start chunk=0]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=0]   int32 (24, 15360, 3) x 1 = 0.00 GB
+[mem_probe rchunk_start chunk=0]   int32 (24, 15360) x 2 = 0.00 GB
+[mem_probe rchunk_start chunk=0]   complex128 (196, 196) x 3 = 0.00 GB
+[mem_probe rchunk_start chunk=0] in_use=1.28 GB  peak=10.67 GB  live_count=104 live_total=6.28 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe rchunk_start chunk=0]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe rchunk_start chunk=0]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=0]   int32 (24, 15360, 3) x 2 = 0.01 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=0]   int32 (24, 15360) x 2 = 0.00 GB
+[mem_probe rchunk_start chunk=0]   complex128 (196, 196) x 3 = 0.00 GB
+[mem_probe rchunk_start chunk=0] in_use=1.28 GB  peak=10.67 GB  live_count=107 live_total=6.28 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe rchunk_start chunk=0]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe rchunk_start chunk=0]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=0]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=0]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=0]   int32 (24, 15360) x 3 = 0.00 GB
+[mem_probe rchunk_start chunk=0]   complex128 (196, 196) x 3 = 0.00 GB
+[stage 14:35:49]     -> zeta_fit.chunk.fit_one_rchunk
+[rchunk_dbg]   z_q_build=63ms solve=422ms d_zq=+0.001GB d_solve=+0.017GB
+[stage 14:35:50]     <- zeta_fit.chunk.fit_one_rchunk  0.5 s
+[mem_probe after_fit_one_rchunk chunk=0] in_use=3.10 GB  peak=10.67 GB  live_count=113 live_total=13.56 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (36, 196, 15360) x 1 = 1.73 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 196, 15360) x 1 = 0.34 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=0]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[stage 14:35:50]     -> zeta_fit.chunk.h5_write
+[stage 14:35:51]     <- zeta_fit.chunk.h5_write  0.9 s
+[mem_probe after_accumulate chunk=0] in_use=3.02 GB  peak=10.67 GB  live_count=119 live_total=13.22 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_accumulate chunk=0]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_accumulate chunk=0]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_accumulate chunk=0]   complex128 (36, 196, 15360) x 1 = 1.73 GB
+[mem_probe after_accumulate chunk=0]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=0]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[stage 14:35:51]     -> zeta_fit.chunk.fit_one_rchunk
+[rchunk_dbg] chunk=1/3 r=[0,46080) fit=532ms write=922ms total=1454ms rss=2.380GB live=15.292GB d_fit=+0.023 d_acc=+0.042 rss_trim=2.359GB
+[ 14:35:51 | ███░░░░░░░ |  33% ] r-chunk 1 / 3 · ETA 17 s
+[rchunk_dbg]   z_q_build=3ms solve=14ms d_zq=-0.011GB d_solve=+0.007GB
+[stage 14:35:51]     <- zeta_fit.chunk.fit_one_rchunk  0.0 s
+[mem_probe after_fit_one_rchunk chunk=0] in_use=3.53 GB  peak=10.67 GB  live_count=118 live_total=15.29 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 196, 15360) x 1 = 0.34 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=0]   int32 (24, 15360, 3) x 2 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[stage 14:35:51]     -> zeta_fit.chunk.h5_write
+[stage 14:35:51]     <- zeta_fit.chunk.h5_write  0.0 s
+[mem_probe after_accumulate chunk=0] in_use=3.44 GB  peak=10.67 GB  live_count=118 live_total=14.95 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_accumulate chunk=0]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_accumulate chunk=0]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_accumulate chunk=0]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe after_accumulate chunk=0]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_accumulate chunk=0]   int32 (24, 15360, 3) x 2 = 0.01 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[stage 14:35:51]     -> zeta_fit.chunk.fit_one_rchunk
+[rchunk_dbg] chunk=1/3 r=[0,46080) fit=18ms write=7ms total=26ms rss=2.359GB live=16.689GB d_fit=+0.056 d_acc=-0.007 rss_trim=2.358GB
+[ 14:35:51 | ███░░░░░░░ |  33% ] r-chunk 1 / 3 · ETA 13 s
+[mem_probe rchunk_start chunk=1] in_use=3.45 GB  peak=10.67 GB  live_count=122 live_total=14.95 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe rchunk_start chunk=1]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe rchunk_start chunk=1]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe rchunk_start chunk=1]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe rchunk_start chunk=1]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=1]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[rchunk_dbg]   z_q_build=2ms solve=14ms d_zq=+0.001GB d_solve=+0.008GB
+[stage 14:35:51]     <- zeta_fit.chunk.fit_one_rchunk  0.0 s
+[mem_probe after_fit_one_rchunk chunk=0] in_use=3.55 GB  peak=10.67 GB  live_count=120 live_total=15.29 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 196, 15360) x 1 = 0.34 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=0]   int32 (24, 15360, 3) x 2 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=0]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[stage 14:35:51]     -> zeta_fit.chunk.h5_write
+[stage 14:35:51]     <- zeta_fit.chunk.h5_write  0.0 s
+[mem_probe after_accumulate chunk=0] in_use=3.46 GB  peak=10.67 GB  live_count=120 live_total=14.95 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_accumulate chunk=0]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_accumulate chunk=0]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_accumulate chunk=0]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe after_accumulate chunk=0]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_accumulate chunk=0]   int32 (24, 15360, 3) x 2 = 0.01 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe after_accumulate chunk=0]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[rchunk_dbg] chunk=1/3 r=[0,46080) fit=17ms write=7ms total=24ms rss=2.369GB live=14.955GB d_fit=+0.057 d_acc=+0.002 rss_trim=2.362GB
+[ 14:35:51 | ███░░░░░░░ |  33% ] r-chunk 1 / 3 · ETA 9 s
+[mem_probe rchunk_start chunk=1] in_use=3.47 GB  peak=10.67 GB  live_count=124 live_total=14.95 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe rchunk_start chunk=1]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe rchunk_start chunk=1]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe rchunk_start chunk=1]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe rchunk_start chunk=1]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=1]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=1] in_use=1.74 GB  peak=10.67 GB  live_count=122 live_total=8.02 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe rchunk_start chunk=1]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe rchunk_start chunk=1]   complex128 (36, 196, 15360) x 1 = 1.73 GB
+[mem_probe rchunk_start chunk=1]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=1]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=1]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=1]   int32 (24, 15360) x 3 = 0.00 GB
+[stage 14:35:52]     -> zeta_fit.chunk.fit_one_rchunk
+[rchunk_dbg]   z_q_build=1ms solve=14ms d_zq=+0.000GB d_solve=+0.000GB
+[stage 14:35:52]     <- zeta_fit.chunk.fit_one_rchunk  0.0 s
+[mem_probe after_fit_one_rchunk chunk=1] in_use=3.10 GB  peak=10.67 GB  live_count=124 live_total=13.56 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (36, 196, 15360) x 1 = 1.73 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 196, 15360) x 1 = 0.34 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=1]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[stage 14:35:52]     -> zeta_fit.chunk.h5_write
+[stage 14:35:52]     <- zeta_fit.chunk.h5_write  0.0 s
+[mem_probe after_accumulate chunk=1] in_use=3.02 GB  peak=10.67 GB  live_count=123 live_total=13.22 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_accumulate chunk=1]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_accumulate chunk=1]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_accumulate chunk=1]   complex128 (36, 196, 15360) x 1 = 1.73 GB
+[mem_probe after_accumulate chunk=1]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=1]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[stage 14:35:52]     -> zeta_fit.chunk.fit_one_rchunk
+[rchunk_dbg] chunk=2/3 r=[0,46080) fit=16ms write=7ms total=23ms rss=2.366GB live=14.955GB d_fit=+0.002 d_acc=+0.001 rss_trim=2.361GB
+[ 14:35:52 | ███████░░░ |  67% ] r-chunk 2 / 3 · ETA 5 s
+[rchunk_dbg]   z_q_build=2ms solve=14ms d_zq=+0.000GB d_solve=+0.008GB
+[stage 14:35:52]     <- zeta_fit.chunk.fit_one_rchunk  0.0 s
+[mem_probe after_fit_one_rchunk chunk=1] in_use=3.53 GB  peak=10.67 GB  live_count=121 live_total=15.29 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 196, 15360) x 1 = 0.34 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=1]   int32 (24, 15360, 3) x 2 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[stage 14:35:52]     -> zeta_fit.chunk.h5_write
+[stage 14:35:52]     <- zeta_fit.chunk.h5_write  0.0 s
+[mem_probe after_accumulate chunk=1] in_use=3.44 GB  peak=10.67 GB  live_count=120 live_total=14.95 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_accumulate chunk=1]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_accumulate chunk=1]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_accumulate chunk=1]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe after_accumulate chunk=1]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_accumulate chunk=1]   int32 (24, 15360, 3) x 2 = 0.01 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[stage 14:35:52]     -> zeta_fit.chunk.fit_one_rchunk
+[rchunk_dbg] chunk=2/3 r=[0,46080) fit=17ms write=7ms total=24ms rss=2.365GB live=16.689GB d_fit=+0.000 d_acc=-0.004 rss_trim=2.357GB
+[ 14:35:52 | ███████░░░ |  67% ] r-chunk 2 / 3 · ETA 4 s
+[mem_probe rchunk_start chunk=2] in_use=3.45 GB  peak=10.67 GB  live_count=124 live_total=14.95 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe rchunk_start chunk=2]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe rchunk_start chunk=2]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe rchunk_start chunk=2]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe rchunk_start chunk=2]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=2]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[rchunk_dbg]   z_q_build=2ms solve=14ms d_zq=+0.000GB d_solve=+0.009GB
+[stage 14:35:52]     <- zeta_fit.chunk.fit_one_rchunk  0.0 s
+[mem_probe after_fit_one_rchunk chunk=1] in_use=3.55 GB  peak=10.67 GB  live_count=121 live_total=15.29 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 196, 15360) x 1 = 0.34 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=1]   int32 (24, 15360, 3) x 2 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=1]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[stage 14:35:52]     -> zeta_fit.chunk.h5_write
+[stage 14:35:52]     <- zeta_fit.chunk.h5_write  0.0 s
+[mem_probe after_accumulate chunk=1] in_use=3.46 GB  peak=10.67 GB  live_count=120 live_total=14.95 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_accumulate chunk=1]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_accumulate chunk=1]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_accumulate chunk=1]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe after_accumulate chunk=1]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_accumulate chunk=1]   int32 (24, 15360, 3) x 2 = 0.01 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe after_accumulate chunk=1]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[rchunk_dbg] chunk=2/3 r=[0,46080) fit=17ms write=7ms total=24ms rss=2.367GB live=14.955GB d_fit=-0.001 d_acc=-0.000 rss_trim=2.362GB
+[ 14:35:52 | ███████░░░ |  67% ] r-chunk 2 / 3 · ETA 3 s
+[mem_probe rchunk_start chunk=2] in_use=3.47 GB  peak=10.67 GB  live_count=124 live_total=14.95 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe rchunk_start chunk=2]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe rchunk_start chunk=2]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe rchunk_start chunk=2]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe rchunk_start chunk=2]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=2]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=2] in_use=1.74 GB  peak=10.67 GB  live_count=122 live_total=8.02 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe rchunk_start chunk=2]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe rchunk_start chunk=2]   complex128 (36, 196, 15360) x 1 = 1.73 GB
+[mem_probe rchunk_start chunk=2]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe rchunk_start chunk=2]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=2]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe rchunk_start chunk=2]   int32 (24, 15360) x 3 = 0.00 GB
+[stage 14:35:53]     -> zeta_fit.chunk.fit_one_rchunk
+[rchunk_dbg]   z_q_build=2ms solve=15ms d_zq=+0.000GB d_solve=+0.000GB
+[stage 14:35:53]     <- zeta_fit.chunk.fit_one_rchunk  0.0 s
+[mem_probe after_fit_one_rchunk chunk=2] in_use=3.10 GB  peak=10.67 GB  live_count=124 live_total=13.56 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (36, 196, 15360) x 1 = 1.73 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 196, 15360) x 1 = 0.34 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=2]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[stage 14:35:53]     -> zeta_fit.chunk.h5_write
+[stage 14:35:53]     <- zeta_fit.chunk.h5_write  0.0 s
+[mem_probe after_accumulate chunk=2] in_use=3.02 GB  peak=10.67 GB  live_count=123 live_total=13.22 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_accumulate chunk=2]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_accumulate chunk=2]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_accumulate chunk=2]   complex128 (36, 196, 15360) x 1 = 1.73 GB
+[mem_probe after_accumulate chunk=2]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=2]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[stage 14:35:53]     -> zeta_fit.chunk.fit_one_rchunk
+[rchunk_dbg] chunk=3/3 r=[0,46080) fit=17ms write=7ms total=24ms rss=2.364GB live=14.955GB d_fit=-0.002 d_acc=+0.001 rss_trim=2.359GB
+[ 14:35:53 | ██████████ | 100% ] r-chunk 3 / 3 · ETA 0 s
+[stage 14:35:53]   <- zeta_fit.chunk_loop  6.7 s
+Finished zeta fitting at 14:35:53.  Elapsed: 11 s.
+[rchunk_dbg]   z_q_build=2ms solve=13ms d_zq=+0.000GB d_solve=+0.000GB
+[stage 14:35:53]     <- zeta_fit.chunk.fit_one_rchunk  0.0 s
+[mem_probe after_fit_one_rchunk chunk=2] in_use=3.53 GB  peak=10.67 GB  live_count=125 live_total=15.29 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 196, 15360) x 1 = 0.34 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=2]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[stage 14:35:53]     -> zeta_fit.chunk.h5_write
+[stage 14:35:53]     <- zeta_fit.chunk.h5_write  0.0 s
+[mem_probe after_accumulate chunk=2] in_use=3.45 GB  peak=10.67 GB  live_count=124 live_total=14.95 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_accumulate chunk=2]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_accumulate chunk=2]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_accumulate chunk=2]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe after_accumulate chunk=2]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=2]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[stage 14:35:53]     -> zeta_fit.chunk.fit_one_rchunk
+[rchunk_dbg] chunk=3/3 r=[0,46080) fit=16ms write=7ms total=23ms rss=2.359GB live=16.689GB d_fit=-0.007 d_acc=-0.000 rss_trim=2.359GB
+[ 14:35:53 | ██████████ | 100% ] r-chunk 3 / 3 · ETA 0 s
+[stage 14:35:53]   <- zeta_fit.chunk_loop  6.8 s
+Finished zeta fitting at 14:35:53.  Elapsed: 9 s.
+[rchunk_dbg]   z_q_build=2ms solve=14ms d_zq=+0.000GB d_solve=+0.000GB
+[stage 14:35:53]     <- zeta_fit.chunk.fit_one_rchunk  0.0 s
+[mem_probe after_fit_one_rchunk chunk=2] in_use=3.99 GB  peak=10.67 GB  live_count=126 live_total=17.03 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (36, 196, 15360) x 3 = 5.20 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 196, 15360) x 1 = 0.34 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_fit_one_rchunk chunk=2]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_fit_one_rchunk chunk=2]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[stage 14:35:53]     -> zeta_fit.chunk.h5_write
+[stage 14:35:53]     <- zeta_fit.chunk.h5_write  0.0 s
+[mem_probe after_accumulate chunk=2] in_use=3.90 GB  peak=10.67 GB  live_count=125 live_total=16.69 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe after_accumulate chunk=2]   complex128 (36, 196, 15360) x 3 = 5.20 GB
+[mem_probe after_accumulate chunk=2]   complex128 (3, 36, 196, 15360) x 1 = 5.20 GB
+[mem_probe after_accumulate chunk=2]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe after_accumulate chunk=2]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe after_accumulate chunk=2]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe after_accumulate chunk=2]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[rchunk_dbg] chunk=3/3 r=[0,46080) fit=17ms write=7ms total=23ms rss=2.359GB live=11.487GB d_fit=-0.007 d_acc=+0.000 rss_trim=2.359GB
+[ 14:35:53 | ██████████ | 100% ] r-chunk 3 / 3 · ETA 0 s
+[stage 14:35:53]   <- zeta_fit.chunk_loop  6.9 s
+Finished zeta fitting at 14:35:53.  Elapsed: 7 s.
+[stage 14:35:53]   -> zeta_fit.gflat_restore_final_write
+[stage 14:35:53]   <- zeta_fit.gflat_restore_final_write  0.0 s
+[stage 14:35:53]   -> zeta_fit.write_g_flat
+[ffi-debug proc=0] name=zeta_q_G shape=(7, 196, 1964) dtype=complex128 spec=P(None, ('x', 'y')) offset=(0, 0, 0) valid_shape=(7, 194, 1964) gshape=(7, 194, 1964) local_shapes=[(7, 49, 1964)]
+[stage 14:35:54]   <- zeta_fit.write_g_flat  0.4 s
+[stage 14:35:54]   -> zeta_fit.close_io
+  [SlabIO.close] draining 1 pending writes for zeta_q_mu1.h5 …
+[phdf5-write rank=0 ds=/zeta_q_G id=360287970189639686] extent=[7,194,1964] offset=[0,0,0] count=[7,49,1964] mem_dims=[7,49,1964] base=[0,0,0] valid=[7,194,1964] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/zeta_q_G bytes/rank=10778432 coll=1 empty=0  d2h_wait=0.40  spaces=0.05  select=0.00  write=32.51  total=32.96 (ms)  332 MB/s
+  [SlabIO.close] Python dispatch drained in 0.1 s (0.04 GB at 668 MB/s); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+[stage 14:35:54]   <- zeta_fit.close_io  0.1 s
+[stage 14:35:54]   -> zeta_fit.sync_global
+[stage 14:35:54]   <- zeta_fit.sync_global  0.0 s
+  Zeta output: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu1.h5  shape: (n_q_disk=7 of 6·6·1=36 full-BZ, n_rtot=46080, n_rmu=194)
+  Timing (3 r-chunks, 11.4s total):
+    fit      0.56s   5.0%
+    H5       0.94s   8.2%
+[mem_probe zeta_fit_end] in_use=2.60 GB  peak=10.67 GB  live_count=121 live_total=11.49 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe zeta_fit_end]   complex128 (36, 196, 15360) x 3 = 5.20 GB
+[mem_probe zeta_fit_end]   complex128 (5, 7, 16, 4, 46080) x 3 = 4.95 GB
+[mem_probe zeta_fit_end]   complex128 (5, 7, 4, 4, 46080) x 3 = 1.24 GB
+[mem_probe zeta_fit_end]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe zeta_fit_end]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe zeta_fit_end]   int32 (24, 15360, 3) x 3 = 0.01 GB
+[mem_probe zeta_fit_end]   complex128 (7, 196, 196) x 3 = 0.01 GB
+[mem_probe zeta_fit_end]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe zeta_fit_end]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe zeta_fit_end]   int32 (24, 15360) x 3 = 0.00 GB
+[stage 14:35:54] <- gw_jax.zeta_fit_chunked_mu1  16.3 s
+    ζ rank-cut closure: ARMED (mode=snap, rtol=1.0e-06) and SILENT — no cut fell inside a degenerate block of C_q on any q.
+    ζ rank-cut certification: ARMED (mode=refuse, transverse κ is UNCERTIFIED, discarded-weight ceiling 1.0e-03) and SILENT — either the cut bound nothing, or its discarded weight remained inside the certified regime.
+[stage 14:35:54]   -> zeta_fit.gflat_restore_final_write
+[stage 14:35:54]   <- zeta_fit.gflat_restore_final_write  0.0 s
+[stage 14:35:54]   -> zeta_fit.write_g_flat
+[ffi-debug proc=0] name=zeta_q_G shape=(7, 196, 1964) dtype=complex128 spec=P(None, ('x', 'y')) offset=(0, 0, 0) valid_shape=(7, 194, 1964) gshape=(7, 194, 1964) local_shapes=[(7, 49, 1964)]
+[stage 14:35:54]   <- zeta_fit.write_g_flat  0.0 s
+[stage 14:35:54]   -> zeta_fit.close_io
+  [SlabIO.close] draining 1 pending writes for zeta_q_mu2.h5 …
+[phdf5-write rank=0 ds=/zeta_q_G id=360287970189639689] extent=[7,194,1964] offset=[0,0,0] count=[7,49,1964] mem_dims=[7,49,1964] base=[0,0,0] valid=[7,194,1964] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/zeta_q_G bytes/rank=10778432 coll=1 empty=0  d2h_wait=0.40  spaces=0.04  select=0.00  write=32.37  total=32.81 (ms)  333 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (0.04 GB at 1048 MB/s); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+[stage 14:35:54]   <- zeta_fit.close_io  0.0 s
+[stage 14:35:54]   -> zeta_fit.sync_global
+[stage 14:35:54]   <- zeta_fit.sync_global  0.0 s
+  Zeta output: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu2.h5  shape: (n_q_disk=7 of 6·6·1=36 full-BZ, n_rtot=46080, n_rmu=194)
+  Timing (3 r-chunks, 9.2s total):
+    fit      0.05s   0.6%
+    H5       0.02s   0.2%
+[mem_probe zeta_fit_end] in_use=1.75 GB  peak=10.67 GB  live_count=99 live_total=7.68 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe zeta_fit_end]   complex128 (36, 196, 15360) x 2 = 3.47 GB
+[mem_probe zeta_fit_end]   complex128 (5, 7, 16, 4, 46080) x 2 = 3.30 GB
+[mem_probe zeta_fit_end]   complex128 (5, 7, 4, 4, 46080) x 2 = 0.83 GB
+[mem_probe zeta_fit_end]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe zeta_fit_end]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe zeta_fit_end]   int32 (24, 15360, 3) x 2 = 0.01 GB
+[mem_probe zeta_fit_end]   complex128 (7, 196, 196) x 2 = 0.01 GB
+[mem_probe zeta_fit_end]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe zeta_fit_end]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe zeta_fit_end]   int32 (24, 15360) x 2 = 0.00 GB
+[stage 14:35:54] <- gw_jax.zeta_fit_chunked_mu2  12.1 s
+    ζ rank-cut closure: ARMED (mode=snap, rtol=1.0e-06) and SILENT — no cut fell inside a degenerate block of C_q on any q.
+    ζ rank-cut certification: ARMED (mode=refuse, transverse κ is UNCERTIFIED, discarded-weight ceiling 1.0e-03) and SILENT — either the cut bound nothing, or its discarded weight remained inside the certified regime.
+[stage 14:35:54]   -> zeta_fit.gflat_restore_final_write
+[stage 14:35:54]   <- zeta_fit.gflat_restore_final_write  0.0 s
+[stage 14:35:54]   -> zeta_fit.write_g_flat
+[ffi-debug proc=0] name=zeta_q_G shape=(7, 196, 1964) dtype=complex128 spec=P(None, ('x', 'y')) offset=(0, 0, 0) valid_shape=(7, 194, 1964) gshape=(7, 194, 1964) local_shapes=[(7, 49, 1964)]
+[stage 14:35:54]   <- zeta_fit.write_g_flat  0.0 s
+[stage 14:35:54]   -> zeta_fit.close_io
+  [SlabIO.close] draining 1 pending writes for zeta_q_mu3.h5 …
+[phdf5-write rank=0 ds=/zeta_q_G id=360287970189639692] extent=[7,194,1964] offset=[0,0,0] count=[7,49,1964] mem_dims=[7,49,1964] base=[0,0,0] valid=[7,194,1964] collective=1 oob=0 empty=0
+[phdf5 write r0] ds=/zeta_q_G bytes/rank=10778432 coll=1 empty=0  d2h_wait=0.40  spaces=0.03  select=0.00  write=32.17  total=32.60 (ms)  335 MB/s
+  [SlabIO.close] Python dispatch drained in 0.0 s (0.04 GB at 1043 MB/s); joining writer thread
+  [SlabIO.close] writer thread joined in 0.0 s; calling H5Fclose collectively
+  [SlabIO.close] H5Fclose returned in 0.0 s
+[stage 14:35:54]   <- zeta_fit.close_io  0.1 s
+[stage 14:35:54]   -> zeta_fit.sync_global
+[stage 14:35:54]   <- zeta_fit.sync_global  0.0 s
+  Zeta output: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/56_P3_coupled_factor/tmp/zeta_q_mu3.h5  shape: (n_q_disk=7 of 6·6·1=36 full-BZ, n_rtot=46080, n_rmu=194)
+  Timing (3 r-chunks, 7.1s total):
+    fit      0.05s   0.7%
+    H5       0.02s   0.3%
+[mem_probe zeta_fit_end] in_use=0.89 GB  peak=10.67 GB  live_count=77 live_total=3.87 GB  nvsmi=24.64 GB nvsmi_peak=24.64 GB
+[mem_probe zeta_fit_end]   complex128 (36, 196, 15360) x 1 = 1.73 GB
+[mem_probe zeta_fit_end]   complex128 (5, 7, 16, 4, 46080) x 1 = 1.65 GB
+[mem_probe zeta_fit_end]   complex128 (5, 7, 4, 4, 46080) x 1 = 0.41 GB
+[mem_probe zeta_fit_end]   complex128 (7, 4, 600, 80) x 1 = 0.02 GB
+[mem_probe zeta_fit_end]   complex128 (7, 80, 4, 600) x 1 = 0.02 GB
+[mem_probe zeta_fit_end]   complex128 (7, 4, 196, 80) x 1 = 0.01 GB
+[mem_probe zeta_fit_end]   complex128 (7, 80, 4, 196) x 1 = 0.01 GB
+[mem_probe zeta_fit_end]   int32 (24, 15360, 3) x 1 = 0.00 GB
+[mem_probe zeta_fit_end]   complex128 (7, 196, 196) x 1 = 0.00 GB
+[mem_probe zeta_fit_end]   int32 (24, 15360) x 1 = 0.00 GB
+[stage 14:35:54] <- gw_jax.zeta_fit_chunked_mu3  9.9 s
+    ζ rank-cut closure: ARMED (mode=snap, rtol=1.0e-06) and SILENT — no cut fell inside a degenerate block of C_q on any q.
+    ζ rank-cut certification: ARMED (mode=refuse, transverse κ is UNCERTIFIED, discarded-weight ceiling 1.0e-03) and SILENT — either the cut bound nothing, or its discarded weight remained inside the certified regime.
+[stage 14:35:54]   <- gw_jax.zeta_fit_transverse  16.5 s
+*** LORRAX EARLY EXIT: LORRAX_EXIT_AFTER_ZETA=1 — stopping after fit_zeta.  V_q, W, and Σ were NOT computed; this run produced no self-energy. ***
+[stage 14:35:54] <- ISDF basis + wavefunctions  37.0 s  [EXC] SystemExit: 0
+*** LORRAX EARLY EXIT (LORRAX_EXIT_AFTER_ZETA) ***
+  [compile-cache] rank 0/4 summary: xla_compiles=247 (17.53s)  compile_agreement=247 (0.313s fingerprint + 0.446s exchange; enabled)  cache_probes=0 hits=0 (0.00s) vetoed=0  cache_writes_local=unmeasured (cache off or capped-LRU path; JAX p0-only)  agreed=0/0 prefetch=0.00s  enabled=False
+[runtime] filtered 9 exact known-benign JAX runtime notice line(s) on rank 0; all other stderr was forwarded unchanged.
+[runtime] process finalized explicitly (effects barrier, distributed shutdown, atexit hooks) and ending with os._exit: the interpreter-teardown destruction of the XLA:CPU client is skipped deliberately — it deadlocks in pool shutdown after cold-compile storms (jobs 7884928/7884989).

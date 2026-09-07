@@ -1,0 +1,397 @@
+[
+  {
+    "name": "jit_restore",
+    "digest": "77e799331fd7f34dec66b0857c21d60bc74ebfde34cd12b71f8a3a0025331863",
+    "seconds": 1.0648794880253263,
+    "stack": [
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py",
+        "line": 1985,
+        "function": "run_main_and_finalize"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/gw_jax.py",
+        "line": 1034,
+        "function": "main"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/sigma_dispatch.py",
+        "line": 1104,
+        "function": "compute_sigma_xc"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py",
+        "line": 260,
+        "function": "compute_static_photon_sigma"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py",
+        "line": 221,
+        "function": "contract_lorentz_blocks"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/jax_compile_cache.py",
+        "line": 1737,
+        "function": "_counting"
+      }
+    ]
+  },
+  {
+    "name": "jit_contract_class",
+    "digest": "141748875fcec23161c0c9a16d00ddc63f0c69125d8078adba5439b7edade539",
+    "seconds": 0.5031470739922952,
+    "stack": [
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py",
+        "line": 1985,
+        "function": "run_main_and_finalize"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/gw_jax.py",
+        "line": 1034,
+        "function": "main"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/sigma_dispatch.py",
+        "line": 1104,
+        "function": "compute_sigma_xc"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py",
+        "line": 260,
+        "function": "compute_static_photon_sigma"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py",
+        "line": 229,
+        "function": "contract_lorentz_blocks"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/jax_compile_cache.py",
+        "line": 1737,
+        "function": "_counting"
+      }
+    ]
+  },
+  {
+    "name": "jit_contract_class",
+    "digest": "9a76e9b1c726c954c1bc2b7626a60b132459440a82931d715eda8051aa5ab69b",
+    "seconds": 0.4947623519983608,
+    "stack": [
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py",
+        "line": 1985,
+        "function": "run_main_and_finalize"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/gw_jax.py",
+        "line": 1034,
+        "function": "main"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/sigma_dispatch.py",
+        "line": 1104,
+        "function": "compute_sigma_xc"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py",
+        "line": 260,
+        "function": "compute_static_photon_sigma"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py",
+        "line": 229,
+        "function": "contract_lorentz_blocks"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/jax_compile_cache.py",
+        "line": 1737,
+        "function": "_counting"
+      }
+    ]
+  },
+  {
+    "name": "jit_contract_class",
+    "digest": "ebf7c6d171ee94444f5de0205f15ca908ec6a591c32dd0bcbd1b4cdf8a62e632",
+    "seconds": 0.48628659499809146,
+    "stack": [
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py",
+        "line": 1985,
+        "function": "run_main_and_finalize"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/gw_jax.py",
+        "line": 1034,
+        "function": "main"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/sigma_dispatch.py",
+        "line": 1104,
+        "function": "compute_sigma_xc"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py",
+        "line": 260,
+        "function": "compute_static_photon_sigma"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py",
+        "line": 229,
+        "function": "contract_lorentz_blocks"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/jax_compile_cache.py",
+        "line": 1737,
+        "function": "_counting"
+      }
+    ]
+  },
+  {
+    "name": "jit_contract_class",
+    "digest": "2186a14348c7100fdb3b51a0bdf06d298a1c57c8a8e9004902af19390e4c9f90",
+    "seconds": 0.46683826399385,
+    "stack": [
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py",
+        "line": 1985,
+        "function": "run_main_and_finalize"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/gw_jax.py",
+        "line": 1034,
+        "function": "main"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/sigma_dispatch.py",
+        "line": 1104,
+        "function": "compute_sigma_xc"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py",
+        "line": 260,
+        "function": "compute_static_photon_sigma"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py",
+        "line": 229,
+        "function": "contract_lorentz_blocks"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/jax_compile_cache.py",
+        "line": 1737,
+        "function": "_counting"
+      }
+    ]
+  },
+  {
+    "name": "jit_restore",
+    "digest": "9b54fb94b9269a4792c5362a4457402c97ecff493197aedb32c566f8215a1fc7",
+    "seconds": 0.21359585001482628,
+    "stack": [
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py",
+        "line": 1985,
+        "function": "run_main_and_finalize"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/gw_jax.py",
+        "line": 1034,
+        "function": "main"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/sigma_dispatch.py",
+        "line": 1104,
+        "function": "compute_sigma_xc"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py",
+        "line": 260,
+        "function": "compute_static_photon_sigma"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py",
+        "line": 221,
+        "function": "contract_lorentz_blocks"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/jax_compile_cache.py",
+        "line": 1737,
+        "function": "_counting"
+      }
+    ]
+  },
+  {
+    "name": "jit_restore",
+    "digest": "206af00ec4cf350a4cc2b3170d76c1c3efc9254da21942a28ef1f4f718b3b114",
+    "seconds": 0.20828005200019106,
+    "stack": [
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py",
+        "line": 1985,
+        "function": "run_main_and_finalize"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/gw_jax.py",
+        "line": 1034,
+        "function": "main"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/sigma_dispatch.py",
+        "line": 1104,
+        "function": "compute_sigma_xc"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py",
+        "line": 260,
+        "function": "compute_static_photon_sigma"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/photon_sigma.py",
+        "line": 221,
+        "function": "contract_lorentz_blocks"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/jax_compile_cache.py",
+        "line": 1737,
+        "function": "_counting"
+      }
+    ]
+  },
+  {
+    "name": "jit__photon_q0_factor_orbit",
+    "digest": "0d9c7048e2a57630884ce4abc2d1f739843001dccc2f45887a9e109bc4e3a1ca",
+    "seconds": 0.19598544100881554,
+    "stack": [
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py",
+        "line": 1985,
+        "function": "run_main_and_finalize"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/gw_jax.py",
+        "line": 811,
+        "function": "main"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/w_isdf.py",
+        "line": 1867,
+        "function": "compute_static_photon_response"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/head_correction.py",
+        "line": 1578,
+        "function": "complete_static_slab_photon_q0"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/jax_compile_cache.py",
+        "line": 1737,
+        "function": "_counting"
+      }
+    ]
+  },
+  {
+    "name": "jit_body",
+    "digest": "4113de2d16c32a51745604729ab8038a1fbcf71f9bf8acb356d0bfaab74d66bd",
+    "seconds": 0.17582080399733968,
+    "stack": [
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py",
+        "line": 1985,
+        "function": "run_main_and_finalize"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/gw_jax.py",
+        "line": 811,
+        "function": "main"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/w_isdf.py",
+        "line": 1841,
+        "function": "compute_static_photon_response"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/static_gauge_response.py",
+        "line": 237,
+        "function": "build_static_photon_head_response"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/qsgw_head.py",
+        "line": 2831,
+        "function": "build_dft_head_response"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/qsgw_head.py",
+        "line": 1381,
+        "function": "head_wings_sharded"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/qsgw_head.py",
+        "line": 1420,
+        "function": "_head_wings_sharded_face"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/w_isdf.py",
+        "line": 2618,
+        "function": "iter_parent_children_faces"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/jax_compile_cache.py",
+        "line": 1737,
+        "function": "_counting"
+      }
+    ]
+  },
+  {
+    "name": "jit_body",
+    "digest": "fb3714c137d9ebc888572969473cb2b6cc6ed32dce42665fa89f5509da1ded32",
+    "seconds": 0.17395278200274333,
+    "stack": [
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py",
+        "line": 1985,
+        "function": "run_main_and_finalize"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/gw_jax.py",
+        "line": 811,
+        "function": "main"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/w_isdf.py",
+        "line": 1841,
+        "function": "compute_static_photon_response"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/static_gauge_response.py",
+        "line": 237,
+        "function": "build_static_photon_head_response"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/qsgw_head.py",
+        "line": 2831,
+        "function": "build_dft_head_response"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/qsgw_head.py",
+        "line": 1381,
+        "function": "head_wings_sharded"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/qsgw_head.py",
+        "line": 1420,
+        "function": "_head_wings_sharded_face"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/w_isdf.py",
+        "line": 2621,
+        "function": "iter_parent_children_faces"
+      },
+      {
+        "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/jax_compile_cache.py",
+        "line": 1737,
+        "function": "_counting"
+      }
+    ]
+  }
+]

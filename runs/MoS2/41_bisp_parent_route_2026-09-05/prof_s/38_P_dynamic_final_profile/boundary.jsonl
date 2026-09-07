@@ -1,0 +1,158 @@
+{"label": "sigma_restore", "host_ms": 1056.4658399962354, "compiles": 7, "compile_s": 0.9503416449879296, "key": [0, 1], "term": "V"}
+{"label": "sigma_block", "host_ms": 627.6665570039768, "compiles": 1, "compile_s": 0.5035708119976334, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 6.955410004593432, "compiles": 0, "compile_s": 0.0, "key": [0, 2], "term": "V"}
+{"label": "sigma_block", "host_ms": 3.398019995074719, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 7.020676013780758, "compiles": 0, "compile_s": 0.0, "key": [0, 3], "term": "V"}
+{"label": "sigma_block", "host_ms": 3.520988975651562, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 1020.9746009786613, "compiles": 6, "compile_s": 0.9276966170000378, "key": [1, 0], "term": "V"}
+{"label": "sigma_block", "host_ms": 641.3909840048291, "compiles": 1, "compile_s": 0.5193048809887841, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 1038.868512987392, "compiles": 6, "compile_s": 0.9243746920255944, "key": [1, 1], "term": "V"}
+{"label": "sigma_block", "host_ms": 622.3601719830185, "compiles": 1, "compile_s": 0.5128267749969382, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 19.133713009068742, "compiles": 0, "compile_s": 0.0, "key": [1, 2], "term": "V"}
+{"label": "sigma_block", "host_ms": 3.149780008243397, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 18.43935900251381, "compiles": 0, "compile_s": 0.0, "key": [1, 3], "term": "V"}
+{"label": "sigma_block", "host_ms": 3.0667590035591274, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 6.408640008885413, "compiles": 0, "compile_s": 0.0, "key": [2, 0], "term": "V"}
+{"label": "sigma_block", "host_ms": 3.546397987520322, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 18.243869999423623, "compiles": 0, "compile_s": 0.0, "key": [2, 1], "term": "V"}
+{"label": "sigma_block", "host_ms": 3.0006199958734214, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 18.235924013424665, "compiles": 0, "compile_s": 0.0, "key": [2, 2], "term": "V"}
+{"label": "sigma_block", "host_ms": 3.0274229939095676, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 18.236334988614544, "compiles": 0, "compile_s": 0.0, "key": [2, 3], "term": "V"}
+{"label": "sigma_block", "host_ms": 3.007393010193482, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 6.247248005820438, "compiles": 0, "compile_s": 0.0, "key": [3, 0], "term": "V"}
+{"label": "sigma_block", "host_ms": 3.3115829864982516, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 18.263568985275924, "compiles": 0, "compile_s": 0.0, "key": [3, 1], "term": "V"}
+{"label": "sigma_block", "host_ms": 3.0401269905269146, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 18.164907000027597, "compiles": 0, "compile_s": 0.0, "key": [3, 2], "term": "V"}
+{"label": "sigma_block", "host_ms": 3.091906983172521, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 18.22314999299124, "compiles": 0, "compile_s": 0.0, "key": [3, 3], "term": "V"}
+{"label": "sigma_block", "host_ms": 3.039677016204223, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 6.425403000321239, "compiles": 0, "compile_s": 0.0, "key": [0, 1], "term": "W"}
+{"label": "sigma_block", "host_ms": 3.7739379913546145, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 7.1562489902134985, "compiles": 0, "compile_s": 0.0, "key": [0, 2], "term": "W"}
+{"label": "sigma_block", "host_ms": 3.5392739810049534, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 6.560704990988597, "compiles": 0, "compile_s": 0.0, "key": [0, 3], "term": "W"}
+{"label": "sigma_block", "host_ms": 3.389063000213355, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 6.537028995808214, "compiles": 0, "compile_s": 0.0, "key": [1, 0], "term": "W"}
+{"label": "sigma_block", "host_ms": 3.642194002168253, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 19.90152001962997, "compiles": 0, "compile_s": 0.0, "key": [1, 1], "term": "W"}
+{"label": "sigma_block", "host_ms": 3.431596007430926, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 19.122701982269064, "compiles": 0, "compile_s": 0.0, "key": [1, 2], "term": "W"}
+{"label": "sigma_block", "host_ms": 3.3044190204236656, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 20.909120998112485, "compiles": 0, "compile_s": 0.0, "key": [1, 3], "term": "W"}
+{"label": "sigma_block", "host_ms": 3.9138599822763354, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 6.8583209940698, "compiles": 0, "compile_s": 0.0, "key": [2, 0], "term": "W"}
+{"label": "sigma_block", "host_ms": 3.6274650192353874, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 19.118063006317243, "compiles": 0, "compile_s": 0.0, "key": [2, 1], "term": "W"}
+{"label": "sigma_block", "host_ms": 5.5183760123327374, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 19.09415700356476, "compiles": 0, "compile_s": 0.0, "key": [2, 2], "term": "W"}
+{"label": "sigma_block", "host_ms": 3.2619370031170547, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 19.074908981565386, "compiles": 0, "compile_s": 0.0, "key": [2, 3], "term": "W"}
+{"label": "sigma_block", "host_ms": 3.283198020653799, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 6.580763991223648, "compiles": 0, "compile_s": 0.0, "key": [3, 0], "term": "W"}
+{"label": "sigma_block", "host_ms": 3.443980007432401, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 19.099747005384415, "compiles": 0, "compile_s": 0.0, "key": [3, 1], "term": "W"}
+{"label": "sigma_block", "host_ms": 3.0333239992614836, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 18.517510005040094, "compiles": 0, "compile_s": 0.0, "key": [3, 2], "term": "W"}
+{"label": "sigma_block", "host_ms": 3.06520500453189, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 18.708780000451952, "compiles": 0, "compile_s": 0.0, "key": [3, 3], "term": "W"}
+{"label": "sigma_block", "host_ms": 3.0281940125860274, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 177.05933097749949, "compiles": 1, "compile_s": 0.15450014398084022, "key": [0, 1], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.833583992673084, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 8.830339997075498, "compiles": 0, "compile_s": 0.0, "key": [0, 2], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.4641780075617135, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 8.410367008764297, "compiles": 0, "compile_s": 0.0, "key": [0, 3], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.460121020907536, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 171.81211998104118, "compiles": 1, "compile_s": 0.15272219199687243, "key": [1, 0], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.841508994810283, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 191.08640498598106, "compiles": 1, "compile_s": 0.1519789019948803, "key": [1, 1], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.347773017594591, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 25.047716015251353, "compiles": 0, "compile_s": 0.0, "key": [1, 2], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.1660509994253516, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 24.37788899987936, "compiles": 0, "compile_s": 0.0, "key": [1, 3], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.0906450119800866, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 8.366210997337475, "compiles": 0, "compile_s": 0.0, "key": [2, 0], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.3728019916452467, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 24.399880989221856, "compiles": 0, "compile_s": 0.0, "key": [2, 1], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.8987699954304844, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 24.390381993725896, "compiles": 0, "compile_s": 0.0, "key": [2, 2], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.0576210119761527, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 24.532719020498917, "compiles": 0, "compile_s": 0.0, "key": [2, 3], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.089262987487018, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 8.375127974431962, "compiles": 0, "compile_s": 0.0, "key": [3, 0], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.3789230219554156, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 24.337729992112145, "compiles": 0, "compile_s": 0.0, "key": [3, 1], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.0420509865507483, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 24.36873098486103, "compiles": 0, "compile_s": 0.0, "key": [3, 2], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.06507499772124, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_restore", "host_ms": 24.33245099382475, "compiles": 0, "compile_s": 0.0, "key": [3, 3], "term": "W-V"}
+{"label": "sigma_block", "host_ms": 3.0900840065442026, "compiles": 0, "compile_s": 0.0, "options": {"with_head": true}}
+{"label": "sigma_static_stage", "host_ms": 25035.705566988327, "compiles": 126, "compile_s": 21.810318897798425}
+{"label": "sigma_tau", "host_ms": 159.244875976583, "compiles": 1, "compile_s": 0.143442185013555}
+{"label": "sigma_tau", "host_ms": 2.309391973540187, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3307429801207036, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3267960059456527, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.330783987417817, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2953349980525672, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3167259932961315, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2539740020874888, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.416419010842219, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.7655750163830817, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.305364003404975, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.290115022333339, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2965870157349855, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2833610128145665, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3006550036370754, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.287089009769261, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.295265003340319, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.299874002346769, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2685329895466566, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2501069761347026, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3100629914551973, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2476629819720984, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3068470181897283, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.318560000276193, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2892830020282418, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3318660096265376, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2581829980481416, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2848439984954894, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2919180046301335, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.271478995680809, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2768889903090894, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.318359009223059, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2625320125371218, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3245310003403574, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 3.6632840055972338, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2816679847892374, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2724099981132895, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.294082019943744, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2601370001211762, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2797049896325916, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.289002004545182, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.285144990310073, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2747250040993094, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2774499957449734, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2940530034247786, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2651559847872704, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2649349994026124, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3118160024750978, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2735829988960177, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3174269881565124, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2926800011191517, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2608180006500334, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3005640250630677, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2770189971197397, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2511990100611, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.331703988602385, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.264014008687809, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3729450185783207, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2649660240858793, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3083899868652225, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3199229908641428, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2884920181240886, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.2754959936719388, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.343528001802042, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.269174001412466, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.285916998516768, "compiles": 0, "compile_s": 0.0}
+{"label": "sigma_tau", "host_ms": 2.3102240229491144, "compiles": 0, "compile_s": 0.0}

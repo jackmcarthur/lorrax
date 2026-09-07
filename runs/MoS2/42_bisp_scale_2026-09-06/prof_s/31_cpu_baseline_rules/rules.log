@@ -1,0 +1,48 @@
+rules_gate: IMPROVED (run --regen to ratchet down): B4-no-device-put: bandstructure/htransform.py 4 -> 3
+rules_gate: IMPROVED (run --regen to ratchet down): B4-no-device-put: bse/bse_io.py 4 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): B4-no-device-put: file_io/wfn_loader.py 3 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): B4-no-device-put: gw/ppm_accumulators.py 2 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): B4-no-device-put: gw/ppm_sigma.py 2 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): B4-no-device-put: gw/qsgw_utils.py 1 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): B4-no-device-put: gw/sigma_dispatch.py 1 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): B4b-no-bulk-h5-to-device: bse/bse_io.py 11 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): D1-no-raw-jnp-fft: psp/dft_operators.py 4 -> 3
+rules_gate: IMPROVED (run --regen to ratchet down): D1-no-raw-jnp-fft: psp/get_DFT_mtxels.py 1 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): S1-replicated-3d-out-spec: file_io/wfn_loader.py 2 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): S1-replicated-3d-out-spec: gw/sigma_x_bispinor.py 1 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): S2-scan-explicit-unroll: bse/bse_w_exact.py 1 -> 0
+rules_gate: FAIL (17 violation(s))
+  B4-no-device-put: bse/bse_densify.py has 1 match(es), allowlist permits 0.
+    device_put of something that is not trivial. The rule (owner, 2026-08-05): device_put is for SMALL arrays that do not need to be sharded at all. Wavefunctions, and essentially any HDF5 payload that must land on processes in a sharded way, go through the FFI I/O layer (file_io.slab_io) or a sharded loader -- never device_put, never the jit argument list. RULES_v2 B4.
+  B4-no-device-put: bse/bse_loading.py has 3 match(es), allowlist permits 0.
+    device_put of something that is not trivial. The rule (owner, 2026-08-05): device_put is for SMALL arrays that do not need to be sharded at all. Wavefunctions, and essentially any HDF5 payload that must land on processes in a sharded way, go through the FFI I/O layer (file_io.slab_io) or a sharded loader -- never device_put, never the jit argument list. RULES_v2 B4.
+  B4-no-device-put: bse/exciton_bands.py has 4 match(es), allowlist permits 3.
+    device_put of something that is not trivial. The rule (owner, 2026-08-05): device_put is for SMALL arrays that do not need to be sharded at all. Wavefunctions, and essentially any HDF5 payload that must land on processes in a sharded way, go through the FFI I/O layer (file_io.slab_io) or a sharded loader -- never device_put, never the jit argument list. RULES_v2 B4.
+  B4-no-device-put: bse/vq_interp.py has 1 match(es), allowlist permits 0.
+    device_put of something that is not trivial. The rule (owner, 2026-08-05): device_put is for SMALL arrays that do not need to be sharded at all. Wavefunctions, and essentially any HDF5 payload that must land on processes in a sharded way, go through the FFI I/O layer (file_io.slab_io) or a sharded loader -- never device_put, never the jit argument list. RULES_v2 B4.
+  B4-no-device-put: bse/w_ladder_freq.py has 1 match(es), allowlist permits 0.
+    device_put of something that is not trivial. The rule (owner, 2026-08-05): device_put is for SMALL arrays that do not need to be sharded at all. Wavefunctions, and essentially any HDF5 payload that must land on processes in a sharded way, go through the FFI I/O layer (file_io.slab_io) or a sharded loader -- never device_put, never the jit argument list. RULES_v2 B4.
+  B4-no-device-put: gw/head_correction.py has 4 match(es), allowlist permits 0.
+    device_put of something that is not trivial. The rule (owner, 2026-08-05): device_put is for SMALL arrays that do not need to be sharded at all. Wavefunctions, and essentially any HDF5 payload that must land on processes in a sharded way, go through the FFI I/O layer (file_io.slab_io) or a sharded loader -- never device_put, never the jit argument list. RULES_v2 B4.
+  B4-no-device-put: gw/photon_sigma.py has 4 match(es), allowlist permits 0.
+    device_put of something that is not trivial. The rule (owner, 2026-08-05): device_put is for SMALL arrays that do not need to be sharded at all. Wavefunctions, and essentially any HDF5 payload that must land on processes in a sharded way, go through the FFI I/O layer (file_io.slab_io) or a sharded loader -- never device_put, never the jit argument list. RULES_v2 B4.
+  B4b-no-bulk-h5-to-device: bse/bse_loading.py has 8 match(es), allowlist permits 0.
+    a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.
+  B4b-no-bulk-h5-to-device: bse/bse_window.py has 1 match(es), allowlist permits 0.
+    a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.
+  B4b-no-bulk-h5-to-device: bse/exciton_bands.py has 2 match(es), allowlist permits 1.
+    a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.
+  B4b-no-bulk-h5-to-device: file_io/tagged_arrays.py has 3 match(es), allowlist permits 2.
+    a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.
+  B4b-no-bulk-h5-to-device: gw/downfold_run.py has 2 match(es), allowlist permits 0.
+    a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.
+  B4b-no-bulk-h5-to-device: gw/head_correction.py has 1 match(es), allowlist permits 0.
+    a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.
+  B4b-no-bulk-h5-to-device: postprocess/rotate_wfn_to_qp.py has 1 match(es), allowlist permits 0.
+    a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.
+  S1-replicated-3d-out-spec: gw/downfold.py has 1 match(es), allowlist permits 0.
+    fully replicated 3-axis object. If its trailing two axes are mu-class this is the guaranteed-OOM case INVARIANTS 6 exists to prevent -- there must be a path that does not materialize N_mu^2 on any process. If they are N_b-class it is the post-Sigma seam: add the file to `exempt` WITH a reason. RULES_v2 S1.
+  S1-replicated-3d-out-spec: gw/qsgw_head.py has 1 match(es), allowlist permits 0.
+    fully replicated 3-axis object. If its trailing two axes are mu-class this is the guaranteed-OOM case INVARIANTS 6 exists to prevent -- there must be a path that does not materialize N_mu^2 on any process. If they are N_b-class it is the post-Sigma seam: add the file to `exempt` WITH a reason. RULES_v2 S1.
+  S2-scan-explicit-unroll: bse/bse_stack_matvec.py has 3 match(es), allowlist permits 1.
+    lax.scan without an explicit `unroll=`. Write it out even when it is 1 (the default): the dial must be visible at the call site so the next reader knows it exists and any change to it is reviewable. Owner rule 2026-08-05. RULES_v2 S2.

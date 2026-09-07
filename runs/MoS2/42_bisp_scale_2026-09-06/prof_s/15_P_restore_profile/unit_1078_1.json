@@ -1,0 +1,71 @@
+{
+  "program": 1078,
+  "occurrence": 1,
+  "occurrences": 3,
+  "label": "XlaModule:#hlo_module=jit_restore,program_id=1078#",
+  "host_range_ms": 0.518913,
+  "projected_ms": 0.295871,
+  "kernel_count": 12,
+  "kernel_sum_ms": 0.296991,
+  "kernels": [
+    {
+      "name": "loop_dynamic_slice_fusion",
+      "count": 1,
+      "sum_ms": 0.002592
+    },
+    {
+      "name": "loop_complex_fusion",
+      "count": 1,
+      "sum_ms": 0.002272
+    },
+    {
+      "name": "wrapped_slice_1",
+      "count": 1,
+      "sum_ms": 0.006336
+    },
+    {
+      "name": "input_transpose_fusion_3",
+      "count": 3,
+      "sum_ms": 0.074208
+    },
+    {
+      "name": "wrapped_slice",
+      "count": 1,
+      "sum_ms": 0.00688
+    },
+    {
+      "name": "input_transpose_fusion",
+      "count": 1,
+      "sum_ms": 0.08736
+    },
+    {
+      "name": "wrapped_slice_2",
+      "count": 1,
+      "sum_ms": 0.006688
+    },
+    {
+      "name": "input_transpose_fusion_1",
+      "count": 1,
+      "sum_ms": 0.036543
+    },
+    {
+      "name": "input_concatenate_fusion",
+      "count": 1,
+      "sum_ms": 0.072576
+    },
+    {
+      "name": "loop_broadcast_fusion",
+      "count": 1,
+      "sum_ms": 0.001536
+    }
+  ],
+  "thunks": [
+    {
+      "name": "Thunk:#hlo_op=command_buffer_1#",
+      "kernels": 12,
+      "projected_ms": 0.295871,
+      "kernel_sum_ms": 0.296991
+    }
+  ],
+  "scope": "Native launch-correlation projection; nested thunk ranges must not be summed"
+}

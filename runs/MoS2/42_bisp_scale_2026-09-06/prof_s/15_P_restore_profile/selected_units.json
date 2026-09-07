@@ -1,0 +1,62 @@
+[
+  {
+    "shape_class": "CC",
+    "program": 1058,
+    "occurrence": 1,
+    "projected_ms": 32.027033,
+    "kernel_sum_ms": 30.805052,
+    "kernel_classes_ms": {
+      "GEMM": 5.761065,
+      "NCCL": 11.650559,
+      "FFT": 5.354575,
+      "other_fused": 8.038853
+    },
+    "memory": "Total bytes used: 1784731404 (1.66GiB)",
+    "explicit_collectives": {}
+  },
+  {
+    "shape_class": "CT",
+    "program": 1122,
+    "occurrence": 1,
+    "projected_ms": 17.229896,
+    "kernel_sum_ms": 16.20769,
+    "kernel_classes_ms": {
+      "GEMM": 3.053783,
+      "NCCL": 7.036903,
+      "FFT": 1.812763,
+      "other_fused": 4.304241000000001
+    },
+    "memory": "Total bytes used: 624712340 (595.77MiB)",
+    "explicit_collectives": {}
+  },
+  {
+    "shape_class": "TC",
+    "program": 1188,
+    "occurrence": 1,
+    "projected_ms": 16.99569,
+    "kernel_sum_ms": 15.970542,
+    "kernel_classes_ms": {
+      "GEMM": 3.043576,
+      "NCCL": 6.76737,
+      "FFT": 1.81529,
+      "other_fused": 4.3443060000000004
+    },
+    "memory": "Total bytes used: 624712340 (595.77MiB)",
+    "explicit_collectives": {}
+  },
+  {
+    "shape_class": "TT",
+    "program": 1252,
+    "occurrence": 1,
+    "projected_ms": 10.878397,
+    "kernel_sum_ms": 8.822533,
+    "kernel_classes_ms": {
+      "GEMM": 1.446138,
+      "NCCL": 3.661366,
+      "FFT": 0.708093,
+      "other_fused": 3.0069359999999996
+    },
+    "memory": "Total bytes used: 239742932 (228.64MiB)",
+    "explicit_collectives": {}
+  }
+]

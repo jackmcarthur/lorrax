@@ -1,0 +1,54 @@
+diff --git a/src/gw/photon_sigma.py b/src/gw/photon_sigma.py
+index 27c5729b..bac9f295 100644
+--- a/src/gw/photon_sigma.py
++++ b/src/gw/photon_sigma.py
+@@ -229,7 +229,6 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
+         value = kernel(left.green_parent, right.green_parent, weights, interactions,
+                        -0.5 if term == _TERM_COH else 1.0, vertices, head_blocks)
+         result, head = value if with_head else (value, None)
+-        jax.block_until_ready((result, head))
+         yield keys[0], result, head
+ 
+ 
+@@ -270,10 +269,11 @@ def compute_static_photon_sigma(
+                 heads[term][sector] = head if old is None else old + head
+                 head_totals[term] = head if head_totals[term] is None else head_totals[term] + head
+             if verbose and jax.process_index() == 0:
+-                print_fn(f"  packed photon Sigma term {term} class {key} complete")
++                print_fn(f"  packed photon Sigma term {term} class {key} submitted")
+     sym = wfns_charge.green_parent.plan.sym
+     nb = wfns_charge.slices.nb_sigma
+ 
++    @jax.jit
+     def finish(value):
+         full = unfold_file_wedge_band_operator(sym, value, trs_rule="transpose")
+         return _replicate_band_sigma(full, mesh_xy)[:, :nb, :nb]
+diff --git a/src/gw/sigma_x_bispinor.py b/src/gw/sigma_x_bispinor.py
+index e4f4b432..064ab073 100644
+--- a/src/gw/sigma_x_bispinor.py
++++ b/src/gw/sigma_x_bispinor.py
+@@ -38,7 +38,6 @@ def compute_sigma_x_bispinor(
+             families=(wfns_transverse,wfns_transverse), term=_TERM_X,
+             response=response, Gij=Gij, meta=meta, mesh_xy=mesh_xy):
+         sigma = value if sigma is None else sigma + value
+-        sigma.block_until_ready()
+     sigma = unfold_file_wedge_band_operator(sym, sigma, trs_rule="transpose")
+     return _replicate_band_sigma(sigma, mesh_xy)[:, :wfns_transverse.slices.nb_sigma,
+                                                 :wfns_transverse.slices.nb_sigma]
+diff --git a/src/gw/v_q_bispinor.py b/src/gw/v_q_bispinor.py
+index b165a212..a67f6fc5 100644
+--- a/src/gw/v_q_bispinor.py
++++ b/src/gw/v_q_bispinor.py
+@@ -834,8 +834,10 @@ class BispinorVqReader:
+         if self._mu_bases is not None:
+             left = self._mu_bases[int(mu_L != 0)]
+             right = self._mu_bases[int(nu_L != 0)]
+-            tile = left.pack_axis(tile, -2)
+-            tile = right.pack_axis(tile, -1)
++            if left is right:
++                tile = left.pack_operator(tile)
++            else:
++                tile = right.pack_axis(left.pack_axis(tile, -2), -1)
+         return tile
+ 
+     @property

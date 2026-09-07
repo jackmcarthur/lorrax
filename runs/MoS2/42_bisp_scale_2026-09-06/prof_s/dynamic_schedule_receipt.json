@@ -1,0 +1,22 @@
+{
+  "02_P_dynamic_baseline": [
+    "    \u03c9\u2265E_F cond:resonant: n_tau=15, nodes=9082528ff4f0e7bb, cache=hit:rule_2d109ca0c9a9fb86.npz, box=(-0.6306198656818706, -0.015345068498391361, 0.01837465441237269, 0.01837465441237269) Ry, sup=2.08199e-06/1e-05 (relative), kappa_max=1.18895, noise=7.13372e-08/5e-07",
+    "    \u03c9\u2265E_F cond:state_tail: n_tau=10, nodes=c076707524dfd957, cache=hit:rule_6cf410a94963dd6a.npz, box=(-2.21236598387081, -0.32579618534576404, 0.01837465441237269, 0.01837465441237269) Ry, sup=4.67081e-06/1e-05 (relative), kappa_max=1.02248, noise=6.13485e-08/5e-07",
+    "    \u03c9\u2265E_F cond:pole_tail: n_tau=17, nodes=1255a67225d857e0, cache=miss, box=(-6.819963593803269, -0.06396825417838985, 0.01837465441237269, 0.01837465441237269) Ry, sup=6.40689e-06/1e-05 (relative), kappa_max=1.0771, noise=6.46257e-08/5e-07",
+    "    \u03c9\u2265E_F val:bulk: n_tau=15, nodes=7f04851aaaa7ba72, cache=hit:rule_e9441967862d1329.npz, box=(0.22114119791696546, 9.804056702592991, 0.01837465441237269, 0.01837465441237269) Ry, sup=4.70075e-06/1e-05 (relative), kappa_max=1.02207, noise=6.13241e-08/5e-07",
+    "    \u03c9<E_F cond:bulk: n_tau=14, nodes=9ed26293b488db1a, cache=hit:rule_3d9070ae2197acc5.npz, box=(-7.113877325924814, -0.272590230271609, 0.01837465441237269, 0.01837465441237269) Ry, sup=5.23099e-06/1e-05 (relative), kappa_max=1.04119, noise=6.24713e-08/5e-07",
+    "    \u03c9<E_F val:resonant: n_tau=14, nodes=81b5a1f08d217250, cache=hit:rule_d385b15fe2de3578.npz, box=(0.015345068498391361, 0.567203466768078, 0.01837465441237269, 0.01837465441237269) Ry, sup=7.20008e-06/1e-05 (relative), kappa_max=1.46415, noise=8.78494e-08/5e-07",
+    "    \u03c9<E_F val:state_tail: n_tau=13, nodes=76999d7f2b404689, cache=hit:rule_8b92f380a398557f.npz, box=(0.19953462939826494, 4.827647336247717, 0.01837465441237269, 0.01837465441237269) Ry, sup=4.07106e-06/1e-05 (relative), kappa_max=1.02589, noise=6.15535e-08/5e-07",
+    "    \u03c9<E_F val:pole_tail: n_tau=18, nodes=7603613289643180, cache=miss, box=(0.06396825417838985, 9.433704408115975, 0.01837465441237269, 0.01837465441237269) Ry, sup=3.4976e-06/1e-05 (relative), kappa_max=1.04033, noise=6.24199e-08/5e-07"
+  ],
+  "16_P_restore_dynamic": [
+    "    \u03c9\u2265E_F cond:resonant: n_tau=15, nodes=9082528ff4f0e7bb, cache=hit:rule_2d109ca0c9a9fb86.npz, box=(-0.6306198656818706, -0.015345068498391361, 0.01837465441237269, 0.01837465441237269) Ry, sup=2.08199e-06/1e-05 (relative), kappa_max=1.18895, noise=7.13372e-08/5e-07",
+    "    \u03c9\u2265E_F cond:state_tail: n_tau=10, nodes=c076707524dfd957, cache=hit:rule_6cf410a94963dd6a.npz, box=(-2.21236598387081, -0.32579618534576404, 0.01837465441237269, 0.01837465441237269) Ry, sup=4.67081e-06/1e-05 (relative), kappa_max=1.02248, noise=6.13485e-08/5e-07",
+    "    \u03c9\u2265E_F cond:pole_tail: n_tau=17, nodes=1255a67225d857e0, cache=hit:rule_9319195825913887.npz, box=(-6.819963593803269, -0.06396825417838985, 0.01837465441237269, 0.01837465441237269) Ry, sup=6.40689e-06/1e-05 (relative), kappa_max=1.0771, noise=6.46257e-08/5e-07",
+    "    \u03c9\u2265E_F val:bulk: n_tau=15, nodes=7f04851aaaa7ba72, cache=hit:rule_e9441967862d1329.npz, box=(0.22114119791696546, 9.804056702592991, 0.01837465441237269, 0.01837465441237269) Ry, sup=4.70075e-06/1e-05 (relative), kappa_max=1.02207, noise=6.13241e-08/5e-07",
+    "    \u03c9<E_F cond:bulk: n_tau=14, nodes=9ed26293b488db1a, cache=hit:rule_3d9070ae2197acc5.npz, box=(-7.113877325924814, -0.272590230271609, 0.01837465441237269, 0.01837465441237269) Ry, sup=5.23099e-06/1e-05 (relative), kappa_max=1.04119, noise=6.24713e-08/5e-07",
+    "    \u03c9<E_F val:resonant: n_tau=14, nodes=81b5a1f08d217250, cache=hit:rule_d385b15fe2de3578.npz, box=(0.015345068498391361, 0.567203466768078, 0.01837465441237269, 0.01837465441237269) Ry, sup=7.20008e-06/1e-05 (relative), kappa_max=1.46415, noise=8.78494e-08/5e-07",
+    "    \u03c9<E_F val:state_tail: n_tau=13, nodes=76999d7f2b404689, cache=hit:rule_8b92f380a398557f.npz, box=(0.19953462939826494, 4.827647336247717, 0.01837465441237269, 0.01837465441237269) Ry, sup=4.07106e-06/1e-05 (relative), kappa_max=1.02589, noise=6.15535e-08/5e-07",
+    "    \u03c9<E_F val:pole_tail: n_tau=18, nodes=7603613289643180, cache=hit:rule_1878d6fe3ff705ef.npz, box=(0.06396825417838985, 9.433704408115975, 0.01837465441237269, 0.01837465441237269) Ry, sup=3.4976e-06/1e-05 (relative), kappa_max=1.04033, noise=6.24199e-08/5e-07"
+  ]
+}

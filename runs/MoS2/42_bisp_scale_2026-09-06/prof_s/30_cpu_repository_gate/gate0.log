@@ -1,0 +1,197 @@
+ok   test_driver_stays_within_its_plumbing_budget[bandstructure.htransform]
+ok   test_driver_stays_within_its_plumbing_budget[bse.bse_feast]
+ok   test_driver_stays_within_its_plumbing_budget[bse.bse_jax]
+ok   test_driver_stays_within_its_plumbing_budget[bse.bse_kpm]
+ok   test_driver_stays_within_its_plumbing_budget[bse.bse_pseudopoles]
+ok   test_driver_stays_within_its_plumbing_budget[bse.bse_w_exact]
+ok   test_driver_stays_within_its_plumbing_budget[bse.exciton_bands]
+ok   test_driver_stays_within_its_plumbing_budget[centroid.kmeans_cli]
+ok   test_driver_stays_within_its_plumbing_budget[gw.compute_vcoul_0d]
+ok   test_driver_stays_within_its_plumbing_budget[gw.downfold_cli]
+ok   test_driver_stays_within_its_plumbing_budget[gw.eqp_bgw]
+ok   test_driver_stays_within_its_plumbing_budget[gw.gw_jax]
+ok   test_driver_stays_within_its_plumbing_budget[gw.kin_ion_io]
+ok   test_driver_stays_within_its_plumbing_budget[postprocess.rotate_wfn_to_qp]
+ok   test_driver_stays_within_its_plumbing_budget[psp.finite_q_head_interp]
+ok   test_driver_stays_within_its_plumbing_budget[psp.get_DFT_mtxels]
+ok   test_driver_stays_within_its_plumbing_budget[psp.get_dipole_mtxels]
+ok   test_driver_stays_within_its_plumbing_budget[psp.kpm_dos]
+ok   test_driver_stays_within_its_plumbing_budget[psp.orbital_magnetization]
+ok   test_driver_stays_within_its_plumbing_budget[psp.run_nscf]
+ok   test_driver_stays_within_its_plumbing_budget[psp.run_sternheimer]
+ok   test_every_budgeted_driver_exists
+ok   test_every_module_gets_a_level
+ok   test_every_module_in_the_map_exists
+ok   test_every_package_in_the_map_exists
+ok   test_l1_library_env_reads_are_pinned[bandstructure.bse_setup]
+ok   test_l1_library_env_reads_are_pinned[bandstructure.htransform]
+ok   test_l1_library_env_reads_are_pinned[gw.sigma_box_plan]
+ok   test_l1_library_env_reads_are_pinned[gw.sigma_plan]
+ok   test_l1_library_env_reads_live_in_resolvers[bandstructure.bse_setup]
+ok   test_l1_library_env_reads_live_in_resolvers[bandstructure.htransform]
+ok   test_l1_library_env_reads_live_in_resolvers[gw.sigma_box_plan]
+ok   test_l1_library_env_reads_live_in_resolvers[gw.sigma_plan]
+ok   test_lorrax_reaches_a_service_only_through_its_door
+ok   test_no_bse_driver_defaults_its_mesh_shape
+ok   test_no_l2_module_reads_the_environment
+ok   test_no_module_imports_a_lower_numbered_layer
+ok   test_no_module_is_in_two_levels
+ok   test_only_entry_points_write_the_environment_at_import
+ok   test_only_the_substrate_constructs_a_mesh
+ok   test_pivoted_cholesky_selection_has_one_l2_owner
+ok   test_the_bench_driver_classifier_can_fail
+ok   test_the_bse_family_builds_no_second_mesh
+ok   test_the_bse_mesh_owner_still_owns_one
+ok   test_the_env_scan_can_fail
+ok   test_the_env_scan_separates_reads_from_writes
+ok   test_the_l1_env_read_ratchet_rejects_a_new_unregistered_policy
+ok   test_the_l2_env_exceptions_are_all_still_needed
+ok   test_the_mesh_owners_all_still_build_one
+ok   test_the_mesh_scan_can_fail
+ok   test_the_module_scope_env_write_exceptions_are_still_needed
+ok   test_the_module_scope_env_write_scan_can_fail
+ok   test_the_plumbing_budget_is_tight[bandstructure.htransform]
+ok   test_the_plumbing_budget_is_tight[bse.bse_feast]
+ok   test_the_plumbing_budget_is_tight[bse.bse_jax]
+ok   test_the_plumbing_budget_is_tight[bse.bse_kpm]
+ok   test_the_plumbing_budget_is_tight[bse.bse_pseudopoles]
+ok   test_the_plumbing_budget_is_tight[bse.bse_w_exact]
+ok   test_the_plumbing_budget_is_tight[bse.exciton_bands]
+ok   test_the_plumbing_budget_is_tight[centroid.kmeans_cli]
+ok   test_the_plumbing_budget_is_tight[gw.compute_vcoul_0d]
+ok   test_the_plumbing_budget_is_tight[gw.downfold_cli]
+ok   test_the_plumbing_budget_is_tight[gw.eqp_bgw]
+ok   test_the_plumbing_budget_is_tight[gw.gw_jax]
+ok   test_the_plumbing_budget_is_tight[gw.kin_ion_io]
+ok   test_the_plumbing_budget_is_tight[postprocess.rotate_wfn_to_qp]
+ok   test_the_plumbing_budget_is_tight[psp.finite_q_head_interp]
+ok   test_the_plumbing_budget_is_tight[psp.get_DFT_mtxels]
+ok   test_the_plumbing_budget_is_tight[psp.get_dipole_mtxels]
+ok   test_the_plumbing_budget_is_tight[psp.kpm_dos]
+ok   test_the_plumbing_budget_is_tight[psp.orbital_magnetization]
+ok   test_the_plumbing_budget_is_tight[psp.run_nscf]
+ok   test_the_plumbing_budget_is_tight[psp.run_sternheimer]
+ok   test_the_plumbing_scan_can_fail
+ok   test_the_plumbing_scan_does_not_cry_wolf
+ok   test_the_px_py_default_scan_can_fail
+ok   test_the_resolver_scan_can_fail
+ok   test_the_retired_shim_modules_are_gone
+ok   test_the_service_door_carve_out_is_narrow
+ok   test_the_service_door_exceptions_are_all_still_needed
+ok   test_the_service_door_scan_can_fail
+ok   test_the_service_door_scan_does_not_cry_wolf
+ok   test_the_src_tree_grows_no_new_bench_drivers
+ok   test_the_three_levels_are_each_populated
+ok   test_the_upward_edge_scan_can_fail
+ok   test_the_upward_edge_scan_ignores_downhill_imports
+ok   test_the_upward_edge_scan_sees_package_relative_imports
+ok   test_the_upward_exceptions_are_all_still_needed
+ok   test_the_wfn_loader_door_scan_can_fail
+ok   test_the_wfn_loader_door_scan_does_not_cry_wolf
+
+90/90 passed, 0 failed
+ok   test_allocator_check_runs_inside_set_default_env
+ok   test_allocator_env_accepts_exactly_what_jaxlib_accepts
+ok   test_allocator_env_refuses_a_typo_and_names_it
+ok   test_allocator_env_removes_a_blank_value
+ok   test_allocator_spellings_match_the_installed_jaxlib_if_present
+ok   test_auditor_addressability_guard_can_fail
+ok   test_auditor_driver_imports_can_fail
+ok   test_auditor_driver_warmup_can_fail
+ok   test_auditor_env_grammar_can_fail
+ok   test_auditor_swallowed_barriers_can_fail
+ok   test_auditor_swallowed_barriers_does_not_fire_on_a_real_handler
+ok   test_auditor_truncation_guard_can_fail
+ok   test_bse_io_guard_comes_from_the_service
+ok   test_bse_io_refuses_a_mesh_with_no_addressable_device
+ok   test_dipole_provenance_checker_still_exists_with_that_signature
+ok   test_entry_point_calls_prepare_mesh_in_the_service
+ok   test_every_chain_driver_owns_its_startup
+ok   test_force_full_bz_has_no_runtime_readers
+ok   test_gw_init_still_guards_the_provenance_stamp
+ok   test_gw_jax_gets_mesh_and_warmup_from_prepare_mesh
+ok   test_gw_jax_imports_prepare_mesh_from_the_service
+ok   test_gw_package_init_no_longer_claims_to_be_the_guarantee
+ok   test_head_correction_checks_dipole_provenance_and_coverage
+ok   test_isdf_fitting_does_not_mark_a_truncated_zeta_done
+ok   test_no_module_anywhere_reads_force_full_bz_by_hand
+ok   test_no_module_imports_collectives_plumbing_from_the_kin_ion_driver
+ok   test_package_init_runs_before_submodule_body_under_dash_m
+ok   test_runtime_env_falsy_reads_blank_as_unset
+ok   test_runtime_env_falsy_still_honours_real_falsy_tokens
+ok   test_sigma_dispatch_still_takes_the_physics_from_the_driver
+ok   test_slab_io_ffi_barrier_is_the_service_one
+ok   test_slab_io_ffi_has_no_swallowed_barrier
+ok   test_the_head_reader_consumes_the_window_rather_than_mirroring_defaults
+ok   test_the_runtime_docstring_names_all_adopters
+
+34/34 passed, 0 failed
+ok   test_a_service_env_read_is_actually_visible_to_the_registry
+ok   test_cpp_regex_can_fail_and_can_match
+ok   test_cpp_scan_sees_the_tree_at_all
+ok   test_deleting_tf32_row_exposes_the_source_read
+ok   test_env_audit_selftest_passes_here
+ok   test_every_cpp_lorrax_read_has_a_registry_row
+ok   test_every_python_lorrax_read_has_a_registry_row
+ok   test_module_constant_read_must_have_a_registry_row
+ok   test_module_constants_work_for_every_read_shape
+ok   test_python_scan_sees_the_tree_at_all
+ok   test_python_visitor_sees_helper_reads
+ok   test_registry_coverage_can_fail
+ok   test_registry_file_exists_and_is_a_registry
+ok   test_the_real_registry_has_no_universal_glob
+ok   test_the_scan_covers_every_service_source_root
+ok   test_universal_glob_would_hide_an_unregistered_name
+
+16/16 passed, 0 failed
+rules_gate: IMPROVED (run --regen to ratchet down): B4-no-device-put: bandstructure/htransform.py 4 -> 3
+rules_gate: IMPROVED (run --regen to ratchet down): B4-no-device-put: bse/bse_io.py 4 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): B4-no-device-put: file_io/wfn_loader.py 3 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): B4-no-device-put: gw/ppm_accumulators.py 2 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): B4-no-device-put: gw/ppm_sigma.py 2 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): B4-no-device-put: gw/qsgw_utils.py 1 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): B4-no-device-put: gw/sigma_dispatch.py 1 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): B4b-no-bulk-h5-to-device: bse/bse_io.py 11 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): D1-no-raw-jnp-fft: psp/dft_operators.py 4 -> 3
+rules_gate: IMPROVED (run --regen to ratchet down): D1-no-raw-jnp-fft: psp/get_DFT_mtxels.py 1 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): S1-replicated-3d-out-spec: file_io/wfn_loader.py 2 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): S1-replicated-3d-out-spec: gw/sigma_x_bispinor.py 1 -> 0
+rules_gate: IMPROVED (run --regen to ratchet down): S2-scan-explicit-unroll: bse/bse_w_exact.py 1 -> 0
+rules_gate: FAIL (17 violation(s))
+  B4-no-device-put: bse/bse_densify.py has 1 match(es), allowlist permits 0.
+    device_put of something that is not trivial. The rule (owner, 2026-08-05): device_put is for SMALL arrays that do not need to be sharded at all. Wavefunctions, and essentially any HDF5 payload that must land on processes in a sharded way, go through the FFI I/O layer (file_io.slab_io) or a sharded loader -- never device_put, never the jit argument list. RULES_v2 B4.
+  B4-no-device-put: bse/bse_loading.py has 3 match(es), allowlist permits 0.
+    device_put of something that is not trivial. The rule (owner, 2026-08-05): device_put is for SMALL arrays that do not need to be sharded at all. Wavefunctions, and essentially any HDF5 payload that must land on processes in a sharded way, go through the FFI I/O layer (file_io.slab_io) or a sharded loader -- never device_put, never the jit argument list. RULES_v2 B4.
+  B4-no-device-put: bse/exciton_bands.py has 4 match(es), allowlist permits 3.
+    device_put of something that is not trivial. The rule (owner, 2026-08-05): device_put is for SMALL arrays that do not need to be sharded at all. Wavefunctions, and essentially any HDF5 payload that must land on processes in a sharded way, go through the FFI I/O layer (file_io.slab_io) or a sharded loader -- never device_put, never the jit argument list. RULES_v2 B4.
+  B4-no-device-put: bse/vq_interp.py has 1 match(es), allowlist permits 0.
+    device_put of something that is not trivial. The rule (owner, 2026-08-05): device_put is for SMALL arrays that do not need to be sharded at all. Wavefunctions, and essentially any HDF5 payload that must land on processes in a sharded way, go through the FFI I/O layer (file_io.slab_io) or a sharded loader -- never device_put, never the jit argument list. RULES_v2 B4.
+  B4-no-device-put: bse/w_ladder_freq.py has 1 match(es), allowlist permits 0.
+    device_put of something that is not trivial. The rule (owner, 2026-08-05): device_put is for SMALL arrays that do not need to be sharded at all. Wavefunctions, and essentially any HDF5 payload that must land on processes in a sharded way, go through the FFI I/O layer (file_io.slab_io) or a sharded loader -- never device_put, never the jit argument list. RULES_v2 B4.
+  B4-no-device-put: gw/head_correction.py has 4 match(es), allowlist permits 0.
+    device_put of something that is not trivial. The rule (owner, 2026-08-05): device_put is for SMALL arrays that do not need to be sharded at all. Wavefunctions, and essentially any HDF5 payload that must land on processes in a sharded way, go through the FFI I/O layer (file_io.slab_io) or a sharded loader -- never device_put, never the jit argument list. RULES_v2 B4.
+  B4-no-device-put: gw/photon_sigma.py has 2 match(es), allowlist permits 0.
+    device_put of something that is not trivial. The rule (owner, 2026-08-05): device_put is for SMALL arrays that do not need to be sharded at all. Wavefunctions, and essentially any HDF5 payload that must land on processes in a sharded way, go through the FFI I/O layer (file_io.slab_io) or a sharded loader -- never device_put, never the jit argument list. RULES_v2 B4.
+  B4b-no-bulk-h5-to-device: bse/bse_loading.py has 8 match(es), allowlist permits 0.
+    a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.
+  B4b-no-bulk-h5-to-device: bse/bse_window.py has 1 match(es), allowlist permits 0.
+    a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.
+  B4b-no-bulk-h5-to-device: bse/exciton_bands.py has 2 match(es), allowlist permits 1.
+    a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.
+  B4b-no-bulk-h5-to-device: file_io/tagged_arrays.py has 3 match(es), allowlist permits 2.
+    a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.
+  B4b-no-bulk-h5-to-device: gw/downfold_run.py has 2 match(es), allowlist permits 0.
+    a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.
+  B4b-no-bulk-h5-to-device: gw/head_correction.py has 1 match(es), allowlist permits 0.
+    a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.
+  B4b-no-bulk-h5-to-device: postprocess/rotate_wfn_to_qp.py has 1 match(es), allowlist permits 0.
+    a whole HDF5 dataset materialized on every process. Wavefunctions and mu-class restart tensors must enter through the FFI I/O layer (file_io.slab_io) or a sharded reader -- see bse/bse_io.py's _read_wq_sharded for the per-rank tile read. Owner rule 2026-08-05. RULES_v2 B4b.
+  S1-replicated-3d-out-spec: gw/downfold.py has 1 match(es), allowlist permits 0.
+    fully replicated 3-axis object. If its trailing two axes are mu-class this is the guaranteed-OOM case INVARIANTS 6 exists to prevent -- there must be a path that does not materialize N_mu^2 on any process. If they are N_b-class it is the post-Sigma seam: add the file to `exempt` WITH a reason. RULES_v2 S1.
+  S1-replicated-3d-out-spec: gw/qsgw_head.py has 1 match(es), allowlist permits 0.
+    fully replicated 3-axis object. If its trailing two axes are mu-class this is the guaranteed-OOM case INVARIANTS 6 exists to prevent -- there must be a path that does not materialize N_mu^2 on any process. If they are N_b-class it is the post-Sigma seam: add the file to `exempt` WITH a reason. RULES_v2 S1.
+  S2-scan-explicit-unroll: bse/bse_stack_matvec.py has 3 match(es), allowlist permits 1.
+    lax.scan without an explicit `unroll=`. Write it out even when it is 1 (the default): the dial must be visible at the call site so the next reader knows it exists and any change to it is reviewable. Owner rule 2026-08-05. RULES_v2 S2.
+gate0: CLAIMS rows without evidence token: [254, 341, 349, 384, 514, 519, 523, 625, 672, 694, 720, 823]
+gate0: test evidence OK (jobid 57909062, exit 0)
+gate0: FAIL

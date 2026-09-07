@@ -1,0 +1,694 @@
+HloModule jit_contract_block, is_scheduled=true, entry_computation_layout={(c128[9,40,4,50]{3,2,1,0}, c128[9,4,50,40]{3,2,1,0}, c128[9,4,50,40]{3,2,1,0}, c128[9,40,4,50]{3,2,1,0}, c128[9,30,30]{2,1,0}, /*index=5*/c128[9,50,50]{2,1,0}, c128[9,50,50]{2,1,0}, c128[1,50,50]{2,1,0}, c128[1,50,50]{2,1,0}, s32[])->(c128[9,80,80]{2,1,0}, c128[9,80,80]{2,1,0})}, allow_spmd_sharding_propagation_to_parameters={false,false,false,false,false,false,false,false,false,false}, allow_spmd_sharding_propagation_to_output={true,true}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="b8e5fcdfec63daf67e7e9f7d34995985"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_main_de8dcfbc_fixed/src/gw/wavefunction_bundle.py"
+2 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/41_bisp_parent_route_2026-09-05/prof_s/12_F_full_static_profile/profile_driver.py"
+3 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_main_de8dcfbc_fixed/src/runtime/__init__.py"
+4 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_main_de8dcfbc_fixed/src/gw/gw_jax.py"
+5 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_main_de8dcfbc_fixed/src/gw/sigma_dispatch.py"
+6 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_main_de8dcfbc_fixed/src/gw/photon_sigma.py"
+7 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_main_de8dcfbc_fixed/src/common/contract_bands.py"
+8 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_main_de8dcfbc_fixed/src/gw/cohsex_sigma.py"
+9 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_main_de8dcfbc_fixed/src/gw/greens_function_kernel.py"
+10 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_main_de8dcfbc_fixed/services/distrib_la/src/distrib_la/matmul_plan.py"
+11 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_main_de8dcfbc_fixed/src/ffi/fft.py"
+
+FunctionNames
+1 "Wavefunctions.band_mask"
+2 "<module>"
+3 "run_main_and_finalize"
+4 "captured_main"
+5 "main"
+6 "compute_sigma_xc"
+7 "measured.<locals>.call"
+8 "compute_static_photon_sigma"
+9 "_make_photon_static_block_kernel.<locals>.contract_block"
+10 "_make_photon_static_block_kernel.<locals>.contract_block.<locals>.coh"
+11 "_face_project_kernel.<locals>.project"
+12 "_face_project_kernel.<locals>._project_one"
+13 "_make_photon_static_block_kernel.<locals>.contract_block.<locals>.x_or_sx"
+14 "_make_photon_static_block_kernel.<locals>.contract_block.<locals>.occupied"
+15 "_make_static_convolution.<locals>._convolve"
+16 "build_G"
+17 "_build_G_face"
+18 "merge_spin_centroid"
+19 "_build_kernel.<locals>._local"
+20 "_local_gemm_call"
+21 "_local_gemm_call.<locals>.<genexpr>"
+22 "split_spin_centroid"
+23 "make_gw_conv_ffi.<locals>._gw_conv"
+24 "make_gw_conv_ffi.<locals>._local"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=424 end_line=424 column=14 end_column=14}
+2 {file_name_id=1 function_name_id=1 line=425 end_line=425 column=29 end_column=29}
+3 {file_name_id=2 function_name_id=2 line=78 end_line=78 column=0 end_column=0}
+4 {file_name_id=3 function_name_id=3 line=1985 end_line=1985 column=13 end_column=13}
+5 {file_name_id=2 function_name_id=4 line=72 end_line=72 column=15 end_column=15}
+6 {file_name_id=4 function_name_id=5 line=1012 end_line=1012 column=18 end_column=18}
+7 {file_name_id=5 function_name_id=6 line=1103 end_line=1103 column=37 end_column=37}
+8 {file_name_id=2 function_name_id=7 line=34 end_line=34 column=21 end_column=21}
+9 {file_name_id=6 function_name_id=8 line=443 end_line=443 column=23 end_column=23}
+10 {file_name_id=6 function_name_id=9 line=308 end_line=308 column=12 end_column=12}
+11 {file_name_id=6 function_name_id=9 line=264 end_line=264 column=34 end_column=34}
+12 {file_name_id=1 function_name_id=1 line=426 end_line=426 column=15 end_column=15}
+13 {file_name_id=6 function_name_id=9 line=307 end_line=307 column=30 end_column=30}
+14 {file_name_id=6 function_name_id=10 line=287 end_line=287 column=25 end_column=25}
+15 {file_name_id=7 function_name_id=11 line=399 end_line=399 column=19 end_column=19}
+16 {file_name_id=7 function_name_id=12 line=393 end_line=393 column=12 end_column=12}
+17 {file_name_id=6 function_name_id=13 line=305 end_line=305 column=19 end_column=19}
+18 {file_name_id=6 function_name_id=14 line=272 end_line=272 column=25 end_column=25}
+19 {file_name_id=8 function_name_id=15 line=280 end_line=280 column=23 end_column=23}
+20 {file_name_id=6 function_name_id=10 line=283 end_line=283 column=20 end_column=20}
+21 {file_name_id=9 function_name_id=16 line=227 end_line=227 column=12 end_column=12}
+22 {file_name_id=9 function_name_id=17 line=175 end_line=175 column=12 end_column=12}
+23 {file_name_id=9 function_name_id=17 line=176 end_line=176 column=28 end_column=28}
+24 {file_name_id=6 function_name_id=14 line=268 end_line=268 column=20 end_column=20}
+25 {file_name_id=9 function_name_id=17 line=176 end_line=176 column=8 end_column=8}
+26 {file_name_id=7 function_name_id=18 line=226 end_line=226 column=9 end_column=9}
+27 {file_name_id=7 function_name_id=18 line=230 end_line=230 column=11 end_column=11}
+28 {file_name_id=10 function_name_id=19 line=284 end_line=284 column=15 end_column=15}
+29 {file_name_id=10 function_name_id=20 line=236 end_line=236 column=4 end_column=4}
+30 {file_name_id=10 function_name_id=21 line=236 end_line=236 column=14 end_column=14}
+31 {file_name_id=10 function_name_id=20 line=238 end_line=238 column=15 end_column=15}
+32 {file_name_id=10 function_name_id=20 line=239 end_line=239 column=9 end_column=9}
+33 {file_name_id=10 function_name_id=20 line=242 end_line=242 column=11 end_column=11}
+34 {file_name_id=9 function_name_id=17 line=185 end_line=185 column=8 end_column=8}
+35 {file_name_id=7 function_name_id=22 line=240 end_line=240 column=8 end_column=8}
+36 {file_name_id=7 function_name_id=22 line=241 end_line=241 column=11 end_column=11}
+37 {file_name_id=9 function_name_id=17 line=186 end_line=186 column=8 end_column=8}
+38 {file_name_id=6 function_name_id=10 line=286 end_line=286 column=32 end_column=32}
+39 {file_name_id=8 function_name_id=15 line=280 end_line=280 column=35 end_column=35}
+40 {file_name_id=11 function_name_id=23 line=546 end_line=546 column=15 end_column=15}
+41 {file_name_id=11 function_name_id=24 line=529 end_line=529 column=15 end_column=15}
+42 {file_name_id=7 function_name_id=12 line=388 end_line=388 column=13 end_column=13}
+43 {file_name_id=7 function_name_id=12 line=389 end_line=389 column=17 end_column=17}
+44 {file_name_id=7 function_name_id=12 line=390 end_line=390 column=23 end_column=23}
+45 {file_name_id=6 function_name_id=10 line=292 end_line=292 column=34 end_column=34}
+46 {file_name_id=6 function_name_id=10 line=291 end_line=291 column=27 end_column=27}
+47 {file_name_id=8 function_name_id=15 line=258 end_line=258 column=19 end_column=19}
+48 {file_name_id=6 function_name_id=13 line=300 end_line=300 column=16 end_column=16}
+49 {file_name_id=6 function_name_id=13 line=299 end_line=299 column=27 end_column=27}
+50 {file_name_id=6 function_name_id=14 line=276 end_line=276 column=34 end_column=34}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=1}
+3 {file_location_id=3 parent_frame_id=1}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=9}
+10 {file_location_id=8 parent_frame_id=10}
+11 {file_location_id=10 parent_frame_id=11}
+12 {file_location_id=11 parent_frame_id=11}
+13 {file_location_id=12 parent_frame_id=1}
+14 {file_location_id=13 parent_frame_id=11}
+15 {file_location_id=14 parent_frame_id=15}
+16 {file_location_id=15 parent_frame_id=16}
+17 {file_location_id=16 parent_frame_id=17}
+18 {file_location_id=17 parent_frame_id=18}
+19 {file_location_id=18 parent_frame_id=19}
+20 {file_location_id=15 parent_frame_id=20}
+21 {file_location_id=16 parent_frame_id=21}
+22 {file_location_id=19 parent_frame_id=1}
+23 {file_location_id=20 parent_frame_id=15}
+24 {file_location_id=21 parent_frame_id=24}
+25 {file_location_id=22 parent_frame_id=25}
+26 {file_location_id=23 parent_frame_id=25}
+27 {file_location_id=17 parent_frame_id=27}
+28 {file_location_id=24 parent_frame_id=28}
+29 {file_location_id=21 parent_frame_id=29}
+30 {file_location_id=23 parent_frame_id=30}
+31 {file_location_id=25 parent_frame_id=25}
+32 {file_location_id=26 parent_frame_id=32}
+33 {file_location_id=27 parent_frame_id=32}
+34 {file_location_id=28 parent_frame_id=1}
+35 {file_location_id=29 parent_frame_id=35}
+36 {file_location_id=30 parent_frame_id=36}
+37 {file_location_id=31 parent_frame_id=35}
+38 {file_location_id=32 parent_frame_id=35}
+39 {file_location_id=33 parent_frame_id=35}
+40 {file_location_id=34 parent_frame_id=25}
+41 {file_location_id=35 parent_frame_id=41}
+42 {file_location_id=36 parent_frame_id=41}
+43 {file_location_id=37 parent_frame_id=25}
+44 {file_location_id=35 parent_frame_id=44}
+45 {file_location_id=36 parent_frame_id=44}
+46 {file_location_id=38 parent_frame_id=15}
+47 {file_location_id=39 parent_frame_id=1}
+48 {file_location_id=40 parent_frame_id=48}
+49 {file_location_id=41 parent_frame_id=1}
+50 {file_location_id=42 parent_frame_id=17}
+51 {file_location_id=26 parent_frame_id=51}
+52 {file_location_id=27 parent_frame_id=51}
+53 {file_location_id=43 parent_frame_id=17}
+54 {file_location_id=26 parent_frame_id=54}
+55 {file_location_id=27 parent_frame_id=54}
+56 {file_location_id=44 parent_frame_id=17}
+57 {file_location_id=26 parent_frame_id=57}
+58 {file_location_id=27 parent_frame_id=57}
+59 {file_location_id=45 parent_frame_id=15}
+60 {file_location_id=15 parent_frame_id=60}
+61 {file_location_id=16 parent_frame_id=61}
+62 {file_location_id=17 parent_frame_id=62}
+63 {file_location_id=18 parent_frame_id=63}
+64 {file_location_id=15 parent_frame_id=64}
+65 {file_location_id=16 parent_frame_id=65}
+66 {file_location_id=46 parent_frame_id=15}
+67 {file_location_id=47 parent_frame_id=1}
+68 {file_location_id=42 parent_frame_id=61}
+69 {file_location_id=26 parent_frame_id=69}
+70 {file_location_id=27 parent_frame_id=69}
+71 {file_location_id=43 parent_frame_id=61}
+72 {file_location_id=26 parent_frame_id=72}
+73 {file_location_id=27 parent_frame_id=72}
+74 {file_location_id=44 parent_frame_id=61}
+75 {file_location_id=26 parent_frame_id=75}
+76 {file_location_id=27 parent_frame_id=75}
+77 {file_location_id=17 parent_frame_id=15}
+78 {file_location_id=18 parent_frame_id=78}
+79 {file_location_id=15 parent_frame_id=79}
+80 {file_location_id=16 parent_frame_id=80}
+81 {file_location_id=17 parent_frame_id=81}
+82 {file_location_id=18 parent_frame_id=82}
+83 {file_location_id=15 parent_frame_id=83}
+84 {file_location_id=16 parent_frame_id=84}
+85 {file_location_id=24 parent_frame_id=78}
+86 {file_location_id=21 parent_frame_id=86}
+87 {file_location_id=22 parent_frame_id=87}
+88 {file_location_id=23 parent_frame_id=87}
+89 {file_location_id=17 parent_frame_id=89}
+90 {file_location_id=24 parent_frame_id=90}
+91 {file_location_id=21 parent_frame_id=91}
+92 {file_location_id=23 parent_frame_id=92}
+93 {file_location_id=25 parent_frame_id=87}
+94 {file_location_id=26 parent_frame_id=94}
+95 {file_location_id=27 parent_frame_id=94}
+96 {file_location_id=34 parent_frame_id=87}
+97 {file_location_id=35 parent_frame_id=97}
+98 {file_location_id=36 parent_frame_id=97}
+99 {file_location_id=37 parent_frame_id=87}
+100 {file_location_id=35 parent_frame_id=100}
+101 {file_location_id=36 parent_frame_id=100}
+102 {file_location_id=48 parent_frame_id=15}
+103 {file_location_id=49 parent_frame_id=15}
+104 {file_location_id=42 parent_frame_id=80}
+105 {file_location_id=26 parent_frame_id=105}
+106 {file_location_id=27 parent_frame_id=105}
+107 {file_location_id=43 parent_frame_id=80}
+108 {file_location_id=26 parent_frame_id=108}
+109 {file_location_id=27 parent_frame_id=108}
+110 {file_location_id=44 parent_frame_id=80}
+111 {file_location_id=26 parent_frame_id=111}
+112 {file_location_id=27 parent_frame_id=111}
+113 {file_location_id=50 parent_frame_id=78}
+114 {file_location_id=15 parent_frame_id=114}
+115 {file_location_id=16 parent_frame_id=115}
+116 {file_location_id=17 parent_frame_id=116}
+117 {file_location_id=18 parent_frame_id=117}
+118 {file_location_id=15 parent_frame_id=118}
+119 {file_location_id=16 parent_frame_id=119}
+120 {file_location_id=42 parent_frame_id=115}
+121 {file_location_id=26 parent_frame_id=121}
+122 {file_location_id=27 parent_frame_id=121}
+123 {file_location_id=43 parent_frame_id=115}
+124 {file_location_id=26 parent_frame_id=124}
+125 {file_location_id=27 parent_frame_id=124}
+126 {file_location_id=44 parent_frame_id=115}
+127 {file_location_id=26 parent_frame_id=127}
+128 {file_location_id=27 parent_frame_id=127}
+
+
+%fused_transpose (param_0.1: c128[9,200,200]) -> c128[9,4,50,4,50] {
+  %param_0.1 = c128[9,200,200]{2,1,0} parameter(0)
+  %bitcast.64.1 = c128[9,50,4,50,4]{4,3,2,1,0} bitcast(%param_0.1)
+  ROOT %transpose.183.1 = c128[9,4,50,4,50]{4,3,2,1,0} transpose(%bitcast.64.1), dimensions={0,4,3,2,1}, metadata={op_name="jit(contract_block)/cond/branch_1_fun/transpose" stack_frame_id=42}
+}
+
+%fused_transpose.1 (param_0.3: c128[9,40,80]) -> c128[40,9,80] {
+  %param_0.3 = c128[9,40,80]{1,0,2} parameter(0)
+  %bitcast.95.1 = c128[80,9,40]{2,1,0} bitcast(%param_0.3)
+  ROOT %transpose.259.1 = c128[40,9,80]{2,1,0} transpose(%bitcast.95.1), dimensions={2,1,0}
+}
+
+%fused_transpose.2 (param_0.5: c128[9,40,80]) -> c128[40,9,80] {
+  %param_0.5 = c128[9,40,80]{1,0,2} parameter(0)
+  %bitcast.81.1 = c128[80,9,40]{2,1,0} bitcast(%param_0.5)
+  ROOT %transpose.256.1 = c128[40,9,80]{2,1,0} transpose(%bitcast.81.1), dimensions={2,1,0}
+}
+
+%fused_transpose.3 (param_0.19: c128[9,4,50,4,50]) -> c128[9,50,4,50,4] {
+  %constant_57_1 = c128[] constant((-0.5, 0))
+  %mul.74.3 = c128[9,4,50,4,50]{4,3,2,1,0} broadcast(%constant_57_1), dimensions={}, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_convolve)/mul" stack_frame_id=22}
+  %param_0.19 = c128[9,4,50,4,50]{4,3,2,1,0} parameter(0)
+  %mul.79.3 = c128[9,4,50,4,50]{4,3,2,1,0} multiply(%mul.74.3, %param_0.19), metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_convolve)/mul" stack_frame_id=22}
+  ROOT %transpose.254.1 = c128[9,50,4,50,4]{4,3,2,1,0} transpose(%mul.79.3), dimensions={0,4,3,2,1}, metadata={op_name="jit(contract_block)/cond/branch_1_fun/transpose" stack_frame_id=51}
+}
+
+%fused_transpose.4 (param_0.51: c128[9,4,50,4,50], param_1.29: c128[1,50,50], param_2.13: c128[1,50,50]) -> c128[9,50,4,50,4] {
+  %param_0.51 = c128[9,4,50,4,50]{4,3,2,1,0} parameter(0)
+  %param_1.29 = c128[1,50,50]{2,1,0} parameter(1)
+  %param_2.13 = c128[1,50,50]{2,1,0} parameter(2)
+  %sub.5.3 = c128[1,50,50]{2,1,0} subtract(%param_1.29, %param_2.13), metadata={op_name="jit(contract_block)/cond/branch_1_fun/sub" stack_frame_id=66}
+  %constant_57_2 = c128[] constant((-0.5, 0))
+  %mul.80.3 = c128[1,50,50]{2,1,0} broadcast(%constant_57_2), dimensions={}, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_convolve)/mul" stack_frame_id=67}
+  %mul.81.3 = c128[1,50,50]{2,1,0} multiply(%sub.5.3, %mul.80.3), metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_convolve)/mul" stack_frame_id=67}
+  %bitcast.8.7 = c128[50,50]{1,0} bitcast(%mul.81.3), metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_convolve)/mul" stack_frame_id=67}
+  %mul.83.7 = c128[9,4,50,4,50]{4,3,2,1,0} broadcast(%bitcast.8.7), dimensions={2,4}, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_convolve)/mul" stack_frame_id=67}
+  %mul.84.5 = c128[9,4,50,4,50]{4,3,2,1,0} multiply(%param_0.51, %mul.83.7), metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_convolve)/mul" stack_frame_id=67}
+  %constant_58_1 = c128[] constant((-0.1111111111111111, 0))
+  %mul.85.3 = c128[9,4,50,4,50]{4,3,2,1,0} broadcast(%constant_58_1), dimensions={}, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_convolve)/mul" stack_frame_id=67}
+  %mul.86.3 = c128[9,4,50,4,50]{4,3,2,1,0} multiply(%mul.84.5, %mul.85.3), metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_convolve)/mul" stack_frame_id=67}
+  ROOT %transpose.257.1 = c128[9,50,4,50,4]{4,3,2,1,0} transpose(%mul.86.3), dimensions={0,4,3,2,1}, metadata={op_name="jit(contract_block)/cond/branch_1_fun/transpose" stack_frame_id=69}
+}
+
+%fused_multiply (param_0.33: c128[9,40], param_1.18: c128[9,4,50,40]) -> c128[9,40,50,4] {
+  %param_1.18 = c128[9,4,50,40]{3,2,1,0} parameter(1)
+  %transpose.250.1 = c128[9,40,50,4]{3,2,1,0} transpose(%param_1.18), dimensions={0,3,2,1}
+  %param_0.33 = c128[9,40]{1,0} parameter(0)
+  %broadcast.23.1 = c128[9,40,50,4]{3,2,1,0} broadcast(%param_0.33), dimensions={0,1}, metadata={op_name="jit(contract_block)/cond/branch_1_fun/mul" stack_frame_id=25}
+  ROOT %multiply.11.1 = c128[9,40,50,4]{3,2,1,0} multiply(%transpose.250.1, %broadcast.23.1), metadata={op_name="jit(contract_block)/cond/branch_1_fun/mul" stack_frame_id=25}
+}
+
+%fused_transpose.5 (param_0.36: f64[9,50,4,40], param_1.21: c128[9,40,4,50]) -> c128[9,50,4,40] {
+  %param_1.21 = c128[9,40,4,50]{3,2,1,0} parameter(1)
+  %transpose.249.4 = c128[9,50,4,40]{3,2,1,0} transpose(%param_1.21), dimensions={0,3,2,1}
+  %real.26.3 = f64[9,50,4,40]{3,2,1,0} real(%transpose.249.4), metadata={op_name="jit(contract_block)/cond/branch_1_fun/real" stack_frame_id=21}
+  %param_0.36 = f64[9,50,4,40]{3,2,1,0} parameter(0)
+  ROOT %complex.42.1 = c128[9,50,4,40]{3,2,1,0} complex(%real.26.3, %param_0.36), metadata={op_name="jit(contract_block)/cond/branch_1_fun/complex" stack_frame_id=21}
+}
+
+%fused_transpose.6 (param_0.40: c128[9,40,4,50]) -> f64[9,50,4,40] {
+  %param_0.40 = c128[9,40,4,50]{3,2,1,0} parameter(0)
+  %transpose.249.6 = c128[9,50,4,40]{3,2,1,0} transpose(%param_0.40), dimensions={0,3,2,1}
+  %imag.26.3 = f64[9,50,4,40]{3,2,1,0} imag(%transpose.249.6), metadata={op_name="jit(contract_block)/cond/branch_1_fun/imag" stack_frame_id=21}
+  ROOT %negate.5 = f64[9,50,4,40]{3,2,1,0} negate(%imag.26.3), metadata={op_name="jit(contract_block)/cond/branch_1_fun/neg" stack_frame_id=21}
+}
+
+%fused_transpose.7 (param_0.43: f64[9,50,4,40], param_1.24: c128[9,40,4,50]) -> c128[9,50,4,40] {
+  %param_1.24 = c128[9,40,4,50]{3,2,1,0} parameter(1)
+  %transpose.251.4 = c128[9,50,4,40]{3,2,1,0} transpose(%param_1.24), dimensions={0,3,2,1}
+  %real.27.3 = f64[9,50,4,40]{3,2,1,0} real(%transpose.251.4), metadata={op_name="jit(contract_block)/cond/branch_1_fun/real" stack_frame_id=30}
+  %param_0.43 = f64[9,50,4,40]{3,2,1,0} parameter(0)
+  ROOT %complex.43.1 = c128[9,50,4,40]{3,2,1,0} complex(%real.27.3, %param_0.43), metadata={op_name="jit(contract_block)/cond/branch_1_fun/complex" stack_frame_id=30}
+}
+
+%fused_transpose.8 (param_0.47: c128[9,40,4,50]) -> f64[9,50,4,40] {
+  %param_0.47 = c128[9,40,4,50]{3,2,1,0} parameter(0)
+  %transpose.251.6 = c128[9,50,4,40]{3,2,1,0} transpose(%param_0.47), dimensions={0,3,2,1}
+  %imag.27.3 = f64[9,50,4,40]{3,2,1,0} imag(%transpose.251.6), metadata={op_name="jit(contract_block)/cond/branch_1_fun/imag" stack_frame_id=30}
+  ROOT %negate.1.1 = f64[9,50,4,40]{3,2,1,0} negate(%imag.27.3), metadata={op_name="jit(contract_block)/cond/branch_1_fun/neg" stack_frame_id=30}
+}
+
+%fused_broadcast () -> c128[9,200,200] {
+  %constant_84_1 = c128[] constant((0, 0)), metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map"}
+  ROOT %broadcast_in_dim.50.1 = c128[9,200,200]{2,1,0} broadcast(%constant_84_1), dimensions={}, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=37}
+}
+
+%fused_broadcast.1 () -> c128[9,40,200] {
+  %constant_84_2 = c128[] constant((0, 0)), metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map"}
+  ROOT %broadcast_in_dim.51.1 = c128[9,40,200]{2,1,0} broadcast(%constant_84_2), dimensions={}, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=37}
+}
+
+%fused_broadcast.2 () -> c128[9,40,40] {
+  %constant_84_3 = c128[] constant((0, 0)), metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map"}
+  ROOT %broadcast_in_dim.52.1 = c128[9,40,40]{2,1,0} broadcast(%constant_84_3), dimensions={}, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=37}
+}
+
+%wrapped_subtract_computation (param_0.148: c128[9,50,50], param_1.103: c128[9,50,50]) -> c128[9,50,50] {
+  %param_0.148 = c128[9,50,50]{2,1,0} parameter(0)
+  %param_1.103 = c128[9,50,50]{2,1,0} parameter(1)
+  ROOT %sub.4.1 = c128[9,50,50]{2,1,0} subtract(%param_0.148, %param_1.103), metadata={op_name="jit(contract_block)/cond/branch_1_fun/sub" stack_frame_id=46}
+}
+
+%wrapped_transpose_computation (param_0.149: c128[9,4,50,40]) -> c128[9,40,50,4] {
+  %param_0.149 = c128[9,4,50,40]{3,2,1,0} parameter(0)
+  ROOT %transpose.252.1 = c128[9,40,50,4]{3,2,1,0} transpose(%param_0.149), dimensions={0,3,2,1}
+}
+
+%wrapped_transpose_computation.1 (param_0.150: c128[9,40,40]) -> c128[40,9,40] {
+  %param_0.150 = c128[9,40,40]{2,1,0} parameter(0)
+  ROOT %transpose.255.1 = c128[40,9,40]{2,1,0} transpose(%param_0.150), dimensions={1,0,2}, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/transpose" stack_frame_id=39}
+}
+
+%wrapped_transpose_computation.2 (param_0.151: c128[9,40,40]) -> c128[40,9,40] {
+  %param_0.151 = c128[9,40,40]{2,1,0} parameter(0)
+  ROOT %transpose.258.1 = c128[40,9,40]{2,1,0} transpose(%param_0.151), dimensions={1,0,2}, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/transpose" stack_frame_id=39}
+}
+
+%region_0.7_spmd (param.12: (c128[9,40,4,50], c128[9,40], c128[9,4,50,40], c128[9,40,4,50], c128[9,50,50], /*index=5*/c128[9,50,50], c128[9,4,50,40], c128[1,50,50], c128[1,50,50])) -> (c128[9,80,80], c128[9,80,80]) {
+  %param.12 = (c128[9,40,4,50]{3,2,1,0}, c128[9,40]{1,0}, c128[9,4,50,40]{3,2,1,0}, c128[9,40,4,50]{3,2,1,0}, c128[9,50,50]{2,1,0}, /*index=5*/c128[9,50,50]{2,1,0}, c128[9,4,50,40]{3,2,1,0}, c128[1,50,50]{2,1,0}, c128[1,50,50]{2,1,0}) parameter(0)
+  %get-tuple-element.82.0 = c128[9,40,4,50]{3,2,1,0} get-tuple-element(%param.12), index=3
+  %input_transpose_fusion.5 = f64[9,50,4,40]{3,2,1,0} fusion(%get-tuple-element.82.0), kind=kInput, calls=%fused_transpose.8, metadata={op_name="jit(contract_block)/cond/branch_1_fun/neg" deduplicated_name="input_transpose_fusion.3" stack_frame_id=30}
+  %input_transpose_fusion.4 = c128[9,50,4,40]{3,2,1,0} fusion(%input_transpose_fusion.5, %get-tuple-element.82.0), kind=kInput, calls=%fused_transpose.7, metadata={op_name="jit(contract_block)/cond/branch_1_fun/complex" deduplicated_name="input_transpose_fusion.2" stack_frame_id=30}
+  %bitcast.58.0 = c128[9,200,40]{2,1,0} bitcast(%input_transpose_fusion.4), metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/transpose" stack_frame_id=36}
+  %loop_broadcast_fusion = c128[9,200,200]{2,1,0} fusion(), kind=kLoop, calls=%fused_broadcast, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/broadcast_in_dim" deduplicated_name="loop_broadcast_fusion" stack_frame_id=37}
+  %get-tuple-element.34.0 = c128[9,40]{1,0} get-tuple-element(%param.12), index=1
+  %get-tuple-element.81.0 = c128[9,4,50,40]{3,2,1,0} get-tuple-element(%param.12), index=2
+  %loop_multiply_fusion = c128[9,40,50,4]{3,2,1,0} fusion(%get-tuple-element.34.0, %get-tuple-element.81.0), kind=kLoop, calls=%fused_multiply, metadata={op_name="jit(contract_block)/cond/branch_1_fun/mul" deduplicated_name="loop_multiply_fusion" stack_frame_id=25}
+  %bitcast.47.0 = c128[9,40,200]{2,1,0} bitcast(%loop_multiply_fusion), metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/transpose" stack_frame_id=36}
+  %ffi_call.36 = c128[9,200,200]{2,1,0} custom-call(%bitcast.47.0, %bitcast.58.0, %loop_broadcast_fusion), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[9,40,200]{2,1,0}, c128[9,200,40]{2,1,0}, c128[9,200,200]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call" stack_frame_id=38}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 93914436686400 : i64, k = 80 : i64, lld_a = 200 : i64, lld_b = 40 : i64, lld_c = 200 : i64, m = 400 : i64, mb_a = 200 : i64, mb_b = 40 : i64, mb_c = 200 : i64, n = 400 : i64, nb_a = 40 : i64, nb_b = 200 : i64, nb_c = 200 : i64, nq = 9 : i64, transa = 0 : i64, transb = 0 : i64}
+  %loop_transpose_fusion = c128[9,4,50,4,50]{4,3,2,1,0} fusion(%ffi_call.36), kind=kLoop, calls=%fused_transpose, metadata={op_name="jit(contract_block)/cond/branch_1_fun/transpose" deduplicated_name="loop_transpose_fusion" stack_frame_id=42}
+  %copy.73 = c128[9,4,50,4,50]{4,3,2,1,0} copy(%loop_transpose_fusion)
+  %get-tuple-element.36.0 = c128[9,50,50]{2,1,0} get-tuple-element(%param.12), index=4
+  %get-tuple-element.46.0 = c128[9,50,50]{2,1,0} get-tuple-element(%param.12), index=5
+  %wrapped_subtract = c128[9,50,50]{2,1,0} fusion(%get-tuple-element.36.0, %get-tuple-element.46.0), kind=kLoop, calls=%wrapped_subtract_computation, metadata={op_name="jit(contract_block)/cond/branch_1_fun/sub" stack_frame_id=46}
+  %ffi_call.37 = c128[9,4,50,4,50]{4,3,2,1,0} custom-call(%copy.73, %wrapped_subtract), custom_call_target="lorrax_mklfft_gw_conv", operand_layout_constraints={c128[9,4,50,4,50]{4,3,2,1,0}, c128[9,50,50]{2,1,0}}, output_to_operand_aliasing={{}: (0, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_convolve)/shard_map/ffi_call" stack_frame_id=49}, backend_config={nkx = 3 : i64, nky = 3 : i64, nkz = 1 : i64, scale_f = -0.1111111111111111 : f64, scale_i = 0.33333333333333331 : f64}
+  %loop_transpose_fusion.1 = c128[9,50,4,50,4]{4,3,2,1,0} fusion(%ffi_call.37), kind=kLoop, calls=%fused_transpose.3, metadata={op_name="jit(contract_block)/cond/branch_1_fun/transpose" stack_frame_id=51}
+  %bitcast.72.0 = c128[9,200,200]{2,1,0} bitcast(%loop_transpose_fusion.1), metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/transpose" stack_frame_id=36}
+  %loop_broadcast_fusion.1 = c128[9,40,200]{2,1,0} fusion(), kind=kLoop, calls=%fused_broadcast.1, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/broadcast_in_dim" deduplicated_name="loop_broadcast_fusion.1" stack_frame_id=37}
+  %copy.74 = c128[9,40,200]{2,1,0} copy(%loop_broadcast_fusion.1)
+  %get-tuple-element.85.0 = c128[9,4,50,40]{3,2,1,0} get-tuple-element(%param.12), index=6
+  %wrapped_transpose = c128[9,40,50,4]{3,2,1,0} fusion(%get-tuple-element.85.0), kind=kLoop, calls=%wrapped_transpose_computation
+  %bitcast.77.0 = c128[9,40,200]{2,1,0} bitcast(%wrapped_transpose), metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/transpose" stack_frame_id=36}
+  %ffi_call.38 = c128[9,40,200]{2,1,0} custom-call(%bitcast.72.0, %bitcast.77.0, %copy.74), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[9,200,200]{2,1,0}, c128[9,40,200]{2,1,0}, c128[9,40,200]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call" stack_frame_id=38}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 93914436686400 : i64, k = 400 : i64, lld_a = 200 : i64, lld_b = 200 : i64, lld_c = 200 : i64, m = 400 : i64, mb_a = 200 : i64, mb_b = 200 : i64, mb_c = 200 : i64, n = 80 : i64, nb_a = 200 : i64, nb_b = 40 : i64, nb_c = 40 : i64, nq = 9 : i64, transa = 0 : i64, transb = 0 : i64}
+  %get-tuple-element.79.0 = c128[9,40,4,50]{3,2,1,0} get-tuple-element(%param.12), index=0
+  %input_transpose_fusion.3 = f64[9,50,4,40]{3,2,1,0} fusion(%get-tuple-element.79.0), kind=kInput, calls=%fused_transpose.6, metadata={op_name="jit(contract_block)/cond/branch_1_fun/neg" deduplicated_name="input_transpose_fusion.3" stack_frame_id=21}
+  %input_transpose_fusion.2 = c128[9,50,4,40]{3,2,1,0} fusion(%input_transpose_fusion.3, %get-tuple-element.79.0), kind=kInput, calls=%fused_transpose.5, metadata={op_name="jit(contract_block)/cond/branch_1_fun/complex" deduplicated_name="input_transpose_fusion.2" stack_frame_id=21}
+  %bitcast.40.0 = c128[9,200,40]{2,1,0} bitcast(%input_transpose_fusion.2), metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/transpose" stack_frame_id=36}
+  %loop_broadcast_fusion.2 = c128[9,40,40]{2,1,0} fusion(), kind=kLoop, calls=%fused_broadcast.2, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/broadcast_in_dim" deduplicated_name="loop_broadcast_fusion.2" stack_frame_id=37}
+  %copy.75 = c128[9,40,40]{2,1,0} copy(%loop_broadcast_fusion.2)
+  %ffi_call.39 = c128[9,40,40]{2,1,0} custom-call(%bitcast.40.0, %ffi_call.38, %copy.75), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[9,200,40]{2,1,0}, c128[9,40,200]{2,1,0}, c128[9,40,40]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call" stack_frame_id=38}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 93914436686400 : i64, k = 400 : i64, lld_a = 40 : i64, lld_b = 200 : i64, lld_c = 40 : i64, m = 80 : i64, mb_a = 40 : i64, mb_b = 200 : i64, mb_c = 40 : i64, n = 80 : i64, nb_a = 200 : i64, nb_b = 40 : i64, nb_c = 40 : i64, nq = 9 : i64, transa = 0 : i64, transb = 0 : i64}
+  %wrapped_transpose.1 = c128[40,9,40]{2,1,0} fusion(%ffi_call.39), kind=kLoop, calls=%wrapped_transpose_computation.1, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/transpose" stack_frame_id=39}
+  %bitcast.303.0 = c128[9,40,40]{1,0,2} bitcast(%wrapped_transpose.1)
+  %get-tuple-element.50.0 = c128[1,50,50]{2,1,0} get-tuple-element(%param.12), index=7
+  %get-tuple-element.52.0 = c128[1,50,50]{2,1,0} get-tuple-element(%param.12), index=8
+  %loop_transpose_fusion.2 = c128[9,50,4,50,4]{4,3,2,1,0} fusion(%loop_transpose_fusion, %get-tuple-element.50.0, %get-tuple-element.52.0), kind=kLoop, calls=%fused_transpose.4, metadata={op_name="jit(contract_block)/cond/branch_1_fun/transpose" stack_frame_id=69}
+  %bitcast.91.0 = c128[9,200,200]{2,1,0} bitcast(%loop_transpose_fusion.2), metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/transpose" stack_frame_id=36}
+  %ffi_call.40 = c128[9,40,200]{2,1,0} custom-call(%bitcast.91.0, %bitcast.77.0, %loop_broadcast_fusion.1), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[9,200,200]{2,1,0}, c128[9,40,200]{2,1,0}, c128[9,40,200]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call" stack_frame_id=38}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 93914436686400 : i64, k = 400 : i64, lld_a = 200 : i64, lld_b = 200 : i64, lld_c = 200 : i64, m = 400 : i64, mb_a = 200 : i64, mb_b = 200 : i64, mb_c = 200 : i64, n = 80 : i64, nb_a = 200 : i64, nb_b = 40 : i64, nb_c = 40 : i64, nq = 9 : i64, transa = 0 : i64, transb = 0 : i64}
+  %ffi_call.41 = c128[9,40,40]{2,1,0} custom-call(%bitcast.40.0, %ffi_call.40, %loop_broadcast_fusion.2), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[9,200,40]{2,1,0}, c128[9,40,200]{2,1,0}, c128[9,40,40]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/ffi_call" stack_frame_id=38}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 93914436686400 : i64, k = 400 : i64, lld_a = 40 : i64, lld_b = 200 : i64, lld_c = 40 : i64, m = 80 : i64, mb_a = 40 : i64, mb_b = 200 : i64, mb_c = 40 : i64, n = 80 : i64, nb_a = 200 : i64, nb_b = 40 : i64, nb_c = 40 : i64, nq = 9 : i64, transa = 0 : i64, transb = 0 : i64}
+  %wrapped_transpose.2 = c128[40,9,40]{2,1,0} fusion(%ffi_call.41), kind=kLoop, calls=%wrapped_transpose_computation.2, metadata={op_name="jit(contract_block)/cond/branch_1_fun/jit(_local)/shard_map/transpose" stack_frame_id=39}
+  %bitcast.311.0 = c128[9,40,40]{1,0,2} bitcast(%wrapped_transpose.2)
+  %all-gather-start = ((c128[9,40,40]{1,0,2}, c128[9,40,40]{1,0,2}), (c128[9,40,80]{1,0,2}, c128[9,40,80]{1,0,2})) all-gather-start(%bitcast.303.0, %bitcast.311.0), channel_id=1, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+  %all-gather-done = (c128[9,40,80]{1,0,2}, c128[9,40,80]{1,0,2}) all-gather-done(%all-gather-start)
+  %get-tuple-element.100 = c128[9,40,80]{1,0,2} get-tuple-element(%all-gather-done), index=0
+  %input_transpose_fusion.1 = c128[40,9,80]{2,1,0} fusion(%get-tuple-element.100), kind=kInput, calls=%fused_transpose.2
+  %bitcast.307.0 = c128[9,40,80]{2,0,1} bitcast(%input_transpose_fusion.1)
+  %get-tuple-element.101 = c128[9,40,80]{1,0,2} get-tuple-element(%all-gather-done), index=1
+  %input_transpose_fusion = c128[40,9,80]{2,1,0} fusion(%get-tuple-element.101), kind=kInput, calls=%fused_transpose.1
+  %bitcast.315.0 = c128[9,40,80]{2,0,1} bitcast(%input_transpose_fusion)
+  %all-gather-start.1 = ((c128[9,40,80]{2,0,1}, c128[9,40,80]{2,0,1}), (c128[9,80,80]{2,0,1}, c128[9,80,80]{2,0,1})) all-gather-start(%bitcast.307.0, %bitcast.315.0), channel_id=2, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+  ROOT %all-gather-done.1 = (c128[9,80,80]{2,0,1}, c128[9,80,80]{2,0,1}) all-gather-done(%all-gather-start.1)
+}
+
+%region_2.9_spmd.clone (param.38: (c128[9,50,50], c128[1,50,50])) -> (c128[9,50,50], c128[1,50,50]) {
+  ROOT %param.38 = (c128[9,50,50]{2,1,0}, c128[1,50,50]{2,1,0}) parameter(0)
+}
+
+%region_2.9_spmd.clone.1 (param.39: (c128[9,50,50], c128[1,50,50])) -> (c128[9,50,50], c128[1,50,50]) {
+  %param.39 = (c128[9,50,50]{2,1,0}, c128[1,50,50]{2,1,0}) parameter(0)
+  %get-tuple-element.110 = c128[9,50,50]{2,1,0} get-tuple-element(%param.39), index=0
+  %copy.81 = c128[9,50,50]{2,1,0} copy(%get-tuple-element.110)
+  %get-tuple-element.111 = c128[1,50,50]{2,1,0} get-tuple-element(%param.39), index=1
+  %copy.82 = c128[1,50,50]{2,1,0} copy(%get-tuple-element.111)
+  ROOT %tuple.30 = (c128[9,50,50]{2,1,0}, c128[1,50,50]{2,1,0}) tuple(%copy.81, %copy.82)
+}
+
+%fused_transpose.9 (param_0.56: c128[9,200,200]) -> c128[9,4,50,4,50] {
+  %param_0.56 = c128[9,200,200]{2,1,0} parameter(0)
+  %bitcast.137.1 = c128[9,50,4,50,4]{4,3,2,1,0} bitcast(%param_0.56)
+  ROOT %transpose.207.1 = c128[9,4,50,4,50]{4,3,2,1,0} transpose(%bitcast.137.1), dimensions={0,4,3,2,1}, metadata={op_name="jit(contract_block)/cond/branch_0_fun/transpose" stack_frame_id=98}
+}
+
+%fused_transpose.10 (param_0.58: c128[9,40,80]) -> c128[40,9,80] {
+  %param_0.58 = c128[9,40,80]{1,0,2} parameter(0)
+  %bitcast.168.1 = c128[80,9,40]{2,1,0} bitcast(%param_0.58)
+  ROOT %transpose.270.1 = c128[40,9,80]{2,1,0} transpose(%bitcast.168.1), dimensions={2,1,0}
+}
+
+%fused_transpose.11 (param_0.60: c128[9,40,80]) -> c128[40,9,80] {
+  %param_0.60 = c128[9,40,80]{1,0,2} parameter(0)
+  %bitcast.154.1 = c128[80,9,40]{2,1,0} bitcast(%param_0.60)
+  ROOT %transpose.267.1 = c128[40,9,80]{2,1,0} transpose(%bitcast.154.1), dimensions={2,1,0}
+}
+
+%fused_transpose.12 (param_0.98: c128[9,4,50,4,50], param_1.51: c128[1,50,50]) -> c128[9,50,4,50,4] {
+  %param_0.98 = c128[9,4,50,4,50]{4,3,2,1,0} parameter(0)
+  %param_1.51 = c128[1,50,50]{2,1,0} parameter(1)
+  %bitcast.19.7 = c128[50,50]{1,0} bitcast(%param_1.51), metadata={op_name="jit(contract_block)/cond/branch_0_fun/cond" stack_frame_id=103}
+  %mul.92.7 = c128[9,4,50,4,50]{4,3,2,1,0} broadcast(%bitcast.19.7), dimensions={2,4}, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_convolve)/mul" stack_frame_id=67}
+  %mul.93.5 = c128[9,4,50,4,50]{4,3,2,1,0} multiply(%param_0.98, %mul.92.7), metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_convolve)/mul" stack_frame_id=67}
+  %constant_65_1 = c128[] constant((-0.1111111111111111, 0))
+  %mul.94.3 = c128[9,4,50,4,50]{4,3,2,1,0} broadcast(%constant_65_1), dimensions={}, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_convolve)/mul" stack_frame_id=67}
+  %mul.95.3 = c128[9,4,50,4,50]{4,3,2,1,0} multiply(%mul.93.5, %mul.94.3), metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_convolve)/mul" stack_frame_id=67}
+  ROOT %transpose.268.1 = c128[9,50,4,50,4]{4,3,2,1,0} transpose(%mul.95.3), dimensions={0,4,3,2,1}, metadata={op_name="jit(contract_block)/cond/branch_0_fun/transpose" stack_frame_id=121}
+}
+
+%fused_multiply.1 (param_0.82: c128[9,40], param_1.43: c128[9,4,50,40]) -> c128[9,40,50,4] {
+  %param_1.43 = c128[9,4,50,40]{3,2,1,0} parameter(1)
+  %transpose.261.1 = c128[9,40,50,4]{3,2,1,0} transpose(%param_1.43), dimensions={0,3,2,1}
+  %param_0.82 = c128[9,40]{1,0} parameter(0)
+  %broadcast.24.1 = c128[9,40,50,4]{3,2,1,0} broadcast(%param_0.82), dimensions={0,1}, metadata={op_name="jit(contract_block)/cond/branch_0_fun/mul" stack_frame_id=87}
+  ROOT %multiply.12.1 = c128[9,40,50,4]{3,2,1,0} multiply(%transpose.261.1, %broadcast.24.1), metadata={op_name="jit(contract_block)/cond/branch_0_fun/mul" stack_frame_id=87}
+}
+
+%fused_transpose.13 (param_0.85: f64[9,50,4,40], param_1.46: c128[9,40,4,50]) -> c128[9,50,4,40] {
+  %param_1.46 = c128[9,40,4,50]{3,2,1,0} parameter(1)
+  %transpose.260.4 = c128[9,50,4,40]{3,2,1,0} transpose(%param_1.46), dimensions={0,3,2,1}
+  %real.28.3 = f64[9,50,4,40]{3,2,1,0} real(%transpose.260.4), metadata={op_name="jit(contract_block)/cond/branch_0_fun/real" stack_frame_id=84}
+  %param_0.85 = f64[9,50,4,40]{3,2,1,0} parameter(0)
+  ROOT %complex.44.1 = c128[9,50,4,40]{3,2,1,0} complex(%real.28.3, %param_0.85), metadata={op_name="jit(contract_block)/cond/branch_0_fun/complex" stack_frame_id=84}
+}
+
+%fused_transpose.14 (param_0.89: c128[9,40,4,50]) -> f64[9,50,4,40] {
+  %param_0.89 = c128[9,40,4,50]{3,2,1,0} parameter(0)
+  %transpose.260.6 = c128[9,50,4,40]{3,2,1,0} transpose(%param_0.89), dimensions={0,3,2,1}
+  %imag.28.3 = f64[9,50,4,40]{3,2,1,0} imag(%transpose.260.6), metadata={op_name="jit(contract_block)/cond/branch_0_fun/imag" stack_frame_id=84}
+  ROOT %negate.2.1 = f64[9,50,4,40]{3,2,1,0} negate(%imag.28.3), metadata={op_name="jit(contract_block)/cond/branch_0_fun/neg" stack_frame_id=84}
+}
+
+%fused_transpose.15 (param_0.92: f64[9,50,4,40], param_1.49: c128[9,40,4,50]) -> c128[9,50,4,40] {
+  %param_1.49 = c128[9,40,4,50]{3,2,1,0} parameter(1)
+  %transpose.262.4 = c128[9,50,4,40]{3,2,1,0} transpose(%param_1.49), dimensions={0,3,2,1}
+  %real.29.3 = f64[9,50,4,40]{3,2,1,0} real(%transpose.262.4), metadata={op_name="jit(contract_block)/cond/branch_0_fun/real" stack_frame_id=92}
+  %param_0.92 = f64[9,50,4,40]{3,2,1,0} parameter(0)
+  ROOT %complex.45.1 = c128[9,50,4,40]{3,2,1,0} complex(%real.29.3, %param_0.92), metadata={op_name="jit(contract_block)/cond/branch_0_fun/complex" stack_frame_id=92}
+}
+
+%fused_transpose.16 (param_0.96: c128[9,40,4,50]) -> f64[9,50,4,40] {
+  %param_0.96 = c128[9,40,4,50]{3,2,1,0} parameter(0)
+  %transpose.262.6 = c128[9,50,4,40]{3,2,1,0} transpose(%param_0.96), dimensions={0,3,2,1}
+  %imag.29.3 = f64[9,50,4,40]{3,2,1,0} imag(%transpose.262.6), metadata={op_name="jit(contract_block)/cond/branch_0_fun/imag" stack_frame_id=92}
+  ROOT %negate.3.1 = f64[9,50,4,40]{3,2,1,0} negate(%imag.29.3), metadata={op_name="jit(contract_block)/cond/branch_0_fun/neg" stack_frame_id=92}
+}
+
+%fused_compare (param_0.97: s32[]) -> pred[] {
+  %param_0.97 = s32[] parameter(0)
+  %constant_64_1 = s32[] constant(0)
+  ROOT %eq.4.1 = pred[] compare(%param_0.97, %constant_64_1), direction=EQ, metadata={op_name="jit(contract_block)/cond/branch_0_fun/eq" stack_frame_id=102}
+}
+
+%fused_broadcast.3 () -> c128[9,200,200] {
+  %constant_89_1 = c128[] constant((0, 0)), metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map"}
+  ROOT %broadcast_in_dim.55.1 = c128[9,200,200]{2,1,0} broadcast(%constant_89_1), dimensions={}, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=37}
+}
+
+%fused_broadcast.4 () -> c128[9,40,200] {
+  %constant_89_2 = c128[] constant((0, 0)), metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map"}
+  ROOT %broadcast_in_dim.56.1 = c128[9,40,200]{2,1,0} broadcast(%constant_89_2), dimensions={}, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=37}
+}
+
+%fused_broadcast.5 () -> c128[9,40,40] {
+  %constant_89_3 = c128[] constant((0, 0)), metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map"}
+  ROOT %broadcast_in_dim.57.1 = c128[9,40,40]{2,1,0} broadcast(%constant_89_3), dimensions={}, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=37}
+}
+
+%wrapped_transpose_computation.3 (param_0.152: c128[9,4,50,4,50]) -> c128[9,50,4,50,4] {
+  %param_0.152 = c128[9,4,50,4,50]{4,3,2,1,0} parameter(0)
+  ROOT %transpose.265.1 = c128[9,50,4,50,4]{4,3,2,1,0} transpose(%param_0.152), dimensions={0,4,3,2,1}, metadata={op_name="jit(contract_block)/cond/branch_0_fun/transpose" stack_frame_id=105}
+}
+
+%wrapped_transpose_computation.4 (param_0.153: c128[9,4,50,40]) -> c128[9,40,50,4] {
+  %param_0.153 = c128[9,4,50,40]{3,2,1,0} parameter(0)
+  ROOT %transpose.263.1 = c128[9,40,50,4]{3,2,1,0} transpose(%param_0.153), dimensions={0,3,2,1}
+}
+
+%wrapped_transpose_computation.5 (param_0.154: c128[9,40,40]) -> c128[40,9,40] {
+  %param_0.154 = c128[9,40,40]{2,1,0} parameter(0)
+  ROOT %transpose.266.1 = c128[40,9,40]{2,1,0} transpose(%param_0.154), dimensions={1,0,2}, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/transpose" stack_frame_id=39}
+}
+
+%wrapped_transpose_computation.6 (param_0.155: c128[9,40,40]) -> c128[40,9,40] {
+  %param_0.155 = c128[9,40,40]{2,1,0} parameter(0)
+  ROOT %transpose.269.1 = c128[40,9,40]{2,1,0} transpose(%param_0.155), dimensions={1,0,2}, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/transpose" stack_frame_id=39}
+}
+
+%region_1.16_spmd (param.27: (c128[9,40,4,50], c128[9,40], c128[9,4,50,40], c128[9,40,4,50], s32[], /*index=5*/c128[9,50,50], c128[1,50,50], c128[9,50,50], c128[1,50,50], c128[9,4,50,40])) -> (c128[9,80,80], c128[9,80,80]) {
+  %param.27 = (c128[9,40,4,50]{3,2,1,0}, c128[9,40]{1,0}, c128[9,4,50,40]{3,2,1,0}, c128[9,40,4,50]{3,2,1,0}, s32[], /*index=5*/c128[9,50,50]{2,1,0}, c128[1,50,50]{2,1,0}, c128[9,50,50]{2,1,0}, c128[1,50,50]{2,1,0}, c128[9,4,50,40]{3,2,1,0}) parameter(0)
+  %get-tuple-element.91.0 = c128[9,40,4,50]{3,2,1,0} get-tuple-element(%param.27), index=3
+  %input_transpose_fusion.11 = f64[9,50,4,40]{3,2,1,0} fusion(%get-tuple-element.91.0), kind=kInput, calls=%fused_transpose.16, metadata={op_name="jit(contract_block)/cond/branch_0_fun/neg" deduplicated_name="input_transpose_fusion.3" stack_frame_id=92}
+  %input_transpose_fusion.10 = c128[9,50,4,40]{3,2,1,0} fusion(%input_transpose_fusion.11, %get-tuple-element.91.0), kind=kInput, calls=%fused_transpose.15, metadata={op_name="jit(contract_block)/cond/branch_0_fun/complex" deduplicated_name="input_transpose_fusion.2" stack_frame_id=92}
+  %bitcast.131.0 = c128[9,200,40]{2,1,0} bitcast(%input_transpose_fusion.10), metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/transpose" stack_frame_id=36}
+  %loop_broadcast_fusion.3 = c128[9,200,200]{2,1,0} fusion(), kind=kLoop, calls=%fused_broadcast.3, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/broadcast_in_dim" deduplicated_name="loop_broadcast_fusion" stack_frame_id=37}
+  %get-tuple-element.58.0 = c128[9,40]{1,0} get-tuple-element(%param.27), index=1
+  %get-tuple-element.90.0 = c128[9,4,50,40]{3,2,1,0} get-tuple-element(%param.27), index=2
+  %loop_multiply_fusion.1 = c128[9,40,50,4]{3,2,1,0} fusion(%get-tuple-element.58.0, %get-tuple-element.90.0), kind=kLoop, calls=%fused_multiply.1, metadata={op_name="jit(contract_block)/cond/branch_0_fun/mul" deduplicated_name="loop_multiply_fusion" stack_frame_id=87}
+  %bitcast.120.0 = c128[9,40,200]{2,1,0} bitcast(%loop_multiply_fusion.1), metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/transpose" stack_frame_id=36}
+  %ffi_call.42 = c128[9,200,200]{2,1,0} custom-call(%bitcast.120.0, %bitcast.131.0, %loop_broadcast_fusion.3), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[9,40,200]{2,1,0}, c128[9,200,40]{2,1,0}, c128[9,200,200]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call" stack_frame_id=38}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 93914436686400 : i64, k = 80 : i64, lld_a = 200 : i64, lld_b = 40 : i64, lld_c = 200 : i64, m = 400 : i64, mb_a = 200 : i64, mb_b = 40 : i64, mb_c = 200 : i64, n = 400 : i64, nb_a = 40 : i64, nb_b = 200 : i64, nb_c = 200 : i64, nq = 9 : i64, transa = 0 : i64, transb = 0 : i64}
+  %loop_transpose_fusion.3 = c128[9,4,50,4,50]{4,3,2,1,0} fusion(%ffi_call.42), kind=kLoop, calls=%fused_transpose.9, metadata={op_name="jit(contract_block)/cond/branch_0_fun/transpose" deduplicated_name="loop_transpose_fusion" stack_frame_id=98}
+  %copy.83 = c128[9,4,50,4,50]{4,3,2,1,0} copy(%loop_transpose_fusion.3)
+  %get-tuple-element.72.0 = c128[9,50,50]{2,1,0} get-tuple-element(%param.27), index=5
+  %get-tuple-element.73.0 = c128[1,50,50]{2,1,0} get-tuple-element(%param.27), index=6
+  %tuple.12.0 = (c128[9,50,50]{2,1,0}, c128[1,50,50]{2,1,0}) tuple(%get-tuple-element.72.0, %get-tuple-element.73.0), metadata={op_name="jit(contract_block)/cond/branch_0_fun/cond" stack_frame_id=103}
+  %get-tuple-element.74.0 = c128[9,50,50]{2,1,0} get-tuple-element(%param.27), index=7
+  %get-tuple-element.75.0 = c128[1,50,50]{2,1,0} get-tuple-element(%param.27), index=8
+  %tuple.14.0 = (c128[9,50,50]{2,1,0}, c128[1,50,50]{2,1,0}) tuple(%get-tuple-element.74.0, %get-tuple-element.75.0), metadata={op_name="jit(contract_block)/cond/branch_0_fun/cond" stack_frame_id=103}
+  %get-tuple-element.71.0 = s32[] get-tuple-element(%param.27), index=4
+  %loop_compare_fusion = pred[] fusion(%get-tuple-element.71.0), kind=kLoop, calls=%fused_compare, metadata={op_name="jit(contract_block)/cond/branch_0_fun/eq" stack_frame_id=102}
+  %conditional.2 = (c128[9,50,50]{2,1,0}, c128[1,50,50]{2,1,0}) conditional(%loop_compare_fusion, %tuple.12.0, %tuple.14.0), true_computation=%region_2.9_spmd.clone, false_computation=%region_2.9_spmd.clone.1, metadata={op_name="jit(contract_block)/cond/branch_0_fun/cond" stack_frame_id=103}
+  %get-tuple-element.76.0 = c128[9,50,50]{2,1,0} get-tuple-element(%conditional.2), index=0, metadata={op_name="jit(contract_block)/cond/branch_0_fun/cond" stack_frame_id=103}
+  %ffi_call.43 = c128[9,4,50,4,50]{4,3,2,1,0} custom-call(%copy.83, %get-tuple-element.76.0), custom_call_target="lorrax_mklfft_gw_conv", operand_layout_constraints={c128[9,4,50,4,50]{4,3,2,1,0}, c128[9,50,50]{2,1,0}}, output_to_operand_aliasing={{}: (0, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_convolve)/shard_map/ffi_call" stack_frame_id=49}, backend_config={nkx = 3 : i64, nky = 3 : i64, nkz = 1 : i64, scale_f = -0.1111111111111111 : f64, scale_i = 0.33333333333333331 : f64}
+  %wrapped_transpose.3 = c128[9,50,4,50,4]{4,3,2,1,0} fusion(%ffi_call.43), kind=kLoop, calls=%wrapped_transpose_computation.3, metadata={op_name="jit(contract_block)/cond/branch_0_fun/transpose" stack_frame_id=105}
+  %bitcast.145.0 = c128[9,200,200]{2,1,0} bitcast(%wrapped_transpose.3), metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/transpose" stack_frame_id=36}
+  %loop_broadcast_fusion.4 = c128[9,40,200]{2,1,0} fusion(), kind=kLoop, calls=%fused_broadcast.4, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/broadcast_in_dim" deduplicated_name="loop_broadcast_fusion.1" stack_frame_id=37}
+  %copy.84 = c128[9,40,200]{2,1,0} copy(%loop_broadcast_fusion.4)
+  %get-tuple-element.97.0 = c128[9,4,50,40]{3,2,1,0} get-tuple-element(%param.27), index=9
+  %wrapped_transpose.4 = c128[9,40,50,4]{3,2,1,0} fusion(%get-tuple-element.97.0), kind=kLoop, calls=%wrapped_transpose_computation.4
+  %bitcast.150.0 = c128[9,40,200]{2,1,0} bitcast(%wrapped_transpose.4), metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/transpose" stack_frame_id=36}
+  %ffi_call.44 = c128[9,40,200]{2,1,0} custom-call(%bitcast.145.0, %bitcast.150.0, %copy.84), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[9,200,200]{2,1,0}, c128[9,40,200]{2,1,0}, c128[9,40,200]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call" stack_frame_id=38}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 93914436686400 : i64, k = 400 : i64, lld_a = 200 : i64, lld_b = 200 : i64, lld_c = 200 : i64, m = 400 : i64, mb_a = 200 : i64, mb_b = 200 : i64, mb_c = 200 : i64, n = 80 : i64, nb_a = 200 : i64, nb_b = 40 : i64, nb_c = 40 : i64, nq = 9 : i64, transa = 0 : i64, transb = 0 : i64}
+  %get-tuple-element.88.0 = c128[9,40,4,50]{3,2,1,0} get-tuple-element(%param.27), index=0
+  %input_transpose_fusion.9 = f64[9,50,4,40]{3,2,1,0} fusion(%get-tuple-element.88.0), kind=kInput, calls=%fused_transpose.14, metadata={op_name="jit(contract_block)/cond/branch_0_fun/neg" deduplicated_name="input_transpose_fusion.3" stack_frame_id=84}
+  %input_transpose_fusion.8 = c128[9,50,4,40]{3,2,1,0} fusion(%input_transpose_fusion.9, %get-tuple-element.88.0), kind=kInput, calls=%fused_transpose.13, metadata={op_name="jit(contract_block)/cond/branch_0_fun/complex" deduplicated_name="input_transpose_fusion.2" stack_frame_id=84}
+  %bitcast.113.0 = c128[9,200,40]{2,1,0} bitcast(%input_transpose_fusion.8), metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/transpose" stack_frame_id=36}
+  %loop_broadcast_fusion.5 = c128[9,40,40]{2,1,0} fusion(), kind=kLoop, calls=%fused_broadcast.5, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/broadcast_in_dim" deduplicated_name="loop_broadcast_fusion.2" stack_frame_id=37}
+  %copy.85 = c128[9,40,40]{2,1,0} copy(%loop_broadcast_fusion.5)
+  %ffi_call.45 = c128[9,40,40]{2,1,0} custom-call(%bitcast.113.0, %ffi_call.44, %copy.85), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[9,200,40]{2,1,0}, c128[9,40,200]{2,1,0}, c128[9,40,40]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call" stack_frame_id=38}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 93914436686400 : i64, k = 400 : i64, lld_a = 40 : i64, lld_b = 200 : i64, lld_c = 40 : i64, m = 80 : i64, mb_a = 40 : i64, mb_b = 200 : i64, mb_c = 40 : i64, n = 80 : i64, nb_a = 200 : i64, nb_b = 40 : i64, nb_c = 40 : i64, nq = 9 : i64, transa = 0 : i64, transb = 0 : i64}
+  %wrapped_transpose.5 = c128[40,9,40]{2,1,0} fusion(%ffi_call.45), kind=kLoop, calls=%wrapped_transpose_computation.5, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/transpose" stack_frame_id=39}
+  %bitcast.319.0 = c128[9,40,40]{1,0,2} bitcast(%wrapped_transpose.5)
+  %get-tuple-element.78.0 = c128[1,50,50]{2,1,0} get-tuple-element(%conditional.2), index=1, metadata={op_name="jit(contract_block)/cond/branch_0_fun/cond" stack_frame_id=103}
+  %loop_transpose_fusion.4 = c128[9,50,4,50,4]{4,3,2,1,0} fusion(%loop_transpose_fusion.3, %get-tuple-element.78.0), kind=kLoop, calls=%fused_transpose.12, metadata={op_name="jit(contract_block)/cond/branch_0_fun/transpose" stack_frame_id=121}
+  %bitcast.164.0 = c128[9,200,200]{2,1,0} bitcast(%loop_transpose_fusion.4), metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/transpose" stack_frame_id=36}
+  %ffi_call.46 = c128[9,40,200]{2,1,0} custom-call(%bitcast.164.0, %bitcast.150.0, %loop_broadcast_fusion.4), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[9,200,200]{2,1,0}, c128[9,40,200]{2,1,0}, c128[9,40,200]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call" stack_frame_id=38}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 93914436686400 : i64, k = 400 : i64, lld_a = 200 : i64, lld_b = 200 : i64, lld_c = 200 : i64, m = 400 : i64, mb_a = 200 : i64, mb_b = 200 : i64, mb_c = 200 : i64, n = 80 : i64, nb_a = 200 : i64, nb_b = 40 : i64, nb_c = 40 : i64, nq = 9 : i64, transa = 0 : i64, transb = 0 : i64}
+  %ffi_call.47 = c128[9,40,40]{2,1,0} custom-call(%bitcast.113.0, %ffi_call.46, %loop_broadcast_fusion.5), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[9,200,40]{2,1,0}, c128[9,40,200]{2,1,0}, c128[9,40,40]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/ffi_call" stack_frame_id=38}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 93914436686400 : i64, k = 400 : i64, lld_a = 40 : i64, lld_b = 200 : i64, lld_c = 40 : i64, m = 80 : i64, mb_a = 40 : i64, mb_b = 200 : i64, mb_c = 40 : i64, n = 80 : i64, nb_a = 200 : i64, nb_b = 40 : i64, nb_c = 40 : i64, nq = 9 : i64, transa = 0 : i64, transb = 0 : i64}
+  %wrapped_transpose.6 = c128[40,9,40]{2,1,0} fusion(%ffi_call.47), kind=kLoop, calls=%wrapped_transpose_computation.6, metadata={op_name="jit(contract_block)/cond/branch_0_fun/jit(_local)/shard_map/transpose" stack_frame_id=39}
+  %bitcast.327.0 = c128[9,40,40]{1,0,2} bitcast(%wrapped_transpose.6)
+  %all-gather-start.2 = ((c128[9,40,40]{1,0,2}, c128[9,40,40]{1,0,2}), (c128[9,40,80]{1,0,2}, c128[9,40,80]{1,0,2})) all-gather-start(%bitcast.319.0, %bitcast.327.0), channel_id=5, replica_groups=[2,2]<=[4], dimensions={2}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+  %all-gather-done.2 = (c128[9,40,80]{1,0,2}, c128[9,40,80]{1,0,2}) all-gather-done(%all-gather-start.2)
+  %get-tuple-element.104 = c128[9,40,80]{1,0,2} get-tuple-element(%all-gather-done.2), index=0
+  %input_transpose_fusion.7 = c128[40,9,80]{2,1,0} fusion(%get-tuple-element.104), kind=kInput, calls=%fused_transpose.11
+  %bitcast.323.0 = c128[9,40,80]{2,0,1} bitcast(%input_transpose_fusion.7)
+  %get-tuple-element.105 = c128[9,40,80]{1,0,2} get-tuple-element(%all-gather-done.2), index=1
+  %input_transpose_fusion.6 = c128[40,9,80]{2,1,0} fusion(%get-tuple-element.105), kind=kInput, calls=%fused_transpose.10
+  %bitcast.331.0 = c128[9,40,80]{2,0,1} bitcast(%input_transpose_fusion.6)
+  %all-gather-start.3 = ((c128[9,40,80]{2,0,1}, c128[9,40,80]{2,0,1}), (c128[9,80,80]{2,0,1}, c128[9,80,80]{2,0,1})) all-gather-start(%bitcast.323.0, %bitcast.331.0), channel_id=6, replica_groups=[2,2]<=[2,2]T(1,0), dimensions={1}, use_global_device_ids=true, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+  ROOT %all-gather-done.3 = (c128[9,80,80]{2,0,1}, c128[9,80,80]{2,0,1}) all-gather-done(%all-gather-start.3)
+}
+
+%fused_transpose.17 (param_0.105: c128[9,80,80]) -> c128[9,80,80] {
+  %param_0.105 = c128[9,80,80]{2,0,1} parameter(0)
+  %bitcast.179.1 = c128[80,9,80]{2,1,0} bitcast(%param_0.105)
+  ROOT %transpose.272.1 = c128[9,80,80]{2,1,0} transpose(%bitcast.179.1), dimensions={1,0,2}, metadata={op_name="jit(contract_block)/cond" stack_frame_id=14}
+}
+
+%fused_transpose.18 (param_0.107: c128[9,80,80]) -> c128[9,80,80] {
+  %param_0.107 = c128[9,80,80]{2,0,1} parameter(0)
+  %bitcast.177.1 = c128[80,9,80]{2,1,0} bitcast(%param_0.107)
+  ROOT %transpose.271.1 = c128[9,80,80]{2,1,0} transpose(%bitcast.177.1), dimensions={1,0,2}, metadata={op_name="jit(contract_block)/cond" stack_frame_id=14}
+}
+
+%fused_dynamic_slice (param_0.146: c128[9,15], param_1.102: s32[4], param_2.59: u32[], param_3.22: c128[9,30,30]) -> c128[9,40] {
+  %param_3.22 = c128[9,30,30]{2,1,0} parameter(3)
+  %iota.10.3 = s64[15]{0} iota(), iota_dimension=0, metadata={op_name="jit(contract_block)/jit(diagonal)/iota"}
+  %param_1.102 = s32[4]{0} parameter(1)
+  %param_2.59 = u32[] parameter(2)
+  %dynamic-slice.14 = s32[1]{0} dynamic-slice(%param_1.102, %param_2.59), dynamic_slice_sizes={1}, metadata={op_name="jit(contract_block)/jit(band_mask)/iota" stack_frame_id=1}
+  %constant_95_2 = s32[1]{0} constant({15}), metadata={op_name="jit(contract_block)/jit(diagonal)/iota"}
+  %multiply.9.3 = s32[1]{0} multiply(%dynamic-slice.14, %constant_95_2), metadata={op_name="jit(contract_block)/jit(diagonal)/iota"}
+  %bitcast.23.11 = s32[] bitcast(%multiply.9.3), metadata={op_name="jit(contract_block)/jit(diagonal)/iota"}
+  %convert.10.11 = s64[] convert(%bitcast.23.11), metadata={op_name="jit(contract_block)/jit(diagonal)/iota"}
+  %broadcast.20.9 = s64[15]{0} broadcast(%convert.10.11), dimensions={}, metadata={op_name="jit(contract_block)/jit(diagonal)/iota"}
+  %add.5.7 = s64[15]{0} add(%iota.10.3, %broadcast.20.9), metadata={op_name="jit(contract_block)/jit(diagonal)/iota"}
+  %convert_element_type.22.5 = s32[15]{0} convert(%add.5.7), metadata={op_name="jit(contract_block)/jit(diagonal)/convert_element_type"}
+  %bitcast.24.5 = s32[15,1]{1,0} bitcast(%convert_element_type.22.5), metadata={op_name="jit(contract_block)/jit(diagonal)/convert_element_type"}
+  %concatenate.3.5 = s32[15,2]{1,0} concatenate(%bitcast.24.5, %bitcast.24.5), dimensions={1}, metadata={op_name="jit(contract_block)/jit(diagonal)/concatenate"}
+  %gather.4.3 = c128[15,9,1,1]{0,1,3,2} gather(%param_3.22, %concatenate.3.5), offset_dims={1,2,3}, collapsed_slice_dims={}, start_index_map={1,2}, index_vector_dim=1, slice_sizes={9,1,1}, metadata={op_name="jit(contract_block)/jit(diagonal)/gather"}
+  %bitcast.175.5 = c128[9,15]{1,0} bitcast(%gather.4.3), metadata={op_name="jit(contract_block)/jit(diagonal)/gather"}
+  %param_0.146 = c128[9,15]{1,0} parameter(0)
+  %constant_76_1 = c128[] constant((0, 0))
+  %broadcast.22.1 = c128[9,10]{1,0} broadcast(%constant_76_1), dimensions={}, metadata={op_name="jit(contract_block)/jit(_pad)/pad"}
+  %concatenate.4.5 = c128[9,40]{1,0} concatenate(%bitcast.175.5, %param_0.146, %broadcast.22.1), dimensions={1}, metadata={op_name="jit(contract_block)/jit(_pad)/pad"}
+  %pad.3.3 = c128[9,65]{1,0} pad(%concatenate.4.5, %constant_76_1), padding=0_0x0_25, metadata={op_name="jit(contract_block)/jit(_pad)/pad"}
+  %constant_82_1 = s32[] constant(0), metadata={op_name="jit(contract_block)/jit(_pad)/pad"}
+  %constant_96_1 = s32[1]{0} constant({25}), metadata={op_name="jit(contract_block)/jit(_pad)/pad"}
+  %multiply.10.1 = s32[1]{0} multiply(%dynamic-slice.14, %constant_96_1), metadata={op_name="jit(contract_block)/jit(_pad)/pad"}
+  %bitcast.26.1 = s32[] bitcast(%multiply.10.1), metadata={op_name="jit(contract_block)/jit(_pad)/pad"}
+  ROOT %dynamic-slice.6.1 = c128[9,40]{1,0} dynamic-slice(%pad.3.3, %constant_82_1, %bitcast.26.1), dynamic_slice_sizes={9,40}, metadata={op_name="jit(contract_block)/jit(_pad)/pad"}
+}
+
+%fused_gather (param_0.115: c128[9,30,30], param_1.101: s32[4], param_2.58: u32[]) -> c128[15,9,1,1] {
+  %param_0.115 = c128[9,30,30]{2,1,0} parameter(0)
+  %iota.10.1 = s64[15]{0} iota(), iota_dimension=0, metadata={op_name="jit(contract_block)/jit(diagonal)/iota"}
+  %param_1.101 = s32[4]{0} parameter(1)
+  %param_2.58 = u32[] parameter(2)
+  %dynamic-slice.10 = s32[1]{0} dynamic-slice(%param_1.101, %param_2.58), dynamic_slice_sizes={1}, metadata={op_name="jit(contract_block)/jit(band_mask)/iota" stack_frame_id=1}
+  %constant_95_1 = s32[1]{0} constant({15}), metadata={op_name="jit(contract_block)/jit(diagonal)/iota"}
+  %multiply.9.1 = s32[1]{0} multiply(%dynamic-slice.10, %constant_95_1), metadata={op_name="jit(contract_block)/jit(diagonal)/iota"}
+  %bitcast.23.9 = s32[] bitcast(%multiply.9.1), metadata={op_name="jit(contract_block)/jit(diagonal)/iota"}
+  %convert.10.9 = s64[] convert(%bitcast.23.9), metadata={op_name="jit(contract_block)/jit(diagonal)/iota"}
+  %broadcast.20.7 = s64[15]{0} broadcast(%convert.10.9), dimensions={}, metadata={op_name="jit(contract_block)/jit(diagonal)/iota"}
+  %add.5.5 = s64[15]{0} add(%iota.10.1, %broadcast.20.7), metadata={op_name="jit(contract_block)/jit(diagonal)/iota"}
+  %convert_element_type.22.3 = s32[15]{0} convert(%add.5.5), metadata={op_name="jit(contract_block)/jit(diagonal)/convert_element_type"}
+  %bitcast.24.3 = s32[15,1]{1,0} bitcast(%convert_element_type.22.3), metadata={op_name="jit(contract_block)/jit(diagonal)/convert_element_type"}
+  %concatenate.3.3 = s32[15,2]{1,0} concatenate(%bitcast.24.3, %bitcast.24.3), dimensions={1}, metadata={op_name="jit(contract_block)/jit(diagonal)/concatenate"}
+  ROOT %gather.4.1 = c128[15,9,1,1]{0,1,3,2} gather(%param_0.115, %concatenate.3.3), offset_dims={1,2,3}, collapsed_slice_dims={}, start_index_map={1,2}, index_vector_dim=1, slice_sizes={9,1,1}, metadata={op_name="jit(contract_block)/jit(diagonal)/gather"}
+}
+
+%fused_broadcast.6 (param_0.147: s32[4], param_1.100: u32[]) -> c128[9,40] {
+  %iota.9.3 = s64[40]{0} iota(), iota_dimension=0, metadata={op_name="jit(contract_block)/jit(band_mask)/iota" stack_frame_id=1}
+  %param_0.147 = s32[4]{0} parameter(0)
+  %param_1.100 = u32[] parameter(1)
+  %dynamic-slice.16 = s32[1]{0} dynamic-slice(%param_0.147, %param_1.100), dynamic_slice_sizes={1}, metadata={op_name="jit(contract_block)/jit(band_mask)/iota" stack_frame_id=1}
+  %constant_94_1 = s32[1]{0} constant({40}), metadata={op_name="jit(contract_block)/jit(band_mask)/iota" stack_frame_id=1}
+  %multiply.8.5 = s32[1]{0} multiply(%dynamic-slice.16, %constant_94_1), metadata={op_name="jit(contract_block)/jit(band_mask)/iota" stack_frame_id=1}
+  %bitcast.22.5 = s32[] bitcast(%multiply.8.5), metadata={op_name="jit(contract_block)/jit(band_mask)/iota" stack_frame_id=1}
+  %convert.9.5 = s64[] convert(%bitcast.22.5), metadata={op_name="jit(contract_block)/jit(band_mask)/iota" stack_frame_id=1}
+  %broadcast.19.3 = s64[40]{0} broadcast(%convert.9.5), dimensions={}, metadata={op_name="jit(contract_block)/jit(band_mask)/iota" stack_frame_id=1}
+  %add.4.3 = s64[40]{0} add(%iota.9.3, %broadcast.19.3), metadata={op_name="jit(contract_block)/jit(band_mask)/iota" stack_frame_id=1}
+  %constant_69_1 = s64[] constant(80)
+  %lt.10.3 = s64[40]{0} broadcast(%constant_69_1), dimensions={}, metadata={op_name="jit(contract_block)/jit(band_mask)/lt" stack_frame_id=2}
+  %lt.11.3 = pred[40]{0} compare(%add.4.3, %lt.10.3), direction=LT, metadata={op_name="jit(contract_block)/jit(band_mask)/lt" stack_frame_id=2}
+  %convert_element_type.21.1 = c128[40]{0} convert(%lt.11.3), metadata={op_name="jit(contract_block)/convert_element_type" stack_frame_id=12}
+  ROOT %broadcast_in_dim.47.1 = c128[9,40]{1,0} broadcast(%convert_element_type.21.1), dimensions={1}, metadata={op_name="jit(contract_block)/jit(band_mask)/broadcast_in_dim" stack_frame_id=13}
+}
+
+%fused_compare.1 (param_0.144: s32[]) -> pred[] {
+  %param_0.144 = s32[] parameter(0)
+  %constant_66_1 = s32[] constant(2)
+  ROOT %eq.5.1 = pred[] compare(%param_0.144, %constant_66_1), direction=EQ, metadata={op_name="jit(contract_block)/eq" stack_frame_id=11}
+}
+
+ENTRY %main.0_spmd (param.29: c128[9,40,4,50], param.34: c128[9,4,50,40], param.30: c128[9,4,50,40], param.31: c128[9,40,4,50], param.37: c128[9,30,30], param.32: c128[9,50,50], param.33: c128[9,50,50], param.35: c128[1,50,50], param.36: c128[1,50,50], param.28: s32[]) -> (c128[9,80,80], c128[9,80,80]) {
+  %partition-id.16.0 = u32[] partition-id()
+  %constant_67_0 = s32[4]{0} constant({0, 1, 0, 1}), metadata={op_name="jit(contract_block)/jit(band_mask)/iota" stack_frame_id=1}
+  %param.37 = c128[9,30,30]{2,1,0} parameter(4), sharding={replicated}, metadata={op_name="Gij"}
+  %loop_gather_fusion = c128[15,9,1,1]{0,1,3,2} fusion(%param.37, %constant_67_0, %partition-id.16.0), kind=kLoop, calls=%fused_gather, metadata={op_name="jit(contract_block)/jit(diagonal)/gather"}
+  %bitcast.175.0 = c128[9,15]{1,0} bitcast(%loop_gather_fusion), metadata={op_name="jit(contract_block)/jit(diagonal)/gather"}
+  %collective-permute-start = (c128[9,15]{1,0}, c128[9,15]{1,0}) collective-permute-start(%bitcast.175.0), channel_id=9, source_target_pairs={{1,0},{3,2}}, metadata={op_name="jit(contract_block)/jit(_pad)/pad"}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"collective_backend_config":{"is_sync":true,"is_pipelined":false,"backend":"DEFAULT"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+  %collective-permute-done = c128[9,15]{1,0} collective-permute-done(%collective-permute-start), metadata={op_name="jit(contract_block)/jit(_pad)/pad"}
+  %loop_dynamic_slice_fusion = c128[9,40]{1,0} fusion(%collective-permute-done, %constant_67_0, %partition-id.16.0, %param.37), kind=kLoop, calls=%fused_dynamic_slice, metadata={op_name="jit(contract_block)/jit(_pad)/pad"}
+  %param.33 = c128[9,50,50]{2,1,0} parameter(6), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="V_AB"}
+  %copy.94 = c128[9,50,50]{2,1,0} copy(%param.33)
+  %param.36 = c128[1,50,50]{2,1,0} parameter(8), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="V_head_AB"}
+  %copy.95 = c128[1,50,50]{2,1,0} copy(%param.36)
+  %param.28 = s32[] parameter(9), sharding={replicated}, metadata={op_name="term"}
+  %param.29 = c128[9,40,4,50]{3,2,1,0} parameter(0), sharding={devices=[1,2,1,2]<=[4]}, metadata={op_name="wfns_left.psi_nmu"}
+  %param.30 = c128[9,4,50,40]{3,2,1,0} parameter(2), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="wfns_left_g.psi_mun"}
+  %param.31 = c128[9,40,4,50]{3,2,1,0} parameter(3), sharding={devices=[1,2,1,2]<=[4]}, metadata={op_name="wfns_right_g.psi_nmu"}
+  %param.32 = c128[9,50,50]{2,1,0} parameter(5), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="W_AB"}
+  %param.34 = c128[9,4,50,40]{3,2,1,0} parameter(1), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="wfns_right.psi_mun"}
+  %param.35 = c128[1,50,50]{2,1,0} parameter(7), sharding={devices=[1,2,2]<=[4]}, metadata={op_name="W_head_AB"}
+  %tuple.20.0 = (c128[9,40,4,50]{3,2,1,0}, c128[9,40]{1,0}, c128[9,4,50,40]{3,2,1,0}, c128[9,40,4,50]{3,2,1,0}, s32[], /*index=5*/c128[9,50,50]{2,1,0}, c128[1,50,50]{2,1,0}, c128[9,50,50]{2,1,0}, c128[1,50,50]{2,1,0}, c128[9,4,50,40]{3,2,1,0}) tuple(%param.29, %loop_dynamic_slice_fusion, %param.30, %param.31, %param.28, /*index=5*/%copy.94, %copy.95, %param.32, %param.35, %param.34), metadata={op_name="jit(contract_block)/cond" stack_frame_id=14}
+  %loop_broadcast_fusion.6 = c128[9,40]{1,0} fusion(%constant_67_0, %partition-id.16.0), kind=kLoop, calls=%fused_broadcast.6, metadata={op_name="jit(contract_block)/jit(band_mask)/broadcast_in_dim" stack_frame_id=13}
+  %tuple.18.0 = (c128[9,40,4,50]{3,2,1,0}, c128[9,40]{1,0}, c128[9,4,50,40]{3,2,1,0}, c128[9,40,4,50]{3,2,1,0}, c128[9,50,50]{2,1,0}, /*index=5*/c128[9,50,50]{2,1,0}, c128[9,4,50,40]{3,2,1,0}, c128[1,50,50]{2,1,0}, c128[1,50,50]{2,1,0}) tuple(%param.29, %loop_broadcast_fusion.6, %param.30, %param.31, %param.32, /*index=5*/%copy.94, %param.34, %param.35, %copy.95), metadata={op_name="jit(contract_block)/cond" stack_frame_id=14}
+  %loop_compare_fusion.1 = pred[] fusion(%param.28), kind=kLoop, calls=%fused_compare.1, metadata={op_name="jit(contract_block)/eq" stack_frame_id=11}
+  %conditional.3 = (c128[9,80,80]{2,0,1}, c128[9,80,80]{2,0,1}) conditional(%loop_compare_fusion.1, %tuple.18.0, %tuple.20.0), true_computation=%region_0.7_spmd, false_computation=%region_1.16_spmd, metadata={op_name="jit(contract_block)/cond" stack_frame_id=14}
+  %get-tuple-element.99.0 = c128[9,80,80]{2,0,1} get-tuple-element(%conditional.3), index=1, metadata={op_name="jit(contract_block)/cond" stack_frame_id=14}
+  %loop_transpose_fusion.5 = c128[9,80,80]{2,1,0} fusion(%get-tuple-element.99.0), kind=kLoop, calls=%fused_transpose.17, metadata={op_name="jit(contract_block)/cond" deduplicated_name="loop_transpose_fusion.5" stack_frame_id=14}
+  %get-tuple-element.98.0 = c128[9,80,80]{2,0,1} get-tuple-element(%conditional.3), index=0, metadata={op_name="jit(contract_block)/cond" stack_frame_id=14}
+  %loop_transpose_fusion.6 = c128[9,80,80]{2,1,0} fusion(%get-tuple-element.98.0), kind=kLoop, calls=%fused_transpose.18, metadata={op_name="jit(contract_block)/cond" deduplicated_name="loop_transpose_fusion.5" stack_frame_id=14}
+  ROOT %tuple.26.0 = (c128[9,80,80]{2,1,0}, c128[9,80,80]{2,1,0}) tuple(%loop_transpose_fusion.6, %loop_transpose_fusion.5), metadata={op_name="jit(contract_block)/cond" stack_frame_id=14}
+}
+

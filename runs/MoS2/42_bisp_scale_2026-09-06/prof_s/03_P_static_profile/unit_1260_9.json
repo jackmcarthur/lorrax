@@ -1,0 +1,167 @@
+{
+  "program": 1260,
+  "occurrence": 9,
+  "occurrences": 27,
+  "label": "XlaModule:#hlo_module=jit_contract_block,program_id=1260#",
+  "host_range_ms": 6.351477,
+  "projected_ms": 7.827103,
+  "kernel_count": 319,
+  "kernel_sum_ms": 6.251199,
+  "kernels": [
+    {
+      "name": "input_concatenate_fusion",
+      "count": 1,
+      "sum_ms": 0.032192
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_tensorop_z884gemm_16x32_16x3_nn_align1>(T1::Params)",
+      "count": 1,
+      "sum_ms": 0.095392
+    },
+    {
+      "name": "loop_multiply_fusion",
+      "count": 1,
+      "sum_ms": 0.02176
+    },
+    {
+      "name": "loop_complex_fusion",
+      "count": 1,
+      "sum_ms": 0.019872
+    },
+    {
+      "name": "loop_broadcast_fusion",
+      "count": 1,
+      "sum_ms": 0.088288
+    },
+    {
+      "name": "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)",
+      "count": 200,
+      "sum_ms": 3.686367
+    },
+    {
+      "name": "void cutlass::Kernel2<cutlass_80_tensorop_z884gemm_32x16_16x3_nn_align1>(T1::Params)",
+      "count": 100,
+      "sum_ms": 1.36064
+    },
+    {
+      "name": "loop_transpose_fusion",
+      "count": 1,
+      "sum_ms": 0.173376
+    },
+    {
+      "name": "void regular_fft<(unsigned int)6, EPT<(unsigned int)2, (unsigned int)3>, (unsigned int)32, (unsigned int)16, (padding_t)14, (twiddle_t)0, (loadstore_modifier_t)2, (layout_t)1, unsigned int, double, HostConfigPlaceholder>(kernel_arguments_t<T9>)",
+      "count": 6,
+      "sum_ms": 0.584832
+    },
+    {
+      "name": "lrx_gw_mult_c128",
+      "count": 1,
+      "sum_ms": 0.130944
+    },
+    {
+      "name": "loop_gather_fusion",
+      "count": 1,
+      "sum_ms": 0.038976
+    },
+    {
+      "name": "wrapped_transpose",
+      "count": 1,
+      "sum_ms": 0.005504
+    },
+    {
+      "name": "loop_broadcast_fusion_1",
+      "count": 1,
+      "sum_ms": 0.00288
+    },
+    {
+      "name": "input_transpose_fusion",
+      "count": 1,
+      "sum_ms": 0.005632
+    },
+    {
+      "name": "loop_broadcast_fusion_2",
+      "count": 1,
+      "sum_ms": 0.001984
+    },
+    {
+      "name": "wrapped_transpose_1",
+      "count": 1,
+      "sum_ms": 0.00256
+    }
+  ],
+  "thunks": [
+    {
+      "name": "Thunk:#hlo_op=command_buffer_1#",
+      "kernels": 5,
+      "projected_ms": 0.25712,
+      "kernel_sum_ms": 0.257504
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.12#",
+      "kernels": 216,
+      "projected_ms": 4.173567,
+      "kernel_sum_ms": 2.866943
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/transpose,hlo_op=loop_transpose_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.173376,
+      "kernel_sum_ms": 0.173376
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/jit(_convolve)/shard_map/ffi_call,hlo_op=ffi_call.13#",
+      "kernels": 7,
+      "projected_ms": 0.722144,
+      "kernel_sum_ms": 0.715776
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block),hlo_op=loop_gather_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.038976,
+      "kernel_sum_ms": 0.038976
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/transpose,hlo_op=wrapped_transpose#",
+      "kernels": 1,
+      "projected_ms": 0.005504,
+      "kernel_sum_ms": 0.005504
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/jit(_local)/shard_map,hlo_op=loop_broadcast_fusion.1#",
+      "kernels": 1,
+      "projected_ms": 0.00288,
+      "kernel_sum_ms": 0.00288
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.14#",
+      "kernels": 42,
+      "projected_ms": 1.532352,
+      "kernel_sum_ms": 1.411616
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block),hlo_op=input_transpose_fusion#",
+      "kernels": 1,
+      "projected_ms": 0.005632,
+      "kernel_sum_ms": 0.005632
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/jit(_local)/shard_map,hlo_op=loop_broadcast_fusion.2#",
+      "kernels": 1,
+      "projected_ms": 0.001984,
+      "kernel_sum_ms": 0.001984
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/jit(_local)/shard_map/ffi_call,hlo_op=ffi_call.15#",
+      "kernels": 42,
+      "projected_ms": 0.868416,
+      "kernel_sum_ms": 0.768448
+    },
+    {
+      "name": "Thunk:#name=jit(contract_block)/jit(_local)/shard_map/transpose,hlo_op=wrapped_transpose.1#",
+      "kernels": 1,
+      "projected_ms": 0.00256,
+      "kernel_sum_ms": 0.00256
+    }
+  ],
+  "scope": "Native launch-correlation projection; nested thunk ranges must not be summed"
+}

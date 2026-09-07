@@ -1,0 +1,10 @@
+run_id: 34_P3_allocation
+system: MoS2
+pipeline: profiling
+platform: perlmutter
+steps:
+  allocation:
+    state: complete
+    jobid: 57992641
+    attempts: 3
+    prior_failures: QOSMaxSubmitJobPerUserLimit
