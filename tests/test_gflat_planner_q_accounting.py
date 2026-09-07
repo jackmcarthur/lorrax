@@ -49,7 +49,7 @@ def test_plan_receipt_distinguishes_full_K_from_selected_Q(monkeypatch):
         fit_nb_total=80, ngkmax=1963, n_q_disk=5, n_q_ibz=5,
         budget_gb=80.0, target_utilization=0.8,
         r_chunk_override=46080, band_chunk_override=16,
-        distributed_zeta_solve="distributed", low_mem_bands=True,
+        distributed_zeta_solve="distributed",
     )
     assert (plan.n_q_full, plan.n_q_selected) == (9, 5)
     assert "selected Q 5 / full-zone K 9" in plan.format()
