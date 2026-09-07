@@ -120,3 +120,13 @@
 | GW full-head restart / frozen BSE | Both complete with moved provenance reader | `06_soc_ns2_fixture/metadata_{restart,bse}.rank0.log` |
 | Historical DFT htransform control | Completes; RED reference equality: max0.0564528864 meV, RMS0.0375181558 meV over4×16 bands | `23_htransform_reference/comparison.json`; existing stamped parser from `tools/compare_bgw_inteqp_htransform.py`. Retired CLI/deck options translated; this DFT-only path reads no restart. Difference is outside bundle restoration; exact algorithmic cause unassigned |
 | ns2 GN pure-refit diagnostic, finite on-grid Q | RED:0.66200 meV against0.01 meV certificate; tolerance unchanged | `07_soc_ns2_gn/metadata_refit_finite.rank0.log`; 8v8c, four guards, refit-window=bse |
+
+
+| EQP consolidation seam | Verdict | Evidence |
+|---|---|---|
+| `read_bgw_eqp`, `read_eqp_energies`, `apply_eqp_corrections`, `read_kin_ion_full_bz` | One actual reader module; removed BSE three-tuple façade and htransform/GW parser implementations | `file_io.restart_bundle`; energies retain their existing units and window contracts |
+| BSE with eqp1.dat | PASS execution on ns2 GN q-IBZ bundle | `07_soc_ns2_gn/bse_eqp_shared.rank0.log` |
+| htransform with eqp1.dat | PASS execution on same bundle | `07_soc_ns2_gn/htransform_eqp_shared.rank0.log`, `bands_eqp.dat` |
+| CPU parser and header selection | 52 passed:19 EQP plus33 header/import checks | `00_audit/eqp_headers_cpu_final.lx.log`; two native-I/O cells excluded and separately recorded |
+| P4 broad unit selection | 61 passed;10 tests require fully addressable local arrays and fail on distributed four-process arrays | `00_audit/shared_tests.rank0.log`; these unit fixtures are not production P4 drivers. Production BSE/htransform above complete |
+| Metadata batch | 8a274048 pushed; claim1438 | P4 metadata tests and full-head restart/BSE |

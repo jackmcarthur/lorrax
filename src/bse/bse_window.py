@@ -29,6 +29,7 @@ window narrower than the one that was solved.
 from __future__ import annotations
 
 import os
+from file_io.restart_bundle import apply_eqp_corrections
 from typing import Optional
 
 import h5py
@@ -388,18 +389,6 @@ def write_eigenvectors_stream(
           + ("" if use_tda else " (+ coupling Y)"))
 
 
-def read_bgw_eqp(eqp_file: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Read a BerkeleyGW ``eqp{0,1}.dat`` — see :func:`gw.eqp_bgw.read_bgw_eqp`.
-
-    The implementation moved NEXT TO THE WRITER (``gw/eqp_bgw.py``) so
-    ``bandstructure.htransform`` could reach it without a
-    ``bandstructure → bse`` edge that exists nowhere else in the tree.
-    Re-exported here because BSE is where every existing caller looks for
-    it; there is one implementation, not two.
-    """
-    from gw.eqp_bgw import read_bgw_eqp as _read
-    kpts, e_dft, e_qp, _band_offset = _read(eqp_file)
-    return kpts, e_dft, e_qp
 
 
 def _parse_wfn_path(input_file: str) -> str:
@@ -518,98 +507,6 @@ def resolve_n_occ(
     )
 
 
-def apply_eqp_corrections(
-    enk_full: np.ndarray,
-    eqp_file: str,
-    input_file: str,
-    ry_to_ev: float = 13.6056980659,
-    *,
-    state_artifact_path: str | None = None,
-) -> np.ndarray:
-    """Apply BGW ``eqp{0,1}.dat`` corrections to full-BZ DFT eigenvalues.
-
-    ``eqp_file`` is on the IRREDUCIBLE WEDGE (one block per
-    ``wfn.kpoints``, coordinates in the block header) and ``enk_full`` is
-    on the full BZ, so this is an UNFOLD — and it goes through the
-    symmetry service, like every other unfold in the tree.
-
-    ``input_file`` is REQUIRED.  It used to be optional, and passing
-    ``None`` selected a second implementation that matched each full-BZ k
-    to a wedge block by comparing MEAN-FIELD ENERGIES to 0.01 eV.  That
-    was bespoke unfolding: it happened to be right because E_DFT is
-    constant over a symmetry star, but two accidentally-degenerate stars
-    alias, and the star it picks is then simply the wrong one — silently,
-    with QP energies from another k inside what the caller believes is a
-    quasiparticle calculation.  The heuristic existed only because the
-    call site believed LORRAX wrote ``eqp1.dat`` on the full BZ and that
-    the symmetry-map branch would therefore refuse; it does not and it
-    does not (``gw_output.py`` subsets through ``kirr_to_kfull``).  Both
-    the belief and the second implementation are gone: there is one path,
-    and it asks the service.
-    """
-    if not input_file:
-        raise ValueError(
-            "apply_eqp_corrections requires input_file: the eqp file is on "
-            "the irreducible wedge and the unfold to the full BZ needs this "
-            "deck's symmetry tables.  It used to be optional, and omitting "
-            "it selected a mean-field-energy nearest-match that silently "
-            "took QP shifts from the wrong star whenever two stars were "
-            "degenerate; that path is deleted rather than defaulted.")
-
-    # Every public BSE eqp frontend (bse_jax, Haydock, Davidson, the direct
-    # restart loader and exciton bands) reaches this one correction owner.
-    # Refuse a second DFT-labelled ladder on a positively stamped QP WFN here
-    # rather than relying on each CLI to remember the same content contract.
-    from file_io.qp_wfn import refuse_conflicting_qp_state_sources
-    refuse_conflicting_qp_state_sources(
-        wfn_path=_parse_wfn_path(input_file), eqp_file=eqp_file,
-        state_artifact_path=state_artifact_path,
-        where="BSE diagonal-eqp state")
-
-    from ffi import _services
-    _services.ensure_on_path()
-    from symmetry_maps import unfold_file_wedge_to_full_bz
-    from wfn_loader import WfnLoader
-
-    # 3-tuple: this consumer's band axis is already LOCAL to the deck's
-    # ``b0`` (``enk_full`` spans [b0, b4) and the eqp window starts at b0),
-    # so column 0 lines up by construction and the file's absolute band
-    # offset is not needed here.
-    _kpts_ibz, _e_dft_ibz, e_qp_ibz = read_bgw_eqp(eqp_file)
-    nk_ibz, nb_eqp = e_qp_ibz.shape
-    nk_full, nb_full = enk_full.shape
-
-    wfn = WfnLoader(_parse_wfn_path(input_file))
-    sym = wfn.symmetry()
-    if sym.nk_tot != nk_full:
-        raise ValueError(
-            f"apply_eqp_corrections: enk_full has {nk_full} k-points but the "
-            f"deck's symmetry maps describe {sym.nk_tot} — the eigenvalues "
-            f"and the WFN in {os.path.basename(input_file)} are not the same "
-            f"k-grid.")
-    if nk_ibz != sym.nk_red:
-        raise ValueError(
-            f"apply_eqp_corrections: {os.path.basename(eqp_file)} holds "
-            f"{nk_ibz} k-blocks but this deck's irreducible wedge has "
-            f"{sym.nk_red}.  This reader expects the wedge file LORRAX's GW "
-            f"writes; a full-BZ file ({sym.nk_tot} blocks) is the pre-unfolded "
-            f"form that no longer exists.")
-
-    # THE UNFOLD, named for the wedge it is on.  ``eqp1.dat`` is indexed by
-    # ``wfn.kpoints`` — the FILE wedge — which on two of the three committed
-    # decks is a different LENGTH from the star wedge, so the distinction is
-    # not cosmetic.  One backend under both named ops; no index table
-    # crosses into this module.
-    e_qp_full_ev = unfold_file_wedge_to_full_bz(sym, e_qp_ibz)
-
-    enk_qp = enk_full.copy()
-    n_take = min(nb_eqp, nb_full)
-    block = np.asarray(e_qp_full_ev)[:, :n_take]
-    have = ~np.isnan(block)
-    # A band absent from the eqp file keeps its mean-field value; a band
-    # present replaces it.  Ry in, Ry out.
-    enk_qp[:, :n_take] = np.where(have, block / ry_to_ev, enk_qp[:, :n_take])
-    return enk_qp
 
 
 def apply_eqp_and_reslice_bands(

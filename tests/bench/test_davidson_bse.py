@@ -77,7 +77,8 @@ def _load_data_and_matvec(
     # than the user-requested n_val / n_cond — otherwise eps_v can be
     # wider than psi_v_X (when n_occ < n_val) and the matvec einsum fails.
     if eqp_file is not None:
-        from bse.bse_io import apply_eqp_corrections, PAD_EPS_GUARD_RY
+        from bse.bse_io import (PAD_EPS_GUARD_RY)
+        from file_io.restart_bundle import (apply_eqp_corrections)
         from runtime.padding import pad_axis
         n_val_eff = int(data["n_val"])
         n_cond_eff = int(data["n_cond"])

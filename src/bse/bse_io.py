@@ -47,12 +47,7 @@ from .bse_densify import (W_HEAD_DENSIFY_MODES, _interpolate_bse_data_to_grid,
 from .bse_head import (_inject_q0_head, _parse_head_overrides,
                        _resolve_head_params)
 from .bse_loading import (_load_ring_subset, _pad_first_two_axes, _pad_last_axis, _pad_last_two_axes, load_bse_data_from_restart_sharded)
-from .bse_window import (PAD_EPS_GUARD_RY, _generate_kpts_grid, _log0,
-                         _parse_wfn_path,
-                         apply_eqp_and_reslice_bands, apply_eqp_corrections,
-                         n_pad_transitions, pad_zone_mask, pad_zone_mask_np,
-                         read_bgw_eqp, resolve_n_occ,
-                         write_eigenvectors_stream)
+from .bse_window import (PAD_EPS_GUARD_RY, _generate_kpts_grid, _log0, _parse_wfn_path, apply_eqp_and_reslice_bands, n_pad_transitions, pad_zone_mask, pad_zone_mask_np, resolve_n_occ, write_eigenvectors_stream)
 
 __all__ = [
     "DEFAULT_MODE",
@@ -60,7 +55,6 @@ __all__ = [
     "PAD_EPS_GUARD_RY",
     "W_HEAD_DENSIFY_MODES",
     "apply_eqp_and_reslice_bands",
-    "apply_eqp_corrections",
     "build_w_head_channel",
     "check_band_window",
     "decimate_W_q_to_subgrid",
@@ -70,7 +64,6 @@ __all__ = [
     "pad_W_R_to_grid",
     "pad_zone_mask",
     "pad_zone_mask_np",
-    "read_bgw_eqp",
     "resolve_band_window",
     "resolve_n_occ",
     "resolve_w_head_densify",

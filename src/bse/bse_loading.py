@@ -18,8 +18,8 @@ from .bse_densify import (_interpolate_bse_data_to_grid,
                           resolve_w_head_densify)
 from .bse_head import _inject_q0_head, _resolve_head_params
 from .bse_serial import compute_pair_amplitude
-from .bse_window import (PAD_EPS_GUARD_RY, _log0,
-                         _parse_wfn_path, apply_eqp_corrections, resolve_n_occ)
+from .bse_window import (PAD_EPS_GUARD_RY, _log0, _parse_wfn_path, resolve_n_occ)
+from file_io.restart_bundle import (apply_eqp_corrections)
 
 
 def _pad_last_axis(x: jax.Array, target: int) -> jax.Array:

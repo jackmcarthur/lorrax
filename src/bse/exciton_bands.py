@@ -1637,8 +1637,8 @@ def main(argv=None):
         # ``_parse_wfn_path`` — one owner for "which WFN does this deck name",
         # and it asks the FILE's stamp rather than its name.
         refuse_eqp_on_a_qp_wfn(args.input, args.eqp)
-        from .bse_io import (apply_eqp_and_reslice_bands, apply_eqp_corrections,
-                             resolve_n_occ)
+        from .bse_io import (apply_eqp_and_reslice_bands, resolve_n_occ)
+        from file_io.restart_bundle import (apply_eqp_corrections)
         from file_io.restart_bundle import read_metadata
         _enk_dft_full = read_metadata(restart_file)["energies"]
         n_occ_in = resolve_n_occ(_enk_dft_full, input_file=args.input)

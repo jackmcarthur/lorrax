@@ -258,7 +258,8 @@ def test_bse_eqp_frontends_reach_the_shared_stamp_owner():
     from bse import bse_window
 
     adapter = inspect.getsource(bse_window.refuse_eqp_on_a_qp_wfn)
-    correction = inspect.getsource(bse_window.apply_eqp_corrections)
+    from file_io.restart_bundle import apply_eqp_corrections
+    correction = inspect.getsource(apply_eqp_corrections)
     assert "refuse_conflicting_qp_state_sources" in adapter
     assert "refuse_conflicting_qp_state_sources" in correction
     source_root = Path(__file__).resolve().parents[1]

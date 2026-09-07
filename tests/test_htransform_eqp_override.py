@@ -25,7 +25,7 @@ def _imports():
     """Inside a function, not at module scope: importing
     ``bandstructure.htransform`` sets ``HDF5_USE_FILE_LOCKING``, and the
     harness refuses env mutation at collection time."""
-    from bandstructure.htransform import read_eqp_energies
+    from file_io.restart_bundle import (read_eqp_energies)
     from common.units import RYD_TO_EV
     from gw.eqp_bgw import write_bgw_eqp
     return read_eqp_energies, RYD_TO_EV, write_bgw_eqp

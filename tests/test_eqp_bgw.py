@@ -77,12 +77,12 @@ def test_writer_band_offset_uses_one_based_label(tmp_path, reference_block):
 
 def test_reader_skips_provenance_header(tmp_path, reference_block):
 	"""The LORRAX BGW eqp reader must transparently skip ``#`` lines."""
-	from bse.bse_io import read_bgw_eqp
+	from file_io.restart_bundle import (read_bgw_eqp)
 
 	kpts, e_dft, e_qp = reference_block
 	out = tmp_path / "eqp1.dat"
 	write_bgw_eqp(str(out), kpts, e_dft, e_qp, band_offset=18, nspin=1)
-	kpts_back, e_dft_back, e_qp_back = read_bgw_eqp(str(out))
+	kpts_back, e_dft_back, e_qp_back, band_offset = read_bgw_eqp(str(out))
 	np.testing.assert_allclose(kpts_back, kpts)
 	np.testing.assert_allclose(e_dft_back, e_dft, atol=1e-9)
 	np.testing.assert_allclose(e_qp_back, e_qp, atol=1e-9)
