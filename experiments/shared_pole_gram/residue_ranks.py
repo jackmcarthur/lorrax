@@ -98,7 +98,7 @@ def main(fits, out):
                     io.write_slab('residue_sign',sign_device)
                     io.sync_writes()
                     io.write_attr('q_parent',int(low['parent_qrows'][q]));io.write_attr('qslot',q)
-                    io.write_attr('scope','signed Hermitian residue model; tau1e-3 truncation; no passivity repair')
+                    io.write_attr('scope',np.bytes_('signed Hermitian residue model; tau1e-3 truncation; no passivity repair'))
                 record['export_path']=str(model);record['export_K_with_padding']=len(signs)
                 record['export_actual_factor_bytes']=int(2*896*len(signs)*16)
                 record['passivity_scope']='untruncated model only; exported truncation needs independent EVAL receipt'
