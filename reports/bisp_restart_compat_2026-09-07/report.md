@@ -141,3 +141,12 @@
 | Final CPU core |66 passed,7 skipped, same4 registered host-provider failures | `00_audit/core_cpu_final.lx.log` |
 | EQP batch |0056ba63 pushed; claim1439 | BSE and htransform eqp1 legs complete |
 | Remaining direct reads audit |No private gwjax-bundle HDF5 or SlabIO reader remains in the audited drivers | `post_census.txt`; qsgw_head's two SlabIO reads are upstream parallel_transport.h5 preprocessing, not gwjax output. compute_vcoul's auxiliary symmetry read and eqp_bgw's source-energy read are WFN inputs. BSE pseudopole/eigenvector readers consume BSE outputs |
+
+
+| Exact BSE spin-family seam | Verdict | Evidence |
+|---|---|---|
+| Private scalar/two-spinor `_spin_rotation` | Deleted; call site uses `symmetry_maps.spinor_rotation_for_sym_row` for the family's true extent | No new spin-specific branch; the existing symmetry service supplies scalar/Pauli/Dirac actions |
+| CPU family-span and TRS refusal controls |3 passed (ns1,2,4) | `00_audit/trs_family_cpu.lx.log` |
+| Exact BSE, scalar true |PASS: two Wc columns, max residual7.40e-11 ≤1e-10;9/200 iterations | `01_scalar_true/exact_trs.rank0.log` |
+| Exact BSE, ns2 GN and ns4 supplied GN |PASS: two Wc columns each, max residual7.28e-11 ≤1e-10;9/200 iterations | `07_soc_ns2_gn/exact_trs_complete.rank0.log`, `02_soc_true/exact_trs_complete.rank0.log`; full8v8c windows avoid the trial4-conduction-band multiplet cut |
+| ζ header batch |80f2b2f6 pushed; claim1440 | Exact dynamic restart and canonical downfold-child BSE |

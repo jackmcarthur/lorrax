@@ -602,16 +602,6 @@ def _kramers_canonicalize_trim_block(Psi, R, *, where="a TRIM block"):
     return np.tensordot(V.T, Psi, axes=(1, 0))
 
 
-def _spin_rotation(nspinor):
-    """The unitary part of TRS: Theta = R K.  Scalar: R = 1.  Spinor:
-    R = i*sigma_y = [[0, 1], [-1, 0]] — REAL orthogonal, R^2 = -1 (Kramers)."""
-    if nspinor == 1:
-        return np.eye(1)
-    if nspinor == 2:
-        return np.array([[0.0, 1.0], [-1.0, 0.0]])
-    raise ValueError(f"nspinor={nspinor}?")
-
-
 def _theta(psi_k, R):
     """Theta psi for one k-slot (nb, ns, mu): R on the spin axis, conj."""
     return np.einsum("st,btm->bsm", R, np.conj(psi_k))
@@ -635,7 +625,9 @@ def _trs_fix_band_array(psi, eps, grid, *, label):
     eigenstates, not just operator-equivalent ones."""
     nk = psi.shape[0]
     ns = psi.shape[2]
-    R = _spin_rotation(ns)
+    from symmetry_maps import spinor_rotation_for_sym_row
+    R = spinor_rotation_for_sym_row(
+        np.eye(2)[None], 1, 1, nspinor=ns, R_cart=np.eye(3)[None])
     psi = psi.copy()
     eps = eps.copy()
     idx = np.arange(nk).reshape(grid)

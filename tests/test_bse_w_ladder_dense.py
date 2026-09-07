@@ -307,13 +307,15 @@ def _trs_synthetic_payload(mesh, *, nkx=3, nky=3, nkz=1, nc=2, nv=2, nmu=8,
     path is actually exercised (a 2x2 grid is ALL TRIM points)."""
     from bse.bse_serial import compute_pair_amplitude
     from bse.bse_ring_comm import make_bse_shardings
-    from bse.bse_w_exact import _spin_rotation, _theta
+    from bse.bse_w_exact import _theta
+    from symmetry_maps import spinor_rotation_for_sym_row
     nk = nkx * nky * nkz
     grid = (nkx, nky, nkz)
     rng = np.random.default_rng(seed)
     coords = np.stack(np.unravel_index(np.arange(nk), grid), axis=1)
     neg = np.ravel_multi_index(tuple(((-coords) % np.array(grid)).T), grid)
-    R = _spin_rotation(ns)
+    R = spinor_rotation_for_sym_row(
+        np.eye(2)[None], 1, 1, nspinor=ns, R_cart=np.eye(3)[None])
 
     def _c(*shape):
         return (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)) / 8.0
@@ -584,7 +586,8 @@ def test_w_ladder_gauge_sensitivity_is_real_bounded_and_reciprocity_blind():
     from bse.bse_ring_comm import make_bse_shardings
     from common.collectives import single_device_mesh
     from bse.bse_serial import compute_pair_amplitude
-    from bse.bse_w_exact import _theta, _spin_rotation
+    from bse.bse_w_exact import _theta
+    from symmetry_maps import spinor_rotation_for_sym_row
     mesh = single_device_mesh()
     data, neg = _trs_synthetic_payload(mesh)
     # a degenerate pair at a source slot, so the gauge freedom is non-trivial
@@ -599,7 +602,8 @@ def test_w_ladder_gauge_sensitivity_is_real_bounded_and_reciprocity_blind():
     rel_a = _reciprocity_of_production(data, mesh, q, cols)
 
     rng = np.random.default_rng(41)
-    R = _spin_rotation(1)
+    R = spinor_rotation_for_sym_row(
+        np.eye(2)[None], 1, 1, nspinor=1, R_cart=np.eye(3)[None])
     sh = make_bse_shardings(mesh)
     gaugeB = dict(data)
     for nm in ("psi_c", "psi_v"):
