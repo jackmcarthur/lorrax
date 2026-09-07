@@ -1,6 +1,6 @@
 """Host-only fitting of Run306 small Grams; no full matrices or HDF5 reads.
 
-Training rows are [0:36,44:80] in each 88-row real channel Gram.
+Training rows are [0:Nt,Nt+Nh:2*Nt+Nh] in each 2*(Nt+Nh) channel Gram.
 Saved row maps act on unweighted [H_train; A_train], in this order.
 """
 
@@ -25,7 +25,12 @@ from measure import spectrum
 ORDER = Path('/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/152_shared_pole_push_2026-09-07/exchange/order/weight.npz')
 ORDER_SHA = '27eb75153dc49849e6c5f3d27cbff24514f7ff28a0f705bc864be34c1b82b0f2'
 EV = 13.605693122994
-TRAIN = np.r_[np.arange(36), np.arange(44, 80)]
+
+
+def train_indices(bank):
+    """Indices of unweighted Htrain then Atrain in a full train/held Gram."""
+    nt, nh = len(bank['z']), len(bank['zh'])
+    return np.r_[np.arange(nt), np.arange(nt)+nt+nh]
 
 
 def sha(path):
@@ -105,13 +110,17 @@ def errors_from_gram(z_all, indices, row_map, poles, gram, weights):
     stored H/A rows. Linear Coulomb congruence commutes with this same map,
     so either whitened or physical channel Gram can be scored directly.
     """
-    selection = np.eye(88)[TRAIN]
+    nall = len(z_all)
+    nt = row_map.shape[1]//2
+    if row_map.shape[1] != 2*nt or gram.shape != (2*nall,2*nall):
+        raise ValueError('Residual row-map/Gram shape mismatch')
+    selection = np.eye(2*nall)[np.r_[np.arange(nt),np.arange(nt)+nall]]
     phi = varpro.basis(z_all[indices], poles)
     prediction = np.vstack((phi.real, phi.imag)) @ row_map @ selection
-    reference = np.eye(88)[np.r_[indices, indices+44]]
+    reference = np.eye(2*nall)[np.r_[indices, indices+nall]]
     residual = prediction - reference
     row_error = np.einsum('ij,jk,ik->i', residual, gram, residual)
-    row_norm = np.diag(gram)[np.r_[indices, indices+44]]
+    row_norm = np.diag(gram)[np.r_[indices, indices+nall]]
     w = np.r_[weights, weights]
     denominator = float(w @ row_norm)
     numerator = float(w @ row_error)
@@ -129,7 +138,8 @@ def line_errors(bank, fitted, omega, weight):
     """Report each train/held height, in whitened and physical coordinates."""
     z_all = np.r_[bank['z'], bank['zh']]
     result = {}
-    for split, base in [('train', np.arange(36)), ('held', np.arange(36,44))]:
+    nt = len(bank['z'])
+    for split, base in [('train', np.arange(nt)), ('held', np.arange(nt,len(z_all)))]:
         for height in np.unique(np.round(z_all[base].imag * EV, 9)):
             indices = base[np.round(z_all[base].imag * EV, 9) == height]
             loss = line_weights(z_all[indices], omega, weight)
@@ -149,8 +159,13 @@ def load_gram(path):
         raise FileNotFoundError(f'Gram input missing (production may still be running): {path}')
     with np.load(path, allow_pickle=False) as data:
         bank = {key: data[key].copy() for key in data.files}
-    shapes = {'z': (36,), 'zh': (8,), 'channel_gram': (88,88),
-              'physical_channel_gram': (88,88), 'complex_gram': (36,36), 'sketches': (36,5)}
+    for key in ('z','zh'):
+        if key not in bank or bank[key].ndim != 1 or not bank[key].size:
+            raise ValueError(f'{path}: missing/empty/nonvector {key}')
+    nt, nh = len(bank['z']), len(bank['zh'])
+    nc = 2*(nt+nh)
+    shapes = {'z': (nt,), 'zh': (nh,), 'channel_gram': (nc,nc),
+              'physical_channel_gram': (nc,nc), 'complex_gram': (nt,nt), 'sketches': (nt,5)}
     for key, shape in shapes.items():
         if key not in bank or bank[key].shape != shape or not np.all(np.isfinite(bank[key])):
             raise ValueError(f'{path}: invalid {key}, expected finite shape {shape}')
@@ -166,7 +181,7 @@ def provenance():
             'source_sha256': {p.name: sha(p) for p in [Path(__file__), Path(varpro.__file__)]},
             'weight_path': str(ORDER), 'weight_sha256': ORDER_SHA,
             'weight_rule': 'trapezoid times ORDER; training heights normalized equally; held rows excluded',
-            'row_map_contract': 'unweighted Htrain[0:36], Atrain[44:80]; residues in Ry',
+            'row_map_contract': 'unweighted Htrain[0:Nt], Atrain[Nt+Nh:2*Nt+Nh]; residues in Ry',
             'scope': 'Hermitian-residue damped subcase only; no general complex residues, residue ranks, passivity, or Sigma score'}
 
 
@@ -184,7 +199,7 @@ def rank_summary(gram_dir, out_dir):
         scopes = {}
         groups = [(f'height_{h:.9f}_ev', np.flatnonzero(np.round(bank['z'].imag*EV,9) == h))
                   for h in np.unique(np.round(bank['z'].imag*EV,9))]
-        groups.append(('combined', np.arange(36)))
+        groups.append(('combined', np.arange(len(bank['z']))))
         for name, indices in groups:
             sw = np.sqrt(loss[indices])
             scopes[name] = spectrum(bank['complex_gram'][np.ix_(indices, indices)] * sw[:,None] * sw[None,:])
@@ -204,7 +219,41 @@ def rank_summary(gram_dir, out_dir):
         stream.write('\n'.join(lines)+'\n')
 
 
-def main(gram_dir, out_dir, check=False):
+def warm_start(directory, q, p, bank, loss):
+    """Authenticate a warm seed and refuse changes to the fixed fit functional.
+
+    Poles alone are seeded; every frequency and width remains an optimizer
+    variable. Training/held grids, weights, p, and solver implementation must
+    match. This verifies a fixed functional, not physical SC convergence.
+    """
+    path = directory/f'q{q:02d}_p{p:02d}.npz'
+    record_path = path.with_suffix('.json')
+    record = json.loads(record_path.read_text())
+    if record['status'] != 'FIT_COMPLETE' or record['q'] != q or record['p'] != p:
+        raise ValueError(f'Warm model is not a completed matching q/p: {record_path}')
+    if sha(path) != record['export_sha256']:
+        raise ValueError(f'Warm export hash mismatch: {path}')
+    if record['provenance']['source_sha256']['varpro.py'] != sha(varpro.__file__):
+        raise ValueError('Warm-start solver changed; cannot claim identical functional')
+    if record['provenance']['weight_sha256'] != ORDER_SHA:
+        raise ValueError('Warm-start ORDER functional changed')
+    old_gram_path = Path(record['input_path'])
+    if sha(old_gram_path) != record['input_sha256']:
+        raise ValueError(f'Warm input Gram hash mismatch: {old_gram_path}')
+    old_bank = load_gram(old_gram_path)
+    with np.load(path, allow_pickle=False) as old:
+        if (not np.array_equal(old['z_train_ry'], bank['z']) or
+                not np.array_equal(old['weights_loss'], loss) or
+                not np.array_equal(old_bank['zh'], bank['zh']) or
+                old['poles_ry'].shape != (p,)):
+            raise ValueError('Warm-start grid, weights, held grid, or p changed; fixed functional refused')
+        poles = old['poles_ry'].copy()
+    return poles, {'path': str(path), 'sha256': sha(path), 'receipt_path': str(record_path),
+                   'receipt_sha256': sha(record_path), 'grid_weights_solver_match': True,
+                   'pole_variables': 'all frequencies and widths remain free'}
+
+
+def main(gram_dir, out_dir, check=False, warm_dir=None):
     """Fit q slots distributed by SLURM_PROCID stride SLURM_NTASKS."""
     rank, tasks = int(os.getenv('SLURM_PROCID', '0')), int(os.getenv('SLURM_NTASKS', '1'))
     if tasks < 1 or not 0 <= rank < tasks:
@@ -219,6 +268,10 @@ def main(gram_dir, out_dir, check=False):
         if not (gram_dir/f'q{q:02d}.npz').is_file():
             raise FileNotFoundError(f'Missing assigned Gram q{q:02d} in {gram_dir}')
         for p in (8,16,24,32):
+            if warm_dir is not None:
+                for suffix in ('npz','json'):
+                    if not (warm_dir/f'q{q:02d}_p{p:02d}.{suffix}').is_file():
+                        raise FileNotFoundError(f'Warm-start q{q:02d} p{p:02d} {suffix} missing in {warm_dir}')
             for suffix in ('npz', 'json'):
                 path = out_dir/f'q{q:02d}_p{p:02d}.{suffix}'
                 if path.exists():
@@ -229,7 +282,8 @@ def main(gram_dir, out_dir, check=False):
         path = gram_dir/f'q{q:02d}.npz'
         bank = load_gram(path)
         loss = line_weights(bank['z'], omega, weight)
-        gram = bank['channel_gram'][np.ix_(TRAIN, TRAIN)]
+        training = train_indices(bank)
+        gram = bank['channel_gram'][np.ix_(training, training)]
         upstream_path = path.with_suffix('.json')
         upstream = json.loads(upstream_path.read_text()) if upstream_path.is_file() else {'receipt_missing': str(upstream_path)}
         for p in (8,16,24,32):
@@ -238,11 +292,16 @@ def main(gram_dir, out_dir, check=False):
                       'input_path': str(path), 'input_sha256': sha(path), 'upstream_receipt': upstream}
             try:
                 print(f'FIT q{q:02d} p={p} rank={rank} start', flush=True)
-                fitted = varpro.fit(bank['z'], loss, gram, bank['sketches'], p)
+                initial = None
+                if warm_dir is not None:
+                    initial, seed_receipt = warm_start(warm_dir, q, p, bank, loss)
+                    record['warm_start'] = seed_receipt
+                fitted = varpro.fit(bank['z'], loss, gram, bank['sketches'], p, initial=initial)
                 errors = line_errors(bank, fitted, omega, weight)
                 with stem.with_suffix('.npz').open('xb') as stream:
                     np.savez(stream, poles_ry=fitted['poles_ry'], row_map=fitted['row_map'],
-                             z_train_ry=bank['z'], weights_loss=loss, train_channel_indices=TRAIN)
+                             z_train_ry=bank['z'], z_held_ry=bank['zh'], weights_loss=loss,
+                             train_channel_indices=training)
                 record.update(status='FIT_COMPLETE', diagnostics={k:v for k,v in fitted.items() if k != 'row_map'},
                               line_errors=errors, export_path=str(stem.with_suffix('.npz')),
                               export_sha256=sha(stem.with_suffix('.npz')))
@@ -261,9 +320,10 @@ if __name__ == '__main__':
     parser.add_argument('--gram', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--synthetic-check', action='store_true')
+    parser.add_argument('--warm-start', type=Path, help='Matching q/p exports; grid/weights/solver equality required')
     parser.add_argument('--summary-only', action='store_true', help='Emit all-q original-Gram ORDER rank tables only')
     args = parser.parse_args()
     if args.summary_only:
         rank_summary(args.gram, args.out)
     else:
-        main(args.gram, args.out, args.synthetic_check)
+        main(args.gram, args.out, args.synthetic_check, args.warm_start)

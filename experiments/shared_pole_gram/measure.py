@@ -22,7 +22,7 @@ def spectrum(gram):
                 rank_frobenius={str(t): int(np.flatnonzero(tail <= t)[0]) for t in (1e-2, 1e-3, 1e-4)})
 
 
-def main(out):
+def main(out, data_banks=None):
     assert os.getenv('SLURM_JOB_ID'), 'Compute only'
     from runtime import initialize_communicator_stack
     initialize_communicator_stack()
@@ -38,7 +38,11 @@ def main(out):
     rep = NamedSharding(mesh, P())
     eig = plan('eigh', mesh, backend='distributed', n=896, batched_route='auto')
     owner = banks.low_owner(mesh)
-    low, broad, z, zh = banks.metadata()
+    low, broad, z, zh = banks.metadata(data_banks)
+    data_specs = low.get('data_banks')
+    ntrain, nheld = len(z), len(zh)
+    nall = ntrain+nheld
+    nlow = sum(len(bank['z']) for bank in data_specs) if data_specs else 12
     weights = banks.loss_weights(z)
     job = os.getenv('SLURM_JOB_ID')+'.'+os.getenv('SLURM_STEP_ID', '?')
     source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
@@ -81,8 +85,8 @@ def main(out):
     for q in range(29):
         start = time.perf_counter()
         print(f'GRAM q{q:02d} start job={job}',flush=True)
-        w, wh, v, provenance = banks.load(q, mesh, eig_jit, owner, broad)
-        assert w.shape == (36,896,896) and wh.shape == (8,896,896)
+        w, wh, v, provenance = banks.load(q, mesh, eig_jit, owner, broad, data_specs)
+        assert w.shape == (ntrain,896,896) and wh.shape == (nheld,896,896)
         ev, u = eig_jit(v)
         if float(ev[0]) <= 0:
             raise ValueError('Nonpositive Coulomb')
@@ -96,17 +100,23 @@ def main(out):
         sketches = np.asarray(sketch(ww,vd))
         record = dict(q=q, job_step=job, source=source, input_paths=provenance,
                       weight='trapezoid * 1/(1+(omega_eV/20)^2); each height normalized equally',
-                      low_floor=1e-14, broad_floor=0., scopes={})
-        for label, indices in [('low', np.arange(12)),('broad',np.arange(12,36)),('combined',np.arange(36))]:
+                      low_floor=0. if data_specs else 1e-14, broad_floor=0., scopes={},
+                      ntrain=ntrain, nheld=nheld, low_source='DATA physical' if data_specs else 'Run216',
+                      tail_source='Run300 A/B, unchanged unperturbed banks')
+        groups = [('low', np.arange(nlow)),('broad',np.arange(nlow,ntrain)),('combined',np.arange(ntrain))]
+        if data_specs:
+            groups += [(f'height_{height*banks.EV:.9f}_ev', np.flatnonzero(z.imag==height))
+                       for height in np.unique(z.imag)]
+        for label, indices in groups:
             wi = np.sqrt(weights[indices])
             g = gw[np.ix_(indices,indices)]*wi[:,None]*wi[None,:]
-            ci = np.r_[indices,indices+44]
+            ci = np.r_[indices,indices+nall]
             cw = np.r_[wi,wi]
             record['scopes'][label] = dict(complex=spectrum(g),
                 hermitian_channels=spectrum(gc[np.ix_(ci,ci)]*cw[:,None]*cw[None,:]), rows=len(indices))
         record['seconds'] = time.perf_counter()-start
         record['allocator'] = os.getenv('XLA_PYTHON_CLIENT_ALLOCATOR','runtime default')
-        record['peak_bank_bytes_per_rank'] = int(44*896*896*16/4)
+        record['peak_bank_bytes_per_rank'] = int(nall*896*896*16/4)
         if jax.process_index()==0:
             with (out/f'q{q:02d}.npz').open('xb') as stream:
                 np.savez(stream, z=z, zh=zh, weights=weights, complex_gram=gw,
@@ -128,5 +138,7 @@ def main(out):
 if __name__=='__main__':
     parser=argparse.ArgumentParser()
     parser.add_argument('--out',type=Path,required=True)
+    parser.add_argument('--data-bank',type=Path,action='append',default=None,
+                        help='Repeatable COMPLETE DATA physical bank; replaces Run216, retains Run300 A/B tail')
     args=parser.parse_args()
-    main(args.out)
+    main(args.out, args.data_bank)
