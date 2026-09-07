@@ -3212,7 +3212,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                  else inputs.dipole_velocity_dft)
         ratio = (float(jnp.max(jnp.abs(delta_velocity_dft)))
                  / max(float(jnp.max(jnp.abs(v_ref))), 1e-300))
-        inputs.print_fn(
+        # The SC record channel (record_fn), like every other per-map line;
+        # inputs.print_fn is the bare print the production stream swallows.
+        _record_sc(
+            inputs,
             f"    SC current carriers: max|v_Delta| / max|v_DFT| = "
             f"{ratio:.3e} ({inputs.current_velocity_update})")
 
