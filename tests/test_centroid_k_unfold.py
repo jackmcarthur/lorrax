@@ -168,6 +168,8 @@ def _emulated_flat_k_fftn(mesh, kgrid, spec, *, norm="ortho",
 def _local_gemm_plan(_mesh, **_kwargs):
     gemm = lambda a, b: jnp.einsum("qmk,qkn->qmn", a, b, optimize=True)
     gemm.mesh = _mesh
+    gemm.in_sharding_a = NamedSharding(_mesh, P(None, "x", "y"))
+    gemm.in_sharding_b = gemm.in_sharding_a
     return gemm
 
 

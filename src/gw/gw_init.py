@@ -844,7 +844,8 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 	enk, _ = get_enk_bandrange(wfn, sym, band_slices.full_range,
 	                         (band_slices.b1, band_slices.b3), nspinor=4)
 	wfns = wavefunctions_face_from_restart(
-				None, None, layout="face" if cfg.memory.low_mem_bands else "axis", enk_full=enk, slices=band_slices, mesh_xy=mesh_xy)
+		None, None, layout="face" if cfg.memory.low_mem_bands else "axis",
+		enk_full=enk, slices=band_slices, mesh_xy=mesh_xy)
 	carrier = build_packed_parent_green_carrier(
 		wfns, nmu, mun, plan=plan, mesh_xy=mesh_xy)
 	return dict(meta=meta_T, centroid_indices=cent_T_idx, green_parent=carrier)
@@ -2200,7 +2201,7 @@ def _fit_charge_zeta_channel(
                     chunks.get('cache_face_y_blocks', False)),
                 write_ibz_only=_write_ibz_only_charge,
                 zeta_cutoff_ry=_zeta_cutoff,
-            layout="face" if cfg.memory.low_mem_bands else "axis",
+                layout="face" if cfg.memory.low_mem_bands else "axis",
                 print_fn=print_fn,
                 bispinor_lift=(representation.charge_lift or "raw"),
                 k_unfold_plan=k_unfold_plan,
@@ -2326,7 +2327,7 @@ def _transverse_zeta_channel_runner(
                 bispinor_lift=(representation.current_lift or "raw"),
                 write_ibz_only=_write_ibz_only_transverse,
                 zeta_cutoff_ry=_zeta_cutoff,
-            layout="face" if cfg.memory.low_mem_bands else "axis",
+                layout="face" if cfg.memory.low_mem_bands else "axis",
                 _coupled_mu123_coordinator=coordinator,
                 _coupled_rank_gate=(
                     (lambda stage: _drain_coupled_rank_findings(
@@ -3027,7 +3028,7 @@ def _write_fresh_restart(
     		psi_parent_y=_to_file_order(sigma_parent_carrier.psi_nmu, (3,)),
     		psi_parent_y_mun=_to_file_order(sigma_parent_carrier.psi_mun, (2,)),
     		parent_k_rows=_candidate_plan.parent_full_rows,
-            psi_layout=sigma_parent_carrier.layout,
+    		psi_layout=sigma_parent_carrier.layout,
     		mesh=mesh_xy, mode="a",
     		psi_parent_y_transverse=(
     			_to_file_order(parent_T.psi_nmu, (3,), basis_T) if parent_T is not None else None),

@@ -68,7 +68,7 @@ def _real_eigh_U(rng, nk, na):
 
 
 def check_rotate_face_parity(mesh, *, ns, nk, n_rmu, nb_full, edges,
-                             active_slice, seed):
+                             active_slice, seed, layout="face"):
     """Rotate complex eigenvector columns and preserve inactive bands exactly."""
     from jax.experimental import multihost_utils as mhu
     rng = np.random.default_rng(seed)
@@ -83,7 +83,7 @@ def check_rotate_face_parity(mesh, *, ns, nk, n_rmu, nb_full, edges,
             jax.device_put(psi, rep4),
             jax.device_put(psi.conj().transpose(0, 3, 1, 2), rep4),
             enk_full=jax.device_put(energies, NamedSharding(mesh, P(None, None))),
-            slices=slices, mesh_xy=mesh)
+            slices=slices, mesh_xy=mesh, layout=layout)
         out = rotate_wavefunctions(
             wfns, U, enk_active_new=E_new, efermi=0.0, mesh_xy=mesh,
             active_slice=None if active_slice is None else slice(a_lo, a_hi))
@@ -118,6 +118,14 @@ def test_rotate_wavefunctions_face_matches_numpy(name, kwargs):
             f"real check (see this module's docstring)")
     mesh = Mesh(np.asarray(jax.devices()).reshape(PX, PY), ("x", "y"))
     check_rotate_face_parity(mesh, **kwargs)
+
+
+@pytest.mark.parametrize("name,kwargs", _CASES, ids=[c[0] for c in _CASES])
+def test_rotate_wavefunctions_axis_matches_numpy(name, kwargs):
+    from lxkit.testing import require_devices
+    require_devices(4, "cpu")
+    mesh = Mesh(np.asarray(jax.devices("cpu")[:4]).reshape(2, 2), ("x", "y"))
+    check_rotate_face_parity(mesh, **kwargs, layout="axis")
 
 
 def _cli_main():

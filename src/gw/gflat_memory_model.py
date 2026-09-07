@@ -378,32 +378,11 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
     selected post-slice q extent ``nq_disk``.  ``nq`` remains the full-zone
     extent used by the C/Z construction stages.
 
-    ``psi_copies`` prices the RESOLVED ``Wavefunctions`` layout
-    (``gw.wavefunction_bundle``, report
-    ``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md`` §verdict/§7):
-
-      ``low_mem_bands=False`` (``layout="legacy"``, the default): the four
-      ψ centroid copies are single-axis ÷√P (2 on 'x', 2 on 'y') — the
-      corrected centroid term (design §5 bug #4: NOT ÷p_xy).
-      ``2·S/Px + 2·S/Py`` where ``S = psi_one``.
-
-      ``low_mem_bands=True`` (``layout="face"``): exactly TWO copies, both
-      2-D sharded on the FULL (x, y) mesh (``psi_nmu``, ``psi_mun``).
-      ``2·S/(Px·Py)`` — the ``2·√P`` reduction on a square mesh the
-      feature exists for.
-
-      As of the zeta-fit face-CCT and r-chunk redesigns
-      (feat/zeta-fit-face-psi and feat/zeta-fit-rchunk-face-psi,
-      2026-08-22), this term is GENUINELY accurate for Stages A--D
-      (centroid load, CCT/Cholesky): ``gw.gw_init.prepare_isdf_and_
-      wavefunctions`` builds ``psi_nmu``/``psi_mun`` immediately after the
-      fresh load and drops the single-axis ψ_Y copy BEFORE the fit runs,
-      and ``gw.isdf_fitting.fit_zeta_to_h5``'s CCT step (STEP 2) reads
-      them directly (``isdf.core.c_q_from_psi_sm(layout='face')``, a
-      distributed SUMMA GEMM) instead of single-axis Y-forms.  Stages C/D
-      read the band-contraction operand from that same persistent face
-      carrier; their bounded incremental workspace is disclosed separately
-      by ``GFlatChunkPlan.stage_cd_psi_bytes``.
+    ``psi_copies`` prices the two resolved centroid arrays: face costs
+    ``2*S/(Px*Py)`` and axis costs ``S/Px + S/Py``, with
+    ``S = 16*n_parent*ns*mu*nb`` bytes on the parent route. Bands are
+    sharded in face and complete in axis; both retain the same parent rows.
+    Stage-C/D incremental workspaces are disclosed separately.
 
     ``loader_tables`` is the WFN loader's REPLICATED per-k metadata (the
     sparse-G→FFT-box index + the τ-phase row), retained for the loader's
@@ -415,7 +394,7 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
     if low_mem_bands:
         psi_copies = 2.0 * psi_one / P_
     else:
-        psi_copies = 2 * psi_one / p_x + 2 * psi_one / p_y
+        psi_copies = psi_one / p_x + psi_one / p_y
     if parent_route is not None:
         # The raw-parent carrier: one face pair at n_parent rows
         # (gw.wavefunction_bundle.ParentGreenCarrier).  Under parents-only
@@ -763,12 +742,11 @@ def plan_gflat_chunks(
     is conservatively priced as ``replicated``; the live resolver may choose
     ``per_q`` at execution time, but that cannot make this plan optimistic.
 
-    ``low_mem_bands`` (the deck key of the same name; default ``False``)
-    selects which ``Wavefunctions`` layout ``_persistent_bytes`` and the
-    Stage-E base price the ψ centroid inventory as — see
-    :func:`_persistent_bytes`.  When that face inventory fits but the
-    all-band ψ(r) hoist does not, it also selects the canonical streamed
-    band-chunk FFT route.  The legacy/default route retains the hoist.
+    ``low_mem_bands`` selects the face or axis centroid inventory; the
+    deck default is True. Both layouts use the parent band-chunk route,
+    including its streamed FFT fallback when the all-band r cache does
+    not fit. The function default preserves callers' explicit inventory
+    convention; production passes the resolved deck value.
 
     ``face_current_vertex`` selects the nonidentity-current face executable's
     measured ``ns²`` arena.  False preserves the independently calibrated
@@ -1322,27 +1300,10 @@ def plan_gflat_chunks(
     # lx-Xg4-005932 (forced 8x8) and JID 57281385 step .28 (natural 9x9).
     C_t = max(C_fit_t, solve_t + _zq_live)
     D_t = zeta_chunk_D + fft_per_row * gflat_cs
-    # Stage E (V_q) has its OWN base: L_q + gflat_acc are freed post-fit.
-    # Transient = V_acc + the ζ slabs read from disk (+ their single-axis
-    # resharded copies).  The RESIDENT ψ term prices the resolved layout
-    # (report §7), same split as ``_persistent_bytes``:
-    #
-    #   low_mem_bands=False (legacy): only ~2 of the 4 centroid copies are
-    #   still live at this point (fit_zeta's own psi_rmu_Y/psi_rmuT_X
-    #   fit-input copies — the caller has not yet built the four-copy
-    #   bundle, which happens after V_q) — HALF of the fit-loop persistent
-    #   term: S/Px + S/Py.
-    #
-    #   low_mem_bands=True (face): the fresh path converts to the two
-    #   face copies and DELETES the fit-input copies before V begins (see
-    #   gw.gw_init.prepare_isdf_and_wavefunctions), so the SAME 2S/(Px·Py)
-    #   that is live for the rest of the run is already what is resident
-    #   here — there is no separate "post-fit narrowing" step to price.
+    # V_q and tensor writes retain exactly the same parent psi copies;
+    # the fit's L_q and gflat accumulator have been released.
     psi_one = _c128(nk, ns, mu, inventory_nb)
-    if parent_algorithm:
-        E_base = 2.0 * psi_one / p_xy
-    else:
-        E_base = psi_one / p_x + psi_one / p_y
+    E_base = persistent["psi_copies"]
     # Stage-C/D disclosure (GFlatChunkPlan.stage_cd_psi_bytes docstring).
     # The face value is already present in the separate build/pair peaks.
     #

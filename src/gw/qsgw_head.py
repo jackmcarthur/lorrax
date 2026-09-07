@@ -1105,7 +1105,7 @@ def _head_wing_kernel(
 ) -> Callable:
     """Build the canonical face head-wing kernel with bounded centroid tiles."""
     if layout not in ("face", "axis"):
-        raise ValueError(f"_head_wing_kernel requires layout='face', got {layout!r}")
+        raise ValueError(f"_head_wing_kernel requires face or axis layout, got {layout!r}")
     return _head_wing_kernel_face(
         mesh, nb_logical=int(nb_logical), include_surface=bool(include_surface), layout=layout)
 
@@ -1381,7 +1381,7 @@ def head_wings_sharded(
 ):
     """Contract energy-scaled velocity jets with centroid vertices on canonical faces or parents."""
     if getattr(wfns, "layout", None) not in ("face", "axis"):
-        raise ValueError("head_wings_sharded requires the canonical face layout")
+        raise ValueError("head_wings_sharded requires a canonical face or axis layout")
     return _head_wings_sharded_face(
         velocity_cart, wfns, energies_kn_ry, occupations_kn, omegas_ry,
         mesh=mesh, nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
@@ -1545,7 +1545,7 @@ def static_head_wings_sharded(
 ):
     """Sum the static density vertex with minus the supplied negative occupation derivative."""
     if getattr(wfns, "layout", None) not in ("face", "axis"):
-        raise ValueError("static_head_wings_sharded requires the canonical face layout")
+        raise ValueError("static_head_wings_sharded requires a canonical face or axis layout")
     return _static_head_wings_sharded_face(
         wfns, surface_weight_kn, mesh=mesh, nb_logical=nb_logical,
         nk_tot=nk_tot, nspin=nspin, nspinor=nspinor)

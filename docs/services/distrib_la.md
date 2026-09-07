@@ -1102,3 +1102,17 @@ replicated global pivot.
   calls in `isdf/core.py` exist only for their raise; wrapping any of them
   turns a loud refusal into a silent different-backend run
   (`tests/test_charge_zeta_route.py` pins all six).
+
+## Parent wavefunction contractions
+
+`gemm_plan(..., layout="face" | "axis")` resolves the carrier's contraction
+once. Face selects distributed GEMM; axis selects `local_gemm_plan`, returning
+the same `GemmPlan` interface. The default axis operands are
+`A(q,m_X,k)` and `B(q,k,n_Y)`, with complete local k and output
+`D(q,m_X,n_Y)`. There is no collective in this band contraction.
+
+For projection of a tiled centroid operator, `reduction_axis="y"` or `"x"`
+selects the corresponding local tile GEMM followed by centroid reduce-scatter.
+These reductions do not apply to Green or zeta band sums. SC band rotations
+use `out_spec=P(None,"x",None)` or `P(None,None,"y")` to retain the carrier's
+single-axis centroid sharding. They do not create another Green algorithm.

@@ -217,9 +217,11 @@ def test_where_returns_exact_zero_where_the_multiply_would_give_nan():
 def gemm():
     """Isolate phase and selector algebra from the native distributed GEMM backend."""
     import jax
-    from jax.sharding import Mesh
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     plan = lambda left, right: left @ right
     plan.mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    plan.in_sharding_a = NamedSharding(plan.mesh, P(None, "x", "y"))
+    plan.in_sharding_b = plan.in_sharding_a
     return plan
 
 
