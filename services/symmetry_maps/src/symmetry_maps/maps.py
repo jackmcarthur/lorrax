@@ -2311,6 +2311,17 @@ class SymMaps:
                 its ``2·ntran`` candidate layout because wavefunction and
                 nonsymmorphic-phase consumers key conjugation from the row.
         """
+        self._initialize_symmetry_provenance(wfn, allow_trs)
+        ntran = self._initialize_active_operations(wfn)
+        if self._validate_identity_grid(wfn, ntran):
+            self._initialize_identity_maps(wfn)
+            return
+        operator_tables = self._initialize_spatial_operators(wfn)
+        self._initialize_k_maps(wfn, operator_tables)
+        self._initialize_q_maps(wfn)
+
+    def _initialize_symmetry_provenance(self, wfn, allow_trs):
+        """Initialize the authenticated time-reversal policy and its provenance."""
         # Measured-TRS gate.  The old allow_trs override and the missing-field
         # permissive default could both assert a symmetry the DFT state had
         # not established.  Refuse those paths by name; every executable
@@ -2358,6 +2369,8 @@ class SymMaps:
                 "WfnLoader(..., qe_schema=...).",
                 RuntimeWarning)
 
+    def _initialize_active_operations(self, wfn):
+        """Produce the authorized operation rows and their spatial extent."""
         # get symmetry matrices from wfn file
         try:
             ntran = int(getattr(wfn, 'ntran', 1))
@@ -2394,6 +2407,10 @@ class SymMaps:
         self.active_symmetry_rows = (
             np.arange(2 * ntran, dtype=np.int32)
             if self.trs_allowed else _qe_base_rows.copy())
+        return ntran
+
+    def _validate_identity_grid(self, wfn, ntran):
+        """Produce the identity-grid verdict after validating stored k coordinates."""
         _kgrid = np.asarray(wfn.kgrid, dtype=np.int64)
         if _kgrid.shape != (3,) or np.any(_kgrid <= 0):
             raise ValueError(
@@ -2431,112 +2448,115 @@ class SymMaps:
                     f"{_nfull_declared}, but its stored k coordinates do not "
                     f"cover the declared uniform mesh; {_bad.size} rows are "
                     f"missing, first {_declared_grid[_bad[0]].tolist()}.")
+        return _identity_full_grid
 
-        if _identity_full_grid:
-            # Trivial identity-only symmetry path
-            self.sym_matrices = np.eye(3, dtype=np.int32)[None, :, :]
-            # ``sym_mats_k`` MUST be TRS-augmented to length ``2·ntran``
-            # exactly like the general branch below: every consumer
-            # (``unfold_psi``/``spinor_rotation_for_sym_row`` derive
-            # ``n_sym_spatial = len(sym_mats_k)//2``, ``zeta_loader``'s q-IBZ
-            # TR mapping, ``compute_vcoul``'s q lookup) assumes the spatial
-            # half is followed by the ``-S`` time-reversal half.  Leaving it at
-            # length 1 made ``n_sym_spatial = 1//2 = 0``, so ``unfold_psi``
-            # classified the *identity* row (sym_idx=0) as a TRS row and
-            # returned ``iσ_y·conj(ψ)`` on an un-negated G-list — i.e. it
-            # silently replaced ψ(r) by ψ*(−r) for EVERY k of any
-            # symmetry-free (``nosym``) WFN.  Norms, ⟨ψ_m|ψ_n⟩, T and
-            # (because ρ is inverted too) V_H all survive that, so it only
-            # shows up in the position-dependent ionic terms: V_NL
-            # collapses and V_loc shifts by O(100 eV).  See scorecard §Q.
-            _sym_mats_k = self.sym_matrices.transpose(0, 2, 1).copy()
-            self.sym_mats_k = np.concatenate(
-                [_sym_mats_k, -_sym_mats_k], axis=0)
-            # Rows this instance is ALLOWED to select (see ``trs_allowed``).
-            # In this branch ``sym_idx_k`` is identically zero anyway, so
-            # the restriction is documentation of intent; it is still set
-            # so every code path can read one attribute.
-            self._sym_row_ids_search = self.active_symmetry_rows.copy()
-            self._sym_mats_k_search = self.sym_mats_k[
-                self._sym_row_ids_search]
-            self.translations = np.zeros((1, 3), dtype=np.float64)
+    def _initialize_identity_maps(self, wfn):
+        """Initialize reciprocal, spinor and q maps for a full identity grid."""
+        # Trivial identity-only symmetry path
+        self.sym_matrices = np.eye(3, dtype=np.int32)[None, :, :]
+        # ``sym_mats_k`` MUST be TRS-augmented to length ``2·ntran``
+        # exactly like the general branch below: every consumer
+        # (``unfold_psi``/``spinor_rotation_for_sym_row`` derive
+        # ``n_sym_spatial = len(sym_mats_k)//2``, ``zeta_loader``'s q-IBZ
+        # TR mapping, ``compute_vcoul``'s q lookup) assumes the spatial
+        # half is followed by the ``-S`` time-reversal half.  Leaving it at
+        # length 1 made ``n_sym_spatial = 1//2 = 0``, so ``unfold_psi``
+        # classified the *identity* row (sym_idx=0) as a TRS row and
+        # returned ``iσ_y·conj(ψ)`` on an un-negated G-list — i.e. it
+        # silently replaced ψ(r) by ψ*(−r) for EVERY k of any
+        # symmetry-free (``nosym``) WFN.  Norms, ⟨ψ_m|ψ_n⟩, T and
+        # (because ρ is inverted too) V_H all survive that, so it only
+        # shows up in the position-dependent ionic terms: V_NL
+        # collapses and V_loc shifts by O(100 eV).  See scorecard §Q.
+        _sym_mats_k = self.sym_matrices.transpose(0, 2, 1).copy()
+        self.sym_mats_k = np.concatenate(
+            [_sym_mats_k, -_sym_mats_k], axis=0)
+        # Rows this instance is ALLOWED to select (see ``trs_allowed``).
+        # In this branch ``sym_idx_k`` is identically zero anyway, so
+        # the restriction is documentation of intent; it is still set
+        # so every code path can read one attribute.
+        self._sym_row_ids_search = self.active_symmetry_rows.copy()
+        self._sym_mats_k_search = self.sym_mats_k[
+            self._sym_row_ids_search]
+        self.translations = np.zeros((1, 3), dtype=np.float64)
 
-            # In no-symmetry case, unfolded grid equals irreducible grid
-            self.unfolded_kpts = np.asarray(wfn.kpoints, dtype=float)
+        # In no-symmetry case, unfolded grid equals irreducible grid
+        self.unfolded_kpts = np.asarray(wfn.kpoints, dtype=float)
 
-            # Maps: each full k maps to itself; only identity symmetry
-            self.irr_idx_k = np.arange(self.unfolded_kpts.shape[0], dtype=np.int32)
-            self.sym_idx_k = np.zeros(self.unfolded_kpts.shape[0], dtype=np.int32)
+        # Maps: each full k maps to itself; only identity symmetry
+        self.irr_idx_k = np.arange(self.unfolded_kpts.shape[0], dtype=np.int32)
+        self.sym_idx_k = np.zeros(self.unfolded_kpts.shape[0], dtype=np.int32)
 
-            self.nk_tot = int(self.unfolded_kpts.shape[0])
-            self.nk_red = int(getattr(wfn, 'nkpts', self.nk_tot))
+        self.nk_tot = int(self.unfolded_kpts.shape[0])
+        self.nk_red = int(getattr(wfn, 'nkpts', self.nk_tot))
 
-            # kirr_fullids: identity mapping
-            self.kirr_fullids = np.arange(self.nk_red, dtype=np.int32)
+        # kirr_fullids: identity mapping
+        self.kirr_fullids = np.arange(self.nk_red, dtype=np.int32)
 
-            # Rotation matrices and spinor (identity)
-            self.R_grid = np.eye(3, dtype=np.int32)[None, :, :]
-            self.Rinv_grid = self.R_grid.copy()
-            # Keep the same augmented-row invariant as ``sym_mats_k``:
-            # the TRS row is the negative Cartesian row.  The old one-row
-            # special case made ``cartesian_action(sym_idx, ...)`` fail on
-            # an identity-only WFN if a measured policy selected its TRS
-            # partner, despite the reciprocal table correctly having two
-            # rows.
-            _R_identity = self.R_grid.astype(float)
-            self.R_cart = np.concatenate(
-                [_R_identity, -_R_identity], axis=0)
-            self.U_spinor = np.eye(2, dtype=complex)[None, :, :]
-            # Build direct integer-grid lookup for the identity/no-symmetry case.
-            kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
-            shift = np.asarray(getattr(wfn, "shift", (0.0, 0.0, 0.0)), dtype=np.float64)
-            shift_frac = shift / kgrid.astype(np.float64)
-            kpts_wrapped = np.mod(self.unfolded_kpts - shift_frac[None, :], 1.0)
-            self.kvecs_asints = np.mod(
-                np.rint(kpts_wrapped * kgrid[None, :]).astype(np.int32),
-                kgrid[None, :],
-            )
+        # Rotation matrices and spinor (identity)
+        self.R_grid = np.eye(3, dtype=np.int32)[None, :, :]
+        self.Rinv_grid = self.R_grid.copy()
+        # Keep the same augmented-row invariant as ``sym_mats_k``:
+        # the TRS row is the negative Cartesian row.  The old one-row
+        # special case made ``cartesian_action(sym_idx, ...)`` fail on
+        # an identity-only WFN if a measured policy selected its TRS
+        # partner, despite the reciprocal table correctly having two
+        # rows.
+        _R_identity = self.R_grid.astype(float)
+        self.R_cart = np.concatenate(
+            [_R_identity, -_R_identity], axis=0)
+        self.U_spinor = np.eye(2, dtype=complex)[None, :, :]
+        # Build direct integer-grid lookup for the identity/no-symmetry case.
+        kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
+        shift = np.asarray(getattr(wfn, "shift", (0.0, 0.0, 0.0)), dtype=np.float64)
+        shift_frac = shift / kgrid.astype(np.float64)
+        kpts_wrapped = np.mod(self.unfolded_kpts - shift_frac[None, :], 1.0)
+        self.kvecs_asints = np.mod(
+            np.rint(kpts_wrapped * kgrid[None, :]).astype(np.int32),
+            kgrid[None, :],
+        )
 
-            lookup = -np.ones(tuple(int(x) for x in kgrid), dtype=np.int32)
-            lookup[
-                self.kvecs_asints[:, 0],
-                self.kvecs_asints[:, 1],
-                self.kvecs_asints[:, 2],
-            ] = np.arange(self.unfolded_kpts.shape[0], dtype=np.int32)
+        lookup = -np.ones(tuple(int(x) for x in kgrid), dtype=np.int32)
+        lookup[
+            self.kvecs_asints[:, 0],
+            self.kvecs_asints[:, 1],
+            self.kvecs_asints[:, 2],
+        ] = np.arange(self.unfolded_kpts.shape[0], dtype=np.int32)
 
-            # k−q maps on the unfolded (which equals reduced) grid.
-            # Use direct modular arithmetic instead of the generic O(nk^3) search path.
-            kminusq_mod = np.mod(
-                self.kvecs_asints[:, None, :] - self.kvecs_asints[None, :, :],
-                kgrid[None, None, :],
-            )
-            self.kqfull_map = lookup[
-                kminusq_mod[:, :, 0],
-                kminusq_mod[:, :, 1],
-                kminusq_mod[:, :, 2],
-            ]
-            self.kq_map = self.kqfull_map.copy()
+        # k−q maps on the unfolded (which equals reduced) grid.
+        # Use direct modular arithmetic instead of the generic O(nk^3) search path.
+        kminusq_mod = np.mod(
+            self.kvecs_asints[:, None, :] - self.kvecs_asints[None, :, :],
+            kgrid[None, None, :],
+        )
+        self.kqfull_map = lookup[
+            kminusq_mod[:, :, 0],
+            kminusq_mod[:, :, 1],
+            kminusq_mod[:, :, 2],
+        ]
+        self.kq_map = self.kqfull_map.copy()
 
-            # Integer q enumerations for k' - k outside the first BZ.
-            qpt_vecs = self.kvecs_asints[:, None, :] - self.kvecs_asints[None, :, :]
-            self.all_unfolded_qpts, inverse = np.unique(
-                qpt_vecs.reshape(-1, 3),
-                axis=0,
-                return_inverse=True,
-            )
-            self.all_unfolded_qpt_ids = inverse.reshape(
-                self.kvecs_asints.shape[0],
-                self.kvecs_asints.shape[0],
-            ).astype(np.int32)
+        # Integer q enumerations for k' - k outside the first BZ.
+        qpt_vecs = self.kvecs_asints[:, None, :] - self.kvecs_asints[None, :, :]
+        self.all_unfolded_qpts, inverse = np.unique(
+            qpt_vecs.reshape(-1, 3),
+            axis=0,
+            return_inverse=True,
+        )
+        self.all_unfolded_qpt_ids = inverse.reshape(
+            self.kvecs_asints.shape[0],
+            self.kvecs_asints.shape[0],
+        ).astype(np.int32)
 
-            # Trivial-sym q-IBZ: each full-BZ q is its own IBZ partner under identity.
-            n_full = int(self.kvecs_asints.shape[0])
-            self.irr_idx_q = np.arange(n_full, dtype=np.int32)
-            self.sym_idx_q = np.zeros(n_full, dtype=np.int32)
-            self.q_irr_full_idx = np.arange(n_full, dtype=np.int32)
-            self.q_irr_kgrid_int = self.kvecs_asints.copy()
-            return
+        # Trivial-sym q-IBZ: each full-BZ q is its own IBZ partner under identity.
+        n_full = int(self.kvecs_asints.shape[0])
+        self.irr_idx_q = np.arange(n_full, dtype=np.int32)
+        self.sym_idx_q = np.zeros(n_full, dtype=np.int32)
+        self.q_irr_full_idx = np.arange(n_full, dtype=np.int32)
+        self.q_irr_kgrid_int = self.kvecs_asints.copy()
 
+    def _initialize_spatial_operators(self, wfn):
+        """Produce the spatial operator tables and authorized search rows."""
         # THE G-SPACE ACTION USES ``mtrx.T``, NOT ``mtrx``.  This comment
         # used to say `G' = mtrx @ G`, which contradicts both the line
         # directly below it (``sym_mats_k = mtrx.transpose(0,2,1)``) and
@@ -2567,7 +2587,7 @@ class SymMaps:
         # API.  Slice to ``[:ntran]`` to match ``sym_matrices`` —
         # legacy WFN files pad ``tnp`` to length 48.
         self.translations = _operator_tables.translations
-        
+
         # Add time-reversal symmetry (k → -k) combined with each spatial symmetry
         # This is needed because QE uses time-reversal to reduce k-points, but doesn't
         # store it as one of the ntran symmetries.
@@ -2632,7 +2652,10 @@ class SymMaps:
                     "operation-specific antiunitary row(s); arbitrary "
                     "k<->-k partners remain disabled.",
                     RuntimeWarning)
+        return _operator_tables
 
+    def _initialize_k_maps(self, wfn, _operator_tables):
+        """Initialize full-zone parent maps and their Cartesian and spinor actions."""
         # The list of full-zone k-points.  The k_full -> k_irr PARENT MAP
         # this used to compute alongside it is gone (design decision 4):
         # it was a second, independently-ruled derivation of the same
@@ -2709,12 +2732,12 @@ class SymMaps:
         # useful maps:
         # k (full zone) to kbar 
         # k,q (both full zone) to k-q (full zone)
-        
+
         # Get rotation matrices and their spinor representations
         self.R_grid = np.rint(self.sym_matrices).astype(np.int32)
         self.Rinv_grid = np.rint(np.linalg.inv(self.R_grid)).astype(np.int32)
 
-        
+
         # ``R_cart`` covers the full ``2·ntran``-row sym_mats_k (kept for
         # any caller that needs cartesian-frame rotations e.g. for current
         # density / transverse channels). ``U_spinor`` is restricted to the
@@ -2727,6 +2750,9 @@ class SymMaps:
         # Site #6 for the per-element derivation.
         self.R_cart = _operator_tables.R_cart
         self.U_spinor = _operator_tables.U_spinor
+
+    def _initialize_q_maps(self, wfn):
+        """Initialize k-minus-q maps and irreducible q representatives."""
         self.kq_map = self.get_kminusq_map(wfn, self.unfolded_kpts)
         self.kqfull_map = self.get_kminusqfull_map(wfn, self.unfolded_kpts)
 
@@ -2766,6 +2792,7 @@ class SymMaps:
         # the q_irr_kgrid_int row ordering).
         _, first_occ = np.unique(irr_idx_q, return_index=True)
         self.q_irr_full_idx = np.sort(first_occ).astype(np.int32)
+
 
 
     def get_qpt_id_from_kkp(self, kidx, kpidx):
