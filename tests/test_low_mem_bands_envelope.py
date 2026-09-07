@@ -291,14 +291,14 @@ def test_compute_sigma_xc_checks_the_gij_row_before_any_kernel():
     import inspect
     from gw import sigma_dispatch
 
-    src = inspect.getsource(sigma_dispatch.compute_sigma_xc)
-    order = [src.index(name) for name in (
-        "refuse_unimplemented_compute_mode(",
-        "refuse_explicit_gij_under_low_mem_bands(",
-        "W_static = W_by_role.get(")]
-    assert order == sorted(order), (
-        "compute_sigma_xc no longer checks the Gij envelope row before "
-        "the static-Sigma kernel dispatch")
+    entry = inspect.getsource(sigma_dispatch.compute_sigma_xc)
+    src = inspect.getsource(sigma_dispatch._validate_sigma_stage)
+    assert src.index("refuse_unimplemented_compute_mode(") < src.index(
+        "refuse_explicit_gij_under_low_mem_bands(")
+    assert entry.index("_validate_sigma_stage(") < entry.index(
+        "_static_sigma_channels("), (
+        "compute_sigma_xc must validate the Gij row before allocating channels")
+
 
 
 # ---------------------------------------------------------------------------
