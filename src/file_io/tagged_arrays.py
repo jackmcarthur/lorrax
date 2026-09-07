@@ -1884,26 +1884,6 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
             psi_nmu_parent_T, psi_mun_parent_T)
 
 
-def require_full_k_psi(f, *, where: str) -> None:
-    """Refuse, by name, a restart file that stores raw-parent ψ only.
-
-    ``gw_init``'s parents-only storage writes ``psi_parent_y`` (k_irr rows)
-    and no ``psi_full_y``.  Readers that still want the full-k faces (BSE,
-    downfold) call this before touching ``psi_full_y`` so the failure names
-    its cause instead of a KeyError.
-    """
-    if "psi_full_y" in f:
-        return
-    if "psi_parent_y" in f:
-        raise ValueError(
-            f"{where}: {f.filename} stores the raw-parent ψ faces only "
-            "(psi_parent_y, written by a parents-only GW run) and no "
-            "psi_full_y.  This reader has no parent unfold yet; it needs "
-            "a GW run that kept the full-k faces, or the parent-aware port "
-            "(KNOWN_LORRAX_ISSUES.md, 2026-09-05).")
-    raise ValueError(f"{where}: {f.filename} has no psi_full_y dataset.")
-
-
 def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
     """Read ONE ``(…, μ, ν)`` restart tensor, sharded, wedge unfolded.
 

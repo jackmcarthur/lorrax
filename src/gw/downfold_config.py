@@ -78,6 +78,8 @@ DOWNFOLD_DEFAULTS = {
     # says so rather than stamping the parent's hash, which would be a lie
     # about which points the tensors describe.
     "parent_centroids_file": "",
+    # Producer GW deck authenticating the raw-parent symmetry action.
+    "parent_input_file": "",
 
     # ---- the retained band window ------------------------------------
     # THE FIT WINDOW.  Two spellings, and exactly one of them may be used.
@@ -305,6 +307,7 @@ class DownfoldConfig:
     report_residual: bool
     residual_refuse_above: float | None
     input_path: str
+    parent_input_file: str = ""
 
     # -- construction -----------------------------------------------------
 
@@ -479,6 +482,7 @@ class DownfoldConfig:
             report_residual=bool(params["report_residual"]),
             residual_refuse_above=refuse_above,
             input_path=os.path.abspath(filename),
+            parent_input_file=_path("parent_input_file", required=False),
         )
         return cfg
 

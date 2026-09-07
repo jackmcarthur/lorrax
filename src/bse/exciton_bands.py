@@ -2007,7 +2007,7 @@ def main(argv=None):
             # target Q from the htransform ψ and contracts it with the
             # producer's own Coulomb door.  So this branch loads ζ and stops.
             zx = vq_interp.load_zeta_coarse(restart_file, zeta_path,
-                                            mesh=mesh_xy, log_fn=log,
+                                            mesh=mesh_xy, log_fn=log, input_file=args.input,
                                             require_slab=False,
                                             require_full_bz_zeta=False)
             prep = eval_vq = pinvF = coeffs_packed = None
@@ -2020,7 +2020,7 @@ def main(argv=None):
                     "which is the pointwise head this flag would replace.")
         else:
             vqm = vq_interp.build_vq_evaluator(
-                restart_file, mesh_xy, n_rmu_pad, alpha=args.alpha,
+                restart_file, mesh_xy, n_rmu_pad, input_file=args.input, alpha=args.alpha,
                 eps_tik=args.eps_tik, eigh_backend=args.eigh_backend,
                 distrib_la_batched_route=args.distrib_la_batched_route,
                 head_minibz_average=head_mbz, log_fn=log)

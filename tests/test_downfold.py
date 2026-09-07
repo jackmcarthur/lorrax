@@ -1814,3 +1814,19 @@ def test_offline_downfold_refuses_unavailable_centroid_actions():
         downfold.orbit_complete_keep(np.array([0]), perm)
     with pytest.raises(ValueError, match="unavailable rows are unsupported"):
         downfold.child_unfold_tables(np.array([0]), perm, np.zeros((2, 2, 3)))
+
+
+def test_downfold_geometry_accepts_raw_parent_faces(tmp_path):
+    """Parent rows define the stored bands, while energies define the full k grid."""
+    import h5py
+    from gw.downfold_run import _read_geometry
+    path = tmp_path / "parent.h5"
+    with h5py.File(path, "w") as f:
+        f["psi_parent_y"] = np.zeros((2, 8, 4, 4), dtype=np.complex128)
+        f["enk_full"] = np.zeros((8, 8))
+        f["kgrid"] = (2, 2, 2)
+        f["V_qmunu"] = np.zeros((8, 4, 4))
+        f["W0_qmunu"] = np.zeros((8, 4, 4))
+        f["W0_qmunu"].attrs["W0_ready"] = True
+    geom = _read_geometry(str(path))
+    assert (geom["nk"], geom["nb"], geom["nspinor"]) == (8, 8, 4)

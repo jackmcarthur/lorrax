@@ -176,13 +176,9 @@ def resolve_restart_file(path: str) -> str:
 def _read_geometry(filename: str) -> dict:
     """The small, replicated facts, read serially before any tensor moves."""
     with h5py.File(filename, "r") as f:
-        if "psi_full_y" not in f:
-            raise ValueError(
-                f"downfold: {filename} has no psi_full_y.  Without "
-                f"psi-at-centroids there are no pair densities to fit "
-                f"against, so there is no downfold to do — this is not a "
-                f"LORRAX restart bundle, or it is one from before the "
-                f"canonical writer.")
+        psi_key = "psi_full_y" if "psi_full_y" in f else "psi_parent_y"
+        if psi_key not in f:
+            raise ValueError(f"downfold: {filename} has no centroid wavefunctions.")
         if "V_qmunu" not in f:
             raise ValueError(
                 f"downfold: {filename} has no V_qmunu.")
@@ -215,9 +211,9 @@ def _read_geometry(filename: str) -> dict:
             "band_window_split": (
                 np.asarray(f["band_window_split"])[:].astype(np.int64)
                 if "band_window_split" in f else None),
-            "nb": int(f["psi_full_y"].shape[1]),
-            "nk": int(f["psi_full_y"].shape[0]),
-            "nspinor": int(f["psi_full_y"].shape[2]),
+            "nb": int(f[psi_key].shape[1]),
+            "nk": int(f["psi_full_y" if "psi_full_y" in f else "enk_full"].shape[0]),
+            "nspinor": int(f[psi_key].shape[2]),
             "vhead": (np.asarray(f["vhead"])[()] if "vhead" in f else None),
             "whead": (np.asarray(f["whead"][:]) if "whead" in f else None),
             "omega_grid": (np.asarray(f["whead"].attrs["omega_grid"])
@@ -758,6 +754,22 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
                             right=tuple(cfg.band_range_right))
         window.validate(geom["nb"])
         rs = load_restart_state_from_h5(src, mesh_xy)
+        if getattr(rs, "psi_nmu_parent", None) is not None:
+            from bse.bse_loading import _unfold_bse_parent_faces
+            parent_input = getattr(cfg, "parent_input_file", "")
+            if not parent_input:
+                run_dir = os.path.dirname(src)
+                if os.path.basename(run_dir) == "tmp":
+                    run_dir = os.path.dirname(run_dir)
+                parent_input = os.path.join(run_dir, "cohsex.in")
+            (psi,) = _unfold_bse_parent_faces(
+                (rs.psi_nmu_parent,), src, parent_input, mesh_xy)
+            rs.psi_rmu_Y = jax.lax.with_sharding_constraint(
+                psi, NamedSharding(mesh_xy, P(None, None, None, "y")))
+            rs.psi_rmuT_X = jax.lax.with_sharding_constraint(
+                jnp.conj(psi).transpose(0, 3, 1, 2),
+                NamedSharding(mesh_xy, P(None, "x", None, None)))
+            rs.psi_nmu_parent = rs.psi_mun_parent = None
         tensors = {}
         for name in geom["present"]:
             if name == "V_qmunu":

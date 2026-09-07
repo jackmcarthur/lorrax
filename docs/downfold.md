@@ -598,3 +598,5 @@ twice the μ_S, and no end-to-end Σ gate has been run on it. So nothing here is
 a claim about quasiparticle energies. Re-fitting Σ in a downfolded basis is
 real, buildable, later work; today the small bundle serves the retained-window
 BSE and the exciton bands built on it, and nothing upstream of them.
+
+Raw-parent GW bundles use `parent_input_file` to authenticate and unfold the stored wavefunctions; it defaults to `cohsex.in` in the parent run directory.

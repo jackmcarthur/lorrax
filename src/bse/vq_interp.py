@@ -417,7 +417,7 @@ def assert_slab_scope(bvec, qfr=None, policy=None, *, source="") -> None:
 # coarse-data loading (reference load_fixture, with paths as arguments)
 # ===========================================================================
 def load_zeta_coarse(restart_file: str, zeta_file: str, *,
-                     mesh: Mesh | None = None, log_fn=print,
+                     mesh: Mesh | None = None, log_fn=print, input_file=None,
                      require_slab: bool = True,
                      require_full_bz_zeta: bool = True) -> dict:
     """Load the coarse-grid ζ/ψ/tile data into a plain-dict bundle ``zx``.
@@ -481,9 +481,29 @@ def load_zeta_coarse(restart_file: str, zeta_file: str, *,
     # ``close_zeta_coarse(zx)``.
     fr = h5py.File(restart_file, "r")
     zx["_h5_restart"] = fr
-    from file_io.tagged_arrays import require_full_k_psi
-    require_full_k_psi(fr, where="vq_interp restart-file ψ reader")
-    zx["psi"] = fr["psi_full_y"][()]          # (nk, nb, ns, n_mu) u at centroids
+    from .bse_loading import _unfold_bse_parent_faces, _read_psi_mu_sharded
+    psi_ds = fr["psi_full_y" if "psi_full_y" in fr else "psi_parent_y"]
+    if "psi_full_y" in fr:
+        zx["psi"] = psi_ds[()]
+    else:
+        if mesh is None:
+            from common.collectives import resolve_mesh
+            mesh = resolve_mesh()
+        from runtime.padding import padded_mu_extent
+        n_mu_pad = padded_mu_extent(psi_ds.shape[-1], mesh)
+        face = _read_psi_mu_sharded(
+            psi_ds, np.arange(psi_ds.shape[1]), n_mu_pad // mesh.shape["x"],
+            "x", mesh, n_mu_pad, trim=False)
+        (full_face,) = _unfold_bse_parent_faces(
+            (face,), restart_file, input_file, mesh)
+        # Keep this reader's host-cache contract; replicate only one k row
+        # on device before the canonical host transfer, never the full face.
+        zx["psi"] = np.empty(full_face.shape[:-1] + (psi_ds.shape[-1],),
+                             dtype=psi_ds.dtype)
+        replicate_row = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh, P()))
+        for k in range(full_face.shape[0]):
+            zx["psi"][k] = _to_host(replicate_row(full_face[k, ..., :psi_ds.shape[-1]]))
+        del face, full_face
     zx["kgrid"] = fr["kgrid"][()].astype(int)
     # LAZY — disk tiles (gate reference) — UNLESS the file stores the q
     # wedge, in which case the tiles do not exist on disk and the unfold
@@ -2061,7 +2081,7 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None,
 
 
 def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None,
-                       *, zeta_file=None, alpha=ALPHA, eps_tik=EPS_TIK,
+                       *, zeta_file=None, input_file=None, alpha=ALPHA, eps_tik=EPS_TIK,
                        eigh_backend="auto", head_minibz_average=False,
                        distrib_la_batched_route: str = "batch_reshard",
                        run_diagnostics=True, log_fn=print, fit_ecut=None):
@@ -2100,7 +2120,7 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
     # read on every rank.  The reader announces and falls back to the
     # local h5py plan when the deployment cannot serve SlabIO.
     zx = load_zeta_coarse(restart_file, zeta_file, mesh=mesh_xy,
-                          log_fn=log_fn, require_slab=False)
+                          log_fn=log_fn, input_file=input_file, require_slab=False)
     # THE ONE SITE, moved here from the loader: this function is the b26p
     # model build, and the model is what is slab-only.  Still before anything
     # expensive — ``build_cq`` is the next line.

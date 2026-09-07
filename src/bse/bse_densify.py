@@ -719,7 +719,7 @@ def _interpolate_bse_data_to_grid(
         # model reproduced at the q=0 training point (run_nulls certifies the
         # reproduction).  This arm is bit-for-bit the pre-2026-08-09 behaviour.
         vqm = vq_interp.build_vq_evaluator(
-            restart_file, mesh_xy, n_rmu_pad, head_minibz_average=True,
+            restart_file, mesh_xy, n_rmu_pad, input_file=input_file, head_minibz_average=True,
             distrib_la_batched_route=_distrib_la_batched_route,
             log_fn=log_fn)
         gstar, head_val = vq_interp.minibz_head_vlr(
