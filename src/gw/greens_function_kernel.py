@@ -46,7 +46,8 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
         return G
     transposed = None
     if np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial):
-        if phases is None or not jnp.issubdtype(phases.dtype, jnp.complexfloating):
+        if (real_weights is True or phases is None
+                or not jnp.issubdtype(phases.dtype, jnp.complexfloating)):
             transposed = jnp.conj(G)
         else:
             transposed = jax.lax.cond(
@@ -140,10 +141,16 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                 band_weight=None, E_min=None, E_max=None,
                 layout='face', gemm=None, k_unfold_plan=None):
     """Contract phases exp(-t*(energy-reference)) with energy windows, identity masks and signed weights."""
+    real_weights = not jnp.issubdtype(jnp.result_type(t), jnp.complexfloating)
+    if not real_weights:
+        real_weights = jnp.imag(t) == 0
+    if band_weight is not None and jnp.issubdtype(
+            jnp.result_type(band_weight), jnp.complexfloating):
+        real_weights = False
     phases = windowed_exp_iEt(enk, t, E_min, E_max, e_ref=e_ref)
     if band_weight is not None:
         band_weight = jnp.reshape(band_weight, enk.shape)
-        weight = band_weight.astype(phases.dtype)
+        weight = band_weight.astype(jnp.result_type(phases, band_weight))
         # A sparse tuple selector is an exact support gate, not merely a
         # post-hoc scale.  Complex delivered nodes can overflow the phase on
         # an UNSELECTED high-energy band even though the planner certified
@@ -165,4 +172,4 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
     return build_G(
         psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
-        k_unfold_plan=k_unfold_plan, real_weights=jnp.imag(t) == 0)
+        k_unfold_plan=k_unfold_plan, real_weights=real_weights)

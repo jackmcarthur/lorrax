@@ -640,6 +640,7 @@ def _compute_invalid_static_sigma(
         phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
         phases = k_unfold_plan.parent_rows(phases)
         G_occ = build_G(g_mun, g_nmu, phases=phases,
+                        real_weights=not jnp.issubdtype(phases.dtype, jnp.complexfloating),
                         layout=wfns.layout, gemm=g_plan,
                         k_unfold_plan=k_unfold_plan)
         sig_sx = spatial.conv_project(psi_xr, psi_yn, G_occ, W_prep)
@@ -649,8 +650,8 @@ def _compute_invalid_static_sigma(
                 trs_rule="transpose"), nb_real), dtype=np.complex128)
         del G_occ, sig_sx
 
-        mask = g_carrier.band_mask(s.sigma_sum).astype(jnp.complex128)
-        G_ri = build_G(g_mun, g_nmu, phases=mask,
+        mask = g_carrier.band_mask(s.sigma_sum)
+        G_ri = build_G(g_mun, g_nmu, phases=mask, real_weights=True,
                        layout=wfns.layout, gemm=g_plan,
                        k_unfold_plan=k_unfold_plan)
         sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
@@ -736,8 +737,8 @@ def _invalid_static_coh_by_bracket(
             int(s.nb_sigma), mesh_xy, ansatz="static face")
         for lo, hi in brackets:
             mask = g_carrier.band_mask(
-                slice(int(lo), int(hi))).astype(jnp.complex128)
-            G_ri = build_G(g_mun, g_nmu, phases=mask,
+                slice(int(lo), int(hi)))
+            G_ri = build_G(g_mun, g_nmu, phases=mask, real_weights=True,
                            layout=wfns.layout, gemm=g_plan,
                            k_unfold_plan=k_unfold_plan)
             sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)

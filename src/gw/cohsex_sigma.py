@@ -81,7 +81,10 @@ def build_Gij(meta, mesh_xy: Mesh, occupation_state=None) -> jax.Array:
     # (asserted in tests/test_sigma_fermi_split.py).  Weights are never
     # clipped: an MP-overshoot band (f<0 or f>1) contributes with its sign.
     if occupation_state is not None:
-        f = np.asarray(occupation_state.f_kn, dtype=np.float64)
+        f = np.asarray(occupation_state.f_kn)
+        if np.iscomplexobj(f):
+            raise TypeError("build_Gij requires real occupation weights")
+        f = f.astype(np.float64)
         f = f.reshape(int(meta.nk_tot), -1)
         if f.shape[1] < int(meta.nb_sigma):
             raise ValueError(
@@ -105,9 +108,9 @@ def build_Gij(meta, mesh_xy: Mesh, occupation_state=None) -> jax.Array:
                 "Hartree density would be missing weight carried by bands "
                 "outside the window; widen nb_sigma or re-solve.")
         Gij = np.zeros((meta.nk_tot, meta.nb_sigma, meta.nb_sigma),
-                       dtype=np.complex128)
+                       dtype=np.float64)
         idx = np.arange(int(meta.nb_sigma))
-        Gij[:, idx, idx] = f_win.astype(np.complex128)
+        Gij[:, idx, idx] = f_win
         from common.collectives import device_put_process_local
         return device_put_process_local(
             Gij, NamedSharding(mesh_xy, P(None, None, None)))
@@ -126,8 +129,8 @@ def build_Gij(meta, mesh_xy: Mesh, occupation_state=None) -> jax.Array:
             f"density would be missing {int(meta.nelec) - int(meta.nb_sigma)} "
             "occupied bands, which no centroid count can repair.")
     nocc = min(meta.nelec, meta.nb_sigma)
-    Gij = np.zeros((meta.nk_tot, meta.nb_sigma, meta.nb_sigma), dtype=np.complex128)
-    Gij[:, :nocc, :nocc] = np.eye(nocc, dtype=np.complex128)
+    Gij = np.zeros((meta.nk_tot, meta.nb_sigma, meta.nb_sigma), dtype=np.float64)
+    Gij[:, :nocc, :nocc] = np.eye(nocc, dtype=np.float64)
     # Process-local placement, NOT plain ``jax.device_put``: on a
     # multi-process mesh the latter silently runs multihost
     # ``assert_equal`` — a P-linear all-gather of the operand (scorecard
@@ -164,9 +167,10 @@ def _resolve_Gij(Gij, meta, mesh_xy: Mesh, occupation_state):
 # PPM sigma use the same factory pattern.
 # ---------------------------------------------------------------------------
 
+@partial(jax.jit, static_argnums=(1, 2))
 def _occ_diag_full(Gij, nb_sigma, nb_full):
     """(nk, nb_sigma, nb_sigma) diagonal occupation matrix -> (nk,
-    nb_full) COMPLEX weight vector, zero-padded outside [0, nb_sigma).
+    nb_full) weight vector with the occupation dtype, zero-padded beyond nb_sigma.
     Every production Gij (integer or diag(f), :func:`build_Gij`) is
     diagonal by construction — obstacle #4's "carry the occupation vector
     as the common path".  This reads that diagonal rather than doing the
@@ -351,6 +355,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         if k_unfold_plan is not None:
             phases = k_unfold_plan.parent_rows(phases)
         G_occ = build_G(g_mun, g_nmu, phases=phases,
+                        real_weights=not jnp.issubdtype(phases.dtype, jnp.complexfloating),
                         layout=layout, gemm=g_plan,
                         k_unfold_plan=k_unfold_plan)
         return _project_bands(wfns, _convolve(G_occ, W_q, 1.0))
@@ -361,8 +366,8 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         bands = (s.sigma_sum if ri_bands is None
                  else slice(int(ri_bands[0]), int(ri_bands[1])))
         g_mun, g_nmu, owner = _g_operands(wfns)
-        mask = owner.band_mask(bands).astype(jnp.complex128)
-        G_ri = build_G(g_mun, g_nmu, phases=mask,
+        mask = owner.band_mask(bands)
+        G_ri = build_G(g_mun, g_nmu, phases=mask, real_weights=True,
                        layout=layout, gemm=g_plan,
                        k_unfold_plan=k_unfold_plan)
         return _project_bands(wfns, _convolve(G_ri, W_q - V_q, -0.5))
