@@ -4,8 +4,8 @@
 
 | Item | Status | Remaining |
 |---|---|---|
-| 1 — dead dispatch | Draft planner cut; numerical identity to unmodified parent established | Remaining dispatch; live-consumer exceptions below; direct parent Gram owner cleanup |
-| 2 — phase extraction | Not started; phase comments inspected | All named giant-function extractions; 120-line target |
+| 1 — dead dispatch | Planner and direct Gram owners identity-gated | Remaining dispatch; live-consumer exceptions below; remaining live-consumer exceptions |
+| 2 — phase extraction | SymMaps constructor stages prepared for identity gate | All named giant-function extractions; 120-line target |
 | 3 — duplication | Not started; live cache captures inspected | Operand selector, assertions/refusals, provenance emitter, safe owner-cache consolidation |
 | 4 — docstrings | Not started | Narrative relocation and six-file share below 10%; draft planner docs still need updating |
 | 5 — configuration | Not started; strict-key mechanism inspected | Parsing table, envelope extraction; retired-key exemptions must be accounted for |
@@ -42,11 +42,11 @@
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---:|---:|---|
 | `src/isdf/core.py` | `solve_zeta` | 699 | 699 | Not changed |
-| `src/isdf/core.py` | `c_q_from_psi_sm` | 42 | 42 | Not changed |
-| `src/isdf/core.py` | `_c_q_legacy` | 122 | 122 | Not changed |
+| `src/isdf/core.py` | `c_q_from_psi_sm` | 42 + parent kernel | Direct parent kernel | Removed selector wrapper; former `_c_q_face_parent` is the public owner |
+| `src/isdf/core.py` | `c_q_downfold` (formerly `_c_q_legacy`) | 122 | 122 | Direct live rectangular downfold owner; equations unchanged |
 | `src/isdf/core.py` | `_z_q_face_parent` | 327 | 327 | Not changed |
 | `src/isdf/core.py` | `factor_c_q` | 317 | 317 | Not changed |
-| `src/isdf/core.py` | **File total** | 5831 | 5831 | Net +0 lines |
+| `src/isdf/core.py` | **File total** | 5831 | 5789 | Net -42 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---:|---:|---|
@@ -132,3 +132,11 @@
 |---|---|---|
 | Focused CPU rerun | 473 passed, 2 skipped, 1 xfailed | allocation58001753, lx-Xg0-174825-2182563-9864; `06_planner_cpu/cpu.xml` |
 | Scalar reference attempt 01 | Incomplete; terminated after >16 min without output after screening; native stacks in CUDA/NCCL, cause unisolated | allocation58001753, lx-Xg4-173501-2115516-9331; `00_references/si_scalar_attempt01/verdict.txt`, explicit stack logs |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---:|---:|---|
+| `src/gw/downfold.py` | Gram call sites | unchanged | unchanged | Call `c_q_downfold` directly; no layout selector |
+
+| Batch | Claim | CPU | P4 identity |
+|---|---|---|---|
+| 2 — direct Gram owners | 1396 | 543 passed, 2 skipped, 1 xfailed; allocation58001753 lx-Xg0-175412-2208707-1724; `07_gram_cpu/cpu.xml` | EXACT eqp0, eqp1, sigma_diag; lx-Xg4-175656-2221647-2270; `07_gram_p4_ready/mos2/identity.json` |

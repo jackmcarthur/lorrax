@@ -563,7 +563,7 @@ def test_isdf_current_signed_normal_matrix_against_literal_pair_gram(monkeypatch
                     for n in (2,3):
                         density = np.einsum('am,ab,bm->m',child[k,m].conj(),gamma[a],child[kp,n])
                         expected[q] += np.outer(density.conj(),density)
-        actual = core._c_q_face_parent(mun,nmu,jnp.array([1.,1.,0.,0.]),jnp.array([0.,0.,1.,1.]),
+        actual = core.c_q_from_psi_sm(mun,nmu,jnp.array([1.,1.,0.,0.]),jnp.array([0.,0.,1.,1.]),
             kgrid=(3,3,1),mesh_xy=mesh,gemm=lambda x,y:x@y,k_unfold_plan=plan,gamma_L=a,gamma_R=a)
         sign = -1 if a == 2 else 1
         np.testing.assert_allclose(actual,sign*expected,rtol=3e-12,atol=3e-12,err_msg=f'ISDF signed Gram gamma{a}')

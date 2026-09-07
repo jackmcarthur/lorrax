@@ -1121,52 +1121,10 @@ def gram_q0_aot_peak_bytes(
 # ============================================================================
 
 
-def c_q_from_psi_sm(
-	psi_l_X: jax.Array | None = None,
-	psi_l_Y: jax.Array | None = None,
-	psi_r_X: jax.Array | None = None,
-	psi_r_Y: jax.Array | None = None,
-	gamma_L: tuple[jax.Array, jax.Array] | None = None,
-	gamma_R: tuple[jax.Array, jax.Array] | None = None,
-	*,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-	layout: str = "legacy",
-	psi_mun: jax.Array | None = None,
-	psi_nmu: jax.Array | None = None,
-	weight_l: jax.Array | None = None,
-	weight_r: jax.Array | None = None,
-	gemm=None,
-	k_unfold_plan=None,
-) -> jax.Array:
-	"""Build the parent GW Gram or the shared rectangular downfold Gram."""
-	if layout == "legacy":
-		if psi_l_X is None or psi_l_Y is None or psi_r_X is None or psi_r_Y is None:
-			raise ValueError(
-				"c_q_from_psi_sm(layout='legacy') requires psi_l_X/"
-				"psi_l_Y/psi_r_X/psi_r_Y.")
-		return _c_q_legacy(psi_l_X, psi_l_Y, psi_r_X, psi_r_Y,
-		                   gamma_L, gamma_R, kgrid=kgrid, mesh_xy=mesh_xy)
-	if layout != "face":
-		raise ValueError(
-			f"c_q_from_psi_sm: layout must be 'legacy' or 'face', got "
-			f"{layout!r}")
-	if psi_mun is None or psi_nmu is None or weight_l is None or weight_r is None or gemm is None:
-		raise ValueError(
-			"c_q_from_psi_sm(layout='face') requires psi_mun=, psi_nmu=, "
-			"weight_l=, weight_r=, gemm= (see gw.isdf_fitting.fit_zeta_to_h5"
-			").")
-	if k_unfold_plan is None:
-		raise ValueError("c_q_from_psi_sm face operands require a typed parent plan")
-	return _c_q_face_parent(
-		psi_mun, psi_nmu, weight_l, weight_r,
-		k_unfold_plan=k_unfold_plan, kgrid=kgrid, mesh_xy=mesh_xy,
-		gemm=gemm, gamma_L=0 if gamma_L is None else int(gamma_L),
-		gamma_R=0 if gamma_R is None else int(gamma_R))
 
 
 
-def _c_q_legacy(
+def c_q_downfold(
 	psi_l_X: jax.Array,
 	psi_l_Y: jax.Array,
 	psi_r_X: jax.Array,
@@ -1302,7 +1260,7 @@ def _c_q_legacy(
 
 
 
-def _c_q_face_parent(
+def c_q_from_psi_sm(
 	psi_mun_parent: jax.Array,
 	psi_nmu_parent: jax.Array,
 	weight_l: jax.Array,

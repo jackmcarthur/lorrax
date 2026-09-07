@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from isdf.core import c_q_from_psi_sm
+from isdf.core import c_q_downfold
 from common.gamma_matrices import gamma_perm_phase
 
 PX = PY = 2
@@ -74,7 +74,7 @@ def check_shared_cq(mesh, *, ns, nk_tuple, n_rmu, nb_full, l_range,
     r0, r1 = r_range
     gamma_l = None if gamma_mu_L == 0 else gamma_perm_phase(gamma_mu_L)
     gamma_r = None if gamma_nu_L == 0 else gamma_perm_phase(gamma_nu_L)
-    got = c_q_from_psi_sm(
+    got = c_q_downfold(
         jax.device_put(bra[:, :, l0:l1], row),
         jax.device_put(psi[:, l0:l1], col),
         jax.device_put(bra[:, :, r0:r1], row),

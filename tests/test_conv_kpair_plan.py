@@ -121,9 +121,9 @@ def test_rchunk_vertex_is_captured_before_jit_trace():
 
 def test_shared_downfold_cq_enters_the_conv_plan():
     import inspect
-    from isdf.core import _c_q_legacy
+    from isdf.core import c_q_downfold
 
-    assert "_conv_kpair_setup(" in inspect.getsource(_c_q_legacy)
+    assert "_conv_kpair_setup(" in inspect.getsource(c_q_downfold)
 
 
 def test_ns2_setup_forwards_monomial_gamma_to_native_factory(monkeypatch):

@@ -237,12 +237,12 @@ def test_RED_TWIN_the_raw_kernel_labels_the_gram_by_MINUS_q():
     probe found intact.  A missing unfold phase would have tracked the
     umklapp wrap count instead; it does not.
     """
-    from isdf.core import c_q_from_psi_sm
+    from isdf.core import c_q_downfold
 
     mesh = resolve_mesh()
     R = np.arange(1, MU + 1, dtype=float)
     psi_X, psi_Y = _plane_wave_psi(mesh, R)
-    raw = np.asarray(jax.device_get(c_q_from_psi_sm(
+    raw = np.asarray(jax.device_get(c_q_downfold(
         psi_X[:, :, 0:1, :], psi_Y[:, 0:1, :, :],
         psi_X[:, :, 0:1, :], psi_Y[:, 0:1, :, :],
         kgrid=KGRID, mesh_xy=mesh)))
