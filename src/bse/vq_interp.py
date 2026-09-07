@@ -1938,7 +1938,7 @@ def read_zeta_fit_provenance(zeta_file: str) -> dict | None:
     """
     import json
 
-    from file_io.isdf_header import read_isdf_header
+    from file_io.restart_bundle import (read_isdf_header)
     try:
         prov = read_isdf_header(zeta_file).fit_provenance
     except (OSError, KeyError, ValueError):
@@ -2063,7 +2063,7 @@ def refit_window_view(zx, band_range, log_fn=print,
     the same either way.  ``"bse"`` is the narrowing above — ζ' ≠ ζ, tile null
     off, contracted gate on.  ``"zeta"`` is the OTHER caller (2026-08-11): on a
     bundle whose deck decoupled ``zeta_nband`` from ``nband``, the producer's ζ
-    was fitted on a STRICT SUB-WINDOW of the ``psi_full_y`` band axis, so
+    was fitted on a STRICT SUB-WINDOW of the ``stored charge faces`` band axis, so
     reaching the producer's own window is itself a slice — and there the tile
     null is exactly the right gate and stays armed.  Passing the wrong label
     would print the wrong certification story next to a correct number, which
@@ -2081,7 +2081,7 @@ def refit_window_view(zx, band_range, log_fn=print,
             f"exciton_bands --refit-window={window_mode}: {zx.get('restart_file')} "
             f"carries no ``band_window`` stamp, so the deck's absolute band "
             f"range ({b_lo}, {b_hi}) cannot be located inside the stored "
-            f"psi_full_y's {zx['nb']}-band ζ-fit window.  Without that offset "
+            f"stored charge faces's {zx['nb']}-band ζ-fit window.  Without that offset "
             f"the band axis would be sliced from an assumed origin and the "
             f"refit would fit ζ' on the wrong bands — silently, since every "
             f"shape still matches.  The stamp is written by "
@@ -2092,7 +2092,7 @@ def refit_window_view(zx, band_range, log_fn=print,
     if (z_hi - z_lo) != int(zx["nb"]):
         raise SystemExit(
             f"exciton_bands --refit-window={window_mode}: the restart's band_window "
-            f"stamp {tuple(bw)} spans {z_hi - z_lo} bands but psi_full_y "
+            f"stamp {tuple(bw)} spans {z_hi - z_lo} bands but stored charge faces "
             f"carries nb={zx['nb']}.  The stamp and the tensor disagree about "
             f"the window they were written under, so no slice of the band "
             f"axis can be trusted.")
@@ -2101,7 +2101,7 @@ def refit_window_view(zx, band_range, log_fn=print,
             f"exciton_bands --refit-window={window_mode}: the deck's band window "
             f"[{b_lo}, {b_hi}) is not contained in the bundle's ζ-fit window "
             f"[{z_lo}, {z_hi}).  The refit fits ζ' from the STORED "
-            f"psi_full_y, so it can only narrow that window, never reach "
+            f"stored charge faces, so it can only narrow that window, never reach "
             f"outside it.  Lower the deck's nval/ncond into the stored range.")
     lo, hi = b_lo - z_lo, b_hi - z_lo
     if (hi - lo) == int(zx["nb"]):
@@ -2120,7 +2120,7 @@ def refit_window_view(zx, band_range, log_fn=print,
     zw["nb"] = hi - lo
     zw["_refit_window_abs"] = (b_lo, b_hi)
     _shape = (f"ζ' is re-fitted on absolute bands [{b_lo}, {b_hi}) "
-              f"({hi - lo} of psi_full_y's {zx['nb']}), so the Galerkin rank "
+              f"({hi - lo} of stored charge faces's {zx['nb']}), so the Galerkin rank "
               f"bound is nk·nb = {zx['nk']}·{hi - lo} = "
               f"{zx['nk'] * (hi - lo)} instead of {zx['nk'] * zx['nb']}.")
     if window_mode == "bse":
@@ -2294,7 +2294,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
                                window_mode="bse")
     else:
         # THE ζ-FIT WINDOW IS WHAT THE PRODUCER'S STAMP SAYS IT IS, not what
-        # psi_full_y's extent says.  Those were the same object until the
+        # stored charge faces's extent says.  Those were the same object until the
         # 2026-08-11 ``zeta_nband`` decoupling: ``nband`` used to set BOTH the
         # χ0/Σ band-sum top ``b4`` and the top of the ζ fit's own band ranges,
         # so the stored band axis and the ζ-fit window could not differ.  With

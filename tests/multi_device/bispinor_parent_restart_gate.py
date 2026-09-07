@@ -14,7 +14,8 @@ def main():
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.centroid_basis import PackedCentroidBasis
     from common.meta import Meta
-    from common.wfn_transforms import load_centroids_band_chunked
+    from common.wfn_transforms import load_centroids_band_chunked, get_enk_bandrange
+    from types import SimpleNamespace
     from file_io.centroids import load_centroids
     from file_io.tagged_arrays import (write_restart_state_to_h5)
     from file_io.restart_bundle import (read_restart_state_from_h5)
@@ -49,10 +50,16 @@ def main():
         bases.append(basis)
         packed.append(faces)
         disk.append(tuple(basis.unpack_axis(face, axis) for face, axis in zip(faces, (3, 2))))
-    zero = jax.jit(lambda: jnp.zeros((1, 480, 480), jnp.complex128),
+    n_mu = bases[0].n_logical
+    n_mu_pad = disk[0][0].shape[-1]
+    nb = disk[0][0].shape[1]
+    enk, _ = get_enk_bandrange(wfn, sym, (0, nb), (0, nb))
+    window = SimpleNamespace(b0=0, b1=0, b2=min(8, nb), b3=nb, b4=nb)
+    zero = jax.jit(lambda: jnp.zeros((sym.nk_tot, n_mu_pad, n_mu_pad), jnp.complex128),
                    out_shardings=NamedSharding(mesh, P(None, "x", "y")))()
-    write_restart_state_to_h5("parent_restart.h5", n_rmu_logical=480,
-        n_rmu_transverse_logical=168, V_qmunu=zero,
+    write_restart_state_to_h5("parent_restart.h5", n_rmu_logical=n_mu,
+        n_rmu_transverse_logical=bases[1].n_logical, V_qmunu=zero,
+        enk_full=enk, kgrid=tuple(wfn.kgrid), band_slices=window,
         psi_parent_y=disk[0][0], psi_parent_y_mun=disk[0][1],
         psi_parent_y_transverse=disk[1][0], psi_parent_y_transverse_mun=disk[1][1],
         parent_k_rows=sym.kirr_fullids, mesh=mesh, mode="w")

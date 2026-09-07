@@ -253,54 +253,12 @@ def bind_isdf_attrs(obj: object, isdf: IsdfHeader) -> None:
 # Read
 # ---------------------------------------------------------------------------
 
-def _read_group(f: h5.File) -> IsdfHeader:
-    g = f[_GROUP]
-    # Legacy files predate the ``zeta_is_done`` field; treat as ``True``
-    # (they were always written atomically at end-of-fit).  Legacy files
-    # also predate ``zeta_layout``; treat as ``'r_space'``.  New files
-    # carry both fields explicitly.
-    zeta_done = (bool(g['zeta_is_done'][()]) if 'zeta_is_done' in g
-                 else True)
-    zeta_layout = (_decode_str(g['zeta_layout'][()]) if 'zeta_layout' in g
-                   else 'r_space')
-    # G-flat metadata (only present when zeta_layout == 'G_flat').
-    gv = (np.asarray(g['gvec_components'][:], dtype=np.int32)
-          if 'gvec_components' in g else None)
-    nk = (np.asarray(g['ngk'][:], dtype=np.int32)
-          if 'ngk' in g else None)
-    cutoff = (float(g['zeta_cutoff_ry'][()])
-              if 'zeta_cutoff_ry' in g else None)
-    prov = (_decode_str(g['fit_provenance'][()])
-            if 'fit_provenance' in g else None)
-    return IsdfHeader(
-        density=_decode_str(g['density'][()]),
-        vertex_mu_L=int(g['vertex_mu_L'][()]),
-        r_mu_fft_idx=np.asarray(g['centroids/r_mu_fft_idx'][:], dtype=np.int32),
-        r_mu_crystal=np.asarray(g['centroids/r_mu_crystal'][:], dtype=np.float64),
-        zeta_is_done=zeta_done,
-        zeta_layout=zeta_layout,
-        gvec_components=gv,
-        ngk_per_q=nk,
-        zeta_cutoff_ry=cutoff,
-        fit_provenance=prov,
-    )
 
 
-def _decode_str(v) -> str:
-    if isinstance(v, bytes):
-        return v.decode('utf-8')
-    return str(v)
 
 
-def read_isdf_header(path: str | Path) -> IsdfHeader:
-    """Open ``path`` and return its ``isdf_header`` group."""
-    with h5.File(str(path), 'r') as f:
-        return _read_group(f)
 
 
-def read_isdf_header_from_file(f: h5.File) -> IsdfHeader:
-    """Same as :func:`read_isdf_header` but operates on an open handle."""
-    return _read_group(f)
 
 
 # ---------------------------------------------------------------------------
@@ -391,8 +349,6 @@ __all__ = [
     'centroid_table_md5',
     'IsdfHeader',
     'WavefunctionBasisReceipt',
-    'read_isdf_header',
-    'read_isdf_header_from_file',
     'bind_isdf_attrs',
     'write_isdf_header',
     'mark_zeta_done',

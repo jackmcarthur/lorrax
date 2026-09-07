@@ -1133,8 +1133,8 @@ def write_downfolded_zeta(src_restart, out_file, T_x, keep_idx, mu_S, n_q,
 
     Returns the written path, or ``""`` when no ζ was transported.
     """
-    from file_io.isdf_header import (IsdfHeader, mark_zeta_done,
-                                     read_isdf_header, write_isdf_header)
+    from file_io.isdf_header import (IsdfHeader, mark_zeta_done, write_isdf_header)
+    from file_io.restart_bundle import (read_isdf_header)
     from file_io.mf_header import copy_mf_header
 
     src_zeta = os.path.join(os.path.dirname(os.path.abspath(src_restart)),
@@ -1370,7 +1370,7 @@ def _isdf_fft_grid(src_restart):
     if not os.path.isfile(zeta):
         return None
     try:
-        from file_io.isdf_header import read_isdf_header
+        from file_io.restart_bundle import (read_isdf_header)
         return _fft_grid_of(read_isdf_header(zeta))
     except (OSError, KeyError, ValueError):
         return None
@@ -1519,7 +1519,7 @@ def resolve_parent_centroids(cfg, src_restart, mu_large, geom, out_dir, *,
                             "zeta_q.h5")
     if os.path.isfile(src_zeta):
         try:
-            from file_io.isdf_header import read_isdf_header
+            from file_io.restart_bundle import (read_isdf_header)
             hdr = read_isdf_header(src_zeta)
         except (OSError, KeyError, ValueError) as exc:      # noqa: BLE001
             hdr = None

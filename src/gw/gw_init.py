@@ -599,7 +599,7 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 	if not os.path.exists(zeta_h5_path):
 		return False
 	try:
-		from file_io.isdf_header import read_isdf_header
+		from file_io.restart_bundle import (read_isdf_header)
 		hdr = read_isdf_header(zeta_h5_path)
 	except Exception as exc:
 		print_fn(f"    [zeta reuse] {zeta_h5_path}: unreadable isdf_header "

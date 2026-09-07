@@ -122,8 +122,8 @@ def _mf_header_binders():
 def _isdf_header_binders():
     """``(bind_isdf_attrs, read_isdf_header_from_file)`` — the ζ metadata."""
     try:
-        from file_io.isdf_header import (
-            bind_isdf_attrs, read_isdf_header_from_file)
+        from file_io.isdf_header import (bind_isdf_attrs)
+        from file_io.restart_bundle import (read_isdf_header_from_file)
     except ImportError as exc:                                  # noqa: BLE001
         raise ImportError(_host_tree_refusal(
             "file_io.isdf_header",

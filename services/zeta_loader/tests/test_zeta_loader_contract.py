@@ -84,7 +84,7 @@ def test_the_synthetic_header_matches_the_real_writers(tmp_path):
     cell in this suite into a test of a file format nothing produces.
     """
     _needs_host_tree()
-    from file_io.isdf_header import read_isdf_header
+    from file_io.restart_bundle import (read_isdf_header)
     from file_io.mf_header import read_mf_header
 
     path, _payload = Z.build_gflat(tmp_path / "z.h5", n_q=2, n_rmu=3,
@@ -600,7 +600,8 @@ def test_the_pin_covers_everything_the_binders_actually_bind(tmp_path):
     # hand-written body), so diff against a REAL bound object instead.
     path, _p = Z.build_gflat(tmp_path / "z.h5")
     probe_obj = type("_Probe", (), {})()
-    from file_io.isdf_header import bind_isdf_attrs, read_isdf_header
+    from file_io.isdf_header import (bind_isdf_attrs)
+    from file_io.restart_bundle import (read_isdf_header)
     bind_isdf_attrs(probe_obj, read_isdf_header(path))
     bound = {k for k in vars(probe_obj) if not k.startswith("_")}
     assert bound - set(_BOUND_ISDF) == set(), (

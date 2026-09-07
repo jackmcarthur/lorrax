@@ -24,11 +24,8 @@ from file_io.mf_header import (
     copy_mf_header,
     read_mf_header,
 )
-from file_io.isdf_header import (
-    IsdfHeader,
-    read_isdf_header,
-    write_isdf_header,
-)
+from file_io.isdf_header import (IsdfHeader, write_isdf_header)
+from file_io.restart_bundle import (read_isdf_header)
 
 
 # ---------------------------------------------------------------------------
@@ -522,9 +519,8 @@ def test_read_zeta_G_slab_pad_smaller_than_one_per_rank(
 
 # extra imports for the merged r-space ZetaLoader cases
 from jax.sharding import PartitionSpec as P  # noqa: F401
-from file_io.isdf_header import (
-    mark_zeta_done, read_isdf_header,
-)
+from file_io.isdf_header import (mark_zeta_done)
+from file_io.restart_bundle import (read_isdf_header)
 from zeta_loader import ZetaLoader
 
 

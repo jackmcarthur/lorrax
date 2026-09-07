@@ -1,0 +1,32 @@
+src/bse/BGW_COMPARE.md:119:with h5py.File('dipole_p_only.h5','r') as f:
+src/bse/absorption_common.py:135:    with h5py.File(str(path), "r") as f:
+src/bse/absorption_common.py:338:    with h5py.File(str(path), "w") as f:
+src/bse/bse_pseudopoles.py:508:    with h5py.File(output_file, "w") as h5:
+src/bse/bse_w_exact.py:1522:        with h5py.File(args.out, "w") as h5:
+src/bse/bse_window.py:301:    # (job 7879470, leg m24x64) when every rank reached the ``h5py.File(...,
+src/bse/bse_window.py:331:    with h5py.File(output_file, "w") as f:
+src/bse/pseudopoles_eval.py:49:def _iter_window_groups(h5: h5py.File, windows: Iterable[str] | None) -> list[str]:
+src/bse/pseudopoles_eval.py:62:    with h5py.File(path, "r") as h5:
+src/bse/pseudopoles_eval.py:143:    with h5py.File(args.poles, "r") as h5:
+src/bse/pseudopoles_eval.py:162:    with h5py.File(args.out, "w") as h5:
+src/bse/pseudopoles_sweep.py:31:    with h5py.File(h5_path, "r") as h5:
+src/bse/pseudopoles_sweep.py:57:    with h5py.File(h5_path, "r") as h5:
+src/bse/pseudopoles_sweep.py:118:    with h5py.File(h5_path, "r") as h5:
+src/bse/pseudopoles_sweep.py:190:        with h5py.File(h5_path, "r") as h5:
+src/bse/pseudopoles_sweep.py:212:    with h5py.File(h5_path, "r") as h5:
+src/bse/pseudopoles_sweep.py:225:    with h5py.File(h5_path, "r") as h5:
+src/bse/pseudopoles_sweep.py:261:    with h5py.File(args.poles, "r") as h5:
+src/bse/pseudopoles_sweep.py:265:    with h5py.File(args.ref, "r") as h5:
+src/gw/compute_vcoul.py:245:        with h5py.File(aux_path, "r") as fsym:
+src/gw/downfold_run.py:943:    with h5py.File(filename, "a") as f:
+src/gw/downfold_run.py:1047:    with h5py.File(filename, "a") as f:
+src/gw/downfold_run.py:1260:            with h5py.File(out_zeta, "a") as f:
+src/gw/downfold_run.py:1666:            with h5py.File(out_file, "a") as f:
+src/gw/eqp_bgw.py:918:	with h5py.File(wfn_path, "r") as wfn:
+src/gw/gw_init.py:3035:    			with h5py.File(tensors_filename, 'a') as _f:
+src/gw/gw_output.py:481:        with h5py.File(tensors_filename, "a") as f:
+src/gw/kin_ion_io.py:1447:            with h5py.File(out_path, "w") as f:
+src/gw/v_q_bispinor.py:618:        with h5py.File(output_h5_path, "a") as f:
+src/psp/get_dipole_mtxels.py:1540:		with timing.section("write_h5"), h5py.File(str(out_path), 'w') as h5:
+src/psp/run_nscf.py:599:        with h5py.File(args.ref_wfn, "r") as f:
+src/psp/run_sternheimer.py:1194:    out_h5 = h5py.File(output_path, "w")

@@ -327,8 +327,7 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
         transverse_name = "psi_parent_y_transverse"
         parent_k_rows = np.asarray(f["psi_parent_k_rows"][()], dtype=np.int64)
         # THE UNFOLD TABLES, while this handle is open and before any tensor
-        # bytes move.  Empty on every full-BZ and legacy file, which is what
-        # keeps those reads on the byte path they have always had.
+        # bytes move. Current unreduced tensors have no q-star table.
         wedge_tables = _qirr_wedge_tables(f)
         shapes = {k: tuple(int(s) for s in f[k].shape)
                   for k in ("V_qmunu", "S_qmunu", "V0_noG0_munu",
@@ -413,12 +412,12 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
                   spinor_axis=2, band_axis=1):
         """One direct hyperslab of a ψ dataset, μ padded, at ``spec``.
 
-        ``mu_axis``/``spinor_axis`` default to the legacy/nmu axis order
+        ``mu_axis``/``spinor_axis`` default to the nmu axis order
         (nk, n, s, μ); the mun face (nk, s, μ, n) passes both explicitly
         — its μ is axis -2 and its spinor is axis 1, not axis -1/2.  NO
         RESHARD happens here regardless of ``spec``: this is a straight
         SlabIO hyperslab read, so a face spec costs exactly what the
-        legacy spec costs (one direct read), never a transpose collective.
+        axis spec costs (one direct read), never a transpose collective.
         """
         if name not in shapes:
             return None
@@ -4428,3 +4427,54 @@ def apply_eqp_corrections(
 def read_kin_ion_full_bz(filename):
     """Return the canonical full-zone kinetic plus ionic Hamiltonian."""
     return read_full_bz_dataset(filename, "kin_ion")
+
+
+def _read_isdf_group(f: h5py.File) -> IsdfHeader:
+    from file_io.isdf_header import IsdfHeader, _GROUP
+    g = f[_GROUP]
+    # Legacy files predate the ``zeta_is_done`` field; treat as ``True``
+    # (they were always written atomically at end-of-fit).  Legacy files
+    # also predate ``zeta_layout``; treat as ``'r_space'``.  New files
+    # carry both fields explicitly.
+    zeta_done = (bool(g['zeta_is_done'][()]) if 'zeta_is_done' in g
+                 else True)
+    zeta_layout = (_decode_isdf_str(g['zeta_layout'][()]) if 'zeta_layout' in g
+                   else 'r_space')
+    # G-flat metadata (only present when zeta_layout == 'G_flat').
+    gv = (np.asarray(g['gvec_components'][:], dtype=np.int32)
+          if 'gvec_components' in g else None)
+    nk = (np.asarray(g['ngk'][:], dtype=np.int32)
+          if 'ngk' in g else None)
+    cutoff = (float(g['zeta_cutoff_ry'][()])
+              if 'zeta_cutoff_ry' in g else None)
+    prov = (_decode_isdf_str(g['fit_provenance'][()])
+            if 'fit_provenance' in g else None)
+    return IsdfHeader(
+        density=_decode_isdf_str(g['density'][()]),
+        vertex_mu_L=int(g['vertex_mu_L'][()]),
+        r_mu_fft_idx=np.asarray(g['centroids/r_mu_fft_idx'][:], dtype=np.int32),
+        r_mu_crystal=np.asarray(g['centroids/r_mu_crystal'][:], dtype=np.float64),
+        zeta_is_done=zeta_done,
+        zeta_layout=zeta_layout,
+        gvec_components=gv,
+        ngk_per_q=nk,
+        zeta_cutoff_ry=cutoff,
+        fit_provenance=prov,
+    )
+
+
+def _decode_isdf_str(v) -> str:
+    if isinstance(v, bytes):
+        return v.decode('utf-8')
+    return str(v)
+
+
+def read_isdf_header(path: str | Path) -> IsdfHeader:
+    """Open ``path`` and return its ``isdf_header`` group."""
+    with h5py.File(str(path), 'r') as f:
+        return _read_isdf_group(f)
+
+
+def read_isdf_header_from_file(f: h5py.File) -> IsdfHeader:
+    """Same as :func:`read_isdf_header` but operates on an open handle."""
+    return _read_isdf_group(f)

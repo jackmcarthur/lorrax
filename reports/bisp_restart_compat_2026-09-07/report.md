@@ -130,3 +130,14 @@
 | CPU parser and header selection | 52 passed:19 EQP plus33 header/import checks | `00_audit/eqp_headers_cpu_final.lx.log`; two native-I/O cells excluded and separately recorded |
 | P4 broad unit selection | 61 passed;10 tests require fully addressable local arrays and fail on distributed four-process arrays | `00_audit/shared_tests.rank0.log`; these unit fixtures are not production P4 drivers. Production BSE/htransform above complete |
 | Metadata batch | 8a274048 pushed; claim1438 | P4 metadata tests and full-head restart/BSE |
+
+
+| ζ header consolidation | Verdict | Evidence |
+|---|---|---|
+| `read_isdf_header`, `read_isdf_header_from_file` | Actual metadata reader and decoder moved from isdf_header into restart_bundle; zeta service uses that same decoder | 33 CPU header/import checks, within the52-pass selection |
+| Dynamic ns2 GN restart after move | PASS:256/256 rows exact for eqp0 and eqp1 | `07_soc_ns2_gn/header_restart.rank0.log`, `eqp{0,1}.header_compare.txt` |
+| Canonical four-spinor writer/readback | PASS: both charge/current orientations exact, four max errors0 | `08_parent_contract/parent_contract.rank0.log`, `restart_parity.json`; synthetic writer now supplies complete current band/energy/grid receipts |
+| Downfolded child → BSE | PASS: child96-centroid bundle read by the same canonical parent reader and solved | `25_child_reader/bse_child.rank0.log`; source `07_soc_ns2_gn/child/tmp` |
+| Final CPU core |66 passed,7 skipped, same4 registered host-provider failures | `00_audit/core_cpu_final.lx.log` |
+| EQP batch |0056ba63 pushed; claim1439 | BSE and htransform eqp1 legs complete |
+| Remaining direct reads audit |No private gwjax-bundle HDF5 or SlabIO reader remains in the audited drivers | `post_census.txt`; qsgw_head's two SlabIO reads are upstream parallel_transport.h5 preprocessing, not gwjax output. compute_vcoul's auxiliary symmetry read and eqp_bgw's source-energy read are WFN inputs. BSE pseudopole/eigenvector readers consume BSE outputs |

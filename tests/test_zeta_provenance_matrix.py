@@ -114,7 +114,7 @@ class _Hdr(SimpleNamespace):
 @pytest.fixture()
 def stub_reader(monkeypatch, tmp_path):
     """Point _zeta_reuse_ok at a real (empty) file + a stubbed header."""
-    import file_io.isdf_header as ih
+    import file_io.restart_bundle as ih
 
     path = str(tmp_path / "zeta_q.h5")
     open(path, "w").close()

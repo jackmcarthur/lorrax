@@ -199,9 +199,8 @@ from common.coulomb_sphere import (
     compute_per_q_bare_coulomb_components,
 )
 from common.wfn_transforms import accumulate_rchunk_to_gflat
-from file_io.isdf_header import (
-    IsdfHeader, write_isdf_header, read_isdf_header,
-)
+from file_io.isdf_header import (IsdfHeader, write_isdf_header)
+from file_io.restart_bundle import (read_isdf_header)
 
 
 # ---------------------------------------------------------------------------
