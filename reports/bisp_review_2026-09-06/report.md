@@ -6,8 +6,8 @@
 |---|---|
 | 1 — dead dispatch | Planner and direct Gram cuts pushed; live-consumer exceptions below |
 | 2 — phase extraction | In progress; remaining functions above 120 lines are reported explicitly |
-| 3 — duplication | Pending |
-| 4 — docstrings | Prepared relocation; not yet applied broadly |
+| 3 — duplication | Canonical mesh cache keys and duplicate fit-price reuse pushed; plan authentication retained |
+| 4 — docstrings | Six modules below 3.2%; complete contracts relocated with executable AST identity |
 | 5 — configuration | Strict-key/legacy exemptions inspected; parser separation pending |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
@@ -20,7 +20,7 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/gw_jax.py` | `main` | 1448 | 118 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/gw_jax.py` | `main` | 1448 | 118 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
 | `src/gw/gw_jax.py` | `main._config_print` | 5 | 0 | Deleted or renamed to direct owner |
 | `src/gw/gw_jax.py` | `_open_production_report` | 0 | 27 | New explicit phase/direct owner |
 | `src/gw/gw_jax.py` | `_open_production_report._config_print` | 0 | 5 | New explicit phase/direct owner |
@@ -46,11 +46,12 @@
 | `src/gw/gw_jax.py` | `_close_timing` | 0 | 13 | New explicit phase/direct owner |
 | `src/gw/gw_jax.py` | `_report_final_observables` | 0 | 72 | New explicit phase/direct owner |
 | `src/gw/gw_jax.py` | `_report_file_rows` | 0 | 45 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | Docstring lines / share | 70 / 4.09% | 94 / 6.37% | Owner: docs/architecture/decisions.md |
 | `src/gw/gw_jax.py` | **File total** | 1712 | 1476 | Net -236 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/isdf_fitting.py` | `fit_zeta_to_h5` | 1366 | 124 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/isdf_fitting.py` | `fit_zeta_to_h5` | 1366 | 124 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/gw/isdf_fitting.py` | `_prepare_zeta_fit_geometry` | 0 | 94 | New explicit phase/direct owner |
 | `src/gw/isdf_fitting.py` | `_build_zeta_fit_gram` | 0 | 60 | New explicit phase/direct owner |
 | `src/gw/isdf_fitting.py` | `_report_zeta_factor_route` | 0 | 41 | New explicit phase/direct owner |
@@ -66,6 +67,7 @@
 | `src/gw/isdf_fitting.py` | `_run_zeta_fit_tiles` | 0 | 95 | New explicit phase/direct owner |
 | `src/gw/isdf_fitting.py` | `_write_zeta_fit_result` | 0 | 24 | New explicit phase/direct owner |
 | `src/gw/isdf_fitting.py` | `_close_zeta_fit_output` | 0 | 32 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | Docstring lines / share | 29 / 1.88% | 44 / 3.79% | Owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/gw/isdf_fitting.py` | **File total** | 1542 | 1162 | Net -380 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
@@ -75,9 +77,9 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/gw_init.py` | `_plan_gflat_chunks_for_channel` | 136 | 135 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/gw_init.py` | `fit_zeta` | 576 | 56 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/gw_init.py` | `compute_V_q` | 398 | 22 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/gw_init.py` | `_plan_gflat_chunks_for_channel` | 136 | 135 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
+| `src/gw/gw_init.py` | `fit_zeta` | 576 | 56 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
+| `src/gw/gw_init.py` | `compute_V_q` | 398 | 22 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
 | `src/gw/gw_init.py` | `prepare_isdf_and_wavefunctions` | 742 | 742 | Unchanged; target remains |
 | `src/gw/gw_init.py` | `_report_zeta_chunk_plan` | 0 | 16 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_reuse_zeta_faces` | 0 | 27 | New explicit phase/direct owner |
@@ -96,27 +98,69 @@
 | `src/gw/gw_init.py` | `_compute_photon_vq` | 0 | 90 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_compute_scalar_vq` | 0 | 35 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_finalize_vq_views` | 0 | 23 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | Docstring lines / share | 504 / 13.31% | 504 / 14.20% | Owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
 | `src/gw/gw_init.py` | **File total** | 3786 | 3549 | Net -237 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/isdf/core.py` | `_pair_density_kernel` | 24 | 24 | Existing statements moved to named stages or dead selector removed |
-| `src/isdf/core.py` | `_gram_q0_kernel` | 43 | 43 | Existing statements moved to named stages or dead selector removed |
-| `src/isdf/core.py` | `_gram_q0_from_psi_kernel` | 63 | 63 | Existing statements moved to named stages or dead selector removed |
-| `src/isdf/core.py` | `_gram_q0_tiled_from_psi_kernel` | 154 | 154 | Existing statements moved to named stages or dead selector removed |
-| `src/isdf/core.py` | `c_q_from_psi_sm` | 42 | 95 | Existing statements moved to named stages or dead selector removed |
+| `src/isdf/core.py` | `host_rss_gb` | 17 | 10 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `complete_ordered_pair_normal_equations` | 30 | 19 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_conv_kpair_static_gamma` | 14 | 8 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_pair_density_kernel` | 24 | 24 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `pair_density` | 24 | 11 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `pair_density_aot_peak_bytes` | 33 | 26 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_gram_q0_kernel` | 43 | 43 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `gram_q0_from_pair` | 66 | 31 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `transverse_gram_q0_from_pair` | 39 | 24 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_gram_q0_from_psi_kernel` | 63 | 63 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `gram_q0_from_psi_sm` | 65 | 53 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_gram_q0_tiled_from_psi_kernel` | 154 | 146 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `gram_q0_tiled_from_psi_sm` | 88 | 73 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `gram_q0_tiled_from_psi_aot_resident_increment_bytes` | 72 | 65 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `c_q_from_psi_sm` | 42 | 95 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/isdf/core.py` | `_c_q_legacy` | 122 | 0 | Deleted or renamed to direct owner |
 | `src/isdf/core.py` | `_c_q_face_parent` | 95 | 0 | Deleted or renamed to direct owner |
-| `src/isdf/core.py` | `build_psi_r_cache_sm` | 70 | 70 | Existing statements moved to named stages or dead selector removed |
-| `src/isdf/core.py` | `_z_q_face_parent` | 327 | 327 | Existing statements moved to named stages or dead selector removed |
-| `src/isdf/core.py` | `_factor_c_q_replicated` | 116 | 116 | Existing statements moved to named stages or dead selector removed |
-| `src/isdf/core.py` | `_factor_c_q_replicated_qparallel` | 121 | 121 | Existing statements moved to named stages or dead selector removed |
-| `src/isdf/core.py` | `_factor_c_q_transverse_lu` | 127 | 127 | Existing statements moved to named stages or dead selector removed |
-| `src/isdf/core.py` | `_factor_c_q_transverse_distributed_lu` | 59 | 59 | Existing statements moved to named stages or dead selector removed |
-| `src/isdf/core.py` | `_factor_c_q_distributed_rank_truncate` | 246 | 246 | Existing statements moved to named stages or dead selector removed |
-| `src/isdf/core.py` | `_distributed_pinv_apply` | 99 | 99 | Existing statements moved to named stages or dead selector removed |
-| `src/isdf/core.py` | `factor_c_q` | 317 | 317 | Unchanged; target remains |
-| `src/isdf/core.py` | `solve_zeta` | 699 | 101 | Existing statements moved to named stages or dead selector removed |
+| `src/isdf/core.py` | `build_psi_r_cache_sm` | 70 | 59 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_band_chunk_compaction` | 30 | 24 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_z_q_face_parent` | 327 | 327 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_identity_pad_block_diagonal` | 66 | 23 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_replicate_charge_ok` | 13 | 5 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_replicate_rank_truncate_ok` | 36 | 8 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_rank_truncate_capacity_error` | 63 | 39 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_resolve_channel_ladder` | 51 | 27 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_resolve_solver_kind_charge` | 116 | 73 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_resolve_solver_kind_transverse` | 190 | 115 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_resolve_solver_kind` | 37 | 22 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_env_override_raw` | 12 | 6 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `deprecated_env_record` | 9 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_deprecated_env_float` | 21 | 16 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_resolve_zeta_gather` | 122 | 67 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_close_the_cut` | 73 | 36 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_certify_the_cut` | 117 | 58 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_close_the_cut_padded` | 35 | 8 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_withdraw_identity_pad` | 17 | 8 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_charge_factor_math` | 156 | 137 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `solve_zeta_charge_dense` | 66 | 24 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_factor_c_q_replicated` | 116 | 69 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `factor_c_q_replicated_batched` | 29 | 17 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_qparallel_factor_ok` | 19 | 11 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_factor_c_q_replicated_qparallel` | 121 | 80 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_certify_transverse_ridge` | 78 | 50 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_embed_lu_padded` | 14 | 10 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_factor_c_q_transverse_lu` | 127 | 107 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_factor_c_q_transverse_distributed_lu` | 59 | 36 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_distributed_q_batch` | 8 | 3 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_collective_chunk_bytes` | 16 | 10 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_chunk_q` | 11 | 5 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_chunk_log` | 63 | 57 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_factor_c_q_distributed_rank_truncate` | 246 | 195 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_distributed_pinv_apply` | 99 | 71 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `factor_c_q` | 317 | 229 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_reshard_zeta_mu_X_r_Y_to_mu_XY` | 23 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_distributed_backsolve` | 36 | 9 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_reshard_zeta_r_XY_to_mu_XY` | 18 | 6 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_factor_nbatch` | 25 | 5 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `solve_zeta` | 699 | 101 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/isdf/core.py` | `solve_zeta._ridge_indef_solve` | 7 | 0 | Deleted or renamed to direct owner |
 | `src/isdf/core.py` | `solve_zeta._ridge_indef_solve._ridged_lu` | 4 | 0 | Deleted or renamed to direct owner |
 | `src/isdf/core.py` | `solve_zeta._lu_apply_logical` | 16 | 0 | Deleted or renamed to direct owner |
@@ -126,26 +170,27 @@
 | `src/isdf/core.py` | `solve_zeta._pinv_matmul_logical._mm` | 2 | 0 | Deleted or renamed to direct owner |
 | `src/isdf/core.py` | `solve_zeta._pinv_apply_T_logical` | 8 | 0 | Deleted or renamed to direct owner |
 | `src/isdf/core.py` | `solve_zeta._pinv_apply_T_logical._mm` | 2 | 0 | Deleted or renamed to direct owner |
-| `src/isdf/core.py` | `fit_one_rchunk` | 137 | 137 | Existing statements moved to named stages or dead selector removed |
+| `src/isdf/core.py` | `fit_one_rchunk` | 137 | 137 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_band_norms_slice` | 21 | 14 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/isdf/core.py` | `c_q_downfold` | 0 | 122 | New explicit phase/direct owner |
-| `src/isdf/core.py` | `_zeta_logical_solvers` | 0 | 61 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_logical_solvers` | 0 | 39 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_logical_solvers._ridge_indef_solve` | 0 | 7 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_logical_solvers._ridge_indef_solve._ridged_lu` | 0 | 4 | New explicit phase/direct owner |
-| `src/isdf/core.py` | `_zeta_logical_solvers._lu_apply_logical` | 0 | 16 | New explicit phase/direct owner |
-| `src/isdf/core.py` | `_zeta_logical_solvers._tri_solve_logical` | 0 | 13 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_logical_solvers._lu_apply_logical` | 0 | 7 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_logical_solvers._tri_solve_logical` | 0 | 7 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_logical_solvers._tri_solve_logical._chol_backsolve` | 0 | 4 | New explicit phase/direct owner |
-| `src/isdf/core.py` | `_zeta_logical_solvers._pinv_matmul_logical` | 0 | 9 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_logical_solvers._pinv_matmul_logical` | 0 | 5 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_logical_solvers._pinv_matmul_logical._mm` | 0 | 2 | New explicit phase/direct owner |
-| `src/isdf/core.py` | `_zeta_logical_solvers._pinv_apply_T_logical` | 0 | 8 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_logical_solvers._pinv_apply_T_logical` | 0 | 5 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_logical_solvers._pinv_apply_T_logical._mm` | 0 | 2 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_batched_kernels` | 0 | 68 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_batched_kernels._sharded_cho_solve` | 0 | 11 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_batched_kernels._sharded_cho_solve_batch` | 0 | 23 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_batched_kernels._solve_batch_and_update` | 0 | 8 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_batched_kernels._solve_all_at_once` | 0 | 5 | New explicit phase/direct owner |
-| `src/isdf/core.py` | `_zeta_per_q_kernel` | 0 | 88 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_per_q_kernel` | 0 | 79 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_per_q_kernel._per_q_block` | 0 | 25 | New explicit phase/direct owner |
-| `src/isdf/core.py` | `_zeta_per_q_kernel._solve_one_q_and_update` | 0 | 16 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_per_q_kernel._solve_one_q_and_update` | 0 | 7 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_rhs_resharder` | 0 | 21 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_rhs_resharder._reshard_z` | 0 | 3 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_cache_zeta_solve_kernels` | 0 | 24 | New explicit phase/direct owner |
@@ -156,23 +201,151 @@
 | `src/isdf/core.py` | `_solve_zeta_fused_lu` | 0 | 70 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_solve_zeta_fused_lu._dist_ridged_lu` | 0 | 27 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_solve_zeta_fused_lu._run_lu` | 0 | 8 | New explicit phase/direct owner |
-| `src/isdf/core.py` | **File total** | 5831 | 5780 | Net -51 lines |
+| `src/isdf/core.py` | Docstring lines / share | 1365 / 23.41% | 107 / 2.32% | Owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | **File total** | 5831 | 4604 | Net -1227 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/common/wfn_transforms.py` | `gflat_to_rmu` | 362 | 362 | Unchanged; target remains |
-| `src/common/wfn_transforms.py` | `load_centroids_band_chunked` | 683 | 683 | Unchanged; target remains |
-| `src/common/wfn_transforms.py` | **File total** | 3158 | 3158 | Net +0 lines |
+| `src/common/wfn_transforms.py` | `_cached_gindex_dev` | 54 | 36 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `_resolve_gindex_dev` | 49 | 18 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `_box_kernel` | 29 | 22 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `_spec_of` | 16 | 9 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `_local_box_fft` | 15 | 8 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `_sharding_key` | 17 | 4 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `to_box` | 29 | 24 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `to_rbox` | 46 | 38 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `from_rbox` | 77 | 51 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `to_rmu` | 49 | 44 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `to_rchunk_inner` | 74 | 27 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `to_rpoints_inner` | 59 | 25 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `take_rchunk_padded` | 36 | 28 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `to_rchunk` | 102 | 86 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `gflat_to_rchunk_aot_memory` | 113 | 93 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `gflat_to_rchunk_aot_peak_bytes` | 22 | 17 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `to_rmu_inner` | 59 | 19 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `gflat_to_rmu` | 362 | 267 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `accumulate_rchunk_to_gflat` | 284 | 189 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `apply_bloch_phase` | 38 | 28 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `apply_bloch_phase_at` | 58 | 40 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `apply_bloch_phase_on_slice` | 35 | 14 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `_refuse_spinor_zero_fill` | 34 | 11 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `load_kpoint_fftbox_local` | 32 | 16 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `load_kpoint_fftbox` | 19 | 4 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `get_enk_bandrange` | 74 | 45 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `read_Gvecs_to_devices` | 45 | 30 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `load_psi_gflat_padded` | 52 | 32 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `prepare_rchunk_carrier` | 68 | 56 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `iter_psi_rchunk_bandwise` | 141 | 107 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | `load_centroids_band_chunked` | 683 | 624 | Contract relocated to docs/architecture/zeta_fit_face_psi_cct.md; executable AST unchanged |
+| `src/common/wfn_transforms.py` | Docstring lines / share | 833 / 26.38% | 36 / 1.52% | Owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | **File total** | 3158 | 2361 | Net -797 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/gw_config.py` | `read_lorrax_input` | 378 | 378 | Unchanged; target remains |
-| `src/gw/gw_config.py` | **File total** | 5586 | 5586 | Net +0 lines |
+| `src/gw/gw_config.py` | `env_float` | 35 | 22 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `active_zeta_truncating_knobs` | 12 | 8 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `ComputeMode.is_dynamic` | 12 | 4 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `ComputeMode.ppm_model` | 12 | 6 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `announce_legacy_sigma_axis_keys` | 22 | 16 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `SigmaChannel.label` | 14 | 8 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `coerce_compute_mode` | 24 | 12 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `coerce_screening_diagrams` | 20 | 13 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `refuse_unsupported_screening_diagrams` | 38 | 19 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `explain_missing_channels` | 15 | 10 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `refuse_unimplemented_compute_mode` | 18 | 10 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `normalize_w_dyson_solver` | 43 | 28 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `eigh_backend_choices` | 42 | 20 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `resolve_linalg` | 44 | 39 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `distrib_la_batched_route_choices` | 19 | 11 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `BandCounts.describe` | 34 | 14 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `resolve_band_counts` | 110 | 73 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `resolve_band_extrapolation` | 52 | 26 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `sigma_stage_modes` | 74 | 28 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `band_extrapolation_is_consumable` | 9 | 3 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `_deck_key_line` | 11 | 7 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `_print_deck_report` | 15 | 9 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `read_lorrax_input` | 378 | 374 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `_normalize_placement` | 13 | 4 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `scalar_head_overrides_named` | 14 | 9 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `packed_static_envelope` | 76 | 47 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `packed_bare_transverse_route` | 52 | 26 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `packed_photon_screens_current` | 12 | 5 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `uses_static_photon_response` | 12 | 7 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `packed_photon_replaces_charge_sigma` | 19 | 4 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `uses_dynamic_packed_photon_route` | 12 | 4 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `uses_coupled_photon_head` | 14 | 4 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `incumbent_bispinor_head_record` | 39 | 24 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `refuse_unsupported_bispinor_gw` | 122 | 116 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `refuse_unsupported_bispinor_tt_head_correction` | 57 | 35 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `DynamicSigmaConfig.parsed_omega_patches_ev` | 35 | 29 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `MPAConfig.sample_plan` | 24 | 19 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `_validate_occupation_smearing` | 50 | 41 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `resolve_mpa_sampling_alpha` | 28 | 24 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `LorraxConfig.occ_broadening_ry` | 37 | 5 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `LorraxConfig.compute_mode` | 49 | 32 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `LorraxConfig.qp_solver` | 48 | 29 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `LorraxConfig.omega_grid_ev` | 31 | 21 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | `LorraxConfig.from_input_file` | 584 | 574 | Contract relocated to docs/architecture/decisions.md; executable AST unchanged |
+| `src/gw/gw_config.py` | Docstring lines / share | 1002 / 17.94% | 90 / 1.93% | Owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | **File total** | 5586 | 4674 | Net -912 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_isdf_operator` | 412 | 412 | Unchanged; target remains |
-| `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps.__init__` | 488 | 41 | Existing statements moved to named stages or dead selector removed |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `kgrid_shift_map` | 47 | 18 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `bgw_signed_q_representative` | 26 | 19 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `bgw_integer_q_to_fractional` | 28 | 22 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `q_negation_index` | 22 | 16 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `common_uniform_grid_indices` | 54 | 38 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `find_irreducible_bz_points` | 90 | 71 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `map_full_kpoints_to_irreducible` | 58 | 47 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `build_spatial_operator_tables` | 36 | 31 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `slice_q_full_to_ibz` | 49 | 7 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_isdf_operator` | 412 | 301 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `_apply_unfold_phase_and_trs_local` | 24 | 15 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_operator_local` | 72 | 46 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_wavefunction_local` | 79 | 51 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `open_spin_block_coefficient` | 13 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `_get_unfold_isdf_operator_jit` | 172 | 165 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `_rotate_open_spin_centroid_operator` | 48 | 36 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_spin_centroid_operator` | 137 | 111 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_isdf_one_leg` | 283 | 212 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `_get_unfold_isdf_one_leg_jit` | 83 | 76 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `apply_spinor_rotation` | 48 | 30 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `tau_phase_row` | 33 | 8 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `tau_phase_row_jax` | 17 | 11 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_reciprocal_carriers` | 14 | 9 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_psi` | 195 | 76 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps.__init__` | 488 | 10 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps.create_kpoint_symmetry_map` | 28 | 3 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps.syms_crystal_to_cartesian` | 72 | 13 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps.q_irr_is_full_identity` | 19 | 12 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps.operation_rows` | 22 | 17 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps.cartesian_action` | 24 | 18 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps.get_spinor_rotations` | 85 | 73 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps.get_kminusq_map` | 13 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps._get_kminusq_index_map` | 55 | 47 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps.get_umklapp_vector` | 24 | 18 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps.find_qpoint_index` | 36 | 28 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `_jit_with` | 8 | 3 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `_row_out_sharding` | 15 | 7 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `_scalar_out_sharding` | 12 | 6 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `_star_row_order` | 19 | 7 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `_broadcast_rows` | 40 | 32 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `_star_conj_flags` | 26 | 8 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `_spread_tables` | 14 | 6 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `_star_stats` | 44 | 38 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `star_select` | 10 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `star_broadcast` | 98 | 39 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `star_tables_of` | 19 | 5 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_file_wedge_to_full_bz` | 43 | 14 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_file_wedge_band_operator` | 35 | 11 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_file_wedge_polar_matrix` | 38 | 21 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `reduce_full_bz_to_file_wedge` | 23 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `unfold_star_wedge_to_full_bz` | 14 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `star_spread` | 16 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `KStarMap.select` | 7 | 3 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `KStarMap.spread` | 9 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | `KStarMap.spread_rel` | 11 | 5 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/symmetry_register.md |
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps._initialize_symmetry_provenance` | 0 | 48 | New explicit phase/direct owner |
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps._initialize_active_operations` | 0 | 39 | New explicit phase/direct owner |
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps._validate_identity_grid` | 0 | 40 | New explicit phase/direct owner |
@@ -180,30 +353,87 @@
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps._initialize_spatial_operators` | 0 | 98 | New explicit phase/direct owner |
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps._initialize_k_maps` | 0 | 96 | New explicit phase/direct owner |
 | `services/symmetry_maps/src/symmetry_maps/maps.py` | `SymMaps._initialize_q_maps` | 0 | 41 | New explicit phase/direct owner |
-| `services/symmetry_maps/src/symmetry_maps/maps.py` | **File total** | 4190 | 4217 | Net +27 lines |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | Docstring lines / share | 1172 / 27.97% | 86 / 2.75% | Owner: docs/architecture/symmetry_register.md |
+| `services/symmetry_maps/src/symmetry_maps/maps.py` | **File total** | 4190 | 3124 | Net -1066 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/w_isdf.py` | `_get_chi_minimax_kernel` | 48 | 48 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/w_isdf.py` | `_get_chi_fractional_contour_kernel` | 28 | 28 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/w_isdf.py` | `_get_w_solve_fn_local` | 142 | 142 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/w_isdf.py` | `_get_w_solve_fn_distributed` | 201 | 201 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/w_isdf.py` | `compute_static_photon_response` | 362 | 58 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/w_isdf.py` | `_parent_face_unfold_operands` | 22 | 22 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/w_isdf.py` | `iter_parent_children_faces` | 56 | 56 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/w_isdf.py` | `iter_parent_children_faces._kernel` | 17 | 17 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/w_isdf.py` | `_get_chi_static_fractional_gamma_kernel_face` | 52 | 52 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/w_isdf.py` | `_get_chi_fractional_q_kernel_face` | 60 | 60 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/w_isdf.py` | `_complete_static_vertex_orientations` | 24 | 6 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_get_chi_minimax_kernel` | 48 | 48 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_get_chi_fractional_contour_kernel` | 28 | 28 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_get_w_solve_fn_local` | 142 | 123 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_get_w_solve_fn_distributed` | 201 | 151 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_w_residual_report` | 24 | 16 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_w_solve_pref_scalar` | 17 | 9 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_resolve_w_solve_fn` | 44 | 25 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_require_w_operand_geometry` | 32 | 26 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `solve_w` | 42 | 12 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `compute_chi0` | 51 | 33 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `compute_chi0_imag_ordered` | 45 | 18 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `compute_experimental_no_pair_photon_chi0` | 54 | 50 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_load_static_photon_hall` | 59 | 51 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `compute_static_photon_response` | 362 | 58 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_chi0_multi_kernel_args` | 39 | 29 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_chi0_contour_alpha_rows` | 23 | 18 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `compute_chi0_contour` | 16 | 11 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `compute_chi0_contour_ordered` | 131 | 80 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_occupation_support_slices` | 49 | 25 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `compute_chi0_contour_fractional` | 39 | 28 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_fractional_pair_scan_face` | 147 | 139 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_fractional_pair_scan_face._gather_mun` | 14 | 11 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_fractional_pair_scan_face._gather_nmu` | 17 | 12 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_parent_face_unfold_operands` | 22 | 22 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `iter_parent_children_faces` | 56 | 56 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `iter_parent_children_faces._kernel` | 17 | 17 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_get_chi_static_fractional_gamma_kernel_face` | 52 | 52 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `_get_chi_fractional_q_kernel_face` | 60 | 60 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `compute_chi0_static_fractional_gamma` | 78 | 63 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `occupation_support_bandwidth` | 17 | 8 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `compute_chi0_static_fractional` | 28 | 14 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `compute_chi0_direct_fractional` | 101 | 90 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `precompile_chi0` | 34 | 29 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `precompile_solve_w` | 23 | 19 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
 | `src/gw/w_isdf.py` | `_resolve_static_photon_policy` | 0 | 92 | New explicit phase/direct owner |
 | `src/gw/w_isdf.py` | `_read_static_photon_body` | 0 | 27 | New explicit phase/direct owner |
 | `src/gw/w_isdf.py` | `_report_static_photon_body` | 0 | 26 | New explicit phase/direct owner |
 | `src/gw/w_isdf.py` | `_screen_static_photon_body` | 0 | 85 | New explicit phase/direct owner |
 | `src/gw/w_isdf.py` | `_complete_static_photon_head` | 0 | 60 | New explicit phase/direct owner |
-| `src/gw/w_isdf.py` | **File total** | 3072 | 3069 | Net -3 lines |
+| `src/gw/w_isdf.py` | Docstring lines / share | 512 / 16.67% | 73 / 2.72% | Owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | **File total** | 3072 | 2682 | Net -390 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/head_correction.py` | **File total** | 2559 | 2559 | Net +0 lines |
+| `src/gw/head_correction.py` | `static_hall_linear_response` | 37 | 28 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `canonicalize_static_gauge_q2_tensor` | 13 | 6 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `static_gauge_tensor_residuals` | 39 | 31 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `resolve_bgw_q0_channel` | 64 | 57 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `finite_q0_epsinv_head` | 41 | 29 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `_check_dipole_coverage` | 58 | 43 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `_dipole_window_from_params` | 43 | 18 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `_check_dipole_provenance` | 67 | 43 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `build_S_cart_omega` | 60 | 30 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `fold_small_head_wings_sharded` | 104 | 62 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `fold_cartesian_head_wings_sharded` | 17 | 12 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `small_head_wing_halves_sharded` | 45 | 34 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `_static_slab_photon_head_moment_chunk` | 79 | 61 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `static_slab_photon_head_moment_chunk` | 56 | 44 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `complete_static_slab_photon_q0` | 234 | 220 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `resolve_head_S_cart` | 57 | 30 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `fit_head_ppm` | 72 | 65 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `fit_head_ppm_from_samples` | 27 | 13 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `fit_head_hl_analytic` | 50 | 33 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `fit_head_with_fixed_omega` | 31 | 21 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `compute_static_head_terms` | 40 | 34 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `expand_band_diagonal_to_kij` | 19 | 14 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `static_head_terms_to_kij` | 30 | 13 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `compute_ppm_head_sigma_kij` | 68 | 26 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `compute_ppm_head_sigma_diag` | 46 | 37 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `on_shell_occupied_head_sigma_ry` | 39 | 19 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `compute_complex_pole_head_sigma_diag` | 62 | 44 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `apply_q0_head_rank1` | 34 | 22 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | `apply_q0_head_rank1_sharded` | 37 | 23 | Contract relocated to docs/architecture/four_current_wiring.md; executable AST unchanged |
+| `src/gw/head_correction.py` | Docstring lines / share | 610 / 23.84% | 64 / 3.18% | Owner: docs/architecture/four_current_wiring.md |
+| `src/gw/head_correction.py` | **File total** | 2559 | 2013 | Net -546 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -302,7 +532,7 @@
 
 | Tree scope | Before | After | Net |
 |---|---|---|---|
-| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 124325 | -922 |
+| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119414 | -5833 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
@@ -315,7 +545,8 @@
 | 7 — Vq stages (f579b808) | 1403 | 445 passed, 2 skipped, 1 xfailed; centroid/parent/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-184246-65473-4941, lx-Xg4-184258-66104-4580; 15_vq_stages/cpu/cpu.xml; 15_vq_stages/p4/mos2/identity.json |
 | 8 — extract charge and current fit stages (36b46cb0) | 1404 | 453 passed, 2 skipped, 1 xfailed, 102 warnings in 177.56s (0:02:57) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-185204-112340-9401, lx-Xg4-185204-112565-5557; 16_fit_stages/cpu/cpu.xml; 16_fit_stages/p4/mos2/identity.json |
 | 9 — extract zeta writer and tile stages (48194876) | 1405 | 465 passed, 2 skipped, 1 xfailed, 102 warnings in 247.62s (0:04:07) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-190233-157458-4126, lx-Xg4-190235-157617-6713; 18_fit_writer_stages/cpu/cpu.xml; 18_fit_writer_stages/p4/mos2/identity.json |
-| 10 — use canonical mesh cache keys (this commit) | 1406 | 452 passed, 2 skipped, 1 xfailed, 102 warnings in 177.23s (0:02:57) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-190804-191933-7526, lx-Xg4-190804-192105-9882; 19_owner_cache_keys/cpu/cpu.xml; 19_owner_cache_keys/p4/mos2/identity.json |
+| 10 — use canonical mesh cache keys (37aa7db2) | 1406 | 452 passed, 2 skipped, 1 xfailed, 102 warnings in 177.23s (0:02:57) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-190804-191933-7526, lx-Xg4-190804-192105-9882; 19_owner_cache_keys/cpu/cpu.xml; 19_owner_cache_keys/p4/mos2/identity.json |
+| 11 — relocate long source contracts to architecture owners (this commit) | 1408 | 450 passed, 2 skipped, 1 xfailed, 102 warnings in 178.98s (0:02:58) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-191254-220724-5967, lx-Xg4-191254-220772-4165; 20_contract_docs/cpu/cpu.xml; 20_contract_docs/p4/mos2/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|

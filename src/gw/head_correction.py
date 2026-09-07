@@ -1,63 +1,4 @@
-"""The q=0, G=G'=0 (Gamma-cell) head of the Coulomb / photon interaction.
-
-A finite k-grid never samples the singular ``q -> 0, G = 0`` slot of ``v``
-or ``W``.  This module owns every way LORRAX fills that slot, for the scalar
-charge channel and for the packed four-current (photon) operator; the
-physics is stated in ``docs/theory/four-current-head-corrections.md`` and the
-``S(omega)`` convention in ``docs/theory/s-tensor-convention.md``.
-
-What the module owns
---------------------
-
-* **Scalar head resolution** -- :class:`HeadResolver`, :func:`resolve_head_sample`
-  and :func:`build_S_cart_omega`: the ``head_correction`` policy
-  (``full`` / ``no_local_fields`` / ``off``), the head source order
-  (deck overrides, ``epshead``, the ``dipole.h5`` ``S`` tensor), the
-  ``dipole.h5`` coverage and provenance gates, and the memoized per-frequency
-  :class:`HeadSample` ``(v_h, W_h(omega))`` every Sigma route reads.
-* **The Schur fold of head against body** --
-  :func:`fold_cartesian_head_wings_sharded` (scalar ``S_eff = S + Y W Z /
-  Omega``), :func:`fold_small_head_wings_sharded` and
-  :func:`small_head_wing_halves_sharded` (the same fold for one Lorentz block
-  of the packed photon body, wings sharded on the mesh; nothing gathers).
-* **Static COHSEX head terms** -- :class:`StaticHeadTerms` and
-  :func:`compute_static_head_terms`: the exact band-diagonal ``Sigma^X``,
-  ``Sigma^SX``, ``Sigma^(SX-X)``, ``Sigma^COH`` shifts.
-* **Dynamic heads** -- :func:`fit_head_ppm` (GN / HL single pole from two
-  samples) and :func:`compute_complex_pole_head_sigma_diag` (MPA poles on the
-  stamped complex grid).
-* **Rank-1 re-attachment** -- :func:`apply_q0_head_rank1` and
-  :func:`resolve_head_S_cart`: the ``(W_h/Omega) conj(g0) x g0`` update that
-  downstream W consumers (BSE, densifiers) apply to a headless ``W(q=0)``.
-* **The BGW finite-q0 channel** -- :class:`BGWQ0Channel`,
-  :func:`resolve_bgw_q0_channel` (``bgw_metal_q0_treatment``).
-* **The packed static photon Gamma-cell completion** --
-  :func:`static_hall_linear_response` (the unique Hall-only CT/TC tensor from
-  ``sigma_H``), :func:`canonicalize_static_gauge_q2_tensor` and
-  :func:`static_gauge_tensor_residuals` (the in-plane Ward / Hermiticity
-  certificates of a ``(2,2,4,4)`` response), the fixed-size coupled 4x4
-  Dyson/cubature kernel :func:`static_slab_photon_head_moment_chunk`, and
-  :func:`complete_static_slab_photon_q0`, which folds the bounded
-  :class:`gw.static_gauge_response.StaticPhotonHeadResponse` through the
-  headless packed body, solves ``W_h(q) = [1 - D(q) R(q)]^{-1} D(q)`` on the
-  exact slab Wigner-Seitz cubature, and inserts the bare and nine screened
-  rank-4 moments into packed V and W (:func:`gw.photon_layout.
-  add_photon_q0_low_rank`).  Its evidence record
-  :class:`StaticSlabPhotonHeadCompletion` carries the numerical
-  certificates and the bounded factor carrier
-  :class:`StaticPhotonQ0FactorCarrier` that ``gw.photon_sigma`` uses to
-  attribute Sigma per Lorentz sector.  Slab only: a bulk analytic-sphere
-  completion cannot be added after the nonlinear coupled solve and has no
-  derived integrator.
-
-What it does not own
---------------------
-
-The velocity / ``S`` / wing / Hall producers (``gw.qsgw_head``), the mini-BZ
-estimators and the photon cubature (``vcoul``), the packed layout
-(``gw.photon_layout``), the bare TT head slot (``gw.v_q_bispinor``), and the
-Hall artifact format (``file_io.static_gauge_head``).
-"""
+"""The q=0, G=G'=0 (Gamma-cell) head of the Coulomb / photon interaction; see docs/architecture/four_current_wiring.md."""
 
 from __future__ import annotations
 
@@ -86,13 +27,7 @@ def _analytic_q0_sphere(params) -> bool:
 
 
 class HeadResponseKind(str, enum.Enum):
-    """Reduction state of the response that produced a scalar head.
-
-    The distinction is operational, not documentation: ``DIRECT_IRREDUCIBLE``
-    still needs the head/body Schur complement for a physical macroscopic W,
-    whereas ``MICRO_REDUCIBLE`` already contains that local-field resummation
-    and must never be folded again.
-    """
+    """Reduction state of the response that produced a scalar head; see docs/architecture/four_current_wiring.md."""
 
     DIRECT_IRREDUCIBLE = "direct_irreducible"
     FULL_LOCAL_FIELDS = "full_local_fields"
@@ -138,12 +73,7 @@ class HeadGNParams:
 
 @dataclass(frozen=True)
 class StaticHeadTerms:
-    """Exact static q=0 head terms for bare X / SX / COHSEX.
-
-    All values are diagonal-in-band shifts in Rydberg atomic units.
-    The head contributes equally at every k-point, with the Brillouin-zone
-    average carried by the explicit ``1 / N_k`` factor.
-    """
+    """Exact static q=0 head terms for bare X / SX / COHSEX; see docs/architecture/four_current_wiring.md."""
 
     sigma_x_diag: jnp.ndarray
     sigma_sx_diag: jnp.ndarray
@@ -160,16 +90,7 @@ _STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX = 1.0e-10
 
 
 def static_hall_linear_response(sigma_H) -> jax.Array:
-    r"""Return the unique static Hall-only linear CT/TC tensor.
-
-    ``Pi_H[0,i](q) = -i epsilon[b,a,i] sigma_H[b] q[a]`` for the persisted
-    occupied-bra Berry ``sigma_H``; ``TC = CT^dagger``.
-    The result has shape ``(2,4,4)`` with coordinate index ``a=(x,y)``.
-    Charge is Lorentz row/column zero and currents are columns/rows 1:4.
-    Every CC and TT entry is exactly zero; TC is the Hermitian conjugate of
-    CT.  A real, separately sourced ``sigma_H`` is required so this function
-    cannot manufacture an unconstrained fitted Hall matrix.
-    """
+    """Return the unique static Hall-only linear CT/TC tensor; see docs/architecture/four_current_wiring.md."""
     sigma_raw = np.asarray(sigma_H)
     if sigma_raw.shape != (3,):
         raise ValueError(
@@ -199,14 +120,7 @@ def static_hall_linear_response(sigma_H) -> jax.Array:
 
 
 def canonicalize_static_gauge_q2_tensor(S_direct) -> jax.Array:
-    r"""Return the unique coordinate-symmetric representative of ``q S q``.
-
-    Only ``q_a q_b S[a,b]`` is observable in the quadratic response, so the
-    coordinate-antisymmetric part is identically null.  Broken-TRS bubbles
-    and their Hermitian Schur folds generically carry such an imaginary
-    antisymmetric part; remove it at construction sites while leaving the
-    independent validation gate fail-closed for arbitrary consumer input.
-    """
+    """Return the unique coordinate-symmetric representative of ``q S q``; see docs/architecture/four_current_wiring.md."""
     S = jnp.asarray(S_direct)
     if tuple(S.shape) != (2, 2, 4, 4):
         raise ValueError(f"S_direct must be (2,2,4,4); got {S.shape}")
@@ -214,15 +128,7 @@ def canonicalize_static_gauge_q2_tensor(S_direct) -> jax.Array:
 
 
 def static_gauge_tensor_residuals(S_direct) -> tuple[float, float]:
-    r"""Return algebraic in-plane Ward and Hermiticity residuals of ``S``.
-
-    The Ward residual is the largest coefficient of the two cubic identities
-    ``q_i q_a q_b S[a,b,i,J]=0`` and
-    ``q_a q_b S[a,b,I,i] q_i=0``, normalized by ``max|S|``.  Hermiticity also
-    includes the coordinate-canonical condition ``S[a,b]=S[b,a]``; an
-    antisymmetric coordinate tensor is unobservable under ``q_a q_b`` and is
-    refused rather than retained as an arbitrary representative.
-    """
+    """Return algebraic in-plane Ward and Hermiticity residuals of ``S``; see docs/architecture/four_current_wiring.md."""
     S = np.asarray(jax.device_get(S_direct), dtype=np.complex128)
     if S.shape != (2, 2, 4, 4):
         raise ValueError(f"S_direct must be (2,2,4,4); got {S.shape}")
@@ -269,14 +175,7 @@ class BGWQ0Channel:
 def resolve_bgw_q0_channel(
     config, sym, q_wedge_full_indices, head_channel, *, kgrid,
 ):
-    """Bind the deck's reduced q0 vector to one stored W-wedge row.
-
-    The shifted point must be exactly on the WFN grid.  Its irreducible
-    representative may point in another symmetry-equivalent direction; the
-    scalar epsilon-inverse head is invariant under that operation, and the
-    head-channel vector is therefore taken from the representative row that
-    the Dyson solve actually stores.
-    """
+    """Bind the deck's reduced q0 vector to one stored W-wedge row; see docs/architecture/four_current_wiring.md."""
     if not bool(config.head.uses_bgw_metal_q0shift):
         return None
     if head_channel is None:
@@ -342,19 +241,7 @@ def finite_q0_epsinv_head(
     *,
     mesh_xy: Mesh,
 ):
-    r"""Return the full finite-q ``epsilon^{-1}_{00}``, including wings.
-
-    In the centroid representation the selected plane-wave channel is
-    ``V_0 = v_0 |conj(g)><g|``.  With the already solved
-    ``W=(1-V chi)^{-1}V``, the exact bordered-Dyson scalar is
-
-    ``epsinv_00 = 1 + v_0 <g| chi (1 + W chi) |conj(g)>``.
-
-    Thus the regular finite-q W tile supplies the head, both wings, and the
-    body Schur fold without forming a plane-wave epsilon matrix.  Every
-    ``(mu,nu)`` object remains two-dimensionally sharded; only two vectors
-    and the final scalar are resharded/reduced.
-    """
+    """Return the full finite-q ``epsilon^{-1}_{00}``, including wings; see docs/architecture/four_current_wiring.md."""
     chi = jnp.asarray(chi_q0) * jnp.asarray(
         chi_prefactor, dtype=jnp.asarray(chi_q0).dtype)
     W = jnp.asarray(W_q0)
@@ -437,22 +324,7 @@ def resolve_head_override(params, omega) -> HeadSample | None:
 def _check_dipole_coverage(
     dipole_path, *, nb_file, nk_file, nk_run, nb_run, nelec, print_fn,
 ):
-    """Loud coverage check on ``dipole.h5`` at the point of use.
-
-    ``dipole.h5`` is generated once by ``psp.get_dipole_mtxels`` at
-    whatever ``nbands`` the generating run happened to use, and it is
-    *not* namespaced by that count.  The head ``S(ω)`` built from it sums
-    over ``arange(nelec, nb_file)`` conduction states — so a file written
-    at 120 bands feeding a run whose Σ window spans 160 silently
-    truncates the transition space in ``wcoul0``, and therefore in every
-    q→0 Σ_SX / Σ_COH correction.  That exact mismatch shipped in the
-    2026-07 production runs and was found by hand, not by the code.
-
-    The file stamps ``nbands`` / ``nk`` as HDF5 attrs; nothing read them.
-    This warns rather than raises: a short dipole file is a *convergence*
-    defect, not a corrupt one, and refusing would break every existing
-    run directory.  It is loud enough to see.
-    """
+    """Loud coverage check on ``dipole.h5`` at the point of use; see docs/architecture/four_current_wiring.md."""
     from common import sanity
 
     if not sanity.sanity_enabled():
@@ -495,32 +367,7 @@ def _check_dipole_coverage(
 
 
 def _dipole_window_from_params(params, wfn) -> tuple[int, int, int]:
-    """``(nval, ncond, nband)`` — the RUN's resolved band window, or a refusal.
-
-    THE THREE NUMBERS ARE READ, NEVER INVENTED.  This helper used to default
-    ``nval``/``ncond`` to 5 and ``nband`` to ``max(wfn.nbands, nelec+ncond)``,
-    on the stated grounds that it "mirrors the writer".  The writer resolves
-    those defaults against the DECK; this side only ever saw
-    ``config.head`` — a six-key dict with no band window in it — so the
-    defaults were not a mirror, they were the only thing the comparison ever
-    used.  Measured on the MoS2 production deck (JID 57269074): a dipole.h5
-    generated from the very same WFN and deck reported
-    ``file=26/26/600`` against an invented ``run=5/5/610``, and under
-    ``LORRAX_SANITY=strict`` that false warning is an unconditional refusal
-    of a correct file.
-
-    So an ABSENT field is a refusal, not a guess.  A provenance check whose
-    reference is fabricated cannot fail for the reason it claims and cannot
-    pass for one either — it is the class of check
-    ``TASTE.md``/"a check that cannot fail is not evidence" is about.  The
-    one supported caller (:class:`HeadResolver`) carries the resolved
-    ``config.nval``/``config.ncond``/``config.nband``; a direct caller must
-    do the same.
-
-    ``wfn`` is retained for the refusal message only — it is what makes the
-    "which numbers were missing, and what would they have been" line
-    actionable — and is deliberately NOT consulted for a value.
-    """
+    """``(nval, ncond, nband)`` — the RUN's resolved band window, or a refusal; see docs/architecture/four_current_wiring.md."""
     missing = [k for k in ("nval", "ncond", "nband")
                if params.get(k) is None]
     if missing:
@@ -540,31 +387,7 @@ def _dipole_window_from_params(params, wfn) -> tuple[int, int, int]:
 
 
 def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
-    """Was ``dipole.h5`` built from THIS DFT solution and THIS band window?
-
-    The coverage check above answers "is the file big enough"; this answers
-    "is it the right file at all".  They are different failures and neither
-    implies the other: a dipole.h5 regenerated from a *different* WFN has
-    exactly the right shape, so every shape-based check passes and nothing
-    downstream notices that the q→0 head S(ω) — and therefore every
-    Σ_SX/Σ_COH head correction — is built from stale velocity matrix
-    elements.
-
-    ``psp.get_dipole_mtxels`` has stamped ``prov_*`` attrs (WFN sha256 plus
-    the band window) since the guard landed, and shipped
-    ``check_dipole_provenance`` to read them back.  Nothing called it; the
-    writer and the checker both existed and the consumer did neither.
-
-    Reports through ``common.sanity`` — loud by default, a refusal under
-    ``LORRAX_SANITY=strict`` — and is gated on ``sanity_enabled()`` like
-    its sibling.  An UNSTAMPED file (written before the guard) reports as
-    unverifiable and does not fail the run.
-
-    A caller that supplies no band window is refused outright by
-    :func:`_dipole_window_from_params` (a code defect, not a deck error):
-    an invented reference makes this check accuse correct files and vouch
-    for nothing.
-    """
+    """Was ``dipole.h5`` built from THIS DFT solution and THIS band window?; see docs/architecture/four_current_wiring.md."""
     from common import sanity
     from common.four_current_model import resolve_four_current_representation
 
@@ -720,37 +543,7 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
 
 def build_S_cart_omega(wfn, sym, meta, params, dipole_path, omega,
                        *, eta: float = 0.0, print_fn=print) -> np.ndarray:
-    """``S(ω)``, the Cartesian q²-coefficient tensor, from ``dipole.h5``.
-
-    THE ONE SPELLING of the dipole → ``S(ω)`` build.  It has two consumers and
-    they must not drift: ``resolve_head_sample``'s ``s_tensor`` branch (the GW
-    run, which then averages it into ``wcoul0``) and
-    :func:`resolve_head_S_cart` (the BSE, which needs the integrand itself to
-    re-attach W's head per fine q under ``gw.head_densify``).  A second copy
-    would be a tensor that agrees with the run's head everywhere except where
-    it matters.
-
-    Units and convention are ``docs/theory/s-tensor-convention.md``: Cartesian,
-    the canonical form, ``1/(Ry·bohr²)`` such that ``v(q)·qᵀSq`` is
-    dimensionless.
-
-    Parameters
-    ----------
-    wfn, sym, meta
-        The run's loader / symmetry table / system parameters.
-    params : dict
-        Deck keys; read for the dipole provenance check only.
-    dipole_path : str
-        Absolute path to ``dipole.h5``.
-    omega : complex
-        Frequency in Ry.  0 for the static head this stage consumes.
-    eta : float
-        Broadening in Ry (deck ``wcoul0_eta``).  Non-zero makes ``S`` complex.
-
-    Returns
-    -------
-    numpy.ndarray, shape (3, 3), complex128
-    """
+    """``S(ω)``, the Cartesian q²-coefficient tensor, from ``dipole.h5``; see docs/architecture/four_current_wiring.md."""
     from common.chi_from_dipole import read_dipole_h5, compute_S_omega
     from common import timing as _tmg
 
@@ -790,49 +583,7 @@ def fold_small_head_wings_sharded(
     *,
     mesh_xy: Mesh,
 ) -> jax.Array:
-    r"""Fold a bounded small-field response through the screened body.
-
-    This is the single production owner of the small head/body Schur fold.
-    It accepts independently sized left and right field bases; both field
-    extents are replicated and therefore must remain bounded.  The body is
-    never gathered: every rank contracts its local ``(I_x, J_y)`` tile and
-    only the small output is reduced across the two-dimensional mesh.
-
-    .. math::
-
-        R_{AB}^{\mathrm{eff}}(z) = R_{AB}^{0}(z)
-          + \frac{1}{V_{\mathrm{cell}}}
-            \sum_{IJ}Y_{AI}(z)W_{IJ}(z)Z_{JB}(z).
-
-    Any replicated batch/frequency axes may precede the displayed axes and
-    must match exactly (no broadcasting).  Body axes remain tiled exactly
-    like screening: ``Y`` on ``x``, ``W`` on ``(x,y)``, and ``Z`` on ``y``.
-    The caller supplies those shardings; this kernel deliberately does not
-    defensively reshard large inputs.
-
-    Parameters
-    ----------
-    R_direct
-        Direct response, ``(..., F_left, F_right)``, replicated.  Its units
-        are set by the caller's field basis.
-    Y_x
-        Left wing, ``(..., F_left, n_I)``, body axis sharded on ``x``.
-    W_body_xy
-        Screened body, ``(..., n_I, n_J)``, sharded on ``(x,y)``.
-    Z_y
-        Right wing, ``(..., n_J, F_right)``, body axis sharded on ``y``.
-        Wing/body units must make ``Y W Z / Vcell`` match ``R_direct``.
-    Vcell
-        Primitive-cell volume in bohr³; it appears exactly once.
-    mesh_xy
-        Production two-dimensional device mesh.
-
-    Returns
-    -------
-    jax.Array
-        ``R_eff`` with shape ``(..., F_left, F_right)``, the same units as
-        ``R_direct``, replicated on ``mesh_xy``.
-    """
+    """Fold a bounded small-field response through the screened body; see docs/architecture/four_current_wiring.md."""
     n_lead = W_body_xy.ndim - 2
     arrays = (R_direct, Y_x, W_body_xy, Z_y)
     if n_lead < 0 or any(a.ndim != n_lead + 2 for a in arrays):
@@ -896,12 +647,7 @@ def fold_cartesian_head_wings_sharded(
     *,
     mesh_xy: Mesh,
 ) -> jax.Array:
-    """Charge-head adapter to :func:`fold_small_head_wings_sharded`.
-
-    ``S_direct`` and the result have shape ``(..., 3, 3)`` and units
-    ``1/(Ry·bohr²)``; the centroid/body axes retain their existing
-    ``x``/``(x,y)``/``y`` shardings.
-    """
+    """Charge-head adapter to :func:`fold_small_head_wings_sharded`; see docs/architecture/four_current_wiring.md."""
     return fold_small_head_wings_sharded(
         S_direct, Y_x, W_body_xy, Z_y, cell_volume, mesh_xy=mesh_xy)
 
@@ -935,18 +681,7 @@ def small_head_wing_halves_sharded(
     *,
     mesh_xy: Mesh,
 ) -> tuple[jax.Array, jax.Array]:
-    r"""Contract each small photon wing through one resident body ``W``.
-
-    For the two in-plane directions and four Lorentz fields this returns
-
-    ``YW[a,A,J] = sum_I Y[a,A,I] W[I,J]`` and
-    ``WZ[b,I,B] = sum_J W[I,J] Z[b,J,B]``.
-
-    Only the contracted centroid axis is reduced.  The outputs remain
-    respectively y- and x-sharded one-index objects; the body is neither
-    gathered nor transposed.  No conjugation, cell-volume factor, or head
-    model is implicit.
-    """
+    """Contract each small photon wing through one resident body ``W``; see docs/architecture/four_current_wiring.md."""
     if Y_x.ndim != 3 or W_body_xy.ndim != 2 or Z_y.ndim != 3:
         raise ValueError(
             "small photon-head halves require Y=(2,4,N), W=(N,N), "
@@ -984,25 +719,7 @@ def _static_slab_photon_head_moment_chunk(
     valid_count: jax.Array,
     sample_weight: jax.Array,
 ):
-    r"""Accumulate one fixed-size chunk of the coupled small-head solve.
-
-    ``R(q) = q_a H_hall[a] + q_a q_b S_quadratic[a,b]`` uses the two
-    periodic in-plane Cartesian coordinates of a slab.  ``H_hall`` is private
-    to this numerical kernel: the public entry derives it from ``sigma_H`` so
-    an arbitrary linear CT/TC matrix cannot enter production.  For every valid
-    mini-BZ sample this evaluates the *coupled* four-field Dyson equation
-
-    ``W_h(q) = [I - D(q) R(q)]^-1 D(q)``
-
-    before averaging.  The returned ``(1,qx,qy)`` moments are sufficient to
-    rebuild the head, both single wings, and the double-wing body update as
-    repeated rank-four outer products; no sample-by-centroid array exists.
-
-    This is the sole sample-sized graph.  The vcoul provider zero-pads its
-    final chunk to the same fixed size and passes ``valid_count``, preventing
-    a tail-shape recompile and keeping the invalid q=0 rows outside every
-    accumulated quantity.
-    """
+    """Accumulate one fixed-size chunk of the coupled small-head solve; see docs/architecture/four_current_wiring.md."""
     q = jnp.asarray(q_cart, dtype=jnp.float64)
     D = jnp.asarray(D_raw, dtype=jnp.complex128)
     H = jnp.asarray(H_hall, dtype=jnp.complex128)
@@ -1065,19 +782,7 @@ def static_slab_photon_head_moment_chunk(
     valid_count,
     sample_weight,
 ):
-    """Validated entry to the fixed-size static slab photon-head graph.
-
-    Parameters follow :func:`_static_slab_photon_head_moment_chunk`:
-    ``q_cart`` is ``(chunk,3)``, ``D_raw`` is ``(chunk,4,4)`` in raw vcoul
-    units (no cell-volume factor), ``sigma_H`` is the separately sourced real
-    Hall pseudovector, and ``S_quadratic`` is ``(2,2,4,4)``.  The caller
-    normalizes each provider-issued weighted rule and applies the one and only
-    ``1/Vcell`` while rebuilding the packed q=Gamma row.
-
-    The function is intentionally slab/static-only.  A bulk analytic-sphere
-    correction cannot be added after this nonlinear coupled solve, and must
-    have its own derived integrator before that policy is admitted.
-    """
+    """Validated entry to the fixed-size static slab photon-head graph; see docs/architecture/four_current_wiring.md."""
     q_shape = tuple(np.shape(q_cart))
     d_shape = tuple(np.shape(D_raw))
     sigma_shape = tuple(np.shape(sigma_H))
@@ -1117,13 +822,7 @@ def static_slab_photon_head_moment_chunk(
 
 @dataclass(frozen=True)
 class StaticPhotonQ0FactorCarrier:
-    """Bounded factors for the exact q=0 updates inserted into V and W.
-
-    The bare pair and nine screened pairs are the completed factors, after
-    the coupled 4x4 Dyson/cubature transaction.  They are retained only so
-    the incumbent Sigma contraction can attribute the FINAL Lorentz blocks
-    linearly; they are not a second response model or a packed-body copy.
-    """
+    """Bounded factors for the exact q=0 updates inserted into V and W; see docs/architecture/four_current_wiring.md."""
 
     bare_pair: tuple[jax.Array, jax.Array]
     screened_pairs: tuple[tuple[jax.Array, jax.Array], ...]
@@ -1407,21 +1106,7 @@ def complete_static_slab_photon_q0(
     mesh_xy: Mesh,
     family_plans: tuple = (),
 ) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
-    r"""Complete bare and screened packed photon operators in the Γ cell.
-
-    ``response`` is the sealed bounded
-    :class:`gw.static_gauge_response.StaticPhotonHeadResponse` (charge
-    ``S^{00}``, charge wings, ``sigma_H``); the kernel below constructs the
-    Hall tensor from ``sigma_H`` itself, so no arbitrary linear CT/TC matrix
-    can enter.  ``cubature_receipt`` is the sole vcoul provider's
-    authenticated exact Wigner--Seitz/Duffy ladder and the sole cell-volume
-    source for the completion.  Each sample first solves the coupled
-    four-field head Dyson equation; only its ``(1,qx,qy)`` moments survive.
-    The packed body is then updated by one bare and nine screened rank-four
-    outer products, each averaged over the authenticated Gamma little group
-    through its rank-four factors.  No sample-by-centroid tensor or second
-    photon packing convention exists.
-    """
+    """Complete bare and screened packed photon operators in the Γ cell; see docs/architecture/four_current_wiring.md."""
     from .photon_layout import (
         MAX_Q0_UPDATE_RANK, add_photon_q0_low_rank)
     from .static_gauge_response import require_static_photon_head_response
@@ -1634,34 +1319,7 @@ def complete_static_slab_photon_q0(
 
 def resolve_head_S_cart(restart_file=None, *, input_file=None, wfn=None,
                         sym=None, meta=None, params=None, print_fn=print):
-    """The ``S`` tensor behind the restart's ``whead`` — read it, or rebuild it.
-
-    ``whead`` alone is the head CELL AVERAGE on one grid.  A coarse→fine
-    densification needs the INTEGRAND that average was taken of, so it can be
-    re-evaluated on a different cell and pointwise inside the old one — that
-    integrand is ``v/(1 − v qᵀS q)`` and this returns its ``S``.
-
-    Two routes, in order, because the first is exact and free and the second
-    exists for restarts written before the first one did:
-
-    1. **The restart's own ``S_cart_head``** — written beside ``vhead`` /
-       ``whead`` by :func:`file_io.write_head_scalars_to_h5` since this change.
-       This is the tensor that PRODUCED that ``whead``, so the provenance ratio
-       is 1 by construction and nothing has to be recomputed.
-    2. **Rebuilt from ``dipole.h5``** through :func:`build_S_cart_omega`, the
-       same call the GW run made.  Needs ``wfn``/``sym``/``meta`` (the BSE
-       coarse→fine paths already load all three for the htransform leg) and a
-       ``dipole.h5`` beside the deck.  The rebuild is deterministic, so the
-       provenance ratio it produces is a real check on whether the head in the
-       restart and this tensor describe the same screening.
-
-    Returns
-    -------
-    tuple[numpy.ndarray | None, str]
-        ``(S_cart, provenance)``.  ``S_cart`` is ``(3, 3)`` complex128 or
-        ``None`` when neither route is available; ``provenance`` names which
-        route ran, or why none did, and is meant to be logged verbatim.
-    """
+    """The ``S`` tensor behind the restart's ``whead`` — read it, or rebuild it; see docs/architecture/four_current_wiring.md."""
     if restart_file is not None:
         try:
             import h5py
@@ -1692,20 +1350,7 @@ def resolve_head_S_cart(restart_file=None, *, input_file=None, wfn=None,
 
 
 class HeadResolver:
-    """Memoized q=0 head-sample resolver for a single GW run.
-
-    The driver needs the head sample at up to two frequencies (ω=0 always,
-    and a second probe ω for the dynamic PPM path).  Building it requires
-    reading ``eps0mat.h5`` or ``dipole.h5`` and crunching a Voronoi-cell
-    integral, which is non-trivial; without memoization the same work was
-    being done three times per run.
-
-    Construct once at the top of ``main()``::
-
-        head = HeadResolver(config, input_dir, wfn, sym, meta, print_fn)
-        head_static = head.at(0.0 + 0.0j)
-        head_probe  = head.at(probe_omega)
-    """
+    """Memoized q=0 head-sample resolver for a single GW run; see docs/architecture/four_current_wiring.md."""
 
     __slots__ = ("_params", "_input_dir", "_wfn", "_sym", "_meta",
                  "_print_fn", "_cache", "_direct_cache", "_policy",
@@ -1857,14 +1502,7 @@ def fit_head_ppm(
     wcoul0_probe: float,
     probe_omega: complex,
 ) -> HeadGNParams:
-    """Fit a scalar PPM pole from two W^c head samples.
-
-    Model-agnostic two-point fit: the same algebra serves both the
-    Godby-Needs PPM (purely imaginary probe ``probe_omega = i·ωp``) and
-    the Hybertsen-Louie PPM (real probe ``probe_omega = Ω`` above all
-    transitions).  The signed quantity ``z² = (probe_omega)²`` carries
-    the model choice — negative for GN, positive for HL.
-    """
+    """Fit a scalar PPM pole from two W^c head samples; see docs/architecture/four_current_wiring.md."""
 
     z = complex(probe_omega)
     omega_2_sq = float((z * z).real)
@@ -1931,21 +1569,7 @@ def fit_head_ppm_from_samples(
     *,
     probe_omega: complex,
 ) -> HeadGNParams:
-    """Fit the scalar PPM head from resolved static and probe-frequency samples.
-
-    THE ``.real`` IS THE HERMITIAN PART, AND IT IS THE WHOLE HEAD.  On a
-    time-reversal-broken deck the Cartesian head tensor ``S_ab(iω)`` has an
-    anti-Hermitian, magnetisation-odd part, but that part is ``∝ ω (P^{ab} −
-    P^{ba})`` — ANTISYMMETRIC in ``ab`` — and the scalar head is the
-    isotropic average ``⟨q̂_a S_ab q̂_b⟩``, which annihilates every
-    antisymmetric tensor.  The scalar GN head is therefore exactly
-    time-reversal-even: its odd residue is identically zero, and taking the
-    real part of a 1×1 Hermitian half is not an approximation
-    (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` §6; gated in
-    ``tests/test_gnppm_ordered_orientations.py``).  The channel lives only in
-    the antisymmetric (Faraday-like) part of ``S_ab``, which no scalar head
-    can carry.
-    """
+    """Fit the scalar PPM head from resolved static and probe-frequency samples; see docs/architecture/four_current_wiring.md."""
     return fit_head_ppm(
         vc0=float(head_static.vc0.real),
         wcoul0_static=float(head_static.wcoul0.real),
@@ -1959,24 +1583,7 @@ def fit_head_hl_analytic(
     wcoul0_static: float,
     omega_p_sq_ry: float,
 ) -> HeadGNParams:
-    """Set the HL-PPM head pole analytically from the bulk plasmon, BGW-style.
-
-    The 2-point HL fit at finite probe Ω asymptotes to the f-sum-rule
-    value as Ω → ∞, but at finite Ω the static-vs-probe head W^c samples
-    can be sensitive to numerical convention (mini-BZ averaging, head
-    truncation), giving an Ω_h that drifts ~10–20 % from the exact
-    bulk-plasmon limit.  BGW sidesteps this by taking the head pole
-    directly from the analytic f-sum-rule: ``Ω̃²(0,0) = ω_p²`` (set in
-    ``Sigma/wpeff.f90`` as the q=g=g'=0 special case), and the kernel
-    pole ``wtilde² = Ω² / I_ε(0,0) = ω_p² / (1 − ε⁻¹(0,0))``.
-
-    This mirrors that: ``Ω_h² = ω_p² / I_ε_head`` where
-    ``I_ε_head = (v_head − W(0)) / v_head`` is computed from the same
-    mini-BZ-averaged static head ``W(0)`` LORRAX already resolves.
-    The static W^c(0) head is still used (for B_h and R_h via the GN/HL
-    pole ansatz), so the magnitude of the head correction stays
-    consistent with the COHSEX block.
-    """
+    """Set the HL-PPM head pole analytically from the bulk plasmon, BGW-style; see docs/architecture/four_current_wiring.md."""
     w1 = wcoul0_static - vc0  # W^c(0) head, in a.u.
     if abs(w1) < 1.0e-30 or abs(vc0) < 1.0e-30:
         return HeadGNParams(
@@ -2024,17 +1631,7 @@ def fit_head_with_fixed_omega(
     wcoul0_static: float,
     omega_h_ry: float,
 ) -> HeadGNParams:
-    """Build head params with a user-supplied pole frequency Ω_h.
-
-    Useful for cross-validation against BGW: take BGW's analytic head
-    pole ``Ω_h(BGW) = √(ω_p²/(1 − ε_head⁻¹))`` (with ε_head⁻¹ from BGW's
-    ``epshead(q→0)``), set this option to that value, and isolate any
-    LORRAX-vs-BGW residual that's *not* due to the head pole frequency.
-
-    The static W^c(0) head is still LORRAX's, so B_h and R_h scale with
-    the LORRAX mini-BZ-averaged static head — same logic as
-    :func:`fit_head_hl_analytic`.
-    """
+    """Build head params with a user-supplied pole frequency Ω_h; see docs/architecture/four_current_wiring.md."""
     w1 = wcoul0_static - vc0
     omega_h = float(omega_h_ry)
     omega_h_sq = omega_h ** 2
@@ -2078,13 +1675,7 @@ def compute_static_head_terms(
     nk_tot: int,
     source: str = "unknown",
 ) -> StaticHeadTerms:
-    """Build exact static COHSEX head terms (Σ^X, Σ^SX, Σ^{SX-X}, Σ^COH) in band space.
-
-    ``vc0`` / ``wcoul0_static`` are the bare and static-screened Coulomb heads
-    in a.u.; ``occ`` is the (nb,) {0,1} occupation mask for the active window.
-    Returns diagonal-in-band shifts in Rydberg, with the Brillouin-zone
-    average carried by an explicit ``1 / (V_cell · N_k)`` prefactor.
-    """
+    """Build exact static COHSEX head terms (Σ^X, Σ^SX, Σ^{SX-X}, Σ^COH) in band space; see docs/architecture/four_current_wiring.md."""
 
     occ_arr = jnp.asarray(occ, dtype=jnp.complex128)
     ones = jnp.ones_like(occ_arr, dtype=jnp.complex128)
@@ -2155,12 +1746,7 @@ def _expand_band_diagonal_to_kij_jit(diag, *, nk_tot: int, nb: int):
 
 
 def expand_band_diagonal_to_kij(diag: jnp.ndarray, nk_tot: int) -> jnp.ndarray:
-    """Broadcast a band-diagonal shift to a dense ``(nk, nb, nb)`` matrix.
-
-    Thin Python wrapper that pulls ``nb`` from ``diag.shape`` and
-    forwards to ``_expand_band_diagonal_to_kij_jit`` — collapses
-    ~6 eager-pjit cache misses per call into one cached XLA module.
-    """
+    """Broadcast a band-diagonal shift to a dense ``(nk, nb, nb)`` matrix; see docs/architecture/four_current_wiring.md."""
     diag_arr = jnp.asarray(diag, dtype=jnp.complex128)
     if diag_arr.ndim == 1:
         nb = int(diag_arr.shape[0])
@@ -2181,24 +1767,7 @@ def static_head_terms_to_kij(
     nk_tot: int,
     do_screened: bool,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Expand exact static head shifts to dense ``(k, i, j)`` matrices.
-
-    Parameters
-    ----------
-    head
-        Exact static head terms from :func:`compute_static_head_terms`.
-    nk_tot
-        Total number of k-points in the full-zone average.
-    do_screened
-        If ``True``, return the screened-exchange head ``Sigma^SX``.
-        If ``False``, return the bare-exchange head ``Sigma^X``.
-
-    Returns
-    -------
-    sigma_sx_kij, sigma_coh_kij
-        Dense diagonal matrices shaped ``(nk_tot, nb, nb)`` suitable for adding
-        directly to the static COHSEX matrices in GWJAX.
-    """
+    """Expand exact static head shifts to dense ``(k, i, j)`` matrices; see docs/architecture/four_current_wiring.md."""
 
     sx_diag = head.sigma_sx_diag if do_screened else head.sigma_x_diag
     return (
@@ -2218,49 +1787,7 @@ def compute_ppm_head_sigma_kij(
     nk_tot: int,
     eta: float = 1.0e-6,
 ) -> np.ndarray:
-    """q→0, G=G'=0 head contribution to PPM ``Σ^c_kij(ω)``.
-
-    At q=0, ``M_{nm}(k, q→0, G=0) = δ_{nm}``, so the head only enters the
-    band-diagonal ``(i, i)`` of the PPM ``Σ^c`` matrix.  With the GN pole
-    extracted in :func:`fit_head_ppm` (``R_h = B_h / (2 Ω_h)``,
-    ``B_h = -W^c(0) · Ω_h²``):
-
-        Σ^c_n^head(ω - E_F) =
-            +R_h / (V_cell · N_k) · [
-                  f_n     / (ω - ε_n + Ω_h - iη)
-                + (1-f_n) / (ω - ε_n - Ω_h + iη)
-            ]
-
-    where ω, ε_n are taken in the same E_F-relative convention (the difference
-    ω - ε_n is invariant under that shift).  In the static limit ω → ε_n
-    this reduces to ``-W^c(0) / (2 V_cell N_k)`` for occupied bands and
-    ``+W^c(0) / (2 V_cell N_k)`` for empty bands, matching the COHSEX
-    static-head pieces (``Σ^{SX-X} + Σ^COH``) built by
-    :func:`compute_static_head_terms`.
-
-    Parameters
-    ----------
-    head
-        Fitted GN head pole.
-    omega_grid_ry
-        Σ^c frequency grid (relative to E_F), shape ``(n_omega,)`` in Ry.
-    enk_ry
-        Absolute band energies for the σ window, shape ``(nk, nb)`` in Ry.
-    efermi_ry
-        Fermi level in Ry (subtracted from ``enk_ry`` to get ``ε - E_F``).
-    n_occ
-        Number of occupied bands at the bottom of the σ window
-        (``f_n = 1`` for ``n < n_occ``, else ``0``).
-    cell_volume, nk_tot
-        Unit-cell volume and full-zone k-point count.
-    eta
-        Imaginary regularization for the retarded poles.
-
-    Returns
-    -------
-    sigma_kij : np.ndarray, shape ``(n_omega, nk, nb, nb)``, dtype complex128
-        Diagonal-in-band head contribution; off-diagonals are zero.
-    """
+    """q→0, G=G'=0 head contribution to PPM ``Σ^c_kij(ω)``; see docs/architecture/four_current_wiring.md."""
 
     omega = np.asarray(omega_grid_ry, dtype=np.float64).reshape(-1)
     enk = np.asarray(enk_ry, dtype=np.float64)
@@ -2289,16 +1816,7 @@ def compute_ppm_head_sigma_diag(
     nk_tot: int,
     eta: float = 1.0e-6,
 ) -> np.ndarray:
-    """Band-DIAGONAL of :func:`compute_ppm_head_sigma_kij` — ``(nω, nk, nb)``.
-
-    The q→0 head enters only the band diagonal (``M_{nm}(k, q→0, G=0) =
-    δ_{nm}``), so this is the complete information content of the dense
-    ``(nω, nk, nb, nb)`` tensor at nb× less memory — the representation the
-    sharded-Σ layout (``sigma_omega_layout=sharded``) injects rank-locally
-    instead of materializing the dense cube on every rank.  The dense
-    builder above embeds exactly this array, so the two representations are
-    bit-identical by construction (single source of truth).
-    """
+    """Band-DIAGONAL of :func:`compute_ppm_head_sigma_kij` — ``(nω, nk, nb)``; see docs/architecture/four_current_wiring.md."""
     omega = np.asarray(omega_grid_ry, dtype=np.float64).reshape(-1)
     enk = np.asarray(enk_ry, dtype=np.float64)
     if enk.ndim != 2:
@@ -2332,27 +1850,7 @@ def on_shell_occupied_head_sigma_ry(
     nk_tot: int,
     eta: float = 1.0e-6,
 ) -> float:
-    """Re(Σ^head) for an OCCUPIED band evaluated ON SHELL (ω = ε_nk − E_F).
-
-    THE ONE PLACE the concise-log scalar comes from.  It is *derived from*
-    :func:`compute_ppm_head_sigma_diag` — the same kernel that builds the
-    tensor the ansatz-neutral finalizer injects — by evaluating it at a
-    synthetic single occupied state whose ω sits exactly on shell
-    (``δ = ω − (ε − E_F) = 0``).  Nothing here restates the closed form.
-
-    WHY IT EXISTS.  ``gw/ppm_pipeline.py`` used to print this number from a
-    hand-written ``-R_h/(Ω_h·V·N_k)``, while the kernel and the named
-    ``sig_c_head(Edft).Re`` output column evaluate ``+R_h/(Ω_h·V·N_k)``.
-    Measured on the Si 6×6×6 two-update controls (JID 57243214): the log
-    said ``-0.8071 eV`` where ``sigma_freq_debug.dat`` carried
-    ``+0.807048 eV`` for the same occupied state.  The physics array was
-    always right; the duplicated formula in the log had drifted in sign.
-    A second spelling of a formula is a second thing to keep in step, so
-    there is now only one.
-
-    Returns Ry.  ``0.0`` for a degenerate head (``R_h`` or ``Ω_h`` ≈ 0),
-    which is what the kernel returns there too.
-    """
+    """Re(Σ^head) for an OCCUPIED band evaluated ON SHELL (ω = ε_nk − E_F); see docs/architecture/four_current_wiring.md."""
     val = compute_ppm_head_sigma_diag(
         head,
         omega_grid_ry=np.zeros(1, dtype=np.float64),
@@ -2377,25 +1875,7 @@ def compute_complex_pole_head_sigma_diag(
     cell_volume: float,
     nk_tot: int,
 ) -> np.ndarray:
-    r"""Band-diagonal head self-energy for generic retarded complex poles.
-
-    For poles ``Omega_p = a_p - i Gamma_p`` and head residues ``R_p``,
-
-    .. math::
-
-        \Sigma_n^{\mathrm{head}}(\omega) =
-        \frac{1}{V_{\mathrm{cell}}N_k}\sum_p R_p
-        \left[\frac{f_{nk}}{\delta_{nk}+\Omega_p}
-        + \frac{1-f_{nk}}{\delta_{nk}-\Omega_p}\right],
-
-    where ``delta_nk = omega - (epsilon_nk - E_F)``.  Occupations are
-    accepted per band or per ``(k,band)``; this keeps the denominator valid
-    when an energy window straddles the Fermi level without deciding how the
-    occupations themselves are produced.
-
-    All energy-like inputs and residues are in Ry.  The result is complex Ry
-    with shape ``(n_omega, n_k, n_band)``.
-    """
+    """Band-diagonal head self-energy for generic retarded complex poles; see docs/architecture/four_current_wiring.md."""
     omega = np.asarray(omega_grid_ry, dtype=np.float64).reshape(-1)
     enk = np.asarray(enk_ry, dtype=np.float64)
     if enk.ndim != 2:
@@ -2494,19 +1974,7 @@ def apply_q0_head_rank1(
     *,
     omega_index: int = 0,
 ):
-    """Inject the q=0 Coulomb head as a rank-1 update in the centroid basis.
-
-    Args:
-        V_qmunu:   (..., nkx, nky, nkz, n_μ, n_ν) bare-Coulomb body.
-        W_qmunu:   same shape (single ω) or ``None`` to skip W.
-        G0_mu_nu:  (n_μ,) — ``ζ(q=0, μ, G=0)``.
-        vhead, whead: scalar or ``(n_omega,)`` in Ry, or ``None`` to skip.
-        cell_volume: V_cell in Bohr³.
-        omega_index: slot of ``whead`` to apply (default 0).
-
-    Returns:
-        (V_qmunu, W_qmunu) with the q=0 slice updated.
-    """
+    """Inject the q=0 Coulomb head as a rank-1 update in the centroid basis; see docs/architecture/four_current_wiring.md."""
     g0g0 = jnp.einsum('m,n->mn', jnp.conj(G0_mu_nu), G0_mu_nu)
     v_scalar, w_scalar = _head_rank1_scalars(
         vhead, whead, cell_volume, omega_index,
@@ -2531,21 +1999,7 @@ def apply_q0_head_rank1_sharded(
     *,
     omega_index: int = 0,
 ):
-    """Sharded q=0 head injection — local on every proc.
-
-    Variant of :func:`apply_q0_head_rank1` for BSE-side sharded
-    (``P("x", "y")``-on-(μ,ν)) tensors.  ``g0_X`` and ``g0_Y`` are the
-    same ``ζ(0,μ,G=0)`` vector duplicated under ``P("x")`` and ``P("y")``
-    so the rank-1 ``conj(g0_X)[:, None] * g0_Y[None, :]`` is local.
-
-    Args:
-        V_q0:  ``(n_μ, n_ν)``                       sharded ``P("x", "y")``.
-        W_q:   ``(n_μ, n_ν, nkx, nky, nkz)`` or ``None``.
-        g0_X:  ``(n_μ,)`` sharded ``P("x")`` — μ-axis copy of ζ(0,μ,G=0).
-        g0_Y:  ``(n_ν,)`` sharded ``P("y")`` — ν-axis copy of ζ(0,ν,G=0).
-        vhead, whead, cell_volume, omega_index: as in
-            :func:`apply_q0_head_rank1`.
-    """
+    """Sharded q=0 head injection — local on every proc; see docs/architecture/four_current_wiring.md."""
     g0g0 = jnp.conj(g0_X)[:, None] * g0_Y[None, :]
     v_scalar, w_scalar = _head_rank1_scalars(
         vhead, whead, cell_volume, omega_index,
