@@ -22,7 +22,7 @@ def spectrum(gram):
                 rank_frobenius={str(t): int(np.flatnonzero(tail <= t)[0]) for t in (1e-2, 1e-3, 1e-4)})
 
 
-def main(out, data_banks=None):
+def main(out, data_banks=None, moment_bank=None):
     assert os.getenv('SLURM_JOB_ID'), 'Compute only'
     from runtime import initialize_communicator_stack
     initialize_communicator_stack()
@@ -31,6 +31,7 @@ def main(out, data_banks=None):
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.collectives import resolve_mesh, barrier
     from distrib_la import plan, gemm_plan
+    from file_io.slab_io import SlabIO
     assert jax.process_count() == 4
     mesh = resolve_mesh()
     face = NamedSharding(mesh, P('x', 'y'))
@@ -39,6 +40,9 @@ def main(out, data_banks=None):
     eig = plan('eigh', mesh, backend='distributed', n=896, batched_route='auto')
     owner = banks.low_owner(mesh)
     low, broad, z, zh = banks.metadata(data_banks)
+    if moment_bank is not None:
+        if banks.sha(moment_bank) != 'f68a710c1831587afa4b9be642bddaf67e0c674b3433fa56e068129aa41fd2d1':
+            raise ValueError('SHIFT authenticated moment bank drift')
     data_specs = low.get('data_banks')
     ntrain, nheld = len(z), len(zh)
     nall = ntrain+nheld
@@ -97,12 +101,27 @@ def main(out, data_banks=None):
         all_white = jnp.concatenate((ww,wwh))
         gc = np.asarray(gram(channels(all_white))).real
         gp = np.asarray(gram(channels(jnp.concatenate((w,wh))))).real
+        moment_arrays = {}
+        if moment_bank is not None:
+            with SlabIO(moment_bank, mode='r', mesh=mesh) as io:
+                targets = [io.read_slab(f'q{q:02d}/parent/{name}', partition_spec=P('x','y'))
+                           for name in ('M0','Mm1','M1')]
+            targets = jax.jit(lambda *a:jnp.stack(a),out_shardings=stack)(*targets)
+            target_white = congruence_rows(vi,targets)
+            moment_arrays['moment_channel_gram'] = np.asarray(gram(
+                jnp.concatenate((channels(all_white),target_white)))).real
+            moment_arrays['physical_moment_channel_gram'] = np.asarray(gram(
+                jnp.concatenate((channels(jnp.concatenate((w,wh))),targets)))).real
         sketches = np.asarray(sketch(ww,vd))
         record = dict(q=q, job_step=job, source=source, input_paths=provenance,
                       weight='trapezoid * 1/(1+(omega_eV/20)^2); each height normalized equally',
                       low_floor=0. if data_specs else 1e-14, broad_floor=0., scopes={},
                       ntrain=ntrain, nheld=nheld, low_source='DATA physical' if data_specs else 'Run216',
                       tail_source='Run300 A/B, unchanged unperturbed banks')
+        if moment_bank is not None:
+            record['moment_bank'] = str(moment_bank)
+            record['moment_sha256'] = banks.sha(moment_bank)
+            record['moment_scope'] = 'Run258 parent dA moments (SHIFT58051053.2); unchanged parent even for perturbed DATA'
         groups = [('low', np.arange(nlow)),('broad',np.arange(nlow,ntrain)),('combined',np.arange(ntrain))]
         if data_specs:
             groups += [(f'height_{height*banks.EV:.9f}_ev', np.flatnonzero(z.imag==height))
@@ -120,7 +139,7 @@ def main(out, data_banks=None):
         if jax.process_index()==0:
             with (out/f'q{q:02d}.npz').open('xb') as stream:
                 np.savez(stream, z=z, zh=zh, weights=weights, complex_gram=gw,
-                         channel_gram=gc, physical_channel_gram=gp, sketches=sketches)
+                         channel_gram=gc, physical_channel_gram=gp, sketches=sketches, **moment_arrays)
             (out/f'q{q:02d}.json').write_text(json.dumps(record,indent=2))
         records.append(record)
         print(f'GRAM q{q:02d} complete {record["seconds"]:.3f}s ranks={record["scopes"]["combined"]["complex"]["rank_amplitude"]}',flush=True)
@@ -140,5 +159,7 @@ if __name__=='__main__':
     parser.add_argument('--out',type=Path,required=True)
     parser.add_argument('--data-bank',type=Path,action='append',default=None,
                         help='Repeatable COMPLETE DATA physical bank; replaces Run216, retains Run300 A/B tail')
+    parser.add_argument('--moment-bank',type=Path,default=None,
+                        help='Authenticated SHIFT parent moments; save extended small Grams')
     args=parser.parse_args()
-    main(args.out, args.data_bank)
+    main(args.out, args.data_bank, args.moment_bank)
