@@ -194,7 +194,7 @@ def test_density_sc_suppresses_both_frozen_direct_components():
     module = ast.parse(path.read_text(encoding="utf-8"))
     fn = next(n for n in module.body
               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-              and n.name == "compute_sigma_xc")
+              and n.name == "_sigma_hartree_fields")
     omit = next(n for n in ast.walk(fn)
                 if isinstance(n, ast.If)
                 and isinstance(n.test, ast.Name)

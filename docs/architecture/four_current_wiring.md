@@ -2140,3 +2140,593 @@ AOT lower+compile of the W-solve jit.  See ``precompile_chi0``.
 
 Goes through the same ``_resolve_w_solve_fn`` dispatch as
 :func:`solve_w` so both paths agree on which jit to compile.
+
+
+### Sigma dispatch entry contract and phase rulings (2026-09-06)
+
+One-line entry point: build the full Σ_xc + V_H given the current
+wfn bundle and screened W's.
+
+Parameters
+----------
+mode
+    Compute-mode pivot.  Determines which Σ kernel chain runs and
+    which roles in ``W_by_role`` are consulted.
+wfns
+    ``Wavefunctions`` bundle in the *current* QP basis (or DFT basis
+    for the iter-0 / one-shot call).
+V_q
+    Bare Coulomb in flat-q ISDF basis.
+W_by_role
+    Screened-Coulomb dict produced by
+    :func:`gw.screening.compute_screening`, keyed by symbolic role.
+    Conventional roles consumed here:
+
+    * ``"static"`` — W(ω = 0).  Used by COHSEX (Σ_SX, Σ_COH) and as
+      the ω-zero anchor for the PPM two-point fit.
+    * ``"probe"``  — W at the GN/HL probe frequency.  Used by PPM
+      for the second fit point.
+    * ``"mpa_fit"`` — on-disk path of the MPA screening-model fit
+      store (``gw.screening.compute_screening_model`` for
+      ``ComputeMode.MPA``); the MPA branch reads it instead of an
+      in-memory W.
+
+    ``X_ONLY`` ignores ``W_by_role`` entirely.  Adding a new mode
+    means picking the role labels it needs in
+    :func:`gw.screening.screening_requests_for`, giving it a row in
+    ``gw_config.MODE_SIGMA_CHANNELS``, and reading the roles here —
+    no plumbing changes elsewhere.  Until it has a branch here it is
+    refused by name; it is never served by the PPM one.
+e_qp_ev
+    Per-(k, n) QP energies (eV) used by the QSGW build to evaluate
+    Σ_c(E_m, E_n).  Required for dynamic modes; ignored for static.
+static_head_terms, head_resolver
+    q→0 head plumbing; ``static_head_terms`` is None when ``do_G0`` is
+    false in the config.
+quad
+    Static minimax quadrature for χ₀; produced by
+    ``minimax_screening.build_static_quadrature`` once per W solve.
+config, meta, mesh_xy, sym, wfn, band_slices, input_dir
+    Standard driver scaffolding.
+Gij
+    Optional band-space occupation projector; ``None`` builds it
+    inside the static kernels from ``occupation_state``.  Supplying
+    both is refused (``cohsex_sigma._resolve_Gij``).
+occupation_state
+    The iteration's :class:`gw.efermi.OccupationState`.  It reaches
+    BOTH halves of Σ here: the MPA branch below (µ, stamps, the
+    fractional contour) and — since this commit — the static
+    channels, so Σ_X / Σ_SX / V_H and the PPM invalid-pole static
+    term take the same ``diag(f)`` weights Σ_c does.  ``None`` is
+    the insulating default and every static channel is then
+    bit-for-bit the integer ``occ > 0.5`` projector.
+wfns_transverse, bispinor_v_q_path
+    Bispinor Σ^B channel (transverse-centroid ψ bundle + V^{i,j}
+    tile file).  Both-or-neither; the static kernels fold Σ^B into
+    ``sig_x`` and, for COHSEX, the physical ``sig_sx`` component that
+    forms ``sigma_xc``.  ``None`` for scalar runs.
+photon_response
+    Packed static four-current response.  Used only by
+    ``bispinor_gw=full_static_cohsex``; the default bare-transverse path
+    neither inspects nor constructs it.
+print_fn
+    Rank-0-only print.
+
+Returns
+-------
+:class:`SigmaResult` populated per the mode.
+
+The following original phase comments retain all rules, history and measured values from the entry function.
+
+```text
+    # ── THE MODE IS CHECKED BEFORE ANY KERNEL RUNS ──────────────────────
+
+    # ``gw_jax.main`` already refused a declared-but-unbuilt mode at
+
+    # driver entry, and this is the same refusal at the seam that would
+
+    # otherwise absorb it.  Both exist on purpose: the entry check is what
+
+    # saves the operator's allocation, this one is what makes the SC loop,
+
+    # the tests and any future caller safe without having to remember the
+
+    # entry check.  It is a dict lookup on a resolved enum, so it costs
+
+    # nothing on the Σ path it guards.
+
+    # ── THE ONE ENVELOPE ROW NO DECK KEY CAN EXPRESS ─────────────────────
+
+    # low_mem_bands's other four unsupported combinations (head_correction,
+
+    # qp_solver, mpa_material_class, bispinor) already refused at config
+
+    # resolution, before this function -- or anything upstream of it --
+
+    # ever ran.  An explicit Gij is a call-time Python parameter with no
+
+    # deck key, so it is checked here instead: this is the only seam that
+
+    # ever sees both a resolved low_mem_bands and a live Gij operand
+
+    # together, and it still runs before any Gij-dependent allocation.
+
+    # ── PPM-ONLY IS A CORRECTNESS GUARD, NOT A WIRING GAP ───────────────
+
+    # Two independent reasons, and the second is the load-bearing one.
+
+    #
+
+    # (1) Wiring.  ``sigma_band_extrapolation`` is read by the GN/HL
+
+    #     two-point PPM Σ kernel and nothing else.  Reaching MPA / COHSEX /
+
+    #     X_ONLY with it set would produce a perfectly ordinary run whose
+
+    #     log simply lacks the extrapolation block — the exact failure mode
+
+    #     measurement-discipline rule 1 names, where a green A/B measured
+
+    #     nothing because one arm silently dropped the knob.
+
+    #
+
+    # (2) THE MATH ITSELF IS MODE-DEPENDENT.  The extrapolation's limit
+
+    #     point is 1/N → 0, and that limit is WRONG for a static Coulomb
+
+    #     hole.  MEASURED 2026-08-15 against BerkeleyGW's exact static CH
+
+    #     (the closure sum — no band sum and no extrapolation in it), Si
+
+    #     4×4×4 SOC, 192 (k, band) states, MAE in meV:
+
+    #
+
+    #         nband                     60      76     100     124
+
+    #         static COHSEX, 1/N → 0  94.9    96.6   202.8   288.2   WORSE
+
+    #         GN-PPM,        1/N → 0 171.3    97.4    55.1    32.8   better
+
+    #
+
+    #     The static arm ANTI-CONVERGES — more bands determine the line
+
+    #     better and drive it more confidently ~340 meV past the right
+
+    #     answer — because the static CH's high-energy tail is not
+
+    #     suppressed by a pole denominator and keeps contributing past where
+
+    #     the 1/N law was calibrated.  So routing this at a static mode
+
+    #     would not merely fail to log; it would return a wrong number
+
+    #     carrying a "consistent" verdict that gets worse the more you spend
+
+    #     on it.  Report: sandbox
+
+    #     reports/ch_converge_band_extrapolation_2026-08-15/.
+
+    # ── RECONCILING THE GUARD WITH A DEFAULT-ON KEY ─────────────────────
+
+    # Before 2026-08-16 the key defaulted OFF, so "set it on a non-PPM mode"
+
+    # was always a deliberate act and refusing was the whole answer.  The key
+
+    # now defaults ON, and a refusal that fires on the DEFAULT would make
+
+    # every COHSEX / MPA / X_ONLY run in the tree unrunnable — two gates
+
+    # fighting, with the operator caught in the middle.
+
+    #
+
+    # So the guard splits on PROVENANCE, which is the only thing that
+
+    # distinguishes the two situations:
+
+    #
+
+    #   explicitly named + NO stage can consume it  ->  REFUSE.  The operator
+
+    #       wrote the knob down and nothing in this run will read it; silently
+
+    #       doing nothing with it is exactly how a green A/B comes to measure
+
+    #       nothing (measurement-discipline rule 1).
+
+    #   defaulted, or a LATER STAGE will consume it ->  DISABLE FOR THIS
+
+    #       STAGE, and SAY SO.  The stage is not what the key is for, but the
+
+    #       run may still be, and killing it would refuse a run that works.
+
+    #
+
+    # Both branches keep the physics guard intact: no static-mode Σ is ever
+
+    # extrapolated either way.  What changes is who gets refused.
+
+    #
+
+    # ── THE REFUSAL IS ABOUT THE RUN, NOT ABOUT THIS STAGE ──────────────
+
+    # Corrected 2026-08-16 against the REAL staged-SC interface
+
+    # (``origin/feat/staged-sc-2026-08-15``, 98289d77), which the wiring
+
+    # branch had concluded did not exist — from an ``--all`` search in a
+
+    # single-branch checkout, where ``--all`` covers only fetched refs.
+
+    # See ``gw_config.sigma_stage_modes`` for the full correction.  The
+
+    # short form: ``run_staged_self_consistency`` rewrites ``compute_mode``
+
+    # per stage, so a per-stage DISABLE written against ``compute_mode`` was
+
+    # already right — but a per-stage REFUSAL is not, because it kills the
+
+    # run before the stage that would have consumed the key.  Two shipped
+
+    # configurations it would have killed:
+
+    #
+
+    #   sc_stage_1_type = cohsex, sc_stage_2_type = gnppm
+
+    #       -> dies at stage 1, one stage short of the consumer.
+
+    #   compute_mode = mpa  (the DEFAULT ladder is GN_PPM then MPA)
+
+    #       -> dies at stage 2, after paying for a full GN-PPM stage.
+
+    #
+
+    # Asking the LADDER instead makes both runnable and still refuses the
+
+    # case the guard was written for: an explicit key on a run in which no
+
+    # stage is a plasmon-pole model.
+
+        # AUTO-DISABLED, LOUDLY.  Printed at the Σ seam every iteration
+
+        # rather than once at startup: a staged run changes mode between
+
+        # stages, and the fact "this stage did not extrapolate" belongs
+
+        # beside that stage's Σ, not in a banner scrolled past an hour ago.
+
+        # The JUSTIFICATION differs by stage kind and must not be recited
+
+        # wrongly.  A static mode gets the measured static-CH anti-convergence;
+
+        # MPA is DYNAMIC, so that measurement is not about it, and claiming it
+
+        # were would be inventing evidence.
+
+        # NOTHING IS REBOUND HERE, deliberately.  ``config.sigma.
+
+        # band_extrapolation`` is read in exactly one place — the GN/HL-PPM
+
+        # pipeline's ``plan_band_brackets`` call — and this branch is the one
+
+        # where that pipeline is NOT reached.  Rewriting the config to keep it
+
+        # cosmetically truthful would mean a ``dataclasses.replace`` of the
+
+        # whole frozen LorraxConfig (re-running its __post_init__) to change a
+
+        # field with no remaining reader.  The log line above is the record.
+
+    # Static exchange is needed by every mode; sig_sx / sig_coh use W(ω=0),
+
+    # and WHICH MODES BUILD
+
+    # THEM IS THE CHANNEL TABLE'S ANSWER (``gw_config.
+
+    # MODE_SIGMA_CHANNELS``), not this branch's opinion — that is the one
+
+    # fact the QSGW appendix writer and this dispatch have to agree on,
+
+    # and they now read it from the same row.  Route to a separate
+
+    # top-level entry point for the X-only path so the modes that build no
+
+    # static screened channels never invoke the W-touching kernels, and
+
+    # the two paths each get their own jit-cached graph.
+
+        # X, SX, and COH are all produced by one sixteen-block photon loop
+
+        # over the same packed V/W and canonical services.
+
+        # ── THE DYNAMIC PACKED ROUTE (phase 3, minimal form) ─────────────
+
+        # W_packed(w) = diag(W_00(w), W_TT, W_CT): the CHARGE block carries
+
+        # the run's plasmon-pole model, the twelve CURRENT blocks are frozen
+
+        # at w = 0.  Because the sixteen-block sum is a plain sum once
+
+        # W_packed is built, Sigma splits exactly in two and each half keeps
+
+        # its existing owner:
+
+        #
+
+        #   Sigma_xc(w) = [ Sigma_x^CC + Sigma_c^CC(w) ]        <- scalar owner
+
+        #               + [ sum_{AB != CC} SX(W_AB) + COH(W_AB - V_AB) ]
+
+        #                                                       <- packed owner
+
+        #
+
+        # There is no third implementation here: the first bracket is the
+
+        # ordinary compute_sigma_x + ppm_pipeline chain below, the second is
+
+        # the SAME gw.photon_sigma consumer the static packed mode uses,
+
+        # called with blocks = "current".
+
+        #
+
+        # In the BARE family (chi_TT = chi_CT = 0) the second bracket is
+
+        # SX(D_TT) = X(D_TT) = Sigma^B with COH(D_TT - D_TT) = 0 and CT/TC
+
+        # identically zero -- i.e. exactly what gw.sigma_x_bispinor returned
+
+        # and what compute_sigma_x folded into sig_x on the incumbent route,
+
+        # plus the TT/CT Gamma cell the packed completion carries.
+
+        # reports/bisp_n_dynamic_packed_2026-09-01/DESIGN.md section 1.
+
+        # CHARGE CHANNEL: the ordinary scalar bare-exchange owner, with the
+
+        # incumbent Sigma^B arms EXPLICITLY OFF.  The transverse exchange is
+
+        # the packed consumer's TT block below; letting compute_sigma_x add
+
+        # it as well is precisely the double count this route exists to
+
+        # remove.  ``static_head_terms`` is the scalar band-diagonal q->0
+
+        # bare-X head, i.e. the CC head, and it stays the scalar owner's --
+
+        # the packed completion supplies only the TT/CT Gamma cell here.
+
+        # BOOKING.  A genuinely w-independent W_AB gives a w-independent
+
+        # Sigma contribution, so adding the current sector to sig_x and
+
+        # adding it to Sigma_c(w) produce the SAME Sigma_xc
+
+        # (qsgw_utils.build_qsgw_sigma_xc forms sig_x + Sigma_c(E)).  It
+
+        # goes into sig_x, the seam the incumbent route used for Sigma^B, so
+
+        # the bare family's sigX column is unchanged from that route and the
+
+        # A/B against it is like for like.  In the SCREENED family the same
+
+        # column then also carries the current blocks' static CORRELATION,
+
+        # which is O(alpha_FS^2) and is printed here rather than left
+
+        # invisible.
+
+        # EXHAUSTIVENESS over the packed route's compute modes.  The two
+
+        # predicates above cover gw_config.PACKED_PHOTON_COMPUTE_MODES; a
+
+        # packed deck on any other mode (mpa today) reaches here only
+
+        # through a hand-built config that skipped
+
+        # refuse_unsupported_bispinor_gw, and is refused by name rather
+
+        # than served the charge-only scalar path with its transverse
+
+        # channel silently dropped.
+
+    # Density-SC rebuilds this same exact G-space operator from the evolving
+
+    # orbitals directly in the DFT basis.  Other paths build it once here.
+
+        # A scalar zero preserves SigmaResult's arithmetic-compatible field
+
+        # contract without allocating an otherwise dead (nk,nb,nb) matrix.
+
+        # The density-SC caller branches before matrix assembly and replaces
+
+        # this sentinel with its separately retained exact field at every
+
+        # final output seam.
+
+        # The exact periodic G-space current artifact is a separate operator,
+
+        # so append it independently after the scalar source replacement.
+
+        # ``omit_v_h`` cleared it above together with the scalar term: under
+
+        # density-SC the caller rebuilt BOTH fields from the evolving
+
+        # orbitals, and retaining this frozen DFT artifact would double-count
+
+        # H_T while silently mixing two densities.
+
+        # sigma_sx ← sig_x so the static sigma_diag.dat writer's sigSX
+
+        # column reports Σ_X (incl. the bispinor Σ^B fold-in) instead of
+
+        # zeros; sigTOT = sigSX + sigCOH stays consistent.
+
+    # Dynamic modes (MPA + the PPM pair) all evaluate the QSGW Σ_c at QP
+
+    # energies — one check above both branches, one message.
+
+        # ── DECK KEYS THIS BRANCH HONORS, NAMED ─────────────────────────
+
+        # Both keys below are parsed and validated by gw_config and were
+
+        # then IGNORED here: MPA hard-coded ``wfn.efermi`` and always
+
+        # emitted the sharded cube, while the PPM branch honored both.  A
+
+        # parsed-but-ignored key is a defect (TASTE 13), and it became a
+
+        # live one the moment UNIMPLEMENTED_MODES stopped holding MPA back.
+
+        #
+
+        # sigma_omega_layout: the MPA executor's accumulator is born
+
+        # P(None,None,'x','y') and there is no replicated plan for it --
+
+        # which is what the metal-only refusal in
+
+        # gw_config._validate_occupation_smearing already SAYS ("the MPA
+
+        # Sigma emits the mesh-sharded omega cube only").  That is a fact
+
+        # about MPA, not about metals, so the refusal is generalised here
+
+        # rather than left to fire on one material class.  Refusing (not
+
+        # gathering) is the standing ruling: the sharded layout exists
+
+        # precisely to elide the P-independent full-cube gather, so
+
+        # "replicated" would be an allgather sold as a fallback
+
+        # (decisions.md 2026-08-05).
+
+        #
+
+        # BUT REFUSE ONLY A DECK THAT SAID IT.  ``sigma_omega_layout``'s
+
+        # DEFAULT is ``replicated``, so a bare refusal on the resolved
+
+        # value fires on every insulating MPA deck that never mentioned
+
+        # the key -- a flag day for decks that are not wrong about
+
+        # anything.  TASTE 13 draws exactly this line: an off-dial may
+
+        # refuse, a typo never does, and a value nobody typed is not a
+
+        # request.  The parser records the raw keys it saw
+
+        # (``GWConfig.raw_input_keys``), so the question is asked of that
+
+        # -- the same idiom ``restart_q_storage.deck_named_the_key`` uses,
+
+        # including its conservative answer when the record is absent.
+
+        # A deck that DID name ``replicated`` still refuses: honouring it
+
+        # would mean gathering the full cube on every rank, which is the
+
+        # P-independent collective the sharded layout exists to elide
+
+        # (decisions.md 2026-08-05, refuse rather than gather).
+
+        # The effective Sigma broadening, from the SAME resolver the PPM
+
+        # driver uses.  MPA used to take ``regularization_ev`` raw while
+
+        # GN-PPM silently raised it to a window-dependent conditioning
+
+        # floor -- 1.90x apart on the sodium 48b deck, 5.7x on a +/-15 eV
+
+        # window -- so every cross-ansatz comparison was confounded and
+
+        # neither output said what xi it ran at.
+
+            # Metal deck-key consistency is refused at config parse
+
+            # (_validate_occupation_smearing); here the run-level facts:
+
+            # the one-occupation-state rule, and head/body provenance.
+
+            # No stamp assert here: this is a SAME-RUN site (the fit store
+
+            # was written by this run's screening step), and W4 rules that
+
+            # stamps are asserted at REUSE sites only — a same-run
+
+            # write-then-read cannot detect the cross-iteration leak it
+
+            # would claim to guard (claim 0194: the assert here was
+
+            # unsatisfiable while no writer path carried the state).
+
+            # assert_occupation_stamps remains the cross-run reuse gate.
+
+        # fermi_reference: resolved by the one owned resolver, which also
+
+        # returns the provenance string the sigma_mnk.h5 stamp needs.
+
+        # AFTER the metal block on purpose: that block owns the more
+
+        # specific "metal needs an occupation_state" message, and the
+
+        # resolver's own refusal for the same case would otherwise pre-empt
+
+        # it with a less situated one.
+
+        # Read and authenticate the cheap scalar head before the expensive
+
+        # body sweep.  A certified legacy store can differ only by an exact-
+
+        # zero square-mesh band pad; the helper reproduces that digest from
+
+        # the live table rather than trusting artifact metadata.
+
+            # PROVENANCE ASSERT AT LOAD: these poles were fitted to a W
+
+            # this run's screening_diagrams either did or did not produce,
+
+            # and the two are indistinguishable in the bytes.
+
+            # The MPA grid was built against this reference (one per
+
+            # iteration); the finalizer must read it back against the same
+
+            # one, and STAMP which one it was -- the `efermi_ry is None`
+
+            # proxy the finalizer falls back to would label every explicit
+
+            # reference "fixed-N mu", so a midgap MPA run would be written
+
+            # into sigma_mnk.h5 as a metal's chemical potential.
+
+    # ── THE EXHAUSTIVENESS SEAM ─────────────────────────────────────────
+
+    # What follows is the two-point plasmon-pole pipeline, and until this
+
+    # guard it was reached by ELSE: anything that was not X_ONLY and not
+
+    # COHSEX ran it.  That is fine while the enum's only remaining members
+
+    # ARE the two PPM fits, and it silently mis-runs the first member that
+
+    # is not — a multipole run would have taken a GN fit of two W samples
+
+    # and reported it as Σ_c(ω) with no stage able to tell.  So the pole
+
+    # model is now asked for by name: ``ppm_model`` is 'gn' or 'hl' for
+
+    # exactly the two PPM modes and None for every other member, present
+
+    # or future.
+
+    # Dynamic PPM modes: need W_static + W_probe.
+
+```
