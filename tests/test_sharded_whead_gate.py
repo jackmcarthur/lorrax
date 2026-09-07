@@ -113,6 +113,8 @@ def _write_restart(path, *, w0_ready: bool):
         f.create_dataset("vhead", data=VHEAD)
         f.create_dataset("whead", data=np.array([WHEAD], dtype=np.complex128))
         f.create_dataset("kgrid", data=np.array([NKX, NKY, NKZ]))
+    from restart_fixture import canonicalize_fixture
+    canonicalize_fixture(path)
     return V[0, 0, 0], W0[0, 0, 0], g0
 
 
@@ -133,6 +135,9 @@ def _worker(px: int, py: int) -> dict:
     from jax.sharding import Mesh
 
     from bse import bse_loading
+    import pytest
+    from restart_fixture import identity_parent_transport
+    identity_parent_transport(pytest.MonkeyPatch())
 
     mesh = Mesh(np.asarray(jax.devices()[:px * py]).reshape(px, py),
                 axis_names=("x", "y"))
@@ -375,7 +380,9 @@ def test_neither_loader_reaches_past_the_shared_injector():
                   if isinstance(n, ast.FunctionDef) and n.name == name)
         called = {getattr(c.func, "id", None) or getattr(c.func, "attr", None)
                   for c in ast.walk(fn) if isinstance(c, ast.Call)}
-        assert "_inject_q0_head" in called, (
+        required = ("load_bse_data_from_restart_sharded"
+                    if name == "_load_ring_subset" else "_inject_q0_head")
+        assert required in called, (
             f"{name} no longer injects the q=0 head through the shared "
             f"helper; the two loaders' gates can drift again")
         assert "apply_q0_head_rank1_sharded" not in called, (

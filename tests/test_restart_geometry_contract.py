@@ -17,7 +17,8 @@ jax = pytest.importorskip("jax")
 from jax.sharding import Mesh
 
 from common import collectives
-from file_io import slab_io, tagged_arrays
+from file_io import slab_io, tagged_arrays, restart_bundle
+from restart_fixture import canonicalize_fixture
 
 
 class _HostSlabIO:
@@ -90,6 +91,8 @@ def host_transport(monkeypatch):
         lambda value, _sharding: value)
     monkeypatch.setattr(
         collectives, "device_put_process_local", lambda value, _sharding: value)
+    monkeypatch.setattr(restart_bundle, "NamedSharding", lambda mesh, spec: (mesh, spec))
+    monkeypatch.setattr(restart_bundle, "device_put_process_local", lambda value, _sharding: value)
     return _HostSlabIO
 
 
@@ -162,11 +165,14 @@ def test_charge_zeta_receipt_fresh_stamp_and_read(tmp_path, host_transport):
     tagged_arrays.write_restart_state_to_h5(
         path, n_rmu_logical=2,
         V_qmunu=np.eye(2, dtype=np.complex128)[None],
-        psi_full_y=np.ones((1, 1, 1, 2), dtype=np.complex128),
+        psi_parent_y=np.ones((1, 1, 1, 2), dtype=np.complex128),
+        psi_parent_y_mun=np.ones((1, 1, 2, 1), dtype=np.complex128),
+        parent_k_rows=np.array([0]),
         charge_zeta_identity=receipt, mesh=_mesh_product(1), mode="w")
     mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1),
                 axis_names=("x", "y"))
-    state = tagged_arrays.load_restart_state_from_h5(path, mesh)
+    canonicalize_fixture(path)
+    state = restart_bundle.load_restart_state_from_h5(path, mesh)
     assert state.charge_zeta_identity == receipt
 
 
@@ -180,14 +186,15 @@ def test_malformed_charge_zeta_receipt_refuses_before_tensor_read(
     path = tmp_path / "bad_zeta_receipt.h5"
     with h5py.File(path, "w") as f:
         f["V_qmunu"] = np.eye(2, dtype=np.complex128)[None]
-        f["psi_full_y"] = np.ones((1, 1, 1, 2), dtype=np.complex128)
+        f["psi_parent_y"] = np.ones((1, 1, 1, 2), dtype=np.complex128)
         f[tagged_arrays.CHARGE_ZETA_IDENTITY_DATASET] = stored
     opens = []
     monkeypatch.setattr(
         slab_io, "SlabIO",
         lambda *_a, **_k: opens.append(True))
+    canonicalize_fixture(path)
     with pytest.raises(ValueError, match="charge-zeta receipt"):
-        tagged_arrays.read_restart_state_from_h5(str(path), object())
+        restart_bundle.read_restart_state_from_h5(str(path), object())
     assert opens == []
 
 
@@ -210,30 +217,32 @@ def _write_then_repad(
     V[:, :2, :2] = np.eye(2, dtype=np.complex128)[None, :, :]
 
     tagged_arrays.write_restart_state_to_h5(
-        path, n_rmu_logical=2, V_qmunu=V, psi_full_y=psi,
+        path, n_rmu_logical=2, V_qmunu=V, psi_parent_y=psi,
+        psi_parent_y_mun=psi.transpose(0, 2, 3, 1), parent_k_rows=np.array([0]),
         enk_full=enk, band_slices=_bands(source_carrier),
         mesh=_mesh_product(source_divisor), mode="w")
 
     # The identity is the 184-band physical prefix; the source carrier is a
     # receipt, not part of the comparison.  A changed physical top still
     # refuses in the separate red twin below.
-    tagged_arrays.assert_restart_window_matches(
+    canonicalize_fixture(path)
+    restart_bundle.assert_restart_window_matches(
         path, band_slices=_bands(target_carrier), n_rmu_logical=2)
 
     with h5py.File(path, "r") as f:
         assert tuple(f["band_window"][:]) == (0, 0, 46, 72, logical)
         assert tuple(f[tagged_arrays.BAND_WINDOW_CARRIER_DATASET][:]) == (
             0, 0, 46, 72, source_carrier)
-        assert f["psi_full_y"].shape == (1, logical, 1, 2)
+        assert f["psi_parent_y"].shape == (1, logical, 1, 2)
         assert f["enk_full"].shape == (1, logical)
         np.testing.assert_array_equal(
-            f["psi_full_y"][:], psi[:, :logical, :, :2])
+            f["psi_parent_y"][:], psi[:, :logical, :, :2])
         np.testing.assert_array_equal(f["enk_full"][:], enk[:, :logical])
 
     mesh = _mesh_product(target_divisor)
-    state = tagged_arrays.read_restart_state_from_h5(
+    state = restart_bundle.read_restart_state_from_h5(
         path, mesh, n_band_carrier=target_carrier)
-    psi_got, enk_got = state[2], state[3]
+    psi_got, enk_got = state.psi_nmu_parent, state.enk_full
     assert psi_got.shape == (1, target_carrier, 1, target_divisor)
     assert enk_got.shape == (1, target_carrier)
     np.testing.assert_array_equal(
@@ -265,8 +274,9 @@ def test_same_carrier_different_logical_band_identity_still_refuses(tmp_path):
         f["band_window_carrier"] = np.asarray(
             (0, 0, 46, 72, 192), dtype=np.int64)
         f["band_window_split"] = np.asarray((180, 180), dtype=np.int64)
+    canonicalize_fixture(path)
     with pytest.raises(ValueError, match="number_bands_chi"):
-        tagged_arrays.assert_restart_window_matches(
+        restart_bundle.assert_restart_window_matches(
             str(path), band_slices=_bands(192))
 
 
@@ -289,8 +299,9 @@ def test_torn_dataset_shape_receipt_refuses_before_slab_read(
             raise AssertionError("SlabIO opened before receipt validation")
 
     monkeypatch.setattr(slab_io, "SlabIO", _MustNotOpen)
+    canonicalize_fixture(path)
     with pytest.raises(ValueError, match="stamped logical storage shape"):
-        tagged_arrays.read_restart_state_from_h5(
+        restart_bundle.read_restart_state_from_h5(
             str(path), object(), n_band_carrier=1)
     assert opens == []
 
@@ -312,8 +323,9 @@ def test_noncanonical_padded_axis_receipt_refuses_before_slab_read(
     opens = []
     monkeypatch.setattr(
         slab_io, "SlabIO", lambda *_a, **_k: opens.append(True))
+    canonicalize_fixture(path)
     with pytest.raises(ValueError, match="expected 8"):
-        tagged_arrays.read_restart_state_from_h5(str(path), object())
+        restart_bundle.read_restart_state_from_h5(str(path), object())
     assert opens == []
 
 
@@ -330,25 +342,28 @@ def test_four_spinor_parent_families_round_trip(tmp_path, host_transport, layout
         psi_parent_y_transverse=current,
         psi_parent_y_transverse_mun=current.transpose(0, 2, 3, 1),
         parent_k_rows=np.array([0, 3]), mesh=_mesh_product(1), mode="w")
-    result = tagged_arrays.read_restart_state_from_h5(
+    canonicalize_fixture(path)
+    result = restart_bundle.read_restart_state_from_h5(
         path, _mesh_product(1), low_mem_bands=layout == "face")
     from gw.wavefunction_bundle import ParentGreenCarrier
     with h5py.File(path) as f:
         assert f["psi_parent_y"].attrs["psi_layout"] == layout
         assert f["psi_parent_y_transverse"].attrs["psi_layout"] == layout
-    carrier = ParentGreenCarrier(result[13], result[14], np.zeros((2, 4)),
+    carrier = ParentGreenCarrier(result.psi_nmu_parent, result.psi_mun_parent, np.zeros((2, 4)),
                                  np.ones((2, 4)), object(), layout=layout)
     leaves, tree = jax.tree_util.tree_flatten(carrier)
     assert jax.tree_util.tree_unflatten(tree, leaves).layout == layout
-    np.testing.assert_array_equal(result[13], charge)
-    np.testing.assert_array_equal(result[14], charge.transpose(0, 2, 3, 1))
-    np.testing.assert_array_equal(result[16], current)
-    np.testing.assert_array_equal(result[17], current.transpose(0, 2, 3, 1))
-    assert result[10] is None and result[11] is None
+    np.testing.assert_array_equal(result.psi_nmu_parent, charge)
+    np.testing.assert_array_equal(result.psi_mun_parent, charge.transpose(0, 2, 3, 1))
+    np.testing.assert_array_equal(result.psi_nmu_parent_transverse, current)
+    np.testing.assert_array_equal(result.psi_mun_parent_transverse, current.transpose(0, 2, 3, 1))
+    assert result.layout == layout
+    assert not hasattr(result, "psi_full_y")
+    assert not hasattr(result, "psi_full_y_transverse")
     with h5py.File(path, "r+") as f:
         del f["psi_parent_y_transverse_mun"]
     opens_before = len(host_transport.opens)
     with pytest.raises(ValueError, match="torn transverse parent faces"):
-        tagged_arrays.read_restart_state_from_h5(
+        restart_bundle.read_restart_state_from_h5(
             path, _mesh_product(1), low_mem_bands=True)
     assert len(host_transport.opens) == opens_before

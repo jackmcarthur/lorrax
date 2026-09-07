@@ -251,6 +251,11 @@ def test_the_loaders_agree_on_the_names_the_resolved_window_travels_under_p1():
         if fn.name not in loaders:
             continue
         seen.add(fn.name)
+        if fn.name == "_load_ring_subset":
+            assert any(isinstance(n, ast.Call) and getattr(n.func, "id", None) ==
+                       "load_bse_data_from_restart_sharded" for n in ast.walk(fn))
+            fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                      and n.name == "load_bse_data_from_restart_sharded")
         keys = set()
         for node in ast.walk(fn):
             if isinstance(node, ast.Dict):

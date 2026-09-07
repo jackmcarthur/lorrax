@@ -60,6 +60,8 @@ def _bundle(path, nmu):
         f["band_window"] = np.array([0, 0, 1, 2, 2])
         f["vhead"] = 0.
         f["whead"] = np.array([0.], dtype=complex)
+    from restart_fixture import canonicalize_fixture
+    canonicalize_fixture(path)
     return path
 
 
@@ -112,3 +114,9 @@ def test_single_candidate_loads_the_same_tensor_values(tmp_path, nmu):
     for name in expected:
         np.testing.assert_array_equal(actual[name], expected[name], err_msg=name)
     np.testing.assert_array_equal(actual["V_q0"], 2 * np.eye(nmu))
+
+
+@pytest.fixture(autouse=True)
+def _identity_transport(monkeypatch):
+    from restart_fixture import identity_parent_transport
+    identity_parent_transport(monkeypatch)

@@ -147,6 +147,8 @@ def load_bse_data_from_restart_sharded(
     if mesh_xy is None:
         raise ValueError("mesh_xy is required for sharded load")
 
+    from common.collectives import _require_addressable
+    _require_addressable(mesh_xy, origin="BSE restart reader")
     from file_io.restart_bundle import read_metadata, read_bse_payload
     header = read_metadata(restart_file)
     enk_full = header["energies"]
@@ -156,7 +158,7 @@ def load_bse_data_from_restart_sharded(
     w0_ready = header["screened_ready"]
     n_occ = resolve_n_occ(enk_full, n_occ=n_occ, input_file=input_file,
         fermi_energy=fermi_energy if fermi_energy != 0.0 else None)
-    nb_total = header["family_shapes"]["charge"][1]
+    nb_total = header["logical_band_count"]
     n_val, n_cond = min(n_val, n_occ), min(n_cond, nb_total-n_occ)
     if n_val <= 0 or n_cond <= 0:
         raise ValueError("BSE window contains no valence or conduction states")

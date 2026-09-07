@@ -130,6 +130,8 @@ def _write_restart(path, *, padded: bool):
         f.create_dataset(
             "band_window",
             data=np.array([0, 0, N_OCC, nb, nb], dtype=np.int64))
+    from restart_fixture import canonicalize_fixture
+    canonicalize_fixture(path)
 
 
 @pytest.fixture()
@@ -236,7 +238,7 @@ def test_an_all_zero_psi_file_falls_back_to_the_array_shape(tmp_path):
     path = tmp_path / "allzero.h5"
     _write_restart(path, padded=True)
     with h5py.File(path, "r+") as f:
-        f["psi_full_y"][...] = 0.0
+        f["psi_parent_y"][...] = 0.0
     data = bse_loading.load_bse_data_from_restart_sharded(
         str(path), n_val=100, n_cond=100, mesh_xy=_mesh_1x1(),
         n_occ=N_OCC, cell_volume=270.0)
@@ -248,6 +250,17 @@ def test_parent_face_extent_must_match_saved_rows(tmp_path):
     path = tmp_path / "parents.h5"
     with h5py.File(path, "w") as f:
         f["psi_parent_k_rows"] = np.array([0, 2])
+    from restart_fixture import canonicalize_fixture
+    canonicalize_fixture(path)
     faces = (np.ones((3, 1, 1, 4)), np.ones((3, 2, 1, 4)))
     with pytest.raises(ValueError, match="face extent does not match"):
-        bse_loading._unfold_bse_parent_faces(faces, str(path), None, None)
+        from file_io.restart_bundle import unfold_parent_faces
+        unfold_parent_faces(faces, str(path), None, None)
+
+
+@pytest.fixture(autouse=True)
+def _identity_transport(monkeypatch, request):
+    if request.node.name == "test_parent_face_extent_must_match_saved_rows":
+        return
+    from restart_fixture import identity_parent_transport
+    identity_parent_transport(monkeypatch)

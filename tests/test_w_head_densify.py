@@ -133,7 +133,7 @@ def test_on_grid_the_red_twin_is_invisible(kind):
     assert np.array_equal(true_arm, twin)
 
 
-def test_the_loader_does_not_defer_when_the_grids_are_equal(tmp_path):
+def test_the_loader_does_not_defer_when_the_grids_are_equal(tmp_path, monkeypatch):
     """``bse_k_grid == coarse`` returns the bundle the no-flag path returns.
 
     THE SEAM THIS GUARDS.  C1 works by having the loader DEFER the rank-1
@@ -146,6 +146,8 @@ def test_the_loader_does_not_defer_when_the_grids_are_equal(tmp_path):
     from bse.bse_io import load_bse_data_from_restart_sharded
     from common.collectives import single_device_mesh
 
+    from restart_fixture import identity_parent_transport
+    identity_parent_transport(monkeypatch)
     restart = str(tmp_path / "isdf_tensors_test.h5")
     _write_synthetic_restart(restart)
     mesh_xy = single_device_mesh()
@@ -797,5 +799,7 @@ def _write_synthetic_restart(path):
         f.create_dataset("vhead", data=np.complex128(_SYN_VHEAD))
         f.create_dataset("whead", data=np.array([_SYN_WHEAD], dtype=np.complex128))
         f.create_dataset("kgrid", data=np.array(_SYN_K))
+    from restart_fixture import canonicalize_fixture
+    canonicalize_fixture(path)
     # The q=0 W tile as written, for the "the head really is there" check.
     _SYN_W0 = (W0[0, 0, 0, 0, 0, 0],)

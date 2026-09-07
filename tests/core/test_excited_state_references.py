@@ -38,11 +38,9 @@ def _run_module(run_dir, module, argv, *, timeout=120):
 def _stage(source, target):
     shutil.copytree(source, target)
     harness.make_writable(target)
-    # _find_restart_file deliberately chooses the newest candidate when a
-    # sweep directory holds several bases. Core keeps both the 21-centroid
-    # GW bundle and the 31-centroid excited-state bundle, so remove the
-    # inapplicable copy from this private staged directory.
-    (target / "tmp" / "isdf_tensors_21.h5").unlink()
+    # Rebuild the 31-centroid bundle with the current writer. The frozen
+    # tmp contains both old-format restarts and a 21-centroid zeta cache.
+    shutil.rmtree(target / "tmp")
     return target
 
 
@@ -79,6 +77,7 @@ def test_fixture_a_exciton_band_reference(core_fixtures):
         pytest.skip("tiny exciton reference is the GPU core cell")
     source = core_fixtures / "A"
     run = rank_session.stage(source, _stage)
+    _run_module(run, "gw.gw_jax", ["-i", "exciton_gw.in"])
     ref = json.loads((source / "excited_state_ref.json").read_text())
     # The 2x2 mesh pads the nine physical transitions to 36 states. Nine
     # Krylov steps do not converge the padded spectrum to the reference.
@@ -109,6 +108,7 @@ def test_fixture_a_standalone_htransform_and_direct_tda_reference(
     run = rank_session.stage(source, _stage)
     ref = json.loads((source / "excited_state_ref.json").read_text())
     tol = ref["tolerances_ev"]
+    _run_module(run, "gw.gw_jax", ["-i", "exciton_gw.in"])
 
     _run_module(run, "bandstructure.htransform", [
         "-i", "htransform.in", "--guard-bands", "1",
@@ -124,7 +124,7 @@ def test_fixture_a_standalone_htransform_and_direct_tda_reference(
     # Davidson seeds physical transitions and converges individual states;
     # scalar Lanczos at the full padded dimension suffers exact breakdown.
     bse = _run_module(run, "bse.bse_jax", [
-        "-i", "cohsex.in", "--bse", "--lanczos", "--tda",
+        "-i", "exciton_gw.in", "--bse", "--lanczos", "--tda",
         "--solver", "davidson",
         "--n-val", "1", "--n-cond", "1", "--n-occ", "2",
         "--band-degeneracy", "off", "--max-lanczos-iter", "36",

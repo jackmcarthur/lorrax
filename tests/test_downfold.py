@@ -1696,7 +1696,7 @@ def test_downfold_band_slices_legacy_parent_uses_unsplit_fallback():
 
 def test_downfold_geometry_reads_parent_chi_sigma_split(tmp_path):
     """The shim cannot preserve a split that the geometry reader drops."""
-    from gw.downfold_run import _read_geometry
+    from file_io.restart_bundle import read_downfold_geometry as _read_geometry
 
     path = tmp_path / "parent.h5"
     with h5py.File(path, "w") as f:
@@ -1711,6 +1711,8 @@ def test_downfold_geometry_reads_parent_chi_sigma_split(tmp_path):
         f.create_dataset("band_window_split", data=np.asarray(
             (600, 608), dtype=np.int64))
 
+    from restart_fixture import canonicalize_fixture
+    canonicalize_fixture(path)
     geom = _read_geometry(str(path))
     assert tuple(geom["band_window_split"]) == (600, 608)
 
@@ -1819,7 +1821,7 @@ def test_offline_downfold_refuses_unavailable_centroid_actions():
 def test_downfold_geometry_accepts_raw_parent_faces(tmp_path):
     """Parent rows define the stored bands, while energies define the full k grid."""
     import h5py
-    from gw.downfold_run import _read_geometry
+    from file_io.restart_bundle import read_downfold_geometry as _read_geometry
     path = tmp_path / "parent.h5"
     with h5py.File(path, "w") as f:
         f["psi_parent_y"] = np.zeros((2, 8, 4, 4), dtype=np.complex128)
@@ -1828,5 +1830,7 @@ def test_downfold_geometry_accepts_raw_parent_faces(tmp_path):
         f["V_qmunu"] = np.zeros((8, 4, 4))
         f["W0_qmunu"] = np.zeros((8, 4, 4))
         f["W0_qmunu"].attrs["W0_ready"] = True
+    from restart_fixture import canonicalize_fixture
+    canonicalize_fixture(path)
     geom = _read_geometry(str(path))
     assert (geom["nk"], geom["nb"], geom["nspinor"]) == (8, 8, 4)

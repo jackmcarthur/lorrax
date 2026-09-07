@@ -256,28 +256,29 @@ def _guards_on_w0_ready(source, binder):
     return found
 
 
-def test_the_interpolation_path_gates_on_w0_ready_like_bse_io_does():
-    """``vq_interp`` binds W0 only behind the persisted flag.
+def test_the_interpolation_path_gates_on_w0_ready_like_bse_io_does(tmp_path, monkeypatch):
+    """Both paths consume the shared readiness decision, including the bare fallback."""
+    import h5py
+    import inspect
+    from file_io import restart_bundle as reader
+    from bse import vq_interp
+    from restart_fixture import canonicalize_fixture
+    path = tmp_path / "screening.h5"
+    with h5py.File(path, "w") as f:
+        f["V_qmunu"] = np.ones((1, 2, 2), complex)
+        f["W0_qmunu"] = np.zeros((1, 2, 2), complex)
+    canonicalize_fixture(path)
+    monkeypatch.setattr(reader, "read_munu_tensor_from_h5", lambda f, name, mesh: name)
+    for ready in (False, True):
+        with h5py.File(path, "r+") as f:
+            f["W0_qmunu"].attrs["W0_ready"] = ready
+        assert reader.read_interaction(path, "screened", None) == (
+            "W0_qmunu" if ready else "V_qmunu")
+    assert vq_interp.read_vq_payload is reader.read_vq_payload
+    assert "read_coarse_interactions(" in inspect.getsource(reader.read_vq_payload)
+    assert 'read_interaction(filename, "screened", mesh_xy)' in inspect.getsource(reader.read_coarse_interactions)
+    assert 'read_interaction(filename, "screened", mesh_xy' in inspect.getsource(reader.read_bse_payload)
 
-    The pre-fix line was ``if "W0_qmunu" in fr:`` — the presence question —
-    while ``bse_io`` two modules over had been asking the right one all
-    along.  Both are asserted here, so the two readers cannot drift apart
-    again silently: if somebody relaxes either, this fails.
-    """
-    vq_guards = _guards_on_w0_ready(_VQ_INTERP.read_text(), "'W0'")
-    assert vq_guards, (
-        "no `if` in bse/vq_interp.py binds zx['W0'] any more; the gate "
-        "has moved and this cell is no longer measuring it")
-    assert all(vq_guards), (
-        "bse/vq_interp.py binds zx['W0'] behind a condition that does not "
-        "mention W0_ready.  Presence is not persistence: gw_init allocates "
-        "a full-size ZERO W0 unconditionally, so `\"W0_qmunu\" in fr` is "
-        "true on a run whose persist_w0 never fired.  That is the April "
-        "all-zero-screening mechanism.")
-
-    io_guards = _guards_on_w0_ready(_BSE_IO.read_text(), "wq_key")
-    assert any(io_guards), (
-        "bse/bse_loading.py no longer gates its W0 selection on W0_ready")
 
 
 def test_the_ast_matcher_detects_the_pre_fix_shape():
@@ -395,52 +396,41 @@ def test_the_writer_stamps_v_ready_where_it_stamps_w0_ready():
         f"persisted flags must be set here, in one rank-0 block")
 
 
-def test_a_file_that_says_v_was_never_persisted_is_refused(tmp_path):
-    """The refusal, and the legacy path beside it.
-
-    Three states, and the middle one is the whole backward-compatibility
-    story: ABSENT means ready, because every restart file written before
-    the attr existed carries nothing and must keep loading byte-for-byte.
-    """
+def test_a_file_that_says_v_was_never_persisted_is_refused(tmp_path, monkeypatch):
+    """Absent and true V_ready pass; false refuses before any tensor read."""
     import h5py
-    from bse.bse_io import _refuse_unpersisted
-
+    from file_io import restart_bundle as reader
+    from restart_fixture import canonicalize_fixture
     path = tmp_path / "v.h5"
     with h5py.File(path, "w") as f:
-        legacy = f.create_dataset("legacy", shape=(NQ, N_MU, N_MU),
-                                  dtype=np.complex128)
-        ready = f.create_dataset("ready", shape=(NQ, N_MU, N_MU),
-                                 dtype=np.complex128)
-        ready.attrs["V_ready"] = True
-        never = f.create_dataset("never", shape=(NQ, N_MU, N_MU),
-                                 dtype=np.complex128)
-        never.attrs["V_ready"] = False
+        f["V_qmunu"] = np.ones((1, N_MU, N_MU), complex)
+    canonicalize_fixture(path)
+    reads = []
+    monkeypatch.setattr(reader, "read_munu_tensor_from_h5", lambda *args: reads.append(args))
+    reader.read_interaction(path, "bare", None)
+    with h5py.File(path, "r+") as f:
+        f["V_qmunu"].attrs["V_ready"] = True
+    reader.read_interaction(path, "bare", None)
+    assert len(reads) == 2
+    with h5py.File(path, "r+") as f:
+        f["V_qmunu"].attrs["V_ready"] = False
+    with pytest.raises(ValueError, match="never persisted"):
+        reader.read_interaction(path, "bare", None)
+    assert len(reads) == 2
 
-        _refuse_unpersisted(legacy, "legacy", str(path))     # absent -> ok
-        _refuse_unpersisted(ready, "ready", str(path))       # True   -> ok
-        with pytest.raises(ValueError, match="never persisted"):
-            _refuse_unpersisted(never, "never", str(path))
 
 
 def test_both_readers_ask_before_reading_v():
-    """SOURCE cell: the gate is at BOTH V reads, not just the one named.
+    """The serial adapter delegates to the one guarded sharded payload reader."""
+    import inspect
+    from bse import bse_loading
+    from file_io import restart_bundle as reader
+    assert "load_bse_data_from_restart_sharded(" in inspect.getsource(bse_loading._load_ring_subset)
+    assert "read_bse_payload(" in inspect.getsource(bse_loading.load_bse_data_from_restart_sharded)
+    assert 'read_interaction(filename, "bare", mesh_xy' in inspect.getsource(reader.read_bse_payload)
+    src = inspect.getsource(reader.read_interaction)
+    assert src.index('"V_ready"') < src.index("read_munu_tensor_from_h5(")
 
-    ``_load_ring_subset`` is the reader the map found; the sharded loader
-    reads V too, and a gate on one of two readers is a gate a caller can
-    route around by choosing a path.
-    """
-    src = _BSE_IO.read_text()
-    tree = ast.parse(src)
-    guarded = {
-        n.name for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef)
-        and any(isinstance(c, ast.Call)
-                and getattr(c.func, "id", None) == "_refuse_unpersisted"
-                for c in ast.walk(n))
-    }
-    assert {"_load_ring_subset",
-            "load_bse_data_from_restart_sharded"} <= guarded, (
-        f"only {sorted(guarded)} refuse an unpersisted V")
 
 
 def test_build_hdir_refuses_a_w0_whose_q_axis_is_not_the_full_bz():

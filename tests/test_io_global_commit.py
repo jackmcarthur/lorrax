@@ -44,15 +44,14 @@ def test_rank0_filesystem_error_names_action_and_path():
 
 
 def test_incomplete_restart_refuses_even_with_stale_ready_flag(tmp_path):
-    from bse.bse_loading import _refuse_unpersisted
+    from file_io.restart_bundle import read_metadata
     path = tmp_path / 'restart.h5'
     with h5py.File(path, 'w') as f:
         ds = f.create_dataset('V_qmunu', data=np.zeros((1, 2, 2)))
         ds.attrs['V_ready'] = True
         set_commit_state(f, False)
-    with h5py.File(path) as f:
-        with pytest.raises(ValueError, match='not globally committed'):
-            _refuse_unpersisted(f['V_qmunu'], 'V_qmunu', str(path))
+    with pytest.raises(ValueError, match='not globally committed'):
+        read_metadata(path)
     with h5py.File(path, 'a') as f:
         set_commit_state(f, True)
         assert_committed(f)

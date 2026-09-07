@@ -582,6 +582,8 @@ def test_restart_refuses_a_changed_chi_count_and_allows_a_changed_sigma():
             f["band_window"] = np.asarray(window, dtype=np.int64)
             if split is not None:
                 f["band_window_split"] = np.asarray(split, dtype=np.int64)
+        from restart_fixture import canonicalize_fixture
+        canonicalize_fixture(path)
         return path
 
     with tempfile.TemporaryDirectory() as tmp:

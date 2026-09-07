@@ -43,6 +43,8 @@ _REGENERATE = (
 
 def _require_current(f):
     """Refuse retired full-k bundles once, before any payload read."""
+    from .commit_state import assert_committed
+    assert_committed(f)
     required = ("psi_parent_y", "psi_parent_y_mun", "psi_parent_k_rows",
                 "band_window", "band_window_schema", "enk_full", "kgrid")
     if (any(name not in f for name in required)
@@ -666,7 +668,14 @@ def read_metadata(filename):
         _require_current(f)
         def value(name):
             return np.asarray(f[name][()]) if name in f else None
+        # Uniform band padding is exact zero in every parent face. A single
+        # parent row detects the logical prefix without loading full-k psi;
+        # preserve the all-zero-file fallback of the BSE reader.
+        psi0 = np.asarray(f["psi_parent_y"][0])
+        populated = np.flatnonzero(np.any(psi0 != 0, axis=(1, 2)))
+        nb_logical = int(populated[-1]) + 1 if populated.size else f["enk_full"].shape[1]
         return dict(
+            logical_band_count=nb_logical,
             energies=value("enk_full"), grid=value("kgrid"),
             band_window=value("band_window"), band_split=value("band_window_split"),
             centroid_count=int(f["n_rmu_logical"][()]),
@@ -686,9 +695,11 @@ def read_interaction(filename, kind, mesh_xy, *, nohead=False):
     name = names[kind]
     with h5py.File(filename, "r") as f:
         _require_current(f)
-        if name not in f or not bool(f[name].attrs.get(
-                "W0_ready" if kind == "screened" else "V_ready", kind == "bare")):
-            raise ValueError(f"{filename}: {kind} interaction was not persisted")
+        if kind == "screened" and (name not in f or not bool(
+                f[name].attrs.get("W0_ready", False))):
+            name = "V_qmunu"
+        if name not in f or not bool(f[name].attrs.get("V_ready", True)):
+            raise ValueError(f"{filename}: {name} was never persisted")
         if nohead and name + "_nohead" in f:
             name += "_nohead"
     return read_munu_tensor_from_h5(filename, name, mesh_xy)

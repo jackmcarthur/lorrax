@@ -324,7 +324,11 @@ def _audit_addressability_guard(src, name="<mod>"):
         if isinstance(n, ast.FunctionDef) and n.name == "_get_local_mesh_coords":
             helper = n
     if helper is None:
-        return ["%s has no _get_local_mesh_coords" % name]
+        reader = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                       and n.name == "load_bse_data_from_restart_sharded"), None)
+        if reader is not None and "_require_addressable" in _call_names(reader):
+            return []
+        return ["%s has no guarded BSE reader" % name]
     if "_require_addressable" not in _call_names(helper):
         bad.append("_get_local_mesh_coords does not call _require_addressable")
     fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
