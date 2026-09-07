@@ -1543,91 +1543,15 @@ def _load_static_photon_hall(
     return hall
 
 
-def compute_static_photon_response(
-    wfns_charge, wfns_transverse, quad, bispinor_v_q_path,
-    meta, mesh_xy, *,
-    screen_current: bool,
-    mu_bases,
-    W_charge=None,
-    wfn=None,
-    config=None,
-    photon_g0_vectors=None,
-    wf_binding_charge=None,
-    wf_binding_transverse=None,
-    wfn_fingerprint_binding=None,
-    current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
-    energy_reference=0.0,
-    dyson_solver: str = "distributed",
-    distrib_la_batched_route: str = "batch_reshard",
-    print_fn=print,
-) -> StaticPhotonResponse:
-    """Build the packed static photon body and complete its Gamma cell.
-
-    THE SCREENING OWNER OF BOTH PACKED STATIC MODES.  ``screen_current``
-    (resolved once by :func:`gw_config.packed_photon_screens_current`, never
-    defaulted here) selects which:
-
-    ``screen_current = True`` -- ``bispinor_gw = full_static_cohsex``: the
-    sixteen no-pair blocks of ``chi``, one distributed Dyson solve at
-    omega=0.
-
-    ``screen_current = False`` -- the ``bare_transverse`` family: the twelve
-    current blocks of ``chi`` are ZERO by declaration, so the packed Dyson
-    equation is block diagonal and neither the current blocks nor the packed
-    solve are built at all.  The CC block is screened by the incumbent
-    scalar owner (``gw.screening.compute_screening_model`` -> :func:`solve_w`
-    at ``n_C``) and arrives as ``W_charge``; this function assembles
-    ``W_packed = diag(W_00, D_TT)`` with ``W_CT = 0`` through the sole
-    packer.  The sixteen-block Sigma consumer then returns the screened
-    charge COHSEX in CC, the bare Breit exchange ``Sigma^B`` in TT
-    (``SX(D_TT) = X(D_TT)``, ``COH(D_TT - D_TT) = 0``) and zero in CT/TC --
-    the incumbent ``gw.sigma_x_bispinor`` result, block for block.
-
-    Both modes then run ONE Gamma-cell completion
-    (:func:`gw.head_correction.complete_static_slab_photon_q0`) from the
-    bounded response of
-    :func:`gw.static_gauge_response.build_static_photon_head_response` --
-    bare ``<D>`` into V, the charge ``S^{00}``/wing head into W, the Hall
-    CT/TC term from ``config.paths.static_gauge_hall_file`` when that
-    artifact exists (``sigma_H = 0`` otherwise, announced).  With the
-    charge-only ``R(q)`` the coupled 4x4 solve returns
-    ``diag(W^{00}_h(q), D_TT(q))``, so the same completion inserts the
-    charge head AND the bare ``<D_TT> = -<v P^T>`` that the
-    ``bispinor_tt_head_correction`` overlay writes into the TT V tiles on
-    the incumbent route (that key is refused here, GATE
-    ``packed_bare_transverse_tt_head_double_count``).  The Hall term needs a
-    screened CT/TC channel to live in, so a nonzero Hall artifact is refused
-    on the bare route; an authenticated exact-zero artifact is admitted and
-    gives the same operator as the unnamed zero-Hall default.  The completion
-    runs under ``head_correction = full`` (the
-    default); ``off`` skips it behind a DEBUG banner and is not a production
-    setting (owner ruling 2026-09-01).  The current q^2/contact/complement
-    terms are omitted by model in either case.
-
-    MEMORY.  Both modes keep the packed body resident: ``V_packed`` and
-    ``W_packed`` are each ``(nq, N_packed, N_packed)`` complex128 at
-    ``P(None,'x','y')`` with ``N_packed = n_C + 3 n_T``, i.e.
-    ``16 nq N_packed^2 / P`` bytes per rank each.  The bare route's
-    incumbent predecessor held one TT tile at a time instead, so this IS a
-    new resident carrier for that route (it is the same object the screened
-    mode already holds).  The figure is printed at this site below; the
-    per-block streaming inside ``gw.photon_sigma`` is unchanged.
-
-    ``print_fn`` is the driver's rank-zero printer.  In production mode the
-    driver sinks ordinary component chatter, so the DEBUG banner below
-    carries a WARNING token (retained in the run record's warning block)
-    and the driver copies the completion / Hall status into its
-    ``Photon head`` record line from the returned ``head_completion``.
-    """
+def _resolve_static_photon_policy(
+        config, screen_current, dyson_solver, W_charge, wfn, photon_g0_vectors,
+        wf_binding_charge, wf_binding_transverse, wfn_fingerprint_binding, wfns_charge,
+        wfns_transverse, meta, mesh_xy, print_fn):
+    """Produce the validated photon head policy and authenticated Hall input."""
     from .gw_config import (
         BispinorGWMode, HeadCorrection,
         coerce_bispinor_gw_mode, packed_bare_transverse_route,
         packed_photon_screens_current)
-    from .photon_layout import (
-        PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
-        pack_photon_operator)
-    from .v_q_bispinor import ZERO_TILES, BispinorVqReader
-
     if str(dyson_solver).strip().lower() != "distributed":
         raise ValueError(
             "packed static photon response requires "
@@ -1710,7 +1634,16 @@ def compute_static_photon_response(
             "  (owner ruling 2026-09-01, docs/architecture/decisions.md).\n"
             "  ==========================================================\n",
             flush=True)
+    return coupled_head, screen_current, hall, head_policy
 
+
+def _read_static_photon_body(
+        wfns_charge, wfns_transverse, meta, bispinor_v_q_path, mesh_xy, mu_bases):
+    """Produce the parent-family plans, q policy and packed bare photon operator."""
+    from .photon_layout import (
+        PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
+        pack_photon_operator)
+    from .v_q_bispinor import ZERO_TILES, BispinorVqReader
     plans = (wfns_charge.green_parent.plan, wfns_transverse.green_parent.plan)
     sym = plans[0].sym
     from .qgrid_symmetry import qgrid_trs_policy_for
@@ -1730,7 +1663,12 @@ def compute_static_photon_response(
         V_packed = pack_photon_operator(
             lambda A, B: None if (A, B) in ZERO_TILES else reader.get_tile(A, B),
             nq, layout, mesh_xy)
+    return plans, sym, policy, nq, layout, V_packed
 
+
+def _report_static_photon_body(
+        screen_current, current_contact, head_policy, layout, nq, print_fn):
+    """Report the resolved photon model and resident operator size."""
     if jax.process_index() == 0:
         # MEASURED at the site, per lane C's design note: the packed body is
         # the resident carrier of BOTH modes and is new to the bare route.
@@ -1754,6 +1692,17 @@ def compute_static_photon_response(
             f"{layout.carrier_extent(1)}), nq={nq}: "
             f"{body_bytes / 1e9:.4f} GB/rank resident for EACH of V and W",
             flush=True)
+
+
+def _screen_static_photon_body(
+        screen_current, wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
+        current_contact, energy_reference, V_packed, distrib_la_batched_route, W_charge,
+        sym, nq):
+    """Produce the screened packed operator on the existing photon basis."""
+    from .photon_layout import (
+        PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
+        pack_photon_operator)
+    from .v_q_bispinor import ZERO_TILES, BispinorVqReader
     if screen_current:
         chi_packed = compute_experimental_no_pair_photon_chi0(
             wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
@@ -1829,7 +1778,17 @@ def compute_static_photon_response(
         raise ValueError(
             "static packed photon W[q=0] failed the canonical Hermiticity "
             "gate before coupled head/body folding")
+    return W_packed
 
+
+def _complete_static_photon_head(
+        coupled_head, V_packed, W_packed, wfns_charge, config, mesh_xy, wfn, meta, layout,
+        hall, wfn_fingerprint_binding, photon_g0_vectors, plans, print_fn):
+    """Produce the Gamma-completed photon operators and their completion receipt."""
+    from common import sanity
+    from .photon_layout import (
+        PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
+        pack_photon_operator)
     head_completion = None
     if coupled_head:
         from vcoul import (
@@ -1881,6 +1840,43 @@ def compute_static_photon_response(
                 "dyson_forward_bound="
                 f"{head_completion.max_dyson_forward_error_bound:.3e}",
                 flush=True)
+    return V_packed, W_packed, head_completion
+
+
+def compute_static_photon_response(
+    wfns_charge, wfns_transverse, quad, bispinor_v_q_path,
+    meta, mesh_xy, *,
+    screen_current: bool,
+    mu_bases,
+    W_charge=None,
+    wfn=None,
+    config=None,
+    photon_g0_vectors=None,
+    wf_binding_charge=None,
+    wf_binding_transverse=None,
+    wfn_fingerprint_binding=None,
+    current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
+    energy_reference=0.0,
+    dyson_solver: str = "distributed",
+    distrib_la_batched_route: str = "batch_reshard",
+    print_fn=print,
+) -> StaticPhotonResponse:
+    """Produce the static photon response; see docs/architecture/four_current_wiring.md."""
+    (coupled_head, screen_current, hall, head_policy) = _resolve_static_photon_policy(
+        config, screen_current, dyson_solver, W_charge, wfn, photon_g0_vectors,
+        wf_binding_charge, wf_binding_transverse, wfn_fingerprint_binding, wfns_charge,
+        wfns_transverse, meta, mesh_xy, print_fn)
+    (plans, sym, policy, nq, layout, V_packed) = _read_static_photon_body(
+        wfns_charge, wfns_transverse, meta, bispinor_v_q_path, mesh_xy, mu_bases)
+    _report_static_photon_body(
+        screen_current, current_contact, head_policy, layout, nq, print_fn)
+    (W_packed) = _screen_static_photon_body(
+        screen_current, wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
+        current_contact, energy_reference, V_packed, distrib_la_batched_route, W_charge,
+        sym, nq)
+    (V_packed, W_packed, head_completion) = _complete_static_photon_head(
+        coupled_head, V_packed, W_packed, wfns_charge, config, mesh_xy, wfn, meta, layout,
+        hall, wfn_fingerprint_binding, photon_g0_vectors, plans, print_fn)
 
     if screen_current:
         return StaticPhotonResponse(
