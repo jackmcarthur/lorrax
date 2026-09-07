@@ -716,3 +716,14 @@
 | Four-node pool release | Allocation cancelled after successful step completion | 58007765 | 44_p16_retry/release_status.txt |
 | Rejected first P16 launch | Allocation FAILED before scientific output; retried on a successfully returned allocation | 58007540 / lx-Xg4-204952-766253-9574 | 23_final_gates/p16/launch.log |
 | Non-pytest launchers in initial CPU collection | Four standalone GPU scripts have no pytest test functions; removed from CPU payload after import-time host-FFI refusal | 58006471 / lx-Xg0-204635-749765-5736 | 23_final_gates/non_pytest_launchers.txt; cpu/collection.log |
+
+| L1 integration batch | Result | Step / allocation | Artifact |
+|---|---|---|---|
+| Claim 1427; a7d08c02 → c5c75d10 on e978f06d | 19 compaction commits retained; duplicate7225ea43 dropped; one cache-key conflict preserves mesh signature and native-kernel flag | allocation58009036 | runs/DEV/117_bisp_review_codex_2026-09-06/47_l1_rebase/range_diff.txt |
+| Parent convolution algorithm | Four owner ASTs identical after accepted name/docstring/mesh-key normalization; src/ffi/fft.py and tests/test_isdf_parent_conv.py byte-identical | Static audit | runs/DEV/117_bisp_review_codex_2026-09-06/47_l1_rebase/kernel_audit.json |
+| Untouched L1 MoS2 reference | e978f06d P4; fresh fit without tmp | 58009036 / lx-Xg4-213916-1030231-5738 | runs/DEV/117_bisp_review_codex_2026-09-06/46_l1_references/mos2_6x6/launch.log |
+| Untouched L1 Si SOC reference | e978f06d P4; donor56 deck and copied tmp | 58009036 / lx-Xg4-214058-1038832-5154 | runs/DEV/117_bisp_review_codex_2026-09-06/46_l1_references/si_soc/launch.log |
+| Requested CPU oracles | 409 passed, 2 skipped, 1 xfailed, 89 warnings in 185.84s (0:03:05) | 58009036 / lx-Xg0-214250-1046990-1636 | runs/DEV/117_bisp_review_codex_2026-09-06/47_l1_rebase/cpu/cpu.xml |
+| Rebased MoS2 P4 | eqp0/eqp1/sigma_diag identical to own L1 reference; 217/217/246 printed lines | 58009036 / lx-Xg4-214250-1047014-8035 | runs/DEV/117_bisp_review_codex_2026-09-06/47_l1_rebase/identity.json |
+| Rebased Si SOC P4 | eqp0/eqp1/sigma_diag identical to own L1 reference; 264/264/297 printed lines | 58009036 / lx-Xg4-214420-1055388-6554 | runs/DEV/117_bisp_review_codex_2026-09-06/47_l1_rebase/identity.json |
+| Allocation retries | Premium requests exceeded lx 120-second timeout; interactive request refused QOSMaxSubmitJobPerUserLimit; pending requests cancelled before retry | Own allocation receipts | runs/DEV/117_bisp_review_codex_2026-09-06/46_l1_references/allocate*.log |
