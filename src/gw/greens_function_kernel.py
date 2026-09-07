@@ -1,21 +1,17 @@
-"""Contract typed child centroid faces with one planned Green GEMM."""
+"""Build parent Green operators and transport them with typed local symmetry actions."""
+from functools import partial
+
+import jax
+import numpy as np
 import jax.numpy as jnp
 
 from common.contract_bands import merge_spin_centroid, split_spin_centroid
 
 
-def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None):
-    """Form the weighted direct/conjugate outer product in the centroid-major GEMM order."""
+def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None):
+    """Contract band-replicated faces locally or band-distributed faces with their GEMM plan."""
     if Gij is not None:
-        raise NotImplementedError(
-            "build_G(layout='face'): an explicit dense Gij band-operator "
-            "is not ported for this layout (report obstacle #4's named "
-            "escape hatch — 'refuse that uncommon combination under "
-            "low_mem_bands=true by name').  Production diagonal-occupation "
-            "weights go through `phases` instead, which IS supported; a "
-            "genuinely dense (non-diagonal) band operator would need its "
-            "own face-sharded two-GEMM contract (like the projector's), "
-            "not this identity/diagonal-weight path.")
+        raise NotImplementedError("Green faces support diagonal band weights, not dense Gij.")
     nk_, s_, mu_l_, n_ = psi_mun.shape
     nk_r_, n_r_, s_r_, mu_r_ = psi_nmu.shape
     if nk_r_ != nk_ or n_r_ != n_ or s_r_ != s_:
@@ -23,6 +19,17 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None):
             "build_G(layout='face'): left psi_mun and right psi_nmu must "
             "share (nk, nb, nspinor); got "
             f"{psi_mun.shape} and {psi_nmu.shape}.")
+    if gemm is None:
+        from common.shard_map import shard_map
+        from jax.sharding import PartitionSpec as P
+        @partial(shard_map, mesh=mesh,
+                   in_specs=(P(None, None, 'x', None), P(None, None, None, 'y'), P()),
+                   out_specs=P(None, None, 'x', None, 'y'), check_vma=False)
+        def contract(left, right, weights):
+            return jnp.einsum('ksmn,kntr->ksmtr',
+                              left * weights[:, None, None, :], jnp.conj(right))
+        weights = jnp.ones((nk_, n_), dtype=psi_mun.dtype) if phases is None else phases
+        return contract(psi_mun, psi_nmu, weights)
     A = merge_spin_centroid(psi_mun, 1, 2)          # (nk, mu*s, n) P(_,'x','y')
     if phases is not None:
         w = phases.astype(A.dtype)                  # (nk, n)
@@ -35,41 +42,33 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None):
     A = lax.with_sharding_constraint(A, sharding)
     B = lax.with_sharding_constraint(B, sharding)
     G_flat = gemm(A, B)                              # (nk, mu*s, mu*s) P(_,'x','y')
-    # Undo BOTH merges, restoring legacy's rectangular
-    # (k, s, μ_left_X, s', μ_right_Y) axis order.  The historical
-    # square path is the mu_l_ == mu_r_ specialization; accepting distinct
-    # endpoint extents here lets the canonical G builder serve mixed C/T
-    # response blocks without a second Green-function implementation.
-    # The row merge sits at axis 1, the (still-merged) column pair shifts
-    # from axis 2 to axis 3 once the first split inserts an axis.
     G = split_spin_centroid(G_flat, 1, s_, mu_l_)
     G = split_spin_centroid(G, 3, s_, mu_r_)
     return G
 
 
 def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
-           gemm=None, k_unfold_plan=None):
-    """Unfold parent faces before contracting weights with the conjugated endpoint."""
-    if layout != 'face':
-        raise ValueError(f"build_G: layout must be 'face', got {layout!r}")
-    if gemm is None:
-        raise ValueError("build_G requires gemm=<distrib_la.GemmPlan> built outside the kernel.")
-    if k_unfold_plan is not None:
-        from common.shard_map import shard_map
-        from jax import jit
-        from jax.sharding import PartitionSpec as P
-        specs = (P(None, None, "x", "y"), P(None, "x", None, "y"))
-        def unfold(left, right):
-            return (k_unfold_plan.unfold_face(
-                left, spin_axis=1, mu_axis=2, mesh_axis="x"),
-                    k_unfold_plan.unfold_face(
-                right, spin_axis=2, mu_axis=3, mesh_axis="y"))
-        psi_xn, psi_yr = jit(shard_map(
-            unfold, mesh=gemm.mesh, in_specs=specs,
-            out_specs=specs, check_vma=False))(psi_xn, psi_yr)
-        if phases is not None:
-            phases = jnp.take(phases, jnp.asarray(k_unfold_plan.irr_idx), axis=0)
-    return _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases)
+           gemm=None, k_unfold_plan=None, right_k_unfold_plan=None, real_weights=None):
+    """Build parent operators and transport both typed endpoints without processor exchange."""
+    if layout != 'face' or (gemm is None and k_unfold_plan is None):
+        raise ValueError("build_G requires canonical faces and a GEMM plan or typed parent plan.")
+    G = _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases,
+                      mesh=None if k_unfold_plan is None else k_unfold_plan.mesh_xy)
+    if k_unfold_plan is None:
+        return G
+    transposed = None
+    if np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial):
+        if phases is None or not jnp.issubdtype(phases.dtype, jnp.complexfloating):
+            transposed = jnp.conj(G)
+        else:
+            transposed = jax.lax.cond(
+                (jnp.any(jnp.imag(phases) != 0) if real_weights is None
+                 else ~jnp.asarray(real_weights)),
+                lambda _: _build_G_face(jnp.conj(psi_xn), jnp.conj(psi_yr),
+                                        gemm=gemm, Gij=Gij, phases=phases, mesh=k_unfold_plan.mesh_xy),
+                lambda _: jnp.conj(G), operand=None)
+    return k_unfold_plan.unfold_operator(
+        G, operator_transpose=transposed, right_plan=right_k_unfold_plan)
 
 
 def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
@@ -178,4 +177,4 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
     return build_G(
         psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
-        k_unfold_plan=k_unfold_plan)
+        k_unfold_plan=k_unfold_plan, real_weights=jnp.imag(t) == 0)

@@ -179,10 +179,12 @@ class CentroidKUnfoldPlan:
             source[unused] = 0
         return jnp.take(src, jnp.asarray(source), axis=axis)
 
-    def unfold_operator(self, operator_parent, *, operator_transpose=None):
+    def unfold_operator(self, operator_parent, *, operator_transpose=None, right_plan=None):
         """Transport ``(k_parent,s,mu,s,nu)`` to full k locally."""
+        right = self if right_plan is None else right_plan
         return unfold_spin_centroid_operator(
             operator_parent,
+            right_sym_perm=right.sym_perm, right_L_table=right.L_table,
             operator_transpose=operator_transpose,
             irr_idx=self.irr_idx,
             sym_idx=self.sym_idx,

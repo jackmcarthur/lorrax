@@ -614,7 +614,7 @@ def _compute_invalid_static_sigma(
         mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
     s = wfns.slices
     g_plan = _face_g_plan(
-        mesh_xy, (k_unfold_plan.n_full, *face_kwargs["face_shape"][1:]))
+        mesh_xy, (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]))
     (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
     g_carrier = wfns.green_parent
 
@@ -719,7 +719,7 @@ def _invalid_static_coh_by_bracket(
         mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
     s = wfns.slices
     g_plan = _face_g_plan(
-        mesh_xy, (k_unfold_plan.n_full, *face_kwargs["face_shape"][1:]))
+        mesh_xy, (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]))
     (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
     g_carrier = wfns.green_parent
 
