@@ -392,13 +392,14 @@ def test_dft_head_refuses_dipole_provenance_before_read_or_allocation(
         tmp_path, monkeypatch):
     """A four-spinor charge body must not consume a two-spinor dipole."""
     import common.chi_from_dipole as dipole_reader
+    from file_io import restart_bundle
     import psp.get_dipole_mtxels as dipole_owner
 
     (tmp_path / "dipole.h5").write_bytes(b"not read")
     monkeypatch.setattr(
         dipole_owner, "resolve_vnl_velocity_sign", lambda *_args: +1)
     monkeypatch.setattr(
-        dipole_owner, "check_dipole_provenance", lambda *_args, **_kw: False)
+        restart_bundle, "check_dipole_provenance", lambda *_args, **_kw: False)
     monkeypatch.setattr(
         dipole_reader, "read_dipole_h5",
         lambda *_args, **_kw: pytest.fail("dipole payload was read"))

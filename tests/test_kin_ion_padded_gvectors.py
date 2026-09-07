@@ -86,7 +86,7 @@ def test_kin_ion_provenance_refuses_folded_and_mismatched_files_before_read(
     """Only a pristine operator with matching spinor provenance is usable."""
     import h5py
     import pytest
-    from file_io import kin_ion as owner
+    from file_io import restart_bundle as owner
 
     good = tmp_path / "kin_ion_good.h5"
     wrong = tmp_path / "kin_ion_wrong.h5"

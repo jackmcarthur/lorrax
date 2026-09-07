@@ -217,7 +217,7 @@ def test_the_driver_threads_wfn_nspinor_into_the_validator():
     production call site, without importing the heavy driver module."""
     src = (_REPO / "src" / "gw" / "gw_jax.py").read_text()
     call = src[src.index("validate_kin_ion_against_run("):]
-    call = call[:call.index("\n\t)")]        # the call's closing paren line
+    call = call[:call.index("\n    )")]        # the call's closing paren line
     assert "nspinor=int(wfn.nspinor)" in call
 
 

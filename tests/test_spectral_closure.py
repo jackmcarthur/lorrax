@@ -868,7 +868,7 @@ def test_the_absence_of_sym_perm_is_reported_as_an_absence():
     """No table means UNMEASURED, and the driver must not let that read clean."""
     import pathlib
     src = (pathlib.Path(__file__).resolve().parents[1]
-           / "src" / "gw" / "downfold_run.py").read_text()
+           / "src" / "file_io" / "restart_bundle.py").read_text()
     assert "closure is UNMEASURED" in src
     assert "an absence and not a pass" in src
 

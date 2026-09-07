@@ -34,6 +34,7 @@ def _write_rotations(path, U, E_ry, band_range, *, kgrid=(2, 1, 1),
         str(path), U, np.asarray(E_ry) / 2.0,
         int(band_range[0]), int(band_range[1]), np.asarray(kpoints),
         *kgrid, k_storage="full",
+        kirr_to_kfull=np.arange(len(kpoints)),
         source_wfn=(_source_wfn() if source_wfn is True else source_wfn))
 
 

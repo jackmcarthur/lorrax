@@ -362,15 +362,15 @@ def test_bi_schedule_reuses_one_sample_handle_per_checkpoint_epoch(
         }
 
     monkeypatch.setattr(
-        MS, "read_w_header",
+        _bundle_reader, "read_w_header",
         lambda _src, name: negative if name == _W_NEGATIVE_NAME else positive)
-    monkeypatch.setattr(MS, "read_w_tables", lambda *_args: object())
+    monkeypatch.setattr(_bundle_reader, "read_w_tables", lambda *_args: object())
     monkeypatch.setattr(
         MS, "allocate_fit_store_collective", lambda *_args, **_kwargs: ledger)
     monkeypatch.setattr(MS, "fit_completion_ledger", lambda *_args: ledger)
     monkeypatch.setattr(MS, "write_fit_io_receipt",
                         lambda _dest, _report: None)
-    monkeypatch.setattr(MS, "open_w_column_reader", open_reader)
+    monkeypatch.setattr(_bundle_reader, "open_w_column_reader", open_reader)
     monkeypatch.setattr(MS, "FitWriter", FakeWriter)
     monkeypatch.setattr(fit_driver, "fit_one_block", fake_fit_one_block)
     monkeypatch.setattr(fit_driver.os.path, "exists", lambda _path: False)
@@ -659,7 +659,7 @@ def test_fit_restart_checkpoints_only_closed_32_block_epochs(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(fit_driver, "fit_one_block", fail_in_second_epoch)
-    monkeypatch.setattr(MS, "open_w_column_reader", track_reader)
+    monkeypatch.setattr(_bundle_reader, "open_w_column_reader", track_reader)
     monkeypatch.setattr(MS, "FitWriter", TrackingWriter)
     with pytest.raises(RuntimeError, match="synthetic epoch crash"):
         fit_driver.run_fit_driver(

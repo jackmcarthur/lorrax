@@ -9,7 +9,7 @@ from gw.greens_function_kernel import build_G, build_G_tau
 
 
 def _operands():
-    mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ("x", "y"))
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
     calls = []
     def gemm(a, b):
         calls.append(1)

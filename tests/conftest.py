@@ -6,8 +6,6 @@ process, otherwise ``jnp.complex128`` silently degrades to complex64
 into one process, so the first import wins — set the env here.
 """
 
-from file_io import restart_bundle
-
 import json as _json
 import os
 import sys as _sys
@@ -21,6 +19,8 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 # not own service-path setup.
 from runtime.source_closure import ensure_source_closure as _seal_sources
 _seal_sources(print_fn=lambda _line: None)
+
+from file_io import restart_bundle
 
 # Some test modules import JAX during collection, before any driver can enter
 # ``runtime.set_default_env``.  Route that early-import corner through the

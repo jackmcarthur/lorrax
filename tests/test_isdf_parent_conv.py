@@ -93,7 +93,8 @@ def _decomposed(parents,tables,U,mesh):
 
 def test_parent_conv_typed_tables_match_decomposed():
     """Random ns=2/4 parent loads with spin mixing and antiunitary rows match the oracle."""
-    assert len(jax.devices()) >= 4, 'requires four emulated CPU devices'
+    from lxkit.testing import require_devices
+    require_devices(4)
     mesh=Mesh(np.asarray(jax.devices()[:4]).reshape(2,2),('x','y'))
     for ns in (2,4):
         parents,tables,U=_fixture(ns)

@@ -59,8 +59,8 @@ def _zx(nb_zeta=60, b0=0, nk=64, ns=2, n_mu=191, enk=None):
         enk = np.tile(enk, (nk, 1))
     return {
         "restart_file": "/nowhere/isdf_tensors.h5",
-        "_h5_restart": {"band_window": np.array([b0, b0, b0 + 8,
-                                                 b0 + nb_zeta, b0 + nb_zeta])},
+        "band_window": np.array([b0, b0, b0 + 8,
+                                 b0 + nb_zeta, b0 + nb_zeta]),
         "psi": np.arange(nk * nb_zeta * ns * n_mu, dtype=np.complex128
                          ).reshape(nk, nb_zeta, ns, n_mu),
         "enk": enk,
@@ -161,7 +161,7 @@ def test_a_bundle_with_no_band_window_stamp_refuses():
     offset slices the wrong bands with every shape still matching."""
     vq = _vq()
     zx = _zx(nb_zeta=60, b0=0)
-    zx["_h5_restart"] = {}
+    zx.pop("band_window")
     with pytest.raises(SystemExit) as e:
         vq.refit_window_view(zx, (0, 20), log_fn=lambda *_: None)
     assert "band_window" in str(e.value)
@@ -170,7 +170,7 @@ def test_a_bundle_with_no_band_window_stamp_refuses():
 def test_a_stamp_that_disagrees_with_the_tensor_refuses():
     vq = _vq()
     zx = _zx(nb_zeta=60, b0=0)
-    zx["_h5_restart"]["band_window"] = np.array([0, 0, 8, 40, 40])
+    zx["band_window"] = np.array([0, 0, 8, 40, 40])
     with pytest.raises(SystemExit) as e:
         vq.refit_window_view(zx, (0, 20), log_fn=lambda *_: None)
     assert "disagree" in str(e.value)

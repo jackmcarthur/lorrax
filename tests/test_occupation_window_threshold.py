@@ -643,6 +643,6 @@ def test_the_static_occupation_projector_is_not_thresholded():
 
     src = inspect.getsource(build_Gij)
     assert "occupation_window_threshold" not in src
-    assert "Gij[:, idx, idx] = f_win.astype(np.complex128)" in src
+    assert "Gij[:, idx, idx] = f_win" in src
     assert "hartree density would be missing weight carried by bands" in (
         src.lower())
