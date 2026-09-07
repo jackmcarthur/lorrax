@@ -1,0 +1,1 @@
+CompiledMemoryStats(generated_code_size_in_bytes=2551872, argument_size_in_bytes=129763669, output_size_in_bytes=32768, alias_size_in_bytes=0, temp_size_in_bytes=2359296512, host_generated_code_size_in_bytes=0, host_argument_size_in_bytes=0, host_output_size_in_bytes=0, host_alias_size_in_bytes=0, host_temp_size_in_bytes=0)

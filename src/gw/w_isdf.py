@@ -208,7 +208,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     # "hoist this call out of every per-k/per-tau loop" instruction.
     g_plan = gemm_plan(
         mesh_xy, m=n_rmu_left * ns, k=nb_full,
-        n=n_rmu_right * ns, nq=nk,
+        n=n_rmu_right * ns, nq=nk if paired else expected_input_nk,
         dtype=jnp.complex128)
     if paired:
         from common.shard_map import shard_map

@@ -1,0 +1,10 @@
+{
+  "scope": "Optimized instruction census; async starts counted once, done instructions excluded. Complements the unchanged canonical analyzer.",
+  "modules": [
+    {
+      "file": "module_tau.jit__tau.gpu_after_optimizations.txt",
+      "collectives": {},
+      "instructions": []
+    }
+  ]
+}

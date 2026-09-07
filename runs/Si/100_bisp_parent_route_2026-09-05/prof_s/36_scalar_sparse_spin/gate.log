@@ -1,0 +1,15 @@
+A            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/99_psi_irr_zeta_2026-09-05/31_bisect_scalar_tau/7c5466be/eqp0.dat
+B            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/36_scalar_sparse_spin/eqp0.dat
+rows         224 over 8 k-points
+identical    224/224 E_qp rows agree to the printed digit
+max|dE_DFT|  0.000 ueV   (must be 0 for two arms of one deck)
+max|dE_qp|   0.000 ueV   at None
+VERDICT      PASS  (tolerance 0.0 ueV)
+A            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/99_psi_irr_zeta_2026-09-05/31_bisect_scalar_tau/7c5466be/eqp1.dat
+B            /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/36_scalar_sparse_spin/eqp1.dat
+rows         224 over 8 k-points
+identical    224/224 E_qp rows agree to the printed digit
+max|dE_DFT|  0.000 ueV   (must be 0 for two arms of one deck)
+max|dE_qp|   0.000 ueV   at None
+VERDICT      PASS  (tolerance 0.0 ueV)
+PASS: 224 complete printed state rows identical, including sigCC/sigTT/sigCT.

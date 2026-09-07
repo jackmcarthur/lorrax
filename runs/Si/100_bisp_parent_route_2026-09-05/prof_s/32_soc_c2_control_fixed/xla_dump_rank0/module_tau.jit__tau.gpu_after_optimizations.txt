@@ -1,0 +1,622 @@
+HloModule jit__tau, is_scheduled=true, entry_computation_layout={(c128[8,4,240,16]{3,2,1,0}, c128[8,16,4,240]{3,2,1,0}, c128[8,16,4,240]{3,2,1,0}, c128[8,4,240,16]{3,2,1,0}, f64[8,32]{1,0}, /*index=5*/pred[8,16]{1,0}, c128[1,64,240,240]{3,2,1,0}, c128[1,64,240,240]{3,2,1,0}, s32[1]{0}, f64[1,6]{1,0}, /*index=10*/pred[1]{0}, f64[], f64[], c128[])->c128[1,8,16,16]{3,2,1,0}}, allow_spmd_sharding_propagation_to_parameters={false,false,false,false,false,true,false,false,false,false,false,false,false,false}, allow_spmd_sharding_propagation_to_output={true}, num_partitions=4, frontend_attributes={fingerprint_before_lhs="231f3dc008d2c3c8ced7859c6c5d59a0"}
+
+FileNames
+1 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/32_soc_c2_control_fixed/reference_source/src/gw/ppm_tau_kernel.py"
+2 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/32_soc_c2_control_fixed/reference_source/src/gw/centroid_k_unfold.py"
+3 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/32_soc_c2_control_fixed/reference_source/services/symmetry_maps/src/symmetry_maps/maps.py"
+4 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/32_soc_c2_control_fixed/reference_source/services/distrib_la/src/distrib_la/matmul_plan.py"
+5 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/32_soc_c2_control_fixed/reference_source/src/ffi/fft.py"
+6 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/32_soc_c2_control_fixed/reference_source/src/gw/greens_function_kernel.py"
+7 "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/32_soc_c2_control_fixed/reference_source/src/common/contract_bands.py"
+
+FunctionNames
+1 "_get_sigma_kij_kernel.<locals>.kernel"
+2 "_get_sigma_kij_kernel.<locals>._kernel_impl"
+3 "_get_sigma_kij_kernel.<locals>._bracketed_face"
+4 "_get_sigma_kij_kernel.<locals>.unfold"
+5 "CentroidKUnfoldPlan.unfold_face"
+6 "unfold_wavefunction_local"
+7 "_build_kernel.<locals>._local"
+8 "_local_gemm_call"
+9 "make_gw_conv_ffi.<locals>._local"
+10 "_get_sigma_kij_kernel.<locals>._g_from_selector"
+11 "_local_gemm_call.<locals>.<genexpr>"
+12 "_stack_channels"
+13 "_stack_channels.<locals>._one"
+14 "build_G_tau"
+15 "build_G"
+16 "_build_G_face"
+17 "split_spin_centroid"
+18 "get_sigma_spatial_kernel.<locals>.conv_project"
+19 "_make_project_ri_reduce_scatter.<locals>.project"
+20 "_face_project_kernel.<locals>.project"
+21 "_face_project_kernel.<locals>._project_one"
+22 "build_shared_w_tau.<locals>._add"
+23 "merge_spin_centroid"
+24 "windowed_exp_iEt"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=411 end_line=411 column=23 end_column=23}
+2 {file_name_id=1 function_name_id=2 line=398 end_line=398 column=19 end_column=19}
+3 {file_name_id=1 function_name_id=3 line=363 end_line=363 column=14 end_column=14}
+4 {file_name_id=1 function_name_id=4 line=331 end_line=331 column=16 end_column=16}
+5 {file_name_id=2 function_name_id=5 line=118 end_line=118 column=16 end_column=16}
+6 {file_name_id=3 function_name_id=6 line=1113 end_line=1113 column=16 end_column=16}
+7 {file_name_id=4 function_name_id=7 line=290 end_line=290 column=15 end_column=15}
+8 {file_name_id=4 function_name_id=8 line=240 end_line=240 column=9 end_column=9}
+9 {file_name_id=5 function_name_id=9 line=529 end_line=529 column=15 end_column=15}
+10 {file_name_id=1 function_name_id=3 line=376 end_line=376 column=18 end_column=18}
+11 {file_name_id=1 function_name_id=10 line=340 end_line=340 column=17 end_column=17}
+12 {file_name_id=3 function_name_id=6 line=1110 end_line=1110 column=12 end_column=12}
+13 {file_name_id=4 function_name_id=8 line=237 end_line=237 column=4 end_column=4}
+14 {file_name_id=4 function_name_id=11 line=237 end_line=237 column=14 end_column=14}
+15 {file_name_id=3 function_name_id=6 line=1128 end_line=1128 column=12 end_column=12}
+16 {file_name_id=1 function_name_id=3 line=380 end_line=380 column=15 end_column=15}
+17 {file_name_id=1 function_name_id=12 line=293 end_line=293 column=11 end_column=11}
+18 {file_name_id=1 function_name_id=13 line=288 end_line=288 column=12 end_column=12}
+19 {file_name_id=1 function_name_id=10 line=349 end_line=349 column=19 end_column=19}
+20 {file_name_id=6 function_name_id=14 line=179 end_line=179 column=11 end_column=11}
+21 {file_name_id=6 function_name_id=15 line=72 end_line=72 column=11 end_column=11}
+22 {file_name_id=6 function_name_id=16 line=45 end_line=45 column=8 end_column=8}
+23 {file_name_id=7 function_name_id=17 line=241 end_line=241 column=11 end_column=11}
+24 {file_name_id=6 function_name_id=16 line=30 end_line=30 column=28 end_column=28}
+25 {file_name_id=3 function_name_id=6 line=1127 end_line=1127 column=12 end_column=12}
+26 {file_name_id=6 function_name_id=16 line=29 end_line=29 column=12 end_column=12}
+27 {file_name_id=1 function_name_id=18 line=210 end_line=210 column=15 end_column=15}
+28 {file_name_id=1 function_name_id=19 line=124 end_line=124 column=15 end_column=15}
+29 {file_name_id=7 function_name_id=20 line=399 end_line=399 column=19 end_column=19}
+30 {file_name_id=7 function_name_id=21 line=393 end_line=393 column=12 end_column=12}
+31 {file_name_id=4 function_name_id=8 line=239 end_line=239 column=15 end_column=15}
+32 {file_name_id=1 function_name_id=22 line=488 end_line=488 column=30 end_column=30}
+33 {file_name_id=7 function_name_id=21 line=390 end_line=390 column=23 end_column=23}
+34 {file_name_id=7 function_name_id=23 line=226 end_line=226 column=9 end_column=9}
+35 {file_name_id=1 function_name_id=4 line=333 end_line=333 column=16 end_column=16}
+36 {file_name_id=6 function_name_id=14 line=156 end_line=156 column=13 end_column=13}
+37 {file_name_id=6 function_name_id=24 line=139 end_line=139 column=12 end_column=12}
+38 {file_name_id=1 function_name_id=3 line=374 end_line=374 column=28 end_column=28}
+39 {file_name_id=1 function_name_id=3 line=373 end_line=373 column=38 end_column=38}
+40 {file_name_id=6 function_name_id=24 line=139 end_line=139 column=20 end_column=20}
+41 {file_name_id=6 function_name_id=24 line=139 end_line=139 column=26 end_column=26}
+42 {file_name_id=3 function_name_id=6 line=1121 end_line=1121 column=11 end_column=11}
+43 {file_name_id=3 function_name_id=6 line=1115 end_line=1115 column=16 end_column=16}
+44 {file_name_id=3 function_name_id=6 line=1114 end_line=1114 column=20 end_column=20}
+45 {file_name_id=1 function_name_id=22 line=488 end_line=488 column=12 end_column=12}
+46 {file_name_id=1 function_name_id=22 line=488 end_line=488 column=22 end_column=22}
+47 {file_name_id=1 function_name_id=22 line=488 end_line=488 column=37 end_column=37}
+48 {file_name_id=1 function_name_id=22 line=485 end_line=485 column=36 end_column=36}
+49 {file_name_id=1 function_name_id=22 line=482 end_line=482 column=20 end_column=20}
+50 {file_name_id=1 function_name_id=22 line=484 end_line=484 column=40 end_column=40}
+51 {file_name_id=1 function_name_id=22 line=484 end_line=484 column=49 end_column=49}
+52 {file_name_id=1 function_name_id=22 line=484 end_line=484 column=23 end_column=23}
+53 {file_name_id=1 function_name_id=22 line=484 end_line=484 column=31 end_column=31}
+54 {file_name_id=1 function_name_id=22 line=483 end_line=483 column=41 end_column=41}
+55 {file_name_id=1 function_name_id=22 line=483 end_line=483 column=49 end_column=49}
+56 {file_name_id=1 function_name_id=22 line=483 end_line=483 column=23 end_column=23}
+57 {file_name_id=1 function_name_id=22 line=483 end_line=483 column=32 end_column=32}
+58 {file_name_id=1 function_name_id=22 line=481 end_line=481 column=16 end_column=16}
+59 {file_name_id=1 function_name_id=22 line=481 end_line=481 column=17 end_column=17}
+60 {file_name_id=1 function_name_id=22 line=482 end_line=482 column=34 end_column=34}
+61 {file_name_id=1 function_name_id=22 line=482 end_line=482 column=39 end_column=39}
+62 {file_name_id=1 function_name_id=22 line=482 end_line=482 column=21 end_column=21}
+63 {file_name_id=1 function_name_id=22 line=482 end_line=482 column=25 end_column=25}
+64 {file_name_id=1 function_name_id=22 line=480 end_line=480 column=12 end_column=12}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=3}
+4 {file_location_id=4 parent_frame_id=1}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=1}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=1}
+10 {file_location_id=10 parent_frame_id=3}
+11 {file_location_id=11 parent_frame_id=11}
+12 {file_location_id=12 parent_frame_id=6}
+13 {file_location_id=13 parent_frame_id=8}
+14 {file_location_id=14 parent_frame_id=14}
+15 {file_location_id=15 parent_frame_id=6}
+16 {file_location_id=16 parent_frame_id=3}
+17 {file_location_id=17 parent_frame_id=17}
+18 {file_location_id=18 parent_frame_id=18}
+19 {file_location_id=19 parent_frame_id=11}
+20 {file_location_id=20 parent_frame_id=20}
+21 {file_location_id=21 parent_frame_id=21}
+22 {file_location_id=22 parent_frame_id=22}
+23 {file_location_id=23 parent_frame_id=23}
+24 {file_location_id=24 parent_frame_id=22}
+25 {file_location_id=1 parent_frame_id=25}
+26 {file_location_id=2 parent_frame_id=26}
+27 {file_location_id=10 parent_frame_id=27}
+28 {file_location_id=19 parent_frame_id=28}
+29 {file_location_id=20 parent_frame_id=29}
+30 {file_location_id=21 parent_frame_id=30}
+31 {file_location_id=24 parent_frame_id=31}
+32 {file_location_id=25 parent_frame_id=6}
+33 {file_location_id=26 parent_frame_id=22}
+34 {file_location_id=27 parent_frame_id=1}
+35 {file_location_id=28 parent_frame_id=35}
+36 {file_location_id=29 parent_frame_id=36}
+37 {file_location_id=30 parent_frame_id=37}
+38 {file_location_id=27 parent_frame_id=38}
+39 {file_location_id=28 parent_frame_id=39}
+40 {file_location_id=29 parent_frame_id=40}
+41 {file_location_id=30 parent_frame_id=41}
+42 {file_location_id=31 parent_frame_id=8}
+43 {file_location_id=32 parent_frame_id=1}
+44 {file_location_id=33 parent_frame_id=37}
+45 {file_location_id=34 parent_frame_id=45}
+46 {file_location_id=35 parent_frame_id=1}
+47 {file_location_id=5 parent_frame_id=47}
+48 {file_location_id=15 parent_frame_id=48}
+49 {file_location_id=36 parent_frame_id=20}
+50 {file_location_id=37 parent_frame_id=50}
+51 {file_location_id=38 parent_frame_id=3}
+52 {file_location_id=39 parent_frame_id=3}
+53 {file_location_id=40 parent_frame_id=50}
+54 {file_location_id=41 parent_frame_id=50}
+55 {file_location_id=25 parent_frame_id=48}
+56 {file_location_id=42 parent_frame_id=6}
+57 {file_location_id=42 parent_frame_id=48}
+58 {file_location_id=43 parent_frame_id=48}
+59 {file_location_id=43 parent_frame_id=6}
+60 {file_location_id=44 parent_frame_id=6}
+61 {file_location_id=44 parent_frame_id=48}
+62 {file_location_id=6 parent_frame_id=48}
+63 {file_location_id=45 parent_frame_id=1}
+64 {file_location_id=46 parent_frame_id=1}
+65 {file_location_id=47 parent_frame_id=1}
+66 {file_location_id=48 parent_frame_id=1}
+67 {file_location_id=49 parent_frame_id=1}
+68 {file_location_id=50 parent_frame_id=1}
+69 {file_location_id=51 parent_frame_id=1}
+70 {file_location_id=52 parent_frame_id=1}
+71 {file_location_id=53 parent_frame_id=1}
+72 {file_location_id=54 parent_frame_id=1}
+73 {file_location_id=55 parent_frame_id=1}
+74 {file_location_id=56 parent_frame_id=1}
+75 {file_location_id=57 parent_frame_id=1}
+76 {file_location_id=58 parent_frame_id=1}
+77 {file_location_id=59 parent_frame_id=1}
+78 {file_location_id=60 parent_frame_id=1}
+79 {file_location_id=61 parent_frame_id=1}
+80 {file_location_id=62 parent_frame_id=1}
+81 {file_location_id=63 parent_frame_id=1}
+82 {file_location_id=64 parent_frame_id=1}
+
+
+%fused_transpose (param_0.3: c128[8,16,16]) -> c128[1,8,16,16] {
+  %param_0.3 = c128[8,16,16]{2,1,0} parameter(0)
+  %bitcast.178.1 = c128[1,8,16,16]{3,2,1,0} bitcast(%param_0.3)
+  ROOT %transpose.154.1 = c128[1,8,16,16]{3,2,1,0} transpose(%bitcast.178.1), dimensions={0,1,3,2}, metadata={op_name="jit(_tau)/jit(kernel)/broadcast_in_dim" stack_frame_id=18}
+}
+
+%fused_transpose.1 (param_0.5: c128[64,960,960]) -> c128[64,4,240,4,240] {
+  %param_0.5 = c128[64,960,960]{2,1,0} parameter(0)
+  %bitcast.160.1 = c128[64,240,4,240,4]{4,3,2,1,0} bitcast(%param_0.5)
+  ROOT %transpose.85.1 = c128[64,4,240,4,240]{4,3,2,1,0} transpose(%bitcast.160.1), dimensions={0,4,3,2,1}, metadata={op_name="jit(_tau)/jit(kernel)/transpose" stack_frame_id=23}
+}
+
+%fused_transpose.2 (param_0.170: c128[64,7680,4]) -> c128[64,960,16] {
+  %param_0.170 = c128[64,7680,4]{2,1,0} parameter(0)
+  %slice.38.4 = c128[64,3840,4]{2,1,0} slice(%param_0.170), slice={[0:64], [3840:7680], [0:4]}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/qac,q...c->q...a/dot_general" stack_frame_id=48}
+  %real.26.3 = f64[64,3840,4]{2,1,0} real(%slice.38.4), metadata={op_name="jit(_tau)/jit(kernel)/real" stack_frame_id=31}
+  %imag.26.5 = f64[64,3840,4]{2,1,0} imag(%slice.38.4), metadata={op_name="jit(_tau)/jit(kernel)/imag" stack_frame_id=31}
+  %neg.30.3 = f64[64,3840,4]{2,1,0} negate(%imag.26.5), metadata={op_name="jit(_tau)/jit(kernel)/neg" stack_frame_id=31}
+  %complex.24.1 = c128[64,3840,4]{2,1,0} complex(%real.26.3, %neg.30.3), metadata={op_name="jit(_tau)/jit(kernel)/complex" stack_frame_id=31}
+  %bitcast.25.1 = c128[64,16,960]{2,1,0} bitcast(%complex.24.1), metadata={op_name="jit(_tau)/jit(kernel)/complex" stack_frame_id=31}
+  ROOT %transpose.94.1 = c128[64,960,16]{2,1,0} transpose(%bitcast.25.1), dimensions={0,2,1}, metadata={op_name="jit(_tau)/jit(kernel)/complex" stack_frame_id=31}
+}
+
+%fused_select (param_0.302: s32[64,1], param_1.308: pred[8,16], param_2.201: f64[], param_3.157: u32[4], param_4.129: u32[], param_5.85: f64[8,32], param_6.97: s32[4], param_7.79: c128[]) -> c128[64,16] {
+  %param_1.308 = pred[8,16]{1,0} parameter(1)
+  %iota.3.3 = s64[16]{0} iota(), iota_dimension=0, metadata={op_name="jit(_tau)/jit(kernel)/iota" stack_frame_id=3}
+  %param_6.97 = s32[4]{0} parameter(6)
+  %param_4.129 = u32[] parameter(4)
+  %dynamic-slice.17 = s32[1]{0} dynamic-slice(%param_6.97, %param_4.129), dynamic_slice_sizes={1}, metadata={op_name="jit(_tau)/jit(kernel)/iota" stack_frame_id=3}
+  %constant_425_1 = s32[1]{0} constant({16}), metadata={op_name="jit(_tau)/jit(kernel)/iota" stack_frame_id=3}
+  %multiply.9.3 = s32[1]{0} multiply(%dynamic-slice.17, %constant_425_1), metadata={op_name="jit(_tau)/jit(kernel)/iota" stack_frame_id=3}
+  %bitcast.16.9 = s32[] bitcast(%multiply.9.3), metadata={op_name="jit(_tau)/jit(kernel)/iota" stack_frame_id=3}
+  %convert.12.9 = s64[] convert(%bitcast.16.9), metadata={op_name="jit(_tau)/jit(kernel)/iota" stack_frame_id=3}
+  %broadcast.49.7 = s64[16]{0} broadcast(%convert.12.9), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/iota" stack_frame_id=3}
+  %add.122.5 = s64[16]{0} add(%iota.3.3, %broadcast.49.7), metadata={op_name="jit(_tau)/jit(kernel)/iota" stack_frame_id=3}
+  %constant_360_1 = s64[] constant(32)
+  %lt.122.3 = s64[16]{0} broadcast(%constant_360_1), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/lt" stack_frame_id=52}
+  %lt.123.3 = pred[16]{0} compare(%add.122.5, %lt.122.3), direction=LT, metadata={op_name="jit(_tau)/jit(kernel)/lt" stack_frame_id=52}
+  %and.89.1 = pred[8,16]{1,0} broadcast(%lt.123.3), dimensions={1}, metadata={op_name="jit(_tau)/jit(kernel)/and" stack_frame_id=51}
+  %and.90.1 = pred[8,16]{1,0} and(%param_1.308, %and.89.1), metadata={op_name="jit(_tau)/jit(kernel)/and" stack_frame_id=51}
+  %param_0.302 = s32[64,1]{1,0} parameter(0)
+  %gather.78.1 = pred[64,1,16]{2,0,1} gather(%and.90.1, %param_0.302), offset_dims={1,2}, collapsed_slice_dims={}, start_index_map={0}, index_vector_dim=1, slice_sizes={1,16}, metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %bitcast.17.1 = pred[64,16]{1,0} bitcast(%gather.78.1), metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %param_7.79 = c128[] parameter(7)
+  %constant_364_1 = c128[] constant((0, 1))
+  %jit.3.4 = c128[] multiply(%param_7.79, %constant_364_1), metadata={op_name="jit(_tau)/jit(kernel)/mul;jit(_tau)/jit"}
+  %neg.24.6 = c128[] negate(%jit.3.4), metadata={op_name="jit(_tau)/jit(kernel)/neg" stack_frame_id=53}
+  %broadcast.109.9 = c128[1,64,16]{2,1,0} broadcast(%neg.24.6), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/mul" stack_frame_id=53}
+  %param_5.85 = f64[8,32]{1,0} parameter(5)
+  %gather.79.11 = f64[64,1,32]{2,0,1} gather(%param_5.85, %param_0.302), offset_dims={1,2}, collapsed_slice_dims={}, start_index_map={0}, index_vector_dim=1, slice_sizes={1,32}, metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %bitcast.125.11 = f64[1,64,32]{2,1,0} bitcast(%gather.79.11)
+  %constant_366_1 = s32[] constant(0), metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %constant_426_1 = u32[1]{0} constant({0}), metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %param_3.157 = u32[4]{0} parameter(3)
+  %dynamic-slice.3.6 = u32[1]{0} dynamic-slice(%param_3.157, %param_4.129), dynamic_slice_sizes={1}, metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %constant_427_1 = u32[1]{0} constant({1}), metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %clamp.1.6 = u32[1]{0} clamp(%constant_426_1, %dynamic-slice.3.6, %constant_427_1), metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %convert.3.6 = s32[1]{0} convert(%clamp.1.6), metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %multiply.10.6 = s32[1]{0} multiply(%convert.3.6, %constant_425_1), metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %bitcast.18.11 = s32[] bitcast(%multiply.10.6), metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %dynamic-slice.13.11 = f64[1,64,16]{2,1,0} dynamic-slice(%bitcast.125.11, %constant_366_1, %constant_366_1, %bitcast.18.11), dynamic_slice_sizes={1,64,16}, metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %param_2.201 = f64[] parameter(2)
+  %broadcast.110.9 = f64[1,64,16]{2,1,0} broadcast(%param_2.201), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/sub" stack_frame_id=54}
+  %subtract.10 = f64[1,64,16]{2,1,0} subtract(%dynamic-slice.13.11, %broadcast.110.9), metadata={op_name="jit(_tau)/jit(kernel)/sub" stack_frame_id=54}
+  %convert.17.9 = c128[1,64,16]{2,1,0} convert(%subtract.10), metadata={op_name="jit(_tau)/jit(kernel)/convert_element_type" stack_frame_id=53}
+  %multiply.13.9 = c128[1,64,16]{2,1,0} multiply(%broadcast.109.9, %convert.17.9), metadata={op_name="jit(_tau)/jit(kernel)/mul" stack_frame_id=53}
+  %real.27.3 = f64[1,64,16]{2,1,0} real(%multiply.13.9), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %exponential.6 = f64[1,64,16]{2,1,0} exponential(%real.27.3), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %bitcast.19.9 = f64[64,16]{1,0} bitcast(%exponential.6), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %constant_368_1 = f64[] constant(inf)
+  %exp.292.3 = f64[64,16]{1,0} broadcast(%constant_368_1), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %exp.293.3 = pred[64,16]{1,0} compare(%bitcast.19.9, %exp.292.3), direction=EQ, metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %constant_369_1 = f64[] constant(0.5)
+  %broadcast.111.5 = f64[1,64,16]{2,1,0} broadcast(%constant_369_1), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %multiply.14.5 = f64[1,64,16]{2,1,0} multiply(%real.27.3, %broadcast.111.5), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %exponential.1.3 = f64[1,64,16]{2,1,0} exponential(%multiply.14.5), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %bitcast.20.12 = f64[64,16]{1,0} bitcast(%exponential.1.3), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %imag.27.3 = f64[1,64,16]{2,1,0} imag(%multiply.13.9), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %cosine.2 = f64[1,64,16]{2,1,0} cosine(%imag.27.3), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %bitcast.21.6 = f64[64,16]{1,0} bitcast(%cosine.2), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %exp.299.3 = f64[64,16]{1,0} multiply(%bitcast.20.12, %bitcast.21.6), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %exp.300.3 = f64[64,16]{1,0} multiply(%exp.299.3, %bitcast.20.12), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %exp.301.3 = f64[64,16]{1,0} multiply(%bitcast.19.9, %bitcast.21.6), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %exp.302.1 = f64[64,16]{1,0} select(%exp.293.3, %exp.300.3, %exp.301.3), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %constant_370_1 = f64[] constant(0)
+  %broadcast.112.3 = f64[1,64,16]{2,1,0} broadcast(%constant_370_1), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %compare.6.3 = pred[1,64,16]{2,1,0} compare(%imag.27.3, %broadcast.112.3), direction=EQ, metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %bitcast.22.3 = pred[64,16]{1,0} bitcast(%compare.6.3), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %exp.303.1 = f64[64,16]{1,0} broadcast(%constant_370_1), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %sine.2 = f64[1,64,16]{2,1,0} sine(%imag.27.3), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %bitcast.23.4 = f64[64,16]{1,0} bitcast(%sine.2), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %exp.306.3 = f64[64,16]{1,0} multiply(%bitcast.20.12, %bitcast.23.4), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %exp.307.5 = f64[64,16]{1,0} multiply(%exp.306.3, %bitcast.20.12), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %exp.308.3 = f64[64,16]{1,0} multiply(%bitcast.19.9, %bitcast.23.4), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %exp.309.3 = f64[64,16]{1,0} select(%exp.293.3, %exp.307.5, %exp.308.3), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %exp.310.3 = f64[64,16]{1,0} select(%bitcast.22.3, %exp.303.1, %exp.309.3), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %exp.311.1 = c128[64,16]{1,0} complex(%exp.302.1, %exp.310.3), metadata={op_name="jit(_tau)/jit(kernel)/exp" stack_frame_id=50}
+  %constant_371_1 = c128[] constant((0, 0))
+  %broadcast_in_dim.176.1 = c128[64,16]{1,0} broadcast(%constant_371_1), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/jit(_where)/broadcast_in_dim"}
+  ROOT %select_n.163.1 = c128[64,16]{1,0} select(%bitcast.17.1, %exp.311.1, %broadcast_in_dim.176.1), metadata={op_name="jit(_tau)/jit(kernel)/jit(_where)/select_n"}
+}
+
+%fused_concatenate (param_0.310: c128[8,4,240,16], param_1.315: s32[64,1], param_2.205: c128[8,16,4,240], param_3.154: pred[1,64,240], param_4.126: pred[1,64,240], param_5.82: c128[64,480], param_6.94: s32[1,64,480], param_7.76: u32[]) -> c128[64,7680,4] {
+  %param_3.154 = pred[1,64,240]{2,1,0} parameter(3)
+  %bitcast.3.3 = pred[64,240]{1,0} bitcast(%param_3.154), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/and"}
+  %broadcast.101.3 = pred[64,240,16,4]{3,2,1,0} broadcast(%bitcast.3.3), dimensions={0,1}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/broadcast_in_dim"}
+  %param_0.310 = c128[8,4,240,16]{3,2,1,0} parameter(0)
+  %param_1.315 = s32[64,1]{1,0} parameter(1)
+  %gather.69.3 = c128[64,1,4,240,16]{4,3,2,1,0} gather(%param_0.310, %param_1.315), offset_dims={1,2,3,4}, collapsed_slice_dims={}, start_index_map={0}, index_vector_dim=1, slice_sizes={1,4,240,16}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(_take)/gather"}
+  %bitcast.4.5 = c128[64,4,240,16]{3,2,1,0} bitcast(%gather.69.3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(_take)/gather"}
+  %iota.7.1 = s32[1,64,240]{2,1,0} iota(), iota_dimension=1
+  %param_6.94 = s32[1,64,480]{2,1,0} parameter(6)
+  %constant_366_2 = s32[] constant(0), metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %param_7.76 = u32[] parameter(7)
+  %constant_381_1 = u32[] constant(1), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %axis_index.23.2 = u32[] shift-right-logical(%param_7.76, %constant_381_1), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/axis_index" stack_frame_id=6}
+  %axis_index.24.1 = u32[] and(%axis_index.23.2, %constant_381_1), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/axis_index" stack_frame_id=6}
+  %axis_index.25.2 = s32[] convert(%axis_index.24.1), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/axis_index" stack_frame_id=6}
+  %constant_382_3 = s32[] constant(240), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %mul.76.1 = s32[] multiply(%axis_index.25.2, %constant_382_3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/mul" stack_frame_id=6}
+  %lt.128.1 = pred[] compare(%mul.76.1, %constant_366_2), direction=LT, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/lt" stack_frame_id=60}
+  %constant_383_3 = s32[] constant(480), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %add.125.1 = s32[] add(%mul.76.1, %constant_383_3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/add" stack_frame_id=60}
+  %select_n.169.2 = s32[] select(%lt.128.1, %add.125.1, %mul.76.1), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/select_n" stack_frame_id=60}
+  %dynamic-slice.11.16 = s32[1,64,240]{2,1,0} dynamic-slice(%param_6.94, %constant_366_2, %constant_366_2, %select_n.169.2), dynamic_slice_sizes={1,64,240}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/dynamic_slice" stack_frame_id=60}
+  %bitcast.49.21 = s32[1,1,64,240]{3,2,1,0} bitcast(%dynamic-slice.11.16)
+  %convert.13.21 = s64[1,1,64,240]{3,2,1,0} convert(%bitcast.49.21), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/convert_element_type"}
+  %constant_384_2 = s64[] constant(0), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %broadcast.97.6 = s64[1,1,64,240]{3,2,1,0} broadcast(%constant_384_2), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/lt"}
+  %compare.12 = pred[1,1,64,240]{3,2,1,0} compare(%convert.13.21, %broadcast.97.6), direction=LT, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/lt"}
+  %constant_385_3 = s64[] constant(240), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %broadcast.98.14 = s64[1,1,64,240]{3,2,1,0} broadcast(%constant_385_3), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/add"}
+  %add.141.5 = s64[1,1,64,240]{3,2,1,0} add(%convert.13.21, %broadcast.98.14), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/add"}
+  %select.9 = s64[1,1,64,240]{3,2,1,0} select(%compare.12, %add.141.5, %convert.13.21), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/select_n"}
+  %convert.14.3 = s32[1,1,64,240]{3,2,1,0} convert(%select.9), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/convert_element_type"}
+  %bitcast.60.5 = s32[1,64,240]{2,1,0} bitcast(%convert.14.3)
+  %concatenate.3.3 = s32[2,64,240]{2,1,0} concatenate(%iota.7.1, %bitcast.60.5), dimensions={0}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/gather"}
+  %bitcast.261.5 = s32[15360,2]{0,1} bitcast(%concatenate.3.3)
+  %gather.70.5 = c128[15360,1,4,1,16]{2,4,0,3,1} gather(%bitcast.4.5, %bitcast.261.5), offset_dims={1,2,3,4}, collapsed_slice_dims={}, start_index_map={0,2}, index_vector_dim=1, slice_sizes={1,4,1,16}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/gather"}
+  %bitcast.78.5 = c128[64,240,16,4]{3,2,1,0} bitcast(%gather.70.5)
+  %constant_389_1 = c128[] constant((nan, 0)), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %broadcast.102.3 = c128[64,240,16,4]{3,2,1,0} broadcast(%constant_389_1), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(_take)/broadcast_in_dim"}
+  %select.1.5 = c128[64,240,16,4]{3,2,1,0} select(%broadcast.101.3, %bitcast.78.5, %broadcast.102.3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/select_n"}
+  %param_5.82 = c128[64,480]{1,0} parameter(5)
+  %dynamic_slice.23.1 = c128[64,240]{1,0} dynamic-slice(%param_5.82, %constant_366_2, %select_n.169.2), dynamic_slice_sizes={64,240}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/dynamic_slice" stack_frame_id=59}
+  %broadcast.103.3 = c128[64,240,16,4]{3,2,1,0} broadcast(%dynamic_slice.23.1), dimensions={0,1}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/mul" stack_frame_id=56}
+  %multiply.11.3 = c128[64,240,16,4]{3,2,1,0} multiply(%select.1.5, %broadcast.103.3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/mul" stack_frame_id=56}
+  %bitcast.7.1 = c128[64,3840,4]{2,1,0} bitcast(%multiply.11.3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/transpose" stack_frame_id=32}
+  %param_4.126 = pred[1,64,240]{2,1,0} parameter(4)
+  %bitcast.10.3 = pred[64,240]{1,0} bitcast(%param_4.126), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/and"}
+  %broadcast.106.3 = pred[64,16,240,4]{3,2,1,0} broadcast(%bitcast.10.3), dimensions={0,2}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/broadcast_in_dim"}
+  %param_2.205 = c128[8,16,4,240]{3,2,1,0} parameter(2)
+  %gather.74.3 = c128[64,1,16,4,240]{4,3,2,1,0} gather(%param_2.205, %param_1.315), offset_dims={1,2,3,4}, collapsed_slice_dims={}, start_index_map={0}, index_vector_dim=1, slice_sizes={1,16,4,240}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(_take)/gather"}
+  %bitcast.11.5 = c128[64,16,4,240]{3,2,1,0} bitcast(%gather.74.3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(_take)/gather"}
+  %iota.8.1 = s32[1,64,240]{2,1,0} iota(), iota_dimension=1
+  %axis_index.26.1 = u32[] and(%param_7.76, %constant_381_1), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/axis_index" stack_frame_id=62}
+  %axis_index.27.2 = s32[] convert(%axis_index.26.1), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/axis_index" stack_frame_id=62}
+  %mul.80.1 = s32[] multiply(%axis_index.27.2, %constant_382_3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/mul" stack_frame_id=62}
+  %lt.133.1 = pred[] compare(%mul.80.1, %constant_366_2), direction=LT, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/lt" stack_frame_id=61}
+  %add.131.1 = s32[] add(%mul.80.1, %constant_383_3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/add" stack_frame_id=61}
+  %select_n.179.2 = s32[] select(%lt.133.1, %add.131.1, %mul.80.1), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/select_n" stack_frame_id=61}
+  %dynamic-slice.12.16 = s32[1,64,240]{2,1,0} dynamic-slice(%param_6.94, %constant_366_2, %constant_366_2, %select_n.179.2), dynamic_slice_sizes={1,64,240}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/dynamic_slice" stack_frame_id=61}
+  %bitcast.87.21 = s32[1,1,64,240]{3,2,1,0} bitcast(%dynamic-slice.12.16)
+  %convert.15.21 = s64[1,1,64,240]{3,2,1,0} convert(%bitcast.87.21), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/convert_element_type"}
+  %compare.3.5 = pred[1,1,64,240]{3,2,1,0} compare(%convert.15.21, %broadcast.97.6), direction=LT, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/lt"}
+  %add.142.5 = s64[1,1,64,240]{3,2,1,0} add(%convert.15.21, %broadcast.98.14), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/add"}
+  %select.2.5 = s64[1,1,64,240]{3,2,1,0} select(%compare.3.5, %add.142.5, %convert.15.21), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/select_n"}
+  %convert.16.3 = s32[1,1,64,240]{3,2,1,0} convert(%select.2.5), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/convert_element_type"}
+  %bitcast.98.5 = s32[1,64,240]{2,1,0} bitcast(%convert.16.3)
+  %concatenate.4.3 = s32[2,64,240]{2,1,0} concatenate(%iota.8.1, %bitcast.98.5), dimensions={0}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/gather"}
+  %bitcast.265.5 = s32[15360,2]{0,1} bitcast(%concatenate.4.3)
+  %gather.75.5 = c128[15360,1,16,4,1]{4,3,2,1,0} gather(%bitcast.11.5, %bitcast.265.5), offset_dims={1,2,3,4}, collapsed_slice_dims={}, start_index_map={0,3}, index_vector_dim=1, slice_sizes={1,16,4,1}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/gather"}
+  %bitcast.13.7 = c128[64,240,16,4]{3,2,1,0} bitcast(%gather.75.5), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/gather"}
+  %transpose.149.7 = c128[64,16,240,4]{3,2,1,0} transpose(%bitcast.13.7), dimensions={0,2,1,3}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/gather"}
+  %broadcast.107.3 = c128[64,16,240,4]{3,2,1,0} broadcast(%constant_389_1), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(_take)/broadcast_in_dim"}
+  %select.3.5 = c128[64,16,240,4]{3,2,1,0} select(%broadcast.106.3, %transpose.149.7, %broadcast.107.3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/select_n"}
+  %dynamic_slice.25.1 = c128[64,240]{1,0} dynamic-slice(%param_5.82, %constant_366_2, %select_n.179.2), dynamic_slice_sizes={64,240}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/dynamic_slice" stack_frame_id=58}
+  %broadcast.108.3 = c128[64,16,240,4]{3,2,1,0} broadcast(%dynamic_slice.25.1), dimensions={0,2}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/mul" stack_frame_id=57}
+  %multiply.12.3 = c128[64,16,240,4]{3,2,1,0} multiply(%select.3.5, %broadcast.108.3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/mul" stack_frame_id=57}
+  %bitcast.14.1 = c128[64,3840,4]{2,1,0} bitcast(%multiply.12.3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/transpose" stack_frame_id=55}
+  ROOT %concatenate.2.1 = c128[64,7680,4]{2,1,0} concatenate(%bitcast.7.1, %bitcast.14.1), dimensions={1}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/transpose" stack_frame_id=32}
+}
+
+%fused_select.1 (param_0.303: c128[1,64,240,240], param_1.309: c128[], param_2.202: c128[1,64,240,240], param_3.151: pred[1], param_4.123: f64[], param_5.79: f64[1,6]) -> c128[64,240,240] {
+  %param_2.202 = c128[1,64,240,240]{3,2,1,0} parameter(2)
+  %bitcast.28.25 = c128[64,240,240]{2,1,0} bitcast(%param_2.202), metadata={op_name="Omega_poles"}
+  %real.22.3 = f64[64,240,240]{2,1,0} real(%bitcast.28.25), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/real" stack_frame_id=82}
+  %param_5.79 = f64[1,6]{1,0} parameter(5)
+  %slice.31.1 = f64[1,1]{1,0} slice(%param_5.79), slice={[0:1], [0:1]}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/slice" stack_frame_id=81}
+  %bitcast.29.5 = f64[] bitcast(%slice.31.1), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/slice" stack_frame_id=81}
+  %gt.20.5 = f64[64,240,240]{2,1,0} broadcast(%bitcast.29.5), dimensions={}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/gt" stack_frame_id=80}
+  %gt.21.3 = pred[64,240,240]{2,1,0} compare(%real.22.3, %gt.20.5), direction=GT, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/gt" stack_frame_id=80}
+  %bitcast.30.15 = f64[6]{0} bitcast(%param_5.79), metadata={op_name="bounds"}
+  %slice.32.3 = f64[1]{0} slice(%bitcast.30.15), slice={[1:2]}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/slice" stack_frame_id=79}
+  %bitcast.31.7 = f64[] bitcast(%slice.32.3), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/slice" stack_frame_id=79}
+  %le.102.7 = f64[64,240,240]{2,1,0} broadcast(%bitcast.31.7), dimensions={}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/le" stack_frame_id=78}
+  %le.103.5 = pred[64,240,240]{2,1,0} compare(%real.22.3, %le.102.7), direction=LE, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/le" stack_frame_id=78}
+  %and.91.3 = pred[64,240,240]{2,1,0} and(%gt.21.3, %le.103.5), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/and" stack_frame_id=67}
+  %imag.22.11 = f64[64,240,240]{2,1,0} imag(%bitcast.28.25), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/imag" stack_frame_id=77}
+  %neg.26.9 = f64[64,240,240]{2,1,0} negate(%imag.22.11), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/neg" stack_frame_id=76}
+  %slice.33.3 = f64[1]{0} slice(%bitcast.30.15), slice={[2:3]}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/slice" stack_frame_id=75}
+  %bitcast.32.7 = f64[] bitcast(%slice.33.3), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/slice" stack_frame_id=75}
+  %ge.100.7 = f64[64,240,240]{2,1,0} broadcast(%bitcast.32.7), dimensions={}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/ge" stack_frame_id=74}
+  %ge.101.5 = pred[64,240,240]{2,1,0} compare(%neg.26.9, %ge.100.7), direction=GE, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/ge" stack_frame_id=74}
+  %and.92.3 = pred[64,240,240]{2,1,0} and(%and.91.3, %ge.101.5), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/and" stack_frame_id=67}
+  %slice.34.3 = f64[1]{0} slice(%bitcast.30.15), slice={[3:4]}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/slice" stack_frame_id=73}
+  %bitcast.33.7 = f64[] bitcast(%slice.34.3), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/slice" stack_frame_id=73}
+  %gt.22.7 = f64[64,240,240]{2,1,0} broadcast(%bitcast.33.7), dimensions={}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/gt" stack_frame_id=72}
+  %gt.23.5 = pred[64,240,240]{2,1,0} compare(%neg.26.9, %gt.22.7), direction=GT, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/gt" stack_frame_id=72}
+  %and.93.3 = pred[64,240,240]{2,1,0} and(%and.92.3, %gt.23.5), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/and" stack_frame_id=67}
+  %slice.35.3 = f64[1]{0} slice(%bitcast.30.15), slice={[4:5]}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/slice" stack_frame_id=71}
+  %bitcast.34.7 = f64[] bitcast(%slice.35.3), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/slice" stack_frame_id=71}
+  %lt.124.7 = f64[64,240,240]{2,1,0} broadcast(%bitcast.34.7), dimensions={}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/lt" stack_frame_id=70}
+  %lt.125.5 = pred[64,240,240]{2,1,0} compare(%neg.26.9, %lt.124.7), direction=LT, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/lt" stack_frame_id=70}
+  %and.94.3 = pred[64,240,240]{2,1,0} and(%and.93.3, %lt.125.5), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/and" stack_frame_id=67}
+  %slice.36.3 = f64[1]{0} slice(%bitcast.30.15), slice={[5:6]}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/slice" stack_frame_id=69}
+  %bitcast.35.7 = f64[] bitcast(%slice.36.3), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/slice" stack_frame_id=69}
+  %le.104.7 = f64[64,240,240]{2,1,0} broadcast(%bitcast.35.7), dimensions={}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/le" stack_frame_id=68}
+  %le.105.5 = pred[64,240,240]{2,1,0} compare(%neg.26.9, %le.104.7), direction=LE, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/le" stack_frame_id=68}
+  %and.95.3 = pred[64,240,240]{2,1,0} and(%and.94.3, %le.105.5), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/and" stack_frame_id=67}
+  %param_0.303 = c128[1,64,240,240]{3,2,1,0} parameter(0)
+  %bitcast.36.3 = c128[64,240,240]{2,1,0} bitcast(%param_0.303), metadata={op_name="B_poles"}
+  %param_3.151 = pred[1]{0} parameter(3)
+  %bitcast.37.3 = pred[] bitcast(%param_3.151), metadata={op_name="phase_real"}
+  %select_n.164.3 = pred[64,240,240]{2,1,0} broadcast(%bitcast.37.3), dimensions={}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/jit(_where)/select_n"}
+  %convert_element_type.48.7 = c128[64,240,240]{2,1,0} convert(%real.22.3), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/convert_element_type" stack_frame_id=66}
+  %select_n.165.9 = c128[64,240,240]{2,1,0} select(%select_n.164.3, %convert_element_type.48.7, %bitcast.28.25), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/jit(_where)/select_n"}
+  %param_4.123 = f64[] parameter(4)
+  %convert_element_type.49.1 = c128[] convert(%param_4.123), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/convert_element_type" stack_frame_id=65}
+  %sub.18.9 = c128[64,240,240]{2,1,0} broadcast(%convert_element_type.49.1), dimensions={}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/sub" stack_frame_id=65}
+  %sub.19.9 = c128[64,240,240]{2,1,0} subtract(%select_n.165.9, %sub.18.9), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/sub" stack_frame_id=65}
+  %param_1.309 = c128[] parameter(1)
+  %mul.73.7 = c128[64,240,240]{2,1,0} broadcast(%param_1.309), dimensions={}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/mul" stack_frame_id=43}
+  %mul.74.7 = c128[64,240,240]{2,1,0} multiply(%sub.19.9, %mul.73.7), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/mul" stack_frame_id=43}
+  %exp.312.3 = f64[64,240,240]{2,1,0} real(%mul.74.7), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.313.4 = f64[64,240,240]{2,1,0} exponential(%exp.312.3), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %constant_368_2 = f64[] constant(inf)
+  %exp.314.3 = f64[64,240,240]{2,1,0} broadcast(%constant_368_2), dimensions={}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.315.3 = pred[64,240,240]{2,1,0} compare(%exp.313.4, %exp.314.3), direction=EQ, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %constant_369_2 = f64[] constant(0.5)
+  %exp.316.3 = f64[64,240,240]{2,1,0} broadcast(%constant_369_2), dimensions={}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.317.3 = f64[64,240,240]{2,1,0} multiply(%exp.312.3, %exp.316.3), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.318.1 = f64[64,240,240]{2,1,0} exponential(%exp.317.3), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.319.3 = f64[64,240,240]{2,1,0} imag(%mul.74.7), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.320.1 = f64[64,240,240]{2,1,0} cosine(%exp.319.3), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.321.5 = f64[64,240,240]{2,1,0} multiply(%exp.318.1, %exp.320.1), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.322.5 = f64[64,240,240]{2,1,0} multiply(%exp.321.5, %exp.318.1), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.323.3 = f64[64,240,240]{2,1,0} multiply(%exp.313.4, %exp.320.1), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.324.3 = f64[64,240,240]{2,1,0} select(%exp.315.3, %exp.322.5, %exp.323.3), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %constant_370_2 = f64[] constant(0)
+  %exp.325.6 = f64[64,240,240]{2,1,0} broadcast(%constant_370_2), dimensions={}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.326.3 = pred[64,240,240]{2,1,0} compare(%exp.319.3, %exp.325.6), direction=EQ, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.327.5 = f64[64,240,240]{2,1,0} sine(%exp.319.3), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.328.7 = f64[64,240,240]{2,1,0} multiply(%exp.318.1, %exp.327.5), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.329.7 = f64[64,240,240]{2,1,0} multiply(%exp.328.7, %exp.318.1), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.330.5 = f64[64,240,240]{2,1,0} multiply(%exp.313.4, %exp.327.5), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.331.5 = f64[64,240,240]{2,1,0} select(%exp.315.3, %exp.329.7, %exp.330.5), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.332.3 = f64[64,240,240]{2,1,0} select(%exp.326.3, %exp.325.6, %exp.331.5), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %exp.333.1 = c128[64,240,240]{2,1,0} complex(%exp.324.3, %exp.332.3), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/exp" stack_frame_id=64}
+  %mul.75.3 = c128[64,240,240]{2,1,0} multiply(%bitcast.36.3, %exp.333.1), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/mul" stack_frame_id=63}
+  %constant_371_2 = c128[] constant((0, 0))
+  %broadcast_in_dim.177.1 = c128[64,240,240]{2,1,0} broadcast(%constant_371_2), dimensions={}, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/jit(_where)/broadcast_in_dim"}
+  ROOT %select_n.166.1 = c128[64,240,240]{2,1,0} select(%and.95.3, %mul.75.3, %broadcast_in_dim.177.1), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/jit(_where)/select_n"}
+}
+
+%fused_multiply (param_0.158: c128[64,16], param_1.138: c128[64,7680,4]) -> c128[64,16,240,4] {
+  %param_1.138 = c128[64,7680,4]{2,1,0} parameter(1)
+  %slice.37.1 = c128[64,3840,4]{2,1,0} slice(%param_1.138), slice={[0:64], [0:3840], [0:4]}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/qac,q...c->q...a/dot_general" stack_frame_id=15}
+  %bitcast.15.3 = c128[64,240,16,4]{3,2,1,0} bitcast(%slice.37.1), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/qac,q...c->q...a/dot_general" stack_frame_id=15}
+  %transpose.150.3 = c128[64,16,240,4]{3,2,1,0} transpose(%bitcast.15.3), dimensions={0,2,1,3}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/qac,q...c->q...a/dot_general" stack_frame_id=15}
+  %param_0.158 = c128[64,16]{1,0} parameter(0)
+  %broadcast.113.1 = c128[64,16,240,4]{3,2,1,0} broadcast(%param_0.158), dimensions={0,1}, metadata={op_name="jit(_tau)/jit(kernel)/mul" stack_frame_id=33}
+  ROOT %multiply.15.1 = c128[64,16,240,4]{3,2,1,0} multiply(%transpose.150.3, %broadcast.113.1), metadata={op_name="jit(_tau)/jit(kernel)/mul" stack_frame_id=33}
+}
+
+%fused_transpose.3 (param_0.197: c128[8,16,4,240]) -> c128[8,240,4,16] {
+  %param_0.197 = c128[8,16,4,240]{3,2,1,0} parameter(0)
+  %real.20.1 = f64[8,16,4,240]{3,2,1,0} real(%param_0.197), metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/real" stack_frame_id=41}
+  %imag.20.1 = f64[8,16,4,240]{3,2,1,0} imag(%param_0.197), metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/imag" stack_frame_id=41}
+  %neg.23.1 = f64[8,16,4,240]{3,2,1,0} negate(%imag.20.1), metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/neg" stack_frame_id=41}
+  %complex.17.1 = c128[8,16,4,240]{3,2,1,0} complex(%real.20.1, %neg.23.1), metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/complex" stack_frame_id=41}
+  ROOT %transpose.148.1 = c128[8,240,4,16]{3,2,1,0} transpose(%complex.17.1), dimensions={0,3,2,1}, metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/complex" stack_frame_id=41}
+}
+
+%fused_and (param_0.309: s32[1,64,480], param_1.314: u32[]) -> pred[1,64,240] {
+  %param_0.309 = s32[1,64,480]{2,1,0} parameter(0)
+  %constant_366_4 = s32[] constant(0), metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %param_1.314 = u32[] parameter(1)
+  %constant_381_2 = u32[] constant(1), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %axis_index.23.1 = u32[] shift-right-logical(%param_1.314, %constant_381_2), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/axis_index" stack_frame_id=6}
+  %axis_index.24.2 = u32[] and(%axis_index.23.1, %constant_381_2), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/axis_index" stack_frame_id=6}
+  %axis_index.25.1 = s32[] convert(%axis_index.24.2), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/axis_index" stack_frame_id=6}
+  %constant_382_1 = s32[] constant(240), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %mul.76.2 = s32[] multiply(%axis_index.25.1, %constant_382_1), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/mul" stack_frame_id=6}
+  %lt.128.2 = pred[] compare(%mul.76.2, %constant_366_4), direction=LT, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/lt" stack_frame_id=60}
+  %constant_383_1 = s32[] constant(480), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %add.125.2 = s32[] add(%mul.76.2, %constant_383_1), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/add" stack_frame_id=60}
+  %select_n.169.1 = s32[] select(%lt.128.2, %add.125.2, %mul.76.2), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/select_n" stack_frame_id=60}
+  %dynamic-slice.11.14 = s32[1,64,240]{2,1,0} dynamic-slice(%param_0.309, %constant_366_4, %constant_366_4, %select_n.169.1), dynamic_slice_sizes={1,64,240}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/dynamic_slice" stack_frame_id=60}
+  %bitcast.49.19 = s32[1,1,64,240]{3,2,1,0} bitcast(%dynamic-slice.11.14)
+  %convert.13.19 = s64[1,1,64,240]{3,2,1,0} convert(%bitcast.49.19), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/convert_element_type"}
+  %constant_384_3 = s64[] constant(0), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %broadcast.97.4 = s64[1,1,64,240]{3,2,1,0} broadcast(%constant_384_3), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/lt"}
+  %compare.10 = pred[1,1,64,240]{3,2,1,0} compare(%convert.13.19, %broadcast.97.4), direction=LT, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/lt"}
+  %constant_385_2 = s64[] constant(240), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %broadcast.98.22 = s64[1,1,64,240]{3,2,1,0} broadcast(%constant_385_2), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/add"}
+  %add.141.13 = s64[1,1,64,240]{3,2,1,0} add(%convert.13.19, %broadcast.98.22), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/add"}
+  %select.17 = s64[1,1,64,240]{3,2,1,0} select(%compare.10, %add.141.13, %convert.13.19), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/select_n"}
+  %convert.14.11 = s32[1,1,64,240]{3,2,1,0} convert(%select.17), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/convert_element_type"}
+  %bitcast.60.9 = s32[1,64,240]{2,1,0} bitcast(%convert.14.11)
+  %broadcast.99.4 = s32[1,64,240]{2,1,0} broadcast(%constant_366_4), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/ge"}
+  %compare.1.3 = pred[1,64,240]{2,1,0} compare(%bitcast.60.9, %broadcast.99.4), direction=GE, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/ge"}
+  %constant_386_2 = s32[] constant(239), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %broadcast.100.4 = s32[1,64,240]{2,1,0} broadcast(%constant_386_2), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/le"}
+  %compare.2.3 = pred[1,64,240]{2,1,0} compare(%bitcast.60.9, %broadcast.100.4), direction=LE, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/le"}
+  ROOT %and.102.1 = pred[1,64,240]{2,1,0} and(%compare.1.3, %compare.2.3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/and"}
+}
+
+%fused_and.1 (param_0.308: s32[1,64,480], param_1.313: u32[]) -> pred[1,64,240] {
+  %param_0.308 = s32[1,64,480]{2,1,0} parameter(0)
+  %constant_366_3 = s32[] constant(0), metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %param_1.313 = u32[] parameter(1)
+  %constant_381_3 = u32[] constant(1), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %axis_index.26.2 = u32[] and(%param_1.313, %constant_381_3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/axis_index" stack_frame_id=62}
+  %axis_index.27.1 = s32[] convert(%axis_index.26.2), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/axis_index" stack_frame_id=62}
+  %constant_382_2 = s32[] constant(240), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %mul.80.2 = s32[] multiply(%axis_index.27.1, %constant_382_2), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/mul" stack_frame_id=62}
+  %lt.133.2 = pred[] compare(%mul.80.2, %constant_366_3), direction=LT, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/lt" stack_frame_id=61}
+  %constant_383_2 = s32[] constant(480), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %add.131.2 = s32[] add(%mul.80.2, %constant_383_2), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/add" stack_frame_id=61}
+  %select_n.179.1 = s32[] select(%lt.133.2, %add.131.2, %mul.80.2), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/select_n" stack_frame_id=61}
+  %dynamic-slice.12.14 = s32[1,64,240]{2,1,0} dynamic-slice(%param_0.308, %constant_366_3, %constant_366_3, %select_n.179.1), dynamic_slice_sizes={1,64,240}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/dynamic_slice" stack_frame_id=61}
+  %bitcast.87.19 = s32[1,1,64,240]{3,2,1,0} bitcast(%dynamic-slice.12.14)
+  %convert.15.19 = s64[1,1,64,240]{3,2,1,0} convert(%bitcast.87.19), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/convert_element_type"}
+  %constant_384_1 = s64[] constant(0), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %broadcast.97.8 = s64[1,1,64,240]{3,2,1,0} broadcast(%constant_384_1), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/lt"}
+  %compare.3.3 = pred[1,1,64,240]{3,2,1,0} compare(%convert.15.19, %broadcast.97.8), direction=LT, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/lt"}
+  %constant_385_1 = s64[] constant(240), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %broadcast.98.26 = s64[1,1,64,240]{3,2,1,0} broadcast(%constant_385_1), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/add"}
+  %add.142.13 = s64[1,1,64,240]{3,2,1,0} add(%convert.15.19, %broadcast.98.26), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/add"}
+  %select.2.13 = s64[1,1,64,240]{3,2,1,0} select(%compare.3.3, %add.142.13, %convert.15.19), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/select_n"}
+  %convert.16.11 = s32[1,1,64,240]{3,2,1,0} convert(%select.2.13), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/convert_element_type"}
+  %bitcast.98.9 = s32[1,64,240]{2,1,0} bitcast(%convert.16.11)
+  %broadcast.99.6 = s32[1,64,240]{2,1,0} broadcast(%constant_366_3), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/ge"}
+  %compare.4.3 = pred[1,64,240]{2,1,0} compare(%bitcast.98.9, %broadcast.99.6), direction=GE, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/ge"}
+  %constant_386_1 = s32[] constant(239), metadata={op_name="jit(_tau)/jit(kernel)/shard_map"}
+  %broadcast.100.6 = s32[1,64,240]{2,1,0} broadcast(%constant_386_1), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/le"}
+  %compare.5.3 = pred[1,64,240]{2,1,0} compare(%bitcast.98.9, %broadcast.100.6), direction=LE, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/le"}
+  ROOT %and.103.1 = pred[1,64,240]{2,1,0} and(%compare.4.3, %compare.5.3), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/and"}
+}
+
+%fused_broadcast () -> c128[64,960,960] {
+  %constant_371_3 = c128[] constant((0, 0))
+  ROOT %broadcast_in_dim.200.1 = c128[64,960,960]{2,1,0} broadcast(%constant_371_3), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=42}
+}
+
+%fused_broadcast.1 () -> c128[8,16,960] {
+  %constant_371_4 = c128[] constant((0, 0))
+  ROOT %broadcast_in_dim.201.1 = c128[8,16,960]{2,1,0} broadcast(%constant_371_4), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=42}
+}
+
+%fused_broadcast.2 () -> c128[8,16,16] {
+  %constant_371_5 = c128[] constant((0, 0))
+  ROOT %broadcast_in_dim.202.1 = c128[8,16,16]{2,1,0} broadcast(%constant_371_5), dimensions={}, metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=42}
+}
+
+%fused_multiply.1 (param_0.307: c128[]) -> c128[] {
+  %param_0.307 = c128[] parameter(0)
+  %constant_372_1 = c128[] constant((-0, -1))
+  ROOT %mul.72.1 = c128[] multiply(%param_0.307, %constant_372_1), metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/mul" stack_frame_id=43}
+}
+
+%wrapped_gather_computation (param_0.311: c128[64,4,240,4,240], param_1.316: s32[8,1]) -> c128[8,1,4,240,4,240] {
+  %param_0.311 = c128[64,4,240,4,240]{4,3,2,1,0} parameter(0)
+  %param_1.316 = s32[8,1]{1,0} parameter(1)
+  ROOT %gather.80.1 = c128[8,1,4,240,4,240]{2,3,4,5,0,1} gather(%param_0.311, %param_1.316), offset_dims={1,2,3,4,5}, collapsed_slice_dims={}, start_index_map={0}, index_vector_dim=1, slice_sizes={1,4,240,4,240}, metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/jit(_take)/gather"}
+}
+
+%wrapped_transpose_computation (param_0.312: c128[8,4,240,16]) -> c128[8,16,240,4] {
+  %param_0.312 = c128[8,4,240,16]{3,2,1,0} parameter(0)
+  ROOT %transpose.153.1 = c128[8,16,240,4]{3,2,1,0} transpose(%param_0.312), dimensions={0,3,2,1}, metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/transpose" stack_frame_id=45}
+}
+
+ENTRY %main.6_spmd (param.24: c128[8,4,240,16], param.25: c128[8,16,4,240], param.23: c128[8,16,4,240], param.35: c128[8,4,240,16], param.28: f64[8,32], param.26: pred[8,16], param.32: c128[1,64,240,240], param.30: c128[1,64,240,240], param.22: s32[1], param.31: f64[1,6], param.33: pred[1], param.29: f64[], param.34: f64[], param.27: c128[]) -> c128[1,8,16,16] {
+  %param.22 = s32[1]{0} parameter(8), sharding={replicated}, metadata={op_name="pole_indices"}
+  %axis_index.22.0 = u32[] partition-id(), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/axis_index" stack_frame_id=6}
+  %constant_413_0 = s32[1,64,480]{2,1,0} constant({...}), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(_take)/gather"}
+  %loop_and_fusion = pred[1,64,240]{2,1,0} fusion(%constant_413_0, %axis_index.22.0), kind=kLoop, calls=%fused_and, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/and"}
+  %loop_and_fusion.1 = pred[1,64,240]{2,1,0} fusion(%constant_413_0, %axis_index.22.0), kind=kLoop, calls=%fused_and.1, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/jit(take_along_axis)/and"}
+  %constant_361_0 = s32[64,1]{1,0} constant({...})
+  %constant_477_0 = c128[64,480]{1,0} constant({...}), metadata={op_name="jit(_tau)/jit(kernel)/shard_map/exp" stack_frame_id=12}
+  %param.24 = c128[8,4,240,16]{3,2,1,0} parameter(0), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="psi_coh_xn"}
+  %param.25 = c128[8,16,4,240]{3,2,1,0} parameter(1), sharding={devices=[1,2,1,2]<=[4]}, metadata={op_name="psi_coh_yr"}
+  %input_concatenate_fusion = c128[64,7680,4]{2,1,0} fusion(%param.24, %constant_361_0, %param.25, %loop_and_fusion, %loop_and_fusion.1, /*index=5*/%constant_477_0, %constant_413_0, %axis_index.22.0), kind=kInput, calls=%fused_concatenate, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/transpose" stack_frame_id=32}
+  %constant_424_0 = c128[64,4,4]{2,1,0} constant({...}), metadata={op_name="jit(_tau)/jit(kernel)/shard_map" stack_frame_id=11}
+  %custom-call.1 = (c128[64,7680,4]{2,1,0}, s8[4194304]{0}) custom-call(%input_concatenate_fusion, %constant_424_0), custom_call_target="__cublas$gemm", metadata={op_name="jit(_tau)/jit(kernel)/shard_map/qac,q...c->q...a/dot_general" stack_frame_id=15}, backend_config={"operation_queue_id":"0","wait_on_operation_queues":[],"gemm_backend_config":{"alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":["2"],"rhs_contracting_dimensions":["1"],"lhs_batch_dimensions":["0"],"rhs_batch_dimensions":["0"]},"alpha_imag":0,"precision_config":{"operand_precision":["HIGHEST","HIGHEST"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"30720","rhs_stride":"16","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0"},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}
+  %get-tuple-element.54.0 = c128[64,7680,4]{2,1,0} get-tuple-element(%custom-call.1), index=0, metadata={op_name="jit(_tau)/jit(kernel)/shard_map/qac,q...c->q...a/dot_general" stack_frame_id=15}
+  %constant_358_0 = s32[4]{0} constant({0, 1, 0, 1}), metadata={op_name="jit(_tau)/jit(kernel)/iota" stack_frame_id=3}
+  %constant_365_0 = u32[4]{0} constant({0, 1, 0, 1}), metadata={op_name="jit(_tau)/jit(kernel)/jit(_take)/gather"}
+  %param.26 = pred[8,16]{1,0} parameter(5), sharding={devices=[1,2,2]<=[2,2]T(1,0) last_tile_dim_replicate}, metadata={op_name="mask_A"}
+  %param.27 = c128[] parameter(13), sharding={replicated}, metadata={op_name="t_node"}
+  %param.28 = f64[8,32]{1,0} parameter(4), sharding={replicated}, metadata={op_name="E_A"}
+  %param.29 = f64[] parameter(11), sharding={replicated}, metadata={op_name="E_ref_A"}
+  %loop_select_fusion = c128[64,16]{1,0} fusion(%constant_361_0, %param.26, %param.29, %constant_365_0, %axis_index.22.0, /*index=5*/%param.28, %constant_358_0, %param.27), kind=kLoop, calls=%fused_select, metadata={op_name="jit(_tau)/jit(kernel)/jit(_where)/select_n"}
+  %loop_multiply_fusion = c128[64,16,240,4]{3,2,1,0} fusion(%loop_select_fusion, %get-tuple-element.54.0), kind=kLoop, calls=%fused_multiply, metadata={op_name="jit(_tau)/jit(kernel)/mul" stack_frame_id=33}
+  %bitcast.153.0 = c128[64,16,960]{2,1,0} bitcast(%loop_multiply_fusion), metadata={op_name="jit(_tau)/jit(kernel)/jit(_local)/shard_map/transpose" stack_frame_id=14}
+  %input_transpose_fusion.1 = c128[64,960,16]{2,1,0} fusion(%get-tuple-element.54.0), kind=kInput, calls=%fused_transpose.2, metadata={op_name="jit(_tau)/jit(kernel)/complex" stack_frame_id=31}
+  %loop_broadcast_fusion = c128[64,960,960]{2,1,0} fusion(), kind=kLoop, calls=%fused_broadcast, metadata={op_name="jit(_tau)/jit(kernel)/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=42}
+  %ffi_call.12 = c128[64,960,960]{2,1,0} custom-call(%bitcast.153.0, %input_transpose_fusion.1, %loop_broadcast_fusion), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[64,16,960]{2,1,0}, c128[64,960,16]{2,1,0}, c128[64,960,960]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(_tau)/jit(kernel)/jit(_local)/shard_map/ffi_call" stack_frame_id=8}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 93903486437120 : i64, k = 32 : i64, lld_a = 960 : i64, lld_b = 16 : i64, lld_c = 960 : i64, m = 1920 : i64, mb_a = 960 : i64, mb_b = 16 : i64, mb_c = 960 : i64, n = 1920 : i64, nb_a = 16 : i64, nb_b = 960 : i64, nb_c = 960 : i64, nq = 64 : i64, transa = 0 : i64, transb = 0 : i64}
+  %loop_transpose_fusion = c128[64,4,240,4,240]{4,3,2,1,0} fusion(%ffi_call.12), kind=kLoop, calls=%fused_transpose.1, metadata={op_name="jit(_tau)/jit(kernel)/transpose" stack_frame_id=23}
+  %loop_multiply_fusion.1 = c128[] fusion(%param.27), kind=kLoop, calls=%fused_multiply.1, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/mul" stack_frame_id=43}
+  %param.30 = c128[1,64,240,240]{3,2,1,0} parameter(7), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="Omega_poles"}
+  %param.31 = f64[1,6]{1,0} parameter(9), sharding={replicated}, metadata={op_name="bounds"}
+  %param.32 = c128[1,64,240,240]{3,2,1,0} parameter(6), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="B_poles"}
+  %param.33 = pred[1]{0} parameter(10), sharding={replicated}, metadata={op_name="phase_real"}
+  %param.34 = f64[] parameter(12), sharding={replicated}, metadata={op_name="E_ref_B"}
+  %loop_select_fusion.1 = c128[64,240,240]{2,1,0} fusion(%param.32, %loop_multiply_fusion.1, %param.30, %param.33, %param.34, /*index=5*/%param.31), kind=kLoop, calls=%fused_select.1, metadata={op_name="jit(_tau)/jit(_build)/while/body/closed_call/jit(_where)/select_n"}
+  %ffi_call.13 = c128[64,4,240,4,240]{4,3,2,1,0} custom-call(%loop_transpose_fusion, %loop_select_fusion.1), custom_call_target="lorrax_mklfft_gw_conv", operand_layout_constraints={c128[64,4,240,4,240]{4,3,2,1,0}, c128[64,240,240]{2,1,0}}, output_to_operand_aliasing={{}: (0, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/shard_map/ffi_call" stack_frame_id=9}, backend_config={nkx = 4 : i64, nky = 4 : i64, nkz = 4 : i64, scale_f = -1.562500e-02 : f64, scale_i = 1.250000e-01 : f64}
+  %constant_373_0 = s32[8,1]{1,0} constant({ {0}, {1}, {2}, {5}, {6}, {7}, {10}, {27} })
+  %wrapped_gather = c128[8,1,4,240,4,240]{2,3,4,5,0,1} fusion(%ffi_call.13, %constant_373_0), kind=kLoop, calls=%wrapped_gather_computation, metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/jit(_take)/gather"}
+  %bitcast.171.0 = c128[8,960,960]{2,1,0} bitcast(%wrapped_gather), metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/jit(_local)/shard_map/transpose" stack_frame_id=14}
+  %param.35 = c128[8,4,240,16]{3,2,1,0} parameter(3), sharding={devices=[1,1,2,2]<=[4]}, metadata={op_name="psi_proj_yn"}
+  %wrapped_transpose = c128[8,16,240,4]{3,2,1,0} fusion(%param.35), kind=kLoop, calls=%wrapped_transpose_computation, metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/transpose" stack_frame_id=45}
+  %bitcast.175.0 = c128[8,16,960]{2,1,0} bitcast(%wrapped_transpose), metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/jit(_local)/shard_map/transpose" stack_frame_id=14}
+  %loop_broadcast_fusion.1 = c128[8,16,960]{2,1,0} fusion(), kind=kLoop, calls=%fused_broadcast.1, metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=42}
+  %ffi_call.14 = c128[8,16,960]{2,1,0} custom-call(%bitcast.171.0, %bitcast.175.0, %loop_broadcast_fusion.1), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[8,960,960]{2,1,0}, c128[8,16,960]{2,1,0}, c128[8,16,960]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/jit(_local)/shard_map/ffi_call" stack_frame_id=8}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 93903486437120 : i64, k = 1920 : i64, lld_a = 960 : i64, lld_b = 960 : i64, lld_c = 960 : i64, m = 1920 : i64, mb_a = 960 : i64, mb_b = 960 : i64, mb_c = 960 : i64, n = 32 : i64, nb_a = 960 : i64, nb_b = 16 : i64, nb_c = 16 : i64, nq = 8 : i64, transa = 0 : i64, transb = 0 : i64}
+  %param.23 = c128[8,16,4,240]{3,2,1,0} parameter(2), sharding={devices=[1,2,1,2]<=[4]}, metadata={op_name="psi_proj_xr"}
+  %input_transpose_fusion.2 = c128[8,240,4,16]{3,2,1,0} fusion(%param.23), kind=kInput, calls=%fused_transpose.3, metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/complex" stack_frame_id=41}
+  %bitcast.45.0 = c128[8,960,16]{2,1,0} bitcast(%input_transpose_fusion.2), metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/jit(_local)/shard_map/transpose" stack_frame_id=14}
+  %loop_broadcast_fusion.2 = c128[8,16,16]{2,1,0} fusion(), kind=kLoop, calls=%fused_broadcast.2, metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/jit(_local)/shard_map/broadcast_in_dim" stack_frame_id=42}
+  %ffi_call.15 = c128[8,16,16]{2,1,0} custom-call(%bitcast.45.0, %ffi_call.14, %loop_broadcast_fusion.2), custom_call_target="lorrax_cublasmp_batched_gemm", operand_layout_constraints={c128[8,960,16]{2,1,0}, c128[8,16,960]{2,1,0}, c128[8,16,16]{2,1,0}}, output_to_operand_aliasing={{}: (2, {})}, api_version=API_VERSION_TYPED_FFI, metadata={op_name="jit(_tau)/jit(kernel)/jit(conv_project)/jit(_local)/shard_map/ffi_call" stack_frame_id=8}, backend_config={alpha_im = 0.000000e+00 : f64, alpha_re = 1.000000e+00 : f64, beta_im = 0.000000e+00 : f64, beta_re = 0.000000e+00 : f64, ctx_handle = 93903486437120 : i64, k = 1920 : i64, lld_a = 16 : i64, lld_b = 960 : i64, lld_c = 16 : i64, m = 32 : i64, mb_a = 16 : i64, mb_b = 960 : i64, mb_c = 16 : i64, n = 32 : i64, nb_a = 960 : i64, nb_b = 16 : i64, nb_c = 16 : i64, nq = 8 : i64, transa = 0 : i64, transb = 0 : i64}
+  ROOT %input_transpose_fusion = c128[1,8,16,16]{3,2,1,0} fusion(%ffi_call.15), kind=kInput, calls=%fused_transpose, metadata={op_name="jit(_tau)/jit(kernel)/broadcast_in_dim" stack_frame_id=18}
+}
+

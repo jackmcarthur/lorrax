@@ -1,0 +1,11 @@
+run_id: 36_scalar_sparse_spin
+system: Si
+pipeline: gwjax
+platform: perlmutter
+variant_of: /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/99_psi_irr_zeta_2026-09-05/20_g0w0_packed_order
+reused: copied zeta and rule caches; immutable input links
+pool: 58001243
+geometry: P4 one rank per GPU
+steps:
+  sigma:
+    state: complete

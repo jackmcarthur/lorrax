@@ -299,7 +299,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
     nk_g, nb_g, n_rmu_g, ns_g = (int(v) for v in g_shape)
     mu_s = n_rmu_g * ns_g
 
-    g_plan = gemm_plan(mesh_xy, m=mu_s, k=nb_g, n=mu_s, nq=nk,
+    g_plan = gemm_plan(mesh_xy, m=mu_s, k=nb_g, n=mu_s, nq=nk_g,
                        dtype=jnp.complex128)
     proj_fn = contract_bands_block_reshard(
         mesh_xy, layout="face", face_shape=tuple(g_shape))

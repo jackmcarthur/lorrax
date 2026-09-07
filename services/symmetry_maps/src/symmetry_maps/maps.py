@@ -1319,53 +1319,18 @@ def _get_unfold_isdf_operator_jit(
 
 
 def _rotate_open_spin_centroid_operator(spatial, spin):
-    """Apply ``U O U†`` without routing the fixed 2c case through GEMM.
-
-    The generic two-sided einsum is mathematically compact, but on CUDA XLA
-    lowers its two length-two contractions to two enormous skinny cuBLAS
-    GEMMs with a complete operator transpose on each side.  For ``ns=2``
-    the contraction is a fixed four-scalar block action.  Writing that block
-    explicitly keeps it in one elementwise fusion and avoids all four
-    full-operator layout moves used by a valence/conduction Green pair.
-
-    Other spin extents retain the generic expression.  This helper owns only
-    the spin representation; centroid permutation, nonsymmorphic phases and
-    the antiunitary endpoint rule remain in :func:`unfold_isdf_operator`.
-    """
+    """Apply the typed spin action with two local contractions over resident spin axes."""
     U = jnp.asarray(spin)
     ns = int(spatial.shape[1])
-    if int(spatial.shape[3]) != ns or tuple(U.shape[1:]) != (ns, ns):
-        raise ValueError(
-            "_rotate_open_spin_centroid_operator: spatial spin axes and "
-            f"spin action disagree: {spatial.shape}/{U.shape}.")
-    if ns == 1:
-        factor = U[:, 0, 0] * jnp.conj(U[:, 0, 0])
-        return spatial * factor[:, None, None, None, None]
-    if ns != 2:
-        return jnp.einsum(
-            'kac,kcmdn,kbd->kambn', U, spatial, jnp.conj(U),
-            optimize=True)
-
-    u00 = U[:, 0, 0, None, None]
-    u01 = U[:, 0, 1, None, None]
-    u10 = U[:, 1, 0, None, None]
-    u11 = U[:, 1, 1, None, None]
-    g00 = spatial[:, 0, :, 0, :]
-    g01 = spatial[:, 0, :, 1, :]
-    g10 = spatial[:, 1, :, 0, :]
-    g11 = spatial[:, 1, :, 1, :]
-    l00 = u00 * g00 + u01 * g10
-    l01 = u00 * g01 + u01 * g11
-    l10 = u10 * g00 + u11 * g10
-    l11 = u10 * g01 + u11 * g11
-    o00 = l00 * jnp.conj(u00) + l01 * jnp.conj(u01)
-    o01 = l00 * jnp.conj(u10) + l01 * jnp.conj(u11)
-    o10 = l10 * jnp.conj(u00) + l11 * jnp.conj(u01)
-    o11 = l10 * jnp.conj(u10) + l11 * jnp.conj(u11)
-    return jnp.stack((
-        jnp.stack((o00, o01), axis=2),
-        jnp.stack((o10, o11), axis=2),
-    ), axis=1)
+    if spatial.shape[3] != ns or U.shape[1:] != (ns, ns):
+        raise ValueError("Operator spin axes and typed spin action disagree.")
+    left = jnp.stack([sum(U[:, a, c, None, None, None] * spatial[:, c]
+                         for c in range(ns) if np.any(spin[:, a, c] != 0))
+                      for a in range(ns)], axis=1)
+    return jnp.stack([sum(left[:, :, :, d, :] *
+                         jnp.conj(U[:, b, d])[:, None, None, None]
+                         for d in range(ns) if np.any(spin[:, b, d] != 0))
+                      for b in range(ns)], axis=3)
 
 
 def unfold_spin_centroid_operator(
@@ -1382,6 +1347,8 @@ def unfold_spin_centroid_operator(
     logical_centroid_extent=None,
     axis_local=False,
     operator_transpose=None,
+    right_sym_perm=None,
+    right_L_table=None,
 ):
     r"""Unfold an open-spin centroid operator from k parents to full k.
 
@@ -1400,10 +1367,9 @@ def unfold_spin_centroid_operator(
     reverse ``t``.  The underlying ``pair_transpose`` rule also owns the
     nonsymmorphic lattice-wrap phase.
 
-    ``operator_transpose`` optionally supplies the same operator with its
-    complete endpoints already transposed, produced directly on X/Y shards.
-    The pair action retains its transpose rule and consumes that placement
-    without a processor-axis exchange.
+    ``operator_transpose`` supplies the conjugated-face operator on the
+    same X/Y shards. Its reverse-axis view supplies the lower owner's
+    pair-transpose rule without a processor-axis exchange.
 
     ``axis_local=True`` is accepted only when the supplied packed global
     source maps prove that every endpoint gather stays within its X/Y shard.
@@ -1416,11 +1382,6 @@ def unfold_spin_centroid_operator(
             "unfold_spin_centroid_operator: operator_ibz must have shape "
             f"(nk,s,mu,s,nu); got {shape}.")
     nk_parent, ns, n_left, _, n_right = shape
-    if n_left != n_right:
-        raise ValueError(
-            "unfold_spin_centroid_operator: the first implementation owns "
-            "one square centroid basis; mixed endpoint bases must use one "
-            "authenticated rectangular plan, not truncate or pad implicitly.")
     spin = np.asarray(spin_action_full, dtype=np.complex128)
     n_full = int(np.asarray(irr_idx).shape[0])
     if spin.shape != (n_full, ns, ns):
@@ -1473,6 +1434,13 @@ def unfold_spin_centroid_operator(
                 "unfold_spin_centroid_operator: merged endpoint extent "
                 f"{n_left * ns} is not divisible by X={px}.")
         local_perm = np.where(perm_ms < 0, -1, perm_ms % ((n_left * ns) // px))
+    right_perm = perm if right_sym_perm is None else np.asarray(right_sym_perm)
+    right_wraps = wraps if right_L_table is None else np.asarray(right_L_table)
+    right_perm_ms = (right_perm[:, :, None] * ns + spin_slot).reshape(
+        right_perm.shape[0], n_right * ns)
+    right_wraps_ms = np.repeat(right_wraps, ns, axis=1)
+    right_local_perm = (right_perm_ms % ((n_right * ns) // int(mesh_xy.shape['y']))
+                        if axis_local else None)
     pair = None
     if operator_transpose is not None:
         if operator_transpose.shape != operator_ibz.shape:
@@ -1492,8 +1460,10 @@ def unfold_spin_centroid_operator(
         trs_rule="pair_transpose",
         trs_pair_q_ibz=pair,
         left_logical_extent=logical_mu * ns,
-        right_logical_extent=logical_mu * ns,
+        right_logical_extent=n_right * ns,
         axis_local_sym_perm=local_perm,
+        right_sym_perm=right_perm_ms, right_L_table=right_wraps_ms,
+        right_axis_local_sym_perm=right_local_perm,
     )
     spatial = jnp.transpose(
         flat_full.reshape(n_full, n_left, ns, n_right, ns),

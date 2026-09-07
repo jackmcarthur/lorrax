@@ -1,0 +1,377 @@
+diff --git a/services/symmetry_maps/src/symmetry_maps/maps.py b/services/symmetry_maps/src/symmetry_maps/maps.py
+index 4d46774e..83eae712 100755
+--- a/services/symmetry_maps/src/symmetry_maps/maps.py
++++ b/services/symmetry_maps/src/symmetry_maps/maps.py
+@@ -1319,53 +1319,16 @@ def _get_unfold_isdf_operator_jit(
+ 
+ 
+ def _rotate_open_spin_centroid_operator(spatial, spin):
+-    """Apply ``U O U†`` without routing the fixed 2c case through GEMM.
+-
+-    The generic two-sided einsum is mathematically compact, but on CUDA XLA
+-    lowers its two length-two contractions to two enormous skinny cuBLAS
+-    GEMMs with a complete operator transpose on each side.  For ``ns=2``
+-    the contraction is a fixed four-scalar block action.  Writing that block
+-    explicitly keeps it in one elementwise fusion and avoids all four
+-    full-operator layout moves used by a valence/conduction Green pair.
+-
+-    Other spin extents retain the generic expression.  This helper owns only
+-    the spin representation; centroid permutation, nonsymmorphic phases and
+-    the antiunitary endpoint rule remain in :func:`unfold_isdf_operator`.
+-    """
++    """Apply the typed spin action with two local contractions over resident spin axes."""
+     U = jnp.asarray(spin)
+     ns = int(spatial.shape[1])
+-    if int(spatial.shape[3]) != ns or tuple(U.shape[1:]) != (ns, ns):
+-        raise ValueError(
+-            "_rotate_open_spin_centroid_operator: spatial spin axes and "
+-            f"spin action disagree: {spatial.shape}/{U.shape}.")
+-    if ns == 1:
+-        factor = U[:, 0, 0] * jnp.conj(U[:, 0, 0])
+-        return spatial * factor[:, None, None, None, None]
+-    if ns != 2:
+-        return jnp.einsum(
+-            'kac,kcmdn,kbd->kambn', U, spatial, jnp.conj(U),
+-            optimize=True)
+-
+-    u00 = U[:, 0, 0, None, None]
+-    u01 = U[:, 0, 1, None, None]
+-    u10 = U[:, 1, 0, None, None]
+-    u11 = U[:, 1, 1, None, None]
+-    g00 = spatial[:, 0, :, 0, :]
+-    g01 = spatial[:, 0, :, 1, :]
+-    g10 = spatial[:, 1, :, 0, :]
+-    g11 = spatial[:, 1, :, 1, :]
+-    l00 = u00 * g00 + u01 * g10
+-    l01 = u00 * g01 + u01 * g11
+-    l10 = u10 * g00 + u11 * g10
+-    l11 = u10 * g01 + u11 * g11
+-    o00 = l00 * jnp.conj(u00) + l01 * jnp.conj(u01)
+-    o01 = l00 * jnp.conj(u10) + l01 * jnp.conj(u11)
+-    o10 = l10 * jnp.conj(u00) + l11 * jnp.conj(u01)
+-    o11 = l10 * jnp.conj(u10) + l11 * jnp.conj(u11)
+-    return jnp.stack((
+-        jnp.stack((o00, o01), axis=2),
+-        jnp.stack((o10, o11), axis=2),
+-    ), axis=1)
++    if spatial.shape[3] != ns or U.shape[1:] != (ns, ns):
++        raise ValueError("Operator spin axes and typed spin action disagree.")
++    left = jnp.stack([sum(U[:, a, c, None, None, None] * spatial[:, c]
++                         for c in range(ns)) for a in range(ns)], axis=1)
++    return jnp.stack([sum(left[:, :, :, d, :] *
++                         jnp.conj(U[:, b, d])[:, None, None, None]
++                         for d in range(ns)) for b in range(ns)], axis=3)
+ 
+ 
+ def unfold_spin_centroid_operator(
+@@ -1382,6 +1345,8 @@ def unfold_spin_centroid_operator(
+     logical_centroid_extent=None,
+     axis_local=False,
+     operator_transpose=None,
++    right_sym_perm=None,
++    right_L_table=None,
+ ):
+     r"""Unfold an open-spin centroid operator from k parents to full k.
+ 
+@@ -1416,11 +1381,6 @@ def unfold_spin_centroid_operator(
+             "unfold_spin_centroid_operator: operator_ibz must have shape "
+             f"(nk,s,mu,s,nu); got {shape}.")
+     nk_parent, ns, n_left, _, n_right = shape
+-    if n_left != n_right:
+-        raise ValueError(
+-            "unfold_spin_centroid_operator: the first implementation owns "
+-            "one square centroid basis; mixed endpoint bases must use one "
+-            "authenticated rectangular plan, not truncate or pad implicitly.")
+     spin = np.asarray(spin_action_full, dtype=np.complex128)
+     n_full = int(np.asarray(irr_idx).shape[0])
+     if spin.shape != (n_full, ns, ns):
+@@ -1473,6 +1433,13 @@ def unfold_spin_centroid_operator(
+                 "unfold_spin_centroid_operator: merged endpoint extent "
+                 f"{n_left * ns} is not divisible by X={px}.")
+         local_perm = np.where(perm_ms < 0, -1, perm_ms % ((n_left * ns) // px))
++    right_perm = perm if right_sym_perm is None else np.asarray(right_sym_perm)
++    right_wraps = wraps if right_L_table is None else np.asarray(right_L_table)
++    right_perm_ms = (right_perm[:, :, None] * ns + spin_slot).reshape(
++        right_perm.shape[0], n_right * ns)
++    right_wraps_ms = np.repeat(right_wraps, ns, axis=1)
++    right_local_perm = (right_perm_ms % ((n_right * ns) // int(mesh_xy.shape['y']))
++                        if axis_local else None)
+     pair = None
+     if operator_transpose is not None:
+         if operator_transpose.shape != operator_ibz.shape:
+@@ -1492,8 +1459,10 @@ def unfold_spin_centroid_operator(
+         trs_rule="pair_transpose",
+         trs_pair_q_ibz=pair,
+         left_logical_extent=logical_mu * ns,
+-        right_logical_extent=logical_mu * ns,
++        right_logical_extent=n_right * ns,
+         axis_local_sym_perm=local_perm,
++        right_sym_perm=right_perm_ms, right_L_table=right_wraps_ms,
++        right_axis_local_sym_perm=right_local_perm,
+     )
+     spatial = jnp.transpose(
+         flat_full.reshape(n_full, n_left, ns, n_right, ns),
+diff --git a/src/gw/centroid_k_unfold.py b/src/gw/centroid_k_unfold.py
+index f4042666..269fc0dd 100644
+--- a/src/gw/centroid_k_unfold.py
++++ b/src/gw/centroid_k_unfold.py
+@@ -179,10 +179,12 @@ class CentroidKUnfoldPlan:
+             source[unused] = 0
+         return jnp.take(src, jnp.asarray(source), axis=axis)
+ 
+-    def unfold_operator(self, operator_parent, *, operator_transpose=None):
++    def unfold_operator(self, operator_parent, *, operator_transpose=None, right_plan=None):
+         """Transport ``(k_parent,s,mu,s,nu)`` to full k locally."""
++        right = self if right_plan is None else right_plan
+         return unfold_spin_centroid_operator(
+             operator_parent,
++            right_sym_perm=right.sym_perm, right_L_table=right.L_table,
+             operator_transpose=operator_transpose,
+             irr_idx=self.irr_idx,
+             sym_idx=self.sym_idx,
+diff --git a/src/gw/cohsex_sigma.py b/src/gw/cohsex_sigma.py
+index ae58bd94..f7c6866f 100644
+--- a/src/gw/cohsex_sigma.py
++++ b/src/gw/cohsex_sigma.py
+@@ -299,7 +299,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
+     nk_g, nb_g, n_rmu_g, ns_g = (int(v) for v in g_shape)
+     mu_s = n_rmu_g * ns_g
+ 
+-    g_plan = gemm_plan(mesh_xy, m=mu_s, k=nb_g, n=mu_s, nq=nk,
++    g_plan = gemm_plan(mesh_xy, m=mu_s, k=nb_g, n=mu_s, nq=nk_g,
+                        dtype=jnp.complex128)
+     proj_fn = contract_bands_block_reshard(
+         mesh_xy, layout="face", face_shape=tuple(g_shape))
+diff --git a/src/gw/greens_function_kernel.py b/src/gw/greens_function_kernel.py
+index c0092aac..a26f1cf2 100644
+--- a/src/gw/greens_function_kernel.py
++++ b/src/gw/greens_function_kernel.py
+@@ -1,10 +1,14 @@
+-"""Contract typed child centroid faces with one planned Green GEMM."""
++"""Build parent Green operators and transport them with typed local symmetry actions."""
++from functools import partial
++
++import jax
++import numpy as np
+ import jax.numpy as jnp
+ 
+ from common.contract_bands import merge_spin_centroid, split_spin_centroid
+ 
+ 
+-def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None):
++def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None):
+     """Form the weighted direct/conjugate outer product in the centroid-major GEMM order."""
+     if Gij is not None:
+         raise NotImplementedError(
+@@ -23,6 +27,17 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None):
+             "build_G(layout='face'): left psi_mun and right psi_nmu must "
+             "share (nk, nb, nspinor); got "
+             f"{psi_mun.shape} and {psi_nmu.shape}.")
++    if gemm is None:
++        from common.shard_map import shard_map
++        from jax.sharding import PartitionSpec as P
++        @partial(shard_map, mesh=mesh,
++                   in_specs=(P(None, None, 'x', None), P(None, None, None, 'y'), P()),
++                   out_specs=P(None, None, 'x', None, 'y'), check_vma=False)
++        def contract(left, right, weights):
++            return jnp.einsum('ksmn,kntr->ksmtr',
++                              left * weights[:, None, None, :], jnp.conj(right))
++        weights = jnp.ones((nk_, n_), dtype=psi_mun.dtype) if phases is None else phases
++        return contract(psi_mun, psi_nmu, weights)
+     A = merge_spin_centroid(psi_mun, 1, 2)          # (nk, mu*s, n) P(_,'x','y')
+     if phases is not None:
+         w = phases.astype(A.dtype)                  # (nk, n)
+@@ -48,28 +63,27 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None):
+ 
+ 
+ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
+-           gemm=None, k_unfold_plan=None):
+-    """Unfold parent faces before contracting weights with the conjugated endpoint."""
+-    if layout != 'face':
+-        raise ValueError(f"build_G: layout must be 'face', got {layout!r}")
+-    if gemm is None:
+-        raise ValueError("build_G requires gemm=<distrib_la.GemmPlan> built outside the kernel.")
+-    if k_unfold_plan is not None:
+-        from common.shard_map import shard_map
+-        from jax import jit
+-        from jax.sharding import PartitionSpec as P
+-        specs = (P(None, None, "x", "y"), P(None, "x", None, "y"))
+-        def unfold(left, right):
+-            return (k_unfold_plan.unfold_face(
+-                left, spin_axis=1, mu_axis=2, mesh_axis="x"),
+-                    k_unfold_plan.unfold_face(
+-                right, spin_axis=2, mu_axis=3, mesh_axis="y"))
+-        psi_xn, psi_yr = jit(shard_map(
+-            unfold, mesh=gemm.mesh, in_specs=specs,
+-            out_specs=specs, check_vma=False))(psi_xn, psi_yr)
+-        if phases is not None:
+-            phases = jnp.take(phases, jnp.asarray(k_unfold_plan.irr_idx), axis=0)
+-    return _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases)
++           gemm=None, k_unfold_plan=None, right_k_unfold_plan=None, real_weights=None):
++    """Build parent operators and transport both typed endpoints without processor exchange."""
++    if layout != 'face' or (gemm is None and k_unfold_plan is None):
++        raise ValueError("build_G requires canonical faces and a planned GEMM.")
++    G = _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases,
++                      mesh=None if k_unfold_plan is None else k_unfold_plan.mesh_xy)
++    if k_unfold_plan is None:
++        return G
++    transposed = None
++    if np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial):
++        if phases is None or not jnp.issubdtype(phases.dtype, jnp.complexfloating):
++            transposed = jnp.conj(G)
++        else:
++            transposed = jax.lax.cond(
++                (jnp.any(jnp.imag(phases) != 0) if real_weights is None
++                 else ~jnp.asarray(real_weights)),
++                lambda _: _build_G_face(jnp.conj(psi_xn), jnp.conj(psi_yr),
++                                        gemm=gemm, Gij=Gij, phases=phases, mesh=k_unfold_plan.mesh_xy),
++                lambda _: jnp.conj(G), operand=None)
++    return k_unfold_plan.unfold_operator(
++        G, operator_transpose=transposed, right_plan=right_k_unfold_plan)
+ 
+ 
+ def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
+@@ -178,4 +192,4 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
+                            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+     return build_G(
+         psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
+-        k_unfold_plan=k_unfold_plan)
++        k_unfold_plan=k_unfold_plan, real_weights=jnp.imag(t) == 0)
+diff --git a/src/gw/photon_sigma.py b/src/gw/photon_sigma.py
+index ce8b0ebf..ae97f69e 100644
+--- a/src/gw/photon_sigma.py
++++ b/src/gw/photon_sigma.py
+@@ -130,26 +130,19 @@ def _make_photon_static_class_kernel(
+         project = contract_bands_block_reshard(mesh_xy, layout="face",
+             face_shape=shapes[0], right_face_shape=shapes[1])
+         g_plan = gemm_plan(mesh_xy, m=shapes[0][2]*shapes[0][3], k=shapes[0][1],
+-            n=shapes[1][2]*shapes[1][3], nq=nk_tot, dtype=jnp.complex128)
++            n=shapes[1][2]*shapes[1][3], nq=shapes[0][0], dtype=jnp.complex128)
+         _photon_sigma_kernel_cache[plan_key] = project, g_plan
+     project, g_plan = _photon_sigma_kernel_cache[plan_key]
+     convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=False, lorentz=True)
+     head_convolve = (_make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=True, lorentz=True)
+                      if with_head else None)
+     rows = np.asarray(plans[0].parent_full_rows)
+-    specs = (P(None,None,"x","y"), P(None,"x",None,"y"))
+-
+-    def unfold(psi_mun, psi_nmu):
+-        direct = plans[0].unfold_face(psi_mun, spin_axis=1, mu_axis=2, mesh_axis="x")
+-        conjugated = plans[1].unfold_face(psi_nmu, spin_axis=2, mu_axis=3, mesh_axis="y")
+-        return direct, conjugated
+-    unfold = shard_map(unfold, mesh=mesh_xy, in_specs=specs,
+-                       out_specs=specs, check_vma=False)
+-
+     @jax.jit
+     def contract_class(left, right, weights, interaction, factor, vertices, head_interaction=None):
+-        direct, conjugated = unfold(left.psi_mun, right.psi_nmu)
+-        G = build_G(direct, conjugated, phases=weights, layout="face", gemm=g_plan)
++        weights = plans[0].parent_rows(weights)
++        G = build_G(left.psi_mun, right.psi_nmu, phases=jnp.real(weights),
++                    layout="face", gemm=g_plan, k_unfold_plan=plans[0],
++                    right_k_unfold_plan=plans[1])
+         sigma = convolve(G, interaction, factor, vertices)
+         result = project(left.psi_nmu, jnp.take(sigma, jnp.asarray(rows), axis=0), right.psi_mun)
+         if with_head:
+diff --git a/src/gw/ppm_sigma.py b/src/gw/ppm_sigma.py
+index 984dea1b..56d776bd 100644
+--- a/src/gw/ppm_sigma.py
++++ b/src/gw/ppm_sigma.py
+@@ -614,7 +614,7 @@ def _compute_invalid_static_sigma(
+         mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
+     s = wfns.slices
+     g_plan = _face_g_plan(
+-        mesh_xy, (k_unfold_plan.n_full, *face_kwargs["face_shape"][1:]))
++        mesh_xy, (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]))
+     (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
+     g_carrier = wfns.green_parent
+ 
+@@ -719,7 +719,7 @@ def _invalid_static_coh_by_bracket(
+         mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
+     s = wfns.slices
+     g_plan = _face_g_plan(
+-        mesh_xy, (k_unfold_plan.n_full, *face_kwargs["face_shape"][1:]))
++        mesh_xy, (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]))
+     (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
+     g_carrier = wfns.green_parent
+ 
+diff --git a/src/gw/ppm_tau_kernel.py b/src/gw/ppm_tau_kernel.py
+index 6c2085df..b6c6d082 100644
+--- a/src/gw/ppm_tau_kernel.py
++++ b/src/gw/ppm_tau_kernel.py
+@@ -318,42 +318,21 @@ def _get_sigma_kij_kernel(
+         layout=layout, face_shape=face_shape,
+         face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan)
+ 
+-    from distrib_la import gemm_plan
+-    _, nb_full_f, n_rmu_f, ns_f = (int(v) for v in face_shape)
+-    mu_s_f = n_rmu_f * ns_f
+-    g_plan = gemm_plan(mesh_xy, m=mu_s_f, k=nb_full_f, n=mu_s_f,
+-                       nq=k_unfold_plan.n_full, dtype=jnp.complex128)
+-
+-    from common.shard_map import shard_map
+-    specs = (P(None, None, "x", "y"), P(None, "x", None, "y"))
+-
+-    def unfold(xn, yr):
+-        return (k_unfold_plan.unfold_face(
+-            xn, vertex=0, spin_axis=1, mu_axis=2, mesh_axis="x"),
+-                k_unfold_plan.unfold_face(
+-            yr, vertex=0, spin_axis=2, mu_axis=3, mesh_axis="y"))
+-    unfold = shard_map(unfold, mesh=mesh_xy, in_specs=specs,
+-                       out_specs=specs, check_vma=False)
+-
+     def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t):
+         """Apply boolean identity masks or signed occupation weights without clipping."""
+-        xn, yr = unfold(xn, yr)
+-        rows = jnp.asarray(k_unfold_plan.irr_idx)
+-        sel = jnp.take(jnp.reshape(sel, E.shape), rows, axis=0)
+-        E = jnp.take(E, rows, axis=0)
+         if sel.dtype == jnp.bool_:
+             if energy_windows:
+                 return build_G_tau(
+                     xn, yr, E, 1j * t, e_ref=ref, mask=sel,
+-                    E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan)
++                    E_min=E_min, E_max=E_max, layout=layout, k_unfold_plan=k_unfold_plan)
+             return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, mask=sel,
+-                               layout=layout, gemm=g_plan)
++                               layout=layout, k_unfold_plan=k_unfold_plan)
+         if energy_windows:
+             return build_G_tau(
+                 xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
+-                E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan)
++                E_min=E_min, E_max=E_max, layout=layout, k_unfold_plan=k_unfold_plan)
+         return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
+-                           layout=layout, gemm=g_plan)
++                           layout=layout, k_unfold_plan=k_unfold_plan)
+ 
+     def _bracketed_face(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                         E_A, mask_A, E_min, E_max, E_ref_A, t_node,
+diff --git a/src/gw/w_isdf.py b/src/gw/w_isdf.py
+index 8fc52f33..1d83b9be 100755
+--- a/src/gw/w_isdf.py
++++ b/src/gw/w_isdf.py
+@@ -208,7 +208,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
+     # "hoist this call out of every per-k/per-tau loop" instruction.
+     g_plan = gemm_plan(
+         mesh_xy, m=n_rmu_left * ns, k=nb_full,
+-        n=n_rmu_right * ns, nq=nk,
++        n=n_rmu_right * ns, nq=nk if paired else expected_input_nk,
+         dtype=jnp.complex128)
+     if paired:
+         from common.shard_map import shard_map
+diff --git a/src/gw/wavefunction_bundle.py b/src/gw/wavefunction_bundle.py
+index bb88c1d4..bc1e9dc6 100644
+--- a/src/gw/wavefunction_bundle.py
++++ b/src/gw/wavefunction_bundle.py
+@@ -423,7 +423,10 @@ def parent_sigma_operands(wfns: "Wavefunctions"):
+     if carrier is None:
+         raise ValueError(
+             "parent_sigma_operands: the bundle carries no parent carrier.")
+-    return (carrier.psi_mun, carrier.psi_nmu,
++    mesh = carrier.plan.mesh_xy
++    green_mun = jax.device_put(carrier.psi_mun, NamedSharding(mesh, P(None, None, "x", None)))
++    green_nmu = jax.device_put(carrier.psi_nmu, NamedSharding(mesh, P(None, None, None, "y")))
++    return (green_mun, green_nmu,
+             carrier.psi_nmu, carrier.psi_mun,
+             carrier.enk, carrier.occ)
+ 

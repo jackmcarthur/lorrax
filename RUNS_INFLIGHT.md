@@ -13,3 +13,7 @@ This register is worktree-local under the explicit modify-only-this-worktree ins
 | BISP-PROF-S follow-up | perf/bisp-prof-s-2026-09-06 | CLOSED: see final COMPLETE row; compiler seconds, Sigma copies, P16; own pool 57992641 and campaign 57988457; worktree wt_bisp_prof_s_codex_20260906 |
 
 | BISP-PROF-S final close-out | perf/bisp-prof-s-2026-09-06, wt_bisp_prof_s_codex_20260906 | COMPLETE on owner instruction: fixes integrated on feature tip d4fc26eb; final P16 dynamic identity passed, static retry canceled before launch; no active steps; own pool57992641 released at close, campaign57988457 retained. |
+
+| BISP-PROF-S parent Green regression | perf/bisp-prof-s-2026-09-06, wt_bisp_prof_s_codex_20260906 | ACTIVE: pinned c2f69987, typed parent operator transport for every ns; three P4 gates on58001243 |
+
+| BISP-PROF-S parent Green regression | COMPLETE | perf/bisp-prof-s-2026-09-06, wt_bisp_prof_s_codex_20260906 | JID58001243; final Si36 lx-Xg4-183148-21883-3115, Si37 lx-Xg4-183313-24970-9150, MoS72 lx-Xg4-182907-6545-6500; printed identity and both speed targets met, Si56 reference mismatch reproduced on unchanged c2 control; no active steps or further legs; campaign-owned pool retained | reports/bisp_prof_s_2026-09-06/report.md |

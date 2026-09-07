@@ -130,26 +130,19 @@ def _make_photon_static_class_kernel(
         project = contract_bands_block_reshard(mesh_xy, layout="face",
             face_shape=shapes[0], right_face_shape=shapes[1])
         g_plan = gemm_plan(mesh_xy, m=shapes[0][2]*shapes[0][3], k=shapes[0][1],
-            n=shapes[1][2]*shapes[1][3], nq=nk_tot, dtype=jnp.complex128)
+            n=shapes[1][2]*shapes[1][3], nq=shapes[0][0], dtype=jnp.complex128)
         _photon_sigma_kernel_cache[plan_key] = project, g_plan
     project, g_plan = _photon_sigma_kernel_cache[plan_key]
     convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=False, lorentz=True)
     head_convolve = (_make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=True, lorentz=True)
                      if with_head else None)
     rows = np.asarray(plans[0].parent_full_rows)
-    specs = (P(None,None,"x","y"), P(None,"x",None,"y"))
-
-    def unfold(psi_mun, psi_nmu):
-        direct = plans[0].unfold_face(psi_mun, spin_axis=1, mu_axis=2, mesh_axis="x")
-        conjugated = plans[1].unfold_face(psi_nmu, spin_axis=2, mu_axis=3, mesh_axis="y")
-        return direct, conjugated
-    unfold = shard_map(unfold, mesh=mesh_xy, in_specs=specs,
-                       out_specs=specs, check_vma=False)
-
     @jax.jit
     def contract_class(left, right, weights, interaction, factor, vertices, head_interaction=None):
-        direct, conjugated = unfold(left.psi_mun, right.psi_nmu)
-        G = build_G(direct, conjugated, phases=weights, layout="face", gemm=g_plan)
+        weights = plans[0].parent_rows(weights)
+        G = build_G(left.psi_mun, right.psi_nmu, phases=jnp.real(weights),
+                    layout="face", gemm=g_plan, k_unfold_plan=plans[0],
+                    right_k_unfold_plan=plans[1])
         sigma = convolve(G, interaction, factor, vertices)
         result = project(left.psi_nmu, jnp.take(sigma, jnp.asarray(rows), axis=0), right.psi_mun)
         if with_head:

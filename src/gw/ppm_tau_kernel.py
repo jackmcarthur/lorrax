@@ -318,42 +318,21 @@ def _get_sigma_kij_kernel(
         layout=layout, face_shape=face_shape,
         face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan)
 
-    from distrib_la import gemm_plan
-    _, nb_full_f, n_rmu_f, ns_f = (int(v) for v in face_shape)
-    mu_s_f = n_rmu_f * ns_f
-    g_plan = gemm_plan(mesh_xy, m=mu_s_f, k=nb_full_f, n=mu_s_f,
-                       nq=k_unfold_plan.n_full, dtype=jnp.complex128)
-
-    from common.shard_map import shard_map
-    specs = (P(None, None, "x", "y"), P(None, "x", None, "y"))
-
-    def unfold(xn, yr):
-        return (k_unfold_plan.unfold_face(
-            xn, vertex=0, spin_axis=1, mu_axis=2, mesh_axis="x"),
-                k_unfold_plan.unfold_face(
-            yr, vertex=0, spin_axis=2, mu_axis=3, mesh_axis="y"))
-    unfold = shard_map(unfold, mesh=mesh_xy, in_specs=specs,
-                       out_specs=specs, check_vma=False)
-
     def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t):
         """Apply boolean identity masks or signed occupation weights without clipping."""
-        xn, yr = unfold(xn, yr)
-        rows = jnp.asarray(k_unfold_plan.irr_idx)
-        sel = jnp.take(jnp.reshape(sel, E.shape), rows, axis=0)
-        E = jnp.take(E, rows, axis=0)
         if sel.dtype == jnp.bool_:
             if energy_windows:
                 return build_G_tau(
                     xn, yr, E, 1j * t, e_ref=ref, mask=sel,
-                    E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan)
+                    E_min=E_min, E_max=E_max, layout=layout, k_unfold_plan=k_unfold_plan)
             return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, mask=sel,
-                               layout=layout, gemm=g_plan)
+                               layout=layout, k_unfold_plan=k_unfold_plan)
         if energy_windows:
             return build_G_tau(
                 xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
-                E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan)
+                E_min=E_min, E_max=E_max, layout=layout, k_unfold_plan=k_unfold_plan)
         return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
-                           layout=layout, gemm=g_plan)
+                           layout=layout, k_unfold_plan=k_unfold_plan)
 
     def _bracketed_face(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                         E_A, mask_A, E_min, E_max, E_ref_A, t_node,

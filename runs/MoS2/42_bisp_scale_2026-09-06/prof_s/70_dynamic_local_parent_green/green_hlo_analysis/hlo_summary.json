@@ -1,0 +1,57 @@
+{
+  "dump_dir": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/70_dynamic_local_parent_green/green_hlo_analysis",
+  "total_modules": 1,
+  "total_peak_bytes": 0,
+  "agg_custom_calls": {
+    "__cublas$gemm": 2,
+    "lorrax_mklfft_gw_conv": 1,
+    "lorrax_cublasmp_batched_gemm": 2
+  },
+  "agg_collectives": [],
+  "agg_remats": [],
+  "agg_layout_ops": [
+    {
+      "module": "module_0000.jit__tau",
+      "op": "bitcast",
+      "count": 30,
+      "max_bytes": 829440000,
+      "max_source": ""
+    },
+    {
+      "module": "module_0000.jit__tau",
+      "op": "transpose",
+      "count": 6,
+      "max_bytes": 829440000,
+      "max_source": ""
+    }
+  ],
+  "modules": {
+    "module_0000.jit__tau": {
+      "memory": null,
+      "hlo": {
+        "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/MoS2/42_bisp_scale_2026-09-06/prof_s/70_dynamic_local_parent_green/green_hlo_analysis/module_0000.jit__tau.gpu_after_optimizations.txt",
+        "collectives": [],
+        "custom_calls": {
+          "__cublas$gemm": 2,
+          "lorrax_mklfft_gw_conv": 1,
+          "lorrax_cublasmp_batched_gemm": 2
+        },
+        "remats": [],
+        "layout_ops": {
+          "bitcast": {
+            "count": 30,
+            "max_bytes": 829440000,
+            "max_source": ""
+          },
+          "transpose": {
+            "count": 6,
+            "max_bytes": 829440000,
+            "max_source": ""
+          }
+        }
+      },
+      "buffer": null,
+      "sig": null
+    }
+  }
+}

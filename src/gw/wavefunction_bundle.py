@@ -413,7 +413,7 @@ def parent_sigma_operands(wfns: "Wavefunctions"):
     """The Σ kernel operands of the parent route, in the kernels' slot order.
 
     ``(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, enk, occ)``: the
-    parent faces for the G contraction (first operand direct, second
+    band-replicated parent faces for the G contraction (first operand direct, second
     conjugated inside ``build_G``), the same faces for the band projection
     (first operand conjugated inside the projector), and the parent-row
     energy/occupation tables.  Same six roles the full-k face call sites
@@ -423,7 +423,10 @@ def parent_sigma_operands(wfns: "Wavefunctions"):
     if carrier is None:
         raise ValueError(
             "parent_sigma_operands: the bundle carries no parent carrier.")
-    return (carrier.psi_mun, carrier.psi_nmu,
+    mesh = carrier.plan.mesh_xy
+    green_mun = jax.device_put(carrier.psi_mun, NamedSharding(mesh, P(None, None, "x", None)))
+    green_nmu = jax.device_put(carrier.psi_nmu, NamedSharding(mesh, P(None, None, None, "y")))
+    return (green_mun, green_nmu,
             carrier.psi_nmu, carrier.psi_mun,
             carrier.enk, carrier.occ)
 

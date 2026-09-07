@@ -1,0 +1,122 @@
+{
+  "step": [
+    "[lx] step lx-Xg4-183313-24970-9150 exit 0 in 52 s"
+  ],
+  "stages": {
+    "batch": 4,
+    "executor_census": "production_progress_exact_tau_total",
+    "launcher_log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/37_soc_sparse_spin/evidence/science_lx_run.log",
+    "log": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/runs/Si/100_bisp_parent_route_2026-09-05/prof_s/37_soc_sparse_spin/gwjax.out",
+    "logical_windows": null,
+    "plan": "box",
+    "planned_distinct_tau": null,
+    "planned_window_tau_pairs": null,
+    "pole_batches": 1,
+    "poles": 1,
+    "seconds_per_tau_dispatch": 0.09655172413793103,
+    "sigma_other_seconds": 22.33,
+    "sigma_rule_plan_seconds": 0.12,
+    "sigma_tau_sweep_seconds": 2.8,
+    "sigma_wall_seconds": 25.25,
+    "sweeps": null,
+    "tau": 29,
+    "total_wall_seconds": 47.71,
+    "window_census_status": "not emitted by minimal production reporter; requires an artifact-bound planner receipt"
+  },
+  "boundaries": {
+    "scope": "synchronized host boundaries; outer stage is nested, never sum it with children",
+    "groups": [
+      {
+        "label": "sigma_tau",
+        "term": "",
+        "head": false,
+        "calls": 29,
+        "compiles": 0,
+        "compile_s": 0.0,
+        "host_s": 0.8855157729121856,
+        "cold_calls": 0,
+        "cold_median_ms": null,
+        "warm_calls": 29,
+        "warm_median_ms": 29.987169022206217
+      }
+    ]
+  },
+  "compile_events": 406,
+  "compiler_seconds": 25.077451888122596,
+  "tau_compile": [
+    {
+      "name": "jit__tau",
+      "digest": "85351442dda7e37ac92e70723bd566860e2d081408972d56e54bee9b8e3f67c4",
+      "seconds": 0.7245034259976819,
+      "stack": [
+        {
+          "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/runtime/__init__.py",
+          "line": 1985,
+          "function": "run_main_and_finalize"
+        },
+        {
+          "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/gw_jax.py",
+          "line": 1034,
+          "function": "main"
+        },
+        {
+          "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/sigma_dispatch.py",
+          "line": 1554,
+          "function": "compute_sigma_xc"
+        },
+        {
+          "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/ppm_pipeline.py",
+          "line": 650,
+          "function": "compute_ppm_sigma_pipeline"
+        },
+        {
+          "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/ppm_sigma.py",
+          "line": 973,
+          "function": "compute_sigma_c_ppm_omega_grid"
+        },
+        {
+          "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/mpa/sigma.py",
+          "line": 817,
+          "function": "compute_sigma_c_mpa_omega_grid"
+        },
+        {
+          "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/mpa/sigma.py",
+          "line": 585,
+          "function": "integrate_sigma_store"
+        },
+        {
+          "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/mpa/sigma.py",
+          "line": 578,
+          "function": "run"
+        },
+        {
+          "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/gw/mpa/sigma.py",
+          "line": 378,
+          "function": "_integrate_sigma_batches"
+        },
+        {
+          "file": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_prof_s_codex_20260906/src/common/jax_compile_cache.py",
+          "line": 1737,
+          "function": "_counting"
+        }
+      ]
+    }
+  ],
+  "custom_calls": {
+    "__cublas$gemm": 1,
+    "lorrax_mklfft_gw_conv": 1,
+    "lorrax_cublasmp_batched_gemm": 2
+  },
+  "collectives": {
+    "scope": "Optimized instruction census; async starts counted once, done instructions excluded. Complements the unchanged canonical analyzer.",
+    "modules": [
+      {
+        "file": "module_tau.jit__tau.gpu_after_optimizations.txt",
+        "collectives": {},
+        "instructions": []
+      }
+    ]
+  },
+  "memory": "CompiledMemoryStats(generated_code_size_in_bytes=2551872, argument_size_in_bytes=129763669, output_size_in_bytes=32768, alias_size_in_bytes=0, temp_size_in_bytes=2359296512, host_generated_code_size_in_bytes=0, host_argument_size_in_bytes=0, host_output_size_in_bytes=0, host_alias_size_in_bytes=0, host_temp_size_in_bytes=0)\n",
+  "capture_note": "module_0000 is the analysis index of the single as_text capture, not an original XLA module ordinal"
+}

@@ -1,0 +1,1 @@
+PASS: 224 complete printed state rows identical, including sigCC/sigTT/sigCT.

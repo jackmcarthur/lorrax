@@ -1,0 +1,4 @@
+# collectives_details.txt — top-3 collectives by output bytes
+# Each block: HLO line of the collective ± 3 lines of context
+# plus the Python source_file:line extracted from metadata.
+

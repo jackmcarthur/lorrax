@@ -48,3 +48,9 @@ The authorized named fallback `LX_ALLOC_MATCH=lx-alloc-jackm-BISP-PROF-S LX_ALLO
 - 2026-09-06 PROF-S: `lx status --jid 57988457` is rejected by lx_pool; --jid is a run flag, not a status selector. No allocation or step affected.
 
 - 2026-09-06 PROF-S run63 P16 fixed-main: timing wrapper treated present-but-None green_parent as a carrier, causing AttributeError before the first static block. Scientific source unchanged; retry in fresh67 uses green_parent or the full-k bundle.
+
+- PROF-S parent regression: bisect7c5466be has lx_run1.log and rankwrap.sh but no driver.sh; copy via lane runner. One read used an invalid workdir spelling and was rejected without launching.
+
+- Parent-Green gate28: copied Si56 rule cache missed four exact containment edges shifted by at most7.714e-13 Ry after floating-point reassociation; regenerated29-node schedule. The0.518 ueV difference from Si56 also occurs on unchanged c2f69987 (control32); it was not caused by the new Green algorithm or cured by rule pinning. Gate retry freezes the copied certificates through a run-local lookup with an explicit1e-10 Ry edge bound; production cache unchanged.
+
+- Parent-Green controls: archived c2 control31 omitted root pyproject.toml and source closure refused; MoS2 gate68 overwrote its supplied per-window replay hook and consequently found no ordinary tmp rule cache. Fresh controls preserve the original replay hook and root project metadata.
