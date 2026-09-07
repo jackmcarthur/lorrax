@@ -36,6 +36,7 @@ def _plan(p_x: int, p_y: int):
         budget_gb=1000.0,
         band_chunk_override=16,
         pair_density_slots=3,
+        low_mem_bands=True,
     )
 
 

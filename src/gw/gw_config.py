@@ -851,7 +851,12 @@ AUTOMATIC_BAND_CHUNK_SIZE = 16
 
 @dataclass(frozen=True)
 class LinalgResolution:
-    """Internal execution profile selected by the one ``linalg`` deck dial; see docs/architecture/decisions.md."""
+    """Internal execution profile selected by the one ``linalg`` deck dial.
+
+    The public vocabulary deliberately stops at layout.  These fields retain
+    the established implementation choices so existing stage code need not
+    become a second interpreter of ``local`` versus ``distributed``.
+    """
 
     layout: str
     provenance: str

@@ -104,10 +104,18 @@ def test_memory_model_prices_resolved_layout():
     p_x, p_y = 2, 2
     s = _C128 * nk * ns * mu * nb  # one global complex128 psi image
 
+    legacy = _persistent_bytes(
+        nk=nk, ns=ns, nq=1, nq_disk=1, mu=mu, nb=nb, ngkmax=1, n_rtot=1,
+        p_x=p_x, p_y=p_y, low_mem_bands=False)
     face = _persistent_bytes(
         nk=nk, ns=ns, nq=1, nq_disk=1, mu=mu, nb=nb, ngkmax=1, n_rtot=1,
-        p_x=p_x, p_y=p_y)
+        p_x=p_x, p_y=p_y, low_mem_bands=True)
+
+    assert legacy["psi_copies"] == pytest.approx(2 * s / p_x + 2 * s / p_y)
     assert face["psi_copies"] == pytest.approx(2 * s / (p_x * p_y))
+    # the face reduction is the 2*sqrt(P) the audit claims, on a square mesh
+    assert legacy["psi_copies"] / face["psi_copies"] == pytest.approx(
+        2 * (p_x * p_y) ** 0.5)
 
 
 def test_face_carrier_addressable_bytes_match_2s_over_p():

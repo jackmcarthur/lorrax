@@ -370,7 +370,7 @@ def centroid_fft_tile_geometry(
 # ---------------------------------------------------------------------------
 
 def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
-                      p_x, p_y,
+                      p_x, p_y, low_mem_bands: bool = False,
                       parent_route=None) -> dict:
     """The un-chunkable floor resident across the whole r-chunk loop.
 
@@ -412,7 +412,10 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
     corrections behind the G-flat terms" #1."""
     P_ = p_x * p_y
     psi_one = _c128(nk, ns, mu, nb)
-    psi_copies = 2.0 * psi_one / P_
+    if low_mem_bands:
+        psi_copies = 2.0 * psi_one / P_
+    else:
+        psi_copies = 2 * psi_one / p_x + 2 * psi_one / p_y
     if parent_route is not None:
         # The raw-parent carrier: one face pair at n_parent rows
         # (gw.wavefunction_bundle.ParentGreenCarrier).  Under parents-only
@@ -601,7 +604,7 @@ class GFlatChunkPlan:
     #: priced under (``low_mem_bands`` deck key).  Disclosed on the
     #: startup banner so a run cannot believe it selected the low-memory
     #: path when the planner priced the other one (report §7).
-    psi_layout: str = "face"
+    psi_layout: str = "legacy"
     #: Per-rank bytes of the ψ centroid term (``_persistent_bytes``'s
     #: ``"psi_copies"``) AT THE RESOLVED LAYOUT — the number the banner
     #: prints next to ``psi_layout``.
@@ -734,6 +737,7 @@ def plan_gflat_chunks(
     n_q_ibz: int | None = None,
     pair_density_slots: int | None = None,
     distributed_zeta_solve: str = "auto",
+    low_mem_bands: bool = False,
     face_current_vertex: bool = False,
     parent_route=None,
 ) -> GFlatChunkPlan:
@@ -801,9 +805,10 @@ def plan_gflat_chunks(
         raise ValueError(
             f"fit_nb_total and face_nb_total must be positive, got "
             f"fit={fit_nb}, face={face_nb}")
-    from runtime.padding import authenticate_padded_axis
-    authenticate_padded_axis(
-        face_nb, face_nb, p_y, name="face band memory-model carrier")
+    if low_mem_bands:
+        from runtime.padding import authenticate_padded_axis
+        authenticate_padded_axis(
+            face_nb, face_nb, p_y, name="face band memory-model carrier")
     fft_grid = tuple(getattr(meta, 'fft_grid', None)
                      or (int(round(n_rtot ** (1 / 3))),) * 3)
     if n_q_ibz is None:
@@ -825,10 +830,14 @@ def plan_gflat_chunks(
     budget = budget_gb * 1e9
     target = budget * target_utilization
 
-    inventory_nb = face_nb
+    inventory_nb = face_nb if low_mem_bands else nb
+    if parent_route is not None and not low_mem_bands:
+        raise ValueError(
+            "plan_gflat_chunks: parent_route requires low_mem_bands (the "
+            "parent faces are face-layout carriers).")
     sys = dict(nk=nk, ns=ns, nq=nq, nq_disk=nq_disk, mu=mu,
                nb=inventory_nb,
-               ngkmax=ngkmax, n_rtot=n_rtot,
+               ngkmax=ngkmax, n_rtot=n_rtot, low_mem_bands=bool(low_mem_bands),
                parent_route=parent_route)
 
     # The hoisted ψ(r) cache has no centroid axis: at large FFT grids it can
@@ -846,29 +855,30 @@ def plan_gflat_chunks(
         nk, _min_cache_slots, ns, n_rtot, shard=p_xy)
     cache_psi_r = True
     _cache_probe_peak = sum(_persistent_base.values()) + _min_cache_bytes
-    _cache_probe_bc = (
-        int(band_chunk_override)
-        if band_chunk_override and band_chunk_override > 0 else fit_nb)
-    _cache_probe_bc = max(
-        p_xy, padded_axis(
-            _cache_probe_bc, p_xy,
-            name="cache-probe fit-band chunk").carrier)
-    _cache_probe_bc = min(_cache_probe_bc, _min_cache_slots)
-    _cache_probe_r = min(
-        n_rtot, max(min(mu, n_rtot), math.ceil(n_rtot / max_chunks)))
-    _cache_probe_r = max(
-        p_y, round_down(_cache_probe_r, p_y))
-    _cache_probe_face = _stage_C_face_terms(
-        nk=nk, ns=ns, mu=mu, face_nb=face_nb,
-        slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
-        band_chunk=_cache_probe_bc,
-        n_band_chunks=math.ceil(fit_nb / _cache_probe_bc))
-    _cache_probe_peak += (
-        _cache_probe_face["constant"]
-        + _cache_probe_face["repeated_pair_slope"] * _cache_probe_r)
-    cache_psi_r = not (
-        sum(_persistent_base.values()) + _min_cache_bytes > target
-        or _cache_probe_peak > target)
+    if low_mem_bands:
+        _cache_probe_bc = (
+            int(band_chunk_override)
+            if band_chunk_override and band_chunk_override > 0 else fit_nb)
+        _cache_probe_bc = max(
+            p_xy, padded_axis(
+                _cache_probe_bc, p_xy,
+                name="cache-probe fit-band chunk").carrier)
+        _cache_probe_bc = min(_cache_probe_bc, _min_cache_slots)
+        _cache_probe_r = min(
+            n_rtot, max(min(mu, n_rtot), math.ceil(n_rtot / max_chunks)))
+        _cache_probe_r = max(
+            p_y, round_down(_cache_probe_r, p_y))
+        _cache_probe_face = _stage_C_face_terms(
+            nk=nk, ns=ns, mu=mu, face_nb=face_nb,
+            slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
+            band_chunk=_cache_probe_bc,
+            n_band_chunks=math.ceil(fit_nb / _cache_probe_bc))
+        _cache_probe_peak += (
+            _cache_probe_face["constant"]
+            + _cache_probe_face["repeated_pair_slope"] * _cache_probe_r)
+        cache_psi_r = not (
+            sum(_persistent_base.values()) + _min_cache_bytes > target
+            or _cache_probe_peak > target)
     if not cache_psi_r:
         _announce(
             "stream-psi-r-cache-lowmem",
@@ -897,25 +907,27 @@ def plan_gflat_chunks(
         cache_slots = math.ceil(fit_nb / floor_bc) * floor_bc
         psi_r_cache = _c128(nk, cache_slots, ns, n_rtot, shard=pp)
         floor_sys = dict(sys)
-        floor_sys["nb"] = face_nb_pp
+        if low_mem_bands:
+            floor_sys["nb"] = face_nb_pp
         floor = (sum(_persistent_bytes(
                      p_x=px, p_y=py, **floor_sys).values())
                  + (psi_r_cache if cache_psi_r else 0.0))
-        # P_min must admit one legal face r slab.  Use the universal
-        # repeated route at r=Py and the full-nk analytic transform.
-        face_floor = _stage_C_face_terms(
-            nk=nk, ns=ns, mu=mu, face_nb=face_nb_pp,
-            slots=face_slots, p_x=px, p_y=py, p_xy=pp,
-            band_chunk=floor_bc,
-            n_band_chunks=math.ceil(fit_nb / floor_bc))
-        fft_floor = (_c128(
-            nk, floor_bc, ns, n_rtot, shard=pp)
-            * _FFT_CUFFT_FACTOR)
-        pair_floor = (
-            face_floor["constant"]
-            + face_floor["repeated_pair_slope"] * py
-            + (0.0 if cache_psi_r else fft_floor))
-        floor += max(fft_floor if cache_psi_r else 0.0, pair_floor)
+        if low_mem_bands:
+            # P_min must admit one legal face r slab.  Use the universal
+            # repeated route at r=Py and the full-nk analytic transform.
+            face_floor = _stage_C_face_terms(
+                nk=nk, ns=ns, mu=mu, face_nb=face_nb_pp,
+                slots=face_slots, p_x=px, p_y=py, p_xy=pp,
+                band_chunk=floor_bc,
+                n_band_chunks=math.ceil(fit_nb / floor_bc))
+            fft_floor = (_c128(
+                nk, floor_bc, ns, n_rtot, shard=pp)
+                * _FFT_CUFFT_FACTOR)
+            pair_floor = (
+                face_floor["constant"]
+                + face_floor["repeated_pair_slope"] * py
+                + (0.0 if cache_psi_r else fft_floor))
+            floor += max(fft_floor if cache_psi_r else 0.0, pair_floor)
         return floor
 
     # ``loader_tables`` is P-INDEPENDENT, so if it alone busts the budget no
@@ -965,7 +977,7 @@ def plan_gflat_chunks(
     # planner's existing performance floor / max-chunk floor; Phase 2 may
     # still choose a larger affordable r chunk after band K is resolved.
     r_lo = min(mu, n_rtot)
-    r_alignment = p_y
+    r_alignment = p_y if low_mem_bands else p_xy
     if r_chunk_override and r_chunk_override > 0:
         r_for_band_guard = min(int(r_chunk_override), n_rtot)
     else:
@@ -985,12 +997,18 @@ def plan_gflat_chunks(
             nk=nk, band_chunk=bc, p_band=p_xy)
         centroid_fft_t = _fft_for_bc(bc, nk_extent=centroid_k)
         zeta_fft_t = _fft_for_bc(bc, nk_extent=nk)
-        face = _stage_C_face_terms(
-            nk=nk, ns=ns, mu=mu, face_nb=face_nb,
-            slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
-            band_chunk=bc, n_band_chunks=n_bc)
-        fit_t = (face["constant"]
-                 + face["repeated_pair_slope"] * r_for_band_guard)
+        if low_mem_bands:
+            face = _stage_C_face_terms(
+                nk=nk, ns=ns, mu=mu, face_nb=face_nb,
+                slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
+                band_chunk=bc, n_band_chunks=n_bc)
+            fit_t = (face["constant"]
+                     + face["repeated_pair_slope"] * r_for_band_guard)
+        else:
+            c_slope = _stage_C_slope(
+                nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
+                p_xy=p_xy, band_chunk=bc, p_y=p_y)
+            fit_t = c_slope * r_for_band_guard
         # Centroid sampling sees only its bounded k tile.  The incumbent
         # to_rchunk_inner source sees full nk and is a distinct peak when
         # hoisted, or coexists with the streamed pair route when not.
@@ -1052,80 +1070,96 @@ def plan_gflat_chunks(
     face_cache_build_t = 0.0
     face_tile_concat_t = 0.0
     face_y_cache_bytes = 0.0
-    face_terms = _stage_C_face_terms(
-        nk=nk, ns=ns, mu=mu, face_nb=face_nb,
-        slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
-        band_chunk=band_chunk, n_band_chunks=_cache_n_bc,
-        parent_route=parent_route)
-    # to_rchunk_inner consumes the full-nk carrier.  This is deliberately
-    # the 12.96-GB CrI3/P16 term, not Stage A's 5.76-GB bounded k tile.
-    streamed_fft = 0.0 if cache_psi_r else fft_box_zeta_transform
-    face_headroom = max(
-        target - persistent_total - face_terms["constant"], 0.0)
+    if low_mem_bands:
+        face_terms = _stage_C_face_terms(
+            nk=nk, ns=ns, mu=mu, face_nb=face_nb,
+            slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
+            band_chunk=band_chunk, n_band_chunks=_cache_n_bc,
+            parent_route=parent_route)
+        # to_rchunk_inner consumes the full-nk carrier.  This is deliberately
+        # the 12.96-GB CrI3/P16 term, not Stage A's 5.76-GB bounded k tile.
+        streamed_fft = 0.0 if cache_psi_r else fft_box_zeta_transform
+        face_headroom = max(
+            target - persistent_total - face_terms["constant"], 0.0)
 
-    cache_pair_cap = int(
-        face_headroom / face_terms["cache_pair_slope"])
-    cache_build_headroom = max(face_headroom - streamed_fft, 0.0)
-    cache_build_cap = int(
-        cache_build_headroom / face_terms["cache_build_slope"])
-    # The calibrated four-slot arena already contains old/new Z and both
-    # k-IFFT outputs.  Only the Y cache sits outside its placement bound.
-    cache_other_slope = face_terms["y_cache_slope"]
-    cache_arena_cap = int(
-        _ARENA_PLACEMENT_FRAC * face_headroom
-        / (face_terms["pair_arena_slope"]
-           + _ARENA_PLACEMENT_FRAC * cache_other_slope))
-    cache_cap = min(cache_pair_cap, cache_build_cap, cache_arena_cap)
+        cache_pair_cap = int(
+            face_headroom / face_terms["cache_pair_slope"])
+        cache_build_headroom = max(face_headroom - streamed_fft, 0.0)
+        cache_build_cap = int(
+            cache_build_headroom / face_terms["cache_build_slope"])
+        # The calibrated four-slot arena already contains old/new Z and both
+        # k-IFFT outputs.  Only the Y cache sits outside its placement bound.
+        cache_other_slope = face_terms["y_cache_slope"]
+        cache_arena_cap = int(
+            _ARENA_PLACEMENT_FRAC * face_headroom
+            / (face_terms["pair_arena_slope"]
+               + _ARENA_PLACEMENT_FRAC * cache_other_slope))
+        cache_cap = min(cache_pair_cap, cache_build_cap, cache_arena_cap)
 
-    repeated_headroom = max(face_headroom - streamed_fft, 0.0)
-    repeated_pair_cap = int(
-        repeated_headroom / face_terms["repeated_pair_slope"])
-    repeated_other_slope = (
-        _GATHERED_PSI_SLOTS * face_terms["y_block_slope"]
-        + face_terms["y_source_slope"])
-    repeated_arena_cap = int(
-        _ARENA_PLACEMENT_FRAC * repeated_headroom
-        / (face_terms["pair_arena_slope"]
-           + _ARENA_PLACEMENT_FRAC * repeated_other_slope))
-    repeated_cap = min(repeated_pair_cap, repeated_arena_cap)
+        repeated_headroom = max(face_headroom - streamed_fft, 0.0)
+        repeated_pair_cap = int(
+            repeated_headroom / face_terms["repeated_pair_slope"])
+        repeated_other_slope = (
+            _GATHERED_PSI_SLOTS * face_terms["y_block_slope"]
+            + face_terms["y_source_slope"])
+        repeated_arena_cap = int(
+            _ARENA_PLACEMENT_FRAC * repeated_headroom
+            / (face_terms["pair_arena_slope"]
+               + _ARENA_PLACEMENT_FRAC * repeated_other_slope))
+        repeated_cap = min(repeated_pair_cap, repeated_arena_cap)
 
-    route_width = (min(int(r_chunk_override), n_rtot)
-                   if r_chunk_override and r_chunk_override > 0
-                   else min(n_rtot, max(
-                       r_lo, math.ceil(n_rtot / max_chunks))))
-    route_width = max(
-        r_alignment, round_down(route_width, r_alignment))
-    route_tile = bounded_partition_tile(
-        route_width, cache_cap, r_alignment)
-    route_tiles = (route_width // route_tile) if route_tile else 0
-    # The bounded fallback executes one transform per scalar spin pair.
-    # A tiled cache is useful only while it executes strictly fewer
-    # transforms than that fallback; otherwise retain the smaller-memory
-    # incumbent.  The outer r chunk is unchanged either way.
-    cache_face_y_blocks = bool(
-        ns > 1 and route_tile > 0 and route_tiles < ns * ns)
-    face_y_cache_r_tile = route_tile if cache_face_y_blocks else 0
-    if cache_face_y_blocks:
-        C_slope = face_terms["cache_pair_slope"]
-        C_constant = face_terms["constant"]
-        r_from_budget = min(cache_pair_cap, cache_build_cap)
-        r_from_arena = cache_arena_cap
-        r_budget_cap = cache_cap
+        route_width = (min(int(r_chunk_override), n_rtot)
+                       if r_chunk_override and r_chunk_override > 0
+                       else min(n_rtot, max(
+                           r_lo, math.ceil(n_rtot / max_chunks))))
+        route_width = max(
+            r_alignment, round_down(route_width, r_alignment))
+        route_tile = bounded_partition_tile(
+            route_width, cache_cap, r_alignment)
+        route_tiles = (route_width // route_tile) if route_tile else 0
+        # The bounded fallback executes one transform per scalar spin pair.
+        # A tiled cache is useful only while it executes strictly fewer
+        # transforms than that fallback; otherwise retain the smaller-memory
+        # incumbent.  The outer r chunk is unchanged either way.
+        cache_face_y_blocks = bool(
+            ns > 1 and route_tile > 0 and route_tiles < ns * ns)
+        face_y_cache_r_tile = route_tile if cache_face_y_blocks else 0
+        if cache_face_y_blocks:
+            C_slope = face_terms["cache_pair_slope"]
+            C_constant = face_terms["constant"]
+            r_from_budget = min(cache_pair_cap, cache_build_cap)
+            r_from_arena = cache_arena_cap
+            r_budget_cap = cache_cap
+        else:
+            C_slope = face_terms["repeated_pair_slope"]
+            C_constant = face_terms["constant"] + streamed_fft
+            r_from_budget = repeated_pair_cap
+            r_from_arena = repeated_arena_cap
+            r_budget_cap = repeated_cap
     else:
-        C_slope = face_terms["repeated_pair_slope"]
-        C_constant = face_terms["constant"] + streamed_fft
-        r_from_budget = repeated_pair_cap
-        r_from_arena = repeated_arena_cap
-        r_budget_cap = repeated_cap
+        C_slope = _stage_C_slope(
+            nk=nk, ns=ns, nq=nq, mu=mu, slots=slots,
+            p_xy=p_xy, band_chunk=band_chunk, p_y=p_y)
+        C_constant = 0.0
+        arena_slope = slots * _c128(nk, ns, ns, mu, shard=p_xy)
 
     headroom_C = max(
-        target - persistent_total - C_constant,
+        target - persistent_total - C_constant
+        - (0.0 if (low_mem_bands or cache_psi_r)
+           else fft_box_zeta_transform),
         0.0)
     if r_chunk_override and r_chunk_override > 0:
         # The register-documented run-level workaround: an explicit
         # r_chunk_size wins over every cap below, exactly as before.
         r_chunk = min(int(r_chunk_override), n_rtot)
     else:
+        if not low_mem_bands:
+            r_from_budget = (
+                int(headroom_C / C_slope) if C_slope > 0 else n_rtot)
+            r_from_arena = (
+                int(_ARENA_PLACEMENT_FRAC * headroom_C / arena_slope)
+                if arena_slope > 0 else n_rtot)
+            r_budget_cap = min(r_from_budget, r_from_arena)
         # Performance floors — chunks at least μ wide, at most
         # ``max_chunks`` of them.  THE BUDGET OUTRANKS THE FLOORS: until
         # 2026-08-22 ``r_lo = min(μ, n_rtot)`` silently overrode a
@@ -1249,33 +1283,38 @@ def plan_gflat_chunks(
     A_psi_r_cache_t = fft_box_zeta_transform if cache_psi_r else 0.0
     B_t = (_c128(nq, mu, mu, shard=p_xy)               # C_q
            + 2 * _c128(nk, ns, ns, mu, mu, shard=p_xy))  # full (μ,μ) pair density
-    if cache_face_y_blocks:
-        _cache_tile = face_y_cache_r_tile
-        _completed_tile_z = (
-            _c128(nq, mu, shard=p_xy) * (r_chunk - _cache_tile))
-        C_fit_t = (face_terms["constant"]
-                   + face_terms["cache_pair_slope"] * _cache_tile
-                   + _completed_tile_z)
-        face_y_cache_bytes = (
-            face_terms["y_cache_slope"] * _cache_tile)
-        # Every tile invokes the SAME canonical face owner at tile width,
-        # so the source/all_to_all/all_gather transaction and stacked
-        # cache are both tile-sized.  Previously completed compact Z_q
-        # tiles stay live while the next tile is built/contracted.
-        face_cache_build_t = (
-            face_terms["constant"]
-            + (0.0 if cache_psi_r else fft_box_zeta_transform)
-            + face_terms["cache_build_slope"] * _cache_tile
-            + _completed_tile_z)
-        if _cache_tile < r_chunk:
-            # Global tile arrays are concatenated outside manual
-            # shard_map, then constrained once to the incumbent outer
-            # P(None,'x','y') carrier.  Conservatively price live tile
-            # inputs plus the redistributed output as two all-P Z stacks.
-            face_tile_concat_t = 2.0 * _c128(
-                nq, mu, r_chunk, shard=p_xy)
+    if low_mem_bands:
+        if cache_face_y_blocks:
+            _cache_tile = face_y_cache_r_tile
+            _completed_tile_z = (
+                _c128(nq, mu, shard=p_xy) * (r_chunk - _cache_tile))
+            C_fit_t = (face_terms["constant"]
+                       + face_terms["cache_pair_slope"] * _cache_tile
+                       + _completed_tile_z)
+            face_y_cache_bytes = (
+                face_terms["y_cache_slope"] * _cache_tile)
+            # Every tile invokes the SAME canonical face owner at tile width,
+            # so the source/all_to_all/all_gather transaction and stacked
+            # cache are both tile-sized.  Previously completed compact Z_q
+            # tiles stay live while the next tile is built/contracted.
+            face_cache_build_t = (
+                face_terms["constant"]
+                + (0.0 if cache_psi_r else fft_box_zeta_transform)
+                + face_terms["cache_build_slope"] * _cache_tile
+                + _completed_tile_z)
+            if _cache_tile < r_chunk:
+                # Global tile arrays are concatenated outside manual
+                # shard_map, then constrained once to the incumbent outer
+                # P(None,'x','y') carrier.  Conservatively price live tile
+                # inputs plus the redistributed output as two all-P Z stacks.
+                face_tile_concat_t = 2.0 * _c128(
+                    nq, mu, r_chunk, shard=p_xy)
+        else:
+            C_fit_t = C_constant + C_slope * r_chunk
     else:
-        C_fit_t = C_constant + C_slope * r_chunk
+        C_fit_t = C_slope * r_chunk
+        if not cache_psi_r:
+            C_fit_t += fft_box_zeta_transform
     # THE Z_q/SOLVE SEAM IS A SUM, NOT A MAX.  ``fit_one_rchunk`` hands
     # the full-BZ ``Z_q (nq, μ, cr) P(None,'x','y')`` it just built to
     # ``solve_phase`` as a live input: the solve's Z_col reshard targets a
@@ -1304,7 +1343,10 @@ def plan_gflat_chunks(
     #   that is live for the rest of the run is already what is resident
     #   here — there is no separate "post-fit narrowing" step to price.
     psi_one = _c128(nk, ns, mu, inventory_nb)
-    E_base = 2.0 * psi_one / p_xy
+    if low_mem_bands:
+        E_base = 2.0 * psi_one / p_xy
+    else:
+        E_base = psi_one / p_x + psi_one / p_y
     # Stage-C/D disclosure (GFlatChunkPlan.stage_cd_psi_bytes docstring).
     # The face value is already present in the separate build/pair peaks.
     #
@@ -1327,13 +1369,16 @@ def plan_gflat_chunks(
     # band_chunk-bounded per-bc gather/weight transient (tiny against (a)
     # whenever band_chunk << n_rmu, the normal case).  Both scale with P
     # (px·py), not sqrt(P) — the fix this term exists to disclose.
-    if cache_face_y_blocks:
-        face_y_route_bytes = face_y_cache_bytes
+    if low_mem_bands:
+        if cache_face_y_blocks:
+            face_y_route_bytes = face_y_cache_bytes
+        else:
+            face_y_route_bytes = (
+                (_GATHERED_PSI_SLOTS * face_terms["y_block_slope"]
+                 + face_terms["y_source_slope"]) * r_chunk)
+        stage_cd_psi_bytes = face_terms["constant"] + face_y_route_bytes
     else:
-        face_y_route_bytes = (
-            (_GATHERED_PSI_SLOTS * face_terms["y_block_slope"]
-             + face_terms["y_source_slope"]) * r_chunk)
-    stage_cd_psi_bytes = face_terms["constant"] + face_y_route_bytes
+        stage_cd_psi_bytes = 2.0 * psi_one / p_x
     zeta_slab = _c128(n_q_ibz, mu, ngkmax, shard=p_xy)
     E_t = (_c128(n_q_ibz, mu, mu, shard=p_xy)          # V_acc
            + zeta_slab                                  # ζ_L_all
@@ -1396,7 +1441,7 @@ def plan_gflat_chunks(
         p_min=int(p_min),
         budget_bytes=float(budget),
         target_utilization=float(target_utilization),
-        psi_layout="face",
+        psi_layout=("face" if low_mem_bands else "legacy"),
         psi_layout_bytes=float(persistent["psi_copies"]),
         stage_cd_psi_bytes=float(stage_cd_psi_bytes),
         cache_psi_r=bool(cache_psi_r),
