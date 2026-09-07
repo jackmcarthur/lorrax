@@ -2747,7 +2747,11 @@ def read_authenticated_dipole_velocity(
     # The producer owns both the stamp grammar and sign resolution; consume
     # those owners directly rather than mirroring either convention here.
     from psp.get_dipole_mtxels import (
-        check_dipole_provenance, resolve_vnl_velocity_sign)
+        resolve_vnl_velocity_sign,
+    )
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
     expected_vnl_sign = resolve_vnl_velocity_sign(
         None, config.vnl_velocity_sign)
     from common.four_current_model import resolve_four_current_representation

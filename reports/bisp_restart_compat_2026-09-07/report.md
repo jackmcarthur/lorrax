@@ -82,7 +82,6 @@
 | `src/bse/absorption_common.py` | 25 | Dipole reader |
 | `src/gw/eqp_bgw.py` | 41 | Private QP/evaluation energy reader |
 | `src/postprocess/rotate_wfn_to_qp.py` | 73 | Private k-irr map reader |
-
 | `src/file_io/mpa_store.py` | 1294 | Public W, fit, head and pole readers/classes moved to shared module; writer calls the same reader |
 
 | Shared reader public surface | Returns |
@@ -110,4 +109,14 @@
 
 | Dynamic batch | Evidence |
 |---|---|
-| Ready for push | `07_soc_ns2_gn`: fresh/restart exact EQP; `00_audit/dynamic_cpu_v2.lx.log`:112 passed |
+| 64313881 pushed; claim1437 | `07_soc_ns2_gn`: fresh/restart exact EQP; `00_audit/dynamic_cpu_v2.lx.log`:112 passed |
+
+
+| Metadata seam | Verdict | Evidence |
+|---|---|---|
+| VQ metadata and dipole provenance | Actual readers moved to `file_io.restart_bundle`; removed 232 VQ and 178 PSP lines, including their private provenance handle | `read_vq_payload`, `check_dipole_provenance`; central family and q-storage decisions |
+| P4 provenance/scope/parent velocity tests | 24 passed on each rank | `00_audit/metadata_tests.rank0.log`; JID58016040 |
+| CPU counterpart | 12 passed,12 blocked by missing host FFI during producer-module import | `00_audit/metadata_cpu.lx.log`; P4 counterpart passes |
+| GW full-head restart / frozen BSE | Both complete with moved provenance reader | `06_soc_ns2_fixture/metadata_{restart,bse}.rank0.log` |
+| Historical DFT htransform control | Completes; RED reference equality: max0.0564528864 meV, RMS0.0375181558 meV over4×16 bands | `23_htransform_reference/comparison.json`; existing stamped parser from `tools/compare_bgw_inteqp_htransform.py`. Retired CLI/deck options translated; this DFT-only path reads no restart. Difference is outside bundle restoration; exact algorithmic cause unassigned |
+| ns2 GN pure-refit diagnostic, finite on-grid Q | RED:0.66200 meV against0.01 meV certificate; tolerance unchanged | `07_soc_ns2_gn/metadata_refit_finite.rank0.log`; 8v8c, four guards, refit-window=bse |

@@ -307,7 +307,9 @@ def _write_stamped(path, wfn, *, nb_written=4, dataset_nb=None,
 
 
 def test_provenance_guard_accepts_its_own_stamp(tmp_path):
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     wfn = _FakeWfn()
     p = tmp_path / "dipole.h5"
@@ -323,7 +325,9 @@ def test_provenance_guard_refuses_representation_or_vnl_sign_mismatch(
         tmp_path, monkeypatch):
     """Equal shapes do not make two velocity operators interchangeable."""
     from common import sanity
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
     wfn = _FakeWfn()
@@ -352,7 +356,9 @@ def test_provenance_guard_refuses_a_different_wfn(tmp_path, monkeypatch):
     """The case nothing on disk could detect before: same shapes, different
     DFT solution."""
     from common import sanity
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
     old = _FakeWfn(seed=0)
@@ -371,7 +377,9 @@ def test_provenance_guard_refuses_a_different_wfn(tmp_path, monkeypatch):
 def test_provenance_guard_accepts_ncond_mismatch_at_identical_q0_extent(
         tmp_path):
     """ncond labels no smaller matrix when nband already sets the extent."""
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     wfn = _FakeWfn()
     p = tmp_path / "dipole.h5"
@@ -390,7 +398,9 @@ def test_provenance_guard_refuses_unversioned_q0_operator_despite_coverage(
     """Mode/sign alone cannot authenticate the pre-exact-origin operator."""
     import h5py
     from common import sanity
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
     wfn = _FakeWfn()
@@ -410,7 +420,9 @@ def test_provenance_guard_refuses_unversioned_q0_operator_despite_coverage(
 def test_provenance_guard_refuses_ncond_mismatch_that_changes_q0_extent(
         tmp_path, monkeypatch):
     from common import sanity
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
     wfn = _FakeWfn()
@@ -432,7 +444,9 @@ def test_provenance_guard_refuses_ncond_mismatch_for_finite_q_payload(
         tmp_path, monkeypatch):
     """finite_q conduction data are literally sized by producer ncond."""
     from common import sanity
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
     wfn = _FakeWfn()
@@ -451,7 +465,9 @@ def test_provenance_guard_refuses_ncond_relaxation_when_dataset_is_short(
         tmp_path, monkeypatch):
     """A plausible coverage stamp cannot overrule the physical HDF5 axes."""
     from common import sanity
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
     wfn = _FakeWfn()
@@ -470,7 +486,9 @@ def test_provenance_guard_refuses_ncond_relaxation_when_dataset_is_short(
 def test_provenance_guard_still_refuses_nval_or_nband_mismatch(
         tmp_path, monkeypatch):
     from common import sanity
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
     wfn = _FakeWfn()
@@ -490,7 +508,9 @@ def test_provenance_guard_still_refuses_nval_or_nband_mismatch(
 
 def test_provenance_guard_reports_an_unstamped_file(tmp_path):
     import h5py
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     p = tmp_path / "old_dipole.h5"
     with h5py.File(str(p), "w") as h5:
@@ -505,7 +525,9 @@ def test_provenance_guard_reports_an_unstamped_file(tmp_path):
 def test_provenance_guard_reports_legacy_fingerprint_as_unverifiable(tmp_path):
     """A pre-content-scheme hash must not masquerade as a DFT mismatch."""
     import h5py
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     p = tmp_path / "legacy_dipole.h5"
     with h5py.File(str(p), "w") as h5:

@@ -473,11 +473,8 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
                                         spec=psi_mun_spec, mu_axis=-2,
                                         spinor_axis=1, band_axis=-1)
 
-    # G0: μ-class, read whole above.  Collapse a legacy 2-D (nqz, μ) store
-    # to its q=0 row, pad to the same in-memory μ extent as everything
-    # else, and pin it to the ν axis.  Done HERE so the reader's contract
-    # is uniform — every array it returns is padded and sharded — rather
-    # than leaving one straggler for the caller to remember.
+    # G0 is the canonical one-dimensional head vector. Pad and shard
+    # it on the same centroid extent as the restored tensors.
     if G0_mu_nu is not None:
         if G0_mu_nu.ndim != 1:
             raise ValueError(_REGENERATE)
@@ -530,15 +527,7 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
 def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
     """Read ONE ``(…, μ, ν)`` restart tensor, sharded, wedge unfolded.
 
-    ``read_restart_state_from_h5`` reads the fixed set of tensors ``gw_init``
-    writes on its ``mode="w"`` pass and deliberately does not know about
-    ``W0_qmunu`` — W is written later, by a different function, once the
-    Dyson solve has produced it.  Every consumer that wants W back has
-    therefore had to re-derive the slab request, the legacy-layout collapse
-    and the wedge unfold for itself (``bse_io`` does, at its own scale).
-    This is that read, named once, on the same three private helpers the
-    canonical reader uses, so a fourth consumer does not spell it a fourth
-    way.
+    All callers use the same slab planning, padding and q-star restoration.
 
     Returns ``None`` when the dataset is absent — which is the normal case
     for ``V_qmunu_nohead`` / ``W0_qmunu_nohead``, an opt-in pair nothing
@@ -3763,3 +3752,407 @@ def read_occupation_stamps(src, *, mode="r"):
             "smearing_width_ry": float(grp.attrs["mpa_smearing_width_ry"]),
             "occ_nelec": float(grp.attrs["mpa_occ_nelec"]),
         }
+
+
+def _fix_sphere_wrap(zx):
+    """(reference ``_fix_sphere_wrap``) Half-boundary wrap disambiguation:
+    per q, among the ±1/2 sign candidates keep the one whose sphere fits
+    max|q+G|² ≤ cutoff.  No-op on grids without half components."""
+    changed = 0
+    for q in range(zx["nq"]):
+        base = zx["qfr_raw"][q] - np.round(zx["qfr_raw"][q])
+        cands = [[]]
+        for c in range(3):
+            opts = [0.5, -0.5] if abs(abs(base[c]) - 0.5) < 1e-9 else [base[c]]
+            cands = [cc + [o] for cc in cands for o in opts]
+        n = int(zx["ngk"][q])
+        G = zx["gvec"][q][:, :n].astype(np.float64)
+        best, bestm = None, None
+        for cc in cands:
+            qc = np.asarray(cc)
+            K = zx["bvec"].T @ (qc[:, None] + G)
+            m = float(np.max(np.sum(K * K, axis=0)))
+            if bestm is None or m < bestm:
+                best, bestm = qc, m
+        assert bestm <= zx["zeta_cutoff"] + 1e-9, \
+            f"q={q}: no candidate wrap fits the stored sphere"
+        if np.max(np.abs(best - zx["qfr"][q])) > 1e-12:
+            changed += 1
+        zx["qfr"][q] = best
+    if changed:
+        print(f"  [wrapfix] {changed} of {zx['nq']} q relabeled to the "
+              f"sphere-derived center")
+
+
+
+def read_vq_payload(restart_file: str, zeta_file: str, *,
+                     mesh: Mesh | None = None, log_fn=print, input_file=None,
+                     require_slab: bool = True,
+                     require_full_bz_zeta: bool = True) -> dict:
+    """Load the coarse-grid ζ/ψ/tile data into a plain-dict bundle ``zx``.
+
+    q-LABELING (the two wrap traps, KNOWN_SANDBOX_ERRORS 2026-07-17):
+    ``zeta_q.h5 mf_header/kpoints/rk`` stores the UNWRAPPED QE list, while
+    the stored ζ spheres are centred on the BGW-WRAPPED q (worth a measured
+    155× on the physical interp ladder).  ``np.round`` is round-half-to-even,
+    so components at exactly 1/2 need the sphere itself to pick the sign:
+    keep the candidate wrap minimising max|q+G|² over the stored sphere
+    (``_fix_sphere_wrap``).  Every downstream phase/kernel uses these
+    wrapped labels.
+
+    ``require_full_bz_zeta`` is true for the interpolation model, which reads
+    every stored ζ tile.  The pure-refit caller sets it false: that route reads
+    ζ metadata and the producer's solve provenance but reconstructs ζ(Q) from
+    the canonical full-BZ WFN source, so an IBZ-only ζ file is sufficient.
+
+    THE THREE BIG q-STACKS STAY ON DISK.  ``ZG`` (nq, n_μ, ngkmax),
+    ``Vqmunu`` and ``W0`` (nq, n_μ, n_μ) are read-only and every consumer
+    slices them on the q axis, so they are kept as LAZY handles and
+    pulled per q-chunk instead of being materialised per process.  At
+    the converged MoS2 reference (nq = 144, n_μ = 2412, ngkmax = 8603) ζ
+    alone is **47.8 GB**; four ranks per Perlmutter GPU node (251 GB) cannot
+    hold it, which is what confined the exciton driver to ``--vq-mode
+    ongrid``.  Lazy, the resident host cost is ψ (3.7 GB) plus one q-chunk.
+    Same principle as the ψ(G) host cache in the GW path: large read-only
+    caches are pulled per slice, never carried.
+
+    The zeta service owns its metadata and bounded tile transport. Static
+    interactions and family wavefunctions use this module's canonical
+    parent-face and q-star readers. The returned cache owns one zeta handle,
+    released by the consuming VQ cache's close operation.
+
+    ``mesh`` selects the ζ TRANSPORT (see :func:`_zeta_mesh_for_loader`):
+    with a mesh whose stack can serve SlabIO, ``prepare_coarse``'s q-chunk
+    read becomes a per-rank hyperslab; without one, the local h5py plan
+    runs, byte-identical.  It is optional so the host-only diagnostics and
+    the fixture tests keep working on a bare checkout.
+    """
+    from bse.vq_interp import (
+        assert_slab_scope,
+    )
+    zx = {"restart_file": restart_file, "zeta_file": zeta_file}
+    zx.update(read_coarse_interactions(restart_file, input_file, mesh))
+    _mesh_for_loader, _distributed = _zeta_mesh_for_loader(mesh, log_fn=log_fn)
+    zl = open_zeta(zeta_file, mesh=_mesh_for_loader)
+    zx["_zeta_loader"] = zl
+    zx["zeta_distributed"] = _distributed
+    zx["ZG"] = _ZetaGTiles(zl, path=zeta_file, distributed=_distributed)
+    # ``ngk_per_q`` is ``isdf_header/ngk`` (the per-q ζ SPHERE size).
+    # ``zl.ngk`` is a DIFFERENT array — ``mf_header/kpoints/ngk``, the
+    # WFN's per-k G count, bound by ``bind_mf_attrs``.  Reading the wrong
+    # one truncates every sphere silently.
+    zx["gvec"] = np.asarray(zl.gvec_components).astype(np.int64)
+    zx["ngk"] = np.asarray(zl.ngk_per_q).astype(int)
+    fg = np.asarray(zl.fft_grid).astype(int)
+    qraw = np.array(zl.kpoints, copy=True)
+    zx["adot"] = np.asarray(zl.adot)
+    blat = float(np.real(zl.blat))
+    # BGW stores bvec in units of blat = 2π/alat; physical bohr⁻¹
+    # (|bvec^T g|² in Ry) needs the blat factor (measured: 10.4%
+    # makeVq-vs-disk residual without it).
+    zx["bvec"] = np.asarray(zl.bvec) * blat
+    zx["celvol"] = float(np.real(zl.cell_volume))
+    rmu_idx = np.asarray(zl.r_mu_fft_idx).astype(int)
+    zx["zeta_cutoff"] = float(zl.zeta_cutoff_ry)
+    ifmax = np.asarray(zl.ifmax)
+    zx["nk"], zx["nb"], zx["ns"], zx["n_mu"] = zx["psi"].shape
+    zx["nq"] = zx["ZG"].shape[0]
+    zx["ngkmax"] = zx["ZG"].shape[2]
+    zx["nx"], zx["ny"], zx["nz"] = [int(x) for x in fg]
+    zx["n_rtot"] = zx["nx"] * zx["ny"] * zx["nz"]
+    if require_full_bz_zeta and zx["nq"] != zx["nk"]:
+        raise ValueError(
+            f"vq_interp needs FULL-BZ zeta storage: zeta_q.h5 has nq={zx['nq']} "
+            f"but the k-grid has nk={zx['nk']} (IBZ cascade active).  "
+            f"Regenerate the fit with full-BZ zeta, or wait for the IBZ-zeta "
+            f"unfold (deferred; must route through the one SymMaps sym-action).")
+    if not require_full_bz_zeta and zx["nq"] != zx["nk"]:
+        log_fn(
+            f"  [vq_interp] pure refit accepts IBZ-only ζ metadata: "
+            f"nq={zx['nq']}, full-BZ nk={zx['nk']}. Stored ZG is not read; "
+            "the symmetry service supplies the full-BZ WFN source and the "
+            "restart loader supplies unfolded V_qmunu for the on-grid gate.")
+    # ── q LABELS FOR A FULL-BZ ζ WRITTEN FROM A SYMMETRY-REDUCED WFN ──────
+    # ``mf_header`` is copied verbatim from the WFN, so ``kpoints/rk`` holds
+    # the WFN's k-list — the IBZ when the mean-field run used symmetry.  The ζ
+    # historical full-BZ ζ writer stored:
+    # ``_bgw_wrap_q(sym.kvecs_asints) / kgrid`` (gw/isdf_fitting.py, the
+    # ``q_irr_frac is None`` branch).  On the MoS2 4x4 deck that is 16 ζ tiles
+    # against a 10-row ``rk``, and ``qraw[:nq]`` silently returned 10 rows —
+    # surfacing three lines later as the misleading "duplicate k labels in rk
+    # list" (job 7882499 cell exb64s).  Reconstruct the writer's own list.
+    #
+    # THIS IS NOT TAKEN ON TRUST.  ``run_gates`` rebuilds V from ζ at EVERY q
+    # and compares it against the stored ``V_qmunu[q]`` at 5e-6
+    # (``makeVq_vs_disk_Vqmunu_allq_max``).  A permuted or mis-wrapped q list
+    # cannot pass that: each q's ζ would be checked against a different q's
+    # stored tile.  Do not run this path with ``LORRAX_SKIP_VQ_GATES=1`` until
+    # it has passed once on a given deck.
+    if qraw.shape[0] < zx["nq"]:
+        _kg = np.asarray(zx["kgrid"], dtype=np.float64)
+        _idx = np.stack(np.meshgrid(np.arange(_kg[0]), np.arange(_kg[1]),
+                                    np.arange(_kg[2]), indexing="ij"),
+                        axis=-1).reshape(-1, 3).astype(np.float64)
+        _wrapped = np.where(_idx > _kg[None, :] / 2.0, _idx - _kg[None, :], _idx)
+        qfull = _wrapped / _kg[None, :]
+        # Necessary condition: every k the mean-field header DOES carry must
+        # appear in the reconstruction (catches a transposed grid or the wrong
+        # wrap convention, both of which would otherwise reach run_gates as a
+        # confusing numerical failure).
+        _have = {tuple(np.rint(v * _kg).astype(int) % _kg.astype(int))
+                 for v in qfull}
+        _missing = [tuple(np.rint(v * _kg).astype(int) % _kg.astype(int))
+                    for v in qraw if tuple(np.rint(v * _kg).astype(int)
+                                           % _kg.astype(int)) not in _have]
+        if _missing:
+            raise ValueError(
+                f"reconstructed full-BZ q list does not contain "
+                f"{len(_missing)} of the {qraw.shape[0]} mf_header k-points "
+                f"(e.g. {_missing[0]}); the on-disk q ordering is not the "
+                f"C-order wrapped {tuple(int(v) for v in zx['kgrid'])} grid "
+                f"this reconstruction assumes.")
+        try:
+            _first = jax.process_index() == 0
+        except Exception:
+            _first = True
+        if _first:
+            print(f"  [vq_interp] zeta_q.h5 holds {zx['nq']} full-BZ q but "
+                  f"mf_header/kpoints/rk has only {qraw.shape[0]} (the WFN is "
+                  f"symmetry-reduced).  q labels reconstructed as the BGW-"
+                  f"wrapped C-order {tuple(int(v) for v in zx['kgrid'])} grid; "
+                  f"run_gates' per-q makeVq-vs-disk check verifies it.",
+                  flush=True)
+        qraw = qfull
+    zx["qfr_raw"] = qraw[: zx["nq"]]
+    zx["qfr"] = zx["qfr_raw"] - np.round(zx["qfr_raw"])  # BGW-wrapped, pre half-fix
+    kg = zx["kgrid"]
+    zx["k_int"] = np.rint(zx["qfr_raw"] * kg[None, :]).astype(int) % kg[None, :]
+    zx["k_lookup"] = {tuple(v): i for i, v in enumerate(zx["k_int"])}
+    assert len(zx["k_lookup"]) == zx["nq"], "duplicate k labels in rk list"
+    rx = np.arange(zx["nx"]) / zx["nx"]
+    ry = np.arange(zx["ny"]) / zx["ny"]
+    rz = np.arange(zx["nz"]) / zx["nz"]
+    RX, RY, RZ = np.meshgrid(rx, ry, rz, indexing="ij")
+    zx["rfrac"] = np.stack([RX.ravel(), RY.ravel(), RZ.ravel()], 1)
+    dims = np.array([zx["nx"], zx["ny"], zx["nz"]])
+    zx["rmu_frac"] = rmu_idx / dims[None, :]     # centroid frac coords s_μ
+    zx["rmu_flat"] = ((rmu_idx[:, 0] * zx["ny"]) + rmu_idx[:, 1]) * zx["nz"] \
+        + rmu_idx[:, 2]
+    zx["nv"] = int(ifmax.ravel()[0])
+    assert np.all(ifmax == zx["nv"]), "ifmax not uniform over k"
+    _fix_sphere_wrap(zx)
+    # SCOPE, before anything expensive.  The stamp is scalar metadata read
+    # with serial h5py (safe on every rank, no SlabIO handle), and it is the
+    # deck's own record of which Coulomb kernel built ``V_qmunu`` — the one
+    # fact this module cannot derive from geometry.  NOT re-announced here:
+    # ``bse_io`` already prints ``describe_coulomb_policy_stamp`` once per
+    # driver run, and the row-23 log shows that line sitting one screen above
+    # the gate failures it explained.  The stamp was never missing; nothing
+    # READ it.  So the fix is a refusal that quotes it, not a second copy.
+    from file_io import read_coulomb_policy_from_h5
+    zx["policy"] = read_coulomb_policy_from_h5(restart_file)
+    # ``require_slab=False`` is the REFIT caller, and it is not a bypass of
+    # the scope check — it is the observation that the scope check is about a
+    # part of this module the refit never touches.  Both slab-only facts
+    # (:func:`slab_scope_violations`) are properties of the b26p long-range
+    # MODEL and of ``v_slab_on_set``; the refit fits ζ at the target Q and
+    # contracts it with the kernel :func:`make_v_on_set` hands it, which on a
+    # bulk deck is the producer's own.  The check therefore moved to
+    # ``build_vq_evaluator`` — the model build — rather than being weakened,
+    # so an interp/both run on a bulk deck refuses exactly as loudly as
+    # before, one call later and before anything expensive still.
+    if require_slab:
+        assert_slab_scope(zx["bvec"], qfr=zx["qfr"], policy=zx["policy"],
+                          source=restart_file)
+    return zx
+
+
+
+def check_dipole_provenance(
+    path, *, wfn, nval, ncond, nband,
+    bispinor=None, skip_vnl=None, vnl_mode=None, vnl_velocity_sign=None,
+    wfn_fingerprint_binding=None,
+    print_fn=print,
+) -> bool:
+    """Does ``path`` match the WFN, window, and requested operator convention?
+
+    Returns True only when a stamp exists AND agrees.  Disagreement goes
+    through ``common.sanity.warn`` (the same channel
+    ``gw.head_correction`` uses for its coverage check) so a strict run
+    turns it into a refusal and a permissive one still prints loudly.
+    A MISSING stamp is reported as such and returns False — an
+    unstamped file predates this guard and cannot be vouched for.
+    """
+    from psp.get_dipole_mtxels import (
+        WFN_FINGERPRINT_SCHEME,
+        _DIPOLE_Q0_OPERATOR_SCHEME,
+        _PROV_ATTRS,
+        _prov_ne,
+        _prov_show,
+        wfn_fingerprint,
+    )
+    from common import sanity
+    from common.parallel_transport import fingerprint_from_binding
+
+    try:
+        with h5py.File(str(path), "r") as h5:
+            attrs = {k: h5.attrs[k] for k in _PROV_ATTRS if k in h5.attrs}
+            ncond_mismatch = (
+                "prov_ncond" not in attrs
+                or _prov_ne(attrs["prov_ncond"], int(ncond)))
+            q0_ncond_ok, q0_ncond_detail = (False, "prov_ncond is absent")
+            if ncond_mismatch and "prov_ncond" in attrs:
+                q0_ncond_ok, q0_ncond_detail = _q0_ncond_coverage(
+                    h5, wfn=wfn, ncond=ncond, nband=nband)
+    except OSError as exc:
+        print_fn(f"  [dipole provenance] cannot open {path} "
+                 f"({type(exc).__name__}: {exc})")
+        return False
+
+    if "prov_wfn_sha256" not in attrs:
+        print_fn(f"  [dipole provenance] {path} carries no provenance stamp "
+                 f"(written before the guard existed).  Regenerate with "
+                 f"`python -m psp.get_dipole_mtxels` to make it checkable.")
+        return False
+
+    got_scheme = attrs.get("prov_wfn_fingerprint_scheme")
+    if isinstance(got_scheme, bytes):
+        got_scheme = got_scheme.decode()
+    fingerprint_checkable = got_scheme == WFN_FINGERPRINT_SCHEME
+    if got_scheme is None:
+        print_fn(
+            "  [dipole provenance] the WFN fingerprint predates the "
+            f"location-independent {WFN_FINGERPRINT_SCHEME!r} scheme and "
+            "cannot be compared across checkouts; regenerate dipole.h5 with "
+            "`python -m psp.get_dipole_mtxels` to make the WFN identity "
+            "checkable.")
+    elif not fingerprint_checkable:
+        print_fn(
+            "  [dipole provenance] the WFN fingerprint uses unsupported "
+            f"scheme {got_scheme!r}, not {WFN_FINGERPRINT_SCHEME!r}; "
+            "regenerate dipole.h5 with `python -m psp.get_dipole_mtxels` "
+            "to make it checkable.")
+    if not fingerprint_checkable:
+        # This is an identity refusal, not evidence that any later field
+        # differs.  Preserve that distinction: legacy-fingerprint tests and
+        # users must not receive a fabricated DFT/window/operator mismatch
+        # merely because a newly required field is also absent.
+        return False
+
+    # ``prov_nspinor`` rides the present-key filter below: a legacy file
+    # that predates the stamp is accepted (same reading as every other
+    # prov_* attr), while a STAMPED mismatch refuses — a dipole.h5 built
+    # from an nspinor=1 WFN has the right shape for an nspinor=2 run of
+    # the same crystal and vice versa (INVARIANTS row 3: representation).
+    want = {"prov_nval": int(nval), "prov_ncond": int(ncond),
+            "prov_nband": int(nband),
+            "prov_q0_operator_scheme": _DIPOLE_Q0_OPERATOR_SCHEME}
+    if fingerprint_checkable:
+        want["prov_wfn_sha256"] = (
+            wfn_fingerprint(wfn)
+            if wfn_fingerprint_binding is None
+            else fingerprint_from_binding(wfn_fingerprint_binding, wfn))
+    optional = {
+        "prov_bispinor": bispinor,
+        "prov_skip_vnl": skip_vnl,
+        "prov_vnl_mode": vnl_mode,
+        "prov_vnl_velocity_sign": vnl_velocity_sign,
+    }
+    want.update({key: value for key, value in optional.items()
+                 if value is not None})
+    # An expected operator field that is absent is not a legacy default: it is
+    # uncheckable provenance.  The caller choosing that convention must fail
+    # closed instead of silently reading whichever operator made the file.
+    bad = [(k, attrs.get(k, "<absent>"), v) for k, v in want.items()
+           if (k != "prov_ncond" or not q0_ncond_ok)
+           and (k not in attrs or _prov_ne(attrs[k], v))]
+    # prov_nspinor: required-IF-PRESENT (the comment above this want dict
+    # is the contract) — a legacy file that predates the stamp is accepted,
+    # a stamped mismatch refuses.
+    if "prov_nspinor" in attrs and _prov_ne(attrs["prov_nspinor"],
+                                            int(wfn.nspinor)):
+        bad.append(("prov_nspinor", attrs["prov_nspinor"],
+                    int(wfn.nspinor)))
+    if bad:
+        detail = "; ".join(f"{k}: file={_prov_show(got)} run={_prov_show(exp)}"
+                           for k, got, exp in bad)
+        if ncond_mismatch and not q0_ncond_ok:
+            detail += f"; q→0 coverage refusal: {q0_ncond_detail}"
+        sanity.warn(
+            f"{path} was generated from a DIFFERENT DFT solution, spin representation, band "
+            f"window, or velocity/representation convention than this run "
+            f"({detail}).  dipole.h5 has the right shape either way, so a "
+            f"shape-only reader would not notice: the q→0 head S(ω), and "
+            f"every Σ_SX/Σ_COH correction built from it, would be assembled "
+            f"from incompatible velocity matrix elements.  "
+            f"Regenerate it with `python -m psp.get_dipole_mtxels -i <deck>`.",
+            print_fn=print_fn)
+        return False
+
+    if ncond_mismatch:
+        print_fn(
+            "  [dipole provenance] producer "
+            f"ncond={int(np.asarray(attrs['prov_ncond']))} differs from run "
+            f"ncond={int(ncond)}, accepted because {q0_ncond_detail}; the "
+            "ordinary payload is the same full-square operator.")
+    print_fn(
+        f"  dipole.h5 provenance OK (WFN {want['prov_wfn_sha256'][:12]}…, "
+        f"window nval={int(nval)} ncond={int(ncond)} nband={int(nband)}"
+        + (f", bispinor={bool(bispinor)}" if bispinor is not None else "")
+        + (f", vnl_velocity_sign={float(vnl_velocity_sign):+.1f}"
+           if vnl_velocity_sign is not None else "")
+        + ")")
+    return True
+
+
+
+def _q0_ncond_coverage(h5, *, wfn, ncond, nband) -> tuple[bool, str]:
+    """Can an ``ncond``-mismatched file represent the identical q→0 matrix?"""
+    from psp.get_dipole_mtxels import (
+        _resolve_dipole_nb_written,
+    )
+    expected = _resolve_dipole_nb_written(
+        wfn, ncond=int(ncond), nband=int(nband))
+    if "finite_q" in h5:
+        return False, (
+            "finite_q/ is present and its stored conduction axis is sized by "
+            "the producer's ncond")
+
+    problems = []
+    if "prov_nb_written" not in h5.attrs:
+        problems.append("prov_nb_written is absent")
+    else:
+        got = int(np.asarray(h5.attrs["prov_nb_written"]))
+        producer_expected = _resolve_dipole_nb_written(
+            wfn,
+            ncond=int(np.asarray(h5.attrs["prov_ncond"])),
+            nband=int(np.asarray(h5.attrs.get("prov_nband", nband))),
+        )
+        if got != producer_expected:
+            problems.append(
+                f"prov_nb_written: file={got} producer-resolved="
+                f"{producer_expected}")
+        if got != expected:
+            problems.append(
+                f"prov_nb_written: file={got} run-resolved={expected}")
+
+    shapes = {}
+    for name, rank in (("dipole_cart", 4), ("deltaE", 3)):
+        if name not in h5:
+            problems.append(f"{name} is absent")
+            continue
+        shape = tuple(int(v) for v in h5[name].shape)
+        shapes[name] = shape
+        if len(shape) != rank or shape[-2:] != (expected, expected):
+            problems.append(
+                f"{name} shape={shape}, expected square band axes "
+                f"({expected},{expected})")
+    if (len(shapes.get("dipole_cart", ())) >= 2
+            and len(shapes.get("deltaE", ())) >= 1
+            and shapes["dipole_cart"][1] != shapes["deltaE"][0]):
+        problems.append(
+            "dipole_cart and deltaE carry different k extents "
+            f"({shapes['dipole_cart'][1]} versus {shapes['deltaE'][0]})")
+
+    return not problems, ("; ".join(problems) if problems
+                          else f"identical q→0 extent {expected}")

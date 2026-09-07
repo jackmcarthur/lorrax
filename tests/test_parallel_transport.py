@@ -89,7 +89,11 @@ def test_wfn_fingerprint_refuses_sampled_coefficient_mismatch(
 
     from common import sanity
     from psp.get_dipole_mtxels import (
-        check_dipole_provenance, stamp_dipole_provenance)
+        stamp_dipole_provenance,
+    )
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
     dipole = tmp_path / "dipole.h5"
@@ -133,7 +137,11 @@ def test_wfn_fingerprint_accepts_byte_identical_copy(tmp_path):
     assert wfn_fingerprint(wfn_a) == wfn_fingerprint(wfn_b)
 
     from psp.get_dipole_mtxels import (
-        check_dipole_provenance, stamp_dipole_provenance)
+        stamp_dipole_provenance,
+    )
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     dipole = tmp_path / "dipole.h5"
     with h5py.File(dipole, "w") as h5:

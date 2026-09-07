@@ -64,7 +64,7 @@ def _synthetic_zx(qfrac):
 
     One stored q slot at ``qfrac`` with a sphere of ``_NGK`` distinct Miller
     triples, the FFT grid, ``rfrac`` and ``rmu_frac`` — the same keys
-    ``load_zeta_coarse`` binds, spelled the same way.
+    ``read_vq_payload`` binds, spelled the same way.
     """
     nx, ny, nz = _FFT
     n_rtot = nx * ny * nz

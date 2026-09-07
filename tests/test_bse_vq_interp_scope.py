@@ -46,7 +46,7 @@ def _planar_q(n=4):
 
 
 def _bgw_wrapped_q(kgrid=(4, 4, 4)):
-    """si_bse_debug's own 4x4x4 q list in the BGW wrap, as load_zeta_coarse
+    """si_bse_debug's own 4x4x4 q list in the BGW wrap, as read_vq_payload
     reconstructs it: wrap to (-k/2, k/2], then divide."""
     kg = np.asarray(kgrid, dtype=np.float64)
     idx = np.stack(np.meshgrid(*[np.arange(int(s)) for s in kgrid],
@@ -162,12 +162,12 @@ def test_the_scope_check_is_wired_into_the_loader():
     file exists to avoid."""
     import ast
     import inspect
-    src = inspect.getsource(V.load_zeta_coarse)
+    src = inspect.getsource(V.read_vq_payload)
     tree = ast.parse(src.lstrip())
     called = {n.func.id for n in ast.walk(tree)
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert "assert_slab_scope" in called, (
-        "load_zeta_coarse no longer applies the slab-scope refusal; every "
+        "read_vq_payload no longer applies the slab-scope refusal; every "
         "vq_interp entry point reaches the model through it")
 
 

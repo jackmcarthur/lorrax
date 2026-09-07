@@ -62,10 +62,8 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common import timing
 from common.collectives import barrier, process_rank
 from file_io import (
-    load_restart_state_from_h5,
     parse_coulomb_policy,
     read_coulomb_policy_from_h5,
-    read_munu_tensor_from_h5,
     write_head_scalars_to_h5,
     write_restart_state_to_h5,
 )
@@ -1297,7 +1295,7 @@ def _zeta_q_to_restart_q(zl, kgrid, nq_disk, *, n_q=None, print_fn=print):
     So: when ``rk`` is long enough to label every stored q, MATCH on it (an
     exact wrapped-integer match, no tolerance games).  When it is short, the
     writer's own full-BZ order is the wrapped C-order grid — the same
-    reconstruction ``vq_interp.load_zeta_coarse`` makes on the read side, and
+    reconstruction ``vq_interp.read_vq_payload`` makes on the read side, and
     the same one its per-q makeVq-vs-disk gate verifies — so the identity is
     the answer and this says which branch it took.
 

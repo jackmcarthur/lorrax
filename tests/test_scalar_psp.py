@@ -236,7 +236,9 @@ def _write_stamped(path, wfn, **kw):
 
 def test_prov_nspinor_and_soc_are_stamped_and_accepted(tmp_path):
     import h5py
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     wfn = _FakeWfn(nspinor=1)
     p = tmp_path / "dipole.h5"
@@ -252,7 +254,9 @@ def test_prov_nspinor_mismatch_refuses(tmp_path, monkeypatch):
     # Red twin: an nspinor=1 artifact has the right SHAPE for an nspinor=2
     # run of the same crystal, so only the stamp can catch the reuse.
     from common import sanity
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
     p = tmp_path / "dipole.h5"
@@ -271,7 +275,9 @@ def test_prov_nspinor_missing_stamp_is_legacy_accepted(tmp_path):
     # A file written by a pre-stamp producer carries no prov_nspinor and
     # must keep working — same reading as prov_vnl_velocity_sign.
     import h5py
-    from psp.get_dipole_mtxels import check_dipole_provenance
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+    )
 
     wfn = _FakeWfn(nspinor=2)
     p = tmp_path / "dipole.h5"

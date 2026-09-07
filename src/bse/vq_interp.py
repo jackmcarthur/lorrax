@@ -69,7 +69,7 @@ slab-only (q_z = 0 coarse grids and slab-separable axes; the per-G_z channels
 are exact nowhere else), and that half is ENFORCED by
 :func:`slab_scope_violations`, from :func:`build_vq_evaluator` — the MODEL
 build — before anything expensive.  It used to fire at load, and moved when
-the refit below stopped being slab-bound; ``load_zeta_coarse`` still defaults
+the refit below stopped being slab-bound; ``read_vq_payload`` still defaults
 to ``require_slab=True`` and only the refit caller passes ``False``.  Both
 The interpolation model needs FULL-BZ stored ζ (nq == nk); unfolding its
 stored tiles through the canonical symmetry service remains separate work.
@@ -142,7 +142,7 @@ from common.sharding_fit import legal_spec as _legal_spec        # noqa: E402
 # The ζ file's DOOR.  TOP-LEVEL name only: ``zeta_loader.loader`` would be
 # a past-the-door edge and ``tests/test_layering.py`` fails on those.  The
 # ``ensure_on_path()`` above is what makes it resolvable in a bare launch.
-from file_io.restart_bundle import (open_zeta as ZetaLoader)
+from file_io.restart_bundle import read_vq_payload
 
 
 # ===========================================================================
@@ -272,202 +272,10 @@ def assert_slab_scope(bvec, qfr=None, policy=None, *, source="") -> None:
 # ===========================================================================
 # coarse-data loading (reference load_fixture, with paths as arguments)
 # ===========================================================================
-def load_zeta_coarse(restart_file: str, zeta_file: str, *,
-                     mesh: Mesh | None = None, log_fn=print, input_file=None,
-                     require_slab: bool = True,
-                     require_full_bz_zeta: bool = True) -> dict:
-    """Load the coarse-grid ζ/ψ/tile data into a plain-dict bundle ``zx``.
-
-    q-LABELING (the two wrap traps, KNOWN_SANDBOX_ERRORS 2026-07-17):
-    ``zeta_q.h5 mf_header/kpoints/rk`` stores the UNWRAPPED QE list, while
-    the stored ζ spheres are centred on the BGW-WRAPPED q (worth a measured
-    155× on the physical interp ladder).  ``np.round`` is round-half-to-even,
-    so components at exactly 1/2 need the sphere itself to pick the sign:
-    keep the candidate wrap minimising max|q+G|² over the stored sphere
-    (``_fix_sphere_wrap``).  Every downstream phase/kernel uses these
-    wrapped labels.
-
-    ``require_full_bz_zeta`` is true for the interpolation model, which reads
-    every stored ζ tile.  The pure-refit caller sets it false: that route reads
-    ζ metadata and the producer's solve provenance but reconstructs ζ(Q) from
-    the canonical full-BZ WFN source, so an IBZ-only ζ file is sufficient.
-
-    THE THREE BIG q-STACKS STAY ON DISK.  ``ZG`` (nq, n_μ, ngkmax),
-    ``Vqmunu`` and ``W0`` (nq, n_μ, n_μ) are read-only and every consumer
-    slices them on the q axis, so they are kept as LAZY handles and
-    pulled per q-chunk instead of being materialised per process.  At
-    the converged MoS2 reference (nq = 144, n_μ = 2412, ngkmax = 8603) ζ
-    alone is **47.8 GB**; four ranks per Perlmutter GPU node (251 GB) cannot
-    hold it, which is what confined the exciton driver to ``--vq-mode
-    ongrid``.  Lazy, the resident host cost is ψ (3.7 GB) plus one q-chunk.
-    Same principle as the ψ(G) host cache in the GW path: large read-only
-    caches are pulled per slice, never carried.
-
-    READERS AND OWNERSHIP.  ``zeta_q.h5`` is read by exactly ONE object,
-    :class:`zeta_loader.ZetaLoader` — every header/metadata value
-    below is one of its attributes, the ζ tiles come through
-    :class:`_ZetaGTiles`, which wraps that same loader, and since the V4
-    replumb the tiles' serial h5py handle is the loader's too — so this
-    module does not open ``zeta_q.h5`` at all any more.  It used to open
-    it itself and re-derive the G-flat layout contract
-    (per-q ``gvec_components`` padded with the sentinel Miller index,
-    ``ngk``, ``ngkmax``, the ``zeta_q_G[q, :, ngk[q]:] == 0``
-    guarantee) from raw datasets, which made it a SECOND independent
-    reader of a layout only ``ZetaLoader``/``common.coulomb_sphere``
-    define.  ``restart_file`` (``psi_full_y`` / ``V_qmunu`` /
-    ``W0_qmunu`` / ``enk_full``) has no such owner — it is not a ζ file
-    and no loader class covers it — so its handle is still a raw
-    ``h5py.File``, but it is now closed explicitly by
-    :func:`close_zeta_coarse` rather than kept alive by the convention
-    that nobody drops ``zx``.
-
-    ``mesh`` selects the ζ TRANSPORT (see :func:`_zeta_mesh_for_loader`):
-    with a mesh whose stack can serve SlabIO, ``prepare_coarse``'s q-chunk
-    read becomes a per-rank hyperslab; without one, the local h5py plan
-    runs, byte-identical.  It is optional so the host-only diagnostics and
-    the fixture tests keep working on a bare checkout.
-    """
-    from file_io.restart_bundle import (read_coarse_interactions,
-        _zeta_mesh_for_loader, _ZetaGTiles)
-    zx = {"restart_file": restart_file, "zeta_file": zeta_file}
-    zx.update(read_coarse_interactions(restart_file, input_file, mesh))
-    _mesh_for_loader, _distributed = _zeta_mesh_for_loader(mesh, log_fn=log_fn)
-    zl = ZetaLoader(zeta_file, mesh=_mesh_for_loader)
-    zx["_zeta_loader"] = zl
-    zx["zeta_distributed"] = _distributed
-    zx["ZG"] = _ZetaGTiles(zl, path=zeta_file, distributed=_distributed)
-    # ``ngk_per_q`` is ``isdf_header/ngk`` (the per-q ζ SPHERE size).
-    # ``zl.ngk`` is a DIFFERENT array — ``mf_header/kpoints/ngk``, the
-    # WFN's per-k G count, bound by ``bind_mf_attrs``.  Reading the wrong
-    # one truncates every sphere silently.
-    zx["gvec"] = np.asarray(zl.gvec_components).astype(np.int64)
-    zx["ngk"] = np.asarray(zl.ngk_per_q).astype(int)
-    fg = np.asarray(zl.fft_grid).astype(int)
-    qraw = np.array(zl.kpoints, copy=True)
-    zx["adot"] = np.asarray(zl.adot)
-    blat = float(np.real(zl.blat))
-    # BGW stores bvec in units of blat = 2π/alat; physical bohr⁻¹
-    # (|bvec^T g|² in Ry) needs the blat factor (measured: 10.4%
-    # makeVq-vs-disk residual without it).
-    zx["bvec"] = np.asarray(zl.bvec) * blat
-    zx["celvol"] = float(np.real(zl.cell_volume))
-    rmu_idx = np.asarray(zl.r_mu_fft_idx).astype(int)
-    zx["zeta_cutoff"] = float(zl.zeta_cutoff_ry)
-    ifmax = np.asarray(zl.ifmax)
-    zx["nk"], zx["nb"], zx["ns"], zx["n_mu"] = zx["psi"].shape
-    zx["nq"] = zx["ZG"].shape[0]
-    zx["ngkmax"] = zx["ZG"].shape[2]
-    zx["nx"], zx["ny"], zx["nz"] = [int(x) for x in fg]
-    zx["n_rtot"] = zx["nx"] * zx["ny"] * zx["nz"]
-    if require_full_bz_zeta and zx["nq"] != zx["nk"]:
-        raise ValueError(
-            f"vq_interp needs FULL-BZ zeta storage: zeta_q.h5 has nq={zx['nq']} "
-            f"but the k-grid has nk={zx['nk']} (IBZ cascade active).  "
-            f"Regenerate the fit with full-BZ zeta, or wait for the IBZ-zeta "
-            f"unfold (deferred; must route through the one SymMaps sym-action).")
-    if not require_full_bz_zeta and zx["nq"] != zx["nk"]:
-        log_fn(
-            f"  [vq_interp] pure refit accepts IBZ-only ζ metadata: "
-            f"nq={zx['nq']}, full-BZ nk={zx['nk']}. Stored ZG is not read; "
-            "the symmetry service supplies the full-BZ WFN source and the "
-            "restart loader supplies unfolded V_qmunu for the on-grid gate.")
-    # ── q LABELS FOR A FULL-BZ ζ WRITTEN FROM A SYMMETRY-REDUCED WFN ──────
-    # ``mf_header`` is copied verbatim from the WFN, so ``kpoints/rk`` holds
-    # the WFN's k-list — the IBZ when the mean-field run used symmetry.  The ζ
-    # historical full-BZ ζ writer stored:
-    # ``_bgw_wrap_q(sym.kvecs_asints) / kgrid`` (gw/isdf_fitting.py, the
-    # ``q_irr_frac is None`` branch).  On the MoS2 4x4 deck that is 16 ζ tiles
-    # against a 10-row ``rk``, and ``qraw[:nq]`` silently returned 10 rows —
-    # surfacing three lines later as the misleading "duplicate k labels in rk
-    # list" (job 7882499 cell exb64s).  Reconstruct the writer's own list.
-    #
-    # THIS IS NOT TAKEN ON TRUST.  ``run_gates`` rebuilds V from ζ at EVERY q
-    # and compares it against the stored ``V_qmunu[q]`` at 5e-6
-    # (``makeVq_vs_disk_Vqmunu_allq_max``).  A permuted or mis-wrapped q list
-    # cannot pass that: each q's ζ would be checked against a different q's
-    # stored tile.  Do not run this path with ``LORRAX_SKIP_VQ_GATES=1`` until
-    # it has passed once on a given deck.
-    if qraw.shape[0] < zx["nq"]:
-        _kg = np.asarray(zx["kgrid"], dtype=np.float64)
-        _idx = np.stack(np.meshgrid(np.arange(_kg[0]), np.arange(_kg[1]),
-                                    np.arange(_kg[2]), indexing="ij"),
-                        axis=-1).reshape(-1, 3).astype(np.float64)
-        _wrapped = np.where(_idx > _kg[None, :] / 2.0, _idx - _kg[None, :], _idx)
-        qfull = _wrapped / _kg[None, :]
-        # Necessary condition: every k the mean-field header DOES carry must
-        # appear in the reconstruction (catches a transposed grid or the wrong
-        # wrap convention, both of which would otherwise reach run_gates as a
-        # confusing numerical failure).
-        _have = {tuple(np.rint(v * _kg).astype(int) % _kg.astype(int))
-                 for v in qfull}
-        _missing = [tuple(np.rint(v * _kg).astype(int) % _kg.astype(int))
-                    for v in qraw if tuple(np.rint(v * _kg).astype(int)
-                                           % _kg.astype(int)) not in _have]
-        if _missing:
-            raise ValueError(
-                f"reconstructed full-BZ q list does not contain "
-                f"{len(_missing)} of the {qraw.shape[0]} mf_header k-points "
-                f"(e.g. {_missing[0]}); the on-disk q ordering is not the "
-                f"C-order wrapped {tuple(int(v) for v in zx['kgrid'])} grid "
-                f"this reconstruction assumes.")
-        try:
-            _first = jax.process_index() == 0
-        except Exception:
-            _first = True
-        if _first:
-            print(f"  [vq_interp] zeta_q.h5 holds {zx['nq']} full-BZ q but "
-                  f"mf_header/kpoints/rk has only {qraw.shape[0]} (the WFN is "
-                  f"symmetry-reduced).  q labels reconstructed as the BGW-"
-                  f"wrapped C-order {tuple(int(v) for v in zx['kgrid'])} grid; "
-                  f"run_gates' per-q makeVq-vs-disk check verifies it.",
-                  flush=True)
-        qraw = qfull
-    zx["qfr_raw"] = qraw[: zx["nq"]]
-    zx["qfr"] = zx["qfr_raw"] - np.round(zx["qfr_raw"])  # BGW-wrapped, pre half-fix
-    kg = zx["kgrid"]
-    zx["k_int"] = np.rint(zx["qfr_raw"] * kg[None, :]).astype(int) % kg[None, :]
-    zx["k_lookup"] = {tuple(v): i for i, v in enumerate(zx["k_int"])}
-    assert len(zx["k_lookup"]) == zx["nq"], "duplicate k labels in rk list"
-    rx = np.arange(zx["nx"]) / zx["nx"]
-    ry = np.arange(zx["ny"]) / zx["ny"]
-    rz = np.arange(zx["nz"]) / zx["nz"]
-    RX, RY, RZ = np.meshgrid(rx, ry, rz, indexing="ij")
-    zx["rfrac"] = np.stack([RX.ravel(), RY.ravel(), RZ.ravel()], 1)
-    dims = np.array([zx["nx"], zx["ny"], zx["nz"]])
-    zx["rmu_frac"] = rmu_idx / dims[None, :]     # centroid frac coords s_μ
-    zx["rmu_flat"] = ((rmu_idx[:, 0] * zx["ny"]) + rmu_idx[:, 1]) * zx["nz"] \
-        + rmu_idx[:, 2]
-    zx["nv"] = int(ifmax.ravel()[0])
-    assert np.all(ifmax == zx["nv"]), "ifmax not uniform over k"
-    _fix_sphere_wrap(zx)
-    # SCOPE, before anything expensive.  The stamp is scalar metadata read
-    # with serial h5py (safe on every rank, no SlabIO handle), and it is the
-    # deck's own record of which Coulomb kernel built ``V_qmunu`` — the one
-    # fact this module cannot derive from geometry.  NOT re-announced here:
-    # ``bse_io`` already prints ``describe_coulomb_policy_stamp`` once per
-    # driver run, and the row-23 log shows that line sitting one screen above
-    # the gate failures it explained.  The stamp was never missing; nothing
-    # READ it.  So the fix is a refusal that quotes it, not a second copy.
-    from file_io import read_coulomb_policy_from_h5
-    zx["policy"] = read_coulomb_policy_from_h5(restart_file)
-    # ``require_slab=False`` is the REFIT caller, and it is not a bypass of
-    # the scope check — it is the observation that the scope check is about a
-    # part of this module the refit never touches.  Both slab-only facts
-    # (:func:`slab_scope_violations`) are properties of the b26p long-range
-    # MODEL and of ``v_slab_on_set``; the refit fits ζ at the target Q and
-    # contracts it with the kernel :func:`make_v_on_set` hands it, which on a
-    # bulk deck is the producer's own.  The check therefore moved to
-    # ``build_vq_evaluator`` — the model build — rather than being weakened,
-    # so an interp/both run on a bulk deck refuses exactly as loudly as
-    # before, one call later and before anything expensive still.
-    if require_slab:
-        assert_slab_scope(zx["bvec"], qfr=zx["qfr"], policy=zx["policy"],
-                          source=restart_file)
-    return zx
 
 
 def close_zeta_coarse(zx: dict) -> None:
-    """Release every handle :func:`load_zeta_coarse` opened.
+    """Release every handle :func:`read_vq_payload` opened.
 
     EXPLICIT ownership, because the three lazy q-stacks are read-only HANDLES
     and have to outlive the loader call — so ending them cannot be left to
@@ -487,34 +295,6 @@ def close_zeta_coarse(zx: dict) -> None:
     zx.pop("W0", None)
 
 
-def _fix_sphere_wrap(zx):
-    """(reference ``_fix_sphere_wrap``) Half-boundary wrap disambiguation:
-    per q, among the ±1/2 sign candidates keep the one whose sphere fits
-    max|q+G|² ≤ cutoff.  No-op on grids without half components."""
-    changed = 0
-    for q in range(zx["nq"]):
-        base = zx["qfr_raw"][q] - np.round(zx["qfr_raw"][q])
-        cands = [[]]
-        for c in range(3):
-            opts = [0.5, -0.5] if abs(abs(base[c]) - 0.5) < 1e-9 else [base[c]]
-            cands = [cc + [o] for cc in cands for o in opts]
-        n = int(zx["ngk"][q])
-        G = zx["gvec"][q][:, :n].astype(np.float64)
-        best, bestm = None, None
-        for cc in cands:
-            qc = np.asarray(cc)
-            K = zx["bvec"].T @ (qc[:, None] + G)
-            m = float(np.max(np.sum(K * K, axis=0)))
-            if bestm is None or m < bestm:
-                best, bestm = qc, m
-        assert bestm <= zx["zeta_cutoff"] + 1e-9, \
-            f"q={q}: no candidate wrap fits the stored sphere"
-        if np.max(np.abs(best - zx["qfr"][q])) > 1e-12:
-            changed += 1
-        zx["qfr"][q] = best
-    if changed:
-        print(f"  [wrapfix] {changed} of {zx['nq']} q relabeled to the "
-              f"sphere-derived center")
 
 
 # ===========================================================================
@@ -1879,7 +1659,7 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
     """ONE arbitrary-Q exchange-tile model build (stages 1-3), packaged.
 
     This is the SINGLE orchestration of the ``vq_interp`` pipeline
-    (``load_zeta_coarse`` → ``build_cq`` → gates → ``prepare_coarse`` →
+    (``read_vq_payload`` → ``build_cq`` → gates → ``prepare_coarse`` →
     ``lr_design_blocks`` → ``fit_lr_model`` → nulls → ``make_eval_vq`` +
     stencil pieces).  BOTH the ``exciton_bands`` Q-path driver and the general
     BSE init's ``bse_k_grid`` coarse→fine densification (on its
@@ -1910,7 +1690,7 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
     # read is a per-rank SlabIO hyperslab rather than a whole-chunk host
     # read on every rank.  The reader announces and falls back to the
     # local h5py plan when the deployment cannot serve SlabIO.
-    zx = load_zeta_coarse(restart_file, zeta_file, mesh=mesh_xy,
+    zx = read_vq_payload(restart_file, zeta_file, mesh=mesh_xy,
                           log_fn=log_fn, input_file=input_file, require_slab=False)
     # THE ONE SITE, moved here from the loader: this function is the b26p
     # model build, and the model is what is slab-only.  Still before anything
@@ -2087,7 +1867,7 @@ def build_hdir(zx, q0, nvw=3, ncw=3):
     psic = np.ascontiguousarray(zx["psi"][:, cs])
     psiv = np.ascontiguousarray(zx["psi"][:, vs])
     psic_kq = psic[kqs]
-    # ``zx["W0"]`` is a lazy h5py dataset (see load_zeta_coarse) and the q
+    # ``zx["W0"]`` is a lazy h5py dataset (see read_vq_payload) and the q
     # lookup below is an unsorted permutation, which h5py cannot fancy-index.
     # This diagnostic wants every q anyway, so materialise once here.
     W0 = _to_host(zx["W0"])

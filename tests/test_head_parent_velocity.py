@@ -13,6 +13,7 @@ def test_parent_velocity_ignores_nonparent_payload_and_slices_bands(tmp_path, mo
 
     monkeypatch.setattr(runtime, "initialize_communicator_stack", lambda **kw: None)
     import psp.get_dipole_mtxels as owner
+    from file_io import restart_bundle as reader
 
     sym = object.__new__(SymMaps)
     sym.nk_red, sym.nk_tot = 1, 2
@@ -28,7 +29,7 @@ def test_parent_velocity_ignores_nonparent_payload_and_slices_bands(tmp_path, mo
     path = tmp_path / 'dipole.h5'
     with h5py.File(path, 'w') as h5:
         h5['dipole_cart'] = velocity
-    monkeypatch.setattr(owner, 'check_dipole_provenance', lambda *a, **k: True)
+    monkeypatch.setattr(reader, 'check_dipole_provenance', lambda *a, **k: True)
     monkeypatch.setattr(owner, 'resolve_vnl_velocity_sign', lambda *a: 1)
     got = read_authenticated_dipole_velocity(
         path, wfn=SimpleNamespace(symmetry=lambda: sym),

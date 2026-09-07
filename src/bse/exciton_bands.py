@@ -2000,7 +2000,7 @@ def main(argv=None):
             # is the slab-only half of vq_interp; the refit path fits ζ at the
             # target Q from the htransform ψ and contracts it with the
             # producer's own Coulomb door.  So this branch loads ζ and stops.
-            zx = vq_interp.load_zeta_coarse(restart_file, zeta_path,
+            zx = vq_interp.read_vq_payload(restart_file, zeta_path,
                                             mesh=mesh_xy, log_fn=log, input_file=args.input,
                                             require_slab=False,
                                             require_full_bz_zeta=False)

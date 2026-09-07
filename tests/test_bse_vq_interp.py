@@ -56,7 +56,7 @@ def vq_state():
     # actually built — a bare checkout still takes the local plan, which
     # is why this line cannot be read as evidence that the phdf5 path
     # ran.
-    zx = vqi.load_zeta_coarse(f"{FX}/isdf_tensors_640.h5",
+    zx = vqi.read_vq_payload(f"{FX}/isdf_tensors_640.h5",
                               f"{FX}/zeta_q.h5", mesh=mesh)
     C_q = vqi.build_cq(zx, mesh)
     vqi.run_gates(zx, C_q)                 # hard machine-level gates

@@ -14,7 +14,7 @@ was identically zero and nothing asked whether W had ever been written.
 
 ``tagged_arrays`` already stamps the answer — ``W0_ready``, False on the
 placeholder and True when real data lands — and ``bse_io`` already gates
-on it in both of its readers.  ``bse.vq_interp.load_zeta_coarse`` did not:
+on it in both of its readers.  ``bse.vq_interp.read_vq_payload`` did not:
 it asked ``if "W0_qmunu" in fr``, which is the presence question.  This
 file pins the fix and the hazard it closes.
 
