@@ -101,6 +101,25 @@ def test_plan_packs_raw_parent_faces_and_unfolds_their_operator():
                                atol=2e-13)
 
 
+def test_square_antiunitary_operator_uses_itself_as_transpose_partner():
+    """Square typed transport equals the explicit pair_source=V action on TR rows."""
+    mesh = _mesh_2x2()
+    sym = _symmetry_fixture()
+    sym.sym_idx_k = np.asarray([0, 3, 0], dtype=np.int32)
+    plan = build_centroid_k_unfold_plan(
+        sym, np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]]),
+        (2, 2, 1), mesh, nspinor=2)
+    rng = np.random.default_rng(20260906)
+    shape = (plan.n_parent, 2, plan.n_centroid_packed, 2, plan.n_centroid_packed)
+    op = jax.device_put(rng.normal(size=shape) + 1j * rng.normal(size=shape),
+                       NamedSharding(mesh, P(None, None, 'x', None, 'y')))
+    with mesh:
+        actual = plan.unfold_operator(op)
+        expected = plan.unfold_operator(
+            op, operator_transpose=op.transpose(0, 3, 4, 1, 2))
+    np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-13)
+
+
 def test_parent_scalar_rows_do_not_masquerade_as_parent_wavefunctions():
     mesh = _mesh_2x2()
     plan = build_centroid_k_unfold_plan(
