@@ -421,7 +421,7 @@ def test_packed_runtime_refuses_a_config_less_call_before_opening_a_body():
     mesh = _mesh()
     with pytest.raises(ValueError, match="requires the run config"):
         compute_static_photon_response(
-            None, None, None, None, None, mesh, screen_current=True,
+            None, None, None, None, None, mesh, screen_current=True, mu_bases=None,
             config=None)
 
 
@@ -433,7 +433,7 @@ def test_packed_runtime_refuses_no_local_fields_before_opening_a_body():
     )
     with pytest.raises(ValueError, match="head_correction=full"):
         compute_static_photon_response(
-            None, None, None, None, None, mesh, screen_current=True,
+            None, None, None, None, None, mesh, screen_current=True, mu_bases=None,
             config=config)
 
 
@@ -527,7 +527,7 @@ def test_the_route_and_the_refusal_read_the_same_envelope_table(tmp_path):
     both = [row[2] for row in gw_config.packed_static_envelope(
         _parse(tmp_path, _packed_deck()), screened=True)]
     assert both[:len(shared)] == shared
-    assert len(both) == len(shared) + 2      # 6 shared (incl. linalg) + 2 screened-only
+    assert len(both) == len(shared) + 1      # scalar-head override is screened-only
     assert "linalg = distributed" in shared
 
 
@@ -580,20 +580,21 @@ def test_mode_required_settings_are_derived_from_the_envelope_table(tmp_path):
     assert config.memory.low_mem_bands is True
     assert str(config.backend.linalg) == "distributed"
     assert uses_static_photon_response(config)
-    assert any("low_mem_bands was not named" in ln for ln in lines), lines
+    assert not any("WARNING" in ln for ln in lines), lines
     assert not any("linalg was not named" in ln for ln in lines), lines
 
 
-def test_an_explicit_conflicting_value_is_still_refused_not_overridden(
-        tmp_path):
-    """Rule 13: derive what the deck left unsaid, refuse what it said."""
+def test_axis_parent_key_is_preserved_without_coercion(tmp_path):
+    """False selects axis parents without changing the requested deck value."""
     deck = _packed_deck().replace(
         "low_mem_bands = true", "low_mem_bands = false")
-    with pytest.raises(ValueError) as exc:
-        _parse(tmp_path, deck)
-    message = str(exc.value)
-    assert "static_bispinor_photon_envelope" in message
-    assert "low_mem_bands = false" in message
+    path = tmp_path / "retired.in"
+    path.write_text(deck)
+    lines = []
+    config = LorraxConfig.from_input_file(str(path), print_fn=lines.append)
+    assert config.memory.low_mem_bands is False
+    assert uses_static_photon_response(config)
+    assert not any("WARNING: low_mem_bands = false" in line for line in lines)
 
 
 def test_a_deck_outside_the_envelope_still_sees_its_own_reason(tmp_path):
@@ -680,23 +681,14 @@ def test_the_driver_replays_config_provenance_into_the_production_report():
     assert "report.emit(line.strip())" in src
 
 
-def test_restart_may_not_swap_the_head_mechanism_on_a_slab_cohsex_deck(
-        tmp_path):
-    """restart = true used to move a slab bispinor COHSEX deck from the
-    packed Gamma-cell completion to the incumbent scalar head, silently,
-    for 5.7 meV plus the whole transverse head."""
+def test_restart_preserves_the_packed_head_mechanism(tmp_path):
+    """A copied parent restart uses the same coupled Gamma completion as fresh GW."""
     deck = (_INCUMBENT_DECK
             .replace("sys_dim = 3", "sys_dim = 2")
             .replace("restart = false", "restart = true"))
-    with pytest.raises(ValueError) as exc:
-        _parse(tmp_path, deck)
-    message = str(exc.value)
-    assert ("bispinor_slab_cohsex_restart_changes_the_head_mechanism"
-            in message)
-    # it must NAME BOTH mechanisms, not just say "unsupported"
-    assert "Wigner-Seitz" in message and "StaticHeadTerms" in message
-    assert "5.72 meV" in message
-    assert "IMPLEMENTATION LIMIT" in message
+    config = _parse(tmp_path, deck)
+    assert config.restart
+    assert uses_static_photon_response(config)
 
 
 def test_an_unnamed_restart_uses_the_fresh_physics_default(tmp_path):

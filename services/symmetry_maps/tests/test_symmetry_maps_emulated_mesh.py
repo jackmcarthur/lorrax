@@ -16,7 +16,7 @@ WHAT THE SURVEY RANKED HIGH AND NOTHING COVERED (§7.2):
   extent."  HIGH, and the CHARTER's mandatory band-pad class for a
   mesh-touching service.  Both halves are here: the refusal AND the red
   twin showing the divisible case going through the same code path.
-* **G6** — ``mix_channels_by_proper_rotation`` has no direct test anywhere.
+* **G6** — ``mix_lorentz_blocks`` has no direct test anywhere.
 
 HOW THE FOUR DEVICES GET HERE.  ``conftest.py`` sets
 ``XLA_FLAGS=--xla_force_host_platform_device_count=4`` before the first jax
@@ -43,7 +43,7 @@ import pytest
 
 from lxkit.testing import require_devices
 from symmetry_maps import (KStarMap, centroid_source_map_and_wrap,
-                           mix_channels_by_proper_rotation, star_broadcast,
+                           mix_lorentz_blocks, star_broadcast,
                            star_select, star_spread,
                            spinor_rotation_for_sym_row,
                            unfold_isdf_operator,
@@ -691,7 +691,7 @@ def test_a_mu_extent_mismatch_refuses_in_both_tables():
 
 
 # ---------------------------------------------------------------------------
-# G6 — mix_channels_by_proper_rotation
+# G6 — mix_lorentz_blocks
 # ---------------------------------------------------------------------------
 
 def _inverse_axial_rows(rng, n_rows):
@@ -714,19 +714,21 @@ class _TypedSym:
         self.inverse_proper = np.asarray(inverse_proper)
         self.n_spatial = self.inverse_proper.shape[0] // 2
 
-    def cartesian_action(self, rows, *, axial, time_odd):
-        assert axial and time_odd
+    def lorentz_action(self, rows):
         idx = np.asarray(rows, dtype=np.int32)
         forward = np.swapaxes(self.inverse_proper[idx], -1, -2)
-        return np.where((idx >= self.n_spatial)[:, None, None],
-                        -forward, forward)
+        action = np.zeros((len(idx), 4, 4))
+        action[:, 0, 0] = 1
+        action[:, 1:, 1:] = np.where(
+            (idx >= self.n_spatial)[:, None, None], -forward, forward)
+        return action
 
 
 @pytest.mark.parametrize("px,py", [(1, 1), (2, 2)])
 def test_the_lorentz_mixing_matches_a_dense_numpy_reference(px, py):
     """G6.  The §A5 3-vector mixing, against an explicit double sum.
 
-    ``mix_channels_by_proper_rotation`` applies, per full-BZ q::
+    ``mix_lorentz_blocks`` applies, per full-BZ q::
 
         V^{i,j}_mixed = Σ_{α,β} R^{α,i}(q) · R^{β,j}(q) · V^{α,β}
 
@@ -749,7 +751,7 @@ def test_the_lorentz_mixing_matches_a_dense_numpy_reference(px, py):
             a = (rng.standard_normal((n_q, n_mu, n_mu))
                  + 1j * rng.standard_normal((n_q, n_mu, n_mu)))
             tiles[(i, j)] = a
-    out = mix_channels_by_proper_rotation(
+    out = mix_lorentz_blocks(
         {k: jnp.asarray(v) for k, v in tiles.items()},
         sym=_TypedSym(R), sym_idx=_SYM, mesh_xy=mesh)
 
@@ -805,35 +807,28 @@ def test_the_lorentz_reference_notices_a_transposed_R():
         f"this draw of R is too close to symmetric to be a discriminator")
 
 
-def test_the_lorentz_mix_refuses_a_missing_tile_and_a_bad_action():
-    """All nine tiles and a typed ``(n_q,3,3)`` action are required.
-
-    Nine, not six: the caller may synthesise the Hermitian-redundant
-    entries with ``conj(swapaxes(...))``, but the function will not guess.
-    """
+def test_the_lorentz_mix_zero_fills_absent_blocks_and_refuses_bad_actions():
+    """Absent source blocks are zero; Lorentz rows must be typed host metadata."""
     import jax.numpy as jnp
     mesh = _mesh(1, 1)
-    rng = np.random.default_rng(31)
-    R = _inverse_axial_rows(rng, _NTRAN)
-    tiles = {(i, j): jnp.asarray(rng.standard_normal((5, 4, 4))
-                                 + 0j)
-             for i in (1, 2, 3) for j in (1, 2, 3)}
-    partial = {k: v for k, v in tiles.items() if k != (2, 3)}
-    with pytest.raises(ValueError, match=r"missing TT tile"):
-        mix_channels_by_proper_rotation(
-            partial, sym=_TypedSym(R), sym_idx=_SYM, mesh_xy=mesh)
+    sym = _TypedSym(_inverse_axial_rows(np.random.default_rng(31), _NTRAN))
+    tile = jnp.ones((5, 4, 4), dtype=jnp.complex128)
+    partial = mix_lorentz_blocks({(2, 3): tile}, sym=sym, sym_idx=_SYM, mesh_xy=mesh)
+    complete = mix_lorentz_blocks(
+        {(i, j): tile if (i, j) == (2, 3) else jnp.zeros_like(tile)
+         for i in (1, 2, 3) for j in (1, 2, 3)},
+        sym=sym, sym_idx=_SYM, mesh_xy=mesh)
+    for key in complete:
+        np.testing.assert_array_equal(partial[key], complete[key])
 
     class _BadTypedSym:
-        def cartesian_action(self, rows, *, axial, time_odd):
-            return R[np.asarray(rows), :2, :]
+        def lorentz_action(self, rows):
+            return np.zeros((len(rows), 3, 3))
 
-    with pytest.raises(ValueError, match=r"typed Cartesian actions"):
-        mix_channels_by_proper_rotation(
-            tiles, sym=_BadTypedSym(), sym_idx=_SYM, mesh_xy=mesh)
-
-    with pytest.raises(TypeError, match=r"host metadata"):
-        mix_channels_by_proper_rotation(
-            tiles, sym=_TypedSym(R), sym_idx=jnp.asarray(_SYM), mesh_xy=mesh)
+    with pytest.raises(ValueError, match="typed Lorentz actions"):
+        mix_lorentz_blocks({(2, 3): tile}, sym=_BadTypedSym(), sym_idx=_SYM, mesh_xy=mesh)
+    with pytest.raises(TypeError, match="host metadata"):
+        mix_lorentz_blocks({(2, 3): tile}, sym=sym, sym_idx=jnp.asarray(_SYM), mesh_xy=mesh)
 
 
 # ---------------------------------------------------------------------------

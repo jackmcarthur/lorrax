@@ -311,6 +311,8 @@ def _wedge_sweep_kspec(wfn, sym):
     deck cut at a true IBZ takes byte-for-byte the path it always took —
     same loader cache key, same read, same scan.
     """
+    if sym.parent_k_domain == "full_bz":
+        return "full_bz", wfn.kvecs(k="full_bz"), int(sym.nk_tot)
     rows, _ = star_wedge_rows(sym)
     kpts = np.asarray(wfn.kpoints, dtype=np.float64)
     n_red = int(wfn.nkpts)
@@ -694,7 +696,11 @@ def build_valence_density_distributed(wfn, sym, meta, *,
              f"{'  [rotated ψ: k-partition only]' if rotated else ''}")
     accumulator_shape = ((4, nx, ny, nz) if include_current
                          else (nx, ny, nz))
-    rho_local = jnp.zeros(accumulator_shape, dtype=jnp.float64)
+    # Match the process-local FFT result from the first addition onward;
+    # uneven item counts must not introduce a second compile signature.
+    from jax import local_devices
+    rho_local = jnp.zeros(accumulator_shape, dtype=jnp.float64,
+                          device=local_devices()[0])
     for n_done, (ik, b_lo, b_hi) in enumerate(mine):
         if n_done % 32 == 0:
             print_fn(f"    rho: item {n_done + 1}/{len(mine)} "

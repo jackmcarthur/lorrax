@@ -36,7 +36,7 @@ import symmetry_maps
 from symmetry_maps._compat import RENAME_HOME, RENAMES, RETIREMENT_GATE
 
 
-def test_the_rename_table_is_the_six_the_survey_chose():
+def test_remaining_rename_table_excludes_retired_tt_mixer():
     """The sweep's scope, pinned.
 
     Not a tautology: the table is the input to every other cell here, so
@@ -45,7 +45,6 @@ def test_the_rename_table_is_the_six_the_survey_chose():
     """
     assert set(RENAMES) == {
         "unfold_v_q",
-        "unfold_v_q_bispinor_lorentz",
         "trs_augment_U",
         "compute_centroid_sym_perm",
         "compute_rgrid_sym_perm",

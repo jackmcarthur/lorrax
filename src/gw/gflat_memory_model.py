@@ -378,32 +378,11 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
     selected post-slice q extent ``nq_disk``.  ``nq`` remains the full-zone
     extent used by the C/Z construction stages.
 
-    ``psi_copies`` prices the RESOLVED ``Wavefunctions`` layout
-    (``gw.wavefunction_bundle``, report
-    ``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md`` §verdict/§7):
-
-      ``low_mem_bands=False`` (``layout="legacy"``, the default): the four
-      ψ centroid copies are single-axis ÷√P (2 on 'x', 2 on 'y') — the
-      corrected centroid term (design §5 bug #4: NOT ÷p_xy).
-      ``2·S/Px + 2·S/Py`` where ``S = psi_one``.
-
-      ``low_mem_bands=True`` (``layout="face"``): exactly TWO copies, both
-      2-D sharded on the FULL (x, y) mesh (``psi_nmu``, ``psi_mun``).
-      ``2·S/(Px·Py)`` — the ``2·√P`` reduction on a square mesh the
-      feature exists for.
-
-      As of the zeta-fit face-CCT and r-chunk redesigns
-      (feat/zeta-fit-face-psi and feat/zeta-fit-rchunk-face-psi,
-      2026-08-22), this term is GENUINELY accurate for Stages A--D
-      (centroid load, CCT/Cholesky): ``gw.gw_init.prepare_isdf_and_
-      wavefunctions`` builds ``psi_nmu``/``psi_mun`` immediately after the
-      fresh load and drops the single-axis ψ_Y copy BEFORE the fit runs,
-      and ``gw.isdf_fitting.fit_zeta_to_h5``'s CCT step (STEP 2) reads
-      them directly (``isdf.core.c_q_from_psi_sm(layout='face')``, a
-      distributed SUMMA GEMM) instead of single-axis Y-forms.  Stages C/D
-      read the band-contraction operand from that same persistent face
-      carrier; their bounded incremental workspace is disclosed separately
-      by ``GFlatChunkPlan.stage_cd_psi_bytes``.
+    ``psi_copies`` prices the two resolved centroid arrays: face costs
+    ``2*S/(Px*Py)`` and axis costs ``S/Px + S/Py``, with
+    ``S = 16*n_parent*ns*mu*nb`` bytes on the parent route. Bands are
+    sharded in face and complete in axis; both retain the same parent rows.
+    Stage-C/D incremental workspaces are disclosed separately.
 
     ``loader_tables`` is the WFN loader's REPLICATED per-k metadata (the
     sparse-G→FFT-box index + the τ-phase row), retained for the loader's
@@ -415,15 +394,14 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
     if low_mem_bands:
         psi_copies = 2.0 * psi_one / P_
     else:
-        psi_copies = 2 * psi_one / p_x + 2 * psi_one / p_y
+        psi_copies = psi_one / p_x + psi_one / p_y
     if parent_route is not None:
         # The raw-parent carrier: one face pair at n_parent rows
         # (gw.wavefunction_bundle.ParentGreenCarrier).  Under parents-only
         # storage it is the run's ONLY psi; otherwise it sits beside the
         # full-k faces.
-        carrier = 2.0 * _c128(
-            int(parent_route["n_parent"]), ns,
-            mu, nb) / P_
+        carrier = _c128(int(parent_route["n_parent"]), ns, mu, nb) * (
+            2.0 / P_ if low_mem_bands else 1.0 / p_x + 1.0 / p_y)
         psi_copies = carrier if parent_route.get("parents_only") \
             else psi_copies + carrier
     return {
@@ -667,7 +645,7 @@ class GFlatChunkPlan:
             f"    Stage C/D ψ floor (post-CCT, {self.psi_layout} r-chunk "
             f"incremental) = {self.stage_cd_psi_bytes / 1e9:.3f} GB/dev "
             + ("[included in face Stage-C peaks]"
-               if self.psi_layout == "face" else
+               if self.psi_layout in ("face", "axis") else
                "[legacy compatibility disclosure]"),
             "    ψ(r) source   = " + (
                 "hoisted all-band cache" if self.cache_psi_r else
@@ -677,11 +655,11 @@ class GFlatChunkPlan:
                   else f"tiled current-r cache ({self.r_chunk // max(self.face_y_cache_r_tile, 1)}"
                        f" x {self.face_y_cache_r_tile})"))
                 if self.cache_face_y_blocks else
-                ("repeated bounded transform" if self.psi_layout == "face"
+                ("repeated bounded transform" if self.psi_layout in ("face", "axis")
                  else "n/a (legacy layout)")),
             *([f"    face Y cache = "
                f"{self.face_y_cache_bytes / 1e9:.3f} GB/dev"]
-              if self.psi_layout == "face" else []),
+              if self.psi_layout in ("face", "axis") else []),
             *([f"    parent route  = {int(self.parent_route['n_parent'])} raw "
                "parents; psi terms at n_parent rows"
                + (" (parents-only storage: no full-k faces)"
@@ -764,12 +742,11 @@ def plan_gflat_chunks(
     is conservatively priced as ``replicated``; the live resolver may choose
     ``per_q`` at execution time, but that cannot make this plan optimistic.
 
-    ``low_mem_bands`` (the deck key of the same name; default ``False``)
-    selects which ``Wavefunctions`` layout ``_persistent_bytes`` and the
-    Stage-E base price the ψ centroid inventory as — see
-    :func:`_persistent_bytes`.  When that face inventory fits but the
-    all-band ψ(r) hoist does not, it also selects the canonical streamed
-    band-chunk FFT route.  The legacy/default route retains the hoist.
+    ``low_mem_bands`` selects the face or axis centroid inventory; the
+    deck default is True. Both layouts use the parent band-chunk route,
+    including its streamed FFT fallback when the all-band r cache does
+    not fit. The function default preserves callers' explicit inventory
+    convention; production passes the resolved deck value.
 
     ``face_current_vertex`` selects the nonidentity-current face executable's
     measured ``ns²`` arena.  False preserves the independently calibrated
@@ -805,7 +782,8 @@ def plan_gflat_chunks(
         raise ValueError(
             f"fit_nb_total and face_nb_total must be positive, got "
             f"fit={fit_nb}, face={face_nb}")
-    if low_mem_bands:
+    parent_algorithm = low_mem_bands or parent_route is not None
+    if parent_algorithm:
         from runtime.padding import authenticate_padded_axis
         authenticate_padded_axis(
             face_nb, face_nb, p_y, name="face band memory-model carrier")
@@ -830,11 +808,7 @@ def plan_gflat_chunks(
     budget = budget_gb * 1e9
     target = budget * target_utilization
 
-    inventory_nb = face_nb if low_mem_bands else nb
-    if parent_route is not None and not low_mem_bands:
-        raise ValueError(
-            "plan_gflat_chunks: parent_route requires low_mem_bands (the "
-            "parent faces are face-layout carriers).")
+    inventory_nb = face_nb if parent_algorithm else nb
     sys = dict(nk=nk, ns=ns, nq=nq, nq_disk=nq_disk, mu=mu,
                nb=inventory_nb,
                ngkmax=ngkmax, n_rtot=n_rtot, low_mem_bands=bool(low_mem_bands),
@@ -855,7 +829,7 @@ def plan_gflat_chunks(
         nk, _min_cache_slots, ns, n_rtot, shard=p_xy)
     cache_psi_r = True
     _cache_probe_peak = sum(_persistent_base.values()) + _min_cache_bytes
-    if low_mem_bands:
+    if parent_algorithm:
         _cache_probe_bc = (
             int(band_chunk_override)
             if band_chunk_override and band_chunk_override > 0 else fit_nb)
@@ -907,12 +881,12 @@ def plan_gflat_chunks(
         cache_slots = math.ceil(fit_nb / floor_bc) * floor_bc
         psi_r_cache = _c128(nk, cache_slots, ns, n_rtot, shard=pp)
         floor_sys = dict(sys)
-        if low_mem_bands:
+        if parent_algorithm:
             floor_sys["nb"] = face_nb_pp
         floor = (sum(_persistent_bytes(
                      p_x=px, p_y=py, **floor_sys).values())
                  + (psi_r_cache if cache_psi_r else 0.0))
-        if low_mem_bands:
+        if parent_algorithm:
             # P_min must admit one legal face r slab.  Use the universal
             # repeated route at r=Py and the full-nk analytic transform.
             face_floor = _stage_C_face_terms(
@@ -977,7 +951,7 @@ def plan_gflat_chunks(
     # planner's existing performance floor / max-chunk floor; Phase 2 may
     # still choose a larger affordable r chunk after band K is resolved.
     r_lo = min(mu, n_rtot)
-    r_alignment = p_y if low_mem_bands else p_xy
+    r_alignment = p_y if parent_algorithm else p_xy
     if r_chunk_override and r_chunk_override > 0:
         r_for_band_guard = min(int(r_chunk_override), n_rtot)
     else:
@@ -997,7 +971,7 @@ def plan_gflat_chunks(
             nk=nk, band_chunk=bc, p_band=p_xy)
         centroid_fft_t = _fft_for_bc(bc, nk_extent=centroid_k)
         zeta_fft_t = _fft_for_bc(bc, nk_extent=nk)
-        if low_mem_bands:
+        if parent_algorithm:
             face = _stage_C_face_terms(
                 nk=nk, ns=ns, mu=mu, face_nb=face_nb,
                 slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
@@ -1070,7 +1044,7 @@ def plan_gflat_chunks(
     face_cache_build_t = 0.0
     face_tile_concat_t = 0.0
     face_y_cache_bytes = 0.0
-    if low_mem_bands:
+    if parent_algorithm:
         face_terms = _stage_C_face_terms(
             nk=nk, ns=ns, mu=mu, face_nb=face_nb,
             slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
@@ -1145,7 +1119,7 @@ def plan_gflat_chunks(
 
     headroom_C = max(
         target - persistent_total - C_constant
-        - (0.0 if (low_mem_bands or cache_psi_r)
+        - (0.0 if (parent_algorithm or cache_psi_r)
            else fft_box_zeta_transform),
         0.0)
     if r_chunk_override and r_chunk_override > 0:
@@ -1153,7 +1127,7 @@ def plan_gflat_chunks(
         # r_chunk_size wins over every cap below, exactly as before.
         r_chunk = min(int(r_chunk_override), n_rtot)
     else:
-        if not low_mem_bands:
+        if not parent_algorithm:
             r_from_budget = (
                 int(headroom_C / C_slope) if C_slope > 0 else n_rtot)
             r_from_arena = (
@@ -1283,7 +1257,7 @@ def plan_gflat_chunks(
     A_psi_r_cache_t = fft_box_zeta_transform if cache_psi_r else 0.0
     B_t = (_c128(nq, mu, mu, shard=p_xy)               # C_q
            + 2 * _c128(nk, ns, ns, mu, mu, shard=p_xy))  # full (μ,μ) pair density
-    if low_mem_bands:
+    if parent_algorithm:
         if cache_face_y_blocks:
             _cache_tile = face_y_cache_r_tile
             _completed_tile_z = (
@@ -1319,34 +1293,17 @@ def plan_gflat_chunks(
     # the full-BZ ``Z_q (nq, μ, cr) P(None,'x','y')`` it just built to
     # ``solve_phase`` as a live input: the solve's Z_col reshard targets a
     # DIFFERENT sharding, so donation cannot alias and Z_q coexists with
-    # the solve's two RHS stacks.  Whether full q storage is forced
-    # (LORRAX_FORCE_FULL_BZ) or the 81-q mesh is naturally unreduced,
+    # the solve's two RHS stacks.  In the historical forced-full measurement
+    # or when the 81-q mesh is naturally unreduced,
     # Z_q is built at the full BZ (z_q_from_psi_sm's contract) — the two
     # measured escapes this seam-charge closes are JID 57269074 step
     # lx-Xg4-005932 (forced 8x8) and JID 57281385 step .28 (natural 9x9).
     C_t = max(C_fit_t, solve_t + _zq_live)
     D_t = zeta_chunk_D + fft_per_row * gflat_cs
-    # Stage E (V_q) has its OWN base: L_q + gflat_acc are freed post-fit.
-    # Transient = V_acc + the ζ slabs read from disk (+ their single-axis
-    # resharded copies).  The RESIDENT ψ term prices the resolved layout
-    # (report §7), same split as ``_persistent_bytes``:
-    #
-    #   low_mem_bands=False (legacy): only ~2 of the 4 centroid copies are
-    #   still live at this point (fit_zeta's own psi_rmu_Y/psi_rmuT_X
-    #   fit-input copies — the caller has not yet built the four-copy
-    #   bundle, which happens after V_q) — HALF of the fit-loop persistent
-    #   term: S/Px + S/Py.
-    #
-    #   low_mem_bands=True (face): the fresh path converts to the two
-    #   face copies and DELETES the fit-input copies before V begins (see
-    #   gw.gw_init.prepare_isdf_and_wavefunctions), so the SAME 2S/(Px·Py)
-    #   that is live for the rest of the run is already what is resident
-    #   here — there is no separate "post-fit narrowing" step to price.
+    # V_q and tensor writes retain exactly the same parent psi copies;
+    # the fit's L_q and gflat accumulator have been released.
     psi_one = _c128(nk, ns, mu, inventory_nb)
-    if low_mem_bands:
-        E_base = 2.0 * psi_one / p_xy
-    else:
-        E_base = psi_one / p_x + psi_one / p_y
+    E_base = persistent["psi_copies"]
     # Stage-C/D disclosure (GFlatChunkPlan.stage_cd_psi_bytes docstring).
     # The face value is already present in the separate build/pair peaks.
     #
@@ -1369,7 +1326,7 @@ def plan_gflat_chunks(
     # band_chunk-bounded per-bc gather/weight transient (tiny against (a)
     # whenever band_chunk << n_rmu, the normal case).  Both scale with P
     # (px·py), not sqrt(P) — the fix this term exists to disclose.
-    if low_mem_bands:
+    if parent_algorithm:
         if cache_face_y_blocks:
             face_y_route_bytes = face_y_cache_bytes
         else:
@@ -1441,7 +1398,7 @@ def plan_gflat_chunks(
         p_min=int(p_min),
         budget_bytes=float(budget),
         target_utilization=float(target_utilization),
-        psi_layout=("face" if low_mem_bands else "legacy"),
+        psi_layout=("face" if low_mem_bands else "axis"),
         psi_layout_bytes=float(persistent["psi_copies"]),
         stage_cd_psi_bytes=float(stage_cd_psi_bytes),
         cache_psi_r=bool(cache_psi_r),

@@ -1,0 +1,1034 @@
+file,line_at_b8e036a8,test_or_gate,declared_purpose,audit_scope
+services/symmetry_maps/tests/test_bispinor_actions.py,15,test_four_spinor_action_on_all_si_soc_rows,"On antiunitary rows conjugate U†γU, since the current expectation uses Kψ.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_bispinor_actions.py,46,test_four_spinor_requires_spatial_parity,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_bispinor_actions.py,51,test_lorentz_mixer_tt_identity_and_rectangular_ct,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_bispinor_actions.py,74,test_selected_lorentz_output_matches_complete_sector,Selecting one rectangular sector output avoids allocating its sibling blocks.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,62,test_q_negation_index_is_the_c_order_involution,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,71,test_nonnested_8x8_to_12x12_has_the_exact_4x4_intersection,"RED TWIN: 8→12 shares 4 points/axis, not all 8 and not a prefix.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,99,test_common_grid_map_keeps_every_point_when_grids_nest_or_match,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,113,test_qpoint_lookup_keeps_signed_representatives_periodically_paired,The CrI3 -4/9 representative is the same point as wrapped +5/9.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,133,test_the_fold_equals_a_roll_and_the_wrap_counts_it,"``arr[kpq_index] == roll(arr, -q)`` and ``G_umk`` is the wrap count.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,156,test_the_fold_identity_can_fail,"RED TWIN.  The roll identity is a real constraint, not a shape check.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,173,test_the_anchored_branch_reproduces_the_shipping_op_policy,The anchored branch shadows ``find_symmetry_ops_simple`` bit-for-bit.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,207,test_the_derive_branch_returns_lex_min_representatives,"The ``irr_kgrid_int=None`` branch, and WHY it cannot carry I5/I6.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,234,test_a_full_point_with_no_preimage_refuses,RED TWIN for the anchored branch: a k the IBZ list cannot reach.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,271,test_the_trivial_branch_augments_trs_exactly_like_the_general_one,"G8.  ``len(sym_mats_k) == 2 * ntran`` in BOTH branches, with content.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,305,test_the_trivial_branch_publishes_every_attribute_the_general_one_does,"Same surface from both branches, or a consumer breaks on ``nosym``.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,341,test_the_trs_spinor_factor_squares_to_minus_one,"Θ² = −1 on the spinor factor, and ``_I_SIGMA_Y`` is the source.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,377,test_the_su2_intertwining_identity_can_fail,RED TWIN.  ``iσ_y conj(U) = U iσ_y`` is an SU(2) statement.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,392,test_a_spatial_row_is_not_augmented,The other half: below ``n_tran`` the spinor op is passed through.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,403,test_the_augmentation_vectorizes_over_a_row_of_sym_indices,Scalar and array ``sym_idx`` must agree elementwise.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,420,test_static_spinor_application_matches_ordered_complex_contraction,Complex spatial/TR rows agree with the direct ordered contraction.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,450,test_static_spinor_application_covers_scalar_and_refuses_wrong_extent,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,461,test_run58_spinor_shape_compiles_without_a_cublas_gemm,"Exact failed local shape: k16 × G76551 × ns2, one local band.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,481,test_tau_phase_row_is_none_at_tau_zero,"A symmorphic op has NO phase, and ``None`` is how that is said.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,506,test_tau_phase_row_jax_matches_the_host_convention,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,520,test_unfold_reciprocal_carriers_has_one_numpy_jax_convention,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,533,test_unfold_psi_refuses_a_sym_table_that_is_not_twice_ntran,S8.  The §Q guard: the ONE thing keeping the two halves of Θ in step.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,612,test_the_scalar_spinor_factor_is_the_1x1_identity_on_every_row_kind,"ns=1: one factor, it is 1, and it does not look at ``U_spinor``.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,647,test_spinless_time_reversal_squares_to_PLUS_one,"The ns=1 TRS row is a DIFFERENT operator, not a truncated iso_y.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,672,test_unfold_psi_transforms_a_scalar_psi_with_no_spinor_factor,"The fix, stated as the thing the loader actually needs.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,696,test_RED_TWIN_the_unconditional_2x2_silently_broadcasts_over_a_scalar_psi,"RED TWIN.  Reproduce the defect and show it is silent, then caught.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,767,test_the_helper_refuses_an_nspinor_it_has_no_representation_for,Unsupported spin extents refuse instead of broadcasting a Pauli action.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,797,test_an_orbit_closed_set_passes_validation,The positive case: every row is a permutation and no image escapes.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,810,test_a_dropped_centroid_refuses_with_the_fix_named,S6 half one — an image that is not in the table.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,837,test_validation_off_returns_the_broken_table_instead_of_raising,RED TWIN for the refusal: ``validate=False`` is the other branch.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,857,test_the_rgrid_permutation_covers_the_whole_fft_grid,``fft_grid_pullback_perm`` — the ζ-side twin of the centroid table.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,878,test_a_cubic_density_recovers_the_full_48_op_holohedry,"G9.  19683 candidate matrices, filtered against ρ on the FFT grid.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,903,test_a_broken_density_recovers_a_strict_subgroup,RED TWIN.  Break the density and the recovered group must SHRINK.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,931,test_the_cartesian_metric_convention_is_discriminated_by_bdot,"The transpose contract, stated with h5py and no lorrax code at all.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,991,test_three_of_the_four_decks_cannot_tell_the_conventions_apart,RED TWIN for the deck choice above — the reason it is not a loop.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,1030,test_the_kgrid_unfolding_validator_passes_on_every_in_tree_deck,"G7 positive.  Zero consumers, zero tests — so it gets both here.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,1045,test_the_kgrid_unfolding_validator_can_fail,"G7 constructible-FALSE, BOTH of the validator's two failure surfaces.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,1085,test_the_validator_reports_a_grid_size_mismatch_by_name,The other refusal branch: the uniform grid and the table disagree.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,83,test_the_stub_supplies_exactly_what_symmaps_reads,"The eleven attributes, checked against the MODULE, not the docstring.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,106,test_the_stub_carries_every_declared_attribute,"And the read actually populated them, with the right shapes.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,126,test_the_deck_tables_are_bit_identical_to_the_committed_derivation,"THE ACCEPTANCE GATE.  Four decks, two integer tables, bit-for-bit.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,163,test_the_bit_equality_gate_can_fail,RED TWIN.  Collapse ONE symmetry op and ``sym_idx_k`` must move.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,192,test_gnppm_selects_only_the_identity_and_its_time_reversal,"MEASURED, and the reason the red twin above is not parametrized.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,253,test_symmaps_no_longer_publishes_the_lowest_sym_parent_map,"Decision 4.  ``kpoint_map`` is GONE, and the used half stayed.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,277,test_incomplete_symmetry_metadata_refuses_instead_of_fabricating_gamma,An uncovered full-k row must never inherit stored Γ/identity.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,296,test_operator_tables_do_not_require_a_complete_k_map,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,322,test_identity_only_tr_reduced_mesh_uses_the_synthesized_minus_identity,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,329,test_identity_only_tr_reduced_mesh_refuses_when_reference_breaks_trs,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,335,test_identity_full_grid_rejects_duplicate_coordinates,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,343,test_the_in_tree_decks_do_not_trip_that_warning,The other half — otherwise the twin above proves the warning fires,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,361,test_cohsex_still_has_a_star_that_begins_on_a_time_reversal_row,"THE §8.1 TRIPWIRE.  Fails, never skips.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,409,test_the_two_predicates_are_the_same_function_only_on_si,"I9, the scope statement, as a table over all four decks.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,446,test_the_stub_and_the_production_loader_build_the_same_tables,THE PARITY ARM.  ``SymMaps(stub)`` == ``SymMaps(WfnLoader(...))``.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,485,test_the_atomic_symmetry_check_passes_on_every_in_tree_deck,"S4.  96/96 Si atom mappings, and the same for the other three.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,508,test_the_wrong_rotation_direction_fails_half_the_mappings,S4's constructible-FALSE — the 48/96 the docstrings cite.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,540,test_a_single_corrupted_op_is_caught_and_the_others_are_not,"One bad op, one failure — localisation, not a blanket refusal.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,560,test_the_round_trip_is_exact_on_the_production_tables,"I1 on the real thing, not on a hand-typed copy of it.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,228,test_the_unfold_matches_the_hand_reference_on_every_mesh,"The SAME numbers from 1x1, 2x2 and 4x1.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,253,test_the_hand_reference_is_not_a_reimplementation,ANTI-TAUTOLOGY for the cell above.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,278,test_the_conj_wrap_on_trs_rows_is_live,ANTI-TAUTOLOGY two: the TRS half is doing something.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,307,test_pair_transpose_unfolds_a_nonhermitian_operator,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,321,test_axis_local_packed_unfold_matches_canonical_without_collectives,Orbit packing removes both permutation all-to-all round trips.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,362,test_open_spin_green_unfold_uses_transpose_not_conjugation_for_tr,Complex real-time weights make the antiunitary rule observable.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,413,test_two_spin_operator_rotation_is_explicit_and_matches_dense_reference,The 2c backend must not regress to skinny GEMMs plus layout copies.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,441,test_scalar_operator_rotation_is_explicit_and_matches_dense_reference,Scalar parent-k transport has the same dot-free lowering contract.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,467,test_rectangular_ct_uses_distinct_bases_explicit_tc_partner_and_padding,One all-P tile closes the CT↔TC antiunitary action.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,523,test_rectangular_pair_transpose_refuses_without_the_reversed_tile,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,547,test_unknown_trs_rule_refuses,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,558,test_the_trivial_map_short_circuits_to_its_input,``irr_idx`` identity + ``sym_idx`` all-zero returns the operand.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,582,test_a_non_dividing_centroid_extent_refuses_on_a_2x2,"G10.  ``n_rmu_padded % (Px·Py) != 0`` RAISES, naming both numbers.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,611,test_the_same_hostile_extent_goes_through_at_1x1,"RED TWIN for the refusal: it is about the MESH, not the geometry.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,629,test_a_divisible_extent_passes_the_same_2x2_code_path,"The other half of the twin: 12 divides 4, so the 2x2 runs.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,647,test_a_sym_table_that_does_not_cover_the_trs_half_refuses,S7.  ``sym_perm`` must reach every row ``sym_idx`` names.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,669,test_a_mu_extent_mismatch_refuses_in_both_tables,"S7 continued: V, ``sym_perm`` and ``L_table`` share ONE padded extent.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,728,test_the_lorentz_mixing_matches_a_dense_numpy_reference,"G6.  The §A5 3-vector mixing, against an explicit double sum.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,772,test_the_lorentz_reference_notices_a_transposed_R,"ANTI-TAUTOLOGY / the compensating transpose, made VISIBLE.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,810,test_the_lorentz_mix_zero_fills_absent_blocks_and_refuses_bad_actions,Absent source blocks are zero; Lorentz rows must be typed host metadata.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,838,test_the_star_helpers_keep_a_sharded_operand_sharded,"S11 check 4 on a REAL 2x2: bit-identical, and the spec survives.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,884,test_the_device_bit_identity_can_fail,RED TWIN.  Perturb the device operand and the comparison must move.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_kirr_fullids.py,69,test_the_wedge_row_is_the_stored_k_itself,"``unfolded_kpts[kirr_fullids[i]] == wfn.kpoints[i]``, on every deck.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_kirr_fullids.py,100,test_no_two_irreducible_points_share_a_wedge_row,"Injectivity, stated separately because it is the visible symptom.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_kirr_fullids.py,124,test_the_si_4x4x4_wedge_is_the_true_first_occurrence_list,"The pinned value, and the identity operation that goes with it.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_kirr_fullids.py,147,test_the_si_wedge_rows_carry_berkeleygws_own_mean_field,"The external anchor: BGW's ``Emf`` at all eight k, all sixteen bands.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_kirr_fullids.py,233,test_a_permuted_irreducible_list_is_followed_not_enumerated,THE RED TWIN.  The map tracks the stored order; it does not invent one.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_kirr_fullids.py,255,test_an_irreducible_point_off_the_uniform_grid_is_refused,The fallback is gone; a k that is not on the grid raises by name.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,131,test_a_closed_set_resolves_to_ibz_with_bit_identical_tables,NO BEHAVIOR CHANGE ON THE CLOSED PATH — measured to the byte.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,171,test_a_closed_set_announces_nothing,RED TWIN of the loud path: a healthy deck stays quiet.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,189,test_a_non_closed_set_resolves_to_full_bz_and_says_why,The production case.  It RESOLVES; it does not raise.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,213,test_asking_a_full_bz_resolution_for_tables_refuses_by_name,A caller that branched wrong gets told WHICH decision it ignored.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,228,test_the_announcement_carries_the_numbers_and_the_consequence,The loud line is composed FROM the measurement.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,256,test_the_announce_key_is_the_centroid_set_not_the_call_site,"Dedup is keyed on the SET, and that is the load-bearing choice.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,280,test_the_table_builders_own_refusal_is_caught_here_and_named_apart,"Arm 2: verdict CLOSED, table builder still refuses.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,317,test_the_2pi_contract_is_forwarded_not_reinvented,"Neither/both of ``tnp=``/``tau=`` is a refusal, here as there.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,339,test_a_malformed_centroid_table_or_grid_raises_rather_than_degrading,Shape errors are NOT resolved to ``full_bz``.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,357,test_the_verdict_is_present_on_both_paths,The numbers survive the decision.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,374,test_selected_centroid_actions_keep_canonical_trs_rows,TRS duplicates the spatial pullback; an unused mirror has no centroid action.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,391,test_selected_centroid_actions_preserve_available_unused_rows,Selecting identity leaves a valid mirror and its TRS partner unchanged.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,404,test_selected_centroid_actions_refuse_out_of_range_rows,Canonical row validation precedes spatial-row normalization.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,413,test_selected_qgrid_resolution_names_measured_spatial_subset,The closure verdict names its subset while the action table retains four rows.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,505,test_the_round_trip_is_exact_on_a_trs_active_deck,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,510,test_the_round_trip_is_exact_on_an_emulated_2x2,"The same body on four emulated devices, when the flag took.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,521,test_the_trs_conjugation_is_what_the_arm_is_testing,"ANTI-TAUTOLOGY, and the reason Si cannot stand in for these decks.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,558,test_silicon_is_a_negative_control_and_says_so,Si round-trips exactly and PROVES NOTHING about time reversal.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,593,test_the_umklapp_phase_is_not_optional,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,597,test_the_umklapp_arm_on_an_emulated_2x2,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,601,test_unfold_false_hands_back_the_wedge_itself,"The small array, for a caller that wants to hold it.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,627,test_the_writer_refuses_the_production_centroid_set,"REFUSAL 1, on the real vector: the 960-centroid production set.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,668,test_the_writer_will_not_write_without_the_question_being_asked,There is no path to disk that skips the closure verdict.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,712,test_a_tampered_table_refuses_at_read,REFUSAL 2: the table hash.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,741,test_a_missing_table_group_refuses,The tables must be IN the file; a tensor without them is a ruin.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,762,test_a_version_mismatch_refuses,REFUSAL 3: a reader must not read a layout it was not built for.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,787,test_a_rank_4_tensor_stamped_version_1_refuses_by_name,"REFUSAL 3b: THE HAZARD, CONSTRUCTED — and refused on the RANK.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,867,test_the_format_plumbing_is_reachable_through_the_door,"The promotion, pinned where it has to hold: on the PACKAGE.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,899,test_shape_and_attr_must_agree_and_the_shape_wins_the_argument,"REFUSAL 4: the cross-check, in both directions.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,936,test_tables_that_do_not_describe_the_tensor_refuse_at_write,"Every extent the unfold silently clips on, refused at the door.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,988,test_the_centroid_hash_is_the_readers_identity_check,A consumer can insist the tensor was written against ITS set.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1017,test_the_table_digest_moves_when_any_table_moves,"The digest has to be sensitive to every table, and to dtype drift.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1056,test_a_legacy_file_with_no_attrs_reads_byte_for_byte,"REFUSAL 5's twin, and the backward-compatibility contract itself.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1085,test_a_half_stamped_file_refuses_instead_of_reading_as_legacy,"The hole the ""no attrs means full"" rule would otherwise leave open.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1112,test_a_zero_placeholder_never_reads_as_data,"THE VACUOUS-PRESENCE GATE, in the q_irr format.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1158,test_the_provenance_is_stamped_the_way_kin_ion_stamps_it,A file that cannot be told from a stale one is a file nobody checks.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1190,test_the_reader_refuses_a_name_that_is_not_there,,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1203,test_a_group_handle_and_a_path_are_the_same_door,"``h5group_or_path``, both spellings, one file.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1231,test_a_wedge_that_is_the_whole_bz_is_labelled_full,"The degenerate case, labelled the way ζ has always labelled it.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1300,test_the_pad_is_stripped_on_write_and_the_file_states_the_logical_extent,The file must not be able to say how many devices wrote it.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1324,test_a_padded_write_reads_back_bit_identical_at_a_DIFFERENT_pad,"THE CLAIM THIS ARM EXISTS FOR: write at one device count, read at",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1371,test_a_permutation_tail_that_is_not_the_identity_refuses,RED TWIN 1.  A non-identity tail is not a pad — it is a table that,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1393,test_a_nonzero_wrap_tail_refuses,RED TWIN 2.  A non-zero ``L_table`` tail carries umklapp phase that,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1413,test_a_tensor_whose_pad_rows_are_not_zero_refuses,RED TWIN 3.  Pad rows are zeros BY CONSTRUCTION; anything else in,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1430,test_an_unpadded_write_is_byte_identical_to_before_this_arm_existed,The default path did not move.  ``n_rmu_logical=None`` is what every,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,1449,test_unavailable_actions_round_trip_reader_padding_and_digest,Canonical unavailable rows survive both reader widths without an identity substitute.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_r_cart.py,100,test_the_forward_rotation_is_the_transpose_per_op,Decision 5's defining equation: ``forward[s] == R_cart[s].T``.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_r_cart.py,118,test_every_op_is_orthogonal_and_the_transpose_is_the_inverse,``R Rᵀ = I`` per op — which is WHY the two spellings are confusable.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_r_cart.py,145,test_the_determinants_follow_the_documented_row_convention,"``(2·ntran, 3, 3)``, and the TRS half is ``−`` the spatial half.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_r_cart.py,176,test_the_no_symmetry_branch_publishes_a_forward_rotation_too,``ntran <= 1`` sets ``R_cart`` on a different line (:983).,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_r_cart.py,198,test_the_wrong_spelling_is_invisible_to_every_cheap_check,"G5.  Same norm, same trace, same Frobenius norm, DIFFERENT answer.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_r_cart.py,299,test_two_of_the_four_decks_cannot_tell_the_spellings_apart,RED TWIN for the deck choice — why the cell above is not a loop.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_r_cart.py,327,test_the_forward_action_is_derived_not_stored,The typed result follows its one raw service table without a cache.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,144,test_the_typed_tables_match_the_committed_derivation,"Typo guard one way, regeneration guard the other.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,162,test_the_27cc885_singleton_claim_is_refuted_by_the_tables,"The erratum, in executable form (design brief, owner-visible row).",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,181,test_a_derived_grid_cannot_carry_these_tests,"THE §5.2b TRAP, measured — so nobody 'simplifies' the literals away.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,213,test_the_predicates_disagree_on_a_real_deck,"I5.  The disagreement is real, and it is this many rows.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,218,test_the_disagreement_count_can_fail,RED TWIN for the precondition itself.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,239,test_select_broadcast_round_trip_is_exact,"I1 + I3.  ``star_broadcast(star_select(A), trs_reference=""star_row"") == A``, BIT-exact.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,263,test_the_round_trip_survives_non_monotone_first_occurrence,"I2.  gnppm's first-occurrence labels are [0, 2, 6, 8, 7].",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,287,test_sorted_label_order_breaks_the_round_trip,"RED TWIN for I2/I3 — the ``np.unique`` ordering, shown failing.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,311,test_the_wrong_flavour_error_is_entirely_off_diagonal,"I6.  THE 183.61 eV SIGNATURE, and why nothing caught it for a month.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,345,test_the_two_flavours_agree_when_no_star_begins_on_a_trs_row,"I5's other half, and I9's scope statement.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,365,test_an_unknown_trs_reference_refuses,"I7.  ``""auto""`` RAISES, naming both legal values.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,386,test_star_spread_sees_an_unconjugated_operand,RED TWIN.  Drop the conjugation and ``star_spread`` goes to O(1).,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,412,test_star_spread_sees_a_permuted_member,"S11 check 2, ported: the negative control from the uncollected gate.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,431,test_singleton_stars_contribute_nothing_to_the_spread,"``_spread_tables`` compares members, and a singleton has none.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,455,test_the_class_and_the_free_functions_are_bit_equal,G4.  Every ``KStarMap`` method against its free-function twin.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,482,test_the_identity_map_is_a_no_op_in_both_directions,"``KStarMap.identity`` — the symmetry-off path, byte-identical.",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,498,test_the_class_refuses_mismatched_index_shapes,RED TWIN.  ``irr_idx`` and ``sym_idx`` are the pair that must agree.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,509,test_from_sym_reads_the_two_tables_it_names,``KStarMap.from_sym`` on a SymMaps-shaped object.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,527,test_the_scissor_weight_orderings_hold_on_the_real_class,"G4.  ``tests/test_scissor_weights.py``'s two ordering assertions,",census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,556,test_spread_rel_returns_a_float_and_propagates_nan,S3.  ``sc_iteration.py:780`` is written ``not (spread <= tol)``.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,585,test_the_nan_check_can_fail,RED TWIN for the spelling above.,census only; classification in gate_blindness.md
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,597,test_the_helpers_keep_a_device_operand_on_the_device,"S11 check 4 at 1x1: same numbers, still a ``jax.Array``.",census only; classification in gate_blindness.md
+tests/bench/test_sternheimer_jvp.py,225,test_bz_boundary_guard,,census only; classification in gate_blindness.md
+tests/bench/test_sternheimer_jvp.py,251,test_forward_chi_symmetry,,census only; classification in gate_blindness.md
+tests/bench/test_sternheimer_jvp.py,283,test_q_zero_jvp,,census only; classification in gate_blindness.md
+tests/bench/test_sternheimer_jvp.py,304,test_finite_q_jvp,,census only; classification in gate_blindness.md
+tests/multi_device/bispinor_exact_hartree_gate.py,54,main,,census only; classification in gate_blindness.md
+tests/multi_device/bispinor_parent_faces_gate.py,10,main,"Compare both families in the Seitz gauge, removing the loader’s typed reciprocal phase.",census only; classification in gate_blindness.md
+tests/multi_device/bispinor_parent_restart_gate.py,7,main,Canonical files restore both packed parent faces without changing a byte.,census only; classification in gate_blindness.md
+tests/multi_device/bispinor_transverse_vertex_face_gate.py,76,check_vertex_build_g,,census only; classification in gate_blindness.md
+tests/multi_device/bispinor_transverse_vertex_face_gate.py,141,check_sigma_sx_chain_face_matches_legacy,,census only; classification in gate_blindness.md
+tests/multi_device/bispinor_transverse_vertex_face_gate.py,274,check_four_current_ordered_pair_all16,"Discriminate AB/BA, q/-q, and rectangular CT/TC orientations.",census only; classification in gate_blindness.md
+tests/multi_device/eqp_invariance_cross_p.py,266,main,,census only; classification in gate_blindness.md
+tests/multi_device/face_carrier_restart_gate.py,87,main,,census only; classification in gate_blindness.md
+tests/multi_device/full_photon_head_sigma_gate.py,637,main,,census only; classification in gate_blindness.md
+tests/multi_device/head_wings_face_gate.py,164,check_dynamic_wings,,census only; classification in gate_blindness.md
+tests/multi_device/head_wings_face_gate.py,205,check_static_wings,,census only; classification in gate_blindness.md
+tests/multi_device/head_wings_face_gate.py,238,check_lorentz_endpoints,Real-mesh endpoint-order and conjugation discriminator.,census only; classification in gate_blindness.md
+tests/multi_device/head_wings_face_gate.py,325,check_bounded_residency,"The positive memory claim, measured -- and measured ISOLATED (this",census only; classification in gate_blindness.md
+tests/multi_device/mtxel_callsite_gate.py,151,main,,census only; classification in gate_blindness.md
+tests/multi_device/mtxel_vnl_scaling_probe.py,86,main,,census only; classification in gate_blindness.md
+tests/multi_device/phdf5_padded_rank_write.py,347,main,,census only; classification in gate_blindness.md
+tests/multi_device/rectangular_response_symmetry_gate.py,133,check_rectangular_response_symmetry,,census only; classification in gate_blindness.md
+tests/multi_device/restart_sharded_parity.py,90,main,,census only; classification in gate_blindness.md
+tests/multi_device/test_hartree_uneven_work.py,9,test_uneven_density_work_reaches_the_reduction,Six unit-occupied Bloch states give two electrons over three k rows.,census only; classification in gate_blindness.md
+tests/multi_device/wfn_parent_stream_p4.py,352,main,,census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,59,test_internal_hint_is_mesh_rounded_and_window_capped,,census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,73,test_internal_hint_caps_below_sixteen_on_p1,,census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,90,test_band_chunk_bumped_when_smaller_than_world_size,User sets ``band_chunk_size=2`` on a 16-rank mesh — the planner,census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,111,test_band_chunk_rounded_up_to_multiple_of_world_size,User sets ``band_chunk_size=20`` on an 8-rank mesh — round up,census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,127,test_band_chunk_unchanged_when_already_valid,User sets ``band_chunk_size=32`` on a 16-rank mesh — already a,census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,143,test_band_chunk_unchanged_on_single_device_mesh,``p_xy == 1`` ⇒ band axis is not sharded; no floor applies.,census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,162,test_band_chunk_autopick_respects_world_size_floor,"Even with no user override, the planner's auto-pick must respect",census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,178,test_band_chunk_autopick_uses_full_zeta_window_when_it_fits,Explicit deck 0 retains the full-window-first planner ladder.,census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,193,test_band_chunk_autopick_mesh_pads_full_zeta_window,P=4 transports 52 bands but leaves the logical window at 50.,census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,208,test_band_chunk_deck_override_still_wins_over_full_window_default,,census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,227,test_band_chunk_capped_at_nb_total_or_world_size,"``band_chunk`` is clamped to ``max(nb_total, p_xy)``; if nb_total",census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,267,test_auto_solve_route_conservatively_prices_replicated_factors,,census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,275,test_nonreplicated_solve_routes_do_not_advertise_a_fake_q_batch,,census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,296,test_a_non_divisible_band_chunk_is_refused,,census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,309,test_a_divisible_split_is_accepted,NOT-VOID control.  Without it the refusal above could be,census only; classification in gate_blindness.md
+tests/test_band_chunk_size_floor.py,327,test_the_store_calls_the_guard_before_it_divides,"AST: the check must run BEFORE `bpd_per_bc` is formed, or it is",census only; classification in gate_blindness.md
+tests/test_bispinor_dynamic_packed_route.py,60,test_gn_ppm_bispinor_takes_the_packed_route,,census only; classification in gate_blindness.md
+tests/test_bispinor_dynamic_packed_route.py,79,test_cohsex_bispinor_still_replaces_the_charge_sigma,,census only; classification in gate_blindness.md
+tests/test_bispinor_dynamic_packed_route.py,91,test_mpa_bispinor_does_not_take_the_packed_route,MPA has no independent static-role W; it must not be served silently.,census only; classification in gate_blindness.md
+tests/test_bispinor_dynamic_packed_route.py,107,test_scalar_decks_are_untouched_by_the_new_grammar,,census only; classification in gate_blindness.md
+tests/test_bispinor_dynamic_packed_route.py,120,test_the_hand_tt_overlay_is_refused_on_the_dynamic_packed_route,"The completion carries the TT head here too, so the overlay double counts.",census only; classification in gate_blindness.md
+tests/test_bispinor_dynamic_packed_route.py,135,test_the_route_is_not_taken_when_its_dyson_solver_would_refuse,A route predicate must not claim a deck its screening owner refuses.,census only; classification in gate_blindness.md
+tests/test_bispinor_dynamic_packed_route.py,158,test_unnamed_linalg_uses_local_default_and_incumbent_route,,census only; classification in gate_blindness.md
+tests/test_bispinor_dynamic_packed_route.py,179,test_photon_sigma_block_selection_is_validated,"A misspelled selection must refuse, not silently sum all sixteen.",census only; classification in gate_blindness.md
+tests/test_bispinor_dynamic_packed_route.py,193,test_the_dispatch_asks_for_the_current_blocks_only,The dynamic branch must not re-sum the CC block the scalar Sigma owns.,census only; classification in gate_blindness.md
+tests/test_bispinor_dynamic_packed_route.py,208,test_this_file_grades_the_checkout_it_lives_in,,census only; classification in gate_blindness.md
+tests/test_bispinor_dynamic_packed_route.py,223,test_lorentz_contractor_refuses_different_parent_bindings,Equal-shaped families cannot borrow another centroid plan's interaction.,census only; classification in gate_blindness.md
+tests/test_bispinor_kinetic_balance_jet.py,50,test_sigma_dot_matches_independent_cartesian_pauli_matrices,,census only; classification in gate_blindness.md
+tests/test_bispinor_kinetic_balance_jet.py,62,test_isometric_lift_preserves_each_g_point_norm,,census only; classification in gate_blindness.md
+tests/test_bispinor_kinetic_balance_jet.py,79,test_isometric_endpoint_jet_is_the_analytic_r_product_rule,,census only; classification in gate_blindness.md
+tests/test_bispinor_kinetic_balance_jet.py,137,test_raw_endpoint_default_and_selected_families_remain_exactly_affine,,census only; classification in gate_blindness.md
+tests/test_bispinor_kinetic_balance_jet.py,157,test_lift_jet_is_the_cartesian_finite_difference_of_existing_lift,,census only; classification in gate_blindness.md
+tests/test_bispinor_kinetic_balance_jet.py,208,test_raw_alpha_jet_matches_rydberg_kinetic_velocity_and_contact,,census only; classification in gate_blindness.md
+tests/test_bispinor_kinetic_balance_jet.py,249,test_large_component_boundary_and_sigma_dot_reuse_are_explicit,,census only; classification in gate_blindness.md
+tests/test_bispinor_restart_face.py,51,test_legacy_written_transverse_refuses_by_name_under_face,,census only; classification in gate_blindness.md
+tests/test_bispinor_restart_face.py,58,test_face_pair_present_passes_pass1,,census only; classification in gate_blindness.md
+tests/test_bispinor_restart_face.py,74,test_scalar_file_passes_pass1_under_both_flags,,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,107,test_tt_head_correction_off_leaves_gamma_slot_zero,"Default (tt_head_correction=False): the q=Γ, G=0 slot of a TT tile",census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,121,test_tt_head_correction_on_injects_only_at_gamma_g0,"tt_head_correction=True: the q=Γ, G=0 slot equals",census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,151,test_tt_head_correction_requires_kgrid,,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,160,test_tt_head_correction_cc_tile_is_a_no_op,tt_head_correction is a TT-only knob; the CC tile is unaffected,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,179,test_tt_head_tensor_refuses_box_truncation,,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,186,test_tt_head_tensor_trace_identity_matches_2_vc0,tr(t_ij(q̂)) = 2 at every point on the unit sphere (delta_ii=3,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,204,test_tt_head_tensor_matches_measured_slab_reference_ratio,"In-plane-isotropic slab cell: T/vc0 -> diag(1/2, 1/2, 1), matching",census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,264,test_packed_completion_bare_D_TT_is_the_transverse_projector_average,"``<D>``'s TT block is ``-<v P^T>``, checked by three identities that",census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,301,test_packed_completion_charge_only_R_returns_diag_W00_and_bare_D_TT,THE identity the packed bare-transverse route rests on.,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,377,test_the_deck_key_is_tombstoned,The removed key refuses BY NAME and says what carries the head now.,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,388,test_default_is_off_and_never_refuses,,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,393,test_refuses_without_bispinor,,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,404,test_refuses_sys_dim_zero,,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,413,test_supported_combination_parses_without_refusing,,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,422,test_bispinor_false_decks_are_untouched,The flag existing must not change any default-deck resolution.,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,429,test_gw_init_calls_the_canonical_refusal,The driver-entry mirror call exists (parser-altitude coverage,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,439,test_the_docs_row_names_the_key,,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,446,test_refusal_doc_pointer_names_a_section_that_actually_exists,Both refusal messages cite a ``docs/input_reference.md`` section by,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,489,test_packed_bare_route_refuses_the_hand_tt_overlay,,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,502,test_packed_bare_route_accepts_the_default_and_takes_the_packed_path,,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,515,test_outside_the_packed_envelope_the_overlay_is_still_accepted,The incumbent route keeps the overlay: it is its ONLY TT head.,census only; classification in gate_blindness.md
+tests/test_bispinor_tt_head_correction.py,549,test_this_file_grades_the_checkout_it_lives_in,,census only; classification in gate_blindness.md
+tests/test_bispinor_v_file_contract.py,92,test_writer_refuses_invalid_tile_carrier,,census only; classification in gate_blindness.md
+tests/test_bispinor_v_file_contract.py,100,test_writer_accepts_exact_q_and_padded_centroid_carrier,,census only; classification in gate_blindness.md
+tests/test_bispinor_v_file_contract.py,106,test_reader_refuses_missing_unique_tile_before_collective_open,,census only; classification in gate_blindness.md
+tests/test_bispinor_v_file_contract.py,127,test_reader_refuses_short_tile_before_collective_open,,census only; classification in gate_blindness.md
+tests/test_bispinor_v_file_contract.py,153,test_reader_refuses_wrong_tile_dtype_before_collective_open,,census only; classification in gate_blindness.md
+tests/test_bispinor_v_file_contract.py,169,test_reader_refuses_unready_or_noncanonical_inventory,,census only; classification in gate_blindness.md
+tests/test_bispinor_v_file_contract.py,194,test_reader_accepts_complete_certified_file,,census only; classification in gate_blindness.md
+tests/test_bispinor_v_file_contract.py,223,test_reader_refuses_unstamped_full_q_file,,census only; classification in gate_blindness.md
+tests/test_bispinor_v_file_contract.py,234,test_reader_refuses_disagreeing_current_family_tables,,census only; classification in gate_blindness.md
+tests/test_bispinor_v_file_contract.py,250,test_reader_authenticates_each_tile_receipt,,census only; classification in gate_blindness.md
+tests/test_bispinor_v_file_contract.py,261,test_reader_refuses_sibling_centroid_stamp_mismatch,,census only; classification in gate_blindness.md
+tests/test_bispinor_zeta_reuse_ast.py,84,test_reuse_decisions_are_independent_and_use_one_validator,,census only; classification in gate_blindness.md
+tests/test_bispinor_zeta_reuse_ast.py,104,test_every_reuse_check_probes_the_dataset_extent,,census only; classification in gate_blindness.md
+tests/test_bispinor_zeta_reuse_ast.py,116,test_reuse_contract_precedes_and_bypasses_fit_only_planners,A complete cache never enters either charge or transverse fit HWM.,census only; classification in gate_blindness.md
+tests/test_bispinor_zeta_reuse_ast.py,150,test_only_missing_channels_reach_fit_writers,,census only; classification in gate_blindness.md
+tests/test_bispinor_zeta_reuse_ast.py,174,test_bispinor_reuse_path_returns_rebuilt_transverse_data,,census only; classification in gate_blindness.md
+tests/test_bispinor_zeta_reuse_ast.py,215,test_transverse_psi_has_exactly_two_call_sites,,census only; classification in gate_blindness.md
+tests/test_bispinor_zeta_reuse_ast.py,225,test_transverse_zeta_files_are_stamped,,census only; classification in gate_blindness.md
+tests/test_bispinor_zeta_reuse_ast.py,236,test_every_fresh_channel_gates_rank_findings_before_stamp,,census only; classification in gate_blindness.md
+tests/test_cartesian_actions_cri3.py,31,test_typed_cartesian_actions_match_cri3_fixture,,census only; classification in gate_blindness.md
+tests/test_centroid_current_density.py,50,test_transverse_projectors_match_pairs_and_are_gauge_invariant,,census only; classification in gate_blindness.md
+tests/test_centroid_current_density.py,70,test_asymmetric_charge_projectors_match_pairs,,census only; classification in gate_blindness.md
+tests/test_centroid_current_density.py,82,test_one_k_scalar_equal_window_row_norm_is_the_band_density,,census only; classification in gate_blindness.md
+tests/test_centroid_current_density.py,148,test_parent_stream_partitions_across_ranks_and_keeps_union,,census only; classification in gate_blindness.md
+tests/test_centroid_current_density.py,178,test_nonuniform_parent_weights_are_divided_over_unequal_stars,,census only; classification in gate_blindness.md
+tests/test_centroid_current_density.py,221,test_ibz_storage_weights_are_bit_identical_to_the_legacy_expansion,IBZ identity: nkpts < nk_tot must reproduce the pre-fix numbers exactly.,census only; classification in gate_blindness.md
+tests/test_centroid_current_density.py,242,test_full_bz_storage_uses_the_stored_weights_and_does_not_refuse,"nkpts == nk_tot: every point is stored, so kweights IS the quadrature.",census only; classification in gate_blindness.md
+tests/test_centroid_current_density.py,278,test_full_bz_storage_refuses_when_parents_are_not_their_own_image,The full-BZ branch needs the raw and full-BZ k axes to be one axis.,census only; classification in gate_blindness.md
+tests/test_centroid_current_density.py,288,test_ibz_storage_still_refuses_uncovered_quadrature_weight,The IBZ precondition survives: a short axis must cover weight one.,census only; classification in gate_blindness.md
+tests/test_centroid_current_density.py,298,test_projector_memory_plan_prices_and_refuses,,census only; classification in gate_blindness.md
+tests/test_centroid_current_density.py,309,test_distributed_build_requires_mesh,,census only; classification in gate_blindness.md
+tests/test_centroid_current_density.py,322,test_builder_has_no_occupation_or_persistent_pullback_cache,,census only; classification in gate_blindness.md
+tests/test_centroid_fit_policy.py,16,test_nonsymmorphic_grid_average_uses_the_seitz_translation,,census only; classification in gate_blindness.md
+tests/test_centroid_fit_policy.py,32,test_off_grid_seitz_translation_refuses_instead_of_rounding,,census only; classification in gate_blindness.md
+tests/test_centroid_fit_policy.py,43,test_kmeans_cli_has_no_occupation_weight_fit_option,,census only; classification in gate_blindness.md
+tests/test_centroid_fit_policy.py,79,test_kmeans_report_carries_the_density_mode_suffix,A charge and a current selection in one directory must not collide.,census only; classification in gate_blindness.md
+tests/test_centroid_fit_policy.py,113,test_current_mode_refuses_metric_bypasses,,census only; classification in gate_blindness.md
+tests/test_centroid_fit_policy.py,124,test_scalar_mode_retains_explicit_experiment_switches,,census only; classification in gate_blindness.md
+tests/test_centroid_fit_policy.py,158,test_current_prune_routes_exact_transverse_metric_through_group_blocks,Current mode spends a point budget and pivots complete atom orbits.,census only; classification in gate_blindness.md
+tests/test_centroid_fit_policy.py,205,test_scalar_prune_keeps_the_same_ungrouped_charge_route,The current hardening does not redirect scalar point selection.,census only; classification in gate_blindness.md
+tests/test_chi0_fractional_face_parity.py,259,test_fractional_chi0_face_matches_legacy,,census only; classification in gate_blindness.md
+tests/test_compute_V_q_bispinor_g_flat.py,124,test_reader_refuses_stale_format_before_collective_open,A schema refusal must not strand an unreachable collective handle.,census only; classification in gate_blindness.md
+tests/test_compute_V_q_bispinor_g_flat.py,146,test_bispinor_7_tiles_match_einsum_reference,All 7 unique tiles agree with a per-q einsum reference.,census only; classification in gate_blindness.md
+tests/test_compute_V_q_bispinor_g_flat.py,229,test_bispinor_CC_tile_matches_charge_orchestrator,CC tile from the bispinor orchestrator == output of the charge-only,census only; classification in gate_blindness.md
+tests/test_compute_V_q_bispinor_g_flat.py,335,test_cc_tile_is_bare_v_real,,census only; classification in gate_blindness.md
+tests/test_compute_V_q_bispinor_g_flat.py,341,test_tt_diagonal_applies_negative_transverse_projector,,census only; classification in gate_blindness.md
+tests/test_compute_V_q_bispinor_g_flat.py,350,test_tt_offdiagonal_applies_negative_transverse_projector,,census only; classification in gate_blindness.md
+tests/test_compute_V_q_bispinor_g_flat.py,358,test_invalid_tt_indices_raise,,census only; classification in gate_blindness.md
+tests/test_conv_kpair_numerical.py,34,test_conv_kpair_matches_xla,,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,163,test_exact_origin_radial_moment_and_contact_action,,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,207,test_nonzero_k_action_matches_cartesian_value_finite_differences,,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,256,test_fixed_row_and_g_scans_cover_each_coupled_block_once,,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,281,test_strict_large_components_contact_setup_and_finite_q_refuse,,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,299,test_ordinary_and_gauge_projector_values_share_exact_origin_owner,,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,312,test_icl_kminusq_jet_reuses_uniform_current_and_contact_exactly,,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,341,test_icl_kminusq_taylor_ward_and_transfer_hermiticity,The q jet is the straight-line average of dV(k-lambda*q).,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,384,test_icl_q2_physical_radial_third_derivative_and_operator_jet,,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,467,test_fixed_large_component_photon_vertex_jet_taylor_ward_and_hermiticity,,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,592,test_isometric_photon_vertex_jet_matches_the_direct_kminusq_endpoint,,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,681,test_exact_icl_finite_transfer_matches_q0_and_landed_q2_jet,,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,725,test_exact_icl_finite_contact_q0_and_two_photon_ward,,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,771,test_uniform_contact_and_paramagnetic_sum_have_fsum_prefactor,Hellmann--Feynman curvature fixes contact/bubble sign and factor 2.,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,838,test_exact_icl_finite_contact_centered_q2_coefficient,,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,884,test_exact_icl_finite_transfer_ward_wrap_and_hermiticity,,census only; classification in gate_blindness.md
+tests/test_dft_gauge_vertices.py,930,test_exact_icl_finite_transfer_rejects_noncanonical_wrap_and_stamps_rule,,census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,206,test_default_arm_is_bit_identical_to_the_pre_knob_assembly,The DEFAULT is the flipped arm; the LEGACY arm is still exact.,census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,246,test_the_bit_identity_reference_can_fail,The FALSE case for the reference itself.,census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,278,test_flipped_arm_moves_the_matrix_elements,Perturb it and watch the physics move.,census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,325,test_operator_key_separates_the_two_arms_and_nothing_else,,census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,349,test_sweep_does_not_serve_one_arm_for_the_other,"Both arms, both orders, one process -- the end-to-end cache check.",census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,386,test_operator_refuses_anything_that_is_not_a_sign,,census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,410,test_producer_resolution_order,,census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,417,test_producer_refuses_a_deck_key_that_is_not_a_sign,,census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,426,test_producer_and_operator_share_one_sign_validation_owner,The parser resolves precedence; common.mtxel_sweep owns validity.,census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,446,test_the_deck_key_survives_the_deck_reader,"The FALSE case a grep would have passed, and did.",census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,467,test_a_deck_that_omits_the_key_reads_as_not_declared,Empty is UNSET and must stay distinguishable from an explicit,census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,477,test_strict_keys_accepts_a_deck_that_names_the_sign,Always-strict parsing accepts the registered sign key.,census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,485,test_the_whole_chain_from_deck_line_to_resolved_sign,"Deck text in, arm out -- the two halves joined.",census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,531,test_the_stamp_records_the_arm_that_ran,,census only; classification in gate_blindness.md
+tests/test_dipole_vnl_velocity_sign.py,540,test_an_unstamped_file_stays_unstamped,"``None`` is ""written before the knob existed"", which is a real",census only; classification in gate_blindness.md
+tests/test_file_io.py,121,test_read_mf_header_round_trip,"Write a fake WFN.h5, read mf_header, assert every field matches.",census only; classification in gate_blindness.md
+tests/test_file_io.py,167,test_copy_mf_header_verbatim,Copy mf_header from a fake WFN.h5 to a fresh destination and,census only; classification in gate_blindness.md
+tests/test_file_io.py,188,test_copy_mf_header_refuses_overwrite,,census only; classification in gate_blindness.md
+tests/test_file_io.py,197,test_isdf_header_round_trip,,census only; classification in gate_blindness.md
+tests/test_file_io.py,222,test_isdf_header_current_label,,census only; classification in gate_blindness.md
+tests/test_file_io.py,241,test_isdf_header_refuses_overwrite,,census only; classification in gate_blindness.md
+tests/test_file_io.py,256,test_mf_and_isdf_headers_coexist,The two headers must live side-by-side without trampling each,census only; classification in gate_blindness.md
+tests/test_file_io.py,334,test_zeta_reader_loads_mf_and_isdf_headers,,census only; classification in gate_blindness.md
+tests/test_file_io.py,360,test_zeta_reader_detects_ibz_q_axis,An IBZ-only zeta_q.h5 has a smaller leading axis; ZetaReader,census only; classification in gate_blindness.md
+tests/test_file_io.py,372,test_zeta_reader_vertex_mu_L_is_int,,census only; classification in gate_blindness.md
+tests/test_file_io.py,381,test_zeta_reader_context_manager_closes,,census only; classification in gate_blindness.md
+tests/test_file_io.py,394,test_zeta_reader_slab_io_property,The exposed SlabIO handle is the one we can hand to legacy,census only; classification in gate_blindness.md
+tests/test_file_io.py,448,test_read_zeta_G_slab_zero_pads_trailing_mu,When ``mu_count > valid_mu`` the reader must return the on-disk,census only; classification in gate_blindness.md
+tests/test_file_io.py,491,test_read_zeta_G_slab_pad_smaller_than_one_per_rank,Edge case: when ``n_rmu_logical < n_rmu_padded`` AND,census only; classification in gate_blindness.md
+tests/test_file_io.py,562,test_mark_zeta_done_flips_flag,,census only; classification in gate_blindness.md
+tests/test_file_io.py,572,test_legacy_files_without_flag_read_as_done,A pre-flag zeta_q.h5 (no zeta_is_done dataset) reads as True.,census only; classification in gate_blindness.md
+tests/test_file_io.py,582,test_zeta_layout_round_trip,``zeta_layout`` round-trips for both 'r_space' (default) and 'G_flat'.,census only; classification in gate_blindness.md
+tests/test_file_io.py,611,test_zeta_layout_legacy_default,Files without ``zeta_layout`` read as 'r_space'.,census only; classification in gate_blindness.md
+tests/test_file_io.py,620,test_zeta_layout_rejects_garbage,"build() rejects non-{'r_space','G_flat'} values.",census only; classification in gate_blindness.md
+tests/test_file_io.py,647,test_load_q_ibz_returns_all_disk_rows,,census only; classification in gate_blindness.md
+tests/test_file_io.py,655,test_load_q_index_list_subset,,census only; classification in gate_blindness.md
+tests/test_file_io.py,667,test_load_mu_range,,census only; classification in gate_blindness.md
+tests/test_file_io.py,678,test_load_q_full_bz_on_full_disk_returns_all,"When the on-disk layout IS full-BZ, q='full_bz' == q='ibz'.",census only; classification in gate_blindness.md
+tests/test_file_io.py,688,test_load_q_full_bz_on_an_ibz_file_refuses_and_names_the_post_v_q_unfold,The successor to ``test_load_q_full_bz_unfold_path_exists``.,census only; classification in gate_blindness.md
+tests/test_file_io.py,724,test_r_space_header_surface_still_opens,,census only; classification in gate_blindness.md
+tests/test_file_io.py,739,test_r_space_data_reads_refuse_naming_the_removal,,census only; classification in gate_blindness.md
+tests/test_file_io.py,746,test_the_g_flat_data_reads_do_not_hit_that_refusal,The does-not-cry-wolf half: a G-flat file must get PAST the layout,census only; classification in gate_blindness.md
+tests/test_file_io.py,759,test_the_deleted_read_arguments_are_gone_from_the_signature,"D3, pinned.  ``qvec_batch_frac``/``sphere_idx`` on",census only; classification in gate_blindness.md
+tests/test_file_io.py,806,test_normalize_slab_request_rejects_rank_mismatch,,census only; classification in gate_blindness.md
+tests/test_file_io.py,817,test_normalize_slab_request_rejects_out_of_bounds,,census only; classification in gate_blindness.md
+tests/test_file_io.py,828,test_normalize_slab_request_allows_nonzero_read_offset_without_extent,,census only; classification in gate_blindness.md
+tests/test_file_io.py,842,test_validate_block_divisible_rejects_ragged_write_axis,,census only; classification in gate_blindness.md
+tests/test_file_io.py,858,test_validate_block_divisible_accepts_cri3_zeta_shape,,census only; classification in gate_blindness.md
+tests/test_file_io.py,869,test_normalize_valid_shape_rejects_prefix_larger_than_physical_slab,,census only; classification in gate_blindness.md
+tests/test_file_io.py,881,test_normalize_valid_shape_allows_ragged_last_file_chunk,,census only; classification in gate_blindness.md
+tests/test_file_io.py,893,test_normalize_valid_shape_derives_the_dataset_clip_by_default,decisions.md 2026-08-04: with no ``valid_shape`` the extent is,census only; classification in gate_blindness.md
+tests/test_file_io.py,908,test_normalize_valid_shape_default_clips_a_sub_slab_at_its_offset,,census only; classification in gate_blindness.md
+tests/test_file_io.py,915,test_normalize_valid_shape_default_never_refuses_an_overhang,A slab starting past the end of the dataset derives an EMPTY,census only; classification in gate_blindness.md
+tests/test_file_io.py,924,test_normalize_valid_shape_override_that_overruns_refuses,,census only; classification in gate_blindness.md
+tests/test_file_io.py,931,test_slabio_implicit_pad_write_and_zero_padded_read,The padded write/read round-trip with NO padding argument.,census only; classification in gate_blindness.md
+tests/test_file_io.py,956,test_slabio_implicit_pad_matches_explicit_valid_shape,BYTE-IDENTITY: dropping ``valid_shape`` must not move a bit.,census only; classification in gate_blindness.md
+tests/test_file_io.py,992,test_create_dataset_refuses_a_geometry_change,"decisions.md 2026-08-04: reuse-if-identical, refuse otherwise.",census only; classification in gate_blindness.md
+tests/test_file_io.py,1024,test_read_slab_without_shape_rounds_up_to_the_mesh,THE EASY CALL IS THE CORRECT CALL (2026-08-06).,census only; classification in gate_blindness.md
+tests/test_file_io.py,1059,test_mesh_divisible_shape_rounds_each_axis_by_its_own_divisor,"The rounding rule itself, without a file.",census only; classification in gate_blindness.md
+tests/test_file_io.py,1132,test_zeta_q_headers_append_onto_phdf5_created_inode,Serial h5py can append the header groups to a PHDF5-created inode.,census only; classification in gate_blindness.md
+tests/test_file_io.py,1182,test_zeta_q_inode_gets_striping_policy,The zeta_q.h5 inode carries the stripe count the policy resolves to.,census only; classification in gate_blindness.md
+tests/test_file_io.py,1273,test_the_attr_writer_writes_what_the_host_path_would_write,"THE WSL TWIN, and it needs no transport: same bytes, both ways.",census only; classification in gate_blindness.md
+tests/test_file_io.py,1312,test_the_writers_stamp_survives_its_own_reader,"The consequence, end to end at the h5py altitude.",census only; classification in gate_blindness.md
+tests/test_file_io.py,1343,test_an_attr_for_a_missing_dataset_refuses,"The regression twin for the SHAPE of the defect, not its instance.",census only; classification in gate_blindness.md
+tests/test_file_io.py,1360,test_slabio_create_dataset_attrs_reach_the_file,"THE RED TWIN, on the transport that had the defect.",census only; classification in gate_blindness.md
+tests/test_file_io.py,1386,test_slabio_and_h5py_write_attr_identical_files,"The two paths, the same call, the same file.",census only; classification in gate_blindness.md
+tests/test_file_io.py,1419,test_slabio_create_dataset_does_not_warn_about_attrs,The discard's ghost.  A warning here means the drop came back.,census only; classification in gate_blindness.md
+tests/test_galerkin_basis_store.py,91,test_galerkin_basis_logical_roundtrip_and_provenance,,census only; classification in gate_blindness.md
+tests/test_gflat_planner_face_pairs.py,74,test_coupled_mu123_prototype_prices_two_zq_outputs_and_shared_x_face,,census only; classification in gate_blindness.md
+tests/test_gflat_planner_face_pairs.py,84,test_coupled_mu123_stacked_solve_prices_nonconcurrent_peak,,census only; classification in gate_blindness.md
+tests/test_gflat_planner_face_pairs.py,92,test_coupled_host_spill_moves_gflat_bytes_off_device,,census only; classification in gate_blindness.md
+tests/test_gflat_planner_face_pairs.py,108,test_batch_reshard_floor_matches_three_measured_live_arenas,,census only; classification in gate_blindness.md
+tests/test_gflat_planner_face_pairs.py,114,test_local_route_hwm_includes_solve_floor_not_just_base_plus_delta,,census only; classification in gate_blindness.md
+tests/test_gflat_planner_face_pairs.py,123,test_run50_matched_deck_selects_bounded_y_cache_without_full_grid_cache,,census only; classification in gate_blindness.md
+tests/test_gflat_planner_face_pairs.py,145,test_cri3_prices_bounded_centroid_and_full_k_zeta_ffts_separately,,census only; classification in gate_blindness.md
+tests/test_gflat_planner_face_pairs.py,170,test_face_pair_arena_distinguishes_charge_and_current_executables,,census only; classification in gate_blindness.md
+tests/test_gflat_planner_face_pairs.py,199,test_ns1_falls_back_and_large_band_selects_cache_feasible_outer_chunk,,census only; classification in gate_blindness.md
+tests/test_gflat_planner_face_pairs.py,211,test_face_uses_exact_carrier_inventory_and_only_py_r_alignment,,census only; classification in gate_blindness.md
+tests/test_gflat_planner_face_pairs.py,219,test_bounded_partition_tile_preserves_outer_extent_and_alignment,,census only; classification in gate_blindness.md
+tests/test_gflat_planner_face_pairs.py,227,test_run158_cliff_uses_two_41472_tiles_and_prices_compact_redistribution,,census only; classification in gate_blindness.md
+tests/test_gflat_planner_face_pairs.py,252,test_parent_open_spin_projectors_are_in_the_transverse_live_set,Five four-spinor parents on 668 centroids need both open-spin projectors live.,census only; classification in gate_blindness.md
+tests/test_gw_jax_regression.py,180,test_gw_jax_matches_reference,,census only; classification in gate_blindness.md
+tests/test_gw_jax_regression.py,204,test_si_production_matches_frozen_reference,Si production deck vs its own frozen output — 'did the code change?'.,census only; classification in gate_blindness.md
+tests/test_gw_jax_regression.py,262,test_si_production_matches_berkeleygw,Si production deck vs literal BerkeleyGW columns — THE external anchor.,census only; classification in gate_blindness.md
+tests/test_gw_jax_regression.py,337,test_si_fast_matches_frozen_reference,Si fast deck vs its own frozen output.  NOT a BerkeleyGW anchor.,census only; classification in gate_blindness.md
+tests/test_gw_jax_regression.py,392,test_hbn_matches_frozen_reference,hBN non-cubic deck vs its own frozen output.  NOT a BerkeleyGW anchor.,census only; classification in gate_blindness.md
+tests/test_gw_jax_regression.py,436,test_hbn_mc_average_vcoul_body_moves_sigma,THE NEGATIVE CONTROL — the cell this whole fixture exists for.,census only; classification in gate_blindness.md
+tests/test_gw_jax_regression.py,504,test_gnppm_matches_reference,"MoS2 3×3 GN-PPM frozen gate, on the session run (Tier-2's state).",census only; classification in gate_blindness.md
+tests/test_gw_jax_regression.py,534,test_bispinor_gnppm_matches_reference,Bispinor GN-PPM frozen gate (Σ^B folded into sigX).,census only; classification in gate_blindness.md
+tests/test_gw_production_report.py,88,test_report_is_scientific_rank_zero_output,,census only; classification in gate_blindness.md
+tests/test_gw_production_report.py,250,test_report_spells_out_enabled_eqp2_and_convergence,,census only; classification in gate_blindness.md
+tests/test_gw_production_report.py,279,test_closing_file_roles_do_not_conflate_full_matrix_and_diagonal_outputs,,census only; classification in gate_blindness.md
+tests/test_gw_production_report.py,286,test_incomplete_sigma_coverage_is_an_actionable_final_warning,,census only; classification in gate_blindness.md
+tests/test_gw_production_report.py,329,test_timing_report_hides_sub_display_precision_residuals,,census only; classification in gate_blindness.md
+tests/test_gw_production_report.py,348,test_report_collapses_minimax_catalog_receipts,,census only; classification in gate_blindness.md
+tests/test_gw_production_report.py,370,test_nonzero_rank_never_creates_report,,census only; classification in gate_blindness.md
+tests/test_gw_production_report.py,382,test_local_linalg_warning_has_dense_matrix_numbers,,census only; classification in gate_blindness.md
+tests/test_gw_production_report.py,400,test_low_mem_bands_warning_has_automatic_chunk_number,,census only; classification in gate_blindness.md
+tests/test_gw_production_report.py,421,test_distributed_linalg_reports_2d_layout,,census only; classification in gate_blindness.md
+tests/test_gw_production_report.py,438,test_mpa_trs_route_is_part_of_the_scientific_run_record,,census only; classification in gate_blindness.md
+tests/test_head_correction.py,44,test_head_policy_enum_is_strict_and_has_one_physical_default_axis,,census only; classification in gate_blindness.md
+tests/test_head_correction.py,51,test_full_policy_refuses_an_unfolded_direct_epsilon_head,,census only; classification in gate_blindness.md
+tests/test_head_correction.py,63,test_full_policy_accepts_only_once_reduced_head_kinds,,census only; classification in gate_blindness.md
+tests/test_head_correction.py,73,test_diagnostic_and_off_policies_are_observable,,census only; classification in gate_blindness.md
+tests/test_head_correction.py,82,test_head_resolver_forwards_the_gw_run_dipole_window,"The provenance message compares the reader's window, not defaults.",census only; classification in gate_blindness.md
+tests/test_head_correction.py,102,test_an_absent_dipole_window_refuses_instead_of_defaulting_to_5_5,No band window means NO reference — never a fabricated 5/5/nbands.,census only; classification in gate_blindness.md
+tests/test_head_correction.py,128,test_compute_static_head_terms_matches_cohsex_formulas,,census only; classification in gate_blindness.md
+tests/test_head_correction.py,157,test_static_head_terms_to_kij_broadcasts_diagonal_heads,,census only; classification in gate_blindness.md
+tests/test_head_correction.py,179,test_resolve_head_override_uses_frequency_specific_whead,,census only; classification in gate_blindness.md
+tests/test_head_correction.py,225,test_fit_head_ppm_negative_branch_sign_matches_positive_limit,Drive the Ω_h²<0 branch and assert R_h has the anti-Bug-A sign.,census only; classification in gate_blindness.md
+tests/test_head_correction.py,264,test_fit_head_ppm_R_h_continuous_across_omega_sq_zero,R_h is sign- and magnitude-continuous across the Ω_h²=0 crossing.,census only; classification in gate_blindness.md
+tests/test_invariance_gates.py,98,test_restart_equals_fresh,restart=true from the fresh run's tmp/ must reproduce the fresh run.,census only; classification in gate_blindness.md
+tests/test_invariance_gates.py,124,test_mu_pad_flip_invariance_gnppm,EXTRA_MU_PAD=12 vs 0 at fixed P=1 on the dynamic GN-PPM chain.,census only; classification in gate_blindness.md
+tests/test_invariance_gates.py,163,test_mu_pad_flip_invariance_bispinor,"EXTRA_MU_PAD=4 vs 0, bispinor GN-PPM: Sigma byte identity.",census only; classification in gate_blindness.md
+tests/test_invariance_gates.py,208,test_sc_iteration1_equals_one_shot,,census only; classification in gate_blindness.md
+tests/test_invariance_gates.py,235,test_fixed_point_frozen_qp_rotations,,census only; classification in gate_blindness.md
+tests/test_isdf_cq_face_parity.py,221,test_cq_face_layout_matches_legacy,,census only; classification in gate_blindness.md
+tests/test_isdf_zq_face_parity.py,523,test_zq_face_layout_matches_legacy,,census only; classification in gate_blindness.md
+tests/test_isdf_zq_face_parity.py,539,test_global_tile_concat_restores_outer_y_shard_order_complex128,"Global concat, not local concat, restores the outer y-shard order.",census only; classification in gate_blindness.md
+tests/test_isdf_zq_face_parity.py,568,test_band_chunks_must_complete_before_pair_product,Negative oracle: per-chunk products omit cross-band-chunk terms.,census only; classification in gate_blindness.md
+tests/test_isdf_zq_parent_parity.py,348,test_parent_zq_and_cq_match_the_full_k_face_route,,census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,84,test_kin_ion_provenance_refuses_folded_and_mismatched_files_before_read,Only a pristine operator with matching spinor provenance is usable.,census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,207,test_kinetic_padded_matches_ragged_and_mask_is_load_bearing,,census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,234,test_local_V_padded_matches_ragged_and_mask_is_load_bearing,,census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,255,test_gather_psi_G_padded_zeroes_pad_columns,"The V_NL route masks ψ_G, not Z — check the ψ side directly.",census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,288,test_summed_operator_block_agrees_at_1e12,"T + V_loc together, the combination ``get_kin_ion_k`` returns.",census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,320,test_get_kin_ion_k_refuses_a_padded_list_without_its_mask,"The mask contract is ENFORCED, not merely documented.",census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,353,test_the_duplicate_arm_is_blind_to_a_single_pad_row,Construct the case where arm (b) returns FALSE.,census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,392,test_the_sentinel_arm_catches_a_single_pad_row,"Arm (a): with ``fft_grid`` known, ONE pad row is enough.",census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,458,test_padded_gvectors_mask_matches_ngk_valid,,census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,490,test_padded_gvectors_refuses_unpaired_k_rows,,census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,504,test_padded_gvectors_refuses_invalid_logical_extents,,census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,520,test_sweep_consumers_take_kvecs_from_the_same_gtab,Every migrated sweep pairs ``gtab.gvecs`` with ``gtab.kvecs``.,census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,548,test_sweep_local_k_places_blocks_by_global_index,,census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,575,test_sweep_local_k_empty_rank_keeps_the_collective_shape,world > nk leaves ranks with NO k — they still join the gather.,census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,595,test_sweep_local_k_refuses_a_shape_mismatch,"The declared item_shape is enforced, not trusted.",census only; classification in gate_blindness.md
+tests/test_kin_ion_padded_gvectors.py,605,test_sweep_local_k_lookahead_does_not_change_values,"Pipelining depth is a scheduling knob, never a numerical one.",census only; classification in gate_blindness.md
+tests/test_low_mem_bands_envelope.py,134,test_full_q_storage_selection_refuses_at_parse_time,Explicit full-q storage cannot override the WFN's parent representation.,census only; classification in gate_blindness.md
+tests/test_low_mem_bands_envelope.py,140,test_head_correction_full_is_lifted_on_the_bare_default,head_correction=full (the shipping default) is PORTED for the face,census only; classification in gate_blindness.md
+tests/test_low_mem_bands_envelope.py,234,test_the_supported_envelope_parses_and_does_not_refuse,The other half of a refusal matrix: what it does NOT refuse.,census only; classification in gate_blindness.md
+tests/test_low_mem_bands_envelope.py,252,test_the_key_is_registered_so_it_is_not_an_unknown_key,Always-strict parsing must accept the registered boolean dial.,census only; classification in gate_blindness.md
+tests/test_low_mem_bands_envelope.py,264,test_an_explicit_gij_under_low_mem_bands_refuses,"RED TWIN.  A live Gij operand alongside low_mem_bands=true refuses,",census only; classification in gate_blindness.md
+tests/test_low_mem_bands_envelope.py,277,test_gij_none_under_low_mem_bands_is_the_positive_twin,POSITIVE TWIN.  ``Gij = None`` is every production call today —,census only; classification in gate_blindness.md
+tests/test_low_mem_bands_envelope.py,288,test_compute_sigma_xc_checks_the_gij_row_before_any_kernel,"The Gij row runs at the top of the dispatch, beside the mode-",census only; classification in gate_blindness.md
+tests/test_low_mem_bands_envelope.py,309,test_the_docs_name_the_live_gij_refusal,The input reference must name the one live low-memory refusal.,census only; classification in gate_blindness.md
+tests/test_low_mem_bands_envelope.py,316,test_qp_solver_enum_still_has_exactly_the_members_the_row_assumes,"Pin the axis this row reads, the same way the w_bse suite pins",census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,89,test_the_two_census_requests_are_now_served_from_certified_tables,"The arming row, through the production door and not around it.",census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,124,test_the_served_table_beats_the_solve_it_replaces_on_amplification,Why serving these two is an improvement and not merely a change.,census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,149,test_the_announcement_is_pinned_and_happens_exactly_once,"R2, as a fixed string rather than a hope.",census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,199,test_red_twin_a_near_miss_refuses_and_names_the_nearest_certified_beta,The refusal the whole staging exists for.,census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,234,test_the_near_miss_is_a_real_error_and_not_a_bookkeeping_rule,Why the band is narrow: the error really does move.,census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,268,test_the_full_precision_deck_sweep_is_served_end_to_end,"Gate 0 sec 9's warning, executable -- and now discharged.",census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,309,test_the_two_census_production_requests_are_still_the_easy_case,gnppm and bispinor were served before the regeneration too.,census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,332,test_the_catalog_clause_stamp_is_proved_against_the_bytes,"``CATALOG_CLAUSE`` is a claim about the sweep, so it is checked.",census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,351,test_red_twin_a_width_clause_request_refuses_a_height_clause_table,"The trap: numerically it matches, physically it is a different ask.",census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,389,test_a_clause_with_no_catalog_refuses_by_naming_the_one_that_has,"The state the MPA-Sigma routing audit found, kept as a red twin.",census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,427,test_a_beta_outside_its_own_clause_refuses_by_name,"Both envelopes have edges, and the metals rung is beyond one.",census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,456,test_the_fit_stage_tier_is_now_tabulated_and_the_budget_is_the_gate,The refusal this cell used to assert has been generated away.,census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,498,test_the_node_budget_is_a_ceiling_and_says_so,566 composite nodes against a 64-node budget is a refusal.,census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,525,test_the_ranking_prefers_the_cheap_certified_rule_over_the_composite,"Where both cover the request, the ten-node rule wins.",census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,545,test_the_composite_entry_is_rephased_at_the_request_not_served_raw,"The one axis that rounds, and the reason it is not a shortcut.",census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,582,test_the_composite_does_not_round_upward,Downward only.  Above its own beta it is an ordinary near miss.,census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,607,test_an_unknown_beta_axis_raises_rather_than_guessing,A rule this selector does not know is not a rule it may ignore.,census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,620,test_a_missing_band_field_refuses_the_catalog_not_the_entry,R2's per-entry row: a malformed entry means a corrupt artifact.,census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,642,test_an_unreadable_payload_refuses_by_name,,census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,657,test_a_stamped_band_that_does_not_hold_refuses,"The band is a measurement, so it has a FALSE case at runtime too.",census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,683,test_a_missing_catalog_refuses_with_the_path_it_tried,No catalog for EITHER clause -- which is a different failure from,census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,702,test_a_refused_request_is_byte_identical_to_the_runtime_solve,"The A/B claim, pinned where it can never drift.",census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,751,test_the_escape_hatch_still_reaches_the_runtime_solve,``use_shipped_tables=False`` bypasses the catalog entirely.,census only; classification in gate_blindness.md
+tests/test_minimax_beta_selector.py,770,test_the_static_and_crossing_selectors_are_untouched,The beta axis is additive: the generic rule still keys on three fields.,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,107,test_the_catalog_covers_the_census_request_table,"Three R buckets, two beta grids, two tiers -- and why each exists.",census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,148,test_every_entry_declares_a_known_rule_and_a_shipping_tier,,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,157,test_btv_lps_share_the_pinned_highs_accuracy_owner,Both incumbent LPs use one explicit sub-1e-7 solver contract.,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,189,test_append_preserves_every_preexisting_certificate_field,Adding one asset is not an implicit recertification of old bytes.,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,239,test_generator_shipping_rule_points_to_the_registered_theory_ssot,,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,245,test_static_no_clobber_preserves_prior_rows_bytes_and_sweep,A one-cell append must not re-author an older static payload.,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,330,test_shipped_entry_recertifies_from_its_own_bytes,"Every stamped number, recomputed off disk and compared.",census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,349,test_the_amplification_metric_agrees_with_the_shipped_catalog,kappa0 is not a metric invented for this family.,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,387,test_red_twin_inflated_weight_fails_the_amplification_check,A weight pair that cancels on the target still amplifies.,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,407,test_red_twin_moved_node_fails_the_held_out_error_check,,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,418,test_red_twin_wrong_beta_fails_because_the_target_moved,The omega-hat axis does not round up for a minimax entry.,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,459,test_the_catalog_serves_the_two_requests_that_refuse_today,"The arming claim, executable.",census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,496,test_the_beta_band_is_measured_and_refuses_outside_itself,"The band is a certificate, so it has a FALSE case too.",census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,518,test_red_twin_flipped_byte_fails_the_digest,,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,531,test_red_twin_constant_offset_fails_the_moment_identity,The grid-free check catches what a grid-blind rule hides.,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,556,test_red_twin_wrong_rescaling_convention_fails_the_rescale_check,"The convention the catalog states, against the one it does not.",census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,581,test_certify_refuses_a_negative_node,,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,596,test_the_real_part_is_the_noncrossing_imag_target,``alpha.real`` fits ``minimax._imag_target`` at this beta.,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,617,test_the_composite_route_rounds_the_beta_axis_and_minimax_does_not,"Gate 0's structural finding, as a test.",census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,644,test_the_composite_envelope_costs_a_longer_tail_and_says_so,"The one place the beta envelope is not free, stated as a number.",census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,667,test_positive_composite_amplification_is_one_by_construction,And a red twin: break positivity and the bound goes with it.,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,692,test_the_shipped_entry_beats_the_runtime_solve_on_amplification,The measurement that motivates the whole campaign.,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,724,test_the_fit_stage_floor_is_no_longer_a_quadrature,R1's hole was the MPA fit stage's accuracy floor.  It is not now.,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,849,test_the_fit_stage_tier_is_served_from_the_catalog_through_the_door,"The same floor, but with the shipped catalog and selector in it.",census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,947,test_the_catalog_carries_both_tiers_and_says_who_asks_for_each,Production has one tier and the fit stage has another.,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,984,test_the_composite_route_regenerates_byte_identically,"No seed, no local optimiser -- so the bytes must repeat exactly.",census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,1046,test_the_width_clause_ships_and_is_stamped_as_its_own_sweep,"One family, two clauses, two catalogs -- and the stamp proves it.",census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,1081,test_the_width_clause_edge_is_derived_from_the_fitters_own_guard,"``beta_max = 1`` is an identity, not a histogram fit.",census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,1101,test_the_width_clause_serves_the_audits_whole_demand_histogram,The 62.25% of |B| mass that refused must now be SERVED.,census only; classification in gate_blindness.md
+tests/test_minimax_imag_tables.py,1152,test_the_width_axis_is_a_continuum_which_is_why_it_is_composite,"Why no BTV entry is generated here, argued from the demand.",census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,86,test_zero_eps_pad_puts_spurious_transitions_below_the_onset,"WHY the BSE ε pad is not zero — the wrong number, exhibited.",census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,127,test_sentinel_eps_pad_keeps_every_pad_transition_out_of_the_window,The gate: with the shipped fill no pad transition can be selected.,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,154,test_pad_axis_fill_is_keyword_only_and_signed,"The seam itself: psi pads 0, eps pads +/-guard, BOTH extents are named.",census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,196,test_padded_axis_tag_owns_extent_mask_pad_strip_and_authentication,,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,222,test_padded_axis_spec_derives_product_divisor_inside_owner,,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,243,test_authenticate_padded_axis_recomputes_the_canonical_receipt,,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,259,test_authenticate_padded_axis_preserves_a_producer_extra_pad_receipt,A requested invariance pad is canonical because its receipt says so.,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,273,test_pad_square_can_identity_embed_a_rotation,,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,282,test_padded_axis_refusal_names_logical_and_carrier_extents,,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,294,test_pad_axis_is_bit_identical_to_both_helpers_it_replaced,"The A/B that licensed the deletion.  BIT equality, not a tolerance.",census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,353,test_there_is_exactly_one_mesh_divisibility_pad_helper,Source gate: the deleted twin must not come back under any name.,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,376,test_fftgrid_clients_delegate_divisor_and_extent_arithmetic,The kmeans/htransform seam has one spec and one arithmetic backend.,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,576,test_init_bse_subspace_drops_the_pad_by_count_not_by_value,The Davidson seed must have exact-zero support on the pad block.,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,604,test_init_bse_subspace_without_counts_still_leaks_the_pad,Falsifiability twin: omitting the counts reproduces the old failure.,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,621,test_init_bse_subspace_is_byte_identical_when_the_extent_divides,"No pad ⇒ no change, byte for byte — the 0086 contract.",census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,635,test_pad_zone_mask_counts_match_the_bundle,,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,661,test_w_solve_q_pad_is_stripped_and_bit_exact_on_the_logical_q,"The q pad adds INDEPENDENT trivial systems, so parity is bit equality.",census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,704,test_w_isdf_strips_the_q_pad_at_the_seam,Source-level: the strip exists and is not conditional on the plan.,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,717,test_resolve_extra_rank_pad_reads_the_env_and_refuses_garbage,``LORRAX_EXTRA_RANK_PAD`` had ONE read site and zero tests that set it.,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,747,test_extra_rank_pad_only_adds_mesh_aligned_null_directions,The knob's arithmetic: rank stays lcm-aligned and only grows.,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,767,test_fh_pad_zeros_sort_above_every_selected_band,"The invariant the rank pad's safety rests on, asserted for the first time.",census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,809,test_a_negative_rank_sentinel_would_steal_band_slots,Falsifiability twin for the sign: the failure mode is reachable.,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,835,test_spinor_zero_fill_refuses_and_names_the_small_components,,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,845,test_no_spinor_axis_zero_fill_survives_in_the_tree,Static gate: the 2→4 zero fill must not come back anywhere.,census only; classification in gate_blindness.md
+tests/test_pad_parity_gates.py,869,test_spinor_zero_fill_gate_can_fail,"The gate above, run against a REAL file from the tree with a",census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,42,test_w_av_neighbor_flags_are_input_controls,,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,52,test_common_storage_extent_handles_rectangular_meshes,,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,59,test_wfn_fingerprint_refuses_sampled_coefficient_mismatch,Equal headers must not hide a genuinely different fixed-gauge WFN.,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,108,test_wfn_fingerprint_accepts_byte_identical_copy,Filesystem identity is not part of the mean-field identity.,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,151,test_undersampled_link_axes_names_collapsed_and_undersampled_axes,"The shared per-axis threshold: clean, undersampled and collapsed.",census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,160,test_link_stage_refuses_an_aliased_fourth_order_mesh_before_io,"D2/D3(c): the stencil gate now lives on the LINK remainder, not the",census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,176,test_link_stage_refuses_a_collapsed_2d_axis_before_io,A genuinely collapsed slab axis (kgrid[i]=1) refuses HERE too — it is,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,191,test_initialize_no_longer_gates_the_velocity_write_on_kgrid,D2: the exact-DFT-velocity write is unconditional on kgrid.,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,211,test_forward_neighbors_do_not_assume_flattening_order,A permuted full-grid table still produces the exact three neighbours.,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,229,test_full_energy_rows_follow_symmaps_full_order_not_ibz_row_order,irr_idx_k is the exact full-row source; kirr_fullids is inverse idiom.,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,248,test_g_wrap_lookup_boundary_and_wrong_sign_red_twin,The +G_wrap convention crosses the zone edge; its sign twin does not.,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,280,test_cross_k_link_fuses_overlap_and_polar_on_hostile_2x2_mesh_subprocess,The nb=5/8 overlap stays tiled through its planned polar factor.,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,376,test_distributed_band_matmul_hostile_2x2_mesh_subprocess,"One-axis gathers retain a P(x,y) result for nb=8 / logical nb=5.",census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,414,test_fourth_order_connection_and_orientation_red_twin,L=exp(-iAh) reconstructs +A; storing L dagger reconstructs -A.,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,444,test_completion_runs_shared_spectral_service_and_stamps,Producer completion calls the shared finite-link service and passes.,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,488,test_completion_sign_red_twin_stamps_failure_then_refuses,A phase-reversed derivative fails even though its response is equal.,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,525,test_artifact_schema_is_slabio_only_and_names_the_head_manifold,The new artifact has no raw h5py escape hatch and stable reader keys.,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,655,test_finite_link_gate_passes_a_band_crossing_and_refuses_wrong_orientation,The head-observable gate accepts a crossing and rejects bad links.,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,679,test_finite_link_gate_passes_a_non_crossing_window,The same production gate accepts the separated insulating control.,census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,694,test_transported_frame_closes_every_line_on_the_torus,"The frame is unitary, and twisting makes the transported link constant.",census only; classification in gate_blindness.md
+tests/test_parallel_transport.py,727,test_fourth_order_negative_hop_keeps_noncommuting_product_order,,census only; classification in gate_blindness.md
+tests/test_photon_chi_vertices.py,8,test_current_chi_matches_literal_hermitian_density,"The Lehmann pair uses ψ†Γψ at each endpoint, including imaginary Γ2.",census only; classification in gate_blindness.md
+tests/test_photon_head_sign_oracle.py,565,test_part_a_definitions_share_one_convention,,census only; classification in gate_blindness.md
+tests/test_photon_head_sign_oracle.py,580,test_completion_matches_the_independent_reference,"Both signs of ``sigma_H``, every block nonzero.",census only; classification in gate_blindness.md
+tests/test_photon_head_sign_oracle.py,602,test_completed_gamma_body_is_hermitian,W(Gamma) stays Hermitian after all ten rank-4 updates.,census only; classification in gate_blindness.md
+tests/test_photon_head_sign_oracle.py,623,test_zero_hall_decouples_into_charge_head_plus_bare_transverse,,census only; classification in gate_blindness.md
+tests/test_photon_head_sign_oracle.py,643,test_zero_wings_reduce_the_folded_response_to_S,,census only; classification in gate_blindness.md
+tests/test_photon_head_sign_oracle.py,668,test_negative_controls_are_caught,"A check that cannot fail is not evidence (TASTE.md, 2026-08-06).",census only; classification in gate_blindness.md
+tests/test_photon_head_sign_oracle.py,677,test_schur_fold_and_rank4_reattachment_are_one_block_inverse_identity,Where the fold's PLUS and the four insertion families come from.,census only; classification in gate_blindness.md
+tests/test_photon_head_sign_oracle.py,738,test_receipt_samples_never_reach_the_singular_origin,,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,95,test_g_lookup_padded_matches_ragged_on_the_physical_prefix,,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,125,test_g_lookup_pad_rows_would_alias_a_real_bra_G_without_the_extent,The failure this guard exists to stop — shown happening.,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,170,test_momentum_padded_matches_ragged_and_mask_is_load_bearing,,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,196,test_momentum_control_is_inert_at_gamma_by_construction,Document the one place the control legitimately cannot fire.,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,227,test_build_vnl_kdata_zeroes_Z_on_the_pad,,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,309,test_provenance_guard_accepts_its_own_stamp,,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,322,test_provenance_guard_refuses_representation_or_vnl_sign_mismatch,Equal shapes do not make two velocity operators interchangeable.,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,351,test_provenance_guard_refuses_a_different_wfn,"The case nothing on disk could detect before: same shapes, different",census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,371,test_provenance_guard_accepts_ncond_mismatch_at_identical_q0_extent,ncond labels no smaller matrix when nband already sets the extent.,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,388,test_provenance_guard_refuses_unversioned_q0_operator_despite_coverage,Mode/sign alone cannot authenticate the pre-exact-origin operator.,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,410,test_provenance_guard_refuses_ncond_mismatch_that_changes_q0_extent,,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,431,test_provenance_guard_refuses_ncond_mismatch_for_finite_q_payload,finite_q conduction data are literally sized by producer ncond.,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,450,test_provenance_guard_refuses_ncond_relaxation_when_dataset_is_short,A plausible coverage stamp cannot overrule the physical HDF5 axes.,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,470,test_provenance_guard_still_refuses_nval_or_nband_mismatch,,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,491,test_provenance_guard_reports_an_unstamped_file,,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,505,test_provenance_guard_reports_legacy_fingerprint_as_unverifiable,A pre-content-scheme hash must not masquerade as a DFT mismatch.,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,525,test_wfn_fingerprint_moves_with_the_eigenvalues,,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,558,test_psp_drivers_do_not_hand_roll_the_distribution_layer,No ``multihost_utils`` / ``Mesh`` / ``NamedSharding`` in a driver.,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,580,test_the_driver_scan_can_fail,The negative control for the check above.,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,589,test_psp_drivers_import_the_service,"...and they actually reach for it, rather than simply going without.",census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,625,test_dipole_driver_streams_k_rather_than_materialising_all_of_them,,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,636,test_the_residency_scan_can_fail,Negative control: the scan must flag a source that DOES hold all k.,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,675,test_a_non_default_window_dipole_passes_its_own_provenance_guard,GREEN arm: the file the deck itself produced is not accused.,census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,689,test_a_stale_wfn_still_refuses_on_that_same_window,"RED arm: the guard has not been muted, only aimed.",census only; classification in gate_blindness.md
+tests/test_psp_padded_gvectors.py,714,test_the_head_checker_refuses_a_params_dict_with_no_window,"The defect itself, pinned: no window reaching the checker is a REFUSAL.",census only; classification in gate_blindness.md
+tests/test_qgrid_symmetry_resolution.py,131,test_the_fallback_announcement_fires_exactly_once_per_run,"Four resolutions of one non-closed set, ONE line.",census only; classification in gate_blindness.md
+tests/test_qgrid_symmetry_resolution.py,160,test_a_closed_deck_announces_nothing_at_all,"RED TWIN.  Same code path, orbit-closed set, silence.",census only; classification in gate_blindness.md
+tests/test_qgrid_symmetry_resolution.py,176,test_two_different_centroid_sets_are_two_facts,"Dedup is on the SET, not on the process.",census only; classification in gate_blindness.md
+tests/test_qgrid_symmetry_resolution.py,196,test_the_transverse_refusal_path_does_not_announce_a_fallback,"``announce_fallback=False`` is the one suppression, and it is right.",census only; classification in gate_blindness.md
+tests/test_qgrid_symmetry_resolution.py,293,test_no_module_bypasses_the_resolution_point,"The ratchet.  One door to the table builder, one door to the service.",census only; classification in gate_blindness.md
+tests/test_qgrid_symmetry_resolution.py,327,test_the_consolidated_sites_no_longer_catch_the_refusal,No ``try`` wraps the resolution at the four sites it was removed from.,census only; classification in gate_blindness.md
+tests/test_qgrid_symmetry_resolution.py,361,test_resolve_ibz_q_list_has_no_verbose_knob,``verbose`` gated whether a degradation was visible.  It is gone.,census only; classification in gate_blindness.md
+tests/test_qp_rotations_k_storage.py,85,test_qp_authentication_reuses_bound_wfn_fingerprint_without_rescan,,census only; classification in gate_blindness.md
+tests/test_qp_rotations_k_storage.py,112,test_wedge_stored_file_unfolds_back_to_the_full_bz_arrays,write wedge -> read -> unfold == the full-BZ array the old path wrote.,census only; classification in gate_blindness.md
+tests/test_qp_rotations_k_storage.py,138,test_the_wedge_and_full_arms_read_back_identically,"The A/B a consumer actually cares about: same numbers, fewer bytes.",census only; classification in gate_blindness.md
+tests/test_qp_rotations_k_storage.py,176,test_an_unstamped_file_is_read_as_full_bz_and_never_reinterpreted,"No ``k_storage`` attr means FULL, even when the rows would fit a wedge.",census only; classification in gate_blindness.md
+tests/test_qp_rotations_k_storage.py,210,test_rotations_carry_additive_one_shot_method_provenance,,census only; classification in gate_blindness.md
+tests/test_qp_rotations_k_storage.py,232,test_auto_falls_back_to_full_when_the_rows_are_not_gathers,"An independent ``eigh`` per full-BZ k is NOT compressible, and ``auto``",census only; classification in gate_blindness.md
+tests/test_qp_rotations_k_storage.py,259,test_ibz_refuses_rather_than_falling_back,"``ibz`` is for a run that wants to be told, not quietly accommodated.",census only; classification in gate_blindness.md
+tests/test_qp_rotations_k_storage.py,271,test_a_wedge_row_that_is_never_a_parent_is_refused_not_written,The writer must not produce a file its own reader would refuse.,census only; classification in gate_blindness.md
+tests/test_qp_rotations_k_storage.py,312,test_the_wedge_arm_refuses_without_the_tables_it_would_file,A tensor whose reconstruction tables live elsewhere silently decays.,census only; classification in gate_blindness.md
+tests/test_qp_rotations_k_storage.py,319,test_an_unrecognised_k_storage_is_not_read_as_the_default,,census only; classification in gate_blindness.md
+tests/test_qp_rotations_k_storage.py,330,test_the_stamp_is_the_kin_ion_contract_and_the_tables_travel_with_it,,census only; classification in gate_blindness.md
+tests/test_qp_rotations_k_storage.py,344,test_the_coordinate_and_index_tables_do_not_move,"``kpoints_crys`` / ``kirr_to_kfull`` stay full-BZ, and that is the design.",census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,52,test_default_is_one_shot_dft,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,57,test_one_shot_semantics_name_the_full_matrix_not_textbook_g0w0,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,67,test_legacy_self_consistent_resolves_and_warns,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,73,test_legacy_sigma_at_dft_energies_resolves_and_warns,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,79,test_explicit_overrides_legacy,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,86,test_explicit_fixed_point_dynamic,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,92,test_unknown_value_raises,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,101,test_fixed_point_static_mode_rejected,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,107,test_kij_stream_refused_at_parse,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,118,test_kij_stream_refused_even_in_static_modes,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,134,test_bispinor_gw_grammar_is_exactly_two_values,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,147,test_retired_bispinor_gw_spellings_refuse_and_name_the_replacement,A retired MODE VALUE stops the run and says what replaced it.,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,163,test_both_shipped_modes_ride_the_one_raw_carrier,"``bispinor_gw`` picks which Lorentz blocks are screened, not a lift.",census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,173,test_default_bispinor_self_consistency_uses_live_four_current,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,189,test_bispinor_explicit_frozen_density_is_refused,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,201,test_bispinor_accepts_live_four_current_self_consistency,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,212,test_scalar_self_consistency_keeps_fixed_density_default,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,218,test_legacy_bispinor_self_consistency_gets_same_live_default,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,229,test_packed_mode_requires_four_current_enablement,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,236,test_bispinor_refuses_no_local_fields_head,PHYSICS/POLICY row 20: two head values on a bispinor deck.,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,251,test_scalar_deck_keeps_no_local_fields,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,256,test_bispinor_tt_head_correction_key_is_tombstoned,"The deleted key refuses BY NAME, at either value.",census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,268,test_static_gauge_hall_file_is_unset_by_default,"An unnamed optional artifact must stay EMPTY, not become the deck dir.",census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,282,test_sc_defaults,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,291,test_sc_input_keys,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,306,test_sc_exact_degeneracy_tolerance_refuses_mev_pair_averaging,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,311,test_sc_tail_fit_refuses_unknown_policy,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,316,test_sc_buffer_controls_refuse_invalid_values,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,325,test_sc_env_overrides_deprecated,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,344,test_sc_bad_accelerator_rejected,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,353,test_eqp2_defaults_off_with_one_mev_cutoff,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,363,test_eqp2_dynamic_one_shot_keys_parse,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,387,test_eqp2_invalid_iteration_knobs_refuse,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,392,test_eqp2_static_mode_refuses,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,398,test_eqp2_is_additional_to_one_shot_only,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,418,test_distributed_linalg_defaults,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,426,test_distributed_linalg_lowers_to_gpu_libraries,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,439,test_removed_legacy_aliases_refuse_as_unknown,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,451,test_unknown_keys_always_refuse_in_one_aggregate,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,462,test_strict_keys_is_retired_even_without_other_unknown_keys,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,470,test_unknown_key_always_refuses,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,480,test_mixed_case_key_is_recognised_not_reported_unknown,"``do_G0`` is honoured, so it must not also be called unrecognised.",census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,503,test_screening_method_ctsp_refuses_and_names_minimax,"``ctsp`` must REFUSE, not resolve to minimax in silence.",census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,515,test_screening_method_minimax_and_default_still_parse,"The supported value, and omitting the key, both stay clean.",census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,522,test_every_tracked_fixture_deck_has_no_dead_keys,No tracked ``*.in`` fixture may carry a key nothing reads.,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,561,test_legacy_keys_keep_their_dedicated_messages,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,580,test_distributed_layout_lowers_to_scalapack_on_cpu,,census only; classification in gate_blindness.md
+tests/test_qp_solver_config.py,592,test_the_dynamic_self_consistent_regression_deck_is_supported,The shipped dynamic SC deck remains a live supported combination.,census only; classification in gate_blindness.md
+tests/test_qsgw_head_face_wings.py,162,test_head_wings_face_matches_legacy_and_oracle,,census only; classification in gate_blindness.md
+tests/test_qsgw_head_face_wings.py,210,test_packed_vertex_wings_preserve_three_axis_bits_legacy_and_face,"One n_vertex kernel serves Cartesian and packed (a,I) axes.",census only; classification in gate_blindness.md
+tests/test_qsgw_head_face_wings.py,255,test_head_wings_face_mu_blocking_exercised,Force multiple mu blocks with a tiny mu count by shrinking,census only; classification in gate_blindness.md
+tests/test_qsgw_head_face_wings.py,290,test_head_wings_face_separate_lorentz_endpoints_preserve_order,The one face kernel must distinguish CC/TC/CT/TT endpoint algebra.,census only; classification in gate_blindness.md
+tests/test_qsgw_head_face_wings.py,375,test_static_head_wings_face_matches_legacy_and_oracle,,census only; classification in gate_blindness.md
+tests/test_qsgw_head_face_wings.py,413,test_pad_head_band_manifold_to_refuses_narrower_width,,census only; classification in gate_blindness.md
+tests/test_qsgw_head_face_wings.py,423,test_pad_head_band_manifold_to_commits_to_declared_sharding,,census only; classification in gate_blindness.md
+tests/test_qsgw_head_face_wings.py,436,test_dft_head_refuses_dipole_provenance_before_read_or_allocation,A four-spinor charge body must not consume a two-spinor dipole.,census only; classification in gate_blindness.md
+tests/test_qsgw_head_face_wings.py,460,test_head_wings_sharded_face_requires_face_psi_fields,,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,57,test_pt_loader_reads_stamps_through_read_small_and_never_h5py,"The stamps come through ONE handle, and it is not a second HDF5 stack.",census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,207,test_pt_loader_refuses_a_velocity_only_artifact_instead_of_crashing,"Red twin, audit finding 2026-08-23 (D2 schema-break hunt).",census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,288,test_reduced_covector_conversion_uses_row_basis_convention,,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,304,test_distributed_velocity_rotation_matches_explicit_u_dagger_v_u,,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,319,test_sharded_s_tensor_pads_unaligned_manifold_and_matches_dft_formula,,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,360,test_packed_vertex_s_tensor_preserves_incumbent_three_axis_bits,Width three stays exact; packed width eight has one direct oracle.,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,395,test_raw_hall_matches_orbital_cB_owner_and_documented_sign,Distributed raw Hall is the incumbent orbital cB with one rescale.,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,466,test_raw_hall_fractional_occupations_and_degeneracy_refusal,,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,518,test_static_gauge_hall_transaction_uses_file_wedge_service_and_fingerprint,One full-BZ uniform transaction owns Hall values and provenance.,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,578,test_uniform_gauge_fingerprint_is_contact_capability_only,Ordinary VNL setup does not hash tables it cannot authenticate.,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,602,test_head_manifold_embedding_preserves_inactive_identity_and_cross_blocks,,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,622,test_s_tensor_ignores_mesh_padding_bands,,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,662,test_frequency_blocked_isdf_wings_match_direct_transition_sum,Y/Z retain all-band and surface terms across a block boundary.,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,732,test_head_wing_interband_sign_matches_direct_adler_wiser_density_jet,Two-level direct-AW oracle for the one-leg ``D -> P`` sign.,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,779,test_finite_link_derivative_is_exactly_gauge_covariant,,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,826,test_active_rotation_matches_dense_block_diagonal_rotation,,census only; classification in gate_blindness.md
+tests/test_qsgw_parallel_transport_head.py,845,test_s_tensor_uses_k_dependent_occupations_not_band_cut,,census only; classification in gate_blindness.md
+tests/test_quickstart_verbatim.py,106,test_the_documented_quickstart_deck_completes_on_the_shipped_fixture,The shipped artifacts still authenticate under the shipped default.,census only; classification in gate_blindness.md
+tests/test_quickstart_verbatim.py,137,test_the_head_policy_the_quickstart_runs_under_is_the_default,"The quickstart must exercise the SHIPPING head, not a debug override.",census only; classification in gate_blindness.md
+tests/test_quickstart_verbatim.py,154,test_the_docs_still_name_the_deck_this_file_runs,The published command must name a deck that exists.,census only; classification in gate_blindness.md
+tests/test_quickstart_verbatim.py,173,test_this_suite_imports_the_checkout_it_lives_in,"The canary: is pytest testing THIS tree, or the base module's?",census only; classification in gate_blindness.md
+tests/test_rank_truncate_capacity_gate.py,68,test_the_predicate_is_one_function_for_both_channels,"A/B: same (nq, n_mu) -> same verdict.  There is no second criterion.",census only; classification in gate_blindness.md
+tests/test_rank_truncate_capacity_gate.py,77,test_transverse_rank_truncate_refuses_where_charge_refuses,"The gate that was missing.  Same size, same verdict, both channels.",census only; classification in gate_blindness.md
+tests/test_rank_truncate_capacity_gate.py,103,test_transverse_rank_truncate_is_admitted_at_a_size_that_fits,The gate is not a blanket refusal: a fit-size transverse solve runs.,census only; classification in gate_blindness.md
+tests/test_rank_truncate_capacity_gate.py,113,test_unknown_nq_keeps_the_legacy_policy,gw_init's pre-flight has no nq; it must not refuse on a guess.,census only; classification in gate_blindness.md
+tests/test_rank_truncate_capacity_gate.py,127,test_the_distributed_tier_escape_survives,``distributed_zeta_solve='distributed'`` never allocates the buffer.,census only; classification in gate_blindness.md
+tests/test_rank_truncate_capacity_gate.py,145,test_the_shared_error_refuses_an_unknown_channel,"A new channel must add its own escape advice, not inherit charge's.",census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,83,test_device_check_finite_clean,,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,90,test_device_check_finite_catches_nan,,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,99,test_device_check_finite_complex_imag_nan,``inf`` / ``nan`` hiding in the imaginary part must be caught.,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,107,test_device_check_finite_on_sharded_array,"The reduction must be global, not per-shard.",census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,131,test_device_check_hermitian,,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,142,test_device_gate_cost_is_one_fetch,"Sanity: the reduction returns scalars, not the array (cheapness gate).",census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,150,test_fresh_equal_named_sharding_hits_the_finite_kernel_cache,NamedSharding identity churn must not multiply sanity kernels.,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,166,test_off_switch_skips_device_work,,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,239,test_zeta_basis_guard_sees_gflat_dataset,The regression this fixes: the old guard probed the wrong dataset.,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,263,test_zeta_basis_guard_catches_wrong_fft_grid,,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,278,test_zeta_basis_guard_warns_on_incomplete,,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,288,test_zeta_loader_refuses_incomplete_file,A ζ from a crashed fit must not open for reading.,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,302,test_zeta_loader_override_env,,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,318,test_zeta_loader_accepts_complete_file,,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,331,test_implied_vxc_window_is_sourced_from_gw_output,"With the driver importable, the writer must adopt ITS window.",census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,350,test_kin_ion_cli_has_no_hartree_mode_flags,kin_ion writes only the pristine one-body operator.,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,363,test_kin_ion_io_catches_a_BROKEN_multiprocess_launch,The generator now distributes — but a *failed* distributed init,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,402,test_rho_work_items_cover_every_band_exactly_once,"The ρ partition must be a partition — no band counted twice, none",census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,420,test_rho_work_items_are_the_serial_sweep_when_P_le_nk,THE BIT-PARITY PRECONDITION.,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,437,test_rho_work_items_balance_within_one_item,"Round-robin, not contiguous blocks: nk=9 at P=4 must be 3/2/2/2,",census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,447,test_valence_density_nocc_none_matches_the_sliced_form,"``nocc=None`` is a slicing convention, not a second quadrature.",census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,467,test_fractional_weights_apply_identically_to_charge_and_dirac_current,One signed f_nk operand weights rho and every J=psi^dag alpha psi.,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,488,test_pauli_reference_removes_only_small_component_charge,"The comparison changes j0/electron count, never raw4 spatial J.",census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,519,test_collective_helpers_are_the_identity_at_P1,P=1 must not go anywhere near a collective — that is what makes,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,545,test_hartree_mesh_resolution_is_square_and_covers_every_device,,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,557,test_rotated_density_load_reduces_to_the_plain_load_at_U_identity,The QSGW density seam must be a no-op at U = 1.,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,603,test_process_local_load_matches_the_legacy_wrapper,``load_kpoint_fftbox`` must keep its values while gaining a,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,641,test_barrier_single_process_is_noop,,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,650,test_failfast_hook_not_installed_single_process,The hook must stay OFF in single-process runs (normal tracebacks).,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,682,test_failfast_hook_respects_optout,,census only; classification in gate_blindness.md
+tests/test_sanity_gates_jax.py,730,test_check_hermitian_sharded_no_full_gather,"The hermiticity gate must never materialise a replicated (n, n) tile.",census only; classification in gate_blindness.md
+tests/test_sc_band_window.py,76,test_psi_sphere_reads_the_global_sigma_window,"b0 != 0: the read must start at b0, not at 0.",census only; classification in gate_blindness.md
+tests/test_sc_band_window.py,86,test_psi_sphere_is_unchanged_at_b0_zero,The production decks in use have b0 = 0; that path must not move.,census only; classification in gate_blindness.md
+tests/test_sc_band_window.py,95,test_psi_sphere_cache_key_separates_equal_width_windows,Two windows of the same width at different b0 are different psi.,census only; classification in gate_blindness.md
+tests/test_sc_band_window.py,108,test_psi_sphere_reuses_the_loader_owned_device_index,Both SC consumers receive the canonical resident box-index buffer.,census only; classification in gate_blindness.md
+tests/test_sc_band_window.py,119,test_psi_sphere_refuses_a_width_that_disagrees_with_the_carry,"The b0-relative vs global mismatch itself, caught before the read.",census only; classification in gate_blindness.md
+tests/test_sc_band_window.py,129,test_run_sc_driver_refuses_b0_nonzero,"The occupancy assumption, refused rather than silently applied.",census only; classification in gate_blindness.md
+tests/test_sc_four_current_hartree.py,60,test_qsgw_four_current_matches_the_shared_per_k_kernel,Finite signed occupations weight rho and J identically in both plans.,census only; classification in gate_blindness.md
+tests/test_sc_four_current_hartree.py,87,test_equal_occupation_unitary_preserves_the_whole_four_current,A degenerate occupied gauge rotates neither charge nor spatial J.,census only; classification in gate_blindness.md
+tests/test_sc_four_current_hartree.py,108,test_complex_nontrivial_rotation_matches_explicit_orbitals,The inline scan rotation matches the column-convention reference.,census only; classification in gate_blindness.md
+tests/test_sc_four_current_hartree.py,129,test_packed_four_current_matrix_sweep_matches_two_independent_sweeps,Packing shares FFT/reshard work without changing either component.,census only; classification in gate_blindness.md
+tests/test_sc_four_current_hartree.py,170,test_exact_hartree_basis_rotation_retains_two_axis_band_sharding,The gspace replacement must not replicate while rotating into QP.,census only; classification in gate_blindness.md
+tests/test_sc_four_current_hartree.py,191,test_density_sc_suppresses_both_frozen_direct_components,The caller-owned four-current cannot coexist with frozen H_T.,census only; classification in gate_blindness.md
+tests/test_sc_four_current_hartree.py,222,test_live_hartree_addition_is_fused_and_donates_the_dead_base,SC must not retain or materialise V_H+H_T before H assembly.,census only; classification in gate_blindness.md
+tests/test_sc_four_current_hartree.py,236,test_hartree_omission_receipt_restores_full_output_matrices,The compact internal sentinel cannot masquerade as a final field.,census only; classification in gate_blindness.md
+tests/test_sc_four_current_hartree.py,258,test_live_hartree_is_carried_to_both_final_output_seams,The final SigmaResult and sigma_mnk writer both receive the live field.,census only; classification in gate_blindness.md
+tests/test_sc_four_current_hartree.py,269,test_sc_density_applies_rotation_inside_the_scan,SC must not materialise a full resident QP-wavefunction array.,census only; classification in gate_blindness.md
+tests/test_sc_four_current_hartree.py,292,test_density_scan_reshards_only_the_singleton_k_slice,Resident psi stays band-xy; only psi[k] is placed m-on-x.,census only; classification in gate_blindness.md
+tests/test_sc_four_current_hartree.py,339,test_live_gspace_hartree_cannot_cross_the_host_gather_boundary,The sole GW caller requests a sharded device result.,census only; classification in gate_blindness.md
+tests/test_sc_four_current_hartree.py,357,test_reduced_current_requires_the_typed_vector_action,Scalar FFT pullbacks cannot substitute for the polar current action.,census only; classification in gate_blindness.md
+tests/test_sc_kset_tables.py,29,test_every_band_indexed_sigma_field_declares_its_k_axis,,census only; classification in gate_blindness.md
+tests/test_sc_kset_tables.py,36,test_sc_output_seam_selects_every_retained_sigma_table,A Si-4x4x4-sized nontrivial star map leaves no full-BZ table.,census only; classification in gate_blindness.md
+tests/test_sc_kset_tables.py,126,test_terminal_h5_boundary_stamps_preselected_rows_without_reselecting,,census only; classification in gate_blindness.md
+tests/test_sc_kset_tables.py,150,test_retained_sigma_tables_have_no_second_select_or_broadcast,Bounded source guard: only the named SC output seam owns selection.,census only; classification in gate_blindness.md
+tests/test_scalar_gw_factors.py,43,test_w_solve_pref_scalar_pins_all_three_spin_structures,The nspinor=2 value is pinned FIRST and exactly: it is the,census only; classification in gate_blindness.md
+tests/test_scalar_gw_factors.py,71,test_live_gspace_density_carries_scalar_spin_degeneracy,The sole Hartree density quadrature applies the scalar factor once.,census only; classification in gate_blindness.md
+tests/test_scalar_gw_factors.py,85,test_cohsex_has_no_second_hartree_density_owner,,census only; classification in gate_blindness.md
+tests/test_scalar_gw_factors.py,92,test_live_hartree_derives_f_spin_at_the_density_owner,Pin the production call chain from exact Hartree to the quadrature.,census only; classification in gate_blindness.md
+tests/test_scalar_gw_factors.py,105,test_spin_capacity_refuses_an_undeclared_spin_structure,"The canonical helper getattr-defaults a missing attr to 1, i.e. an",census only; classification in gate_blindness.md
+tests/test_scalar_gw_factors.py,132,test_fixed_n_window_check_accepts_a_scalar_deck,``occupation_state.n_electrons`` is capacity-weighted (2 e⁻ per,census only; classification in gate_blindness.md
+tests/test_scalar_gw_factors.py,149,test_fixed_n_window_check_red_twins,,census only; classification in gate_blindness.md
+tests/test_scalar_gw_factors.py,189,test_kin_ion_validator_refuses_a_spin_structure_mismatch,gw.kin_ion_io stamps the source WFN's nspinor (kin_ion_io.py:1464);,census only; classification in gate_blindness.md
+tests/test_scalar_gw_factors.py,201,test_kin_ion_validator_green_and_legacy_twins,,census only; classification in gate_blindness.md
+tests/test_scalar_gw_factors.py,214,test_the_driver_threads_wfn_nspinor_into_the_validator,A check whose parameter no production caller passes is dead code,census only; classification in gate_blindness.md
+tests/test_scalar_gw_factors.py,233,test_meta_refuses_nval_beyond_the_wfn_occupied_bands,A user porting an nspinor=2 Si deck (nval=8) onto a scalar WFN,census only; classification in gate_blindness.md
+tests/test_scalar_gw_factors.py,244,test_meta_accepts_nval_at_and_below_nelec,Silent-otherwise twin: the guard fires ONLY past nelec — the,census only; classification in gate_blindness.md
+tests/test_scalar_gw_factors.py,283,test_zeta_provenance_stamps_the_file_nspinor,,census only; classification in gate_blindness.md
+tests/test_scalar_gw_factors.py,299,test_zeta_reuse_enforces_nspinor_symmetrically,Read-side twin of the stamp: a ζ fit from a spinor WFN must not be,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,84,test_sr_pseudo_resolves_false_quietly_for_any_nspinor,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,96,test_the_soc_flag_is_gone,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,110,test_fr_nspinor2_undeclared_returns_none_meaning_measure,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,122,test_fr_nspinor1_undeclared_is_forced_averaged_and_says_so,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,136,test_fr_nspinor1_qe_spinorbit_true_refuses_naming_the_source,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,153,test_qe_spinorbit_is_authoritative_both_ways,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,171,test_resolve_soc_mode_requires_nspinor,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,184,test_jfree_blocks_are_D_times_spin_identity_and_soc_cannot_matter,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,237,test_prov_nspinor_and_soc_are_stamped_and_accepted,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,251,test_prov_nspinor_mismatch_refuses,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,270,test_prov_nspinor_missing_stamp_is_legacy_accepted,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,311,test_nlcc_enum_false_with_payload_present_is_not_nlcc,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,324,test_nlcc_enum_true_reads_the_grid_and_none_or_missing_do_not,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,342,test_extract_species_carries_no_spin_fields,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,363,test_real_sr_si_upf_is_scalar_end_to_end,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,438,test_measurement_selects_javeraged_on_the_lspinorb_false_wfn,The auto-fix of the defect-#21 class: the spinor Si fixture,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,462,test_measurement_selects_jresolved_on_the_lspinorb_true_wfn,"The other arm: a genuine SOC WFN (MoS2, spin pairing broken by",census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,485,test_measurement_refusals_are_loud_and_the_equivalence_arm_is_green,"Red twins for the measured arm — the refusals must fire, and the",census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,569,test_qe_vloc_radial_scheme_matches_qe_and_old_rectangle_fails,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,612,test_beta_tables_use_kkbeta_and_full_mesh_generic_weights_fail,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,649,test_qe_simpsn_weights_match_upflib_conventions,Odd n: standard composite Simpson.  Even n: QE's simpsn drops the,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,675,test_alpha_z_uses_qe_msh_scheme_and_full_mesh_simpson_fails,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,705,test_vloc_nlcc_tables_use_qe_msh_scheme_and_full_mesh_fails,,census only; classification in gate_blindness.md
+tests/test_scalar_psp.py,761,test_projector_numpy_twins_match_batched_tables,projector_table / projector_deriv_table (kkbeta scheme) against the,census only; classification in gate_blindness.md
+tests/test_sigma_eqp_assembly_receipt.py,95,test_live_gspace_receipt_preserves_the_assembled_direct_field,,census only; classification in gate_blindness.md
+tests/test_sigma_eqp_assembly_receipt.py,104,test_receipt_replays_the_same_conditioned_curve_and_assembly,,census only; classification in gate_blindness.md
+tests/test_sigma_eqp_assembly_receipt.py,155,test_new_schema_states_fail_closed,"Every partial, old-source, or interrupted v5 state refuses.",census only; classification in gate_blindness.md
+tests/test_sigma_eqp_assembly_receipt.py,177,test_appender_refuses_new_raw_cube_missing_creation_marker,,census only; classification in gate_blindness.md
+tests/test_sigma_eqp_assembly_receipt.py,185,test_receipt_checks_rows_and_policy_before_writing,,census only; classification in gate_blindness.md
+tests/test_sigma_eqp_assembly_receipt.py,228,test_receipt_rows_are_the_call_site_s_own_file_wedge,The stamped rows are the ones the caller passed.,census only; classification in gate_blindness.md
+tests/test_sigma_eqp_assembly_receipt.py,263,test_receipt_accepts_canonical_first_occurrences_as_the_file_wedge,Canonical star parents remain valid when they are the caller's rows.,census only; classification in gate_blindness.md
+tests/test_sigma_eqp_assembly_receipt.py,327,test_receipt_accepts_the_real_gnppm_file_wedge_over_a_star_wedge_cube,9 assembly rows against a 5-row cube is correct on this deck.,census only; classification in gate_blindness.md
+tests/test_sigma_eqp_assembly_receipt.py,350,test_receipt_refuses_a_file_wedge_that_misses_one_of_the_cube_s_stars,"Five rows, the count the old gate demanded, covering three stars.",census only; classification in gate_blindness.md
+tests/test_sigma_eqp_assembly_receipt.py,365,test_receipt_lands_on_the_real_gnppm_run,The real input: the sigma_mnk.h5 a driver run wrote.,census only; classification in gate_blindness.md
+tests/test_sigma_output_columns.py,59,test_one_complex_element_makes_every_row_of_that_column_complex,The property: a column complex ANYWHERE is written complex EVERYWHERE.,census only; classification in gate_blindness.md
+tests/test_sigma_output_columns.py,72,test_a_fully_real_component_carries_no_imaginary_field_anywhere,THE RED TWIN of the cell above.,census only; classification in gate_blindness.md
+tests/test_sigma_output_columns.py,89,test_every_row_has_the_same_width_with_every_column_present,Constant row width is the thing a column parser actually depends on.,census only; classification in gate_blindness.md
+tests/test_sigma_output_columns.py,121,test_the_totals_column_decides_on_its_own_sum,"sigTOT is sigSX+sigCOH, so its complexity is its OWN question.",census only; classification in gate_blindness.md
+tests/test_sigma_output_columns.py,146,test_bispinor_lorentz_columns_are_additive_and_scalar_schema_is_unchanged,,census only; classification in gate_blindness.md
+tests/test_sigma_output_columns.py,176,test_lorentz_column_closure_refuses_a_bad_decomposition,,census only; classification in gate_blindness.md
+tests/test_sigma_output_columns.py,187,test_z_column_records_raw_value_and_state_local_fallback,,census only; classification in gate_blindness.md
+tests/test_sigma_result_basis.py,88,test_every_sigma_result_field_declares_its_basis,,census only; classification in gate_blindness.md
+tests/test_sigma_result_basis.py,114,test_sc_finalize_rotates_exactly_the_declared_set,,census only; classification in gate_blindness.md
+tests/test_sigma_result_basis.py,142,test_sigma_basis_fields_are_never_rotated,,census only; classification in gate_blindness.md
+tests/test_sigma_x_bispinor.py,20,test_gamma0_perm_phase_is_identity,"γ̃^0 = I_4: perm = (0,1,2,3), phase = (1,1,1,1).  Applying it",census only; classification in gate_blindness.md
+tests/test_sigma_x_bispinor.py,37,test_gamma_apply_matches_dense_matmul_xn_axis,"``gamma_apply(ψ, perm, phase, axis=1)`` must equal",census only; classification in gate_blindness.md
+tests/test_sigma_x_bispinor.py,55,test_gamma_apply_matches_dense_matmul_yr_axis,"psi_yr has shape (nk, n, s, μ_Y); γ̃ applies on axis 2.",census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,54,test_padded_slab_clips_to_the_logical_extent,A padded operand writes its logical prefix and nothing else.,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,61,test_slab_starting_past_the_dataset_is_an_empty_no_op_not_a_refusal,Offset past the end yields a 0 extent — a legitimate rendezvous.,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,70,test_offset_overrunning_the_dataset_clips_silently,"Documented clip (slab_io.write_slab): min(A.shape, ds - offset).",census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,79,test_valid_shape_override_that_overruns_the_dataset_refuses,valid_shape is an assertion SlabIO has no licence to shrink.,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,92,test_nondivisible_sharded_extent_refuses_naming_the_padded_shape,"``read_slab(shape=(17,16), P('x','y'))`` on a 4x4 mesh REFUSES.",census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,114,test_padded_extent_that_is_itself_not_divisible_refuses,A caller who pads to 18 on a 4-wide mesh axis is still wrong.,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,124,test_replicated_dims_are_never_divisibility_checked,"A dim no mesh axis shards has divisor 1, so ANY extent is legal.",census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,144,test_one_dim_sharded_by_both_mesh_axes_uses_the_axis_PRODUCT,"P(('x','y'), None) on 4x4 needs dim 0 divisible by 16, not 4.",census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,180,test_singleton_mpi_world_under_a_16_rank_launch_is_refused,"The measured case: MPI says 1, JAX says 16.",census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,190,test_matching_world_sizes_pass_and_a_single_process_run_is_fine,,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,195,test_an_unprobeable_mpi_warns_by_default_and_refuses_when_required,Not finding libmpi must not break a working run by itself...,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,207,test_the_verdict_is_rank_invariant_by_construction,Every rank compares its own MPI_Comm_size to a replicated,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,283,test_clamp_in_extent_passthrough,"When the request fills the window exactly, every rank gets the full",census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,297,test_clamp_bispinor_16gpu_regression,The exact case that crashed the bispinor 16-GPU gate.,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,316,test_clamp_extreme_zero_avail,All ranks past the window (degenerate) ⇒ all band_cnt=0.,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,323,test_clamp_with_b_lo_offset,b_lo > 0 shifts each rank's window; the clip must respect it.,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,342,test_clamp_shape_and_axes,"Result shape ``(world * n_reads, 4)`` with proper axis values.",census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,382,test_band_pad_rows_get_no_file_data,Per-rank band counts must sum to the LOGICAL band count.,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,406,test_clamp_agrees_with_the_slab_io_clip_on_every_dim,Every counts row equals ``_derive_valid_shape`` of that rank's,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,444,test_helper_is_used_by_read_slabs,Smoke check that ``read_slabs`` source references the helper.,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,463,test_helper_delegates_the_clip,The clip ARITHMETIC must not be respelled in the table builder.,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,502,test_inconsistent_window_tables_refuse,``read_slabs`` takes TWO tables describing ONE list of windows.,census only; classification in gate_blindness.md
+tests/test_slab_io_hostile_geometry.py,517,test_the_window_table_check_passes_a_well_formed_request,RED TWIN for the refusals above: the check is not unconditional.,census only; classification in gate_blindness.md
+tests/test_spin_density_matrix.py,35,test_pure_spinors_have_expected_pauli_fields,,census only; classification in gate_blindness.md
+tests/test_spin_density_matrix.py,46,test_mixed_occupations_are_hermitian_real_and_match_direct_paulis,,census only; classification in gate_blindness.md
+tests/test_spin_density_matrix.py,79,test_pauli_helper_is_literal_trace_for_nonhermitian_diagnostic_input,,census only; classification in gate_blindness.md
+tests/test_spin_density_matrix.py,95,test_kpoint_matrix_trace_matches_charge_and_preserves_all_weights,,census only; classification in gate_blindness.md
+tests/test_spin_density_matrix.py,118,test_spin_matrix_mode_refuses_non_pauli_and_conflicting_requests,,census only; classification in gate_blindness.md
+tests/test_star_wedge_measured_values.py,185,test_the_star_wedge_sweep_counts_are_what_was_measured,"MEASURED ``L15_wedge_tables.log``, six lines, ``VERDICT PASS``::",census only; classification in gate_blindness.md
+tests/test_star_wedge_measured_values.py,221,test_renumber_composed_with_rows_returns_the_parent_map_exactly,"THE identity, ``rows[irr_idx_wedge] == SymMaps.irr_idx_k``, all six decks.",census only; classification in gate_blindness.md
+tests/test_star_wedge_measured_values.py,268,test_these_three_decks_really_do_separate_the_two_wedges,"PRECONDITION for everything above, stated so a fixture change shows.",census only; classification in gate_blindness.md
+tests/test_star_wedge_measured_values.py,288,test_the_true_ibz_decks_keep_the_literal_old_path,The other half of the sweep claim: ``si_*`` and ``hbn_*`` do not move.,census only; classification in gate_blindness.md
+tests/test_star_wedge_measured_values.py,329,test_a_wedge_stored_slab_reads_back_exactly_star_covariant,"MEASURED ``0.000000e+00``, diagonal AND off-diagonal, on FRESH files.",census only; classification in gate_blindness.md
+tests/test_star_wedge_measured_values.py,397,test_read_star_map_counts_distinct_stars_not_the_max_label,RED TWIN for the refusal that did not fire.,census only; classification in gate_blindness.md
+tests/test_star_wedge_measured_values.py,453,test_the_committed_kin_ion_fixtures_carry_their_measured_deviation,"The four stale fixtures and the two clean ones, measured 2026-08-17.",census only; classification in gate_blindness.md
+tests/test_static_gauge_head_artifact.py,71,test_hall_artifact_roundtrip_is_sealed_and_immutable,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_artifact.py,109,test_hall_artifact_refuses_mismatched_runtime_identity,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_artifact.py,119,test_hall_artifact_refuses_absent_partial_and_incomplete,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_artifact.py,143,test_bare_route_accepts_authenticated_exact_zero_hall,Positive control for the narrowed bare-route Hall refusal.,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_artifact.py,170,test_bare_route_still_refuses_authenticated_nonzero_hall,Negative control: a nonzero Gamma-only CT/TC block still refuses.,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_artifact.py,191,test_hall_artifact_schema_version_has_a_red_twin,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_artifact.py,204,test_response_tile_adapters_delegate_canonical_pack_and_views,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_artifact.py,230,test_immutable_output_refusal_names_path_flag_and_recovery,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,65,test_hall_builder_has_only_transverse_ct_tc_and_fixed_sign,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,81,test_hall_builder_with_zero_sigma_is_exactly_zero,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,86,test_static_head_moment_matches_direct_coupled_dyson_algebra,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,122,test_static_head_moment_applies_deterministic_cubature_weights,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,195,test_scalar_head_owner_and_packed_completion_share_one_q0_quadrature,"ONE q->0 cell-average owner: same nodes, same weights, same numbers.",census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,250,test_slab_q0_ladder_certificate_can_refuse,NEGATIVE CONTROL: the ladder gate is reachable in the FAIL direction.,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,278,test_slab_q0_rule_is_a_named_selection_that_refuses_its_alternatives,No silent rule: an unknown name and the 3D sphere key both refuse.,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,297,test_static_head_numerical_certificate_gates_transformed_forward_bound,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,321,test_static_head_numerical_certificate_refuses_bound_denominator,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,334,test_static_head_numerical_certificate_refuses_nonfinite_theta,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,346,test_static_head_numerical_certificate_refuses_nonfinite_convergence,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,358,test_static_head_mixed_error_refuses_nonfinite_nonfirst_block,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,368,test_static_head_order_reduction_refuses_later_nonfinite_diagnostic,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,381,test_static_head_completion_has_no_independent_cell_volume_seam,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,386,test_static_gauge_tensor_residuals_accept_a_nonzero_ward_closed_tensor,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,392,test_static_gauge_tensor_residuals_flag_a_ward_breaking_tensor,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,399,test_static_gauge_tensor_residuals_flag_a_nonhermitian_tensor,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,406,test_static_photon_head_response_is_sealed_to_its_producer,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,415,test_packed_runtime_has_no_caller_supplied_head_response_seam,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,420,test_packed_runtime_refuses_a_config_less_call_before_opening_a_body,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,428,test_packed_runtime_refuses_no_local_fields_before_opening_a_body,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,464,test_packed_deck_default_head_runs_the_completion,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,471,test_packed_deck_off_head_is_an_announced_debug_skip,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,477,test_packed_deck_refuses_no_local_fields,"Refused for EVERY bispinor deck now, not only the packed envelope.",census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,491,test_packed_deck_completion_is_slab_only_and_says_why,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,500,test_packed_deck_off_head_keeps_the_bulk_body_reachable,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,511,test_the_route_and_the_refusal_read_the_same_envelope_table,The envelope had two owners; a condition written twice will differ.,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,534,test_material_class_is_owned_by_wfn_validation_not_the_envelope,The removed material-class deck key must not survive as a shadow row.,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,543,test_every_envelope_row_says_physics_or_implementation_limit,A refusal that does not say WHICH cannot be acted on.,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,555,test_the_eight_scalar_head_overrides_are_one_conjunct,Eight hand-written got/want rows became one predicate that names,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,572,test_mode_required_settings_are_derived_from_the_envelope_table,"The packed kernel derives its band carrier, not the public LA dial.",census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,587,test_retired_full_carrier_key_warns_and_uses_parents,The temporary compatibility ruling accepts false with an explicit warning.,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,600,test_a_deck_outside_the_envelope_still_sees_its_own_reason,The promotion must not fire for a deck that is outside the envelope,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,636,test_incumbent_head_off_gets_the_same_debug_labelling_as_the_packed_route,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,650,test_incumbent_head_full_says_it_has_no_transverse_gamma_head,A bulk bispinor number must not look complete.,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,666,test_the_driver_prints_the_incumbent_head_record,The one owner is gw_config; gw_jax must not grow a second copy.,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,675,test_the_driver_replays_config_provenance_into_the_production_report,Unnamed physics defaults must survive the production chatter filter.,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,684,test_restart_preserves_the_packed_head_mechanism,A copied parent restart uses the same coupled Gamma completion as fresh GW.,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,694,test_an_unnamed_restart_uses_the_fresh_physics_default,The global default is fresh physics and its provenance is visible.,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,711,test_a_scalar_deck_gets_the_same_fresh_restart_default,,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,727,test_a_bulk_bispinor_restart_deck_is_untouched,The gate is aimed at the deck class the packed route would have,census only; classification in gate_blindness.md
+tests/test_static_gauge_head_response.py,737,test_retired_charge_hall_cubature_spelling_names_the_new_mode,,census only; classification in gate_blindness.md
+tests/test_static_photon_head_response.py,125,test_producer_with_hall_artifact_has_only_declared_support,,census only; classification in gate_blindness.md
+tests/test_static_photon_head_response.py,146,test_producer_without_hall_artifact_uses_sigma_h_zero,,census only; classification in gate_blindness.md
+tests/test_static_photon_head_response.py,159,test_producer_refuses_a_hall_term_from_another_band_manifold,,census only; classification in gate_blindness.md
+tests/test_static_photon_head_response.py,168,test_producer_refuses_an_unsealed_hall_object,,census only; classification in gate_blindness.md
+tests/test_transverse_candidate_gram.py,64,test_transverse_pair_fold_is_the_hermitian_psd_feature_gram,The production fold equals explicit stacked transition features.,census only; classification in gate_blindness.md
+tests/test_transverse_candidate_gram.py,80,test_summed_transverse_gram_is_cartesian_rotation_invariant,Equal unnormalised component weights make the sum frame-covariant.,census only; classification in gate_blindness.md
+tests/test_transverse_candidate_gram.py,103,test_point_supported_in_only_one_component_keeps_its_leverage,A large one-component feature can be the first selected point.,census only; classification in gate_blindness.md
+tests/test_transverse_candidate_gram.py,121,test_charge_candidate_fold_is_bit_identical_to_the_scalar_owner,The new mode dispatch leaves the historical scalar path untouched.,census only; classification in gate_blindness.md
+tests/test_transverse_candidate_gram.py,134,test_transverse_orbit_block_deflates_every_emitted_current_point,One representative per orbit does not span a generic current Gram.,census only; classification in gate_blindness.md
+tests/test_transverse_candidate_gram.py,184,test_fused_wfn_route_matches_staged_pair_route_for_both_metrics,"Fusion removes dispatch boundaries, not candidate physics.",census only; classification in gate_blindness.md
+tests/test_transverse_factor_hoist.py,283,test_hoisted_transverse_lu_is_bit_identical_to_fused,"factor_c_q's hoisted (LU, perm) + solve_zeta's lu_solve reproduce",census only; classification in gate_blindness.md
+tests/test_transverse_factor_hoist.py,297,test_hoisted_factor_carries_the_ridge,An exact-null transverse mode stays finite through the hoisted,census only; classification in gate_blindness.md
+tests/test_transverse_factor_hoist.py,307,test_batch_reshard_provider_lu_is_hoisted_once_and_bit_identical,Two r chunks reuse one local-JAX factor under a provider request.,census only; classification in gate_blindness.md
+tests/test_transverse_rank_truncate.py,372,test_local_family_is_bit_identical_across_schedules,Within the rank_truncate family: exact bit equality across,census only; classification in gate_blindness.md
+tests/test_transverse_rank_truncate.py,390,test_truncation_drops_the_trs_near_null_pair,n_keep == n_log - 2 on the fixture (both TRS modes cut).,census only; classification in gate_blindness.md
+tests/test_transverse_rank_truncate.py,401,test_ridge_vs_rank_truncate_agree_on_kept_subspace,"Different algorithms, not bit-comparable: kept-subspace agreement",census only; classification in gate_blindness.md
+tests/test_transverse_rank_truncate.py,420,test_resolver_semantics,Family selection + conflicts + untouched ridge defaults.,census only; classification in gate_blindness.md
+tests/test_vq_charge_capture_routing.py,59,test_charge_capture_role_is_explicit_and_label_independent,,census only; classification in gate_blindness.md
+tests/test_vq_charge_capture_routing.py,84,test_scalar_and_bispinor_callers_supply_the_same_charge_semantics,,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,98,test_on_grid_the_reattached_head_is_bitwise_the_injected_delta,"fine == coarse → exactly ``[whead at Γ, 0 elsewhere]``.  BITWISE.",census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,120,test_on_grid_the_red_twin_is_invisible,The design says the red twin is invisible when the grids are equal.,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,136,test_the_loader_does_not_defer_when_the_grids_are_equal,``bse_k_grid == coarse`` returns the bundle the no-flag path returns.,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,169,test_defer_whead_is_not_the_w0_ready_gate,"The two skips are different, and say different things in the log.",census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,205,test_the_loader_resolves_the_fine_grid_before_it_injects,AST gate: the deferral decision must precede the injection.,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,240,test_the_coarse_gamma_cell_holds_exactly_the_index_many_fine_q,"``|Γ_c ∩ fine grid| = [Λ_f : Λ_c] = m³``, exactly, on every lattice.",census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,264,test_the_kept_q_are_the_ones_nearest_gamma,Each coset's representative is its member of smallest |q|.,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,290,test_nondivisor_8_to_12_has_the_exact_common_cell_overlap,The LCM construction gives the analytic square-cell overlap weights.,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,311,test_nondivisor_hex_overlap_preserves_total_weight_and_evenness,Skew-cell red twin: the 8→12 overlap remains a real Voronoi partition.,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,323,test_a_broken_partition_is_refused_not_absorbed,RED TWIN: monkeypatch the mask to over-count → the builder REFUSES.,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,357,test_the_head_channel_zone_average_is_the_grid_independent_number,"THE SUM RULE, with its exact arm, its refinement arm and its false arm.",census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,408,test_the_head_channel_is_even_in_q,"``S(q) = S(−q)`` exactly, which is what carries reciprocity through.",census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,427,test_the_interpolated_head_rings_and_leaks_where_c1_does_neither,Run the SHIPPED densifier on a delta and on C1's channel; compare.,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,485,test_the_reattached_kernel_is_hermitian_to_machine_zero,"Hermiticity by congruence, and the deliberately complex red twin.",census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,520,test_a_complex_head_scalar_is_refused_before_it_can_be_attached,The twin above cannot be reached through the shipped path.,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,539,test_the_slab_pointwise_head_uses_vcoul_not_the_bulk_pole,Finite-q slab C1 equals vcoul's G=0 kernel plus the shared Dyson factor.,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,559,test_the_slab_head_has_one_over_q_not_bulk_one_over_q_squared_scaling,"The service has the slab factor and 1/q cusp, not the bulk 1/q² pole.",census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,580,test_slab_gamma_and_nondivisor_8_to_12_c1_use_the_service_channel,"The requested slab path: service Γ + LCM overlap, unlike legacy.",census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,629,test_cell_box_head_remains_refused,,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,636,test_an_unstamped_sys_dim_is_refused_not_defaulted_to_bulk,``sys_dim=None`` REFUSES.  This is the cell that keeps the escape shut.,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,675,test_the_bse_meta_is_stamped_with_the_decks_sys_dim,RED TWIN for the OTHER end: ``htransform.initialize_wfns`` must stamp it.,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,712,test_the_pointwise_head_refuses_q_equals_zero,There is no pointwise value at Γ — the object there is an integral.,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,718,test_w_head_densify_takes_only_the_two_modes,,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,728,test_w_head_densify_deck_key_reaches_shipping_resolver,The deck must select the same mode the BSE loader consumes.,census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,744,test_invalid_w_head_densify_deck_value_is_named,"The resolver must report the bad deck token, not its absent CLI arg.",census only; classification in gate_blindness.md
+tests/test_w_head_densify.py,757,test_the_head_grid_may_be_nonnested_but_may_not_coarsen,,census only; classification in gate_blindness.md
+tests/test_w_isdf_padding.py,151,test_solve_w_refuses_equal_but_noncanonical_centroid_extents,Equality alone must not authenticate the weak P36 2070 carrier.,census only; classification in gate_blindness.md
+tests/test_w_isdf_padding.py,169,test_solve_w_geometry_accepts_irreducible_q_extent,"The Dyson seam owns mu padding, not full-BZ versus wedge q mapping.",census only; classification in gate_blindness.md
+tests/test_w_isdf_padding.py,182,test_solve_w_geometry_accepts_explicit_packed_carrier,A direct-sum photon carrier is not the scalar charge prefix.,census only; classification in gate_blindness.md
+tests/test_w_isdf_padding.py,196,test_precompile_solve_w_refuses_the_same_noncanonical_carrier,AOT setup must not compile a geometry the runtime seam rejects.,census only; classification in gate_blindness.md
+tests/test_w_isdf_padding.py,216,test_distributed_solve_cache_is_keyed_by_logical_extent,One padded extent must not reuse another caller's zero-mask closure.,census only; classification in gate_blindness.md
+tests/test_w_isdf_padding.py,239,test_static_gamma_override_accepts_the_chi_carrier_not_logical_prefix,The metallic Gamma row follows product padding through screening.,census only; classification in gate_blindness.md
+tests/test_w_isdf_padding.py,275,test_mpa_reader_and_distributed_dyson_a_build_on_true_6x6_mesh,Logical 42 must reach ``_a_local`` as one zero-padded 72 carrier.,census only; classification in gate_blindness.md
+tests/test_wavefunction_basis_receipt.py,53,test_receipt_is_immutable_and_reuses_the_restart_centroid_digest,,census only; classification in gate_blindness.md
+tests/test_wavefunction_basis_receipt.py,62,test_bound_canonical_wfn_fingerprint_is_reused_without_rescan,,census only; classification in gate_blindness.md
+tests/test_wavefunction_basis_receipt.py,101,test_prepare_constructs_receipts_on_host_from_one_canonical_scan,,census only; classification in gate_blindness.md
+tests/test_wavefunction_basis_receipt.py,137,test_fresh_and_restart_face_builders_validate_host_receipt,,census only; classification in gate_blindness.md
+tests/test_wavefunction_basis_receipt.py,166,test_physical_source_identity_is_layout_and_device_count_independent,,census only; classification in gate_blindness.md
+tests/test_wavefunction_basis_receipt.py,176,test_charge_and_transverse_are_distinct_even_on_the_same_points,,census only; classification in gate_blindness.md
+tests/test_wavefunction_basis_receipt.py,183,test_scalar_spinor_and_kinetic_balance_lift_are_distinct_sources,,census only; classification in gate_blindness.md
+tests/test_wavefunction_basis_receipt.py,204,test_every_physical_source_field_has_a_red_twin,,census only; classification in gate_blindness.md
+tests/test_wavefunction_basis_receipt.py,209,test_wavefunctions_authenticates_receipt_against_live_mu_carrier,,census only; classification in gate_blindness.md
+tests/test_wavefunction_basis_receipt.py,239,test_receipt_is_host_only_and_does_not_split_jit_cache_family,,census only; classification in gate_blindness.md
+tests/test_wavefunction_basis_receipt.py,292,test_finite_transfer_endpoint_preserves_pre_receipt_positional_abi,,census only; classification in gate_blindness.md
+tests/test_wavefunction_basis_receipt.py,320,test_isdf_header_keeps_candidate_import_compatibility_without_ownership,,census only; classification in gate_blindness.md
+tests/test_wfn_rpoints_and_indexed_gflat.py,323,test_to_rpoints_inner_matches_the_contiguous_slab,,census only; classification in gate_blindness.md
+tests/test_wfn_rpoints_and_indexed_gflat.py,339,test_indexed_gflat_accumulate_matches_the_r0_path,,census only; classification in gate_blindness.md
+tests/test_wfn_rpoints_and_indexed_gflat.py,356,test_psi_g_store_ibz_domain_holds_parent_rows,,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,134,test_to_box_ibz_synth,,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,138,test_to_box_full_bz_synth,,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,142,test_to_box_ibz_mos2,,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,146,test_to_box_full_bz_mos2,,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,150,test_to_box_empty_cells_are_zero,FFT-box cells outside the G-sphere must be exactly zero.,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,170,test_to_rbox_matches_ifft_of_to_box,,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,183,test_to_rmu_matches_rbox_take,,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,206,test_to_rchunk_matches_rbox_flat_slab,,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,222,test_to_rchunk_rejects_out_of_bounds,,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,237,test_to_rchunk_inner_matches_to_rchunk_no_phase,to_rchunk_inner is the shard_map-less body of to_rchunk.  On a,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,255,test_to_rchunk_inner_matches_to_rchunk_with_phase,Bloch-phase branch — apply_bloch_phase_on_slice should run,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,278,test_to_rchunk_inner_traced_r0,The r0 arg must accept a traced scalar — the eventual Path D,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,305,test_to_rmu_inner_matches_to_rmu_no_phase,to_rmu_inner is the shard_map-less body of to_rmu.  On a 1×1,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,331,test_to_rmu_inner_matches_to_rmu_with_phase,Bloch-phase branch — applied to the full FFT box before the,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,383,test_gflat_to_rmu_no_phase,One shard_map+scan call equals the bc-loop + concatenate path,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,410,test_gflat_to_rmu_with_phase,Bloch-phase branch — apply_bloch_phase semantics (sign=+1) on,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,440,test_gflat_to_rmu_chunked_matches_oneshot,chunk_size sweep — every choice (incl. one that triggers,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,474,test_gflat_to_rmu_runtime_k_and_centroid_operands_share_one_family,Same-shaped k and centroid values vary without one JIT per tile.,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,517,test_streamed_centroid_transfer_matches_bulk,Two-dimensional WFN tiles preserve the public centroid faces.,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,636,test_k1_stream_reuses_real_multichild_parents_and_keeps_one_k_fft,"The production schedule reduces real WFN reads, not FFT count.",census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,801,test_pad_rows_dont_leak_into_box,"Force the band-pad case (replicated, no mesh → no band pad), and",census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,827,test_apply_bloch_phase_matches_4d_reference,The separable 1D-factor application of exp(2πi k·r) must,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,857,test_to_box_shape,,census only; classification in gate_blindness.md
+tests/test_wfn_transforms.py,870,test_get_enk_bandrange_default_nspinor_is_read_from_the_wfn,``nspinor=2`` as a hardcoded DEFAULT was silent-wrong on an,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,144,test_cri3_asymmetric_physical_ranges_exclude_the_p16_carrier_pad,"Schema 2 records physics, not the mesh-dependent b4=256 carrier.",census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,166,test_legacy_stamp_reused_by_legacy_value_run,,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,172,test_legacy_stamp_refits_for_rank_truncate_family,,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,181,test_8b02c72_tier_exception_regression,,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,195,test_tau_change_refits_within_family,,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,203,test_matching_stamp_reused,,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,209,test_pre_pair_domain_charge_stamp_refits,An LR-only asymmetric charge zeta is not valid for the closed domain.,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,221,test_pair_domain_stamp_changes_only_asymmetric_charge,,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,233,test_logical_band_ranges_are_mesh_invariant_and_physics_sensitive,Zero pad endpoints vary with P; the explicit logical window does not.,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,255,test_legacy_same_padding_cannot_prove_logical_stop,"[0,256] in schema 1 is ambiguous between logical 250 and 256.",census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,272,test_refit_consumer_reads_each_schema_at_its_declared_range,BSE reproduction reads schema 2 logically and schema 1 historically.,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,288,test_provenance_collapse_nonbispinor_and_ridge_tau,,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,303,test_pauli_charge_reuses_off_charge_stamp_but_raw4_tt_stays_pinned,"Carrier identity, not the enclosing four-current policy, owns zeta.",census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,327,test_bispinor_stamp_requires_transverse_identity,A bispinor stamp that does not name its transverse basis is the,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,336,test_transverse_keys_present_for_bispinor_and_none_otherwise,,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,347,test_transverse_centroid_table_change_refits,"Same COUNT, different POINTS: the count-only check passes and the",census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,362,test_transverse_count_change_refits,,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,371,test_distributed_lu_change_refits,A ζ_T fit under ScaLAPACK's block-cyclic LU is a different gauge,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,383,test_transverse_solver_kind_change_refits,"Same deck strings, different RESOLVED kind (the GPU `auto`",census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,396,test_pre_20260804_stamp_reused_by_charge_run_refit_by_bispinor,"The legacy exception for the four new keys, both directions.",census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,413,test_added_key_equal_to_its_legacy_default_still_reuses,"REGRESSION (found by this suite on 2026-08-04, job 7888522).",census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,437,test_stamp_from_a_newer_lorrax_gets_no_exception,A stamp carrying a key this build does not write came from a,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,450,test_real_input_change_alongside_a_legacy_gap_still_refits,A shared key that genuinely differs defeats the exception even,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,465,test_per_vertex_stamps_differ_only_in_vertex_and_mu,One bispinor configuration produces four channel-specific stamps.,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,483,test_dataset_extent_probe_declines_reuse,A good header over a ζ of the wrong μ extent must not be reused,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,545,test_symlinked_wfn_is_the_same_file_and_reuses,"RED TWIN 1 — one file, two spellings: REUSE.",census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,566,test_two_staging_links_to_one_wfn_reuse,The production shape: consecutive legs each stage the same WFN,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,584,test_different_wfn_at_a_new_path_still_refits,"RED TWIN 2 — two genuinely different files: REFIT, naming BOTH.",census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,605,test_repointed_symlink_refits,"The same spelling, repointed at a different file, is NOT reuse.",census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,634,test_hardlinked_wfn_reuses,"Two names, two resolved paths, ONE inode: still one file.",census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,650,test_spelling_difference_composes_with_the_legacy_key_exception,A stamp that BOTH predates keys and was written under another,census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,669,test_stamp_records_the_resolved_path,"The stamp itself is written resolved, so a leg launched through a",census only; classification in gate_blindness.md
+tests/test_zeta_provenance_matrix.py,681,test_spelling_exception_does_not_absorb_a_real_input_change,The spelling arm must not become a way for other changes to ride,census only; classification in gate_blindness.md
+tests/test_zq_from_psi_sm_bit_identity.py,334,test_g1_1_charge_multi_bc,"Main G1.1: nb_total=8, 2 bcs of 4 bands, L=R=(0,8) (full).",census only; classification in gate_blindness.md
+tests/test_zq_from_psi_sm_bit_identity.py,356,test_g1_1a_single_bc,,census only; classification in gate_blindness.md
+tests/test_zq_from_psi_sm_bit_identity.py,369,test_hoisted_psi_r_cache_matches_streaming_path,"Cache construction changes lifetime and placement, not arithmetic.",census only; classification in gate_blindness.md
+tests/test_zq_from_psi_sm_bit_identity.py,404,test_g1_1b_short_final_bc,,census only; classification in gate_blindness.md
+tests/test_zq_from_psi_sm_bit_identity.py,422,test_g1_1c_asymmetric_lr,,census only; classification in gate_blindness.md
+tests/test_zq_from_psi_sm_bit_identity.py,442,test_g1_1d_bispinor_gamma1,,census only; classification in gate_blindness.md
+tests/test_zq_from_psi_sm_bit_identity.py,471,test_g1_1e_pseudobands_pre_divide,,census only; classification in gate_blindness.md
+tests/test_zq_from_psi_sm_bit_identity.py,529,test_zero_user_band_pad_in_shard_zeros_only_requested_pad_slots,,census only; classification in gate_blindness.md
+tests/test_zq_from_psi_sm_bit_identity.py,546,test_zero_user_band_pad_in_shard_returns_original_when_no_pad_owned,,census only; classification in gate_blindness.md
+tests/test_zq_from_psi_sm_bit_identity.py,559,test_zero_user_band_pad_in_shard_rejects_strided_band_slice,,census only; classification in gate_blindness.md
+tests/test_zq_from_psi_sm_bit_identity.py,609,test_slice_local_tile_bc_returns_correct_band_window,"Slicer returns each bc's bands of the host tile, padded to bpd_max.",census only; classification in gate_blindness.md
+tests/test_zq_from_psi_sm_bit_identity.py,642,test_slice_local_tile_bc_traced_bc_idx_inputs,Slicer accepts traced int32 scalars (the io_callback contract); resolved,census only; classification in gate_blindness.md
+tests/test_zq_from_psi_sm_bit_identity.py,662,test_slice_local_tile_bc_rejects_out_of_range_bc,,census only; classification in gate_blindness.md
+tests/test_zq_from_psi_sm_bit_identity.py,673,test_psi_G_device_full_property_removed,Round 6 deleted the buggy lazy property + field.  Confirm absence.,census only; classification in gate_blindness.md

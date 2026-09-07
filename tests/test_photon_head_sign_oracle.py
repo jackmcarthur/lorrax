@@ -143,7 +143,7 @@ def _micro_model(seed=20260901):
     velocity = 0.5 * (raw + np.conj(np.swapaxes(raw, -1, -2)))
     occupations = np.zeros((nk, nb))
     occupations[:, :nocc] = 1.0
-    # psi_xn / psi_yn legacy carrier layout is (nk, ns, nmu, nb).
+    # The host psi uses (nk, ns, nmu, nb).
     psi = (rng.normal(size=(nk, ns, nmu, nb))
            + 1j * rng.normal(size=(nk, ns, nmu, nb)))
     return SimpleNamespace(
@@ -185,7 +185,10 @@ def part_a_residuals(mesh):
         b_mu, D_jet, m.energies, m.occupations,
         cell_volume=m.cell_volume, nk_tot=m.nk, nspin=m.nspin,
         nspinor=m.nspinor)
-    stub = SimpleNamespace(psi_xn=jnp.asarray(m.psi), psi_yn=jnp.asarray(m.psi))
+    stub = SimpleNamespace(layout="face", slices=None,
+        enk=m.energies, occ=m.occupations,
+        psi_mun=jnp.asarray(m.psi),
+        psi_nmu=jnp.asarray(m.psi.transpose(0, 3, 1, 2)))
     Y_code, Z_code = head_wings_sharded(
         m.velocity, stub, m.energies, m.occupations,
         np.asarray([0.0 + 0.0j]), mesh=mesh, nb_logical=m.nb, nk_tot=m.nk,

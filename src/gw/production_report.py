@@ -83,13 +83,12 @@ def layout_dial_record_lines(
     lines.append(
         f"[config provenance] low_mem_bands = {str(low_mem).lower()} "
         f"({provenance})")
-    if low_mem:
-        lines.append(
-            "low_mem_bands = true: the two-face wavefunction carrier (band "
-            f"chunks of {int(config.memory.band_chunk_size)}); required for the "
-            "raw-parent (k_irr) route, which contracts G and the ISDF pair "
-            "densities on the WFN's own k rows.  On an unreduced k grid the "
-            "four-copy carrier (false) is faster when it fits.")
+    psi_layout = "face" if low_mem else "axis"
+    contraction = "distributed GEMM" if low_mem else "local GEMM with complete bands"
+    lines.append(
+        f"low_mem_bands = {str(low_mem).lower()}: {psi_layout} parent carrier; "
+        f"{contraction}; band chunks of {int(config.memory.band_chunk_size)}. "
+        "Both layouts contract G and ISDF pair densities on the same parent rows.")
     return tuple(lines)
 
 
@@ -130,6 +129,9 @@ class GWProductionReport:
         end.  Exceptions still use stderr through the shared fail-fast path.
         """
         text = sep.join(str(v) for v in args)
+        if text.startswith("  Resident ψ "):
+            self.emit(text)
+            return
         # Fixed-SC quadrature identity is a physics invariant, not backend
         # chatter: retain its compact receipt so every map's exact node set
         # and zero-rebuild claim remain auditable after live stdout is gone.
@@ -554,14 +556,17 @@ class GWProductionReport:
             return total(selected)
 
         isdf_total = top_level("gw_jax.isdf")
-        zeta = outer_prefixed(
-            "gw_jax.zeta_fit_chunked", within="gw_jax.isdf")
+        zeta = total(lambda r: r["name"] == "gw_jax.zeta_fit_chunked"
+                     and tuple(r.get("path", ()))[:1] == ("gw_jax.isdf",))
+        zeta_transverse = outer_prefixed(
+            "gw_jax.zeta_fit_transverse", within="gw_jax.isdf")
         v_q = total(lambda r: r["name"] == "gw_jax.V_q_compute"
                     and tuple(r.get("path", ()))[:1] == ("gw_jax.isdf",))
         restart_load = total(
             lambda r: r["name"] == "gw_jax.restart_load"
             and tuple(r.get("path", ()))[:1] == ("gw_jax.isdf",))
-        isdf_support = max(isdf_total - zeta - v_q - restart_load, 0.0)
+        isdf_support = max(
+            isdf_total - zeta - zeta_transverse - v_q - restart_load, 0.0)
 
         screening_total = top_level("gw_jax.screening")
         chi0 = outer_prefixed("chi.", within="gw_jax.screening")
@@ -583,6 +588,7 @@ class GWProductionReport:
             ("pre-main + imports", top_level("gw_jax.imports")),
             ("input + run setup", top_level("gw_jax.startup")),
             ("zeta", zeta),
+            ("zeta transverse", zeta_transverse),
             ("V(q)", v_q),
             ("restart load", restart_load),
             ("ISDF setup + I/O", isdf_support),

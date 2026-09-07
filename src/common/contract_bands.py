@@ -302,6 +302,7 @@ def _face_project_kernel(
     channels: str = "none",
     right_face_shape=None,
     band_extent=None,
+    layout="face",
 ):
     """The face-layout Σ projector: TWO planned N,N GEMMs, no shard_map,
     no psum_scatter — cuBLASMp's own distributed algorithm does the
@@ -358,9 +359,9 @@ def _face_project_kernel(
     mu_s_left = n_rmu_left * ns
     mu_s_right = n_rmu_right * ns
     plan1 = gemm_plan(mesh_xy, m=mu_s_left, k=mu_s_right, n=nb_project, nq=nk,
-                      dtype=jnp.complex128)
+                      dtype=jnp.complex128, layout=layout, reduction_axis="y")
     plan2 = gemm_plan(mesh_xy, m=nb_project, k=mu_s_left, n=nb_project, nq=nk,
-                      dtype=jnp.complex128)
+                      dtype=jnp.complex128, layout=layout, reduction_axis="x")
 
     def _check(psi_nmu, O, psi_mun):
         if psi_nmu.ndim != 4 or psi_mun.ndim != 4 or O.ndim != 5:
@@ -497,11 +498,11 @@ def contract_bands_block_reshard(
     layout table.  Face: two chained planned GEMMs, output ``(nk, m, n)``
     at ``P(None, ax_x, ax_y)`` — the SAME output spec as legacy's.
     """
-    if layout not in ("legacy", "face"):
+    if layout not in ("legacy", "face", "axis"):
         raise ValueError(
             f"contract_bands_block_reshard: layout must be 'legacy' or "
             f"'face', got {layout!r}")
-    if layout == "face":
+    if layout in ("face", "axis"):
         if channels not in ("none", "split_reim"):
             raise ValueError(
                 f"contract_bands_block_reshard(layout='face'): channels="
@@ -524,7 +525,7 @@ def contract_bands_block_reshard(
         return _face_project_kernel(
             mesh_xy, face_shape, axes, channels=channels,
             right_face_shape=right_face_shape,
-            band_extent=face_band_extent)
+            band_extent=face_band_extent, layout=layout)
 
     from common.shard_map import shard_map
 

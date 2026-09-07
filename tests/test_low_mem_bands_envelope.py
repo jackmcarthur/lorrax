@@ -48,8 +48,7 @@ end-to-end gated then, so the row STAYED for ``compute_mode = mpa``.
 2026-08-23, ``claims/0443.md``), not narrowed further**: ``mpa/sigma.
 _integrate_sigma_batches``' own named gap (a split Σ window, ``nb_sigma
 != nb_full``) is fixed — ``strip_sigma_window`` gained a device-array arm
-reusing ``wavefunction_bundle.pack_band_window``'s slice+reshard
-mechanism on Σ_c's own trailing axes — and gated end to end (real 4-rank
+using distributed slicing and resharding on Σ_c's own trailing axes — and gated end to end (real 4-rank
 CUDA mesh-aware parity, ``tests/test_mpa_sigma_split_window_strip.py``,
 5/5 bit-exact; a real fresh one-shot insulating MPA leg with a genuine
 split window, eqp0/eqp1 max|dE_QP| 6.5e-5/8.6e-5 eV legacy-vs-face).
@@ -71,7 +70,7 @@ session, none of them in ``gw.mpa.sigma``'s own code).
 face-rotations-2026-08-23), same shape as the ``head_correction=full`` lift
 above: ``wavefunction_bundle.rotate_wavefunctions`` now dispatches on
 ``wfns_dft.layout`` and routes ``layout='face'`` through
-``_rotate_wavefunctions_face`` — two planned ``distrib_la.gemm_plan`` N,N
+``rotate_wavefunctions`` — two planned ``distrib_la.gemm_plan`` N,N
 GEMMs (``U^T @ psi_nmu``, ``psi_mun @ U``) against a block-embedded U
 rather than a sliced ψ.  ``sc_iteration.py:1753`` needed no change.  Gated
 on real 4-rank CUDA algebra parity (``tests/test_qsgw_rotate_face_parity.py``
@@ -129,6 +128,12 @@ def _config(tmp_path, extra="", name="low_mem_bands.in"):
     path.write_text(_BASE + extra)
     return LorraxConfig.from_input_file(
         str(path), print_fn=lambda *a, **k: None)
+
+
+def test_full_q_storage_selection_refuses_at_parse_time(tmp_path):
+    """Explicit full-q storage cannot override the WFN's parent representation."""
+    with pytest.raises(ValueError, match="restart_q_storage='full'"):
+        _config(tmp_path, "restart_q_storage = full\n")
 
 
 def test_head_correction_full_is_lifted_on_the_bare_default():
@@ -200,7 +205,7 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
     "compute_mode = gn_ppm\nqp_solver = fixed_point\n",
     # qp_solver=self_consistent, LIFTED 2026-08-23 (feat/qsgw-face-
     # rotations-2026-08-23): rotate_wavefunctions now dispatches on
-    # wfns_dft.layout (wavefunction_bundle._rotate_wavefunctions_face) --
+    # wfns_dft.layout (wavefunction_bundle.rotate_wavefunctions) --
     # gated on real 4-rank CUDA algebra parity (tests/
     # test_qsgw_rotate_face_parity.py) and a real end-to-end MoS2 k6_c50
     # compute_mode=gn_ppm head_correction=full qp_solver=self_consistent
@@ -214,7 +219,7 @@ def test_head_correction_full_is_lifted_on_the_bare_default():
     # gw.mpa.sigma._integrate_sigma_batches' named split-Sigma-window gap
     # (nb_sigma != nb_full, the ordinary case) is fixed --
     # strip_sigma_window's new mesh-aware device-array arm reuses
-    # wavefunction_bundle.pack_band_window's own slice+reshard mechanism
+    # distributed slicing and resharding
     # on Sigma_c's own trailing axes.  Gated on real 4-rank CUDA (mesh-
     # aware strip_sigma_window parity, tests/
     # test_mpa_sigma_split_window_strip.py, 5/5 bit-exact) and a real
@@ -275,8 +280,8 @@ def test_gij_none_under_low_mem_bands_is_the_positive_twin(tmp_path):
     off = _config(tmp_path, "", name="lmb_off.in")
     refuse_explicit_gij_under_low_mem_bands(on, None)    # must not raise
     refuse_explicit_gij_under_low_mem_bands(off, None)   # must not raise
-    refuse_explicit_gij_under_low_mem_bands(               # must not raise
-        off, "an explicit Gij is FINE under low_mem_bands=false")
+    with pytest.raises(ValueError, match="explicit_gij_unported"):
+        refuse_explicit_gij_under_low_mem_bands(off, "explicit dense Gij")
 
 
 def test_compute_sigma_xc_checks_the_gij_row_before_any_kernel():
@@ -286,14 +291,14 @@ def test_compute_sigma_xc_checks_the_gij_row_before_any_kernel():
     import inspect
     from gw import sigma_dispatch
 
-    src = inspect.getsource(sigma_dispatch.compute_sigma_xc)
-    order = [src.index(name) for name in (
-        "refuse_unimplemented_compute_mode(",
-        "refuse_explicit_gij_under_low_mem_bands(",
-        "W_static = W_by_role.get(")]
-    assert order == sorted(order), (
-        "compute_sigma_xc no longer checks the Gij envelope row before "
-        "the static-Sigma kernel dispatch")
+    entry = inspect.getsource(sigma_dispatch.compute_sigma_xc)
+    src = inspect.getsource(sigma_dispatch._validate_sigma_stage)
+    assert src.index("refuse_unimplemented_compute_mode(") < src.index(
+        "refuse_explicit_gij_under_low_mem_bands(")
+    assert entry.index("_validate_sigma_stage(") < entry.index(
+        "_static_sigma_channels("), (
+        "compute_sigma_xc must validate the Gij row before allocating channels")
+
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +308,7 @@ def test_compute_sigma_xc_checks_the_gij_row_before_any_kernel():
 def test_the_docs_name_the_live_gij_refusal():
     """The input reference must name the one live low-memory refusal."""
     page = (_REPO / "docs" / "input_reference.md").read_text()
-    assert "low_mem_bands = true` envelope" in page
+    assert "Raw-parent GW" in page
     assert "low_mem_bands_explicit_gij_unported" in page
 
 

@@ -765,15 +765,9 @@ def test_RED_TWIN_the_unconditional_2x2_silently_broadcasts_over_a_scalar_psi(
 
 
 def test_the_helper_refuses_an_nspinor_it_has_no_representation_for():
-    """4-spinor never comes through here — say so rather than guess.
-
-    ``WfnLoader.load(bispinor=True)`` lifts 2 -> 4 components DOWNSTREAM
-    of the unfold, so an ``nspinor=4`` arriving here means a caller has
-    confused the two stages.  Silently returning the 2x2 would put a
-    4-component psi through the broadcast trap this whole section is about.
-    """
+    """Unsupported spin extents refuse instead of broadcasting a Pauli action."""
     U = np.eye(2, dtype=np.complex128)[None]
-    for bad in (0, 3, 4):
+    for bad in (0, 3, 5):
         with pytest.raises(ValueError, match="nspinor must be 1"):
             spinor_rotation_for_sym_row(U, 0, 1, nspinor=bad)
 

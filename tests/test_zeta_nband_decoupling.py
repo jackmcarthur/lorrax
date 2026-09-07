@@ -406,7 +406,11 @@ def test_the_fit_window_travels_into_the_provenance_stamp():
     # fields and passes them to the canonical writer.
     assert "band_range_left = zeta_contract.band_range_left" in fit_body
     assert "band_range_right = zeta_contract.band_range_right" in fit_body
-    assert "band_range_left=band_range_left" in fit_body
-    assert "band_range_right=band_range_right" in fit_body
+    writer = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "_fit_charge_zeta_channel")
+    writer_body = ast.get_source_segment(src, writer) or ""
+    assert "_fit_charge_zeta_channel(" in fit_body
+    assert "band_range_left=band_range_left" in writer_body
+    assert "band_range_right=band_range_right" in writer_body
     assert contract_body.index("_zeta_fit_provenance(") > 0
-    assert fit_body.index("fit_zeta_to_h5(") > 0
+    assert writer_body.index("fit_zeta_to_h5(") > 0

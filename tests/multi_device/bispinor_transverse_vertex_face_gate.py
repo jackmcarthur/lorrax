@@ -1,62 +1,8 @@
-"""Real 4-rank CUDA gate: bispinor Σ^B transverse-vertex insertion —
-``gw.wavefunction_bundle.with_lorentz_vertices`` — against an independent
-4x4-γ̃-matmul NumPy reference, AND legacy-vs-face parity through the exact
-kernel chain ``gw.sigma_x_bispinor.compute_sigma_x_bispinor`` uses
-(``gw.cohsex_sigma._make_cohsex_kernels``'s layout-dispatched ``sigma_sx``).
-
-Guide: reports/gwjax_low_mem_bands_audit_2026-08-22/report.md, census row
-"Bispinor transverse exchange" — this file is the "transverse-exchange
-algebra parity legacy-vs-face on real 4-rank CUDA with a genuine 4-spinor
-fixture" gate that row's guide names.
-
-WHY REAL CUDA, NOT EMULATED.  The face-layout leg of every check below
-routes ``build_G``/the band projector through ``distrib_la.gemm_plan``
-(cuBLASMp, CUDA-only, refuses on any non-CUDA mesh by construction) — same
-reason ``low_mem_bands_g_projection_hartree_gate.py`` (this file's sibling
-and structural template) needs real hardware.  A CPU-emulated leg would
-silently pass NOTHING for the face side.
-
-SAME ψ, EVERY REPRESENTATION.  Exactly ``low_mem_bands_g_projection_
-hartree_gate.py``'s own convention: ONE host NumPy ψ array (here ns=4, a
-GENUINE bispinor/4-spinor shape — γ̃^i is a real 4x4 matrix, not the
-ns<4 no-op every OTHER face gate in this tree happens to exercise), every
-legacy/face copy derived from it by pure reshape/transpose.
-
-Checks:
-  1. ``with_lorentz_vertices`` + ``build_G`` — for (mu_L, nu_L) in
-     {(0,0), (1,1), (1,2), (2,3), (3,1)} (identity, a diagonal transverse
-     tile, and the three off-diagonal upper/lower pairs Σ^B actually
-     sums), BOTH layouts against an INDEPENDENT NumPy reference built
-     from the FULL 4x4 γ̃ matrix (``common.gamma_matrices.gamma0..3``),
-     not the perm/phase gather this function itself uses — a genuinely
-     different mechanism for the same claim (the module's own docstring:
-     "Replaces a 4x4 matmul ... with a gather + multiply").
-  2. The full ``sigma_sx`` chain (``build_G`` -> FFT convolve -> band
-     projection) as ``compute_sigma_x_bispinor`` actually calls it via
-     ``_make_cohsex_kernels``, legacy vs face, on the SAME vertex-
-     inserted ψ and the SAME (Hermitian, physical) V tile — this is
-     ``compute_sigma_x_bispinor``'s own per-tile mechanism, minus the
-     HDF5 reader / 9-tile Python loop (pure orchestration, not new
-     physics).  The same fixture also checks that the packed-photon block
-     kernel's dynamic X/SX selector reproduces V and 2V algebra through
-     one compiled executable, and that its full-photon caller can request
-     Hartree without running the historical bare-X path.  ``mu_L == 0``
-     also exercises the no-op short-circuit path
-     (``with_lorentz_vertices`` returns the SAME bundle object).
-  3. The static four-current bubble for all 16 Lorentz blocks against a
-     literal ordered-band-pair NumPy oracle on deterministic complex
-     broken-TR states.  Longitudinal and transverse centroid extents differ,
-     so CT/TC reverse axes cannot pass by an accidental square transpose.
-     The combined tensor is Hermitian per q and exactly q-reciprocal; a
-     distinct-but-value-identical CC endpoint matches scalar charge.
-
-Run:
-    lx run -N 1 -G 4 -n 4 bash <pythonpath-wrapper> python3 -u \\
-        tests/multi_device/bispinor_transverse_vertex_face_gate.py \\
-        --mesh 2x2
-"""
+"""P4 gamma, parent static Sigma, and ordered-pair bubble tests against full-face oracles."""
 from __future__ import annotations
 
+from dataclasses import replace
+import jax.numpy as jnp
 import argparse
 import os
 import sys
@@ -130,8 +76,7 @@ def _gamma_full(mu_L: int) -> np.ndarray:
 def check_vertex_build_g(mesh, dtype="complex128", *, mu_L, nu_L, ns=4,
                          mu=8, nb=6, nk=2):
     from gw.wavefunction_bundle import (
-        BandSlices, Wavefunctions, PSI_XN_SPEC, PSI_YR_SPEC,
-        PSI_MUN_SPEC, PSI_NMU_SPEC, with_lorentz_vertices)
+        BandSlices, Wavefunctions, PSI_MUN_SPEC, PSI_NMU_SPEC)
     from gw.greens_function_kernel import build_G
     from distrib_la import gemm_plan
 
@@ -141,28 +86,17 @@ def check_vertex_build_g(mesh, dtype="complex128", *, mu_L, nu_L, ns=4,
     slices = BandSlices.from_band_edges(0, 0, 2, nb, nb)
     rep2 = _put(np.zeros((nk, nb)), mesh, (None, None))
 
-    wfns_legacy = Wavefunctions(
-        psi_xn=_put(psi_band_last, mesh, PSI_XN_SPEC),
-        psi_yr=_put(psi_np, mesh, PSI_YR_SPEC),
-        enk=rep2, occ=rep2, slices=slices,
-    )
     wfns_face = Wavefunctions(
         psi_mun=_put(psi_band_last, mesh, PSI_MUN_SPEC),
         psi_nmu=_put(psi_np, mesh, PSI_NMU_SPEC),
         enk=rep2, occ=rep2, slices=slices, layout="face",
     )
 
-    wfns_legacy_v = with_lorentz_vertices(wfns_legacy, mu_L, nu_L)
-    wfns_face_v = with_lorentz_vertices(wfns_face, mu_L, nu_L)
-    if mu_L == 0 and nu_L == 0:
-        assert wfns_legacy_v is wfns_legacy, (
-            "with_lorentz_vertices(0,0) must be a true no-op (same object)")
-        assert wfns_face_v is wfns_face, (
-            "with_lorentz_vertices(0,0) must be a true no-op (same object)")
+    wfns_face_v = replace(wfns_face,
+        psi_mun=jnp.einsum("ab,kbxn->kaxn", _gamma_full(mu_L), wfns_face.psi_mun),
+        psi_nmu=jnp.einsum("ab,knbx->knax", _gamma_full(nu_L), wfns_face.psi_nmu))
 
     plan = gemm_plan(mesh, m=mu * ns, k=nb, n=mu * ns, nq=nk, dtype=dtype)
-    G_legacy = build_G(wfns_legacy_v.psi_xn, wfns_legacy_v.psi_yr,
-                       layout="legacy")
     G_face = build_G(wfns_face_v.psi_mun, wfns_face_v.psi_nmu,
                      layout="face", gemm=plan)
 
@@ -179,29 +113,24 @@ def check_vertex_build_g(mesh, dtype="complex128", *, mu_L, nu_L, ns=4,
     want = np.einsum("ksxn,knty->ksxty", psi_direct_ref,
                      np.conj(psi_conj_ref), optimize=True)
 
-    r_legacy = _rel(_gather(G_legacy), want)
     r_face = _rel(_gather(G_face), want)
-    assert r_legacy < RTOL, (
-        f"legacy vertex+G rel err {r_legacy:.3e} (mu_L={mu_L}, nu_L={nu_L})")
     assert r_face < RTOL, (
         f"face vertex+G rel err {r_face:.3e} (mu_L={mu_L}, nu_L={nu_L})")
-    return {"legacy": r_legacy, "face": r_face}
+    return {"face": r_face}
 
 
 # ---------------------------------------------------------------------------
-# 2. Full sigma_sx chain (build_G -> convolve -> project), legacy vs face,
-#    exactly compute_sigma_x_bispinor's own per-tile mechanism.
+# 2. Static Sigma chain versus literal NumPy q/band sums.
 # ---------------------------------------------------------------------------
 
-def check_sigma_sx_chain_face_matches_legacy(
+def check_sigma_sx_chain_matches_dense(
         mesh, dtype="complex128", *, mu_L, nu_L, ns=4, mu=8, nb_full=8,
         nb_sigma=5, nk=2):
     from gw.cohsex_sigma import _make_cohsex_kernels
     from gw.photon_sigma import (
-        _TERM_SX, _TERM_X, _make_photon_static_block_kernel)
+        _TERM_SX, _TERM_X, _make_photon_static_class_kernel)
     from gw.wavefunction_bundle import (
-        BandSlices, Wavefunctions, PSI_XN_SPEC, PSI_XR_SPEC, PSI_YR_SPEC,
-        PSI_YN_SPEC, PSI_MUN_SPEC, PSI_NMU_SPEC, with_lorentz_vertices)
+        BandSlices, Wavefunctions, PSI_MUN_SPEC, PSI_NMU_SPEC)
 
     rng = np.random.default_rng(2026082310 + 17 * mu_L + nu_L)
     psi_np = _rng_mat(rng, (nk, nb_full, ns, mu), dtype)   # (nk,n,s,mu)
@@ -221,15 +150,6 @@ def check_sigma_sx_chain_face_matches_legacy(
     kgrid = (nk, 1, 1)
     slices = BandSlices.from_band_edges(0, 0, 2, nb_sigma, nb_full)
 
-    wfns_legacy = Wavefunctions(
-        psi_xn=_put(psi_band_last, mesh, PSI_XN_SPEC),
-        psi_xr=_put(psi_np, mesh, PSI_XR_SPEC),
-        psi_yr=_put(psi_np, mesh, PSI_YR_SPEC),
-        psi_yn=_put(psi_band_last, mesh, PSI_YN_SPEC),
-        enk=_put(enk_np, mesh, (None, None)),
-        occ=_put(np.zeros_like(enk_np), mesh, (None, None)),
-        slices=slices,
-    )
     wfns_face = Wavefunctions(
         psi_nmu=_put(psi_np, mesh, PSI_NMU_SPEC),
         psi_mun=_put(psi_band_last, mesh, PSI_MUN_SPEC),
@@ -237,46 +157,33 @@ def check_sigma_sx_chain_face_matches_legacy(
         occ=_put(np.zeros_like(enk_np), mesh, (None, None)),
         slices=slices, layout="face",
     )
-    Gij_legacy = _put(Gij_np, mesh, (None, None, None))
     Gij_face = _put(Gij_np, mesh, (None, None, None))
-    V_q_legacy = _put(V_q_np, mesh, (None, None, None))
     V_q_face = _put(V_q_np, mesh, (None, None, None))
 
-    sigma_sx_legacy, _ = _make_cohsex_kernels(mesh, kgrid, nk,
-                                              layout="legacy")
     sigma_sx_face, _ = _make_cohsex_kernels(
         mesh, kgrid, nk, layout="face",
         face_shape=(nk, nb_full, mu, ns))
 
-    wfns_legacy_v = with_lorentz_vertices(wfns_legacy, mu_L, nu_L)
-    wfns_face_v = with_lorentz_vertices(wfns_face, mu_L, nu_L)
+    wfns_face_v = replace(wfns_face,
+        psi_mun=jnp.einsum("ab,kbxn->kaxn", _gamma_full(mu_L), wfns_face.psi_mun),
+        psi_nmu=jnp.einsum("ab,knbx->knax", _gamma_full(nu_L), wfns_face.psi_nmu))
 
-    # Legacy: with_lorentz_vertices only ever touches psi_xn/psi_yr (the
-    # G-build's two fields), leaving psi_xr/psi_yn (the projection's own
-    # two fields) untouched — so the single-argument call already keeps
-    # the outer projection bra/ket un-rotated, exactly what the physics
-    # requires (module docstring of gw.sigma_x_bispinor).
-    got_legacy = _gather(sigma_sx_legacy(wfns_legacy_v, Gij_legacy, V_q_legacy))
-    # Face: the two-array carrier serves BOTH roles, so the vertex-
-    # inserted bundle must be threaded through ONLY as wfns_g (the
-    # G-build operand); wfns_face itself (untouched) supplies the
-    # projection's bra/ket.  See _make_cohsex_kernels_face's own
-    # sigma_sx docstring for the derivation and the O(1) discrepancy
-    # this parameter exists to fix (found by an earlier version of THIS
-    # gate, before wfns_g existed).
     got_face_full = _gather(sigma_sx_face(wfns_face, Gij_face, V_q_face,
                                           wfns_g=wfns_face_v))
-    # Mirrors compute_sigma_x_bispinor's OWN gather-then-window step for
-    # layout='face' (its return contract: (nk, nb_sigma, nb_sigma) in
-    # EITHER layout).
-    got_face = got_face_full[:, :nb_sigma, :nb_sigma]
-
-    assert got_legacy.shape == got_face.shape, (
-        f"shape mismatch: legacy={got_legacy.shape} face={got_face.shape}")
-    r = _rel(got_face, got_legacy)
-    assert r < RTOL, (
-        f"sigma_sx chain face-vs-legacy rel err {r:.3e} "
-        f"(mu_L={mu_L}, nu_L={nu_L})")
+    left = np.einsum("st,kbtm->kbsm", _gamma_full(mu_L), psi_np)
+    right = np.einsum("st,kbtm->kbsm", _gamma_full(nu_L), psi_np)
+    reference = np.zeros((nk, nb_full, nb_full), complex)
+    for k in range(nk):
+        sigma = np.zeros((ns, mu, ns, mu), complex)
+        for q in range(nk):
+            kmq = (k - q) % nk
+            green = np.einsum("b,bsm,btn->smtn", f_np[kmq],
+                left[kmq, :nb_sigma], right[kmq, :nb_sigma].conj())
+            sigma -= green * V_q_np[q][None, :, None, :] / nk
+        reference[k] = np.einsum("asm,smtn,btn->ab",
+            psi_np[k].conj(), sigma, psi_np[k])
+    r = _rel(got_face_full, reference)
+    assert r < RTOL, f"static SX vs literal q/band sum: {r:.3e}"
 
     # The coupled photon path must evaluate X[V_packed] and SX[W_packed]
     # through the same Green/convolution/projector graph and one compiled
@@ -284,17 +191,20 @@ def check_sigma_sx_chain_face_matches_legacy(
     # reference, while keeping V/W in their production 2-D packed sharding.
     V_q_packed = _put(V_q_np, mesh, (None, "x", "y"))
     W_q_packed = 2.0 * V_q_packed
-    photon_block = _make_photon_static_block_kernel(
-        mesh, kgrid, nk, wfns_face, wfns_face)
-    left_g = with_lorentz_vertices(wfns_face, mu_L, 0)
-    right_g = with_lorentz_vertices(wfns_face, 0, nu_L)
-    photon_x = photon_block(
-        wfns_face, wfns_face, left_g, right_g, Gij_face,
-        W_q_packed, V_q_packed, np.asarray(_TERM_X, dtype=np.int32))
+    from full_photon_head_sigma_gate import _bundle
+    from common.gamma_matrices import gamma_perm_phase
+    parent = _bundle(mesh, psi_np, enk_np, np.zeros_like(enk_np), slices)
+    photon_block = _make_photon_static_class_kernel(
+        mesh, kgrid, nk, parent, parent)
+    vertices = tuple(tuple(x[None] for x in gamma_perm_phase(v)) for v in (mu_L, nu_L))
+    weights = np.zeros((nk, nb_full), dtype=np.complex128)
+    weights[:, :nb_sigma] = f_np
+    weights = _put(weights, mesh, (None, None))
+    photon_x = photon_block(parent.green_parent, parent.green_parent,
+        weights, V_q_packed[None], 1.0, vertices)
     photon_x.block_until_ready()
-    photon_sx = photon_block(
-        wfns_face, wfns_face, left_g, right_g, Gij_face,
-        W_q_packed, V_q_packed, np.asarray(_TERM_SX, dtype=np.int32))
+    photon_sx = photon_block(parent.green_parent, parent.green_parent,
+        weights, W_q_packed[None], 1.0, vertices)
     photon_sx.block_until_ready()
     r_photon_x = _rel(_gather(photon_x), got_face_full)
     r_photon_sx = _rel(_gather(photon_sx), 2.0 * got_face_full)
@@ -310,11 +220,10 @@ def check_sigma_sx_chain_face_matches_legacy(
         f"cache_size={cache_size}")
 
     return {
-        "face_vs_legacy": r,
+        "face_vs_dense": r,
         "photon_x_vs_v": r_photon_x,
         "photon_sx_vs_2v": r_photon_sx,
         "photon_kernel_cache_size": cache_size,
-        "skipped_x_max_abs": max_skipped_x,
     }
 
 
@@ -342,13 +251,10 @@ def check_four_current_ordered_pair_all16(
     occ = np.tile(np.asarray([1.0, 1.0, 0.0, 0.0]), (nk, 1))
     slices = BandSlices.from_band_edges(0, 0, 2, 4, 4)
 
+    from full_photon_head_sigma_gate import _bundle
+
     def bundle(psi):
-        return Wavefunctions(
-            psi_mun=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_MUN_SPEC),
-            psi_nmu=_put(psi, mesh, PSI_NMU_SPEC),
-            enk=_put(enk, mesh, (None, None)),
-            occ=_put(occ, mesh, (None, None)),
-            slices=slices, layout="face")
+        return _bundle(mesh, psi, enk, occ, slices)
 
     wfns_c = bundle(psi_c)
     wfns_t = bundle(psi_t)
@@ -371,6 +277,7 @@ def check_four_current_ordered_pair_all16(
             got = _gather(w_isdf.compute_no_pair_dirac_current_block(
                 families[A], families[B], quad, meta, mesh,
                 vertex_left=A, vertex_right=B))
+            got = got[:, :extents[A], :extents[B]]
             want = np.zeros(
                 (nk, extents[A], extents[B]), dtype=np.complex128)
             for q in range(nk):
@@ -380,20 +287,20 @@ def check_four_current_ordered_pair_all16(
                         for c in (2, 3):
                             # Occupied-to-empty ordered transition.
                             left_vc = np.einsum(
-                                "am,aA,Am->m", psi_a[k, v], gamma_a,
-                                np.conj(psi_a[kmq, c]), optimize=True)
+                                "am,ab,bm->m", np.conj(psi_a[kmq, c]), gamma_a,
+                                psi_a[k, v], optimize=True)
                             right_vc = np.einsum(
-                                "bn,Bb,Bn->n", np.conj(psi_b[k, v]),
+                                "an,ab,bn->n", np.conj(psi_b[k, v]),
                                 gamma_b, psi_b[kmq, c], optimize=True)
                             # Empty-to-occupied ordered transition.  This is
                             # F_BA(-q)^dagger after relabelling k; spelling it
                             # directly keeps the oracle independent of the
                             # production R-space completion.
                             left_cv = np.einsum(
-                                "am,aA,Am->m", psi_a[k, c], gamma_a,
-                                np.conj(psi_a[kmq, v]), optimize=True)
+                                "am,ab,bm->m", np.conj(psi_a[kmq, v]), gamma_a,
+                                psi_a[k, c], optimize=True)
                             right_cv = np.einsum(
-                                "bn,Bb,Bn->n", np.conj(psi_b[k, c]),
+                                "an,ab,bn->n", np.conj(psi_b[k, c]),
                                 gamma_b, psi_b[kmq, v], optimize=True)
                             want[q] -= (
                                 left_vc[:, None] * right_vc[None, :]
@@ -454,7 +361,7 @@ _CLI_CELLS = (
      for (mu_L, nu_L) in _LORENTZ_PAIRS]
     + [(f"sigma_sx_chain_{mu_L}{nu_L}",
         (lambda mesh, dt, mu_L=mu_L, nu_L=nu_L:
-         check_sigma_sx_chain_face_matches_legacy(
+         check_sigma_sx_chain_matches_dense(
              mesh, dt, mu_L=mu_L, nu_L=nu_L)))
        for (mu_L, nu_L) in _LORENTZ_PAIRS]
     + [("four_current_ordered_pair_all16",

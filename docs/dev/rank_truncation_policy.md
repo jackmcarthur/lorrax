@@ -190,25 +190,24 @@ which is exactly the class of failure this policy exists to remove.
 
 ## 4. Indefinite operators — a positive ridge is not a regularizer
 
-The transverse (bispinor) CCT is Hermitian **indefinite**: both signs of λ are
-physical.  Adding `+ε·I` moves every eigenvalue the same way, so it pushes the
-negative ones *toward* zero.  Above κ ≈ 1e12 the ridge therefore makes
-conditioning worse, which is measured (register `bispinor`, job 7885987) and
-refutes the mechanism the ridge path's own docstring claimed.
+An arbitrary Hermitian indefinite operator cannot be regularized by a fixed
+positive shift: negative eigenvalues move toward zero. Rank truncation on
+|λ| remains the policy for that general case.
 
-The policy for an indefinite operator is the same one as for a definite one,
-stated on |λ|: **truncate, do not shift.**  `transverse_zeta_solve =
-rank_truncate` is that route and it is plumbed end to end.
+The literal bispinor audit corrected the equal-current fit convention:
+C=sQ and Z=sRHS, with Q a positive Gram and the same sign s on both inputs.
+Gamma2 has s=-1. The default local and distributed transverse routes still
+use LU, but `isdf.core._transverse_lu_ridge` now gives the shift the trace's
+sign. Thus (sQ+sδI)^−1(sRHS) equals (Q+δI)^−1RHS. This repairs the inherited
+negative-ridge consequence without changing the RHS convention, ridge
+magnitude, charge regularizer, or rank-truncation route. It is not a claim
+that trace-directed shifting regularizes a general indefinite matrix.
 
-The ridge path stays reachable because flipping a production default is a
-physics ruling with a measurement attached, and no transverse measurement of
-the truncated route exists yet on a production deck.  What it may not stay is
-**uninstrumented**: it now carries a κ lower bound from `|diag U|` of its own
-LU — O(n) after a factorization that already happened — and refuses above
-κ ≥ 1e12 under the same `LORRAX_RANK_POLICY` dial.  A lower bound is the right
-direction for a gate that fires when the number is *large*: exceeding it
-proves κ exceeds it.  Failing to exceed it proves nothing, and the log says so
-rather than reporting a clean bill.
+The actual corrected LU retains its κ lower-bound instrument from |diag U|
+and existing refusal ceiling. Exceeding the bound proves bad conditioning;
+failing to exceed it certifies nothing. The adversarial Gamma2 oracle and
+fresh Si/MoS2 printed-digit identity gates are recorded in the bispinor
+convention register and campaign report.
 
 ---
 

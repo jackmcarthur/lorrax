@@ -223,6 +223,10 @@ def _write_and_check_receipts(plus, nk, nb, output_dir):
             sym=sym,
             print_fn=lambda *_args, **_kwargs: None,
         )
+        if not explicit:
+            if os.path.exists(path):
+                raise AssertionError(f"disabled diagnostic emitted a receipt: {path}")
+            return None
         if not os.path.isfile(path):
             raise AssertionError(f"canonical Sigma receipt was not emitted: {path}")
         header, rows = _read_debug_table(path)
@@ -231,8 +235,9 @@ def _write_and_check_receipts(plus, nk, nb, output_dir):
             raise AssertionError(f"Sigma receipt lacks columns {missing}")
         return path, header, rows
 
+    assert emit("disabled.dat", plus["components"], True, False) is None
     full_path, header, rows = emit(
-        "sigma_freq_debug.dat", plus["components"], True, False)
+        "sigma_freq_debug.dat", plus["components"], True, True)
     with open(full_path, "r", encoding="utf-8") as stream:
         full_receipt_text = stream.read()
     required_metadata = (
@@ -312,17 +317,34 @@ def _check_rotated_diagonal(mesh):
     )
 
 
-def _bundle(mesh, psi, enk, occ, slices):
+def _bundle(mesh, psi, enk, occ, slices, *, kgrid=None):
+    """Synthetic identity-group parents use the production typed plan."""
+    from symmetry_maps import SymMaps
+    from common.centroid_basis import PackedCentroidBasis
+    from gw.centroid_k_unfold import build_centroid_k_unfold_plan
     from gw.wavefunction_bundle import (
-        PSI_MUN_SPEC, PSI_NMU_SPEC, Wavefunctions)
-    return Wavefunctions(
-        psi_mun=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_MUN_SPEC),
-        psi_nmu=_put(psi, mesh, PSI_NMU_SPEC),
-        enk=_put(enk, mesh, (None, None)),
-        occ=_put(occ, mesh, (None, None)),
-        slices=slices,
-        layout="face",
-    )
+        PSI_MUN_SPEC, PSI_NMU_SPEC, Wavefunctions, ParentGreenCarrier)
+    nk, _, ns, mu = psi.shape
+    kgrid = (nk, 1, 1) if kgrid is None else tuple(kgrid)
+    k = np.asarray(list(np.ndindex(kgrid)), dtype=float) / np.asarray(kgrid)
+    assert len(k) == nk
+    stub = SimpleNamespace(kpoints=k, kgrid=np.asarray(kgrid),
+        shift=np.zeros(3), nkpts=nk, ntran=1,
+        sym_matrices=np.eye(3, dtype=int)[None], translations=np.zeros((1, 3)),
+        avec=np.eye(3), atom_types=np.array([1]), atom_crys=np.zeros((1, 3)),
+        trs_holds=False)
+    sym = SymMaps(stub)
+    points = np.column_stack((np.arange(mu), np.zeros((mu, 2), dtype=int)))
+    grid = np.array([mu, 1, 1])
+    basis = PackedCentroidBasis.build(points, sym, grid, mesh)
+    plan = build_centroid_k_unfold_plan(sym, points, grid, mesh,
+        nspinor=ns, parent_k_frac=k, layout=basis.layout)
+    psi = np.pad(psi, ((0,0), (0,0), (0,0), (0, basis.n_packed-mu)))
+    nmu = _put(psi, mesh, PSI_NMU_SPEC)
+    mun = _put(psi.transpose(0, 2, 3, 1), mesh, PSI_MUN_SPEC)
+    energy, occupation = (_put(x, mesh, (None, None)) for x in (enk, occ))
+    return Wavefunctions(enk=energy, occ=occupation, slices=slices, layout="face",
+        green_parent=ParentGreenCarrier(nmu, mun, energy, occupation, plan))
 
 
 def run_gate(mesh, wfn_path, output_dir):
@@ -418,6 +440,13 @@ def _run_gate(mesh, wfn, output_dir):
             jax.device_put(W_host, packed_sharding),
         )
 
+    from gw.w_isdf import StaticPhotonResponse
+    from gw.qgrid_symmetry import qgrid_trs_policy_for
+    plan = wfns_c.green_parent.plan
+    sym = plan.sym
+    policy = qgrid_trs_policy_for(sym=sym, irr_idx_q=sym.irr_idx_q,
+        sym_idx_q=sym.sym_idx_q, kgrid=(nq, 1, 1),
+        n_sym_spatial=1, context="synthetic identity photon head")
     V_reference, W_reference = base_operators()
     (baseline_x, baseline_sx, baseline_coh, baseline_diagnostics,
      baseline_sigma_diagnostics) = (
@@ -425,9 +454,9 @@ def _run_gate(mesh, wfn, output_dir):
             wfns_charge=wfns_c,
             wfns_transverse=wfns_t,
             Gij=Gij,
-            V_packed=V_reference,
-            W_packed=W_reference,
-            photon_layout=layout,
+            response=StaticPhotonResponse(layout, V_reference, W_reference,
+                "none", "test", qgrid_policy=policy,
+                family_plans=(plan, wfns_t.green_parent.plan)),
             meta=meta,
             mesh_xy=mesh,
             verbose=False,
@@ -460,15 +489,24 @@ def _run_gate(mesh, wfn, output_dir):
             wfns_charge=wfns_c,
             wfns_transverse=wfns_t,
             Gij=Gij,
-            V_packed=V,
-            W_packed=W,
-            photon_layout=layout,
+            response=StaticPhotonResponse(layout, V, W, "none", "test",
+                head_completion=completion, qgrid_policy=policy,
+                family_plans=(plan, wfns_t.green_parent.plan)),
             meta=meta,
             mesh_xy=mesh,
-            head_completion=completion,
             diagnostic_input_basis="dft",
+            head_diagnostics=True,
             verbose=False,
         )
+        off = compute_static_photon_sigma(
+            wfns_charge=wfns_c, wfns_transverse=wfns_t, Gij=Gij,
+            response=StaticPhotonResponse(layout, V, W, "none", "test",
+                head_completion=completion, qgrid_policy=policy,
+                family_plans=(plan, wfns_t.green_parent.plan)),
+            meta=meta, mesh_xy=mesh, verbose=False)
+        assert off[3] is None
+        for on_value, off_value in zip((sig_x, sig_sx, sig_coh), off[:3]):
+            np.testing.assert_array_equal(_gather(on_value), _gather(off_value))
         aggregate = tuple(_gather(x) for x in (sig_x, sig_sx, sig_coh))
         components = _gather(diagnostics.components_tskn_ry)
         sigma_components = _gather(sigma_diagnostics.components_skij_ry)

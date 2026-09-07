@@ -1,43 +1,7 @@
-"""Algebra parity: the exact finite-occupation chi0 family (legacy vs
-face), the census row "Exact finite-occupation response"
-(``gw_config._LOW_MEM_BANDS_REFUSALS``'s
-``low_mem_bands_metal_material_class_unported``) plus the fractional/
-contour chi0 kernel — ``feat/metal-response-face-2026-08-23``.  See
-``docs/architecture/fractional_chi0_response_face.md`` for the full
-derivation this test is gating.
+"""Check finite-occupation response with nondivisible band windows and metallic tails.
 
-Three functions, all layout-dispatched on ``wfns.layout``, all exercised
-here against the SAME synthetic ψ/energy/occupation data (legacy and face
-``Wavefunctions`` bundles are built from the identical underlying
-``psi_rmu_Y``/``psi_rmuT_X`` pair via ``build_wavefunctions``/
-``build_wavefunctions_face``, so any disagreement is the face mechanism,
-not a data mismatch):
-
-* :func:`gw.w_isdf.compute_chi0_static_fractional_gamma` — the exact
-  static q=0 divided-difference body (Part B, ordered-pair kernel, the
-  genuinely new masked-gather + psum mechanism).  Exercised at
-  ``nb_logical < e.shape[1] < nb_full`` — a non-mesh-divisible logical
-  window narrower than BOTH the caller's own energies table AND the face
-  carrier's full band extent, forcing the face path's own zero-pad from
-  ``e.shape[1]`` up to ``nb_full``.
-* :func:`gw.w_isdf.compute_chi0_direct_fractional` — the finite-q,
-  finite-z generalization (same mechanism; a nonzero ``z`` exercises the
-  DYNAMIC weight branch, not the static divided difference), at
-  ``nb_logical < nb_full`` (``e.shape[1] == nb_full`` here, since this
-  function reads ``wfns.enk`` directly).
-* :func:`gw.w_isdf.compute_chi0_contour_fractional` — Part A, the
-  fractional/contour kernel; a substitution of operands onto the existing
-  ``build_G_tau(layout='face', ...)`` mechanism, no new algorithm.
-
-Cases (task-specified coverage): ``ns1``/``ns2`` (the GEMM-seam-adjacent
-axis-order concern for a bispinor-shaped input — though this kernel family
-has no GEMM seam, ns=2 still exercises the einsum's spinor contraction and
-the density-tile axis order), each with a genuinely metallic (MP1,
-fractional, injected near-degenerate pair) occupation table built from
-:func:`gw.efermi.mp1_occupations`/:func:`mp1_negative_derivative`.
-
-    lx run -N 1 -G 4 -n 4 bash tmp/lm_chi0frac_run_wrap.sh \\
-        tests/test_chi0_fractional_face_parity.py --mesh 2x2
+All three responses are compared with independent NumPy band-pair sums.
+The native four-rank CLI exercises the vendor FFT omitted by CPU workers.
 """
 from __future__ import annotations
 
@@ -74,6 +38,49 @@ _NB_LOGICAL_GAMMA = 17     # == e.shape[1] here: the Gamma kernel's full window
 _NB_LOGICAL_DIRECT = 19    # < nb_full=24: exercises the mask with no caller-pad
 
 
+def _direct_pairs(psi_x, psi_y, energies, occupations, surface, rows, z, nb):
+    """Evaluate the literal Kubo sum with its static coincident-energy limit."""
+    import numpy as np
+    out = np.zeros((len(z), len(rows), psi_x.shape[-1], psi_y.shape[-1]), complex)
+    for q, row in enumerate(rows):
+        for k, kmq in enumerate(row):
+            for a in range(nb):
+                for b in range(nb):
+                    de = energies[k, a] - energies[kmq, b]
+                    df = occupations[k, a] - occupations[kmq, b]
+                    dx = np.einsum("sm,sm->m", psi_x[k, a], psi_x[kmq, b].conj())
+                    dy = np.einsum("sn,sn->n", psi_y[k, a], psi_y[kmq, b].conj())
+                    for iz, freq in enumerate(z):
+                        if freq == 0 and de == 0:
+                            weight = -0.5 * (surface[k, a] + surface[kmq, b])
+                        else:
+                            weight = df / (de + freq)
+                        out[iz, q] += weight * np.outer(dx, dy.conj())
+    return out / np.sqrt(len(energies))
+
+
+def _direct_contour(psi_x, psi_y, energies, occupations, times, weights, z, grid):
+    """Sum both oriented band-pair responses directly without Green functions or FFTs."""
+    import numpy as np
+    coords = np.asarray(list(np.ndindex(*grid)))
+    nk = len(coords)
+    A = np.zeros((len(times), nk, psi_x.shape[-1], psi_y.shape[-1]), complex)
+    for q in range(nk):
+        for k in range(nk):
+            kmq = np.ravel_multi_index(tuple((coords[k] - coords[q]) % grid), grid)
+            mx = np.einsum("asm,bsm->abm", psi_x[k], psi_x[kmq].conj())
+            my = np.einsum("asn,bsn->abn", psi_y[k], psi_y[kmq].conj())
+            delta = energies[kmq][None, :] - energies[k][:, None]
+            f = occupations[k][:, None] * (1.0 - occupations[kmq][None, :])
+            for i, time in enumerate(times):
+                A[i, q] += np.einsum("ab,abm,abn->mn",
+                    f * np.exp(-1j * time * delta), mx, my.conj())
+    neg = np.ravel_multi_index(tuple((-coords % grid).T), grid)
+    projection = weights[None, :] * np.exp(1j * z[:, None] * times[None, :])
+    return np.einsum("zt,tqmn->zqmn", projection,
+                     -1j * (A - A[:, neg].conj())) / np.sqrt(nk)
+
+
 def _worker(case_name: str) -> int:
     """Runs in a fresh subprocess (JAX_PLATFORMS=cpu,
     --xla_force_host_platform_device_count=4 set by the caller).  Prints
@@ -84,7 +91,7 @@ def _worker(case_name: str) -> int:
     from jax.sharding import Mesh
 
     from gw.wavefunction_bundle import (
-        BandSlices, build_wavefunctions, build_wavefunctions_face,
+        BandSlices, build_wavefunctions_face,
     )
     from gw.w_isdf import (
         compute_chi0_contour_fractional,
@@ -136,9 +143,9 @@ def _worker(case_name: str) -> int:
     # window is applied -- see docs/architecture/
     # fractional_chi0_response_face.md for the mechanism this exercises.
     enk = rng.uniform(-1.0, 1.0, size=(nk, nb_full))
-    enk[0, 3] = enk[0, 2]
     enk[:, 0:3] = rng.uniform(-50.0, -40.0, size=(nk, 3))       # deep occupied
     enk[:, nb_full - 3:nb_full] = rng.uniform(40.0, 50.0, size=(nk, 3))  # deep empty
+    enk[0, 3:5] = -0.01  # Exact off-diagonal degeneracy survives the deep-tail setup.
     enk_full = jnp.asarray(enk, dtype=jnp.float64)
 
     mu = float(np.median(enk))
@@ -148,9 +155,6 @@ def _worker(case_name: str) -> int:
 
     slices = BandSlices.from_band_edges(0, 0, nb_full // 2, nb_full, nb_full)
 
-    wfns_legacy = build_wavefunctions(
-        psi_rmu_Y, psi_rmuT_X, enk_full=enk_full, slices=slices,
-        mesh_xy=mesh, efermi=None)
     wfns_face = build_wavefunctions_face(
         psi_rmu_Y, psi_rmuT_X, enk_full=enk_full, slices=slices,
         mesh_xy=mesh, efermi=None)
@@ -162,10 +166,10 @@ def _worker(case_name: str) -> int:
     from jax.experimental import multihost_utils as _mhu
 
     def _cmp(a, b):
-        A = np.asarray(_mhu.process_allgather(a, tiled=True))
+        A = a if isinstance(a, np.ndarray) else np.asarray(_mhu.process_allgather(a, tiled=True))
         B = np.asarray(_mhu.process_allgather(b, tiled=True))
         if A.shape != B.shape:
-            return {"error": f"shape mismatch: legacy={A.shape} face={B.shape}"}
+            return {"error": f"shape mismatch: reference={A.shape} face={B.shape}"}
         absdiff = np.abs(A - B)
         ref_scale = float(np.abs(A).max())
         max_abs = float(absdiff.max())
@@ -178,25 +182,27 @@ def _worker(case_name: str) -> int:
     e_narrow = enk_full[:, :_NB_NARROW]
     f_narrow = f_kn[:, :_NB_NARROW]
     s_narrow = surface[:, :_NB_NARROW]
-    gamma_legacy = jax.block_until_ready(compute_chi0_static_fractional_gamma(
-        wfns_legacy, e_narrow, f_narrow, s_narrow, meta, mesh,
-        nb_logical=_NB_LOGICAL_GAMMA))
+    psi_x = np.asarray(psi_rmuT_X).conj().transpose(0, 2, 3, 1)
+    psi_y = np.asarray(psi_rmu_Y)
+    gamma_reference = _direct_pairs(
+        psi_x, psi_y, np.asarray(e_narrow), np.asarray(f_narrow),
+        np.asarray(s_narrow), [np.arange(nk)], [0.0], _NB_LOGICAL_GAMMA)[0]
     gamma_face = jax.block_until_ready(compute_chi0_static_fractional_gamma(
         wfns_face, e_narrow, f_narrow, s_narrow, meta, mesh,
         nb_logical=_NB_LOGICAL_GAMMA))
-    out["gamma"] = _cmp(gamma_legacy, gamma_face)
+    out["gamma"] = _cmp(gamma_reference, gamma_face)
 
     # ---- Part B, finite-q/finite-z: z != 0, exercises the dynamic branch
     kminq_rows = np.stack([
         rng.permutation(nk).astype(np.int32) for _ in range(2)])
     z_direct = np.asarray([0.03 + 0.01j], dtype=np.complex128)
-    direct_legacy = jax.block_until_ready(compute_chi0_direct_fractional(
-        wfns_legacy, z_direct, meta, mesh, occupation_state=occ_state,
-        kminq_rows=kminq_rows, nb_logical=_NB_LOGICAL_DIRECT))
+    direct_reference = _direct_pairs(
+        psi_x, psi_y, np.asarray(enk_full), np.asarray(f_kn), np.asarray(surface),
+        kminq_rows, z_direct, _NB_LOGICAL_DIRECT)[0]
     direct_face = jax.block_until_ready(compute_chi0_direct_fractional(
         wfns_face, z_direct, meta, mesh, occupation_state=occ_state,
         kminq_rows=kminq_rows, nb_logical=_NB_LOGICAL_DIRECT))
-    out["direct"] = _cmp(direct_legacy, direct_face)
+    out["direct"] = _cmp(direct_reference, direct_face)
 
     # ---- Part A, fractional/contour kernel -----------------------------
     # Needs make_flat_k_fftn -> the FFTW3-ABI HOST FFI backend (the SAME
@@ -214,13 +220,14 @@ def _worker(case_name: str) -> int:
         time_nodes = np.asarray([0.1, 0.5, 1.3], dtype=np.float64)
         weight_rows = np.asarray([0.4, 0.3, 0.2], dtype=np.float64)
         z_contour = np.asarray([0.05 + 0.2j], dtype=np.complex128)
-        contour_legacy = jax.block_until_ready(compute_chi0_contour_fractional(
-            wfns_legacy, time_nodes, weight_rows, z_contour, meta, mesh,
-            occupations=f_kn, energy_reference=mu))
+        contour_reference = _direct_contour(
+            np.asarray(psi_rmuT_X).conj().transpose(0, 2, 3, 1),
+            np.asarray(psi_rmu_Y), np.asarray(enk_full), np.asarray(f_kn),
+            time_nodes, weight_rows, z_contour, kgrid)
         contour_face = jax.block_until_ready(compute_chi0_contour_fractional(
             wfns_face, time_nodes, weight_rows, z_contour, meta, mesh,
             occupations=f_kn, energy_reference=mu))
-        out["contour"] = _cmp(contour_legacy, contour_face)
+        out["contour"] = _cmp(contour_reference[0], contour_face)
     except RuntimeError as exc:
         if "FFTW3-ABI host backend is unavailable" not in str(exc):
             raise

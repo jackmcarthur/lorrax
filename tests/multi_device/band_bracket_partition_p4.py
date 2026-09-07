@@ -86,11 +86,14 @@ def main() -> None:
     def put(x, spec):
         return device_put_process_local(x, NamedSharding(mesh, spec))
 
-    psi_xn = put(c(nk, 1, n_mu, nb), P(None, None, 'x', None))
-    psi_yr = put(c(nk, nb, 1, n_mu), P(None, None, None, 'y'))
-    psi_xr = put(c(nk, m, 1, n_mu), P(None, None, None, 'x'))
-    psi_yn = put(c(nk, 1, n_mu, m), P(None, None, 'y', None))
-    E_A = put(np.abs(rng.standard_normal((nk, nb))), P(None, None))
+    from full_photon_head_sigma_gate import _bundle
+    from gw.wavefunction_bundle import BandSlices, parent_sigma_operands, sigma_face_kernel_kwargs
+    psi = c(nk, nb, 1, n_mu)
+    energy = np.abs(rng.standard_normal((nk, nb)))
+    wfns = _bundle(mesh, psi, energy, np.zeros((nk, nb)),
+        BandSlices.from_band_edges(0, 0, 0, m, nb), kgrid=kgrid)
+    psi_xn, psi_yr, psi_xr, psi_yn, E_A, _ = parent_sigma_operands(wfns)
+    face_kwargs = sigma_face_kernel_kwargs(wfns)
     mask_A = jnp.asarray(rng.random((nk, nb)) > 0.3)
     B_q = put(c(nk, n_mu, n_mu), P(None, 'x', 'y'))
     Omega_q = put(np.abs(rng.standard_normal((nk, n_mu, n_mu))) + 0.1,
@@ -124,9 +127,9 @@ def main() -> None:
     # ---- 1 + 3: partition through the shared carrier ---------------------
     with mesh:
         one = get_shared_sigma_tau_kernel(
-            mesh_xy=mesh, kgrid=kgrid, brackets=((0, nb),))(*tau_args)
+            mesh_xy=mesh, kgrid=kgrid, brackets=((0, nb),), **face_kwargs)(*tau_args)
         three = get_shared_sigma_tau_kernel(
-            mesh_xy=mesh, kgrid=kgrid, brackets=brk3)(*tau_args)
+            mesh_xy=mesh, kgrid=kgrid, brackets=brk3, **face_kwargs)(*tau_args)
     spec = tuple(three.sharding.spec)
     if spec != (None, None, 'x', 'y'):
         _fail(f"stacked sigma(tau) sharding is {spec}, expected "
@@ -151,9 +154,9 @@ def main() -> None:
                 jnp.asarray(0.3 - 0.7j, dtype=jnp.complex128), B_q)
     with mesh:
         a = _get_sigma_kij_kernel(mesh_xy=mesh, kgrid=kgrid, merged_x=True,
-                                  brackets=None)(*kij_args)
+                                  brackets=None, **face_kwargs)(*kij_args)
         b = _get_sigma_kij_kernel(mesh_xy=mesh, kgrid=kgrid, merged_x=True,
-                                  brackets=((0, nb),))(*kij_args)
+                                  brackets=((0, nb),), **face_kwargs)(*kij_args)
     for sa, sb in zip(a.addressable_shards, b.addressable_shards):
         ta, tb = np.asarray(sa.data), np.asarray(sb.data)
         if not np.array_equal(ta, tb[0]):

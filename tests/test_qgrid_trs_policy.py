@@ -593,3 +593,24 @@ def test_the_adapter_reads_the_measured_verdict_and_nothing_else():
                 "a caller — an argument here is a way to assume TRS again")
             return
     raise AssertionError("qgrid_trs_policy_for is missing from the adapter")
+
+
+def test_covariance_diagnostic_excludes_unavailable_unused_actions():
+    """The diagnostic reports no nonidentity test when only identity centroids exist."""
+    policy = build_qgrid_trs_policy(
+        trs_measured=True, irr_idx_q=np.array([0]), sym_idx_q=np.array([0]),
+        q_irr_full_idx=np.array([0]), kgrid=(1, 1, 1), n_sym_spatial=2)
+    spatial = np.array([np.eye(3, dtype=int), np.diag([1, 1, -1])])
+    perm = np.array([[0, 1], [-1, -1], [0, 1], [-1, -1]])
+    result = policy.measure_covariance(
+        np.eye(2)[None], q_irr_frac=np.zeros((1, 3)), q_irr_full_idx=np.array([0]),
+        sym_mats_k=np.concatenate([spatial, -spatial]),
+        sym_perm=perm, L_table=np.zeros((4, 2, 3)))
+    assert result['n_ops_sampled'] == 0
+    assert np.isnan(result['max_rel'])
+    with pytest.raises(ValueError, match="requested centroid action is unavailable"):
+        policy.measure_covariance(
+            np.eye(2)[None], q_irr_frac=np.zeros((1, 3)), q_irr_full_idx=np.array([0]),
+            sym_mats_k=np.concatenate([spatial, -spatial]),
+            sym_perm=perm, L_table=np.zeros((4, 2, 3)),
+            active_symmetry_rows=np.array([0, 1]))

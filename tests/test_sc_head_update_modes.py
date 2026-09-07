@@ -310,7 +310,9 @@ def _head_fixture(seed: int):
         nk=nk, nb=nb, na=na, velocity=velocity, energies=energies,
         occupations=occupations, surface=surface,
         wfns_qp=SimpleNamespace(
-            psi_xn=jnp.asarray(psi), psi_yn=jnp.asarray(psi)),
+            layout="face", slices=None, enk=energies, occ=occupations,
+            psi_mun=jnp.asarray(psi),
+            psi_nmu=jnp.asarray(psi.transpose(0, 3, 1, 2))),
         U=U, bvec=bvec,
         omegas=np.asarray([0.31 + 0.05j, 0.77 + 0.05j, 1.4 + 0.05j]),
         wfn=SimpleNamespace(nspin=1),

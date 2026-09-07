@@ -127,6 +127,7 @@ _CUDA_TARGET_SYMBOLS = {
     # k axes leading; the handler contracts the two spin axes and returns the
     # rank-5 tile.  CUDA-only, with the unchanged JAX chain as its fallback.
     "lorrax_cufft_conv_kpair":      "CufftConvKPairCudaFfi",
+    "lorrax_cufft_conv_kparent":    "CufftConvKParentCudaFfi",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",

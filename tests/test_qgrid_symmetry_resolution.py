@@ -92,7 +92,8 @@ def _sym_stub_and_centroids(name):
     frac = np.loadtxt(_deck_file(name))
     idx = (np.rint(frac * fft[None, :]).astype(np.int64)
            % fft[None, :]).astype(np.int32)
-    return types.SimpleNamespace(sym_matrices=S, translations=tnp), idx, fft
+    return types.SimpleNamespace(sym_matrices=S, translations=tnp,
+                                 sym_idx_q=np.arange(2 * n)), idx, fft
 
 
 def _resolve_n_times(name, n, context="unit test"):

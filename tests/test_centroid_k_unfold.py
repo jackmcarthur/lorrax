@@ -10,12 +10,12 @@ import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.grouped_layout import build_square_grouped_shard_layout
+from common.centroid_basis import PackedCentroidBasis
+from gw.gw_init import _prepare_parent_wavefunction_plan
 from gw.centroid_k_unfold import (
     CentroidKUnfoldPlan,
     build_centroid_k_unfold_plan,
-    parent_k_contraction_profitable,
 )
-from gw.gw_init import _resolve_parent_green_admission
 from gw.wavefunction_bundle import (
     BandSlices,
     attach_parent_green_carrier,
@@ -32,6 +32,8 @@ def _mesh_2x2():
 
 
 def _symmetry_fixture():
+    from types import MethodType
+    from symmetry_maps import SymMaps
     identity = np.eye(3, dtype=np.int32)
     swap_xy = np.asarray([[0, 1, 0], [1, 0, 0], [0, 0, 1]],
                          dtype=np.int32)
@@ -42,8 +44,10 @@ def _symmetry_fixture():
             np.eye(nspinor, dtype=np.complex128),
             rows.shape + (nspinor, nspinor)).copy()
 
-    return SimpleNamespace(
+    sym = SimpleNamespace(
+        parent_k_domain="ibz",
         sym_matrices=np.stack([identity, swap_xy]),
+        sym_mats_k=np.stack([identity, swap_xy]),
         translations=np.zeros((2, 3), dtype=np.float64),
         irr_idx_k=np.asarray([0, 0, 1], dtype=np.int32),
         sym_idx_k=np.asarray([0, 1, 0], dtype=np.int32),
@@ -52,62 +56,8 @@ def _symmetry_fixture():
         kirr_fullids=np.asarray([0, 2], dtype=np.int32),
         spinor_action=spinor_action,
     )
-
-
-def test_parent_k_profitability_uses_measured_small_band_envelope():
-    assert parent_k_contraction_profitable(
-        n_full=64, n_parent=8, n_bands=4)
-    assert not parent_k_contraction_profitable(
-        n_full=64, n_parent=8, n_bands=3)
-    assert not parent_k_contraction_profitable(
-        n_full=64, n_parent=40, n_bands=256)
-    assert not parent_k_contraction_profitable(
-        n_full=64, n_parent=64, n_bands=1024)
-
-
-def test_bispinor_parent_k_candidate_falls_back_by_name():
-    """The production admission predicate cannot send current data to charge unfold."""
-    cfg = SimpleNamespace(
-        bispinor=True,
-        memory=SimpleNamespace(low_mem_bands=True),
-        compute_mode=SimpleNamespace(needs_screening=True),
-        screening=SimpleNamespace(diagrams="w_rpa"),
-        qp_solver="one_shot_dft",
-    )
-    meta = SimpleNamespace(nk_tot=64, nspinor=4)
-    wfn = SimpleNamespace(nkpts=8)
-    bands = SimpleNamespace(nb_full=4)
-    records = []
-
-    admitted, work_ok = _resolve_parent_green_admission(
-        cfg, meta, wfn, bands, backend="gpu", print_fn=records.append)
-
-    assert work_ok
-    assert not admitted
-    assert len(records) == 1
-    record = records[0]
-    for required in (
-        "GATE parent_k_green_bispinor_vector_unfold_unimplemented",
-        "bispinor = true",
-        "psi_nk_irr-only",
-        "full-k wavefunction-storage fallback",
-        "scalar charge operators",
-        "current vertices are Cartesian vectors",
-        "k and k-q current endpoints",
-        "q_stencil_orbit_table",
-        "apply_band_matrix_symmetry",
-        "set bispinor = false",
-    ):
-        assert required in record
-
-    cfg.bispinor = False
-    meta.nspinor = 2
-    records.clear()
-    admitted, work_ok = _resolve_parent_green_admission(
-        cfg, meta, wfn, bands, backend="gpu", print_fn=records.append)
-    assert work_ok
-    assert admitted
-    assert records == []
+    sym.operation_rows = MethodType(SymMaps.operation_rows, sym)
+    return sym
 
 
 def test_plan_packs_raw_parent_faces_and_unfolds_their_operator():
@@ -149,6 +99,25 @@ def test_plan_packs_raw_parent_faces_and_unfolds_their_operator():
         expected[child] = np.take(transported, perm, axis=3)
     np.testing.assert_allclose(np.asarray(full_op), expected, rtol=2e-13,
                                atol=2e-13)
+
+
+def test_square_antiunitary_operator_uses_itself_as_transpose_partner():
+    """Square typed transport equals the explicit pair_source=V action on TR rows."""
+    mesh = _mesh_2x2()
+    sym = _symmetry_fixture()
+    sym.sym_idx_k = np.asarray([0, 3, 0], dtype=np.int32)
+    plan = build_centroid_k_unfold_plan(
+        sym, np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]]),
+        (2, 2, 1), mesh, nspinor=2)
+    rng = np.random.default_rng(20260906)
+    shape = (plan.n_parent, 2, plan.n_centroid_packed, 2, plan.n_centroid_packed)
+    op = jax.device_put(rng.normal(size=shape) + 1j * rng.normal(size=shape),
+                       NamedSharding(mesh, P(None, None, 'x', None, 'y')))
+    with mesh:
+        actual = plan.unfold_operator(op)
+        expected = plan.unfold_operator(
+            op, operator_transpose=op.transpose(0, 3, 4, 1, 2))
+    np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-13)
 
 
 def test_parent_scalar_rows_do_not_masquerade_as_parent_wavefunctions():
@@ -197,7 +166,11 @@ def _emulated_flat_k_fftn(mesh, kgrid, spec, *, norm="ortho",
 
 
 def _local_gemm_plan(_mesh, **_kwargs):
-    return lambda a, b: jnp.einsum("qmk,qkn->qmn", a, b, optimize=True)
+    gemm = lambda a, b: jnp.einsum("qmk,qkn->qmn", a, b, optimize=True)
+    gemm.mesh = _mesh
+    gemm.in_sharding_a = NamedSharding(_mesh, P(None, "x", "y"))
+    gemm.in_sharding_b = gemm.in_sharding_a
+    return gemm
 
 
 def test_parent_carrier_matches_full_k_minimax_response(monkeypatch):
@@ -386,3 +359,91 @@ def test_sigma_spatial_cache_owns_plan_and_selects_each_plans_parent_rows(monkey
         None, None, jnp.asarray([10., 20., 30.]), None)), [10., 30.])
     np.testing.assert_array_equal(np.asarray(second.conv_project(
         None, None, jnp.asarray([10., 20., 30.]), None)), [20., 30.])
+
+
+def test_four_spinor_face_vertex_follows_unfold_without_collectives():
+    """Inversion anticommutes with α, so applying a vertex before unfold must fail."""
+    from dataclasses import replace
+    from common.gamma_matrices import gamma_apply, gamma_perm_phase
+    from common.shard_map import shard_map
+
+    mesh = _mesh_2x2()
+    centroids = np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]])
+    plan = build_centroid_k_unfold_plan(
+        _symmetry_fixture(), centroids, (2, 2, 1), mesh, nspinor=4)
+    spin = np.broadcast_to(np.eye(4), (3, 4, 4)).copy().astype(complex)
+    spin[1] = np.diag([1, 1, -1, -1])
+    plan = replace(plan, spin_action_full=spin)
+    rng = np.random.default_rng(92)
+    face = jnp.asarray(plan.layout.axis.pack_host(
+        rng.normal(size=(2, 4, 4, 4)) + 1j * rng.normal(size=(2, 4, 4, 4)), axis=2))
+    spec = P(None, None, 'x', 'y')
+    def body(value):
+        return plan.unfold_face(value, vertex=2, spin_axis=1, mu_axis=2, mesh_axis='x')
+    fn = jax.jit(shard_map(body, mesh=mesh, in_specs=spec, out_specs=spec,
+                          check_vma=False))
+    bare = jax.jit(shard_map(
+        lambda value: plan.unfold_face(value, spin_axis=1, mu_axis=2, mesh_axis='x'),
+        mesh=mesh, in_specs=spec, out_specs=spec, check_vma=False))
+    perm, phase = gamma_perm_phase(2)
+    expected = gamma_apply(bare(face), perm, phase, axis=1)
+    np.testing.assert_allclose(fn(face), expected, atol=1e-14)
+    wrong = bare(gamma_apply(face, perm, phase, axis=1))
+    assert np.max(np.abs(np.asarray(wrong - expected))) > 1
+    hlo = fn.lower(face).compile().as_text().lower()
+    assert 'all-to-all(' not in hlo
+    assert 'all-gather(' not in hlo
+
+
+def test_parent_plan_keeps_the_unreduced_one_band_case():
+    """An unreduced k table uses typed parents even with only one band."""
+    mesh = _mesh_2x2()
+    sym = _symmetry_fixture()
+    sym.sym_matrices = np.eye(3, dtype=np.int32)[None]
+    sym.translations = np.zeros((1, 3))
+    sym.irr_idx_k = np.arange(3, dtype=np.int32)
+    sym.sym_idx_k = np.zeros(3, dtype=np.int32)
+    sym.kirr_fullids = np.arange(3, dtype=np.int32)
+    centroids = np.asarray([[0, 0, 0], [1, 0, 0]], dtype=np.int32)
+    basis = PackedCentroidBasis.build(centroids, sym, (2, 2, 1), mesh)
+    meta = SimpleNamespace(nspinor=4, fft_grid=(2, 2, 1), mu_basis=basis)
+    cfg = SimpleNamespace(compute_mode=SimpleNamespace(needs_screening=True),
+                          screening=SimpleNamespace(diagrams="w_rpa"))
+    wfn = SimpleNamespace(kvecs=lambda *, k: sym.unfolded_kpts)
+    plan, green, storage = _prepare_parent_wavefunction_plan(
+        cfg, meta, wfn, SimpleNamespace(nb_full=1), sym=sym,
+        centroid_indices=centroids, mesh_xy=mesh)
+    assert plan.n_parent == plan.n_full == 3
+    assert green and storage
+    np.testing.assert_array_equal(plan.irr_idx, [0, 1, 2])
+    np.testing.assert_array_equal(plan.spin_action_full,
+                                  np.broadcast_to(np.eye(4), (3, 4, 4)))
+
+
+def test_non_rpa_consumer_refuses_before_parent_loading():
+    """Unported screening cannot retain a hidden full-k wavefunction carrier."""
+    cfg = SimpleNamespace(compute_mode=SimpleNamespace(needs_screening=True),
+                          screening=SimpleNamespace(diagrams="w_bse"))
+    with pytest.raises(ValueError, match="parent_screening_diagrams.*w_bse"):
+        _prepare_parent_wavefunction_plan(
+            cfg, None, None, None, sym=None, centroid_indices=None, mesh_xy=None)
+
+
+def test_parent_plan_requires_only_consumed_canonical_actions():
+    """An unused mirror stays unavailable while canonical TRS row2 remains row2."""
+    mesh = _mesh_2x2()
+    sym = _symmetry_fixture()
+    sym.sym_matrices = np.array([np.eye(3, dtype=int), np.diag([1, 1, -1])])
+    sym.sym_idx_k = np.array([0, 2, 0], dtype=np.int32)
+    centroids = np.array([[0, 0, 0], [1, 0, 1]], dtype=np.int32)
+    basis = PackedCentroidBasis.build(centroids, sym, (4, 4, 4), mesh)
+    plan = build_centroid_k_unfold_plan(
+        sym, centroids, (4, 4, 4), mesh, nspinor=4, layout=basis.layout)
+    assert plan.n_sym_spatial == 2
+    np.testing.assert_array_equal(plan.sym_idx, [0, 2, 0])
+    assert np.all(plan.sym_perm[[1, 3]] == -1)
+    assert np.all(plan.centroid_local_perm[[1, 3]] == -1)
+    sym.sym_idx_k = np.array([0, 3, 0], dtype=np.int32)
+    with pytest.raises(RuntimeError, match="closure"):
+        build_centroid_k_unfold_plan(
+            sym, centroids, (4, 4, 4), mesh, nspinor=4, layout=basis.layout)

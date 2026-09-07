@@ -236,3 +236,22 @@ def test_single_device_mesh_converts_without_collectives():
     op = jnp.einsum('im,in->mn', dev, dev.conj())
     np.testing.assert_array_equal(
         np.asarray(basis.unpack_operator(basis.pack_operator(op))), np.asarray(op))
+
+
+def test_unavailable_actions_survive_packed_orbits_and_padding():
+    """Unavailable rows remain -1 through nontrivial packing and canonical restoration."""
+    from symmetry_maps import centroid_source_map_and_wrap
+    basis = _basis(_mesh_2x2())
+    sym = _sym_swap_xy()
+    perm, wraps = centroid_source_map_and_wrap(
+        basis.canonical_indices, sym.sym_matrices, sym.translations, (4, 4, 1))
+    perm = np.concatenate([perm, -np.ones((1, 7), dtype=np.int32)])
+    wraps = np.concatenate([wraps, np.zeros((1, 7, 3), dtype=np.int8)])
+    packed, packed_wraps = basis.pack_tables(perm, wraps)
+    assert np.all(packed[2] == -1)
+    restored, restored_wraps = basis.unpack_tables(packed, packed_wraps)
+    np.testing.assert_array_equal(restored, perm)
+    np.testing.assert_array_equal(restored_wraps, wraps)
+    packed[2, 0] = 0
+    with pytest.raises(ValueError, match="wholly unavailable"):
+        basis.unpack_tables(packed, packed_wraps)

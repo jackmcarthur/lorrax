@@ -729,3 +729,16 @@ def test_env_is_untouched_by_this_module():
     check is still meaningful when the harness sets the variable itself.
     """
     assert os.environ.get(_LOOKAHEAD_ENV) == _LOOKAHEAD_AT_IMPORT
+
+
+def test_process_local_placement_accepts_traced_factor_slice():
+    """A compiled factor slice is placed on device without NumPy staging."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    mesh = C.single_device_mesh()
+    target = NamedSharding(mesh, P(None, "x"))
+    values = jnp.arange(24, dtype=jnp.float64).reshape(3, 2, 4)
+    compiled = jax.jit(lambda a: C.device_put_process_local(a[1], target))
+    result = compiled(values)
+    np.testing.assert_array_equal(result, np.arange(8, 16).reshape(2, 4))
+    assert result.sharding.is_equivalent_to(target, 2)

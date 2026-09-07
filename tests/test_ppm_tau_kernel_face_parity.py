@@ -1,51 +1,4 @@
-"""Algebra parity: the shared dynamic Sigma_c(tau) kernel
-(``gw.ppm_tau_kernel.get_shared_sigma_tau_kernel``), ``layout='legacy'`` vs
-``layout='face'``, on the SAME synthetic operands, real multi-rank CUDA.
-
-Companion to ``tests/test_isdf_cq_face_parity.py``/``test_isdf_zq_face_
-parity.py`` (feat/dynamic-sigma-face-port-2026-08-22): those gate the ISDF
-fit's own face port; this one gates the dynamic PPM/MPA Sigma pipeline's
-face port (``docs`` register: ``low_mem_bands_dynamic_ppm_unported``).
-Same reason for real multi-process CUDA -- ``layout='face'`` needs a real
-``distrib_la.gemm_plan`` (GUARD 4: cuBLASMp refuses whenever
-``jax.process_count() < mesh.devices.size``) -- and the same CLI-vs-pytest
-dual entry point.
-
-    lx run -N 1 -G 4 -n 4 bash <wrapper.sh> \\
-        tests/test_ppm_tau_kernel_face_parity.py --mesh 2x2
-
-Under plain pytest (one process) every case SKIPS rather than failing --
-it names exactly why (process_count) rather than reporting a silent pass
-(TASTE.md, "a check that cannot fail is not evidence").
-
-What is and is not checked
----------------------------
-This is an ALGEBRA-PARITY test, not a physics test: B_q/Omega_q/E_A/mask_A
-are synthetic random operands with no PPM-fit provenance.  What it proves
-is that ``layout='face'`` computes the SAME sigma^tau(k,m,n) tile the
-established ``layout='legacy'`` body does, given the SAME logical psi and
-the SAME physics operands -- not that either is physically correct PPM
-Sigma_c (that is what the k6_c600 end-to-end leg checks, against a
-BerkeleyGW/legacy-gn_ppm reference).
-
-Five cases cover the matrix the port's own design points name:
-  * ``identity_ns1``/``identity_ns2`` -- the boolean band-identity mask
-    path (``build_G_tau``'s ``mask=`` seam), ns=1 and ns=2 (the GEMM-seam
-    spin-merge order), sigma window == nb_full (mesh-divisible, the
-    trivial/no-pad case).
-  * ``real_weight_ns1_nondivisible`` -- a FLOAT ``band_weight`` (fractional
-    occupation-shaped, not 0/1) through ``build_G_tau``'s ``band_weight=``
-    seam, AND a sigma window that does NOT divide the mesh (nb_sigma=5 on
-    a 2x2 mesh) -- legacy's ``pad_sigma_window``/``strip_sigma_window``
-    round trip vs face's full-nb_full-then-late-slice design (this
-    shared executor's full complex carrier.
-  * ``real_weight_ns2`` -- ns=2 through the float band_weight seam, the
-    single-complex-chain plan.
-  * ``brackets_ns1`` -- a genuine THREE-bracket plan (the band-
-    extrapolation shape), exercising ``_bracketed_face``'s mask-
-    intersection loop for real (not the single-bracket ((0,None),) shape
-    every other case here uses, which is a no-op intersection).
-"""
+"""Compare parent Sigma(tau) against independent NumPy band/q sums on real P4."""
 from __future__ import annotations
 
 import os
@@ -73,7 +26,8 @@ import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
-from gw.ppm_sigma import pad_sigma_window
+from gw.wavefunction_bundle import BandSlices, parent_sigma_operands, sigma_face_kernel_kwargs
+from multi_device.full_photon_head_sigma_gate import _bundle
 
 PX = PY = 2
 
@@ -103,6 +57,15 @@ _CASES = (
         ns=1, nk_tuple=(2, 1, 1), n_rmu=4, nb_full=8, nb_sigma=8,
         weight_kind="bool",
         brackets=((0, 3), (3, 6), (6, None)), seed=5)),
+    ("brackets_ns2", dict(
+        ns=2, nk_tuple=(2, 1, 1), n_rmu=4, nb_full=10, nb_sigma=10,
+        weight_kind="bool", brackets=((0, 3), (3, 7), (7, 10)), seed=202)),
+    ("signed_brackets_ns4_nondivisible", dict(
+        ns=4, nk_tuple=(2, 1, 1), n_rmu=4, nb_full=10, nb_sigma=5,
+        weight_kind="float", brackets=((0, 3), (3, 7), (7, 10)), seed=203)),
+    ("unbracketed_ns4", dict(
+        ns=4, nk_tuple=(2, 1, 1), n_rmu=4, nb_full=8, nb_sigma=5,
+        weight_kind="float", brackets=None, seed=204)),
 )
 
 
@@ -112,7 +75,7 @@ def _to_host(x, mesh):
     return np.asarray(mhu.process_allgather(x, tiled=True))
 
 
-def check_tau_kernel_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
+def check_tau_kernel_parent_dense(mesh, *, ns, nk_tuple, n_rmu, nb_full,
                                  nb_sigma, weight_kind, brackets,
                                  seed):
     p0 = print if jax.process_index() == 0 else (lambda *a, **k: None)
@@ -121,19 +84,12 @@ def check_tau_kernel_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
     kgrid = nk_tuple
     rng = np.random.default_rng(seed)
 
-    # ---- one logical psi, two axis orders (module docstring) ---------
-    # psi_full[k, n(band), s, mu]: the (n,s,mu) order -- IS psi_xr/psi_yr
-    # (legacy) and psi_nmu (face), unchanged.
     psi_full = _crand(rng, nk, nb_full, ns, n_rmu)
-    # (k, s, mu, n) order -- IS psi_xn/psi_yn (legacy) and psi_mun (face).
-    psi_full_T = np.transpose(psi_full, (0, 2, 3, 1))
-
-    # ---- shared, layout-agnostic physics operands ---------------------
     E_A = jnp.asarray(rng.uniform(-1.0, 1.0, size=(nk, nb_full)))
     if weight_kind == "bool":
         sel = jnp.asarray(rng.uniform(size=(nk, nb_full)) > 0.5)
     else:
-        sel = jnp.asarray(rng.uniform(0.0, 1.0, size=(nk, nb_full)))
+        sel = jnp.asarray(rng.uniform(-0.125, 1.125, size=(nk, nb_full)))
     B_q = jnp.asarray(_crand(rng, nk, n_rmu, n_rmu))
     Omega_q = jnp.asarray(
         rng.uniform(0.2, 3.0, size=(nk, n_rmu, n_rmu))
@@ -149,85 +105,48 @@ def check_tau_kernel_face_parity(mesh, *, ns, nk_tuple, n_rmu, nb_full,
     E_ref_B = jnp.asarray(0.0, dtype=jnp.float64)
     t_node = jnp.asarray(0.15 + 0.07j, dtype=jnp.complex128)
 
-    tau_kernel_legacy = get_shared_sigma_tau_kernel(
-        mesh_xy=mesh, kgrid=kgrid, brackets=brackets)
-
-    # ---- legacy operands ----------------------------------------------
-    xn_spec = NamedSharding(mesh, P(None, None, "x", None))
-    yr_spec = NamedSharding(mesh, P(None, None, None, "y"))
-    xr_spec = NamedSharding(mesh, P(None, None, None, "x"))
-    yn_spec = NamedSharding(mesh, P(None, None, "y", None))
-
-    psi_coh_xn_L = jax.device_put(jnp.asarray(psi_full_T), xn_spec)
-    psi_coh_yr_L = jax.device_put(jnp.asarray(psi_full), yr_spec)
-    psi_proj_xr_L0 = jax.device_put(
-        jnp.asarray(psi_full[:, :nb_sigma, :, :]), xr_spec)
-    psi_proj_yn_L0 = jax.device_put(
-        jnp.asarray(psi_full_T[:, :, :, :nb_sigma]), yn_spec)
-    psi_proj_xr_L, psi_proj_yn_L, band_axis = pad_sigma_window(
-        psi_proj_xr_L0, psi_proj_yn_L0, mesh)
-    assert band_axis.logical == nb_sigma
-
-    out_legacy = jax.block_until_ready(tau_kernel_legacy(
-        psi_coh_xn_L, psi_coh_yr_L, psi_proj_xr_L, psi_proj_yn_L,
-        E_A, sel, B_poles, Omega_poles, pole_indices, bounds, phase_real,
-        E_ref_A, E_ref_B, t_node,
-    ))
-
-    # ---- face operands ---------------------------------------------------
-    mun_spec = NamedSharding(mesh, P(None, None, "x", "y"))
-    nmu_spec = NamedSharding(mesh, P(None, "x", None, "y"))
-    psi_mun = jax.device_put(jnp.asarray(psi_full_T), mun_spec)
-    psi_nmu = jax.device_put(jnp.asarray(psi_full), nmu_spec)
-    face_shape = (nk, nb_full, n_rmu, ns)
-
-    # pack_brackets=False: this module gates the MASK bracket loop
-    # specifically (module docstring, ``brackets_ns1``'s own case
-    # comment -- "exercising _bracketed_face's mask-intersection loop for
-    # real").  ``pack_brackets`` now defaults True at the multi-bracket
-    # kernel factory (2026-08-23), which would otherwise silently route
-    # this SAME case through the packed loop instead -- a different
-    # calling convention (tuples, not bare arrays) that this test's own
-    # operands below do not use.  Pin the mask route explicitly rather
-    # than ride whatever the current default happens to be; the packed
-    # route has its own dedicated gate,
-    # tests/test_pack_band_window.py, which cross-checks packed vs mask
-    # vs legacy on the identical three-bracket shape.
-    tau_kernel_face = get_shared_sigma_tau_kernel(
+    slices = BandSlices.from_band_edges(0, 0, 0, nb_sigma, nb_full)
+    wfns = _bundle(mesh, psi_full, np.asarray(E_A), np.zeros((nk, nb_full)), slices)
+    xn, yr, xr, yn, energy, _ = parent_sigma_operands(wfns)
+    kernel = get_shared_sigma_tau_kernel(
         mesh_xy=mesh, kgrid=kgrid, brackets=brackets,
-        layout="face", face_shape=face_shape, pack_brackets=False)
+        **sigma_face_kernel_kwargs(wfns))
+    got = _to_host(kernel(xn, yr, xr, yn, energy, sel,
+        B_poles, Omega_poles, pole_indices, bounds, phase_real,
+        E_ref_A, E_ref_B, t_node), mesh)[..., :nb_sigma, :nb_sigma]
+    reference = _dense_tau(psi_full, np.asarray(E_A), np.asarray(sel),
+        np.asarray(B_poles[0]), np.asarray(Omega_q), complex(t_node),
+        brackets, nb_sigma)
+    assert got.shape == reference.shape
+    error = float(np.max(np.abs(got - reference)))
+    relative = error / max(float(np.max(np.abs(reference))), 1e-300)
+    p0(f"ns={ns} nb_sigma={nb_sigma} brackets={brackets}: "
+       f"NumPy max_abs={error:.16e} max_rel={relative:.16e}")
+    assert relative < 2e-12
 
-    out_face = jax.block_until_ready(tau_kernel_face(
-        psi_mun, psi_nmu, psi_nmu, psi_mun,
-        E_A, sel, B_poles, Omega_poles, pole_indices, bounds, phase_real,
-        E_ref_A, E_ref_B, t_node,
-    ))
 
-    for c, (la, fa) in enumerate(((out_legacy, out_face),)):
-        la_h = _to_host(la, mesh)[..., :nb_sigma, :nb_sigma]
-        fa_h = _to_host(fa, mesh)[..., :nb_sigma, :nb_sigma]
-        assert la_h.shape == fa_h.shape, (
-            f"channel {c}: shape mismatch legacy={la_h.shape} "
-            f"face={fa_h.shape}")
-        absdiff = np.abs(la_h - fa_h)
-        ref_scale = float(np.abs(la_h).max())
-        max_abs = float(absdiff.max())
-        max_rel = max_abs / max(ref_scale, 1e-300)
-        p0(f"  ns={ns} nk={nk} nb_full={nb_full} nb_sigma={nb_sigma} "
-           f"brackets={brackets} channel={c}: "
-           f"max|diff|={max_abs:.3e} (ref scale {ref_scale:.3e}) "
-           f"max|rel diff|={max_rel:.3e}")
-        # Engine-parity bar (this repo's convention, same as
-        # test_isdf_cq_face_parity's): relative, never bit-exact -- a
-        # SUMMA-distributed cuBLASMp GEMM and a shard_map/psum_scatter
-        # chain sum in different orders.
-        assert max_rel < 1e-9, (
-            f"tau kernel layout='face' vs 'legacy' parity FAILED "
-            f"(channel {c}): max relative diff {max_rel:.3e}")
+def _dense_tau(psi, energy, selector, residue, pole, t, brackets, nb_sigma):
+    """Sum intermediate bands and momentum transfers with the literal negative GW convolution."""
+    nk, nb, ns, mu = psi.shape
+    weights = selector * np.exp(-1j * energy * t)
+    W = residue * np.exp(-1j * pole * t)
+    outputs = []
+    for lo, hi in (((0, nb),) if brackets is None else brackets):
+        mask = (np.arange(nb) >= lo) & (np.arange(nb) < (nb if hi is None else hi))
+        green = np.einsum("kb,kbsm,kbtn->ksmtn", weights * mask, psi, psi.conj())
+        out = np.zeros((nk, nb_sigma, nb_sigma), complex)
+        for k in range(nk):
+            sigma = np.zeros((ns, mu, ns, mu), complex)
+            for q in range(nk):
+                sigma -= green[(k-q) % nk] * W[q][None, :, None, :] / nk
+            out[k] = np.einsum("asm,smtn,btn->ab",
+                psi[k, :nb_sigma].conj(), sigma, psi[k, :nb_sigma])
+        outputs.append(out)
+    return outputs[0] if brackets is None else np.stack(outputs)
 
 
 @pytest.mark.parametrize("name,kwargs", _CASES, ids=[c[0] for c in _CASES])
-def test_tau_kernel_face_matches_legacy(name, kwargs):
+def test_tau_kernel_parent_matches_dense(name, kwargs):
     if jax.process_count() < PX * PY:
         pytest.skip(
             f"needs {PX * PY} REAL processes for gemm_plan's cuBLASMp "
@@ -235,7 +154,7 @@ def test_tau_kernel_face_matches_legacy(name, kwargs):
             f"`lx run -N 1 -G 4 -n 4 ... {__file__} --mesh 2x2` for the "
             f"real check (see this module's docstring)")
     mesh = Mesh(np.asarray(jax.devices()).reshape(PX, PY), ("x", "y"))
-    check_tau_kernel_face_parity(mesh, **kwargs)
+    check_tau_kernel_parent_dense(mesh, **kwargs)
 
 
 def _cli_main():
@@ -254,7 +173,7 @@ def _cli_main():
     failures = 0
     for name, kwargs in _CASES:
         try:
-            check_tau_kernel_face_parity(mesh, **kwargs)
+            check_tau_kernel_parent_dense(mesh, **kwargs)
             p0(f"PASS {name}")
         except AssertionError as exc:
             failures += 1

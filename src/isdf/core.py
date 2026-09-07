@@ -1,14 +1,4 @@
-"""ISDF core primitives: ψ + centroids -> ζ interpolation vectors.
-
-Neutral array-in / array-out core of the ISDF fit — the composable phases
-``c_q_from_psi_sm`` -> ``factor_c_q`` -> ``fit_one_rchunk`` (which fuses
-``z_q_from_psi_sm`` + ``solve_zeta``) plus the q=0 Gram building blocks used
-by centroid selection.  Depends only on ``common/`` (Meta, timing,
-gamma_matrices, fft_helpers, wfn_transforms, psi_G_store) and on the
-``distrib_la`` service door (every distributed factor and solve, including
-the 2-D blocked Cholesky, which is its ``native2d`` backend).  NO ``gw`` /
-LorraxConfig / h5 / V_q packaging lives here — GW and BSE are consumers.
-"""
+"""ISDF core primitives: ψ + centroids -> ζ interpolation vectors; see docs/architecture/zeta_fit_face_psi_cct.md."""
 import math
 import os
 import time
@@ -71,14 +61,7 @@ from distrib_la import (                                            # noqa: E402
 
 
 def host_rss_gb() -> float:
-    """This process's resident set size in GB, from ``/proc/self/status``.
-
-    The CPU backend returns ``None`` from ``device.memory_stats()``, so
-    on a CPU mesh the ONLY faithful per-rank memory observable is the
-    kernel's own RSS accounting.  Cheap (one small read, no JAX calls) —
-    safe to sample inside the r-chunk loop.  Returns -1.0 where
-    ``/proc`` is unavailable.
-    """
+    """This process's resident set size in GB, from ``/proc/self/status``; see docs/architecture/zeta_fit_face_psi_cct.md."""
     try:
         with open("/proc/self/status", "r") as fh:
             for line in fh:
@@ -132,18 +115,7 @@ def _ordered_pair_normal_equations(normal_eq, q_neg_idx):
 
 
 def complete_ordered_pair_normal_equations(normal_eq, q_neg_idx):
-	"""Complete an LR normal equation to the conjugation-closed LR+RL set.
-
-	For a Hermitian charge vertex, relabelling ``(n,m,k)`` gives exactly
-
-	``N_RL(q) = conj(N_LR(-q))``
-
-	for both the CCT metric and every ZCT right-hand-side chunk.  Therefore
-	this one operation is the normal equation of the concatenated ordered
-	pair training domain; it is not a projection of fitted zeta, V, or W.
-	The q permutation is supplied by the symmetry service so this neutral
-	ISDF layer does not own a second q-grid convention.
-	"""
+	"""Complete an LR normal equation to the conjugation-closed LR+RL set; see docs/architecture/zeta_fit_face_psi_cct.md."""
 	if getattr(normal_eq, "ndim", 0) < 1:
 		raise ValueError(
 			"complete_ordered_pair_normal_equations: normal_eq must have a "
@@ -164,13 +136,7 @@ def complete_ordered_pair_normal_equations(normal_eq, q_neg_idx):
 
 
 def _conv_kpair_static_gamma(gamma, ns: int):
-	"""Host-stable monomial data for the conv_kpair attribute ABI.
-
-	The existing XLA arm keeps gamma arrays as runtime operands.  The FFI ABI
-	uses attributes because every channel's monomial is invariant across the
-	whole compiled C/Z kernel; including the values in the caller cache key
-	prevents one Lorentz channel from reusing another's executable.
-	"""
+	"""Host-stable monomial data for the conv_kpair attribute ABI; see docs/architecture/zeta_fit_face_psi_cct.md."""
 	if gamma is None:
 		return (np.arange(ns, dtype=np.int64),
 		        np.ones(ns, dtype=np.complex128))
@@ -198,6 +164,44 @@ def _conv_kpair_setup(mesh_xy, kgrid, ns, trailing_shape, gamma_L, gamma_R):
 	return arm, reason, kernel, gamma_key
 
 
+def _parent_conv_tables(plan, right_perm, right_wraps, mu_loc, nu_loc):
+	"""Slice the plan's typed tables for the native parent-load convolution on this rank."""
+	from symmetry_maps import open_spin_block_coefficient
+	x = jax.lax.axis_index('x') * mu_loc
+	y = jax.lax.axis_index('y') * nu_loc
+	def local(table, start, width, dtype):
+		return jax.lax.dynamic_slice_in_dim(jnp.asarray(table, dtype), start, width, axis=1)
+	ns = int(plan.nspinor)
+	coef = jnp.stack([open_spin_block_coefficient(plan.spin_action_full, a, b)
+	                 for a in range(ns) for b in range(ns)], axis=1)
+	return (jnp.asarray(plan.irr_idx, jnp.int32),
+	        jnp.asarray(plan.sym_idx, jnp.int32),
+	        local(plan.centroid_local_perm, x, mu_loc, jnp.int32),
+	        local(right_perm, y, nu_loc, jnp.int32),
+	        local(plan.L_table, x, mu_loc, jnp.float64),
+	        local(right_wraps, y, nu_loc, jnp.float64),
+	        jnp.asarray(plan.k_parent_frac, jnp.float64),
+	        jnp.asarray(np.asarray(plan.sym_idx) >= plan.n_sym_spatial, jnp.int32),
+	        coef.reshape(plan.n_full, ns*ns, ns*ns),
+	        coef.reshape(plan.n_full, ns*ns, ns*ns))
+
+
+def _parent_conv_vertices(tables, vertex_l, vertex_r):
+	"""Fold the post-unfold monomial into the right coefficient before the final conjugate."""
+	perm_l, phase_l = vertex_l
+	perm_r, phase_r = vertex_r
+	if perm_l is None and perm_r is None:
+		return tables
+	ns = math.isqrt(tables[-1].shape[1])
+	if perm_l is None:
+		perm_l, phase_l = jnp.arange(ns), jnp.ones(ns)
+	if perm_r is None:
+		perm_r, phase_r = jnp.arange(ns), jnp.ones(ns)
+	pairs = (perm_l[:, None] * ns + perm_r[None, :]).reshape(-1)
+	phase = (phase_l[:, None] * phase_r[None, :]).reshape(-1)
+	return (*tables[:-1], tables[-1][:, pairs, :] * jnp.conj(phase)[None, :, None])
+
+
 def _pair_density_kernel(
 	mesh_xy: Mesh,
 	nk: int,
@@ -207,7 +211,7 @@ def _pair_density_kernel(
 	n_col: int,
 ):
 	"""Return the one cached executable factory used by run and planning."""
-	cache_key = ('pair_density', id(mesh_xy), nk, n_rmu, nb, ns, n_col)
+	cache_key = ('pair_density', _mesh_key(mesh_xy), nk, n_rmu, nb, ns, n_col)
 
 	if cache_key not in _pair_density_cache:
 		x1_4 = NamedSharding(mesh_xy, P(None, 'x', None, None))
@@ -229,20 +233,7 @@ def pair_density(
 	psi_rcol_Y: jax.Array,
 	mesh_xy: Mesh,
 ) -> jax.Array:
-	"""Open-spin pair density P_k,ab(μ, col) = Σ_n ψ*_{n,k,a}(μ) ψ_{n,k,b}(col).
-
-	Spin axes (a,b) are kept open; γ̃ is applied downstream at the C_q
-	or Z_q post-IFFT reduction step.
-
-	Inputs:
-	    psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None)
-	    psi_rcol_Y: (nk, nb, ns, n_col) with P(None, None, None, 'y')
-
-	Output:
-	    P_k_ab: (nk, ns, ns, n_rmu, n_col) with P(None, None, None, 'x', 'y')
-
-	einsum: ``'kmna,knbr->kabmr'``.
-	"""
+	"""Open-spin pair density P_k,ab(μ, col) = Σ_n ψ*_{n,k,a}(μ) ψ_{n,k,b}(col); see docs/architecture/zeta_fit_face_psi_cct.md."""
 	nk, n_rmu, nb, ns = psi_rmuT_X.shape
 	_, _, _, n_col = psi_rcol_Y.shape
 	return _pair_density_kernel(
@@ -260,14 +251,7 @@ def pair_density_aot_peak_bytes(
 	n_col: int,
 	dtype=jnp.complex128,
 ) -> int:
-	"""Per-rank compiled peak for the canonical :func:`pair_density`.
-
-	This is a planning view of the SAME cached JIT production calls.  It does
-	not carry a modelling-only einsum: shapes and shardings are passed to the
-	canonical factory above, then the shared AOT memory service reads XLA's
-	buffer assignment.  There is no FFT in this kernel, so the service's
-	cuFFT-workspace term is exactly zero.
-	"""
+	"""Per-rank compiled peak for the canonical :func:`pair_density`; see docs/architecture/zeta_fit_face_psi_cct.md."""
 	x_sh = NamedSharding(mesh_xy, P(None, 'x', None, None))
 	y_sh = NamedSharding(mesh_xy, P(None, None, None, 'y'))
 	x = jax.ShapeDtypeStruct(
@@ -374,7 +358,7 @@ def _gram_q0_kernel(
 	transverse_feature_sum: bool = False,
 ):
 	"""Return the one cached q=0 executable used by run and planning."""
-	cache_key = ('gram_q0_from_pair', id(mesh_xy), nk, ns1, ns2, n_rmu,
+	cache_key = ('gram_q0_from_pair', _mesh_key(mesh_xy), nk, ns1, ns2, n_rmu,
 	             n_col, lhs_id, rhs_id, symmetrize,
 	             transverse_feature_sum)
 
@@ -415,42 +399,7 @@ def gram_q0_from_pair(
 	mesh_xy: Mesh,
 	symmetrize: bool = True,
 ) -> jax.Array:
-	"""q=0 valence-conduction pair-product Gram from open-spin pair densities.
-
-	``symmetrize=False`` skips the final Hermitian symmetrization (which
-	requires a SQUARE G) — used by the tiled Gram build in
-	:mod:`centroid.pivoted_cholesky`, which assembles rectangular edge tiles
-	and applies the identical 0.5·(G+G^H) once on the full matrix.
-
-	Mathematically (q=0 special case of the CCT-over-k structure):
-
-	    G(μ,ν) = Σ_k w_k · [Σ_{αβα'β'} γ̃^{μ_L}_{αα'} γ̃^{ν_L}_{ββ'}
-	                          · P_v_{αβ}(μ,ν;k)*  · P_c_{α'β'}(μ,ν;k)]
-
-	γ̃ identity short-circuit: pass ``gamma_L=None`` (and/or
-	``gamma_R=None``) for charge / left-only / right-only sides.
-	Both None → Σ_{αβ} P_v* · P_c, the historical pivoted-Cholesky
-	candidate Gram in open-spin form.  γ̃^μ is monomial — each non-
-	identity contraction is one ``jnp.take`` + element-wise phase
-	multiply, not a 4×4 matmul.
-
-	Used by :mod:`centroid.pivoted_cholesky`.
-
-	Args:
-		P_v_k: (nk, ns, ns, n_rows, n_cols) complex, valence open-spin pair
-			density (output of :func:`pair_density` on the valence band
-			window), sharded ``P(None, None, None, 'x', 'y')``.
-		P_c_k: (nk, ns, ns, n_rows, n_cols) complex, conduction window,
-			same layout.
-		k_weights: (nk,) real, k-point weights (IBZ weights summing to 1,
-			or 1/nk_tot for each full-BZ k-point).
-		gamma_L, gamma_R: ``(perm, phase)`` tuples or ``None`` (=identity).
-		mesh_xy: ('x','y') device mesh, same as the pair densities.
-
-	Returns:
-		G: (n_rows, n_cols) complex, sharded ``P('x','y')``. Hermitian PSD
-			when square and ``symmetrize=True``.
-	"""
+	"""q=0 valence-conduction pair-product Gram from open-spin pair densities; see docs/architecture/zeta_fit_face_psi_cct.md."""
 	nk, ns1, ns2, n_rmu, n_col = P_v_k.shape
 	lhs_id = gamma_L is None
 	rhs_id = gamma_R is None
@@ -481,22 +430,7 @@ def transverse_gram_q0_from_pair(
 	mesh_xy: Mesh,
 	symmetrize: bool = True,
 ) -> jax.Array:
-	"""PSD q=0 Gram of the three stacked transverse transition features.
-
-	For ``Z_i(a,mn,k) = <psi^R_m(a)|gamma_i|psi^L_n(a)>`` this computes
-
-	``G_perp(a,b) = sum_{i=1}^3 sum_{nmk} w_k Z_i(a,mn,k) conj(Z_i(b,mn,k))``.
-
-	Since every transverse gamma is Hermitian, this ``Z_i`` is the conjugate
-	of ``<psi^L|gamma_i|psi^R>``; the pair-density factorisation therefore
-	uses ``gamma_i^*`` on its first endpoint and ``gamma_i`` on its second.
-	Components have equal weight and are never normalised separately, so an
-	orthogonal rotation among the three Cartesian current components leaves
-	the Gram invariant.  The computation
-	reuses :func:`gamma_double_contract` and scans one component at a time;
-	neither band-pair features nor a three-component pair-density stack is
-	materialised.
-	"""
+	"""PSD q=0 Gram of the three stacked transverse transition features; see docs/architecture/zeta_fit_face_psi_cct.md."""
 	nk, ns1, ns2, n_rmu, n_col = P_l_k.shape
 	if int(ns1) != 4 or int(ns2) != 4:
 		raise ValueError(
@@ -529,7 +463,7 @@ def _gram_q0_from_psi_kernel(
 	"""Return the fused pair-density + q=0 normal-matrix executable."""
 	transverse = gamma_mode == "transverse"
 	cache_key = (
-		'gram_q0_from_psi_sm', id(mesh_xy), nk, n_rows, n_cols,
+		'gram_q0_from_psi_sm', _mesh_key(mesh_xy), nk, n_rows, n_cols,
 		nb_l, nb_r, nspinor, gamma_mode, symmetrize,
 	)
 	if cache_key not in _isdf_pipeline_cache:
@@ -579,43 +513,34 @@ def _gram_q0_from_psi_kernel(
 	return _isdf_pipeline_cache[cache_key]
 
 
-def gram_q0_from_psi_sm(
-	psi_l_X: jax.Array,
-	psi_l_Y: jax.Array,
-	psi_r_X: jax.Array,
-	psi_r_Y: jax.Array,
-	k_weights: jax.Array,
-	*,
-	mesh_xy: Mesh,
-	gamma_mode: str = "charge",
-	symmetrize: bool = True,
-) -> jax.Array:
-	"""Fused candidate Gram from two left/right centroid-WFN faces.
-
-	Inputs use the same single-axis face convention as
-	:func:`c_q_from_psi_sm`'s legacy route.  The two band contractions and
-	the q=0 normal-matrix fold are one compiled program, so their rank-5
-	pair densities are compiler-internal temporaries rather than committed
-	outputs of separate dispatches.
-
-	``gamma_mode='charge'`` computes the scalar q=0 CCT normal matrix.
-	``gamma_mode='transverse'`` requires four-component bispinors and computes
-	the PSD sum ``sum_i Z_i Z_i^H`` used by centroid selection; it is not the
-	individual indefinite transverse ``C_q^i`` used by the zeta solve.
-	"""
+def _gram_gamma_mode(gamma_mode):
+	"""Return the canonical charge or transverse Gram channel."""
 	mode = str(gamma_mode).strip().lower()
 	if mode not in ("charge", "transverse"):
 		raise ValueError(
 			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
-	if any(arr.ndim != 4 for arr in
-	       (psi_l_X, psi_l_Y, psi_r_X, psi_r_Y)):
-		raise ValueError("gram_q0_from_psi_sm requires four rank-4 WFN faces")
+	return mode
+
+
+def _gram_planning_gamma_mode(gamma_mode, nspinor):
+	"""Return a Gram channel supported by the planned spin extent."""
+	mode = _gram_gamma_mode(gamma_mode)
+	if mode == "transverse" and int(nspinor) != 4:
+		raise ValueError(
+			"transverse Gram planning requires nspinor=4; got "
+			f"{int(nspinor)}")
+	return mode
+
+
+def _validate_gram_face_shapes(
+	psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights, mode, n_cols,
+):
+	"""Return the compatible Gram face extents after checking both endpoints."""
 	nk, n_rows, nb_l, ns = (int(v) for v in psi_l_X.shape)
-	if tuple(int(v) for v in psi_l_Y.shape[:3]) != (nk, nb_l, ns):
+	if tuple(int(v) for v in psi_l_Y.shape) != (nk, nb_l, ns, n_cols):
 		raise ValueError(
 			"left WFN faces disagree: "
 			f"X={psi_l_X.shape}, Y={psi_l_Y.shape}")
-	n_cols = int(psi_l_Y.shape[3])
 	if (int(psi_r_X.shape[0]) != nk or int(psi_r_X.shape[1]) != n_rows
 	        or int(psi_r_X.shape[3]) != ns):
 		raise ValueError(
@@ -633,6 +558,28 @@ def gram_q0_from_psi_sm(
 		raise ValueError(
 			"gamma_mode='transverse' requires four-component bispinors; "
 			f"got nspinor={ns}")
+	return nk, n_rows, nb_l, ns, nb_r
+
+
+def gram_q0_from_psi_sm(
+	psi_l_X: jax.Array,
+	psi_l_Y: jax.Array,
+	psi_r_X: jax.Array,
+	psi_r_Y: jax.Array,
+	k_weights: jax.Array,
+	*,
+	mesh_xy: Mesh,
+	gamma_mode: str = "charge",
+	symmetrize: bool = True,
+) -> jax.Array:
+	"""Fused candidate Gram from two left/right centroid-WFN faces; see docs/architecture/zeta_fit_face_psi_cct.md."""
+	mode = _gram_gamma_mode(gamma_mode)
+	if any(arr.ndim != 4 for arr in
+	       (psi_l_X, psi_l_Y, psi_r_X, psi_r_Y)):
+		raise ValueError("gram_q0_from_psi_sm requires four rank-4 WFN faces")
+	n_cols = int(psi_l_Y.shape[3])
+	nk, n_rows, nb_l, ns, nb_r = _validate_gram_face_shapes(
+		psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights, mode, n_cols)
 	if mode == "transverse":
 		perm = _gammas_perm
 		phase = _gammas_phase
@@ -657,15 +604,7 @@ def _gram_q0_tiled_from_psi_kernel(
 	*,
 	gamma_mode: str,
 ):
-	"""Return one donated executable for a complete tiled q=0 Gram build.
-
-	The manual shard-map body owns each rank's complete WFN faces and local
-	``P('x','y')`` Gram shard.  Its scan walks the caller's fixed square-tile
-	schedule in column-major order, matching the historical Python loop.  Thus
-	the four face slices, two pair densities, Gram fold and local insertion are
-	compiler-internal to one dispatch; only the full WFN faces and the donated
-	Gram persist across tiles.
-	"""
+	"""Return one donated executable for a complete tiled q=0 Gram build; see docs/architecture/zeta_fit_face_psi_cct.md."""
 	transverse = gamma_mode == "transverse"
 	n_x = int(mesh_xy.shape['x'])
 	n_y = int(mesh_xy.shape['y'])
@@ -680,7 +619,7 @@ def _gram_q0_tiled_from_psi_kernel(
 	col_tail = local_cols - (n_col_tiles - 1) * local_tile_cols
 	has_tail = (row_tail != local_tile_rows or col_tail != local_tile_cols)
 	cache_key = (
-		'gram_q0_tiled_from_psi_sm', id(mesh_xy), nk, n_points,
+		'gram_q0_tiled_from_psi_sm', _mesh_key(mesh_xy), nk, n_points,
 		nb_l, nb_r, nspinor, tile_width, gamma_mode,
 	)
 	if cache_key not in _isdf_pipeline_cache:
@@ -814,26 +753,8 @@ def gram_q0_tiled_from_psi_sm(
 	tile_width: int,
 	gamma_mode: str = "charge",
 ) -> jax.Array:
-	"""Assemble every q=0 candidate-Gram tile in one donated executable.
-
-	This is the blocked counterpart of :func:`gram_q0_from_psi_sm`.  ``G_xy``
-	is a square destination sharded ``P('x','y')`` and is donated.  The WFN
-	faces keep their full candidate extent and their canonical X/Y layouts;
-	each scan step slices only the already-owned local shards.  The final
-	Hermitian fold remains the caller's operation, exactly as in the historical
-	blocked schedule.
-
-	``tile_width`` is the existing global square-tile width, not a tuning
-	choice made here.  It must divide both mesh axes.  Tail tiles are padded
-	with exact zeros locally; the final partial row and column are trimmed to
-	their static in-range shapes before the contiguous destination update.
-	The transverse route calls the unchanged three-component scan in
-	:func:`_gram_q0_fold_local`, preserving its component and reduction order.
-	"""
-	mode = str(gamma_mode).strip().lower()
-	if mode not in ("charge", "transverse"):
-		raise ValueError(
-			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
+	"""Assemble every q=0 candidate-Gram tile in one donated executable; see docs/architecture/zeta_fit_face_psi_cct.md."""
+	mode = _gram_gamma_mode(gamma_mode)
 	if any(arr.ndim != 4 for arr in
 	       (psi_l_X, psi_l_Y, psi_r_X, psi_r_Y)):
 		raise ValueError(
@@ -847,28 +768,8 @@ def gram_q0_tiled_from_psi_sm(
 		raise ValueError(
 			"Gram destination and WFN point extents disagree: "
 			f"G={G_xy.shape}, psi_l_X={psi_l_X.shape}")
-	if tuple(int(v) for v in psi_l_Y.shape) != (nk, nb_l, ns, n_points):
-		raise ValueError(
-			"left WFN faces disagree: "
-			f"X={psi_l_X.shape}, Y={psi_l_Y.shape}")
-	if (int(psi_r_X.shape[0]) != nk
-	        or int(psi_r_X.shape[1]) != n_points
-	        or int(psi_r_X.shape[3]) != ns):
-		raise ValueError(
-			"right X face disagrees with left X face: "
-			f"left={psi_l_X.shape}, right={psi_r_X.shape}")
-	nb_r = int(psi_r_X.shape[2])
-	if tuple(int(v) for v in psi_r_Y.shape) != (nk, nb_r, ns, n_points):
-		raise ValueError(
-			"right WFN faces disagree: "
-			f"X={psi_r_X.shape}, Y={psi_r_Y.shape}")
-	if tuple(int(v) for v in k_weights.shape) != (nk,):
-		raise ValueError(
-			f"k_weights must have shape ({nk},); got {k_weights.shape}")
-	if mode == "transverse" and ns != 4:
-		raise ValueError(
-			"gamma_mode='transverse' requires four-component bispinors; "
-			f"got nspinor={ns}")
+	nk, n_points, nb_l, ns, nb_r = _validate_gram_face_shapes(
+		psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights, mode, n_points)
 	width = int(tile_width)
 	if width <= 0:
 		raise ValueError(f"tile_width must be positive; got {width}")
@@ -904,22 +805,8 @@ def gram_q0_tiled_from_psi_aot_resident_increment_bytes(
 	dtype=jnp.complex128,
 	gamma_mode: str = "charge",
 ) -> int:
-	"""Compiled bytes above the already-resident WFN faces and donated G.
-
-	This lowers the exact production scan executable.  The caller's live-set
-	model already counts all arguments (the four complete WFN faces and the
-	local ``P('x','y')`` destination), so ``resident_increment`` is the relevant
-	compiler fact: temporary bytes plus any non-aliased output bytes.  Donation
-	should make the latter zero; the focused P=4 HLO gate asserts the alias.
-	"""
-	mode = str(gamma_mode).strip().lower()
-	if mode not in ("charge", "transverse"):
-		raise ValueError(
-			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
-	if mode == "transverse" and int(nspinor) != 4:
-		raise ValueError(
-			"transverse Gram planning requires nspinor=4; got "
-			f"{int(nspinor)}")
+	"""Compiled bytes above the already-resident WFN faces and donated G; see docs/architecture/zeta_fit_face_psi_cct.md."""
+	mode = _gram_planning_gamma_mode(gamma_mode, nspinor)
 	width = int(tile_width)
 	if int(n_points) <= 0 or width <= 0:
 		raise ValueError(
@@ -980,14 +867,7 @@ def gram_q0_from_psi_aot_peak_bytes(
 	symmetrize: bool = False,
 ) -> int:
 	"""Per-rank compiled peak of :func:`gram_q0_from_psi_sm`."""
-	mode = str(gamma_mode).strip().lower()
-	if mode not in ("charge", "transverse"):
-		raise ValueError(
-			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
-	if mode == "transverse" and int(nspinor) != 4:
-		raise ValueError(
-			"transverse Gram planning requires nspinor=4; got "
-			f"{int(nspinor)}")
+	mode = _gram_planning_gamma_mode(gamma_mode, nspinor)
 	x_sh = NamedSharding(mesh_xy, P(None, 'x', None, None))
 	y_sh = NamedSharding(mesh_xy, P(None, None, None, 'y'))
 	rep = NamedSharding(mesh_xy, P())
@@ -1027,14 +907,7 @@ def gram_q0_aot_peak_bytes(
 	gamma_mode: str = "charge",
 ) -> int:
 	"""Per-rank compiled peak for the canonical q=0 candidate tile fold."""
-	mode = str(gamma_mode).strip().lower()
-	if mode not in ("charge", "transverse"):
-		raise ValueError(
-			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
-	if mode == "transverse" and int(nspinor) != 4:
-		raise ValueError(
-			"transverse Gram planning requires nspinor=4; got "
-			f"{int(nspinor)}")
+	mode = _gram_planning_gamma_mode(gamma_mode, nspinor)
 	pair_sh = NamedSharding(
 		mesh_xy, P(None, None, None, 'x', 'y'),
 	)
@@ -1083,103 +956,10 @@ def gram_q0_aot_peak_bytes(
 # ============================================================================
 
 
-def c_q_from_psi_sm(
-	psi_l_X: jax.Array | None = None,
-	psi_l_Y: jax.Array | None = None,
-	psi_r_X: jax.Array | None = None,
-	psi_r_Y: jax.Array | None = None,
-	gamma_L: tuple[jax.Array, jax.Array] | None = None,
-	gamma_R: tuple[jax.Array, jax.Array] | None = None,
-	*,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-	layout: str = "legacy",
-	psi_mun: jax.Array | None = None,
-	psi_nmu: jax.Array | None = None,
-	weight_l: jax.Array | None = None,
-	weight_r: jax.Array | None = None,
-	gemm=None,
-	k_unfold_plan=None,
-) -> jax.Array:
-	"""C_q, the ζ fit's CCT Gram (band contraction + IFFT/γ̃/FFT over k).
-
-	``layout='legacy'`` (default, ``low_mem_bands=False``) — UNCHANGED
-	body: psi is single-axis-sharded, the band contraction is a rank-local
-	einsum (bands replicated per rank), and everything (pair density +
-	IFFT + γ̃·γ̃ + FFT) runs fused inside one Manual-mode shard_map.
-
-	    psi_l_X, psi_r_X : (nk, n_rmu, nb, ns) sharded ``P(None, 'x', None, None)``
-	    psi_l_Y, psi_r_Y : (nk, nb, ns, n_col) sharded ``P(None, None, None, 'y')``
-	    gamma_L, gamma_R : ``(perm, phase)`` tuples or ``None`` (= γ̃^0 = I).
-
-	``layout='face'`` (``low_mem_bands=True``) — the band-contraction axis
-	is mesh-sharded on BOTH faces (``gw.wavefunction_bundle``'s
-	``psi_mun``/``psi_nmu``, both un-conjugated, both spanning the fit's
-	FULL loaded band range), so the contraction is a genuinely distributed
-	SUMMA GEMM (``distrib_la.gemm_plan``) rather than a local einsum — see
-	``gw.isdf_fitting.fit_zeta_to_h5`` and
-	``docs/architecture/zeta_fit_face_psi_cct.md``.  The bispinor
-	transverse channel (``gamma_L``/``gamma_R`` not ``None``) IS supported
-	here (2026-08-23, ``feat/transverse-zeta-face-2026-08-23``): the γ̃
-	vertex is folded into the appropriate psi ENDPOINT
-	(``psi_mun``/``psi_nmu``, mirroring ``gw.wavefunction_bundle.
-	with_lorentz_vertices``'s field/axis table) before the band GEMM
-	rather than at ``_c_q_legacy``'s post-IFFT ``gamma_double_contract``
-	step — see ``docs/architecture/zeta_fit_face_psi_cct.md``'s vertex
-	section for the derivation and its conjugation-convention correction.
-
-	    psi_mun  : (nk, s, μ, n)  P(None, None, 'x', 'y')
-	    psi_nmu  : (nk, n, s, μ)  P(None, 'x', None, 'y')
-	    weight_l, weight_r : (nb,) real, 1.0 inside the L/R band window and
-	                          0.0 outside (``nb`` = ``psi_mun``'s own band
-	                          extent).  Zero-weighted bands contribute
-	                          EXACTLY zero to the band sum (bilinear in ψ),
-	                          so no window-divisibility pad is needed — the
-	                          ONLY divisibility requirement is ``nb`` itself
-	                          (the array's own extent, already mesh-
-	                          divisible: ``BandSlices.b4`` is padded to the
-	                          world size).
-	    gemm     : one ``distrib_la.GemmPlan`` (``m=n=n_rmu``, ``k=nb``,
-	               ``nq=nk``), built ONCE by the caller and reused for both
-	               P_l and P_r — only the weight differs between them.
-
-	Output (either layout):
-	    C_q : (nq, n_rmu, n_col) sharded ``P(None, 'x', 'y')``.
-	    ``n_col == n_rmu`` for CCT (square centroid).
-	"""
-	if layout == "legacy":
-		if psi_l_X is None or psi_l_Y is None or psi_r_X is None or psi_r_Y is None:
-			raise ValueError(
-				"c_q_from_psi_sm(layout='legacy') requires psi_l_X/"
-				"psi_l_Y/psi_r_X/psi_r_Y.")
-		return _c_q_legacy(psi_l_X, psi_l_Y, psi_r_X, psi_r_Y,
-		                   gamma_L, gamma_R, kgrid=kgrid, mesh_xy=mesh_xy)
-	if layout != "face":
-		raise ValueError(
-			f"c_q_from_psi_sm: layout must be 'legacy' or 'face', got "
-			f"{layout!r}")
-	if psi_mun is None or psi_nmu is None or weight_l is None or weight_r is None or gemm is None:
-		raise ValueError(
-			"c_q_from_psi_sm(layout='face') requires psi_mun=, psi_nmu=, "
-			"weight_l=, weight_r=, gemm= (see gw.isdf_fitting.fit_zeta_to_h5"
-			").")
-	if k_unfold_plan is not None:
-		# Raw-parent contraction: psi_mun/psi_nmu are the plan's PACKED
-		# parent faces and ``gemm`` is planned at nq = n_parent.
-		if gamma_L is not None or gamma_R is not None:
-			raise ValueError(
-				"c_q_from_psi_sm(k_unfold_plan=...): the parent-k route "
-				"owns the charge vertex only.")
-		return _c_q_face_parent(
-			psi_mun, psi_nmu, weight_l, weight_r,
-			k_unfold_plan=k_unfold_plan, kgrid=kgrid, mesh_xy=mesh_xy,
-			gemm=gemm)
-	return _c_q_face(psi_mun, psi_nmu, weight_l, weight_r,
-	                 gamma_L, gamma_R,
-	                 kgrid=kgrid, mesh_xy=mesh_xy, gemm=gemm)
 
 
-def _c_q_legacy(
+
+def c_q_downfold(
 	psi_l_X: jax.Array,
 	psi_l_Y: jax.Array,
 	psi_r_X: jax.Array,
@@ -1190,9 +970,7 @@ def _c_q_legacy(
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
 ) -> jax.Array:
-	"""The exact pre-``layout=`` body of :func:`c_q_from_psi_sm`.  UNTOUCHED
-	— do not edit this function to add face-layout behaviour; it has its
-	own sibling, :func:`_c_q_face`, below."""
+	"""Contract the shared rectangular downfold Gram through the local pair-convolution owner."""
 	nkx, nky, nkz = kgrid
 	nk = int(psi_l_X.shape[0])
 	n_rmu = int(psi_l_X.shape[1])
@@ -1208,7 +986,7 @@ def _c_q_legacy(
 		mesh_xy, kgrid, ns, (n_col // p_y, n_rmu // p_x),
 		gamma_L, gamma_R)
 
-	cache_key = ('c_q_from_psi_sm', id(mesh_xy), nk, n_rmu, n_col, ns,
+	cache_key = ('c_q_from_psi_sm', _mesh_key(mesh_xy), nk, n_rmu, n_col, ns,
 	             nb_l, nb_r, nkx, nky, nkz, lhs_id, rhs_id,
 	             pair_arm, pair_gamma_key)
 	if cache_key not in _pair_pipeline_sm_cache:
@@ -1315,182 +1093,9 @@ def _c_q_legacy(
 # window does not cover.  See docs/architecture/zeta_fit_face_psi_cct.md.
 # ============================================================================
 
-def _c_q_face(
-	psi_mun: jax.Array,
-	psi_nmu: jax.Array,
-	weight_l: jax.Array,
-	weight_r: jax.Array,
-	gamma_L: tuple[jax.Array, jax.Array] | None = None,
-	gamma_R: tuple[jax.Array, jax.Array] | None = None,
-	*,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-	gemm,
-) -> jax.Array:
-	"""Face-layout C_q: ONE planned N,N band GEMM per side (SUMMA-
-	distributed over the mesh-sharded band contraction axis) producing the
-	open-spin pair density at (μ_X, ν_Y), then the SAME THREE PRIMITIVES
-	:func:`_c_q_legacy` uses for its own IFFT -> γ̃-double-contract -> FFT
-	tail (:func:`common.fft_helpers.local_ifftn3`/``local_fftn3``,
-	:func:`common.gamma_matrices.gamma_double_contract`), in this path's
-	OWN axis order (a=s, μ, b=s', ν — no 'karmb' transpose: no FFI
-	pair_kernel constrains the trailing axis order here, since the face
-	path always takes the XLA IFFT/FFT fallback, and that transpose would
-	be a real μ²-scale buffer, not a bitcast).
-
-	ONE OUTER ``jax.jit``, NOT THREE SEPARATE DISPATCHES.  Both GEMM calls
-	(``gemm(A_l, B)``, ``gemm(A_r, B)`` — trace-safe, per
-	``distrib_la.gemm_plan``'s own contract) and the IFFT/γ̃/FFT tail's
-	``shard_map`` are traced into ONE compiled program, mirroring
-	``gw.w_isdf._get_chi_minimax_kernel_face``'s own ``_build_Gv_Gc``
-	(one outer jit wrapping two calls into the SAME ``g_plan``) rather
-	than calling the plan, then a second top-level jit, then a third.
-	MEASURED, not a style preference: three separate top-level dispatches
-	— each its own compiled executable with no cross-executable buffer
-	reuse — OOM'd at MoS2 6x6x1/626b/mu=5282/P16
-	(`RESOURCE_EXHAUSTED ... 11.28GiB` at `C_q.block_until_ready()`);
-	folding into one outer jit, where XLA's buffer assignment sees the
-	WHOLE graph and can alias/reuse the P_l/P_r-scale buffers the way
-	`_c_q_legacy`'s own single fused shard_map already does, fixed it
-	with no other change (same fix that motivated dropping the 'karmb'
-	transpose above — both are instances of "an extra top-level
-	buffer this design does not need").
-
-	The GEMM seam (``common.contract_bands.merge_spin_centroid`` /
-	``split_spin_centroid``) and the weighted-band convention
-	(``gemm(A * weight, B)``) are EXACTLY ``gw.greens_function_kernel.
-	_build_G_face``'s pattern, reused rather than re-derived — same
-	merge positions (1,2) and (2,3), same "conjugate the μ/row operand,
-	leave the ν/col operand un-conjugated" convention as
-	:func:`pair_density`'s own docstring (the X-form is pre-conjugated by
-	its caller in the legacy path; here the conjugate is applied
-	explicitly since the face carrier stores un-conjugated ψ throughout).
-
-	γ̃ VERTEX (``gamma_L``/``gamma_R`` not ``None``, 2026-08-23) — endpoint
-	application, NOT ``_c_q_legacy``'s post-IFFT ``gamma_double_contract``.
-	``_c_q_legacy`` inserts γ̃ by calling ``gamma_apply`` TWICE on ``P_r``
-	alone (once per spin axis) — ``P_l`` (only conjugated, never
-	γ̃-transformed) is untouched; see
-	``docs/architecture/zeta_fit_face_psi_cct.md``'s vertex section for the
-	full derivation.  This path reproduces that exactly by transforming the
-	psi ENDPOINTS that feed ``P_r``'s own GEMM, mirroring
-	``gw.wavefunction_bundle.with_lorentz_vertices``'s field/axis table
-	(``_G_VERTEX_FIELDS``: ``psi_mun`` axis 1 for the mu_L/left vertex,
-	``psi_nmu`` axis 2 for the nu_L/right vertex) — ``P_l`` keeps using the
-	RAW ``psi_mun``/``psi_nmu``, ``P_r`` uses gamma-transformed copies:
-
-	* ``psi_mun`` plays CCT's CONJUGATED (μ/row) operand — the OPPOSITE
-	  conjugation role from the G-build, where ``psi_mun`` is the
-	  UNCONJUGATED direct operand (``greens_function_kernel._build_G_face``
-	  conjugates ``psi_nmu``, not ``psi_mun``).  So γ̃_L is applied to
-	  ``jnp.conj(psi_mun)`` (conjugate FIRST — commutes with the merge, a
-	  pure reshape) using the ORIGINAL, uncompensated ``phase_L``: applying
-	  γ̃ to an ALREADY-conjugated array needs no phase conjugate, whereas
-	  applying it BEFORE the conjugate would (``conj(gamma_apply(X,phase))
-	  == gamma_apply(conj(X), conj(phase))`` — this path takes the
-	  conjugate-first branch of that identity to avoid the correction).
-	* ``psi_nmu`` plays CCT's UNCONJUGATED (ν/col) operand — SAME role as
-	  the G-build's own ``psi_nmu`` argument slot except THAT one gets
-	  conjugated internally by ``_build_G_face`` and this one never is — so
-	  γ̃_R applies directly, original phase, no compensation needed either
-	  way.
-
-	``mu_L == 0`` / ``nu_L == 0`` (``gamma_L``/``gamma_R is None``) skip
-	the corresponding transform — ``P_r`` then equals ``P_l``'s own
-	construction (weight aside), and the tail's ``gamma_double_contract``
-	call runs with no perm/phase, byte-identical to the pre-vertex code.
-	"""
-	nk, s_, mu_full, nb = psi_mun.shape
-	nkx, nky, nkz = kgrid
-	if nk != nkx * nky * nkz:
-		raise ValueError(
-			f"_c_q_face: psi_mun k-axis {nk} != prod(kgrid)={nkx*nky*nkz}")
-	n_col_full = mu_full  # square centroid: n_rmu on both faces
-	px = int(mesh_xy.shape['x'])
-	py = int(mesh_xy.shape['y'])
-	mu_loc = mu_full // px
-	col_loc = n_col_full // py
-	lhs_id = gamma_L is None
-	rhs_id = gamma_R is None
-
-	in_mun = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
-	in_nmu = NamedSharding(mesh_xy, P(None, 'x', None, 'y'))
-	w_rep = NamedSharding(mesh_xy, P(None))
-	out_C = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-	pair_spec = P(None, None, 'x', None, 'y')
-
-	@partial(jax.jit,
-	         in_shardings=(in_mun, in_nmu, w_rep, w_rep,
-	                       w_rep, w_rep, w_rep, w_rep),
-	         out_shardings=out_C)
-	def _fused(psi_mun_, psi_nmu_, w_l, w_r, perm_L_, phase_L_, perm_R_, phase_R_):
-		def _pair(psi_mun_conj_: jax.Array, psi_nmu_use: jax.Array,
-		          w: jax.Array) -> jax.Array:
-			A = merge_spin_centroid(psi_mun_conj_, 1, 2)        # (nk, mu*s, nb)  x-major
-			A = A * w[None, None, :].astype(A.dtype)
-			B = merge_spin_centroid(psi_nmu_use, 2, 3)          # (nk, nb, nu*s)  y-major
-			D = gemm(A, B)                                      # (nk, mu*s, nu*s)  P(_,'x','y')
-			Pp = split_spin_centroid(D, 1, s_, mu_full)         # (nk, s, mu, nu*s)
-			return split_spin_centroid(Pp, 3, s_, n_col_full)   # (nk, s, mu, s', nu)
-
-		psi_mun_conj = jnp.conj(psi_mun_)
-		P_l = _pair(psi_mun_conj, psi_nmu_, w_l)
-		if lhs_id and rhs_id:
-			P_r = _pair(psi_mun_conj, psi_nmu_, w_r)
-		else:
-			# Endpoint γ̃ insertion -- ONLY for P_r's own construction
-			# (mirrors _c_q_legacy's gamma_apply(P_r, ...) calls, which
-			# never touch P_l).  Both transforms act on the REPLICATED
-			# spin axis: local permute+phase, zero collectives.
-			psi_mun_conj_r = (psi_mun_conj if lhs_id else
-			                  gamma_apply(psi_mun_conj, perm_L_, phase_L_, axis=1))
-			psi_nmu_r = (psi_nmu_ if rhs_id else
-			            gamma_apply(psi_nmu_, perm_R_, phase_R_, axis=2))
-			P_r = _pair(psi_mun_conj_r, psi_nmu_r, w_r)
-
-		@partial(shard_map, mesh=mesh_xy, in_specs=(pair_spec, pair_spec),
-		         out_specs=P(None, 'x', 'y'), check_vma=False)
-		def _tail(P_l_, P_r_):
-			P_l_3d = P_l_.reshape(nkx, nky, nkz, s_, mu_loc, s_, col_loc)
-			P_r_3d = P_r_.reshape(nkx, nky, nkz, s_, mu_loc, s_, col_loc)
-			P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
-			P_l_R_conj = jnp.conj(P_l_R)
-			del P_l_3d, P_l_R
-			P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
-			del P_r_3d
-			# Spin axes at (3, 5) in THIS (k,a,mu,b,nu) order -- NOT
-			# legacy's (3, 6), which is 'karmb' (k,a,col,mu,b).  The γ̃
-			# vertex is ALREADY baked into P_r (above), so this call is
-			# always the plain identity contraction (a trace over spin)
-			# -- no perm/phase args, in either channel.
-			C_R = gamma_double_contract(P_l_R_conj, P_r_R, spin_axes=(3, 5))
-			del P_l_R_conj, P_r_R
-			C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
-			# Already (kx, ky, kz, mu_loc, col_loc): the γ̃ contraction
-			# dropped the two spin axes it sat between, leaving mu then
-			# col in that order already -- no output transpose.
-			return C_q_3d.reshape(nkx * nky * nkz, mu_loc, col_loc)
-
-		return _tail(P_l, P_r)
-
-	if lhs_id:
-		perm_L = jnp.arange(s_, dtype=jnp.int32)
-		phase_L = jnp.ones(s_, dtype=jnp.complex128)
-	else:
-		perm_L, phase_L = gamma_L
-	if rhs_id:
-		perm_R = jnp.arange(s_, dtype=jnp.int32)
-		phase_R = jnp.ones(s_, dtype=jnp.complex128)
-	else:
-		perm_R, phase_R = gamma_R
-
-	return _fused(psi_mun, psi_nmu,
-	             jnp.asarray(weight_l, dtype=jnp.float64),
-	             jnp.asarray(weight_r, dtype=jnp.float64),
-	             perm_L, phase_L, perm_R, phase_R)
 
 
-def _c_q_face_parent(
+def c_q_from_psi_sm(
 	psi_mun_parent: jax.Array,
 	psi_nmu_parent: jax.Array,
 	weight_l: jax.Array,
@@ -1500,36 +1105,10 @@ def _c_q_face_parent(
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
 	gemm,
+	gamma_L: int = 0,
+	gamma_R: int = 0,
 ) -> jax.Array:
-	"""Face-layout C_q contracted on raw WFN parents only.
-
-	The band contraction of the CCT Gram is the whole of its cost.  On a
-	symmetry-reduced grid it need not be repeated on every child k: the pair
-	projector at a child is the typed symmetry image of the projector at its
-	raw parent.  So this kernel forms the Green-oriented projector
-
-	    D^A_kbar[a, mu, b, nu] = sum_n w^A_n psi_{n kbar a}(mu) conj(psi_{n kbar b}(nu))
-
-	with ONE planned GEMM per side on the ``n_parent`` raw rows (the same
-	``merge_spin_centroid``/``gemm``/``split_spin_centroid`` seam as
-	:func:`_c_q_face` and ``greens_function_kernel._build_G_face``), hands the
-	completed operator to the plan's typed, collective-free unfold
-	(:meth:`gw.centroid_k_unfold.CentroidKUnfoldPlan.unfold_operator`, the
-	route the screening Green function already takes), and only then runs the
-	UNCHANGED k-IFFT / spin-trace / k-FFT tail of :func:`_c_q_face`.  The
-	incumbent tail consumes ``P = conj(D)``; the elementwise conjugate is
-	taken after the unfold so that no second spin or phase convention is
-	written here.  Both centroid endpoints are in the run's orbit-packed
-	order, like every other operator.
-
-	Charge channel only: a current vertex needs the Cartesian action the plan
-	does not own (``gw.gw_init._resolve_parent_green_admission``).
-
-	    psi_mun_parent : (n_parent, s, mu_pk, nb)  P(None,None,'x','y'), packed
-	    psi_nmu_parent : (n_parent, nb, s, mu_pk)  P(None,'x',None,'y'), packed
-	    gemm           : GemmPlan with m = n = mu_pk*s, k = nb, nq = n_parent
-	Returns ``C_q`` (nk_full, n_rmu_canonical, n_rmu_canonical) P(None,'x','y').
-	"""
+	"""Contract raw-parent band projectors and apply fixed vertices after typed unfolding."""
 	n_parent, s_, mu_pk, nb = (int(v) for v in psi_mun_parent.shape)
 	nkx, nky, nkz = kgrid
 	nk = nkx * nky * nkz
@@ -1548,75 +1127,87 @@ def _c_q_face_parent(
 		raise ValueError(
 			"_c_q_face_parent: psi_nmu_parent shape "
 			f"{tuple(psi_nmu_parent.shape)} != {(n_parent, nb, s_, mu_pk)}.")
+	left_gamma = (None, None) if gamma_L == 0 else _gamma_perm_phase_mu(gamma_L)
+	right_gamma = (None, None) if gamma_R == 0 else _gamma_perm_phase_mu(gamma_R)
 	px = int(mesh_xy.shape['x'])
 	py = int(mesh_xy.shape['y'])
 	mu_loc = mu_pk // px
 	col_loc = mu_pk // py
+	from ffi.fft import make_fused_conv_kparent
+	p_l, ph_l = _conv_kpair_static_gamma(None, s_)
+	p_r, ph_r = _conv_kpair_static_gamma(None, s_)
+	pair_kernel = make_fused_conv_kparent(
+		mesh_xy, kgrid, s_, (mu_loc, col_loc),
+		perm_l=p_l, phase_l=ph_l, perm_r=p_r, phase_r=ph_r, centroid_major=True)
 
-	in_mun = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
-	in_nmu = NamedSharding(mesh_xy, P(None, 'x', None, 'y'))
+	in_mun = NamedSharding(mesh_xy, P(None, None, *gemm.in_sharding_a.spec[1:]))
+	in_nmu = NamedSharding(mesh_xy, P(None, gemm.in_sharding_b.spec[1],
+	                                      None, gemm.in_sharding_b.spec[2]))
 	w_rep = NamedSharding(mesh_xy, P(None))
 	out_C = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 	pair_spec = P(None, None, 'x', None, 'y')
 
-	@partial(jax.jit, in_shardings=(in_mun, in_nmu, w_rep, w_rep),
-	         out_shardings=out_C)
-	def _fused(psi_mun_, psi_nmu_, w_l, w_r):
-		def _projector(w):
-			A = merge_spin_centroid(psi_mun_, 1, 2)            # (p, mu*s, nb)
-			A = A * w[None, None, :].astype(A.dtype)
-			B = merge_spin_centroid(jnp.conj(psi_nmu_), 2, 3)  # (p, nb, nu*s)
-			D = gemm(A, B)                                      # (p, mu*s, nu*s)
-			D = split_spin_centroid(D, 1, s_, mu_pk)
-			return split_spin_centroid(D, 3, s_, mu_pk)         # (p, s, mu, s, nu)
+	cache_key = ('c_q_face_parent', mesh_xy, plan, gemm, tuple(kgrid),
+	             tuple(psi_mun_parent.shape), tuple(psi_nmu_parent.shape),
+	             str(psi_mun_parent.dtype), str(psi_nmu_parent.dtype),
+	             bool(gamma_L), bool(gamma_R), pair_kernel is not None)
+	if cache_key not in _isdf_pipeline_cache:
+		left_spec = tuple(None if value is None else w_rep for value in left_gamma)
+		right_spec = tuple(None if value is None else w_rep for value in right_gamma)
+		@partial(jax.jit, in_shardings=(in_mun, in_nmu, w_rep, w_rep,
+		                                 left_spec, right_spec),
+		         out_shardings=out_C)
+		def _fused(psi_mun_, psi_nmu_, w_l, w_r, vertex_l, vertex_r):
+			def _projector(w):
+				A = merge_spin_centroid(psi_mun_, 1, 2)            # (p, mu*s, nb)
+				A = A * w[None, None, :].astype(A.dtype)
+				B = merge_spin_centroid(jnp.conj(psi_nmu_), 2, 3)  # (p, nb, nu*s)
+				D = gemm(A, B)                                      # (p, mu*s, nu*s)
+				D = split_spin_centroid(D, 1, s_, mu_pk)
+				return split_spin_centroid(D, 3, s_, mu_pk)         # (p, s, mu, s, nu)
 
-		# Parent contraction, then the plan's local typed transport: the
-		# full-k operator is a transient, never a stored carrier.
-		D_l_full = plan.unfold_operator(_projector(w_l))
-		D_r_full = plan.unfold_operator(_projector(w_r))
+			# Parent contraction; native loads apply the typed transport inside the convolution.
+			D_l, D_r = _projector(w_l), _projector(w_r)
+			if pair_kernel is None:
+				D_l = plan.unfold_operator(D_l)
+				D_r = plan.unfold_operator(D_r)
 
-		@partial(shard_map, mesh=mesh_xy, in_specs=(pair_spec, pair_spec),
-		         out_specs=P(None, 'x', 'y'), check_vma=False)
-		def _tail(D_l_, D_r_):
-			# The incumbent ISDF tail is written for P = conj(D).
-			P_l_3d = jnp.conj(D_l_).reshape(
-				nkx, nky, nkz, s_, mu_loc, s_, col_loc)
-			P_r_3d = jnp.conj(D_r_).reshape(
-				nkx, nky, nkz, s_, mu_loc, s_, col_loc)
-			P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
-			P_l_R_conj = jnp.conj(P_l_R)
-			del P_l_3d, P_l_R
-			P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
-			del P_r_3d
-			C_R = gamma_double_contract(P_l_R_conj, P_r_R, spin_axes=(3, 5))
-			del P_l_R_conj, P_r_R
-			C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
-			return C_q_3d.reshape(nk, mu_loc, col_loc)
+			@partial(shard_map, mesh=mesh_xy, in_specs=(pair_spec, pair_spec),
+			         out_specs=P(None, 'x', 'y'), check_vma=False)
+			def _tail(D_l_, D_r_):
+				if pair_kernel is not None:
+					tables = _parent_conv_tables(
+						plan, plan.centroid_local_perm, plan.L_table, mu_loc, col_loc)
+					return pair_kernel(D_l_, D_r_, _parent_conv_vertices(tables, vertex_l, vertex_r))
+				# The incumbent ISDF tail is written for P = conj(D).
+				P_l_3d = jnp.conj(D_l_).reshape(
+					nkx, nky, nkz, s_, mu_loc, s_, col_loc)
+				P_r_3d = jnp.conj(D_r_).reshape(
+					nkx, nky, nkz, s_, mu_loc, s_, col_loc)
+				P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
+				P_l_R_conj = jnp.conj(P_l_R)
+				del P_l_3d, P_l_R
+				P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
+				del P_r_3d
+				C_R = gamma_double_contract(
+					P_l_R_conj, P_r_R, *vertex_l, *vertex_r, spin_axes=(3, 5))
+				del P_l_R_conj, P_r_R
+				C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
+				return C_q_3d.reshape(nk, mu_loc, col_loc)
 
-		return _tail(D_l_full, D_r_full)
+			return _tail(D_l, D_r)
 
-	return _fused(psi_mun_parent, psi_nmu_parent,
+		_isdf_pipeline_cache[cache_key] = _fused
+
+	return _isdf_pipeline_cache[cache_key](psi_mun_parent, psi_nmu_parent,
 	             jnp.asarray(weight_l, dtype=jnp.float64),
-	             jnp.asarray(weight_r, dtype=jnp.float64))
+	             jnp.asarray(weight_r, dtype=jnp.float64), left_gamma, right_gamma)
 
 
 def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
-	"""Hoist all ψ(G)->ψ(r) transforms out of the outer r-chunk loop.
-
-	The returned global array has shape
-	``(n_bc, nk, bpd_max*P, ns, n_rtot)`` and sharding
-	``P(None, None, ('x','y'), None, None)``.  Thus every cached coefficient
-	is owned by exactly one rank; neither the full band window nor an r slab is
-	replicated.  The leading chunk axis preserves the store's uniform static
-	shape, including zero pad rows in its last chunk.  This is deliberate: a
-	ragged final item cannot be the output of the same ``lax.scan`` and would
-	create a second compiled cache/slice family.  For the 50-band Si window,
-	bc16 therefore carries 64 slots (28% pad; priced exactly by the planner).
-	"""
+	"""Hoist all ψ(G)->ψ(r) transforms out of the outer r-chunk loop; see docs/architecture/zeta_fit_face_psi_cct.md."""
 	fft_grid = tuple(int(s) for s in psi_G_store.meta.fft_grid)
-	# The store's own k extent: full-zone rows for the production carrier,
-	# raw parent rows for a ``k_domain='ibz'`` store.  ``meta.nk_tot`` is the
-	# former in both cases and must not size a parent cache.
+	# The store owns its raw-parent k extent; meta.nk_tot names full k.
 	nk, bpd_max, ns, ngkmax = (
 		int(v) for v in psi_G_store.local_band_chunk_shape)
 	n_rtot = math.prod(fft_grid)
@@ -1627,7 +1218,7 @@ def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
 			f"n_bc={n_bc}, bpd_max={bpd_max}")
 
 	key = (
-		id(mesh_xy), id(psi_G_store), tuple(psi_G_store.band_chunk_ranges),
+		_mesh_key(mesh_xy), id(psi_G_store), tuple(psi_G_store.band_chunk_ranges),
 		nk, ns, n_rtot, bpd_max, ngkmax, fft_grid,
 	)
 	fn = _psi_r_cache_sm_cache.get(key)
@@ -1675,1291 +1266,27 @@ def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
 
 
 def z_q_from_psi_sm(
-	psi_l_X: jax.Array | None = None,
-	psi_r_X: jax.Array | None = None,
-	psi_G_store=None,
-	psi_r_cache: jax.Array | None = None,
-	*,
-	band_chunk_ranges: tuple[tuple[int, int], ...],
-	band_range_left: tuple[int, int] | None = None,
-	band_range_right: tuple[int, int] | None = None,
-	r_start_dyn,
-	r_chunk_size: int,
-	gamma_L: tuple[jax.Array, jax.Array] | None = None,
-	gamma_R: tuple[jax.Array, jax.Array] | None = None,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-	layout: str = "legacy",
-	psi_mun: jax.Array | None = None,
-	weight_l: jax.Array | None = None,
-	weight_r: jax.Array | None = None,
-	cache_face_y_blocks: bool = False,
-	face_y_cache_r_tile: int = 0,
-	k_unfold_plan=None,
-	tile_r_index: jax.Array | None = None,
-	tile_local_perm: jax.Array | None = None,
-	tile_wraps: jax.Array | None = None,
-) -> jax.Array:
-	"""Z_q, the ζ fit's r-chunk pair-density RHS (band contraction + IFFT/γ̃/FFT,
-	streamed over r-chunks).
+    *, psi_G_store, psi_r_cache=None, band_chunk_ranges,
+    kgrid, mesh_xy, psi_mun, weight_l, weight_r, k_unfold_plan,
+    tile_r_index, tile_local_perm, tile_wraps, gamma_L=0, gamma_R=0, layout="face",
+):
+    """Build Zq from raw parents on one typed orbit-closed real-grid tile."""
+    if k_unfold_plan is None:
+        raise ValueError("z_q_from_psi_sm requires a typed parent unfold plan")
+    if tile_r_index is None or tile_local_perm is None or tile_wraps is None:
+        raise ValueError("z_q_from_psi_sm requires all three orbit-tile tables")
+    return _z_q_face_parent(
+        psi_mun, psi_G_store, psi_r_cache, weight_l, weight_r,
+        k_unfold_plan=k_unfold_plan,
+        tile_r_index=tile_r_index, tile_local_perm=tile_local_perm,
+        tile_wraps=tile_wraps, band_chunk_ranges=band_chunk_ranges,
+        kgrid=kgrid, mesh_xy=mesh_xy, gamma_L=gamma_L, gamma_R=gamma_R, layout=layout)
 
-	``layout='legacy'`` (default, ``low_mem_bands=False``) dispatches to
-	:func:`_z_q_legacy` — UNCHANGED body: ψ's band-contraction operand
-	(``psi_l_X``/``psi_r_X``) is single-axis-sharded (μ on ``'x'``, bands
-	REPLICATED) and resident for the whole caller's r-chunk loop.
 
-	``layout='face'`` (``low_mem_bands=True``) dispatches to
-	:func:`_z_q_face` — the band-contraction operand is instead read, ONE
-	bounded band-chunk at a time, directly out of the two-face carrier's
-	``psi_mun`` (``gw.wavefunction_bundle.PSI_MUN_SPEC``, ``2·S/(Px·Py)``
-	resident for the WHOLE fit, unlike ``psi_l_X``/``psi_r_X``), via a
-	per-position gather + ``psum('y')`` — never a resident single-axis
-	copy.  It supports the identity charge vertex and the canonical monomial
-	current vertices.  ``cache_face_y_blocks`` is an internal structural
-	memory-plan decision: true caches the bounded current-rchunk Y slabs once;
-	false repeats their canonical transform per scalar spin pair and is the
-	always-valid bounded fallback.  It is not a deck or environment knob.
-	See ``docs/architecture/zeta_fit_face_psi_cct.md``'s r-chunk section for
-	the derivation and the ``all_to_all('y')`` collision this design avoids.
-	"""
-	if layout == "legacy":
-		if psi_l_X is None or psi_r_X is None:
-			raise ValueError(
-				"z_q_from_psi_sm(layout='legacy') requires psi_l_X= and "
-				"psi_r_X=.")
-		if band_range_left is None or band_range_right is None:
-			raise ValueError(
-				"z_q_from_psi_sm(layout='legacy') requires "
-				"band_range_left= and band_range_right=.")
-		return _z_q_legacy(
-			psi_l_X, psi_r_X, psi_G_store, psi_r_cache,
-			band_chunk_ranges=band_chunk_ranges,
-			band_range_left=band_range_left,
-			band_range_right=band_range_right,
-			r_start_dyn=r_start_dyn, r_chunk_size=r_chunk_size,
-			gamma_L=gamma_L, gamma_R=gamma_R,
-			kgrid=kgrid, mesh_xy=mesh_xy)
-	if layout != "face":
-		raise ValueError(
-			f"z_q_from_psi_sm: layout must be 'legacy' or 'face', got "
-			f"{layout!r}")
-	if (psi_mun is None or weight_l is None or weight_r is None
-			or psi_G_store is None):
-		raise ValueError(
-			"z_q_from_psi_sm(layout='face') requires psi_mun=, weight_l=, "
-			"weight_r= and psi_G_store= (see gw.isdf_fitting.fit_zeta_to_h5"
-			").")
-	if k_unfold_plan is not None:
-		# Raw-parent contraction on one orbit-closed real-grid tile.  The
-		# same face carrier slot carries the plan's PACKED parent faces and
-		# the store holds parent rows; ``r_start_dyn``/``r_chunk_size`` are
-		# replaced by the tile's slot tables.  See :func:`_z_q_face_parent`.
-		if tile_r_index is None or tile_local_perm is None or tile_wraps is None:
-			raise ValueError(
-				"z_q_from_psi_sm(k_unfold_plan=...) requires tile_r_index=, "
-				"tile_local_perm= and tile_wraps= (gw.centroid_k_unfold."
-				"RealGridOrbitTiles.source_tables).")
-		if gamma_L is not None or gamma_R is not None:
-			raise ValueError(
-				"z_q_from_psi_sm(k_unfold_plan=...): the parent-k route "
-				"owns the charge vertex only; current vertices need the "
-				"Cartesian action (gw.gw_init._resolve_parent_green_admission).")
-		return _z_q_face_parent(
-			psi_mun, psi_G_store, psi_r_cache, weight_l, weight_r,
-			k_unfold_plan=k_unfold_plan,
-			tile_r_index=tile_r_index, tile_local_perm=tile_local_perm,
-			tile_wraps=tile_wraps,
-			band_chunk_ranges=band_chunk_ranges,
-			kgrid=kgrid, mesh_xy=mesh_xy)
-	return _z_q_face(
-		psi_mun, psi_G_store, psi_r_cache, weight_l, weight_r,
-		gamma_L, gamma_R,
-		band_chunk_ranges=band_chunk_ranges,
-		r_start_dyn=r_start_dyn, r_chunk_size=r_chunk_size,
-		kgrid=kgrid, mesh_xy=mesh_xy,
-		cache_y_blocks=bool(cache_face_y_blocks),
-		cache_y_r_tile=int(face_y_cache_r_tile))
-
-
-def _z_q_legacy(
-	psi_l_X: jax.Array,
-	psi_r_X: jax.Array,
-	psi_G_store,
-	psi_r_cache: jax.Array | None = None,
-	*,
-	band_chunk_ranges: tuple[tuple[int, int], ...],
-	band_range_left: tuple[int, int],
-	band_range_right: tuple[int, int],
-	r_start_dyn,
-	r_chunk_size: int,
-	gamma_L: tuple[jax.Array, jax.Array] | None = None,
-	gamma_R: tuple[jax.Array, jax.Array] | None = None,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-) -> jax.Array:
-	"""The exact pre-``layout=`` body of :func:`z_q_from_psi_sm`.  UNTOUCHED
-	— do not edit this function to add face-layout behaviour; it has its
-	own sibling, :func:`_z_q_face`, below (mirrors ``isdf.core._c_q_legacy``
-	/ ``_c_q_face``).
-
-	Z_q built from ψ via a streaming-scan pair density inside one shard_map.
-
-	Round 6 redesign (`round5_unified_plan.md` §2.10 / §6.5).  Replaces
-	the all-at-once einsum that consumed pre-computed ``psi_l_Y`` /
-	``psi_r_Y`` with a ``lax.scan`` over band-chunks inside the
-	``shard_map`` body.  Per iter:
-
-	  1. The production path slices this rank's 1/P bands of bc ``i`` from
-	     ``psi_r_cache``, whose full-grid IFFT was hoisted once before the
-	     outer r-chunk loop.  The compatibility path (``psi_r_cache=None``)
-	     retains the historical ``io_callback`` + per-r-chunk IFFT.
-	     ``io_callback`` pulls this rank's 1/P bands of bc ``i`` from
-	     :class:`PsiGStore`'s host tile (band-flat-sharded over the
-	     full ``('x','y')`` mesh).
-	  2. :func:`common.wfn_transforms.to_rchunk_inner` does the local
-	     IFFT + per-rank r-slab (``r0_local = r_start + axis_index('y')
-	     * r_loc``).
-	  3. ``lax.all_to_all('y', split_axis=r, concat_axis=band,
-	     tiled=True)`` then ``lax.all_gather('x', axis=1, tiled=True)``
-	     aligns the band axis with ``psi_l_X`` / ``psi_r_X``'s
-	     band-replicated layout WHILE scattering r onto 'y', so the
-	     gathered slab is ``r_loc`` deep, not ``n_zchunk`` (p_y× less
-	     memory; see the step-(3) comment for why this is the exact
-	     movement and why band order is unchanged).  IFFT-FIRST;
-	     gather-first would blow the FFT box to ~80 GB / rank.
-	  4. L/R per-bc band masks (mask approach — ``jnp.where`` on a
-	     rank-local axis).
-	  5. Two einsums into rank-5 carries ``(P_l_acc, P_r_acc)``.
-
-	Post-scan: existing IFFT(k) → γ̃·γ̃ → FFT(k) tail (byte-identical
-	to the pre-rewrite body — only the front of the body changes per
-	plan §2.7).
-
-	Inputs:
-	    psi_l_X, psi_r_X    : ``(nk, n_rmu, nb_l, ns)`` /
-	                          ``(nk, n_rmu, nb_r, ns)`` sharded
-	                          ``P(None, 'x', None, None)`` (μ on 'x',
-	                          bands replicated).
-	    psi_G_store         : :class:`PsiGStore` — closure-captured;
-	                          provides ``_slice_local_tile_bc`` /
-	                          ``g_index`` / ``kvecs_frac``.  NOT a jit
-	                          argument.
-	    psi_r_cache         : optional all-P band-sharded cache with shape
-	                          ``(n_bc,nk,bpd_max*P,ns,n_rtot)``.  Production
-	                          supplies it; ``None`` is the test/reference path.
-	    band_chunk_ranges   : tuple of (b_lo, b_hi) global band indices.
-	    band_range_left     : (L_lo, L_hi) global L-window.  Must
-	                          satisfy nb_l == L_hi - L_lo.
-	    band_range_right    : (R_lo, R_hi) global R-window.
-	    fft_grid            : (nx, ny, nz).
-	    r_start_dyn         : int32 scalar — flat-r start of the chunk.
-	    r_chunk_size        : static int — full r-chunk extent.  Per
-	                          rank slab is ``r_chunk_size // p_y``.
-	    gamma_L, gamma_R    : ``(perm, phase)`` tuples or ``None``
-	                          (= γ̃^0 = I).
-	    kgrid               : (nkx, nky, nkz).
-	Output:
-	    Z_q                 : (nq, n_rmu, n_zchunk) sharded
-	                          ``P(None, 'x', 'y')``.
-	"""
-	fft_grid = tuple(int(s) for s in psi_G_store.meta.fft_grid)
-	nkx, nky, nkz = kgrid
-	nk = int(psi_l_X.shape[0])
-	n_rmu = int(psi_l_X.shape[1])
-	nb_l = int(psi_l_X.shape[2])
-	nb_r = int(psi_r_X.shape[2])
-	ns = int(psi_l_X.shape[3])
-	n_zchunk = int(r_chunk_size)
-	p_x = int(mesh_xy.shape['x'])
-	p_y = int(mesh_xy.shape['y'])
-	from runtime.padding import authenticate_padded_axis
-	authenticate_padded_axis(
-		n_zchunk, n_zchunk, mesh_xy, name="zeta real-space chunk carrier",
-		spec=P(None, 'x', 'y'), axis=2)
-	r_loc = n_zchunk // p_y
-
-	bcr = tuple((int(lo), int(hi)) for (lo, hi) in band_chunk_ranges)
-	use_psi_r_cache = psi_r_cache is not None
-	L_lo_g = int(band_range_left[0]); L_hi_g = int(band_range_left[1])
-	R_lo_g = int(band_range_right[0]); R_hi_g = int(band_range_right[1])
-	if L_hi_g - L_lo_g != nb_l:
-		raise ValueError(
-			f"z_q_from_psi_sm: psi_l_X.shape[2]={nb_l} != L_hi - L_lo "
-			f"= {L_hi_g - L_lo_g}.")
-	if R_hi_g - R_lo_g != nb_r:
-		raise ValueError(
-			f"z_q_from_psi_sm: psi_r_X.shape[2]={nb_r} != R_hi - R_lo "
-			f"= {R_hi_g - R_lo_g}.")
-
-	lhs_id = gamma_L is None
-	rhs_id = gamma_R is None
-	pair_arm, _pair_reason, pair_kernel, pair_gamma_key = _conv_kpair_setup(
-		mesh_xy, kgrid, ns, (r_loc, n_rmu // p_x), gamma_L, gamma_R)
-
-	cache_key = (
-		'z_q_from_psi_sm_streaming', id(mesh_xy), id(psi_G_store),
-		nk, n_rmu, n_zchunk, ns, nb_l, nb_r, nkx, nky, nkz,
-		lhs_id, rhs_id, bcr, (L_lo_g, L_hi_g), (R_lo_g, R_hi_g),
-		tuple(int(s) for s in fft_grid), pair_arm, pair_gamma_key,
-		use_psi_r_cache,
-		(None if psi_r_cache is None else tuple(int(s) for s in psi_r_cache.shape)),
-	)
-	if cache_key not in _pair_pipeline_sm_cache:
-		_lhs_id = lhs_id
-		_rhs_id = rhs_id
-		_pair_kernel = pair_kernel
-		_psi_G_store = psi_G_store
-		fft_grid_t = tuple(int(s) for s in fft_grid)
-
-		# Static per-bc tables: global band-axis offsets for the
-		# bc-aligned scan body.  Each iter gathers ``bpd_max_global =
-		# P · _bpd_max`` bands (the bc's full band width), so the L/R
-		# masks index into a static-size axis.
-		from runtime.padding import mesh_divisor
-		P_total = mesh_divisor(mesh_xy)
-		bpd_max = int(_psi_G_store._bpd_max)
-		bpd_max_global = bpd_max * P_total          # padded global bc band count
-		n_bc = len(bcr)
-		# Static per-bc Y-compaction gather table (device-invariance fix):
-		# all_gather(tiled) over ('x','y') stacks P per-rank blocks of
-		# `bpd_max` slots along the gathered band axis; rank r's block holds
-		# this bc's global bands in its FIRST `bpd_per_bc` slots + zero pad.
-		# The g_axis mask and the contiguous psi_*_X slice both assume a
-		# CONTIGUOUS global band axis, so reorder the gathered slots to place
-		# this bc's real bands contiguously at the front (out pos p -> src
-		# slot).  Identity whenever bpd_per_bc == bpd_max (every full chunk
-		# AND every chunk at P=1) -> no-op / byte-identical there.
-		_y_compact_idx_np = np.zeros((n_bc, bpd_max_global), dtype=np.int32)
-		for _bc in range(n_bc):
-			_bpd = int(_psi_G_store._bpd_per_bc[_bc])
-			_bc_width = int(bcr[_bc][1] - bcr[_bc][0])
-			from runtime.padding import authenticate_padded_axis
-			_bc_axis = authenticate_padded_axis(
-				_bc_width, _bc_width, P_total,
-				name=f"zeta band chunk {_bc}")
-			_nb_tot = _bc_axis.carrier
-			# Precondition guard (device-invariance audit): each band-chunk
-			# width MUST be world_size-divisible, else floor-div silently drops
-			# bands and the populate tile assignment shape-mismatches at P>1.
-			# ValueError, not assert: the fix is a user input key
-			# (band_chunk_size), and an assert vanishes under `python -O`,
-			# re-arming exactly the silent band-dropping this guards
-			# (audit fix/zq 2026-07-28).
-			if _bpd != _nb_tot // P_total or _bpd > bpd_max:
-				raise ValueError(
-					f"z_q band chunk {_bc} carrier metadata disagrees: width="
-					f"{_nb_tot}, expected bands/rank={_nb_tot // P_total}, "
-					f"stored bands/rank={_bpd}, maximum={bpd_max}")
-			if _bpd <= 0:
-				continue  # zero-width bc: every slot is masked downstream
-			# out pos p -> src slot (strided real bands compacted to front);
-			# tail (p >= _nb_tot) -> slot _bpd, a guaranteed-zero pad slot.
-			_p = np.arange(bpd_max_global)
-			_y_compact_idx_np[_bc] = np.where(
-				_p < _nb_tot, (_p // _bpd) * bpd_max + (_p % _bpd), _bpd)
-		# STATIC identity check.  When EVERY bc's compaction is the
-		# identity permutation the ``jnp.take`` in the scan body is
-		# mathematically a no-op -- but XLA cannot prove that from a
-		# traced index array, so it materialises a SECOND copy of the
-		# band-gathered FULL-r psi(r) slab:
-		#     nk * bpd_max_global * ns * n_zchunk * 16 bytes
-		# with NO mesh division on either axis (129 GB/rank at MoS2
-		# 12x12, 160-band window, r_chunk = n_rtot = 174960 -- half of
-		# the 271 GB single allocation that OOM'd job 7874236).
-		# Eliding it is BIT-EXACT (take with an identity index is the
-		# identity) and halves the Stage-C arena.  An all-pad bc leaves
-		# its row at zeros (not identity) and correctly disables it.
-		_y_compact_identity = bool(
-			n_bc > 0
-			and np.array_equal(
-				_y_compact_idx_np,
-				np.broadcast_to(
-					np.arange(bpd_max_global, dtype=np.int32),
-					(n_bc, bpd_max_global))))
-		# Per-bc tables.  Built as np arrays here (NOT jnp.asarray) so
-		# they enter the shard_map body via numpy → jnp lift inside the
-		# Manual-mode body.  Closure-captured Auto-sharded jax.Arrays
-		# inside a Manual-mode shard_map body trigger a mesh-context
-		# mismatch (same issue as kvecs_frac in the earlier debug);
-		# wrapping them as numpy constants and lifting inside the body
-		# treats them as concrete constants from the body's perspective.
-		_b_lo_global_np = np.asarray(
-			[lo for (lo, _hi) in bcr], dtype=np.int32)
-		_b_hi_global_np = np.asarray(
-			[hi for (_lo, hi) in bcr], dtype=np.int32)
-		# psi_l_X / psi_r_X are sized to their L/R window; per-bc slice
-		# offset within them is `bc.lo - L_lo_g` / `bc.lo - R_lo_g`,
-		# which can be NEGATIVE when bc starts below the window AND
-		# the slice (offset, offset+bpd_max_global) can extend PAST
-		# the window when bc spans the upper boundary or the final bc
-		# is short.  We pre-pad psi_l_X / psi_r_X at BOTH ends with
-		# zero rows so that the dynamic_slice never goes out of
-		# bounds — which would otherwise trigger XLA's silent clamp
-		# (start clamped to ``axis_size - slice_size``), producing
-		# *physically wrong bands* that the L/R mask CANNOT recover
-		# (the mask's index assumes the slice covers
-		# ``[bc.lo, bc.lo+bpd_max_global)`` but the clamp returns
-		# something else).  See round6_discussion.md:506 BLOCKER from
-		# Agent 4.  Pad rows correspond to out-of-window global bands;
-		# the L/R mask zeros their contribution to the einsum
-		# (math-neutral) — same contract as the front-pad rows.
-		front_pad_l = max(
-			(max(0, L_lo_g - lo) for (lo, _hi) in bcr), default=0)
-		front_pad_r = max(
-			(max(0, R_lo_g - lo) for (lo, _hi) in bcr), default=0)
-		# After front-pad, offset = bc.lo - L_lo_g + front_pad_l (always ≥ 0).
-		_psi_l_X_bc_offset_np = np.asarray(
-			[lo - L_lo_g + front_pad_l for (lo, _hi) in bcr],
-			dtype=np.int32)
-		_psi_r_X_bc_offset_np = np.asarray(
-			[lo - R_lo_g + front_pad_r for (lo, _hi) in bcr],
-			dtype=np.int32)
-		# Back-pad: the slice (offset, offset+bpd_max_global) must fit
-		# entirely within the padded array (front_pad + nb + back_pad).
-		# The largest end-offset across all bcs determines the back-pad.
-		_max_end_l = int(max(
-			(off + bpd_max_global for off in _psi_l_X_bc_offset_np),
-			default=0))
-		_max_end_r = int(max(
-			(off + bpd_max_global for off in _psi_r_X_bc_offset_np),
-			default=0))
-		back_pad_l = max(0, _max_end_l - (front_pad_l + nb_l))
-		back_pad_r = max(0, _max_end_r - (front_pad_r + nb_r))
-		ngkmax = int(_psi_G_store._per_rank_shape[3])
-
-		# Slicer needs static `out_sds`; close over the padded shape.
-		_per_rank_bc_shape = (nk, bpd_max, ns, ngkmax)
-		_slicer_out_sds = jax.ShapeDtypeStruct(
-			_per_rank_bc_shape, jnp.complex128)
-
-		def _slicer_host(x_idx, y_idx, bc_idx):
-			return _psi_G_store._slice_local_tile_bc(x_idx, y_idx, bc_idx)
-
-		L_spec = P(None, 'x', None, None)
-		out_spec = P(None, 'x', 'y')
-		# g_index, kvecs_frac: replicated.  Pass through shard_map's
-		# in_specs (NOT closure) so JAX sees Manual-mode-compatible
-		# access inside the body (closure-captured Auto-sharded arrays
-		# trip a mesh-context mismatch under multi-device shard_map).
-		g_index_spec    = P(None, None, None, None)
-		kvecs_frac_spec = P(None, None)
-
-		cache_spec = P(None, None, ('x', 'y'), None, None)
-		@partial(shard_map, mesh=mesh_xy,
-		         in_specs=(L_spec, L_spec, P(), P(), P(), P(), P(),
-		                   g_index_spec, kvecs_frac_spec, cache_spec),
-		         out_specs=out_spec,
-		         check_vma=False)
-		def _local(psi_l_X_, psi_r_X_, perm_L_, phase_L_,
-		           perm_R_, phase_R_, r_start_,
-		           g_index_dev, kvecs_frac_dev, psi_r_cache_):
-			# Per-rank shapes:
-			#   psi_l_X_ : (nk, n_rmu_loc, nb_l, ns)   μ on 'x' (replicated bands)
-			#   psi_r_X_ : (nk, n_rmu_loc, nb_r, ns)
-			# Carry (rank-local, NO sharding annotation):
-			#   P_l_acc  : (nk, ns, r_loc, mu_loc, ns)
-			# r_loc = n_zchunk / p_y per §2.3 (out_spec='y' on n_zchunk).
-			x_idx = jax.lax.axis_index('x')
-			y_idx = jax.lax.axis_index('y')
-			mu_loc = psi_l_X_.shape[1]
-
-			# Lift per-bc static tables to jnp.array INSIDE the
-			# Manual-mode body so they're treated as Manual-mode
-			# concrete constants (vs Auto-sharded closure jax.Arrays
-			# which trip a mesh-context mismatch).
-			b_lo_global_arr = jnp.asarray(_b_lo_global_np)
-			b_hi_global_arr = jnp.asarray(_b_hi_global_np)
-			psi_l_X_bc_offset = jnp.asarray(_psi_l_X_bc_offset_np)
-			psi_r_X_bc_offset = jnp.asarray(_psi_r_X_bc_offset_np)
-			if not _y_compact_identity:
-				y_compact_idx = jnp.asarray(_y_compact_idx_np)
-
-			# Pre-pad psi_l_X_ / psi_r_X_ at the front with front_pad_*
-			# zero bands so the per-bc offset is always non-negative
-			# (handles the bc.lo < L_lo_g / R_lo_g case where the
-			# X-side offset would otherwise be negative; bands at
-			# position [0, front_pad) are zeros, masked-zero in the
-			# einsum).  Static front_pad_* baked at trace.
-			# Pad both ends.  Front-pad covers bc.lo < window_lo
-			# (negative offset case); back-pad covers
-			# bc.lo + bpd_max_global > window_lo + nb (out-of-bounds
-			# end case — XLA's dynamic_slice would otherwise silently
-			# clamp the start, producing wrong bands the L/R mask
-			# can't recover; see round6_discussion.md:506 BLOCKER).
-			if front_pad_l > 0 or back_pad_l > 0:
-				psi_l_X_padded = jnp.pad(
-					psi_l_X_,
-					((0, 0), (0, 0), (front_pad_l, back_pad_l), (0, 0)))
-			else:
-				psi_l_X_padded = psi_l_X_
-			if front_pad_r > 0 or back_pad_r > 0:
-				psi_r_X_padded = jnp.pad(
-					psi_r_X_,
-					((0, 0), (0, 0), (front_pad_r, back_pad_r), (0, 0)))
-			else:
-				psi_r_X_padded = psi_r_X_
-
-			# r-slab strategy: each y-rank ultimately owns ``r_loc``
-			# positions of the r-chunk (out_spec=P(None, 'x', 'y') on
-			# n_zchunk).  A plain per-rank r-slice BEFORE the band gather
-			# would mix r-slabs from different y-ranks at the same gathered
-			# band position (r-incoherence at the einsum) — which is why
-			# this used to gather bands at FULL r and slice afterwards.
-			# It no longer does: step (3) below performs the band-gather and
-			# the r-scatter as ONE all-to-all + all_gather, which is exactly
-			# the required permutation and never materialises the
-			# full-bands × full-r slab.  ``psi_Y_local`` (this rank's OWN
-			# bands over full r) is still built per iter — unavoidable, since
-			# other y-ranks need other r-blocks of those same bands — but it
-			# is only ``bpd_max`` bands wide and XLA's scan-internal
-			# allocator aliases it across iters → single slot.
-
-			P_l_init = jnp.zeros(
-				(nk, ns, r_loc, mu_loc, ns), dtype=jnp.complex128)
-			P_r_init = jnp.zeros(
-				(nk, ns, r_loc, mu_loc, ns), dtype=jnp.complex128)
-
-			def body(carry, bc_idx):
-				P_l_acc, P_r_acc = carry
-				# (1) io_callback: this rank's 1/P bands of bc bc_idx.
-				#     ordered=False per §3.4 (lax.scan(unroll=1) gives
-				#     sequential per-rank execution at runtime; ordered
-				#     is a perf knob, not correctness).
-				# (2) IFFT + FULL r-chunk slab (NOT per-rank r_loc — see
-				#     "r-slab strategy" comment above).  Local FFT box
-				#     per rank is c128[nk, bpd_max, ns, n_rtot] ·
-				#     cuFFT_scratch; the full-r slab is c128[nk,
-				#     bpd_max, ns, n_zchunk] per rank.  Both per-iter,
-				#     aliased across iters by XLA's scan-internal
-				#     allocator → single slot of each.
-				if use_psi_r_cache:
-					psi_Y_bc_local_full_r = take_rchunk_padded(
-						psi_r_cache_[bc_idx], r_start_, n_zchunk)
-				else:
-					psi_G_bc_local = _io_callback(
-						_slicer_host, _slicer_out_sds,
-						x_idx, y_idx, bc_idx,
-						ordered=False)
-					psi_Y_bc_local_full_r = to_rchunk_inner(
-						psi_G_bc_local, g_index_dev, fft_grid_t,
-						r_start_, n_zchunk,
-						kvecs_frac=kvecs_frac_dev, norm="ortho")
-				# (3) Band-gather AND r-scatter in one shot.
-				#
-				#     The old code did all_gather(('x','y')) over bands at the
-				#     FULL r-chunk and only THEN sliced r — so every rank held
-				#     nk · bpd_max_global · ns · n_zchunk · 16 bytes with NO mesh
-				#     division on either axis (129 GB/rank at MoS2 12x12,
-				#     band_chunk=160, cr=174960).  That single object is wall #0:
-				#     it is what forced r_chunk down to <=81 chunks and capped the
-				#     machine at n_mu ~ 4000 independently of everything else.
-				#
-				#     The r-slice CANNOT simply move before the gather (that mixes
-				#     r-slabs from different y-ranks at the same gathered band --
-				#     the r-incoherence the old comment warns about).  But the
-				#     movement we actually want IS an all-to-all: rank (x,y) owns
-				#     its own bands over ALL r and needs ALL bands over r-block y.
-				#     Express it exactly:
-				#       (3a) all_to_all on 'y'  — split r into p_y blocks, concat
-				#            onto bands: (x,y) ships its y'-th r-block to (x,y')
-				#            and receives every (x,y'')'s bands at r-block y.
-				#       (3b) all_gather on 'x'  — the remaining band blocks, now
-				#            already restricted to r-block y.
-				#     Same NCCL/Gloo byte volume, pure data movement (BIT-EXACT),
-				#     and the peak drops by p_y: 129 -> 12.9 GB/rank at run1 scale.
-				#
-				#     BAND ORDER IS PRESERVED, which is load-bearing (g_axis mask,
-				#     y_compact_idx and the psi_*_X slice all assume it).  all_to_all
-				#     concatenates sources in 'y' order, then all_gather concatenates
-				#     in 'x' order, so block (x,y) lands at offset (x·p_y + y)·bpd_max
-				#     — exactly where all_gather(('x','y'), tiled=True) put it (that
-				#     flattens row-major with 'x' slowest).
-				psi_Y_col = jax.lax.all_to_all(
-					psi_Y_bc_local_full_r, 'y',
-					split_axis=3, concat_axis=1, tiled=True)
-				psi_Y_bc_full_r = jax.lax.all_gather(
-					psi_Y_col, axis_name='x', axis=1, tiled=True)
-				# Guard: the gathered band axis must be the full contiguous width
-				# (P blocks x bpd_max).  A wrong strided/contiguous read surfaces
-				# HERE as a loud shape mismatch, not silent P-dependent corruption.
-				assert psi_Y_bc_full_r.shape[1] == bpd_max_global
-				# (3a) Compact strided per-rank band blocks to a CONTIGUOUS
-				#      global-band axis so the g_axis mask + psi_*_X slice align
-				#      with the gathered Y band axis.  No-op when
-				#      bpd_per_bc == bpd_max (full chunk / P=1).
-				#      ELIDED when the permutation is the identity for every
-				#      bc (``_y_compact_identity``): XLA cannot fold a
-				#      traced-index take, so it would allocate a SECOND full
-				#      band-gathered FULL-r slab (nk * bpd_max_global * ns *
-				#      n_zchunk * 16, unsharded on both axes).
-				if not _y_compact_identity:
-					psi_Y_bc_full_r = jnp.take(
-						psi_Y_bc_full_r, y_compact_idx[bc_idx], axis=1)
-				# (3c) The r-slice is GONE: step (3a) already delivered this
-				#      y-rank's r-block, coherently with the gathered band axis.
-				assert psi_Y_bc_full_r.shape[3] == r_loc
-				psi_Y_bc = psi_Y_bc_full_r
-				# (4) L/R global-index masks (mask approach per §2.5).
-				#     bc_valid handles short final bc (pad rows = zero).
-				g_axis = (b_lo_global_arr[bc_idx]
-				          + jnp.arange(bpd_max_global, dtype=jnp.int32))
-				bc_valid = g_axis < b_hi_global_arr[bc_idx]
-				l_mask = ((g_axis >= L_lo_g) & (g_axis < L_hi_g) & bc_valid)
-				r_mask = ((g_axis >= R_lo_g) & (g_axis < R_hi_g) & bc_valid)
-				psi_l_Y_bc = jnp.where(
-					l_mask[None, :, None, None], psi_Y_bc, 0)
-				psi_r_Y_bc = jnp.where(
-					r_mask[None, :, None, None], psi_Y_bc, 0)
-				# (5) psi_l_X / psi_r_X per-bc slice (band axis
-				#     replicated → purely local).  Static slice length
-				#     bpd_max_global so XLA can fold; offset traced.
-				#     Slice from the FRONT-PADDED psi_*_X_padded so the
-				#     offset is always non-negative even for bcs
-				#     starting below the L/R window start.
-				psi_l_X_bc = jax.lax.dynamic_slice_in_dim(
-					psi_l_X_padded, psi_l_X_bc_offset[bc_idx],
-					bpd_max_global, axis=2)
-				psi_l_X_bc = jnp.where(
-					l_mask[None, None, :, None], psi_l_X_bc, 0)
-				psi_r_X_bc = jax.lax.dynamic_slice_in_dim(
-					psi_r_X_padded, psi_r_X_bc_offset[bc_idx],
-					bpd_max_global, axis=2)
-				psi_r_X_bc = jnp.where(
-					r_mask[None, None, :, None], psi_r_X_bc, 0)
-				# (6) Two einsums into the carries (interleaved single
-				#     scan per §2.10; with the small carry the γ̃
-				#     contract dominates peak — serialization bought
-				#     nothing).
-				delta_P_l = jnp.einsum(
-					'kmna,knbr->karmb',
-					psi_l_X_bc, psi_l_Y_bc, optimize=True)
-				delta_P_r = jnp.einsum(
-					'kmna,knbr->karmb',
-					psi_r_X_bc, psi_r_Y_bc, optimize=True)
-				return (P_l_acc + delta_P_l, P_r_acc + delta_P_r), None
-
-			# DO NOT unroll — the FFT-box and psi_G_bc aliasing depends
-			# on per-iter sequential lifetime.  unroll=1 keeps the
-			# WhileOp atomic and lets XLA's scan-internal allocator
-			# reuse the slot (§3.5).
-			(P_l, P_r), _ = jax.lax.scan(
-				body, (P_l_init, P_r_init),
-				jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
-
-			# Post-pair pipeline: the XLA branch below remains the unchanged
-			# reference tail; the native branch replaces exactly that subgraph.
-			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, r_loc, mu_loc, ns)
-			del P_l
-			P_r_3d = P_r.reshape(nkx, nky, nkz, ns, r_loc, mu_loc, ns)
-			del P_r
-			if _pair_kernel is not None:
-				Z_q_3d = _pair_kernel(P_l_3d, P_r_3d)
-				del P_l_3d, P_r_3d
-			else:
-				P_l_R = local_ifftn3(P_l_3d, axes=(0, 1, 2), norm='forward')
-				P_l_R_conj = jnp.conj(P_l_R)
-				del P_l_3d, P_l_R
-				P_r_R = local_ifftn3(P_r_3d, axes=(0, 1, 2), norm='forward')
-				del P_r_3d
-				Z_R = gamma_double_contract(
-					P_l_R_conj, P_r_R,
-					perm_L=None if _lhs_id else perm_L_,
-					phase_L=None if _lhs_id else phase_L_,
-					perm_R=None if _rhs_id else perm_R_,
-					phase_R=None if _rhs_id else phase_R_,
-					spin_axes=(3, 6),
-				)
-				del P_l_R_conj, P_r_R
-				Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
-			return jnp.transpose(
-				Z_q_3d.reshape(nkx * nky * nkz, r_loc, mu_loc),
-				(0, 2, 1))
-
-		@jax.jit
-		def fn(psi_l_X_, psi_r_X_, pL, phL, pR, phR, r_start_,
-		        g_index_, kvecs_frac_, psi_r_cache_):
-			return _local(psi_l_X_, psi_r_X_, pL, phL, pR, phR, r_start_,
-			              g_index_, kvecs_frac_, psi_r_cache_)
-
-		_pair_pipeline_sm_cache[cache_key] = fn
-
-	if lhs_id:
-		perm_L = jnp.arange(ns, dtype=jnp.int32)
-		phase_L = jnp.ones(ns, dtype=jnp.complex128)
-	else:
-		perm_L, phase_L = gamma_L
-	if rhs_id:
-		perm_R = jnp.arange(ns, dtype=jnp.int32)
-		phase_R = jnp.ones(ns, dtype=jnp.complex128)
-	else:
-		perm_R, phase_R = gamma_R
-
-	r_start_arg = (jnp.int32(int(r_start_dyn))
-	                if isinstance(r_start_dyn, (int, np.integer))
-	                else r_start_dyn)
-	if psi_r_cache is None:
-		# Unused compatibility operand.  Its sharded band axis is exactly P
-		# wide so every mesh can lower the same wrapper without allocating a
-		# full-grid cache merely to exercise the historical path.
-		psi_r_cache = jnp.zeros(
-			(1, 1, P_total, 1, 1), dtype=jnp.complex128)
-	return _pair_pipeline_sm_cache[cache_key](
-		psi_l_X, psi_r_X, perm_L, phase_L, perm_R, phase_R, r_start_arg,
-		psi_G_store.g_index, psi_G_store.kvecs_frac, psi_r_cache)
-
-
-# ============================================================================
-# Face-layout Z_q (low_mem_bands=True) — the r-chunk pair-density RHS reads
-# its band-contraction operand out of the persistent two-face carrier
-# (`gw.wavefunction_bundle.PSI_MUN_SPEC`) instead of a resident single-axis
-# copy.  See docs/architecture/zeta_fit_face_psi_cct.md's r-chunk section for
-# the derivation and the `all_to_all('y')` collision this design avoids;
-# mirrors the `_c_q_legacy` / `_c_q_face` split above.
-# ============================================================================
-
-def _z_q_face(
-	psi_mun: jax.Array,
-	psi_G_store,
-	psi_r_cache: jax.Array | None,
-	weight_l: jax.Array,
-	weight_r: jax.Array,
-	gamma_L: tuple[jax.Array, jax.Array] | None = None,
-	gamma_R: tuple[jax.Array, jax.Array] | None = None,
-	*,
-	band_chunk_ranges: tuple[tuple[int, int], ...],
-	r_start_dyn,
-	r_chunk_size: int,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-	cache_y_blocks: bool = False,
-	cache_y_r_tile: int = 0,
-	coupled_mu123: bool = False,
-) -> jax.Array:
-	"""Face-layout Z_q: the same canonical io_callback/``psi_r_cache``
-	read, ``all_to_all('y')`` r-scatter + ``all_gather('x')`` band
-	replication, IFFT -> γ̃·γ̃ -> FFT tail as :func:`_z_q_legacy`, with the
-	band-contraction operand
-	(``psi_l_X``/``psi_r_X`` in the legacy signature) is never a resident
-	single-axis array.  Instead, for EACH band-chunk ``bc`` inside the
-	SAME scan that already streams the Y-side, this reads a
-	``bpd_max_global``-wide (one band-chunk's worth, NOT the whole
-	[b0,b4) window) slab directly out of the two-face carrier's
-	``psi_mun`` (``gw.wavefunction_bundle.PSI_MUN_SPEC``,
-	``P(None,None,'x','y')``, μ on 'x', bands on 'y', resident at
-	``2·S/(Px·Py)`` for the WHOLE fit) via a per-position ``jnp.take``
-	(this rank's own local band shard, index-clamped to stay in bounds)
-	masked by "does this rank own this global band" and reduced with
-	``jax.lax.psum('y')`` — a bounded, SELECTIVE broadcast-from-owner,
-	not a resident copy and not a full ``all_gather('y')`` of the whole
-	shard.
-
-	Why not a genuine SUMMA :func:`distrib_la.gemm_plan` GEMM (the CCT
-	recipe) instead: ``gemm_plan``'s compiled kernel is its OWN top-level
-	``jax.jit``+``shard_map`` pair operating on GLOBALLY-sharded operands
-	— it cannot be called on the LOCAL, un-annotated buffers a MANUAL-
-	mode ``shard_map`` body (which this kernel already is, for the
-	``all_to_all``/``all_gather`` r-scatter) sees.  Restructuring the
-	whole r-scatter out of manual mode to make room for it is exactly
-	the "distributed-algorithm redesign of the streaming kernel" the
-	design note named as out of scope; the masked-gather-then-``psum``
-	route achieves the SAME "no resident single-axis copy, one bounded
-	transient" result while leaving the r-scatter's own
-	``shard_map``/``lax.scan`` untouched.  See
-	docs/architecture/zeta_fit_face_psi_cct.md's r-chunk section.
-
-	γ̃ VERTEX (``gamma_L``/``gamma_R`` not ``None``, 2026-08-23) — mirrors
-	:func:`_c_q_face`'s endpoint application exactly: only ``P_r`` is
-	transformed and ``P_l`` remains untouched.  For each scalar pair the X
-	gather selects at most the raw ``a`` and ``perm_L[a]`` rows *before* its
-	selective ``psum('y')``; the Y block selects raw ``b`` and
-	``perm_R[b]`` rows after the incumbent r-scatter.  Spin is orthogonal to
-	every axis those collectives move, so endpoint selection commutes with the
-	movement while avoiding a full-spin gathered X transient per pair.
-
-	The pair-density band sums are completed one raw spin pair ``(a,b)`` at
-	a time.  The right endpoint is exactly
-	``(perm_L[a], perm_R[b])`` with the original
-	``phase_L[a] * phase_R[b]``; the bra source has already been conjugated,
-	so these phases are deliberately not conjugated.  Only after all band
-	chunks have completed that pair do the two k-IFFTs and
-	``conj(P_l_R) * P_r_R`` product run.  Multiplying per band chunk would
-	drop the cross-chunk particle-hole terms and is not algebraically valid.
-
-	``cache_y_blocks=True`` builds the canonical Y-side r-scatter once for
-	each bounded cache tile and stacks ``(n_bc,nk,bc,ns,r_tile/Py)`` for
-	reuse by the scalar-pair scan.  ``cache_y_r_tile == r_chunk_size`` is the
-	original one-pass cache; a smaller exact divisor repeats the canonical
-	transform once per tile while keeping the outer solve chunk unchanged.
-	``False`` calls that same transform/scatter owner
-	inside each scalar-pair band scan and keeps only one band block live.  The
-	latter is slower but bounds memory independently of the total band count;
-	it is retained as the fail-safe route for cache-infeasible large-N/P
-	geometries and for ``ns=1`` where stacking has no reuse benefit.
-
-	``weight_l``/``weight_r``: ``(nb_face,)`` real, 1.0 inside the L/R
-	band window and 0.0 outside — the SAME "weight, don't window"
-	convention :func:`_c_q_face` uses for the CCT Gram (the L/R sigma-
-	window edge is not generally mesh-divisible; a weighted FULL-extent
-	contraction needs no extra pad).  Applied to the μ/bra operand only:
-	the contraction is bilinear in ψ, so masking either operand zeroes
-	the product — ``psi_Y_bc`` below is shared UNMASKED between the L
-	and R einsums, unlike legacy's independently-masked
-	``psi_l_Y_bc``/``psi_r_Y_bc`` pair.
-	"""
-	fft_grid = tuple(int(s) for s in psi_G_store.meta.fft_grid)
-	nkx, nky, nkz = kgrid
-	nk = int(psi_mun.shape[0])
-	ns = int(psi_mun.shape[1])
-	nb_face = int(psi_mun.shape[3])
-	if coupled_mu123:
-		if ns != 4 or gamma_L is None or gamma_R is None:
-			raise ValueError(
-				"_z_q_face(coupled_mu123=True) requires ns=4 and the stacked "
-				"mu=1,2,3 monomial endpoint tables.")
-		if (tuple(gamma_L[0].shape) != (3, 4)
-				or tuple(gamma_L[1].shape) != (3, 4)
-				or tuple(gamma_R[0].shape) != (3, 4)
-				or tuple(gamma_R[1].shape) != (3, 4)):
-			raise ValueError(
-				"_z_q_face(coupled_mu123=True) requires exactly three "
-				"four-spinor transverse endpoint tables.")
-		if not cache_y_blocks:
-			raise ValueError(
-				"_z_q_face(coupled_mu123=True) requires cache_y_blocks=True "
-				"so the canonical Y transform is shared across all channels.")
-	if nk != nkx * nky * nkz:
-		raise ValueError(
-			f"_z_q_face: psi_mun k-axis {nk} != prod(kgrid)={nkx*nky*nkz}")
-	if int(weight_l.shape[0]) != nb_face or int(weight_r.shape[0]) != nb_face:
-		raise ValueError(
-			f"_z_q_face: weight_l/weight_r must have shape ({nb_face},) "
-			f"matching psi_mun's own band extent; got "
-			f"{tuple(weight_l.shape)}/{tuple(weight_r.shape)}.")
-	n_zchunk = int(r_chunk_size)
-	p_y = int(mesh_xy.shape['y'])
-	from runtime.padding import authenticate_padded_axis
-	authenticate_padded_axis(
-		n_zchunk, n_zchunk, mesh_xy,
-		name="face zeta real-space chunk carrier",
-		spec=P(None, 'x', 'y'), axis=2)
-	authenticate_padded_axis(
-		nb_face, nb_face, mesh_xy, name="face zeta band carrier",
-		spec=P(None, 'y', None, 'x'), axis=1)
-	r_loc = n_zchunk // p_y
-	cache_y_r_tile = int(cache_y_r_tile)
-	if cache_y_blocks:
-		if cache_y_r_tile <= 0:
-			cache_y_r_tile = n_zchunk
-		if cache_y_r_tile <= n_zchunk:
-			authenticate_padded_axis(
-				cache_y_r_tile, cache_y_r_tile, mesh_xy,
-				name="face zeta cache tile carrier",
-				spec=P(None, None, 'y'), axis=2)
-		if (cache_y_r_tile > n_zchunk
-				or n_zchunk // cache_y_r_tile * cache_y_r_tile != n_zchunk):
-			raise ValueError(
-				"_z_q_face: cache_y_r_tile must be a positive, p_y-aligned "
-				"exact divisor of r_chunk_size; got "
-				f"tile={cache_y_r_tile}, r_chunk_size={n_zchunk}, p_y={p_y}")
-	else:
-		cache_y_r_tile = 0
-	lhs_id = gamma_L is None
-	rhs_id = gamma_R is None
-
-	if cache_y_blocks and cache_y_r_tile < n_zchunk:
-		# Each tile remains a genuine GLOBAL P(None,'x','y') array.  Calling
-		# the same full-cache owner at the tile width bounds its Y
-		# all_to_all/all_gather bytes; concatenating here, OUTSIDE manual
-		# shard_map, lets JAX perform the required compact-Z redistribution.
-		# Concatenating the LOCAL y shards inside `_local` would be wrong:
-		# tile t / rank y owns global segment (t*tile + y*tile/Py), whereas
-		# the outer carrier assigns each rank one contiguous r_chunk/Py slab.
-		n_cache_tiles = n_zchunk // cache_y_r_tile
-		Z_q_tiles = tuple(
-			_z_q_face(
-				psi_mun, psi_G_store, psi_r_cache, weight_l, weight_r,
-				gamma_L=gamma_L, gamma_R=gamma_R,
-				band_chunk_ranges=band_chunk_ranges,
-				r_start_dyn=r_start_dyn + tile_idx * cache_y_r_tile,
-				r_chunk_size=cache_y_r_tile,
-				kgrid=kgrid, mesh_xy=mesh_xy,
-				cache_y_blocks=True,
-				cache_y_r_tile=cache_y_r_tile,
-				coupled_mu123=coupled_mu123)
-			for tile_idx in range(n_cache_tiles)
-		)
-		Z_q = jnp.concatenate(Z_q_tiles, axis=-1)
-		return jax.lax.with_sharding_constraint(
-			Z_q, NamedSharding(
-				mesh_xy,
-				P(None, None, 'x', 'y') if coupled_mu123
-				else P(None, 'x', 'y')))
-
-	bcr = tuple((int(lo), int(hi)) for (lo, hi) in band_chunk_ranges)
-	if not bcr:
-		raise ValueError("_z_q_face: band_chunk_ranges is empty")
-	# band_chunk_ranges (isdf_fitting.py STEP 5) tile starting exactly at
-	# band_range_full[0] — the SAME global offset psi_mun's own axis-0
-	# position (isdf_fitting.py's `_off`, weight_l/weight_r's own
-	# construction) is built from.  So `bc.lo - _bfs` is psi_mun's local
-	# (0-based) band index directly, with no separate parameter needed.
-	_bfs = bcr[0][0]
-	use_psi_r_cache = psi_r_cache is not None
-	from runtime.padding import mesh_divisor
-	P_total = mesh_divisor(mesh_xy)
-	local_band_chunk_shape = tuple(
-		int(v) for v in psi_G_store.local_band_chunk_shape)
-	if local_band_chunk_shape[0] != nk or local_band_chunk_shape[2] != ns:
-		raise ValueError(
-			"_z_q_face: PsiGStore public callback shape disagrees with the "
-			f"face carrier: store={local_band_chunk_shape}, nk={nk}, ns={ns}")
-	bpd_max = int(local_band_chunk_shape[1])
-	bpd_max_global = int(psi_G_store.band_chunk_carrier)
-	if bpd_max_global != bpd_max * P_total:
-		raise ValueError(
-			"_z_q_face: PsiGStore public carrier metadata is inconsistent: "
-			f"band_chunk_carrier={bpd_max_global}, local width={bpd_max}, "
-			f"world_size={P_total}")
-	n_bc = len(bcr)
-
-	# Y-side compaction table — IDENTICAL derivation to `_z_q_legacy`'s
-	# own (duplicated rather than shared: `_z_q_legacy` is a frozen,
-	# untouched body; see its comment for the reasoning).
-	_y_compact_idx_np = np.zeros((n_bc, bpd_max_global), dtype=np.int32)
-	for _bc in range(n_bc):
-		_bc_width = bcr[_bc][1] - bcr[_bc][0]
-		from runtime.padding import authenticate_padded_axis
-		_bc_axis = authenticate_padded_axis(
-			_bc_width, _bc_width, P_total,
-			name=f"face zeta band chunk {_bc}")
-		_nb_tot = _bc_axis.carrier
-		_bpd = _nb_tot // P_total
-		if _bpd > bpd_max:
-			raise ValueError(
-				f"_z_q_face band chunk {_bc} has {_bpd} bands/rank, "
-				f"exceeding the allocated maximum {bpd_max}")
-		if _bpd <= 0:
-			continue
-		_p = np.arange(bpd_max_global)
-		_y_compact_idx_np[_bc] = np.where(
-			_p < _nb_tot, (_p // _bpd) * bpd_max + (_p % _bpd), _bpd)
-	_y_compact_identity = bool(
-		n_bc > 0
-		and np.array_equal(
-			_y_compact_idx_np,
-			np.broadcast_to(
-				np.arange(bpd_max_global, dtype=np.int32),
-				(n_bc, bpd_max_global))))
-
-	_b_lo_rel_np = np.asarray(
-		[lo - _bfs for (lo, _hi) in bcr], dtype=np.int32)
-	# ``bpd_max_global`` is the UNIFORM (max-over-bc) padded width every
-	# scan iteration uses; a SHORT bc (the final one, typically) has
-	# ``hi - lo < bpd_max_global``, so ``global_band`` overruns this bc's
-	# OWN true end for the trailing pad positions -- and, since bc's are
-	# not required to reach ``nb_face`` with a full bpd_max_global margin,
-	# it can overrun psi_mun's/weight's own array EXTENT too.  ``bc_valid``
-	# (mirrors ``_z_q_legacy``'s identically-named mask) catches this
-	# BEFORE any ``jnp.take`` touches ``weight_l``/``weight_r`` — an
-	# unclamped out-of-range take on a REAL (non-JAX-array) axis silently
-	# fills with NaN, and a single NaN entering the scan's ``+=``
-	# accumulator poisons every element of the final Z_q (measured: 100%
-	# NaN, all three parity cases, before this fix).
-	_b_hi_rel_np = np.asarray(
-		[hi - _bfs for (_lo, hi) in bcr], dtype=np.int32)
-
-	ngkmax = int(local_band_chunk_shape[3])
-	_per_rank_bc_shape = (nk, bpd_max, ns, ngkmax)
-	_slicer_out_sds = jax.ShapeDtypeStruct(_per_rank_bc_shape, jnp.complex128)
-
-	def _slicer_host(x_idx, y_idx, bc_idx):
-		return psi_G_store.read_local_band_chunk(x_idx, y_idx, bc_idx)
-
-	mun_spec = P(None, None, 'x', 'y')
-	out_spec = (P(None, None, 'x', 'y') if coupled_mu123
-			else P(None, 'x', 'y'))
-	w_spec = P(None)
-	g_index_spec = P(None, None, None, None)
-	kvecs_frac_spec = P(None, None)
-	cache_spec = P(None, None, ('x', 'y'), None, None)
-	fft_grid_t = tuple(int(s) for s in fft_grid)
-
-	cache_key = (
-		'z_q_face_streaming', id(mesh_xy), id(psi_G_store),
-		nk, ns, nb_face, n_zchunk, nkx, nky, nkz,
-		bcr, use_psi_r_cache, bool(cache_y_blocks), cache_y_r_tile,
-		lhs_id, rhs_id, bool(coupled_mu123),
-		(None if psi_r_cache is None
-		 else tuple(int(s) for s in psi_r_cache.shape)),
-	)
-	if cache_key not in _pair_pipeline_sm_cache:
-
-		@partial(shard_map, mesh=mesh_xy,
-		         in_specs=(mun_spec, w_spec, w_spec, P(), P(), P(), P(), P(),
-		                   g_index_spec, kvecs_frac_spec, cache_spec),
-		         out_specs=out_spec, check_vma=False)
-		def _local(psi_mun_, w_l_, w_r_, perm_L_, phase_L_, perm_R_, phase_R_,
-		           r_start_, g_index_dev, kvecs_frac_dev, psi_r_cache_):
-			x_idx = jax.lax.axis_index('x')
-			y_idx = jax.lax.axis_index('y')
-			mu_loc = psi_mun_.shape[2]
-			shard_w = psi_mun_.shape[3]
-			# X operand role is conj(ψ) (the μ-indexed "bra") — see
-			# `_c_q_face`'s identical convention.  Conjugate the WHOLE
-			# local shard ONCE (not per-bc); XLA's scan-internal
-			# allocator aliases the read across iterations.
-			psi_mun_conj = jnp.conj(psi_mun_)
-
-			b_lo_rel_arr = jnp.asarray(_b_lo_rel_np)
-			b_hi_rel_arr = jnp.asarray(_b_hi_rel_np)
-			if not _y_compact_identity:
-				y_compact_idx = jnp.asarray(_y_compact_idx_np)
-
-			# Cache the incumbent Y-side transform/r-scatter ONCE for this
-			# bounded r chunk.  The leading scan axis is the existing band-chunk
-			# table; its value is consumed read-only by every scalar spin-pair
-			# pass below.  This is not a second WFN/FFT path: the body is the
-			# exact take_rchunk_padded/to_rchunk_inner + all_to_all/all_gather
-			# transaction that used to run inside the open-spin band scan.
-			def load_y_block_full(bc_idx):
-				if use_psi_r_cache:
-					psi_Y_bc_local_full_r = take_rchunk_padded(
-						psi_r_cache_[bc_idx], r_start_, n_zchunk)
-				else:
-					psi_G_bc_local = _io_callback(
-						_slicer_host, _slicer_out_sds,
-						x_idx, y_idx, bc_idx, ordered=False)
-					psi_Y_bc_local_full_r = to_rchunk_inner(
-						psi_G_bc_local, g_index_dev, fft_grid_t,
-						r_start_, n_zchunk,
-						kvecs_frac=kvecs_frac_dev, norm="ortho")
-				psi_Y_col = jax.lax.all_to_all(
-					psi_Y_bc_local_full_r, 'y', split_axis=3,
-					concat_axis=1, tiled=True)
-				psi_Y_bc = jax.lax.all_gather(
-					psi_Y_col, axis_name='x', axis=1, tiled=True)
-				assert psi_Y_bc.shape[1] == bpd_max_global
-				if not _y_compact_identity:
-					psi_Y_bc = jnp.take(
-						psi_Y_bc, y_compact_idx[bc_idx], axis=1)
-				assert psi_Y_bc.shape[3] == r_loc
-				return psi_Y_bc
-
-			def load_x_block_full(bc_idx):
-				"""One full-spin owner broadcast, shared by mu=1,2,3."""
-				p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
-				global_band = b_lo_rel_arr[bc_idx] + p_arr
-				owner_y = global_band // shard_w
-				local_idx = jnp.clip(
-					global_band - y_idx * shard_w, 0, shard_w - 1)
-				gathered = jnp.take(psi_mun_conj, local_idx, axis=3)
-				gathered = jnp.where(
-					(owner_y == y_idx)[None, None, None, :], gathered, 0)
-				return jax.lax.psum(gathered, 'y')
-
-			# The response is nonlinear in the completed band sums:
-			#   conj(sum_n P_l[n]) * sum_m P_r[m].
-			# Therefore the inner scan completes ALL band chunks for one raw
-			# spin pair (a,b), then both k-IFFTs run, and only then may that
-			# pair's contribution enter Z_R.  The outer scan partitions the
-			# exact Frobenius spin sum into ns^2 scalar terms and retains only
-			# two rank-3 P carries instead of two rank-5 open-spin carries.
-			def accumulate_spin_pairs(
-					psi_Y_blocks, active_r_loc, psi_X_blocks=None,
-					channel_idx=None):
-				"""Complete every spin pair for one local-r cache transaction."""
-				if coupled_mu123:
-					perm_L_channel = perm_L_[channel_idx]
-					phase_L_channel = phase_L_[channel_idx]
-					perm_R_channel = perm_R_[channel_idx]
-					phase_R_channel = phase_R_[channel_idx]
-				else:
-					perm_L_channel = perm_L_
-					phase_L_channel = phase_L_
-					perm_R_channel = perm_R_
-					phase_R_channel = phase_R_
-				Z_R_init = jnp.zeros(
-					(nkx, nky, nkz, active_r_loc, mu_loc),
-					dtype=jnp.complex128)
-
-				def spin_pair_body(Z_R_acc, ab):
-					a = ab // ns
-					b = ab % ns
-					P_l_init = jnp.zeros(
-						(nk, active_r_loc, mu_loc), dtype=jnp.complex128)
-					P_r_init = jnp.zeros(
-						(nk, active_r_loc, mu_loc), dtype=jnp.complex128)
-
-					def band_body(carry, bc_idx):
-						P_l_acc, P_r_acc = carry
-						if cache_y_blocks:
-							psi_Y_bc = psi_Y_blocks[bc_idx]
-						else:
-							# Always-valid bounded route: repeat the SAME incumbent
-							# transform/scatter for this scalar spin pair, retaining
-							# only one band chunk rather than the stacked Y cache.
-							psi_Y_bc = load_y_block_full(bc_idx)
-
-						# Selectively broadcast this band chunk from psi_mun's
-						# owning y-rank.  The collective and its physical band order
-						# are unchanged from the pre-streaming face kernel.
-						p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
-						global_band = b_lo_rel_arr[bc_idx] + p_arr
-						if coupled_mu123:
-							x_rows_bc = jnp.take(
-								psi_X_blocks[bc_idx],
-								jnp.stack((a, perm_L_channel[a])), axis=1)
-						else:
-							owner_y = global_band // shard_w
-							owns = (owner_y == y_idx)
-							if lhs_id:
-								x_rows_local = jax.lax.dynamic_slice_in_dim(
-									psi_mun_conj, a, 1, axis=1)
-							else:
-								x_rows_local = jnp.take(
-									psi_mun_conj,
-									jnp.stack((a, perm_L_channel[a])), axis=1)
-							local_idx = jnp.clip(
-								global_band - y_idx * shard_w, 0, shard_w - 1)
-							gathered = jnp.take(x_rows_local, local_idx, axis=3)
-							gathered = jnp.where(
-								owns[None, None, None, :], gathered, 0)
-							x_rows_bc = jax.lax.psum(gathered, 'y')
-
-						# A short final chunk can extend past both its true edge and
-						# the face carrier.  Clip every take and zero the inert lanes
-						# through the incumbent weight convention.
-						bc_valid = global_band < b_hi_rel_arr[bc_idx]
-						g_clamped = jnp.clip(global_band, 0, nb_face - 1)
-						w_l_bc = jnp.where(
-							bc_valid, jnp.take(w_l_, g_clamped), 0.0)
-						w_r_bc = jnp.where(
-							bc_valid, jnp.take(w_r_, g_clamped), 0.0)
-
-						# gamma_apply's monomial convention is
-						#   out[a] = phase[a] * raw[perm[a]].
-						# The bra source is already conjugated above, so retain the
-						# ORIGINAL phase (never conj(phase)).  The charge channel's
-						# canonical identity perm/phase makes these the same raw rows.
-						x_l = x_rows_bc[:, 0, :, :]
-						y_l = jax.lax.dynamic_index_in_dim(
-							psi_Y_bc, b, axis=2, keepdims=False)
-						x_r = (x_l if lhs_id else x_rows_bc[:, 1, :, :])
-						x_r = phase_L_channel[a] * x_r
-						y_r = jax.lax.dynamic_index_in_dim(
-							psi_Y_bc, perm_R_channel[b], axis=2, keepdims=False)
-						y_r = phase_R_channel[b] * y_r
-
-						x_l = x_l * w_l_bc[None, None, :].astype(x_l.dtype)
-						x_r = x_r * w_r_bc[None, None, :].astype(x_r.dtype)
-						delta_l = jnp.einsum(
-							'kmn,knr->krm', x_l, y_l, optimize=True)
-						delta_r = jnp.einsum(
-							'kmn,knr->krm', x_r, y_r, optimize=True)
-						return (P_l_acc + delta_l, P_r_acc + delta_r), None
-
-					(P_l, P_r), _ = jax.lax.scan(
-						band_body, (P_l_init, P_r_init),
-						jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
-					P_l_3d = P_l.reshape(
-						nkx, nky, nkz, active_r_loc, mu_loc)
-					P_r_3d = P_r.reshape(
-						nkx, nky, nkz, active_r_loc, mu_loc)
-					P_l_R = local_ifftn3(
-						P_l_3d, axes=(0, 1, 2), norm='forward')
-					P_r_R = local_ifftn3(
-						P_r_3d, axes=(0, 1, 2), norm='forward')
-					return Z_R_acc + jnp.conj(P_l_R) * P_r_R, None
-
-				Z_R, _ = jax.lax.scan(
-					spin_pair_body, Z_R_init,
-					jnp.arange(ns * ns, dtype=jnp.int32), unroll=1)
-				return Z_R
-
-			def accumulate_coupled_channels(
-					psi_Y_blocks, psi_X_blocks, active_r_loc):
-				"""Share the channel-independent left density across mu=1,2,3.
-
-				Only one right-channel density is live at a time.  Thus coupling
-				the arithmetic removes two redundant left contractions/IFFTs per
-				spin pair without introducing a three-channel P_r carrier.
-				"""
-				Z_R_init = jnp.zeros(
-					(3, nkx, nky, nkz, active_r_loc, mu_loc),
-					dtype=jnp.complex128)
-
-				def spin_pair_body(Z_R_acc, ab):
-					a = ab // ns
-					b = ab % ns
-					P_l_init = jnp.zeros(
-						(nk, active_r_loc, mu_loc), dtype=jnp.complex128)
-
-					def left_band_body(P_l_acc, bc_idx):
-						psi_Y_bc = psi_Y_blocks[bc_idx]
-						p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
-						global_band = b_lo_rel_arr[bc_idx] + p_arr
-						bc_valid = global_band < b_hi_rel_arr[bc_idx]
-						g_clamped = jnp.clip(global_band, 0, nb_face - 1)
-						w_l_bc = jnp.where(
-							bc_valid, jnp.take(w_l_, g_clamped), 0.0)
-						x_l = jax.lax.dynamic_index_in_dim(
-							psi_X_blocks[bc_idx], a, axis=1, keepdims=False)
-						y_l = jax.lax.dynamic_index_in_dim(
-							psi_Y_bc, b, axis=2, keepdims=False)
-						x_l = x_l * w_l_bc[None, None, :].astype(x_l.dtype)
-						delta_l = jnp.einsum(
-							'kmn,knr->krm', x_l, y_l, optimize=True)
-						return P_l_acc + delta_l, None
-
-					P_l, _ = jax.lax.scan(
-						left_band_body, P_l_init,
-						jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
-					P_l_R = local_ifftn3(
-						P_l.reshape(nkx, nky, nkz, active_r_loc, mu_loc),
-						axes=(0, 1, 2), norm='forward')
-					P_l_R_conj = jnp.conj(P_l_R)
-
-					def channel_body(Z_R_channels, channel_idx):
-						perm_L_channel = perm_L_[channel_idx]
-						phase_L_channel = phase_L_[channel_idx]
-						perm_R_channel = perm_R_[channel_idx]
-						phase_R_channel = phase_R_[channel_idx]
-						P_r_init = jnp.zeros(
-							(nk, active_r_loc, mu_loc), dtype=jnp.complex128)
-
-						def right_band_body(P_r_acc, bc_idx):
-							psi_Y_bc = psi_Y_blocks[bc_idx]
-							p_arr = jnp.arange(
-								bpd_max_global, dtype=jnp.int32)
-							global_band = b_lo_rel_arr[bc_idx] + p_arr
-							bc_valid = global_band < b_hi_rel_arr[bc_idx]
-							g_clamped = jnp.clip(
-								global_band, 0, nb_face - 1)
-							w_r_bc = jnp.where(
-								bc_valid, jnp.take(w_r_, g_clamped), 0.0)
-							x_r = jax.lax.dynamic_index_in_dim(
-								psi_X_blocks[bc_idx], perm_L_channel[a],
-								axis=1, keepdims=False)
-							x_r = phase_L_channel[a] * x_r
-							y_r = jax.lax.dynamic_index_in_dim(
-								psi_Y_bc, perm_R_channel[b],
-								axis=2, keepdims=False)
-							y_r = phase_R_channel[b] * y_r
-							x_r = x_r * w_r_bc[None, None, :].astype(x_r.dtype)
-							delta_r = jnp.einsum(
-								'kmn,knr->krm', x_r, y_r, optimize=True)
-							return P_r_acc + delta_r, None
-
-						P_r, _ = jax.lax.scan(
-							right_band_body, P_r_init,
-							jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
-						P_r_R = local_ifftn3(
-							P_r.reshape(
-								nkx, nky, nkz, active_r_loc, mu_loc),
-							axes=(0, 1, 2), norm='forward')
-						Z_R_channel = jax.lax.dynamic_index_in_dim(
-							Z_R_channels, channel_idx, axis=0, keepdims=False)
-						Z_R_channel = Z_R_channel + P_l_R_conj * P_r_R
-						Z_R_channels = jax.lax.dynamic_update_index_in_dim(
-							Z_R_channels, Z_R_channel, channel_idx, axis=0)
-						return Z_R_channels, None
-
-					Z_R_acc, _ = jax.lax.scan(
-						channel_body, Z_R_acc,
-						jnp.arange(3, dtype=jnp.int32), unroll=1)
-					return Z_R_acc, None
-
-				Z_R, _ = jax.lax.scan(
-					spin_pair_body, Z_R_init,
-					jnp.arange(ns * ns, dtype=jnp.int32), unroll=1)
-				return Z_R
-
-			if cache_y_blocks:
-				def build_y_block(_unused, bc_idx):
-					return _unused, load_y_block_full(bc_idx)
-
-				_, psi_Y_blocks = jax.lax.scan(
-					build_y_block, jnp.zeros((), dtype=jnp.int32),
-					jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
-				if coupled_mu123:
-					def build_x_block(_unused, bc_idx):
-						return _unused, load_x_block_full(bc_idx)
-
-					_, psi_X_blocks = jax.lax.scan(
-						build_x_block, jnp.zeros((), dtype=jnp.int32),
-						jnp.arange(n_bc, dtype=jnp.int32), unroll=1)
-
-					Z_R_channels = accumulate_coupled_channels(
-						psi_Y_blocks, psi_X_blocks, r_loc)
-
-					def channel_body(_unused, channel_idx):
-						Z_R_channel = Z_R_channels[channel_idx]
-						Z_q_3d_channel = local_fftn3(
-							Z_R_channel, axes=(0, 1, 2), norm='forward')
-						Z_q_channel = jnp.transpose(
-							Z_q_3d_channel.reshape(
-								nkx * nky * nkz, r_loc, mu_loc),
-							(0, 2, 1))
-						return _unused, Z_q_channel
-
-					_, Z_q_channels = jax.lax.scan(
-						channel_body, jnp.zeros((), dtype=jnp.int32),
-						jnp.arange(3, dtype=jnp.int32), unroll=1)
-					return Z_q_channels
-				# Original one-pass cache: one canonical transform per band
-				# chunk, then read-only reuse across every spin pair.
-				Z_R = accumulate_spin_pairs(psi_Y_blocks, r_loc)
-			else:
-				# Dummy is dead after tracing the static repeated-route branch.
-				Z_R = accumulate_spin_pairs(
-					jnp.zeros((), dtype=jnp.int32), r_loc)
-			Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
-			return jnp.transpose(
-				Z_q_3d.reshape(nkx * nky * nkz, r_loc, mu_loc),
-				(0, 2, 1))
-
-		@jax.jit
-		def fn(psi_mun_, w_l_, w_r_, perm_L_, phase_L_, perm_R_, phase_R_,
-		        r_start_, g_index_, kvecs_frac_, psi_r_cache_):
-			return _local(psi_mun_, w_l_, w_r_, perm_L_, phase_L_,
-			              perm_R_, phase_R_, r_start_, g_index_,
-			              kvecs_frac_, psi_r_cache_)
-
-		_pair_pipeline_sm_cache[cache_key] = fn
-
-	if lhs_id:
-		perm_L = jnp.arange(ns, dtype=jnp.int32)
-		phase_L = jnp.ones(ns, dtype=jnp.complex128)
-	else:
-		perm_L, phase_L = gamma_L
-	if rhs_id:
-		perm_R = jnp.arange(ns, dtype=jnp.int32)
-		phase_R = jnp.ones(ns, dtype=jnp.complex128)
-	else:
-		perm_R, phase_R = gamma_R
-
-	r_start_arg = (jnp.int32(int(r_start_dyn))
-	                if isinstance(r_start_dyn, (int, np.integer))
-	                else r_start_dyn)
-	if psi_r_cache is None:
-		psi_r_cache = jnp.zeros(
-			(1, 1, P_total, 1, 1), dtype=jnp.complex128)
-	return _pair_pipeline_sm_cache[cache_key](
-		psi_mun, weight_l.astype(jnp.float64), weight_r.astype(jnp.float64),
-		perm_L, phase_L, perm_R, phase_R,
-		r_start_arg, psi_G_store.g_index, psi_G_store.kvecs_frac,
-		psi_r_cache)
 
 
 def _band_chunk_compaction(bcr, bpd_max: int, P_total: int):
-	"""Per-chunk Y-side compaction table (and whether it is the identity).
-
-	After ``all_to_all('y')`` + ``all_gather('x')`` every rank holds all P
-	ranks' ``bpd_max`` band slots of one chunk; a chunk narrower than the
-	uniform carrier leaves its real bands at stride ``bpd_max``.  The table
-	maps the compact global band position back to that slot.  Shared by the
-	parent-k kernel; the two full-k kernels keep their own frozen copies.
-	"""
+	"""Per-chunk Y-side compaction table (and whether it is the identity); see docs/architecture/zeta_fit_face_psi_cct.md."""
 	n_bc = len(bcr)
 	bpd_max_global = int(bpd_max) * int(P_total)
 	table = np.zeros((n_bc, bpd_max_global), dtype=np.int32)
@@ -2992,71 +1319,18 @@ def _z_q_face_parent(
 	weight_r: jax.Array,
 	*,
 	k_unfold_plan,
+	gamma_L: int = 0,
+	gamma_R: int = 0,
+	coupled_mu123: bool = False,
 	tile_r_index: jax.Array,
 	tile_local_perm: jax.Array,
 	tile_wraps: jax.Array,
 	band_chunk_ranges: tuple[tuple[int, int], ...],
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
+	layout="face",
 ) -> jax.Array:
-	r"""Face-layout Z_q on one orbit-closed real-grid tile, from raw parents.
-
-	The pair-density RHS of the ζ fit,
-
-	    Z_q(mu, r) = FFT_k [ IFFT_k(P^L_k)(mu, r)^* · IFFT_k(P^R_k)(mu, r) ],
-	    P^A_k(mu, r) = sum_n w^A_n psi^*_{nk}(mu) psi_{nk}(r),
-
-	needs the pair density at EVERY full-zone k before its two k-transforms,
-	but the band contraction that forms it is only needed on the raw WFN
-	parents: at a child ``k = g·kbar`` the projector is the typed symmetry
-	image of the parent's,
-
-	    D_k = U_g · [ e^{2πi kbar·(L_mu − L_r)} D_kbar(alpha_g(mu), alpha_g(r)) ] · U_g†,
-	    D_k[a, mu, b, r] = sum_n w_n psi_{nka}(mu) psi^*_{nkb}(r) = conj(P_k),
-
-	conjugated once more on antiunitary rows.  That image is a permutation
-	of BOTH endpoints.  Centroids are orbit-packed so ``alpha_g`` stays on
-	one X owner (``gw.centroid_k_unfold``); a contiguous r slab is not
-	closed, so this kernel takes its r endpoint from an orbit-closed tile
-	(``RealGridOrbitTiles``: complete orbits, each whole on one Y owner,
-	owner-local pads) and the gather stays on one Y owner too.  The
-	transport is therefore collective-free, and the tile's tables are
-	RUNTIME operands so every tile reuses one executable.
-
-	Stages, in one compiled program:
-
-	1. ``_projectors`` (manual ``shard_map``): stream the band chunks exactly
-	   as :func:`_z_q_face` does — Y block through the store/cache and the
-	   canonical ``to_rpoints_inner`` gather at the tile's points, then
-	   ``all_to_all('y')`` + ``all_gather('x')``; X block by the same masked
-	   ``psum('y')`` broadcast from ``psi_mun`` — but on ``n_parent`` k rows
-	   and WITHOUT conjugating the X operand, accumulating the open-spin
-	   Green-oriented projectors ``D^L_kbar``, ``D^R_kbar``
-	   ``(n_parent, s, mu_loc, s, r_loc)``.  Both spin pairs are carried
-	   because the spin action mixes them; at parent size that costs less
-	   than one full-k scalar carry.
-	2. ``_tile_tail`` (manual ``shard_map``): for each OUTPUT spin block
-	   ``(a, b)`` — one full-k block live at a time, the memory contract of
-	   the incumbent scalar-pair loop — accumulate
-	   ``sum_{c,d} U[a,c] U^*[b,d] · unfold(D[c,:,d,:])`` through
-	   :func:`symmetry_maps.unfold_operator_local` (gathers, phases,
-	   antiunitary conjugation) and :func:`symmetry_maps.open_spin_block_coefficient`
-	   (the spin representation), conjugate to obtain ``P_k``, k-IFFT both
-	   sides and add ``conj(P^L_R)·P^R_R`` into ``Z_R``; k-FFT once at the end.
-	   No symmetry algebra is written here; both helpers are the service's.
-
-	    psi_mun_parent : (n_parent, s, mu_pk, nb_face) P(None,None,'x','y'),
-	                     orbit-packed, un-conjugated raw-parent ψ(r_mu)
-	    psi_G_store    : ``PsiGStore(k_domain='ibz')`` (parent rows)
-	    psi_r_cache    : optional hoisted parent ψ(r) cache
-	                     (n_bc, n_parent, B_c, s, n_rtot) P(None,None,('x','y'),None,None)
-	    tile_r_index   : (R_t,) int32 flat grid index per slot, -1 pads
-	    tile_local_perm: (2·n_sym, R_t) int32 owner-local r source offsets
-	    tile_wraps     : (2·n_sym, R_t, 3) lattice wraps of the r sources
-	Returns ``Z_q`` (nk_full, mu_pk, R_t) P(None,'x','y'): centroids in the
-	run's packed order, r in the tile's slot order, pad slots exactly zero.
-	Charge channel only (see :func:`_c_q_face_parent`).
-	"""
+	"""Build raw-parent pair projectors and unfold each spin block on an orbit-closed tile."""
 	from common.wfn_transforms import to_rpoints_inner
 	from ffi import _services
 	_services.ensure_on_path()
@@ -3094,6 +1368,11 @@ def _z_q_face_parent(
 		spec=P(None, 'y', None, 'x'), axis=1)
 	r_loc = R_t // p_y
 	mu_loc = mu_pk // p_x
+	from ffi.fft import make_fused_conv_kparent
+	p_l, ph_l = _conv_kpair_static_gamma(None, ns)
+	pair_kernel = make_fused_conv_kparent(
+		mesh_xy, kgrid, ns, (mu_loc, r_loc),
+		perm_l=p_l, phase_l=ph_l, perm_r=p_l, phase_r=ph_l)
 	n_rows = 2 * int(plan.n_sym_spatial)
 	if (tuple(int(v) for v in tile_local_perm.shape) != (n_rows, R_t)
 			or tuple(int(v) for v in tile_wraps.shape) != (n_rows, R_t, 3)):
@@ -3144,17 +1423,30 @@ def _z_q_face_parent(
 	left_L_np = np.asarray(plan.L_table, dtype=np.float64)
 	spin_np = np.asarray(plan.spin_action_full, dtype=np.complex128)
 	n_sym_spatial = int(plan.n_sym_spatial)
+	# Skip exact structural zeros in the service-provided spin action.
+	spin_support = np.any(spin_np != 0, axis=0)
+	source_pairs = [np.flatnonzero(
+		(spin_support[a, :, None] & spin_support[b, None, :]).reshape(-1))
+		for a in range(ns) for b in range(ns)]
+	max_sources = max(len(pairs) for pairs in source_pairs)
+	source_counts = np.asarray([len(pairs) for pairs in source_pairs])
+	source_pairs = np.asarray([np.pad(pairs, (0, max_sources - len(pairs)),
+		constant_values=int(pairs[0])) for pairs in source_pairs], dtype=np.int32)
 
-	mun_spec = P(None, None, 'x', 'y')
+	from common.wfn_layout import psi_specs
+	_, mun_spec = psi_specs(layout)
 	pair_spec = P(None, None, 'x', None, 'y')
-	out_spec = P(None, 'x', 'y')
+	out_spec = (P(None, None, 'x', 'y') if coupled_mu123
+	            else P(None, 'x', 'y'))
 	w_spec = P(None)
 	cache_spec = P(None, None, ('x', 'y'), None, None)
 
 	cache_key = (
-		'z_q_face_parent', id(mesh_xy), id(psi_G_store), id(plan),
+		'z_q_face_parent', _mesh_key(mesh_xy), id(plan), pair_kernel is not None, layout,
+		(None if use_psi_r_cache else id(psi_G_store)),
+		local_band_chunk_shape, fft_grid,
 		n_parent, ns, mu_pk, nb_face, R_t, nkx, nky, nkz, bcr,
-		use_psi_r_cache,
+		use_psi_r_cache, bool(gamma_L), bool(gamma_R), bool(coupled_mu123),
 		(None if psi_r_cache is None
 		 else tuple(int(s) for s in psi_r_cache.shape)),
 	)
@@ -3200,9 +1492,11 @@ def _z_q_face_parent(
 			def load_x_block(bc_idx):
 				"""ψ_kbar(r_mu) for one band chunk, un-conjugated (the
 				Green-oriented projector's direct operand), broadcast from
-				its owning y rank by the same masked psum as _z_q_face."""
+				its owning y rank by a masked sum."""
 				p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
 				global_band = b_lo_rel_arr[bc_idx] + p_arr
+				if layout == "axis":
+					return jnp.take(psi_mun_, jnp.clip(global_band, 0, nb_face - 1), axis=3)
 				owner_y = global_band // shard_w
 				local_idx = jnp.clip(
 					global_band - y_idx * shard_w, 0, shard_w - 1)
@@ -3238,64 +1532,123 @@ def _z_q_face_parent(
 
 		@partial(shard_map, mesh=mesh_xy,
 		         in_specs=(pair_spec, pair_spec, P(None, None),
-		                   P(None, None, None)),
+		                   P(None, None, None), (P(None), P(None)),
+		                   (P(None), P(None))),
 		         out_specs=out_spec, check_vma=False)
-		def _tile_tail(D_l_, D_r_, local_perm_r_, wraps_r_):
-			def unfold_block(D_, coef):
+		def _tile_tail(D_l_, D_r_, local_perm_r_, wraps_r_, vertex_l, vertex_r):
+			if pair_kernel is not None:
+				tables = _parent_conv_tables(plan, local_perm_r_, wraps_r_, mu_loc, r_loc)
+				if coupled_mu123:
+					vertices = [_gamma_perm_phase_mu(i) for i in (1, 2, 3)]
+					perms = jnp.stack([v[0] for v in vertices])
+					phases = jnp.stack([v[1] for v in vertices])
+					def channel(carry, vertex):
+						return carry, pair_kernel(D_l_, D_r_, _parent_conv_vertices(tables, vertex, vertex))
+					return jax.lax.scan(channel, 0, (perms, phases))[1]
+				return pair_kernel(D_l_, D_r_, _parent_conv_vertices(tables, vertex_l, vertex_r))
+			def unfold_block(D_, coef, sources, source_count):
 				"""One full-k output spin block of P = conj(U D U†)."""
-				acc = None
-				for c in range(ns):
-					for d in range(ns):
-						S = unfold_operator_local(
-							D_[:, c, :, d, :],
-							irr_idx=irr_idx_np, sym_idx=sym_idx_np,
-							q_irr_frac=k_parent_np,
-							left_local_perm=left_local_perm_np,
-							left_L_table=left_L_np,
-							right_local_perm=local_perm_r_,
-							right_L_table=wraps_r_,
-							n_sym_spatial=n_sym_spatial)
-						term = coef[:, c, d][:, None, None] * S
-						acc = term if acc is None else acc + term
-				return jnp.conj(acc)             # (nk, mu_loc, r_loc)
+				def source_spin(acc, slot):
+					pair = sources[slot]
+					c, d = pair // ns, pair % ns
+					block = unfold_operator_local(
+						D_[:, c, :, d, :],
+						irr_idx=irr_idx_np, sym_idx=sym_idx_np,
+						q_irr_frac=k_parent_np,
+						left_local_perm=left_local_perm_np,
+						left_L_table=left_L_np,
+						right_local_perm=local_perm_r_,
+						right_L_table=wraps_r_, n_sym_spatial=n_sym_spatial)
+					return acc + jnp.where(slot < source_count,
+						coef[:, c, d][:, None, None] * block, 0), None
 
-			# A scan keeps one output spin block live, rather than unrolling
-			# four full-k IFFT pairs into the same executable/live set.
+				acc, _ = jax.lax.scan(source_spin,
+					jnp.zeros((nk, mu_loc, r_loc), dtype=D_.dtype),
+					jnp.arange(max_sources), unroll=1)
+				return jnp.conj(acc)
+
 			coefficients = jnp.stack([
 				open_spin_block_coefficient(spin_np, a, b)
 				for a in range(ns) for b in range(ns)])
 
-			def spin_body(Z_R, coef):
-				P_l_R = local_ifftn3(
-					unfold_block(D_l_, coef).reshape(
-						nkx, nky, nkz, mu_loc, r_loc),
-					axes=(0, 1, 2), norm='forward')
-				P_r_R = local_ifftn3(
-					unfold_block(D_r_, coef).reshape(
-						nkx, nky, nkz, mu_loc, r_loc),
-					axes=(0, 1, 2), norm='forward')
-				return Z_R + jnp.conj(P_l_R) * P_r_R, None
+			def channel_tail(perm_L, phase_L, perm_R, phase_R):
+				"""Apply fixed vertices to child output indices of the unfolded P_r."""
+				output_pairs = (perm_L[:, None] * ns + perm_R[None, :]).reshape(-1)
+				output_phases = (phase_L[:, None] * phase_R[None, :]).reshape(-1)
+				coefficients_r = coefficients[output_pairs]
+				sources = jnp.asarray(source_pairs)
+				counts = jnp.asarray(source_counts)
 
-			Z_R, _ = jax.lax.scan(
-				spin_body, jnp.zeros(
-					(nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128),
-				coefficients, unroll=1)
-			Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
-			return Z_q_3d.reshape(nk, mu_loc, r_loc)
+				def spin_body(Z_R, pair):
+					coef_l, coef_r, src_l, src_r, count_l, count_r, phase = pair
+					P_l_R = local_ifftn3(
+						unfold_block(D_l_, coef_l, src_l, count_l).reshape(
+							nkx, nky, nkz, mu_loc, r_loc),
+						axes=(0, 1, 2), norm='forward')
+					P_r_R = local_ifftn3(
+						unfold_block(D_r_, coef_r, src_r, count_r).reshape(
+							nkx, nky, nkz, mu_loc, r_loc),
+						axes=(0, 1, 2), norm='forward')
+					return Z_R + jnp.conj(P_l_R) * (phase * P_r_R), None
+
+				Z_R, _ = jax.lax.scan(
+					spin_body, jnp.zeros(
+						(nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128),
+					(coefficients, coefficients_r, sources, sources[output_pairs],
+					 counts, counts[output_pairs], output_phases), unroll=1)
+				Z_q_3d = local_fftn3(Z_R, axes=(0, 1, 2), norm='forward')
+				return Z_q_3d.reshape(nk, mu_loc, r_loc)
+
+			if coupled_mu123:
+				vertices = [_gamma_perm_phase_mu(mu) for mu in (1, 2, 3)]
+				perms = jnp.stack([vertex[0] for vertex in vertices])
+				phases = jnp.stack([vertex[1] for vertex in vertices])
+				output_pairs = (perms[:, :, None] * ns + perms[:, None, :]).reshape(3, -1)
+				output_phases = (phases[:, :, None] * phases[:, None, :]).reshape(3, -1)
+				sources = jnp.asarray(source_pairs)
+				counts = jnp.asarray(source_counts)
+
+				def spin_channels(acc, pair):
+					"""Share the left child projector across the three current channels."""
+					left = local_ifftn3(unfold_block(
+						D_l_, coefficients[pair], sources[pair], counts[pair]).reshape(
+							nkx, nky, nkz, mu_loc, r_loc), axes=(0, 1, 2), norm='forward')
+					def channel(carry, args):
+						"""Accumulate one canonical vertex in its original spin-pair order."""
+						value, target, phase = args
+						right = local_ifftn3(unfold_block(
+							D_r_, coefficients[target], sources[target], counts[target]).reshape(
+								nkx, nky, nkz, mu_loc, r_loc), axes=(0, 1, 2), norm='forward')
+						return carry, value + jnp.conj(left) * (phase * right)
+					_, result = jax.lax.scan(channel, 0,
+						(acc, output_pairs[:, pair], output_phases[:, pair]), unroll=1)
+					return result, None
+
+				initial = jnp.zeros((3, nkx, nky, nkz, mu_loc, r_loc), dtype=jnp.complex128)
+				result, _ = jax.lax.scan(spin_channels, initial, jnp.arange(ns * ns), unroll=1)
+				_, channels = jax.lax.scan(lambda carry, value: (carry,
+					local_fftn3(value, axes=(0, 1, 2), norm='forward').reshape(nk, mu_loc, r_loc)),
+					0, result, unroll=1)
+				return channels
+			return channel_tail(*vertex_l, *vertex_r)
 
 		@jax.jit
 		def fn(psi_mun_, w_l_, w_r_, r_index_, local_perm_r_, wraps_r_,
-		        g_index_, kvecs_frac_, psi_r_cache_):
+		        g_index_, kvecs_frac_, psi_r_cache_, vertex_l, vertex_r):
 			D_l, D_r = _projectors(
 				psi_mun_, w_l_, w_r_, r_index_, g_index_, kvecs_frac_,
 				psi_r_cache_)
-			return _tile_tail(D_l, D_r, local_perm_r_, wraps_r_)
+			return _tile_tail(D_l, D_r, local_perm_r_, wraps_r_, vertex_l, vertex_r)
 
 		_pair_pipeline_sm_cache[cache_key] = fn
 
 	if psi_r_cache is None:
 		psi_r_cache = jnp.zeros(
 			(1, 1, P_total, 1, 1), dtype=jnp.complex128)
+	left = ((jnp.arange(ns), jnp.ones(ns)) if gamma_L == 0
+	        else _gamma_perm_phase_mu(gamma_L))
+	right = ((jnp.arange(ns), jnp.ones(ns)) if gamma_R == 0
+	         else _gamma_perm_phase_mu(gamma_R))
 	return _pair_pipeline_sm_cache[cache_key](
 		psi_mun_parent,
 		jnp.asarray(weight_l, dtype=jnp.float64),
@@ -3303,46 +1656,7 @@ def _z_q_face_parent(
 		jnp.asarray(tile_r_index, dtype=jnp.int32),
 		jnp.asarray(tile_local_perm, dtype=jnp.int32),
 		jnp.asarray(tile_wraps, dtype=jnp.float64),
-		psi_G_store.g_index, psi_G_store.kvecs_frac, psi_r_cache)
-
-
-def _z_q_face_coupled_mu123(
-	psi_mun: jax.Array,
-	psi_G_store,
-	psi_r_cache: jax.Array | None,
-	weight_l: jax.Array,
-	weight_r: jax.Array,
-	*,
-	band_chunk_ranges: tuple[tuple[int, int], ...],
-	r_start_dyn,
-	r_chunk_size: int,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-	cache_y_r_tile: int = 0,
-) -> jax.Array:
-	"""Private prototype returning ``Z_q[mu123,q,mu_X,r_Y]``.
-
-	The incumbent Y transform/scatter and one full-spin X owner broadcast are
-	built once per band chunk.  Channels then execute sequentially with the
-	accepted scalar-spin-pair and band scans, so only one channel's two P
-	carries are live at a time.  The solver remains outside this transport
-	prototype and consumes each leading-axis slice through its existing owner.
-	"""
-	if int(psi_mun.shape[1]) != 4:
-		raise ValueError(
-			"_z_q_face_coupled_mu123 requires a four-spinor face carrier")
-	_gamma_mu123 = tuple(_gamma_perm_phase_mu(mu) for mu in (1, 2, 3))
-	perm_mu123 = jnp.stack(tuple(gamma[0] for gamma in _gamma_mu123))
-	phase_mu123 = jnp.stack(tuple(gamma[1] for gamma in _gamma_mu123))
-	return _z_q_face(
-		psi_mun, psi_G_store, psi_r_cache, weight_l, weight_r,
-		gamma_L=(perm_mu123, phase_mu123),
-		gamma_R=(perm_mu123, phase_mu123),
-		band_chunk_ranges=band_chunk_ranges,
-		r_start_dyn=r_start_dyn, r_chunk_size=r_chunk_size,
-		kgrid=kgrid, mesh_xy=mesh_xy,
-		cache_y_blocks=True, cache_y_r_tile=cache_y_r_tile,
-		coupled_mu123=True)
+		psi_G_store.g_index, psi_G_store.kvecs_frac, psi_r_cache, left, right)
 
 
 # Backward-compat shim removed — old z_q_from_psi_sm signature
@@ -3356,50 +1670,7 @@ def _identity_pad_block_diagonal(
     n_rmu_logical: int,
     mesh_xy: Mesh,
 ) -> jax.Array:
-    """Add identity to the pad-block diagonal of a square N_μ² matrix.
-
-    ``M`` has shape ``(nq, n_rmu, n_rmu)`` at PADDED μ extent with
-    zero pad rows/cols (the Phase 3a contract: bilinear in zero-padded
-    ψ ⇒ M's pad rows/cols are exact zeros).  This helper adds 1 to the
-    diagonal entries in positions ``[n_rmu_logical, n_rmu)``, leaving
-    the logical block exactly intact.  Result: ``M_id_pad =
-    block_diag(M_log, I_pad)`` — block-diagonal with the input's
-    logical block on top-left and identity on bottom-right.
-
-    Why this matters — and the limits of the guarantee:  In EXACT
-    arithmetic, Cholesky and LU on the identity-padded matrix produce
-    factorisations whose logical block equals the factorisation of the
-    un-padded logical-only matrix (the recursions never read across
-    the zero off-diagonal pad blocks, and ``√1 = 1`` exactly), and the
-    back-solve with zero-pad-row ``Z`` gives ``y_pad = 0`` with the
-    logical solve unchanged.  In FLOATING POINT the guarantee is only
-    approximate, because blocked/tiled implementations regroup partial
-    sums when the matrix extent changes:
-
-    * **Cholesky (charge channel): holds to ≤1e-7 rel** in practice
-      (measured ζ_C 5.5e-8 under a pad-extent flip at fixed P; the
-      well-conditioned PSD CCT does not amplify the regrouping noise).
-    * **LU on the near-singular indefinite transverse CCT: does NOT
-      hold.**  Shape-dependent LU roundoff is amplified O(1) in the
-      near-null modes — each pad extent yields a different,
-      per-extent-deterministic ζ_T, with catastrophic resonances at
-      some extents (MoS2 668→672: Σ^B tile(2,2) −0.15 → −117.9 eV).
-      See ``reports/device_invariance_2026-07-08/ROOT_CAUSE.md``.
-      For this reason :func:`solve_zeta` slices the indefinite solve
-      back to the LOGICAL extent — the identity pad added here is only
-      a non-singularity safety net for the padded buffer, never the
-      extent the transverse system is actually solved at.
-
-    This is NOT ridge regularisation on C_q (which would corrupt the
-    logical block).  The identity is added ONLY to the pad-block
-    diagonal; the logical block is untouched.
-
-    Output sharding is ``P(None, 'x', 'y')`` (n_rmu_padded is
-    mesh-divisible by construction so single-axis sharding on each
-    μ-dim works at any padded extent).  When ``n_rmu_logical ==
-    n_rmu`` (no pad), the function is a no-op pass-through with the
-    sharding constraint reapplied.
-    """
+    """Add identity to the pad-block diagonal of a square N_μ² matrix; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_rmu, n_rmu2 = M.shape
     if n_rmu != n_rmu2:
         raise ValueError(f"_identity_pad_block_diagonal expects square M; got {M.shape}")
@@ -3438,50 +1709,14 @@ _REPLICATED_CHOL_MAX_STACK_BYTES = int(
 
 
 def _replicate_charge_ok(nq: int | None, n_rmu: int | None) -> bool:
-    """True when the charge CCT stack ``(nq, n_μ, n_μ)`` c128 fits under the
-    replication cap — the criterion for the mesh-invariant dense Cholesky
-    over the grid-dependent distributed cuSolverMp potrf.
-
-    Requires both ``nq`` and ``n_rmu`` (the ζ-fit caller passes them from
-    ``C_q.shape[0]`` and ``meta.n_rmu``); ``None`` — direct callers that
-    don't supply them — keeps the legacy distributed policy so nothing off
-    the GW ζ-fit path changes behaviour.
-    """
+    """True when the charge CCT stack ``(nq, n_μ, n_μ)`` c128 fits under the replication cap — the criterion for the mesh-invariant dense Cholesky over the grid-dependent distributed cuSolverMp potrf; see docs/architecture/zeta_fit_face_psi_cct.md."""
     if nq is None or n_rmu is None:
         return False
     return int(nq) * int(n_rmu) ** 2 * 16 <= _REPLICATED_CHOL_MAX_STACK_BYTES
 
 
 def _replicate_rank_truncate_ok(nq: int | None, n_rmu: int | None) -> bool:
-    """True when the rank-truncating charge factor can run replicated.
-
-    DIFFERENT CRITERION from :func:`_replicate_charge_ok`, deliberately.
-    That one gates the *Cholesky* route on the whole ``(nq, μ, μ)`` stack,
-    which is the right question there.  It is the WRONG question for
-    ``rank_truncate``: :func:`factor_c_q_replicated_batched` already splits
-    the q axis at its own ``_REPLICATED_FACTOR_MAX_BATCH_BYTES`` bound, so
-    the replicated transient is ONE q-batch (≤ that bound, plus the eigh's
-    own workspace) and is FLAT IN nq — it does not grow with the stack.
-    Testing the stack made the resolver refuse fits that comfortably fit,
-    e.g. MoS2 12×12 full-BZ (nq=144, μ=2412 → 13.4 GiB stack, but only
-    ~4 GiB replicated at a time), and refusing means losing the §6a
-    rank-truncation physics cure rather than losing memory.
-
-    This can only make the production-default ``rank_truncate`` route
-    REACHABLE where it previously raised; it never changes a route that
-    resolves today, and it does not touch the ``cholesky`` branch at all.
-
-    NOTE (the real μ ceiling on this route): memory is not what breaks
-    here.  The factor is a dense whole-tile ``eigh`` per q (~5.5 h at
-    μ=4k, ~86 h at μ=10k on 28 cores for the FULL nq sweep).  Since
-    2026-08-01 the plan executes q-parallel above the fold threshold
-    (:func:`_factor_c_q_replicated_qparallel` — per-rank cost
-    ceil(nq/P)·μ³, bits unchanged), which divides those walls by
-    min(P, nq) but cannot touch the SINGLE-q eigh: past ~4k centroids the
-    route still needs a genuinely distributed eigh (SLATE/ScaLAPACK via
-    ``distrib_la``; cuSOLVERMp is out on a rectangular mesh), not a
-    bigger cap.
-    """
+    """True when the rank-truncating charge factor can run replicated; see docs/architecture/zeta_fit_face_psi_cct.md."""
     if nq is None or n_rmu is None:
         return False
     n = int(n_rmu)
@@ -3511,31 +1746,7 @@ _RANK_TRUNCATE_CHANNEL_ADVICE = {
 
 
 def _rank_truncate_capacity_error(nq, n_rmu, *, channel: str) -> ValueError:
-    """THE refusal for a replicated rank-truncating eigh that will not fit.
-
-    ONE message for both channels.  The charge branch
-    (``charge_zeta_solve='rank_truncate'``) and the transverse branch
-    (``transverse_zeta_solve='rank_truncate'``) allocate the *same* object
-    — one replicated ``(q_batch, n_mu, n_mu)`` complex128 eigh operand — so
-    they have the same ceiling and must report it the same way.  Before
-    2026-08-22 only the charge branch checked it at all; the transverse
-    resolver returned ``'transverse_rank_truncate'`` unconditionally and
-    the run died on an allocation, hours in, above ``n_mu_T ~ 16k``
-    (register: "transverse resolver lacks the charge branch's capacity
-    gate; OOMs late above mu_T~16k").
-
-    REPORT THE QUANTITY THAT ACTUALLY FAILED (DLM campaign 2026-07-29,
-    jobs 7879700 / 7879689).  Two gates test DIFFERENT things:
-
-        _replicate_charge_ok           whole stack   nq * mu^2 * 16
-        _replicate_rank_truncate_ok    one q-batch   batch * mu^2 * 16
-
-    The second is the weaker one, so IT is what binds, and the cap that
-    would clear it is the per-batch figure — not the stack.  The message
-    this replaced quoted the stack and advised the stack-sized cap (61 /
-    94 GiB at the two sizes measured), overstating the fix by ~10x: 6 / 10
-    GiB is what those runs actually needed.
-    """
+    """THE refusal for a replicated rank-truncating eigh that will not fit; see docs/architecture/zeta_fit_face_psi_cct.md."""
     stack = (int(nq) * int(n_rmu) ** 2 * 16 / 1024**3
              if nq and n_rmu else 0.0)
     batch = (_replicated_factor_q_chunk(int(nq), int(n_rmu))
@@ -3584,31 +1795,7 @@ def _resolve_channel_ladder(
     explicit: dict | None = None,
     auto_pre=None,
 ) -> str:
-    """The mesh/CPU/backend decision ladder SHARED by the per-channel
-    ζ-fit solver resolvers (:func:`_resolve_solver_kind_charge`,
-    :func:`_resolve_solver_kind_transverse`) — written once so the two
-    channels cannot drift.
-
-    Ladder (identical for both channels):
-
-      * ``override='off'``                 → ``kind_fallback``.
-      * ``override`` in ``explicit``       → that handler decides (called
-        with ``(px, py)``; owns its own FFI-availability / mesh-geometry
-        checks and may raise).  Both channels route EXPLICIT
-        ``'cusolvermp'`` (legacy alias ``'on'``) through the distrib_la
-        door — platform, compiled-capability, process-coverage and
-        true-2D geometry guards — exactly like 'slate'/'scalapack'.  The
-        old inline shortcut (``kind_cusolvermp if is_2d else
-        kind_fallback``) silently demoted an explicit request on a 1-D
-        mesh AND skipped every capability probe, so resolve could promise
-        a handler the mesh/build couldn't run (doctrine 3 / quality
-        pattern #6; audit fix/zq 2026-07-28).
-      * auto (or unrecognised): ``auto_pre()`` first when given (the charge
-        channel's replication-cap branch; returns a kind, raises, or
-        returns ``None`` to fall through), then ``kind_cusolvermp`` on true
-        2D non-CPU meshes (cuSOLVERMp is CUDA-only — never auto-picked on
-        a CPU mesh), else ``kind_fallback``.
-    """
+    """The mesh/CPU/backend decision ladder SHARED by the per-channel ζ-fit solver resolvers (:func:`_resolve_solver_kind_charge`, :func:`_resolve_solver_kind_transverse`) — written once so the two channels cannot drift; see docs/architecture/zeta_fit_face_psi_cct.md."""
     px = int(mesh_xy.shape['x'])
     py = int(mesh_xy.shape['y'])
     is_2d = (px >= 2 and py >= 2)
@@ -3634,50 +1821,7 @@ def _resolve_solver_kind_charge(
     charge_zeta_solve: str = "cholesky",
     replicated_factor_used: bool = True,
 ) -> str:
-    """Pick the charge-channel ζ-fit solver: fully-replicated dense
-    Cholesky (mesh-invariant, the default for fit-size tiles) vs the
-    distributed cuSolverMp potrf+potrs vs the in-tree shard_map 2D-blocked
-    Cholesky + per-q triangular solve.
-
-    Default policy (2026-07-20): **replicated dense Cholesky** whenever the
-    CCT stack fits on one device (:func:`_replicate_charge_ok`).  The
-    distributed cuSolverMp potrf is block-cyclic — its partial-sum
-    regrouping depends on the process grid ``(px, py)`` — so at large,
-    mildly rank-deficient n_μ (MoS2 6×6, 1600 centroids) the factor drifts
-    ~0.3% between a 2×2 and a 4×4 grid, and the GN-PPM pole construction
-    amplifies that into tens-of-eV Σ_c garbage on non-16-GPU meshes.  The
-    replicated ``jnp.linalg.cholesky`` runs on the whole matrix on every
-    device (one dense potrf per q), so L_q is bit-identical across device
-    counts and process grids.  This mirrors the eigh-backend policy in
-    ``bse/vq_interp`` (native batched by default; FFI backends reserved for
-    tiles too large to replicate).  See
-    ``reports/gw_zeta_mesh_invariance_2026-07-20``.
-
-    Above the replication cap the older policy applies: cuSolverMp on
-    **true 2D meshes** (px≥2 AND py≥2) — it bundles the distributed
-    Cholesky into one FFI call per q, vs the in-tree ``sharded_cholesky``'s
-    many small NCCL all-reduces per panel — otherwise the in-tree sharded
-    path.
-
-    Override via cohsex.in ``distributed_cholesky``:
-      ``off``        → force the in-tree sharded Cholesky.
-      ``cusolvermp`` → force cuSolverMp (legacy alias ``on``).  EXPLICIT
-                       choice via the distrib_la door: refuses at
-                       resolve time on a non-CUDA mesh, a build without
-                       the compiled handler, or a 1-D mesh (block-cyclic
-                       layout degenerates) — never a silent fallback
-                       (doctrine 3; audit fix/zq 2026-07-28).
-      ``slate``      → SLATE ``potrf`` — the portable (Frontier/Aurora)
-                       backend.  EXPLICIT choice: fails loudly if the
-                       FFI/library is absent or the mesh geometry is the
-                       guarded 1×q case (SLATE stride assert; see
-                       services/distrib_la/tests/test_distrib_la_contract.py,
-                       where that pin now lives) rather than
-                       silently running a different backend.
-      ``auto`` (default) → replicated dense for fit-size stacks, else
-                       cuSolverMp on true 2D / sharded otherwise (neither
-                       cuSolverMp nor slate is auto-picked below the cap).
-    """
+    """Pick the charge-channel ζ-fit solver: fully-replicated dense Cholesky (mesh-invariant, the default for fit-size tiles) vs the distributed cuSolverMp potrf+potrs vs the in-tree shard_map 2D-blocked Cholesky + per-q triangular solve; see docs/architecture/zeta_fit_face_psi_cct.md."""
     def _slate(px: int, py: int) -> str:
         # Door guard ladder (distrib_la.resolve_backend): platform, compiled-
         # capability probe (a slate-less build fails HERE, at resolve time,
@@ -3752,82 +1896,7 @@ def _resolve_solver_kind_transverse(mesh_xy: Mesh, override: str = "auto",
                                     nq: int | None = None,
                                     replicated_factor_used: bool = True,
                                     ) -> str:
-    """Pick the transverse-channel ζ-fit solver: cuSolverMp distributed
-    getrf+getrs vs the in-tree per-q ``jnp.linalg.solve`` + ridge.
-
-    ``transverse_zeta_solve`` (deck key, 2026-08-01) selects the SOLVE
-    FAMILY first, before any backend ladder:
-
-    * ``'ridge'`` (default) — the historical LU+ridge family below,
-      byte-identical behaviour.
-    * ``'rank_truncate'`` — per-q eigh pseudo-inverse of the indefinite
-      transverse CCT with an |λ| cut (the charge channel's conditioning
-      cure ported to the transverse channel; see
-      ``_charge_factor_math``'s ``'transverse_rank_truncate'`` mode).
-      Returns ``'transverse_rank_truncate'`` — the LOCAL plan (whole-tile
-      replicated eigh, q-parallel at P>1, valid at ANY logical extent on
-      ANY mesh).  Its DISTRIBUTED plan (pzheevd at the padded extent) is
-      selected by ``distributed_zeta_solve = 'distributed'`` exactly like
-      the charge channel — the ζ-fit caller overrides the kind to
-      ``'distributed_transverse_rank_truncate'`` after resolving the
-      tier.  ``distributed_lu`` names an LU backend this family does not
-      run, so an EXPLICIT ``distributed_lu`` request combined with
-      ``rank_truncate`` REFUSES here (promise contract) instead of
-      silently ignoring one of the two keys.  Since 2026-08-22 the LOCAL
-      plan carries the CHARGE branch's capacity gate
-      (:func:`_replicate_rank_truncate_ok` →
-      :func:`_rank_truncate_capacity_error`), because it allocates the
-      same replicated ``(q_batch, μ, μ)`` c128 eigh operand: pass ``nq``
-      and ``replicated_factor_used`` to arm it.
-
-    The rest of this docstring documents the RIDGE (LU) family.
-
-    Default policy (2026-05-12): mirrors the charge-channel resolver —
-    use cuSolverMp on **true 2D meshes** (px≥2 AND py≥2).  cuSolverMp
-    0.7.2 fixes the earlier 2D-grid getrf/getrs correctness bug
-    (validated end-to-end on MoS2 3×3 bispinor at 2×2 mesh; see
-    ``src/ffi/cpp/cusolvermp/batched_solve_lu_ffi.cc`` for history).
-
-    Tradeoff: small FFI setup overhead at MoS2 scale (n_rmu=656,
-    2×2 mesh).  At CrI3 6×6 80 Ry (n_rmu≈1800, 4×4 mesh) the cuSolverMp
-    path is the right tool.
-
-    Override via cohsex.in ``distributed_lu``:
-      ``off``        → force per-q ``jnp.linalg.solve``.
-      ``cusolvermp`` → force cuSolverMp (legacy alias ``on``).  EXPLICIT
-                       choice via the distrib_la door: refuses at
-                       resolve time on a non-CUDA mesh, a build without
-                       the compiled handler, or a 1-D mesh — never a
-                       silent fallback (doctrine 3; audit fix/zq
-                       2026-07-28).
-      ``scalapack``  → ScaLAPACK ``pXgetrf``+``pXgetrs`` from Cray LibSci
-                       — the host/CPU-backend backend (liblorrax_ffi_host).
-                       EXPLICIT choice, never auto-picked; fails loudly if
-                       the host FFI is absent, and requires a square or
-                       1-D mesh (pXgetrf needs square blocks).
-      ``auto`` (default) → cuSolverMp on true 2D, legacy otherwise.
-      (No ``slate`` value: a SLATE getrf wrapper does not exist yet.)
-
-    ``n_rmu_logical`` (the LOGICAL transverse centroid count) activates
-    the resolve-time divisibility contract for the two DISTRIBUTED
-    backends: the indefinite solve must run at the logical μ extent
-    (ROOT_CAUSE.md 2026-07-08 — pad-shape LU roundoff is amplified O(1)
-    in the near-null transverse modes), and the block-cyclic descriptors
-    need ``n_log % px == n_log % py == 0``.  When they don't divide:
-
-      * EXPLICIT request (``cusolvermp``/``on``/``scalapack``) → raise
-        HERE, at resolve time, naming the fix — the promise contract
-        (quality pattern #6/#8; the same treatment the charge W solve
-        got in the two-plan cleanup).  Before 2026-07-27 this demoted to
-        the per-q replicated LU via a ``warnings.warn`` deep inside
-        ``solve_zeta`` — the ledgered "silent replicated-LU fallback".
-      * ``auto`` resolution → announce the demotion (rank-0 print) and
-        return the per-q ``'lu'`` route.
-
-    Callers that don't know ``n_rmu_logical`` (pass ``None``) keep the
-    pure mesh/backend ladder; ``solve_zeta`` retains an announced
-    call-time demotion as defense in depth for those.
-    """
+    """Pick the transverse-channel ζ-fit solver: cuSolverMp distributed getrf+getrs vs the in-tree per-q ``jnp.linalg.solve`` + ridge; see docs/architecture/zeta_fit_face_psi_cct.md."""
     fam = str(transverse_zeta_solve).strip().lower()
     if fam == 'rank_truncate':
         if override in ('on', 'cusolvermp', 'scalapack'):
@@ -3948,22 +2017,7 @@ def _resolve_solver_kind(
     replicated_factor_used: bool = True,
     transverse_zeta_solve: str = "ridge",
 ) -> str:
-    """Single source of truth for the ``auto`` resolution.  Transverse
-    channels (γ̃^i, μ_L≠0) take ``_resolve_solver_kind_transverse``;
-    charge channel takes ``_resolve_solver_kind_charge``.
-
-    ``n_rmu`` (logical centroid count) and ``nq`` (per-q factor batch =
-    ``C_q.shape[0]``) let the charge resolver pick the mesh-invariant
-    replicated dense factor for fit-size stacks — and, since 2026-08-22,
-    let the TRANSVERSE resolver apply the same replicated-eigh capacity
-    gate (``_rank_truncate_capacity_error``) instead of OOMing late;
-    ``charge_zeta_solve``
-    (``'rank_truncate'`` | ``'cholesky'``) then picks the rank-revealing
-    eigh pseudo-inverse vs Cholesky on that route.  The ζ-fit caller passes
-    all three (``isdf_fitting.fit_zeta_to_h5``).  A concrete ``solver_kind``
-    is returned unchanged (so ``factor_c_q`` / ``solve_zeta`` re-resolving
-    the already-resolved kind need not repeat them).
-    """
+    """Single source of truth for the ``auto`` resolution; see docs/architecture/zeta_fit_face_psi_cct.md."""
     if solver_kind != 'auto':
         return solver_kind
     if int(vertex_mu_L) != 0:
@@ -4006,13 +2060,7 @@ _env_override_warned: set = set()
 
 
 def _env_override_raw(env_name: str) -> str | None:
-    """THE non-empty-env-wins rule of the deprecated env twins, in ONE
-    place: the raw env string when it is set and non-blank (that value
-    wins this release), else ``None`` (the input key is used).  Shared by
-    the factor sites (:func:`_deprecated_env_float`) and the ζ-provenance
-    record (:func:`deprecated_env_record` ←
-    ``gw.gw_init._zeta_fit_provenance``) so the two can never drift
-    (quality pattern #3; audit fix/zq 2026-07-28)."""
+    """THE non-empty-env-wins rule of the deprecated env twins, in ONE place: the raw env string when it is set and non-blank (that value wins this release), else ``None`` (the input key is used); see docs/architecture/zeta_fit_face_psi_cct.md."""
     raw = os.environ.get(env_name)
     if raw is None or raw.strip() == "":
         return None
@@ -4020,12 +2068,7 @@ def _env_override_raw(env_name: str) -> str | None:
 
 
 def deprecated_env_record(env_name: str, key_value) -> str:
-    """The string ζ-fit provenance records for a deprecated env-twin knob:
-    the raw env string when the env form wins (the exact rule the factor
-    sites apply, via :func:`_env_override_raw`), else ``repr(key_value)``.
-    Byte-identical to the historical inline format in every case that
-    ever produced a reusable ζ, so existing provenance stamps keep
-    matching.  (audit fix/zq 2026-07-28)"""
+    """The string ζ-fit provenance records for a deprecated env-twin knob: the raw env string when the env form wins (the exact rule the factor sites apply, via :func:`_env_override_raw`), else ``repr(key_value)``; see docs/architecture/zeta_fit_face_psi_cct.md."""
     raw = _env_override_raw(env_name)
     return raw if raw is not None else repr(key_value)
 
@@ -4046,12 +2089,7 @@ from gw.gw_config import (ZETA_RCOND_DEFAULT,
 
 
 def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
-    """Input key is the source of truth; a non-empty env var still overrides,
-    but prints a deprecation notice on rank 0 (once per process).
-
-    Empty/unset env → the key's value, exactly.  This also removes the old
-    crash on ``LORRAX_ZETA_RCOND=""`` (``float('')``).
-    """
+    """Input key is the source of truth; a non-empty env var still overrides, but prints a deprecation notice on rank 0 (once per process); see docs/architecture/zeta_fit_face_psi_cct.md."""
     raw = _env_override_raw(env_name)
     if raw is None:
         return float(key_value)
@@ -4078,62 +2116,7 @@ def _resolve_zeta_gather(
     charge_zeta_solve: str = "cholesky",
     transverse_zeta_solve: str = "ridge",
 ) -> str:
-    """Resolve the ζ back-solve TIER — the input key
-    ``distributed_zeta_solve``.
-
-    Returns ``'replicated'``, ``'per_q'`` or ``'distributed'``.
-
-    * ``replicated`` — today's path: the back-solve all-gathers the whole
-      ``(q_batch, μ, μ)`` factor onto every rank, ``nq·μ²·16`` B per rank
-      (18.9 GB at MoS2 12×12 / μ=1998 counting the logical-extent copies,
-      and it is re-gathered on EVERY r-chunk).
-    * ``per_q`` — gather ONE ``(μ, μ)`` tile at a time and loop q inside
-      the r-chunk.  ``μ²·(1 + 1/p_y)·16`` B (75 MB at μ_pad=2048 on an 8×8
-      mesh, 1.8 GB at μ=10k).  Same per-q arithmetic as the batched
-      kernel; only the live gathered extent shrinks.  The slice is taken
-      INSIDE a ``shard_map`` (``_per_q_block``) — written as a
-      ``with_sharding_constraint`` on a traced-``q`` slice it read the
-      same way but COMPILED to the full ``(nq, μ, μ)`` gather plus a
-      dynamic_slice, which is worse than ``replicated`` and cost 12–40×
-      the back-solve wall (scorecard Y.2; do not regress it).
-    * ``distributed`` — the factor is NEVER gathered.  ``C_q`` is
-      eigendecomposed distributed (ScaLAPACK ``pzheevd``), truncated on the
-      replicated spectrum, and the truncated pseudo-inverse ``C⁺`` is kept
-      2D-sharded; the back-solve is a stacked 2D-sharded GEMM ``C⁺ @ Z``.
-      This is the ONLY tier whose eigh ITSELF divides by P — the other two
-      run whole-tile dense ``eigh``s per q (q-parallel over devices above
-      the replicated plan's fold threshold, so min(P, nq)-scaling since
-      2026-08-01; redundant on every rank below it — ~5.5 h at μ=4k,
-      ~86 h at μ=10k for the full sweep, /min(P, nq) with the fold).
-      EXPLICIT opt-in only: ``auto`` never picks it, because it changes the
-      arithmetic (block-cyclic eigh ⇒ a different, equally valid gauge) and
-      so is not bit-identical to the other two.
-    * ``auto`` (default) — ``replicated`` while the gather fits under
-      :data:`_ZETA_GATHER_MAX_BYTES`, ``per_q`` above it.  At fixture scale
-      (nq=9, μ_pad=64 ⇒ 0.6 MB) that is ``replicated``, i.e. bit-identical
-      to the pre-feature path; at MoS2 12×12 / μ=2016 (9.4 GB) it is
-      ``per_q``.
-
-    ``distributed`` additionally REQUIRES (all checked here, at resolve
-    time, so nothing fails minutes later inside an FFI call):
-
-    * ``charge_zeta_solve = 'rank_truncate'`` — the tier IS distributed
-      rank truncation, and the spectral cut is the charge channel's
-      conditioning cure (ADVICE §6a); a plain distributed inverse would
-      silently destroy the physics, so it is refused rather than offered;
-    * a mesh the ScaLAPACK eigh backend accepts — host devices, one
-      process per device, square or 1-D, ``μ_pad`` divisible by both axes
-      (``distrib_la.resolve_backend('eigh', 'distributed', …)`` owns that
-      ladder and raises with the failed guard named).
-
-    On the TRANSVERSE channels (``vertex_mu_L != 0``) ``distributed``
-    resolves to ``per_q``: the transverse CCT is Hermitian INDEFINITE, so
-    no eigh-based rank truncation applies to it, and its distributed route
-    is the already-2D-sharded ``pXgetrf``/``pXgetrs`` pair selected by a
-    DIFFERENT key (``distributed_lu = scalapack``).  One key drives both
-    channels, so raising here would kill a bispinor run in the transverse
-    fit after the charge fit had succeeded.
-    """
+    """Resolve the ζ back-solve TIER — the input key ``distributed_zeta_solve``; see docs/architecture/zeta_fit_face_psi_cct.md."""
     tier = str(override or "auto").strip().lower()
     if tier == "distributed":
         if int(vertex_mu_L) != 0:
@@ -4196,44 +2179,7 @@ _replicated_chol_cache = {}  # replicated dense Cholesky kernel (keyed by shape)
 
 
 def _close_the_cut(spectrum, keep, *, where: str):
-    """Move a ζ rank cut off any degenerate block it slices, by DROPPING the block.
-
-    The device face of ``common/spectral_closure``, wrapped once so all four
-    ζ truncation sites (charge / transverse × replicated / distributed) get
-    the same criterion, the same message and the same mode.
-
-    THE DIRECTION IS THE MODULE'S DEFAULT, not a choice made here — the
-    owner's ruling of 2026-08-10, that a cut landing mid-block truncates the
-    whole block.  So the retained rank comes DOWN, never up, and the
-    amplification cap ``rank_criterion`` sized it by is satisfied by
-    construction afterwards.  Nothing at this seam passes ``direction=``: a
-    site that needs the other one is a finding to report, and the wiring
-    ratchet in ``tests/test_spectral_closure.py`` asserts no site does.
-
-    WHY IT IS SHAPED LIKE THIS.  The cut lives inside a jitted kernel whose
-    eigenvalues never reach host, so the move has to be pure ``jnp`` — it is,
-    and it is a cumulative AND over adjacency links with no data-dependent
-    trip count, so it costs one sort and one cumprod per q against the
-    ``eigh``'s O(n³).  A jitted kernel also cannot raise, which is the
-    division of labour ``centroid/pivoted_cholesky`` already documents ("a
-    jitted kernel cannot raise, so it reports and this refuses"): under
-    ``strict`` the firing is recorded through a host callback and refused by
-    ``spectral_closure.raise_if_pending`` at the next host seam, so the flag
-    means the same thing here as at the host sites.
-
-    THE ONE CASE THE DROP DIRECTION ADDS is a block that reaches ``λ_max``,
-    where dropping it would leave rank zero.  The host face raises on it; a
-    kernel cannot, so the count is carried out and ``_charge_factor_math``'s
-    existing zero-rank refusal catches it — which is why that refusal now
-    names closure as a possible cause.
-
-    MESH INVARIANCE.  ``close_keep_mask`` is elementwise plus a sort and a
-    cumulative product over the SPECTRUM axis, which is never the sharded
-    axis on any of these routes — the replicated tiers factor whole logical
-    blocks, and the distributed tier's ``_masks`` runs on the replicated
-    ``lam``.  So the moved mask is bit-identical across device counts, and
-    the factor keeps the mesh-invariance contract it had before.
-    """
+    """Move a ζ rank cut off any degenerate block it slices, by DROPPING the block; see docs/architecture/zeta_fit_face_psi_cct.md."""
     # The DRIVER reads the dial and passes it: ``common.spectral_closure`` is
     # L2 mathematics and ``tests/test_layering.py`` requires it to be a
     # function of its arguments.  The variable's NAME is still declared once,
@@ -4272,66 +2218,7 @@ def _close_the_cut(spectrum, keep, *, where: str):
 
 def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
                      rcond: float, exclude=None) -> None:
-    """GATE the ζ rank cut against the certified regime.  Device face.
-
-    The sibling of :func:`_close_the_cut`, and the reason this function
-    exists at all: that one decides WHERE the cut may land, this one decides
-    whether the cut was allowed to happen at this conditioning.  Until
-    2026-08-22 the ζ truncation printed ``n_keep/q`` and ``kappa/q`` and
-    GATED ON NEITHER — announced-but-ungated truncation, the pattern
-    ``TASTE.md`` (2026-08-15) names as an instrument that measures a defect
-    and proceeds.
-
-    MEASURED, and it is why the threshold is an ABSOLUTE achieved
-    amplification rather than a drop fraction (register 2026-08-15): Si
-    4×4×4 SYM/SOC 128-band, ``zeta_rcond = 1e-10``, 1776 centroids on a deck
-    with ngkmax = 588 — ``n_keep/q = 1469…1472 of 1776`` at
-    ``kappa/q ≈ 9.7–10.0e9``, i.e. sitting on the rcond floor.  Σ_c MAE
-    **54.4 eV**, max 100.3 eV, **exit 0, no SANITY banner, no refusal**.  The
-    same deck at 600 centroids does not truncate and gives 0.90 eV.
-
-    THE DROP FRACTION IS NOT THE GATE, and must not be re-proposed: MoS2
-    production discards 33 % of the RANK at the certified rcond and is
-    right, this deck discards 17 % and is wrong by 54 eV, and Si 960 at
-    rcond 1e-6 discards 34 % and moves the σ-star spread by 0.005 meV.  The
-    derivation and the full site register are in
-    ``docs/dev/rank_truncation_policy.md``; the criterion itself, the
-    ceiling constant and the message live in ``common/rank_criterion``.
-
-    ``kappa_certified`` is ``None`` for a site no measurement covers (the
-    transverse channel today).  Then only the discarded-weight finding can
-    fire, and the log says the ceiling is absent rather than reporting a
-    clean bill — an absence is not a pass.
-
-    A jitted kernel cannot raise, so a firing is recorded through a host
-    callback and ``rank_criterion.raise_if_pending`` refuses at the next host
-    seam (``gw_init``, immediately after the fit and before ζ is consumed) —
-    the same division of labour :func:`_close_the_cut` already documents.
-
-    THAT CALLBACK NEEDS A CPU DEVICE IN THE BACKEND, and so does the
-    ``jax.debug.print`` above it.  Measured on jax 0.9.1 / CUDA: with a
-    GPU-only backend, ``jax.debug.print``, ``jax.debug.callback`` AND
-    ``io_callback`` all raise "failed to find a local CPU device to place the
-    inputs on".  A LORRAX run never sees that — ``runtime.
-    initialize_communicator_stack`` sets ``JAX_PLATFORMS="cuda,cpu"`` — but a
-    bare process that imports this module without booting the runtime does,
-    which is why the reachability probe in ``tests/test_charge_zeta_route``
-    runs under ``JAX_PLATFORMS=cpu``.  If that ever changes, this gate and
-    the existing ζ telemetry lose their host seam together.
-
-    COST.  One reduction pass over the spectrum axis per q: three sums and a
-    min over ``n_log`` values against the ``eigh``'s O(n³).  Unmeasurable,
-    and it is the only affordable certification at this seam — the honest
-    one (refit and measure Σ) is the run itself.
-
-    THE MODE IS RESOLVED AT TRACE TIME, and the factor jits are cached on a
-    key that does not include it — the same property :func:`_close_the_cut`
-    has for ``LORRAX_SPECTRAL_CLOSURE``.  So changing the dial part-way
-    through ONE process does not retrace an already-compiled factor.  That
-    is correct for a per-run dial and is stated here rather than discovered:
-    a test that flips the variable between two calls in one process must
-    flip it around the FIRST call that compiles the shape.
-    """
+    """GATE the ζ rank cut against the certified regime; see docs/architecture/zeta_fit_face_psi_cct.md."""
     # The DRIVER reads the dial and passes it — same rule as _close_the_cut.
     mode = rank_criterion.resolve_policy_mode(
         os.environ.get(rank_criterion.POLICY_MODE_ENV))
@@ -4390,34 +2277,7 @@ def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
 
 
 def _close_the_cut_padded(lam, keep, *, n_log: int, n_pad: int, where: str):
-    """:func:`_close_the_cut` for the distributed tier's PADDED spectrum.
-
-    The distributed route never forms the logical block alone: it eighs the
-    identity-padded matrix ``[C_log 0; 0 I]``, whose spectrum is
-    ``spec(C_log) ∪ {1.0}×(n_pad − n_log)``.  Those pad eigenvalues are
-    **exactly 1.0 and therefore exactly degenerate with each other**, so a
-    block walk that reached them would move all ``n_pad − n_log`` of them at
-    once — admitting them under ``keep_block``, discarding them under the
-    default ``drop_block``, and in EITHER direction making the retained rank
-    a function of the DEVICE COUNT.  That is the precise defect this route's
-    ``lam_max`` note exists to prevent, and the one
-    ``rank_criterion.violations()`` reports as ``n_dropped_alignment``.  The
-    withdrawal below is therefore direction-independent, and so is the gate
-    on it.
-
-    So the pad is withdrawn from the walk before it starts.  ``lam`` is
-    ascending, so its exact-1.0 entries are contiguous; the first
-    ``n_pad − n_log`` of them are taken as the pad and demoted to magnitude
-    zero, which puts them below every cut and makes them un-linkable (the
-    guard never links a pair whose larger member is zero).  If a PHYSICAL
-    eigenvalue also happens to be exactly 1.0 the choice of which duplicates
-    to demote is immaterial — the values are identical, so the multiset the
-    walk sees is the same either way.
-
-    Whatever the original cut decided about the pad is preserved: a kept pad
-    direction inverts to ``1/1.0 = 1`` against an identity block and is inert
-    by construction, and this guard has no business changing it.
-    """
+    """:func:`_close_the_cut` for the distributed tier's PADDED spectrum; see docs/architecture/zeta_fit_face_psi_cct.md."""
     n_extra = int(n_pad) - int(n_log)
     if n_extra <= 0:
         return _close_the_cut(lam, keep, where=where)
@@ -4427,16 +2287,7 @@ def _close_the_cut_padded(lam, keep, *, n_log: int, n_pad: int, where: str):
 
 
 def _withdraw_identity_pad(lam, *, n_log: int, n_pad: int):
-    """``(spectrum with the identity pad demoted to 0, pad mask)``.
-
-    ONE implementation of the pad withdrawal both padded-spectrum guards
-    need — :func:`_close_the_cut_padded` (so a block walk cannot sweep the
-    exactly-degenerate pad and make the retained rank a function of the
-    device count) and :func:`_certify_the_cut` at the distributed charge
-    site (so the pad is not counted as discarded weight or as dropped
-    directions).  The mechanism is the one that function's docstring
-    argues; it lives here so the two cannot drift apart.
-    """
+    """``(spectrum with the identity pad demoted to 0, pad mask)``; see docs/architecture/zeta_fit_face_psi_cct.md."""
     n_extra = int(n_pad) - int(n_log)
     if n_extra <= 0:
         return lam, jnp.zeros(lam.shape, dtype=bool)
@@ -4447,26 +2298,7 @@ def _withdraw_identity_pad(lam, *, n_log: int, n_pad: int):
 
 def _charge_factor_math(C_log, *, mode: str, n_log: int,
                         ridge_extra: float, rcond: float, rank_log: bool):
-    """The per-q dense factor arithmetic — ONE kernel, shared bit-for-bit
-    by the all-ranks (replicated) and q-parallel executions of the
-    replicated plan (:func:`_factor_c_q_replicated`,
-    :func:`_factor_c_q_replicated_qparallel`).
-
-    ``C_log``: ``(nqb, n_log, n_log)`` whole LOGICAL tiles; the caller
-    guarantees they are fully local / replicated per device.  Pure jnp with
-    NO sharding ops, so the emitted per-q LAPACK calls are identical
-    wherever it runs — the bit-identity contract of the q-parallel fold.
-    ``mode`` selects the factor exactly as documented on
-    :func:`_factor_c_q_replicated` (``'rank_truncate'`` | ``'cholesky'``,
-    charge channel) plus ``'transverse_rank_truncate'`` (bispinor
-    transverse channels, 2026-08-01): the SAME eigh rank truncation on the
-    Hermitian INDEFINITE transverse CCT — the cut is on |λ| (both signs
-    are physical there) and the return value is the EXPLICIT truncated
-    pseudo-inverse C⁺ = Σ_{|λ|>τ·|λ|_max} vᵢvᵢᴴ/λᵢ, not a B with
-    BBᴴ = C⁺ (no such Hermitian factor exists for an indefinite C⁺;
-    explicit C⁺ also halves the per-r-chunk back-solve to ONE matmul —
-    the same trade the distributed charge tier documents).
-    """
+    """The per-q dense factor arithmetic — ONE kernel, shared bit-for-bit by the all-ranks (replicated) and q-parallel executions of the replicated plan (:func:`_factor_c_q_replicated`, :func:`_factor_c_q_replicated_qparallel`); see docs/architecture/zeta_fit_face_psi_cct.md."""
     if mode == 'transverse_rank_truncate':
         # WHY THIS FEATURE EXISTS (mirror of the charge cure below, for
         # the indefinite transverse CCT): TRS in non-magnetic ground
@@ -4606,49 +2438,7 @@ def _charge_factor_math(C_log, *, mode: str, n_log: int,
 def solve_zeta_charge_dense(C, Z, *, charge_zeta_solve: str,
                             zeta_rcond: float, zeta_ridge: float = 0.0,
                             rank_log: bool | None = None):
-    """THE producer's charge-ζ solve on ONE whole, unpadded (n_μ, n_μ) tile.
-
-    ``ζ = C⁺Z`` (``charge_zeta_solve='rank_truncate'``, the production
-    default) or ``ζ = (C + ridge)⁻¹Z`` through two triangular solves
-    (``'cholesky'``).  The factor arithmetic is
-    :func:`_charge_factor_math` — the SAME traced kernel the sharded
-    producer route runs — and the back-solves are the same two bodies
-    ``solve_zeta`` applies (``_pinv_matmul_logical`` /
-    ``_tri_solve_logical``), written here without the identity pad because
-    a caller holding one whole tile has no pad to slice.
-
-    WHY THIS IS PUBLIC.  ``bse.vq_interp``'s per-Q refit has to solve the
-    same system the producer solved, or the ζ' it builds differs from ζ in
-    exactly the near-null subspace the producer discarded — and ``V_Q =
-    Σ_G conj(ζ(G)) v(q+G) ζ(G)`` is QUADRATIC in it.  Before 2026-08-11 the
-    refit ran a plain Cholesky with a fixed 1e-14·|tr C| ridge under a
-    comment claiming it followed a private ridged-Cholesky helper of THIS
-    module — a symbol that has never existed in this tree — and the tile
-    identity
-    ``vq_interp.refit_ongrid_null`` read 3.3, 16, 51 and 140 against a
-    5.0e-02 bracket, monotone in the fraction of directions the producer's
-    truncation had dropped (4.7 % → 3.289, 58.6 % → 139.9; five parents,
-    ``tests/known_failures/2026-08-11-narrowed-zeta-window-clears-fh-and-\
-the-tile-null-still-refuses.md`` §4).  A second, private re-implementation
-    of a solve is how that happens; one exported entry point is the fix.
-
-    ``zeta_rcond`` / ``zeta_ridge`` are taken EXACTLY as given — this
-    function applies no ``LORRAX_ZETA_RCOND`` / ``LORRAX_ZETA_RIDGE``
-    override of its own.  Its caller is reproducing a fit that already
-    happened, and the EFFECTIVE (post-env) values of that fit are recorded
-    in the ζ file's ``isdf_header/fit_provenance``
-    (:func:`gw.gw_init._zeta_fit_provenance`); re-applying today's
-    environment on top would silently solve a different system than the one
-    on disk.  The producer-side entry points (:func:`_factor_c_q_replicated`
-    and friends) still apply the deprecated env twins, because there the
-    deck is what is being resolved.
-
-    ``rank_log`` defaults to the producer's rule (on for
-    ``rank_truncate``), so a
-    refit prints the same ``n_keep``/``kappa`` line the fit did and the two
-    can be read against each other.  jit-safe: everything below is jnp plus
-    ``jax.debug`` callbacks.
-    """
+    """THE producer's charge-ζ solve on ONE whole, unpadded (n_μ, n_μ) tile; see docs/architecture/zeta_fit_face_psi_cct.md."""
     mode = str(charge_zeta_solve).strip().lower()
     if mode not in ('rank_truncate', 'cholesky'):
         raise ValueError(
@@ -4677,54 +2467,7 @@ def _factor_c_q_replicated(
     charge_zeta_solve: str = 'cholesky',
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
 ) -> jax.Array:
-    """Dense, fully REPLICATED factor of the identity-padded charge CCT.
-
-    Two selectable conditioners share this ONE replicated (mesh-invariant)
-    seam — ``charge_zeta_solve`` picks which factor is returned:
-
-    * ``'rank_truncate'`` (production default) — rank-revealing ``eigh``
-      pseudo-inverse factor ``B`` with ``B Bᴴ = C⁺`` (see the WHY note
-      inside).  The back-solve is a matmul ``ζ = B(BᴴZ)``.
-    * ``'cholesky'`` — the historical lower-triangular Cholesky factor
-      ``L`` with ``L Lᴴ = C+ridge``.  Back-solve is two triangular solves.
-      Bit-identical to the pre-rank-truncation code (the frozen contract);
-      it is the selectable ALTERNATIVE.
-
-    Mesh-invariant by construction for BOTH: the factorisation runs on the
-    fully-replicated LOGICAL block — one dense ``eigh`` / ``cholesky`` per q
-    on whole tiles — so the factor is bit-identical across device counts and
-    process grids, unlike the block-cyclic cuSolverMp potrf whose partial-sum
-    regrouping depends on ``(px, py)``.  This is the single code path for the
-    ``'replicated_cholesky'`` / ``'replicated_rank_truncate'`` auto picks
-    (fit-size n_μ on any mesh) and every single-device / 1-D-degenerate mesh
-    (where a dense factor is the only option).
-
-    Cholesky ridge (two per-q scalar terms, so both mesh-invariant):
-
-      ridge = [ 1e-14·|tr(C)|  +  zeta_ridge·|tr(C)|/n ] · I
-
-    * The hard ``1e-14·|tr(C)|`` FLOOR is unchanged from the historical
-      single-device path — it lifts the tiny negative eigenvalues that
-      appear with more centroids than band pairs so ``potrf`` stays real.
-      With ``zeta_ridge == 0`` (the default) the factor is bit-identical to
-      that path (the frozen-golden contract).
-    * ``zeta_ridge`` (a fraction of the mean diagonal tr(C)/n, default 0) is
-      an OPT-IN Tikhonov term that CONDITIONS a near-singular CCT (n_μ
-      over-complete for the pair-density rank).  ``rank_truncate`` (the
-      default) is the PRINCIPLED cure that supersedes it — drop the near-null
-      directions instead of shifting them — so the ridge stays 0 there.
-      Tune ε via the ``zeta_ridge`` input key in the deck; the
-      ``LORRAX_ZETA_RIDGE`` env form is a DEPRECATED twin (scorecard AV:
-      still wins when set non-empty, but loudly — see
-      :func:`_deprecated_env_float`) slated for removal.
-
-    Factorise at the LOGICAL extent and re-embed identity in the pad block
-    (√1 = 1 for L; B's pad block is likewise identity and is sliced away in
-    the back-solve) — see :func:`_identity_pad_block_diagonal`.  The factor
-    regroups partial sums when the matrix extent changes, so factorising at
-    the logical (not padded) extent keeps the factor pad-extent-invariant
-    (the fixed-P invariance gate).
-    """
+    """Dense, fully REPLICATED factor of the identity-padded charge CCT; see docs/architecture/zeta_fit_face_psi_cct.md."""
     import os as _os
     nq, n_rmu, _ = C_q.shape
     n_log = int(n_rmu_logical)
@@ -4740,7 +2483,7 @@ def _factor_c_q_replicated(
                  "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond))
     out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     rep_sh = NamedSharding(mesh_xy, P())
-    key = (id(mesh_xy), int(nq), int(n_rmu), n_log,
+    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log,
            float(ridge_extra), mode, float(rcond))
     if key not in _replicated_chol_cache:
         _re = ridge_extra
@@ -4808,19 +2551,7 @@ def _replicated_factor_q_chunk(nq: int, n_rmu: int) -> int:
 def factor_c_q_replicated_batched(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int, **kw
 ) -> jax.Array:
-    """:func:`_factor_c_q_replicated` over q in bounded batches.
-
-    Per-q independent, so concatenating the batches reproduces the one-shot
-    call; only the XLA workspace differs.  A single batch (every stack that
-    already fitted) takes the identical code path it always did.
-
-    P>1 SCHEDULE (2026-08-01): above :data:`_QPARALLEL_MIN_NQ_MU3` the
-    same plan EXECUTES q-parallel (:func:`_factor_c_q_replicated_qparallel`
-    — q's scattered over all devices, whole tiles per q, bits unchanged)
-    instead of redundantly on every rank.  This is a fold INTO the
-    replicated plan, deliberately not a third resolution — see the WHY on
-    the q-parallel function.
-    """
+    """:func:`_factor_c_q_replicated` over q in bounded batches; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_rmu, _ = C_q.shape
     if _qparallel_factor_ok(nq, int(n_rmu_logical), mesh_xy):
         _qparallel_announce(nq, n_rmu, int(n_rmu_logical), mesh_xy)
@@ -4878,15 +2609,7 @@ _qparallel_announced: set = set()
 
 
 def _qparallel_factor_ok(nq: int, n_rmu_logical: int, mesh_xy: Mesh) -> bool:
-    """True when the replicated charge factor should EXECUTE q-parallel.
-
-    ``LORRAX_ZETA_QPARALLEL``: unset/``auto`` → fold above
-    :data:`_QPARALLEL_MIN_NQ_MU3` (needs >1 device and >1 q to scatter);
-    ``0`` → never (the pre-fold all-ranks execution, kept as the A/B
-    control); ``1`` → always (the bit-identity gate forces it at fixture
-    size).  Either way the RESULT is the same bits — this knob selects an
-    execution schedule, never a numerical route.
-    """
+    """True when the replicated charge factor should EXECUTE q-parallel; see docs/architecture/zeta_fit_face_psi_cct.md."""
     if int(mesh_xy.devices.size) <= 1:
         return False
     raw = os.environ.get("LORRAX_ZETA_QPARALLEL", "auto")
@@ -4947,48 +2670,7 @@ def _factor_c_q_replicated_qparallel(
     charge_zeta_solve: str = 'cholesky',
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
 ) -> jax.Array:
-    """The replicated charge factor, EXECUTED q-parallel.
-
-    WHY THIS IS A FOLD AND NOT A THIRD RESOLUTION: a plan in this family
-    is a numerical contract — ``replicated`` = whole-tile dense factor,
-    bit-identical across meshes and device counts; ``distributed`` =
-    block-cyclic eigh, a different (equally valid) gauge, explicit opt-in.
-    This path changes only WHICH device runs each per-q factorisation,
-    never what is computed, so its output is the replicated plan's output
-    to the bit and it carries no new resolver string, no new input key,
-    and no new downstream contract.  (Precedent: the W-solve family's
-    LOCAL plan is likewise q-parallel — scorecard AN.)
-
-    Schedule: zero-pad the q axis to the device count, scatter q over the
-    FLATTENED mesh (``P(('x','y'), None, None)``) through the measured
-    single-axis staging (``P('x', None, 'y')`` — see gw/w_isdf's
-    involuntary-remat note), factor each OWNED q as one whole-tile call
-    into :func:`_charge_factor_math` (per-q ``fori_loop``: the XLA eigh
-    workspace is bounded by ONE (μ, μ) tile, strictly tighter than
-    :func:`_replicated_factor_q_chunk`'s batch bound), skip pad q's with a
-    ``lax.cond`` (so the Cholesky branch never factors filler and the
-    rank log prints no phantom q's), then stage the factors back to
-    ``P(None, 'x', 'y')`` and re-embed the identity μ-pad block.
-
-    BIT-IDENTITY to the all-ranks execution, claim by claim:
-
-    * the factor is per-q independent — the q-batch split is already
-      relied on (``factor_c_q_replicated_batched`` concatenates cap-sized
-      batches) and XLA's batched LAPACK wrappers loop per matrix;
-    * the reshards move exact byte copies (pure data movement);
-    * the per-q arithmetic is the SAME traced kernel on the same whole
-      logical tile (``_charge_factor_math``; the μ-slice/zero-refill is
-      the same ``solve_at_logical``; the identity μ-pad re-embed is the
-      same helper).
-
-    Gate: ``tests/test_zeta_mesh_invariance.py::
-    test_qparallel_execution_is_bit_identical_to_replicated`` (exact
-    equality, both modes, non-dividing nq, padded μ).
-
-    Observability delta, deliberate: the rank_truncate conditioning log
-    prints per OWNED q from the owning process (the all-ranks execution
-    printed every q from every process); fields are unchanged.
-    """
+    """The replicated charge factor, EXECUTED q-parallel; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_rmu, _ = C_q.shape
     n_log = int(n_rmu_logical)
     mode = str(charge_zeta_solve)
@@ -5010,7 +2692,7 @@ def _factor_c_q_replicated_qparallel(
     q_sh = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
     mid_sh = NamedSharding(mesh_xy, P('x', None, 'y'))
 
-    key = (id(mesh_xy), int(nq), int(n_rmu), n_log,
+    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log,
            float(ridge_extra), mode, float(rcond), bool(rank_log))
     if key not in _qparallel_factor_cache:
         _re, _rc, _rl = ridge_extra, rcond, rank_log
@@ -5102,54 +2784,22 @@ def _factor_c_q_replicated_qparallel(
 # The service owns each provider's pivot dtype and rank-private layout;
 # this physics module never sees or reshards a pivot vector.
 
-# The per-q diagonal ridge for the indefinite transverse LU:
-# eps·|tr(C_log)|/n_log lifts TRS-paired near-zero modes above the
-# partial-pivoting stability floor without perturbing well-conditioned
-# ones.  Module constant so the hoisted factor stage and solve_zeta's
-# fused fallback paths cannot drift.
+# Equal-current C and Z carry the same signed-Gram convention; the shared
+# ridge owner preserves that sign in every hoisted and fused LU preparation.
 _TRANSVERSE_LU_RIDGE = 1e-12
 
 _transverse_lu_cache: dict = {}      # hoisted local LU factor kernels
 _transverse_distributed_lu_cache: dict = {}  # ridged inputs to service getrf
 
 
+def _transverse_lu_ridge(trace, n_log):
+    """Preserve the shared C/Z Gram sign so (sQ+sδI)⁻¹(sZ)=(Q+δI)⁻¹Z."""
+    return _TRANSVERSE_LU_RIDGE * jnp.sign(jnp.real(trace)) * jnp.abs(trace) / n_log
+
+
 def _transverse_lu_math(C_log: jax.Array, n_log: int):
-    """Per-q hoisted transverse LU arithmetic — ONE kernel shared by the
-    all-ranks and q-parallel executions (bit-identity contract, same role
-    as ``_charge_factor_math``).
-
-    ``C_log``: one whole REPLICATED logical tile ``(n_log, n_log)``.
-    Returns ``(lu, piv)`` with ``lu`` the packed L/U factors and ``piv``
-    the int32 LAPACK pivots — the pair ``jnp.linalg.solve`` computes
-    internally (``lax.linalg.lu``), so ``jax.scipy.linalg.lu_solve((lu,
-    piv), Z)`` at solve time runs the identical
-    ``lu_pivots_to_permutation`` + ``lax_linalg.lu_solve`` arithmetic and
-    reproduces the fused ``jnp.linalg.solve(C_reg, Z)`` to the bit.  The
-    ridge uses ``jnp.trace`` on the replicated tile — the same
-    expression (same reduction order, same bits) the fused
-    ``_ridge_indef_solve`` used.
-
-    WHAT THE RIDGE IS AND IS NOT — the docstring claim that was REFUTED.
-    The transverse CCT is Hermitian **INDEFINITE**: both signs of λ are
-    physical (TRS in a non-magnetic ground state puts near-null
-    transverse-current modes at both signs).  ``C + εI`` shifts EVERY
-    eigenvalue the same way, so it pushes the NEGATIVE ones toward zero.
-    A positive ridge is therefore not a regularizer here, and above
-    κ ~ 1e12 it is measured actively harmful (register ``bispinor``, job
-    7885987).  It is retained as the default only because flipping a
-    production default is a physics ruling with a measurement attached,
-    and no production-deck measurement of the truncated route
-    (``transverse_zeta_solve = rank_truncate``, which cuts on ``|λ|`` and
-    is the correct scheme for an indefinite operator) exists yet.
-
-    What it may NOT be is uninstrumented.  :func:`_certify_transverse_ridge`
-    reads a κ LOWER BOUND off ``|diag U|`` of this factor — O(n) after a
-    factorization that already happened — and refuses above
-    ``rank_criterion.KAPPA_INDEFINITE_MAX``.  A lower bound is the right
-    direction for a gate that fires when the number is LARGE.  See
-    ``docs/dev/rank_truncation_policy.md`` §4.
-    """
-    ridge = _TRANSVERSE_LU_RIDGE * jnp.abs(jnp.trace(C_log)) / n_log
+    """Factor the logical signed Gram with its sign-aware ridge before the unchanged RHS solve."""
+    ridge = _transverse_lu_ridge(jnp.trace(C_log), n_log)
     C_reg = C_log + ridge * jnp.eye(n_log, dtype=C_log.dtype)
     lu, piv, _perm = jax.lax.linalg.lu(C_reg)
     return lu, piv.astype(jnp.int32)
@@ -5157,35 +2807,7 @@ def _transverse_lu_math(C_log: jax.Array, n_log: int):
 
 def _certify_transverse_ridge(LU_q: jax.Array, *, n_log: int,
                               where: str) -> None:
-    """CONDITIONING INSTRUMENT for the default (ridge) transverse path.
-
-    THE DEFECT THIS CLOSES.  The ridge family is the default transverse
-    factor and it had **no conditioning instrument at all** — the
-    ``rank_truncate`` family prints ``n_keep/q`` and ``kappa/q``, the ridge
-    family printed nothing, so on the default path there was no number to
-    read and no number to gate.  Registered three times (``bispinor``: the
-    refuted docstring mechanism, the harmful positive ridge above κ~1e12,
-    and the missing instrument).
-
-    WHAT IS MEASURED, and what it is worth.  ``|diag U|`` of the pivoted LU
-    gives ``kappa_lb = max|u_ii| / min|u_ii|``, which is the standard cheap
-    conditioning proxy and is a **LOWER bound** in practice, not a
-    certificate.  That asymmetry is exactly right for a gate that fires when
-    the number is large: exceeding the ceiling PROVES κ exceeds it, so the
-    refusal is sound.  Failing to exceed it proves nothing, and the log says
-    so instead of reporting a clean bill — an absence is not a pass
-    (``TASTE.md``, "a check that cannot fail is not evidence").
-
-    COST.  One diagonal extraction and two reductions over an array the
-    factor already materialised: ``O(nq · n_log)`` against the LU's
-    ``O(nq · n_log³)``, plus ONE host sync per channel (this runs once per
-    channel, not per r-chunk).  Priced before enabling, per the owner's
-    truncation directive.
-
-    NOT REACHABLE on the ScaLAPACK transverse plan: its factor is an opaque
-    ``FactorToken`` with no public buffer, by design.  The caller says so
-    rather than silently skipping.
-    """
+    """CONDITIONING INSTRUMENT for the default (ridge) transverse path; see docs/architecture/zeta_fit_face_psi_cct.md."""
     mode = rank_criterion.resolve_policy_mode(
         os.environ.get(rank_criterion.POLICY_MODE_ENV))
     if mode == "off":
@@ -5208,7 +2830,7 @@ def _certify_transverse_ridge(LU_q: jax.Array, *, n_log: int,
     if jax.process_index() == 0:
         print(f"  [{where}] conditioning: kappa_lb = max|u_ii|/min|u_ii| of "
               f"the pivoted LU, worst over q = {k_max:.3e} at q={q_at} "
-              f"(ridge {_TRANSVERSE_LU_RIDGE:.1e}*|tr C|/n; ceiling "
+              f"(ridge sign(tr C)*{_TRANSVERSE_LU_RIDGE:.1e}*|tr C|/n; ceiling "
               f"{ceiling:.1e}).  This is a LOWER BOUND on kappa — above the "
               f"ceiling it refuses, below it certifies NOTHING.", flush=True)
     if not (k_max > ceiling):
@@ -5237,11 +2859,7 @@ def _certify_transverse_ridge(LU_q: jax.Array, *, n_log: int,
 
 def _embed_lu_padded(LU_log: jax.Array, n_rmu: int, n_log: int,
                      mesh_xy: Mesh) -> jax.Array:
-    """Zero-embed per-q LOGICAL LU factors at the padded extent and set
-    identity on the pad-block diagonal (shape/sharding uniformity only:
-    the back-solve slices back to the logical block, so the pad content
-    is never part of any solve — same contract as the charge factor's
-    identity pad)."""
+    """Zero-embed per-q LOGICAL LU factors at the padded extent and set identity on the pad-block diagonal (shape/sharding uniformity only: the back-solve slices back to the logical block, so the pad content is never part of any solve — same contract as the charge factor's identity pad); see docs/architecture/zeta_fit_face_psi_cct.md."""
     if int(n_rmu) == int(n_log):
         return jax.lax.with_sharding_constraint(
             LU_log, NamedSharding(mesh_xy, P(None, 'x', 'y')))
@@ -5254,27 +2872,7 @@ def _embed_lu_padded(LU_log: jax.Array, n_rmu: int, n_log: int,
 def _factor_c_q_transverse_lu(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
 ) -> tuple[jax.Array, jax.Array]:
-    """LOCAL-plan hoisted transverse factor: per-q pivoted LU of the
-    ridged LOGICAL block, once per channel.
-
-    Returns ``(LU_q, perm_q)``:
-
-    * ``LU_q`` ``(nq, n_rmu, n_rmu)`` at PADDED extent, sharded
-      ``P(None, 'x', 'y')`` — the packed L/U factors in the logical
-      block, identity in the pad block.  Downstream gather tiers
-      (replicated / per_q) consume it exactly like the CCT passthrough
-      they used to gather: same shape, same sharding, same bytes moved.
-    * ``perm_q`` ``(nq, n_log)`` int32, replicated — the LU permutation
-      for ``lax.linalg.lu_solve``.
-
-    Execution schedule mirrors the charge fold
-    (:func:`_factor_c_q_replicated_qparallel`): q-parallel over the
-    flattened mesh when :func:`_qparallel_factor_ok` says so (the factor
-    is per-q independent; scatter/gather reshards are exact byte moves;
-    the per-q arithmetic is the ONE shared kernel
-    :func:`_transverse_lu_math`), all-ranks whole-tile execution
-    otherwise.  Both produce the same bits.
-    """
+    """LOCAL-plan hoisted transverse factor: per-q pivoted LU of the ridged LOGICAL block, once per channel; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_rmu, _ = C_q.shape
     n_log = int(n_rmu_logical)
     qparallel = _qparallel_factor_ok(nq, n_log, mesh_xy)
@@ -5287,7 +2885,7 @@ def _factor_c_q_transverse_lu(
         # r-chunk; per-q independent, so concatenating batches reproduces
         # the one-shot call.
         step = _replicated_factor_q_chunk(nq, n_log)
-        key = (id(mesh_xy), int(n_rmu), n_log, 'batch')
+        key = (_mesh_key(mesh_xy), int(n_rmu), n_log, 'batch')
         if key not in _transverse_lu_cache:
             @partial(jax.jit,
                      out_shardings=(out_sh, NamedSharding(mesh_xy, P(None, None))))
@@ -5314,7 +2912,7 @@ def _factor_c_q_transverse_lu(
             jnp.concatenate([p[1] for p in parts], axis=0),
             NamedSharding(mesh_xy, P(None, None)))
         return LU_q, perm_q
-    key = (id(mesh_xy), int(nq), int(n_rmu), n_log, 'qpar')
+    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, 'qpar')
     if key not in _transverse_lu_cache:
         _qparallel_announce_transverse(nq, n_rmu, n_log, mesh_xy)
         ndev = int(mesh_xy.devices.size)
@@ -5428,35 +3026,12 @@ def _factor_c_q_transverse_distributed_lu(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int, *, backend: str,
     trace_per_q: jax.Array | None = None,
 ) -> FactorToken:
-    """DISTRIBUTED-plan hoisted transverse LU on the ridged logical block.
-
-    Returns a :class:`distrib_la.FactorToken` at ``n = n_log``, the
-    LOGICAL extent (the resolve contract guarantees
-    ``n_log % px == n_log % py == 0`` on this path).  Inside it are the
-    block-cyclic provider factors — each rank's shard IS its local block —
-    and the provider-native, per-rank pivot rows.  ScaLAPACK uses i32;
-    cuSOLVERMp uses i64.  Both remain private to the service token.
-
-    THE TOKEN IS WHY THIS SIGNATURE CHANGED.  It used to hand back
-    ``(LU_q, ipiv_q)`` with "never reshard it, feed it back verbatim"
-    written in the docstring and re-written at the ``pXgetrs`` call three
-    frames away.  A comment is not a contract: the pivot vector was an
-    ordinary ``jax.Array`` that anything could gather, slice or reshard,
-    and gathering it is silently wrong rather than loud.  The token has
-    no public factor attribute at all, so there is nothing to reach —
-    ``distrib_la.solve(token, B)`` is the only thing that can consume it,
-    and it checks B against the extents the factor was made at.
-
-    ``trace_per_q`` is the materialized trace used by the fused path.  It is
-    passed explicitly because allowing XLA to fuse the reduction into this
-    preparation kernel changed its reduction tree on the production CCT;
-    the near-null transverse solve amplified that tiny ridge change.
-    """
+    """DISTRIBUTED-plan hoisted transverse LU on the ridged logical block; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_rmu, _ = C_q.shape
     n_log = int(n_rmu_logical)
     xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
-    key = (id(mesh_xy), int(nq), int(n_rmu), n_log, str(backend))
+    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, str(backend))
     if key not in _transverse_distributed_lu_cache:
         @jax.jit
         def _prep(C, trace):
@@ -5465,8 +3040,7 @@ def _factor_c_q_transverse_distributed_lu(
             # modes — ROOT_CAUSE.md 2026-07-08) and add the per-q ridge.
             C_log = jax.lax.with_sharding_constraint(
                 C[:, :n_log, :n_log], xy_shard)
-            ridge = (_TRANSVERSE_LU_RIDGE
-                     * jnp.abs(trace) / n_log)[:, None, None]
+            ridge = _transverse_lu_ridge(trace, n_log)[:, None, None]
             eye_n = jnp.eye(n_log, dtype=C.dtype)[None, :, :]
             return jax.lax.with_sharding_constraint(
                 C_log + ridge * eye_n, xy_shard)
@@ -5515,12 +3089,7 @@ _dist_solve_cache: dict = {}    # distributed back-solve GEMM kernel
 
 
 def _distributed_q_batch(nq: int, per_q_bytes: int) -> int:
-    """q-batch size bounding the GEMM's gathered transient.
-
-    Reuses :data:`_ZETA_GATHER_MAX_BYTES` (``LORRAX_ZETA_GATHER_CAP_GIB``,
-    4 GiB) because it gates exactly the same thing here as it does for the
-    other tiers: the live extent of the back-solve's gathered operands.
-    """
+    """q-batch size bounding the GEMM's gathered transient; see docs/architecture/zeta_fit_face_psi_cct.md."""
     return max(1, min(int(nq), _ZETA_GATHER_MAX_BYTES // max(1, per_q_bytes)))
 
 
@@ -5567,13 +3136,7 @@ _DEFAULT_COLLECTIVE_CHUNK_MB = 128.0
 
 
 def _collective_chunk_bytes() -> int:
-    """Upper bound on ONE emitted collective's payload, in bytes.
-
-    ``LORRAX_COLLECTIVE_CHUNK_MB`` (default 128 MB, see the note above).
-    ``0`` or a negative value disables chunking entirely and restores the
-    pre-AF single-shot behaviour — kept only so the failure can be
-    reproduced on demand.
-    """
+    """Upper bound on ONE emitted collective's payload, in bytes; see docs/architecture/zeta_fit_face_psi_cct.md."""
     try:
         mb = float(os.environ.get("LORRAX_COLLECTIVE_CHUNK_MB",
                                   _DEFAULT_COLLECTIVE_CHUNK_MB))
@@ -5585,13 +3148,7 @@ def _collective_chunk_bytes() -> int:
 
 
 def _chunk_q(nq: int, per_q_collective_bytes: int) -> int:
-    """Largest q-block whose LARGEST single collective fits the budget.
-
-    ``per_q_collective_bytes`` must be the size of the BIGGEST collective
-    the block emits per q — not the sum over collectives and not the live
-    footprint.  The bound is per-instruction because that is what the
-    transport sees.
-    """
+    """Largest q-block whose LARGEST single collective fits the budget; see docs/architecture/zeta_fit_face_psi_cct.md."""
     return max(1, min(int(nq),
                       _collective_chunk_bytes()
                       // max(1, int(per_q_collective_bytes))))
@@ -5601,13 +3158,7 @@ _chunk_logged: set = set()
 
 
 def _chunk_log(where: str, nq: int, qb: int, per_q_bytes: int) -> None:
-    """One line per call site naming the emitted per-collective payload.
-
-    Mandatory production telemetry: a tier
-    that silently stopped chunking would otherwise be invisible until it
-    took a 72-node job down again.  Deduplicated on the tuple, because the
-    back-solve site is re-entered once per r-chunk (9–81 times).
-    """
+    """One line per call site naming the emitted per-collective payload; see docs/architecture/zeta_fit_face_psi_cct.md."""
     # --- LOUD FLOOR (size campaign 2026-07-29, owner-approved) -------------
     # `_chunk_q` splits the q axis ONLY.  Once ONE q's collective exceeds the
     # budget its `max(1, ...)` floor returns q_block=1 and there is no
@@ -5671,58 +3222,7 @@ def _factor_c_q_distributed_rank_truncate(
     indefinite: bool = False,
     distrib_la_batched_route: str = "batch_reshard",
 ) -> jax.Array:
-    """Truncated pseudo-inverse ``C⁺``, formed and kept 2D-SHARDED.
-
-    Same physics as :func:`_factor_c_q_replicated`'s ``rank_truncate``
-    branch — drop ``λ < rcond·λ_max``, then ``C⁺ = Σ_{keep} vᵢvᵢᴴ/λᵢ`` —
-    with two structural differences:
-
-    1. the ``eigh`` is DISTRIBUTED (ScaLAPACK ``pzheevd`` over the whole
-       mesh), so the O(nq·μ³) factorisation finally divides by P instead of
-       running redundantly on every rank;
-    2. ``C⁺`` is returned EXPLICITLY (not as the factor ``B`` with
-       ``BBᴴ = C⁺``).  Explicit costs one extra ``nq·μ³`` at fit time but
-       halves the per-r-chunk back-solve: one GEMM ``C⁺Z`` instead of two
-       (``B(BᴴZ)``), and the r-chunk loop runs 9–81 times.
-
-    PADDED extent, deliberately.  The other charge routes factor at the
-    LOGICAL extent and re-embed identity, because a blocked factorisation
-    regroups partial sums when the extent changes.  ScaLAPACK's descriptors
-    need ``n`` divisible by both mesh axes, which ``n_rmu_logical`` in
-    general is not and ``n_rmu_padded`` always is — so this route factors
-    the identity-padded block-diagonal ``[C_log 0; 0 I]``.  That is exact,
-    not a compromise: the blocks do not mix, so ``C⁺``'s logical block is
-    ``pinv(C_log)`` and its pad block is ``I`` or ``0`` depending on which
-    side of the cut ``λ = 1`` lands; either way ζ's pad rows come out zero
-    because Z's pad rows are exactly zero (the bilinear-in-zero-padded-ψ
-    contract).  The *floating-point* consequence is that ζ from this tier
-    agrees with the replicated tier to ~κ·ε rather than bit-exactly —
-    which is already true of any block-cyclic eigh (different gauge), and
-    is why the tier is explicit opt-in.
-
-    ``λ`` is replicated by ScaLAPACK's own contract (``W`` is a global
-    output computed on every process of the grid), so the truncation mask
-    is computed LOCALLY and is identical on every rank by construction —
-    no collective, and no chance of a rank-dependent cut.
-
-    ``indefinite=True`` (2026-08-01) is the TRANSVERSE-channel mode
-    (``transverse_zeta_solve='rank_truncate'`` +
-    ``distributed_zeta_solve='distributed'``): the transverse CCT is
-    Hermitian INDEFINITE, so (a) the cut is on ``|λ|`` (both signs are
-    physical) and (b) the pad block is ZEROED instead of identity —
-    ``[C_log 0; 0 0]`` — so the pad eigenvalues are exactly 0, are
-    truncated for EVERY τ, and can never contaminate ``σ_max`` (an
-    identity pad's λ=1 modes could win σ_max on a small-|λ| transverse
-    spectrum; zeros cannot).  Zero rows/cols stay exact zeros through the
-    Householder tridiagonalization and deflate exactly, so the pad modes
-    are inert in the same block-diagonal sense the charge note above
-    argues — and their ``inv=0`` removes them from C⁺ regardless.  THIS
-    is what removes the transverse mesh-divisibility constraint: the
-    eigh runs at the PADDED extent (divisible by both axes by
-    construction of ``n_rmu_padded``), where the LU family had to refuse
-    (pad-extent LU roundoff is amplified O(1) through the near-null
-    modes that rank truncation removes).
-    """
+    """Truncated pseudo-inverse ``C⁺``, formed and kept 2D-SHARDED; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_pad, _ = C_q.shape
     n_log = int(n_rmu_logical)
     if indefinite:
@@ -5767,7 +3267,7 @@ def _factor_c_q_distributed_rank_truncate(
     qb = _chunk_q(nq, per_q_coll)
     _chunk_log('C+ formation (pinv)', nq, qb, per_q_coll)
 
-    key = ('dist_rank_trunc', id(mesh_xy), int(nq), int(n_pad), n_log,
+    key = ('dist_rank_trunc', _mesh_key(mesh_xy), int(nq), int(n_pad), n_log,
            float(rcond), bool(rank_log), int(qb), bool(indefinite))
     if key not in _dist_factor_cache:
         out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
@@ -5916,35 +3416,7 @@ def _factor_c_q_distributed_rank_truncate(
 def _distributed_pinv_apply(
     C_pinv: jax.Array, Z_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
 ) -> jax.Array:
-    """ζ = C⁺ Z as a stacked GEMM with BOTH operands 2D-sharded.
-
-    ``out[q,i,j] = Σ_k C⁺[q,i,k]·Z[q,k,j]`` with ``C⁺`` at
-    ``P(None,'x','y')`` (i on 'x', k on 'y') and ``Z`` at the same spec
-    (k on 'x', j on 'y') — the classic 2-D block GEMM pairing.  Rank (x,y)
-    all-gathers C⁺'s row-block along 'y' (full k for its own i rows) and
-    Z's column-block along 'x' (full k for its own j columns), multiplies
-    locally, and is done: no psum, and the output lands at
-    ``P(None,'x','y')`` with no further movement.
-
-    COMMUNICATION, honestly counted (per rank, per r-chunk, μ_pad=μ,
-    r = r_chunk, mesh Px×Py):
-
-        this tier   nq·(μ²/Px + μ·r/Py)·16 B   received
-        replicated  nq·μ²·16 B                 received (the whole factor)
-        per_q       nq·μ²·16 B                 received (same total, lower peak)
-
-    At MoS2 12×12 (nq=144, μ=2016, r_chunk=11664, 12×12 mesh) that is
-    5.3 GB/rank/r-chunk here against 9.4 GB/rank/r-chunk for the other two
-    — 1.8× less traffic AND a 36.8 MB live transient per q instead of a
-    65 MB gathered tile (replicated: 9.4 GB).  On top of that this tier
-    does NOT run ``_reshard_z`` (two all-to-alls moving the whole
-    ``nq·μ·r`` tensor) and skips the first leg of the output reshard,
-    because Z is consumed in the layout it is built in.
-
-    The q axis is batched to bound the gathered transient (see
-    :func:`_distributed_q_batch`); the GEMM is per-q independent, so the
-    batching is invisible to the result.
-    """
+    """ζ = C⁺ Z as a stacked GEMM with BOTH operands 2D-sharded; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_pad, _ = C_pinv.shape
     n_zcols = int(Z_q.shape[2])
     px = int(mesh_xy.shape['x'])
@@ -5977,7 +3449,7 @@ def _distributed_pinv_apply(
     # that do not exist.  Two compiles + two transient slices per r-chunk
     # against ~nq of each on the traced-q form; at MoS2 12x12 (nq=144,
     # qb=116) that is 2 blocks per r-chunk.
-    key = ('dist_pinv_apply', id(mesh_xy), int(nq), int(n_pad), n_log,
+    key = ('dist_pinv_apply', _mesh_key(mesh_xy), int(nq), int(n_pad), n_log,
            n_zcols, int(qb))
     if key not in _dist_solve_cache:
         @partial(shard_map, mesh=mesh_xy,
@@ -6027,95 +3499,7 @@ def factor_c_q(
     distrib_la_batched_route: str = "batch_reshard",
     transverse_trace_per_q: jax.Array | None = None,
 ) -> jax.Array:
-    """
-    Compute system-matrix L_q from CCT matrix.
-
-    For ``vertex_mu_L == 0`` (standard spin-traced path) the CCT is
-    Hermitian positive-definite (modulo numerical noise); we run the
-    optimized 2D blocked Cholesky and return the lower-triangular
-    factor.  Downstream :func:`solve_zeta` then does two
-    triangular solves per-q.
-
-    For ``vertex_mu_L != 0`` (transverse Lorentz channels γ̃^i, i∈{1,2,3})
-    the CCT is Hermitian but **indefinite** — Cholesky NaNs; the factor
-    is a per-q pivoted LU with a stabilising ridge, HOISTED here (once
-    per channel) since 2026-08-01.  The return value is a PAIR
-    ``(factor, piv)``: the local plan stores ``(LU, perm)`` for
-    ``lax.linalg.lu_solve`` (bit-identical to the fused per-r-chunk
-    ``jnp.linalg.solve`` it replaced), the scalapack plan stores the
-    block-cyclic provider factors + private per-rank pivots for one
-    provider back-solve per r-chunk.
-
-    Padded-input path (``n_rmu_logical < C_q.shape[-1]``):
-    n_rmu may be padded to mesh divisibility at the boundary so the
-    ``P(None, 'x', 'y')`` input sharding is admissible at any logical
-    centroid count (e.g. n_rmu_logical = 661 prime → padded to 672 on
-    a 4×4 mesh).  By the Phase 3a contract the trailing pad rows/cols
-    of C_q are exact zeros (bilinear in zero-padded ψ).  We add
-    identity ONLY to the pad-block diagonal in-place — turning C_q
-    into a block-diagonal ``[C_log 0; 0 I_pad]`` matrix — and then
-    run the same sharded Cholesky / LU path the divisible case uses.
-    Cholesky of an identity-padded matrix produces a factor whose
-    logical block matches the logical-only factor in exact
-    arithmetic; in floating point the match is ≤1e-7 rel (blocked
-    implementations regroup partial sums when the extent changes —
-    see ``_identity_pad_block_diagonal``).  The pad-block factor is
-    exactly identity; the back-solve's pad rows of ζ come out as zero
-    (because Z's pad rows are zero by the same bilinear argument).
-    For the indefinite transverse channels the exact-arithmetic
-    guarantee FAILS in floating point (near-null-mode amplification —
-    ROOT_CAUSE.md 2026-07-08), so ``solve_zeta`` slices that solve
-    back to the logical extent.  On single-device meshes the dense
-    Cholesky below also factorises at the logical extent and
-    re-embeds, making the charge factor pad-extent-invariant at P=1
-    (the fixed-P invariance gate).
-
-    This is NOT ridge regularisation of C_q.  The logical block is
-    untouched; identity is added ONLY to the pad-block diagonal.
-
-    Output sharding is ``P(None, 'x', 'y')`` natively at the padded
-    extent — no replication, no slice + embed gymnastics, the chol
-    stays sharded across the mesh.
-
-    Args:
-        C_q: (nq, n_rmu, n_rmu) CCT matrix at PADDED μ extent, sharded
-            ``P(None, 'x', 'y')``.  ``n_rmu == n_rmu_padded`` (== ∏ p_a
-            of the device mesh) so the existing 2D-blocked path
-            applies.
-        mesh_xy: 2D device mesh.
-        block_size: Tile block size (auto if None).
-        vertex_mu_L: Lorentz vertex index (0 = spin-traced PSD path,
-            1/2/3 = transverse indefinite path).
-        n_rmu_logical: Logical centroid count.  When given and
-            strictly less than ``C_q.shape[-1]``, the pad-block
-            diagonal is set to identity before factorisation.
-            ``None`` (default) skips the identity-pad: input == output
-            extent and the matrix is assumed to be PSD on its full
-            extent (legacy mesh-divisible path).
-        zeta_rcond: rank-truncation cutoff for the
-            ``'replicated_rank_truncate'`` charge factor (drop
-            eigenvalues < ``zeta_rcond·λ_max``).  Ignored by the Cholesky
-            paths.  Tune via the ``zeta_rcond`` input key in the deck;
-            the ``LORRAX_ZETA_RCOND`` env form is a DEPRECATED twin
-            (scorecard AV: still wins when set non-empty, but loudly)
-            slated for removal.
-
-    Returns:
-        For ``vertex_mu_L == 0``: L_q ``(nq, n_rmu, n_rmu)`` at PADDED
-        extent, sharded ``P(None, 'x', 'y')`` — the Cholesky factor
-        (block-diagonal ``[L_log 0; 0 I_pad]``) for the JAX cholesky
-        paths, or the rank-revealing pseudo-inverse factor ``B``
-        (``B Bᴴ = C⁺``) for ``'replicated_rank_truncate'``.  The two
-        LIBRARY cholesky paths (``cusolvermp_cholesky``,
-        ``slate_cholesky``) return a :class:`distrib_la.FactorToken`
-        instead: their factor is a block-cyclic handle that means nothing
-        off the grid that produced it, so it is opaque by construction and
-        ``solve_zeta`` feeds it back whole.
-        For ``vertex_mu_L ≠ 0``: the PAIR ``(factor, piv)`` described
-        above.  ``piv`` is non-None ONLY on the local ``'lu'`` plan, whose
-        factor is jax's own ``(LU, perm)``; every distributed factor is a
-        :class:`distrib_la.FactorToken` carrying its own pivots.
-    """
+    """Compute system-matrix L_q from CCT matrix; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_rmu, n_rmu2 = C_q.shape
     assert n_rmu == n_rmu2, f"C_q must be square, got {n_rmu} x {n_rmu2}"
     if n_rmu_logical is None:
@@ -6338,59 +3722,13 @@ _solve_cache = {}  # zeta-solve kernel
 
 
 def _reshard_zeta_mu_X_r_Y_to_mu_XY(zeta: jax.Array, mesh_xy: Mesh) -> jax.Array:
-    """Reshard (q_, μ_X, r_Y) → (q_, μ_XY, r_) for the cuSolverMp branches.
-
-    Single mesh axis ``'y'`` moves from the r-axis to the μ-axis (where
-    it joins ``'x'`` to form a flat tuple).  All other shardings stay.
-
-    Downstream consumer ``accumulate_rchunk_to_gflat`` wants ζ
-    μ-flat-sharded so the FFT box and gflat-accumulator both live at
-    ``P(None, ('x','y'), None)``; landing ζ in that layout here means
-    the FFT runs sharding-preserving (no further reshard, no
-    replicated FFT box).
-
-    Note on overhead: tried both ``@jax.jit(donate_argnums=(0,))``
-    closure-wrapping (matching the ``_reshard_z`` pattern above) and a
-    module-level decorator with ``static_argnums``.  Neither flipped
-    XLA's ``is_sync`` flag on the emitted all-to-all from ``true`` to
-    ``false``, and runtime cost was the same either way (~3 ms/call in
-    the trace).  The bare ``with_sharding_constraint`` is the simplest
-    form for the same emitted HLO; trace shows the reshard is not on
-    the critical path at MoS2 3×3 scale.
-    """
+    """Reshard (q_, μ_X, r_Y) → (q_, μ_XY, r_) for the cuSolverMp branches; see docs/architecture/zeta_fit_face_psi_cct.md."""
     return jax.lax.with_sharding_constraint(
         zeta, NamedSharding(mesh_xy, P(None, ('x', 'y'), None)))
 
 
 def _distributed_backsolve(Z_q: jax.Array, mesh_xy: Mesh, run) -> jax.Array:
-    """RHS pad → distributed back-solve → output reshard → trim.
-
-    THE shared frame for every ζ back-solve that keeps the factor
-    distributed — cuSolverMp ``potrs``, the cuSolverMp/ScaLAPACK
-    ``getrf``+``getrs`` pair, and the ``distributed`` tier's ``C⁺Z``
-    GEMM.  Those three differ ONLY in ``run``; the three things around
-    it are identical and used to be written out three times:
-
-    1. **NRHS padding.**  Every block-cyclic descriptor (and the GEMM's
-       ``'y'``-sharded column block) needs the last axis divisible by
-       ``Py``.  ``pad_last_axis_to`` appends zero columns, which give
-       exactly zero solution columns, so this is free of arithmetic
-       consequences.
-    2. **The output reshard.**  All three land ζ at ``P(None,'x','y')``
-       = ``(q_, μ_X, r_Y)``; the downstream G-flat accumulator wants
-       ``(q_, μ_XY, r_)`` so its FFT runs sharding-preserving.  That is
-       ONE all-to-all on ``'y'`` (:func:`_reshard_zeta_mu_X_r_Y_to_mu_XY`)
-       — half of what the replicated/per_q tiers pay, because their
-       shard_map back-solve lands ζ column-sharded over the flat mesh.
-    3. **The trim** back to the caller's logical column count.
-
-    Keeping them here is not only de-duplication: FFI-adjacent
-    resharding is where this code base has lost the most time (J.9's
-    silent NaNs from a Z re-layout, T.4's per-r-chunk recompile of one),
-    so there is exactly one copy to keep right.
-
-    ``run`` takes the PADDED Z and returns ζ at ``P(None,'x','y')``.
-    """
+    """RHS pad → distributed back-solve → output reshard → trim; see docs/architecture/zeta_fit_face_psi_cct.md."""
     Py = int(mesh_xy.shape['y'])
     _zpad = pad_last_axis_to(Z_q, Py)
     Z_pad, n_cols = _zpad.array, _zpad.logical   # LOGICAL, by name
@@ -6401,19 +3739,7 @@ def _distributed_backsolve(Z_q: jax.Array, mesh_xy: Mesh, run) -> jax.Array:
 
 
 def _reshard_zeta_r_XY_to_mu_XY(zeta: jax.Array, mesh_xy: Mesh) -> jax.Array:
-    """Reshard (q_, μ_, r_XY) → (q_, μ_XY, r_) for the shard_map branch.
-
-    The shard_map triangular-solve naturally lands ζ at
-    ``P(None, None, ('x','y'))`` because the solve is parallelised over
-    r-columns.  The downstream FFT wants μ-sharded.  Two mesh axes have
-    to move on the (μ, r) data axes; SPMD's all-to-all planner only
-    handles one mesh axis at a time, so we stage through the cuSolverMp
-    intermediate ``P(None, 'x', 'y')`` to keep every step a single-axis
-    all-to-all primitive ``(a_X, b) → (a, b_X)``:
-
-      Step 1  (q_, μ_, r_XY) → (q_, μ_X, r_Y)   ['x' moves r → μ]
-      Step 2  (q_, μ_X, r_Y) → (q_, μ_XY, r_)   ['y' moves r → μ]
-    """
+    """Reshard (q_, μ_, r_XY) → (q_, μ_XY, r_) for the shard_map branch; see docs/architecture/zeta_fit_face_psi_cct.md."""
     zeta = jax.lax.with_sharding_constraint(
         zeta, NamedSharding(mesh_xy, P(None, 'x', 'y')))
     return jax.lax.with_sharding_constraint(
@@ -6421,451 +3747,33 @@ def _reshard_zeta_r_XY_to_mu_XY(zeta: jax.Array, mesh_xy: Mesh) -> jax.Array:
 
 
 def _factor_nbatch(L_q) -> int:
-    """The q-axis extent of a ζ factor, whichever kind it is.
-
-    ``factor_c_q`` returns either a sharded array or an opaque
-    :class:`distrib_la.FactorToken`, and the token deliberately has no
-    ``.shape``: a ScaLAPACK token holds a ``(nq, n, n)`` factor AND a
-    ``(nq, P·ipiv_len)`` pivot vector, so "the shape" is not one thing and
-    a property that picked one of them would be a guess dressed as a fact.
-    The token publishes ``nbatch`` and ``n`` instead, which is what the two
-    readers in this file ever wanted.
-
-    NOT A PYTREE, and that is deliberate.  Registering the token so it
-    could be a traced ``jax.jit`` argument would let XLA relayout its
-    leaves at the boundary — and the ipiv is the one operand nothing
-    re-pins (``distrib_la.solve`` pins B, never the factor), so a
-    relayouted pivot vector is a silently wrong solve.  "Never reshard it"
-    is the whole contract; making it traceable is how it would be broken.
-    The token therefore travels as a Python value, which is exactly how
-    the production path uses it (``fit_one_rchunk`` calls the un-fused
-    ``z_q_phase`` / ``solve_phase``, never the composed ``@jax.jit``
-    ``_kernel``, which has no caller in this tree).
-    """
+    """The q-axis extent of a ζ factor, whichever kind it is; see docs/architecture/zeta_fit_face_psi_cct.md."""
     if isinstance(L_q, FactorToken):
         return int(L_q.nbatch)
     return int(L_q.shape[0])
 
 
-def solve_zeta(
-    L_q: jax.Array,
-    Z_q: jax.Array,
-    mesh_xy: Mesh,
-    q_chunk_size: int = 1,
-    vertex_mu_L: int = 0,
-    solver_kind: str = 'auto',
-    cct_trace_per_q: jax.Array | None = None,
-    n_rmu_logical: int | None = None,
-    zeta_gather: str = "replicated",
-    lu_piv: jax.Array | None = None,
-    distrib_la_batched_route: str = "batch_reshard",
-) -> jax.Array:
-    """
-    Solve for zeta_q given pre-computed system matrix from
-    :func:`factor_c_q`.
-
-    For ``vertex_mu_L == 0`` ``L_q`` is the lower-triangular Cholesky
-    factor of CCT and the inner solve is two triangular substitutions
-    (``L y = Z`` then ``L^H ζ = y``).  This is the historical fast
-    path — bit-identical to the previous implementation.
-
-    For ``vertex_mu_L != 0`` the transverse CCT^μ is Hermitian but
-    indefinite — γ̃^i ⊗ γ̃^i has both signs of eigenvalue, so Cholesky is
-    invalid and the factor is a pivoted LU with a small diagonal ridge
-    ``ε·|tr(C_log)|/n_log`` (ε = :data:`_TRANSVERSE_LU_RIDGE`).  Since
-    the 2026-08 hoist ``factor_c_q`` computes that LU ONCE per channel on
-    the local plan (including provider selection with ``batch_reshard``):
-    ``L_q`` carries the packed factors and
-    ``lu_piv`` the permutation, and this routine only APPLIES them per
-    r-chunk (``lax.linalg.lu_solve`` — bit-identical to the fused
-    ``jnp.linalg.solve``).  On the ScaLAPACK and cuSOLVERMp plans ``L_q``
-    is instead a :class:`distrib_la.FactorToken`, which carries the
-    block-cyclic factors and rank-private pivots; this module never opens
-    that token.
-    Bunch-Kaufman LDL^T would be the natural Hermitian-
-    indefinite factorization but JAX doesn't expose it; pivoted LU is
-    numerically equivalent for our purposes.
-
-    Uses q-chunked all-gather strategy: gather B_q matrices at a time,
-    then solve all B_q systems in parallel using vmap.
-
-    Memory trade-off:
-    - q_chunk_size=1: Minimum memory (one matrix replicated at a time)
-    - q_chunk_size=nq: Maximum parallelism (all matrices replicated)
-
-    Args:
-        L_q: (nq, n_rmu, n_rmu) Cholesky factor (μ_L=0) or raw CCT
-             (μ_L=1,2,3), sharded P(None, 'x', 'y') — OR a
-             :class:`distrib_la.FactorToken` from one of the three
-             library-handle routes, which is consumed whole and never
-             indexed, resharded or gathered
-        Z_q: (nq, n_rmu, n_zchunk) ZCT matrix, sharded P(None, 'x', 'y')
-             or P(None, None, ('x','y')) if caller already resharded
-        mesh_xy: 2D device mesh
-        q_chunk_size: Number of q-points to solve simultaneously (default 1)
-        vertex_mu_L: Lorentz vertex index — selects Cholesky-back-solve
-                     vs jnp.linalg.solve.  Output sharding is identical
-                     in both branches.
-        solver_kind: 'auto' (default) defers to :func:`_resolve_solver_kind`;
-                     explicit values are 'replicated_cholesky' (mesh-
-                     invariant dense factor from :func:`_factor_c_q_replicated`;
-                     back-solve shares the 'sharded_cholesky' per-q
-                     triangular path — L is replicated, r-columns sharded,
-                     so ζ is grid-agnostic), 'sharded_cholesky' (legacy 2D
-                     blocked chol + per-q triangular solve), 'lu' (per-q
-                     pivoted-LU for transverse channels),
-                     'cusolvermp_cholesky' (distributed potrs via FFI),
-                     'cusolvermp_lu' (distributed getrf+getrs via FFI
-                     for the transverse channels), or
-                     'replicated_rank_truncate' (charge rank-truncation:
-                     ``L_q`` is the pseudo-inverse factor B, back-solve is
-                     the matmul ζ = B(BᴴZ)), or
-                     'distributed_rank_truncate' (the
-                     ``distributed_zeta_solve='distributed'`` tier: ``L_q``
-                     is the truncated pseudo-inverse ``C⁺`` itself, kept
-                     2D-sharded, and the back-solve is one stacked GEMM
-                     with BOTH operands 2D-sharded — see
-                     :func:`_distributed_pinv_apply`).  'replicated_cholesky',
-                     'sharded_cholesky' and 'replicated_rank_truncate' all
-                     take the general shard_map back-solve branch below
-                     (none matches the cuSolverMp/scalapack guards).
-        n_rmu_logical: Logical centroid count.  When given and smaller
-                     than the padded input extent, every per-q dense
-                     solve (pivoted LU AND the per-q triangular
-                     back-solve) is μ-SLICED to this extent before the
-                     factorisation and the ζ pad rows are zero-filled
-                     after.  This is load-bearing for device-count
-                     invariance: solving the identity-padded system at
-                     the padded extent makes ζ depend deterministically
-                     on the pad extent (= on the device count), with
-                     O(1) amplification in the near-null transverse
-                     modes (reports/device_invariance_2026-07-08/
-                     ROOT_CAUSE.md).  ``None`` keeps the padded extent
-                     (back-compat for mesh-divisible callers).
-
-    Returns:
-        zeta_q: (nq, n_rmu, n_zchunk) solution, sharded P(None, ('x','y'), None)
-                — μ-axis flat-sharded across the ('x','y') mesh product,
-                r-axis replicated.  This is the layout the downstream
-                G-flat FFT (``accumulate_rchunk_to_gflat``) wants:
-                each rank owns a μ-slab over the full r-extent, so the
-                per-rank cuFFT runs locally without resharding.
-    """
-    # A distributed factor arrives as an opaque :class:`FactorToken` (the
-    # three library-handle routes) or as a plain sharded array (every JAX
-    # route).  The token deliberately exposes no factor, so read its
-    # EXTENTS — which are exactly the two numbers this line ever wanted —
-    # rather than reaching for a ``.shape`` it does not have.
-    if isinstance(L_q, FactorToken):
-        nq, n_rmu = int(L_q.nbatch), int(L_q.n)
-    else:
-        nq, n_rmu, _ = L_q.shape
-    _, _, n_zchunk = Z_q.shape
-    n_log = int(n_rmu_logical) if n_rmu_logical is not None else int(n_rmu)
-    if n_log > n_rmu:
-        raise ValueError(
-            f"solve_zeta: n_rmu_logical={n_log} exceeds input extent {n_rmu}")
-    mu_pad = n_rmu - n_log
-
-    solver_kind = _resolve_solver_kind(mesh_xy, vertex_mu_L, solver_kind)
-
-    # ``factor_c_q`` deliberately answers a provider LU request with the
-    # local-JAX (LU, pivots) pair when batch_reshard is selected: the provider
-    # token has a block-cyclic lifetime and cannot cross that route, whereas
-    # the JAX factor can be retained across r chunks.  Normalize the already
-    # resolved provider name at this seam so the remainder takes the ordinary
-    # hoisted lu_solve path.  A non-None pivot vector is the unambiguous tag;
-    # provider tokens keep their pivots opaque and were handled above.
-    if (lu_piv is not None
-            and solver_kind in ('cusolvermp_lu', 'scalapack_lu')
-            and distrib_la_batched_route == 'batch_reshard'):
-        solver_kind = 'lu'
-
-    if isinstance(L_q, FactorToken):
-        # THE LIBRARY-HANDLE ROUTES, now one branch.  ``factor_c_q``
-        # made this token on this mesh at these extents; ``distrib_la.solve``
-        # feeds it back verbatim to the matching back-solve entry point —
-        # cuSOLVERMp ``potrs``/``getrs``, SLATE's two ``trsm`` passes, or
-        # ScaLAPACK ``pXgetrs`` with its own ipiv.  Z stays at
-        # P(None,'x','y'): no
-        # input reshard, no all-gather of a factor, and — the part that used
-        # to be a comment — no way for this file to touch a pivot vector.
-        #
-        # The μ-slice to the LOGICAL extent + zero-refill is written out
-        # rather than delegated to ``solve_at_logical``: the pad extent has
-        # to come from Z, because the ScaLAPACK factor is ALREADY logical
-        # and the helper would read the wrong extent off it.  Z's pad rows
-        # are exact zeros by the Phase 3a contract, so the sliced system IS
-        # the logical system.  On the two cholesky routes the token's n is
-        # the padded extent and this is a no-op slice.
-        xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-        n_rows_pad = int(Z_q.shape[1])
-        n_solve = int(L_q.n)
-
-        def _run_token(Z):
-            Z_in = (jax.lax.with_sharding_constraint(
-                        Z[:, :n_solve, :], xy_shard)
-                    if n_rows_pad != n_solve else Z)
-            X = linalg_solve(L_q, Z_in)
-            if n_rows_pad != n_solve:
-                X = jnp.pad(X, ((0, 0), (0, n_rows_pad - n_solve), (0, 0)))
-            return jax.lax.with_sharding_constraint(X, xy_shard)
-
-        return _distributed_backsolve(Z_q, mesh_xy, _run_token)
-
-    if solver_kind in ('cusolvermp_lu', 'scalapack_lu') and mu_pad:
-        Px_ = int(mesh_xy.shape['x'])
-        Py_ = int(mesh_xy.shape['y'])
-        from runtime.padding import padded_axis
-        logical_lu_axis = padded_axis(
-            n_log, mesh_xy, name="logical distributed LU extent",
-            specs=((P('x', None), 0), (P(None, 'y'), 1)))
-        if logical_lu_axis.pad:
-            # The indefinite solve MUST run at the logical extent (see
-            # ``n_rmu_logical`` above), but the distributed block-cyclic
-            # descriptors need n % Px == n % Py == 0.  Fall back to the
-            # per-q replicated LU, which runs at any logical extent.
-            # Defense in depth ONLY: the config path refuses (explicit
-            # request) or announces (auto) this at RESOLVE time inside
-            # ``_resolve_solver_kind_transverse``; reaching this branch
-            # means a caller passed an explicit distributed kind without
-            # the divisibility precondition.  Announce via print, not
-            # warnings.warn — warnings dedupe/capture made the original
-            # demotion effectively silent in production logs (the
-            # ledgered "silent replicated-LU fallback").
-            if jax.process_index() == 0:
-                print(
-                    f"  [solve_zeta] n_rmu_logical={n_log} not divisible "
-                    f"by the {Px_}x{Py_} mesh axes; transverse LU falls "
-                    f"back from {solver_kind} to the per-q "
-                    f"jnp.linalg.solve path so the solve can run at the "
-                    f"logical extent.", flush=True)
-            solver_kind = 'lu'
-
-    if solver_kind in ('distributed_rank_truncate',
-                       'distributed_transverse_rank_truncate'):
-        # `distributed` tier: L_q IS the truncated pseudo-inverse C⁺, kept
-        # 2D-sharded.  ζ = C⁺Z is one stacked GEMM with BOTH operands at
-        # P(None,'x','y') — no factor gather, and no Z re-layout (Z is
-        # consumed in the layout z_q_from_psi_sm builds it in, which is
-        # exactly what scorecard J.9's flat-mesh column sharding made
-        # impossible).  The transverse spelling (2026-08-01) is the SAME
-        # back-solve on the transverse C⁺ (formed in indefinite mode);
-        # it runs at the padded extent by design, so it must NOT enter
-        # the logical-extent mu_pad guard above this dispatch.
-        return _distributed_backsolve(
-            Z_q, mesh_xy,
-            lambda Z: _distributed_pinv_apply(L_q, Z, mesh_xy, n_log))
-
-    if solver_kind in ('cusolvermp_lu', 'scalapack_lu'):
-        # FUSED distributed getrf+getrs for legacy callers that pass the
-        # raw CCT instead of factor_c_q's opaque FactorToken.
-        # L_q here is the *unfactored* CCT^μ (Hermitian indefinite) —
-        # factor_c_q passes it through.  Same input sharding, output
-        # reshard, and column padding pattern as the cholesky branch.
-        # The two backends share this branch verbatim — identical call
-        # contract; scalapack is the host/CPU-backend twin (Cray LibSci).
-        if lu_piv is not None:
-            raise ValueError(
-                f"solve_zeta: lu_piv was passed with solver_kind="
-                f"{solver_kind!r}, but the fused branch expects the raw "
-                f"CCT (the {solver_kind} factor hoist does not exist).")
-        # The FUSED route is plan-shaped, not handle-shaped: getrf+getrs
-        # in one FFI call, factors allocated and freed inside it, an ARRAY
-        # out.  So it goes through ``plan`` (which owns the operand
-        # reshard to P(None,'x','y') and the donation contract) rather
-        # than ``factor``/``solve`` — and ``factor('solve_lu')`` refuses
-        # cuSOLVERMp by name for exactly this reason: its entry point
-        # never surfaces the pivots, so there is no token to make.
-        #
-        # ``n=n_log``: the solve runs at the LOGICAL extent, so that is
-        # the extent the divisibility guard must check.
-        _lu_plan = linalg_plan(
-            'solve_lu', mesh_xy,
-            backend=('scalapack' if solver_kind == 'scalapack_lu'
-                     else 'cusolvermp'),
-            n=n_log, batched_route=distrib_la_batched_route)
-
-        def _dist_ridged_lu(L_log, Z_log):
-            # The μ-slice to the LOGICAL extent (via solve_at_logical;
-            # guarded above: n_log divides both mesh axes on this path)
-            # is load-bearing: L/Z pad rows are exact zeros (+ identity
-            # pad diag on L), so the sliced system IS the logical
-            # system; solving at the padded extent instead changes ζ_T
-            # wholesale — pad-shape LU roundoff is amplified O(1) in
-            # the near-null transverse modes (ROOT_CAUSE.md 2026-07-08,
-            # Manifestation 1).
-            xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-            L_log = jax.lax.with_sharding_constraint(L_log, xy_shard)
-            Z_log = jax.lax.with_sharding_constraint(Z_log, xy_shard)
-            # Per-q ridge ε·|tr(L_log)|/n_log — same lift as the legacy
-            # 'lu' branch, to keep TRS-paired near-zero modes above the
-            # LU stability floor without perturbing well-conditioned
-            # ones.  ``cct_trace_per_q`` is precomputed once per channel
-            # by the caller (fit_zeta_to_h5) over the LOGICAL block —
-            # computing it inline re-fires an all-reduce across the
-            # (μ_X, ν_Y) sharding on every r-chunk (~17 s GPU stream at
-            # MoS2 3×3 bispinor).  Both the trace and the denominator
-            # must be LOGICAL quantities or the ridge (hence ζ) depends
-            # on the pad extent.
-            LU_RIDGE = 1e-12
-            trace_per_q = (cct_trace_per_q if cct_trace_per_q is not None
-                           else jnp.einsum('qii->q', L_log))
-            ridge = (LU_RIDGE * jnp.abs(trace_per_q) / n_log)[:, None, None]
-            eye_n = jnp.eye(n_log, dtype=L_log.dtype)[None, :, :]
-            return _lu_plan.batched(L_log + ridge * eye_n, Z_log)
-
-        def _run_lu(Z):
-            zeta_xy = solve_at_logical(_dist_ridged_lu, n_log, (L_q,), Z)
-            if mu_pad:
-                # solve_at_logical's zero-refill re-embeds at the padded
-                # extent; pin the layout back before the output reshard.
-                zeta_xy = jax.lax.with_sharding_constraint(
-                    zeta_xy, NamedSharding(mesh_xy, P(None, 'x', 'y')))
-            return zeta_xy
-
-        return _distributed_backsolve(Z_q, mesh_xy, _run_lu)
-
-    # Compute padding needed for even sharding across all devices
-    from runtime.padding import padded_axis
-    z_axis = padded_axis(
-        n_zchunk, mesh_xy, name="zeta RHS column carrier",
-        spec=P(None, None, ('x', 'y')), axis=2)
-    n_zchunk_padded = z_axis.carrier
-    needs_padding = n_zchunk_padded != n_zchunk
-
-    z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
-    # Staging layout for the Z reshard (see ``_reshard_z``): parks 'x' on
-    # the leading nq axis so each with_sharding_constraint moves exactly
-    # one mesh axis.
-    intermediate_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
-    L_rep_shard = NamedSharding(mesh_xy, P(None, None))
-    L_batch_rep_shard = NamedSharding(mesh_xy, P(None, None, None))  # (B_q, n_rmu, n_rmu)
-    # The layout ``L_q`` actually ARRIVES in (2-D over the mesh face); the
-    # per_q tier consumes it directly instead of asking for a replica.
-    L_batch_xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    q_batch = min(q_chunk_size, nq)
-    nq_padded = padded_axis(
-        nq, q_batch, name="zeta solve q-batch carrier").carrier
-
-    # Dispatch on solver_kind (already resolved above).  The solve itself is
-    # independent of the particular transverse gamma; the outer r-chunk
-    # factory may still specialize that gamma for an FFI attribute.
-    use_lu = (solver_kind == 'lu')
-    # ``use_lu`` selects a pivoted-LU back-solve for transverse channels
-    # (γ̃^i, i∈{1,2,3}).  CCT^μ for those channels is Hermitian but
-    # indefinite (γ̃^i ⊗ γ̃^i has both signs of eigenvalue), so Cholesky
-    # is invalid.  Bunch-Kaufman LDL^T would be the natural fit for
-    # Hermitian indefinite, but JAX doesn't expose it; ``jnp.linalg.solve``
-    # uses LU with partial pivoting which handles indefinite matrices
-    # correctly as long as they aren't actually singular.  We keep a
-    # small ridge ``LU_RIDGE·trace/n_rmu`` on the diagonal to lift any
-    # near-zero modes from TRS-paired band cancellations safely above
-    # the LU stability floor — small enough not to perturb the
-    # well-conditioned modes.
-    LU_RIDGE = _TRANSVERSE_LU_RIDGE
-
-    # HOISTED transverse back-solve: factor_c_q already ran the pivoted
-    # LU (once per channel) and handed us (LU factors, permutation).
-    # This routine then only APPLIES lax.linalg.lu_solve per r-chunk —
-    # the same call jnp.linalg.solve makes after its internal lu(), so
-    # the bits match the fused path exactly.  A plain array with
-    # ``lu_piv is None`` is either an explicit pseudo-inverse or the raw CCT
-    # used by the local batch-reshard/legacy factor+solve path.  Provider
-    # factors arrive as FactorToken and are handled above this branch.
-    hoisted_lu = bool(use_lu and lu_piv is not None)
-
-    # ``use_rank_trunc`` selects the matmul back-solve for the charge
-    # rank-truncation factor: ``L_q`` is then the pseudo-inverse factor B
-    # (B Bᴴ = C⁺) from ``_factor_c_q_replicated``, so ζ = C⁺Z = B(BᴴZ) is
-    # two matmuls, NOT a triangular solve (C⁺ is rank-deficient — its
-    # inverse does not exist, so the tri-solve would be wrong).
-    use_rank_trunc = (solver_kind == 'replicated_rank_truncate')
-
-    # ``use_pinv_T`` selects the transverse rank-truncation back-solve
-    # (2026-08-01): ``L_q`` is the EXPLICIT truncated pseudo-inverse C⁺
-    # of the indefinite transverse CCT (no BBᴴ factor exists there), so
-    # ζ = C⁺Z is ONE matmul at the logical extent.  Flows through the
-    # same replicated/per_q gather tiers as every other whole-tile
-    # factor.
-    use_pinv_T = (solver_kind == 'transverse_rank_truncate')
-
-    # ``zeta_gather`` selects the GATHER GRANULARITY of the replicated
-    # factor, not the factorization — see :func:`_resolve_zeta_gather`.
-    #   'replicated' : one all-gather of the whole (q_batch, μ, μ) stack
-    #                  (today's path, and what ``_solve_all_at_once``
-    #                  does at q_batch = nq).
-    #   'per_q'      : one all-gather of a SINGLE (1, μ, μ) tile at a
-    #                  time, looped over q.  Same arithmetic per q as the
-    #                  batched kernel — only the live gathered extent
-    #                  changes, from ``nq·μ²·16`` to ``μ²·(1+1/Py)·16``.
-    #                  The gather is written INSIDE a shard_map so the
-    #                  partitioner cannot hoist it back to the full stack;
-    #                  see ``_per_q_block`` for the measurement that forced
-    #                  that form (scorecard Y.2).
-    per_q_gather = (str(zeta_gather).strip().lower() == "per_q")
-
-    # Cache key for solve function (includes q_chunk_size and padded size).
-    # ``use_lu`` / ``use_rank_trunc`` partition the cache so the three
-    # back-solve compiles don't collide on the same key.  ``n_log`` is
-    # closure state of the kernels below (the slice extent), so it keys the
-    # cache too.
-    cache_key = ('solve_from_L', id(mesh_xy), nq, n_rmu, n_log,
-                 n_zchunk_padded, q_chunk_size, bool(use_lu),
-                 bool(use_rank_trunc), bool(per_q_gather),
-                 bool(hoisted_lu), bool(use_pinv_T))
-
-    # Uniform piv operand for the kernels below: the real (nq, n_log)
-    # permutation on the hoisted-LU path, a (nq, 1) placeholder (dead
-    # operand, DCE'd by XLA) everywhere else — same idiom as the
-    # cct_trace placeholder in fit_one_rchunk.
-    piv_arr = (lu_piv if hoisted_lu
-               else jnp.zeros((nq, 1), dtype=jnp.int32))
-    piv_rep_shard = NamedSharding(mesh_xy, P(None, None))
-
+def _zeta_logical_solvers(
+        n_log):
+    """Produce the existing back-solves restricted to the logical centroid extent."""
     def _ridge_indef_solve(L: jax.Array, Z: jax.Array) -> jax.Array:
-        """Solve (L + ε·tr(L)/n · I) · ζ = Z via pivoted LU at the
-        LOGICAL μ extent (slice/zero-refill via ``solve_at_logical`` —
-        load-bearing: LU at the identity-padded extent yields a
-        different, per-extent-deterministic ζ_T, amplified O(1) in the
-        near-null transverse modes; ROOT_CAUSE.md 2026-07-08).
-
-        ε = ``LU_RIDGE`` (1e-12) on the logical trace/denominator: well
-        below any physically meaningful eigenvalue but above the
-        partial-pivoting floor, so LU stays stable on TRS-paired
-        near-zero modes without perturbing the rest of the spectrum.
-        """
+        """Solve the paired-sign regularized system at the logical centroid extent."""
         def _ridged_lu(L_log, Z_log):
-            ridge = LU_RIDGE * jnp.abs(jnp.trace(L_log)) / n_log
+            ridge = _transverse_lu_ridge(jnp.trace(L_log), n_log)
             L_reg = L_log + ridge * jnp.eye(n_log, dtype=L.dtype)
             return jnp.linalg.solve(L_reg, Z_log)
         return solve_at_logical(_ridged_lu, n_log, (L,), Z)
 
     def _lu_apply_logical(LU: jax.Array, piv: jax.Array,
                           Z: jax.Array) -> jax.Array:
-        """HOISTED transverse back-solve at the LOGICAL μ extent: apply
-        the per-q ``(LU, piv)`` factor that ``factor_c_q`` computed once
-        per channel.  ``jax.scipy.linalg.lu_solve((lu, piv), Z)`` runs
-        ``lu_pivots_to_permutation`` + ``lax_linalg.lu_solve`` — exactly
-        the arithmetic ``jnp.linalg.solve`` runs after its internal
-        ``lu()`` — so the result is bit-identical to the fused
-        ``_ridge_indef_solve`` path this replaces (the ridge is baked
-        into the factor).  ``piv`` is built at the logical extent
-        already; ``solve_at_logical`` slices LU/Z and zero-refills ζ's
-        pad rows (gate: tests/test_transverse_factor_hoist.py)."""
+        """HOISTED transverse back-solve at the LOGICAL μ extent: apply the per-q ``(LU, piv)`` factor that ``factor_c_q`` computed once per channel; see docs/architecture/zeta_fit_face_psi_cct.md."""
         return solve_at_logical(
             lambda LU_log, Z_log: jax.scipy.linalg.lu_solve(
                 (LU_log, piv), Z_log, trans=0),
             n_log, (LU,), Z)
 
     def _tri_solve_logical(L: jax.Array, Z: jax.Array) -> jax.Array:
-        """Charge-channel two-triangular back-solve at the LOGICAL μ
-        extent (same ``solve_at_logical`` rationale — the
-        well-conditioned Cholesky back-solve only wobbles ≤1e-7 under a
-        pad-extent change, but at fixed shape it is exactly
-        pad-invariant, which the fixed-P invariance gate requires).
-        L is the block-diag ``[L_log 0; 0 I]`` factor; its logical
-        block is exactly the factor of the logical system."""
+        """Charge-channel two-triangular back-solve at the LOGICAL μ extent (same ``solve_at_logical`` rationale — the well-conditioned Cholesky back-solve only wobbles ≤1e-7 under a pad-extent change, but at fixed shape it is exactly pad-invariant, which the fixed-P invariance gate requires); see docs/architecture/zeta_fit_face_psi_cct.md."""
         def _chol_backsolve(L_log, Z_log):
             y = jax.scipy.linalg.solve_triangular(L_log, Z_log, lower=True)
             return jax.scipy.linalg.solve_triangular(
@@ -6873,201 +3781,223 @@ def solve_zeta(
         return solve_at_logical(_chol_backsolve, n_log, (L,), Z)
 
     def _pinv_matmul_logical(B: jax.Array, Z: jax.Array) -> jax.Array:
-        """Charge rank-truncation back-solve at the LOGICAL μ extent:
-        ζ = C⁺Z = B(BᴴZ), two matmuls (B is the pseudo-inverse factor,
-        B Bᴴ = C⁺).  ``solve_at_logical`` slices to the logical block
-        (dropping the identity pad — never inverted, so no LU/tri
-        amplification) and zero-refills ζ's pad rows."""
+        """Charge rank-truncation back-solve at the LOGICAL μ extent: ζ = C⁺Z = B(BᴴZ), two matmuls (B is the pseudo-inverse factor, B Bᴴ = C⁺); see docs/architecture/zeta_fit_face_psi_cct.md."""
         def _mm(B_log, Z_log):
             return B_log @ (B_log.conj().T @ Z_log)
         return solve_at_logical(_mm, n_log, (B,), Z)
 
     def _pinv_apply_T_logical(Cp: jax.Array, Z: jax.Array) -> jax.Array:
-        """Transverse rank-truncation back-solve at the LOGICAL μ
-        extent: ζ = C⁺Z, ONE matmul (``Cp`` is the explicit truncated
-        pseudo-inverse of the indefinite transverse CCT).  Same
-        slice/zero-refill contract as the other whole-tile bodies."""
+        """Transverse rank-truncation back-solve at the LOGICAL μ extent: ζ = C⁺Z, ONE matmul (``Cp`` is the explicit truncated pseudo-inverse of the indefinite transverse CCT); see docs/architecture/zeta_fit_face_psi_cct.md."""
         def _mm(Cp_log, Z_log):
             return Cp_log @ Z_log
         return solve_at_logical(_mm, n_log, (Cp,), Z)
+    return _ridge_indef_solve, _lu_apply_logical, _tri_solve_logical, _pinv_matmul_logical, _pinv_apply_T_logical
 
-    if cache_key not in _solve_cache:
-        @partial(shard_map, mesh=mesh_xy,
-                 in_specs=(P(None, None), P(None, ('x', 'y'))),
-                 out_specs=P(None, ('x', 'y')))
-        def _sharded_cho_solve(L: jax.Array, Z_cols: jax.Array) -> jax.Array:
-            if use_rank_trunc:
-                # Charge C⁺ pseudo-inverse factor: matmul back-solve.
-                return _pinv_matmul_logical(L, Z_cols)
-            if use_pinv_T:
-                # Transverse explicit C⁺: one-matmul back-solve.
-                return _pinv_apply_T_logical(L, Z_cols)
-            if use_lu:
-                # Indefinite CCT^μ: pivoted-LU back-solve with ridge.
-                return _ridge_indef_solve(L, Z_cols)
-            return _tri_solve_logical(L, Z_cols)
 
-        # Vectorized solve for a batch of q-points.  ``piv_batch`` is the
-        # hoisted-LU permutation (replicated; placeholder + dead on every
-        # other path — see ``piv_arr`` above).
-        @partial(shard_map, mesh=mesh_xy,
-                 in_specs=(P(None, None, None), P(None, None, ('x', 'y')),
-                           P(None, None)),
-                 out_specs=P(None, None, ('x', 'y')))
-        def _sharded_cho_solve_batch(L_batch: jax.Array, Z_batch: jax.Array,
-                                     piv_batch: jax.Array) -> jax.Array:
-            """Solve (B_q, n_rmu, n_rmu) @ (B_q, n_rmu, n_cols) -> (B_q, n_rmu, n_cols)"""
-            if use_rank_trunc:
-                # C⁺ factor matmul back-solve, per-q vmapped (same reshard
-                # plan as the Cholesky/LU paths so the caller is agnostic).
-                return jax.vmap(_pinv_matmul_logical)(L_batch, Z_batch)
-            if use_pinv_T:
-                # Transverse explicit C⁺, per-q vmapped one-matmul.
-                return jax.vmap(_pinv_apply_T_logical)(L_batch, Z_batch)
-            if hoisted_lu:
-                # Apply the once-per-channel (LU, perm) factor.
-                return jax.vmap(_lu_apply_logical)(
-                    L_batch, piv_batch, Z_batch)
-            if use_lu:
-                # FUSED fallback (lu_piv=None): ``jnp.linalg.solve`` is
-                # natively batched on the leading axis and dispatches one
-                # LU factorization per q.  Same vmap structure as the
-                # Cholesky path so reshard plans match.  We vmap the
-                # ridge-add per-q so each LU sees its own conditioning
-                # shift.
-                return jax.vmap(_ridge_indef_solve)(L_batch, Z_batch)
-            return jax.vmap(_tri_solve_logical)(L_batch, Z_batch)
+def _zeta_batched_kernels(
+        L_batch_rep_shard, _lu_apply_logical, _pinv_apply_T_logical, _pinv_matmul_logical,
+        _ridge_indef_solve, _tri_solve_logical, hoisted_lu, mesh_xy, piv_rep_shard, use_lu,
+        use_pinv_T, use_rank_trunc):
+    """Produce the existing sharded and donated batched zeta solve kernels."""
+    @partial(shard_map, mesh=mesh_xy,
+             in_specs=(P(None, None), P(None, ('x', 'y'))),
+             out_specs=P(None, ('x', 'y')))
+    def _sharded_cho_solve(L: jax.Array, Z_cols: jax.Array) -> jax.Array:
+        if use_rank_trunc:
+            # Charge C⁺ pseudo-inverse factor: matmul back-solve.
+            return _pinv_matmul_logical(L, Z_cols)
+        if use_pinv_T:
+            # Transverse explicit C⁺: one-matmul back-solve.
+            return _pinv_apply_T_logical(L, Z_cols)
+        if use_lu:
+            # Indefinite CCT^μ: pivoted-LU back-solve with ridge.
+            return _ridge_indef_solve(L, Z_cols)
+        return _tri_solve_logical(L, Z_cols)
 
-        @partial(jax.jit, donate_argnums=(2,))
-        def _solve_batch_and_update(L_batch_sharded, Z_batch_col, zeta_acc,
-                                    q_start, piv_batch):
-            """Solve one q-batch and update zeta_acc via dynamic_update_slice.
-            donate_argnums=(2,) donates zeta_acc so XLA reuses its buffer."""
-            L_rep = jax.lax.with_sharding_constraint(L_batch_sharded, L_batch_rep_shard)
-            piv_rep = jax.lax.with_sharding_constraint(piv_batch, piv_rep_shard)
-            batch_result = _sharded_cho_solve_batch(L_rep, Z_batch_col, piv_rep)
-            return jax.lax.dynamic_update_slice(zeta_acc, batch_result, (q_start, 0, 0))
+    # Vectorized solve for a batch of q-points.  ``piv_batch`` is the
+    # hoisted-LU permutation (replicated; placeholder + dead on every
+    # other path — see ``piv_arr`` above).
+    @partial(shard_map, mesh=mesh_xy,
+             in_specs=(P(None, None, None), P(None, None, ('x', 'y')),
+                       P(None, None)),
+             out_specs=P(None, None, ('x', 'y')))
+    def _sharded_cho_solve_batch(L_batch: jax.Array, Z_batch: jax.Array,
+                                 piv_batch: jax.Array) -> jax.Array:
+        """Solve (B_q, n_rmu, n_rmu) @ (B_q, n_rmu, n_cols) -> (B_q, n_rmu, n_cols)"""
+        if use_rank_trunc:
+            # C⁺ factor matmul back-solve, per-q vmapped (same reshard
+            # plan as the Cholesky/LU paths so the caller is agnostic).
+            return jax.vmap(_pinv_matmul_logical)(L_batch, Z_batch)
+        if use_pinv_T:
+            # Transverse explicit C⁺, per-q vmapped one-matmul.
+            return jax.vmap(_pinv_apply_T_logical)(L_batch, Z_batch)
+        if hoisted_lu:
+            # Apply the once-per-channel (LU, perm) factor.
+            return jax.vmap(_lu_apply_logical)(
+                L_batch, piv_batch, Z_batch)
+        if use_lu:
+            # FUSED fallback (lu_piv=None): ``jnp.linalg.solve`` is
+            # natively batched on the leading axis and dispatches one
+            # LU factorization per q.  Same vmap structure as the
+            # Cholesky path so reshard plans match.  We vmap the
+            # ridge-add per-q so each LU sees its own conditioning
+            # shift.
+            return jax.vmap(_ridge_indef_solve)(L_batch, Z_batch)
+        return jax.vmap(_tri_solve_logical)(L_batch, Z_batch)
 
-        @jax.jit
-        def _solve_all_at_once(L_q_sharded, Z_col, piv):
-            """Fast path: solve all q-points in a single batched call."""
-            L_full_rep = jax.lax.with_sharding_constraint(L_q_sharded, L_batch_rep_shard)
-            piv_rep = jax.lax.with_sharding_constraint(piv, piv_rep_shard)
-            return _sharded_cho_solve_batch(L_full_rep, Z_col, piv_rep)
+    @partial(jax.jit, donate_argnums=(2,))
+    def _solve_batch_and_update(L_batch_sharded, Z_batch_col, zeta_acc,
+                                q_start, piv_batch):
+        """Solve one q-batch and update zeta_acc via dynamic_update_slice.
+        donate_argnums=(2,) donates zeta_acc so XLA reuses its buffer."""
+        L_rep = jax.lax.with_sharding_constraint(L_batch_sharded, L_batch_rep_shard)
+        piv_rep = jax.lax.with_sharding_constraint(piv_batch, piv_rep_shard)
+        batch_result = _sharded_cho_solve_batch(L_rep, Z_batch_col, piv_rep)
+        return jax.lax.dynamic_update_slice(zeta_acc, batch_result, (q_start, 0, 0))
 
-        # PER-Q tier.  The q-selection happens INSIDE a shard_map, where
-        # the gather is a `lax.all_gather` on an already-sliced tile — so
-        # the per-q extent is a STRUCTURAL property of the program, not a
-        # request the partitioner is free to reorder.
-        #
-        # HISTORY — do not regress this (scorecard Y.2, measured on the
-        # production deck).  The first implementation sliced a traced ``q``
-        # out of the sharded stack and then asked for the tile replicated::
-        #
-        #     L_one = lax.dynamic_slice_in_dim(L_q_sharded, q, 1, axis=0)
-        #     L_one_rep = lax.with_sharding_constraint(L_one, replicated)
-        #
-        # which reads as "gather one (μ,μ) tile".  XLA:CPU's SPMD
-        # partitioner does NOT sink a q-axis ``dynamic_slice`` through the
-        # μ-axis ``all-gather`` even though the two commute: it emitted the
-        # WHOLE ``(nq, μ_pad, μ_pad)`` gather and applied the slice
-        # afterwards.  Measured at 1998 centroids / μ_pad = 2048 / P = 64,
-        # the buffer assignment charged ``jit(_solve_one_q_and_update)``
-        # ``nq·μ_pad·(μ_pad + μ_pad/P_x)·16`` = 10.87 GB — i.e. the tier's
-        # own gather was LARGER than the ``replicated`` gather it exists to
-        # avoid (9.66 GB), and because the module runs once per q it moved
-        # 144× that per r-chunk.  That is the whole of the 12–40× wall-clock
-        # penalty Y.1 measured, and it is why T.5's "9.36 GB → 0.065 GB"
-        # headline was wrong.
-        #
-        # Inside a shard_map there is nothing left to hoist: the local
-        # slice is a local slice of the rank's OWN ``(nq, μ/Px, μ/Py)``
-        # block, and the two ``all_gather``s that follow it are written on
-        # a single-q operand.  Gathered bytes per execution are exactly
-        # ``μ_pad·(μ_pad/Py)·16 + μ_pad²·16`` — 75 MB at μ_pad = 2048,
-        # independent of nq.
-        @partial(shard_map, mesh=mesh_xy,
-                 in_specs=(P(None, 'x', 'y'),            # L_q  (nq, μ, μ)
-                           P(None, None, ('x', 'y')),    # Z_col
-                           P(None, None, ('x', 'y')),    # zeta_acc
-                           P(),                          # q (replicated scalar)
-                           P(None, None)),               # piv (replicated)
-                 out_specs=P(None, None, ('x', 'y')),
-                 check_vma=False)
-        def _per_q_block(L_loc, Z_loc, zeta_loc, q, piv_loc):
-            # L_loc: (nq, μ/Px, μ/Py) — this rank's 2-D block of the stack.
-            L_one = jax.lax.dynamic_slice_in_dim(L_loc, q, 1, axis=0)
-            # Rebuild EXACTLY the replicated (1, μ, μ) tile the batched
-            # kernel would have seen: 'x' owns axis 1, 'y' owns axis 2, so
-            # the tiled all_gathers concatenate in mesh-index order.
-            L_row = jax.lax.all_gather(L_one, 'x', axis=1, tiled=True)
-            L_tile = jax.lax.all_gather(L_row, 'y', axis=2, tiled=True)
-            Z_one = jax.lax.dynamic_slice_in_dim(Z_loc, q, 1, axis=0)
-            piv_one = jax.lax.dynamic_slice_in_dim(piv_loc, q, 1, axis=0)
-            # Same back-solve bodies as ``_sharded_cho_solve_batch``
-            # at batch 1 — identical shapes, identical operand values,
-            # therefore bit-identical arithmetic.
-            if use_rank_trunc:
-                out = jax.vmap(_pinv_matmul_logical)(L_tile, Z_one)
-            elif use_pinv_T:
-                out = jax.vmap(_pinv_apply_T_logical)(L_tile, Z_one)
-            elif hoisted_lu:
-                out = jax.vmap(_lu_apply_logical)(L_tile, piv_one, Z_one)
-            elif use_lu:
-                out = jax.vmap(_ridge_indef_solve)(L_tile, Z_one)
-            else:
-                out = jax.vmap(_tri_solve_logical)(L_tile, Z_one)
-            return jax.lax.dynamic_update_slice_in_dim(
-                zeta_loc, out, q, axis=0)
+    @jax.jit
+    def _solve_all_at_once(L_q_sharded, Z_col, piv):
+        """Fast path: solve all q-points in a single batched call."""
+        L_full_rep = jax.lax.with_sharding_constraint(L_q_sharded, L_batch_rep_shard)
+        piv_rep = jax.lax.with_sharding_constraint(piv, piv_rep_shard)
+        return _sharded_cho_solve_batch(L_full_rep, Z_col, piv_rep)
+    return _sharded_cho_solve, _sharded_cho_solve_batch, _solve_batch_and_update, _solve_all_at_once
 
-        @partial(jax.jit, donate_argnums=(2,))
-        def _solve_one_q_and_update(L_q_sharded, Z_col, zeta_acc, q, piv):
-            """PER-Q tier: gather ONE ``(μ, μ)`` factor tile, solve that q,
-            scatter into ``zeta_acc``.
 
-            ``q`` is a traced argument, so every iteration shares one
-            trace, one compile and one executable, and ``Z_col`` is never
-            sliced eagerly (an eager slice would materialise ``nq`` extra
-            ``(1, μ, r/P)`` device arrays per r-chunk).  ``donate_argnums``
-            chains ``zeta_acc`` through the loop the same way
-            ``_solve_batch_and_update`` does.
-            """
-            L_xy = jax.lax.with_sharding_constraint(
-                L_q_sharded, L_batch_xy_shard)
-            piv_rep = jax.lax.with_sharding_constraint(piv, piv_rep_shard)
-            return _per_q_block(L_xy, Z_col, zeta_acc, jnp.asarray(q),
-                                piv_rep)
+def _zeta_per_q_kernel(
+        L_batch_xy_shard, _lu_apply_logical, _pinv_apply_T_logical, _pinv_matmul_logical,
+        _ridge_indef_solve, _tri_solve_logical, hoisted_lu, mesh_xy, piv_rep_shard, use_lu,
+        use_pinv_T, use_rank_trunc):
+    """Produce the existing one-q factor-gather and donated zeta update kernel."""
+    # PER-Q tier.  The q-selection happens INSIDE a shard_map, where
+    # the gather is a `lax.all_gather` on an already-sliced tile — so
+    # the per-q extent is a STRUCTURAL property of the program, not a
+    # request the partitioner is free to reorder.
+    #
+    # HISTORY — do not regress this (scorecard Y.2, measured on the
+    # production deck).  The first implementation sliced a traced ``q``
+    # out of the sharded stack and then asked for the tile replicated::
+    #
+    #     L_one = lax.dynamic_slice_in_dim(L_q_sharded, q, 1, axis=0)
+    #     L_one_rep = lax.with_sharding_constraint(L_one, replicated)
+    #
+    # which reads as "gather one (μ,μ) tile".  XLA:CPU's SPMD
+    # partitioner does NOT sink a q-axis ``dynamic_slice`` through the
+    # μ-axis ``all-gather`` even though the two commute: it emitted the
+    # WHOLE ``(nq, μ_pad, μ_pad)`` gather and applied the slice
+    # afterwards.  Measured at 1998 centroids / μ_pad = 2048 / P = 64,
+    # the buffer assignment charged ``jit(_solve_one_q_and_update)``
+    # ``nq·μ_pad·(μ_pad + μ_pad/P_x)·16`` = 10.87 GB — i.e. the tier's
+    # own gather was LARGER than the ``replicated`` gather it exists to
+    # avoid (9.66 GB), and because the module runs once per q it moved
+    # 144× that per r-chunk.  That is the whole of the 12–40× wall-clock
+    # penalty Y.1 measured, and it is why T.5's "9.36 GB → 0.065 GB"
+    # headline was wrong.
+    #
+    # Inside a shard_map there is nothing left to hoist: the local
+    # slice is a local slice of the rank's OWN ``(nq, μ/Px, μ/Py)``
+    # block, and the two ``all_gather``s that follow it are written on
+    # a single-q operand.  Gathered bytes per execution are exactly
+    # ``μ_pad·(μ_pad/Py)·16 + μ_pad²·16`` — 75 MB at μ_pad = 2048,
+    # independent of nq.
+    @partial(shard_map, mesh=mesh_xy,
+             in_specs=(P(None, 'x', 'y'),            # L_q  (nq, μ, μ)
+                       P(None, None, ('x', 'y')),    # Z_col
+                       P(None, None, ('x', 'y')),    # zeta_acc
+                       P(),                          # q (replicated scalar)
+                       P(None, None)),               # piv (replicated)
+             out_specs=P(None, None, ('x', 'y')),
+             check_vma=False)
+    def _per_q_block(L_loc, Z_loc, zeta_loc, q, piv_loc):
+        # L_loc: (nq, μ/Px, μ/Py) — this rank's 2-D block of the stack.
+        L_one = jax.lax.dynamic_slice_in_dim(L_loc, q, 1, axis=0)
+        # Rebuild EXACTLY the replicated (1, μ, μ) tile the batched
+        # kernel would have seen: 'x' owns axis 1, 'y' owns axis 2, so
+        # the tiled all_gathers concatenate in mesh-index order.
+        L_row = jax.lax.all_gather(L_one, 'x', axis=1, tiled=True)
+        L_tile = jax.lax.all_gather(L_row, 'y', axis=2, tiled=True)
+        Z_one = jax.lax.dynamic_slice_in_dim(Z_loc, q, 1, axis=0)
+        piv_one = jax.lax.dynamic_slice_in_dim(piv_loc, q, 1, axis=0)
+        # Same back-solve bodies as ``_sharded_cho_solve_batch``
+        # at batch 1 — identical shapes, identical operand values,
+        # therefore bit-identical arithmetic.
+        if use_rank_trunc:
+            out = jax.vmap(_pinv_matmul_logical)(L_tile, Z_one)
+        elif use_pinv_T:
+            out = jax.vmap(_pinv_apply_T_logical)(L_tile, Z_one)
+        elif hoisted_lu:
+            out = jax.vmap(_lu_apply_logical)(L_tile, piv_one, Z_one)
+        elif use_lu:
+            out = jax.vmap(_ridge_indef_solve)(L_tile, Z_one)
+        else:
+            out = jax.vmap(_tri_solve_logical)(L_tile, Z_one)
+        return jax.lax.dynamic_update_slice_in_dim(
+            zeta_loc, out, q, axis=0)
 
-        # Z reshard P(None,'x','y') → P(None,None,('x','y')), staged
-        # through P('x',None,'y') so each step moves ONE mesh axis (see
-        # the call site below for the Involuntary-Remat measurement that
-        # forced the two-step form).
-        #
-        # MUST live in the cache with the other kernels.  It used to be
-        # defined at the call site, i.e. a FRESH ``jax.jit`` object per
-        # r-chunk — and a fresh wrapper is a fresh key for JAX's
-        # trace/lower/compile caches (they key on the wrapped function's
-        # identity), so every r-chunk retraced, relowered and
-        # RECOMPILED this reshard.  At production scale that is the one
-        # XLA compilation inside the r-chunk loop, and it is on the
-        # r_chunk-sized tensor.
-        @partial(jax.jit, donate_argnums=(0,))
-        def _reshard_z(z):
-            z = jax.lax.with_sharding_constraint(z, intermediate_shard)
-            return jax.lax.with_sharding_constraint(z, z_col_shard)
+    @partial(jax.jit, donate_argnums=(2,))
+    def _solve_one_q_and_update(L_q_sharded, Z_col, zeta_acc, q, piv):
+        """PER-Q tier: gather ONE ``(μ, μ)`` factor tile, solve that q, scatter into ``zeta_acc``; see docs/architecture/zeta_fit_face_psi_cct.md."""
+        L_xy = jax.lax.with_sharding_constraint(
+            L_q_sharded, L_batch_xy_shard)
+        piv_rep = jax.lax.with_sharding_constraint(piv, piv_rep_shard)
+        return _per_q_block(L_xy, Z_col, zeta_acc, jnp.asarray(q),
+                            piv_rep)
+    return _solve_one_q_and_update
 
-        _solve_cache[cache_key] = SimpleNamespace(
-            solve_batch_and_update=_solve_batch_and_update,
-            solve_all_at_once=_solve_all_at_once,
-            sharded_cho_solve=_sharded_cho_solve,
-            sharded_cho_solve_batch=_sharded_cho_solve_batch,
-            solve_one_q_and_update=_solve_one_q_and_update,
-            reshard_z=_reshard_z,
-        )
 
-    helpers = _solve_cache[cache_key]
+def _zeta_rhs_resharder(
+        intermediate_shard, z_col_shard):
+    """Produce the donated two-stage RHS reshard kernel."""
+    # Z reshard P(None,'x','y') → P(None,None,('x','y')), staged
+    # through P('x',None,'y') so each step moves ONE mesh axis (see
+    # the call site below for the Involuntary-Remat measurement that
+    # forced the two-step form).
+    #
+    # MUST live in the cache with the other kernels.  It used to be
+    # defined at the call site, i.e. a FRESH ``jax.jit`` object per
+    # r-chunk — and a fresh wrapper is a fresh key for JAX's
+    # trace/lower/compile caches (they key on the wrapped function's
+    # identity), so every r-chunk retraced, relowered and
+    # RECOMPILED this reshard.  At production scale that is the one
+    # XLA compilation inside the r-chunk loop, and it is on the
+    # r_chunk-sized tensor.
+    @partial(jax.jit, donate_argnums=(0,))
+    def _reshard_z(z):
+        z = jax.lax.with_sharding_constraint(z, intermediate_shard)
+        return jax.lax.with_sharding_constraint(z, z_col_shard)
+    return _reshard_z
 
-    # Pad Z if needed (zeros on RHS → zero solution for those columns, harmless)
+
+def _cache_zeta_solve_kernels(
+        L_batch_rep_shard, L_batch_xy_shard, _lu_apply_logical, _pinv_apply_T_logical,
+        _pinv_matmul_logical, _ridge_indef_solve, _tri_solve_logical, cache_key, hoisted_lu,
+        intermediate_shard, mesh_xy, piv_rep_shard, use_lu, use_pinv_T, use_rank_trunc,
+        z_col_shard):
+    """Populate the existing solve cache with its shape-specific kernels."""
+    (_sharded_cho_solve, _sharded_cho_solve_batch, _solve_batch_and_update, _solve_all_at_once) = _zeta_batched_kernels(
+        L_batch_rep_shard, _lu_apply_logical, _pinv_apply_T_logical, _pinv_matmul_logical,
+        _ridge_indef_solve, _tri_solve_logical, hoisted_lu, mesh_xy, piv_rep_shard, use_lu,
+        use_pinv_T, use_rank_trunc)
+    (_solve_one_q_and_update) = _zeta_per_q_kernel(
+        L_batch_xy_shard, _lu_apply_logical, _pinv_apply_T_logical, _pinv_matmul_logical,
+        _ridge_indef_solve, _tri_solve_logical, hoisted_lu, mesh_xy, piv_rep_shard, use_lu,
+        use_pinv_T, use_rank_trunc)
+    (_reshard_z) = _zeta_rhs_resharder(
+        intermediate_shard, z_col_shard)
+    _solve_cache[cache_key] = SimpleNamespace(
+        solve_batch_and_update=_solve_batch_and_update,
+        solve_all_at_once=_solve_all_at_once,
+        sharded_cho_solve=_sharded_cho_solve,
+        sharded_cho_solve_batch=_sharded_cho_solve_batch,
+        solve_one_q_and_update=_solve_one_q_and_update,
+        reshard_z=_reshard_z,
+    )
+
+
+def _apply_replicated_zeta(
+        L_q, Z_q, helpers, mesh_xy, n_zchunk, n_zchunk_padded, needs_padding, nq, nq_padded,
+        per_q_gather, piv_arr, q_batch, z_col_shard):
+    """Produce zeta by applying the cached solver and restoring centroid sharding."""
     if needs_padding:
         pad_width = n_zchunk_padded - n_zchunk
         Z_q = jnp.pad(Z_q, ((0, 0), (0, 0), (0, pad_width)), mode='constant')
@@ -7169,37 +4099,328 @@ def solve_zeta(
     return zeta
 
 
-# =============================================================================
-# Jittable r-chunk body — the whole per-r-chunk iteration in one jit
-# =============================================================================
-#
-# This is the hot kernel: load-phase FFT → reshard → streaming pair-density
-# accumulate (both L and R) over all band-chunks → ZCT → reshard → solve,
-# all fused into one jax.jit.  The Python driver only does persistent-state
-# setup (centroids, L_q, G-space cache) and H5 I/O writes around the jit call.
-#
-# All "structural" configuration (band_chunk_ranges, band_range_left/right,
-# actual_n_rchunk, q_chunk_size, mesh, meta) is closure state —
-# the factory compiles a distinct jit per (hashable) tuple.  The typical
-# r-chunk loop has exactly TWO compiled variants: the full-sized r-chunks
-# and the last remainder.
-#
-# Dynamic inputs: the pre-loaded G-space tuple (one array per band-chunk),
-# the centroid copies and L_q (persistent across the full fit), band_norms
-# (normalised to jnp.ones(nb) when absent so the shape is uniform), and
-# r_start as a scalar dynamic int.
+def _solve_zeta_replicated(
+        L_q, Z_q, lu_piv, mesh_xy, n_log, n_rmu, n_zchunk, nq, q_chunk_size, solver_kind,
+        zeta_gather):
+    """Produce zeta with the existing replicated-factor or per-q gather route."""
+    from runtime.padding import padded_axis
+    z_axis = padded_axis(
+        n_zchunk, mesh_xy, name="zeta RHS column carrier",
+        spec=P(None, None, ('x', 'y')), axis=2)
+    n_zchunk_padded = z_axis.carrier
+    needs_padding = n_zchunk_padded != n_zchunk
 
-_fit_one_rchunk_cache: dict = {}  # fused fit_one_rchunk kernel (cleared per-run by gw_init:703)
+    z_col_shard = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
+    # Staging layout for the Z reshard (see ``_reshard_z``): parks 'x' on
+    # the leading nq axis so each with_sharding_constraint moves exactly
+    # one mesh axis.
+    intermediate_shard = NamedSharding(mesh_xy, P('x', None, 'y'))
+    L_rep_shard = NamedSharding(mesh_xy, P(None, None))
+    L_batch_rep_shard = NamedSharding(mesh_xy, P(None, None, None))  # (B_q, n_rmu, n_rmu)
+    # The layout ``L_q`` actually ARRIVES in (2-D over the mesh face); the
+    # per_q tier consumes it directly instead of asking for a replica.
+    L_batch_xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    q_batch = min(q_chunk_size, nq)
+    nq_padded = padded_axis(
+        nq, q_batch, name="zeta solve q-batch carrier").carrier
+
+    # Dispatch on solver_kind (already resolved above).  The solve itself is
+    # independent of the particular transverse gamma; the outer r-chunk
+    # factory may still specialize that gamma for an FFI attribute.
+    use_lu = (solver_kind == 'lu')
+    # Current normal inputs retain their common C/Z sign; both hoisted and
+    # fused solves use the same trace-directed shift at the logical extent.
+
+    # HOISTED transverse back-solve: factor_c_q already ran the pivoted
+    # LU (once per channel) and handed us (LU factors, permutation).
+    # This routine then only APPLIES lax.linalg.lu_solve per r-chunk —
+    # the same call jnp.linalg.solve makes after its internal lu(), so
+    # the bits match the fused path exactly.  A plain array with
+    # ``lu_piv is None`` is either an explicit pseudo-inverse or the raw CCT
+    # used by the local batch-reshard/legacy factor+solve path.  Provider
+    # factors arrive as FactorToken and are handled above this branch.
+    hoisted_lu = bool(use_lu and lu_piv is not None)
+
+    # ``use_rank_trunc`` selects the matmul back-solve for the charge
+    # rank-truncation factor: ``L_q`` is then the pseudo-inverse factor B
+    # (B Bᴴ = C⁺) from ``_factor_c_q_replicated``, so ζ = C⁺Z = B(BᴴZ) is
+    # two matmuls, NOT a triangular solve (C⁺ is rank-deficient — its
+    # inverse does not exist, so the tri-solve would be wrong).
+    use_rank_trunc = (solver_kind == 'replicated_rank_truncate')
+
+    # ``use_pinv_T`` selects the transverse rank-truncation back-solve
+    # (2026-08-01): ``L_q`` is the EXPLICIT truncated pseudo-inverse C⁺
+    # of the indefinite transverse CCT (no BBᴴ factor exists there), so
+    # ζ = C⁺Z is ONE matmul at the logical extent.  Flows through the
+    # same replicated/per_q gather tiers as every other whole-tile
+    # factor.
+    use_pinv_T = (solver_kind == 'transverse_rank_truncate')
+
+    # ``zeta_gather`` selects the GATHER GRANULARITY of the replicated
+    # factor, not the factorization — see :func:`_resolve_zeta_gather`.
+    #   'replicated' : one all-gather of the whole (q_batch, μ, μ) stack
+    #                  (today's path, and what ``_solve_all_at_once``
+    #                  does at q_batch = nq).
+    #   'per_q'      : one all-gather of a SINGLE (1, μ, μ) tile at a
+    #                  time, looped over q.  Same arithmetic per q as the
+    #                  batched kernel — only the live gathered extent
+    #                  changes, from ``nq·μ²·16`` to ``μ²·(1+1/Py)·16``.
+    #                  The gather is written INSIDE a shard_map so the
+    #                  partitioner cannot hoist it back to the full stack;
+    #                  see ``_per_q_block`` for the measurement that forced
+    #                  that form (scorecard Y.2).
+    per_q_gather = (str(zeta_gather).strip().lower() == "per_q")
+
+    # Cache key for solve function (includes q_chunk_size and padded size).
+    # ``use_lu`` / ``use_rank_trunc`` partition the cache so the three
+    # back-solve compiles don't collide on the same key.  ``n_log`` is
+    # closure state of the kernels below (the slice extent), so it keys the
+    # cache too.
+    cache_key = ('solve_from_L', _mesh_key(mesh_xy), nq, n_rmu, n_log,
+                 n_zchunk_padded, q_chunk_size, bool(use_lu),
+                 bool(use_rank_trunc), bool(per_q_gather),
+                 bool(hoisted_lu), bool(use_pinv_T))
+
+    # Uniform piv operand for the kernels below: the real (nq, n_log)
+    # permutation on the hoisted-LU path, a (nq, 1) placeholder (dead
+    # operand, DCE'd by XLA) everywhere else — same idiom as the
+    # cct_trace placeholder in fit_one_rchunk.
+    piv_arr = (lu_piv if hoisted_lu
+               else jnp.zeros((nq, 1), dtype=jnp.int32))
+    piv_rep_shard = NamedSharding(mesh_xy, P(None, None))
+
+    (_ridge_indef_solve, _lu_apply_logical, _tri_solve_logical, _pinv_matmul_logical, _pinv_apply_T_logical) = _zeta_logical_solvers(
+        n_log)
+
+    if cache_key not in _solve_cache:
+        _cache_zeta_solve_kernels(
+            L_batch_rep_shard, L_batch_xy_shard, _lu_apply_logical, _pinv_apply_T_logical,
+            _pinv_matmul_logical, _ridge_indef_solve, _tri_solve_logical, cache_key, hoisted_lu,
+            intermediate_shard, mesh_xy, piv_rep_shard, use_lu, use_pinv_T, use_rank_trunc,
+            z_col_shard)
+    helpers = _solve_cache[cache_key]
+    return _apply_replicated_zeta(
+        L_q, Z_q, helpers, mesh_xy, n_zchunk, n_zchunk_padded, needs_padding, nq, nq_padded,
+        per_q_gather, piv_arr, q_batch, z_col_shard)
+
+
+def _solve_zeta_token(
+        L_q, Z_q, mesh_xy):
+    """Produce zeta using the authenticated distributed factor token."""
+    # THE LIBRARY-HANDLE ROUTES, now one branch.  ``factor_c_q``
+    # made this token on this mesh at these extents; ``distrib_la.solve``
+    # feeds it back verbatim to the matching back-solve entry point —
+    # cuSOLVERMp ``potrs``/``getrs``, SLATE's two ``trsm`` passes, or
+    # ScaLAPACK ``pXgetrs`` with its own ipiv.  Z stays at
+    # P(None,'x','y'): no
+    # input reshard, no all-gather of a factor, and — the part that used
+    # to be a comment — no way for this file to touch a pivot vector.
+    #
+    # The μ-slice to the LOGICAL extent + zero-refill is written out
+    # rather than delegated to ``solve_at_logical``: the pad extent has
+    # to come from Z, because the ScaLAPACK factor is ALREADY logical
+    # and the helper would read the wrong extent off it.  Z's pad rows
+    # are exact zeros by the Phase 3a contract, so the sliced system IS
+    # the logical system.  On the two cholesky routes the token's n is
+    # the padded extent and this is a no-op slice.
+    xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    n_rows_pad = int(Z_q.shape[1])
+    n_solve = int(L_q.n)
+
+    def _run_token(Z):
+        Z_in = (jax.lax.with_sharding_constraint(
+                    Z[:, :n_solve, :], xy_shard)
+                if n_rows_pad != n_solve else Z)
+        X = linalg_solve(L_q, Z_in)
+        if n_rows_pad != n_solve:
+            X = jnp.pad(X, ((0, 0), (0, n_rows_pad - n_solve), (0, 0)))
+        return jax.lax.with_sharding_constraint(X, xy_shard)
+
+    return _distributed_backsolve(Z_q, mesh_xy, _run_token)
+
+
+def _solve_zeta_fused_lu(
+        L_q, Z_q, cct_trace_per_q, distrib_la_batched_route, lu_piv, mesh_xy, mu_pad, n_log,
+        solver_kind):
+    """Produce zeta using the existing fused distributed LU plan."""
+    # FUSED distributed getrf+getrs for legacy callers that pass the
+    # raw CCT instead of factor_c_q's opaque FactorToken.
+    # L_q here is the *unfactored* CCT^μ (Hermitian indefinite) —
+    # factor_c_q passes it through.  Same input sharding, output
+    # reshard, and column padding pattern as the cholesky branch.
+    # The two backends share this branch verbatim — identical call
+    # contract; scalapack is the host/CPU-backend twin (Cray LibSci).
+    if lu_piv is not None:
+        raise ValueError(
+            f"solve_zeta: lu_piv was passed with solver_kind="
+            f"{solver_kind!r}, but the fused branch expects the raw "
+            f"CCT (the {solver_kind} factor hoist does not exist).")
+    # The FUSED route is plan-shaped, not handle-shaped: getrf+getrs
+    # in one FFI call, factors allocated and freed inside it, an ARRAY
+    # out.  So it goes through ``plan`` (which owns the operand
+    # reshard to P(None,'x','y') and the donation contract) rather
+    # than ``factor``/``solve`` — and ``factor('solve_lu')`` refuses
+    # cuSOLVERMp by name for exactly this reason: its entry point
+    # never surfaces the pivots, so there is no token to make.
+    #
+    # ``n=n_log``: the solve runs at the LOGICAL extent, so that is
+    # the extent the divisibility guard must check.
+    _lu_plan = linalg_plan(
+        'solve_lu', mesh_xy,
+        backend=('scalapack' if solver_kind == 'scalapack_lu'
+                 else 'cusolvermp'),
+        n=n_log, batched_route=distrib_la_batched_route)
+
+    def _dist_ridged_lu(L_log, Z_log):
+        # The μ-slice to the LOGICAL extent (via solve_at_logical;
+        # guarded above: n_log divides both mesh axes on this path)
+        # is load-bearing: L/Z pad rows are exact zeros (+ identity
+        # pad diag on L), so the sliced system IS the logical
+        # system; solving at the padded extent instead changes ζ_T
+        # wholesale — pad-shape LU roundoff is amplified O(1) in
+        # the near-null transverse modes (ROOT_CAUSE.md 2026-07-08,
+        # Manifestation 1).
+        xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+        L_log = jax.lax.with_sharding_constraint(L_log, xy_shard)
+        Z_log = jax.lax.with_sharding_constraint(Z_log, xy_shard)
+        # Per-q ridge ε·|tr(L_log)|/n_log — same lift as the legacy
+        # 'lu' branch, to keep TRS-paired near-zero modes above the
+        # LU stability floor without perturbing well-conditioned
+        # ones.  ``cct_trace_per_q`` is precomputed once per channel
+        # by the caller (fit_zeta_to_h5) over the LOGICAL block —
+        # computing it inline re-fires an all-reduce across the
+        # (μ_X, ν_Y) sharding on every r-chunk (~17 s GPU stream at
+        # MoS2 3×3 bispinor).  Both the trace and the denominator
+        # must be LOGICAL quantities or the ridge (hence ζ) depends
+        # on the pad extent.
+        trace_per_q = (cct_trace_per_q if cct_trace_per_q is not None
+                       else jnp.einsum('qii->q', L_log))
+        ridge = _transverse_lu_ridge(trace_per_q, n_log)[:, None, None]
+        eye_n = jnp.eye(n_log, dtype=L_log.dtype)[None, :, :]
+        return _lu_plan.batched(L_log + ridge * eye_n, Z_log)
+
+    def _run_lu(Z):
+        zeta_xy = solve_at_logical(_dist_ridged_lu, n_log, (L_q,), Z)
+        if mu_pad:
+            # solve_at_logical's zero-refill re-embeds at the padded
+            # extent; pin the layout back before the output reshard.
+            zeta_xy = jax.lax.with_sharding_constraint(
+                zeta_xy, NamedSharding(mesh_xy, P(None, 'x', 'y')))
+        return zeta_xy
+
+    return _distributed_backsolve(Z_q, mesh_xy, _run_lu)
+
+
+def solve_zeta(
+    L_q: jax.Array,
+    Z_q: jax.Array,
+    mesh_xy: Mesh,
+    q_chunk_size: int = 1,
+    vertex_mu_L: int = 0,
+    solver_kind: str = 'auto',
+    cct_trace_per_q: jax.Array | None = None,
+    n_rmu_logical: int | None = None,
+    zeta_gather: str = "replicated",
+    lu_piv: jax.Array | None = None,
+    distrib_la_batched_route: str = "batch_reshard",
+) -> jax.Array:
+    """Produce zeta from its factor; see docs/architecture/zeta_fit_face_psi_cct.md."""
+    # A distributed factor arrives as an opaque :class:`FactorToken` (the
+    # three library-handle routes) or as a plain sharded array (every JAX
+    # route).  The token deliberately exposes no factor, so read its
+    # EXTENTS — which are exactly the two numbers this line ever wanted —
+    # rather than reaching for a ``.shape`` it does not have.
+    if isinstance(L_q, FactorToken):
+        nq, n_rmu = int(L_q.nbatch), int(L_q.n)
+    else:
+        nq, n_rmu, _ = L_q.shape
+    _, _, n_zchunk = Z_q.shape
+    n_log = int(n_rmu_logical) if n_rmu_logical is not None else int(n_rmu)
+    if n_log > n_rmu:
+        raise ValueError(
+            f"solve_zeta: n_rmu_logical={n_log} exceeds input extent {n_rmu}")
+    mu_pad = n_rmu - n_log
+
+    solver_kind = _resolve_solver_kind(mesh_xy, vertex_mu_L, solver_kind)
+
+    # ``factor_c_q`` deliberately answers a provider LU request with the
+    # local-JAX (LU, pivots) pair when batch_reshard is selected: the provider
+    # token has a block-cyclic lifetime and cannot cross that route, whereas
+    # the JAX factor can be retained across r chunks.  Normalize the already
+    # resolved provider name at this seam so the remainder takes the ordinary
+    # hoisted lu_solve path.  A non-None pivot vector is the unambiguous tag;
+    # provider tokens keep their pivots opaque and were handled above.
+    if (lu_piv is not None
+            and solver_kind in ('cusolvermp_lu', 'scalapack_lu')
+            and distrib_la_batched_route == 'batch_reshard'):
+        solver_kind = 'lu'
+
+    if isinstance(L_q, FactorToken):
+        return _solve_zeta_token(
+            L_q, Z_q, mesh_xy)
+
+    if solver_kind in ('cusolvermp_lu', 'scalapack_lu') and mu_pad:
+        Px_ = int(mesh_xy.shape['x'])
+        Py_ = int(mesh_xy.shape['y'])
+        from runtime.padding import padded_axis
+        logical_lu_axis = padded_axis(
+            n_log, mesh_xy, name="logical distributed LU extent",
+            specs=((P('x', None), 0), (P(None, 'y'), 1)))
+        if logical_lu_axis.pad:
+            # The indefinite solve MUST run at the logical extent (see
+            # ``n_rmu_logical`` above), but the distributed block-cyclic
+            # descriptors need n % Px == n % Py == 0.  Fall back to the
+            # per-q replicated LU, which runs at any logical extent.
+            # Defense in depth ONLY: the config path refuses (explicit
+            # request) or announces (auto) this at RESOLVE time inside
+            # ``_resolve_solver_kind_transverse``; reaching this branch
+            # means a caller passed an explicit distributed kind without
+            # the divisibility precondition.  Announce via print, not
+            # warnings.warn — warnings dedupe/capture made the original
+            # demotion effectively silent in production logs (the
+            # ledgered "silent replicated-LU fallback").
+            if jax.process_index() == 0:
+                print(
+                    f"  [solve_zeta] n_rmu_logical={n_log} not divisible "
+                    f"by the {Px_}x{Py_} mesh axes; transverse LU falls "
+                    f"back from {solver_kind} to the per-q "
+                    f"jnp.linalg.solve path so the solve can run at the "
+                    f"logical extent.", flush=True)
+            solver_kind = 'lu'
+
+    if solver_kind in ('distributed_rank_truncate',
+                       'distributed_transverse_rank_truncate'):
+        # `distributed` tier: L_q IS the truncated pseudo-inverse C⁺, kept
+        # 2D-sharded.  ζ = C⁺Z is one stacked GEMM with BOTH operands at
+        # P(None,'x','y') — no factor gather, and no Z re-layout (Z is
+        # consumed in the layout z_q_from_psi_sm builds it in, which is
+        # exactly what scorecard J.9's flat-mesh column sharding made
+        # impossible).  The transverse spelling (2026-08-01) is the SAME
+        # back-solve on the transverse C⁺ (formed in indefinite mode);
+        # it runs at the padded extent by design, so it must NOT enter
+        # the logical-extent mu_pad guard above this dispatch.
+        return _distributed_backsolve(
+            Z_q, mesh_xy,
+            lambda Z: _distributed_pinv_apply(L_q, Z, mesh_xy, n_log))
+
+    if solver_kind in ('cusolvermp_lu', 'scalapack_lu'):
+        return _solve_zeta_fused_lu(
+            L_q, Z_q, cct_trace_per_q, distrib_la_batched_route, lu_piv, mesh_xy, mu_pad, n_log,
+            solver_kind)
+
+    # Compute padding needed for even sharding across all devices
+    return _solve_zeta_replicated(
+        L_q, Z_q, lu_piv, mesh_xy, n_log, n_rmu, n_zchunk, nq, q_chunk_size, solver_kind,
+        zeta_gather)
+
+
+_fit_one_rchunk_cache: dict = {}
 
 
 def _make_fit_one_rchunk_kernel(
     mesh_xy: Mesh,
     meta: Meta,
     band_chunk_ranges: tuple[tuple[int, int], ...],
-    band_range_left: tuple[int, int],
-    band_range_right: tuple[int, int],
-    band_range_full: tuple[int, int],
-    actual_n_rchunk: int,
     q_chunk_size: int,
     psi_G_store,
     vertex_mu_L: int = 0,
@@ -7209,100 +4430,18 @@ def _make_fit_one_rchunk_kernel(
     zeta_gather: str = 'replicated',
     lu_hoisted: bool = False,
     distrib_la_batched_route: str = "batch_reshard",
-    layout: str = "legacy",
-    cache_face_y_blocks: bool = False,
-    face_y_cache_r_tile: int = 0,
     k_unfold_plan=None,
+    layout="face",
 ):
-    """Factory: returns a ``jax.jit``'d fit_one_rchunk callable closing
-    over every piece of static structure + a :class:`PsiGStore` carrying
-    the static FFT metadata.  The dynamic ``psi_r_cache`` is optional:
-    plans that can afford it supply the hoisted all-P-sharded ψ(r) cache;
-    bounded plans pass ``None`` and read each band chunk through the same
-    store/transform owner inside the r-chunk kernel.
-
-    Returned function signature::
-
-        zeta_chunk = kernel(
-            psi_l_rmuT_X_fit,
-            psi_r_rmuT_X_fit,
-            L_q,
-            norms_l, norms_r,      # jax arrays; jnp.ones when no band_norms
-            r_start_dyn,           # scalar int32
-        )
-
-    ψ(G) is NOT a jit argument.  On the hoisted route its full-grid IFFT has
-    already been done once by :func:`build_psi_r_cache_sm`; on the streamed
-    route the bc-loop reads through :class:`PsiGStore` and calls the canonical
-    bounded-rchunk transform.
-
-    The inner body fully composes the load-phase FFT + reshard, the
-    band-chunk pair-density streaming loop (Python-unrolled at trace),
-    the ZCT, the Z_q→Z_col reshard, and the Cholesky solve.
-
-    ``layout='face'`` (``low_mem_bands=True``): ``z_q_phase`` reads
-    ``psi_mun``/``weight_l``/``weight_r`` instead of
-    ``psi_l_rmuT_X_fit``/``psi_r_rmuT_X_fit``/``norms_l``/``norms_r`` —
-    see :func:`isdf.core._z_q_face` and
-    ``docs/architecture/zeta_fit_face_psi_cct.md``'s r-chunk section.
-    ``vertex_mu_L != 0`` (2026-08-23) is now supported here too: the
-    SAME ``gamma_static`` (perm, phase) tuple this factory already
-    resolves for the legacy branch is passed as BOTH ``gamma_L=`` and
-    ``gamma_R=`` to ``z_q_from_psi_sm(layout='face')`` — mirroring the
-    legacy branch's own ``gamma_L=gamma_mu, gamma_R=gamma_mu`` call
-    exactly (``gw.isdf_fitting.fit_zeta_to_h5``'s STEP 2 CCT call uses
-    the identical single-index-for-both convention).
-
-    ``cache_face_y_blocks`` is the memory planner's internal face-route
-    decision; it is static, cache-keyed, and has no frontend/env spelling.
-    ``face_y_cache_r_tile`` is its bounded internal global-r tile; zero means
-    the full outer chunk for compatibility.
-
-    ``k_unfold_plan`` (face layout only) switches ``z_q_phase`` to the
-    raw-parent route: ``psi_mun`` is then the plan's PACKED parent face, the
-    store holds parent rows, and the r "chunk" is one orbit-closed tile whose
-    slot tables arrive as runtime operands (:func:`_z_q_face_parent`).  The
-    resulting ``Z_q`` has its centroid axis in packed order; ``solve_phase``
-    restores canonical order right after the q selection, before the solve.
-    """
-    if layout not in ("legacy", "face"):
-        raise ValueError(
-            f"_make_fit_one_rchunk_kernel: layout must be 'legacy' or "
-            f"'face', got {layout!r}")
-    if k_unfold_plan is not None and layout != "face":
-        raise ValueError(
-            "_make_fit_one_rchunk_kernel: the raw-parent route needs the "
-            "face carrier (low_mem_bands=true).")
-    nk_tot = meta.nk_tot
+    """Cache parent Zq construction and the unchanged selected-q solve phases."""
+    if k_unfold_plan is None:
+        raise ValueError("_make_fit_one_rchunk_kernel requires a typed parent plan")
     vertex_mu_L = int(vertex_mu_L)
     if vertex_mu_L < 0 or vertex_mu_L > 3:
         raise ValueError(
             f"vertex_mu_L={vertex_mu_L}; gamma attribute ABI supports 0..3")
-    is_charge = vertex_mu_L == 0
-    # conv_kpair's monomial is an FFI attribute, hence compile-time state.
-    # Capture it before tracing rather than converting the historical runtime
-    # gamma operands inside z_q_from_psi_sm (which would be illegal for JAX
-    # tracers).  The cache keys vertex_mu_L below, so channels cannot reuse an
-    # executable carrying another channel's attributes.
-    gamma_static = None if is_charge else _gamma_perm_phase_mu(vertex_mu_L)
-    # In-memory shapes throughout this kernel use the PADDED μ extent.
-    # ψ enters at padded (Phase 3a's load_centroids contract); all
-    # bilinear consumers / WSCs / inner-jit boundary checks see
-    # n_rmu_padded == ∏ p_a (mesh-divisible by construction).  L_q
-    # is also at padded extent (factor_c_q embeds the
-    # logical-extent factor with identity in the pad block — pad rows
-    # of zeta come out as zero, logical block byte-identical to a
-    # pure-logical solve).  meta.n_rmu (logical) is used only as the
-    # dataset shape stated in fit_zeta_to_h5, which is what SlabIO
-    # clips the pad rows against, so the on-disk extent stays logical
-    # and round-trips across mesh sizes.
-    n_rmu = meta.n_rmu_padded
-    nspinor = meta.nspinor
     kgrid = meta.kgrid
 
-    # Closure-side IBZ row indices (Phase B).  None → full-BZ solve
-    # (back-compat for ``write_ibz_only=False``).  Otherwise a static
-    # jax int32 array baked into the jit's HLO.
     if q_irr_full_idx is not None:
         q_irr_idx_j = jnp.asarray(
             np.asarray(q_irr_full_idx, dtype=np.int32))
@@ -7311,104 +4450,25 @@ def _make_fit_one_rchunk_kernel(
     q_neg_idx_np = (None if q_neg_idx is None else
                     np.asarray(q_neg_idx, dtype=np.int32))
 
-    # ψ enters at PADDED n_rmu.  All in-memory arrays here operate at
-    # PADDED extent so the inner shard_map boundaries see divisible
-    # shapes (n_rmu_padded ≡ ∏ p_a).  The Cholesky factor L_q is at
-    # PADDED extent too (factor_c_q embeds the logical-extent factor
-    # with identity in the pad block); the back-solve produces zeta
-    # with zero pad rows, logical block byte-identical to a logical-
-    # only solve.  zeta is returned at padded extent; the dataset is
-    # created at meta.n_rmu, so SlabIO clips the pad rows against it
-    # and the on-disk extent stays logical.
-
-    def z_q_phase(
-        psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
-        norms_l, norms_r, r_start_dyn, gamma_perm, gamma_phase,
-        psi_r_cache, psi_mun=None, weight_l=None, weight_r=None,
-        tile_r_index=None, tile_local_perm=None, tile_wraps=None,
-    ):
-        if k_unfold_plan is not None:
-            Z_q = z_q_from_psi_sm(
-                psi_G_store=psi_G_store, psi_r_cache=psi_r_cache,
-                band_chunk_ranges=band_chunk_ranges,
-                r_start_dyn=r_start_dyn,
-                r_chunk_size=actual_n_rchunk,
-                kgrid=kgrid, mesh_xy=mesh_xy,
-                layout="face", psi_mun=psi_mun,
-                weight_l=weight_l, weight_r=weight_r,
-                k_unfold_plan=k_unfold_plan,
-                tile_r_index=tile_r_index,
-                tile_local_perm=tile_local_perm,
-                tile_wraps=tile_wraps,
-            )
-        elif layout == "face":
-            # low_mem_bands=True: the band-contraction operand is read
-            # per-bc out of the persistent face carrier (psi_mun),
-            # never a resident single-axis array — see _z_q_face.
-            # band_norms is refused upstream under low_mem_bands
-            # (fit_zeta_to_h5), so norms_l/norms_r are always all-ones
-            # here; no scaling needed (unlike the legacy branch below).
-            # gamma_static: None for the charge channel (is_charge),
-            # the closure-captured (perm, phase) tuple for a transverse
-            # channel — SAME value passed as both gamma_L and gamma_R,
-            # mirroring the legacy branch below.
-            Z_q = z_q_from_psi_sm(
-                psi_G_store=psi_G_store, psi_r_cache=psi_r_cache,
-                band_chunk_ranges=band_chunk_ranges,
-                r_start_dyn=r_start_dyn,
-                r_chunk_size=actual_n_rchunk,
-                gamma_L=gamma_static, gamma_R=gamma_static,
-                kgrid=kgrid, mesh_xy=mesh_xy,
-                layout="face", psi_mun=psi_mun,
-                weight_l=weight_l, weight_r=weight_r,
-                cache_face_y_blocks=bool(cache_face_y_blocks),
-                face_y_cache_r_tile=int(face_y_cache_r_tile),
-            )
-        else:
-            # Pre-multiply by 1/norms so the pair-density einsum sees the
-            # norm-scaled input without a per-bc divide inside the scan
-            # (algebraically identical: einsum is linear in psi_X·psi_Y).
-            psi_l_X_scaled = psi_l_rmuT_X_fit / norms_l[None, None, :, None]
-            psi_r_X_scaled = psi_r_rmuT_X_fit / norms_r[None, None, :, None]
-            # gamma_perm/gamma_phase remain in this callable's compatibility ABI,
-            # but the FFI path must use the closure-captured attribute values.
-            gamma_mu = gamma_static
-            # Streaming pair density + γ̃·γ̃ + FFT — single shard_map.  The
-            # expensive full-grid ψ IFFT is hoisted outside the r-chunk loop.
-            # Build Z_q at FULL-BZ q-shape; charge completion below needs the
-            # complete -q domain before the selected rows can be returned.
-            Z_q = z_q_from_psi_sm(
-                psi_l_X_scaled, psi_r_X_scaled, psi_G_store, psi_r_cache,
-                band_chunk_ranges=band_chunk_ranges,
-                band_range_left=band_range_left,
-                band_range_right=band_range_right,
-                r_start_dyn=r_start_dyn,
-                r_chunk_size=actual_n_rchunk,
-                gamma_L=gamma_mu,
-                gamma_R=gamma_mu,
-                kgrid=kgrid,
-                mesh_xy=mesh_xy,
-            )
+    def z_q_phase(psi_r_cache, psi_mun, weight_l, weight_r,
+                  tile_r_index, tile_local_perm, tile_wraps):
+        """Complete the parent RHS on full q before the external row selection."""
+        Z_q = z_q_from_psi_sm(
+            psi_G_store=psi_G_store, psi_r_cache=psi_r_cache,
+            band_chunk_ranges=band_chunk_ranges,
+            kgrid=kgrid, mesh_xy=mesh_xy, psi_mun=psi_mun,
+            weight_l=weight_l, weight_r=weight_r,
+            k_unfold_plan=k_unfold_plan,
+            gamma_L=vertex_mu_L, gamma_R=vertex_mu_L,
+            tile_r_index=tile_r_index, tile_local_perm=tile_local_perm,
+            tile_wraps=tile_wraps, layout=layout)
         if q_neg_idx_np is not None:
             Z_q = complete_ordered_pair_normal_equations(Z_q, q_neg_idx_np)
         return Z_q
 
     def solve_phase(Z_q, L_q, cct_trace_per_q, lu_piv=None):
-        # IBZ-only solve (Phase B): L_q + cct_trace + lu_piv come in
-        # PRE-SLICED at IBZ rows (via ``symmetry_maps.slice_q_full_to_ibz``
-        # upstream in ``fit_zeta_to_h5``; the factor stage runs after the
-        # slice, so its piv q-axis is already IBZ).  Production selects Z
-        # immediately outside ``z_q_phase`` and before its outer host
-        # synchronization.  The composed AOT helper below hands this routine
-        # the full carrier directly, so select it here based on its static
-        # shape.  Keeping the selection outside the physics-producing JIT
-        # preserves that JIT's numerical lowering and bit identity.
         if q_irr_idx_j is not None and int(Z_q.shape[0]) == int(meta.nk_tot):
             Z_q = Z_q[q_irr_idx_j]
-        # ``n_rmu_logical=meta.mu_solve_extent``: the per-q dense solves
-        # run at the LOGICAL μ extent (ζ pad rows zero-filled after) when
-        # the pads are a suffix, and at the whole packed carrier (identity
-        # on the pad diagonal, zero pad rows in Z) when they are interleaved.
         return solve_zeta(
             L_q, Z_q, mesh_xy, q_chunk_size,
             solver_kind=solver_kind,
@@ -7419,49 +4479,14 @@ def _make_fit_one_rchunk_kernel(
             distrib_la_batched_route=distrib_la_batched_route)
 
     @jax.jit
-    def _kernel(
-        psi_l_rmuT_X_fit,
-        psi_r_rmuT_X_fit,
-        L_q,
-        norms_l,
-        norms_r,
-        r_start_dyn,
-        gamma_perm,
-        gamma_phase,
-        cct_trace_per_q,
-        lu_piv,
-        psi_r_cache,
-        psi_mun=None,
-        weight_l=None,
-        weight_r=None,
-        tile_r_index=None,
-        tile_local_perm=None,
-        tile_wraps=None,
-    ):
-        # Composed (z_q ∘ solve) under one ``@jax.jit`` — preserved for
-        # the AOT memory model path which lowers a single callable.
-        # Production ``fit_one_rchunk`` calls ``z_q_phase`` and
-        # ``solve_phase`` directly with ``timing.section`` between, so
-        # the per-r-chunk breakdown is host-visible.  ``lu_piv`` is a
-        # placeholder unless ``lu_hoisted`` (the closure static that keys
-        # the cache) — the hoisted/fused distinction must be structural.
-        #
-        # ARRAY FACTORS ONLY.  ``L_q`` here is a jit ARGUMENT, so the three
-        # library-handle routes — whose factor is a
-        # :class:`distrib_la.FactorToken` — cannot come through this
-        # entry point, and jax refuses them by name rather than tracing
-        # something it should not.  See :func:`_factor_nbatch` for why the
-        # token is not a pytree; the un-fused phases below, which is what
-        # production calls, take it fine.
-        Z_q = z_q_phase(
-            psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
-            norms_l, norms_r, r_start_dyn, gamma_perm, gamma_phase,
-            psi_r_cache, psi_mun, weight_l, weight_r,
-            tile_r_index, tile_local_perm, tile_wraps)
+    def _kernel(L_q, cct_trace_per_q, lu_piv, psi_r_cache, psi_mun,
+                weight_l, weight_r, tile_r_index, tile_local_perm, tile_wraps):
+        """Compose parent construction and an array-factor solve for AOT callers."""
+        Z_q = z_q_phase(psi_r_cache, psi_mun, weight_l, weight_r,
+                        tile_r_index, tile_local_perm, tile_wraps)
         return solve_phase(Z_q, L_q, cct_trace_per_q,
                            lu_piv if lu_hoisted else None)
 
-    # Attach the un-fused phases so ``fit_one_rchunk`` can time them.
     _kernel.z_q_phase = z_q_phase
     _kernel.solve_phase = solve_phase
     return _kernel
@@ -7471,18 +4496,10 @@ def fit_one_rchunk(
     *,
     psi_G_store,
     psi_r_cache,
-    psi_l_rmuT_X_fit=None,
-    psi_r_rmuT_X_fit=None,
     L_q,
-    norms_l=None,
-    norms_r=None,
-    r_start_dyn,
     mesh_xy: Mesh,
     meta: Meta,
     band_chunk_ranges: tuple[tuple[int, int], ...],
-    band_range_left: tuple[int, int],
-    band_range_right: tuple[int, int],
-    band_range_full: tuple[int, int],
     actual_n_rchunk: int,
     q_chunk_size: int,
     vertex_mu_L: int = 0,
@@ -7493,85 +4510,33 @@ def fit_one_rchunk(
     zeta_gather: str = 'replicated',
     lu_piv: jax.Array | None = None,
     distrib_la_batched_route: str = "batch_reshard",
-    layout: str = "legacy",
     psi_mun: jax.Array | None = None,
     weight_l: jax.Array | None = None,
     weight_r: jax.Array | None = None,
-    cache_face_y_blocks: bool = False,
-    face_y_cache_r_tile: int = 0,
     _prebuilt_Z_q: jax.Array | None = None,
     k_unfold_plan=None,
     tile_r_index: jax.Array | None = None,
     tile_local_perm: jax.Array | None = None,
     tile_wraps: jax.Array | None = None,
+    layout="face",
 ):
-    """Entry point for the r-chunk body jit.  Caches one compiled kernel
-    per distinct static configuration.
-
-    ``psi_G_store`` is captured for static FFT/store metadata, while
-    ``psi_r_cache`` is a dynamic, all-P band-sharded argument.  The cache key
-    includes ``id(psi_G_store)`` to avoid reusing a compile built against a
-    different layout.
-
-    ``layout='legacy'`` (default): ``psi_l_rmuT_X_fit``/
-    ``psi_r_rmuT_X_fit``/``norms_l``/``norms_r`` are required, exactly as
-    before.  ``layout='face'`` (``low_mem_bands=True``): ``psi_mun``/
-    ``weight_l``/``weight_r`` are required instead — see
-    :func:`isdf.core._z_q_face`.  ``vertex_mu_L`` may be non-zero under
-    either layout (2026-08-23).
-    """
-    if layout not in ("legacy", "face"):
-        raise ValueError(
-            f"fit_one_rchunk: layout must be 'legacy' or 'face', got "
-            f"{layout!r}")
-    if layout == "legacy":
-        if psi_l_rmuT_X_fit is None or psi_r_rmuT_X_fit is None:
-            raise ValueError(
-                "fit_one_rchunk(layout='legacy') requires "
-                "psi_l_rmuT_X_fit= and psi_r_rmuT_X_fit=.")
-        if norms_l is None or norms_r is None:
-            raise ValueError(
-                "fit_one_rchunk(layout='legacy') requires norms_l= and "
-                "norms_r=.")
-    else:
-        if psi_mun is None or weight_l is None or weight_r is None:
-            raise ValueError(
-                "fit_one_rchunk(layout='face') requires psi_mun=, "
-                "weight_l= and weight_r=.")
-    if k_unfold_plan is not None and (
+    """Build or reuse a parent RHS, select q rows, and solve with cached factors."""
+    if k_unfold_plan is None:
+        raise ValueError("fit_one_rchunk requires a typed parent plan")
+    if psi_mun is None or weight_l is None or weight_r is None:
+        raise ValueError("fit_one_rchunk requires the parent face and both band weights")
+    if (
             tile_r_index is None or tile_local_perm is None
             or tile_wraps is None):
         raise ValueError(
             "fit_one_rchunk(k_unfold_plan=...) requires the tile's slot "
             "tables: tile_r_index=, tile_local_perm=, tile_wraps=.")
-    # conv_kpair passes the monomial gamma as FFI attributes, so the Lorentz
-    # channel is structural and keys the cache.  The historical runtime gamma
-    # operands remain in the callable ABI, but the native post-pair path uses
-    # the factory's closure-captured values; μ=1/2/3 therefore compile
-    # separately instead of trying to turn tracers into host attributes.
-    is_charge = (int(vertex_mu_L) == 0)
-    if _prebuilt_Z_q is not None and (layout != "face" or is_charge):
-        raise ValueError(
-            "fit_one_rchunk: _prebuilt_Z_q is reserved for the private "
-            "coupled transverse face route")
-    gamma_perm, gamma_phase = _gamma_perm_phase_mu(vertex_mu_L)
-    _cache_y_r_tile = 0
-    _cache_y_blocks = bool(cache_face_y_blocks)
-    if _cache_y_blocks:
-        _cap = int(face_y_cache_r_tile) or int(actual_n_rchunk)
-        _cache_y_r_tile = bounded_partition_tile(
-            int(actual_n_rchunk), _cap, int(mesh_xy.shape['y']))
-        if (_cache_y_r_tile <= 0
-                or int(actual_n_rchunk) // _cache_y_r_tile
-                >= int(meta.nspinor) ** 2):
-            _cache_y_blocks = False
-            _cache_y_r_tile = 0
+    if _prebuilt_Z_q is not None and int(vertex_mu_L) == 0:
+        raise ValueError("fit_one_rchunk: _prebuilt_Z_q requires a current vertex")
     cache_key = (
-        id(mesh_xy),
+        _mesh_key(mesh_xy),
         actual_n_rchunk,
         tuple(tuple(b) for b in band_chunk_ranges),
-        tuple(band_range_left), tuple(band_range_right),
-        tuple(band_range_full),
         q_chunk_size,
         meta.n_rmu, meta.n_rmu_padded, meta.nk_tot, meta.nspinor,
         tuple(meta.fft_grid),
@@ -7583,10 +4548,7 @@ def fit_one_rchunk(
         str(zeta_gather),
         str(distrib_la_batched_route),
         bool(lu_piv is not None),
-        str(layout),
-        bool(_cache_y_blocks),
-        int(_cache_y_r_tile),
-        id(k_unfold_plan),
+        id(k_unfold_plan), layout,
         (None if q_irr_full_idx is None
          else (int(q_irr_full_idx.shape[0]),
                hash(np.asarray(q_irr_full_idx,
@@ -7600,10 +4562,6 @@ def fit_one_rchunk(
         fn = _make_fit_one_rchunk_kernel(
             mesh_xy, meta,
             tuple(tuple(b) for b in band_chunk_ranges),
-            tuple(band_range_left),
-            tuple(band_range_right),
-            tuple(band_range_full),
-            actual_n_rchunk,
             q_chunk_size,
             psi_G_store,
             vertex_mu_L=int(vertex_mu_L),
@@ -7613,10 +4571,7 @@ def fit_one_rchunk(
             zeta_gather=str(zeta_gather),
             lu_hoisted=bool(lu_piv is not None),
             distrib_la_batched_route=str(distrib_la_batched_route),
-            layout=str(layout),
-            cache_face_y_blocks=bool(_cache_y_blocks),
-            face_y_cache_r_tile=int(_cache_y_r_tile),
-            k_unfold_plan=k_unfold_plan,
+            k_unfold_plan=k_unfold_plan, layout=layout,
         )
         _fit_one_rchunk_cache[cache_key] = fn
     # cct_trace_per_q is None for the charge channel (Cholesky path
@@ -7642,10 +4597,7 @@ def fit_one_rchunk(
     with timing.section("zeta_fit.chunk.z_q_build"):
         if _prebuilt_Z_q is None:
             Z_q = fn.z_q_phase(
-                psi_l_rmuT_X_fit, psi_r_rmuT_X_fit,
-                norms_l, norms_r, r_start_dyn,
-                gamma_perm, gamma_phase, psi_r_cache,
-                psi_mun, weight_l, weight_r,
+                psi_r_cache, psi_mun, weight_l, weight_r,
                 tile_r_index, tile_local_perm, tile_wraps)
             # Keep the full-domain charge completion inside z_q_phase, but
             # select in this separate scheduling operation before the outer
@@ -7683,14 +4635,7 @@ def fit_one_rchunk(
 def _band_norms_slice(
     band_norms: np.ndarray | None, band_range: tuple[int, int], nb: int,
 ) -> jax.Array:
-    """Slice + clamp the pseudobands weights to a ``(nb,)`` jax array.
-
-    Divisor is ``max(1, w_n)``: low-weight pseudobands keep their
-    sub-unit norm (DOS-preserving), high-weight ones are pulled back
-    to unit (no dominance), zero-weight windows stay at 1.0 since the
-    ``max(1, 0)=1`` floor avoids a divide-by-zero.  When
-    ``band_norms`` is ``None`` (no pseudobands), returns ``jnp.ones``.
-    """
+    """Slice + clamp the pseudobands weights to a ``(nb,)`` jax array; see docs/architecture/zeta_fit_face_psi_cct.md."""
     if band_norms is None:
         return jnp.ones((nb,), dtype=jnp.float64)
     lo, hi = band_range

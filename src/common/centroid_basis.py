@@ -103,11 +103,7 @@ class PackedCentroidBasis:
     @classmethod
     def build(cls, centroid_indices, sym, fft_grid, mesh_xy: Mesh, *,
               identity: bool = False) -> "PackedCentroidBasis":
-        """Orbits of ``centroid_indices`` under ``sym``'s spatial operations
-        (time reversal extended).  A set that is not orbit-closed, a trivial
-        group, or ``identity=True`` gives the identity layout: the packed
-        order IS the canonical suffix-padded order and every conversion is a
-        no-op."""
+        """Pack orbits of available centroid actions without changing the physical group."""
         idx = np.array(jax.device_get(centroid_indices), dtype=np.int32,
                        order="C", copy=True)
         idx.setflags(write=False)
@@ -121,8 +117,10 @@ class PackedCentroidBasis:
                 perm, _ = centroid_source_map_and_wrap(
                     idx, np.asarray(sym.sym_matrices)[:n_spatial],
                     np.asarray(sym.translations)[:n_spatial],
-                    np.asarray(fft_grid, dtype=np.int32), extend_trs=True)
-                groups = permutation_orbit_labels(perm)
+                    np.asarray(fft_grid, dtype=np.int32), extend_trs=True, validate=False)
+                available = np.all(np.sort(perm, axis=1) == np.arange(idx.shape[0]), axis=1)
+                if np.any(available):
+                    groups = permutation_orbit_labels(perm[available])
             except (ValueError, RuntimeError):
                 # not orbit-closed: nothing to pack, keep the canonical order
                 groups = None
@@ -177,15 +175,33 @@ class PackedCentroidBasis:
                 f"canonical carrier {self.n_canonical})")
 
     def pack_tables(self, sym_perm, L_table):
-        """Canonical centroid permutations/wraps → packed coordinates."""
-        return (self.layout.axis.pack_permutations_host(sym_perm),
-                self.layout.axis.pack_host(L_table, axis=1, fill_value=0))
+        """Pack available canonical actions while preserving unavailable whole rows."""
+        perm, wraps = np.asarray(sym_perm), np.asarray(L_table)
+        missing = np.all(perm == -1, axis=1)
+        if wraps.shape != perm.shape + (3,) or np.any(wraps[missing] != 0):
+            raise ValueError("centroid tables require zero wraps for unavailable actions")
+        packed = np.full((perm.shape[0], self.n_packed), -1, dtype=np.int32)
+        packed[~missing] = self.layout.axis.pack_permutations_host(perm[~missing])
+        return packed, self.layout.axis.pack_host(wraps, axis=1, fill_value=0)
 
     def unpack_tables(self, sym_perm_packed, L_table_packed):
+        """Unpack available actions without indexing the unavailable-row sentinel."""
         ax = self.layout.axis
         perm = np.asarray(sym_perm_packed)
-        canonical = ax.packed_to_canonical[perm[:, ax.canonical_to_packed]]
-        return canonical.astype(np.int32), ax.unpack_host(L_table_packed, axis=1)
+        if perm.ndim != 2 or perm.shape[1] != self.n_packed:
+            raise ValueError("packed centroid table has the wrong extent")
+        missing = np.all(perm == -1, axis=1)
+        valid = perm[~missing]
+        if np.any(valid < 0) or np.any(valid >= self.n_packed):
+            raise ValueError("centroid action is neither available nor wholly unavailable")
+        canonical = np.full((perm.shape[0], self.n_logical), -1, dtype=np.int32)
+        canonical[~missing] = ax.packed_to_canonical[valid[:, ax.canonical_to_packed]]
+        wraps = ax.unpack_host(L_table_packed, axis=1)
+        check_perm, check_wraps = self.pack_tables(canonical, wraps)
+        if not (np.array_equal(check_perm, perm)
+                and np.array_equal(check_wraps, L_table_packed)):
+            raise ValueError("packed centroid action or pad does not round trip")
+        return canonical, wraps
 
     # ---- host arrays -------------------------------------------------------
     def pack_host(self, array, *, axis: int = -1):

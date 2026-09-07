@@ -1,22 +1,4 @@
-"""``cohsex_sigma`` face-layout dispatch: fast refusals and the
-``_face_kwargs`` helper.  Emulated CPU mesh, unit-scope (QUALITY_PATTERNS'
-FOUR-GPU RULE exempts unit/CPU cells).
-
-The face NUMERIC kernels (``sigma_sx``/``sigma_coh``/``hartree`` under
-``layout='face'``) go through ``distrib_la.gemm_plan`` (cuBLASMp,
-CUDA-only today) AND the flat-k FFT FFI (unavailable in this sandbox's CPU
-build — ``liblorrax_ffi_host.so`` missing/unloadable, a pre-existing,
-already-registered environment gap, not something this file works around).
-Their algebra parity against ``layout='legacy'`` is certified on the real
-4-rank CUDA gate,
-``tests/multi_device/low_mem_bands_g_projection_hartree_gate.py``.
-
-What IS certified here, with no FFT and no gemm plan: ``layout`` and
-``face_shape`` are validated BEFORE any FFT/FFI setup runs (a bad layout
-string or a missing ``face_shape`` fails fast rather than surfacing as an
-unrelated FFI probe error), and ``_face_kwargs`` reads the right shape off
-a real face bundle.
-"""
+"""Validate static kernel admission and canonical face shapes before backend setup."""
 from __future__ import annotations
 
 import numpy as np
@@ -32,7 +14,7 @@ from gw.cohsex_sigma import (  # noqa: E402
     G_FFT7D_SPEC, V_FFT5D_SPEC, _face_kwargs, _make_cohsex_kernels,
     _make_static_convolution)
 from gw.wavefunction_bundle import (  # noqa: E402
-    BandSlices, build_wavefunctions, build_wavefunctions_face)
+    BandSlices, build_wavefunctions_face)
 
 
 def _mesh_xy():
@@ -50,7 +32,7 @@ def _put(a, mesh, spec):
     return jax.device_put(jnp.asarray(a), NamedSharding(mesh, spec))
 
 
-def _bundle(mesh, *, face: bool, nk=2, nb=6, ns=2, nmu=8):
+def _bundle(mesh, *, nk=2, nb=6, ns=2, nmu=8):
     rng = np.random.default_rng(3)
     psi = (rng.standard_normal((nk, nb, ns, nmu))
            + 1j * rng.standard_normal((nk, nb, ns, nmu)))
@@ -60,8 +42,7 @@ def _bundle(mesh, *, face: bool, nk=2, nb=6, ns=2, nmu=8):
     y_in = _put(psi, mesh, P(None, None, None, "y"))
     x_in = _put(psi_rmuT_X, mesh, P(None, "x", None, None))
     enk_in = _put(enk, mesh, P(None, None))
-    builder = build_wavefunctions_face if face else build_wavefunctions
-    return builder(y_in, x_in, enk_full=enk_in, slices=slices, mesh_xy=mesh)
+    return build_wavefunctions_face(y_in, x_in, enk_full=enk_in, slices=slices, mesh_xy=mesh)
 
 
 # ---------------------------------------------------------------------------
@@ -84,16 +65,10 @@ def test_make_cohsex_kernels_face_requires_face_shape_before_fft_setup():
 # _face_kwargs
 # ---------------------------------------------------------------------------
 
-def test_face_kwargs_empty_for_legacy_bundle():
-    mesh = _mesh_xy()
-    wfns = _bundle(mesh, face=False)
-    assert _face_kwargs(wfns) == {}
-
-
 def test_face_kwargs_reads_shape_off_the_face_bundle():
     mesh = _mesh_xy()
     nk, nb, ns, nmu = 2, 6, 2, 8
-    wfns = _bundle(mesh, face=True, nk=nk, nb=nb, ns=ns, nmu=nmu)
+    wfns = _bundle(mesh, nk=nk, nb=nb, ns=ns, nmu=nmu)
     kw = _face_kwargs(wfns)
     assert kw["layout"] == "face"
     assert kw["face_shape"] == (nk, nb, nmu, ns)

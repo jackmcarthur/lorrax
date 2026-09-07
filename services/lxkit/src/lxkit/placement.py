@@ -32,10 +32,11 @@ def device_put_process_local(host_array, sharding, *, check: bool | None = None)
     import jax
     import numpy as np
 
-    # An already globally sharded array is a real reshard, not host staging.
+    # A traced or already globally sharded array needs a real reshard.
     # Never np.asarray it: that would gather the value this helper exists to
     # keep distributed.
-    if isinstance(host_array, jax.Array) and not host_array.is_fully_addressable:
+    if isinstance(host_array, jax.core.Tracer) or (
+            isinstance(host_array, jax.Array) and not host_array.is_fully_addressable):
         return jax.device_put(host_array, sharding)
 
     arr = np.asarray(host_array)

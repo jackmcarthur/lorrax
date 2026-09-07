@@ -10,7 +10,7 @@ check itself uses NumPy coefficient overlaps and no FFT.
 One door for everything symmetry: the IBZ ⇄ full-BZ tables (`SymMaps`), the
 k-star index map for band-index quantities (`KStarMap`, `star_select` /
 `star_broadcast` / `star_spread`), the sharded q-axis unfolds (`unfold_v_q`,
-`unfold_v_q_bispinor_lorentz`), the ψ-unfold antiunitary rule (`unfold_psi`,
+`mix_lorentz_blocks`), the ψ-unfold antiunitary rule (`unfold_psi`,
 `trs_augment_U`, `tau_phase_row`), the real-space orbit machinery
 (`compute_centroid_sym_perm` and friends), and the time-reversal
 MEASUREMENT (`check_density_symmetries`).

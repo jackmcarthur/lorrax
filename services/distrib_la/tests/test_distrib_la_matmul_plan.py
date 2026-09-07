@@ -204,3 +204,20 @@ def test_c_still_works_unaffected_on_a_beta_nonzero_plan():
     C = _sharded(mesh, 1, (1, 2, 2))
     out = plan(A, B, C=C)
     assert out is C
+
+
+@pytest.mark.parametrize("reduction_axis", [None, "x", "y"])
+def test_local_gemm_plan_contracts_random_complex_operands(reduction_axis):
+    """Local band GEMMs and centroid reductions reproduce the dense contraction."""
+    import jax
+    mesh = _mesh()
+    rng = np.random.default_rng(20260906)
+    a = rng.normal(size=(2, 8, 6)) + 1j * rng.normal(size=(2, 8, 6))
+    b = rng.normal(size=(2, 6, 10)) + 1j * rng.normal(size=(2, 6, 10))
+    plan = D.local_gemm_plan(mesh, m=8, k=6, n=10, nq=2,
+                            dtype="complex128", reduction_axis=reduction_axis)
+    assert isinstance(plan, D.GemmPlan)
+    result = plan(jax.device_put(a, plan.in_sharding_a),
+                  jax.device_put(b, plan.in_sharding_b))
+    np.testing.assert_allclose(np.asarray(result), a @ b, atol=1e-12, rtol=0)
+    assert result.sharding == plan.out_sharding

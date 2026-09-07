@@ -34,41 +34,8 @@ from symmetry_maps import (
     permutation_orbit_labels,
     real_space_orbit_labels,
     unfold_spin_centroid_operator,
+    unfold_wavefunction_local,
 )
-
-
-# P=4 A100 crossover after the fixed-size spin action was made dot-free and
-# canonicalization was postponed to one completed chi operator.  This is an
-# internal scheduling policy, not a user-tunable physics/runtime knob.  The
-# lower boundary is the measured 64->8, four-band case; require a separate 2x
-# k-reduction floor so an almost-unreduced grid cannot satisfy the scalar work
-# proxy merely by carrying many bands.
-_MIN_AVOIDED_BAND_WORK = 3.5
-_MIN_PARENT_K_REDUCTION = 2.0
-
-
-def parent_k_contraction_profitable(
-    *, n_full: int, n_parent: int, n_bands: int,
-) -> bool:
-    """Conservative automatic admission for parent-k Green contractions.
-
-    The saved band contraction is proportional to
-    ``n_bands * (1 - n_parent/n_full)``; the required full-k operator
-    transport is not.  On the real Si P=4 64->8 geometry, the dot-free
-    transport kept complete eight-node chi builds faster at 4, 8 and 16
-    bands.  Four bands gives the boundary score 3.5.  A distinct 2x reduction
-    floor prevents extrapolation to grids with almost no symmetry reduction.
-    Callers additionally restrict this measured policy to GPU execution.
-    """
-    full = int(n_full)
-    parent = int(n_parent)
-    bands = int(n_bands)
-    if full < 1 or parent < 1 or parent >= full or bands < 1:
-        return False
-    if full / parent < _MIN_PARENT_K_REDUCTION:
-        return False
-    avoided = bands * (full - parent) / full
-    return avoided >= _MIN_AVOIDED_BAND_WORK
 
 
 def _readonly(value, dtype) -> np.ndarray:
@@ -125,8 +92,8 @@ class CentroidKUnfoldPlan:
         manual-mode local unfold gathers with.  Same reduction
         :func:`unfold_spin_centroid_operator` performs for ``axis_local``.
         """
-        return (self.sym_perm % int(self.layout.axis_shard_size)).astype(
-            np.int32)
+        return np.where(self.sym_perm < 0, -1,
+                        self.sym_perm % int(self.layout.axis_shard_size)).astype(np.int32)
 
     def wavefunction_unfold_tables(self) -> dict:
         """Host tables for ``symmetry_maps.unfold_wavefunction_local`` on a
@@ -141,6 +108,22 @@ class CentroidKUnfoldPlan:
             local_perm=self.centroid_local_perm, L_table=self.L_table,
             spin_action_full=self.spin_action_full,
             n_sym_spatial=int(self.n_sym_spatial))
+
+    def unfold_face(self, face, *, vertex=0, spin_axis, mu_axis,
+                    mesh_axis=None, tables=None):
+        """Unfold a raw-parent face by the typed action, then apply its Lorentz vertex."""
+        from common.gamma_matrices import gamma_apply, gamma_perm_phase
+
+        t = self.wavefunction_unfold_tables() if tables is None else tables
+        child = unfold_wavefunction_local(
+            face, irr_idx=t["irr_idx"], sym_idx=t["sym_idx"],
+            k_irr_frac=t["k_irr_frac"], local_perm=t["local_perm"],
+            L_table=t["L_table"], spin_action_full=t["spin_action_full"],
+            n_sym_spatial=t["n_sym_spatial"], spin_axis=spin_axis,
+            mu_axis=mu_axis, mesh_axis=mesh_axis)
+        if vertex:
+            child = gamma_apply(child, *gamma_perm_phase(vertex), axis=spin_axis)
+        return child
 
     def real_grid_tiles(self, *, target_width: int) -> "RealGridOrbitTiles":
         """Orbit-closed real-grid tiles for this plan's Y axis and group."""
@@ -196,10 +179,14 @@ class CentroidKUnfoldPlan:
             source[unused] = 0
         return jnp.take(src, jnp.asarray(source), axis=axis)
 
-    def unfold_operator(self, operator_parent):
+    def unfold_operator(self, operator_parent, *, operator_transpose=None, right_plan=None):
         """Transport ``(k_parent,s,mu,s,nu)`` to full k locally."""
+        right = self if right_plan is None else right_plan
         return unfold_spin_centroid_operator(
             operator_parent,
+            right_sym_perm=None if right_plan is None else right.sym_perm,
+            right_L_table=None if right_plan is None else right.L_table,
+            operator_transpose=operator_transpose,
             irr_idx=self.irr_idx,
             sym_idx=self.sym_idx,
             sym_perm=self.sym_perm,
@@ -247,12 +234,9 @@ def build_centroid_k_unfold_plan(
             "build_centroid_k_unfold_plan requires the GW square mesh; "
             f"got {shape}.")
     ns = int(nspinor)
-    if ns not in (1, 2):
+    if ns not in (1, 2, 4):
         raise ValueError(
-            "build_centroid_k_unfold_plan currently supports scalar and "
-            f"two-component spinor wavefunctions; got nspinor={ns}.  "
-            "Four-component kinetic-balance states require their exact "
-            "Dirac representation at this seam and remain on full k.")
+            f"build_centroid_k_unfold_plan: nspinor must be 1, 2 or 4; got {ns}.")
 
     n_spatial = int(np.asarray(sym.sym_matrices).shape[0])
     sym_perm, wraps = centroid_source_map_and_wrap(
@@ -260,16 +244,18 @@ def build_centroid_k_unfold_plan(
         np.asarray(sym.sym_matrices)[:n_spatial],
         np.asarray(sym.translations)[:n_spatial],
         np.asarray(fft_grid, dtype=np.int32),
-        extend_trs=True,
+        extend_trs=True, required_rows=np.asarray(sym.sym_idx_k),
     )
-    groups = permutation_orbit_labels(sym_perm)
+    available = np.all(sym_perm >= 0, axis=1)
+    groups = permutation_orbit_labels(sym_perm[available])
     if layout is None:
         layout = build_square_grouped_shard_layout(groups, shape)
     elif int(layout.axis.n_logical) != int(sym_perm.shape[-1]):
         raise ValueError(
             "build_centroid_k_unfold_plan: the run's centroid layout holds "
             f"{layout.axis.n_logical} centroids, the table {sym_perm.shape[-1]}.")
-    packed_perm = layout.axis.pack_permutations_host(sym_perm)
+    packed_perm = np.full((sym_perm.shape[0], layout.axis.n_padded), -1, dtype=np.int32)
+    packed_perm[available] = layout.axis.pack_permutations_host(sym_perm[available])
     packed_wraps = layout.axis.pack_host(wraps, axis=1, fill_value=0)
 
     irr = np.asarray(sym.irr_idx_k, dtype=np.int32)
@@ -440,5 +426,4 @@ __all__ = [
     "RealGridOrbitTiles",
     "build_centroid_k_unfold_plan",
     "build_real_grid_orbit_tiles",
-    "parent_k_contraction_profitable",
 ]

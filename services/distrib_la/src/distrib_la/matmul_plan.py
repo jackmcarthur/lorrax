@@ -152,7 +152,7 @@ shape mismatch that keeps it on ``psum``, not GEMM.
 from __future__ import annotations
 
 import operator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Callable
 
@@ -161,10 +161,11 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la._shard_map import shard_map
-from distrib_la.matmul import (_OP_CODE, _TARGETS, _mesh_shape, _zeros,
+from distrib_la.matmul import (_CUBLASMP_CACHE, _OP_CODE, _TARGETS, _mesh_shape, _zeros,
                                resolve_matmul_backend)
+from distrib_la.resolve import mesh_key
 
-__all__ = ["GemmPlan", "gemm_plan"]
+__all__ = ["GemmPlan", "gemm_plan", "local_gemm_plan"]
 
 _SUPPORTED_DTYPES = (jnp.dtype(jnp.float64), jnp.dtype(jnp.complex128))
 
@@ -266,6 +267,10 @@ def _build_kernel(mesh, *, px, py, nq, m, k, n, dtype, alpha, beta,
     one compiled program, not two.  See the module docstring "Output
     liveness".
     """
+    key = ("planned", mesh_key(mesh), px, py, nq, m, k, n, str(dtype),
+           alpha, beta, int(ctx_handle), with_c)
+    if key in _CUBLASMP_CACHE:
+        return _CUBLASMP_CACHE[key]
     attrs = _gemm_attrs(px=px, py=py, nq=nq, m=m, k=k, n=n, alpha=alpha,
                         beta=beta, ctx_handle=ctx_handle, with_c=with_c)
     out_t = jax.ShapeDtypeStruct((nq, n // py, m // px), dtype)
@@ -276,6 +281,7 @@ def _build_kernel(mesh, *, px, py, nq, m, k, n, dtype, alpha, beta,
         def _local(a, b, c):
             return _local_gemm_call(a, b, c, attrs=attrs, out_t=out_t,
                                     with_c=True)
+        _CUBLASMP_CACHE[key] = _local
         return _local
 
     @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),) * 2,
@@ -283,6 +289,7 @@ def _build_kernel(mesh, *, px, py, nq, m, k, n, dtype, alpha, beta,
     def _local(a, b):
         return _local_gemm_call(a, b, None, attrs=attrs, out_t=out_t,
                                 with_c=False)
+    _CUBLASMP_CACHE[key] = _local
     return _local
 
 
@@ -327,7 +334,7 @@ def _check_operand(plan: "GemmPlan", label: str, x, shape: tuple[int, int, int],
         if not _same_layout(have, sharding):
             raise ValueError(
                 f"gemm_plan {label}: must already be sharded "
-                f"P(None,'x','y') on the plan's mesh; refusing an "
+                f"{sharding.spec} on the plan's mesh; refusing an "
                 f"implicit reshard of a {shape} array.  Got {have!r}.")
 
 
@@ -358,8 +365,9 @@ class GemmPlan:
     in_sharding_b: NamedSharding
     out_sharding: NamedSharding
     ctx_handle: int
-    _fn_with_c: Callable
-    _fn_no_c: Callable | None
+    _fn_with_c: Callable = field(compare=False, hash=False)
+    _fn_no_c: Callable | None = field(compare=False, hash=False)
+    reduction_axis: str | None = None
 
     def describe(self) -> str:
         """One line for a run banner: what resolved, and to what shape."""
@@ -461,6 +469,22 @@ class GemmPlan:
                 ".  Pass C= instead, where the accumulate is explicit at "
                 "the call site.")
         px, py = _mesh_shape(self.mesh)
+        if self.backend == "local":
+            a_shape = tuple(size // (self.mesh.shape[axis] if axis else 1)
+                            for size, axis in zip((self.nq, self.m, self.k), self.in_sharding_a.spec))
+            b_shape = tuple(size // (self.mesh.shape[axis] if axis else 1)
+                            for size, axis in zip((self.nq, self.k, self.n), self.in_sharding_b.spec))
+            _check_local_operand(self, "A", A, a_shape)
+            _check_local_operand(self, "B", B, b_shape)
+            c = C if C is not None else out
+            if c is None and self.beta != 0:
+                raise ValueError("gemm_plan.local_call: C is required when beta != 0")
+            if c is not None:
+                c_shape = tuple(size // (self.mesh.shape[axis] if axis else 1)
+                                for size, axis in zip((self.nq, self.m, self.n), self.out_sharding.spec))
+                _check_local_operand(self, "C/out", c, c_shape)
+            return _axis_matmul(A, B, c, alpha=self.alpha, beta=self.beta,
+                                reduction_axis=self.reduction_axis)
         _check_local_operand(self, "A", A, (self.nq, self.m // px, self.k // py))
         _check_local_operand(self, "B", B, (self.nq, self.k // px, self.n // py))
         c_or_out = C if C is not None else out
@@ -485,6 +509,67 @@ class GemmPlan:
                                 with_c=True)
 
 
+def _axis_matmul(a, b, c=None, *, alpha, beta, reduction_axis=None):
+    """Contract local bands or centroid tiles with the requested centroid reduction."""
+    scale = alpha if a.dtype.kind == "c" else alpha.real
+    result = scale * jnp.matmul(a, b)
+    if reduction_axis is not None:
+        result = jax.lax.psum_scatter(result, reduction_axis,
+            scatter_dimension=1 if reduction_axis == "x" else 2, tiled=True)
+    if beta != 0:
+        scale = beta if a.dtype.kind == "c" else beta.real
+        result = result + scale * c
+    return result
+
+
+def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
+                    dtype, alpha=1.0, beta=0.0, reduction_axis=None, out_spec=None) -> GemmPlan:
+    """Warm A(q,m_X,k) B(q,k,n_Y) → D(q,m_X,n_Y) with a replicated contraction axis."""
+    m, k, n, nq = (_as_extent(label, value) for label, value in
+                   (("m", m), ("k", k), ("n", n), ("nq", nq)))
+    dtype = jnp.dtype(dtype)
+    _validate_dtype(dtype)
+    alpha, beta = _as_scalar("alpha", alpha), _as_scalar("beta", beta)
+    if dtype.kind != "c" and (alpha.imag or beta.imag):
+        raise ValueError("local_gemm_plan: alpha/beta must be real for real dtype")
+    px, py = _mesh_shape(mesh)
+    out_spec = P(None, "x", "y") if out_spec is None else out_spec
+    if out_spec not in (P(None, "x", "y"), P(None, "x", None), P(None, None, "y")):
+        raise ValueError("local_gemm_plan: output must retain its centroid axis shards")
+    for extent, axis in zip((m, n), out_spec[1:]):
+        if axis is not None and extent % mesh.shape[axis]:
+            raise ValueError("local_gemm_plan: output extent does not tile its mesh axis")
+    a_spec, b_spec = P(None, out_spec[1], None), P(None, None, out_spec[2])
+    if reduction_axis is not None and out_spec != P(None, "x", "y"):
+        raise ValueError("local_gemm_plan: centroid reduction requires the two-axis output")
+    if reduction_axis == "y":
+        a_spec, b_spec = P(None, "x", "y"), P(None, "y", None)
+    elif reduction_axis == "x":
+        a_spec, b_spec = P(None, None, "x"), P(None, "x", "y")
+    elif reduction_axis is not None:
+        raise ValueError("local_gemm_plan: reduction_axis must be x, y or None")
+    if reduction_axis is not None and k % mesh.shape[reduction_axis]:
+        raise ValueError("local_gemm_plan: contraction extent must tile its reduction axis")
+    a_sh, b_sh, out_sh = (NamedSharding(mesh, spec)
+                           for spec in (a_spec, b_spec, out_spec))
+    local = partial(_axis_matmul, alpha=alpha, beta=beta, reduction_axis=reduction_axis)
+    with_c = jax.jit(shard_map(local, mesh=mesh,
+        in_specs=(a_spec, b_spec, out_spec), out_specs=out_spec,
+        check_vma=False), donate_argnums=(2,))
+    with_c(_zeros((nq, m, k), dtype, a_sh),
+           _zeros((nq, k, n), dtype, b_sh),
+           _zeros((nq, m, n), dtype, out_sh))
+    no_c = None
+    if beta == 0:
+        no_c = jax.jit(shard_map(local, mesh=mesh,
+            in_specs=(a_spec, b_spec), out_specs=out_spec, check_vma=False))
+        no_c(_zeros((nq, m, k), dtype, a_sh), _zeros((nq, k, n), dtype, b_sh))
+    return GemmPlan(mesh=mesh, backend="local", m=m, k=k, n=n, nq=nq,
+                    dtype=dtype, alpha=alpha, beta=beta,
+                    in_sharding_a=a_sh, in_sharding_b=b_sh, out_sharding=out_sh,
+                    ctx_handle=0, _fn_with_c=with_c, _fn_no_c=no_c, reduction_axis=reduction_axis)
+
+
 def gemm_plan(
     mesh: Mesh,
     *,
@@ -496,6 +581,9 @@ def gemm_plan(
     backend: str = "auto",
     alpha=1.0,
     beta=0.0,
+    layout="face",
+    reduction_axis=None,
+    out_spec=None,
 ) -> GemmPlan:
     """Eagerly resolve, probe, warm and COMPILE one N,N GEMM shape, ONCE.
 
@@ -549,6 +637,13 @@ def gemm_plan(
         ``beta != 0`` compiles only the donated-``C`` kernel, and every
         call must then supply ``C``.
     """
+    if layout == "axis":
+        return local_gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
+                               alpha=alpha, beta=beta, reduction_axis=reduction_axis, out_spec=out_spec)
+    if layout != "face":
+        raise ValueError(f"gemm_plan: unknown psi layout {layout!r}")
+    if out_spec is not None and out_spec != P(None, "x", "y"):
+        raise ValueError("gemm_plan: single-axis output requires layout=axis")
     px, py = _mesh_shape(mesh)
     m = _as_extent("m", m)
     k = _as_extent("k", k)

@@ -56,7 +56,6 @@ do not implicitly suppress tests.
 {"nodeid":"tests/test_gw_jax_regression.py::test_bispinor_gnppm_matches_reference","reason":"the 2026-08-09 bispinor frozen reference is stale by 1.434381 eV and must not be refrozen without a physics ruling","owner":"GW/physics"}
 {"nodeid":"tests/test_gw_jax_regression.py::test_gnppm_matches_reference","reason":"frozen GW reference differs from the current computed result","owner":"GW/physics"}
 {"nodeid":"tests/test_invariance_gates.py::test_fixed_point_frozen_qp_rotations","reason":"restart/IBZ/fixed-point invariance remains outside its pinned contract","owner":"GW/physics"}
-{"nodeid":"tests/test_invariance_gates.py::test_ibz_equals_full_bz","reason":"restart/IBZ/fixed-point invariance remains outside its pinned contract","owner":"GW/physics"}
 {"nodeid":"tests/test_invariance_gates.py::test_restart_equals_fresh","reason":"restart/IBZ/fixed-point invariance remains outside its pinned contract","owner":"GW/physics"}
 {"nodeid":"tests/test_minimax_beta_selector.py::test_a_refused_request_is_byte_identical_to_the_runtime_solve","reason":"runtime minimax refusal and offline solve are not byte-identical","owner":"minimax/quadrature"}
 {"nodeid":"tests/test_minimax_beta_selector.py::test_the_escape_hatch_still_reaches_the_runtime_solve","reason":"the explicit runtime-solve escape hatch returns 7 nodes where the gate requires 10","owner":"minimax/quadrature"}

@@ -1,31 +1,4 @@
-"""Unified configuration for LORRAX GW calculations.
-
-``LorraxConfig`` is built once via :meth:`LorraxConfig.from_input_file`
-from the ``[cohsex]`` section of ``cohsex.in`` and threaded through the
-entire driver.  Its ~80 input keys are grouped into sub-dataclasses
-along the same axes the input file's section comments already use:
-
-    config.head        — q→0 Coulomb-head sources & overrides
-    config.minimax     — screening-minimax target error / max nodes / table mode
-    config.ppm         — PPM model + sigma quadrature + on-shell σ_c options
-    config.sigma_grid  — ω-grid for Σ_c(ω) output
-    config.sc          — self-consistency loop knobs (qp_solver = self_consistent)
-    config.memory      — chunk sizing
-    config.backend     — FFI/linalg backend selection
-    config.debug       — debug-only flags & file paths
-    config.bse         — BSE interpolation setup (htransform-driven)
-    config.paths       — output filenames
-
-The top-level ``LorraxConfig`` retains only system geometry
-(``nval`` / ``ncond`` / ``nband`` / ``sys_dim``) and the orthogonal
-mode flags (``compute_mode`` / ``qp_solver`` / etc.) that the
-driver reads on the fast path.
-
-Derived sub-objects (the math-internal ``MinimaxConfig`` from
-``minimax_config.py``, one instance per quadrature consumer) and derived
-data (the Σ_c(ω) grid) are constructed on demand via ``LorraxConfig``
-properties.
-"""
+"""Unified configuration for LORRAX GW calculations; see docs/architecture/decisions.md."""
 
 from __future__ import annotations
 
@@ -108,20 +81,7 @@ from runtime.env_flags import (  # noqa: E402
 
 def env_float(name: str, default: float, *, print_fn=print,
               refuse: bool = False) -> float:
-    """Canonical numeric env parse: unset/blank → default, bad → ANNOUNCE
-    (or, with ``refuse=True``, RAISE).
-
-    The same defect class as :func:`env_bool`, one type along.  A
-    ``try: float(...) except: default`` leaves the user believing a knob is
-    in force when it is not — the exact failure the
-    ``ISDF_CHUNK_TARGET_UTILIZATION`` parser used to commit.
-
-    ``refuse=True`` is for knobs that GATE correctness rather than tune
-    performance (``LORRAX_FI_FSHOULDER_TOL``): running with the default while
-    the user believes a gate threshold is in force is itself the silent
-    failure, so garbage refuses loudly, naming the variable — the
-    announce-or-refuse doctrine's refuse half.
-    """
+    """Canonical numeric env parse: unset/blank → default, bad → ANNOUNCE (or, with ``refuse=True``, RAISE); see docs/architecture/decisions.md."""
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
         return default
@@ -159,11 +119,7 @@ ZETA_TRUNCATING_ENV_KNOBS = ("LORRAX_MAX_RCHUNKS",)
 
 
 def active_zeta_truncating_knobs() -> list[tuple[str, str]]:
-    """``[(name, raw), ...]`` for every truncating knob currently in force.
-
-    Blank counts as unset (the r-chunk loop's own guard is
-    ``if _max_rchunks and ...``, so ``""`` does not truncate).
-    """
+    """``[(name, raw), ...]`` for every truncating knob currently in force; see docs/architecture/decisions.md."""
     out = []
     for name in ZETA_TRUNCATING_ENV_KNOBS:
         raw = os.environ.get(name)
@@ -206,45 +162,7 @@ from runtime.xla_memory import (       # noqa: F401
 # ---------------------------------------------------------------------------
 
 class ComputeMode(str, enum.Enum):
-    """The single axis describing what self-energy is computed.
-
-    Orthogonal to ``qp_solver`` (how QP energies are extracted from Σ):
-    any mode can be wrapped in the ``self_consistent`` QSGW loop — the
-    loop dispatches through the mode-agnostic
-    ``sigma_dispatch.compute_sigma_xc`` (COHSEX and GN-PPM verified
-    end-to-end; see reports/gw_refactor_map_2026-07-01/
-    G0W0_SC_TOGGLE_DESIGN.md §4).
-
-    - ``X_ONLY`` — bare exchange Σ_X = -G·V (no screening, no correlation).
-    - ``COHSEX`` — static screened-exchange + Coulomb-hole.
-    - ``GN_PPM`` — dynamic Σ_c(ω) via GN plasmon-pole (probe at iω_p).
-    - ``HL_PPM`` — dynamic Σ_c(ω) via HL plasmon-pole (probe at real Ω).
-    - ``MPA`` — dynamic Σ_c(ω) from an n-pole multipole fit of W on a
-      double-parallel sample grid in the complex-ω plane (complex poles
-      Ω_p, residues B_p).  **DECLARED, NOT YET RUNNABLE** — see
-      :data:`UNIMPLEMENTED_MODES` and
-      :func:`refuse_unimplemented_compute_mode` below.
-
-    WHY THE VALUE IS SPELLED ``mpa`` AND NOT ``full_freq``.  Every value
-    on this axis names the *ansatz* for W's frequency dependence, not the
-    numerical machinery that follows from it: ``cohsex`` is "W at ω = 0",
-    ``gn_ppm`` / ``hl_ppm`` are "one plasmon pole, fitted this way".  The
-    next member of that series is "n poles, fitted to a sampled W", whose
-    name in the literature is the multipole approximation, so ``mpa`` is
-    the spelling that keeps the axis reading as one list of ansätze.
-
-    ``full_freq`` was the rejected alternative, and it was rejected for
-    two reasons rather than taste.  First, it names a *family* — contour
-    deformation, real-axis quadrature and MPA are all "full frequency" —
-    so a deck that set it would still have to say which one, which is a
-    second axis, which is precisely the thing the "single axis" wording
-    at the top of this docstring exists to prevent.  Second, it would
-    spend the good name: a genuinely numerical full-frequency Σ (no pole
-    model at all) is a plausible future member of this enum, and it
-    should be able to be called ``full_freq`` when it arrives instead of
-    finding the name already taken by a pole method.  The owner-facing
-    shorthand for this work is still "FF"; the deck key is ``mpa``.
-    """
+    """The single axis describing what self-energy is computed; see docs/architecture/decisions.md."""
 
     X_ONLY = "x_only"
     COHSEX = "cohsex"
@@ -259,27 +177,13 @@ class ComputeMode(str, enum.Enum):
 
     @property
     def is_dynamic(self) -> bool:
-        """True when the mode builds a Σ_c(ω) grid: GN/HL-PPM and MPA.
-
-        The honest reading is "this run has an ω axis", which is what the
-        consumers of this property want to know (the σ-cube layout gate,
-        ``qp_solver = fixed_point``'s ω-grid requirement, ``GWResults.
-        use_ppm``).  It is deliberately NOT the same question as "is this
-        a plasmon-pole model" — that one is :attr:`ppm_model`, and the
-        two questions differ for exactly one member, ``MPA``.
-        """
+        """True when the mode builds a Σ_c(ω) grid: GN/HL-PPM and MPA; see docs/architecture/decisions.md."""
         return self in (ComputeMode.GN_PPM, ComputeMode.HL_PPM,
                         ComputeMode.MPA)
 
     @property
     def ppm_model(self) -> str | None:
-        """``'gn'`` for GN-PPM, ``'hl'`` for HL-PPM, else None.
-
-        None for MPA as well as for the static modes: MPA is dynamic but
-        is not a plasmon-pole model, so any site that means "which of the
-        two two-point PPM fits" must ask THIS and handle None, never
-        ``is_dynamic`` with an ``else`` that assumes GN.
-        """
+        """``'gn'`` for GN-PPM, ``'hl'`` for HL-PPM, else None; see docs/architecture/decisions.md."""
         return {
             ComputeMode.GN_PPM: "gn",
             ComputeMode.HL_PPM: "hl",
@@ -287,32 +191,7 @@ class ComputeMode(str, enum.Enum):
 
 
 class BispinorGWMode(str, enum.Enum):
-    """How the four-current photon channels enter the GW self-energy.
-
-    This is orthogonal to :class:`ComputeMode`: that enum selects the
-    frequency ansatz, while this one selects which Lorentz blocks are screened
-    and contracted.  ``bare_transverse`` is the historical charge-screened +
-    bare-TT behavior and remains the default.
-
-    TWO VALUES, and that is the whole grammar (owner ruling 2026-09-01,
-    ``docs/architecture/decisions.md``; lane J's dial review,
-    ``reports/bisp_j_architecture_review_2026-09-01/report.md`` section 2).
-    The three retired spellings -- ``charge_hall_cubature`` and the two
-    carrier-comparison modes ``pauli_reference_bare_transverse`` and
-    ``isometric_kinetic_balance_bare_transverse`` -- are refused BY NAME in
-    :func:`coerce_bispinor_gw_mode`, never aliased: a mode value is the one
-    thing in the grammar that decides which physics runs, so a stale deck
-    must stop, not be silently re-pointed.
-
-    ``full_static_cohsex`` is the ONE packed static mode: the sixteen-block
-    no-pair photon body, screened once at omega=0 under ``compute_mode =
-    cohsex``, plus the Gamma-cell completion (bare ``<D>`` into V, the charge
-    ``S^{00}``/wing head into W, the Hall CT/TC term when a Hall artifact is
-    present).  The completion runs by default (owner ruling 2026-09-01,
-    ``docs/architecture/decisions.md``); ``head_correction = off`` skips it
-    behind a DEBUG banner.  The former ``charge_hall_cubature`` spelling is
-    refused by :func:`coerce_bispinor_gw_mode` naming this mode.
-    """
+    """How the four-current photon channels enter the GW self-energy; see docs/architecture/decisions.md."""
 
     BARE_TRANSVERSE = "bare_transverse"
     FULL_STATIC_COHSEX = "full_static_cohsex"
@@ -407,13 +286,7 @@ LEGACY_SIGMA_AXIS_KEYS: dict[str, str] = {
 
 def announce_legacy_sigma_axis_keys(named_keys, resolved_mode, resolved_solver,
                                     *, print_fn=print) -> tuple[str, ...]:
-    """Print one deprecation note per LEGACY self-energy-axis key the deck named.
-
-    Returns the keys announced, so a caller (or a test) can assert on them
-    rather than scraping the log.  Nothing is refused and nothing resolves
-    differently: this is the warning stage of the migration described on
-    :data:`LEGACY_SIGMA_AXIS_KEYS`.
-    """
+    """Print one deprecation note per LEGACY self-energy-axis key the deck named; see docs/architecture/decisions.md."""
     named = frozenset(str(k).strip().lower() for k in (named_keys or ()))
     hit = tuple(k for k in LEGACY_SIGMA_AXIS_KEYS if k in named)
     if not hit:
@@ -430,21 +303,7 @@ def announce_legacy_sigma_axis_keys(named_keys, resolved_mode, resolved_solver,
 
 
 class SigmaChannel(str, enum.Enum):
-    """One term of Σ that a compute mode either builds or does not.
-
-    These are the channels the driver's outputs are written FROM — the
-    names on ``sigma_dispatch.SigmaResult`` and the operands of the QP
-    ladders in ``gw_output`` — not every intermediate a kernel touches.
-
-    - ``X`` — bare exchange Σ_x = −G·V.  Built by every mode; it needs no
-      screening and every output that reports a Σ decomposition wants it.
-    - ``SX`` — static screened exchange Σ_SX = −G·W(0).
-    - ``COH`` — the Coulomb hole Σ_COH.  SX and COH are one pair in
-      practice (a mode that builds one builds the other) but they are two
-      datasets and two columns, so they are two channels here.
-    - ``C_OMEGA`` — dynamic correlation Σ_c(ω) on an ω grid, whatever
-      analytic model produced it.
-    """
+    """One term of Σ that a compute mode either builds or does not; see docs/architecture/decisions.md."""
 
     X = "x"
     SX = "sx"
@@ -453,13 +312,7 @@ class SigmaChannel(str, enum.Enum):
 
     @property
     def label(self) -> str:
-        """How the channel is spelled in prose and in operator messages.
-
-        The enum VALUE stays a lowercase identifier because it is data —
-        it keys tables and appears in tests.  Messages an operator reads
-        want the physics spelling, and having both means neither has to
-        compromise.
-        """
+        """How the channel is spelled in prose and in operator messages; see docs/architecture/decisions.md."""
         return {
             SigmaChannel.X: "Σ_X",
             SigmaChannel.SX: "Σ_SX",
@@ -503,19 +356,7 @@ MODE_SIGMA_CHANNELS: dict[ComputeMode, frozenset[SigmaChannel]] = {
 
 
 def coerce_compute_mode(mode) -> ComputeMode:
-    """Accept a :class:`ComputeMode`, its ``.value``, or a bare string.
-
-    The writers reach this table holding whatever their caller handed
-    them — a resolved enum from ``config.compute_mode`` in the driver, a
-    plain string in a deck-echo path, an object carrying ``.value`` in a
-    unit test's stand-in config.  Normalising in ONE place is what lets
-    the table be the single answer rather than the third mode-string
-    hand-check in the tree.
-
-    An unrecognised spelling raises the same ValueError shape the config
-    parser raises, naming the legal set — a typo never resolves to a
-    default.
-    """
+    """Accept a :class:`ComputeMode`, its ``.value``, or a bare string; see docs/architecture/decisions.md."""
     if isinstance(mode, ComputeMode):
         return mode
     raw = getattr(mode, "value", mode)
@@ -529,16 +370,7 @@ def coerce_compute_mode(mode) -> ComputeMode:
 
 
 class HeadCorrection(str, enum.Enum):
-    """Finite-grid treatment of the singular macroscopic ``q -> 0`` head.
-
-    ``FULL`` is the physical default: an irreducible direct response is
-    completed with its microscopic head/body wings exactly once, while an
-    already micro-reducible response (the BSE resolvent) is used as-is.
-    ``NO_LOCAL_FIELDS`` is the explicitly diagnostic epsilon-head value, and
-    ``OFF`` removes the special Gamma-cell contribution so brute-force k-grid
-    convergence can be studied.  The diagram choice remains the orthogonal
-    :class:`ScreeningDiagrams` axis.
-    """
+    """Finite-grid treatment of the singular macroscopic ``q -> 0`` head; see docs/architecture/decisions.md."""
 
     FULL = "full"
     NO_LOCAL_FIELDS = "no_local_fields"
@@ -560,90 +392,7 @@ def coerce_head_correction(value) -> HeadCorrection:
 
 
 class ScreeningDiagrams(str, enum.Enum):
-    """WHICH DIAGRAMS build the W that Σ consumes — the screening axis.
-
-    Orthogonal to :class:`ComputeMode` (which Σ *ansatz* is evaluated) and
-    to ``screening_method`` (how the χ₀ frequency integral is done).  Those
-    two say *at which frequencies* W is wanted and *how the quadrature is
-    taken*; this one says *which series* W sums.
-
-    - ``W_RPA`` — the random-phase approximation, ``W = (1 − Vχ₀)⁻¹V``.
-      The only screening LORRAX had before 2026-08-15 and the default, so
-      a deck that does not name this key is bit-identical to every deck
-      written before it.
-    - ``W_BSE`` — ladder-corrected W: ``W(ω) − v = v (ω − H)⁻¹ v`` with the
-      statically screened direct rung ``−W(0)`` in the kernel of ``H``.
-      Two-stage by construction — the RPA ``W(0)`` of the first stage IS
-      the ``W_R`` the ladder kernel consumes — which is why this value
-      changes the dataflow rather than one solver call.
-    - ``W_RPA_RESOLVENT`` — the SAME resolvent identity
-      ``W(ω) − v = v (ω − H)⁻¹ v`` evaluated with the RPA operator
-      (``H_RPA``, the ladder's own ``include_w=False`` limit: the direct
-      rung ``−W_R(0)`` is parameterized OUT of the ring matvec rather than
-      rebuilt by a second matvec — ``bse.bse_ring_comm.
-      build_bse_ring_matvec_full(..., include_W=False)`` — so this value
-      exercises the same operator family as ``w_bse``, minus one term).
-      DESIGNED to reproduce ``w_rpa``'s W to the minimax-quadrature floor,
-      and CERTIFIED to do so on the spinor fixture the existing unit
-      suite exercises (``tests/test_bse_w_ladder_identities.py``,
-      ``tests/test_w_bse_wiring_closure.py`` — ``gnppm_debug``, nspinor=2,
-      ~7e-12 agreement). **OPEN, MEASURED 2026-08-23 on a SCALAR
-      (nspinor=1) system: it does NOT.** A direct q=0 tile probe against
-      the incumbent ``W0_qmunu`` on a fresh scalar Si deck found a
-      38-61%-relative, P-independent, window-size-insensitive
-      disagreement (KNOWN_LORRAX_ISSUES.md, the
-      ``bse_w_exact._build_rpa_resolvent`` row) — high shape-correlation
-      (cos~0.999) but a non-uniform per-entry under-scaling, the
-      signature of a missing/misapplied occupation or spin-degeneracy
-      weight rather than a sign, operator, or solver-tolerance defect.
-      THIS IS UPSTREAM OF ``include_w``: the same shared ring term backs
-      ``w_bse`` too, and that feature's own first-ever scalar decks
-      (``runs/Si_scalar/01_wbse_ab_2026-08-16``) never finished far
-      enough to have compared against a reference, so the gap has been
-      latent and undetected since that feature shipped. Do not read this
-      value (or ``w_bse``) as certified-correct on a scalar mean field
-      until that row closes; it exists to gate the resolvent machinery
-      against the incumbent Dyson route on a diagram set simple enough to
-      have an independent right answer, and on THIS run it correctly
-      caught that the two disagree.
-
-    WHY AN ENUM AND NOT A BOOL.  ``ladder_screening = true`` would name the
-    one alternative that exists today and spend the axis: the resolvent
-    formalism admits more than one diagram set (TDA vs full symplectic,
-    test-charge vs test-electron), and each is a *value* on this axis, not
-    a second boolean beside it.  The same reasoning that spelled
-    ``compute_mode`` as an enum of ansätze rather than ``use_ppm_sigma``
-    (see :class:`ComputeMode`'s docstring) applies here.
-
-    NOT EVERY COMBINATION IS SUPPORTED.  ``w_bse`` is refused at parse
-    time against ``x_only``, ``hl_ppm``, the self-consistent QP solver,
-    ``mc_average_placement != off`` and a declared metal
-    (``mpa_material_class = metal``) — see
-    :func:`refuse_unsupported_screening_diagrams`, which carries the
-    reason for each.  INSULATORS ONLY is the one of those that a deck key
-    cannot always express: a metallic WFN on a deck that declares nothing
-    is refused at the stage instead, on the occupations themselves
-    (``gw.screening_bse``, the same ``w_bse_insulators_only`` id).
-    ``w_rpa_resolvent`` is refused at parse time against ``x_only``, the
-    self-consistent QP solver, ``mc_average_placement != off`` and
-    ``compute_mode = mpa`` — audited against ``w_bse``'s table, not
-    copied: the x_only / broadening / SC-loop / head-placement arguments
-    transfer (some by MECHANISM, some as an inherited infrastructure
-    risk; see ``_W_RPA_RESOLVENT_REFUSALS``' own per-row comments), and
-    ``compute_mode = mpa`` is a NEW row here — MPA's ``wc_source`` seam
-    (``gw.screening_bse.make_ladder_wc_source``) has not been extended or
-    gated for the RPA-resolvent arm this session, unlike ``w_bse``, where
-    it is SUPPORTED.  INSULATORS ONLY has NO parse-time row for this
-    value: it is subsumed by the ``compute_mode = mpa`` refusal (a
-    declared metal requires ``compute_mode = mpa``, which is refused
-    unconditionally here, making a parallel deck-key predicate always
-    shadowed — see ``_W_RPA_RESOLVENT_REFUSALS``' comment at that site).
-    The certification and its enforcement survive in full through the
-    OTHER half w_bse already has: a metallic WFN on a deck that declares
-    nothing is refused at the stage, on the occupations themselves,
-    under the SAME ``{value}_insulators_only`` id pattern
-    (``gw.screening_bse``).
-    """
+    """WHICH DIAGRAMS build the W that Σ consumes — the screening axis; see docs/architecture/decisions.md."""
 
     W_RPA = "w_rpa"
     W_BSE = "w_bse"
@@ -651,14 +400,7 @@ class ScreeningDiagrams(str, enum.Enum):
 
 
 def coerce_screening_diagrams(value) -> ScreeningDiagrams:
-    """Accept a :class:`ScreeningDiagrams`, its ``.value``, or a string.
-
-    Same shape and same reason as :func:`coerce_compute_mode`: the parser,
-    a hand-built stub config and a deck-echo path all reach the axis
-    holding different spellings of the same request, and normalising in
-    ONE place is what keeps the dispatch a single answer.  A typo raises
-    naming the legal set — it never resolves to the default.
-    """
+    """Accept a :class:`ScreeningDiagrams`, its ``.value``, or a string; see docs/architecture/decisions.md."""
     if isinstance(value, ScreeningDiagrams):
         return value
     raw = getattr(value, "value", value)
@@ -894,26 +636,7 @@ _RESOLVENT_REFUSAL_TABLES: dict[
 
 
 def refuse_unsupported_screening_diagrams(config) -> None:
-    """Refuse the resolvent-diagram combinations v1 does not serve, at PARSE time.
-
-    Called from :meth:`LorraxConfig.from_input_file` once the record
-    exists, because every predicate here reads a RESOLVED axis
-    (``compute_mode`` and ``qp_solver`` are properties that fold in the
-    legacy flags) and re-deriving them beside the parse would be a second
-    opinion about the same question -- the shadow-accounting failure
-    class, QUALITY_PATTERNS #3.
-
-    NO-OP FOR ``w_rpa``, evaluated first and returning before any property
-    is touched: a default deck must not acquire a new parse-time
-    resolution -- and hence a new possible refusal -- from this function
-    existing.  ``w_bse`` and ``w_rpa_resolvent`` each carry their OWN
-    table (:data:`_RESOLVENT_REFUSAL_TABLES`) rather than one shared list,
-    because a shared table's ``doc`` text would have to describe both
-    operators at once -- which is exactly how the hl_ppm gate's dead-gate
-    incident happened (TASTE.md, "a gate pinned to a convention re-arms
-    itself"): a reused reference that does not resolve per call site reads
-    as evidence for a case it never measured.
-    """
+    """Refuse the resolvent-diagram combinations v1 does not serve, at PARSE time; see docs/architecture/decisions.md."""
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
     table = _RESOLVENT_REFUSAL_TABLES.get(diagrams)
@@ -954,12 +677,7 @@ def mode_builds_channels(mode, *channels: SigmaChannel) -> bool:
 
 
 def explain_missing_channels(mode, *channels: SigmaChannel) -> str:
-    """The named-omission clause for channels ``mode`` does not build.
-
-    Phrased as a fragment so a writer can put it in parentheses after the
-    name of whatever it is declining to write, which is the shape the
-    QSGW appendix's line already had.
-    """
+    """The named-omission clause for channels ``mode`` does not build; see docs/architecture/decisions.md."""
     resolved = coerce_compute_mode(mode)
     built = sigma_channels_for(resolved)
     absent = [c for c in channels if c not in built]
@@ -993,15 +711,7 @@ UNIMPLEMENTED_MODES: dict[ComputeMode, str] = {}
 
 
 def refuse_unimplemented_compute_mode(mode, *, context: str = "this run"):
-    """Refuse a declared-but-not-yet-built compute mode, by name.
-
-    No-op for every mode whose Σ stage exists, so the call is free to sit
-    on the driver's fast path.  Raises :class:`NotImplementedError` —
-    distinct from the ``ValueError`` a *typo* gets from the parser,
-    because the two are different operator mistakes and deserve different
-    words: ``compute_mode = mpaa`` is "no such mode", ``compute_mode =
-    mpa`` is "that mode, not yet".
-    """
+    """Refuse a declared-but-not-yet-built compute mode, by name; see docs/architecture/decisions.md."""
     resolved = coerce_compute_mode(mode)
     reason = UNIMPLEMENTED_MODES.get(resolved)
     if reason is None:
@@ -1013,31 +723,7 @@ def refuse_unimplemented_compute_mode(mode, *, context: str = "this run"):
 
 
 class QPSolver(str, enum.Enum):
-    """How QP energies are extracted from Σ — orthogonal to ``compute_mode``.
-
-    The three states are mutually exclusive answers to the same physics
-    question, each naming a standard method:
-
-    - ``ONE_SHOT_DFT`` — one-shot full-matrix effective Hamiltonian (THE
-      DEFAULT).  Σ is built once from the DFT inputs and evaluated at
-      E_DFT; the QSGW-Hermitianised Σ_xc is diagonalised to produce
-      ``E_qp_ry`` / ``qp_wfn_rotations.h5`` / ``WFN_qp.h5``.  This is
-      distinct from the fixed-DFT-state diagonal ``eqp0.dat`` /
-      ``eqp1.dat`` outputs.  No iteration of any kind.
-    - ``FIXED_POINT`` — one-shot Σ + diagonal on-shell solve
-      E = h0 + ReΣ(E) for the QSGW-build evaluation energies
-      (eigenvalue-only; Σ is never rebuilt).  Dynamic modes only — static
-      Σ has no ω-grid to solve on.  ``sigma.sigma_at_dft_extrapolate`` is a
-      sub-knob of this state (scissor for out-of-grid bands).
-    - ``SELF_CONSISTENT`` — full QSGW loop (:mod:`gw.sc_iteration`):
-      Σ rebuilt each iteration from rotated ψ + the previous iteration's
-      E.  Loop knobs live in :class:`SCConfig` (``config.sc``).
-
-    eqp0.dat / eqp1.dat keep the same formula in all three states; only
-    the provenance of Σ changes under ``SELF_CONSISTENT`` (converged Σ,
-    still evaluated at E_DFT — one more at-DFT Newton step from the SC
-    fixed point).
-    """
+    """How QP energies are extracted from Σ — orthogonal to ``compute_mode``; see docs/architecture/decisions.md."""
 
     ONE_SHOT_DFT = "one_shot_dft"
     FIXED_POINT = "fixed_point"
@@ -1096,22 +782,7 @@ _W_DYSON_PLANS = ("local", "distributed")
 
 
 def normalize_w_dyson_solver(value) -> str:
-    """Normalise a ``w_dyson_solver`` spelling to one of the TWO plans.
-
-    Single source of the vocabulary — the parser and
-    ``w_isdf._resolve_w_solve_fn`` both call this, so a spelling cannot
-    mean different things at parse time and solve time.
-
-    - ``local`` / ``auto`` / None → ``"local"`` (the q-parallel per-q
-      dense LU; ``auto`` is a permanent back-compat alias).
-    - ``distributed`` → ``"distributed"`` (the 2-D-sharded stacked-GEMM
-      backsolve through the distrib_la plan door).
-    - ``lu`` → ``"local"`` with a DeprecationWarning (it was the same
-      route under its old name).
-    - ``lstsq`` → ``ValueError``: the SVD min-norm inner solve was
-      REMOVED in the two-plan cleanup (2026-07-27) — old decks fail
-      informatively instead of silently rerouting.
-    """
+    """Normalise a ``w_dyson_solver`` spelling to one of the TWO plans; see docs/architecture/decisions.md."""
     s = ("auto" if value is None else str(value)).strip().lower()
     if s == "lu":
         import warnings
@@ -1149,29 +820,7 @@ EIGH_CHOICES_SOURCE = "not called"
 
 
 def eigh_backend_choices() -> tuple:
-    """The legal ``eigh_backend`` spellings — the RESOLVER's own list.
-
-    Read from :data:`distrib_la.BACKEND_CHOICES` so the parser and the
-    thing that actually dispatches cannot drift.  They HAD drifted:
-    this parser accepted only ``auto|off|cusolvermp|slate`` while the
-    resolver had grown ``distributed`` (the portable "spread ONE tile over
-    the mesh" spelling, and the ONLY eigh backend that exists on a host
-    mesh, where it means ScaLAPACK ``pzheevd``) and ``scalapack``.  The
-    effect was that the low-memory eigh could not be requested at all
-    through a GW input file on CPU — the very platform it is needed on.
-
-    ``BACKEND_CHOICES`` is importable with NO ``.so`` on the machine — that
-    is a distrib_la door promise, precisely so a deck parser never needs
-    the FFI layer.  The literal fallback below covers the remaining case,
-    a tree whose ``services/`` is not on the path at all; it is pinned
-    equal to the door's list by ``tests/test_bse_setup_qchunk.py``.
-
-    :data:`EIGH_CHOICES_SOURCE` records WHICH of the two answered, because
-    a test comparing the two lists cannot: they are equal today, so the
-    comparison passes whether the live import ran or the except branch
-    caught it, and the drift this function exists to prevent would recur
-    with no signal at all.
-    """
+    """The legal ``eigh_backend`` spellings — the RESOLVER's own list; see docs/architecture/decisions.md."""
     global EIGH_CHOICES_SOURCE
     try:
         from ffi import _services
@@ -1226,12 +875,7 @@ _LINALG_RESOLUTION = "_linalg_resolution"
 
 
 def resolve_linalg(params) -> LinalgResolution:
-    """Interpret ``linalg = local | distributed`` exactly once.
-
-    ``distributed_lu='distributed'`` is an internal portable sentinel.  The
-    typed-config factory lowers it to cuSolverMp on CUDA and ScaLAPACK on CPU;
-    that is capability routing, not another interpretation of the deck dial.
-    """
+    """Interpret ``linalg = local | distributed`` exactly once; see docs/architecture/decisions.md."""
     raw = params.get("linalg", "local") if hasattr(params, "get") else "local"
     layout = str("local" if raw is None else raw).strip().lower()
     if layout not in ("local", "distributed"):
@@ -1281,15 +925,7 @@ def linalg_resolution(params) -> LinalgResolution:
 
 
 def distrib_la_batched_route_choices() -> tuple[str, ...]:
-    """User-facing batch-route vocabulary from the ``distrib_la`` door.
-
-    ``batch_reshard`` is the shipping default: it moves the batch axis onto
-    the device mesh and runs the service's local JAX kernel on whole
-    per-device matrices. ``auto`` explicitly restores the resolved
-    backend's scan/stacked-FFI route. Keep
-    this resolver beside :func:`eigh_backend_choices`: deck and CLI parsers
-    must not grow frozen copies of a service-owned vocabulary.
-    """
+    """User-facing batch-route vocabulary from the ``distrib_la`` door; see docs/architecture/decisions.md."""
     try:
         from ffi import _services
         _services.ensure_on_path()
@@ -1891,18 +1527,10 @@ _DEFAULTS = {
     # The automatic band chunk request is ``AUTOMATIC_BAND_CHUNK_SIZE``;
     # the planner mesh-rounds and caps it at the logical zeta window.
     "r_chunk_size": 0,
-    # Two-face 2-D-sharded ψ carrier (gw.wavefunction_bundle
-    # layout="face") in place of the legacy four single-axis copies:
-    # 2*S/(Px*Py) per-rank psi residency instead of 2*S/Px + 2*S/Py.
-    # Default false = layout="legacy", the exact existing construction
-    # path, bit-identical.  NOT an env var (decisions.md: physics- and
-    # routing-relevant choices are declared inputs, not environment).
-    # Narrow envelope while G/Sigma/head/rotation/exact-response
-    # consumers are ported one at a time (see
-    # reports/gwjax_low_mem_bands_audit_2026-08-22/report.md §6); an
-    # unsupported combination refuses by name rather than silently
-    # falling back to legacy.
-    "low_mem_bands": False,
+    # One raw-parent carrier: face (default) shards bands and centroids,
+    # 2*S/(Px*Py) per rank; axis keeps full bands, S/Px + S/Py.
+    # Both layouts share the Green, screening and self-energy algorithms.
+    "low_mem_bands": True,
     # ISDF
     # Which of the TWO W Dyson plans solves A·W = V, A = (1 - Vχ₀):
     #   local (default; auto is an alias)
@@ -2437,43 +2065,12 @@ _BAND_COUNTS = "_band_counts"
 # ---------------------------------------------------------------------------
 
 class BandCountConflict(ValueError):
-    """Two band-count keys were set and they disagree.
-
-    Refusal, not coercion.  Every silent resolution of this case is wrong for
-    somebody: picking the umbrella throws away the specific request the deck
-    took the trouble to write, picking the specific makes the umbrella a lie
-    for the OTHER consumer, and picking the max or the min invents a run
-    nobody asked for.  So it is named, with both values quoted and the edit
-    that fixes it spelled out.
-    """
+    """Two band-count keys were set and they disagree; see docs/architecture/decisions.md."""
 
 
 @dataclass(frozen=True)
 class BandCounts:
-    """The resolved χ and Σ band counts, and what the ISDF fit is sized by.
-
-    Constructed exactly once per run, by :func:`resolve_band_counts`.  The
-    only three numbers below this point are :attr:`chi`, :attr:`sigma` and
-    :attr:`isdf`; nothing downstream re-reads a deck key to get a band count.
-
-    Attributes
-    ----------
-    chi, sigma : int
-        The χ0/W band count and the Σ band-sum count, both fully resolved
-        (never ``None``): a deck that names only the umbrella gets them equal
-        to it, which is the whole of the bit-identity claim.
-    isdf : int
-        ``max(chi, sigma)`` — the top of the band window the ψ is loaded over
-        and therefore the window the ISDF ζ fit is built for.  The
-        interpolation basis has to span the pair densities of whichever
-        consumer reaches higher; sizing it by the smaller one would leave the
-        larger consumer extrapolating in the ζ basis.
-    named : frozenset[str]
-        Which of the four keys the DECK itself wrote.  Kept so consumers can
-        distinguish "asked for this edge by name" (→ strict degeneracy check,
-        the ``zeta_nband`` precedent) from "inherited it" (→ the grandfather
-        clause), without re-parsing the deck.
-    """
+    """The resolved χ and Σ band counts, and what the ISDF fit is sized by; see docs/architecture/decisions.md."""
 
     chi: int
     sigma: int
@@ -2499,27 +2096,7 @@ class BandCounts:
         return self.chi != self.sigma
 
     def describe(self, zeta_fit_edge: int | None = None) -> str:
-        """The one line a run logs so the ``max`` is never silent.
-
-        Named in the brief that asked for the split: "log which count won the
-        ``max`` and what the fit was built for.  A silent ``max`` is the kind
-        of thing that gets mis-debugged for a day."
-
-        ``zeta_fit_edge`` IS THE RESOLVED EDGE, NOT THE DECK KEY.  Pass
-        ``gw.gw_init.resolve_zeta_fit_edge(band_slices, config.zeta_nband)``
-        — the same value the fit, the window gates and the memory planner
-        act on.  ``None`` means "nothing narrows it", i.e. the fit really is
-        sized by :attr:`isdf`.
-
-        A BANNER PRINTS RESOLVED VALUES ONLY.  With ``nband=700`` and
-        ``zeta_nband=160`` this line used to say "ISDF zeta fit sized for 700
-        bands ... the fit spans both" while the resolver and the memory
-        planner were both acting on 160 (the CrI3 rank floor fell 180 -> 84
-        on that key).  A startup-only run was then left with a materially
-        false provenance line and no way to tell.  Perlmutter smoke step
-        57236676.2,
-        ``runs/CrI3/00_fm_331_991_700b_qsgw_gnppm_20260818/00_lorrax_smoke_p4/``.
-        """
+        """The one line a run logs so the ``max`` is never silent; see docs/architecture/decisions.md."""
         if zeta_fit_edge is not None and int(zeta_fit_edge) != int(self.isdf):
             fit = (f"ISDF zeta fit sized for {int(zeta_fit_edge)} bands, "
                    f"NARROWED from {self.isdf} by deck key zeta_nband")
@@ -2542,44 +2119,7 @@ _SPECIFIC_KEYS = {"number_bands_chi": "chi", "number_bands_sigma": "sigma"}
 
 
 def resolve_band_counts(params: dict, deck_named=None) -> BandCounts:
-    """Resolve the four band-count keys into one :class:`BandCounts`.
-
-    **THE ONLY PLACE THIS PRECEDENCE EXISTS.**  Four keys with two spellings
-    of the umbrella is exactly the shape that grows a second, disagreeing
-    resolution in a consumer six weeks later, so there is one function, it is
-    pure, and it is directly testable without a deck, a WFN or jax.
-
-    PRECEDENCE, in order:
-
-    1. ``nband`` is a TRANSITIONAL ALIAS of ``number_bands``.  Either
-       spelling sets the umbrella.  Both set to DIFFERENT values → refuse
-       (:class:`BandCountConflict`).
-    2. The umbrella supplies BOTH consumers.  A deck that names only it —
-       every deck in the tree today — gets ``chi == sigma == umbrella``, and
-       that is the bit-identity claim.
-    3. ``number_bands_chi`` / ``number_bands_sigma`` override their own
-       consumer and nothing else.
-    4. Naming the umbrella AND a specific key with DIFFERENT values → refuse.
-       "The umbrella overrides both" and "a specific key overrides its
-       consumer" are both true and they contradict each other exactly here;
-       this codebase has been bitten repeatedly by silent coercion, so the
-       contradiction is reported rather than broken by fiat.  Naming them
-       with the SAME value is redundant, not wrong, and is accepted.
-
-    Parameters
-    ----------
-    params : dict
-        A params dict from :func:`read_lorrax_input`, or any dict with the
-        same keys.  Missing keys fall back to ``_DEFAULTS``.
-    deck_named : iterable of str, optional
-        The keys the deck itself wrote.  Defaults to
-        ``params[_DECK_NAMED_KEYS]`` and then to "every key whose value is
-        not None", so a hand-made dict behaves sensibly.  This is what
-        separates "set to 100" from "defaulted to 100": without it a deck
-        that pinned ``number_bands = 100`` beside ``number_bands_chi = 248``
-        would be indistinguishable from one that pinned neither, and rule 4
-        could not fire.
-    """
+    """Resolve the four band-count keys into one :class:`BandCounts`; see docs/architecture/decisions.md."""
     if deck_named is None:
         deck_named = params.get(_DECK_NAMED_KEYS)
     if deck_named is None:
@@ -2667,33 +2207,7 @@ _BAND_EXTRAP_KEYS = ("use_band_extrapolation", "sigma_band_extrapolation")
 
 
 def resolve_band_extrapolation(use_val, alias_val, *, print_fn=None) -> tuple:
-    """Resolve the two spellings into ``(enabled, explicit)``.
-
-    ``use_band_extrapolation`` is the key; ``sigma_band_extrapolation`` is a
-    TRANSITIONAL alias kept so committed decks and fixtures do not break.
-    Both arrive tri-state: ``None`` means the deck did not name that spelling.
-
-    Returns
-    -------
-    enabled : bool
-        Whether the feature is on.
-    explicit : bool
-        Whether a deck NAMED either spelling.  This is not decoration -- it
-        selects between two different behaviours on a non-PPM ``compute_mode``
-        (``gw.sigma_dispatch``): a defaulted-on key AUTO-DISABLES with a
-        recorded note so that staged / static runs stay usable, while an
-        explicitly-named one REFUSES.  Silently ignoring a knob the operator
-        wrote down is how a green A/B comes to measure nothing.
-
-    Raises
-    ------
-    ValueError
-        When both spellings are named and they DISAGREE.  Refusing by name
-        rather than picking a winner: whichever precedence we chose, half the
-        decks that hit it would silently get the other one, and the operator
-        would have no signal.  Same migration shape as ``nband`` ->
-        ``number_bands``.
-    """
+    """Resolve the two spellings into ``(enabled, explicit)``; see docs/architecture/decisions.md."""
     named = {k: v for k, v in zip(_BAND_EXTRAP_KEYS, (use_val, alias_val))
              if v is not None}
     if len(named) == 2 and bool(use_val) != bool(alias_val):
@@ -2721,53 +2235,7 @@ def resolve_band_extrapolation(use_val, alias_val, *, print_fn=None) -> tuple:
 
 
 def sigma_stage_modes(config, fallback=None) -> tuple:
-    """Every :class:`ComputeMode` this RUN will dispatch a Σ under, in order.
-
-    **THIS FUNCTION EXISTS BECAUSE A PREVIOUS ANALYSIS WAS WRONG, and the
-    correction is worth stating rather than silently applying.**  The
-    2026-08-16 SC-wiring branch concluded from a ``git log --all`` /
-    ``git grep --all`` search that ``sc_stage_N_type`` "does not exist on any
-    branch", and mapped per-stage behaviour onto ``compute_mode`` as the only
-    available proxy.  The search was run in a single-branch checkout, where
-    ``--all`` covers only FETCHED refs, so the null was a statement about that
-    checkout's remotes.  The keys are real: ``origin/feat/staged-sc-2026-08-15``
-    (98289d77) carries ``SC_STAGE_TYPES`` (``none | cohsex | gnppm | mpa``),
-    ``SCStage(mode, cutoff_ev, max_iter)``, ``default_sc_ladder`` and
-    ``resolve_sc_stages`` in this file, plus ``SCConfig.stages`` and
-    ``run_staged_self_consistency`` in ``gw.sc_iteration``.
-
-    WHAT THE REAL INTERFACE CHANGES, AND WHAT IT DOES NOT.
-
-    * It does NOT invalidate the ``compute_mode`` seam.  Read against the real
-      branch, ``run_staged_self_consistency`` rebuilds each stage's inputs with
-      ``dataclasses.replace(config, compute_mode_raw=stage.mode.value)`` and
-      passes ``stage.mode`` into ``compute_sigma_xc``, so during a stage the
-      dispatched ``mode`` **is** that stage's mode.  A per-stage guard written
-      against ``compute_mode`` therefore fires per stage already.  That part of
-      the SC branch was accidentally right.
-    * It DOES invalidate the REFUSAL.  A refusal is a statement about the whole
-      RUN, and under a ladder the stage in front of you is not the run.  With
-      the guard written per-stage, an explicitly-named key would kill:
-      ``sc_stage_1_type = cohsex, sc_stage_2_type = gnppm`` at stage 1 (before
-      reaching the very stage that consumes the key), and the SHIPPED DEFAULT
-      LADDER for ``compute_mode = mpa`` — ``(GN_PPM @5 meV, MPA @2 meV)`` — at
-      stage 2, after paying for a full GN-PPM stage.  Both are runs that must
-      work.  Hence this function, and hence the refusal below is asked about
-      the LADDER rather than about one stage.
-
-    Parameters
-    ----------
-    config
-        A :class:`LorraxConfig`, or anything shaped like one.  Read entirely
-        through ``getattr`` so it is correct **before** the staged-SC branch
-        merges (no ``config.sc.stages`` → the deck's single ``compute_mode``)
-        and **after** it merges (the resolved ladder), with no edit here.
-    fallback
-        Mode to report when the config exposes neither a ladder nor a
-        ``compute_mode`` — a hand-made namespace in a unit test, or a config
-        whose ``compute_mode`` property refuses.  Callers pass the mode they
-        are currently dispatching, which is the only honest answer available.
-    """
+    """Every :class:`ComputeMode` this RUN will dispatch a Σ under, in order; see docs/architecture/decisions.md."""
     stages = getattr(getattr(config, "sc", None), "stages", None) or ()
     modes = []
     for stage in stages:
@@ -2797,13 +2265,7 @@ def sigma_stage_modes(config, fallback=None) -> tuple:
 
 
 def band_extrapolation_is_consumable(modes) -> bool:
-    """Does ANY stage of this run reach the kernel that reads the key?
-
-    ``ppm_model is not None`` is the exact predicate: the extrapolation is
-    wired into the two-point GN/HL plasmon-pole Σ_c kernel and nothing else.
-    Deliberately NOT ``is_dynamic`` — that is True for MPA, which is dynamic
-    and still does not consume this key.
-    """
+    """Does ANY stage of this run reach the kernel that reads the key?; see docs/architecture/decisions.md."""
     return any(getattr(m, "ppm_model", None) is not None for m in modes)
 
 
@@ -2812,11 +2274,7 @@ def band_extrapolation_is_consumable(modes) -> bool:
 # ---------------------------------------------------------------------------
 
 def _deck_key_line(lines, start, end, key) -> str:
-    """Locate ``key`` in the ``[cohsex]`` section; return ``"line N"``.
-
-    Returns ``"line ?"`` when the key cannot be found on a line of its own
-    (it can still have been parsed — configparser accepts continuations).
-    """
+    """Locate ``key`` in the ``[cohsex]`` section; return ``"line N"``; see docs/architecture/decisions.md."""
     lineno = next(
         (i + 1 for i in range(start, end)
          if re.match(rf"\s*{re.escape(key)}\s*[=:]", lines[i], re.IGNORECASE)),
@@ -2825,13 +2283,7 @@ def _deck_key_line(lines, start, end, key) -> str:
 
 
 def _print_deck_report(msg: str) -> None:
-    """Print one deck-hygiene report on rank 0.
-
-    ``process_rank`` is jax-free-safe (lazy jax import inside, falls back
-    to 0 when jax is absent or uninitialised) — a downhill L1→L3 import,
-    function-scoped so this parser stays importable without the common
-    package fully initialised.
-    """
+    """Print one deck-hygiene report on rank 0; see docs/architecture/decisions.md."""
     try:
         from common.collectives import process_rank
         rank = process_rank()
@@ -2841,16 +2293,564 @@ def _print_deck_report(msg: str) -> None:
         print(msg)
 
 
-def read_lorrax_input(filename: str) -> dict:
-    """Parse a LORRAX input file ([cohsex] section) into a params dict.
+def _input_key_type(key, default):
+    """Produce the existing INI conversion type for one declared key."""
+    if key in _NULLABLE_BOOL:
+        return bool
+    if key in _NULLABLE_INT:
+        return int
+    if key in _NULLABLE_STR:
+        return str
+    if isinstance(default, bool):
+        return bool
+    if isinstance(default, int):
+        return int
+    if default is None or isinstance(default, float):
+        return float
+    return str
 
-    Handles the QE-style K_POINTS block and strips it before INI parsing.
-    All keys use ``_DEFAULTS`` for fallback values — no duplicate definitions.
-    """
-    with open(filename, 'r') as f:
-        lines = f.readlines()
 
-    # Locate [cohsex] section
+def _normalize_input_string(value):
+    """Produce the existing lowercase spelling for a normalized string key."""
+    return value.strip().lower() if isinstance(value, str) else value
+
+
+_INPUT_KEY_SCHEMA = tuple(
+    (key, _input_key_type(key, default), default,
+     _normalize_input_string if key in _NORMALIZE_STR else None)
+    for key, default in _DEFAULTS.items())
+
+
+def _parse_input_keys(section):
+    """Produce all declared typed key values and the set explicitly named by the deck."""
+    params, named = {}, set()
+    for key, kind, default, validator in _INPUT_KEY_SCHEMA:
+        raw = section.get(key, fallback=None)
+        if raw is None:
+            value = default
+        else:
+            named.add(key)
+            if kind is bool:
+                value = section.getboolean(key)
+            elif kind is int:
+                value = section.getint(key)
+            elif kind is float:
+                value = section.getfloat(key)
+            else:
+                value = str(raw)
+        params[key] = validator(value) if validator is not None else value
+    params[_DECK_NAMED_KEYS] = frozenset(named)
+    return params
+
+
+def _resolve_input_memory(
+        params, print_fn, resolve_hardware):
+    """Produce the runtime memory budget and chunk utilization."""
+    memory_per_device_gb = float(params.get("memory_per_device_gb", 0.0))
+    if memory_per_device_gb <= 0 and resolve_hardware:
+        from common.gpu_utils import get_device_memory_gb
+        memory_per_device_gb = get_device_memory_gb()
+        print_fn(
+            f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device"
+        )
+    chunk_utilization = env_float("ISDF_CHUNK_TARGET_UTILIZATION", 0.0,
+                                  print_fn=print_fn)
+    if chunk_utilization > 0:
+        chunk_utilization = max(0.85, min(1.0, chunk_utilization))
+    return (memory_per_device_gb, chunk_utilization)
+
+
+def _resolve_input_metal_policy(
+        params, print_fn):
+    """Produce the metallic q0 policy and explicit-key provenance."""
+    _bgw_q0_mode = _normalize_bgw_metal_q0_treatment(
+        params["bgw_metal_q0_treatment"])
+    _bgw_q0_vector = _parse_bgw_metal_q0_vector(
+        params["bgw_metal_q0_vector"])
+    if _bgw_q0_mode == "bgw_q0shift" and int(params["sys_dim"]) != 3:
+        raise ValueError(
+            "bgw_metal_q0_treatment = bgw_q0shift is defined only for "
+            "3-D metals (sys_dim = 3); this deck sets "
+            f"sys_dim = {int(params['sys_dim'])}.")
+    _named_keys = frozenset(params.get(_DECK_NAMED_KEYS, ()))
+    _effective_named_keys = set(_named_keys)
+    if "mpa_sigma_sector_target_error" in _named_keys:
+        raise ValueError(
+            "mpa_sigma_sector_target_error is retired: MPA Sigma now "
+            "uses one uniform denominator-box rule per product window "
+            "and has no measured-sector error apportionment. Remove the "
+            "key and use sigma_quadrature_eps (default 1e-4).")
+    if "mpa_sigma_max_nodes" in _named_keys:
+        raise ValueError(
+            "mpa_sigma_max_nodes is retired (2026-09-02): the pair "
+            "ceiling is eliminated and the box plan never refuses on "
+            "count. Remove the key; sigma_quadrature_eps is the only "
+            "accuracy dial.")
+    if "sigma_regularization_floor_ev" in _named_keys:
+        raise ValueError(
+            "sigma_regularization_floor_ev is retired (2026-09-02): "
+            "sigma_regularization_ev is the broadening every ansatz "
+            "runs at and nothing raises it. Remove the key.")
+    if _bgw_q0_mode == "exact":
+        _effective_named_keys.discard("bgw_metal_q0_treatment")
+        if _bgw_q0_vector == _parse_bgw_metal_q0_vector(
+                _DEFAULTS["bgw_metal_q0_vector"]):
+            _effective_named_keys.discard("bgw_metal_q0_vector")
+    _mc_average_vcoul_body = bool(params["mc_average_vcoul_body"])
+    if _bgw_q0_mode == "bgw_q0shift":
+        if ("mc_average_vcoul_body" in _named_keys
+                and _mc_average_vcoul_body):
+            raise ValueError(
+                "contradictory deck settings: "
+                "bgw_metal_q0_treatment = bgw_q0shift requires "
+                "mc_average_vcoul_body = false, but the deck explicitly "
+                "sets mc_average_vcoul_body = true. Remove that key or "
+                "set it to false.")
+        _mc_origin = (
+            "explicit compatible mc_average_vcoul_body=false"
+            if "mc_average_vcoul_body" in _named_keys
+            else "inherited mc_average_vcoul_body=true")
+        print_fn(
+            "  [config provenance] bgw_metal_q0_treatment="
+            "bgw_q0shift: overriding mc_average_vcoul_body -> false "
+            f"({_mc_origin}); q0 reduced vector="
+            f"{_bgw_q0_vector}. Analytic-sphere v-head and finite-q0 "
+            "W head/wings are enabled; eta/broadening and MPA "
+            "quadrature are unchanged.")
+        _mc_average_vcoul_body = False
+    return (_bgw_q0_mode, _bgw_q0_vector, _named_keys, _effective_named_keys, _mc_average_vcoul_body)
+
+
+def _input_paths(
+        params):
+    """Produce the resolved file-path group."""
+    cents_curr = params["centroids_file_current"]
+    cents_curr_resolved = str(cents_curr) if cents_curr else None
+    paths = FilePaths(
+        wfn_file=str(params["wfn_file"]),
+        centroids_file=str(params["centroids_file"]),
+        centroids_file_current=cents_curr_resolved,
+        kin_ion_file=str(params["kin_ion_file"]),
+        parallel_transport_file=str(params["parallel_transport_file"]),
+        static_gauge_hall_file=str(params["static_gauge_hall_file"]),
+        sigma_diag_file=str(params["sigma_diag_file"]),
+        eqp0_file=str(params["eqp0_file"]),
+        eqp1_file=str(params["eqp1_file"]),
+        eqp2_file=str(params["eqp2_file"]),
+        report_file=str(params["report_file"]),
+        sigma_omega_h5_file=str(params["sigma_omega_h5_file"]),
+    )
+    return (paths)
+
+
+def _input_head(
+        _bgw_q0_mode, _bgw_q0_vector, _mc_average_vcoul_body, _named_keys, params, print_fn):
+    """Produce the Gamma-head policy and its legacy boolean mirror."""
+    _head_correction = coerce_head_correction(params["head_correction"])
+    _legacy_do_g0 = bool(params["do_G0"])
+    if "do_G0" in _named_keys:
+        legacy_policy = (
+            HeadCorrection.FULL if _legacy_do_g0
+            else HeadCorrection.OFF)
+        if ("head_correction" in _named_keys
+                and ((_head_correction is HeadCorrection.OFF)
+                     != (legacy_policy is HeadCorrection.OFF))):
+            raise ValueError(
+                "contradictory deck settings: legacy do_G0 and "
+                "head_correction request opposite Gamma-head policies. "
+                "Remove do_G0 and use head_correction = full | "
+                "no_local_fields | off.")
+        if "head_correction" not in _named_keys:
+            _head_correction = legacy_policy
+            print_fn(
+                "  [config provenance] legacy do_G0 explicitly set: "
+                f"mapping it to head_correction = "
+                f"{_head_correction.value}. Prefer the named policy in "
+                "new decks.")
+    _resolved_do_g0 = _head_correction is not HeadCorrection.OFF
+    head = HeadConfig(
+        correction=_head_correction,
+        wcoul0_source=str(params["wcoul0_source"]).strip().lower(),
+        wcoul0_eta=float(params["wcoul0_eta"] or 0.0),
+        vhead=params["vhead"],
+        whead_0freq=params["whead_0freq"],
+        whead_imfreq=params["whead_imfreq"],
+        mc_average_vcoul_body=_mc_average_vcoul_body,
+        bgw_metal_q0_treatment=_bgw_q0_mode,
+        bgw_metal_q0_vector=_bgw_q0_vector,
+        mc_average_placement=_normalize_placement(
+            params["mc_average_placement"]),
+        mc_average_placement_vcoul=(
+            str(params["mc_average_placement_vcoul"] or "") or None),
+        head_minibz_average=bool(params["head_minibz_average"]),
+        bispinor_tt_head_correction=False,
+        w_av_first_neighbors=bool(params["w_av_first_neighbors"]),
+        w_av_second_neighbors=bool(params["w_av_second_neighbors"]),
+        bare_coulomb_cutoff=params["bare_coulomb_cutoff"],
+        zeta_cutoff=params["zeta_cutoff"],
+        use_bgw_vcoul=bool(params["use_bgw_vcoul"]),
+        bgw_vcoul_file=(str(params["bgw_vcoul_file"]) or None),
+        bgw_vcoul_sym_wfn=(str(params["bgw_vcoul_sym_wfn"]) or None),
+    )
+    return (head, _resolved_do_g0)
+
+
+def _input_response(
+        _named_keys, params):
+    """Produce the screening, pole, Sigma and occupation settings."""
+    screening = ScreeningConfig(
+        method=str(params["screening_method"]).strip().lower(),
+        occ_broadening_ev=float(params["occ_broadening"]),
+        minimax_target_error=float(params["minimax_target_error"]),
+        minimax_max_nodes=int(params["minimax_max_nodes"]),
+        regenerate_minimax_tables=bool(params["regenerate_minimax_tables"]),
+        minimax_energy_reference=str(params["minimax_energy_reference"]).strip().lower(),
+        diagrams=coerce_screening_diagrams(params["screening_diagrams"]),
+        ladder_probe_chunk=int(params["ladder_probe_chunk"]),
+    )
+    ppm = PPMConfig(
+        model=str(params["ppm_model"]).strip().lower(),
+        omega_p=float(params["ppm_omega_p"]),
+        fallback_omega=float(params["ppm_fallback_omega"]),
+        head_omega_h_ry=(
+            float(params["ppm_head_omega_h_ry"])
+            if params["ppm_head_omega_h_ry"] is not None else None),
+        probe_chi_reuse=str(params["ppm_probe_chi_reuse"]).strip().lower(),
+        invalid_mode=str(params["ppm_invalid_mode"] or "static_limit").strip().lower(),
+    )
+    mpa = MPAConfig(
+        n_poles=int(params["mpa_n_poles"]),
+        sampling_alpha=(
+            int(params["mpa_sampling_alpha"])
+            if params["mpa_sampling_alpha"] is not None else None),
+        sampling_alpha_provenance=(
+            "deck" if "mpa_sampling_alpha" in _named_keys
+            else "unresolved"),
+        sampling_schedule=str(
+            params["mpa_sampling_schedule"]).strip().lower(),
+        pole_solver=str(params["mpa_pole_solver"]).strip().lower(),
+        varpi_near_ry=float(params["mpa_varpi_near_ry"]),
+        varpi_far_ry=float(params["mpa_varpi_far_ry"]),
+        metal_origin_shift_ry=(
+            float(params["mpa_metal_origin_shift_ry"])
+            if params["mpa_metal_origin_shift_ry"] is not None else None),
+        pole_batch_size=int(params["mpa_pole_batch_size"]),
+        overwrite_completed_artifacts=bool(
+            params["mpa_overwrite_completed_artifacts"]),
+        occupation_window_threshold=float(
+            params["occupation_window_threshold"]),
+        fit_reuse_file=(str(params["mpa_fit_reuse_file"]) or None),
+    )
+    sigma = DynamicSigmaConfig(
+        omega_min_ev=float(params["sigma_omega_min_ev"]),
+        omega_max_ev=float(params["sigma_omega_max_ev"]),
+        omega_step_ev=float(params["sigma_omega_step_ev"]),
+        regularization_ev=float(params["sigma_regularization_ev"]),
+        window_edge_factor=float(params["sigma_window_edge_factor"]),
+        fermi_reference=str(params["fermi_reference"]).strip().lower(),
+        quadrature_eps=float(params["sigma_quadrature_eps"]),
+        quadrature_reduction_seconds=float(
+            params["sigma_quadrature_reduction_seconds"]),
+        quadrature_reduction_steps=(
+            None if params["sigma_quadrature_reduction_steps"] is None
+            else int(params["sigma_quadrature_reduction_steps"])),
+        quadrature_cache_dir=str(
+            params["sigma_quadrature_cache_dir"]).strip(),
+        sigma_at_dft_extrapolate=bool(params["sigma_at_dft_extrapolate"]),
+        sigma_at_dft_energies=bool(params["sigma_at_dft_energies"]),
+        omega_patches_ev=str(params["sigma_omega_patches_ev"]).strip(),
+        band_extrapolation_estimator=str(
+            params["band_extrapolation_estimator"]
+            or BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT).strip().lower(),
+        band_extrapolation_bracket_scheme=str(
+            params["band_extrapolation_bracket_scheme"]
+            or BRACKET_SCHEME_DEFAULT).strip().lower(),
+        band_extrapolation_bracket_scheme_explicit=(
+            "band_extrapolation_bracket_scheme" in _named_keys),
+        **dict(zip(
+            ("band_extrapolation", "band_extrapolation_explicit"),
+            resolve_band_extrapolation(
+                params["use_band_extrapolation"],
+                params["sigma_band_extrapolation"],
+                print_fn=_print_deck_report))),
+    )
+    _patches = sigma.parsed_omega_patches_ev()
+    if _patches:
+        sigma = _dc_replace(
+            sigma, omega_min_ev=float(_patches[0][0]),
+            omega_max_ev=float(_patches[-1][1]))
+    _occ_family = params["occ_smearing_family"]
+    _occ_family = (
+        str(_occ_family).strip().lower()
+        if _occ_family is not None else None)
+    _occ_width = params["occ_smearing_width_ry"]
+    _occ_width = float(_occ_width) if _occ_width is not None else None
+    _validate_occupation_smearing(screening, _occ_family, _occ_width)
+    return (screening, ppm, mpa, sigma, _occ_family, _occ_width)
+
+
+def _input_iteration(
+        _linalg, params, print_fn):
+    """Produce self-consistency and EQP2 settings with their environment precedence."""
+    def _sc_env(env_key: str, cast, file_val, input_key: str):
+        raw_env = os.environ.get(env_key)
+        if raw_env is None or raw_env == "":
+            return file_val
+        val = cast(raw_env)
+        print_fn(
+            f"  [config] {env_key}={raw_env} (deprecated env override; "
+            f"set '{input_key} = {raw_env}' in cohsex.in instead)")
+        return val
+    sc = SCConfig(
+        max_iter=_sc_env(
+            "LORRAX_SC_MAX_ITER", int, int(params["sc_max_iter"]),
+            "sc_max_iter"),
+        tol_ev=_sc_env(
+            "LORRAX_SC_TOL_EV", float, float(params["sc_tol_ev"]),
+            "sc_tol_ev"),
+        accelerator=_sc_env(
+            "LORRAX_SC_ACCEL", lambda s: str(s).strip().lower(),
+            str(params["sc_accelerator"]).strip().lower(), "sc_accelerator"),
+        history_depth=_sc_env(
+            "LORRAX_SC_DEPTH", int, int(params["sc_history_depth"]),
+            "sc_history_depth"),
+        mixing=_sc_env(
+            "LORRAX_SC_MIXING", float, float(params["sc_mixing"]),
+            "sc_mixing"),
+        dump_dir=_sc_env(
+            "LORRAX_SC_DUMP_DIR", str, str(params["sc_dump_dir"] or ""),
+            "sc_dump_dir") or None,
+        exact_degeneracy_tol_ev=float(
+            params["sc_exact_degeneracy_tol_ev"]),
+        tail_fit=str(params["sc_tail_fit"]).strip().lower(),
+        buffer_nbands=int(params["sc_buffer_nbands"]),
+        buffer_mode=str(params["sc_buffer_mode"]).strip().lower(),
+        eigh=_linalg.sc_eigh,
+        head_update=str(params["sc_head_update"]).strip().lower(),
+    )
+    eqp2 = EQP2Config(
+        enabled=bool(params["write_eqp2"]),
+        tol_ev=float(params["eqp2_tol_ev"]),
+        max_iter=int(params["eqp2_max_iter"]),
+        accelerator=str(params["eqp2_accelerator"]).strip().lower(),
+        history_depth=int(params["eqp2_history_depth"]),
+    )
+    return (sc, eqp2)
+
+
+def _input_memory_group(
+        _named_keys, chunk_utilization, memory_per_device_gb, params, print_fn):
+    """Resolve the requested parent layout and memory settings."""
+    memory = MemoryConfig(
+        per_device_gb=memory_per_device_gb,
+        chunk_target_utilization=chunk_utilization,
+        band_chunk_size=AUTOMATIC_BAND_CHUNK_SIZE,
+        r_chunk_override=int(params["r_chunk_size"]),
+        gflat_chunk_size=int(params["gflat_chunk_size"]),
+        vq_g_chunk_size=int(params["vq_g_chunk_size"]),
+        low_mem_bands=bool(params["low_mem_bands"]),
+        low_mem_bands_provenance=(
+            "deck" if "low_mem_bands" in _named_keys else "default"),
+    )
+    return (memory)
+
+
+def _input_backend(
+        _linalg, params, runtime_platform):
+    """Produce the resolved factorization and contraction backends."""
+    _transverse_zeta_rcond = float(params["transverse_zeta_rcond"])
+    if not (0.0 < _transverse_zeta_rcond < 1.0):
+        raise ValueError(
+            f"transverse_zeta_rcond={_transverse_zeta_rcond!r} must be "
+            f"a relative cutoff in (0, 1).")
+    if runtime_platform is not None:
+        platform = str(runtime_platform).strip().lower()
+        if platform not in ("cpu", "gpu", "cuda"):
+            raise ValueError(
+                "runtime_platform must be cpu or gpu/cuda, got "
+                f"{runtime_platform!r}")
+        _is_cpu_backend = platform == "cpu"
+    else:
+        try:
+            import jax as _jax
+            _is_cpu_backend = _jax.default_backend() == "cpu"
+        except Exception:
+            _is_cpu_backend = False
+    _dist_lu = _linalg.distributed_lu
+    _dist_chol = _linalg.distributed_cholesky
+    if _dist_lu == "distributed":
+        _dist_lu = "scalapack" if _is_cpu_backend else "cusolvermp"
+    elif _dist_lu == "auto" and _is_cpu_backend:
+        _dist_lu = "off"
+    backend = BackendConfig(
+        linalg=_linalg.layout,
+        linalg_provenance=_linalg.provenance,
+        w_dyson_solver=_linalg.w_dyson_solver,
+        distributed_cholesky=_dist_chol,
+        distributed_lu=_dist_lu,
+        distrib_la_batched_route=_linalg.batched_route,
+        eigh_backend=_linalg.eigh_backend,
+        zeta_ridge=float(params["zeta_ridge"]),
+        charge_zeta_solve=_linalg.charge_zeta_solve,
+        distributed_zeta_solve=_linalg.distributed_zeta_solve,
+        zeta_rcond=float(params["zeta_rcond"]),
+        transverse_zeta_solve=_linalg.transverse_zeta_solve,
+        transverse_zeta_rcond=_transverse_zeta_rcond,
+        gamma_contract_mode=str(params["gamma_contract_mode"]).strip().lower(),
+    )
+    return (backend)
+
+
+def _input_storage(
+        params):
+    """Produce validated storage, debugging and BSE settings."""
+    from gw.restart_q_storage import RESTART_Q_STORAGE
+    _restart_q_storage = str(
+        params["restart_q_storage"] or "auto").strip().lower()
+    if _restart_q_storage not in RESTART_Q_STORAGE:
+        raise ValueError(
+            f"restart_q_storage={_restart_q_storage!r} is not one of "
+            f"{RESTART_Q_STORAGE}.  This key selects the q-set the "
+            "restart tensors are STORED on; a value nobody recognises "
+            "is not silently read as the default.")
+    from file_io.qp_wfn import QP_ROTATIONS_K_STORAGE
+    _qp_rot_k_storage = str(
+        params["qp_rotations_k_storage"] or "auto").strip().lower()
+    if _qp_rot_k_storage not in QP_ROTATIONS_K_STORAGE:
+        raise ValueError(
+            f"qp_rotations_k_storage={_qp_rot_k_storage!r} is not one "
+            f"of {QP_ROTATIONS_K_STORAGE}.  This key selects the k-set "
+            "qp_wfn_rotations.h5 is STORED on; a value nobody "
+            "recognises is not silently read as the default.")
+    debug = DebugConfig(
+        sigma_freq_debug_output=bool(params["sigma_freq_debug_output"]),
+        sigma_freq_debug_file=str(params["sigma_freq_debug_file"]),
+        write_wfn_h5=bool(params["write_wfn_h5"]),
+    )
+    bse = BSEConfig(
+        get_centroids_fi=bool(params["get_centroids_fi"]),
+        wfn_fi_min=int(params["wfn_fi_min"]),
+        wfn_fi_max=int(params["wfn_fi_max"]),
+        kgrid_fi=str(params["kgrid_fi"] or ""),
+        wfn_fi_q_chunk=int(params["wfn_fi_q_chunk"]),
+    )
+    if bse.wfn_fi_q_chunk < 0:
+        raise ValueError(
+            f"wfn_fi_q_chunk={bse.wfn_fi_q_chunk} invalid; expected >= 1, "
+            f"or 0 for the default (= N_q_co, the coarse k-point count).")
+    return (_restart_q_storage, _qp_rot_k_storage, debug, bse)
+
+
+def _input_band_windows(
+        params):
+    """Produce the resolved serving and fitting band extents."""
+    _bands = params.get(_BAND_COUNTS)
+    if not isinstance(_bands, BandCounts):
+        _bands = resolve_band_counts(params)
+    _zeta_nband_raw = params["zeta_nband"]
+    if _zeta_nband_raw in (None, ""):
+        _zeta_nband = None
+    else:
+        _zeta_nband = int(_zeta_nband_raw)
+        if _zeta_nband < 1 or _zeta_nband > _bands.isdf:
+            raise ValueError(
+                f"zeta_nband={_zeta_nband} must be in [1, {_bands.isdf}] "
+                f"— the ISDF fit's band-window top, which is "
+                f"max(number_bands_chi={_bands.chi}, "
+                f"number_bands_sigma={_bands.sigma}).  zeta_nband NARROWS "
+                f"the band window ζ is fitted on; it cannot widen it, "
+                f"because the centroid ψ this run loads spans [b0, b4) "
+                f"and there are no bands above b4 to fit.  Raise "
+                f"number_bands (or whichever of number_bands_chi / "
+                f"number_bands_sigma is the larger) if you want more "
+                f"bands in the fit AND in the band sum that owns them.")
+    return (_bands, _zeta_nband)
+
+
+def _assemble_input_config(
+        _bands, _effective_named_keys, _occ_family, _occ_width, _qp_rot_k_storage,
+        _resolved_do_g0, _restart_q_storage, _zeta_nband, backend, bse, cls, debug, eqp2,
+        filename, head, input_dir, memory, mpa, params, paths, ppm, sc, screening, sigma):
+    """Produce the typed configuration from its resolved groups."""
+    resolved = cls(
+        nval=int(params["nval"]),
+        ncond=int(params["ncond"]),
+        nband=int(_bands.isdf),
+        bands=_bands,
+        zeta_nband=_zeta_nband,
+        sys_dim=int(params["sys_dim"]),
+        density_self_consistent=bool(params["density_self_consistent"]),
+        sc_on_ibz=bool(params["sc_on_ibz"]),
+        occ_smearing_family=_occ_family,
+        occ_smearing_width_ry=_occ_width,
+        occupation_clamp_tol=float(params["occupation_clamp_tol"]),
+        restart=bool(params["restart"]),
+        write_restart_tensors=bool(params["write_restart_tensors"]),
+        write_qsgw_datasets=bool(params["write_qsgw_datasets"]),
+        restart_q_storage_raw=_restart_q_storage,
+        qp_rotations_k_storage=_qp_rot_k_storage,
+        raw_input_keys=frozenset(sorted(_effective_named_keys)),
+        compute_mode_raw=str(params["compute_mode"] or "auto").strip().lower(),
+        qp_solver_raw=str(params["qp_solver"] or "auto").strip().lower(),
+        do_screened=bool(params["do_screened"]),
+        bispinor=bool(params["bispinor"]),
+        bispinor_gw=coerce_bispinor_gw_mode(params["bispinor_gw"]),
+        vnl_velocity_sign=str(params["vnl_velocity_sign"] or ""),
+        do_G0=_resolved_do_g0,
+        self_consistent=bool(params["self_consistent"]),
+        use_ppm_sigma=bool(params["use_ppm_sigma"]),
+        no_degen_averaging=bool(params["no_degen_averaging"]),
+        degen_avg_tol_ry=float(params["degen_avg_tol_ry"]),
+        paths=paths,
+        head=head,
+        screening=screening,
+        sigma=sigma,
+        ppm=ppm,
+        mpa=mpa,
+        sc=sc,
+        eqp2=eqp2,
+        memory=memory,
+        backend=backend,
+        debug=debug,
+        bse=bse,
+        kpoints_crystal_b=params.get("kpoints_crystal_b"),
+        input_dir=input_dir,
+        input_file=os.path.abspath(filename),
+    )
+    return (resolved)
+
+
+def _apply_input_envelope(
+        _named_keys, print_fn, resolved):
+    """Produce the final configuration after cross-key refusals and provenance."""
+    if (bool(resolved.bispinor)
+            and resolved.qp_solver is QPSolver.SELF_CONSISTENT
+            and "density_self_consistent" not in _named_keys
+            and not bool(resolved.density_self_consistent)):
+        resolved = _dc_replace(resolved, density_self_consistent=True)
+        print_fn(
+            "  [config provenance] bispinor qp_solver=self_consistent: "
+            "density_self_consistent was not named; enabling the "
+            "required live (rho, J) Hartree rebuild")
+    if "restart" not in _named_keys:
+        print_fn(
+            "  [config provenance] restart was not named; using the "
+            "fresh-physics default restart = false.  Tensor files are "
+            "never selected from mere presence; set restart = true "
+            "explicitly to enter the authenticated restart loader "
+            "(docs/input_reference.md, restart)")
+    refuse_unsupported_bgw_metal_q0_treatment(resolved)
+    refuse_unsupported_screening_diagrams(resolved)
+    refuse_unsupported_bispinor_gw(resolved)
+    announce_legacy_sigma_axis_keys(
+        _named_keys, resolved.compute_mode, resolved.qp_solver,
+        print_fn=print_fn)
+    return (resolved)
+
+
+def _locate_input_blocks(
+        lines):
+    """Produce INI and optional K_POINTS block boundaries."""
     start = None
     for i, line in enumerate(lines):
         if line.strip().lower().startswith('[cohsex]'):
@@ -2862,8 +2862,6 @@ def read_lorrax_input(filename: str) -> dict:
                 start = i
                 break
     end = len(lines)
-
-    # Locate optional K_POINTS block
     kp_idx = None
     for i, line in enumerate(lines):
         if line.strip().lower().startswith("k_points"):
@@ -2876,316 +2874,209 @@ def read_lorrax_input(filename: str) -> dict:
         except Exception:
             seg_count = 0
         kp_end = min(len(lines), kp_idx + 2 + max(seg_count, 0))
-
-    if start is not None:
-        for j in range(start + 1, len(lines)):
-            if re.match(r"\s*\[.*\]", lines[j]):
-                end = j
-                break
-        # Strip K_POINTS from INI text
-        if kp_idx is not None and start <= kp_idx < end:
-            section_lines = lines[start:kp_idx] + lines[(kp_end or kp_idx + 1):end]
-        else:
-            section_lines = lines[start:end]
-
-        # inline_comment_prefixes so 'key = off  # note' parses to 'off', not
-        # 'off  # note' (the latter silently voided flags — a real footgun).
-        parser = configparser.ConfigParser(inline_comment_prefixes=('#',))
-        parser.read_string(''.join(section_lines))
-        section = parser["cohsex"] if "cohsex" in parser else parser[parser.sections()[0]]
-
-        # Legacy key check
-        if section.get("use_shipped_minimax_tables", fallback=None) is not None:
-            raise ValueError(
-                "Input key 'use_shipped_minimax_tables' is no longer supported. "
-                "Use 'regenerate_minimax_tables = true/false' instead.")
-
-        # RETIRED-KEY REPORT.  A key with an explicit legacy branch is
-        # exempt from the unknown-key check below so one deck key never
-        # draws two messages — but that exemption left
-        # ``warnings.warn(..., DeprecationWarning)`` as the ONLY report,
-        # and Python's default filter hides DeprecationWarning outside
-        # ``__main__``.  A retired key was therefore parsed, matched,
-        # ignored, and announced to nobody, which is exactly the failure
-        # the unknown-key check exists to prevent.  Collect every hit and
-        # print it through the same rank-0 reporter, in wording that keeps
-        # "retired" (the key was real once, and here is what replaced it)
-        # distinct from "unrecognized" (nothing ever read this).  The
-        # DeprecationWarnings stay — they are what a library consumer
-        # filters on.  Explicit refusal branches below own keys whose
-        # replacement must be named rather than hidden in a generic error.
-        retired = []                         # (key, what the run does with it)
-
-        # ``chunk_size`` (legacy band-chunk knob) was a no-op: its only
-        # consumer wrote ``meta.chunk_size``, which nothing ever read —
-        # chunk sizing is owned by the gflat planner.  Dropped 2026-07-09.
-        if section.get("chunk_size", fallback=None) is not None:
-            import warnings
-            warnings.warn(
-                "Input key 'chunk_size' is no longer supported and will be "
-                "ignored (it was a no-op; chunk sizing is planner-owned — "
-                "see 'gflat_chunk_size' / 'low_mem_bands').",
-                DeprecationWarning, stacklevel=2,
-            )
-            retired.append((
-                "chunk_size",
-                "IGNORED — it was a no-op; chunk sizing is planner-owned "
-                "(see 'gflat_chunk_size' / 'low_mem_bands')"))
-        for legacy_key in ("output_file", "eqp_output_file"):
-            if section.get(legacy_key, fallback=None) is not None:
-                import warnings
-                warnings.warn(
-                    f"Input key '{legacy_key}' is no longer supported and "
-                    f"will be ignored.  ``output_file`` (LORRAX-native eqp0) "
-                    f"is now ``sigma_diag_file`` (defaults to "
-                    f"``sigma_diag.dat``); BGW-format ``eqp0.dat`` and "
-                    f"``eqp1.dat`` (with Z-linearization) are written "
-                    f"automatically.  Remove '{legacy_key}' from your "
-                    f"input file.",
-                    DeprecationWarning, stacklevel=2,
-                )
-                retired.append((
-                    legacy_key,
-                    "IGNORED — the LORRAX-native eqp0 filename is now "
-                    "'sigma_diag_file'; eqp0.dat / eqp1.dat are written "
-                    "automatically"))
-        # There is one sharded-slab transport and the deck does not select
-        # it.  Refuse the deleted selectors by name: accepting and ignoring
-        # them made stale decks look as though their requested HDF5 route was
-        # still active.  The tombstones stay in ``_LEGACY_DECK_KEYS`` only so
-        # strict unknown-key handling does not mask this specific message.
-        for legacy_key in ("slab_io", "use_ffi_io"):
-            if section.get(legacy_key, fallback=None) is not None:
-                raise ValueError(
-                    f"Input key '{legacy_key}' is no longer supported and "
-                    f"must be removed: there is one sharded-slab transport "
-                    f"and the deck does not select an HDF5 implementation."
-                )
-        if section.get("gspace_mode", fallback=None) is not None:
-            raise ValueError(
-                "Input key 'gspace_mode' is no longer supported and must "
-                "be removed: the fit builds one all-rank-sharded ψ(r) "
-                "cache, then releases the host ψ(G) tiles before the "
-                "r-chunk loop.  The former file_reread mode no longer "
-                "described a distinct execution path."
-            )
-        if section.get(
-                "bispinor_tt_head_correction", fallback=None) is not None:
-            raise ValueError(
-                "Input key 'bispinor_tt_head_correction' has been REMOVED "
-                "and must be deleted from the deck (any value, including "
-                "the old default false).\n"
-                "  want: nothing -- the transverse q=Gamma, G=0 head is "
-                "carried by the packed static photon route's Gamma-cell "
-                "completion (bispinor_gw = bare_transverse or "
-                "full_static_cohsex, head_correction = full), which inserts "
-                "the same <D_TT> = -<v P^T> the overlay wrote.\n"
-                "  why:  heads are always on with bispinors (owner ruling "
-                "2026-09-01, docs/architecture/decisions.md; TASTE.md row "
-                "20), so a deck dial that turns one off is not a dial.  The "
-                "overlay code (gw.v_q_bispinor._tt_head_tensor) survives "
-                "only for the incumbent non-packed route, which is being "
-                "retired; nothing reads a deck value for it.\n"
-                "  doc:  docs/input_reference.md, bispinor_gw / "
-                "head_correction."
-            )
-        if section.get("hartree_source", fallback=None) is not None:
-            raise ValueError(
-                "Input key 'hartree_source' has been removed: Hartree is "
-                "always built live in G-space from the run's WFN.  Remove "
-                "the key; stored, folded, and ISDF Hartree paths no longer "
-                "exist."
-            )
-        for legacy_key in ("ppm_sigma_target_error", "ppm_sigma_max_nodes"):
-            if section.get(legacy_key, fallback=None) is not None:
-                raise ValueError(
-                    f"Input key '{legacy_key}' is retired: GN/HL-PPM now "
-                    "writes a one-pole MPA store and uses the shared dynamic "
-                    "Sigma route. Remove the key and use "
-                    "sigma_quadrature_eps, "
-                    "sigma_quadrature_reduction_seconds, "
-                    "sigma_quadrature_cache_dir."
-                )
-        for legacy_key in (
-            "distributed_zeta_solve",
-            "distributed_cholesky",
-            "distributed_lu",
-            "w_dyson_solver",
-            "distrib_la_batched_route",
-            "charge_zeta_solve",
-            "transverse_zeta_solve",
-            "eigh_backend",
-            "sc_eigh",
-            "use_low_mem_eigh",
-        ):
-            if section.get(legacy_key, fallback=None) is not None:
-                raise ValueError(
-                    f"Input key '{legacy_key}' is retired; use "
-                    "'linalg = local | distributed'.")
-        if section.get("band_chunk_size", fallback=None) is not None:
-            raise ValueError(
-                "Input key 'band_chunk_size' is retired; use "
-                "'low_mem_bands = true | false' (chunk size is automatic).")
-        if section.get("strict_keys", fallback=None) is not None:
-            raise ValueError(
-                "Input key 'strict_keys' is retired; remove it (unknown "
-                "deck keys are always refused).")
-        # ``sigma_omega_accumulation`` was REMOVED (2026-08-14): host-tile
-        # accumulation is the only mode, so the key steered nothing.  The
-        # long-removed ``kij_stream`` VALUE keeps its dedicated refusal.
-        _acc = section.get("sigma_omega_accumulation", fallback=None)
-        if _acc is not None:
-            if _acc.strip().strip('"\'').lower() == "kij_stream":
-                raise ValueError(
-                    "sigma_omega_accumulation = kij_stream was REMOVED; "
-                    "host-tile accumulation is the only mode and the "
-                    "end-of-stage dynamic Sigma cube is always sharded")
-            import warnings
-            warnings.warn(
-                "Input key 'sigma_omega_accumulation' is no longer "
-                "supported and will be ignored (host-tile accumulation is "
-                "the only mode).  Remove it from your input file.",
-                DeprecationWarning, stacklevel=2,
-            )
-            retired.append((
-                "sigma_omega_accumulation",
-                "IGNORED — host-tile accumulation is the only mode"))
-        # Deprecated qp_solver aliases (still honored via auto-resolution;
-        # see ``LorraxConfig.qp_solver``).
-        for legacy_key, replacement in (
-            ("self_consistent", "qp_solver = self_consistent"),
-            ("sigma_at_dft_energies", "qp_solver = one_shot_dft (the default)"),
-        ):
-            if section.get(legacy_key, fallback=None) is not None:
-                import warnings
-                warnings.warn(
-                    f"Input key '{legacy_key}' is deprecated; it is honored "
-                    f"via ``qp_solver = auto`` resolution.  Set "
-                    f"'{replacement}' instead.",
-                    DeprecationWarning, stacklevel=2,
-                )
-                retired.append((
-                    legacy_key,
-                    f"deprecated but still HONORED via 'qp_solver = auto' "
-                    f"resolution; set '{replacement}' instead"))
-
-        if retired:
-            _print_deck_report(
-                f"read_lorrax_input: {len(retired)} retired deck key(s) in "
-                f"{filename}:\n"
-                + "\n".join(
-                    f"    {key} "
-                    f"({_deck_key_line(lines, start, end, key)}): {note}"
-                    for key, note in retired))
+    return (start, end, kp_idx, kp_end)
 
 
-        # REMOVED keys (owner-approved deletions, 2026-07-31; these behave
-        # like any other unknown deck key — reported by the unknown-key
-        # check below, never steering anything): ``isdf_memory_mode``
-        # (two-plan W cleanup — the W Dyson solve is selected by
-        # w_dyson_solver=local|distributed) and the legacy aliases
-        # ``cusolvermp_charge``/``cusolvermp_lu`` (use the ``linalg`` dial).
-
-        # --- Unknown-key check -----------------------------------------
-        # Every key in the deck that is neither in ``_DEFAULTS`` nor
-        # handled by one of the explicit legacy branches above is refused
-        # in ONE aggregated error (key and line number).  Deck parsing is
-        # always strict; there is no mode in which a typo is ignored.
-        # Retired keys are exempt (they got their own report above).
-        # configparser lower-cases option names (``optionxform = str.lower``),
-        # so iterating ``section`` yields ``do_g0`` for a deck that writes
-        # the documented ``do_G0`` -- the ONE non-lower-case key among the
-        # 99 in _DEFAULTS.  Comparing the two raw made that key BOTH
-        # honoured and unrecognised at the same time: ``section.get`` folds
-        # the LOOKUP too, so ``do_G0 = false`` really did steer the run,
-        # while this check reported it as an unknown key -- and, under
-        # ``strict_keys``, REFUSED a valid deck outright.  Fold both sides
-        # so recognition matches the lookup that already happens.
-        _known = ({k.lower() for k in _DEFAULTS}
-                  | {k.lower() for k in _LEGACY_DECK_KEYS})
-        unknown = [k for k in section if k.lower() not in _known]
-        if unknown:
-            located = [f"{key} ({_deck_key_line(lines, start, end, key)})"
-                       for key in unknown]
-            raise ValueError(
-                f"read_lorrax_input: {len(unknown)} unrecognized deck "
-                f"key(s) in {filename}:\n"
-                + "\n".join(
-                    f"    {loc}: not a recognized deck key"
-                    for loc in located))
-
-        # Build params from _DEFAULTS, overriding with parsed values
-        params = {}
-        # WHICH KEYS THE DECK ITSELF NAMED.  ``params`` cannot answer this
-        # afterwards — a deck pinning a key to its default and a deck that
-        # never mentions it produce the identical entry — and the difference
-        # matters to anything that must speak only to decks that opted in.
-        # Its first consumer is the ``restart_q_storage`` deprecation notice
-        # (owner ruling 2026-08-08: the key is scheduled for deletion), which
-        # must fire for a deck that pins it and stay silent for the other
-        # ~forty, or it is noise nobody reads.  Recorded here, where the
-        # answer is free, rather than re-parsed by each consumer.
-        named = set()
-        for key, default in _DEFAULTS.items():
-            raw = section.get(key, fallback=None)
-            if raw is not None:
-                named.add(key)
-            if raw is None:
-                params[key] = default
-            elif key in _NULLABLE_BOOL:
-                # Tri-state boolean (default None = unset); an explicit
-                # value parses as bool.
-                params[key] = section.getboolean(key)
-            elif key in _NULLABLE_INT:
-                params[key] = section.getint(key)
-            elif key in _NULLABLE_STR:
-                params[key] = str(raw)
-            elif isinstance(default, bool):
-                params[key] = section.getboolean(key)
-            elif isinstance(default, int):
-                params[key] = section.getint(key)
-            elif isinstance(default, float):
-                params[key] = section.getfloat(key)
-            elif default is None:
-                # Nullable float (vhead, whead_0freq, etc.)
-                params[key] = section.getfloat(key, fallback=None)
-            else:
-                params[key] = str(raw)
-            if key in _NORMALIZE_STR and isinstance(params[key], str):
-                params[key] = params[key].strip().lower()
-        params[_DECK_NAMED_KEYS] = frozenset(named)
+def _read_input_section(
+        end, kp_end, kp_idx, lines, start):
+    """Produce the INI section after removing its K_POINTS block."""
+    for j in range(start + 1, len(lines)):
+        if re.match(r"\s*\[.*\]", lines[j]):
+            end = j
+            break
+    if kp_idx is not None and start <= kp_idx < end:
+        section_lines = lines[start:kp_idx] + lines[(kp_end or kp_idx + 1):end]
     else:
-        params = dict(_DEFAULTS)
-        params[_DECK_NAMED_KEYS] = frozenset()
+        section_lines = lines[start:end]
+    parser = configparser.ConfigParser(inline_comment_prefixes=('#',))
+    parser.read_string(''.join(section_lines))
+    section = parser["cohsex"] if "cohsex" in parser else parser[parser.sections()[0]]
+    return (section, end)
 
-    # Deck dial interpretation point (INVARIANTS row 19).  Every downstream
-    # consumer reads this immutable record; no stage reinterprets ``linalg``.
-    params[_LINALG_RESOLUTION] = resolve_linalg(params)
 
-    # --- Band counts: resolve ONCE, here ------------------------------
-    # ``number_bands`` / ``number_bands_chi`` / ``number_bands_sigma`` /
-    # ``nband`` collapse into two numbers plus their max, and this is the
-    # only call to the resolver on the deck path.  Resolving here rather
-    # than in ``LorraxConfig`` is what lets the params dict stay honest for
-    # the tools that read it directly (``bandstructure.htransform``,
-    # ``psp.get_DFT_mtxels``, ``gw.kin_ion_io``, ``file_io.epsreader``):
-    # they ask for ``params["nband"]`` and must get the LOADED band extent,
-    # which after the split is ``max(chi, sigma)`` — the same number they
-    # always got on an unsplit deck.
-    #
-    # The mirror is why this is not idempotent and why the answer is
-    # cached in ``params[_BAND_COUNTS]`` instead of being re-derived: after
-    # the write-back, ``nband`` no longer says what the DECK said, so a
-    # second ``resolve_band_counts`` on this dict would see an umbrella that
-    # the deck never wrote.
-    _counts = resolve_band_counts(params, deck_named=params[_DECK_NAMED_KEYS])
-    params[_BAND_COUNTS] = _counts
-    params["number_bands_chi"] = _counts.chi
-    params["number_bands_sigma"] = _counts.sigma
-    params["number_bands"] = _counts.isdf
-    params["nband"] = _counts.isdf
+def _report_early_retired_keys(
+        section):
+    """Produce the early retired-key findings after dedicated refusals."""
+    if section.get("use_shipped_minimax_tables", fallback=None) is not None:
+        raise ValueError(
+            "Input key 'use_shipped_minimax_tables' is no longer supported. "
+            "Use 'regenerate_minimax_tables = true/false' instead.")
+    retired = []                         # (key, what the run does with it)
+    if section.get("chunk_size", fallback=None) is not None:
+        import warnings
+        warnings.warn(
+            "Input key 'chunk_size' is no longer supported and will be "
+            "ignored (it was a no-op; chunk sizing is planner-owned — "
+            "see 'gflat_chunk_size' / 'low_mem_bands').",
+            DeprecationWarning, stacklevel=2,
+        )
+        retired.append((
+            "chunk_size",
+            "IGNORED — it was a no-op; chunk sizing is planner-owned "
+            "(see 'gflat_chunk_size' / 'low_mem_bands')"))
+    for legacy_key in ("output_file", "eqp_output_file"):
+        if section.get(legacy_key, fallback=None) is not None:
+            import warnings
+            warnings.warn(
+                f"Input key '{legacy_key}' is no longer supported and "
+                f"will be ignored.  ``output_file`` (LORRAX-native eqp0) "
+                f"is now ``sigma_diag_file`` (defaults to "
+                f"``sigma_diag.dat``); BGW-format ``eqp0.dat`` and "
+                f"``eqp1.dat`` (with Z-linearization) are written "
+                f"automatically.  Remove '{legacy_key}' from your "
+                f"input file.",
+                DeprecationWarning, stacklevel=2,
+            )
+            retired.append((
+                legacy_key,
+                "IGNORED — the LORRAX-native eqp0 filename is now "
+                "'sigma_diag_file'; eqp0.dat / eqp1.dat are written "
+                "automatically"))
+    for legacy_key in ("slab_io", "use_ffi_io"):
+        if section.get(legacy_key, fallback=None) is not None:
+            raise ValueError(
+                f"Input key '{legacy_key}' is no longer supported and "
+                f"must be removed: there is one sharded-slab transport "
+                f"and the deck does not select an HDF5 implementation."
+            )
+    if section.get("gspace_mode", fallback=None) is not None:
+        raise ValueError(
+            "Input key 'gspace_mode' is no longer supported and must "
+            "be removed: the fit builds one all-rank-sharded ψ(r) "
+            "cache, then releases the host ψ(G) tiles before the "
+            "r-chunk loop.  The former file_reread mode no longer "
+            "described a distinct execution path."
+        )
+    if section.get(
+            "bispinor_tt_head_correction", fallback=None) is not None:
+        raise ValueError(
+            "Input key 'bispinor_tt_head_correction' has been REMOVED "
+            "and must be deleted from the deck (any value, including "
+            "the old default false).\n"
+            "  want: nothing -- the transverse q=Gamma, G=0 head is "
+            "carried by the packed static photon route's Gamma-cell "
+            "completion (bispinor_gw = bare_transverse or "
+            "full_static_cohsex, head_correction = full), which inserts "
+            "the same <D_TT> = -<v P^T> the overlay wrote.\n"
+            "  why:  heads are always on with bispinors (owner ruling "
+            "2026-09-01, docs/architecture/decisions.md; TASTE.md row "
+            "20), so a deck dial that turns one off is not a dial.  The "
+            "overlay code (gw.v_q_bispinor._tt_head_tensor) survives "
+            "only for the incumbent non-packed route, which is being "
+            "retired; nothing reads a deck value for it.\n"
+            "  doc:  docs/input_reference.md, bispinor_gw / "
+            "head_correction."
+        )
+    if section.get("hartree_source", fallback=None) is not None:
+        raise ValueError(
+            "Input key 'hartree_source' has been removed: Hartree is "
+            "always built live in G-space from the run's WFN.  Remove "
+            "the key; stored, folded, and ISDF Hartree paths no longer "
+            "exist."
+        )
+    for legacy_key in ("ppm_sigma_target_error", "ppm_sigma_max_nodes"):
+        if section.get(legacy_key, fallback=None) is not None:
+            raise ValueError(
+                f"Input key '{legacy_key}' is retired: GN/HL-PPM now "
+                "writes a one-pole MPA store and uses the shared dynamic "
+                "Sigma route. Remove the key and use "
+                "sigma_quadrature_eps, "
+                "sigma_quadrature_reduction_seconds, "
+                "sigma_quadrature_cache_dir."
+            )
+    return (retired)
 
-    # Parse optional QE K_POINTS block
+
+def _report_remaining_retired_keys(
+        end, filename, lines, retired, section, start):
+    """Report the remaining retired-key rules and their located provenance."""
+    for legacy_key in (
+        "distributed_zeta_solve",
+        "distributed_cholesky",
+        "distributed_lu",
+        "w_dyson_solver",
+        "distrib_la_batched_route",
+        "charge_zeta_solve",
+        "transverse_zeta_solve",
+        "eigh_backend",
+        "sc_eigh",
+        "use_low_mem_eigh",
+    ):
+        if section.get(legacy_key, fallback=None) is not None:
+            raise ValueError(
+                f"Input key '{legacy_key}' is retired; use "
+                "'linalg = local | distributed'.")
+    if section.get("band_chunk_size", fallback=None) is not None:
+        raise ValueError(
+            "Input key 'band_chunk_size' is retired; use "
+            "'low_mem_bands = true | false' (chunk size is automatic).")
+    if section.get("strict_keys", fallback=None) is not None:
+        raise ValueError(
+            "Input key 'strict_keys' is retired; remove it (unknown "
+            "deck keys are always refused).")
+    _acc = section.get("sigma_omega_accumulation", fallback=None)
+    if _acc is not None:
+        if _acc.strip().strip('"\'').lower() == "kij_stream":
+            raise ValueError(
+                "sigma_omega_accumulation = kij_stream was REMOVED; "
+                "host-tile accumulation is the only mode and the "
+                "end-of-stage dynamic Sigma cube is always sharded")
+        import warnings
+        warnings.warn(
+            "Input key 'sigma_omega_accumulation' is no longer "
+            "supported and will be ignored (host-tile accumulation is "
+            "the only mode).  Remove it from your input file.",
+            DeprecationWarning, stacklevel=2,
+        )
+        retired.append((
+            "sigma_omega_accumulation",
+            "IGNORED — host-tile accumulation is the only mode"))
+    for legacy_key, replacement in (
+        ("self_consistent", "qp_solver = self_consistent"),
+        ("sigma_at_dft_energies", "qp_solver = one_shot_dft (the default)"),
+    ):
+        if section.get(legacy_key, fallback=None) is not None:
+            import warnings
+            warnings.warn(
+                f"Input key '{legacy_key}' is deprecated; it is honored "
+                f"via ``qp_solver = auto`` resolution.  Set "
+                f"'{replacement}' instead.",
+                DeprecationWarning, stacklevel=2,
+            )
+            retired.append((
+                legacy_key,
+                f"deprecated but still HONORED via 'qp_solver = auto' "
+                f"resolution; set '{replacement}' instead"))
+    if retired:
+        _print_deck_report(
+            f"read_lorrax_input: {len(retired)} retired deck key(s) in "
+            f"{filename}:\n"
+            + "\n".join(
+                f"    {key} "
+                f"({_deck_key_line(lines, start, end, key)}): {note}"
+                for key, note in retired))
+
+
+def _refuse_unknown_input_keys(
+        end, filename, lines, section, start):
+    """Refuse unrecognized keys with their original line locations."""
+    _known = ({k.lower() for k in _DEFAULTS}
+              | {k.lower() for k in _LEGACY_DECK_KEYS})
+    unknown = [k for k in section if k.lower() not in _known]
+    if unknown:
+        located = [f"{key} ({_deck_key_line(lines, start, end, key)})"
+                   for key in unknown]
+        raise ValueError(
+            f"read_lorrax_input: {len(unknown)} unrecognized deck "
+            f"key(s) in {filename}:\n"
+            + "\n".join(
+                f"    {loc}: not a recognized deck key"
+                for loc in located))
+
+
+def _parse_input_kpoints(
+        kp_idx, lines, params):
+    """Add the optional QE band-path segments to the parameter dictionary."""
     if kp_idx is not None:
         j = kp_idx + 1
         try:
@@ -3218,6 +3109,35 @@ def read_lorrax_input(filename: str) -> dict:
         if segments:
             params["kpoints_crystal_b"] = {"segments": segments}
 
+
+def read_lorrax_input(filename: str) -> dict:
+    """Produce typed deck values and resolved band counts; see docs/architecture/decisions.md."""
+    with open(filename, 'r') as f:
+        lines = f.readlines()
+    (start, end, kp_idx, kp_end) = _locate_input_blocks(
+        lines)
+    if start is not None:
+        (section, end) = _read_input_section(
+            end, kp_end, kp_idx, lines, start)
+        (retired) = _report_early_retired_keys(
+            section)
+        _report_remaining_retired_keys(
+            end, filename, lines, retired, section, start)
+        _refuse_unknown_input_keys(
+            end, filename, lines, section, start)
+        params = _parse_input_keys(section)
+    else:
+        params = dict(_DEFAULTS)
+        params[_DECK_NAMED_KEYS] = frozenset()
+    params[_LINALG_RESOLUTION] = resolve_linalg(params)
+    _counts = resolve_band_counts(params, deck_named=params[_DECK_NAMED_KEYS])
+    params[_BAND_COUNTS] = _counts
+    params["number_bands_chi"] = _counts.chi
+    params["number_bands_sigma"] = _counts.sigma
+    params["number_bands"] = _counts.isdf
+    params["nband"] = _counts.isdf
+    _parse_input_kpoints(
+        kp_idx, lines, params)
     return params
 
 
@@ -3253,16 +3173,7 @@ class FilePaths:
 
 
 def _normalize_placement(value):
-    """Canonicalise ``mc_average_placement`` at deck-parse time.
-
-    Delegates to :func:`gw.head_channel.normalize_placement` so the deck
-    parser and the consumer cannot drift on what the mode names are, and so
-    a typo is a refusal at config time (with the valid list in the message)
-    rather than a silent ``off`` two stages later.  Imported lazily: this
-    module is imported by the CLI before jax is configured, and
-    ``head_channel`` keeps its jax imports function-local for the same
-    reason, so the cost is one numpy-only module.
-    """
+    """Canonicalise ``mc_average_placement`` at deck-parse time; see docs/architecture/decisions.md."""
     from .head_channel import normalize_placement
     return normalize_placement(value)
 
@@ -3303,198 +3214,9 @@ def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
         "bgw_metal_q0_treatment.")
 
 
-#: HISTORICAL LIFT RECORD for the former ``low_mem_bands = true`` refusal
-#: table.  Its last row was lifted on 2026-08-23; the empty table and its
-#: parser/driver no-op were deleted by the gate survey on 2026-09-02.
-#:
-#: SUPPORTED, deliberately absent from this table (guide
-#: ``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md`` §6):
-#: scalar/spinor, one-shot insulator (``qp_solver`` = ``one_shot_dft`` or
-#: ``fixed_point``), ``head_correction`` = ``off`` | ``no_local_fields``,
-#: standard chi0, COHSEX / GN-PPM / HL-PPM / insulating MPA, restart
-#: read/write.
-#:
-#: The one remaining limitation — an explicit dense ``Gij`` operand
-#: has no deck key (every shipped driver call site leaves it at its
-#: ``None`` default; see ``cohsex_sigma._resolve_Gij``), so it cannot be a
-#: config-resolution row keyed on parsed values.  It is guarded
-#: separately by :func:`refuse_explicit_gij_under_low_mem_bands`, called
-#: from ``compute_sigma_xc`` at the one seam that ever sees both operands
-#: together.
-    # LIFTED 2026-08-23 (feat/qsgw-face-rotations-2026-08-23) per this row's
-    # own recorded lift condition: rotate_wavefunctions now dispatches on
-    # wfns_dft.layout and routes layout='face' through
-    # wavefunction_bundle._rotate_wavefunctions_face (two planned
-    # distrib_la.gemm_plan N,N GEMMs -- U^T @ psi_nmu, psi_mun @ U -- against
-    # a block-embedded U rather than a sliced ψ; see wavefunction_bundle
-    # ._face_rotate_kernel/._face_embed_active_U).  sc_iteration.py:1753
-    # needed NO change: it already calls rotate_wavefunctions(inputs.
-    # wfns_dft, ...), and the dispatch reads wfns_dft.layout, not a
-    # call-site flag.  Gated: real 4-rank CUDA algebra parity vs legacy
-    # (tests/test_qsgw_rotate_face_parity.py, U from a REAL small eigh —
-    # ns=1/ns=2, default AND offset active windows — 3/3 PASS, max relative
-    # diff ~1e-16..2e-16); a real end-to-end MoS2 k6_c50 compute_mode=
-    # gn_ppm head_correction=full qp_solver=self_consistent (3 iterations)
-    # leg, face vs legacy — see this session's CLAIMS.md row for job id and
-    # measured tolerances.  ``head_wings_sharded``'s own consumer,
-    # ``build_iteration_head_response`` (qsgw_head.py), needed NO change
-    # either: it treats ``wfns_qp`` opaquely (no direct psi_* field access)
-    # and forwards it to the already layout-dispatching wing kernels; the
-    # ONLY reason it read as "still legacy-only" before this session is
-    # that its sole producer, rotate_wavefunctions, had no face arm.
-    # LIFTED 2026-08-23 (fix/mpa-head-status-line-2026-08-23): the metal
-    # row was the LAST entry.  Both of its originally-named blockers were
-    # already ported+gated (metallic chi0 response; the MPA executor), and
-    # the residual reachability obstacle was the sc_iteration mpa_z
-    # NameError (KNOWN_LORRAX_ISSUES 2026-08-19 row), fixed in the same
-    # branch and gated by the staged Na dft_velocity P16 legs
-    # (runs/Na/02_soc48b_qsgw_mpa/09_dft_velocity_headgate_p16_20260823).
-    # The envelope is now EMPTY: every deck the legacy path serves is
-    # served under low_mem_bands=true.
-    # LIFTED for FRESH-FIT decks (2026-08-23,
-        # feat/transverse-zeta-face-2026-08-23) — the row's LAST gap
-        # closed.  Both halves the previous session's comment named as
-        # missing are now ported and gated:
-        #
-        # * Sigma^B/vertex insertion (sigma_x_bispinor.py's G-build side)
-        #   — gw.wavefunction_bundle.with_lorentz_vertices, a
-        #   representation-aware bundle operation folding γ̃ into whichever
-        #   pair of fields plays the G-build's direct/conjugated role
-        #   (psi_xn/psi_yr legacy, psi_mun/psi_nmu face) — landed
-        #   2026-08-23 (feat/bispinor-face-2026-08-23), gated on real
-        #   4-rank CUDA with a genuine ns=4 fixture (5/5 Lorentz pairs,
-        #   ~1e-16 relative; tests/multi_device/
-        #   bispinor_transverse_vertex_face_gate.py).
-        # * The transverse ζ-FIT's face path — ``isdf.core.
-        #   c_q_from_psi_sm(layout='face')``/``z_q_from_psi_sm(layout=
-        #   'face')`` now accept non-identity ``gamma_L``/``gamma_R`` via
-        #   psi-ENDPOINT application (mirroring
-        #   ``with_lorentz_vertices``'s own field/axis table, folded in
-        #   BEFORE the band GEMM / masked-gather rather than at
-        #   ``gamma_double_contract``'s post-IFFT step — see
-        #   ``docs/architecture/zeta_fit_face_psi_cct.md``'s "γ̃ VERTEX"
-        #   sections for the derivation and its conjugation-convention
-        #   correction, found by reading ``greens_function_kernel.
-        #   _build_G_face`` directly: CCT's psi_mun is the CONJUGATED
-        #   operand, the OPPOSITE role from the G-build's own psi_mun).
-        #   Gated on real 4-rank CUDA, ALL 15 non-identity
-        #   ``(mu_L, nu_L)`` Lorentz-index pairs at ns=4 (the
-        #   discriminating cases — an identity vertex passes trivially
-        #   and proves nothing): ``tests/test_isdf_cq_face_parity.py``
-        #   18/18 PASS, max relative diff ~6e-16; ``tests/
-        #   test_isdf_zq_face_parity.py`` 18/18 PASS on real CUDA
-        #   (mostly bit-exact, max relative diff ~4e-16 where not — the
-        #   masked-``psum`` mechanism is a select, immune to summation-
-        #   order noise, same as its own identity-channel result).
-        #   ``gw.isdf_fitting.fit_zeta_to_h5``'s ``vertex_mu_L != 0``
-        #   refusal under ``low_mem_bands`` is dropped;
-        #   ``isdf.core._make_fit_one_rchunk_kernel``'s matching refusal
-        #   too.  ``gw.gw_init.fit_zeta`` builds the TRANSVERSE
-        #   centroid set's OWN face carrier via the SAME
-        #   ``PSI_MUN_SPEC``/``PSI_NMU_SPEC`` build path the charge
-        #   channel already uses (not a fork), reused for both the ζ_T
-        #   fit and the post-fit Σ^B bundle.
-        #
-        # End-to-end: MoS2 3×3 bispinor GN-PPM fixture
-        # (tests/regression/bispinor_debug/bispinor_test.in,
-        # head_correction=off, restart=false), real 4-rank CUDA,
-        # low_mem_bands=true vs low_mem_bands=false — see
-        # runs/MoS2/90_bispinor_lowmem_smoke_2026-08-23/ for the
-        # artifacts and claims/ for the numbers.
-        #
-        # DELETED, not narrowed (same precedent as
-        # ``low_mem_bands_self_consistent_unported``'s own 2026-08-23
-        # lift): the census row's gap is closed for every combination
-        # bispinor ITSELF supports.  ``restart = true`` +
-        # ``bispinor = true`` round-trips in BOTH layouts (legacy
-        # per-channel ``psi_full_y_transverse`` since 2026-07-27; the
-        # face pair ``psi_full_y_transverse`` +
-        # ``psi_full_y_transverse_mun`` since 2026-08-23,
-        # feat/bispinor-restart-2026-08-23).  A file written by one
-        # layout read by the other refuses loudly by name in
-        # ``gw.gw_init.prepare_isdf_and_wavefunctions`` /
-        # ``file_io.read_restart_state_from_h5`` -- no silent data loss
-        # in any combination.
-    # LIFTED for GN_PPM/HL_PPM 2026-08-22 (feat/dynamic-sigma-face-
-        # port-2026-08-22); the row was KEPT, narrowed to MPA only.  History
-        # of that narrowing:
-        # DISCOVERED on real 4-rank CUDA (tests/multi_device/
-        # low_mem_bands_one_shot_insulating_envelope_gate.py, MoS2 k6_c50,
-        # 2026-08-22): a low_mem_bands=true, compute_mode=gn_ppm deck (the
-        # supported-table's own claimed envelope) ran ISDF fit + chi0/W
-        # construction to completion under layout='face', then died in
-        # the former PPM tau precompile at the FIRST legacy accessor
-        # call (``wfns.xn(s.full)``) with the carrier's own named
-        # ``_require_legacy`` ValueError -- not a clean parse-time refusal.
-        # The dynamic two-point plasmon-pole Sigma_c(omega) pipeline
-        # (the spatial ``_get_sigma_kij_kernel``, ``common.contract_bands``'s
-        # channels="split_reim" face arm, and ppm_sigma.py's per-branch
-        # sigma builders + invalid-pole static-limit term) now dispatches
-        # on ``wfns.layout`` and routes through
-        # ``greens_function_kernel.build_G_tau(layout='face', gemm=...)``/
-        # ``contract_bands_block_reshard(layout='face', channels=...)`` —
-        # the SAME canonical owners the static COHSEX channels already
-        # used, extended rather than forked (report §5).  Gated: real
-        # 4-rank CUDA algebra parity (legacy vs face, identity + real tau
-        # weights, ns=1/ns=2, a non-mesh-divisible sigma window,
-        # tests/test_ppm_tau_kernel_face_parity.py, 5/5 PASS), a real
-        # end-to-end MoS2 k6_c50 leg at compute_mode=gn_ppm
-        # head_correction=full matching the legacy gn_ppm reference to
-        # ~1e-5 eV, and tests/test_zeta_mesh_invariance.py 7/7 unaffected
-        # (claims/0435.md).  A LARGER k6_c600 (mu=5282) confirmation of
-        # the same combination could NOT be completed this session: it
-        # dies in the already-registered, pre-existing qsgw_head.py
-        # head-response OOM (KNOWN_LORRAX_ISSUES.md's
-        # src/gw/qsgw_head.py:250-256 row; third independent
-        # reproduction, claims/0436.md) before ever reaching this
-        # pipeline's own code — that defect is inherited from this
-        # branch's base and is unrelated to this port (it also blocks
-        # head_correction=full under low_mem_bands=true for COHSEX at
-        # that scale).  Production-scale confirmation of THIS port
-        # remains open follow-up work, not claimed here.  ``mpa/sigma.py``
-        # (insulating MPA's own executor,
-        # ``_integrate_sigma_batches``) was mechanically ported the SAME
-        # session, sharing this now-gated tau-kernel/projector infra, but
-        # was NOT itself run end to end this session (its own
-        # sharded-output final layout has an additional named gap for a
-        # split Σ window — see that file's own comment) — kept refused
-        # then, pending its own gate.
-        #
-        # DELETED 2026-08-23 (feat/mpa-executor-face-gate-2026-08-23,
-        # claims/0443.md), not narrowed to metal-only: that named gap is
-        # now FIXED. gw.mpa.sigma._integrate_sigma_batches' sharded-output
-        # tail (a split Sigma window, nb_sigma != nb_full -- the ORDINARY
-        # case) is ported: strip_sigma_window gained a device-array arm
-        # that applies wavefunction_bundle.pack_band_window's OWN
-        # mechanism (jax.lax.slice_in_dim + jax.lax.with_sharding_
-        # constraint) to Sigma_c's own trailing (m,n) axes -- reusing that
-        # primitive's idiom rather than reworking psi_proj's INPUT width,
-        # which would have desynced it from contract_bands.py's eagerly-
-        # built, fixed-width GEMM plans (a shared contract this fix does
-        # not reopen).  Gated: real 4-rank CUDA mesh-aware strip_sigma_
-        # window parity (5/5, tests/test_mpa_sigma_split_window_strip.py,
-        # bit-exact) and a real end-to-end fresh one-shot insulating MPA
-        # leg (Si_scalar, a genuine split window nb_sigma=8 < nb_full=20)
-        # -- eqp0.dat max|dE_QP|=6.510e-05 eV, eqp1.dat max|dE_QP|=
-        # 8.575e-05 eV, max|dE_DFT|=0.0 eV both, legacy vs face.
-        #
-        # A NARROWED (metal-only) row was drafted first and then deleted
-        # rather than kept, per its own predicate's own "narrow it away
-        # entirely if nothing else remains under it" instruction: a
-        # metal deck's mpa_material_class == 'metal' predicate is a
-        # STRICT SUBSET of -- and, given _validate_metal_compute_mode's
-        # standing invariant (material_class == metal implies compute_
-        # mode == mpa, enforced in LorraxConfig.__post_init__ BEFORE this
-        # table ever runs), logically EQUIVALENT to -- the
-        # low_mem_bands_metal_material_class_unported row's own predicate,
-        # which appears earlier in this tuple and therefore always fires
-        # first.  A second, later row with an implied-equivalent predicate
-        # would never be reached -- a dead, vacuous entry, the exact "gate
-        # that cannot fail" shape TASTE.md warns against -- so it is
-        # deleted outright rather than shipped unreachable.  Metal MPA
-        # remains refused, by the metal row alone; see that row's own
-        # updated comment for why (three named infra obstacles this
-        # session, none of them in gw.mpa.sigma's own code).
+# GW uses typed raw parents; the low_mem_bands transition is recorded in
+# docs/architecture/decisions.md. Explicit dense Gij inputs refuse below.
+
 #: How a reader should read an unmet envelope condition.  PHYSICS means the
 #: quantity does not exist outside the condition; IMPLEMENTATION LIMIT means
 #: it exists and nobody has written it.  Printed in every refusal, because
@@ -3543,7 +3265,7 @@ _SCALAR_HEAD_OVERRIDES: tuple[tuple[str, object], ...] = (
 #: the phase-1 static mode (the packed operator owns the WHOLE Sigma); the
 #: two-point plasmon-pole pair is the phase-3 dynamic packed route, where the
 #: CHARGE block is dynamic (the ordinary scalar Sigma_c on the same ISDF
-#: W_00) and the twelve current blocks are frozen at omega = 0.
+#: W_00) and the fifteen current blocks are frozen at omega = 0.
 #:
 #: ``mpa`` is deliberately absent.  ``gw.screening.screening_requests_for``
 #: returns NO independent static role for it (its shared double-parallel
@@ -3558,12 +3280,7 @@ PACKED_PHOTON_COMPUTE_MODES: tuple[ComputeMode, ...] = (
 )
 
 def scalar_head_overrides_named(config) -> tuple[str, ...]:
-    """Which scalar-head overrides this deck names, formatted for a message.
-
-    Empty for every deck that leaves them alone, which is the whole point:
-    the envelope's ``got``/``want`` used to be eight hand-written rows and
-    is now one line naming only what the deck actually set.
-    """
+    """Which scalar-head overrides this deck names, formatted for a message; see docs/architecture/decisions.md."""
     named = []
     for template, probe in _SCALAR_HEAD_OVERRIDES:
         value = probe(config)
@@ -3574,36 +3291,7 @@ def scalar_head_overrides_named(config) -> tuple[str, ...]:
 
 
 def packed_static_envelope(config, *, screened: bool):
-    """THE envelope of the packed static photon operator, as ONE table.
-
-    It used to be two: six conditions inside
-    :func:`packed_bare_transverse_route` and seventeen inside
-    :func:`refuse_unsupported_bispinor_gw`, five of them restated with
-    separately formatted ``got``/``want`` strings (lane J section 6.2,
-    quality pattern #3 -- shadow accounting).  A condition that is written
-    twice is a condition that will differ.
-
-    Yields ``(accepted, got, want, klass, why, derived_key)`` in the order
-    a reader should meet them.  ``derived_key`` names the deck key that
-    :meth:`LorraxConfig.from_input_file` SETS for this mode when the deck
-    did not name it (``None`` for a row the deck must satisfy itself), so
-    the promotion and the refusal read the same table instead of
-    re-deriving each other.  ``screened`` selects the packed SCREENED mode
-    (``full_static_cohsex``): the extra rows are the ones that only bite
-    when the twelve current ``chi`` blocks and the packed Dyson solve are
-    actually built.  Material class is deliberately NOT a configuration
-    row: it is inferred once from the loaded WFN occupations and
-    :func:`validate_material_inputs` refuses every fractional-occupation
-    non-MPA run, including this COHSEX-only screened route, and is not a
-    row.  The distributed-plan row (``linalg = distributed``) is
-    shared because the packed response facade has that one plan even when
-    the bare route can skip the block-diagonal current solve.  ``sys_dim`` is
-    also deliberately NOT here -- the bare route treats it as a routing
-    condition while the screened mode refuses it only under
-    ``head_correction = full`` (``GATE
-    static_bispinor_photon_head_slab_only``), and one row cannot honestly
-    say both.
-    """
+    """THE envelope of the packed static photon operator, as ONE table; see docs/architecture/decisions.md."""
     yield (config.compute_mode in PACKED_PHOTON_COMPUTE_MODES,
            f"compute_mode = {config.compute_mode.value}",
            "compute_mode in {"
@@ -3611,7 +3299,7 @@ def packed_static_envelope(config, *, screened: bool):
            _ENV_IMPL,
            "the photon response is built once at omega = 0: cohsex is the "
            "static packed mode; the two-point plasmon-pole pair is the DYNAMIC "
-           "packed route (W_00(omega) on the charge block, the twelve current "
+           "packed route (W_00(omega) on the charge block, the fifteen current "
            "blocks frozen at omega = 0); mpa has no independent static-role W, "
            "so its CC block would have no owner and it refuses by name", None)
     yield (config.qp_solver is QPSolver.ONE_SHOT_DFT,
@@ -3630,27 +3318,12 @@ def packed_static_envelope(config, *, screened: bool):
            "heads are always on with bispinors and 'off' is the announced "
            "DEBUG skip (owner ruling 2026-09-01, "
            "docs/architecture/decisions.md; TASTE.md row 20)", None)
-    yield (not bool(config.restart), "restart = true", "restart = false",
-           _ENV_IMPL,
-           "there is no photon restart storage: the packed V/W and the "
-           "Gamma-cell completion are not in the restart schema, so a "
-           "restarted deck would silently fall back to a different q->0 "
-           "head mechanism.  On a slab COHSEX deck this row is normally "
-           "unreachable: GATE "
-           "bispinor_slab_cohsex_restart_changes_the_head_mechanism refuses "
-           "at parse time, naming both mechanisms", None)
     yield (str(config.backend.linalg) == "distributed",
            f"linalg = {config.backend.linalg}",
            "linalg = distributed", _ENV_IMPL,
            "the packed response facade has only the distributed plan", None)
     if not screened:
         return
-    yield (bool(config.memory.low_mem_bands), "low_mem_bands = false",
-           "low_mem_bands = true", _ENV_IMPL,
-           "the sixteen-block no-pair chi0 kernel is written against the "
-           "face layout only.  DERIVED: an unnamed low_mem_bands is set to "
-           "true for this mode at parse time, so this row can only fire on "
-           "an explicit conflicting value", "low_mem_bands")
     _overrides = scalar_head_overrides_named(config)
     yield (not _overrides, ", ".join(_overrides),
            "no scalar q->0 head override named", _ENV_IMPL,
@@ -3661,33 +3334,7 @@ def packed_static_envelope(config, *, screened: bool):
 
 
 def packed_bare_transverse_route(config) -> tuple[bool, str]:
-    """Is the bare-transverse family served by the packed photon path?
-
-    ``bare_transverse`` IS the packed static mode with the twelve current
-    blocks of ``chi`` set to zero: the packed Dyson equation is then block
-    diagonal, ``W_packed = diag(W_00, D_TT)`` with ``W_CT = 0``, and the
-    sixteen-block Sigma consumer returns the screened charge COHSEX in CC,
-    the bare Breit exchange ``Sigma^B`` in TT (``SX(D_TT) = X(D_TT)``,
-    ``COH(D_TT - D_TT) = 0``) and zero in CT/TC -- the incumbent
-    ``gw.sigma_x_bispinor`` result, block for block.  The Gamma completion
-    is the same :func:`gw.head_correction.complete_static_slab_photon_q0`
-    with the charge-only ``R(q)``, which returns ``diag(W^00_h, D_TT)`` and
-    so inserts BOTH the charge head and the bare ``<D_TT>`` that the
-    ``bispinor_tt_head_correction`` overlay writes into the V tiles today.
-
-    The route is taken exactly inside the envelope that completion is
-    derived for, and NOWHERE else: outside it the incumbent
-    charge-screened + ``Sigma^B`` route is the only certified one, and it
-    is unchanged.  Returns ``(taken, reason)`` so the driver can print the
-    first unmet condition instead of switching physics in silence; the
-    predicate and its narration have one owner.
-
-    Not in the predicate on purpose: ``bispinor_tt_head_correction``.  Its
-    value must not move the route -- a deck that asks for the hand TT
-    overlay inside this envelope is REFUSED by
-    :func:`refuse_unsupported_bispinor_gw` (the completion already carries
-    that head, so honouring both would double count it).
-    """
+    """Is the bare-transverse family served by the packed photon path?; see docs/architecture/decisions.md."""
     mode = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
     if mode is not BispinorGWMode.BARE_TRANSVERSE:
@@ -3710,31 +3357,19 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
         return True, "bispinor slab one-shot static COHSEX"
     return True, (
         f"bispinor slab one-shot {config.compute_mode.value} -- the DYNAMIC "
-        "packed route: W_00(omega) on the charge block, the twelve current "
+        "packed route: W_00(omega) on the charge block, the fifteen current "
         "blocks frozen at omega = 0")
 
 
 def packed_photon_screens_current(config) -> bool:
-    """Whether the packed response builds and screens the current blocks.
-
-    The ONE selector between the two packed static modes.  ``True`` for
-    ``full_static_cohsex``: sixteen ``chi`` blocks and one packed Dyson
-    solve.  ``False`` for the bare-transverse family on the packed route:
-    ``chi_TT = chi_CT = 0``, so the packed solve is skipped and the CC
-    block alone is screened by the incumbent scalar owner.
-    """
+    """Whether the packed response builds and screens the current blocks; see docs/architecture/decisions.md."""
     mode = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
     return mode is BispinorGWMode.FULL_STATIC_COHSEX
 
 
 def uses_static_photon_response(config) -> bool:
-    """Whether screening and Sigma use the packed 4x4 photon response.
-
-    Both packed static modes: ``full_static_cohsex`` always, and the
-    bare-transverse family inside :func:`packed_bare_transverse_route`'s
-    envelope.  :func:`packed_photon_screens_current` says which.
-    """
+    """Whether screening and Sigma use the packed 4x4 photon response; see docs/architecture/decisions.md."""
     mode = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
     if mode is BispinorGWMode.FULL_STATIC_COHSEX:
@@ -3743,73 +3378,25 @@ def uses_static_photon_response(config) -> bool:
 
 
 def packed_photon_replaces_charge_sigma(config) -> bool:
-    """Does the packed operator own the WHOLE Sigma, charge channel included?
-
-    True only for ``compute_mode = cohsex``: the sixteen-block consumer
-    produces Sigma_X, Sigma_SX and Sigma_COH from the packed V/W and no
-    scalar charge Sigma, scalar q->0 head or scalar W role survives beside
-    it.
-
-    False on the DYNAMIC packed route, where the charge block is the
-    ordinary scalar ``Sigma_x + Sigma_c(omega)`` on the same ISDF ``W_00``
-    and the packed consumer contributes only the twelve current blocks
-    (``gw.photon_sigma`` ``blocks = "current"``).  Every driver seam that
-    asks "may I skip the scalar charge machinery?" asks THIS, not
-    :func:`uses_static_photon_response` -- the difference is exactly the
-    four call sites in ``gw.gw_jax`` that install head samples, persist W0,
-    build ``static_head_terms`` and read the scalar ``W_by_role``.
-    """
+    """Does the packed operator own the WHOLE Sigma, charge channel included?; see docs/architecture/decisions.md."""
     return (uses_static_photon_response(config)
             and config.compute_mode is ComputeMode.COHSEX)
 
 
 def uses_dynamic_packed_photon_route(config) -> bool:
-    """The packed four-current operator on a frequency-dependent Sigma.
-
-    ``W_packed(omega) = diag(W_00(omega), W_TT, W_CT)``: the charge block
-    carries the run's plasmon-pole model, the current blocks are the
-    ``omega = 0`` packed response.  See
-    ``reports/bisp_n_dynamic_packed_2026-09-01/DESIGN.md`` for the block
-    algebra and the measured bound on what freezing the current blocks
-    costs.
-    """
+    """The packed four-current operator on a frequency-dependent Sigma; see docs/architecture/decisions.md."""
     return (uses_static_photon_response(config)
             and config.compute_mode.ppm_model is not None)
 
 
 def uses_coupled_photon_head(config) -> bool:
-    """Whether the packed photon response runs its Gamma-cell completion.
-
-    True for either packed static mode under ``head_correction = full``
-    (the default; the completion needs the four literal-Gamma channel
-    vectors, which ``gw_init`` retains only when this is true).  False
-    under the DEBUG setting ``head_correction = off``, where the packed
-    V/W keep a zero q=Gamma, G=0 slot.  No third value reaches here:
-    ``full_static_cohsex`` refuses ``no_local_fields`` in its envelope,
-    and a ``no_local_fields`` bare-transverse deck never takes the packed
-    route at all (:func:`packed_bare_transverse_route`).
-    """
+    """Whether the packed photon response runs its Gamma-cell completion; see docs/architecture/decisions.md."""
     return (uses_static_photon_response(config)
             and config.head.correction is HeadCorrection.FULL)
 
 
 def incumbent_bispinor_head_record(config) -> tuple[str, str]:
-    """``(banner, run_record_line)`` for a bispinor deck on the INCUMBENT route.
-
-    Heads are always on (owner ruling 2026-09-01,
-    ``docs/architecture/decisions.md``; TASTE.md row 20).  The packed route
-    has said so since lane B: a boxed ``WARNING -- DEBUG`` banner and a
-    ``Photon head`` line naming the completion.  The incumbent route said
-    only "no special Gamma-cell contribution", in component chatter that
-    production mode sinks -- so a headless bispinor bulk / dynamic /
-    ``x_only`` run reached ``eqp1.dat`` with no DEBUG token anywhere in the
-    run record (lane J section 3.c).
-
-    Returned rather than printed so the policy has ONE owner and a test can
-    read it without a driver.  ``banner`` is ``""`` when there is nothing
-    loud to say.  The caller is :mod:`gw.gw_jax`, and only for decks with
-    ``uses_static_photon_response(config)`` false.
-    """
+    """``(banner, run_record_line)`` for a bispinor deck on the INCUMBENT route; see docs/architecture/decisions.md."""
     if config.head.correction is HeadCorrection.OFF:
         return (
             "\n  ==========================================================\n"
@@ -3835,13 +3422,7 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
 
 
 def refuse_unsupported_bispinor_gw(config) -> None:
-    """Validate four-current modes and require live direct fields for QSGW.
-
-    ``head_correction`` has TWO values on a bispinor deck, ``full`` and
-    ``off`` (owner ruling 2026-09-01, ``docs/architecture/decisions.md``;
-    TASTE.md row 20).  The third scalar value is refused here for EVERY
-    bispinor deck, not just the packed ones -- see the gate below.
-    """
+    """Validate four-current modes and require live direct fields for QSGW; see docs/architecture/decisions.md."""
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
     if (bool(config.bispinor)
@@ -3861,42 +3442,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "never choose a route (lane J section 2/3.d).  Bispinor heads "
             "are on by default and 'off' is the announced DEBUG skip.\n"
             "  doc:  docs/input_reference.md, head_correction.")
-    # A DECK KEY THAT IS NOT A HEAD DIAL MUST NOT CHANGE THE HEAD.  On a
-    # bispinor slab COHSEX deck, flipping ``restart`` alone used to move the
-    # calculation from the packed Gamma-cell completion to the incumbent
-    # scalar band-diagonal head -- silently, with no run-record difference
-    # beyond the routing reason, and worth 5.7 meV on an occupied state's
-    # SX+COH (lane J section 4.2: the two quadratures measured on the SAME
-    # head function, exact Wigner-Seitz vs the production Sobol draw), plus
-    # the whole transverse q=Gamma head.  Photon restart storage is not
-    # built, so the honest answer is to refuse, not to route.
-    if (bool(config.bispinor)
-            and config.compute_mode is ComputeMode.COHSEX
-            and int(config.sys_dim) == 2
-            and bool(config.restart)):
-        raise ValueError(
-            "GATE bispinor_slab_cohsex_restart_changes_the_head_mechanism: "
-            "restart = true is refused on a bispinor slab static-COHSEX "
-            "deck.\n"
-            f"  got:  bispinor = true, compute_mode = cohsex, sys_dim = "
-            f"{config.sys_dim}, restart = true\n"
-            "  want: restart = false, or leave restart unnamed (an unnamed "
-            "restart is set to false for this deck class at parse time, "
-            "with a [config provenance] line)\n"
-            "  why:  IMPLEMENTATION LIMIT.  There is no photon restart "
-            "storage: neither the packed 4x4 V/W nor the Gamma-cell "
-            "completion is in the restart schema.  A restarted deck would "
-            "therefore silently swap ONE q->0 head mechanism for ANOTHER -- "
-            "from the packed completion (exact slab Wigner-Seitz cubature "
-            "of the coupled 4x4 Dyson equation: charge CC q^2 head, charge "
-            "wings, the bare <D_TT> transverse head, optional Hall CT/TC) "
-            "to the incumbent one (a Sobol mini-BZ <v>/W_h inserted band "
-            "diagonally by gw.head_correction's StaticHeadTerms, and NO "
-            "transverse head at all).  Measured difference on MoS2 3x3: "
-            "+5.72 meV on an occupied state's SX+COH from the quadrature "
-            "alone (reports/bisp_j_architecture_review_2026-09-01 section "
-            "4.2), before the missing transverse head.\n"
-            "  doc:  docs/input_reference.md, bispinor_gw / restart.")
     if (bool(config.bispinor)
             and config.qp_solver is QPSolver.SELF_CONSISTENT
             and not bool(config.density_self_consistent)):
@@ -3995,29 +3540,7 @@ def refuse_unsupported_bispinor_gw(config) -> None:
 
 
 def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
-    """Refuse ``bispinor_tt_head_correction = true`` outside its envelope.
-
-    NOT REACHABLE FROM A DECK since 2026-09-01: the key is tombstoned in
-    ``read_lorrax_input`` and :class:`HeadConfig` is built with ``False``,
-    so every parsed config returns on the first line.  This function is
-    the guard for a HAND-BUILT config (tests, tools, an embedded caller)
-    that sets the field itself, which is why the driver-entry call in
-    ``gw.gw_init.prepare_isdf_and_wavefunctions`` remains and the
-    parser-altitude call was dropped.  Lane N deletes both with the
-    incumbent non-packed route.
-
-    Two named conditions, GATE ``bispinor_tt_head_unsupported``:
-
-    1. ``bispinor = false`` — the flag corrects a bare TT V-tile that a
-       non-bispinor run never builds.
-    2. ``sys_dim not in (2, 3)`` — box truncation's q=Γ, G=0 slot is
-       already finite (``vcoul.box_0d.Box0D._v_bare_per_q`` never zeros
-       it), so there is no missing slot to substitute; the bispinor
-       g-flat path also does not reach sys_dim=0 today
-       (``gw.v_q_g_flat`` refuses sys_dim not in (2, 3) at its own
-       entry), so this is a defensive, not merely a redundant, refusal.
-
-    """
+    """Refuse ``bispinor_tt_head_correction = true`` outside its envelope; see docs/architecture/decisions.md."""
     if not bool(config.head.bispinor_tt_head_correction):
         return
     if not bool(config.bispinor):
@@ -4054,25 +3577,8 @@ def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
 
 
 def refuse_explicit_gij_under_low_mem_bands(config, Gij) -> None:
-    """Refuse an explicit dense ``Gij`` operand under ``low_mem_bands = true``.
-
-    This cannot be a deck-key refusal: an explicit ``Gij`` is a keyword-only
-    Python parameter of
-    ``compute_sigma_xc`` / ``compute_cohsex_sigma`` that every shipped
-    driver call site (``gw_jax.py``, ``sc_iteration.py``) leaves at its
-    ``None`` default — ``cohsex_sigma._resolve_Gij``'s docstring names the
-    caller this guards, the SC-COHSEX loop iterating on its own projector.
-    No deck-resolution point ever sees the value, so this is called from
-    ``compute_sigma_xc`` at entry instead, before any Gij-dependent
-    allocation (``build_Gij`` / the dense band-matrix contract) — the one
-    seam that ever sees both ``low_mem_bands`` and a live ``Gij`` operand
-    together.
-
-    NO-OP for ``Gij is None`` (every production call today) or
-    ``low_mem_bands = false``, so this feature existing changes nothing for
-    the vastly more common calls that never touch either axis.
-    """
-    if Gij is None or not bool(config.memory.low_mem_bands):
+    """Require diagonal occupation data for the parent Green contraction."""
+    if Gij is None:
         return
     raise ValueError(
         "GATE low_mem_bands_explicit_gij_unported: "
@@ -4081,8 +3587,7 @@ def refuse_explicit_gij_under_low_mem_bands(config, Gij) -> None:
         "band-space occupation projector)\n"
         "  want: Gij = None (the standard occupation_state path)\n"
         "  fix:  do not pass an explicit Gij under low_mem_bands = true — "
-        "the occupation_state argument already builds one — or set "
-        "low_mem_bands = false\n"
+        "use the occupation_state argument for diagonal weights\n"
         "  why:  cohsex_sigma.build_Gij returns a fully replicated dense "
         "(nk, nb_sigma, nb_sigma) array; under face psi, G and the "
         "Hartree/exchange projection need a face-sharded band-matrix "
@@ -4117,14 +3622,7 @@ def _parse_bgw_metal_q0_vector(value) -> tuple[float, float, float]:
 
 @dataclass(frozen=True)
 class HeadConfig:
-    """q→0 Coulomb-head sources, BGW vcoul override, bare-cutoff knobs.
-
-    All Coulomb-at-small-q tweaks live here.  Σ head plumbing
-    (``wcoul0_*``, ``vhead``/``whead_*``) is consumed by
-    :class:`gw.head_correction.HeadResolver`; the BGW vcoul override is
-    purely diagnostic (matches BGW's per-G mini-BZ averaging exactly for
-    bit-reproducible comparisons).
-    """
+    """q→0 Coulomb-head sources, BGW vcoul override, bare-cutoff knobs; see docs/architecture/decisions.md."""
     correction: HeadCorrection    # full | no_local_fields | off
     wcoul0_source: str            # "s_tensor" | "epshead"
     wcoul0_eta: float
@@ -4158,25 +3656,7 @@ class HeadConfig:
 
 @dataclass(frozen=True)
 class ScreeningConfig:
-    """χ₀ / W screening: method choice + minimax-quadrature knobs.
-
-    ``method`` selects the chi0 frequency treatment, and minimax is the
-    ONLY one LORRAX implements (owner ruling 2026-08-06).  Nothing
-    downstream branches on this field, and that is deliberate -- there is
-    no second branch to take.  Its whole job is the ``__post_init__``
-    check below, which is what makes it honest: before that check the
-    field was pure decoration, so ``screening_method = ctsp`` parsed,
-    normalised, and ran minimax without a word.
-
-    ``diagrams`` is a DIFFERENT axis and it does have a second branch:
-    ``method`` says how the chi0 frequency integral is taken, ``diagrams``
-    says which series W sums (RPA, or the BSE ladder).  The fork lives in
-    ``gw.screening.compute_screening_model`` and nowhere else.  Its
-    default is spelled here as well as in ``_DEFAULTS`` so a hand-built
-    config -- a tool, a test stub -- takes the SAME decision the parser
-    would; a fallback that disagreed with the registered default is the
-    defect the ``restart_q_storage`` note above describes.
-    """
+    """χ₀ / W screening: method choice + minimax-quadrature knobs; see docs/architecture/decisions.md."""
     method: str                   # "minimax" -- the only supported value
     occ_broadening_ev: float      # BGW MP1 width; 0 keeps step occupations
     minimax_target_error: float
@@ -4356,13 +3836,7 @@ class DynamicSigmaConfig:
                 "extrapolation.")
 
     def parsed_omega_patches_ev(self):
-        """The validated ``[(lo, hi), ...]`` patch list, or ``[]``.
-
-        Parsed from ``"lo:hi, lo:hi"``.  Patches must be well-formed
-        (hi > lo), ascending, and separated by at least one step —
-        overlapping or touching patches are a deck typo, refused rather
-        than silently merged.
-        """
+        """The validated ``[(lo, hi), ...]`` patch list, or ``[]``; see docs/architecture/decisions.md."""
         text = str(self.omega_patches_ev or "").strip()
         if not text:
             return []
@@ -4489,12 +3963,7 @@ class MPAConfig:
                     "default 1e-5 Ha = 2e-5 Ry).")
 
     def sample_plan(self, omega_m_ry, *, material_class):
-        """Return the configured double-parallel frequency plan in Ry.
-
-        This is sampling geometry only.  In particular, constructing a
-        metallic plan does not claim that the occupation-weighted χ/Σ
-        evaluators needed to consume it have landed.
-        """
+        """Return the configured double-parallel frequency plan in Ry; see docs/architecture/decisions.md."""
         if self.sampling_alpha is None:
             raise RuntimeError(
                 "mpa_sampling_alpha is unresolved; infer the material class "
@@ -4523,41 +3992,7 @@ METAL_HEAD_UPDATES = ("parallel_transport", "dft_velocity")
 
 @dataclass(frozen=True)
 class SCConfig:
-    """Self-consistency loop knobs (read only when qp_solver=self_consistent).
-
-    Promoted from the ``LORRAX_SC_*`` env vars (NEXT_TARGETS #11); the
-    envs are still honored as deprecated overrides at config construction
-    (``from_input_file`` prints a note when one is active).
-
-    - ``max_iter`` / ``tol_ev``: loop length and RMS-ΔE convergence (eV).
-    - ``accelerator``: ``"rcrop"`` (Anderson-style restart-CROP, default —
-      required for QSGW's typical 2-cycle Jacobian) or ``"linear"``
-      (plain α-mixing, diagnostic).  rCROP makes TWO ``gw_iteration_map``
-      calls per accelerator iteration (trial + residual).
-    - ``history_depth``: rCROP history (m=5 is BGW's QSGW default).
-    - ``mixing``: linear-mixing α (``accelerator="linear"`` only).
-    - ``dump_dir``: per-iteration E/U-history .npy dump dir (None = off).
-    - ``exact_degeneracy_tol_ev``: maximum splitting for the symmetric
-      accidental-degeneracy average.  The default is 0.1 meV; physical SOC
-      splittings above it remain distinct states.
-    - ``tail_fit``: ``"frontier"`` uses the lowest accidental-degeneracy
-      conduction manifold for the energy-only sum-band tail;
-      ``"all_conduction"`` is the historical affine-fit diagnostic control;
-      ``"buffer_edges"`` fits the two tails only to their adjacent diagonal
-      buffers.
-    - ``buffer_nbands``: number of extra valence and conduction states
-      evaluated around the named nval/ncond SC window.  Zero is the exact
-      historical path.
-    - ``buffer_mode``: treatment of those extra states: diagonal-only Sigma,
-      one-sided cross-edge Sigma, or a carried previous-energy reference.
-    - ``eigh``: which eigh diagonalises the ``(nk, nb, nb)`` carry each
-      iteration — ``"native"`` (k-sharded batch: one WHOLE ``(nb, nb)``
-      tile per device), ``"distributed"`` (one tile spread over the mesh),
-      or ``"auto"``.  A LAYOUT choice: it does not change the physics and
-      it is deliberately not a side effect of ``density_self_consistent``,
-      which is what used to select it.  Resolution lives in
-      ``sc_iteration._resolve_sc_eigh``.
-    """
+    """Self-consistency loop knobs (read only when qp_solver=self_consistent); see docs/architecture/decisions.md."""
     max_iter: int
     tol_ev: float
     accelerator: str      # "rcrop" | "linear"
@@ -4624,13 +4059,7 @@ class SCConfig:
 
 @dataclass(frozen=True)
 class EQP2Config:
-    """Fixed-Sigma eigenvalue self-consistency for the opt-in eqp2 file.
-
-    This is deliberately separate from :class:`SCConfig`: it does not
-    rebuild G, chi0, W, or Sigma.  It repeatedly evaluates and rotates the
-    one-shot full-matrix Sigma(omega) table, diagonalizes the resulting QP
-    Hamiltonian, and tests the worst eigenvalue change in eV.
-    """
+    """Fixed-Sigma eigenvalue self-consistency for the opt-in eqp2 file; see docs/architecture/decisions.md."""
 
     enabled: bool = False
     tol_ev: float = 1.0e-3
@@ -4653,20 +4082,14 @@ class EQP2Config:
 
 @dataclass(frozen=True)
 class MemoryConfig:
-    """Per-device memory budget + chunk sizing + AOT chunk-chooser flag.
-
-    ``memory_per_device_gb=0`` triggers GPU auto-detection at config
-    construction time.  ``chunk_target_utilization=0`` is the auto sentinel;
-    a positive ``ISDF_CHUNK_TARGET_UTILIZATION`` value overrides the
-    planner's spin-aware default after clamping to ``[0.85, 1.0]``.
-    """
+    """Per-device memory budget + chunk sizing + AOT chunk-chooser flag; see docs/architecture/decisions.md."""
     per_device_gb: float
     chunk_target_utilization: float
     band_chunk_size: int
     r_chunk_override: int         # 0 = auto
     gflat_chunk_size: int         # 0 = planner-picked
     vq_g_chunk_size: int          # 0 = auto _pick_g_chunk(ngkmax)
-    low_mem_bands: bool           # gw.wavefunction_bundle layout="face"
+    low_mem_bands: bool           # parent ψ layout: face=True, axis=False
     low_mem_bands_provenance: str  # deck | default | derived for packed mode
 
 
@@ -4703,11 +4126,7 @@ class DebugConfig:
 
 @dataclass(frozen=True)
 class BSEConfig:
-    """BSE interpolation setup (htransform-driven fine-k wfn recovery).
-
-    See ``bandstructure.bse_setup.compute_wfns_fi``.  ``get_centroids_fi``
-    is the master gate; if False the rest is unused.
-    """
+    """BSE interpolation setup (htransform-driven fine-k wfn recovery); see docs/architecture/decisions.md."""
     get_centroids_fi: bool
     wfn_fi_min: int
     wfn_fi_max: int
@@ -4726,16 +4145,7 @@ _OCC_WIDTH_RTOL = 1.0e-4
 
 
 def _validate_occupation_smearing(screening, family, width_ry):
-    """Validate the occupation-smearing pair without classifying the WFN.
-
-    THE WIDTH CONVENTION, stated once, here, because two keys carry it.
-    ``occ_smearing_width_ry`` and ``occ_broadening`` are the SAME width in
-    different units: BerkeleyGW's ``occ_broadening``, whose MP1 argument is
-    ``(E - mu) / (2 * width)``.  The QE ``degauss`` is TWICE it.  A deck
-    that sets both and disagrees is refused below rather than silently
-    resolved, because the two ways of being wrong (halving or doubling the
-    smearing) are indistinguishable in the output.
-    """
+    """Validate the occupation-smearing pair without classifying the WFN; see docs/architecture/decisions.md."""
     if (family is None) != (width_ry is None):
         raise ValueError(
             "occ_smearing_family and occ_smearing_width_ry must be set "
@@ -4824,11 +4234,7 @@ def validate_material_inputs(config, material_class):
 
 
 def resolve_mpa_sampling_alpha(config, material_class, *, print_fn=print):
-    """Resolve and report the MPA sampling exponent from WFN material class.
-
-    This runs only after occupations are loaded: fractional occupations select
-    2, while integer-occupation nonmetals select 1.  A deck value wins.
-    """
+    """Resolve and report the MPA sampling exponent from WFN material class; see docs/architecture/decisions.md."""
     if material_class not in ("insulator", "metal"):
         raise ValueError(f"unknown inferred material class {material_class!r}")
     named = "mpa_sampling_alpha" in config.raw_input_keys
@@ -4855,26 +4261,7 @@ def resolve_mpa_sampling_alpha(config, material_class, *, print_fn=print):
 
 @dataclass(frozen=True)
 class LorraxConfig:
-    """Unified, immutable configuration for a LORRAX GW calculation.
-
-    Created once via :meth:`from_input_file` and threaded through the
-    entire driver.  Top-level fields are ``hot-path`` reads (system
-    geometry + the orthogonal mode flags); group sub-dataclasses
-    organise the remaining ~70 input keys along the same axes the
-    input file's section comments already use.
-
-    Access pattern::
-
-        config.compute_mode           # -> ComputeMode enum
-        config.head.wcoul0_source     # head plumbing
-        config.ppm.omega_p            # PPM probe ω
-        config.sigma.omega_grid_ev    # shared dynamic-Sigma frequency grid
-        config.debug.sigma_freq_debug_output
-
-    See module docstring for the full grouping.  ``cohsex.in`` keys
-    are unchanged — input files written for prior versions still parse
-    (the factory unflattens the dict into sub-dataclasses).
-    """
+    """Unified, immutable configuration for a LORRAX GW calculation; see docs/architecture/decisions.md."""
 
     # --- System geometry (top-level; hot path) ---
     nval: int
@@ -5063,63 +4450,14 @@ class LorraxConfig:
 
     @property
     def occ_broadening_ry(self) -> float:
-        """THE occupation-smearing width consumed at runtime, in Ry.
-
-        One width, one owner.  Every MP1 solve in the driver reads this
-        and nothing else, so the two deck keys that carry the width can
-        no longer feed different numbers into different stages.
-
-        CONVENTION — BerkeleyGW's, not QE's.  ``gw.efermi``'s MP1
-        argument is ``(E - mu) / (2 * width)`` (``_mp1_values``), the same
-        form BerkeleyGW uses (``Common/input_utils.f90:380``), so this
-        width is HALF the QE ``degauss``.  Measured, not asserted: at
-        ``degauss = 0.02 Ry`` the sodium SOC deck's BGW arm reproduces
-        QE's own stored occupations to 7.1e-12 with ``occ_broadening =
-        0.13605693122994 eV = 0.01 Ry`` (CLAIMS 185), and LORRAX's mu
-        lands 6.2e-7 eV from QE's E_F at the same width (CLAIMS 180).
-        ``OccupationState.smearing_width_ry`` — the field this feeds and
-        the one stamped into the MPA fit store — is the same quantity
-        under the same name.
-
-        SOURCE.  ``occ_smearing_width_ry`` when the deck declares it (the
-        metal path); otherwise ``occ_broadening`` converted from eV, which
-        is every insulating and pre-metal deck and is bit-for-bit what
-        those decks used before this key existed.  When both are set
-        ``_validate_occupation_smearing`` has already refused any
-        disagreement beyond ``_OCC_WIDTH_RTOL``, so the branch cannot
-        change the physics of a deck that carries both — it only decides
-        which of two agreeing numbers is the exact one, and the deck's own
-        Ry value is the one that did not make a round trip through eV.
-
-        NOT A DIAL.  ``occ_broadening == 0`` remains the switch that
-        selects step occupations (``sc_iteration._solve_head_occupations``
-        and the metal V_H rebuild both read it as such); this property
-        answers "how wide", never "whether".
-        """
+        """THE occupation-smearing width consumed at runtime, in Ry; see docs/architecture/decisions.md."""
         if self.occ_smearing_width_ry is not None:
             return float(self.occ_smearing_width_ry)
         return float(self.screening.occ_broadening_ev) / RYD_TO_EV
 
     @property
     def compute_mode(self) -> ComputeMode:
-        """Resolve ``compute_mode`` from explicit input or legacy flags.
-
-        ``compute_mode = auto`` (the default) infers from
-        ``do_screened`` / ``use_ppm_sigma`` / ``ppm.model``.  An explicit
-        setting overrides them; the legacy fields are still parsed for
-        back-compat but the enum is the load-bearing axis the driver
-        pivots on.
-
-        RESOLVING IS NOT PERMITTING.  This property answers "which mode
-        did the deck ask for", and it answers it for every member of the
-        enum including the ones whose Σ stage has not landed — the
-        refusal for those is
-        :func:`refuse_unimplemented_compute_mode`, called at driver
-        entry, so that config-only consumers (the deck echo, the layering
-        tests, an operator reading a config back) can name the mode
-        without tripping over it.  ``auto`` never infers an unimplemented
-        mode: the legacy flags it reads predate all of them.
-        """
+        """Resolve ``compute_mode`` from explicit input or legacy flags; see docs/architecture/decisions.md."""
         raw = (self.compute_mode_raw or "auto").strip().lower()
         if raw == "auto":
             if self.use_ppm_sigma:
@@ -5153,26 +4491,7 @@ class LorraxConfig:
 
     @property
     def qp_solver(self) -> QPSolver:
-        """Resolve ``qp_solver`` from explicit input or legacy flags.
-
-        ``qp_solver = auto`` (the default) resolves:
-
-        1. ``self_consistent = true`` → ``SELF_CONSISTENT`` (deprecated
-           key, still honored);
-        2. else → ``ONE_SHOT_DFT`` — the one-shot full-matrix
-           effective-Hamiltonian route is the default.
-           (The deprecated ``sigma_at_dft_energies = true`` alias also
-           lands here: its intended meaning — authoritative at-DFT QP
-           evaluation — IS the default.)
-
-        An explicit setting overrides the legacy flags, mirroring how
-        ``compute_mode`` absorbs ``do_screened`` / ``use_ppm_sigma``.
-
-        Validation (mutually inconsistent axis combinations):
-
-        - ``fixed_point`` × static mode → error (no ω-grid to solve on;
-          a silent no-op would blur the axis).
-        """
+        """Resolve ``qp_solver`` from explicit input or legacy flags; see docs/architecture/decisions.md."""
         raw = (self.qp_solver_raw or "auto").strip().lower()
         if raw == "auto":
             solver = (QPSolver.SELF_CONSISTENT if self.self_consistent
@@ -5214,17 +4533,7 @@ class LorraxConfig:
 
     @property
     def omega_grid_ev(self):
-        """Σ_c(ω) frequency grid in eV (length-stable single formula).
-
-        ``n = floor((max−min)/step + 0.5) + 1`` — the Ry grid is derived
-        from this one by division so the two can never disagree in length
-        or accumulate independent float-step rounding.
-
-        With ``sigma_omega_patches_ev`` set, the grid is the union of the
-        patches, each built by the SAME length-stable formula, ascending
-        by the patch validation.  ``sigma_omega_min/max_ev`` are ignored
-        then — the patches ARE the grid.
-        """
+        """Σ_c(ω) frequency grid in eV (length-stable single formula); see docs/architecture/decisions.md."""
         if (getattr(self, "qp_solver", None) is QPSolver.SELF_CONSISTENT
                 and getattr(self, "sc_omega_grid_ev", None) is not None):
             # The SC session's sampled support, grown only when a retained
@@ -5274,623 +4583,36 @@ class LorraxConfig:
         runtime_platform: str | None = None,
         resolve_hardware: bool = True,
     ) -> LorraxConfig:
-        """Parse input file and resolve runtime settings (memory, env vars).
-
-        Replaces ``read_cohsex_input`` + ``resolve_runtime_config`` +
-        path resolution in one call.  Returns a ``LorraxConfig`` with
-        sub-dataclasses fully populated.
-        unknown-key policy. ``runtime_platform`` is an injected ``cpu`` or
-        ``gpu`` answer for a preflight that has no target device. With
-        ``resolve_hardware=False``, an auto memory budget stays at its zero
-        sentinel and no device-memory probe is made; explicit deck budgets
-        remain resolved. Production callers use all defaults.
-        """
+        """Produce resolved input settings; see docs/architecture/decisions.md."""
         from file_io import resolve_input_paths
-
         params = read_lorrax_input(filename)
         _linalg = params[_LINALG_RESOLUTION]
         input_dir = os.path.dirname(os.path.abspath(filename))
         resolve_input_paths(params, input_dir)
-
-        # --- Memory auto-detection ---
-        memory_per_device_gb = float(params.get("memory_per_device_gb", 0.0))
-        if memory_per_device_gb <= 0 and resolve_hardware:
-            from common.gpu_utils import get_device_memory_gb
-            memory_per_device_gb = get_device_memory_gb()
-            print_fn(
-                f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device"
-            )
-
-        # --- Chunk utilization from env ---
-        # 0.0 (default) = auto: the planner uses its ns²-aware default
-        # (higher for scalar, lower for bispinor's 4× pair density).  A
-        # positive env value overrides it, clamped to [0.85, 1.0].
-        # ``env_float`` announces a non-numeric value instead of swallowing
-        # it — the bare ``except Exception`` here left the user believing a
-        # utilization was in force when it was not.
-        chunk_utilization = env_float("ISDF_CHUNK_TARGET_UTILIZATION", 0.0,
-                                      print_fn=print_fn)
-        if chunk_utilization > 0:
-            chunk_utilization = max(0.85, min(1.0, chunk_utilization))
-
-        def _g(key):
-            return params.get(key, _DEFAULTS.get(key))
-
-        # Resolve the bundled metallic q0 contract before constructing any
-        # typed group.  ``mc_average_vcoul_body`` defaults to true for every
-        # historical deck, but BGW's noavg metal comparison requires false.
-        # Only an EXPLICIT contradictory value refuses: an absent key is the
-        # compatibility case this bundle exists to override, while an
-        # explicit false is already compatible and remains visible in the
-        # provenance line.
-        _bgw_q0_mode = _normalize_bgw_metal_q0_treatment(
-            _g("bgw_metal_q0_treatment"))
-        _bgw_q0_vector = _parse_bgw_metal_q0_vector(
-            _g("bgw_metal_q0_vector"))
-        if _bgw_q0_mode == "bgw_q0shift" and int(_g("sys_dim")) != 3:
-            raise ValueError(
-                "bgw_metal_q0_treatment = bgw_q0shift is defined only for "
-                "3-D metals (sys_dim = 3); this deck sets "
-                f"sys_dim = {int(_g('sys_dim'))}.")
-        _named_keys = frozenset(params.get(_DECK_NAMED_KEYS, ()))
-        _effective_named_keys = set(_named_keys)
-        if "mpa_sigma_sector_target_error" in _named_keys:
-            raise ValueError(
-                "mpa_sigma_sector_target_error is retired: MPA Sigma now "
-                "uses one uniform denominator-box rule per product window "
-                "and has no measured-sector error apportionment. Remove the "
-                "key and use sigma_quadrature_eps (default 1e-4).")
-        if "mpa_sigma_max_nodes" in _named_keys:
-            raise ValueError(
-                "mpa_sigma_max_nodes is retired (2026-09-02): the pair "
-                "ceiling is eliminated and the box plan never refuses on "
-                "count. Remove the key; sigma_quadrature_eps is the only "
-                "accuracy dial.")
-        if "sigma_regularization_floor_ev" in _named_keys:
-            raise ValueError(
-                "sigma_regularization_floor_ev is retired (2026-09-02): "
-                "sigma_regularization_ev is the broadening every ansatz "
-                "runs at and nothing raises it. Remove the key.")
-        if _bgw_q0_mode == "exact":
-            # An explicit spelling of the shipping default must serialize to
-            # the same LorraxConfig as an absent key.  ``raw_input_keys`` is
-            # otherwise the one field that would distinguish them.
-            _effective_named_keys.discard("bgw_metal_q0_treatment")
-            if _bgw_q0_vector == _parse_bgw_metal_q0_vector(
-                    _DEFAULTS["bgw_metal_q0_vector"]):
-                _effective_named_keys.discard("bgw_metal_q0_vector")
-        _mc_average_vcoul_body = bool(_g("mc_average_vcoul_body"))
-        if _bgw_q0_mode == "bgw_q0shift":
-            if ("mc_average_vcoul_body" in _named_keys
-                    and _mc_average_vcoul_body):
-                raise ValueError(
-                    "contradictory deck settings: "
-                    "bgw_metal_q0_treatment = bgw_q0shift requires "
-                    "mc_average_vcoul_body = false, but the deck explicitly "
-                    "sets mc_average_vcoul_body = true. Remove that key or "
-                    "set it to false.")
-            _mc_origin = (
-                "explicit compatible mc_average_vcoul_body=false"
-                if "mc_average_vcoul_body" in _named_keys
-                else "inherited mc_average_vcoul_body=true")
-            print_fn(
-                "  [config provenance] bgw_metal_q0_treatment="
-                "bgw_q0shift: overriding mc_average_vcoul_body -> false "
-                f"({_mc_origin}); q0 reduced vector="
-                f"{_bgw_q0_vector}. Analytic-sphere v-head and finite-q0 "
-                "W head/wings are enabled; eta/broadening and MPA "
-                "quadrature are unchanged.")
-            _mc_average_vcoul_body = False
-
-        # --- Build sub-dataclasses ---
-        cents_curr = _g("centroids_file_current")
-        cents_curr_resolved = str(cents_curr) if cents_curr else None
-        paths = FilePaths(
-            wfn_file=str(_g("wfn_file")),
-            centroids_file=str(_g("centroids_file")),
-            centroids_file_current=cents_curr_resolved,
-            kin_ion_file=str(_g("kin_ion_file")),
-            parallel_transport_file=str(_g("parallel_transport_file")),
-            static_gauge_hall_file=str(_g("static_gauge_hall_file")),
-            sigma_diag_file=str(_g("sigma_diag_file")),
-            eqp0_file=str(_g("eqp0_file")),
-            eqp1_file=str(_g("eqp1_file")),
-            eqp2_file=str(_g("eqp2_file")),
-            report_file=str(_g("report_file")),
-            sigma_omega_h5_file=str(_g("sigma_omega_h5_file")),
-        )
-        _head_correction = coerce_head_correction(_g("head_correction"))
-        _legacy_do_g0 = bool(_g("do_G0"))
-        if "do_G0" in _named_keys:
-            legacy_policy = (
-                HeadCorrection.FULL if _legacy_do_g0
-                else HeadCorrection.OFF)
-            if ("head_correction" in _named_keys
-                    and ((_head_correction is HeadCorrection.OFF)
-                         != (legacy_policy is HeadCorrection.OFF))):
-                raise ValueError(
-                    "contradictory deck settings: legacy do_G0 and "
-                    "head_correction request opposite Gamma-head policies. "
-                    "Remove do_G0 and use head_correction = full | "
-                    "no_local_fields | off.")
-            if "head_correction" not in _named_keys:
-                _head_correction = legacy_policy
-                print_fn(
-                    "  [config provenance] legacy do_G0 explicitly set: "
-                    f"mapping it to head_correction = "
-                    f"{_head_correction.value}. Prefer the named policy in "
-                    "new decks.")
-        _resolved_do_g0 = _head_correction is not HeadCorrection.OFF
-
-        head = HeadConfig(
-            correction=_head_correction,
-            wcoul0_source=str(_g("wcoul0_source")).strip().lower(),
-            wcoul0_eta=float(_g("wcoul0_eta") or 0.0),
-            vhead=_g("vhead"),
-            whead_0freq=_g("whead_0freq"),
-            whead_imfreq=_g("whead_imfreq"),
-            mc_average_vcoul_body=_mc_average_vcoul_body,
-            bgw_metal_q0_treatment=_bgw_q0_mode,
-            bgw_metal_q0_vector=_bgw_q0_vector,
-            mc_average_placement=_normalize_placement(
-                _g("mc_average_placement")),
-            mc_average_placement_vcoul=(
-                str(_g("mc_average_placement_vcoul") or "") or None),
-            head_minibz_average=bool(_g("head_minibz_average")),
-            # NOT a deck key any more (tombstoned above).  The field stays
-            # so the incumbent non-packed TT overlay owner
-            # (gw.v_q_bispinor._make_per_q_v_builder_for_tile) keeps ONE
-            # place to read, and so a hand-built config that sets it True
-            # still meets refuse_unsupported_bispinor_tt_head_correction.
-            # Lane N deletes the field with the incumbent route.
-            bispinor_tt_head_correction=False,
-            w_av_first_neighbors=bool(_g("w_av_first_neighbors")),
-            w_av_second_neighbors=bool(_g("w_av_second_neighbors")),
-            bare_coulomb_cutoff=_g("bare_coulomb_cutoff"),
-            zeta_cutoff=_g("zeta_cutoff"),
-            use_bgw_vcoul=bool(_g("use_bgw_vcoul")),
-            bgw_vcoul_file=(str(_g("bgw_vcoul_file")) or None),
-            bgw_vcoul_sym_wfn=(str(_g("bgw_vcoul_sym_wfn")) or None),
-        )
-        screening = ScreeningConfig(
-            method=str(_g("screening_method")).strip().lower(),
-            occ_broadening_ev=float(_g("occ_broadening")),
-            minimax_target_error=float(_g("minimax_target_error")),
-            minimax_max_nodes=int(_g("minimax_max_nodes")),
-            regenerate_minimax_tables=bool(_g("regenerate_minimax_tables")),
-            minimax_energy_reference=str(_g("minimax_energy_reference")).strip().lower(),
-            diagrams=coerce_screening_diagrams(_g("screening_diagrams")),
-            ladder_probe_chunk=int(_g("ladder_probe_chunk")),
-        )
-        ppm = PPMConfig(
-            model=str(_g("ppm_model")).strip().lower(),
-            omega_p=float(_g("ppm_omega_p")),
-            fallback_omega=float(_g("ppm_fallback_omega")),
-            head_omega_h_ry=(
-                float(_g("ppm_head_omega_h_ry"))
-                if _g("ppm_head_omega_h_ry") is not None else None),
-            probe_chi_reuse=str(_g("ppm_probe_chi_reuse")).strip().lower(),
-            invalid_mode=str(_g("ppm_invalid_mode") or "static_limit").strip().lower(),
-        )
-        mpa = MPAConfig(
-            n_poles=int(_g("mpa_n_poles")),
-            sampling_alpha=(
-                int(_g("mpa_sampling_alpha"))
-                if _g("mpa_sampling_alpha") is not None else None),
-            sampling_alpha_provenance=(
-                "deck" if "mpa_sampling_alpha" in _named_keys
-                else "unresolved"),
-            sampling_schedule=str(
-                _g("mpa_sampling_schedule")).strip().lower(),
-            pole_solver=str(_g("mpa_pole_solver")).strip().lower(),
-            varpi_near_ry=float(_g("mpa_varpi_near_ry")),
-            varpi_far_ry=float(_g("mpa_varpi_far_ry")),
-            metal_origin_shift_ry=(
-                float(_g("mpa_metal_origin_shift_ry"))
-                if _g("mpa_metal_origin_shift_ry") is not None else None),
-            pole_batch_size=int(_g("mpa_pole_batch_size")),
-            overwrite_completed_artifacts=bool(
-                _g("mpa_overwrite_completed_artifacts")),
-            occupation_window_threshold=float(
-                _g("occupation_window_threshold")),
-            fit_reuse_file=(str(_g("mpa_fit_reuse_file")) or None),
-        )
-        sigma = DynamicSigmaConfig(
-            omega_min_ev=float(_g("sigma_omega_min_ev")),
-            omega_max_ev=float(_g("sigma_omega_max_ev")),
-            omega_step_ev=float(_g("sigma_omega_step_ev")),
-            regularization_ev=float(_g("sigma_regularization_ev")),
-            window_edge_factor=float(_g("sigma_window_edge_factor")),
-            fermi_reference=str(_g("fermi_reference")).strip().lower(),
-            quadrature_eps=float(_g("sigma_quadrature_eps")),
-            quadrature_reduction_seconds=float(
-                _g("sigma_quadrature_reduction_seconds")),
-            quadrature_reduction_steps=(
-                None if _g("sigma_quadrature_reduction_steps") is None
-                else int(_g("sigma_quadrature_reduction_steps"))),
-            quadrature_cache_dir=str(
-                _g("sigma_quadrature_cache_dir")).strip(),
-            sigma_at_dft_extrapolate=bool(_g("sigma_at_dft_extrapolate")),
-            sigma_at_dft_energies=bool(_g("sigma_at_dft_energies")),
-            omega_patches_ev=str(_g("sigma_omega_patches_ev")).strip(),
-            band_extrapolation_estimator=str(
-                _g("band_extrapolation_estimator")
-                or BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT).strip().lower(),
-            band_extrapolation_bracket_scheme=str(
-                _g("band_extrapolation_bracket_scheme")
-                or BRACKET_SCHEME_DEFAULT).strip().lower(),
-            band_extrapolation_bracket_scheme_explicit=(
-                "band_extrapolation_bracket_scheme" in _named_keys),
-            **dict(zip(
-                ("band_extrapolation", "band_extrapolation_explicit"),
-                resolve_band_extrapolation(
-                    _g("use_band_extrapolation"),
-                    _g("sigma_band_extrapolation"),
-                    print_fn=_print_deck_report))),
-        )
-        # With patches, omega_min/max_ev ARE the patch hull.  Consumers
-        # read these fields as "the Σ grid's reach" (the SC partition's
-        # in-grid classification above all); leaving them at the deck
-        # defaults silently scissored every band outside [-5, +5] on the
-        # first patched run — Σ was computed on the deep clusters and
-        # then never consulted (measured: arm 21, SC partition 2/48).
-        _patches = sigma.parsed_omega_patches_ev()
-        if _patches:
-            sigma = _dc_replace(
-                sigma, omega_min_ev=float(_patches[0][0]),
-                omega_max_ev=float(_patches[-1][1]))
-        _occ_family = _g("occ_smearing_family")
-        _occ_family = (
-            str(_occ_family).strip().lower()
-            if _occ_family is not None else None)
-        _occ_width = _g("occ_smearing_width_ry")
-        _occ_width = float(_occ_width) if _occ_width is not None else None
-        _validate_occupation_smearing(screening, _occ_family, _occ_width)
-        # SC loop knobs.  The LORRAX_SC_* env vars are deprecated overrides
-        # of the sc_* input keys (kept so existing sweep scripts run
-        # unchanged); a note is printed whenever one is active.
-        def _sc_env(env_key: str, cast, file_val, input_key: str):
-            raw_env = os.environ.get(env_key)
-            if raw_env is None or raw_env == "":
-                return file_val
-            val = cast(raw_env)
-            print_fn(
-                f"  [config] {env_key}={raw_env} (deprecated env override; "
-                f"set '{input_key} = {raw_env}' in cohsex.in instead)")
-            return val
-
-        sc = SCConfig(
-            max_iter=_sc_env(
-                "LORRAX_SC_MAX_ITER", int, int(_g("sc_max_iter")),
-                "sc_max_iter"),
-            tol_ev=_sc_env(
-                "LORRAX_SC_TOL_EV", float, float(_g("sc_tol_ev")),
-                "sc_tol_ev"),
-            accelerator=_sc_env(
-                "LORRAX_SC_ACCEL", lambda s: str(s).strip().lower(),
-                str(_g("sc_accelerator")).strip().lower(), "sc_accelerator"),
-            history_depth=_sc_env(
-                "LORRAX_SC_DEPTH", int, int(_g("sc_history_depth")),
-                "sc_history_depth"),
-            mixing=_sc_env(
-                "LORRAX_SC_MIXING", float, float(_g("sc_mixing")),
-                "sc_mixing"),
-            dump_dir=_sc_env(
-                "LORRAX_SC_DUMP_DIR", str, str(_g("sc_dump_dir") or ""),
-                "sc_dump_dir") or None,
-            exact_degeneracy_tol_ev=float(
-                _g("sc_exact_degeneracy_tol_ev")),
-            tail_fit=str(_g("sc_tail_fit")).strip().lower(),
-            buffer_nbands=int(_g("sc_buffer_nbands")),
-            buffer_mode=str(_g("sc_buffer_mode")).strip().lower(),
-            # No env override: the LORRAX_SC_* envs are deprecated and a
-            # new knob must not add one.
-            eigh=_linalg.sc_eigh,
-            head_update=str(_g("sc_head_update")).strip().lower(),
-        )
-        eqp2 = EQP2Config(
-            enabled=bool(_g("write_eqp2")),
-            tol_ev=float(_g("eqp2_tol_ev")),
-            max_iter=int(_g("eqp2_max_iter")),
-            accelerator=str(_g("eqp2_accelerator")).strip().lower(),
-            history_depth=int(_g("eqp2_history_depth")),
-        )
-        memory = MemoryConfig(
-            per_device_gb=memory_per_device_gb,
-            chunk_target_utilization=chunk_utilization,
-            band_chunk_size=AUTOMATIC_BAND_CHUNK_SIZE,
-            r_chunk_override=int(_g("r_chunk_size")),
-            gflat_chunk_size=int(_g("gflat_chunk_size")),
-            vq_g_chunk_size=int(_g("vq_g_chunk_size")),
-            low_mem_bands=bool(_g("low_mem_bands")),
-            low_mem_bands_provenance=(
-                "deck" if "low_mem_bands" in _named_keys else "default"),
-        )
-        # Lower the one layout profile to platform libraries.  This is a
-        # capability choice inside the already-resolved profile: GPU uses
-        # cuSolverMp/cuBLASMp; CPU uses ScaLAPACK.
-        _transverse_zeta_rcond = float(_g("transverse_zeta_rcond"))
-        if not (0.0 < _transverse_zeta_rcond < 1.0):
-            raise ValueError(
-                f"transverse_zeta_rcond={_transverse_zeta_rcond!r} must be "
-                f"a relative cutoff in (0, 1).")
-        if runtime_platform is not None:
-            platform = str(runtime_platform).strip().lower()
-            if platform not in ("cpu", "gpu", "cuda"):
-                raise ValueError(
-                    "runtime_platform must be cpu or gpu/cuda, got "
-                    f"{runtime_platform!r}")
-            _is_cpu_backend = platform == "cpu"
-        else:
-            try:
-                import jax as _jax
-                _is_cpu_backend = _jax.default_backend() == "cpu"
-            except Exception:
-                _is_cpu_backend = False
-        _dist_lu = _linalg.distributed_lu
-        _dist_chol = _linalg.distributed_cholesky
-        if _dist_lu == "distributed":
-            _dist_lu = "scalapack" if _is_cpu_backend else "cusolvermp"
-        elif _dist_lu == "auto" and _is_cpu_backend:
-            _dist_lu = "off"
-        backend = BackendConfig(
-            linalg=_linalg.layout,
-            linalg_provenance=_linalg.provenance,
-            w_dyson_solver=_linalg.w_dyson_solver,
-            distributed_cholesky=_dist_chol,
-            distributed_lu=_dist_lu,
-            distrib_la_batched_route=_linalg.batched_route,
-            eigh_backend=_linalg.eigh_backend,
-            zeta_ridge=float(_g("zeta_ridge")),
-            charge_zeta_solve=_linalg.charge_zeta_solve,
-            distributed_zeta_solve=_linalg.distributed_zeta_solve,
-            zeta_rcond=float(_g("zeta_rcond")),
-            transverse_zeta_solve=_linalg.transverse_zeta_solve,
-            transverse_zeta_rcond=_transverse_zeta_rcond,
-            gamma_contract_mode=str(_g("gamma_contract_mode")).strip().lower(),
-        )
-        # Same treatment, same reason, for the restart q-set.  Validated
-        # here and NOT resolved here: ``auto`` resolves against the closure
-        # answer, which needs the run's centroid set and its symmetry
-        # tables, so the field below is the RAW request and
-        # ``gw.restart_q_storage.resolve_restart_q_storage`` turns it into a
-        # mode once those exist.  The ``_raw`` suffix says which kind it is — the
-        # same convention ``compute_mode_raw`` / ``qp_solver_raw`` use.)
-        from gw.restart_q_storage import RESTART_Q_STORAGE
-        # The ``or`` fallback must agree with ``_DEFAULTS`` — it is reached
-        # only by a caller that built the params dict by hand and left the
-        # key out, and a fallback that disagreed with the registered default
-        # would make THAT caller silently take a different storage decision.
-        _restart_q_storage = str(
-            _g("restart_q_storage") or "auto").strip().lower()
-        if _restart_q_storage not in RESTART_Q_STORAGE:
-            raise ValueError(
-                f"restart_q_storage={_restart_q_storage!r} is not one of "
-                f"{RESTART_Q_STORAGE}.  This key selects the q-set the "
-                "restart tensors are STORED on; a value nobody recognises "
-                "is not silently read as the default.")
-
-        from file_io.qp_wfn import QP_ROTATIONS_K_STORAGE
-        # Same ``or`` caveat as above: this fallback is reached only by a
-        # hand-built params dict and must agree with ``_DEFAULTS``.
-        _qp_rot_k_storage = str(
-            _g("qp_rotations_k_storage") or "auto").strip().lower()
-        if _qp_rot_k_storage not in QP_ROTATIONS_K_STORAGE:
-            raise ValueError(
-                f"qp_rotations_k_storage={_qp_rot_k_storage!r} is not one "
-                f"of {QP_ROTATIONS_K_STORAGE}.  This key selects the k-set "
-                "qp_wfn_rotations.h5 is STORED on; a value nobody "
-                "recognises is not silently read as the default.")
-
-        debug = DebugConfig(
-            sigma_freq_debug_output=bool(_g("sigma_freq_debug_output")),
-            sigma_freq_debug_file=str(_g("sigma_freq_debug_file")),
-            write_wfn_h5=bool(_g("write_wfn_h5")),
-        )
-        bse = BSEConfig(
-            get_centroids_fi=bool(_g("get_centroids_fi")),
-            wfn_fi_min=int(_g("wfn_fi_min")),
-            wfn_fi_max=int(_g("wfn_fi_max")),
-            kgrid_fi=str(_g("kgrid_fi") or ""),
-            wfn_fi_q_chunk=int(_g("wfn_fi_q_chunk")),
-        )
-        if bse.wfn_fi_q_chunk < 0:
-            raise ValueError(
-                f"wfn_fi_q_chunk={bse.wfn_fi_q_chunk} invalid; expected >= 1, "
-                f"or 0 for the default (= N_q_co, the coarse k-point count).")
-
-        # BAND COUNTS.  ``read_lorrax_input`` already resolved them (once) and
-        # left the answer in the params dict; a hand-made dict that never went
-        # through the parser gets resolved here instead.  Either way there is
-        # exactly one ``resolve_band_counts`` call per config.
-        _bands = params.get(_BAND_COUNTS)
-        if not isinstance(_bands, BandCounts):
-            _bands = resolve_band_counts(params)
-
-        # ζ-fit window top.  Empty / unset collapse to None — "follow the
-        # loaded window".  An EXPLICIT value is stored verbatim, INCLUDING one
-        # that equals ``bands.isdf``.
-        #
-        # WHY IT IS NO LONGER ERASED HERE (2026-08-22).  This used to rewrite
-        # ``zeta_nband == bands.isdf`` to None, reasoning that a redundant
-        # restatement of the default must take the default path "pad and all".
-        # It is not redundant, because ``bands.isdf`` is the LOGICAL count and
-        # the edge the fit actually gets is ``BandSlices.b4`` — that count
-        # ROUNDED UP to the world size.  On P=4 a scalar-Si deck with
-        # ``nband = zeta_nband = 14`` silently fitted [0,16) and then refused,
-        # correctly, because band 16 cuts a multiplet; the deck had asked for
-        # 14 and no banner ever said otherwise (JID 57152792,
-        # runs/Si_scalar/11_scalar_v_rootcause_20260817/).
-        #
-        # The collapse still exists — it just happens where the padded edge is
-        # known, in ``gw.gw_init.resolve_zeta_fit_edge``, which is also the one
-        # place the banner and the three fit-window consumers read.  A deck
-        # whose ``nband`` already divides the world size is unchanged.
-        _zeta_nband_raw = _g("zeta_nband")
-        if _zeta_nband_raw in (None, ""):
-            _zeta_nband = None
-        else:
-            _zeta_nband = int(_zeta_nband_raw)
-            if _zeta_nband < 1 or _zeta_nband > _bands.isdf:
-                raise ValueError(
-                    f"zeta_nband={_zeta_nband} must be in [1, {_bands.isdf}] "
-                    f"— the ISDF fit's band-window top, which is "
-                    f"max(number_bands_chi={_bands.chi}, "
-                    f"number_bands_sigma={_bands.sigma}).  zeta_nband NARROWS "
-                    f"the band window ζ is fitted on; it cannot widen it, "
-                    f"because the centroid ψ this run loads spans [b0, b4) "
-                    f"and there are no bands above b4 to fit.  Raise "
-                    f"number_bands (or whichever of number_bands_chi / "
-                    f"number_bands_sigma is the larger) if you want more "
-                    f"bands in the fit AND in the band sum that owns them.")
-
-        resolved = cls(
-            # Top-level: system + mode flags
-            nval=int(_g("nval")),
-            ncond=int(_g("ncond")),
-            nband=int(_bands.isdf),
-            bands=_bands,
-            zeta_nband=_zeta_nband,
-            sys_dim=int(_g("sys_dim")),
-            density_self_consistent=bool(_g("density_self_consistent")),
-            sc_on_ibz=bool(_g("sc_on_ibz")),
-            occ_smearing_family=_occ_family,
-            occ_smearing_width_ry=_occ_width,
-            occupation_clamp_tol=float(_g("occupation_clamp_tol")),
-            restart=bool(_g("restart")),
-            write_restart_tensors=bool(_g("write_restart_tensors")),
-            write_qsgw_datasets=bool(_g("write_qsgw_datasets")),
-            restart_q_storage_raw=_restart_q_storage,
-            qp_rotations_k_storage=_qp_rot_k_storage,
-            # Build from a stable sequence.  Equal sets reached through an
-            # absent key versus an explicit default can retain different
-            # hash-table histories; pickling those frozensets then need not
-            # be byte-identical even though the typed values compare equal.
-            raw_input_keys=frozenset(sorted(_effective_named_keys)),
-            compute_mode_raw=str(_g("compute_mode") or "auto").strip().lower(),
-            qp_solver_raw=str(_g("qp_solver") or "auto").strip().lower(),
-            do_screened=bool(_g("do_screened")),
-            bispinor=bool(_g("bispinor")),
-            bispinor_gw=coerce_bispinor_gw_mode(_g("bispinor_gw")),
-            vnl_velocity_sign=str(_g("vnl_velocity_sign") or ""),
-            # Compatibility mirror only.  Every new head decision reads the
-            # enum above; keeping this resolved bool prevents old consumers
-            # from disagreeing with ``head_correction = off``.
-            do_G0=_resolved_do_g0,
-            self_consistent=bool(_g("self_consistent")),
-            use_ppm_sigma=bool(_g("use_ppm_sigma")),
-            no_degen_averaging=bool(_g("no_degen_averaging")),
-            degen_avg_tol_ry=float(_g("degen_avg_tol_ry")),
-            # Sub-dataclass groups
-            paths=paths,
-            head=head,
-            screening=screening,
-            sigma=sigma,
-            ppm=ppm,
-            mpa=mpa,
-            sc=sc,
-            eqp2=eqp2,
-            memory=memory,
-            backend=backend,
-            debug=debug,
-            bse=bse,
-            # Parsed blocks
-            kpoints_crystal_b=params.get("kpoints_crystal_b"),
-            input_dir=input_dir,
-            input_file=os.path.abspath(filename),
-        )
-        # ``density_self_consistent`` is still an independent physics choice
-        # for scalar QSGW, whose conventional fixed-density path remains the
-        # default.  Bispinor QSGW has no corresponding safe fixed-density
-        # treatment: both rho and the signed Dirac current J must follow the
-        # evolving occupied orbitals.  Normalize the UNNAMED default here,
-        # after the canonical qp_solver resolver exists, instead of duplicating
-        # its legacy/explicit precedence logic.  An explicit false survives
-        # unchanged and the gate below refuses it rather than overriding what
-        # the user wrote.
-        if (bool(resolved.bispinor)
-                and resolved.qp_solver is QPSolver.SELF_CONSISTENT
-                and "density_self_consistent" not in _named_keys
-                and not bool(resolved.density_self_consistent)):
-            resolved = _dc_replace(resolved, density_self_consistent=True)
-            print_fn(
-                "  [config provenance] bispinor qp_solver=self_consistent: "
-                "density_self_consistent was not named; enabling the "
-                "required live (rho, J) Hartree rebuild")
-        # Fresh physics is the global default.  A file existing in ``tmp``
-        # is not permission to replace a live fit: only an explicit
-        # ``restart = true`` enters the restart loader, whose provenance
-        # gates authenticate the tensor set before use.
-        if "restart" not in _named_keys:
-            print_fn(
-                "  [config provenance] restart was not named; using the "
-                "fresh-physics default restart = false.  Tensor files are "
-                "never selected from mere presence; set restart = true "
-                "explicitly to enter the authenticated restart loader "
-                "(docs/input_reference.md, restart)")
-        # ``low_mem_bands`` is derived for the packed screened mode because
-        # its sixteen-block kernel has only the face carrier.  ``linalg`` is
-        # never derived here: its global default is local, and packed modes
-        # must explicitly select the distributed layout they require.
-        # Promote only when EVERY OTHER envelope row already passes: a deck
-        # that is outside the envelope for some other reason must still see
-        # that reason, not a low_mem_bands refusal it never asked for.  An
-        # explicitly named conflicting value is left alone and refused by
-        # the envelope (rule 13: refuse rather than ignore).
-        # ONE derivation site for every packed route.  Applicability and the
-        # derived-key names come from ``packed_static_envelope``; this code
-        # knows only how to set a named field.  Explicit conflicts survive
-        # and are refused (screened mode) or select the incumbent route
-        # (bare mode), never overwritten.
-        _packed_candidate = (
-            bool(resolved.bispinor)
-            and (resolved.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX
-                 or (resolved.bispinor_gw
-                     is BispinorGWMode.BARE_TRANSVERSE
-                     and int(resolved.sys_dim) == 2)))
-        if _packed_candidate:
-            _screened = (
-                resolved.bispinor_gw is BispinorGWMode.FULL_STATIC_COHSEX)
-            _unmet = [row for row in packed_static_envelope(
-                resolved, screened=_screened) if not row[0]]
-            if _unmet and all(row[5] for row in _unmet):
-                _promotions = {"low_mem_bands": ("memory", True)}
-                for row in _unmet:
-                    key = row[5]
-                    if key in _named_keys:
-                        continue
-                    group, value = _promotions[key]
-                    resolved = _dc_replace(resolved, **{group: _dc_replace(
-                        getattr(resolved, group), **{key: value})})
-                    if key == "low_mem_bands":
-                        resolved = _dc_replace(
-                            resolved,
-                            memory=_dc_replace(
-                                resolved.memory,
-                                low_mem_bands_provenance=(
-                                    "derived for packed static envelope")))
-                    print_fn(
-                        "  [config provenance] packed_static_envelope "
-                        f"(bispinor_gw = {resolved.bispinor_gw.value}): "
-                        f"{key} was not named; setting "
-                        f"{key} = {value} (the packed response is written "
-                        "against this derived layout/plan; "
-                        "docs/input_reference.md, bispinor_gw)")
-        # CROSS-KEY, and therefore after the record exists: the w_bse
-        # refusals read resolved axes (compute_mode / qp_solver fold in the
-        # legacy flags), and the honest way to ask which mode a deck chose
-        # is to ask the resolver, not to re-derive it here.  A w_rpa deck
-        # returns from this call before either property is touched.
-        refuse_unsupported_bgw_metal_q0_treatment(resolved)
-        refuse_unsupported_screening_diagrams(resolved)
-        refuse_unsupported_bispinor_gw(resolved)
-        # ONE CANONICAL VOCABULARY FOR THE SELF-ENERGY AXIS, and a note for
-        # the other one.  Same position and same reason as the two refusals
-        # above: the announcement quotes the RESOLVED axes, which only the
-        # record can answer.  Honoring a legacy key in silence beside a
-        # canonical twin is how a tree ends up with two vocabularies for one
-        # axis and no way to tell which one a run went through.
-        announce_legacy_sigma_axis_keys(
-            _named_keys, resolved.compute_mode, resolved.qp_solver,
-            print_fn=print_fn)
+        (memory_per_device_gb, chunk_utilization) = _resolve_input_memory(
+            params, print_fn, resolve_hardware)
+        (_bgw_q0_mode, _bgw_q0_vector, _named_keys, _effective_named_keys, _mc_average_vcoul_body) = _resolve_input_metal_policy(
+            params, print_fn)
+        (paths) = _input_paths(
+            params)
+        (head, _resolved_do_g0) = _input_head(
+            _bgw_q0_mode, _bgw_q0_vector, _mc_average_vcoul_body, _named_keys, params, print_fn)
+        (screening, ppm, mpa, sigma, _occ_family, _occ_width) = _input_response(
+            _named_keys, params)
+        (sc, eqp2) = _input_iteration(
+            _linalg, params, print_fn)
+        (memory) = _input_memory_group(
+            _named_keys, chunk_utilization, memory_per_device_gb, params, print_fn)
+        (backend) = _input_backend(
+            _linalg, params, runtime_platform)
+        (_restart_q_storage, _qp_rot_k_storage, debug, bse) = _input_storage(
+            params)
+        (_bands, _zeta_nband) = _input_band_windows(
+            params)
+        (resolved) = _assemble_input_config(
+            _bands, _effective_named_keys, _occ_family, _occ_width, _qp_rot_k_storage,
+            _resolved_do_g0, _restart_q_storage, _zeta_nband, backend, bse, cls, debug, eqp2,
+            filename, head, input_dir, memory, mpa, params, paths, ppm, sc, screening, sigma)
+        (resolved) = _apply_input_envelope(
+            _named_keys, print_fn, resolved)
         return resolved

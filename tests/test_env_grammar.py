@@ -305,12 +305,6 @@ OWNED_FILES = (
 OWNED_BOOL_KNOBS = (
     "LORRAX_EXIT_AFTER_ZETA",
     "LORRAX_MALLOC_TRIM",
-    # Converted 2026-07-30 across ALL FIVE readers at once (gw_init.py x3,
-    # gw/v_q_g_flat.py, gw/screening.py), which is what let it move from
-    # CROSS_FILE_BOOL_KNOBS to here.  The whole-tree gate lives in
-    # tests/test_crossfile_requests.py::
-    # test_no_module_anywhere_reads_force_full_bz_by_hand.
-    "LORRAX_FORCE_FULL_BZ",
     # Read once, in gw_init's ζ-reuse gate — previously through a lazy
     # ``from isdf.core import _env_bool`` (the last consumer of that
     # helper); collapsed onto the module-scope env_bool import.

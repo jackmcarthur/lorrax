@@ -173,3 +173,38 @@ def test_orbit_labels_match_the_pullback_union_find(tnp):
     sizes = np.bincount(labels)
     sizes = sizes[sizes > 0]
     assert sizes.max() == 2 and (sizes == 2).sum() > 50
+
+
+def test_unavailable_unused_rows_preserve_canonical_trs_unfold():
+    """Canonical row2 is antiunitary for n_spatial2 and conjugates the complex operator."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    mesh = _mesh(2, 2)
+    operator = np.array([[[1, 2j, 0, 0], [-2j, 3, 0, 0],
+                          [0, 0, 4, 1j], [0, 0, -1j, 5]]])
+    perm = np.array([[0, 1, 2, 3], [-1, -1, -1, -1],
+                     [0, 1, 2, 3], [-1, -1, -1, -1]])
+    local = np.where(perm < 0, -1, perm % 2)
+    dev = jax.device_put(jnp.asarray(operator), NamedSharding(mesh, P(None, 'x', 'y')))
+    result = unfold_isdf_operator(
+        dev, irr_idx=np.array([0, 0]), sym_idx=np.array([0, 2]),
+        sym_perm=perm, L_table=np.zeros((4, 4, 3)),
+        q_irr_frac=np.array([[0.25, 0, 0]]), mesh_xy=mesh, n_sym_spatial=2,
+        axis_local_sym_perm=local)
+    np.testing.assert_array_equal(result, np.concatenate([operator, operator.conj()]))
+    with pytest.raises(ValueError, match="selected centroid action is unavailable"):
+        unfold_isdf_operator(
+            dev, irr_idx=np.array([0, 0]), sym_idx=np.array([0, 3]),
+            sym_perm=perm, L_table=np.zeros((4, 4, 3)),
+            q_irr_frac=np.array([[0.25, 0, 0]]), mesh_xy=mesh, n_sym_spatial=2)
+
+
+def test_identity_shortcut_refuses_an_unavailable_identity_action():
+    """Even a q axis requiring no expansion must authenticate its centroid identity."""
+    import jax.numpy as jnp
+    with pytest.raises(ValueError, match="selected centroid action is unavailable"):
+        unfold_isdf_operator(
+            jnp.eye(4)[None], irr_idx=np.array([0]), sym_idx=np.array([0]),
+            sym_perm=-np.ones((2, 4), dtype=int), L_table=np.zeros((2, 4, 3)),
+            q_irr_frac=np.zeros((1, 3)), mesh_xy=_mesh(2, 2), n_sym_spatial=1)

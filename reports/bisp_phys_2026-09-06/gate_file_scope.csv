@@ -1,0 +1,94 @@
+file,fixture_audit_scope,numerically_rerun_in_final_leg
+services/symmetry_maps/tests/test_bispinor_actions.py,direct fixture classification in gate_blindness.md,true
+services/symmetry_maps/tests/test_symmetry_maps_algebra.py,supporting/unclassified: no independent bispinor physics certification,false
+services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py,supporting/unclassified: no independent bispinor physics certification,false
+services/symmetry_maps/tests/test_symmetry_maps_emulated_mesh.py,supporting/unclassified: no independent bispinor physics certification,false
+services/symmetry_maps/tests/test_symmetry_maps_kirr_fullids.py,supporting/unclassified: no independent bispinor physics certification,false
+services/symmetry_maps/tests/test_symmetry_maps_qgrid_resolution.py,supporting/unclassified: no independent bispinor physics certification,false
+services/symmetry_maps/tests/test_symmetry_maps_qirr_store.py,supporting/unclassified: no independent bispinor physics certification,false
+services/symmetry_maps/tests/test_symmetry_maps_r_cart.py,supporting/unclassified: no independent bispinor physics certification,false
+services/symmetry_maps/tests/test_symmetry_maps_star_contract.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/bench/test_sternheimer_jvp.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/multi_device/bispinor_exact_hartree_gate.py,direct fixture classification in gate_blindness.md,false
+tests/multi_device/bispinor_parent_faces_gate.py,direct fixture classification in gate_blindness.md,false
+tests/multi_device/bispinor_parent_restart_gate.py,direct fixture classification in gate_blindness.md,false
+tests/multi_device/bispinor_transverse_vertex_face_gate.py,direct fixture classification in gate_blindness.md,false
+tests/multi_device/eqp_invariance_cross_p.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/multi_device/face_carrier_restart_gate.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/multi_device/full_photon_head_sigma_gate.py,direct fixture classification in gate_blindness.md,false
+tests/multi_device/head_wings_face_gate.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/multi_device/mtxel_callsite_gate.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/multi_device/mtxel_vnl_scaling_probe.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/multi_device/phdf5_padded_rank_write.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/multi_device/rectangular_response_symmetry_gate.py,direct fixture classification in gate_blindness.md,false
+tests/multi_device/restart_sharded_parity.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/multi_device/test_hartree_uneven_work.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/multi_device/wfn_parent_stream_p4.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_band_chunk_size_floor.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_bispinor_dynamic_packed_route.py,direct fixture classification in gate_blindness.md,false
+tests/test_bispinor_kinetic_balance_jet.py,direct fixture classification in gate_blindness.md,false
+tests/test_bispinor_restart_face.py,direct fixture classification in gate_blindness.md,false
+tests/test_bispinor_tt_head_correction.py,direct fixture classification in gate_blindness.md,false
+tests/test_bispinor_v_file_contract.py,direct fixture classification in gate_blindness.md,false
+tests/test_bispinor_zeta_reuse_ast.py,direct fixture classification in gate_blindness.md,false
+tests/test_cartesian_actions_cri3.py,direct fixture classification in gate_blindness.md,false
+tests/test_centroid_current_density.py,direct fixture classification in gate_blindness.md,false
+tests/test_centroid_fit_policy.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_chi0_fractional_face_parity.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_compute_V_q_bispinor_g_flat.py,direct fixture classification in gate_blindness.md,false
+tests/test_conv_kpair_numerical.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_dft_gauge_vertices.py,direct fixture classification in gate_blindness.md,false
+tests/test_dipole_vnl_velocity_sign.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_file_io.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_galerkin_basis_store.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_gflat_planner_face_pairs.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_gw_jax_regression.py,direct fixture classification in gate_blindness.md,false
+tests/test_gw_production_report.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_head_correction.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_invariance_gates.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_isdf_cq_face_parity.py,direct fixture classification in gate_blindness.md,false
+tests/test_isdf_zq_face_parity.py,direct fixture classification in gate_blindness.md,false
+tests/test_isdf_zq_parent_parity.py,direct fixture classification in gate_blindness.md,false
+tests/test_kin_ion_padded_gvectors.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_low_mem_bands_envelope.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_minimax_beta_selector.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_minimax_imag_tables.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_pad_parity_gates.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_parallel_transport.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_photon_chi_vertices.py,direct fixture classification in gate_blindness.md,true
+tests/test_photon_head_sign_oracle.py,direct fixture classification in gate_blindness.md,true
+tests/test_psp_padded_gvectors.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_qgrid_symmetry_resolution.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_qp_rotations_k_storage.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_qp_solver_config.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_qsgw_head_face_wings.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_qsgw_parallel_transport_head.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_quickstart_verbatim.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_rank_truncate_capacity_gate.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_sanity_gates_jax.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_sc_band_window.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_sc_four_current_hartree.py,direct fixture classification in gate_blindness.md,false
+tests/test_sc_kset_tables.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_scalar_gw_factors.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_scalar_psp.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_sigma_eqp_assembly_receipt.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_sigma_output_columns.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_sigma_result_basis.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_sigma_x_bispinor.py,direct fixture classification in gate_blindness.md,false
+tests/test_slab_io_hostile_geometry.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_spin_density_matrix.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_star_wedge_measured_values.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_static_gauge_head_artifact.py,direct fixture classification in gate_blindness.md,false
+tests/test_static_gauge_head_response.py,direct fixture classification in gate_blindness.md,false
+tests/test_static_photon_head_response.py,direct fixture classification in gate_blindness.md,false
+tests/test_transverse_candidate_gram.py,direct fixture classification in gate_blindness.md,false
+tests/test_transverse_factor_hoist.py,direct fixture classification in gate_blindness.md,false
+tests/test_transverse_rank_truncate.py,direct fixture classification in gate_blindness.md,false
+tests/test_vq_charge_capture_routing.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_w_head_densify.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_w_isdf_padding.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_wavefunction_basis_receipt.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_wfn_rpoints_and_indexed_gflat.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_wfn_transforms.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_zeta_provenance_matrix.py,supporting/unclassified: no independent bispinor physics certification,false
+tests/test_zq_from_psi_sm_bit_identity.py,supporting/unclassified: no independent bispinor physics certification,false

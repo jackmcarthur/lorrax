@@ -1,5 +1,13 @@
 # Exact finite-occupation χ₀ on the two-face ψ carrier (`low_mem_bands=true`)
 
+> 2026-09-06 parent-route update: production minimax and fractional-contour
+> response factories now accept only canonical faces or typed raw parents;
+> their legacy four-copy factories and operand branches are deleted.
+> All three response validations use independent band-pair sums. Static Γ/direct
+> pair legacy bodies and their public-wrapper branches are also deleted.
+> Historical port descriptions below are retained as derivation context,
+> not as current route-selection instructions; see [decisions](decisions.md).
+
 Ports census row "Exact finite-occupation response"
 (`reports/gwjax_low_mem_bands_audit_2026-08-22/report.md`, former gate
 `low_mem_bands_metal_material_class_unported`) plus the fractional/contour χ₀

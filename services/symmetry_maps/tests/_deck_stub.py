@@ -70,7 +70,7 @@ def regression_dir() -> str:
 
 def deck_path(deck: str, name: str | None = None) -> str:
     """Absolute path to ``deck``'s WFN (or to another file in its dir)."""
-    return os.path.join(regression_dir(), deck, name or DECK_WFN[deck])
+    return os.path.join(regression_dir(), deck, name or DECK_WFN.get(deck, "WFN.h5"))
 
 
 def deck_available(deck: str) -> bool:

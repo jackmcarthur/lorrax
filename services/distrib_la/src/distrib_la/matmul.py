@@ -184,9 +184,11 @@ def _validate_operands(A, B, C, transa: str, transb: str):
     return out
 
 
+@partial(jax.jit, static_argnums=(0, 1, 2))
 def _zeros(shape, dtype, sharding):
-    return jax.jit(
-        lambda: jnp.zeros(shape, dtype=dtype), out_shardings=sharding)()
+    """Allocate a sharded zero tile with one executable per shape and dtype."""
+    return jax.lax.with_sharding_constraint(
+        jnp.zeros(shape, dtype=dtype), sharding)
 
 
 def _cublasmp(mesh, A, B, C, *, alpha: complex, beta: complex,

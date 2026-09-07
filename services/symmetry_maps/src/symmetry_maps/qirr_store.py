@@ -189,7 +189,8 @@ class QirrTables:
     :func:`symmetry_maps.unfold_isdf_operator` takes, bundled so that a writer
     cannot supply four of them.  Built from ``SymMaps.irr_idx_q`` /
     ``sym_idx_q`` / ``q_irr_frac`` and
-    ``centroid_source_map_and_wrap(..., extend_trs=True)``.
+    ``centroid_source_map_and_wrap(..., extend_trs=True)``. Unavailable
+    unselected actions are whole -1 rows with zero wraps, including pads.
     """
 
     irr_idx_q: np.ndarray
@@ -269,6 +270,7 @@ class QirrTables:
         tail = perm[:, n_log:]
         want = np.broadcast_to(np.arange(n_log, n_pad, dtype=tail.dtype),
                                tail.shape)
+        want = np.where(np.all(perm[:, :n_log] == -1, axis=1)[:, None], -1, want)
         if not np.array_equal(tail, want):
             bad = int(np.argmax(np.any(tail != want, axis=0)))
             raise ValueError(
@@ -316,6 +318,7 @@ class QirrTables:
         tail = np.broadcast_to(
             np.arange(n_log, n_pad, dtype=perm.dtype),
             (perm.shape[0], n_pad - n_log))
+        tail = np.where(np.all(perm == -1, axis=1)[:, None], -1, tail)
         return dataclasses.replace(
             self,
             sym_perm=np.concatenate([perm, tail], axis=1),
@@ -548,12 +551,19 @@ def validate_qirr_tables(tables: QirrTables, n_q_on_disk: int,
             f"qirr_store: L_table must be {(n_sym_rows, n_mu, 3)}; got "
             f"{t.L_table.shape}")
     max_sym = int(t.sym_idx_q.max()) if t.sym_idx_q.size else -1
-    if max_sym >= n_sym_rows:
+    if np.any(t.sym_idx_q < 0) or max_sym >= n_sym_rows:
         raise ValueError(
             f"qirr_store: sym_idx_q reaches row {max_sym} but sym_perm has "
             f"only {n_sym_rows}.  Build sym_perm via "
             f"``centroid_source_map_and_wrap(..., extend_trs=True)`` so it "
             f"covers the TRS-augmented half.")
+    missing = np.all(t.sym_perm == -1, axis=1)
+    valid = t.sym_perm[~missing]
+    if (np.any(np.sort(valid, axis=1) != np.arange(n_mu))
+            or np.any(t.L_table[missing] != 0)):
+        raise ValueError("qirr_store: each action must be a bijection or wholly unavailable with zero wraps")
+    if np.any(missing[t.sym_idx_q]):
+        raise ValueError("qirr_store: selected centroid action is unavailable")
     n_spatial = int(t.n_sym_spatial)
     if n_spatial <= 0:
         raise ValueError(
@@ -974,9 +984,13 @@ def read_tensor(
     require_persisted: bool = True,
     expect_centroid_hash: str | None = None,
     expect_table_hash: str | None = None,
+    metadata_only: bool = False,
     mode: str = "r",
 ):
     """Read ``name``, unfolding to the full BZ when it is stored on a wedge.
+
+    ``metadata_only=True`` validates the same receipts and returns ``(None, header)``
+    without reading or unfolding the tensor payload.
 
     Returns ``(array, header)``.  The header is not optional decoration:
     ``header.data_ready`` is the persisted flag, ``header.q_storage`` says
@@ -1048,7 +1062,7 @@ def read_tensor(
                     f"PARTIAL stamp is not, because the missing half is "
                     f"exactly what would say whether the shape means what "
                     f"it looks like.")
-            return ds[()], QirrHeader(
+            return (None if metadata_only else ds[()]), QirrHeader(
                 q_storage="full", format_version=None,
                 n_q_on_disk=int(ds.shape[0]), n_q_full=None,
                 n_mu=int(ds.shape[-1]) if ds.ndim >= 1 else None,
@@ -1145,6 +1159,8 @@ def read_tensor(
                 f"written.  Pass require_persisted=False only to inspect "
                 f"the placeholder deliberately.")
 
+        if metadata_only:
+            return None, header
         raw = ds[()]
 
     if not unfold or shape_says == "full":

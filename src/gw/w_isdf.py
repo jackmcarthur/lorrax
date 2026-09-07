@@ -1,56 +1,5 @@
-"""Static χ₀ and W computation using ISDF + minimax quadrature.
-
-All inter-function arrays use flat k/q indices: chi(nq, μ, μ), V(nq, μ, μ), W(nq, μ, μ).
-The 3D k-grid only appears inside FFT helpers.
-
-W Dyson solve — exactly TWO plans (input key ``w_dyson_solver``):
-
-``local`` (default)
-    q-parallel shard_map: q's scattered ``P(('x','y'),None,None)``, one
-    dense pivoted LU per q on the owning rank, W constrained back out to
-    ``P(None,'x','y')`` through a staged relayout.  Fast at moderate P;
-    every rank must hold whole (μ, μ) tiles for its q's.
-``distributed``
-    2-D-sharded backsolve: A_q = 1 − V_q·χ_q formed by stacked block
-    GEMMs with every operand at ``P(None,'x','y')``, factored and solved
-    through the ``distrib_la`` plan door (ScaLAPACK ``pzgetrf`` /
-    ``pzgetrs`` on CPU meshes, cuSOLVERMp on CUDA).  No rank ever
-    materialises a full (μ, μ) tile — the memory ceiling that matters at
-    thousands of low-memory processes.  W lands natively in
-    ``P(None,'x','y')`` (no relayout).
-
-Two-face carrier (``low_mem_bands = true``, ``wfns.layout == "face"``):
-:func:`_get_chi_minimax_kernel` dispatches to
-:func:`_get_chi_minimax_kernel_legacy` (untouched) or
-:func:`_get_chi_minimax_kernel_face`, which builds G via a single planned
-``distrib_la.gemm_plan`` shared by Gv/Gc (the val/cond split becomes a
-band-identity mask over the FULL loaded extent, not two differently-sized
-slices — report §3) and reuses the legacy FFT/contraction stages
-unchanged (G's output shape/sharding does not depend on layout).
-:func:`_chi_layout_operands`/:func:`_chi_face_kwargs` are the one place
-:func:`compute_chi0`/:func:`_chi0_multi_kernel_args`/
-:func:`_chi0_contour_kernel_args` turn a bundle into kernel operands, so
-those callers no longer extract legacy views (``.xn()``/``.yr()``)
-themselves.
-
-Exact finite-occupation response (``feat/metal-response-face-2026-08-23``,
-``docs/architecture/fractional_chi0_response_face.md``): also ported.
-``_get_chi_fractional_contour_kernel`` dispatches to
-``_get_chi_fractional_contour_kernel_legacy`` (untouched) or
-``_get_chi_fractional_contour_kernel_face`` — a substitution of operands
-onto the SAME ``build_G_tau(layout='face', ...)`` mechanism the ordinary
-minimax kernel already uses, since its two Green's functions are each a
-one-particle, band_weight-diagonal contraction.  The ordered-pair kernel
-(``_fractional_pair_scan`` / :func:`_get_chi_static_fractional_gamma_kernel`
-/ :func:`_get_chi_fractional_q_kernel`) needed a genuinely new mechanism —
-its divided-difference weight depends JOINTLY on both band indices and
-cannot collapse to a one-particle GEMM — and gets one:
-``_fractional_pair_scan_face`` reconstructs each band tile it touches from
-the persistent ``psi_mun``/``psi_nmu`` via a masked-gather + ``psum`` on
-BOTH mesh axes (``isdf.core._z_q_face``'s idiom, generalized), never a
-resident single-axis copy.  See the design doc for the full derivation and
-why ``distrib_la.gemm_plan``/``GemmPlan.local_call`` do not apply here.
-"""
+"""Screen charge and current response with typed parent transport and q-IBZ operators."""
+from distrib_la import mesh_key as _mesh_key
 import os
 import time
 from dataclasses import dataclass
@@ -96,30 +45,11 @@ _STATIC_FRACTIONAL_PAIR_TILE = 32
 
 
 def _complete_static_vertex_orientations(forward_R, reverse_R=None):
-    r"""Return both ordered Hermitian-vertex orientations in R space.
-
-    ``forward_R`` has endpoint axes ``(mu_A,mu_B)``.  For two different
-    Hermitian vertices, ``reverse_R`` is the reversed ordered contribution
-    in its natural ``(mu_B,mu_A)`` orientation.  Its dagger maps it back to
-    the forward endpoint order before addition::
-
-        forward_R + reverse_R^dagger
-
-    Charge is the same-vertex special case: its natural reverse is
-    ``swapaxes(forward_R)`` and the expression reduces exactly to the
-    incumbent ``forward_R + conj(forward_R)`` completion.  Replacing either
-    form by ``2*forward_R`` is valid only in a real gauge and is wrong for a
-    complex broken-time-reversal wavefunction.
-
-    Keep this completion before the final R-to-q FFT.  It is transition
-    algebra, not a post-hoc q symmetrization, and preserves sharding
-    elementwise.
-    """
+    """Return both ordered Hermitian-vertex orientations in R space; see docs/architecture/four_current_wiring.md."""
     if reverse_R is None:
         # Preserve the incumbent scalar graph and arithmetic order exactly.
         return forward_R + jnp.conj(forward_R)
     return forward_R + jnp.conj(jnp.swapaxes(reverse_R, -1, -2))
-
 
 
 # ============================================================================
@@ -129,34 +59,11 @@ def _complete_static_vertex_orientations(forward_R, reverse_R=None):
 def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             n_out: int = 1, *,
                             complex_contour: bool = False,
-                            layout: str = "legacy", face_shape=None,
+                            layout: str = "face", face_shape=None,
                             right_face_shape=None,
-                            vertex_pair: bool = False,
-                            vertex_identity=(False, False),
+                            vertex_pairs=None,
                             k_unfold_plan=None):
-    """Build chi0 kernel with device-local FFTs.  Returns flat-q χ₀(nq, μ, μ).
-
-    ``n_out`` (static): number of χ outputs accumulated over the SAME τ
-    sweep.  ``n_out=1`` is the historical kernel, untouched.  ``n_out>=2``
-    (the probe-χ₀ reuse path, ``ppm_probe_chi_reuse=auto``) takes
-    ``nodes.alpha`` of shape ``(n_out, L)`` and returns an ``n_out``-tuple
-    of χ's — the per-τ G-build/FFT/contraction tensors are computed once
-    and each output is its own weighted accumulation.
-
-    ``complex_contour=True`` carries complex time through the same spatial
-    contraction.  The cache key keeps that convention separate from the
-    bit-locked real-time static path.
-
-    ``layout`` (static): ``'legacy'`` (default) is the exact kernel this
-    module has always built — see :func:`_get_chi_minimax_kernel_legacy`.
-    ``'face'`` builds the two-face carrier's G-construction instead (one
-    planned ``distrib_la.gemm_plan`` per kernel, shared by Gv/Gc since
-    face G no longer slices a band window — see report §3); requires
-    ``face_shape=(nk, nb_full, n_rmu, nspinor)``.  Its ordinary scalar
-    branch preserves the established FFT/contraction sequence; the optional
-    four-current face branch changes only the open-spin trace to insert the
-    canonical Lorentz vertices.  See :func:`_get_chi_minimax_kernel_face`.
-    """
+    """Build the face or parent minimax response with vertices applied after unfold."""
     nkx, nky, nkz = kgrid
     nk = nkx * nky * nkz
     n_out = int(n_out)
@@ -166,275 +73,73 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     # (flat-k FFT service contract, docs/dev/flat_k_fft_service.md).
     from ffi import ffi_dial_key
     complex_contour = bool(complex_contour)
-    if layout not in ("legacy", "face"):
+    if layout not in ("face", "axis"):
         raise ValueError(
-            f"_get_chi_minimax_kernel: layout must be 'legacy' or 'face', "
+            f"_get_chi_minimax_kernel: layout must be 'face', "
             f"got {layout!r}")
-    vertex_pair = bool(vertex_pair)
-    vertex_identity = tuple(bool(x) for x in vertex_identity)
-    if len(vertex_identity) != 2:
-        raise ValueError("vertex_identity must be (left_identity,right_identity)")
-    if vertex_pair and n_out != 1:
-        raise ValueError(
-            "four-current vertex chi currently supports one static output "
-            "per tau sweep")
-    if vertex_pair and layout != "face":
-        raise ValueError(
-            "four-current vertex chi requires the canonical face "
-            "wavefunction layout")
-    cache_key = (id(mesh_xy), kgrid, ffi_dial_key(), n_out,
+    vertex_classes = None
+    if vertex_pairs is not None:
+        vertex_pairs = tuple(tuple(int(v) for v in pair) for pair in vertex_pairs)
+        if not vertex_pairs or any(len(pair) != 2 or any(v not in range(4) for v in pair)
+                                   for pair in vertex_pairs):
+            raise ValueError("vertex_pairs must name nonempty Lorentz pairs in 0..3.")
+        vertex_classes = tuple(tuple(v == 0 for v in pair) for pair in vertex_pairs)
+        if len(set(vertex_classes)) != 1 or n_out != 1:
+            raise ValueError("Vertex outputs must share one family pair and one static rule.")
+    cache_key = (_mesh_key(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
-                 vertex_pair, vertex_identity, id(k_unfold_plan))
+                 vertex_classes, (tuple(id(p) for p in k_unfold_plan)
+                               if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)))
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
-    if layout == "legacy":
-        kernel = _get_chi_minimax_kernel_legacy(
-            mesh_xy, kgrid, nk, n_out, complex_contour)
-    else:
-        if face_shape is None:
-            raise ValueError(
-                "_get_chi_minimax_kernel(layout='face') requires "
-                "face_shape=(nk, nb_full, n_rmu, nspinor)")
-        kernel = _get_chi_minimax_kernel_face(
-            mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
-            right_face_shape=right_face_shape,
-            vertex_pair=vertex_pair,
-            vertex_identity=vertex_identity,
-            k_unfold_plan=k_unfold_plan)
+    if face_shape is None:
+        raise ValueError(
+            "_get_chi_minimax_kernel(layout='face') requires "
+            "face_shape=(nk, nb_full, n_rmu, nspinor)")
+    kernel = _get_chi_minimax_kernel_face(
+        mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
+        right_face_shape=right_face_shape,
+        vertex_pairs=vertex_pairs,
+        k_unfold_plan=k_unfold_plan, layout=layout)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
 
-def _get_chi_minimax_kernel_legacy(mesh_xy, kgrid, nk, n_out, complex_contour):
-    """The exact pre-``low_mem_bands`` kernel body, moved verbatim out of
-    :func:`_get_chi_minimax_kernel` so that dispatcher could gain a
-    layout branch without touching this one at all.  Caching is now the
-    dispatcher's job — this function only builds."""
-    from common.fft_helpers import make_flat_k_fftn
-
-    # Flat-k FFT helpers — callers see only (nk, *trail) arrays.
-    #
-    # Historical form had Gv via ifftn (sign +ikR) and Gc via fftn (sign -ikR),
-    # with einsum 'Rambn, Rbnam -> Rmn' swapping the μ_m/μ_n positions across
-    # the two operands.  That forced Gc (or Gv) to reshard its μ sharding to
-    # make the contracted index consistent, and landed chi_R in
-    # P(None, 'y', 'x') — which then had to reshard AGAIN at the hand-off to
-    # the W-solve (which consumes chi in P(None, 'x', 'y')).
-    #
-    # We exploit G's per-k Hermitian property ``G_k(μ,ν) = G_k(ν,μ)*``.  After
-    # FT, ``G_R(μ,ν) = G_{-R}(ν,μ)*``, so running Gv's k→R with the SAME sign
-    # as Gc's (both fftn, not one fft + one ifft) gives a Gv_R that equals
-    # ``conj(original_Gv_R)`` with (μ_m, μ_n) swapped to the Gc-natural order.
-    # The chi0 einsum then collapses to an element-wise product + spin sum:
-    #
-    #    chi_R(m,n) = Σ_{a,b} Gc_R(a,m,b,n) · conj(Gv_R(a,m,b,n))
-    #
-    # identical index order on both operands, no reshard.  Verified to
-    # machine precision against the original formulation.
-    #
-    # Both Gs now share their natural 5-D sharding P(_, _, 'x', _, 'y')
-    # (μ_first on x from psi_xn, μ_second on y from psi_yr).  chi_R inherits
-    # P(_, 'x', 'y') naturally — aligned with V for W-solve, so the post-chi0
-    # reshard into the fused W-solve drops out too.
-    from .wavefunction_bundle import (
-        G_FFT7D_SPEC as _G_spec,
-        G_FLATK_SPEC as _G_out_flatk,
-        CHI_Q_SPEC as _chi_spec,
-        CHI_R_SPEC as _chi_R_spec,
-        PSI_XN_SPEC as _psi_xn_spec,
-        PSI_YR_SPEC as _psi_yr_spec,
-    )
-    _Gv_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
-    _Gc_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
-    _chi_fftn_local = make_flat_k_fftn(mesh_xy, kgrid, _chi_spec, norm='ortho')
-
-    from .greens_function_kernel import build_G_tau
-    # Scalars / 1-D arrays replicated across all devices.
-    _rep0 = P()             # scalar
-    _rep1 = P(None)         # (nb,) band-indexed
-
-    _G_k_shard = NamedSharding(mesh_xy, _G_out_flatk)
-    _chi_R_shard = NamedSharding(mesh_xy, _chi_R_spec)
-
-    @partial(jax.jit,
-             in_shardings=(NamedSharding(mesh_xy, _psi_xn_spec),
-                            NamedSharding(mesh_xy, _psi_yr_spec),
-                            NamedSharding(mesh_xy, _psi_yr_spec),
-                            NamedSharding(mesh_xy, _psi_xn_spec),
-                            NamedSharding(mesh_xy, _rep1),
-                            NamedSharding(mesh_xy, _rep1),
-                            NamedSharding(mesh_xy, _rep0),
-                            NamedSharding(mesh_xy, _rep0),
-                            NamedSharding(mesh_xy, _rep0)),
-             out_shardings=(_G_k_shard, _G_k_shard))
-    def _build_Gv_Gc(psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
-                    enk_v, enk_c, tau_scalar, vmax, cmin):
-        # The returned conjugate changes a raw builder time t into conj(t).
-        # Complex contour nodes therefore need raw t_c=conj(τ), while the
-        # locked real path continues to receive t_c=τ exactly as before.
-        t_c = jnp.conj(tau_scalar) if complex_contour else tau_scalar
-        Gv_k = jax.lax.with_sharding_constraint(
-            build_G_tau(psi_v_xn, psi_v_yr, enk_v, -tau_scalar, e_ref=vmax),
-            _G_k_shard)
-        Gc_k = jax.lax.with_sharding_constraint(
-            build_G_tau(psi_c_xn, psi_c_yr, enk_c, t_c, e_ref=cmin),
-            _G_k_shard)
-        # Hermitian-swap conj (see FFT-convention block comment above) —
-        # belongs at the call site, NOT inside build_G_tau.
-        return jnp.conj(Gv_k), jnp.conj(Gc_k)
-
-    # MinimaxNodes pytree (t, alpha) — both replicated across devices.
-    # n_out>=2: alpha is (n_out, L); P() replicates every axis.
-    _nodes_shard = MinimaxNodes(
-        t=NamedSharding(mesh_xy, _rep1),
-        alpha=NamedSharding(mesh_xy, _rep1 if n_out == 1 else P()),
-    )
-
-    if n_out >= 2:
-        _chi_R_out = tuple(_chi_R_shard for _ in range(n_out))
-
-        @partial(jax.jit,
-                 in_shardings=(_nodes_shard,
-                                NamedSharding(mesh_xy, _psi_xn_spec),
-                                NamedSharding(mesh_xy, _psi_yr_spec),
-                                NamedSharding(mesh_xy, _psi_yr_spec),
-                                NamedSharding(mesh_xy, _psi_xn_spec),
-                                NamedSharding(mesh_xy, _rep1),
-                                NamedSharding(mesh_xy, _rep1),
-                                NamedSharding(mesh_xy, _rep0),      # vmax
-                                NamedSharding(mesh_xy, _rep0)),     # cmin
-                 out_shardings=_chi_R_out,
-                 static_argnums=())
-        def minimax_tau_integrate_chi_multi(
-            nodes, psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
-            enk_v, enk_c, vmax, cmin,
-        ):
-            """n_out-output sibling of ``minimax_tau_integrate_chi``: ONE τ
-            sweep (identical per-node Gv/Gc + FFTs + contraction), n_out
-            weighted accumulators, one R→q FFT per output.  Bit-parity
-            with the single kernel is NOT contractual (different XLA
-            program); the consumer (probe-χ₀ reuse) is gated on the
-            quadrature-error contract instead."""
-            n_rmu = psi_v_xn.shape[2]
-            zero = jax.lax.with_sharding_constraint(
-                jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128),
-                _chi_R_shard)
-            acc0 = tuple(zero for _ in range(n_out))
-
-            def _body(accs, xs):
-                t_scalar, alpha_col = xs        # alpha_col: (n_out,)
-                tau_kernel = (t_scalar if complex_contour else
-                              jnp.real(t_scalar).astype(jnp.float64))
-                Gv_k, Gc_k = _build_Gv_Gc(psi_v_xn, psi_v_yr,
-                                          psi_c_yr, psi_c_xn,
-                                          enk_v, enk_c, tau_kernel, vmax, cmin)
-                Gv_R = _Gv_fftn(Gv_k)
-                Gc_R = _Gc_fftn(Gc_k)
-                chi_tau = jax.lax.with_sharding_constraint(
-                    jnp.einsum('Rambn,Rambn->Rmn',
-                               Gc_R, jnp.conj(Gv_R), optimize=True),
-                    _chi_R_shard)
-                if not complex_contour:
-                    chi_tau = _complete_static_vertex_orientations(chi_tau)
-                return tuple(a + alpha_col[i] * chi_tau
-                             for i, a in enumerate(accs)), None
-
-            final_R, _ = jax.lax.scan(
-                _body, acc0, (nodes.t, jnp.transpose(nodes.alpha)), unroll=1)
-            return tuple(_chi_fftn_local(f) for f in final_R)
-
-        return minimax_tau_integrate_chi_multi
-
-    @partial(jax.jit,
-             in_shardings=(_nodes_shard,
-                            NamedSharding(mesh_xy, _psi_xn_spec),
-                            NamedSharding(mesh_xy, _psi_yr_spec),
-                            NamedSharding(mesh_xy, _psi_yr_spec),
-                            NamedSharding(mesh_xy, _psi_xn_spec),
-                            NamedSharding(mesh_xy, _rep1),
-                            NamedSharding(mesh_xy, _rep1),
-                            NamedSharding(mesh_xy, _rep0),       # vmax
-                            NamedSharding(mesh_xy, _rep0)),      # cmin
-             out_shardings=_chi_R_shard,
-             static_argnums=())
-    def minimax_tau_integrate_chi(
-        nodes, psi_v_xn, psi_v_yr, psi_c_yr, psi_c_xn,
-        enk_v, enk_c, vmax, cmin,
-    ):
-        """Full τ sweep accumulating χ_R, then one R→q FFT.
-
-        The chi0 tau sweep consumes a ``MinimaxNodes`` pytree.  For chi0 the nodes
-        arrive with purely-real τ (``time_axis='real'``) and complex α
-        whose Im part is zero; ``alpha`` includes the one-orientation
-        prefactor ``-α_quad·exp(-τ·E_gap)``.  The scan body explicitly adds
-        the reverse ordered transition before scaling the per-τ contraction.
-
-        For each τ node: build Gv, Gc via build_G_tau; FFT both to R;
-        element-wise contract (Σ_{a,b} Gc_R · conj(Gv_R)) into chi_R;
-        accumulate weighted by α; final back-FFT to q.  All collectives
-        and dispatch happen inside one compiled graph — no Python loop.
-        """
-        n_rmu = psi_v_xn.shape[2]
-        chi_R_zero = jax.lax.with_sharding_constraint(
-            jnp.zeros((nk, n_rmu, n_rmu), dtype=jnp.complex128), _chi_R_shard)
-
-        def _body(chi_R_acc, xs):
-            t_scalar, alpha_scalar = xs
-            # ``t`` arrives complex (pytree dtype); chi0's Laplace quad
-            # places it with Im=0.  Cast to float64 so _build_Gv_Gc's
-            # float64 tau signature — and build_G_tau's downstream exp —
-            # stay on the exact numerical path that produced the locked
-            # MoS2 3×3 regression hash.
-            tau_kernel = (t_scalar if complex_contour else
-                          jnp.real(t_scalar).astype(jnp.float64))
-            Gv_k, Gc_k = _build_Gv_Gc(psi_v_xn, psi_v_yr,
-                                      psi_c_yr, psi_c_xn,
-                                      enk_v, enk_c, tau_kernel, vmax, cmin)
-            Gv_R = _Gv_fftn(Gv_k)
-            Gc_R = _Gc_fftn(Gc_k)
-            # chi_R(m, n) = Σ_{a,b} Gc_R(a,m,b,n) · conj(Gv_R(a,m,b,n))
-            chi_tau = jax.lax.with_sharding_constraint(
-                jnp.einsum('Rambn,Rambn->Rmn',
-                           Gc_R, jnp.conj(Gv_R), optimize=True),
-                _chi_R_shard)
-            if not complex_contour:
-                chi_tau = _complete_static_vertex_orientations(chi_tau)
-            # α is complex; its Im part is zero for the chi0 Laplace
-            # window.  Multiplying complex·complex is identical to
-            # float·complex at the hardware level when Im(α)=0.
-            return chi_R_acc + alpha_scalar * chi_tau, None
-
-        final_R, _ = jax.lax.scan(
-            _body, chi_R_zero, (nodes.t, nodes.alpha), unroll=1)
-        return _chi_fftn_local(final_R)
-
-    # Minimax quadrature always delivers ≥1 node — the compiled scan
-    # handles any n≥1 without a short-circuit wrapper.
-    return minimax_tau_integrate_chi
+def _contract_chi_vertices(Gv_R, Gc_R, operands, identities, complex_contour):
+    """Contract Hermitian endpoint vertices and complete their ordered orientations."""
+    from common.gamma_matrices import gamma_double_contract
+    left_identity, right_identity = identities
+    reverse = None
+    if operands is None or (left_identity and right_identity):
+        forward = jnp.einsum('Rambn,Rambn->Rmn', Gc_R, jnp.conj(Gv_R), optimize=True)
+    else:
+        perm_l, phase_l, perm_r, phase_r = operands
+        forward = gamma_double_contract(
+            jnp.conj(Gv_R), Gc_R,
+            perm_L=None if left_identity else perm_l,
+            phase_L=None if left_identity else phase_l,
+            perm_R=None if right_identity else perm_r,
+            phase_R=None if right_identity else jnp.conj(phase_r),
+            spin_axes=(1, 3))
+        Gv_R_ba = jnp.transpose(Gv_R, (0, 3, 4, 1, 2))
+        Gc_R_ba = jnp.transpose(Gc_R, (0, 3, 4, 1, 2))
+        reverse = gamma_double_contract(
+            jnp.conj(Gv_R_ba), Gc_R_ba,
+            perm_L=None if right_identity else perm_r,
+            phase_L=None if right_identity else jnp.conj(phase_r),
+            perm_R=None if left_identity else perm_l,
+            phase_R=None if left_identity else phase_l,
+            spin_axes=(1, 3))
+    return (forward if complex_contour else
+            _complete_static_vertex_orientations(forward, reverse))
 
 
 def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                                  face_shape, *, right_face_shape=None,
-                                 vertex_pair=False,
-                                 vertex_identity=(False, False),
-                                 k_unfold_plan=None):
-    """Face-layout sibling of :func:`_get_chi_minimax_kernel_legacy`.
-
-    G construction is the only part that forks (module-level docstring):
-    ``psi_mun``/``psi_nmu`` cover the FULL [b0,b4) band range (obstacle
-    #3 — a legal face matrix cannot be sliced to val/cond), so the
-    val/cond split that legacy expresses as two DIFFERENTLY-SIZED band
-    slices becomes two full-extent G builds gated by a band-IDENTITY
-    ``mask`` (``Wavefunctions.band_mask`` — this is exactly
-    ``build_G_tau``'s own pre-existing ``mask`` parameter, designed for
-    Σ's val/cond selector; chi0 simply becomes its second user).  ONE
-    ``distrib_la.gemm_plan`` serves BOTH Gv and Gc, since both now share
-    the same (mu*ns, nb_full, mu*ns) shape — the legacy kernel needed two
-    only because its val/cond slices differ in size.  FFT/contraction
-    stages below are copied from the legacy body UNCHANGED (same specs,
-    same einsum) because G's output shape/sharding is layout-independent.
-    """
+                                 vertex_pairs=None,
+                                 k_unfold_plan=None, layout="face"):
+    """Build masked valence/conduction Green functions and integrate both response orientations."""
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
     from .wavefunction_bundle import (
@@ -442,46 +147,32 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
         G_FLATK_SPEC as _G_out_flatk,
         CHI_Q_SPEC as _chi_spec,
         CHI_R_SPEC as _chi_R_spec,
-        PSI_MUN_SPEC as _psi_mun_spec,
-        PSI_NMU_SPEC as _psi_nmu_spec,
     )
     from .greens_function_kernel import build_G_tau
+    from common.wfn_layout import psi_specs
+    _psi_nmu_spec, _psi_mun_spec = psi_specs(layout)
 
     nk_shape, nb_full, n_rmu_left, ns = (int(v) for v in face_shape)
     if right_face_shape is None:
         right_face_shape = face_shape
     nk_right, nb_right, n_rmu_right, ns_right = (
         int(v) for v in right_face_shape)
-    expected_input_nk = (
-        nk if k_unfold_plan is None else int(k_unfold_plan.n_parent))
-    if nk_shape != expected_input_nk:
-        raise ValueError(
-            f"_get_chi_minimax_kernel_face: face_shape nk={nk_shape} does "
-            f"not match expected input k extent {expected_input_nk}")
-    if (nk_right, nb_right, ns_right) != (
-            expected_input_nk, nb_full, ns):
-        raise ValueError(
-            "_get_chi_minimax_kernel_face: left/right endpoint bundles "
-            "must share (nk, nb_full, nspinor); got "
-            f"{face_shape} and {right_face_shape}")
-    if k_unfold_plan is not None:
-        if int(k_unfold_plan.n_full) != nk:
-            raise ValueError(
-                "_get_chi_minimax_kernel_face: parent plan full-k extent "
-                f"{k_unfold_plan.n_full} != prod(kgrid)={nk}.")
-        if vertex_pair or n_rmu_left != n_rmu_right:
-            raise ValueError(
-                "_get_chi_minimax_kernel_face: parent-k bring-up owns the "
-                "ordinary square charge response only; rectangular/four-"
-                "current blocks remain on full k.")
-        # Keep every per-node Green function in the orbit-packed basis.  Its
-        # parent->full symmetry action is then process-local; canonicalize the
-        # accumulated chi only once after the complete tau sweep.
-        n_rmu_out_left = int(k_unfold_plan.n_centroid_packed)
-        n_rmu_out_right = n_rmu_out_left
-    else:
-        n_rmu_out_left = n_rmu_left
-        n_rmu_out_right = n_rmu_right
+    plans = (k_unfold_plan if isinstance(k_unfold_plan, tuple)
+             else (k_unfold_plan, k_unfold_plan))
+    left_plan, right_plan = plans
+    expected_input_nk = nk if left_plan is None else left_plan.n_parent
+    if (nk_shape, nk_right, nb_right, ns_right) != (
+            expected_input_nk, expected_input_nk, nb_full, ns):
+        raise ValueError("chi endpoints must share parent k, band and spin extents.")
+    if any(p is not None and p.n_full != nk for p in plans):
+        raise ValueError("chi parent plan full-k extent disagrees with kgrid.")
+    if (left_plan is None) != (right_plan is None):
+        raise ValueError("Both chi endpoints must carry parent plans together.")
+    n_rmu_out_left, n_rmu_out_right = n_rmu_left, n_rmu_right
+    paired = isinstance(k_unfold_plan, tuple)
+    if paired and any(not np.array_equal(getattr(left_plan, name), getattr(right_plan, name))
+                      for name in ("irr_idx", "sym_idx", "k_parent_frac", "spin_action_full")):
+        raise ValueError("chi family plans disagree on the raw-parent k action.")
 
     _Gv_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
     _Gc_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
@@ -500,7 +191,18 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     # "hoist this call out of every per-k/per-tau loop" instruction.
     g_plan = gemm_plan(
         mesh_xy, m=n_rmu_left * ns, k=nb_full,
-        n=n_rmu_right * ns, nq=expected_input_nk, dtype=jnp.complex128)
+        n=n_rmu_right * ns, nq=nk if paired else expected_input_nk,
+        dtype=jnp.complex128, layout=layout)
+    if paired:
+        from common.shard_map import shard_map
+        def unfold_pair(psi_left, psi_right):
+            return (left_plan.unfold_face(psi_left, spin_axis=1, mu_axis=2,
+                                         mesh_axis="x"),
+                    right_plan.unfold_face(psi_right, spin_axis=2, mu_axis=3,
+                                          mesh_axis="y"))
+        unfold_pair = shard_map(unfold_pair, mesh=mesh_xy,
+            in_specs=(_psi_mun_spec, _psi_nmu_spec),
+            out_specs=(_psi_mun_spec, _psi_nmu_spec), check_vma=False)
 
     @partial(jax.jit,
              in_shardings=(_psi_mun_shard, _psi_nmu_shard,
@@ -514,18 +216,24 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     def _build_Gv_Gc(psi_mun_left, psi_nmu_right,
                     mask_v, mask_c, enk_full,
                     tau_scalar, vmax, cmin):
+        if paired:
+            psi_mun_left, psi_nmu_right = unfold_pair(
+                psi_mun_left, psi_nmu_right)
+            rows = jnp.asarray(left_plan.irr_idx)
+            mask_v, mask_c, enk_full = (jnp.take(v, rows, axis=0)
+                                       for v in (mask_v, mask_c, enk_full))
         t_c = jnp.conj(tau_scalar) if complex_contour else tau_scalar
         Gv_k = jax.lax.with_sharding_constraint(
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        -tau_scalar, e_ref=vmax,
-                       mask=mask_v, layout="face", gemm=g_plan,
-                       k_unfold_plan=k_unfold_plan),
+                       mask=mask_v, layout=layout, gemm=g_plan,
+                       k_unfold_plan=None if paired else k_unfold_plan),
             _G_k_shard)
         Gc_k = jax.lax.with_sharding_constraint(
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        t_c, e_ref=cmin,
-                       mask=mask_c, layout="face", gemm=g_plan,
-                       k_unfold_plan=k_unfold_plan),
+                       mask=mask_c, layout=layout, gemm=g_plan,
+                       k_unfold_plan=None if paired else k_unfold_plan),
             _G_k_shard)
         return jnp.conj(Gv_k), jnp.conj(Gc_k)
 
@@ -581,73 +289,43 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
         return minimax_tau_integrate_chi_multi
 
-    if vertex_pair:
-        from common.gamma_matrices import gamma_double_contract
-    left_identity, right_identity = vertex_identity
+    identities = ((True, True) if vertex_pairs is None else
+                  tuple(v == 0 for v in vertex_pairs[0]))
+    n_vertices = 1 if vertex_pairs is None else len(vertex_pairs)
 
     def _single_impl(
         nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
         vertex_operands,
     ):
-        chi_R_zero = jax.lax.with_sharding_constraint(
-            jnp.zeros((nk, n_rmu_out_left, n_rmu_out_right),
-                      dtype=jnp.complex128), _chi_R_shard)
+        stack_shard = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
+        zero = jax.lax.with_sharding_constraint(
+            jnp.zeros((n_vertices, nk, n_rmu_out_left, n_rmu_out_right),
+                      dtype=jnp.complex128), stack_shard)
+        tables = (None if vertex_pairs is None else
+                  tuple(jnp.stack(values) for values in zip(*vertex_operands)))
 
-        def _body(chi_R_acc, xs):
+        def _body(accumulators, xs):
             t_scalar, alpha_scalar = xs
             tau_kernel = (t_scalar if complex_contour else
                           jnp.real(t_scalar).astype(jnp.float64))
             Gv_k, Gc_k = _build_Gv_Gc(psi_mun, psi_nmu, mask_v, mask_c,
                                       enk_full, tau_kernel, vmax, cmin)
-            Gv_R = _Gv_fftn(Gv_k)
-            Gc_R = _Gc_fftn(Gc_k)
-            reverse_tau_raw = None
-            if vertex_operands is None or (left_identity and right_identity):
-                chi_tau_raw = jnp.einsum(
-                    'Rambn,Rambn->Rmn',
-                    Gc_R, jnp.conj(Gv_R), optimize=True)
-            else:
-                perm_l, phase_l, perm_r, phase_r = vertex_operands
-                chi_tau_raw = gamma_double_contract(
-                    jnp.conj(Gv_R), Gc_R,
-                    perm_L=None if left_identity else perm_l,
-                    phase_L=None if left_identity else phase_l,
-                    # Right endpoint orientation: the trace uses
-                    # Gamma_B[c,d], whereas the helper's row form is
-                    # Gamma_B[d,c].  Canonical alpha matrices are Hermitian
-                    # monomials, so conjugating the row phase transposes it.
-                    perm_R=None if right_identity else perm_r,
-                    phase_R=(None if right_identity else jnp.conj(phase_r)),
-                    spin_axes=(1, 3))
-                # The reverse ordered transition has natural endpoint axes
-                # (mu_B,mu_A) and swapped Lorentz labels (B,A).  The local
-                # transposes are views of the SAME two Green tensors: no
-                # second G build or FFT is required.  Only the orientation
-                # owner below applies its dagger back to (mu_A,mu_B).
-                Gv_R_ba = jnp.transpose(Gv_R, (0, 3, 4, 1, 2))
-                Gc_R_ba = jnp.transpose(Gc_R, (0, 3, 4, 1, 2))
-                reverse_tau_raw = gamma_double_contract(
-                    jnp.conj(Gv_R_ba), Gc_R_ba,
-                    perm_L=None if right_identity else perm_r,
-                    # Taking the natural BA endpoint adjoint conjugates
-                    # both Hermitian vertex tables.  On the left that is
-                    # the conjugated row phase; on the helper's transposed
-                    # right convention the two conjugations cancel.
-                    phase_L=(None if right_identity
-                             else jnp.conj(phase_r)),
-                    perm_R=None if left_identity else perm_l,
-                    phase_R=None if left_identity else phase_l,
-                    spin_axes=(1, 3))
-            chi_tau = jax.lax.with_sharding_constraint(
-                chi_tau_raw, _chi_R_shard)
-            if not complex_contour:
-                chi_tau = _complete_static_vertex_orientations(
-                    chi_tau, reverse_tau_raw)
-            return chi_R_acc + alpha_scalar * chi_tau, None
+            Gv_R, Gc_R = _Gv_fftn(Gv_k), _Gc_fftn(Gc_k)
+
+            def vertex_step(index, acc):
+                operands = None if tables is None else tuple(table[index] for table in tables)
+                chi_tau = _contract_chi_vertices(
+                    Gv_R, Gc_R, operands, identities, complex_contour)
+                chi_tau = jax.lax.with_sharding_constraint(chi_tau, _chi_R_shard)
+                previous = jax.lax.dynamic_index_in_dim(acc, index, axis=0, keepdims=False)
+                value = previous + alpha_scalar * chi_tau
+                return jax.lax.dynamic_update_index_in_dim(acc, value, index, axis=0)
+
+            return jax.lax.fori_loop(0, n_vertices, vertex_step, accumulators, unroll=1), None
 
         final_R, _ = jax.lax.scan(
-            _body, chi_R_zero, (nodes.t, nodes.alpha), unroll=1)
-        return _finish_chi(final_R)
+            _body, zero, (nodes.t, nodes.alpha), unroll=1)
+        return tuple(_finish_chi(final_R[index]) for index in range(n_vertices))
 
     _base_in = (_nodes_shard, _psi_mun_shard, _psi_nmu_shard,
                 NamedSharding(mesh_xy, _rep2),
@@ -656,19 +334,19 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                 NamedSharding(mesh_xy, _rep0),
                 NamedSharding(mesh_xy, _rep0))
 
-    if vertex_pair:
-        @partial(jax.jit,
-                 in_shardings=_base_in + tuple(
-                     NamedSharding(mesh_xy, _rep1) for _ in range(4)),
-                 out_shardings=_chi_R_shard)
+    if vertex_pairs is not None:
+        vertex_shard = tuple(tuple(NamedSharding(mesh_xy, P()) for _ in range(4))
+                             for _ in vertex_pairs)
+
+        @partial(jax.jit, in_shardings=(*_base_in, vertex_shard),
+                 out_shardings=(_chi_R_shard,) * n_vertices)
         def minimax_tau_integrate_chi_vertex(
             nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
-            perm_l, phase_l, perm_r, phase_r,
+            vertex_operands,
         ):
-            return _single_impl(
-                nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full,
-                vmax, cmin, (perm_l, phase_l, perm_r, phase_r))
-
+            """Share each Green/FFT pair across the ordered vertices of one family class."""
+            return _single_impl(nodes, psi_mun, psi_nmu, mask_v, mask_c,
+                                enk_full, vmax, cmin, vertex_operands)
         return minimax_tau_integrate_chi_vertex
 
     @partial(jax.jit, in_shardings=_base_in, out_shardings=_chi_R_shard)
@@ -677,232 +355,46 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     ):
         return _single_impl(
             nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full,
-            vmax, cmin, None)
+            vmax, cmin, (None,))[0]
 
     return minimax_tau_integrate_chi
 
 
-
-
 def _get_chi_fractional_contour_kernel(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int,
-    *, layout: str = "legacy", face_shape=None, k_unfold_plan=None,
+    *, layout: str = "face", face_shape=None, k_unfold_plan=None,
 ):
-    """Retarded finite-occupation chi0 on one positive-time sweep.
-
-    ``layout`` (static): ``'legacy'`` (default) is the exact kernel this
-    module has always built — see
-    :func:`_get_chi_fractional_contour_kernel_legacy`.  ``'face'`` builds
-    the two-face carrier's version — a substitution of operands onto the
-    SAME ``build_G_tau(layout='face', ...)`` mechanism the ordinary
-    minimax kernel already uses (this kernel's two Green's functions are
-    each a one-particle, ``band_weight``-diagonal contraction, so no new
-    distributed algorithm is needed here — see
-    :func:`_get_chi_fractional_contour_kernel_face` and
-    ``docs/architecture/fractional_chi0_response_face.md``); requires
-    ``face_shape=(nk, nb_full, n_rmu, nspinor)``.  Mirrors
-    ``_get_chi_minimax_kernel``'s own legacy/face dispatcher split — the
-    cache-management lines below moved here from the (now pure-builder)
-    legacy body, exactly as that split's own precedent.
-    """
+    """Build the face or parent retarded response on one positive-time sweep."""
     from ffi import ffi_dial_key
 
     grid = tuple(int(n) for n in kgrid)
     n_out = int(n_out)
     if n_out < 1:
         raise ValueError("fractional contour chi0 requires at least one output")
-    if layout not in ("legacy", "face"):
+    if layout not in ("face", "axis"):
         raise ValueError(
-            f"_get_chi_fractional_contour_kernel: layout must be 'legacy' "
-            f"or 'face', got {layout!r}")
-    cache_key = ("fractional_contour", id(mesh_xy), grid, ffi_dial_key(),
+            f"_get_chi_fractional_contour_kernel: layout must be 'face' "
+            f"got {layout!r}")
+    cache_key = ("fractional_contour", _mesh_key(mesh_xy), grid, ffi_dial_key(),
                  n_out, layout, face_shape, id(k_unfold_plan))
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
-    if layout == "legacy":
-        kernel = _get_chi_fractional_contour_kernel_legacy(mesh_xy, grid, n_out)
-    else:
-        if face_shape is None:
-            raise ValueError(
-                "_get_chi_fractional_contour_kernel(layout='face') requires "
-                "face_shape=(nk, nb_full, n_rmu, nspinor)")
-        kernel = _get_chi_fractional_contour_kernel_face(
-            mesh_xy, grid, n_out, face_shape, k_unfold_plan=k_unfold_plan)
+    if face_shape is None:
+        raise ValueError(
+            "_get_chi_fractional_contour_kernel(layout='face') requires "
+            "face_shape=(nk, nb_full, n_rmu, nspinor)")
+    kernel = _get_chi_fractional_contour_kernel_face(
+        mesh_xy, grid, n_out, face_shape, k_unfold_plan=k_unfold_plan, layout=layout)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
 
-def _get_chi_fractional_contour_kernel_legacy(
-    mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int,
-):
-    """The exact pre-``low_mem_bands`` kernel body, moved verbatim out of
-    :func:`_get_chi_fractional_contour_kernel` (only the cache-key/lookup/
-    store lines were removed — that bookkeeping is now the dispatcher's
-    job, mirroring ``_get_chi_minimax_kernel_legacy``'s own split) so the
-    dispatcher could gain a layout branch without touching this one at
-    all.
-
-    At each node this builds only
-
-        A_q(t) = sum_ab f_a (1-f_b) exp[-i(E_b-E_a)t] X_ab(q)
-
-    from two single-band Green sums.  The other Keldysh product is not a
-    second pair build: Hermiticity of the density vertex gives
-
-        B_q(t) = A_{-q}(-t)^T.
-
-    With the FFT convention used here, FFT_R[conj(A_R(t))](q) is exactly
-    conj(A_{-q}(t)) = A_{-q}(-t)^T.  This is an explicit full-grid
-    q-orientation identity, not time-reversal symmetry, and is therefore
-    valid for broken-TRS spinor calculations.  The two products meet only
-    after both band sums have disappeared.
-    """
-    from common.fft_helpers import make_flat_k_fftn
-    from .greens_function_kernel import build_G_tau
-    from .wavefunction_bundle import (
-        G_FFT7D_SPEC,
-        G_FLATK_SPEC,
-        CHI_Q_SPEC,
-        CHI_R_SPEC,
-        PSI_XN_SPEC,
-        PSI_YR_SPEC,
-    )
-
-    grid = tuple(int(n) for n in kgrid)
-    nk = int(np.prod(grid))
-    n_out = int(n_out)
-
-    G_fftn = make_flat_k_fftn(
-        mesh_xy, grid, G_FFT7D_SPEC, norm="ortho")
-    chi_fftn = make_flat_k_fftn(
-        mesh_xy, grid, CHI_Q_SPEC, norm="ortho")
-    G_shard = NamedSharding(mesh_xy, G_FLATK_SPEC)
-    chi_R_shard = NamedSharding(mesh_xy, CHI_R_SPEC)
-    rep2 = NamedSharding(mesh_xy, P(None, None))
-    rep1 = NamedSharding(mesh_xy, P(None))
-    rep0 = NamedSharding(mesh_xy, P())
-
-    @partial(
-        jax.jit,
-        in_shardings=(
-            rep1, rep0,
-            NamedSharding(mesh_xy, PSI_XN_SPEC),
-            NamedSharding(mesh_xy, PSI_YR_SPEC),
-            NamedSharding(mesh_xy, PSI_YR_SPEC),
-            NamedSharding(mesh_xy, PSI_XN_SPEC),
-            rep2, rep2, rep2, rep2, rep0,
-        ),
-        out_shardings=tuple(chi_R_shard for _ in range(n_out)),
-    )
-    def integrate(
-        time_nodes,
-        projection_rows,
-        psi_f_xn,
-        psi_f_yr,
-        psi_u_yr,
-        psi_u_xn,
-        enk_f,
-        enk_u,
-        occ_f,
-        occ_u,
-        energy_reference,
-    ):
-        n_mu = psi_f_xn.shape[2]
-        zero = jax.lax.with_sharding_constraint(
-            jnp.zeros((nk, n_mu, n_mu), dtype=jnp.complex128),
-            chi_R_shard,
-        )
-        initial = tuple(zero for _ in range(n_out))
-
-        def body(accumulators, node):
-            time, projection = node
-            tau = jnp.asarray(1j, dtype=jnp.complex128) * time
-            Gf_k = jax.lax.with_sharding_constraint(
-                jnp.conj(build_G_tau(
-                    psi_f_xn,
-                    psi_f_yr,
-                    enk_f,
-                    -tau,
-                    e_ref=energy_reference,
-                    band_weight=occ_f,
-                )),
-                G_shard,
-            )
-            Gu_k = jax.lax.with_sharding_constraint(
-                jnp.conj(build_G_tau(
-                    psi_u_xn,
-                    psi_u_yr,
-                    enk_u,
-                    -tau,
-                    e_ref=energy_reference,
-                    band_weight=1.0 - occ_u,
-                )),
-                G_shard,
-            )
-            Gf_R = G_fftn(Gf_k)
-            Gu_R = G_fftn(Gu_k)
-            A_R = jax.lax.with_sharding_constraint(
-                jnp.einsum(
-                    "Rambn,Rambn->Rmn",
-                    Gu_R,
-                    jnp.conj(Gf_R),
-                    optimize=True,
-                ),
-                chi_R_shard,
-            )
-            reverse_R = jnp.conj(A_R)
-            updated = tuple(
-                accumulators[i]
-                - 1j * projection[i] * A_R
-                + 1j * projection[i] * reverse_R
-                for i in range(n_out)
-            )
-            return updated, None
-
-        final_R, _ = jax.lax.scan(
-            body,
-            initial,
-            (time_nodes, jnp.transpose(projection_rows)),
-            unroll=1,
-        )
-        return tuple(chi_fftn(value) for value in final_R)
-
-    return integrate
-
-
 def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
-    *, k_unfold_plan=None,
+    *, k_unfold_plan=None, layout="face",
 ):
-    """Face-layout sibling of
-    :func:`_get_chi_fractional_contour_kernel_legacy`.  Same Keldysh
-    identity (see that function's docstring); the two per-node Green's
-    functions (``Gf`` weighted by ``occ_f``, ``Gu`` weighted by
-    ``occ_u``) are each an ordinary ONE-PARTICLE ``build_G_tau``
-    contraction — this kernel is therefore a substitution of operands
-    (``psi_mun``/``psi_nmu`` instead of the four legacy views) onto the
-    SAME mechanism the ordinary minimax kernel's face port already ships,
-    not a new algorithm.  ONE ``distrib_la.gemm_plan`` (shared by both
-    ``Gf`` and ``Gu``, mirroring ``_get_chi_minimax_kernel_face``'s own
-    ``g_plan`` shared by ``Gv``/``Gc``) is built ONCE here, eagerly.
-
-    Legacy slices ψ down to the ``f_slice``/``u_slice`` occupation-support
-    window (a genuine cost cut — fewer bands enter the contraction); a
-    face carrier cannot be band-sliced (obstacle #3), so the CALLER
-    (:func:`_chi0_fractional_contour_args`) instead precomputes the FINAL
-    ``occ_f``/``occ_u`` band_weight values — ``occ`` and ``1-occ``
-    respectively, legacy's own two conventions — zero-weighted outside
-    that same window before calling here — "weight, don't window", the
-    SAME convention ``isdf.core._c_q_face`` uses for its own L/R window
-    (see the design doc).  ``occ_u`` therefore already IS ``1-occ``, not
-    a raw occupation this function must itself invert — applying a
-    SECOND ``1-x`` here reintroduces exactly the bug this comment is
-    warning against (see ``integrate``'s own comment, found via the Na
-    production-shape harness).  This function always runs the FULL
-    ``nb_full`` contraction; it does not know or care that the caller
-    has already zeroed part of the weight.
-    """
+    """Integrate the retarded response using final occupied and unoccupied band weights."""
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
     from .greens_function_kernel import build_G_tau
@@ -915,6 +407,8 @@ def _get_chi_fractional_contour_kernel_face(
         PSI_NMU_SPEC,
     )
 
+    from common.wfn_layout import psi_specs
+    PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(layout)
     grid = tuple(int(n) for n in kgrid)
     nk = int(np.prod(grid))
     n_out = int(n_out)
@@ -952,7 +446,7 @@ def _get_chi_fractional_contour_kernel_face(
     # and Gu build this kernel ever does — mirrors
     # _get_chi_minimax_kernel_face's own g_plan.
     g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
-                       nq=expected_input_nk, dtype=jnp.complex128)
+                       nq=nk, dtype=jnp.complex128, layout=layout)
     def _finish(value):
         return chi_fftn(value)
 
@@ -975,24 +469,7 @@ def _get_chi_fractional_contour_kernel_face(
         occ_u,
         energy_reference,
     ):
-        # occ_f/occ_u are the FINAL band_weight values, applied directly
-        # (no further transform here) -- the caller
-        # (_chi0_fractional_contour_args) has ALREADY done both jobs: the
-        # physical weight (occ_f is occ; occ_u is 1-occ -- legacy's own
-        # Gu_k convention, inverted BEFORE masking, not after) AND the
-        # "weight, don't window" support indicator (zero outside
-        # f_slice/u_slice).  Do NOT write `1.0 - occ_u` here: occ_u is
-        # already `(1-occ)*indicator`, and re-subtracting from 1.0 would
-        # turn the correctly-zeroed OUTSIDE-the-window positions into 1.0
-        # instead of 0.0, silently pulling every band outside u_slice
-        # into Gu_k's contraction (found and fixed 2026-08-23 via the Na
-        # production-shape harness: max_rel 0.19 -> 1e-16 at nb_full=48,
-        # 98.7% of the (mu,mu) output entries above 1% of the max diff --
-        # not a localized bug, every u_slice-adjacent band was wrong).
-        # enk_full is the bundle's own full [b0,b4) energy table, shared
-        # by both roles -- legacy's enk_f/enk_u are always the SAME array
-        # sliced twice, so this is not a new sharing, only a name
-        # simplification.
+        # The caller supplies occ and 1-occ after support masking; do not invert again.
         n_mu = psi_mun.shape[2]
         zero = jax.lax.with_sharding_constraint(
             jnp.zeros((nk, n_mu, n_mu), dtype=jnp.complex128),
@@ -1011,7 +488,7 @@ def _get_chi_fractional_contour_kernel_face(
                     -tau,
                     e_ref=energy_reference,
                     band_weight=occ_f,
-                    layout="face",
+                    layout=layout,
                     gemm=g_plan,
                     k_unfold_plan=k_unfold_plan,
                 )),
@@ -1025,7 +502,7 @@ def _get_chi_fractional_contour_kernel_face(
                     -tau,
                     e_ref=energy_reference,
                     band_weight=occ_u,
-                    layout="face",
+                    layout=layout,
                     gemm=g_plan,
                     k_unfold_plan=k_unfold_plan,
                 )),
@@ -1062,33 +539,13 @@ def _get_chi_fractional_contour_kernel_face(
     return integrate
 
 
-
 # ============================================================================
 # W solve — plan 1 of 2: LOCAL (q-parallel per-q dense LU)
 # ============================================================================
 
 def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
                           n_rmu_logical: int | None = None):
-    """W = (I - V χ)⁻¹ V via q-parallel shard_map.  All arrays flat-q: (nq, μ, μ).
-
-    The LOCAL plan: q's are scattered over all devices
-    (``P(('x','y'),None,None)``) and each rank runs one dense pivoted LU
-    (``lu_factor``/``lu_solve``) per owned q.  LU is the right inner
-    solve: A is SQUARE and generically well conditioned (it is I minus a
-    term whose spectral radius is < 1 wherever the RPA screening is
-    physical — an eigenvalue of Vχ₀ reaching 1 is a plasmon instability,
-    not a numerical one).  One factorisation, one triangular pair of
-    solves.
-
-    ``n_rmu_logical``: when smaller than ``n_rmu`` (μ-padded inputs),
-    the per-q pivoted LU is μ-SLICED to the logical extent and the W
-    pad rows/cols are zero-filled after (their exact value: V pad rows
-    are zero).  Load-bearing for device-count invariance — LU at the
-    padded extent regroups partial sums per pad extent, and the
-    resulting 1e-8-rel W wobble is amplified to eV on near-pole GN-PPM
-    bands (reports/device_invariance_2026-07-08/ROOT_CAUSE.md, charge
-    manifestation).  At zero pad the slice/fill are no-ops.
-    """
+    """W = (I - V χ)⁻¹ V via q-parallel shard_map; see docs/architecture/four_current_wiring.md."""
     from common.shard_map import shard_map
 
     n_log = int(n_rmu_logical) if n_rmu_logical is not None else int(n_rmu)
@@ -1097,7 +554,7 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
             f"_get_w_solve_fn_local: n_rmu_logical={n_log} exceeds extent {n_rmu}")
     mu_pad = int(n_rmu) - n_log
 
-    cache_key = ("local", id(mesh_xy), nq, n_rmu, n_log)
+    cache_key = ("local", _mesh_key(mesh_xy), nq, n_rmu, n_log)
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
 
@@ -1218,57 +675,7 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
 def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
                                 n_rmu_logical: int,
                                 distrib_la_batched_route: str = "batch_reshard"):
-    """W = solve(A, V), A = (1 − pref·V·χ₀), everything 2-D sharded.
-
-    The DISTRIBUTED plan — the scale-out route for thousands of
-    low-memory processes, in the same architectural family as the
-    ζ-fit's distributed rank-truncate tier
-    (:func:`isdf.core._factor_c_q_distributed_rank_truncate`):
-
-    1. **A build** — per q-block, ``A = I − V·(pref·χ)`` as a 2-D block
-       GEMM inside ``shard_map``: rank (x, y) all-gathers V's row block
-       along 'y' (full k for its i rows, μ·μ/Px per rank) and χ's column
-       block along 'x' (full k for its j columns, μ·μ/Py per rank),
-       multiplies locally, and subtracts from its identity tile.  The
-       gathers are STRUCTURAL — inside shard_map the partitioner cannot
-       hoist them into a full-stack gather (the per_q-tier lesson,
-       quality pattern #4).  The q loop is chunked HOST-side so one
-       collective instruction never exceeds ``LORRAX_COLLECTIVE_CHUNK_MB``
-       (the AF transport bound; separate XLA executions cannot be
-       re-combined by a compiler pass).
-    2. **Factor + backsolve** — ONE resolved
-       :class:`distrib_la.Plan` for ``solve_lu`` with
-       ``backend='distributed'`` (ScaLAPACK ``pzgetrf``/``pzgetrs`` on a
-       CPU mesh, cuSOLVERMp on CUDA — ``resolve._DISTRIBUTED_DEFAULT``),
-       consuming the block-cyclic tiles where they already live.
-
-    **No rank ever materialises a full (μ, μ) tile**: inputs, A, the LU
-    factors and W all stay ``P(None,'x','y')`` (per-rank blocks of
-    μ/Px × μ/Py; the largest per-rank transient is the μ·μ/min(Px,Py)
-    gathered GEMM operand).  W lands natively in ``P(None,'x','y')`` —
-    no relayout, unlike the local plan.
-
-    Padding contract, and why it is exact: V and χ pad rows/cols are
-    exact zeros (the bilinear-in-zero-padded-ψ contract), so at the
-    PADDED extent ``A = [[A_log, 0], [0, I]]`` and ``RHS = [[V_log], [0]]``
-    hold EXACTLY — the identity-embedded block-diagonal system whose
-    solution is ``[[W_log], [0]]``; partial pivoting cannot mix the
-    blocks (every pad column is a unit vector, every pad row is zero in
-    the logical columns).  Therefore W's pad rows/cols leave the solve as
-    exact zeros without a separate post-solve mask graph.  Unlike the local
-    plan the LOGICAL
-    block is formed/factored at the padded extent, so W here carries the
-    ≤1e-8-rel pad-extent regrouping wobble — which is subsumed by the
-    block-cyclic factorisation's own non-bit-identity; this plan's
-    numerical contract is the Dyson residual (``LORRAX_W_RESIDUAL_CHECK``),
-    not bit-identity with the local plan.
-
-    Geometry/capability failures (host lib absent, non-square or 1-D
-    mesh, n not divisible, process coverage) RAISE at resolve time with
-    the resolver's own message — an explicitly requested distributed
-    solve never silently downgrades to the local plan (quality pattern
-    #6/#8).
-    """
+    """W = solve(A, V), A = (1 − pref·V·χ₀), everything 2-D sharded; see docs/architecture/four_current_wiring.md."""
     n_ext = int(n_rmu)
     n_log = int(n_rmu_logical)
     if n_log > n_ext:
@@ -1280,7 +687,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     # legitimately share one padded extent while owning different logical
     # prefixes (notably scalar charge versus an explicit packed carrier), so
     # omitting n_log would reuse a closure with the wrong exact-zero mask.
-    cache_key = ("distributed", id(mesh_xy), nq, n_ext, n_log,
+    cache_key = ("distributed", _mesh_key(mesh_xy), nq, n_ext, n_log,
                  str(distrib_la_batched_route))
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
@@ -1419,15 +826,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
 
 
 def _w_residual_report(V_flat, chi_scaled, W, n_ext, n_check: int = 4):
-    """Direct Dyson residual ‖(1−Vχ)W − V‖/‖V‖ on the first few q.
-
-    THE strict numerical contract of the distributed plan (a
-    block-cyclic LU is not bit-comparable to the local per-q LU; the
-    residual is what certifies the solve — quality pattern #6, "test
-    what executes").  Diagnostic-only, opt-in via
-    ``LORRAX_W_RESIDUAL_CHECK=1``; never on in the traced production
-    path, so the collective-table gate is taken with it OFF.
-    """
+    """Direct Dyson residual ‖(1−Vχ)W − V‖/‖V‖ on the first few q; see docs/architecture/four_current_wiring.md."""
     ns = min(int(V_flat.shape[0]), int(n_check))
 
     @jax.jit
@@ -1445,15 +844,7 @@ def _w_residual_report(V_flat, chi_scaled, W, n_ext, n_check: int = 4):
 
 
 def _w_solve_pref_scalar(meta) -> float:
-    """The physical-state prefactor in front of χ₀ in the Dyson solve.
-
-    ``nspinor_wfnfile`` is the source-WFN state multiplicity.  In a
-    kinetic-balance lift ``meta.nspinor`` becomes four only to describe the
-    bispinor representation; the band and occupation axes are unchanged.
-    Using that representation width here would therefore halve every
-    charge/current response block.  Read the source field strictly: silently
-    falling back to the representation width would reinstate that error.
-    """
+    """The physical-state prefactor in front of χ₀ in the Dyson solve; see docs/architecture/four_current_wiring.md."""
     nq = int(meta.nk_tot)
     nspin = max(1, int(getattr(meta, 'nspin', 1)))
     nspinor_wfnfile = max(1, int(meta.nspinor_wfnfile))
@@ -1466,26 +857,7 @@ def _w_solve_pref_scalar(meta) -> float:
 def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
                         dyson_solver=None,
                         distrib_la_batched_route: str = "batch_reshard"):
-    """Return ``(solve_fn, pref)`` for the requested W plan.
-
-    Single source of truth for the two-plan dispatch.  Both ``solve_w``
-    and ``precompile_solve_w`` go through this helper — the dispatch
-    logic exists in one place.
-
-    ``dyson_solver`` (input key ``w_dyson_solver``) selects the plan:
-
-    ``local`` (default; ``auto`` is an alias)
-        per-q pivoted LU inside the q-parallel shard_map —
-        :func:`_get_w_solve_fn_local`.
-    ``distributed``
-        the 2-D-sharded stacked-GEMM backsolve through the linalg plan
-        facade — :func:`_get_w_solve_fn_distributed`.  Refuses loudly at
-        resolve time when the mesh/build cannot run it; never silently
-        downgrades.
-
-    W comes out ``P(None,'x','y')`` on BOTH — that is the module's
-    output contract, not a per-plan detail.
-    """
+    """Return ``(solve_fn, pref)`` for the requested W plan; see docs/architecture/four_current_wiring.md."""
     from .gw_config import normalize_w_dyson_solver
     dyson = normalize_w_dyson_solver(dyson_solver)
     nq = int(meta.nk_tot)
@@ -1511,13 +883,7 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
 
 def _require_w_operand_geometry(V_q, chi0_q, meta, mesh_xy, *,
                                 n_rmu_logical=None):
-    """Authenticate the public Dyson carrier without owning its q set.
-
-    The q axis may be full-BZ or an irreducible wedge; its mapping belongs to
-    the screening/MPA caller.  The two centroid axes, however, must be one
-    square runtime carrier shared by V and chi, owned by the packed basis
-    when present or by the canonical suffix-padding receipt otherwise.
-    """
+    """Authenticate the public Dyson carrier without owning its q set; see docs/architecture/four_current_wiring.md."""
     v_shape = tuple(int(n) for n in V_q.shape)
     chi_shape = tuple(int(n) for n in chi0_q.shape)
     if v_shape != chi_shape:
@@ -1546,37 +912,7 @@ def _require_w_operand_geometry(V_q, chi0_q, meta, mesh_xy, *,
 def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
             n_rmu_logical=None,
             distrib_la_batched_route: str = "batch_reshard"):
-    """W(q) = (I − V χ₀)⁻¹ V  via a Dyson solve.  **W comes out sharded.**
-
-    All arrays flat-q: V(nq, μ, μ), χ₀(nq, μ, μ) → W(nq, μ, μ).
-    Scalar inputs use ``meta.mu_basis``'s packed runtime extent when present,
-    otherwise ``padded_mu_extent(meta.n_rmu, mesh_xy)``.  Their q axis may be full-BZ
-    or an irreducible wedge; q-set ownership stays with the caller.  A packed
-    direct-sum caller supplies ``n_rmu_logical`` explicitly because its
-    channel padding is internal rather than one trailing scalar prefix.  The
-    distributed plan masks scalar trailing pad rows/columns to exact zero
-    before its first contraction.
-
-    **Output contract:** ``W`` is ``P(None, 'x', 'y')`` — 2-D sharded
-    W_q(μ_X, ν_Y) — on both plans, and stays that way into its
-    consumers (Σ_SX/Σ_COH's 5-D FFT spec, the PPM fit, the IBZ unfold,
-    the restart writer).
-
-    ``dyson_solver`` (input key ``w_dyson_solver``) picks one of the
-    TWO plans — see :func:`_resolve_w_solve_fn`:
-
-    - ``local`` (default): q-parallel reshard + per-q dense LU via
-      shard_map.  Legal on any mesh; each rank holds whole (μ, μ)
-      tiles for its q's.
-    - ``distributed``: 2-D-sharded stacked-GEMM backsolve through the
-      distrib_la plan door (ScaLAPACK on CPU, cuSOLVERMp on CUDA).
-      No rank ever materialises a full (μ, μ) tile — the P→∞ memory
-      ceiling.  Slower than ``local`` at moderate P; that is priced and
-      accepted (the point is the per-rank memory ceiling, not speed).
-
-    ``chi0_q``'s buffer is CONSUMED (donated) on both plans — the
-    caller must drop its reference after this call.
-    """
+    """W(q) = (I − V χ₀)⁻¹ V via a Dyson solve; see docs/architecture/four_current_wiring.md."""
     n_logical = _require_w_operand_geometry(
         V_q, chi0_q, meta, mesh_xy, n_rmu_logical=n_rmu_logical)
     solve_fn, pref = _resolve_w_solve_fn(
@@ -1588,54 +924,21 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
 
 
 def _chi_face_kwargs(wfns) -> dict:
-    """``{}`` under ``layout='legacy'``; the ``layout='face'`` +
-    ``face_shape`` kwargs :func:`_get_chi_minimax_kernel` needs otherwise.
-    Thin alias for :func:`gw.wavefunction_bundle.face_kernel_kwargs`, the
-    shared owner (mirrors ``cohsex_sigma._face_kwargs``) — kept under this
-    name so this module's own call sites did not need to change."""
+    """Return the canonical face shape arguments from the wavefunction carrier."""
     from .wavefunction_bundle import face_kernel_kwargs
     return face_kernel_kwargs(wfns)
 
 
 def _chi_parent_face_kwargs(wfns) -> dict:
-    """Minimax-G shape kwargs, including raw-parent transport when present.
-
-    The minimax and fractional-CONTOUR kernels take the plan: their G's are
-    one-particle ``build_G_tau`` contractions, so the parent transport is
-    the Green-function rule.  The fractional static-Γ and direct-q PAIR
-    SCANS still consume the primary full-k carrier through
-    :func:`_chi_face_kwargs`: their divided-difference weight couples both
-    band indices and needs the ψ faces themselves at every k.
-    """
+    """Return Green-function shape and typed raw-parent transport arguments."""
     from .wavefunction_bundle import green_face_kernel_kwargs
     return green_face_kernel_kwargs(wfns)
 
 
 def _chi_layout_operands(wfns, eref):
-    """The ψ/energy operand tuple :func:`_get_chi_minimax_kernel`'s
-    returned kernel expects AFTER ``nodes``, dispatched on ``wfns.layout``
-    — the one place :func:`compute_chi0`, :func:`_chi0_multi_kernel_args`
-    and :func:`_chi0_contour_kernel_args` turn a bundle into kernel
-    operands, so those three callers stop extracting legacy views
-    (``.xn()``/``.yr()``) themselves.  Pair with
-    :func:`_chi_parent_face_kwargs`
-    at the SAME call site to build the matching kernel — the two tuples
-    differ in length (legacy's four windowed ψ views vs face's two
-    full-extent ψ copies plus two band masks) because the two kernel
-    bodies' own signatures do
-    (``_get_chi_minimax_kernel_legacy``/``_face``), not because this
-    function special-cases anything beyond that.  ``vmax``/``cmin`` are
-    NOT included — every caller appends those itself, since their host-
-    side reduction is layout-independent and already computed before this
-    is called.
-    """
+    """Select face operands and physical valence/conduction masks for the minimax response."""
     s = wfns.slices
     eref_j = jnp.asarray(eref, dtype=wfns.enk.dtype)
-    if wfns.layout == "legacy":
-        enk_v = wfns.enk[:, s.val] - eref_j
-        enk_c = wfns.enk[:, s.cond] - eref_j
-        return (wfns.xn(s.val), wfns.yr(s.val),
-               wfns.yr(s.cond), wfns.xn(s.cond), enk_v, enk_c)
     carrier = wfns.green_parent
     if carrier is None:
         carrier = wfns
@@ -1647,25 +950,7 @@ def _chi_layout_operands(wfns, eref):
 
 
 def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
-    """Compute χ₀(q) from a wavefunction bundle and minimax quadrature.
-
-    Returns flat-q array (nq, μ, μ).
-
-    ``quad.tau`` and ``quad.alpha`` approximate either 1/x (static) or
-    x/(x²+ωp²) (imaginary-frequency) on [x_min, x_max] where x = E_c - E_v.
-    The physical static/imaginary-axis χ₀ contains both ordered
-    particle-hole orientations.  In the real-space convolution used here::
-
-        χ₀ = -Σ_ℓ α_ℓ [A_R(τ_ℓ) + conj(A_R(τ_ℓ))]
-
-    before the final R-to-q FFT.  The conjugate term maps to
-    ``conj(A_-q)`` and is distinct from ``A_q`` for complex broken-TR states.
-
-    A uniform energy shift via ``energy_reference`` is applied to both
-    valence and conduction energies before building the minimax factors.
-    Because only differences enter, this is algebraically invariant; the
-    knob lets callers align the global zero (e.g. midgap, VBM, CBM).
-    """
+    """Compute χ₀(q) from a wavefunction bundle and minimax quadrature; see docs/architecture/four_current_wiring.md."""
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 
@@ -1744,34 +1029,7 @@ def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
 
 def compute_chi0_imag_ordered(wfns, quad, meta, mesh_xy, *, q_neg_index,
                               energy_reference=0.0):
-    """χ₀(q; iω_p) with BOTH particle-hole orientations carrying their own
-    frequency weight — the route for a deck whose measured time-reversal
-    verdict is false.  Returns flat-q (nq, μ, μ), ``P(None, 'x', 'y')``.
-
-    :func:`compute_chi0` applies the EVEN kernel ``x/(x²+ωp²)`` to the
-    orientation sum ``A_R + conj(A_R)``, which deletes the anti-Hermitian,
-    magnetisation-odd channel ``iω(P^q − conj(P^{−q}))/(ω²+Δ²)`` of χ₀(iω)
-    (lane G, measured on CrI3 run 128).  The exact object is the SAME two
-    carriers with independent complex weights::
-
-        χ₀_q(iωp) = F_q + conj(F_{−q}),
-        F_q       = Σ_l γ_l e^{−τ_l E_gap} A_q(τ_l),   γ_l = −(α_l − iβ_l),
-
-    with ``α`` the served even rule (unchanged) and ``β`` the odd rule
-    ``ωp/(x²+ωp²)`` on the same nodes (``quad.alpha_odd``).  ``F_q`` is one
-    sweep of the existing ``complex_contour`` kernel (real nodes, complex
-    weights, no in-kernel completion) — no second response implementation —
-    and the partner is the flat-q negation gather of its conjugate, which
-    ``FFT_R[conj(A_R)] = conj(A_{−q})`` makes exact.  On a Θ deck
-    ``conj(A_{−q}) = A_q`` and this equals :func:`compute_chi0` to roundoff;
-    the caller keeps the incumbent path there so Θ decks stay bit-identical.
-    Reciprocity ``χ_{−q} = conj(χ_q)`` holds by construction.
-
-    ``q_neg_index`` is the public ``symmetry_maps.q_negation_index`` row
-    permutation for ``meta.kgrid`` — passed in, never rebuilt here (TASTE 4).
-    The probe roles run on the FULL BZ, which is the only grid on which the
-    involution is meaningful.
-    """
+    """χ₀(q; iω_p) with BOTH particle-hole orientations carrying their own frequency weight — the route for a deck whose measured time-reversal verdict is false; see docs/architecture/four_current_wiring.md."""
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     args = _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference)
@@ -1814,61 +1072,43 @@ def compute_no_pair_dirac_current_block(
     wfns_left, wfns_right, quad, meta, mesh_xy, *,
     vertex_left: int, vertex_right: int, energy_reference=0.0,
 ):
-    """Compute one raw no-pair Dirac-current response block ``chi_AB``.
+    """Return one paramagnetic no-pair block without a Ward contact."""
+    return compute_no_pair_dirac_current_blocks(
+        wfns_left, wfns_right, quad, meta, mesh_xy,
+        vertex_pairs=((vertex_left, vertex_right),),
+        energy_reference=energy_reference)[0]
 
-    Returns ``(nq, mu_left, mu_right)`` at ``P(None,'x','y')``.  Endpoint
-    Green functions are built by the same :func:`build_G_tau` path as scalar
-    charge response; only its two centroid operands may have different
-    extents.  The final open-spin trace routes through the canonical
-    :func:`common.gamma_matrices.gamma_double_contract` for a non-scalar
-    vertex pair.  This is the exact paramagnetic component selected by
-    :data:`common.bispinor_init.NO_PAIR_DIRAC_CURRENT_MODEL`: it contains no
-    diamagnetic/seagull contact, gauged nonlocal-pseudopotential term, Hall
-    coefficient, or negative-energy/downfolded completion.  Consumers must not
-    label this block gauge-complete merely because its four-spinor contraction
-    is algebraically closed.
 
-    ``quad.tau`` and ``quad.alpha`` approximate either 1/x (static) or
-    x/(x²+ωp²) (imaginary-frequency) on [x_min, x_max] where x = E_c - E_v.
-    The physical static χ₀ is::
-
-        χ₀_AB(q) = -Σ_ℓ α_ℓ [F_AB(q,τ_ℓ)
-                              + F_BA(-q,τ_ℓ)^dagger]
-
-    The two ordered orientations meet in R space before the final q FFT.
-    They are not two copies of ``F_AB`` on a complex broken-TR deck.
-
-    A uniform energy shift via ``energy_reference`` is applied to both
-    valence and conduction energies before building the minimax factors.
-    Because only differences enter, this is algebraically invariant; the
-    knob lets callers align the global zero (e.g. midgap, VBM, CBM).
-    """
-    A, B = int(vertex_left), int(vertex_right)
-    if not (0 <= A <= 3 and 0 <= B <= 3):
-        raise ValueError(
-            f"chi Lorentz vertices must be in {{0,1,2,3}}; got ({A},{B})")
+def _require_current_chi_endpoints(wfns_left, wfns_right):
+    """Authenticate the paired raw-parent face, spin and band extents."""
     if wfns_left.layout != wfns_right.layout:
         raise ValueError(
             "compute_no_pair_dirac_current_block endpoint layouts differ: "
             f"{wfns_left.layout!r} vs {wfns_right.layout!r}")
-    if wfns_left.layout != "face":
+    if wfns_left.layout not in ("face", "axis"):
         raise ValueError(
             "compute_no_pair_dirac_current_block requires "
-            "layout='face' (low_mem_bands=true); the incumbent legacy "
-            "scalar chi kernel remains unchanged")
+            "the canonical face layout")
     if wfns_right.slices != wfns_left.slices or tuple(
             wfns_right.enk.shape) != tuple(wfns_left.enk.shape):
         raise ValueError(
             "chi endpoint bundles must share band slices and energy-table "
             f"shape; got left={wfns_left.slices}/{wfns_left.enk.shape}, "
             f"right={wfns_right.slices}/{wfns_right.enk.shape}")
-    ns_left = int(wfns_left.psi_mun.shape[1])
-    ns_right = int(wfns_right.psi_nmu.shape[2])
-    if ns_left != 4 or ns_right != 4:
-        raise ValueError(
-            "four-current gamma vertices require four-component bispinors; "
-            f"got endpoint spinor extents ({ns_left},{ns_right})")
+    left, right = wfns_left.green_parent, wfns_right.green_parent
+    if left is None or right is None:
+        raise ValueError("Four-current response requires two raw-parent carriers.")
+    if left.psi_mun.shape[1] != 4 or right.psi_nmu.shape[2] != 4:
+        raise ValueError("Four-current vertices require four spin components.")
+    return left, right
 
+
+def compute_no_pair_dirac_current_blocks(
+    wfns_left, wfns_right, quad, meta, mesh_xy, *,
+    vertex_pairs, energy_reference=0.0,
+):
+    """Integrate one centroid-family class with shared Greens and return q-IBZ blocks."""
+    left, right = _require_current_chi_endpoints(wfns_left, wfns_right)
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 
@@ -1892,27 +1132,27 @@ def compute_no_pair_dirac_current_block(
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
     )
 
-    from .wavefunction_bundle import face_kernel_kwargs
-    left_shape = face_kernel_kwargs(wfns_left)["face_shape"]
-    right_shape = face_kernel_kwargs(wfns_right)["face_shape"]
+    from .wavefunction_bundle import green_face_kernel_kwargs
+    left_shape = green_face_kernel_kwargs(wfns_left)["face_shape"]
+    right_shape = green_face_kernel_kwargs(wfns_right)["face_shape"]
     kernel = _get_chi_minimax_kernel(
-        mesh_xy, kgrid, layout="face", face_shape=left_shape,
-        right_face_shape=right_shape, vertex_pair=True,
-        vertex_identity=(A == 0, B == 0))
-    mask_v = wfns_left.band_mask(s.val)
-    mask_c = wfns_left.band_mask(s.cond)
-    enk_full = wfns_left.enk - jnp.asarray(
-        eref, dtype=wfns_left.enk.dtype)
-    args = (
-        nodes, wfns_left.psi_mun, wfns_right.psi_nmu,
-        mask_v, mask_c, enk_full,
-        jnp.asarray(vmax, dtype=jnp.float64),
-        jnp.asarray(cmin, dtype=jnp.float64),
-    )
+        mesh_xy, kgrid, layout=left.layout, face_shape=left_shape,
+        right_face_shape=right_shape, vertex_pairs=vertex_pairs,
+        k_unfold_plan=(left.plan, right.plan))
+    mask_v = left.plan.parent_rows(wfns_left.band_mask(s.val))
+    mask_c = left.plan.parent_rows(wfns_left.band_mask(s.cond))
+    args = (nodes, left.psi_mun, right.psi_nmu, mask_v, mask_c,
+            left.enk - jnp.asarray(eref, dtype=left.enk.dtype),
+            jnp.asarray(vmax, dtype=jnp.float64), jnp.asarray(cmin, dtype=jnp.float64))
     from common.gamma_matrices import gamma_perm_phase
-    perm_l, phase_l = gamma_perm_phase(A)
-    perm_r, phase_r = gamma_perm_phase(B)
-    return kernel(*args, perm_l, phase_l, perm_r, phase_r)
+    vertices = []
+    for A, B in vertex_pairs:
+        perm_l, phase_l = gamma_perm_phase(A)
+        perm_r, phase_r = gamma_perm_phase(B)
+        vertices.append((perm_l, jnp.conj(phase_l), perm_r, jnp.conj(phase_r)))
+    full = kernel(*args, tuple(vertices))
+    rows = jnp.asarray(left.plan.sym.q_irr_full_idx)
+    return tuple(jnp.take(block, rows, axis=0) for block in full)
 
 
 _WARD_SUBTRACTED_NO_PAIR = "ward_subtracted_no_pair"
@@ -1922,12 +1162,7 @@ STATIC_PHOTON_NO_PAIR_MODEL = NO_PAIR_DIRAC_CURRENT_MODEL
 
 @partial(jax.jit, donate_argnums=(0,))
 def _subtract_static_tt_contact(chi_tt):
-    """Bring-up Ward proxy ``Pi_para(q)-Pi_para(q=0)`` for one TT block.
-
-    Full flat-q uses the production C-order convention with Gamma at index
-    zero (the same body convention consumed by ``qsgw_head.py``'s
-    ``finalize_iteration_head_samples``); this is not a second q lookup.
-    """
+    """Subtract the Γ contact on q-IBZ before its typed star transport."""
     corrected = chi_tt - chi_tt[0:1]
     # Make the q=0 cancellation structural rather than roundoff-dependent.
     return corrected.at[0].set(jnp.zeros_like(corrected[0]))
@@ -1938,12 +1173,7 @@ def compute_experimental_no_pair_photon_chi0(
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
 ):
-    """Build all sixteen no-pair blocks with an experimental TT proxy.
-
-    Only one response block and the donated packed accumulator are live at a
-    time.  The three transverse channels reuse ``wfns_transverse`` and differ
-    only by their gamma vertex; no T1/T2/T3 wavefunction copies are made.
-    """
+    """Build all sixteen no-pair blocks with an experimental TT proxy; see docs/architecture/four_current_wiring.md."""
     from .photon_layout import pack_photon_operator
 
     layout.assert_mesh(mesh_xy)
@@ -1952,39 +1182,47 @@ def compute_experimental_no_pair_photon_chi0(
             "full static photon response currently requires "
             f"current_contact={_WARD_SUBTRACTED_NO_PAIR!r}; "
             f"got {current_contact!r}")
-    if (wfns_charge.layout, wfns_transverse.layout) != ("face", "face"):
+    if (wfns_charge.layout != wfns_transverse.layout
+            or wfns_charge.layout not in ("face", "axis")):
         raise ValueError(
-            "full four-current response requires layout='face' for both "
-            "charge and transverse endpoint bundles (low_mem_bands=true); "
+            "full four-current response requires matching face or axis layouts "
+            "for charge and transverse endpoint bundles; "
             f"got {wfns_charge.layout!r}/{wfns_transverse.layout!r}")
-    n_c = int(wfns_charge.psi_mun.shape[2])
-    n_t = int(wfns_transverse.psi_mun.shape[2])
+    from .wavefunction_bundle import padded_centroid_extent
+    n_c = padded_centroid_extent(wfns_charge)
+    n_t = padded_centroid_extent(wfns_transverse)
     if (n_c != layout.carrier_extent(0) or
             n_t != layout.carrier_extent(1)):
         raise ValueError(
             "photon layout padded extents do not match wavefunction "
             f"bundles: layout C/T=({layout.carrier_extent(0)},"
             f"{layout.carrier_extent(1)}), wfns C/T=({n_c},{n_t})")
-    nq = int(meta.nk_tot)
+    nq = len(wfns_charge.green_parent.plan.sym.q_irr_full_idx)
     families = (wfns_charge, wfns_transverse,
                 wfns_transverse, wfns_transverse)
+    classes = tuple(tuple((A, B) for A in left for B in right)
+                    for left in ((0,), (1, 2, 3)) for right in ((0,), (1, 2, 3)))
+    pending_classes = iter(classes)
+    blocks = {}
 
     def get_block(A, B):
-        chi_ab = compute_no_pair_dirac_current_block(
-            families[A], families[B], quad, meta, mesh_xy,
-            vertex_left=A, vertex_right=B,
-            energy_reference=energy_reference)
+        if not blocks:
+            pairs = next(pending_classes)
+            values = compute_no_pair_dirac_current_blocks(
+                families[A], families[B], quad, meta, mesh_xy,
+                vertex_pairs=pairs, energy_reference=energy_reference)
+            blocks.update(zip(pairs, values))
+        chi_ab = blocks.pop((A, B))
         if A and B:
-            # Experimental no-pair Ward completion: TT only.  CC/CT/TC are
-            # left untouched and no diamagnetic contact is invented.
             return _subtract_static_tt_contact(chi_ab)
         return chi_ab
 
-    return pack_photon_operator(get_block, nq, layout, mesh_xy)
+    order = tuple(pair for pairs in classes for pair in pairs)
+    return pack_photon_operator(get_block, nq, layout, mesh_xy, block_order=order)
 
 
 #: Provenance of the unscreened-current packed body.  The bare-transverse
-#: family declares NO current response model: the twelve current blocks of
+#: family declares NO current response model: the fifteen current blocks of
 #: chi are zero, not approximated.
 STATIC_PHOTON_BARE_CURRENT_MODEL = "bare_breit_no_current_response_v1"
 STATIC_PHOTON_BARE_CURRENT_CONTACT = "none: current channels unscreened"
@@ -2006,21 +1244,46 @@ class StaticPhotonResponse:
     approximation: str
     head_completion: object | None = None
     current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
+    qgrid_policy: object = None
+    family_plans: tuple = ()
+
+
+def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy):
+    """Restore each source once and apply the canonical Lorentz mixing for one class."""
+    from symmetry_maps import unfold_isdf_operator, mix_lorentz_blocks
+    from symmetry_maps import bgw_integer_q_to_fractional
+    from .photon_layout import photon_block_view
+    a, b = map(bool, keys[0])
+    if any((bool(A), bool(B)) != (a, b) for A, B in keys):
+        raise ValueError("A photon restore must contain one endpoint shape class.")
+    left, right = family_plans[a], family_plans[b]
+    sym, mesh, policy = left.sym, left.mesh_xy, qgrid_policy
+    qfrac = bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, policy.kgrid)
+    pairs = tuple((C, D) for C in ((1, 2, 3) if a else (0,))
+                  for D in ((1, 2, 3) if b else (0,)))
+    parent_blocks = jnp.stack([photon_block_view(packed, layout, C, D, mesh)
+                               for C, D in pairs])
+
+    def restore(source):
+        return unfold_isdf_operator(
+            source, irr_idx=sym.irr_idx_q, sym_idx=policy.unfold_sym_idx,
+            sym_perm=left.sym_perm, L_table=left.L_table,
+            right_sym_perm=right.sym_perm, right_L_table=right.L_table,
+            q_irr_frac=qfrac, mesh_xy=mesh, n_sym_spatial=policy.n_sym_spatial,
+            axis_local_sym_perm=left.centroid_local_perm,
+            right_axis_local_sym_perm=right.centroid_local_perm)
+
+    restored = jax.lax.map(restore, parent_blocks)
+    sources = {pair: restored[i] for i, pair in enumerate(pairs)}
+    yield from mix_lorentz_blocks(sources, sym=sym, sym_idx=policy.unfold_sym_idx,
+                                 mesh_xy=mesh, keys=keys).items()
 
 
 def _load_static_photon_hall(
     config, meta, mesh_xy, wfn, wfn_fingerprint_binding, *,
     screen_current: bool, print_fn=print,
 ):
-    """Load/authenticate the optional Hall artifact and gate its model.
-
-    An unnamed ``static_gauge_hall_file`` is the declared ``sigma_H = 0``
-    default.  A named path always reaches the one artifact loader, including
-    the absent-path refusal.  The bare-transverse model admits an authenticated
-    artifact only when its value is exactly zero: then the Hall response is
-    identically absent and the packed operator is the same charge/TT block
-    diagonal model as the unnamed case.  Any nonzero component still refuses.
-    """
+    """Load/authenticate the optional Hall artifact and gate its model; see docs/architecture/four_current_wiring.md."""
     hall_path = str(config.paths.static_gauge_hall_file).strip()
     if not hall_path:
         if jax.process_index() == 0:
@@ -2069,90 +1332,15 @@ def _load_static_photon_hall(
     return hall
 
 
-def compute_static_photon_response(
-    wfns_charge, wfns_transverse, quad, bispinor_v_q_path,
-    meta, mesh_xy, *,
-    screen_current: bool,
-    W_charge=None,
-    wfn=None,
-    config=None,
-    photon_g0_vectors=None,
-    wf_binding_charge=None,
-    wf_binding_transverse=None,
-    wfn_fingerprint_binding=None,
-    current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
-    energy_reference=0.0,
-    dyson_solver: str = "distributed",
-    distrib_la_batched_route: str = "batch_reshard",
-    print_fn=print,
-) -> StaticPhotonResponse:
-    """Build the packed static photon body and complete its Gamma cell.
-
-    THE SCREENING OWNER OF BOTH PACKED STATIC MODES.  ``screen_current``
-    (resolved once by :func:`gw_config.packed_photon_screens_current`, never
-    defaulted here) selects which:
-
-    ``screen_current = True`` -- ``bispinor_gw = full_static_cohsex``: the
-    sixteen no-pair blocks of ``chi``, one distributed Dyson solve at
-    omega=0.
-
-    ``screen_current = False`` -- the ``bare_transverse`` family: the twelve
-    current blocks of ``chi`` are ZERO by declaration, so the packed Dyson
-    equation is block diagonal and neither the current blocks nor the packed
-    solve are built at all.  The CC block is screened by the incumbent
-    scalar owner (``gw.screening.compute_screening_model`` -> :func:`solve_w`
-    at ``n_C``) and arrives as ``W_charge``; this function assembles
-    ``W_packed = diag(W_00, D_TT)`` with ``W_CT = 0`` through the sole
-    packer.  The sixteen-block Sigma consumer then returns the screened
-    charge COHSEX in CC, the bare Breit exchange ``Sigma^B`` in TT
-    (``SX(D_TT) = X(D_TT)``, ``COH(D_TT - D_TT) = 0``) and zero in CT/TC --
-    the incumbent ``gw.sigma_x_bispinor`` result, block for block.
-
-    Both modes then run ONE Gamma-cell completion
-    (:func:`gw.head_correction.complete_static_slab_photon_q0`) from the
-    bounded response of
-    :func:`gw.static_gauge_response.build_static_photon_head_response` --
-    bare ``<D>`` into V, the charge ``S^{00}``/wing head into W, the Hall
-    CT/TC term from ``config.paths.static_gauge_hall_file`` when that
-    artifact exists (``sigma_H = 0`` otherwise, announced).  With the
-    charge-only ``R(q)`` the coupled 4x4 solve returns
-    ``diag(W^{00}_h(q), D_TT(q))``, so the same completion inserts the
-    charge head AND the bare ``<D_TT> = -<v P^T>`` that the
-    ``bispinor_tt_head_correction`` overlay writes into the TT V tiles on
-    the incumbent route (that key is refused here, GATE
-    ``packed_bare_transverse_tt_head_double_count``).  The Hall term needs a
-    screened CT/TC channel to live in, so a nonzero Hall artifact is refused
-    on the bare route; an authenticated exact-zero artifact is admitted and
-    gives the same operator as the unnamed zero-Hall default.  The completion
-    runs under ``head_correction = full`` (the
-    default); ``off`` skips it behind a DEBUG banner and is not a production
-    setting (owner ruling 2026-09-01).  The current q^2/contact/complement
-    terms are omitted by model in either case.
-
-    MEMORY.  Both modes keep the packed body resident: ``V_packed`` and
-    ``W_packed`` are each ``(nq, N_packed, N_packed)`` complex128 at
-    ``P(None,'x','y')`` with ``N_packed = n_C + 3 n_T``, i.e.
-    ``16 nq N_packed^2 / P`` bytes per rank each.  The bare route's
-    incumbent predecessor held one TT tile at a time instead, so this IS a
-    new resident carrier for that route (it is the same object the screened
-    mode already holds).  The figure is printed at this site below; the
-    per-block streaming inside ``gw.photon_sigma`` is unchanged.
-
-    ``print_fn`` is the driver's rank-zero printer.  In production mode the
-    driver sinks ordinary component chatter, so the DEBUG banner below
-    carries a WARNING token (retained in the run record's warning block)
-    and the driver copies the completion / Hall status into its
-    ``Photon head`` record line from the returned ``head_completion``.
-    """
+def _resolve_static_photon_policy(
+        config, screen_current, dyson_solver, W_charge, wfn, photon_g0_vectors,
+        wf_binding_charge, wf_binding_transverse, wfn_fingerprint_binding, wfns_charge,
+        wfns_transverse, meta, mesh_xy, print_fn):
+    """Produce the validated photon head policy and authenticated Hall input."""
     from .gw_config import (
         BispinorGWMode, HeadCorrection,
         coerce_bispinor_gw_mode, packed_bare_transverse_route,
         packed_photon_screens_current)
-    from .photon_layout import (
-        PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
-        pack_photon_operator)
-    from .v_q_bispinor import ZERO_TILES, BispinorVqReader
-
     if str(dyson_solver).strip().lower() != "distributed":
         raise ValueError(
             "packed static photon response requires "
@@ -2235,23 +1423,47 @@ def compute_static_photon_response(
             "  (owner ruling 2026-09-01, docs/architecture/decisions.md).\n"
             "  ==========================================================\n",
             flush=True)
+    return coupled_head, screen_current, hall, head_policy
 
-    with BispinorVqReader(bispinor_v_q_path, mesh_xy) as reader:
-        if int(reader.n_q_total) != int(meta.nk_tot):
-            raise ValueError(
-                "full photon response requires full-BZ body blocks: "
-                f"V reader has nq={reader.n_q_total}, meta.nk_tot={meta.nk_tot}")
+
+def _read_static_photon_body(
+        wfns_charge, wfns_transverse, meta, bispinor_v_q_path, mesh_xy, mu_bases):
+    """Produce the parent-family plans, q policy and packed bare photon operator."""
+    from .photon_layout import (
+        PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
+        pack_photon_operator)
+    from .v_q_bispinor import ZERO_TILES, BispinorVqReader
+    plans = (wfns_charge.green_parent.plan, wfns_transverse.green_parent.plan)
+    sym = plans[0].sym
+    from .qgrid_symmetry import qgrid_trs_policy_for
+    policy = qgrid_trs_policy_for(
+        sym=sym, irr_idx_q=sym.irr_idx_q, sym_idx_q=sym.sym_idx_q,
+        kgrid=tuple(meta.kgrid), n_sym_spatial=plans[0].n_sym_spatial,
+        context="packed photon response")
+    nq = len(sym.q_irr_full_idx)
+    from symmetry_maps import bgw_integer_q_to_fractional
+    qfrac = bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, meta.kgrid)
+    with BispinorVqReader(bispinor_v_q_path, mesh_xy, mu_bases=mu_bases,
+                         family_plans=plans) as reader:
+        if reader.n_q_total != nq:
+            raise ValueError("Photon V and response disagree on q-IBZ extent.")
         layout = PhotonBasisLayout.from_centroid_extents(
-            reader.n_rmu_C, reader.n_rmu_T, mesh_xy)
+            plans[0].n_centroid_packed, plans[1].n_centroid_packed, mesh_xy)
         V_packed = pack_photon_operator(
-            reader.get_tile, reader.n_q_total, layout, mesh_xy)
+            lambda A, B: None if (A, B) in ZERO_TILES else reader.get_tile(A, B),
+            nq, layout, mesh_xy)
+    return plans, sym, policy, nq, layout, V_packed
 
+
+def _report_static_photon_body(
+        screen_current, current_contact, head_policy, layout, nq, print_fn):
+    """Report the resolved photon model and resident operator size."""
     if jax.process_index() == 0:
         # MEASURED at the site, per lane C's design note: the packed body is
         # the resident carrier of BOTH modes and is new to the bare route.
         n_packed = int(layout.packed_extent)
         n_ranks = max(int(jax.process_count()), 1)
-        body_bytes = 16.0 * int(meta.nk_tot) * n_packed * n_packed / n_ranks
+        body_bytes = 16.0 * nq * n_packed * n_packed / n_ranks
         print_fn(
             "  [photon response] DECLARED no-pair model "
             "Psi=(Psi_L,(alpha_FS/2)*sigma.p*Psi_L), "
@@ -2266,9 +1478,20 @@ def compute_static_photon_response(
         print_fn(
             f"  [photon response] packed body N_packed={n_packed} "
             f"(n_C={layout.carrier_extent(0)} + 3*n_T="
-            f"{layout.carrier_extent(1)}), nq={int(meta.nk_tot)}: "
+            f"{layout.carrier_extent(1)}), nq={nq}: "
             f"{body_bytes / 1e9:.4f} GB/rank resident for EACH of V and W",
             flush=True)
+
+
+def _screen_static_photon_body(
+        screen_current, wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
+        current_contact, energy_reference, V_packed, distrib_la_batched_route, W_charge,
+        sym, nq):
+    """Produce the screened packed operator on the existing photon basis."""
+    from .photon_layout import (
+        PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
+        pack_photon_operator)
+    from .v_q_bispinor import ZERO_TILES, BispinorVqReader
     if screen_current:
         chi_packed = compute_experimental_no_pair_photon_chi0(
             wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
@@ -2290,7 +1513,7 @@ def compute_static_photon_response(
     else:
         # chi_TT = chi_CT = 0 makes the packed Dyson equation block diagonal:
         #     W_packed = diag((1 - D_00 chi_00)^-1 D_00, D_TT),  W_CT = 0.
-        # Neither the twelve current blocks of chi nor the (n_C + 3 n_T)^2
+        # Neither the fifteen current blocks of chi nor the (n_C + 3 n_T)^2
         # solve is built.  The CC block was solved by the incumbent scalar
         # owner at n_C; the rest of W is V, block for block, through the sole
         # packer -- one local write per block, no gather.
@@ -2306,8 +1529,9 @@ def compute_static_photon_response(
                 "photon layout padded extents do not match wavefunction "
                 f"bundles: layout C/T=({layout.carrier_extent(0)},"
                 f"{layout.carrier_extent(1)}), wfns C/T=({n_c},{n_t})")
-        W_cc = jnp.asarray(W_charge)
-        expected_cc = layout.block_shape(int(meta.nk_tot), 0, 0)
+        W_cc = jnp.take(jnp.asarray(W_charge),
+                        jnp.asarray(sym.q_irr_full_idx), axis=0)
+        expected_cc = layout.block_shape(nq, 0, 0)
         if tuple(W_cc.shape) != expected_cc:
             raise ValueError(
                 "the packed bare-transverse route needs the incumbent scalar "
@@ -2328,7 +1552,7 @@ def compute_static_photon_response(
             return photon_block_view(V_packed, layout, A, B, mesh_xy)
 
         W_packed = pack_photon_operator(
-            _bare_W_block, int(meta.nk_tot), layout, mesh_xy)
+            _bare_W_block, nq, layout, mesh_xy)
         W_packed.block_until_ready()
         del W_cc
     # This packed path bypasses screening._gate_w, so apply its two valid
@@ -2343,7 +1567,17 @@ def compute_static_photon_response(
         raise ValueError(
             "static packed photon W[q=0] failed the canonical Hermiticity "
             "gate before coupled head/body folding")
+    return W_packed
 
+
+def _complete_static_photon_head(
+        coupled_head, V_packed, W_packed, wfns_charge, config, mesh_xy, wfn, meta, layout,
+        hall, wfn_fingerprint_binding, photon_g0_vectors, plans, print_fn):
+    """Produce the Gamma-completed photon operators and their completion receipt."""
+    from common import sanity
+    from .photon_layout import (
+        PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
+        pack_photon_operator)
     head_completion = None
     if coupled_head:
         from vcoul import (
@@ -2380,7 +1614,7 @@ def compute_static_photon_response(
         V_packed, W_packed, head_completion = (
             complete_static_slab_photon_q0(
                 V_packed, W_packed, response, g0_X, g0_Y, cubature,
-                mesh_xy=mesh_xy))
+                mesh_xy=mesh_xy, family_plans=plans))
         jax.block_until_ready((V_packed, W_packed))
         sanity.refuse_nonfinite(
             "Gamma-completed static photon V", V_packed)
@@ -2395,11 +1629,49 @@ def compute_static_photon_response(
                 "dyson_forward_bound="
                 f"{head_completion.max_dyson_forward_error_bound:.3e}",
                 flush=True)
+    return V_packed, W_packed, head_completion
+
+
+def compute_static_photon_response(
+    wfns_charge, wfns_transverse, quad, bispinor_v_q_path,
+    meta, mesh_xy, *,
+    screen_current: bool,
+    mu_bases,
+    W_charge=None,
+    wfn=None,
+    config=None,
+    photon_g0_vectors=None,
+    wf_binding_charge=None,
+    wf_binding_transverse=None,
+    wfn_fingerprint_binding=None,
+    current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
+    energy_reference=0.0,
+    dyson_solver: str = "distributed",
+    distrib_la_batched_route: str = "batch_reshard",
+    print_fn=print,
+) -> StaticPhotonResponse:
+    """Produce the static photon response; see docs/architecture/four_current_wiring.md."""
+    (coupled_head, screen_current, hall, head_policy) = _resolve_static_photon_policy(
+        config, screen_current, dyson_solver, W_charge, wfn, photon_g0_vectors,
+        wf_binding_charge, wf_binding_transverse, wfn_fingerprint_binding, wfns_charge,
+        wfns_transverse, meta, mesh_xy, print_fn)
+    (plans, sym, policy, nq, layout, V_packed) = _read_static_photon_body(
+        wfns_charge, wfns_transverse, meta, bispinor_v_q_path, mesh_xy, mu_bases)
+    _report_static_photon_body(
+        screen_current, current_contact, head_policy, layout, nq, print_fn)
+    (W_packed) = _screen_static_photon_body(
+        screen_current, wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
+        current_contact, energy_reference, V_packed, distrib_la_batched_route, W_charge,
+        sym, nq)
+    (V_packed, W_packed, head_completion) = _complete_static_photon_head(
+        coupled_head, V_packed, W_packed, wfns_charge, config, mesh_xy, wfn, meta, layout,
+        hall, wfn_fingerprint_binding, photon_g0_vectors, plans, print_fn)
 
     if screen_current:
         return StaticPhotonResponse(
             layout=layout, V_packed=V_packed, W_packed=W_packed,
             current_contact=current_contact,
+            qgrid_policy=policy, family_plans=plans,
             head_completion=head_completion,
             current_model=STATIC_PHOTON_NO_PAIR_MODEL,
             approximation=(
@@ -2410,6 +1682,7 @@ def compute_static_photon_response(
     return StaticPhotonResponse(
         layout=layout, V_packed=V_packed, W_packed=W_packed,
         current_contact=STATIC_PHOTON_BARE_CURRENT_CONTACT,
+        qgrid_policy=policy, family_plans=plans,
         head_completion=head_completion,
         current_model=STATIC_PHOTON_BARE_CURRENT_MODEL,
         approximation=(
@@ -2420,17 +1693,7 @@ def compute_static_photon_response(
 
 
 def _chi0_multi_kernel_args(wfns, tau, alpha_rows, energy_reference):
-    """Shared host prep for the multi-output χ₀ paths (compute + precompile).
-
-    ``tau``: (L,) node vector (the fused static∪extra union on the probe-
-    reuse path).  ``alpha_rows``: (n_out, L) RAW quadrature weights, one
-    row per output, all on ``tau``.  Row 0 is normally the static weights
-    (zero-padded onto any extra nodes — zero-weight nodes add exact
-    zeros); further rows are probe representations on the same nodes.
-    The one-orientation prefactor ``-exp(-τ·E_gap)`` folds into every row;
-    the kernel adds the reverse ordered transition through the shared
-    R-space orientation combiner exactly as the single-output path does.
-    """
+    """Shared host prep for the multi-output χ₀ paths (compute + precompile); see docs/architecture/four_current_wiring.md."""
     s = wfns.slices
     enk_v = wfns.enk[:, s.val]
     enk_c = wfns.enk[:, s.cond]
@@ -2491,12 +1754,7 @@ def precompile_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
 
 def _chi0_contour_alpha_rows(tau, weight_rows, frequency_sign, z_values,
                              E_gap):
-    """Complete contour weights for both independent-particle resolvents.
-
-    ``frequency_sign=+1`` represents ``-1/(Delta-z)`` and ``-1`` represents
-    ``-1/(Delta+z)``.  The device kernel evolves ``Delta-E_gap``, so this
-    host-side coefficient supplies the omitted gap and requested frequency.
-    """
+    """Complete contour weights for both independent-particle resolvents; see docs/architecture/four_current_wiring.md."""
     tau = np.asarray(tau, dtype=np.complex128)
     weight_rows = np.asarray(weight_rows, dtype=np.complex128)
     frequency_sign = np.asarray(frequency_sign)
@@ -2544,12 +1802,7 @@ def _chi0_contour_kernel_args(wfns, tau, weight_rows, frequency_sign,
 
 def compute_chi0_contour(wfns, tau, weight_rows, frequency_sign, z_values,
                          meta, mesh_xy, *, energy_reference=0.0):
-    """Evaluate several complex-frequency chi0 values in one node sweep.
-
-    The scalar contour arrays select the two ``Delta +/- z`` resolvents.  All
-    Green-function construction, FFTs, contraction, and sharding are the same
-    operations used by :func:`compute_chi0`.
-    """
+    """Evaluate several complex-frequency chi0 values in one node sweep; see docs/architecture/four_current_wiring.md."""
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     args, n_out = _chi0_contour_kernel_args(
@@ -2572,58 +1825,7 @@ def compute_chi0_contour_ordered(
     energy_reference=0.0,
     return_reflected=False,
 ):
-    r"""Evaluate magnetic contour samples with both ordered orientations.
-
-    For an upper-half-plane sample ``z`` the independent-particle response is
-
-    ``chi0_q(z) = F_q(z) + conj(F_{-q}(-conj(z)))``,
-
-    where the kernel's native orientation is
-    ``F_q(z) = -P_q/(z+Delta)``.  Both ``F(z)`` and
-    ``F(-conj(z))`` are outputs of ONE contour sweep through the existing
-    response kernel.  The second orientation is then a flat-q negation
-    gather and conjugation; no second response kernel is evaluated and no
-    large intermediate is rematerialized on fewer than all processors.
-
-    This is the complex-contour analogue of
-    :func:`compute_chi0_imag_ordered`.  The incumbent
-    :func:`compute_chi0_contour` applies the two scalar resolvents to the same
-    transition orientation, which is valid after a time-reversal completion
-    but deletes the magnetisation-odd channel when time reversal is broken.
-    Callers therefore select this route only from ``SymMaps.trs_allowed``.
-
-    Parameters
-    ----------
-    wfns
-        Wavefunction bundle.  Its flat k axis remains sharded as in the
-        ordinary contour kernel.
-    time, weights
-        Positive real-time quadrature nodes and weights, shape ``(L,)``, in
-        reciprocal-energy and time units respectively.
-    z_values
-        Upper-half-plane complex frequencies, shape ``(n_z,)``, in the same
-        energy unit used by ``wfns.enk``.
-    meta, mesh_xy
-        Runtime metadata and the two-dimensional processor mesh.
-    q_neg_index
-        Public ``symmetry_maps.q_negation_index`` permutation, shape
-        ``(n_q,)``.  It must be an involution on the complete flat q grid.
-    energy_reference
-        Common energy origin subtracted from valence and conduction bands.
-    return_reflected
-        When true, also return the independently completed response at
-        ``-conj(z)``.  Both orientations already belong to the same contour
-        sweep; this option exposes the second completion without evaluating
-        another response kernel.  The default preserves the incumbent return
-        object exactly.
-
-    Returns
-    -------
-    jax.Array or tuple[jax.Array, ...]
-        One flat-q ``(n_q, n_mu, n_mu)`` response for one frequency, or an
-        ``n_z`` tuple for several frequencies.  Arrays retain
-        ``P(None, 'x', 'y')`` sharding.
-    """
+    """Evaluate magnetic contour samples with both ordered orientations; see docs/architecture/four_current_wiring.md."""
     time = np.asarray(time, dtype=np.float64)
     weights = np.asarray(weights, dtype=np.float64)
     z = np.asarray(z_values, dtype=np.complex128)
@@ -2715,36 +1917,10 @@ def precompile_chi0_contour(wfns, tau, weight_rows, frequency_sign,
     kernel.lower(*args).compile()
 
 
-
-
 def _occupation_support_slices(
         occupations,
         occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT):
-    """Smallest contiguous f and (1-f) band supports without truncation.
-
-    THIS IS THE ONE PLACE χ₀'s TWO GREEN'S FUNCTIONS GET THEIR BANDS, and
-    unlike the Σ planner's mask it is a genuine COST cut: the returned slices
-    index ``wfns.xn``/``yr``, so a band outside them is absent from the
-    ``build_G_tau`` contraction rather than merely multiplied by a small
-    weight.  ``occupation_support_bandwidth`` reads the same two slices to
-    size the damped-line rule, so widening them also buys quadrature nodes.
-
-    ``occupation_window_threshold`` is the OCCUPANCY at which a band leaves a
-    support; the cut is on the branch WEIGHT — ``f`` on the occupied side,
-    ``1 − f`` on the empty side, matching ``band_weight=occ_f`` and
-    ``band_weight=1.0 - occ_u`` in the kernel — at the floor
-    ``1 − threshold``, by MAGNITUDE.  Nothing is clipped: MP1 occupations
-    overshoot [0, 1] and a wrong-side band's NEGATIVE weight is kept by
-    ``abs`` exactly as the historical rule kept it (the argument is at
-    ``gw.efermi.band_in_occupation_window``).  Partially occupied bands
-    belong to both slices, as before.
-
-    ``threshold = 1.0`` gives floor 0.0 and restores the historical exact
-    rule (``occ != 0`` / ``occ != 1``) bit-for-bit; an insulating table, whose
-    weights are exactly 0 or 1, gives the same two slices at EVERY threshold,
-    since ``abs(1) > floor`` and ``abs(0) > floor`` are threshold-independent
-    on [0.5, 1.0].
-    """
+    """Smallest contiguous f and (1-f) band supports without truncation; see docs/architecture/four_current_wiring.md."""
     occ = np.asarray(jax.device_get(occupations), dtype=np.float64)
     if occ.ndim != 2:
         raise ValueError(
@@ -2777,17 +1953,7 @@ def _chi0_fractional_contour_args(
     energy_reference,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ):
-    """Prepare the exact finite-occupation positive-time response.
-
-    Layout-dispatched (``docs/architecture/fractional_chi0_response_
-    face.md``).  ``legacy``: windowed ψ views + windowed energies/
-    occupations, the historical body, unchanged.  ``face``: the FULL
-    [b0,b4) face carrier (``psi_mun``/``psi_nmu`` cannot be band-sliced —
-    obstacle #3) plus occupations WEIGHTED to zero exactly outside the
-    SAME two contiguous support windows legacy slices to — "weight, don't
-    window" — which reproduces legacy's windowed contraction bit-for-bit
-    up to summation-order roundoff (the contraction is bilinear in ψ).
-    """
+    """Prepare final band weights on the occupied and unoccupied support windows."""
     time_nodes = np.asarray(time_nodes, dtype=np.float64)
     z_values = np.asarray(z_values, dtype=np.complex128)
     if time_nodes.ndim != 1 or time_nodes.size == 0:
@@ -2825,32 +1991,7 @@ def _chi0_fractional_contour_args(
     f_slice, u_slice = _occupation_support_slices(
         occ_full, occupation_window_threshold)
     eref = 0.0 if energy_reference is None else float(energy_reference)
-    if wfns.layout == "legacy":
-        args = (
-            jnp.asarray(time_nodes, dtype=jnp.float64),
-            jnp.asarray(projection_rows, dtype=jnp.complex128),
-            wfns.xn(f_slice),
-            wfns.yr(f_slice),
-            wfns.yr(u_slice),
-            wfns.xn(u_slice),
-            wfns.enk[:, f_slice],
-            wfns.enk[:, u_slice],
-            occ_full[:, f_slice],
-            occ_full[:, u_slice],
-            jnp.asarray(eref, dtype=jnp.float64),
-        )
-        return args, z_values.size
-    # face: "weight, don't window" -- occ_full multiplied by a {0,1}
-    # indicator that is 1 exactly inside f_slice/u_slice, 0 outside,
-    # reproducing legacy's windowed sum bit-for-bit (see this function's
-    # docstring).  enk stays the bundle's FULL [b0,b4) table, unsliced,
-    # shared by both roles.  occ_f_face/occ_u_face are the FINAL
-    # band_weight values the face kernel applies directly (see
-    # _get_chi_fractional_contour_kernel_face's own comment on why the
-    # 1-occ inversion for the Gu role must happen BEFORE masking, not
-    # after -- masking a RAW occupation then inverting turns the
-    # correctly-excluded outside-window positions into 1.0 instead of
-    # 0.0).
+    # Invert occupations before masking so excluded bands retain zero weight.
     nb_full = int(wfns.slices.nb_full)
     idx = np.arange(nb_full)
     f_ind = jnp.asarray(
@@ -2901,18 +2042,7 @@ def compute_chi0_contour_fractional(
     energy_reference=0.0,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ):
-    """Evaluate retarded finite-occupation chi0 at complex frequencies.
-
-    weight_rows contains the positive real-time quadrature weights; this
-    routine supplies exp(i*z*t) and both exact Keldysh terms.  It does not
-    implement z=0: the gapless static limit contains the finite divided
-    difference -df/dE and requires its own certified integration rule.
-
-    ``occupation_window_threshold`` is the OCCUPANCY at which a band leaves
-    one of the two Green's-function supports; it MUST be the same value the
-    caller gave ``occupation_support_bandwidth``, or the damped-line rule is
-    sized for transitions the band slices no longer contain.
-    """
+    """Evaluate retarded finite-occupation chi0 at complex frequencies; see docs/architecture/four_current_wiring.md."""
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     args, n_out = _chi0_fractional_contour_args(
@@ -2930,253 +2060,17 @@ def compute_chi0_contour_fractional(
     return values[0] if n_out == 1 else values
 
 
-def _fractional_pair_scan(
-    psi_x_a, psi_y_a, psi_x_b, psi_y_b, energy_a, energy_b,
-    occ_a, occ_b, surface_a, surface_b, z_values, *, nb_logical, tile,
-):
-    """Ordered-pair scan shared by the static and direct-frequency kernels.
-
-    The ``a`` operands ride at k; the ``b`` operands ride at whatever k row
-    the caller supplied — the same arrays for the Gamma kernel, the k−q
-    rolled arrays for the finite-q kernel.  TASTE 6 judgment (the same
-    ruling the Gamma kernel carries): the ordered band-pair index exists
-    only inside one tile step beside the centroid axes; the per-rank
-    transient is the two density tiles,
-    ``nk·(nmu_x/P_x + nmu_y/P_y)·tile²·16 B`` per step (Na 48b, 8³ k,
-    tile 8: tens of MB).  At z=0 it uses the analytic divided difference;
-    at nonzero z it evaluates ``(f_a-f_b)/(E_a-E_b+z)`` directly.  The
-    latter is the exact escape hatch for the ONE shifted-origin metal MPA
-    sample whose damped contour would require about a million nodes; it is
-    not a general full-frequency route.  The certified separable rational-f
-    service (docs/theory/finite-occupation-screening.md §static) is the
-    staged scaling path behind the same public API.
-    """
-    nk, nspinor, nmu_x, nb = psi_x_a.shape
-    nmu_y = psi_y_a.shape[2]
-    # A rank-padded carrier can be wider than the physical chi window.
-    # The logical mask makes those bands numerically zero, but a scan sized
-    # from the carrier would still pay their quadratic tile cost.
-    from runtime.padding import padded_axis
-    nb_pad = padded_axis(
-        int(nb_logical), tile,
-        name="fractional-response band tile carrier").carrier
-    pad = max(0, nb_pad - int(nb))
-    pad4 = ((0, 0), (0, 0), (0, 0), (0, pad))
-    pad2 = ((0, 0), (0, pad))
-    pa_x_full = jnp.pad(psi_x_a, pad4)
-    pb_x_full = jnp.pad(psi_x_b, pad4)
-    pa_y_full = jnp.pad(psi_y_a, pad4)
-    pb_y_full = jnp.pad(psi_y_b, pad4)
-    ea_full = jnp.pad(energy_a, pad2)
-    eb_full = jnp.pad(energy_b, pad2)
-    fa_full = jnp.pad(occ_a, pad2)
-    fb_full = jnp.pad(occ_b, pad2)
-    sa_full = jnp.pad(surface_a, pad2)
-    sb_full = jnp.pad(surface_b, pad2)
-    z = jnp.asarray(z_values, dtype=jnp.complex128)
-    ntiles = nb_pad // tile
-
-    def _pair_tile(accumulator, flat_index):
-        ia = (flat_index // ntiles) * tile
-        ib = (flat_index % ntiles) * tile
-        pa_x = jax.lax.dynamic_slice(
-            pa_x_full, (0, 0, 0, ia), (nk, nspinor, nmu_x, tile))
-        pb_x = jax.lax.dynamic_slice(
-            pb_x_full, (0, 0, 0, ib), (nk, nspinor, nmu_x, tile))
-        pa_y = jax.lax.dynamic_slice(
-            pa_y_full, (0, 0, 0, ia), (nk, nspinor, nmu_y, tile))
-        pb_y = jax.lax.dynamic_slice(
-            pb_y_full, (0, 0, 0, ib), (nk, nspinor, nmu_y, tile))
-        ea = jax.lax.dynamic_slice(ea_full, (0, ia), (nk, tile))
-        eb = jax.lax.dynamic_slice(eb_full, (0, ib), (nk, tile))
-        fa = jax.lax.dynamic_slice(fa_full, (0, ia), (nk, tile))
-        fb = jax.lax.dynamic_slice(fb_full, (0, ib), (nk, tile))
-        sa = jax.lax.dynamic_slice(sa_full, (0, ia), (nk, tile))
-        sb = jax.lax.dynamic_slice(sb_full, (0, ib), (nk, tile))
-
-        de = ea[:, :, None] - eb[:, None, :]
-        df = fa[:, :, None] - fb[:, None, :]
-        scale = jnp.maximum(
-            1.0,
-            jnp.maximum(jnp.abs(ea[:, :, None]),
-                        jnp.abs(eb[:, None, :])),
-        )
-        separated = (
-            jnp.abs(de) > 64.0 * jnp.finfo(jnp.float64).eps * scale)
-        # surface_weight is -df/dE.  The average is exact for a truly
-        # degenerate pair and is the stable midpoint limit for a pair
-        # closer than floating-point energy resolution.
-        diagonal_limit = -0.5 * (sa[:, :, None] + sb[:, None, :])
-        static_divided = jnp.where(
-            separated, df / jnp.where(separated, de, 1.0),
-            diagonal_limit)
-        dynamic = df[None, :, :, :] / (
-            de[None, :, :, :] + z[:, None, None, None])
-        weights = jnp.where(
-            (z == 0.0)[:, None, None, None],
-            static_divided[None, :, :, :], dynamic)
-        ga = ia + jnp.arange(tile)
-        gb = ib + jnp.arange(tile)
-        logical = (
-            (ga[:, None] < int(nb_logical))
-            & (gb[None, :] < int(nb_logical))
-        )[None, :, :]
-        weights = jnp.where(logical[None, :, :, :], weights, 0.0)
-
-        # d_ab(mu) = sum_s psi_a(mu) conj(psi_b(mu)).  The spinor
-        # component is summed here, so scalar, two-component and future
-        # four-component wavefunctions share this exact kernel.
-        density_x = jnp.einsum(
-            "ksma,ksmb->kmab", pa_x, jnp.conj(pb_x), optimize=True)
-        density_y = jnp.einsum(
-            "ksna,ksnb->knab", pa_y, jnp.conj(pb_y), optimize=True)
-        contribution = jnp.einsum(
-            "zkab,kmab,knab->zmn", weights, density_x,
-            jnp.conj(density_y), optimize=True)
-        return accumulator + contribution, None
-
-    zero = jnp.zeros((z.size, nmu_x, nmu_y), dtype=jnp.complex128)
-    chi, _ = jax.lax.scan(
-        _pair_tile, zero, jnp.arange(ntiles * ntiles), unroll=1)
-    return chi / jnp.sqrt(jnp.asarray(nk, jnp.float64))
-
-
-def _get_chi_static_fractional_gamma_kernel(
-    mesh_xy: Mesh, *, nb_logical: int, pair_tile: int,
-):
-    """Exact q=0 divided-difference body, streamed by band-pair tiles.
-
-    The output centroid axes are the process mesh axes.  Bands and k points
-    remain replicated, so every rank performs the same number of pair-tile
-    steps for its unique ``(mu_x, nu_y)`` output tile.  No rank forms an
-    ``(nk, nb, nb, n_mu)`` transition-density array.
-    """
-    from common.shard_map import shard_map
-    from .wavefunction_bundle import PSI_XN_SPEC, PSI_YN_SPEC
-
-    tile = int(pair_tile)
-    key = ("static_fractional_gamma", id(mesh_xy), int(nb_logical), tile)
-    hit = _chi_minimax_kernel_cache.get(key)
-    if hit is not None:
-        return hit
-
-    def _local(psi_xn, psi_yn, energies, occupations, surface_weight):
-        return _fractional_pair_scan(
-            psi_xn, psi_yn, psi_xn, psi_yn, energies, energies,
-            occupations, occupations, surface_weight, surface_weight,
-            jnp.zeros((1,), dtype=jnp.complex128),
-            nb_logical=nb_logical, tile=tile)
-
-    kernel = jax.jit(shard_map(
-        _local,
-        mesh=mesh_xy,
-        in_specs=(PSI_XN_SPEC, PSI_YN_SPEC, P(None, None), P(None, None),
-                  P(None, None)),
-        out_specs=P(None, "x", "y"),
-        check_vma=False,
-    ))
-    _chi_minimax_kernel_cache[key] = kernel
-    return kernel
-
-
-def _get_chi_fractional_q_kernel(
-    mesh_xy: Mesh, *, nb_logical: int, pair_tile: int, n_z: int,
-):
-    """Finite-q direct ordered-pair kernel: b rides at k−q.
-
-    The caller supplies the flat ``k → k−q`` map for one stored q row;
-    every b-side operand (both densities, energies, occupations, surface
-    weights) is rolled by it before the shared ordered-pair scan.  The
-    map is replicated and the ψ k axis is replicated on this mesh, so the
-    gather is rank-local — no collectives are added over the Gamma kernel.
-    """
-    from common.shard_map import shard_map
-    from .wavefunction_bundle import PSI_XN_SPEC, PSI_YN_SPEC
-
-    tile = int(pair_tile)
-    key = ("direct_fractional_q", id(mesh_xy), int(nb_logical), tile,
-           int(n_z))
-    hit = _chi_minimax_kernel_cache.get(key)
-    if hit is not None:
-        return hit
-
-    def _local(psi_xn, psi_yn, kminq_idx, energies, occupations,
-               surface_weight, z_values):
-        pb_x = jnp.take(psi_xn, kminq_idx, axis=0)
-        pb_y = jnp.take(psi_yn, kminq_idx, axis=0)
-        eb = jnp.take(energies, kminq_idx, axis=0)
-        fb = jnp.take(occupations, kminq_idx, axis=0)
-        sb = jnp.take(surface_weight, kminq_idx, axis=0)
-        return _fractional_pair_scan(
-            psi_xn, psi_yn, pb_x, pb_y, energies, eb,
-            occupations, fb, surface_weight, sb,
-            z_values,
-            nb_logical=nb_logical, tile=tile)
-
-    kernel = jax.jit(shard_map(
-        _local,
-        mesh=mesh_xy,
-        in_specs=(PSI_XN_SPEC, PSI_YN_SPEC, P(None), P(None, None),
-                  P(None, None), P(None, None), P(None)),
-        out_specs=P(None, "x", "y"),
-        check_vma=False,
-    ))
-    _chi_minimax_kernel_cache[key] = kernel
-    return kernel
-
-
 # ============================================================================
 # Exact finite-occupation response — face-layout ordered-pair kernel
 # ============================================================================
 #
-# See docs/architecture/fractional_chi0_response_face.md for the full
-# derivation.  ``_fractional_pair_scan`` above is FROZEN — this session
-# does not edit it, matching every other legacy/face split in this
-# codebase (isdf.core._c_q_legacy/_c_q_face, _z_q_legacy/_z_q_face,
-# greens_function_kernel._legacy_build_G/_face_build_G).  The per-pair
-# physics below (divided-difference weight, two density contractions, the
-# final zmn einsum) is intentionally re-typed rather than shared through a
-# helper both functions call, for the same reason.
-
-
 def _fractional_pair_scan_face(
     psi_mun_a, psi_nmu_a, psi_mun_b, psi_nmu_b, energy_a, energy_b,
     occ_a, occ_b, surface_a, surface_b, z_values, *,
     nb_full, nb_logical, tile, unfold_x=None, unfold_y=None, roll_b=None,
+    k_unfold_plan=None,
 ):
-    """Face-layout sibling of :func:`_fractional_pair_scan`.
-
-    Runs INSIDE a shard_map body whose in_specs give this rank only its
-    own local shard of the persistent face carrier (``PSI_MUN_SPEC``/
-    ``PSI_NMU_SPEC``) — never a resident, band-replicated single-axis
-    copy.  The divided-difference weight depends JOINTLY on both band
-    indices' energies/occupations, so it cannot collapse to the
-    one-particle G GEMM (see the design doc); instead, each band TILE
-    this scan touches is reconstructed on demand from the persistent
-    carrier via a masked-gather + ``psum`` on BOTH mesh axes —
-    ``isdf.core._z_q_face``'s idiom, generalized from one axis (its own
-    ``psum('y')`` X-operand reconstruction) to both, since this kernel
-    needs BOTH ψ orientations (μ-on-X from ``psi_mun``, μ-on-Y from
-    ``psi_nmu``) at BOTH pair-index roles.
-
-    ``psi_mun_a``/``psi_nmu_a`` and ``psi_mun_b``/``psi_nmu_b`` are the
-    (already rank-local) face-carrier shards for the "a" and "b" pair-
-    index roles respectively — the SAME array for both, at Gamma; the
-    caller's own k−q-rolled copy for the finite-q kernel (rolling a
-    REPLICATED k axis is a rank-local ``jnp.take``, unaffected by layout).
-    ``energy_*``/``occ_*``/``surface_*`` are ``(nk, nb_full)`` REPLICATED
-    (already zero-padded by the caller up to ``nb_full`` if its own
-    window was narrower — safe, since any padded position is
-    ``>= nb_logical`` and hence excluded by the mask below regardless).
-
-    Tiling: nested scans, outer over the "a" band tile (reconstructed
-    ONCE per outer step, reused across the whole inner sweep), inner over
-    "b" (reconstructed fresh every step) — bounding the resident working
-    set to O(tile) band-widths at any instant.  See the design doc's
-    "Tiling choice" for the communication-cost accounting and why a
-    ``ppermute`` ring was considered and deferred, not needed at the
-    scale this session gated.
-    """
+    """Stream ordered band-pair tiles from canonical faces with optional typed parent transport."""
     # The k extent of the PAIR SUM is the energy table's (full BZ).  With
     # raw parents (``unfold_x``/``unfold_y`` given) the ψ operands carry
     # n_parent rows and every band tile is unfolded to full k after its
@@ -3192,18 +2086,14 @@ def _fractional_pair_scan_face(
         raise ValueError(
             "_fractional_pair_scan_face: give unfold tables for BOTH faces "
             "or neither.")
-    if unfold_x is not None:
-        from ffi import _services
-        _services.ensure_on_path()
-        from symmetry_maps import unfold_wavefunction_local
 
     def _children(tile_psi, tables):
         """(n_parent, s, mu_loc, t) -> (nk, s, mu_loc, t) by the typed action;
         identity when the operand already spans full k."""
         if tables is None:
             return tile_psi
-        return unfold_wavefunction_local(
-            tile_psi, spin_axis=1, mu_axis=2, mesh_axis=None, **tables)
+        return k_unfold_plan.unfold_face(
+            tile_psi, spin_axis=1, mu_axis=2, tables=tables)
 
     def _roll(tile_psi):
         return tile_psi if roll_b is None else jnp.take(tile_psi, roll_b, axis=0)
@@ -3213,12 +2103,11 @@ def _fractional_pair_scan_face(
     x_idx = jax.lax.axis_index('x')
 
     def _gather_mun(psi_mun_local, g_lo):
-        """(nk, s, mu_X_loc, tile) un-conjugated, present on every rank —
-        masked-gather + psum('y') from psi_mun's local shard (bands on
-        'y').  psi_mun's own axis order (nk, s, mu, n) already matches
-        PSI_XN_SPEC's (nk, s, mu_X, n) -- no reorder needed."""
+        """(nk, s, mu_X_loc, tile) un-conjugated, present on every rank — masked-gather + psum('y') from psi_mun's local shard (bands on 'y'); see docs/architecture/four_current_wiring.md."""
         p = jnp.arange(tile, dtype=jnp.int32)
         global_band = g_lo + p
+        if shard_w_y == nb_full:
+            return jnp.take(psi_mun_local, jnp.clip(global_band, 0, nb_full - 1), axis=3)
         owner = global_band // shard_w_y
         owns = owner == y_idx
         local_idx = jnp.clip(
@@ -3228,14 +2117,12 @@ def _fractional_pair_scan_face(
         return jax.lax.psum(gathered, 'y')
 
     def _gather_nmu(psi_nmu_local, g_lo):
-        """(nk, s, mu_Y_loc, tile) un-conjugated, present on every rank —
-        masked-gather + psum('x') from psi_nmu's local shard (bands on
-        'x'), then a LOCAL (no-comm, bounded-size — this tile is `tile`
-        bands wide, not nb_full) axis reorder: psi_nmu stores (nk, n, s,
-        mu), band axis SECOND, so the post-gather (nk, tile, s, mu_Y_loc)
-        needs one transpose to match PSI_YN_SPEC's (nk, s, mu, n) order."""
+        """(nk, s, mu_Y_loc, tile) un-conjugated, present on every rank — masked-gather + psum('x') from psi_nmu's local shard (bands on 'x'), then a LOCAL (no-comm, bounded-size — this tile is `tile` bands wide, not nb_full) axis reorder: psi_nmu stores (nk, n, s, mu), band axis SECOND, so the post-gather (nk, tile, s, mu_Y_loc) needs one transpose to match the band-last endpoint (nk, s, mu, n) order; see docs/architecture/four_current_wiring.md."""
         p = jnp.arange(tile, dtype=jnp.int32)
         global_band = g_lo + p
+        if shard_w_x == nb_full:
+            gathered = jnp.take(psi_nmu_local, jnp.clip(global_band, 0, nb_full - 1), axis=1)
+            return jnp.transpose(gathered, (0, 2, 3, 1))
         owner = global_band // shard_w_x
         owns = owner == x_idx
         local_idx = jnp.clip(
@@ -3267,8 +2154,7 @@ def _fractional_pair_scan_face(
 
     def _pair_contribution(pa_x, pb_x, pa_y, pb_y, ea, eb, fa, fb, sa, sb,
                            ga, gb):
-        # EXACT mirror of _fractional_pair_scan's per-pair body -- see
-        # that function for the physics derivation/comments.
+        # At coincident energies, df/dE is minus the supplied surface weight.
         de = ea[:, :, None] - eb[:, None, :]
         df = fa[:, :, None] - fb[:, None, :]
         scale = jnp.maximum(
@@ -3328,10 +2214,8 @@ _PARENT_UNFOLD_OPERANDS = {}
 
 
 def _parent_face_unfold_operands(plan, mesh_xy):
-    """The eight placed table operands the parent pair scans take, cached per
-    plan: rows/operations/parent k/spin action replicated, the centroid
-    offset and wrap tables sharded on the axis of the face they serve."""
-    key = (id(plan), id(mesh_xy))
+    """Place the eight typed parent-unfold tables from host data on their declared mesh axes."""
+    key = (id(plan), _mesh_key(mesh_xy))
     hit = _PARENT_UNFOLD_OPERANDS.get(key)
     if hit is not None:
         return hit
@@ -3339,14 +2223,14 @@ def _parent_face_unfold_operands(plan, mesh_xy):
     from common.collectives import device_put_process_local
     rep = lambda spec: NamedSharding(mesh_xy, spec)
     ops = (
-        device_put_process_local(jnp.asarray(t["irr_idx"], jnp.int32), rep(P(None))),
-        device_put_process_local(jnp.asarray(t["sym_idx"], jnp.int32), rep(P(None))),
-        device_put_process_local(jnp.asarray(t["k_irr_frac"], jnp.float64), rep(P(None, None))),
-        device_put_process_local(jnp.asarray(t["spin_action_full"], jnp.complex128), rep(P(None, None, None))),
-        device_put_process_local(jnp.asarray(t["local_perm"], jnp.int32), rep(P(None, "x"))),
-        device_put_process_local(jnp.asarray(t["L_table"], jnp.float64), rep(P(None, "x", None))),
-        device_put_process_local(jnp.asarray(t["local_perm"], jnp.int32), rep(P(None, "y"))),
-        device_put_process_local(jnp.asarray(t["L_table"], jnp.float64), rep(P(None, "y", None))),
+        device_put_process_local(np.asarray(t["irr_idx"], np.int32), rep(P(None))),
+        device_put_process_local(np.asarray(t["sym_idx"], np.int32), rep(P(None))),
+        device_put_process_local(np.asarray(t["k_irr_frac"], np.float64), rep(P(None, None))),
+        device_put_process_local(np.asarray(t["spin_action_full"], np.complex128), rep(P(None, None, None))),
+        device_put_process_local(np.asarray(t["local_perm"], np.int32), rep(P(None, "x"))),
+        device_put_process_local(np.asarray(t["L_table"], np.float64), rep(P(None, "x", None))),
+        device_put_process_local(np.asarray(t["local_perm"], np.int32), rep(P(None, "y"))),
+        device_put_process_local(np.asarray(t["L_table"], np.float64), rep(P(None, "y", None))),
     )
     hit = (ops, int(t["n_sym_spatial"]))
     _PARENT_UNFOLD_OPERANDS[key] = hit
@@ -3361,39 +2245,31 @@ _PARENT_UNFOLD_SPECS = (P(None), P(None), P(None, None), P(None, None, None),
 _CHILD_FACE_KERNELS: dict = {}
 
 
-def iter_parent_children_faces(carrier, mesh_xy, *, slices):
-    """Yield ``(rows, child_bundle)`` per parent star of a
-    :class:`gw.wavefunction_bundle.ParentGreenCarrier`: the full-k rows that
-    are the children of one raw parent and a face bundle holding THEIR two
-    faces, built by the one-endpoint typed action
-    (``symmetry_maps.unfold_wavefunction_local``) from the packed parent
-    faces.  For consumers that need ψ itself at every k but only as a sum
-    over k (the q→0 head wings): one star is resident at a time, never a
-    full-k face.  ``child_bundle`` carries ``layout='face'``, ``psi_mun``/
-    ``psi_nmu`` at the star's rows, the parent's energies/occupations on
-    those rows, and ``slices``."""
+def iter_parent_children_faces(carrier, mesh_xy, *, slices, by_parent=True):
+    """Yield typed child faces in parent order, optionally as one full-k batch."""
     from types import SimpleNamespace
     from common.shard_map import shard_map
     from ffi import _services
     _services.ensure_on_path()
-    from symmetry_maps import unfold_wavefunction_local
-    from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+    from common.wfn_layout import psi_specs
+    PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(carrier.layout)
 
     plan = carrier.plan
     ops, n_sym_spatial = _parent_face_unfold_operands(plan, mesh_xy)
     irr, sym_rows, kfrac, U, perm_x, L_x, perm_y, L_y = ops
     irr_np = np.asarray(plan.irr_idx)
+    host_tables = plan.wavefunction_unfold_tables()
 
     def _kernel(spec, spin_axis, mu_axis, perm_spec, L_spec, n_rows):
-        key = (id(mesh_xy), spec, spin_axis, mu_axis, int(n_rows))
+        key = (plan, _mesh_key(mesh_xy), spec, spin_axis, mu_axis, int(n_rows))
         hit = _CHILD_FACE_KERNELS.get(key)
         if hit is None:
             def body(psi, irr_r, sym_r, kfrac_r, U_r, perm, L):
-                return unfold_wavefunction_local(
-                    psi, irr_idx=irr_r, sym_idx=sym_r, k_irr_frac=kfrac_r,
-                    spin_action_full=U_r, local_perm=perm, L_table=L,
-                    n_sym_spatial=n_sym_spatial, spin_axis=spin_axis,
-                    mu_axis=mu_axis, mesh_axis=None)
+                tables = dict(irr_idx=irr_r, sym_idx=sym_r, k_irr_frac=kfrac_r,
+                              spin_action_full=U_r, local_perm=perm, L_table=L,
+                              n_sym_spatial=n_sym_spatial)
+                return plan.unfold_face(
+                    psi, spin_axis=spin_axis, mu_axis=mu_axis, tables=tables)
             hit = jax.jit(shard_map(
                 body, mesh=mesh_xy,
                 in_specs=(spec, P(None), P(None), P(None, None),
@@ -3403,15 +2279,19 @@ def iter_parent_children_faces(carrier, mesh_xy, *, slices):
         return hit
 
     rep = lambda spec: NamedSharding(mesh_xy, spec)
-    for parent in range(int(plan.n_parent)):
-        rows = np.flatnonzero(irr_np == parent)
+    groups = [np.flatnonzero(irr_np == parent) for parent in range(int(plan.n_parent))]
+    if not by_parent:
+        groups = [np.concatenate(groups)]
+    for rows in groups:
         if rows.size == 0:
             continue
-        r = jnp.asarray(rows, dtype=jnp.int32)
-        irr_r = jax.lax.with_sharding_constraint(jnp.take(irr, r), rep(P(None)))
-        sym_r = jax.lax.with_sharding_constraint(jnp.take(sym_rows, r), rep(P(None)))
-        U_r = jax.lax.with_sharding_constraint(
-            jnp.take(U, r, axis=0), rep(P(None, None, None)))
+        irr_r = device_put_process_local(
+            np.asarray(host_tables["irr_idx"], np.int32)[rows], rep(P(None)))
+        sym_r = device_put_process_local(
+            np.asarray(host_tables["sym_idx"], np.int32)[rows], rep(P(None)))
+        U_r = device_put_process_local(
+            np.asarray(host_tables["spin_action_full"], np.complex128)[rows],
+            rep(P(None, None, None)))
         mun = _kernel(PSI_MUN_SPEC, 1, 2, P(None, "x"), P(None, "x", None),
                       rows.size)(carrier.psi_mun, irr_r, sym_r, kfrac, U_r,
                                  perm_x, L_x)
@@ -3419,9 +2299,9 @@ def iter_parent_children_faces(carrier, mesh_xy, *, slices):
                       rows.size)(carrier.psi_nmu, irr_r, sym_r, kfrac, U_r,
                                  perm_y, L_y)
         yield rows, SimpleNamespace(
-            layout="face", psi_mun=mun, psi_nmu=nmu, slices=slices,
-            enk=jnp.broadcast_to(carrier.enk[parent][None], (rows.size,) + carrier.enk.shape[1:]),
-            occ=jnp.broadcast_to(carrier.occ[parent][None], (rows.size,) + carrier.occ.shape[1:]))
+            layout=carrier.layout, psi_mun=mun, psi_nmu=nmu, slices=slices,
+            enk=jnp.take(carrier.enk, irr_np[rows], axis=0),
+            occ=jnp.take(carrier.occ, irr_np[rows], axis=0))
 
 
 def _unfold_tables_from_operands(irr, sym, kfrac, U, perm_x, L_x, perm_y, L_y,
@@ -3434,18 +2314,16 @@ def _unfold_tables_from_operands(irr, sym, kfrac, U, perm_x, L_x, perm_y, L_y,
 
 def _get_chi_static_fractional_gamma_kernel_face(
     mesh_xy: Mesh, *, nb_full: int, nb_logical: int, pair_tile: int,
-    k_unfold_plan=None,
+    k_unfold_plan=None, layout="face",
 ):
-    """Face-layout sibling of :func:`_get_chi_static_fractional_gamma_kernel`.
-    See that function's docstring for the physics; only the operand
-    source differs — the persistent face carrier, never a resident
-    band-replicated copy (:func:`_fractional_pair_scan_face`)."""
+    """Build the static Gamma divided-difference kernel on canonical faces or parents."""
     from common.shard_map import shard_map
-    from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+    from common.wfn_layout import psi_specs
+    PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(layout)
 
     tile = int(pair_tile)
-    key = ("static_fractional_gamma_face", id(mesh_xy), int(nb_full),
-           int(nb_logical), tile, id(k_unfold_plan))
+    key = ("static_fractional_gamma_face", _mesh_key(mesh_xy), int(nb_full),
+           int(nb_logical), tile, id(k_unfold_plan), layout)
     hit = _chi_minimax_kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -3474,7 +2352,7 @@ def _get_chi_static_fractional_gamma_kernel_face(
                 occupations, occupations, surface_weight, surface_weight,
                 jnp.zeros((1,), dtype=jnp.complex128),
                 nb_full=nb_full, nb_logical=nb_logical, tile=tile,
-                unfold_x=unfold_x, unfold_y=unfold_y)
+                unfold_x=unfold_x, unfold_y=unfold_y, k_unfold_plan=k_unfold_plan)
         in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None, None), P(None, None),
                     P(None, None)) + _PARENT_UNFOLD_SPECS
 
@@ -3491,18 +2369,16 @@ def _get_chi_static_fractional_gamma_kernel_face(
 
 def _get_chi_fractional_q_kernel_face(
     mesh_xy: Mesh, *, nb_full: int, nb_logical: int, pair_tile: int,
-    n_z: int, k_unfold_plan=None,
+    n_z: int, k_unfold_plan=None, layout="face",
 ):
-    """Face-layout sibling of :func:`_get_chi_fractional_q_kernel`.  The
-    k−q roll is unaffected by layout (a rank-local ``jnp.take`` on the
-    REPLICATED k axis, same as legacy's own roll on ``PSI_XN_SPEC``'s
-    replicated k axis); only the band-tile reconstruction differs."""
+    """Roll the unfolded b endpoint to k−q inside the ordered-pair contraction."""
     from common.shard_map import shard_map
-    from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+    from common.wfn_layout import psi_specs
+    PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(layout)
 
     tile = int(pair_tile)
-    key = ("direct_fractional_q_face", id(mesh_xy), int(nb_full),
-           int(nb_logical), tile, int(n_z), id(k_unfold_plan))
+    key = ("direct_fractional_q_face", _mesh_key(mesh_xy), int(nb_full),
+           int(nb_logical), tile, int(n_z), id(k_unfold_plan), layout)
     hit = _chi_minimax_kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -3538,7 +2414,8 @@ def _get_chi_fractional_q_kernel_face(
                 psi_mun, psi_nmu, psi_mun, psi_nmu, energies, eb,
                 occupations, fb, surface_weight, sb, z_values,
                 nb_full=nb_full, nb_logical=nb_logical, tile=tile,
-                unfold_x=unfold_x, unfold_y=unfold_y, roll_b=kminq_idx)
+                unfold_x=unfold_x, unfold_y=unfold_y, roll_b=kminq_idx,
+                k_unfold_plan=k_unfold_plan)
         in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None), P(None, None),
                     P(None, None), P(None, None), P(None)) + _PARENT_UNFOLD_SPECS
 
@@ -3563,22 +2440,7 @@ def compute_chi0_static_fractional_gamma(
     *,
     nb_logical: int,
 ):
-    r"""Return the exact static fractional-occupation chi0 at Gamma.
-
-    The ordered-pair kernel evaluates
-
-    ``(f_ka-f_kb)/(E_ka-E_kb)``
-
-    and uses ``df/dE`` on the degenerate diagonal.  The supplied surface
-    table owns that diagonal limit; the QSGW metal path supplies periodic
-    tetrahedron weights, while off-diagonal pairs retain the carried MP1
-    occupations.  The returned ``(1,n_mu,n_mu)`` array has the historical
-    raw-chi normalization expected by :func:`solve_w`.
-
-    This direct tiled implementation is the exact finite-band fallback.  A
-    future certified separable divided-difference minimax target can replace
-    its internals without changing this API or the Dyson/head callers.
-    """
+    """Return the exact static fractional-occupation chi0 at Gamma; see docs/architecture/four_current_wiring.md."""
     e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     f = jnp.asarray(occupations_kn, dtype=jnp.float64)
     surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
@@ -3595,17 +2457,6 @@ def compute_chi0_static_fractional_gamma(
         raise ValueError(
             f"static fractional chi needs 0 < nb_logical <= {e.shape[1]}; "
             f"got {nb_logical}")
-    if wfns.layout == "legacy":
-        if int(wfns.psi_xn.shape[-1]) < int(e.shape[1]):
-            raise ValueError(
-                "centroid wavefunctions do not cover the static bands")
-        psi_x = wfns.psi_xn[..., : int(e.shape[1])]
-        psi_y = wfns.psi_yn[..., : int(e.shape[1])]
-        return _get_chi_static_fractional_gamma_kernel(
-            mesh_xy,
-            nb_logical=int(nb_logical),
-            pair_tile=_STATIC_FRACTIONAL_PAIR_TILE,
-        )(psi_x, psi_y, e, f, surface)
     # face: the persistent carrier spans the FULL [b0,b4) window and
     # cannot be band-sliced (obstacle #3) -- pad the caller's
     # energies/occupations/surface table up to nb_full instead (any
@@ -3633,30 +2484,21 @@ def compute_chi0_static_fractional_gamma(
             nb_full=nb_full,
             nb_logical=int(nb_logical),
             pair_tile=_STATIC_FRACTIONAL_PAIR_TILE,
-            k_unfold_plan=plan,
+            k_unfold_plan=plan, layout=wfns.layout,
         )(carrier.psi_mun, carrier.psi_nmu, e_full, f_full, surface_full,
           *tables)
     return _get_chi_static_fractional_gamma_kernel_face(
         mesh_xy,
         nb_full=nb_full,
         nb_logical=int(nb_logical),
-        pair_tile=_STATIC_FRACTIONAL_PAIR_TILE,
+        pair_tile=_STATIC_FRACTIONAL_PAIR_TILE, layout=wfns.layout,
     )(wfns.psi_mun, wfns.psi_nmu, e_full, f_full, surface_full)
 
 
 def occupation_support_bandwidth(
         energies_kn_ry, occupations_kn,
         occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT):
-    """Largest transition energy over the occupation supports, Ry.
-
-    ``max(E over the (1-f) support) − min(E over the f support)`` over the
-    SAME two slices :func:`_occupation_support_slices` hands the χ₀ kernel,
-    so the rule bandwidth and the bands it must resolve can never disagree —
-    which is why the threshold is an argument here rather than a second
-    default.  An MP1 overshoot band at a support edge is included, by
-    magnitude.  This — not ``quad.x_max`` — sizes the damped-line rule
-    bandwidth on metal plans, where the occupied and empty supports overlap.
-    """
+    """Largest transition energy over the occupation supports, Ry; see docs/architecture/four_current_wiring.md."""
     e = np.asarray(jax.device_get(energies_kn_ry), dtype=np.float64)
     f_slice, u_slice = _occupation_support_slices(
         occupations_kn, occupation_window_threshold)
@@ -3672,21 +2514,7 @@ def compute_chi0_static_fractional(
     kminq_rows,
     nb_logical=None,
 ):
-    """Exact static finite-occupation chi0 for every stored q row.
-
-    The finite-q generalization of
-    :func:`compute_chi0_static_fractional_gamma`: for wedge row j the b
-    side of every ordered pair rides at ``k − q_j`` through the caller's
-    precomputed flat map ``kminq_rows[j]`` (``common.kq_mapping``), and
-    the divided difference ``(f_a(k)−f_b(k−q))/(E_a(k)−E_b(k−q))`` uses
-    the analytic MP1 ``−df/dE`` midpoint limit on accidentally degenerate
-    pairs.  This is the literal static member of the shared ordered-pair
-    evaluator; the metal MPA shifted-origin slot instead calls
-    :func:`compute_chi0_direct_fractional` at its stamped nonzero ``z``.
-    Returns ``(n_q, n_mu, n_mu)``
-    wedge rows in the raw-chi normalization expected by :func:`solve_w`,
-    sharded ``P(None, 'x', 'y')``.
-    """
+    """Exact static finite-occupation chi0 for every stored q row; see docs/architecture/four_current_wiring.md."""
     return compute_chi0_direct_fractional(
         wfns, np.asarray([0.0j], dtype=np.complex128), meta, mesh_xy,
         occupation_state=occupation_state, kminq_rows=kminq_rows,
@@ -3704,18 +2532,7 @@ def compute_chi0_direct_fractional(
     nb_logical=None,
     progress_fn=None,
 ):
-    """Exact finite-occupation chi0 at selected complex frequencies.
-
-    This is the ordered-pair escape hatch for isolated points at which the
-    damped-contour evaluator is unaffordable.  It shares the static kernel's
-    band-pair scan and distributed centroid output.  A zero entry uses the
-    MP1 divided-difference limit; every nonzero entry is evaluated at its
-    literal complex coordinate.  With one frequency the returned shape is
-    ``(n_q,n_mu,n_mu)``; otherwise it is ``(n_z,n_q,n_mu,n_mu)``.
-    ``progress_fn``, when supplied, is called as
-    ``progress_fn(rows_done, rows_total, elapsed_seconds)`` after each q-row
-    result is device-ready.  It changes synchronization only, never values.
-    """
+    """Exact finite-occupation chi0 at selected complex frequencies; see docs/architecture/four_current_wiring.md."""
     from gw.efermi import mp1_negative_derivative
 
     family = getattr(occupation_state, "smearing_family", None)
@@ -3756,27 +2573,6 @@ def compute_chi0_direct_fractional(
     surface = mp1_negative_derivative(
         e, float(occupation_state.mu_ry),
         float(occupation_state.smearing_width_ry))
-    if wfns.layout == "legacy":
-        if int(wfns.psi_xn.shape[-1]) < nb:
-            raise ValueError(
-                "centroid wavefunctions do not cover the direct bands")
-        psi_x = wfns.psi_xn[..., :nb]
-        psi_y = wfns.psi_yn[..., :nb]
-        kernel = _get_chi_fractional_q_kernel(
-            mesh_xy, nb_logical=nb_log,
-            pair_tile=_STATIC_FRACTIONAL_PAIR_TILE, n_z=z.size)
-        rows = []
-        for q_row, row in enumerate(kmq):
-            started = time.monotonic()
-            value = kernel(
-                psi_x, psi_y, jnp.asarray(row), e, f, surface,
-                jnp.asarray(z))
-            if progress_fn is not None:
-                value.block_until_ready()
-                progress_fn(q_row + 1, len(kmq), time.monotonic() - started)
-            rows.append(value)
-        values = jnp.stack(rows, axis=1)
-        return values[0] if z.size == 1 else values
     # face: wfns.enk is already (nk, nb_full) -- e/f/surface above are
     # ALREADY at the full loaded extent for this call site (they are
     # wfns.enk/occupation_state.f_kn/its own derivative, not a caller-
@@ -3802,7 +2598,7 @@ def compute_chi0_direct_fractional(
     kernel = _get_chi_fractional_q_kernel_face(
         mesh_xy, nb_full=nb_full, nb_logical=nb_log,
         pair_tile=_STATIC_FRACTIONAL_PAIR_TILE, n_z=z.size,
-        k_unfold_plan=plan)
+        k_unfold_plan=plan, layout=wfns.layout)
     rows = []
     for q_row, row in enumerate(kmq):
         started = time.monotonic()
@@ -3846,12 +2642,7 @@ def precompile_chi0_contour_fractional(
 
 
 def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
-    """AOT lower+compile of the χ₀ minimax kernel at the real input
-    shapes/shardings — warms the JAX in-process cache so the first
-    ``compute_chi0`` call is execution-only.  Call inside a dedicated
-    ``timing.section('chi0_W.chi.compile')`` block to separate compile
-    from exec in the end-of-run timing report.
-    """
+    """AOT lower+compile of the χ₀ minimax kernel at the real input shapes/shardings — warms the JAX in-process cache so the first ``compute_chi0`` call is execution-only; see docs/architecture/four_current_wiring.md."""
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     eref = 0.0 if energy_reference is None else float(energy_reference)
@@ -3884,11 +2675,7 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
 def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
                        n_rmu_logical=None,
                        distrib_la_batched_route: str = "batch_reshard"):
-    """AOT lower+compile of the W-solve jit.  See ``precompile_chi0``.
-
-    Goes through the same ``_resolve_w_solve_fn`` dispatch as
-    :func:`solve_w` so both paths agree on which jit to compile.
-    """
+    """AOT lower+compile of the W-solve jit; see docs/architecture/four_current_wiring.md."""
     ensure_jax_compile_cache()
     n_logical = _require_w_operand_geometry(
         V_q, chi0_q, meta, mesh_xy, n_rmu_logical=n_rmu_logical)

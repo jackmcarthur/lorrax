@@ -1444,3 +1444,25 @@ def test_an_unpadded_write_is_byte_identical_to_before_this_arm_existed():
         assert _shard_max_abs_diff(got, arm.kernel(mesh)) == 0.0
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_unavailable_actions_round_trip_reader_padding_and_digest():
+    """Canonical unavailable rows survive both reader widths without an identity substitute."""
+    table = QS.QirrTables(
+        irr_idx_q=np.array([0, 0]), sym_idx_q=np.array([0, 2]),
+        q_irr_frac=np.array([[0.25, 0., 0.]]),
+        sym_perm=np.array([[0, 1], [-1, -1], [0, 1], [-1, -1]]),
+        L_table=np.zeros((4, 2, 3), dtype=np.int32), n_sym_spatial=2)
+    assert QS.validate_qirr_tables(table, 1, 2) == "ibz"
+    for extent in (4, 16):
+        padded = table.padded(extent)
+        assert np.all(padded.sym_perm[[1, 3]] == -1)
+        assert QS.validate_qirr_tables(padded, 1, extent) == "ibz"
+        assert padded.logical(2).digest() == table.digest()
+    from dataclasses import replace
+    with pytest.raises(ValueError, match="selected centroid action is unavailable"):
+        QS.validate_qirr_tables(replace(table, sym_idx_q=np.array([0, 3])), 1, 2)
+    corrupt = table.sym_perm.copy()
+    corrupt[1, 0] = 0
+    with pytest.raises(ValueError, match="bijection or wholly unavailable"):
+        QS.validate_qirr_tables(replace(table, sym_perm=corrupt), 1, 2)

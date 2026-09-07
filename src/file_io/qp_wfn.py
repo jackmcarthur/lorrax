@@ -68,9 +68,7 @@ from .kin_ion import (
 )
 from .sigma_output import SIGMA_EVAL_PROVENANCE_ATTR
 
-#: Legal values of the ``qp_rotations_k_storage`` input key.  Same three
-#: words as ``restart_q_storage`` (``gw.restart_q_storage.RESTART_Q_STORAGE``)
-#: so a deck author learns one vocabulary, not two:
+#: Legal values of the independent ``qp_rotations_k_storage`` input key:
 #:
 #:   auto — store the file wedge IF the round trip reproduces the full-BZ
 #:          arrays exactly; the full BZ otherwise, saying which array and

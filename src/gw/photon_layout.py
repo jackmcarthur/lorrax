@@ -36,6 +36,7 @@ logical blocks remain the portable on-disk representation.
 """
 from __future__ import annotations
 
+from distrib_la import mesh_key as _mesh_key
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Mapping
@@ -161,7 +162,7 @@ _q0_block_cache: dict = {}
 
 def _empty(nq, layout, mesh_xy, dtype):
     shape = (int(nq), layout.packed_extent, layout.packed_extent)
-    key = (id(mesh_xy), shape, np.dtype(dtype).str)
+    key = (_mesh_key(mesh_xy), shape, np.dtype(dtype).str)
     if key not in _zero_cache:
         out = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
@@ -175,7 +176,7 @@ def _empty(nq, layout, mesh_xy, dtype):
 
 def _insert_program(layout, mesh_xy, nq, p_left, p_right):
     """Shape-specialized insert; offsets/valid lengths stay runtime data."""
-    key = (id(mesh_xy), int(nq), layout.packed_extent,
+    key = (_mesh_key(mesh_xy), int(nq), layout.packed_extent,
            int(p_left), int(p_right))
     if key in _insert_cache:
         return _insert_cache[key]
@@ -227,38 +228,29 @@ def _insert(packed, block, layout, A, B, mesh_xy):
 
 def pack_photon_operator(
     get_block: Callable[[int, int], jax.Array | None], nq: int,
-    layout: PhotonBasisLayout, mesh_xy: Mesh, *, dtype=jnp.complex128,
+    layout: PhotonBasisLayout, mesh_xy: Mesh, *, dtype=jnp.complex128, block_order=None,
 ) -> jax.Array:
-    """Stream sixteen blocks into one packed ``P(None,'x','y')`` operator.
-
-    ``get_block(A,B)`` is called only when that block is about to be inserted.
-    Each insertion is completed before the next callback so the consumed
-    block's device buffer is released before another response block can be
-    allocated.  Peak residency is therefore the accumulator plus one block,
-    and T1/T2/T3 never imply wavefunction copies.
-    """
+    """Insert blocks in the requested order, synchronizing before releasing each input."""
     layout.assert_mesh(mesh_xy)
     packed = _empty(nq, layout, mesh_xy, dtype)
-    for A in range(N_LORENTZ):
-        for B in range(N_LORENTZ):
-            block = get_block(A, B)
-            # Missing physical channels are exact zero blocks.  Keeping this
-            # case in the sole packer avoids a second packing graph and a
-            # second body-sized zero accumulator.
-            if block is None:
-                continue
-            packed = _insert(packed, block, layout, A, B, mesh_xy)
-            # JAX dispatch is asynchronous.  The next get_block() is an
-            # independent, body-sized response build, so the accumulator
-            # dependency alone does not prevent two block outputs from being
-            # allocated at once.  This is the explicit one-block lifetime
-            # boundary promised by the streaming contract above.
-            packed.block_until_ready()
+    order = (tuple((A, B) for A in range(N_LORENTZ) for B in range(N_LORENTZ))
+             if block_order is None else block_order)
+    for A, B in order:
+        block = get_block(A, B)
+        # Missing physical channels are exact zero blocks.  Keeping this
+        # case in the sole packer avoids a second packing graph and a
+        # second body-sized zero accumulator.
+        if block is None:
+            continue
+        packed = _insert(packed, block, layout, A, B, mesh_xy)
+        # Finish the donated insert before the callback builds another class.
+        packed.block_until_ready()
+        del block
     return packed
 
 
 def _view_program(layout, mesh_xy, nq, p_left, p_right):
-    key = (id(mesh_xy), int(nq), layout.packed_extent,
+    key = (_mesh_key(mesh_xy), int(nq), layout.packed_extent,
            int(p_left), int(p_right))
     if key in _view_cache:
         return _view_cache[key]
@@ -374,7 +366,7 @@ def unpack_photon_response_tiles(
 def _vector_pack_program(layout, mesh_xy, nq, dtype, axis_name):
     """One local graph for embedding four channel vectors in packed space."""
     padded = tuple(int(n) for n in layout.carrier_extents)
-    key = (id(mesh_xy), padded, int(nq), np.dtype(dtype).str, axis_name)
+    key = (_mesh_key(mesh_xy), padded, int(nq), np.dtype(dtype).str, axis_name)
     if key in _vector_pack_cache:
         return _vector_pack_cache[key]
     from common.shard_map import shard_map
@@ -489,8 +481,10 @@ def _q0_local_outer(left_rows, right_rows):
     return jnp.einsum("ai,aj->ij", left_rows, right_rows)
 
 
-def _validate_q0_factor_pair(left, right, layout, mesh_xy, *, dtype, label):
+def _validate_q0_factor_pair(left, right, layout, mesh_xy, *, dtype, label, stacked=False):
     factor_shape = (MAX_Q0_UPDATE_RANK, layout.packed_extent)
+    if stacked:
+        factor_shape = (int(left.shape[0]),) + factor_shape
     if tuple(left.shape) != factor_shape or tuple(right.shape) != factor_shape:
         raise ValueError(
             f"{label} q=0 factor pair must have two {factor_shape} arrays; "
@@ -501,8 +495,8 @@ def _validate_q0_factor_pair(left, right, layout, mesh_xy, *, dtype, label):
             f"{label} q=0 factors must have dtype {np.dtype(dtype)}; got "
             f"{left.dtype}/{right.dtype}")
     for array, name, spec in (
-        (left, "left_rows_X", P(None, "x")),
-        (right, "right_rows_Y", P(None, "y")),
+        (left, "left_rows_X", P(*((None,) * (left.ndim - 1)), "x")),
+        (right, "right_rows_Y", P(*((None,) * (right.ndim - 1)), "y")),
     ):
         wanted = NamedSharding(mesh_xy, spec)
         sharding = getattr(array, "sharding", None)
@@ -513,17 +507,17 @@ def _validate_q0_factor_pair(left, right, layout, mesh_xy, *, dtype, label):
                 f"{sharding}. Refusing an implicit factor reshard.")
 
 
-def _q0_update_program(layout, mesh_xy, nq, dtype):
+def _q0_update_program(layout, mesh_xy, nq, dtype, factor_ndim=2):
     """One shape-stable local graph per padded q=0 update geometry."""
-    key = (id(mesh_xy), tuple(layout.carrier_extents), int(nq),
-           np.dtype(dtype).str)
+    key = (_mesh_key(mesh_xy), tuple(layout.carrier_extents), int(nq),
+           np.dtype(dtype).str, factor_ndim)
     if key in _q0_update_cache:
         return _q0_update_cache[key]
     from common.shard_map import shard_map
 
     packed_spec = P(None, 'x', 'y')
-    left_spec = P(None, 'x')
-    right_spec = P(None, 'y')
+    left_spec = P(*((None,) * (factor_ndim - 1)), 'x')
+    right_spec = P(*((None,) * (factor_ndim - 1)), 'y')
     logical_spec = P(None)
     packed_sharding = NamedSharding(mesh_xy, packed_spec)
     left_sharding = NamedSharding(mesh_xy, left_spec)
@@ -534,22 +528,27 @@ def _q0_update_program(layout, mesh_xy, nq, dtype):
              in_specs=(packed_spec, left_spec, right_spec, logical_spec),
              out_specs=packed_spec, check_vma=False)
     def add_local(packed, left_rows, right_rows, logical_extents):
-        left_pieces = []
-        right_pieces = []
-        for channel in range(N_LORENTZ):
-            local = layout.carrier_extent(channel) // layout.mesh_side
-            left_pieces.append(_q0_local_factor_piece(
-                left_rows, axis_name="x", local_extent=local,
-                local_offset=layout.local_offset(channel),
-                logical_extent=logical_extents[channel]))
-            right_pieces.append(_q0_local_factor_piece(
-                right_rows, axis_name="y", local_extent=local,
-                local_offset=layout.local_offset(channel),
-                logical_extent=logical_extents[channel]))
-        delta_q0 = _q0_local_outer(
-            jnp.concatenate(tuple(left_pieces), axis=1),
-            jnp.concatenate(tuple(right_pieces), axis=1))
-        return packed.at[0, :, :].add(delta_q0)
+        def one(packed, pair):
+            left_rows, right_rows = pair
+            left_pieces = []
+            right_pieces = []
+            for channel in range(N_LORENTZ):
+                local = layout.carrier_extent(channel) // layout.mesh_side
+                left_pieces.append(_q0_local_factor_piece(
+                    left_rows, axis_name="x", local_extent=local,
+                    local_offset=layout.local_offset(channel),
+                    logical_extent=logical_extents[channel]))
+                right_pieces.append(_q0_local_factor_piece(
+                    right_rows, axis_name="y", local_extent=local,
+                    local_offset=layout.local_offset(channel),
+                    logical_extent=logical_extents[channel]))
+            delta_q0 = _q0_local_outer(
+                jnp.concatenate(tuple(left_pieces), axis=1),
+                jnp.concatenate(tuple(right_pieces), axis=1))
+            return packed.at[0, :, :].add(delta_q0), None
+        if factor_ndim == 2:
+            return one(packed, (left_rows, right_rows))[0]
+        return jax.lax.scan(one, packed, (left_rows, right_rows), unroll=1)[0]
 
     @partial(jax.jit,
              in_shardings=(packed_sharding, left_sharding, right_sharding,
@@ -605,7 +604,7 @@ def add_photon_q0_low_rank(
             f"packed photon operator shape {packed.shape} != {packed_shape}")
     _validate_q0_factor_pair(
         left_rows_X, right_rows_Y, layout, mesh_xy, dtype=packed.dtype,
-        label="packed update")
+        label="packed update", stacked=left_rows_X.ndim == 3)
     wanted_packed = NamedSharding(mesh_xy, P(None, "x", "y"))
     if (getattr(packed, "sharding", None) is None
             or not packed.sharding.is_equivalent_to(wanted_packed, 3)):
@@ -615,7 +614,7 @@ def add_photon_q0_low_rank(
             "packed-body reshard.")
 
     updated = _q0_update_program(
-        layout, mesh_xy, packed_shape[0], packed.dtype)(
+        layout, mesh_xy, packed_shape[0], packed.dtype, left_rows_X.ndim)(
             packed, left_rows_X, right_rows_Y,
             jnp.asarray(layout.logical_extents, dtype=jnp.int32))
     # Repeated bounded updates reuse the donated accumulator.  This explicit
@@ -627,7 +626,7 @@ def add_photon_q0_low_rank(
 
 def _q0_block_program(mesh_xy, p_left, p_right, dtype, n_pairs):
     """One q-extent-one graph per padded shape class and factor count."""
-    key = (id(mesh_xy), int(p_left), int(p_right), np.dtype(dtype).str,
+    key = (_mesh_key(mesh_xy), int(p_left), int(p_right), np.dtype(dtype).str,
            int(n_pairs))
     if key in _q0_block_cache:
         return _q0_block_cache[key]

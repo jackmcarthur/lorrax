@@ -264,66 +264,16 @@ def _integrate_sigma_batches(
         if not brackets:
             raise ValueError("MPA Sigma band-bracket plan must be nonempty")
     face_kwargs = sigma_face_kernel_kwargs(wfns)
-    k_unfold_plan = face_kwargs.get("k_unfold_plan")
-    if wfns.layout == "legacy":
-        # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded
-        # extent.  Identical on an unsplit deck.  UNVERIFIED on a split
-        # one: the public MPA Σ still refuses to run (gw_config.
-        # ComputeMode), so this line is wired for consistency and has
-        # never executed under a split.
-        state_slice = s.full if bracketed else s.sigma_sum
-        psi_coh_xn, psi_coh_yr = wfns.xn(state_slice), wfns.yr(state_slice)
-        psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
-        psi_proj_xr = pad_to_axis(
-            psi_proj_xr, sigma_axis, axis=1)
-        psi_proj_yn = pad_to_axis(
-            psi_proj_yn, sigma_axis, axis=3)
-        spatial_shape = (int(psi_proj_xr.shape[0]),
-                         int(psi_proj_xr.shape[1]),
-                         int(psi_proj_yn.shape[3]))
-    else:
-        # Face carrier (2026-08-22, mechanical port sharing
-        # ppm_tau_kernel's face dispatch — see gw.ppm_sigma._run_sigma_
-        # branch's identically-shaped docstring): psi_mun/psi_nmu are used
-        # UNSLICED for both roles — the accumulator BUILDS at the mesh-
-        # divisible nb_full extent regardless of nb_sigma, and always
-        # will: contract_bands.contract_bands_block_reshard's face arm
-        # The face projector's GEMM plan now takes the requested projection
-        # carrier separately from the resident full-band face.  The producer
-        # selects the logical Sigma window, appends exact-zero rows to the
-        # runtime-owned carrier, and the accumulator is born at that carrier
-        # width.  It stays there until a logical output consumer strips by
-        # ``sigma_axis``; no nondivisible sharded array is ever published.
-        # The projection operands default to the full-k faces; the parent
-        # route below replaces both roles with the parent faces.
-        psi_proj_xr, psi_proj_yn = wfns.psi_nmu, wfns.psi_mun
-        if k_unfold_plan is not None:
-            # Raw parents only: the parent faces feed the G contraction (the
-            # plan transports G to full k) and the projection (the spatial
-            # tail selects, projects, broadcasts).  Bracket packing is not
-            # combined with the route.
-            (psi_coh_xn, psi_coh_yr,
-             psi_proj_xr, psi_proj_yn, _, _) = parent_sigma_operands(wfns)
-            pack_brackets = False
-        elif bracketed and len(brackets) > 1:
-            from gw.wavefunction_bundle import pack_band_window
-            packed = [pack_band_window(wfns, lo, hi, mesh_xy=mesh_xy)
-                      for lo, hi in brackets]
-            psi_coh_xn = tuple(pair[0] for pair in packed)
-            psi_coh_yr = tuple(pair[1] for pair in packed)
-            pack_brackets = True
-        else:
-            psi_coh_xn, psi_coh_yr = wfns.psi_mun, wfns.psi_nmu
-            pack_brackets = False
-        psi_proj_xr = pad_to_axis(
-            psi_proj_xr, sigma_axis, axis=1)
-        psi_proj_yn = pad_to_axis(
-            psi_proj_yn, sigma_axis, axis=3)
-        spatial_shape = (
-            int(meta.nk_tot), sigma_axis.carrier, sigma_axis.carrier)
-        face_kwargs["face_band_extent"] = sigma_axis.carrier
-    if wfns.layout == "legacy":
-        pack_brackets = False
+    k_unfold_plan = wfns.green_parent.plan
+    (psi_coh_xn, psi_coh_yr,
+     psi_proj_xr, psi_proj_yn, _, _) = parent_sigma_operands(wfns)
+    psi_proj_xr = pad_to_axis(
+        psi_proj_xr, sigma_axis, axis=1)
+    psi_proj_yn = pad_to_axis(
+        psi_proj_yn, sigma_axis, axis=3)
+    spatial_shape = (
+        int(k_unfold_plan.n_parent), sigma_axis.carrier, sigma_axis.carrier)
+    face_kwargs["face_band_extent"] = sigma_axis.carrier
     if bracketed:
         shape = (len(brackets), omega.size, *spatial_shape)
         output_sharding = NamedSharding(
@@ -343,7 +293,6 @@ def _integrate_sigma_batches(
         mesh_xy=mesh_xy,
         kgrid=kgrid,
         brackets=brackets,
-        pack_brackets=pack_brackets,
         **face_kwargs)
     small = NamedSharding(mesh_xy, P())
 
@@ -411,14 +360,9 @@ def _integrate_sigma_batches(
                             * jnp.reshape(
                                 jnp.asarray(weight, jnp.float64),
                                 np.asarray(win.mask_A).shape))
-            E_A_call = row.E_A
-            if k_unfold_plan is not None:
-                # The G contraction runs on the raw parents: its energy and
-                # selector tables are the parents' rows of the star-invariant
-                # full-k tables (one child per raw row, plan.parent_rows).
-                E_A_call = k_unfold_plan.parent_rows(row.E_A)
-                selector = k_unfold_plan.parent_rows(
-                    jnp.reshape(selector, np.shape(row.E_A)))
+            E_A_call = k_unfold_plan.parent_rows(row.E_A)
+            selector = k_unfold_plan.parent_rows(
+                jnp.reshape(selector, np.shape(row.E_A)))
             if not sweep_started:
                 first_t = np.asarray(
                     jax.device_get(win.nodes.t), np.complex128)[0]
@@ -523,6 +467,14 @@ def _integrate_sigma_batches(
         raise SystemExit(0)
 
     sigma = accumulator.finalize()
+    from symmetry_maps import unfold_file_wedge_band_operator
+    k_axis = 2 if bracketed else 1
+    # Transpose is complex-linear, so transport follows the complete omega
+    # fold without conjugating quadrature coefficients or storing tau tiles.
+    sigma = jax.jit(lambda value: jnp.moveaxis(
+        unfold_file_wedge_band_operator(
+            k_unfold_plan.sym, jnp.moveaxis(value, k_axis, 0),
+            trs_rule="transpose"), 0, k_axis))(sigma)
     if bracketed:
         sigma = jax.jit(
             lambda values: jnp.cumsum(values, axis=0),

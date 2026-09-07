@@ -64,7 +64,7 @@ charge basis belonging to a different centroid table.
 
 | Family | Producer boundary | Logical receipt | Consumer boundary |
 |---|---|---|---|
-| loaded, χ, ζ and packed band windows | `Meta`, WFN loading, ζ fitting, and `pack_band_window` | band slices plus `PaddedAxis` | masks retain the requested interval; projection/output uses the logical slice |
+| loaded, χ, ζ and masked band windows | `Meta`, WFN loading, ζ fitting, and parent Sigma masks | band slices plus `PaddedAxis` | masks retain the requested interval; projection/output uses the logical slice |
 | Σ band window | `sigma_band_axis` before the projected operands enter MPA/GN-PPM | `SigmaOmegaResult.band_axis` → `SigmaResult.sigma_band_axis` | QP, QSGW, SC, `eqp.dat`, and `sigma.h5` strip from that receipt |
 | SC/QP protected square matrices | rotation/history producers | one receipt shared by both matrix axes | sentinel/identity pad is removed after eigensolve or at the QP boundary |
 | charge and transverse centroids | `PackedCentroidBasis`, canonical loaders and `PhotonBasisLayout.channel_axes` | basis active map / solve receipt, or a suffix `PaddedAxis` | packed solves retain the carrier; suffix solves use the prefix; restart/output stores canonical logical shapes |
