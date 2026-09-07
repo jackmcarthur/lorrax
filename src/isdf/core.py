@@ -513,31 +513,34 @@ def _gram_q0_from_psi_kernel(
 	return _isdf_pipeline_cache[cache_key]
 
 
-def gram_q0_from_psi_sm(
-	psi_l_X: jax.Array,
-	psi_l_Y: jax.Array,
-	psi_r_X: jax.Array,
-	psi_r_Y: jax.Array,
-	k_weights: jax.Array,
-	*,
-	mesh_xy: Mesh,
-	gamma_mode: str = "charge",
-	symmetrize: bool = True,
-) -> jax.Array:
-	"""Fused candidate Gram from two left/right centroid-WFN faces; see docs/architecture/zeta_fit_face_psi_cct.md."""
+def _gram_gamma_mode(gamma_mode):
+	"""Return the canonical charge or transverse Gram channel."""
 	mode = str(gamma_mode).strip().lower()
 	if mode not in ("charge", "transverse"):
 		raise ValueError(
 			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
-	if any(arr.ndim != 4 for arr in
-	       (psi_l_X, psi_l_Y, psi_r_X, psi_r_Y)):
-		raise ValueError("gram_q0_from_psi_sm requires four rank-4 WFN faces")
+	return mode
+
+
+def _gram_planning_gamma_mode(gamma_mode, nspinor):
+	"""Return a Gram channel supported by the planned spin extent."""
+	mode = _gram_gamma_mode(gamma_mode)
+	if mode == "transverse" and int(nspinor) != 4:
+		raise ValueError(
+			"transverse Gram planning requires nspinor=4; got "
+			f"{int(nspinor)}")
+	return mode
+
+
+def _validate_gram_face_shapes(
+	psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights, mode, n_cols,
+):
+	"""Return the compatible Gram face extents after checking both endpoints."""
 	nk, n_rows, nb_l, ns = (int(v) for v in psi_l_X.shape)
-	if tuple(int(v) for v in psi_l_Y.shape[:3]) != (nk, nb_l, ns):
+	if tuple(int(v) for v in psi_l_Y.shape) != (nk, nb_l, ns, n_cols):
 		raise ValueError(
 			"left WFN faces disagree: "
 			f"X={psi_l_X.shape}, Y={psi_l_Y.shape}")
-	n_cols = int(psi_l_Y.shape[3])
 	if (int(psi_r_X.shape[0]) != nk or int(psi_r_X.shape[1]) != n_rows
 	        or int(psi_r_X.shape[3]) != ns):
 		raise ValueError(
@@ -555,6 +558,28 @@ def gram_q0_from_psi_sm(
 		raise ValueError(
 			"gamma_mode='transverse' requires four-component bispinors; "
 			f"got nspinor={ns}")
+	return nk, n_rows, nb_l, ns, nb_r
+
+
+def gram_q0_from_psi_sm(
+	psi_l_X: jax.Array,
+	psi_l_Y: jax.Array,
+	psi_r_X: jax.Array,
+	psi_r_Y: jax.Array,
+	k_weights: jax.Array,
+	*,
+	mesh_xy: Mesh,
+	gamma_mode: str = "charge",
+	symmetrize: bool = True,
+) -> jax.Array:
+	"""Fused candidate Gram from two left/right centroid-WFN faces; see docs/architecture/zeta_fit_face_psi_cct.md."""
+	mode = _gram_gamma_mode(gamma_mode)
+	if any(arr.ndim != 4 for arr in
+	       (psi_l_X, psi_l_Y, psi_r_X, psi_r_Y)):
+		raise ValueError("gram_q0_from_psi_sm requires four rank-4 WFN faces")
+	n_cols = int(psi_l_Y.shape[3])
+	nk, n_rows, nb_l, ns, nb_r = _validate_gram_face_shapes(
+		psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights, mode, n_cols)
 	if mode == "transverse":
 		perm = _gammas_perm
 		phase = _gammas_phase
@@ -729,10 +754,7 @@ def gram_q0_tiled_from_psi_sm(
 	gamma_mode: str = "charge",
 ) -> jax.Array:
 	"""Assemble every q=0 candidate-Gram tile in one donated executable; see docs/architecture/zeta_fit_face_psi_cct.md."""
-	mode = str(gamma_mode).strip().lower()
-	if mode not in ("charge", "transverse"):
-		raise ValueError(
-			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
+	mode = _gram_gamma_mode(gamma_mode)
 	if any(arr.ndim != 4 for arr in
 	       (psi_l_X, psi_l_Y, psi_r_X, psi_r_Y)):
 		raise ValueError(
@@ -746,28 +768,8 @@ def gram_q0_tiled_from_psi_sm(
 		raise ValueError(
 			"Gram destination and WFN point extents disagree: "
 			f"G={G_xy.shape}, psi_l_X={psi_l_X.shape}")
-	if tuple(int(v) for v in psi_l_Y.shape) != (nk, nb_l, ns, n_points):
-		raise ValueError(
-			"left WFN faces disagree: "
-			f"X={psi_l_X.shape}, Y={psi_l_Y.shape}")
-	if (int(psi_r_X.shape[0]) != nk
-	        or int(psi_r_X.shape[1]) != n_points
-	        or int(psi_r_X.shape[3]) != ns):
-		raise ValueError(
-			"right X face disagrees with left X face: "
-			f"left={psi_l_X.shape}, right={psi_r_X.shape}")
-	nb_r = int(psi_r_X.shape[2])
-	if tuple(int(v) for v in psi_r_Y.shape) != (nk, nb_r, ns, n_points):
-		raise ValueError(
-			"right WFN faces disagree: "
-			f"X={psi_r_X.shape}, Y={psi_r_Y.shape}")
-	if tuple(int(v) for v in k_weights.shape) != (nk,):
-		raise ValueError(
-			f"k_weights must have shape ({nk},); got {k_weights.shape}")
-	if mode == "transverse" and ns != 4:
-		raise ValueError(
-			"gamma_mode='transverse' requires four-component bispinors; "
-			f"got nspinor={ns}")
+	nk, n_points, nb_l, ns, nb_r = _validate_gram_face_shapes(
+		psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights, mode, n_points)
 	width = int(tile_width)
 	if width <= 0:
 		raise ValueError(f"tile_width must be positive; got {width}")
@@ -804,14 +806,7 @@ def gram_q0_tiled_from_psi_aot_resident_increment_bytes(
 	gamma_mode: str = "charge",
 ) -> int:
 	"""Compiled bytes above the already-resident WFN faces and donated G; see docs/architecture/zeta_fit_face_psi_cct.md."""
-	mode = str(gamma_mode).strip().lower()
-	if mode not in ("charge", "transverse"):
-		raise ValueError(
-			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
-	if mode == "transverse" and int(nspinor) != 4:
-		raise ValueError(
-			"transverse Gram planning requires nspinor=4; got "
-			f"{int(nspinor)}")
+	mode = _gram_planning_gamma_mode(gamma_mode, nspinor)
 	width = int(tile_width)
 	if int(n_points) <= 0 or width <= 0:
 		raise ValueError(
@@ -872,14 +867,7 @@ def gram_q0_from_psi_aot_peak_bytes(
 	symmetrize: bool = False,
 ) -> int:
 	"""Per-rank compiled peak of :func:`gram_q0_from_psi_sm`."""
-	mode = str(gamma_mode).strip().lower()
-	if mode not in ("charge", "transverse"):
-		raise ValueError(
-			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
-	if mode == "transverse" and int(nspinor) != 4:
-		raise ValueError(
-			"transverse Gram planning requires nspinor=4; got "
-			f"{int(nspinor)}")
+	mode = _gram_planning_gamma_mode(gamma_mode, nspinor)
 	x_sh = NamedSharding(mesh_xy, P(None, 'x', None, None))
 	y_sh = NamedSharding(mesh_xy, P(None, None, None, 'y'))
 	rep = NamedSharding(mesh_xy, P())
@@ -919,14 +907,7 @@ def gram_q0_aot_peak_bytes(
 	gamma_mode: str = "charge",
 ) -> int:
 	"""Per-rank compiled peak for the canonical q=0 candidate tile fold."""
-	mode = str(gamma_mode).strip().lower()
-	if mode not in ("charge", "transverse"):
-		raise ValueError(
-			f"gamma_mode must be 'charge' or 'transverse'; got {gamma_mode!r}")
-	if mode == "transverse" and int(nspinor) != 4:
-		raise ValueError(
-			"transverse Gram planning requires nspinor=4; got "
-			f"{int(nspinor)}")
+	mode = _gram_planning_gamma_mode(gamma_mode, nspinor)
 	pair_sh = NamedSharding(
 		mesh_xy, P(None, None, None, 'x', 'y'),
 	)
