@@ -812,7 +812,7 @@ CONV_KPAIR_GATE = Gate(
 
 CONV_KPARENT_TARGET = "lorrax_cufft_conv_kparent"
 CONV_KPARENT_GATE = Gate(
-    env="LORRAX_CONV_KPAIR_FFI", target=CONV_KPARENT_TARGET,
+    env="LORRAX_CONV_KPARENT_FFI", target=CONV_KPARENT_TARGET,
     platforms=("CUDA",), modes=("off", "auto", "on"), default="auto",
     off_label="the decomposed parent ISDF tail", off_policy="fallback",
     auto_capability="CUDA exports CufftConvKParentCudaFfi with typed local tables",
@@ -821,8 +821,8 @@ CONV_KPARENT_GATE = Gate(
     off_announce_msg="[conv_kparent] off: decomposed parent ISDF tail",
     label={"CUDA": "ISDF parent-load convolution"},
     resolved_msg={"CUDA": "[conv_kparent] typed parent-load handler ({target}) available"},
-    refuse_platform_msg="Parent convolution requires CUDA; got {platform}",
-    refuse_probe_msg="Parent convolution target {target} unavailable: {reason}; rebuild the CUDA leg",
+    refuse_platform_msg="LORRAX_CONV_KPARENT_FFI=on requires CUDA; got {platform}",
+    refuse_probe_msg="LORRAX_CONV_KPARENT_FFI=on: target {target} unavailable: {reason}; rebuild the CUDA leg",
 )
 
 

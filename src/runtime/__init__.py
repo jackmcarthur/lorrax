@@ -2240,7 +2240,7 @@ def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
     log.  An import failure of the gate modules themselves is a broken
     build and propagates for the same reason.
     """
-    from ffi.fft import (CONV_KLEAD_GATE, CONV_KMINOR_GATE, CONV_KPAIR_GATE,
+    from ffi.fft import (CONV_KLEAD_GATE, CONV_KMINOR_GATE, CONV_KPAIR_GATE, CONV_KPARENT_GATE,
                          FUSED_GATE, GATE as _FFT_GATE)
     from ffi.gemm import GATE as _GEMM_GATE
 
@@ -2255,6 +2255,10 @@ def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
     CONV_KMINOR_GATE.enforce(mesh, announce=announce)
     CONV_KLEAD_GATE.enforce(mesh, announce=announce)
     CONV_KPAIR_GATE.enforce(mesh, announce=announce)
+    if CONV_KPARENT_GATE.mode() == "on":
+        CONV_KPARENT_GATE.require(mesh, announce=announce)
+    else:
+        CONV_KPARENT_GATE.enforce(mesh, announce=announce)
 
 
 def _ffi_dial_facts() -> list:
@@ -2273,7 +2277,7 @@ def _ffi_dial_facts() -> list:
     try:
         from ffi.gemm import GATE as _GEMM_GATE
         from ffi.fft import (CONV_KLEAD_GATE, CONV_KMINOR_GATE,
-                             CONV_KPAIR_GATE, GATE as _FFT_GATE, FUSED_GATE)
+                             CONV_KPAIR_GATE, CONV_KPARENT_GATE, GATE as _FFT_GATE, FUSED_GATE)
     except Exception as exc:                                  # noqa: BLE001
         return [{"env": "<ffi dials>", "mode": None, "enabled": None,
                  "detail": f"the FFI gate modules could not be imported "
@@ -2290,7 +2294,8 @@ def _ffi_dial_facts() -> list:
                         "conv (Sigma; accelerator, default off)"),
                        (CONV_KPAIR_GATE,
                         "the fused post-pair convolution used to form the "
-                        "ISDF Coulomb operator")):
+                        "ISDF Coulomb operator"),
+                       (CONV_KPARENT_GATE, "the native parent-load ISDF convolution")):
         try:
             mode = gate.mode()
             enabled = gate.enabled()

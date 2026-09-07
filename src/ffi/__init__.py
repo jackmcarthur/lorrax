@@ -43,6 +43,7 @@ FFI_DIAL_ENV = (
     # ISDF CCT/ZCT post-pair accelerator.  The mode changes the post-einsum
     # HLO body inside a shard_map, so every rank must compile the same arm.
     "LORRAX_CONV_KPAIR_FFI",
+    "LORRAX_CONV_KPARENT_FFI",
 )
 
 
