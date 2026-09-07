@@ -61,15 +61,27 @@
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
 | `src/gw/gw_init.py` | `_plan_gflat_chunks_for_channel` | 136 | 135 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/gw_init.py` | `fit_zeta` | 576 | 575 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/gw_init.py` | `fit_zeta` | 576 | 56 | Existing statements moved to named stages or dead selector removed |
 | `src/gw/gw_init.py` | `compute_V_q` | 398 | 22 | Existing statements moved to named stages or dead selector removed |
 | `src/gw/gw_init.py` | `prepare_isdf_and_wavefunctions` | 742 | 742 | Unchanged; target remains |
+| `src/gw/gw_init.py` | `_report_zeta_chunk_plan` | 0 | 16 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_reuse_zeta_faces` | 0 | 27 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_plan_transverse_zeta` | 0 | 28 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_plan_coupled_zeta_fit` | 0 | 108 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_fit_charge_zeta_channel` | 0 | 74 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_report_zeta_fit_peak` | 0 | 33 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_transverse_zeta_channel_runner` | 0 | 80 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_transverse_zeta_channel_runner._drop_traced_caches` | 0 | 3 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_transverse_zeta_channel_runner._drain_coupled_rank_findings` | 0 | 5 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_transverse_zeta_channel_runner._fit_transverse_channel` | 0 | 62 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_run_transverse_zeta_schedule` | 0 | 47 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_fit_transverse_zeta_channels` | 0 | 28 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_vcoul_geometry_and_budget` | 0 | 19 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_vcoul_transverse_inputs` | 0 | 25 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_compute_photon_vq` | 0 | 90 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_compute_scalar_vq` | 0 | 35 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_finalize_vq_views` | 0 | 23 | New explicit phase/direct owner |
-| `src/gw/gw_init.py` | **File total** | 3786 | 3610 | Net -176 lines |
+| `src/gw/gw_init.py` | **File total** | 3786 | 3550 | Net -236 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -173,6 +185,12 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
+| `tests/test_bispinor_zeta_reuse_ast.py` | `_fit_zeta_tree` | 2 | 8 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_bispinor_zeta_reuse_ast.py` | `test_reuse_contract_precedes_and_bypasses_fit_only_planners` | 32 | 36 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_bispinor_zeta_reuse_ast.py` | **File total** | 290 | 300 | Net +10 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
 | `tests/test_centroid_fft_k_plan.py` | `_plan` | 22 | 21 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_centroid_fft_k_plan.py` | **File total** | 164 | 163 | Net -1 lines |
 
@@ -215,7 +233,7 @@
 
 | Tree scope | Before | After | Net |
 |---|---|---|---|
-| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 124762 | -485 |
+| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 124702 | -545 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
@@ -225,7 +243,8 @@
 | 4 — driver/photon stages (76a1587d) | 1398 | 467 passed,2 skipped,1 xfailed; centroid/parent/photon/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-180746-2273070-8918, lx-Xg4-180754-2273585-4383; 10_photon_stages/cpu/cpu.xml; 10_photon_stages/p4/mos2/identity.json |
 | 5 — zeta stages (b3487462) | 1399 | 485 passed,2 skipped,1 xfailed; parent/factor-hoist/mesh-invariance/charge/refit/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-181422-2302374-7638, lx-Xg4-181430-2302826-9451; 11_zeta_stages/cpu/cpu.xml; 11_zeta_stages/p4/mos2/identity.json |
 | 6 — complete driver stages (208ed323) | 1401 | 456 passed,2 skipped,1 xfailed; centroid closure/parent/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-183807-44846-3326, lx-Xg4-183816-45219-2050; 14_driver_stages/cpu/cpu.xml; 14_driver_stages/p4/mos2/identity.json |
-| 7 — Vq stages (this commit) | 1403 | 445 passed, 2 skipped, 1 xfailed; centroid/parent/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-184246-65473-4941, lx-Xg4-184258-66104-4580; 15_vq_stages/cpu/cpu.xml; 15_vq_stages/p4/mos2/identity.json |
+| 7 — Vq stages (f579b808) | 1403 | 445 passed, 2 skipped, 1 xfailed; centroid/parent/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-184246-65473-4941, lx-Xg4-184258-66104-4580; 15_vq_stages/cpu/cpu.xml; 15_vq_stages/p4/mos2/identity.json |
+| 8 — extract charge and current fit stages (this commit) | 1404 | 453 passed, 2 skipped, 1 xfailed, 102 warnings in 177.56s (0:02:57) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-185204-112340-9401, lx-Xg4-185204-112565-5557; 16_fit_stages/cpu/cpu.xml; 16_fit_stages/p4/mos2/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|
