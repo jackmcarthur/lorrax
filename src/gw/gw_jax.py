@@ -737,15 +737,14 @@ def _install_oneshot_head(
 
 def _persist_screening(
         V_q, W_by_role, centroid_indices, config, head_resolver, mesh_xy, meta, mode,
-        print0, qp_solver, sym, tensors_filename):
+        print0, qp_solver, sym, tensors_filename, photon_response=None):
     """Persist the screened static body and head on the canonical q set."""
-    if (not packed_photon_replaces_charge_sigma(config)
-            and driver_persists_w0(mode, config)
+    if (driver_persists_w0(mode, config)
             and qp_solver is not QPSolver.SELF_CONSISTENT):
         with timing.section("gw_jax.persist_w0"):
             from .gw_output import persist_w0_and_head
             persist_w0_and_head(
-                W_by_role.get("static", V_q),
+                W_by_role.get("static", V_q), photon_response=photon_response,
                 tensors_filename=tensors_filename, head_resolver=head_resolver,
                 config=config, meta=meta, mesh_xy=mesh_xy,
                 sym=sym, centroid_indices=centroid_indices,
@@ -1397,7 +1396,7 @@ def main(argv=None):
 	    oneshot_head_response, print0, wfn)
 	_persist_screening(
 	    V_q, W_by_role, centroid_indices, config, head_resolver, mesh_xy, meta, mode, print0,
-	    qp_solver, sym, tensors_filename)
+	    qp_solver, sym, tensors_filename, photon_response=photon_response)
 	(
 	    static_head_terms) = _prepare_static_head(
 	    config, do_screened, head_resolver, meta, mode, print0, qp_solver)

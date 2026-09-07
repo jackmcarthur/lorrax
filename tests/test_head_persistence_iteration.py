@@ -252,3 +252,48 @@ def test_qp_diagonal_head_diagnostic_is_rotated_to_dft_on_four_devices():
         diag_qp, U, mesh=mesh)
 
     np.testing.assert_allclose(np.asarray(got), [[1.5, 2.5]], rtol=0, atol=1e-7)
+
+
+def test_embedded_photon_head_does_not_resolve_or_add_a_second_head(tmp_path, monkeypatch):
+    """CC already includes its Gamma completion; only bare V needs a scalar."""
+    restart = tmp_path / "isdf_tensors_1.h5"
+    restart.touch()
+    written = {}
+    _patch_writer_plumbing(monkeypatch, written)
+    config = _config()
+    config.qp_solver = SimpleNamespace(value="one_shot_dft")
+    resolver = _HeadSource({})
+    sample = HeadSample(vc0=101.0, wcoul0=0.0, omega=0.0j,
+                        source="packed photon CC: embedded Gamma completion",
+                        response_kind=HeadResponseKind.FULL_LOCAL_FIELDS)
+    gw_output.persist_w0_and_head(
+        np.zeros((1, 1, 1), dtype=np.complex128),
+        tensors_filename=str(restart), head_resolver=resolver,
+        static_head_sample=sample, static_head_only=True,
+        config=config, meta=SimpleNamespace(n_rmu=1), mesh_xy=object(),
+        print_fn=lambda *_args: None)
+    assert resolver.calls == []
+    assert written["head"]["vhead"] == 101.0
+    np.testing.assert_array_equal(written["head"]["whead"], [0.0])
+    np.testing.assert_array_equal(written["head"]["omega_grid"], [0.0])
+    assert written["head"]["S_cart"] is None
+    assert written["head"]["head_source"] == sample.source
+
+
+@pytest.mark.parametrize("static_only, omega", [(False, 0.0j), (True, 2.0j)])
+def test_static_receipt_refuses_mislabeled_frequency_before_writing(
+        tmp_path, monkeypatch, static_only, omega):
+    restart = tmp_path / "isdf_tensors_1.h5"
+    restart.touch()
+    written = {}
+    _patch_writer_plumbing(monkeypatch, written)
+    config = _config()
+    config.qp_solver = SimpleNamespace(value="one_shot_dft")
+    sample = HeadSample(vc0=1.0, wcoul0=0.0, omega=omega, source="test")
+    with pytest.raises(ValueError, match="requires static_head_only"):
+        gw_output.persist_w0_and_head(
+            np.zeros((1, 1, 1), dtype=np.complex128),
+            tensors_filename=str(restart), head_resolver=_HeadSource({}),
+            static_head_sample=sample, static_head_only=static_only,
+            config=config, meta=SimpleNamespace(n_rmu=1), mesh_xy=object())
+    assert written == {}

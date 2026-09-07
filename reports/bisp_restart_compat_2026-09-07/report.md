@@ -2,6 +2,13 @@
 |---|---|---|---|---|
 | BISP-RESTART-COMPAT | heavy: audit and end-to-end compatibility | fix/restart-consumers-2026-09-07, unmerged | 891047f4e6e8639b28d6da61375c3deecfae3259 | /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/122_bisp_restart_compat_codex_2026-09-07 |
 
+| Latest follow-up result | Evidence |
+|---|---|
+| Baseline attribution |Scalar/ns4 BSE, htransform and raw refit certificate arrays match891047f4 exactly. W_BSE admission regression corrected by restoring baseline refusal; no claim that its unported solver failures pre-existed |
+| Producer gap |Fresh MoS2 both layouts now persist screened CC through the canonical writer; readback max absolute0; BSE and downfold complete |
+| Scope |Two requested follow-ups; tables below preserve the original census and superseded diagnostic history, followed by matched-tip and producer gate tables |
+
+
 | Pre-edit consumer census (2026-09-07) | Bundle datasets / ancillary input | Reader and source | Assumptions / defect |
 |---|---|---|---|
 | Census evidence | All requested search terms, including writers and non-read mentions | `census.txt`: worktree `git grep -n` over src and services at baseline | Written before source edits; broad matches are discovery evidence, not all reads |
@@ -69,7 +76,7 @@
 | Upstream centroids/WFN/PSP | N/A | Producers or source inputs, not gwjax bundle consumers; existing canonical source services |
 | Dynamic pole stores | `file_io.restart_bundle` | W-slab/header/column, pole/head, resume and fit readers moved out of mpa_store; writer and format helpers remain there. Quadrature rules retain their existing non-HDF5 service |
 
-| Deletion ledger module (b05e586a versus891047f4; source/service code) | Lines removed | Lines added | Reader deletion / disposition |
+| Deletion ledger module (final versus891047f4; source/service code) | Lines removed | Lines added | Reader deletion / disposition |
 |---|---:|---:|---|
 | `services/zeta_loader/src/zeta_loader/loader.py` | 2 | 2 | Call sites/imports use the sole reader; no independent reader retained |
 | `src/bandstructure/htransform.py` | 101 | 3 | EQP parser moved; canonical rotation and energy readers used |
@@ -94,29 +101,31 @@
 | `src/file_io/kin_ion.py` | 309 | 0 | Star-table, matrix and provenance readers moved |
 | `src/file_io/mpa_store.py` | 1216 | 11 | Dynamic W, head, fit and pole readers/handle classes moved; writers retained |
 | `src/file_io/qp_wfn.py` | 148 | 7 | Rotation, stamp and provenance readers moved |
-| `src/file_io/restart_bundle.py` | 0 | 4500 | One actual implementation module; moved functions, shared admission and semantic accessors |
+| `src/file_io/restart_bundle.py` | 0 | 4501 | One actual implementation module; moved functions, shared admission and semantic accessors |
 | `src/file_io/sigma_output.py` | 320 | 10 | EQP assembly/evaluation/reference readers moved |
 | `src/file_io/tagged_arrays.py` | 992 | 37 | All readers moved; full-k writer compatibility deleted |
 | `src/gw/downfold.py` | 1 | 1 | Stale full-k dataset name removed from band-window explanation |
 | `src/gw/downfold_config.py` | 2 | 2 | Stale full-k dataset name removed from band-window explanation |
 | `src/gw/downfold_run.py` | 165 | 15 | Geometry, q-storage probe and payload readers moved |
 | `src/gw/eqp_bgw.py` | 116 | 8 | EQP text parser moved; private QP/evaluation reads replaced |
-| `src/gw/gw_init.py` | 48 | 16 | Private bundle probes replaced; reader layout consumed; obsolete W_BSE refusal removed |
+| `src/gw/gw_init.py` | 48 | 18 | Private bundle probes replaced; reader layout consumed; baseline W_BSE admission delegated to the shared reader |
 | `src/gw/head_correction.py` | 15 | 14 | Call sites/imports use the sole reader; no independent reader retained |
 | `src/gw/mpa/fit_driver.py` | 8 | 10 | Call sites/imports use the sole reader; no independent reader retained |
 | `src/gw/mpa/model.py` | 5 | 7 | Call sites/imports use the sole reader; no independent reader retained |
 | `src/gw/mpa/sigma.py` | 1 | 5 | Call sites/imports use the sole reader; no independent reader retained |
 | `src/gw/qsgw_head.py` | 10 | 8 | Call sites/imports use the sole reader; no independent reader retained |
 | `src/gw/sc_iteration.py` | 1 | 5 | Call sites/imports use the sole reader; no independent reader retained |
-| `src/gw/screening_bse.py` | 65 | 7 | Private handoff probe replaced; central canonical-to-packed accessor used |
+| `src/gw/screening_bse.py` | 65 | 4 | Private handoff probe replaced; intermediate unported ordering change withdrawn |
 | `src/gw/sigma_dispatch.py` | 1 | 3 | Call sites/imports use the sole reader; no independent reader retained |
 | `src/gw/sigma_x_bispinor.py` | 1 | 1 | Call sites/imports use the sole reader; no independent reader retained |
 | `src/gw/v_q_bispinor.py` | 213 | 0 | BispinorVqReader moved intact |
 | `src/gw/v_q_g_flat.py` | 1 | 1 | Call sites/imports use the sole reader; no independent reader retained |
-| `src/gw/w_isdf.py` | 2 | 4 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/gw/w_isdf.py` | 2 | 47 | Call sites/imports use the sole reader; no independent reader retained |
 | `src/postprocess/rotate_wfn_to_qp.py` | 73 | 5 | Private k-irr mapping reader deleted |
 | `src/psp/get_dipole_mtxels.py` | 176 | 2 | Provenance reader moved; producer retained |
-| Total, 45 source/service modules; excludes tests | 5971 | 4824 | Net -1147 lines; counts include moved implementations and call-site edits, not a claim that every deleted line was a private read |
+| `src/gw/gw_jax.py` | 5 | 4 | Canonical packed-photon CC producer handoff and existing writer |
+| `src/gw/gw_output.py` | 1 | 26 | Canonical packed-photon CC producer handoff and existing writer |
+| Total, 47 source/service modules; excludes tests | 5977 | 4897 | Net -1080 lines; counts include moved implementations and call-site edits |
 
 | Shared reader public surface | Returns |
 |---|---|
@@ -210,7 +219,7 @@
 | W_BSE batch |d8edf9f7 pushed; claim1443 | Execution and remaining scientific failures distinguished above |
 
 
-| Closeout | Result |
+| Initial closeout at b05e586a | Result |
 |---|---|
 | Consolidation |45 source/service modules;5971 lines removed,4824 added, net1147 removed. Reader implementations moved into `file_io.restart_bundle`; writer and canonical transport/symmetry services retain their existing ownership |
 | Obsolete full-k reader contracts |No `require_full_k_psi`, `psi_full_y` compatibility arm or `_unfold_bse_parent_faces` remains in src/services; old static bundles are refused centrally: regenerate with gwjax at main ≥ 891047f4 |
@@ -235,3 +244,40 @@
 | Htransform DFT vs run74 b5a58202 |Max0.05645288638657168 meV; RMS0.03751815584079322 |Same max/RMS |Tip max absolute/relative difference0 over4×16 values ≤1e-6 | pre-existing — reference drift | `{base,branch}/23_htransform_reference/{control.rank0.log,bandstructure.dat}`; `tip_comparison.json` |
 | Scalar8-band GN BSE lowest20 |2.48309532…2.79925695 eV |Same20 values |Max absolute0 eV; max relative0 ≤1e-6 | pre-existing — no tip regression | `{base,branch}/01_scalar_true/control.rank0.log`; all20 values in `tip_comparison.json` |
 | Supplied SOC ns4 GN BSE lowest20 |2.45655385…2.57529601 eV |Same20 values |Max absolute0 eV; max relative0 ≤1e-6 | pre-existing — no tip regression | `{base,branch}/02_soc_true/control.rank0.log`; all20 values in `tip_comparison.json` |
+
+
+| Packed-photon charge persistence follow-up | Implementation / evidence |
+|---|---|
+| Producer handoff | `gw_jax._persist_screening` passes the produced photon response to the existing `gw_output.persist_w0_and_head`; the packed-route exclusion is removed |
+| One restoration and writer | `w_isdf.photon_charge_for_restart` obtains CC through `photon_blocks_full_q`, deposits the actual q-parent capture and its canonical symmetry tables, and returns the resolved static head receipt. The existing scalar writer performs canonical centroid unpacking, q-IBZ persistence and readiness publication |
+| Head accounting | The producing CC already contains its screened Gamma head/wings. The persisted additional screened scalar is0; the bare scalar is the producer's bare CC cell average. BSE therefore consumes the completed CC without adding its screened head twice |
+| Reader proof | Runtime witness captures the actual full-q CC passed out of the producer helper, calls the canonical writer, then compares `file_io.restart_bundle.read_interaction(..., 'screened', mesh)` to that array in canonical order. Only scalar reductions leave the distributed arrays; no second unfolding implementation |
+| Storage inspection | `h5dump -A -d /W0_qmunu` confirms actual W dataset shape7×597×597, q_storage=ibz, W0_ready=true in both layouts. This is an external artifact inspection; consumers continue through the one reader |
+| Retained issue | Four-spinor exciton interpolation carrier mismatch remains registered; no spin-axis conversion was added |
+
+| Driver / producer gate | Bundle | Verdict | Number / cause | Evidence relative to lane122 root |
+|---|---|---|---|---|
+| Fresh GW + CC round trip | MoS2 ns4; low_mem_bands=true; q-IBZ | PASS |Readback max absolute0 ≤1e-12; W0_ready=true;7 stored q restored to36 | `31_cc_true/{producer.rank0.log,cc_readback.json,w0_metadata.txt}` |
+| Fresh GW + CC round trip | MoS2 ns4; low_mem_bands=false; q-IBZ | PASS |Readback max absolute0 ≤1e-12; W0_ready=true;7 stored q restored to36 | `32_cc_false/{producer.rank0.log,cc_readback.json,w0_metadata.txt}` |
+| GW output neutrality | Both layouts versus original pristine-main fresh arms03/05 | PASS |All210 eqp0 rows and210 eqp1 rows identical to printed digits, tolerance0 | `{31_cc_true,32_cc_false}/eqp{0,1}.producer_compare.txt`; existing `tools/eqp_ab.py` |
+| BSE ring Lanczos | Both fresh MoS2 layouts;4v4c,n_occ26,400 iterations,20 eigenvalues | PASS |Both complete on the screened charge payload | `{31_cc_true,32_cc_false}/bse.rank0.log`; `30_tip_controls/cc_bse_layout_comparison.json` contains both full spectra |
+| Downfold | Both fresh MoS2 layouts; symmetric absolute window[22,30), auto rank | PASS |Both complete and write canonical child bundles from the same reader | `{31_cc_true,32_cc_false}/downfold.rank0.log`, `child/tmp`; `downfold.in` |
+| Head-persistence tests | P4 launch; independent unit fixtures per rank | PASS |8 passed,1 existing local2×2-mesh test skipped per rank; new tests prevent duplicate head resolution and mislabeled static frequency receipts | `30_tip_controls/head_tests.rank{0,1,2,3}.log` |
+| Rank completion | Two producers, two BSE solves, two downfolds | PASS |24/24 rank exit codes0; four head-test processes exit0 | `30_tip_controls/cc_exit_receipts.json`, `cc_gates.lx.log` |
+| Baseline-control batch | f662226e pushed; claim1446 | VERIFIED |Pre-existing numerical rows separated from the corrected W_BSE admission regression | `30_tip_controls/tip_comparison.json` |
+
+| Additional BSE layout comparison | Value |
+|---|---|
+| MoS2 new screened-charge lowest20, true vs false |Max absolute difference0 eV; both full arrays recorded, no reference tolerance widened |
+
+| Final source ledger after follow-up | Result |
+|---|---|
+| 47 source/service modules versus891047f4 |5977 lines removed,4897 added; net1080 removed. Earlier b05e586a totals remain historical context |
+
+
+| Final producer non-regression check | Verdict / evidence |
+|---|---|
+| Ownership boundary |The existing `packed_photon_replaces_charge_sigma` predicate selects the new CC handoff only when the packed operator owns the full static Sigma. Dynamic modes retain their original static charge body and frequency-probe head receipt |
+| SOC ns4 GN restart after writer change |PASS: all256/256 eqp0 and256/256 eqp1 rows exact against pristine-main fresh02, tolerance0; all4 ranks exit0. `14_soc_tt/writer_followup.rank0.log`, `eqp{0,1}.writer_followup_compare.txt`; `34_writer_dynamic/gate.lx.log` |
+| Allocation |58021406 released after all follow-up gates; no other allocation cancelled |
+| Requested stopping point |Baseline attribution/admission correction and the packed-photon CC producer gap are complete. The existing four-spinor exciton interpolation model issue remains registered |

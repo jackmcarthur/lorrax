@@ -1281,6 +1281,49 @@ def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy):
                                  mesh_xy=mesh, keys=keys).items()
 
 
+def photon_charge_for_restart(response, meta):
+    """Restore screened CC once and capture its producer q parents for I/O.
+
+    The charge block is a scalar Lorentz component with packed centroid axes.
+    Its Gamma completion is already in the operator; a consumer must not add
+    another screened rank-one head. The bare interaction remains the separate
+    canonical GW body, so its bare head is retained in the scalar receipt.
+    """
+    from symmetry_maps import bgw_integer_q_to_fractional
+    from .photon_layout import photon_block_view
+    from .restart_q_storage import deposit_pre_unfold
+    from .head_correction import HeadSample, HeadResponseKind
+
+    plan = response.family_plans[0]
+    sym, policy = plan.sym, response.qgrid_policy
+    parents = photon_block_view(
+        response.W_packed, response.layout, 0, 0, plan.mesh_xy)
+    deposit_pre_unfold(
+        "W0_qmunu", parents, n_rmu_logical=int(meta.n_rmu),
+        q_irr_frac=bgw_integer_q_to_fractional(
+            sym.q_irr_kgrid_int, policy.kgrid),
+        irr_idx_q=sym.irr_idx_q, sym_idx_q=policy.unfold_sym_idx,
+        sym_perm=plan.sym_perm, L_table=plan.L_table,
+        n_sym_spatial=policy.n_sym_spatial, mu_basis=meta.mu_basis)
+
+    @jax.jit
+    def restore(packed):
+        return next(photon_blocks_full_q(
+            packed, ((0, 0),), layout=response.layout,
+            family_plans=response.family_plans, qgrid_policy=policy))[1]
+
+    completion = response.head_completion
+    head = HeadSample(
+        vc0=(complex(completion.bare_D_mean[0, 0])
+             if completion is not None else 0.0j),
+        wcoul0=0.0j, omega=0.0j, S_cart=None,
+        source=("packed photon CC: screened Gamma completion embedded in body"
+                if completion is not None else "packed photon CC: head_correction=off"),
+        response_kind=(HeadResponseKind.FULL_LOCAL_FIELDS
+                       if completion is not None else HeadResponseKind.OFF))
+    return restore(response.W_packed), head
+
+
 def _load_static_photon_hall(
     config, meta, mesh_xy, wfn, wfn_fingerprint_binding, *,
     screen_current: bool, print_fn=print,

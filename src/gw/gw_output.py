@@ -497,6 +497,8 @@ def persist_w0_and_head(
     sym=None,
     centroid_indices=None,
     static_head_only: bool = False,
+    static_head_sample=None,
+    photon_response=None,
     print_fn=print,
 ):
     """Persist W0_qmunu + q=0 head scalars to the ISDF restart file.
@@ -534,6 +536,16 @@ def persist_w0_and_head(
     was sampled at {0} and I am telling you so".  A caller that cannot
     make that statement still gets the refusal.
 
+    ``photon_response`` selects the produced screened charge block and its
+    q-parent capture when the packed operator owns the whole static Sigma.
+    Dynamic modes retain their existing charge body and probe-head receipt.
+    This happens only after the write policy and output-file preflight.
+
+    ``static_head_sample`` supplies an already resolved static receipt. The
+    packed-photon producer uses it with ``static_head_only`` because its
+    screened Gamma completion is embedded in CC: the additional screened
+    scalar is zero, while the bare scalar still completes the bare GW body.
+
     ``iteration_head`` is the QSGW map's resolved head sample set.  When it is
     present it is the sole source of the persisted head scalars; the DFT-basis
     ``head_resolver`` remains the bit-identical one-shot/default route.  A
@@ -549,6 +561,12 @@ def persist_w0_and_head(
         return
     if not os.path.exists(tensors_filename):
         return
+    from .gw_config import packed_photon_replaces_charge_sigma
+    if (photon_response is not None
+            and packed_photon_replaces_charge_sigma(config)):
+        from .w_isdf import photon_charge_for_restart
+        W_q, static_head_sample = photon_charge_for_restart(photon_response, meta)
+        static_head_only = True
     is_sc = (
         getattr(config, "qp_solver", None) is not None
         and getattr(config.qp_solver, "value", config.qp_solver)
@@ -569,7 +587,14 @@ def persist_w0_and_head(
             f"sc_head_update={_sc_head_update!r}; want: accepted QSGW map "
             "iteration_head samples; why: persisting self-consistent W with "
             "the DFT seed head would mix iteration provenances.")
-    head_static = None
+    if static_head_sample is not None:
+        if not static_head_only or abs(complex(static_head_sample.omega)) > 0.0:
+            raise ValueError(
+                "A supplied static head receipt requires static_head_only "
+                "and omega=0; refusing before restart mutation.")
+        if iteration_head is not None:
+            raise ValueError("Supply either a static or an iteration head receipt, not both.")
+    head_static = static_head_sample
     if iteration_head is not None:
         head_static = iteration_head.at(0.0 + 0.0j)
         if head_static.S_cart is None:
