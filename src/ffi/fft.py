@@ -1026,9 +1026,6 @@ def make_fused_conv_kpair(
 def make_fused_conv_kparent(mesh, kgrid, ns, trailing_shape, *,
                            perm_l, phase_l, perm_r, phase_r, centroid_major=False):
     """Convolve rank-5 local parents using typed maps, wraps and open-spin coefficients."""
-    # The ns=1/2 production gates require printed-digit identity with the XLA FFT.
-    if ns in (1, 2) and conv_kpair_mode() == "auto":
-        return None
     if CONV_KPARENT_GATE.resolve(mesh) is None:
         return None
     arm, _ = conv_kpair_plan(mesh, kgrid, ns, trailing_shape)
