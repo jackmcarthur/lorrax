@@ -36,7 +36,7 @@ def _haar(rng, n):
 
 def _fixture():
     rng = np.random.default_rng(20260829)
-    nk, nb, ns, ng = 2, 3, 4, 8
+    nk, nb, ns, ng = 2, 4, 4, 8
     grid = (3, 4, 2)
     ngrid = int(np.prod(grid))
     psi = (rng.standard_normal((nk, nb, ns, ng))
@@ -61,8 +61,8 @@ def test_qsgw_four_current_matches_the_shared_per_k_kernel():
     """Finite signed occupations weight rho and J identically in both plans."""
     _, psi, bidx, coords, grid = _fixture()
     mesh = resolve_mesh()
-    occ = np.asarray([[0.75, 0.30, -0.05],
-                      [0.65, 0.20, 0.00]], dtype=np.float64)
+    occ = np.asarray([[0.75, 0.30, -0.05, 0.0],
+                      [0.65, 0.20, 0.00, 0.0]], dtype=np.float64)
     weights = np.full(2, 0.5, dtype=np.float64)
     volume = 17.0
     got = np.asarray(rho_from_wfns(
@@ -73,7 +73,7 @@ def test_qsgw_four_current_matches_the_shared_per_k_kernel():
 
     expected = np.zeros((4, *grid), dtype=np.float64)
     for ik, xyz in enumerate(coords):
-        box = np.zeros((3, 4, *grid), dtype=np.complex128)
+        box = np.zeros((4, 4, *grid), dtype=np.complex128)
         box[:, :, xyz[:, 0], xyz[:, 1], xyz[:, 2]] = psi[ik]
         expected += np.asarray(valence_density_from_kpoint(
             jnp.asarray(box), nocc=None, weight=weights[ik],
@@ -88,14 +88,14 @@ def test_equal_occupation_unitary_preserves_the_whole_four_current():
     """A degenerate occupied gauge rotates neither charge nor spatial J."""
     rng, psi, bidx, _, grid = _fixture()
     mesh = resolve_mesh()
-    occ = np.asarray([[0.7, 0.7, 0.0], [0.7, 0.7, 0.0]])
+    occ = np.asarray([[0.7, 0.7, 0.0, 0.0], [0.7, 0.7, 0.0, 0.0]])
     weights = np.full(2, 0.5)
     psi_j = _put(psi, mesh, band_sphere_spec())
     kw = dict(mesh=mesh, box_index=bidx, fft_grid=grid,
               cell_volume=17.0, spin_degeneracy=1.0,
               include_dirac_current=True, charge_nspinor=2)
     baseline = np.asarray(rho_from_wfns(psi_j, occ, weights, **kw))
-    rotations = np.stack([np.eye(3, dtype=np.complex128) for _ in range(2)])
+    rotations = np.stack([np.eye(4, dtype=np.complex128) for _ in range(2)])
     for ik in range(2):
         rotations[ik, :2, :2] = _haar(rng, 2)
     rotated = np.asarray(rho_from_wfns(
@@ -109,9 +109,9 @@ def test_complex_nontrivial_rotation_matches_explicit_orbitals():
     """The inline scan rotation matches the column-convention reference."""
     rng, psi, bidx, _, grid = _fixture()
     mesh = resolve_mesh()
-    occ = np.asarray([[0.85, 0.35, 0.05], [0.70, 0.20, -0.03]])
+    occ = np.asarray([[0.85, 0.35, 0.05, 0.0], [0.70, 0.20, -0.03, 0.0]])
     weights = np.full(2, 0.5)
-    rotations = np.stack([_haar(rng, 3) for _ in range(2)])
+    rotations = np.stack([_haar(rng, 4) for _ in range(2)])
     psi_rotated = np.einsum(
         "kmn,kmsg->knsg", rotations, psi, optimize=True)
     kw = dict(mesh=mesh, box_index=bidx, fft_grid=grid,

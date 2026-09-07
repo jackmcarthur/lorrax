@@ -60,3 +60,28 @@ def test_unreduced_file_output_keeps_authenticated_file_rows():
     result = sigma_table_to_file_wedge(view, values,
         source_kset=SIGMA_KSET_FULL_BZ, file_sym=source)
     np.testing.assert_array_equal(result, [[10., 20.], [30., 40.]])
+
+
+def test_hartree_trivial_view_weights_match_selected_rows(monkeypatch):
+    """An IBZ file supplies normalized full-grid weights to a trivial-view rebuild."""
+    import pytest
+    from gw import sc_iteration, efermi
+    source = _source_symmetry()
+    view = source.trivial_view()
+    wfn = SimpleNamespace(nkpts=2, kweights=np.array([1/3, 2/3]),
+                          symmetry=lambda: source)
+    inputs = SimpleNamespace(wfn=wfn, sym=view, material_class="semiconductor",
+                             meta=SimpleNamespace(nelec=1))
+    monkeypatch.setattr(sc_iteration, "_dft_psi_sphere",
+                        lambda _: (np.zeros((3, 2, 4, 1)), None))
+    class ReachedOccupations(Exception):
+        pass
+    def check(energies, weights, nelec):
+        assert weights.shape == energies.shape[:1] == (len(view.kirr_fullids),)
+        np.testing.assert_allclose(weights, np.full(3, 1/3))
+        assert np.isclose(weights.sum(), 1.0)
+        raise ReachedOccupations
+    monkeypatch.setattr(efermi, "fermi_level_step", check)
+    with pytest.raises(ReachedOccupations):
+        sc_iteration.rebuild_hartree_dft_basis(
+            inputs, np.broadcast_to(np.eye(2), (3, 2, 2)), np.zeros((3, 2)))

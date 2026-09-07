@@ -2130,7 +2130,11 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
 
     psi_G, bidx = _dft_psi_sphere(inputs)
     nk, nb = int(psi_G.shape[0]), int(psi_G.shape[1])
-    kweights = np.asarray(inputs.wfn.kweights, dtype=np.float64)
+    from centroid.sampling_metric import full_k_quadrature_weights
+    kweights = (full_k_quadrature_weights(inputs.wfn, inputs.wfn.symmetry())
+                if inputs.sym.parent_k_domain == "full_bz" else
+                np.asarray(inputs.wfn.kweights, dtype=np.float64))
+    kweights = kweights / kweights.sum()
     rows = jnp.asarray(inputs.sym.kirr_fullids, dtype=jnp.int32)
     U_qp = jnp.take(U_qp, rows, axis=0)
     E_qp_ry = jnp.take(E_qp_ry, rows, axis=0)
