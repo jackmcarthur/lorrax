@@ -1,5 +1,6 @@
 """Hostile provenance and finalized-payload gates for MPA artifacts."""
 
+
 import ast
 import json
 from pathlib import Path
@@ -10,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from file_io import restart_bundle as _bundle_reader
 from file_io import mpa_store
 from gw.mpa import fit_driver, model, sigma
 
@@ -206,7 +208,7 @@ def test_explicit_identity_refuses_missing_and_wrong_wfn(tmp_path):
     missing = tmp_path / "missing_identity.h5"
     _finalized_fit(missing)
     with pytest.raises(ValueError, match="wfn_fingerprint_scheme"):
-        mpa_store.validate_fit_store(
+        _bundle_reader.validate_fit_store(
             missing, expected_identity={
                 "wfn_fingerprint_scheme": _SCHEME,
                 "wfn_fingerprint": "current-wfn",
@@ -218,12 +220,12 @@ def test_explicit_identity_refuses_missing_and_wrong_wfn(tmp_path):
         "wfn_fingerprint": "source-a",
     })
     with pytest.raises(ValueError, match="wfn_fingerprint"):
-        mpa_store.validate_fit_store(
+        _bundle_reader.validate_fit_store(
             stamped, expected_identity={
                 "wfn_fingerprint_scheme": _SCHEME,
                 "wfn_fingerprint": "source-b",
             })
-    ledger = mpa_store.validate_fit_store(
+    ledger = _bundle_reader.validate_fit_store(
         stamped, expected_identity={
             "wfn_fingerprint_scheme": _SCHEME,
             "wfn_fingerprint": "source-a",
@@ -249,7 +251,7 @@ def test_finalized_fit_refuses_short_or_wrong_dtype_pole_payload(
         h5.create_dataset(dataset_name, shape=shape, dtype=dtype)
 
     with pytest.raises(ValueError, match=message):
-        mpa_store.validate_fit_store(path)
+        _bundle_reader.validate_fit_store(path)
 
 
 def test_streamed_nonfinite_pole_slab_refuses_before_planning():

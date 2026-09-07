@@ -23,6 +23,7 @@ much as imports the ladder helper.
 
 from __future__ import annotations
 
+
 import ast
 import os
 import pathlib
@@ -961,12 +962,13 @@ def test_the_mpa_fit_store_carries_the_tag_and_the_consumer_asserts_it():
     the axis existed" and "written by the RPA path" are different facts.
     """
     import inspect
+    from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store
     from gw.mpa import model, sigma
 
     assert '"screening_diagrams": diagrams' in inspect.getsource(
         model.build_mpa_fit)
-    validate = inspect.getsource(mpa_store.validate_fit_store)
+    validate = inspect.getsource(_bundle_reader.validate_fit_store)
     assert "expected_screening_diagrams" in validate
     assert "carries no screening_diagrams stamp" in validate
     assert "expected_screening_diagrams=expected_screening_diagrams" in \

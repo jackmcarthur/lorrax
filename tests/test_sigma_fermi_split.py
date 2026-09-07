@@ -437,7 +437,7 @@ def test_mpa_head_occupation_preflight_precedes_the_body_sweep():
     from gw.sigma_dispatch import _compute_mpa_sigma
 
     mpa = inspect.getsource(_compute_mpa_sigma)
-    assert mpa.index("head = mpa_store.read_head_fit_collective") < mpa.index(
+    assert mpa.index("head = _bundle_reader.read_head_fit_collective") < mpa.index(
         "body = compute_sigma_c_mpa_omega_grid")
 
 

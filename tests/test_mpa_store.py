@@ -29,6 +29,7 @@ checkpoint's format layer and nothing else.
 
 from __future__ import annotations
 
+
 import inspect
 import os
 import sys
@@ -43,6 +44,7 @@ pytest.importorskip("symmetry_maps.qirr_store")
 from symmetry_maps import verify_centroid_orbit_closure           # noqa: E402
 from symmetry_maps import qirr_store as QS                        # noqa: E402
 
+from file_io import restart_bundle as _bundle_reader
 from file_io import mpa_store as MS                               # noqa: E402
 from gw.mpa import tiling                                         # noqa: E402
 from tests._mpa_test_geometry import (                            # noqa: E402
@@ -194,7 +196,7 @@ def test_every_frequency_slab_round_trips_bit_identically(tmpdir_path):
     """
     W, _, _, _, _, _ = _write_w(tmpdir_path)
     for i in range(W.shape[0]):
-        got, hdr = MS.read_w_slab(tmpdir_path, "W_qmunu_omega", i)
+        got, hdr = _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", i)
         assert np.array_equal(got, W[i]), f"slab {i} is not bit-identical"
         _assert_offdiag_elementwise(got, W[i], f"slab {i}")
         assert hdr["n_omega"] == W.shape[0]
@@ -353,7 +355,7 @@ def _partial_fit_for_resume(path):
 
 
 def _validate_partial_fit(path, provenance, schedule):
-    return MS.validate_fit_store_for_resume(
+    return _bundle_reader.validate_fit_store_for_resume(
         path, n_q=1, n_mu=4, n_p=1, energy_unit="Ry",
         grid_hash="grid", table_hash="table", centroid_hash="centroids",
         provenance=provenance, ordered_residues=False, schedule=schedule)
@@ -522,7 +524,7 @@ def test_collective_writer_keeps_large_bytes_behind_slabio(
         tmpdir_path, "W", 0, W, mesh_xy=mesh,
         global_shape=shape) is None
 
-    got, header = MS.read_w_slab(tmpdir_path, "W", 0)
+    got, header = _bundle_reader.read_w_slab(tmpdir_path, "W", 0)
     np.testing.assert_array_equal(got, W_host)
     assert header["data_ready"].tolist() == [True]
     assert header["n_ready"] == 1
@@ -580,7 +582,7 @@ def test_complete_pole_writer_preserves_2d_sharding_and_finalizes(
     assert ledger["n_done"] == ledger["n_total"] == 6
     assert ledger["condition_max"] == ledger["backward_error_max"] == 0.0
     assert ledger["provenance"]["fit_protocol"] == "synthetic_algebraic"
-    got_Omega, got_B = MS.read_poles(tmpdir_path)
+    got_Omega, got_B = _bundle_reader.read_poles(tmpdir_path)
     np.testing.assert_array_equal(got_Omega, Omega[..., :3, :3])
     np.testing.assert_array_equal(got_B, B[..., :3, :3])
     writes = [row for row in calls if row[0] == "write"]
@@ -614,7 +616,7 @@ def test_complete_pole_writer_round_trips_ordered_residues(
                        "backward_error_max_allowed": 1.0})
 
     assert ledger["ordered_residues"] is True
-    got_Omega, got_B, got_D = MS.read_poles(tmpdir_path, include_odd=True)
+    got_Omega, got_B, got_D = _bundle_reader.read_poles(tmpdir_path, include_odd=True)
     np.testing.assert_array_equal(got_Omega, Omega)
     np.testing.assert_array_equal(got_B, B)
     np.testing.assert_array_equal(got_D, D)
@@ -714,7 +716,7 @@ def test_collective_reader_keeps_one_frequency_slab_sharded(
 
     import file_io.slab_io as slab_io
     monkeypatch.setattr(slab_io, "SlabIO", RecordingSlabIO)
-    got, header = MS.read_w_slab_collective(
+    got, header = _bundle_reader.read_w_slab_collective(
         tmpdir_path, "W_qmunu_omega", 1, mesh_xy=_mesh())
     np.testing.assert_array_equal(np.asarray(got), W[1])
     assert header["data_ready"][1]
@@ -725,7 +727,7 @@ def test_w_column_reader_holds_one_handle_and_preserves_ragged_bytes(
         tmpdir_path, monkeypatch):
     """One epoch handle serves full and short-final column selections."""
     W, _, _, n_mu, _, _ = _write_w(tmpdir_path)
-    header = MS.read_w_header(tmpdir_path, "W_qmunu_omega")
+    header = _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")
     calls = []
 
     class RecordingSlabIO(HostSlabIO):
@@ -749,7 +751,7 @@ def test_w_column_reader_holds_one_handle_and_preserves_ragged_bytes(
     ragged_tile = 3 * 6 * n_mu * MS.COMPLEX128_BYTES
     budget = MS.choose_column_budget(n_mu, 6, ragged_tile)
     assert budget > 1 and n_mu % budget
-    with MS.open_w_column_reader(
+    with _bundle_reader.open_w_column_reader(
             tmpdir_path, mesh_xy=mesh,
             headers={"W_qmunu_omega": header}) as reader:
         first = reader.read(
@@ -780,7 +782,7 @@ def test_ordered_w_components_share_one_reader_handle(
     negative, _, _, _, _, _ = _write_w(
         tmpdir_path, name="W_minus", seed=29)
     headers = {
-        name: MS.read_w_header(tmpdir_path, name)
+        name: _bundle_reader.read_w_header(tmpdir_path, name)
         for name in ("W_plus", "W_minus")
     }
     calls = []
@@ -803,7 +805,7 @@ def test_ordered_w_components_share_one_reader_handle(
     monkeypatch.setattr(slab_io, "SlabIO", RecordingSlabIO)
     width = MS.choose_column_budget(n_mu, 12)
     cols = np.arange(width)
-    with MS.open_w_column_reader(
+    with _bundle_reader.open_w_column_reader(
             tmpdir_path, mesh_xy=_mesh(), headers=headers) as reader:
         got_positive = reader.read(
             "W_plus", 2, cols, n_cols_buffer=width,
@@ -825,7 +827,7 @@ def test_ordered_w_components_share_one_reader_handle(
 def test_w_column_reader_closes_collectively_on_exception(
         tmpdir_path, monkeypatch):
     _write_w(tmpdir_path)
-    header = MS.read_w_header(tmpdir_path, "W_qmunu_omega")
+    header = _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")
     closes = []
 
     class RecordingSlabIO(HostSlabIO):
@@ -837,7 +839,7 @@ def test_w_column_reader_closes_collectively_on_exception(
     import file_io.slab_io as slab_io
     monkeypatch.setattr(slab_io, "SlabIO", RecordingSlabIO)
     with pytest.raises(RuntimeError, match="synthetic fit failure"):
-        with MS.open_w_column_reader(
+        with _bundle_reader.open_w_column_reader(
                 tmpdir_path, mesh_xy=_mesh(),
                 headers={"W_qmunu_omega": header}):
             raise RuntimeError("synthetic fit failure")
@@ -862,7 +864,7 @@ def test_collective_reader_reconstructs_the_product_padded_mu_carrier(
         "n_mu": 2070,
         "data_ready": np.asarray([True]),
     }
-    monkeypatch.setattr(MS, "read_w_header", lambda *_args, **_kw: header)
+    monkeypatch.setattr(_bundle_reader, "read_w_header", lambda *_args, **_kw: header)
     calls = []
     sentinel = object()
 
@@ -890,7 +892,7 @@ def test_collective_reader_reconstructs_the_product_padded_mu_carrier(
     monkeypatch.setattr(slab_io, "SlabIO", RecordingSlabIO)
     mesh = SimpleNamespace(axis_names=("x", "y"), shape={"x": 6, "y": 6})
 
-    got, got_header = MS.read_w_slab_collective(
+    got, got_header = _bundle_reader.read_w_slab_collective(
         "samples.h5", "chi0_qmunu_z", 0, mesh_xy=mesh)
 
     assert got is sentinel
@@ -934,13 +936,13 @@ def test_collective_writer_refuses_partial_slab_before_readiness(
 def test_a_single_q_of_a_slab_is_the_same_bytes(tmpdir_path):
     W, _, _, _, _, _ = _write_w(tmpdir_path)
     for iq in range(_N_Q_IBZ):
-        got, _ = MS.read_w_slab(tmpdir_path, "W_qmunu_omega", 2, q=iq)
+        got, _ = _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 2, q=iq)
         assert np.array_equal(got, W[2, iq])
 
 
 def test_the_header_reports_the_grid_and_the_protocol(tmpdir_path):
     _, _, _, _, omega, line = _write_w(tmpdir_path)
-    hdr = MS.read_w_header(tmpdir_path, "W_qmunu_omega")
+    hdr = _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")
     assert np.array_equal(hdr["omega"], omega)
     assert np.array_equal(hdr["omega_line"], line)
     assert hdr["omega_units"] == "Ha"
@@ -987,7 +989,7 @@ def test_the_leading_axis_is_removable(tmpdir_path):
                          closure_verdict=verdict,
                          provenance={"deck": "synthetic-glide"})
 
-    got, _ = MS.read_w_slab(tmpdir_path, "W_qmunu_omega", slab)
+    got, _ = _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", slab)
     ref, _ = QS.read_tensor(v1, "W0_qmunu", unfold=False)
     assert np.array_equal(got, ref), (
         "the frequency slab is not the bytes a frequency-free file holds")
@@ -1033,11 +1035,11 @@ def test_an_unstamped_frequency_slab_refuses(tmpdir_path):
     W, _, _, _, _, _ = _write_w(tmpdir_path, n_omega=4, ready=True)
     MS.write_w_slab(tmpdir_path, "W_qmunu_omega", 1, W[1], ready=False)
 
-    MS.read_w_slab(tmpdir_path, "W_qmunu_omega", 0)                # TWIN
+    _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 0)                # TWIN
     with pytest.raises(ValueError, match="data_ready bit is False"):
-        MS.read_w_slab(tmpdir_path, "W_qmunu_omega", 1)
+        _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 1)
     # Announced, the placeholder is inspectable.
-    got, hdr = MS.read_w_slab(tmpdir_path, "W_qmunu_omega", 1,
+    got, hdr = _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 1,
                               require_ready=False)
     assert np.array_equal(got, W[1])
     assert hdr["n_ready"] == 3
@@ -1054,11 +1056,11 @@ def test_the_readiness_scalar_must_agree_with_the_ledger(tmpdir_path):
     """
     W, _, _, _, _, _ = _write_w(tmpdir_path, n_omega=4)
     MS.write_w_slab(tmpdir_path, "W_qmunu_omega", 2, W[2], ready=False)
-    MS.read_w_header(tmpdir_path, "W_qmunu_omega")                 # TWIN
+    _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")                 # TWIN
     with h5py.File(tmpdir_path, "a") as f:
         f["W_qmunu_omega"].attrs["qirr_data_ready"] = True
     with pytest.raises(ValueError, match="qirr_data_ready"):
-        MS.read_w_header(tmpdir_path, "W_qmunu_omega")
+        _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")
 
 
 # ---------------------------------------------------------------------------
@@ -1079,7 +1081,7 @@ def test_the_wedge_unfolds_per_frequency(tmpdir_path):
     W, tables, _, _, _, _ = _write_w(tmpdir_path)
     mesh = _mesh()
     for i in range(W.shape[0]):
-        got, hdr = MS.read_w_slab(tmpdir_path, "W_qmunu_omega", i,
+        got, hdr = _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", i,
                                   unfold=True, mesh_xy=mesh)
         assert got.shape == (_N_Q_FULL, W.shape[-1], W.shape[-1])
         want = _hand_unfold(W[i], tables)
@@ -1098,7 +1100,7 @@ def test_the_unfold_of_a_single_stored_q_refuses(tmpdir_path):
     """
     _write_w(tmpdir_path)
     with pytest.raises(ValueError, match="cannot unfold a single"):
-        MS.read_w_slab(tmpdir_path, "W_qmunu_omega", 0, q=1,
+        _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 0, q=1,
                        unfold=True, mesh_xy=None)
 
 
@@ -1166,11 +1168,11 @@ def test_a_column_request_that_busts_the_budget_refuses(tmpdir_path):
     _, _, _, n_mu, _, _ = _write_w(tmpdir_path, n_omega=6)
     budget = MS.choose_column_budget(n_mu, 6)
     assert budget >= 1
-    MS.read_w_columns(tmpdir_path, "W_qmunu_omega", 0,
+    _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0,
                       range(budget))                              # TWIN
     over = list(range(budget + 1))
     with pytest.raises(ValueError) as exc:
-        MS.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, over)
+        _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, over)
     msg = str(exc.value)
     assert "read_w_columns" in msg and "W_qmunu_omega" in msg
     cost = 6 * n_mu * len(over) * 16
@@ -1179,7 +1181,7 @@ def test_a_column_request_that_busts_the_budget_refuses(tmpdir_path):
     assert f"allows {budget}" in msg, msg
     # And the budget can be raised DELIBERATELY, which is the point of
     # refusing rather than clamping.
-    MS.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, over,
+    _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, over,
                       tile_bytes=4 * MS.one_tile_bytes(n_mu))
 
 
@@ -1195,11 +1197,11 @@ def test_read_w_columns_is_the_slab_read_transposed(tmpdir_path):
     budget = MS.choose_column_budget(n_mu, 6)
     for q in range(_N_Q_IBZ):
         cols = list(range(2, 2 + min(budget, 3)))
-        blk = MS.read_w_columns(tmpdir_path, "W_qmunu_omega", q, cols)
+        blk = _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", q, cols)
         assert blk.shape == (6, n_mu, len(cols))
         assert np.array_equal(blk, W[:, q][:, :, cols])
     scattered = [0, 3, n_mu - 1][:budget]
-    blk = MS.read_w_columns(tmpdir_path, "W_qmunu_omega", 1, scattered)
+    blk = _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 1, scattered)
     assert np.array_equal(blk, W[:, 1][:, :, scattered])
 
 
@@ -1213,11 +1215,11 @@ def test_read_w_columns_refuses_a_half_filled_grid(tmpdir_path):
     most expensive form.
     """
     W, _, _, n_mu, _, _ = _write_w(tmpdir_path, n_omega=6)
-    MS.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1])     # TWIN
+    _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1])     # TWIN
     MS.write_w_slab(tmpdir_path, "W_qmunu_omega", 4, W[4], ready=False)
     with pytest.raises(ValueError, match="frequency slabs are not ready"):
-        MS.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1])
-    blk = MS.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
+        _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1])
+    blk = _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
                             require_ready=False)
     assert blk.shape == (6, n_mu, 2)
 
@@ -1236,15 +1238,15 @@ def test_the_column_block_is_sharded_on_rows_only(tmpdir_path):
     _write_w(tmpdir_path, n_omega=6)
     ok = tiling.row_shard_spec()
     assert ok == (None, "x", None)
-    MS.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
+    _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
                       out_spec=ok)                                 # TWIN
     for bad in ((None, "x", "y"), ("x", "y", None), (None, None, "y"),
                 ("x", None, None)):
         with pytest.raises(ValueError, match="ROW AXIS"):
-            MS.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
+            _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
                               out_spec=bad)
     with pytest.raises(ValueError, match="three entries"):
-        MS.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
+        _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
                           out_spec=(None, "x"))
 
 
@@ -1333,7 +1335,7 @@ def test_the_frequency_attr_and_the_version_must_agree(tmpdir_path):
     with h5py.File(tmpdir_path, "a") as f:
         del f["W_qmunu_omega"].attrs[MS._FREQ_ATTR]
     with pytest.raises(ValueError, match="mpa_freq_axis"):
-        MS.read_w_header(tmpdir_path, "W_qmunu_omega")
+        _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")
 
 
 def test_the_frequency_stamp_refuses_a_rank_3_dataset(tmpdir_path):
@@ -1355,11 +1357,11 @@ def test_the_frequency_stamp_refuses_a_rank_3_dataset(tmpdir_path):
 def test_the_shape_wins_the_argument_about_n_omega(tmpdir_path):
     """RED: the SHAPE is the discriminant, the attr is its cross-check."""
     _write_w(tmpdir_path, n_omega=4)
-    MS.read_w_header(tmpdir_path, "W_qmunu_omega")                 # TWIN
+    _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")                 # TWIN
     with h5py.File(tmpdir_path, "a") as f:
         f["W_qmunu_omega"].attrs["mpa_n_omega"] = np.int64(3)
     with pytest.raises(ValueError, match="mpa_n_omega=3"):
-        MS.read_w_header(tmpdir_path, "W_qmunu_omega")
+        _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")
 
 
 def test_a_half_stamped_version_2_file_refuses(tmpdir_path):
@@ -1372,11 +1374,11 @@ def test_a_half_stamped_version_2_file_refuses(tmpdir_path):
     invisible to every shape check there is.
     """
     _write_w(tmpdir_path, n_omega=4)
-    MS.read_w_header(tmpdir_path, "W_qmunu_omega")                 # TWIN
+    _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")                 # TWIN
     with h5py.File(tmpdir_path, "a") as f:
         del f["W_qmunu_omega"].attrs["mpa_alpha"]
     with pytest.raises(ValueError, match=r"missing \['mpa_alpha'\]"):
-        MS.read_w_header(tmpdir_path, "W_qmunu_omega")
+        _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")
 
 
 def test_a_tampered_omega_grid_refuses(tmpdir_path):
@@ -1388,14 +1390,14 @@ def test_a_tampered_omega_grid_refuses(tmpdir_path):
     wrong in a way no shape check can see.
     """
     _write_w(tmpdir_path, n_omega=4)
-    MS.read_w_header(tmpdir_path, "W_qmunu_omega")                 # TWIN
+    _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")                 # TWIN
     with h5py.File(tmpdir_path, "a") as f:
         g = f["W_qmunu_omega" + MS.MPA_GROUP_SUFFIX]
         w = g["omega"][()]
         w[2] += 1e-9
         g["omega"][...] = w
     with pytest.raises(ValueError, match="ω-grid hash mismatch"):
-        MS.read_w_header(tmpdir_path, "W_qmunu_omega")
+        _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")
 
 
 def test_the_protocol_moves_the_grid_hash_even_at_a_fixed_grid():
@@ -1459,17 +1461,17 @@ def test_the_pad_is_reconstructed_by_the_reader_not_stored(tmpdir_path):
     zero; and the logical block is bit-identical to the unpadded read.
     """
     W, _, _, n_mu, _, _ = _write_w(tmpdir_path, n_omega=4)
-    hdr = MS.read_w_header(tmpdir_path, "W_qmunu_omega")
+    hdr = _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")
     assert hdr["n_rmu_logical"] == n_mu == hdr["n_mu"]
 
-    padded, _ = MS.read_w_slab(tmpdir_path, "W_qmunu_omega", 1,
+    padded, _ = _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 1,
                                n_mu_padded=n_mu + 5)
     assert padded.shape == (_N_Q_IBZ, n_mu + 5, n_mu + 5)
     assert np.array_equal(padded[:, :n_mu, :n_mu], W[1])
     assert not padded[:, n_mu:, :].any()
     assert not padded[:, :, n_mu:].any()
 
-    blk = MS.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
+    blk = _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0, 1],
                             n_mu_padded=n_mu + 5)
     assert blk.shape == (4, n_mu + 5, 2), (
         "the ROW axis takes the pad; the columns are a selection the "
@@ -1482,10 +1484,10 @@ def test_padding_down_refuses(tmpdir_path):
     """RED: the pad only ever grows the extent."""
     _, _, _, n_mu, _, _ = _write_w(tmpdir_path, n_omega=4)
     with pytest.raises(ValueError, match="pad DOWN"):
-        MS.read_w_slab(tmpdir_path, "W_qmunu_omega", 0,
+        _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 0,
                        n_mu_padded=n_mu - 1)
     with pytest.raises(ValueError, match="pad the row axis DOWN"):
-        MS.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0],
+        _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", 0, [0],
                           n_mu_padded=n_mu - 1)
 
 
@@ -1629,7 +1631,7 @@ def test_fit_io_receipt_handles_both_body_completion_interruption_windows(
     replacement = _fit_io_report(blocks_walked=len(steps))
     preserved = MS.write_fit_io_receipt(tmpdir_path, replacement)
     assert preserved == first
-    assert MS.read_fit_io_receipt(tmpdir_path) == first
+    assert _bundle_reader.read_fit_io_receipt(tmpdir_path) == first
 
     MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     with pytest.raises(ValueError, match="before root COMPLETE"):
@@ -1649,7 +1651,7 @@ def test_fit_io_receipt_refuses_wrong_census_and_poisoned_ready_schema(
     with h5py.File(tmpdir_path, "a") as h5:
         h5[MS.MPA_FIT_IO_RECEIPT_SUFFIX].attrs["unexpected"] = 1
     with pytest.raises(ValueError, match="exact schema"):
-        MS.read_fit_io_receipt(tmpdir_path)
+        _bundle_reader.read_fit_io_receipt(tmpdir_path)
 
 
 def _poison_fit_io_report(report, poison):
@@ -1700,7 +1702,7 @@ def test_fit_io_receipt_ready_incumbent_refuses_plausible_poison(
             receipt.attrs["count_" + key] = poisoned[key]
         receipt.attrs["ordered_residues"] = poisoned["ordered_residues"]
     with pytest.raises(ValueError, match=match):
-        MS.read_fit_io_receipt(tmpdir_path)
+        _bundle_reader.read_fit_io_receipt(tmpdir_path)
 
 
 def test_b_and_omega_round_trip_with_condition_payload_intact(tmpdir_path):
@@ -1716,7 +1718,7 @@ def test_b_and_omega_round_trip_with_condition_payload_intact(tmpdir_path):
     MS.finalize_fit_store(
         tmpdir_path, certification=dict(_CERT, condition_max_allowed=1e8))
     for (q, lo, hi), (Om, Bp, diag) in truth.items():
-        gOm, gBp, gdiag, ledger = MS.read_fit_block(
+        gOm, gBp, gdiag, ledger = _bundle_reader.read_fit_block(
             tmpdir_path, q, list(range(lo, hi)))
         assert np.array_equal(gOm, Om), (q, lo, hi)
         assert np.array_equal(gBp, Bp), (q, lo, hi)
@@ -1724,7 +1726,7 @@ def test_b_and_omega_round_trip_with_condition_payload_intact(tmpdir_path):
         assert set(gdiag) == {"condition"}
         assert ledger["complete"]
 
-    Om, Bp, diag, ledger = MS.read_fit_tensors(tmpdir_path)
+    Om, Bp, diag, ledger = _bundle_reader.read_fit_tensors(tmpdir_path)
     assert Om.shape == (3, 2, 6, 6) and Bp.shape == Om.shape
     assert set(diag) == {"condition"}
     assert ledger["n_done"] == ledger["n_total"] == 2 * 6
@@ -1763,7 +1765,7 @@ def test_pole_slice_owns_units_and_the_existing_q_unfold_tables(tmpdir_path):
     assert ledger["q_storage"] == "ibz"
     assert ledger["n_q_full"] == tables.n_q_full
     assert ledger["table_hash"] == tables.canonical().digest()
-    Om, Bp = MS.read_poles(tmpdir_path, pole_slice=0, to_unit="Ry")
+    Om, Bp = _bundle_reader.read_poles(tmpdir_path, pole_slice=0, to_unit="Ry")
     Om, Bp = Om[0], Bp[0]
     np.testing.assert_array_equal(Om, 2.0 * (0.7 - 0.1j))
     np.testing.assert_array_equal(Bp, 2.0 * (0.2 + 0.3j))
@@ -1782,7 +1784,7 @@ def test_scalar_head_fit_round_trip_units_and_readiness(tmpdir_path):
         fit_condition=17.0, fit_backward_error=2.0e-12,
         fit_max_abs_residual=4.0e-8, model="fixed_dft_gn")
 
-    got = MS.read_head_fit(tmpdir_path, to_unit="Ry")
+    got = _bundle_reader.read_head_fit(tmpdir_path, to_unit="Ry")
     np.testing.assert_array_equal(got["sample_z"], 2.0 * z)
     np.testing.assert_array_equal(got["sample_Wc"], wc)
     np.testing.assert_array_equal(got["Omega_p"], 2.0 * poles)
@@ -1798,7 +1800,7 @@ def test_scalar_head_fit_round_trip_units_and_readiness(tmpdir_path):
     with h5py.File(tmpdir_path, "a") as f:
         f[MS.MPA_HEAD_SUFFIX].attrs["ready"] = False
     with pytest.raises(ValueError, match="NOT READY"):
-        MS.read_head_fit(tmpdir_path)
+        _bundle_reader.read_head_fit(tmpdir_path)
 
 
 @pytest.mark.parametrize("solve", ("loewner", "companion", "thiele"))
@@ -1849,7 +1851,7 @@ def test_resume_paths_transfer_serial_readers_before_collective_writers():
     assert validate < pre_allocate < allocate < final_headers < pre_return
 
     slab = inspect.getsource(MS.write_w_slab_collective)
-    header = slab.index("header = read_w_header")
+    header = slab.index("header = _bundle_reader.read_w_header")
     handoff = slab.index('barrier("mpa_w_slab_header_readers_closed")')
     writer = slab.index("with SlabIO", handoff)
     assert header < handoff < writer
@@ -1946,11 +1948,11 @@ def test_sigma_fit_contract_exposes_identity_and_enforces_certificate(
     assert ledger["w_table_hash"] == "table"
     assert ledger["w_centroid_hash"] == "centroids"
     assert ledger["provenance"]["solver"] == "unit-test"
-    MS.validate_fit_store(tmpdir_path, expected_identity={
+    _bundle_reader.validate_fit_store(tmpdir_path, expected_identity={
         "w_grid_hash": "grid", "w_table_hash": "table",
         "w_centroid_hash": "centroids"})
     with pytest.raises(ValueError, match="identity mismatch"):
-        MS.validate_fit_store(
+        _bundle_reader.validate_fit_store(
             tmpdir_path, expected_identity={"w_grid_hash": "wrong"})
 
 
@@ -1989,7 +1991,7 @@ def test_finalize_refuses_a_store_sigma_could_never_read(tmpdir_path):
     assert ledger["complete"]
     assert ledger["certification"]["condition_max_allowed"] == \
         _CERT["condition_max_allowed"]
-    assert MS.validate_fit_store(tmpdir_path)["complete"]
+    assert _bundle_reader.validate_fit_store(tmpdir_path)["complete"]
 
 
 def test_sigma_still_refuses_an_uncertified_store_it_finds_on_disk(
@@ -2006,7 +2008,7 @@ def test_sigma_still_refuses_an_uncertified_store_it_finds_on_disk(
     with h5py.File(tmpdir_path, "a") as f:      # the old writer's stamp
         f.attrs["mpa_fit_complete"] = True
     with pytest.raises(ValueError, match="requires certified pole fits"):
-        MS.validate_fit_store(tmpdir_path)
+        _bundle_reader.validate_fit_store(tmpdir_path)
 
 
 def test_an_unfinalized_store_is_readable_only_through_the_announced_door(
@@ -2022,16 +2024,16 @@ def test_an_unfinalized_store_is_readable_only_through_the_announced_door(
     """
     truth, steps = _staged_fit(tmpdir_path, stop_after=4)
     with pytest.raises(ValueError, match="NOT FINALIZED"):
-        MS.read_fit_tensors(tmpdir_path)
+        _bundle_reader.read_fit_tensors(tmpdir_path)
     with pytest.raises(ValueError, match="NOT FINALIZED"):
-        MS.read_fit_block(tmpdir_path, 0, [0, 1])
+        _bundle_reader.read_fit_block(tmpdir_path, 0, [0, 1])
 
-    Om, Bp, diag, ledger = MS.read_fit_tensors(tmpdir_path,
+    Om, Bp, diag, ledger = _bundle_reader.read_fit_tensors(tmpdir_path,
                                                allow_partial=True)
     assert not ledger["complete"]
     assert ledger["n_done"] == 4 * 2
     (q, lo, hi) = steps[0]
-    gOm, _, _, _ = MS.read_fit_block(tmpdir_path, q, list(range(lo, hi)),
+    gOm, _, _, _ = _bundle_reader.read_fit_block(tmpdir_path, q, list(range(lo, hi)),
                                      allow_partial=True)
     assert np.array_equal(gOm, truth[(q, lo, hi)][0])
 
@@ -2039,7 +2041,7 @@ def test_an_unfinalized_store_is_readable_only_through_the_announced_door(
     # "the file is incomplete" and "the columns you asked for are
     # incomplete" are different facts.
     with pytest.raises(ValueError, match="are not fitted"):
-        MS.read_fit_block(tmpdir_path, 1, [4, 5], allow_partial=True)
+        _bundle_reader.read_fit_block(tmpdir_path, 1, [4, 5], allow_partial=True)
 
 
 def test_finalize_flips_the_gate_and_names_the_gaps(tmpdir_path):
@@ -2063,7 +2065,7 @@ def test_finalize_flips_the_gate_and_names_the_gaps(tmpdir_path):
                            diag)
     ledger = MS.finalize_fit_store(tmpdir_path, certification=_CERT)
     assert ledger["complete"] and ledger["finalized_utc"]
-    MS.read_fit_tensors(tmpdir_path)
+    _bundle_reader.read_fit_tensors(tmpdir_path)
 
 
 def test_a_second_finalize_refuses(tmpdir_path):
@@ -2101,12 +2103,12 @@ def test_a_scattered_column_block_writes_and_reads_the_same_bytes(
     assert ledger["blocks_done"][0].tolist() == [1, 0, 0, 1, 0, 1]
     assert ledger["journal"].tolist() == [[0, 0, 6]], (
         "the journal records the SPAN; blocks_done records the truth")
-    gOm, gBp, gdiag, _ = MS.read_fit_block(tmpdir_path, 0, [0, 3, 5],
+    gOm, gBp, gdiag, _ = _bundle_reader.read_fit_block(tmpdir_path, 0, [0, 3, 5],
                                            allow_partial=True)
     assert np.array_equal(gOm, Om) and np.array_equal(gBp, Bp)
     assert np.array_equal(gdiag["condition"], diag["condition"])
     with pytest.raises(ValueError, match="are not fitted"):
-        MS.read_fit_block(tmpdir_path, 0, [1, 2], allow_partial=True)
+        _bundle_reader.read_fit_block(tmpdir_path, 0, [1, 2], allow_partial=True)
 
 
 def test_a_block_written_twice_refuses(tmpdir_path):
@@ -2153,7 +2155,7 @@ def test_extra_diagnostics_are_validated_but_not_persisted(tmpdir_path):
     diag["n_poles_pruned"] = np.full((4, 4), 2.0)
     MS.write_fit_block(tmpdir_path, 0, list(range(4)), Om, Bp, diag)
     MS.finalize_fit_store(tmpdir_path, certification=_CERT)
-    _, _, got, _ = MS.read_fit_block(tmpdir_path, 0, list(range(4)))
+    _, _, got, _ = _bundle_reader.read_fit_block(tmpdir_path, 0, list(range(4)))
     assert set(got) == {"condition"}
     with h5py.File(tmpdir_path, "r") as f:
         assert "fit_n_poles_pruned" not in f
@@ -2167,7 +2169,7 @@ def test_ephemeral_diagnostics_may_change_without_changing_schema(tmpdir_path):
                        dict(diag, held_out=np.zeros((4, 2))))
     MS.write_fit_block(tmpdir_path, 0, [2, 3], Om, Bp, diag)
     MS.finalize_fit_store(tmpdir_path, certification=_CERT)
-    _, _, got, _ = MS.read_fit_tensors(tmpdir_path)
+    _, _, got, _ = _bundle_reader.read_fit_tensors(tmpdir_path)
     assert set(got) == {"condition"}
 
 
@@ -2247,7 +2249,7 @@ def test_a_tensor_without_its_omega_group_refuses(tmpdir_path):
     with h5py.File(tmpdir_path, "a") as f:
         del f["W_qmunu_omega" + MS.MPA_GROUP_SUFFIX]
     with pytest.raises(ValueError, match="carries no"):
-        MS.read_w_header(tmpdir_path, "W_qmunu_omega")
+        _bundle_reader.read_w_header(tmpdir_path, "W_qmunu_omega")
 
 
 def test_the_column_helpers_refuse_a_malformed_request(tmpdir_path):
@@ -2266,9 +2268,9 @@ def test_the_column_helpers_refuse_a_malformed_request(tmpdir_path):
     with pytest.raises(ValueError, match="empty"):
         MS.normalise_columns([], n_mu)
     with pytest.raises(IndexError, match="outside"):
-        MS.read_w_columns(tmpdir_path, "W_qmunu_omega", _N_Q_IBZ, [0])
+        _bundle_reader.read_w_columns(tmpdir_path, "W_qmunu_omega", _N_Q_IBZ, [0])
     with pytest.raises(IndexError, match="outside"):
-        MS.read_w_slab(tmpdir_path, "W_qmunu_omega", 99)
+        _bundle_reader.read_w_slab(tmpdir_path, "W_qmunu_omega", 99)
 
 
 def test_a_slab_of_the_wrong_shape_refuses(tmpdir_path):
@@ -2320,7 +2322,7 @@ def test_the_table_read_is_declared_to_the_registry(
                              where="test: SlabIO(mode='a')")
         try:
             with pytest.raises(RuntimeError) as exc:
-                MS.read_w_tables(tmpdir_path, "W_qmunu_omega")
+                _bundle_reader.read_w_tables(tmpdir_path, "W_qmunu_omega")
             msg = str(exc.value)
             assert "one-owner-per-file" in msg, msg
             assert "mpa_store.read_w_tables" in msg, msg
@@ -2329,7 +2331,7 @@ def test_the_table_read_is_declared_to_the_registry(
 
         # 2. THE JOURNAL.  The allowed read is COUNTED: the tables still
         #    come back from the format layer, and the open is on the line.
-        tables = MS.read_w_tables(tmpdir_path, "W_qmunu_omega")
+        tables = _bundle_reader.read_w_tables(tmpdir_path, "W_qmunu_omega")
         assert tables.canonical().digest()
         with open(J.journal_path()) as fh:
             lines = [ln for ln in fh.read().splitlines() if ln.strip()]

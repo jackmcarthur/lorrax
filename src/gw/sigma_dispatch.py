@@ -33,6 +33,7 @@ file write, QSGW build).
 
 from __future__ import annotations
 
+
 import os
 from dataclasses import dataclass, replace
 from functools import partial
@@ -1122,6 +1123,7 @@ def _compute_mpa_sigma(
         omit_v_h, print_fn, sig_h, sig_x, sigma_lorentz, sym, v_h_scalar, wfn, wfns,
         write_sigma_omega_h5):
     """Produce the MPA Sigma result with authenticated head and body inputs."""
+    from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store
     from .head_correction import compute_complex_pole_head_sigma_diag
     from .mpa.sigma import compute_sigma_c_mpa_omega_grid
@@ -1146,7 +1148,7 @@ def _compute_mpa_sigma(
     from .sigma_box_plan import resolve_sigma_box_cache_dir
     quadrature_cache_dir = resolve_sigma_box_cache_dir(
         config.sigma.quadrature_cache_dir, input_dir)
-    head = mpa_store.read_head_fit_collective(
+    head = _bundle_reader.read_head_fit_collective(
         fit_path, mesh_xy=mesh_xy, to_unit="Ry")
     compatible_occ_hashes = ()
     if occupation_state is not None:

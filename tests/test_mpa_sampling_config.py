@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import ast
 import os
 from pathlib import Path
@@ -299,6 +300,7 @@ def _occ_state(**over):
 
 
 def _tiny_fit_store(tmp_path, occupation_state):
+    from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store as MS
 
     dest = tmp_path / "fit.h5"
@@ -309,10 +311,11 @@ def _tiny_fit_store(tmp_path, occupation_state):
 
 
 def test_stamps_round_trip_through_the_fit_store(tmp_path):
+    from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store as MS
 
     dest = _tiny_fit_store(tmp_path, _occ_state())
-    stamps = MS.read_occupation_stamps(dest)
+    stamps = _bundle_reader.read_occupation_stamps(dest)
     assert stamps["occ_hash"] == "abc123def4567890"
     assert stamps["smearing_family"] == "mp1"
     assert stamps["smearing_width_ry"] == 0.02
@@ -321,6 +324,7 @@ def test_stamps_round_trip_through_the_fit_store(tmp_path):
 
 
 def test_a_mismatched_state_is_refused_with_the_field_named(tmp_path):
+    from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store as MS
 
     dest = _tiny_fit_store(tmp_path, _occ_state())
@@ -329,6 +333,7 @@ def test_a_mismatched_state_is_refused_with_the_field_named(tmp_path):
 
 
 def test_a_legacy_zero_pad_hash_is_accepted_only_when_reproduced(tmp_path):
+    from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store as MS
 
     legacy = _occ_state(occ_hash="legacy-p36")
@@ -342,6 +347,7 @@ def test_a_legacy_zero_pad_hash_is_accepted_only_when_reproduced(tmp_path):
 
 
 def test_an_unstamped_store_is_refused_at_a_metallic_reuse(tmp_path):
+    from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store as MS
 
     dest = _tiny_fit_store(tmp_path, None)
@@ -352,10 +358,11 @@ def test_an_unstamped_store_is_refused_at_a_metallic_reuse(tmp_path):
 def test_an_insulating_store_carries_no_occ_attrs(tmp_path):
     import h5py
 
+    from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store as MS
 
     dest = _tiny_fit_store(tmp_path, None)
-    assert MS.read_occupation_stamps(dest) is None
+    assert _bundle_reader.read_occupation_stamps(dest) is None
     banned = {"mpa_" + key for key in MS._OCC_STAMP_ORDER}
     with h5py.File(dest, "r") as f:
 
@@ -638,6 +645,7 @@ def _sampling_record(config, omega_max):
 
 
 def _stamped_store(path, record):
+    from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store as MS
 
     from tests._mpa_test_geometry import geometry
@@ -693,6 +701,7 @@ def test_an_undeclared_shift_leaves_the_store_byte_identical(tmp_path):
 def test_the_stamp_is_outside_the_omega_grid_digest():
     """Source-level pin of the same fact: ``_SAMPLING_ORDER`` is what the
     digest hashes, and the shift is deliberately not in it."""
+    from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store as MS
 
     assert "metal_origin_shift_ry" not in MS._SAMPLING_ORDER

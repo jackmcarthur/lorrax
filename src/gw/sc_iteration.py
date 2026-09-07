@@ -917,7 +917,11 @@ def _certified_seed_occupation_state(
             "certified metallic MPA reuse requires an entry occupation state")
 
     from file_io.mpa_store import (
-        assert_occupation_stamps, read_occupation_stamps)
+        assert_occupation_stamps,
+    )
+    from file_io.restart_bundle import (
+        read_occupation_stamps,
+    )
     from .efermi import assert_fixed_n, mp1_occupations
 
     stamps = read_occupation_stamps(certified_fit)

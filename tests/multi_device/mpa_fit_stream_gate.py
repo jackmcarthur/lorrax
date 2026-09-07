@@ -8,6 +8,7 @@ exercising the production four-pole plus one-pole tail reads.
 """
 from __future__ import annotations
 
+
 import os
 import sys
 
@@ -26,6 +27,7 @@ import numpy as np  # noqa: E402
 from jax.sharding import NamedSharding, PartitionSpec as P  # noqa: E402
 
 from common.collectives import barrier, process_count, process_rank, resolve_mesh  # noqa: E402
+from file_io import restart_bundle as _bundle_reader
 from file_io import mpa_store  # noqa: E402
 from gw.mpa import fit_driver, sampling  # noqa: E402
 from gw.ppm_tau_kernel import build_shared_w_tau  # noqa: E402
@@ -138,7 +140,7 @@ def main():
     # per-axis reader returned 6 while every canonical μ carrier was padded
     # to 8.  Assert the product-padded carrier and its exact-zero pad before
     # the fit's independently tiled column reader can hide the mismatch.
-    reloaded, _ = mpa_store.read_w_slab_collective(
+    reloaded, _ = _bundle_reader.read_w_slab_collective(
         sample_path, W_NAME, 0, mesh_xy=mesh)
     if tuple(reloaded.shape) != padded:
         _fail(f"full-slab reload shape {tuple(reloaded.shape)} != "
@@ -158,7 +160,7 @@ def main():
     widths = []
     t = np.float64(0.37)
     for lo, hi in ((0, 4), (4, 5)):
-        Omega, B = mpa_store.read_poles(
+        Omega, B = _bundle_reader.read_poles(
             fit_path, pole_slice=slice(lo, hi), mesh_xy=mesh,
             unfold=True, return_sharded=True)
         widths.append(int(Omega.shape[0]))

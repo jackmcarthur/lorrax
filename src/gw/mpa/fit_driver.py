@@ -43,12 +43,14 @@ protocol grid they were evaluated on is stamped beside them.
 
 from __future__ import annotations
 
+
 import functools
 import os
 import time
 
 import numpy as np
 
+from file_io import restart_bundle as _bundle_reader
 from file_io import mpa_store
 from gw.mpa import pade_fit, tiling
 
@@ -313,7 +315,7 @@ def fit_one_block(
     from common.collectives import device_put_process_local
 
     n = int(n_p)
-    hdr = mpa_store.read_w_header(w_src, w_name) if header is None else header
+    hdr = _bundle_reader.read_w_header(w_src, w_name) if header is None else header
     n_mu = int(hdr["n_mu"])
     cols = mpa_store.normalise_columns(mu_cols, n_mu)
     if n_cols_buffer is None:
@@ -321,7 +323,7 @@ def fit_one_block(
             n_mu, int(hdr["n_omega"]), tile_bytes)
     t_read = time.perf_counter()
     if w_reader is None:
-        block = mpa_store.read_w_columns_collective(
+        block = _bundle_reader.read_w_columns_collective(
             w_src, w_name, q, cols, mesh_xy=mesh_xy,
             n_cols_buffer=n_cols_buffer, tile_bytes=tile_bytes, header=hdr)
     else:
@@ -331,7 +333,7 @@ def fit_one_block(
     negative_block = block
     if w_negative_name is not None:
         if w_reader is None:
-            negative_block = mpa_store.read_w_columns_collective(
+            negative_block = _bundle_reader.read_w_columns_collective(
                 w_src, w_negative_name, q, cols, mesh_xy=mesh_xy,
                 n_cols_buffer=n_cols_buffer, tile_bytes=tile_bytes,
                 header=negative_header)
@@ -535,11 +537,11 @@ def run_fit_driver(
             np.sqrt(np.finfo(np.float64).eps)),
     }
     t_total = time.perf_counter()
-    header = mpa_store.read_w_header(w_src, w_name)
+    header = _bundle_reader.read_w_header(w_src, w_name)
     negative_header = None
     ordered = w_negative_name is not None
     if ordered:
-        negative_header = mpa_store.read_w_header(w_src, w_negative_name)
+        negative_header = _bundle_reader.read_w_header(w_src, w_negative_name)
     n_mu = header["n_mu"]
     n_omega = header["n_omega"]
     n_q = header["n_q_on_disk"]
@@ -590,7 +592,7 @@ def run_fit_driver(
     must_allocate = not os.path.exists(os.fspath(fit_dest))
     if not must_allocate:
         try:
-            ledger = mpa_store.validate_fit_store_for_resume(
+            ledger = _bundle_reader.validate_fit_store_for_resume(
                 fit_dest, n_q=n_q, n_mu=n_mu, n_p=n,
                 energy_unit=header["omega_units"],
                 grid_hash=header["grid_hash"],
@@ -623,7 +625,7 @@ def run_fit_driver(
             grid_hash=header["grid_hash"],
             table_hash=header["table_hash"],
             centroid_hash=header["centroid_hash"],
-            unfold_tables=mpa_store.read_w_tables(w_src, w_name),
+            unfold_tables=_bundle_reader.read_w_tables(w_src, w_name),
             provenance=fit_provenance,
             occupation_state=occupation_state,
             ordered_residues=ordered)
@@ -712,7 +714,7 @@ def run_fit_driver(
             report["seconds"]["write"] += (
                 time.perf_counter() - t_write_lifecycle)
             t_source_lifecycle = time.perf_counter()
-            w_reader = mpa_store.open_w_column_reader(
+            w_reader = _bundle_reader.open_w_column_reader(
                 w_src, mesh_xy=mesh_xy, headers=headers)
             report["seconds"]["source_open"] += (
                 time.perf_counter() - t_source_lifecycle)

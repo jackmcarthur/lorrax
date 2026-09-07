@@ -20,6 +20,7 @@ rather than the transport is what keeps the guard's semantics testable
 without one; the transport's own leg is the R6 run log's probe lines.
 """
 
+
 import os
 import tempfile
 
@@ -27,6 +28,7 @@ import numpy as np
 import pytest
 
 from file_io import hdf5_owner as HO
+from file_io import restart_bundle as _bundle_reader
 from file_io import mpa_store as MS
 
 
@@ -402,12 +404,12 @@ def test_the_probe_names_the_unsafe_condition_when_it_holds(fit_store,
 def test_the_pole_reader_needs_a_mesh_and_says_why():
     """The host path stays :func:`read_poles`; the reader is the mesh one."""
     with pytest.raises(ValueError, match="PoleReader requires mesh_xy"):
-        MS.open_pole_reader("ignored.h5", mesh_xy=None)
+        _bundle_reader.open_pole_reader("ignored.h5", mesh_xy=None)
 
 
 def test_read_poles_still_reads_the_host_path_whole(fit_store):
     """The one-shot door is unchanged for mesh-less callers."""
-    Om, Bp = MS.read_poles(fit_store, pole_slice=slice(0, 1), to_unit="Ry")
+    Om, Bp = _bundle_reader.read_poles(fit_store, pole_slice=slice(0, 1), to_unit="Ry")
     assert Om.shape[0] == 1 and Bp.shape == Om.shape
     with pytest.raises(IndexError, match="outside"):
-        MS.read_poles(fit_store, pole_slice=slice(5, 9))
+        _bundle_reader.read_poles(fit_store, pole_slice=slice(5, 9))

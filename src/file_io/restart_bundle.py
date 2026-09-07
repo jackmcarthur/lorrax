@@ -2387,3 +2387,1379 @@ def _omega_metadata_from_open_h5(h5):
 	if isinstance(prov, bytes):
 		prov = prov.decode("utf-8")
 	return omega, ref, str(prov)
+
+
+def read_poles(
+    src,
+    *,
+    pole_slice=None,
+    mesh_xy=None,
+    unfold=False,
+    return_sharded=False,
+    to_unit=None,
+    allow_partial=False,
+    include_odd=False,
+    mode="r",
+):
+    """Read one contiguous pole range with two collective SlabIO reads.
+
+    The leading pole axis is always retained.  ``pole_slice=None`` reads it
+    completely; an integer reads a length-one range.  A mesh read is always
+    sharded — pass ``return_sharded=True`` with ``mesh_xy``; there is no
+    gather path.
+
+    THE SUMMARY LINE DESCRIBES ONE OF TWO BRANCHES, and the contract
+    changes with ``mesh_xy``:
+
+    * ``mesh_xy`` given — COLLECTIVE, two ``SlabIO`` reads through
+      :func:`open_pole_reader`; ``src`` must be a PATH; returns two sharded
+      ``jax.Array``s of ``(n_poles, n_q, n_mu_padded, n_mu_padded)`` on
+      ``P(None, None, 'x', 'y')``, where the pad is
+      ``runtime.padding.padded_mu_extent``, not ``mesh_divisible_shape``.
+    * ``mesh_xy=None`` — SERIAL, rank-local, no SlabIO and nothing
+      collective; ``src`` may be a path or an open h5py group; returns two
+      HOST numpy arrays at the LOGICAL ``(n_poles, n_q, n_mu, n_mu)``.
+
+    Returns the 2-tuple ``(Omega_p, B_p)`` either way.  This is NOT the
+    sole pole reader — :func:`read_fit_block`, :func:`read_fit_tensors` and
+    :meth:`PoleReader.read` also read these datasets, and the production Σ
+    reader is the last of those; this function has no ``src`` caller.
+
+    ONE range per call, so a caller reading SEVERAL ranges of one file —
+    every Σ stage does — opens and closes the store once per range.  Use
+    :func:`open_pole_reader` there instead: it holds one collective handle
+    across the whole walk and does its h5py reads before that handle
+    exists (audit A1).  This function is the single-range door, and is
+    that reader with a lifetime of one call.
+    """
+    from file_io.mpa_store import (
+        _finish_pole_read,
+        _h5,
+        _pole_range,
+        _refuse_unfinalized,
+        fit_completion_ledger,
+    )
+    if mesh_xy is not None and not return_sharded:
+        raise ValueError(
+            "read_poles: got mesh_xy with return_sharded=False; want "
+            "return_sharded=True on every mesh read — the collective "
+            "read lands sharded and every mesh caller consumes that "
+            "layout, so no gather path exists.  Fix: pass "
+            "return_sharded=True, or drop mesh_xy for a host-side read.")
+    if mesh_xy is not None:
+        with open_pole_reader(src, mesh_xy=mesh_xy,
+                              allow_partial=allow_partial, mode=mode) as rd:
+            return rd.read(pole_slice, unfold=unfold,
+                           return_sharded=return_sharded, to_unit=to_unit,
+                           include_odd=include_odd)
+
+    with _h5(src, mode) as grp:
+        ledger = fit_completion_ledger(grp)
+        _refuse_unfinalized(grp, ledger, allow_partial, "read_poles")
+        lo, hi = _pole_range(ledger, pole_slice, "read_poles")
+        Omega = np.asarray(grp["Omega_p"][lo:hi])
+        Bp = np.asarray(grp["B_p"][lo:hi])
+        B_odd = (np.asarray(grp["B_odd_p"][lo:hi])
+                 if include_odd and ledger["ordered_residues"] else None)
+    return _finish_pole_read(
+        src, Omega, Bp, ledger, mesh_xy=None, unfold=unfold,
+        return_sharded=return_sharded, to_unit=to_unit,
+        B_odd=B_odd, include_odd=include_odd)
+
+
+
+def open_pole_reader(src, *, mesh_xy, allow_partial=False, mode="r"):
+    """A :class:`PoleReader` for one iteration's pole walk.
+
+    COLLECTIVE: this opens a ``SlabIO`` handle, so every rank must call it,
+    in the same order, and every rank must close it — use ``with``, or a
+    ``close()`` in a ``finally``.  ``src`` must be a PATH.  While the
+    reader lives, do not open this path with h5py (see :class:`PoleReader`
+    for exactly how much of that the registry enforces).
+    """
+    return PoleReader(src, mesh_xy=mesh_xy, allow_partial=allow_partial,
+                      mode=mode)
+
+
+
+class PoleReader:
+    """ONE collective handle serving every pole batch of one iteration.
+
+    WHY THIS EXISTS (audit A1 fix 2).  The Σ stage walks the pole axis in
+    batches so no complete pole tensor ever exists on host or device, and
+    it walks it TWICE per iteration — once for the census that plans the
+    windows, once for the spatial executor.  Called through
+    :func:`read_poles`, each batch opened and closed its own h5py handle
+    (ledger), its own collective ``SlabIO``, and a THIRD h5py handle for
+    the unfold tables — and the third one landed *between* the two, so the
+    per-batch sequence alternated h5py → FFI → h5py on one file, through
+    two independent HDF5 library instances, once per batch.
+
+    This reader collapses that to: read the ledger and the unfold tables
+    with h5py FIRST (two opens, or one when the store is not wedge-packed),
+    CLOSE h5py, then hold ONE ``SlabIO`` open for every batch of the
+    iteration.  Two properties, and the second is the one that matters more
+    than the arithmetic:
+
+    * the churn drops from ``3·n_batches`` opens per walk to ``2 + 1``;
+    * **no h5py open happens while the collective handle is live**, so
+      the alternation the two libraries cannot survive does not occur at
+      all inside a Σ stage.
+
+    HOW MUCH OF THAT IS MACHINE-ENFORCED, precisely — because the sentence
+    here used to claim all of it.  This reader opens ``SlabIO`` READ-ONLY,
+    and :mod:`file_io.hdf5_owner` refuses a cross-stack overlap only when
+    one side can WRITE.  So a stray h5py **write** open on this path while
+    the reader is alive refuses by name; a stray h5py **read** open is
+    ALLOWED BY DESIGN and merely counted.  The no-h5py-while-live property
+    above is upheld by this class's own ordering, and by the registry only
+    for writers.
+
+    The handle is released in a ``finally`` — use it as a context manager,
+    or call :meth:`close` from one.  A refusal raised mid-walk (an
+    uncertified fit, a bad pole range) must still release the collective
+    handle on every rank, because the next collective call on this mesh
+    would otherwise rendezvous against a file this rank never closed.
+    """
+
+    def __init__(self, src, *, mesh_xy, allow_partial=False, mode="r"):
+        from file_io.mpa_store import (
+            _h5,
+            _refuse_unfinalized,
+            fit_completion_ledger,
+        )
+        if mesh_xy is None:
+            raise ValueError(
+                "PoleReader requires mesh_xy: it exists to hold ONE "
+                "collective handle open across an iteration's pole "
+                "batches, and a mesh-less read has no such handle.  Use "
+                "read_poles(src, pole_slice=...) for the host path.")
+        self.src = src
+        self.mesh_xy = mesh_xy
+        # h5py FIRST, and completely, and closed — before any collective
+        # handle exists.  Both reads are small and neither is repeated.
+        with _h5(src, mode) as grp:
+            self.ledger = fit_completion_ledger(grp)
+            _refuse_unfinalized(grp, self.ledger, allow_partial, "PoleReader")
+        self.tables = (read_fit_unfold_tables(src)
+                       if self.ledger["q_storage"] == "ibz" else None)
+        self.n_poles = int(self.ledger["n_p"])
+        from file_io.slab_io import SlabIO
+        self._io = SlabIO(src, mode="r", mesh=mesh_xy)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def close(self):
+        io, self._io = getattr(self, "_io", None), None
+        if io is not None:
+            io.close()
+
+    def read(self, pole_slice=None, *, unfold=False, return_sharded=False,
+             to_unit=None, include_odd=False):
+        """One contiguous pole range, through the handle already open."""
+        from file_io.mpa_store import (
+            _finish_pole_read,
+            _pole_range,
+            _pole_read_shape,
+        )
+        if self._io is None:
+            raise ValueError(
+                "PoleReader.read after close(): the collective handle this "
+                "reader owns is gone.  Open a new reader rather than "
+                "reopening this one — a reader whose handle can be revived "
+                "is a reader whose lifetime nobody can read off the code.")
+        from jax.sharding import PartitionSpec as P
+
+        lo, hi = _pole_range(self.ledger, pole_slice, "PoleReader.read")
+        shape = (hi - lo, *_pole_read_shape(self.ledger, self.mesh_xy))
+        Omega = self._io.read_slab(
+            "Omega_p", shape=shape, offset=(lo, 0, 0, 0),
+            partition_spec=P(None, None, "x", "y"))
+        Bp = self._io.read_slab(
+            "B_p", shape=shape, offset=(lo, 0, 0, 0),
+            partition_spec=P(None, None, "x", "y"))
+        B_odd = None
+        if include_odd and self.ledger["ordered_residues"]:
+            B_odd = self._io.read_slab(
+                "B_odd_p", shape=shape, offset=(lo, 0, 0, 0),
+                partition_spec=P(None, None, "x", "y"))
+        return _finish_pole_read(
+            self.src, Omega, Bp, self.ledger, mesh_xy=self.mesh_xy,
+            unfold=unfold, return_sharded=return_sharded, to_unit=to_unit,
+            tables=self.tables, B_odd=B_odd, include_odd=include_odd)
+
+
+
+def read_fit_unfold_tables(src, *, mode="r"):
+    """Return the fit store's q-unfold tables, or ``None`` for full BZ."""
+    from file_io.mpa_store import (
+        FIT_TABLE_OWNER,
+        _h5,
+        _qs,
+    )
+    qs = _qs()
+    with _h5(src, mode) as grp:
+        if FIT_TABLE_OWNER + qs.QIRR_TABLE_SUFFIX not in grp:
+            return None
+        return qs.read_tables(grp, FIT_TABLE_OWNER, mode=mode)
+
+
+
+def read_fit_tensors(src, *, allow_partial=False, mode="r"):
+    """The whole ``(Omega_p, B_p, diagnostics, ledger)``.
+
+    For tests and offline inspection.  The Σ stage does NOT read this — it
+    streams contiguous pole ranges through :class:`PoleReader` (opened by
+    :func:`open_pole_reader`) and never holds the whole tensor.  This used
+    to name :func:`read_poles`, which the Σ stage stopped using when
+    ``PoleReader`` landed.
+
+    ``Omega_p`` and ``B_p`` come back ``(n_p, n_q, n_mu, n_mu)``
+    complex128 and ``diagnostics`` as ``{key: (n_q, n_mu, n_mu) float64}``
+    — the whole tensor, on this rank, which is the cost the first
+    paragraph is warning about.  Serial; ``src`` is a path or an open
+    group.  Same finalize refusal as :func:`read_fit_block`.
+    """
+    from file_io.mpa_store import (
+        _h5,
+        _qs,
+        _refuse_unfinalized,
+        fit_completion_ledger,
+    )
+    qs = _qs()
+    with _h5(src, mode) as grp:
+        ledger = fit_completion_ledger(grp)
+        _refuse_unfinalized(grp, ledger, allow_partial,
+                            "read_fit_tensors")
+        Om = np.asarray(grp["Omega_p"][()])
+        Bp = np.asarray(grp["B_p"][()])
+        diag = {str(k)[len("fit_"):]: np.asarray(grp[k][()])
+                for k in grp if str(k).startswith("fit_")}
+        return Om, Bp, diag, ledger
+
+
+
+def read_fit_block(src, q, mu_cols, *, allow_partial=False, mode="r"):
+    """One column block's ``(Omega_p, B_p, diagnostics, ledger)``.
+
+    Refuses an unfinalized store unless ``allow_partial=True``, and
+    when partial, refuses the specific columns that are not fitted —
+    "the file is incomplete" and "the columns you asked for are
+    incomplete" are different facts and a driver resuming a crashed fit
+    needs the second one.
+    """
+    from file_io.mpa_store import (
+        _column_span,
+        _h5,
+        _qs,
+        _ranges,
+        _refuse_unfinalized,
+        fit_completion_ledger,
+        normalise_columns,
+    )
+    qs = _qs()
+    with _h5(src, mode) as grp:
+        ledger = fit_completion_ledger(grp)
+        _refuse_unfinalized(grp, ledger, allow_partial,
+                            f"read_fit_block(q={q})")
+        iq = int(q)
+        if not 0 <= iq < ledger["n_q"]:
+            raise IndexError(
+                f"read_fit_block: q={iq} is outside [0, "
+                f"{ledger['n_q']})")
+        cols = normalise_columns(mu_cols, ledger["n_mu"])
+        undone = cols[~ledger["blocks_done"][iq, cols]]
+        if undone.size:
+            raise ValueError(
+                f"read_fit_block: q={iq} columns "
+                f"{_ranges(undone)} are not fitted.  They read back as "
+                f"zeros, which is a converged-looking dark channel and "
+                f"not an absent one, so the refusal is on the LEDGER "
+                f"and never on the data.")
+        lo, hi, sel = _column_span(cols)
+        sel = slice(lo, hi) if sel is None else sel
+        Om = np.asarray(grp["Omega_p"][:, iq, :, sel])
+        Bp = np.asarray(grp["B_p"][:, iq, :, sel])
+        stamp = ledger["diagnostic_keys"] or ""
+        keys = tuple(key for key in stamp.split(",") if key)
+        diag = {}
+        for key in keys:
+            name = "fit_" + key
+            if name not in grp:
+                raise ValueError(
+                    f"read_fit_block: diagnostic_keys names {name!r}, "
+                    "but the dataset is absent")
+            diag[key] = np.asarray(grp[name][iq, :, sel])
+        return Om, Bp, diag, ledger
+
+
+
+def read_fit_io_receipt(src, *, mode="r"):
+    """Return the ready body-attempt I/O receipt, or ``None`` if absent."""
+    from file_io.mpa_store import (
+        _h5,
+        _read_fit_io_receipt_group,
+    )
+    with _h5(src, mode) as grp:
+        return _read_fit_io_receipt_group(grp)
+
+
+
+def validate_fit_store(src, *, expected_identity=None,
+                       expected_screening_diagrams=None, mode="r"):
+    """Validate the finalized fit contract before Sigma reads pole bytes.
+
+    ``expected_identity`` may name ``w_grid_hash``, ``w_table_hash`` and
+    ``w_centroid_hash`` from the screening object currently in use, plus the
+    canonical ``wfn_fingerprint_scheme`` / ``wfn_fingerprint`` copied from
+    the W sample.  The fit's own declared ``*_max_allowed`` certification
+    thresholds are always enforced against its observed maxima.
+
+    ``expected_screening_diagrams`` is the run's ``screening_diagrams``
+    value.  RPA poles and ladder-corrected poles are the same shape, pass
+    the same certification and read back equally plausibly, so the only
+    thing separating them is the stamp the writer left — which makes this
+    the load-time half of QUALITY_PATTERNS #10.  A store with NO stamp is
+    refused rather than assumed RPA: "written before the axis existed" and
+    "written by the RPA path" are different facts, and silently reading the
+    first as the second is how a ladder fit gets consumed as an RPA one.
+
+    Pole bytes are not materialized here.  The finalized datasets themselves
+    are nevertheless opened for metadata and must exactly match the ledger's
+    logical ``(n_p,n_q,n_mu,n_mu)`` shape and ``complex128`` dtype before a
+    collective reader can be opened.  Finiteness is a streamed property: the
+    Sigma census reduces each resident pole slab before planning or execution.
+
+    LEGACY POLICY: a caller that supplies no WFN fields may still validate an
+    old fit for offline inspection or same-run compatibility.  Explicit reuse
+    supplies both canonical fields and therefore refuses every legacy fit that
+    predates them; absence is not interpreted as a match.
+
+    Returns the :func:`fit_completion_ledger` dict, which callers use for
+    ``n_p``.  Rank-local and serial; ``src`` is a path or an open group.
+    """
+    from file_io.mpa_store import (
+        CERTIFICATION_METRICS,
+        FIT_ENERGY_UNITS,
+        MPA_IDENTITY_PROVENANCE_KEYS,
+        _validate_pole_payload_metadata,
+        fit_completion_ledger,
+    )
+    ledger = fit_completion_ledger(src, mode=mode)
+    if expected_screening_diagrams is not None:
+        want = str(getattr(expected_screening_diagrams, "value",
+                           expected_screening_diagrams))
+        got = ledger["provenance"].get("screening_diagrams")
+        if got is None:
+            raise ValueError(
+                f"MPA fit store carries no screening_diagrams stamp, so it "
+                f"cannot say whether its poles came from the RPA W or the "
+                f"ladder-corrected W; this run is {want!r}.  Regenerate the "
+                f"fit with a writer that stamps it (gw.mpa.model."
+                f"build_mpa_fit does).")
+        if str(got) != want:
+            raise ValueError(
+                f"MPA fit provenance mismatch: the store was built with "
+                f"screening_diagrams = {str(got)!r} and this run is "
+                f"{want!r}.  The two produce different W and therefore "
+                f"different poles; reusing one for the other is the "
+                f"changed-band-window class of silent reuse.")
+    if not ledger["complete"]:
+        raise ValueError("MPA Sigma requires a finalized pole fit store")
+    if ledger["energy_unit"] not in FIT_ENERGY_UNITS:
+        raise ValueError("MPA fit store does not declare a supported unit")
+    _validate_pole_payload_metadata(src, ledger, mode=mode)
+    for key, want in (expected_identity or {}).items():
+        if key in MPA_IDENTITY_PROVENANCE_KEYS:
+            got = ledger["provenance"].get(key)
+        elif key in ("w_grid_hash", "w_table_hash", "w_centroid_hash"):
+            got = ledger[key]
+        else:
+            raise KeyError(f"unknown MPA fit identity field {key!r}")
+        if got is None or str(got) != str(want):
+            raise ValueError(
+                f"MPA fit identity mismatch for {key}: got {got!r}, "
+                f"expected {want!r}")
+    missing = [key + "_max_allowed" for key in CERTIFICATION_METRICS
+               if key + "_max_allowed" not in ledger["certification"]]
+    if missing:
+        raise ValueError(
+            "MPA Sigma requires certified pole fits; the store is missing "
+            + ", ".join(missing))
+    for metric_key in CERTIFICATION_METRICS:
+        key = metric_key + "_max_allowed"
+        allowed = ledger["certification"][key]
+        if not np.isfinite(float(allowed)) or float(allowed) <= 0.0:
+            raise ValueError(
+                f"MPA fit has invalid stored certification {key}="
+                f"{allowed!r}")
+        metric = metric_key + "_max"
+        got = ledger[metric]
+        if got is None or float(got) > float(allowed):
+            raise ValueError(
+                f"MPA fit failed its stored certification: {metric}="
+                f"{got!r} exceeds {allowed!r}")
+    return ledger
+
+
+
+def validate_fit_store_for_resume(
+        src, *, n_q, n_mu, n_p, energy_unit, grid_hash, table_hash,
+        centroid_hash, provenance, ordered_residues, schedule,
+        occupation_state=None, mode="r"):
+    """Authenticate a partial fit and prove its ledger against the schedule.
+
+    Only whole scheduled ranges can be checkpointed.  The journal, both
+    diagnostics vectors and ``blocks_done`` are redundant by design here:
+    all three must describe exactly the same non-overlapping union before a
+    restart may skip any work.
+    """
+    from file_io.mpa_store import (
+        CERTIFICATION_METRICS,
+        MPA_FIT_FORMAT_VERSION,
+        PERSISTED_DIAGNOSTICS,
+        _occ_stamp_values,
+        _validate_pole_payload_metadata,
+        _values_equal,
+        fit_completion_ledger,
+    )
+    ledger = fit_completion_ledger(src, mode=mode)
+    expected = {
+        "format_version": MPA_FIT_FORMAT_VERSION,
+        "n_q": int(n_q), "n_mu": int(n_mu), "n_p": int(n_p),
+        "energy_unit": str(energy_unit),
+        "w_grid_hash": str(grid_hash), "w_table_hash": str(table_hash),
+        "w_centroid_hash": str(centroid_hash),
+        "ordered_residues": bool(ordered_residues),
+        "diagnostic_keys": ",".join(PERSISTED_DIAGNOSTICS),
+    }
+    faults = [
+        f"{key}: stored={ledger.get(key)!r}, expected={want!r}"
+        for key, want in expected.items()
+        if not _values_equal(ledger.get(key), want)
+    ]
+    stored_provenance = dict(ledger.get("provenance") or {})
+    expected_provenance = dict(provenance or {})
+    if (set(stored_provenance) != set(expected_provenance)
+            or any(not _values_equal(stored_provenance[key], value)
+                   for key, value in expected_provenance.items()
+                   if key in stored_provenance)):
+        faults.append(
+            "provenance differs: stored keys="
+            f"{sorted(stored_provenance)}, expected keys="
+            f"{sorted(expected_provenance)}")
+    stored_occ = read_occupation_stamps(src, mode=mode)
+    expected_occ = (
+        None if occupation_state is None else _occ_stamp_values(occupation_state))
+    if ((stored_occ is None) != (expected_occ is None)
+            or (stored_occ is not None and any(
+                not _values_equal(stored_occ[key], expected_occ[key])
+                for key in expected_occ))):
+        faults.append("occupation provenance differs")
+    if faults:
+        raise ValueError(
+            "MPA partial fit store is incompatible:\n  " + "\n  ".join(faults))
+
+    _validate_pole_payload_metadata(src, ledger, mode=mode)
+    done = np.asarray(ledger["blocks_done"], dtype=bool)
+    if done.shape != (int(n_q), int(n_mu)):
+        raise ValueError(
+            f"MPA partial fit blocks_done has shape {done.shape}, expected "
+            f"{(int(n_q), int(n_mu))}")
+    journal = np.asarray(ledger["journal"], dtype=np.int64)
+    if journal.ndim != 2 or journal.shape[1:] != (3,):
+        raise ValueError(
+            f"MPA partial fit journal must have shape (n,3); got {journal.shape}")
+    n_records = int(journal.shape[0])
+    for key in CERTIFICATION_METRICS:
+        values = np.asarray(ledger["block_" + key + "_max"], np.float64)
+        if values.shape != (n_records,):
+            raise ValueError(
+                f"MPA partial fit {key} diagnostics length {values.shape} "
+                f"does not equal journal length {n_records}")
+        if not np.all(np.isfinite(values)):
+            raise ValueError(
+                f"MPA partial fit {key} diagnostics contain non-finite values")
+
+    schedule = tuple(schedule)
+    allowed = {(int(q), int(lo), int(hi)) for q, lo, hi in schedule}
+    if len(allowed) != len(schedule):
+        raise ValueError("MPA fit schedule itself contains duplicate ranges")
+    schedule_union = np.zeros_like(done)
+    for q, lo, hi in allowed:
+        if not (0 <= q < int(n_q) and 0 <= lo < hi <= int(n_mu)):
+            raise ValueError(
+                f"MPA fit schedule carries invalid range {(q, lo, hi)}")
+        if bool(schedule_union[q, lo:hi].any()):
+            raise ValueError(
+                f"MPA fit schedule carries overlapping range {(q, lo, hi)}")
+        schedule_union[q, lo:hi] = True
+    if not bool(schedule_union.all()):
+        raise ValueError("MPA fit schedule does not cover every q/column pair")
+    union = np.zeros_like(done)
+    seen = set()
+    for row in journal:
+        record = tuple(int(value) for value in row)
+        if record not in allowed:
+            raise ValueError(
+                f"MPA partial fit journal range {record} is outside the "
+                "current column schedule")
+        if record in seen:
+            raise ValueError(
+                f"MPA partial fit journal repeats scheduled range {record}")
+        seen.add(record)
+        q, lo, hi = record
+        if bool(union[q, lo:hi].any()):
+            raise ValueError(
+                f"MPA partial fit journal range {record} overlaps an earlier "
+                "committed range")
+        union[q, lo:hi] = True
+    if not np.array_equal(done, union):
+        raise ValueError(
+            "MPA partial fit blocks_done does not exactly equal the union of "
+            "its validated journal ranges")
+    return ledger
+
+
+
+def read_head_fit_collective(src, *, mesh_xy, to_unit=None):
+    """Collectively read and certify the scalar head fit through SlabIO.
+
+    COLLECTIVE over ``mesh_xy``.  ``src`` must be a PATH.  Every open on
+    this path is read-only (h5py ``'r'`` twice, then FFI ``'r'``), which is
+    the cross-stack concurrency the one-owner registry allows.
+
+    WHAT IS READ, stated because this is the call that produced failure
+    signature S3 (``docs/architecture/slab_io.md#s3``): the four
+    ``mpa_head/{sample_z,sample_Wc,Omega_p,B_p}`` vectors, WHOLE, with
+    ``partition_spec=P(None)`` and **no offset and no shape** — so the
+    extent comes from the dataset and the offset that reaches the FFI is
+    zero.  ``sample_z``/``sample_Wc`` are 2·n_p long, ``Omega_p``/``B_p``
+    are n_p.  A nonzero ``offset_base`` in a refusal from this call is not
+    an arithmetic mistake in this function; it is the marshal.
+
+    RETURNS HOST NUMPY, not sharded arrays, despite taking ``mesh_xy``:
+    the four vectors come back ``np.complex128`` via ``as_numpy=True``,
+    alongside ``units``, ``diagnostics``, ``provenance``, ``model``,
+    ``occupation_stamps`` and ``ready``.
+
+    "CERTIFY" MEANS: :func:`validate_fit_store` on the body, head
+    ``format_version == 2``, ``ready``, head-vs-body ``mpa_grid_hash``,
+    a known head model, and observed ``condition`` / ``backward_error``
+    against the stamped ``*_max_allowed``.  Those two thresholds DEFAULT TO
+    INFINITY when absent, so an unstamped head certifies vacuously.
+    """
+    from file_io.mpa_store import (
+        MPA_HEAD_SUFFIX,
+        _HEAD_FIT_MODELS,
+        _OCC_STAMP_ORDER,
+        _h5,
+        _open_fit,
+        _qs,
+        _unit_scale,
+    )
+    from jax.sharding import PartitionSpec as P
+
+    from file_io.slab_io import SlabIO
+
+    ledger = validate_fit_store(src)
+    with _h5(src, "r") as grp:
+        _open_fit(grp)
+        if MPA_HEAD_SUFFIX not in grp:
+            raise ValueError("MPA fit store carries no scalar head")
+        head = grp[MPA_HEAD_SUFFIX]
+        if int(head.attrs.get("format_version", -1)) != 2:
+            raise ValueError("collective scalar-head reader requires format version 2")
+        if not bool(head.attrs.get("ready", False)):
+            raise ValueError("scalar MPA head is NOT READY")
+        source_unit = _qs().qirr_attr_str(head, "frequency_unit")
+        model = _qs().qirr_attr_str(head, "model")
+        grid_hash = _qs().qirr_attr_str(head, "mpa_grid_hash")
+        occupation_stamps = None
+        if ("mpa_" + _OCC_STAMP_ORDER[0]) in head.attrs:
+            occupation_stamps = {
+                "occ_hash": _qs().qirr_attr_str(head, "mpa_occ_hash"),
+                "mu_ry": float(head.attrs["mpa_mu_ry"]),
+            }
+        diagnostics = {
+            key: float(head.attrs[key])
+            for key in (
+                "fit_condition", "fit_backward_error",
+                "fit_max_abs_residual")
+        }
+        provenance = {
+            str(key)[len("fit_"):]: head.attrs[key]
+            for key in head.attrs if str(key).startswith("fit_")
+            and str(key) not in diagnostics
+        }
+    if str(grid_hash) != str(ledger["w_grid_hash"]):
+        raise ValueError("scalar-head/body MPA grid hashes differ")
+    if str(model) not in _HEAD_FIT_MODELS:
+        raise ValueError(
+            f"read_head_fit_collective: stored head model {model!r} is not "
+            f"one of {_HEAD_FIT_MODELS}; a consumer must not silently "
+            "interpret an unknown fitting protocol")
+    condition_limit = float(provenance.get(
+        "condition_max_allowed", np.inf))
+    backward_limit = float(provenance.get(
+        "backward_error_max_allowed", np.inf))
+    if diagnostics["fit_condition"] > condition_limit:
+        raise ValueError("scalar-head MPA fit exceeds its condition gate")
+    if diagnostics["fit_backward_error"] > backward_limit:
+        raise ValueError("scalar-head MPA fit exceeds its backward-error gate")
+
+    prefix = MPA_HEAD_SUFFIX + "/"
+    with SlabIO(src, mode="r", mesh=mesh_xy) as io:
+        z = io.read_slab(
+            prefix + "sample_z", partition_spec=P(None), as_numpy=True)
+        wc = io.read_slab(
+            prefix + "sample_Wc", partition_spec=P(None), as_numpy=True)
+        poles = io.read_slab(
+            prefix + "Omega_p", partition_spec=P(None), as_numpy=True)
+        residues = io.read_slab(
+            prefix + "B_p", partition_spec=P(None), as_numpy=True)
+    z = np.asarray(z, dtype=np.complex128)
+    wc = np.asarray(wc, dtype=np.complex128)
+    poles = np.asarray(poles, dtype=np.complex128)
+    residues = np.asarray(residues, dtype=np.complex128)
+    if z.shape != wc.shape or poles.shape != residues.shape:
+        raise ValueError("collective scalar-head payload has inconsistent shapes")
+    if not all(np.all(np.isfinite(x)) for x in (z, wc, poles, residues)):
+        raise ValueError("collective scalar-head payload is not finite")
+    if to_unit is not None:
+        # THE SHARED HELPER, not a second copy of the same policy: it
+        # refuses an undeclared unit by NAME and prints both spellings,
+        # where the inline version said only that the conversion was
+        # "unsupported" (audit §E.3 item 12).
+        scale = _unit_scale(source_unit, to_unit, "read_head_fit_collective")
+        z, poles, residues = z * scale, poles * scale, residues * scale
+        source_unit = str(to_unit)
+    return {
+        "sample_z": z,
+        "sample_Wc": wc,
+        "Omega_p": poles,
+        "B_p": residues,
+        "units": {
+            "frequency": source_unit,
+            "Wc": "a.u.",
+            "residue": f"{source_unit}*a.u.",
+        },
+        "diagnostics": diagnostics,
+        "provenance": provenance,
+        "model": model,
+        "occupation_stamps": occupation_stamps,
+        "ready": True,
+    }
+
+
+
+def read_head_fit(src, *, to_unit=None, mode="r"):
+    """Read the complete scalar q->0 MPA fit; refuse absent/partial data."""
+    from file_io.mpa_store import (
+        MPA_HEAD_SUFFIX,
+        _HEAD_FIT_MODELS,
+        _h5,
+        _open_fit,
+        _qs,
+        _unit_scale,
+    )
+    qs = _qs()
+    with _h5(src, mode) as grp:
+        _open_fit(grp)
+        if MPA_HEAD_SUFFIX not in grp:
+            raise ValueError("read_head_fit: fit store carries no scalar head")
+        head = grp[MPA_HEAD_SUFFIX]
+        if int(head.attrs.get("format_version", -1)) != 1:
+            raise ValueError("read_head_fit: unsupported scalar-head format")
+        if not bool(head.attrs.get("ready", False)):
+            raise ValueError("read_head_fit: scalar head is NOT READY")
+        source_unit = qs.qirr_attr_str(head, "frequency_unit")
+        z = np.asarray(head["sample_z"][()])
+        wc = np.asarray(head["sample_Wc"][()])
+        poles = np.asarray(head["Omega_p"][()])
+        residues = np.asarray(head["B_p"][()])
+        diagnostics = {
+            key: float(head.attrs[key])
+            for key in ("fit_condition", "fit_backward_error",
+                        "fit_max_abs_residual")
+        }
+        units = {
+            "frequency": source_unit,
+            "Wc": qs.qirr_attr_str(head, "Wc_unit"),
+            "residue": qs.qirr_attr_str(head, "residue_unit"),
+        }
+        model = qs.qirr_attr_str(head, "model")
+        if model not in _HEAD_FIT_MODELS:
+            raise ValueError(
+                f"read_head_fit: got scalar-head model {model!r}; want "
+                f"one of {_HEAD_FIT_MODELS} — the only fitting protocols "
+                f"this reader knows how to interpret, and a pole set "
+                f"whose protocol nobody can name cannot be consumed "
+                f"correctly.  Fix: refit the head with a known model, or "
+                f"teach _HEAD_FIT_MODELS the new one alongside its "
+                f"consumer.")
+    if to_unit is not None:
+        scale = _unit_scale(source_unit, to_unit, "head read")
+        z, poles, residues = z * scale, poles * scale, residues * scale
+        units["frequency"] = str(to_unit)
+        units["residue"] = f"{to_unit}*a.u."
+    return {
+        "sample_z": z,
+        "sample_Wc": wc,
+        "Omega_p": poles,
+        "B_p": residues,
+        "units": units,
+        "diagnostics": diagnostics,
+        "model": model,
+        "ready": True,
+    }
+
+
+
+def open_w_column_reader(src, *, mesh_xy, headers):
+    """Open the persistent source reader for one fit checkpoint epoch."""
+    return WColumnReader(src, mesh_xy=mesh_xy, headers=headers)
+
+
+
+class WColumnReader:
+    """ONE collective source handle for one bounded fit epoch.
+
+    A fit block still performs one H5Dread per sample component and retains
+    exactly one budgeted all-frequency column tile per component.  What this
+    object removes is file/dataset discovery churn: the source is opened once
+    for the epoch, not once for every ``(q, column)`` block.  At the scalar Bi
+    geometry that changes 1,105 source opens to 35 without changing the 1,105
+    H5Dreads, their selections, the fit algebra, or device memory.
+
+    ``headers`` is explicit because production authenticates both positive
+    and optional negative components before collective I/O begins.  Keeping
+    those already-closed serial reads outside this lifetime also prevents an
+    h5py metadata open from appearing while the collective handle is live.
+    Multiple names share this ONE handle, so ordered fitting reads W(z) and
+    W(-z) without independently reopening their common source.
+
+    COLLECTIVE over ``mesh_xy``.  Every rank must construct, read in the same
+    order, and close.  Use the context-manager spelling; :meth:`read` refuses
+    after close rather than silently reviving a handle whose lifetime would
+    no longer be visible in the driver.
+    """
+
+    def __init__(self, src, *, mesh_xy, headers):
+        if mesh_xy is None:
+            raise ValueError(
+                "WColumnReader requires mesh_xy: its source handle is "
+                "collective")
+        rows = {str(name): dict(header)
+                for name, header in dict(headers).items()}
+        if not rows:
+            raise ValueError(
+                "WColumnReader requires at least one authenticated header")
+        self.src = os.fspath(src)
+        self.mesh_xy = mesh_xy
+        self.headers = rows
+        self.h5d_reads = 0
+        from file_io.slab_io import SlabIO
+        self._io = SlabIO(self.src, mode="r", mesh=mesh_xy)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def close(self):
+        io, self._io = getattr(self, "_io", None), None
+        if io is not None:
+            io.close()
+
+    def read(
+        self,
+        name,
+        q,
+        mu_cols,
+        *,
+        n_cols_buffer,
+        tile_bytes=None,
+    ):
+        """Read one contiguous column tile through the live handle."""
+        from file_io.mpa_store import (
+            _column_span,
+            _validate_column_request,
+        )
+        from jax.sharding import PartitionSpec as P
+
+        from file_io.slab_io import mesh_divisible_shape
+
+        if self._io is None:
+            raise ValueError(
+                "WColumnReader.read after close(): open a new epoch reader")
+        key = str(name)
+        if key not in self.headers:
+            raise KeyError(
+                f"WColumnReader has no authenticated header for {key!r}; "
+                f"available={sorted(self.headers)}")
+        header = self.headers[key]
+        n_mu = int(header["n_mu"])
+        n_omega = int(header["n_omega"])
+        iq, cols, budget = _validate_column_request(
+            header, q, mu_cols, tile_bytes,
+            f"WColumnReader.read({key!r})")
+        lo, _, sel = _column_span(cols)
+        if sel is not None:
+            raise ValueError(
+                "WColumnReader.read requires one contiguous column range; "
+                "the production fit schedule emits contiguous blocks")
+        width = int(n_cols_buffer)
+        if width < int(cols.size) or width > budget:
+            raise ValueError(
+                f"WColumnReader.read: n_cols_buffer={width}, actual "
+                f"width={int(cols.size)}, budget={budget}; require "
+                "actual <= buffer <= budget")
+
+        spec = P(None, None, ("x", "y"), None)
+        shape = mesh_divisible_shape(
+            (n_omega, 1, n_mu, width), self.mesh_xy, spec)
+        block = self._io.read_slab(
+            key, shape=shape, offset=(0, iq, 0, lo),
+            valid_shape=(n_omega, 1, n_mu, int(cols.size)),
+            partition_spec=spec)
+        self.h5d_reads += 1
+        return block
+
+
+
+def read_w_columns_collective(
+    src,
+    name,
+    q,
+    mu_cols,
+    *,
+    mesh_xy,
+    n_cols_buffer,
+    tile_bytes=None,
+    header=None,
+):
+    """One-shot collective read of an all-frequency column tile.
+
+    The returned array is ``(n_omega, 1, n_mu_padded, n_cols_buffer)``
+    with ``P(None, None, ('x', 'y'), None)``.  The singleton is the stored
+    q axis; retaining it makes the SlabIO offset and the fit-store write
+    geometry identical.  A short final column block is zero-filled to the
+    fixed buffer width and ``valid_shape`` prevents those zeros from reading
+    bytes belonging to the next block.  This is the surgical single-read
+    door; a scheduled fit must use :class:`WColumnReader` so its epoch does
+    not reopen the same source once per column block.
+    """
+    hdr = read_w_header(src, name) if header is None else header
+    with WColumnReader(
+            src, mesh_xy=mesh_xy, headers={name: hdr}) as reader:
+        return reader.read(
+            name, q, mu_cols, n_cols_buffer=n_cols_buffer,
+            tile_bytes=tile_bytes)
+
+
+
+def read_w_columns(
+    src,
+    name,
+    q,
+    mu_cols,
+    *,
+    tile_bytes=None,
+    n_mu_padded=None,
+    out_spec=None,
+    require_ready=True,
+    mode="r",
+):
+    """A few ν columns of W_q, ACROSS ALL FREQUENCIES.
+
+    Returns ``(n_omega, N_μ_rows, len(mu_cols))`` complex — the shape
+    the per-element plasmon-pole fit consumes.  This is the read the
+    leading frequency axis exists for: the fit needs all of ω for one
+    (μ, ν) element and never needs all of (μ, ν) for one ω, so the
+    frequency axis is the OUTER one on disk and the innermost one in the
+    solve.
+
+    THE BUDGET REFUSES BY NAME.  ``len(mu_cols)`` is checked against
+    :func:`choose_column_budget` and a request that busts it raises with
+    the full arithmetic — the per-column cost, the total, the tile it is
+    measured against, the ratio, and the count that would have fit.
+    Silently truncating or silently allowing would each defeat the
+    constraint the number encodes: a small number of W_q(μ,ν) copies fit
+    at once, and this block is priced to be one of them.
+
+    THE SHARDING IS 1-D ON THE ROW AXIS.  ``out_spec`` is checked, not
+    applied — the read itself is host-side h5py and the placement is the
+    caller's — but a 2-D spec is refused here rather than downstream,
+    because by the time it is downstream the column count is no longer
+    the number the budget was computed for.  See
+    :func:`_refuse_two_dim_sharding`.
+
+    REQUIRES EVERY SLAB.  The block spans the whole frequency axis, so
+    every ω must be ready; a partially filled file refuses and names how
+    many slabs are missing.  That is stricter than :func:`read_w_slab`
+    on purpose — a fit run on the ready half of a grid produces poles
+    that are wrong rather than absent.
+    """
+    from file_io.mpa_store import (
+        _column_span,
+        _h5,
+        _qs,
+        _refuse_two_dim_sharding,
+        _validate_column_request,
+    )
+    qs = _qs()
+    header = read_w_header(src, name, mode=mode)
+    _refuse_two_dim_sharding(out_spec, f"read_w_columns({name!r})")
+    n_mu = header["n_mu"]
+    iq, cols, _ = _validate_column_request(
+        header, q, mu_cols, tile_bytes, f"read_w_columns({name!r})",
+        require_ready=require_ready)
+
+    # ONE HYPERSLAB, NOT ONE PER FREQUENCY.  A contiguous run becomes a
+    # slice (HDF5 reads it as a single hyperslab); anything else is a
+    # point selection on the LAST axis only, which h5py supports and
+    # which keeps the row axis whole — the axis the caller shards.
+    lo, hi, sel = _column_span(cols)
+    with _h5(src, mode) as grp:
+        block = grp[name][:, iq, :, slice(lo, hi) if sel is None else sel]
+    block = np.asarray(block)
+
+    if n_mu_padded is not None and int(n_mu_padded) != n_mu:
+        pad = int(n_mu_padded) - n_mu
+        if pad < 0:
+            raise ValueError(
+                f"read_w_columns({name!r}): the file stores {n_mu} "
+                f"logical centroids and the caller asked to pad the row "
+                f"axis DOWN to {n_mu_padded}.  The pad only ever grows "
+                f"the extent.")
+        # ROWS ONLY.  The columns are a selection the caller chose, not
+        # an axis with a pad; padding them would invent centroids the
+        # caller did not ask for and shift every index in ``mu_cols``.
+        block = np.pad(block, ((0, 0), (0, pad), (0, 0)))
+    return block
+
+
+
+def read_w_tables(src, name, *, mode="r"):
+    """The stored unfold tables — ``qirr_store.read_tables``, unchanged.
+
+    Re-exported rather than reimplemented, and named here so a caller
+    reading a v2 file does not have to know which module owns the table
+    group.  They are ω-INDEPENDENT: one set for the whole frequency
+    axis, because the symmetry operation acts on (q, μ, ν).
+
+    THROUGH :func:`_h5`, and that is the whole content of this wrapper.
+    ``qirr_store.read_tables`` opens h5py itself, so forwarding ``src``
+    to it was an h5py open the ownership registry could not see — the one
+    blind spot in this module's one-owner invariant, and not a rare one:
+    it runs on EVERY RANK in production (``gw/mpa/fit_driver.py``'s
+    unfold-table read).  The door takes the open and hands the already-open
+    group on, so the format layer still owns the reading and the registry
+    still owns the counting (audit §E.3 item 2).
+    """
+    from file_io.mpa_store import (
+        _h5,
+        _qs,
+    )
+    with _h5(src, mode) as grp:
+        return _qs().read_tables(grp, name)
+
+
+
+def read_w_slab(
+    src,
+    name,
+    i_omega,
+    *,
+    q=None,
+    unfold=False,
+    mesh_xy=None,
+    n_mu_padded=None,
+    require_ready=True,
+    mode="r",
+):
+    """One frequency slab: ``(n_q, N_μ, N_μ)``, or one q of it.
+
+    THE REMOVABILITY CLAIM, AS A FUNCTION.  What comes back for
+    ``unfold=False`` and ``n_mu_padded=None`` is bit-identical to what
+    ``qirr_store.read_tensor`` returns from a version-1 file written
+    from this slab — same bytes, same wedge, same tables.  That is the
+    whole content of "the leading dimension is removable later": the
+    axis is a container, not a change of meaning, and dropping it is a
+    slice rather than a migration.  ``test_the_leading_axis_is_
+    removable`` asserts it attr-for-attr.
+
+    Parameters
+    ----------
+    q
+        Optional q index into the stored wedge.  ``None`` returns every
+        stored q at this ω.
+    unfold
+        Unfold the wedge to the full BZ AT THIS FREQUENCY.  The tables
+        are ω-independent, so this is ``unfold_isdf_operator`` on the
+        slab — the same call, the same arguments, one frequency at a
+        time.  Needs ``mesh_xy``.
+    n_mu_padded
+        Re-apply a μ pad of the READER's own width.  The file stores the
+        LOGICAL extent, so a consumer that wants the padded in-memory
+        layout asks for it here rather than finding the writer's pad and
+        hoping it matches.
+    require_ready
+        Refuse when this slab's ledger bit is False.  Default True.
+    """
+    from file_io.mpa_store import (
+        _h5,
+        _qs,
+    )
+    qs = _qs()
+    header = read_w_header(src, name, mode=mode)
+    i = int(i_omega)
+    n_omega = header["n_omega"]
+    if not 0 <= i < n_omega:
+        raise IndexError(
+            f"mpa_store: frequency index {i} is outside [0, {n_omega}) "
+            f"for {name!r}.")
+    if require_ready and not bool(header["data_ready"][i]):
+        raise ValueError(
+            f"mpa_store: {name!r} frequency slab {i} (ω = "
+            f"{header['omega'][i]}) is PRESENT AND CORRECTLY SHAPED but "
+            f"its data_ready bit is False — it is allocated space, not "
+            f"data.  {header['n_ready']} of {n_omega} slabs are ready.  "
+            f"Reading it would hand the fit a slab of zeros that passes "
+            f"every shape check, which is the mechanism behind the "
+            f"all-zero-screening incident: a plausible excitonic "
+            f"spectrum out of a W that was never written.  A "
+            f"frequency-resolved file reaches this state routinely — "
+            f"the producer fills ω one line-batched sweep at a time — "
+            f"so the ledger is per slab and not per file.  Pass "
+            f"require_ready=False to inspect the placeholder "
+            f"deliberately.")
+
+    with _h5(src, mode) as grp:
+        ds = grp[name]
+        raw = ds[i] if q is None else ds[i, int(q)]
+    raw = np.asarray(raw)
+
+    # THE TABLES ARE READ ONLY WHEN THEY ARE NEEDED, which is the
+    # unfold and the re-pad.  The production per-slab read is neither —
+    # a consumer walking ω takes the wedge as stored — and opening the
+    # table group on every one of those would be a second file open per
+    # frequency for arrays nobody looks at.  Their DIGEST was already
+    # checked by ``read_w_header`` above, so this is a saved read and
+    # not a skipped check.
+    if not unfold and n_mu_padded is None:
+        return raw, header
+
+    tables = read_w_tables(src, name, mode=mode)
+    can = tables.canonical()
+    if n_mu_padded is not None and int(n_mu_padded) != int(can.n_mu):
+        pad = int(n_mu_padded) - int(can.n_mu)
+        if pad < 0:
+            raise ValueError(
+                f"mpa_store: {name!r} stores {can.n_mu} logical "
+                f"centroids and the caller asked to pad DOWN to "
+                f"{n_mu_padded}.  The pad only ever grows the extent; a "
+                f"smaller request means the caller and the file "
+                f"disagree about the centroid set.")
+        widths = [(0, 0)] * (raw.ndim - 2) + [(0, pad), (0, pad)]
+        raw = np.pad(raw, widths)
+        can = can.padded(int(n_mu_padded))
+
+    if not unfold or header["q_storage"] == "full":
+        return raw, header
+    if q is not None:
+        raise ValueError(
+            f"mpa_store: {name!r} cannot unfold a single stored q "
+            f"(q={q}).  The unfold gathers every full-BZ row from its "
+            f"IBZ parent, so it needs the whole wedge at this ω; ask "
+            f"for q=None and index the result.")
+    if mesh_xy is None:
+        raise ValueError(
+            f"mpa_store: {name!r} is stored on the q wedge "
+            f"({header['n_q_on_disk']} of {header['n_q_full']} q) and "
+            f"unfolding slab {i} needs a mesh; pass mesh_xy= or "
+            f"unfold=False to take the wedge.")
+    import jax.numpy as jnp
+    # THROUGH THE SERVICE'S DOOR, not past it: the top-level package,
+    # never ``symmetry_maps.maps``.  Reaching a submodule is what stops
+    # a service being replaceable, and ``test_layering`` enforces it.
+    from symmetry_maps import unfold_isdf_operator
+    # Test seam only — the bulk to-device transfer below has zero
+    # production callers; production unfolds sharded in _finish_pole_read.
+    full = unfold_isdf_operator(
+        jnp.asarray(raw),
+        irr_idx=can.irr_idx_q,
+        sym_idx=can.sym_idx_q,
+        sym_perm=can.sym_perm,
+        L_table=can.L_table,
+        q_irr_frac=can.q_irr_frac,
+        mesh_xy=mesh_xy,
+        n_sym_spatial=int(can.n_sym_spatial),
+    )
+    return full, header
+
+
+
+def read_w_header(src, name, *, mode="r"):
+    """Everything the file CLAIMS about ``name``, reading no tensor data.
+
+    Returns a plain dict with these keys, every one of which some reader
+    below indexes by name: ``format_version``, ``freq_axis``, ``n_omega``,
+    ``omega`` ``(n_omega,)`` complex128, ``omega_line`` ``(n_omega,)``
+    int32, ``omega_units``, ``sampling``, ``grid_hash``, ``data_ready``
+    ``(n_omega,)`` bool, ``n_ready``, ``q_storage``, ``n_q_on_disk``,
+    ``n_q_full``, ``n_mu``, ``n_rmu_logical``, ``centroid_hash``,
+    ``table_hash``, ``closure_verdict``, ``provenance``.
+
+    Rank-local and serial, but called on every rank from three collective
+    functions — a collective caller must invoke it uniformly.  ``src`` is a
+    path (this call's ``_h5`` owns the handle) or an already-open group (the
+    caller owns it, and ``mode`` is then IGNORED by ``QirrDest``: the
+    parameter looks live and is not).
+
+    Every cross-check the format owns runs here,
+    so a caller that got a header back has already been told the file is
+    self-consistent, and every reader below calls this first rather than
+    repeating the checks — one implementation of "what does this file
+    say", because a second one is how a reader ends up disagreeing with
+    the format about what it is holding.
+    """
+    from file_io.mpa_store import (
+        QIRR_FORMAT_VERSION_FREQ,
+        _FREQ_ATTR,
+        _MPA_OWNED_ATTRS,
+        _SAMPLING_ORDER,
+        _canonical_sampling,
+        _h5,
+        _open_w,
+        _qs,
+        _refuse_unless_rank_matches_version,
+        omega_grid_digest,
+    )
+    qs = _qs()
+    with _h5(src, mode) as grp:
+        ds, mgrp = _open_w(grp, name)
+        version = _refuse_unless_rank_matches_version(ds, name)
+        if version != QIRR_FORMAT_VERSION_FREQ:
+            raise ValueError(
+                f"mpa_store: {name!r} is format version {version}; the "
+                f"frequency-resolved readers are version "
+                f"{QIRR_FORMAT_VERSION_FREQ}.  Use "
+                f"qirr_store.read_tensor for a version-1 tensor.")
+
+        # THE PARTIAL-STAMP REFUSAL, version 2's half.  The rank check
+        # above settles which format this is; this settles whether the
+        # format's own record is whole.  Named rather than left to a
+        # KeyError deep in the read, because "which attr is missing" is
+        # the question a half-written file raises and a traceback
+        # through ``ds.attrs[...]`` answers it one attr at a time.
+        absent = [a for a in _MPA_OWNED_ATTRS if a not in ds.attrs]
+        if absent:
+            raise ValueError(
+                f"mpa_store: {name!r} is a version "
+                f"{QIRR_FORMAT_VERSION_FREQ} tensor missing {absent}.  "
+                f"A half-stamped file is refused rather than read: the "
+                f"missing half is the sampling protocol, which is what "
+                f"says what the ω values MEAN, and a fit against "
+                f"abscissae nobody can characterise is a fit nobody can "
+                f"reproduce or extend.")
+
+        n_omega = int(ds.shape[0])
+        stamped_n = int(ds.attrs["mpa_n_omega"])
+        if stamped_n != n_omega:
+            raise ValueError(
+                f"mpa_store: {name!r} stamps mpa_n_omega={stamped_n} but "
+                f"its leading axis is {n_omega}.  The SHAPE is the "
+                f"primary discriminant and the attr is its cross-check, "
+                f"so a disagreement is a refusal and not a preference.")
+
+        omega = mgrp["omega"][()]
+        line = mgrp["omega_line"][()]
+        ready = np.asarray(mgrp["data_ready"][()], dtype=bool)
+        for label, arr in (("omega", omega), ("omega_line", line),
+                           ("data_ready", ready)):
+            if int(np.asarray(arr).shape[0]) != n_omega:
+                raise ValueError(
+                    f"mpa_store: {name!r} has {n_omega} frequency slabs "
+                    f"but its {label} is length "
+                    f"{int(np.asarray(arr).shape[0])}.  Each of these is "
+                    f"one entry per slab; a short one cannot address "
+                    f"every slab and a long one addresses slabs that do "
+                    f"not exist.")
+
+        # THE SAMPLING ATTRS, through :data:`_SAMPLING_ORDER` and back
+        # through ``_canonical_sampling`` — the same coercions the stamp
+        # used, run by the one function that owns them.  (The digest
+        # check below already re-canonicalises, so this adds no check
+        # that did not run before; it only runs one call earlier.)
+        sampling, _ = _canonical_sampling({
+            key: (qs.qirr_attr_str(ds, "mpa_" + key) if key == "protocol"
+                  else ds.attrs["mpa_" + key])
+            for key in _SAMPLING_ORDER})
+        recomputed = omega_grid_digest(omega, line, sampling)
+        stamped_hash = qs.qirr_attr_str(ds, "mpa_grid_hash")
+        if stamped_hash != recomputed:
+            raise ValueError(
+                f"mpa_store: {name!r} ω-grid hash mismatch.  Stamped "
+                f"{stamped_hash}, the grid and protocol on disk hash to "
+                f"{recomputed}.  The sampling points are not the ones "
+                f"this tensor was evaluated at, so every pole fitted "
+                f"from it would be fitted against the wrong abscissae.")
+
+        scalar_ready = ds.attrs.get("qirr_data_ready", None)
+        if scalar_ready is not None and bool(scalar_ready) != bool(
+                ready.all()):
+            raise ValueError(
+                f"mpa_store: {name!r} stamps qirr_data_ready="
+                f"{bool(scalar_ready)} but its per-frequency ledger has "
+                f"{int(ready.sum())} of {n_omega} slabs ready.  The "
+                f"scalar is the CONSERVATIVE summary any version-1 "
+                f"reader will honour, so it must be all(ledger); a "
+                f"disagreement is a file claiming readiness it cannot "
+                f"support.")
+
+        # The q_irr half: tables, digest, shape-vs-attr — the landed
+        # checks, run against the PER-FREQUENCY extents.
+        tables = qs.read_tables(grp, name)
+        can = tables.canonical()
+        if can.digest() != qs.qirr_attr_str(ds, "qirr_table_hash"):
+            raise ValueError(
+                f"mpa_store: {name!r} table hash mismatch.  The unfold "
+                f"tables are not the ones this tensor was written "
+                f"against, so every q it reconstructs — at every ω — "
+                f"would be a permutation of the wrong centroids.")
+        n_q_on_disk = int(ds.shape[1])
+        n_mu = int(ds.shape[3])
+        shape_says = qs.validate_qirr_tables(can, n_q_on_disk, n_mu)
+        attr_says = qs.qirr_attr_str(ds, "q_storage")
+        if attr_says != shape_says:
+            raise ValueError(
+                f"mpa_store: {name!r} shape says q_storage="
+                f"{shape_says!r} ({n_q_on_disk} q rows per frequency "
+                f"against {can.n_q_full} full-BZ rows in the tables) but "
+                f"the attr says {attr_says!r}.  The SHAPE is the primary "
+                f"discriminant and the attr is its cross-check, so a "
+                f"disagreement is a refusal.")
+
+        prov = {k[len("prov_"):]: v for k, v in ds.attrs.items()
+                if str(k).startswith("prov_")}
+        sampling_extra = {
+            str(k)[len("mpa_prov_"):]: v for k, v in ds.attrs.items()
+            if str(k).startswith("mpa_prov_")}
+        for key in ("qirr_generator_commit", "qirr_written_utc",
+                    "qirr_writer", "mpa_writer"):
+            if key in ds.attrs:
+                prov[key] = qs.qirr_attr_str(ds, key)
+        return {
+            "format_version": version,
+            "freq_axis": qs.qirr_attr_str(ds, _FREQ_ATTR),
+            "n_omega": n_omega,
+            "omega": omega,
+            "omega_line": line,
+            "omega_units": qs.qirr_attr_str(ds, "mpa_omega_units"),
+            "sampling": sampling,
+            "grid_hash": recomputed,
+            "data_ready": ready,
+            "n_ready": int(ready.sum()),
+            "q_storage": shape_says,
+            "n_q_on_disk": n_q_on_disk,
+            "n_q_full": can.n_q_full,
+            "n_mu": n_mu,
+            "dtype": np.dtype(ds.dtype),
+            "n_rmu_logical": int(ds.attrs["qirr_n_rmu_logical"]),
+            "centroid_hash": qs.qirr_attr_str(ds, "qirr_centroid_hash"),
+            "table_hash": can.digest(),
+            "closure_verdict": qs.qirr_attr_str(ds, "qirr_closure_verdict"),
+            "provenance": prov,
+            "sampling_extra": sampling_extra,
+        }
+
+
+
+def read_w_slab_collective(
+    src,
+    name,
+    i_omega,
+    *,
+    mesh_xy,
+    require_ready=True,
+):
+    """Read one frequency slab directly into ``P(None,'x','y')``.
+
+    This is the inverse of :func:`write_w_slab_collective`: the file keeps
+    the logical centroid extent, SlabIO pads only the two distributed axes,
+    and no rank materializes the complete ``(q,mu,nu)`` slab.  The routine
+    is valid for any MPA frequency tensor with this layout (in particular
+    both ``chi(z)`` and ``Wc(z)``); the historical ``W`` in its name denotes
+    the on-disk format, not an extra transport.
+
+    COLLECTIVE over ``mesh_xy``: every rank calls it, in the same order,
+    for the same ``i_omega``.  ``src`` must be a PATH (SlabIO).
+
+    RETURNS ``(slab, header)``.  ``slab`` is
+    ``(n_q_on_disk, n_mu_padded, n_mu_padded)`` complex128 — the μ extent
+    is the canonical ``runtime.padding.padded_mu_extent`` round-up, NOT
+    ``header['n_mu']`` and not the weaker per-axis SlabIO round-up.  The
+    4-D read is issued at ``P(None, None, 'x', 'y')`` and the returned 3-D
+    array therefore carries ``P(None, 'x', 'y')``; that is inferred from the
+    leading index, not asserted on the way out.  ``header`` is
+    :func:`read_w_header`'s dict, read with h5py on every rank BEFORE the
+    collective handle opens (read-only on both stacks, which the one-owner
+    registry allows and counts).
+    """
+    from jax.sharding import PartitionSpec as P
+    from file_io.slab_io import SlabIO
+    from runtime.padding import padded_mu_extent
+
+    header = read_w_header(src, name)
+    i = int(i_omega)
+    if not 0 <= i < header["n_omega"]:
+        raise IndexError(
+            f"read_w_slab_collective: frequency index {i} is outside "
+            f"[0,{header['n_omega']}) for {name!r}")
+    if require_ready and not bool(header["data_ready"][i]):
+        raise ValueError(
+            f"read_w_slab_collective: {name!r} slab {i} is allocated but "
+            "not ready")
+
+    logical = (1, header["n_q_on_disk"], header["n_mu"], header["n_mu"])
+    spec = P(None, None, "x", "y")
+    # Both μ axes belong to one canonical in-memory carrier.  Padding each
+    # axis only by its own mesh side is legal for this SlabIO read but is not
+    # sufficient for downstream product-face/all-to-all consumers.  In
+    # particular, P=36 and n_mu=2070 would otherwise reload χ at 2070 while
+    # V is correctly carried at padded_mu_extent(2070, 36) == 2088.
+    n_mu_padded = int(padded_mu_extent(header["n_mu"], mesh_xy))
+    shape = (1, header["n_q_on_disk"], n_mu_padded, n_mu_padded)
+    with SlabIO(src, mode="r", mesh=mesh_xy) as io:
+        slab = io.read_slab(
+            name, shape=shape, offset=(i, 0, 0, 0),
+            valid_shape=logical, partition_spec=spec)
+    return slab[0], header
+
+
+
+def read_occupation_stamps(src, *, mode="r"):
+    """Return the fit store's occupation stamps, or None if unstamped."""
+    from file_io.mpa_store import (
+        _OCC_STAMP_ORDER,
+        _h5,
+        _qs,
+    )
+    qs = _qs()
+    with _h5(src, mode) as grp:
+        if ("mpa_" + _OCC_STAMP_ORDER[0]) not in grp.attrs:
+            return None
+        return {
+            "occ_hash": qs.qirr_attr_str(grp, "mpa_occ_hash"),
+            "mu_ry": float(grp.attrs["mpa_mu_ry"]),
+            "smearing_family": qs.qirr_attr_str(grp, "mpa_smearing_family"),
+            "smearing_width_ry": float(grp.attrs["mpa_smearing_width_ry"]),
+            "occ_nelec": float(grp.attrs["mpa_occ_nelec"]),
+        }

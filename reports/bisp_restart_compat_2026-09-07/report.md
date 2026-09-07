@@ -10,7 +10,7 @@
 | BSE absorption_haydock | Above plus enk_full privately; dipole_cart/deltaE | bse_loading for tensors; private h5py at absorption_haydock:174, absorption_common:208 for dipole | Defect: private energy/dipole reads; full-k energies/dipoles, no packed axes |
 | BSE bse_window energy correction | enk_full | private h5py bse_window:642 | Defect: route energy read through shared backend; full-k ladder |
 | exciton_bands | BSE datasets above; enk_full privately for eqp; whead/W0_ready privately for head; dipole provenance attrs | bse_loading plus private accesses exciton_bands:450,1393,1648 | Defect: private metadata reads; htransform carrier currently may be 4-spinor while source WFN is SOC 2-spinor |
-| exciton_bands VQ path | psi_parent_y or psi_full_y, psi_parent_k_rows, kgrid, enk_full, V_qmunu, W0_qmunu; zeta_q_G, G vectors, ngk, FFT grid, centroid coordinates and solve identity | vq_interp.load_zeta_coarse:482 private restart handle; bse_loading parent unfold and q store; ZetaLoader for zeta | Defect: private restart dataset access remains. Canonical host psi cache, full-q lazy tiles or shared q unfold. Interp needs full-q zeta; default refit accepts q-IBZ zeta metadata |
+| exciton_bands VQ path | psi_parent_y or psi_full_y, psi_parent_k_rows, kgrid, enk_full, V_qmunu, W0_qmunu; zeta_q_G, G vectors, ngk, FFT grid, centroid coordinates and solve identity | vq_interp.load_zeta_coarse:482 private restart handle; bse_loading parent unfold and q store; ZetaLoader for zeta | Defect: private restart dataset access remains. Canonical host psi cache, full-q lazy tiles or shared q unfold. Interp needs full-q zeta; pure refit accepts q-IBZ zeta metadata |
 | bandstructure/bse_setup | No direct HDF5 bundle access; accepts B_at_mu, interpolated energies and arrays | htransform setup + bse_loading caller | Spin is B_at_mu shape; reconstructed psi must share charge family with BSE inputs |
 | bandstructure/htransform | qp_wfn_rotations: U_mnk, E_qp_nk_rydberg, band_range, kgrid, kpoints_crys, source provenance; centroid text; WFN | file_io.qp_wfn.read_qp_rotations_artifact; WfnLoader, file_io.centroids | No private HDF5; authenticates source k/window, canonical rotation order; no restart V/W or packed centroid dependency |
 | gw.downfold_run | psi_parent_y/legacy psi_full_y; V_qmunu/W0_qmunu and nohead siblings; enk_full; G0_mu_nu, kgrid, band windows, heads/S_cart_head, logical extents, centroid digest, q tables; zeta_q_G/header | tagged_arrays load_restart_state_from_h5/read_munu_tensor_from_h5; bse_loading parent action; ZetaLoader; private _read_geometry:178 and q-storage probe:268 | Defect: private geometry and storage metadata reads; shared tensors full-k/full-q, canonical order, ns shape; reads axis layout regardless of writer |
@@ -35,6 +35,11 @@
 | GW cross-layout restart | scalar (1; false→true; IBZ) | RED, registered | eqp0 max0.128 μeV; eqp1 max0.174 μeV; exact tolerance0 | `12_scalar_ft/eqp*.compare_final.txt` |
 | Dynamic GW restart | SOC GN (4; true→true; IBZ) | PASS | Both EQPs identical; mpa and sigma_quadrature_rules stores carried into restart | `14_soc_tt/restart_final.rank0.log`, `eqp*.compare_final.txt`, `tmp/mpa`, `tmp/sigma_quadrature_rules` |
 | GW same/cross-layout restart | MoS2 (4; true→true, true→false, false→true, false→false; IBZ) | PASS | eqp0/eqp1 identical in all210 printed rows for all four arms | `15_mos2_tt` through `18_mos2_ff`: `restart_final.rank0.log`, `eqp*.compare_final.txt` |
+| Fresh + dynamic GW restart | additional SOC GN (2; true; IBZ) | PASS | Both EQPs identical in all256 printed rows after moving dynamic store readers | `07_soc_ns2_gn/{fresh,restart}.rank0.log`, `eqp*.compare.txt` |
+| BSE, downfold, htransform | additional SOC GN (2; true; IBZ) | PASS execution | All complete on the new two-spinor GN bundle; htransform includes the complete QP block | `07_soc_ns2_gn/{bse,downfold,htransform}.rank0.log` |
+| Exciton ongrid | additional SOC GN (2; true; IBZ) | PASS | Production ongrid calculation completes | `07_soc_ns2_gn/ongrid.rank0.log`, `ongrid.out` |
+| Exciton default (interp) | additional SOC GN (2; true; IBZ) | RED, registered | ζ is8 stored q versus64 full q; existing interpolation requires full-BZ ζ and separately supports only slab geometry | `07_soc_ns2_gn/exciton.rank0.log` |
+| Dynamic store/pipeline CPU tests | four emulated CPU devices, G0 | PASS | 112 passed after retargeting instrumentation to the actual reader owner | `00_audit/dynamic_cpu_v2.lx.log` |
 | Shared reader P4 | All six fresh bundles (1/2/4; both read layouts; IBZ) | PASS | V, energies and both raw parent faces in every present family: max absolute difference0 between layouts | `00_audit/reader_layout_parity.json`, `reader_layout.rank0.log` |
 | BSE ring Lanczos | scalar (1; true/false; IBZ) | PASS execution/layout parity | Lowest20 spectra identical between layouts; no same-deck recorded external spectrum was supplied for the 8-band GN fresh deck | `01_scalar_true/bse_debug.rank0.log`, `04_scalar_false/bse_layout_comparison.json` |
 | BSE ring Lanczos | supplied SOC GN (4; true; IBZ) | PASS execution | Charge-family ns4 kernel completes; recorded receipt uses a different band/energy deck, so no same-deck reference claim | `02_soc_true/bse_debug.rank0.log` |
@@ -62,7 +67,7 @@
 | Photon static readers | `file_io.restart_bundle` | Existing BispinorVqReader moved intact; family tile validation and q tables; writer retains format constants |
 | ζ consumers | `file_io.restart_bundle` | `open_zeta` opens the one zeta_loader service; moved VQ tile adapter owns no independent HDF5 handle |
 | Upstream centroids/WFN/PSP | N/A | Producers or source inputs, not gwjax bundle consumers; existing canonical source services |
-| Dynamic pole/quadrature stores | `file_io.mpa_store` / rule service | Existing single specialized store remains; no duplicated driver HDF5 reader. Further physical module consolidation is not claimed by the static-bundle seam |
+| Dynamic pole stores | `file_io.restart_bundle` | W-slab/header/column, pole/head, resume and fit readers moved out of mpa_store; writer and format helpers remain there. Quadrature rules retain their existing non-HDF5 service |
 
 | Deletion ledger module | Lines removed in batch | Private or duplicate reader deleted |
 |---|---:|---|
@@ -78,6 +83,8 @@
 | `src/gw/eqp_bgw.py` | 41 | Private QP/evaluation energy reader |
 | `src/postprocess/rotate_wfn_to_qp.py` | 73 | Private k-irr map reader |
 
+| `src/file_io/mpa_store.py` | 1294 | Public W, fit, head and pole readers/classes moved to shared module; writer calls the same reader |
+
 | Shared reader public surface | Returns |
 |---|---|
 | `read_metadata`, `_find_restart_file`, `require_screened_bundle` | Small semantic metadata; unique canonical path; authenticated readiness |
@@ -92,8 +99,15 @@
 | `BispinorVqReader`, `read_photon_charge`, `read_photon_gamma` | Family photon tiles and canonical head factors |
 | `load_dipole_h5`, `read_dipole_metadata`, `read_dipole_parent_window` | Dipole arrays, small provenance, selected parent velocity blocks |
 | `open_zeta` | Canonical zeta service handle, whose local/collective transports remain single-owner |
+| `read_w_header`, `read_w_slab[_collective]`, `read_w_tables`, `read_w_columns[_collective]`, `open_w_column_reader`, `WColumnReader` | Dynamic sampled-W headers, q slabs and bounded frequency-column tiles |
+| `read_head_fit[_collective]`, `read_fit_block`, `read_fit_tensors`, `read_fit_io_receipt`, `read_fit_unfold_tables`, `read_poles`, `open_pole_reader`, `PoleReader` | Dynamic head and pole payloads with the existing bounded collective handle lifetime |
+| `validate_fit_store[_for_resume]`, `read_occupation_stamps` | Resume admission, completed-fit ledger and occupation identity |
 | Policy and band-window validators | Existing provenance/refusal contracts, now beside payload reads |
 
 | Batch state | Evidence / limitation |
 |---|---|
-| Foundation batch, gated for push | Gates above distinguish baseline runs, current reader proof, follow-up diagnostics and independent physical restrictions; no all-green claim |
+| Foundation batch 76da8f9f pushed; claim1436 | Gates above distinguish baseline runs, current reader proof, follow-up diagnostics and independent physical restrictions; no all-green claim |
+
+| Dynamic batch | Evidence |
+|---|---|
+| Ready for push | `07_soc_ns2_gn`: fresh/restart exact EQP; `00_audit/dynamic_cpu_v2.lx.log`:112 passed |

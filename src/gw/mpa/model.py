@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+
 import os
 
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from file_io import restart_bundle as _bundle_reader
 from file_io import mpa_store
 from gw.mpa import evaluator, fit_driver, sample_plan
 
@@ -94,7 +96,7 @@ def make_mpa_plan_from_fit(config, fit_path, *, mesh_xy, material_class):
     mesh_xy : jax.sharding.Mesh
         Process mesh used by the collective fit reader.
     """
-    head = mpa_store.read_head_fit_collective(
+    head = _bundle_reader.read_head_fit_collective(
         fit_path, mesh_xy=mesh_xy, to_unit="Ry")
     stored_z = np.asarray(head["sample_z"], dtype=np.complex128).reshape(-1)
     if stored_z.size == 0 or not np.all(np.isfinite(stored_z)):
@@ -154,7 +156,7 @@ def validate_reused_mpa_fit(
     wfn_identity = _canonical_wfn_identity(wfn, wfn_fingerprint_binding)
     zeta_identity = _canonical_charge_zeta_identity(
         charge_zeta_identity, source_path=charge_zeta_source_path or path)
-    ledger = mpa_store.validate_fit_store(
+    ledger = _bundle_reader.validate_fit_store(
         path,
         expected_identity={
             "w_table_hash": logical_tables.digest(),
@@ -471,7 +473,7 @@ def _solve_wc(
         need_live_w = bool(bgw_q0 is not None or head_response is not None)
         chi = None
         if not wc_ready[index] or bgw_q0 is not None:
-            chi, _ = mpa_store.read_w_slab_collective(
+            chi, _ = _bundle_reader.read_w_slab_collective(
                 sample_path, _CHI, index, mesh_xy=mesh_xy)
             chi = _to_run_order(chi, meta)
         chi_q0 = None
@@ -483,7 +485,7 @@ def _solve_wc(
             chi_q0 = chi[q0row:q0row + 1].copy()
         if wc_ready[index]:
             if need_live_w:
-                Wc, _ = mpa_store.read_w_slab_collective(
+                Wc, _ = _bundle_reader.read_w_slab_collective(
                     sample_path, _WC, index, mesh_xy=mesh_xy)
                 W = _to_run_order(Wc, meta) + V
                 W.block_until_ready()
@@ -543,7 +545,7 @@ def _solve_wc(
                 and not negative_wc_ready[index]):
             import jax
 
-            chi_reflected, _ = mpa_store.read_w_slab_collective(
+            chi_reflected, _ = _bundle_reader.read_w_slab_collective(
                 sample_path, reflected_chi_name, index, mesh_xy=mesh_xy)
             chi_reflected = _to_run_order(chi_reflected, meta)
             W_reflected = solve_w(

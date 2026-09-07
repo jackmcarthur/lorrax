@@ -15,6 +15,7 @@ separate contract.
 """
 from __future__ import annotations
 
+
 import os
 from pathlib import Path
 import subprocess
@@ -33,6 +34,7 @@ def _run_6x6_child() -> None:
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
     import distrib_la
+    from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store
     import file_io.slab_io as slab_io
     from runtime.padding import padded_mu_extent
@@ -58,7 +60,7 @@ def _run_6x6_child() -> None:
         "n_mu": n_logical,
         "data_ready": np.asarray([True]),
     }
-    mpa_store.read_w_header = lambda *_args, **_kwargs: header
+    _bundle_reader.read_w_header = lambda *_args, **_kwargs: header
 
     class _MemorySlabIO:
         """Return the logical payload in the production requested carrier."""
@@ -86,7 +88,7 @@ def _run_6x6_child() -> None:
                 carrier, NamedSharding(self.mesh, partition_spec))
 
     slab_io.SlabIO = _MemorySlabIO
-    chi_q, _ = mpa_store.read_w_slab_collective(
+    chi_q, _ = _bundle_reader.read_w_slab_collective(
         "synthetic_samples.h5", "chi0_qmunu_z", 0, mesh_xy=mesh)
     assert tuple(chi_q.shape) == (n_q, n_padded, n_padded)
     chi_host = np.asarray(chi_q).copy()

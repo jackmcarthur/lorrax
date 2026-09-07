@@ -33,6 +33,7 @@ full-size valid-pole-count map solely for that assertion.
 
 from __future__ import annotations
 
+
 import io
 import inspect
 
@@ -43,6 +44,7 @@ h5py = pytest.importorskip("h5py")
 pytest.importorskip("symmetry_maps.qirr_store")
 jax = pytest.importorskip("jax")
 
+from file_io import restart_bundle as _bundle_reader
 from file_io import mpa_store as MS                               # noqa: E402
 from gw.mpa import fit_driver, pade_fit, sampling, tiling         # noqa: E402
 from tests._mpa_test_geometry import (                            # noqa: E402
@@ -260,7 +262,7 @@ def test_run_driver_holds_one_fit_payload_handle(
     fit_writes = [name for path, name in writes if path == str(fit_path)]
     assert len(fit_writes) == 3 * report["blocks_walked"]
     assert set(fit_writes) == {"Omega_p", "B_p", "fit_condition"}
-    receipt = MS.read_fit_io_receipt(str(fit_path))
+    receipt = _bundle_reader.read_fit_io_receipt(str(fit_path))
     assert receipt["scope"] == "successful_body_attempt"
     for key in MS._FIT_IO_RECEIPT_COUNTS:
         assert receipt["counts"][key] == report[key]
@@ -576,11 +578,11 @@ def test_sample_identities_propagate_through_fit_and_reuse(fitted):
     assert {
         key: fitted["ledger"]["provenance"][key] for key in expected
     } == expected
-    reused = MS.validate_fit_store(
+    reused = _bundle_reader.validate_fit_store(
         str(fitted["path"]), expected_identity=expected)
     assert reused["complete"]
     with pytest.raises(ValueError, match="charge_zeta_identity"):
-        MS.validate_fit_store(
+        _bundle_reader.validate_fit_store(
             str(fitted["path"]), expected_identity={
                 **expected, "charge_zeta_identity": "wrong-zeta"})
 
@@ -600,7 +602,7 @@ def test_end_to_end_recovers_the_planted_pole_field(planted, fitted,
     again through ``read_fit_tensors`` after ``finalize_fit_store``.
     Nothing in this assertion touches an in-memory shortcut.
     """
-    Om, Bp, diag, ledger = MS.read_fit_tensors(str(fitted["path"]))
+    Om, Bp, diag, ledger = _bundle_reader.read_fit_tensors(str(fitted["path"]))
     assert ledger["complete"]
     assert Om.shape == planted["Omega"].shape
     assert Bp.shape == planted["B"].shape
@@ -627,7 +629,7 @@ def test_fit_restart_checkpoints_only_closed_32_block_epochs(
     one_column_tile = (
         planted["z"].size * planted["n_mu"] * np.dtype(np.complex128).itemsize)
     original = fit_driver.fit_one_block
-    original_open = MS.open_w_column_reader
+    original_open = _bundle_reader.open_w_column_reader
     original_writer = MS.FitWriter
     calls = {"count": 0}
     readers = []
@@ -721,7 +723,7 @@ def test_ordered_end_to_end_stores_and_recovers_the_odd_residue(
     ledger, report = fit_driver.run_fit_driver(
         str(sample_path), _W_NAME, str(fit_path), z, _N_P,
         w_negative_name=_W_NEGATIVE_NAME, mesh_xy=mesh_xy)
-    Omega_f, B_f, D_f = MS.read_poles(
+    Omega_f, B_f, D_f = _bundle_reader.read_poles(
         str(fit_path), include_odd=True)
     assert ledger["ordered_residues"]
     assert report["ordered_residues"]
@@ -744,7 +746,7 @@ def test_thiele_end_to_end_keeps_only_condition_payload(tmp_path, mesh_xy):
     assert ledger["complete"]
     assert report["solve"] == "thiele"
     assert report["eig"] == "lapack"
-    _, _, diagnostics, _ = MS.read_fit_tensors(str(fit_path))
+    _, _, diagnostics, _ = _bundle_reader.read_fit_tensors(str(fit_path))
     assert set(diagnostics) == {"condition"}
     assert np.all(np.isfinite(diagnostics["condition"]))
     with h5py.File(fit_path, "r") as f:
@@ -882,7 +884,7 @@ def test_end_to_end_at_the_si_pole_schedule(tmp_path, capsys, mesh_xy):
     assert report["n_cols_budget"] == 1
     assert report["blocks_walked"] == field["n_q"] * field["n_mu"]
 
-    Om, Bp, diag, _ = MS.read_fit_tensors(str(fit_path))
+    Om, Bp, diag, _ = _bundle_reader.read_fit_tensors(str(fit_path))
     d_omega = float(np.max(np.abs(Om - field["Omega"])))
     d_b = float(np.max(np.abs(Bp - field["B"])))
     with capsys.disabled():
@@ -910,7 +912,7 @@ def test_end_to_end_at_the_si_pole_schedule(tmp_path, capsys, mesh_xy):
 
 def test_production_fit_persists_only_condition_map(planted, fitted):
     """Full fit-health arrays do not silently return to production I/O."""
-    _, _, diag, _ = MS.read_fit_tensors(str(fitted["path"]))
+    _, _, diag, _ = _bundle_reader.read_fit_tensors(str(fitted["path"]))
     assert set(diag) == {"condition"}
     with h5py.File(fitted["path"], "r") as f:
         assert set(k for k in f if str(k).startswith("fit_")) == {
@@ -937,7 +939,7 @@ def test_every_block_has_its_diagnostics_and_the_ledger_is_complete(
             np.sqrt(np.finfo(np.float64).eps)),
     }
 
-    _, _, diag, _ = MS.read_fit_tensors(str(fitted["path"]))
+    _, _, diag, _ = _bundle_reader.read_fit_tensors(str(fitted["path"]))
     assert set(diag) == {"condition"}
     arr = diag["condition"]
     assert arr.shape == (n_q, n_mu, n_mu)
@@ -1057,7 +1059,7 @@ def test_red_twin_budget_bust_refuses_mid_walk_then_resumes(
     ledger = MS.finalize_fit_store(str(fit_path), certification=_CERT)
     assert ledger["complete"]
 
-    Om, Bp, _, _ = MS.read_fit_tensors(str(fit_path))
+    Om, Bp, _, _ = _bundle_reader.read_fit_tensors(str(fit_path))
     assert np.max(np.abs(Om - planted["Omega"])) < 1.0e-7
     assert np.max(np.abs(Bp - planted["B"])) < 1.0e-6
 
@@ -1180,7 +1182,7 @@ def test_driver_writes_occupation_stamps_when_given_a_state(planted,
         str(planted["w_path"]), _W_NAME, str(fit_path),
         planted["z"], planted["n_p"], mesh_xy=mesh_xy,
         occupation_state=state)
-    got = MS.read_occupation_stamps(str(fit_path))
+    got = _bundle_reader.read_occupation_stamps(str(fit_path))
     assert got["occ_hash"] == "deadbeefdeadbeef"
     assert got["smearing_family"] == "mp1"
     np.testing.assert_allclose(

@@ -89,7 +89,7 @@ def test_explicit_fit_reuse_asserts_every_cross_run_identity(
             "ordered_residues": False,
         }
 
-    monkeypatch.setattr(model.mpa_store, "validate_fit_store", validate)
+    monkeypatch.setattr(model._bundle_reader, "validate_fit_store", validate)
     monkeypatch.setattr(
         model, "_canonical_wfn_identity",
         lambda source, binding=None: {
@@ -157,7 +157,7 @@ def test_explicit_fit_reuse_accepts_conservative_frequency_ceiling(
         model, "_q_wedge", lambda *_args: (
             np.arange(1), _Tables(), SimpleNamespace(centroid_hash="centroids")))
     monkeypatch.setattr(
-        model.mpa_store, "validate_fit_store", lambda *_args, **_kwargs: {
+        model._bundle_reader, "validate_fit_store", lambda *_args, **_kwargs: {
             "n_p": 2, "n_q": 1, "n_mu": 3, "ordered_residues": False})
     monkeypatch.setattr(
         model, "_canonical_wfn_identity",
@@ -225,7 +225,7 @@ def test_dyson_walk_holds_one_chi_frequency_and_writes_wc(monkeypatch):
         assert name == model._WC
         events.append(("write", i, np.asarray(value)))
 
-    monkeypatch.setattr(model.mpa_store, "read_w_slab_collective", read)
+    monkeypatch.setattr(model._bundle_reader, "read_w_slab_collective", read)
     monkeypatch.setattr(model.mpa_store, "write_w_slab_collective", write)
 
     import gw.w_isdf as w_isdf
@@ -262,7 +262,7 @@ def test_dyson_resume_skips_independently_ready_wc_slabs(monkeypatch):
         assert name == model._WC
         events.append(("write", i))
 
-    monkeypatch.setattr(model.mpa_store, "read_w_slab_collective", read)
+    monkeypatch.setattr(model._bundle_reader, "read_w_slab_collective", read)
     monkeypatch.setattr(model.mpa_store, "write_w_slab_collective", write)
     import gw.w_isdf as w_isdf
     monkeypatch.setattr(

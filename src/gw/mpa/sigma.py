@@ -17,7 +17,11 @@ from common.collectives import device_put_process_local
 from common import timing
 from common.progress import LoopProgress
 from common.units import RYD_TO_EV
-from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
+from file_io.restart_bundle import (
+    PoleReader,
+    open_pole_reader,
+    validate_fit_store,
+)
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import SigmaOmegaResult, _residue_for_space, sigma_band_axis
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
