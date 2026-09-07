@@ -19,12 +19,16 @@ import numpy as np
 # for both direct-script and python -m invocation without importing JAX.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import varpro
+import constrained_varpro
 from measure import spectrum
 
 
 ORDER = Path('/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/152_shared_pole_push_2026-09-07/exchange/order/weight.npz')
 ORDER_SHA = '27eb75153dc49849e6c5f3d27cbff24514f7ff28a0f705bc864be34c1b82b0f2'
 EV = 13.605693122994
+MOMENT_NAMES = ['M0', 'Mm1', 'M1']
+MOMENT_IDENTITY = {'kind': 'parent_dA', 'names': MOMENT_NAMES, 'units': 'Ry',
+                   'coordinate': 'physical moments in the same V-whitened Hermitian channels'}
 
 
 def train_indices(bank):
@@ -143,14 +147,16 @@ def errors_from_gram(z_all, indices, row_map, poles, gram, weights):
     so either whitened or physical channel Gram can be scored directly.
     """
     nall = len(z_all)
-    nt = row_map.shape[1]//2
-    if row_map.shape[1] != 2*nt or gram.shape != (2*nall,2*nall):
+    extra = gram.shape[0]-2*nall
+    nt = (row_map.shape[1]-extra)//2
+    if extra not in (0,3) or row_map.shape[1] != 2*nt+extra or gram.shape != (2*nall+extra,2*nall+extra):
         raise ValueError('Residual row-map/Gram shape mismatch')
-    selection = np.eye(2*nall)[np.r_[np.arange(nt),np.arange(nt)+nall]]
+    source_rows = np.r_[np.arange(nt),np.arange(nt)+nall,np.arange(extra)+2*nall]
+    selection = np.eye(2*nall+extra)[source_rows]
     phi = varpro.basis(z_all[indices], poles)
     evaluation_map = np.vstack((phi.real, phi.imag)) @ row_map
     prediction = evaluation_map @ selection
-    reference = np.eye(2*nall)[np.r_[indices, indices+nall]]
+    reference = np.eye(2*nall+extra)[np.r_[indices, indices+nall]]
     residual = prediction - reference
     row_error = np.einsum('ij,jk,ik->i', residual, gram, residual)
     row_norm = np.diag(gram)[np.r_[indices, indices+nall]]
@@ -167,7 +173,8 @@ def errors_from_gram(z_all, indices, row_map, poles, gram, weights):
             'squared_error': numerator, 'squared_reference': denominator,
             'negative_roundoff_clamped': bool(numerator < 0),
             'evaluation_map_operator_2norm': float(amplification),
-            'evaluation_map_scope': 'unweighted real H/A output from unweighted original Htrain/Atrain; fixed-pole map only',
+            'evaluation_map_scope': ('unweighted real H/A output from unweighted original Htrain/Atrain'
+                                     + (' and raw Ry M0/Mm1/M1' if extra else '') + '; fixed-pole map only'),
             'rows': int(len(indices))}
 
 
@@ -176,6 +183,9 @@ def line_errors(bank, fitted, omega, weight, selected=None):
     z_all = np.r_[bank['z'], bank['zh']]
     result = {}
     nt = len(bank['z'])
+    constrained = fitted['row_map'].shape[1] == 2*nt+3
+    coordinates = ([('white','moment_channel_gram'),('physical','physical_moment_channel_gram')]
+                   if constrained else [('white','channel_gram'),('physical','physical_channel_gram')])
     selected = np.arange(nt) if selected is None else selected
     omitted = np.setdiff1d(np.arange(nt), selected)
     for split, base in [('train', selected), ('validation_unselected_train', omitted),
@@ -185,7 +195,7 @@ def line_errors(bank, fitted, omega, weight, selected=None):
             loss = line_weights(z_all[indices], omega, weight)
             label = f'{split}_height_{height:.9f}_ev'
             result[label] = {}
-            for coordinate, key in [('white', 'channel_gram'), ('physical', 'physical_channel_gram')]:
+            for coordinate, key in coordinates:
                 result[label][coordinate] = {
                     mode: errors_from_gram(z_all, indices, fitted['row_map'], fitted['poles_ry'],
                                            bank[key], selected)
@@ -193,7 +203,7 @@ def line_errors(bank, fitted, omega, weight, selected=None):
     return result
 
 
-def load_gram(path):
+def load_gram(path, require_moments=False):
     """Refuse missing or mismatched banks before starting any fit."""
     if not path.is_file():
         raise FileNotFoundError(f'Gram input missing (production may still be running): {path}')
@@ -206,6 +216,8 @@ def load_gram(path):
     nc = 2*(nt+nh)
     shapes = {'z': (nt,), 'zh': (nh,), 'channel_gram': (nc,nc),
               'physical_channel_gram': (nc,nc), 'complex_gram': (nt,nt), 'sketches': (nt,5)}
+    if require_moments:
+        shapes.update(moment_channel_gram=(nc+3,nc+3),physical_moment_channel_gram=(nc+3,nc+3))
     for key, shape in shapes.items():
         if key not in bank or bank[key].shape != shape or not np.all(np.isfinite(bank[key])):
             raise ValueError(f'{path}: invalid {key}, expected finite shape {shape}')
@@ -218,7 +230,8 @@ def provenance():
     return {'job_step': os.getenv('SLURM_JOB_ID', 'login-cpu')+'.'+os.getenv('SLURM_STEP_ID', 'none'),
             'rank': int(os.getenv('SLURM_PROCID', '0')), 'source_tree': str(root),
             'source_commit': subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip(),
-            'source_sha256': {p.name: sha(p) for p in [Path(__file__), Path(varpro.__file__)]},
+            'source_sha256': {p.name: sha(p) for p in [Path(__file__), Path(varpro.__file__),
+                                                      Path(constrained_varpro.__file__)]},
             'weight_path': str(ORDER), 'weight_sha256': ORDER_SHA,
             'weight_rule': 'trapezoid times ORDER; training heights normalized equally; held rows excluded',
             'row_map_contract': 'unweighted Htrain[0:Nt], Atrain[Nt+Nh:2*Nt+Nh]; residues in Ry',
@@ -264,7 +277,23 @@ def rank_summary(gram_dir, out_dir, training_indices=None):
         stream.write('\n'.join(lines)+'\n')
 
 
-def warm_start(directory, q, p, bank, loss, selected=None):
+def moment_receipt(upstream):
+    """Identify parent moments; refuse a known frozen-parent perturbed input."""
+    digest = upstream.get('moment_sha256','')
+    scope = upstream.get('moment_scope','')
+    if len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest.lower()):
+        raise ValueError('Moment-constrained fit needs a producer-authenticated moment SHA256')
+    if 'parent' not in scope.lower() or 'defect' in scope.lower():
+        raise ValueError('Moment constraints require identified parent dA moments, not defects')
+    censuses = [item['band_energy_census'] for item in upstream.get('input_paths',[])
+                if isinstance(item,dict) and 'band_energy_census' in item]
+    if 'unchanged parent' in scope.lower() and any(census.get('amplitude_mev',0)!=0 for census in censuses):
+        raise ValueError('Perturbed DATA has frozen parent moments; dependent SC moments must be regenerated')
+    return {'identity': MOMENT_IDENTITY, 'path': upstream.get('moment_bank'), 'sha256': digest,
+            'scope': scope, 'band_energy_after_sha256': [census.get('after_sha256') for census in censuses]}
+
+
+def warm_start(directory, q, p, bank, loss, selected=None, moment_constrained=False, current_moments=None):
     """Authenticate a warm seed and refuse changes to the fixed fit functional.
 
     Poles alone are seeded; every frequency and width remains an optimizer
@@ -280,12 +309,25 @@ def warm_start(directory, q, p, bank, loss, selected=None):
         raise ValueError(f'Warm export hash mismatch: {path}')
     if record['provenance']['source_sha256']['varpro.py'] != sha(varpro.__file__):
         raise ValueError('Warm-start solver changed; cannot claim identical functional')
+    old_kind = record.get('kind','unconstrained')
+    kind = 'moment_constrained' if moment_constrained else 'unconstrained'
+    if old_kind != kind:
+        raise ValueError('Warm-start constrained/unconstrained functional changed')
+    if moment_constrained:
+        if record['provenance']['source_sha256'].get('constrained_varpro.py') != sha(constrained_varpro.__file__):
+            raise ValueError('Warm-start constrained solver changed')
+        old_moments = record.get('moment_target')
+        if old_moments is None or current_moments is None or old_moments['identity']!=current_moments['identity']:
+            raise ValueError('Warm-start moment identity/order/units changed')
+        if (old_moments['band_energy_after_sha256'] != current_moments['band_energy_after_sha256']
+                and old_moments['sha256'] == current_moments['sha256']):
+            raise ValueError('Band energies changed but parent moment artifact stayed frozen')
     if record['provenance']['weight_sha256'] != ORDER_SHA:
         raise ValueError('Warm-start ORDER functional changed')
     old_gram_path = Path(record['input_path'])
     if sha(old_gram_path) != record['input_sha256']:
         raise ValueError(f'Warm input Gram hash mismatch: {old_gram_path}')
-    old_bank = load_gram(old_gram_path)
+    old_bank = load_gram(old_gram_path,require_moments=moment_constrained)
     selected = np.arange(len(bank['z'])) if selected is None else selected
     with np.load(path, allow_pickle=False) as old:
         old_selected = (old['selected_training_indices'] if 'selected_training_indices' in old.files
@@ -299,10 +341,12 @@ def warm_start(directory, q, p, bank, loss, selected=None):
         poles = old['poles_ry'].copy()
     return poles, {'path': str(path), 'sha256': sha(path), 'receipt_path': str(record_path),
                    'receipt_sha256': sha(record_path), 'grid_weights_solver_match': True,
+                   'kind':kind, 'moment_identity_match':bool(moment_constrained),
+                   'moment_data_policy':'Dependent moment values may change; constraint identities remain fixed',
                    'pole_variables': 'all frequencies and widths remain free'}
 
 
-def main(gram_dir, out_dir, check=False, warm_dir=None, training_indices=None):
+def main(gram_dir, out_dir, check=False, warm_dir=None, training_indices=None, moment_constrained=False):
     """Fit q slots distributed by SLURM_PROCID stride SLURM_NTASKS."""
     rank, tasks = int(os.getenv('SLURM_PROCID', '0')), int(os.getenv('SLURM_NTASKS', '1'))
     if tasks < 1 or not 0 <= rank < tasks:
@@ -311,6 +355,13 @@ def main(gram_dir, out_dir, check=False, warm_dir=None, training_indices=None):
     rowplan = read_rowplan(training_indices)
     origin = provenance()
     origin['training_rowplan'] = rowplan
+    solver = constrained_varpro if moment_constrained else varpro
+    kind = 'moment_constrained' if moment_constrained else 'unconstrained'
+    moment_names = MOMENT_NAMES if moment_constrained else []
+    extra = 3 if moment_constrained else 0
+    origin['kind'] = kind
+    if moment_constrained:
+        origin['row_map_contract'] += '; then raw physical Ry M0,Mm1,M1 coordinates'
     slots = list(range(rank, 29, tasks))
     out_dir.mkdir(parents=True, exist_ok=True)
     if (out_dir/f'receipt_rank{rank:02d}.json').exists():
@@ -327,20 +378,24 @@ def main(gram_dir, out_dir, check=False, warm_dir=None, training_indices=None):
                 path = out_dir/f'q{q:02d}_p{p:02d}.{suffix}'
                 if path.exists():
                     raise FileExistsError(f'Immutable output exists; use a new experiment: {path}')
-    check_result = varpro.synthetic_check() if check else None
+    check_result = solver.synthetic_check() if check else None
     statuses = []
     for q in slots:
         path = gram_dir/f'q{q:02d}.npz'
-        bank = load_gram(path)
+        bank = load_gram(path,require_moments=moment_constrained)
         selected = selected_rows(bank, rowplan)
         loss = fitting_weights(bank, selected, omega, weight)
         training = train_indices(bank)
         nt = len(bank['z'])
         selected_channels = np.r_[selected, selected+nt]
         fit_training = training[selected_channels]
-        gram = bank['channel_gram'][np.ix_(fit_training, fit_training)]
+        if moment_constrained:
+            fit_training = np.r_[fit_training,2*(nt+len(bank['zh']))+np.arange(3)]
+        gram_name = 'moment_channel_gram' if moment_constrained else 'channel_gram'
+        gram = bank[gram_name][np.ix_(fit_training, fit_training)]
         upstream_path = path.with_suffix('.json')
         upstream = json.loads(upstream_path.read_text()) if upstream_path.is_file() else {'receipt_missing': str(upstream_path)}
+        current_moments = moment_receipt(upstream) if moment_constrained else None
         for p in (8,16,24,32):
             stem = out_dir/f'q{q:02d}_p{p:02d}'
             record = {'q': q, 'p': p, 'provenance': origin, 'order_receipt': receipt,
@@ -349,17 +404,20 @@ def main(gram_dir, out_dir, check=False, warm_dir=None, training_indices=None):
                       'rowplan_sha256': rowplan['sha256'] if rowplan is not None else None,
                       'training_values_available': nt, 'held_validation_values': len(bank['zh']),
                       'unselected_training_validation_values': nt-len(selected),
-                      'within_40_fitted_values': bool(len(selected) <= 40)}
+                      'within_40_fitted_values': bool(len(selected) <= 40), 'kind':kind,
+                      'moment_names':moment_names, 'moment_target':current_moments}
             try:
                 print(f'FIT q{q:02d} p={p} rank={rank} start', flush=True)
                 initial = None
                 if warm_dir is not None:
-                    initial, seed_receipt = warm_start(warm_dir, q, p, bank, loss, selected)
+                    initial, seed_receipt = warm_start(warm_dir, q, p, bank, loss, selected,
+                                                       moment_constrained,current_moments)
                     record['warm_start'] = seed_receipt
-                fitted = varpro.fit(bank['z'][selected], loss[selected], gram,
+                fitted = solver.fit(bank['z'][selected], loss[selected], gram,
                                     bank['sketches'][selected], p, initial=initial)
-                expanded_map = np.zeros((p,2*nt), dtype=fitted['row_map'].dtype)
-                expanded_map[:,selected_channels] = fitted['row_map']
+                expanded_map = np.zeros((p,2*nt+extra), dtype=fitted['row_map'].dtype)
+                output_columns = np.r_[selected_channels,2*nt+np.arange(extra)]
+                expanded_map[:,output_columns] = fitted['row_map']
                 fitted['row_map'] = expanded_map
                 fitted.update(values_used=len(selected), selected_training_indices=selected.tolist(),
                               rowplan_sha256=rowplan['sha256'] if rowplan is not None else None)
@@ -368,6 +426,7 @@ def main(gram_dir, out_dir, check=False, warm_dir=None, training_indices=None):
                     np.savez(stream, poles_ry=fitted['poles_ry'], row_map=fitted['row_map'],
                              z_train_ry=bank['z'], z_held_ry=bank['zh'], weights_loss=loss,
                              train_channel_indices=training, selected_training_indices=selected,
+                             kind=np.asarray(kind),moment_names=np.asarray(moment_names,dtype='U3'),
                              rowplan_sha256=np.asarray(rowplan['sha256'] if rowplan is not None else ''))
                 record.update(status='FIT_COMPLETE', diagnostics={k:v for k,v in fitted.items() if k != 'row_map'},
                               line_errors=errors, export_path=str(stem.with_suffix('.npz')),
@@ -390,9 +449,13 @@ if __name__ == '__main__':
     parser.add_argument('--warm-start', type=Path, help='Matching q/p exports; grid/weights/solver equality required')
     parser.add_argument('--training-indices', type=Path,
                         help='Fixed JSON list of at most 40 original training rows; held rows forbidden')
+    parser.add_argument('--moment-constrained',action='store_true',
+                        help='Experiment variant: enforce parent M0,Mm1,M1 from extended Grams')
     parser.add_argument('--summary-only', action='store_true', help='Emit all-q original-Gram ORDER rank tables only')
     args = parser.parse_args()
     if args.summary_only:
+        if args.moment_constrained:
+            parser.error('--summary-only reports original sample ranks; omit --moment-constrained')
         rank_summary(args.gram, args.out, args.training_indices)
     else:
-        main(args.gram, args.out, args.synthetic_check, args.warm_start, args.training_indices)
+        main(args.gram, args.out, args.synthetic_check, args.warm_start, args.training_indices,args.moment_constrained)

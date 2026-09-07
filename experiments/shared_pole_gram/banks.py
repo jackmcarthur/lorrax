@@ -2,6 +2,7 @@
 from pathlib import Path
 import hashlib
 import json
+import subprocess
 import numpy as np
 
 S = Path('/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14')
@@ -89,9 +90,25 @@ def data_metadata(paths, parents):
             raise ValueError(f'Unsupported DATA units/geometry: {directory}')
         if rec['parent_qrows'] != parents or len(rec['q_receipts']) != 29:
             raise ValueError(f'DATA parent-q contract differs: {directory}')
+        source_evidence = {}
         for key in ('constructor', 'owner'):
-            if sha(rec[key+'_path']) != rec[key+'_sha256']:
+            expected_sha = rec[key+'_sha256']
+            source_path = Path(rec[key+'_path'])
+            if sha(source_path) == expected_sha:
+                source_evidence[key] = dict(path=str(source_path), sha256=expected_sha)
+                continue
+            # Completed banks pin bytes, not the mutable sampler's current HEAD.
+            # This is the reviewed Run307 constructor revision, not a hash bypass.
+            if key != 'constructor':
                 raise ValueError(f'DATA {key} source hash mismatch: {directory}')
+            revision = 'b3ab15ba'
+            relative = source_path.relative_to(S).as_posix()
+            blob = subprocess.check_output(['git', '-C', str(S), 'show', revision+':'+relative])
+            if hashlib.sha256(blob).hexdigest() != expected_sha:
+                raise ValueError(f'DATA immutable constructor hash mismatch: {directory}')
+            source_evidence[key] = dict(repository=str(S), revision=revision,
+                                        path=relative, sha256=expected_sha)
+
         zs = []
         for kind in ('construction', 'held'):
             pairs = np.asarray(rec['z_Ry'][kind], dtype=float)
@@ -106,7 +123,7 @@ def data_metadata(paths, parents):
         for slot, item in enumerate(rec['q_receipts']):
             if item['q_wedge'] != slot or item['q_full'] != parents[slot] or not item['shape_verified']:
                 raise ValueError(f'DATA q shape/index receipt invalid: {directory}/q{slot:02d}')
-        banks.append(dict(receipt=rec, receipt_path=str(receipt_path), receipt_sha256=sha(receipt_path),
+        banks.append(dict(source_evidence=source_evidence, receipt=rec, receipt_path=str(receipt_path), receipt_sha256=sha(receipt_path),
                           launcher_path=str(launcher_path), launcher_sha256=sha(launcher_path),
                           z=zs[0], zh=zs[1]))
     return banks
@@ -176,6 +193,7 @@ def load(slot, mesh, eig, owner, broad, data_banks=None):
                               receipt=bank['receipt_path'], receipt_sha256=bank['receipt_sha256'],
                               launcher=bank['launcher_path'], launcher_sha256=bank['launcher_sha256'],
                               job_step=str(rec['jobid'])+'.'+str(rec['stepid']),
+                              source_evidence=bank['source_evidence'],
                               coordinate=rec['coordinate'], band_energy_census=rec['band_energy_census']))
     else:
         low, provenance, v = owner['load_anchor'](slot, eig, jnp, None, return_coulomb=True)
