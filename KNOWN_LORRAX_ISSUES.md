@@ -13,3 +13,4 @@
 | 4 | `src/gw/gw_init.py:3351` | Fixed: restart checks both transverse parent faces with `sanity.check_finite` before any carrier construction. |
 | 5 | `src/ffi/fft.py:814`, `src/runtime/__init__.py:2243` | Fixed: independent parent FFI dial, startup enforcement and collision-free announcements. |
 | 6 | `src/ffi/fft.py:1031` | Fixed: shared planner probes the selected gate target; parent ns=4 uses two-stage above the portable floor; every shape decision is announced. |
+| 7 | `src/gw/{w_isdf,cohsex_sigma,photon_sigma,photon_layout}.py` | Fixed: seal service paths before module-scope distrib_la imports; bare-launch tests cover all four consumers. |

@@ -1,6 +1,8 @@
 """Contract static screened exchange and Coulomb hole on canonical parent wavefunctions."""
 from __future__ import annotations
 
+from ffi import _services
+_services.ensure_on_path()
 from distrib_la import mesh_key as _mesh_key
 from functools import partial
 

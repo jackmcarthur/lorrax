@@ -1,4 +1,6 @@
 """Screen charge and current response with typed parent transport and q-IBZ operators."""
+from ffi import _services
+_services.ensure_on_path()
 from distrib_la import mesh_key as _mesh_key
 import os
 import time

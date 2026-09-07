@@ -114,6 +114,10 @@ _SRC = str(_REPO / "src")
 #: the screened-head cubature.
 _MODULE_SCOPE_CONSUMERS = (
     ("isdf.core", "distrib_la"),
+    ("gw.w_isdf", "distrib_la"),
+    ("gw.cohsex_sigma", "distrib_la"),
+    ("gw.photon_sigma", "distrib_la"),
+    ("gw.photon_layout", "distrib_la"),
     ("bse.vq_interp", "distrib_la"),
     ("common.gauss_legendre", "vcoul"),
     ("file_io", "wfn_loader"),
@@ -1011,3 +1015,11 @@ def test_the_census_detector_catches_a_missing_and_a_late_bootstrap(tmp_path):
         f"ORDER claim is not being checked.")
     assert "no module-scope" in flagged["missing"], flagged["missing"]
     assert "AFTER the import" in flagged["late"], flagged["late"]
+
+
+def test_gw_mesh_key_consumers_seal_distrib_la_before_import():
+    """The distrib_la census includes every GW mesh-key consumer's early seal."""
+    census, bad = _scan_tree(_SRC, "distrib_la")
+    consumers = {"gw.w_isdf", "gw.cohsex_sigma", "gw.photon_sigma", "gw.photon_layout"}
+    assert consumers <= set(census)
+    assert not [row for row in bad if row[0] in consumers]
