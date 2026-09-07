@@ -45,11 +45,7 @@ def test_host_byte_diagnostic_counts_only_addressable_local_shards():
 
 
 def test_production_lifetime_spills_before_prepared_and_around_accumulate():
-    source = "\n".join(inspect.getsource(fn) for fn in (
-        isdf_fitting._prepare_zeta_accumulator,
-        isdf_fitting._accumulate_zeta_tile,
-        isdf_fitting._run_zeta_fit_tiles,
-        isdf_fitting._write_zeta_fit_result))
+    source = inspect.getsource(isdf_fitting.fit_zeta_to_h5)
     initial = source.index('timing.section("zeta_fit.gflat_spill_initial")')
     prepared = source.index('_coupled_rank_gate("prepared")')
     restore = source.index(

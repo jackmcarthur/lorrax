@@ -48,24 +48,9 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/isdf_fitting.py` | `fit_zeta_to_h5` | 1366 | 124 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
-| `src/gw/isdf_fitting.py` | `_prepare_zeta_fit_geometry` | 0 | 94 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | `_build_zeta_fit_gram` | 0 | 60 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | `_report_zeta_factor_route` | 0 | 41 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | `_factor_zeta_fit_gram` | 0 | 94 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | `_prepare_zeta_output_sphere` | 0 | 51 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | `_open_zeta_fit_output` | 0 | 56 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | `_prepare_zeta_fit_wavefunctions` | 0 | 58 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | `_prepare_zeta_accumulator` | 0 | 55 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | `_prepare_coupled_zeta_tile` | 0 | 71 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | `_fit_zeta_tile` | 0 | 43 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | `_accumulate_zeta_tile` | 0 | 31 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | `_report_zeta_tile_memory` | 0 | 27 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | `_run_zeta_fit_tiles` | 0 | 95 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | `_write_zeta_fit_result` | 0 | 24 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | `_close_zeta_fit_output` | 0 | 32 | New explicit phase/direct owner |
-| `src/gw/isdf_fitting.py` | Docstring lines / share | 29 / 1.88% | 44 / 3.79% | Owner: docs/architecture/zeta_fit_face_psi_cct.md |
-| `src/gw/isdf_fitting.py` | **File total** | 1542 | 1162 | Net -380 lines |
+| `src/gw/isdf_fitting.py` | `fit_zeta_to_h5` | 1366 | 1366 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/gw/isdf_fitting.py` | Docstring lines / share | 29 / 1.88% | 29 / 1.88% | Owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/gw/isdf_fitting.py` | **File total** | 1542 | 1542 | Net +0 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -567,10 +552,9 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `tests/test_coupled_mu123_gflat_host_spill.py` | `test_production_lifetime_spills_before_prepared_and_around_accumulate` | 18 | 22 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_coupled_mu123_gflat_host_spill.py` | `test_host_spill_is_automatic_and_only_threads_through_coupled_route` | 8 | 8 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_coupled_mu123_gflat_host_spill.py` | `test_automatic_policy_keeps_fragmentation_platform_and_host_gates` | 9 | 9 | Existing statements moved to named stages or dead selector removed |
-| `tests/test_coupled_mu123_gflat_host_spill.py` | **File total** | 108 | 113 | Net +5 lines |
+| `tests/test_coupled_mu123_gflat_host_spill.py` | **File total** | 108 | 109 | Net +1 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -597,14 +581,9 @@
 | `tests/test_zeta_nband_decoupling.py` | `test_the_fit_window_travels_into_the_provenance_stamp` | 25 | 29 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_zeta_nband_decoupling.py` | **File total** | 412 | 416 | Net +4 lines |
 
-| Module | Function | Lines before | Lines after | Deleted or moved; destination |
-|---|---|---|---|---|
-| `tests/test_zeta_slice_before_commit.py` | `test_c_and_prebuilt_z_select_before_outer_block_until_ready` | 22 | 22 | Existing statements moved to named stages or dead selector removed |
-| `tests/test_zeta_slice_before_commit.py` | **File total** | 59 | 59 | Net +0 lines |
-
 | Tree scope | Before | After | Net |
 |---|---|---|---|
-| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119520 | -5727 |
+| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119900 | -5347 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
@@ -621,7 +600,8 @@
 | 11 — relocate long source contracts to architecture owners (14b6fb1d) | 1408 | 450 passed, 2 skipped, 1 xfailed, 102 warnings in 178.98s (0:02:58) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-191254-220724-5967, lx-Xg4-191254-220772-4165; 20_contract_docs/cpu/cpu.xml; 20_contract_docs/p4/mos2/identity.json |
 | 12 — separate input parsing from configuration envelopes (35b45dc6) | 1409 | 751 passed, 2 skipped, 1 xfailed, 116 warnings in 184.45s (0:03:04) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-192253-278495-2175, lx-Xg4-191743-249096-5555; 22_config_corrected/cpu/cpu.xml; 22_config_corrected/p4/mos2/identity.json |
 | 13 — extract bounded centroid loading stages (7225ea43) | 1410 | 458 passed, 2 skipped, 1 xfailed, 102 warnings in 176.27s (0:02:56) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-193204-329368-3760, lx-Xg4-192729-303163-2911; 31_centroid_guard/cpu/cpu.xml; 31_centroid_guard/p4/mos2/identity.json |
-| 14 — restore low_mem_bands and two-layout planner dispatch (this commit) | 1413 | 474 passed, 2 skipped, 1 xfailed, 102 warnings in 187.73s (0:03:07) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-201643-544166-5522, lx-Xg4-201649-544831-8820; 34_restore_layout/cpu/cpu.xml; 34_restore_layout/p4/mos2/identity.json |
+| 14 — restore low_mem_bands and two-layout planner dispatch (a9560071) | 1413 | 474 passed, 2 skipped, 1 xfailed, 102 warnings in 187.73s (0:03:07) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-201643-544166-5522, lx-Xg4-201649-544831-8820; 34_restore_layout/cpu/cpu.xml; 34_restore_layout/p4/mos2/identity.json |
+| 15 — revert writer extraction exposed by fresh fitting (this commit) | 1414 | 455 passed, 2 skipped, 1 xfailed, 102 warnings in 192.85s (0:03:12) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-202436-590723-1370, lx-Xg4-202604-591455-1706; 39_writer_revert_corrected/cpu/cpu.xml; 39_writer_revert_corrected/p4/mos2/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|
@@ -639,6 +619,6 @@
 | Reverted initializer stage cut | 17_prepare_stages/verdict.txt: CPU476 passed/2 skipped/1 xfailed; P4 failed because the extracted fresh-carrier stage omitted _parent_green_faces. Source/tests/contract relocation reverted |
 | Configuration guard retry | 21_config_stages/verdict.txt: initial CPU750 pass/1 fail depended on a moved driver comment; reverted and reapplied with owner-based structural guard in22_config_corrected. Its P4 receipt is reused after exact production-diff comparison |
 | Restored low_mem_bands/layout dispatch | Owner amendment applied: gflat_memory_model restored byte-for-byte to c2f69987; both gw_init caller guards and planner tests restored. Config and Sigma flagged lines remain in extracted owners; 34_restore_layout/dispatch_audit.json records the mapping |
-| Writer extraction failed fresh-fit gate | 35_fresh_fit/mos2_6x6, step lx-Xg4-201745-548578-5869: _close_zeta_fit_output lacks nqx/nqy/nqz arguments; revert only writer extraction and rerun fresh fit. Original accepted copied-zeta evidence did not cover this branch |
+| Writer extraction failed fresh-fit gate | 35_fresh_fit/mos2_6x6, step lx-Xg4-201745-548578-5869: _close_zeta_fit_output lacks nqx/nqy/nqz arguments; writer extraction reverted to its exact pre-extraction version (retaining the Gram API). Fresh retry39 passed: eqp0/eqp1 max0.018 microeV vs104, step lx-Xg4-202436-590632-3315, fresh_eqp0.txt and fresh_eqp1.txt. Original copied-zeta evidence did not cover this branch |
 | Final CPU/core/P16/compile-event gates | Pending; no final-suite or performance claim |
 | CPU skips/xfail | Host FFT FFI unavailable; not WSL; existing CPU partitioned-max NaN xfail. Explicit scoped CPU logs own details |

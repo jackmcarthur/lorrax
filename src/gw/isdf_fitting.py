@@ -174,868 +174,6 @@ def _collect_fit_setup_garbage():
     gc.collect()
 
 
-def _prepare_zeta_fit_geometry(
-        _coupled_mu123_coordinator, _coupled_rank_gate, _spill_coupled_gflat_to_host,
-        _stack_coupled_solve_inputs, band_norms, band_range_left, band_range_right,
-        cache_face_y_blocks, centroid_indices, chunk_r, k_unfold_plan, meta, output_file,
-        print_fn, psi_mun_parent, psi_nmu_parent, sym, vertex_mu_L, wfn, write_ibz_only):
-    """Produce validated fit dimensions, band windows and the q-domain decision."""
-    if k_unfold_plan is None or psi_nmu_parent is None or psi_mun_parent is None:
-        raise ValueError("fit_zeta_to_h5 requires a typed plan and both raw-parent faces.")
-    if band_norms is not None:
-        raise NotImplementedError("Raw-parent zeta fitting does not support pseudobands.")
-    if (int(psi_mun_parent.shape[0]) != int(k_unfold_plan.n_parent)
-            or int(psi_mun_parent.shape[2]) != int(k_unfold_plan.n_centroid_packed)):
-        raise ValueError("fit_zeta_to_h5: parent face extent differs from its typed plan.")
-    if (_coupled_mu123_coordinator is not None
-            and (not cache_face_y_blocks
-                 or int(vertex_mu_L) not in (1, 2, 3))):
-        raise ValueError(
-            "fit_zeta_to_h5: the private coupled-mu123 coordinator is "
-            "transverse-only and requires the "
-            "planner-selected bounded face-Y cache")
-    if ((_coupled_mu123_coordinator is None)
-            != (_coupled_rank_gate is None)):
-        raise ValueError(
-            "fit_zeta_to_h5: the private coupled coordinator and rank "
-            "gate must be supplied together")
-    if (_spill_coupled_gflat_to_host
-            and _coupled_mu123_coordinator is None):
-        raise ValueError(
-            "fit_zeta_to_h5: coupled G-flat host spill is private to the "
-            "three-channel transverse coordinator")
-    if (_stack_coupled_solve_inputs
-            and _coupled_mu123_coordinator is None):
-        raise ValueError(
-            "fit_zeta_to_h5: stacked coupled solves are private to the "
-            "three-channel transverse coordinator")
-    mem_probe("zeta_fit_start")
-    nx, ny, nz = meta.fft_grid
-    n_rmu = meta.n_rmu                      # logical (the file extent)
-    n_rmu_padded = meta.n_rmu_padded        # padded (the in-memory carrier)
-    n_rmu_solve = int(getattr(meta, 'mu_solve_extent', n_rmu))
-    mu_basis = getattr(meta, 'mu_basis', None)
-    n_rtot = meta.n_rtot
-    nk_tot = meta.nk_tot
-    kgrid = meta.kgrid
-    nqx, nqy, nqz = kgrid
-    nq = nqx * nqy * nqz
-    num_chunks = (n_rtot + chunk_r - 1) // chunk_r
-    n_rchunk = chunk_r
-    if band_range_left is None:
-        band_range_left = (meta.b_id_0, meta.b_id_3)
-    if band_range_right is None:
-        band_range_right = (meta.b_id_0, meta.b_id_4)
-    _complete_charge_pairs = (
-        int(vertex_mu_L) == 0
-        and tuple(band_range_left) != tuple(band_range_right))
-    if _complete_charge_pairs:
-        from ffi import _services
-        _services.ensure_on_path()
-        from symmetry_maps import q_negation_index
-        _q_neg_idx = q_negation_index(kgrid)
-        print("  Charge pair training domain: ordered LR + RL "
-              "(conjugation-closed normal equations)")
-    else:
-        _q_neg_idx = None
-    band_range_full = (min(band_range_left[0], band_range_right[0]),
-                       max(band_range_left[1], band_range_right[1]))
-    nb_left = band_range_left[1] - band_range_left[0]
-    nb_right = band_range_right[1] - band_range_right[0]
-    nb_full = band_range_full[1] - band_range_full[0]
-    print_fn(f"\n  Zeta fitting: {num_chunks} r-chunks x {n_rchunk} r-points, "
-             f"{nb_full} bands ({nb_left} left + {nb_right} right)")
-    print_fn(f"  Output: {output_file}")
-    if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
-        from .qgrid_symmetry import resolve_qgrid_symmetry_tables
-        _is_transverse = int(vertex_mu_L) != 0
-        _res = resolve_qgrid_symmetry_tables(
-            sym=sym, centroid_indices=centroid_indices,
-            fft_grid=meta.fft_grid, translations=wfn.translations,
-            context=("bispinor transverse ζ̃_T IBZ write"
-                     if _is_transverse else "ζ̃ IBZ write"),
-            announce_fallback=not _is_transverse,
-        )
-        if not _res.use_ibz:
-            if _is_transverse:
-                raise RuntimeError(
-                    f"Bispinor transverse zeta_T (mu_L={int(vertex_mu_L)}) "
-                    f"IBZ-write requested, but the transverse centroid set "
-                    f"fails the orbit-closure check under the WFN sym group: "
-                    f"{_res.reason}.  Regenerate the transverse centroid "
-                    f"file with ``centroid.kmeans_cli --density-mode "
-                    f"current`` (orbit-aware by default for ntran>1) so the "
-                    f"set is closed under the spatial sym group.")
-            write_ibz_only = False
-    return (n_rmu, n_rmu_padded, n_rmu_solve, mu_basis, n_rtot, nk_tot, kgrid, nq, num_chunks, n_rchunk, band_range_left, band_range_right, band_range_full, _q_neg_idx, write_ibz_only)
-
-
-def _build_zeta_fit_gram(
-        _q_neg_idx, band_range_full, band_range_left, band_range_right, k_unfold_plan,
-        kgrid, mesh_xy, mu_basis, n_rmu, n_rmu_padded, n_rmu_solve, nk_tot, nq, print_fn,
-        psi_mun_parent, psi_nmu_parent, sym, vertex_mu_L, write_ibz_only):
-    """Produce the selected-q parent Gram and its band weights."""
-    with timing.section("zeta_fit.CCT"):
-        chan_label = ("charge γ̃^0=I" if vertex_mu_L == 0
-                      else f"transverse γ̃^{vertex_mu_L}")
-        print_fn(f"  Computing C_q via shard_map pipeline (open-spin, {chan_label})")
-        with timing.section("zeta_fit.CCT.face_gemm_plan"):
-            from distrib_la import gemm_plan as _gemm_plan
-            _ns_face, _nb_face = int(psi_mun_parent.shape[1]), int(psi_mun_parent.shape[3])
-            if (int(psi_nmu_parent.shape[1]) != _nb_face
-                    or int(psi_nmu_parent.shape[2]) != _ns_face):
-                raise ValueError("fit_zeta_to_h5: parent face band/spin extents differ.")
-            _mu_gemm = int(k_unfold_plan.n_centroid_packed)
-            _face_gemm = _gemm_plan(
-                mesh_xy, m=_mu_gemm * _ns_face, k=_nb_face,
-                n=_mu_gemm * _ns_face, nq=int(k_unfold_plan.n_parent),
-                dtype=jnp.complex128)
-            print_fn(f"  {_face_gemm.describe()}")
-            _off = int(band_range_full[0])
-            _idx = np.arange(_nb_face)
-            weight_l_face = jnp.asarray(np.where(
-                (_idx >= band_range_left[0] - _off)
-                & (_idx < band_range_left[1] - _off), 1.0, 0.0), dtype=jnp.float64)
-            weight_r_face = jnp.asarray(np.where(
-                (_idx >= band_range_right[0] - _off)
-                & (_idx < band_range_right[1] - _off), 1.0, 0.0), dtype=jnp.float64)
-        print_fn(f"  C_q on raw parents: {k_unfold_plan.n_parent} -> {nk_tot} k rows")
-        C_q = c_q_from_psi_sm(
-            kgrid=kgrid, mesh_xy=mesh_xy,
-            psi_mun_parent=psi_mun_parent, psi_nmu_parent=psi_nmu_parent,
-            weight_l=weight_l_face, weight_r=weight_r_face,
-            gemm=_face_gemm, k_unfold_plan=k_unfold_plan,
-            gamma_L=int(vertex_mu_L), gamma_R=int(vertex_mu_L))
-        C_q_flat = C_q.reshape(nq, n_rmu_padded, n_rmu_padded)
-        del C_q
-        flat_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-        C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, flat_shard)
-        if n_rmu_solve == n_rmu_padded and n_rmu_padded > n_rmu:
-            _pad_scale = (jnp.trace(C_q_flat, axis1=-2, axis2=-1).real
-                          / float(n_rmu)).astype(C_q_flat.dtype)
-            _pad_diag = jnp.diag(jnp.asarray(
-                ~mu_basis.active_mask, dtype=C_q_flat.dtype))
-            C_q_flat = jax.lax.with_sharding_constraint(
-                C_q_flat + _pad_scale[:, None, None] * _pad_diag[None],
-                flat_shard)
-        if _q_neg_idx is not None:
-            C_q_flat = complete_ordered_pair_normal_equations(
-                C_q_flat, _q_neg_idx)
-        if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
-            from ffi import _services
-            _services.ensure_on_path()
-            from symmetry_maps import slice_q_full_to_ibz
-            C_q_flat = slice_q_full_to_ibz(
-                C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
-        C_q_flat.block_until_ready()
-    del _face_gemm
-    return (C_q_flat, weight_l_face, weight_r_face)
-
-
-def _report_zeta_factor_route(
-        C_q_flat, _resolved_solver_kind, _resolved_zeta_gather, distributed_zeta_solve,
-        mesh_xy, n_rmu_padded, print_fn, transverse_zeta_rcond, vertex_mu_L):
-    """Report the resolved factor and back-solve route with its memory price."""
-    if int(vertex_mu_L) == 0:
-        _how = ("rank-truncated pinv"
-                if _resolved_solver_kind == 'replicated_rank_truncate'
-                else "distributed rank-truncated pinv (2D-sharded C+)"
-                if _resolved_solver_kind == 'distributed_rank_truncate'
-                else "chol(C_q)")
-        print_fn(f"  Computing L_q = {_how}  [PSD, charge channel, "
-                 f"path={_resolved_solver_kind}]")
-    else:
-        _how_t = ("hoisted per-q pivoted LU (once per channel)"
-                  if _resolved_solver_kind == 'lu'
-                  else "hoisted distributed getrf (block-cyclic, "
-                       "once per channel)"
-                  if _resolved_solver_kind in
-                  ('scalapack_lu', 'cusolvermp_lu')
-                  else "rank-truncated pinv (|lambda| cut, explicit "
-                       "C+, once per channel, rcond="
-                       f"{float(transverse_zeta_rcond):g})"
-                  if _resolved_solver_kind == 'transverse_rank_truncate'
-                  else "distributed rank-truncated pinv (pzheevd, "
-                       "2D-sharded C+, rcond="
-                       f"{float(transverse_zeta_rcond):g})"
-                  if _resolved_solver_kind
-                  == 'distributed_transverse_rank_truncate'
-                  else "CCT passthrough (fused per-r-chunk getrf+getrs)")
-        print_fn(f"  Computing transverse factor = {_how_t}  "
-                 f"[γ̃^{vertex_mu_L} indefinite — "
-                 f"path={_resolved_solver_kind}]")
-    _gather_gb = (int(C_q_flat.shape[0]) * int(n_rmu_padded) ** 2
-                  * 16 / 1e9)
-    _p_y = int(mesh_xy.shape['y'])
-    _tile_gb = (int(n_rmu_padded) ** 2 * 16 * (1.0 + 1.0 / _p_y)) / 1e9
-    print_fn(f"  Zeta back-solve tier: {_resolved_zeta_gather} "
-             f"(distributed_zeta_solve={distributed_zeta_solve})  "
-             f"replicated (nq,μ,μ) gather would be {_gather_gb:.2f} GB/rank; "
-             f"per-q tile {_tile_gb:.3f} GB (×nq executions/r-chunk); "
-             f"distributed tier gathers NO (μ,μ) object")
-
-
-def _factor_zeta_fit_gram(
-        C_q_flat, _coupled_mu123_coordinator, _stack_coupled_solve_inputs,
-        charge_zeta_solve, distrib_la_batched_route, distributed_cholesky, distributed_lu,
-        distributed_zeta_solve, mesh_xy, n_rmu_padded, n_rmu_solve, print_fn, solver_kind,
-        transverse_zeta_rcond, transverse_zeta_solve, vertex_mu_L, zeta_rcond, zeta_ridge):
-    """Produce the existing factor and back-solve contract."""
-    with timing.section("zeta_fit.cholesky"):
-        _resolved_zeta_gather = _resolve_zeta_gather(
-            distributed_zeta_solve,
-            n_rmu=int(n_rmu_padded), nq=int(C_q_flat.shape[0]),
-            mesh_xy=mesh_xy, vertex_mu_L=int(vertex_mu_L),
-            charge_zeta_solve=charge_zeta_solve,
-            transverse_zeta_solve=transverse_zeta_solve)
-        _resolved_solver_kind = _resolve_solver_kind(
-            mesh_xy, int(vertex_mu_L), solver_kind,
-            distributed_cholesky=distributed_cholesky,
-            distributed_lu=distributed_lu,
-            n_rmu=n_rmu_solve, nq=int(C_q_flat.shape[0]),
-            charge_zeta_solve=charge_zeta_solve,
-            replicated_factor_used=(_resolved_zeta_gather != 'distributed'),
-            transverse_zeta_solve=transverse_zeta_solve)
-        if _resolved_zeta_gather == 'distributed':
-            if int(vertex_mu_L) != 0:
-                if _resolved_solver_kind != 'transverse_rank_truncate':
-                    raise ValueError(
-                        f"distributed_zeta_solve='distributed' on a "
-                        f"transverse channel expects the rank_truncate "
-                        f"family, but the solver resolved to "
-                        f"{_resolved_solver_kind!r}.")
-                _resolved_solver_kind = 'distributed_transverse_rank_truncate'
-            else:
-                if _resolved_solver_kind not in ('replicated_rank_truncate',):
-                    raise ValueError(
-                        f"distributed_zeta_solve='distributed' resolves the "
-                        f"charge factor itself, but distributed_cholesky "
-                        f"resolved to {_resolved_solver_kind!r}.  Leave "
-                        f"distributed_cholesky at 'auto' (which gives "
-                        f"replicated_rank_truncate) for this tier.")
-                _resolved_solver_kind = 'distributed_rank_truncate'
-        factor_trace_per_q = None
-        if (int(vertex_mu_L) != 0 and _resolved_solver_kind in
-                ('cusolvermp_lu', 'scalapack_lu')):
-            with timing.section("zeta_fit.trace_L_q"):
-                factor_trace_per_q = jnp.einsum(
-                    'qii->q', C_q_flat[:, :n_rmu_solve, :n_rmu_solve])
-                factor_trace_per_q.block_until_ready()
-        _report_zeta_factor_route(
-            C_q_flat, _resolved_solver_kind, _resolved_zeta_gather, distributed_zeta_solve, mesh_xy,
-            n_rmu_padded, print_fn, transverse_zeta_rcond, vertex_mu_L)
-        _coupled_factor = bool(
-            _coupled_mu123_coordinator is not None
-            and _stack_coupled_solve_inputs
-            and _resolved_solver_kind in ('cusolvermp_lu', 'scalapack_lu'))
-        if _coupled_factor:
-            L_q, lu_piv = C_q_flat, None
-            print_fn("  Deferring current factor to one coupled LU factor")
-        elif int(vertex_mu_L) != 0:
-            L_q, lu_piv = factor_c_q(
-                C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
-                n_rmu_logical=n_rmu_solve, solver_kind=_resolved_solver_kind,
-                zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
-                transverse_zeta_rcond=float(transverse_zeta_rcond),
-                distrib_la_batched_route=distrib_la_batched_route,
-                transverse_trace_per_q=factor_trace_per_q)
-        else:
-            L_q = factor_c_q(
-                C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
-                n_rmu_logical=n_rmu_solve, solver_kind=_resolved_solver_kind,
-                zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
-                distrib_la_batched_route=distrib_la_batched_route)
-            lu_piv = None
-        if isinstance(L_q, FactorToken):
-            print_fn(f"  L_q: {L_q!r}")
-        else:
-            L_q.block_until_ready()
-            print_fn(f"  L_q: {L_q.shape}")
-    if _coupled_factor:
-        cct_trace_per_q = factor_trace_per_q
-    elif (int(vertex_mu_L) != 0 and lu_piv is None
-            and not isinstance(L_q, FactorToken)
-            and _resolved_solver_kind not in (
-                'transverse_rank_truncate',
-                'distributed_transverse_rank_truncate')):
-        with timing.section("zeta_fit.trace_L_q"):
-            cct_trace_per_q = jnp.einsum(
-                'qii->q', L_q[:, :n_rmu_solve, :n_rmu_solve])
-            cct_trace_per_q.block_until_ready()
-    else:
-        cct_trace_per_q = None
-    _coupled_stacked_solve = _coupled_factor
-    _coupled_solve_inputs = (
-        (L_q, cct_trace_per_q) if _coupled_stacked_solve else None)
-    del C_q_flat
-    return (L_q, lu_piv, _resolved_solver_kind, _resolved_zeta_gather, cct_trace_per_q, _coupled_stacked_solve, _coupled_solve_inputs)
-
-
-def _prepare_zeta_output_sphere(
-        meta, n_rtot, nq, print_fn, sym, wfn, write_ibz_only, zeta_cutoff_ry):
-    """Produce the disk q rows and their Coulomb sphere."""
-    from ffi import _services
-    _services.ensure_on_path()
-    from symmetry_maps import bgw_integer_q_to_fractional
-    if write_ibz_only:
-        q_irr_kgrid_int = sym.q_irr_kgrid_int
-        q_irr_full_idx = sym.q_irr_full_idx
-        n_q_disk = int(q_irr_full_idx.shape[0])
-        q_irr_frac = bgw_integer_q_to_fractional(
-            q_irr_kgrid_int, meta.kgrid)
-        print_fn(f"  q-IBZ reduction: {n_q_disk} IBZ q-points / {nq} full-BZ "
-                 f"(disk shrink {nq / max(1, n_q_disk):.1f}×)")
-    else:
-        q_irr_full_idx = None
-        q_irr_frac = None
-        n_q_disk = nq
-        print_fn(f"  q axis on disk: full BZ ({nq} q-points) "
-                 f"(write_ibz_only=False or closure check failed)")
-    if q_irr_frac is None:
-        q_irr_frac = bgw_integer_q_to_fractional(
-            sym.kvecs_asints, meta.kgrid)
-    _gflat_sphere_idx_padded = None      # (n_q_disk, ngkmax) int32
-    _gflat_gvec_components = None        # (n_q_disk, 3, ngkmax) int32
-    _gflat_ngk_per_q = None              # (n_q_disk,) int32
-    _gflat_ngkmax = None
-    if zeta_cutoff_ry is not None and int(meta.sys_dim) != 0:
-        from common.coulomb_sphere import compute_per_q_bare_coulomb_components
-        from ffi import _services
-        _services.ensure_on_path()
-        from vcoul import CoulombGeometry
-        _bvec_for_sphere = CoulombGeometry.from_wfn(wfn).bvec
-        _sphere_pkg = compute_per_q_bare_coulomb_components(
-            fft_grid=meta.fft_grid,
-            bvec=_bvec_for_sphere,
-            q_irr_frac=q_irr_frac,
-            vcoul_cutoff_ry=float(zeta_cutoff_ry),
-            sys_dim=int(meta.sys_dim),
-        )
-        _gflat_sphere_idx_padded = _sphere_pkg["sphere_idx_padded"]
-        _gflat_gvec_components = _sphere_pkg["gvec_components_padded"]
-        _gflat_ngk_per_q = _sphere_pkg["ngk_per_q"]
-        _gflat_ngkmax = int(_sphere_pkg["ngkmax"])
-        if jax.process_index() == 0:
-            print_fn(
-                f"  G-flat ζ sphere: ngkmax={_gflat_ngkmax}, "
-                f"min ngk={int(_gflat_ngk_per_q.min())}, "
-                f"max ngk={int(_gflat_ngk_per_q.max())} "
-                f"({_gflat_ngkmax / float(n_rtot):.3%} of n_rtot)")
-    return (q_irr_full_idx, q_irr_frac, n_q_disk, _gflat_sphere_idx_padded, _gflat_gvec_components, _gflat_ngk_per_q, _gflat_ngkmax)
-
-
-def _open_zeta_fit_output(
-        _gflat_gvec_components, _gflat_ngk_per_q, _gflat_ngkmax, centroid_indices, mesh_xy,
-        meta, n_q_disk, n_rmu, n_rtot, output_file, vertex_mu_L, wfn, zeta_cutoff_ry):
-    """Produce the collective zeta output handle after writing its headers."""
-    from file_io.slab_io import SlabIO
-    from file_io.mf_header import copy_mf_header
-    from file_io.isdf_header import IsdfHeader, write_isdf_header
-    _wfn_src_path = getattr(wfn, '_filename', None)
-    if _wfn_src_path is None:
-        raise ValueError(
-            "fit_zeta_to_h5: wfn must expose '_filename' (the source "
-            "WFN.h5 path) so mf_header can be copied verbatim into "
-            "zeta_q.h5.")
-    _cent_idx_np = np.asarray(jax.device_get(centroid_indices),
-                              dtype=np.int32)
-    if _cent_idx_np.shape != (n_rmu, 3):
-        raise ValueError(
-            f"fit_zeta_to_h5: centroid_indices has shape "
-            f"{_cent_idx_np.shape}, expected ({n_rmu}, 3).")
-    _density_label = 'scalar' if int(vertex_mu_L) == 0 else 'current'
-    _hdr_kwargs = dict(
-        r_mu_fft_idx=_cent_idx_np,
-        fft_grid=meta.fft_grid,
-        density=_density_label,
-        vertex_mu_L=int(vertex_mu_L),
-        zeta_layout='G_flat',
-    )
-    if _gflat_gvec_components is None:
-        raise ValueError(
-            "G-flat ζ writer requires a ζ sphere — pass "
-            "zeta_cutoff_ry to fit_zeta_to_h5.")
-    _hdr_kwargs.update(
-        gvec_components=_gflat_gvec_components,
-        ngk_per_q=_gflat_ngk_per_q,
-        zeta_cutoff_ry=float(zeta_cutoff_ry),
-    )
-    _isdf_hdr = IsdfHeader.build(**_hdr_kwargs)
-    with timing.section("zeta_fit.write_headers"):
-        with SlabIO(output_file, mode='w', mesh=mesh_xy):
-            pass
-        if jax.process_index() == 0:
-            copy_mf_header(_wfn_src_path, output_file, dst_mode='a')
-            write_isdf_header(output_file, _isdf_hdr, mode='a')
-        jax.experimental.multihost_utils.sync_global_devices(
-            "zeta_fit_headers_written")
-    with timing.section("zeta_fit.open_file"):
-        _n_G_sph = (int(_gflat_ngkmax)
-                     if _gflat_ngkmax is not None else n_rtot)
-        zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy,
-                         )
-        zeta_io.create_dataset(
-            'zeta_q_G',
-            shape=(n_q_disk, n_rmu, _n_G_sph),
-            dtype=np.complex128,
-        )
-    return (zeta_io, _n_G_sph)
-
-
-def _prepare_zeta_fit_wavefunctions(
-        band_chunk_size, band_range_full, bispinor, bispinor_lift, cache_psi_r, chunk_r,
-        k_unfold_plan, mesh_xy, meta, n_rtot, nk_tot, print_fn, wfn):
-    """Produce the shared wavefunction store, optional real-space cache and real-grid tiles."""
-    _bfs, _bfe = band_range_full
-    from runtime.padding import padded_axis
-    band_chunk_size = padded_axis(
-        band_chunk_size, mesh_xy, name="zeta-fit band chunk").carrier
-    _bfe_transport = _bfs + padded_axis(
-        _bfe - _bfs, mesh_xy, name="zeta-fit band transport").carrier
-    band_chunk_ranges = [
-        (_bfs + i * band_chunk_size,
-         min(_bfs + (i + 1) * band_chunk_size, _bfe_transport))
-        for i in range(
-            (_bfe_transport - _bfs + band_chunk_size - 1) // band_chunk_size)
-    ]
-    from common.psi_G_store import build_psi_G_store
-    psi_G_store = build_psi_G_store(
-        wfn=wfn, mesh_xy=mesh_xy, meta=meta,
-        band_chunk_ranges=band_chunk_ranges,
-        bispinor=bispinor,
-        bispinor_lift=bispinor_lift,
-        k_domain=k_unfold_plan.sym.parent_k_domain,
-    )
-    real_grid_tiles = k_unfold_plan.real_grid_tiles(
-        target_width=int(chunk_r))
-    num_chunks = int(real_grid_tiles.n_tiles)
-    n_rchunk = int(real_grid_tiles.width)
-    if n_rchunk > int(chunk_r):
-        print_fn(
-            f"  *** LORRAX SANITY: orbit-closed r tiles are {n_rchunk} "
-            f"slots wide but the memory plan priced chunk_r = "
-            f"{int(chunk_r)}; the Z_q / solve / zeta chunk live set is "
-            f"{n_rchunk / max(1, int(chunk_r)):.2f}x the planned one. ***")
-    print_fn(
-        f"  Z_q on raw parents: {k_unfold_plan.n_parent} parent k rows "
-        f"-> {nk_tot} full k by the typed unfold on {num_chunks} "
-        f"orbit-closed real-grid tiles x {n_rchunk} slots "
-        f"(planned chunk_r {int(chunk_r)}; pad slots "
-        f"{num_chunks * n_rchunk - n_rtot})")
-    psi_r_cache = None
-    if cache_psi_r:
-        with timing.section("zeta_fit.build_psi_r_cache"):
-            psi_r_cache = build_psi_r_cache_sm(
-                psi_G_store, mesh_xy=mesh_xy)
-            psi_r_cache.block_until_ready()
-        _cache_local_bytes = sum(
-            int(shard.data.size) * int(shard.data.dtype.itemsize)
-            for shard in psi_r_cache.addressable_shards)
-        if jax.process_index() == 0:
-            print_fn(f"  ψ(r) cache: {psi_r_cache.shape}, "
-                     f"band-sharded over ('x','y'), "
-                     f"{_cache_local_bytes / 1e9:.2f} GB local")
-        psi_G_store.release_host_tiles()
-    elif jax.process_index() == 0:
-        print_fn("  ψ(r) cache: disabled by the low-memory plan; streaming "
-                 "one ψ(G) band chunk per r chunk")
-    return (band_chunk_ranges, psi_G_store, real_grid_tiles, num_chunks, n_rchunk, psi_r_cache)
-
-
-def _prepare_zeta_accumulator(
-        L_q, _coupled_mu123_coordinator, _coupled_rank_gate, _coupled_solve_inputs,
-        _coupled_stacked_solve, _gflat_ngkmax, _spill_coupled_gflat_to_host,
-        cct_trace_per_q, gflat_chunk_size, mesh_xy, meta, n_q_disk, n_rtot, print_fn,
-        q_irr_frac, vertex_mu_L):
-    """Produce the sharded G-flat accumulator and coupled preparation boundary."""
-    _n_rmu_padded = int(meta.n_rmu_padded)
-    _gflat_acc_n_G = (int(_gflat_ngkmax)
-                       if _gflat_ngkmax is not None else n_rtot)
-    _gflat_acc_sharding = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
-    gflat_acc = jax.jit(
-        lambda: jnp.zeros(
-            (n_q_disk, _n_rmu_padded, _gflat_acc_n_G),
-            dtype=jnp.complex128),
-        out_shardings=_gflat_acc_sharding,
-    )()
-    _gflat_chunk_size = int(gflat_chunk_size) if gflat_chunk_size else None
-    if jax.process_index() == 0:
-        from runtime.padding import mesh_divisor
-        _p_prod = mesh_divisor(mesh_xy)
-        _n_mu_local = int(meta.n_rmu_padded) // _p_prod
-        _N = n_q_disk * _n_mu_local
-        _cs = _gflat_chunk_size or _N
-        print_fn(f"  G-flat ζ accumulator: N={_N} rows/rank "
-                 f"(n_q={n_q_disk} × n_mu_local={_n_mu_local}); "
-                 f"chunk_size={_cs} → "
-                 f"per-iter FFT box {_cs * n_rtot * 16 / 1e9:.2f} GB/rank")
-    _q_irr_frac_dev = _device_put_process_local(
-        np.asarray(q_irr_frac, dtype=np.float64),
-        NamedSharding(mesh_xy, P(None, None)))
-    if debug_print_enabled():
-        jax.block_until_ready(gflat_acc)
-        jax.block_until_ready(L_q)
-    mem_probe("pre_rchunk_loop")
-    if _coupled_mu123_coordinator is not None:
-        if _spill_coupled_gflat_to_host:
-            _local_gflat_host_bytes = _local_shard_nbytes(gflat_acc)
-            with timing.section("zeta_fit.gflat_spill_initial"):
-                gflat_acc = _coupled_gflat_spill(
-                    gflat_acc, enabled=True)
-            if (jax.process_index() == 0 and int(vertex_mu_L) == 1):
-                print_fn(
-                    "  [bispinor] coupled G-flat host spill: "
-                    f"{_local_gflat_host_bytes} bytes/channel/rank, "
-                    f"{3 * _local_gflat_host_bytes} bytes/rank with all "
-                    "three accumulators parked")
-            mem_probe("pre_rchunk_loop_host_spilled")
-        _coupled_rank_gate("prepared")
-        _coupled_mu123_coordinator.channel_prepared(
-            int(vertex_mu_L), solve_inputs=_coupled_solve_inputs)
-        if _coupled_stacked_solve:
-            L_q = None
-            cct_trace_per_q = None
-            _coupled_solve_inputs = None
-    return (gflat_acc, _gflat_chunk_size, _q_irr_frac_dev, L_q, cct_trace_per_q, _coupled_solve_inputs)
-
-
-def _prepare_coupled_zeta_tile(
-        _coupled_mu123_coordinator, _coupled_stacked_solve, _resolved_solver_kind,
-        _resolved_zeta_gather, _tile_args, actual_n_rchunk, band_chunk_ranges, chunk_idx,
-        distrib_la_batched_route, k_unfold_plan, kgrid, mesh_xy, n_rmu_padded, n_rmu_solve,
-        psi_G_store, psi_mun_parent, psi_r_cache, q_chunk_size, q_irr_full_idx,
-        transverse_zeta_rcond, vertex_mu_L, weight_l_face, weight_r_face, zeta_rcond,
-        zeta_ridge):
-    """Produce the existing coupled tile factor or solve result."""
-    _prebuilt_Z_q = None
-    _prebuilt_zeta = None
-    if _coupled_mu123_coordinator is not None:
-        def _build_coupled_Z_q():
-            return _z_q_face_parent(
-                psi_mun_parent, psi_G_store, psi_r_cache,
-                weight_l_face, weight_r_face,
-                band_chunk_ranges=band_chunk_ranges,
-                kgrid=kgrid, mesh_xy=mesh_xy,
-                k_unfold_plan=k_unfold_plan, coupled_mu123=True,
-                tile_r_index=_tile_args["tile_r_index"],
-                tile_local_perm=_tile_args["tile_local_perm"],
-                tile_wraps=_tile_args["tile_wraps"])
-        if _coupled_stacked_solve:
-            def _build_coupled_zeta():
-                with timing.section(
-                        "zeta_fit.chunk.coupled_z_q_build"):
-                    Z_mu_q = _build_coupled_Z_q()
-                    if q_irr_full_idx is not None:
-                        Z_mu_q = Z_mu_q[:, jnp.asarray(
-                            np.asarray(
-                                q_irr_full_idx, dtype=np.int32))]
-                def factorize(C, trace):
-                    return factor_c_q(
-                        C, mesh_xy, vertex_mu_L=1,
-                        n_rmu_logical=n_rmu_solve,
-                        solver_kind=_resolved_solver_kind,
-                        zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
-                        transverse_zeta_rcond=transverse_zeta_rcond,
-                        distrib_la_batched_route=distrib_la_batched_route,
-                        transverse_trace_per_q=trace)
-                L_mu_q, piv_mu_q = (
-                    _coupled_mu123_coordinator.
-                    stacked_solve_inputs(factorize=factorize))
-                n_q_solve = int(Z_mu_q.shape[1])
-                Z_flat = Z_mu_q.reshape(
-                    3 * n_q_solve, n_rmu_padded,
-                    actual_n_rchunk)
-                with timing.section(
-                        "zeta_fit.chunk.coupled_solve"):
-                    zeta_flat = solve_zeta(
-                        L_mu_q, Z_flat, mesh_xy, q_chunk_size,
-                        vertex_mu_L=1,
-                        solver_kind=_resolved_solver_kind,
-                        lu_piv=piv_mu_q,
-                        n_rmu_logical=n_rmu_solve,
-                        zeta_gather=_resolved_zeta_gather,
-                        distrib_la_batched_route=(
-                            distrib_la_batched_route))
-                    zeta_mu_q = zeta_flat.reshape(
-                        3, n_q_solve, n_rmu_padded,
-                        actual_n_rchunk)
-                return zeta_mu_q
-            _prebuilt_zeta = (
-                _coupled_mu123_coordinator.acquire_channel_zeta(
-                    int(vertex_mu_L), chunk_idx,
-                    _build_coupled_zeta))
-        else:
-            _prebuilt_Z_q = (
-                _coupled_mu123_coordinator.acquire_channel_Z_q(
-                    int(vertex_mu_L), chunk_idx,
-                    _build_coupled_Z_q))
-    return (_prebuilt_Z_q, _prebuilt_zeta)
-
-
-def _fit_zeta_tile(
-        L_q, _coupled_rank_gate, _prebuilt_Z_q, _prebuilt_zeta, _q_neg_idx,
-        _resolved_solver_kind, _resolved_zeta_gather, _tile_args, actual_n_rchunk,
-        band_chunk_ranges, cct_trace_per_q, chunk_idx, distrib_la_batched_route,
-        logical_n_rchunk, lu_piv, mesh_xy, meta, psi_G_store, psi_mun_parent, psi_r_cache,
-        q_chunk_size, q_irr_full_idx, vertex_mu_L, weight_l_face, weight_r_face):
-    """Produce a solved zeta tile and its elapsed fit time."""
-    t0 = time.perf_counter()
-    with timing.section("zeta_fit.chunk.fit_one_rchunk"), \
-         jax_profile.step_annotation("chunk_fit", step_num=chunk_idx):
-        if _prebuilt_zeta is not None:
-            zeta_chunk = _prebuilt_zeta
-        else:
-            zeta_chunk = fit_one_rchunk(
-                psi_G_store=psi_G_store,
-                psi_r_cache=psi_r_cache,
-                L_q=L_q,
-                mesh_xy=mesh_xy,
-                meta=meta,
-                band_chunk_ranges=band_chunk_ranges,
-                actual_n_rchunk=actual_n_rchunk,
-                q_chunk_size=q_chunk_size,
-                vertex_mu_L=int(vertex_mu_L),
-                solver_kind=_resolved_solver_kind,
-                q_irr_full_idx=q_irr_full_idx,
-                q_neg_idx=_q_neg_idx,
-                cct_trace_per_q=cct_trace_per_q,
-                zeta_gather=_resolved_zeta_gather,
-                lu_piv=lu_piv,
-                distrib_la_batched_route=distrib_la_batched_route,
-                psi_mun=psi_mun_parent,
-                weight_l=weight_l_face,
-                weight_r=weight_r_face,
-                _prebuilt_Z_q=_prebuilt_Z_q,
-                **_tile_args,
-            )
-        if actual_n_rchunk != logical_n_rchunk:
-            zeta_chunk = zeta_chunk[..., :logical_n_rchunk]
-        zeta_chunk.block_until_ready()
-    if _coupled_rank_gate is not None:
-        _coupled_rank_gate(f"rchunk {chunk_idx} solve")
-    _t_fit = time.perf_counter() - t0
-    return (zeta_chunk, _t_fit)
-
-
-def _accumulate_zeta_tile(
-        _gflat_chunk_size, _gflat_sphere_idx_padded, _q_irr_frac_dev,
-        _spill_coupled_gflat_to_host, _tile_r_indices_dev, accumulate_rchunk_to_gflat,
-        gflat_acc, mesh_xy, meta, zeta_chunk):
-    """Produce the updated G-flat accumulator and elapsed accumulation time."""
-    t0 = time.perf_counter()
-    with timing.section("zeta_fit.chunk.h5_write"):
-        if _spill_coupled_gflat_to_host:
-            with timing.section("zeta_fit.gflat_restore_accumulate"):
-                gflat_acc = _coupled_gflat_restore(
-                    gflat_acc, enabled=True)
-        gflat_acc = accumulate_rchunk_to_gflat(
-            rchunk=zeta_chunk, gflat_acc=gflat_acc,
-            fft_grid=meta.fft_grid,
-            r0=None,
-            r_indices=_tile_r_indices_dev,
-            sphere_idx=_gflat_sphere_idx_padded,
-            qvec_frac=_q_irr_frac_dev,
-            norm='backward',
-            chunk_size=_gflat_chunk_size,
-            mesh=mesh_xy,
-        )
-        del zeta_chunk
-        if _spill_coupled_gflat_to_host:
-            with timing.section("zeta_fit.gflat_spill_accumulated"):
-                gflat_acc = _coupled_gflat_spill(
-                    gflat_acc, enabled=True)
-        elif debug_print_enabled():
-            jax.block_until_ready(gflat_acc)
-    _t_write = time.perf_counter() - t0
-    return (gflat_acc, _t_write)
-
-
-def _report_zeta_tile_memory(
-        _dbg_rchunk, _rss0, _rss1, _rss2, _t_fit, _t_write, _trim_fn, chunk_idx, num_chunks,
-        print_fn, r_end, r_start):
-    """Report the existing tile memory observations after heap trimming."""
-    _trimmed = _rss2
-    if _trim_fn is not None:
-        try:
-            _trim_fn(0)
-            _trimmed = _host_rss_gb()
-        except Exception:
-            pass
-    if _dbg_rchunk and jax.process_index() == 0:
-        _live_gb = 0.0
-        try:
-            for _a in jax.live_arrays():
-                _live_gb += (int(np.prod(_a.shape))
-                             * _a.dtype.itemsize) / 1e9
-        except Exception:
-            _live_gb = -1.0
-        print_fn(f"[rchunk_dbg] chunk={chunk_idx+1}/{num_chunks} "
-                 f"r=[{r_start},{r_end}) fit={_t_fit*1000:.0f}ms "
-                 f"write={_t_write*1000:.0f}ms "
-                 f"total={(_t_fit+_t_write)*1000:.0f}ms "
-                 f"rss={_rss2:.3f}GB live={_live_gb:.3f}GB "
-                 f"d_fit={_rss1 - _rss0:+.3f} "
-                 f"d_acc={_rss2 - _rss1:+.3f} "
-                 f"rss_trim={_trimmed:.3f}GB")
-
-
-def _run_zeta_fit_tiles(
-        L_q, _coupled_mu123_coordinator, _coupled_rank_gate, _coupled_stacked_solve,
-        _gflat_chunk_size, _gflat_sphere_idx_padded, _mem_probe, _q_irr_frac_dev,
-        _q_neg_idx, _resolved_solver_kind, _resolved_zeta_gather,
-        _spill_coupled_gflat_to_host, _trim_fn, accumulate_rchunk_to_gflat,
-        band_chunk_ranges, cct_trace_per_q, distrib_la_batched_route, gflat_acc,
-        k_unfold_plan, kgrid, lu_piv, mesh_xy, meta, n_rmu_padded, n_rmu_solve, n_rtot,
-        num_chunks, print_fn, psi_G_store, psi_mun_parent, psi_r_cache, q_chunk_size,
-        q_irr_full_idx, r_progress, real_grid_tiles, t_fit_total, t_write_total,
-        transverse_zeta_rcond, vertex_mu_L, weight_l_face, weight_r_face, zeta_rcond,
-        zeta_ridge):
-    """Produce the accumulated G-flat fit and fit/write timing totals."""
-    with timing.section("zeta_fit.chunk_loop"):
-        for chunk_idx in range(num_chunks):
-            _tile_args = {}
-            _tile_r_indices_dev = None
-            _tile_row = np.asarray(real_grid_tiles.r_index[chunk_idx])
-            _tile_perm, _tile_wraps = real_grid_tiles.source_tables(
-                chunk_idx)
-            _rep = NamedSharding(mesh_xy, P())
-            _tile_args = dict(
-                k_unfold_plan=k_unfold_plan,
-                tile_r_index=_device_put_process_local(
-                    _tile_row.astype(np.int32), _rep),
-                tile_local_perm=_device_put_process_local(
-                    _tile_perm.astype(np.int32), _rep),
-                tile_wraps=_device_put_process_local(
-                    _tile_wraps.astype(np.int32), _rep),
-            )
-            _tile_r_indices_dev = _device_put_process_local(
-                np.where(
-                    _tile_row >= 0, _tile_row,
-                    n_rtot + np.arange(_tile_row.size)).astype(np.int32),
-                _rep)
-            r_start = 0
-            r_end = n_rtot
-            logical_n_rchunk = actual_n_rchunk = int(real_grid_tiles.width)
-            _dbg_rchunk = debug_print_enabled()
-            _rss0 = _host_rss_gb() if _dbg_rchunk else 0.0
-            _mem_probe(f"rchunk_start chunk={chunk_idx}")
-            (_prebuilt_Z_q, _prebuilt_zeta) = _prepare_coupled_zeta_tile(
-                _coupled_mu123_coordinator, _coupled_stacked_solve, _resolved_solver_kind,
-                _resolved_zeta_gather, _tile_args, actual_n_rchunk, band_chunk_ranges, chunk_idx,
-                distrib_la_batched_route, k_unfold_plan, kgrid, mesh_xy, n_rmu_padded, n_rmu_solve,
-                psi_G_store, psi_mun_parent, psi_r_cache, q_chunk_size, q_irr_full_idx,
-                transverse_zeta_rcond, vertex_mu_L, weight_l_face, weight_r_face, zeta_rcond, zeta_ridge)
-            (zeta_chunk, _t_fit) = _fit_zeta_tile(
-                L_q, _coupled_rank_gate, _prebuilt_Z_q, _prebuilt_zeta, _q_neg_idx,
-                _resolved_solver_kind, _resolved_zeta_gather, _tile_args, actual_n_rchunk,
-                band_chunk_ranges, cct_trace_per_q, chunk_idx, distrib_la_batched_route,
-                logical_n_rchunk, lu_piv, mesh_xy, meta, psi_G_store, psi_mun_parent, psi_r_cache,
-                q_chunk_size, q_irr_full_idx, vertex_mu_L, weight_l_face, weight_r_face)
-            t_fit_total += _t_fit
-            _rss1 = _host_rss_gb() if _dbg_rchunk else 0.0
-            _mem_probe(f"after_fit_one_rchunk chunk={chunk_idx}")
-            (gflat_acc, _t_write) = _accumulate_zeta_tile(
-                _gflat_chunk_size, _gflat_sphere_idx_padded, _q_irr_frac_dev,
-                _spill_coupled_gflat_to_host, _tile_r_indices_dev, accumulate_rchunk_to_gflat,
-                gflat_acc, mesh_xy, meta, zeta_chunk)
-            del zeta_chunk
-            t_write_total += _t_write
-            _mem_probe(f"after_accumulate chunk={chunk_idx}")
-            if _coupled_mu123_coordinator is not None:
-                _coupled_mu123_coordinator.finish_chunk(
-                    int(vertex_mu_L), chunk_idx)
-            _rss2 = _host_rss_gb() if _dbg_rchunk else 0.0
-            _report_zeta_tile_memory(
-                _dbg_rchunk, _rss0, _rss1, _rss2, _t_fit, _t_write, _trim_fn, chunk_idx, num_chunks,
-                print_fn, r_end, r_start)
-            r_progress.step()
-            _max_rchunks = os.environ.get("LORRAX_MAX_RCHUNKS")
-            _max_rchunks = _max_rchunks.strip() if _max_rchunks else ""
-            if _max_rchunks:
-                try:
-                    _max_n = int(_max_rchunks)
-                except ValueError:
-                    raise ValueError(
-                        f"LORRAX_MAX_RCHUNKS={_max_rchunks!r} is not an "
-                        f"integer.  It truncates the ζ fit after N r-chunks "
-                        f"(profiling only); unset it to fit every chunk."
-                    ) from None
-                if _max_n < 1:
-                    raise ValueError(
-                        f"LORRAX_MAX_RCHUNKS={_max_rchunks!r} must be >= 1.  "
-                        f"To disable the truncation, UNSET the variable — "
-                        f"'0' used to be accepted and truncated the fit to a "
-                        f"single r-chunk, silently."
-                    )
-            if _max_rchunks and (chunk_idx + 1) >= _max_n:
-                if jax.process_index() == 0:
-                    print_fn(f"[rchunk_dbg] LORRAX_MAX_RCHUNKS={_max_rchunks} "
-                             f"reached after chunk {chunk_idx+1}; "
-                             f"breaking r-chunk loop for profiling.")
-                break
-    return (gflat_acc, t_fit_total, t_write_total)
-
-
-def _write_zeta_fit_result(
-        _coupled_mu123_coordinator, _gflat_ngk_per_q, _spill_coupled_gflat_to_host,
-        gflat_acc, mesh_xy, mu_basis, vertex_mu_L, zeta_io):
-    """Write the completed G-flat tensor through the collective output handle."""
-    if _coupled_mu123_coordinator is not None:
-        _coupled_mu123_coordinator.wait_finalize(int(vertex_mu_L))
-    if _spill_coupled_gflat_to_host:
-        with timing.section("zeta_fit.gflat_restore_final_write"):
-            gflat_acc = _coupled_gflat_restore(gflat_acc, enabled=True)
-    with timing.section("zeta_fit.write_g_flat"):
-        if _gflat_ngk_per_q is not None:
-            _ngk_dev = _device_put_process_local(
-                np.asarray(_gflat_ngk_per_q, dtype=np.int32),
-                NamedSharding(mesh_xy, P(None)))
-            _g_axis = jnp.arange(int(gflat_acc.shape[-1]),
-                                  dtype=jnp.int32)        # (ngkmax,)
-            _mask = (_g_axis[None, None, :] < _ngk_dev[:, None, None])
-            gflat_acc = jnp.where(
-                _mask, gflat_acc, jnp.zeros_like(gflat_acc))
-        jax.block_until_ready(gflat_acc)
-        _n_G_sph = int(gflat_acc.shape[-1])
-        if mu_basis is not None:
-            gflat_acc = mu_basis.unpack_axis(gflat_acc, 1)
-        zeta_io.write_slab('zeta_q_G', gflat_acc)
-
-
-def _close_zeta_fit_output(
-        n_q_disk, n_rmu, n_rtot, nq, num_chunks, output_file, print_fn, psi_G_store,
-        t_chunks_total, t_fit_total, t_write_total, zeta_io):
-    """Close collective fit resources and report the existing completion diagnostics."""
-    with timing.section("zeta_fit.close_io"):
-        zeta_io.close()
-    with timing.section("zeta_fit.sync_global"):
-        jax.experimental.multihost_utils.sync_global_devices("zeta_writes_complete")
-    _trunc = active_zeta_truncating_knobs()
-    if _trunc and jax.process_index() == 0:
-        _names = ", ".join(f"{k}={v}" for k, v in _trunc)
-        print_fn("")
-        print_fn("  " + "!" * 68)
-        print_fn(f"  *** LORRAX SANITY: {_names} truncated this ζ fit "
-                 f"(fewer than {num_chunks} r-chunks). ***")
-        print_fn(f"  {output_file} holds a PARTIAL ζ and is NOT being marked")
-        print_fn("  complete (isdf_header/zeta_is_done stays False), so no")
-        print_fn("  restart or reuse path will trust it.  Profiling only —")
-        print_fn("  delete this file before any production run from this")
-        print_fn("  directory.")
-        print_fn("  " + "!" * 68)
-    elif jax.process_index() == 0:
-        from file_io.isdf_header import mark_zeta_done
-        mark_zeta_done(output_file)
-    psi_G_store.close()
-    print_fn(f"  Zeta output: {output_file}  shape: "
-             f"(n_q_disk={n_q_disk} of {nqx}·{nqy}·{nqz}={nq} full-BZ, "
-             f"n_rtot={n_rtot}, n_rmu={n_rmu})")
-    print_fn(f"  Timing ({num_chunks} r-chunks, {t_chunks_total:.1f}s total):")
-    for label, t in [("fit", t_fit_total), ("H5", t_write_total)]:
-        print_fn(f"    {label:<6} {t:6.2f}s  {100*t/t_chunks_total:4.1f}%")
-    mem_probe("zeta_fit_end")
-
-
 def fit_zeta_to_h5(
     wfn,
     sym,
@@ -1077,37 +215,846 @@ def fit_zeta_to_h5(
     psi_mun_parent: jax.Array | None = None,
     print_fn=print,
 ):
-    """Fit canonical parent-face zeta; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    (n_rmu, n_rmu_padded, n_rmu_solve, mu_basis, n_rtot, nk_tot, kgrid, nq, num_chunks, n_rchunk, band_range_left, band_range_right, band_range_full, _q_neg_idx, write_ibz_only) = _prepare_zeta_fit_geometry(
-        _coupled_mu123_coordinator, _coupled_rank_gate, _spill_coupled_gflat_to_host,
-        _stack_coupled_solve_inputs, band_norms, band_range_left, band_range_right,
-        cache_face_y_blocks, centroid_indices, chunk_r, k_unfold_plan, meta, output_file,
-        print_fn, psi_mun_parent, psi_nmu_parent, sym, vertex_mu_L, wfn, write_ibz_only)
-    (C_q_flat, weight_l_face, weight_r_face) = _build_zeta_fit_gram(
-        _q_neg_idx, band_range_full, band_range_left, band_range_right, k_unfold_plan, kgrid,
-        mesh_xy, mu_basis, n_rmu, n_rmu_padded, n_rmu_solve, nk_tot, nq, print_fn,
-        psi_mun_parent, psi_nmu_parent, sym, vertex_mu_L, write_ibz_only)
+    """Fit canonical q-IBZ ζ from raw-parent faces and orbit-closed real-grid tiles."""
+    if k_unfold_plan is None or psi_nmu_parent is None or psi_mun_parent is None:
+        raise ValueError("fit_zeta_to_h5 requires a typed plan and both raw-parent faces.")
+    if band_norms is not None:
+        raise NotImplementedError("Raw-parent zeta fitting does not support pseudobands.")
+    if (int(psi_mun_parent.shape[0]) != int(k_unfold_plan.n_parent)
+            or int(psi_mun_parent.shape[2]) != int(k_unfold_plan.n_centroid_packed)):
+        raise ValueError("fit_zeta_to_h5: parent face extent differs from its typed plan.")
+    if (_coupled_mu123_coordinator is not None
+            and (not cache_face_y_blocks
+                 or int(vertex_mu_L) not in (1, 2, 3))):
+        raise ValueError(
+            "fit_zeta_to_h5: the private coupled-mu123 coordinator is "
+            "transverse-only and requires the "
+            "planner-selected bounded face-Y cache")
+    if ((_coupled_mu123_coordinator is None)
+            != (_coupled_rank_gate is None)):
+        raise ValueError(
+            "fit_zeta_to_h5: the private coupled coordinator and rank "
+            "gate must be supplied together")
+    if (_spill_coupled_gflat_to_host
+            and _coupled_mu123_coordinator is None):
+        raise ValueError(
+            "fit_zeta_to_h5: coupled G-flat host spill is private to the "
+            "three-channel transverse coordinator")
+    if (_stack_coupled_solve_inputs
+            and _coupled_mu123_coordinator is None):
+        raise ValueError(
+            "fit_zeta_to_h5: stacked coupled solves are private to the "
+            "three-channel transverse coordinator")
+
+    # P0 — entry of ζ-fit.  Captures the persistent state set up by
+    # ``prepare_isdf_and_wavefunctions`` BEFORE ζ-fit starts: ψ at
+    # centroids (full [b0, b4) band range, both Y and X transposes),
+    # gflat_acc allocation will not have happened yet.  Forms the
+    # planner's "Peak C const" baseline.  Round-1 addition.
+    mem_probe("zeta_fit_start")
+
+    nx, ny, nz = meta.fft_grid
+    # Two μ extents flow through this function (see common/meta.py:38):
+    # ``n_rmu`` is the LOGICAL centroid count from the centroid file;
+    # ``n_rmu_padded`` rounds up to ``world_size = ∏ p_a`` so any
+    # single- or product-axis sharding on the μ dim divides cleanly.
+    # ψ is delivered at PADDED extent by ``load_centroids_band_chunked``
+    # (Phase 3a) — pad rows zero — and stays there through the
+    # in-memory pair-density / CCT chain.  The Cholesky in
+    # ``factor_c_q`` slices internally to logical via the
+    # ``n_rmu_logical=`` kwarg (Phase 3b-Cholesky) so the factorization
+    # sees a non-singular matrix at its true extent.  zeta_q on disk
+    # has logical extent (SlabIO clips the padded output against the
+    # dataset's extent on write).
+    n_rmu = meta.n_rmu                      # logical (the file extent)
+    n_rmu_padded = meta.n_rmu_padded        # padded (the in-memory carrier)
+    # Dense factor/solve extent: the whole carrier when the run's packed
+    # centroid order interleaves its pad slots per shard (identity on the pad
+    # diagonal below keeps them inert), the logical prefix otherwise.
+    n_rmu_solve = int(getattr(meta, 'mu_solve_extent', n_rmu))
+    mu_basis = getattr(meta, 'mu_basis', None)
+    n_rtot = meta.n_rtot
+    nk_tot = meta.nk_tot
+    kgrid = meta.kgrid
+    nqx, nqy, nqz = kgrid
+    nq = nqx * nqy * nqz
+
+    num_chunks = (n_rtot + chunk_r - 1) // chunk_r
+    n_rchunk = chunk_r
+
+    # Band ranges for left and right wavefunctions.
+    # Defaults here are (b0,b3) and (b0,b4); gw_jax typically passes (b0,b3) and (b1,b4).
+    if band_range_left is None:
+        band_range_left = (meta.b_id_0, meta.b_id_3)
+    if band_range_right is None:
+        band_range_right = (meta.b_id_0, meta.b_id_4)
+
+    # The production charge fit uses asymmetric serving windows: L contains
+    # all occupied states plus the Sigma conduction window, while R contains
+    # the Sigma occupied window plus all empty states.  Complex conjugation
+    # swaps those ordered endpoints, so LR alone is not a conjugation-closed
+    # training space.  Complete the *normal equations* before factor/solve;
+    # no fitted zeta, V, or W is projected downstream.  The q involution is
+    # owned by the symmetry service and passed into neutral ``isdf.core``.
+    _complete_charge_pairs = (
+        int(vertex_mu_L) == 0
+        and tuple(band_range_left) != tuple(band_range_right))
+    if _complete_charge_pairs:
+        from ffi import _services
+        _services.ensure_on_path()
+        from symmetry_maps import q_negation_index
+        _q_neg_idx = q_negation_index(kgrid)
+        print("  Charge pair training domain: ordered LR + RL "
+              "(conjugation-closed normal equations)")
+    else:
+        _q_neg_idx = None
+
+    # Full range for loading (max of left and right)
+    band_range_full = (min(band_range_left[0], band_range_right[0]),
+                       max(band_range_left[1], band_range_right[1]))
+
+    nb_left = band_range_left[1] - band_range_left[0]
+    nb_right = band_range_right[1] - band_range_right[0]
+    nb_full = band_range_full[1] - band_range_full[0]
+
+    print_fn(f"\n  Zeta fitting: {num_chunks} r-chunks x {n_rchunk} r-points, "
+             f"{nb_full} bands ({nb_left} left + {nb_right} right)")
+    print_fn(f"  Output: {output_file}")
+
+    # ========== STEP 2: Compute CCT (C_q) from left/right pair densities ==========
+    # γ̃^0 = I_4 → vertex_mu_L=0 is the standard spin-traced path.  For
+    # vertex_mu_L ∈ {1,2,3} the γ̃^μ vertex is folded into both P_l and
+    # P_r so C_q is the proper per-channel interpolation metric for the
+    # Lorentz pair density.  CCT^μ for transverse channels is Hermitian
+    # indefinite and rank-deficient: TRS in non-magnetic ground states
+    # gives near-null transverse-current modes that would be amplified
+    # by 10^4–10^6 if we naively LU-solved through them (the original
+    # MoS2 σ^B blowup).  The robust solver in :func:`solve_zeta`
+    # uses an SVD pseudoinverse with rcond cutoff to drop those null
+    # modes instead of inverting through them — the unique min-norm LSQ
+    # solution.
+    # ── Finalize write_ibz_only BEFORE any IBZ slicing (bug fix) ─────────
+    # The IBZ cascade slices C_q/L_q to IBZ rows in STEP 2/3 below, and
+    # slices Z_q to IBZ inside the per-r-chunk kernel; the two MUST agree.
+    # The orbit-closure auto-fallback can flip write_ibz_only=False when the
+    # centroid set isn't closed under the WFN sym group, so it must run HERE
+    # — before the C_q slice.  (Previously it ran after factor_c_q, so the
+    # charge channel sliced L_q to IBZ, then fell back, leaving L_q at IBZ
+    # while Z_q stayed full-BZ → the ``B.shape[0]=nq_full != Nq=nq_ibz``
+    # distributed-potrs crash.)  Transverse channels can't fall back (the
+    # V_q orchestrator assumes IBZ ζ̃_T), so they loud-fail with a hint.
+    #
+    # ONE RESOLUTION POINT.  This used to call ``centroid_source_map_and_wrap``
+    # for its side effect — build the whole table, throw it away, and read
+    # the answer off whether an exception came back — which is both the
+    # third spelling of the closure question in ``gw/`` and an
+    # exception used as a boolean.  It now asks
+    # ``gw.qgrid_symmetry`` the same question every other site asks, and
+    # branches on the mode.  The charge channel's fallback line is the
+    # SHARED announcement (deduped on the centroid set, so a run that also
+    # falls back in V_q says it once, not twice); the transverse channel
+    # suppresses it because its consequence is a refusal, not a fallback.
+    if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
+        from .qgrid_symmetry import resolve_qgrid_symmetry_tables
+        _is_transverse = int(vertex_mu_L) != 0
+        # ``sym.sym_matrices`` holds the spatial ops; the fractional
+        # translations live on WFNReader (BGW WFN.h5 layout).
+        _res = resolve_qgrid_symmetry_tables(
+            sym=sym, centroid_indices=centroid_indices,
+            fft_grid=meta.fft_grid, translations=wfn.translations,
+            context=("bispinor transverse ζ̃_T IBZ write"
+                     if _is_transverse else "ζ̃ IBZ write"),
+            announce_fallback=not _is_transverse,
+        )
+        if not _res.use_ibz:
+            if _is_transverse:
+                raise RuntimeError(
+                    f"Bispinor transverse zeta_T (mu_L={int(vertex_mu_L)}) "
+                    f"IBZ-write requested, but the transverse centroid set "
+                    f"fails the orbit-closure check under the WFN sym group: "
+                    f"{_res.reason}.  Regenerate the transverse centroid "
+                    f"file with ``centroid.kmeans_cli --density-mode "
+                    f"current`` (orbit-aware by default for ntran>1) so the "
+                    f"set is closed under the spatial sym group.")
+            write_ibz_only = False
+
+    with timing.section("zeta_fit.CCT"):
+        # ψ inputs at PADDED n_rmu (Phase 3a's load_centroids contract).
+        # Monolithic shard_map pipeline: open-spin pair density + IFFT
+        # + γ̃·γ̃ + FFT fused inside one shard_map.  The rank-5
+        # P_l/P_r pair density never exists as a global XLA value, so
+        # the rank-3 fused-replicated reshape that pegged the kernel
+        # peak under the legacy chain cannot form.  γ̃^μ_L applied at
+        # the post-IFFT contraction step (charge: identity short-
+        # circuit; transverse: (perm, phase) tuple).  Output C_q is
+        # rank-3 (k, μ, ν).
+        chan_label = ("charge γ̃^0=I" if vertex_mu_L == 0
+                      else f"transverse γ̃^{vertex_mu_L}")
+        print_fn(f"  Computing C_q via shard_map pipeline (open-spin, {chan_label})")
+        with timing.section("zeta_fit.CCT.face_gemm_plan"):
+            from distrib_la import gemm_plan as _gemm_plan
+            _ns_face, _nb_face = int(psi_mun_parent.shape[1]), int(psi_mun_parent.shape[3])
+            if (int(psi_nmu_parent.shape[1]) != _nb_face
+                    or int(psi_nmu_parent.shape[2]) != _ns_face):
+                raise ValueError("fit_zeta_to_h5: parent face band/spin extents differ.")
+            _mu_gemm = int(k_unfold_plan.n_centroid_packed)
+            _face_gemm = _gemm_plan(
+                mesh_xy, m=_mu_gemm * _ns_face, k=_nb_face,
+                n=_mu_gemm * _ns_face, nq=int(k_unfold_plan.n_parent),
+                dtype=jnp.complex128)
+            print_fn(f"  {_face_gemm.describe()}")
+            _off = int(band_range_full[0])
+            _idx = np.arange(_nb_face)
+            weight_l_face = jnp.asarray(np.where(
+                (_idx >= band_range_left[0] - _off)
+                & (_idx < band_range_left[1] - _off), 1.0, 0.0), dtype=jnp.float64)
+            weight_r_face = jnp.asarray(np.where(
+                (_idx >= band_range_right[0] - _off)
+                & (_idx < band_range_right[1] - _off), 1.0, 0.0), dtype=jnp.float64)
+        print_fn(f"  C_q on raw parents: {k_unfold_plan.n_parent} -> {nk_tot} k rows")
+        C_q = c_q_from_psi_sm(
+            kgrid=kgrid, mesh_xy=mesh_xy,
+            psi_mun_parent=psi_mun_parent, psi_nmu_parent=psi_nmu_parent,
+            weight_l=weight_l_face, weight_r=weight_r_face,
+            gemm=_face_gemm, k_unfold_plan=k_unfold_plan,
+            gamma_L=int(vertex_mu_L), gamma_R=int(vertex_mu_L))
+        # C_q: (nqx, nqy, nqz, n_rmu_padded, n_rmu_padded) with zero
+        # pad rows/cols.
+
+        # Flatten for Cholesky.  Reshape uses padded extent (the
+        # in-memory shape); factor_c_q slices to logical
+        # internally via ``n_rmu_logical=``.
+        C_q_flat = C_q.reshape(nq, n_rmu_padded, n_rmu_padded)
+        del C_q
+        flat_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+        C_q_flat = jax.lax.with_sharding_constraint(C_q_flat, flat_shard)
+        if n_rmu_solve == n_rmu_padded and n_rmu_padded > n_rmu:
+            # Interleaved pad slots (orbit-packed order): C_q's pad rows and
+            # columns are exact zeros.  Put C's own MEAN DIAGONAL (tr C/n per
+            # q; the pad rows contribute nothing to the trace) on the pad
+            # diagonal: the factor is nonsingular, Z's zero pad rows give
+            # zeta_pad = 0, and the pad eigenvalues sit inside the active
+            # spectrum -- a unit pad would BE lambda_max when C's scale is
+            # small and the rank-truncation cut rcond*lambda_max would then
+            # drop real modes (Si leg 20 attempt 1: 39 meV).
+            _pad_scale = (jnp.trace(C_q_flat, axis1=-2, axis2=-1).real
+                          / float(n_rmu)).astype(C_q_flat.dtype)
+            _pad_diag = jnp.diag(jnp.asarray(
+                ~mu_basis.active_mask, dtype=C_q_flat.dtype))
+            C_q_flat = jax.lax.with_sharding_constraint(
+                C_q_flat + _pad_scale[:, None, None] * _pad_diag[None],
+                flat_shard)
+        if _q_neg_idx is not None:
+            C_q_flat = complete_ordered_pair_normal_equations(
+                C_q_flat, _q_neg_idx)
+
+        # IBZ cascade for the per-q factor: slice C_q to IBZ rows *before*
+        # ``factor_c_q`` runs so Cholesky / LU factors only ``n_q_ibz``
+        # blocks instead of all ``n_q_full``.  C_q has the same (n_q, μ, ν)
+        # shape as V_q, and Cholesky is per-q independent — slice-then-
+        # factor gives bit-equal L_q rows as factor-then-slice.  The
+        # downstream solve still produces ζ_q at IBZ, and V_q unfolds via
+        # ``symmetry_maps.unfold_isdf_operator`` from IBZ → full BZ.  Same
+        # slice helper applies to χ_q for the W_q = (1 − v_q χ_q)^{-1} v_q
+        # path once that lands.
+        if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
+            from ffi import _services
+            _services.ensure_on_path()
+            from symmetry_maps import slice_q_full_to_ibz
+            C_q_flat = slice_q_full_to_ibz(
+                C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
+
+        # Commit only the selected q carrier at the outer host boundary.
+        # The charge -q completion above still needs all K rows internally,
+        # but waiting on C_full before this slice pinned d*(K-Q)*M^2/P bytes
+        # through the synchronization point for no consumer.  The slice is a
+        # pure row selection, so the selected values are unchanged.
+        C_q_flat.block_until_ready()
+
+    del _face_gemm
     gc.collect()
-    (L_q, lu_piv, _resolved_solver_kind, _resolved_zeta_gather, cct_trace_per_q, _coupled_stacked_solve, _coupled_solve_inputs) = _factor_zeta_fit_gram(
-        C_q_flat, _coupled_mu123_coordinator, _stack_coupled_solve_inputs, charge_zeta_solve,
-        distrib_la_batched_route, distributed_cholesky, distributed_lu, distributed_zeta_solve,
-        mesh_xy, n_rmu_padded, n_rmu_solve, print_fn, solver_kind, transverse_zeta_rcond,
-        transverse_zeta_solve, vertex_mu_L, zeta_rcond, zeta_ridge)
+
+    # ========== STEP 3: Compute L_q from CCT ==========
+    # μ_L=0 (charge): C_q is PSD → 2D-blocked Cholesky factor L_q.
+    # μ_L=1,2,3 (transverse): C_q is Hermitian indefinite — skip the
+    # factorization and pass the slice through; the per-chunk
+    # solve_zeta dispatches to an SVD pseudoinverse with
+    # rcond cutoff (drops null transverse-current modes that would
+    # otherwise be amplified by 10^4–10^6).
+    with timing.section("zeta_fit.cholesky"):
+        # Resolve once so the banner reflects what actually runs and
+        # downstream callees skip their own 'auto' fallback.  Pass the
+        # factor batch (nq = C_q_flat.shape[0], IBZ-sliced above when the
+        # cascade fires) and the logical centroid count so the charge
+        # resolver can pick the mesh-invariant replicated dense Cholesky for
+        # fit-size stacks (see _resolve_solver_kind_charge).
+        # ORDER MATTERS (capacity fix 2026-07-29, ladder notes R15.1).
+        # The back-solve tier is resolved FIRST because when it is
+        # ``distributed`` it REPLACES the charge factor wholesale a few lines
+        # below, and the replicated factor's capacity check must therefore not
+        # be enforced.  Enforcing it was capping mu at
+        # sqrt(4 GiB / 16 B) = 16,384 on the size of a buffer the distributed
+        # route never allocates.  ``_resolve_zeta_gather`` does not depend on
+        # the factor kind, so the reorder is free.
+        _resolved_zeta_gather = _resolve_zeta_gather(
+            distributed_zeta_solve,
+            n_rmu=int(n_rmu_padded), nq=int(C_q_flat.shape[0]),
+            mesh_xy=mesh_xy, vertex_mu_L=int(vertex_mu_L),
+            charge_zeta_solve=charge_zeta_solve,
+            transverse_zeta_solve=transverse_zeta_solve)
+        _resolved_solver_kind = _resolve_solver_kind(
+            mesh_xy, int(vertex_mu_L), solver_kind,
+            distributed_cholesky=distributed_cholesky,
+            distributed_lu=distributed_lu,
+            n_rmu=n_rmu_solve, nq=int(C_q_flat.shape[0]),
+            charge_zeta_solve=charge_zeta_solve,
+            replicated_factor_used=(_resolved_zeta_gather != 'distributed'),
+            transverse_zeta_solve=transverse_zeta_solve)
+        if _resolved_zeta_gather == 'distributed':
+            # The tier IS a charge-channel route: it replaces the whole
+            # factor+back-solve pair, not just the gather granularity of
+            # the replicated one.  Overriding here (and NOT inside
+            # _resolve_solver_kind_charge) keeps the two knobs
+            # single-purpose: `distributed_cholesky` picks the factor
+            # LIBRARY, `distributed_zeta_solve` picks whether the factor is
+            # ever replicated.  Refuses rather than downgrades if the user
+            # also pinned an incompatible factor route.
+            if int(vertex_mu_L) != 0:
+                # Transverse rank_truncate family (the ONLY way the
+                # transverse channel reaches this tier — the ridge
+                # family's resolver returns per_q above): replace the
+                # local eigh factor with the pzheevd 2D-sharded C⁺.
+                if _resolved_solver_kind != 'transverse_rank_truncate':
+                    raise ValueError(
+                        f"distributed_zeta_solve='distributed' on a "
+                        f"transverse channel expects the rank_truncate "
+                        f"family, but the solver resolved to "
+                        f"{_resolved_solver_kind!r}.")
+                _resolved_solver_kind = 'distributed_transverse_rank_truncate'
+            else:
+                if _resolved_solver_kind not in ('replicated_rank_truncate',):
+                    raise ValueError(
+                        f"distributed_zeta_solve='distributed' resolves the "
+                        f"charge factor itself, but distributed_cholesky "
+                        f"resolved to {_resolved_solver_kind!r}.  Leave "
+                        f"distributed_cholesky at 'auto' (which gives "
+                        f"replicated_rank_truncate) for this tier.")
+                _resolved_solver_kind = 'distributed_rank_truncate'
+
+        # Preserve the fused path's exact ridge scalar for distributed LU.
+        # Materializing this tiny (nq,) reduction before factor preparation
+        # prevents XLA from choosing a different fused reduction tree whose
+        # last-bit change is amplified by the near-null transverse modes.
+        factor_trace_per_q = None
+        if (int(vertex_mu_L) != 0 and _resolved_solver_kind in
+                ('cusolvermp_lu', 'scalapack_lu')):
+            with timing.section("zeta_fit.trace_L_q"):
+                factor_trace_per_q = jnp.einsum(
+                    'qii->q', C_q_flat[:, :n_rmu_solve, :n_rmu_solve])
+                factor_trace_per_q.block_until_ready()
+        if int(vertex_mu_L) == 0:
+            _how = ("rank-truncated pinv"
+                    if _resolved_solver_kind == 'replicated_rank_truncate'
+                    else "distributed rank-truncated pinv (2D-sharded C+)"
+                    if _resolved_solver_kind == 'distributed_rank_truncate'
+                    else "chol(C_q)")
+            print_fn(f"  Computing L_q = {_how}  [PSD, charge channel, "
+                     f"path={_resolved_solver_kind}]")
+        else:
+            _how_t = ("hoisted per-q pivoted LU (once per channel)"
+                      if _resolved_solver_kind == 'lu'
+                      else "hoisted distributed getrf (block-cyclic, "
+                           "once per channel)"
+                      if _resolved_solver_kind in
+                      ('scalapack_lu', 'cusolvermp_lu')
+                      else "rank-truncated pinv (|lambda| cut, explicit "
+                           "C+, once per channel, rcond="
+                           f"{float(transverse_zeta_rcond):g})"
+                      if _resolved_solver_kind == 'transverse_rank_truncate'
+                      else "distributed rank-truncated pinv (pzheevd, "
+                           "2D-sharded C+, rcond="
+                           f"{float(transverse_zeta_rcond):g})"
+                      if _resolved_solver_kind
+                      == 'distributed_transverse_rank_truncate'
+                      else "CCT passthrough (fused per-r-chunk getrf+getrs)")
+            print_fn(f"  Computing transverse factor = {_how_t}  "
+                     f"[γ̃^{vertex_mu_L} indefinite — "
+                     f"path={_resolved_solver_kind}]")
+        _gather_gb = (int(C_q_flat.shape[0]) * int(n_rmu_padded) ** 2
+                      * 16 / 1e9)
+        # per-q tile: the two structural all_gathers inside ``_per_q_block``
+        # move μ²/p_y (row block) + μ² (full tile) — measured, not nominal.
+        _p_y = int(mesh_xy.shape['y'])
+        _tile_gb = (int(n_rmu_padded) ** 2 * 16 * (1.0 + 1.0 / _p_y)) / 1e9
+        print_fn(f"  Zeta back-solve tier: {_resolved_zeta_gather} "
+                 f"(distributed_zeta_solve={distributed_zeta_solve})  "
+                 f"replicated (nq,μ,μ) gather would be {_gather_gb:.2f} GB/rank; "
+                 f"per-q tile {_tile_gb:.3f} GB (×nq executions/r-chunk); "
+                 f"distributed tier gathers NO (μ,μ) object")
+        _coupled_factor = bool(
+            _coupled_mu123_coordinator is not None
+            and _stack_coupled_solve_inputs
+            and _resolved_solver_kind in ('cusolvermp_lu', 'scalapack_lu'))
+        if _coupled_factor:
+            L_q, lu_piv = C_q_flat, None
+            print_fn("  Deferring current factor to one coupled LU factor")
+        elif int(vertex_mu_L) != 0:
+            # Transverse: the factor stage is HOISTED (2026-08) — one
+            # pivoted LU per q per CHANNEL instead of per r-chunk.
+            # factor_c_q returns (factor, piv): (LU, perm) on the local
+            # plan, or a distrib_la FactorToken (ipiv inside it) on either
+            # distributed-library plan.
+            L_q, lu_piv = factor_c_q(
+                C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
+                n_rmu_logical=n_rmu_solve, solver_kind=_resolved_solver_kind,
+                zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
+                transverse_zeta_rcond=float(transverse_zeta_rcond),
+                distrib_la_batched_route=distrib_la_batched_route,
+                transverse_trace_per_q=factor_trace_per_q)
+        else:
+            L_q = factor_c_q(
+                C_q_flat, mesh_xy, vertex_mu_L=int(vertex_mu_L),
+                n_rmu_logical=n_rmu_solve, solver_kind=_resolved_solver_kind,
+                zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
+                distrib_la_batched_route=distrib_la_batched_route)
+            lu_piv = None
+        # A distributed library factor is an OPAQUE token: no ``.shape``
+        # to print and no single buffer to block on (a ScaLAPACK token
+        # holds factors AND pivots).  Report what it does publish.
+        if isinstance(L_q, FactorToken):
+            print_fn(f"  L_q: {L_q!r}")
+        else:
+            L_q.block_until_ready()
+            print_fn(f"  L_q: {L_q.shape}")
+
+    # Pre-compute per-q trace of the CCT ONCE per channel — needed ONLY
+    # by the remaining FUSED transverse route (cusolvermp passthrough,
+    # piv None), whose per-r-chunk ridge is ``ε·|tr(CCT)|/n``.  On the
+    # hoisted routes the ridge is baked into the factor, so the trace
+    # (and its per-r-chunk all-reduce, 17 s of GPU stream at MoS2 3×3
+    # bispinor) is gone.
+    if _coupled_factor:
+        cct_trace_per_q = factor_trace_per_q
+    elif (int(vertex_mu_L) != 0 and lu_piv is None
+            and not isinstance(L_q, FactorToken)
+            and _resolved_solver_kind not in (
+                'transverse_rank_truncate',
+                'distributed_transverse_rank_truncate')):
+        # ``not isinstance(...)`` is the ScaLAPACK hoist: its ridge is
+        # baked into the factored matrix, so it needs no trace operand —
+        # the condition used to read that off ``lu_piv is not None``, and
+        # the pivots live in the token now.  Rank-truncate kinds also
+        # return piv=None but carry no fused LU path — no ridge, hence no
+        # trace operand (their L_q is C⁺, whose trace would be a
+        # different, meaningless quantity here).
+        with timing.section("zeta_fit.trace_L_q"):
+            # LOGICAL-block trace only: the identity pad block would
+            # contribute exactly +mu_pad to the padded trace, making
+            # the LU ridge (ε·|tr|/n) depend on the pad extent — i.e.
+            # on the device count.  The slice is a no-op when the
+            # extent is already logical.  solve_zeta divides by the
+            # logical n to match.
+            cct_trace_per_q = jnp.einsum(
+                'qii->q', L_q[:, :n_rmu_solve, :n_rmu_solve])
+            cct_trace_per_q.block_until_ready()
+    else:
+        cct_trace_per_q = None
+
+    # Stack raw current Grams before their one factor, retaining its native pivot carrier.
+    _coupled_stacked_solve = _coupled_factor
+    _coupled_solve_inputs = (
+        (L_q, cct_trace_per_q) if _coupled_stacked_solve else None)
+
+    # Free C_q to reclaim GPU memory before z-chunk loop
+    # (P_k_mumu was already deleted above)
+    # This is critical for fitting within memory budget
     del C_q_flat
     with timing.section("zeta_fit.gc_pre_chunk_loop"):
         _collect_fit_setup_garbage()
-    (q_irr_full_idx, q_irr_frac, n_q_disk, _gflat_sphere_idx_padded, _gflat_gvec_components, _gflat_ngk_per_q, _gflat_ngkmax) = _prepare_zeta_output_sphere(
-        meta, n_rtot, nq, print_fn, sym, wfn, write_ibz_only, zeta_cutoff_ry)
-    (zeta_io, _n_G_sph) = _open_zeta_fit_output(
-        _gflat_gvec_components, _gflat_ngk_per_q, _gflat_ngkmax, centroid_indices, mesh_xy,
-        meta, n_q_disk, n_rmu, n_rtot, output_file, vertex_mu_L, wfn, zeta_cutoff_ry)
-    (band_chunk_ranges, psi_G_store, real_grid_tiles, num_chunks, n_rchunk, psi_r_cache) = _prepare_zeta_fit_wavefunctions(
-        band_chunk_size, band_range_full, bispinor, bispinor_lift, cache_psi_r, chunk_r,
-        k_unfold_plan, mesh_xy, meta, n_rtot, nk_tot, print_fn, wfn)
+
+    # ========== STEP 4a: q-IBZ reduction + header writes (rank 0) ==========
+    # When ``write_ibz_only=True`` (default), ζ is written for IBZ q's
+    # only.  V_q at the full BZ is recovered by the reader / V_q
+    # orchestrator using sym data from ``mf_header`` (see report.md
+    # §2.4).  The on-disk ``zeta_q`` leading axis is ``n_q_disk``
+    # rather than ``n_q_full``; the chunk loop slices
+    # ``zeta_chunk[q_irr_full_idx]`` before writing.
+    #
+    # When ``write_ibz_only=False`` (caller forced full-BZ writes via
+    # an unreduced q grid), the full-BZ axis is preserved on
+    # disk for back-compatibility.
+    #
+    # ``write_ibz_only`` was finalized above (before the C_q/L_q IBZ slice)
+    # by the orbit-closure auto-fallback, so the on-disk q-axis is IBZ when
+    # it is True and full-BZ when it fell back — nothing more to decide here.
+
+    # BGW Brillouin-zone wrap: ``q > kgrid/2 → q − kgrid``.  The writer
+    # and V_q consumer share the symmetry service's exact tie convention so
+    # the per-q phase
+    # ``exp(-2πi (q/kgrid)·r)`` baked into the G-flat output is the
+    # convention the consumer expects.
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import bgw_integer_q_to_fractional
+
+    if write_ibz_only:
+        q_irr_kgrid_int = sym.q_irr_kgrid_int
+        q_irr_full_idx = sym.q_irr_full_idx
+        n_q_disk = int(q_irr_full_idx.shape[0])
+        # IBZ fractional q-vectors for the G-flat accumulator (Phase C1b).
+        # BGW wrap THEN divide by kgrid so the writer's per-q phase
+        # matches the V_q kernel's ``apply_bloch_phase`` convention.
+        q_irr_frac = bgw_integer_q_to_fractional(
+            q_irr_kgrid_int, meta.kgrid)
+        print_fn(f"  q-IBZ reduction: {n_q_disk} IBZ q-points / {nq} full-BZ "
+                 f"(disk shrink {nq / max(1, n_q_disk):.1f}×)")
+    else:
+        q_irr_full_idx = None
+        q_irr_frac = None
+        n_q_disk = nq
+        print_fn(f"  q axis on disk: full BZ ({nq} q-points) "
+                 f"(write_ibz_only=False or closure check failed)")
+
+    # ---- G-flat on-disk format ---------------------------------
+    # The writer accumulates each r-chunk's contribution into a
+    # persistent G-flat buffer via
+    # ``common.wfn_transforms.accumulate_rchunk_to_gflat`` and writes
+    # the final tensor as ``zeta_q_G`` (shape
+    # ``(n_q_disk, n_rmu, ngkmax)``).  The full r-space ζ_q is never
+    # materialised on disk or as a persistent device buffer.  When
+    # ``zeta_cutoff_ry`` is provided we build the per-q WFN.h5-style
+    # sphere ``{G : |q+G|² ≤ cutoff}``, pad to a uniform ``ngkmax``
+    # with the shared FFT-box pad sentinel (Nyquist-corner cell; the
+    # Miller index is ``(-n/2)`` per even axis and ``+(n-1)/2`` per odd
+    # one — ``common.gvec_fft_box.fft_box_pad_sentinel``), and
+    # store both the coeffs and the per-q components on disk.  Without
+    # a cutoff the writer falls back to the full flat-FFT axis
+    # (n_G_sph = n_rtot) — slow disk path, kept for sanity checks.
+    if q_irr_frac is None:
+        # Full-BZ q-vectors with BGW wrap, then / kgrid — the convention
+        # the per-q sphere below is built in.  (It used to be stated as
+        # "what the V_q
+        # consumer's disk→G path expects"; that path,
+        # ``zeta_loader._do_disk_to_G``, was deleted on 2026-08-07 — this
+        # writer bakes the phase in and the reader does no FFT at all.)
+        q_irr_frac = bgw_integer_q_to_fractional(
+            sym.kvecs_asints, meta.kgrid)
+
+    # Build the per-q WFN.h5-style sphere when a cutoff is available.
+    # The output is host numpy; the writer threads ``sphere_idx_padded``
+    # through ``accumulate_rchunk_to_gflat`` and stashes the components
+    # / ngk / cutoff into the isdf_header below.  ``zeta_cutoff_ry``
+    # — distinct from V_q's bare-Coulomb cutoff — defines the per-q
+    # sphere on disk.  Caller (``gw_init.fit_zeta``) validates
+    # ``zeta_cutoff_ry ≥ bare_coulomb_cutoff_ry`` so V_q has every G
+    # it needs.
+    _gflat_sphere_idx_padded = None      # (n_q_disk, ngkmax) int32
+    _gflat_gvec_components = None        # (n_q_disk, 3, ngkmax) int32
+    _gflat_ngk_per_q = None              # (n_q_disk,) int32
+    _gflat_ngkmax = None
+    if zeta_cutoff_ry is not None and int(meta.sys_dim) != 0:
+        from common.coulomb_sphere import compute_per_q_bare_coulomb_components
+        # The Cartesian reciprocal ROWS off the vcoul door's geometry rather
+        # than a hand-written ``blat * bvec``, which ``docs/services/vcoul.md``
+        # names as an antipattern for a reason worth restating: a product
+        # every caller has to remember to take is a footgun, and the day one
+        # of them forgets, every G in this sphere is off by the lattice
+        # constant with no shape error to say so.  ``from_wfn`` is duck-typed
+        # on ``blat``/``bvec``/``cell_volume``; ``WfnLoader`` binds all three
+        # off the mf_header.  Only ``.bvec`` is read here — this site takes no
+        # Ω at all, so there is no ``cell_volume`` question to answer.
+        from ffi import _services
+        _services.ensure_on_path()
+        from vcoul import CoulombGeometry
+        _bvec_for_sphere = CoulombGeometry.from_wfn(wfn).bvec
+        _sphere_pkg = compute_per_q_bare_coulomb_components(
+            fft_grid=meta.fft_grid,
+            bvec=_bvec_for_sphere,
+            q_irr_frac=q_irr_frac,
+            vcoul_cutoff_ry=float(zeta_cutoff_ry),
+            sys_dim=int(meta.sys_dim),
+        )
+        _gflat_sphere_idx_padded = _sphere_pkg["sphere_idx_padded"]
+        _gflat_gvec_components = _sphere_pkg["gvec_components_padded"]
+        _gflat_ngk_per_q = _sphere_pkg["ngk_per_q"]
+        _gflat_ngkmax = int(_sphere_pkg["ngkmax"])
+        if jax.process_index() == 0:
+            print_fn(
+                f"  G-flat ζ sphere: ngkmax={_gflat_ngkmax}, "
+                f"min ngk={int(_gflat_ngk_per_q.min())}, "
+                f"max ngk={int(_gflat_ngk_per_q.max())} "
+                f"({_gflat_ngkmax / float(n_rtot):.3%} of n_rtot)")
+
+    # ``zeta_q.h5`` carries the BGW-style ``mf_header`` verbatim from
+    # the source WFN so any downstream consumer (the new
+    # :class:`zeta_loader.ZetaLoader`, or anything else that
+    # speaks the WFN.h5 header) sees the same crystal / k-grid / G-grid
+    # / symmetry view.  ``isdf_header`` holds ζ-specific metadata only
+    # — centroids in FFT-grid + fractional coords, density label,
+    # ``vertex_mu_L``.  Everything sym-derivable (q-IBZ list, centroid
+    # orbit permutation, G-sphere) is rebuilt at read time via
+    # ``SymMaps`` + ``orbit_syms`` and is *not* stored.
+    #
+    # Sequence: SlabIO(mode='w') replaces the inode (rank-0 unlink +
+    # barrier) and CREATES it collectively, so H5Fcreate applies the
+    # Lustre striping hints; it closes immediately.  Rank 0 then appends
+    # both header groups with h5py mode='a'.  Then SlabIO re-opens with
+    # mode='a' so the headers survive and ``create_dataset('zeta_q')``
+    # appends rather than truncates.  The create-order matters and is
+    # explained at the write_headers section below.
+    from file_io.slab_io import SlabIO
+    from file_io.mf_header import copy_mf_header
+    from file_io.isdf_header import IsdfHeader, write_isdf_header
+
+    _wfn_src_path = getattr(wfn, '_filename', None)
+    if _wfn_src_path is None:
+        raise ValueError(
+            "fit_zeta_to_h5: wfn must expose '_filename' (the source "
+            "WFN.h5 path) so mf_header can be copied verbatim into "
+            "zeta_q.h5.")
+
+    # Centroid FFT-grid indices for the isdf_header.  ``centroid_indices``
+    # may be a jax.Array on device; pull to host as int32 (n_rmu, 3).
+    _cent_idx_np = np.asarray(jax.device_get(centroid_indices),
+                              dtype=np.int32)
+    if _cent_idx_np.shape != (n_rmu, 3):
+        raise ValueError(
+            f"fit_zeta_to_h5: centroid_indices has shape "
+            f"{_cent_idx_np.shape}, expected ({n_rmu}, 3).")
+    _density_label = 'scalar' if int(vertex_mu_L) == 0 else 'current'
+    _hdr_kwargs = dict(
+        r_mu_fft_idx=_cent_idx_np,
+        fft_grid=meta.fft_grid,
+        density=_density_label,
+        vertex_mu_L=int(vertex_mu_L),
+        zeta_layout='G_flat',
+    )
+    if _gflat_gvec_components is None:
+        raise ValueError(
+            "G-flat ζ writer requires a ζ sphere — pass "
+            "zeta_cutoff_ry to fit_zeta_to_h5.")
+    _hdr_kwargs.update(
+        gvec_components=_gflat_gvec_components,
+        ngk_per_q=_gflat_ngk_per_q,
+        zeta_cutoff_ry=float(zeta_cutoff_ry),
+    )
+    _isdf_hdr = IsdfHeader.build(**_hdr_kwargs)
+
+    with timing.section("zeta_fit.write_headers"):
+        # WHICHEVER CALL CREATES THE INODE DECIDES THE STRIPE LAYOUT.
+        # A Lustre layout is fixed at inode create, and the striping
+        # hints live in the MPI_Info that phdf5's H5Fcreate builds — so
+        # the inode has to be created by MPI-IO, and everything after
+        # inherits what it chose.  (The old ``lfs setstripe`` prestripe
+        # helper was deleted 2026-07-31: ``lfs`` is absent in the
+        # production container, so the hints are the only lever left.)
+        #
+        # This used to be ``_replace_inode_for_write`` followed straight
+        # by ``copy_mf_header(..., dst_mode='w')`` — i.e. rank-0 SERIAL
+        # h5py created the inode, MPI-IO never saw it, and the file took
+        # the DIRECTORY DEFAULT while the comment here claimed it got the
+        # hints.  MEASURED 2026-08-07: zeta_q.h5 stripe_count=1 against a
+        # resolved policy of 4 and a sibling isdf_tensors_*.h5 of 4
+        # (``lfs getstripe -c -S``; /pscratch directory default is 1).
+        # Cost at 1 rank is exactly zero, which is how it survived — it
+        # bites at P>1, where ROMIO sets cb_nodes = min(stripe_count,
+        # nranks), so a 1-stripe file pins collective buffering to a
+        # SINGLE aggregator however many ranks are writing.
+        #
+        # So: SlabIO(mode='w') creates and closes the file collectively
+        # (that H5Fcreate carries the striping hints), and only THEN does
+        # rank-0 h5py append the two header groups with mode='a', which
+        # keeps the inode it finds.  Serial h5py appending to a
+        # parallel-HDF5-created file is fine — verified through both
+        # readers by
+        # tests/test_file_io.py::test_zeta_q_inode_gets_striping_policy.
+        # Measured cost of the extra collective create+close on an empty
+        # file: 4 ms at 1 rank.
+        #
+        # SlabIO mode='w' runs the same rank-0 unlink + barrier helper
+        # (``_replace_inode_for_write``) internally, so the explicit call
+        # that used to be here would be doing its job twice.
+        with SlabIO(output_file, mode='w', mesh=mesh_xy):
+            pass
+        if jax.process_index() == 0:
+            # Append both header groups to the inode SlabIO just created.
+            copy_mf_header(_wfn_src_path, output_file, dst_mode='a')
+            write_isdf_header(output_file, _isdf_hdr, mode='a')
+        jax.experimental.multihost_utils.sync_global_devices(
+            "zeta_fit_headers_written")
+
+    # ========== STEP 4b: SlabIO appends zeta_q to the pre-created file ==========
+    # zeta_q is stored flat-q: shape (nq, n_rmu, n_rtot) with
+    # q_flat = qx*nqy*nqz + qy*nqz + qz.  Flat-q is the ongoing
+    # convention across LORRAX; see file_io.slab_io docs.  Chunk by
+    # single-q r-slice so per-q reads stay contiguous.
+    #
+    # Single SlabIO handle reused for both create_dataset and all
+    # writes — avoids the ~900 ms cost of a second collective
+    # H5Fopen/close pair (measured 2026-04-18 at MoS2 3x3).  The same
+    # handle serves BOTH backends: the allgather backend's handle is a
+    # cheap rank-0 h5py file object, and routing its final write through
+    # ``write_slab`` (instead of a hand-rolled gather + ``[...] =``)
+    # applies the shared logical-extent clip — the bypass used
+    # to write the PADDED gathered buffer into the logical-shaped
+    # dataset and crashed whenever a μ pad existed (PADDING_AUDIT #2).
+    #
+    # mode='a' (not 'w') so the pre-written mf_header + isdf_header
+    # are preserved.  SlabIO's mode='w' inode replace is skipped on 'a'
+    # — the inode was already replaced above.
+    #
+    # Dataset layout ``(nq, n_rtot, n_rmu)`` — NOT ``(nq, n_rmu, n_rtot)``.
+    # Rationale: per-r-chunk writes span the full innermost axis (n_rmu)
+    # under this layout, so each ``(q, r)`` row is contiguous on disk.
+    # Under the old ``(nq, n_rmu, n_rtot)`` layout we'd write n_rchunk <
+    # n_rtot on the innermost axis, producing 480K × 1920-B scattered
+    # strips per rank per write (measured at 0.18 GB/s on Perlmutter
+    # pscratch, 8× slower than contiguous).  Per-q reads (V_q) stay
+    # contiguous under this layout too: a 6.6 M-element slab at
+    # ``(q, 0, 0)`` is a single contiguous block.  Downstream V_q
+    # transposes the returned array on GPU to match the kernel's
+    # (n_rmu, n_rtot) expectation — ~50 µs per q, negligible.
+    with timing.section("zeta_fit.open_file"):
+        # G-flat layout: ``zeta_q_G`` dataset (n_q_disk, n_rmu, ngkmax)
+        # — WFN.h5 ``wfns/coeffs`` style with a fixed ``ngkmax`` padded
+        # G axis.  Per-q components live in
+        # ``isdf_header/gvec_components`` (already serialised by the
+        # write_isdf_header call above).  The row-major axis order keeps one
+        # full q slab contiguous without requesting an HDF5 chunk layout.
+        _n_G_sph = (int(_gflat_ngkmax)
+                     if _gflat_ngkmax is not None else n_rtot)
+        zeta_io = SlabIO(output_file, mode='a', mesh=mesh_xy,
+                         )
+        zeta_io.create_dataset(
+            'zeta_q_G',
+            shape=(n_q_disk, n_rmu, _n_G_sph),
+            dtype=np.complex128,
+        )
+
+    # ========== STEP 5: Pre-load G-space for all band chunks (ONCE) ==========
+    # This caches the expensive HDF5 read + scatter so we don't repeat it
+    # for each r-chunk. Memory cost depends on band_range_full (can be large).
+    # Uniform band chunks over [b_full_start, b_full_end]: N-1 of
+    # size ``band_chunk_size`` plus one remainder chunk.  This gives
+    # the read/FFT pipeline and the pair-density einsum exactly
+    # TWO compile shapes, regardless of where the L/R endpoints fall.
+    # Chunks that straddle an L/R endpoint get handled in the loop
+    # below by padding the left-side ``psi_L_bc`` slice with zero
+    # bands — the resulting einsum still runs at the uniform
+    # ``bc_size``, so it hits the same JIT cache.
+    _bfs, _bfe = band_range_full
+    from runtime.padding import padded_axis
+    band_chunk_size = padded_axis(
+        band_chunk_size, mesh_xy, name="zeta-fit band chunk").carrier
+    # The physics window remains exactly [_bfs, _bfe): masks below use the
+    # logical endpoints.  Only the ψ(G) transport range is padded so every
+    # per-chunk band shard is P-divisible.  The loader and the pair masks
+    # zero/ignore these at-most-P-1 tail bands.
+    _bfe_transport = _bfs + padded_axis(
+        _bfe - _bfs, mesh_xy, name="zeta-fit band transport").carrier
+    band_chunk_ranges = [
+        (_bfs + i * band_chunk_size,
+         min(_bfs + (i + 1) * band_chunk_size, _bfe_transport))
+        for i in range(
+            (_bfe_transport - _bfs + band_chunk_size - 1) // band_chunk_size)
+    ]
+
+    # Build the host-resident ψ(G) staging store.  It supplies one band
+    # chunk at a time while the all-P-sharded ψ(r) cache is built below,
+    # then its host tiles are released before the r-chunk loop.
+    from common.psi_G_store import build_psi_G_store
+    psi_G_store = build_psi_G_store(
+        wfn=wfn, mesh_xy=mesh_xy, meta=meta,
+        band_chunk_ranges=band_chunk_ranges,
+        bispinor=bispinor,
+        bispinor_lift=bispinor_lift,
+        # Parent route: the r-chunk kernel contracts on the WFN's raw rows
+        # and never needs a full-k ψ(G) or ψ(r); the store is 1/(nk/n_parent)
+        # of its full-k size and so is the hoisted ψ(r) cache below.
+        k_domain=k_unfold_plan.sym.parent_k_domain,
+    )
+    # The parent route streams orbit-closed real-grid TILES, not contiguous
+    # slabs; every tile has one static width <= the planner's chunk_r, so the
+    # priced r extent still bounds each Z_q/solve transient.
+    real_grid_tiles = k_unfold_plan.real_grid_tiles(
+        target_width=int(chunk_r))
+    num_chunks = int(real_grid_tiles.n_tiles)
+    n_rchunk = int(real_grid_tiles.width)
+    if n_rchunk > int(chunk_r):
+        # A tile holds whole real-space orbits on each Y owner, so its
+        # width is bounded below by n_y x the largest orbit.  When the
+        # planner's chunk_r sits under that floor the tiles are WIDER
+        # than what was priced: say so, loudly, rather than OOM in
+        # silence (planner floor: KNOWN_LORRAX_ISSUES 2026-09-05).
+        print_fn(
+            f"  *** LORRAX SANITY: orbit-closed r tiles are {n_rchunk} "
+            f"slots wide but the memory plan priced chunk_r = "
+            f"{int(chunk_r)}; the Z_q / solve / zeta chunk live set is "
+            f"{n_rchunk / max(1, int(chunk_r)):.2f}x the planned one. ***")
+    print_fn(
+        f"  Z_q on raw parents: {k_unfold_plan.n_parent} parent k rows "
+        f"-> {nk_tot} full k by the typed unfold on {num_chunks} "
+        f"orbit-closed real-grid tiles x {n_rchunk} slots "
+        f"(planned chunk_r {int(chunk_r)}; pad slots "
+        f"{num_chunks * n_rchunk - n_rtot})")
+
+    # Hoist the full-grid ψ(G)->ψ(r) transforms when the memory plan admits
+    # the cache.  Otherwise retain the SAME host staging store and let the
+    # canonical z_q kernel stream one band chunk through to_rchunk_inner per
+    # r chunk.  This is a storage policy only; both routes enter the same
+    # pair-density/FFT/solve physics below.
+    psi_r_cache = None
+    if cache_psi_r:
+        with timing.section("zeta_fit.build_psi_r_cache"):
+            psi_r_cache = build_psi_r_cache_sm(
+                psi_G_store, mesh_xy=mesh_xy)
+            psi_r_cache.block_until_ready()
+        _cache_local_bytes = sum(
+            int(shard.data.size) * int(shard.data.dtype.itemsize)
+            for shard in psi_r_cache.addressable_shards)
+        if jax.process_index() == 0:
+            print_fn(f"  ψ(r) cache: {psi_r_cache.shape}, "
+                     f"band-sharded over ('x','y'), "
+                     f"{_cache_local_bytes / 1e9:.2f} GB local")
+        # Every io_callback has drained.  Release the host coefficient tiles,
+        # but retain the store-owned box index and k vectors consumed by the
+        # parent kernel metadata until the final close below.
+        psi_G_store.release_host_tiles()
+    elif jax.process_index() == 0:
+        print_fn("  ψ(r) cache: disabled by the low-memory plan; streaming "
+                 "one ψ(G) band chunk per r chunk")
+
+    # ========== STEP 6: Loop over chunks ==========
+    # Wall-clock totals for the end-of-fit timing line.  ``t_fit_total``
+    # covers the fused fit_one_rchunk jit (load + pair + ZCT + solve) —
+    # finer-grained breakdown now lives inside the jit and is only
+    # observable via xprof, not perf_counter.
     t_fit_total = 0.0
     t_write_total = 0.0
     t_chunk_start = time.perf_counter()
+
+    # Driver debug — runtime probe of process-wide HBM at
+    # named lifecycle sites.  The module-level ``mem_probe`` helper is
+    # reused so the r-chunk loop sites and the gw_init V_q sites all
+    # share one source of truth.  HLO's buffer-assignment.txt is per-jit
+    # and cannot prove cross-jit liveness — see
+    # reports/memory_model_refit_2026-05-17/agent_e_cross_jit_lifetime.md.
     _mem_probe = mem_probe
+
+    # Per-chunk: ``accumulate_rchunk_to_gflat`` adds the chunk's
+    # contribution into the donated ``gflat_acc`` in place; no
+    # per-chunk SlabIO write.  The single ``zeta_q_G`` write happens
+    # once after the loop.
+
+    # GPU high-water tracker — the all-time ``peak_bytes_in_use``, which is what
+    # actually determines OOM (it includes JIT caches + prior-stage allocations,
+    # not just the chunk-loop arrays).  Prefer JAX's exact per-rank BFC-arena peak
+    # from ``memory_stats()``; fall back to THIS rank's nvidia-smi sample only if
+    # that's unavailable.  Two traps this avoids: (1) ``--id=0`` reads a *foreign*
+    # GPU on a multi-rank / shared node (``_nvsmi_used_mb_local_gpu`` honours
+    # CUDA_VISIBLE_DEVICES); (2) a single post-loop nvidia-smi sample MISSES the
+    # peak under the cudaMallocAsync allocator (freed transients already returned),
+    # so it is only a last-resort floor, never the reported number when stats work.
     _peak_bytes = 0
     def _track_peak():
         nonlocal _peak_bytes
@@ -1123,15 +1070,110 @@ def fit_zeta_to_h5(
             _peak_bytes = max(_peak_bytes, _nvsmi_used_mb_local_gpu() * (1024 ** 2))
         except Exception:
             pass  # leave _peak_bytes = 0; caller suppresses the print
+
     from common.progress import LoopProgress
     r_progress = LoopProgress(
         num_chunks, print_fn, title="zeta fitting",
         item_name="r-chunk", max_updates=min(num_chunks, 20)).start()
+
+    # ---- G-flat accumulator (zero-init, μ-sharded) ----
+    # Persistent buffer: (n_q_disk, n_rmu_padded, ngkmax) c128 with
+    # μ sharded across ('x', 'y') so each rank holds n_rmu/p per q.
+    # Donated to ``accumulate_rchunk_to_gflat`` each iter; in-place add.
+    # When the per-q sphere isn't available (no vcoul_cutoff_ry) we
+    # fall back to the full flat-FFT axis n_rtot — slow, kept for
+    # smoke / sanity tests.
     from common.wfn_transforms import accumulate_rchunk_to_gflat
-    (gflat_acc, _gflat_chunk_size, _q_irr_frac_dev, L_q, cct_trace_per_q, _coupled_solve_inputs) = _prepare_zeta_accumulator(
-        L_q, _coupled_mu123_coordinator, _coupled_rank_gate, _coupled_solve_inputs,
-        _coupled_stacked_solve, _gflat_ngkmax, _spill_coupled_gflat_to_host, cct_trace_per_q,
-        gflat_chunk_size, mesh_xy, meta, n_q_disk, n_rtot, print_fn, q_irr_frac, vertex_mu_L)
+    # μ allocated at PADDED extent so the ('x','y') sharding divides
+    # cleanly.  Pad rows are zero because the back-solve produces
+    # zeta_pad = 0 (L_q's pad block is identity).
+    _n_rmu_padded = int(meta.n_rmu_padded)
+    _gflat_acc_n_G = (int(_gflat_ngkmax)
+                       if _gflat_ngkmax is not None else n_rtot)
+    _gflat_acc_sharding = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+    gflat_acc = jax.jit(
+        lambda: jnp.zeros(
+            (n_q_disk, _n_rmu_padded, _gflat_acc_n_G),
+            dtype=jnp.complex128),
+        out_shardings=_gflat_acc_sharding,
+    )()
+    # Flat-axis chunking inside ``accumulate_rchunk_to_gflat``.  The
+    # kernel runs inside a ``shard_map`` over ``('x','y')`` and chunks
+    # the per-rank flat ``(n_q · n_mu_local)`` axis into rows-per-
+    # scan-iteration of ``chunk_size``.  Memory bound:
+    # ``chunk_size · n_rtot · 16 B`` for the per-iteration FFT box.
+    #
+    # ``gflat_chunk_size = 0`` ⇒ one-shot (fine when the full per-rank
+    # box ``N · n_rtot · 16 B`` fits; MoS2 3×3 at 4 ranks: 1.1 GB).
+    # For CrI3-class FFT grids set cohsex.in ``gflat_chunk_size`` to
+    # an integer; the kernel zero-pads N up to a multiple of the chunk
+    # size so any value works (no divisibility constraint on either
+    # n_q or n_mu_local).
+    _gflat_chunk_size = int(gflat_chunk_size) if gflat_chunk_size else None
+    if jax.process_index() == 0:
+        from runtime.padding import mesh_divisor
+        _p_prod = mesh_divisor(mesh_xy)
+        _n_mu_local = int(meta.n_rmu_padded) // _p_prod
+        _N = n_q_disk * _n_mu_local
+        _cs = _gflat_chunk_size or _N
+        print_fn(f"  G-flat ζ accumulator: N={_N} rows/rank "
+                 f"(n_q={n_q_disk} × n_mu_local={_n_mu_local}); "
+                 f"chunk_size={_cs} → "
+                 f"per-iter FFT box {_cs * n_rtot * 16 / 1e9:.2f} GB/rank")
+    # Numpy → replicated, process-locally: ``jax.device_put(numpy, <a
+    # multi-process NamedSharding>)`` fires JAX's hidden
+    # ``multihost_utils.assert_equal`` all-gather (see
+    # ``common.collectives.device_put_process_local``).
+    _q_irr_frac_dev = _device_put_process_local(
+        np.asarray(q_irr_frac, dtype=np.float64),
+        NamedSharding(mesh_xy, P(None, None)))
+
+    # P1 — pre r-chunk loop, after L_q computed AND gflat_acc allocated.
+    # This is the persistent baseline the planner's ``_peak_C_const``
+    # should match: centroids (ψ_l/ψ_r in both Y and X transposes), L_q
+    # (Cholesky factor at IBZ for charge / pass-through CCT for
+    # transverse), and the freshly-zeroed gflat_acc.  Round-1 addition.
+    if debug_print_enabled():
+        jax.block_until_ready(gflat_acc)
+        jax.block_until_ready(L_q)
+    mem_probe("pre_rchunk_loop")
+    if _coupled_mu123_coordinator is not None:
+        if _spill_coupled_gflat_to_host:
+            _local_gflat_host_bytes = _local_shard_nbytes(gflat_acc)
+            with timing.section("zeta_fit.gflat_spill_initial"):
+                gflat_acc = _coupled_gflat_spill(
+                    gflat_acc, enabled=True)
+            if (jax.process_index() == 0 and int(vertex_mu_L) == 1):
+                print_fn(
+                    "  [bispinor] coupled G-flat host spill: "
+                    f"{_local_gflat_host_bytes} bytes/channel/rank, "
+                    f"{3 * _local_gflat_host_bytes} bytes/rank with all "
+                    "three accumulators parked")
+            mem_probe("pre_rchunk_loop_host_spilled")
+        _coupled_rank_gate("prepared")
+        _coupled_mu123_coordinator.channel_prepared(
+            int(vertex_mu_L), solve_inputs=_coupled_solve_inputs)
+        if _coupled_stacked_solve:
+            # release_channels() has materialized and synchronized the one
+            # concatenated carrier.  Drop each channel's superseded factor
+            # and trace before entering the memory-dominant face loop.
+            L_q = None
+            cct_trace_per_q = None
+            _coupled_solve_inputs = None
+
+    # glibc heap trim hook (see the comment at the call site in the loop
+    # below).  DEFAULT ON — one ``malloc_trim(0)`` per r-chunk costs a few
+    # ms and is the second half of the workstream-T ramp cure (the first
+    # half is ``runtime.tune_glibc_malloc``, applied before ``import jax``).
+    # ``LORRAX_MALLOC_TRIM=0`` disables; ``malloc_trim`` is glibc-only, so
+    # a missing symbol just disables the hook.
+    #
+    # The parse used to be a case-SENSITIVE ``not in ("0", "off", "false")``,
+    # which missed ``""``, ``"no"`` and every uppercase spelling — so
+    # ``LORRAX_MALLOC_TRIM=OFF`` left the hook ON while its documented
+    # sibling ``LORRAX_MALLOC_TUNE=OFF`` (runtime._env_falsy) correctly
+    # turned OFF.  The two knobs are advertised together in
+    # docs/dev/env_vars.md:116-117 and now answer identically.
     _trim_fn = None
     if env_bool("LORRAX_MALLOC_TRIM", True):
         try:
@@ -1139,24 +1181,362 @@ def fit_zeta_to_h5(
             _trim_fn = ctypes.CDLL("libc.so.6").malloc_trim
         except Exception:
             _trim_fn = None
-    (gflat_acc, t_fit_total, t_write_total) = _run_zeta_fit_tiles(
-        L_q, _coupled_mu123_coordinator, _coupled_rank_gate, _coupled_stacked_solve,
-        _gflat_chunk_size, _gflat_sphere_idx_padded, _mem_probe, _q_irr_frac_dev, _q_neg_idx,
-        _resolved_solver_kind, _resolved_zeta_gather, _spill_coupled_gflat_to_host, _trim_fn,
-        accumulate_rchunk_to_gflat, band_chunk_ranges, cct_trace_per_q,
-        distrib_la_batched_route, gflat_acc, k_unfold_plan, kgrid, lu_piv, mesh_xy, meta,
-        n_rmu_padded, n_rmu_solve, n_rtot, num_chunks, print_fn, psi_G_store, psi_mun_parent,
-        psi_r_cache, q_chunk_size, q_irr_full_idx, r_progress, real_grid_tiles, t_fit_total,
-        t_write_total, transverse_zeta_rcond, vertex_mu_L, weight_l_face, weight_r_face,
-        zeta_rcond, zeta_ridge)
+
+    with timing.section("zeta_fit.chunk_loop"):
+        for chunk_idx in range(num_chunks):
+            _tile_args = {}
+            _tile_r_indices_dev = None
+            _tile_row = np.asarray(real_grid_tiles.r_index[chunk_idx])
+            _tile_perm, _tile_wraps = real_grid_tiles.source_tables(
+                chunk_idx)
+            _rep = NamedSharding(mesh_xy, P())
+            _tile_args = dict(
+                k_unfold_plan=k_unfold_plan,
+                tile_r_index=_device_put_process_local(
+                    _tile_row.astype(np.int32), _rep),
+                tile_local_perm=_device_put_process_local(
+                    _tile_perm.astype(np.int32), _rep),
+                tile_wraps=_device_put_process_local(
+                    _tile_wraps.astype(np.int32), _rep),
+            )
+            # Each pad slot gets its OWN out-of-range sentinel so the
+            # scatter's unique-index promise holds with mode='drop'.
+            _tile_r_indices_dev = _device_put_process_local(
+                np.where(
+                    _tile_row >= 0, _tile_row,
+                    n_rtot + np.arange(_tile_row.size)).astype(np.int32),
+                _rep)
+            r_start = 0
+            r_end = n_rtot
+            logical_n_rchunk = actual_n_rchunk = int(real_grid_tiles.width)
+
+            _dbg_rchunk = debug_print_enabled()
+            _rss0 = _host_rss_gb() if _dbg_rchunk else 0.0
+            _mem_probe(f"rchunk_start chunk={chunk_idx}")
+            _prebuilt_Z_q = None
+            _prebuilt_zeta = None
+            if _coupled_mu123_coordinator is not None:
+                def _build_coupled_Z_q():
+                    return _z_q_face_parent(
+                        psi_mun_parent, psi_G_store, psi_r_cache,
+                        weight_l_face, weight_r_face,
+                        band_chunk_ranges=band_chunk_ranges,
+                        kgrid=kgrid, mesh_xy=mesh_xy,
+                        k_unfold_plan=k_unfold_plan, coupled_mu123=True,
+                        tile_r_index=_tile_args["tile_r_index"],
+                        tile_local_perm=_tile_args["tile_local_perm"],
+                        tile_wraps=_tile_args["tile_wraps"])
+
+                if _coupled_stacked_solve:
+                    def _build_coupled_zeta():
+                        with timing.section(
+                                "zeta_fit.chunk.coupled_z_q_build"):
+                            Z_mu_q = _build_coupled_Z_q()
+                            if q_irr_full_idx is not None:
+                                Z_mu_q = Z_mu_q[:, jnp.asarray(
+                                    np.asarray(
+                                        q_irr_full_idx, dtype=np.int32))]
+                        def factorize(C, trace):
+                            return factor_c_q(
+                                C, mesh_xy, vertex_mu_L=1,
+                                n_rmu_logical=n_rmu_solve,
+                                solver_kind=_resolved_solver_kind,
+                                zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
+                                transverse_zeta_rcond=transverse_zeta_rcond,
+                                distrib_la_batched_route=distrib_la_batched_route,
+                                transverse_trace_per_q=trace)
+                        L_mu_q, piv_mu_q = (
+                            _coupled_mu123_coordinator.
+                            stacked_solve_inputs(factorize=factorize))
+                        n_q_solve = int(Z_mu_q.shape[1])
+                        Z_flat = Z_mu_q.reshape(
+                            3 * n_q_solve, n_rmu_padded,
+                            actual_n_rchunk)
+                        with timing.section(
+                                "zeta_fit.chunk.coupled_solve"):
+                            zeta_flat = solve_zeta(
+                                L_mu_q, Z_flat, mesh_xy, q_chunk_size,
+                                vertex_mu_L=1,
+                                solver_kind=_resolved_solver_kind,
+                                lu_piv=piv_mu_q,
+                                n_rmu_logical=n_rmu_solve,
+                                zeta_gather=_resolved_zeta_gather,
+                                distrib_la_batched_route=(
+                                    distrib_la_batched_route))
+                            zeta_mu_q = zeta_flat.reshape(
+                                3, n_q_solve, n_rmu_padded,
+                                actual_n_rchunk)
+                        return zeta_mu_q
+
+                    _prebuilt_zeta = (
+                        _coupled_mu123_coordinator.acquire_channel_zeta(
+                            int(vertex_mu_L), chunk_idx,
+                            _build_coupled_zeta))
+                else:
+                    _prebuilt_Z_q = (
+                        _coupled_mu123_coordinator.acquire_channel_Z_q(
+                            int(vertex_mu_L), chunk_idx,
+                            _build_coupled_Z_q))
+            t0 = time.perf_counter()
+            with timing.section("zeta_fit.chunk.fit_one_rchunk"), \
+                 jax_profile.step_annotation("chunk_fit", step_num=chunk_idx):
+                if _prebuilt_zeta is not None:
+                    zeta_chunk = _prebuilt_zeta
+                else:
+                    zeta_chunk = fit_one_rchunk(
+                        psi_G_store=psi_G_store,
+                        psi_r_cache=psi_r_cache,
+                        L_q=L_q,
+                        mesh_xy=mesh_xy,
+                        meta=meta,
+                        band_chunk_ranges=band_chunk_ranges,
+                        actual_n_rchunk=actual_n_rchunk,
+                        q_chunk_size=q_chunk_size,
+                        vertex_mu_L=int(vertex_mu_L),
+                        solver_kind=_resolved_solver_kind,
+                        q_irr_full_idx=q_irr_full_idx,
+                        q_neg_idx=_q_neg_idx,
+                        cct_trace_per_q=cct_trace_per_q,
+                        zeta_gather=_resolved_zeta_gather,
+                        lu_piv=lu_piv,
+                        distrib_la_batched_route=distrib_la_batched_route,
+                        psi_mun=psi_mun_parent,
+                        weight_l=weight_l_face,
+                        weight_r=weight_r_face,
+                        _prebuilt_Z_q=_prebuilt_Z_q,
+                        **_tile_args,
+                    )
+                if actual_n_rchunk != logical_n_rchunk:
+                    zeta_chunk = zeta_chunk[..., :logical_n_rchunk]
+                zeta_chunk.block_until_ready()
+            if _coupled_rank_gate is not None:
+                _coupled_rank_gate(f"rchunk {chunk_idx} solve")
+            _t_fit = time.perf_counter() - t0
+            t_fit_total += _t_fit
+            _rss1 = _host_rss_gb() if _dbg_rchunk else 0.0
+            _mem_probe(f"after_fit_one_rchunk chunk={chunk_idx}")
+
+            # 6e. IBZ-slice → allgather (or FFI) → HDF5 write.
+            # ``zeta_chunk`` is computed at full BZ q (the FFT in
+            # ``solve_zeta`` naturally outputs all q's).  We slice to
+            # Phase B: ``zeta_chunk`` is already IBZ-shape
+            # (n_q_disk, n_rmu, n_rchunk) — the gather happens inside
+            # ``fit_one_rchunk`` before the triangular solve.  In
+            # full-BZ mode (q_irr_full_idx=None) the kernel returns
+            # full-BZ shape.  Accumulate this r-chunk's contribution
+            # into ``gflat_acc`` in place; the full ``zeta_q_G`` is
+            # written once after the loop.
+            t0 = time.perf_counter()
+            with timing.section("zeta_fit.chunk.h5_write"):
+                if _spill_coupled_gflat_to_host:
+                    with timing.section("zeta_fit.gflat_restore_accumulate"):
+                        gflat_acc = _coupled_gflat_restore(
+                            gflat_acc, enabled=True)
+                gflat_acc = accumulate_rchunk_to_gflat(
+                    rchunk=zeta_chunk, gflat_acc=gflat_acc,
+                    fft_grid=meta.fft_grid,
+                    r0=None,
+                    r_indices=_tile_r_indices_dev,
+                    sphere_idx=_gflat_sphere_idx_padded,
+                    qvec_frac=_q_irr_frac_dev,
+                    norm='backward',
+                    chunk_size=_gflat_chunk_size,
+                    mesh=mesh_xy,
+                )
+                del zeta_chunk
+                if _spill_coupled_gflat_to_host:
+                    with timing.section("zeta_fit.gflat_spill_accumulated"):
+                        gflat_acc = _coupled_gflat_spill(
+                            gflat_acc, enabled=True)
+                elif debug_print_enabled():
+                    jax.block_until_ready(gflat_acc)
+            _t_write = time.perf_counter() - t0
+            t_write_total += _t_write
+            _mem_probe(f"after_accumulate chunk={chunk_idx}")
+            if _coupled_mu123_coordinator is not None:
+                _coupled_mu123_coordinator.finish_chunk(
+                    int(vertex_mu_L), chunk_idx)
+            _rss2 = _host_rss_gb() if _dbg_rchunk else 0.0
+            # Return glibc's free-but-still-mapped heap to the OS at the
+            # end of each r-chunk.  Together with
+            # ``runtime.tune_glibc_malloc`` this is the cure for the
+            # workstream-T per-r-chunk anonymous-memory ramp: XLA:CPU's
+            # transients are ordinary malloc/free, and the memory glibc
+            # keeps in its per-thread arenas after ``free`` is what
+            # ratchets RSS up chunk after chunk while
+            # ``jax.live_arrays()`` stays flat.  MEASURED at MoS2 12x12 /
+            # 606c / P=80 / 81 r-chunks: +0.35 GB/rank/chunk -> 0.00.
+            _trimmed = _rss2
+            if _trim_fn is not None:
+                try:
+                    _trim_fn(0)
+                    _trimmed = _host_rss_gb()
+                except Exception:
+                    pass
+            if _dbg_rchunk and jax.process_index() == 0:
+                # ``rss`` is the leak observable: on CPU the XLA arena is
+                # invisible to ``memory_stats()``, so per-chunk anonymous
+                # growth only shows up here.  ``live`` is the JAX-side
+                # array total — rss growing while live stays flat means
+                # the accumulation is NOT a retained jax.Array.
+                _live_gb = 0.0
+                try:
+                    for _a in jax.live_arrays():
+                        _live_gb += (int(np.prod(_a.shape))
+                                     * _a.dtype.itemsize) / 1e9
+                except Exception:
+                    _live_gb = -1.0
+                print_fn(f"[rchunk_dbg] chunk={chunk_idx+1}/{num_chunks} "
+                         f"r=[{r_start},{r_end}) fit={_t_fit*1000:.0f}ms "
+                         f"write={_t_write*1000:.0f}ms "
+                         f"total={(_t_fit+_t_write)*1000:.0f}ms "
+                         f"rss={_rss2:.3f}GB live={_live_gb:.3f}GB "
+                         f"d_fit={_rss1 - _rss0:+.3f} "
+                         f"d_acc={_rss2 - _rss1:+.3f} "
+                         f"rss_trim={_trimmed:.3f}GB")
+            r_progress.step()
+            # LORRAX_MAX_RCHUNKS=N: stop the r-chunk loop after N chunks
+            # for profiling/sweeping.  Clean python exit avoids the
+            # SLURM step-zombie issue you get from killing the python
+            # mid-run.  Off when unset.
+            #
+            # STRICT PARSE.  The old ``if _max_rchunks and ... >= int(...)``
+            # took any non-empty string as a request: ``=0`` — the natural
+            # spelling of "no limit" — is a truthy STRING whose int is 0, so
+            # ``(chunk_idx+1) >= 0`` fired on the very first chunk and
+            # truncated the fit to one r-chunk.  A non-numeric value raised a
+            # bare ``invalid literal for int()`` from inside the loop.  Both
+            # produce a PARTIAL ζ that the writer still marks complete, so
+            # they must refuse up front instead.
+            _max_rchunks = os.environ.get("LORRAX_MAX_RCHUNKS")
+            _max_rchunks = _max_rchunks.strip() if _max_rchunks else ""
+            if _max_rchunks:
+                try:
+                    _max_n = int(_max_rchunks)
+                except ValueError:
+                    raise ValueError(
+                        f"LORRAX_MAX_RCHUNKS={_max_rchunks!r} is not an "
+                        f"integer.  It truncates the ζ fit after N r-chunks "
+                        f"(profiling only); unset it to fit every chunk."
+                    ) from None
+                if _max_n < 1:
+                    raise ValueError(
+                        f"LORRAX_MAX_RCHUNKS={_max_rchunks!r} must be >= 1.  "
+                        f"To disable the truncation, UNSET the variable — "
+                        f"'0' used to be accepted and truncated the fit to a "
+                        f"single r-chunk, silently."
+                    )
+            if _max_rchunks and (chunk_idx + 1) >= _max_n:
+                if jax.process_index() == 0:
+                    print_fn(f"[rchunk_dbg] LORRAX_MAX_RCHUNKS={_max_rchunks} "
+                             f"reached after chunk {chunk_idx+1}; "
+                             f"breaking r-chunk loop for profiling.")
+                break
+
+
     t_chunks_total = time.perf_counter() - t_chunk_start
     r_progress.finish()
+    # Sample GPU memory ONCE after the last chunk's jit settles.  The
+    # allocator keeps the peak reservation so this reads close to the
+    # all-time high water.
     _track_peak()
-    _write_zeta_fit_result(
-        _coupled_mu123_coordinator, _gflat_ngk_per_q, _spill_coupled_gflat_to_host, gflat_acc,
-        mesh_xy, mu_basis, vertex_mu_L, zeta_io)
+
+    if _coupled_mu123_coordinator is not None:
+        _coupled_mu123_coordinator.wait_finalize(int(vertex_mu_L))
+    if _spill_coupled_gflat_to_host:
+        with timing.section("zeta_fit.gflat_restore_final_write"):
+            gflat_acc = _coupled_gflat_restore(gflat_acc, enabled=True)
+
+    # ---- Write the accumulated G-flat ζ_q ----
+    # One collective write of the persistent ``(n_q_disk, n_rmu,
+    # ngkmax)`` tensor to disk.
+    with timing.section("zeta_fit.write_g_flat"):
+        # Pad slot zero-fill (WFN.h5 ``coeffs = 0`` convention).  The
+        # per-q gather inside ``accumulate_rchunk_to_gflat`` read the
+        # FFT-box pad sentinel's flat slot into every
+        # pad position; those values are physical (not zero) so we
+        # mask them here.  Logical slots ``[..., :ngk[q]]`` carry the
+        # real coeffs and are untouched.
+        if _gflat_ngk_per_q is not None:
+            _ngk_dev = _device_put_process_local(
+                np.asarray(_gflat_ngk_per_q, dtype=np.int32),
+                NamedSharding(mesh_xy, P(None)))
+            _g_axis = jnp.arange(int(gflat_acc.shape[-1]),
+                                  dtype=jnp.int32)        # (ngkmax,)
+            _mask = (_g_axis[None, None, :] < _ngk_dev[:, None, None])
+            gflat_acc = jnp.where(
+                _mask, gflat_acc, jnp.zeros_like(gflat_acc))
+        jax.block_until_ready(gflat_acc)
+        _n_G_sph = int(gflat_acc.shape[-1])
+        # On-disk extent is LOGICAL n_rmu in the CANONICAL centroid order
+        # (stated once, at the ``create_dataset`` above).  The buffer is in
+        # the run's packed order: convert at this seam (one exchange), then
+        # SlabIO clips the trailing canonical pad rows against the dataset's
+        # own extent, identically on every backend.
+        if mu_basis is not None:
+            gflat_acc = mu_basis.unpack_axis(gflat_acc, 1)
+        zeta_io.write_slab('zeta_q_G', gflat_acc)
     del gflat_acc
-    _close_zeta_fit_output(
-        n_q_disk, n_rmu, n_rtot, nq, num_chunks, output_file, print_fn, psi_G_store,
-        t_chunks_total, t_fit_total, t_write_total, zeta_io)
+
+    with timing.section("zeta_fit.close_io"):
+        zeta_io.close()
+
+    with timing.section("zeta_fit.sync_global"):
+        jax.experimental.multihost_utils.sync_global_devices("zeta_writes_complete")
+
+    # Flip ``isdf_header/zeta_is_done`` to True now that every chunk
+    # has drained to disk.  Restart paths key off this flag to decide
+    # whether the on-disk ζ is trustable; flipping it here (after the
+    # global sync above) guarantees every rank's writes are durable.
+    #
+    # NOT when a truncating knob was in force.  ``LORRAX_MAX_RCHUNKS=N``
+    # breaks the r-chunk loop above after N chunks, so the tensor written
+    # a few lines up is a PARTIAL ζ — and this stamp is the file's own
+    # claim about itself.  ``gw_init`` already refuses to add
+    # ``fit_provenance`` in that case, which blocks REUSE; this stops the
+    # file lying in the first place.  The two guards are deliberately
+    # independent: provenance is about "may a later run reuse this", and
+    # ``zeta_is_done`` is about "did the writer finish", which it did not.
+    # Both read the one list in ``gw_config.ZETA_TRUNCATING_ENV_KNOBS``.
+    _trunc = active_zeta_truncating_knobs()
+    if _trunc and jax.process_index() == 0:
+        _names = ", ".join(f"{k}={v}" for k, v in _trunc)
+        print_fn("")
+        print_fn("  " + "!" * 68)
+        print_fn(f"  *** LORRAX SANITY: {_names} truncated this ζ fit "
+                 f"(fewer than {num_chunks} r-chunks). ***")
+        print_fn(f"  {output_file} holds a PARTIAL ζ and is NOT being marked")
+        print_fn("  complete (isdf_header/zeta_is_done stays False), so no")
+        print_fn("  restart or reuse path will trust it.  Profiling only —")
+        print_fn("  delete this file before any production run from this")
+        print_fn("  directory.")
+        print_fn("  " + "!" * 68)
+    elif jax.process_index() == 0:
+        from file_io.isdf_header import mark_zeta_done
+        mark_zeta_done(output_file)
+
+    # Full teardown after the last cached kernel has completed.  The phdf5
+    # reader itself is cached at module level and survives.
+    psi_G_store.close()
+
+    # Per-stage timing breakdown.  ``fit`` is the fused fit_one_rchunk jit;
+    # ``H5`` is the allgather+write (or FFI write_slab).  Everything else
+    # lives inside the jit — see xprof for the intra-jit breakdown.
+    print_fn(f"  Zeta output: {output_file}  shape: "
+             f"(n_q_disk={n_q_disk} of {nqx}·{nqy}·{nqz}={nq} full-BZ, "
+             f"n_rtot={n_rtot}, n_rmu={n_rmu})")
+    print_fn(f"  Timing ({num_chunks} r-chunks, {t_chunks_total:.1f}s total):")
+    for label, t in [("fit", t_fit_total), ("H5", t_write_total)]:
+        print_fn(f"    {label:<6} {t:6.2f}s  {100*t/t_chunks_total:4.1f}%")
+
+    # P3 — exit of ζ-fit.  Captures what's still alive after the chunk
+    # loop completes: gflat_acc was del'd above, zeta_chunk freed, but
+    # centroids (psi_l/psi_r) and L_q are still referenced by the
+    # caller's closure (they were passed in as args).  V_q runs next
+    # against this baseline.  Round-1 addition.
+    mem_probe("zeta_fit_end")
+
+    # Return only peak-memory high-water mark; centroid wavefunctions
+    # are not returned (see docstring — callers re-load them directly
+    # via ``load_centroids_band_chunked``).
     return _peak_bytes
