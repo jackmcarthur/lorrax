@@ -877,6 +877,7 @@ def conv_kpair_plan(
     kgrid,
     ns: int,
     trailing_shape,
+    *, gate=CONV_KPAIR_GATE,
 ) -> tuple[str, str]:
     """Return ``(xla|resident|two_stage|device, reason)`` for one local tile.
 
@@ -886,15 +887,22 @@ def conv_kpair_plan(
     applies the measured shape crossover so an over-residency coverage arm is
     never selected when the XLA reference is expected to be faster.
     """
-    mode = conv_kpair_mode()
+    mode = gate.mode()
     kg = tuple(int(v) for v in kgrid)
     tail = tuple(int(v) for v in trailing_shape)
     if mode == "off":
-        return "xla", "LORRAX_CONV_KPAIR_FFI=off"
+        return "xla", f"{gate.env}=off"
     if mode == "on":
-        CONV_KPAIR_GATE.require(mesh, target=CONV_KPAIR_TARGET)
+        gate.require(mesh, target=gate.target)
         return "device", "on; C++ derives the final residency/refusal verdict"
-    ok, why = conv_kpair_available(mesh)
+    if gate is CONV_KPAIR_GATE:
+        ok, why = conv_kpair_available(mesh)
+    else:
+        try:
+            gate.require(mesh, target=gate.target)
+            ok, why = True, "CUDA"
+        except Exception as exc:
+            ok, why = False, f"{type(exc).__name__}: {exc}"
     if not ok:
         return "xla", why
     if (len(kg) != 3 or min(kg) < 1
@@ -910,6 +918,10 @@ def conv_kpair_plan(
         return "resident", (
             f"resident minimum={need} B <= portable "
             f"{_CONV_KPAIR_AUTO_SMEM_FLOOR} B")
+    if gate is CONV_KPARENT_GATE and int(ns) == 4:
+        return "two_stage", (
+            f"parent ns=4 over-residency arm: resident minimum={need} B "
+            f"> portable {_CONV_KPAIR_AUTO_SMEM_FLOOR} B")
     charge_fast = (int(ns) == 1 and (
         nk <= _CONV_KPAIR_AUTO_NK_ALWAYS
         or (nk <= _CONV_KPAIR_AUTO_NK_LARGE_ROW
@@ -1026,9 +1038,11 @@ def make_fused_conv_kpair(
 def make_fused_conv_kparent(mesh, kgrid, ns, trailing_shape, *,
                            perm_l, phase_l, perm_r, phase_r, centroid_major=False):
     """Convolve rank-5 local parents using typed maps, wraps and open-spin coefficients."""
-    if CONV_KPARENT_GATE.resolve(mesh) is None:
-        return None
-    arm, _ = conv_kpair_plan(mesh, kgrid, ns, trailing_shape)
+    from ffi.gate import announce_once
+    arm, reason = conv_kpair_plan(
+        mesh, kgrid, ns, trailing_shape, gate=CONV_KPARENT_GATE)
+    announce_once((CONV_KPARENT_GATE.env, "plan", tuple(kgrid), ns, tuple(trailing_shape), arm),
+                  f"[conv_kparent] arm={arm}: {reason}")
     if arm == "xla":
         return None
     nkx, nky, nkz = map(int, kgrid)

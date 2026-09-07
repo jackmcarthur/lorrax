@@ -151,3 +151,24 @@ def gpu_main():
 if __name__ == '__main__':
     from runtime import run_main_and_finalize
     run_main_and_finalize(gpu_main)
+
+
+def test_parent_plan_admits_ns4_above_resident_floor(monkeypatch):
+    """Parent-only registration admits the four-spin two-stage arm above portable SMEM."""
+    from ffi import fft
+    from ffi.gate import Gate
+    monkeypatch.setenv("LORRAX_CONV_KPARENT_FFI", "auto")
+    monkeypatch.setenv("LORRAX_CONV_KPAIR_FFI", "off")
+    probed = []
+    def require(self, mesh, *, target=None, **kwargs):
+        assert target == fft.CONV_KPARENT_TARGET
+        probed.append(target)
+        return "CUDA"
+    monkeypatch.setattr(Gate, "require", require)
+    arm, reason = fft.conv_kpair_plan(
+        object(), (12, 12, 8), 4, (4, 4), gate=fft.CONV_KPARENT_GATE)
+    assert arm == "two_stage" and "over-residency" in reason
+    kernel = fft.make_fused_conv_kparent(
+        object(), (12, 12, 8), 4, (4, 4), perm_l=np.arange(4),
+        phase_l=np.ones(4), perm_r=np.arange(4), phase_r=np.ones(4))
+    assert callable(kernel) and probed == [fft.CONV_KPARENT_TARGET] * 2
