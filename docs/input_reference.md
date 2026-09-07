@@ -67,7 +67,7 @@ page has to read it from.
 | `low_mem_bands` | `true` | Raw-parent ψ sharding: `true` uses two mesh-face copies with distributed band contractions; `false` uses two single-axis centroid copies with complete bands and local band contractions. Both use the same Green, screening and projection algorithms. Axis projection retains centroid-shard reductions; axis ψ uses more memory. |
 | `zeta_cutoff` | None | Zeta-sphere G-cutoff (Ry) for per-q zeta_q_G writes; None = ecutwfc; must be >= bare_coulomb_cutoff. |
 
-**Raw-parent GW.** Exact typed centroid transport is mandatory; a nonclosed required centroid action refuses rather than selecting full-k storage. Unported non-RPA screening refuses by name. GW restart requires raw-parent datasets; regenerate older full-k files with `restart = false`. An explicit dense `Gij` remains refused; pass diagonal occupations through `occupation_state`.
+**Raw-parent GW.** Typed centroid transport is mandatory; a nonclosed centroid set selects the service-owned trivial symmetry view, with loader-unfolded full-k states as parents on the same route. Unported non-RPA screening refuses by name. GW restart requires raw-parent datasets; regenerate older full-k files with `restart = false`. An explicit dense `Gij` remains refused; pass diagonal occupations through `occupation_state`.
 
 | combination | status | rule id / lift condition |
 |---|---|---|

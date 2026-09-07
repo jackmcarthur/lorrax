@@ -426,7 +426,7 @@ def test_head_wings_sharded_face_requires_face_psi_fields():
         head_wings_sharded(
             v, broken, jnp.asarray(enk), jnp.asarray(occ), omega,
             mesh=mesh, nb_logical=nb, nk_tot=nk, nspin=1, nspinor=1)
-    with pytest.raises(ValueError, match="canonical face layout"):
+    with pytest.raises(ValueError, match="canonical face or axis layout"):
         head_wings_sharded(
             v, object(), jnp.asarray(enk), jnp.asarray(occ), omega,
             mesh=mesh, nb_logical=nb, nk_tot=nk, nspin=1, nspinor=1,

@@ -217,9 +217,11 @@ def test_where_returns_exact_zero_where_the_multiply_would_give_nan():
 def gemm():
     """Isolate phase and selector algebra from the native distributed GEMM backend."""
     import jax
-    from jax.sharding import Mesh
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     plan = lambda left, right: left @ right
     plan.mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    plan.in_sharding_a = NamedSharding(plan.mesh, P(None, "x", "y"))
+    plan.in_sharding_b = plan.in_sharding_a
     return plan
 
 
@@ -332,17 +334,17 @@ def test_build_G_tau_forwards_layout_and_gemm_to_build_G():
                    enk, 1.0, layout="face")
 
 
-def test_build_G_and_tau_unfold_faces_before_the_only_contraction(gemm):
-    from types import SimpleNamespace
-
+def test_build_G_and_tau_unfold_parent_operators_after_contraction(gemm):
     class ParentRows:
-        irr_idx = np.array([1, 0, 1], dtype=np.int32)
-        sym = SimpleNamespace(operation_rows=lambda rows: (
-            None, None, np.zeros(len(rows), dtype=bool)))
+        mesh_xy = gemm.mesh
+        sym_idx = np.zeros(3, dtype=np.int32)
+        n_sym_spatial = 1
 
         @staticmethod
-        def unfold_face(face, *, spin_axis, mu_axis, mesh_axis):
-            return face[jnp.asarray([1, 0, 1])]
+        def unfold_operator(operator, *, operator_transpose, right_plan):
+            assert operator_transpose is None
+            assert right_plan is None
+            return operator[jnp.asarray([1, 0, 1])]
 
     xn = jnp.asarray(np.arange(2 * 1 * 2 * 3).reshape(2, 1, 2, 3)
                      + 1j)

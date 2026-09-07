@@ -16,6 +16,8 @@ def test_current_chi_matches_literal_hermitian_density(monkeypatch):
     def local_gemm_plan(mesh, **kwargs):
         gemm = lambda x, y: x @ y
         gemm.mesh = mesh
+        gemm.in_sharding_a = NamedSharding(mesh, P(None, "x", "y"))
+        gemm.in_sharding_b = gemm.in_sharding_a
         return gemm
 
     monkeypatch.setattr(distrib_la, "gemm_plan", local_gemm_plan)

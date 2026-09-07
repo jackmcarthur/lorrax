@@ -133,6 +133,8 @@ def _cpu_algebra(monkeypatch):
         def contract(x, y):
             return x @ y
         contract.mesh = mesh
+        contract.in_sharding_a = NamedSharding(mesh, P(None, "x", "y"))
+        contract.in_sharding_b = contract.in_sharding_a
         return contract
     monkeypatch.setattr(distrib_la, 'gemm_plan', gemm)
     monkeypatch.setattr(ffi.mklfft, 'fused_fft_ffi_enabled', lambda: False)
@@ -541,6 +543,7 @@ def test_periodic_transverse_hartree_sign_projector_and_zero_mode(monkeypatch):
 def test_isdf_current_signed_normal_matrix_against_literal_pair_gram(monkeypatch):
     """The legacy Gamma2 normal matrix is minus the physical Gram; other channels are positive."""
     import isdf.core as core
+    import distrib_la
     from common.gamma_matrices import gamma_perm_phase
     _cpu_algebra(monkeypatch)
     monkeypatch.setattr(core,'local_fftn3',lambda x,**k:jnp.fft.fftn(x,**k))
@@ -564,7 +567,7 @@ def test_isdf_current_signed_normal_matrix_against_literal_pair_gram(monkeypatch
                         density = np.einsum('am,ab,bm->m',child[k,m].conj(),gamma[a],child[kp,n])
                         expected[q] += np.outer(density.conj(),density)
         actual = core._c_q_face_parent(mun,nmu,jnp.array([1.,1.,0.,0.]),jnp.array([0.,0.,1.,1.]),
-            kgrid=(3,3,1),mesh_xy=mesh,gemm=lambda x,y:x@y,k_unfold_plan=plan,gamma_L=a,gamma_R=a)
+            kgrid=(3,3,1),mesh_xy=mesh,gemm=distrib_la.gemm_plan(mesh),k_unfold_plan=plan,gamma_L=a,gamma_R=a)
         sign = -1 if a == 2 else 1
         np.testing.assert_allclose(actual,sign*expected,rtol=3e-12,atol=3e-12,err_msg=f'ISDF signed Gram gamma{a}')
         print(f'ISDF_SIGNED_GRAM channel={a} sign={sign} max_physical_difference={np.max(np.abs(actual-expected)):.16e}')

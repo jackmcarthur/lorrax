@@ -288,6 +288,8 @@ def _worker(case_name: str, *, mesh_shape=(2, 2), return_arrays=False, return_fi
     # ---- CCT: the same claim for the square projector -----------------
     def _local_gemm(a, b):
         return jnp.einsum("qmk,qkn->qmn", a, b, optimize=True)
+    _local_gemm.in_sharding_a = NamedSharding(mesh, P(None, "x", "y"))
+    _local_gemm.in_sharding_b = _local_gemm.in_sharding_a
 
     C_face = pack(pack(Z_face[:, :, cent_flat], axis=1), axis=2)
     C_parent = np.asarray(jax.block_until_ready(c_q_from_psi_sm(

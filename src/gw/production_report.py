@@ -83,12 +83,12 @@ def layout_dial_record_lines(
     lines.append(
         f"[config provenance] low_mem_bands = {str(low_mem).lower()} "
         f"({provenance})")
-    if low_mem:
-        lines.append(
-            "low_mem_bands = true: the two-face wavefunction carrier (band "
-            f"chunks of {int(config.memory.band_chunk_size)}); required for the "
-            "raw-parent (k_irr) route, which contracts G and the ISDF pair "
-            "densities on the WFN's own k rows.")
+    psi_layout = "face" if low_mem else "axis"
+    contraction = "distributed GEMM" if low_mem else "local GEMM with complete bands"
+    lines.append(
+        f"low_mem_bands = {str(low_mem).lower()}: {psi_layout} parent carrier; "
+        f"{contraction}; band chunks of {int(config.memory.band_chunk_size)}. "
+        "Both layouts contract G and ISDF pair densities on the same parent rows.")
     return tuple(lines)
 
 
@@ -129,6 +129,9 @@ class GWProductionReport:
         end.  Exceptions still use stderr through the shared fail-fast path.
         """
         text = sep.join(str(v) for v in args)
+        if text.startswith("  Resident ψ "):
+            self.emit(text)
+            return
         # Fixed-SC quadrature identity is a physics invariant, not backend
         # chatter: retain its compact receipt so every map's exact node set
         # and zero-rebuild claim remain auditable after live stdout is gone.

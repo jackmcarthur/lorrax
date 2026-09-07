@@ -527,7 +527,7 @@ def test_the_route_and_the_refusal_read_the_same_envelope_table(tmp_path):
     both = [row[2] for row in gw_config.packed_static_envelope(
         _parse(tmp_path, _packed_deck()), screened=True)]
     assert both[:len(shared)] == shared
-    assert len(both) == len(shared) + 2      # 6 shared (incl. linalg) + 2 screened-only
+    assert len(both) == len(shared) + 1      # scalar-head override is screened-only
     assert "linalg = distributed" in shared
 
 
@@ -584,17 +584,17 @@ def test_mode_required_settings_are_derived_from_the_envelope_table(tmp_path):
     assert not any("linalg was not named" in ln for ln in lines), lines
 
 
-def test_retired_full_carrier_key_warns_and_uses_parents(tmp_path):
-    """The temporary compatibility ruling accepts false with an explicit warning."""
+def test_axis_parent_key_is_preserved_without_coercion(tmp_path):
+    """False selects axis parents without changing the requested deck value."""
     deck = _packed_deck().replace(
         "low_mem_bands = true", "low_mem_bands = false")
     path = tmp_path / "retired.in"
     path.write_text(deck)
     lines = []
     config = LorraxConfig.from_input_file(str(path), print_fn=lines.append)
-    assert config.memory.low_mem_bands is True
+    assert config.memory.low_mem_bands is False
     assert uses_static_photon_response(config)
-    assert any("WARNING: low_mem_bands = false" in line for line in lines)
+    assert not any("WARNING: low_mem_bands = false" in line for line in lines)
 
 
 def test_a_deck_outside_the_envelope_still_sees_its_own_reason(tmp_path):

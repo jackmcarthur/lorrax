@@ -158,3 +158,16 @@ row. The original loader remains authoritative for file energies and the
 G-sphere unfold. No deleted full-k Zq or Green kernel is reinstated. The
 binding admission ruling is in [decisions.md](decisions.md); the historical
 fixtures keep their original centroid coordinates and printed references.
+
+## Face and axis parent layouts
+
+Both `low_mem_bands` values use the same packed parents and fit schedule.
+Face uses distributed C_q GEMMs and reconstructs each centroid-side band
+chunk with a masked Y reduction. Axis uses local C_q GEMMs and takes those
+chunks directly from complete bands. The real-grid FFT staging transaction
+is shared; its all-to-all/all-gather are input placement, separate from the
+band contraction. Canonical zeta files do not encode a processor grid.
+
+Independent fresh fits can amplify different GEMM reduction orders in a
+conditioned CCT solve. The campaign report distinguishes copied-zeta exact
+QP gates from own-zeta micro-eV gates and retains the stricter array residual.

@@ -440,8 +440,8 @@ def test_parent_carrier_description_has_automatic_chunk_number(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert "[config provenance] low_mem_bands = true (deck)" in text
     assert (
-        "low_mem_bands = true: the two-face wavefunction carrier (band "
-        "chunks of 24); required for the raw-parent (k_irr) route" in text)
+        "low_mem_bands = true: face parent carrier; distributed GEMM; "
+        "band chunks of 24." in text)
     assert "set false" not in text
 
 

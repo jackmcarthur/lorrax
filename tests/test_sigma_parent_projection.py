@@ -66,6 +66,8 @@ def _worker() -> int:
     def _local_gemm_plan(_mesh, **_kwargs):
         gemm = lambda a, b: jnp.einsum("qmk,qkn->qmn", a, b, optimize=True)
         gemm.mesh = _mesh
+        gemm.in_sharding_a = NamedSharding(_mesh, P(None, "x", "y"))
+        gemm.in_sharding_b = gemm.in_sharding_a
         return gemm
 
     distrib_la.gemm_plan = _local_gemm_plan

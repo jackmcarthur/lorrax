@@ -1891,17 +1891,9 @@ _DEFAULTS = {
     # The automatic band chunk request is ``AUTOMATIC_BAND_CHUNK_SIZE``;
     # the planner mesh-rounds and caps it at the logical zeta window.
     "r_chunk_size": 0,
-    # Two-face 2-D-sharded ψ carrier (gw.wavefunction_bundle
-    # layout="face") in place of the legacy four single-axis copies:
-    # 2*S/(Px*Py) per-rank psi residency instead of 2*S/Px + 2*S/Py.
-    # Default false = layout="legacy", the exact existing construction
-    # path, bit-identical.  NOT an env var (decisions.md: physics- and
-    # routing-relevant choices are declared inputs, not environment).
-    # Narrow envelope while G/Sigma/head/rotation/exact-response
-    # consumers are ported one at a time (see
-    # reports/gwjax_low_mem_bands_audit_2026-08-22/report.md §6); an
-    # unsupported combination refuses by name rather than silently
-    # falling back to legacy.
+    # One raw-parent carrier: face (default) shards bands and centroids,
+    # 2*S/(Px*Py) per rank; axis keeps full bands, S/Px + S/Py.
+    # Both layouts share the Green, screening and self-energy algorithms.
     "low_mem_bands": True,
     # ISDF
     # Which of the TWO W Dyson plans solves A·W = V, A = (1 - Vχ₀):
@@ -4408,7 +4400,7 @@ class MemoryConfig:
     r_chunk_override: int         # 0 = auto
     gflat_chunk_size: int         # 0 = planner-picked
     vq_g_chunk_size: int          # 0 = auto _pick_g_chunk(ngkmax)
-    low_mem_bands: bool           # gw.wavefunction_bundle layout="face"
+    low_mem_bands: bool           # parent ψ layout: face=True, axis=False
     low_mem_bands_provenance: str  # deck | default | derived for packed mode
 
 

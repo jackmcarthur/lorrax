@@ -1391,8 +1391,8 @@ def compute_experimental_no_pair_photon_chi0(
     if (wfns_charge.layout != wfns_transverse.layout
             or wfns_charge.layout not in ("face", "axis")):
         raise ValueError(
-            "full four-current response requires layout='face' for both "
-            "charge and transverse endpoint bundles (low_mem_bands=true); "
+            "full four-current response requires matching face or axis layouts "
+            "for charge and transverse endpoint bundles; "
             f"got {wfns_charge.layout!r}/{wfns_transverse.layout!r}")
     from .wavefunction_bundle import padded_centroid_extent
     n_c = padded_centroid_extent(wfns_charge)

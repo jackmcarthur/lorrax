@@ -39,7 +39,7 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
            gemm=None, k_unfold_plan=None, right_k_unfold_plan=None, real_weights=None):
     """Build parent operators and transport both typed endpoints without processor exchange."""
     if layout not in ('face', 'axis') or gemm is None:
-        raise ValueError("build_G requires canonical faces and a GEMM plan or typed parent plan.")
+        raise ValueError("build_G requires layout=face or axis and a gemm plan.")
     G = _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases,
                       mesh=None if k_unfold_plan is None else k_unfold_plan.mesh_xy)
     if k_unfold_plan is None:

@@ -510,7 +510,7 @@ class GemmPlan:
 
 
 def _axis_matmul(a, b, c=None, *, alpha, beta, reduction_axis=None):
-    """Contract complete local band axes without communication."""
+    """Contract local bands or centroid tiles with the requested centroid reduction."""
     scale = alpha if a.dtype.kind == "c" else alpha.real
     result = scale * jnp.matmul(a, b)
     if reduction_axis is not None:
