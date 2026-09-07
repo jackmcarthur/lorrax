@@ -86,7 +86,7 @@ def main():
         k = len(active)
         a = jnp.concatenate([-ETA-1j*om, -ETA+1j*om])
         B = jnp.tile(adj(b), (2,1))
-        C = jnp.concatenate([1j*b, -1j*b], axis=1)
+        C = jnp.concatenate([-1j*b, 1j*b], axis=1)
         def parent_w(zi):
             return (factor/(zi**2-om**2)[None,:])@adj(factor)
         def relative(x,y):
