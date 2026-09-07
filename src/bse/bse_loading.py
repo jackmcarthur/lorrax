@@ -66,6 +66,97 @@ _BARE_V_FALLBACK_WARNING = (
 )
 
 
+def finite_occupation_rpa_data(orbitals, energies_ry, occupations, coulomb_q,
+                               kminq_index, mesh_xy, *, kgrid,
+                               trs_receipt, envelope_threshold=1e-5):
+    """Bind live full-band centroid orbitals to the TRS-folded RPA operator.
+
+    ``orbitals`` holds ``psi_X``/``psi_Y`` with shape ``(nk,nb,spin,mu)``
+    on centroid-X/Y faces. The caller must authenticate physical TRS and
+    complete retained band projectors. Y is defined as Theta applied to X;
+    no stored-state gauge rewrite or full-wavefunction host gather is used.
+    ``energies_ry`` and exact ``occupations`` are small host tables; ``kminq``
+    is the caller's canonical periodic k−q map, with no additional phase.
+    No restart, W construction, symmetry reconstruction or head injection is
+    performed. ``coulomb_q`` is the existing head-policy-compatible body.
+
+    For retained positive transitions, D=ec(k−q)−ev(k), F=fv(k)−fc(k−q).
+    The TRS-folded negative sector has −D and the same sqrt(F). Padding and
+    D<=0 pairs have exactly zero coupling. Envelope truncation is explicit;
+    the surviving Fermi differences are not clipped to binary occupations.
+    """
+    from runtime.padding import padded_axis, pad_to_axis
+    from common.collectives import device_put_process_local
+    from .occupation_pairs import occupation_band_envelopes
+
+    e = np.asarray(energies_ry, dtype=np.float64)
+    f = np.asarray(occupations, dtype=np.float64)
+    if (trs_receipt.get("status") != "PASS"
+            or trs_receipt.get("scope") != "physical_trs_complete_pair_subspaces"
+            or trs_receipt.get("band_count") != e.shape[1]):
+        raise ValueError("GATE fd_pair_trs: require authenticated physical TRS and complete retained pair subspaces; energy symmetry alone is insufficient")
+    selection = occupation_band_envelopes(e, f, threshold=envelope_threshold)
+    hi, lo = selection["hole_stop"], selection["particle_start"]
+    nk, nb = e.shape
+    if int(np.prod(kgrid)) != nk:
+        raise ValueError("GATE fd_pair_grid: kgrid and energy table disagree")
+    idx_host = np.asarray(kminq_index, dtype=np.int32)
+    if idx_host.shape != (nk,) or not np.array_equal(np.sort(idx_host), np.arange(nk)):
+        raise ValueError("GATE fd_pair_kmap: canonical k-minus-q map must be a permutation")
+    pair_spec = P("x", "y", None)
+    c_axis = padded_axis(nb-lo, mesh_xy, name="FD particle bands", spec=pair_spec, axis=0)
+    v_axis = padded_axis(hi, mesh_xy, name="FD hole bands", spec=pair_spec, axis=1)
+    rep = NamedSharding(mesh_xy, P())
+    idx = device_put_process_local(idx_host, rep)
+    data = dict(nkx=int(kgrid[0]), nky=int(kgrid[1]), nkz=int(kgrid[2]),
+                n_cond=nb-lo, n_val=hi, n_cond_pad=c_axis.carrier,
+                n_val_pad=v_axis.carrier, V_q0=coulomb_q,
+                fd_trs_authenticated=True, fd_trs_receipt=dict(trs_receipt),
+                fd_band_selection=selection, fd_particle_axis=c_axis,
+                fd_hole_axis=v_axis)
+    for face, mesh_axis in (("X", "x"), ("Y", "y")):
+        psi = orbitals[f"psi_{face}"]
+        if psi.shape[:2] != (nk, nb):
+            raise ValueError("GATE fd_pair_orbitals: require uncut common retained-band array")
+        target = NamedSharding(mesh_xy, P(None, None, None, mesh_axis))
+        # Existing BSE generator/snapshot encodes conj(M); both legs must
+        # therefore be conjugated to reproduce the GW density at +q.
+        pc = jnp.conj(jnp.take(psi[:, lo:], idx, axis=0))
+        pv = jnp.conj(psi[:, :hi])
+        data[f"psi_c_{face}"] = jax.lax.with_sharding_constraint(pad_to_axis(pc, c_axis, axis=1), target)
+        data[f"psi_v_{face}"] = jax.lax.with_sharding_constraint(pad_to_axis(pv, v_axis, axis=1), target)
+    data["eps_c"] = pad_to_axis(device_put_process_local(e[idx_host, lo:], rep), c_axis, axis=1, fill=PAD_EPS_GUARD_RY)
+    data["eps_v"] = pad_to_axis(device_put_process_local(e[:, :hi], rep), v_axis, axis=1, fill=-PAD_EPS_GUARD_RY)
+    fc = pad_to_axis(device_put_process_local(f[idx_host, lo:], rep), c_axis, axis=1)
+    fv = pad_to_axis(device_put_process_local(f[:, :hi], rep), v_axis, axis=1)
+
+    # Only one-particle tables are replicated. The pair products are created
+    # inside the final sharded program, never as replicated host/device cubes.
+    from functools import partial
+
+    @partial(jax.jit, out_shardings=(NamedSharding(mesh_xy, pair_spec),
+             NamedSharding(mesh_xy, P(None, None, "x", "y", None)), rep))
+    def pair_tables(ec, ev, occupation_c, occupation_v):
+        delta = (ec[:, :, None]-ev[:, None, :]).transpose(1, 2, 0)
+        difference = (occupation_v[:, None, :]-occupation_c[:, :, None]).transpose(1, 2, 0)
+        logical = ((jnp.arange(c_axis.carrier)[:, None] < c_axis.logical)
+                   & (jnp.arange(v_axis.carrier)[None, :] < v_axis.logical))[:, :, None]
+        active = logical & (delta > 0) & (difference > 0)
+        weight = jnp.sqrt(jnp.where(active, difference, 0.))
+        diagonal = jnp.where(active, delta, PAD_EPS_GUARD_RY)
+        bad = jnp.any(logical & (delta > 0) & (difference < -1e-14))
+        return weight, jnp.stack((diagonal, -diagonal))[:, None], bad
+
+    weight, diagonal, bad = pair_tables(data["eps_c"], data["eps_v"], fc, fv)
+    if bool(jax.device_get(bad)):
+        raise ValueError("GATE fd_pair_passivity: occupations must decrease with positive transition energy")
+    data["fd_sqrt_weight"] = weight
+    data["fd_signed_diagonal"] = diagonal
+    data["n_rmu"] = int(orbitals["psi_X"].shape[-1])
+    data["n_rmu_pad"] = data["n_rmu"]
+    return data
+
+
 def _refuse_unpersisted(dset, name: str, restart_file: str) -> None:
     """Refuse a restart tensor whose file says its data was never written.
 

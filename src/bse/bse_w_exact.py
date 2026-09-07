@@ -79,6 +79,45 @@ jax.config.update("jax_enable_x64", True)
 _BLOCK_GMRES_CACHE: dict[tuple, tuple] = {}
 
 
+def fd_rpa_operands(data):
+    """Ring operands plus authenticated finite-occupation pair arrays.
+
+    ``fd_sqrt_weight`` is sqrt(f_h-f_p) on active positive-energy pairs,
+    shape (c, v, k), sharded P('x', 'y', None).  The signed independent-
+    particle diagonal has shape (2, 1, c, v, k), on ``sh.X_full``.
+    The payload owner handles overlapping windows, zero padding and TRS;
+    this operator never clips occupations or transition energies.
+    Authentication concerns the physical TRS subspaces, not equality of
+    stored Bloch gauges: the Y basis is defined as the time reverse of X.
+    """
+    if data.get("fd_trs_authenticated") is not True:
+        raise ValueError("FD RPA coincident vertices require authenticated TRS")
+    return matvec_operands(data) + (
+        data["fd_sqrt_weight"], data["fd_signed_diagonal"])
+
+
+def _finite_occupation_rpa_matvec(matvec, sh):
+    """Dress the existing ring interaction with sqrt(F), not its diagonal.
+
+    H_F = D_sigma + S (H_integer - D_sigma) S.  This TRS-only density
+    representation uses the same positive-transition vertex in both
+    sectors.  All heavy ring contractions remain in ``matvec``; only
+    elementwise operations on the all-P pair carrier are added.
+    """
+    @jax.jit
+    def weighted(x, *operands):
+        sqrt_f, diagonal = operands[-2:]
+        scale = sqrt_f[None, None, ...]
+        sx = scale * x
+        interaction = matvec(sx, *operands[:-2]) - diagonal * sx
+        return jax.lax.with_sharding_constraint(
+            diagonal * x + scale * interaction, sh.X_full)
+    return weighted
+
+
+_RPA_KERNEL_CACHE = {}  # Structural callables only: never q-dependent arrays.
+
+
 def _build_rpa_resolvent(mesh_xy: Mesh, data: dict):
     """Assemble the RPA-screening resolvent stack for ``data``.
 
@@ -90,18 +129,40 @@ def _build_rpa_resolvent(mesh_xy: Mesh, data: dict):
     two reshard boundaries of the resolvent; ``snapshot`` is built in the
     reduce-scatter mode so the projection-back assembles ``W(mu_X, nu_Y)`` tiles
     directly (see :func:`apply_screening_resolvent_block`).
+
+    An explicit ``fd_sqrt_weight`` payload opts into finite-occupation,
+    TRS-authenticated positive transitions.  The integer path is unchanged.
+    This dynamic body operator does not supply a static zero-gap term or
+    replace the existing head treatment.
     """
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     ensure_W_R(data, include_W=False, mesh_xy=mesh_xy)
-    matvec = build_bse_ring_matvec_full(
-        mesh_xy, nkx, nky, nkz, include_W=False, screening=True)
+    finite = "fd_sqrt_weight" in data
+    key = (mesh_xy, nkx, nky, nkz, int(data["n_cond_pad"]),
+           int(data["n_val_pad"]), finite)
+    kernels = _RPA_KERNEL_CACHE.get(key)
+    if kernels is None:
+        matvec = build_bse_ring_matvec_full(
+            mesh_xy, nkx, nky, nkz, include_W=False, screening=True)
+        gen = build_realspace_random_transition_generator(
+            mesh_xy, nkx, nky, nkz, key[4], key[5])
+        snapshot = build_density_snapshot_operator(
+            mesh_xy, nkx, nky, nkz, scatter_nu_on_y=True)
+        sh = make_bse_shardings(mesh_xy)
+        if finite:
+            matvec = _finite_occupation_rpa_matvec(matvec, sh)
+        kernels = (matvec, gen, snapshot, sh)
+        _RPA_KERNEL_CACHE[key] = kernels
+    matvec, gen, snapshot, sh = kernels
     diag_h = build_preconditioner_diagonal_sharded(
         data, mesh_xy, include_W=False, use_tda=False)
-    gen = build_realspace_random_transition_generator(
-        mesh_xy, nkx, nky, nkz, int(data["n_cond_pad"]), int(data["n_val_pad"]))
-    snapshot = build_density_snapshot_operator(
-        mesh_xy, nkx, nky, nkz, scatter_nu_on_y=True)
-    return matvec, diag_h, gen, snapshot, make_bse_shardings(mesh_xy)
+    if "fd_sqrt_weight" in data:
+        fd_rpa_operands(data)  # Authenticate the explicitly opted-in payload.
+        diagonal = data["fd_signed_diagonal"]
+        sqrt_f = data["fd_sqrt_weight"][None, None, ...]
+        diag_h = jax.lax.with_sharding_constraint(
+            diagonal + sqrt_f**2 * (diag_h - diagonal), sh.X_full)
+    return matvec, diag_h, gen, snapshot, sh
 
 
 #: ``(q, nkx, nky, nkz) -> flat int32 k permutation``.  Tiny (nk entries) and a
@@ -777,7 +838,7 @@ def _symmetry_reduced_q_list(input_file: str) -> np.ndarray:
 
 
 def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
-                            resid_relative_to: str = "b"):
+                            resid_relative_to: str = "b", *, return_pair_states=False):
     """Cached jitted per-column-scan block-GMRES engine for the screening
     resolvent — the stage-2 SOLVE of :func:`apply_screening_resolvent_block`.
 
@@ -798,7 +859,8 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
     reuses one executable.  ``resid_relative_to`` IS in the key because it is
     a different stopping rule and so a different program; see
     :func:`bse_feast._gmres_solve_core` for what the two mean."""
-    key = (id(matvec), int(max_iter), str(resid_relative_to), str(dtype))
+    key = (id(matvec), int(max_iter), str(resid_relative_to), str(dtype),
+           bool(return_pair_states))
     hit = _BLOCK_GMRES_CACHE.get(key)
     if hit is not None:
         return _bind_tol(hit[1], tol)
@@ -822,6 +884,8 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
             nrhs = jnp.linalg.norm(rhs_i)
             resid = jnp.where(nrhs == 0.0, jnp.asarray(0.0, dtype=nrhs.dtype),
                               jnp.linalg.norm(r_true) / nrhs)
+            if return_pair_states:
+                return carry, (x[:, 0], resid, k_used)
             s = jax.lax.with_sharding_constraint(x[0] + x[1], sh.X)  # (1, c, v, k)
             return carry, (s[0], resid, k_used)
 
@@ -834,7 +898,11 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
         # to buy the memory with.
         _, (s_all, resids, iters) = jax.lax.scan(_solve_col, None, rhs_scan,
                                                  unroll=1)
-        s_all = jax.lax.with_sharding_constraint(s_all, sh.X)        # (nu, c, v, k)
+        if return_pair_states:
+            s_all = jax.lax.with_sharding_constraint(
+                jnp.moveaxis(s_all, 0, 1), sh.X_full)
+        else:
+            s_all = jax.lax.with_sharding_constraint(s_all, sh.X)
         return s_all, resids, iters
 
     _BLOCK_GMRES_CACHE[key] = (matvec, _block)
@@ -870,22 +938,11 @@ def build_probe_rhs(G_zeta, data, gen, sh):
     # each rank materialises only its own shard — where plain ``device_put``
     # of the materialised broadcast paid a P × n_probe·n_rmu·nk·8 B
     # assert_equal all-gather.  LORRAX_CHECK_REPLICA=1 re-arms the check.
-    # REAL probe blocks only, refused rather than cast.  The stage-1 seed is
-    # float64 all the way to ``gen``, and ``np.asarray(x, dtype=np.float64)``
-    # on a complex array DISCARDS the imaginary part with a ComplexWarning —
-    # not an error — so a caller handing this a complex probe block (a
-    # Lanczos start vector, a rotated basis) would get a silently wrong tile.
-    # Every probe in the tree today is a real unit column or the identity, so
-    # this is a real assumption being stated, not a capability being removed.
+    # Preserve the real seed ABI; complex tangents use the same linear
+    # generator in complex128, never two solves or a discarded imaginary part.
     G0 = np.asarray(G_zeta)
-    if np.iscomplexobj(G0):
-        raise TypeError(
-            "the probe block is complex; the screening seed is real-valued "
-            "(float64 through the transition generator) and casting here "
-            "would discard the imaginary part silently.  Split a complex "
-            "probe into its real and imaginary blocks and solve both, or "
-            "widen the generator's dtype deliberately.")
-    G = np.asarray(G0, dtype=np.float64)
+    seed_dtype = np.complex128 if np.iscomplexobj(G0) else np.float64
+    G = np.asarray(G0, dtype=seed_dtype)
     # UPLOAD THE PROBE BLOCK, BROADCAST ON DEVICE.  ``np.broadcast_to`` is a
     # 0-stride VIEW on host, but ``device_put_process_local`` slices a
     # hyperslab out of it and numpy materialises the contiguous copy right
@@ -905,13 +962,67 @@ def build_probe_rhs(G_zeta, data, gen, sh):
     # buys a further 6.1 MiB of H2D per wedge over this; it is not worth
     # taking the memory knob back.
     g = device_put_process_local(
-        np.ascontiguousarray(G, dtype=np.float64), sh.S_k0)
+        np.ascontiguousarray(G), sh.S_k0)
     r = jax.lax.with_sharding_constraint(
         jnp.broadcast_to(g[:, :, None], (n_probe, n_rmu, nk)), sh.S)
     f = jax.lax.with_sharding_constraint(
         gen(r, data["psi_c_X"], data["psi_v_X"], data["V_q0"]), sh.X)
-    return jax.lax.with_sharding_constraint(
-        jnp.stack([f, -f], axis=0).astype(jnp.complex128), sh.X_full)
+    rhs = jnp.stack([f, -f], axis=0).astype(jnp.complex128)
+    if "fd_sqrt_weight" in data:
+        fd_rpa_operands(data)
+        rhs = rhs * data["fd_sqrt_weight"][None, None, ...]
+    return jax.lax.with_sharding_constraint(rhs, sh.X_full)
+
+
+def solve_screening_pair_snapshots(rhs, z, data, matvec, diag_h, sh, *,
+                                   max_iter, tol):
+    """Return existing physical RPA shifted solutions, without discarding Y.
+
+    Parameters
+    ----------
+    rhs : jax.Array, shape (2, n_probe, c, v, k), sh.X_full
+        Seed from build_probe_rhs, including FD weights and physical Coulomb.
+    z : complex
+        Frequency in Ry. Solve (z - H_RPA) x = rhs.
+
+    Returns
+    -------
+    x, residuals, iterations : tuple of jax.Array
+        x has rhs's shape and all-P sharding. It is a first-order RPA
+        coordinate, NOT a Euclidean-Hermitian or normalized squared-H state.
+
+    Notes
+    -----
+    Experimental reduction interface: r stored snapshots cost O(Nt*r),
+    Nt=Nk*Nc*Nv. At fixed Nk, r shifted solves cost approximately
+    O(r*iterations*Nmu*Nc*Nv), generally quartic when r scales as Nmu.
+    No cubic-production admissibility follows from this interface.
+    """
+    operands = fd_rpa_operands(data) if "fd_sqrt_weight" in data else matvec_operands(data)
+    solver = _get_block_gmres_solver(
+        matvec, sh, max_iter, tol, rhs.dtype, return_pair_states=True)
+    return solver(rhs, diag_h, jnp.asarray(z, dtype=jnp.complex128), operands)
+
+
+def project_screening_pair_snapshots(x, data, snapshot, sh):
+    """Physical Wc readout of full RPA states on sh.X_full; no q weights.
+
+    Return shape (n_mu, n_probe) on sh.V. The canonical snapshot owns
+    spin/Nk/Coulomb normalization. FD contributes S exactly once here,
+    paired with S already present in build_probe_rhs; no 2*Omega factor
+    or extra Coulomb factor belongs in a caller.
+    """
+    s = jax.lax.with_sharding_constraint(x[0] + x[1], sh.X)
+    return _project_screening_pair_sum(s, data, snapshot, sh)
+
+
+def _project_screening_pair_sum(s, data, snapshot, sh, snapshot_v=None):
+    if "fd_sqrt_weight" in data:
+        fd_rpa_operands(data)
+        s = jax.lax.with_sharding_constraint(
+            s * data["fd_sqrt_weight"][None, ...], sh.X)
+    return snapshot(s, data["psi_c_Y"], data["psi_v_Y"],
+                    data["V_q0"] if snapshot_v is None else snapshot_v)
 
 
 def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
@@ -1000,6 +1111,14 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
     if rhs is None:
         rhs = build_probe_rhs(G_zeta, data, gen, sh)      # (2, nu, c, v, k)
 
+    if "fd_sqrt_weight" in data:
+        if (operands_fn is not matvec_operands or solve_data is not None
+                or snapshot_v is not None):
+            raise ValueError("FD RPA supports only the physical ring resolvent")
+        # A supplied rhs must come from build_probe_rhs, including its S
+        # factor.  Frequency sweeps may still hoist that unchanged seed.
+        operands_fn = fd_rpa_operands
+
     # --- Stage 2: SOLVE via the cached jitted per-column-scan GMRES engine. ---
     # The engine is keyed on the operator STRUCTURE (matvec); the q/omega-dependent
     # operand arrays flow in as runtime args, so it compiles ONCE and every later
@@ -1025,8 +1144,8 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
                                               else solve_data))
 
     # --- Stage 3: PROJECT (pair -> zeta), reduce-scatter to W(mu_X, nu_Y). ---
-    W_tile = snapshot(s_all, data["psi_c_Y"], data["psi_v_Y"],
-                      data["V_q0"] if snapshot_v is None else snapshot_v)
+    W_tile = _project_screening_pair_sum(
+        s_all, data, snapshot, sh, snapshot_v)
     if return_iters:
         return W_tile, resids, iters
     return W_tile, resids
