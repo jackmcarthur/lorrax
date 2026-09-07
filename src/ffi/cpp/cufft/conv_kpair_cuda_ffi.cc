@@ -157,8 +157,20 @@ static std::string cu_err(CUresult result) {
     return "CUresult=" + std::to_string(static_cast<int>(result));
 }
 
+struct ParentTables {
+    const int *irr, *sym, *left, *right, *trs;
+    const double *L, *R, *q, *coef_l, *coef_r;
+    int mu, nu, centroid_major;
+};
+
 static const char* kKernelSrc = R"__lrx__(
 struct __align__(16) lrx_c2 { double x, y; };
+struct ParentTables {
+    const int *irr, *sym, *left, *right, *trs;
+    const double *L, *R, *q, *coef_l, *coef_r;
+    int mu, nu, centroid_major;
+};
+
 
 __device__ __forceinline__ lrx_c2 lrx_mul(lrx_c2 a, lrx_c2 b) {
     lrx_c2 z = {a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x};
@@ -170,6 +182,40 @@ __device__ __forceinline__ lrx_c2 lrx_phase(lrx_c2 z, int code) {
     if (code == 2) { lrx_c2 q = {-z.x, -z.y}; return q; }
     if (code == 3) { lrx_c2 q = {z.y, -z.x}; return q; }
     return z;
+}
+
+// P = conj(sum_cd U_ac conj(U_bd) T[phase_L D_cd conj(phase_R)]).
+// The source maps are owner-local; no full-k operand is written to HBM.
+__device__ __forceinline__ lrx_c2 lrx_parent_load(
+    const lrx_c2* d, ParentTables t, int k, int a, int b,
+    long long row, int ns, bool right) {
+    const int m = row / t.nu, n = row % t.nu;
+    const int p = t.irr[k], op = t.sym[k];
+    const int lm = t.left[op*t.mu+m], rn = t.right[op*t.nu+n];
+    double dl=0.0, dr=0.0;
+    for (int i=0;i<3;++i) {
+        dl += t.q[3*p+i]*t.L[3*(op*t.mu+m)+i];
+        dr += t.q[3*p+i]*t.R[3*(op*t.nu+n)+i];
+    }
+    lrx_c2 pl, pr;
+    sincospi(2.0*dl,&pl.y,&pl.x);
+    sincospi(-2.0*dr,&pr.y,&pr.x);
+    const lrx_c2* coef = reinterpret_cast<const lrx_c2*>(right?t.coef_r:t.coef_l)
+        + ((long long)k*ns*ns+a*ns+b)*ns*ns;
+    lrx_c2 sum={0.0,0.0};
+    for (int c=0;c<ns;++c) for (int e=0;e<ns;++e) {
+        const lrx_c2 weight=coef[c*ns+e];
+        if (weight.x==0.0 && weight.y==0.0) continue;
+        const long long index=t.centroid_major
+            ? ((((long long)p*t.nu+rn)*ns+e)*t.mu+lm)*ns+c
+            : (((long long)p*ns+c)*t.mu+lm)*ns*t.nu+e*t.nu+rn;
+        lrx_c2 v=lrx_mul(lrx_mul(pl,d[index]),pr);
+        if (t.trs[k]) v.y=-v.y;
+        v=lrx_mul(weight,v);
+        sum.x+=v.x; sum.y+=v.y;
+    }
+    sum.y=-sum.y;
+    return sum;
 }
 
 template <int EPT, int AXIS>
@@ -276,12 +322,13 @@ __device__ __forceinline__ void lrx_transform_resident_pair(
 #undef LRX_PAIR_AXIS
 }
 
-template <int EPT>
+template <int EPT, bool Parent = false>
 __device__ __forceinline__ void lrx_resident_body(
     const lrx_c2* ain, const lrx_c2* bin, lrx_c2* uout,
     long long rows, int ns, int nk, int n0, int n1, int n2, int sp,
     double scale, unsigned long long perm_l, unsigned long long phase_l,
-    unsigned long long perm_r, unsigned long long phase_r, lrx_c2* sm) {
+    unsigned long long perm_r, unsigned long long phase_r, lrx_c2* sm,
+    ParentTables tables = {}) {
     const int tpr = blockDim.x;
     const int rb = blockDim.y;
     const int tid = threadIdx.y*tpr + threadIdx.x;
@@ -322,9 +369,14 @@ __device__ __forceinline__ void lrx_resident_body(
                 const long long row = r0+j;
                 lrx_c2 av={0.0,0.0}, bv={0.0,0.0};
                 if (row < rows) {
+                    if (Parent) {
+                        av=lrx_parent_load(ain,tables,k,a,b,row,ns,false);
+                        bv=lrx_parent_load(bin,tables,k,ap,bp,row,ns,true);
+                    } else {
                     const long long base = (long long)k*ns*rows*ns;
                     av=ain[base + (long long)a*rows*ns + row*ns + b];
                     bv=bin[base + (long long)ap*rows*ns + row*ns + bp];
+                    }
                 }
                 abank[(long long)j*sp+k]=av;
                 bbank[(long long)j*sp+k]=bv;
@@ -443,13 +495,13 @@ __device__ __forceinline__ void lrx_axis_one(
     __syncthreads();
 }
 
-extern "C" __global__ void lrx_pair_stage1(
+template <bool Parent>
+__device__ __forceinline__ void lrx_stage1_body(
     const lrx_c2* ain, const lrx_c2* bin, lrx_c2* wa_all,
     lrx_c2* wb_all, lrx_c2* tmp, long long rows, int ns, int nk,
     int n0, int n1, int n2, unsigned long long perm_l,
     unsigned long long phase_l, unsigned long long perm_r,
-    unsigned long long phase_r) {
-    extern __shared__ lrx_c2 sm[];
+    unsigned long long phase_r, lrx_c2* sm, ParentTables tables) {
     const long long row=blockIdx.x;
     if (row >= rows) return;
     const int nwarp=blockDim.x>>5;
@@ -474,9 +526,14 @@ extern "C" __global__ void lrx_pair_stage1(
             const int bp=(perm_r>>(4*b))&15;
             const int pc=(pcl+((phase_r>>(2*b))&3))&3;
             for (int k=threadIdx.x;k<nk;k+=blockDim.x) {
+                if (Parent) {
+                    wa[k]=lrx_parent_load(ain,tables,k,a,b,row,ns,false);
+                    wb[k]=lrx_parent_load(bin,tables,k,ap,bp,row,ns,true);
+                } else {
                 const long long base=(long long)k*ns*rows*ns;
                 wa[k]=ain[base+(long long)a*rows*ns+row*ns+b];
                 wb[k]=bin[base+(long long)ap*rows*ns+row*ns+bp];
+                }
             }
             __syncthreads();
             lrx_axis_pair(wa,wb,n0,n1,n2,2,-1.0,line_a,line_b,tw+n0+n1);
@@ -492,6 +549,26 @@ extern "C" __global__ void lrx_pair_stage1(
             __syncthreads();
         }
     }
+}
+
+extern "C" __global__ void lrx_pair_stage1(
+    const lrx_c2* a, const lrx_c2* b, lrx_c2* wa, lrx_c2* wb, lrx_c2* tmp,
+    long long rows, int ns, int nk, int n0, int n1, int n2,
+    unsigned long long pl, unsigned long long hl,
+    unsigned long long pr, unsigned long long hr) {
+    extern __shared__ lrx_c2 sm[];
+    lrx_stage1_body<false>(a,b,wa,wb,tmp,rows,ns,nk,n0,n1,n2,
+        pl,hl,pr,hr,sm,{});
+}
+
+extern "C" __global__ void lrx_parent_stage1(
+    const lrx_c2* a, const lrx_c2* b, lrx_c2* wa, lrx_c2* wb, lrx_c2* tmp,
+    long long rows, int ns, int nk, int n0, int n1, int n2,
+    unsigned long long pl, unsigned long long hl,
+    unsigned long long pr, unsigned long long hr, ParentTables tables) {
+    extern __shared__ lrx_c2 sm[];
+    lrx_stage1_body<true>(a,b,wa,wb,tmp,rows,ns,nk,n0,n1,n2,
+        pl,hl,pr,hr,sm,tables);
 }
 
 extern "C" __global__ void lrx_pair_stage2(
@@ -538,12 +615,30 @@ LRX_ENTRY(5) LRX_ENTRY(6) LRX_ENTRY(7) LRX_ENTRY(8)
 LRX_ENTRY(9) LRX_ENTRY(10) LRX_ENTRY(11) LRX_ENTRY(12)
 LRX_ENTRY(13) LRX_ENTRY(14) LRX_ENTRY(15) LRX_ENTRY(16)
 #undef LRX_ENTRY
+#define LRX_ENTRY(N)                                                    \
+extern "C" __global__ __launch_bounds__(512)                          \
+void lrx_parent_resident_e##N(                                           \
+    const lrx_c2* a,const lrx_c2* b,lrx_c2* u,long long rows,int ns,   \
+    int nk,int n0,int n1,int n2,int sp,double scale,                   \
+    unsigned long long pl,unsigned long long hl,                       \
+    unsigned long long pr,unsigned long long hr, ParentTables tables) {                     \
+    extern __shared__ lrx_c2 sm[];                                     \
+    lrx_resident_body<N,true>(a,b,u,rows,ns,nk,n0,n1,n2,sp,scale,           \
+                         pl,hl,pr,hr,sm,tables);                               \
+}
+LRX_ENTRY(1) LRX_ENTRY(2) LRX_ENTRY(3) LRX_ENTRY(4)
+LRX_ENTRY(5) LRX_ENTRY(6) LRX_ENTRY(7) LRX_ENTRY(8)
+LRX_ENTRY(9) LRX_ENTRY(10) LRX_ENTRY(11) LRX_ENTRY(12)
+LRX_ENTRY(13) LRX_ENTRY(14) LRX_ENTRY(15) LRX_ENTRY(16)
+#undef LRX_ENTRY
 )__lrx__";
 
 static std::mutex g_mu;
 
 struct KernelArms {
     CUfunction resident[kEptMax] = {nullptr};
+    CUfunction parent_resident[kEptMax] = {nullptr};
+    CUfunction parent_stage1 = nullptr;
     CUfunction stage1 = nullptr;
     CUfunction stage2 = nullptr;
     int smem_max = 0;
@@ -677,8 +772,11 @@ static ffi::Error ensure_kernels(const KernelArms** out) {
     for (int e=1;e<=kEptMax;++e) {
         char name[64]; std::snprintf(name,sizeof(name),"lrx_pair_resident_e%d",e);
         functions.emplace_back(&arms.resident[e-1],name);
+        std::snprintf(name,sizeof(name),"lrx_parent_resident_e%d",e);
+        functions.emplace_back(&arms.parent_resident[e-1],name);
     }
     functions.emplace_back(&arms.stage1,"lrx_pair_stage1");
+    functions.emplace_back(&arms.parent_stage1,"lrx_parent_stage1");
     functions.emplace_back(&arms.stage2,"lrx_pair_stage2");
     for (auto& item:functions) {
         cr=api.ModuleGetFunction(item.first,module,item.second.c_str());
@@ -801,12 +899,13 @@ static bool overlaps(const void* p,size_t pn,const void* q,size_t qn) {
     return pb<qb+qn && qb<pb+pn;
 }
 
-static ffi::Error ConvKPairDispatch(
-    cudaStream_t stream,ffi::ScratchAllocator scratch,
+static ffi::Error Dispatch(
+    cudaStream_t stream,ffi::ScratchAllocator& scratch,
     ffi::AnyBuffer A,ffi::AnyBuffer B,ffi::Result<ffi::AnyBuffer> U,
     int64_t nkx,int64_t nky,int64_t nkz,double scale,int64_t requested_arm,
     ffi::Span<const int64_t> perm_l,ffi::Span<const int64_t> phase_l,
-    ffi::Span<const int64_t> perm_r,ffi::Span<const int64_t> phase_r) {
+    ffi::Span<const int64_t> perm_r,ffi::Span<const int64_t> phase_r,
+    const ParentTables* parent) {
     if (A.element_type()!=ffi::DataType::C128 ||
         B.element_type()!=ffi::DataType::C128 ||
         U->element_type()!=ffi::DataType::C128) {
@@ -814,21 +913,22 @@ static ffi::Error ConvKPairDispatch(
                     ffi::ErrorCode::kInvalidArgument);
     }
     auto ad=A.dimensions(),bd=B.dimensions(),ud=U->dimensions();
-    if (ad.size()!=7 || bd.size()!=7 || ud.size()!=5) {
+    if (ad.size()!=(parent?5:7) || bd.size()!=ad.size() || ud.size()!=(parent?3:5)) {
         std::ostringstream os;
         os << "expected ranks A=7, B=7, U=5; got " << ad.size() << ","
            << bd.size() << "," << ud.size();
         return fail("contract",os.str(),ffi::ErrorCode::kInvalidArgument);
     }
-    for (size_t i=0;i<7;++i) {
+    for (size_t i=0;i<ad.size();++i) {
         if (ad[i]!=bd[i]) return fail("contract","A/B shapes differ",
                                       ffi::ErrorCode::kInvalidArgument);
     }
-    const int64_t ns=ad[3],d0=ad[4],d1=ad[5];
+    const int64_t ns=ad[parent?1:3],d0=ad[parent?2:4],d1=ad[parent?4:5];
     const int64_t nk=nkx*nky*nkz,rows=d0*d1;
-    bool shape_ok=nkx>=1&&nky>=1&&nkz>=1&&
-        ad[0]==nkx&&ad[1]==nky&&ad[2]==nkz&&ad[6]==ns&&
-        ud[0]==nkx&&ud[1]==nky&&ud[2]==nkz&&ud[3]==d0&&ud[4]==d1;
+    bool shape_ok=nkx>=1&&nky>=1&&nkz>=1 && (parent
+        ? (ad[3]==ns && ud[0]==nk && ud[1]==d0 && ud[2]==d1)
+        : (ad[0]==nkx&&ad[1]==nky&&ad[2]==nkz&&ad[6]==ns&&
+           ud[0]==nkx&&ud[1]==nky&&ud[2]==nkz&&ud[3]==d0&&ud[4]==d1));
     if (!shape_ok || ns<1 || ns>4 || requested_arm<0 || requested_arm>2) {
         std::ostringstream os;
         os << "shape/attribute mismatch: A=(";
@@ -859,7 +959,7 @@ static ffi::Error ConvKPairDispatch(
                     " exceeds grid.x; fallback=XLA reference chain",
                     ffi::ErrorCode::kInvalidArgument);
     }
-    const size_t a_bytes=static_cast<size_t>(nk)*ns*rows*ns*16;
+    const size_t a_bytes=static_cast<size_t>(parent?ad[0]:nk)*ns*rows*ns*16;
     const size_t u_bytes=static_cast<size_t>(nk)*rows*16;
     const void* a_ptr=A.untyped_data(); const void* b_ptr=B.untyped_data();
     void* u_ptr=U->untyped_data();
@@ -893,10 +993,10 @@ static ffi::Error ConvKPairDispatch(
         int an0=static_cast<int>(nkx),an1=static_cast<int>(nky);
         int an2=static_cast<int>(nkz),asp=cfg.sp; double ascale=scale;
         void* args[]={(void*)&ap,(void*)&bp,(void*)&up,&ar,&ans,&ank,&an0,&an1,
-                      &an2,&asp,&ascale,&pl,&hl,&pr,&hr};
+                      &an2,&asp,&ascale,&pl,&hl,&pr,&hr,(void*)parent};
         const int64_t blocks=(rows+cfg.rb-1)/cfg.rb;
         CUresult cr=driver_api().LaunchKernel(
-            arms->resident[cfg.ept-1],static_cast<unsigned>(blocks),1,1,
+            (parent?arms->parent_resident[cfg.ept-1]:arms->resident[cfg.ept-1]),static_cast<unsigned>(blocks),1,1,
             static_cast<unsigned>(cfg.tpr),static_cast<unsigned>(cfg.rb),1,
             static_cast<unsigned>(cfg.smem),reinterpret_cast<CUstream>(stream),
             args,nullptr);
@@ -945,12 +1045,12 @@ static ffi::Error ConvKPairDispatch(
     int an0=static_cast<int>(nkx),an1=static_cast<int>(nky);
     int an2=static_cast<int>(nkz); double ascale=scale;
     void* args1[]={(void*)&ap,(void*)&bp,(void*)&wa,(void*)&wb,(void*)&tmp,
-                   &ar,&ans,&ank,&an0,&an1,&an2,&pl,&hl,&pr,&hr};
+                   &ar,&ans,&ank,&an0,&an1,&an2,&pl,&hl,&pr,&hr,(void*)parent};
     const unsigned stage_threads=256;
     const unsigned stage_warps=stage_threads/32;
     const unsigned stage1_smem=16U*(2U*stage_warps*kAxisMax+nkx+nky+nkz);
     CUresult cr=driver_api().LaunchKernel(
-        arms->stage1,static_cast<unsigned>(rows),1,1,stage_threads,1,1,
+        (parent?arms->parent_stage1:arms->stage1),static_cast<unsigned>(rows),1,1,stage_threads,1,1,
         stage1_smem,reinterpret_cast<CUstream>(stream),args1,nullptr);
     if (cr!=CUDA_SUCCESS) return fail("two-stage stage1 cuLaunchKernel",cu_err(cr));
     void* args2[]={(void*)&tmp,(void*)&up,&ar,&ank,&an0,&an1,&an2,&ascale};
@@ -971,6 +1071,64 @@ static ffi::Error ConvKPairDispatch(
     return ffi::Error::Success();
 }
 
+static ffi::Error ConvKPairDispatch(
+    cudaStream_t stream,ffi::ScratchAllocator scratch,
+    ffi::AnyBuffer A,ffi::AnyBuffer B,ffi::Result<ffi::AnyBuffer> U,
+    int64_t nkx,int64_t nky,int64_t nkz,double scale,int64_t requested_arm,
+    ffi::Span<const int64_t> perm_l,ffi::Span<const int64_t> phase_l,
+    ffi::Span<const int64_t> perm_r,ffi::Span<const int64_t> phase_r) {
+    return Dispatch(stream,scratch,A,B,U,nkx,nky,nkz,scale,requested_arm,perm_l,phase_l,perm_r,phase_r,nullptr);
+}
+
+static ffi::Error ConvKParentDispatch(
+    cudaStream_t stream,ffi::ScratchAllocator scratch,
+    ffi::AnyBuffer A,ffi::AnyBuffer B,
+    ffi::AnyBuffer irr,ffi::AnyBuffer sym,ffi::AnyBuffer left,ffi::AnyBuffer right,
+    ffi::AnyBuffer L,ffi::AnyBuffer R,ffi::AnyBuffer q,ffi::AnyBuffer trs,
+    ffi::AnyBuffer coef_l,ffi::AnyBuffer coef_r,ffi::Result<ffi::AnyBuffer> U,
+    int64_t nkx,int64_t nky,int64_t nkz,double scale,int64_t requested_arm,
+    int64_t centroid_major,
+    ffi::Span<const int64_t> perm_l,ffi::Span<const int64_t> phase_l,
+    ffi::Span<const int64_t> perm_r,ffi::Span<const int64_t> phase_r) {
+    const auto ad=A.dimensions();
+    if (ad.size()!=5) return fail("parent contract","D must have rank 5",
+        ffi::ErrorCode::kInvalidArgument);
+    const int64_t nk=nkx*nky*nkz,ns=ad[1],mu=ad[2],nu=ad[4];
+    auto shape=[](ffi::AnyBuffer x,ffi::DataType dtype,std::vector<int64_t> dims) {
+        auto d=x.dimensions();
+        return x.element_type()==dtype && d.size()==dims.size() &&
+            std::equal(d.begin(),d.end(),dims.begin());
+    };
+    auto ld=left.dimensions();
+    const int64_t ops=ld.size()==2?ld[0]:0;
+    if ((centroid_major!=0 && centroid_major!=1) || mu<1 || nu<1 || mu>2147483647LL || nu>2147483647LL || ops<1 ||
+        !shape(irr,ffi::DataType::S32,{nk}) ||
+        !shape(sym,ffi::DataType::S32,{nk}) ||
+        !shape(trs,ffi::DataType::S32,{nk}) ||
+        !shape(left,ffi::DataType::S32,{ops,mu}) ||
+        !shape(right,ffi::DataType::S32,{ops,nu}) ||
+        !shape(L,ffi::DataType::F64,{ops,mu,3}) ||
+        !shape(R,ffi::DataType::F64,{ops,nu,3}) ||
+        !shape(q,ffi::DataType::F64,{ad[0],3}) ||
+        !shape(coef_l,ffi::DataType::C128,{nk,ns*ns,ns*ns}) ||
+        !shape(coef_r,ffi::DataType::C128,{nk,ns*ns,ns*ns}))
+        return fail("parent tables","typed table shape/dtype mismatch",
+                    ffi::ErrorCode::kInvalidArgument);
+    ParentTables tables{
+        static_cast<const int*>(irr.untyped_data()),
+        static_cast<const int*>(sym.untyped_data()),
+        static_cast<const int*>(left.untyped_data()),
+        static_cast<const int*>(right.untyped_data()),
+        static_cast<const int*>(trs.untyped_data()),
+        static_cast<const double*>(L.untyped_data()),
+        static_cast<const double*>(R.untyped_data()),
+        static_cast<const double*>(q.untyped_data()),
+        static_cast<const double*>(coef_l.untyped_data()),
+        static_cast<const double*>(coef_r.untyped_data()),
+        static_cast<int>(mu),static_cast<int>(nu),static_cast<int>(centroid_major)};
+    return Dispatch(stream,scratch,A,B,U,nkx,nky,nkz,scale,requested_arm,perm_l,phase_l,perm_r,phase_r,&tables);
+}
+
 }  // namespace lorrax_ffi::conv_kpair
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -986,6 +1144,35 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nkz")
         .Attr<double>("scale")
         .Attr<int64_t>("requested_arm")
+        .Attr<xla::ffi::Span<const int64_t>>("perm_l")
+        .Attr<xla::ffi::Span<const int64_t>>("phase_l")
+        .Attr<xla::ffi::Span<const int64_t>>("perm_r")
+        .Attr<xla::ffi::Span<const int64_t>>("phase_r"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    CufftConvKParentCudaFfi,lorrax_ffi::conv_kpair::ConvKParentDispatch,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::ScratchAllocator>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Arg<xla::ffi::AnyBuffer>()
+        .Ret<xla::ffi::AnyBuffer>()
+        .Attr<int64_t>("nkx")
+        .Attr<int64_t>("nky")
+        .Attr<int64_t>("nkz")
+        .Attr<double>("scale")
+        .Attr<int64_t>("requested_arm")
+        .Attr<int64_t>("centroid_major")
         .Attr<xla::ffi::Span<const int64_t>>("perm_l")
         .Attr<xla::ffi::Span<const int64_t>>("phase_l")
         .Attr<xla::ffi::Span<const int64_t>>("perm_r")
