@@ -2925,7 +2925,6 @@ def _prepare_fresh_carriers(
     _parent_carrier = build_packed_parent_green_carrier(
     	wfns, *_parent_green_faces,
     	plan=_candidate_plan, mesh_xy=mesh_xy)
-    del _parent_green_faces
     sigma_parent_carrier = _parent_carrier
     print0(
     	"  Parent-k Sigma route ready: G contracted on "
@@ -3084,6 +3083,7 @@ def _prepare_fresh_isdf(
             _parent_green_faces,
             _candidate_plan, _parent_green_plan, band_slices, cfg, charge_basis_receipt, mesh_xy, meta,
             print0, sym, transverse_basis_receipt, transverse_wfn_data, wfn)
+        del _parent_green_faces
         (V_qmunu, G0, head_channel, photon_g0_vectors) = _prepare_fresh_coulomb(
             basis_T, bgw_v_grid_fn, centroid_indices, cfg, mem_est, mesh_xy, meta, print0, sym, wfn,
             zeta_path)
