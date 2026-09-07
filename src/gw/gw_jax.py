@@ -257,6 +257,532 @@ def _oneshot_mpa_occupation_state(config, wfn, wfns, material_class,
 	return state
 
 
+def _open_production_report(args):
+    """Produce the resolved configuration and its scientific report."""
+    _config_provenance = []
+    def _config_print(*values, sep=" ", **kwargs):
+        debug_print(*values, sep=sep, **kwargs)
+        text = sep.join(str(value) for value in values)
+        if "[config provenance]" in text:
+            _config_provenance.append(text)
+    print0 = _config_print
+
+    # ---- Configuration ----
+    # The two orthogonal physics axes are resolved + validated up front so
+    # inconsistent (qp_solver × compute_mode × accumulation) combinations
+    # fail before any heavy compute (see ``LorraxConfig.qp_solver``).
+    config = LorraxConfig.from_input_file(args.input, print_fn=print0)
+    input_dir = config.input_dir
+    qp_solver = config.qp_solver     # how QP energies are extracted from Σ
+    mode = config.compute_mode       # the self-energy ansatz
+    report = GWProductionReport(
+        config.paths.report_file, runtime=RUNTIME,
+        debug=debug_print_enabled(), stdout=rank0_print)
+    production_stdout = ProductionStdout(
+        debug=debug_print_enabled(), rank=RUNTIME.process_index,
+        warning_fn=report.legacy_print)
+    production_stdout.install()
+    report.stdout = (rank0_print if debug_print_enabled()
+                     else production_stdout.emit)
+    print0 = report.legacy_print
+    report.begin(input_file=args.input, config=config)
+    # A mode may be DECLARED on the axis before its Σ stage exists (today:
+    # ``mpa``).  Refusing here — before the WFN read, before ISDF, before
+    # any allocation is spent — is the difference between an operator
+    # learning in the first second and learning after the ζ fit.  The
+    # refusal names the mode; a typo'd mode value never reaches this line
+    # because ``config.compute_mode`` already raised on it.
+    refuse_unimplemented_compute_mode(mode, context="the LORRAX GW driver")
+    do_screened = mode.needs_screening
+    return (config, input_dir, qp_solver, mode, report, production_stdout, print0, _config_provenance, do_screened)
+
+
+def _report_head_and_photon_policy(config, print0, report):
+    """Report the resolved head and photon policies."""
+    print0(
+        f"  Head policy: head_correction={config.head.correction.value}; "
+        f"screening_diagrams={config.screening.diagrams.value}; "
+        f"direct diagnostic source={config.head.wcoul0_source}. "
+        + ({
+            HeadCorrection.FULL: "macroscopic W, local fields exactly once",
+            HeadCorrection.NO_LOCAL_FIELDS: "diagnostic epsilon head",
+            HeadCorrection.OFF: "no special Gamma-cell contribution",
+        }[config.head.correction]))
+    if config.bispinor:
+        _bispinor_note = {
+            "full_static_cohsex": (
+                " (packed no-pair 4x4 static response with the Gamma-cell "
+                "completion: bare <D> into V, charge S00/wing head into W, "
+                "Hall CT/TC from static_gauge_hall_file when present)"
+                if config.head.correction is HeadCorrection.FULL else
+                " (packed no-pair 4x4 static response; DEBUG: Gamma-cell "
+                "head disabled by head_correction=off)"),
+        }.get(config.bispinor_gw.value, "")
+        print0(
+            f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}"
+            f"{_bispinor_note}")
+        # Which route a bare-transverse deck takes is deck-visible, never
+        # silent: the packed path and the incumbent charge-screened + Sigma^B
+        # path are the SAME physics inside the envelope below (lane C gate,
+        # reports/bisp_c_bare_as_packed_2026-09-01), but they differ in the
+        # q->0 head mechanism, so the reader must be told which one ran and,
+        # when it is the incumbent one, the first condition that decided it.
+        _bare_taken, _bare_reason = packed_bare_transverse_route(config)
+        if config.bispinor_gw.value == "full_static_cohsex":
+            report.progress(
+                "Photon route   : packed screened static photon operator "
+                "(sixteen response and Sigma blocks; coupled 4x4 Dyson solve; "
+                "Gamma-cell completion carries charge, mixed, and transverse heads)")
+        else:
+            # In production mode print0 sinks component chatter, so this goes
+            # into the RUN RECORD: which of two physically equivalent-inside-
+            # the-envelope routes ran is exactly the fact a later reader needs
+            # (they differ in the q->0 head mechanism).
+            report.progress(
+                "Photon route   : "
+                + ("packed static photon operator (chi_TT = chi_CT = 0; scalar "
+                   "Dyson on CC, W_packed = diag(W_00, D_TT); the Gamma-cell "
+                   "completion carries both the charge head and the bare "
+                   f"<D_TT>) -- {_bare_reason}"
+                   if _bare_taken else
+                   "incumbent charge-screened W + Sigma^B "
+                   "(gw.sigma_x_bispinor) with the scalar band-diagonal q->0 "
+                   f"head -- {_bare_reason}"))
+        # HEADS ARE ALWAYS ON (owner ruling 2026-09-01,
+        # docs/architecture/decisions.md; TASTE.md row 20).  The packed route
+        # already prints a boxed WARNING banner and a `Photon head` record
+        # line when head_correction=off (gw.w_isdf, lane B).  The INCUMBENT
+        # route printed only "no special Gamma-cell contribution" in the
+        # component chatter that production mode sinks, so a headless
+        # bispinor bulk / dynamic / x_only run reached eqp1.dat with no
+        # DEBUG token anywhere in the run record (lane J section 3.c).
+        if not uses_static_photon_response(config):
+            _banner, _head_record = incumbent_bispinor_head_record(config)
+            if _banner:
+                print0(_banner)
+            report.progress(f"Photon head    : {_head_record}")
+
+
+def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_provenance):
+    """Produce wavefunctions, symmetry, centroid basis and output paths."""
+    wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
+    material_class = infer_material_class(wfn.occs)
+    config = resolve_mpa_sampling_alpha(
+        config, material_class, print_fn=report.progress)
+    validate_material_inputs(config, material_class)
+    print0(f"  Material class: {material_class} (inferred from WFN occupations)")
+    sym = wfn.symmetry()
+    centroid_basis = load_centroid_basis(
+        config.paths.centroids_file, wfn.fft_grid, sym=sym)
+    centroid_sets = [centroid_basis]
+    if config.bispinor and config.paths.centroids_file_current:
+        centroid_sets.append(load_centroid_basis(
+            config.paths.centroids_file_current, wfn.fft_grid, sym=sym))
+    nonclosed = [basis.path for basis in centroid_sets if not basis.orbit_closed]
+    if nonclosed:
+        print0("WARNING: non-orbit-closed centroid set(s): " + ", ".join(nonclosed)
+               + "; using unreduced parents (n_parent = nk) and full q on the same "
+               "parent route. Generate orbit-closed centroids with kmeans to restore reduction.")
+        sym = sym.trivial_view()
+    centroid_indices = centroid_basis.centroid_indices
+    n_rmu = centroid_basis.n_rmu
+    # This receipt is reporting evidence.  ``resolve_qgrid_symmetry_tables``
+    # remains the one q-storage policy/table authority and deliberately
+    # remeasures through the same symmetry_maps service at its execution seam.
+    tmp_dir = os.path.join(input_dir, "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tensors_filename = os.path.join(tmp_dir, f"isdf_tensors_{n_rmu}.h5")
+    print_system_summary(
+        n_rmu=n_rmu, fft_grid=wfn.fft_grid,
+        cell_volume=wfn.cell_volume, print_fn=print0,
+    )
+    report.layout_dials(
+        config=config, n_mu=n_rmu, n_q_irr=int(sym.nk_red),
+        processes=RUNTIME.process_count)
+    # The two user-facing execution dials belong in the first startup lines.
+    # Their numeric memory receipt needs the loaded WFN symmetry and centroid
+    # basis, so defer the longer architecture/method sections until now.
+    if _config_provenance:
+        report.heading("Configuration provenance")
+        for line in _config_provenance:
+            report.emit(line.strip())
+    report.architecture()
+    report.method(config=config)
+    return (config, wfn, material_class, sym, centroid_basis, centroid_indices, n_rmu, tmp_dir, tensors_filename)
+
+
+def _prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn):
+    """Produce the physical and padded band windows on the packed centroid basis."""
+    charge_bispinor = uses_four_spinor_finite_q_charge(
+        config.bispinor, config.bispinor_gw)
+    # A self-consistent diagonal buffer evaluates a bounded number of real
+    # states immediately outside the user-named nval/ncond window.  The named
+    # counts remain the physical/full-matrix window; only Meta's execution
+    # edges expand.  Other solvers and buffer_nbands=0 retain their exact
+    # historical Meta construction.
+    _sc_buffer = (int(config.sc.buffer_nbands)
+                  if config.qp_solver is QPSolver.SELF_CONSISTENT else 0)
+    # THE in-memory centroid order (common.centroid_basis): whole symmetry
+    # orbits per shard so every symmetry action is rank-local; files keep
+    # the canonical order and convert at the I/O seam.  Each current family has
+    # its own independently packed basis.
+    from common.centroid_basis import PackedCentroidBasis
+    mu_basis = PackedCentroidBasis.build(
+        centroid_indices, sym, wfn.fft_grid, mesh_xy)
+    print0(f"  {mu_basis.describe()}")
+    meta = Meta.from_system(wfn, sym,
+                            int(config.nval) + _sc_buffer,
+                            int(config.ncond) + _sc_buffer, config.nband,
+                            n_rmu, charge_bispinor,
+                            nband_chi=config.bands.chi,
+                            nband_sigma=config.bands.sigma,
+                            mesh_xy=mesh_xy, mu_basis=mu_basis)
+    if _sc_buffer:
+        print0(
+            f"  SC buffer: {int(config.nval)}/{int(config.ncond)} named "
+            f"valence/conduction window + {_sc_buffer} diagonal state(s) "
+            f"at each edge; mode={config.sc.buffer_mode}, "
+            f"tail_fit={config.sc.tail_fit}")
+    meta.rank = RUNTIME.process_index
+    meta.n_proc = RUNTIME.process_count
+    meta.sys_dim = config.sys_dim
+    # ``Meta`` describes the charge/CC carrier.  Spatial-current enablement
+    # remains the independently parsed ``config.bispinor`` policy.
+    meta.bispinor = charge_bispinor
+    band_slices = BandSlices.from_band_edges(
+        *meta.band_edges, b4_chi=meta.b_id_4_chi,
+        b4_sigma=meta.b_id_4_sigma, b4_logical=meta.b_id_4_user)
+    # THE ``max`` IS NEVER SILENT.  Which of the two counts sized the ISDF ζ
+    # fit is exactly the thing a reader of this log needs and cannot infer:
+    # ``nband`` in the deck echo is already the max, so without this line a
+    # split deck and an unsplit one at the larger count print the same
+    # number.  Printed here, above the ζ fit, because this is where the
+    # window it is about is decided.
+    # RESOLVED, not requested: ``config.zeta_nband`` is a logical deck count
+    # and the edge the fit gets is measured against the PADDED ``b4``.  This
+    # banner used to print "sized for 700 bands" on a deck whose resolver and
+    # memory planner were both acting on 160 (gw_init.resolve_zeta_fit_edge is
+    # the one place that comparison is made).
+    zeta_fit_edge = resolve_zeta_fit_edge(
+        band_slices, getattr(config, "zeta_nband", None))
+    print0(f"  {config.bands.describe(zeta_fit_edge)}")
+    if config.bands.split:
+        print0(f"    chi0/W sums bands [{band_slices.b0}, "
+               f"{band_slices.b4_chi}); Sigma sums bands [{band_slices.b0}, "
+               f"{band_slices.b4_sigma}); psi is LOADED over "
+               f"[{band_slices.b0}, {band_slices.b4}) "
+               f"(padded from {meta.b_id_4_user} to the world size).")
+    check_band_sum_degeneracy(wfn, config, band_slices, log=print0)
+    return (meta, band_slices, zeta_fit_edge)
+
+
+def _report_sampling_and_bands(
+        band_slices, centroid_basis, config, material_class, mesh_xy, meta, mode, print0,
+        report, sym, wfn, zeta_fit_edge):
+    """Produce DFT band energies and report the sampled system."""
+    _p_x = int(mesh_xy.devices.shape[0])
+    _p_y = int(mesh_xy.devices.shape[1])
+    _nbs = int(meta.nb_sigma)
+    if mode.is_dynamic:
+        from .ppm_sigma import sigma_band_axis
+        _sigma_axis = sigma_band_axis(
+            _nbs, mesh_xy,
+            ansatz=f"compute_mode = {getattr(mode, 'value', mode)}")
+        # The second refusal that used to live here -- sharded layout with
+        # slab_io=h5py_allgather at P>1, which would have re-introduced the
+        # full Σ_c(ω) cube gather inside the sigma_mnk.h5 writer -- is gone
+        # with the tier.  It was door 7 of 7 and the only one that read
+        # ``jax.process_count()`` raw instead of the launcher-aware count,
+        # so it was also the weakest.  Nothing can select that writer now.
+        print0(
+            f"  Sigma omega layout: sharded; Σ_c(ω,k,m,n) stays "
+            f"(m_X, n_Y)-tiled on the {_p_x}x{_p_y} mesh at "
+            f"logical/carrier={_sigma_axis.logical}/{_sigma_axis.carrier} "
+            f"(consumers read tiles; no full-cube replication).")
+
+    # DFT eigenvalues on the Σ band window (Ry) — one fetch, reused by the
+    # Σ_X diagnostic, the SC initial state, degeneracy averaging, and the
+    # results writer.
+    enk_dft, _ = get_enk_bandrange(
+        wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
+        nspinor=meta.nspinor)
+    _zeta_ranges = zeta_fit_band_ranges(
+        band_slices, zeta_fit_edge, log=lambda *args, **kwargs: None)
+    report.environment(config=config, wfn=wfn)
+    report.sampling(wfn=wfn, sym=sym, centroids=centroid_basis)
+    report.trs_pathways(config=config, sym=sym, material_class=material_class)
+    report.bands(
+        config=config, wfn=wfn, band_slices=band_slices,
+        zeta_ranges=_zeta_ranges)
+    return (enk_dft)
+
+
+def _prepare_oneshot_response(
+        config, do_screened, input_dir, material_class, mesh_xy, meta, mode, print0,
+        qp_solver, wfn, wfns, wfns_sigma):
+    """Produce quadrature and direct head-response inputs for one-shot screening."""
+    quad, e_ref = None, None
+    if do_screened:
+        # The minimax τ-axis, solved on G's actual spectral range — shared
+        # by every χ₀ build this run (static + probe W here, SC re-solves).
+        # TIMED because it is the classic mis-attribution on this path: the
+        # crossing-minimax solve costs ~95 s cold with no cache and no
+        # shipped table (XPROF_TRACE_GUIDE §"Known LORRAX cost centers"),
+        # and with no row of its own that 95 s reads as "GW startup".
+        with timing.section("gw_jax.minimax_quadrature", announce=True,
+                            label="minimax tau-axis"):
+            # The minimax service announces every served/uncertified rule with
+            # ``warnings.warn`` in each process.  This request is deterministic
+            # and collective, so keep its loud provenance warning once on the
+            # output owner instead of repeating it P times.  The filter is local
+            # to this call; exceptions and warnings from later rank-local work
+            # remain untouched.
+            with warnings.catch_warnings():
+                if jax.process_index() != 0:
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                quad, e_ref = build_static_quadrature(
+                    wfns, config.minimax_config,
+                    # A metal's fundamental gap is not its smallest MEANINGFUL
+                    # transition; the smearing width is.  Insulating decks
+                    # carry no smearing and keep the incumbent interval.
+                    occupation_width_ry=(
+                        float(config.occ_broadening_ry)
+                        if getattr(config, "occ_smearing_family", None)
+                        else None),
+                    print_fn=print0)
+
+    # One-shot and QSGW now share one response/finalization implementation.
+    # Build the irreducible DFT tensor and its wings on the exact chi0 band
+    # manifold before W, then retain only the tiny finalized head after W.
+    oneshot_head_response = None
+    oneshot_head_requests = None
+    oneshot_mpa_plan = None
+    if (do_screened
+            and config.head.correction is HeadCorrection.FULL
+            and config.screening.diagrams is ScreeningDiagrams.W_RPA
+            # The DYNAMIC packed route keeps the scalar charge owner (its CC
+            # channel is Sigma_x + Sigma_c(omega) on W_00), so it still needs
+            # the direct DFT response its q->0 head samples are finalized
+            # from.  Only the STATIC packed mode, whose packed Gamma-cell
+            # completion replaces that machinery outright, skips it.
+            and not packed_photon_replaces_charge_sigma(config)
+            # Every self-consistent mode builds its exact frequency plan and
+            # response inside the map.  A pre-map response would exist only to
+            # seed a restart artifact and could be mistaken for final physics.
+            and qp_solver is not QPSolver.SELF_CONSISTENT):
+        from .qsgw_head import build_dft_head_response
+        if mode.value == "mpa":
+            from .mpa import sample_plan
+            from .mpa.model import make_mpa_plan
+            oneshot_mpa_plan = make_mpa_plan(
+                config, quad, material_class=material_class)
+            oneshot_omegas = np.asarray(
+                sample_plan.plan_z(oneshot_mpa_plan), dtype=np.complex128)
+        else:
+            oneshot_head_requests = screening_requests_for(mode, config)
+            oneshot_omegas = np.asarray(
+                [complex(r.omega_ry) for r in oneshot_head_requests],
+                dtype=np.complex128)
+        # An explicit MPA fit is validate-or-refuse and already owns its
+        # finalized scalar head.  Keep the live plan above for authentication,
+        # but do not allocate a direct response the reuse branch must discard.
+        reused_mpa_fit_owns_head = (
+            mode is ComputeMode.MPA
+            and config.mpa.fit_reuse_file is not None)
+        if oneshot_omegas.size and not reused_mpa_fit_owns_head:
+            # ONE charge bundle: both shipped bispinor_gw values ride the
+            # raw kinetic-balance carrier, so the scalar q->0 head/wings are
+            # built on the run's own charge centroids.  The separate
+            # source-Pauli head bundle went with the two retired
+            # carrier-comparison modes (2026-09-01).
+            # The Sigma view carries the parent carrier: on parents-only
+            # storage the wings stream the children from it (qsgw_head).
+            oneshot_head_response = build_dft_head_response(
+                wfns_sigma, oneshot_omegas,
+                input_dir=input_dir, mesh=mesh_xy,
+                wfn=wfn, meta=meta, config=config)
+            print0(
+                "  head_correction=full: built direct DFT response and "
+                "head/body wings on the chi0 transition manifold; finalizing "
+                "once against the resident W(Gamma).")
+        elif oneshot_omegas.size:
+            print0(
+                "  MPA fit reuse: deferring to the stored finalized full head; "
+                "skipped the redundant direct DFT head/body-wing allocation. "
+                "The live fit and sampling plan will still be authenticated.")
+    return (quad, e_ref, oneshot_head_response, oneshot_head_requests, oneshot_mpa_plan)
+
+
+def _install_oneshot_head(
+        W_by_role, config, head_resolver, mesh_xy, meta, mode, oneshot_head_requests,
+        oneshot_head_response, print0, wfn):
+    """Install the finalized one-shot head samples in their resolver."""
+    if (oneshot_head_response is not None
+            and not packed_photon_replaces_charge_sigma(config)):
+        if mode.value == "mpa":
+            if W_by_role.get("mpa_fit_reused", False):
+                # The certified fit carries its already-folded scalar head and
+                # Sigma reads that head directly.  Re-folding the current direct
+                # response without resident W would be both impossible and a
+                # second head path.
+                final_head = None
+                print0(
+                    "  MPA screening reuse: consuming the certified stored "
+                    "body/head; no second head fold performed.")
+            else:
+                final_head = W_by_role.get("iteration_head")
+                if final_head is None:
+                    raise RuntimeError(
+                        "head_correction=full: MPA screening returned no "
+                        "finalized head samples")
+        else:
+            from .qsgw_head import finalize_iteration_head_samples
+            final_head = finalize_iteration_head_samples(
+                oneshot_head_response, wfn=wfn, meta=meta, config=config,
+                mesh=mesh_xy, requests=oneshot_head_requests,
+                W_by_role=W_by_role)
+        if final_head is not None:
+            head_resolver.install_samples(final_head.samples)
+
+
+def _persist_screening(
+        V_q, W_by_role, centroid_indices, config, head_resolver, mesh_xy, meta, mode,
+        print0, qp_solver, sym, tensors_filename):
+    """Persist the screened static body and head on the canonical q set."""
+    if (not packed_photon_replaces_charge_sigma(config)
+            and driver_persists_w0(mode, config)
+            and qp_solver is not QPSolver.SELF_CONSISTENT):
+        with timing.section("gw_jax.persist_w0"):
+            from .gw_output import persist_w0_and_head
+            persist_w0_and_head(
+                W_by_role.get("static", V_q),
+                tensors_filename=tensors_filename, head_resolver=head_resolver,
+                config=config, meta=meta, mesh_xy=mesh_xy,
+                sym=sym, centroid_indices=centroid_indices,
+                print_fn=print0)
+
+
+def _prepare_static_head(config, do_screened, head_resolver, meta, mode, print0, qp_solver):
+    """Produce the static head terms required by the selected QP solver."""
+    static_head_terms = None
+    if (config.do_G0
+            # The dynamic packed route's CC head is this scalar one; only the
+            # static packed mode refuses it (its packed completion carries the
+            # charge sector, and a scalar overlay would double count it).
+            and not packed_photon_replaces_charge_sigma(config)):
+        # A screened SC+FULL map always builds/folds its own head.  Supplying
+        # and printing a direct DFT seed here would be false provenance even
+        # though the map later replaces it.  OFF/NLF and unscreened X_ONLY keep
+        # the direct/default route because that is the policy they consume.
+        _sc_full = (qp_solver is QPSolver.SELF_CONSISTENT
+                    and do_screened
+                    and config.head.correction is HeadCorrection.FULL)
+        if not _sc_full:
+            with timing.section("gw_jax.static_head"):
+                static_head_terms = _compute_static_head(
+                    head_resolver, meta, do_screened, print0,
+                    # MPA has no {0,probe} persistence grid; its one-shot
+                    # static contribution here is bare X from the direct sample.
+                    require_screened=(mode.value != "mpa" and
+                                      qp_solver is not QPSolver.SELF_CONSISTENT))
+    return (static_head_terms)
+
+
+def _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, wfn):
+    """Produce the authenticated kinetic and ionic band matrix."""
+    from file_io import validate_kin_ion_against_run
+    # TIMED as one row: the gate and slab read are one logical stage.
+    _t_kin = time.perf_counter()
+    validate_kin_ion_against_run(
+        config.paths.kin_ion_file,
+        expected_bispinor=config.bispinor,
+        expected_bispinor_gw_mode=config.bispinor_gw.value,
+        sys_dim=config.sys_dim,
+        nk=meta.nk_tot,
+        band_stop=band_slices.b3,
+        nspinor=int(wfn.nspinor),
+        print_fn=print0,
+    )
+    kin_ion = load_kin_ion_submatrix(
+        config.paths.kin_ion_file, band_slices.b0, band_slices.b3,
+        mesh=mesh_xy,
+    )
+    timing.record("gw_jax.kin_ion_load", time.perf_counter() - _t_kin)
+    return (kin_ion)
+
+
+def _close_timing(_pre_main, _t_main, meta, print0):
+    """Produce the complete process wall time and timing decomposition."""
+    if _pre_main is not None:
+        # DECOMPOSE the pre-main span; do not add rows to it.  The entry
+        # point timed its own phases (it happened before ``timing.reset()``,
+        # so its own ``collective_warmup`` section was wiped), and the
+        # remainder of ``_pre_main`` is the import storm — 75.0 s cold vs
+        # 2.1 s warm, job 7881949.  Recording the phases AND the whole span
+        # would double-count and break the table's "rows + (untimed) ==
+        # wall" property, which is the only thing that lets a reader tell a
+        # complete accounting from a partial one.
+        _phases = RUNTIME.facts.get("elapsed", {})
+        for _phase, _secs in sorted(_phases.items()):
+            if _phase != "total":
+                timing.record(f"gw_jax.runtime_stack.{_phase}", _secs)
+        timing.record("gw_jax.imports",
+                      max(_pre_main - _phases.get("total", 0.0), 0.0))
+    _wall = time.perf_counter() - _t_main + (_pre_main or 0.0)
+    if meta.rank == 0 and debug_print_enabled():
+        # ``wall=`` closes the table: printed rows + ``(untimed)`` == the
+        # whole PROCESS when /proc gave us the pre-main span, else main().
+        timing.report(print_fn=print0, title="--- Timing ---", wall=_wall)
+    return (_wall)
+
+
+def _report_file_rows(args, config, input_dir, report, sigma_omega_h5_path, tensors_filename):
+    """Produce the report rows for consumed and generated files."""
+    _file_rows = [
+        ("input deck", "read", args.input),
+        ("DFT wavefunctions", "read", config.paths.wfn_file),
+        ("ISDF centroids", "read", config.paths.centroids_file),
+        ("mean-field Hamiltonian", "read", config.paths.kin_ion_file),
+        ("long-wave dipoles", "read" if os.path.exists(os.path.join(
+            input_dir, "dipole.h5")) else "absent",
+         os.path.join(input_dir, "dipole.h5")),
+        ("parallel transport", "read" if os.path.exists(
+            config.paths.parallel_transport_file) else "absent",
+         config.paths.parallel_transport_file),
+        ("ISDF restart tensors", "present" if os.path.exists(tensors_filename)
+         else "absent", tensors_filename),
+        ("self-energy table", "written" if os.path.exists(
+            config.paths.sigma_diag_file) else "absent",
+         config.paths.sigma_diag_file),
+        (EQP0_FILE_ROLE,
+         "written" if os.path.exists(config.paths.eqp0_file)
+         else "absent", config.paths.eqp0_file),
+        (EQP1_FILE_ROLE,
+         "written" if os.path.exists(
+            config.paths.eqp1_file) else "absent", config.paths.eqp1_file),
+        (QP_ROTATIONS_FILE_ROLE, "written" if os.path.exists(
+            os.path.join(input_dir, "qp_wfn_rotations.h5")) else "absent",
+         os.path.join(input_dir, "qp_wfn_rotations.h5")),
+        (QP_WFN_FILE_ROLE, "written" if os.path.exists(
+            os.path.join(input_dir, "WFN_qp.h5")) else "absent",
+         os.path.join(input_dir, "WFN_qp.h5")),
+    ]
+    if config.eqp2.enabled:
+        _file_rows.append((
+            "fixed-Sigma evSC energies", "written" if os.path.exists(
+                config.paths.eqp2_file) else "absent", config.paths.eqp2_file))
+    if config.paths.centroids_file_current:
+        _file_rows.insert(3, (
+            "current centroids", "read", config.paths.centroids_file_current))
+    if sigma_omega_h5_path:
+        _file_rows.append((
+            "dynamic Sigma spectrum",
+            "written" if os.path.exists(sigma_omega_h5_path) else "absent",
+            sigma_omega_h5_path))
+    _file_rows.append(("calculation report", "written", report.path))
+    return (_file_rows)
+
+
 def main(argv=None):
 	# Same factory the module-scope seam used, so the two cannot disagree.
 	args = build_parser().parse_args(argv)
@@ -289,103 +815,11 @@ def main(argv=None):
 	# echo is forensic detail, so it follows the driver's ONE debug switch.
 	# Default/derivation provenance is different: it is part of the scientific
 	# record, so retain just those lines and replay them once the report exists.
-	_config_provenance = []
-	def _config_print(*values, sep=" ", **kwargs):
-		debug_print(*values, sep=sep, **kwargs)
-		text = sep.join(str(value) for value in values)
-		if "[config provenance]" in text:
-			_config_provenance.append(text)
-	print0 = _config_print
-
-	# ---- Configuration ----
-	# The two orthogonal physics axes are resolved + validated up front so
-	# inconsistent (qp_solver × compute_mode × accumulation) combinations
-	# fail before any heavy compute (see ``LorraxConfig.qp_solver``).
-	config = LorraxConfig.from_input_file(args.input, print_fn=print0)
-	input_dir = config.input_dir
-	qp_solver = config.qp_solver     # how QP energies are extracted from Σ
-	mode = config.compute_mode       # the self-energy ansatz
-	report = GWProductionReport(
-		config.paths.report_file, runtime=RUNTIME,
-		debug=debug_print_enabled(), stdout=rank0_print)
-	production_stdout = ProductionStdout(
-		debug=debug_print_enabled(), rank=RUNTIME.process_index,
-		warning_fn=report.legacy_print)
-	production_stdout.install()
-	report.stdout = (rank0_print if debug_print_enabled()
-	                 else production_stdout.emit)
-	print0 = report.legacy_print
-	report.begin(input_file=args.input, config=config)
-	# A mode may be DECLARED on the axis before its Σ stage exists (today:
-	# ``mpa``).  Refusing here — before the WFN read, before ISDF, before
-	# any allocation is spent — is the difference between an operator
-	# learning in the first second and learning after the ζ fit.  The
-	# refusal names the mode; a typo'd mode value never reaches this line
-	# because ``config.compute_mode`` already raised on it.
-	refuse_unimplemented_compute_mode(mode, context="the LORRAX GW driver")
-	do_screened = mode.needs_screening
-	print0(
-		f"  Head policy: head_correction={config.head.correction.value}; "
-		f"screening_diagrams={config.screening.diagrams.value}; "
-		f"direct diagnostic source={config.head.wcoul0_source}. "
-		+ ({
-			HeadCorrection.FULL: "macroscopic W, local fields exactly once",
-			HeadCorrection.NO_LOCAL_FIELDS: "diagnostic epsilon head",
-			HeadCorrection.OFF: "no special Gamma-cell contribution",
-		}[config.head.correction]))
-	if config.bispinor:
-		_bispinor_note = {
-			"full_static_cohsex": (
-				" (packed no-pair 4x4 static response with the Gamma-cell "
-				"completion: bare <D> into V, charge S00/wing head into W, "
-				"Hall CT/TC from static_gauge_hall_file when present)"
-				if config.head.correction is HeadCorrection.FULL else
-				" (packed no-pair 4x4 static response; DEBUG: Gamma-cell "
-				"head disabled by head_correction=off)"),
-		}.get(config.bispinor_gw.value, "")
-		print0(
-			f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}"
-			f"{_bispinor_note}")
-		# Which route a bare-transverse deck takes is deck-visible, never
-		# silent: the packed path and the incumbent charge-screened + Sigma^B
-		# path are the SAME physics inside the envelope below (lane C gate,
-		# reports/bisp_c_bare_as_packed_2026-09-01), but they differ in the
-		# q->0 head mechanism, so the reader must be told which one ran and,
-		# when it is the incumbent one, the first condition that decided it.
-		_bare_taken, _bare_reason = packed_bare_transverse_route(config)
-		if config.bispinor_gw.value == "full_static_cohsex":
-			report.progress(
-				"Photon route   : packed screened static photon operator "
-				"(sixteen response and Sigma blocks; coupled 4x4 Dyson solve; "
-				"Gamma-cell completion carries charge, mixed, and transverse heads)")
-		else:
-			# In production mode print0 sinks component chatter, so this goes
-			# into the RUN RECORD: which of two physically equivalent-inside-
-			# the-envelope routes ran is exactly the fact a later reader needs
-			# (they differ in the q->0 head mechanism).
-			report.progress(
-				"Photon route   : "
-				+ ("packed static photon operator (chi_TT = chi_CT = 0; scalar "
-				   "Dyson on CC, W_packed = diag(W_00, D_TT); the Gamma-cell "
-				   "completion carries both the charge head and the bare "
-				   f"<D_TT>) -- {_bare_reason}"
-				   if _bare_taken else
-				   "incumbent charge-screened W + Sigma^B "
-				   "(gw.sigma_x_bispinor) with the scalar band-diagonal q->0 "
-				   f"head -- {_bare_reason}"))
-		# HEADS ARE ALWAYS ON (owner ruling 2026-09-01,
-		# docs/architecture/decisions.md; TASTE.md row 20).  The packed route
-		# already prints a boxed WARNING banner and a `Photon head` record
-		# line when head_correction=off (gw.w_isdf, lane B).  The INCUMBENT
-		# route printed only "no special Gamma-cell contribution" in the
-		# component chatter that production mode sinks, so a headless
-		# bispinor bulk / dynamic / x_only run reached eqp1.dat with no
-		# DEBUG token anywhere in the run record (lane J section 3.c).
-		if not uses_static_photon_response(config):
-			_banner, _head_record = incumbent_bispinor_head_record(config)
-			if _banner:
-				print0(_banner)
-			report.progress(f"Photon head    : {_head_record}")
+	(
+	    config, input_dir, qp_solver, mode, report, production_stdout, print0,
+	    _config_provenance, do_screened) = _open_production_report(
+	    args)
+	_report_head_and_photon_policy(config, print0, report)
 
 	# ---- The runtime is already up ----------------------------------------
 	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
@@ -425,110 +859,14 @@ def main(argv=None):
 	_hdf5_probe("startup", print_fn=print0)
 
 	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
-	wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
-	material_class = infer_material_class(wfn.occs)
-	config = resolve_mpa_sampling_alpha(
-		config, material_class, print_fn=report.progress)
-	validate_material_inputs(config, material_class)
-	print0(f"  Material class: {material_class} (inferred from WFN occupations)")
-	sym = wfn.symmetry()
-	centroid_basis = load_centroid_basis(
-		config.paths.centroids_file, wfn.fft_grid, sym=sym)
-	centroid_sets = [centroid_basis]
-	if config.bispinor and config.paths.centroids_file_current:
-		centroid_sets.append(load_centroid_basis(
-			config.paths.centroids_file_current, wfn.fft_grid, sym=sym))
-	nonclosed = [basis.path for basis in centroid_sets if not basis.orbit_closed]
-	if nonclosed:
-		print0("WARNING: non-orbit-closed centroid set(s): " + ", ".join(nonclosed)
-		       + "; using unreduced parents (n_parent = nk) and full q on the same "
-		       "parent route. Generate orbit-closed centroids with kmeans to restore reduction.")
-		sym = sym.trivial_view()
-	centroid_indices = centroid_basis.centroid_indices
-	n_rmu = centroid_basis.n_rmu
-	# This receipt is reporting evidence.  ``resolve_qgrid_symmetry_tables``
-	# remains the one q-storage policy/table authority and deliberately
-	# remeasures through the same symmetry_maps service at its execution seam.
-	tmp_dir = os.path.join(input_dir, "tmp")
-	os.makedirs(tmp_dir, exist_ok=True)
-	tensors_filename = os.path.join(tmp_dir, f"isdf_tensors_{n_rmu}.h5")
-	print_system_summary(
-		n_rmu=n_rmu, fft_grid=wfn.fft_grid,
-		cell_volume=wfn.cell_volume, print_fn=print0,
-	)
-	report.layout_dials(
-		config=config, n_mu=n_rmu, n_q_irr=int(sym.nk_red),
-		processes=RUNTIME.process_count)
-	# The two user-facing execution dials belong in the first startup lines.
-	# Their numeric memory receipt needs the loaded WFN symmetry and centroid
-	# basis, so defer the longer architecture/method sections until now.
-	if _config_provenance:
-		report.heading("Configuration provenance")
-		for line in _config_provenance:
-			report.emit(line.strip())
-	report.architecture()
-	report.method(config=config)
+	(
+	    config, wfn, material_class, sym, centroid_basis, centroid_indices, n_rmu, tmp_dir,
+	    tensors_filename) = _load_system_inputs(
+	    config, input_dir, mesh_xy, report, print0, _config_provenance)
 
-	charge_bispinor = uses_four_spinor_finite_q_charge(
-		config.bispinor, config.bispinor_gw)
-	# A self-consistent diagonal buffer evaluates a bounded number of real
-	# states immediately outside the user-named nval/ncond window.  The named
-	# counts remain the physical/full-matrix window; only Meta's execution
-	# edges expand.  Other solvers and buffer_nbands=0 retain their exact
-	# historical Meta construction.
-	_sc_buffer = (int(config.sc.buffer_nbands)
-	              if config.qp_solver is QPSolver.SELF_CONSISTENT else 0)
-	# THE in-memory centroid order (common.centroid_basis): whole symmetry
-	# orbits per shard so every symmetry action is rank-local; files keep
-	# the canonical order and convert at the I/O seam.  Each current family has
-	# its own independently packed basis.
-	from common.centroid_basis import PackedCentroidBasis
-	mu_basis = PackedCentroidBasis.build(
-		centroid_indices, sym, wfn.fft_grid, mesh_xy)
-	print0(f"  {mu_basis.describe()}")
-	meta = Meta.from_system(wfn, sym,
-	                        int(config.nval) + _sc_buffer,
-	                        int(config.ncond) + _sc_buffer, config.nband,
-	                        n_rmu, charge_bispinor,
-	                        nband_chi=config.bands.chi,
-	                        nband_sigma=config.bands.sigma,
-	                        mesh_xy=mesh_xy, mu_basis=mu_basis)
-	if _sc_buffer:
-		print0(
-			f"  SC buffer: {int(config.nval)}/{int(config.ncond)} named "
-			f"valence/conduction window + {_sc_buffer} diagonal state(s) "
-			f"at each edge; mode={config.sc.buffer_mode}, "
-			f"tail_fit={config.sc.tail_fit}")
-	meta.rank = RUNTIME.process_index
-	meta.n_proc = RUNTIME.process_count
-	meta.sys_dim = config.sys_dim
-	# ``Meta`` describes the charge/CC carrier.  Spatial-current enablement
-	# remains the independently parsed ``config.bispinor`` policy.
-	meta.bispinor = charge_bispinor
-	band_slices = BandSlices.from_band_edges(
-		*meta.band_edges, b4_chi=meta.b_id_4_chi,
-		b4_sigma=meta.b_id_4_sigma, b4_logical=meta.b_id_4_user)
-	# THE ``max`` IS NEVER SILENT.  Which of the two counts sized the ISDF ζ
-	# fit is exactly the thing a reader of this log needs and cannot infer:
-	# ``nband`` in the deck echo is already the max, so without this line a
-	# split deck and an unsplit one at the larger count print the same
-	# number.  Printed here, above the ζ fit, because this is where the
-	# window it is about is decided.
-	# RESOLVED, not requested: ``config.zeta_nband`` is a logical deck count
-	# and the edge the fit gets is measured against the PADDED ``b4``.  This
-	# banner used to print "sized for 700 bands" on a deck whose resolver and
-	# memory planner were both acting on 160 (gw_init.resolve_zeta_fit_edge is
-	# the one place that comparison is made).
-	zeta_fit_edge = resolve_zeta_fit_edge(
-		band_slices, getattr(config, "zeta_nband", None))
-	print0(f"  {config.bands.describe(zeta_fit_edge)}")
-	if config.bands.split:
-		print0(f"    chi0/W sums bands [{band_slices.b0}, "
-		       f"{band_slices.b4_chi}); Sigma sums bands [{band_slices.b0}, "
-		       f"{band_slices.b4_sigma}); psi is LOADED over "
-		       f"[{band_slices.b0}, {band_slices.b4}) "
-		       f"(padded from {meta.b_id_4_user} to the world size).")
-	check_band_sum_degeneracy(wfn, config, band_slices, log=print0)
+	(
+	    meta, band_slices, zeta_fit_edge) = _prepare_band_metadata(
+	    centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn)
 
 	# ---- dynamic-Sigma logical/carrier receipt ----
 	# Resolve the same square carrier the producer will use, early enough to
@@ -537,40 +875,10 @@ def main(argv=None):
 	#
 	# ``compute_mode = mpa`` reaches it whatever the deck says about layout,
 	# because the MPA executor emits the sharded cube unconditionally.
-	_p_x = int(mesh_xy.devices.shape[0])
-	_p_y = int(mesh_xy.devices.shape[1])
-	_nbs = int(meta.nb_sigma)
-	if mode.is_dynamic:
-		from .ppm_sigma import sigma_band_axis
-		_sigma_axis = sigma_band_axis(
-			_nbs, mesh_xy,
-			ansatz=f"compute_mode = {getattr(mode, 'value', mode)}")
-		# The second refusal that used to live here -- sharded layout with
-		# slab_io=h5py_allgather at P>1, which would have re-introduced the
-		# full Σ_c(ω) cube gather inside the sigma_mnk.h5 writer -- is gone
-		# with the tier.  It was door 7 of 7 and the only one that read
-		# ``jax.process_count()`` raw instead of the launcher-aware count,
-		# so it was also the weakest.  Nothing can select that writer now.
-		print0(
-			f"  Sigma omega layout: sharded; Σ_c(ω,k,m,n) stays "
-			f"(m_X, n_Y)-tiled on the {_p_x}x{_p_y} mesh at "
-			f"logical/carrier={_sigma_axis.logical}/{_sigma_axis.carrier} "
-			f"(consumers read tiles; no full-cube replication).")
-
-	# DFT eigenvalues on the Σ band window (Ry) — one fetch, reused by the
-	# Σ_X diagnostic, the SC initial state, degeneracy averaging, and the
-	# results writer.
-	enk_dft, _ = get_enk_bandrange(
-		wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
-		nspinor=meta.nspinor)
-	_zeta_ranges = zeta_fit_band_ranges(
-		band_slices, zeta_fit_edge, log=lambda *args, **kwargs: None)
-	report.environment(config=config, wfn=wfn)
-	report.sampling(wfn=wfn, sym=sym, centroids=centroid_basis)
-	report.trs_pathways(config=config, sym=sym, material_class=material_class)
-	report.bands(
-		config=config, wfn=wfn, band_slices=band_slices,
-		zeta_ranges=_zeta_ranges)
+	(
+	    enk_dft) = _report_sampling_and_bands(
+	    band_slices, centroid_basis, config, material_class, mesh_xy, meta, mode, print0,
+	    report, sym, wfn, zeta_fit_edge)
 
 	# Single resolver for every q→0 head sample we'll need this run; the
 	# COHSEX static head, the W0 restart-flush head, and the PPM dynamic
@@ -666,95 +974,10 @@ def main(argv=None):
 	# ---- Screening: χ₀ → W = (1 − Vχ)⁻¹ V at every ω the Σ scheme needs ----
 	# X_ONLY requests no screening at all.
 	V_q = V_qmunu               # flat-q (nq, μ, μ) — compute and restart alike
-	quad, e_ref = None, None
-	if do_screened:
-		# The minimax τ-axis, solved on G's actual spectral range — shared
-		# by every χ₀ build this run (static + probe W here, SC re-solves).
-		# TIMED because it is the classic mis-attribution on this path: the
-		# crossing-minimax solve costs ~95 s cold with no cache and no
-		# shipped table (XPROF_TRACE_GUIDE §"Known LORRAX cost centers"),
-		# and with no row of its own that 95 s reads as "GW startup".
-		with timing.section("gw_jax.minimax_quadrature", announce=True,
-		                    label="minimax tau-axis"):
-			# The minimax service announces every served/uncertified rule with
-			# ``warnings.warn`` in each process.  This request is deterministic
-			# and collective, so keep its loud provenance warning once on the
-			# output owner instead of repeating it P times.  The filter is local
-			# to this call; exceptions and warnings from later rank-local work
-			# remain untouched.
-			with warnings.catch_warnings():
-				if jax.process_index() != 0:
-					warnings.simplefilter("ignore", RuntimeWarning)
-				quad, e_ref = build_static_quadrature(
-					wfns, config.minimax_config,
-					# A metal's fundamental gap is not its smallest MEANINGFUL
-					# transition; the smearing width is.  Insulating decks
-					# carry no smearing and keep the incumbent interval.
-					occupation_width_ry=(
-						float(config.occ_broadening_ry)
-						if getattr(config, "occ_smearing_family", None)
-						else None),
-					print_fn=print0)
-
-	# One-shot and QSGW now share one response/finalization implementation.
-	# Build the irreducible DFT tensor and its wings on the exact chi0 band
-	# manifold before W, then retain only the tiny finalized head after W.
-	oneshot_head_response = None
-	oneshot_head_requests = None
-	oneshot_mpa_plan = None
-	if (do_screened
-			and config.head.correction is HeadCorrection.FULL
-			and config.screening.diagrams is ScreeningDiagrams.W_RPA
-			# The DYNAMIC packed route keeps the scalar charge owner (its CC
-			# channel is Sigma_x + Sigma_c(omega) on W_00), so it still needs
-			# the direct DFT response its q->0 head samples are finalized
-			# from.  Only the STATIC packed mode, whose packed Gamma-cell
-			# completion replaces that machinery outright, skips it.
-			and not packed_photon_replaces_charge_sigma(config)
-			# Every self-consistent mode builds its exact frequency plan and
-			# response inside the map.  A pre-map response would exist only to
-			# seed a restart artifact and could be mistaken for final physics.
-			and qp_solver is not QPSolver.SELF_CONSISTENT):
-		from .qsgw_head import build_dft_head_response
-		if mode.value == "mpa":
-			from .mpa import sample_plan
-			from .mpa.model import make_mpa_plan
-			oneshot_mpa_plan = make_mpa_plan(
-				config, quad, material_class=material_class)
-			oneshot_omegas = np.asarray(
-				sample_plan.plan_z(oneshot_mpa_plan), dtype=np.complex128)
-		else:
-			oneshot_head_requests = screening_requests_for(mode, config)
-			oneshot_omegas = np.asarray(
-				[complex(r.omega_ry) for r in oneshot_head_requests],
-				dtype=np.complex128)
-		# An explicit MPA fit is validate-or-refuse and already owns its
-		# finalized scalar head.  Keep the live plan above for authentication,
-		# but do not allocate a direct response the reuse branch must discard.
-		reused_mpa_fit_owns_head = (
-			mode is ComputeMode.MPA
-			and config.mpa.fit_reuse_file is not None)
-		if oneshot_omegas.size and not reused_mpa_fit_owns_head:
-			# ONE charge bundle: both shipped bispinor_gw values ride the
-			# raw kinetic-balance carrier, so the scalar q->0 head/wings are
-			# built on the run's own charge centroids.  The separate
-			# source-Pauli head bundle went with the two retired
-			# carrier-comparison modes (2026-09-01).
-			# The Sigma view carries the parent carrier: on parents-only
-			# storage the wings stream the children from it (qsgw_head).
-			oneshot_head_response = build_dft_head_response(
-				wfns_sigma, oneshot_omegas,
-				input_dir=input_dir, mesh=mesh_xy,
-				wfn=wfn, meta=meta, config=config)
-			print0(
-				"  head_correction=full: built direct DFT response and "
-				"head/body wings on the chi0 transition manifold; finalizing "
-				"once against the resident W(Gamma).")
-		elif oneshot_omegas.size:
-			print0(
-				"  MPA fit reuse: deferring to the stored finalized full head; "
-				"skipped the redundant direct DFT head/body-wing allocation. "
-				"The live fit and sampling plan will still be authenticated.")
+	(
+	    quad, e_ref, oneshot_head_response, oneshot_head_requests, oneshot_mpa_plan) = _prepare_oneshot_response(
+	    config, do_screened, input_dir, material_class, mesh_xy, meta, mode, print0, qp_solver,
+	    wfn, wfns, wfns_sigma)
 	# SC solves W inside each map and persists only the final accepted map.
 	# Do not perform a redundant DFT screening solve here: besides its cost,
 	# that seed body used to survive long enough to be paired with a final head.
@@ -923,32 +1146,9 @@ def main(argv=None):
 			print0("  Parent-k Green carrier detached from the screening view "
 			       "(the Sigma view keeps it).")
 
-	if (oneshot_head_response is not None
-			and not packed_photon_replaces_charge_sigma(config)):
-		if mode.value == "mpa":
-			if W_by_role.get("mpa_fit_reused", False):
-				# The certified fit carries its already-folded scalar head and
-				# Sigma reads that head directly.  Re-folding the current direct
-				# response without resident W would be both impossible and a
-				# second head path.
-				final_head = None
-				print0(
-					"  MPA screening reuse: consuming the certified stored "
-					"body/head; no second head fold performed.")
-			else:
-				final_head = W_by_role.get("iteration_head")
-				if final_head is None:
-					raise RuntimeError(
-						"head_correction=full: MPA screening returned no "
-						"finalized head samples")
-		else:
-			from .qsgw_head import finalize_iteration_head_samples
-			final_head = finalize_iteration_head_samples(
-				oneshot_head_response, wfn=wfn, meta=meta, config=config,
-				mesh=mesh_xy, requests=oneshot_head_requests,
-				W_by_role=W_by_role)
-		if final_head is not None:
-			head_resolver.install_samples(final_head.samples)
+	_install_oneshot_head(
+	    W_by_role, config, head_resolver, mesh_xy, meta, mode, oneshot_head_requests,
+	    oneshot_head_response, print0, wfn)
 
 	# Persist W0_qmunu + q=0 head scalars to the ISDF restart file for
 	# downstream consumers (BSE, future Σ-builders); no-op unless screened
@@ -968,17 +1168,9 @@ def main(argv=None):
 	# ONLY (see the callee): W0 must land on the same q-set V did, and the
 	# way to be sure of that is to ask the same resolution point about the
 	# same centroid set rather than to infer it from a shape.
-	if (not packed_photon_replaces_charge_sigma(config)
-			and driver_persists_w0(mode, config)
-			and qp_solver is not QPSolver.SELF_CONSISTENT):
-		with timing.section("gw_jax.persist_w0"):
-			from .gw_output import persist_w0_and_head
-			persist_w0_and_head(
-				W_by_role.get("static", V_q),
-				tensors_filename=tensors_filename, head_resolver=head_resolver,
-				config=config, meta=meta, mesh_xy=mesh_xy,
-				sym=sym, centroid_indices=centroid_indices,
-				print_fn=print0)
+	_persist_screening(
+	    V_q, W_by_role, centroid_indices, config, head_resolver, mesh_xy, meta, mode, print0,
+	    qp_solver, sym, tensors_filename)
 
 	# q→0 head correction.  The bare-X head is the same physical quantity in
 	# both COHSEX and PPM modes; gating this on ``not use_ppm_sigma`` was
@@ -987,27 +1179,9 @@ def main(argv=None):
 	# sig_sx/sig_coh in compute_cohsex_sigma, but for PPM those static values
 	# are overwritten downstream (sig_sx ← sig_x, sig_c ← PPM-evaluated
 	# correlation), so only the X-head survives — which is the piece needed.
-	static_head_terms = None
-	if (config.do_G0
-			# The dynamic packed route's CC head is this scalar one; only the
-			# static packed mode refuses it (its packed completion carries the
-			# charge sector, and a scalar overlay would double count it).
-			and not packed_photon_replaces_charge_sigma(config)):
-		# A screened SC+FULL map always builds/folds its own head.  Supplying
-		# and printing a direct DFT seed here would be false provenance even
-		# though the map later replaces it.  OFF/NLF and unscreened X_ONLY keep
-		# the direct/default route because that is the policy they consume.
-		_sc_full = (qp_solver is QPSolver.SELF_CONSISTENT
-		            and do_screened
-		            and config.head.correction is HeadCorrection.FULL)
-		if not _sc_full:
-			with timing.section("gw_jax.static_head"):
-				static_head_terms = _compute_static_head(
-					head_resolver, meta, do_screened, print0,
-					# MPA has no {0,probe} persistence grid; its one-shot
-					# static contribution here is bare X from the direct sample.
-					require_screened=(mode.value != "mpa" and
-					                  qp_solver is not QPSolver.SELF_CONSISTENT))
+	(
+	    static_head_terms) = _prepare_static_head(
+	    config, do_screened, head_resolver, meta, mode, print0, qp_solver)
 
 	# ---- Σ_xc + V_H: ONE dispatch for every mode ----
 	# The same ``compute_sigma_xc`` call the SC iteration map makes each
@@ -1103,24 +1277,7 @@ def main(argv=None):
 	# Provenance gate BEFORE the read.  In particular, refuse the retired
 	# format that folded V_H into kin_ion: this driver always adds the live
 	# G-space field.
-	from file_io import validate_kin_ion_against_run
-	# TIMED as one row: the gate and slab read are one logical stage.
-	_t_kin = time.perf_counter()
-	validate_kin_ion_against_run(
-		config.paths.kin_ion_file,
-		expected_bispinor=config.bispinor,
-		expected_bispinor_gw_mode=config.bispinor_gw.value,
-		sys_dim=config.sys_dim,
-		nk=meta.nk_tot,
-		band_stop=band_slices.b3,
-		nspinor=int(wfn.nspinor),
-		print_fn=print0,
-	)
-	kin_ion = load_kin_ion_submatrix(
-		config.paths.kin_ion_file, band_slices.b0, band_slices.b3,
-		mesh=mesh_xy,
-	)
-	timing.record("gw_jax.kin_ion_load", time.perf_counter() - _t_kin)
+	(kin_ion) = _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, wfn)
 
 	# ---- update_H[Σ; qp_solver] — all branches yield ``sigma_total``
 	# (Σ_xc + V_H, Ry, DFT basis, replicated) whose eigh gives E_qp/U_qp.
@@ -1568,26 +1725,7 @@ def main(argv=None):
 			print_fn=print0,
 		)
 		timing.record("gw_jax.output", time.perf_counter() - _t_out)
-	if _pre_main is not None:
-		# DECOMPOSE the pre-main span; do not add rows to it.  The entry
-		# point timed its own phases (it happened before ``timing.reset()``,
-		# so its own ``collective_warmup`` section was wiped), and the
-		# remainder of ``_pre_main`` is the import storm — 75.0 s cold vs
-		# 2.1 s warm, job 7881949.  Recording the phases AND the whole span
-		# would double-count and break the table's "rows + (untimed) ==
-		# wall" property, which is the only thing that lets a reader tell a
-		# complete accounting from a partial one.
-		_phases = RUNTIME.facts.get("elapsed", {})
-		for _phase, _secs in sorted(_phases.items()):
-			if _phase != "total":
-				timing.record(f"gw_jax.runtime_stack.{_phase}", _secs)
-		timing.record("gw_jax.imports",
-		              max(_pre_main - _phases.get("total", 0.0), 0.0))
-	_wall = time.perf_counter() - _t_main + (_pre_main or 0.0)
-	if meta.rank == 0 and debug_print_enabled():
-		# ``wall=`` closes the table: printed rows + ``(untimed)`` == the
-		# whole PROCESS when /proc gave us the pre-main span, else main().
-		timing.report(print_fn=print0, title="--- Timing ---", wall=_wall)
+	(_wall) = _close_timing(_pre_main, _t_main, meta, print0)
 
 	if sigma_lorentz_diag_skn_ry is not None:
 		_labels = ("CC", "CT+TC", "TT")
@@ -1656,48 +1794,9 @@ def main(argv=None):
 			iterations=eqp2_result.iterations,
 			residual_ev=eqp2_result.residual_ev,
 			tol_ev=config.eqp2.tol_ev)
-	_file_rows = [
-		("input deck", "read", args.input),
-		("DFT wavefunctions", "read", config.paths.wfn_file),
-		("ISDF centroids", "read", config.paths.centroids_file),
-		("mean-field Hamiltonian", "read", config.paths.kin_ion_file),
-		("long-wave dipoles", "read" if os.path.exists(os.path.join(
-			input_dir, "dipole.h5")) else "absent",
-		 os.path.join(input_dir, "dipole.h5")),
-		("parallel transport", "read" if os.path.exists(
-			config.paths.parallel_transport_file) else "absent",
-		 config.paths.parallel_transport_file),
-		("ISDF restart tensors", "present" if os.path.exists(tensors_filename)
-		 else "absent", tensors_filename),
-		("self-energy table", "written" if os.path.exists(
-			config.paths.sigma_diag_file) else "absent",
-		 config.paths.sigma_diag_file),
-		(EQP0_FILE_ROLE,
-		 "written" if os.path.exists(config.paths.eqp0_file)
-		 else "absent", config.paths.eqp0_file),
-		(EQP1_FILE_ROLE,
-		 "written" if os.path.exists(
-			config.paths.eqp1_file) else "absent", config.paths.eqp1_file),
-		(QP_ROTATIONS_FILE_ROLE, "written" if os.path.exists(
-			os.path.join(input_dir, "qp_wfn_rotations.h5")) else "absent",
-		 os.path.join(input_dir, "qp_wfn_rotations.h5")),
-		(QP_WFN_FILE_ROLE, "written" if os.path.exists(
-			os.path.join(input_dir, "WFN_qp.h5")) else "absent",
-		 os.path.join(input_dir, "WFN_qp.h5")),
-	]
-	if config.eqp2.enabled:
-		_file_rows.append((
-			"fixed-Sigma evSC energies", "written" if os.path.exists(
-				config.paths.eqp2_file) else "absent", config.paths.eqp2_file))
-	if config.paths.centroids_file_current:
-		_file_rows.insert(3, (
-			"current centroids", "read", config.paths.centroids_file_current))
-	if sigma_omega_h5_path:
-		_file_rows.append((
-			"dynamic Sigma spectrum",
-			"written" if os.path.exists(sigma_omega_h5_path) else "absent",
-			sigma_omega_h5_path))
-	_file_rows.append(("calculation report", "written", report.path))
+	(
+	    _file_rows) = _report_file_rows(
+	    args, config, input_dir, report, sigma_omega_h5_path, tensors_filename)
 	report.timings(timing.records(), wall=_wall)
 	report.warnings()
 	report.files(_file_rows)
