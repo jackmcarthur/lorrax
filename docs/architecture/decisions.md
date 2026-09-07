@@ -2289,3 +2289,204 @@ unknown-key policy. ``runtime_platform`` is an injected ``cpu`` or
 ``resolve_hardware=False``, an auto memory budget stays at its zero
 sentinel and no device-memory probe is made; explicit deck budgets
 remain resolved. Production callers use all defaults.
+
+
+### Input parsing and envelope phase rulings (2026-09-06)
+
+```text
+        # --- Memory auto-detection ---
+        # --- Chunk utilization from env ---
+        # 0.0 (default) = auto: the planner uses its ns²-aware default
+        # (higher for scalar, lower for bispinor's 4× pair density).  A
+        # positive env value overrides it, clamped to [0.85, 1.0].
+        # ``env_float`` announces a non-numeric value instead of swallowing
+        # it — the bare ``except Exception`` here left the user believing a
+        # utilization was in force when it was not.
+        # Resolve the bundled metallic q0 contract before constructing any
+        # typed group.  ``mc_average_vcoul_body`` defaults to true for every
+        # historical deck, but BGW's noavg metal comparison requires false.
+        # Only an EXPLICIT contradictory value refuses: an absent key is the
+        # compatibility case this bundle exists to override, while an
+        # explicit false is already compatible and remains visible in the
+        # provenance line.
+            # An explicit spelling of the shipping default must serialize to
+            # the same LorraxConfig as an absent key.  ``raw_input_keys`` is
+            # otherwise the one field that would distinguish them.
+        # --- Build sub-dataclasses ---
+            # NOT a deck key any more (tombstoned above).  The field stays
+            # so the incumbent non-packed TT overlay owner
+            # (gw.v_q_bispinor._make_per_q_v_builder_for_tile) keeps ONE
+            # place to read, and so a hand-built config that sets it True
+            # still meets refuse_unsupported_bispinor_tt_head_correction.
+            # Lane N deletes the field with the incumbent route.
+        # With patches, omega_min/max_ev ARE the patch hull.  Consumers
+        # read these fields as "the Σ grid's reach" (the SC partition's
+        # in-grid classification above all); leaving them at the deck
+        # defaults silently scissored every band outside [-5, +5] on the
+        # first patched run — Σ was computed on the deep clusters and
+        # then never consulted (measured: arm 21, SC partition 2/48).
+        # SC loop knobs.  The LORRAX_SC_* env vars are deprecated overrides
+        # of the sc_* input keys (kept so existing sweep scripts run
+        # unchanged); a note is printed whenever one is active.
+            # No env override: the LORRAX_SC_* envs are deprecated and a
+            # new knob must not add one.
+        # Lower the one layout profile to platform libraries.  This is a
+        # capability choice inside the already-resolved profile: GPU uses
+        # cuSolverMp/cuBLASMp; CPU uses ScaLAPACK.
+        # Same treatment, same reason, for the restart q-set.  Validated
+        # here and NOT resolved here: ``auto`` resolves against the closure
+        # answer, which needs the run's centroid set and its symmetry
+        # tables, so the field below is the RAW request and
+        # ``gw.restart_q_storage.resolve_restart_q_storage`` turns it into a
+        # mode once those exist.  The ``_raw`` suffix says which kind it is — the
+        # same convention ``compute_mode_raw`` / ``qp_solver_raw`` use.)
+        # The ``or`` fallback must agree with ``_DEFAULTS`` — it is reached
+        # only by a caller that built the params dict by hand and left the
+        # key out, and a fallback that disagreed with the registered default
+        # would make THAT caller silently take a different storage decision.
+        # Same ``or`` caveat as above: this fallback is reached only by a
+        # hand-built params dict and must agree with ``_DEFAULTS``.
+        # BAND COUNTS.  ``read_lorrax_input`` already resolved them (once) and
+        # left the answer in the params dict; a hand-made dict that never went
+        # through the parser gets resolved here instead.  Either way there is
+        # exactly one ``resolve_band_counts`` call per config.
+        # ζ-fit window top.  Empty / unset collapse to None — "follow the
+        # loaded window".  An EXPLICIT value is stored verbatim, INCLUDING one
+        # that equals ``bands.isdf``.
+        #
+        # WHY IT IS NO LONGER ERASED HERE (2026-08-22).  This used to rewrite
+        # ``zeta_nband == bands.isdf`` to None, reasoning that a redundant
+        # restatement of the default must take the default path "pad and all".
+        # It is not redundant, because ``bands.isdf`` is the LOGICAL count and
+        # the edge the fit actually gets is ``BandSlices.b4`` — that count
+        # ROUNDED UP to the world size.  On P=4 a scalar-Si deck with
+        # ``nband = zeta_nband = 14`` silently fitted [0,16) and then refused,
+        # correctly, because band 16 cuts a multiplet; the deck had asked for
+        # 14 and no banner ever said otherwise (JID 57152792,
+        # runs/Si_scalar/11_scalar_v_rootcause_20260817/).
+        #
+        # The collapse still exists — it just happens where the padded edge is
+        # known, in ``gw.gw_init.resolve_zeta_fit_edge``, which is also the one
+        # place the banner and the three fit-window consumers read.  A deck
+        # whose ``nband`` already divides the world size is unchanged.
+            # Top-level: system + mode flags
+            # Build from a stable sequence.  Equal sets reached through an
+            # absent key versus an explicit default can retain different
+            # hash-table histories; pickling those frozensets then need not
+            # be byte-identical even though the typed values compare equal.
+            # Compatibility mirror only.  Every new head decision reads the
+            # enum above; keeping this resolved bool prevents old consumers
+            # from disagreeing with ``head_correction = off``.
+            # Sub-dataclass groups
+            # Parsed blocks
+        # ``density_self_consistent`` is still an independent physics choice
+        # for scalar QSGW, whose conventional fixed-density path remains the
+        # default.  Bispinor QSGW has no corresponding safe fixed-density
+        # treatment: both rho and the signed Dirac current J must follow the
+        # evolving occupied orbitals.  Normalize the UNNAMED default here,
+        # after the canonical qp_solver resolver exists, instead of duplicating
+        # its legacy/explicit precedence logic.  An explicit false survives
+        # unchanged and the gate below refuses it rather than overriding what
+        # the user wrote.
+        # Fresh physics is the global default.  A file existing in ``tmp``
+        # is not permission to replace a live fit: only an explicit
+        # ``restart = true`` enters the restart loader, whose provenance
+        # gates authenticate the tensor set before use.
+        # CROSS-KEY, and therefore after the record exists: the w_bse
+        # refusals read resolved axes (compute_mode / qp_solver fold in the
+        # legacy flags), and the honest way to ask which mode a deck chose
+        # is to ask the resolver, not to re-derive it here.  A w_rpa deck
+        # returns from this call before either property is touched.
+        # ONE CANONICAL VOCABULARY FOR THE SELF-ENERGY AXIS, and a note for
+        # the other one.  Same position and same reason as the two refusals
+        # above: the announcement quotes the RESOLVED axes, which only the
+        # record can answer.  Honoring a legacy key in silence beside a
+        # canonical twin is how a tree ends up with two vocabularies for one
+        # axis and no way to tell which one a run went through.
+    # Locate [cohsex] section
+    # Locate optional K_POINTS block
+        # Strip K_POINTS from INI text
+        # inline_comment_prefixes so 'key = off  # note' parses to 'off', not
+        # 'off  # note' (the latter silently voided flags — a real footgun).
+        # Legacy key check
+        # RETIRED-KEY REPORT.  A key with an explicit legacy branch is
+        # exempt from the unknown-key check below so one deck key never
+        # draws two messages — but that exemption left
+        # ``warnings.warn(..., DeprecationWarning)`` as the ONLY report,
+        # and Python's default filter hides DeprecationWarning outside
+        # ``__main__``.  A retired key was therefore parsed, matched,
+        # ignored, and announced to nobody, which is exactly the failure
+        # the unknown-key check exists to prevent.  Collect every hit and
+        # print it through the same rank-0 reporter, in wording that keeps
+        # "retired" (the key was real once, and here is what replaced it)
+        # distinct from "unrecognized" (nothing ever read this).  The
+        # DeprecationWarnings stay — they are what a library consumer
+        # filters on.  Explicit refusal branches below own keys whose
+        # replacement must be named rather than hidden in a generic error.
+        # ``chunk_size`` (legacy band-chunk knob) was a no-op: its only
+        # consumer wrote ``meta.chunk_size``, which nothing ever read —
+        # chunk sizing is owned by the gflat planner.  Dropped 2026-07-09.
+        # There is one sharded-slab transport and the deck does not select
+        # it.  Refuse the deleted selectors by name: accepting and ignoring
+        # them made stale decks look as though their requested HDF5 route was
+        # still active.  The tombstones stay in ``_LEGACY_DECK_KEYS`` only so
+        # strict unknown-key handling does not mask this specific message.
+        # ``sigma_omega_accumulation`` was REMOVED (2026-08-14): host-tile
+        # accumulation is the only mode, so the key steered nothing.  The
+        # long-removed ``kij_stream`` VALUE keeps its dedicated refusal.
+        # Deprecated qp_solver aliases (still honored via auto-resolution;
+        # see ``LorraxConfig.qp_solver``).
+        # REMOVED keys (owner-approved deletions, 2026-07-31; these behave
+        # like any other unknown deck key — reported by the unknown-key
+        # check below, never steering anything): ``isdf_memory_mode``
+        # (two-plan W cleanup — the W Dyson solve is selected by
+        # w_dyson_solver=local|distributed) and the legacy aliases
+        # ``cusolvermp_charge``/``cusolvermp_lu`` (use the ``linalg`` dial).
+        # --- Unknown-key check -----------------------------------------
+        # Every key in the deck that is neither in ``_DEFAULTS`` nor
+        # handled by one of the explicit legacy branches above is refused
+        # in ONE aggregated error (key and line number).  Deck parsing is
+        # always strict; there is no mode in which a typo is ignored.
+        # Retired keys are exempt (they got their own report above).
+        # configparser lower-cases option names (``optionxform = str.lower``),
+        # so iterating ``section`` yields ``do_g0`` for a deck that writes
+        # the documented ``do_G0`` -- the ONE non-lower-case key among the
+        # 99 in _DEFAULTS.  Comparing the two raw made that key BOTH
+        # honoured and unrecognised at the same time: ``section.get`` folds
+        # the LOOKUP too, so ``do_G0 = false`` really did steer the run,
+        # while this check reported it as an unknown key -- and, under
+        # ``strict_keys``, REFUSED a valid deck outright.  Fold both sides
+        # so recognition matches the lookup that already happens.
+        # Build params from _DEFAULTS, overriding with parsed values
+        # WHICH KEYS THE DECK ITSELF NAMED.  ``params`` cannot answer this
+        # afterwards — a deck pinning a key to its default and a deck that
+        # never mentions it produce the identical entry — and the difference
+        # matters to anything that must speak only to decks that opted in.
+        # Its first consumer is the ``restart_q_storage`` deprecation notice
+        # (owner ruling 2026-08-08: the key is scheduled for deletion), which
+        # must fire for a deck that pins it and stay silent for the other
+        # ~forty, or it is noise nobody reads.  Recorded here, where the
+        # answer is free, rather than re-parsed by each consumer.
+                # Tri-state boolean (default None = unset); an explicit
+                # value parses as bool.
+                # Nullable float (vhead, whead_0freq, etc.)
+    # Deck dial interpretation point (INVARIANTS row 19).  Every downstream
+    # consumer reads this immutable record; no stage reinterprets ``linalg``.
+    # --- Band counts: resolve ONCE, here ------------------------------
+    # ``number_bands`` / ``number_bands_chi`` / ``number_bands_sigma`` /
+    # ``nband`` collapse into two numbers plus their max, and this is the
+    # only call to the resolver on the deck path.  Resolving here rather
+    # than in ``LorraxConfig`` is what lets the params dict stay honest for
+    # the tools that read it directly (``bandstructure.htransform``,
+    # ``psp.get_DFT_mtxels``, ``gw.kin_ion_io``, ``file_io.epsreader``):
+    # they ask for ``params["nband"]`` and must get the LOADED band extent,
+    # which after the split is ``max(chi, sigma)`` — the same number they
+    # always got on an unsplit deck.
+    #
+    # The mirror is why this is not idempotent and why the answer is
+    # cached in ``params[_BAND_COUNTS]`` instead of being re-derived: after
+    # the write-back, ``nband`` no longer says what the DECK said, so a
+    # second ``resolve_band_counts`` on this dict would see an umbrella that
+    # the deck never wrote.
+    # Parse optional QE K_POINTS block
+```
