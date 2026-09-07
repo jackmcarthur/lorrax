@@ -10,3 +10,4 @@
 | CPU fixture blocker | `src/bse/bse_loading.py:262` | Three legacy padding tests construct a 1x1 mesh while four CPU devices are visible; `_get_local_mesh_coords` indexes missing devices. Initial targeted run 70 passed/4 failed; geometry regression fixed, remaining three unrelated mesh failures excluded from 68-pass downfold/scope rerun. |
 | 2 | `src/gw/sc_iteration.py:2133` | Fixed: trivial-view density quadrature expands the original WFN weights through its source symmetry table; CPU gate passes. |
 | 3 | `src/gw/gw_init.py:3076` | Fixed: caller drops the raw parent-face tuple after carrier construction; MoS2 P4 live-set and eqp identity gate pass. |
+| 4 | `src/gw/gw_init.py:3351` | Fixed: restart checks both transverse parent faces with `sanity.check_finite` before any carrier construction. |

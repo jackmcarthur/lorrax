@@ -3262,6 +3262,11 @@ def _restart_current_carrier(
     from .wavefunction_bundle import build_packed_parent_green_carrier
     wfns_transverse = None
     if cfg.bispinor:
+    	from common import sanity
+    	sanity.check_finite("restart ψ (psi_parent_y_transverse)",
+    	                    rs.psi_nmu_parent_transverse, print_fn=print0)
+    	sanity.check_finite("restart ψ (psi_parent_y_transverse_mun)",
+    	                    rs.psi_mun_parent_transverse, print_fn=print0)
     	if not getattr(cfg.paths, 'centroids_file_current', None):
     		raise ValueError(
     			"bispinor restart requires centroids_file_current "
