@@ -413,8 +413,8 @@ def fit_zeta_to_h5(
                 & (_idx < band_range_right[1] - _off), 1.0, 0.0), dtype=jnp.float64)
         print_fn(f"  C_q on raw parents: {k_unfold_plan.n_parent} -> {nk_tot} k rows")
         C_q = c_q_from_psi_sm(
-            kgrid=kgrid, mesh_xy=mesh_xy, layout='face',
-            psi_mun=psi_mun_parent, psi_nmu=psi_nmu_parent,
+            kgrid=kgrid, mesh_xy=mesh_xy,
+            psi_mun_parent=psi_mun_parent, psi_nmu_parent=psi_nmu_parent,
             weight_l=weight_l_face, weight_r=weight_r_face,
             gemm=_face_gemm, k_unfold_plan=k_unfold_plan,
             gamma_L=int(vertex_mu_L), gamma_R=int(vertex_mu_L))

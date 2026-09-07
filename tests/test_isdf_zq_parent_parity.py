@@ -291,8 +291,8 @@ def _worker(case_name: str, *, mesh_shape=(2, 2), return_arrays=False, return_fi
 
     C_face = pack(pack(Z_face[:, :, cent_flat], axis=1), axis=2)
     C_parent = np.asarray(jax.block_until_ready(c_q_from_psi_sm(
-        kgrid=kgrid, mesh_xy=mesh, layout="face",
-        psi_mun=psi_mun_pk, psi_nmu=psi_nmu_pk,
+        kgrid=kgrid, mesh_xy=mesh,
+        psi_mun_parent=psi_mun_pk, psi_nmu_parent=psi_nmu_pk,
         weight_l=w_l, weight_r=w_r, gemm=_local_gemm,
         k_unfold_plan=plan, gamma_L=vertex, gamma_R=vertex_right)))
     c_rel = float(np.max(np.abs(C_parent - C_face))) / float(np.max(np.abs(C_face)))
@@ -303,8 +303,8 @@ def _worker(case_name: str, *, mesh_shape=(2, 2), return_arrays=False, return_fi
                                        np.asarray(w_l), np.asarray(w_r), 1)
         C_current = pack(pack(current_rhs[:, :, cent_flat], axis=1), axis=2)
         C_no_vertex = np.asarray(jax.block_until_ready(c_q_from_psi_sm(
-            kgrid=kgrid, mesh_xy=mesh, layout="face",
-            psi_mun=psi_mun_pk, psi_nmu=psi_nmu_pk,
+            kgrid=kgrid, mesh_xy=mesh,
+            psi_mun_parent=psi_mun_pk, psi_nmu_parent=psi_nmu_pk,
             weight_l=w_l, weight_r=w_r, gemm=_local_gemm, k_unfold_plan=plan)))
         current_c_rel = float(np.max(np.abs(C_no_vertex - C_current))) / float(np.max(np.abs(C_current)))
 

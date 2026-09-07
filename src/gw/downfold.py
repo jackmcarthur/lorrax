@@ -30,7 +30,7 @@ with the three **pair-density Grams over the fit window**
     S_cross = X^S (X^L)†      (μ_S, μ_L)
     S_LL    = X^L (X^L)†      (μ_L, μ_L)
 
-All three are what :func:`isdf.core.c_q_from_psi_sm` already computes — that
+All three are what :func:`isdf.core.c_q_downfold` already computes — that
 kernel IS the pair-density Gram at centroids over whatever band window its ψ
 operands were sliced to, and it is rectangular-capable, so feeding it ψ at
 the small centroids on its X legs and ψ at the large centroids on its Y legs
@@ -289,7 +289,7 @@ class BandWindow:
     n_cond)`` spelling is ``left = (0, n_val)``, ``right = (n_val, n_val +
     n_cond)``.
 
-    THE LEG MAPPING INTO ``c_q_from_psi_sm``, AND THE SIGN OF q IT FIXES.
+    THE LEG MAPPING INTO ``c_q_downfold``, AND THE SIGN OF q IT FIXES.
     ``S[μ,ν] = Σ_{mnk} X[μ,a] conj(X[ν,a])`` with
     ``X[μ, (mnk)] = conj(ψ_m(k, r_μ)) ψ_n(k+q, r_μ)`` factorises as
 
@@ -303,7 +303,7 @@ class BandWindow:
     **AND THEN THE q AXIS IS REVERSED, BECAUSE THE KERNEL RETURNS S(−q).**
     That is the defect this function shipped with from 2026-08-09
     (``0dd61f20``) to 2026-08-11, and it is a labelling error, not an
-    algebra one: the leg mapping above is right, ``c_q_from_psi_sm`` is
+    algebra one: the leg mapping above is right, ``c_q_downfold`` is
     right for ITS OWN caller (the ISDF fit, self-consistent in that
     labelling and untouched here), and the downfold is the caller that has
     to agree with something else — the RESTART TENSORS' q axis, because it
@@ -394,20 +394,20 @@ def pair_density_gram(psi_X, psi_Y, window: BandWindow, *, kgrid, mesh_xy):
     Gram comes out at the right sharding with no reshard and no sharded
     fancy-indexing.
     """
-    from isdf.core import c_q_from_psi_sm
+    from isdf.core import c_q_downfold
 
     (bl0, bl1), (br0, br1) = window.left, window.right
     grid = tuple(int(v) for v in kgrid)
     # left (m) window -> the kernel's r legs; right (n) window -> its l legs.
     # This mapping is correct and is NOT what was wrong; see the docstring.
-    C = c_q_from_psi_sm(
+    C = c_q_downfold(
         psi_X[:, :, br0:br1, :], psi_Y[:, br0:br1, :, :],
         psi_X[:, :, bl0:bl1, :], psi_Y[:, bl0:bl1, :, :],
         kgrid=grid, mesh_xy=mesh_xy)
     # ...AND THE q AXIS IS THEN REVERSED, WHICH IS THE WHOLE FIX.  Measured
     # against the closed form and against a dense double loop on an
     # ASYMMETRIC window (the only shape that can see it):
-    # ``c_q_from_psi_sm`` returns S(-q).  Its own caller, the ISDF fit, is
+    # ``c_q_downfold`` returns S(-q).  Its own caller, the ISDF fit, is
     # self-consistent in that labelling and is untouched here; the downfold
     # is the caller that must agree with the RESTART TENSORS' q axis,
     # because it multiplies this Gram's transfer into V_qmunu[q].
