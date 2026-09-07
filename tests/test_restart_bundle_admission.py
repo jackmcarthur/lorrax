@@ -39,14 +39,16 @@ def test_old_full_wavefunction_bundle_refused_once(tmp_path, reader):
         f['psi_full_y'] = np.zeros((4, 3, 2, 5), complex)
     with pytest.raises(ValueError) as exc:
         reader(path)
-    assert str(exc.value) == 'regenerate with gwjax at main ≥ 891047f4'
+    assert str(exc.value) == (
+        'this bundle predates the raw-parent format; '
+        'regenerate it with gwjax at main >= 891047f4')
 
 
 def test_missing_parent_face_is_not_derived(tmp_path):
     path = _current(tmp_path / 'partial.h5', 4)
     with h5py.File(path, 'a') as f:
         del f['psi_parent_y_mun']
-    with pytest.raises(ValueError, match='regenerate with gwjax'):
+    with pytest.raises(ValueError, match='regenerate it with gwjax'):
         bundle.read_metadata(path)
 
 

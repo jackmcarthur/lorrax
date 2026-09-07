@@ -36,7 +36,9 @@ from .tagged_arrays import (BAND_WINDOW_SCHEMA_DATASET, BAND_WINDOW_SCHEMA_VERSI
 if TYPE_CHECKING:
     from .isdf_header import IsdfHeader
 
-_REGENERATE = "regenerate with gwjax at main ≥ 891047f4"
+_REGENERATE = (
+    "this bundle predates the raw-parent format; "
+    "regenerate it with gwjax at main >= 891047f4")
 
 
 def _require_current(f):
