@@ -134,35 +134,9 @@ def main():
         print(json.dumps(receipt), flush=True)
         if args.curves_only:
             continue
-        # Save the requested first-order d as an explicit count; do not call d
-        # positive-pole K before establishing modal pairing.
-        for d in (224,448,896,1792):
-            invsqrt = 1/jnp.sqrt(hsv[:d])
-            T = (lp@adj(vh[:d]))*invsqrt[None,:]
-            Ti = invsqrt[:,None]*(adj(u[:,:d])@adj(lq))
-            Ar = Ti@(a[:,None]*T)
-            Br = Ti@B
-            Cr = C@T
-            eye_error = float(jnp.linalg.norm(Ti@T-jnp.eye(d))/np.sqrt(d))
-            errors = [relative(Cr@jnp.linalg.solve((-1j*zi-ETA)*jnp.eye(d)-Ar,Br), parent_w(zi)) for zi in z]
-            # Non-normal eigensolve on the compute host; large square-root
-            # balancing and W contractions above execute on the assigned GPU.
-            import scipy.linalg
-            ar, vr = scipy.linalg.eig(np.asarray(Ar))
-            right = np.asarray(Cr)@vr
-            left = scipy.linalg.solve(vr,np.asarray(Br))
-            physical = 1j*(ar+ETA)
-            np.savez(out/f'd{d}.npz', poles_ry=physical, residue_left=right,
-                     residue_right=left, A_ry=np.asarray(Ar), B=np.asarray(Br), C=np.asarray(Cr))
-            info = dict(state_order=d, positive_pole_K=None, modal_condition=float(np.linalg.cond(vr)),
-                        balanced_identity_error=eye_error, W16_parent_relative_errors=errors,
-                        damping_fraction_gt_0p1ev=float(np.mean(-physical.imag*EV>.1)),
-                        minimum_physical_gamma_ev=float(np.min(-physical.imag*EV)),
-                        maximum_abs_real_pole_ev=float(np.max(np.abs(physical.real))*EV),
-                        stable_broadened=bool(np.all(ar.real<0)),
-                        storage_bytes=int(physical.nbytes+right.nbytes+left.nbytes),
-                        passivity='PENDING', jobid=receipt['jobid'],stepid=receipt['stepid'])
-            write(out/f'd{d}.json', info)
+        from reductions import reduce_models
+        reduce_models(a, B, C, (lp,lq,u,hsv,vh),
+                      dict(out=out,receipt=receipt,z=z,factor=factor,omega=om,mesh=mesh))
         receipt.update(status='REDUCTIONS_COMPLETE', elapsed_seconds=time.monotonic()-t0)
         write(out/'receipt.json', receipt)
 
