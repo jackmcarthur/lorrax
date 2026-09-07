@@ -30,7 +30,7 @@ def main(out):
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.collectives import resolve_mesh, barrier
-    from distrib_la import plan, matmul
+    from distrib_la import plan, gemm_plan
     assert jax.process_count() == 4
     mesh = resolve_mesh()
     face = NamedSharding(mesh, P('x', 'y'))
@@ -43,10 +43,13 @@ def main(out):
     job = os.getenv('SLURM_JOB_ID')+'.'+os.getenv('SLURM_STEP_ID', '?')
     source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
     out.mkdir(parents=True, exist_ok=True)
-    mm = lambda a,b: matmul(a,b,mesh=mesh,backend='distributed',batched_route='auto')
+    product = gemm_plan(mesh,m=896,k=896,n=896,nq=1,dtype=jnp.complex128,backend='distributed')
+    mm = lambda a,b: product(a[None],b[None])[0]
     # Preserve Run299's physical conversion verbatim; its @ products are
     # traced with all-P input/output layouts. No matrix leaves the device.
     eig_jit = jax.jit(lambda v: eig((v+v.conj().T)/2), in_shardings=face, out_shardings=(rep,face))
+    inverse_root = jax.jit(lambda u,e: mm(u/jnp.sqrt(e)[None,:],
+        jax.lax.with_sharding_constraint(u.conj().T,face)),out_shardings=face)
     adj = lambda w: jnp.swapaxes(w.conj(), -1, -2)
 
     @jax.jit
@@ -83,8 +86,7 @@ def main(out):
         ev, u = eig_jit(v)
         if float(ev[0]) <= 0:
             raise ValueError('Nonpositive Coulomb')
-        vi = jax.jit(lambda u,e: matmul(u/jnp.sqrt(e)[None,:],u,transb='C',
-            mesh=mesh,backend='distributed',batched_route='auto'),out_shardings=face)(u,ev)
+        vi = inverse_root(u,ev)
         ww = congruence_rows(vi,w)
         wwh = congruence_rows(vi,wh)
         gw = np.asarray(gram(ww))
