@@ -695,11 +695,9 @@ def read_interaction(filename, kind, mesh_xy, *, nohead=False):
     name = names[kind]
     with h5py.File(filename, "r") as f:
         _require_current(f)
-        if kind == "screened" and (name not in f or not bool(
-                f[name].attrs.get("W0_ready", False))):
-            name = "V_qmunu"
-        if name not in f or not bool(f[name].attrs.get("V_ready", True)):
-            raise ValueError(f"{filename}: {name} was never persisted")
+        if name not in f or not bool(f[name].attrs.get(
+                "W0_ready" if kind == "screened" else "V_ready", kind == "bare")):
+            raise ValueError(f"{filename}: {kind} interaction was not persisted")
         if nohead and name + "_nohead" in f:
             name += "_nohead"
     return read_munu_tensor_from_h5(filename, name, mesh_xy)
@@ -740,7 +738,10 @@ def read_bse_payload(filename, input_file, mesh_xy, val_indices, cond_indices,
     v = read_wavefunctions(filename, input_file, mesh_xy, bands=val_indices)
     c = read_wavefunctions(filename, input_file, mesh_xy, bands=cond_indices)
     V = read_interaction(filename, "bare", mesh_xy, nohead=nohead)
-    W = read_interaction(filename, "screened", mesh_xy, nohead=nohead)
+    # An unready W is the established bare-interaction BSE fallback.
+    # The explicit screened reader itself must still refuse that request.
+    kind = "screened" if m["screened_ready"] else "bare"
+    W = read_interaction(filename, kind, mesh_xy, nohead=nohead)
     grid = tuple(int(n) for n in m["grid"])
     def qgrid(a):
         return jax.jit(lambda x: x.reshape(grid+x.shape[-2:]).transpose(3,4,0,1,2),
@@ -767,7 +768,8 @@ def read_coarse_interactions(filename, input_file, mesh_xy):
     return {"psi": host, "kgrid": m["grid"], "enk": m["energies"],
             "band_window": m["band_window"],
             "Vqmunu": read_interaction(filename, "bare", mesh_xy),
-            "W0": read_interaction(filename, "screened", mesh_xy)}
+            "W0": (read_interaction(filename, "screened", mesh_xy)
+                   if m["screened_ready"] else None)}
 
 
 def read_downfold_geometry(filename: str) -> dict:

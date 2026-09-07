@@ -257,27 +257,44 @@ def _guards_on_w0_ready(source, binder):
 
 
 def test_the_interpolation_path_gates_on_w0_ready_like_bse_io_does(tmp_path, monkeypatch):
-    """Both paths consume the shared readiness decision, including the bare fallback."""
+    """Explicit W refuses; BSE chooses bare V; interpolation leaves W absent."""
     import h5py
     import inspect
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh
     from file_io import restart_bundle as reader
     from bse import vq_interp
     from restart_fixture import canonicalize_fixture
     path = tmp_path / "screening.h5"
     with h5py.File(path, "w") as f:
-        f["V_qmunu"] = np.ones((1, 2, 2), complex)
-        f["W0_qmunu"] = np.zeros((1, 2, 2), complex)
+        f["V_qmunu"] = np.full((1, 2, 2), 2.0, complex)
+        f["W0_qmunu"] = np.full((1, 2, 2), 3.0, complex)
     canonicalize_fixture(path)
-    monkeypatch.setattr(reader, "read_munu_tensor_from_h5", lambda f, name, mesh: name)
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    def transport(filename, name, mesh):
+        with h5py.File(filename) as f:
+            return jnp.asarray(f[name][:])
+    monkeypatch.setattr(reader, "read_munu_tensor_from_h5", transport)
+    monkeypatch.setattr(reader, "read_wavefunctions", lambda *args, **kwargs:
+                        jnp.ones((1, 2, 1, 2), dtype=jnp.complex128))
     for ready in (False, True):
         with h5py.File(path, "r+") as f:
             f["W0_qmunu"].attrs["W0_ready"] = ready
-        assert reader.read_interaction(path, "screened", None) == (
-            "W0_qmunu" if ready else "V_qmunu")
+        if not ready:
+            with pytest.raises(ValueError, match="not persisted"):
+                reader.read_interaction(path, "screened", mesh)
+        else:
+            np.testing.assert_array_equal(reader.read_interaction(path, "screened", mesh), 3.0)
+        payload = reader.read_bse_payload(path, None, mesh, [0], [1])
+        np.testing.assert_array_equal(payload[3], 3.0 if ready else 2.0)
+        coarse = reader.read_coarse_interactions(path, None, mesh)
+        if ready:
+            np.testing.assert_array_equal(coarse["W0"], 3.0)
+        else:
+            assert coarse["W0"] is None
     assert vq_interp.read_vq_payload is reader.read_vq_payload
     assert "read_coarse_interactions(" in inspect.getsource(reader.read_vq_payload)
-    assert 'read_interaction(filename, "screened", mesh_xy)' in inspect.getsource(reader.read_coarse_interactions)
-    assert 'read_interaction(filename, "screened", mesh_xy' in inspect.getsource(reader.read_bse_payload)
 
 
 
@@ -414,7 +431,7 @@ def test_a_file_that_says_v_was_never_persisted_is_refused(tmp_path, monkeypatch
     assert len(reads) == 2
     with h5py.File(path, "r+") as f:
         f["V_qmunu"].attrs["V_ready"] = False
-    with pytest.raises(ValueError, match="never persisted"):
+    with pytest.raises(ValueError, match="not persisted"):
         reader.read_interaction(path, "bare", None)
     assert len(reads) == 2
 
