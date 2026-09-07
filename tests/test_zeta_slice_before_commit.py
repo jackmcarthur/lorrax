@@ -40,7 +40,7 @@ def test_c_and_prebuilt_z_select_before_outer_block_until_ready():
     from gw import isdf_fitting
     import isdf.core as core
 
-    fit_source = inspect.getsource(isdf_fitting.fit_zeta_to_h5)
+    fit_source = inspect.getsource(isdf_fitting._build_zeta_fit_gram)
     c_slice = fit_source.index("C_q_flat = slice_q_full_to_ibz(")
     c_wait = fit_source.index("C_q_flat.block_until_ready()", c_slice)
     assert c_slice < c_wait
