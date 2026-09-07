@@ -788,6 +788,7 @@ def _validate_sigma_stage(
     """Validate the Sigma stage; see docs/architecture/four_current_wiring.md."""
     refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
     refuse_explicit_gij_under_low_mem_bands(config, Gij)
+    # AUTO-DISABLED, LOUDLY: non-PPM stages keep the ordinary full-band sum.
     if bool(config.sigma.band_extrapolation) and mode.ppm_model is None:
         explicit_switch = bool(getattr(
             config.sigma, "band_extrapolation_explicit", False))
@@ -852,6 +853,8 @@ def _validate_sigma_stage(
             f"  Σc band extrapolation: AUTO-DISABLED for compute_mode = "
             f"{getattr(mode, 'value', mode)} ({why}).  {because}.  "
             f"This stage's Σ is the ordinary full-band sum.")
+
+    # NOTHING IS REBOUND HERE: the stage kernels select their own band sum.
 
 
 def _packed_static_sigma_channels(
