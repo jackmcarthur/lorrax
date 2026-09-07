@@ -522,6 +522,7 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
     assert "_centroid_sampling_shardings(" in centroid_body
     centroid_body += wfn.split("def _centroid_sampling_shardings(", 1)[1].split("\ndef ", 1)[0]
     centroid_body += wfn.split("def _centroid_stream_geometry(", 1)[1].split("\ndef ", 1)[0]
+    centroid_body += wfn.split("def _centroid_resident_bytes(", 1)[1].split("\ndef ", 1)[0]
     assert "p_band = spec_divisor(mesh_xy, sharding_load, axis=1)" in centroid_body
 
     # Streaming owns one fixed, mesh-divisible band tile and pads the logical
@@ -529,11 +530,12 @@ def test_fftgrid_clients_delegate_divisor_and_extent_arithmetic():
     # this pins the contract without copying its extent arithmetic into a
     # second executable helper (and without depending on source formatting).
     assert "_centroid_stream_geometry(" in centroid_body
+    assert "_centroid_resident_bytes(" in centroid_body
     centroid_tree = ast.Module(body=[
         node for node in ast.parse(wfn).body
         if isinstance(node, ast.FunctionDef) and node.name in {
             "load_centroids_band_chunked", "_centroid_sampling_shardings",
-            "_centroid_stream_geometry"}], type_ignores=[])
+            "_centroid_stream_geometry", "_centroid_resident_bytes"}], type_ignores=[])
 
     def has_centroid_assignment(name, expression):
         expected = ast.dump(ast.parse(expression, mode="eval").body)
