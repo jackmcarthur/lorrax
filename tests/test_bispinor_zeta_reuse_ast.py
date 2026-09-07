@@ -59,7 +59,13 @@ def _function_tree(name):
 
 
 def _fit_zeta_tree():
-    return _function_tree("fit_zeta")
+    mod, entry = _function_tree("fit_zeta")
+    owners = {"fit_zeta", "_reuse_zeta_faces", "_plan_transverse_zeta",
+              "_fit_charge_zeta_channel", "_transverse_zeta_channel_runner",
+              "_run_transverse_zeta_schedule", "_fit_transverse_zeta_channels"}
+    return mod, ast.Module(body=[n for n in mod.body
+                                if isinstance(n, ast.FunctionDef)
+                                and n.name in owners], type_ignores=[])
 
 
 def _nested_function(tree, name):
@@ -137,7 +143,11 @@ def test_reuse_contract_precedes_and_bypasses_fit_only_planners():
     reuse_if = next(n for n in ast.walk(fit_zeta)
                     if isinstance(n, ast.If)
                     and ast.unparse(n.test) == "zeta_contract.reuse")
-    assert reuse_if.lineno < transverse_plans[0].lineno
+    _, entry = _function_tree("fit_zeta")
+    stage = _calls(entry, "_plan_transverse_zeta")
+    assert len(stage) == 1 and reuse_if.lineno < stage[0].lineno
+    _, planner = _function_tree("_plan_transverse_zeta")
+    assert len(_calls(planner, "_plan_gflat_chunks_for_channel")) == 1
     assert any(isinstance(n, ast.Return) for n in ast.walk(reuse_if))
     transverse_plan_guard = [n for n in ast.walk(fit_zeta)
                              if isinstance(n, ast.If)

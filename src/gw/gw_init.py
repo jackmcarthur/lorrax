@@ -1971,21 +1971,475 @@ def _select_coupled_mu123_route(*, requested_route, base_hwm_bytes,
 	return False, route, None
 
 
+def _report_zeta_chunk_plan(
+        chunks, print_fn, zeta_h5_path):
+    """Produce the existing memory estimate and report the resolved fit chunks."""
+    mem_est = chunks.get('memory_estimate', {}) if chunks is not None else {}
+    if chunks is not None:
+        print_fn(f"\n  Chunked ISDF fitting:")
+        print_fn(f"    Band chunks: {chunks['band_chunk']}")
+        print_fn(f"    R chunks:    {chunks['chunk_r']} (contiguous r-space)")
+        print_fn(f"    Q chunks:    {chunks['q_chunk']}")
+        print_fn("    ψ(r) source: " + (
+            "hoisted all-band cache" if chunks.get('cache_psi_r', True)
+            else "streamed band-chunk FFT"))
+        if chunks.get('gflat_chunk_size') is not None:
+            print_fn(f"    GFlat cs:    {chunks['gflat_chunk_size']}")
+        print_fn(f"    Zeta output: {zeta_h5_path}")
+    return mem_est
+
+
+def _reuse_zeta_faces(
+        band_slices, cfg, mem_est, mesh_xy, print_fn, sym, wfn, zeta_contract, zeta_h5_path):
+    """Produce the reusable zeta paths and the required transverse wavefunction view."""
+    print_fn("")
+    print_fn("  " + "=" * 68)
+    print_fn(f"  REUSING the existing ζ at {zeta_h5_path} — FIT SKIPPED.")
+    if cfg.bispinor:
+        print_fn("  ...and the three transverse ζ at "
+                 "zeta_q_mu{1,2,3}.h5.")
+    print_fn("  isdf_header/zeta_is_done is True, the centroid table")
+    print_fn("  matches, and fit_provenance is identical to this run's")
+    print_fn("  inputs (band windows, cutoffs, solver knobs, source WFN).")
+    print_fn("  Set LORRAX_FORCE_REFIT=1 to refit unconditionally.")
+    print_fn("  " + "=" * 68)
+    print_fn("")
+    if not cfg.bispinor:
+        return zeta_h5_path, mem_est, None
+    print_fn(
+        f"  [bispinor] re-sampling ψ at the "
+        f"{int(zeta_contract.meta_transverse.n_rmu)} transverse "
+        "centroids for σ^B (the ζ_T fit is skipped, but Σ^B still "
+        "needs ψ(r_{μ_T})).")
+    return zeta_h5_path, mem_est, _transverse_wfn_data(
+        wfn, sym, zeta_contract.meta_transverse,
+        zeta_contract.centroids_transverse, cfg, mesh_xy, band_slices,
+        zeta_contract.loader_band_chunk,
+        k_chunk_size=zeta_contract.loader_k_chunk)
+
+
+def _plan_transverse_zeta(
+        _reuse_T, band_slices, cfg, mesh_xy, print_fn, sym, zeta_contract):
+    """Produce the existing independently sized transverse fit plan."""
+    _meta_T = zeta_contract.meta_transverse
+    _cent_T_idx = zeta_contract.centroids_transverse
+    _transverse_identity = zeta_contract.transverse_identity
+    _chunks_T = None
+    _gflat_plan_T = None
+    _write_ibz_only_transverse = zeta_contract.write_ibz_only_transverse
+    if cfg.bispinor:
+        if len(_reuse_T) != 3:
+            raise AssertionError(
+                "a bispinor zeta contract must carry three transverse "
+                "reuse verdicts")
+        _cent_T_idx = jnp.asarray(
+            zeta_contract.centroids_transverse, dtype=jnp.int32)
+        if not all(_reuse_T):
+            _n_q_selected_T = (
+                int(np.asarray(sym.q_irr_full_idx).shape[0])
+                if _write_ibz_only_transverse else int(_meta_T.nk_tot))
+            _chunks_T, _gflat_plan_T = _plan_gflat_chunks_for_channel(
+                meta=_meta_T, cfg=cfg, band_slices=band_slices,
+                mesh_xy=mesh_xy, is_bispinor=True,
+                n_q_selected=_n_q_selected_T,
+                parent_route=dict(n_parent=int(np.asarray(sym.kirr_fullids).size),
+                                  parents_only=True),
+                face_current_vertex=True, print_fn=print_fn)
+    return _meta_T, _cent_T_idx, _chunks_T, _gflat_plan_T, _write_ibz_only_transverse
+
+
+def _plan_coupled_zeta_fit(
+        _chunks_T, _gflat_plan_T, _meta_T, _reuse_T, band_slices, cfg, mesh_xy, print_fn):
+    """Produce the existing coupled-current capacity decision and solve route."""
+    _coupled_mu123_enabled = False
+    _transverse_batched_route = str(
+        cfg.backend.distrib_la_batched_route).strip().lower()
+    if cfg.bispinor and any(_reuse_T) and not all(_reuse_T):
+        print_fn(
+            "  [bispinor] partial transverse ζ reuse: fitting only missing "
+            "channels on the sequential schedule.")
+    if (cfg.bispinor and not any(_reuse_T)
+            and bool(_chunks_T.get('cache_face_y_blocks', False))):
+        from gw.gflat_memory_model import (
+            _batch_reshard_operand_floor_bytes,
+            _coupled_route_projected_hwm_bytes,
+            _coupled_mu123_zq_incremental_bytes)
+        from common.gpu_utils import get_cpu_memory_total
+        _p_x = int(mesh_xy.shape['x'])
+        _p_y = int(mesh_xy.shape['y'])
+        _delta_args = dict(
+            nk=int(_meta_T.nk_tot), nq=int(_meta_T.nk_tot),
+            ns=int(_meta_T.nspinor), mu=int(_meta_T.n_rmu_padded),
+            face_nb=int(band_slices.b4 - band_slices.b0),
+            r_chunk=int(_chunks_T['chunk_r']), p_x=_p_x, p_y=_p_y,
+            ngkmax=(int(getattr(_meta_T, 'ngkmax', 0))
+                      or int(0.06 * _meta_T.n_rtot)),
+            n_rtot=int(_meta_T.n_rtot),
+            cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)),
+            host_spill_gflat=True)
+        _local_delta = _coupled_mu123_zq_incremental_bytes(
+            **_delta_args, stack_three_solves=False)
+        _distributed_delta = _coupled_mu123_zq_incremental_bytes(
+            **_delta_args, stack_three_solves=False)
+        from runtime.padding import mesh_divisor
+        _p_xy = mesh_divisor(mesh_xy)
+        _mu_T = int(_meta_T.n_rmu_padded)
+        _local_operand_floor = _batch_reshard_operand_floor_bytes(
+            batch=int(_meta_T.nk_tot), mu=_mu_T,
+            nrhs=int(_chunks_T['chunk_r']), processes=_p_xy)
+        _local_devices = jax.local_devices()
+        _device_kind = (
+            str(_local_devices[0].device_kind).upper()
+            if _local_devices else "")
+        _certified_local_backend = (
+            jax.default_backend() in ('gpu', 'cuda')
+            and 'A100' in _device_kind
+            and _p_x == _p_y and _p_xy in (4, 16))
+        _allocator_limit = float(_gflat_plan_T.budget_bytes)
+        _local_capacity_ok = (
+            _certified_local_backend and _mu_T <= 16_384
+            and _local_operand_floor <= 0.50 * _allocator_limit)
+        try:
+            _slurm_nodes = max(1, int(os.environ.get('SLURM_NNODES', '1')))
+        except ValueError:
+            _slurm_nodes = 1
+        _ranks_per_node = (
+            int(jax.process_count()) + _slurm_nodes - 1) // _slurm_nodes
+        _host_total_gb = get_cpu_memory_total()
+        _host_required_node = (
+            _local_delta['three_host_gflat_outputs'] * _ranks_per_node)
+        _host_spill_ok = (
+            _host_total_gb is not None
+            and _host_required_node <= 0.35 * _host_total_gb * 1024**3)
+        _effective_device_budget = (
+            float(_gflat_plan_T.budget_bytes)
+            * float(_gflat_plan_T.target_utilization))
+        _local_projected_hwm = _coupled_route_projected_hwm_bytes(
+            base_hwm=_gflat_plan_T.hwm_bytes,
+            persistent=_gflat_plan_T.persistent_bytes,
+            coupled_delta=_local_delta['total'],
+            solve_operand_floor=_local_operand_floor)
+        _local_budget_delta = max(
+            0.0, _local_projected_hwm - float(_gflat_plan_T.hwm_bytes))
+        if _host_spill_ok:
+            (_coupled_mu123_enabled, _transverse_batched_route,
+             _selected_delta_bytes) = _select_coupled_mu123_route(
+                requested_route=_transverse_batched_route,
+                base_hwm_bytes=_gflat_plan_T.hwm_bytes,
+                budget_bytes=_effective_device_budget,
+                local_delta_bytes=_local_budget_delta,
+                distributed_delta_bytes=_distributed_delta['total'],
+                local_capacity_ok=_local_capacity_ok)
+        else:
+            _selected_delta_bytes = None
+        if _coupled_mu123_enabled:
+            _coupled_delta = (
+                _local_delta if _transverse_batched_route == 'batch_reshard'
+                else _distributed_delta)
+            _coupled_projected = (
+                float(_gflat_plan_T.hwm_bytes) + _selected_delta_bytes)
+            print_fn(
+                f"  [bispinor] coupled μ_L=1,2,3 schedule: "
+                f"solve_route={_transverse_batched_route}, "
+                f"device increment {_selected_delta_bytes / 1e9:.2f} GB, "
+                f"projected HWM {_coupled_projected / 1e9:.2f} GB; "
+                f"three G-flat outputs use "
+                f"{_coupled_delta['three_host_gflat_outputs'] / 1e9:.2f} "
+                f"GB host/rank, {_host_required_node / 1e9:.2f} GB/node.")
+        else:
+            _reason = (
+                f"host spill {_host_required_node / 1e9:.2f} GB/node exceeds "
+                "the 35% host-RAM cap"
+                if not _host_spill_ok else
+                "coupled live set exceeds the fragmentation-safe device budget")
+            print_fn(
+                f"  [bispinor] {_reason}; using the sequential capacity "
+                "fallback.")
+    return _coupled_mu123_enabled, _transverse_batched_route
+
+
+def _fit_charge_zeta_channel(
+        _band_norms, _provenance, _reuse_charge, _write_ibz_only_charge, _zeta_cutoff,
+        band_range_left, band_range_right, centroid_indices, cfg, chunks, k_unfold_plan,
+        mesh_xy, meta, print_fn, psi_mun_parent, psi_nmu_parent, representation, sym, wfn,
+        zeta_h5_path):
+    """Produce the charge fit peak and truncation verdict after its reuse stamp."""
+    from gw.isdf_fitting import fit_zeta_to_h5
+    if not _reuse_charge and chunks is None:
+        raise AssertionError(
+            "a non-reusable charge zeta reached fit_zeta without the canonical "
+            "G-flat chunk plan")
+    peak_bytes = 0
+    if _reuse_charge:
+        print_fn(f"  [zeta reuse] charge ζ accepted at {zeta_h5_path}; "
+                 "charge fit skipped independently.")
+    else:
+        with timing.section("gw_jax.zeta_fit_chunked"), \
+             jax_profile.trace_section("zeta_fit"):
+            peak_bytes = fit_zeta_to_h5(
+                wfn=wfn, sym=sym, meta=meta,
+                centroid_indices=centroid_indices, mesh_xy=mesh_xy,
+                chunk_r=chunks['chunk_r'], output_file=zeta_h5_path,
+                band_chunk_size=chunks['band_chunk'],
+                q_chunk_size=chunks['q_chunk'],
+                bispinor=bool(int(meta.nspinor) == 4),
+                band_range_left=band_range_left,
+                band_range_right=band_range_right,
+                band_norms=_band_norms,
+                distributed_cholesky=cfg.backend.distributed_cholesky,
+                distributed_lu=cfg.backend.distributed_lu,
+                distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
+                zeta_ridge=cfg.backend.zeta_ridge,
+                charge_zeta_solve=cfg.backend.charge_zeta_solve,
+                distributed_zeta_solve=cfg.backend.distributed_zeta_solve,
+                zeta_rcond=cfg.backend.zeta_rcond,
+                gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
+                cache_psi_r=bool(chunks.get('cache_psi_r', True)),
+                cache_face_y_blocks=bool(
+                    chunks.get('cache_face_y_blocks', False)),
+                write_ibz_only=_write_ibz_only_charge,
+                zeta_cutoff_ry=_zeta_cutoff,
+                print_fn=print_fn,
+                bispinor_lift=(representation.charge_lift or "raw"),
+                k_unfold_plan=k_unfold_plan,
+                psi_nmu_parent=psi_nmu_parent,
+                psi_mun_parent=psi_mun_parent,
+            )
+    if not _reuse_charge:
+        _gate_fresh_zeta_rank_findings(
+            "the ζ fit's rank truncation", print_fn=print_fn)
+    _trunc = active_zeta_truncating_knobs()
+    if not _reuse_charge and _trunc:
+        _names = ", ".join(f"{k}={v}" for k, v in _trunc)
+        print_fn("")
+        print_fn("  " + "!" * 68)
+        print_fn(f"  *** LORRAX SANITY: {_names} truncated this ζ fit. ***")
+        print_fn(f"  {zeta_h5_path} is INCOMPLETE and is NOT being stamped")
+        print_fn( "  with fit_provenance, so no later run can reuse it.  The")
+        print_fn( "  writer also left isdf_header/zeta_is_done False, so no")
+        print_fn( "  restart path will trust it either.  Profiling only —")
+        print_fn( "  delete this file before any production run from this")
+        print_fn( "  directory.")
+        print_fn("  " + "!" * 68)
+        print_fn("")
+    elif not _reuse_charge and jax.process_index() == 0:
+        try:
+            from file_io.isdf_header import stamp_fit_provenance
+            stamp_fit_provenance(zeta_h5_path, _provenance)
+        except Exception as exc:
+            print_fn(f"    [zeta provenance] not stamped ({exc}); this ζ "
+                     f"will be refit on the next run.")
+    if not _reuse_charge:
+        barrier("zeta_provenance")
+    return peak_bytes, _trunc
+
+
+def _report_zeta_fit_peak(
+        cfg, mem_est, peak_bytes, print_fn):
+    """Report the observed zeta fit peak with its allocator provenance."""
+    budget_gb = mem_est.get('budget_gb', cfg.memory.per_device_gb)
+    if peak_bytes > 0:
+        peak_gb = peak_bytes / 1e9
+        _xm = resolve_xla_gpu_memory_env()
+        _backend = jax.default_backend()
+        try:
+            _stats = jax.local_devices()[0].memory_stats()
+        except Exception as _exc:
+            _stats = None
+            print_fn(f"    [mem] memory_stats() unavailable "
+                     f"({type(_exc).__name__}: {_exc}); the peak below is "
+                     f"whatever the ζ-fit tracker could sample.")
+        _pool = classify_xla_pool(_stats, backend=_backend, env=_xm)
+        _caveat = _xm.caveat()
+        if _pool.disagreement:
+            print_fn(f"    *** LORRAX SANITY: {_pool.disagreement} ***")
+        _pct = (f"{100 * peak_gb / budget_gb:.0f}%" if budget_gb > 0
+                else "budget unknown")
+        if str(_backend).strip().lower() in ("gpu", "cuda", "rocm"):
+            _src = ("XLA arena" if _pool.peak_source == "arena"
+                    else "nvidia-smi whole-GPU sample")
+            print_fn(f"    GPU high-water mark: {peak_gb:.2f} GB / "
+                     f"{budget_gb:.2f} GB budget ({_pct})  "
+                     f"[source: {_src}]{_caveat}")
+        else:
+            print_fn(f"    ζ-fit high-water mark: {peak_gb:.2f} GB / "
+                     f"{budget_gb:.2f} GB budget ({_pct})  [backend="
+                     f"{_backend}: this figure comes from the device "
+                     f"memory-stats/nvidia-smi tracker and is NOT this "
+                     f"run's host RSS — use LORRAX_DEBUG_PRINT=1 for that]")
+
+
+def _transverse_zeta_channel_runner(
+        _band_norms, _chunks_T, _provenance_T, _reuse_T, _transverse_batched_route, _trunc,
+        _write_ibz_only_transverse, _zeta_T_paths, _zeta_cutoff, band_range_left,
+        band_range_right, cents_curr_idx, cfg, mesh_xy, meta_curr, parent_T, print_fn,
+        representation, sym, wfn):
+    """Produce the existing transverse fit callback and cache-lifetime boundary."""
+    from gw.isdf_fitting import fit_zeta_to_h5
+    import gc
+    from isdf import core as _isdf_core
+    def _drop_traced_caches():
+        _isdf_core._fit_one_rchunk_cache.clear()
+        gc.collect()
+    def _drain_coupled_rank_findings(mu_L, stage):
+        if spectral_closure.pending() or rank_criterion.pending():
+            _gate_fresh_zeta_rank_findings(
+                f"the μ_L={mu_L} transverse ζ fit's {stage}",
+                transverse=True, print_fn=print_fn)
+    def _fit_transverse_channel(mu_L, coordinator=None):
+        zeta_mu_path = _zeta_T_paths[mu_L]
+        if _reuse_T[mu_L - 1]:
+            print_fn(f"  [zeta reuse] μ_L={mu_L} accepted at "
+                     f"{zeta_mu_path}; fit skipped independently.")
+            return
+        print_fn(f"  [bispinor] μ_L={mu_L} → {zeta_mu_path}")
+        with timing.section(f"gw_jax.zeta_fit_chunked_mu{mu_L}"), \
+             jax_profile.trace_section(f"zeta_fit_mu{mu_L}"):
+            fit_zeta_to_h5(
+                wfn=wfn, sym=sym, meta=meta_curr,
+                centroid_indices=cents_curr_idx,
+                mesh_xy=mesh_xy,
+                chunk_r=_chunks_T['chunk_r'], output_file=zeta_mu_path,
+                k_unfold_plan=parent_T.plan,
+                psi_nmu_parent=parent_T.psi_nmu,
+                psi_mun_parent=parent_T.psi_mun,
+                band_chunk_size=_chunks_T['band_chunk'],
+                q_chunk_size=_chunks_T['q_chunk'],
+                bispinor=True,
+                band_range_left=band_range_left,
+                band_range_right=band_range_right,
+                band_norms=_band_norms,
+                distributed_cholesky=cfg.backend.distributed_cholesky,
+                distributed_lu=cfg.backend.distributed_lu,
+                distrib_la_batched_route=_transverse_batched_route,
+                zeta_ridge=cfg.backend.zeta_ridge,
+                distributed_zeta_solve=cfg.backend.distributed_zeta_solve,
+                transverse_zeta_solve=cfg.backend.transverse_zeta_solve,
+                transverse_zeta_rcond=cfg.backend.transverse_zeta_rcond,
+                gflat_chunk_size=int(_chunks_T.get('gflat_chunk_size', 0)),
+                cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)),
+                cache_face_y_blocks=bool(
+                    _chunks_T.get('cache_face_y_blocks', False)),
+                vertex_mu_L=mu_L,
+                bispinor_lift=(representation.current_lift or "raw"),
+                write_ibz_only=_write_ibz_only_transverse,
+                zeta_cutoff_ry=_zeta_cutoff,
+                _coupled_mu123_coordinator=coordinator,
+                _coupled_rank_gate=(
+                    (lambda stage: _drain_coupled_rank_findings(
+                        mu_L, stage))
+                    if coordinator is not None else None),
+                _spill_coupled_gflat_to_host=bool(
+                    coordinator is not None),
+                _stack_coupled_solve_inputs=coordinator is not None,
+                print_fn=print_fn,
+            )
+        _gate_fresh_zeta_rank_findings(
+            f"the μ_L={mu_L} transverse ζ fit's rank truncation",
+            transverse=True, print_fn=print_fn)
+        if not _trunc and jax.process_index() == 0:
+            try:
+                from file_io.isdf_header import stamp_fit_provenance
+                stamp_fit_provenance(zeta_mu_path, _provenance_T(mu_L))
+            except Exception as exc:
+                print_fn(f"    [zeta provenance] μ_L={mu_L} not stamped "
+                         f"({exc}); this ζ_T will be refit on the next "
+                         f"run.")
+        barrier(f"zeta_provenance_mu{mu_L}")
+        if coordinator is not None:
+            coordinator.finish_channel(mu_L)
+    return _fit_transverse_channel, _drop_traced_caches
+
+
+def _run_transverse_zeta_schedule(
+        _coupled_mu123_enabled, _drop_traced_caches, _fit_transverse_channel, _reuse_T,
+        print_fn):
+    """Execute the existing ordered coupled or sequential transverse schedule."""
+    with timing.section("gw_jax.zeta_fit_transverse"):
+        if _coupled_mu123_enabled:
+            print_fn(
+                "  [bispinor] coupled μ_L=1,2,3 transverse Zq: one "
+                "shared face transform per r chunk; the three solves, write, and "
+                "provenance remain ordered μ_L=1→2→3")
+            _drop_traced_caches()
+            _coordinator = _CoupledMu123ZqCoordinator()
+            _errors = {}
+            _errors_lock = threading.Lock()
+            def _run_coupled_channel(mu_L):
+                try:
+                    _fit_transverse_channel(mu_L, _coordinator)
+                except BaseException as exc:
+                    with _errors_lock:
+                        _errors.setdefault(mu_L, exc)
+                    _coordinator.abort(exc)
+            _threads = []
+            _setup_exc = None
+            try:
+                for mu_L in (1, 2, 3):
+                    _thread = threading.Thread(
+                        target=_run_coupled_channel, args=(mu_L,),
+                        name=f"lorrax-zq-mu{mu_L}", daemon=False)
+                    _thread.start()
+                    _threads.append(_thread)
+                    _coordinator.wait_channel_prepared(mu_L)
+                _coordinator.release_channels()
+            except BaseException as exc:
+                _setup_exc = exc
+                _coordinator.abort(exc)
+            finally:
+                for _thread in _threads:
+                    _thread.join()
+            if _errors:
+                raise _errors[min(_errors)]
+            if _setup_exc is not None:
+                raise _setup_exc
+        else:
+            for mu_L in (1, 2, 3):
+                if not _reuse_T[mu_L - 1]:
+                    _drop_traced_caches()
+                _fit_transverse_channel(mu_L)
+
+
+def _fit_transverse_zeta_channels(
+        _band_norms, _cent_T_idx, _chunks_T, _coupled_mu123_enabled, _meta_T, _provenance_T,
+        _reuse_T, _transverse_batched_route, _trunc, _write_ibz_only_transverse,
+        _zeta_T_paths, _zeta_cutoff, band_range_left, band_range_right, band_slices, cfg,
+        mesh_xy, print_fn, representation, sym, wfn, zeta_contract):
+    """Produce the transverse wavefunction view after fitting missing currents."""
+    print_fn(f"\n  [bispinor] resolving ζ^{{μ_L=1,2,3}} on current-density "
+             f"centroids: {cfg.paths.centroids_file_current}")
+    meta_curr = _meta_T
+    cents_curr_idx = _cent_T_idx
+    transverse_wfn_data = _transverse_wfn_data(
+        wfn, sym, meta_curr, cents_curr_idx, cfg, mesh_xy,
+        band_slices,
+        (_chunks_T['band_chunk'] if _chunks_T is not None
+         else zeta_contract.loader_band_chunk),
+        k_chunk_size=(
+            _chunks_T['centroid_k_chunk']
+            if _chunks_T is not None
+            else zeta_contract.loader_k_chunk))
+    parent_T = transverse_wfn_data['green_parent']
+    (_fit_transverse_channel, _drop_traced_caches) = _transverse_zeta_channel_runner(
+        _band_norms, _chunks_T, _provenance_T, _reuse_T, _transverse_batched_route, _trunc,
+        _write_ibz_only_transverse, _zeta_T_paths, _zeta_cutoff, band_range_left,
+        band_range_right, cents_curr_idx, cfg, mesh_xy, meta_curr, parent_T, print_fn,
+        representation, sym, wfn)
+    _run_transverse_zeta_schedule(
+        _coupled_mu123_enabled, _drop_traced_caches, _fit_transverse_channel, _reuse_T, print_fn)
+    return transverse_wfn_data
+
+
 def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
              chunks, print_fn=print,
              zeta_contract=None,
              k_unfold_plan=None, psi_nmu_parent=None, psi_mun_parent=None):
-	"""Fit missing charge/current ζ channels from their typed parents, preserving independent reuse."""
+	"""Fit missing charge/current ζ channels from their typed parents, preserving independent reuse; see docs/architecture/zeta_fit_face_psi_cct.md."""
 	from gw.isdf_fitting import fit_zeta_to_h5
 	from common.gamma_matrices import set_gamma_contract_mode
 	representation = resolve_four_current_representation(
 		cfg.bispinor, cfg.bispinor_gw)
-	# Honour cohsex.in ``gamma_contract_mode`` for the γ̃·γ̃ kernel
-	# inside the monolithic pair pipeline.  Mode is module-level (the
-	# γ̃ contract sits inside shard_map bodies so threading a kwarg
-	# through every call would be churn for no benefit).
 	set_gamma_contract_mode(cfg.backend.gamma_contract_mode)
-
 	if zeta_contract is None:
 		zeta_contract = _resolve_zeta_fit_contract(
 			wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices,
@@ -1999,196 +2453,15 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	_write_ibz_only_charge = zeta_contract.write_ibz_only_charge
 	_reuse_charge = bool(zeta_contract.reuse_charge)
 	_reuse_T = tuple(bool(value) for value in zeta_contract.reuse_transverse)
-
-	# Chunk sizes (band_chunk / chunk_r / q_chunk / gflat_chunk_size) were
-	# picked once by ``plan_gflat_chunks`` in the caller and live in
-	# ``chunks``; fit_zeta is a pure consumer.
-	mem_est = chunks.get('memory_estimate', {}) if chunks is not None else {}
-	if chunks is not None:
-		print_fn(f"\n  Chunked ISDF fitting:")
-		print_fn(f"    Band chunks: {chunks['band_chunk']}")
-		print_fn(f"    R chunks:    {chunks['chunk_r']} (contiguous r-space)")
-		print_fn(f"    Q chunks:    {chunks['q_chunk']}")
-		print_fn("    ψ(r) source: " + (
-			"hoisted all-band cache" if chunks.get('cache_psi_r', True)
-			else "streamed band-chunk FFT"))
-		if chunks.get('gflat_chunk_size') is not None:
-			print_fn(f"    GFlat cs:    {chunks['gflat_chunk_size']}")
-		print_fn(f"    Zeta output: {zeta_h5_path}")
+	(mem_est) = _report_zeta_chunk_plan(
+	    chunks, print_fn, zeta_h5_path)
 	if zeta_contract.reuse:
-		print_fn("")
-		print_fn("  " + "=" * 68)
-		print_fn(f"  REUSING the existing ζ at {zeta_h5_path} — FIT SKIPPED.")
-		if cfg.bispinor:
-			print_fn("  ...and the three transverse ζ at "
-			         "zeta_q_mu{1,2,3}.h5.")
-		print_fn("  isdf_header/zeta_is_done is True, the centroid table")
-		print_fn("  matches, and fit_provenance is identical to this run's")
-		print_fn("  inputs (band windows, cutoffs, solver knobs, source WFN).")
-		print_fn("  Set LORRAX_FORCE_REFIT=1 to refit unconditionally.")
-		print_fn("  " + "=" * 68)
-		print_fn("")
-		if not cfg.bispinor:
-			return zeta_h5_path, mem_est, None
-		print_fn(
-			f"  [bispinor] re-sampling ψ at the "
-			f"{int(zeta_contract.meta_transverse.n_rmu)} transverse "
-			"centroids for σ^B (the ζ_T fit is skipped, but Σ^B still "
-			"needs ψ(r_{μ_T})).")
-		return zeta_h5_path, mem_est, _transverse_wfn_data(
-			wfn, sym, zeta_contract.meta_transverse,
-			zeta_contract.centroids_transverse, cfg, mesh_xy, band_slices,
-			zeta_contract.loader_band_chunk,
-			k_chunk_size=zeta_contract.loader_k_chunk)
-	# Any missing bispinor channel consumes the transverse identity already
-	# resolved by the per-channel contract.  Only the fit-specific chunk plan
-	# remains here.
-	_meta_T = zeta_contract.meta_transverse
-	_cent_T_idx = zeta_contract.centroids_transverse
-	_transverse_identity = zeta_contract.transverse_identity
-	_chunks_T = None
-	_gflat_plan_T = None
-	_write_ibz_only_transverse = zeta_contract.write_ibz_only_transverse
-	if cfg.bispinor:
-		if len(_reuse_T) != 3:
-			raise AssertionError(
-				"a bispinor zeta contract must carry three transverse "
-				"reuse verdicts")
-		_cent_T_idx = jnp.asarray(
-			zeta_contract.centroids_transverse, dtype=jnp.int32)
-		# Chunk-plan the TRANSVERSE channel SEPARATELY from the charge
-		# ``chunks`` this function was handed.  μ_T is typically ≈ μ_C/3,
-		# and reusing the charge-sized plan unchanged for all three ζ_T
-		# fits is exactly the register row this closes: "three ζ_T fits
-		# inherit the CHARGE chunk plan (μ_T≈μ_C/3): ~3x extra r-chunks,
-		# ~2.7 GB/rank avoidable gather".  ONE call here, after reuse was
-		# definitively declined and ahead of the μ_L fit loop; all three
-		# Lorentz components share this one transverse-sized plan.
-		if not all(_reuse_T):
-			_n_q_selected_T = (
-				int(np.asarray(sym.q_irr_full_idx).shape[0])
-				if _write_ibz_only_transverse else int(_meta_T.nk_tot))
-			_chunks_T, _gflat_plan_T = _plan_gflat_chunks_for_channel(
-				meta=_meta_T, cfg=cfg, band_slices=band_slices,
-				mesh_xy=mesh_xy, is_bispinor=True,
-				n_q_selected=_n_q_selected_T,
-				parent_route=dict(n_parent=int(np.asarray(sym.kirr_fullids).size),
-				                  parents_only=True),
-				face_current_vertex=True, print_fn=print_fn)
-	_coupled_mu123_enabled = False
-	_transverse_batched_route = str(
-		cfg.backend.distrib_la_batched_route).strip().lower()
-	if cfg.bispinor and any(_reuse_T) and not all(_reuse_T):
-		print_fn(
-			"  [bispinor] partial transverse ζ reuse: fitting only missing "
-			"channels on the sequential schedule.")
-	if (cfg.bispinor and not any(_reuse_T)
-			and bool(_chunks_T.get('cache_face_y_blocks', False))):
-		from gw.gflat_memory_model import (
-			_batch_reshard_operand_floor_bytes,
-			_coupled_route_projected_hwm_bytes,
-			_coupled_mu123_zq_incremental_bytes)
-		from common.gpu_utils import get_cpu_memory_total
-		_p_x = int(mesh_xy.shape['x'])
-		_p_y = int(mesh_xy.shape['y'])
-		_delta_args = dict(
-			nk=int(_meta_T.nk_tot), nq=int(_meta_T.nk_tot),
-			ns=int(_meta_T.nspinor), mu=int(_meta_T.n_rmu_padded),
-			face_nb=int(band_slices.b4 - band_slices.b0),
-			r_chunk=int(_chunks_T['chunk_r']), p_x=_p_x, p_y=_p_y,
-			ngkmax=(int(getattr(_meta_T, 'ngkmax', 0))
-			          or int(0.06 * _meta_T.n_rtot)),
-			n_rtot=int(_meta_T.n_rtot),
-			cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)),
-			host_spill_gflat=True)
-		# The shared Zq transform is coupled, but the three real transverse
-		# systems retain their accepted 36-q solve boundaries.  Flattening them
-		# to 108 q exposed input-sensitive ~1e-9 arithmetic drift on CrI3 while
-		# saving only a small solve dispatch inside a transform-dominated chunk.
-		_local_delta = _coupled_mu123_zq_incremental_bytes(
-			**_delta_args, stack_three_solves=False)
-		_distributed_delta = _coupled_mu123_zq_incremental_bytes(
-			**_delta_args, stack_three_solves=False)
-		from runtime.padding import mesh_divisor
-		_p_xy = mesh_divisor(mesh_xy)
-		_mu_T = int(_meta_T.n_rmu_padded)
-		_local_operand_floor = _batch_reshard_operand_floor_bytes(
-			batch=int(_meta_T.nk_tot), mu=_mu_T,
-			nrhs=int(_chunks_T['chunk_r']), processes=_p_xy)
-		_local_devices = jax.local_devices()
-		_device_kind = (
-			str(_local_devices[0].device_kind).upper()
-			if _local_devices else "")
-		_certified_local_backend = (
-			jax.default_backend() in ('gpu', 'cuda')
-			and 'A100' in _device_kind
-			and _p_x == _p_y and _p_xy in (4, 16))
-		# The deck/planner budget is rank-invariant and no larger than the
-		# allocator pool.  Using it for the measured 50% operand ceiling is a
-		# conservative static dispatch; process-local memory_stats could differ
-		# transiently and must not choose different collective routes by rank.
-		_allocator_limit = float(_gflat_plan_T.budget_bytes)
-		_local_capacity_ok = (
-			_certified_local_backend and _mu_T <= 16_384
-			and _local_operand_floor <= 0.50 * _allocator_limit)
-		try:
-			_slurm_nodes = max(1, int(os.environ.get('SLURM_NNODES', '1')))
-		except ValueError:
-			_slurm_nodes = 1
-		_ranks_per_node = (
-			int(jax.process_count()) + _slurm_nodes - 1) // _slurm_nodes
-		_host_total_gb = get_cpu_memory_total()
-		_host_required_node = (
-			_local_delta['three_host_gflat_outputs'] * _ranks_per_node)
-		_host_spill_ok = (
-			_host_total_gb is not None
-			and _host_required_node <= 0.35 * _host_total_gb * 1024**3)
-		_effective_device_budget = (
-			float(_gflat_plan_T.budget_bytes)
-			* float(_gflat_plan_T.target_utilization))
-		_local_projected_hwm = _coupled_route_projected_hwm_bytes(
-			base_hwm=_gflat_plan_T.hwm_bytes,
-			persistent=_gflat_plan_T.persistent_bytes,
-			coupled_delta=_local_delta['total'],
-			solve_operand_floor=_local_operand_floor)
-		_local_budget_delta = max(
-			0.0, _local_projected_hwm - float(_gflat_plan_T.hwm_bytes))
-		if _host_spill_ok:
-			(_coupled_mu123_enabled, _transverse_batched_route,
-			 _selected_delta_bytes) = _select_coupled_mu123_route(
-				requested_route=_transverse_batched_route,
-				base_hwm_bytes=_gflat_plan_T.hwm_bytes,
-				budget_bytes=_effective_device_budget,
-				local_delta_bytes=_local_budget_delta,
-				distributed_delta_bytes=_distributed_delta['total'],
-				local_capacity_ok=_local_capacity_ok)
-		else:
-			_selected_delta_bytes = None
-		if _coupled_mu123_enabled:
-			_coupled_delta = (
-				_local_delta if _transverse_batched_route == 'batch_reshard'
-				else _distributed_delta)
-			_coupled_projected = (
-				float(_gflat_plan_T.hwm_bytes) + _selected_delta_bytes)
-			print_fn(
-				f"  [bispinor] coupled μ_L=1,2,3 schedule: "
-				f"solve_route={_transverse_batched_route}, "
-				f"device increment {_selected_delta_bytes / 1e9:.2f} GB, "
-				f"projected HWM {_coupled_projected / 1e9:.2f} GB; "
-				f"three G-flat outputs use "
-				f"{_coupled_delta['three_host_gflat_outputs'] / 1e9:.2f} "
-				f"GB host/rank, {_host_required_node / 1e9:.2f} GB/node.")
-		else:
-			_reason = (
-				f"host spill {_host_required_node / 1e9:.2f} GB/node exceeds "
-				"the 35% host-RAM cap"
-				if not _host_spill_ok else
-				"coupled live set exceeds the fragmentation-safe device budget")
-			print_fn(
-				f"  [bispinor] {_reason}; using the sequential capacity "
-				"fallback.")
-	# Fresh writers and provenance stamps consume exactly the identity that
-	# was tested before planning; there is no second reconstruction here.
+	    return _reuse_zeta_faces(
+	        band_slices, cfg, mem_est, mesh_xy, print_fn, sym, wfn, zeta_contract, zeta_h5_path)
+	(_meta_T, _cent_T_idx, _chunks_T, _gflat_plan_T, _write_ibz_only_transverse) = _plan_transverse_zeta(
+	    _reuse_T, band_slices, cfg, mesh_xy, print_fn, sym, zeta_contract)
+	(_coupled_mu123_enabled, _transverse_batched_route) = _plan_coupled_zeta_fit(
+	    _chunks_T, _gflat_plan_T, _meta_T, _reuse_T, band_slices, cfg, mesh_xy, print_fn)
 	_provenance = zeta_contract.provenance
 
 	def _provenance_T(mu_L):
@@ -2198,353 +2471,20 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		mu_L: path for mu_L, path in
 		enumerate(zeta_contract.zeta_transverse_paths, start=1)
 	}
-	if not _reuse_charge and chunks is None:
-		raise AssertionError(
-			"a non-reusable charge zeta reached fit_zeta without the canonical "
-			"G-flat chunk plan")
-	peak_bytes = 0
-	if _reuse_charge:
-		print_fn(f"  [zeta reuse] charge ζ accepted at {zeta_h5_path}; "
-		         "charge fit skipped independently.")
-	else:
-		with timing.section("gw_jax.zeta_fit_chunked"), \
-		     jax_profile.trace_section("zeta_fit"):
-			peak_bytes = fit_zeta_to_h5(
-				wfn=wfn, sym=sym, meta=meta,
-				centroid_indices=centroid_indices, mesh_xy=mesh_xy,
-				chunk_r=chunks['chunk_r'], output_file=zeta_h5_path,
-				band_chunk_size=chunks['band_chunk'],
-				q_chunk_size=chunks['q_chunk'],
-				bispinor=bool(int(meta.nspinor) == 4),
-				band_range_left=band_range_left,
-				band_range_right=band_range_right,
-				band_norms=_band_norms,
-				distributed_cholesky=cfg.backend.distributed_cholesky,
-				distributed_lu=cfg.backend.distributed_lu,
-				distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
-				zeta_ridge=cfg.backend.zeta_ridge,
-				charge_zeta_solve=cfg.backend.charge_zeta_solve,
-				distributed_zeta_solve=cfg.backend.distributed_zeta_solve,
-				zeta_rcond=cfg.backend.zeta_rcond,
-				gflat_chunk_size=int(chunks.get('gflat_chunk_size', 0)),
-				cache_psi_r=bool(chunks.get('cache_psi_r', True)),
-				cache_face_y_blocks=bool(
-					chunks.get('cache_face_y_blocks', False)),
-				write_ibz_only=_write_ibz_only_charge,
-				zeta_cutoff_ry=_zeta_cutoff,
-				print_fn=print_fn,
-				bispinor_lift=(representation.charge_lift or "raw"),
-				k_unfold_plan=k_unfold_plan,
-				psi_nmu_parent=psi_nmu_parent,
-				psi_mun_parent=psi_mun_parent,
-			)
-
-	# Device kernels can only record closure/certification findings.  The
-	# shared host seam must dispose them after this fresh writer and before its
-	# provenance stamp makes the artifact reusable.
-	if not _reuse_charge:
-		_gate_fresh_zeta_rank_findings(
-			"the ζ fit's rank truncation", print_fn=print_fn)
-
-	# Stamp what this ζ was fit FOR, so a later run can reuse it.  AFTER
-	# the fit (and therefore after ``mark_zeta_done`` inside
-	# fit_zeta_to_h5) on purpose: a job killed between the two leaves a
-	# complete-but-unstamped file, which _zeta_reuse_ok refits.  Rank 0
-	# only, then a barrier so no rank races ahead of the write.
-	#
-	# EXCEPT when a truncating knob was in force.  ``LORRAX_MAX_RCHUNKS=N``
-	# breaks the r-chunk loop after N chunks (gw/isdf_fitting.py) and the
-	# writer downstream of the loop still calls ``mark_zeta_done``, so the
-	# partial ζ is stamped COMPLETE on disk.  Provenance records the
-	# CONFIGURATION, which a later production run in the same directory
-	# reproduces exactly — so stamping here would make _zeta_reuse_ok
-	# reuse a truncated ζ and produce silently wrong physics from a
-	# profiling knob.  Refusing the stamp breaks that chain outright
-	# (rule 4 of _zeta_reuse_ok: no provenance ⇒ refit).
-	#
-	# The writer now consults the SAME knob list before calling
-	# ``mark_zeta_done``, so a truncated file also carries
-	# ``zeta_is_done=False``.  The two guards stay separate on purpose —
-	# provenance answers "may a later run REUSE this", zeta_is_done answers
-	# "did the writer FINISH" — and either alone stops the reuse.
-	_trunc = active_zeta_truncating_knobs()
-	if not _reuse_charge and _trunc:
-		_names = ", ".join(f"{k}={v}" for k, v in _trunc)
-		print_fn("")
-		print_fn("  " + "!" * 68)
-		print_fn(f"  *** LORRAX SANITY: {_names} truncated this ζ fit. ***")
-		print_fn(f"  {zeta_h5_path} is INCOMPLETE and is NOT being stamped")
-		print_fn( "  with fit_provenance, so no later run can reuse it.  The")
-		print_fn( "  writer also left isdf_header/zeta_is_done False, so no")
-		print_fn( "  restart path will trust it either.  Profiling only —")
-		print_fn( "  delete this file before any production run from this")
-		print_fn( "  directory.")
-		print_fn("  " + "!" * 68)
-		print_fn("")
-	elif not _reuse_charge and jax.process_index() == 0:
-		try:
-			from file_io.isdf_header import stamp_fit_provenance
-			stamp_fit_provenance(zeta_h5_path, _provenance)
-		except Exception as exc:
-			# Non-fatal: the ζ itself is fine, it just won't be reusable.
-			print_fn(f"    [zeta provenance] not stamped ({exc}); this ζ "
-			         f"will be refit on the next run.")
-	if not _reuse_charge:
-		barrier("zeta_provenance")
-
-	budget_gb = mem_est.get('budget_gb', cfg.memory.per_device_gb)
-	if peak_bytes > 0:
-		peak_gb = peak_bytes / 1e9
-		# WHERE DID THIS NUMBER COME FROM?  ``fit_zeta_to_h5._track_peak``
-		# prefers ``memory_stats()['peak_bytes_in_use']`` and falls back to
-		# an nvidia-smi whole-GPU sample when that is 0/absent — and the
-		# caller cannot tell which fired.  Under the ``platform`` allocator
-		# the arena reports bytes_limit=0 AND peak_bytes_in_use=0
-		# (measured, job 7882447), so every figure printed there is the
-		# nvidia-smi fallback: the whole card, other processes included.
-		#
-		# Four bugs in the previous three lines, all silent:
-		#   * ``== "platform"`` was case-SENSITIVE while jax lowercases
-		#     (jaxlib/xla_client.py:190), so ``=PLATFORM`` printed bare;
-		#   * it never matched ``cuda_async``, which is what
-		#     ``config/frontera/ffi_env.sh:24`` deploys;
-		#   * it called ``platform`` "cuda_async" — three distinct
-		#     allocators, and ``platform`` is plain cudaMalloc;
-		#   * its ``TF_GPU_ALLOCATOR`` clause was dead (inert for jax).
-		# And its premise — "cuda_async under-reports" — was not
-		# reproduced: peak_bytes_in_use measured IDENTICAL to BFC.
-		#
-		# The environment alone cannot answer this: the allocator is fixed
-		# at backend init, so a variable set later changes the string and
-		# not the client (job 7882443).  Corroborate against the device.
-		_xm = resolve_xla_gpu_memory_env()
-		_backend = jax.default_backend()
-		try:
-			_stats = jax.local_devices()[0].memory_stats()
-		except Exception as _exc:
-			_stats = None
-			print_fn(f"    [mem] memory_stats() unavailable "
-			         f"({type(_exc).__name__}: {_exc}); the peak below is "
-			         f"whatever the ζ-fit tracker could sample.")
-		_pool = classify_xla_pool(_stats, backend=_backend, env=_xm)
-		_caveat = _xm.caveat()
-		if _pool.disagreement:
-			print_fn(f"    *** LORRAX SANITY: {_pool.disagreement} ***")
-		# Label the line by the LIVE backend.  On a CPU-backend run that
-		# lands on a GPU node (JAX_PLATFORMS=cpu with SLURM still exporting
-		# CUDA_VISIBLE_DEVICES) the nvidia-smi fallback reads a GPU this
-		# run never used, so calling it a "GPU high-water mark" would be a
-		# statement about another job.
-		# ``budget_gb`` is 0 when no device memory could be detected (the CPU
-		# backend reaches this line too).  Print "n/a" rather than divide.
-		_pct = (f"{100 * peak_gb / budget_gb:.0f}%" if budget_gb > 0
-		        else "budget unknown")
-		if str(_backend).strip().lower() in ("gpu", "cuda", "rocm"):
-			_src = ("XLA arena" if _pool.peak_source == "arena"
-			        else "nvidia-smi whole-GPU sample")
-			print_fn(f"    GPU high-water mark: {peak_gb:.2f} GB / "
-			         f"{budget_gb:.2f} GB budget ({_pct})  "
-			         f"[source: {_src}]{_caveat}")
-		else:
-			print_fn(f"    ζ-fit high-water mark: {peak_gb:.2f} GB / "
-			         f"{budget_gb:.2f} GB budget ({_pct})  [backend="
-			         f"{_backend}: this figure comes from the device "
-			         f"memory-stats/nvidia-smi tracker and is NOT this "
-			         f"run's host RSS — use LORRAX_DEBUG_PRINT=1 for that]")
-
-	# Default: no transverse-channel ψ to surface to the caller.
+	(peak_bytes, _trunc) = _fit_charge_zeta_channel(
+	    _band_norms, _provenance, _reuse_charge, _write_ibz_only_charge, _zeta_cutoff,
+	    band_range_left, band_range_right, centroid_indices, cfg, chunks, k_unfold_plan,
+	    mesh_xy, meta, print_fn, psi_mun_parent, psi_nmu_parent, representation, sym, wfn,
+	    zeta_h5_path)
+	_report_zeta_fit_peak(
+	    cfg, mem_est, peak_bytes, print_fn)
 	transverse_wfn_data = None
-
-	# ── Bispinor: fit ζ^{μ_L=1,2,3} on the current-density centroid set ──
-	# Same kernel as the charge channel, swapping in the γ̃^i vertex.  The
-	# automatic coupled schedule shares the expensive face transform; its
-	# capacity fallback makes three sequential calls.  Output paths follow the
-	# convention zeta_q_mu{1,2,3}.h5 next to zeta_q.h5.
-	#
-	# Loud-fail guard: if cfg.bispinor=True the transverse ζ fit MUST run,
-	# otherwise downstream V_q silently falls back to scalar V_q and then
-	# crashes on a full-BZ vs IBZ shape mismatch (ζ_T written by bispinor
-	# mode is full-BZ; scalar V_q expects IBZ-only).  See the 2026-05-14
-	# CrI3 30 Ry test-bed KNOWN_SANDBOX_ERRORS entry.  The
-	# missing-centroids_file_current refusal itself now lives in the
-	# bispinor PRE-FLIGHT above (before the charge fit), so this branch
-	# gate is only reachable with the path present.
-	if cfg.bispinor and getattr(cfg.paths, 'centroids_file_current', None):
-		print_fn(f"\n  [bispinor] resolving ζ^{{μ_L=1,2,3}} on current-density "
-		         f"centroids: {cfg.paths.centroids_file_current}")
-		# ``meta_T``, the centroid table and its μ padding were built ONCE
-		# in the bispinor pre-flight (they are inputs to the ζ-reuse
-		# decision, which runs before the charge fit).
-		meta_curr = _meta_T
-		cents_curr_idx = _cent_T_idx
-		transverse_wfn_data = _transverse_wfn_data(
-			wfn, sym, meta_curr, cents_curr_idx, cfg, mesh_xy,
-			band_slices,
-			(_chunks_T['band_chunk'] if _chunks_T is not None
-			 else zeta_contract.loader_band_chunk),
-			k_chunk_size=(
-				_chunks_T['centroid_k_chunk']
-				if _chunks_T is not None
-				else zeta_contract.loader_k_chunk))
-		parent_T = transverse_wfn_data['green_parent']
-
-		# Per-channel cache hygiene.  The 2026-05-04 bispinor branch needed
-		# ``jax.clear_caches()`` here because the original ζ-fit cached
-		# functions closed over tracers from the enclosing jit (the
-		# UnexpectedTracerError surface).  After the 2026-05-08 open-spin
-		# consolidation (commit ce28d50), the cached helpers only capture
-		# static config (Mesh, shape, kgrid) — no tracer leaks remain.
-		#
-		# Keeping the surgical drop on ``_fit_one_rchunk_cache`` (whose
-		# cache key includes ``id(psi_G_store)`` and would never hit
-		# across channels anyway — drop = memory hygiene, not a workaround).
-		# The pair-density caches are intentionally preserved so the three
-		# transverse channels share the same n_rmu=n_rmu_current compile.
-		import gc
-		from isdf import core as _isdf_core
-
-		def _drop_traced_caches():
-			_isdf_core._fit_one_rchunk_cache.clear()
-			gc.collect()
-
-		def _drain_coupled_rank_findings(mu_L, stage):
-			# The services are process-global.  The coupled schedule serializes
-			# this callback with the corresponding preparation/solve so a
-			# deferred finding can never be attributed to the next current.
-			# Stay silent on the overwhelmingly common empty path; the accepted
-			# per-channel gate below still emits its canonical final banner.
-			if spectral_closure.pending() or rank_criterion.pending():
-				_gate_fresh_zeta_rank_findings(
-					f"the μ_L={mu_L} transverse ζ fit's {stage}",
-					transverse=True, print_fn=print_fn)
-
-		def _fit_transverse_channel(mu_L, coordinator=None):
-			zeta_mu_path = _zeta_T_paths[mu_L]
-			if _reuse_T[mu_L - 1]:
-				print_fn(f"  [zeta reuse] μ_L={mu_L} accepted at "
-				         f"{zeta_mu_path}; fit skipped independently.")
-				return
-			print_fn(f"  [bispinor] μ_L={mu_L} → {zeta_mu_path}")
-			with timing.section(f"gw_jax.zeta_fit_chunked_mu{mu_L}"), \
-			     jax_profile.trace_section(f"zeta_fit_mu{mu_L}"):
-				fit_zeta_to_h5(
-					wfn=wfn, sym=sym, meta=meta_curr,
-					centroid_indices=cents_curr_idx,
-					mesh_xy=mesh_xy,
-					chunk_r=_chunks_T['chunk_r'], output_file=zeta_mu_path,
-					k_unfold_plan=parent_T.plan,
-					psi_nmu_parent=parent_T.psi_nmu,
-					psi_mun_parent=parent_T.psi_mun,
-					band_chunk_size=_chunks_T['band_chunk'],
-					q_chunk_size=_chunks_T['q_chunk'],
-					bispinor=True,
-					band_range_left=band_range_left,
-					band_range_right=band_range_right,
-					band_norms=_band_norms,
-					distributed_cholesky=cfg.backend.distributed_cholesky,
-					distributed_lu=cfg.backend.distributed_lu,
-					distrib_la_batched_route=_transverse_batched_route,
-					zeta_ridge=cfg.backend.zeta_ridge,
-					distributed_zeta_solve=cfg.backend.distributed_zeta_solve,
-					transverse_zeta_solve=cfg.backend.transverse_zeta_solve,
-					transverse_zeta_rcond=cfg.backend.transverse_zeta_rcond,
-					gflat_chunk_size=int(_chunks_T.get('gflat_chunk_size', 0)),
-					cache_psi_r=bool(_chunks_T.get('cache_psi_r', True)),
-					cache_face_y_blocks=bool(
-						_chunks_T.get('cache_face_y_blocks', False)),
-					vertex_mu_L=mu_L,
-					bispinor_lift=(representation.current_lift or "raw"),
-					# Transverse ζ IBZ-write activates whenever the
-					# bispinor V_q orchestrator iterates IBZ q's — same
-					# gate the charge ζ uses,
-					# resolved once in the pre-flight so the provenance
-					# stamp and this call cannot disagree.
-					# Orbit-closure of the transverse centroid set is
-					# checked downstream in ``fit_zeta_to_h5``; failure
-					# is loud per the bispinor IBZ requirement.
-					write_ibz_only=_write_ibz_only_transverse,
-					zeta_cutoff_ry=_zeta_cutoff,
-					_coupled_mu123_coordinator=coordinator,
-					_coupled_rank_gate=(
-						(lambda stage: _drain_coupled_rank_findings(
-							mu_L, stage))
-						if coordinator is not None else None),
-					_spill_coupled_gflat_to_host=bool(
-						coordinator is not None),
-					_stack_coupled_solve_inputs=coordinator is not None,
-					print_fn=print_fn,
-				)
-			_gate_fresh_zeta_rank_findings(
-				f"the μ_L={mu_L} transverse ζ fit's rank truncation",
-				transverse=True, print_fn=print_fn)
-			# Stamp this ζ_T so a later run can reuse it — same ordering
-			# and same truncating-knob veto as the charge stamp above
-			# (fit → mark_zeta_done → stamp; a run killed between the
-			# last two leaves a complete-but-unstamped file, which
-			# ``_zeta_reuse_ok`` refits).  The μ_L loop was previously
-			# unstamped altogether, which is why bispinor ζ from before
-			# 2026-08-04 is never reusable.
-			if not _trunc and jax.process_index() == 0:
-				try:
-					from file_io.isdf_header import stamp_fit_provenance
-					stamp_fit_provenance(zeta_mu_path, _provenance_T(mu_L))
-				except Exception as exc:
-					print_fn(f"    [zeta provenance] μ_L={mu_L} not stamped "
-					         f"({exc}); this ζ_T will be refit on the next "
-					         f"run.")
-			barrier(f"zeta_provenance_mu{mu_L}")
-			if coordinator is not None:
-				coordinator.finish_channel(mu_L)
-
-		with timing.section("gw_jax.zeta_fit_transverse"):
-			if _coupled_mu123_enabled:
-				print_fn(
-					"  [bispinor] coupled μ_L=1,2,3 transverse Zq: one "
-					"shared face transform per r chunk; the three solves, write, and "
-					"provenance remain ordered μ_L=1→2→3")
-				_drop_traced_caches()
-				_coordinator = _CoupledMu123ZqCoordinator()
-				_errors = {}
-				_errors_lock = threading.Lock()
-
-				def _run_coupled_channel(mu_L):
-					try:
-						_fit_transverse_channel(mu_L, _coordinator)
-					except BaseException as exc:
-						with _errors_lock:
-							_errors.setdefault(mu_L, exc)
-						_coordinator.abort(exc)
-
-				_threads = []
-				_setup_exc = None
-				try:
-					# Starting each successor only after its predecessor has
-					# reached the r-loop keeps all preparation collectives in the
-					# exact accepted μ order on every process.
-					for mu_L in (1, 2, 3):
-						_thread = threading.Thread(
-							target=_run_coupled_channel, args=(mu_L,),
-							name=f"lorrax-zq-mu{mu_L}", daemon=False)
-						_thread.start()
-						_threads.append(_thread)
-						_coordinator.wait_channel_prepared(mu_L)
-					_coordinator.release_channels()
-				except BaseException as exc:
-					_setup_exc = exc
-					_coordinator.abort(exc)
-				finally:
-					for _thread in _threads:
-						_thread.join()
-				if _errors:
-					raise _errors[min(_errors)]
-				if _setup_exc is not None:
-					raise _setup_exc
-			else:
-				for mu_L in (1, 2, 3):
-					if not _reuse_T[mu_L - 1]:
-						_drop_traced_caches()
-					_fit_transverse_channel(mu_L)
-
+	if cfg.bispinor and getattr(cfg.paths, "centroids_file_current", None):
+	    (transverse_wfn_data) = _fit_transverse_zeta_channels(
+	        _band_norms, _cent_T_idx, _chunks_T, _coupled_mu123_enabled, _meta_T, _provenance_T,
+	        _reuse_T, _transverse_batched_route, _trunc, _write_ibz_only_transverse, _zeta_T_paths,
+	        _zeta_cutoff, band_range_left, band_range_right, band_slices, cfg, mesh_xy, print_fn,
+	        representation, sym, wfn, zeta_contract)
 	return zeta_h5_path, mem_est, transverse_wfn_data
 
 
