@@ -2490,3 +2490,13 @@ remain resolved. Production callers use all defaults.
     # the deck never wrote.
     # Parse optional QE K_POINTS block
 ```
+### 2026-09-06 — both low_mem_bands values select parent ψ shardings
+
+The owner supersedes the temporary false-to-true coercion: `true` selects
+`face`, and `false` selects `axis`, for every spinor extent and both centroid
+families. The same ParentGreenCarrier holds two packed raw-parent copies;
+its static layout chooses their band sharding and the distrib_la matmul plan.
+The Green builder and two-GEMM band projector are shared. Axis band contractions
+have no collectives; projection of the tiled centroid operator retains the X/Y
+centroid reduce-scatter operations and existing final psums. Canonical files
+remain independent of processor grid and can be read into either layout.

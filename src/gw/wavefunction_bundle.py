@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC
+from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC, psi_specs
 from file_io.wfn_basis import WavefunctionBasisReceipt
 
 
@@ -217,7 +217,7 @@ CHI_R_SPEC = P(None, 'x', 'y')
 
 #: Valid ``Wavefunctions.layout`` tags.  Anything else refuses at
 #: construction (:meth:`Wavefunctions.__post_init__`).
-_LAYOUTS = ('face',)
+_LAYOUTS = ('face', 'axis')
 
 
 @dataclass
@@ -236,6 +236,18 @@ class ParentGreenCarrier:
     enk: jax.Array
     occ: jax.Array
     plan: object
+    layout: str = 'face'
+
+    def __post_init__(self):
+        """Validate the static layout independently of the spinor extent."""
+        psi_specs(self.layout)
+
+    def projection_faces(self):
+        """Orient the existing copies along the operator's contracted centroid axes."""
+        if self.layout == "axis":
+            return (self.psi_mun.transpose(0, 3, 1, 2),
+                    self.psi_nmu.transpose(0, 2, 3, 1))
+        return self.psi_nmu, self.psi_mun
 
     @functools.partial(jax.jit, static_argnames=('bands',))
     def band_mask(self, bands: slice) -> jax.Array:
@@ -249,7 +261,7 @@ class ParentGreenCarrier:
 jax.tree_util.register_dataclass(
     ParentGreenCarrier,
     data_fields=['psi_nmu', 'psi_mun', 'enk', 'occ'],
-    meta_fields=['plan'],
+    meta_fields=['plan', 'layout'],
 )
 
 
@@ -334,7 +346,7 @@ def face_extents(wfns: "Wavefunctions") -> tuple[int, int, int]:
     sizes itself by comes through here, so a parents-only bundle looks to
     the factories exactly like a full-k one.
     """
-    if wfns.layout != "face":
+    if wfns.layout not in _LAYOUTS:
         raise ValueError(
             f"face_extents: layout={wfns.layout!r} carries no face.")
     if wfns.psi_mun is not None:
@@ -361,7 +373,7 @@ def face_kernel_kwargs(wfns: "Wavefunctions", wfns_right=None) -> dict:
     nk_r, s_r, mu_r = face_extents(wfns_right)
     left_shape = (nk, wfns.slices.nb_full, mu, s)
     right_shape = (nk_r, wfns_right.slices.nb_full, mu_r, s_r)
-    result = {"layout": "face", "face_shape": left_shape}
+    result = {"layout": wfns.layout, "face_shape": left_shape}
     if right_shape != left_shape:
         result["right_face_shape"] = right_shape
     return result
@@ -385,7 +397,7 @@ def green_face_kernel_kwargs(wfns: "Wavefunctions") -> dict:
             "green_face_kernel_kwargs: parent face orientations disagree: "
             f"{parent.psi_mun.shape}/{parent.psi_nmu.shape}.")
     return {
-        "layout": "face",
+        "layout": parent.layout,
         "face_shape": (nk, nb, nmu, ns),
         "k_unfold_plan": parent.plan,
     }
@@ -423,16 +435,14 @@ def parent_sigma_operands(wfns: "Wavefunctions"):
     if carrier is None:
         raise ValueError(
             "parent_sigma_operands: the bundle carries no parent carrier.")
-    mesh = carrier.plan.mesh_xy
-    green_mun = jax.device_put(carrier.psi_mun, NamedSharding(mesh, P(None, None, "x", None)))
-    green_nmu = jax.device_put(carrier.psi_nmu, NamedSharding(mesh, P(None, None, None, "y")))
-    return (green_mun, green_nmu,
-            carrier.psi_nmu, carrier.psi_mun,
+    proj_nmu, proj_mun = carrier.projection_faces()
+    return (carrier.psi_mun, carrier.psi_nmu, proj_nmu, proj_mun,
             carrier.enk, carrier.occ)
 
 
+
 def parent_faces(
-    psi_rmu_Y_parent, psi_rmuT_X_parent, *, mesh_xy: Mesh,
+    psi_rmu_Y_parent, psi_rmuT_X_parent, *, mesh_xy: Mesh, layout='face',
 ) -> tuple[jax.Array, jax.Array]:
     """Raw-parent loader outputs as the two face layouts.
 
@@ -440,12 +450,13 @@ def parent_faces(
     full-k load, on ``n_parent`` rows.  The loader already sampled the run's
     packed centroid order, so nothing is permuted here.
     """
+    nmu_spec, mun_spec = psi_specs(layout)
     with mesh_xy:
         psi_nmu = jax.lax.with_sharding_constraint(
-            psi_rmu_Y_parent, NamedSharding(mesh_xy, PSI_NMU_SPEC))
+            psi_rmu_Y_parent, NamedSharding(mesh_xy, nmu_spec))
         psi_mun = jax.lax.with_sharding_constraint(
             jnp.conj(psi_rmuT_X_parent).transpose(0, 3, 1, 2),
-            NamedSharding(mesh_xy, PSI_MUN_SPEC))
+            NamedSharding(mesh_xy, mun_spec))
     return psi_nmu, psi_mun
 
 
@@ -454,9 +465,7 @@ def build_packed_parent_green_carrier(
     mesh_xy: Mesh,
 ) -> ParentGreenCarrier:
     """Bind raw-parent faces to the full-k bundle's scalar tables."""
-    if wfns.layout != "face":
-        raise ValueError(
-            "build_packed_parent_green_carrier requires canonical face layout.")
+    nmu_spec, mun_spec = psi_specs(wfns.layout)
     expected_nmu = (
         int(plan.n_parent), int(wfns.slices.nb_full), int(plan.nspinor),
         int(plan.n_centroid_packed))
@@ -473,16 +482,17 @@ def build_packed_parent_green_carrier(
             f"{psi_mun_parent.shape} != {expected_mun}.")
     with mesh_xy:
         psi_nmu = jax.lax.with_sharding_constraint(
-            psi_nmu_parent, NamedSharding(mesh_xy, PSI_NMU_SPEC))
+            psi_nmu_parent, NamedSharding(mesh_xy, nmu_spec))
         psi_mun = jax.lax.with_sharding_constraint(
-            psi_mun_parent, NamedSharding(mesh_xy, PSI_MUN_SPEC))
+            psi_mun_parent, NamedSharding(mesh_xy, mun_spec))
         enk = plan.parent_rows(wfns.enk)
         occ = plan.parent_rows(wfns.occ)
         rep2 = NamedSharding(mesh_xy, P(None, None))
         enk = jax.lax.with_sharding_constraint(enk, rep2)
         occ = jax.lax.with_sharding_constraint(occ, rep2)
     return ParentGreenCarrier(
-        psi_nmu=psi_nmu, psi_mun=psi_mun, enk=enk, occ=occ, plan=plan)
+        psi_nmu=psi_nmu, psi_mun=psi_mun, enk=enk, occ=occ, plan=plan,
+        layout=wfns.layout)
 
 
 def attach_packed_parent_green_carrier(
@@ -502,7 +512,7 @@ def attach_parent_green_carrier(
 ) -> "Wavefunctions":
     """Attach raw-parent loader outputs to a face bundle."""
     psi_nmu, psi_mun = parent_faces(
-        psi_rmu_Y_parent, psi_rmuT_X_parent, mesh_xy=mesh_xy)
+        psi_rmu_Y_parent, psi_rmuT_X_parent, mesh_xy=mesh_xy, layout=wfns.layout)
     return attach_packed_parent_green_carrier(
         wfns, psi_nmu, psi_mun, plan=plan, mesh_xy=mesh_xy)
 
@@ -567,7 +577,7 @@ def _build_occ(enk_full, slices, efermi):
 
 def build_wavefunctions_face(
     psi_rmu_Y, psi_rmuT_X, *, enk_full, slices, mesh_xy, efermi=None,
-    basis_receipt=None,
+    basis_receipt=None, layout="face",
 ) -> Wavefunctions:
     """Assemble canonical faces from direct Y samples and conjugated X samples."""
     with mesh_xy:
@@ -584,7 +594,7 @@ def build_wavefunctions_face(
 
     wfns = Wavefunctions(
         psi_nmu=psi_nmu, psi_mun=psi_mun,
-        enk=enk_full, occ=occ_full, slices=slices, layout="face")
+        enk=enk_full, occ=occ_full, slices=slices, layout=layout)
     if basis_receipt is not None:
         basis_receipt.assert_matches_carrier(
             wfns, where="build_wavefunctions_face")
@@ -593,7 +603,7 @@ def build_wavefunctions_face(
 
 def wavefunctions_face_from_restart(
     psi_nmu, psi_mun, *, enk_full, slices, mesh_xy, efermi=None,
-    basis_receipt=None,
+    basis_receipt=None, layout="face",
 ) -> Wavefunctions:
     """Assemble the ``layout="face"`` bundle from arrays ALREADY read at
     their face specs (``file_io.load_restart_state_from_h5``,
@@ -612,7 +622,7 @@ def wavefunctions_face_from_restart(
 
     wfns = Wavefunctions(
         psi_nmu=psi_nmu, psi_mun=psi_mun,
-        enk=enk_full, occ=occ_full, slices=slices, layout="face")
+        enk=enk_full, occ=occ_full, slices=slices, layout=layout)
     if basis_receipt is not None:
         basis_receipt.assert_matches_carrier(
             wfns, where="wavefunctions_face_from_restart")
@@ -872,7 +882,7 @@ def _rotate_parent_carrier(carrier, U_placed, *, a_lo, nb_active, nb_full,
 def project(psi_xr, psi_yn, sigma_k, *, layout='face', mesh_xy=None,
            face_shape=None, right_face_shape=None, face_project_fn=None):
     """Project a centroid operator through the shared canonical face contraction."""
-    if layout != 'face':
+    if layout not in _LAYOUTS:
         raise ValueError(
             f"project: layout must be 'face', got {layout!r}")
     fn = face_project_fn
@@ -884,6 +894,6 @@ def project(psi_xr, psi_yn, sigma_k, *, layout='face', mesh_xy=None,
                 "(see common.contract_bands.contract_bands_block_reshard)")
         from common.contract_bands import contract_bands_block_reshard
         fn = contract_bands_block_reshard(
-            mesh_xy, layout='face', face_shape=face_shape,
+            mesh_xy, layout=layout, face_shape=face_shape,
             right_face_shape=right_face_shape)
     return fn(psi_xr, sigma_k, psi_yn)

@@ -2648,11 +2648,7 @@ def _input_iteration(
 
 def _input_memory_group(
         _named_keys, chunk_utilization, memory_per_device_gb, params, print_fn):
-    """Produce face-route memory settings with the retained deck-key warning."""
-    if not bool(params["low_mem_bands"]):
-        print_fn(
-            "[config provenance] WARNING: low_mem_bands = false: the full-k carrier no longer "
-            "exists; proceeding on raw parents.")
+    """Resolve the requested parent layout and memory settings."""
     memory = MemoryConfig(
         per_device_gb=memory_per_device_gb,
         chunk_target_utilization=chunk_utilization,
@@ -2660,7 +2656,7 @@ def _input_memory_group(
         r_chunk_override=int(params["r_chunk_size"]),
         gflat_chunk_size=int(params["gflat_chunk_size"]),
         vq_g_chunk_size=int(params["vq_g_chunk_size"]),
-        low_mem_bands=True,
+        low_mem_bands=bool(params["low_mem_bands"]),
         low_mem_bands_provenance=(
             "deck" if "low_mem_bands" in _named_keys else "default"),
     )
@@ -3336,12 +3332,6 @@ def packed_static_envelope(config, *, screened: bool):
            "the packed response facade has only the distributed plan", None)
     if not screened:
         return
-    yield (bool(config.memory.low_mem_bands), "low_mem_bands = false",
-           "low_mem_bands = true", _ENV_IMPL,
-           "the sixteen-block no-pair chi0 kernel is written against the "
-           "face layout only.  DERIVED: an unnamed low_mem_bands is set to "
-           "true for this mode at parse time, so this row can only fire on "
-           "an explicit conflicting value", "low_mem_bands")
     _overrides = scalar_head_overrides_named(config)
     yield (not _overrides, ", ".join(_overrides),
            "no scalar q->0 head override named", _ENV_IMPL,

@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from .band_extrapolation import BandBracketPlan
 
 
-def _face_g_plan(mesh_xy: Mesh, face_shape):
+def _face_g_plan(mesh_xy: Mesh, face_shape, layout="face"):
     """One ``distrib_la.gemm_plan`` for a face-layout G build, at the shape
     ``greens_function_kernel._build_G_face`` requires — mirrors
     ``cohsex_sigma._make_cohsex_kernels_face``'s identical construction
@@ -55,7 +55,7 @@ def _face_g_plan(mesh_xy: Mesh, face_shape):
     nk, nb_full, n_rmu, ns = (int(v) for v in face_shape)
     mu_s = n_rmu * ns
     return gemm_plan(mesh_xy, m=mu_s, k=nb_full, n=mu_s, nq=nk,
-                     dtype=jnp.complex128)
+                     dtype=jnp.complex128, layout=layout)
 
 
 @dataclass(frozen=True)
@@ -614,7 +614,7 @@ def _compute_invalid_static_sigma(
         mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
     s = wfns.slices
     g_plan = _face_g_plan(
-        mesh_xy, (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]))
+        mesh_xy, (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]), layout=wfns.layout)
     (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
     g_carrier = wfns.green_parent
 
@@ -640,7 +640,7 @@ def _compute_invalid_static_sigma(
         phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
         phases = k_unfold_plan.parent_rows(phases)
         G_occ = build_G(g_mun, g_nmu, phases=phases,
-                        layout="face", gemm=g_plan,
+                        layout=wfns.layout, gemm=g_plan,
                         k_unfold_plan=k_unfold_plan)
         sig_sx = spatial.conv_project(psi_xr, psi_yn, G_occ, W_prep)
         sx_host = np.asarray(strip_sigma_window(
@@ -651,7 +651,7 @@ def _compute_invalid_static_sigma(
 
         mask = g_carrier.band_mask(s.sigma_sum).astype(jnp.complex128)
         G_ri = build_G(g_mun, g_nmu, phases=mask,
-                       layout="face", gemm=g_plan,
+                       layout=wfns.layout, gemm=g_plan,
                        k_unfold_plan=k_unfold_plan)
         sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
         ri_host = np.asarray(strip_sigma_window(
@@ -719,7 +719,7 @@ def _invalid_static_coh_by_bracket(
         mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
     s = wfns.slices
     g_plan = _face_g_plan(
-        mesh_xy, (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]))
+        mesh_xy, (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]), layout=wfns.layout)
     (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
     g_carrier = wfns.green_parent
 
@@ -738,7 +738,7 @@ def _invalid_static_coh_by_bracket(
             mask = g_carrier.band_mask(
                 slice(int(lo), int(hi))).astype(jnp.complex128)
             G_ri = build_G(g_mun, g_nmu, phases=mask,
-                           layout="face", gemm=g_plan,
+                           layout=wfns.layout, gemm=g_plan,
                            k_unfold_plan=k_unfold_plan)
             sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
             ri_host = np.asarray(strip_sigma_window(

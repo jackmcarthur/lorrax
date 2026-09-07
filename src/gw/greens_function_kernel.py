@@ -19,17 +19,6 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None):
             "build_G(layout='face'): left psi_mun and right psi_nmu must "
             "share (nk, nb, nspinor); got "
             f"{psi_mun.shape} and {psi_nmu.shape}.")
-    if gemm is None:
-        from common.shard_map import shard_map
-        from jax.sharding import PartitionSpec as P
-        @partial(shard_map, mesh=mesh,
-                   in_specs=(P(None, None, 'x', None), P(None, None, None, 'y'), P()),
-                   out_specs=P(None, None, 'x', None, 'y'), check_vma=False)
-        def contract(left, right, weights):
-            return jnp.einsum('ksmn,kntr->ksmtr',
-                              left * weights[:, None, None, :], jnp.conj(right))
-        weights = jnp.ones((nk_, n_), dtype=psi_mun.dtype) if phases is None else phases
-        return contract(psi_mun, psi_nmu, weights)
     A = merge_spin_centroid(psi_mun, 1, 2)          # (nk, mu*s, n) P(_,'x','y')
     if phases is not None:
         w = phases.astype(A.dtype)                  # (nk, n)
@@ -38,9 +27,8 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None):
     # Eager operations may erase singleton mesh axes before the GEMM boundary.
     from jax import lax
     from jax.sharding import NamedSharding, PartitionSpec as P
-    sharding = NamedSharding(gemm.mesh, P(None, 'x', 'y'))
-    A = lax.with_sharding_constraint(A, sharding)
-    B = lax.with_sharding_constraint(B, sharding)
+    A = lax.with_sharding_constraint(A, gemm.in_sharding_a)
+    B = lax.with_sharding_constraint(B, gemm.in_sharding_b)
     G_flat = gemm(A, B)                              # (nk, mu*s, mu*s) P(_,'x','y')
     G = split_spin_centroid(G_flat, 1, s_, mu_l_)
     G = split_spin_centroid(G, 3, s_, mu_r_)
@@ -50,7 +38,7 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None):
 def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
            gemm=None, k_unfold_plan=None, right_k_unfold_plan=None, real_weights=None):
     """Build parent operators and transport both typed endpoints without processor exchange."""
-    if layout != 'face' or (gemm is None and k_unfold_plan is None):
+    if layout not in ('face', 'axis') or gemm is None:
         raise ValueError("build_G requires canonical faces and a GEMM plan or typed parent plan.")
     G = _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases,
                       mesh=None if k_unfold_plan is None else k_unfold_plan.mesh_xy)

@@ -109,12 +109,12 @@ def _make_project_ri_reduce_scatter(
 
     if k_unfold_plan is None or face_shape is None:
         raise ValueError("Sigma projection requires canonical face shapes and a typed parent unfold plan.")
-    if layout != "face" or not merged_x:
+    if layout not in ("face", "axis") or not merged_x:
         raise ValueError(
             "_make_project_ri_reduce_scatter(k_unfold_plan=...) requires the "
             "face layout and the merged single-complex projection chain.")
     inner = contract_bands_block_reshard(
-        mesh_xy, channels="none", layout="face",
+        mesh_xy, channels="none", layout=layout,
         face_shape=(k_unfold_plan.n_parent, *face_shape[1:]),
         face_band_extent=face_band_extent)
     k_rows = np.asarray(k_unfold_plan.parent_full_rows, dtype=np.int32)
@@ -301,7 +301,7 @@ def _get_sigma_kij_kernel(
     k_unfold_plan=None,
 ) -> Callable[..., jax.Array]:
     """Build Green functions with band-range masks and contract each bracket against one prepared W."""
-    if layout != "face" or face_shape is None or k_unfold_plan is None:
+    if layout not in ("face", "axis") or face_shape is None or k_unfold_plan is None:
         raise ValueError("Sigma tau requires canonical face shapes and a typed parent unfold plan.")
     from ffi import ffi_dial_key
     key = (id(mesh_xy), tuple(map(int, kgrid)), _stage_timing_enabled(),
@@ -318,21 +318,26 @@ def _get_sigma_kij_kernel(
         layout=layout, face_shape=face_shape,
         face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan)
 
+    from distrib_la import gemm_plan
+    _, nb, mu, ns = face_shape
+    g_plan = gemm_plan(mesh_xy, m=mu * ns, k=nb, n=mu * ns,
+                       nq=k_unfold_plan.n_parent, dtype=jnp.complex128, layout=layout)
+
     def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t):
         """Apply boolean identity masks or signed occupation weights without clipping."""
         if sel.dtype == jnp.bool_:
             if energy_windows:
                 return build_G_tau(
                     xn, yr, E, 1j * t, e_ref=ref, mask=sel,
-                    E_min=E_min, E_max=E_max, layout=layout, k_unfold_plan=k_unfold_plan)
+                    E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan, k_unfold_plan=k_unfold_plan)
             return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, mask=sel,
-                               layout=layout, k_unfold_plan=k_unfold_plan)
+                               layout=layout, gemm=g_plan, k_unfold_plan=k_unfold_plan)
         if energy_windows:
             return build_G_tau(
                 xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
-                E_min=E_min, E_max=E_max, layout=layout, k_unfold_plan=k_unfold_plan)
+                E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan, k_unfold_plan=k_unfold_plan)
         return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
-                           layout=layout, k_unfold_plan=k_unfold_plan)
+                           layout=layout, gemm=g_plan, k_unfold_plan=k_unfold_plan)
 
     def _bracketed_face(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                         E_A, mask_A, E_min, E_max, E_ref_A, t_node,
