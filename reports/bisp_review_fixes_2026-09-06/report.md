@@ -13,4 +13,5 @@ Evidence root: `/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/ru
 | 7 | `0cca2900` | `07_service_bootstrap/gate.log`: 38 tests passed | PASS: bare-src imports of all four consumers and distrib_la bootstrap-order census. |
 | 8 | `e224a753` | `08_restart_q_contract/parser.log`: auto/ibz PASS; `retry.log`: 4 collected, 4 setup errors | Parser/doc fix PASS; full closure gate BLOCKED: required CPU `liblorrax_ffi_host.so` absent. CPU fixture preserves its platform rather than attempting a hidden GPU run. |
 | 9 | `af0942bf` | `09_parent_log/mos2/driver.rank0.log`: MoS2 P4 completed | PASS: eqp0/1 identical; ineffective detach block and false release message removed. |
-| 10 | this commit | `10_real_weights/cpu.fused.log`: 42 passed, 7 deselected; `before/` vs `after_fused/`, `comparison.txt` | PASS: Si SOC GN P4 eqp0/1 identical; compile events 622 → 622; real-weight trace has one GEMM. |
+| 10 | `cdbe1f27` | `10_real_weights/cpu.fused.log`: 42 passed, 7 deselected; `before/` vs `after_fused/`, `comparison.txt` | PASS: Si SOC GN P4 eqp0/1 identical; compile events 622 → 622; real-weight trace has one GEMM. |
+| 11 | this commit | `11_local_gemm_donation/gate.log`: 30 distrib_la CPU tests passed | PASS: beta-zero out buffer remains live, result correct, no donation warning. |

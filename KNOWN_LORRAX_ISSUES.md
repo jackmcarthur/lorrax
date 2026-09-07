@@ -18,3 +18,4 @@
 | 9 | `src/gw/gw_jax.py:708,475`, `docs/architecture/decisions.md:971` | Fixed: removed ineffective detach and unused local carrier reference; documentation says the shared carrier stays resident. |
 | 10 | `src/gw/greens_function_kernel.py:168`, static Σ callers | Fixed: real occupation dtype is enforced, static real weights exclude the second GEMM at tracing, and complex band weights preserve their imaginary part. Si P4 eqp and compile-count gate passes. |
 | CPU gate exclusions | `tests/test_windowed_exp_iEt.py`, `tests/test_sigma_fermi_split.py` | Three existing refusal-regex expectations still name the pre-merge Green API; four static-kernel cells need absent `liblorrax_ffi_host.so`. Listed in `10_real_weights/cpu.log`; excluded by name from the 42-pass focused rerun. |
+| 11 | `services/distrib_la/src/distrib_la/matmul_plan.py:558` | Fixed: local beta-zero GEMM does not donate the ignored addend; actual out-buffer liveness and numerics tested. |

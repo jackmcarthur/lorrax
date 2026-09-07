@@ -221,3 +221,23 @@ def test_local_gemm_plan_contracts_random_complex_operands(reduction_axis):
                   jax.device_put(b, plan.in_sharding_b))
     np.testing.assert_allclose(np.asarray(result), a @ b, atol=1e-12, rtol=0)
     assert result.sharding == plan.out_sharding
+
+
+def test_local_beta_zero_keeps_out_live_without_donation_warning():
+    """The ignored beta-zero addend remains live and emits no donation warning."""
+    import warnings
+    import jax
+    mesh = _mesh()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        plan = D.local_gemm_plan(mesh, m=4, k=4, n=4, nq=1,
+                                 dtype="complex128", beta=0)
+        a = jax.device_put(np.ones((1, 4, 4), np.complex128), plan.in_sharding_a)
+        b = jax.device_put(np.ones((1, 4, 4), np.complex128), plan.in_sharding_b)
+        out = jax.device_put(np.full((1, 4, 4), 17+0j), plan.out_sharding)
+        result = plan(a, b, out=out)
+        result.block_until_ready()
+    assert not out.is_deleted()
+    np.testing.assert_array_equal(np.asarray(out), 17)
+    np.testing.assert_array_equal(np.asarray(result), 4)
+    assert not [w for w in caught if "donat" in str(w.message).lower()]

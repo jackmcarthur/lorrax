@@ -382,6 +382,7 @@ class GemmPlan:
         ``C`` (accumulate; required when this plan's ``beta != 0``) and
         ``out`` (a live buffer DONATED purely for its storage when
         ``beta == 0`` — its content is ignored) are mutually exclusive.
+        The local backend leaves `out` live and returns a fresh result.
         With neither, and ``beta == 0``, the zero addend is built inside
         the same compiled call — see the module docstring.
 
@@ -555,7 +556,7 @@ def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
     local = partial(_axis_matmul, alpha=alpha, beta=beta, reduction_axis=reduction_axis)
     with_c = jax.jit(shard_map(local, mesh=mesh,
         in_specs=(a_spec, b_spec, out_spec), out_specs=out_spec,
-        check_vma=False), donate_argnums=(2,))
+        check_vma=False), donate_argnums=(2,) if beta != 0 else ())
     with_c(_zeros((nq, m, k), dtype, a_sh),
            _zeros((nq, k, n), dtype, b_sh),
            _zeros((nq, m, n), dtype, out_sh))
