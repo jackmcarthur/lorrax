@@ -114,10 +114,12 @@
 | `src/isdf/core.py` | `gram_q0_from_pair` | 66 | 31 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/isdf/core.py` | `transverse_gram_q0_from_pair` | 39 | 24 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/isdf/core.py` | `_gram_q0_from_psi_kernel` | 63 | 63 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
-| `src/isdf/core.py` | `gram_q0_from_psi_sm` | 65 | 53 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `gram_q0_from_psi_sm` | 65 | 30 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/isdf/core.py` | `_gram_q0_tiled_from_psi_kernel` | 154 | 146 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
-| `src/isdf/core.py` | `gram_q0_tiled_from_psi_sm` | 88 | 73 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
-| `src/isdf/core.py` | `gram_q0_tiled_from_psi_aot_resident_increment_bytes` | 72 | 65 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `gram_q0_tiled_from_psi_sm` | 88 | 50 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `gram_q0_tiled_from_psi_aot_resident_increment_bytes` | 72 | 58 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `gram_q0_from_psi_aot_peak_bytes` | 48 | 41 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `gram_q0_aot_peak_bytes` | 39 | 32 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/isdf/core.py` | `c_q_from_psi_sm` | 42 | 95 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/isdf/core.py` | `_c_q_legacy` | 122 | 0 | Deleted or renamed to direct owner |
 | `src/isdf/core.py` | `_c_q_face_parent` | 95 | 0 | Deleted or renamed to direct owner |
@@ -173,6 +175,9 @@
 | `src/isdf/core.py` | `solve_zeta._pinv_apply_T_logical._mm` | 2 | 0 | Deleted or renamed to direct owner |
 | `src/isdf/core.py` | `fit_one_rchunk` | 137 | 137 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/isdf/core.py` | `_band_norms_slice` | 21 | 14 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `_gram_gamma_mode` | 0 | 7 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_gram_planning_gamma_mode` | 0 | 8 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_validate_gram_face_shapes` | 0 | 27 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `c_q_downfold` | 0 | 122 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_logical_solvers` | 0 | 39 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_logical_solvers._ridge_indef_solve` | 0 | 7 | New explicit phase/direct owner |
@@ -202,8 +207,8 @@
 | `src/isdf/core.py` | `_solve_zeta_fused_lu` | 0 | 70 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_solve_zeta_fused_lu._dist_ridged_lu` | 0 | 27 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_solve_zeta_fused_lu._run_lu` | 0 | 8 | New explicit phase/direct owner |
-| `src/isdf/core.py` | Docstring lines / share | 1365 / 23.41% | 107 / 2.32% | Owner: docs/architecture/zeta_fit_face_psi_cct.md |
-| `src/isdf/core.py` | **File total** | 5831 | 4604 | Net -1227 lines |
+| `src/isdf/core.py` | Docstring lines / share | 1365 / 23.41% | 110 / 2.40% | Owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | **File total** | 5831 | 4585 | Net -1246 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -625,7 +630,7 @@
 
 | Tree scope | Before | After | Net |
 |---|---|---|---|
-| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119611 | -5636 |
+| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119592 | -5655 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
@@ -645,7 +650,8 @@
 | 14 — restore low_mem_bands and two-layout planner dispatch (a9560071) | 1413 | 474 passed, 2 skipped, 1 xfailed, 102 warnings in 187.73s (0:03:07) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-201643-544166-5522, lx-Xg4-201649-544831-8820; 34_restore_layout/cpu/cpu.xml; 34_restore_layout/p4/mos2/identity.json |
 | 15 — revert writer extraction exposed by fresh fitting (fe51b102) | 1414 | 455 passed, 2 skipped, 1 xfailed, 102 warnings in 192.85s (0:03:12) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-202436-590723-1370, lx-Xg4-202604-591455-1706; 39_writer_revert_corrected/cpu/cpu.xml; 39_writer_revert_corrected/p4/mos2/identity.json |
 | 16 — split Sigma dispatch into explicit physics stages (9f2c64d5) | 1416 | 478 passed, 2 skipped, 3 xfailed, 102 warnings in 196.16s (0:03:16); CPU1 13 passed, 1 warning in 3.65s | Si SOC GN exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-202851-614453-8799, lx-Xg4-202906-616745-3091, lx-Xg0-202904-616331-8607; 36_sigma_stages/cpu/cpu.xml; 36_sigma_stages/p4/si_soc/identity.json |
-| 17 — split fresh and restart ISDF initialization stages (this commit) | 1418 | 472 passed, 2 skipped, 1 xfailed, 102 warnings in 190.64s (0:03:10) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-203308-639938-5868, lx-Xg4-203317-641493-1330; 37_initializer_port/cpu/cpu.xml; 37_initializer_port/p4/mos2/identity.json |
+| 17 — split fresh and restart ISDF initialization stages (49d96f1b) | 1418 | 472 passed, 2 skipped, 1 xfailed, 102 warnings in 190.64s (0:03:10) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-203308-639938-5868, lx-Xg4-203317-641493-1330; 37_initializer_port/cpu/cpu.xml; 37_initializer_port/p4/mos2/identity.json |
+| 18 — share Gram face shape and channel refusal rules (this commit) | 1419 | 459 passed, 2 skipped, 1 xfailed, 102 warnings in 194.62s (0:03:14) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-203735-696670-7606, lx-Xg4-203744-697852-1411; 41_gram_shape_rules/cpu/cpu.xml; 41_gram_shape_rules/p4/mos2/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|
