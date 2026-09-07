@@ -1022,3 +1022,1121 @@ because charge and transverse channels use different μ counts.
 	# ``sanity.report_parent_covariance``.  Do NOT tighten the rtol here
 	# to compensate; this statistic is measuring a projection.
 ```
+
+
+## Source contracts relocated during the 2026-09-06 compaction
+
+### `src/gw/head_correction.py` — `<module>`
+
+The q=0, G=G'=0 (Gamma-cell) head of the Coulomb / photon interaction.
+
+A finite k-grid never samples the singular ``q -> 0, G = 0`` slot of ``v``
+or ``W``.  This module owns every way LORRAX fills that slot, for the scalar
+charge channel and for the packed four-current (photon) operator; the
+physics is stated in ``docs/theory/four-current-head-corrections.md`` and the
+``S(omega)`` convention in ``docs/theory/s-tensor-convention.md``.
+
+What the module owns
+--------------------
+
+* **Scalar head resolution** -- :class:`HeadResolver`, :func:`resolve_head_sample`
+  and :func:`build_S_cart_omega`: the ``head_correction`` policy
+  (``full`` / ``no_local_fields`` / ``off``), the head source order
+  (deck overrides, ``epshead``, the ``dipole.h5`` ``S`` tensor), the
+  ``dipole.h5`` coverage and provenance gates, and the memoized per-frequency
+  :class:`HeadSample` ``(v_h, W_h(omega))`` every Sigma route reads.
+* **The Schur fold of head against body** --
+  :func:`fold_cartesian_head_wings_sharded` (scalar ``S_eff = S + Y W Z /
+  Omega``), :func:`fold_small_head_wings_sharded` and
+  :func:`small_head_wing_halves_sharded` (the same fold for one Lorentz block
+  of the packed photon body, wings sharded on the mesh; nothing gathers).
+* **Static COHSEX head terms** -- :class:`StaticHeadTerms` and
+  :func:`compute_static_head_terms`: the exact band-diagonal ``Sigma^X``,
+  ``Sigma^SX``, ``Sigma^(SX-X)``, ``Sigma^COH`` shifts.
+* **Dynamic heads** -- :func:`fit_head_ppm` (GN / HL single pole from two
+  samples) and :func:`compute_complex_pole_head_sigma_diag` (MPA poles on the
+  stamped complex grid).
+* **Rank-1 re-attachment** -- :func:`apply_q0_head_rank1` and
+  :func:`resolve_head_S_cart`: the ``(W_h/Omega) conj(g0) x g0`` update that
+  downstream W consumers (BSE, densifiers) apply to a headless ``W(q=0)``.
+* **The BGW finite-q0 channel** -- :class:`BGWQ0Channel`,
+  :func:`resolve_bgw_q0_channel` (``bgw_metal_q0_treatment``).
+* **The packed static photon Gamma-cell completion** --
+  :func:`static_hall_linear_response` (the unique Hall-only CT/TC tensor from
+  ``sigma_H``), :func:`canonicalize_static_gauge_q2_tensor` and
+  :func:`static_gauge_tensor_residuals` (the in-plane Ward / Hermiticity
+  certificates of a ``(2,2,4,4)`` response), the fixed-size coupled 4x4
+  Dyson/cubature kernel :func:`static_slab_photon_head_moment_chunk`, and
+  :func:`complete_static_slab_photon_q0`, which folds the bounded
+  :class:`gw.static_gauge_response.StaticPhotonHeadResponse` through the
+  headless packed body, solves ``W_h(q) = [1 - D(q) R(q)]^{-1} D(q)`` on the
+  exact slab Wigner-Seitz cubature, and inserts the bare and nine screened
+  rank-4 moments into packed V and W (:func:`gw.photon_layout.
+  add_photon_q0_low_rank`).  Its evidence record
+  :class:`StaticSlabPhotonHeadCompletion` carries the numerical
+  certificates and the bounded factor carrier
+  :class:`StaticPhotonQ0FactorCarrier` that ``gw.photon_sigma`` uses to
+  attribute Sigma per Lorentz sector.  Slab only: a bulk analytic-sphere
+  completion cannot be added after the nonlinear coupled solve and has no
+  derived integrator.
+
+What it does not own
+--------------------
+
+The velocity / ``S`` / wing / Hall producers (``gw.qsgw_head``), the mini-BZ
+estimators and the photon cubature (``vcoul``), the packed layout
+(``gw.photon_layout``), the bare TT head slot (``gw.v_q_bispinor``), and the
+Hall artifact format (``file_io.static_gauge_head``).
+
+### `src/gw/head_correction.py` — `HeadResponseKind`
+
+Reduction state of the response that produced a scalar head.
+
+The distinction is operational, not documentation: ``DIRECT_IRREDUCIBLE``
+still needs the head/body Schur complement for a physical macroscopic W,
+whereas ``MICRO_REDUCIBLE`` already contains that local-field resummation
+and must never be folded again.
+
+### `src/gw/head_correction.py` — `StaticHeadTerms`
+
+Exact static q=0 head terms for bare X / SX / COHSEX.
+
+All values are diagonal-in-band shifts in Rydberg atomic units.
+The head contributes equally at every k-point, with the Brillouin-zone
+average carried by the explicit ``1 / N_k`` factor.
+
+### `src/gw/head_correction.py` — `static_hall_linear_response`
+
+Return the unique static Hall-only linear CT/TC tensor.
+
+``Pi_H[0,i](q) = -i epsilon[b,a,i] sigma_H[b] q[a]`` for the persisted
+occupied-bra Berry ``sigma_H``; ``TC = CT^dagger``.
+The result has shape ``(2,4,4)`` with coordinate index ``a=(x,y)``.
+Charge is Lorentz row/column zero and currents are columns/rows 1:4.
+Every CC and TT entry is exactly zero; TC is the Hermitian conjugate of
+CT.  A real, separately sourced ``sigma_H`` is required so this function
+cannot manufacture an unconstrained fitted Hall matrix.
+
+### `src/gw/head_correction.py` — `canonicalize_static_gauge_q2_tensor`
+
+Return the unique coordinate-symmetric representative of ``q S q``.
+
+Only ``q_a q_b S[a,b]`` is observable in the quadratic response, so the
+coordinate-antisymmetric part is identically null.  Broken-TRS bubbles
+and their Hermitian Schur folds generically carry such an imaginary
+antisymmetric part; remove it at construction sites while leaving the
+independent validation gate fail-closed for arbitrary consumer input.
+
+### `src/gw/head_correction.py` — `static_gauge_tensor_residuals`
+
+Return algebraic in-plane Ward and Hermiticity residuals of ``S``.
+
+The Ward residual is the largest coefficient of the two cubic identities
+``q_i q_a q_b S[a,b,i,J]=0`` and
+``q_a q_b S[a,b,I,i] q_i=0``, normalized by ``max|S|``.  Hermiticity also
+includes the coordinate-canonical condition ``S[a,b]=S[b,a]``; an
+antisymmetric coordinate tensor is unobservable under ``q_a q_b`` and is
+refused rather than retained as an arbitrary representative.
+
+### `src/gw/head_correction.py` — `resolve_bgw_q0_channel`
+
+Bind the deck's reduced q0 vector to one stored W-wedge row.
+
+The shifted point must be exactly on the WFN grid.  Its irreducible
+representative may point in another symmetry-equivalent direction; the
+scalar epsilon-inverse head is invariant under that operation, and the
+head-channel vector is therefore taken from the representative row that
+the Dyson solve actually stores.
+
+### `src/gw/head_correction.py` — `finite_q0_epsinv_head`
+
+Return the full finite-q ``epsilon^{-1}_{00}``, including wings.
+
+In the centroid representation the selected plane-wave channel is
+``V_0 = v_0 |conj(g)><g|``.  With the already solved
+``W=(1-V chi)^{-1}V``, the exact bordered-Dyson scalar is
+
+``epsinv_00 = 1 + v_0 <g| chi (1 + W chi) |conj(g)>``.
+
+Thus the regular finite-q W tile supplies the head, both wings, and the
+body Schur fold without forming a plane-wave epsilon matrix.  Every
+``(mu,nu)`` object remains two-dimensionally sharded; only two vectors
+and the final scalar are resharded/reduced.
+
+### `src/gw/head_correction.py` — `_check_dipole_coverage`
+
+Loud coverage check on ``dipole.h5`` at the point of use.
+
+``dipole.h5`` is generated once by ``psp.get_dipole_mtxels`` at
+whatever ``nbands`` the generating run happened to use, and it is
+*not* namespaced by that count.  The head ``S(ω)`` built from it sums
+over ``arange(nelec, nb_file)`` conduction states — so a file written
+at 120 bands feeding a run whose Σ window spans 160 silently
+truncates the transition space in ``wcoul0``, and therefore in every
+q→0 Σ_SX / Σ_COH correction.  That exact mismatch shipped in the
+2026-07 production runs and was found by hand, not by the code.
+
+The file stamps ``nbands`` / ``nk`` as HDF5 attrs; nothing read them.
+This warns rather than raises: a short dipole file is a *convergence*
+defect, not a corrupt one, and refusing would break every existing
+run directory.  It is loud enough to see.
+
+### `src/gw/head_correction.py` — `_dipole_window_from_params`
+
+``(nval, ncond, nband)`` — the RUN's resolved band window, or a refusal.
+
+THE THREE NUMBERS ARE READ, NEVER INVENTED.  This helper used to default
+``nval``/``ncond`` to 5 and ``nband`` to ``max(wfn.nbands, nelec+ncond)``,
+on the stated grounds that it "mirrors the writer".  The writer resolves
+those defaults against the DECK; this side only ever saw
+``config.head`` — a six-key dict with no band window in it — so the
+defaults were not a mirror, they were the only thing the comparison ever
+used.  Measured on the MoS2 production deck (JID 57269074): a dipole.h5
+generated from the very same WFN and deck reported
+``file=26/26/600`` against an invented ``run=5/5/610``, and under
+``LORRAX_SANITY=strict`` that false warning is an unconditional refusal
+of a correct file.
+
+So an ABSENT field is a refusal, not a guess.  A provenance check whose
+reference is fabricated cannot fail for the reason it claims and cannot
+pass for one either — it is the class of check
+``TASTE.md``/"a check that cannot fail is not evidence" is about.  The
+one supported caller (:class:`HeadResolver`) carries the resolved
+``config.nval``/``config.ncond``/``config.nband``; a direct caller must
+do the same.
+
+``wfn`` is retained for the refusal message only — it is what makes the
+"which numbers were missing, and what would they have been" line
+actionable — and is deliberately NOT consulted for a value.
+
+### `src/gw/head_correction.py` — `_check_dipole_provenance`
+
+Was ``dipole.h5`` built from THIS DFT solution and THIS band window?
+
+The coverage check above answers "is the file big enough"; this answers
+"is it the right file at all".  They are different failures and neither
+implies the other: a dipole.h5 regenerated from a *different* WFN has
+exactly the right shape, so every shape-based check passes and nothing
+downstream notices that the q→0 head S(ω) — and therefore every
+Σ_SX/Σ_COH head correction — is built from stale velocity matrix
+elements.
+
+``psp.get_dipole_mtxels`` has stamped ``prov_*`` attrs (WFN sha256 plus
+the band window) since the guard landed, and shipped
+``check_dipole_provenance`` to read them back.  Nothing called it; the
+writer and the checker both existed and the consumer did neither.
+
+Reports through ``common.sanity`` — loud by default, a refusal under
+``LORRAX_SANITY=strict`` — and is gated on ``sanity_enabled()`` like
+its sibling.  An UNSTAMPED file (written before the guard) reports as
+unverifiable and does not fail the run.
+
+A caller that supplies no band window is refused outright by
+:func:`_dipole_window_from_params` (a code defect, not a deck error):
+an invented reference makes this check accuse correct files and vouch
+for nothing.
+
+### `src/gw/head_correction.py` — `build_S_cart_omega`
+
+``S(ω)``, the Cartesian q²-coefficient tensor, from ``dipole.h5``.
+
+THE ONE SPELLING of the dipole → ``S(ω)`` build.  It has two consumers and
+they must not drift: ``resolve_head_sample``'s ``s_tensor`` branch (the GW
+run, which then averages it into ``wcoul0``) and
+:func:`resolve_head_S_cart` (the BSE, which needs the integrand itself to
+re-attach W's head per fine q under ``gw.head_densify``).  A second copy
+would be a tensor that agrees with the run's head everywhere except where
+it matters.
+
+Units and convention are ``docs/theory/s-tensor-convention.md``: Cartesian,
+the canonical form, ``1/(Ry·bohr²)`` such that ``v(q)·qᵀSq`` is
+dimensionless.
+
+Parameters
+----------
+wfn, sym, meta
+    The run's loader / symmetry table / system parameters.
+params : dict
+    Deck keys; read for the dipole provenance check only.
+dipole_path : str
+    Absolute path to ``dipole.h5``.
+omega : complex
+    Frequency in Ry.  0 for the static head this stage consumes.
+eta : float
+    Broadening in Ry (deck ``wcoul0_eta``).  Non-zero makes ``S`` complex.
+
+Returns
+-------
+numpy.ndarray, shape (3, 3), complex128
+
+### `src/gw/head_correction.py` — `fold_small_head_wings_sharded`
+
+Fold a bounded small-field response through the screened body.
+
+This is the single production owner of the small head/body Schur fold.
+It accepts independently sized left and right field bases; both field
+extents are replicated and therefore must remain bounded.  The body is
+never gathered: every rank contracts its local ``(I_x, J_y)`` tile and
+only the small output is reduced across the two-dimensional mesh.
+
+.. math::
+
+    R_{AB}^{\mathrm{eff}}(z) = R_{AB}^{0}(z)
+      + \frac{1}{V_{\mathrm{cell}}}
+        \sum_{IJ}Y_{AI}(z)W_{IJ}(z)Z_{JB}(z).
+
+Any replicated batch/frequency axes may precede the displayed axes and
+must match exactly (no broadcasting).  Body axes remain tiled exactly
+like screening: ``Y`` on ``x``, ``W`` on ``(x,y)``, and ``Z`` on ``y``.
+The caller supplies those shardings; this kernel deliberately does not
+defensively reshard large inputs.
+
+Parameters
+----------
+R_direct
+    Direct response, ``(..., F_left, F_right)``, replicated.  Its units
+    are set by the caller's field basis.
+Y_x
+    Left wing, ``(..., F_left, n_I)``, body axis sharded on ``x``.
+W_body_xy
+    Screened body, ``(..., n_I, n_J)``, sharded on ``(x,y)``.
+Z_y
+    Right wing, ``(..., n_J, F_right)``, body axis sharded on ``y``.
+    Wing/body units must make ``Y W Z / Vcell`` match ``R_direct``.
+Vcell
+    Primitive-cell volume in bohr³; it appears exactly once.
+mesh_xy
+    Production two-dimensional device mesh.
+
+Returns
+-------
+jax.Array
+    ``R_eff`` with shape ``(..., F_left, F_right)``, the same units as
+    ``R_direct``, replicated on ``mesh_xy``.
+
+### `src/gw/head_correction.py` — `fold_cartesian_head_wings_sharded`
+
+Charge-head adapter to :func:`fold_small_head_wings_sharded`.
+
+``S_direct`` and the result have shape ``(..., 3, 3)`` and units
+``1/(Ry·bohr²)``; the centroid/body axes retain their existing
+``x``/``(x,y)``/``y`` shardings.
+
+### `src/gw/head_correction.py` — `small_head_wing_halves_sharded`
+
+Contract each small photon wing through one resident body ``W``.
+
+For the two in-plane directions and four Lorentz fields this returns
+
+``YW[a,A,J] = sum_I Y[a,A,I] W[I,J]`` and
+``WZ[b,I,B] = sum_J W[I,J] Z[b,J,B]``.
+
+Only the contracted centroid axis is reduced.  The outputs remain
+respectively y- and x-sharded one-index objects; the body is neither
+gathered nor transposed.  No conjugation, cell-volume factor, or head
+model is implicit.
+
+### `src/gw/head_correction.py` — `_static_slab_photon_head_moment_chunk`
+
+Accumulate one fixed-size chunk of the coupled small-head solve.
+
+``R(q) = q_a H_hall[a] + q_a q_b S_quadratic[a,b]`` uses the two
+periodic in-plane Cartesian coordinates of a slab.  ``H_hall`` is private
+to this numerical kernel: the public entry derives it from ``sigma_H`` so
+an arbitrary linear CT/TC matrix cannot enter production.  For every valid
+mini-BZ sample this evaluates the *coupled* four-field Dyson equation
+
+``W_h(q) = [I - D(q) R(q)]^-1 D(q)``
+
+before averaging.  The returned ``(1,qx,qy)`` moments are sufficient to
+rebuild the head, both single wings, and the double-wing body update as
+repeated rank-four outer products; no sample-by-centroid array exists.
+
+This is the sole sample-sized graph.  The vcoul provider zero-pads its
+final chunk to the same fixed size and passes ``valid_count``, preventing
+a tail-shape recompile and keeping the invalid q=0 rows outside every
+accumulated quantity.
+
+### `src/gw/head_correction.py` — `static_slab_photon_head_moment_chunk`
+
+Validated entry to the fixed-size static slab photon-head graph.
+
+Parameters follow :func:`_static_slab_photon_head_moment_chunk`:
+``q_cart`` is ``(chunk,3)``, ``D_raw`` is ``(chunk,4,4)`` in raw vcoul
+units (no cell-volume factor), ``sigma_H`` is the separately sourced real
+Hall pseudovector, and ``S_quadratic`` is ``(2,2,4,4)``.  The caller
+normalizes each provider-issued weighted rule and applies the one and only
+``1/Vcell`` while rebuilding the packed q=Gamma row.
+
+The function is intentionally slab/static-only.  A bulk analytic-sphere
+correction cannot be added after this nonlinear coupled solve, and must
+have its own derived integrator before that policy is admitted.
+
+### `src/gw/head_correction.py` — `StaticPhotonQ0FactorCarrier`
+
+Bounded factors for the exact q=0 updates inserted into V and W.
+
+The bare pair and nine screened pairs are the completed factors, after
+the coupled 4x4 Dyson/cubature transaction.  They are retained only so
+the incumbent Sigma contraction can attribute the FINAL Lorentz blocks
+linearly; they are not a second response model or a packed-body copy.
+
+### `src/gw/head_correction.py` — `complete_static_slab_photon_q0`
+
+Complete bare and screened packed photon operators in the Γ cell.
+
+``response`` is the sealed bounded
+:class:`gw.static_gauge_response.StaticPhotonHeadResponse` (charge
+``S^{00}``, charge wings, ``sigma_H``); the kernel below constructs the
+Hall tensor from ``sigma_H`` itself, so no arbitrary linear CT/TC matrix
+can enter.  ``cubature_receipt`` is the sole vcoul provider's
+authenticated exact Wigner--Seitz/Duffy ladder and the sole cell-volume
+source for the completion.  Each sample first solves the coupled
+four-field head Dyson equation; only its ``(1,qx,qy)`` moments survive.
+The packed body is then updated by one bare and nine screened rank-four
+outer products, each averaged over the authenticated Gamma little group
+through its rank-four factors.  No sample-by-centroid tensor or second
+photon packing convention exists.
+
+### `src/gw/head_correction.py` — `resolve_head_S_cart`
+
+The ``S`` tensor behind the restart's ``whead`` — read it, or rebuild it.
+
+``whead`` alone is the head CELL AVERAGE on one grid.  A coarse→fine
+densification needs the INTEGRAND that average was taken of, so it can be
+re-evaluated on a different cell and pointwise inside the old one — that
+integrand is ``v/(1 − v qᵀS q)`` and this returns its ``S``.
+
+Two routes, in order, because the first is exact and free and the second
+exists for restarts written before the first one did:
+
+1. **The restart's own ``S_cart_head``** — written beside ``vhead`` /
+   ``whead`` by :func:`file_io.write_head_scalars_to_h5` since this change.
+   This is the tensor that PRODUCED that ``whead``, so the provenance ratio
+   is 1 by construction and nothing has to be recomputed.
+2. **Rebuilt from ``dipole.h5``** through :func:`build_S_cart_omega`, the
+   same call the GW run made.  Needs ``wfn``/``sym``/``meta`` (the BSE
+   coarse→fine paths already load all three for the htransform leg) and a
+   ``dipole.h5`` beside the deck.  The rebuild is deterministic, so the
+   provenance ratio it produces is a real check on whether the head in the
+   restart and this tensor describe the same screening.
+
+Returns
+-------
+tuple[numpy.ndarray | None, str]
+    ``(S_cart, provenance)``.  ``S_cart`` is ``(3, 3)`` complex128 or
+    ``None`` when neither route is available; ``provenance`` names which
+    route ran, or why none did, and is meant to be logged verbatim.
+
+### `src/gw/head_correction.py` — `HeadResolver`
+
+Memoized q=0 head-sample resolver for a single GW run.
+
+The driver needs the head sample at up to two frequencies (ω=0 always,
+and a second probe ω for the dynamic PPM path).  Building it requires
+reading ``eps0mat.h5`` or ``dipole.h5`` and crunching a Voronoi-cell
+integral, which is non-trivial; without memoization the same work was
+being done three times per run.
+
+Construct once at the top of ``main()``::
+
+    head = HeadResolver(config, input_dir, wfn, sym, meta, print_fn)
+    head_static = head.at(0.0 + 0.0j)
+    head_probe  = head.at(probe_omega)
+
+### `src/gw/head_correction.py` — `fit_head_ppm`
+
+Fit a scalar PPM pole from two W^c head samples.
+
+Model-agnostic two-point fit: the same algebra serves both the
+Godby-Needs PPM (purely imaginary probe ``probe_omega = i·ωp``) and
+the Hybertsen-Louie PPM (real probe ``probe_omega = Ω`` above all
+transitions).  The signed quantity ``z² = (probe_omega)²`` carries
+the model choice — negative for GN, positive for HL.
+
+### `src/gw/head_correction.py` — `fit_head_ppm_from_samples`
+
+Fit the scalar PPM head from resolved static and probe-frequency samples.
+
+THE ``.real`` IS THE HERMITIAN PART, AND IT IS THE WHOLE HEAD.  On a
+time-reversal-broken deck the Cartesian head tensor ``S_ab(iω)`` has an
+anti-Hermitian, magnetisation-odd part, but that part is ``∝ ω (P^{ab} −
+P^{ba})`` — ANTISYMMETRIC in ``ab`` — and the scalar head is the
+isotropic average ``⟨q̂_a S_ab q̂_b⟩``, which annihilates every
+antisymmetric tensor.  The scalar GN head is therefore exactly
+time-reversal-even: its odd residue is identically zero, and taking the
+real part of a 1×1 Hermitian half is not an approximation
+(``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` §6; gated in
+``tests/test_gnppm_ordered_orientations.py``).  The channel lives only in
+the antisymmetric (Faraday-like) part of ``S_ab``, which no scalar head
+can carry.
+
+### `src/gw/head_correction.py` — `fit_head_hl_analytic`
+
+Set the HL-PPM head pole analytically from the bulk plasmon, BGW-style.
+
+The 2-point HL fit at finite probe Ω asymptotes to the f-sum-rule
+value as Ω → ∞, but at finite Ω the static-vs-probe head W^c samples
+can be sensitive to numerical convention (mini-BZ averaging, head
+truncation), giving an Ω_h that drifts ~10–20 % from the exact
+bulk-plasmon limit.  BGW sidesteps this by taking the head pole
+directly from the analytic f-sum-rule: ``Ω̃²(0,0) = ω_p²`` (set in
+``Sigma/wpeff.f90`` as the q=g=g'=0 special case), and the kernel
+pole ``wtilde² = Ω² / I_ε(0,0) = ω_p² / (1 − ε⁻¹(0,0))``.
+
+This mirrors that: ``Ω_h² = ω_p² / I_ε_head`` where
+``I_ε_head = (v_head − W(0)) / v_head`` is computed from the same
+mini-BZ-averaged static head ``W(0)`` LORRAX already resolves.
+The static W^c(0) head is still used (for B_h and R_h via the GN/HL
+pole ansatz), so the magnitude of the head correction stays
+consistent with the COHSEX block.
+
+### `src/gw/head_correction.py` — `fit_head_with_fixed_omega`
+
+Build head params with a user-supplied pole frequency Ω_h.
+
+Useful for cross-validation against BGW: take BGW's analytic head
+pole ``Ω_h(BGW) = √(ω_p²/(1 − ε_head⁻¹))`` (with ε_head⁻¹ from BGW's
+``epshead(q→0)``), set this option to that value, and isolate any
+LORRAX-vs-BGW residual that's *not* due to the head pole frequency.
+
+The static W^c(0) head is still LORRAX's, so B_h and R_h scale with
+the LORRAX mini-BZ-averaged static head — same logic as
+:func:`fit_head_hl_analytic`.
+
+### `src/gw/head_correction.py` — `compute_static_head_terms`
+
+Build exact static COHSEX head terms (Σ^X, Σ^SX, Σ^{SX-X}, Σ^COH) in band space.
+
+``vc0`` / ``wcoul0_static`` are the bare and static-screened Coulomb heads
+in a.u.; ``occ`` is the (nb,) {0,1} occupation mask for the active window.
+Returns diagonal-in-band shifts in Rydberg, with the Brillouin-zone
+average carried by an explicit ``1 / (V_cell · N_k)`` prefactor.
+
+### `src/gw/head_correction.py` — `expand_band_diagonal_to_kij`
+
+Broadcast a band-diagonal shift to a dense ``(nk, nb, nb)`` matrix.
+
+Thin Python wrapper that pulls ``nb`` from ``diag.shape`` and
+forwards to ``_expand_band_diagonal_to_kij_jit`` — collapses
+~6 eager-pjit cache misses per call into one cached XLA module.
+
+### `src/gw/head_correction.py` — `static_head_terms_to_kij`
+
+Expand exact static head shifts to dense ``(k, i, j)`` matrices.
+
+Parameters
+----------
+head
+    Exact static head terms from :func:`compute_static_head_terms`.
+nk_tot
+    Total number of k-points in the full-zone average.
+do_screened
+    If ``True``, return the screened-exchange head ``Sigma^SX``.
+    If ``False``, return the bare-exchange head ``Sigma^X``.
+
+Returns
+-------
+sigma_sx_kij, sigma_coh_kij
+    Dense diagonal matrices shaped ``(nk_tot, nb, nb)`` suitable for adding
+    directly to the static COHSEX matrices in GWJAX.
+
+### `src/gw/head_correction.py` — `compute_ppm_head_sigma_kij`
+
+q→0, G=G'=0 head contribution to PPM ``Σ^c_kij(ω)``.
+
+At q=0, ``M_{nm}(k, q→0, G=0) = δ_{nm}``, so the head only enters the
+band-diagonal ``(i, i)`` of the PPM ``Σ^c`` matrix.  With the GN pole
+extracted in :func:`fit_head_ppm` (``R_h = B_h / (2 Ω_h)``,
+``B_h = -W^c(0) · Ω_h²``):
+
+    Σ^c_n^head(ω - E_F) =
+        +R_h / (V_cell · N_k) · [
+              f_n     / (ω - ε_n + Ω_h - iη)
+            + (1-f_n) / (ω - ε_n - Ω_h + iη)
+        ]
+
+where ω, ε_n are taken in the same E_F-relative convention (the difference
+ω - ε_n is invariant under that shift).  In the static limit ω → ε_n
+this reduces to ``-W^c(0) / (2 V_cell N_k)`` for occupied bands and
+``+W^c(0) / (2 V_cell N_k)`` for empty bands, matching the COHSEX
+static-head pieces (``Σ^{SX-X} + Σ^COH``) built by
+:func:`compute_static_head_terms`.
+
+Parameters
+----------
+head
+    Fitted GN head pole.
+omega_grid_ry
+    Σ^c frequency grid (relative to E_F), shape ``(n_omega,)`` in Ry.
+enk_ry
+    Absolute band energies for the σ window, shape ``(nk, nb)`` in Ry.
+efermi_ry
+    Fermi level in Ry (subtracted from ``enk_ry`` to get ``ε - E_F``).
+n_occ
+    Number of occupied bands at the bottom of the σ window
+    (``f_n = 1`` for ``n < n_occ``, else ``0``).
+cell_volume, nk_tot
+    Unit-cell volume and full-zone k-point count.
+eta
+    Imaginary regularization for the retarded poles.
+
+Returns
+-------
+sigma_kij : np.ndarray, shape ``(n_omega, nk, nb, nb)``, dtype complex128
+    Diagonal-in-band head contribution; off-diagonals are zero.
+
+### `src/gw/head_correction.py` — `compute_ppm_head_sigma_diag`
+
+Band-DIAGONAL of :func:`compute_ppm_head_sigma_kij` — ``(nω, nk, nb)``.
+
+The q→0 head enters only the band diagonal (``M_{nm}(k, q→0, G=0) =
+δ_{nm}``), so this is the complete information content of the dense
+``(nω, nk, nb, nb)`` tensor at nb× less memory — the representation the
+sharded-Σ layout (``sigma_omega_layout=sharded``) injects rank-locally
+instead of materializing the dense cube on every rank.  The dense
+builder above embeds exactly this array, so the two representations are
+bit-identical by construction (single source of truth).
+
+### `src/gw/head_correction.py` — `on_shell_occupied_head_sigma_ry`
+
+Re(Σ^head) for an OCCUPIED band evaluated ON SHELL (ω = ε_nk − E_F).
+
+THE ONE PLACE the concise-log scalar comes from.  It is *derived from*
+:func:`compute_ppm_head_sigma_diag` — the same kernel that builds the
+tensor the ansatz-neutral finalizer injects — by evaluating it at a
+synthetic single occupied state whose ω sits exactly on shell
+(``δ = ω − (ε − E_F) = 0``).  Nothing here restates the closed form.
+
+WHY IT EXISTS.  ``gw/ppm_pipeline.py`` used to print this number from a
+hand-written ``-R_h/(Ω_h·V·N_k)``, while the kernel and the named
+``sig_c_head(Edft).Re`` output column evaluate ``+R_h/(Ω_h·V·N_k)``.
+Measured on the Si 6×6×6 two-update controls (JID 57243214): the log
+said ``-0.8071 eV`` where ``sigma_freq_debug.dat`` carried
+``+0.807048 eV`` for the same occupied state.  The physics array was
+always right; the duplicated formula in the log had drifted in sign.
+A second spelling of a formula is a second thing to keep in step, so
+there is now only one.
+
+Returns Ry.  ``0.0`` for a degenerate head (``R_h`` or ``Ω_h`` ≈ 0),
+which is what the kernel returns there too.
+
+### `src/gw/head_correction.py` — `compute_complex_pole_head_sigma_diag`
+
+Band-diagonal head self-energy for generic retarded complex poles.
+
+For poles ``Omega_p = a_p - i Gamma_p`` and head residues ``R_p``,
+
+.. math::
+
+    \Sigma_n^{\mathrm{head}}(\omega) =
+    \frac{1}{V_{\mathrm{cell}}N_k}\sum_p R_p
+    \left[\frac{f_{nk}}{\delta_{nk}+\Omega_p}
+    + \frac{1-f_{nk}}{\delta_{nk}-\Omega_p}\right],
+
+where ``delta_nk = omega - (epsilon_nk - E_F)``.  Occupations are
+accepted per band or per ``(k,band)``; this keeps the denominator valid
+when an energy window straddles the Fermi level without deciding how the
+occupations themselves are produced.
+
+All energy-like inputs and residues are in Ry.  The result is complex Ry
+with shape ``(n_omega, n_k, n_band)``.
+
+### `src/gw/head_correction.py` — `apply_q0_head_rank1`
+
+Inject the q=0 Coulomb head as a rank-1 update in the centroid basis.
+
+Args:
+    V_qmunu:   (..., nkx, nky, nkz, n_μ, n_ν) bare-Coulomb body.
+    W_qmunu:   same shape (single ω) or ``None`` to skip W.
+    G0_mu_nu:  (n_μ,) — ``ζ(q=0, μ, G=0)``.
+    vhead, whead: scalar or ``(n_omega,)`` in Ry, or ``None`` to skip.
+    cell_volume: V_cell in Bohr³.
+    omega_index: slot of ``whead`` to apply (default 0).
+
+Returns:
+    (V_qmunu, W_qmunu) with the q=0 slice updated.
+
+### `src/gw/head_correction.py` — `apply_q0_head_rank1_sharded`
+
+Sharded q=0 head injection — local on every proc.
+
+Variant of :func:`apply_q0_head_rank1` for BSE-side sharded
+(``P("x", "y")``-on-(μ,ν)) tensors.  ``g0_X`` and ``g0_Y`` are the
+same ``ζ(0,μ,G=0)`` vector duplicated under ``P("x")`` and ``P("y")``
+so the rank-1 ``conj(g0_X)[:, None] * g0_Y[None, :]`` is local.
+
+Args:
+    V_q0:  ``(n_μ, n_ν)``                       sharded ``P("x", "y")``.
+    W_q:   ``(n_μ, n_ν, nkx, nky, nkz)`` or ``None``.
+    g0_X:  ``(n_μ,)`` sharded ``P("x")`` — μ-axis copy of ζ(0,μ,G=0).
+    g0_Y:  ``(n_ν,)`` sharded ``P("y")`` — ν-axis copy of ζ(0,ν,G=0).
+    vhead, whead, cell_volume, omega_index: as in
+        :func:`apply_q0_head_rank1`.
+
+### `src/gw/w_isdf.py` — `_complete_static_vertex_orientations`
+
+Return both ordered Hermitian-vertex orientations in R space.
+
+``forward_R`` has endpoint axes ``(mu_A,mu_B)``.  For two different
+Hermitian vertices, ``reverse_R`` is the reversed ordered contribution
+in its natural ``(mu_B,mu_A)`` orientation.  Its dagger maps it back to
+the forward endpoint order before addition::
+
+    forward_R + reverse_R^dagger
+
+Charge is the same-vertex special case: its natural reverse is
+``swapaxes(forward_R)`` and the expression reduces exactly to the
+incumbent ``forward_R + conj(forward_R)`` completion.  Replacing either
+form by ``2*forward_R`` is valid only in a real gauge and is wrong for a
+complex broken-time-reversal wavefunction.
+
+Keep this completion before the final R-to-q FFT.  It is transition
+algebra, not a post-hoc q symmetrization, and preserves sharding
+elementwise.
+
+### `src/gw/w_isdf.py` — `_get_w_solve_fn_local`
+
+W = (I - V χ)⁻¹ V via q-parallel shard_map.  All arrays flat-q: (nq, μ, μ).
+
+The LOCAL plan: q's are scattered over all devices
+(``P(('x','y'),None,None)``) and each rank runs one dense pivoted LU
+(``lu_factor``/``lu_solve``) per owned q.  LU is the right inner
+solve: A is SQUARE and generically well conditioned (it is I minus a
+term whose spectral radius is < 1 wherever the RPA screening is
+physical — an eigenvalue of Vχ₀ reaching 1 is a plasmon instability,
+not a numerical one).  One factorisation, one triangular pair of
+solves.
+
+``n_rmu_logical``: when smaller than ``n_rmu`` (μ-padded inputs),
+the per-q pivoted LU is μ-SLICED to the logical extent and the W
+pad rows/cols are zero-filled after (their exact value: V pad rows
+are zero).  Load-bearing for device-count invariance — LU at the
+padded extent regroups partial sums per pad extent, and the
+resulting 1e-8-rel W wobble is amplified to eV on near-pole GN-PPM
+bands (reports/device_invariance_2026-07-08/ROOT_CAUSE.md, charge
+manifestation).  At zero pad the slice/fill are no-ops.
+
+### `src/gw/w_isdf.py` — `_get_w_solve_fn_distributed`
+
+W = solve(A, V), A = (1 − pref·V·χ₀), everything 2-D sharded.
+
+The DISTRIBUTED plan — the scale-out route for thousands of
+low-memory processes, in the same architectural family as the
+ζ-fit's distributed rank-truncate tier
+(:func:`isdf.core._factor_c_q_distributed_rank_truncate`):
+
+1. **A build** — per q-block, ``A = I − V·(pref·χ)`` as a 2-D block
+   GEMM inside ``shard_map``: rank (x, y) all-gathers V's row block
+   along 'y' (full k for its i rows, μ·μ/Px per rank) and χ's column
+   block along 'x' (full k for its j columns, μ·μ/Py per rank),
+   multiplies locally, and subtracts from its identity tile.  The
+   gathers are STRUCTURAL — inside shard_map the partitioner cannot
+   hoist them into a full-stack gather (the per_q-tier lesson,
+   quality pattern #4).  The q loop is chunked HOST-side so one
+   collective instruction never exceeds ``LORRAX_COLLECTIVE_CHUNK_MB``
+   (the AF transport bound; separate XLA executions cannot be
+   re-combined by a compiler pass).
+2. **Factor + backsolve** — ONE resolved
+   :class:`distrib_la.Plan` for ``solve_lu`` with
+   ``backend='distributed'`` (ScaLAPACK ``pzgetrf``/``pzgetrs`` on a
+   CPU mesh, cuSOLVERMp on CUDA — ``resolve._DISTRIBUTED_DEFAULT``),
+   consuming the block-cyclic tiles where they already live.
+
+**No rank ever materialises a full (μ, μ) tile**: inputs, A, the LU
+factors and W all stay ``P(None,'x','y')`` (per-rank blocks of
+μ/Px × μ/Py; the largest per-rank transient is the μ·μ/min(Px,Py)
+gathered GEMM operand).  W lands natively in ``P(None,'x','y')`` —
+no relayout, unlike the local plan.
+
+Padding contract, and why it is exact: V and χ pad rows/cols are
+exact zeros (the bilinear-in-zero-padded-ψ contract), so at the
+PADDED extent ``A = [[A_log, 0], [0, I]]`` and ``RHS = [[V_log], [0]]``
+hold EXACTLY — the identity-embedded block-diagonal system whose
+solution is ``[[W_log], [0]]``; partial pivoting cannot mix the
+blocks (every pad column is a unit vector, every pad row is zero in
+the logical columns).  Therefore W's pad rows/cols leave the solve as
+exact zeros without a separate post-solve mask graph.  Unlike the local
+plan the LOGICAL
+block is formed/factored at the padded extent, so W here carries the
+≤1e-8-rel pad-extent regrouping wobble — which is subsumed by the
+block-cyclic factorisation's own non-bit-identity; this plan's
+numerical contract is the Dyson residual (``LORRAX_W_RESIDUAL_CHECK``),
+not bit-identity with the local plan.
+
+Geometry/capability failures (host lib absent, non-square or 1-D
+mesh, n not divisible, process coverage) RAISE at resolve time with
+the resolver's own message — an explicitly requested distributed
+solve never silently downgrades to the local plan (quality pattern
+#6/#8).
+
+### `src/gw/w_isdf.py` — `_w_residual_report`
+
+Direct Dyson residual ‖(1−Vχ)W − V‖/‖V‖ on the first few q.
+
+THE strict numerical contract of the distributed plan (a
+block-cyclic LU is not bit-comparable to the local per-q LU; the
+residual is what certifies the solve — quality pattern #6, "test
+what executes").  Diagnostic-only, opt-in via
+``LORRAX_W_RESIDUAL_CHECK=1``; never on in the traced production
+path, so the collective-table gate is taken with it OFF.
+
+### `src/gw/w_isdf.py` — `_w_solve_pref_scalar`
+
+The physical-state prefactor in front of χ₀ in the Dyson solve.
+
+``nspinor_wfnfile`` is the source-WFN state multiplicity.  In a
+kinetic-balance lift ``meta.nspinor`` becomes four only to describe the
+bispinor representation; the band and occupation axes are unchanged.
+Using that representation width here would therefore halve every
+charge/current response block.  Read the source field strictly: silently
+falling back to the representation width would reinstate that error.
+
+### `src/gw/w_isdf.py` — `_resolve_w_solve_fn`
+
+Return ``(solve_fn, pref)`` for the requested W plan.
+
+Single source of truth for the two-plan dispatch.  Both ``solve_w``
+and ``precompile_solve_w`` go through this helper — the dispatch
+logic exists in one place.
+
+``dyson_solver`` (input key ``w_dyson_solver``) selects the plan:
+
+``local`` (default; ``auto`` is an alias)
+    per-q pivoted LU inside the q-parallel shard_map —
+    :func:`_get_w_solve_fn_local`.
+``distributed``
+    the 2-D-sharded stacked-GEMM backsolve through the linalg plan
+    facade — :func:`_get_w_solve_fn_distributed`.  Refuses loudly at
+    resolve time when the mesh/build cannot run it; never silently
+    downgrades.
+
+W comes out ``P(None,'x','y')`` on BOTH — that is the module's
+output contract, not a per-plan detail.
+
+### `src/gw/w_isdf.py` — `_require_w_operand_geometry`
+
+Authenticate the public Dyson carrier without owning its q set.
+
+The q axis may be full-BZ or an irreducible wedge; its mapping belongs to
+the screening/MPA caller.  The two centroid axes, however, must be one
+square runtime carrier shared by V and chi, owned by the packed basis
+when present or by the canonical suffix-padding receipt otherwise.
+
+### `src/gw/w_isdf.py` — `solve_w`
+
+W(q) = (I − V χ₀)⁻¹ V  via a Dyson solve.  **W comes out sharded.**
+
+All arrays flat-q: V(nq, μ, μ), χ₀(nq, μ, μ) → W(nq, μ, μ).
+Scalar inputs use ``meta.mu_basis``'s packed runtime extent when present,
+otherwise ``padded_mu_extent(meta.n_rmu, mesh_xy)``.  Their q axis may be full-BZ
+or an irreducible wedge; q-set ownership stays with the caller.  A packed
+direct-sum caller supplies ``n_rmu_logical`` explicitly because its
+channel padding is internal rather than one trailing scalar prefix.  The
+distributed plan masks scalar trailing pad rows/columns to exact zero
+before its first contraction.
+
+**Output contract:** ``W`` is ``P(None, 'x', 'y')`` — 2-D sharded
+W_q(μ_X, ν_Y) — on both plans, and stays that way into its
+consumers (Σ_SX/Σ_COH's 5-D FFT spec, the PPM fit, the IBZ unfold,
+the restart writer).
+
+``dyson_solver`` (input key ``w_dyson_solver``) picks one of the
+TWO plans — see :func:`_resolve_w_solve_fn`:
+
+- ``local`` (default): q-parallel reshard + per-q dense LU via
+  shard_map.  Legal on any mesh; each rank holds whole (μ, μ)
+  tiles for its q's.
+- ``distributed``: 2-D-sharded stacked-GEMM backsolve through the
+  distrib_la plan door (ScaLAPACK on CPU, cuSOLVERMp on CUDA).
+  No rank ever materialises a full (μ, μ) tile — the P→∞ memory
+  ceiling.  Slower than ``local`` at moderate P; that is priced and
+  accepted (the point is the per-rank memory ceiling, not speed).
+
+``chi0_q``'s buffer is CONSUMED (donated) on both plans — the
+caller must drop its reference after this call.
+
+### `src/gw/w_isdf.py` — `compute_chi0`
+
+Compute χ₀(q) from a wavefunction bundle and minimax quadrature.
+
+Returns flat-q array (nq, μ, μ).
+
+``quad.tau`` and ``quad.alpha`` approximate either 1/x (static) or
+x/(x²+ωp²) (imaginary-frequency) on [x_min, x_max] where x = E_c - E_v.
+The physical static/imaginary-axis χ₀ contains both ordered
+particle-hole orientations.  In the real-space convolution used here::
+
+    χ₀ = -Σ_ℓ α_ℓ [A_R(τ_ℓ) + conj(A_R(τ_ℓ))]
+
+before the final R-to-q FFT.  The conjugate term maps to
+``conj(A_-q)`` and is distinct from ``A_q`` for complex broken-TR states.
+
+A uniform energy shift via ``energy_reference`` is applied to both
+valence and conduction energies before building the minimax factors.
+Because only differences enter, this is algebraically invariant; the
+knob lets callers align the global zero (e.g. midgap, VBM, CBM).
+
+### `src/gw/w_isdf.py` — `compute_chi0_imag_ordered`
+
+χ₀(q; iω_p) with BOTH particle-hole orientations carrying their own
+frequency weight — the route for a deck whose measured time-reversal
+verdict is false.  Returns flat-q (nq, μ, μ), ``P(None, 'x', 'y')``.
+
+:func:`compute_chi0` applies the EVEN kernel ``x/(x²+ωp²)`` to the
+orientation sum ``A_R + conj(A_R)``, which deletes the anti-Hermitian,
+magnetisation-odd channel ``iω(P^q − conj(P^{−q}))/(ω²+Δ²)`` of χ₀(iω)
+(lane G, measured on CrI3 run 128).  The exact object is the SAME two
+carriers with independent complex weights::
+
+    χ₀_q(iωp) = F_q + conj(F_{−q}),
+    F_q       = Σ_l γ_l e^{−τ_l E_gap} A_q(τ_l),   γ_l = −(α_l − iβ_l),
+
+with ``α`` the served even rule (unchanged) and ``β`` the odd rule
+``ωp/(x²+ωp²)`` on the same nodes (``quad.alpha_odd``).  ``F_q`` is one
+sweep of the existing ``complex_contour`` kernel (real nodes, complex
+weights, no in-kernel completion) — no second response implementation —
+and the partner is the flat-q negation gather of its conjugate, which
+``FFT_R[conj(A_R)] = conj(A_{−q})`` makes exact.  On a Θ deck
+``conj(A_{−q}) = A_q`` and this equals :func:`compute_chi0` to roundoff;
+the caller keeps the incumbent path there so Θ decks stay bit-identical.
+Reciprocity ``χ_{−q} = conj(χ_q)`` holds by construction.
+
+``q_neg_index`` is the public ``symmetry_maps.q_negation_index`` row
+permutation for ``meta.kgrid`` — passed in, never rebuilt here (TASTE 4).
+The probe roles run on the FULL BZ, which is the only grid on which the
+involution is meaningful.
+
+### `src/gw/w_isdf.py` — `compute_experimental_no_pair_photon_chi0`
+
+Build all sixteen no-pair blocks with an experimental TT proxy.
+
+One family class and the donated packed accumulator are resident at a
+time; its vertices share the same Green/FFT pair at each tau node.
+
+### `src/gw/w_isdf.py` — `_load_static_photon_hall`
+
+Load/authenticate the optional Hall artifact and gate its model.
+
+An unnamed ``static_gauge_hall_file`` is the declared ``sigma_H = 0``
+default.  A named path always reaches the one artifact loader, including
+the absent-path refusal.  The bare-transverse model admits an authenticated
+artifact only when its value is exactly zero: then the Hall response is
+identically absent and the packed operator is the same charge/TT block
+diagonal model as the unnamed case.  Any nonzero component still refuses.
+
+### `src/gw/w_isdf.py` — `_chi0_multi_kernel_args`
+
+Shared host prep for the multi-output χ₀ paths (compute + precompile).
+
+``tau``: (L,) node vector (the fused static∪extra union on the probe-
+reuse path).  ``alpha_rows``: (n_out, L) RAW quadrature weights, one
+row per output, all on ``tau``.  Row 0 is normally the static weights
+(zero-padded onto any extra nodes — zero-weight nodes add exact
+zeros); further rows are probe representations on the same nodes.
+The one-orientation prefactor ``-exp(-τ·E_gap)`` folds into every row;
+the kernel adds the reverse ordered transition through the shared
+R-space orientation combiner exactly as the single-output path does.
+
+### `src/gw/w_isdf.py` — `_chi0_contour_alpha_rows`
+
+Complete contour weights for both independent-particle resolvents.
+
+``frequency_sign=+1`` represents ``-1/(Delta-z)`` and ``-1`` represents
+``-1/(Delta+z)``.  The device kernel evolves ``Delta-E_gap``, so this
+host-side coefficient supplies the omitted gap and requested frequency.
+
+### `src/gw/w_isdf.py` — `compute_chi0_contour`
+
+Evaluate several complex-frequency chi0 values in one node sweep.
+
+The scalar contour arrays select the two ``Delta +/- z`` resolvents.  All
+Green-function construction, FFTs, contraction, and sharding are the same
+operations used by :func:`compute_chi0`.
+
+### `src/gw/w_isdf.py` — `compute_chi0_contour_ordered`
+
+Evaluate magnetic contour samples with both ordered orientations.
+
+For an upper-half-plane sample ``z`` the independent-particle response is
+
+``chi0_q(z) = F_q(z) + conj(F_{-q}(-conj(z)))``,
+
+where the kernel's native orientation is
+``F_q(z) = -P_q/(z+Delta)``.  Both ``F(z)`` and
+``F(-conj(z))`` are outputs of ONE contour sweep through the existing
+response kernel.  The second orientation is then a flat-q negation
+gather and conjugation; no second response kernel is evaluated and no
+large intermediate is rematerialized on fewer than all processors.
+
+This is the complex-contour analogue of
+:func:`compute_chi0_imag_ordered`.  The incumbent
+:func:`compute_chi0_contour` applies the two scalar resolvents to the same
+transition orientation, which is valid after a time-reversal completion
+but deletes the magnetisation-odd channel when time reversal is broken.
+Callers therefore select this route only from ``SymMaps.trs_allowed``.
+
+Parameters
+----------
+wfns
+    Wavefunction bundle.  Its flat k axis remains sharded as in the
+    ordinary contour kernel.
+time, weights
+    Positive real-time quadrature nodes and weights, shape ``(L,)``, in
+    reciprocal-energy and time units respectively.
+z_values
+    Upper-half-plane complex frequencies, shape ``(n_z,)``, in the same
+    energy unit used by ``wfns.enk``.
+meta, mesh_xy
+    Runtime metadata and the two-dimensional processor mesh.
+q_neg_index
+    Public ``symmetry_maps.q_negation_index`` permutation, shape
+    ``(n_q,)``.  It must be an involution on the complete flat q grid.
+energy_reference
+    Common energy origin subtracted from valence and conduction bands.
+return_reflected
+    When true, also return the independently completed response at
+    ``-conj(z)``.  Both orientations already belong to the same contour
+    sweep; this option exposes the second completion without evaluating
+    another response kernel.  The default preserves the incumbent return
+    object exactly.
+
+Returns
+-------
+jax.Array or tuple[jax.Array, ...]
+    One flat-q ``(n_q, n_mu, n_mu)`` response for one frequency, or an
+    ``n_z`` tuple for several frequencies.  Arrays retain
+    ``P(None, 'x', 'y')`` sharding.
+
+### `src/gw/w_isdf.py` — `_occupation_support_slices`
+
+Smallest contiguous f and (1-f) band supports without truncation.
+
+THIS IS THE ONE PLACE χ₀'s TWO GREEN'S FUNCTIONS GET THEIR BANDS, and
+unlike the Σ planner's mask it is a genuine COST cut: the returned slices
+index ``wfns.xn``/``yr``, so a band outside them is absent from the
+``build_G_tau`` contraction rather than merely multiplied by a small
+weight.  ``occupation_support_bandwidth`` reads the same two slices to
+size the damped-line rule, so widening them also buys quadrature nodes.
+
+``occupation_window_threshold`` is the OCCUPANCY at which a band leaves a
+support; the cut is on the branch WEIGHT — ``f`` on the occupied side,
+``1 − f`` on the empty side, matching ``band_weight=occ_f`` and
+``band_weight=1.0 - occ_u`` in the kernel — at the floor
+``1 − threshold``, by MAGNITUDE.  Nothing is clipped: MP1 occupations
+overshoot [0, 1] and a wrong-side band's NEGATIVE weight is kept by
+``abs`` exactly as the historical rule kept it (the argument is at
+``gw.efermi.band_in_occupation_window``).  Partially occupied bands
+belong to both slices, as before.
+
+``threshold = 1.0`` gives floor 0.0 and restores the historical exact
+rule (``occ != 0`` / ``occ != 1``) bit-for-bit; an insulating table, whose
+weights are exactly 0 or 1, gives the same two slices at EVERY threshold,
+since ``abs(1) > floor`` and ``abs(0) > floor`` are threshold-independent
+on [0.5, 1.0].
+
+### `src/gw/w_isdf.py` — `compute_chi0_contour_fractional`
+
+Evaluate retarded finite-occupation chi0 at complex frequencies.
+
+weight_rows contains the positive real-time quadrature weights; this
+routine supplies exp(i*z*t) and both exact Keldysh terms.  It does not
+implement z=0: the gapless static limit contains the finite divided
+difference -df/dE and requires its own certified integration rule.
+
+``occupation_window_threshold`` is the OCCUPANCY at which a band leaves
+one of the two Green's-function supports; it MUST be the same value the
+caller gave ``occupation_support_bandwidth``, or the damped-line rule is
+sized for transitions the band slices no longer contain.
+
+### `src/gw/w_isdf.py` — `_fractional_pair_scan_face._gather_mun`
+
+(nk, s, mu_X_loc, tile) un-conjugated, present on every rank —
+masked-gather + psum('y') from psi_mun's local shard (bands on
+'y').  psi_mun's own axis order (nk, s, mu, n) already matches
+the direct endpoint (nk, s, mu_X, n) -- no reorder needed.
+
+### `src/gw/w_isdf.py` — `_fractional_pair_scan_face._gather_nmu`
+
+(nk, s, mu_Y_loc, tile) un-conjugated, present on every rank —
+masked-gather + psum('x') from psi_nmu's local shard (bands on
+'x'), then a LOCAL (no-comm, bounded-size — this tile is `tile`
+bands wide, not nb_full) axis reorder: psi_nmu stores (nk, n, s,
+mu), band axis SECOND, so the post-gather (nk, tile, s, mu_Y_loc)
+needs one transpose to match the band-last endpoint (nk, s, mu, n) order.
+
+### `src/gw/w_isdf.py` — `compute_chi0_static_fractional_gamma`
+
+Return the exact static fractional-occupation chi0 at Gamma.
+
+The ordered-pair kernel evaluates
+
+``(f_ka-f_kb)/(E_ka-E_kb)``
+
+and uses ``df/dE`` on the degenerate diagonal.  The supplied surface
+table owns that diagonal limit; the QSGW metal path supplies periodic
+tetrahedron weights, while off-diagonal pairs retain the carried MP1
+occupations.  The returned ``(1,n_mu,n_mu)`` array has the historical
+raw-chi normalization expected by :func:`solve_w`.
+
+This direct tiled implementation is the exact finite-band fallback.  A
+future certified separable divided-difference minimax target can replace
+its internals without changing this API or the Dyson/head callers.
+
+### `src/gw/w_isdf.py` — `occupation_support_bandwidth`
+
+Largest transition energy over the occupation supports, Ry.
+
+``max(E over the (1-f) support) − min(E over the f support)`` over the
+SAME two slices :func:`_occupation_support_slices` hands the χ₀ kernel,
+so the rule bandwidth and the bands it must resolve can never disagree —
+which is why the threshold is an argument here rather than a second
+default.  An MP1 overshoot band at a support edge is included, by
+magnitude.  This — not ``quad.x_max`` — sizes the damped-line rule
+bandwidth on metal plans, where the occupied and empty supports overlap.
+
+### `src/gw/w_isdf.py` — `compute_chi0_static_fractional`
+
+Exact static finite-occupation chi0 for every stored q row.
+
+The finite-q generalization of
+:func:`compute_chi0_static_fractional_gamma`: for wedge row j the b
+side of every ordered pair rides at ``k − q_j`` through the caller's
+precomputed flat map ``kminq_rows[j]`` (``common.kq_mapping``), and
+the divided difference ``(f_a(k)−f_b(k−q))/(E_a(k)−E_b(k−q))`` uses
+the analytic MP1 ``−df/dE`` midpoint limit on accidentally degenerate
+pairs.  This is the literal static member of the shared ordered-pair
+evaluator; the metal MPA shifted-origin slot instead calls
+:func:`compute_chi0_direct_fractional` at its stamped nonzero ``z``.
+Returns ``(n_q, n_mu, n_mu)``
+wedge rows in the raw-chi normalization expected by :func:`solve_w`,
+sharded ``P(None, 'x', 'y')``.
+
+### `src/gw/w_isdf.py` — `compute_chi0_direct_fractional`
+
+Exact finite-occupation chi0 at selected complex frequencies.
+
+This is the ordered-pair escape hatch for isolated points at which the
+damped-contour evaluator is unaffordable.  It shares the static kernel's
+band-pair scan and distributed centroid output.  A zero entry uses the
+MP1 divided-difference limit; every nonzero entry is evaluated at its
+literal complex coordinate.  With one frequency the returned shape is
+``(n_q,n_mu,n_mu)``; otherwise it is ``(n_z,n_q,n_mu,n_mu)``.
+``progress_fn``, when supplied, is called as
+``progress_fn(rows_done, rows_total, elapsed_seconds)`` after each q-row
+result is device-ready.  It changes synchronization only, never values.
+
+### `src/gw/w_isdf.py` — `precompile_chi0`
+
+AOT lower+compile of the χ₀ minimax kernel at the real input
+shapes/shardings — warms the JAX in-process cache so the first
+``compute_chi0`` call is execution-only.  Call inside a dedicated
+``timing.section('chi0_W.chi.compile')`` block to separate compile
+from exec in the end-of-run timing report.
+
+### `src/gw/w_isdf.py` — `precompile_solve_w`
+
+AOT lower+compile of the W-solve jit.  See ``precompile_chi0``.
+
+Goes through the same ``_resolve_w_solve_fn`` dispatch as
+:func:`solve_w` so both paths agree on which jit to compile.

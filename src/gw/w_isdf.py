@@ -45,25 +45,7 @@ _STATIC_FRACTIONAL_PAIR_TILE = 32
 
 
 def _complete_static_vertex_orientations(forward_R, reverse_R=None):
-    r"""Return both ordered Hermitian-vertex orientations in R space.
-
-    ``forward_R`` has endpoint axes ``(mu_A,mu_B)``.  For two different
-    Hermitian vertices, ``reverse_R`` is the reversed ordered contribution
-    in its natural ``(mu_B,mu_A)`` orientation.  Its dagger maps it back to
-    the forward endpoint order before addition::
-
-        forward_R + reverse_R^dagger
-
-    Charge is the same-vertex special case: its natural reverse is
-    ``swapaxes(forward_R)`` and the expression reduces exactly to the
-    incumbent ``forward_R + conj(forward_R)`` completion.  Replacing either
-    form by ``2*forward_R`` is valid only in a real gauge and is wrong for a
-    complex broken-time-reversal wavefunction.
-
-    Keep this completion before the final R-to-q FFT.  It is transition
-    algebra, not a post-hoc q symmetrization, and preserves sharding
-    elementwise.
-    """
+    """Return both ordered Hermitian-vertex orientations in R space; see docs/architecture/four_current_wiring.md."""
     if reverse_R is None:
         # Preserve the incumbent scalar graph and arithmetic order exactly.
         return forward_R + jnp.conj(forward_R)
@@ -561,26 +543,7 @@ def _get_chi_fractional_contour_kernel_face(
 
 def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
                           n_rmu_logical: int | None = None):
-    """W = (I - V χ)⁻¹ V via q-parallel shard_map.  All arrays flat-q: (nq, μ, μ).
-
-    The LOCAL plan: q's are scattered over all devices
-    (``P(('x','y'),None,None)``) and each rank runs one dense pivoted LU
-    (``lu_factor``/``lu_solve``) per owned q.  LU is the right inner
-    solve: A is SQUARE and generically well conditioned (it is I minus a
-    term whose spectral radius is < 1 wherever the RPA screening is
-    physical — an eigenvalue of Vχ₀ reaching 1 is a plasmon instability,
-    not a numerical one).  One factorisation, one triangular pair of
-    solves.
-
-    ``n_rmu_logical``: when smaller than ``n_rmu`` (μ-padded inputs),
-    the per-q pivoted LU is μ-SLICED to the logical extent and the W
-    pad rows/cols are zero-filled after (their exact value: V pad rows
-    are zero).  Load-bearing for device-count invariance — LU at the
-    padded extent regroups partial sums per pad extent, and the
-    resulting 1e-8-rel W wobble is amplified to eV on near-pole GN-PPM
-    bands (reports/device_invariance_2026-07-08/ROOT_CAUSE.md, charge
-    manifestation).  At zero pad the slice/fill are no-ops.
-    """
+    """W = (I - V χ)⁻¹ V via q-parallel shard_map; see docs/architecture/four_current_wiring.md."""
     from common.shard_map import shard_map
 
     n_log = int(n_rmu_logical) if n_rmu_logical is not None else int(n_rmu)
@@ -710,57 +673,7 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
 def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
                                 n_rmu_logical: int,
                                 distrib_la_batched_route: str = "batch_reshard"):
-    """W = solve(A, V), A = (1 − pref·V·χ₀), everything 2-D sharded.
-
-    The DISTRIBUTED plan — the scale-out route for thousands of
-    low-memory processes, in the same architectural family as the
-    ζ-fit's distributed rank-truncate tier
-    (:func:`isdf.core._factor_c_q_distributed_rank_truncate`):
-
-    1. **A build** — per q-block, ``A = I − V·(pref·χ)`` as a 2-D block
-       GEMM inside ``shard_map``: rank (x, y) all-gathers V's row block
-       along 'y' (full k for its i rows, μ·μ/Px per rank) and χ's column
-       block along 'x' (full k for its j columns, μ·μ/Py per rank),
-       multiplies locally, and subtracts from its identity tile.  The
-       gathers are STRUCTURAL — inside shard_map the partitioner cannot
-       hoist them into a full-stack gather (the per_q-tier lesson,
-       quality pattern #4).  The q loop is chunked HOST-side so one
-       collective instruction never exceeds ``LORRAX_COLLECTIVE_CHUNK_MB``
-       (the AF transport bound; separate XLA executions cannot be
-       re-combined by a compiler pass).
-    2. **Factor + backsolve** — ONE resolved
-       :class:`distrib_la.Plan` for ``solve_lu`` with
-       ``backend='distributed'`` (ScaLAPACK ``pzgetrf``/``pzgetrs`` on a
-       CPU mesh, cuSOLVERMp on CUDA — ``resolve._DISTRIBUTED_DEFAULT``),
-       consuming the block-cyclic tiles where they already live.
-
-    **No rank ever materialises a full (μ, μ) tile**: inputs, A, the LU
-    factors and W all stay ``P(None,'x','y')`` (per-rank blocks of
-    μ/Px × μ/Py; the largest per-rank transient is the μ·μ/min(Px,Py)
-    gathered GEMM operand).  W lands natively in ``P(None,'x','y')`` —
-    no relayout, unlike the local plan.
-
-    Padding contract, and why it is exact: V and χ pad rows/cols are
-    exact zeros (the bilinear-in-zero-padded-ψ contract), so at the
-    PADDED extent ``A = [[A_log, 0], [0, I]]`` and ``RHS = [[V_log], [0]]``
-    hold EXACTLY — the identity-embedded block-diagonal system whose
-    solution is ``[[W_log], [0]]``; partial pivoting cannot mix the
-    blocks (every pad column is a unit vector, every pad row is zero in
-    the logical columns).  Therefore W's pad rows/cols leave the solve as
-    exact zeros without a separate post-solve mask graph.  Unlike the local
-    plan the LOGICAL
-    block is formed/factored at the padded extent, so W here carries the
-    ≤1e-8-rel pad-extent regrouping wobble — which is subsumed by the
-    block-cyclic factorisation's own non-bit-identity; this plan's
-    numerical contract is the Dyson residual (``LORRAX_W_RESIDUAL_CHECK``),
-    not bit-identity with the local plan.
-
-    Geometry/capability failures (host lib absent, non-square or 1-D
-    mesh, n not divisible, process coverage) RAISE at resolve time with
-    the resolver's own message — an explicitly requested distributed
-    solve never silently downgrades to the local plan (quality pattern
-    #6/#8).
-    """
+    """W = solve(A, V), A = (1 − pref·V·χ₀), everything 2-D sharded; see docs/architecture/four_current_wiring.md."""
     n_ext = int(n_rmu)
     n_log = int(n_rmu_logical)
     if n_log > n_ext:
@@ -911,15 +824,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
 
 
 def _w_residual_report(V_flat, chi_scaled, W, n_ext, n_check: int = 4):
-    """Direct Dyson residual ‖(1−Vχ)W − V‖/‖V‖ on the first few q.
-
-    THE strict numerical contract of the distributed plan (a
-    block-cyclic LU is not bit-comparable to the local per-q LU; the
-    residual is what certifies the solve — quality pattern #6, "test
-    what executes").  Diagnostic-only, opt-in via
-    ``LORRAX_W_RESIDUAL_CHECK=1``; never on in the traced production
-    path, so the collective-table gate is taken with it OFF.
-    """
+    """Direct Dyson residual ‖(1−Vχ)W − V‖/‖V‖ on the first few q; see docs/architecture/four_current_wiring.md."""
     ns = min(int(V_flat.shape[0]), int(n_check))
 
     @jax.jit
@@ -937,15 +842,7 @@ def _w_residual_report(V_flat, chi_scaled, W, n_ext, n_check: int = 4):
 
 
 def _w_solve_pref_scalar(meta) -> float:
-    """The physical-state prefactor in front of χ₀ in the Dyson solve.
-
-    ``nspinor_wfnfile`` is the source-WFN state multiplicity.  In a
-    kinetic-balance lift ``meta.nspinor`` becomes four only to describe the
-    bispinor representation; the band and occupation axes are unchanged.
-    Using that representation width here would therefore halve every
-    charge/current response block.  Read the source field strictly: silently
-    falling back to the representation width would reinstate that error.
-    """
+    """The physical-state prefactor in front of χ₀ in the Dyson solve; see docs/architecture/four_current_wiring.md."""
     nq = int(meta.nk_tot)
     nspin = max(1, int(getattr(meta, 'nspin', 1)))
     nspinor_wfnfile = max(1, int(meta.nspinor_wfnfile))
@@ -958,26 +855,7 @@ def _w_solve_pref_scalar(meta) -> float:
 def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
                         dyson_solver=None,
                         distrib_la_batched_route: str = "batch_reshard"):
-    """Return ``(solve_fn, pref)`` for the requested W plan.
-
-    Single source of truth for the two-plan dispatch.  Both ``solve_w``
-    and ``precompile_solve_w`` go through this helper — the dispatch
-    logic exists in one place.
-
-    ``dyson_solver`` (input key ``w_dyson_solver``) selects the plan:
-
-    ``local`` (default; ``auto`` is an alias)
-        per-q pivoted LU inside the q-parallel shard_map —
-        :func:`_get_w_solve_fn_local`.
-    ``distributed``
-        the 2-D-sharded stacked-GEMM backsolve through the linalg plan
-        facade — :func:`_get_w_solve_fn_distributed`.  Refuses loudly at
-        resolve time when the mesh/build cannot run it; never silently
-        downgrades.
-
-    W comes out ``P(None,'x','y')`` on BOTH — that is the module's
-    output contract, not a per-plan detail.
-    """
+    """Return ``(solve_fn, pref)`` for the requested W plan; see docs/architecture/four_current_wiring.md."""
     from .gw_config import normalize_w_dyson_solver
     dyson = normalize_w_dyson_solver(dyson_solver)
     nq = int(meta.nk_tot)
@@ -1003,13 +881,7 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
 
 def _require_w_operand_geometry(V_q, chi0_q, meta, mesh_xy, *,
                                 n_rmu_logical=None):
-    """Authenticate the public Dyson carrier without owning its q set.
-
-    The q axis may be full-BZ or an irreducible wedge; its mapping belongs to
-    the screening/MPA caller.  The two centroid axes, however, must be one
-    square runtime carrier shared by V and chi, owned by the packed basis
-    when present or by the canonical suffix-padding receipt otherwise.
-    """
+    """Authenticate the public Dyson carrier without owning its q set; see docs/architecture/four_current_wiring.md."""
     v_shape = tuple(int(n) for n in V_q.shape)
     chi_shape = tuple(int(n) for n in chi0_q.shape)
     if v_shape != chi_shape:
@@ -1038,37 +910,7 @@ def _require_w_operand_geometry(V_q, chi0_q, meta, mesh_xy, *,
 def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
             n_rmu_logical=None,
             distrib_la_batched_route: str = "batch_reshard"):
-    """W(q) = (I − V χ₀)⁻¹ V  via a Dyson solve.  **W comes out sharded.**
-
-    All arrays flat-q: V(nq, μ, μ), χ₀(nq, μ, μ) → W(nq, μ, μ).
-    Scalar inputs use ``meta.mu_basis``'s packed runtime extent when present,
-    otherwise ``padded_mu_extent(meta.n_rmu, mesh_xy)``.  Their q axis may be full-BZ
-    or an irreducible wedge; q-set ownership stays with the caller.  A packed
-    direct-sum caller supplies ``n_rmu_logical`` explicitly because its
-    channel padding is internal rather than one trailing scalar prefix.  The
-    distributed plan masks scalar trailing pad rows/columns to exact zero
-    before its first contraction.
-
-    **Output contract:** ``W`` is ``P(None, 'x', 'y')`` — 2-D sharded
-    W_q(μ_X, ν_Y) — on both plans, and stays that way into its
-    consumers (Σ_SX/Σ_COH's 5-D FFT spec, the PPM fit, the IBZ unfold,
-    the restart writer).
-
-    ``dyson_solver`` (input key ``w_dyson_solver``) picks one of the
-    TWO plans — see :func:`_resolve_w_solve_fn`:
-
-    - ``local`` (default): q-parallel reshard + per-q dense LU via
-      shard_map.  Legal on any mesh; each rank holds whole (μ, μ)
-      tiles for its q's.
-    - ``distributed``: 2-D-sharded stacked-GEMM backsolve through the
-      distrib_la plan door (ScaLAPACK on CPU, cuSOLVERMp on CUDA).
-      No rank ever materialises a full (μ, μ) tile — the P→∞ memory
-      ceiling.  Slower than ``local`` at moderate P; that is priced and
-      accepted (the point is the per-rank memory ceiling, not speed).
-
-    ``chi0_q``'s buffer is CONSUMED (donated) on both plans — the
-    caller must drop its reference after this call.
-    """
+    """W(q) = (I − V χ₀)⁻¹ V via a Dyson solve; see docs/architecture/four_current_wiring.md."""
     n_logical = _require_w_operand_geometry(
         V_q, chi0_q, meta, mesh_xy, n_rmu_logical=n_rmu_logical)
     solve_fn, pref = _resolve_w_solve_fn(
@@ -1106,25 +948,7 @@ def _chi_layout_operands(wfns, eref):
 
 
 def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
-    """Compute χ₀(q) from a wavefunction bundle and minimax quadrature.
-
-    Returns flat-q array (nq, μ, μ).
-
-    ``quad.tau`` and ``quad.alpha`` approximate either 1/x (static) or
-    x/(x²+ωp²) (imaginary-frequency) on [x_min, x_max] where x = E_c - E_v.
-    The physical static/imaginary-axis χ₀ contains both ordered
-    particle-hole orientations.  In the real-space convolution used here::
-
-        χ₀ = -Σ_ℓ α_ℓ [A_R(τ_ℓ) + conj(A_R(τ_ℓ))]
-
-    before the final R-to-q FFT.  The conjugate term maps to
-    ``conj(A_-q)`` and is distinct from ``A_q`` for complex broken-TR states.
-
-    A uniform energy shift via ``energy_reference`` is applied to both
-    valence and conduction energies before building the minimax factors.
-    Because only differences enter, this is algebraically invariant; the
-    knob lets callers align the global zero (e.g. midgap, VBM, CBM).
-    """
+    """Compute χ₀(q) from a wavefunction bundle and minimax quadrature; see docs/architecture/four_current_wiring.md."""
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 
@@ -1203,34 +1027,7 @@ def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
 
 def compute_chi0_imag_ordered(wfns, quad, meta, mesh_xy, *, q_neg_index,
                               energy_reference=0.0):
-    """χ₀(q; iω_p) with BOTH particle-hole orientations carrying their own
-    frequency weight — the route for a deck whose measured time-reversal
-    verdict is false.  Returns flat-q (nq, μ, μ), ``P(None, 'x', 'y')``.
-
-    :func:`compute_chi0` applies the EVEN kernel ``x/(x²+ωp²)`` to the
-    orientation sum ``A_R + conj(A_R)``, which deletes the anti-Hermitian,
-    magnetisation-odd channel ``iω(P^q − conj(P^{−q}))/(ω²+Δ²)`` of χ₀(iω)
-    (lane G, measured on CrI3 run 128).  The exact object is the SAME two
-    carriers with independent complex weights::
-
-        χ₀_q(iωp) = F_q + conj(F_{−q}),
-        F_q       = Σ_l γ_l e^{−τ_l E_gap} A_q(τ_l),   γ_l = −(α_l − iβ_l),
-
-    with ``α`` the served even rule (unchanged) and ``β`` the odd rule
-    ``ωp/(x²+ωp²)`` on the same nodes (``quad.alpha_odd``).  ``F_q`` is one
-    sweep of the existing ``complex_contour`` kernel (real nodes, complex
-    weights, no in-kernel completion) — no second response implementation —
-    and the partner is the flat-q negation gather of its conjugate, which
-    ``FFT_R[conj(A_R)] = conj(A_{−q})`` makes exact.  On a Θ deck
-    ``conj(A_{−q}) = A_q`` and this equals :func:`compute_chi0` to roundoff;
-    the caller keeps the incumbent path there so Θ decks stay bit-identical.
-    Reciprocity ``χ_{−q} = conj(χ_q)`` holds by construction.
-
-    ``q_neg_index`` is the public ``symmetry_maps.q_negation_index`` row
-    permutation for ``meta.kgrid`` — passed in, never rebuilt here (TASTE 4).
-    The probe roles run on the FULL BZ, which is the only grid on which the
-    involution is meaningful.
-    """
+    """χ₀(q; iω_p) with BOTH particle-hole orientations carrying their own frequency weight — the route for a deck whose measured time-reversal verdict is false; see docs/architecture/four_current_wiring.md."""
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     args = _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference)
@@ -1374,11 +1171,7 @@ def compute_experimental_no_pair_photon_chi0(
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
 ):
-    """Build all sixteen no-pair blocks with an experimental TT proxy.
-
-    One family class and the donated packed accumulator are resident at a
-    time; its vertices share the same Green/FFT pair at each tau node.
-    """
+    """Build all sixteen no-pair blocks with an experimental TT proxy; see docs/architecture/four_current_wiring.md."""
     from .photon_layout import pack_photon_operator
 
     layout.assert_mesh(mesh_xy)
@@ -1487,15 +1280,7 @@ def _load_static_photon_hall(
     config, meta, mesh_xy, wfn, wfn_fingerprint_binding, *,
     screen_current: bool, print_fn=print,
 ):
-    """Load/authenticate the optional Hall artifact and gate its model.
-
-    An unnamed ``static_gauge_hall_file`` is the declared ``sigma_H = 0``
-    default.  A named path always reaches the one artifact loader, including
-    the absent-path refusal.  The bare-transverse model admits an authenticated
-    artifact only when its value is exactly zero: then the Hall response is
-    identically absent and the packed operator is the same charge/TT block
-    diagonal model as the unnamed case.  Any nonzero component still refuses.
-    """
+    """Load/authenticate the optional Hall artifact and gate its model; see docs/architecture/four_current_wiring.md."""
     hall_path = str(config.paths.static_gauge_hall_file).strip()
     if not hall_path:
         if jax.process_index() == 0:
@@ -1905,17 +1690,7 @@ def compute_static_photon_response(
 
 
 def _chi0_multi_kernel_args(wfns, tau, alpha_rows, energy_reference):
-    """Shared host prep for the multi-output χ₀ paths (compute + precompile).
-
-    ``tau``: (L,) node vector (the fused static∪extra union on the probe-
-    reuse path).  ``alpha_rows``: (n_out, L) RAW quadrature weights, one
-    row per output, all on ``tau``.  Row 0 is normally the static weights
-    (zero-padded onto any extra nodes — zero-weight nodes add exact
-    zeros); further rows are probe representations on the same nodes.
-    The one-orientation prefactor ``-exp(-τ·E_gap)`` folds into every row;
-    the kernel adds the reverse ordered transition through the shared
-    R-space orientation combiner exactly as the single-output path does.
-    """
+    """Shared host prep for the multi-output χ₀ paths (compute + precompile); see docs/architecture/four_current_wiring.md."""
     s = wfns.slices
     enk_v = wfns.enk[:, s.val]
     enk_c = wfns.enk[:, s.cond]
@@ -1976,12 +1751,7 @@ def precompile_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
 
 def _chi0_contour_alpha_rows(tau, weight_rows, frequency_sign, z_values,
                              E_gap):
-    """Complete contour weights for both independent-particle resolvents.
-
-    ``frequency_sign=+1`` represents ``-1/(Delta-z)`` and ``-1`` represents
-    ``-1/(Delta+z)``.  The device kernel evolves ``Delta-E_gap``, so this
-    host-side coefficient supplies the omitted gap and requested frequency.
-    """
+    """Complete contour weights for both independent-particle resolvents; see docs/architecture/four_current_wiring.md."""
     tau = np.asarray(tau, dtype=np.complex128)
     weight_rows = np.asarray(weight_rows, dtype=np.complex128)
     frequency_sign = np.asarray(frequency_sign)
@@ -2029,12 +1799,7 @@ def _chi0_contour_kernel_args(wfns, tau, weight_rows, frequency_sign,
 
 def compute_chi0_contour(wfns, tau, weight_rows, frequency_sign, z_values,
                          meta, mesh_xy, *, energy_reference=0.0):
-    """Evaluate several complex-frequency chi0 values in one node sweep.
-
-    The scalar contour arrays select the two ``Delta +/- z`` resolvents.  All
-    Green-function construction, FFTs, contraction, and sharding are the same
-    operations used by :func:`compute_chi0`.
-    """
+    """Evaluate several complex-frequency chi0 values in one node sweep; see docs/architecture/four_current_wiring.md."""
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     args, n_out = _chi0_contour_kernel_args(
@@ -2057,58 +1822,7 @@ def compute_chi0_contour_ordered(
     energy_reference=0.0,
     return_reflected=False,
 ):
-    r"""Evaluate magnetic contour samples with both ordered orientations.
-
-    For an upper-half-plane sample ``z`` the independent-particle response is
-
-    ``chi0_q(z) = F_q(z) + conj(F_{-q}(-conj(z)))``,
-
-    where the kernel's native orientation is
-    ``F_q(z) = -P_q/(z+Delta)``.  Both ``F(z)`` and
-    ``F(-conj(z))`` are outputs of ONE contour sweep through the existing
-    response kernel.  The second orientation is then a flat-q negation
-    gather and conjugation; no second response kernel is evaluated and no
-    large intermediate is rematerialized on fewer than all processors.
-
-    This is the complex-contour analogue of
-    :func:`compute_chi0_imag_ordered`.  The incumbent
-    :func:`compute_chi0_contour` applies the two scalar resolvents to the same
-    transition orientation, which is valid after a time-reversal completion
-    but deletes the magnetisation-odd channel when time reversal is broken.
-    Callers therefore select this route only from ``SymMaps.trs_allowed``.
-
-    Parameters
-    ----------
-    wfns
-        Wavefunction bundle.  Its flat k axis remains sharded as in the
-        ordinary contour kernel.
-    time, weights
-        Positive real-time quadrature nodes and weights, shape ``(L,)``, in
-        reciprocal-energy and time units respectively.
-    z_values
-        Upper-half-plane complex frequencies, shape ``(n_z,)``, in the same
-        energy unit used by ``wfns.enk``.
-    meta, mesh_xy
-        Runtime metadata and the two-dimensional processor mesh.
-    q_neg_index
-        Public ``symmetry_maps.q_negation_index`` permutation, shape
-        ``(n_q,)``.  It must be an involution on the complete flat q grid.
-    energy_reference
-        Common energy origin subtracted from valence and conduction bands.
-    return_reflected
-        When true, also return the independently completed response at
-        ``-conj(z)``.  Both orientations already belong to the same contour
-        sweep; this option exposes the second completion without evaluating
-        another response kernel.  The default preserves the incumbent return
-        object exactly.
-
-    Returns
-    -------
-    jax.Array or tuple[jax.Array, ...]
-        One flat-q ``(n_q, n_mu, n_mu)`` response for one frequency, or an
-        ``n_z`` tuple for several frequencies.  Arrays retain
-        ``P(None, 'x', 'y')`` sharding.
-    """
+    """Evaluate magnetic contour samples with both ordered orientations; see docs/architecture/four_current_wiring.md."""
     time = np.asarray(time, dtype=np.float64)
     weights = np.asarray(weights, dtype=np.float64)
     z = np.asarray(z_values, dtype=np.complex128)
@@ -2203,31 +1917,7 @@ def precompile_chi0_contour(wfns, tau, weight_rows, frequency_sign,
 def _occupation_support_slices(
         occupations,
         occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT):
-    """Smallest contiguous f and (1-f) band supports without truncation.
-
-    THIS IS THE ONE PLACE χ₀'s TWO GREEN'S FUNCTIONS GET THEIR BANDS, and
-    unlike the Σ planner's mask it is a genuine COST cut: the returned slices
-    index ``wfns.xn``/``yr``, so a band outside them is absent from the
-    ``build_G_tau`` contraction rather than merely multiplied by a small
-    weight.  ``occupation_support_bandwidth`` reads the same two slices to
-    size the damped-line rule, so widening them also buys quadrature nodes.
-
-    ``occupation_window_threshold`` is the OCCUPANCY at which a band leaves a
-    support; the cut is on the branch WEIGHT — ``f`` on the occupied side,
-    ``1 − f`` on the empty side, matching ``band_weight=occ_f`` and
-    ``band_weight=1.0 - occ_u`` in the kernel — at the floor
-    ``1 − threshold``, by MAGNITUDE.  Nothing is clipped: MP1 occupations
-    overshoot [0, 1] and a wrong-side band's NEGATIVE weight is kept by
-    ``abs`` exactly as the historical rule kept it (the argument is at
-    ``gw.efermi.band_in_occupation_window``).  Partially occupied bands
-    belong to both slices, as before.
-
-    ``threshold = 1.0`` gives floor 0.0 and restores the historical exact
-    rule (``occ != 0`` / ``occ != 1``) bit-for-bit; an insulating table, whose
-    weights are exactly 0 or 1, gives the same two slices at EVERY threshold,
-    since ``abs(1) > floor`` and ``abs(0) > floor`` are threshold-independent
-    on [0.5, 1.0].
-    """
+    """Smallest contiguous f and (1-f) band supports without truncation; see docs/architecture/four_current_wiring.md."""
     occ = np.asarray(jax.device_get(occupations), dtype=np.float64)
     if occ.ndim != 2:
         raise ValueError(
@@ -2349,18 +2039,7 @@ def compute_chi0_contour_fractional(
     energy_reference=0.0,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ):
-    """Evaluate retarded finite-occupation chi0 at complex frequencies.
-
-    weight_rows contains the positive real-time quadrature weights; this
-    routine supplies exp(i*z*t) and both exact Keldysh terms.  It does not
-    implement z=0: the gapless static limit contains the finite divided
-    difference -df/dE and requires its own certified integration rule.
-
-    ``occupation_window_threshold`` is the OCCUPANCY at which a band leaves
-    one of the two Green's-function supports; it MUST be the same value the
-    caller gave ``occupation_support_bandwidth``, or the damped-line rule is
-    sized for transitions the band slices no longer contain.
-    """
+    """Evaluate retarded finite-occupation chi0 at complex frequencies; see docs/architecture/four_current_wiring.md."""
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     args, n_out = _chi0_fractional_contour_args(
@@ -2421,10 +2100,7 @@ def _fractional_pair_scan_face(
     x_idx = jax.lax.axis_index('x')
 
     def _gather_mun(psi_mun_local, g_lo):
-        """(nk, s, mu_X_loc, tile) un-conjugated, present on every rank —
-        masked-gather + psum('y') from psi_mun's local shard (bands on
-        'y').  psi_mun's own axis order (nk, s, mu, n) already matches
-        the direct endpoint (nk, s, mu_X, n) -- no reorder needed."""
+        """(nk, s, mu_X_loc, tile) un-conjugated, present on every rank — masked-gather + psum('y') from psi_mun's local shard (bands on 'y'); see docs/architecture/four_current_wiring.md."""
         p = jnp.arange(tile, dtype=jnp.int32)
         global_band = g_lo + p
         owner = global_band // shard_w_y
@@ -2436,12 +2112,7 @@ def _fractional_pair_scan_face(
         return jax.lax.psum(gathered, 'y')
 
     def _gather_nmu(psi_nmu_local, g_lo):
-        """(nk, s, mu_Y_loc, tile) un-conjugated, present on every rank —
-        masked-gather + psum('x') from psi_nmu's local shard (bands on
-        'x'), then a LOCAL (no-comm, bounded-size — this tile is `tile`
-        bands wide, not nb_full) axis reorder: psi_nmu stores (nk, n, s,
-        mu), band axis SECOND, so the post-gather (nk, tile, s, mu_Y_loc)
-        needs one transpose to match the band-last endpoint (nk, s, mu, n) order."""
+        """(nk, s, mu_Y_loc, tile) un-conjugated, present on every rank — masked-gather + psum('x') from psi_nmu's local shard (bands on 'x'), then a LOCAL (no-comm, bounded-size — this tile is `tile` bands wide, not nb_full) axis reorder: psi_nmu stores (nk, n, s, mu), band axis SECOND, so the post-gather (nk, tile, s, mu_Y_loc) needs one transpose to match the band-last endpoint (nk, s, mu, n) order; see docs/architecture/four_current_wiring.md."""
         p = jnp.arange(tile, dtype=jnp.int32)
         global_band = g_lo + p
         owner = global_band // shard_w_x
@@ -2758,22 +2429,7 @@ def compute_chi0_static_fractional_gamma(
     *,
     nb_logical: int,
 ):
-    r"""Return the exact static fractional-occupation chi0 at Gamma.
-
-    The ordered-pair kernel evaluates
-
-    ``(f_ka-f_kb)/(E_ka-E_kb)``
-
-    and uses ``df/dE`` on the degenerate diagonal.  The supplied surface
-    table owns that diagonal limit; the QSGW metal path supplies periodic
-    tetrahedron weights, while off-diagonal pairs retain the carried MP1
-    occupations.  The returned ``(1,n_mu,n_mu)`` array has the historical
-    raw-chi normalization expected by :func:`solve_w`.
-
-    This direct tiled implementation is the exact finite-band fallback.  A
-    future certified separable divided-difference minimax target can replace
-    its internals without changing this API or the Dyson/head callers.
-    """
+    """Return the exact static fractional-occupation chi0 at Gamma; see docs/architecture/four_current_wiring.md."""
     e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     f = jnp.asarray(occupations_kn, dtype=jnp.float64)
     surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
@@ -2831,16 +2487,7 @@ def compute_chi0_static_fractional_gamma(
 def occupation_support_bandwidth(
         energies_kn_ry, occupations_kn,
         occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT):
-    """Largest transition energy over the occupation supports, Ry.
-
-    ``max(E over the (1-f) support) − min(E over the f support)`` over the
-    SAME two slices :func:`_occupation_support_slices` hands the χ₀ kernel,
-    so the rule bandwidth and the bands it must resolve can never disagree —
-    which is why the threshold is an argument here rather than a second
-    default.  An MP1 overshoot band at a support edge is included, by
-    magnitude.  This — not ``quad.x_max`` — sizes the damped-line rule
-    bandwidth on metal plans, where the occupied and empty supports overlap.
-    """
+    """Largest transition energy over the occupation supports, Ry; see docs/architecture/four_current_wiring.md."""
     e = np.asarray(jax.device_get(energies_kn_ry), dtype=np.float64)
     f_slice, u_slice = _occupation_support_slices(
         occupations_kn, occupation_window_threshold)
@@ -2856,21 +2503,7 @@ def compute_chi0_static_fractional(
     kminq_rows,
     nb_logical=None,
 ):
-    """Exact static finite-occupation chi0 for every stored q row.
-
-    The finite-q generalization of
-    :func:`compute_chi0_static_fractional_gamma`: for wedge row j the b
-    side of every ordered pair rides at ``k − q_j`` through the caller's
-    precomputed flat map ``kminq_rows[j]`` (``common.kq_mapping``), and
-    the divided difference ``(f_a(k)−f_b(k−q))/(E_a(k)−E_b(k−q))`` uses
-    the analytic MP1 ``−df/dE`` midpoint limit on accidentally degenerate
-    pairs.  This is the literal static member of the shared ordered-pair
-    evaluator; the metal MPA shifted-origin slot instead calls
-    :func:`compute_chi0_direct_fractional` at its stamped nonzero ``z``.
-    Returns ``(n_q, n_mu, n_mu)``
-    wedge rows in the raw-chi normalization expected by :func:`solve_w`,
-    sharded ``P(None, 'x', 'y')``.
-    """
+    """Exact static finite-occupation chi0 for every stored q row; see docs/architecture/four_current_wiring.md."""
     return compute_chi0_direct_fractional(
         wfns, np.asarray([0.0j], dtype=np.complex128), meta, mesh_xy,
         occupation_state=occupation_state, kminq_rows=kminq_rows,
@@ -2888,18 +2521,7 @@ def compute_chi0_direct_fractional(
     nb_logical=None,
     progress_fn=None,
 ):
-    """Exact finite-occupation chi0 at selected complex frequencies.
-
-    This is the ordered-pair escape hatch for isolated points at which the
-    damped-contour evaluator is unaffordable.  It shares the static kernel's
-    band-pair scan and distributed centroid output.  A zero entry uses the
-    MP1 divided-difference limit; every nonzero entry is evaluated at its
-    literal complex coordinate.  With one frequency the returned shape is
-    ``(n_q,n_mu,n_mu)``; otherwise it is ``(n_z,n_q,n_mu,n_mu)``.
-    ``progress_fn``, when supplied, is called as
-    ``progress_fn(rows_done, rows_total, elapsed_seconds)`` after each q-row
-    result is device-ready.  It changes synchronization only, never values.
-    """
+    """Exact finite-occupation chi0 at selected complex frequencies; see docs/architecture/four_current_wiring.md."""
     from gw.efermi import mp1_negative_derivative
 
     family = getattr(occupation_state, "smearing_family", None)
@@ -3009,12 +2631,7 @@ def precompile_chi0_contour_fractional(
 
 
 def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
-    """AOT lower+compile of the χ₀ minimax kernel at the real input
-    shapes/shardings — warms the JAX in-process cache so the first
-    ``compute_chi0`` call is execution-only.  Call inside a dedicated
-    ``timing.section('chi0_W.chi.compile')`` block to separate compile
-    from exec in the end-of-run timing report.
-    """
+    """AOT lower+compile of the χ₀ minimax kernel at the real input shapes/shardings — warms the JAX in-process cache so the first ``compute_chi0`` call is execution-only; see docs/architecture/four_current_wiring.md."""
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     eref = 0.0 if energy_reference is None else float(energy_reference)
@@ -3047,11 +2664,7 @@ def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
 def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
                        n_rmu_logical=None,
                        distrib_la_batched_route: str = "batch_reshard"):
-    """AOT lower+compile of the W-solve jit.  See ``precompile_chi0``.
-
-    Goes through the same ``_resolve_w_solve_fn`` dispatch as
-    :func:`solve_w` so both paths agree on which jit to compile.
-    """
+    """AOT lower+compile of the W-solve jit; see docs/architecture/four_current_wiring.md."""
     ensure_jax_compile_cache()
     n_logical = _require_w_operand_geometry(
         V_q, chi0_q, meta, mesh_xy, n_rmu_logical=n_rmu_logical)
