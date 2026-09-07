@@ -20,22 +20,33 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/gw_jax.py` | `main` | 1448 | 1021 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/gw_jax.py` | `main` | 1448 | 118 | Existing statements moved to named stages or dead selector removed |
 | `src/gw/gw_jax.py` | `main._config_print` | 5 | 0 | Deleted or renamed to direct owner |
-| `src/gw/gw_jax.py` | `_open_production_report` | 0 | 38 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_open_production_report` | 0 | 27 | New explicit phase/direct owner |
 | `src/gw/gw_jax.py` | `_open_production_report._config_print` | 0 | 5 | New explicit phase/direct owner |
-| `src/gw/gw_jax.py` | `_report_head_and_photon_policy` | 0 | 64 | New explicit phase/direct owner |
-| `src/gw/gw_jax.py` | `_load_system_inputs` | 0 | 46 | New explicit phase/direct owner |
-| `src/gw/gw_jax.py` | `_prepare_band_metadata` | 0 | 63 | New explicit phase/direct owner |
-| `src/gw/gw_jax.py` | `_report_sampling_and_bands` | 0 | 39 | New explicit phase/direct owner |
-| `src/gw/gw_jax.py` | `_prepare_oneshot_response` | 0 | 94 | New explicit phase/direct owner |
-| `src/gw/gw_jax.py` | `_install_oneshot_head` | 0 | 30 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_report_head_and_photon_policy` | 0 | 46 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_load_system_inputs` | 0 | 40 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_prepare_band_metadata` | 0 | 41 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_report_sampling_and_bands` | 0 | 29 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_prepare_isdf_carriers` | 0 | 54 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_prepare_oneshot_response` | 0 | 57 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_report_packed_screening` | 0 | 57 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_run_oneshot_screening` | 0 | 89 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_install_oneshot_head` | 0 | 26 | New explicit phase/direct owner |
 | `src/gw/gw_jax.py` | `_persist_screening` | 0 | 15 | New explicit phase/direct owner |
-| `src/gw/gw_jax.py` | `_prepare_static_head` | 0 | 24 | New explicit phase/direct owner |
-| `src/gw/gw_jax.py` | `_load_kinetic_ionic_hamiltonian` | 0 | 21 | New explicit phase/direct owner |
-| `src/gw/gw_jax.py` | `_close_timing` | 0 | 23 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_prepare_static_head` | 0 | 15 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_run_oneshot_sigma` | 0 | 51 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_load_kinetic_ionic_hamiltonian` | 0 | 20 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_solve_qp_stage` | 0 | 56 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_sigma_output_fields` | 0 | 84 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_diagonalize_qp_hamiltonian` | 0 | 28 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_sigma_diagnostic_fields` | 0 | 84 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_assemble_gw_results` | 0 | 56 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_write_gw_results` | 0 | 43 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_close_timing` | 0 | 13 | New explicit phase/direct owner |
+| `src/gw/gw_jax.py` | `_report_final_observables` | 0 | 72 | New explicit phase/direct owner |
 | `src/gw/gw_jax.py` | `_report_file_rows` | 0 | 45 | New explicit phase/direct owner |
-| `src/gw/gw_jax.py` | **File total** | 1712 | 1811 | Net +99 lines |
+| `src/gw/gw_jax.py` | **File total** | 1712 | 1476 | Net -236 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -199,7 +210,7 @@
 
 | Tree scope | Before | After | Net |
 |---|---|---|---|
-| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 125271 | 24 |
+| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 124936 | -311 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
@@ -207,7 +218,8 @@
 | 2 — direct Gram (9b41e422) | 1396 | 543 passed,2 skipped,1 xfailed; centroid/parent/Gram/downfold/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-175412-2208707-1724, lx-Xg4-175656-2221647-2270; 07_gram_cpu/cpu.xml; 07_gram_p4_ready/mos2/identity.json |
 | 3 — symmetry stages (c604c3d6) | 1397 | 445 passed,2 skipped,1 xfailed; centroid/parent/physics/symmetry | Si SOC GN exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-180057-2240310-9849, lx-Xg4-180106-2241405-3156; 09_symmetry_stages/cpu/cpu.xml; 09_symmetry_stages/p4/si_soc/identity.json |
 | 4 — driver/photon stages (76a1587d) | 1398 | 467 passed,2 skipped,1 xfailed; centroid/parent/photon/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-180746-2273070-8918, lx-Xg4-180754-2273585-4383; 10_photon_stages/cpu/cpu.xml; 10_photon_stages/p4/mos2/identity.json |
-| 5 — zeta stages (this commit) | 1399 | 485 passed,2 skipped,1 xfailed; parent/factor-hoist/mesh-invariance/charge/refit/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-181422-2302374-7638, lx-Xg4-181430-2302826-9451; 11_zeta_stages/cpu/cpu.xml; 11_zeta_stages/p4/mos2/identity.json |
+| 5 — zeta stages (b3487462) | 1399 | 485 passed,2 skipped,1 xfailed; parent/factor-hoist/mesh-invariance/charge/refit/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-181422-2302374-7638, lx-Xg4-181430-2302826-9451; 11_zeta_stages/cpu/cpu.xml; 11_zeta_stages/p4/mos2/identity.json |
+| 6 — complete driver stages (this commit) | 1401 | 456 passed,2 skipped,1 xfailed; centroid closure/parent/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-183807-44846-3326, lx-Xg4-183816-45219-2050; 14_driver_stages/cpu/cpu.xml; 14_driver_stages/p4/mos2/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|
@@ -220,5 +232,7 @@
 | Captured symmetry data in identity caches | Shape equality alone does not authenticate captured action tables; no unsafe shape-only replacement |
 | Strict-key legacy exemptions | read_lorrax_input includes _LEGACY_DECK_KEYS in _known; dropping only explicit refusals would silently accept retired keys |
 | First push parent synchronization | Fetched parent immediately before first push; still c2f69987, so no rebase needed. No rebases after first push |
+| Reverted centroid-loader stage cut | 12_centroid_stages/verdict.txt: P4 exact; CPU1 failed/460 passed/2 skipped/1 xfailed because test_centroid_fft_k_plan requires in-entry calls. Source and contract relocation reverted |
+| Reverted Sigma stage cut | 13_sigma_stages/verdict.txt: P4 exact; CPU9 failed/496 passed/2 skipped/3 xfailed: four nb=3 fixtures incompatible with CPU4 band sharding, four absent-host-FFI failures, one entry-body structural guard. Source/tests/contract relocation reverted |
 | Final CPU/core/P16/compile-event gates | Pending; no final-suite or performance claim |
 | CPU skips/xfail | Host FFT FFI unavailable; not WSL; existing CPU partitioned-max NaN xfail. Explicit scoped CPU logs own details |

@@ -266,11 +266,6 @@ def _open_production_report(args):
         if "[config provenance]" in text:
             _config_provenance.append(text)
     print0 = _config_print
-
-    # ---- Configuration ----
-    # The two orthogonal physics axes are resolved + validated up front so
-    # inconsistent (qp_solver × compute_mode × accumulation) combinations
-    # fail before any heavy compute (see ``LorraxConfig.qp_solver``).
     config = LorraxConfig.from_input_file(args.input, print_fn=print0)
     input_dir = config.input_dir
     qp_solver = config.qp_solver     # how QP energies are extracted from Σ
@@ -286,12 +281,6 @@ def _open_production_report(args):
                      else production_stdout.emit)
     print0 = report.legacy_print
     report.begin(input_file=args.input, config=config)
-    # A mode may be DECLARED on the axis before its Σ stage exists (today:
-    # ``mpa``).  Refusing here — before the WFN read, before ISDF, before
-    # any allocation is spent — is the difference between an operator
-    # learning in the first second and learning after the ζ fit.  The
-    # refusal names the mode; a typo'd mode value never reaches this line
-    # because ``config.compute_mode`` already raised on it.
     refuse_unimplemented_compute_mode(mode, context="the LORRAX GW driver")
     do_screened = mode.needs_screening
     return (config, input_dir, qp_solver, mode, report, production_stdout, print0, _config_provenance, do_screened)
@@ -321,12 +310,6 @@ def _report_head_and_photon_policy(config, print0, report):
         print0(
             f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}"
             f"{_bispinor_note}")
-        # Which route a bare-transverse deck takes is deck-visible, never
-        # silent: the packed path and the incumbent charge-screened + Sigma^B
-        # path are the SAME physics inside the envelope below (lane C gate,
-        # reports/bisp_c_bare_as_packed_2026-09-01), but they differ in the
-        # q->0 head mechanism, so the reader must be told which one ran and,
-        # when it is the incumbent one, the first condition that decided it.
         _bare_taken, _bare_reason = packed_bare_transverse_route(config)
         if config.bispinor_gw.value == "full_static_cohsex":
             report.progress(
@@ -334,10 +317,6 @@ def _report_head_and_photon_policy(config, print0, report):
                 "(sixteen response and Sigma blocks; coupled 4x4 Dyson solve; "
                 "Gamma-cell completion carries charge, mixed, and transverse heads)")
         else:
-            # In production mode print0 sinks component chatter, so this goes
-            # into the RUN RECORD: which of two physically equivalent-inside-
-            # the-envelope routes ran is exactly the fact a later reader needs
-            # (they differ in the q->0 head mechanism).
             report.progress(
                 "Photon route   : "
                 + ("packed static photon operator (chi_TT = chi_CT = 0; scalar "
@@ -348,14 +327,6 @@ def _report_head_and_photon_policy(config, print0, report):
                    "incumbent charge-screened W + Sigma^B "
                    "(gw.sigma_x_bispinor) with the scalar band-diagonal q->0 "
                    f"head -- {_bare_reason}"))
-        # HEADS ARE ALWAYS ON (owner ruling 2026-09-01,
-        # docs/architecture/decisions.md; TASTE.md row 20).  The packed route
-        # already prints a boxed WARNING banner and a `Photon head` record
-        # line when head_correction=off (gw.w_isdf, lane B).  The INCUMBENT
-        # route printed only "no special Gamma-cell contribution" in the
-        # component chatter that production mode sinks, so a headless
-        # bispinor bulk / dynamic / x_only run reached eqp1.dat with no
-        # DEBUG token anywhere in the run record (lane J section 3.c).
         if not uses_static_photon_response(config):
             _banner, _head_record = incumbent_bispinor_head_record(config)
             if _banner:
@@ -386,9 +357,6 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
         sym = sym.trivial_view()
     centroid_indices = centroid_basis.centroid_indices
     n_rmu = centroid_basis.n_rmu
-    # This receipt is reporting evidence.  ``resolve_qgrid_symmetry_tables``
-    # remains the one q-storage policy/table authority and deliberately
-    # remeasures through the same symmetry_maps service at its execution seam.
     tmp_dir = os.path.join(input_dir, "tmp")
     os.makedirs(tmp_dir, exist_ok=True)
     tensors_filename = os.path.join(tmp_dir, f"isdf_tensors_{n_rmu}.h5")
@@ -399,9 +367,6 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
     report.layout_dials(
         config=config, n_mu=n_rmu, n_q_irr=int(sym.nk_red),
         processes=RUNTIME.process_count)
-    # The two user-facing execution dials belong in the first startup lines.
-    # Their numeric memory receipt needs the loaded WFN symmetry and centroid
-    # basis, so defer the longer architecture/method sections until now.
     if _config_provenance:
         report.heading("Configuration provenance")
         for line in _config_provenance:
@@ -415,17 +380,8 @@ def _prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym
     """Produce the physical and padded band windows on the packed centroid basis."""
     charge_bispinor = uses_four_spinor_finite_q_charge(
         config.bispinor, config.bispinor_gw)
-    # A self-consistent diagonal buffer evaluates a bounded number of real
-    # states immediately outside the user-named nval/ncond window.  The named
-    # counts remain the physical/full-matrix window; only Meta's execution
-    # edges expand.  Other solvers and buffer_nbands=0 retain their exact
-    # historical Meta construction.
     _sc_buffer = (int(config.sc.buffer_nbands)
                   if config.qp_solver is QPSolver.SELF_CONSISTENT else 0)
-    # THE in-memory centroid order (common.centroid_basis): whole symmetry
-    # orbits per shard so every symmetry action is rank-local; files keep
-    # the canonical order and convert at the I/O seam.  Each current family has
-    # its own independently packed basis.
     from common.centroid_basis import PackedCentroidBasis
     mu_basis = PackedCentroidBasis.build(
         centroid_indices, sym, wfn.fft_grid, mesh_xy)
@@ -446,23 +402,10 @@ def _prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym
     meta.rank = RUNTIME.process_index
     meta.n_proc = RUNTIME.process_count
     meta.sys_dim = config.sys_dim
-    # ``Meta`` describes the charge/CC carrier.  Spatial-current enablement
-    # remains the independently parsed ``config.bispinor`` policy.
     meta.bispinor = charge_bispinor
     band_slices = BandSlices.from_band_edges(
         *meta.band_edges, b4_chi=meta.b_id_4_chi,
         b4_sigma=meta.b_id_4_sigma, b4_logical=meta.b_id_4_user)
-    # THE ``max`` IS NEVER SILENT.  Which of the two counts sized the ISDF ζ
-    # fit is exactly the thing a reader of this log needs and cannot infer:
-    # ``nband`` in the deck echo is already the max, so without this line a
-    # split deck and an unsplit one at the larger count print the same
-    # number.  Printed here, above the ζ fit, because this is where the
-    # window it is about is decided.
-    # RESOLVED, not requested: ``config.zeta_nband`` is a logical deck count
-    # and the edge the fit gets is measured against the PADDED ``b4``.  This
-    # banner used to print "sized for 700 bands" on a deck whose resolver and
-    # memory planner were both acting on 160 (gw_init.resolve_zeta_fit_edge is
-    # the one place that comparison is made).
     zeta_fit_edge = resolve_zeta_fit_edge(
         band_slices, getattr(config, "zeta_nband", None))
     print0(f"  {config.bands.describe(zeta_fit_edge)}")
@@ -488,21 +431,11 @@ def _report_sampling_and_bands(
         _sigma_axis = sigma_band_axis(
             _nbs, mesh_xy,
             ansatz=f"compute_mode = {getattr(mode, 'value', mode)}")
-        # The second refusal that used to live here -- sharded layout with
-        # slab_io=h5py_allgather at P>1, which would have re-introduced the
-        # full Σ_c(ω) cube gather inside the sigma_mnk.h5 writer -- is gone
-        # with the tier.  It was door 7 of 7 and the only one that read
-        # ``jax.process_count()`` raw instead of the launcher-aware count,
-        # so it was also the weakest.  Nothing can select that writer now.
         print0(
             f"  Sigma omega layout: sharded; Σ_c(ω,k,m,n) stays "
             f"(m_X, n_Y)-tiled on the {_p_x}x{_p_y} mesh at "
             f"logical/carrier={_sigma_axis.logical}/{_sigma_axis.carrier} "
             f"(consumers read tiles; no full-cube replication).")
-
-    # DFT eigenvalues on the Σ band window (Ry) — one fetch, reused by the
-    # Σ_X diagnostic, the SC initial state, degeneracy averaging, and the
-    # results writer.
     enk_dft, _ = get_enk_bandrange(
         wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
         nspinor=meta.nspinor)
@@ -517,58 +450,87 @@ def _report_sampling_and_bands(
     return (enk_dft)
 
 
+def _prepare_isdf_carriers(
+        band_slices, bgw_v_grid_fn, centroid_indices, config, material_class, mesh_xy, meta,
+        mode, print0, qp_solver, sym, tensors_filename, tmp_dir, wfn):
+    """Produce the fitted ISDF operators and wavefunction views."""
+    with timing.section("gw_jax.isdf", announce=True,
+                        label="ISDF basis + wavefunctions"):
+        isdf = prepare_isdf_and_wavefunctions(
+            cfg=config,
+            wfn=wfn,
+            sym=sym,
+            meta=meta,
+            centroid_indices=centroid_indices,
+            band_slices=band_slices,
+            mesh_xy=mesh_xy,
+            tmp_dir=tmp_dir,
+            tensors_filename=tensors_filename,
+            print0=print0,
+            bgw_v_grid_fn=bgw_v_grid_fn,
+        )
+    V_qmunu = isdf.V_qmunu
+    wfns = isdf.wf_bundle
+    green_parent_carrier = getattr(isdf, 'green_parent_carrier', None)
+    sigma_parent_carrier = getattr(isdf, 'sigma_parent_carrier', None)
+    wfns_sigma = wfns
+    wfns_screening = wfns
+    oneshot_occupation_state = (
+        _oneshot_mpa_occupation_state(
+            config, wfn, wfns, material_class, mesh_xy=mesh_xy, print_fn=print0)
+        if (qp_solver is not QPSolver.SELF_CONSISTENT
+            and mode.value == "mpa") else None)
+    if oneshot_occupation_state is not None:
+        print0(
+            "  one-shot occupations: fixed-N MP1 state, "
+            f"mu={oneshot_occupation_state.mu_ry * RYD_TO_EV:.8f} eV, "
+            f"width={oneshot_occupation_state.smearing_width_ry:.10f} Ry, "
+            f"occ_hash={oneshot_occupation_state.occ_hash}")
+    wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
+    if config.bispinor and wfns_transverse is None:
+        raise RuntimeError(
+            "bispinor = true but no transverse-centroid Wfns bundle was "
+            "produced (Σ^B would be silently dropped).  Check "
+            "centroids_file_current and, on restart, that the restart "
+            "file carries psi_parent_y_transverse.")
+    bispinor_v_q_path = (
+        os.path.join(tmp_dir, 'v_q_bispinor.h5')
+        if wfns_transverse is not None else None
+    )
+    if bispinor_v_q_path is not None and not os.path.exists(bispinor_v_q_path):
+        raise RuntimeError(
+            f"bispinor: {bispinor_v_q_path} is missing.  The V^{{i,j}} "
+            f"tile file is written by the non-restart pipeline "
+            f"(compute_V_q); on restart it must still be present in "
+            f"tmp/.  Rerun with restart = false to regenerate it.")
+    return (V_qmunu, bispinor_v_q_path, green_parent_carrier, isdf, oneshot_occupation_state, wfns, wfns_screening, wfns_sigma, wfns_transverse)
+
+
 def _prepare_oneshot_response(
         config, do_screened, input_dir, material_class, mesh_xy, meta, mode, print0,
         qp_solver, wfn, wfns, wfns_sigma):
     """Produce quadrature and direct head-response inputs for one-shot screening."""
     quad, e_ref = None, None
     if do_screened:
-        # The minimax τ-axis, solved on G's actual spectral range — shared
-        # by every χ₀ build this run (static + probe W here, SC re-solves).
-        # TIMED because it is the classic mis-attribution on this path: the
-        # crossing-minimax solve costs ~95 s cold with no cache and no
-        # shipped table (XPROF_TRACE_GUIDE §"Known LORRAX cost centers"),
-        # and with no row of its own that 95 s reads as "GW startup".
         with timing.section("gw_jax.minimax_quadrature", announce=True,
                             label="minimax tau-axis"):
-            # The minimax service announces every served/uncertified rule with
-            # ``warnings.warn`` in each process.  This request is deterministic
-            # and collective, so keep its loud provenance warning once on the
-            # output owner instead of repeating it P times.  The filter is local
-            # to this call; exceptions and warnings from later rank-local work
-            # remain untouched.
             with warnings.catch_warnings():
                 if jax.process_index() != 0:
                     warnings.simplefilter("ignore", RuntimeWarning)
                 quad, e_ref = build_static_quadrature(
                     wfns, config.minimax_config,
-                    # A metal's fundamental gap is not its smallest MEANINGFUL
-                    # transition; the smearing width is.  Insulating decks
-                    # carry no smearing and keep the incumbent interval.
                     occupation_width_ry=(
                         float(config.occ_broadening_ry)
                         if getattr(config, "occ_smearing_family", None)
                         else None),
                     print_fn=print0)
-
-    # One-shot and QSGW now share one response/finalization implementation.
-    # Build the irreducible DFT tensor and its wings on the exact chi0 band
-    # manifold before W, then retain only the tiny finalized head after W.
     oneshot_head_response = None
     oneshot_head_requests = None
     oneshot_mpa_plan = None
     if (do_screened
             and config.head.correction is HeadCorrection.FULL
             and config.screening.diagrams is ScreeningDiagrams.W_RPA
-            # The DYNAMIC packed route keeps the scalar charge owner (its CC
-            # channel is Sigma_x + Sigma_c(omega) on W_00), so it still needs
-            # the direct DFT response its q->0 head samples are finalized
-            # from.  Only the STATIC packed mode, whose packed Gamma-cell
-            # completion replaces that machinery outright, skips it.
             and not packed_photon_replaces_charge_sigma(config)
-            # Every self-consistent mode builds its exact frequency plan and
-            # response inside the map.  A pre-map response would exist only to
-            # seed a restart artifact and could be mistaken for final physics.
             and qp_solver is not QPSolver.SELF_CONSISTENT):
         from .qsgw_head import build_dft_head_response
         if mode.value == "mpa":
@@ -583,20 +545,10 @@ def _prepare_oneshot_response(
             oneshot_omegas = np.asarray(
                 [complex(r.omega_ry) for r in oneshot_head_requests],
                 dtype=np.complex128)
-        # An explicit MPA fit is validate-or-refuse and already owns its
-        # finalized scalar head.  Keep the live plan above for authentication,
-        # but do not allocate a direct response the reuse branch must discard.
         reused_mpa_fit_owns_head = (
             mode is ComputeMode.MPA
             and config.mpa.fit_reuse_file is not None)
         if oneshot_omegas.size and not reused_mpa_fit_owns_head:
-            # ONE charge bundle: both shipped bispinor_gw values ride the
-            # raw kinetic-balance carrier, so the scalar q->0 head/wings are
-            # built on the run's own charge centroids.  The separate
-            # source-Pauli head bundle went with the two retired
-            # carrier-comparison modes (2026-09-01).
-            # The Sigma view carries the parent carrier: on parents-only
-            # storage the wings stream the children from it (qsgw_head).
             oneshot_head_response = build_dft_head_response(
                 wfns_sigma, oneshot_omegas,
                 input_dir=input_dir, mesh=mesh_xy,
@@ -613,6 +565,156 @@ def _prepare_oneshot_response(
     return (quad, e_ref, oneshot_head_response, oneshot_head_requests, oneshot_mpa_plan)
 
 
+def _report_packed_screening(_dynamic_packed, _screens_current, mode, photon_response, print0, report):
+    """Report the resolved packed screening and Gamma completion."""
+    print0(
+        "  static photon route: "
+        + ("full_static_cohsex (sixteen chi blocks, one packed "
+           "Dyson solve)" if _screens_current else
+           "bare_transverse as the packed path (chi_TT = chi_CT = 0; "
+           "scalar Dyson on CC, W_packed = diag(W_00, D_TT))")
+        + ("" if not _dynamic_packed else
+           "; DYNAMIC packed route: the CC block carries "
+           f"compute_mode = {mode.value} at every omega and the "
+           "fifteen current blocks are frozen at omega = 0"))
+    print0(
+        "  static photon response: "
+        f"approximation={photon_response.approximation}, "
+        f"current_model={photon_response.current_model}, "
+        f"current_contact={photon_response.current_contact}, "
+        f"packed_extent={photon_response.layout.packed_extent}")
+    if _dynamic_packed:
+        report.progress(
+            "Photon Sigma   : dynamic packed route -- "
+            f"W_packed(omega) = diag(W_00(omega), W_TT, W_CT) with "
+            f"compute_mode = {mode.value} on the CHARGE block and "
+            "the fifteen current blocks STATIC (omega = 0). The "
+            "charge q->0 head is the dynamic model's; the TT/CT "
+            "q->0 head is the packed Gamma-cell completion's. "
+            "Sigma^B is the TT block of the packed operator, not "
+            "a separate term.")
+    else:
+        report.progress(
+            "Photon Sigma   : static packed route -- all sixteen "
+            "Lorentz blocks contracted once; Sigma_xc = Sigma_SX + "
+            "Sigma_COH and the per-state CC / CT+TC / TT split is "
+            "written to sigma_diag.dat.")
+    _hc = photon_response.head_completion
+    report.progress(
+        "Photon head    : "
+        + ("DEBUG: Gamma-cell head disabled by head_correction=off "
+           "(headless packed body; NOT a production calculation)"
+           if _hc is None else
+           "Gamma-cell completion applied (bare <D> into V, "
+           "charge S00/wing head into W); "
+           f"hall_source={_hc.hall_source}; "
+           f"sigma_H={np.asarray(_hc.sigma_H).tolist()} bohr^-1; "
+           f"ward={_hc.ward_residual:.3e}; "
+               f"hermiticity={_hc.hermiticity_residual:.3e}; "
+               f"dyson_forward_bound={_hc.max_dyson_forward_error_bound:.3e}; "
+               f"cubature_orders={_hc.cubature_receipt.orders}"))
+    if _hc is not None:
+        report.progress(
+            "Photon WS cert : "
+            f"orders={_hc.cubature_receipt.orders}; "
+            f"nodes={_hc.observed_physical_counts}; "
+            f"final_error_ratio="
+            f"{_hc.mixed_convergence_error_ratios[-1]:.3e}; "
+            f"max_dyson_backward_residual="
+            f"{_hc.max_backward_residual:.3e}")
+
+
+def _run_oneshot_screening(
+        V_q, bispinor_v_q_path, centroid_indices, config, e_ref, green_parent_carrier,
+        head_resolver, isdf, material_class, mesh_xy, meta, mode, oneshot_head_response,
+        oneshot_mpa_plan, oneshot_occupation_state, print0, qp_solver, quad, report, sym,
+        tensors_filename, tmp_dir, wfn, wfns_screening, wfns_transverse):
+    """Produce the one-shot screening roles and packed response."""
+    photon_response = None
+    if qp_solver is QPSolver.SELF_CONSISTENT:
+        W_by_role = {}
+    else:
+        with timing.section("gw_jax.screening", announce=True,
+                            label="screening (chi0 -> W)"):
+            if uses_static_photon_response(config):
+                if wfns_transverse is None or bispinor_v_q_path is None:
+                    raise RuntimeError(
+                        "static packed-photon screening requires the transverse "
+                        "wavefunction "
+                        "bundle and v_q_bispinor.h5; refusing a charge-only W.")
+                _screens_current = packed_photon_screens_current(config)
+                _dynamic_packed = uses_dynamic_packed_photon_route(config)
+                _W_charge = None
+                if not _screens_current or _dynamic_packed:
+                    W_by_role = compute_screening_model(
+                        mode, wfns_screening, V_q, quad=quad, e_ref=e_ref, sym=sym,
+                        centroid_indices=centroid_indices, config=config,
+                        meta=meta, mesh_xy=mesh_xy,
+                        run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
+                        wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
+                        charge_zeta_identity=isdf.charge_zeta_identity,
+                        label="oneshot", head_resolver=head_resolver,
+                        head_channel=getattr(isdf, 'head_channel', None),
+                        mpa_plan=oneshot_mpa_plan,
+                        iteration_head_response=oneshot_head_response,
+                        occupation_state=oneshot_occupation_state,
+                        material_class=material_class,
+                        tensors_filename=tensors_filename,
+                        static_only=not _dynamic_packed,
+                        print_fn=print0)
+                    if not _screens_current:
+                        _W_charge = W_by_role.get("static")
+                        if _W_charge is None:
+                            raise RuntimeError(
+                                "the packed bare-transverse route needs the incumbent "
+                                "static W(omega=0) on the charge block; the screening "
+                                "model returned no 'static' role.")
+                from .w_isdf import compute_static_photon_response
+                photon_response = compute_static_photon_response(
+                    wfns_screening, wfns_transverse, quad, bispinor_v_q_path,
+                    meta, mesh_xy,
+                    screen_current=_screens_current,
+                    mu_bases=isdf.mu_bases,
+                    W_charge=_W_charge,
+                    wfn=wfn, config=config,
+                    photon_g0_vectors=isdf.photon_g0_vectors,
+                    wf_binding_charge=isdf.wf_binding_charge,
+                    wf_binding_transverse=isdf.wf_binding_transverse,
+                    wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
+                    energy_reference=e_ref,
+                    dyson_solver=config.backend.w_dyson_solver,
+                    distrib_la_batched_route=(
+                        config.backend.distrib_la_batched_route),
+                    print_fn=print0)
+                _W_charge = None
+                if not _dynamic_packed:
+                    W_by_role = {}
+                _report_packed_screening(_dynamic_packed, _screens_current, mode, photon_response, print0, report)
+            else:
+                W_by_role = compute_screening_model(
+                    mode, wfns_screening, V_q, quad=quad, e_ref=e_ref, sym=sym,
+                    centroid_indices=centroid_indices, config=config, meta=meta,
+                    mesh_xy=mesh_xy, run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
+                    wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
+                    charge_zeta_identity=isdf.charge_zeta_identity,
+                    label="oneshot", head_resolver=head_resolver,
+                    head_channel=getattr(isdf, 'head_channel', None),
+                    mpa_plan=oneshot_mpa_plan,
+                    iteration_head_response=oneshot_head_response,
+                    occupation_state=oneshot_occupation_state,
+                    material_class=material_class,
+                    tensors_filename=tensors_filename,
+                    print_fn=print0)
+        if green_parent_carrier is not None:
+            isdf.green_parent_carrier = None
+            wfns_screening = None
+            green_parent_carrier = None
+            gc.collect()
+            print0("  Parent-k Green carrier detached from the screening view "
+                   "(the Sigma view keeps it).")
+    return (W_by_role, photon_response, green_parent_carrier, wfns_screening)
+
+
 def _install_oneshot_head(
         W_by_role, config, head_resolver, mesh_xy, meta, mode, oneshot_head_requests,
         oneshot_head_response, print0, wfn):
@@ -621,10 +723,6 @@ def _install_oneshot_head(
             and not packed_photon_replaces_charge_sigma(config)):
         if mode.value == "mpa":
             if W_by_role.get("mpa_fit_reused", False):
-                # The certified fit carries its already-folded scalar head and
-                # Sigma reads that head directly.  Re-folding the current direct
-                # response without resident W would be both impossible and a
-                # second head path.
                 final_head = None
                 print0(
                     "  MPA screening reuse: consuming the certified stored "
@@ -666,14 +764,7 @@ def _prepare_static_head(config, do_screened, head_resolver, meta, mode, print0,
     """Produce the static head terms required by the selected QP solver."""
     static_head_terms = None
     if (config.do_G0
-            # The dynamic packed route's CC head is this scalar one; only the
-            # static packed mode refuses it (its packed completion carries the
-            # charge sector, and a scalar overlay would double count it).
             and not packed_photon_replaces_charge_sigma(config)):
-        # A screened SC+FULL map always builds/folds its own head.  Supplying
-        # and printing a direct DFT seed here would be false provenance even
-        # though the map later replaces it.  OFF/NLF and unscreened X_ONLY keep
-        # the direct/default route because that is the policy they consume.
         _sc_full = (qp_solver is QPSolver.SELF_CONSISTENT
                     and do_screened
                     and config.head.correction is HeadCorrection.FULL)
@@ -681,17 +772,67 @@ def _prepare_static_head(config, do_screened, head_resolver, meta, mode, print0,
             with timing.section("gw_jax.static_head"):
                 static_head_terms = _compute_static_head(
                     head_resolver, meta, do_screened, print0,
-                    # MPA has no {0,probe} persistence grid; its one-shot
-                    # static contribution here is bare X from the direct sample.
                     require_screened=(mode.value != "mpa" and
                                       qp_solver is not QPSolver.SELF_CONSISTENT))
     return (static_head_terms)
 
 
+def _run_oneshot_sigma(
+        V_q, W_by_role, band_slices, bispinor_v_q_path, config, enk_dft, head_resolver,
+        input_dir, isdf, material_class, mesh_xy, meta, mode, oneshot_occupation_state,
+        photon_response, print0, qp_solver, quad, static_head_terms, sym, wfn, wfns_sigma,
+        wfns_transverse):
+    """Produce one-shot Sigma and release its consumed screening bodies."""
+    gc.collect()   # drop ISDF-stage temporaries before the Σ build
+    sigma_result = None
+    if qp_solver is not QPSolver.SELF_CONSISTENT:
+        with timing.section("gw_jax.sigma"):
+            sigma_result = compute_sigma_xc(
+                mode,
+                wfns=wfns_sigma, V_q=V_q, W_by_role=W_by_role,
+                e_qp_ev=np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV,
+                static_head_terms=static_head_terms,
+                head_resolver=head_resolver,
+                quad=quad,
+                config=config, meta=meta, mesh_xy=mesh_xy,
+                sym=sym, wfn=wfn, band_slices=band_slices,
+                input_dir=input_dir,
+                wfns_transverse=wfns_transverse,
+                bispinor_v_q_path=bispinor_v_q_path, mu_bases=isdf.mu_bases,
+                photon_response=photon_response,
+                occupation_state=oneshot_occupation_state,
+                material_class=material_class,
+                print_fn=print0,
+            )
+        sigma_result = sigma_result_on_kset(
+            sigma_result, kset=SIGMA_KSET_FULL_BZ, nk=int(meta.nk_tot))
+        W_by_role = {}
+        photon_response = None
+        gc.collect()
+        sig_x_diag = np.real(np.diagonal(
+            np.asarray(sigma_result.sigma_x_kij_ry),
+            axis1=1, axis2=2)) * RYD_TO_EV
+        if not config.no_degen_averaging:
+            sig_x_diag = average_within_degenerate_sets(
+                sig_x_diag,
+                energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+                tol_ry=float(config.degen_avg_tol_ry),
+            )
+        print0(f"  Bare Σ_X diagonal (eV), k=0: "
+               + "  ".join(f"{sig_x_diag[0, i]:.4f}" for i in range(min(8, sig_x_diag.shape[1]))))
+        from common import sanity
+        sanity.check_finite("Σ_x", sigma_result.sigma_x_kij_ry, print_fn=print0)
+        sanity.check_finite("V_H", sigma_result.v_h_kij_ry, print_fn=print0)
+        sanity.check_sign("Σ_x diagonal (eV)", sig_x_diag,
+                          expect="negative", print_fn=print0)
+        sanity.check_in_range("Σ_x diagonal (eV)", sig_x_diag,
+                              -200.0, 0.0, unit="eV", print_fn=print0)
+    return (sigma_result, W_by_role, photon_response)
+
+
 def _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, wfn):
     """Produce the authenticated kinetic and ionic band matrix."""
     from file_io import validate_kin_ion_against_run
-    # TIMED as one row: the gate and slab read are one logical stage.
     _t_kin = time.perf_counter()
     validate_kin_ion_against_run(
         config.paths.kin_ion_file,
@@ -711,17 +852,372 @@ def _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, 
     return (kin_ion)
 
 
+def _solve_qp_stage(
+        V_q, band_slices, bispinor_v_q_path, centroid_indices, config, e_ref, enk_dft,
+        head_resolver, input_dir, isdf, kin_ion, material_class, mesh_xy, meta, print0,
+        qp_solver, quad, report, sigma_result, static_head_terms, sym, tensors_filename,
+        wfn, wfns_sigma, wfns_transverse):
+    """Produce the QP Hamiltonian and optional self-consistency results."""
+    sc_result = None
+    rotations_written = False
+    final_static_head_terms = static_head_terms
+    if qp_solver is QPSolver.SELF_CONSISTENT:
+        from .sc_iteration import run_sc_driver
+        with timing.section("gw_jax.sc_driver", announce=True,
+                            label="self-consistent QSGW driver"):
+            sc_result = run_sc_driver(
+                wfns_sigma, V_q, kin_ion,
+                wfns_transverse=wfns_transverse,
+                bispinor_v_q_path=bispinor_v_q_path, mu_bases=isdf.mu_bases,
+                head_channel=getattr(isdf, 'head_channel', None),
+                wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
+                charge_zeta_identity=isdf.charge_zeta_identity,
+                quad=quad, e_ref=e_ref,
+                static_head_terms=static_head_terms,
+                head_resolver=head_resolver,
+                screening_model_fn=compute_screening_model,
+                config=config, meta=meta, mesh_xy=mesh_xy,
+                sym=sym, wfn=wfn, centroid_indices=centroid_indices,
+                band_slices=band_slices, input_dir=input_dir,
+                tensors_filename=tensors_filename,
+                enk_dft=enk_dft, material_class=material_class,
+                print_fn=print0, record_fn=report.progress)
+        sigma_result = sc_result.sigma_result_dft
+        sigma_total = sc_result.sigma_total_dft
+        rotations_written = sc_result.rotations_written
+        final_static_head_terms = sc_result.static_head_terms_dft
+        if sigma_result.kset == SIGMA_KSET_STAR_WEDGE:
+            from ffi import _services
+            _services.ensure_on_path()
+            from symmetry_maps import KStarMap
+            _output_kstar = KStarMap.from_sym(sym, int(wfn.ntran))
+            kin_ion = _output_kstar.select(kin_ion)
+            enk_dft = _output_kstar.select(enk_dft)
+    else:
+        with timing.section("gw_jax.solve_qp"):
+            sigma_total = solve_qp(
+                qp_solver, sigma_result, kin_ion,
+                config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
+    eqp2_result = None
+    if config.eqp2.enabled:
+        from .sc_iteration import run_fixed_sigma_evsc
+        with timing.section("gw_jax.eqp2_evsc", announce=True,
+                            label="fixed-Sigma eigenvalue self-consistency"):
+            eqp2_result = run_fixed_sigma_evsc(
+                sigma_result, kin_ion, enk_dft,
+                config=config, meta=meta, band_slices=band_slices, wfn=wfn,
+                mesh_xy=mesh_xy, print_fn=print0)
+    return (enk_dft, eqp2_result, final_static_head_terms, kin_ion, rotations_written, sc_result, sigma_result, sigma_total)
+
+
+def _sigma_output_fields(
+        config, enk_dft, final_static_head_terms, mesh_xy, qp_solver, sc_result,
+        sigma_result, sigma_total):
+    """Produce the existing Sigma fields and degenerate-state output averages."""
+    sig_h   = sigma_result.v_h_kij_ry
+    sig_h_scalar = sigma_result.v_h_scalar_kij_ry
+    h_transverse = sigma_result.h_transverse_kij_ry
+    sig_x   = sigma_result.sigma_x_kij_ry
+    sig_sx  = (sigma_result.sigma_sx_kij_ry
+               if sigma_result.sigma_sx_kij_ry is not None
+               else jnp.zeros_like(sig_x))
+    sig_coh = (sigma_result.sigma_coh_kij_ry
+               if sigma_result.sigma_coh_kij_ry is not None
+               else jnp.zeros_like(sig_x))
+    photon_head_sigma_diag_tskn_ry = (
+        sigma_result.photon_head_sigma_diag_tskn_ry)
+    photon_head_sigma_basis = sigma_result.photon_head_sigma_basis
+    sigma_lorentz_skij_ry = sigma_result.sigma_lorentz_skij_ry
+    sigma_c_odd_at_dft_ev = sigma_result.sigma_c_odd_at_dft_diag_ev
+    if photon_head_sigma_diag_tskn_ry is None:
+        photon_head_sigma_diag_tskn_ry = np.zeros(
+            (3, 3) + tuple(np.asarray(enk_dft).shape), dtype=np.complex128)
+    sigma_omega_h5_path = sigma_result.sigma_omega_h5_path
+    sigma_c_at_dft_ev   = sigma_result.sigma_c_at_dft_diag_ev
+    omega_dft_rel_ev    = sigma_result.omega_dft_rel_ev
+    e_eval_ev           = sigma_result.e_eval_ev
+    efermi_dft_ev       = sigma_result.efermi_dft_ev
+    sigma_c_omega       = sigma_result.sigma_c_omega_kij_ry
+    head_sigma_diag_w_kn_ry = (
+        sc_result.head_sigma_diag_dft_w_kn_ry
+        if qp_solver is QPSolver.SELF_CONSISTENT
+        else sigma_result.head_sigma_diag_w_kn_ry)
+    omega_grid_ev = (
+        np.asarray(sigma_result.omega_grid_ev, dtype=np.float64)
+        if sigma_result.omega_grid_ev is not None else None)
+    omega_grid_ry = (
+        np.asarray(sigma_result.omega_grid_ry, dtype=np.float64)
+        if sigma_result.omega_grid_ry is not None else None)
+    if not config.no_degen_averaging:
+        (sigma_total, sig_sx, sig_coh, sig_h, sig_h_scalar,
+         h_transverse, sig_x,
+         sigma_c_at_dft_ev) = average_sigma_components(
+            sigma_total, sig_sx, sig_coh, sig_h, sig_h_scalar,
+            h_transverse, sig_x, sigma_c_at_dft_ev,
+            energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+            tol_ry=float(config.degen_avg_tol_ry),
+            mesh_xy=mesh_xy)
+        def _average_head_diag(diag):
+            arr = np.asarray(diag)
+            if arr.ndim == 1:
+                arr = np.broadcast_to(arr, np.asarray(enk_dft).shape)
+            if arr.ndim in (2, 3):
+                return average_within_degenerate_sets(
+                    arr, energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+                    tol_ry=float(config.degen_avg_tol_ry))
+            raise ValueError(
+                f"head diagnostic has unsupported shape {arr.shape}")
+        if final_static_head_terms is not None:
+            import dataclasses
+            final_static_head_terms = dataclasses.replace(
+                final_static_head_terms,
+                sigma_x_diag=_average_head_diag(
+                    final_static_head_terms.sigma_x_diag),
+                sigma_sx_diag=_average_head_diag(
+                    final_static_head_terms.sigma_sx_diag),
+                sigma_sx_minus_x_diag=_average_head_diag(
+                    final_static_head_terms.sigma_sx_minus_x_diag),
+                sigma_coh_diag=_average_head_diag(
+                    final_static_head_terms.sigma_coh_diag),
+            )
+        if head_sigma_diag_w_kn_ry is not None:
+            head_sigma_diag_w_kn_ry = _average_head_diag(
+                head_sigma_diag_w_kn_ry)
+        photon_head_sigma_diag_tskn_ry = average_within_degenerate_sets(
+            np.asarray(photon_head_sigma_diag_tskn_ry),
+            energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+            tol_ry=float(config.degen_avg_tol_ry))
+    from gw.qsgw_utils import static_sigma_diag_to_host
+    sig_x_diag_ry = static_sigma_diag_to_host(sig_x, mesh_xy)
+    sigma_xc_at_dft_ev = (
+        sig_x_diag_ry * RYD_TO_EV
+        + sigma_c_at_dft_ev
+        if sigma_c_at_dft_ev is not None else None)
+    return (e_eval_ev, efermi_dft_ev, final_static_head_terms, h_transverse, head_sigma_diag_w_kn_ry, omega_dft_rel_ev, omega_grid_ev, omega_grid_ry, photon_head_sigma_basis, photon_head_sigma_diag_tskn_ry, sig_coh, sig_h, sig_h_scalar, sig_sx, sig_x, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev, sigma_c_omega, sigma_lorentz_skij_ry, sigma_omega_h5_path, sigma_total, sigma_xc_at_dft_ev)
+
+
+def _diagonalize_qp_hamiltonian(
+        band_slices, config, input_dir, kin_ion, print0, qp_solver, sigma_total, wfn):
+    """Produce the QP eigensystem and initialize output timing."""
+    from common import sanity
+    sanity.refuse_nonfinite("kin_ion (from kin_ion.h5)", kin_ion,
+                            print_fn=print0,
+                            detail="kin_ion.h5 is the mean-field side of H0; "
+                                   "regenerate it from THIS run's input file.")
+    sanity.refuse_nonfinite(
+        "Σ_total (Σ_xc + V_H)", sigma_total, print_fn=print0,
+        detail="A finite, well-conditioned pole set producing a non-finite "
+               "Σ is a defect in the contraction or in what was handed to "
+               "it, not a convergence problem.")
+    with timing.section("gw_jax.qp_eigh") as _sec_eigh:
+        H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
+        E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
+        _sec_eigh.watch(E_full, U_full)
+    sanity.refuse_nonfinite(
+        "E_qp (eigh of H_QP)", E_full, print_fn=print0,
+        detail="LAPACK returns without complaining on a NaN-bearing matrix, "
+               "so this is the last place a NaN spectrum can be stopped "
+               "before eqp0/eqp1/WFN_qp.h5.")
+    _t_out = time.perf_counter()
+    if config.debug.write_wfn_h5 and qp_solver is not QPSolver.SELF_CONSISTENT:
+        write_qp_wfn_oneshot(
+            U_full, E_full, wfn=wfn, band_slices=band_slices,
+            input_dir=input_dir, qp_solver=qp_solver, print_fn=print0)
+    return (E_full, U_full, _t_out)
+
+
+def _sigma_diagnostic_fields(
+        config, enk_dft, final_static_head_terms, h_transverse, head_sigma_diag_w_kn_ry,
+        mesh_xy, mode, omega_dft_rel_ev, omega_grid_ev, photon_head_sigma_diag_tskn_ry,
+        sig_coh, sig_h, sig_h_scalar, sig_sx, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev,
+        sigma_c_omega, sigma_lorentz_skij_ry, sigma_result, sigma_xc_at_dft_ev):
+    """Produce the existing host diagnostic diagonals and head-sector split."""
+    from gw.qsgw_utils import static_sigma_diag_to_host
+    if sigma_c_omega is not None:
+        sigma_c_omega_diag_ev = extract_sigma_diag_logical(
+            sigma_c_omega, mesh_xy,
+            band_axis=sigma_result.sigma_band_axis) * RYD_TO_EV
+        if not config.no_degen_averaging:
+            sigma_c_omega_diag_ev = average_within_degenerate_sets(
+                sigma_c_omega_diag_ev,
+                energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+                tol_ry=float(config.degen_avg_tol_ry))
+            if sigma_c_odd_at_dft_ev is not None:
+                sigma_c_odd_at_dft_ev = average_within_degenerate_sets(
+                    np.asarray(sigma_c_odd_at_dft_ev),
+                    energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+                    tol_ry=float(config.degen_avg_tol_ry))
+        omega_rel_ev = omega_grid_ev
+    else:
+        sigma_c_omega_diag_ev = None
+        omega_rel_ev = None
+    sigma_c_diag_at_dft_ry = (
+        sigma_c_at_dft_ev / RYD_TO_EV
+        if (mode.is_dynamic and sigma_c_at_dft_ev is not None)
+        else None
+    )
+    head_sigma_split_skn_ry = None
+    if config.bispinor and config.debug.sigma_freq_debug_output:
+        head_sigma_split_skn_ry = np.asarray(
+            photon_head_sigma_diag_tskn_ry[1]
+            + photon_head_sigma_diag_tskn_ry[2]).copy()
+        charge_head = None
+        if final_static_head_terms is not None:
+            if mode is ComputeMode.X_ONLY or mode.is_dynamic:
+                charge_head = np.asarray(final_static_head_terms.sigma_x_diag)
+            else:
+                charge_head = np.asarray(
+                    final_static_head_terms.sigma_sx_diag
+                    + final_static_head_terms.sigma_coh_diag)
+            if charge_head.ndim == 1:
+                charge_head = np.broadcast_to(
+                    charge_head, np.asarray(enk_dft).shape)
+        if mode.is_dynamic and head_sigma_diag_w_kn_ry is not None:
+            from .qsgw_utils import (interp_along_omega,
+                                     resolve_out_of_range_policy)
+            charge_corr = interp_along_omega(
+                np.asarray(head_sigma_diag_w_kn_ry),
+                np.asarray(omega_grid_ev), np.asarray(omega_dft_rel_ev),
+                out_of_range=resolve_out_of_range_policy(),
+                context="charge-head Sigma_c at E_DFT",
+                print_fn=lambda *args, **kwargs: None)
+            charge_head = (charge_corr if charge_head is None
+                           else charge_head + charge_corr)
+        if charge_head is not None:
+            head_sigma_split_skn_ry[0] += charge_head
+    sig_sx_diag_ry = static_sigma_diag_to_host(sig_sx, mesh_xy)
+    sig_coh_diag_ry = static_sigma_diag_to_host(sig_coh, mesh_xy)
+    sig_h_diag_ry = static_sigma_diag_to_host(sig_h, mesh_xy)
+    sig_h_scalar_diag_ry = static_sigma_diag_to_host(sig_h_scalar, mesh_xy)
+    h_transverse_diag_ry = (
+        None if h_transverse is None
+        else static_sigma_diag_to_host(h_transverse, mesh_xy))
+    sigma_lorentz_diag_skn_ry = None
+    if sigma_lorentz_skij_ry is not None:
+        sigma_lorentz_diag_skn_ry = np.stack([
+            static_sigma_diag_to_host(
+                sigma_lorentz_skij_ry[sector], mesh_xy)
+            for sector in range(3)
+        ])
+        if not config.no_degen_averaging:
+            sigma_lorentz_diag_skn_ry = average_within_degenerate_sets(
+                sigma_lorentz_diag_skn_ry,
+                energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+                tol_ry=float(config.degen_avg_tol_ry))
+        if mode.is_dynamic and sigma_xc_at_dft_ev is not None:
+            _output_total_ry = np.asarray(sigma_xc_at_dft_ev) / RYD_TO_EV
+            sigma_lorentz_diag_skn_ry[0] = (
+                _output_total_ry - sigma_lorentz_diag_skn_ry[1]
+                - sigma_lorentz_diag_skn_ry[2])
+    return (h_transverse_diag_ry, head_sigma_split_skn_ry, omega_rel_ev, sig_coh_diag_ry, sig_h_diag_ry, sig_h_scalar_diag_ry, sig_sx_diag_ry, sigma_c_diag_at_dft_ry, sigma_c_odd_at_dft_ev, sigma_c_omega_diag_ev, sigma_lorentz_diag_skn_ry)
+
+
+def _assemble_gw_results(
+        E_full, U_full, band_slices, config, e_eval_ev, efermi_dft_ev, enk_dft, eqp2_result,
+        h_transverse, h_transverse_diag_ry, kin_ion, mode, omega_rel_ev,
+        photon_head_sigma_basis, photon_head_sigma_diag_tskn_ry, qp_solver, sig_coh,
+        sig_coh_diag_ry, sig_h, sig_h_diag_ry, sig_h_scalar, sig_h_scalar_diag_ry, sig_sx,
+        sig_sx_diag_ry, sig_x, sig_x_diag_ry, sigma_c_diag_at_dft_ry, sigma_c_odd_at_dft_ev,
+        sigma_c_omega_diag_ev, sigma_lorentz_diag_skn_ry, sigma_omega_h5_path, sigma_result,
+        sigma_xc_at_dft_ev, tensors_filename):
+    """Produce the existing GW result record from resolved output fields."""
+    results = GWResults(
+        sig_sx=sig_sx,
+        sig_coh=sig_coh,
+        sig_h=sig_h,
+        sig_h_scalar=sig_h_scalar,
+        h_transverse=h_transverse,
+        sig_x=sig_x,
+        sig_sx_diag_ry=sig_sx_diag_ry,
+        sig_coh_diag_ry=sig_coh_diag_ry,
+        sig_h_diag_ry=sig_h_diag_ry,
+        sig_h_scalar_diag_ry=sig_h_scalar_diag_ry,
+        h_transverse_diag_ry=h_transverse_diag_ry,
+        sig_x_diag_ry=sig_x_diag_ry,
+        E_qp_ry=np.array(E_full),
+        U_qp=np.array(U_full),
+        E_dft_ry=np.array(enk_dft),
+        kin_ion_ry=np.array(kin_ion),
+        band_start=band_slices.b0,
+        band_stop=band_slices.b3,
+        use_ppm=mode.is_dynamic,
+        self_consistent=qp_solver is QPSolver.SELF_CONSISTENT,
+        sigma_kset=sigma_result.kset,
+        sigma_c_diag_at_dft_ry=sigma_c_diag_at_dft_ry,
+        sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
+        sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
+        omega_rel_ev=omega_rel_ev,
+        e_eval_ev=e_eval_ev,
+        efermi_ev=efermi_dft_ev,
+        sigma_omega_h5_path=sigma_omega_h5_path,
+        tensors_filename=tensors_filename,
+        E_eqp2_ry=(None if eqp2_result is None
+                     else np.asarray(eqp2_result.energies_ry)),
+        eqp2_iterations=(None if eqp2_result is None
+                         else int(eqp2_result.iterations)),
+        eqp2_residual_ev=(None if eqp2_result is None
+                          else float(eqp2_result.residual_ev)),
+        eqp2_tol_ev=(None if eqp2_result is None
+                     else float(config.eqp2.tol_ev)),
+        photon_head_sigma_diag_tskn_ry=np.asarray(
+            photon_head_sigma_diag_tskn_ry),
+        photon_head_sigma_basis=photon_head_sigma_basis,
+        sigma_lorentz_diag_skn_ry=sigma_lorentz_diag_skn_ry,
+        sigma_c_odd_diag_at_dft_ry=(
+            None if sigma_c_odd_at_dft_ev is None
+            else np.asarray(sigma_c_odd_at_dft_ev) / RYD_TO_EV),
+    )
+    return (results)
+
+
+def _write_gw_results(
+        _t_out, config, e_eval_ev, final_static_head_terms, head_sigma_diag_w_kn_ry,
+        input_dir, meta, omega_dft_rel_ev, omega_grid_ev, omega_grid_ry, print0, qp_solver,
+        results, rotations_written, sigma_c_omega, sigma_c_omega_diag_ev, sym, wfn):
+    """Write the QP and diagnostic results on the reporting rank."""
+    if meta.rank == 0:
+        write_freq_debug(
+            results, config=config,
+            static_head_terms=final_static_head_terms,
+            omega_dft_rel_ev=omega_dft_rel_ev,
+            head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
+            omega_grid_ry=omega_grid_ry,
+            sym=sym, file_sym=wfn.symmetry(),
+            e_eval_ev=e_eval_ev,
+            print_fn=print0,
+        )
+        write_qsgw_qp_ladders(
+            results, config=config,
+            e_qp_ry=results.E_qp_ry,
+            sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
+            omega_grid_ev=omega_grid_ev,
+            sigma_c_omega=sigma_c_omega,
+            print_fn=print0,
+        )
+        write_results(
+            results,
+            sigma_diag_file=config.paths.sigma_diag_file,
+            eqp0_file=config.paths.eqp0_file,
+            eqp1_file=config.paths.eqp1_file,
+            eqp2_file=config.paths.eqp2_file,
+            input_dir=input_dir,
+            kgrid=meta.kgrid,
+            sym=sym,
+            wfn=wfn,
+            degeneracy_policy=(
+                "disabled" if config.no_degen_averaging else "bgw_average"),
+            degeneracy_tol_ry=float(config.degen_avg_tol_ry),
+            write_qp_rotations=not rotations_written,
+            qp_rotations_k_storage=config.qp_rotations_k_storage,
+            qp_solver=qp_solver,
+            print_fn=print0,
+        )
+        timing.record("gw_jax.output", time.perf_counter() - _t_out)
+
+
 def _close_timing(_pre_main, _t_main, meta, print0):
     """Produce the complete process wall time and timing decomposition."""
     if _pre_main is not None:
-        # DECOMPOSE the pre-main span; do not add rows to it.  The entry
-        # point timed its own phases (it happened before ``timing.reset()``,
-        # so its own ``collective_warmup`` section was wiped), and the
-        # remainder of ``_pre_main`` is the import storm — 75.0 s cold vs
-        # 2.1 s warm, job 7881949.  Recording the phases AND the whole span
-        # would double-count and break the table's "rows + (untimed) ==
-        # wall" property, which is the only thing that lets a reader tell a
-        # complete accounting from a partial one.
         _phases = RUNTIME.facts.get("elapsed", {})
         for _phase, _secs in sorted(_phases.items()):
             if _phase != "total":
@@ -730,10 +1226,82 @@ def _close_timing(_pre_main, _t_main, meta, print0):
                       max(_pre_main - _phases.get("total", 0.0), 0.0))
     _wall = time.perf_counter() - _t_main + (_pre_main or 0.0)
     if meta.rank == 0 and debug_print_enabled():
-        # ``wall=`` closes the table: printed rows + ``(untimed)`` == the
-        # whole PROCESS when /proc gave us the pre-main span, else main().
         timing.report(print_fn=print0, title="--- Timing ---", wall=_wall)
     return (_wall)
+
+
+def _report_final_observables(
+        E_full, band_slices, config, enk_dft, eqp2_result, head_sigma_split_skn_ry,
+        q0_certificates, report, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev,
+        sigma_lorentz_diag_skn_ry, sigma_result):
+    """Report the final Sigma coverage, sector summaries and QP gaps."""
+    if sigma_lorentz_diag_skn_ry is not None:
+        _labels = ("CC", "CT+TC", "TT")
+        _parts_ev = np.asarray(sigma_lorentz_diag_skn_ry) * RYD_TO_EV
+        report.progress(
+            "Sigma blocks   : " + "; ".join(
+                f"{label} max|diag|={np.max(np.abs(part)):.6e} eV, "
+                f"mean|diag|={np.mean(np.abs(part)):.6e} eV"
+                for label, part in zip(_labels, _parts_ev)))
+    if head_sigma_split_skn_ry is not None:
+        _head_parts_ev = np.asarray(head_sigma_split_skn_ry) * RYD_TO_EV
+        report.progress(
+            "Head Sigma     : Gamma-cell contribution; " + "; ".join(
+                f"{label} max|diag|={np.max(np.abs(part)):.6e} eV, "
+                f"mean|diag|={np.mean(np.abs(part)):.6e} eV"
+                for label, part in zip(("CC", "CT+TC", "TT"),
+                                       _head_parts_ev)))
+    if sigma_c_odd_at_dft_ev is not None:
+        _odd_abs = np.abs(np.asarray(sigma_c_odd_at_dft_ev))
+        _xc_diag_ev = (
+            np.sum(np.asarray(sigma_lorentz_diag_skn_ry), axis=0) * RYD_TO_EV
+            if sigma_lorentz_diag_skn_ry is not None else
+            np.asarray(sig_x_diag_ry) * RYD_TO_EV
+            + np.asarray(sigma_c_at_dft_ev))
+        _xc_abs = np.abs(_xc_diag_ev)
+        _max_share = (np.max(_odd_abs) / np.max(_xc_abs)
+                      if np.max(_xc_abs) > 0.0 else np.max(_odd_abs))
+        _mean_share = (np.mean(_odd_abs) / np.mean(_xc_abs)
+                       if np.mean(_xc_abs) > 0.0 else np.mean(_odd_abs))
+        _odd_prefix = (
+            "MPA odd Sigma  "
+            if getattr(config.compute_mode, "value", config.compute_mode) == "mpa"
+            else "GN odd Sigma   ")
+        _odd_line = (
+            f"{_odd_prefix}: measured-broken-TR ordered residue; "
+            f"max|sigC_odd|={np.max(_odd_abs):.6e} eV; "
+            f"mean|sigC_odd|={np.mean(_odd_abs):.6e} eV; "
+            f"max-share-of-|Sigma_xc|={_max_share:.6e}; "
+            f"mean-share-of-|Sigma_xc|={_mean_share:.6e}")
+        if sigma_result.ppm_probe_hermiticity_residual is not None:
+            _odd_line += (
+                f"; W(iomega_p)-Hermiticity="
+                f"{sigma_result.ppm_probe_hermiticity_residual:.3e}")
+        if sigma_result.ppm_odd_even_residue_ratio is not None:
+            _odd_line += (
+                f"; max|D|/max|B|="
+                f"{sigma_result.ppm_odd_even_residue_ratio:.3e}")
+        report.progress(_odd_line)
+    if q0_certificates:
+        _q0_cert = max(q0_certificates, key=lambda item: item.final_error_ratio)
+        report.progress(
+            "Slab WS cert   : exact q=0 charge-head cubature; "
+            f"orders={_q0_cert.orders}; nodes={_q0_cert.physical_counts}; "
+            f"polygon_edges={_q0_cert.polygon_edges}; evaluations="
+            f"{len(q0_certificates)}; max_final_error_ratio="
+            f"{_q0_cert.final_error_ratio:.3e} (<=1 required)")
+    report.sigma_coverage(
+        config=config, band_slices=band_slices, enk_dft_ry=enk_dft,
+        sigma_result=sigma_result)
+    report.qp_gap(
+        band_slices=band_slices, e_dft_ry=enk_dft, e_qp_ry=E_full)
+    if eqp2_result is not None:
+        report.eqp2_summary(
+            band_slices=band_slices,
+            e_eqp2_ry=eqp2_result.energies_ry,
+            iterations=eqp2_result.iterations,
+            residual_ev=eqp2_result.residual_ev,
+            tol_ev=config.eqp2.tol_ev)
 
 
 def _report_file_rows(args, config, input_dir, report, sigma_omega_h5_path, tensors_filename):
@@ -784,1016 +1352,114 @@ def _report_file_rows(args, config, input_dir, report, sigma_omega_h5_path, tens
 
 
 def main(argv=None):
-	# Same factory the module-scope seam used, so the two cannot disagree.
+	"""Run the GW stages; see docs/architecture/decisions.md."""
 	args = build_parser().parse_args(argv)
-
-	# ---- Stage timing: ONE table, and it sums to the wall -------------------
-	# ``timing.reset()`` used to sit just above the ISDF call, which threw
-	# away everything the prologue had already recorded.  Resetting HERE,
-	# before any stage runs, is what lets the prologue appear at all.
-	# ``_t_main`` is the wall this table is closed against
-	# (``report(wall=...)``), so the printed rows plus ``(untimed)`` always
-	# add up to the run — a reader can tell a complete accounting from a
-	# partial one without doing arithmetic.
-	#
-	# The startup stack now runs ABOVE this reset (it runs above ``main()``),
-	# so its own ``collective_warmup`` section is wiped here.  That is fine
-	# and deliberate: ``initialize_communicator_stack`` measured every phase
-	# itself and handed the numbers back in ``RUNTIME.facts['elapsed']``, and
-	# the epilogue re-records them as a DECOMPOSITION of the pre-main span
-	# rather than as extra rows.
 	_t_main = time.perf_counter()
-	# Work done BEFORE main(): the module body's
-	# ``initialize_communicator_stack()`` (env, jax.distributed, backend
-	# init, mesh + clique warm-up) and every import under it.  Measured 75.0 s
-	# to first output on a cold node vs 2.1 s warm — the largest single row in
-	# a small run, and previously in no row at all.
 	_pre_main = timing.process_elapsed_s()
 	timing.reset()
-
-	# Configuration parsing predates the scientific report file.  Its deck
-	# echo is forensic detail, so it follows the driver's ONE debug switch.
-	# Default/derivation provenance is different: it is part of the scientific
-	# record, so retain just those lines and replay them once the report exists.
 	(
 	    config, input_dir, qp_solver, mode, report, production_stdout, print0,
 	    _config_provenance, do_screened) = _open_production_report(
 	    args)
 	_report_head_and_photon_policy(config, print0, report)
-
-	# ---- The runtime is already up ----------------------------------------
-	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
-	# of this module, above ``import jax``, because the JAX env defaults only
-	# bind before jax reads them.  ``RUNTIME.mesh`` is THE run's square
-	# ('x','y') mesh with every communicator it will need ALREADY created —
-	# the warm-up is not optional and not the physics' job:
-	#   * a mesh this process owns no device on is refused there, naming the
-	#     caller, instead of surfacing a bare StopIteration deeper down;
-	#   * ``warm_mesh_cliques`` (CPU/MPI) ran as well as ``nccl_warmup``
-	#     (GPU/NCCL).  This driver used to call only the latter, so under
-	#     ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` its MPI cliques were
-	#     created incidentally, by whichever physics kernel happened to fire
-	#     the first collective (``common/zeta_projection.py``,
-	#     ``common/contract_bands.py`` each warm their own mesh).  That works
-	#     only while those early programs stay small enough for XLA's
-	#     SEQUENTIAL thunk executor; the parallel executor lands on the
-	#     ``MPI_Is_thread_main`` refusal that killed the BSE TDA Lanczos
-	#     (32 refusals at P=16, gate 7881216).
-	# Do NOT call prepare_mesh() again here: a second Mesh object is a second
-	# set of communicators and a second copy of every shape-keyed jit cache.
 	mesh_xy = RUNTIME.mesh
 	_setup_runtime()
-
-	# HOW MANY HDF5 LIBRARY INSTANCES IS THIS PROCESS CARRYING?  Measured
-	# from /proc/self/maps, not asserted (audit A1 fix 3).  Two
-	# instances — h5py's bundled libhdf5 and the FFI's cray
-	# libhdf5_parallel — alternately touching one file is the standing
-	# explanation for the metallic driver's iteration-3 rank-0 segfault,
-	# and until now the condition was INFERRED from the deployed
-	# artifacts' NEEDED entries rather than observed in the running
-	# process.  Healthy inventory is diagnostic-only and quiet by default;
-	# an unsafe condition is always printed.  ``file_io.hdf5_owner`` probes
-	# again after each SC iteration's store cycle, with the paths that were
-	# touched through both.
 	from file_io.hdf5_owner import probe as _hdf5_probe
 	_hdf5_probe("startup", print_fn=print0)
-
-	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
 	(
 	    config, wfn, material_class, sym, centroid_basis, centroid_indices, n_rmu, tmp_dir,
 	    tensors_filename) = _load_system_inputs(
 	    config, input_dir, mesh_xy, report, print0, _config_provenance)
-
 	(
 	    meta, band_slices, zeta_fit_edge) = _prepare_band_metadata(
 	    centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn)
-
-	# ---- dynamic-Sigma logical/carrier receipt ----
-	# Resolve the same square carrier the producer will use, early enough to
-	# print the allocation shape before ζ fitting.  This is informational:
-	# indivisible windows are ordinary exact-zero pads, not a geometry refusal.
-	#
-	# ``compute_mode = mpa`` reaches it whatever the deck says about layout,
-	# because the MPA executor emits the sharded cube unconditionally.
 	(
 	    enk_dft) = _report_sampling_and_bands(
 	    band_slices, centroid_basis, config, material_class, mesh_xy, meta, mode, print0,
 	    report, sym, wfn, zeta_fit_edge)
-
-	# Single resolver for every q→0 head sample we'll need this run; the
-	# COHSEX static head, the W0 restart-flush head, and the PPM dynamic
-	# head all read from the same plumbing (overrides → epshead → s_tensor)
-	# so they share one cache.  See ``head_correction.HeadResolver``.
 	q0_certificates = []
 	head_resolver = HeadResolver(
 		config, input_dir, wfn, sym, meta, print0,
 		q0_certificate_fn=q0_certificates.append)
-
-	# Optional BGW vcoul override (purely diagnostic — bit-reproducible BGW
-	# comparisons).  Returns None when ``use_bgw_vcoul`` is False.
 	bgw_v_grid_fn = build_bgw_v_grid_fn(
 		config, wfn=wfn, sym=sym, input_dir=input_dir, print_fn=print0)
-
-	# Everything from ``main()`` entry to here is the driver PROLOGUE:
-	# config parse, the PHDF5 MPI pre-init, WFN + symmetry +
-	# centroid reads, the head resolver.  (The mesh, its collective warm-up
-	# and the compile cache are NOT here any more — they happen above
-	# ``main()`` in ``initialize_communicator_stack`` and are reported as
-	# their own rows.)  It is
-	# executed exactly once and, on a cold node, it is the largest single row
-	# in this table (75.0 s to first output, job 7881949) — so it is named.
-	# ``timing.record`` rather than a ``with`` block deliberately: the block
-	# above is another workstream's and must not be re-indented for a timer.
 	timing.record("gw_jax.startup", time.perf_counter() - _t_main)
-
-	# ISDF fitting or restart loading
-	with timing.section("gw_jax.isdf", announce=True,
-	                    label="ISDF basis + wavefunctions"):
-		isdf = prepare_isdf_and_wavefunctions(
-			cfg=config,
-			wfn=wfn,
-			sym=sym,
-			meta=meta,
-			centroid_indices=centroid_indices,
-			band_slices=band_slices,
-			mesh_xy=mesh_xy,
-			tmp_dir=tmp_dir,
-			tensors_filename=tensors_filename,
-			print0=print0,
-			bgw_v_grid_fn=bgw_v_grid_fn,
-		)
-	V_qmunu = isdf.V_qmunu
-	wfns = isdf.wf_bundle
-	green_parent_carrier = getattr(isdf, 'green_parent_carrier', None)
-	# The Σ kernels take the parent carrier whenever one exists: their G
-	# contraction and band projection then run on the raw parents and the
-	# band matrix is broadcast back to full k (gw.wavefunction_bundle.
-	# sigma_face_kernel_kwargs); the q->0 head wings take the same view and
-	# stream the children from the carrier.  Density, output and restart
-	# consumers keep the primary bundle.
-	sigma_parent_carrier = getattr(isdf, 'sigma_parent_carrier', None)
-	wfns_sigma = wfns
-	wfns_screening = wfns
-	oneshot_occupation_state = (
-		_oneshot_mpa_occupation_state(
-			config, wfn, wfns, material_class, mesh_xy=mesh_xy, print_fn=print0)
-		if (qp_solver is not QPSolver.SELF_CONSISTENT
-			and mode.value == "mpa") else None)
-	if oneshot_occupation_state is not None:
-		print0(
-			"  one-shot occupations: fixed-N MP1 state, "
-			f"mu={oneshot_occupation_state.mu_ry * RYD_TO_EV:.8f} eV, "
-			f"width={oneshot_occupation_state.smearing_width_ry:.10f} Ry, "
-			f"occ_hash={oneshot_occupation_state.occ_hash}")
-	# Bispinor: σ^B reads V^{i,j} tiles from v_q_bispinor.h5 and
-	# samples ψ at the transverse-centroid Wfns bundle (None when
-	# bispinor=False or centroids_file_current is unset).
-	wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
-	# LOUD guard (quality pattern #7): the Σ kernels' Σ^B fold-in is a
-	# structural no-op when ``wfns_transverse``/``bispinor_v_q_path`` is
-	# None — a bispinor run reaching Σ without them would exit rc=0 with
-	# Σ^B silently dropped.  Both producer paths (fit + restart) raise
-	# with specifics before this point; this is the last-line invariant.
-	if config.bispinor and wfns_transverse is None:
-		raise RuntimeError(
-			"bispinor = true but no transverse-centroid Wfns bundle was "
-			"produced (Σ^B would be silently dropped).  Check "
-			"centroids_file_current and, on restart, that the restart "
-			"file carries psi_parent_y_transverse.")
-	bispinor_v_q_path = (
-		os.path.join(tmp_dir, 'v_q_bispinor.h5')
-		if wfns_transverse is not None else None
-	)
-	if bispinor_v_q_path is not None and not os.path.exists(bispinor_v_q_path):
-		raise RuntimeError(
-			f"bispinor: {bispinor_v_q_path} is missing.  The V^{{i,j}} "
-			f"tile file is written by the non-restart pipeline "
-			f"(compute_V_q); on restart it must still be present in "
-			f"tmp/.  Rerun with restart = false to regenerate it.")
-
-	# ---- Screening: χ₀ → W = (1 − Vχ)⁻¹ V at every ω the Σ scheme needs ----
-	# X_ONLY requests no screening at all.
+	(
+	    V_qmunu, bispinor_v_q_path, green_parent_carrier, isdf, oneshot_occupation_state, wfns,
+	    wfns_screening, wfns_sigma, wfns_transverse) = _prepare_isdf_carriers(
+	    band_slices, bgw_v_grid_fn, centroid_indices, config, material_class, mesh_xy, meta,
+	    mode, print0, qp_solver, sym, tensors_filename, tmp_dir, wfn)
 	V_q = V_qmunu               # flat-q (nq, μ, μ) — compute and restart alike
 	(
 	    quad, e_ref, oneshot_head_response, oneshot_head_requests, oneshot_mpa_plan) = _prepare_oneshot_response(
 	    config, do_screened, input_dir, material_class, mesh_xy, meta, mode, print0, qp_solver,
 	    wfn, wfns, wfns_sigma)
-	# SC solves W inside each map and persists only the final accepted map.
-	# Do not perform a redundant DFT screening solve here: besides its cost,
-	# that seed body used to survive long enough to be paired with a final head.
-	photon_response = None
-	if qp_solver is QPSolver.SELF_CONSISTENT:
-		W_by_role = {}
-	else:
-		with timing.section("gw_jax.screening", announce=True,
-		                    label="screening (chi0 -> W)"):
-			if uses_static_photon_response(config):
-				if wfns_transverse is None or bispinor_v_q_path is None:
-					raise RuntimeError(
-						"static packed-photon screening requires the transverse "
-						"wavefunction "
-						"bundle and v_q_bispinor.h5; refusing a charge-only W.")
-				# ONE selector, resolved in gw_config: full_static_cohsex screens
-				# all sixteen blocks inside the packed Dyson solve; the
-				# bare-transverse family declares chi_TT = chi_CT = 0 and screens
-				# only CC, whose owner is the incumbent scalar screening model.
-				_screens_current = packed_photon_screens_current(config)
-				# PHASE 3.  On the dynamic packed route the CHARGE block is
-				# frequency dependent and is owned end to end by the scalar
-				# Sigma_c machinery, so this run needs the mode's FULL role
-				# set ({static, probe} for the plasmon-pole pair) rather than
-				# the single static role the bare family's packed CC block is
-				# assembled from -- and it must KEEP them past this block.
-				_dynamic_packed = uses_dynamic_packed_photon_route(config)
-				_W_charge = None
-				if not _screens_current or _dynamic_packed:
-					W_by_role = compute_screening_model(
-						mode, wfns_screening, V_q, quad=quad, e_ref=e_ref, sym=sym,
-						centroid_indices=centroid_indices, config=config,
-						meta=meta, mesh_xy=mesh_xy,
-						run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
-						wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
-						charge_zeta_identity=isdf.charge_zeta_identity,
-						label="oneshot", head_resolver=head_resolver,
-						head_channel=getattr(isdf, 'head_channel', None),
-						mpa_plan=oneshot_mpa_plan,
-						iteration_head_response=oneshot_head_response,
-						occupation_state=oneshot_occupation_state,
-						material_class=material_class,
-						tensors_filename=tensors_filename,
-						static_only=not _dynamic_packed,
-						print_fn=print0)
-					if not _screens_current:
-						_W_charge = W_by_role.get("static")
-						if _W_charge is None:
-							raise RuntimeError(
-								"the packed bare-transverse route needs the incumbent "
-								"static W(omega=0) on the charge block; the screening "
-								"model returned no 'static' role.")
-				from .w_isdf import compute_static_photon_response
-				photon_response = compute_static_photon_response(
-					wfns_screening, wfns_transverse, quad, bispinor_v_q_path,
-					meta, mesh_xy,
-					screen_current=_screens_current,
-					mu_bases=isdf.mu_bases,
-					W_charge=_W_charge,
-					wfn=wfn, config=config,
-					photon_g0_vectors=isdf.photon_g0_vectors,
-					wf_binding_charge=isdf.wf_binding_charge,
-					wf_binding_transverse=isdf.wf_binding_transverse,
-					wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
-					energy_reference=e_ref,
-					dyson_solver=config.backend.w_dyson_solver,
-					distrib_la_batched_route=(
-						config.backend.distrib_la_batched_route),
-					print_fn=print0)
-				# Sigma consumes packed block views directly.  Do not extract a
-				# scalar W00 body solely to satisfy the legacy role mapping.
-				# The DYNAMIC route keeps W_by_role: its charge channel is the
-				# ordinary Sigma_c(omega) on those same role W's.
-				_W_charge = None
-				if not _dynamic_packed:
-					W_by_role = {}
-				print0(
-					"  static photon route: "
-					+ ("full_static_cohsex (sixteen chi blocks, one packed "
-					   "Dyson solve)" if _screens_current else
-					   "bare_transverse as the packed path (chi_TT = chi_CT = 0; "
-					   "scalar Dyson on CC, W_packed = diag(W_00, D_TT))")
-					+ ("" if not _dynamic_packed else
-					   "; DYNAMIC packed route: the CC block carries "
-					   f"compute_mode = {mode.value} at every omega and the "
-					   "fifteen current blocks are frozen at omega = 0"))
-				print0(
-					"  static photon response: "
-					f"approximation={photon_response.approximation}, "
-					f"current_model={photon_response.current_model}, "
-					f"current_contact={photon_response.current_contact}, "
-					f"packed_extent={photon_response.layout.packed_extent}")
-				# The run record (gwjax.out) must state the Gamma-cell status
-				# of the packed mode in production mode, where print0 sinks
-				# component chatter (owner ruling 2026-09-01: a headless
-				# packed run is a DEBUG setting and must say so).
-				if _dynamic_packed:
-					# THE RUN RECORD MUST SAY WHICH SIGMA RAN.  A bispinor
-					# plasmon-pole deck used to take the incumbent
-					# charge-screened + Sigma^B route with no TT Gamma head;
-					# it now takes the packed operator, and the current blocks
-					# are an omega = 0 approximation inside a dynamic run.
-					# Both facts are physics, so neither is left to a log.
-					report.progress(
-						"Photon Sigma   : dynamic packed route -- "
-						f"W_packed(omega) = diag(W_00(omega), W_TT, W_CT) with "
-						f"compute_mode = {mode.value} on the CHARGE block and "
-						"the fifteen current blocks STATIC (omega = 0). The "
-						"charge q->0 head is the dynamic model's; the TT/CT "
-						"q->0 head is the packed Gamma-cell completion's. "
-						"Sigma^B is the TT block of the packed operator, not "
-						"a separate term.")
-				else:
-					report.progress(
-						"Photon Sigma   : static packed route -- all sixteen "
-						"Lorentz blocks contracted once; Sigma_xc = Sigma_SX + "
-						"Sigma_COH and the per-state CC / CT+TC / TT split is "
-						"written to sigma_diag.dat.")
-				_hc = photon_response.head_completion
-				report.progress(
-					"Photon head    : "
-					+ ("DEBUG: Gamma-cell head disabled by head_correction=off "
-					   "(headless packed body; NOT a production calculation)"
-					   if _hc is None else
-					   "Gamma-cell completion applied (bare <D> into V, "
-					   "charge S00/wing head into W); "
-					   f"hall_source={_hc.hall_source}; "
-					   f"sigma_H={np.asarray(_hc.sigma_H).tolist()} bohr^-1; "
-					   f"ward={_hc.ward_residual:.3e}; "
-						   f"hermiticity={_hc.hermiticity_residual:.3e}; "
-						   f"dyson_forward_bound={_hc.max_dyson_forward_error_bound:.3e}; "
-						   f"cubature_orders={_hc.cubature_receipt.orders}"))
-				if _hc is not None:
-					report.progress(
-						"Photon WS cert : "
-						f"orders={_hc.cubature_receipt.orders}; "
-						f"nodes={_hc.observed_physical_counts}; "
-						f"final_error_ratio="
-						f"{_hc.mixed_convergence_error_ratios[-1]:.3e}; "
-						f"max_dyson_backward_residual="
-						f"{_hc.max_backward_residual:.3e}")
-			else:
-				W_by_role = compute_screening_model(
-					mode, wfns_screening, V_q, quad=quad, e_ref=e_ref, sym=sym,
-					centroid_indices=centroid_indices, config=config, meta=meta,
-					mesh_xy=mesh_xy, run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
-					wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
-					charge_zeta_identity=isdf.charge_zeta_identity,
-					label="oneshot", head_resolver=head_resolver,
-					head_channel=getattr(isdf, 'head_channel', None),
-					mpa_plan=oneshot_mpa_plan,
-					iteration_head_response=oneshot_head_response,
-					occupation_state=oneshot_occupation_state,
-					material_class=material_class,
-					tensors_filename=tensors_filename,
-					print_fn=print0)
-		if green_parent_carrier is not None:
-			# Every chi0 call above blocks before returning.  Drop the
-			# screening view's reference so it is not an unused jit operand
-			# downstream.  The arrays themselves stay resident: the Sigma
-			# view (wfns_sigma) holds the same carrier, priced as such.
-			isdf.green_parent_carrier = None
-			wfns_screening = None
-			green_parent_carrier = None
-			gc.collect()
-			print0("  Parent-k Green carrier detached from the screening view "
-			       "(the Sigma view keeps it).")
-
+	(
+	    W_by_role, photon_response, green_parent_carrier, wfns_screening) = _run_oneshot_screening(
+	    V_q, bispinor_v_q_path, centroid_indices, config, e_ref, green_parent_carrier,
+	    head_resolver, isdf, material_class, mesh_xy, meta, mode, oneshot_head_response,
+	    oneshot_mpa_plan, oneshot_occupation_state, print0, qp_solver, quad, report, sym,
+	    tensors_filename, tmp_dir, wfn, wfns_screening, wfns_transverse)
 	_install_oneshot_head(
 	    W_by_role, config, head_resolver, mesh_xy, meta, mode, oneshot_head_requests,
 	    oneshot_head_response, print0, wfn)
-
-	# Persist W0_qmunu + q=0 head scalars to the ISDF restart file for
-	# downstream consumers (BSE, future Σ-builders); no-op unless screened
-	# and the restart file exists.
-	# TIMED, and it was not.  The stage was measured at ~1.7 MB/s
-	# aggregate and 2 h 55 m of total silence at c2406 (AF.4c), back when
-	# this call gathered the whole (nq, μ, μ) W0 onto one rank on the
-	# ``h5py_allgather`` backend to write it.  That backend is gone
-	# (233a830d) and the write is SlabIO's per-rank tile path now, so the
-	# number is history, not a prediction — yet the call still sat
-	# between two timed stages with no
-	# section of its own, so it appeared in the run's wall clock and in
-	# NO row of the stage table.  Naming it is the precondition for
-	# anyone attributing that wall time (the write path itself is
-	# workstream AE/AF's; this is the instrument, not the fix).
-	# ``sym``/``centroid_indices`` below are for the q-storage resolution
-	# ONLY (see the callee): W0 must land on the same q-set V did, and the
-	# way to be sure of that is to ask the same resolution point about the
-	# same centroid set rather than to infer it from a shape.
 	_persist_screening(
 	    V_q, W_by_role, centroid_indices, config, head_resolver, mesh_xy, meta, mode, print0,
 	    qp_solver, sym, tensors_filename)
-
-	# q→0 head correction.  The bare-X head is the same physical quantity in
-	# both COHSEX and PPM modes; gating this on ``not use_ppm_sigma`` was
-	# the original ``Bare Σ_X missing q→0 head'' bug (skill compare/SKILL.md
-	# §4i).  The SX/COH head pieces are also attached to the static
-	# sig_sx/sig_coh in compute_cohsex_sigma, but for PPM those static values
-	# are overwritten downstream (sig_sx ← sig_x, sig_c ← PPM-evaluated
-	# correlation), so only the X-head survives — which is the piece needed.
 	(
 	    static_head_terms) = _prepare_static_head(
 	    config, do_screened, head_resolver, meta, mode, print0, qp_solver)
-
-	# ---- Σ_xc + V_H: ONE dispatch for every mode ----
-	# The same ``compute_sigma_xc`` call the SC iteration map makes each
-	# step — static COHSEX kernels for X_ONLY/COHSEX, the PPM pipeline
-	# (fit → 4-branch τ-integration → analytic q→0 head → at-DFT interp)
-	# for the dynamic modes, with the QSGW-symmetrised Σ_xc evaluated at
-	# E_DFT (a one-shot full-matrix effective Hamiltonian, distinct from the
-	# fixed-state diagonal G0W0 output; ``solve_qp`` re-evaluates for
-	# fixed_point).
-	# SC-iteration-1 ≡ this call, pinned by tests/test_invariance_gates.py
-	# ::test_sc_iteration1_equals_one_shot.
-	# SC runs skip it — the iteration map would re-do this work on iter 1.
-	#
-	# History note (kept here because it explains a specific decision and
-	# is not yet captured anywhere else): the analytic q→0 head injected
-	# at the end of ``compute_ppm_sigma_pipeline`` was re-added in
-	# 2026-04-25 after being removed in 1542342 (Apr-10).  Magnitude is
-	# ±W^c(0)/(2·V_cell·N_k) on-shell — ~1.24 eV/band on Si 4×4×4 60b.
-	# See reports/mos2_kgrid_gnppm_head_convergence_2026-4-10/.
-	gc.collect()   # drop ISDF-stage temporaries before the Σ build
-	sigma_result = None
-	if qp_solver is not QPSolver.SELF_CONSISTENT:
-		with timing.section("gw_jax.sigma"):
-			sigma_result = compute_sigma_xc(
-				mode,
-				wfns=wfns_sigma, V_q=V_q, W_by_role=W_by_role,
-				e_qp_ev=np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV,
-				static_head_terms=static_head_terms,
-				head_resolver=head_resolver,
-				quad=quad,
-				config=config, meta=meta, mesh_xy=mesh_xy,
-				sym=sym, wfn=wfn, band_slices=band_slices,
-				input_dir=input_dir,
-				wfns_transverse=wfns_transverse,
-				bispinor_v_q_path=bispinor_v_q_path, mu_bases=isdf.mu_bases,
-				photon_response=photon_response,
-				occupation_state=oneshot_occupation_state,
-				material_class=material_class,
-				print_fn=print0,
-			)
-		# The one-shot path deliberately retains the full BZ.  Use the same
-		# named k-set boundary as the SC map, here as a validation rather than
-		# a selection, so both paths state what their Sigma tables contain.
-		sigma_result = sigma_result_on_kset(
-			sigma_result, kset=SIGMA_KSET_FULL_BZ, nk=int(meta.nk_tot))
-		# Screening bodies have no consumer after Sigma.  In the photon mode
-		# this drops the packed V/W pair at the exact lifetime boundary rather
-		# than carrying O(N_gamma^2) arrays through QP/output post-processing.
-		W_by_role = {}
-		photon_response = None
-		gc.collect()
-
-		# Print bare Σ_X diagonal for ISDF quality assessment.  Apply
-		# BGW-style degenerate-set averaging (mirrors Sigma/shiftenergy.f90)
-		# unless disabled — without it, the QE basis-dependent splitting
-		# within degenerate manifolds shows up as a few-meV spread across
-		# symmetry-equivalent bands.
-		sig_x_diag = np.real(np.diagonal(
-			np.asarray(sigma_result.sigma_x_kij_ry),
-			axis1=1, axis2=2)) * RYD_TO_EV
-		if not config.no_degen_averaging:
-			sig_x_diag = average_within_degenerate_sets(
-				sig_x_diag,
-				energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-				tol_ry=float(config.degen_avg_tol_ry),
-			)
-		print0(f"  Bare Σ_X diagonal (eV), k=0: "
-		       + "  ".join(f"{sig_x_diag[0, i]:.4f}" for i in range(min(8, sig_x_diag.shape[1]))))
-
-		# ── Σ stage gate ─────────────────────────────────────────────
-		# Σ_x[n,n] = −Σ_{m∈occ} ⟨nm|V|mn⟩ is a negative-definite
-		# quadratic form in a positive-semidefinite kernel: every
-		# diagonal entry is strictly negative in a correct run, whatever
-		# the system.  A positive one is a sign / conjugation /
-		# band-index slip, not a convergence issue.  The magnitude
-		# bracket is deliberately loose (bare exchange runs −40…−5 eV
-		# for the production decks) — it exists to catch a units or
-		# basis-normalisation slip, not to police physics.
-		from common import sanity
-		sanity.check_finite("Σ_x", sigma_result.sigma_x_kij_ry, print_fn=print0)
-		sanity.check_finite("V_H", sigma_result.v_h_kij_ry, print_fn=print0)
-		sanity.check_sign("Σ_x diagonal (eV)", sig_x_diag,
-		                  expect="negative", print_fn=print0)
-		sanity.check_in_range("Σ_x diagonal (eV)", sig_x_diag,
-		                      -200.0, 0.0, unit="eV", print_fn=print0)
-
-	# ---- QP Hamiltonian: H_QP = (H_DFT - V_xc) + V_H + Σ_xc ----
-	#
-	# Static operators retain the layout selected by their producers through
-	# the H build and diagonalisation.  Rank-0 text output consumes bounded
-	# ``(nk,nb)`` diagonal mirrors; it never gathers a band-sharded
-	# ``(nk,nb,nb)`` component merely to print its diagonal.
-	# Provenance gate BEFORE the read.  In particular, refuse the retired
-	# format that folded V_H into kin_ion: this driver always adds the live
-	# G-space field.
+	(
+	    sigma_result, W_by_role, photon_response) = _run_oneshot_sigma(
+	    V_q, W_by_role, band_slices, bispinor_v_q_path, config, enk_dft, head_resolver,
+	    input_dir, isdf, material_class, mesh_xy, meta, mode, oneshot_occupation_state,
+	    photon_response, print0, qp_solver, quad, static_head_terms, sym, wfn, wfns_sigma,
+	    wfns_transverse)
 	(kin_ion) = _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, wfn)
-
-	# ---- update_H[Σ; qp_solver] — all branches yield ``sigma_total``
-	# (Σ_xc + V_H, Ry, DFT basis, replicated) whose eigh gives E_qp/U_qp.
-	# ``rotations_written`` is run_sc_driver's own report of whether it
-	# wrote qp_wfn_rotations.h5; the writer below reads the fact rather
-	# than re-deriving the predicate.
-	rotations_written = False
-	final_static_head_terms = static_head_terms
-	if qp_solver is QPSolver.SELF_CONSISTENT:
-		# SC-QSGW: iterate ψ-rotation → χ₀ → W → Σ_xc (the same
-		# compute_sigma_xc dispatch, mode-agnostic) to the fixed point;
-		# the returned SigmaResult is already rotated back to the DFT
-		# basis and its sigma_omega_h5_path points at the converged
-		# single-write sigma_mnk.h5.  See ``sc_iteration.run_sc_driver``.
-		from .sc_iteration import run_sc_driver
-		# Executed once; it is the whole SC loop, so it is the run's biggest
-		# row when it fires and must not hide inside ``(untimed)``.
-		with timing.section("gw_jax.sc_driver", announce=True,
-		                    label="self-consistent QSGW driver"):
-			# The self-consistent map takes the Σ bundle: under parents-only
-			# storage its carrier is the run's only ψ and the map's rotation
-			# acts on it (wavefunction_bundle.rotate_wavefunctions).
-			sc_result = run_sc_driver(
-				wfns_sigma, V_q, kin_ion,
-				wfns_transverse=wfns_transverse,
-				bispinor_v_q_path=bispinor_v_q_path, mu_bases=isdf.mu_bases,
-				head_channel=getattr(isdf, 'head_channel', None),
-				wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
-				charge_zeta_identity=isdf.charge_zeta_identity,
-				quad=quad, e_ref=e_ref,
-				static_head_terms=static_head_terms,
-				head_resolver=head_resolver,
-				screening_model_fn=compute_screening_model,
-				config=config, meta=meta, mesh_xy=mesh_xy,
-				sym=sym, wfn=wfn, centroid_indices=centroid_indices,
-				band_slices=band_slices, input_dir=input_dir,
-				tensors_filename=tensors_filename,
-				enk_dft=enk_dft, material_class=material_class,
-				print_fn=print0, record_fn=report.progress)
-		sigma_result = sc_result.sigma_result_dft
-		sigma_total = sc_result.sigma_total_dft
-		rotations_written = sc_result.rotations_written
-		final_static_head_terms = sc_result.static_head_terms_dft
-		if sigma_result.kset == SIGMA_KSET_STAR_WEDGE:
-			# SC's retained Sigma, its H/E/U and the mean-field operators used
-			# by post-processing all stay on the loop's star wedge.  Output
-			# writers alone unfold that complete result to their file wedge.
-			from ffi import _services
-			_services.ensure_on_path()
-			from symmetry_maps import KStarMap
-			_output_kstar = KStarMap.from_sym(sym, int(wfn.ntran))
-			kin_ion = _output_kstar.select(kin_ion)
-			enk_dft = _output_kstar.select(enk_dft)
-	else:
-		# One-shot: ``one_shot_dft`` = Σ_xc was already QSGW-built at
-		# E_DFT inside compute_sigma_xc (pass-through; also covers static
-		# modes and the streamed-Σ_c stand-in); ``fixed_point`` = diagonal
-		# on-shell solve + scissor + QSGW rebuild at the solved energies.
-		# eqp0.dat/eqp1.dat are at-DFT in every case (written downstream
-		# from ``sigma_c_at_dft_ev`` / the ω-grid diag, not from here).
-		with timing.section("gw_jax.solve_qp"):
-			sigma_total = solve_qp(
-				qp_solver, sigma_result, kin_ion,
-				config=config, meta=meta, mesh_xy=mesh_xy, print_fn=print0)
-
-	# Optional additional ladder: iterate ONLY the already-built, full-matrix
-	# one-shot Sigma(omega).  This deliberately sits after the sole screening /
-	# Sigma stage and calls neither dispatch, so write_eqp2 cannot accidentally
-	# turn into a second GW calculation.  The callee rotates the fixed cube into
-	# each updated QP basis before evaluating its off-diagonals.
-	eqp2_result = None
-	if config.eqp2.enabled:
-		from .sc_iteration import run_fixed_sigma_evsc
-		with timing.section("gw_jax.eqp2_evsc", announce=True,
-		                    label="fixed-Sigma eigenvalue self-consistency"):
-			eqp2_result = run_fixed_sigma_evsc(
-				sigma_result, kin_ion, enk_dft,
-				config=config, meta=meta, band_slices=band_slices, wfn=wfn,
-				mesh_xy=mesh_xy, print_fn=print0)
-
-	# ---- Post-Σ seam: bare locals from the SigmaResult ----
-	# One extraction for SC and one-shot alike; PPM-only fields are None
-	# in static modes.
-	#
-	# On the SC path the finalize rotates every matrix consumed here,
-	# including the dynamic correlation cube, to the DFT output basis.  The
-	# original cube was already persisted in the last map's QP compute basis,
-	# where the QSGW ansatz is defined.  The separable analytic head diagonal is cheap
-	# enough to rotate without materialising its dense matrix; SC returns that
-	# as a separate DFT-basis diagnostic while leaving SigmaResult's
-	# basis-of-computation field untouched.
-	sig_h   = sigma_result.v_h_kij_ry
-	sig_h_scalar = sigma_result.v_h_scalar_kij_ry
-	h_transverse = sigma_result.h_transverse_kij_ry
-	sig_x   = sigma_result.sigma_x_kij_ry
-	sig_sx  = (sigma_result.sigma_sx_kij_ry
-	           if sigma_result.sigma_sx_kij_ry is not None
-	           else jnp.zeros_like(sig_x))
-	sig_coh = (sigma_result.sigma_coh_kij_ry
-	           if sigma_result.sigma_coh_kij_ry is not None
-	           else jnp.zeros_like(sig_x))
-	photon_head_sigma_diag_tskn_ry = (
-		sigma_result.photon_head_sigma_diag_tskn_ry)
-	photon_head_sigma_basis = sigma_result.photon_head_sigma_basis
-	sigma_lorentz_skij_ry = sigma_result.sigma_lorentz_skij_ry
-	sigma_c_odd_at_dft_ev = sigma_result.sigma_c_odd_at_dft_diag_ev
-	if photon_head_sigma_diag_tskn_ry is None:
-		photon_head_sigma_diag_tskn_ry = np.zeros(
-			(3, 3) + tuple(np.asarray(enk_dft).shape), dtype=np.complex128)
-	sigma_omega_h5_path = sigma_result.sigma_omega_h5_path
-	sigma_c_at_dft_ev   = sigma_result.sigma_c_at_dft_diag_ev
-	omega_dft_rel_ev    = sigma_result.omega_dft_rel_ev
-	# The energies THIS Σ was evaluated at (E_DFT one-shot, the map's input
-	# QP energies under SC).  Not degen-averaged below with the Σ channels:
-	# it is a spectrum, not a self-energy component.
-	e_eval_ev           = sigma_result.e_eval_ev
-	efermi_dft_ev       = sigma_result.efermi_dft_ev
-	sigma_c_omega       = sigma_result.sigma_c_omega_kij_ry
-	head_sigma_diag_w_kn_ry = (
-		sc_result.head_sigma_diag_dft_w_kn_ry
-		if qp_solver is QPSolver.SELF_CONSISTENT
-		else sigma_result.head_sigma_diag_w_kn_ry)
-	omega_grid_ev = (
-		np.asarray(sigma_result.omega_grid_ev, dtype=np.float64)
-		if sigma_result.omega_grid_ev is not None else None)
-	omega_grid_ry = (
-		np.asarray(sigma_result.omega_grid_ry, dtype=np.float64)
-		if sigma_result.omega_grid_ry is not None else None)
-	# ---- BGW-style degenerate-set averaging at the H-build seam ----
-	# (mirrors Sigma/shiftenergy.f90; see ``degen_average``).
-	if not config.no_degen_averaging:
-		(sigma_total, sig_sx, sig_coh, sig_h, sig_h_scalar,
-		 h_transverse, sig_x,
-		 sigma_c_at_dft_ev) = average_sigma_components(
-			sigma_total, sig_sx, sig_coh, sig_h, sig_h_scalar,
-			h_transverse, sig_x, sigma_c_at_dft_ev,
-			energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-			tol_ry=float(config.degen_avg_tol_ry),
-			mesh_xy=mesh_xy)
-		# Head-only debug columns must undergo the SAME DFT-degenerate-set
-		# averaging as the Sigma components they decompose.  After the QP->DFT
-		# diagonal transform an occupied-projector contribution need not be
-		# identical in an arbitrary basis inside a degenerate manifold.
-		def _average_head_diag(diag):
-			arr = np.asarray(diag)
-			if arr.ndim == 1:
-				arr = np.broadcast_to(arr, np.asarray(enk_dft).shape)
-			if arr.ndim in (2, 3):
-				return average_within_degenerate_sets(
-					arr, energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-					tol_ry=float(config.degen_avg_tol_ry))
-			raise ValueError(
-				f"head diagnostic has unsupported shape {arr.shape}")
-
-		if final_static_head_terms is not None:
-			import dataclasses
-			final_static_head_terms = dataclasses.replace(
-				final_static_head_terms,
-				sigma_x_diag=_average_head_diag(
-					final_static_head_terms.sigma_x_diag),
-				sigma_sx_diag=_average_head_diag(
-					final_static_head_terms.sigma_sx_diag),
-				sigma_sx_minus_x_diag=_average_head_diag(
-					final_static_head_terms.sigma_sx_minus_x_diag),
-				sigma_coh_diag=_average_head_diag(
-					final_static_head_terms.sigma_coh_diag),
-			)
-		if head_sigma_diag_w_kn_ry is not None:
-			head_sigma_diag_w_kn_ry = _average_head_diag(
-				head_sigma_diag_w_kn_ry)
-		photon_head_sigma_diag_tskn_ry = average_within_degenerate_sets(
-			np.asarray(photon_head_sigma_diag_tskn_ry),
-			energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-			tol_ry=float(config.degen_avg_tol_ry))
-
-	# The PPM output below needs only bare exchange's diagonal.  Extract it
-	# collectively while every rank is still in lockstep; never host-convert
-	# the full band-sharded operator.
-	from gw.qsgw_utils import static_sigma_diag_to_host
-	sig_x_diag_ry = static_sigma_diag_to_host(sig_x, mesh_xy)
-
-	# Σ_xc(E_DFT) diagonal (eV) — drives eqp_g0w0.dat (PPM one-shot
-	# only).  Form it AFTER the one canonical conditioning seam above: forming
-	# this sum before ``average_sigma_components`` made eqp_g0w0 retain raw,
-	# unequal degenerate diagonals even while every other live text output used
-	# the conditioned X/C pair.  With averaging disabled the seam is a no-op,
-	# so this same expression deliberately preserves the raw red twin.
-	sigma_xc_at_dft_ev = (
-		sig_x_diag_ry * RYD_TO_EV
-		+ sigma_c_at_dft_ev
-		if sigma_c_at_dft_ev is not None else None)
-
-	# ---- Single H-build + diagonalization on the producer-selected layout ----
-	# Gate the two inputs to the QP diagonalization *before* eigh: LAPACK
-	# on a NaN-bearing matrix returns without complaining, and the garbage
-	# then propagates into eqp0/eqp1/WFN_qp.h5 with rc=0.  ``kin_ion`` also
-	# comes off disk (kin_ion.h5), so this doubles as the content check on
-	# that interface.
-	# REFUSALS, not warnings, and that distinction is the 2026-08-15 bcc-Fe
-	# finding: an all-NaN Σ_c produced an all-NaN E_QP column, a NaN E_F and
-	# a NaN scissor fit, and the run exited rc=0 in 883 s with only a warning
-	# line to show for it (JID 57051742, CLAIMS 204).  The SC path catches
-	# that on its SECOND map call, through
-	# ``_solve_head_occupations -> OccupationState`` finiteness; a one-shot
-	# run has no second map call, so this seam -- which both paths cross -- is
-	# where the guard has to be.  ``LORRAX_ALLOW_NONFINITE_RESULT=1`` is the
-	# named escape for forensics.
-	from common import sanity
-	sanity.refuse_nonfinite("kin_ion (from kin_ion.h5)", kin_ion,
-	                        print_fn=print0,
-	                        detail="kin_ion.h5 is the mean-field side of H0; "
-	                               "regenerate it from THIS run's input file.")
-	sanity.refuse_nonfinite(
-		"Σ_total (Σ_xc + V_H)", sigma_total, print_fn=print0,
-		detail="A finite, well-conditioned pole set producing a non-finite "
-		       "Σ is a defect in the contraction or in what was handed to "
-		       "it, not a convergence problem.")
-
-	# TIMED: nk independent (nb_sigma, nb_sigma) Hermitian eigensolves.  It is
-	# one statement and normally seconds, but it is O(nk·nb³) and it is the
-	# only dense LAPACK call on the post-Σ path, so it is the row that tells
-	# you when the band window (not the physics) became the cost.
-	with timing.section("gw_jax.qp_eigh") as _sec_eigh:
-		H = 0.5 * ((kin_ion + sigma_total) + jnp.conj(jnp.swapaxes(kin_ion + sigma_total, -1, -2)))
-		E_full, U_full = jax.vmap(jnp.linalg.eigh, in_axes=0)(H)
-		_sec_eigh.watch(E_full, U_full)
-	sanity.refuse_nonfinite(
-		"E_qp (eigh of H_QP)", E_full, print_fn=print0,
-		detail="LAPACK returns without complaining on a NaN-bearing matrix, "
-		       "so this is the last place a NaN spectrum can be stopped "
-		       "before eqp0/eqp1/WFN_qp.h5.")
-	_t_out = time.perf_counter()
-
-	# ---- One-shot WFN_qp.h5 dump (drop-in BSE / restart input).  SC
-	# already wrote its own WFN_qp.h5 above via dump_qp_wfn_artifacts
-	# (using state_final.H_qp_dft) — same physics, slightly different
-	# numerics from the post-Σ-seam eigh path.  Skip the second write
-	# in SC to avoid clobbering.
-	if config.debug.write_wfn_h5 and qp_solver is not QPSolver.SELF_CONSISTENT:
-		write_qp_wfn_oneshot(
-			U_full, E_full, wfn=wfn, band_slices=band_slices,
-			input_dir=input_dir, qp_solver=qp_solver, print_fn=print0)
-
-	# PPM mode: feed the writer the on-shell diag(Σ_c(E_DFT)) (Ry) so the
-	# eqp0.dat "sigC" column reports dynamic correlation directly comparable
-	# to BGW's (SX-X)+CH at Eo=E_DFT.  Off-diagonals stay zero — the full
-	# Σ_c(ω, k, i, j) tensor is in sigma_mnk.h5 for callers that need them.
-	# Σ_c diagonal on the ω-grid: feed the eqp1.dat writer's central-diff
-	# Z-factor.  Pulled from the on-device sharded tensor when available.
-	if sigma_c_omega is not None:
-		sigma_c_omega_diag_ev = extract_sigma_diag_logical(
-			sigma_c_omega, mesh_xy,
-			band_axis=sigma_result.sigma_band_axis) * RYD_TO_EV
-		if not config.no_degen_averaging:
-			# Output-only diagonal curve.  The full persisted operator stays raw,
-			# while this curve uses the SAME canonical group owner at every omega;
-			# assemble_eqp consequently derives C(E_DFT) and Z from one function.
-			sigma_c_omega_diag_ev = average_within_degenerate_sets(
-				sigma_c_omega_diag_ev,
-				energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-				tol_ry=float(config.degen_avg_tol_ry))
-			if sigma_c_odd_at_dft_ev is not None:
-				sigma_c_odd_at_dft_ev = average_within_degenerate_sets(
-					np.asarray(sigma_c_odd_at_dft_ev),
-					energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-					tol_ry=float(config.degen_avg_tol_ry))
-		omega_rel_ev = omega_grid_ev
-	else:
-		sigma_c_omega_diag_ev = None
-		omega_rel_ev = None
-
-	sigma_c_diag_at_dft_ry = (
-		sigma_c_at_dft_ev / RYD_TO_EV
-		if (mode.is_dynamic and sigma_c_at_dft_ev is not None)
-		else None
-	)
-
-	# Per-state Gamma-cell attribution in the same conditioned DFT basis as
-	# sigma_diag.dat.  The packed diagnostic owns CC/CT+TC/TT for its static
-	# completion; the dynamic scalar owner contributes the X and C charge head.
-	head_sigma_split_skn_ry = None
-	if config.bispinor and config.debug.sigma_freq_debug_output:
-		head_sigma_split_skn_ry = np.asarray(
-			photon_head_sigma_diag_tskn_ry[1]
-			+ photon_head_sigma_diag_tskn_ry[2]).copy()
-		charge_head = None
-		if final_static_head_terms is not None:
-			if mode is ComputeMode.X_ONLY or mode.is_dynamic:
-				charge_head = np.asarray(final_static_head_terms.sigma_x_diag)
-			else:
-				charge_head = np.asarray(
-					final_static_head_terms.sigma_sx_diag
-					+ final_static_head_terms.sigma_coh_diag)
-			if charge_head.ndim == 1:
-				charge_head = np.broadcast_to(
-					charge_head, np.asarray(enk_dft).shape)
-		if mode.is_dynamic and head_sigma_diag_w_kn_ry is not None:
-			from .qsgw_utils import (interp_along_omega,
-			                         resolve_out_of_range_policy)
-			charge_corr = interp_along_omega(
-				np.asarray(head_sigma_diag_w_kn_ry),
-				np.asarray(omega_grid_ev), np.asarray(omega_dft_rel_ev),
-				out_of_range=resolve_out_of_range_policy(),
-				context="charge-head Sigma_c at E_DFT",
-				print_fn=lambda *args, **kwargs: None)
-			charge_head = (charge_corr if charge_head is None
-			               else charge_head + charge_corr)
-		if charge_head is not None:
-			head_sigma_split_skn_ry[0] += charge_head
-
-	# ---- Output ----
-	# Collectively extract only the bounded static diagonals before the
-	# rank-0-only writers.  The full operators remain on their original mesh;
-	# calling ``np.array`` on one here would either fail at multi-host P>1 or
-	# silently reintroduce the full-matrix replication this layout avoids.
-	sig_sx_diag_ry = static_sigma_diag_to_host(sig_sx, mesh_xy)
-	sig_coh_diag_ry = static_sigma_diag_to_host(sig_coh, mesh_xy)
-	sig_h_diag_ry = static_sigma_diag_to_host(sig_h, mesh_xy)
-	sig_h_scalar_diag_ry = static_sigma_diag_to_host(sig_h_scalar, mesh_xy)
-	h_transverse_diag_ry = (
-		None if h_transverse is None
-		else static_sigma_diag_to_host(h_transverse, mesh_xy))
-	sigma_lorentz_diag_skn_ry = None
-	if sigma_lorentz_skij_ry is not None:
-		sigma_lorentz_diag_skn_ry = np.stack([
-			static_sigma_diag_to_host(
-				sigma_lorentz_skij_ry[sector], mesh_xy)
-			for sector in range(3)
-		])
-		if not config.no_degen_averaging:
-			sigma_lorentz_diag_skn_ry = average_within_degenerate_sets(
-				sigma_lorentz_diag_skn_ry,
-				energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-				tol_ry=float(config.degen_avg_tol_ry))
-		if mode.is_dynamic and sigma_xc_at_dft_ev is not None:
-			# Dynamic sigma_diag owns sigXC as the direct per-state
-			# sigX + sigC(E_DFT) interpolation, whereas the H operator above is
-			# the QSGW-Hermitianized matrix.  Their diagonals can differ at the
-			# micro-eV level because they use distinct interpolation kernels.  The
-			# public Lorentz split is a decomposition of the old sigXC column, so
-			# define its CC residual at that SAME output seam; CT+TC and TT remain
-			# the independently computed static current contributions.
-			_output_total_ry = np.asarray(sigma_xc_at_dft_ev) / RYD_TO_EV
-			sigma_lorentz_diag_skn_ry[0] = (
-				_output_total_ry - sigma_lorentz_diag_skn_ry[1]
-				- sigma_lorentz_diag_skn_ry[2])
-
-	results = GWResults(
-		sig_sx=sig_sx,
-		sig_coh=sig_coh,
-		sig_h=sig_h,
-		sig_h_scalar=sig_h_scalar,
-		h_transverse=h_transverse,
-		sig_x=sig_x,
-		sig_sx_diag_ry=sig_sx_diag_ry,
-		sig_coh_diag_ry=sig_coh_diag_ry,
-		sig_h_diag_ry=sig_h_diag_ry,
-		sig_h_scalar_diag_ry=sig_h_scalar_diag_ry,
-		h_transverse_diag_ry=h_transverse_diag_ry,
-		sig_x_diag_ry=sig_x_diag_ry,
-		E_qp_ry=np.array(E_full),
-		U_qp=np.array(U_full),
-		E_dft_ry=np.array(enk_dft),
-		kin_ion_ry=np.array(kin_ion),
-		band_start=band_slices.b0,
-		band_stop=band_slices.b3,
-		use_ppm=mode.is_dynamic,
-		self_consistent=qp_solver is QPSolver.SELF_CONSISTENT,
-		sigma_kset=sigma_result.kset,
-		sigma_c_diag_at_dft_ry=sigma_c_diag_at_dft_ry,
-		sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
-		sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
-		omega_rel_ev=omega_rel_ev,
-		e_eval_ev=e_eval_ev,
-		efermi_ev=efermi_dft_ev,
-		sigma_omega_h5_path=sigma_omega_h5_path,
-		tensors_filename=tensors_filename,
-		E_eqp2_ry=(None if eqp2_result is None
-		             else np.asarray(eqp2_result.energies_ry)),
-		eqp2_iterations=(None if eqp2_result is None
-		                 else int(eqp2_result.iterations)),
-		eqp2_residual_ev=(None if eqp2_result is None
-		                  else float(eqp2_result.residual_ev)),
-		eqp2_tol_ev=(None if eqp2_result is None
-		             else float(config.eqp2.tol_ev)),
-		photon_head_sigma_diag_tskn_ry=np.asarray(
-			photon_head_sigma_diag_tskn_ry),
-		photon_head_sigma_basis=photon_head_sigma_basis,
-		sigma_lorentz_diag_skn_ry=sigma_lorentz_diag_skn_ry,
-		sigma_c_odd_diag_at_dft_ry=(
-			None if sigma_c_odd_at_dft_ev is None
-			else np.asarray(sigma_c_odd_at_dft_ev) / RYD_TO_EV),
-	)
-	if meta.rank == 0:
-		# Canonical Σ-decomposition table.  Explicit debug requests it for all
-		# modes; actual coupled q=0 completion auto-arms the same writer.
-		write_freq_debug(
-			results, config=config,
-			static_head_terms=final_static_head_terms,
-			omega_dft_rel_ev=omega_dft_rel_ev,
-			head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
-			omega_grid_ry=omega_grid_ry,
-			sym=sym, file_sym=wfn.symmetry(),
-			e_eval_ev=e_eval_ev,
-			print_fn=print0,
-		)
-		# The QP-ladder half of sigma_mnk.h5's opt-in plotting appendix
-		# (no-op unless ``write_qsgw_datasets``).  HERE and not at the Σ
-		# seam because two of the three ladders need ``kin_ion``, which
-		# ``compute_sigma_xc`` never sees; the QSGW cube itself was
-		# already appended by whichever path wrote the file
-		# (``qsgw_utils.write_qsgw_sigma_cube``).  Rank-0 and barrier-free
-		# like every other writer in this block: eigenvalues are basis-
-		# free, so this one seam is correct for the one-shot and the
-		# self-consistent paths alike.
-		write_qsgw_qp_ladders(
-			results, config=config,
-			e_qp_ry=results.E_qp_ry,
-			sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
-			omega_grid_ev=omega_grid_ev,
-			sigma_c_omega=sigma_c_omega,
-			print_fn=print0,
-		)
-		# Degen averaging was applied once at the H-build seam upstream;
-		# the writer just serializes the already-averaged Σ components.
-		write_results(
-			results,
-			sigma_diag_file=config.paths.sigma_diag_file,
-			eqp0_file=config.paths.eqp0_file,
-			eqp1_file=config.paths.eqp1_file,
-			eqp2_file=config.paths.eqp2_file,
-			input_dir=input_dir,
-			kgrid=meta.kgrid,
-			# THE symmetry object, not tables off it.  Every k-basis
-			# decision is made where the data is written, through
-			# ``symmetry_maps.reduce_full_bz_to_file_wedge``.
-			sym=sym,
-			wfn=wfn,
-			degeneracy_policy=(
-				"disabled" if config.no_degen_averaging else "bgw_average"),
-			degeneracy_tol_ry=float(config.degen_avg_tol_ry),
-			write_qp_rotations=not rotations_written,
-			qp_rotations_k_storage=config.qp_rotations_k_storage,
-			qp_solver=qp_solver,
-			print_fn=print0,
-		)
-		timing.record("gw_jax.output", time.perf_counter() - _t_out)
+	(
+	    enk_dft, eqp2_result, final_static_head_terms, kin_ion, rotations_written, sc_result,
+	    sigma_result, sigma_total) = _solve_qp_stage(
+	    V_q, band_slices, bispinor_v_q_path, centroid_indices, config, e_ref, enk_dft,
+	    head_resolver, input_dir, isdf, kin_ion, material_class, mesh_xy, meta, print0,
+	    qp_solver, quad, report, sigma_result, static_head_terms, sym, tensors_filename, wfn,
+	    wfns_sigma, wfns_transverse)
+	(
+	    e_eval_ev, efermi_dft_ev, final_static_head_terms, h_transverse,
+	    head_sigma_diag_w_kn_ry, omega_dft_rel_ev, omega_grid_ev, omega_grid_ry,
+	    photon_head_sigma_basis, photon_head_sigma_diag_tskn_ry, sig_coh, sig_h, sig_h_scalar,
+	    sig_sx, sig_x, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev, sigma_c_omega,
+	    sigma_lorentz_skij_ry, sigma_omega_h5_path, sigma_total, sigma_xc_at_dft_ev) = _sigma_output_fields(
+	    config, enk_dft, final_static_head_terms, mesh_xy, qp_solver, sc_result, sigma_result,
+	    sigma_total)
+	(
+	    E_full, U_full, _t_out) = _diagonalize_qp_hamiltonian(
+	    band_slices, config, input_dir, kin_ion, print0, qp_solver, sigma_total, wfn)
+	(
+	    h_transverse_diag_ry, head_sigma_split_skn_ry, omega_rel_ev, sig_coh_diag_ry,
+	    sig_h_diag_ry, sig_h_scalar_diag_ry, sig_sx_diag_ry, sigma_c_diag_at_dft_ry,
+	    sigma_c_odd_at_dft_ev, sigma_c_omega_diag_ev, sigma_lorentz_diag_skn_ry) = _sigma_diagnostic_fields(
+	    config, enk_dft, final_static_head_terms, h_transverse, head_sigma_diag_w_kn_ry,
+	    mesh_xy, mode, omega_dft_rel_ev, omega_grid_ev, photon_head_sigma_diag_tskn_ry, sig_coh,
+	    sig_h, sig_h_scalar, sig_sx, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev, sigma_c_omega,
+	    sigma_lorentz_skij_ry, sigma_result, sigma_xc_at_dft_ev)
+	(
+	    results) = _assemble_gw_results(
+	    E_full, U_full, band_slices, config, e_eval_ev, efermi_dft_ev, enk_dft, eqp2_result,
+	    h_transverse, h_transverse_diag_ry, kin_ion, mode, omega_rel_ev,
+	    photon_head_sigma_basis, photon_head_sigma_diag_tskn_ry, qp_solver, sig_coh,
+	    sig_coh_diag_ry, sig_h, sig_h_diag_ry, sig_h_scalar, sig_h_scalar_diag_ry, sig_sx,
+	    sig_sx_diag_ry, sig_x, sig_x_diag_ry, sigma_c_diag_at_dft_ry, sigma_c_odd_at_dft_ev,
+	    sigma_c_omega_diag_ev, sigma_lorentz_diag_skn_ry, sigma_omega_h5_path, sigma_result,
+	    sigma_xc_at_dft_ev, tensors_filename)
+	_write_gw_results(
+	    _t_out, config, e_eval_ev, final_static_head_terms, head_sigma_diag_w_kn_ry, input_dir,
+	    meta, omega_dft_rel_ev, omega_grid_ev, omega_grid_ry, print0, qp_solver, results,
+	    rotations_written, sigma_c_omega, sigma_c_omega_diag_ev, sym, wfn)
 	(_wall) = _close_timing(_pre_main, _t_main, meta, print0)
-
-	if sigma_lorentz_diag_skn_ry is not None:
-		_labels = ("CC", "CT+TC", "TT")
-		_parts_ev = np.asarray(sigma_lorentz_diag_skn_ry) * RYD_TO_EV
-		report.progress(
-			"Sigma blocks   : " + "; ".join(
-				f"{label} max|diag|={np.max(np.abs(part)):.6e} eV, "
-				f"mean|diag|={np.mean(np.abs(part)):.6e} eV"
-				for label, part in zip(_labels, _parts_ev)))
-	if head_sigma_split_skn_ry is not None:
-		_head_parts_ev = np.asarray(head_sigma_split_skn_ry) * RYD_TO_EV
-		report.progress(
-			"Head Sigma     : Gamma-cell contribution; " + "; ".join(
-				f"{label} max|diag|={np.max(np.abs(part)):.6e} eV, "
-				f"mean|diag|={np.mean(np.abs(part)):.6e} eV"
-				for label, part in zip(("CC", "CT+TC", "TT"),
-				                       _head_parts_ev)))
-	if sigma_c_odd_at_dft_ev is not None:
-		_odd_abs = np.abs(np.asarray(sigma_c_odd_at_dft_ev))
-		_xc_diag_ev = (
-			np.sum(np.asarray(sigma_lorentz_diag_skn_ry), axis=0) * RYD_TO_EV
-			if sigma_lorentz_diag_skn_ry is not None else
-			np.asarray(sig_x_diag_ry) * RYD_TO_EV
-			+ np.asarray(sigma_c_at_dft_ev))
-		_xc_abs = np.abs(_xc_diag_ev)
-		_max_share = (np.max(_odd_abs) / np.max(_xc_abs)
-		              if np.max(_xc_abs) > 0.0 else np.max(_odd_abs))
-		_mean_share = (np.mean(_odd_abs) / np.mean(_xc_abs)
-		               if np.mean(_xc_abs) > 0.0 else np.mean(_odd_abs))
-		_odd_prefix = (
-			"MPA odd Sigma  "
-			if getattr(config.compute_mode, "value", config.compute_mode) == "mpa"
-			else "GN odd Sigma   ")
-		_odd_line = (
-			f"{_odd_prefix}: measured-broken-TR ordered residue; "
-			f"max|sigC_odd|={np.max(_odd_abs):.6e} eV; "
-			f"mean|sigC_odd|={np.mean(_odd_abs):.6e} eV; "
-			f"max-share-of-|Sigma_xc|={_max_share:.6e}; "
-			f"mean-share-of-|Sigma_xc|={_mean_share:.6e}")
-		if sigma_result.ppm_probe_hermiticity_residual is not None:
-			_odd_line += (
-				f"; W(iomega_p)-Hermiticity="
-				f"{sigma_result.ppm_probe_hermiticity_residual:.3e}")
-		if sigma_result.ppm_odd_even_residue_ratio is not None:
-			_odd_line += (
-				f"; max|D|/max|B|="
-				f"{sigma_result.ppm_odd_even_residue_ratio:.3e}")
-		report.progress(_odd_line)
-	if q0_certificates:
-		_q0_cert = max(q0_certificates, key=lambda item: item.final_error_ratio)
-		report.progress(
-			"Slab WS cert   : exact q=0 charge-head cubature; "
-			f"orders={_q0_cert.orders}; nodes={_q0_cert.physical_counts}; "
-			f"polygon_edges={_q0_cert.polygon_edges}; evaluations="
-			f"{len(q0_certificates)}; max_final_error_ratio="
-			f"{_q0_cert.final_error_ratio:.3e} (<=1 required)")
-	report.sigma_coverage(
-		config=config, band_slices=band_slices, enk_dft_ry=enk_dft,
-		sigma_result=sigma_result)
-	report.qp_gap(
-		band_slices=band_slices, e_dft_ry=enk_dft, e_qp_ry=E_full)
-	if eqp2_result is not None:
-		report.eqp2_summary(
-			band_slices=band_slices,
-			e_eqp2_ry=eqp2_result.energies_ry,
-			iterations=eqp2_result.iterations,
-			residual_ev=eqp2_result.residual_ev,
-			tol_ev=config.eqp2.tol_ev)
+	_report_final_observables(
+	    E_full, band_slices, config, enk_dft, eqp2_result, head_sigma_split_skn_ry,
+	    q0_certificates, report, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev,
+	    sigma_lorentz_diag_skn_ry, sigma_result)
 	(
 	    _file_rows) = _report_file_rows(
 	    args, config, input_dir, report, sigma_omega_h5_path, tensors_filename)
@@ -1802,7 +1468,6 @@ def main(argv=None):
 	report.files(_file_rows)
 	report.finish()
 	production_stdout.close()
-
 	return 0
 
 
