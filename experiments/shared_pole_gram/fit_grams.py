@@ -148,7 +148,8 @@ def errors_from_gram(z_all, indices, row_map, poles, gram, weights):
         raise ValueError('Residual row-map/Gram shape mismatch')
     selection = np.eye(2*nall)[np.r_[np.arange(nt),np.arange(nt)+nall]]
     phi = varpro.basis(z_all[indices], poles)
-    prediction = np.vstack((phi.real, phi.imag)) @ row_map @ selection
+    evaluation_map = np.vstack((phi.real, phi.imag)) @ row_map
+    prediction = evaluation_map @ selection
     reference = np.eye(2*nall)[np.r_[indices, indices+nall]]
     residual = prediction - reference
     row_error = np.einsum('ij,jk,ik->i', residual, gram, residual)
@@ -160,9 +161,13 @@ def errors_from_gram(z_all, indices, row_map, poles, gram, weights):
         raise ValueError('Zero or negative reference norm in error diagnostic')
     if numerator < -1e-10 * denominator:
         raise ValueError('Materially negative Gram residual norm')
+    # Fixed-pole data amplification only; optimized pole motion is not included.
+    amplification = np.linalg.svd(evaluation_map, compute_uv=False)[0]
     return {'relative_frobenius': float(np.sqrt(max(numerator, 0.) / denominator)),
             'squared_error': numerator, 'squared_reference': denominator,
             'negative_roundoff_clamped': bool(numerator < 0),
+            'evaluation_map_operator_2norm': float(amplification),
+            'evaluation_map_scope': 'unweighted real H/A output from unweighted original Htrain/Atrain; fixed-pole map only',
             'rows': int(len(indices))}
 
 

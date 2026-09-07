@@ -195,6 +195,10 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
             "cond_real_design": float(singular[0] / singular[-1]) if singular[-1] else float("inf"),
             "design_rank": rank, "jac_sigma_min": (float(jac_singular[-1])
                                                      if jacobian.shape[0] >= jacobian.shape[1] else 0.0),
+            "jac_sigma_min_certified": bool(rank == p),
+            "jac_sigma_min_scope": ("Full-column-rank design: constant-rank reduced-residual derivative"
+                                    if rank == p else
+                                    "Uncertified: truncated-SVD derivative is not the full/constant-rank pseudoinverse derivative"),
             "jac_singular_values": jac_singular, "jac_normalization": "relative loss; log dimensionless poles",
             "bandwidth_ry": bandwidth, "wall_seconds": time.monotonic() - start,
             "nfev": result.nfev, "success": bool(result.success), "message": result.message,
