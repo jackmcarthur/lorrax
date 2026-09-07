@@ -245,7 +245,7 @@ def _pair_density_kernel(
 	n_col: int,
 ):
 	"""Return the one cached executable factory used by run and planning."""
-	cache_key = ('pair_density', id(mesh_xy), nk, n_rmu, nb, ns, n_col)
+	cache_key = ('pair_density', _mesh_key(mesh_xy), nk, n_rmu, nb, ns, n_col)
 
 	if cache_key not in _pair_density_cache:
 		x1_4 = NamedSharding(mesh_xy, P(None, 'x', None, None))
@@ -412,7 +412,7 @@ def _gram_q0_kernel(
 	transverse_feature_sum: bool = False,
 ):
 	"""Return the one cached q=0 executable used by run and planning."""
-	cache_key = ('gram_q0_from_pair', id(mesh_xy), nk, ns1, ns2, n_rmu,
+	cache_key = ('gram_q0_from_pair', _mesh_key(mesh_xy), nk, ns1, ns2, n_rmu,
 	             n_col, lhs_id, rhs_id, symmetrize,
 	             transverse_feature_sum)
 
@@ -567,7 +567,7 @@ def _gram_q0_from_psi_kernel(
 	"""Return the fused pair-density + q=0 normal-matrix executable."""
 	transverse = gamma_mode == "transverse"
 	cache_key = (
-		'gram_q0_from_psi_sm', id(mesh_xy), nk, n_rows, n_cols,
+		'gram_q0_from_psi_sm', _mesh_key(mesh_xy), nk, n_rows, n_cols,
 		nb_l, nb_r, nspinor, gamma_mode, symmetrize,
 	)
 	if cache_key not in _isdf_pipeline_cache:
@@ -718,7 +718,7 @@ def _gram_q0_tiled_from_psi_kernel(
 	col_tail = local_cols - (n_col_tiles - 1) * local_tile_cols
 	has_tail = (row_tail != local_tile_rows or col_tail != local_tile_cols)
 	cache_key = (
-		'gram_q0_tiled_from_psi_sm', id(mesh_xy), nk, n_points,
+		'gram_q0_tiled_from_psi_sm', _mesh_key(mesh_xy), nk, n_points,
 		nb_l, nb_r, nspinor, tile_width, gamma_mode,
 	)
 	if cache_key not in _isdf_pipeline_cache:
@@ -1151,7 +1151,7 @@ def c_q_downfold(
 		mesh_xy, kgrid, ns, (n_col // p_y, n_rmu // p_x),
 		gamma_L, gamma_R)
 
-	cache_key = ('c_q_from_psi_sm', id(mesh_xy), nk, n_rmu, n_col, ns,
+	cache_key = ('c_q_from_psi_sm', _mesh_key(mesh_xy), nk, n_rmu, n_col, ns,
 	             nb_l, nb_r, nkx, nky, nkz, lhs_id, rhs_id,
 	             pair_arm, pair_gamma_key)
 	if cache_key not in _pair_pipeline_sm_cache:
@@ -1393,7 +1393,7 @@ def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
 			f"n_bc={n_bc}, bpd_max={bpd_max}")
 
 	key = (
-		id(mesh_xy), id(psi_G_store), tuple(psi_G_store.band_chunk_ranges),
+		_mesh_key(mesh_xy), id(psi_G_store), tuple(psi_G_store.band_chunk_ranges),
 		nk, ns, n_rtot, bpd_max, ngkmax, fft_grid,
 	)
 	fn = _psi_r_cache_sm_cache.get(key)
@@ -1621,7 +1621,7 @@ def _z_q_face_parent(
 	cache_spec = P(None, None, ('x', 'y'), None, None)
 
 	cache_key = (
-		'z_q_face_parent', id(mesh_xy), id(plan), pair_kernel is not None,
+		'z_q_face_parent', _mesh_key(mesh_xy), id(plan), pair_kernel is not None,
 		(None if use_psi_r_cache else id(psi_G_store)),
 		local_band_chunk_shape, fft_grid,
 		n_parent, ns, mu_pk, nb_face, R_t, nkx, nky, nkz, bcr,
@@ -3231,7 +3231,7 @@ def _factor_c_q_replicated(
                  "LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond))
     out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     rep_sh = NamedSharding(mesh_xy, P())
-    key = (id(mesh_xy), int(nq), int(n_rmu), n_log,
+    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log,
            float(ridge_extra), mode, float(rcond))
     if key not in _replicated_chol_cache:
         _re = ridge_extra
@@ -3501,7 +3501,7 @@ def _factor_c_q_replicated_qparallel(
     q_sh = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
     mid_sh = NamedSharding(mesh_xy, P('x', None, 'y'))
 
-    key = (id(mesh_xy), int(nq), int(n_rmu), n_log,
+    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log,
            float(ridge_extra), mode, float(rcond), bool(rank_log))
     if key not in _qparallel_factor_cache:
         _re, _rc, _rl = ridge_extra, rcond, rank_log
@@ -3746,7 +3746,7 @@ def _factor_c_q_transverse_lu(
         # r-chunk; per-q independent, so concatenating batches reproduces
         # the one-shot call.
         step = _replicated_factor_q_chunk(nq, n_log)
-        key = (id(mesh_xy), int(n_rmu), n_log, 'batch')
+        key = (_mesh_key(mesh_xy), int(n_rmu), n_log, 'batch')
         if key not in _transverse_lu_cache:
             @partial(jax.jit,
                      out_shardings=(out_sh, NamedSharding(mesh_xy, P(None, None))))
@@ -3773,7 +3773,7 @@ def _factor_c_q_transverse_lu(
             jnp.concatenate([p[1] for p in parts], axis=0),
             NamedSharding(mesh_xy, P(None, None)))
         return LU_q, perm_q
-    key = (id(mesh_xy), int(nq), int(n_rmu), n_log, 'qpar')
+    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, 'qpar')
     if key not in _transverse_lu_cache:
         _qparallel_announce_transverse(nq, n_rmu, n_log, mesh_xy)
         ndev = int(mesh_xy.devices.size)
@@ -3915,7 +3915,7 @@ def _factor_c_q_transverse_distributed_lu(
     n_log = int(n_rmu_logical)
     xy_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
-    key = (id(mesh_xy), int(nq), int(n_rmu), n_log, str(backend))
+    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, str(backend))
     if key not in _transverse_distributed_lu_cache:
         @jax.jit
         def _prep(C, trace):
@@ -4225,7 +4225,7 @@ def _factor_c_q_distributed_rank_truncate(
     qb = _chunk_q(nq, per_q_coll)
     _chunk_log('C+ formation (pinv)', nq, qb, per_q_coll)
 
-    key = ('dist_rank_trunc', id(mesh_xy), int(nq), int(n_pad), n_log,
+    key = ('dist_rank_trunc', _mesh_key(mesh_xy), int(nq), int(n_pad), n_log,
            float(rcond), bool(rank_log), int(qb), bool(indefinite))
     if key not in _dist_factor_cache:
         out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
@@ -4435,7 +4435,7 @@ def _distributed_pinv_apply(
     # that do not exist.  Two compiles + two transient slices per r-chunk
     # against ~nq of each on the traced-q form; at MoS2 12x12 (nq=144,
     # qb=116) that is 2 blocks per r-chunk.
-    key = ('dist_pinv_apply', id(mesh_xy), int(nq), int(n_pad), n_log,
+    key = ('dist_pinv_apply', _mesh_key(mesh_xy), int(nq), int(n_pad), n_log,
            n_zcols, int(qb))
     if key not in _dist_solve_cache:
         @partial(shard_map, mesh=mesh_xy,
@@ -5359,7 +5359,7 @@ def _solve_zeta_replicated(
     # back-solve compiles don't collide on the same key.  ``n_log`` is
     # closure state of the kernels below (the slice extent), so it keys the
     # cache too.
-    cache_key = ('solve_from_L', id(mesh_xy), nq, n_rmu, n_log,
+    cache_key = ('solve_from_L', _mesh_key(mesh_xy), nq, n_rmu, n_log,
                  n_zchunk_padded, q_chunk_size, bool(use_lu),
                  bool(use_rank_trunc), bool(per_q_gather),
                  bool(hoisted_lu), bool(use_pinv_T))
@@ -5715,7 +5715,7 @@ def fit_one_rchunk(
     if _prebuilt_Z_q is not None and int(vertex_mu_L) == 0:
         raise ValueError("fit_one_rchunk: _prebuilt_Z_q requires a current vertex")
     cache_key = (
-        id(mesh_xy),
+        _mesh_key(mesh_xy),
         actual_n_rchunk,
         tuple(tuple(b) for b in band_chunk_ranges),
         q_chunk_size,

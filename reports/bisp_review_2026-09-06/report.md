@@ -82,7 +82,7 @@
 | `src/gw/gw_init.py` | `_report_zeta_chunk_plan` | 0 | 16 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_reuse_zeta_faces` | 0 | 27 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_plan_transverse_zeta` | 0 | 28 | New explicit phase/direct owner |
-| `src/gw/gw_init.py` | `_plan_coupled_zeta_fit` | 0 | 108 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_plan_coupled_zeta_fit` | 0 | 107 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_fit_charge_zeta_channel` | 0 | 74 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_report_zeta_fit_peak` | 0 | 33 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_transverse_zeta_channel_runner` | 0 | 80 | New explicit phase/direct owner |
@@ -96,14 +96,25 @@
 | `src/gw/gw_init.py` | `_compute_photon_vq` | 0 | 90 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_compute_scalar_vq` | 0 | 35 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_finalize_vq_views` | 0 | 23 | New explicit phase/direct owner |
-| `src/gw/gw_init.py` | **File total** | 3786 | 3550 | Net -236 lines |
+| `src/gw/gw_init.py` | **File total** | 3786 | 3549 | Net -237 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
+| `src/isdf/core.py` | `_pair_density_kernel` | 24 | 24 | Existing statements moved to named stages or dead selector removed |
+| `src/isdf/core.py` | `_gram_q0_kernel` | 43 | 43 | Existing statements moved to named stages or dead selector removed |
+| `src/isdf/core.py` | `_gram_q0_from_psi_kernel` | 63 | 63 | Existing statements moved to named stages or dead selector removed |
+| `src/isdf/core.py` | `_gram_q0_tiled_from_psi_kernel` | 154 | 154 | Existing statements moved to named stages or dead selector removed |
 | `src/isdf/core.py` | `c_q_from_psi_sm` | 42 | 95 | Existing statements moved to named stages or dead selector removed |
 | `src/isdf/core.py` | `_c_q_legacy` | 122 | 0 | Deleted or renamed to direct owner |
 | `src/isdf/core.py` | `_c_q_face_parent` | 95 | 0 | Deleted or renamed to direct owner |
-| `src/isdf/core.py` | `_z_q_face_parent` | 327 | 327 | Unchanged; target remains |
+| `src/isdf/core.py` | `build_psi_r_cache_sm` | 70 | 70 | Existing statements moved to named stages or dead selector removed |
+| `src/isdf/core.py` | `_z_q_face_parent` | 327 | 327 | Existing statements moved to named stages or dead selector removed |
+| `src/isdf/core.py` | `_factor_c_q_replicated` | 116 | 116 | Existing statements moved to named stages or dead selector removed |
+| `src/isdf/core.py` | `_factor_c_q_replicated_qparallel` | 121 | 121 | Existing statements moved to named stages or dead selector removed |
+| `src/isdf/core.py` | `_factor_c_q_transverse_lu` | 127 | 127 | Existing statements moved to named stages or dead selector removed |
+| `src/isdf/core.py` | `_factor_c_q_transverse_distributed_lu` | 59 | 59 | Existing statements moved to named stages or dead selector removed |
+| `src/isdf/core.py` | `_factor_c_q_distributed_rank_truncate` | 246 | 246 | Existing statements moved to named stages or dead selector removed |
+| `src/isdf/core.py` | `_distributed_pinv_apply` | 99 | 99 | Existing statements moved to named stages or dead selector removed |
 | `src/isdf/core.py` | `factor_c_q` | 317 | 317 | Unchanged; target remains |
 | `src/isdf/core.py` | `solve_zeta` | 699 | 101 | Existing statements moved to named stages or dead selector removed |
 | `src/isdf/core.py` | `solve_zeta._ridge_indef_solve` | 7 | 0 | Deleted or renamed to direct owner |
@@ -115,6 +126,7 @@
 | `src/isdf/core.py` | `solve_zeta._pinv_matmul_logical._mm` | 2 | 0 | Deleted or renamed to direct owner |
 | `src/isdf/core.py` | `solve_zeta._pinv_apply_T_logical` | 8 | 0 | Deleted or renamed to direct owner |
 | `src/isdf/core.py` | `solve_zeta._pinv_apply_T_logical._mm` | 2 | 0 | Deleted or renamed to direct owner |
+| `src/isdf/core.py` | `fit_one_rchunk` | 137 | 137 | Existing statements moved to named stages or dead selector removed |
 | `src/isdf/core.py` | `c_q_downfold` | 0 | 122 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_logical_solvers` | 0 | 61 | New explicit phase/direct owner |
 | `src/isdf/core.py` | `_zeta_logical_solvers._ridge_indef_solve` | 0 | 7 | New explicit phase/direct owner |
@@ -172,13 +184,22 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
+| `src/gw/w_isdf.py` | `_get_chi_minimax_kernel` | 48 | 48 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/w_isdf.py` | `_get_chi_fractional_contour_kernel` | 28 | 28 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/w_isdf.py` | `_get_w_solve_fn_local` | 142 | 142 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/w_isdf.py` | `_get_w_solve_fn_distributed` | 201 | 201 | Existing statements moved to named stages or dead selector removed |
 | `src/gw/w_isdf.py` | `compute_static_photon_response` | 362 | 58 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/w_isdf.py` | `_parent_face_unfold_operands` | 22 | 22 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/w_isdf.py` | `iter_parent_children_faces` | 56 | 56 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/w_isdf.py` | `iter_parent_children_faces._kernel` | 17 | 17 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/w_isdf.py` | `_get_chi_static_fractional_gamma_kernel_face` | 52 | 52 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/w_isdf.py` | `_get_chi_fractional_q_kernel_face` | 60 | 60 | Existing statements moved to named stages or dead selector removed |
 | `src/gw/w_isdf.py` | `_resolve_static_photon_policy` | 0 | 92 | New explicit phase/direct owner |
 | `src/gw/w_isdf.py` | `_read_static_photon_body` | 0 | 27 | New explicit phase/direct owner |
 | `src/gw/w_isdf.py` | `_report_static_photon_body` | 0 | 26 | New explicit phase/direct owner |
 | `src/gw/w_isdf.py` | `_screen_static_photon_body` | 0 | 85 | New explicit phase/direct owner |
 | `src/gw/w_isdf.py` | `_complete_static_photon_head` | 0 | 60 | New explicit phase/direct owner |
-| `src/gw/w_isdf.py` | **File total** | 3072 | 3068 | Net -4 lines |
+| `src/gw/w_isdf.py` | **File total** | 3072 | 3069 | Net -3 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -192,6 +213,27 @@
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
 | `src/common/contract_bands.py` | **File total** | 799 | 799 | Net +0 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
+| `src/gw/cohsex_sigma.py` | `_make_static_convolution` | 34 | 34 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/cohsex_sigma.py` | `_make_cohsex_kernels` | 28 | 28 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/cohsex_sigma.py` | **File total** | 639 | 640 | Net +1 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
+| `src/gw/photon_layout.py` | `_empty` | 12 | 12 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/photon_layout.py` | `_insert_program` | 37 | 37 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/photon_layout.py` | `_view_program` | 26 | 26 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/photon_layout.py` | `_vector_pack_program` | 47 | 47 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/photon_layout.py` | `_q0_update_program` | 52 | 52 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/photon_layout.py` | `_q0_block_program` | 55 | 55 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/photon_layout.py` | **File total** | 736 | 737 | Net +1 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
+| `src/gw/photon_sigma.py` | `_make_photon_static_class_kernel` | 51 | 51 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/photon_sigma.py` | **File total** | 302 | 303 | Net +1 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -260,7 +302,7 @@
 
 | Tree scope | Before | After | Net |
 |---|---|---|---|
-| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 124322 | -925 |
+| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 124325 | -922 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
@@ -272,7 +314,8 @@
 | 6 — complete driver stages (208ed323) | 1401 | 456 passed,2 skipped,1 xfailed; centroid closure/parent/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-183807-44846-3326, lx-Xg4-183816-45219-2050; 14_driver_stages/cpu/cpu.xml; 14_driver_stages/p4/mos2/identity.json |
 | 7 — Vq stages (f579b808) | 1403 | 445 passed, 2 skipped, 1 xfailed; centroid/parent/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-184246-65473-4941, lx-Xg4-184258-66104-4580; 15_vq_stages/cpu/cpu.xml; 15_vq_stages/p4/mos2/identity.json |
 | 8 — extract charge and current fit stages (36b46cb0) | 1404 | 453 passed, 2 skipped, 1 xfailed, 102 warnings in 177.56s (0:02:57) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-185204-112340-9401, lx-Xg4-185204-112565-5557; 16_fit_stages/cpu/cpu.xml; 16_fit_stages/p4/mos2/identity.json |
-| 9 — extract zeta writer and tile stages (this commit) | 1405 | 465 passed, 2 skipped, 1 xfailed, 102 warnings in 247.62s (0:04:07) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-190233-157458-4126, lx-Xg4-190235-157617-6713; 18_fit_writer_stages/cpu/cpu.xml; 18_fit_writer_stages/p4/mos2/identity.json |
+| 9 — extract zeta writer and tile stages (48194876) | 1405 | 465 passed, 2 skipped, 1 xfailed, 102 warnings in 247.62s (0:04:07) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-190233-157458-4126, lx-Xg4-190235-157617-6713; 18_fit_writer_stages/cpu/cpu.xml; 18_fit_writer_stages/p4/mos2/identity.json |
+| 10 — use canonical mesh cache keys (this commit) | 1406 | 452 passed, 2 skipped, 1 xfailed, 102 warnings in 177.23s (0:02:57) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-190804-191933-7526, lx-Xg4-190804-192105-9882; 19_owner_cache_keys/cpu/cpu.xml; 19_owner_cache_keys/p4/mos2/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|

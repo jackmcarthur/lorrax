@@ -1,4 +1,5 @@
 """Screen charge and current response with typed parent transport and q-IBZ operators."""
+from distrib_la import mesh_key as _mesh_key
 import os
 import time
 from dataclasses import dataclass
@@ -103,7 +104,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         vertex_classes = tuple(tuple(v == 0 for v in pair) for pair in vertex_pairs)
         if len(set(vertex_classes)) != 1 or n_out != 1:
             raise ValueError("Vertex outputs must share one family pair and one static rule.")
-    cache_key = (id(mesh_xy), kgrid, ffi_dial_key(), n_out,
+    cache_key = (_mesh_key(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_classes, (tuple(id(p) for p in k_unfold_plan)
                                if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)))
@@ -392,7 +393,7 @@ def _get_chi_fractional_contour_kernel(
         raise ValueError(
             f"_get_chi_fractional_contour_kernel: layout must be 'face' "
             f"got {layout!r}")
-    cache_key = ("fractional_contour", id(mesh_xy), grid, ffi_dial_key(),
+    cache_key = ("fractional_contour", _mesh_key(mesh_xy), grid, ffi_dial_key(),
                  n_out, layout, face_shape, id(k_unfold_plan))
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
@@ -588,7 +589,7 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
             f"_get_w_solve_fn_local: n_rmu_logical={n_log} exceeds extent {n_rmu}")
     mu_pad = int(n_rmu) - n_log
 
-    cache_key = ("local", id(mesh_xy), nq, n_rmu, n_log)
+    cache_key = ("local", _mesh_key(mesh_xy), nq, n_rmu, n_log)
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
 
@@ -771,7 +772,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     # legitimately share one padded extent while owning different logical
     # prefixes (notably scalar charge versus an explicit packed carrier), so
     # omitting n_log would reuse a closure with the wrong exact-zero mask.
-    cache_key = ("distributed", id(mesh_xy), nq, n_ext, n_log,
+    cache_key = ("distributed", _mesh_key(mesh_xy), nq, n_ext, n_log,
                  str(distrib_la_batched_route))
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
@@ -2535,7 +2536,7 @@ _PARENT_UNFOLD_OPERANDS = {}
 
 def _parent_face_unfold_operands(plan, mesh_xy):
     """Place the eight typed parent-unfold tables from host data on their declared mesh axes."""
-    key = (id(plan), id(mesh_xy))
+    key = (id(plan), _mesh_key(mesh_xy))
     hit = _PARENT_UNFOLD_OPERANDS.get(key)
     if hit is not None:
         return hit
@@ -2580,7 +2581,7 @@ def iter_parent_children_faces(carrier, mesh_xy, *, slices, by_parent=True):
     host_tables = plan.wavefunction_unfold_tables()
 
     def _kernel(spec, spin_axis, mu_axis, perm_spec, L_spec, n_rows):
-        key = (plan, id(mesh_xy), spec, spin_axis, mu_axis, int(n_rows))
+        key = (plan, _mesh_key(mesh_xy), spec, spin_axis, mu_axis, int(n_rows))
         hit = _CHILD_FACE_KERNELS.get(key)
         if hit is None:
             def body(psi, irr_r, sym_r, kfrac_r, U_r, perm, L):
@@ -2640,7 +2641,7 @@ def _get_chi_static_fractional_gamma_kernel_face(
     from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
 
     tile = int(pair_tile)
-    key = ("static_fractional_gamma_face", id(mesh_xy), int(nb_full),
+    key = ("static_fractional_gamma_face", _mesh_key(mesh_xy), int(nb_full),
            int(nb_logical), tile, id(k_unfold_plan))
     hit = _chi_minimax_kernel_cache.get(key)
     if hit is not None:
@@ -2694,7 +2695,7 @@ def _get_chi_fractional_q_kernel_face(
     from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
 
     tile = int(pair_tile)
-    key = ("direct_fractional_q_face", id(mesh_xy), int(nb_full),
+    key = ("direct_fractional_q_face", _mesh_key(mesh_xy), int(nb_full),
            int(nb_logical), tile, int(n_z), id(k_unfold_plan))
     hit = _chi_minimax_kernel_cache.get(key)
     if hit is not None:
