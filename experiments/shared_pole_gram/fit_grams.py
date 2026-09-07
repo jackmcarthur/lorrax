@@ -33,6 +33,38 @@ def train_indices(bank):
     return np.r_[np.arange(nt), np.arange(nt)+nt+nh]
 
 
+def read_rowplan(path):
+    """Read one fixed list of original training indices, with its byte hash."""
+    if path is None:
+        return None
+    raw = Path(path).read_bytes()
+    indices = json.loads(raw)
+    if (not isinstance(indices, list) or not indices or
+            any(type(index) is not int for index in indices) or
+            len(set(indices)) != len(indices)):
+        raise ValueError('Training rowplan must be a nonempty JSON list of unique integers')
+    if len(indices) > 40:
+        raise ValueError('Explicit training rowplan exceeds the 40-value fitting budget')
+    return {'indices': indices, 'path': str(Path(path).resolve()),
+            'sha256': hashlib.sha256(raw).hexdigest()}
+
+
+def selected_rows(bank, rowplan):
+    """Validate original training indices; held rows can never enter the fit."""
+    nt = len(bank['z'])
+    selected = np.arange(nt) if rowplan is None else np.asarray(rowplan['indices'], dtype=int)
+    if np.any(selected < 0) or np.any(selected >= nt):
+        raise ValueError(f'Training rowplan indices must lie in [0,{nt}); held rows are forbidden')
+    return selected
+
+
+def fitting_weights(bank, selected, omega, weight):
+    """Recompute quadrature on selected nodes; retain zero weights elsewhere."""
+    loss = np.zeros(len(bank['z']))
+    loss[selected] = line_weights(bank['z'][selected], omega, weight)
+    return loss
+
+
 def sha(path):
     """SHA256 of one explicitly named file."""
     with Path(path).open('rb') as stream:
@@ -134,12 +166,15 @@ def errors_from_gram(z_all, indices, row_map, poles, gram, weights):
             'rows': int(len(indices))}
 
 
-def line_errors(bank, fitted, omega, weight):
+def line_errors(bank, fitted, omega, weight, selected=None):
     """Report each train/held height, in whitened and physical coordinates."""
     z_all = np.r_[bank['z'], bank['zh']]
     result = {}
     nt = len(bank['z'])
-    for split, base in [('train', np.arange(nt)), ('held', np.arange(nt,len(z_all)))]:
+    selected = np.arange(nt) if selected is None else selected
+    omitted = np.setdiff1d(np.arange(nt), selected)
+    for split, base in [('train', selected), ('validation_unselected_train', omitted),
+                        ('held', np.arange(nt,len(z_all)))]:
         for height in np.unique(np.round(z_all[base].imag * EV, 9)):
             indices = base[np.round(z_all[base].imag * EV, 9) == height]
             loss = line_weights(z_all[indices], omega, weight)
@@ -185,28 +220,33 @@ def provenance():
             'scope': 'Hermitian-residue damped subcase only; no general complex residues, residue ranks, passivity, or Sigma score'}
 
 
-def rank_summary(gram_dir, out_dir):
+def rank_summary(gram_dir, out_dir, training_indices=None):
     """Write all-q ORDER-weighted original complex-Gram spectral rank table."""
     for name in ('order_rank_summary.json', 'order_rank_table.md'):
         if (out_dir/name).exists():
             raise FileExistsError(f'Immutable output exists: {out_dir/name}')
     omega, weight, receipt = authenticated_weight()
+    rowplan = read_rowplan(training_indices)
     records = []
     for q in range(29):
         path = gram_dir / f'q{q:02d}.npz'
         bank = load_gram(path)
-        loss = line_weights(bank['z'], omega, weight)
+        selected = selected_rows(bank, rowplan)
+        loss = fitting_weights(bank, selected, omega, weight)
         scopes = {}
-        groups = [(f'height_{h:.9f}_ev', np.flatnonzero(np.round(bank['z'].imag*EV,9) == h))
-                  for h in np.unique(np.round(bank['z'].imag*EV,9))]
-        groups.append(('combined', np.arange(len(bank['z']))))
+        selected_heights = np.round(bank['z'][selected].imag*EV,9)
+        groups = [(f'height_{h:.9f}_ev', selected[selected_heights == h])
+                  for h in np.unique(selected_heights)]
+        groups.append(('combined', selected))
         for name, indices in groups:
             sw = np.sqrt(loss[indices])
             scopes[name] = spectrum(bank['complex_gram'][np.ix_(indices, indices)] * sw[:,None] * sw[None,:])
-        records.append({'q': q, 'input_path': str(path), 'input_sha256': sha(path), 'scopes': scopes})
+        records.append({'q': q, 'input_path': str(path), 'input_sha256': sha(path), 'scopes': scopes,
+                        'values_used': len(selected), 'selected_training_indices': selected.tolist()})
     out_dir.mkdir(parents=True, exist_ok=True)
     origin = provenance()
     origin['scope'] = 'All 29 q original V-whitened complex Gram, training only; no pole fit or residue-rank claim'
+    origin['training_rowplan'] = rowplan
     write_json(out_dir/'order_rank_summary.json', {'provenance': origin, 'order_receipt': receipt, 'records': records})
     lines = ['# ORDER-weighted complex Gram ranks', '',
              'All 29 q, training only. Cutoffs apply to singular amplitudes; no fit acceptance is claimed.', '',
@@ -219,7 +259,7 @@ def rank_summary(gram_dir, out_dir):
         stream.write('\n'.join(lines)+'\n')
 
 
-def warm_start(directory, q, p, bank, loss):
+def warm_start(directory, q, p, bank, loss, selected=None):
     """Authenticate a warm seed and refuse changes to the fixed fit functional.
 
     Poles alone are seeded; every frequency and width remains an optimizer
@@ -241,25 +281,31 @@ def warm_start(directory, q, p, bank, loss):
     if sha(old_gram_path) != record['input_sha256']:
         raise ValueError(f'Warm input Gram hash mismatch: {old_gram_path}')
     old_bank = load_gram(old_gram_path)
+    selected = np.arange(len(bank['z'])) if selected is None else selected
     with np.load(path, allow_pickle=False) as old:
+        old_selected = (old['selected_training_indices'] if 'selected_training_indices' in old.files
+                        else np.arange(len(old['z_train_ry'])))
         if (not np.array_equal(old['z_train_ry'], bank['z']) or
                 not np.array_equal(old['weights_loss'], loss) or
+                not np.array_equal(old_selected, selected) or
                 not np.array_equal(old_bank['zh'], bank['zh']) or
                 old['poles_ry'].shape != (p,)):
-            raise ValueError('Warm-start grid, weights, held grid, or p changed; fixed functional refused')
+            raise ValueError('Warm-start grid, selected rows, weights, held grid, or p changed; fixed functional refused')
         poles = old['poles_ry'].copy()
     return poles, {'path': str(path), 'sha256': sha(path), 'receipt_path': str(record_path),
                    'receipt_sha256': sha(record_path), 'grid_weights_solver_match': True,
                    'pole_variables': 'all frequencies and widths remain free'}
 
 
-def main(gram_dir, out_dir, check=False, warm_dir=None):
+def main(gram_dir, out_dir, check=False, warm_dir=None, training_indices=None):
     """Fit q slots distributed by SLURM_PROCID stride SLURM_NTASKS."""
     rank, tasks = int(os.getenv('SLURM_PROCID', '0')), int(os.getenv('SLURM_NTASKS', '1'))
     if tasks < 1 or not 0 <= rank < tasks:
         raise ValueError('Invalid Slurm rank geometry')
     omega, weight, receipt = authenticated_weight()
+    rowplan = read_rowplan(training_indices)
     origin = provenance()
+    origin['training_rowplan'] = rowplan
     slots = list(range(rank, 29, tasks))
     out_dir.mkdir(parents=True, exist_ok=True)
     if (out_dir/f'receipt_rank{rank:02d}.json').exists():
@@ -281,27 +327,43 @@ def main(gram_dir, out_dir, check=False, warm_dir=None):
     for q in slots:
         path = gram_dir/f'q{q:02d}.npz'
         bank = load_gram(path)
-        loss = line_weights(bank['z'], omega, weight)
+        selected = selected_rows(bank, rowplan)
+        loss = fitting_weights(bank, selected, omega, weight)
         training = train_indices(bank)
-        gram = bank['channel_gram'][np.ix_(training, training)]
+        nt = len(bank['z'])
+        selected_channels = np.r_[selected, selected+nt]
+        fit_training = training[selected_channels]
+        gram = bank['channel_gram'][np.ix_(fit_training, fit_training)]
         upstream_path = path.with_suffix('.json')
         upstream = json.loads(upstream_path.read_text()) if upstream_path.is_file() else {'receipt_missing': str(upstream_path)}
         for p in (8,16,24,32):
             stem = out_dir/f'q{q:02d}_p{p:02d}'
             record = {'q': q, 'p': p, 'provenance': origin, 'order_receipt': receipt,
-                      'input_path': str(path), 'input_sha256': sha(path), 'upstream_receipt': upstream}
+                      'input_path': str(path), 'input_sha256': sha(path), 'upstream_receipt': upstream,
+                      'values_used': len(selected), 'selected_training_indices': selected.tolist(),
+                      'rowplan_sha256': rowplan['sha256'] if rowplan is not None else None,
+                      'training_values_available': nt, 'held_validation_values': len(bank['zh']),
+                      'unselected_training_validation_values': nt-len(selected),
+                      'within_40_fitted_values': bool(len(selected) <= 40)}
             try:
                 print(f'FIT q{q:02d} p={p} rank={rank} start', flush=True)
                 initial = None
                 if warm_dir is not None:
-                    initial, seed_receipt = warm_start(warm_dir, q, p, bank, loss)
+                    initial, seed_receipt = warm_start(warm_dir, q, p, bank, loss, selected)
                     record['warm_start'] = seed_receipt
-                fitted = varpro.fit(bank['z'], loss, gram, bank['sketches'], p, initial=initial)
-                errors = line_errors(bank, fitted, omega, weight)
+                fitted = varpro.fit(bank['z'][selected], loss[selected], gram,
+                                    bank['sketches'][selected], p, initial=initial)
+                expanded_map = np.zeros((p,2*nt), dtype=fitted['row_map'].dtype)
+                expanded_map[:,selected_channels] = fitted['row_map']
+                fitted['row_map'] = expanded_map
+                fitted.update(values_used=len(selected), selected_training_indices=selected.tolist(),
+                              rowplan_sha256=rowplan['sha256'] if rowplan is not None else None)
+                errors = line_errors(bank, fitted, omega, weight, selected)
                 with stem.with_suffix('.npz').open('xb') as stream:
                     np.savez(stream, poles_ry=fitted['poles_ry'], row_map=fitted['row_map'],
                              z_train_ry=bank['z'], z_held_ry=bank['zh'], weights_loss=loss,
-                             train_channel_indices=training)
+                             train_channel_indices=training, selected_training_indices=selected,
+                             rowplan_sha256=np.asarray(rowplan['sha256'] if rowplan is not None else ''))
                 record.update(status='FIT_COMPLETE', diagnostics={k:v for k,v in fitted.items() if k != 'row_map'},
                               line_errors=errors, export_path=str(stem.with_suffix('.npz')),
                               export_sha256=sha(stem.with_suffix('.npz')))
@@ -321,9 +383,11 @@ if __name__ == '__main__':
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--synthetic-check', action='store_true')
     parser.add_argument('--warm-start', type=Path, help='Matching q/p exports; grid/weights/solver equality required')
+    parser.add_argument('--training-indices', type=Path,
+                        help='Fixed JSON list of at most 40 original training rows; held rows forbidden')
     parser.add_argument('--summary-only', action='store_true', help='Emit all-q original-Gram ORDER rank tables only')
     args = parser.parse_args()
     if args.summary_only:
-        rank_summary(args.gram, args.out)
+        rank_summary(args.gram, args.out, args.training_indices)
     else:
-        main(args.gram, args.out, args.synthetic_check, args.warm_start)
+        main(args.gram, args.out, args.synthetic_check, args.warm_start, args.training_indices)
