@@ -352,7 +352,7 @@ class BandWindow:
                 raise ValueError(
                     f"downfold: band_range_{tag}=({b0}, {b1}) runs past the "
                     f"restart's band extent nb={n_bands}.  The window is an "
-                    f"ABSOLUTE band index range into psi_full_y / enk_full, "
+                    f"ABSOLUTE band index range into the stored wavefunctions / energies, "
                     f"not an offset — a window outside the file's extent "
                     f"makes ψ-at-centroids identically zero and every "
                     f"relative threshold downstream meaningless.")

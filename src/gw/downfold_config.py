@@ -89,7 +89,7 @@ DOWNFOLD_DEFAULTS = {
     #                              valence/conduction spelling, identical to
     #                              ``centroid.pivoted_cholesky``'s.
     #   band_range_left/right   -> "lo:hi", half-open, ABSOLUTE band indices
-    #                              into psi_full_y / enk_full.
+    #                              into the stored wavefunctions / energies.
     #
     # Stage 1 serves the BSE, so the window is expected to be SYMMETRIC
     # (left == right): the BSE's direct and exchange kernels both contract ψ
@@ -207,7 +207,7 @@ def _parse_range(raw: str, key: str) -> tuple[int, int]:
         raise ValueError(
             f"downfold: {key}={raw!r} is not a band range.  Spell it "
             f"'lo:hi' — half-open, ABSOLUTE band indices into the restart's "
-            f"psi_full_y / enk_full, counting from 0.  Example: a 20-band "
+            f"the stored wavefunctions / energies, counting from 0.  Example: a 20-band "
             f"window over the lowest 20 bands is '0:20'.")
     lo, hi = int(m.group(1)), int(m.group(2))
     if lo >= hi:

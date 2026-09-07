@@ -69,20 +69,54 @@
 | Upstream centroids/WFN/PSP | N/A | Producers or source inputs, not gwjax bundle consumers; existing canonical source services |
 | Dynamic pole stores | `file_io.restart_bundle` | W-slab/header/column, pole/head, resume and fit readers moved out of mpa_store; writer and format helpers remain there. Quadrature rules retain their existing non-HDF5 service |
 
-| Deletion ledger module | Lines removed in batch | Private or duplicate reader deleted |
-|---|---:|---|
-| `src/bse/bse_loading.py` | 1243 | Serial transport, old full-k/full-q branches, parent action moved to shared reader; retained only array assembly |
-| `src/bse/vq_interp.py` | 218 | Private restart handle and zeta tile adapter moved |
-| `src/gw/downfold_run.py` | 158 | Geometry, q-table probe and private wavefunction restoration |
-| `src/file_io/tagged_arrays.py` | 992 | All reader functions and full-k writer branches |
-| `src/file_io/qp_wfn.py` | 148 | All QP payload/stamp readers |
-| `src/file_io/kin_ion.py` | 309 | Star-table, matrix and provenance readers |
-| `src/file_io/sigma_output.py` | 320 | EQP receipt and evaluation/reference readers |
-| `src/gw/v_q_bispinor.py` | 213 | BispinorVqReader moved intact |
-| `src/bse/absorption_common.py` | 25 | Dipole reader |
-| `src/gw/eqp_bgw.py` | 41 | Private QP/evaluation energy reader |
-| `src/postprocess/rotate_wfn_to_qp.py` | 73 | Private k-irr map reader |
-| `src/file_io/mpa_store.py` | 1294 | Public W, fit, head and pole readers/classes moved to shared module; writer calls the same reader |
+| Deletion ledger module (cumulative versus891047f4; source/service code) | Lines removed | Lines added | Reader deletion / disposition |
+|---|---:|---:|---|
+| `services/zeta_loader/src/zeta_loader/loader.py` | 2 | 2 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/bandstructure/htransform.py` | 101 | 3 | EQP parser moved; canonical rotation and energy readers used |
+| `src/bse/absorption_common.py` | 25 | 0 | Dipole payload reader moved; BSE-output reader is outside bundle scope |
+| `src/bse/absorption_eigvecs.py` | 13 | 2 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/bse/absorption_haydock.py` | 13 | 6 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/bse/bse_feast.py` | 2 | 2 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/bse/bse_io.py` | 22 | 2 | Three-tuple EQP façade deleted |
+| `src/bse/bse_jax.py` | 1 | 2 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/bse/bse_kpm.py` | 2 | 2 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/bse/bse_loading.py` | 1245 | 56 | Parent unfold, serial transport and legacy full-file branches removed; array assembly retained |
+| `src/bse/bse_pseudopoles.py` | 1 | 2 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/bse/bse_ring_comm.py` | 1 | 2 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/bse/bse_w_exact.py` | 12 | 5 | Private scalar/two-spinor action deleted; canonical symmetry service used |
+| `src/bse/bse_window.py` | 106 | 3 | EQP correction reader moved |
+| `src/bse/davidson_absorption.py` | 8 | 4 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/bse/exciton_bands.py` | 21 | 15 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/bse/vq_interp.py` | 447 | 17 | Private restart handle, VQ payload reader and ζ tile adapter moved |
+| `src/bse/w_ladder.py` | 2 | 2 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/file_io/__init__.py` | 8 | 12 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/file_io/isdf_header.py` | 50 | 6 | ISDF decoder and reader moved; dataclass, binder and writer retained |
+| `src/file_io/kin_ion.py` | 309 | 0 | Star-table, matrix and provenance readers moved |
+| `src/file_io/mpa_store.py` | 1216 | 11 | Dynamic W, head, fit and pole readers/handle classes moved; writers retained |
+| `src/file_io/qp_wfn.py` | 148 | 7 | Rotation, stamp and provenance readers moved |
+| `src/file_io/restart_bundle.py` | 0 | 4500 | One actual implementation module; moved functions, shared admission and semantic accessors |
+| `src/file_io/sigma_output.py` | 320 | 10 | EQP assembly/evaluation/reference readers moved |
+| `src/file_io/tagged_arrays.py` | 992 | 37 | All readers moved; full-k writer compatibility deleted |
+| `src/gw/downfold.py` | 1 | 1 | Stale full-k dataset name removed from band-window explanation |
+| `src/gw/downfold_config.py` | 2 | 2 | Stale full-k dataset name removed from band-window explanation |
+| `src/gw/downfold_run.py` | 165 | 15 | Geometry, q-storage probe and payload readers moved |
+| `src/gw/eqp_bgw.py` | 116 | 8 | EQP text parser moved; private QP/evaluation reads replaced |
+| `src/gw/gw_init.py` | 48 | 16 | Private bundle probes replaced; reader layout consumed; obsolete W_BSE refusal removed |
+| `src/gw/head_correction.py` | 15 | 14 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/gw/mpa/fit_driver.py` | 8 | 10 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/gw/mpa/model.py` | 5 | 7 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/gw/mpa/sigma.py` | 1 | 5 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/gw/qsgw_head.py` | 10 | 8 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/gw/sc_iteration.py` | 1 | 5 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/gw/screening_bse.py` | 65 | 7 | Private handoff probe replaced; central canonical-to-packed accessor used |
+| `src/gw/sigma_dispatch.py` | 1 | 3 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/gw/sigma_x_bispinor.py` | 1 | 1 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/gw/v_q_bispinor.py` | 213 | 0 | BispinorVqReader moved intact |
+| `src/gw/v_q_g_flat.py` | 1 | 1 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/gw/w_isdf.py` | 2 | 4 | Call sites/imports use the sole reader; no independent reader retained |
+| `src/postprocess/rotate_wfn_to_qp.py` | 73 | 5 | Private k-irr mapping reader deleted |
+| `src/psp/get_dipole_mtxels.py` | 176 | 2 | Provenance reader moved; producer retained |
+| Total, 45 source/service modules; excludes tests | 5971 | 4824 | Net -1147 lines; counts include moved implementations and call-site edits, not a claim that every deleted line was a private read |
 
 | Shared reader public surface | Returns |
 |---|---|
@@ -101,6 +135,11 @@
 | `read_w_header`, `read_w_slab[_collective]`, `read_w_tables`, `read_w_columns[_collective]`, `open_w_column_reader`, `WColumnReader` | Dynamic sampled-W headers, q slabs and bounded frequency-column tiles |
 | `read_head_fit[_collective]`, `read_fit_block`, `read_fit_tensors`, `read_fit_io_receipt`, `read_fit_unfold_tables`, `read_poles`, `open_pole_reader`, `PoleReader` | Dynamic head and pole payloads with the existing bounded collective handle lifetime |
 | `validate_fit_store[_for_resume]`, `read_occupation_stamps` | Resume admission, completed-fit ledger and occupation identity |
+| `read_bgw_eqp`, `read_eqp_energies`, `apply_eqp_corrections` | One text parser; authenticated wedge energies and BSE correction application, with service-owned k unfolding |
+| `read_kin_ion_full_bz` | Canonical full-k kinetic/ionic matrix for the consuming symmetry map |
+| `read_isdf_header`, `read_isdf_header_from_file` | The shared ISDF header decoder used by ζ service and bundle consumers |
+| `read_vq_payload`, `check_dipole_provenance` | VQ wavefunction/ζ metadata payload and source-identity validation |
+| `pack_canonical_interaction` | Canonical trailing μν axes converted to the consuming packed basis using existing axis kernels |
 | Policy and band-window validators | Existing provenance/refusal contracts, now beside payload reads |
 
 | Batch state | Evidence / limitation |
@@ -169,3 +208,12 @@
 | Scalar cross-layout bound | RED remains0.051/0.122 μeV and0.128/0.174 μeV, tolerance0 | Same comparison files; same-file reader parity is exact |
 | Final default CPU core |66 passed,7 skipped,4 registered native-provider failures | `00_audit/core_cpu_closeout.lx.log`; no native library rebuilt |
 | W_BSE batch |d8edf9f7 pushed; claim1443 | Execution and remaining scientific failures distinguished above |
+
+
+| Closeout | Result |
+|---|---|
+| Consolidation |45 source/service modules;5971 lines removed,4824 added, net1147 removed. Reader implementations moved into `file_io.restart_bundle`; writer and canonical transport/symmetry services retain their existing ownership |
+| Obsolete full-k reader contracts |No `require_full_k_psi`, `psi_full_y` compatibility arm or `_unfold_bse_parent_faces` remains in src/services; old static bundles are refused centrally: regenerate with gwjax at main ≥ 891047f4 |
+| GW layout batch |a63037cf pushed; claim1444; branch fix/restart-consumers-2026-09-07, unmerged |
+| Completion criterion |Every requested execution/reference obligation is green, N/A for non-consumers, or explicitly RED with an invocation and measured boundary in `KNOWN_LORRAX_ISSUES.md`. This is not an all-green compatibility certification |
+| Compute |One allocation58016040; P4 production legs, CPU tests with G0/four emulated devices; no native rebuild. Allocation released after closeout |
