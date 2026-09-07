@@ -90,7 +90,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     # (flat-k FFT service contract, docs/dev/flat_k_fft_service.md).
     from ffi import ffi_dial_key
     complex_contour = bool(complex_contour)
-    if layout != "face":
+    if layout not in ("face", "axis"):
         raise ValueError(
             f"_get_chi_minimax_kernel: layout must be 'face', "
             f"got {layout!r}")
@@ -118,7 +118,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
         right_face_shape=right_face_shape,
         vertex_pairs=vertex_pairs,
-        k_unfold_plan=k_unfold_plan)
+        k_unfold_plan=k_unfold_plan, layout=layout)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
@@ -155,7 +155,7 @@ def _contract_chi_vertices(Gv_R, Gc_R, operands, identities, complex_contour):
 def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                                  face_shape, *, right_face_shape=None,
                                  vertex_pairs=None,
-                                 k_unfold_plan=None):
+                                 k_unfold_plan=None, layout="face"):
     """Build masked valence/conduction Green functions and integrate both response orientations."""
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
@@ -164,10 +164,10 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
         G_FLATK_SPEC as _G_out_flatk,
         CHI_Q_SPEC as _chi_spec,
         CHI_R_SPEC as _chi_R_spec,
-        PSI_MUN_SPEC as _psi_mun_spec,
-        PSI_NMU_SPEC as _psi_nmu_spec,
     )
     from .greens_function_kernel import build_G_tau
+    from common.wfn_layout import psi_specs
+    _psi_nmu_spec, _psi_mun_spec = psi_specs(layout)
 
     nk_shape, nb_full, n_rmu_left, ns = (int(v) for v in face_shape)
     if right_face_shape is None:
@@ -209,7 +209,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     g_plan = gemm_plan(
         mesh_xy, m=n_rmu_left * ns, k=nb_full,
         n=n_rmu_right * ns, nq=nk if paired else expected_input_nk,
-        dtype=jnp.complex128)
+        dtype=jnp.complex128, layout=layout)
     if paired:
         from common.shard_map import shard_map
         def unfold_pair(psi_left, psi_right):
@@ -243,13 +243,13 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
         Gv_k = jax.lax.with_sharding_constraint(
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        -tau_scalar, e_ref=vmax,
-                       mask=mask_v, layout="face", gemm=g_plan,
+                       mask=mask_v, layout=layout, gemm=g_plan,
                        k_unfold_plan=None if paired else k_unfold_plan),
             _G_k_shard)
         Gc_k = jax.lax.with_sharding_constraint(
             build_G_tau(psi_mun_left, psi_nmu_right, enk_full,
                        t_c, e_ref=cmin,
-                       mask=mask_c, layout="face", gemm=g_plan,
+                       mask=mask_c, layout=layout, gemm=g_plan,
                        k_unfold_plan=None if paired else k_unfold_plan),
             _G_k_shard)
         return jnp.conj(Gv_k), jnp.conj(Gc_k)
@@ -388,7 +388,7 @@ def _get_chi_fractional_contour_kernel(
     n_out = int(n_out)
     if n_out < 1:
         raise ValueError("fractional contour chi0 requires at least one output")
-    if layout != "face":
+    if layout not in ("face", "axis"):
         raise ValueError(
             f"_get_chi_fractional_contour_kernel: layout must be 'face' "
             f"got {layout!r}")
@@ -402,14 +402,14 @@ def _get_chi_fractional_contour_kernel(
             "_get_chi_fractional_contour_kernel(layout='face') requires "
             "face_shape=(nk, nb_full, n_rmu, nspinor)")
     kernel = _get_chi_fractional_contour_kernel_face(
-        mesh_xy, grid, n_out, face_shape, k_unfold_plan=k_unfold_plan)
+        mesh_xy, grid, n_out, face_shape, k_unfold_plan=k_unfold_plan, layout=layout)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
 
 def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
-    *, k_unfold_plan=None,
+    *, k_unfold_plan=None, layout="face",
 ):
     """Integrate the retarded response using final occupied and unoccupied band weights."""
     from common.fft_helpers import make_flat_k_fftn
@@ -424,6 +424,8 @@ def _get_chi_fractional_contour_kernel_face(
         PSI_NMU_SPEC,
     )
 
+    from common.wfn_layout import psi_specs
+    PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(layout)
     grid = tuple(int(n) for n in kgrid)
     nk = int(np.prod(grid))
     n_out = int(n_out)
@@ -461,7 +463,7 @@ def _get_chi_fractional_contour_kernel_face(
     # and Gu build this kernel ever does — mirrors
     # _get_chi_minimax_kernel_face's own g_plan.
     g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
-                       nq=nk, dtype=jnp.complex128)
+                       nq=nk, dtype=jnp.complex128, layout=layout)
     def _finish(value):
         return chi_fftn(value)
 
@@ -503,7 +505,7 @@ def _get_chi_fractional_contour_kernel_face(
                     -tau,
                     e_ref=energy_reference,
                     band_weight=occ_f,
-                    layout="face",
+                    layout=layout,
                     gemm=g_plan,
                     k_unfold_plan=k_unfold_plan,
                 )),
@@ -517,7 +519,7 @@ def _get_chi_fractional_contour_kernel_face(
                     -tau,
                     e_ref=energy_reference,
                     band_weight=occ_u,
-                    layout="face",
+                    layout=layout,
                     gemm=g_plan,
                     k_unfold_plan=k_unfold_plan,
                 )),
@@ -1285,7 +1287,7 @@ def _require_current_chi_endpoints(wfns_left, wfns_right):
         raise ValueError(
             "compute_no_pair_dirac_current_block endpoint layouts differ: "
             f"{wfns_left.layout!r} vs {wfns_right.layout!r}")
-    if wfns_left.layout != "face":
+    if wfns_left.layout not in ("face", "axis"):
         raise ValueError(
             "compute_no_pair_dirac_current_block requires "
             "the canonical face layout")
@@ -1336,7 +1338,7 @@ def compute_no_pair_dirac_current_blocks(
     left_shape = green_face_kernel_kwargs(wfns_left)["face_shape"]
     right_shape = green_face_kernel_kwargs(wfns_right)["face_shape"]
     kernel = _get_chi_minimax_kernel(
-        mesh_xy, kgrid, layout="face", face_shape=left_shape,
+        mesh_xy, kgrid, layout=left.layout, face_shape=left_shape,
         right_face_shape=right_shape, vertex_pairs=vertex_pairs,
         k_unfold_plan=(left.plan, right.plan))
     mask_v = left.plan.parent_rows(wfns_left.band_mask(s.val))

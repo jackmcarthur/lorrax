@@ -64,7 +64,7 @@ page has to read it from.
 | `gamma_contract_mode` | `"take"` | HLO variant of the gamma-tilde double contraction: take (default) | einsum | scan; math-identical. |
 | `memory_per_device_gb` | `0.0` | Per-device memory budget for the chunk planners; 0 = auto-detect. |
 | `r_chunk_size` | `0` | Real-space columns per zeta-fit chunk; 0 = auto from the memory model. |
-| `low_mem_bands` | `true` | Temporary compatibility key: `true` is the raw-parent route; `false` prints a WARNING and proceeds on parents. Full-k wavefunction carrier selection is retired. Refusal of the key itself remains an owner ruling. |
+| `low_mem_bands` | `true` | Raw-parent ψ sharding: `true` uses two mesh-face copies with distributed band contractions; `false` uses two single-axis centroid copies with complete bands and local band contractions. Both use the same Green, screening and projection algorithms. Axis projection retains centroid-shard reductions; axis ψ uses more memory. |
 | `zeta_cutoff` | None | Zeta-sphere G-cutoff (Ry) for per-q zeta_q_G writes; None = ecutwfc; must be >= bare_coulomb_cutoff. |
 
 **Raw-parent GW.** Exact typed centroid transport is mandatory; a nonclosed required centroid action refuses rather than selecting full-k storage. Unported non-RPA screening refuses by name. GW restart requires raw-parent datasets; regenerate older full-k files with `restart = false`. An explicit dense `Gij` remains refused; pass diagonal occupations through `occupation_state`.

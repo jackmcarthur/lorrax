@@ -421,9 +421,8 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
         # (gw.wavefunction_bundle.ParentGreenCarrier).  Under parents-only
         # storage it is the run's ONLY psi; otherwise it sits beside the
         # full-k faces.
-        carrier = 2.0 * _c128(
-            int(parent_route["n_parent"]), ns,
-            mu, nb) / P_
+        carrier = _c128(int(parent_route["n_parent"]), ns, mu, nb) * (
+            2.0 / P_ if low_mem_bands else 1.0 / p_x + 1.0 / p_y)
         psi_copies = carrier if parent_route.get("parents_only") \
             else psi_copies + carrier
     return {
@@ -831,10 +830,6 @@ def plan_gflat_chunks(
     target = budget * target_utilization
 
     inventory_nb = face_nb if low_mem_bands else nb
-    if parent_route is not None and not low_mem_bands:
-        raise ValueError(
-            "plan_gflat_chunks: parent_route requires low_mem_bands (the "
-            "parent faces are face-layout carriers).")
     sys = dict(nk=nk, ns=ns, nq=nq, nq_disk=nq_disk, mu=mu,
                nb=inventory_nb,
                ngkmax=ngkmax, n_rtot=n_rtot, low_mem_bands=bool(low_mem_bands),

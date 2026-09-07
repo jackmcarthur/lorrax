@@ -1613,12 +1613,6 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
             raise ValueError(
                 f"Restart file {filename} is missing canonical psi_full_y "
                 "dataset. Regenerate restart tensors with current gw_jax.")
-        if has_parent_psi and not has_full_psi and not low_mem_bands:
-            raise ValueError(
-                f"Restart file {filename} stores the raw-parent ψ faces only "
-                "(psi_parent_y, written by a parents-only low_mem_bands run) "
-                "and no full-k psi_full_y; the legacy layout has no parent "
-                "reader.  Read it with low_mem_bands = true.")
         if has_parent_psi and not (
                 "psi_parent_y_mun" in f and "psi_parent_k_rows" in f):
             raise ValueError(
@@ -1702,8 +1696,8 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
 
     # ---- pass 2: the N_mu²-class and ψ tensors, one tile per rank -------
     psi_spec = P(None, None, None, "y")          # legacy: (nk, n, s, μ_Y)
-    psi_nmu_spec = P(None, "x", None, "y")        # face:   (nk, n_X, s, μ_Y)
-    psi_mun_spec = P(None, None, "x", "y")        # face:   (nk, s, μ_X, n_Y)
+    from common.wfn_layout import psi_specs
+    psi_nmu_spec, psi_mun_spec = psi_specs("face" if low_mem_bands else "axis")
 
     def _read_munu(io, name):
         if name not in shapes:
@@ -1787,7 +1781,7 @@ def read_restart_state_from_h5(filename, mesh_xy, *, low_mem_bands=False,
         psi_nmu_parent = None
         psi_mun_parent = None
         psi_nmu_parent_T = psi_mun_parent_T = None
-        if low_mem_bands:
+        if low_mem_bands or has_parent_psi:
             psi_full_y = None
             # ``_read_psi`` returns None for an absent dataset: a
             # parents-only file has no full-k pair.
@@ -2022,7 +2016,7 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
         filename, mesh_xy, low_mem_bands=bool(low_mem_bands),
         band_receipt=band_axis)
 
-    if low_mem_bands:
+    if low_mem_bands or psi_nmu_parent is not None:
         # No derivation, no reshard: both faces already arrived at their
         # own spec.  Legacy psi_rmu_Y/psi_rmuT_X are not built at all.
         # The transverse (bispinor) pair follows the identical pattern at

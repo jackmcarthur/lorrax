@@ -838,12 +838,13 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 			band_range=band_slices.full_range, band_chunk_size=int(band_chunk_size),
 			k_chunk_size=k_chunk_size, bispinor_lift=representation.current_lift,
 			k_domain=sym.parent_k_domain)
-	nmu, mun = parent_faces(psi_y, psi_x, mesh_xy=mesh_xy)
+	nmu, mun = parent_faces(psi_y, psi_x, mesh_xy=mesh_xy,
+	                         layout="face" if cfg.memory.low_mem_bands else "axis")
 	psi_y = psi_x = None
 	enk, _ = get_enk_bandrange(wfn, sym, band_slices.full_range,
 	                         (band_slices.b1, band_slices.b3), nspinor=4)
 	wfns = wavefunctions_face_from_restart(
-		None, None, enk_full=enk, slices=band_slices, mesh_xy=mesh_xy)
+				None, None, layout="face" if cfg.memory.low_mem_bands else "axis", enk_full=enk, slices=band_slices, mesh_xy=mesh_xy)
 	carrier = build_packed_parent_green_carrier(
 		wfns, nmu, mun, plan=plan, mesh_xy=mesh_xy)
 	return dict(meta=meta_T, centroid_indices=cent_T_idx, green_parent=carrier)
@@ -3169,7 +3170,8 @@ def prepare_isdf_and_wavefunctions(
 					bispinor_lift=(representation.charge_lift or "raw"),
 					k_domain=sym.parent_k_domain)
 			from .wavefunction_bundle import parent_faces
-			_parent_green_faces = parent_faces(parent_y, parent_x, mesh_xy=mesh_xy)
+			_parent_green_faces = parent_faces(parent_y, parent_x, mesh_xy=mesh_xy,
+			    layout="face" if cfg.memory.low_mem_bands else "axis")
 			del parent_y, parent_x
 			print0("  ψ storage: parents only -- "
 			       f"{_candidate_plan.n_parent} raw WFN parents, "
@@ -3241,7 +3243,7 @@ def prepare_isdf_and_wavefunctions(
 				(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
 			with timing.section("gw_jax.wavefunction_setup"):
 				wfns = wavefunctions_face_from_restart(
-					None, None, enk_full=_enk_full_face,
+				None, None, layout="face" if cfg.memory.low_mem_bands else "axis", enk_full=_enk_full_face,
 					slices=band_slices, mesh_xy=mesh_xy,
 					basis_receipt=charge_basis_receipt)
 			from .wavefunction_bundle import (
@@ -3269,7 +3271,7 @@ def prepare_isdf_and_wavefunctions(
 				parent_T = transverse_wfn_data['green_parent']
 				with timing.section("gw_jax.wavefunction_setup"):
 					wfns_transverse = wavefunctions_face_from_restart(
-						None, None,
+				None, None, layout="face" if cfg.memory.low_mem_bands else "axis",
 						enk_full=_enk_full_face,
 						slices=band_slices, mesh_xy=mesh_xy,
 						basis_receipt=transverse_basis_receipt)
@@ -3471,7 +3473,7 @@ def prepare_isdf_and_wavefunctions(
 			rs = load_restart_state_from_h5(
 				tensors_filename, mesh_xy, band_slices=band_slices,
 				n_rmu_logical=int(meta.n_rmu),
-				low_mem_bands=True)
+				low_mem_bands=cfg.memory.low_mem_bands)
 			charge_zeta_identity_receipt = rs.charge_zeta_identity
 			# Files keep the canonical centroid order: convert at the seam.
 			V_qmunu = _to_run_order(rs.V_qmunu, (-2, -1))
@@ -3565,8 +3567,7 @@ def prepare_isdf_and_wavefunctions(
 					n_rmu_padded=int(meta.n_rmu_padded)))
 			from .wavefunction_bundle import wavefunctions_face_from_restart
 			wfns = wavefunctions_face_from_restart(
-				None,
-				None, enk_full=rs.enk_full,
+				None, None, layout="face" if cfg.memory.low_mem_bands else "axis", enk_full=rs.enk_full,
 				slices=band_slices, mesh_xy=mesh_xy,
 				basis_receipt=charge_basis_receipt)
 			from .wavefunction_bundle import build_packed_parent_green_carrier
@@ -3702,8 +3703,7 @@ def prepare_isdf_and_wavefunctions(
 				from .wavefunction_bundle import (
 					wavefunctions_face_from_restart)
 				wfns_transverse = wavefunctions_face_from_restart(
-					None,
-					None,
+				None, None, layout="face" if cfg.memory.low_mem_bands else "axis",
 					enk_full=rs.enk_full, slices=band_slices,
 					mesh_xy=mesh_xy, basis_receipt=transverse_basis_receipt)
 				plan_T, _, _ = _prepare_parent_wavefunction_plan(

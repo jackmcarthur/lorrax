@@ -737,3 +737,15 @@ The full landing gate exposed a downstream reader left behind by the GW carrier 
 ### 2026-09-06 — adopted S phase-2 class residency
 
 The ordered phase-2 integration adopts one compiled Sigma scan and one restore producer per endpoint-family class. The producer returns 1 CC, 3 CT/TC or 9 TT full-q blocks, with centroid axes distributed over all P ranks. This is a correction to the original one-full-q-block residency contract: a TT stack uses `9 * nk_tot * M_T_packed**2 * sizeof(complex128) / P` bytes per rank. It is transient per class, not an interaction cache; each executable shares one Green. Classes are submitted without intervening host fences, so a globally single-class memory lifetime does not follow from this source structure. The campaign report records the measured whole-process allocator peak and the lane gate supporting this explicitly requested integration.
+
+
+### 2026-09-06 — both low_mem_bands values select parent ψ shardings
+
+The owner supersedes the temporary false-to-true coercion: `true` selects
+`face`, and `false` selects `axis`, for every spinor extent and both centroid
+families. The same ParentGreenCarrier holds two packed raw-parent copies;
+its static layout chooses their band sharding and the distrib_la matmul plan.
+The Green builder and two-GEMM band projector are shared. Axis band contractions
+have no collectives; projection of the tiled centroid operator retains the X/Y
+centroid reduce-scatter operations and existing final psums. Canonical files
+remain independent of processor grid and can be read into either layout.

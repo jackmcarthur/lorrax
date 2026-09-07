@@ -261,7 +261,7 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                          nk_tot: int, *, layout: str = "face",
                          face_shape=None, k_unfold_plan=None):
     """Build static SX/COH kernels on canonical faces with optional typed parent transport."""
-    if layout != "face":
+    if layout not in ("face", "axis"):
         raise ValueError(
             f"_make_cohsex_kernels: layout must be 'face', "
             f"got {layout!r}")
@@ -281,14 +281,14 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
 
     _convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot)
     kernels = _make_cohsex_kernels_face(
-        mesh_xy, face_shape, _convolve, k_unfold_plan=k_unfold_plan)
+        mesh_xy, face_shape, _convolve, k_unfold_plan=k_unfold_plan, layout=layout)
 
     _cohsex_kernel_cache[cache_key] = kernels
     return kernels
 
 
 def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
-                              k_unfold_plan=None):
+                              k_unfold_plan=None, layout="face"):
     """Contract static SX/COH and project before selecting the requested output band window."""
     from distrib_la import gemm_plan
     from common.contract_bands import contract_bands_block_reshard
@@ -300,9 +300,9 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
     mu_s = n_rmu_g * ns_g
 
     g_plan = gemm_plan(mesh_xy, m=mu_s, k=nb_g, n=mu_s, nq=nk_g,
-                       dtype=jnp.complex128)
+                       dtype=jnp.complex128, layout=layout)
     proj_fn = contract_bands_block_reshard(
-        mesh_xy, layout="face", face_shape=tuple(g_shape))
+        mesh_xy, layout=layout, face_shape=tuple(g_shape))
     if k_unfold_plan is not None:
         from ffi import _services
         _services.ensure_on_path()
@@ -326,12 +326,13 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
     def _project_bands(wfns, sigma_k):
         if k_unfold_plan is None:
             return _project(wfns.psi_nmu, wfns.psi_mun, sigma_k,
-                            layout="face", face_project_fn=proj_fn)
-        c = wfns.green_parent
+                            layout=layout, face_project_fn=proj_fn)
+        from .wavefunction_bundle import parent_sigma_operands
+        _, _, proj_nmu, proj_mun, _, _ = parent_sigma_operands(wfns)
         parent_rows = _project(
-            c.psi_nmu, c.psi_mun,
+            proj_nmu, proj_mun,
             jnp.take(sigma_k, jnp.asarray(_k_rows), axis=0),
-            layout="face", face_project_fn=proj_fn)
+            layout=layout, face_project_fn=proj_fn)
         # Static Σ is Hermitian, so conj and transpose coincide; use the
         # operator rule the dynamic route uses (unfold_file_wedge_band_
         # operator) so the two routes share one spelling.
@@ -347,7 +348,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         if k_unfold_plan is not None:
             phases = k_unfold_plan.parent_rows(phases)
         G_occ = build_G(g_mun, g_nmu, phases=phases,
-                        layout="face", gemm=g_plan,
+                        layout=layout, gemm=g_plan,
                         k_unfold_plan=k_unfold_plan)
         return _project_bands(wfns, _convolve(G_occ, W_q, 1.0))
 
@@ -359,7 +360,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         g_mun, g_nmu, owner = _g_operands(wfns)
         mask = owner.band_mask(bands).astype(jnp.complex128)
         G_ri = build_G(g_mun, g_nmu, phases=mask,
-                       layout="face", gemm=g_plan,
+                       layout=layout, gemm=g_plan,
                        k_unfold_plan=k_unfold_plan)
         return _project_bands(wfns, _convolve(G_ri, W_q - V_q, -0.5))
 

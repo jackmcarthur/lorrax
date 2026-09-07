@@ -3447,12 +3447,6 @@ def packed_static_envelope(config, *, screened: bool):
            "the packed response facade has only the distributed plan", None)
     if not screened:
         return
-    yield (bool(config.memory.low_mem_bands), "low_mem_bands = false",
-           "low_mem_bands = true", _ENV_IMPL,
-           "the sixteen-block no-pair chi0 kernel is written against the "
-           "face layout only.  DERIVED: an unnamed low_mem_bands is set to "
-           "true for this mode at parse time, so this row can only fire on "
-           "an explicit conflicting value", "low_mem_bands")
     _overrides = scalar_head_overrides_named(config)
     yield (not _overrides, ", ".join(_overrides),
            "no scalar q->0 head override named", _ENV_IMPL,
@@ -5329,10 +5323,6 @@ class LorraxConfig:
             accelerator=str(_g("eqp2_accelerator")).strip().lower(),
             history_depth=int(_g("eqp2_history_depth")),
         )
-        if not bool(_g("low_mem_bands")):
-            print_fn(
-                "[config provenance] WARNING: low_mem_bands = false: the full-k carrier no longer "
-                "exists; proceeding on raw parents.")
         memory = MemoryConfig(
             per_device_gb=memory_per_device_gb,
             chunk_target_utilization=chunk_utilization,
@@ -5340,7 +5330,7 @@ class LorraxConfig:
             r_chunk_override=int(_g("r_chunk_size")),
             gflat_chunk_size=int(_g("gflat_chunk_size")),
             vq_g_chunk_size=int(_g("vq_g_chunk_size")),
-            low_mem_bands=True,
+            low_mem_bands=bool(_g("low_mem_bands")),
             low_mem_bands_provenance=(
                 "deck" if "low_mem_bands" in _named_keys else "default"),
         )

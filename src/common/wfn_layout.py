@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from jax.sharding import PartitionSpec as P
 
-__all__ = ["PSI_MUN_SPEC", "PSI_NMU_SPEC", "band_sphere_spec"]
+__all__ = ["PSI_MUN_SPEC", "PSI_NMU_SPEC", "psi_specs", "band_sphere_spec"]
 
 
 # The two persistent face orientations used by low-memory GW.  Keep these at
@@ -11,6 +11,15 @@ __all__ = ["PSI_MUN_SPEC", "PSI_NMU_SPEC", "band_sphere_spec"]
 # the same layouts without importing the GW bundle that stores them.
 PSI_NMU_SPEC = P(None, "x", None, "y")  # (nk, n_X, s, mu_Y)
 PSI_MUN_SPEC = P(None, None, "x", "y")  # (nk, s, mu_X, n_Y)
+
+
+def psi_specs(layout: str) -> tuple[P, P]:
+    """Return nmu/mun placements with distributed or replicated band axes."""
+    if layout == "face":
+        return PSI_NMU_SPEC, PSI_MUN_SPEC
+    if layout == "axis":
+        return P(None, None, None, "y"), P(None, None, "x", None)
+    raise ValueError(f"Unknown wavefunction layout {layout!r}")
 
 
 def band_sphere_spec() -> P:

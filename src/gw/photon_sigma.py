@@ -119,18 +119,19 @@ def _make_photon_static_class_kernel(
     from .cohsex_sigma import _make_static_convolution
     from .greens_function_kernel import build_G
     left, right = wfns_left.green_parent, wfns_right.green_parent
+    layout = left.layout
     plans = (left.plan, right.plan)
     shapes = tuple((p.n_parent, c.psi_nmu.shape[1], p.n_centroid_packed, p.nspinor)
                    for c, p in zip((left, right), plans))
-    key = (id(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, ffi_dial_key(), with_head)
+    key = (id(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, layout, ffi_dial_key(), with_head)
     if key in _photon_sigma_kernel_cache:
         return _photon_sigma_kernel_cache[key]
-    plan_key = ("plans", id(mesh_xy), tuple(kgrid), nk_tot, shapes, ffi_dial_key())
+    plan_key = ("plans", id(mesh_xy), tuple(kgrid), nk_tot, shapes, layout, ffi_dial_key())
     if plan_key not in _photon_sigma_kernel_cache:
-        project = contract_bands_block_reshard(mesh_xy, layout="face",
+        project = contract_bands_block_reshard(mesh_xy, layout=layout,
             face_shape=shapes[0], right_face_shape=shapes[1])
         g_plan = gemm_plan(mesh_xy, m=shapes[0][2]*shapes[0][3], k=shapes[0][1],
-            n=shapes[1][2]*shapes[1][3], nq=shapes[0][0], dtype=jnp.complex128)
+            n=shapes[1][2]*shapes[1][3], nq=shapes[0][0], dtype=jnp.complex128, layout=layout)
         _photon_sigma_kernel_cache[plan_key] = project, g_plan
     project, g_plan = _photon_sigma_kernel_cache[plan_key]
     convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot, q0_only=False, lorentz=True)
@@ -141,13 +142,13 @@ def _make_photon_static_class_kernel(
     def contract_class(left, right, weights, interaction, factor, vertices, head_interaction=None):
         weights = plans[0].parent_rows(weights)
         G = build_G(left.psi_mun, right.psi_nmu, phases=jnp.real(weights),
-                    layout="face", gemm=g_plan, k_unfold_plan=plans[0],
+                    layout=layout, gemm=g_plan, k_unfold_plan=plans[0],
                     right_k_unfold_plan=plans[1])
         sigma = convolve(G, interaction, factor, vertices)
-        result = project(left.psi_nmu, jnp.take(sigma, jnp.asarray(rows), axis=0), right.psi_mun)
+        result = project(left.projection_faces()[0], jnp.take(sigma, jnp.asarray(rows), axis=0), right.projection_faces()[1])
         if with_head:
             head_sigma = head_convolve(G, head_interaction, factor, vertices)
-            head = project(left.psi_nmu, jnp.take(head_sigma, jnp.asarray(rows), axis=0), right.psi_mun)
+            head = project(left.projection_faces()[0], jnp.take(head_sigma, jnp.asarray(rows), axis=0), right.projection_faces()[1])
             return result, head
         return result
     _photon_sigma_kernel_cache[key] = contract_class
