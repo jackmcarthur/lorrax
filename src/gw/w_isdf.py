@@ -448,7 +448,7 @@ def _get_chi_fractional_contour_kernel_face(
     # and Gu build this kernel ever does — mirrors
     # _get_chi_minimax_kernel_face's own g_plan.
     g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
-                       nq=nk, dtype=jnp.complex128, layout=layout)
+                       nq=nk_shape, dtype=jnp.complex128, layout=layout)
     def _finish(value):
         return chi_fftn(value)
 
