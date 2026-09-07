@@ -666,7 +666,7 @@ class GFlatChunkPlan:
             f"    Stage C/D ψ floor (post-CCT, {self.psi_layout} r-chunk "
             f"incremental) = {self.stage_cd_psi_bytes / 1e9:.3f} GB/dev "
             + ("[included in face Stage-C peaks]"
-               if self.psi_layout == "face" else
+               if self.psi_layout in ("face", "axis") else
                "[legacy compatibility disclosure]"),
             "    ψ(r) source   = " + (
                 "hoisted all-band cache" if self.cache_psi_r else
@@ -676,11 +676,11 @@ class GFlatChunkPlan:
                   else f"tiled current-r cache ({self.r_chunk // max(self.face_y_cache_r_tile, 1)}"
                        f" x {self.face_y_cache_r_tile})"))
                 if self.cache_face_y_blocks else
-                ("repeated bounded transform" if self.psi_layout == "face"
+                ("repeated bounded transform" if self.psi_layout in ("face", "axis")
                  else "n/a (legacy layout)")),
             *([f"    face Y cache = "
                f"{self.face_y_cache_bytes / 1e9:.3f} GB/dev"]
-              if self.psi_layout == "face" else []),
+              if self.psi_layout in ("face", "axis") else []),
             *([f"    parent route  = {int(self.parent_route['n_parent'])} raw "
                "parents; psi terms at n_parent rows"
                + (" (parents-only storage: no full-k faces)"
@@ -804,7 +804,8 @@ def plan_gflat_chunks(
         raise ValueError(
             f"fit_nb_total and face_nb_total must be positive, got "
             f"fit={fit_nb}, face={face_nb}")
-    if low_mem_bands:
+    parent_algorithm = low_mem_bands or parent_route is not None
+    if parent_algorithm:
         from runtime.padding import authenticate_padded_axis
         authenticate_padded_axis(
             face_nb, face_nb, p_y, name="face band memory-model carrier")
@@ -829,7 +830,7 @@ def plan_gflat_chunks(
     budget = budget_gb * 1e9
     target = budget * target_utilization
 
-    inventory_nb = face_nb if low_mem_bands else nb
+    inventory_nb = face_nb if parent_algorithm else nb
     sys = dict(nk=nk, ns=ns, nq=nq, nq_disk=nq_disk, mu=mu,
                nb=inventory_nb,
                ngkmax=ngkmax, n_rtot=n_rtot, low_mem_bands=bool(low_mem_bands),
@@ -850,7 +851,7 @@ def plan_gflat_chunks(
         nk, _min_cache_slots, ns, n_rtot, shard=p_xy)
     cache_psi_r = True
     _cache_probe_peak = sum(_persistent_base.values()) + _min_cache_bytes
-    if low_mem_bands:
+    if parent_algorithm:
         _cache_probe_bc = (
             int(band_chunk_override)
             if band_chunk_override and band_chunk_override > 0 else fit_nb)
@@ -902,12 +903,12 @@ def plan_gflat_chunks(
         cache_slots = math.ceil(fit_nb / floor_bc) * floor_bc
         psi_r_cache = _c128(nk, cache_slots, ns, n_rtot, shard=pp)
         floor_sys = dict(sys)
-        if low_mem_bands:
+        if parent_algorithm:
             floor_sys["nb"] = face_nb_pp
         floor = (sum(_persistent_bytes(
                      p_x=px, p_y=py, **floor_sys).values())
                  + (psi_r_cache if cache_psi_r else 0.0))
-        if low_mem_bands:
+        if parent_algorithm:
             # P_min must admit one legal face r slab.  Use the universal
             # repeated route at r=Py and the full-nk analytic transform.
             face_floor = _stage_C_face_terms(
@@ -972,7 +973,7 @@ def plan_gflat_chunks(
     # planner's existing performance floor / max-chunk floor; Phase 2 may
     # still choose a larger affordable r chunk after band K is resolved.
     r_lo = min(mu, n_rtot)
-    r_alignment = p_y if low_mem_bands else p_xy
+    r_alignment = p_y if parent_algorithm else p_xy
     if r_chunk_override and r_chunk_override > 0:
         r_for_band_guard = min(int(r_chunk_override), n_rtot)
     else:
@@ -992,7 +993,7 @@ def plan_gflat_chunks(
             nk=nk, band_chunk=bc, p_band=p_xy)
         centroid_fft_t = _fft_for_bc(bc, nk_extent=centroid_k)
         zeta_fft_t = _fft_for_bc(bc, nk_extent=nk)
-        if low_mem_bands:
+        if parent_algorithm:
             face = _stage_C_face_terms(
                 nk=nk, ns=ns, mu=mu, face_nb=face_nb,
                 slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
@@ -1065,7 +1066,7 @@ def plan_gflat_chunks(
     face_cache_build_t = 0.0
     face_tile_concat_t = 0.0
     face_y_cache_bytes = 0.0
-    if low_mem_bands:
+    if parent_algorithm:
         face_terms = _stage_C_face_terms(
             nk=nk, ns=ns, mu=mu, face_nb=face_nb,
             slots=face_slots, p_x=p_x, p_y=p_y, p_xy=p_xy,
@@ -1140,7 +1141,7 @@ def plan_gflat_chunks(
 
     headroom_C = max(
         target - persistent_total - C_constant
-        - (0.0 if (low_mem_bands or cache_psi_r)
+        - (0.0 if (parent_algorithm or cache_psi_r)
            else fft_box_zeta_transform),
         0.0)
     if r_chunk_override and r_chunk_override > 0:
@@ -1148,7 +1149,7 @@ def plan_gflat_chunks(
         # r_chunk_size wins over every cap below, exactly as before.
         r_chunk = min(int(r_chunk_override), n_rtot)
     else:
-        if not low_mem_bands:
+        if not parent_algorithm:
             r_from_budget = (
                 int(headroom_C / C_slope) if C_slope > 0 else n_rtot)
             r_from_arena = (
@@ -1278,7 +1279,7 @@ def plan_gflat_chunks(
     A_psi_r_cache_t = fft_box_zeta_transform if cache_psi_r else 0.0
     B_t = (_c128(nq, mu, mu, shard=p_xy)               # C_q
            + 2 * _c128(nk, ns, ns, mu, mu, shard=p_xy))  # full (μ,μ) pair density
-    if low_mem_bands:
+    if parent_algorithm:
         if cache_face_y_blocks:
             _cache_tile = face_y_cache_r_tile
             _completed_tile_z = (
@@ -1338,7 +1339,7 @@ def plan_gflat_chunks(
     #   that is live for the rest of the run is already what is resident
     #   here — there is no separate "post-fit narrowing" step to price.
     psi_one = _c128(nk, ns, mu, inventory_nb)
-    if low_mem_bands:
+    if parent_algorithm:
         E_base = 2.0 * psi_one / p_xy
     else:
         E_base = psi_one / p_x + psi_one / p_y
@@ -1364,7 +1365,7 @@ def plan_gflat_chunks(
     # band_chunk-bounded per-bc gather/weight transient (tiny against (a)
     # whenever band_chunk << n_rmu, the normal case).  Both scale with P
     # (px·py), not sqrt(P) — the fix this term exists to disclose.
-    if low_mem_bands:
+    if parent_algorithm:
         if cache_face_y_blocks:
             face_y_route_bytes = face_y_cache_bytes
         else:
@@ -1436,7 +1437,7 @@ def plan_gflat_chunks(
         p_min=int(p_min),
         budget_bytes=float(budget),
         target_utilization=float(target_utilization),
-        psi_layout=("face" if low_mem_bands else "legacy"),
+        psi_layout=("face" if low_mem_bands else "axis"),
         psi_layout_bytes=float(persistent["psi_copies"]),
         stage_cd_psi_bytes=float(stage_cd_psi_bytes),
         cache_psi_r=bool(cache_psi_r),

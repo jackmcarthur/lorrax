@@ -2085,7 +2085,6 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 			"  [bispinor] partial transverse ζ reuse: fitting only missing "
 			"channels on the sequential schedule.")
 	if (cfg.bispinor and not any(_reuse_T)
-			and bool(cfg.memory.low_mem_bands)
 			and bool(_chunks_T.get('cache_face_y_blocks', False))):
 		from gw.gflat_memory_model import (
 			_batch_reshard_operand_floor_bytes,
@@ -2235,7 +2234,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					chunks.get('cache_face_y_blocks', False)),
 				write_ibz_only=_write_ibz_only_charge,
 				zeta_cutoff_ry=_zeta_cutoff,
-				print_fn=print_fn,
+				layout="face" if cfg.memory.low_mem_bands else "axis", print_fn=print_fn,
 				bispinor_lift=(representation.charge_lift or "raw"),
 				k_unfold_plan=k_unfold_plan,
 				psi_nmu_parent=psi_nmu_parent,
@@ -2475,7 +2474,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 					_spill_coupled_gflat_to_host=bool(
 						coordinator is not None),
 					_stack_coupled_solve_inputs=coordinator is not None,
-					print_fn=print_fn,
+					layout="face" if cfg.memory.low_mem_bands else "axis", print_fn=print_fn,
 				)
 			_gate_fresh_zeta_rank_findings(
 				f"the μ_L={mu_L} transverse ζ fit's rank truncation",
@@ -3393,6 +3392,7 @@ def prepare_isdf_and_wavefunctions(
 					psi_parent_y=_to_file_order(sigma_parent_carrier.psi_nmu, (3,)),
 					psi_parent_y_mun=_to_file_order(sigma_parent_carrier.psi_mun, (2,)),
 					parent_k_rows=_candidate_plan.parent_full_rows,
+					psi_layout=sigma_parent_carrier.layout,
 					mesh=mesh_xy, mode="a",
 					psi_parent_y_transverse=(
 						_to_file_order(parent_T.psi_nmu, (3,), basis_T) if parent_T is not None else None),
@@ -3748,6 +3748,15 @@ def prepare_isdf_and_wavefunctions(
 
 	if green_parent_carrier is not None:
 		wfns = replace(wfns, green_parent=green_parent_carrier)
+	for family, bundle in (("charge", wfns), ("current", wfns_transverse)):
+		if bundle is None or bundle.green_parent is None:
+			continue
+		carrier = bundle.green_parent
+		resident = sum(int(np.prod(array.sharding.shard_shape(array.shape)))
+		               * array.dtype.itemsize for array in (carrier.psi_nmu, carrier.psi_mun))
+		np_, nb_, ns_, mu_ = carrier.psi_nmu.shape
+		print0(f"  Resident ψ ({family}): layout={carrier.layout}, parents={np_}, "
+		       f"bands={nb_}, ns={ns_}, M={mu_}; {resident} bytes/rank (two copies).")
 	from .wavefunction_bundle import AuthenticatedWavefunctions
 	charge_basis_binding = (
 		None if charge_basis_receipt is None else

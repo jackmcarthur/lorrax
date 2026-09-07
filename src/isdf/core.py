@@ -1109,7 +1109,7 @@ def c_q_from_psi_sm(
 				"psi_l_Y/psi_r_X/psi_r_Y.")
 		return _c_q_legacy(psi_l_X, psi_l_Y, psi_r_X, psi_r_Y,
 		                   gamma_L, gamma_R, kgrid=kgrid, mesh_xy=mesh_xy)
-	if layout != "face":
+	if layout not in ("face", "axis"):
 		raise ValueError(
 			f"c_q_from_psi_sm: layout must be 'legacy' or 'face', got "
 			f"{layout!r}")
@@ -1303,8 +1303,9 @@ def _c_q_face_parent(
 	mu_loc = mu_pk // px
 	col_loc = mu_pk // py
 
-	in_mun = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
-	in_nmu = NamedSharding(mesh_xy, P(None, 'x', None, 'y'))
+	in_mun = NamedSharding(mesh_xy, P(None, None, *gemm.in_sharding_a.spec[1:]))
+	in_nmu = NamedSharding(mesh_xy, P(None, gemm.in_sharding_b.spec[1],
+	                                      None, gemm.in_sharding_b.spec[2]))
 	w_rep = NamedSharding(mesh_xy, P(None))
 	out_C = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 	pair_spec = P(None, None, 'x', None, 'y')
@@ -1436,7 +1437,7 @@ def build_psi_r_cache_sm(psi_G_store, *, mesh_xy: Mesh) -> jax.Array:
 def z_q_from_psi_sm(
     *, psi_G_store, psi_r_cache=None, band_chunk_ranges,
     kgrid, mesh_xy, psi_mun, weight_l, weight_r, k_unfold_plan,
-    tile_r_index, tile_local_perm, tile_wraps, gamma_L=0, gamma_R=0,
+    tile_r_index, tile_local_perm, tile_wraps, gamma_L=0, gamma_R=0, layout="face",
 ):
     """Build Zq from raw parents on one typed orbit-closed real-grid tile."""
     if k_unfold_plan is None:
@@ -1448,7 +1449,7 @@ def z_q_from_psi_sm(
         k_unfold_plan=k_unfold_plan,
         tile_r_index=tile_r_index, tile_local_perm=tile_local_perm,
         tile_wraps=tile_wraps, band_chunk_ranges=band_chunk_ranges,
-        kgrid=kgrid, mesh_xy=mesh_xy, gamma_L=gamma_L, gamma_R=gamma_R)
+        kgrid=kgrid, mesh_xy=mesh_xy, gamma_L=gamma_L, gamma_R=gamma_R, layout=layout)
 
 
 
@@ -1502,6 +1503,7 @@ def _z_q_face_parent(
 	band_chunk_ranges: tuple[tuple[int, int], ...],
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
+	layout="face",
 ) -> jax.Array:
 	"""Build raw-parent pair projectors and unfold each spin block on an orbit-closed tile."""
 	from common.wfn_transforms import to_rpoints_inner
@@ -1601,7 +1603,8 @@ def _z_q_face_parent(
 	source_pairs = np.asarray([np.pad(pairs, (0, max_sources - len(pairs)),
 		constant_values=int(pairs[0])) for pairs in source_pairs], dtype=np.int32)
 
-	mun_spec = P(None, None, 'x', 'y')
+	from common.wfn_layout import psi_specs
+	_, mun_spec = psi_specs(layout)
 	pair_spec = P(None, None, 'x', None, 'y')
 	out_spec = (P(None, None, 'x', 'y') if coupled_mu123
 	            else P(None, 'x', 'y'))
@@ -1609,7 +1612,7 @@ def _z_q_face_parent(
 	cache_spec = P(None, None, ('x', 'y'), None, None)
 
 	cache_key = (
-		'z_q_face_parent', id(mesh_xy), id(plan),
+		'z_q_face_parent', id(mesh_xy), id(plan), layout,
 		(None if use_psi_r_cache else id(psi_G_store)),
 		local_band_chunk_shape, fft_grid,
 		n_parent, ns, mu_pk, nb_face, R_t, nkx, nky, nkz, bcr,
@@ -1662,6 +1665,8 @@ def _z_q_face_parent(
 				its owning y rank by a masked sum."""
 				p_arr = jnp.arange(bpd_max_global, dtype=jnp.int32)
 				global_band = b_lo_rel_arr[bc_idx] + p_arr
+				if layout == "axis":
+					return jnp.take(psi_mun_, jnp.clip(global_band, 0, nb_face - 1), axis=3)
 				owner_y = global_band // shard_w
 				local_idx = jnp.clip(
 					global_band - y_idx * shard_w, 0, shard_w - 1)
@@ -5601,6 +5606,7 @@ def _make_fit_one_rchunk_kernel(
     lu_hoisted: bool = False,
     distrib_la_batched_route: str = "batch_reshard",
     k_unfold_plan=None,
+    layout="face",
 ):
     """Cache parent Zq construction and the unchanged selected-q solve phases."""
     if k_unfold_plan is None:
@@ -5630,7 +5636,7 @@ def _make_fit_one_rchunk_kernel(
             k_unfold_plan=k_unfold_plan,
             gamma_L=vertex_mu_L, gamma_R=vertex_mu_L,
             tile_r_index=tile_r_index, tile_local_perm=tile_local_perm,
-            tile_wraps=tile_wraps)
+            tile_wraps=tile_wraps, layout=layout)
         if q_neg_idx_np is not None:
             Z_q = complete_ordered_pair_normal_equations(Z_q, q_neg_idx_np)
         return Z_q
@@ -5687,6 +5693,7 @@ def fit_one_rchunk(
     tile_r_index: jax.Array | None = None,
     tile_local_perm: jax.Array | None = None,
     tile_wraps: jax.Array | None = None,
+    layout="face",
 ):
     """Build or reuse a parent RHS, select q rows, and solve with cached factors."""
     if k_unfold_plan is None:
@@ -5716,7 +5723,7 @@ def fit_one_rchunk(
         str(zeta_gather),
         str(distrib_la_batched_route),
         bool(lu_piv is not None),
-        id(k_unfold_plan),
+        id(k_unfold_plan), layout,
         (None if q_irr_full_idx is None
          else (int(q_irr_full_idx.shape[0]),
                hash(np.asarray(q_irr_full_idx,
@@ -5739,7 +5746,7 @@ def fit_one_rchunk(
             zeta_gather=str(zeta_gather),
             lu_hoisted=bool(lu_piv is not None),
             distrib_la_batched_route=str(distrib_la_batched_route),
-            k_unfold_plan=k_unfold_plan,
+            k_unfold_plan=k_unfold_plan, layout=layout,
         )
         _fit_one_rchunk_cache[cache_key] = fn
     # cct_trace_per_q is None for the charge channel (Cholesky path

@@ -1388,7 +1388,8 @@ def compute_experimental_no_pair_photon_chi0(
             "full static photon response currently requires "
             f"current_contact={_WARD_SUBTRACTED_NO_PAIR!r}; "
             f"got {current_contact!r}")
-    if (wfns_charge.layout, wfns_transverse.layout) != ("face", "face"):
+    if (wfns_charge.layout != wfns_transverse.layout
+            or wfns_charge.layout not in ("face", "axis")):
         raise ValueError(
             "full four-current response requires layout='face' for both "
             "charge and transverse endpoint bundles (low_mem_bands=true); "
@@ -2432,6 +2433,8 @@ def _fractional_pair_scan_face(
         the direct endpoint (nk, s, mu_X, n) -- no reorder needed."""
         p = jnp.arange(tile, dtype=jnp.int32)
         global_band = g_lo + p
+        if shard_w_y == nb_full:
+            return jnp.take(psi_mun_local, jnp.clip(global_band, 0, nb_full - 1), axis=3)
         owner = global_band // shard_w_y
         owns = owner == y_idx
         local_idx = jnp.clip(
@@ -2449,6 +2452,9 @@ def _fractional_pair_scan_face(
         needs one transpose to match the band-last endpoint (nk, s, mu, n) order."""
         p = jnp.arange(tile, dtype=jnp.int32)
         global_band = g_lo + p
+        if shard_w_x == nb_full:
+            gathered = jnp.take(psi_nmu_local, jnp.clip(global_band, 0, nb_full - 1), axis=1)
+            return jnp.transpose(gathered, (0, 2, 3, 1))
         owner = global_band // shard_w_x
         owns = owner == x_idx
         local_idx = jnp.clip(
@@ -2577,7 +2583,8 @@ def iter_parent_children_faces(carrier, mesh_xy, *, slices, by_parent=True):
     from common.shard_map import shard_map
     from ffi import _services
     _services.ensure_on_path()
-    from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+    from common.wfn_layout import psi_specs
+    PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(carrier.layout)
 
     plan = carrier.plan
     ops, n_sym_spatial = _parent_face_unfold_operands(plan, mesh_xy)
@@ -2624,7 +2631,7 @@ def iter_parent_children_faces(carrier, mesh_xy, *, slices, by_parent=True):
                       rows.size)(carrier.psi_nmu, irr_r, sym_r, kfrac, U_r,
                                  perm_y, L_y)
         yield rows, SimpleNamespace(
-            layout="face", psi_mun=mun, psi_nmu=nmu, slices=slices,
+            layout=carrier.layout, psi_mun=mun, psi_nmu=nmu, slices=slices,
             enk=jnp.take(carrier.enk, irr_np[rows], axis=0),
             occ=jnp.take(carrier.occ, irr_np[rows], axis=0))
 
@@ -2639,15 +2646,16 @@ def _unfold_tables_from_operands(irr, sym, kfrac, U, perm_x, L_x, perm_y, L_y,
 
 def _get_chi_static_fractional_gamma_kernel_face(
     mesh_xy: Mesh, *, nb_full: int, nb_logical: int, pair_tile: int,
-    k_unfold_plan=None,
+    k_unfold_plan=None, layout="face",
 ):
     """Build the static Gamma divided-difference kernel on canonical faces or parents."""
     from common.shard_map import shard_map
-    from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+    from common.wfn_layout import psi_specs
+    PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(layout)
 
     tile = int(pair_tile)
     key = ("static_fractional_gamma_face", id(mesh_xy), int(nb_full),
-           int(nb_logical), tile, id(k_unfold_plan))
+           int(nb_logical), tile, id(k_unfold_plan), layout)
     hit = _chi_minimax_kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -2693,15 +2701,16 @@ def _get_chi_static_fractional_gamma_kernel_face(
 
 def _get_chi_fractional_q_kernel_face(
     mesh_xy: Mesh, *, nb_full: int, nb_logical: int, pair_tile: int,
-    n_z: int, k_unfold_plan=None,
+    n_z: int, k_unfold_plan=None, layout="face",
 ):
     """Roll the unfolded b endpoint to k−q inside the ordered-pair contraction."""
     from common.shard_map import shard_map
-    from .wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
+    from common.wfn_layout import psi_specs
+    PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(layout)
 
     tile = int(pair_tile)
     key = ("direct_fractional_q_face", id(mesh_xy), int(nb_full),
-           int(nb_logical), tile, int(n_z), id(k_unfold_plan))
+           int(nb_logical), tile, int(n_z), id(k_unfold_plan), layout)
     hit = _chi_minimax_kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -2822,14 +2831,14 @@ def compute_chi0_static_fractional_gamma(
             nb_full=nb_full,
             nb_logical=int(nb_logical),
             pair_tile=_STATIC_FRACTIONAL_PAIR_TILE,
-            k_unfold_plan=plan,
+            k_unfold_plan=plan, layout=wfns.layout,
         )(carrier.psi_mun, carrier.psi_nmu, e_full, f_full, surface_full,
           *tables)
     return _get_chi_static_fractional_gamma_kernel_face(
         mesh_xy,
         nb_full=nb_full,
         nb_logical=int(nb_logical),
-        pair_tile=_STATIC_FRACTIONAL_PAIR_TILE,
+        pair_tile=_STATIC_FRACTIONAL_PAIR_TILE, layout=wfns.layout,
     )(wfns.psi_mun, wfns.psi_nmu, e_full, f_full, surface_full)
 
 
@@ -2970,7 +2979,7 @@ def compute_chi0_direct_fractional(
     kernel = _get_chi_fractional_q_kernel_face(
         mesh_xy, nb_full=nb_full, nb_logical=nb_log,
         pair_tile=_STATIC_FRACTIONAL_PAIR_TILE, n_z=z.size,
-        k_unfold_plan=plan)
+        k_unfold_plan=plan, layout=wfns.layout)
     rows = []
     for q_row, row in enumerate(kmq):
         started = time.monotonic()
