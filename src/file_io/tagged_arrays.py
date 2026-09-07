@@ -542,6 +542,7 @@ def write_restart_state_to_h5(
     psi_parent_y_transverse=None,
     psi_parent_y_transverse_mun=None,
     parent_k_rows=None,
+    psi_layout="face",
     n_rmu_transverse_logical: int | None = None,
     enk_full=None,
     S_qmunu=None,
@@ -873,6 +874,10 @@ def write_restart_state_to_h5(
             if arr is None:
                 return
             shape, attrs = write_plan[name]
+            if name.startswith("psi_parent_"):
+                from common.wfn_layout import psi_specs
+                psi_specs(psi_layout)
+                attrs = dict(attrs, psi_layout=psi_layout)
             _t0 = time.time()
             # The LOGICAL shape is stated once, to create_dataset; the
             # write clips ``arr``'s μ pad rows against it on its own
@@ -2034,6 +2039,7 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
             psi_nmu_parent_transverse=psi_nmu_parent_T,
             psi_mun_parent_transverse=psi_mun_parent_T,
             parent_k_rows=parent_k_rows,
+            layout="face" if low_mem_bands else "axis",
         )
 
     x1_psi_X = NamedSharding(mesh_xy, P(None, "x", None, None))

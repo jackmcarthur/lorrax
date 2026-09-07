@@ -519,7 +519,7 @@ def attach_parent_green_carrier(
 
 def psi_field_names(layout: str) -> tuple[str, ...]:
     """Name the two canonical face orientations for residency accounting."""
-    if layout != "face":
+    if layout not in _LAYOUTS:
         raise ValueError(f"psi_field_names: unknown layout {layout!r}")
     return ("psi_nmu", "psi_mun")
 
@@ -580,12 +580,13 @@ def build_wavefunctions_face(
     basis_receipt=None, layout="face",
 ) -> Wavefunctions:
     """Assemble canonical faces from direct Y samples and conjugated X samples."""
+    nmu_spec, mun_spec = psi_specs(layout)
     with mesh_xy:
         psi_nmu = jax.lax.with_sharding_constraint(
-            psi_rmu_Y, NamedSharding(mesh_xy, PSI_NMU_SPEC))
+            psi_rmu_Y, NamedSharding(mesh_xy, nmu_spec))
         psi_mun = jax.lax.with_sharding_constraint(
             jnp.conj(psi_rmuT_X).transpose(0, 3, 1, 2),  # (nk, s, μ_X, n)
-            NamedSharding(mesh_xy, PSI_MUN_SPEC))
+            NamedSharding(mesh_xy, mun_spec))
 
         occ_full = _build_occ(enk_full, slices, efermi)
         rep2 = NamedSharding(mesh_xy, P(None, None))
@@ -683,7 +684,7 @@ def _face_embed_active_U(U_active, *, nb_full: int, a_lo: int, mesh_xy: Mesh):
 
 
 def _face_rotate_kernel(mesh: Mesh, a_lo: int, nb_active: int, nb_full: int,
-                        n_rmu: int, ns: int, nk: int):
+                        n_rmu: int, ns: int, nk: int, layout="face"):
     """One built kernel per ``(mesh, active window, face shape)``.
 
     Builds the TWO ``distrib_la.gemm_plan`` N,N GEMMs ONCE (their shapes —
@@ -726,16 +727,18 @@ def _face_rotate_kernel(mesh: Mesh, a_lo: int, nb_active: int, nb_full: int,
     from distrib_la import gemm_plan
     from common.contract_bands import merge_spin_centroid, split_spin_centroid
 
-    key = (id(mesh), a_lo, nb_active, nb_full, n_rmu, ns, nk)
+    key = (id(mesh), a_lo, nb_active, nb_full, n_rmu, ns, nk, layout)
     hit = _FACE_ROTATE_CACHE.get(key)
     if hit is not None:
         return hit
 
     mu_s = n_rmu * ns
     plan_nmu = gemm_plan(mesh, m=nb_full, k=nb_full, n=mu_s, nq=nk,
-                        dtype=jnp.complex128)
+                        dtype=jnp.complex128, layout=layout,
+                        out_spec=P(None, None, "y") if layout == "axis" else None)
     plan_mun = gemm_plan(mesh, m=mu_s, k=nb_full, n=nb_full, nq=nk,
-                        dtype=jnp.complex128)
+                        dtype=jnp.complex128, layout=layout,
+                        out_spec=P(None, "x", None) if layout == "axis" else None)
 
     @jax.jit
     def fn(psi_nmu_full, psi_mun_full, U_active):
@@ -744,12 +747,13 @@ def _face_rotate_kernel(mesh: Mesh, a_lo: int, nb_active: int, nb_full: int,
 
         B_nmu = merge_spin_centroid(psi_nmu_full, 2, 3)   # (nk,nb_full,mu_s) P(_,'x','y')
         A_nmu = jax.lax.with_sharding_constraint(          # U^T: new-on-x, old-on-y
-            jnp.swapaxes(U_full, 1, 2), NamedSharding(mesh, P(None, 'x', 'y')))
+            jnp.swapaxes(U_full, 1, 2), plan_nmu.in_sharding_a)
         D_nmu = plan_nmu(A_nmu, B_nmu)                     # (nk,nb_full,mu_s) P(_,'x','y')
         psi_nmu_out = split_spin_centroid(D_nmu, 2, ns, n_rmu)
 
         A_mun = merge_spin_centroid(psi_mun_full, 1, 2)    # (nk,mu_s,nb_full) P(_,'x','y')
-        D_mun = plan_mun(A_mun, U_full)                    # (nk,mu_s,nb_full) P(_,'x','y')
+        D_mun = plan_mun(A_mun, jax.lax.with_sharding_constraint(
+            U_full, plan_mun.in_sharding_b))                    # (nk,mu_s,nb_full) P(_,'x','y')
         psi_mun_out = split_spin_centroid(D_mun, 1, ns, n_rmu)
         return psi_nmu_out, psi_mun_out
 
@@ -768,7 +772,7 @@ def rotate_wavefunctions(
     active_slice: slice | None = None,
 ) -> Wavefunctions:
     """Rotate the active band columns, preserve inactive wavefunctions, and rebuild energies and occupations."""
-    if wfns_dft.layout != "face":
+    if wfns_dft.layout not in _LAYOUTS:
         raise ValueError("rotate_wavefunctions requires the two-face carrier.")
     sigma_slice = wfns_dft.slices.sigma
     if active_slice is None:
@@ -796,7 +800,7 @@ def rotate_wavefunctions(
         carrier_rotated = None
         if wfns_dft.psi_nmu is not None:
             rotate = _face_rotate_kernel(
-                mesh_xy, a_lo, nb_active, nb_full, n_rmu, ns, nk_face)
+                mesh_xy, a_lo, nb_active, nb_full, n_rmu, ns, nk_face, layout=wfns_dft.layout)
             psi_nmu, psi_mun = rotate(wfns_dft.psi_nmu, wfns_dft.psi_mun, U)
             if wfns_dft.green_parent is not None:
                 # A carrier beside full-k faces (the self-consistent map
@@ -835,7 +839,7 @@ def rotate_wavefunctions(
     # As above, the host DFT binding cannot follow a QP-rotated carrier.
     rotated = Wavefunctions(
         psi_nmu=psi_nmu, psi_mun=psi_mun,
-        enk=enk_full, occ=occ_full, slices=wfns_dft.slices, layout='face',
+        enk=enk_full, occ=occ_full, slices=wfns_dft.slices, layout=wfns_dft.layout,
     )
     if carrier_rotated is None:
         return rotated
@@ -866,7 +870,7 @@ def _rotate_parent_carrier(carrier, U_placed, *, a_lo, nb_active, nb_full,
     n_parent = int(plan.n_parent)
     rot = _face_rotate_kernel(
         mesh_xy, a_lo, nb_active, nb_full, int(plan.n_centroid_packed), ns,
-        n_parent)
+        n_parent, layout=carrier.layout)
     packed_nmu, packed_mun = rot(carrier.psi_nmu, carrier.psi_mun, U_par)
     return packed_nmu, packed_mun, plan
 

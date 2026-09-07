@@ -480,8 +480,9 @@ class GemmPlan:
             if c is None and self.beta != 0:
                 raise ValueError("gemm_plan.local_call: C is required when beta != 0")
             if c is not None:
-                _check_local_operand(self, "C/out", c,
-                                     (self.nq, self.m // px, self.n // py))
+                c_shape = tuple(size // (self.mesh.shape[axis] if axis else 1)
+                                for size, axis in zip((self.nq, self.m, self.n), self.out_sharding.spec))
+                _check_local_operand(self, "C/out", c, c_shape)
             return _axis_matmul(A, B, c, alpha=self.alpha, beta=self.beta,
                                 reduction_axis=self.reduction_axis)
         _check_local_operand(self, "A", A, (self.nq, self.m // px, self.k // py))
@@ -522,7 +523,7 @@ def _axis_matmul(a, b, c=None, *, alpha, beta, reduction_axis=None):
 
 
 def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
-                    dtype, alpha=1.0, beta=0.0, reduction_axis=None) -> GemmPlan:
+                    dtype, alpha=1.0, beta=0.0, reduction_axis=None, out_spec=None) -> GemmPlan:
     """Warm A(q,m_X,k) B(q,k,n_Y) → D(q,m_X,n_Y) with a replicated contraction axis."""
     m, k, n, nq = (_as_extent(label, value) for label, value in
                    (("m", m), ("k", k), ("n", n), ("nq", nq)))
@@ -532,9 +533,15 @@ def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
     if dtype.kind != "c" and (alpha.imag or beta.imag):
         raise ValueError("local_gemm_plan: alpha/beta must be real for real dtype")
     px, py = _mesh_shape(mesh)
-    if m % px or n % py:
-        raise ValueError(f"local_gemm_plan: output ({m}, {n}) must tile {px}x{py}")
-    a_spec, b_spec, out_spec = P(None, "x", None), P(None, None, "y"), P(None, "x", "y")
+    out_spec = P(None, "x", "y") if out_spec is None else out_spec
+    if out_spec not in (P(None, "x", "y"), P(None, "x", None), P(None, None, "y")):
+        raise ValueError("local_gemm_plan: output must retain its centroid axis shards")
+    for extent, axis in zip((m, n), out_spec[1:]):
+        if axis is not None and extent % mesh.shape[axis]:
+            raise ValueError("local_gemm_plan: output extent does not tile its mesh axis")
+    a_spec, b_spec = P(None, out_spec[1], None), P(None, None, out_spec[2])
+    if reduction_axis is not None and out_spec != P(None, "x", "y"):
+        raise ValueError("local_gemm_plan: centroid reduction requires the two-axis output")
     if reduction_axis == "y":
         a_spec, b_spec = P(None, "x", "y"), P(None, "y", None)
     elif reduction_axis == "x":
@@ -576,6 +583,7 @@ def gemm_plan(
     beta=0.0,
     layout="face",
     reduction_axis=None,
+    out_spec=None,
 ) -> GemmPlan:
     """Eagerly resolve, probe, warm and COMPILE one N,N GEMM shape, ONCE.
 
@@ -631,9 +639,11 @@ def gemm_plan(
     """
     if layout == "axis":
         return local_gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
-                               alpha=alpha, beta=beta, reduction_axis=reduction_axis)
+                               alpha=alpha, beta=beta, reduction_axis=reduction_axis, out_spec=out_spec)
     if layout != "face":
         raise ValueError(f"gemm_plan: unknown psi layout {layout!r}")
+    if out_spec is not None and out_spec != P(None, "x", "y"):
+        raise ValueError("gemm_plan: single-axis output requires layout=axis")
     px, py = _mesh_shape(mesh)
     m = _as_extent("m", m)
     k = _as_extent("k", k)
