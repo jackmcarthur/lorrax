@@ -20,36 +20,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
 def kgrid_shift_map(nkx, nky, nkz, q_off):
-    """C-order fold + umklapp G for the on-grid shift ``k -> k + q_off``.
-
-    The ONE place the ``k + q`` integer arithmetic lives (finite-momentum
-    remap of on-grid conduction/valence tensors — the ``jnp.roll`` in the BSE
-    W_q / exciton-Q loaders derives its offsets from here).  Pure numpy; no new
-    class.  ``q_off`` is an integer grid-step vector (may be negative).
-
-    Per-element (full-BZ k = (ix, iy, iz), C-order flat
-    ``k = ix·nky·nkz + iy·nkz + iz``; ``q_off = (qx, qy, qz)``):
-
-        jx = ix + qx ;  kpx = jx mod nkx ;  Gx = jx // nkx      (floor div)
-        (same for y, z)
-        kpq_index[k] = kpx·nky·nkz + kpy·nkz + kpz
-        G_umk[k]     = (Gx, Gy, Gz)          integer reciprocal-lattice wrap
-
-    So ``arr[kpq_index]`` gathers the value at ``k + q_off`` into slot ``k``,
-    i.e. it equals ``jnp.roll(arr_reshaped, shift=(-qx, -qy, -qz),
-    axis=(0, 1, 2)).reshape(nk, ...)`` on the C-order (nkx, nky, nkz) k-axis
-    (verified by the identity ``kpq_index == roll`` in the finite-q gate).
-    ``G_umk`` is the wrap count on each axis; for ``0 <= q < nk`` it is in
-    ``{0, 1}``, and it drives the umklapp Bloch phase
-    ``exp(-2πi G_umk · s_μ)`` at centroid fractional coords ``s_μ`` when the
-    stored ψ is the cell-periodic part ``u_{n,k}`` (see the finite-q W_q
-    derivation in reports/bse_refactor_map_2026-07-15/PHASE2_LOG.md).
-
-    Returns
-    -------
-    kpq_index : (nk,) int32   C-order gather index of ``k + q_off``.
-    G_umk     : (nk, 3) int32 per-k reciprocal-lattice wrap.
-    """
+    """C-order fold + umklapp G for the on-grid shift ``k -> k + q_off``; see docs/architecture/symmetry_register.md."""
     nkx, nky, nkz = int(nkx), int(nky), int(nkz)
     qx, qy, qz = (int(v) for v in q_off)
     ix, iy, iz = np.meshgrid(
@@ -75,14 +46,7 @@ def _bgw_positive_half_wrap_fractional(q_fractional):
 
 
 def bgw_signed_q_representative(qvec):
-    r"""Return BGW's signed representative for stored fractional q rows.
-
-    Input rows must have trailing shape ``(..., 3)`` and lie in the one-cell
-    storage interval ``[-1/2, 1)`` (up to roundoff).  Components strictly
-    greater than one half wrap negative; the even-grid boundary remains
-    ``+1/2``.  This is the public symmetry-service door for consumers whose
-    WFN contract already supplies fractional q representatives.
-    """
+    """Return BGW's signed representative for stored fractional q rows; see docs/architecture/symmetry_register.md."""
     q = np.asarray(qvec, dtype=np.float64)
     if q.ndim < 1 or q.shape[-1] != 3:
         raise ValueError(
@@ -103,13 +67,7 @@ def bgw_signed_q_representative(qvec):
 
 
 def bgw_integer_q_to_fractional(q_int_kgrid, kgrid):
-    """Convert BGW integer-grid q labels to wrapped fractional vectors.
-
-    BGW keeps the positive half-grid point on an even grid and wraps only
-    labels strictly above it: ``q > kgrid/2 -> q-kgrid``.  This service owns
-    that tie convention so symmetry producers and consumers cannot attach
-    different fractional momenta to the same integer star table.
-    """
+    """Convert BGW integer-grid q labels to wrapped fractional vectors; see docs/architecture/symmetry_register.md."""
     q = np.asarray(q_int_kgrid, dtype=np.float64)
     grid = np.asarray(kgrid, dtype=np.float64)
     if q.ndim < 1 or q.shape[-1] != 3:
@@ -133,13 +91,7 @@ def bgw_integer_q_to_fractional(q_int_kgrid, kgrid):
 
 
 def q_negation_index(kgrid):
-    """C-order full-grid permutation ``index(q) -> index(-q)``.
-
-    The q axis used by the ISDF fit, GW restart tensors, and BSE is the
-    row-major flattening of ``(qx, qy, qz)``.  This service owns the
-    involution so normal-equation completion, diagnostics, and downfolding
-    cannot carry independent spellings of the same q convention.
-    """
+    """C-order full-grid permutation ``index(q) -> index(-q)``; see docs/architecture/symmetry_register.md."""
     raw = np.asarray(kgrid)
     if raw.shape != (3,) or not np.all(np.isfinite(raw)):
         raise ValueError(
@@ -157,23 +109,7 @@ def q_negation_index(kgrid):
 
 
 def common_uniform_grid_indices(grid_a, grid_b):
-    """Aligned C-order rows shared by two unshifted uniform BZ grids.
-
-    ``grid_a`` and ``grid_b`` describe fractional point sets
-    ``(i_x/N_x, i_y/N_y, i_z/N_z)`` in ``[0, 1)^3``.  Return two ``int32``
-    vectors ``(rows_a, rows_b)`` whose paired rows are the same fractional
-    coordinate, ordered by the common fractional grid in C order.
-
-    The construction is integer-only.  Along one axis, grids of lengths
-    ``N_a`` and ``N_b`` share ``gcd(N_a, N_b)`` points.  Common point ``t``
-    has native indices ``t*N_a/g`` and ``t*N_b/g``.  Thus 8→12 keeps the
-    four-point one-dimensional intersection, not a prefix, nearest-neighbour
-    match, or a fictitious eight-point nesting.
-
-    This helper deliberately covers *unshifted* grids only.  A shifted mesh
-    needs its shift in the contract and must not be silently treated as this
-    point set.
-    """
+    """Aligned C-order rows shared by two unshifted uniform BZ grids; see docs/architecture/symmetry_register.md."""
     def _grid(name, value):
         raw = np.asarray(value)
         if raw.shape != (3,):
@@ -213,26 +149,7 @@ def common_uniform_grid_indices(grid_a, grid_b):
 
 
 def find_irreducible_bz_points(full_kgrid_int, sym_mats_k, *, irr_kgrid_int=None):
-    """For each row of ``full_kgrid_int`` (a full-BZ point in integer kgrid
-    coords), find which IBZ point + ``sym_mats_k`` row maps onto it.
-
-    Args:
-        full_kgrid_int: ``(N_full, 3)`` int — full-BZ point set. The grid is
-            inferred as ``full_kgrid_int.max(axis=0) + 1``.
-        sym_mats_k: ``(n_sym, 3, 3)`` int — sym matrices acting on k-vectors in
-            kgrid-int form. Typically TRS-augmented ``[spatial, -spatial]`` with
-            ``n_sym = 2 * ntran``; ``is_trs`` is then ``sym_idx >= ntran``.
-        irr_kgrid_int: optional ``(N_irr, 3)`` int — pre-specified IBZ list.
-            If ``None``, the IBZ is derived as lex-smallest orbit representatives
-            (q-side use). If given, IBZ is fixed (k-side use, anchored to
-            ``wfn.kpoints``).
-
-    Returns:
-        irr_idx: ``(N_full,)`` int32 — IBZ row index for each full-BZ point.
-        sym_idx: ``(N_full,)`` int32 — sym_mats_k row mapping IBZ → full-BZ.
-        irr_kgrid_int_out: ``(N_irr, 3)`` int32 — IBZ list (echoes input if
-            given, else the derived lex-min set).
-    """
+    """For each row of ``full_kgrid_int`` (a full-BZ point in integer kgrid coords), find which IBZ point + ``sym_mats_k`` row maps onto it; see docs/architecture/symmetry_register.md."""
     full = np.asarray(full_kgrid_int, dtype=np.int64)
     Smk = np.asarray(sym_mats_k, dtype=np.int64)
     n_full = int(full.shape[0])
@@ -311,18 +228,7 @@ def map_full_kpoints_to_irreducible(
     *,
     tol=1.0e-6,
 ):
-    """Map full-zone rows to stored k rows without inventing preimages.
-
-    This is the coordinate planner used by :class:`SymMaps`.  It deliberately
-    preserves the registered selection rule: the highest stored-k row with a
-    match wins, then the lowest symmetry row for that stored k.  ``matched``
-    is returned separately so callers can refuse incomplete WFN metadata
-    before consuming the zero-initialized index arrays.
-
-    Parameters are fractional reciprocal coordinates.  ``sym_mats_k`` is
-    exactly the set of rows the caller's policy permits (spatial only, or the
-    TRS-augmented table); this function never decides whether TRS is physical.
-    """
+    """Map full-zone rows to stored k rows without inventing preimages; see docs/architecture/symmetry_register.md."""
     stored = np.asarray(kpoints, dtype=np.float64)
     sym = np.asarray(sym_mats_k, dtype=np.int64)
     full = np.asarray(full_kpoints, dtype=np.float64)
@@ -376,12 +282,7 @@ class SpatialOperatorTables:
 
 
 def build_spatial_operator_tables(wfn) -> SpatialOperatorTables:
-    """Build canonical spatial/antiunitary action tables from a WFN header.
-
-    This does not map a single k point.  The 2c reference check can therefore
-    test a malformed or physically inconsistent reduced WFN and issue its TRS
-    verdict before :class:`SymMaps` independently refuses incomplete coverage.
-    """
+    """Build canonical spatial/antiunitary action tables from a WFN header; see docs/architecture/symmetry_register.md."""
     ntran = int(getattr(wfn, "ntran", 0))
     if ntran < 1:
         raise ValueError(
@@ -414,49 +315,7 @@ def build_spatial_operator_tables(wfn) -> SpatialOperatorTables:
 
 
 def slice_q_full_to_ibz(arr_full, q_irr_full_idx, *, out_sharding=None):
-    """Slice a ``(n_q_full, ...)`` array to its IBZ rows.
-
-    The natural ``full BZ → IBZ`` companion to :func:`unfold_isdf_operator`'s
-    ``IBZ → full BZ`` direction: this just picks the IBZ representative
-    q-points out of a full-BZ tensor.  No centroid permute, no L-phase,
-    no TRS conjugation — a pure row gather along axis 0.
-
-    Use it whenever a q-axis quantity is built at full BZ but only the
-    IBZ rows are needed for the downstream per-q step.  Two examples
-    on the same shape ``(n_q, n_rmu, n_rmu)`` sharded as
-    ``P(None, 'x', 'y')`` (q-axis replicated, μ on x, ν on y):
-
-    - ``isdf_fitting.fit_zeta_to_h5``: slice C_q before ``factor_c_q``
-      so Cholesky / LU runs only on the IBZ q-block, then ζ_q is solved
-      and stored at IBZ; downstream V_q unfolds via
-      :func:`unfold_isdf_operator`.
-    - W_q = ``(1 − v_q χ_q)^{-1} v_q``: slice the Hermitian object that
-      needs per-q inversion to IBZ before solve, then unfold via
-      :func:`unfold_isdf_operator` for the q-axis consumers.
-
-    Sharding contract.  The gather along axis 0 leaves the trailing
-    (μ, ν) axes untouched, so XLA preserves whatever ``arr_full``
-    sharding came in.  Pass ``out_sharding`` to lock in an explicit
-    ``NamedSharding`` (typically ``P(None, 'x', 'y')`` for the
-    Cq / V_q / χ_q quantities) — this stabilises the JIT cache key so
-    repeat calls hit the same compiled module.
-
-    Parameters
-    ----------
-    arr_full : jax.Array
-        Shape ``(n_q_full, ...)``.
-    q_irr_full_idx : np.ndarray | jax.Array
-        ``(n_q_ibz,)`` int32 — full-BZ indices of the IBZ q-points.
-        Sourced from :attr:`SymMaps.q_irr_full_idx`.
-    out_sharding : jax.sharding.NamedSharding, optional
-        If given, the output is constrained to this sharding via
-        ``jax.lax.with_sharding_constraint``.
-
-    Returns
-    -------
-    arr_ibz : jax.Array
-        ``(n_q_ibz, ...)`` selected rows of ``arr_full``.
-    """
+    """Slice a ``(n_q_full, ...)`` array to its IBZ rows; see docs/architecture/symmetry_register.md."""
     idx = jnp.asarray(np.asarray(q_irr_full_idx, dtype=np.int32))
     out = arr_full[idx]
     if out_sharding is not None:
@@ -483,118 +342,7 @@ def unfold_isdf_operator(
     axis_local_sym_perm=None,
     right_axis_local_sym_perm=None,
 ):
-    """Expand ``V_q_ibz`` over the IBZ to the full BZ.
-
-    The mapping is a centroid-axis double-gather (using the **source-map**
-    ``α(μ) = sym_perm[s, μ]`` returned by ``centroid_source_map_and_wrap``)
-    plus a per-centroid umklapp phase from the real-space lattice wrap.  The
-    historical square form is
-
-        V_full[q, μ', ν'] = exp(2π i q_irr · (L_{s,μ'} − L_{s,ν'}))
-                            · V_ibz[i(q), α_{s}(μ'), α_{s}(ν')]
-
-    and is exactly the ``right_* is None`` specialization of the rectangular
-    response action
-
-        X_full[q, μ_L, ν_R]
-          = exp(2π i q_irr · (L^L_{s,μ_L} - L^R_{s,ν_R}))
-            X_ibz[i(q), α^L_s(μ_L), α^R_s(ν_R)].
-
-    Distinct left/right tables are required for CT/TC response tiles whose
-    charge and transverse centroid bases differ.  Each padded endpoint stays
-    on its native processor axis, ``P(None,'x','y')``; neither open centroid
-    axis is gathered onto one rank.
-
-    where ``i(q) = irr_idx[q]``, ``s(q) = sym_idx[q]``,
-    ``q_irr = q_irr_frac[i(q)]`` is the IBZ parent q in fractional
-    reciprocal coords, and ``α_s(μ) = sym_perm[s, μ]``,
-    ``L_{s,μ} = L_table[s, μ]`` come from the source-map decomposition
-    ``y_μ = mtrx · (x_μ − τ) = x_{α(μ)} + L_μ`` (the user-spec inverse
-    form; see ``docs/SYMMETRY_COMPREHENSIVE.md`` §4 and §5).
-
-    The phase factor is essential whenever ``S r_μ + τ`` exits the
-    unit cell (i.e. ``L_μ ≠ 0``) — which happens for every non-trivial
-    full-BZ q on a non-cubic / non-symmorphic system.  Skipping the
-    phase produces a ~unity-relative error on umklapp q's (verified
-    empirically on CrI3 30 Ry V_q dumps before this fix).
-
-    TRS-augmented rows
-    ------------------
-    ``sym_idx`` values may be in ``[n_sym_spatial, 2·n_sym_spatial)`` for
-    q's that fold to their IBZ parent only via time reversal.  Per-element
-    derivation (``ζ_{-q,μ}(G) = ζ*_{q,μ}(-G)`` combined with ``v(|q+G|)``
-    real-and-even-in-K) gives, for the scalar (charge-channel) V_q::
-
-        V_full[TRS-q, π_s(μ), π_s(ν)] = conj(V_ibz[i(q), μ, ν])
-
-    For Hermitian V_q the conj equals the ν↔μ transpose; we implement
-    conj for clarity (and to keep the helper correct for any future
-    non-Hermitian channels).  For a rectangular general operator,
-    ``trs_pair_q_ibz`` is the reversed-axis partner ``(q,ν_R,μ_L)``;
-    time reversal uses its transpose.  This is the exact CT↔TC pair action,
-    not a shape-based transpose of CT itself.  The centroid permutation is
-    unchanged under TRS (r is fixed); ``sym_perm`` rows ``[ntran:]``
-    duplicate ``[:ntran]``.  Callers build ``sym_perm`` via
-    ``centroid_source_map_and_wrap(..., extend_trs=True)`` and pass
-    ``n_sym_spatial=ntran``.
-
-    Parameters
-    ----------
-    V_q_ibz
-        ``(n_q_ibz, n_rmu, n_rmu)`` complex, sharded ``P(None,'x','y')``.
-    irr_idx
-        ``(n_q_full,)`` int — IBZ index per full-BZ q (``sym.irr_idx_q``).
-    sym_idx
-        ``(n_q_full,)`` int — sym row per full-BZ q (``sym.sym_idx_q``).
-        Values in ``[0, 2·n_sym_spatial)``.
-    sym_perm
-        ``(2·n_sym_spatial, n_rmu)`` int — centroid permutation table.
-        Must cover ``max(sym_idx)``; we raise a clear error otherwise
-        rather than relying on JAX's silent OOB clamp.
-    L_table
-        ``(2·n_sym_spatial, n_rmu, 3)`` int — per-(sym, centroid)
-        integer real-space lattice wrap, from
-        ``centroid_source_map_and_wrap``.  Drives the umklapp phase.
-    q_irr_frac
-        ``(n_q_ibz, 3)`` float — IBZ q in fractional reciprocal
-        coordinates (already BGW-wrapped to the (−0.5, 0.5] convention
-        if the caller is consistent).  Indexed by ``irr_idx``.
-    mesh_xy
-        Device mesh; the output is constrained to ``P(None,'x','y')``.
-    n_sym_spatial
-        ``ntran`` — count of spatial-only sym ops in ``sym_perm``'s
-        first half.  Used to identify TRS-augmented rows
-        (``sym_idx >= n_sym_spatial``) and apply the required ``conj``.
-    trs_rule
-        ``"conj"`` for Hermitian inputs (the historical default), or
-        ``"pair_transpose"`` for a general complex-frequency operator.
-        Time reversal transposes its centroid pair without conjugating its
-        frequency dependence.
-    right_sym_perm, right_L_table
-        Optional right-endpoint source-map/wrap tables.  Both must be supplied
-        together.  Omission preserves the historical square same-basis action.
-    left_logical_extent, right_logical_extent
-        Physical endpoint extents inside the padded array.  Padding is
-        required to form an invariant tail under every used source map and is
-        zeroed structurally in the result.  Defaults are the full stored axes.
-    trs_pair_q_ibz
-        Reversed-axis partner ``(n_q_ibz,n_right,n_left)`` for rectangular
-        ``trs_rule='pair_transpose'``.  Square callers retain the historical
-        self-transpose default.
-    axis_local_sym_perm, right_axis_local_sym_perm
-        Optional packed-view gather offsets with the same shapes as the
-        corresponding global permutation tables.  Each value is local to
-        its target X or Y shard.  Supplying these certifies an orbit-packed
-        basis and replaces the two all-to-all permutation round trips with
-        local gathers.  The global tables remain required and are checked
-        against these offsets.  A rectangular basis supplies both local
-        tables together.
-    Returns
-    -------
-    V_q_full
-        ``(n_q_full, n_left, n_right)`` complex, sharded
-        ``P(None,'x','y')``.
-    """
+    """Expand ``V_q_ibz`` over the IBZ to the full BZ; see docs/architecture/symmetry_register.md."""
     # Trivial-IBZ short-circuit. When ntran=1 (e.g. nosym runs) the IBZ is
     # already the full BZ — irr_idx is identity, sym_idx is all zeros,
     # sym_perm is identity. The take_along_axis path below is then a
@@ -951,16 +699,7 @@ _UNFOLD_ISDF_OPERATOR_JIT_CACHE: dict = {}
 def _apply_unfold_phase_and_trs_local(
     V_full_local, phase_mu, phase_nu, trs_mask, *, pair_transpose: bool,
 ):
-    """The umklapp phase and the time-reversal rule on one local tile.
-
-    ``V_full_local`` is ``(n_q_full, mu_loc, nu_loc)`` after both endpoint
-    gathers; ``phase_mu``/``phase_nu`` are this rank's slices of
-    ``exp(2πi q_irr·L)`` for each endpoint; ``trs_mask`` marks antiunitary
-    rows.  The Hermitian rule conjugates the whole phased tile on those rows;
-    the pair-transpose rule instead swaps which endpoint's phase is
-    conjugated, because its operand is already the transposed partner.  One
-    body serves the top-level unfold kernel and the manual-mode local body.
-    """
+    """The umklapp phase and the time-reversal rule on one local tile; see docs/architecture/symmetry_register.md."""
     if pair_transpose:
         mu_phase = jnp.where(trs_mask[:, None],
                              jnp.conj(phase_mu), phase_mu)
@@ -986,33 +725,7 @@ def unfold_operator_local(
     right_L_table,
     n_sym_spatial,
 ):
-    r"""Transport one local rectangular tile from raw parents to full k.
-
-    The manual-mode twin of :func:`unfold_isdf_operator`'s axis-local
-    Hermitian action, for a caller that already stands inside an
-    ``('x','y')`` ``shard_map`` and therefore cannot call the top-level jit.
-    ``operator_parent_local`` is this rank's ``(n_parent, mu_loc, nu_loc)``
-    tile of a ``P(None,'x','y')`` operator whose two endpoints are both
-    orbit-packed, so every gather stays inside the rank's own X or Y shard.
-    The result is the same rank's ``(n_full, mu_loc, nu_loc)`` tile of
-
-        X_full[q, mu, nu] = exp(2πi q_irr·(L^L_{s,mu} − L^R_{s,nu}))
-                            X_ibz[i(q), alpha^L_s(mu), alpha^R_s(nu)],
-
-    conjugated on antiunitary rows — the ``trs_rule="conj"`` action, which is
-    the only one a pair projector with real band weights and two different
-    endpoints has (there is no transposed partner for a rectangular tile).
-
-    Tables are indexed by typed operation row over the COMPLETE padded
-    endpoint: ``left_local_perm``/``right_local_perm`` are
-    ``(n_rows, n_left)``/``(n_rows, n_right)`` owner-local gather offsets
-    (packed source ``% shard extent``), ``left_L_table``/``right_L_table``
-    the matching ``(n_rows, n_endpoint, 3)`` lattice wraps.  They may be
-    traced operands: a real-grid tile changes tables on every call, and a
-    caller that baked them as constants would compile once per tile.  The
-    orbit-packing certificate (no gather crosses a shard) belongs to the
-    caller's plan; this body cannot check it under ``jit`` and does not try.
-    """
+    """Transport one local rectangular tile from raw parents to full k; see docs/architecture/symmetry_register.md."""
     irr = jnp.asarray(irr_idx, dtype=jnp.int32)
     sym = jnp.asarray(sym_idx, dtype=jnp.int32)
     trs_mask = sym >= int(n_sym_spatial)
@@ -1062,35 +775,7 @@ def unfold_wavefunction_local(
     mu_axis: int,
     mesh_axis=None,
 ):
-    r"""Children ψ_{gk̄} from raw parents on one μ-local slab, by the typed action.
-
-        ψ_{gk̄,a}(μ) = Σ_c U_g[a,c] · T_g[ e^{2πi k̄·L_{g,μ}} ψ_{k̄,c}(α_g μ) ]
-
-    ``T_g`` is complex conjugation on antiunitary rows (``g >=
-    n_sym_spatial``) and the identity otherwise; ``U_g`` is the spinor
-    representation.  This is the action the loader's host unfold applies to
-    every child row and the one :func:`unfold_operator_local` applies to
-    both endpoints of an operator; here it is applied to ONE wavefunction
-    endpoint, so a consumer that needs ψ itself at every k (a band-pair
-    weight that couples both band indices, which no one-particle Green
-    contraction reproduces) can stream children from the stored parents
-    without any full-k face ever being resident.
-
-    ``psi_parent_local`` is this rank's ``(n_parent, ...)`` slab of an
-    orbit-PACKED face: ``mu_axis`` names the centroid axis, ``spin_axis``
-    the spinor axis; every gather stays inside the slab because orbits never
-    cross a shard.  ``local_perm`` ``(n_rows, n_mu)`` are owner-local gather
-    offsets and ``L_table`` ``(n_rows, n_mu, 3)`` the lattice wraps, both
-    over the slab's own μ extent when ``mesh_axis`` is ``None`` (the
-    caller sliced them, e.g. as ``shard_map`` operands sharded on the same
-    axis as μ) or over the COMPLETE packed endpoint when ``mesh_axis`` names
-    the mesh axis μ is sharded on (sliced here by ``axis_index``).
-    ``irr_idx``/``sym_idx`` are ``(n_full,)``, ``k_irr_frac`` ``(n_parent,
-    3)``; ``spin_action_full`` is ``(n_full, ns, ns)`` -- the spinor matrix
-    of EACH FULL-k ROW (the plan's table, ``sym.spinor_action(sym_idx)``),
-    not a per-operation table.  Returns ``(n_full, ...)`` in the same axis
-    order.
-    """
+    """Children ψ_{gk̄} from raw parents on one μ-local slab, by the typed action; see docs/architecture/symmetry_register.md."""
     x = jnp.asarray(psi_parent_local)
     ndim = int(x.ndim)
     mu_axis = int(mu_axis) % ndim
@@ -1130,16 +815,7 @@ def unfold_wavefunction_local(
 
 
 def open_spin_block_coefficient(spin_action_full, a: int, b: int):
-    """``coef[k, c, d] = U_k[a, c]·conj(U_k[b, d])``: one output spin block.
-
-    The ``(a, b)`` block of the canonical spin action ``U O U†`` in
-    :func:`_rotate_open_spin_centroid_operator` is
-    ``sum_{c,d} coef[k, c, d] O[k, c, :, d, :]``.  A consumer that can hold
-    only one full-k output block at a time — the rectangular pair projector
-    of the ζ fit — accumulates that sum from its small parent blocks instead
-    of materializing the whole rotated operator.  The coefficient is the
-    spin representation and lives here so no consumer restates it.
-    """
+    """``coef[k, c, d] = U_k[a, c]·conj(U_k[b, d])``: one output spin block; see docs/architecture/symmetry_register.md."""
     U = jnp.asarray(spin_action_full)
     return U[:, int(a), :, None] * jnp.conj(U[:, int(b), None, :])
 
@@ -1151,14 +827,7 @@ def _get_unfold_isdf_operator_jit(
     right_local_perm_arr=None,
     trs_rule="conj",
 ):
-    """Cache the inner ``_do_unfold`` jit by (shape, sym table content).
-
-    V_q and W_q with the same sym / centroid configuration share the
-    same compiled HLO (cache hit on bytes-hash of the tables).  The
-    tables are baked into the jit closure as constants — runtime-arg
-    form was ~2× slower per call than closure-baked due to
-    per-invocation argument marshalling.
-    """
+    """Cache the inner ``_do_unfold`` jit by (shape, sym table content); see docs/architecture/symmetry_register.md."""
     key = (
         V_q_shape,
         fwd_perm_arr.shape, fwd_perm_arr.tobytes(),
@@ -1493,78 +1162,7 @@ def unfold_isdf_one_leg(
     component_action,
     source_component=None,
 ):
-    r"""Transport one ISDF Fourier leg from the q-IBZ to the full q grid.
-
-    This is the one-leg companion to :func:`unfold_isdf_operator`.  It
-    normally consumes the stored q-IBZ G-sphere rather than an
-    already-selected ``G=0`` column, because under a star operation the
-    full-zone literal ``G=0`` coefficient can come from a *nonzero* parent
-    Miller vector::
-
-        q_full = S_full (q_parent + G_parent).
-
-    For target centroid ``mu`` the scalar action is
-
-    .. math::
-
-       z_{q,\mu}(0) = e^{-i(S K_p)\cdot t_s}
-                       e^{-2\pi i q_p\cdot L_{s\mu}}
-                       z_{p,\alpha_s(\mu)}(G_p),
-
-    followed by conjugation of the complete spatial result on an
-    antiunitary row.  ``alpha`` is the *source* map returned by
-    :func:`centroid_source_map_and_wrap`; it is used directly, never
-    inverted.  ``t_s`` is raw BGW ``tnp = 2*pi*tau``.  The tau factor is
-    formed with the spatial row and conjugated with the rest of the result
-    under time reversal, matching :func:`unfold_psi`.
-
-    ``component_action='scalar'`` returns that scalar leg.  The ``'polar'``
-    action streams one source Cartesian component through the canonical
-    polar, time-odd :meth:`SymMaps.cartesian_action`.  Summing the three
-    source components gives the full vector action while only one large zeta
-    slab is resident.
-
-    ``sym_idx`` is deliberately explicit: callers must pass the measured
-    :class:`QgridTrsPolicy`'s ``unfold_sym_idx``.  This function never falls
-    back to ``sym.sym_idx_q`` and therefore cannot take a second opinion on
-    which antiunitary rows are legal.
-
-    Parameters
-    ----------
-    zeta_ibz
-        ``(n_q_ibz, n_mu, ngkmax)`` complex, sharded
-        ``P(None, ('x','y'), None)``.
-    gvec_components
-        ``(n_q_ibz, 3, ngkmax)`` integer Miller vectors for ``zeta_ibz``.
-        Required for the rank-3 literal-G=0 form.
-    source_gvec_components
-        Optional ``(n_q_ibz,3)`` source Miller vector when ``zeta_ibz`` is
-        an already-selected rank-2 one-leg carrier.  This is used by the
-        tied Coulomb-head columns: the service still owns every symmetry
-        action and tau phase, while the producer owns which physical source
-        column it selected.  Exactly one of this and ``gvec_components`` is
-        used, selected by the rank of ``zeta_ibz``.
-    sym
-        :class:`SymMaps`; owns the q/star maps, reciprocal actions,
-        translations and Cartesian rotations.
-    sym_idx
-        ``(n_q_full,)`` rows from ``QgridTrsPolicy.unfold_sym_idx``.
-    sym_perm, L_table, q_irr_frac, kgrid
-        The same centroid source-map, lattice-wrap and parent-q tables used
-        by :func:`unfold_isdf_operator`; ``kgrid`` is explicit rather than
-        invented as state on :class:`SymMaps`.
-    component_action
-        ``'scalar'`` or ``'polar'``.
-    source_component
-        Required for ``'polar'``; source Cartesian component in ``0..2``.
-
-    Returns
-    -------
-    jax.Array
-        Scalar: ``(n_q_full, n_mu)`` under ``P(None,'x')``.  Polar source
-        contribution: ``(3, n_q_full, n_mu)`` under
-        ``P(None,None,'x')``.
-    """
+    """Transport one ISDF Fourier leg from the q-IBZ to the full q grid; see docs/architecture/symmetry_register.md."""
     action = str(component_action).strip().lower()
     if action not in ("scalar", "polar"):
         raise ValueError(
@@ -1769,14 +1367,7 @@ _UNFOLD_ISDF_ONE_LEG_JIT_CACHE: dict = {}
 def _get_unfold_isdf_one_leg_jit(
     *, zeta_shape, idx, rows, perm, trs, preselected, action, mesh_xy,
 ):
-    """Content-keyed one-leg action shared by all streamed source legs.
-
-    Source G slots and tau phases are runtime operands on purpose: tied head
-    columns differ only in those tables and must not create a separate
-    compiled module per column.  The q/L tables are runtime operands for the
-    same cache reason; their large ``(nq,nmu)`` phase is formed only inside
-    this executable at its final sharding.
-    """
+    """Content-keyed one-leg action shared by all streamed source legs; see docs/architecture/symmetry_register.md."""
     key = (
         tuple(zeta_shape), idx.tobytes(), rows.tobytes(),
         perm.shape, perm.tobytes(), trs.tobytes(), bool(preselected),
@@ -1926,25 +1517,7 @@ def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_tran, *,
 
 
 def apply_spinor_rotation(U, coeff_last):
-    """Apply a scalar or Pauli-spinor rotation without a general GEMM.
-
-    ``spinor_rotation_for_sym_row`` owns the physical matrix; this function
-    owns its application to wavefunction coefficients.  ``U`` has shape
-    ``(..., a, c)`` and ``coeff_last`` has shape ``(..., c)``.  Their leading
-    dimensions follow ordinary broadcasting, so a caller normalizes its own
-    physical layout once and this service sees only the spinor-last algebra.
-
-    The spinor extent is static and must be one or two.  Writing the Pauli
-    case as two explicit two-term multiply-adds is deliberate: lowering the
-    old ``einsum`` as a general K=2 cuBLAS GEMM made the production PHDF5
-    unfold shape un-compilable under XLA's sharding autotuner.  This spelling
-    is the exact same linear action without asking a matrix-multiply backend
-    to choose a GEMM algorithm for a fixed two-component representation.
-
-    NumPy inputs return a NumPy array; JAX arrays/tracers remain in JAX.  This
-    keeps the eager host unfold host-only while giving the collective loader
-    the same semantic owner inside ``jit``/``shard_map``.
-    """
+    """Apply a scalar or Pauli-spinor rotation without a general GEMM; see docs/architecture/symmetry_register.md."""
     u_shape = np.shape(U)
     coeff_shape = np.shape(coeff_last)
     if len(u_shape) < 2 or len(coeff_shape) < 1:
@@ -1976,32 +1549,7 @@ def apply_spinor_rotation(U, coeff_last):
 
 
 def tau_phase_row(sym_mat_k, tau, g_kbar):
-    """τ-phase ``exp(-i (S·K_parent)·τ)`` for reciprocal carriers.
-
-    Single source of the reciprocal-space translation phase shared by
-    :func:`unfold_psi` and :func:`unfold_isdf_one_leg`.
-    ``sym_mat_k`` is the TRS-augmented sym matrix ``sym_mats_k[sym_idx]`` —
-    for TRS rows it already carries the ``-S`` sign, so the same formula
-    yields ``exp(+i (S·G_kbar)·τ) = conj(spatial-phase)`` automatically.
-
-    Returns ``None`` when ``τ ≈ 0`` (the phase is identically 1 and callers
-    skip the multiply), matching both the host and device table builds.
-
-    Parameters
-    ----------
-    sym_mat_k : (3, 3) int
-        ``sym_mats_k[sym_idx]`` (TRS-augmented; carries the ±S sign).
-    tau : (3,) float
-        Spatial fractional translation ``translations[sym_idx % n_tran]``.
-    g_kbar : (ncarrier, 3) int or float
-        Parent reciprocal-coordinate carriers.  Wavefunction unfolding passes
-        its integer G list; an ISDF one-leg action passes q+G.
-
-    Returns
-    -------
-    (ngk,) complex or None
-        The per-G phase, or ``None`` when ``τ`` is (numerically) zero.
-    """
+    """τ-phase ``exp(-i (S·K_parent)·τ)`` for reciprocal carriers; see docs/architecture/symmetry_register.md."""
     tau = np.asarray(tau, dtype=np.float64)
     if not np.any(np.abs(tau) > 1e-12):
         return None
@@ -2011,13 +1559,7 @@ def tau_phase_row(sym_mat_k, tau, g_kbar):
 
 
 def tau_phase_row_jax(sym_mat_k, tau, g_kbar):
-    """Device form of :func:`tau_phase_row`, including the identity case.
-
-    This owns the same ``exp(-i (S G) . tau)`` convention but is intended
-    for fusion into a larger JAX action.  Unlike the host helper it returns
-    an explicit all-one row at zero translation; avoiding that allocation is
-    then the compiler's job, not a Python branch on traced data.
-    """
+    """Device form of :func:`tau_phase_row`, including the identity case; see docs/architecture/symmetry_register.md."""
     S = jnp.asarray(sym_mat_k, dtype=jnp.int32)
     tau_j = jnp.asarray(tau, dtype=jnp.float64)
     g = jnp.asarray(g_kbar)
@@ -2030,12 +1572,7 @@ def tau_phase_row_jax(sym_mat_k, tau, g_kbar):
 
 
 def unfold_reciprocal_carriers(sym_mat_k, g_parent, umklapp):
-    """Map parent reciprocal carriers to one full-zone child.
-
-    Implements ``G_child = S G_parent - G_umklapp`` for NumPy or JAX
-    operands. This is the shared algebra used by the host G-table builder and
-    device-side parent/bispinor realization.
-    """
+    """Map parent reciprocal carriers to one full-zone child; see docs/architecture/symmetry_register.md."""
     is_jax = any(isinstance(value, (jax.Array, jax.core.Tracer)) for value in (
         sym_mat_k, g_parent, umklapp))
     xp = jnp if is_jax else np
@@ -2054,126 +1591,7 @@ def unfold_psi(
     translations,
     U_spinor_spatial,
 ):
-    """ψ at one full-BZ k from ψ at its IBZ representative ``kbar``.
-
-    Pure-numpy / host-side. Handles spatial AND TRS-augmented sym rows;
-    the bispinor TRS rule lives here (and ONLY here in PR3+).
-
-    Math:
-        For spatial sym (sym_idx < n_sym_spatial, op {S|τ}, S = sym_mats_k[sym_idx]):
-            ψ_full(G_rot) = exp(-i (S·G_kbar)·τ) · U_spinor(S) · ψ_kbar(G_kbar)
-            where G_rot = S·G_kbar + kg0 (umklapp; caller handles G_rot bookkeeping
-            via WfnLoader.gvecs and friends — this helper only computes the
-            spinor + phase factors).
-
-        For TRS-augmented sym (sym_idx ≥ n_sym_spatial, op T∘{S|τ}, T = iσ_y K):
-            ψ_full(G_rot) = (iσ_y · conj(U_spinor(S)))
-                            · exp(+i (S·G_kbar)·τ)
-                            · conj(ψ_kbar(G_kbar))
-        Equivalently: ψ_full = iσ_y · conj(spatial-form), per the per-element
-        derivation in ``reports/trs_sym_audit_2026-05-14/pr3_design.md``.
-
-        WHY THE G-LIST IS NEGATED, AND WHY THAT IS HALF OF THE RULE.
-        Θ = iσ_y K is ANTIUNITARY. Acting on ψ_nk(r) = Σ_G c(G) e^{i(k+G)·r}:
-
-            (Θψ_nk)(r) = iσ_y ψ*_nk(r) = Σ_G [iσ_y c*(G)] e^{−i(k+G)·r}
-                       = Σ_{G'} [iσ_y c*(−G')] e^{i(−k+G')·r}   (G' = −G)
-
-            ⇒  c_{Θ,−k}(G') = iσ_y · conj( c(−G') ).                    (★)
-
-        (★) has TWO halves: the spinor factor ``iσ_y·conj`` (applied HERE)
-        and the negation of the G list (applied by the CALLER, because
-        ``sym_mats_k[sym_idx] = −S`` for a TRS row, so
-        ``WfnLoader.gvecs(k='full_bz')`` emits ``−S·G_kbar − kg0``).
-        Applying one half without the other replaces ψ(r) by ψ*(−r) —
-        norm-, orthogonality- and ⟨T⟩-preserving, hence invisible to every
-        cheap check, and wrong by O(100 eV) in V_loc/V_NL. That is exactly
-        the scorecard §Q bug, and it is why the length guard below is a
-        hard raise rather than a warning: the ONLY thing that keeps the two
-        halves in step is ``len(sym_mats_k) == 2·len(U_spinor_spatial)``.
-
-        NON-SOC (ns = 1) IS A DIFFERENT REPRESENTATION, NOT A SPECIAL
-        CASE. A scalar wavefunction has no spinor index, so the spatial
-        rule loses its U:
-
-            ψ_full(G_rot) = exp(-i (S·G_kbar)·τ) · ψ_kbar(G_kbar)
-
-        and its time reversal is Θ = K — plain conjugation, Θ² = +1, no
-        Kramers pair to protect — so the TRS rule loses its iσ_y too:
-
-            ψ_full(G_rot) = exp(+i (S·G_kbar)·τ) · conj(ψ_kbar(G_kbar))
-
-        The G-LIST NEGATION half of (★) is unchanged: it follows from Θ
-        being antiunitary, which has nothing to do with spin. Only the
-        spinor half disappears. Both lines are what this function already
-        computes once ``spinor_rotation_for_sym_row`` is told ``ns = 1``
-        and hands back the 1×1 identity instead of a 2×2 — see the
-        service application below and that helper's own docstring for the
-        defect this replaced (registered 2026-08-08, fixed 2026-08-09).
-
-        Note that ns = 1 does NOT switch the TRS rows off. The automatic
-        DFT-reference check is deliberately 2c-only, so scalar decks retain
-        the historical permissive setting unless a caller supplies an
-        explicit ``trs_holds`` verdict. The ns=1 TRS branch above therefore
-        remains live code.
-
-        NON-SYMMORPHIC τ UNDER TRS. ``tau_phase_row`` is fed ``S_full``
-        (= −S on a TRS row), so ``exp(−i (−S·G)·τ) = exp(+i (S·G)·τ)`` —
-        the conjugate of the spatial phase — which is what (★) demands
-        since the whole spatial expression is conjugated. There is no
-        separate τ for TRS rows and none is needed; ``translations`` is
-        indexed by ``s_spatial``. Verified end-to-end on the genuinely
-        non-symmorphic ``si_cohsex_debug`` deck (tnp = π ⇒ τ_frac = 1/2).
-
-        INDEPENDENT MEASUREMENT. Whether TRS holds AT ALL for a given file
-        is no longer inferred from ``ntran``/k-weights: it is measured from
-        the two-component DFT reference by ``density_symmetry_check``.  The
-        check compares occupied density operators using raw partners,
-        spatial-only partners, or TRIM closure; it never accepts a state
-        generated by this antiunitary branch as evidence.
-
-        Implementation note: ``sym_mats_k[sym_idx]`` already encodes the
-        ±S sign (TRS rows are ``-S``). Computing
-        ``rotated = sym_mats_k[sym_idx] @ G_kbar`` and then
-        ``exp(-i rotated·τ)`` gives ``exp(+i S·G_kbar · τ)`` automatically
-        for TRS rows — no separate sign branch on the phase. Order:
-        apply phase AFTER conj on the TRS branch so the conj doesn't
-        invert the phase sign.
-
-    Parameters
-    ----------
-    cnk_kbar : (nb, ns, ngk) complex
-        IBZ ψ coefficients on the IBZ G-list. ``ns`` is the spinor axis;
-        ``ns = 1`` for non-SOC, ``ns = 2`` for SOC.  ``ns`` is read off THIS
-        array and handed to :func:`spinor_rotation_for_sym_row`, which is
-        what makes the ``ns = 1`` spinor factor a genuine 1×1 identity (see
-        NON-SOC in Math above) instead of a 2×2 broadcast against a size-1
-        axis.
-    sym_idx : int
-        Row in ``sym_mats_k`` (length ``2·n_sym_spatial``).
-    n_sym_spatial : int
-        Count of spatial-only sym ops (= wfn.ntran). TRS rows are
-        ``[n_sym_spatial, 2·n_sym_spatial)``.
-    g_kbar : (ngk, 3) int
-        IBZ G-list (ψ_kbar's G axis).
-    sym_mats_k : (2·n_sym_spatial, 3, 3) int
-        TRS-augmented sym matrices acting on k/q (and G).
-    translations : (n_sym_spatial, 3) float
-        BGW fractional translations τ_s. Length ``n_sym_spatial`` — TRS rows
-        do not have a separate τ; they reuse the spatial τ with the right sign
-        baked into the formula above.
-    U_spinor_spatial : (n_sym_spatial, 2, 2) complex
-        Spatial-only spinor rotation matrices. The TRS-row spinor is computed
-        inside this helper as ``iσ_y · conj(U_spinor_spatial[s])``.
-
-    Returns
-    -------
-    cnk_full : (nb, ns, ngk) complex
-        ψ at the full-BZ k, returned on the IBZ G-axis (i.e. cnk_full[b, σ, g]
-        corresponds to the G-vector ``sym_mats_k[sym_idx] @ g_kbar[g]`` in the
-        full-k basis). The caller's G-rebuild (``WfnLoader.gvecs``) and umklapp
-        handling are independent.
-    """
+    """ψ at one full-BZ k from ψ at its IBZ representative ``kbar``; see docs/architecture/symmetry_register.md."""
     sym_idx = int(sym_idx)
     # ``sym_mats_k`` always has length ``2 · n_sym_spatial`` — the spatial
     # half is followed by the TRS-augmented rows (-S).
@@ -2279,38 +1697,7 @@ class SymMaps:
         return view
 
     def __init__(self, wfn, *, allow_trs=None):
-        """
-        Initialize symmetry mappings for a given WFN file.
-        class variables:
-        - irr_idx_k[ik_full] = IBZ index in wfn.kpoints for each full-BZ k
-        - sym_idx_k[ik_full] = sym_mats_k row mapping wfn.kpoints[irr_idx_k[ik_full]] → unfolded_kpts[ik_full]
-        - irr_idx_q[iq_full] = IBZ index in q_irr_kgrid_int for each full-BZ q
-        - sym_idx_q[iq_full] = sym_mats_k row mapping q_irr_kgrid_int[irr_idx_q[iq_full]] → kvecs_asints[iq_full]
-        - q_irr_kgrid_int[i_irr] = IBZ q in integer kgrid coords (lex-min representatives)
-        - q_irr_full_idx[i_irr] = full-BZ row index where this IBZ q lives in kvecs_asints
-        U_spinor[sym_idx] is the spinor rotation matrix for the sym_idx-th symmetry operation.
-        The matrices are currently 2x2 Pauli-spinor rotations; upcoming work
-        will expand this to the 4-component formalism used in relativistic
-        treatments.
-        R_grid[sym_idx] is the corresponding list of symmetry operations in the WFN file
-        u_{n,Rk,a}(G) = U_spinor_{a,b} u_{n,k,b}(Rinv G)
-        
-        Args:
-            wfn: WFNReader instance
-            allow_trs: retired override.  It must be ``None``.  SymMaps takes
-                the required ``wfn.trs_holds`` verdict that ``WfnLoader``
-                obtains from the occupied two-component DFT subspaces
-                (``density_symmetry_check``); a caller cannot assert or
-                negate time reversal at this consumer.
-
-                When False, arbitrary global-TR partners are disabled.  An
-                authenticated QE schema may still authorize individual
-                antiunitary magnetic-space-group operations; without that
-                receipt the search conservatively keeps only the WFN
-                header's presumed-unitary half.  ``sym_mats_k`` always keeps
-                its ``2·ntran`` candidate layout because wavefunction and
-                nonsymmorphic-phase consumers key conjugation from the row.
-        """
+        """Initialize symmetry mappings for a given WFN file; see docs/architecture/symmetry_register.md."""
         self._initialize_symmetry_provenance(wfn, allow_trs)
         ntran = self._initialize_active_operations(wfn)
         if self._validate_identity_grid(wfn, ntran):
@@ -2848,32 +2235,7 @@ class SymMaps:
         return self._wrap_to_bz(np.stack([k.flatten() for k in kpts_mesh]).T)
 
     def create_kpoint_symmetry_map(self, wfn):
-        """The full-grid k-point list.
-
-        Returns ``full_kpoints`` — the uniform grid, wrapped to the BZ.
-
-        THE PARENT MAP THIS USED TO RETURN IS GONE (design decision 4,
-        2026-08-07).  It was a ``(n_k_full x 2*ntran x nrk)`` python triple
-        loop computing, by its OWN tie-break rule (lowest sym index that
-        maps ``k_full`` INTO the IBZ, plus a nearest-neighbour fallback),
-        the same k_full -> k_irr relationship that
-        :meth:`find_symmetry_ops_simple` computes a few lines later by the
-        SHIPPING rule (highest matching ``ikbar``, then lowest sym — the
-        register-don't-touch policy of survey §8.1).  3e002f2 recorded that
-        the two agreed on all four in-tree fixtures, which is exactly the
-        shape of a second source of truth waiting to drift.  It was
-        published as ``SymMaps.kpoint_map`` and read by nothing live: the
-        only readers in the tree are ``misc/archived_tests/
-        get_interp_vectors.py`` (:244, :249) and ``misc/archived_tests/
-        symtest.ipynb``, neither of which is collected, and the notebook
-        also prints a ``kpoint_map_ibz_ids`` that has not existed for
-        longer still.  The live tables come from ``find_symmetry_ops_simple``
-        and are pinned bit-for-bit on all four decks by
-        ``services/symmetry_maps/tests/test_symmetry_maps_deck_tables.py``.
-
-        The method is KEPT (it is the only place the uniform grid is built,
-        and it is public surface) rather than inlined.
-        """
+        """The full-grid k-point list; see docs/architecture/symmetry_register.md."""
         return self._generate_uniform_full_kpoints(wfn)
 
     def find_symmetry_ops_simple(self, wfn, kpoint_map, full_kpts):
@@ -3006,66 +2368,7 @@ class SymMaps:
 
     @staticmethod
     def syms_crystal_to_cartesian(wfn):
-        """Cartesian rotation matrix used as input to ``get_spinor_rotations``.
-
-        ``get_spinor_rotations`` runs Markley's quaternion algorithm and
-        requires ORTHOGONAL 3D rotation matrices. The matrix it consumes is
-        the cartesian image of LORRAX's ``mtrx`` (= ``sym_matrices``) — NOT
-        of ``mtrx.T`` (= ``sym_mats_k``), NOT of ``inv(mtrx)``.
-
-        Verified against nosym ground truth: U_spinor built from this
-        R_cart reproduces the nosym ψ within the degenerate-subspace
-        unitary gauge.
-
-        CAUTION FOR OTHER CONSUMERS.  Because ``mtrx`` is the inverse
-        real-space rotation while ``mtrx.T`` is what acts on k and G, this
-        matrix is the INVERSE of the Cartesian rotation that carries
-        k_irr to S·k_irr.  ``get_spinor_rotations`` is unaffected — its
-        quaternion extraction uses the transposed Shepperd form, so the two
-        inversions cancel — but anything rotating a Cartesian INDEX (a
-        dipole or any rank≥1 operator) must use the TRANSPOSE of this
-        matrix.  Using it untransposed leaves norms, hermiticity and traces
-        intact, so the error is invisible to the obvious checks.
-
-        Conjugation formula (column form, ``r_cart = avec.T @ r_frac`` where
-        ``avec[i, :]`` is the i-th real-space lattice vector):
-
-            R_cart = avec.T @ mtrx @ inv(avec.T)
-                   = inv(bvec) @ mtrx @ bvec
-                   (the two are algebraically equivalent given
-                   ``avec @ bvec.T = I``, hence ``inv(bvec) = avec.T``)
-
-        This is the LORRAX convention for the "rotation in cartesian" that
-        the rest of the codebase consumes: it matches the G-space action
-        ``G_full = mtrx.T @ G_irr = sym_mats_k @ G_irr`` (column form) by
-        the relation ``R_cart^{-T} = avec.T @ mtrx.T @ inv(avec.T) = G-side
-        cartesian rotation``. For orthogonal R, ``R^{-T} = R``, so the two
-        are inverses of each other but both orthogonal; the spinor SU(2)
-        Markley algorithm needs the one returned here (i.e. ``mtrx``, not
-        ``mtrx.T`` or ``inv(mtrx)``).
-
-        Output covers the full TRS-augmented sym table: rows ``[:ntran]`` are
-        the spatial cartesian rotations; rows ``[ntran:]`` are ``-R_spatial``
-        (matches the convention that ``sym_mats_k[ntran:] = -sym_mats_k[:ntran]``;
-        TRS does not change the spatial rotation, it only adds a complex-conj /
-        iσ_y factor handled separately in ``unfold_psi``).
-
-        History
-        -------
-        Pre-fix (2026-05-14) this used ``inv(bvec) @ sym_mats_k @ bvec``
-        — wrong because ``sym_mats_k = mtrx.T`` instead of ``mtrx``. The
-        two matrices ``mtrx.T`` and ``mtrx`` give different SU(2) (one is
-        the adjoint of the other for orthogonal R), so U_spinor was wrong
-        on every system but the error CANCELLED in Σ_X for involutive
-        groups (MoS2 σ_h: mtrx = mtrx.T) and for cubic groups whose mtrx
-        entries are integer-orthogonal in crystal coords. CrI3 P-3 (hex,
-        non-involutive C3/S6) gave |R Rᵀ-I|∞ ≈ 3.5 → 6 eV Σ_X failure;
-        Si Fd-3m (non-symmorphic) gave 160 eV failure via a different
-        Σ_X-level amplification of the same wrong U_spinor.
-
-        The original code's ``# NOT SURE IF THESE SHOULD BE SYM_MATS_K OR
-        SYM_MATS TODO`` was the smoking-gun comment. Answer: SYM_MATRICES.
-        """
+        """Cartesian rotation matrix used as input to ``get_spinor_rotations``; see docs/architecture/symmetry_register.md."""
         A_T = np.asarray(wfn.avec).T
         A_T_inv = np.linalg.inv(A_T)
         # Spatial-only mtrx (length ntran). TRS-augmented rows are -R_spatial
@@ -3080,14 +2383,7 @@ class SymMaps:
 
     @property
     def q_irr_is_full_identity(self):
-        """Whether the q-IBZ table is exactly the ordered full q table.
-
-        This is stronger than equality of the two q counts.  It proves that
-        every parent row is its own full-zone row, that the full-to-parent
-        map is identity, and that the stored integer q rows are byte/layout
-        equivalent to ``kvecs_asints``.  Storage/provenance consumers use
-        this named service fact rather than rebuilding q-table logic.
-        """
+        """Whether the q-IBZ table is exactly the ordered full q table; see docs/architecture/symmetry_register.md."""
         q_full = np.asarray(self.kvecs_asints, dtype=np.int32)
         n_q = int(q_full.shape[0])
         identity = np.arange(n_q, dtype=np.int32)
@@ -3100,12 +2396,7 @@ class SymMaps:
                 np.asarray(self.q_irr_kgrid_int, dtype=np.int32), q_full))
 
     def operation_rows(self, rows):
-        """Return reciprocal action, spatial translation and TR bit.
-
-        Rows use the one canonical ``[unitary, antiunitary]`` layout.  The
-        reciprocal matrix already contains the antiunitary minus; the
-        translation always belongs to the underlying spatial Seitz row.
-        """
+        """Return reciprocal action, spatial translation and TR bit; see docs/architecture/symmetry_register.md."""
         raw = np.asarray(rows)
         if (not np.issubdtype(raw.dtype, np.integer)
                 or np.any(raw < 0)):
@@ -3138,13 +2429,7 @@ class SymMaps:
             validate=validate)
 
     def cartesian_action(self, rows, *, axial, time_odd):
-        """Forward action for a typed Cartesian index.
-
-        ``axial`` selects ``det(R) R`` instead of the polar ``R``;
-        ``time_odd`` supplies the minus on antiunitary rows.  Antiunitary
-        complex conjugation is applied by the tensor action, not this real
-        representation table.
-        """
+        """Forward action for a typed Cartesian index; see docs/architecture/symmetry_register.md."""
         if not isinstance(axial, (bool, np.bool_)):
             raise TypeError("SymMaps.cartesian_action: axial must be bool.")
         if not isinstance(time_odd, (bool, np.bool_)):
@@ -3192,19 +2477,7 @@ class SymMaps:
 
     @staticmethod
     def get_spinor_rotations(wfn, sym_matrices_cart):
-        """
-        Converts a list of rotation matrices to their spinor representations using Markley's modification
-        of Shepperd's algorithm (aka quaternion representation, see Brad Barker's dissertation).
-
-        When the wavefunction files store four-component states these routines will
-        compute the corresponding 4x4 spinor rotation matrices.
-        
-        Parameters:
-        sym_matrices (numpy.ndarray): Array of 3x3 rotation matrices with shape (nsym, 3, 3)
-
-        Returns:
-        numpy.ndarray: Array of spinor matrices with shape (nsym, 2, 2) of complex type
-        """
+        """Converts a list of rotation matrices to their spinor representations using Markley's modification of Shepperd's algorithm (aka quaternion representation, see Brad Barker's dissertation); see docs/architecture/symmetry_register.md."""
         nsym = len(sym_matrices_cart)
         spinor_matrices = np.zeros((nsym, 2, 2), dtype=complex)
         
@@ -3278,16 +2551,7 @@ class SymMaps:
         return spinor_matrices
 
     def get_kminusq_map(self, wfn, full_kpts):
-        """Create mapping between k and k-q points in the full k-point grid.
-        
-        Args:
-            wfn: WFNReader instance
-            full_kpts: Array of all k-points in the full grid
-            
-        Returns:
-            numpy.ndarray: kq_map[ik,iq] = index of k-q in full k-point grid,
-                          where ik is index in full grid, iq is index in reduced grid
-        """
+        """Create mapping between k and k-q points in the full k-point grid; see docs/architecture/symmetry_register.md."""
         return self._get_kminusq_index_map(
             full_kpts, np.asarray(wfn.kpoints), name="reduced q grid")
 
@@ -3298,15 +2562,7 @@ class SymMaps:
 
     @staticmethod
     def _get_kminusq_index_map(full_kpts, qpts, *, name):
-        """Map ``k-q`` to the periodic full-grid row in O(Nk*Nq).
-
-        The old implementation performed a nearest-point search over the
-        complete k grid for every pair, making the full map O(Nk**3) in
-        Python.  Uniform-grid coordinates are exact modulo a reciprocal
-        lattice vector, so a quantized periodic-coordinate lookup gives the
-        same row directly.  The quantization is much tighter than the
-        historical 1e-4 acceptance tolerance.
-        """
+        """Map ``k-q`` to the periodic full-grid row in O(Nk*Nq); see docs/architecture/symmetry_register.md."""
         full = np.asarray(full_kpts, dtype=np.float64)
         qarr = np.asarray(qpts, dtype=np.float64)
         if full.ndim != 2 or full.shape[1] != 3:
@@ -3354,13 +2610,7 @@ class SymMaps:
         return flat_map.reshape(target_keys.shape[:2])
     
     def get_umklapp_vector(self, wfn, nk, sym_idx, kbar_idx, sym_krep):
-        """Return BGW's kg0 for the selected full-zone k-point.
-
-        BGW defines the integer umklapp vector kg0 through
-            k_full = S k_irred + kg0 .
-        We use the same convention here so that the associated
-        non-symmorphic phase matches Common/gmap.f90.
-        """
+        """Return BGW's kg0 for the selected full-zone k-point; see docs/architecture/symmetry_register.md."""
         if sym_idx >= len(self.sym_matrices):
             q_full = np.asarray(sym_krep @ wfn.kpoints[kbar_idx], dtype=np.float64)
             q_inzone = q_full % 1.0
@@ -3379,15 +2629,7 @@ class SymMaps:
         return kg0
 
     def find_qpoint_index(self, q_ext, tol=1e-6):
-        """Find a periodic q-point in the canonical full-grid row table.
-
-        Args:
-            q_ext: Vector of length 3 (crystal coordinates)
-            tol: Tolerance for floating point comparison
-
-        Returns:
-            Index of matching q-point, or raises ValueError if not found
-        """
+        """Find a periodic q-point in the canonical full-grid row table; see docs/architecture/symmetry_register.md."""
         q = np.asarray(q_ext, dtype=np.float64)
         tolerance = float(tol)
         if q.shape != (3,) or not np.all(np.isfinite(q)):
@@ -3499,25 +2741,12 @@ def _cached_star_jit(key, build):
 
 
 def _jit_with(fn, out_sh):
-    """``jax.jit(fn)``, pinning the output sharding only when there is one.
-
-    In jax 0.9 ``out_shardings=None`` is not the same as omitting the
-    argument (``pjit._parse_jit_arguments`` keeps ``None`` as a leaf,
-    distinct from ``UnspecifiedValue``), so the two cases are two calls.
-    """
+    """``jax.jit(fn)``, pinning the output sharding only when there is one; see docs/architecture/symmetry_register.md."""
     return jax.jit(fn) if out_sh is None else jax.jit(fn, out_shardings=out_sh)
 
 
 def _row_out_sharding(A):
-    """``A``'s own sharding, when a row gather cannot invalidate it.
-
-    A take along axis 0 leaves the trailing axes alone, so the operand's
-    spec is still valid for the result PROVIDED axis 0 is replicated — it
-    is for every SC operand (U and Σ are ``P(None, 'x', 'y')`` from
-    ``qsgw_density.band_rotation_spec``, E is ``P(None, None)``).  If axis
-    0 were mesh-sharded the new k extent need not divide that mesh axis,
-    so return None and leave the layout to GSPMD.
-    """
+    """``A``'s own sharding, when a row gather cannot invalidate it; see docs/architecture/symmetry_register.md."""
     sh = getattr(A, "sharding", None)
     if isinstance(sh, NamedSharding) and (
             len(sh.spec) == 0 or sh.spec[0] is None):
@@ -3526,13 +2755,7 @@ def _row_out_sharding(A):
 
 
 def _scalar_out_sharding(A):
-    """Replicated ``P()`` on ``A``'s mesh — for the spread's 2-vector.
-
-    Pinned rather than inferred so the result is fully replicated on every
-    rank: that is what makes the single ``np.asarray`` below legal at P>1,
-    since a partially-addressable array raises "spans non-addressable
-    devices".
-    """
+    """Replicated ``P()`` on ``A``'s mesh — for the spread's 2-vector; see docs/architecture/symmetry_register.md."""
     sh = getattr(A, "sharding", None)
     if isinstance(sh, NamedSharding):
         return NamedSharding(sh.mesh, P())
@@ -3540,19 +2763,7 @@ def _scalar_out_sharding(A):
 
 
 def _star_row_order(irr_idx_k):
-    """``(rows, labels)`` — the ONE IBZ row order both directions use.
-
-    ``rows[j]`` is the full-BZ row :func:`star_select` keeps for star
-    ``j`` — the FIRST occurrence of each star label, in full-BZ order —
-    and ``labels[j] = irr_idx_k[rows[j]]``.
-
-    The two directions agree only if first-occurrence order is ASCENDING
-    IN THE LABEL: :func:`star_select` orders rows by first occurrence,
-    :func:`star_broadcast` addresses ``A_irr`` by position in
-    ``np.unique(irr)``.  Checked here rather than assumed, because if it
-    failed ``broadcast`` would silently return a DIFFERENT star's matrix
-    at every affected k.
-    """
+    """``(rows, labels)`` — the ONE IBZ row order both directions use; see docs/architecture/symmetry_register.md."""
     irr = np.asarray(irr_idx_k)
     _, first = np.unique(irr, return_index=True)
     rows = np.sort(first).astype(np.int32)
@@ -3582,15 +2793,7 @@ def _take_rows(A, rows):
 
 
 def _broadcast_rows(A_irr, take, trs, *, transpose=False):
-    """``A_irr[take]`` with the antiunitary rule on the rows ``trs`` marks.
-
-    ``transpose=False``: conjugate (an observable's band matrix; the
-    historical rule).  ``transpose=True``: transpose the two band axes
-    without conjugating — the rule for a frequency-dependent operator whose
-    antiunitary image is its transpose (Green function, self-energy).  Both
-    are expressed through :func:`apply_band_matrix_symmetry`
-    (``antiunitary`` alone, or ``antiunitary`` with ``reverse``).
-    """
+    """``A_irr[take]`` with the antiunitary rule on the rows ``trs`` marks; see docs/architecture/symmetry_register.md."""
     trs_np = np.asarray(trs)
     if not isinstance(A_irr, jax.Array):
         out = np.asarray(A_irr)[take]
@@ -3624,25 +2827,7 @@ def _broadcast_rows(A_irr, take, trs, *, transpose=False):
 
 
 def _star_conj_flags(irr_idx_k, sym_idx_k, n_sym_spatial):
-    """``(ref_rows, conj)`` per full-BZ row: its star's reference row, and
-    whether the value there must be CONJUGATED to give this row's value.
-
-    THE REFERENCE IS A FULL-BZ ROW, NOT AN IBZ POINT.  Both directions of
-    the star map address the row :func:`star_select` keeps — the first
-    member of the star — and that row carries a ``sym_idx`` of its own,
-    which can itself be a time-reversal row.  Θ is antiunitary, so
-    ``O(−k) = conj(O(k))``; two rows that are both time-reversed images of
-    the same IBZ point are therefore related to each other WITHOUT a
-    conjugation, and a spatial row is related to a time-reversed reference
-    WITH one.  The predicate is the XOR of the two TRS flags.
-
-    Testing the member's flag alone — which these helpers used to do —
-    inverts the rule for every star whose first member is a time-reversal
-    row.  That costs nothing while every star begins on a spatial row, and
-    silently conjugates (or fails to conjugate) whole stars as soon as one
-    does not: the norm, hermiticity and the electron count all survive it,
-    and :func:`star_spread` is the only thing that sees it.
-    """
+    """``(ref_rows, conj)`` per full-BZ row: its star's reference row, and whether the value there must be CONJUGATED to give this row's value; see docs/architecture/symmetry_register.md."""
     irr = np.asarray(irr_idx_k)
     trs = np.asarray(sym_idx_k) >= int(n_sym_spatial)
     rows, labels = _star_row_order(irr)
@@ -3652,15 +2837,7 @@ def _star_conj_flags(irr_idx_k, sym_idx_k, n_sym_spatial):
 
 
 def _spread_tables(irr_idx_k, sym_idx_k, n_sym_spatial):
-    """``(members, refs, conj)`` — :func:`star_spread`'s comparison set.
-
-    ``members`` are the rows compared — every row after the first in its
-    star, so singleton stars are absent — ``refs[i]`` is the first row of
-    ``members[i]``'s star, and ``conj[i]`` says ``members[i]`` is
-    time-reversed relative to it.  Rows rather than a mask, so the device
-    kernel gathers only what it compares: ``2 · n_members`` tiles with
-    ``n_members = n_k − n_k_irr``, not ``2 · n_k``.
-    """
+    """``(members, refs, conj)`` — :func:`star_spread`'s comparison set; see docs/architecture/symmetry_register.md."""
     ref_all, conj_all = _star_conj_flags(irr_idx_k, sym_idx_k, n_sym_spatial)
     members = np.where(ref_all != np.arange(ref_all.shape[0]))[0].astype(
         np.int32)
@@ -3668,13 +2845,7 @@ def _spread_tables(irr_idx_k, sym_idx_k, n_sym_spatial):
 
 
 def _star_stats(A_full, members, refs, conj):
-    """``(worst, scale)``: the star residual and ``max|A|`` it is relative to.
-
-    Both reductions are in one compiled module, so a device operand costs
-    one 16-byte transfer rather than a full host readback per number.  The
-    only transient is the two ``n_members``-row gathers, which inherit the
-    operand's sharding.
-    """
+    """``(worst, scale)``: the star residual and ``max|A|`` it is relative to; see docs/architecture/symmetry_register.md."""
     n_mem = int(members.shape[0])
     if not isinstance(A_full, jax.Array):
         A = np.asarray(A_full)
@@ -3714,79 +2885,14 @@ def _star_stats(A_full, members, refs, conj):
 
 
 def star_select(A_full, irr_idx_k):
-    """The IBZ rows of a band-index quantity: ``A[k̄]`` for each IBZ k̄.
-
-    ``A_full`` is ``(n_k_full, ...)``; returns ``(n_k_irr, ...)`` plus the
-    star labels of those rows.  Pure index selection — the first
-    occurrence of each IBZ parent in ``irr_idx_k`` — so it is exact.  A
-    device operand is gathered on the device and keeps its sharding.
-    """
+    """The IBZ rows of a band-index quantity: ``A[k̄]`` for each IBZ k̄; see docs/architecture/symmetry_register.md."""
     rows, labels = _star_row_order(irr_idx_k)
     return _take_rows(A_full, rows), labels
 
 
 def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
                    irr_labels=None, *, trs_reference, trs_rule="conj"):
-    """Spread an IBZ band-index quantity over the full BZ.
-
-    ``trs_rule`` is what the antiunitary rows do to the operand: ``"conj"``
-    (the historical rule, an observable's band matrix) or ``"transpose"``
-    (the two band axes swapped without conjugation — a frequency-dependent
-    operator's band matrix; see :func:`unfold_file_wedge_band_operator`).
-
-    ``A_irr`` is ``(n_k_irr, ...)``; the result is ``(n_k_full, ...)``.
-    A gather plus a CONJUGATION on the rows a predicate selects.  A
-    device operand never leaves the device.
-
-    WHICH PREDICATE DEPENDS ON WHAT ``A_irr``'s ROWS ARE, and there are
-    two callers in this tree that answer differently.  Θ is antiunitary,
-    so the conjugation applies iff the member and the row its value is
-    COPIED FROM differ in TRS-ness — and that source row is not the same
-    object in the two cases:
-
-    ``trs_reference="star_row"`` (default) — ``A_irr`` is what
-        :func:`star_select` returned, so row ``j`` is a FULL-BZ row (the
-        first member of star ``j``) and carries a ``sym_idx`` of its own,
-        which can itself be a time-reversal row.  Predicate: the XOR of
-        the two TRS flags (:func:`_star_conj_flags`).
-
-    ``trs_reference="ibz_slab"`` — ``A_irr`` is the file's own IBZ slab,
-        read verbatim with NO symmetry operation applied, so its rows are
-        untransformed by construction and their TRS flag is identically
-        False.  Predicate: the member's OWN flag, ``sym_idx_k >=
-        n_sym_spatial``.  ``gw.kin_ion_io.broadcast_ibz_to_full_bz`` is
-        this case.
-
-    THE TWO COINCIDE ONLY WHILE EVERY STAR'S FIRST FULL-BZ ROW IS
-    SPATIAL, which is a property of the op-selection policy and not of
-    the physics.  MEASURED on ``tests/regression/cohsex_debug`` with the
-    shipping policy, where star label 2's first row carries sym_idx 12 =
-    ntran (a pure time reversal): the two predicates disagree on 6 of 9
-    k-points, and using the XOR on the IBZ slab conjugates ⟨m|V_H|n⟩'s
-    OFF-DIAGONALS on those rows — 183.61 eV against a V_H computed
-    independently at every full-BZ k, with the DIAGONAL left exactly
-    intact, so the electron count, hermiticity, the spectrum and every
-    diagonal observable survive it unchanged.
-
-    ``sym_idx_k`` and ``n_sym_spatial`` are REQUIRED, not optional with an
-    equality default: a caller that omitted them would get silently wrong
-    matrices on every TRS pair (measured 3.6e-01 relative, job 7889235),
-    and nothing downstream would notice.
-
-    ``trs_reference`` IS REQUIRED TOO, AND HAS NO DEFAULT.  It used to
-    default to ``"star_row"``, which is right for a ``star_select``
-    operand and wrong for a file slab — and the failure it produces is
-    the one nothing sees: 183.61 eV on the off-diagonals with the REAL
-    DIAGONAL EXACTLY INTACT, so the electron count, hermiticity, the
-    spectrum, the eqp.dat V_H column and the diagonal star-spread metric
-    all survive it.  A default is exactly the wrong shape for a choice
-    whose wrong branch is invisible to every cheap check, so there is
-    none: a caller that has not thought about which flavour its operand
-    is gets a ``TypeError`` at the call site instead of a plausible wrong
-    matrix.  ``KStarMap.broadcast`` does not take the argument because
-    its operand can only have come from :meth:`KStarMap.select`, which
-    fixes the answer to ``"star_row"`` by construction.
-    """
+    """Spread an IBZ band-index quantity over the full BZ; see docs/architecture/symmetry_register.md."""
     irr = np.asarray(irr_idx_k)
     sidx = np.asarray(sym_idx_k)
     # THE SAME ROW ORDER ``star_select`` USES, not ``np.unique``.  Deriving
@@ -3849,21 +2955,7 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
 # parameterisation is wrong, not that another name is needed.
 
 def star_tables_of(sym):
-    """``(irr_idx_k, sym_idx_k, n_sym_spatial)`` off a live ``SymMaps``.
-
-    ``n_sym_spatial`` is derived from ``sym_mats_k`` (always ``2·ntran``
-    in both SymMaps branches) rather than read from the WFN header,
-    because that is the derivation :func:`unfold_psi` uses to decide which
-    rows get conjugated when it BUILDS ψ(Sk).  Reading it from the header
-    instead lets the producer and the consumer of that convention drift.
-
-    PUBLIC because a WRITER needs it too, not only the unfolds below.  A
-    file that stores a wedge has to file the reconstruction tables beside
-    the arrays (``kin_ion.h5``'s ``irr_idx_k``/``sym_idx_k``, and now
-    ``qp_wfn_rotations.h5``'s), and the alternative to exporting this is
-    every writer re-spelling the ``// 2`` — which is precisely the
-    header-vs-``sym_mats_k`` drift the paragraph above exists to prevent.
-    """
+    """``(irr_idx_k, sym_idx_k, n_sym_spatial)`` off a live ``SymMaps``; see docs/architecture/symmetry_register.md."""
     return (np.asarray(sym.irr_idx_k, dtype=np.int32),
             np.asarray(sym.sym_idx_k, dtype=np.int32),
             int(np.asarray(sym.sym_mats_k).shape[0]) // 2)
@@ -3875,36 +2967,7 @@ _star_tables_of = star_tables_of
 
 
 def unfold_file_wedge_to_full_bz(sym, data):
-    """FILE wedge → full BZ.  ``(sym.nk_red, …)`` → ``(sym.nk_tot, …)``.
-
-    The wedge as the WFN stores it — ``wfn.kpoints``, the k-set every
-    ``.dat`` output is indexed by and what BerkeleyGW calls the IBZ.  Use
-    this for anything read off disk in that indexing: ``eqp{0,1}.dat``,
-    ``sigma_diag.dat``, a ``kin_ion.h5`` slab.
-
-    Takes the ``SymMaps`` itself, not index tables: the tables are the
-    service's business and a driver that holds one has already lost the
-    abstraction.
-
-    ``irr_labels`` IS THE WHOLE DIFFERENCE BETWEEN THE TWO WEDGES, and
-    omitting it is what made this function a different operation from the
-    production reader.  ``star_broadcast`` with no labels addresses
-    ``data`` by POSITION AMONG DISTINCT STAR LABELS — right for a star
-    wedge, and right here only while the WFN's k-set IS that wedge.  The
-    rows of a FILE wedge are ``wfn.kpoints`` rows, so the labels are the
-    identity and the gather must be ``data[irr_idx_k]`` — which is
-    exactly what ``src/file_io/kin_ion.py``'s
-    ``broadcast_ibz_to_full_bz`` passes.  MEASURED 2026-08-17 on a random
-    operand, this function against that one: ``gnppm_debug`` (nk_red 9,
-    orbits 5) 3.82e+00, ``bispinor_debug`` (9, 5) 5.18e+00,
-    ``cohsex_debug`` (4, 3) 3.91e+00, and exactly 0.0 on
-    ``si_cohsex_debug`` / ``si_bse_debug`` / ``hbn_cohsex_debug``, where
-    ``nk_red == n_orbits``.  That partition is precisely the one a
-    "31.05 / 12.44 / 8.04 Ry star-relation failure" was reported over —
-    a real measurement taken with a broken instrument.
-    :func:`unfold_star_wedge_to_full_bz` below is the one that WANTS the
-    derived labels, and it says so by not passing any.
-    """
+    """FILE wedge → full BZ; see docs/architecture/symmetry_register.md."""
     irr, sidx, nss = _star_tables_of(sym)
     n_rows = int(np.shape(data)[0])
     if n_rows != int(sym.nk_red):
@@ -3920,31 +2983,7 @@ def unfold_file_wedge_to_full_bz(sym, data):
 
 
 def unfold_file_wedge_band_operator(sym, data, *, trs_rule):
-    r"""FILE wedge → full BZ for the band matrix of a k-diagonal OPERATOR.
-
-    Same rows and gather as :func:`unfold_file_wedge_to_full_bz`; the
-    antiunitary rule is the caller's explicit choice, because the two
-    physically distinct cases give different matrices on time-reversed rows:
-
-    ``trs_rule="conj"``
-        An observable: ``<m,Θk|O|n,Θk> = conj(<m,k|O|n,k>)``.  What the
-        file-wedge unfold does by itself.
-    ``trs_rule="transpose"``
-        A frequency-dependent operator that transforms like the Green
-        function.  With ψ_{Θk} = Θψ_k, ``G_{Θk}(r,r') = G_k(r',r)`` at the
-        SAME complex frequency (the weight e^{-τE} is not conjugated —
-        ``unfold_isdf_operator``'s ``pair_transpose`` rule), and the
-        convolution Σ = Σ_q G_{k-q}·W_q inherits it because W obeys
-        reciprocity.  Then ``Σ_{Θk,mn} = Σ ψ*_{Θk,m} Σ_{Θk} ψ_{Θk,n} =
-        Σ_{k,nm}``: the band matrix is TRANSPOSED, not conjugated; on the
-        diagonal the two rules differ by the sign of Im Σ, i.e. by the
-        lifetime.  Hermitian operators (static Σ) satisfy both at once.
-
-    This is the broadcast the raw-parent Σ route uses after projecting
-    the full-k operator on the parents' own rows.  There is no default: a
-    caller that has not decided which object it holds gets a ``TypeError``
-    here rather than a plausible wrong matrix on the antiunitary rows.
-    """
+    """FILE wedge → full BZ for the band matrix of a k-diagonal OPERATOR; see docs/architecture/symmetry_register.md."""
     irr, sidx, nss = _star_tables_of(sym)
     n_rows = int(np.shape(data)[0])
     if n_rows != int(sym.nk_red):
@@ -3957,24 +2996,7 @@ def unfold_file_wedge_band_operator(sym, data, *, trs_rule):
 
 
 def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3):
-    """FILE-wedge polar band matrix → full BZ, on the input's backend.
-
-    This is the canonical route for a cheap same-k observable such as
-    ``<m k|v_i|n k>``.  The stored rows have no operation applied.  The
-    ordinary file-wedge unfold first gathers their band matrices and applies
-    antiunitary conjugation.  The target row's forward Cartesian action then
-    mixes the explicit polar-vector axis.  Its antiunitary half already
-    contains the time-odd minus sign, so no second velocity-parity rule is
-    accepted here.
-
-    Nonsymmorphic translation phases cancel between the equal-k bra and ket.
-    Quantities with distinct endpoints must instead use the directed-edge
-    service, whose endpoint sewing carries those phases.
-
-    ``data`` has shape ``(sym.nk_red, ..., 3, nb, nb)`` by default.  A NumPy
-    input stays on the host; a JAX input stays on device and keeps its band
-    sharding.
-    """
+    """FILE-wedge polar band matrix → full BZ, on the input's backend; see docs/architecture/symmetry_register.md."""
     out = unfold_file_wedge_to_full_bz(sym, data)
     sym_rows = np.asarray(sym.sym_idx_k, dtype=np.int32)
     rotations = np.asarray(sym.cartesian_action(
@@ -3997,87 +3019,25 @@ def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3):
 
 
 def reduce_full_bz_to_file_wedge(sym, data):
-    """full BZ → FILE wedge.  ``(sym.nk_tot, …)`` → ``(sym.nk_red, …)``.
-
-    Selects the rows that ARE ``wfn.kpoints`` — the k-set every ``.dat``
-    output is indexed by — so a writer can reduce without ever holding
-    ``kirr_fullids``.  Pure row selection: no conjugation, no symmetry
-    operation, nothing to get the wrong way round.
-
-    NOT THE EXACT INVERSE of :func:`unfold_file_wedge_to_full_bz`, and the
-    asymmetry is real rather than an oversight.  This keeps one row per
-    STORED k; the unfold rebuilds every full-BZ k from its ORBIT PARENT.
-    Where the WFN carries two k in the same orbit — ``cohsex_debug``, where
-    file wedge row 1 is the time-reverse of row 2 — the round trip
-    reduce→unfold replaces row 1's own stored values with ``conj`` of row
-    2's.  Self-consistent, and correct if the two really are TRS partners,
-    but it is not the identity and must not be assumed to be.
-
-    There is deliberately no ``reduce_full_bz_to_star_wedge``: that is
-    :func:`star_select`, which already exists and returns the labels the
-    star round trip needs.
-    """
+    """full BZ → FILE wedge; see docs/architecture/symmetry_register.md."""
     rows = np.asarray(sym.kirr_fullids, dtype=np.int32)
     return _take_rows(data, rows)
 
 
 def unfold_star_wedge_to_full_bz(sym, data):
-    """STAR wedge → full BZ.  ``(n_orbits, …)`` → ``(sym.nk_tot, …)``.
-
-    The wedge :func:`star_select` produces — one row per symmetry orbit,
-    each row a FULL-BZ row carrying a ``sym_idx`` of its own.  Use this
-    for the round trip ``unfold_star_wedge_to_full_bz(sym,
-    star_select(A_full, sym.irr_idx_k)[0])``, which is the identity.
-
-    NOT interchangeable with :func:`unfold_file_wedge_to_full_bz`: the two
-    wedges differ in LENGTH on two of the three committed decks, and
-    coincide on the third.
-    """
+    """STAR wedge → full BZ; see docs/architecture/symmetry_register.md."""
     irr, sidx, nss = _star_tables_of(sym)
     return star_broadcast(data, irr, sidx, nss, trs_reference="star_row")
 
 
 def star_spread(A_full, irr_idx_k, sym_idx_k, n_sym_spatial):
-    """max residual of ``A_full`` against its own star, by the right rule.
-
-    Compares each member to its star's first member — directly when the
-    two lie on the same side of time reversal, against the CONJUGATE when
-    they do not (:func:`_star_conj_flags`).  Zero up
-    to round-off iff the full-BZ basis really is the unfolded IBZ one and
-    the operator commutes with the symmetry.
-
-    Cheap, and the only thing that catches a gauge mismatch introduced
-    upstream: hermiticity, the norm and the electron count all survive
-    one.  Callers that also want the scale should use
-    :meth:`KStarMap.spread_rel`, which gets both from one reduction.
-    """
+    """max residual of ``A_full`` against its own star, by the right rule; see docs/architecture/symmetry_register.md."""
     return _star_stats(A_full, *_spread_tables(
         irr_idx_k, sym_idx_k, n_sym_spatial))[0]
 
 
 class KStarMap:
-    """IBZ ⇄ full BZ for BAND-INDEX quantities.  Pass one to the SC loop.
-
-    Bundles the three index arrays that always travel together
-    (``irr_idx_k``, ``sym_idx_k``, ``ntran``) so no call site can supply
-    two of the three — omitting ``sym_idx_k`` is the failure that returns
-    the wrong matrix on every time-reversed star and is invisible to
-    hermiticity, the norm and the electron count (job 7889235: 3.6e-01
-    relative).
-
-    :meth:`identity` is the no-reduction map, so a driver written against
-    this reads the same whether or not symmetry is in use, and the
-    symmetry-off path stays byte-identical rather than becoming a
-    separate branch.
-
-    See the module note above :func:`star_select` for WHY this is an index
-    map and not an unfold: the loader builds full-BZ ψ by unfolding in
-    G-space, so a band index is symmetry-inert.
-
-    The row tables are pure functions of ``irr_idx``/``sym_idx``, so they
-    are built once in ``__init__`` as host int arrays and the per-call
-    work is one gather.
-    """
+    """IBZ ⇄ full BZ for BAND-INDEX quantities; see docs/architecture/symmetry_register.md."""
 
     __slots__ = ("irr_idx", "sym_idx", "n_sym_spatial", "labels",
                  "_rows", "_take", "_conj_bcast", "_members", "_refs",
@@ -4132,11 +3092,7 @@ class KStarMap:
         return self.nk_irr == self.nk_full
 
     def select(self, A_full):
-        """``(n_k_full, …)`` → ``(n_k_irr, …)``.  Index selection.
-
-        A ``jax.Array`` stays on the device and keeps its sharding; a
-        numpy array stays on the host (``gw.scissor.k_star_weights``).
-        """
+        """``(n_k_full, …)`` → ``(n_k_irr, …)``; see docs/architecture/symmetry_register.md."""
         return _take_rows(A_full, self._rows)
 
     def broadcast(self, A_irr):
@@ -4145,23 +3101,12 @@ class KStarMap:
         return _broadcast_rows(A_irr, self._take, self._conj_bcast)
 
     def spread(self, A_full) -> float:
-        """Residual of ``A_full`` against its own stars; see :func:`star_spread`.
-
-        Σ is built on the full BZ and then selected to the IBZ, so this is
-        free evidence that the two k-sets agree — and the only check that
-        catches a gauge mismatch introduced upstream.
-        """
+        """Residual of ``A_full`` against its own stars; see :func:`star_spread`; see docs/architecture/symmetry_register.md."""
         return _star_stats(A_full, self._members, self._refs,
                            self._conj)[0]
 
     def spread_rel(self, A_full) -> float:
-        """:meth:`spread` divided by ``max|A_full|`` — what callers print.
-
-        One reduction and one 16-byte transfer for a device operand; the
-        two-call form (``spread`` then a separate ``max``) was two full
-        host readbacks.  The floor on the scale avoids a divide by zero;
-        on a zero operand the residual is zero too, so the ratio is 0.
-        """
+        """:meth:`spread` divided by ``max|A_full|`` — what callers print; see docs/architecture/symmetry_register.md."""
         worst, scale = _star_stats(A_full, self._members, self._refs,
                                    self._conj)
         return worst / max(scale, 1e-300)

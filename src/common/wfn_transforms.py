@@ -1,42 +1,4 @@
-"""Transforms from G-flat ψ to FFT-box / r-space / centroid / r-chunk.
-
-Composes with :class:`wfn_loader.WfnLoader`.  The loader returns
-``psi`` in G-flat layout ``(n_k, nb_padded, nspinor, ngkmax)`` c128 and a
-``g_index`` from :meth:`WfnLoader.box_index`; this module turns either
-pair into the downstream product the consumer actually needs (FFT box,
-r-space box, ψ at centroid indices, ψ on a flat-r slab).
-
-Why split this off
-------------------
-g_flat is ~6-11% of the FFT-box size; band-chunked GW loops that only
-need ψ at centroids should never materialise the full FFT box.  Keeping
-these as standalone composable functions (rather than methods on the
-loader) lets a fused-NUFFT variant land later without changing the
-loader API.
-
-Sharding contract
------------------
-Every transform **preserves the band-axis sharding** of its input ``psi``.
-The default sharding from ``WfnLoader.load`` is
-``P(None, ('x','y'), None, None)`` (band sharded across the 2-D mesh);
-outputs add inner axes as ``P(None, ('x','y'), None, None, None, None)``
-(FFT-box) or ``P(None, ('x','y'), None, None)`` (r-chunk / r-mu).  No
-cross-rank communication is required by any transform.
-
-Replicated ``psi`` (single-rank pytest, or callers passing
-``sharding=None`` to the loader) goes through a non-shard_map jit fast
-path so the transforms work on a laptop without a mesh.
-
-Public API
-----------
-* :func:`to_box`   — G-flat → FFT-box  ``(n_k, nb, ns, nx, ny, nz)``
-* :func:`to_rbox`  — G-flat → r-space FFT-box  (= IFFT(to_box))
-* :func:`to_rmu`   — G-flat → ψ at centroid indices ``(n_k, nb, ns, n_rmu)``
-* :func:`to_rchunk` — G-flat → ψ on flat-r slab ``(n_k, nb, ns, r_len)``
-
-All four use the same gather kernel internally; the variants differ only
-in what happens after the IFFT.
-"""
+"""Transforms from G-flat ψ to FFT-box / r-space / centroid / r-chunk; see docs/architecture/zeta_fit_face_psi_cct.md."""
 from __future__ import annotations
 
 import gc
@@ -140,25 +102,7 @@ _GINDEX_DEV_BY_ID: dict = {}
 
 
 def _cached_gindex_dev(g_arr) -> "jax.Array":
-    """Cache the ``jnp.asarray(g_arr, dtype=jnp.int32)`` REPLICATED
-    device buffer by content hash.  See ``_GINDEX_DEV_CACHE`` comment.
-
-    Accepts either numpy ``np.ndarray`` or ``jax.Array``; if already a
-    jax.Array with int32 dtype the call is a no-op pass-through (see
-    ``jnp.asarray``'s identity contract).  Callers that pass a numpy
-    array end up sharing the device buffer across every cache_key
-    variant that has the same g_index bytes — the typical case for
-    centroid-load + ζ-fit + V_q in a single GW run.
-
-    **Round 6 canonical-accessor path:** when the caller has access
-    to ``WfnLoader.box_index_dev(k, mesh)`` (the loader's cached
-    device-resident sphere index — the canonical buffer shared with
-    psi_G_store), passing that ``jax.Array`` here returns it
-    unchanged.  This collapses the multi-buffer steady state observed
-    in Round 5 (3 distinct ``(nk, nx, ny, nz) i32`` device buffers
-    with identical content but distinct underlying allocations) to a
-    single canonical buffer.
-    """
+    """Cache the ``jnp.asarray(g_arr, dtype=jnp.int32)`` REPLICATED device buffer by content hash; see docs/architecture/zeta_fit_face_psi_cct.md."""
     if isinstance(g_arr, jax.Array):
         # Already a device buffer.  ``jnp.asarray`` is identity when
         # dtype already matches; explicit short-circuit makes the
@@ -196,38 +140,7 @@ def _cached_gindex_dev(g_arr) -> "jax.Array":
 
 
 def _resolve_gindex_dev(g_index):
-    """Return ``(g_index_dev_jax, cache_id)`` for either a numpy array
-    or a ``jax.Array`` g_index — without a device→host roundtrip
-    when the caller has the canonical buffer in hand.
-
-    Round-6 canonical-accessor helper for transform call sites such as
-    :func:`gflat_to_rmu` and :func:`accumulate_rchunk_to_gflat`.
-    Two-path logic:
-
-    * ``jax.Array`` input → assumed to be the canonical buffer (e.g.
-      ``WfnLoader.box_index_dev(k, mesh)``).  Returned unchanged;
-      ``cache_id`` uses ``id(g_index)``, stable across the process
-      lifetime for the canonical buffer.  ``cast`` to int32 only if
-      needed (no-op when dtype already matches).
-    * ``numpy.ndarray`` input → goes through :func:`_cached_gindex_dev`
-      (content-hash dedup → shared device buffer for matching bytes,
-      keyed in a private module dict).  ``cache_id`` uses the same
-      ``(hash, shape)`` tuple ``_cached_gindex_dev`` would derive.
-
-    The ``cache_id`` ends up in the ``_cached_jit`` key for the
-    closure-bake call sites so two unrelated g_index arrays of the
-    same shape don't share a compiled closure (which would silently
-    reuse stale baked-in indices).
-
-    Returns
-    -------
-    g_index_dev : jax.Array
-        Device-resident int32 (nk, nx, ny, nz) (or other) — the
-        canonical buffer if input was already a jax.Array, else the
-        ``_cached_gindex_dev`` result.
-    cache_id : Hashable
-        Identity tag suitable for use in a ``_cached_jit`` key.
-    """
+    """Return ``(g_index_dev_jax, cache_id)`` for either a numpy array or a ``jax.Array`` g_index — without a device→host roundtrip when the caller has the canonical buffer in hand; see docs/architecture/zeta_fit_face_psi_cct.md."""
     if isinstance(g_index, jax.Array):
         if g_index.dtype != jnp.int32:
             # Edge case: caller's canonical buffer is non-int32.  Cast
@@ -259,14 +172,7 @@ def _resolve_gindex_dev(g_index):
 # masking.
 
 def _box_kernel(psi: jax.Array, g_index: jax.Array, *, ngkmax: int) -> jax.Array:
-    """psi: (n_k, nb, ns, ngkmax) c128 — band-sharded acceptable.
-    g_index: (n_k, nx, ny, nz) int32 replicated.
-    Returns (n_k, nb, ns, nx, ny, nz) c128 with band sharding preserved.
-
-    Pure jax — no shard_map.  Sharding propagates by XLA's normal rules:
-    the gather is over the G-axis (axis 3 of psi after the reshape +
-    transpose dance), no cross-rank op required.
-    """
+    """psi: (n_k, nb, ns, ngkmax) c128 — band-sharded acceptable; see docs/architecture/zeta_fit_face_psi_cct.md."""
     n_k, nb, ns, _ = psi.shape
     k_stride = ngkmax + 1
     # Append a zero slot on the G-axis so sentinel index `ngkmax`
@@ -296,14 +202,7 @@ def _box_kernel(psi: jax.Array, g_index: jax.Array, *, ngkmax: int) -> jax.Array
 # ---------------------------------------------------------------------------
 
 def _spec_of(psi: jax.Array) -> tuple:
-    """Partition spec for ``psi``, always of length ``psi.ndim``.
-
-    Returns ``psi.sharding.spec`` padded with trailing ``None`` if
-    JAX's ``PartitionSpec`` trimmed them off, else an all-None tuple
-    (fully replicated) for inputs without a ``NamedSharding`` —
-    e.g. single-device test arrays whose default sharding is
-    ``SingleDeviceSharding``.
-    """
+    """Partition spec for ``psi``, always of length ``psi.ndim``; see docs/architecture/zeta_fit_face_psi_cct.md."""
     sh = getattr(psi, "sharding", None)
     if isinstance(sh, NamedSharding):
         spec = tuple(sh.spec)
@@ -339,14 +238,7 @@ def _maybe_constrain(arr: jax.Array, sharding: NamedSharding) -> jax.Array:
 # resharding; every FFT in this module goes through ``_local_box_fft``.
 
 def _local_box_fft(psi: jax.Array, mesh: Mesh, *, kind: str, norm: str):
-    """Sharded local FFT for the box ``psi.shape[:-1] + (nx, ny, nz)``.
-
-    Returns a callable ``f(box) -> (i)fftn(box, axes=(-3, -2, -1))`` whose
-    output sharding preserves psi's leading layout with the three FFT
-    axes replicated.  ``kind`` is ``'fftn'`` or ``'ifftn'``.  The caller
-    is responsible for the mesh — pass a 1×1 trivial mesh for
-    single-device runs.
-    """
+    """Sharded local FFT for the box ``psi.shape[:-1] + (nx, ny, nz)``; see docs/architecture/zeta_fit_face_psi_cct.md."""
     from common.fft_helpers import (
         make_sharded_ifftn_3d, make_sharded_fftn_3d)
     spec = P(*_spec_of(psi)[:-1], None, None, None)
@@ -360,20 +252,7 @@ def _local_box_fft(psi: jax.Array, mesh: Mesh, *, kind: str, norm: str):
 # ---------------------------------------------------------------------------
 
 def _sharding_key(psi: jax.Array) -> tuple:
-    """Hashable signature of psi's sharding (mesh identity + spec).
-
-    Used as part of the jit-cache key for the public transforms so two
-    arrays with identical mesh + PartitionSpec hit the same compiled
-    XLA module, while a different mesh forces a fresh compile.
-
-    ``spec`` is normalized to ``psi.ndim`` length: JAX sometimes trims
-    trailing ``None`` entries on PartitionSpec (so ``P(None, ('x','y'))``
-    and ``P(None, ('x','y'), None)`` are semantically equal but compare
-    as different tuples).  Without the normalization the same kernel
-    recompiles each time JAX hands back a trimmed spec — 11 extra
-    ``_kernel`` compiles observed at MoS2 3×3 bispinor, adding ~7 s of
-    wall time before this fix.  ``_spec_of`` above already does the
-    same normalization for the in-body sharding derivation."""
+    """Hashable signature of psi's sharding (mesh identity + spec); see docs/architecture/zeta_fit_face_psi_cct.md."""
     return (id(getattr(getattr(psi, "sharding", None), "mesh", None)),
             _spec_of(psi))
 
@@ -396,12 +275,7 @@ def to_box(
     *,
     mesh: Mesh,
 ) -> jax.Array:
-    """Scatter G-flat ψ into the FFT box.
-
-    Sharding (band axis on ``('x','y')`` or replicated) is preserved.
-    ``g_index`` (output of :meth:`WfnLoader.box_index`) uses sentinel
-    ``ngkmax`` to flag empty FFT-box cells (zero on gather).
-    """
+    """Scatter G-flat ψ into the FFT box; see docs/architecture/zeta_fit_face_psi_cct.md."""
     ngkmax = int(psi.shape[-1])
     fft_grid_t = tuple(int(s) for s in fft_grid)
     out_sharding = _output_sharding(psi, mesh, n_extra_axes=3)
@@ -429,15 +303,7 @@ def to_rbox(
     norm: str = "backward",
     kvecs_frac: np.ndarray | jax.Array | None = None,
 ) -> jax.Array:
-    """Scatter ψ → FFT box → IFFT to r-space (+ optional Bloch phase).
-
-    ``norm`` is forwarded to :func:`jnp.fft.ifftn` (``'backward'`` =
-    ``1/N``; ``'ortho'`` = ``1/√N`` on both directions, used by the
-    centroid pivoted-Cholesky path).  ``kvecs_frac`` (n_k, 3) optionally
-    applies ``exp(+2πi k·r)`` after the IFFT (set to ``None`` for the
-    ``|ψ|²``-only path).  Output materialises the full FFT box; prefer
-    :func:`to_rmu`/:func:`to_rchunk` for centroid / slab consumers.
-    """
+    """Scatter ψ → FFT box → IFFT to r-space (+ optional Bloch phase); see docs/architecture/zeta_fit_face_psi_cct.md."""
     ngkmax = int(psi.shape[-1])
     fft_grid_t = tuple(int(s) for s in fft_grid)
     kvecs_shape = (None if kvecs_frac is None
@@ -476,33 +342,7 @@ def from_rbox(
     norm: str = "backward",
     g_mask: np.ndarray | jax.Array | None = None,
 ) -> jax.Array:
-    """r-space FFT box → G-sphere.  The RETURN LEG of :func:`to_rbox`.
-
-    ``psi_r`` is ``(n_k, nb, ns, nx, ny, nz)``; the result is
-    ``(n_k, nb, ns, ngkmax)`` holding the coefficients at the ``ngkmax``
-    crystal G-vectors in ``gvecs`` ``(ngkmax, 3)``.  Band sharding is
-    preserved; the three FFT axes stay replicated.
-
-    WHY THIS EXISTS.  Every local-potential matrix element
-    ``⟨mk|V(r)|nk⟩`` is a round trip — ``to_rbox`` out, multiply by V(r),
-    and this function back — and until now only the outbound leg had a
-    sharded implementation.  ``psp.get_DFT_mtxels`` therefore hand-rolled
-    the return with a bare ``jnp.fft.fftn``, which is exactly what the
-    module comment above :func:`_local_box_fft` forbids: on a sharded
-    tensor XLA's planner is free to insert an all-gather and emit a
-    global FFT (the CrI3 6×6×1 80 Ry 121 GB OOM).  Routing the return leg
-    through ``_local_box_fft`` keeps the transform rank-local.
-
-    ``g_mask`` ``(ngkmax,)`` zeroes pad columns.  Fixed-shape G tables
-    (owner decision D10) pad every k to ``ngkmax`` with ``(0,0,0)`` rows,
-    i.e. Γ — which is a REAL G-vector, so an unmasked gather would fold
-    the Γ coefficient into every pad column instead of zero.  The mask is
-    mandatory whenever the table is padded, not a tidiness measure.
-
-    ``norm`` is forwarded to the FFT and must be the inverse convention
-    of the ``to_rbox`` call it undoes; the caller owns any additional
-    volume/grid scaling.
-    """
+    """r-space FFT box → G-sphere; see docs/architecture/zeta_fit_face_psi_cct.md."""
     gv = np.asarray(gvecs)
     if gv.ndim != 2 or gv.shape[1] != 3:
         raise ValueError(
@@ -557,12 +397,7 @@ def to_rmu(
     norm: str = "backward",
     kvecs_frac: np.ndarray | jax.Array | None = None,
 ) -> jax.Array:
-    """ψ in r-space at the centroid FFT-grid indices ``r_mu``.
-
-    ``r_mu`` is ``(n_rmu, 3)`` int32 (positions in ``[0, fft_grid[a])``);
-    other args as :func:`to_rbox`.  Output ``(n_k, nb, nspinor, n_rmu)``
-    with band-axis sharding preserved.
-    """
+    """ψ in r-space at the centroid FFT-grid indices ``r_mu``; see docs/architecture/zeta_fit_face_psi_cct.md."""
     ngkmax = int(psi.shape[-1])
     fft_grid_t = tuple(int(s) for s in fft_grid)
     n_rmu = int(np.shape(r_mu)[0])
@@ -608,54 +443,7 @@ def to_rchunk_inner(
     norm: str = "backward",
     kvecs_frac: jax.Array | None = None,
 ) -> jax.Array:
-    """Per-rank-local body of :func:`to_rchunk`: G-flat → FFT-box → IFFT
-    → r-slice → optional Bloch phase.
-
-    No ``shard_map`` wrapper.  Callable from inside another shard_map's
-    body or a ``lax.scan`` body — the caller is responsible for any
-    sharding context.  Inputs and outputs are all per-rank-local arrays.
-
-    Path D scaffolding (see
-    ``reports/zeta_rchunk_memory_model_2026-05-13/agent_2_structural_fix.md``
-    §4b).  Not yet wired into the production fit kernel — the consumer
-    refactor (§4c, rewrite of ``c_q_from_psi_sm`` / ``z_q_from_psi_sm``
-    with a ``lax.scan`` over bcs inside their shard_map bodies) is
-    deferred to a follow-up session.  This helper is checked in early
-    so it can be unit-tested independently.
-
-    Mathematically identical to the body of :func:`to_rchunk`; the only
-    difference is that this version does not enter a shard_map.
-
-    Inputs
-    ------
-    psi
-        Shape ``(..., ngkmax)`` c128 — caller's responsibility to have
-        already partitioned data across ranks if running under a
-        shard_map.  The leading axes must contain exactly 3 dims before
-        the trailing ``ngkmax`` so the post-IFFT reshape lands at
-        ``(..., n_rtot)`` — typically ``(nk_local, nb_local, ns,
-        ngkmax)``.
-    g_index
-        Shape ``(..., ngkmax)`` int32 — flat box indices for each
-        G-vector per k.  Same broadcast contract as :func:`to_rchunk`.
-    fft_grid
-        ``(nx, ny, nz)``.
-    r0
-        Python int or traced int32 scalar — flat-r start index.
-    r_len
-        Static int — width of the r slab.
-    norm
-        FFT normalization, same conventions as ``jnp.fft.ifftn``.
-    kvecs_frac
-        Optional ``(..., 3)`` float64 — when provided, the Bloch
-        phase ``exp(+2πi k·r)`` is applied on the sliced slab via
-        :func:`apply_bloch_phase_on_slice`.
-
-    Output
-    ------
-    jax.Array
-        Shape ``(..., r_len)`` c128.
-    """
+    """Per-rank-local body of :func:`to_rchunk`: G-flat → FFT-box → IFFT → r-slice → optional Bloch phase; see docs/architecture/zeta_fit_face_psi_cct.md."""
     ngkmax = int(psi.shape[-1])
     fft_grid_t = tuple(int(s) for s in fft_grid)
     nx, ny, nz = fft_grid_t
@@ -683,41 +471,7 @@ def to_rpoints_inner(
     norm: str = "backward",
     kvecs_frac: jax.Array | None = None,
 ) -> jax.Array:
-    """The arbitrary-point twin of :func:`to_rchunk_inner`.
-
-    Same body — G-flat → FFT-box → local IFFT → reshape to
-    ``(..., n_rtot)`` → optional Bloch phase — except that the r cells
-    kept are the arbitrary flat FFT indices ``r_flat_idx`` rather than a
-    contiguous run.  This is what an orbit-packed real-grid tile needs:
-    the points of one symmetry orbit are scattered through the flat r
-    index, so no ``dynamic_slice`` can name them.
-
-    Inputs
-    ------
-    psi
-        Shape ``(..., ngkmax)`` c128, with exactly 3 leading axes before
-        ``ngkmax`` — same contract as :func:`to_rchunk_inner`.
-    g_index
-        Shape ``(..., ngkmax)`` int32 flat box indices per k.
-    fft_grid
-        ``(nx, ny, nz)``.
-    r_flat_idx
-        ``(R,)`` int32, possibly traced — the flat-r cells to keep, in
-        any order.  Indices outside ``[0, n_rtot)`` are pad slots that
-        the CALLER masks to zero; this function only keeps the gathers
-        in bounds (it clips them, so those cells come back holding some
-        other cell's finite value, not garbage and not zero).
-    norm
-        FFT normalization, same conventions as ``jnp.fft.ifftn``.
-    kvecs_frac
-        Optional ``(..., 3)`` float64 — when given, the Bloch phase
-        ``exp(+2πi k·r)`` is applied via :func:`apply_bloch_phase_at`.
-
-    Output
-    ------
-    jax.Array
-        Shape ``(..., R)`` c128.
-    """
+    """The arbitrary-point twin of :func:`to_rchunk_inner`; see docs/architecture/zeta_fit_face_psi_cct.md."""
     ngkmax = int(psi.shape[-1])
     fft_grid_t = tuple(int(s) for s in fft_grid)
     nx, ny, nz = fft_grid_t
@@ -736,15 +490,7 @@ def to_rpoints_inner(
 
 
 def take_rchunk_padded(values: jax.Array, r0, r_len: int) -> jax.Array:
-    """Take a fixed-width flat-r slab, zero-filling beyond physical r.
-
-    ``lax.dynamic_slice`` clamps an out-of-bounds start backward.  That is
-    correct for its API but wrong for a mesh-padded final r carrier: asking
-    for ``[r0, r0 + r_len)`` must retain those exact logical cells and append
-    zeros, never substitute earlier physical cells.  The r axis is local and
-    replicated at both callers, so this bounded gather preserves their
-    existing low-memory sharding and allocates only the requested slab.
-    """
+    """Take a fixed-width flat-r slab, zero-filling beyond physical r; see docs/architecture/zeta_fit_face_psi_cct.md."""
     n_rtot = int(values.shape[-1])
     r_len_i = int(r_len)
     r0_arr = jnp.asarray(r0, dtype=jnp.int32)
@@ -785,23 +531,7 @@ def to_rchunk(
     kvecs_frac: np.ndarray | jax.Array | None = None,
     allow_padded_tail: bool = False,
 ) -> jax.Array:
-    """ψ in r-space on a contiguous flat-r slab ``[r0, r0 + r_len)``.
-
-    Flat-r convention: ``r_flat = rx * ny * nz + ry * nz + rz``.  ``r0``
-    may be a Python int (bounds-checked) or a traced scalar (caller's
-    responsibility).  ``allow_padded_tail=True`` permits only the upper end
-    of that interval to exceed the physical FFT box; the canonical
-    :func:`take_rchunk_padded` body fills those carrier cells with exact
-    zeros.  The caller remains responsible for deriving the carrier extent
-    through :mod:`runtime.padding`.
-
-    The full G-flat gather → FFT-box → IFFT → r-slice (→ Bloch phase)
-    pipeline runs inside one ``shard_map`` region.  Keeping it
-    inside the manual per-rank region prevents XLA SPMD from
-    reconstructing the full logical band axis between ``PsiGStore``'s
-    ``io_callback`` and the local FFT — verified to remove ~506 MiB
-    all-gathers from the HLO at MoS2 3×3 / 4×A100.
-    """
+    """ψ in r-space on a contiguous flat-r slab ``[r0, r0 + r_len)``; see docs/architecture/zeta_fit_face_psi_cct.md."""
     ngkmax = int(psi.shape[-1])
     fft_grid_t = tuple(int(s) for s in fft_grid)
     nx, ny, nz = fft_grid_t
@@ -889,27 +619,7 @@ def gflat_to_rchunk_aot_memory(
     norm: str,
     dtype=jnp.complex128,
 ) -> AotPeakBreakdown:
-    """AOT memory breakdown of the canonical full-Bloch WFN r-slab program.
-
-    This is the planning view of :func:`to_rchunk_inner`, not an FFT-box
-    proxy.  It compiles the same G-flat gather -> FFT box -> local IFFT ->
-    flat-r slice -> Bloch-phase program used inside
-    :class:`common.psi_G_store.PsiGStore`, with the production shardings and
-    carrier extents, then asks :mod:`runtime.aot_memory` for XLA's complete
-    buffer peak plus the cuFFT plan workspace.
-
-    ``PsiGStore`` obtains ``psi_G`` from an ``io_callback`` inside its
-    ``shard_map``.  Here that callback result is represented as a regular
-    argument of the identical local program.  The AOT service includes
-    argument bytes in ``total``, so the callback output remains priced while
-    avoiding a second WFN reader or transform implementation.
-
-    A standalone IFFT measurement is insufficient for this decision: its
-    argument represents an already-built FFT box and therefore cannot see the
-    gather buffer, retained r-slab, or Bloch-phase/output buffers surrounding
-    the FFT.  Those buffers were enough for a 32-band CrI3 carrier to pass the
-    old preflight and then fail its first real cuFFT workspace allocation.
-    """
+    """AOT memory breakdown of the canonical full-Bloch WFN r-slab program; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nk = int(nk)
     band_carrier = int(band_carrier)
     nspinor = int(nspinor)
@@ -1004,12 +714,7 @@ def gflat_to_rchunk_aot_peak_bytes(
     norm: str,
     dtype=jnp.complex128,
 ) -> int:
-    """Per-rank total peak HBM for the canonical WFN r-slab program.
-
-    Compatibility view of :func:`gflat_to_rchunk_aot_memory`.  Both APIs use
-    the same signature-keyed compiled-memory cache, so a planner that needs
-    the independently placeable cuFFT workspace does not compile twice.
-    """
+    """Per-rank total peak HBM for the canonical WFN r-slab program; see docs/architecture/zeta_fit_face_psi_cct.md."""
     return int(gflat_to_rchunk_aot_memory(
         mesh=mesh, nk=nk, band_carrier=band_carrier, nspinor=nspinor,
         ngkmax=ngkmax, fft_grid=fft_grid, r_carrier=r_carrier, norm=norm,
@@ -1042,47 +747,7 @@ def to_rmu_inner(
     norm: str = "backward",
     kvecs_frac: jax.Array | None = None,
 ) -> jax.Array:
-    """Per-rank-local body of :func:`to_rmu`: G-flat → FFT-box → IFFT
-    → centroid sample → optional Bloch phase.
-
-    No ``shard_map`` wrapper.  Callable from inside another shard_map's
-    body or a ``lax.scan`` body — the caller is responsible for any
-    sharding context.  Inputs and outputs are all per-rank-local arrays.
-
-    Mirror of :func:`to_rchunk_inner` for the centroid-sample direction.
-    Mathematically identical to the body of :func:`to_rmu`; the only
-    difference is that this version does not enter a shard_map.
-
-    Inputs
-    ------
-    psi
-        Shape ``(..., ngkmax)`` c128 — caller's responsibility to have
-        already partitioned data across ranks if running under a
-        shard_map.  Leading axes must contain exactly 3 dims before the
-        trailing ``ngkmax`` so the post-IFFT reshape lands at
-        ``(..., nx, ny, nz)`` — typically ``(nk_local, nb_local, ns,
-        ngkmax)``.
-    g_index
-        Shape ``(..., ngkmax)`` int32 — flat box indices for each
-        G-vector per k.  Same broadcast contract as :func:`to_rmu`.
-    fft_grid
-        ``(nx, ny, nz)``.
-    r_mu
-        Shape ``(n_rmu, 3)`` int32 — FFT-grid coordinates of the
-        centroid sample points.
-    norm
-        FFT normalization, same conventions as ``jnp.fft.ifftn``.
-    kvecs_frac
-        Optional ``(n_k, 3)`` float64 — when provided, the Bloch
-        phase ``exp(+2πi k·r)`` is applied to the full FFT box via
-        :func:`apply_bloch_phase` before the centroid gather (same as
-        :func:`to_rmu`'s body).
-
-    Output
-    ------
-    jax.Array
-        Shape ``(..., n_rmu)`` c128.
-    """
+    """Per-rank-local body of :func:`to_rmu`: G-flat → FFT-box → IFFT → centroid sample → optional Bloch phase; see docs/architecture/zeta_fit_face_psi_cct.md."""
     ngkmax = int(psi.shape[-1])
     fft_grid_t = tuple(int(s) for s in fft_grid)
     box = _box_kernel(psi, g_index, ngkmax=ngkmax)
@@ -1116,102 +781,7 @@ def gflat_to_rmu(
     norm: str = "backward",
     chunk_size: int | None = None,
 ) -> jax.Array:
-    """ψ(G-flat) → ψ at centroid grid points, fused over all (k, n).
-
-    Inverse-direction mirror of :func:`accumulate_rchunk_to_gflat`:
-    same scan-inside-shard_map scaffolding (XY-band/μ sharding,
-    flat-axis pad + scan in chunks of ``cs``, per-row body, truncate
-    output to N), differing only in (a) FFT direction — IFFT here,
-    FFT in the ζ writer; (b) phase site — post-gather separable
-    1D-Bloch here, pre-FFT phase-on-slab in the ζ writer; (c) gather
-    target — centroid grid cells here, G-sphere cells in the ζ writer.
-    Together they form the ψ↔ζ G-flat round-trip primitive.
-
-    Shapes / shardings (mesh = ``('x', 'y')`` of size ``P = p_x · p_y``)::
-
-        psi_G   : (nk, nb_total, ns, ngkmax)  P(None, ('x','y'), None, None)
-        return  : (nk, nb_total, ns, n_rmu)   P(None, ('x','y'), None, None)
-
-    ``nb_total`` must be divisible by ``mesh.size``.  Each rank owns a
-    ``nb_local = nb_total / P`` block of bands across the full
-    ``(nk, ns, ngkmax)`` extent and writes the same band block to the
-    output.
-
-    Algorithm — inside a single ``shard_map`` over ``('x','y')``:
-
-      1. Flatten per-rank ``(nk, nb_local) → N = nk · nb_local`` rows so
-         every row is a single ``(k, n)`` pair.
-      2. Zero-pad ``N → ⌈N / cs⌉ · cs`` so the chunk count is exact.
-      3. ``lax.scan`` over chunks of ``cs`` rows.  Each iteration:
-         a. ``k_row[cs] = (i·cs + arange(cs)) // nb_local`` —
-            which k each row belongs to.  Clipped to ``[0, nk)``;
-            padding rows land on k = nk - 1 but their data is zero
-            (zero-pad) so the centroid samples they produce are
-            zero and get truncated in ``out_flat[:N]``.
-         b. ``_box_kernel(sub[cs, 1, ns, ngkmax], g_index[k_row])``
-            scatters G-sphere coeffs into a per-row FFT box
-            ``(cs, 1, ns, nx, ny, nz)``.  Singleton ``nb`` axis is
-            squeezed.
-         c. ``jnp.fft.ifftn`` on the trailing 3 axes — per-rank-local
-            cuFFT, no resharding.
-         d. Gather centroid cells: ``rb[:, :, r_mu[:,0], r_mu[:,1],
-            r_mu[:,2]]`` → ``(cs, ns, n_rmu)``.
-         e. Optional per-row Bloch phase ``exp(+2πi k·r_mu)`` applied
-            on the *gathered cells only* (not on the full box) —
-            ``apply_bloch_phase``-equivalent under the gather, but
-            scratch drops from ``(cs · n_rtot)`` to ``(cs · n_rmu)``.
-         f. ``dynamic_update_slice_in_dim`` writes the row block into
-            ``out_flat`` at offset ``i·cs``.
-
-    Chunking is on the flat ``(k · n_local)`` axis so the chunk size
-    is a free integer — no divisibility constraint on either nk or
-    nb_local.  Defaults to one-shot (``cs = N``); the scan compiles to a
-    single iteration that XLA folds away.  Per-iteration FFT-box
-    transient is ``cs · ns · n_rtot · 16`` bytes — choose ``chunk_size``
-    to bound this against the per-rank HBM budget.
-
-    Parameters
-    ----------
-    psi_G
-        ``(nk, nb_total, ns, ngkmax)`` c128, band-flat-sharded.
-    g_index
-        ``(nk, nx, ny, nz)`` int32 — flat-FFT-box indices.  Sentinel
-        value ``ngkmax`` flags empty box cells (zero on gather).
-        Replicated.
-    r_mu
-        ``(n_rmu, 3)`` int32 — FFT-grid coordinates of the centroid
-        sample points.  Replicated.
-    mesh
-        Process mesh with named axes ``'x'`` and ``'y'``.
-    fft_grid
-        Static ``(nx, ny, nz)``.
-    kvecs_frac
-        Optional ``(nk, 3)`` fractional k-vectors.  When given, the
-        gathered samples are multiplied by ``exp(+2πi k·r_mu)`` per
-        ``(k, r_mu)`` pair (separable in x/y/z; pre-computed once per
-        k).  ``None`` skips the phase.
-    k_row_map
-        Optional ``(nk,)`` integer row selector.  Row ``k`` of ``psi_G``
-        then uses ``g_index[k_row_map[k]]`` and, when present,
-        ``kvecs_frac[k_row_map[k]]``.  The selector is a runtime operand so
-        every q row shares one executable and the loader's cached full
-        FFT-box table is never copied/reordered outside this owner.  The
-        default ``None`` preserves the historical row-aligned path.
-    norm
-        Forwarded to :func:`jnp.fft.ifftn`.  Defaults to ``"backward"``
-        to match the legacy :func:`to_rmu` default; centroid-load
-        callers typically pass ``"ortho"``.
-    chunk_size
-        Rows per scan iteration along the flat ``(k · n_local)``
-        axis.  Default ``None`` ⇒ one-shot.  Memory bound:
-        ``chunk_size · ns · n_rtot · 16 B`` for the per-iteration FFT
-        box.
-
-    Returns
-    -------
-    ``(nk, nb_total, ns, n_rmu)`` c128 with ``P(None, ('x','y'),
-    None, None)`` sharding.
-    """
+    """ψ(G-flat) → ψ at centroid grid points, fused over all (k, n); see docs/architecture/zeta_fit_face_psi_cct.md."""
     fft_grid_t = tuple(int(s) for s in fft_grid)
     nx, ny, nz = fft_grid_t
     n_rtot = nx * ny * nz
@@ -1514,102 +1084,7 @@ def accumulate_rchunk_to_gflat(
     chunk_size: int | None = None,
     r_indices: jax.Array | None = None,
 ) -> jax.Array:
-    """Add ``FFT(pad(phase(rchunk)))[sphere_idx]`` into ``gflat_acc``.
-
-    Inverse-direction mirror of :func:`gflat_to_rmu`: same
-    scan-inside-shard_map scaffolding (XY-band/μ sharding, flat-axis
-    pad + scan in chunks of ``cs``, per-row body, truncate output to
-    N), differing only in (a) FFT direction — FFT here, IFFT in the ψ
-    reader; (b) phase site — pre-FFT phase-on-slab here, post-gather
-    separable 1D-Bloch in the ψ reader; (c) gather target — G-sphere
-    cells here, centroid grid cells in the ψ reader.  Together they
-    form the ψ↔ζ G-flat round-trip primitive — the user-spec mandate
-    that "ζ and ψ infrastructure are the same except how ngkmax is
-    padded in the G-sphere."  The padding difference is at the loader
-    layer (per-q ζ ngk vs per-k ψ ngk), not in this kernel.
-
-    Shapes / shardings (mesh = ``('x', 'y')`` of size ``P = p_x · p_y``)::
-
-        rchunk    : (n_q, n_rmu_padded, r_len)   P(None, ('x','y'), None)
-        gflat_acc : (n_q, n_rmu_padded, ngkmax)  P(None, ('x','y'), None)
-
-    ``n_rmu_padded`` must be a multiple of ``mesh.size`` (rounded up at
-    :class:`common.meta.Meta` construction).  Each rank owns a
-    ``n_mu_local = n_rmu_padded / P`` block of μ-rows over the full
-    ``(n_q, r_len)`` extent.
-
-    Algorithm — inside a single ``shard_map`` over ``('x','y')``:
-
-      1. Flatten ``(n_q, n_mu_local) → N = n_q · n_mu_local`` rows.
-      2. Zero-pad ``N → ⌈N / cs⌉ · cs`` so the chunk count is exact.
-      3. ``lax.scan`` over chunks of ``cs`` rows.  Each iteration:
-         a. ``q_row[cs] = (i·cs + arange(cs)) // n_mu_local`` —
-            which q each row belongs to.  Clipped to ``[0, n_q)``;
-            padding rows land on q = n_q - 1 but their data is zero
-            (zero-pad) so the contrib they produce is zero — no
-            contamination of ``acc``.
-         b. Slab → FFT box via ``dynamic_update_slice_in_dim`` at
-            offset ``r0``, or, on the ``r_indices`` path, via a gather
-            through the inverse slot table (see the kernel body).
-         c. Per-q Bloch phase, if ``qvec_frac`` given: separable
-            ``exp(-2πi q · r)`` factors, pre-computed per q at trace
-            time, gathered per row by ``q_row``.
-         d. ``jnp.fft.fftn`` on the trailing 3 axes — data is
-            per-rank-local on the entire FFT box (FFT axes are
-            replicated by sharding contract), so plain ``fftn`` runs
-            local cuFFT with no resharding.
-         e. ``jnp.take_along_axis`` gathers the per-q sphere indices
-            (``sphere_idx[q_row]``) along the trailing flat-r axis.
-         f. Accumulate into ``acc`` at offset ``i·cs``.
-
-    Chunking is on the flat ``(q · μ_local)`` axis so the chunk size
-    is a free integer — no divisibility constraint on either n_q or
-    n_mu_local.  Defaults to one-shot (``cs = N``); the scan compiles
-    to a single iteration that XLA folds away.
-
-    Parameters
-    ----------
-    rchunk
-        ``(n_q, n_rmu_padded, r_len)`` c128, μ-flat-sharded.
-    gflat_acc
-        ``(n_q, n_rmu_padded, ngkmax)`` c128, μ-flat-sharded.
-        Donated by the inner jit — its buffer is reused in place.
-    mesh
-        Process mesh with named axes ``'x'`` and ``'y'``.
-    fft_grid
-        Static ``(nx, ny, nz)``.
-    r0
-        Python int or jax-scalar — flat-r start of the slab in
-        ``[0, nx·ny·nz)``.  Exactly one of ``r0`` / ``r_indices``.
-    r_indices
-        ``(r_len,)`` int32 device array — the arbitrary flat-r cells the
-        slab holds, for an orbit-packed real-grid tile whose points are
-        not contiguous in the flat r index.  Entries outside
-        ``[0, nx·ny·nz)`` are pad slots; the scatter drops them and the
-        phase lookup clips them.  Exactly one of ``r0`` / ``r_indices``.
-        The indices must be DISTINCT, pad sentinels included (the caller
-        gives each pad slot its own out-of-range value): the scatter is
-        lowered with ``unique_indices=True`` so no atomic path is needed.
-    sphere_idx
-        ``(n_q, ngkmax)`` int32 flat-FFT indices.  Every q has the
-        same ``ngkmax`` axis length with potentially different index
-        lists per q; pad slots within a row use a sentinel flat-FFT
-        index whose coeffs the caller zeroes post-loop.
-    qvec_frac
-        Optional ``(n_q, 3)`` fractional q-vectors.  When given, the
-        FFT box is multiplied by ``exp(-2πi q · r)`` per row
-        (separable in x/y/z; pre-computed once per q).
-    norm
-        Forwarded to :func:`jnp.fft.fftn`.
-    chunk_size
-        Rows per scan iteration along the flat ``(q · μ_local)``
-        axis.  Default ``None`` ⇒ one-shot.  Memory bound:
-        ``chunk_size · n_rtot · 16 B`` for the per-iteration FFT box.
-
-    Returns
-    -------
-    Updated ``gflat_acc`` (same shape, same sharding).
-    """
+    """Add ``FFT(pad(phase(rchunk)))[sphere_idx]`` into ``gflat_acc``; see docs/architecture/zeta_fit_face_psi_cct.md."""
     indexed = r_indices is not None
     if indexed == (r0 is not None):
         raise ValueError(
@@ -1816,17 +1291,7 @@ def apply_bloch_phase(
     *,
     sign: int = 1,
 ) -> jax.Array:
-    """box × exp(sign · 2πi k·r) applied as three separable 1D multiplies.
-
-    ``box``: trailing shape ``(..., nx, ny, nz)`` c128 (sharding preserved).
-        The leading axis must be the k-axis whose length matches
-        ``kvecs_frac.shape[0]``.  Any number of intermediate broadcast
-        axes are supported (e.g. band, spinor) as long as the spatial
-        axes are the last three.
-    ``kvecs_frac``: ``(n_k, 3)`` fractional k-vectors.
-    ``sign``: ``+1`` for the ψ post-IFFT case; ``-1`` for the ζ pre-FFT
-        case (``z_q,μ(r) = exp(-2πi q·r) · ζ_q,μ(r)``).
-    """
+    """box × exp(sign · 2πi k·r) applied as three separable 1D multiplies; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nx, ny, nz = (int(s) for s in fft_grid)
     fx = jnp.arange(nx, dtype=jnp.float64) / nx
     fy = jnp.arange(ny, dtype=jnp.float64) / ny
@@ -1857,25 +1322,7 @@ def apply_bloch_phase_at(
     *,
     sign: int = 1,
 ) -> jax.Array:
-    """``slab × exp(sign·2πi k·r)`` at arbitrary flat-r grid points.
-
-    The arbitrary-point twin of :func:`apply_bloch_phase_on_slice`, which
-    is now a thin wrapper over this function.  Its slab cells are the
-    contiguous run ``[r0, r0 + r_len)``; here they are whatever flat FFT
-    indices ``flat_idx`` names, in whatever order — the layout an
-    orbit-packed real-grid tile has, where the points of one symmetry
-    orbit are scattered through the flat r index.
-
-    Flat-r convention matches :func:`to_rchunk`:
-    ``r_flat = rx · ny · nz + ry · nz + rz``.
-
-    ``slab``: trailing shape ``(..., r_len)``.  Sharding preserved.
-    ``flat_idx``: ``(r_len,)`` int32, possibly traced.  Entries outside
-        ``[0, nx·ny·nz)`` are inert carrier cells; their phase lookup is
-        clipped into range so every gather stays in bounds, exactly as
-        the contiguous version does for a padded slab tail.  Valid
-        coordinates are unchanged bit-for-bit.
-    """
+    """``slab × exp(sign·2πi k·r)`` at arbitrary flat-r grid points; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nx, ny, nz = (int(s) for s in fft_grid)
     r_len_i = int(flat_idx.shape[-1])
 
@@ -1918,28 +1365,7 @@ def apply_bloch_phase_on_slice(
     *,
     sign: int = 1,
 ) -> jax.Array:
-    """``slab × exp(sign·2πi k·r)`` over a contiguous flat-r slab.
-
-    Flat-r convention matches :func:`to_rchunk`:
-    ``r_flat = rx · ny · nz + ry · nz + rz``.
-
-    Where :func:`apply_bloch_phase` builds the phase over the full FFT
-    box and relies on the caller to slice the result, this helper
-    builds the phase only on the requested slab ``[r0, r0 + r_len)``.
-    Mathematically identical (IFFT + multiply commutes with slicing
-    along r); operationally important when the slab is much smaller
-    than the full box — pulls per-r-cell work from
-    ``n_k × nx · ny · nz`` down to ``n_k × r_len``.
-
-    The contiguous run is just one index list, so the body is a call to
-    :func:`apply_bloch_phase_at` with ``r0 + arange(r_len)`` — the same
-    clip and the same ops it always did.
-
-    ``slab``: trailing shape ``(..., r_len)``.  Sharding preserved.
-    ``r0``: Python int or a jax scalar (traced).  When traced, callers
-        are responsible for the bounds check.
-    ``r_len``: static int — slab length.
-    """
+    """``slab × exp(sign·2πi k·r)`` over a contiguous flat-r slab; see docs/architecture/zeta_fit_face_psi_cct.md."""
     r_len_i = int(r_len)
     return apply_bloch_phase_at(
         slab, kvecs_frac, fft_grid,
@@ -1979,30 +1405,7 @@ from common.collectives import single_device_mesh as process_local_mesh
 
 
 def _refuse_spinor_zero_fill(ns_want: int, ns_have: int, *, origin: str):
-    """Refuse a ψ spinor-extent mismatch instead of zero-filling it.
-
-    This is NOT a mesh-divisibility pad and it never was, which is why it
-    gets a refusal rather than a parity story.  ``meta.nspinor`` is set
-    CATEGORICALLY — ``4 if bispinor else wfn.nspinor`` (``common/meta.py``)
-    — so it is never rounded up to a device count and there is no divisor
-    to be inert with respect to.  A 2→4 mismatch means exactly one thing:
-    the caller asked the loader for the 2-component ψ (``bispinor=False``,
-    the kwarg default) while running under a ``bispinor = true`` deck.
-
-    Zero-filling components 2 and 3 is not an inert pad; it DELETES the
-    small components, whose correct value is ``(α/2)(σ·(k+G)) ψ_L``
-    (``common/bispinor_init.lift_to_4spinor``).  Every consumer contracts
-    the spinor axis (``einsum('msg,nsg->mn')``, ``Σ_s|ψ|²``), so the loss
-    is silent and algebraically well-formed: ρ, V_H and every
-    ⟨mk|V_H|nk⟩ come out built from large components only, ~4e-4 relative
-    at 30 Ry, under ``build_hartree_potential``'s 1e-3 ∫ρ tolerance.  A
-    wrong number under every tolerance that would have caught it is the
-    exact trade the pad-everywhere program exists to avoid, so the branch
-    refuses.
-
-    The fix at a call site is to pass ``bispinor=True`` so the loader
-    LIFTS (producing real small components), never to widen the array.
-    """
+    """Refuse a ψ spinor-extent mismatch instead of zero-filling it; see docs/architecture/zeta_fit_face_psi_cct.md."""
     raise ValueError(
         f"{origin}: refusing to zero-fill the spinor axis from {ns_have} to "
         f"{ns_want} components. meta.nspinor={ns_want} means this is a "
@@ -2017,23 +1420,7 @@ def _refuse_spinor_zero_fill(ns_want: int, ns_have: int, *, origin: str):
 def load_kpoint_fftbox_local(wfn, meta, k_idx, nb, *, b_lo: int = 0,
                              bispinor: bool = False,
                              bispinor_lift: str = "raw"):
-    """One k-point's ψ in the FFT box, **process-local**.
-
-    Returns ``(nb - b_lo, nspinor, nx, ny, nz)`` c128 on
-    ``jax.local_devices()[0]`` — see
-    :meth:`wfn_loader.WfnLoader.load_process_local` for the
-    single-device contract and why the k-parallel kernels need it.
-
-    ``b_lo`` selects a band sub-window ``[b_lo, nb)``; the default
-    ``b_lo=0`` reproduces the legacy "first ``nb`` bands" behaviour.
-    Band sub-windows are what lets the ρ sweep in ``gw.kin_ion_io``
-    add band-parallelism on top of k-parallelism when the rank count
-    exceeds ``nk``.
-
-    Memory: ``(nb - b_lo) · nspinor · nx·ny·nz · 16 B`` — 0.55 GiB for
-    the MoS₂ 12×12 at 120 bands, which is why the callers stream k
-    (and, past P > nk, band chunks) rather than materialising all of it.
-    """
+    """One k-point's ψ in the FFT box, **process-local**; see docs/architecture/zeta_fit_face_psi_cct.md."""
     loader = wfn  # reuse top-level WfnLoader; do NOT re-open (would re-slurp coeffs)
     psi = loader.load_process_local(
         bands=(int(b_lo), int(nb)), k=[int(k_idx)], bispinor=bool(bispinor),
@@ -2049,57 +1436,13 @@ def load_kpoint_fftbox_local(wfn, meta, k_idx, nb, *, b_lo: int = 0,
 
 
 def load_kpoint_fftbox(wfn, sym, meta, k_idx, nb):
-    """Load a single k-point's wavefunction into the FFT box on GPU.
-
-    Returns jax array of shape (nb, nspinor, nx, ny, nz), ~0.55 GiB for 12x12.
-
-    Thin back-compat wrapper over :func:`load_kpoint_fftbox_local`;
-    ``sym`` is unused (the loader's full-BZ unfold is internal to
-    ``load_process_local(k=[k_idx])``) and kept for caller-API
-    compatibility.
-
-    Values are unchanged for every existing (single-process) caller: at
-    ``P=1`` ``jax.local_devices()[0] is jax.devices()[0]`` and the
-    mesh-less loader's ``load(..., sharding=None)`` took the same
-    ``_eager_build`` path ``load_process_local`` takes.  At ``P>1`` the
-    old body was silently wrong (it boxed a band-SHARDED ψ against a
-    1×1 mesh pinned to process 0's device); the delegation fixes that.
-    """
+    """Load a single k-point's wavefunction into the FFT box on GPU; see docs/architecture/zeta_fit_face_psi_cct.md."""
     del sym
     return load_kpoint_fftbox_local(wfn, meta, k_idx, nb)
 
 
 def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=None):
-    """Return band energies and per-band weights for a given band window.
-
-    Args:
-        wfn: WFNReader providing energies and Fermi level
-        sym: SymMaps with mappings between irreducible and full k sets
-        bandrange: tuple[int,int] inclusive-exclusive (start, end) bands to extract
-        sigma_bandrange: tuple[int,int] band window used to compute weighting
-        nspinor: Spinor components widthing the WEIGHTS axis only (2 for
-            Pauli, 4 for bispinor); None reads ``wfn.nspinor``.  ``enk``
-            does not depend on it — a hardcoded default of 2 was
-            silent-wrong for the weights on an nspinor=1 file.
-
-    Returns:
-        enk: jax.Array of shape (nk_full, nb)
-        weights: jax.Array of shape (nk_full, nb * nspinor) with simple val/cond weights
-
-    ────────────────────────────────────────────────────────────────────────
-    NOTE TO FUTURE EDITORS — THE numpy USAGE BELOW IS INTENTIONAL.
-    ────────────────────────────────────────────────────────────────────────
-    Everything in this function operates on tiny host-side arrays
-    (nk × nb ~ a few thousand doubles).  Using ``jnp`` would force each
-    reduction/where/repeat to be dispatched as its own pjit at trace time
-    — ~16 standalone pjit compilations per run, for zero runtime benefit
-    (the arithmetic is ms-scale on host).  Rewriting to ``jnp`` reverses
-    a deliberate compile-cache trim (commit 31b5961, 2026-04-18).
-
-    Only cast to ``jax.Array`` at return so the caller gets the pytree
-    type it expects.  Do NOT "fix" this back to ``jnp``.
-    ────────────────────────────────────────────────────────────────────────
-    """
+    """Return band energies and per-band weights for a given band window; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nspinor = int(wfn.nspinor) if nspinor is None else int(nspinor)
     # Energies are stored on irreducible k; expand to full k using mapping.
     band_lo = int(bandrange[0])
@@ -2150,22 +1493,7 @@ def read_Gvecs_to_devices(
     k_range: tuple[int, int] | None = None,
     *, bispinor_lift: str = "raw",
 ):
-    """G-space wfns on a 2-D mesh, band-sharded, scattered to FFT box.
-
-    Returns ``(global_psi_Gtot, nb_logical)`` where ``global_psi_Gtot``
-    has shape ``(nk, nb_padded, nspinor, nx, ny, nz)`` sharded
-    ``P(None, ('x','y'), None, None, None, None)``.
-
-    The body is thin: :class:`wfn_loader.WfnLoader`
-    + :func:`to_box`.  Symmetry unfold, τ-phase, TR conjugation, spinor
-    rotation, band-axis padding/sharding, and the bispinor lift all happen
-    inside ``WfnLoader.load``.  ``sym`` is unused (the loader builds its own
-    SymMaps lazily); kept in the signature so existing callers don't change.
-
-    Memory note: this function still materialises the FFT-box representation
-    for caller back-compat.  The g_flat path (:meth:`WfnLoader.load`
-    directly) is ~6-11% the size of the FFT box.
-    """
+    """G-space wfns on a 2-D mesh, band-sharded, scattered to FFT box; see docs/architecture/zeta_fit_face_psi_cct.md."""
     del sym
 
     b_lo, b_hi = int(bandrange[0]), int(bandrange[1])
@@ -2203,27 +1531,7 @@ def load_psi_gflat_padded(
     sharding: P = band_sphere_spec(),
     bispinor_lift: str = "raw",
 ) -> "jax.Array | None":
-    """One capped + zero-padded ψ(G-flat) load — THE shared load dance.
-
-    Single source for the load → cap-at-file-nbands → zero-pad-band-axis
-    → reapply-sharding sequence that was previously triplicated (with
-    drift) across ``psi_G_store._populate_from_loader``,
-    ``load_centroids_band_chunked`` and ``iter_psi_rchunk_bandwise``.
-
-    Past-mnband contract (``common/meta.py:100-117``): ``b_id_4 =
-    round_up(b_id_4_user, world_size)`` may exceed the file's ``mnband``
-    (CrI3 6×6 30Ry SOC: mnband=86, world_size=16 ⇒ b_id_4=96).
-    ``WfnLoader.load`` rejects ``b_hi > nbands``; this helper caps the
-    loader call at ``loader.nbands`` and zero-pads the band axis back up
-    to ``max(pad_to, b_hi - b_lo)``, preserving ``sharding``.  Pad rows
-    are physically zero — the same contract every call site already
-    promised downstream.
-
-    Returns ``None`` when the ENTIRE requested window starts at/past the
-    file's band extent (an all-pad chunk) — the caller decides whether
-    that is a zero-fill (psi_G_store tiles) or an error (a user window
-    past EOF on a primary load).
-    """
+    """One capped + zero-padded ψ(G-flat) load — THE shared load dance; see docs/architecture/zeta_fit_face_psi_cct.md."""
     b_lo, b_hi = int(bands[0]), int(bands[1])
     nb_total = b_hi - b_lo
     target = max(nb_total, int(pad_to)) if pad_to is not None else nb_total
@@ -2263,19 +1571,7 @@ def prepare_rchunk_carrier(
     n_rtot: int,
     product_r_spec: P | None,
 ):
-    """Plan and finish the canonical band-sharded r-chunk carrier.
-
-    This is the one owner for the r-range validation, runtime-padding
-    divisor, terminal-tail rule, and staged band-product → r-product move
-    shared by direct WFN iteration and reusable coefficient sources.  The
-    transform that produces the already-zero-filled carrier remains the
-    caller's responsibility.
-
-    Returns ``(carrier_extent, output_sharding, finish)``.  ``finish`` checks
-    the produced extent and commits it to the requested layout; when
-    ``product_r_spec`` is the canonical product-r layout it invokes
-    :func:`common.staged_reshard.band_to_product_r_reshard`.
-    """
+    """Plan and finish the canonical band-sharded r-chunk carrier; see docs/architecture/zeta_fit_face_psi_cct.md."""
     r_start = int(r_start)
     r_end = int(r_end)
     n_rtot = int(n_rtot)
@@ -2334,41 +1630,7 @@ def iter_psi_rchunk_bandwise(
     product_r_spec: P | None = None,
     bispinor_lift: str = "raw",
 ):
-    """Generator: yield ``(bc_range, psi_bc_r)`` one band chunk at a time.
-
-    By default each result has shape ``(nk, bc, ns, r_end-r_start)`` sharded
-    ``P(None, None, None, 'y')``, preserving the historical contract.  When
-    ``product_r_spec=P(None,None,None,('y','x'))``, the free r axis is first
-    rounded through :mod:`runtime.padding` to that spec's canonical divisor;
-    :func:`take_rchunk_padded` emits the exact-zero carrier tail inside the
-    existing FFT shard-map, and the result moves directly from the input's
-    product-band layout to the product-r layout by
-    :func:`common.staged_reshard.band_to_product_r_reshard`.  That route is
-    two volume-preserving all-to-alls and never constructs the historical
-    x-replicated r-on-y global carrier.  The caller is responsible for
-    accumulating contributions (e.g. ``P += einsum(ψ_L_bc, ψ_R_bc)``)
-    so only one band chunk's r-chunk shard is live at any moment,
-    decoupling the pair-density peak from the total band count.
-
-    ``band_chunk_ranges`` lets the caller dictate chunk boundaries —
-    pass a list to respect left/right pair-density endpoints so every
-    yielded chunk lies fully inside one (or both) of those ranges and
-    no out-of-range einsums ever dispatch.  When None, contiguous
-    chunks of ``band_chunk_size`` are built from ``band_range``.
-
-    ``band_pad_to`` zero-pads every yielded chunk's band axis up to a
-    single uniform width (the full chunk width) BEFORE ``to_rchunk``,
-    so the ``to_rchunk`` shard_map — keyed on ``psi.shape`` — sees ONE
-    band-dim across the whole sweep and compiles exactly ONCE instead
-    of once-per-distinct-remainder-width.  The pad rows are physically
-    zero, so a caller that accumulates a band-contraction (the Galerkin
-    ``UH_bc @ psi`` fold) must slice/zero-pad its contraction operand to
-    the same width — the extra bands then contribute exactly zero.
-    ``None`` disables the pad (legacy per-chunk-shape behaviour).
-
-    Uses :class:`wfn_loader.WfnLoader` + ``to_rchunk``.  ``sym``
-    is unused (loader builds its own SymMaps).
-    """
+    """Generator: yield ``(bc_range, psi_bc_r)`` one band chunk at a time; see docs/architecture/zeta_fit_face_psi_cct.md."""
     del sym
 
     b_start, b_end = band_range
@@ -2489,66 +1751,7 @@ def load_centroids_band_chunked(
     k_domain: str = "full_bz",
     return_ibz_parents: bool = False,
 ) -> tuple[jax.Array, ...]:
-    """
-    Load centroid-sampled wavefunctions using band AND k-point chunking.
-
-    Memory-safe version that loops over band chunks (and optionally k-point
-    chunks) to avoid OOM when loading all bands/k-points at once for FFT.
-
-    The FFT box array psi_Gtot_local has shape (nk, nb, nspinor, *fft_grid)
-    and scales as O(nk * nb * n_rtot). For large k-grids (e.g. 10x10x10 =
-    1000 k-points), this exceeds GPU memory. K-chunking processes a subset
-    of k-points at a time, accumulating only the centroid-space outputs
-    (which are O(nk * nb * n_rmu) — much smaller since n_rmu << n_rtot).
-
-    Args:
-        wfn: WFNReader
-        sym: SymMaps
-        meta: Meta object
-        centroid_indices: (n_rmu, 3) centroid grid coordinates
-        bispinor: Whether to use bispinor
-        mesh_xy: Device mesh
-        band_range: (b_start, b_end)
-        band_chunk_size: Maximum bands in one outer WFN/FFT tile.  A
-            positive value smaller than the logical window activates the
-            streamed owner; this is the existing GW Stage-A band policy.
-        k_chunk_size: Maximum k-points in one outer WFN/FFT tile.  ``None``
-            or a non-positive value keeps all k-points inside each band tile.
-            A positive value activates k streaming even when the band window
-            fits one tile.
-        psi_G_flat: Optional already-loaded full G-flat window.  This keeps
-            the bulk path regardless of chunk hints because its owner (the
-            htransform Galerkin path) deliberately reuses the same allocation
-            after centroid sampling.
-        k_domain: ``"full_bz"`` (default) or ``"ibz"``.  The latter samples
-            the raw WFN parent rows without symmetry unfolding.  It exists for
-            parent-k contractions; it is not a second FFT implementation.
-        return_ibz_parents: With ``k_domain="full_bz"``, additionally retain
-            raw-parent centroid faces while the existing parent-major stream
-            already holds each raw WFN row.  Returns
-            ``(full_y, full_x, parent_y, parent_x)``.  The four-component lift
-            remains on the full-k path until its exact operator representation
-            is owned by the symmetry service.
-
-        Both outer remainders are zero-padded through
-        :mod:`runtime.padding` to the one fixed physical tile shape.  G-index
-        and k-vector values are runtime operands, so all tiles of a window
-        reuse one compiled transform family; padding changes scheduling only,
-        not the logical return extent or centroid values.
-
-    Returns:
-        psi_rmu_Y: (nk, nb, ns, n_rmu) with P(None, None, None, 'y')
-        psi_rmuT_X: (nk, n_rmu, nb, ns) with P(None, 'x', None, None)
-
-    n_rmu divisibility: the kernels here shard the n_rmu axis by a
-    single mesh axis (``'x'`` alone in psi_rmuT_X, ``'y'`` alone in
-    psi_rmu_Y) — so n_rmu only needs to divide one axis size, not the
-    product.  ``mesh.x = mesh.y = 4`` and 668 / 4 = 167 ✓; no padding
-    needed at this layer.  The undivisibility shows up only at the
-    V_q read where the trailing axis is sharded by the *product*
-    ``('x', 'y')`` = 16; SlabIO's auto-pad on the on-disk dataset
-    closes that gap (see ``file_io.slab_io.create_dataset``).
-    """
+    """Load centroid-sampled wavefunctions using band AND k-point chunking; see docs/architecture/zeta_fit_face_psi_cct.md."""
     del sym        # WfnLoader builds its own SymMaps lazily
     from common import timing
     from runtime.padding import padded_mu_extent
