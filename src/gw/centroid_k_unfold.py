@@ -184,7 +184,8 @@ class CentroidKUnfoldPlan:
         right = self if right_plan is None else right_plan
         return unfold_spin_centroid_operator(
             operator_parent,
-            right_sym_perm=right.sym_perm, right_L_table=right.L_table,
+            right_sym_perm=None if right_plan is None else right.sym_perm,
+            right_L_table=None if right_plan is None else right.L_table,
             operator_transpose=operator_transpose,
             irr_idx=self.irr_idx,
             sym_idx=self.sym_idx,

@@ -1462,7 +1462,8 @@ def unfold_spin_centroid_operator(
         left_logical_extent=logical_mu * ns,
         right_logical_extent=n_right * ns,
         axis_local_sym_perm=local_perm,
-        right_sym_perm=right_perm_ms, right_L_table=right_wraps_ms,
+        right_sym_perm=None if right_sym_perm is None else right_perm_ms,
+        right_L_table=None if right_L_table is None else right_wraps_ms,
         right_axis_local_sym_perm=right_local_perm,
     )
     spatial = jnp.transpose(
