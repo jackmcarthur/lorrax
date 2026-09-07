@@ -62,9 +62,46 @@
 | `src/isdf/core.py` | `_c_q_face_parent` | 95 | 0 | Deleted or renamed to direct owner |
 | `src/isdf/core.py` | `_z_q_face_parent` | 327 | 327 | Unchanged; target remains |
 | `src/isdf/core.py` | `factor_c_q` | 317 | 317 | Unchanged; target remains |
-| `src/isdf/core.py` | `solve_zeta` | 699 | 699 | Unchanged; target remains |
+| `src/isdf/core.py` | `solve_zeta` | 699 | 101 | Existing statements moved to named stages or dead selector removed |
+| `src/isdf/core.py` | `solve_zeta._ridge_indef_solve` | 7 | 0 | Deleted or renamed to direct owner |
+| `src/isdf/core.py` | `solve_zeta._ridge_indef_solve._ridged_lu` | 4 | 0 | Deleted or renamed to direct owner |
+| `src/isdf/core.py` | `solve_zeta._lu_apply_logical` | 16 | 0 | Deleted or renamed to direct owner |
+| `src/isdf/core.py` | `solve_zeta._tri_solve_logical` | 13 | 0 | Deleted or renamed to direct owner |
+| `src/isdf/core.py` | `solve_zeta._tri_solve_logical._chol_backsolve` | 4 | 0 | Deleted or renamed to direct owner |
+| `src/isdf/core.py` | `solve_zeta._pinv_matmul_logical` | 9 | 0 | Deleted or renamed to direct owner |
+| `src/isdf/core.py` | `solve_zeta._pinv_matmul_logical._mm` | 2 | 0 | Deleted or renamed to direct owner |
+| `src/isdf/core.py` | `solve_zeta._pinv_apply_T_logical` | 8 | 0 | Deleted or renamed to direct owner |
+| `src/isdf/core.py` | `solve_zeta._pinv_apply_T_logical._mm` | 2 | 0 | Deleted or renamed to direct owner |
 | `src/isdf/core.py` | `c_q_downfold` | 0 | 122 | New explicit phase/direct owner |
-| `src/isdf/core.py` | **File total** | 5831 | 5789 | Net -42 lines |
+| `src/isdf/core.py` | `_zeta_logical_solvers` | 0 | 61 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_logical_solvers._ridge_indef_solve` | 0 | 7 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_logical_solvers._ridge_indef_solve._ridged_lu` | 0 | 4 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_logical_solvers._lu_apply_logical` | 0 | 16 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_logical_solvers._tri_solve_logical` | 0 | 13 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_logical_solvers._tri_solve_logical._chol_backsolve` | 0 | 4 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_logical_solvers._pinv_matmul_logical` | 0 | 9 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_logical_solvers._pinv_matmul_logical._mm` | 0 | 2 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_logical_solvers._pinv_apply_T_logical` | 0 | 8 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_logical_solvers._pinv_apply_T_logical._mm` | 0 | 2 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_batched_kernels` | 0 | 68 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_batched_kernels._sharded_cho_solve` | 0 | 11 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_batched_kernels._sharded_cho_solve_batch` | 0 | 23 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_batched_kernels._solve_batch_and_update` | 0 | 8 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_batched_kernels._solve_all_at_once` | 0 | 5 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_per_q_kernel` | 0 | 88 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_per_q_kernel._per_q_block` | 0 | 25 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_per_q_kernel._solve_one_q_and_update` | 0 | 16 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_rhs_resharder` | 0 | 21 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_zeta_rhs_resharder._reshard_z` | 0 | 3 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_cache_zeta_solve_kernels` | 0 | 24 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_apply_replicated_zeta` | 0 | 103 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_solve_zeta_replicated` | 0 | 103 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_solve_zeta_token` | 0 | 33 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_solve_zeta_token._run_token` | 0 | 8 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_solve_zeta_fused_lu` | 0 | 70 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_solve_zeta_fused_lu._dist_ridged_lu` | 0 | 27 | New explicit phase/direct owner |
+| `src/isdf/core.py` | `_solve_zeta_fused_lu._run_lu` | 0 | 8 | New explicit phase/direct owner |
+| `src/isdf/core.py` | **File total** | 5831 | 5780 | Net -51 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -162,14 +199,15 @@
 
 | Tree scope | Before | After | Net |
 |---|---|---|---|
-| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 125280 | 33 |
+| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 125271 | 24 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
 | 1 — planner (25d2e75e) | 1395 | 473 passed,2 skipped,1 xfailed; centroid/parent/planner/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-174825-2182563-9864; 06_planner_cpu/cpu.xml; allocation58000949 lx-Xg4-172154-2062898-2839; 02_face_planner_cpu4/identity.json |
 | 2 — direct Gram (9b41e422) | 1396 | 543 passed,2 skipped,1 xfailed; centroid/parent/Gram/downfold/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-175412-2208707-1724, lx-Xg4-175656-2221647-2270; 07_gram_cpu/cpu.xml; 07_gram_p4_ready/mos2/identity.json |
 | 3 — symmetry stages (c604c3d6) | 1397 | 445 passed,2 skipped,1 xfailed; centroid/parent/physics/symmetry | Si SOC GN exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-180057-2240310-9849, lx-Xg4-180106-2241405-3156; 09_symmetry_stages/cpu/cpu.xml; 09_symmetry_stages/p4/si_soc/identity.json |
-| 4 — driver/photon stages (this commit) | 1398 | 467 passed,2 skipped,1 xfailed; centroid/parent/photon/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-180746-2273070-8918, lx-Xg4-180754-2273585-4383; 10_photon_stages/cpu/cpu.xml; 10_photon_stages/p4/mos2/identity.json |
+| 4 — driver/photon stages (76a1587d) | 1398 | 467 passed,2 skipped,1 xfailed; centroid/parent/photon/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-180746-2273070-8918, lx-Xg4-180754-2273585-4383; 10_photon_stages/cpu/cpu.xml; 10_photon_stages/p4/mos2/identity.json |
+| 5 — zeta stages (this commit) | 1399 | 485 passed,2 skipped,1 xfailed; parent/factor-hoist/mesh-invariance/charge/refit/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-181422-2302374-7638, lx-Xg4-181430-2302826-9451; 11_zeta_stages/cpu/cpu.xml; 11_zeta_stages/p4/mos2/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|

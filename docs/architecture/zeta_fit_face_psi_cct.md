@@ -158,3 +158,96 @@ row. The original loader remains authoritative for file energies and the
 G-sphere unfold. No deleted full-k Zq or Green kernel is reinstated. The
 binding admission ruling is in [decisions.md](decisions.md); the historical
 fixtures keep their original centroid coordinates and printed references.
+
+
+### Zeta solve entry contract (2026-09-06 phase extraction)
+
+Solve for zeta_q given pre-computed system matrix from
+:func:`factor_c_q`.
+
+For ``vertex_mu_L == 0`` ``L_q`` is the lower-triangular Cholesky
+factor of CCT and the inner solve is two triangular substitutions
+(``L y = Z`` then ``L^H ζ = y``).  This is the historical fast
+path — bit-identical to the previous implementation.
+
+For ``vertex_mu_L != 0`` the equal-current CCT is a signed Gram;
+Gamma2 carries the negative sign shared by its RHS.  Pivoted LU uses
+:func:`_transverse_lu_ridge` so regularization preserves the paired sign.
+Since
+the 2026-08 hoist ``factor_c_q`` computes that LU ONCE per channel on
+the local plan (including provider selection with ``batch_reshard``):
+``L_q`` carries the packed factors and
+``lu_piv`` the permutation, and this routine only APPLIES them per
+r-chunk (``lax.linalg.lu_solve`` — bit-identical to the fused
+``jnp.linalg.solve``).  On the ScaLAPACK and cuSOLVERMp plans ``L_q``
+is instead a :class:`distrib_la.FactorToken`, which carries the
+block-cyclic factors and rank-private pivots; this module never opens
+that token.
+Bunch-Kaufman LDL^T would be the natural Hermitian-
+indefinite factorization but JAX doesn't expose it; pivoted LU is
+numerically equivalent for our purposes.
+
+Uses q-chunked all-gather strategy: gather B_q matrices at a time,
+then solve all B_q systems in parallel using vmap.
+
+Memory trade-off:
+- q_chunk_size=1: Minimum memory (one matrix replicated at a time)
+- q_chunk_size=nq: Maximum parallelism (all matrices replicated)
+
+Args:
+    L_q: (nq, n_rmu, n_rmu) Cholesky factor (μ_L=0) or raw CCT
+         (μ_L=1,2,3), sharded P(None, 'x', 'y') — OR a
+         :class:`distrib_la.FactorToken` from one of the three
+         library-handle routes, which is consumed whole and never
+         indexed, resharded or gathered
+    Z_q: (nq, n_rmu, n_zchunk) ZCT matrix, sharded P(None, 'x', 'y')
+         or P(None, None, ('x','y')) if caller already resharded
+    mesh_xy: 2D device mesh
+    q_chunk_size: Number of q-points to solve simultaneously (default 1)
+    vertex_mu_L: Lorentz vertex index — selects Cholesky-back-solve
+                 vs jnp.linalg.solve.  Output sharding is identical
+                 in both branches.
+    solver_kind: 'auto' (default) defers to :func:`_resolve_solver_kind`;
+                 explicit values are 'replicated_cholesky' (mesh-
+                 invariant dense factor from :func:`_factor_c_q_replicated`;
+                 back-solve shares the 'sharded_cholesky' per-q
+                 triangular path — L is replicated, r-columns sharded,
+                 so ζ is grid-agnostic), 'sharded_cholesky' (legacy 2D
+                 blocked chol + per-q triangular solve), 'lu' (per-q
+                 pivoted-LU for transverse channels),
+                 'cusolvermp_cholesky' (distributed potrs via FFI),
+                 'cusolvermp_lu' (distributed getrf+getrs via FFI
+                 for the transverse channels), or
+                 'replicated_rank_truncate' (charge rank-truncation:
+                 ``L_q`` is the pseudo-inverse factor B, back-solve is
+                 the matmul ζ = B(BᴴZ)), or
+                 'distributed_rank_truncate' (the
+                 ``distributed_zeta_solve='distributed'`` tier: ``L_q``
+                 is the truncated pseudo-inverse ``C⁺`` itself, kept
+                 2D-sharded, and the back-solve is one stacked GEMM
+                 with BOTH operands 2D-sharded — see
+                 :func:`_distributed_pinv_apply`).  'replicated_cholesky',
+                 'sharded_cholesky' and 'replicated_rank_truncate' all
+                 take the general shard_map back-solve branch below
+                 (none matches the cuSolverMp/scalapack guards).
+    n_rmu_logical: Logical centroid count.  When given and smaller
+                 than the padded input extent, every per-q dense
+                 solve (pivoted LU AND the per-q triangular
+                 back-solve) is μ-SLICED to this extent before the
+                 factorisation and the ζ pad rows are zero-filled
+                 after.  This is load-bearing for device-count
+                 invariance: solving the identity-padded system at
+                 the padded extent makes ζ depend deterministically
+                 on the pad extent (= on the device count), with
+                 O(1) amplification in the near-null transverse
+                 modes (reports/device_invariance_2026-07-08/
+                 ROOT_CAUSE.md).  ``None`` keeps the padded extent
+                 (back-compat for mesh-divisible callers).
+
+Returns:
+    zeta_q: (nq, n_rmu, n_zchunk) solution, sharded P(None, ('x','y'), None)
+            — μ-axis flat-sharded across the ('x','y') mesh product,
+            r-axis replicated.  This is the layout the downstream
+            G-flat FFT (``accumulate_rchunk_to_gflat``) wants:
+            each rank owns a μ-slab over the full r-extent, so the
+            per-rank cuFFT runs locally without resharding.
