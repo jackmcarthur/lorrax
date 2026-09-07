@@ -382,7 +382,8 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
     ``2*S/(Px*Py)`` and axis costs ``S/Px + S/Py``, with
     ``S = 16*n_parent*ns*mu*nb`` bytes on the parent route. Bands are
     sharded in face and complete in axis; both retain the same parent rows.
-    Stage-C/D incremental workspaces are disclosed separately.
+    Without a parent route, the historical axis fit retains four copies
+    (``2*S/Px + 2*S/Py``). Stage-C/D workspaces are disclosed separately.
 
     ``loader_tables`` is the WFN loader's REPLICATED per-k metadata (the
     sparse-G→FFT-box index + the τ-phase row), retained for the loader's
@@ -394,7 +395,10 @@ def _persistent_bytes(*, nk, ns, nq, nq_disk, mu, nb, ngkmax, n_rtot,
     if low_mem_bands:
         psi_copies = 2.0 * psi_one / P_
     else:
-        psi_copies = psi_one / p_x + psi_one / p_y
+        # The non-parent planning route retains its pre-landing four-copy
+        # fit inventory; the explicit parent carrier below has two arrays.
+        psi_copies = (2 if parent_route is None else 1) * (
+            psi_one / p_x + psi_one / p_y)
     if parent_route is not None:
         # The raw-parent carrier: one face pair at n_parent rows
         # (gw.wavefunction_bundle.ParentGreenCarrier).  Under parents-only
