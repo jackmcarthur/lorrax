@@ -18,9 +18,12 @@ def sha(path):
 
 def low_owner(mesh):
     """Keep the frozen conversion/hash guards; replace only I/O and row extent."""
+    import jax
     import jax.numpy as jnp
     from file_io.slab_io import SlabIO
-    from jax.sharding import PartitionSpec as P
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    face = NamedSharding(mesh, P('x', 'y'))
+    stack = NamedSharding(mesh, P(None, 'x', 'y'))
     assert sha(ANCHOR) == ANCHOR_SHA
 
     def intrinsic_rows(path):
@@ -32,8 +35,9 @@ def low_owner(mesh):
     def coulomb_rows(path, slot):
         with SlabIO(path, mode='r', mesh=mesh) as io:
             parents = io.read_small('q_parent_full_rows')
-            v = io.read_slab('V_canonical_qwedge', shape=(1, 896, 896),
-                             offset=(slot, 0, 0), partition_spec=P(None, 'x', 'y'))[0]
+            slab = io.read_slab('V_canonical_qwedge', shape=(1, 896, 896),
+                               offset=(slot, 0, 0), partition_spec=P(None, 'x', 'y'))
+            v = jax.jit(lambda a: a[0], out_shardings=face)(slab)
         return parents, v
 
     source = ANCHOR.read_text()
@@ -47,7 +51,19 @@ def low_owner(mesh):
     assert source.count(old) == 1
     source = source.replace(old, """parents,v=coulomb_rows(COULOMB,slot)
     assert np.array_equal(parents,_receipt['parent_qrows']) and int(parents[slot])==item['q_full']""")
-    namespace = dict(intrinsic_rows=intrinsic_rows, coulomb_rows=coulomb_rows)
+    # Compile the owner's exact expressions with explicit result layouts.
+    # Its eager Hermitian addition otherwise replicates a transposed XY face.
+    source = source.replace('ev,u=eig((v+v.conj().T)/2)', 'ev,u=eig(v)')
+    owner_half = '(u*jnp.sqrt(ev)[None,:])@u.conj().T'
+    owner_congruence = 'vh@intrinsic@vh'
+    assert source.count('vh='+owner_half) == 1
+    assert source.count('value='+owner_congruence) == 1
+    half = jax.jit(eval('lambda u,ev: '+owner_half, {'jnp':jnp}), out_shardings=face)
+    convert = jax.jit(eval('lambda vh,intrinsic: '+owner_congruence), out_shardings=stack)
+    source = source.replace('vh='+owner_half, 'vh=half(u,ev)')
+    source = source.replace('value='+owner_congruence, 'value=convert(vh,intrinsic)')
+    namespace = dict(intrinsic_rows=intrinsic_rows, coulomb_rows=coulomb_rows,
+                     half=half, convert=convert)
     exec(compile(source, str(ANCHOR), 'exec'), namespace)
     return namespace
 

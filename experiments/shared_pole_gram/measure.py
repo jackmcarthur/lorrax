@@ -83,7 +83,8 @@ def main(out):
         ev, u = eig_jit(v)
         if float(ev[0]) <= 0:
             raise ValueError('Nonpositive Coulomb')
-        vi = mm(u/jnp.sqrt(ev)[None,:], u.conj().T)
+        vi = jax.jit(lambda u,e: matmul(u/jnp.sqrt(e)[None,:],u,transb='C',
+            mesh=mesh,backend='distributed',batched_route='auto'),out_shardings=face)(u,ev)
         ww = congruence_rows(vi,w)
         wwh = congruence_rows(vi,wh)
         gw = np.asarray(gram(ww))
