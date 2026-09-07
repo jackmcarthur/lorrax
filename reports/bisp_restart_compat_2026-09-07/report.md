@@ -30,11 +30,11 @@
 |---|---|---|---|---|
 | Baseline fresh GW | scalar (1; true/false; auto→IBZ), SOC supplied deck (4; true; auto→IBZ), MoS2 (4; true/false; auto→IBZ) | PASS | All five built from pristine 891047f4 at P4; supplied SOC deck is bispinor, not ns2 | `00_audit/fresh.lx.log`, `01_scalar_true` through `05_mos2_false`, `fresh.rank0.log` |
 | Additional fresh GW | recorded Si fixture (2; true; auto→IBZ) | PASS | Genuine two-spinor coverage; COHSEX fixture, separate from supplied GN deck | `06_soc_ns2_fixture/fresh_full_retry.rank0.log` |
-| GW same-layout restart | scalar (1; true→true and false→false; IBZ) | PASS | eqp0/eqp1 identical in all64 printed rows | `10_scalar_tt`, `13_scalar_ff`: `restart_final.rank0.log`, `eqp*.compare_final.txt` |
-| GW cross-layout restart | scalar (1; true→false; IBZ) | RED, registered | eqp0 max0.051 μeV; eqp1 max0.122 μeV; exact tolerance0 | `11_scalar_tf/eqp*.compare_final.txt` |
-| GW cross-layout restart | scalar (1; false→true; IBZ) | RED, registered | eqp0 max0.128 μeV; eqp1 max0.174 μeV; exact tolerance0 | `12_scalar_ft/eqp*.compare_final.txt` |
-| Dynamic GW restart | SOC GN (4; true→true; IBZ) | PASS | Both EQPs identical; mpa and sigma_quadrature_rules stores carried into restart | `14_soc_tt/restart_final.rank0.log`, `eqp*.compare_final.txt`, `tmp/mpa`, `tmp/sigma_quadrature_rules` |
-| GW same/cross-layout restart | MoS2 (4; true→true, true→false, false→true, false→false; IBZ) | PASS | eqp0/eqp1 identical in all210 printed rows for all four arms | `15_mos2_tt` through `18_mos2_ff`: `restart_final.rank0.log`, `eqp*.compare_final.txt` |
+| GW same-layout restart | scalar (1; true→true and false→false; IBZ) | PASS | eqp0/eqp1 identical in all64 printed rows | `10_scalar_tt`, `13_scalar_ff`: `layout_handoff.rank0.log`, `eqp*.layout_handoff_compare.txt` |
+| GW cross-layout restart | scalar (1; true→false; IBZ) | RED, registered | eqp0 max0.051 μeV; eqp1 max0.122 μeV; exact tolerance0 | `11_scalar_tf/eqp*.layout_handoff_compare.txt` |
+| GW cross-layout restart | scalar (1; false→true; IBZ) | RED, registered | eqp0 max0.128 μeV; eqp1 max0.174 μeV; exact tolerance0 | `12_scalar_ft/eqp*.layout_handoff_compare.txt` |
+| Dynamic GW restart | SOC GN (4; true→true; IBZ) | PASS | Both EQPs identical; mpa and sigma_quadrature_rules stores carried into restart | `14_soc_tt/layout_handoff.rank0.log`, `eqp*.layout_handoff_compare.txt`, `tmp/mpa`, `tmp/sigma_quadrature_rules` |
+| GW same/cross-layout restart | MoS2 (4; true→true, true→false, false→true, false→false; IBZ) | PASS | eqp0/eqp1 identical in all210 printed rows for all four arms | `15_mos2_tt` through `18_mos2_ff`: `layout_handoff.rank0.log`, `eqp*.layout_handoff_compare.txt` |
 | Fresh + dynamic GW restart | additional SOC GN (2; true; IBZ) | PASS | Both EQPs identical in all256 printed rows after moving dynamic store readers | `07_soc_ns2_gn/{fresh,restart}.rank0.log`, `eqp*.compare.txt` |
 | BSE, downfold, htransform | additional SOC GN (2; true; IBZ) | PASS execution; BSE/htransform reference obligation RED, registered | All complete on the new two-spinor GN bundle; htransform includes the complete QP block | `07_soc_ns2_gn/{bse,downfold,htransform}.rank0.log` |
 | Exciton ongrid | additional SOC GN (2; true; IBZ) | PASS | Production ongrid calculation completes | `07_soc_ns2_gn/ongrid.rank0.log`, `ongrid.out` |
@@ -48,7 +48,7 @@
 | Exciton default/ongrid | scalar (1; true/false; IBZ) | RED, bounded and registered | Rank147 saturates search160; rank multiplier40 clears search then six zero fH slots expose seed guard-band limit; explicit refit guards do not widen seed | `01_scalar_true`, `04_scalar_false`: `{exciton_retry,ongrid_retry,exciton_rank40,ongrid_rank40,exciton_guard4,ongrid_guard4}.rank0.log` |
 | Exciton default/ongrid | supplied SOC (4; true; IBZ) | RED, registered | Shared reader returns true charge ns4; htransform source carrier has ns2; no two-spinor charge family exists in this model | `02_soc_true/{exciton_retry,ongrid_retry}.rank0.log` |
 | Htransform + QP rotations | scalar (1; true; IBZ) | RED, registered | QRCP budget diagnostic reaches existing corrected-interior guard: corrected block ends at8, same as requested output endpoint8 | `01_scalar_true/{htransform_retry,htransform_fit}.rank0.log` |
-| Htransform + QP rotations | supplied SOC (4; true; IBZ) | PASS execution; reference unavailable | Initial fitted[0,20) omitted part of QP[0,32); ncond20 plus four guards includes full block and completes. Run74 reference is a separate DFT-only deck | `02_soc_true/{htransform_retry,htransform_fit}.rank0.log`, `htransform_fit.dat` |
+| Htransform + QP rotations | supplied SOC (4; true; IBZ) | PASS execution; reference obligation RED, registered | Initial fitted[0,20) omitted part of QP[0,32); ncond20 plus four guards includes full block and completes. Run74 reference is a separate DFT-only deck | `02_soc_true/{htransform_retry,htransform_fit}.rank0.log`, `htransform_fit.dat` |
 | Downfold CLI | scalar (1; true/false; IBZ), supplied SOC (4; true; IBZ) | PASS | Production CLI completes; children now write canonical parent-face pairs. `python -m gw.downfold_run` is a library import, excluded from execution evidence | `01_scalar_true`, `02_soc_true`, `04_scalar_false`: `downfold_final.rank0.log`, `child_v3/tmp` |
 | W_BSE historical decks | scalar COHSEX/GN (1; true; auto→IBZ requested) | RED, registered | Historical left-fit window ends12 and cuts a zero-gap multiplet. Clean ncond4 diagnostic now reaches the shared handoff; remaining ladder covariance and GN extrapolation failures are registered | `21_wbse_cohsex`, `22_wbse_gn`: `{wbse,clean_window}.rank0.log` |
 | kmeans producer → GW | scalar WFN | PASS | Requested192, orbit/block selection delivered168; GW explicitly consumes generated168-centroid file | `20_scalar_producers/kmeans.rank0.log`, `producer_gw_retry.rank0.log` |
@@ -57,7 +57,7 @@
 | Postprocess QP WFN | scalar, SOC supplied, MoS2, ns2 fixture (1/2/4; canonical k-irr rotations) | PASS | Authenticated QP WFN written for each source; CPU preprocessing, no GPU algorithm invoked | `{01_scalar_true,02_soc_true,03_mos2_true,06_soc_ns2_fixture}/postprocess.log`, `WFN_qp_proof.h5`; `00_audit/postprocess.lx.log` |
 | finite_q_head_interp | array helper, all ns/layouts | N/A | No bundle read or CLI; consumes caller-supplied arrays | `census.txt`, `src/psp/finite_q_head_interp.py` |
 | Focused CPU reader tests | four emulated CPU devices, G0 | PASS | 77 passed; one real-GN execution test deselected because it is separately exercised at P4 | `00_audit/readers_cpu_final.lx.log` |
-| Default CPU core | four emulated CPU devices, G0 | RED, registered environment | 66 passed,7 skipped,4 native-provider failures; absent liblorrax_ffi_host.so | `00_audit/core_cpu_v3.lx.log` |
+| Default CPU core | four emulated CPU devices, G0 | RED, registered environment | 66 passed,7 skipped,4 native-provider failures; absent liblorrax_ffi_host.so | `00_audit/core_cpu_closeout.lx.log` |
 
 | Post-consolidation consumer | Reader | Returned meaning / transport owner |
 |---|---|---|
@@ -138,7 +138,7 @@
 | Dynamic ns2 GN restart after move | PASS:256/256 rows exact for eqp0 and eqp1 | `07_soc_ns2_gn/header_restart.rank0.log`, `eqp{0,1}.header_compare.txt` |
 | Canonical four-spinor writer/readback | PASS: both charge/current orientations exact, four max errors0 | `08_parent_contract/parent_contract.rank0.log`, `restart_parity.json`; synthetic writer now supplies complete current band/energy/grid receipts |
 | Downfolded child → BSE | PASS: child96-centroid bundle read by the same canonical parent reader and solved | `25_child_reader/bse_child.rank0.log`; source `07_soc_ns2_gn/child/tmp` |
-| Final CPU core |66 passed,7 skipped, same4 registered host-provider failures | `00_audit/core_cpu_final.lx.log` |
+| Final CPU core |66 passed,7 skipped, same4 registered host-provider failures | `00_audit/core_cpu_closeout.lx.log` |
 | EQP batch |0056ba63 pushed; claim1439 | BSE and htransform eqp1 legs complete |
 | Remaining direct reads audit |No private gwjax-bundle HDF5 or SlabIO reader remains in the audited drivers | `post_census.txt`; qsgw_head's two SlabIO reads are upstream parallel_transport.h5 preprocessing, not gwjax output. compute_vcoul's auxiliary symmetry read and eqp_bgw's source-energy read are WFN inputs. BSE pseudopole/eigenvector readers consume BSE outputs |
 
@@ -160,3 +160,12 @@
 | Scalar GN, clean window |RED after shared handoff:400/512 states refuse spectral-shell extrapolation, counts14/18/20 | `22_wbse_gn/shared_order_fixed.rank2.log`; static/probe covariance0.1230/0.01103 also fails1e-5 |
 | Extra diagnostic cancellations |Early7-minute quiet run cancelled; later trace showed the ladder solve was active, and COHSEX completes in246 s of resolvent work | `00_audit/wbse_v2.lx.log`, `wbse_trace.lx.log`, `21_wbse_cohsex/shared_parent_bounded.rank0.log`. Timeout/stack-dump teardown noise is excluded from correctness evidence |
 | TRS batch |0a7d2d0a pushed; claim1442 | Exact BSE covers ns1/2/4 |
+
+
+| Final GW layout handoff | Verdict | Evidence |
+|---|---|---|
+| Charge/current carrier layout | Reader returns the requested layout; GW uses that value without branching on the band layout again | `src/gw/gw_init.py`; raw tensor transport remains in `file_io.restart_bundle` |
+| Nine-arm P4 repeat after handoff | All36 rank exits0; same-layout scalar, dynamic SOC and all MoS2 arms retain exact printed EQPs | `00_audit/layout_handoff.lx.log`; `10_scalar_tt` through `18_mos2_ff`: `layout_handoff.rank{0,1,2,3}.rc`, `eqp*.layout_handoff_compare.txt` |
+| Scalar cross-layout bound | RED remains0.051/0.122 μeV and0.128/0.174 μeV, tolerance0 | Same comparison files; same-file reader parity is exact |
+| Final default CPU core |66 passed,7 skipped,4 registered native-provider failures | `00_audit/core_cpu_closeout.lx.log`; no native library rebuilt |
+| W_BSE batch |d8edf9f7 pushed; claim1443 | Execution and remaining scientific failures distinguished above |

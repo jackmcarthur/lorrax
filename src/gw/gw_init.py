@@ -3183,7 +3183,7 @@ def _restart_charge_carrier(
     from .wavefunction_bundle import wavefunctions_face_from_restart
     wfns = wavefunctions_face_from_restart(
     	None,
-    	None, layout="face" if cfg.memory.low_mem_bands else "axis", enk_full=rs.enk_full,
+        None, layout=rs.layout, enk_full=rs.enk_full,
     	slices=band_slices, mesh_xy=mesh_xy,
     	basis_receipt=charge_basis_receipt)
     from .wavefunction_bundle import build_packed_parent_green_carrier
@@ -3326,7 +3326,7 @@ def _restart_current_carrier(
     		wavefunctions_face_from_restart)
     	wfns_transverse = wavefunctions_face_from_restart(
     		None,
-    		None, layout="face" if cfg.memory.low_mem_bands else "axis",
+            None, layout=rs.layout,
     		enk_full=rs.enk_full, slices=band_slices,
     		mesh_xy=mesh_xy, basis_receipt=transverse_basis_receipt)
     	plan_T, _, _ = _prepare_parent_wavefunction_plan(
