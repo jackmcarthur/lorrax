@@ -472,7 +472,6 @@ def _prepare_isdf_carriers(
     V_qmunu = isdf.V_qmunu
     wfns = isdf.wf_bundle
     green_parent_carrier = getattr(isdf, 'green_parent_carrier', None)
-    sigma_parent_carrier = getattr(isdf, 'sigma_parent_carrier', None)
     wfns_sigma = wfns
     wfns_screening = wfns
     oneshot_occupation_state = (
@@ -705,13 +704,6 @@ def _run_oneshot_screening(
                     material_class=material_class,
                     tensors_filename=tensors_filename,
                     print_fn=print0)
-        if green_parent_carrier is not None:
-            isdf.green_parent_carrier = None
-            wfns_screening = None
-            green_parent_carrier = None
-            gc.collect()
-            print0("  Parent-k Green carrier detached from the screening view "
-                   "(the Sigma view keeps it).")
     return (W_by_role, photon_response, green_parent_carrier, wfns_screening)
 
 

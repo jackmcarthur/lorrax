@@ -15,3 +15,4 @@
 | 6 | `src/ffi/fft.py:1031` | Fixed: shared planner probes the selected gate target; parent ns=4 uses two-stage above the portable floor; every shape decision is announced. |
 | 7 | `src/gw/{w_isdf,cohsex_sigma,photon_sigma,photon_layout}.py` | Fixed: seal service paths before module-scope distrib_la imports; bare-launch tests cover all four consumers. |
 | 8 | `tests/test_w_bse_wiring_closure.py:136`, `src/gw/gw_config.py:4323` | Fixed stale full request/default. Closure gate blocked on missing CPU FFTW3-ABI provider `liblorrax_ffi_host.so`; 4 setup errors before driver compute (`08_restart_q_contract/retry.log`). |
+| 9 | `src/gw/gw_jax.py:708,475`, `docs/architecture/decisions.md:971` | Fixed: removed ineffective detach and unused local carrier reference; documentation says the shared carrier stays resident. |

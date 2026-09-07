@@ -969,10 +969,6 @@ Original driver phase comments retain their rules, measurements and owner pointe
 					# it now takes the packed operator, and the current blocks
 					# are an omega = 0 approximation inside a dynamic run.
 					# Both facts are physics, so neither is left to a log.
-			# Every chi0 call above blocks before returning.  Drop the
-			# screening view's reference so it is not an unused jit operand
-			# downstream.  The arrays themselves stay resident: the Sigma
-			# view (wfns_sigma) holds the same carrier, priced as such.
 				# The certified fit carries its already-folded scalar head and
 				# Sigma reads that head directly.  Re-folding the current direct
 				# response without resident W would be both impossible and a
@@ -2500,3 +2496,5 @@ The Green builder and two-GEMM band projector are shared. Axis band contractions
 have no collectives; projection of the tiled centroid operator retains the X/Y
 centroid reduce-scatter operations and existing final psums. Canonical files
 remain independent of processor grid and can be read into either layout.
+
+The parent Green carrier remains resident through screening and Sigma because both consume the same wavefunction bundle; no screening-only release is reported.
