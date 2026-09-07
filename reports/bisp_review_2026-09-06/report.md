@@ -50,8 +50,23 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/isdf_fitting.py` | `fit_zeta_to_h5` | 1366 | 1366 | Existing statements moved to named stages or dead selector removed |
-| `src/gw/isdf_fitting.py` | **File total** | 1542 | 1542 | Net +0 lines |
+| `src/gw/isdf_fitting.py` | `fit_zeta_to_h5` | 1366 | 124 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/isdf_fitting.py` | `_prepare_zeta_fit_geometry` | 0 | 94 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | `_build_zeta_fit_gram` | 0 | 60 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | `_report_zeta_factor_route` | 0 | 41 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | `_factor_zeta_fit_gram` | 0 | 94 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | `_prepare_zeta_output_sphere` | 0 | 51 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | `_open_zeta_fit_output` | 0 | 56 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | `_prepare_zeta_fit_wavefunctions` | 0 | 58 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | `_prepare_zeta_accumulator` | 0 | 55 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | `_prepare_coupled_zeta_tile` | 0 | 71 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | `_fit_zeta_tile` | 0 | 43 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | `_accumulate_zeta_tile` | 0 | 31 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | `_report_zeta_tile_memory` | 0 | 27 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | `_run_zeta_fit_tiles` | 0 | 95 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | `_write_zeta_fit_result` | 0 | 24 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | `_close_zeta_fit_output` | 0 | 32 | New explicit phase/direct owner |
+| `src/gw/isdf_fitting.py` | **File total** | 1542 | 1162 | Net -380 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -201,6 +216,13 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
+| `tests/test_coupled_mu123_gflat_host_spill.py` | `test_production_lifetime_spills_before_prepared_and_around_accumulate` | 18 | 22 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_coupled_mu123_gflat_host_spill.py` | `test_host_spill_is_automatic_and_only_threads_through_coupled_route` | 8 | 8 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_coupled_mu123_gflat_host_spill.py` | `test_automatic_policy_keeps_fragmentation_platform_and_host_gates` | 9 | 9 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_coupled_mu123_gflat_host_spill.py` | **File total** | 108 | 113 | Net +5 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
 | `tests/test_downfold.py` | `test_RED_TWIN_the_raw_kernel_labels_the_gram_by_MINUS_q` | 36 | 36 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_downfold.py` | **File total** | 1816 | 1816 | Net +0 lines |
 
@@ -231,9 +253,14 @@
 | `tests/test_wavefunction_bundle_face_carrier.py` | `test_memory_model_prices_resolved_layout` | 19 | 11 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_wavefunction_bundle_face_carrier.py` | **File total** | 204 | 196 | Net -8 lines |
 
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
+| `tests/test_zeta_slice_before_commit.py` | `test_c_and_prebuilt_z_select_before_outer_block_until_ready` | 22 | 22 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_zeta_slice_before_commit.py` | **File total** | 59 | 59 | Net +0 lines |
+
 | Tree scope | Before | After | Net |
 |---|---|---|---|
-| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 124702 | -545 |
+| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 124322 | -925 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
@@ -244,7 +271,8 @@
 | 5 — zeta stages (b3487462) | 1399 | 485 passed,2 skipped,1 xfailed; parent/factor-hoist/mesh-invariance/charge/refit/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-181422-2302374-7638, lx-Xg4-181430-2302826-9451; 11_zeta_stages/cpu/cpu.xml; 11_zeta_stages/p4/mos2/identity.json |
 | 6 — complete driver stages (208ed323) | 1401 | 456 passed,2 skipped,1 xfailed; centroid closure/parent/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-183807-44846-3326, lx-Xg4-183816-45219-2050; 14_driver_stages/cpu/cpu.xml; 14_driver_stages/p4/mos2/identity.json |
 | 7 — Vq stages (f579b808) | 1403 | 445 passed, 2 skipped, 1 xfailed; centroid/parent/physics/symmetry | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-184246-65473-4941, lx-Xg4-184258-66104-4580; 15_vq_stages/cpu/cpu.xml; 15_vq_stages/p4/mos2/identity.json |
-| 8 — extract charge and current fit stages (this commit) | 1404 | 453 passed, 2 skipped, 1 xfailed, 102 warnings in 177.56s (0:02:57) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-185204-112340-9401, lx-Xg4-185204-112565-5557; 16_fit_stages/cpu/cpu.xml; 16_fit_stages/p4/mos2/identity.json |
+| 8 — extract charge and current fit stages (36b46cb0) | 1404 | 453 passed, 2 skipped, 1 xfailed, 102 warnings in 177.56s (0:02:57) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-185204-112340-9401, lx-Xg4-185204-112565-5557; 16_fit_stages/cpu/cpu.xml; 16_fit_stages/p4/mos2/identity.json |
+| 9 — extract zeta writer and tile stages (this commit) | 1405 | 465 passed, 2 skipped, 1 xfailed, 102 warnings in 247.62s (0:04:07) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-190233-157458-4126, lx-Xg4-190235-157617-6713; 18_fit_writer_stages/cpu/cpu.xml; 18_fit_writer_stages/p4/mos2/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|
@@ -259,5 +287,6 @@
 | First push parent synchronization | Fetched parent immediately before first push; still c2f69987, so no rebase needed. No rebases after first push |
 | Reverted centroid-loader stage cut | 12_centroid_stages/verdict.txt: P4 exact; CPU1 failed/460 passed/2 skipped/1 xfailed because test_centroid_fft_k_plan requires in-entry calls. Source and contract relocation reverted |
 | Reverted Sigma stage cut | 13_sigma_stages/verdict.txt: P4 exact; CPU9 failed/496 passed/2 skipped/3 xfailed: four nb=3 fixtures incompatible with CPU4 band sharding, four absent-host-FFI failures, one entry-body structural guard. Source/tests/contract relocation reverted |
+| Reverted initializer stage cut | 17_prepare_stages/verdict.txt: CPU476 passed/2 skipped/1 xfailed; P4 failed because the extracted fresh-carrier stage omitted _parent_green_faces. Source/tests/contract relocation reverted |
 | Final CPU/core/P16/compile-event gates | Pending; no final-suite or performance claim |
 | CPU skips/xfail | Host FFT FFI unavailable; not WSL; existing CPU partitioned-max NaN xfail. Explicit scoped CPU logs own details |

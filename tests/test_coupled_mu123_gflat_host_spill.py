@@ -5,7 +5,8 @@ import inspect
 import numpy as np
 
 from gw import isdf_fitting
-from gw.gw_init import _select_coupled_mu123_route, fit_zeta
+from gw.gw_init import (_select_coupled_mu123_route, fit_zeta,
+                        _transverse_zeta_channel_runner, _plan_coupled_zeta_fit)
 
 
 def test_spill_helpers_are_default_off_and_use_the_collectives_door(monkeypatch):
@@ -44,7 +45,11 @@ def test_host_byte_diagnostic_counts_only_addressable_local_shards():
 
 
 def test_production_lifetime_spills_before_prepared_and_around_accumulate():
-    source = inspect.getsource(isdf_fitting.fit_zeta_to_h5)
+    source = "\n".join(inspect.getsource(fn) for fn in (
+        isdf_fitting._prepare_zeta_accumulator,
+        isdf_fitting._accumulate_zeta_tile,
+        isdf_fitting._run_zeta_fit_tiles,
+        isdf_fitting._write_zeta_fit_result))
     initial = source.index('timing.section("zeta_fit.gflat_spill_initial")')
     prepared = source.index('_coupled_rank_gate("prepared")')
     restore = source.index(
@@ -64,7 +69,7 @@ def test_production_lifetime_spills_before_prepared_and_around_accumulate():
 
 
 def test_host_spill_is_automatic_and_only_threads_through_coupled_route():
-    source = inspect.getsource(fit_zeta)
+    source = inspect.getsource(_transverse_zeta_channel_runner)
     assert "LORRAX_EXPERIMENTAL_COUPLED_ZQ" not in source
     assert "LORRAX_EXPERIMENTAL_COUPLED_ZQ_HOST_SPILL" not in source
     call = source.index("_spill_coupled_gflat_to_host=")
@@ -98,7 +103,7 @@ def test_explicit_local_route_never_silently_changes_backend():
 
 
 def test_automatic_policy_keeps_fragmentation_platform_and_host_gates():
-    source = inspect.getsource(fit_zeta)
+    source = inspect.getsource(_plan_coupled_zeta_fit)
     assert "_gflat_plan_T.target_utilization" in source
     assert "'A100' in _device_kind" in source
     assert "_p_xy in (4, 16)" in source
