@@ -195,7 +195,7 @@ def test_the_dispatch_asks_for_the_current_blocks_only():
     import inspect
 
     from gw import sigma_dispatch
-    source = inspect.getsource(sigma_dispatch.compute_sigma_xc)
+    source = inspect.getsource(sigma_dispatch._packed_dynamic_sigma_channels)
     assert "blocks=PHOTON_BLOCKS_CURRENT" in source
     # and the scalar bare-X call in that branch must not fold Sigma^B twice
     assert "bispinor_v_q_path=None," in source

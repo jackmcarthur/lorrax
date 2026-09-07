@@ -296,13 +296,13 @@ def test_build_G_tau_bounds_route_equals_the_materialised_mask_route(psis, enk, 
 
 
 def test_build_G_rejects_unknown_layout():
-    with pytest.raises(ValueError, match="layout"):
+    with pytest.raises(ValueError, match="canonical faces"):
         build_G(jnp.zeros((1, 1, 1, 1)), jnp.zeros((1, 1, 1, 1)),
                layout="bogus")
 
 
-def test_build_G_face_requires_a_gemm_plan():
-    with pytest.raises(ValueError, match="gemm"):
+def test_build_G_face_requires_a_contraction_plan():
+    with pytest.raises(ValueError, match="GEMM plan or typed parent plan"):
         build_G(jnp.zeros((1, 1, 1, 1)), jnp.zeros((1, 1, 1, 1)),
                layout="face")
 
@@ -324,25 +324,26 @@ def test_build_G_tau_forwards_layout_and_gemm_to_build_G():
     reached through the phase-computation wrapper — pinning that the
     forward is wired, not merely that build_G itself refuses."""
     enk = jnp.zeros((2, 3))
-    with pytest.raises(ValueError, match="layout"):
+    with pytest.raises(ValueError, match="canonical faces"):
         build_G_tau(jnp.zeros((1,)), jnp.zeros((1,)), enk, 1.0,
                    layout="bogus")
-    with pytest.raises(ValueError, match="gemm"):
+    with pytest.raises(ValueError, match="GEMM plan or typed parent plan"):
         build_G_tau(jnp.zeros((2, 1, 1, 3)), jnp.zeros((2, 3, 1, 1)),
                    enk, 1.0, layout="face")
 
 
-def test_build_G_and_tau_unfold_faces_before_the_only_contraction(gemm):
-    from types import SimpleNamespace
-
+def test_build_G_and_tau_transport_parent_operators_after_contraction(gemm):
     class ParentRows:
         irr_idx = np.array([1, 0, 1], dtype=np.int32)
-        sym = SimpleNamespace(operation_rows=lambda rows: (
-            None, None, np.zeros(len(rows), dtype=bool)))
+        mesh_xy = gemm.mesh
+        sym_idx = np.zeros(3, dtype=np.int32)
+        n_sym_spatial = 1
 
         @staticmethod
-        def unfold_face(face, *, spin_axis, mu_axis, mesh_axis):
-            return face[jnp.asarray([1, 0, 1])]
+        def unfold_operator(operator, *, operator_transpose, right_plan):
+            assert operator.shape[0] == 2
+            assert operator_transpose is None and right_plan is None
+            return operator[jnp.asarray([1, 0, 1])]
 
     xn = jnp.asarray(np.arange(2 * 1 * 2 * 3).reshape(2, 1, 2, 3)
                      + 1j)

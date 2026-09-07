@@ -1,12 +1,12 @@
 | Lane | Branch | State | Evidence root |
 |---|---|---|---|
-| BISP-REVIEW | `refactor/bisp-compaction-2026-09-06` | ACTIVE; final gates pending | /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/117_bisp_review_codex_2026-09-06 |
+| BISP-REVIEW | `refactor/bisp-compaction-2026-09-06` | REVIEW CUTS GATED; scalar/CPU environment and global length targets remain open | /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/117_bisp_review_codex_2026-09-06 |
 
 | Item | Status |
 |---|---|
-| 1 — dead dispatch | Two-layout planner restoration required by owner; direct Gram cut retained |
-| 2 — phase extraction | In progress; remaining functions above 120 lines are reported explicitly |
-| 3 — duplication | Canonical mesh cache keys and duplicate fit-price reuse pushed; plan authentication retained |
+| 1 — dead dispatch | Owner-required two-layout planner and caller restoration pushed; direct Gram cut retained; live absent-plan seams documented |
+| 2 — phase extraction | Nine named entry stages extracted; writer reverted after fresh-fit failure; global 120-line target remains unmet (142 functions) |
+| 3 — duplication | Sigma operand selector, shared Gram shape/refusal rules, first mesh-key cut and fit-price reuse pushed; broad cache cut reverted after missing-host-FFI gate failures |
 | 4 — docstrings | Six modules below 3.2%; complete contracts relocated with executable AST identity |
 | 5 — configuration | Table-driven parsing and typed envelope stages gated; legacy refusals retained because strict-key exemptions still apply |
 
@@ -17,7 +17,7 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/gw_jax.py` | `main` | 1448 | 118 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_jax.py` | `main` | 1448 | 118 | Stages in this module: `_open_production_report`, `_report_head_and_photon_policy`, `_load_system_inputs`, `_prepare_band_metadata`, `_report_sampling_and_bands`, `_prepare_isdf_carriers`, `_prepare_oneshot_response`, `_run_oneshot_screening`, `_install_oneshot_head`, `_persist_screening`, `_prepare_static_head`, `_run_oneshot_sigma`, `_load_kinetic_ionic_hamiltonian`, `_solve_qp_stage`, `_sigma_output_fields`, `_diagonalize_qp_hamiltonian`, `_sigma_diagnostic_fields`, `_assemble_gw_results`, `_write_gw_results`, `_close_timing`, `_report_final_observables`, `_report_file_rows`; narrative: docs/architecture/decisions.md |
 | `src/gw/gw_jax.py` | `main._config_print` | 5 | 0 | Deleted or renamed to direct owner |
 | `src/gw/gw_jax.py` | `_open_production_report` | 0 | 27 | New explicit phase/direct owner |
 | `src/gw/gw_jax.py` | `_open_production_report._config_print` | 0 | 5 | New explicit phase/direct owner |
@@ -54,7 +54,7 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/sigma_dispatch.py` | `compute_sigma_xc` | 809 | 63 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/sigma_dispatch.py` | `compute_sigma_xc` | 809 | 63 | Stages in this module: `_validate_sigma_stage`, `_static_sigma_channels`, `_sigma_hartree_fields`, `_static_sigma_result`, `_compute_mpa_sigma`, `_compute_ppm_sigma`; narrative: docs/architecture/decisions.md |
 | `src/gw/sigma_dispatch.py` | `_validate_sigma_stage` | 0 | 69 | New explicit phase/direct owner |
 | `src/gw/sigma_dispatch.py` | `_packed_static_sigma_channels` | 0 | 47 | New explicit phase/direct owner |
 | `src/gw/sigma_dispatch.py` | `_packed_dynamic_sigma_channels` | 0 | 68 | New explicit phase/direct owner |
@@ -67,9 +67,9 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/gw_init.py` | `fit_zeta` | 576 | 56 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
-| `src/gw/gw_init.py` | `compute_V_q` | 398 | 22 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
-| `src/gw/gw_init.py` | `prepare_isdf_and_wavefunctions` | 742 | 78 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
+| `src/gw/gw_init.py` | `fit_zeta` | 576 | 56 | Stages in this module: `_report_zeta_chunk_plan`, `_reuse_zeta_faces`, `_plan_transverse_zeta`, `_plan_coupled_zeta_fit`, `_fit_charge_zeta_channel`, `_report_zeta_fit_peak`, `_fit_transverse_zeta_channels`; narrative: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
+| `src/gw/gw_init.py` | `compute_V_q` | 398 | 22 | Stages in this module: `_vcoul_geometry_and_budget`, `_vcoul_transverse_inputs`, `_compute_photon_vq`, `_compute_scalar_vq`, `_finalize_vq_views`; narrative: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
+| `src/gw/gw_init.py` | `prepare_isdf_and_wavefunctions` | 742 | 78 | Stages in this module: `_prepare_fresh_isdf`, `_prepare_restart_isdf`; narrative: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
 | `src/gw/gw_init.py` | `_report_zeta_chunk_plan` | 0 | 16 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_reuse_zeta_faces` | 0 | 27 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_plan_transverse_zeta` | 0 | 28 | New explicit phase/direct owner |
@@ -163,7 +163,7 @@
 | `src/isdf/core.py` | `_distributed_backsolve` | 36 | 9 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/isdf/core.py` | `_reshard_zeta_r_XY_to_mu_XY` | 18 | 6 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/isdf/core.py` | `_factor_nbatch` | 25 | 5 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
-| `src/isdf/core.py` | `solve_zeta` | 699 | 101 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/isdf/core.py` | `solve_zeta` | 699 | 101 | Stages in this module: `_solve_zeta_token`, `_solve_zeta_fused_lu`, `_solve_zeta_replicated`; narrative: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/isdf/core.py` | `solve_zeta._ridge_indef_solve` | 7 | 0 | Deleted or renamed to direct owner |
 | `src/isdf/core.py` | `solve_zeta._ridge_indef_solve._ridged_lu` | 4 | 0 | Deleted or renamed to direct owner |
 | `src/isdf/core.py` | `solve_zeta._lu_apply_logical` | 16 | 0 | Deleted or renamed to direct owner |
@@ -242,7 +242,7 @@
 | `src/common/wfn_transforms.py` | `load_psi_gflat_padded` | 52 | 32 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/common/wfn_transforms.py` | `prepare_rchunk_carrier` | 68 | 56 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/common/wfn_transforms.py` | `iter_psi_rchunk_bandwise` | 141 | 107 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
-| `src/common/wfn_transforms.py` | `load_centroids_band_chunked` | 683 | 51 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md |
+| `src/common/wfn_transforms.py` | `load_centroids_band_chunked` | 683 | 51 | Stages in this module: `_centroid_sampling_geometry`, `_centroid_sampling_shardings`, `_centroid_stream_geometry`, `_centroid_resident_bytes`, `_centroid_fft_scan_chunk`, `_centroid_sampling_indices`, `_centroid_face_kernels`, `_load_streamed_centroid_faces`, `_load_bulk_centroid_faces`; narrative: docs/architecture/zeta_fit_face_psi_cct.md |
 | `src/common/wfn_transforms.py` | `load_centroids_band_chunked._reshard_centroid_tile` | 16 | 0 | Deleted or renamed to direct owner |
 | `src/common/wfn_transforms.py` | `load_centroids_band_chunked._finish_faces` | 25 | 0 | Deleted or renamed to direct owner |
 | `src/common/wfn_transforms.py` | `_centroid_sampling_geometry` | 0 | 44 | New explicit phase/direct owner |
@@ -290,7 +290,7 @@
 | `src/gw/gw_config.py` | `band_extrapolation_is_consumable` | 9 | 3 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
 | `src/gw/gw_config.py` | `_deck_key_line` | 11 | 7 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
 | `src/gw/gw_config.py` | `_print_deck_report` | 15 | 9 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
-| `src/gw/gw_config.py` | `read_lorrax_input` | 378 | 29 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
+| `src/gw/gw_config.py` | `read_lorrax_input` | 378 | 29 | Stages in this module: `_locate_input_blocks`, `_read_input_section`, `_report_early_retired_keys`, `_report_remaining_retired_keys`, `_refuse_unknown_input_keys`, `_parse_input_keys`, `_parse_input_kpoints`; narrative: docs/architecture/decisions.md |
 | `src/gw/gw_config.py` | `_normalize_placement` | 13 | 4 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
 | `src/gw/gw_config.py` | `scalar_head_overrides_named` | 14 | 9 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
 | `src/gw/gw_config.py` | `packed_static_envelope` | 76 | 47 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/decisions.md |
@@ -423,7 +423,7 @@
 | `src/gw/w_isdf.py` | `compute_chi0_imag_ordered` | 45 | 18 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
 | `src/gw/w_isdf.py` | `compute_experimental_no_pair_photon_chi0` | 54 | 50 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
 | `src/gw/w_isdf.py` | `_load_static_photon_hall` | 59 | 51 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
-| `src/gw/w_isdf.py` | `compute_static_photon_response` | 362 | 58 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
+| `src/gw/w_isdf.py` | `compute_static_photon_response` | 362 | 58 | Stages in this module: `_resolve_static_photon_policy`, `_read_static_photon_body`, `_report_static_photon_body`, `_screen_static_photon_body`, `_complete_static_photon_head`; narrative: docs/architecture/four_current_wiring.md |
 | `src/gw/w_isdf.py` | `_chi0_multi_kernel_args` | 39 | 29 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
 | `src/gw/w_isdf.py` | `_chi0_contour_alpha_rows` | 23 | 18 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
 | `src/gw/w_isdf.py` | `compute_chi0_contour` | 16 | 11 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/four_current_wiring.md |
@@ -556,6 +556,11 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
+| `tests/test_bispinor_dynamic_packed_route.py` | `test_the_dispatch_asks_for_the_current_blocks_only` | 9 | 9 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_bispinor_dynamic_packed_route.py` | **File total** | 232 | 232 | Net +0 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
 | `tests/test_bispinor_zeta_reuse_ast.py` | `_fit_zeta_tree` | 2 | 8 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_bispinor_zeta_reuse_ast.py` | `test_reuse_contract_precedes_and_bypasses_fit_only_planners` | 32 | 36 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_bispinor_zeta_reuse_ast.py` | **File total** | 290 | 300 | Net +10 lines |
@@ -604,6 +609,11 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
+| `tests/test_low_mem_bands_envelope.py` | `test_compute_sigma_xc_checks_the_gij_row_before_any_kernel` | 15 | 14 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_low_mem_bands_envelope.py` | **File total** | 320 | 320 | Net +0 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
 | `tests/test_mpa_sampling_config.py` | `test_explicit_mpa_fit_reuse_gates_the_fresh_head_allocation` | 7 | 8 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_mpa_sampling_config.py` | **File total** | 717 | 719 | Net +2 lines |
 
@@ -625,12 +635,28 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
+| `tests/test_windowed_exp_iEt.py` | `test_build_G_rejects_unknown_layout` | 4 | 4 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_windowed_exp_iEt.py` | `test_build_G_face_requires_a_gemm_plan` | 4 | 0 | Deleted or renamed to direct owner |
+| `tests/test_windowed_exp_iEt.py` | `test_build_G_tau_forwards_layout_and_gemm_to_build_G` | 11 | 11 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_windowed_exp_iEt.py` | `test_build_G_and_tau_unfold_faces_before_the_only_contraction` | 27 | 0 | Deleted or renamed to direct owner |
+| `tests/test_windowed_exp_iEt.py` | `test_build_G_and_tau_unfold_faces_before_the_only_contraction.ParentRows.unfold_face` | 2 | 0 | Deleted or renamed to direct owner |
+| `tests/test_windowed_exp_iEt.py` | `test_build_G_face_requires_a_contraction_plan` | 0 | 4 | New explicit phase/direct owner |
+| `tests/test_windowed_exp_iEt.py` | `test_build_G_and_tau_transport_parent_operators_after_contraction` | 0 | 28 | New explicit phase/direct owner |
+| `tests/test_windowed_exp_iEt.py` | `test_build_G_and_tau_transport_parent_operators_after_contraction.ParentRows.unfold_operator` | 0 | 4 | New explicit phase/direct owner |
+| `tests/test_windowed_exp_iEt.py` | **File total** | 361 | 362 | Net +1 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
 | `tests/test_zeta_nband_decoupling.py` | `test_the_fit_window_travels_into_the_provenance_stamp` | 25 | 29 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_zeta_nband_decoupling.py` | **File total** | 412 | 416 | Net +4 lines |
 
 | Tree scope | Before | After | Net |
 |---|---|---|---|
 | Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119592 | -5655 |
+
+| Whole tracked tree scope | Added | Removed | Net |
+|---|---|---|---|
+| Text diff against c2f69987, including relocated documentation, tests and this report | 14131 | 10849 | 3282 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
@@ -651,7 +677,8 @@
 | 15 — revert writer extraction exposed by fresh fitting (fe51b102) | 1414 | 455 passed, 2 skipped, 1 xfailed, 102 warnings in 192.85s (0:03:12) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-202436-590723-1370, lx-Xg4-202604-591455-1706; 39_writer_revert_corrected/cpu/cpu.xml; 39_writer_revert_corrected/p4/mos2/identity.json |
 | 16 — split Sigma dispatch into explicit physics stages (9f2c64d5) | 1416 | 478 passed, 2 skipped, 3 xfailed, 102 warnings in 196.16s (0:03:16); CPU1 13 passed, 1 warning in 3.65s | Si SOC GN exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-202851-614453-8799, lx-Xg4-202906-616745-3091, lx-Xg0-202904-616331-8607; 36_sigma_stages/cpu/cpu.xml; 36_sigma_stages/p4/si_soc/identity.json |
 | 17 — split fresh and restart ISDF initialization stages (49d96f1b) | 1418 | 472 passed, 2 skipped, 1 xfailed, 102 warnings in 190.64s (0:03:10) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-203308-639938-5868, lx-Xg4-203317-641493-1330; 37_initializer_port/cpu/cpu.xml; 37_initializer_port/p4/mos2/identity.json |
-| 18 — share Gram face shape and channel refusal rules (this commit) | 1419 | 459 passed, 2 skipped, 1 xfailed, 102 warnings in 194.62s (0:03:14) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-203735-696670-7606, lx-Xg4-203744-697852-1411; 41_gram_shape_rules/cpu/cpu.xml; 41_gram_shape_rules/p4/mos2/identity.json |
+| 18 — share Gram face shape and channel refusal rules (bb3a8568) | 1419 | 459 passed, 2 skipped, 1 xfailed, 102 warnings in 194.62s (0:03:14) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-203735-696670-7606, lx-Xg4-203744-697852-1411; 41_gram_shape_rules/cpu/cpu.xml; 41_gram_shape_rules/p4/mos2/identity.json |
+| 19 — align final guards with Sigma stages and parent Green transport (this commit) | 1423 | 61 passed, 1 warning in 4.12s | Si SOC GN exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-205528-792709-2931, lx-Xg4-205531-793059-9785; 43_final_guard_owners/cpu/cpu.xml; 43_final_guard_owners/p4/si_soc/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|
@@ -670,5 +697,22 @@
 | Configuration guard retry | 21_config_stages/verdict.txt: initial CPU750 pass/1 fail depended on a moved driver comment; reverted and reapplied with owner-based structural guard in22_config_corrected. Its P4 receipt is reused after exact production-diff comparison |
 | Restored low_mem_bands/layout dispatch | Owner amendment applied: gflat_memory_model restored byte-for-byte to c2f69987; both gw_init caller guards and planner tests restored. Config and Sigma flagged lines remain in extracted owners; 34_restore_layout/dispatch_audit.json records the mapping |
 | Writer extraction failed fresh-fit gate | 35_fresh_fit/mos2_6x6, step lx-Xg4-201745-548578-5869: _close_zeta_fit_output lacks nqx/nqy/nqz arguments; writer extraction reverted to its exact pre-extraction version (retaining the Gram API). Fresh retry39 passed: eqp0/eqp1 max0.018 microeV vs104, step lx-Xg4-202436-590632-3315, fresh_eqp0.txt and fresh_eqp1.txt. Original copied-zeta evidence did not cover this branch |
-| Final CPU/core/P16/compile-event gates | Pending; no final-suite or performance claim |
+| Broad mesh-value cache cut reverted | 42_mesh_value_keys/verdict.txt: CPU463 passed,2 missing-host-FFT failures,6 skipped,3 xfailed; Si SOC P4 exact. All12 file changes reverted per owner instruction; initial19_owner_cache_keys cut remains |
+| Global length target unmet | 142 functions exceed120 lines; 30_residual_inventory/remaining.json. The prioritized writer extraction was reverted after a real fresh-fit defect; many remaining SC, preprocessing, kernel and service functions were outside the named entry-stage cuts and were not covered by a matching supplied deck |
+| Phase-specific banners retained | Unique phase announcements remain; no blanket replacement of diagnostics or changes to their synchronization/exception timing |
+| Final CPU/core/P16/compile-event gates | Completed with recorded limits below: core57 passed/19 device-count skips; P16 all printed files exact and473 compile events versus674; full CPU has3 inherited host-FFI failures after6 stale guards were fixed |
 | CPU skips/xfail | Host FFT FFI unavailable; not WSL; existing CPU partitioned-max NaN xfail. Explicit scoped CPU logs own details |
+
+| Final gate | Result | Step / allocation | Artifact |
+|---|---|---|---|
+| Untouched Green references | Si SOC and MoS2 completed on ebee1467; scalar stalled after screening | allocation58006471 | 33_green_references/{si_soc,mos2,si_scalar}/source.txt and driver.rank0.log |
+| Fresh MoS2 6x6 P4; no copied tmp | eqp0/eqp1 max0.018 microeV vs104 across210 rows; DFT energies identical | 58006471 / lx-Xg4-202436-590632-3315 | 39_writer_revert_corrected/{fresh_eqp0.txt,fresh_eqp1.txt} |
+| Full CPU union and every bispinor pytest module | 1061 passed,9 failed,6 skipped,1 xfailed; six stale guards corrected by focused gate below | 58006471 / lx-Xg0-204800-756033-8929 | 23_final_gates/cpu_retry/cpu.xml; cpu_suites.txt |
+| Focused final guard owners | 61 passed; resolves two extracted-Sigma guards and four pre-ebee Green-interface tests without production changes | 58006471 / lx-Xg0-205528-792709-2931 | 43_final_guard_owners/cpu/cpu.xml |
+| Remaining CPU failures | Three inherited missing-host-FFI cases: DFT dipole provenance and two bispinor V_q SlabIO tests; no all-green CPU claim | Same full CPU step | 23_final_gates/cpu_retry/cpu.xml; baseline parent sub_14_final_audit/final_gate_table.md |
+| Main core tier (lx test) | 57 passed,19 device-count skips | 58006471 / lx-Xg4-204635-749908-8956 | 23_final_gates/core/core.xml |
+| MoS2 6x6 P16 copied-tensor identity | eqp0/eqp1 and sigma_diag identical to104;217/217/246 printed lines, zero differing rows | 58007765 / lx-Xg4-205616-796667-3750 | 44_p16_retry/identity.json |
+| P16 compile-event count | 473 on every rank; baseline rank0 P4 count674; no increase (cross-geometry count check, not a speedup attribution) | Same P16 step | 44_p16_retry/compile_counts.json; donor104/driver.rank0.log:1313 |
+| Four-node pool release | Allocation cancelled after successful step completion | 58007765 | 44_p16_retry/release_status.txt |
+| Rejected first P16 launch | Allocation FAILED before scientific output; retried on a successfully returned allocation | 58007540 / lx-Xg4-204952-766253-9574 | 23_final_gates/p16/launch.log |
+| Non-pytest launchers in initial CPU collection | Four standalone GPU scripts have no pytest test functions; removed from CPU payload after import-time host-FFI refusal | 58006471 / lx-Xg0-204635-749765-5736 | 23_final_gates/non_pytest_launchers.txt; cpu/collection.log |
