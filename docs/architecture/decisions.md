@@ -737,3 +737,458 @@ The full landing gate exposed a downstream reader left behind by the GW carrier 
 ### 2026-09-06 — adopted S phase-2 class residency
 
 The ordered phase-2 integration adopts one compiled Sigma scan and one restore producer per endpoint-family class. The producer returns 1 CC, 3 CT/TC or 9 TT full-q blocks, with centroid axes distributed over all P ranks. This is a correction to the original one-full-q-block residency contract: a TT stack uses `9 * nk_tot * M_T_packed**2 * sizeof(complex128) / P` bytes per rank. It is transient per class, not an interaction cache; each executable shares one Green. Classes are submitted without intervening host fences, so a globally single-class memory lifetime does not follow from this source structure. The campaign report records the measured whole-process allocator peak and the lane gate supporting this explicitly requested integration.
+
+
+### GW driver phase rulings retained during 2026-09-06 compaction
+
+Original driver phase comments retain their rules, measurements and owner pointers here.
+
+```text
+	# Same factory the module-scope seam used, so the two cannot disagree.
+	# ---- Stage timing: ONE table, and it sums to the wall -------------------
+	# ``timing.reset()`` used to sit just above the ISDF call, which threw
+	# away everything the prologue had already recorded.  Resetting HERE,
+	# before any stage runs, is what lets the prologue appear at all.
+	# ``_t_main`` is the wall this table is closed against
+	# (``report(wall=...)``), so the printed rows plus ``(untimed)`` always
+	# add up to the run — a reader can tell a complete accounting from a
+	# partial one without doing arithmetic.
+	#
+	# The startup stack now runs ABOVE this reset (it runs above ``main()``),
+	# so its own ``collective_warmup`` section is wiped here.  That is fine
+	# and deliberate: ``initialize_communicator_stack`` measured every phase
+	# itself and handed the numbers back in ``RUNTIME.facts['elapsed']``, and
+	# the epilogue re-records them as a DECOMPOSITION of the pre-main span
+	# rather than as extra rows.
+	# Work done BEFORE main(): the module body's
+	# ``initialize_communicator_stack()`` (env, jax.distributed, backend
+	# init, mesh + clique warm-up) and every import under it.  Measured 75.0 s
+	# to first output on a cold node vs 2.1 s warm — the largest single row in
+	# a small run, and previously in no row at all.
+	# Configuration parsing predates the scientific report file.  Its deck
+	# echo is forensic detail, so it follows the driver's ONE debug switch.
+	# Default/derivation provenance is different: it is part of the scientific
+	# record, so retain just those lines and replay them once the report exists.
+	# ---- Configuration ----
+	# The two orthogonal physics axes are resolved + validated up front so
+	# inconsistent (qp_solver × compute_mode × accumulation) combinations
+	# fail before any heavy compute (see ``LorraxConfig.qp_solver``).
+	# A mode may be DECLARED on the axis before its Σ stage exists (today:
+	# ``mpa``).  Refusing here — before the WFN read, before ISDF, before
+	# any allocation is spent — is the difference between an operator
+	# learning in the first second and learning after the ζ fit.  The
+	# refusal names the mode; a typo'd mode value never reaches this line
+	# because ``config.compute_mode`` already raised on it.
+		# Which route a bare-transverse deck takes is deck-visible, never
+		# silent: the packed path and the incumbent charge-screened + Sigma^B
+		# path are the SAME physics inside the envelope below (lane C gate,
+		# reports/bisp_c_bare_as_packed_2026-09-01), but they differ in the
+		# q->0 head mechanism, so the reader must be told which one ran and,
+		# when it is the incumbent one, the first condition that decided it.
+			# In production mode print0 sinks component chatter, so this goes
+			# into the RUN RECORD: which of two physically equivalent-inside-
+			# the-envelope routes ran is exactly the fact a later reader needs
+			# (they differ in the q->0 head mechanism).
+		# HEADS ARE ALWAYS ON (owner ruling 2026-09-01,
+		# docs/architecture/decisions.md; TASTE.md row 20).  The packed route
+		# already prints a boxed WARNING banner and a `Photon head` record
+		# line when head_correction=off (gw.w_isdf, lane B).  The INCUMBENT
+		# route printed only "no special Gamma-cell contribution" in the
+		# component chatter that production mode sinks, so a headless
+		# bispinor bulk / dynamic / x_only run reached eqp1.dat with no
+		# DEBUG token anywhere in the run record (lane J section 3.c).
+	# ---- The runtime is already up ----------------------------------------
+	# ``RUNTIME`` was built by ``initialize_communicator_stack()`` at the top
+	# of this module, above ``import jax``, because the JAX env defaults only
+	# bind before jax reads them.  ``RUNTIME.mesh`` is THE run's square
+	# ('x','y') mesh with every communicator it will need ALREADY created —
+	# the warm-up is not optional and not the physics' job:
+	#   * a mesh this process owns no device on is refused there, naming the
+	#     caller, instead of surfacing a bare StopIteration deeper down;
+	#   * ``warm_mesh_cliques`` (CPU/MPI) ran as well as ``nccl_warmup``
+	#     (GPU/NCCL).  This driver used to call only the latter, so under
+	#     ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` its MPI cliques were
+	#     created incidentally, by whichever physics kernel happened to fire
+	#     the first collective (``common/zeta_projection.py``,
+	#     ``common/contract_bands.py`` each warm their own mesh).  That works
+	#     only while those early programs stay small enough for XLA's
+	#     SEQUENTIAL thunk executor; the parallel executor lands on the
+	#     ``MPI_Is_thread_main`` refusal that killed the BSE TDA Lanczos
+	#     (32 refusals at P=16, gate 7881216).
+	# Do NOT call prepare_mesh() again here: a second Mesh object is a second
+	# set of communicators and a second copy of every shape-keyed jit cache.
+	# HOW MANY HDF5 LIBRARY INSTANCES IS THIS PROCESS CARRYING?  Measured
+	# from /proc/self/maps, not asserted (audit A1 fix 3).  Two
+	# instances — h5py's bundled libhdf5 and the FFI's cray
+	# libhdf5_parallel — alternately touching one file is the standing
+	# explanation for the metallic driver's iteration-3 rank-0 segfault,
+	# and until now the condition was INFERRED from the deployed
+	# artifacts' NEEDED entries rather than observed in the running
+	# process.  Healthy inventory is diagnostic-only and quiet by default;
+	# an unsafe condition is always printed.  ``file_io.hdf5_owner`` probes
+	# again after each SC iteration's store cycle, with the paths that were
+	# touched through both.
+	# ---- System inputs: WFN, symmetry tables, ISDF centroids ----
+	# This receipt is reporting evidence.  ``resolve_qgrid_symmetry_tables``
+	# remains the one q-storage policy/table authority and deliberately
+	# remeasures through the same symmetry_maps service at its execution seam.
+	# The two user-facing execution dials belong in the first startup lines.
+	# Their numeric memory receipt needs the loaded WFN symmetry and centroid
+	# basis, so defer the longer architecture/method sections until now.
+	# A self-consistent diagonal buffer evaluates a bounded number of real
+	# states immediately outside the user-named nval/ncond window.  The named
+	# counts remain the physical/full-matrix window; only Meta's execution
+	# edges expand.  Other solvers and buffer_nbands=0 retain their exact
+	# historical Meta construction.
+	# THE in-memory centroid order (common.centroid_basis): whole symmetry
+	# orbits per shard so every symmetry action is rank-local; files keep
+	# the canonical order and convert at the I/O seam.  Each current family has
+	# its own independently packed basis.
+	# ``Meta`` describes the charge/CC carrier.  Spatial-current enablement
+	# remains the independently parsed ``config.bispinor`` policy.
+	# THE ``max`` IS NEVER SILENT.  Which of the two counts sized the ISDF ζ
+	# fit is exactly the thing a reader of this log needs and cannot infer:
+	# ``nband`` in the deck echo is already the max, so without this line a
+	# split deck and an unsplit one at the larger count print the same
+	# number.  Printed here, above the ζ fit, because this is where the
+	# window it is about is decided.
+	# RESOLVED, not requested: ``config.zeta_nband`` is a logical deck count
+	# and the edge the fit gets is measured against the PADDED ``b4``.  This
+	# banner used to print "sized for 700 bands" on a deck whose resolver and
+	# memory planner were both acting on 160 (gw_init.resolve_zeta_fit_edge is
+	# the one place that comparison is made).
+	# ---- dynamic-Sigma logical/carrier receipt ----
+	# Resolve the same square carrier the producer will use, early enough to
+	# print the allocation shape before ζ fitting.  This is informational:
+	# indivisible windows are ordinary exact-zero pads, not a geometry refusal.
+	#
+	# ``compute_mode = mpa`` reaches it whatever the deck says about layout,
+	# because the MPA executor emits the sharded cube unconditionally.
+		# The second refusal that used to live here -- sharded layout with
+		# slab_io=h5py_allgather at P>1, which would have re-introduced the
+		# full Σ_c(ω) cube gather inside the sigma_mnk.h5 writer -- is gone
+		# with the tier.  It was door 7 of 7 and the only one that read
+		# ``jax.process_count()`` raw instead of the launcher-aware count,
+		# so it was also the weakest.  Nothing can select that writer now.
+	# DFT eigenvalues on the Σ band window (Ry) — one fetch, reused by the
+	# Σ_X diagnostic, the SC initial state, degeneracy averaging, and the
+	# results writer.
+	# Single resolver for every q→0 head sample we'll need this run; the
+	# COHSEX static head, the W0 restart-flush head, and the PPM dynamic
+	# head all read from the same plumbing (overrides → epshead → s_tensor)
+	# so they share one cache.  See ``head_correction.HeadResolver``.
+	# Optional BGW vcoul override (purely diagnostic — bit-reproducible BGW
+	# comparisons).  Returns None when ``use_bgw_vcoul`` is False.
+	# Everything from ``main()`` entry to here is the driver PROLOGUE:
+	# config parse, the PHDF5 MPI pre-init, WFN + symmetry +
+	# centroid reads, the head resolver.  (The mesh, its collective warm-up
+	# and the compile cache are NOT here any more — they happen above
+	# ``main()`` in ``initialize_communicator_stack`` and are reported as
+	# their own rows.)  It is
+	# executed exactly once and, on a cold node, it is the largest single row
+	# in this table (75.0 s to first output, job 7881949) — so it is named.
+	# ``timing.record`` rather than a ``with`` block deliberately: the block
+	# above is another workstream's and must not be re-indented for a timer.
+	# ISDF fitting or restart loading
+	# The Σ kernels take the parent carrier whenever one exists: their G
+	# contraction and band projection then run on the raw parents and the
+	# band matrix is broadcast back to full k (gw.wavefunction_bundle.
+	# sigma_face_kernel_kwargs); the q->0 head wings take the same view and
+	# stream the children from the carrier.  Density, output and restart
+	# consumers keep the primary bundle.
+	# Bispinor: σ^B reads V^{i,j} tiles from v_q_bispinor.h5 and
+	# samples ψ at the transverse-centroid Wfns bundle (None when
+	# bispinor=False or centroids_file_current is unset).
+	# LOUD guard (quality pattern #7): the Σ kernels' Σ^B fold-in is a
+	# structural no-op when ``wfns_transverse``/``bispinor_v_q_path`` is
+	# None — a bispinor run reaching Σ without them would exit rc=0 with
+	# Σ^B silently dropped.  Both producer paths (fit + restart) raise
+	# with specifics before this point; this is the last-line invariant.
+	# ---- Screening: χ₀ → W = (1 − Vχ)⁻¹ V at every ω the Σ scheme needs ----
+	# X_ONLY requests no screening at all.
+		# The minimax τ-axis, solved on G's actual spectral range — shared
+		# by every χ₀ build this run (static + probe W here, SC re-solves).
+		# TIMED because it is the classic mis-attribution on this path: the
+		# crossing-minimax solve costs ~95 s cold with no cache and no
+		# shipped table (XPROF_TRACE_GUIDE §"Known LORRAX cost centers"),
+		# and with no row of its own that 95 s reads as "GW startup".
+			# The minimax service announces every served/uncertified rule with
+			# ``warnings.warn`` in each process.  This request is deterministic
+			# and collective, so keep its loud provenance warning once on the
+			# output owner instead of repeating it P times.  The filter is local
+			# to this call; exceptions and warnings from later rank-local work
+			# remain untouched.
+					# A metal's fundamental gap is not its smallest MEANINGFUL
+					# transition; the smearing width is.  Insulating decks
+					# carry no smearing and keep the incumbent interval.
+	# One-shot and QSGW now share one response/finalization implementation.
+	# Build the irreducible DFT tensor and its wings on the exact chi0 band
+	# manifold before W, then retain only the tiny finalized head after W.
+			# The DYNAMIC packed route keeps the scalar charge owner (its CC
+			# channel is Sigma_x + Sigma_c(omega) on W_00), so it still needs
+			# the direct DFT response its q->0 head samples are finalized
+			# from.  Only the STATIC packed mode, whose packed Gamma-cell
+			# completion replaces that machinery outright, skips it.
+			# Every self-consistent mode builds its exact frequency plan and
+			# response inside the map.  A pre-map response would exist only to
+			# seed a restart artifact and could be mistaken for final physics.
+		# An explicit MPA fit is validate-or-refuse and already owns its
+		# finalized scalar head.  Keep the live plan above for authentication,
+		# but do not allocate a direct response the reuse branch must discard.
+			# ONE charge bundle: both shipped bispinor_gw values ride the
+			# raw kinetic-balance carrier, so the scalar q->0 head/wings are
+			# built on the run's own charge centroids.  The separate
+			# source-Pauli head bundle went with the two retired
+			# carrier-comparison modes (2026-09-01).
+			# The Sigma view carries the parent carrier: on parents-only
+			# storage the wings stream the children from it (qsgw_head).
+	# SC solves W inside each map and persists only the final accepted map.
+	# Do not perform a redundant DFT screening solve here: besides its cost,
+	# that seed body used to survive long enough to be paired with a final head.
+				# ONE selector, resolved in gw_config: full_static_cohsex screens
+				# all sixteen blocks inside the packed Dyson solve; the
+				# bare-transverse family declares chi_TT = chi_CT = 0 and screens
+				# only CC, whose owner is the incumbent scalar screening model.
+				# PHASE 3.  On the dynamic packed route the CHARGE block is
+				# frequency dependent and is owned end to end by the scalar
+				# Sigma_c machinery, so this run needs the mode's FULL role
+				# set ({static, probe} for the plasmon-pole pair) rather than
+				# the single static role the bare family's packed CC block is
+				# assembled from -- and it must KEEP them past this block.
+				# Sigma consumes packed block views directly.  Do not extract a
+				# scalar W00 body solely to satisfy the legacy role mapping.
+				# The DYNAMIC route keeps W_by_role: its charge channel is the
+				# ordinary Sigma_c(omega) on those same role W's.
+				# The run record (gwjax.out) must state the Gamma-cell status
+				# of the packed mode in production mode, where print0 sinks
+				# component chatter (owner ruling 2026-09-01: a headless
+				# packed run is a DEBUG setting and must say so).
+					# THE RUN RECORD MUST SAY WHICH SIGMA RAN.  A bispinor
+					# plasmon-pole deck used to take the incumbent
+					# charge-screened + Sigma^B route with no TT Gamma head;
+					# it now takes the packed operator, and the current blocks
+					# are an omega = 0 approximation inside a dynamic run.
+					# Both facts are physics, so neither is left to a log.
+			# Every chi0 call above blocks before returning.  Drop the
+			# screening view's reference so it is not an unused jit operand
+			# downstream.  The arrays themselves stay resident: the Sigma
+			# view (wfns_sigma) holds the same carrier, priced as such.
+				# The certified fit carries its already-folded scalar head and
+				# Sigma reads that head directly.  Re-folding the current direct
+				# response without resident W would be both impossible and a
+				# second head path.
+	# Persist W0_qmunu + q=0 head scalars to the ISDF restart file for
+	# downstream consumers (BSE, future Σ-builders); no-op unless screened
+	# and the restart file exists.
+	# TIMED, and it was not.  The stage was measured at ~1.7 MB/s
+	# aggregate and 2 h 55 m of total silence at c2406 (AF.4c), back when
+	# this call gathered the whole (nq, μ, μ) W0 onto one rank on the
+	# ``h5py_allgather`` backend to write it.  That backend is gone
+	# (233a830d) and the write is SlabIO's per-rank tile path now, so the
+	# number is history, not a prediction — yet the call still sat
+	# between two timed stages with no
+	# section of its own, so it appeared in the run's wall clock and in
+	# NO row of the stage table.  Naming it is the precondition for
+	# anyone attributing that wall time (the write path itself is
+	# workstream AE/AF's; this is the instrument, not the fix).
+	# ``sym``/``centroid_indices`` below are for the q-storage resolution
+	# ONLY (see the callee): W0 must land on the same q-set V did, and the
+	# way to be sure of that is to ask the same resolution point about the
+	# same centroid set rather than to infer it from a shape.
+	# q→0 head correction.  The bare-X head is the same physical quantity in
+	# both COHSEX and PPM modes; gating this on ``not use_ppm_sigma`` was
+	# the original ``Bare Σ_X missing q→0 head'' bug (skill compare/SKILL.md
+	# §4i).  The SX/COH head pieces are also attached to the static
+	# sig_sx/sig_coh in compute_cohsex_sigma, but for PPM those static values
+	# are overwritten downstream (sig_sx ← sig_x, sig_c ← PPM-evaluated
+	# correlation), so only the X-head survives — which is the piece needed.
+			# The dynamic packed route's CC head is this scalar one; only the
+			# static packed mode refuses it (its packed completion carries the
+			# charge sector, and a scalar overlay would double count it).
+		# A screened SC+FULL map always builds/folds its own head.  Supplying
+		# and printing a direct DFT seed here would be false provenance even
+		# though the map later replaces it.  OFF/NLF and unscreened X_ONLY keep
+		# the direct/default route because that is the policy they consume.
+					# MPA has no {0,probe} persistence grid; its one-shot
+					# static contribution here is bare X from the direct sample.
+	# ---- Σ_xc + V_H: ONE dispatch for every mode ----
+	# The same ``compute_sigma_xc`` call the SC iteration map makes each
+	# step — static COHSEX kernels for X_ONLY/COHSEX, the PPM pipeline
+	# (fit → 4-branch τ-integration → analytic q→0 head → at-DFT interp)
+	# for the dynamic modes, with the QSGW-symmetrised Σ_xc evaluated at
+	# E_DFT (a one-shot full-matrix effective Hamiltonian, distinct from the
+	# fixed-state diagonal G0W0 output; ``solve_qp`` re-evaluates for
+	# fixed_point).
+	# SC-iteration-1 ≡ this call, pinned by tests/test_invariance_gates.py
+	# ::test_sc_iteration1_equals_one_shot.
+	# SC runs skip it — the iteration map would re-do this work on iter 1.
+	#
+	# History note (kept here because it explains a specific decision and
+	# is not yet captured anywhere else): the analytic q→0 head injected
+	# at the end of ``compute_ppm_sigma_pipeline`` was re-added in
+	# 2026-04-25 after being removed in 1542342 (Apr-10).  Magnitude is
+	# ±W^c(0)/(2·V_cell·N_k) on-shell — ~1.24 eV/band on Si 4×4×4 60b.
+	# See reports/mos2_kgrid_gnppm_head_convergence_2026-4-10/.
+		# The one-shot path deliberately retains the full BZ.  Use the same
+		# named k-set boundary as the SC map, here as a validation rather than
+		# a selection, so both paths state what their Sigma tables contain.
+		# Screening bodies have no consumer after Sigma.  In the photon mode
+		# this drops the packed V/W pair at the exact lifetime boundary rather
+		# than carrying O(N_gamma^2) arrays through QP/output post-processing.
+		# Print bare Σ_X diagonal for ISDF quality assessment.  Apply
+		# BGW-style degenerate-set averaging (mirrors Sigma/shiftenergy.f90)
+		# unless disabled — without it, the QE basis-dependent splitting
+		# within degenerate manifolds shows up as a few-meV spread across
+		# symmetry-equivalent bands.
+		# ── Σ stage gate ─────────────────────────────────────────────
+		# Σ_x[n,n] = −Σ_{m∈occ} ⟨nm|V|mn⟩ is a negative-definite
+		# quadratic form in a positive-semidefinite kernel: every
+		# diagonal entry is strictly negative in a correct run, whatever
+		# the system.  A positive one is a sign / conjugation /
+		# band-index slip, not a convergence issue.  The magnitude
+		# bracket is deliberately loose (bare exchange runs −40…−5 eV
+		# for the production decks) — it exists to catch a units or
+		# basis-normalisation slip, not to police physics.
+	# ---- QP Hamiltonian: H_QP = (H_DFT - V_xc) + V_H + Σ_xc ----
+	#
+	# Static operators retain the layout selected by their producers through
+	# the H build and diagonalisation.  Rank-0 text output consumes bounded
+	# ``(nk,nb)`` diagonal mirrors; it never gathers a band-sharded
+	# ``(nk,nb,nb)`` component merely to print its diagonal.
+	# Provenance gate BEFORE the read.  In particular, refuse the retired
+	# format that folded V_H into kin_ion: this driver always adds the live
+	# G-space field.
+	# TIMED as one row: the gate and slab read are one logical stage.
+	# ---- update_H[Σ; qp_solver] — all branches yield ``sigma_total``
+	# (Σ_xc + V_H, Ry, DFT basis, replicated) whose eigh gives E_qp/U_qp.
+	# ``rotations_written`` is run_sc_driver's own report of whether it
+	# wrote qp_wfn_rotations.h5; the writer below reads the fact rather
+	# than re-deriving the predicate.
+		# SC-QSGW: iterate ψ-rotation → χ₀ → W → Σ_xc (the same
+		# compute_sigma_xc dispatch, mode-agnostic) to the fixed point;
+		# the returned SigmaResult is already rotated back to the DFT
+		# basis and its sigma_omega_h5_path points at the converged
+		# single-write sigma_mnk.h5.  See ``sc_iteration.run_sc_driver``.
+		# Executed once; it is the whole SC loop, so it is the run's biggest
+		# row when it fires and must not hide inside ``(untimed)``.
+			# The self-consistent map takes the Σ bundle: under parents-only
+			# storage its carrier is the run's only ψ and the map's rotation
+			# acts on it (wavefunction_bundle.rotate_wavefunctions).
+			# SC's retained Sigma, its H/E/U and the mean-field operators used
+			# by post-processing all stay on the loop's star wedge.  Output
+			# writers alone unfold that complete result to their file wedge.
+		# One-shot: ``one_shot_dft`` = Σ_xc was already QSGW-built at
+		# E_DFT inside compute_sigma_xc (pass-through; also covers static
+		# modes and the streamed-Σ_c stand-in); ``fixed_point`` = diagonal
+		# on-shell solve + scissor + QSGW rebuild at the solved energies.
+		# eqp0.dat/eqp1.dat are at-DFT in every case (written downstream
+		# from ``sigma_c_at_dft_ev`` / the ω-grid diag, not from here).
+	# Optional additional ladder: iterate ONLY the already-built, full-matrix
+	# one-shot Sigma(omega).  This deliberately sits after the sole screening /
+	# Sigma stage and calls neither dispatch, so write_eqp2 cannot accidentally
+	# turn into a second GW calculation.  The callee rotates the fixed cube into
+	# each updated QP basis before evaluating its off-diagonals.
+	# ---- Post-Σ seam: bare locals from the SigmaResult ----
+	# One extraction for SC and one-shot alike; PPM-only fields are None
+	# in static modes.
+	#
+	# On the SC path the finalize rotates every matrix consumed here,
+	# including the dynamic correlation cube, to the DFT output basis.  The
+	# original cube was already persisted in the last map's QP compute basis,
+	# where the QSGW ansatz is defined.  The separable analytic head diagonal is cheap
+	# enough to rotate without materialising its dense matrix; SC returns that
+	# as a separate DFT-basis diagnostic while leaving SigmaResult's
+	# basis-of-computation field untouched.
+	# The energies THIS Σ was evaluated at (E_DFT one-shot, the map's input
+	# QP energies under SC).  Not degen-averaged below with the Σ channels:
+	# it is a spectrum, not a self-energy component.
+	# ---- BGW-style degenerate-set averaging at the H-build seam ----
+	# (mirrors Sigma/shiftenergy.f90; see ``degen_average``).
+		# Head-only debug columns must undergo the SAME DFT-degenerate-set
+		# averaging as the Sigma components they decompose.  After the QP->DFT
+		# diagonal transform an occupied-projector contribution need not be
+		# identical in an arbitrary basis inside a degenerate manifold.
+	# The PPM output below needs only bare exchange's diagonal.  Extract it
+	# collectively while every rank is still in lockstep; never host-convert
+	# the full band-sharded operator.
+	# Σ_xc(E_DFT) diagonal (eV) — drives eqp_g0w0.dat (PPM one-shot
+	# only).  Form it AFTER the one canonical conditioning seam above: forming
+	# this sum before ``average_sigma_components`` made eqp_g0w0 retain raw,
+	# unequal degenerate diagonals even while every other live text output used
+	# the conditioned X/C pair.  With averaging disabled the seam is a no-op,
+	# so this same expression deliberately preserves the raw red twin.
+	# ---- Single H-build + diagonalization on the producer-selected layout ----
+	# Gate the two inputs to the QP diagonalization *before* eigh: LAPACK
+	# on a NaN-bearing matrix returns without complaining, and the garbage
+	# then propagates into eqp0/eqp1/WFN_qp.h5 with rc=0.  ``kin_ion`` also
+	# comes off disk (kin_ion.h5), so this doubles as the content check on
+	# that interface.
+	# REFUSALS, not warnings, and that distinction is the 2026-08-15 bcc-Fe
+	# finding: an all-NaN Σ_c produced an all-NaN E_QP column, a NaN E_F and
+	# a NaN scissor fit, and the run exited rc=0 in 883 s with only a warning
+	# line to show for it (JID 57051742, CLAIMS 204).  The SC path catches
+	# that on its SECOND map call, through
+	# ``_solve_head_occupations -> OccupationState`` finiteness; a one-shot
+	# run has no second map call, so this seam -- which both paths cross -- is
+	# where the guard has to be.  ``LORRAX_ALLOW_NONFINITE_RESULT=1`` is the
+	# named escape for forensics.
+	# TIMED: nk independent (nb_sigma, nb_sigma) Hermitian eigensolves.  It is
+	# one statement and normally seconds, but it is O(nk·nb³) and it is the
+	# only dense LAPACK call on the post-Σ path, so it is the row that tells
+	# you when the band window (not the physics) became the cost.
+	# ---- One-shot WFN_qp.h5 dump (drop-in BSE / restart input).  SC
+	# already wrote its own WFN_qp.h5 above via dump_qp_wfn_artifacts
+	# (using state_final.H_qp_dft) — same physics, slightly different
+	# numerics from the post-Σ-seam eigh path.  Skip the second write
+	# in SC to avoid clobbering.
+	# PPM mode: feed the writer the on-shell diag(Σ_c(E_DFT)) (Ry) so the
+	# eqp0.dat "sigC" column reports dynamic correlation directly comparable
+	# to BGW's (SX-X)+CH at Eo=E_DFT.  Off-diagonals stay zero — the full
+	# Σ_c(ω, k, i, j) tensor is in sigma_mnk.h5 for callers that need them.
+	# Σ_c diagonal on the ω-grid: feed the eqp1.dat writer's central-diff
+	# Z-factor.  Pulled from the on-device sharded tensor when available.
+			# Output-only diagonal curve.  The full persisted operator stays raw,
+			# while this curve uses the SAME canonical group owner at every omega;
+			# assemble_eqp consequently derives C(E_DFT) and Z from one function.
+	# Per-state Gamma-cell attribution in the same conditioned DFT basis as
+	# sigma_diag.dat.  The packed diagnostic owns CC/CT+TC/TT for its static
+	# completion; the dynamic scalar owner contributes the X and C charge head.
+	# ---- Output ----
+	# Collectively extract only the bounded static diagonals before the
+	# rank-0-only writers.  The full operators remain on their original mesh;
+	# calling ``np.array`` on one here would either fail at multi-host P>1 or
+	# silently reintroduce the full-matrix replication this layout avoids.
+			# Dynamic sigma_diag owns sigXC as the direct per-state
+			# sigX + sigC(E_DFT) interpolation, whereas the H operator above is
+			# the QSGW-Hermitianized matrix.  Their diagonals can differ at the
+			# micro-eV level because they use distinct interpolation kernels.  The
+			# public Lorentz split is a decomposition of the old sigXC column, so
+			# define its CC residual at that SAME output seam; CT+TC and TT remain
+			# the independently computed static current contributions.
+		# Canonical Σ-decomposition table.  Explicit debug requests it for all
+		# modes; actual coupled q=0 completion auto-arms the same writer.
+		# The QP-ladder half of sigma_mnk.h5's opt-in plotting appendix
+		# (no-op unless ``write_qsgw_datasets``).  HERE and not at the Σ
+		# seam because two of the three ladders need ``kin_ion``, which
+		# ``compute_sigma_xc`` never sees; the QSGW cube itself was
+		# already appended by whichever path wrote the file
+		# (``qsgw_utils.write_qsgw_sigma_cube``).  Rank-0 and barrier-free
+		# like every other writer in this block: eigenvalues are basis-
+		# free, so this one seam is correct for the one-shot and the
+		# self-consistent paths alike.
+		# Degen averaging was applied once at the H-build seam upstream;
+		# the writer just serializes the already-averaged Σ components.
+			# THE symmetry object, not tables off it.  Every k-basis
+			# decision is made where the data is written, through
+			# ``symmetry_maps.reduce_full_bz_to_file_wedge``.
+		# DECOMPOSE the pre-main span; do not add rows to it.  The entry
+		# point timed its own phases (it happened before ``timing.reset()``,
+		# so its own ``collective_warmup`` section was wiped), and the
+		# remainder of ``_pre_main`` is the import storm — 75.0 s cold vs
+		# 2.1 s warm, job 7881949.  Recording the phases AND the whole span
+		# would double-count and break the table's "rows + (untimed) ==
+		# wall" property, which is the only thing that lets a reader tell a
+		# complete accounting from a partial one.
+		# ``wall=`` closes the table: printed rows + ``(untimed)`` == the
+		# whole PROCESS when /proc gave us the pre-main span, else main().
+```
