@@ -14,4 +14,5 @@ Evidence root: `/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/ru
 | 8 | `e224a753` | `08_restart_q_contract/parser.log`: auto/ibz PASS; `retry.log`: 4 collected, 4 setup errors | Parser/doc fix PASS; full closure gate BLOCKED: required CPU `liblorrax_ffi_host.so` absent. CPU fixture preserves its platform rather than attempting a hidden GPU run. |
 | 9 | `af0942bf` | `09_parent_log/mos2/driver.rank0.log`: MoS2 P4 completed | PASS: eqp0/1 identical; ineffective detach block and false release message removed. |
 | 10 | `cdbe1f27` | `10_real_weights/cpu.fused.log`: 42 passed, 7 deselected; `before/` vs `after_fused/`, `comparison.txt` | PASS: Si SOC GN P4 eqp0/1 identical; compile events 622 → 622; real-weight trace has one GEMM. |
-| 11 | this commit | `11_local_gemm_donation/gate.log`: 30 distrib_la CPU tests passed | PASS: beta-zero out buffer remains live, result correct, no donation warning. |
+| 11 | `5d3e5e57` | `11_local_gemm_donation/gate.log`: 30 distrib_la CPU tests passed | PASS: beta-zero out buffer remains live, result correct, no donation warning. |
+| 12 | this commit | `12_gij_refusal/gate.log`: 21 CPU tests passed | PASS: refusal names the explicit Gij and actual face/axis layout; config parameter is used. |

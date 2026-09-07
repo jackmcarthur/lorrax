@@ -3580,19 +3580,16 @@ def refuse_explicit_gij_under_low_mem_bands(config, Gij) -> None:
     """Require diagonal occupation data for the parent Green contraction."""
     if Gij is None:
         return
+    layout = "face" if config.memory.low_mem_bands else "axis"
     raise ValueError(
         "GATE low_mem_bands_explicit_gij_unported: "
-        "low_mem_bands = true is refused with an explicit Gij operand.\n"
-        "  got:  low_mem_bands = true, Gij is not None (explicit dense "
+        "an explicit Gij operand is refused under either parent layout.\n"
+        f"  got:  layout={layout}, Gij is not None (explicit dense "
         "band-space occupation projector)\n"
-        "  want: Gij = None (the standard occupation_state path)\n"
-        "  fix:  do not pass an explicit Gij under low_mem_bands = true — "
-        "use the occupation_state argument for diagonal weights\n"
-        "  why:  cohsex_sigma.build_Gij returns a fully replicated dense "
-        "(nk, nb_sigma, nb_sigma) array; under face psi, G and the "
-        "Hartree/exchange projection need a face-sharded band-matrix "
-        "contract that has not been ported (obstacle #4, 'treat production "
-        "Gij as diagonal data')\n"
+        "  want: Gij = None under both face and axis layouts\n"
+        "  fix:  use occupation_state for diagonal band weights\n"
+        "  why:  parent Green contractions consume diagonal occupation "
+        "weights; a dense band-space occupation projector is not supported\n"
         "  doc:  docs/input_reference.md '## ISDF / zeta', low_mem_bands.")
 
 

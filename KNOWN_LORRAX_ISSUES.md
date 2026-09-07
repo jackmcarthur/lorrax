@@ -19,3 +19,4 @@
 | 10 | `src/gw/greens_function_kernel.py:168`, static Σ callers | Fixed: real occupation dtype is enforced, static real weights exclude the second GEMM at tracing, and complex band weights preserve their imaginary part. Si P4 eqp and compile-count gate passes. |
 | CPU gate exclusions | `tests/test_windowed_exp_iEt.py`, `tests/test_sigma_fermi_split.py` | Three existing refusal-regex expectations still name the pre-merge Green API; four static-kernel cells need absent `liblorrax_ffi_host.so`. Listed in `10_real_weights/cpu.log`; excluded by name from the 42-pass focused rerun. |
 | 11 | `services/distrib_la/src/distrib_la/matmul_plan.py:558` | Fixed: local beta-zero GEMM does not donate the ignored addend; actual out-buffer liveness and numerics tested. |
+| 12 | `src/gw/gw_config.py:3587` | Fixed: explicit dense Gij refusal describes both layouts and reports the selected layout from config. |
