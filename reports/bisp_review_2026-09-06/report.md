@@ -54,8 +54,16 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
-| `src/gw/sigma_dispatch.py` | `compute_sigma_xc` | 809 | 809 | Unchanged; target remains |
-| `src/gw/sigma_dispatch.py` | **File total** | 1604 | 1604 | Net +0 lines |
+| `src/gw/sigma_dispatch.py` | `compute_sigma_xc` | 809 | 63 | Existing statements moved to named stages or dead selector removed |
+| `src/gw/sigma_dispatch.py` | `_validate_sigma_stage` | 0 | 69 | New explicit phase/direct owner |
+| `src/gw/sigma_dispatch.py` | `_packed_static_sigma_channels` | 0 | 47 | New explicit phase/direct owner |
+| `src/gw/sigma_dispatch.py` | `_packed_dynamic_sigma_channels` | 0 | 68 | New explicit phase/direct owner |
+| `src/gw/sigma_dispatch.py` | `_static_sigma_channels` | 0 | 79 | New explicit phase/direct owner |
+| `src/gw/sigma_dispatch.py` | `_sigma_hartree_fields` | 0 | 26 | New explicit phase/direct owner |
+| `src/gw/sigma_dispatch.py` | `_static_sigma_result` | 0 | 33 | New explicit phase/direct owner |
+| `src/gw/sigma_dispatch.py` | `_compute_mpa_sigma` | 0 | 101 | New explicit phase/direct owner |
+| `src/gw/sigma_dispatch.py` | `_compute_ppm_sigma` | 0 | 62 | New explicit phase/direct owner |
+| `src/gw/sigma_dispatch.py` | **File total** | 1604 | 1359 | Net -245 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -563,6 +571,12 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
+| `tests/test_ff_compute_mode.py` | `test_the_naming_decision_and_its_rejected_alternative_are_written_down` | 9 | 10 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_ff_compute_mode.py` | `test_the_sigma_dispatch_no_longer_reaches_the_ppm_pipeline_by_else` | 22 | 25 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_ff_compute_mode.py` | **File total** | 509 | 513 | Net +4 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
 | `tests/test_isdf_cq_face_parity.py` | `check_shared_cq` | 31 | 31 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_isdf_cq_face_parity.py` | **File total** | 138 | 138 | Net +0 lines |
 
@@ -578,12 +592,23 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
+| `tests/test_sc_four_current_hartree.py` | `test_density_sc_suppresses_both_frozen_direct_components` | 29 | 29 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_sc_four_current_hartree.py` | **File total** | 366 | 366 | Net +0 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
+| `tests/test_sigma_fermi_split.py` | `test_mpa_head_occupation_preflight_precedes_the_body_sweep` | 9 | 8 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_sigma_fermi_split.py` | `test_the_occupation_state_actually_reaches_all_three_build_Gij_sites` | 37 | 40 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_sigma_fermi_split.py` | **File total** | 714 | 716 | Net +2 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
 | `tests/test_zeta_nband_decoupling.py` | `test_the_fit_window_travels_into_the_provenance_stamp` | 25 | 29 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_zeta_nband_decoupling.py` | **File total** | 412 | 416 | Net +4 lines |
 
 | Tree scope | Before | After | Net |
 |---|---|---|---|
-| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119900 | -5347 |
+| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119655 | -5592 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
@@ -601,7 +626,8 @@
 | 12 — separate input parsing from configuration envelopes (35b45dc6) | 1409 | 751 passed, 2 skipped, 1 xfailed, 116 warnings in 184.45s (0:03:04) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-192253-278495-2175, lx-Xg4-191743-249096-5555; 22_config_corrected/cpu/cpu.xml; 22_config_corrected/p4/mos2/identity.json |
 | 13 — extract bounded centroid loading stages (7225ea43) | 1410 | 458 passed, 2 skipped, 1 xfailed, 102 warnings in 176.27s (0:02:56) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-193204-329368-3760, lx-Xg4-192729-303163-2911; 31_centroid_guard/cpu/cpu.xml; 31_centroid_guard/p4/mos2/identity.json |
 | 14 — restore low_mem_bands and two-layout planner dispatch (a9560071) | 1413 | 474 passed, 2 skipped, 1 xfailed, 102 warnings in 187.73s (0:03:07) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-201643-544166-5522, lx-Xg4-201649-544831-8820; 34_restore_layout/cpu/cpu.xml; 34_restore_layout/p4/mos2/identity.json |
-| 15 — revert writer extraction exposed by fresh fitting (this commit) | 1414 | 455 passed, 2 skipped, 1 xfailed, 102 warnings in 192.85s (0:03:12) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-202436-590723-1370, lx-Xg4-202604-591455-1706; 39_writer_revert_corrected/cpu/cpu.xml; 39_writer_revert_corrected/p4/mos2/identity.json |
+| 15 — revert writer extraction exposed by fresh fitting (fe51b102) | 1414 | 455 passed, 2 skipped, 1 xfailed, 102 warnings in 192.85s (0:03:12) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-202436-590723-1370, lx-Xg4-202604-591455-1706; 39_writer_revert_corrected/cpu/cpu.xml; 39_writer_revert_corrected/p4/mos2/identity.json |
+| 16 — split Sigma dispatch into explicit physics stages (this commit) | 1416 | 478 passed, 2 skipped, 3 xfailed, 102 warnings in 196.16s (0:03:16); CPU1 13 passed, 1 warning in 3.65s | Si SOC GN exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-202851-614453-8799, lx-Xg4-202906-616745-3091, lx-Xg0-202904-616331-8607; 36_sigma_stages/cpu/cpu.xml; 36_sigma_stages/p4/si_soc/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|

@@ -782,202 +782,11 @@ def finalize_dynamic_sigma(
 # Dispatcher
 # ---------------------------------------------------------------------------
 
-def compute_sigma_xc(
-    mode: ComputeMode,
-    *,
-    wfns,
-    V_q: jax.Array,
-    W_by_role: dict,
-    e_qp_ev: np.ndarray | None,
-    static_head_terms,
-    head_resolver,
-    quad,
-    config,
-    meta,
-    mesh_xy: Mesh,
-    sym,
-    wfn,
-    band_slices,
-    input_dir: str,
-    Gij: jax.Array | None = None,
-    wfns_transverse=None,
-    bispinor_v_q_path: str | None = None,
-    mu_bases=None,
-    photon_response=None,
-    write_sigma_omega_h5: bool = True,
-    hartree_basis_rotation: jax.Array | None = None,
-    omit_v_h: bool = False,
-    iteration_head=None,
-    occupation_state=None,
-    material_class: str,
-    fixed_quadrature_session=None,
-    print_fn: Callable = print,
-) -> SigmaResult:
-    """One-line entry point: build the full Σ_xc + V_H given the current
-    wfn bundle and screened W's.
-
-    Parameters
-    ----------
-    mode
-        Compute-mode pivot.  Determines which Σ kernel chain runs and
-        which roles in ``W_by_role`` are consulted.
-    wfns
-        ``Wavefunctions`` bundle in the *current* QP basis (or DFT basis
-        for the iter-0 / one-shot call).
-    V_q
-        Bare Coulomb in flat-q ISDF basis.
-    W_by_role
-        Screened-Coulomb dict produced by
-        :func:`gw.screening.compute_screening`, keyed by symbolic role.
-        Conventional roles consumed here:
-
-        * ``"static"`` — W(ω = 0).  Used by COHSEX (Σ_SX, Σ_COH) and as
-          the ω-zero anchor for the PPM two-point fit.
-        * ``"probe"``  — W at the GN/HL probe frequency.  Used by PPM
-          for the second fit point.
-        * ``"mpa_fit"`` — on-disk path of the MPA screening-model fit
-          store (``gw.screening.compute_screening_model`` for
-          ``ComputeMode.MPA``); the MPA branch reads it instead of an
-          in-memory W.
-
-        ``X_ONLY`` ignores ``W_by_role`` entirely.  Adding a new mode
-        means picking the role labels it needs in
-        :func:`gw.screening.screening_requests_for`, giving it a row in
-        ``gw_config.MODE_SIGMA_CHANNELS``, and reading the roles here —
-        no plumbing changes elsewhere.  Until it has a branch here it is
-        refused by name; it is never served by the PPM one.
-    e_qp_ev
-        Per-(k, n) QP energies (eV) used by the QSGW build to evaluate
-        Σ_c(E_m, E_n).  Required for dynamic modes; ignored for static.
-    static_head_terms, head_resolver
-        q→0 head plumbing; ``static_head_terms`` is None when ``do_G0`` is
-        false in the config.
-    quad
-        Static minimax quadrature for χ₀; produced by
-        ``minimax_screening.build_static_quadrature`` once per W solve.
-    config, meta, mesh_xy, sym, wfn, band_slices, input_dir
-        Standard driver scaffolding.
-    Gij
-        Optional band-space occupation projector; ``None`` builds it
-        inside the static kernels from ``occupation_state``.  Supplying
-        both is refused (``cohsex_sigma._resolve_Gij``).
-    occupation_state
-        The iteration's :class:`gw.efermi.OccupationState`.  It reaches
-        BOTH halves of Σ here: the MPA branch below (µ, stamps, the
-        fractional contour) and — since this commit — the static
-        channels, so Σ_X / Σ_SX / V_H and the PPM invalid-pole static
-        term take the same ``diag(f)`` weights Σ_c does.  ``None`` is
-        the insulating default and every static channel is then
-        bit-for-bit the integer ``occ > 0.5`` projector.
-    wfns_transverse, bispinor_v_q_path
-        Bispinor Σ^B channel (transverse-centroid ψ bundle + V^{i,j}
-        tile file).  Both-or-neither; the static kernels fold Σ^B into
-        ``sig_x`` and, for COHSEX, the physical ``sig_sx`` component that
-        forms ``sigma_xc``.  ``None`` for scalar runs.
-    photon_response
-        Packed static four-current response.  Used only by
-        ``bispinor_gw=full_static_cohsex``; the default bare-transverse path
-        neither inspects nor constructs it.
-    print_fn
-        Rank-0-only print.
-
-    Returns
-    -------
-    :class:`SigmaResult` populated per the mode.
-    """
-    from .cohsex_sigma import compute_cohsex_sigma, compute_sigma_x
-    from .ppm_pipeline import compute_ppm_sigma_pipeline
-
-    # ── THE MODE IS CHECKED BEFORE ANY KERNEL RUNS ──────────────────────
-    # ``gw_jax.main`` already refused a declared-but-unbuilt mode at
-    # driver entry, and this is the same refusal at the seam that would
-    # otherwise absorb it.  Both exist on purpose: the entry check is what
-    # saves the operator's allocation, this one is what makes the SC loop,
-    # the tests and any future caller safe without having to remember the
-    # entry check.  It is a dict lookup on a resolved enum, so it costs
-    # nothing on the Σ path it guards.
+def _validate_sigma_stage(
+        Gij, config, mode, print_fn):
+    """Validate the Sigma stage; see docs/architecture/four_current_wiring.md."""
     refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
-
-    # ── THE ONE ENVELOPE ROW NO DECK KEY CAN EXPRESS ─────────────────────
-    # low_mem_bands's other four unsupported combinations (head_correction,
-    # qp_solver, mpa_material_class, bispinor) already refused at config
-    # resolution, before this function -- or anything upstream of it --
-    # ever ran.  An explicit Gij is a call-time Python parameter with no
-    # deck key, so it is checked here instead: this is the only seam that
-    # ever sees both a resolved low_mem_bands and a live Gij operand
-    # together, and it still runs before any Gij-dependent allocation.
     refuse_explicit_gij_under_low_mem_bands(config, Gij)
-
-    # ── PPM-ONLY IS A CORRECTNESS GUARD, NOT A WIRING GAP ───────────────
-    # Two independent reasons, and the second is the load-bearing one.
-    #
-    # (1) Wiring.  ``sigma_band_extrapolation`` is read by the GN/HL
-    #     two-point PPM Σ kernel and nothing else.  Reaching MPA / COHSEX /
-    #     X_ONLY with it set would produce a perfectly ordinary run whose
-    #     log simply lacks the extrapolation block — the exact failure mode
-    #     measurement-discipline rule 1 names, where a green A/B measured
-    #     nothing because one arm silently dropped the knob.
-    #
-    # (2) THE MATH ITSELF IS MODE-DEPENDENT.  The extrapolation's limit
-    #     point is 1/N → 0, and that limit is WRONG for a static Coulomb
-    #     hole.  MEASURED 2026-08-15 against BerkeleyGW's exact static CH
-    #     (the closure sum — no band sum and no extrapolation in it), Si
-    #     4×4×4 SOC, 192 (k, band) states, MAE in meV:
-    #
-    #         nband                     60      76     100     124
-    #         static COHSEX, 1/N → 0  94.9    96.6   202.8   288.2   WORSE
-    #         GN-PPM,        1/N → 0 171.3    97.4    55.1    32.8   better
-    #
-    #     The static arm ANTI-CONVERGES — more bands determine the line
-    #     better and drive it more confidently ~340 meV past the right
-    #     answer — because the static CH's high-energy tail is not
-    #     suppressed by a pole denominator and keeps contributing past where
-    #     the 1/N law was calibrated.  So routing this at a static mode
-    #     would not merely fail to log; it would return a wrong number
-    #     carrying a "consistent" verdict that gets worse the more you spend
-    #     on it.  Report: sandbox
-    #     reports/ch_converge_band_extrapolation_2026-08-15/.
-    # ── RECONCILING THE GUARD WITH A DEFAULT-ON KEY ─────────────────────
-    # Before 2026-08-16 the key defaulted OFF, so "set it on a non-PPM mode"
-    # was always a deliberate act and refusing was the whole answer.  The key
-    # now defaults ON, and a refusal that fires on the DEFAULT would make
-    # every COHSEX / MPA / X_ONLY run in the tree unrunnable — two gates
-    # fighting, with the operator caught in the middle.
-    #
-    # So the guard splits on PROVENANCE, which is the only thing that
-    # distinguishes the two situations:
-    #
-    #   explicitly named + NO stage can consume it  ->  REFUSE.  The operator
-    #       wrote the knob down and nothing in this run will read it; silently
-    #       doing nothing with it is exactly how a green A/B comes to measure
-    #       nothing (measurement-discipline rule 1).
-    #   defaulted, or a LATER STAGE will consume it ->  DISABLE FOR THIS
-    #       STAGE, and SAY SO.  The stage is not what the key is for, but the
-    #       run may still be, and killing it would refuse a run that works.
-    #
-    # Both branches keep the physics guard intact: no static-mode Σ is ever
-    # extrapolated either way.  What changes is who gets refused.
-    #
-    # ── THE REFUSAL IS ABOUT THE RUN, NOT ABOUT THIS STAGE ──────────────
-    # Corrected 2026-08-16 against the REAL staged-SC interface
-    # (``origin/feat/staged-sc-2026-08-15``, 98289d77), which the wiring
-    # branch had concluded did not exist — from an ``--all`` search in a
-    # single-branch checkout, where ``--all`` covers only fetched refs.
-    # See ``gw_config.sigma_stage_modes`` for the full correction.  The
-    # short form: ``run_staged_self_consistency`` rewrites ``compute_mode``
-    # per stage, so a per-stage DISABLE written against ``compute_mode`` was
-    # already right — but a per-stage REFUSAL is not, because it kills the
-    # run before the stage that would have consumed the key.  Two shipped
-    # configurations it would have killed:
-    #
-    #   sc_stage_1_type = cohsex, sc_stage_2_type = gnppm
-    #       -> dies at stage 1, one stage short of the consumer.
-    #   compute_mode = mpa  (the DEFAULT ladder is GN_PPM then MPA)
-    #       -> dies at stage 2, after paying for a full GN-PPM stage.
-    #
-    # Asking the LADDER instead makes both runnable and still refuses the
-    # case the guard was written for: an explicit key on a run in which no
-    # stage is a plasmon-pole model.
     if bool(config.sigma.band_extrapolation) and mode.ppm_model is None:
         explicit_switch = bool(getattr(
             config.sigma, "band_extrapolation_explicit", False))
@@ -1016,10 +825,6 @@ def compute_sigma_xc(
                 f"ladder containing ANY gn_ppm / hl_ppm stage also does not "
                 f"refuse — the non-PPM stages in it disable themselves and the "
                 f"run continues.)")
-        # AUTO-DISABLED, LOUDLY.  Printed at the Σ seam every iteration
-        # rather than once at startup: a staged run changes mode between
-        # stages, and the fact "this stage did not extrapolate" belongs
-        # beside that stage's Σ, not in a banner scrolled past an hour ago.
         if explicit:
             why = (f"this deck NAMES the key and a PPM stage in this run's "
                    f"ladder [{ladder}] will consume it — this stage is not "
@@ -1027,10 +832,6 @@ def compute_sigma_xc(
                    f"the run")
         else:
             why = ("no deck key named it; use_band_extrapolation defaults on")
-        # The JUSTIFICATION differs by stage kind and must not be recited
-        # wrongly.  A static mode gets the measured static-CH anti-convergence;
-        # MPA is DYNAMIC, so that measurement is not about it, and claiming it
-        # were would be inventing evidence.
         if getattr(mode, "is_dynamic", False):
             because = (
                 "MPA is dynamic, so the static Coulomb-hole measurement below "
@@ -1050,23 +851,133 @@ def compute_sigma_xc(
             f"  Σc band extrapolation: AUTO-DISABLED for compute_mode = "
             f"{getattr(mode, 'value', mode)} ({why}).  {because}.  "
             f"This stage's Σ is the ordinary full-band sum.")
-        # NOTHING IS REBOUND HERE, deliberately.  ``config.sigma.
-        # band_extrapolation`` is read in exactly one place — the GN/HL-PPM
-        # pipeline's ``plan_band_brackets`` call — and this branch is the one
-        # where that pipeline is NOT reached.  Rewriting the config to keep it
-        # cosmetically truthful would mean a ``dataclasses.replace`` of the
-        # whole frozen LorraxConfig (re-running its __post_init__) to change a
-        # field with no remaining reader.  The log line above is the record.
 
-    # Static exchange is needed by every mode; sig_sx / sig_coh use W(ω=0),
-    # and WHICH MODES BUILD
-    # THEM IS THE CHANNEL TABLE'S ANSWER (``gw_config.
-    # MODE_SIGMA_CHANNELS``), not this branch's opinion — that is the one
-    # fact the QSGW appendix writer and this dispatch have to agree on,
-    # and they now read it from the same row.  Route to a separate
-    # top-level entry point for the X-only path so the modes that build no
-    # static screened channels never invoke the W-touching kernels, and
-    # the two paths each get their own jit-cached graph.
+
+def _packed_static_sigma_channels(
+        Gij, builds_static_screened, config, hartree_basis_rotation, mesh_xy, meta, mode,
+        occupation_state, photon_head_sigma_basis, photon_head_sigma_diag, photon_response,
+        print_fn, static_head_terms, wfns, wfns_transverse):
+    """Produce all static packed-photon Sigma channels and diagnostics."""
+    if not builds_static_screened or mode is not ComputeMode.COHSEX:
+        raise ValueError(
+            "static packed-photon mode reached Sigma outside "
+            "compute_mode=cohsex; "
+            "the config/driver envelope should have refused this before "
+            "screening allocation.")
+    if photon_response is None:
+        raise RuntimeError(
+            "static packed-photon mode reached Sigma without the "
+            "packed static photon response.  Refusing instead of "
+            "falling back to charge-only screened COHSEX.")
+    if static_head_terms is not None:
+        raise ValueError(
+            "static packed-photon mode received scalar static_head_terms. "
+            "Its "
+            "q->0 policy already lives in the packed four-current V/W; "
+            "a scalar correction would double count the charge sector "
+            "and omit coupled current wings.")
+    from .cohsex_sigma import _resolve_Gij
+    photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
+    from .photon_sigma import compute_static_photon_sigma
+    (sig_x, sig_sx, sig_coh,
+     photon_head_diagnostics,
+     photon_sigma_diagnostics) = compute_static_photon_sigma(
+        wfns_charge=wfns,
+        wfns_transverse=wfns_transverse,
+        Gij=photon_Gij,
+        response=photon_response,
+        meta=meta,
+        mesh_xy=mesh_xy,
+        head_diagnostics=config.debug.sigma_freq_debug_output,
+        diagnostic_basis_rotation=hartree_basis_rotation,
+        diagnostic_input_basis=(
+            "qp" if hartree_basis_rotation is not None else "dft"),
+        print_fn=print_fn,
+    )
+    if photon_head_diagnostics is not None:
+        photon_head_sigma_diag = (
+            photon_head_diagnostics.components_tskn_ry)
+        photon_head_sigma_basis = photon_head_diagnostics.output_basis
+    sigma_lorentz = photon_sigma_diagnostics.components_skij_ry
+    return sig_x, sig_sx, sig_coh, photon_head_sigma_diag, photon_head_sigma_basis, sigma_lorentz
+
+
+def _packed_dynamic_sigma_channels(
+        Gij, V_q, builds_static_screened, config, hartree_basis_rotation, mesh_xy, meta,
+        mode, occupation_state, photon_head_sigma_basis, photon_head_sigma_diag,
+        photon_response, print_fn, static_head_terms, wfns, wfns_transverse):
+    """Produce the scalar exchange and frozen packed-current Sigma channels."""
+    from .cohsex_sigma import compute_sigma_x
+    if photon_response is None:
+        raise RuntimeError(
+            "dynamic packed-photon route reached Sigma without the "
+            "packed static photon response.  Refusing instead of "
+            "falling back to charge-only screened Sigma with no "
+            "transverse channel at all.")
+    if builds_static_screened:
+        raise ValueError(
+            f"dynamic packed-photon route reached Sigma with a mode "
+            f"that builds static screened channels "
+            f"({getattr(mode, 'value', mode)}); the packed current "
+            "blocks and a static screened charge Sigma would both "
+            "claim the SX/COH columns.")
+    from .cohsex_sigma import _resolve_Gij
+    photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
+    sig_x = compute_sigma_x(
+        wfns, V_q, meta, mesh_xy,
+        Gij=photon_Gij,
+        static_head_terms=static_head_terms,
+        wfns_transverse=None,
+        bispinor_v_q_path=None,
+        occupation_state=None,
+    )
+    from .photon_sigma import (
+        PHOTON_BLOCKS_CURRENT, compute_static_photon_sigma)
+    (cur_x, cur_sx, cur_coh,
+     photon_head_diagnostics,
+     photon_sigma_diagnostics) = compute_static_photon_sigma(
+        wfns_charge=wfns,
+        wfns_transverse=wfns_transverse,
+        Gij=photon_Gij,
+        response=photon_response,
+        meta=meta,
+        mesh_xy=mesh_xy,
+        blocks=PHOTON_BLOCKS_CURRENT,
+        head_diagnostics=config.debug.sigma_freq_debug_output,
+        diagnostic_basis_rotation=hartree_basis_rotation,
+        diagnostic_input_basis=(
+            "qp" if hartree_basis_rotation is not None else "dft"),
+        print_fn=print_fn,
+    )
+    current_correlation = (cur_sx - cur_x) + cur_coh
+    sig_x = sig_x + cur_sx + cur_coh
+    sig_x.block_until_ready()
+    sig_sx = sig_coh = jnp.zeros_like(sig_x)
+    if print_fn is not None:
+        _bare_scale = float(jnp.max(jnp.abs(jnp.diagonal(
+            cur_x, axis1=-2, axis2=-1)))) * RYD_TO_EV
+        _corr_scale = float(jnp.max(jnp.abs(jnp.diagonal(
+            current_correlation, axis1=-2, axis2=-1)))) * RYD_TO_EV
+        print_fn(
+            f"  packed photon current sector (static, w = 0): bare "
+            f"exchange max|diag| = {_bare_scale:.6e} eV, static "
+            f"correlation max|diag| = {_corr_scale:.6e} eV "
+            f"(exactly zero in the bare-transverse family, where "
+            f"W_TT = D_TT and W_CT = 0); both booked into sigX")
+    if photon_head_diagnostics is not None:
+        photon_head_sigma_diag = (
+            photon_head_diagnostics.components_tskn_ry)
+        photon_head_sigma_basis = photon_head_diagnostics.output_basis
+    sigma_lorentz = photon_sigma_diagnostics.components_skij_ry
+    return sig_x, sig_sx, sig_coh, photon_head_sigma_diag, photon_head_sigma_basis, sigma_lorentz
+
+
+def _static_sigma_channels(
+        Gij, V_q, W_by_role, bispinor_v_q_path, config, hartree_basis_rotation, mesh_xy,
+        meta, mode, mu_bases, occupation_state, photon_response, print_fn,
+        static_head_terms, wfns, wfns_transverse):
+    """Produce static Sigma channels through the existing mode owners."""
+    from .cohsex_sigma import compute_cohsex_sigma, compute_sigma_x
     W_static = W_by_role.get("static", V_q)
     builds_static_screened = mode_builds_channels(
         mode, SigmaChannel.SX, SigmaChannel.COH)
@@ -1075,159 +986,16 @@ def compute_sigma_xc(
     sigma_lorentz = None
     sig_x_b = None
     if packed_photon_replaces_charge_sigma(config):
-        if not builds_static_screened or mode is not ComputeMode.COHSEX:
-            raise ValueError(
-                "static packed-photon mode reached Sigma outside "
-                "compute_mode=cohsex; "
-                "the config/driver envelope should have refused this before "
-                "screening allocation.")
-        if photon_response is None:
-            raise RuntimeError(
-                "static packed-photon mode reached Sigma without the "
-                "packed static photon response.  Refusing instead of "
-                "falling back to charge-only screened COHSEX.")
-        if static_head_terms is not None:
-            raise ValueError(
-                "static packed-photon mode received scalar static_head_terms. "
-                "Its "
-                "q->0 policy already lives in the packed four-current V/W; "
-                "a scalar correction would double count the charge sector "
-                "and omit coupled current wings.")
-
-        # X, SX, and COH are all produced by one sixteen-block photon loop
-        # over the same packed V/W and canonical services.
-        from .cohsex_sigma import _resolve_Gij
-        photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
-        from .photon_sigma import compute_static_photon_sigma
-        (sig_x, sig_sx, sig_coh,
-         photon_head_diagnostics,
-         photon_sigma_diagnostics) = compute_static_photon_sigma(
-            wfns_charge=wfns,
-            wfns_transverse=wfns_transverse,
-            Gij=photon_Gij,
-            response=photon_response,
-            meta=meta,
-            mesh_xy=mesh_xy,
-            head_diagnostics=config.debug.sigma_freq_debug_output,
-            diagnostic_basis_rotation=hartree_basis_rotation,
-            diagnostic_input_basis=(
-                "qp" if hartree_basis_rotation is not None else "dft"),
-            print_fn=print_fn,
-        )
-        if photon_head_diagnostics is not None:
-            photon_head_sigma_diag = (
-                photon_head_diagnostics.components_tskn_ry)
-            photon_head_sigma_basis = photon_head_diagnostics.output_basis
-        sigma_lorentz = photon_sigma_diagnostics.components_skij_ry
+        (sig_x, sig_sx, sig_coh, photon_head_sigma_diag, photon_head_sigma_basis, sigma_lorentz) = _packed_static_sigma_channels(
+            Gij, builds_static_screened, config, hartree_basis_rotation, mesh_xy, meta, mode,
+            occupation_state, photon_head_sigma_basis, photon_head_sigma_diag, photon_response,
+            print_fn, static_head_terms, wfns, wfns_transverse)
     elif uses_dynamic_packed_photon_route(config):
-        # ── THE DYNAMIC PACKED ROUTE (phase 3, minimal form) ─────────────
-        # W_packed(w) = diag(W_00(w), W_TT, W_CT): the CHARGE block carries
-        # the run's plasmon-pole model, the twelve CURRENT blocks are frozen
-        # at w = 0.  Because the sixteen-block sum is a plain sum once
-        # W_packed is built, Sigma splits exactly in two and each half keeps
-        # its existing owner:
-        #
-        #   Sigma_xc(w) = [ Sigma_x^CC + Sigma_c^CC(w) ]        <- scalar owner
-        #               + [ sum_{AB != CC} SX(W_AB) + COH(W_AB - V_AB) ]
-        #                                                       <- packed owner
-        #
-        # There is no third implementation here: the first bracket is the
-        # ordinary compute_sigma_x + ppm_pipeline chain below, the second is
-        # the SAME gw.photon_sigma consumer the static packed mode uses,
-        # called with blocks = "current".
-        #
-        # In the BARE family (chi_TT = chi_CT = 0) the second bracket is
-        # SX(D_TT) = X(D_TT) = Sigma^B with COH(D_TT - D_TT) = 0 and CT/TC
-        # identically zero -- i.e. exactly what gw.sigma_x_bispinor returned
-        # and what compute_sigma_x folded into sig_x on the incumbent route,
-        # plus the TT/CT Gamma cell the packed completion carries.
-        # reports/bisp_n_dynamic_packed_2026-09-01/DESIGN.md section 1.
-        if photon_response is None:
-            raise RuntimeError(
-                "dynamic packed-photon route reached Sigma without the "
-                "packed static photon response.  Refusing instead of "
-                "falling back to charge-only screened Sigma with no "
-                "transverse channel at all.")
-        if builds_static_screened:
-            raise ValueError(
-                f"dynamic packed-photon route reached Sigma with a mode "
-                f"that builds static screened channels "
-                f"({getattr(mode, 'value', mode)}); the packed current "
-                "blocks and a static screened charge Sigma would both "
-                "claim the SX/COH columns.")
-        from .cohsex_sigma import _resolve_Gij
-        photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
-        # CHARGE CHANNEL: the ordinary scalar bare-exchange owner, with the
-        # incumbent Sigma^B arms EXPLICITLY OFF.  The transverse exchange is
-        # the packed consumer's TT block below; letting compute_sigma_x add
-        # it as well is precisely the double count this route exists to
-        # remove.  ``static_head_terms`` is the scalar band-diagonal q->0
-        # bare-X head, i.e. the CC head, and it stays the scalar owner's --
-        # the packed completion supplies only the TT/CT Gamma cell here.
-        sig_x = compute_sigma_x(
-            wfns, V_q, meta, mesh_xy,
-            Gij=photon_Gij,
-            static_head_terms=static_head_terms,
-            wfns_transverse=None,
-            bispinor_v_q_path=None,
-            occupation_state=None,
-        )
-        from .photon_sigma import (
-            PHOTON_BLOCKS_CURRENT, compute_static_photon_sigma)
-        (cur_x, cur_sx, cur_coh,
-         photon_head_diagnostics,
-         photon_sigma_diagnostics) = compute_static_photon_sigma(
-            wfns_charge=wfns,
-            wfns_transverse=wfns_transverse,
-            Gij=photon_Gij,
-            response=photon_response,
-            meta=meta,
-            mesh_xy=mesh_xy,
-            blocks=PHOTON_BLOCKS_CURRENT,
-            head_diagnostics=config.debug.sigma_freq_debug_output,
-            diagnostic_basis_rotation=hartree_basis_rotation,
-            diagnostic_input_basis=(
-                "qp" if hartree_basis_rotation is not None else "dft"),
-            print_fn=print_fn,
-        )
-        # BOOKING.  A genuinely w-independent W_AB gives a w-independent
-        # Sigma contribution, so adding the current sector to sig_x and
-        # adding it to Sigma_c(w) produce the SAME Sigma_xc
-        # (qsgw_utils.build_qsgw_sigma_xc forms sig_x + Sigma_c(E)).  It
-        # goes into sig_x, the seam the incumbent route used for Sigma^B, so
-        # the bare family's sigX column is unchanged from that route and the
-        # A/B against it is like for like.  In the SCREENED family the same
-        # column then also carries the current blocks' static CORRELATION,
-        # which is O(alpha_FS^2) and is printed here rather than left
-        # invisible.
-        current_correlation = (cur_sx - cur_x) + cur_coh
-        sig_x = sig_x + cur_sx + cur_coh
-        sig_x.block_until_ready()
-        sig_sx = sig_coh = jnp.zeros_like(sig_x)
-        if print_fn is not None:
-            _bare_scale = float(jnp.max(jnp.abs(jnp.diagonal(
-                cur_x, axis1=-2, axis2=-1)))) * RYD_TO_EV
-            _corr_scale = float(jnp.max(jnp.abs(jnp.diagonal(
-                current_correlation, axis1=-2, axis2=-1)))) * RYD_TO_EV
-            print_fn(
-                f"  packed photon current sector (static, w = 0): bare "
-                f"exchange max|diag| = {_bare_scale:.6e} eV, static "
-                f"correlation max|diag| = {_corr_scale:.6e} eV "
-                f"(exactly zero in the bare-transverse family, where "
-                f"W_TT = D_TT and W_CT = 0); both booked into sigX")
-        if photon_head_diagnostics is not None:
-            photon_head_sigma_diag = (
-                photon_head_diagnostics.components_tskn_ry)
-            photon_head_sigma_basis = photon_head_diagnostics.output_basis
-        sigma_lorentz = photon_sigma_diagnostics.components_skij_ry
+        (sig_x, sig_sx, sig_coh, photon_head_sigma_diag, photon_head_sigma_basis, sigma_lorentz) = _packed_dynamic_sigma_channels(
+            Gij, V_q, builds_static_screened, config, hartree_basis_rotation, mesh_xy, meta, mode,
+            occupation_state, photon_head_sigma_basis, photon_head_sigma_diag, photon_response,
+            print_fn, static_head_terms, wfns, wfns_transverse)
     elif uses_static_photon_response(config):
-        # EXHAUSTIVENESS over the packed route's compute modes.  The two
-        # predicates above cover gw_config.PACKED_PHOTON_COMPUTE_MODES; a
-        # packed deck on any other mode (mpa today) reaches here only
-        # through a hand-built config that skipped
-        # refuse_unsupported_bispinor_gw, and is refused by name rather
-        # than served the charge-only scalar path with its transverse
-        # channel silently dropped.
         raise NotImplementedError(
             f"packed four-current mode with compute_mode = "
             f"{getattr(mode, 'value', mode)} has no Sigma branch.  The "
@@ -1282,15 +1050,14 @@ def compute_sigma_xc(
         else:
             sig_x = sigma_x_result
         sig_sx = sig_coh = jnp.zeros_like(sig_x)
+    return W_static, sig_x, sig_sx, sig_coh, sigma_lorentz, photon_head_sigma_diag, photon_head_sigma_basis
 
-    # Density-SC rebuilds this same exact G-space operator from the evolving
-    # orbitals directly in the DFT basis.  Other paths build it once here.
+
+def _sigma_hartree_fields(
+        band_slices, config, hartree_basis_rotation, mesh_xy, meta, omit_v_h, print_fn,
+        sig_x, sym, wfn):
+    """Produce the exact Hartree fields in the Sigma basis."""
     if omit_v_h:
-        # A scalar zero preserves SigmaResult's arithmetic-compatible field
-        # contract without allocating an otherwise dead (nk,nb,nb) matrix.
-        # The density-SC caller branches before matrix assembly and replaces
-        # this sentinel with its separately retained exact field at every
-        # final output seam.
         sig_h = jnp.asarray(0, dtype=sig_x.dtype)
         h_transverse = None
     else:
@@ -1309,18 +1076,16 @@ def compute_sigma_xc(
             rotation,
             mesh=mesh_xy)
     if h_transverse is not None:
-        # The exact periodic G-space current artifact is a separate operator,
-        # so append it independently after the scalar source replacement.
-        # ``omit_v_h`` cleared it above together with the scalar term: under
-        # density-SC the caller rebuilt BOTH fields from the evolving
-        # orbitals, and retaining this frozen DFT artifact would double-count
-        # H_T while silently mixing two densities.
         sig_h = sig_h + h_transverse
         sig_h.block_until_ready()
+    return sig_h, v_h_scalar, h_transverse
+
+
+def _static_sigma_result(
+        h_transverse, mode, omit_v_h, photon_head_sigma_basis, photon_head_sigma_diag,
+        sig_coh, sig_h, sig_sx, sig_x, sigma_lorentz, v_h_scalar):
+    """Produce the existing static-mode Sigma result."""
     if mode is ComputeMode.X_ONLY:
-        # sigma_sx ← sig_x so the static sigma_diag.dat writer's sigSX
-        # column reports Σ_X (incl. the bispinor Σ^B fold-in) instead of
-        # zeros; sigTOT = sigSX + sigCOH stays consistent.
         return SigmaResult(
             v_h_kij_ry=sig_h,
             v_h_scalar_kij_ry=v_h_scalar,
@@ -1350,189 +1115,118 @@ def compute_sigma_xc(
             photon_head_sigma_basis=photon_head_sigma_basis,
         )
 
-    # Dynamic modes (MPA + the PPM pair) all evaluate the QSGW Σ_c at QP
-    # energies — one check above both branches, one message.
-    if e_qp_ev is None:
-        raise ValueError(
-            f"compute_sigma_xc: dynamic mode {mode!r} requires e_qp_ev "
-            "(QP energies for the QSGW Σ_c evaluation).")
 
-    if mode is ComputeMode.MPA:
-        from file_io import mpa_store
-        from .head_correction import compute_complex_pole_head_sigma_diag
-        from .mpa.sigma import compute_sigma_c_mpa_omega_grid
-        from .efermi import resolve_sigma_efermi_ry
-        from .ppm_windows import sigma_regularization_for_config
+def _compute_mpa_sigma(
+        W_by_role, band_slices, config, e_qp_ev, fixed_quadrature_session, h_transverse,
+        input_dir, iteration_head, material_class, mesh_xy, meta, occupation_state,
+        omit_v_h, print_fn, sig_h, sig_x, sigma_lorentz, sym, v_h_scalar, wfn, wfns,
+        write_sigma_omega_h5):
+    """Produce the MPA Sigma result with authenticated head and body inputs."""
+    from file_io import mpa_store
+    from .head_correction import compute_complex_pole_head_sigma_diag
+    from .mpa.sigma import compute_sigma_c_mpa_omega_grid
+    from .efermi import resolve_sigma_efermi_ry
+    from .ppm_windows import sigma_regularization_for_config
+    try:
+        fit_path = W_by_role["mpa_fit"]
+    except KeyError as exc:
+        raise KeyError("MPA Sigma requires W_by_role['mpa_fit']") from exc
+    _xi = sigma_regularization_for_config(config)
+    print_fn(_xi.describe())
+    if material_class == "metal":
+        if occupation_state is None:
+            raise ValueError(
+                "MPA Sigma under mpa_material_class = metal requires "
+                "the iteration's occupation_state (fixed-N MP1 solve); "
+                "got None. The QSGW driver passes it; a direct caller "
+                "must construct one from the current spectrum.")
+    sigma_efermi_ry, sigma_efermi_provenance = resolve_sigma_efermi_ry(
+        config.sigma.fermi_reference,
+        occupation_state=occupation_state, wfn=wfn)
+    from .sigma_box_plan import resolve_sigma_box_cache_dir
+    quadrature_cache_dir = resolve_sigma_box_cache_dir(
+        config.sigma.quadrature_cache_dir, input_dir)
+    head = mpa_store.read_head_fit_collective(
+        fit_path, mesh_xy=mesh_xy, to_unit="Ry")
+    compatible_occ_hashes = ()
+    if occupation_state is not None:
+        from .efermi import legacy_square_mesh_occupation_digests
+        compatible_occ_hashes = legacy_square_mesh_occupation_digests(
+            occupation_state.f_kn, int(meta.b_id_4_user))
+    from .mpa.sigma import assert_head_body_occupation_match
+    head_occ_match = assert_head_body_occupation_match(
+        head.get("occupation_stamps") or {}, occupation_state,
+        compatible_occ_hashes=compatible_occ_hashes)
+    if head_occ_match == "legacy_zero_pad":
+        print_fn(
+            "  MPA scalar head: occupation provenance matched an exact "
+            "legacy square-mesh zero-pad encoding.")
+    body = compute_sigma_c_mpa_omega_grid(
+        wfns, fit_path, meta, mesh_xy,
+        omega_grid_ry=config.omega_grid_ry,
+        efermi_ry=sigma_efermi_ry,
+        occupation_state=occupation_state,
+        regularization_width_ry=_xi.resolved_ry,
+        edge_factor=float(config.sigma.window_edge_factor),
+        quadrature_eps=float(config.sigma.quadrature_eps),
+        quadrature_reduction_seconds=float(
+            config.sigma.quadrature_reduction_seconds),
+        quadrature_reduction_steps=getattr(
+            config.sigma, "quadrature_reduction_steps", None),
+        quadrature_cache_dir=quadrature_cache_dir,
+        omega_grid_step_ry=(
+            float(config.sigma.omega_step_ev) / RYD_TO_EV),
+        occupation_window_threshold=float(
+            config.mpa.occupation_window_threshold),
+        pole_batch_size=int(config.mpa.pole_batch_size),
+        expected_screening_diagrams=config.screening.diagrams,
+        fixed_quadrature_session=(
+            None if fixed_quadrature_session is None else
+            fixed_quadrature_session.setdefault("mpa", {})),
+        print_fn=print_fn)
+    if iteration_head is None:
+        sigma_bands = wfns.slices.sigma
+        head_enk = np.asarray(wfns.enk[:, sigma_bands])
+        head_occ = np.asarray(wfns.occ[:, sigma_bands])
+        head_efermi = sigma_efermi_ry
+    else:
+        head_enk = np.asarray(iteration_head.sigma_energies_ry)
+        head_occ = np.asarray(iteration_head.sigma_occupations)
+        head_efermi = float(iteration_head.efermi_ry)
+    head_diag = compute_complex_pole_head_sigma_diag(
+        omega_grid_ry=np.asarray(config.omega_grid_ry),
+        enk_ry=head_enk,
+        efermi_ry=head_efermi,
+        occupations=head_occ,
+        poles_ry=head["Omega_p"], residues_ry=head["B_p"],
+        cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
+    return finalize_dynamic_sigma(
+        body.sigma_c_kij, head_diag,
+        sigma_band_axis=body.band_axis,
+        sig_x=sig_x, sig_h=sig_h,
+        v_h_scalar=v_h_scalar, h_transverse=h_transverse,
+        hartree_omitted=bool(omit_v_h),
+        e_qp_ev=e_qp_ev,
+        config=config, meta=meta, mesh_xy=mesh_xy,
+        sym=sym, wfn=wfn, band_slices=band_slices,
+        input_dir=input_dir,
+        write_sigma_omega_h5=write_sigma_omega_h5,
+        sigma_lorentz_static_skij_ry=sigma_lorentz,
+        sigma_c_odd_body_omega=body.sigma_c_odd_kij,
+        ppm_odd_even_residue_ratio=body.odd_even_residue_ratio,
+        print_fn=print_fn,
+        efermi_ry=sigma_efermi_ry,
+        efermi_provenance=sigma_efermi_provenance)
 
-        try:
-            fit_path = W_by_role["mpa_fit"]
-        except KeyError as exc:
-            raise KeyError("MPA Sigma requires W_by_role['mpa_fit']") from exc
-        # ── DECK KEYS THIS BRANCH HONORS, NAMED ─────────────────────────
-        # Both keys below are parsed and validated by gw_config and were
-        # then IGNORED here: MPA hard-coded ``wfn.efermi`` and always
-        # emitted the sharded cube, while the PPM branch honored both.  A
-        # parsed-but-ignored key is a defect (TASTE 13), and it became a
-        # live one the moment UNIMPLEMENTED_MODES stopped holding MPA back.
-        #
-        # sigma_omega_layout: the MPA executor's accumulator is born
-        # P(None,None,'x','y') and there is no replicated plan for it --
-        # which is what the metal-only refusal in
-        # gw_config._validate_occupation_smearing already SAYS ("the MPA
-        # Sigma emits the mesh-sharded omega cube only").  That is a fact
-        # about MPA, not about metals, so the refusal is generalised here
-        # rather than left to fire on one material class.  Refusing (not
-        # gathering) is the standing ruling: the sharded layout exists
-        # precisely to elide the P-independent full-cube gather, so
-        # "replicated" would be an allgather sold as a fallback
-        # (decisions.md 2026-08-05).
-        #
-        # BUT REFUSE ONLY A DECK THAT SAID IT.  ``sigma_omega_layout``'s
-        # DEFAULT is ``replicated``, so a bare refusal on the resolved
-        # value fires on every insulating MPA deck that never mentioned
-        # the key -- a flag day for decks that are not wrong about
-        # anything.  TASTE 13 draws exactly this line: an off-dial may
-        # refuse, a typo never does, and a value nobody typed is not a
-        # request.  The parser records the raw keys it saw
-        # (``GWConfig.raw_input_keys``), so the question is asked of that
-        # -- the same idiom ``restart_q_storage.deck_named_the_key`` uses,
-        # including its conservative answer when the record is absent.
-        # A deck that DID name ``replicated`` still refuses: honouring it
-        # would mean gathering the full cube on every rank, which is the
-        # P-independent collective the sharded layout exists to elide
-        # (decisions.md 2026-08-05, refuse rather than gather).
-        # The effective Sigma broadening, from the SAME resolver the PPM
-        # driver uses.  MPA used to take ``regularization_ev`` raw while
-        # GN-PPM silently raised it to a window-dependent conditioning
-        # floor -- 1.90x apart on the sodium 48b deck, 5.7x on a +/-15 eV
-        # window -- so every cross-ansatz comparison was confounded and
-        # neither output said what xi it ran at.
-        _xi = sigma_regularization_for_config(config)
-        print_fn(_xi.describe())
-        if material_class == "metal":
-            # Metal deck-key consistency is refused at config parse
-            # (_validate_occupation_smearing); here the run-level facts:
-            # the one-occupation-state rule, and head/body provenance.
-            if occupation_state is None:
-                raise ValueError(
-                    "MPA Sigma under mpa_material_class = metal requires "
-                    "the iteration's occupation_state (fixed-N MP1 solve); "
-                    "got None. The QSGW driver passes it; a direct caller "
-                    "must construct one from the current spectrum.")
-            # No stamp assert here: this is a SAME-RUN site (the fit store
-            # was written by this run's screening step), and W4 rules that
-            # stamps are asserted at REUSE sites only — a same-run
-            # write-then-read cannot detect the cross-iteration leak it
-            # would claim to guard (claim 0194: the assert here was
-            # unsatisfiable while no writer path carried the state).
-            # assert_occupation_stamps remains the cross-run reuse gate.
-        # fermi_reference: resolved by the one owned resolver, which also
-        # returns the provenance string the sigma_mnk.h5 stamp needs.
-        # AFTER the metal block on purpose: that block owns the more
-        # specific "metal needs an occupation_state" message, and the
-        # resolver's own refusal for the same case would otherwise pre-empt
-        # it with a less situated one.
-        sigma_efermi_ry, sigma_efermi_provenance = resolve_sigma_efermi_ry(
-            config.sigma.fermi_reference,
-            occupation_state=occupation_state, wfn=wfn)
-        from .sigma_box_plan import resolve_sigma_box_cache_dir
-        quadrature_cache_dir = resolve_sigma_box_cache_dir(
-            config.sigma.quadrature_cache_dir, input_dir)
-        # Read and authenticate the cheap scalar head before the expensive
-        # body sweep.  A certified legacy store can differ only by an exact-
-        # zero square-mesh band pad; the helper reproduces that digest from
-        # the live table rather than trusting artifact metadata.
-        head = mpa_store.read_head_fit_collective(
-            fit_path, mesh_xy=mesh_xy, to_unit="Ry")
-        compatible_occ_hashes = ()
-        if occupation_state is not None:
-            from .efermi import legacy_square_mesh_occupation_digests
-            compatible_occ_hashes = legacy_square_mesh_occupation_digests(
-                occupation_state.f_kn, int(meta.b_id_4_user))
-        from .mpa.sigma import assert_head_body_occupation_match
-        head_occ_match = assert_head_body_occupation_match(
-            head.get("occupation_stamps") or {}, occupation_state,
-            compatible_occ_hashes=compatible_occ_hashes)
-        if head_occ_match == "legacy_zero_pad":
-            print_fn(
-                "  MPA scalar head: occupation provenance matched an exact "
-                "legacy square-mesh zero-pad encoding.")
-        body = compute_sigma_c_mpa_omega_grid(
-            wfns, fit_path, meta, mesh_xy,
-            omega_grid_ry=config.omega_grid_ry,
-            efermi_ry=sigma_efermi_ry,
-            occupation_state=occupation_state,
-            regularization_width_ry=_xi.resolved_ry,
-            edge_factor=float(config.sigma.window_edge_factor),
-            quadrature_eps=float(config.sigma.quadrature_eps),
-            quadrature_reduction_seconds=float(
-                config.sigma.quadrature_reduction_seconds),
-            quadrature_reduction_steps=getattr(
-                config.sigma, "quadrature_reduction_steps", None),
-            quadrature_cache_dir=quadrature_cache_dir,
-            omega_grid_step_ry=(
-                float(config.sigma.omega_step_ev) / RYD_TO_EV),
-            occupation_window_threshold=float(
-                config.mpa.occupation_window_threshold),
-            pole_batch_size=int(config.mpa.pole_batch_size),
-            # PROVENANCE ASSERT AT LOAD: these poles were fitted to a W
-            # this run's screening_diagrams either did or did not produce,
-            # and the two are indistinguishable in the bytes.
-            expected_screening_diagrams=config.screening.diagrams,
-            fixed_quadrature_session=(
-                None if fixed_quadrature_session is None else
-                fixed_quadrature_session.setdefault("mpa", {})),
-            print_fn=print_fn)
-        if iteration_head is None:
-            sigma_bands = wfns.slices.sigma
-            head_enk = np.asarray(wfns.enk[:, sigma_bands])
-            head_occ = np.asarray(wfns.occ[:, sigma_bands])
-            head_efermi = sigma_efermi_ry
-        else:
-            head_enk = np.asarray(iteration_head.sigma_energies_ry)
-            head_occ = np.asarray(iteration_head.sigma_occupations)
-            head_efermi = float(iteration_head.efermi_ry)
-        head_diag = compute_complex_pole_head_sigma_diag(
-            omega_grid_ry=np.asarray(config.omega_grid_ry),
-            enk_ry=head_enk,
-            efermi_ry=head_efermi,
-            occupations=head_occ,
-            poles_ry=head["Omega_p"], residues_ry=head["B_p"],
-            cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
-        return finalize_dynamic_sigma(
-            body.sigma_c_kij, head_diag,
-            sigma_band_axis=body.band_axis,
-            sig_x=sig_x, sig_h=sig_h,
-            v_h_scalar=v_h_scalar, h_transverse=h_transverse,
-            hartree_omitted=bool(omit_v_h),
-            e_qp_ev=e_qp_ev,
-            config=config, meta=meta, mesh_xy=mesh_xy,
-            sym=sym, wfn=wfn, band_slices=band_slices,
-            input_dir=input_dir,
-            write_sigma_omega_h5=write_sigma_omega_h5,
-            sigma_lorentz_static_skij_ry=sigma_lorentz,
-            sigma_c_odd_body_omega=body.sigma_c_odd_kij,
-            ppm_odd_even_residue_ratio=body.odd_even_residue_ratio,
-            print_fn=print_fn,
-            # The MPA grid was built against this reference (one per
-            # iteration); the finalizer must read it back against the same
-            # one, and STAMP which one it was -- the `efermi_ry is None`
-            # proxy the finalizer falls back to would label every explicit
-            # reference "fixed-N mu", so a midgap MPA run would be written
-            # into sigma_mnk.h5 as a metal's chemical potential.
-            efermi_ry=sigma_efermi_ry,
-            efermi_provenance=sigma_efermi_provenance)
 
-    # ── THE EXHAUSTIVENESS SEAM ─────────────────────────────────────────
-    # What follows is the two-point plasmon-pole pipeline, and until this
-    # guard it was reached by ELSE: anything that was not X_ONLY and not
-    # COHSEX ran it.  That is fine while the enum's only remaining members
-    # ARE the two PPM fits, and it silently mis-runs the first member that
-    # is not — a multipole run would have taken a GN fit of two W samples
-    # and reported it as Σ_c(ω) with no stage able to tell.  So the pole
-    # model is now asked for by name: ``ppm_model`` is 'gn' or 'hl' for
-    # exactly the two PPM modes and None for every other member, present
-    # or future.
+def _compute_ppm_sigma(
+        V_q, W_by_role, W_static, band_slices, config, e_qp_ev, fixed_quadrature_session,
+        h_transverse, head_resolver, input_dir, iteration_head, mesh_xy, meta, mode,
+        occupation_state, omit_v_h, photon_head_sigma_basis, photon_head_sigma_diag,
+        print_fn, quad, sig_h, sig_x, sigma_lorentz, sym, v_h_scalar, wfn, wfns,
+        write_sigma_omega_h5):
+    """Produce the two-point plasmon-pole Sigma result."""
+    from .ppm_pipeline import compute_ppm_sigma_pipeline
     if mode.ppm_model is None:
         raise NotImplementedError(
             f"compute_sigma_xc: compute_mode = "
@@ -1544,13 +1238,10 @@ def compute_sigma_xc(
             f"needs its own branch here, a row in "
             f"gw_config.MODE_SIGMA_CHANNELS, and a case in "
             f"gw.screening.screening_requests_for.")
-
-    # Dynamic PPM modes: need W_static + W_probe.
     if "probe" not in W_by_role:
         raise KeyError(
             f"compute_sigma_xc: PPM mode {mode!r} requires "
             f"W_by_role['probe'] (set by screening_requests_for).")
-
     ppm_outputs = compute_ppm_sigma_pipeline(
         wfns=wfns,
         V_q=V_q,
@@ -1566,7 +1257,6 @@ def compute_sigma_xc(
             fixed_quadrature_session.setdefault("ppm", {})),
         print_fn=print_fn,
     )
-
     return finalize_dynamic_sigma(
         ppm_outputs.sigma_c_body_omega,
         ppm_outputs.head_sigma_diag_w_kn_ry,
@@ -1591,6 +1281,71 @@ def compute_sigma_xc(
         ppm_odd_even_residue_ratio=ppm_outputs.odd_even_residue_ratio,
         print_fn=print_fn,
     )
+
+
+def compute_sigma_xc(
+    mode: ComputeMode,
+    *,
+    wfns,
+    V_q: jax.Array,
+    W_by_role: dict,
+    e_qp_ev: np.ndarray | None,
+    static_head_terms,
+    head_resolver,
+    quad,
+    config,
+    meta,
+    mesh_xy: Mesh,
+    sym,
+    wfn,
+    band_slices,
+    input_dir: str,
+    Gij: jax.Array | None = None,
+    wfns_transverse=None,
+    bispinor_v_q_path: str | None = None,
+    mu_bases=None,
+    photon_response=None,
+    write_sigma_omega_h5: bool = True,
+    hartree_basis_rotation: jax.Array | None = None,
+    omit_v_h: bool = False,
+    iteration_head=None,
+    occupation_state=None,
+    material_class: str,
+    fixed_quadrature_session=None,
+    print_fn: Callable = print,
+) -> SigmaResult:
+    """Produce Sigma and Hartree fields; see docs/architecture/four_current_wiring.md."""
+    from .cohsex_sigma import compute_cohsex_sigma, compute_sigma_x
+    from .ppm_pipeline import compute_ppm_sigma_pipeline
+    _validate_sigma_stage(
+        Gij, config, mode, print_fn)
+    (W_static, sig_x, sig_sx, sig_coh, sigma_lorentz, photon_head_sigma_diag, photon_head_sigma_basis) = _static_sigma_channels(
+        Gij, V_q, W_by_role, bispinor_v_q_path, config, hartree_basis_rotation, mesh_xy, meta,
+        mode, mu_bases, occupation_state, photon_response, print_fn, static_head_terms, wfns,
+        wfns_transverse)
+    (sig_h, v_h_scalar, h_transverse) = _sigma_hartree_fields(
+        band_slices, config, hartree_basis_rotation, mesh_xy, meta, omit_v_h, print_fn, sig_x,
+        sym, wfn)
+    if mode is ComputeMode.X_ONLY or mode is ComputeMode.COHSEX:
+        return _static_sigma_result(
+            h_transverse, mode, omit_v_h, photon_head_sigma_basis, photon_head_sigma_diag, sig_coh,
+            sig_h, sig_sx, sig_x, sigma_lorentz, v_h_scalar)
+    # Dynamic modes (MPA + the PPM pair) all evaluate the QSGW Σ_c at QP
+    # energies — one check above both branches, one message.
+    if e_qp_ev is None:
+        raise ValueError(
+            f"compute_sigma_xc: dynamic mode {mode!r} requires e_qp_ev "
+            "(QP energies for the QSGW Σ_c evaluation).")
+    if mode is ComputeMode.MPA:
+        return _compute_mpa_sigma(
+            W_by_role, band_slices, config, e_qp_ev, fixed_quadrature_session, h_transverse,
+            input_dir, iteration_head, material_class, mesh_xy, meta, occupation_state, omit_v_h,
+            print_fn, sig_h, sig_x, sigma_lorentz, sym, v_h_scalar, wfn, wfns, write_sigma_omega_h5)
+    return _compute_ppm_sigma(
+        V_q, W_by_role, W_static, band_slices, config, e_qp_ev, fixed_quadrature_session,
+        h_transverse, head_resolver, input_dir, iteration_head, mesh_xy, meta, mode,
+        occupation_state, omit_v_h, photon_head_sigma_basis, photon_head_sigma_diag, print_fn,
+        quad, sig_h, sig_x, sigma_lorentz, sym, v_h_scalar, wfn, wfns, write_sigma_omega_h5)
 
 
 __all__ = [

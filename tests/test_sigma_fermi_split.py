@@ -434,10 +434,9 @@ def test_head_body_occupation_match_accepts_only_a_reproduced_legacy_hash():
 def test_mpa_head_occupation_preflight_precedes_the_body_sweep():
     import inspect
 
-    from gw.sigma_dispatch import compute_sigma_xc
+    from gw.sigma_dispatch import _compute_mpa_sigma
 
-    source = inspect.getsource(compute_sigma_xc)
-    mpa = source.split("if mode is ComputeMode.MPA:", 1)[1]
+    mpa = inspect.getsource(_compute_mpa_sigma)
     assert mpa.index("head = mpa_store.read_head_fit_collective") < mpa.index(
         "body = compute_sigma_c_mpa_omega_grid")
 
@@ -708,7 +707,10 @@ def test_the_occupation_state_actually_reaches_all_three_build_Gij_sites():
             "unconditionally")
 
     # And the dispatcher forwards it into all three static entries.
-    dispatch_src = inspect.getsource(sigma_dispatch.compute_sigma_xc)
+    dispatch_src = "\n".join(inspect.getsource(fn) for fn in (
+        sigma_dispatch._static_sigma_channels,
+        sigma_dispatch._packed_dynamic_sigma_channels,
+        sigma_dispatch._compute_ppm_sigma))
     assert dispatch_src.count("occupation_state=occupation_state") >= 3, (
         "compute_sigma_xc must forward occupation_state to "
         "compute_cohsex_sigma, compute_sigma_x and the PPM pipeline")

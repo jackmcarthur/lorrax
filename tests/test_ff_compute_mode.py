@@ -85,7 +85,8 @@ def test_the_naming_decision_and_its_rejected_alternative_are_written_down():
     A reader who wants to add ``full_freq`` later needs to find the
     reasoning at the enum, not in a commit message.
     """
-    doc = ComputeMode.__doc__
+    assert "docs/architecture/decisions.md" in ComputeMode.__doc__
+    doc = (_REPO / "docs/architecture/decisions.md").read_text()
     assert "full_freq" in doc
     assert "mpa" in doc
 
@@ -278,11 +279,14 @@ def test_the_sigma_dispatch_no_longer_reaches_the_ppm_pipeline_by_else():
               and node.name == "compute_sigma_xc")
     body = ast.unparse(fn)
 
-    guard = body.index("mode.ppm_model is None")
-    assert guard < body.index("compute_ppm_sigma_pipeline("), (
-        "the pole-model guard must come BEFORE the PPM pipeline call, or "
-        "it is not guarding it")
-    assert "refuse_unimplemented_compute_mode(mode" in body
+    ppm = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+               and n.name == "_compute_ppm_sigma")
+    validate = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "_validate_sigma_stage")
+    ppm_body = ast.unparse(ppm)
+    assert ppm_body.index("mode.ppm_model is None") < ppm_body.index("compute_ppm_sigma_pipeline(")
+    assert body.index("_validate_sigma_stage(") < body.index("_static_sigma_channels(")
+    assert "refuse_unimplemented_compute_mode(mode" in ast.unparse(validate)
 
 
 def test_the_ppm_pipeline_turns_away_a_mode_with_no_pole_model():
