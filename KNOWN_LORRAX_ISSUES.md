@@ -67,3 +67,15 @@
 | Packed-photon producer follow-up | Source / invocation | Result |
 |---|---|---|
 | Canonical CC readiness and head receipt | `src/gw/gw_output.py:488`, `src/gw/w_isdf.py:1284`; producing invocation in `30_tip_controls/cc_gates.sh`, then `python3 -u -m bse.bse_jax -i cohsex.in --bse --lanczos --tda --matvec-kind=ring --n-val 4 --n-cond 4 --n-occ 26 --n-reorth -1 --max-lanczos-iter 400 --n-eig 20 --px 2 --py 2` and `python3 -u -m gw.downfold_cli -i downfold.in` |FIXED: both fresh layouts31/32 complete all three drivers (24 rank exits0). Actual W dataset7×597×597, q_storage=ibz and ready=true; shared reader restores36×600×600 and matches the producing CC exactly. Screened Gamma completion is already in CC, so the additional screened scalar is0; the bare head remains the producer's bare CC cell average. EQP0/1 and BSE spectra are layout-identical. Existing local2×2 unit cell skips under independent-rank pytest; production P4 drivers and head-persistence tests pass |
+
+
+MAIN-SUITE-FIX CPU control, 2026-09-07: the optional broad CPU4 gate cannot import
+`bandstructure.htransform` at `src/bandstructure/htransform.py:16` because the
+required host `liblorrax_ffi_host.so` is absent (`src/ffi/gate.py:402`). This affects
+`tests/test_pad_parity_gates.py:734` (`test_resolve_extra_rank_pad_reads_the_env_and_refuses_garbage`)
+and `tests/test_pad_parity_gates.py:759` (`test_extra_rank_pad_only_adds_mesh_aligned_null_directions`).
+Both fail identically on untouched `d3d4b03a` (baseline test lines 725/750) and pass
+in the one-GPU landing census. No assertion or FFI requirement was relaxed.
+Evidence: `/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/123_main_landing_suite_fix_codex_2026-09-07/17_cpu_ffi_baseline/pytest.log`
+and sibling `13_screening_admission/pytest.log`. This is an inherited CPU environment
+limitation, not a remaining GPU landing-suite failure.
