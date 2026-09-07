@@ -107,8 +107,13 @@ def test_prepare_constructs_receipts_on_host_from_one_canonical_scan():
         and node.name == "prepare_isdf_and_wavefunctions")
     assert prepare.decorator_list == []
 
+    stages = [node for node in module.body if isinstance(node, ast.FunctionDef)
+              and node.name in ("_prepare_fresh_isdf", "_prepare_fitted_zeta",
+                                "_restart_charge_basis", "_restart_current_carrier")]
+    assert len(stages) == 4
+    assert all(node.decorator_list == [] for node in stages)
     receipt_calls = [
-        node for node in ast.walk(prepare)
+        node for stage in stages for node in ast.walk(stage)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and isinstance(node.func.value, ast.Name)
@@ -122,7 +127,7 @@ def test_prepare_constructs_receipts_on_host_from_one_canonical_scan():
         for call in receipt_calls)
 
     canonical_scans = [
-        node for node in ast.walk(prepare)
+        node for stage in stages for node in ast.walk(stage)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "bind_wfn_fingerprint"

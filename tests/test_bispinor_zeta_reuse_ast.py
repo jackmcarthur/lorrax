@@ -125,7 +125,7 @@ def test_reuse_contract_precedes_and_bypasses_fit_only_planners():
     assert not _calls(contract, "_plan_gflat_chunks_for_channel")
     assert not _calls(contract, "load_centroids_band_chunked")
 
-    _, prepare = _function_tree("prepare_isdf_and_wavefunctions")
+    _, prepare = _function_tree("_prepare_fresh_parent_faces")
     resolves = _calls(prepare, "_resolve_zeta_fit_contract")
     plans = _calls(prepare, "_plan_gflat_chunks_for_channel")
     assert len(resolves) == 1 and len(plans) == 1

@@ -69,7 +69,7 @@
 |---|---|---|---|---|
 | `src/gw/gw_init.py` | `fit_zeta` | 576 | 56 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
 | `src/gw/gw_init.py` | `compute_V_q` | 398 | 22 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
-| `src/gw/gw_init.py` | `prepare_isdf_and_wavefunctions` | 742 | 742 | Unchanged; target remains |
+| `src/gw/gw_init.py` | `prepare_isdf_and_wavefunctions` | 742 | 78 | Existing statements moved to named stages or dead selector removed; narrative owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
 | `src/gw/gw_init.py` | `_report_zeta_chunk_plan` | 0 | 16 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_reuse_zeta_faces` | 0 | 27 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_plan_transverse_zeta` | 0 | 28 | New explicit phase/direct owner |
@@ -87,8 +87,20 @@
 | `src/gw/gw_init.py` | `_compute_photon_vq` | 0 | 90 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_compute_scalar_vq` | 0 | 35 | New explicit phase/direct owner |
 | `src/gw/gw_init.py` | `_finalize_vq_views` | 0 | 23 | New explicit phase/direct owner |
-| `src/gw/gw_init.py` | Docstring lines / share | 504 / 13.31% | 504 / 14.19% | Owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
-| `src/gw/gw_init.py` | **File total** | 3786 | 3551 | Net -235 lines |
+| `src/gw/gw_init.py` | `_prepare_fresh_parent_faces` | 0 | 46 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_prepare_fitted_zeta` | 0 | 44 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_prepare_fresh_carriers` | 0 | 57 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_prepare_fresh_coulomb` | 0 | 19 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_write_fresh_restart` | 0 | 70 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_prepare_fresh_isdf` | 0 | 43 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_read_authenticated_restart` | 0 | 34 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_restart_charge_basis` | 0 | 61 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_restart_charge_carrier` | 0 | 59 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_restart_current_carrier` | 0 | 106 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_restart_gamma_vectors` | 0 | 24 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | `_prepare_restart_isdf` | 0 | 45 | New explicit phase/direct owner |
+| `src/gw/gw_init.py` | Docstring lines / share | 504 / 13.31% | 504 / 14.37% | Owner: docs/architecture/zeta_fit_face_psi_cct.md / four_current_wiring.md |
+| `src/gw/gw_init.py` | **File total** | 3786 | 3507 | Net -279 lines |
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
@@ -603,12 +615,17 @@
 
 | Module | Function | Lines before | Lines after | Deleted or moved; destination |
 |---|---|---|---|---|
+| `tests/test_wavefunction_basis_receipt.py` | `test_prepare_constructs_receipts_on_host_from_one_canonical_scan` | 34 | 39 | Existing statements moved to named stages or dead selector removed |
+| `tests/test_wavefunction_basis_receipt.py` | **File total** | 326 | 331 | Net +5 lines |
+
+| Module | Function | Lines before | Lines after | Deleted or moved; destination |
+|---|---|---|---|---|
 | `tests/test_zeta_nband_decoupling.py` | `test_the_fit_window_travels_into_the_provenance_stamp` | 25 | 29 | Existing statements moved to named stages or dead selector removed |
 | `tests/test_zeta_nband_decoupling.py` | **File total** | 412 | 416 | Net +4 lines |
 
 | Tree scope | Before | After | Net |
 |---|---|---|---|
-| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119655 | -5592 |
+| Requested production roots, tracked Python; baseline `00_inventory/before.json` | 125247 | 119611 | -5636 |
 
 | Pushed batch | Claim | CPU scope/result | P4 printed identity | Evidence |
 |---|---|---|---|---|
@@ -627,7 +644,8 @@
 | 13 — extract bounded centroid loading stages (7225ea43) | 1410 | 458 passed, 2 skipped, 1 xfailed, 102 warnings in 176.27s (0:02:56) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58001753 lx-Xg0-193204-329368-3760, lx-Xg4-192729-303163-2911; 31_centroid_guard/cpu/cpu.xml; 31_centroid_guard/p4/mos2/identity.json |
 | 14 — restore low_mem_bands and two-layout planner dispatch (a9560071) | 1413 | 474 passed, 2 skipped, 1 xfailed, 102 warnings in 187.73s (0:03:07) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-201643-544166-5522, lx-Xg4-201649-544831-8820; 34_restore_layout/cpu/cpu.xml; 34_restore_layout/p4/mos2/identity.json |
 | 15 — revert writer extraction exposed by fresh fitting (fe51b102) | 1414 | 455 passed, 2 skipped, 1 xfailed, 102 warnings in 192.85s (0:03:12) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-202436-590723-1370, lx-Xg4-202604-591455-1706; 39_writer_revert_corrected/cpu/cpu.xml; 39_writer_revert_corrected/p4/mos2/identity.json |
-| 16 — split Sigma dispatch into explicit physics stages (this commit) | 1416 | 478 passed, 2 skipped, 3 xfailed, 102 warnings in 196.16s (0:03:16); CPU1 13 passed, 1 warning in 3.65s | Si SOC GN exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-202851-614453-8799, lx-Xg4-202906-616745-3091, lx-Xg0-202904-616331-8607; 36_sigma_stages/cpu/cpu.xml; 36_sigma_stages/p4/si_soc/identity.json |
+| 16 — split Sigma dispatch into explicit physics stages (9f2c64d5) | 1416 | 478 passed, 2 skipped, 3 xfailed, 102 warnings in 196.16s (0:03:16); CPU1 13 passed, 1 warning in 3.65s | Si SOC GN exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-202851-614453-8799, lx-Xg4-202906-616745-3091, lx-Xg0-202904-616331-8607; 36_sigma_stages/cpu/cpu.xml; 36_sigma_stages/p4/si_soc/identity.json |
+| 17 — split fresh and restart ISDF initialization stages (this commit) | 1418 | 472 passed, 2 skipped, 1 xfailed, 102 warnings in 190.64s (0:03:10) | MoS2 exact eqp0/eqp1 and sigma_diag | allocation58006471 lx-Xg0-203308-639938-5868, lx-Xg4-203317-641493-1330; 37_initializer_port/cpu/cpu.xml; 37_initializer_port/p4/mos2/identity.json |
 
 | Deviation / open gate | Reason / disposition |
 |---|---|

@@ -3165,3 +3165,167 @@ needed at this layer.  The undivisibility shows up only at the
 V_q read where the trailing axis is sharded by the *product*
 ``('x', 'y')`` = 16; SlabIO's auto-pad on the on-disk dataset
 closes that gap (see ``file_io.slab_io.create_dataset``).
+
+
+### ISDF initialization contract and phase rulings (2026-09-06)
+
+ISDF pipeline (non-restart path reads top-to-bottom):
+
+  1. Resolve the canonical all-channel ζ reuse contract.
+  2. If refitting, ``plan_gflat_chunks`` → band/r/q/G-flat chunk plan.
+  3. ``load_centroids_band_chunked`` → ψ at centroids for [b0, b4).
+  4. ``fit_zeta`` → reuse or write ζ.h5.
+  5. ``compute_V_q`` → V_qmunu, G0 (reads ζ from disk).
+  6. Flush V_q / G0 / enk + W0 placeholder to restart H5 (mode="w").
+  7. Build the downstream Wavefunctions bundle from the same ψ.
+
+Returns the resident V, wavefunction bundles and any fresh literal-Gamma
+channel vectors needed by the packed photon head.
+
+```text
+	# The deck's write/skip decision for tmp/isdf_tensors_*.h5, taken and
+	# announced in ONE place (``write_restart_tensors``).
+	# The q-storage decision + the hand-off slot the V_q producer deposits
+	# its pre-unfold block into.  Imported here rather than at module scope
+	# for the same reason the writer is: this function is the only caller.
+	# Same shape, same two-call-site reason: parser-altitude coverage is
+	# duplicated here for a hand-built cfg.  No-op at the default (false).
+	# The receipt's band interval is PHYSICAL, not the mesh-padded carrier
+	# edge.  ``b_id_4_user`` is the exact loaded WFN boundary; ``b4`` may be
+	# rounded past WFN.nbands and names allocation only.
+	# THE I/O SEAM.  Files keep the canonical centroid order (grid-agnostic);
+	# everything in memory is in the run's packed order (common.centroid_basis).
+	# A reader packs, a writer unpacks, nothing in between converts.
+		# One bounded canonical HDF5 scan supplies every receipt for this
+		# loaded source.  In particular a bispinor run must not reopen/sample
+		# the WFN independently for its charge and transverse identities.
+			# Resolve the complete charge/bispinor zeta identity before
+			# allocating or pricing anything used solely by a fit.  The one
+			# contract includes transverse centroid/solver provenance and an
+			# independent verdict for every artifact when bispinor=true.
+			# Profiling helper: LORRAX_EXIT_AFTER_ZETA=1 short-circuits
+			# the pipeline right after ζ-fit, before the expensive V_q
+			# stage.  Combine with LORRAX_MAX_RCHUNKS=N + LORRAX_DEBUG_PRINT=1
+			# for fast per-r-chunk timing sweeps.
+			#
+			# The parse used to be a bare presence test, so *every* non-empty
+			# value exited — including ``LORRAX_EXIT_AFTER_ZETA=0``.  A debug
+			# knob set to "off" therefore ended a production run with
+			# ``SystemExit(0)``: the worst possible failure shape, because
+			# rc=0 with a truncated output is indistinguishable from
+			# completion to anything downstream.  ``env_bool`` gives ``0``,
+			# ``off``, ``false``, ``no`` (any case) their obvious meaning and
+			# announces anything it does not recognise.
+					# Loud and machine-greppable: this exit is rc=0 by
+					# design (runtime's fail-fast excepthook documents
+					# SystemExit(0) as intentional), so the LOG is the only
+					# place a consumer can tell an early exit from a
+					# finished run.
+			# The same parent carrier serves screening and band projection.
+			# P4 — pre-V_q.  Whatever's still in HBM after fit_zeta
+			# returns forms the persistent baseline that V_q's transient
+			# peak stacks on top of.  Same env gate as the ζ-fit probes
+			# (the one driver debug stream).  Round-1 addition.
+			# P5 — post-V_q.  V_q's transient peak just happened inside
+			# compute_V_q; this probe captures what survives (V_qmunu,
+			# G0) plus anything held over from ζ-fit.  Combined with P4
+			# and the V_q HLO buffer-assignment.txt this lets us model
+			# V_q's contribution to overall HBM peak.  Round-1 addition.
+			# Flush V_q / G0 / enk + W0 placeholder immediately.  Pass
+			# kgrid so BSE downstream can recover the (nkx, nky, nkz)
+			# split from flat-q V_qmunu without re-reading the WFN.
+			#
+			# ``write_restart_tensors = false`` skips this and the ψ
+			# append and the centroid stamp TOGETHER — one decision,
+			# taken once and announced once by
+			# ``gw_output.restart_tensor_writes_enabled``.  Writing
+			# some of the datasets and not the others would produce a
+			# file the band-window and W0_ready guards accept and the
+			# BSE loader then trips over one dataset later.
+			#
+			# THE GUARDED BLOCK CONTAINS COLLECTIVES (the SlabIO writes
+			# and ``barrier("restart_centroid_stamp")``), so the
+			# predicate MUST be rank-invariant or the skipping ranks
+			# hang the writing ones.  It is: a deck key, parsed from a
+			# file every rank reads, with no env override and no
+			# probe.  ``restart_tensor_writes_enabled``'s announcement
+			# is rank-0-only but prints rather than communicating, so
+			# it adds no collective of its own.
+			# THE q-STORAGE DECISION, TAKEN ONCE, FOR BOTH TENSORS.
+			# ``resolve_restart_q_storage`` is rank-invariant for the same
+			# reason ``restart_tensor_writes_enabled`` is — a deck key and
+			# a centroid file every rank reads — so it adds no collective
+			# and cannot make ranks disagree about whether to write.
+			# The decision is taken even when the writes are suppressed:
+			# it costs nothing and the announcement is the only place a
+			# log says which q-set the file would have been on.
+					# THE COULOMB-KERNEL POLICY, stamped with the tensors it
+					# describes.  V_qmunu is reused verbatim by every later
+					# restart and compute_V_q never re-runs, so without this
+					# an averaging-policy change is inherited in silence with
+					# every other guard passing.
+					# Stamp the band window + n_rmu so a later restart
+					# under a CHANGED window fails loudly instead of
+					# silently misindexing Sigma (job 7874375).
+					# ONE resolution, bound to the wedge the V_q producer
+					# offered.  ``take_pre_unfold`` REMOVES it, so the W0
+					# writer downstream cannot be handed V's block.
+			# Append the two canonical raw-parent faces of each present family.
+				# Stamp the centroid tables' CONTENT hashes so a restart
+				# can verify the quadrature points, not just their counts
+				# (see ``_centroid_table_md5``; audit fix/zq 2026-07-28).
+				# Rank 0 only, after the collective writer released the
+				# file; a failed stamp is non-fatal — the restart-side
+				# guard then warns about the missing attr instead of
+				# verifying.
+		# ``mc_average_placement`` changes the finite-q W operator and still
+		# cannot reuse a restart V.  ``bgw_metal_q0_treatment``, by contrast,
+		# needs only one finite-q head vector from the already fitted ζ file;
+		# build that channel below without repeating either ISDF fit or V_q.
+		# low_mem_bands, including bispinor, is supported on this restart
+		# branch.  The entry resolver above is a centralized compatibility
+		# hook whose current deck-key refusal table is empty.
+		# The owner above returns the exact record it read and authenticated;
+		# do not reopen the artifact across that trust boundary.  Absence remains
+		# usable by legacy GW paths, but cannot support a new immutable basis
+		# receipt: there is no fact tying the stored psi/E bytes to this WFN.
+			# Files keep the canonical centroid order: convert at the seam.
+			# COULOMB-KERNEL POLICY DISCLOSURE.  Loud on a mismatch, one
+			# line on a match, and a NAMED "not stamped" on a legacy file —
+			# the three are different facts and the log says which.  A
+			# warning rather than a refusal: a policy change makes the
+			# stored V a legitimate tensor built under another convention,
+			# and which one the operator wants is not this seam's call.
+			# What is removed is the silence.
+			# Restart is the seam where "rc=0 but garbage" was born (job
+			# 7874375: a changed band window silently reused tensors built
+			# under the old one).  The band-window attrs guard inside
+			# ``load_restart_state_from_h5`` covers provenance; these
+			# gates cover the *content* — a truncated/partially-written
+			# restart file from a crashed run reads back as zeros or NaN
+			# and would otherwise flow straight into Σ.
+			# Centroid-table CONTENT guard (pattern #10; audit fix/zq
+			# 2026-07-28).  The band-window/n_rmu attrs pin the SHAPES of
+			# the restart tensors; these md5 stamps (written by the
+			# non-restart path above) pin the quadrature POINTS.  Old
+			# restart files predating the stamp get a LOUD warning naming
+			# the gap, not a refusal.
+			# The transverse parent pair is required by the header guard above.
+				# Provenance: the on-disk transverse centroid COUNT and
+				# CONTENT (md5 stamp) must match the run's
+				# centroids_file_current (pattern #10 — the artifact
+				# outlives the config that made it).
+				# Content check — same count does NOT mean same points
+				# (audit fix/zq 2026-07-28; ``_stamped`` read above).
+		# Recompute the head from canonical one-leg factors, never file padding.
+		# Raw-parent, orbit-packed ψ is a screening-only acceleration carrier,
+		# deliberately separate from the primary Wavefunctions pytree so head,
+		# Sigma, density and output kernels cannot inherit unused large inputs.
+		# The exact loaded-WFN identity was already scanned while binding the
+		# charge/transverse basis receipts.  Keep that opaque host proof at the
+		# orchestration seam so later artifact gates cannot reopen/resample the
+		# same WFN.  Legacy restart bundles legitimately carry ``None``.
+		# Host-only provenance stays in these orchestration bindings rather
+		# than entering Wavefunctions' JAX pytree.  QP rotation returns only a
+		# numerical carrier, so it cannot accidentally inherit a DFT binding.
+```

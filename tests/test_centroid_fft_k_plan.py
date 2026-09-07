@@ -100,7 +100,7 @@ def test_planned_k_tile_reaches_the_one_fixed_shape_padding_owner():
     )
     assert ast.unparse(planned_value) == "int(gflat_plan.centroid_k_chunk)"
 
-    prepare = _function(gw_tree, "prepare_isdf_and_wavefunctions")
+    prepare = _function(gw_tree, "_prepare_fresh_parent_faces")
     charge_calls = _calls(prepare, "load_centroids_band_chunked")
     assert len(charge_calls) == 1
     charge_k = next(
