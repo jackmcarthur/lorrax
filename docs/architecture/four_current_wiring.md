@@ -753,3 +753,64 @@ full-child Green GEMM for static and dynamic channels. The two transient
 complex128 faces occupy `32 * nk * nb * ns * M / P` bytes per rank; the
 quadratic Green result remains sharded over both mesh axes. Head wings batch
 the same typed children in parent order. Neither path persists those faces.
+
+
+### Static photon response entry contract (2026-09-06 phase extraction)
+
+Build the packed static photon body and complete its Gamma cell.
+
+THE SCREENING OWNER OF BOTH PACKED STATIC MODES.  ``screen_current``
+(resolved once by :func:`gw_config.packed_photon_screens_current`, never
+defaulted here) selects which:
+
+``screen_current = True`` -- ``bispinor_gw = full_static_cohsex``: the
+sixteen no-pair blocks of ``chi``, one distributed Dyson solve at
+omega=0.
+
+``screen_current = False`` -- the ``bare_transverse`` family: the twelve
+current blocks of ``chi`` are ZERO by declaration, so the packed Dyson
+equation is block diagonal and neither the current blocks nor the packed
+solve are built at all.  The CC block is screened by the incumbent
+scalar owner (``gw.screening.compute_screening_model`` -> :func:`solve_w`
+at ``n_C``) and arrives as ``W_charge``; this function assembles
+``W_packed = diag(W_00, D_TT)`` with ``W_CT = 0`` through the sole
+packer.  The sixteen-block Sigma consumer then returns the screened
+charge COHSEX in CC, the bare Breit exchange ``Sigma^B`` in TT
+(``SX(D_TT) = X(D_TT)``, ``COH(D_TT - D_TT) = 0``) and zero in CT/TC --
+the incumbent ``gw.sigma_x_bispinor`` result, block for block.
+
+Both modes then run ONE Gamma-cell completion
+(:func:`gw.head_correction.complete_static_slab_photon_q0`) from the
+bounded response of
+:func:`gw.static_gauge_response.build_static_photon_head_response` --
+bare ``<D>`` into V, the charge ``S^{00}``/wing head into W, the Hall
+CT/TC term from ``config.paths.static_gauge_hall_file`` when that
+artifact exists (``sigma_H = 0`` otherwise, announced).  With the
+charge-only ``R(q)`` the coupled 4x4 solve returns
+``diag(W^{00}_h(q), D_TT(q))``, so the same completion inserts the
+charge head AND the bare ``<D_TT> = -<v P^T>`` that the
+``bispinor_tt_head_correction`` overlay writes into the TT V tiles on
+the incumbent route (that key is refused here, GATE
+``packed_bare_transverse_tt_head_double_count``).  The Hall term needs a
+screened CT/TC channel to live in, so a nonzero Hall artifact is refused
+on the bare route; an authenticated exact-zero artifact is admitted and
+gives the same operator as the unnamed zero-Hall default.  The completion
+runs under ``head_correction = full`` (the
+default); ``off`` skips it behind a DEBUG banner and is not a production
+setting (owner ruling 2026-09-01).  The current q^2/contact/complement
+terms are omitted by model in either case.
+
+MEMORY.  Both modes keep the packed body resident: ``V_packed`` and
+``W_packed`` are each ``(nq, N_packed, N_packed)`` complex128 at
+``P(None,'x','y')`` with ``N_packed = n_C + 3 n_T``, i.e.
+``16 nq N_packed^2 / P`` bytes per rank each.  The bare route's
+incumbent predecessor held one TT tile at a time instead, so this IS a
+new resident carrier for that route (it is the same object the screened
+mode already holds).  The figure is printed at this site below; the
+per-block streaming inside ``gw.photon_sigma`` is unchanged.
+
+``print_fn`` is the driver's rank-zero printer.  In production mode the
+driver sinks ordinary component chatter, so the DEBUG banner below
+carries a WARNING token (retained in the run record's warning block)
+and the driver copies the completion / Hall status into its
+``Photon head`` record line from the returned ``head_completion``.
