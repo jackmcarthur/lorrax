@@ -36,6 +36,7 @@ logical blocks remain the portable on-disk representation.
 """
 from __future__ import annotations
 
+from distrib_la import mesh_key as _mesh_key
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Mapping
@@ -161,7 +162,7 @@ _q0_block_cache: dict = {}
 
 def _empty(nq, layout, mesh_xy, dtype):
     shape = (int(nq), layout.packed_extent, layout.packed_extent)
-    key = (id(mesh_xy), shape, np.dtype(dtype).str)
+    key = (_mesh_key(mesh_xy), shape, np.dtype(dtype).str)
     if key not in _zero_cache:
         out = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
@@ -175,7 +176,7 @@ def _empty(nq, layout, mesh_xy, dtype):
 
 def _insert_program(layout, mesh_xy, nq, p_left, p_right):
     """Shape-specialized insert; offsets/valid lengths stay runtime data."""
-    key = (id(mesh_xy), int(nq), layout.packed_extent,
+    key = (_mesh_key(mesh_xy), int(nq), layout.packed_extent,
            int(p_left), int(p_right))
     if key in _insert_cache:
         return _insert_cache[key]
@@ -249,7 +250,7 @@ def pack_photon_operator(
 
 
 def _view_program(layout, mesh_xy, nq, p_left, p_right):
-    key = (id(mesh_xy), int(nq), layout.packed_extent,
+    key = (_mesh_key(mesh_xy), int(nq), layout.packed_extent,
            int(p_left), int(p_right))
     if key in _view_cache:
         return _view_cache[key]
@@ -365,7 +366,7 @@ def unpack_photon_response_tiles(
 def _vector_pack_program(layout, mesh_xy, nq, dtype, axis_name):
     """One local graph for embedding four channel vectors in packed space."""
     padded = tuple(int(n) for n in layout.carrier_extents)
-    key = (id(mesh_xy), padded, int(nq), np.dtype(dtype).str, axis_name)
+    key = (_mesh_key(mesh_xy), padded, int(nq), np.dtype(dtype).str, axis_name)
     if key in _vector_pack_cache:
         return _vector_pack_cache[key]
     from common.shard_map import shard_map
@@ -508,7 +509,7 @@ def _validate_q0_factor_pair(left, right, layout, mesh_xy, *, dtype, label, stac
 
 def _q0_update_program(layout, mesh_xy, nq, dtype, factor_ndim=2):
     """One shape-stable local graph per padded q=0 update geometry."""
-    key = (id(mesh_xy), tuple(layout.carrier_extents), int(nq),
+    key = (_mesh_key(mesh_xy), tuple(layout.carrier_extents), int(nq),
            np.dtype(dtype).str, factor_ndim)
     if key in _q0_update_cache:
         return _q0_update_cache[key]
@@ -625,7 +626,7 @@ def add_photon_q0_low_rank(
 
 def _q0_block_program(mesh_xy, p_left, p_right, dtype, n_pairs):
     """One q-extent-one graph per padded shape class and factor count."""
-    key = (id(mesh_xy), int(p_left), int(p_right), np.dtype(dtype).str,
+    key = (_mesh_key(mesh_xy), int(p_left), int(p_right), np.dtype(dtype).str,
            int(n_pairs))
     if key in _q0_block_cache:
         return _q0_block_cache[key]

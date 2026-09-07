@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from distrib_la import mesh_key as _mesh_key
 from dataclasses import dataclass
 
 from common.collectives import device_put_process_local
@@ -122,10 +123,10 @@ def _make_photon_static_class_kernel(
     plans = (left.plan, right.plan)
     shapes = tuple((p.n_parent, c.psi_nmu.shape[1], p.n_centroid_packed, p.nspinor)
                    for c, p in zip((left, right), plans))
-    key = (id(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, ffi_dial_key(), with_head)
+    key = (_mesh_key(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, ffi_dial_key(), with_head)
     if key in _photon_sigma_kernel_cache:
         return _photon_sigma_kernel_cache[key]
-    plan_key = ("plans", id(mesh_xy), tuple(kgrid), nk_tot, shapes, ffi_dial_key())
+    plan_key = ("plans", _mesh_key(mesh_xy), tuple(kgrid), nk_tot, shapes, ffi_dial_key())
     if plan_key not in _photon_sigma_kernel_cache:
         project = contract_bands_block_reshard(mesh_xy, layout="face",
             face_shape=shapes[0], right_face_shape=shapes[1])

@@ -2079,8 +2079,7 @@ def _plan_coupled_zeta_fit(
             host_spill_gflat=True)
         _local_delta = _coupled_mu123_zq_incremental_bytes(
             **_delta_args, stack_three_solves=False)
-        _distributed_delta = _coupled_mu123_zq_incremental_bytes(
-            **_delta_args, stack_three_solves=False)
+        _distributed_delta = _local_delta
         from runtime.padding import mesh_divisor
         _p_xy = mesh_divisor(mesh_xy)
         _mu_T = int(_meta_T.n_rmu_padded)

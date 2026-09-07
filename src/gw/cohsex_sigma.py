@@ -1,6 +1,7 @@
 """Contract static screened exchange and Coulomb hole on canonical parent wavefunctions."""
 from __future__ import annotations
 
+from distrib_la import mesh_key as _mesh_key
 from functools import partial
 
 import jax
@@ -201,7 +202,7 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     from ffi import ffi_dial_key
     from ffi.mklfft import fused_fft_ffi_enabled
     from common.fft_helpers import make_flat_k_gw_conv
-    key = (id(mesh_xy), tuple(kgrid), ffi_dial_key(), int(nk_tot), q0_only, lorentz)
+    key = (_mesh_key(mesh_xy), tuple(kgrid), ffi_dial_key(), int(nk_tot), q0_only, lorentz)
     if key in _static_convolution_cache:
         return _static_convolution_cache[key]
     scale = -1.0 / (float(nk_tot) if q0_only else np.sqrt(float(nk_tot)))
@@ -274,7 +275,7 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     # as an unrelated FFI probe error from work that was about to be
     # thrown away anyway.
     from ffi import ffi_dial_key
-    cache_key = (id(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(),
+    cache_key = (_mesh_key(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(),
                 layout, face_shape, k_unfold_plan)
     if cache_key in _cohsex_kernel_cache:
         return _cohsex_kernel_cache[cache_key]
