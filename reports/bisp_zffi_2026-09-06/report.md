@@ -13,13 +13,44 @@
 | Si CCT / ZCT modules | device | 35.886 / 506.144 | 0.232 / 3.265 | 0077 / 0198;2 ZCT tiles |
 | Ceiling interpretation | — | — | — | Device rows exclude host compilation; host and device rows overlap and must not be added. ZCT module rows are upper bounds on tail device work. |
 
+| All-ns admission ruling | Result / evidence |
+| --- | --- |
+| Runtime delta | Deleted the three-line ns=1/2 auto-off in make_fused_conv_kparent; existing conv_kpair_plan is the only shape/SMEM admission policy |
+| Geometry / cache | One combined P4 step; separate cold processes, BFC@0.85, JIT cache off; paired initial rule-cache files byte-identical; reduction_steps=0 |
+| Legacy deck correction | Leg20 actually specified30 passes; new variants50/51/52 use the requested0. Arm50 seeds valid0-pass rules before copying the same cache to both paired arms. Original deck retained. |
+| Selected rules | ns=1 node digests identical; ns=2 selected digests differ,700→702 window/tau pairs despite identical initial caches. Its eqp delta includes that adaptive response; no forced certificate or rule-selection bypass. |
+| Kernel coverage | Existing16 native oracle cases cover ns=1/2/4 and both layouts/arms at≤5e-16; no CUDA or ABI change in this admission delta |
+
+| Deck / fresh paired arms | ζ normalized max | eqp0 max µeV | eqp1 max µeV | Cold fit before→native s | Gate |
+| --- | --- | --- | --- | --- | --- |
+| ns=1: 48_ns1_decomposed→49_ns1_native | 3.945964e-09 | 93.562 | 105.735 | 6.9→6.1 | PASS;≤2000µeV; native faster |
+| ns=2: 51_ns2_decomposed→52_ns2_native | 1.436599e-08 | 0.611 | 1.131 | 9.9→8.3 | PASS;≤2000µeV; native faster |
+
+| Fit conditioning check | κ(C) measured max | ε·κ(C), ε=2.220446e-16 | rcond·δζ, rcond=1e-8 | Empirical relative eqp/ζ amplification |
+| --- | --- | --- | --- | --- |
+| ns=1 | 4.864828e+07 | 1.080209e-08 | 3.945964e-17 | 1382.72 |
+| ns=2 | 9.979828e+07 | 2.215967e-08 | 1.436599e-16 | 3.14 |
+
+| Amplification interpretation | Conclusion |
+| --- | --- |
+| Retained solve bound | κ(C)≤1/rcond=1e8. First-order solve sensitivity scales as κ(C)·(relative δCCT + relative δZCT); the oracle’s≈5e-16 scale per term gives an≈1e-7 relative fit-error scale. |
+| Observed fit floor | Both measured δζ are below ε·κ(C), and rcond·δζ is below fp64 ε. The conditioning scale explains the ζ movement without a kernel inconsistency. |
+| Eqp bound / limit | The fit rcond alone does NOT give a rigorous bound on the subsequent nonlinear GW/MPA/eqp stages. Reported amplification is empirical: max(relative Δeqp0/1)/δζ. The measured shifts105.735/1.131µeV are compatible with amplified roundoff and satisfy the owner’s2meV rule. |
+| Source of receipts | 53_all_ns_checks/summary.json; registered compare_zeta_h5.py and eqp_ab.py outputs; per-rank driver stage and condition-number receipts |
+
+| Updated native branch reference | Output arm |
+| --- | --- |
+| ns=1 | /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/118_bisp_zffi_codex_2026-09-06/49_ns1_native |
+| ns=2 | /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/118_bisp_zffi_codex_2026-09-06/52_ns2_native |
+| Reference manifest | all_ns_branch_references.json; validated_commit.txt added to each native arm after commit; in-leg source_head/source.diff preserved |
+
 | Scope | Value |
 | --- | --- |
 | Lane / branch | Heavy BISP-ZFFI; perf/bisp-zeta-ffi-2026-09-06, unmerged; no rebase |
 | Kernel commit | c2e847ad; additive CufftConvKParentCudaFfi, ABI3, existing handlers unchanged |
 | Worktree | /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/wt_bisp_zffi_codex_20260906 |
 | Evidence root | /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/118_bisp_zffi_codex_2026-09-06 |
-| Admission | Automatic ns=4 native; automatic ns=1/2 retains the existing decomposed tail to preserve required printed digits. Explicit on covers all shapes in the kernel oracle. |
+| Admission | Native parent tail admitted for every ns when the existing shape/SMEM plan admits; no ns=1/2 auto-off. CPU, missing-target and refused-plan fallback unchanged. |
 | Owner stage ruling | JAX feed stage skipped; native CUDA implemented directly, unconditionally. No new full-k operand carrier. |
 | Measurement geometry | P4=-N1 -G4 -n4; P16=-N4 -G4 -n16; BFC@0.85; cold JIT; one sample per arm |
 | Stage 0 source | ISDF core equals aa0fdb6e; additive private FFI prototype loaded, new parent target never called;09/source.diff and HLO |
@@ -102,24 +133,24 @@
 | MoS₂ P4 fit-only profile | 48.5 | 45.9 | 5.4% | 09→38 |
 | MoS₂ P4 plain fresh fit | 28.1 | 23.9 | 14.9% | 04→39 |
 | Si SOC GN P4 plain fresh fit | 21.2 | 17.3 | 18.4% | 11→40 |
-| Legacy Si leg20 ns=2 | 9.9 | 10.1 | -2.0% | 12→41; same decomposed tail |
-| True Si ns=1 | 6.8 | 6.9 | -1.5% | supplied00→42; same decomposed tail |
+| Legacy Si leg20 ns=2 | 9.9 | 8.3 | 16.2% | 51_ns2_decomposed→52_ns2_native; matched steps=0 |
+| True Si ns=1 | 6.9 | 6.1 | 11.6% | 48_ns1_decomposed→49_ns1_native; matched steps=0 |
 | MoS₂ P16 plain fresh fit | 25.2 | 22.0 | 12.7% | 43→44 |
 
 | Compile-event gate | Before | After | Result |
 | --- | --- | --- | --- |
 | P4 fit-only MoS₂ rank0 | 250 | 250 | equal;09/38 |
 | P16 whole arm, EVERY rank0–15 | 620 | 620 | equal;43/44 |
-| Legacy Si ns=2 whole arm | 454 | 454 | equal;12/41 |
-| True Si ns=1 whole arm | 405 | 405 | equal;supplied00/42 |
-| ns=1/2 wall interpretation | incumbent tail | incumbent tail | +0.1/+0.2s rounded cold samples; no native scalar speedup or statistically resolved slowdown claim |
+| Legacy Si ns=2 whole arm | 454 | 454 | equal;51/52 |
+| True Si ns=1 whole arm | 405 | 405 | equal;48/49 |
+| ns=1/2 wall interpretation | matched cold controls | native auto | Both fits faster in one P4 sample each; no statistical confidence interval claimed |
 
 | Final same-deck identity | eqp0 max µeV | eqp1 max µeV | Tolerance µeV | Result |
 | --- | --- | --- | --- | --- |
 | 39_column_mos2 | 0.007 | 0.007 | 20 | PASS |
 | 40_column_soc | 3.680 | 3.680 | 20 | PASS |
-| 41_column_si | 0.000 | 0.000 | 0 | PASS |
-| 42_column_ns1 | 0.000 | 0.000 | 0 | PASS |
+| 52_ns2_native | 0.611 | 1.131 | 2000 | PASS |
+| 49_ns1_native | 93.562 | 105.735 | 2000 | PASS |
 | 44_p16_native | 0.009 | 0.009 | 20 | PASS |
 
 | ζ dataset comparison | Normalized max error | Tolerance | Result |
@@ -128,7 +159,8 @@
 | 38_column_mos2_profile_zeta_q_mu1.h5.log | 1.8546e-12 | 1e-6 | PASS |
 | 38_column_mos2_profile_zeta_q_mu2.h5.log | 1.0277e-12 | 1e-6 | PASS |
 | 38_column_mos2_profile_zeta_q_mu3.h5.log | 9.9378e-13 | 1e-6 | PASS |
-| 41_column_si_zeta_q.h5.log | 0.0000e+00 | 1e-6 | PASS |
+| 49_ns1_native_zeta.log | 3.9460e-09 | 1e-6; also below ε·κ | PASS |
+| 52_ns2_native_zeta.log | 1.4366e-08 | 1e-6; also below ε·κ | PASS |
 
 | Correctness gate | Result | Evidence |
 | --- | --- | --- |
@@ -141,11 +173,11 @@
 
 | Refused change / preserved failure | Finding | Disposition |
 | --- | --- | --- |
-| Native ns=1 automatic admission | Initial eqp1 delta105.735µeV; decomposed repeat matches64/64 printed rows | Not admitted automatically; final42 eqp0/1 exact |
-| Native ns=2 automatic admission | Initial candidate failed printed identity; mixed rule-cache choices also contaminated earlier comparison | Not admitted automatically; exact fixed cache + decomposed final41 gives224/224 exact rows |
+| Superseded ns=1 printed-digit gate | Initial eqp1 delta105.735µeV | Owner replaces bit identity with2meV for the conditioning-sensitive fit; native automatic admission restored |
+| Superseded ns=2 printed-digit gate | Legacy mixed-cache comparisons retained as history | Matched-cache steps=0 pair51/52 replaces those branch references; native automatic admission restored |
 | Legacy leg20 labeling | Two-component WFN under bispinor=false, not ns=1 | True scalar gate supplied separately; recorded in KNOWN_SANDBOX_ERRORS.md |
 | P16 first attempt | Missing staged dipole.h5; failed before science | 21 preserved; corrected final43/44 passed |
-| No convention changes | F1 spin action, antiunitarity, phase signs and post-unfold vertices retained | No altered tolerance, rank cutoff or physics deck |
+| No convention changes | F1 spin action, antiunitarity, phase signs and post-unfold vertices retained | No rank-cutoff or physics change; owner explicitly revises scalar eqp acceptance to2meV |
 
 | Build / publication | Value |
 | --- | --- |
@@ -154,7 +186,8 @@
 | Build verification | All build gates passed; ABI3 additive entry; shared runtime unchanged |
 | Integrator order1 | aa0fdb6e — square/TR fresh-fit fix; integrator already owns its gates |
 | Integrator order2 | c2e847ad — native parent CUDA load, direct layouts, automatic identity guard; pushed |
-| Claims | 1411 fresh-fit fix;1421 gated native kernel; report-publication receipt45_final_checks/claim_report.txt |
+| Integrator order3 | This separate admission commit above317d754b: delete ns-specific guard, update matched scalar references and conditioning receipts |
+| Claims | 1411 fresh-fit fix;1421 native kernel;1422 accepted report; admission claim receipt53_all_ns_checks/claim.txt |
 | P16 pool | 58006946 released after final leg;20_p16_pool/release.log |
-| P4 pool | 58005266 released after committed CPU confirmation;45_final_checks/release_pool.log |
-| Status | Native ns=4 implementation pushed and gated; ns=1/2 refused automatic native admission and retain exact fallback; no outstanding science gate |
+| P4 pools | Earlier58005266 released; admission58008072 released after matched pairs,47_all_ns_pool/release.log; failed allocation58007950 recorded |
+| Status | Native parent tail admitted for every ns; both scalar ζ/2meV gates and cold-fit performance checks pass; separate admission delta ready for integration |

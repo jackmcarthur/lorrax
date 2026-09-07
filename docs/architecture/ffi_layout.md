@@ -760,8 +760,7 @@ input layouts so the existing GEMM split is a bitcast. ZCT uses 0 and default
 row-major `(parent,spin,mu,spin,nu)` storage. Both arms use the same load helper;
 only its address calculation differs, with no Python transpose or staging pass.
 
-Automatic parent-convolution admission retains the decomposed `ns=1/2`
-tails: their production gates require printed-digit eqp identity, which the changed
-FFT order fails on the supplied true scalar and legacy Si leg20 decks. Explicit
-`on` retains all-shape native coverage for the kernel oracle; no `ns=1/2`
-production performance improvement is claimed.
+Automatic parent-convolution admission uses the existing shape/SMEM planner
+for every spinor extent. The decomposed tail remains the CPU, unavailable-target,
+and refused-plan fallback and the oracle. Scalar fresh-fit gates use the owner's
+2 meV eqp tolerance for conditioning-sensitive stages, not printed-digit identity.
