@@ -198,6 +198,44 @@ def _conv_kpair_setup(mesh_xy, kgrid, ns, trailing_shape, gamma_L, gamma_R):
 	return arm, reason, kernel, gamma_key
 
 
+def _parent_conv_tables(plan, right_perm, right_wraps, mu_loc, nu_loc):
+	"""Slice the plan's typed tables for the native parent-load convolution on this rank."""
+	from symmetry_maps import open_spin_block_coefficient
+	x = jax.lax.axis_index('x') * mu_loc
+	y = jax.lax.axis_index('y') * nu_loc
+	def local(table, start, width, dtype):
+		return jax.lax.dynamic_slice_in_dim(jnp.asarray(table, dtype), start, width, axis=1)
+	ns = int(plan.nspinor)
+	coef = jnp.stack([open_spin_block_coefficient(plan.spin_action_full, a, b)
+	                 for a in range(ns) for b in range(ns)], axis=1)
+	return (jnp.asarray(plan.irr_idx, jnp.int32),
+	        jnp.asarray(plan.sym_idx, jnp.int32),
+	        local(plan.centroid_local_perm, x, mu_loc, jnp.int32),
+	        local(right_perm, y, nu_loc, jnp.int32),
+	        local(plan.L_table, x, mu_loc, jnp.float64),
+	        local(right_wraps, y, nu_loc, jnp.float64),
+	        jnp.asarray(plan.k_parent_frac, jnp.float64),
+	        jnp.asarray(np.asarray(plan.sym_idx) >= plan.n_sym_spatial, jnp.int32),
+	        coef.reshape(plan.n_full, ns*ns, ns*ns),
+	        coef.reshape(plan.n_full, ns*ns, ns*ns))
+
+
+def _parent_conv_vertices(tables, vertex_l, vertex_r):
+	"""Fold the post-unfold monomial into the right coefficient before the final conjugate."""
+	perm_l, phase_l = vertex_l
+	perm_r, phase_r = vertex_r
+	if perm_l is None and perm_r is None:
+		return tables
+	ns = math.isqrt(tables[-1].shape[1])
+	if perm_l is None:
+		perm_l, phase_l = jnp.arange(ns), jnp.ones(ns)
+	if perm_r is None:
+		perm_r, phase_r = jnp.arange(ns), jnp.ones(ns)
+	pairs = (perm_l[:, None] * ns + perm_r[None, :]).reshape(-1)
+	phase = (phase_l[:, None] * phase_r[None, :]).reshape(-1)
+	return (*tables[:-1], tables[-1][:, pairs, :] * jnp.conj(phase)[None, :, None])
+
+
 def _pair_density_kernel(
 	mesh_xy: Mesh,
 	nk: int,
@@ -1302,6 +1340,12 @@ def _c_q_face_parent(
 	py = int(mesh_xy.shape['y'])
 	mu_loc = mu_pk // px
 	col_loc = mu_pk // py
+	from ffi.fft import make_fused_conv_kparent
+	p_l, ph_l = _conv_kpair_static_gamma(None, s_)
+	p_r, ph_r = _conv_kpair_static_gamma(None, s_)
+	pair_kernel = make_fused_conv_kparent(
+		mesh_xy, kgrid, s_, (mu_loc, col_loc),
+		perm_l=p_l, phase_l=ph_l, perm_r=p_r, phase_r=ph_r, centroid_major=True)
 
 	in_mun = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
 	in_nmu = NamedSharding(mesh_xy, P(None, 'x', None, 'y'))
@@ -1312,7 +1356,7 @@ def _c_q_face_parent(
 	cache_key = ('c_q_face_parent', mesh_xy, plan, gemm, tuple(kgrid),
 	             tuple(psi_mun_parent.shape), tuple(psi_nmu_parent.shape),
 	             str(psi_mun_parent.dtype), str(psi_nmu_parent.dtype),
-	             bool(gamma_L), bool(gamma_R))
+	             bool(gamma_L), bool(gamma_R), pair_kernel is not None)
 	if cache_key not in _isdf_pipeline_cache:
 		left_spec = tuple(None if value is None else w_rep for value in left_gamma)
 		right_spec = tuple(None if value is None else w_rep for value in right_gamma)
@@ -1328,14 +1372,19 @@ def _c_q_face_parent(
 				D = split_spin_centroid(D, 1, s_, mu_pk)
 				return split_spin_centroid(D, 3, s_, mu_pk)         # (p, s, mu, s, nu)
 
-			# Parent contraction, then the plan's local typed transport: the
-			# full-k operator is a transient, never a stored carrier.
-			D_l_full = plan.unfold_operator(_projector(w_l))
-			D_r_full = plan.unfold_operator(_projector(w_r))
+			# Parent contraction; native loads apply the typed transport inside the convolution.
+			D_l, D_r = _projector(w_l), _projector(w_r)
+			if pair_kernel is None:
+				D_l = plan.unfold_operator(D_l)
+				D_r = plan.unfold_operator(D_r)
 
 			@partial(shard_map, mesh=mesh_xy, in_specs=(pair_spec, pair_spec),
 			         out_specs=P(None, 'x', 'y'), check_vma=False)
 			def _tail(D_l_, D_r_):
+				if pair_kernel is not None:
+					tables = _parent_conv_tables(
+						plan, plan.centroid_local_perm, plan.L_table, mu_loc, col_loc)
+					return pair_kernel(D_l_, D_r_, _parent_conv_vertices(tables, vertex_l, vertex_r))
 				# The incumbent ISDF tail is written for P = conj(D).
 				P_l_3d = jnp.conj(D_l_).reshape(
 					nkx, nky, nkz, s_, mu_loc, s_, col_loc)
@@ -1352,7 +1401,7 @@ def _c_q_face_parent(
 				C_q_3d = local_fftn3(C_R, axes=(0, 1, 2), norm='forward')
 				return C_q_3d.reshape(nk, mu_loc, col_loc)
 
-			return _tail(D_l_full, D_r_full)
+			return _tail(D_l, D_r)
 
 		_isdf_pipeline_cache[cache_key] = _fused
 
@@ -1541,6 +1590,11 @@ def _z_q_face_parent(
 		spec=P(None, 'y', None, 'x'), axis=1)
 	r_loc = R_t // p_y
 	mu_loc = mu_pk // p_x
+	from ffi.fft import make_fused_conv_kparent
+	p_l, ph_l = _conv_kpair_static_gamma(None, ns)
+	pair_kernel = make_fused_conv_kparent(
+		mesh_xy, kgrid, ns, (mu_loc, r_loc),
+		perm_l=p_l, phase_l=ph_l, perm_r=p_l, phase_r=ph_l)
 	n_rows = 2 * int(plan.n_sym_spatial)
 	if (tuple(int(v) for v in tile_local_perm.shape) != (n_rows, R_t)
 			or tuple(int(v) for v in tile_wraps.shape) != (n_rows, R_t, 3)):
@@ -1609,7 +1663,7 @@ def _z_q_face_parent(
 	cache_spec = P(None, None, ('x', 'y'), None, None)
 
 	cache_key = (
-		'z_q_face_parent', id(mesh_xy), id(plan),
+		'z_q_face_parent', id(mesh_xy), id(plan), pair_kernel is not None,
 		(None if use_psi_r_cache else id(psi_G_store)),
 		local_band_chunk_shape, fft_grid,
 		n_parent, ns, mu_pk, nb_face, R_t, nkx, nky, nkz, bcr,
@@ -1701,6 +1755,16 @@ def _z_q_face_parent(
 		                   (P(None), P(None))),
 		         out_specs=out_spec, check_vma=False)
 		def _tile_tail(D_l_, D_r_, local_perm_r_, wraps_r_, vertex_l, vertex_r):
+			if pair_kernel is not None:
+				tables = _parent_conv_tables(plan, local_perm_r_, wraps_r_, mu_loc, r_loc)
+				if coupled_mu123:
+					vertices = [_gamma_perm_phase_mu(i) for i in (1, 2, 3)]
+					perms = jnp.stack([v[0] for v in vertices])
+					phases = jnp.stack([v[1] for v in vertices])
+					def channel(carry, vertex):
+						return carry, pair_kernel(D_l_, D_r_, _parent_conv_vertices(tables, vertex, vertex))
+					return jax.lax.scan(channel, 0, (perms, phases))[1]
+				return pair_kernel(D_l_, D_r_, _parent_conv_vertices(tables, vertex_l, vertex_r))
 			def unfold_block(D_, coef, sources, source_count):
 				"""One full-k output spin block of P = conj(U D U†)."""
 				def source_spin(acc, slot):

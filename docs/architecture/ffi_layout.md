@@ -722,3 +722,46 @@ Parity gate for any engine swap, stated once with its class: value-level,
 bit-exactness — swapping engines changes the arithmetic ordering, where bit
 equality is not promised. And not the 1e-16 figures: those are *measured*
 unit residuals sitting at the c128 ULP, where a threshold tests nothing.
+
+### Parent-load ISDF pair convolution (2026-09-06)
+
+`CufftConvKParentCudaFfi` / `lorrax_cufft_conv_kparent` is an additive
+handler in the conv_kpair family; existing handler signatures and ABI 3
+are unchanged, as required by `common/lorrax_ffi_abi.h`. The build stamp
+and live target probe authenticate this entry. Its NVRTC string follows
+the existing `extract_nvrtc_kernel.cmake` / sm_80 prebuild path.
+
+| Positional operands (row-major except CCT parents below) | Shape / dtype |
+|---|---|
+| D_l, D_r | (n_parent, ns, mu_local, ns, nu_local), complex128 |
+| irr_idx, sym_idx | (nk,), int32 |
+| left/right owner-local source maps | (n_ops, mu_local/nu_local), int32 |
+| left/right lattice wraps | (n_ops, mu_local/nu_local, 3), float64 |
+| parent fractional k | (n_parent, 3), float64 |
+| antiunitary mask | (nk,), int32 |
+| left/right spin coefficients | (nk, ns², ns²), complex128 |
+| Result U | (nk, mu_local, nu_local), complex128 |
+
+The existing k-grid, scale, requested-arm and monomial perm/phase attributes
+retain their meanings. Production folds its post-unfold vertex into the
+right coefficient (conjugating the phase because the load produces P=conj(D)),
+so all three current channels reuse one executable. Source maps must already
+be authenticated owner-local plan tables; the handler checks shapes/dtypes,
+not device-side map values. Both arrays remain tiled over the full XY mesh.
+The resident and two-stage implementations share conv_kpair transforms;
+only the load gathers parents and performs the typed action. No full-k
+open-spin array is written to HBM. Two-stage scratch remains three reduced
+local nk×mu×nu arrays. The existing CONV_KPAIR dial governs admission; CPU,
+missing-target and refused-shape auto plans keep the decomposed tail.
+
+The static `centroid_major` attribute is 1 for CCT: the same logical rank-5
+parent uses physical `(parent,nu,spin,mu,spin)` column-major endpoint order, requested through FFI
+input layouts so the existing GEMM split is a bitcast. ZCT uses 0 and default
+row-major `(parent,spin,mu,spin,nu)` storage. Both arms use the same load helper;
+only its address calculation differs, with no Python transpose or staging pass.
+
+Automatic parent-convolution admission retains the decomposed `ns=1/2`
+tails: their production gates require printed-digit eqp identity, which the changed
+FFT order fails on the supplied true scalar and legacy Si leg20 decks. Explicit
+`on` retains all-shape native coverage for the kernel oracle; no `ns=1/2`
+production performance improvement is claimed.

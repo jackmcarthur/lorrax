@@ -172,7 +172,8 @@ __all__ = [
     "CONV_KPAIR_TARGET", "CONV_KPAIR_GATE",
     "conv_kpair_mode", "conv_kpair_available", "conv_kpair_plan",
     "conv_kpair_resident_bytes", "conv_kpair_scale",
-    "make_fused_conv_kpair",
+    "make_fused_conv_kpair", "make_fused_conv_kparent",
+    "CONV_KPARENT_TARGET", "CONV_KPARENT_GATE",
 ]
 
 FLAT_K_TARGET = "lorrax_mklfft_flat_k"
@@ -809,6 +810,22 @@ CONV_KPAIR_GATE = Gate(
         "select off/auto for the XLA reference chain."),
 )
 
+CONV_KPARENT_TARGET = "lorrax_cufft_conv_kparent"
+CONV_KPARENT_GATE = Gate(
+    env="LORRAX_CONV_KPAIR_FFI", target=CONV_KPARENT_TARGET,
+    platforms=("CUDA",), modes=("off", "auto", "on"), default="auto",
+    off_label="the decomposed parent ISDF tail", off_policy="fallback",
+    auto_capability="CUDA exports CufftConvKParentCudaFfi with typed local tables",
+    auto_on_msg="[conv_kparent] auto -> ON: native parent-load convolution ({target})",
+    auto_off_msg="[conv_kparent] auto -> OFF: decomposed parent tail; {reason}",
+    off_announce_msg="[conv_kparent] off: decomposed parent ISDF tail",
+    label={"CUDA": "ISDF parent-load convolution"},
+    resolved_msg={"CUDA": "[conv_kparent] typed parent-load handler ({target}) available"},
+    refuse_platform_msg="Parent convolution requires CUDA; got {platform}",
+    refuse_probe_msg="Parent convolution target {target} unavailable: {reason}; rebuild the CUDA leg",
+)
+
+
 _CONV_KPAIR_AXIS_MAX = 24
 _CONV_KPAIR_AUTO_SMEM_FLOOR = 49152
 # Shape thresholds, not device identifiers.  The representative A100 sweep
@@ -1004,6 +1021,39 @@ def make_fused_conv_kpair(
 
     return _conv_kpair
 
+
+
+def make_fused_conv_kparent(mesh, kgrid, ns, trailing_shape, *,
+                           perm_l, phase_l, perm_r, phase_r, centroid_major=False):
+    """Convolve rank-5 local parents using typed maps, wraps and open-spin coefficients."""
+    # The ns=1/2 production gates require printed-digit identity with the XLA FFT.
+    if ns in (1, 2) and conv_kpair_mode() == "auto":
+        return None
+    if CONV_KPARENT_GATE.resolve(mesh) is None:
+        return None
+    arm, _ = conv_kpair_plan(mesh, kgrid, ns, trailing_shape)
+    if arm == "xla":
+        return None
+    nkx, nky, nkz = map(int, kgrid)
+    attrs = dict(centroid_major=np.int64(centroid_major), nkx=np.int64(nkx), nky=np.int64(nky), nkz=np.int64(nkz),
+                 scale=np.float64(conv_kpair_scale("forward", nkx*nky*nkz, 1.0)),
+                 requested_arm=np.int64({"device": 0, "resident": 1, "two_stage": 2}[arm]),
+                 perm_l=np.asarray(perm_l, np.int64),
+                 phase_l=_conv_kpair_phase_codes(phase_l, ns, "left"),
+                 perm_r=np.asarray(perm_r, np.int64),
+                 phase_r=_conv_kpair_phase_codes(phase_r, ns, "right"))
+
+    def convolve(D_l, D_r, tables):
+        if (D_l.ndim != 5 or D_l.shape != D_r.shape or
+                D_l.shape[1] != ns or D_l.shape[3] != ns or
+                D_l.dtype != jnp.complex128 or D_r.dtype != jnp.complex128):
+            raise ValueError("conv_kparent requires matching c128 (parent,ns,mu,ns,nu) operands")
+        out = jax.ShapeDtypeStruct((nkx*nky*nkz, D_l.shape[2], D_l.shape[4]), D_l.dtype)
+        layout = (0, 4, 3, 2, 1) if centroid_major else None
+        return jax.ffi.ffi_call(CONV_KPARENT_TARGET, out,
+            input_layouts=(layout, layout, *(None for _ in tables)))(D_l, D_r, *tables, **attrs)
+
+    return convolve
 
 # ===========================================================================
 # THE FUSED-CONV FAMILY, k-MINOR broadcast member
