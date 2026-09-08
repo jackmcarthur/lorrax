@@ -2,6 +2,8 @@
 
 Reuse the authenticated parent reader and square-root balancing pipeline;
 replace only the reduction observation with a full-state dense resolvent.
+The q0 receipt is Run304/16_full_dense_q0/q00/full_dense_roundtrip.json
+(job.step 58051053.65).
 """
 import json
 import time
