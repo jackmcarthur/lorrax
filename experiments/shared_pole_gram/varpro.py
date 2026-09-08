@@ -122,7 +122,7 @@ def _vf_initial(z, sketches, p):
                   "vf_positive_seeds": int(accepted.size), "iterations": 6}
 
 
-def _aaa_initial(z, sketches, p):
+def _aaa_initial(z, sketches, p, weights_loss=None):
     """AAA trace seeds with explicit completion to a fixed positive-pole count.
 
     Causal symmetry supplies (-conj(z),conj(trace)); these are transformed
@@ -147,37 +147,102 @@ def _aaa_initial(z, sketches, p):
         warnings.simplefilter('always')
         approx = AAA(nodes,values,max_terms=min(2*p+1,len(nodes)),rtol=1e-12,clean_up=False)
     raw = np.asarray(approx.poles(),complex)
+    raw_residues = np.asarray(approx.residues(),complex)
     keep = np.isfinite(raw)&(raw.real>1e-8)
     positive = raw[keep]
-    positive = positive[np.argsort(positive.real)]
-    if len(positive)>p:
-        ids = np.linspace(0,len(positive)-1,p).round().astype(int)
-        positive = positive[ids]
-    seeds = list(positive.real-1j*np.maximum(np.abs(positive.imag),1e-6))
+    positive_residues = raw_residues[keep]
+    weights = np.ones(len(z)) if weights_loss is None else np.asarray(weights_loss,float)
+    if weights.shape!=(len(z),) or np.any(weights<0) or not np.any(weights>0):
+        raise ValueError('Initializer needs nonnegative nonzero weights on its sample grid')
+    sw = np.sqrt(np.r_[weights,weights])
+
+    def columns(poles):
+        values = basis(z,np.asarray(poles))
+        return sw[:,None]*np.vstack((values.real,values.imag))
+
+    def novelty(pool,chosen):
+        values = columns(pool)
+        norms = np.linalg.norm(values,axis=0)
+        normalized = values/np.maximum(norms,1e-300)
+        if chosen:
+            selected = columns(chosen)
+            selected /= np.maximum(np.linalg.norm(selected,axis=0),1e-300)
+            u,s,_ = np.linalg.svd(selected,full_matrices=False)
+            u = u[:,s>s[0]*1e-13]
+            normalized -= u@(u.T@normalized)
+        score = np.linalg.norm(normalized,axis=0)
+        score[norms==0] = 0.
+        return score
+
+    # Rank-reveal AAA seeds first. This is an initializer-only replacement,
+    # not a post-fit pole drop or a change of the fixed-p functional.
+    candidates_aaa = positive.real-1j*np.maximum(np.abs(positive.imag),1e-6)
+    residue_scale = max(float(np.max(np.abs(raw_residues))) if len(raw_residues) else 0.,1e-300)
+    tiny = np.abs(positive_residues)<1e-12*residue_scale
+    removed = [{'pole_dimensionless':[float(a.real),float(a.imag)],'reason':'tiny AAA trace residue'}
+               for a in candidates_aaa[tiny]]
+    raw_norms = np.linalg.norm(columns(candidates_aaa),axis=0)
+    vanishing = raw_norms<1e-6*max(float(raw_norms.max()) if raw_norms.size else 0.,1e-300)
+    removed.extend({'pole_dimensionless':[float(a.real),float(a.imag)],
+                    'reason':'vanishing weighted paired-basis column before normalization',
+                    'relative_column_norm':float(norm/max(float(raw_norms.max()),1e-300))}
+                   for a,norm in zip(candidates_aaa[vanishing&~tiny],raw_norms[vanishing&~tiny]))
+    pool = list(candidates_aaa[~tiny&~vanishing])
+    seeds = []
+    aaa_novelty = []
+    aaa_floor = 1e-3
+    while pool and len(seeds)<p:
+        scores = novelty(pool,seeds)
+        index = int(np.argmax(scores))
+        if scores[index]<aaa_floor:
+            removed.extend({'pole_dimensionless':[float(a.real),float(a.imag)],
+                            'reason':'near-dependent weighted real AAA column',
+                            'normalized_novelty':float(score)} for a,score in zip(pool,scores))
+            pool = []
+            break
+        seeds.append(pool.pop(index));aaa_novelty.append(float(scores[index]))
+    removed.extend({'pole_dimensionless':[float(a.real),float(a.imag)],
+                    'reason':'AAA seed count exceeds fixed p'} for a in pool)
+    aaa_selected = len(seeds)
     real_nodes = np.abs(np.asarray(z).real)
-    nonzero = real_nodes[real_nodes>1e-8]
-    lo = max(float(nonzero.min())/4 if len(nonzero) else 1e-4,1e-6)
+    minimum_height = float(np.min(np.imag(z)))
+    lo = max(minimum_height*.01,1e-6)
     hi = max(float(real_nodes.max()),lo*10)
-    candidates = np.geomspace(lo,hi,max(8*p,32))
+    unique = np.unique(real_nodes)
+    centers = np.unique(np.r_[np.maximum(unique,lo),
+        np.maximum((unique[:-1]+unique[1:])/2,lo),np.linspace(lo,hi,max(4*p,32))])
+    widths = np.unique(np.r_[minimum_height*np.array([.05,.125,.25,.5,1.,2.]),
+                             np.unique(np.imag(z)),np.unique(np.imag(z))*.5])
+    candidates = (centers[:,None]-1j*widths[None,:]).ravel()
     completion = []
+    completion_novelty = []
     while len(seeds)<p:
-        if seeds:
-            distance = np.min(np.abs(np.log(candidates[:,None])-np.log(np.real(seeds))[None,:]),axis=1)
-            index = int(np.argmax(distance))
-        else:
-            index = len(candidates)//2
-        seed = candidates[index]-1j*max(float(np.min(np.imag(z)))/2,1e-6)
+        scores = novelty(candidates,seeds)
+        index = int(np.argmax(scores))
+        if scores[index]<1e-8:
+            raise ValueError(f'Initializer candidate pool cannot supply {p} independent weighted real columns')
+        seed = candidates[index]
         seeds.append(seed); completion.append(seed)
+        completion_novelty.append(float(scores[index]))
         candidates = np.delete(candidates,index)
     seed = np.asarray(seeds)[np.argsort(np.real(seeds))]
-    design = np.vstack((basis(z,seed).real,basis(z,seed).imag))
-    sketch_rows = np.vstack((y.real,y.imag))
+    design = columns(seed)
+    sketch_rows = sw[:,None]*np.vstack((y.real,y.imag))
     sketch_residual,_,_,_,sketch_rank = _eliminate(design,sketch_rows)
-    return seed, {'method':'AAA trace with conjugate symmetry and fixed-count completion',
+    singular = np.linalg.svd(design,compute_uv=False)
+    if sketch_rank!=p:
+        raise ValueError(f'Initializer weighted design rank {sketch_rank}<{p} after novelty completion')
+    return seed, {'method':'AAA trace with weighted real-basis rank reveal and novelty completion',
         'scipy_version':scipy.__version__,'aaa_source':str(source),'aaa_source_sha256':source_sha,
         'aaa_raw_poles':int(len(raw)),'aaa_positive_poles':int(np.count_nonzero(keep)),
-        'aaa_selected_positive_poles':int(len(positive)),'completion_count':len(completion),
+        'aaa_selected_positive_poles':aaa_selected,'completion_count':len(completion),
         'completion_poles_dimensionless':[[v.real,v.imag] for v in completion],
+        'removed_initializer_seeds':removed,'aaa_normalized_novelty_floor':aaa_floor,
+        'aaa_raw_column_relative_floor':1e-6,
+        'aaa_selected_novelty':aaa_novelty,'completion_selected_novelty':completion_novelty,
+        'initializer_weights':'provided loss weights' if weights_loss is not None else 'uniform explicit default',
+        'initializer_real_design_condition':float(singular[0]/singular[-1]),
+        'initializer_fixed_p':p,'postfit_poles_dropped':0,
         'causal_seed_reflections':int(np.sum(positive.imag>=0)),
         'aaa_cleanup':False,'aaa_warnings':[str(item.message) for item in captured],
         'sketch_seed_relative_errors':(np.linalg.norm(sketch_residual,axis=0)/np.maximum(np.linalg.norm(sketch_rows,axis=0),1e-300)).tolist(),
@@ -220,6 +285,9 @@ def _minimize(evaluate, theta):
         'optimizer_status':int(result.status),'termination_reason':('relative accepted log-parameter step < 1e-8'
             if converged else f'Not relatively step-converged: {result.message}'),
         'iteration_budget_nfev':10000,'callback_available':True,'scipy_version':scipy.__version__}
+    final_residual,final_jacobian,_ = evaluate(result.x)
+    receipt['final_objective_gradient_inf'] = float(np.max(np.abs(2*final_jacobian.T@final_residual)))
+    receipt['final_optimizer_optimality'] = float(result.optimality)
     return result,receipt
 
 
@@ -275,7 +343,7 @@ def real_q_gradient_check(z_ry, weights_loss, channel_gram, sketches, p):
     """AAA-seed real-q finite-difference gate; refuse truncated design ranks."""
     z,weights,gram = np.asarray(z_ry,complex),np.asarray(weights_loss,float),np.asarray(channel_gram).real
     sw,compressed,_,_ = _compress_gram(z,weights,gram)
-    seed,initializer = _aaa_initial(z/BANDWIDTH_RY,sketches,p)
+    seed,initializer = _aaa_initial(z/BANDWIDTH_RY,sketches,p,weights)
     theta = np.log(np.r_[seed.real,-seed.imag])
     def rank_check(state):
         if state[2]!=p:
@@ -330,7 +398,7 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
         raise ValueError("channel_gram is not symmetric")
     sw,compressed,gram_rank,discarded_fraction = _compress_gram(z,weights,gram)
     if initial is None:
-        seed, initializer = _aaa_initial(scaled_z, sketches, p)
+        seed, initializer = _aaa_initial(scaled_z, sketches, p,weights)
     else:
         seed = np.asarray(initial, complex) / bandwidth
         initializer = {"method": "warm start"}

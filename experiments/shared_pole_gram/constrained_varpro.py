@@ -146,7 +146,7 @@ def real_q_gradient_check(z_ry,weights_loss,channel_gram,sketches,p):
     """AAA-seed exact objective-gradient gate including moving moment constraints."""
     z,weights,gram = np.asarray(z_ry,complex),np.asarray(weights_loss,float),np.asarray(channel_gram).real
     sw,_,data,moments,_ = _compress_gram(z,weights,gram)
-    seed,initializer = varpro._aaa_initial(z/varpro.BANDWIDTH_RY,sketches,p)
+    seed,initializer = varpro._aaa_initial(z/varpro.BANDWIDTH_RY,sketches,p,weights)
     theta = np.log(np.r_[seed.real,-seed.imag])
     def rank_check(state):
         # The owner refuses either SVD rank loss before returning this state.
@@ -208,7 +208,7 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
     # Q=R/b: moments become (M0/b, Mm1, M1/b^2) and C uses dimensionless poles.
     sw,moment_scale,data,moments,eigenvalues = _compress_gram(z,weights,gram)
     if initial is None:
-        seed,initializer = varpro._aaa_initial(scaled_z,sketches,p)
+        seed,initializer = varpro._aaa_initial(scaled_z,sketches,p,weights)
     else:
         seed = np.asarray(initial,complex)/bandwidth
         initializer = {'method':'warm start'}
