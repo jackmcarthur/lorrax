@@ -22,7 +22,13 @@ def spectrum(gram):
                 rank_frobenius={str(t): int(np.flatnonzero(tail <= t)[0]) for t in (1e-2, 1e-3, 1e-4)})
 
 
-def main(out, data_banks=None, moment_bank=None):
+def symmetric_pair_features(loadings, xp=np):
+    """Hermitian loading magnitudes, symmetrized on unordered centroid pairs."""
+    magnitude = xp.abs(loadings)
+    return (magnitude+xp.swapaxes(magnitude,-1,-2))/2
+
+
+def main(out, data_banks=None, moment_bank=None, grouped_q0=False, group_training_indices=None):
     assert os.getenv('SLURM_JOB_ID'), 'Compute only'
     from runtime import initialize_communicator_stack
     initialize_communicator_stack()
@@ -81,12 +87,107 @@ def main(out, data_banks=None, moment_bank=None):
             return None, mm(mm(v, wi), v)
         return jax.lax.scan(one, None, w, unroll=1)[1]
 
+    def grouped_receipt(all_white, ww, target_white, gc, moment_arrays, record):
+        """Two disjoint Hermitian element masks; reuse the measured white bank."""
+        group_start = time.perf_counter()
+        selected = np.arange(ntrain)
+        rowplan_sha = None
+        if group_training_indices is not None:
+            raw = json.loads(group_training_indices.read_text())
+            if not isinstance(raw,list) or not raw or any(type(i) is not int for i in raw) or len(set(raw))!=len(raw):
+                raise ValueError('Group training indices must be unique integer training rows')
+            selected = np.asarray(raw,dtype=int); rowplan_sha = banks.sha(group_training_indices)
+        if np.any(selected<0) or np.any(selected>=ntrain):
+            raise ValueError('Group loading indices must exclude held rows')
+        indices = np.r_[selected,selected+nall]
+        from fit_grams import authenticated_weight, line_weights
+        frequency, kernel_weight, kernel_receipt = authenticated_weight()
+        weight = np.sqrt(np.tile(line_weights(z[selected],frequency,kernel_weight,'kernel_height'),2))
+        small = gc[np.ix_(indices,indices)]*weight[:,None]*weight[None,:]
+        eigenvalues,vectors = np.linalg.eigh((small+small.T)/2)
+        if len(eigenvalues)<3 or eigenvalues[-3]<=0:
+            raise ValueError('Three nonzero Hermitian loading modes required')
+        coefficient = vectors[:,-3:].T*weight[None,:]
+        channel_rows = channels(all_white)
+        loading = jax.jit(lambda a,c: jnp.einsum('ri,iab->rab',c,a[indices]),out_shardings=stack)(channel_rows,jnp.asarray(coefficient))
+        features = jax.jit(lambda a:symmetric_pair_features(a,jnp),out_shardings=stack)(loading)
+
+        @jax.jit
+        @jax.shard_map(mesh=mesh,in_specs=P(None,'x','y'),
+                      out_specs=(P('x','y'),P(),P(),P(),P()),check_vma=False)
+        def cluster(x):
+            reduce = lambda a:jax.lax.psum(a,('x','y'))
+            count = reduce(jnp.asarray(x.shape[1]*x.shape[2],jnp.float64))
+            rms = jnp.sqrt(reduce(jnp.sum(x*x,axis=(1,2)))/count)
+            x = x/jnp.maximum(rms[:,None,None],1e-300)
+            mean = reduce(jnp.sum(x,axis=(1,2)))/count
+            spread = jnp.sqrt(jnp.maximum(0,1-mean*mean))
+            initial = jnp.stack((jnp.maximum(mean-spread,0),mean+spread))
+            def step(state,_):
+                centers,previous = state
+                distance = jnp.sum((x[None]-centers[:,:,None,None])**2,axis=1)
+                labels = jnp.argmin(distance,axis=0).astype(jnp.int32)
+                counts = jnp.stack([reduce(jnp.sum(labels==g)) for g in range(2)])
+                sums = jnp.stack([reduce(jnp.sum(x*(labels==g)[None],axis=(1,2))) for g in range(2)])
+                updated = jnp.where(counts[:,None]>0,sums/jnp.maximum(counts[:,None],1),centers)
+                shift = jnp.linalg.norm(updated-centers)/jnp.maximum(jnp.linalg.norm(centers),1e-300)
+                changed = reduce(jnp.sum(labels!=previous))
+                return (updated,labels),jnp.stack((shift,changed))
+            (centers,labels),trace = jax.lax.scan(step,(initial,jnp.full(x.shape[1:],-1,jnp.int32)),None,length=20)
+            counts = jnp.stack([reduce(jnp.sum(labels==g)) for g in range(2)])
+            return labels,initial,centers,trace,counts
+
+        labels,initial,centers,trace,counts = cluster(features)
+        counts,trace = np.asarray(counts),np.asarray(trace)
+        mismatch = jax.jit(lambda a:jnp.max(jnp.abs(a-jax.lax.with_sharding_constraint(a.T,face))),out_shardings=rep)(labels)
+        if int(mismatch)!=0 or np.any(counts==0) or int(counts.sum())!=896*896:
+            raise ValueError('Grouped labels are not a nonempty symmetric two-way partition')
+        mask_path = out/'q00_group_labels.h5'
+        if mask_path.exists():
+            raise FileExistsError(mask_path)
+        with SlabIO(mask_path,mode='w',mesh=mesh) as io:
+            io.create_dataset('labels',shape=labels.shape,dtype=np.int32);io.write_slab('labels',labels);io.sync_writes()
+            io.write_attr('scope',np.bytes_('fixed q0 V-whitened symmetric element groups; labels0/1'))
+        barrier('group-labels-written')
+        audit = dict(q=0,groups=2,job_step=job,source=source,training_indices=selected.tolist(),
+            rowplan_sha256=rowplan_sha,loading_eigenvalues=eigenvalues[-3:].tolist(),
+            loading_weight='trapezoid * authenticated ORDER / height^2, selected training rows only',
+            loading_weight_receipt=kernel_receipt,
+            initial_centers=np.asarray(initial).tolist(),final_centers=np.asarray(centers).tolist(),
+            iterations=20,iteration_trace_shift_changed=trace.tolist(),converged=bool(trace[-1,1]==0),
+            Ng_full_matrix_entries=counts.tolist(),mask_path=str(mask_path),mask_sha256=banks.sha(mask_path),
+            scope='q0 whitened grouped diagnostics only; physical group Grams absent; no K/passivity/Sigma claim')
+        joint = channel_rows if target_white is None else jax.jit(lambda a,b:jnp.concatenate((a,b)),out_shardings=stack)(channel_rows,target_white)
+        full = gc if target_white is None else moment_arrays['moment_channel_gram']
+        summed = np.zeros_like(full)
+        mask_rows = jax.jit(lambda a,m:a*m[None],out_shardings=stack)
+        for group in range(2):
+            mask = jax.jit(lambda a:a==group,out_shardings=face)(labels)
+            gj = np.asarray(gram(mask_rows(joint,mask))).real; summed += gj
+            group_train = mask_rows(ww,mask)
+            arrays = dict(z=z,zh=zh,weights=weights,channel_gram=gj[:2*nall,:2*nall],
+                complex_gram=np.asarray(gram(group_train)),sketches=np.asarray(sketch(group_train,vd)))
+            if target_white is not None: arrays['moment_channel_gram'] = gj
+            directory = out/f'group{group}';directory.mkdir(exist_ok=True)
+            if jax.process_index()==0:
+                with (directory/'q00.npz').open('xb') as stream: np.savez(stream,**arrays)
+        error = float(np.linalg.norm(summed-full)/max(np.linalg.norm(full),1e-300))
+        audit['sum_group_joint_gram_relative_error'] = error
+        if error>1e-11: raise ValueError(f'Group Gram partition failed: {error}')
+        audit['seconds'] = time.perf_counter()-group_start
+        if jax.process_index()==0:
+            for group in range(2):
+                receipt = dict(record,group=group,grouping=audit,physical_group_gram_available=False)
+                with (out/f'group{group}'/'q00.json').open('x') as stream: json.dump(receipt,stream,indent=2)
+            with (out/'grouping.json').open('x') as stream: json.dump(audit,stream,indent=2)
+        return audit
+
     rng = np.random.default_rng(306)
     probes = rng.normal(size=(896,4))+1j*rng.normal(size=(896,4))
     probes /= np.linalg.norm(probes,axis=0)
     vd = jnp.asarray(probes)
     records = []
-    for q in range(29):
+    for q in (range(1) if grouped_q0 else range(29)):
         start = time.perf_counter()
         print(f'GRAM q{q:02d} start job={job}',flush=True)
         w, wh, v, provenance = banks.load(q, mesh, eig_jit, owner, broad, data_specs)
@@ -102,6 +203,7 @@ def main(out, data_banks=None, moment_bank=None):
         gc = np.asarray(gram(channels(all_white))).real
         gp = np.asarray(gram(channels(jnp.concatenate((w,wh))))).real
         moment_arrays = {}
+        target_white = None
         if moment_bank is not None:
             with SlabIO(moment_bank, mode='r', mesh=mesh) as io:
                 targets = [io.read_slab(f'q{q:02d}/parent/{name}', partition_spec=P('x','y'))
@@ -136,6 +238,9 @@ def main(out, data_banks=None, moment_bank=None):
         record['seconds'] = time.perf_counter()-start
         record['allocator'] = os.getenv('XLA_PYTHON_CLIENT_ALLOCATOR','runtime default')
         record['peak_bank_bytes_per_rank'] = int(nall*896*896*16/4)
+        if grouped_q0:
+            record['grouping'] = grouped_receipt(all_white,ww,target_white,gc,moment_arrays,record)
+            record['seconds'] = time.perf_counter()-start
         if jax.process_index()==0:
             with (out/f'q{q:02d}.npz').open('xb') as stream:
                 np.savez(stream, z=z, zh=zh, weights=weights, complex_gram=gw,
@@ -147,7 +252,7 @@ def main(out, data_banks=None, moment_bank=None):
     barrier('gram-complete')
     if jax.process_index()==0:
         (out/'receipt.json').write_text(json.dumps(dict(status='COMPLETE',job_step=job,source=source,records=records),indent=2))
-        lines = ['# Weighted V-whitened Gram ranks', '', f'All 29 q; job.step {job}. Training only. Amplitude cutoff is sqrt(lambda/lambda_max); tail rank also in JSON. Equal line normalization, Sigma proxy stated in receipts.', '', '|q|low 1e-2/3/4|broad 1e-2/3/4|combined 1e-2/3/4|','|---|---|---|---|']
+        lines = ['# Weighted V-whitened Gram ranks', '', f'{len(records)} q; job.step {job}. Training only. Amplitude cutoff is sqrt(lambda/lambda_max); tail rank also in JSON. Equal line normalization, Sigma proxy stated in receipts.', '', '|q|low 1e-2/3/4|broad 1e-2/3/4|combined 1e-2/3/4|','|---|---|---|---|']
         for r in records:
             cells = ['/'.join(str(v) for v in r['scopes'][s]['complex']['rank_amplitude'].values()) for s in ('low','broad','combined')]
             lines.append('|'+str(r['q'])+'|'+'|'.join(cells)+'|')
@@ -161,5 +266,9 @@ if __name__=='__main__':
                         help='Repeatable COMPLETE DATA physical bank; replaces Run216, retains Run300 A/B tail')
     parser.add_argument('--moment-bank',type=Path,default=None,
                         help='Authenticated SHIFT parent moments; save extended small Grams')
+    parser.add_argument('--grouped-q0',action='store_true',help='Only q0: prepare two whitened spectral-loading element groups')
+    parser.add_argument('--group-training-indices',type=Path,help='Fixed JSON training-row list used only for clustering')
     args=parser.parse_args()
-    main(args.out, args.data_bank, args.moment_bank)
+    if args.group_training_indices is not None and not args.grouped_q0:
+        parser.error('--group-training-indices requires --grouped-q0')
+    main(args.out,args.data_bank,args.moment_bank,args.grouped_q0,args.group_training_indices)

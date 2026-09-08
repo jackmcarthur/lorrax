@@ -62,8 +62,15 @@ def main(fits, out, data_banks=None, moment_bank=None):
         for p in (8,16,24,32):
             start=time.perf_counter(); src=fits/f'q{q:02d}_p{p:02d}.npz'
             fit_receipt=json.loads(src.with_suffix('.json').read_text())
-            if fit_receipt['status']!='FIT_COMPLETE' or banks.sha(src)!=fit_receipt['export_sha256']:
-                raise ValueError(f'Fit is incomplete or unauthenticated: {src}')
+            if fit_receipt['status']!='FIT_COMPLETE':
+                record=dict(q=q,p=p,status='REFUSED_FIT',reason=fit_receipt.get('error','fit not complete'),
+                            input_fit=str(src.with_suffix('.json')),job_step=job,source=source)
+                if jax.process_index()==0:
+                    with (out/f'q{q:02d}_p{p:02d}.json').open('x') as stream:json.dump(record,stream,indent=2)
+                records.append(record)
+                continue
+            if banks.sha(src)!=fit_receipt['export_sha256']:
+                raise ValueError(f'Fit export is unauthenticated: {src}')
             with np.load(src,allow_pickle=False) as f:
                 poles=f['poles_ry'].copy(); coef=f['row_map'].copy()
                 assert np.array_equal(z,f['z_train_ry'])
@@ -89,7 +96,7 @@ def main(fits, out, data_banks=None, moment_bank=None):
                             raise ValueError('Reconstruction DATA bank differs from fitted DATA bank')
             total=jax.jit(lambda:jnp.zeros((896,896),jnp.complex128),out_shardings=face)()
             eigen=[]; retained={t:[] for t in (1e-2,1e-3,1e-4)}
-            # Only p8's tau1e-3 model is exported for an initial failed-model score.
+            # Export signed tau1e-3 factors only when the measured K meets2n.
             factors=[]; signs=[]; frequencies=[]
             for k in range(p):
                 residue=reconstruct(jnp.asarray(coef[k]),w)
@@ -103,13 +110,12 @@ def main(fits, out, data_banks=None, moment_bank=None):
                 scale=np.max(abs(lam))
                 for tau in retained:
                     retained[tau].append(int(np.sum(abs(lam)>tau*scale)))
-                if p==8:
-                    ids=np.flatnonzero(abs(lam)>1e-3*scale)
-                    # Pad columns for XY face storage, excluding padding in metadata.
-                    count=len(ids); padded=((count+mesh.shape['y']-1)//mesh.shape['y'])*mesh.shape['y']
-                    idx=np.pad(ids,(0,padded-count)); amp=np.pad(np.sqrt(abs(lam[ids])),(0,padded-count))
-                    factor=jax.jit(lambda a,i,b:a[:,i]*b[None,:],out_shardings=face)(vec,jnp.asarray(idx),jnp.asarray(amp))
-                    factors.append(factor); signs.extend(np.r_[np.sign(lam[ids]),np.zeros(padded-count)].tolist());frequencies.extend([poles[k]]*padded)
+                ids=np.flatnonzero(abs(lam)>1e-3*scale)
+                # Pad columns for XY face storage, excluding padding in metadata.
+                count=len(ids); padded=((count+mesh.shape['y']-1)//mesh.shape['y'])*mesh.shape['y']
+                idx=np.pad(ids,(0,padded-count)); amp=np.pad(np.sqrt(abs(lam[ids])),(0,padded-count))
+                factor=jax.jit(lambda a,i,b:a[:,i]*b[None,:],out_shardings=face)(vec,jnp.asarray(idx),jnp.asarray(amp))
+                factors.append(factor); signs.extend(np.r_[np.sign(lam[ids]),np.zeros(padded-count)].tolist());frequencies.extend([poles[k]]*padded)
             eigs=np.asarray(eigen)
             response=white(vi,total); pv,_=ej(response); pv=np.asarray(pv)
             anti=float(anti_norm(response))
@@ -125,20 +131,22 @@ def main(fits, out, data_banks=None, moment_bank=None):
                     min_eigenvalue=float(pv[0]),max_eigenvalue=float(pv[-1]),antihermitian_relative=anti,nu_ev=.25),
                 input_fit=str(src),input_sha256=banks.sha(src),job_step=job,source=source,
                 fit_diagnostics_path=str(src.with_suffix('.json')),seconds=time.perf_counter()-start)
-            record.update(kind=kind,input_paths=paths,ntrain=len(z),nheld=len(zh),
+            record.update(status='MEASURED',fit_step_converged=fit_receipt['diagnostics']['success'],
+                          numerical_candidate_eligible=fit_receipt['diagnostics'].get('numerical_candidate_eligible',False),
+                          kind=kind,input_paths=paths,ntrain=len(z),nheld=len(zh),
                           values_used=fit_receipt.get('values_used',len(z)),
                           row_map_units='physical Hermitian residues from unweighted physical H/A and optional raw Ry moments')
             if extra:
                 record.update(moment_bank=str(moment_bank),moment_sha256=MOMENT_SHA,
                               moment_names=list(MOMENT_NAMES),moment_target=fit_receipt['moment_target'])
             record['real_snapped_control']='REFUSED_INDEFINITE' if record['worst_relative_negative']>1e-3 else ('REFUSED_WINDOW' if record['max_center_ev']>149.7645217482975 else 'ELIGIBLE_PSD_PROJECTION')
-            if p==8:
+            if record['K_by_threshold']['0.001']<=2*896:
                 factor=jax.jit(lambda *a:jnp.concatenate(a,axis=1),out_shardings=face)(*factors)
                 signs=np.asarray(signs); frequencies=np.asarray(frequencies)
                 sign_device=jnp.asarray(signs); omega_device=jnp.asarray(frequencies)
                 right=jax.jit(lambda a,s:a*s[None,:],out_shardings=face)(factor,sign_device)
                 jax.block_until_ready((factor,right,sign_device,omega_device))
-                model=out/f'q{q:02d}_p08_tau1e-3.h5'
+                model=out/f'q{q:02d}_p{p:02d}_tau1e-3.h5'
                 with SlabIO(model,mode='w',mesh=mesh) as io:
                     io.create_dataset('left',shape=factor.shape,dtype=np.complex128);io.write_slab('left',factor)
                     io.sync_writes()
@@ -165,7 +173,7 @@ def main(fits, out, data_banks=None, moment_bank=None):
             print(f'RESIDUE q{q:02d} p{p} K={record["K_by_threshold"]} passivity={record["passivity_untruncated"]} secs={record["seconds"]:.2f}',flush=True)
     barrier('residue-ranks-complete')
     if jax.process_index()==0:
-        (out/'receipt.json').write_text(json.dumps(dict(status='COMPLETE',job_step=job,records=records),indent=2))
+        (out/'receipt.json').write_text(json.dumps(dict(status='COMPLETE',scope='diagnostics, including explicit refused fits; not an all-q accepted model',job_step=job,records=records),indent=2))
 
 if __name__=='__main__':
     ap=argparse.ArgumentParser();ap.add_argument('--fits',type=Path,required=True);ap.add_argument('--out',type=Path,required=True)

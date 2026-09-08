@@ -376,10 +376,7 @@ def main(gram_dir, out_dir, check=False, warm_dir=None, training_indices=None, m
         if not (gram_dir/f'q{q:02d}.npz').is_file():
             raise FileNotFoundError(f'Missing assigned Gram q{q:02d} in {gram_dir}')
         for p in (8,16,24,32):
-            if warm_dir is not None:
-                for suffix in ('npz','json'):
-                    if not (warm_dir/f'q{q:02d}_p{p:02d}.{suffix}').is_file():
-                        raise FileNotFoundError(f'Warm-start q{q:02d} p{p:02d} {suffix} missing in {warm_dir}')
+            # Missing/refused warm models are recorded per q/p inside the fit loop.
             for suffix in ('npz', 'json'):
                 path = out_dir/f'q{q:02d}_p{p:02d}.{suffix}'
                 if path.exists():

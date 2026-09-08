@@ -98,17 +98,24 @@ def data_metadata(paths, parents):
                 source_evidence[key] = dict(path=str(source_path), sha256=expected_sha)
                 continue
             # Completed banks pin bytes, not the mutable sampler's current HEAD.
-            # This is the reviewed Run307 constructor revision, not a hash bypass.
+            # Inspect at most32 revisions of this named file; the receipt hash
+            # must match exact immutable bytes, never a current-code substitute.
             if key != 'constructor':
                 raise ValueError(f'DATA {key} source hash mismatch: {directory}')
-            revision = 'b3ab15ba'
             relative = source_path.relative_to(S).as_posix()
-            blob = subprocess.check_output(['git', '-C', str(S), 'show', revision+':'+relative])
-            if hashlib.sha256(blob).hexdigest() != expected_sha:
-                raise ValueError(f'DATA immutable constructor hash mismatch: {directory}')
+            revisions = subprocess.check_output(
+                ['git', '-C', str(S), 'log', '-32', '--format=%H', '--', relative],
+                text=True).splitlines()
+            revision = None
+            for candidate in revisions:
+                blob = subprocess.check_output(['git', '-C', str(S), 'show', candidate+':'+relative])
+                if hashlib.sha256(blob).hexdigest() == expected_sha:
+                    revision = candidate
+                    break
+            if revision is None:
+                raise ValueError(f'DATA immutable constructor bytes absent from bounded file history: {directory}')
             source_evidence[key] = dict(repository=str(S), revision=revision,
                                         path=relative, sha256=expected_sha)
-
         zs = []
         for kind in ('construction', 'held'):
             pairs = np.asarray(rec['z_Ry'][kind], dtype=float)
