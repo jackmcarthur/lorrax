@@ -90,6 +90,27 @@ def fourier_components(t, omega, lower=0., upper=W_CERT_RY, *,
     cs = (a+1j*g, a-1j*g, -a+1j*g, -a-1j*g)
     h1, h2, h3, h4 = [_fourier_resolvent(c, t, lower, upper) for c in cs]
     lorentz = np.sign(gamma)*(h1-h2-h3+h4)/(2j*np.pi)
+    # Nearly coincident mirror poles lose relative precision in the four-E1
+    # subtraction. Expand the odd centered difference, not the physical
+    # spectrum or its width: I(c+a)-I(c-a)=2*a*I_2(c)+2*a**3*I_4(c)+O(a**5),
+    # where I_m=int exp(-i*w*t)/(w-c)**m dw. Endpoint integration by parts
+    # gives (m-1)I_m=f(L)/(L-c)**(m-1)-f(U)/(U-c)**(m-1)-i*t*I_(m-1).
+    small = (~real) & (a/g < 1e-4) & (a*np.abs(t) < 1e-4)
+    if np.any(small):
+        tt, aa, gg = t[small], a[small], g[small]
+        terms = []
+        for c in (1j*gg, -1j*gg):
+            value = _fourier_resolvent(c, tt, lower, upper)
+            odd = np.zeros_like(value)
+            for order in range(2, 5):
+                value = (np.exp(-1j*lower*tt)/(lower-c)**(order-1)
+                         - np.exp(-1j*upper*tt)/(upper-c)**(order-1)
+                         - 1j*tt*value)/(order-1)
+                if order % 2 == 0:
+                    odd += aa**(order-1)*value
+            terms.append(odd)
+        lorentz = np.array(lorentz, copy=True)
+        lorentz[small] = np.sign(gamma[small])*(terms[0]-terms[1])/(1j*np.pi)
     dispersive = -(h1+h2+h3+h4)/(2*np.pi)
     atom = np.where((a > lower) & (a <= upper), np.exp(-1j*a*t), 0j)
     return np.where(real, atom, lorentz), np.where(real, np.nan+0j, dispersive)
