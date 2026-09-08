@@ -127,7 +127,8 @@ static ffi::Error BatchedGemmImpl(
         mb_b, nb_b, lld_B), CUBLAS_STATUS_SUCCESS, "Lt B layout");
     LORRAX_LIB_CHECK(cublasLtMatrixLayoutCreate(&cd, mp::CudaDataTypeOf<T>::value,
         mb_c, nb_c, lld_C), CUBLAS_STATUS_SUCCESS, "Lt C layout");
-    const int batches = static_cast<int>(nq);
+    // Select as a single-q GEMM, then retain that arithmetic for the batch.
+    const int batches = 1;
     cublasLtMatrixLayout_t layouts[] = {ad, bd, cd};
     const int64_t strides[] = {a_stride, b_stride, c_stride};
     for (int i = 0; i < 3; ++i) {
@@ -143,6 +144,17 @@ static ffi::Error BatchedGemmImpl(
         ad, bd, cd, cd, pref, 1, &choice, &choices), CUBLAS_STATUS_SUCCESS, "Lt heuristic");
     if (choices != 1) return ffi::Error(ffi::ErrorCode::kUnimplemented,
         "packed-q SUMMA: no zero-workspace strided Lt algorithm");
+    const int execution_batches = static_cast<int>(nq);
+    for (auto layout : layouts) {
+        LORRAX_LIB_CHECK(cublasLtMatrixLayoutSetAttribute(layout,
+            CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &execution_batches,
+            sizeof(execution_batches)), CUBLAS_STATUS_SUCCESS, "Lt execution batch");
+    }
+    cublasLtMatmulHeuristicResult_t supported{};
+    LORRAX_LIB_CHECK(cublasLtMatmulAlgoCheck(ctx->summa_blas, desc,
+        ad, bd, cd, cd, &choice.algo, &supported), CUBLAS_STATUS_SUCCESS, "Lt batch compatibility");
+    LORRAX_LIB_CHECK(supported.state, CUBLAS_STATUS_SUCCESS,
+        "single-q Lt algorithm does not support packed batch");
     const T one = T(1);
     for (int s = 0; s < ctx->p; ++s) {
         // NCCL broadcasts copy bytes only; no floating-point reduction.
