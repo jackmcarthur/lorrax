@@ -18,6 +18,7 @@
 // the call is effectively in-place (D === C), which matches standard
 // BLAS semantics.
 
+#include <algorithm>
 #include <complex>
 #include <cstdint>
 #include <cstdio>
@@ -127,8 +128,12 @@ static ffi::Error BatchedGemmImpl(
         mb_b, nb_b, lld_B), CUBLAS_STATUS_SUCCESS, "Lt B layout");
     LORRAX_LIB_CHECK(cublasLtMatrixLayoutCreate(&cd, mp::CudaDataTypeOf<T>::value,
         mb_c, nb_c, lld_C), CUBLAS_STATUS_SUCCESS, "Lt C layout");
-    // Select as a single-q GEMM, then retain that arithmetic for the batch.
-    const int batches = 1;
+    // Preserve the frozen local arithmetic on the measured sweep shapes:
+    // short-K G construction uses the batched heuristic; long-K projection
+    // uses the single-q heuristic. Execution always batches every q. This
+    // shape-derived prototype policy is not a general bit-parity guarantee.
+    const int batches = nb_a <= std::min(mb_c, nb_c)
+        ? static_cast<int>(nq) : 1;
     cublasLtMatrixLayout_t layouts[] = {ad, bd, cd};
     const int64_t strides[] = {a_stride, b_stride, c_stride};
     for (int i = 0; i < 3; ++i) {
