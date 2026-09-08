@@ -37,14 +37,19 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--source-run', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
-    p.add_argument('--gamma-ev', type=float, required=True)
+    p.add_argument('--gamma-ev', type=float, default=0.)
+    p.add_argument('--export', type=Path, help='Canonical EVAL all-q input; preserve left/right residues')
+    p.add_argument('--allow-anticausal', action='store_true')
     args = p.parse_args()
     if not os.getenv('SLURM_JOB_ID') or args.output.exists():
         raise RuntimeError('Compute-only staging into a new directory')
     sys.path.insert(0, str(EVAL))
     from residue_kernel import width_diagnostic
     from windowed_damped_kernel import W_CERT_RY, fourier_components
-    width = width_diagnostic(np.array([(5.-1j*args.gamma_ev)/13.605693122994]))
+    width = width_diagnostic(np.array([(5.-1j*args.gamma_ev)/13.605693122994]),
+                             allow_anticausal=args.allow_anticausal)
+    if args.export and args.gamma_ev:
+        raise ValueError('Export widths are physical inputs; do not override gamma')
     def git(*a):
         return subprocess.check_output(['git',*a],cwd=CHECKOUT,text=True).strip()
     commit = git('rev-parse','HEAD')
@@ -76,20 +81,57 @@ def main():
     assert sha(old_owner) == 'fab8e2235d5382741702ac94f2c5812fd93bd69ffcac10c51a7cd696b41f238e'
     owner = old_owner.read_text()
     table_receipt = None
-    if args.gamma_ev:
+    general = bool(args.export)
+    hermitian = True
+    stage_receipt = None
+    if general:
+        import h5py
+        # One canonical reader/factorization owner for every lane.
+        sys.path.insert(0, str(TEMPLATE.parents[1]/'allq'))
+        import stage_model
+        model_path, stage_path = stage_model.stage(args.export, out/'staged',
+            allow_anticausal=args.allow_anticausal)
+        stage_receipt = json.loads(stage_path.read_text())
+        hermitian = stage_receipt['hermitian_residues']
+        shape = stage_receipt['shape']
+        # The frozen carrier reads C. Convert L to C exactly once here; its
+        # unchanged normalization restores L. Keep R as its own slab.
+        carrier = out/'carrier.h5'
+        with h5py.File(model_path, 'r') as src, h5py.File(carrier, 'x') as dst:
+            omega = np.asarray(src['omega_ry'])
+            mask = np.asarray(src['factor_mask'], bool)
+            width = width_diagnostic(omega[mask], allow_anticausal=args.allow_anticausal)
+            if np.any(omega.real[mask] > W_CERT_RY):
+                raise ValueError('Export exceeds physical W_cert; no clipping')
+            if not hermitian and np.any(omega.imag[mask] == 0):
+                raise ValueError('Real non-Hermitian residues require an unimplemented PV kernel')
+            dst.create_dataset('factor', shape=shape, dtype=np.complex128)
+            dst.create_dataset('right', shape=shape, dtype=np.complex128)
+            for q in range(shape[0]):
+                dst['factor'][q] = np.asarray(src['left'][q])*np.sqrt(2*omega[q].real)[None,:]
+                dst['right'][q] = src['right'][q]
+            dst['poles2'] = omega.real**2
+            dst['factor_mask'] = mask.astype(np.int32)
+            dst['pole_id'] = np.where(mask, np.arange(shape[2]), -1)
+            dst['retained_rank'] = mask.sum(axis=1).astype(np.int32)
+        inputs['model'].update(path=str(carrier),sha256=sha(carrier),factor_shape=shape,
+            freeze_receipt_path=str(stage_path),freeze_receipt_sha256=sha(stage_path),
+            datasets={key:key for key in ('factor','poles2','factor_mask','pole_id','retained_rank')})
+    if args.gamma_ev or general:
         import h5py
         started = time.monotonic()
-        with h5py.File(inputs['model']['path'],'r') as f:
-            names = inputs['model']['datasets']
-            poles2 = np.asarray(f[names['poles2']])
-            mask = np.asarray(f[names['factor_mask']],bool)
-        omega = np.sqrt(np.where(mask,poles2,1.))-1j*args.gamma_ev/13.605693122994
+        if not general:
+            with h5py.File(inputs['model']['path'],'r') as f:
+                names = inputs['model']['datasets']
+                poles2 = np.asarray(f[names['poles2']])
+                mask = np.asarray(f[names['factor_mask']],bool)
+            omega = np.sqrt(np.where(mask,poles2,1.))-1j*args.gamma_ev/13.605693122994
         if np.any(omega.real[mask] > W_CERT_RY):
             raise RuntimeError('Synthetic centers exceed physical W_cert')
         geom = json.loads(Path(inputs['geometry']['path']).read_text())
         windows = geom['schedules']['primary/owner3']
         table = np.lib.format.open_memmap(out/'phase_table.npy',mode='w+',
-            dtype=np.complex128,shape=(447,)+omega.shape)
+            dtype=np.complex128,shape=(447,)+(() if hermitian else (2,))+omega.shape)
         keys=[];offset=0
         for window in windows:
             label=window['name']
@@ -100,15 +142,21 @@ def main():
             times=np.conj(raw) if window['space']=='val' else raw
             lo,hi=window['pole_interval_ry'];hi=min(hi,W_CERT_RY)
             for t in times:
-                value,_=fourier_components(t,omega,lo,hi)
-                table[offset]=np.where(mask,value,0j)
+                value,dispersive=fourier_components(t,omega,lo,hi,
+                    allow_anticausal=args.allow_anticausal)
+                if hermitian:
+                    table[offset]=np.where(mask,value,0j)
+                else:
+                    # H L + A(-D) = R(L-i(-D))/2 + R^dagger(L+i(-D))/2.
+                    table[offset,0]=np.where(mask,(value-1j*dispersive)/2,0j)
+                    table[offset,1]=np.where(mask,(value+1j*dispersive)/2,0j)
                 keys.append(dict(window=label,time=[float(t.real),float(t.imag)],index=offset))
                 offset+=1
             print('tabulated',label,offset,flush=True)
         assert offset==447
         table.flush();del table
         table_receipt=dict(path=str(out/'phase_table.npy'),sha256=sha(out/'phase_table.npy'),
-            shape=[447]+list(omega.shape),keys=keys,W_cert_ev=149.7645,
+            shape=[447]+([] if hermitian else [2])+list(omega.shape),keys=keys,W_cert_ev=149.7645,
             gamma_ev=args.gamma_ev,normalization='none',seconds=time.monotonic()-started,
             width=width,kernel_sha256=sha(CHECKOUT/'tools/windowed_damped_kernel.py'))
         (out/'phase_table.json').write_text(json.dumps(table_receipt,indent=2)+'\n')
@@ -151,6 +199,33 @@ def main():
             '        return result\n\n    schedule_operands = {}')
         owner=owner.replace('b=C/sqrt(2Omega); b exp(-iOmega*t) b^H',
                             'Run309: unnormalized finite spectral interval; b=C/sqrt(2Omega_center)')
+        if general:
+            owner=replace_once(owner,'        poles2 = reader.read_slab(',
+                '        right_factor = reader.read_slab("right", shape=(NPARENT, NMU_LOGICAL, kmax),\n'
+                '            partition_spec=P(None, "x", "y"))\n        poles2 = reader.read_slab(')
+            owner=replace_once(owner,'    right = jax.jit(',
+                '    right_factor = meta.mu_basis.pack_axis(right_factor, 1, spec=P(None, "x", "y"))\n'
+                '    right = jax.jit(')
+            owner=replace_once(owner,'out_shardings=parent_factor_sharding)(b)',
+                'out_shardings=parent_factor_sharding)(right_factor)')
+            # Every mode contributes to both intervals; never regenerate the
+            # right factor from the left in the old compact-view shortcut.
+            begin=owner.index('    view_bounds = {')
+            end=owner.index('    view_selected = ',begin)
+            owner=owner[:begin]+'    view_bounds = {label: (0, kmax) for label in ("low", "high", "full")}\n'+owner[end:]
+            if not hermitian:
+                old='''        phase = phase * jnp.exp(1j * e_ref_b * tau)
+        return distrib_la.matmul(left * phase[:, None, :], right_, mesh=mesh,
+            backend="off", batched_route="batch_reshard")'''
+                new='''        phase = phase * jnp.exp(1j * e_ref_b * tau)
+        direct = distrib_la.matmul(left * phase[0, :, None, :], right_, mesh=mesh,
+            backend="off", batched_route="batch_reshard")
+        mirror_left = jnp.conj(jnp.swapaxes(right_, -1, -2))
+        mirror_right = jnp.conj(jnp.swapaxes(left, -1, -2))
+        mirror = distrib_la.matmul(mirror_left * phase[1, :, None, :], mirror_right,
+            mesh=mesh, backend="off", batched_route="batch_reshard")
+        return direct + mirror'''
+                owner=replace_once(owner,old,new)
     owner_path=out/'scripts/run229_eval2_owner.py';owner_path.write_text(owner)
     start=adapter.index('OWNER = Path(');end=adapter.index('SMOOTH = ',start)
     adapter=adapter[:start]+f'OWNER = Path({str(owner_path)!r})\nOWNER_SHA256 = {sha(owner_path)!r}\n'+adapter[end:]
@@ -162,7 +237,9 @@ def main():
         assert sha(CHECKOUT/name)==digest
     inputs.update(source_binding=binding,adapter_sha256=sha(out/'scripts/run_tau200_sigma.py'))
     inputs['eval2_spectral_window']=dict(gamma_ev=args.gamma_ev,table=table_receipt,
-        W_cert_ev=149.7645,normalization='none',scope='synthetic Hermitian residues only')
+        W_cert_ev=149.7645,normalization='none',scope='general adjoint-mirrored export' if general else 'synthetic Hermitian residues only',
+        stage_receipt=stage_receipt,hermitian_rank_one_shortcut=hermitian,
+        allow_anticausal=args.allow_anticausal,width=width)
     (out/'inputs.json').write_text(json.dumps(inputs,indent=2)+'\n')
     receipt=dict(status='PREPARED',job_step=os.environ['SLURM_JOB_ID']+'.'+os.getenv('SLURM_STEP_ID','?'),
         source_run=str(original),source_input_sha256=sha(original/'inputs.json'),source_commit=commit,
