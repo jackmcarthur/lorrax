@@ -62,10 +62,10 @@ def selected_rows(bank, rowplan):
     return selected
 
 
-def fitting_weights(bank, selected, omega, weight):
+def fitting_weights(bank, selected, omega, weight, mode="equal_lines"):
     """Recompute quadrature on selected nodes; retain zero weights elsewhere."""
     loss = np.zeros(len(bank['z']))
-    loss[selected] = line_weights(bank['z'][selected], omega, weight)
+    loss[selected] = line_weights(bank['z'][selected], omega, weight, mode)
     return loss
 
 
@@ -92,7 +92,7 @@ def authenticated_weight():
     return omega, weight, receipt
 
 
-def line_weights(z, omega, weight):
+def line_weights(z, omega, weight, mode="equal_lines"):
     """Trapezoid times ORDER weight; each distinct height has equal total loss.
 
     Frequency is Re(z) in eV. Equal-frequency duplicates on one line split
@@ -109,11 +109,16 @@ def line_weights(z, omega, weight):
             trapezoid[0], trapezoid[-1] = (x[1]-x[0])/2, (x[-1]-x[-2])/2
             trapezoid[1:-1] = (x[2:]-x[:-2])/2
         sampled = np.interp(np.abs(x), omega, weight, left=0., right=0.)
-        node_loss = trapezoid * sampled
+        node_loss = trapezoid * (np.ones_like(sampled) if mode == "quadrature_height" else sampled)
         if node_loss.sum() <= 0:
             raise ValueError(f'No positive authenticated weight on height {height} eV')
-        result[indices] = node_loss[inverse] / counts[inverse] / node_loss.sum() / heights.size
-    return result
+        if mode == 'equal_lines':
+            result[indices] = node_loss[inverse] / counts[inverse] / node_loss.sum() / heights.size
+        elif mode in ('kernel_height', 'quadrature_height'):
+            result[indices] = node_loss[inverse] / counts[inverse] / height**2
+        else:
+            raise ValueError(f'Unknown experimental weighting: {mode}')
+    return result / result.sum()
 
 
 def _json_value(value):
@@ -346,7 +351,7 @@ def warm_start(directory, q, p, bank, loss, selected=None, moment_constrained=Fa
                    'pole_variables': 'all frequencies and widths remain free'}
 
 
-def main(gram_dir, out_dir, check=False, warm_dir=None, training_indices=None, moment_constrained=False):
+def main(gram_dir, out_dir, check=False, warm_dir=None, training_indices=None, moment_constrained=False, weighting="equal_lines"):
     """Fit q slots distributed by SLURM_PROCID stride SLURM_NTASKS."""
     rank, tasks = int(os.getenv('SLURM_PROCID', '0')), int(os.getenv('SLURM_NTASKS', '1'))
     if tasks < 1 or not 0 <= rank < tasks:
@@ -360,6 +365,7 @@ def main(gram_dir, out_dir, check=False, warm_dir=None, training_indices=None, m
     moment_names = MOMENT_NAMES if moment_constrained else []
     extra = 3 if moment_constrained else 0
     origin['kind'] = kind
+    origin['weighting'] = weighting
     if moment_constrained:
         origin['row_map_contract'] += '; then raw physical Ry M0,Mm1,M1 coordinates'
     slots = list(range(rank, 29, tasks))
@@ -384,7 +390,7 @@ def main(gram_dir, out_dir, check=False, warm_dir=None, training_indices=None, m
         path = gram_dir/f'q{q:02d}.npz'
         bank = load_gram(path,require_moments=moment_constrained)
         selected = selected_rows(bank, rowplan)
-        loss = fitting_weights(bank, selected, omega, weight)
+        loss = fitting_weights(bank, selected, omega, weight, weighting)
         training = train_indices(bank)
         nt = len(bank['z'])
         selected_channels = np.r_[selected, selected+nt]
@@ -451,6 +457,8 @@ if __name__ == '__main__':
                         help='Fixed JSON list of at most 40 original training rows; held rows forbidden')
     parser.add_argument('--moment-constrained',action='store_true',
                         help='Experiment variant: enforce parent M0,Mm1,M1 from extended Grams')
+    parser.add_argument('--weighting', choices=['equal_lines','kernel_height','quadrature_height'], default='equal_lines',
+                        help='Experimental line loss; height variants use trapezoid/height^2 with/without ORDER')
     parser.add_argument('--summary-only', action='store_true', help='Emit all-q original-Gram ORDER rank tables only')
     args = parser.parse_args()
     if args.summary_only:
@@ -458,4 +466,4 @@ if __name__ == '__main__':
             parser.error('--summary-only reports original sample ranks; omit --moment-constrained')
         rank_summary(args.gram, args.out, args.training_indices)
     else:
-        main(args.gram, args.out, args.synthetic_check, args.warm_start, args.training_indices,args.moment_constrained)
+        main(args.gram, args.out, args.synthetic_check, args.warm_start, args.training_indices,args.moment_constrained,args.weighting)
