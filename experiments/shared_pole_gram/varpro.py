@@ -46,7 +46,9 @@ def _eliminate(design, data):
     keep = s > s[0] * 1e-13
     inverse = (vh[keep].T / s[keep]) @ u[:, keep].T
     coefficients = inverse @ data
-    residual = data - design @ coefficients
+    # Apply the orthogonal projector itself: A(A+ D) amplifies cancellation
+    # by cond(A), even though the subspace residual is well conditioned.
+    residual = data - u[:, keep] @ (u[:, keep].T @ data)
     return residual, coefficients, inverse, s, int(keep.sum())
 
 
@@ -59,11 +61,15 @@ def _residual_jac(theta, z, sqrt_weights, compressed, exact=False):
     a, derivative_u, derivative_v = _design(theta, z)
     a = sqrt_weights[:, None] * a
     r, c, inverse, singular, rank = _eliminate(a, compressed)
+    if rank == a.shape[1]:
+        orthogonal = np.linalg.qr(a, mode="reduced")[0]
+    else:
+        orthogonal = np.linalg.svd(a, full_matrices=False)[0][:, :rank]
     columns = []
     for parameter, derivative in enumerate(np.hstack((derivative_u, derivative_v)).T):
         pole = parameter % c.shape[0]
         dcol = sqrt_weights * derivative
-        perpendicular = dcol - a @ (inverse @ dcol)
+        perpendicular = dcol - orthogonal @ (orthogonal.T @ dcol)
         dr = -perpendicular[:, None] * c[pole]
         if exact:
             dr -= inverse[pole, :, None] * (dcol @ r)[None, :]

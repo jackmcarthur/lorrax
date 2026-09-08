@@ -109,6 +109,7 @@ def _residual_jac(theta, z, sqrt_weights, data, moments):
     residual, coefficients, state = _constrained_eliminate(a,c,data,moments)
     ci, nullspace = state['inverse_c'], state['nullspace']
     reduced, bi = state['reduced'], state['inverse_b']
+    orthogonal = np.linalg.qr(reduced, mode='reduced')[0]
     multiplier = ci.T@(a.T@residual)
     columns = []
     for j in range(theta.size):
@@ -119,7 +120,7 @@ def _residual_jac(theta, z, sqrt_weights, data, moments):
         t = da[:,None]*coefficients[pole]+a@dparticular
         response = da@residual-dc@multiplier
         correction = nullspace[pole,:,None]*response[None,:]
-        derivative = -(t-reduced@(bi@t))-bi.T@correction
+        derivative = -(t-orthogonal@(orthogonal.T@t))-bi.T@correction
         columns.append(derivative.ravel())
     return residual.ravel(), np.stack(columns,axis=1), (coefficients,state)
 
