@@ -92,7 +92,7 @@ static ffi::Error BatchedGemmImpl(
         LORRAX_LIB_CHECK(cublasLtCreate(&ctx->summa_blas), CUBLAS_STATUS_SUCCESS, "cuBLAS create");
         if (ctx->rank == 0) {
             std::fprintf(stderr, "[lorrax packed-q SUMMA] service prototype: "
-                "all-q panel broadcasts, strided batched local GEMMs; existing face ABI\n");
+                "all-q/all-K grouped panel broadcasts, ordered strided batched local GEMMs; existing face ABI\n");
             std::fflush(stderr);
         }
     }
@@ -104,12 +104,12 @@ static ffi::Error BatchedGemmImpl(
     const size_t a_bytes = nq * a_stride * sizeof(T);
     const size_t b_bytes = nq * b_stride * sizeof(T);
     try {
-        ensure_workspace(ctx, a_bytes + b_bytes, 0);
+        ensure_workspace(ctx, ctx->p * (a_bytes + b_bytes), 0);
     } catch (const std::exception& ex) {
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, ex.what());
     }
     T* a_panel = static_cast<T*>(ctx->d_workspace);
-    T* b_panel = a_panel + nq * a_stride;
+    T* b_panel = a_panel + ctx->p * nq * a_stride;
     if (d_C_out != d_C_in) {
         LORRAX_CUDA_CHECK(cudaMemcpyAsync(d_C_out, d_C_in,
             nq * c_stride * sizeof(T), cudaMemcpyDeviceToDevice, ctx->stream));
@@ -155,21 +155,33 @@ static ffi::Error BatchedGemmImpl(
         ad, bd, cd, cd, &choice.algo, &supported), CUBLAS_STATUS_SUCCESS, "Lt batch compatibility");
     LORRAX_LIB_CHECK(supported.state, CUBLAS_STATUS_SUCCESS,
         "single-q Lt algorithm does not support packed batch");
+    // Group the same byte-only broadcasts across K as well as q. Retain
+    // separate face-panel buffers until the ascending local GEMMs consume
+    // them; no complete n-by-n operator is replicated on a rank. Scratch
+    // is p*(a_bytes+b_bytes), bounded by this call's planned tile extents.
+    // C[q] = alpha sum_s A[q,:,s] B[q,s,:] + beta C[q], in original s order.
+    LORRAX_LIB_CHECK(ncclGroupStart(), ncclSuccess, "NCCL all-panel group start");
+    ncclResult_t panel_status = ncclSuccess;
+    for (int s = 0; s < ctx->p; ++s) {
+        const auto a_status = ncclBroadcast(d_A,
+            a_panel + s * nq * a_stride, a_bytes,
+            ncclUint8, s, ctx->summa_row, ctx->stream);
+        const auto b_status = ncclBroadcast(d_B,
+            b_panel + s * nq * b_stride, b_bytes,
+            ncclUint8, s, ctx->summa_col, ctx->stream);
+        if (a_status != ncclSuccess) panel_status = a_status;
+        if (b_status != ncclSuccess) panel_status = b_status;
+    }
+    const auto end_status = ncclGroupEnd();
+    LORRAX_LIB_CHECK(panel_status, ncclSuccess, "NCCL grouped panel broadcast");
+    LORRAX_LIB_CHECK(end_status, ncclSuccess, "NCCL all-panel group end");
     const T one = T(1);
     for (int s = 0; s < ctx->p; ++s) {
-        // NCCL broadcasts copy bytes only; no floating-point reduction.
-        LORRAX_LIB_CHECK(ncclGroupStart(), ncclSuccess, "NCCL group start");
-        const auto a_status = ncclBroadcast(d_A, a_panel, a_bytes,
-            ncclUint8, s, ctx->summa_row, ctx->stream);
-        const auto b_status = ncclBroadcast(d_B, b_panel, b_bytes,
-            ncclUint8, s, ctx->summa_col, ctx->stream);
-        const auto end_status = ncclGroupEnd();
-        LORRAX_LIB_CHECK(a_status, ncclSuccess, "NCCL A broadcast");
-        LORRAX_LIB_CHECK(b_status, ncclSuccess, "NCCL B broadcast");
-        LORRAX_LIB_CHECK(end_status, ncclSuccess, "NCCL group end");
         const T* panel_beta = s == 0 ? &beta : &one;
         LORRAX_LIB_CHECK(cublasLtMatmul(ctx->summa_blas, desc, &alpha,
-            a_panel, ad, b_panel, bd, panel_beta, d_C_out, cd, d_C_out, cd,
+            a_panel + s * nq * a_stride, ad,
+            b_panel + s * nq * b_stride, bd,
+            panel_beta, d_C_out, cd, d_C_out, cd,
             &choice.algo, nullptr, 0, ctx->stream), CUBLAS_STATUS_SUCCESS, "packed-q Lt GEMM");
     }
     cublasLtMatmulPreferenceDestroy(pref);
