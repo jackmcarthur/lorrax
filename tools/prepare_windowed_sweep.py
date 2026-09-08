@@ -40,6 +40,8 @@ def main():
     p.add_argument('--gamma-ev', type=float, default=0.)
     p.add_argument('--export', type=Path, help='Canonical EVAL all-q input; preserve left/right residues')
     p.add_argument('--allow-anticausal', action='store_true')
+    p.add_argument('--signed', action='store_true',
+                   help='Announced opt-in: real-pole signs dataset, active entries exactly +/-1')
     args = p.parse_args()
     if not os.getenv('SLURM_JOB_ID') or args.output.exists():
         raise RuntimeError('Compute-only staging into a new directory')
@@ -62,6 +64,11 @@ def main():
     original = args.source_run.resolve()
     inputs = json.loads((original/'inputs.json').read_text())
     template = json.loads((TEMPLATE/'inputs.json').read_text())
+    has_signs = 'signs' in inputs['model']['datasets']
+    if has_signs != args.signed:
+        raise ValueError('Signed dataset requires --signed; --signed requires a signs dataset')
+    if args.signed and (args.gamma_ev or args.export):
+        raise ValueError('Signed exponential carrier requires real-pole factors')
     # Receipt/model authentication, including the original real source pins.
     for record in (inputs['model'], inputs['generalized_sigma_owner'], inputs['geometry']):
         assert sha(record['path']) == record['sha256']
@@ -228,6 +235,32 @@ def main():
             mesh=mesh, backend="off", batched_route="batch_reshard")
         return direct + mirror'''
                 owner=replace_once(owner,old,new)
+    if args.signed:
+        # W(t) = B diag(s exp(-i Omega t)) B^H. Keep boolean ownership
+        # through the partition checks, then encode signed weights. Compact
+        # and full views receive identical weights; B and B^H are unchanged.
+        owner=replace_once(owner, '        poles2 = reader.read_slab(',
+            '        signs = reader.read_slab(datasets["signs"], shape=(NPARENT, kmax),\n'
+            '            partition_spec=P(None, None))\n        poles2 = reader.read_slab(')
+        owner=replace_once(owner, '    safe_poles2 = ',
+            '    signs_host = np.asarray(gather_to_host(signs))\n'
+            '    if not np.all(np.isin(signs_host, [-1, 1])):\n'
+            '        raise ValueError("Signed carrier requires signs exactly +/-1, including padding")\n'
+            '    print("[EVAL2 signed carrier] active negative columns",\n'
+            '          int(np.sum((signs_host < 0) & mask_host)), flush=True)\n'
+            '    safe_poles2 = ')
+        owner=replace_once(owner,
+            '            owner, jnp.exp(-1j * (omega - e_ref_b) * tau),',
+            '            owner != 0, owner * jnp.exp(-1j * (omega - e_ref_b) * tau),')
+        owner=replace_once(owner,
+            '"pole_owner": replicate_to_mesh(compact_owner, mesh),',
+            '"pole_owner": replicate_to_mesh(compact_owner * signs_host[:, lo:hi], mesh),')
+        owner=replace_once(owner,
+            '"full_pole_owner": replicate_to_mesh(pole_owner, mesh),',
+            '"full_pole_owner": replicate_to_mesh(pole_owner * signs_host, mesh),')
+        inputs['eval2_signed_carrier'] = dict(enabled=True,
+            convention='B diag(signs exp(-i Omega tau)) B^H; C=B sqrt(2 Omega)',
+            absent_signs='unchanged frozen owner arithmetic')
     owner_path=out/'scripts/run229_eval2_owner.py';owner_path.write_text(owner)
     start=adapter.index('OWNER = Path(');end=adapter.index('SMOOTH = ',start)
     adapter=adapter[:start]+f'OWNER = Path({str(owner_path)!r})\nOWNER_SHA256 = {sha(owner_path)!r}\n'+adapter[end:]
