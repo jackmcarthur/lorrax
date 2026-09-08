@@ -10,7 +10,6 @@ No matrix of spatial dimension n is needed here.
 import time
 
 import numpy as np
-from scipy.optimize import least_squares
 
 try:
     from . import varpro
@@ -125,6 +124,38 @@ def _residual_jac(theta, z, sqrt_weights, data, moments):
     return residual.ravel(), np.stack(columns,axis=1), (coefficients,state)
 
 
+def _compress_gram(z,weights,gram):
+    """Fixed-scale joint compression, normalized by sample loss only."""
+    nt = len(z)
+    sw = np.sqrt(np.r_[weights,weights])
+    moment_scale = np.array([1/varpro.BANDWIDTH_RY,1.,1/varpro.BANDWIDTH_RY**2])
+    transform = np.r_[sw,moment_scale]
+    transformed = transform[:,None]*((gram+gram.T)/2)*transform[None,:]
+    eigenvalues,vectors = np.linalg.eigh(transformed)
+    if eigenvalues[-1]<=0 or eigenvalues[0]<-1e-10*eigenvalues[-1]:
+        raise ValueError('Extended Gram must be nonzero positive semidefinite')
+    sample_norm = np.sqrt(np.trace(transformed[:2*nt,:2*nt]))
+    if not sample_norm>0:
+        raise ValueError('Zero weighted training norm')
+    compressed = vectors*np.sqrt(np.maximum(eigenvalues,0))[None,:]/sample_norm
+    return sw,moment_scale,compressed[:2*nt],compressed[2*nt:],eigenvalues
+
+
+def real_q_gradient_check(z_ry,weights_loss,channel_gram,sketches,p):
+    """AAA-seed exact objective-gradient gate including moving moment constraints."""
+    z,weights,gram = np.asarray(z_ry,complex),np.asarray(weights_loss,float),np.asarray(channel_gram).real
+    sw,_,data,moments,_ = _compress_gram(z,weights,gram)
+    seed,initializer = varpro._aaa_initial(z/varpro.BANDWIDTH_RY,sketches,p)
+    theta = np.log(np.r_[seed.real,-seed.imag])
+    def rank_check(state):
+        # The owner refuses either SVD rank loss before returning this state.
+        return {'constraint_rank':3,'reduced_design_rank':state[1]['nullspace'].shape[1]}
+    receipt = varpro._gradient_receipt(
+        lambda t:_residual_jac(t,z/varpro.BANDWIDTH_RY,sw,data,moments),theta,rank_check)
+    receipt.update(initializer=initializer,bandwidth_ry=varpro.BANDWIDTH_RY)
+    return receipt
+
+
 def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
     """Fit damped poles with three exact physical dA moment constraints.
 
@@ -171,24 +202,12 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
         raise ValueError('Need p>=3 and at least p-3 active real data rows')
     if np.linalg.norm(gram-gram.T)>1e-10*max(np.linalg.norm(gram),1e-300):
         raise ValueError('Extended Gram is not symmetric')
-    bandwidth = max(float(np.max(np.abs(z.real))),float(np.max(z.imag)),1e-12)
+    bandwidth = varpro.BANDWIDTH_RY
     scaled_z = z/bandwidth
-    sw = np.sqrt(np.r_[weights,weights])
     # Q=R/b: moments become (M0/b, Mm1, M1/b^2) and C uses dimensionless poles.
-    moment_scale = np.array([1/bandwidth,1.,1/bandwidth**2])
-    transform = np.r_[sw,moment_scale]
-    transformed = transform[:,None]*((gram+gram.T)/2)*transform[None,:]
-    eigenvalues,vectors = np.linalg.eigh(transformed)
-    if eigenvalues[-1]<=0 or eigenvalues[0]<-1e-10*eigenvalues[-1]:
-        raise ValueError('Extended Gram must be nonzero positive semidefinite')
-    sample_norm = np.sqrt(np.trace(transformed[:2*nt,:2*nt]))
-    if not sample_norm>0:
-        raise ValueError('Zero weighted training norm')
-    # Retain all positive modes: moment data must not acquire a relative-rank cut.
-    compressed = vectors*np.sqrt(np.maximum(eigenvalues,0))[None,:]/sample_norm
-    data,moments = compressed[:2*nt],compressed[2*nt:]
+    sw,moment_scale,data,moments,eigenvalues = _compress_gram(z,weights,gram)
     if initial is None:
-        seed,initializer = varpro._vf_initial(scaled_z,sketches,p)
+        seed,initializer = varpro._aaa_initial(scaled_z,sketches,p)
     else:
         seed = np.asarray(initial,complex)/bandwidth
         initializer = {'method':'warm start'}
@@ -206,9 +225,7 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
             cache['value'] = _residual_jac(t,scaled_z,sw,data,moments)
         return cache['value']
 
-    result = least_squares(lambda t:evaluate(t)[0],theta,jac=lambda t:evaluate(t)[1],
-                           bounds=(lower,upper),method='trf',max_nfev=400,
-                           ftol=1e-10,xtol=1e-10,gtol=1e-10)
+    result,iteration_receipt = varpro._minimize(evaluate,theta)
     residual,jacobian,(_,state) = evaluate(result.x)
     a = sw[:,None]*varpro._design(result.x,scaled_z)[0]
     zi = state['nullspace']@state['inverse_b']
@@ -228,6 +245,8 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
     asv = np.linalg.svd(a,compute_uv=False)
     csv = np.linalg.svd(np.sqrt(weights)[:,None]*basis(z,poles),compute_uv=False)
     bs = state['reduced_singular']
+    degeneracy = varpro._degeneracy(row_map,gram,poles)
+    eligible = iteration_receipt['success'] and not degeneracy['unresolved_tiny_residue_degeneracy']
     return {'poles_ry':poles,'row_map':row_map,
             'relative_training_error':float(np.linalg.norm(residual)),
             'cond_phi':float(csv[0]/csv[-1]) if p<=nt and csv[-1] else float('inf'),
@@ -249,10 +268,13 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
             'moment_row_scales':moment_scale,'bandwidth_ry':bandwidth,
             'gram_negative_roundoff_mass':float(-np.minimum(eigenvalues,0).sum()),
             'gram_positive_rank':int(np.count_nonzero(eigenvalues>0)),
-            'initializer':initializer,'nfev':result.nfev,'success':bool(result.success),
+            'initializer':initializer,'nfev':result.nfev,
             'message':result.message,'numerical_log_bounds':[lower,upper],
             'active_bounds':result.active_mask,'wall_seconds':time.monotonic()-start,
-            'residue_constraint':'Hermitian real channels with exact parent dA moment equalities'}
+            'residue_constraint':'Hermitian real channels with exact parent dA moment equalities',
+            'numerical_candidate_eligible':bool(eligible),
+            'candidate_scope':'Numerical prerequisites only; unresolved degeneracy or unconverged fit is not a candidate',
+            **iteration_receipt,**degeneracy}
 
 
 def synthetic_check():
@@ -284,8 +306,11 @@ def synthetic_check():
     assert derivative_error<1e-6,derivative_error
     assert equality_error<1e-10,equality_error
     assert prediction_error<1e-6,prediction_error
+    assert fitted['success'] and fitted['accepted_objective_monotonic'],fitted['termination_reason']
     return {'exact_jacobian_relative_error':float(derivative_error),
             'moment_equality_relative_error':float(equality_error),
             'prediction_relative_error':float(prediction_error),
             'moment_equality_map_error_max':fitted['moment_equality_map_error_max'],
-            'max_pole_error_ry':float(np.max(np.abs(fitted['poles_ry']-poles)))}
+            'max_pole_error_ry':float(np.max(np.abs(fitted['poles_ry']-poles))),
+            'accepted_iterations':fitted['accepted_iterations'],
+            'relative_step_converged':fitted['relative_step_converged']}

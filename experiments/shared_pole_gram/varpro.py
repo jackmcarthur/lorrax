@@ -8,9 +8,17 @@ Loss weights (not amplitude weights) are applied exactly once, inside fit.
 """
 
 import time
+import hashlib
+import inspect
+from pathlib import Path
+import warnings
 
 import numpy as np
+import scipy
 from scipy.optimize import least_squares
+
+EV = 13.605693122994
+BANDWIDTH_RY = 150.0/EV
 
 
 def basis(z_ry, poles_ry):
@@ -108,6 +116,170 @@ def _vf_initial(z, sketches, p):
                   "vf_positive_seeds": int(accepted.size), "iterations": 6}
 
 
+def _aaa_initial(z, sketches, p):
+    """AAA trace seeds with explicit completion to a fixed positive-pole count.
+
+    Causal symmetry supplies (-conj(z),conj(trace)); these are transformed
+    copies, not additional sampled matrices. AAA cleanup is disabled. Only
+    initializer locations are reflected into the causal quadrant; fitted
+    poles and residues are never projected or dropped.
+    """
+    try:
+        from scipy.interpolate import AAA
+    except ImportError as exc:
+        raise RuntimeError(f'scipy.interpolate.AAA unavailable in SciPy {scipy.__version__}; no VF fallback') from exc
+    y = np.asarray(sketches,complex) if sketches is not None else np.empty((0,0))
+    if y.ndim!=2 or y.shape[0]!=len(z) or y.shape[1]<1 or not np.all(np.isfinite(y)):
+        raise ValueError('AAA requires finite trace sketches for every training row')
+    source = Path(inspect.getsourcefile(AAA))
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    nodes = np.r_[z,-np.conj(z)]
+    values = np.r_[y[:,0],np.conj(y[:,0])]
+    nodes,unique = np.unique(nodes,return_index=True)
+    values = values[unique]
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter('always')
+        approx = AAA(nodes,values,max_terms=min(2*p+1,len(nodes)),rtol=1e-12,clean_up=False)
+    raw = np.asarray(approx.poles(),complex)
+    keep = np.isfinite(raw)&(raw.real>1e-8)
+    positive = raw[keep]
+    positive = positive[np.argsort(positive.real)]
+    if len(positive)>p:
+        ids = np.linspace(0,len(positive)-1,p).round().astype(int)
+        positive = positive[ids]
+    seeds = list(positive.real-1j*np.maximum(np.abs(positive.imag),1e-6))
+    real_nodes = np.abs(np.asarray(z).real)
+    nonzero = real_nodes[real_nodes>1e-8]
+    lo = max(float(nonzero.min())/4 if len(nonzero) else 1e-4,1e-6)
+    hi = max(float(real_nodes.max()),lo*10)
+    candidates = np.geomspace(lo,hi,max(8*p,32))
+    completion = []
+    while len(seeds)<p:
+        if seeds:
+            distance = np.min(np.abs(np.log(candidates[:,None])-np.log(np.real(seeds))[None,:]),axis=1)
+            index = int(np.argmax(distance))
+        else:
+            index = len(candidates)//2
+        seed = candidates[index]-1j*max(float(np.min(np.imag(z)))/2,1e-6)
+        seeds.append(seed); completion.append(seed)
+        candidates = np.delete(candidates,index)
+    seed = np.asarray(seeds)[np.argsort(np.real(seeds))]
+    design = np.vstack((basis(z,seed).real,basis(z,seed).imag))
+    sketch_rows = np.vstack((y.real,y.imag))
+    sketch_residual,_,_,_,sketch_rank = _eliminate(design,sketch_rows)
+    return seed, {'method':'AAA trace with conjugate symmetry and fixed-count completion',
+        'scipy_version':scipy.__version__,'aaa_source':str(source),'aaa_source_sha256':source_sha,
+        'aaa_raw_poles':int(len(raw)),'aaa_positive_poles':int(np.count_nonzero(keep)),
+        'aaa_selected_positive_poles':int(len(positive)),'completion_count':len(completion),
+        'completion_poles_dimensionless':[[v.real,v.imag] for v in completion],
+        'causal_seed_reflections':int(np.sum(positive.imag>=0)),
+        'aaa_cleanup':False,'aaa_warnings':[str(item.message) for item in captured],
+        'sketch_seed_relative_errors':(np.linalg.norm(sketch_residual,axis=0)/np.maximum(np.linalg.norm(sketch_rows,axis=0),1e-300)).tolist(),
+        'sketch_seed_design_rank':sketch_rank,'vf_used':False}
+
+
+def _minimize(evaluate, theta):
+    """One accepted-iteration trace and strict relative-step convergence owner."""
+    if 'callback' not in inspect.signature(least_squares).parameters:
+        raise RuntimeError(f'SciPy {scipy.__version__} lacks least_squares callback; accepted-step audit unavailable')
+    previous = theta.copy()
+    initial_residual = evaluate(theta)[0]
+    trace = [{'iteration':0,'objective':float(initial_residual@initial_residual),
+              'relative_residual':float(np.linalg.norm(initial_residual)),'relative_step':None}]
+    converged = False
+
+    def callback(intermediate_result):
+        nonlocal previous,converged
+        current = intermediate_result.x
+        delta = np.linalg.norm(current-previous)
+        if delta==0:
+            return
+        step = float(delta/max(1.,np.linalg.norm(previous)))
+        residual = evaluate(current)[0]
+        trace.append({'iteration':len(trace),'objective':float(residual@residual),
+                      'relative_residual':float(np.linalg.norm(residual)),'relative_step':step})
+        previous = current.copy()
+        if step<1e-8:
+            converged = True
+            raise StopIteration
+
+    result = least_squares(lambda t:evaluate(t)[0],theta,jac=lambda t:evaluate(t)[1],
+        bounds=(-25.,20.),method='trf',max_nfev=10000,ftol=None,gtol=None,xtol=1e-14,
+        callback=callback)
+    objectives = np.array([item['objective'] for item in trace])
+    monotonic = bool(np.all(np.diff(objectives)<=1e-12*np.maximum(objectives[:-1],1e-300)+1e-15))
+    receipt = {'accepted_iteration_trace':trace,'accepted_iterations':len(trace)-1,
+        'accepted_objective_monotonic':monotonic,'relative_step_converged':bool(converged),
+        'success':bool(converged and monotonic),'optimizer_native_success':bool(result.success),
+        'optimizer_status':int(result.status),'termination_reason':('relative accepted log-parameter step < 1e-8'
+            if converged else f'Not relatively step-converged: {result.message}'),
+        'iteration_budget_nfev':10000,'callback_available':True,'scipy_version':scipy.__version__}
+    return result,receipt
+
+
+def _degeneracy(row_map, gram, poles):
+    """Diagnose tiny residues without changing the fixed-p functional."""
+    norm2 = np.einsum('ij,jk,ik->i',row_map,gram,row_map)
+    norms = np.sqrt(np.maximum(norm2,0))
+    relative = norms/max(float(norms.max()),1e-300)
+    tiny = np.flatnonzero(relative<1e-8)
+    return {'residue_coordinate_norms':norms,'residue_norm_relative':relative,
+            'tiny_residue_relative_threshold':1e-8,'tiny_residue_poles':tiny,
+            'unresolved_tiny_residue_degeneracy':bool(tiny.size),
+            'postfit_poles_dropped':0,'pole_count_fixed':len(poles)}
+
+
+def _gradient_receipt(evaluate, theta, rank_check):
+    """Finite-difference objective gradient gate, independent of residual Jacobian."""
+    residual,jacobian,state = evaluate(theta)
+    ranks = rank_check(state)
+    analytic = 2*jacobian.T@residual
+    checks = []
+    for step in (1e-5,1e-6):
+        finite = []
+        for direction in np.eye(len(theta)):
+            plus = evaluate(theta+step*direction);minus = evaluate(theta-step*direction)
+            rank_check(plus[2]);rank_check(minus[2])
+            finite.append((plus[0]@plus[0]-minus[0]@minus[0])/(2*step))
+        finite = np.asarray(finite)
+        error = np.linalg.norm(finite-analytic)/max(np.linalg.norm(finite),np.linalg.norm(analytic),1e-300)
+        checks.append({'log_parameter_step':step,'relative_gradient_error':float(error)})
+    passed = min(item['relative_gradient_error'] for item in checks)<1e-6
+    receipt = {'passed':bool(passed),'threshold_relative':1e-6,'checks':checks,'ranks':ranks,
+               'objective':float(residual@residual),'analytic_gradient_norm':float(np.linalg.norm(analytic))}
+    if not passed:
+        raise ValueError(f'Real-q objective-gradient gate failed: {receipt}')
+    return receipt
+
+
+def _compress_gram(z, weights, gram):
+    """Fixed 150-eV scale and weighted real-channel Gram compression."""
+    sw = np.sqrt(np.r_[weights,weights])
+    weighted = sw[:,None]*((gram+gram.T)/2)*sw[None,:]
+    eigenvalues,vectors = np.linalg.eigh(weighted)
+    if eigenvalues[-1]<=0 or eigenvalues[0]<-1e-10*eigenvalues[-1]:
+        raise ValueError('channel_gram must be nonzero positive semidefinite')
+    keep = eigenvalues>eigenvalues[-1]*1e-14
+    norm = np.sqrt(np.maximum(eigenvalues,0).sum())
+    compressed = vectors[:,keep]*(np.sqrt(eigenvalues[keep])/norm)
+    return sw,compressed,int(keep.sum()),float(np.maximum(eigenvalues[~keep],0).sum()/norm**2)
+
+
+def real_q_gradient_check(z_ry, weights_loss, channel_gram, sketches, p):
+    """AAA-seed real-q finite-difference gate; refuse truncated design ranks."""
+    z,weights,gram = np.asarray(z_ry,complex),np.asarray(weights_loss,float),np.asarray(channel_gram).real
+    sw,compressed,_,_ = _compress_gram(z,weights,gram)
+    seed,initializer = _aaa_initial(z/BANDWIDTH_RY,sketches,p)
+    theta = np.log(np.r_[seed.real,-seed.imag])
+    def rank_check(state):
+        if state[2]!=p:
+            raise ValueError(f'Real-q gradient gate uncertified: design rank {state[2]} < p={p}')
+        return {'design_rank':state[2]}
+    receipt = _gradient_receipt(lambda t:_residual_jac(t,z/BANDWIDTH_RY,sw,compressed,exact=True),theta,rank_check)
+    receipt.update(initializer=initializer,bandwidth_ry=BANDWIDTH_RY)
+    return receipt
+
+
 def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
     """Fit moving damped poles with real Hermitian-channel residue elimination.
 
@@ -146,20 +318,13 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
         raise ValueError("upper-half-plane samples and nonnegative nonzero weights required")
     if p < 1 or p > 2 * np.count_nonzero(weights):
         raise ValueError("p exceeds the number of active real channel rows")
-    bandwidth = max(float(np.max(np.abs(z.real))), float(np.max(z.imag)), 1e-12)
+    bandwidth = BANDWIDTH_RY
     scaled_z = z / bandwidth
-    sw = np.sqrt(np.r_[weights, weights])
     if np.linalg.norm(gram - gram.T) > 1e-10 * max(np.linalg.norm(gram), 1e-300):
         raise ValueError("channel_gram is not symmetric")
-    weighted = sw[:, None] * ((gram + gram.T) / 2) * sw[None, :]
-    eigenvalues, vectors = np.linalg.eigh(weighted)
-    if eigenvalues[-1] <= 0 or eigenvalues[0] < -1e-10 * eigenvalues[-1]:
-        raise ValueError("channel_gram must be nonzero positive semidefinite")
-    keep = eigenvalues > eigenvalues[-1] * 1e-14
-    norm = np.sqrt(np.maximum(eigenvalues, 0).sum())
-    compressed = vectors[:, keep] * (np.sqrt(eigenvalues[keep]) / norm)
+    sw,compressed,gram_rank,discarded_fraction = _compress_gram(z,weights,gram)
     if initial is None:
-        seed, initializer = _vf_initial(scaled_z, sketches, p)
+        seed, initializer = _aaa_initial(scaled_z, sketches, p)
     else:
         seed = np.asarray(initial, complex) / bandwidth
         initializer = {"method": "warm start"}
@@ -178,9 +343,7 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
             cache["value"] = _residual_jac(t, scaled_z, sw, compressed)
         return cache["value"]
 
-    result = least_squares(lambda t: evaluate(t)[0], theta,
-                           jac=lambda t: evaluate(t)[1], bounds=(lower, upper),
-                           method="trf", max_nfev=400, ftol=1e-10, xtol=1e-10, gtol=1e-10)
+    result,iteration_receipt = _minimize(evaluate,theta)
     residual, jacobian, (inverse, singular, rank) = _residual_jac(
         result.x, scaled_z, sw, compressed, exact=True)
     jac_singular = np.linalg.svd(jacobian, compute_uv=False)
@@ -189,7 +352,10 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
     complex_singular = np.linalg.svd(np.sqrt(weights)[:, None] * basis(z, poles), compute_uv=False)
     complex_condition = (float(complex_singular[0] / complex_singular[-1])
                          if p <= z.size and complex_singular[-1] else float("inf"))
-    return {"poles_ry": poles[ordering], "row_map": bandwidth * inverse[ordering] * sw[None, :],
+    row_map = bandwidth * inverse[ordering] * sw[None,:]
+    degeneracy = _degeneracy(row_map,gram,poles[ordering])
+    eligible = iteration_receipt['success'] and rank==p and not degeneracy['unresolved_tiny_residue_degeneracy']
+    return {"poles_ry": poles[ordering], "row_map": row_map,
             "relative_training_error": float(np.linalg.norm(residual)),
             "cond_phi": complex_condition,
             "cond_real_design": float(singular[0] / singular[-1]) if singular[-1] else float("inf"),
@@ -201,11 +367,14 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
                                     "Uncertified: truncated-SVD derivative is not the full/constant-rank pseudoinverse derivative"),
             "jac_singular_values": jac_singular, "jac_normalization": "relative loss; log dimensionless poles",
             "bandwidth_ry": bandwidth, "wall_seconds": time.monotonic() - start,
-            "nfev": result.nfev, "success": bool(result.success), "message": result.message,
-            "initializer": initializer, "gram_rank": int(keep.sum()),
-            "gram_discarded_fraction": float(np.maximum(eigenvalues[~keep], 0).sum() / norm**2),
+            "nfev": result.nfev, "message": result.message,
+            "initializer": initializer, "gram_rank": gram_rank,
+            "gram_discarded_fraction": discarded_fraction,
             "numerical_log_bounds": [lower, upper], "active_bounds": result.active_mask,
-            "moment_constraints": "none", "residue_constraint": "Hermitian real channels"}
+            "moment_constraints": "none", "residue_constraint": "Hermitian real channels",
+            "numerical_candidate_eligible":bool(eligible),
+            "candidate_scope":"Numerical prerequisites only; unresolved degeneracy or unconverged fit is not a candidate",
+            **iteration_receipt,**degeneracy}
 
 
 def synthetic_check():
@@ -235,7 +404,10 @@ def synthetic_check():
     assert gradient_error < 1e-10, gradient_error
     assert fitted["relative_training_error"] < 1e-7, fitted
     assert pole_error < 1e-6, pole_error
+    assert fitted['success'] and fitted['accepted_objective_monotonic'], fitted['termination_reason']
     return {"exact_derivative_relative_error": float(derivative_error),
             "kaufman_gradient_absolute_error": float(gradient_error),
             "training_relative_error": fitted["relative_training_error"],
-            "max_pole_error_ry": float(pole_error)}
+            "max_pole_error_ry": float(pole_error),
+            "accepted_iterations":fitted['accepted_iterations'],
+            "relative_step_converged":fitted['relative_step_converged']}
