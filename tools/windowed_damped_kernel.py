@@ -102,7 +102,7 @@ def mass(omega, lower=0., upper=W_CERT_RY):
     def primitive(w):
         return (np.arctan((w-a)/g)-np.arctan((w+a)/g))/np.pi
     value = np.sign(gamma)*(primitive(upper)-primitive(lower))
-    return np.where(gamma == 0, ((a > lower) & (a <= upper)).astype(float), value)
+    return np.where(gamma == 0, np.asarray((a > lower) & (a <= upper), float), value)
 
 
 def stieltjes_components(z, omega, lower=0., upper=W_CERT_RY, *, xp=np):
