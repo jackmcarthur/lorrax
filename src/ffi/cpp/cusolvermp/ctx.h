@@ -16,7 +16,7 @@
 #endif
 #include <cusolverMp.h>
 #include <cublasmp.h>
-#include <cublas_v2.h>
+#include <cublasLt.h>
 
 namespace lorrax_ffi::cusolvermp {
 
@@ -83,7 +83,7 @@ struct LorraxCusolverMpCtx {
     // Packed-q SUMMA resources. Appended to preserve the existing ctx prefix.
     ncclComm_t summa_row = nullptr;
     ncclComm_t summa_col = nullptr;
-    cublasHandle_t summa_blas = nullptr;
+    cublasLtHandle_t summa_blas = nullptr;
 };
 
 // Grow (d_workspace, h_workspace) if needed; keeps largest allocation.
