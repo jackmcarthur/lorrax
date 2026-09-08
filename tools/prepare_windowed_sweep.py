@@ -213,6 +213,8 @@ def main():
             begin=owner.index('    view_bounds = {')
             end=owner.index('    view_selected = ',begin)
             owner=owner[:begin]+'    view_bounds = {label: (0, kmax) for label in ("low", "high", "full")}\n'+owner[end:]
+            owner=replace_once(owner, '        if label == "full":',
+                '        if lo == 0 and hi == kmax:')
             if not hermitian:
                 old='''        phase = phase * jnp.exp(1j * e_ref_b * tau)
         return distrib_la.matmul(left * phase[:, None, :], right_, mesh=mesh,
