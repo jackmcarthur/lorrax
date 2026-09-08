@@ -346,6 +346,10 @@ void destroy_context(int64_t ctx_handle) {
     if (ctx_handle == 0) return;
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
 
+    if (ctx->summa_blas) cublasDestroy(ctx->summa_blas);
+    if (ctx->summa_row) ncclCommDestroy(ctx->summa_row);
+    if (ctx->summa_col) ncclCommDestroy(ctx->summa_col);
+
     // cuBLASMp first (it shares the CAL comm with cuSOLVERMp — tear down
     // the client handles before we destroy the comm underneath them).
     if (ctx->cublasmp_grid)   { cublasMpGridDestroy(ctx->cublasmp_grid);     ctx->cublasmp_grid = nullptr; }
