@@ -89,8 +89,7 @@ static ffi::Error BatchedGemmImpl(
             ctx->rank % ctx->q, &ctx->summa_row, nullptr), ncclSuccess, "NCCL row split");
         LORRAX_LIB_CHECK(ncclCommSplit(ctx->nccl_comm, ctx->rank % ctx->q,
             ctx->rank / ctx->q, &ctx->summa_col, nullptr), ncclSuccess, "NCCL col split");
-        LORRAX_LIB_CHECK(cublasCreate(&ctx->summa_blas), CUBLAS_STATUS_SUCCESS, "cuBLAS create");
-        LORRAX_LIB_CHECK(cublasSetStream(ctx->summa_blas, ctx->stream), CUBLAS_STATUS_SUCCESS, "cuBLAS stream");
+        LORRAX_LIB_CHECK(cublasLtCreate(&ctx->summa_blas), CUBLAS_STATUS_SUCCESS, "cuBLAS create");
         if (ctx->rank == 0) {
             std::fprintf(stderr, "[lorrax packed-q SUMMA] service prototype: "
                 "all-q panel broadcasts, strided batched local GEMMs; existing face ABI\n");
@@ -115,6 +114,35 @@ static ffi::Error BatchedGemmImpl(
         LORRAX_CUDA_CHECK(cudaMemcpyAsync(d_C_out, d_C_in,
             nq * c_stride * sizeof(T), cudaMemcpyDeviceToDevice, ctx->stream));
     }
+    // Use the Lt kernel family underlying cuBLASMp; retain a batch stride
+    // instead of asking the legacy BLAS API to choose a batched algorithm.
+    cublasLtMatmulDesc_t desc = nullptr;
+    cublasLtMatrixLayout_t ad = nullptr, bd = nullptr, cd = nullptr;
+    cublasLtMatmulPreference_t pref = nullptr;
+    LORRAX_LIB_CHECK(cublasLtMatmulDescCreate(&desc,
+        mp::ComputeTypeOf<T>::value, mp::CudaDataTypeOf<T>::value), CUBLAS_STATUS_SUCCESS, "Lt desc");
+    LORRAX_LIB_CHECK(cublasLtMatrixLayoutCreate(&ad, mp::CudaDataTypeOf<T>::value,
+        mb_a, nb_a, lld_A), CUBLAS_STATUS_SUCCESS, "Lt A layout");
+    LORRAX_LIB_CHECK(cublasLtMatrixLayoutCreate(&bd, mp::CudaDataTypeOf<T>::value,
+        mb_b, nb_b, lld_B), CUBLAS_STATUS_SUCCESS, "Lt B layout");
+    LORRAX_LIB_CHECK(cublasLtMatrixLayoutCreate(&cd, mp::CudaDataTypeOf<T>::value,
+        mb_c, nb_c, lld_C), CUBLAS_STATUS_SUCCESS, "Lt C layout");
+    const int batches = static_cast<int>(nq);
+    cublasLtMatrixLayout_t layouts[] = {ad, bd, cd};
+    const int64_t strides[] = {a_stride, b_stride, c_stride};
+    for (int i = 0; i < 3; ++i) {
+        LORRAX_LIB_CHECK(cublasLtMatrixLayoutSetAttribute(layouts[i],
+            CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batches, sizeof(batches)), CUBLAS_STATUS_SUCCESS, "Lt batch");
+        LORRAX_LIB_CHECK(cublasLtMatrixLayoutSetAttribute(layouts[i],
+            CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strides[i], sizeof(strides[i])), CUBLAS_STATUS_SUCCESS, "Lt stride");
+    }
+    LORRAX_LIB_CHECK(cublasLtMatmulPreferenceCreate(&pref), CUBLAS_STATUS_SUCCESS, "Lt preference");
+    cublasLtMatmulHeuristicResult_t choice{};
+    int choices = 0;
+    LORRAX_LIB_CHECK(cublasLtMatmulAlgoGetHeuristic(ctx->summa_blas, desc,
+        ad, bd, cd, cd, pref, 1, &choice, &choices), CUBLAS_STATUS_SUCCESS, "Lt heuristic");
+    if (choices != 1) return ffi::Error(ffi::ErrorCode::kUnimplemented,
+        "packed-q SUMMA: no zero-workspace strided Lt algorithm");
     const T one = T(1);
     for (int s = 0; s < ctx->p; ++s) {
         // NCCL broadcasts copy bytes only; no floating-point reduction.
@@ -128,14 +156,16 @@ static ffi::Error BatchedGemmImpl(
         LORRAX_LIB_CHECK(b_status, ncclSuccess, "NCCL B broadcast");
         LORRAX_LIB_CHECK(end_status, ncclSuccess, "NCCL group end");
         const T* panel_beta = s == 0 ? &beta : &one;
-        LORRAX_LIB_CHECK(cublasGemmStridedBatchedEx(ctx->summa_blas,
-            CUBLAS_OP_N, CUBLAS_OP_N, mb_c, nb_c, nb_a,
-            &alpha, a_panel, mp::CudaDataTypeOf<T>::value, lld_A, a_stride,
-            b_panel, mp::CudaDataTypeOf<T>::value, lld_B, b_stride,
-            panel_beta, d_C_out, mp::CudaDataTypeOf<T>::value, lld_C, c_stride,
-            nq, mp::ComputeTypeOf<T>::value, CUBLAS_GEMM_DEFAULT),
-            CUBLAS_STATUS_SUCCESS, "packed-q local GEMM");
+        LORRAX_LIB_CHECK(cublasLtMatmul(ctx->summa_blas, desc, &alpha,
+            a_panel, ad, b_panel, bd, panel_beta, d_C_out, cd, d_C_out, cd,
+            &choice.algo, nullptr, 0, ctx->stream), CUBLAS_STATUS_SUCCESS, "packed-q Lt GEMM");
     }
+    cublasLtMatmulPreferenceDestroy(pref);
+    cublasLtMatrixLayoutDestroy(ad);
+    cublasLtMatrixLayoutDestroy(bd);
+    cublasLtMatrixLayoutDestroy(cd);
+    cublasLtMatmulDescDestroy(desc);
+
     FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
         xla_stream, ctx->stream, ctx->ev_ctx_out));
     return ffi::Error::Success();

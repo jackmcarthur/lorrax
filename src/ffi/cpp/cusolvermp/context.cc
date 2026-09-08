@@ -346,7 +346,7 @@ void destroy_context(int64_t ctx_handle) {
     if (ctx_handle == 0) return;
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
 
-    if (ctx->summa_blas) cublasDestroy(ctx->summa_blas);
+    if (ctx->summa_blas) cublasLtDestroy(ctx->summa_blas);
     if (ctx->summa_row) ncclCommDestroy(ctx->summa_row);
     if (ctx->summa_col) ncclCommDestroy(ctx->summa_col);
 
