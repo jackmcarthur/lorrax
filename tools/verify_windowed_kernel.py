@@ -70,12 +70,31 @@ def main():
                     error += abs(e)
                 exact = complex(math.fsum(v.real for v in pieces),
                                 math.fsum(v.imag for v in pieces))
+                reference_method = 'scipy adaptive half-cycle cells'
+                if error/max(abs(exact), 1e-300) >= 1e-9:
+                    # Severe cancellation can exhaust double-precision
+                    # quadrature even after resolving each oscillation.
+                    # Check two independent precision/degree refinements;
+                    # do not lower the requested relative gate.
+                    import mpmath as mp
+                    refined = []
+                    for precision, degree in ((35, 5), (50, 6)):
+                        with mp.workdps(precision):
+                            aa, gg = mp.mpf(omega.real), mp.mpf(-omega.imag)
+                            tt = mp.mpc(t.real,t.imag)
+                            def integrand(w):
+                                return (4*gg*aa*w/(mp.pi*((w-aa)**2+gg*gg)
+                                        *((w+aa)**2+gg*gg))*mp.exp(-1j*w*tt))
+                            refined.append(complex(mp.quadgl(integrand,split,maxdegree=degree)))
+                    exact = refined[-1]
+                    error = abs(refined[1]-refined[0])
+                    reference_method = 'mpmath35/50digits Gauss-Legendre degree5/6 half-cycle cells'
                 relative = abs(values[i]-exact)/max(abs(exact), 1e-300)
                 assert error/max(abs(exact), 1e-300) < 1e-9, (name, slot, error, exact)
                 records.append(dict(center_ev=center_ev,gamma_ev=gamma_ev,window=name,
                     node=slot,time=[t.real,t.imag],relative_error=float(relative),
                     exact=[exact.real,exact.imag],e1=[values[i].real,values[i].imag],
-                    quad_error_estimate=float(error)))
+                    quad_error_estimate=float(error),reference_method=reference_method))
     worst = max(x['relative_error'] for x in records)
     assert worst < 1e-8, worst
     scalar_rows = []
