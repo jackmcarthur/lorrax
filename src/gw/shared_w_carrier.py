@@ -5,6 +5,7 @@ It changes their lifetime, not the pole sum or the local GEMM contraction.
 The caller explicitly selects this carrier and announces the selection.
 """
 from functools import partial
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -36,6 +37,10 @@ def shared_w_carrier(mesh, nq):
         Poles and masks are small replicated arrays, sliced locally by q.
     """
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    if jax.process_index() == 0:
+        print('ANNOUNCED OPT-IN shared W carrier: immutable factors '
+              'distributed over q once per window; local pole phases; '
+              'existing staged output exchanges', file=sys.stderr, flush=True)
     pad = (-nq) % (px * py)
     face = P(None, 'x', 'y')
     batch = P(('x', 'y'), None, None)
