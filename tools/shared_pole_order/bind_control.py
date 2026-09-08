@@ -13,7 +13,7 @@ OWNER=RUN.parent/'289_na_rpa_reduction_sigma_20260906/prepare_sigma.py'
 assert hashlib.sha256(OWNER.read_bytes()).hexdigest()=='e3342e3718de59f47880c8e72776d8ea6c57e43c90c864e28098735e5a14cd2a'
 text=OWNER.read_text()
 extra=[f'tools/shared_pole_order/{name}.py' for name in
-       ('balance','weight','check_gramians','reductions','norm_controls','bind_control','positive_real_audit','validate_models','full_roundtrip','thresholds','local_gauss')]
+       ('balance','weight','check_gramians','reductions','norm_controls','bind_control','positive_real_audit','validate_models','full_roundtrip','thresholds','local_gauss','shifted_bt','check_shifted')]
 for old,new in (
     ('RUN=Path(__file__).resolve().parent',f'RUN=Path({str(RUN)!r})'),
     ("SOURCE=Path('/global/u2/j/jackm/wt_ff_psiirr_20260905')",f'SOURCE=Path({str(W)!r})'),

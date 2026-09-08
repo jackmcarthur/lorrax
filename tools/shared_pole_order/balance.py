@@ -24,6 +24,28 @@ def sha(p):
 def write(p, data):
     p.write_text(json.dumps(data, indent=2, allow_nan=False)+'\n')
 
+def weighted_resolvent_integral(a, grid, values):
+    """Integrate tabulated piecewise-linear w/(i omega-a) exactly.
+
+    Parameters
+    ----------
+    a : jax.Array, (d,)
+        Stable states in Ry on one GPU.
+    grid, values : jax.Array, (m,)
+        Ordered real frequencies in Ry and scalar weights in Ry^-2.
+        Linear interpolation inside each cell; zero outside the grid.
+    """
+    import jax.numpy as jnp
+    dx=jnp.diff(grid)
+    slope=jnp.diff(values)/dx
+    parts=[]
+    for start in range(0,len(a),128):
+        u0=1j*grid[:-1][None,:]-a[start:start+128,None]
+        u1=1j*grid[1:][None,:]-a[start:start+128,None]
+        piece=-1j*slope[None,:]*dx[None,:]+(-1j*values[:-1][None,:]+slope[None,:]*u0)*(jnp.log(u1)-jnp.log(u0))
+        parts.append(jnp.sum(piece,axis=1)/(2*jnp.pi))
+    return jnp.concatenate(parts)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', required=True, type=Path)
@@ -69,8 +91,7 @@ def main():
         with np.load(args.weight) as f:
             om = f['omega_ry']; w = f['weight_ry_minus2']
         grid = np.r_[-om[:0:-1], om]
-        weights = np.r_[w[:0:-1], w] * (om[1]-om[0]) / (2*np.pi)
-        weights[[0,-1]] *= .5
+        weights = np.r_[w[:0:-1], w]
         gweight = (jnp.asarray(grid), jnp.asarray(weights))
     for q in args.q:
         out = args.out/f'q{q:02d}'
@@ -80,7 +101,7 @@ def main():
                        jobid=os.environ['SLURM_JOB_ID'], stepid=os.getenv('SLURM_STEP_ID'),
                        model_path=model['path'], model_sha256=model['sha256'],
                        script_sha256=sha(__file__), weight='unweighted' if args.weight is None else str(args.weight),
-                       eta_ev=.25, status='STARTED',
+                       eta_ev=.25, realization_shift_ev=ETA*EV, weight_integral='piecewise-linear analytic cells' if args.weight else 'closed-form unweighted', status='STARTED',
                        parent_freeze=None if args.parent_freeze is None else dict(path=str(args.parent_freeze),sha256=sha(args.parent_freeze)))
         write(out/'receipt.json', receipt)
         print(json.dumps(receipt), flush=True)
@@ -113,10 +134,7 @@ def main():
             # Partial fractions avoid the [state,state,frequency] tensor exactly:
             # 1/(xy)=(1/x+1/y)/(x+y), x+y=-a_i-conj(a_j).
             grid, weights = gweight
-            gs = []
-            for start in range(0, len(a), 128):
-                gs.append(jnp.sum(weights[None,:]/(1j*grid[None,:]-a[start:start+128,None]), axis=1))
-            g = jnp.concatenate(gs)
+            g = weighted_resolvent_integral(a, grid, weights)
             kernel = kernel*(g[:,None]+g.conj()[None,:])
         gram_b = B@adj(B)
         gram_c = adj(C)@C

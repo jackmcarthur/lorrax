@@ -32,6 +32,8 @@ def reduce_models(a, B, C, balancing, context):
     lp,lq,u,h,vh = balancing
     out,receipt,z = context['out'],context['receipt'],context['z']
     factor,om = context['factor'],context['omega']
+    shift=context.get('shift_ry',ETA)
+    floor_damping=context.get('floor_damping',False)
     adj=lambda x:x.conj().T
     relative=lambda x,y:float(jnp.linalg.norm(x-y)/jnp.linalg.norm(y))
     def exact(zi):
@@ -43,7 +45,7 @@ def reduce_models(a, B, C, balancing, context):
     lqb=adj(lq)@B
     ctv=clp@adj(vh)
     returned=((ctv/h[None,:])@adj(u))@adj(lq)
-    full_errors=[relative((returned/(-1j*zi-ETA-a)[None,:])@B,exact(zi)) for zi in z]
+    full_errors=[relative((returned/(-1j*zi-shift-a)[None,:])@B,exact(zi)) for zi in z]
     receipt['full_balancing_W16_roundtrip_max']=max(full_errors)
     (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
     if max(full_errors)>1e-10:
@@ -61,6 +63,7 @@ def reduce_models(a, B, C, balancing, context):
     targets=[(f'eps{eps:.0e}',int(np.count_nonzero(np.asarray(h)>eps*float(h[0]))),None,eps)
              for eps in (1e-2,1e-3,1e-4)]
     targets += [(f'K{k}',2*k,k,None) for k in (224,448,896) if 2*k<=len(a)]
+    targets=context.get('targets',targets)
     for label,d,budget,epsilon in targets:
         started=time.monotonic()
         invsqrt=1/jnp.sqrt(h[:d])
@@ -70,10 +73,9 @@ def reduce_models(a, B, C, balancing, context):
         Br=invsqrt[:,None]*(adj(u[:,:d])@lqb)
         Cr=ctv[:,:d]*invsqrt[None,:]
         identity=float(jnp.linalg.norm(Ti@T-jnp.eye(d))/np.sqrt(d))
-        errors=[relative(Cr@jnp.linalg.solve((-1j*zi-ETA)*jnp.eye(d)-Ar,Br),exact(zi)) for zi in z]
-        # At nu=eta, s=nu-eta=0. General complex residues require the matrix
-        # check, beyond EVAL's current Hermitian-factor-only interface.
-        response=-Cr@jnp.linalg.solve(-Ar,Br)
+        errors=[relative(Cr@jnp.linalg.solve((-1j*zi-shift)*jnp.eye(d)-Ar,Br),exact(zi)) for zi in z]
+        # At nu=eta, s=nu-shift. Check the assembled general-residue matrix.
+        response=-Cr@jnp.linalg.solve((.25/EV-shift)*jnp.eye(d)-Ar,Br)
         x=whiten@response@adj(whiten)
         anti=float(jnp.linalg.norm(x-adj(x))/max(float(jnp.linalg.norm(x)),1e-300))
         vals=jnp.linalg.eigvalsh((x+adj(x))/2)
@@ -86,15 +88,39 @@ def reduce_models(a, B, C, balancing, context):
         ar,vr=scipy.linalg.eig(ah)
         left=ch@vr
         right=scipy.linalg.solve(vr,bh)
-        physical=1j*(ar+ETA)
+        physical=1j*(ar+shift)
         positive=physical.real>1e-10
         modal_errors=[]
         for zi in z:
             wm=(left/(zi-physical)[None,:])@(1j*right)
-            direct=ch@scipy.linalg.solve((-1j*zi-ETA)*np.eye(d)-ah,bh)
+            direct=ch@scipy.linalg.solve((-1j*zi-shift)*np.eye(d)-ah,bh)
             modal_errors.append(np.linalg.norm(wm-direct)/np.linalg.norm(direct))
         if max(modal_errors)>1e-8:
             raise RuntimeError('Modal conversion lost reduced W')
+        floor_receipt=None
+        if floor_damping:
+            original=physical.copy()
+            # Explicit coordinator perturbation, never hidden as roundoff.
+            eligible=(physical.imag>0)&(physical.imag<=shift+1e-4/EV)
+            physical[eligible]=physical[eligible].real+0j
+            floor_change=[];floor_parent=[]
+            for zi in z:
+                before=(left/(zi-original)[None,:])@(1j*right)
+                after=(left/(zi-physical)[None,:])@(1j*right)
+                floor_change.append(float(np.linalg.norm(after-before)/np.linalg.norm(before)))
+                floor_parent.append(relative(jnp.asarray(after),exact(zi)))
+            response=-jnp.asarray((left/(.25j/EV-physical)[None,:])@(1j*right))
+            x=whiten@response@adj(whiten)
+            vals=jnp.linalg.eigvalsh((x+adj(x))/2)
+            anti=float(jnp.linalg.norm(x-adj(x))/max(float(jnp.linalg.norm(x)),1e-300))
+            passivity=dict(min_eigenvalue=float(vals[0]),max_eigenvalue=float(vals[-1]),relative_antihermitian=anti,
+                           resolved_rank=len(active),status='PASS' if float(vals[0])>=-1e-3 and float(vals[-1])<=1+1e-3 and anti<=1e-8 else 'FAIL',
+                           coulomb_sha256=owner.COULOMB_SHA,nu_ev=.25,tolerance=1e-3)
+            floor_receipt=dict(count=int(np.sum(eligible)),minimum_gamma_before_ev=float(-original.imag.max()*EV),
+                               count_beyond_shift_margin=int(np.sum(original.imag>shift+1e-4/EV)),
+                               W16_change_relative_to_unfloored=floor_change,W16_parent_relative_after_floor=floor_parent,
+                               policy='Coordinator explicitly requested zero physical damping floor; unchanged eta=.25eV')
+            np.savez(out/f'{label}_unfloored_model.npz',poles_ry=original,residue_left=left,residue_right=1j*right,q_parent=np.int32(receipt['q_full_row']))
         path=out/f'{label}_model.npz'
         # W(z)=sum L[:,p] R[p,:]/(z-pole[p]); no implicit conjugation.
         np.savez(path,poles_ry=physical,residue_left=left,residue_right=1j*right,
@@ -113,7 +139,8 @@ def reduce_models(a, B, C, balancing, context):
                   storage_bytes=int(physical.nbytes+left.nbytes+right.nbytes),
                   passivity=passivity,elapsed_seconds=time.monotonic()-started,
                   export_convention='W(z)=L diag(1/(z-poles_ry)) R; all signed poles, no conjugation of R',
-                  weight=receipt['weight'],
+                  weight=receipt['weight'],realization_shift_ev=shift*EV,floor=floor_receipt,
+                  star_tail_target=context.get('target_metadata',{}).get(label),
                   admissibility='REFUSED_PHYSICAL_UPPER_HALF_PLANE' if np.any(physical.imag>1e-10) else ('PASS_POINT_AND_POLES' if passivity['status']=='PASS' else 'REFUSED_POINT_PASSIVITY'))
         (out/f'{label}_receipt.json').write_text(json.dumps(info,indent=2)+'\n')
         print(json.dumps(info),flush=True)
