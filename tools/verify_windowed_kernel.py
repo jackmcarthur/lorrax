@@ -3,6 +3,7 @@ from pathlib import Path
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 
@@ -54,16 +55,23 @@ def main():
             values, dispersive = fourier_components(np.array([x[2] for x in times]), omega)
             for i in indices:
                 name, slot, t = times[i]
-                split = sorted(set([0., min(W_CERT_RY, 1/max(1., abs(t))),
-                                    omega.real, W_CERT_RY]))
-                exact = 0j
+                # Bound each adaptive cell to half an oscillation. This
+                # avoids a global subdivision ceiling and resolves tiny
+                # transforms without a fixed absolute-error floor.
+                count = max(1, int(np.ceil(W_CERT_RY*abs(t.real)/np.pi)))
+                split = sorted(set(np.linspace(0., W_CERT_RY, count+1).tolist()
+                    + [min(W_CERT_RY, 1/max(1., abs(t))), omega.real]))
+                pieces = []
                 error = 0.
                 for lo, hi in zip(split[:-1], split[1:]):
                     v,e = quad(lambda w: spectral_density(w, omega)*np.exp(-1j*w*t),
-                        lo,hi,complex_func=True,epsabs=1e-18,epsrel=2e-12,limit=500)
-                    exact += v
+                        lo,hi,complex_func=True,epsabs=1e-28,epsrel=2e-13,limit=100)
+                    pieces.append(v)
                     error += abs(e)
+                exact = complex(math.fsum(v.real for v in pieces),
+                                math.fsum(v.imag for v in pieces))
                 relative = abs(values[i]-exact)/max(abs(exact), 1e-300)
+                assert error/max(abs(exact), 1e-300) < 1e-9, (name, slot, error, exact)
                 records.append(dict(center_ev=center_ev,gamma_ev=gamma_ev,window=name,
                     node=slot,time=[t.real,t.imag],relative_error=float(relative),
                     exact=[exact.real,exact.imag],e1=[values[i].real,values[i].imag],
