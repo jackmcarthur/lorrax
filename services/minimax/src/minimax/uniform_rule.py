@@ -121,7 +121,8 @@ def box_samples(re_lo, re_hi, im_lo, im_hi, per_unit=5.0, n_im=6, near=30.0):
     levels are smoother and get coarser lines, but never coarser than
     ``4 im_lo / per_unit``: on a rotated ray the fast oscillation is set by
     the ray's own frequency, not by the level's ``Im d``.  The fit cloud uses
-    the defaults; acceptance uses ``per_unit = 8`` and twice the levels."""
+    the defaults; acceptance uses ``per_unit = 10`` and at least 48 levels
+    (or twice the fit levels, whichever is larger)."""
     im = np.geomspace(im_lo, max(im_hi, im_lo * 1.0001), n_im)
     out = []
     for v in im:
