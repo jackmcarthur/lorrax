@@ -608,6 +608,8 @@ if(LORRAX_FFI_HAVE_CUBLASMP)
         cublasmp/batched_gemm_ffi.cc
         cublasmp/batched_w_solve_ffi.cc
         cublasmp/w_solve_kernels.cu
+        common/contour_accumulate.cu
+        common/contour_accumulate_ffi.cc
     )
 endif()
 if(LORRAX_CUFFT_ON)
