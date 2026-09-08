@@ -1,6 +1,5 @@
-// batched_gemm_ffi.cc — per-q distributed GEMM via cuBLASMp on the
-// world-wide (Px, Py) grid.  Mirrors the cuSOLVERMp batched_potrf/potrs
-// pattern: descriptors built once per FFI call, inner loop over q.
+// batched_gemm_ffi.cc — packed-q SUMMA behind the existing distributed
+// GEMM ABI. Broadcast all q panels together; keep the original face layout.
 //
 // Computes: C[q] = alpha * op(A[q]) * op(B[q]) + beta * C[q]
 // where op = 'N' / 'T' / 'C' per the transa, transb attrs.
@@ -72,127 +71,71 @@ static ffi::Error BatchedGemmImpl(
     LorraxCusolverMpCtx* ctx,
     const T* d_A, const T* d_B, const T* d_C_in, T* d_C_out)
 {
-    ensure_cublasmp(ctx);
-
-    FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
-        ctx->stream, xla_stream, ctx->ev_xla_in));
-
-    // Local per-rank slice sizes (full tile, one block per rank under our
-    // sharding convention).
-    const int Px = ctx->p;
-    const int Py = ctx->q;
-    const int64_t A_local_cols = (opA == CUBLAS_OP_N ? k : m + Py - 1) / Py;
-    const int64_t B_local_cols = (opB == CUBLAS_OP_N ? n : k + Py - 1) / Py;
-    const int64_t C_local_cols = (n + Py - 1) / Py;
-    // Slices are nq-stacked.  Size per slice = lld * local_cols.
-    // These are ROW counts * COL counts in the col-major view.
-    const int64_t A_slice = lld_A * A_local_cols;
-    const int64_t B_slice = lld_B * B_local_cols;
-    const int64_t C_slice = lld_C * C_local_cols;
-
-    // If caller didn't alias C_out to C_in, memcpy so beta*C semantics
-    // use the correct input.  With aliasing, FFI is fully in-place.
-    if (d_C_out != static_cast<const T*>(d_C_in)) {
-        LORRAX_CUDA_CHECK(cudaMemcpyAsync(
-            d_C_out, d_C_in,
-            nq * C_slice * sizeof(T),
-            cudaMemcpyDeviceToDevice, ctx->stream));
+    // C[q] = alpha sum_s A[q,:,s] B[q,s,:] + beta C[q].
+    // One complete face tile per rank; panel s belongs to column s for A,
+    // row s for B. Pack all q in each broadcast (already contiguous in the
+    // FFI's col-major, q-stacked input), then perform one strided batch.
+    if (opA != CUBLAS_OP_N || opB != CUBLAS_OP_N || ctx->p != ctx->q
+        || ctx->grid_layout_col_major || m % ctx->p || n % ctx->q
+        || k % ctx->p || mb_a != m / ctx->p || nb_a != k / ctx->q
+        || mb_b != k / ctx->p || nb_b != n / ctx->q
+        || mb_c != m / ctx->p || nb_c != n / ctx->q
+        || lld_A != mb_a || lld_B != mb_b || lld_C != mb_c) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+            "packed-q SUMMA requires N,N square row-major mesh and exact faces");
     }
-
-    cublasMpMatrixDescriptor_t descA = nullptr, descB = nullptr, descC = nullptr;
-    const int64_t A_rows = (opA == CUBLAS_OP_N) ? m : k;
-    const int64_t A_cols = (opA == CUBLAS_OP_N) ? k : m;
-    const int64_t B_rows = (opB == CUBLAS_OP_N) ? k : n;
-    const int64_t B_cols = (opB == CUBLAS_OP_N) ? n : k;
-    (void)A_rows; (void)A_cols; (void)B_rows; (void)B_cols;
-
-    LORRAX_CUBLASMP_CHECK(
-        cublasMpMatrixDescriptorCreate(
-            A_rows, A_cols, mb_a, nb_a, 0, 0, lld_A,
-            mp::CudaDataTypeOf<T>::value, ctx->cublasmp_grid, &descA),
-        "cublasMpMatrixDescriptorCreate(A)");
-    LORRAX_CUBLASMP_CHECK(
-        cublasMpMatrixDescriptorCreate(
-            B_rows, B_cols, mb_b, nb_b, 0, 0, lld_B,
-            mp::CudaDataTypeOf<T>::value, ctx->cublasmp_grid, &descB),
-        "cublasMpMatrixDescriptorCreate(B)");
-    LORRAX_CUBLASMP_CHECK(
-        cublasMpMatrixDescriptorCreate(
-            m, n, mb_c, nb_c, 0, 0, lld_C,
-            mp::CudaDataTypeOf<T>::value, ctx->cublasmp_grid, &descC),
-        "cublasMpMatrixDescriptorCreate(C)");
-
-    // Matmul descriptor carries transA/transB + compute type.
-    cublasMpMatmulDescriptor_t matmulDesc = nullptr;
-    LORRAX_CUBLASMP_CHECK(
-        cublasMpMatmulDescriptorCreate(&matmulDesc, mp::ComputeTypeOf<T>::value),
-        "cublasMpMatmulDescriptorCreate");
-    LORRAX_CUBLASMP_CHECK(
-        lorrax_ffi::cublasmp::set_matmul_descriptor_attribute(
-            matmulDesc, CUBLASMP_MATMUL_DESCRIPTOR_ATTRIBUTE_TRANSA,
-            &opA, sizeof(opA)),
-        "cublasMpMatmulDescriptorAttributeSet(TRANSA)");
-    LORRAX_CUBLASMP_CHECK(
-        lorrax_ffi::cublasmp::set_matmul_descriptor_attribute(
-            matmulDesc, CUBLASMP_MATMUL_DESCRIPTOR_ATTRIBUTE_TRANSB,
-            &opB, sizeof(opB)),
-        "cublasMpMatmulDescriptorAttributeSet(TRANSB)");
-
-    auto cleanup = [&]() {
-        cublasMpMatmulDescriptorDestroy(matmulDesc);
-        cublasMpMatrixDescriptorDestroy(descA);
-        cublasMpMatrixDescriptorDestroy(descB);
-        cublasMpMatrixDescriptorDestroy(descC);
-    };
-
-    // Size workspace using the first slice's pointers; reuse for all q.
-    size_t d_ws = 0, h_ws = 0;
-    cublasMpStatus_t mp_st = mp::MatmulBufferSize<T>(
-        ctx->cublasmp_handle, matmulDesc, m, n, k,
-        &alpha,
-        d_A,     1, 1, descA,
-        d_B,     1, 1, descB,
-        &beta,
-        d_C_out, 1, 1, descC,
-        d_C_out, 1, 1, descC,
-        &d_ws, &h_ws);
-    if (mp_st != CUBLASMP_STATUS_SUCCESS) {
-        cleanup();
-        std::ostringstream os;
-        os << "cublasMpMatmul_bufferSize failed: status=" << (int)mp_st;
-        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
-    }
-    try {
-        ensure_workspace(ctx, d_ws, h_ws);
-    } catch (const std::exception& ex) {
-        cleanup();
-        return ffi::Error(ffi::ErrorCode::kResourceExhausted, ex.what());
-    }
-
-    for (int64_t q = 0; q < nq; ++q) {
-        const T* A_q = d_A     + q * A_slice;
-        const T* B_q = d_B     + q * B_slice;
-        T*       C_q = d_C_out + q * C_slice;
-        mp_st = mp::Matmul<T>(
-            ctx->cublasmp_handle, matmulDesc, m, n, k,
-            &alpha,
-            A_q, 1, 1, descA,
-            B_q, 1, 1, descB,
-            &beta,
-            C_q, 1, 1, descC,
-            C_q, 1, 1, descC,
-            ctx->d_workspace, ctx->d_workspace_bytes,
-            ctx->h_workspace, ctx->h_workspace_bytes);
-        if (mp_st != CUBLASMP_STATUS_SUCCESS) {
-            cleanup();
-            std::ostringstream os;
-            os << "cublasMpMatmul (q=" << q << ") failed: status=" << (int)mp_st;
-            return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+    if (!ctx->summa_blas) {
+        LORRAX_LIB_CHECK(ncclCommSplit(ctx->nccl_comm, ctx->rank / ctx->q,
+            ctx->rank % ctx->q, &ctx->summa_row, nullptr), ncclSuccess, "NCCL row split");
+        LORRAX_LIB_CHECK(ncclCommSplit(ctx->nccl_comm, ctx->rank % ctx->q,
+            ctx->rank / ctx->q, &ctx->summa_col, nullptr), ncclSuccess, "NCCL col split");
+        LORRAX_LIB_CHECK(cublasCreate(&ctx->summa_blas), CUBLAS_STATUS_SUCCESS, "cuBLAS create");
+        LORRAX_LIB_CHECK(cublasSetStream(ctx->summa_blas, ctx->stream), CUBLAS_STATUS_SUCCESS, "cuBLAS stream");
+        if (ctx->rank == 0) {
+            std::fprintf(stderr, "[lorrax packed-q SUMMA] service prototype: "
+                "all-q panel broadcasts, strided batched local GEMMs; existing face ABI\n");
+            std::fflush(stderr);
         }
     }
-
-    cleanup();
-
+    FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
+        ctx->stream, xla_stream, ctx->ev_xla_in));
+    const int64_t a_stride = mb_a * nb_a;
+    const int64_t b_stride = mb_b * nb_b;
+    const int64_t c_stride = mb_c * nb_c;
+    const size_t a_bytes = nq * a_stride * sizeof(T);
+    const size_t b_bytes = nq * b_stride * sizeof(T);
+    try {
+        ensure_workspace(ctx, a_bytes + b_bytes, 0);
+    } catch (const std::exception& ex) {
+        return ffi::Error(ffi::ErrorCode::kResourceExhausted, ex.what());
+    }
+    T* a_panel = static_cast<T*>(ctx->d_workspace);
+    T* b_panel = a_panel + nq * a_stride;
+    if (d_C_out != d_C_in) {
+        LORRAX_CUDA_CHECK(cudaMemcpyAsync(d_C_out, d_C_in,
+            nq * c_stride * sizeof(T), cudaMemcpyDeviceToDevice, ctx->stream));
+    }
+    const T one = T(1);
+    for (int s = 0; s < ctx->p; ++s) {
+        // NCCL broadcasts copy bytes only; no floating-point reduction.
+        LORRAX_LIB_CHECK(ncclGroupStart(), ncclSuccess, "NCCL group start");
+        const auto a_status = ncclBroadcast(d_A, a_panel, a_bytes,
+            ncclUint8, s, ctx->summa_row, ctx->stream);
+        const auto b_status = ncclBroadcast(d_B, b_panel, b_bytes,
+            ncclUint8, s, ctx->summa_col, ctx->stream);
+        const auto end_status = ncclGroupEnd();
+        LORRAX_LIB_CHECK(a_status, ncclSuccess, "NCCL A broadcast");
+        LORRAX_LIB_CHECK(b_status, ncclSuccess, "NCCL B broadcast");
+        LORRAX_LIB_CHECK(end_status, ncclSuccess, "NCCL group end");
+        const T* panel_beta = s == 0 ? &beta : &one;
+        LORRAX_LIB_CHECK(cublasGemmStridedBatchedEx(ctx->summa_blas,
+            CUBLAS_OP_N, CUBLAS_OP_N, mb_c, nb_c, nb_a,
+            &alpha, a_panel, mp::CudaDataTypeOf<T>::value, lld_A, a_stride,
+            b_panel, mp::CudaDataTypeOf<T>::value, lld_B, b_stride,
+            panel_beta, d_C_out, mp::CudaDataTypeOf<T>::value, lld_C, c_stride,
+            nq, mp::ComputeTypeOf<T>::value, CUBLAS_GEMM_DEFAULT),
+            CUBLAS_STATUS_SUCCESS, "packed-q local GEMM");
+    }
     FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
         xla_stream, ctx->stream, ctx->ev_ctx_out));
     return ffi::Error::Success();
