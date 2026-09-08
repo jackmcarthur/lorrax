@@ -53,7 +53,19 @@ def main(out, data_banks=None, moment_bank=None, grouped_q0=False, group_trainin
     ntrain, nheld = len(z), len(zh)
     nall = ntrain+nheld
     nlow = sum(len(bank['z']) for bank in data_specs) if data_specs else 12
-    weights = banks.loss_weights(z)
+    derivative_scale = np.asarray(low['derivative_scale_ry'])
+    held_derivative_scale = np.asarray(low['held_derivative_scale_ry'])
+    hermite = bool(np.any(derivative_scale))
+    if grouped_q0 and hermite:
+        raise ValueError('Hermite grouping needs a separately frozen loading functional')
+    # Separate observation types avoid duplicate-node quadrature; equal type mass.
+    weights = np.zeros(len(z))
+    for derivative in (False,True):
+        rows = (derivative_scale>0) == derivative
+        if np.any(rows):
+            weights[rows] = banks.loss_weights(z[rows])/(2 if hermite else 1)
+    observation_arrays = dict(derivative_scale_ry=derivative_scale,
+        held_derivative_scale_ry=held_derivative_scale) if hermite else {}
     job = os.getenv('SLURM_JOB_ID')+'.'+os.getenv('SLURM_STEP_ID', '?')
     source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
     out.mkdir(parents=True, exist_ok=True)
@@ -220,6 +232,14 @@ def main(out, data_banks=None, moment_bank=None, grouped_q0=False, group_trainin
                       low_floor=0. if data_specs else 1e-14, broad_floor=0., scopes={},
                       ntrain=ntrain, nheld=nheld, low_source='DATA physical' if data_specs else 'Run216',
                       tail_source='Run300 A/B, unchanged unperturbed banks')
+        if hermite:
+            record.update(observation_contract='Yd=h_Ry*2*z_Ry*dWc/d(z_Ry^2); physical before H/A',
+                derivative_rows=int(np.count_nonzero(derivative_scale)),
+                training_value_points=int(np.count_nonzero(derivative_scale==0)),
+                held_value_points=int(np.count_nonzero(held_derivative_scale==0)),
+                distinct_training_value_points=len(np.unique(z[derivative_scale==0])),
+                weight='separate value/derivative quadratures; equal type mass; each type equal-height proxy',
+                fitting_budget_scope='measurement bank is not a <=40 fit; select <=40 value points downstream')
         if moment_bank is not None:
             record['moment_bank'] = str(moment_bank)
             record['moment_sha256'] = banks.sha(moment_bank)
@@ -228,6 +248,12 @@ def main(out, data_banks=None, moment_bank=None, grouped_q0=False, group_trainin
         if data_specs:
             groups += [(f'height_{height*banks.EV:.9f}_ev', np.flatnonzero(z.imag==height))
                        for height in np.unique(z.imag)]
+        if hermite:
+            # Low/tail/height census is value-only; combined includes both types.
+            groups = [(label,indices if label=='combined' else indices[derivative_scale[indices]==0])
+                      for label,indices in groups]
+            groups += [('derivative',np.flatnonzero(derivative_scale>0)),
+                       ('values',np.flatnonzero(derivative_scale==0))]
         for label, indices in groups:
             wi = np.sqrt(weights[indices])
             g = gw[np.ix_(indices,indices)]*wi[:,None]*wi[None,:]
@@ -244,7 +270,7 @@ def main(out, data_banks=None, moment_bank=None, grouped_q0=False, group_trainin
         if jax.process_index()==0:
             with (out/f'q{q:02d}.npz').open('xb') as stream:
                 np.savez(stream, z=z, zh=zh, weights=weights, complex_gram=gw,
-                         channel_gram=gc, physical_channel_gram=gp, sketches=sketches, **moment_arrays)
+                         channel_gram=gc, physical_channel_gram=gp, sketches=sketches, **moment_arrays, **observation_arrays)
             (out/f'q{q:02d}.json').write_text(json.dumps(record,indent=2))
         records.append(record)
         print(f'GRAM q{q:02d} complete {record["seconds"]:.3f}s ranks={record["scopes"]["combined"]["complex"]["rank_amplitude"]}',flush=True)

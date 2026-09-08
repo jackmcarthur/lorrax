@@ -47,8 +47,6 @@ def read_rowplan(path):
             any(type(index) is not int for index in indices) or
             len(set(indices)) != len(indices)):
         raise ValueError('Training rowplan must be a nonempty JSON list of unique integers')
-    if len(indices) > 40:
-        raise ValueError('Explicit training rowplan exceeds the 40-value fitting budget')
     return {'indices': indices, 'path': str(Path(path).resolve()),
             'sha256': hashlib.sha256(raw).hexdigest()}
 
@@ -59,13 +57,44 @@ def selected_rows(bank, rowplan):
     selected = np.arange(nt) if rowplan is None else np.asarray(rowplan['indices'], dtype=int)
     if np.any(selected < 0) or np.any(selected >= nt):
         raise ValueError(f'Training rowplan indices must lie in [0,{nt}); held rows are forbidden')
+    scales = observation_scales(bank)
+    value_rows = selected[scales[selected]==0]
+    if (rowplan is not None or np.any(scales)) and len(value_rows)>40:
+        raise ValueError('Training rowplan exceeds 40 value rows; derivative rows count separately')
+    for row in selected[scales[selected]>0]:
+        if np.count_nonzero(bank['z'][value_rows]==bank['z'][row]) != 1:
+            raise ValueError('Each selected derivative needs exactly one selected value twin')
     return selected
+
+
+def observation_scales(bank, held=False):
+    '''Validate explicit physical h_Ry markers; absent metadata means values.'''
+    grid = bank['zh' if held else 'z']
+    key = 'held_derivative_scale_ry' if held else 'derivative_scale_ry'
+    scales = np.asarray(bank.get(key,np.zeros(len(grid))),float)
+    if scales.shape!=grid.shape or not np.all(np.isfinite(scales)) or np.any(scales<0):
+        raise ValueError('Invalid observation derivative scales')
+    if np.any((scales>0)&(scales!=grid.imag)):
+        raise ValueError('Hermite scale must equal the sampled positive height in Ry')
+    return scales
+
+
+def value_count(bank, selected):
+    return int(np.count_nonzero(observation_scales(bank)[selected]==0))
 
 
 def fitting_weights(bank, selected, omega, weight, mode="equal_lines"):
     """Recompute quadrature on selected nodes; retain zero weights elsewhere."""
     loss = np.zeros(len(bank['z']))
-    loss[selected] = line_weights(bank['z'][selected], omega, weight, mode)
+    scales = observation_scales(bank)
+    values = selected[scales[selected]==0]
+    loss[values] = line_weights(bank['z'][values], omega, weight, mode)
+    # h*dW/dz has W units. Its twin inherits the same loss weight, no new dial.
+    for row in selected[scales[selected]>0]:
+        twin = values[bank['z'][values]==bank['z'][row]]
+        if len(twin)!=1:
+            raise ValueError('Derivative weights require one selected value twin')
+        loss[row] = loss[twin[0]]
     return loss
 
 
@@ -144,7 +173,7 @@ def write_json(path, data):
         stream.write('\n')
 
 
-def errors_from_gram(z_all, indices, row_map, poles, gram, weights):
+def errors_from_gram(z_all, indices, row_map, poles, gram, weights, derivative_scale_ry=None):
     """Relative Frobenius error from Tr(L G L^T), with no n-dependent arrays.
 
     L consists of real and imaginary prediction rows minus the corresponding
@@ -158,7 +187,8 @@ def errors_from_gram(z_all, indices, row_map, poles, gram, weights):
         raise ValueError('Residual row-map/Gram shape mismatch')
     source_rows = np.r_[np.arange(nt),np.arange(nt)+nall,np.arange(extra)+2*nall]
     selection = np.eye(2*nall+extra)[source_rows]
-    phi = varpro.basis(z_all[indices], poles)
+    scales = None if derivative_scale_ry is None else derivative_scale_ry[indices]
+    phi = varpro.basis(z_all[indices], poles, derivative_scale_ry=scales)
     evaluation_map = np.vstack((phi.real, phi.imag)) @ row_map
     prediction = evaluation_map @ selection
     reference = np.eye(2*nall+extra)[np.r_[indices, indices+nall]]
@@ -187,6 +217,7 @@ def line_errors(bank, fitted, omega, weight, selected=None):
     """Report each train/held height, in whitened and physical coordinates."""
     z_all = np.r_[bank['z'], bank['zh']]
     result = {}
+    scales = np.r_[observation_scales(bank),observation_scales(bank,held=True)]
     nt = len(bank['z'])
     constrained = fitted['row_map'].shape[1] == 2*nt+3
     coordinates = ([('white','moment_channel_gram'),('physical','physical_moment_channel_gram')]
@@ -195,16 +226,18 @@ def line_errors(bank, fitted, omega, weight, selected=None):
     omitted = np.setdiff1d(np.arange(nt), selected)
     for split, base in [('train', selected), ('validation_unselected_train', omitted),
                         ('held', np.arange(nt,len(z_all)))]:
-        for height in np.unique(np.round(z_all[base].imag * EV, 9)):
-            indices = base[np.round(z_all[base].imag * EV, 9) == height]
-            loss = line_weights(z_all[indices], omega, weight)
-            label = f'{split}_height_{height:.9f}_ev'
-            result[label] = {}
-            for coordinate, key in coordinates:
-                result[label][coordinate] = {
-                    mode: errors_from_gram(z_all, indices, fitted['row_map'], fitted['poles_ry'],
-                                           bank[key], selected)
-                    for mode, selected in [('uniform', np.ones(indices.size)), ('order_trapezoid', loss)]}
+        for derivative in (False,True):
+            rows = base[(scales[base]>0)==derivative]
+            for height in np.unique(np.round(z_all[rows].imag * EV, 9)):
+                indices = rows[np.round(z_all[rows].imag * EV, 9) == height]
+                loss = line_weights(z_all[indices], omega, weight)
+                label = f'{split}_height_{height:.9f}_ev' + ('_derivative' if derivative else '')
+                result[label] = {}
+                for coordinate, key in coordinates:
+                    result[label][coordinate] = {
+                        mode: errors_from_gram(z_all, indices, fitted['row_map'], fitted['poles_ry'],
+                                               bank[key], selected, scales)
+                        for mode, selected in [('uniform', np.ones(indices.size)), ('order_trapezoid', loss)]}
     return result
 
 
@@ -226,6 +259,8 @@ def load_gram(path, require_moments=False):
     for key, shape in shapes.items():
         if key not in bank or bank[key].shape != shape or not np.all(np.isfinite(bank[key])):
             raise ValueError(f'{path}: invalid {key}, expected finite shape {shape}')
+    observation_scales(bank)
+    observation_scales(bank,held=True)
     return bank
 
 
@@ -265,7 +300,7 @@ def rank_summary(gram_dir, out_dir, training_indices=None):
             sw = np.sqrt(loss[indices])
             scopes[name] = spectrum(bank['complex_gram'][np.ix_(indices, indices)] * sw[:,None] * sw[None,:])
         records.append({'q': q, 'input_path': str(path), 'input_sha256': sha(path), 'scopes': scopes,
-                        'values_used': len(selected), 'selected_training_indices': selected.tolist()})
+                        'values_used': value_count(bank,selected), 'selected_training_indices': selected.tolist()})
     out_dir.mkdir(parents=True, exist_ok=True)
     origin = provenance()
     origin['scope'] = 'All 29 q original V-whitened complex Gram, training only; no pole fit or residue-rank claim'
@@ -337,7 +372,9 @@ def warm_start(directory, q, p, bank, loss, selected=None, moment_constrained=Fa
     with np.load(path, allow_pickle=False) as old:
         old_selected = (old['selected_training_indices'] if 'selected_training_indices' in old.files
                         else np.arange(len(old['z_train_ry'])))
-        if (not np.array_equal(old['z_train_ry'], bank['z']) or
+        if (not np.array_equal(observation_scales(old_bank),observation_scales(bank)) or
+                not np.array_equal(observation_scales(old_bank,True),observation_scales(bank,True)) or
+                not np.array_equal(old['z_train_ry'], bank['z']) or
                 not np.array_equal(old['weights_loss'], loss) or
                 not np.array_equal(old_selected, selected) or
                 not np.array_equal(old_bank['zh'], bank['zh']) or
@@ -403,11 +440,12 @@ def main(gram_dir, out_dir, check=False, warm_dir=None, training_indices=None, m
             stem = out_dir/f'q{q:02d}_p{p:02d}'
             record = {'q': q, 'p': p, 'provenance': origin, 'order_receipt': receipt,
                       'input_path': str(path), 'input_sha256': sha(path), 'upstream_receipt': upstream,
-                      'values_used': len(selected), 'selected_training_indices': selected.tolist(),
+                      'values_used': value_count(bank,selected), 'selected_training_indices': selected.tolist(),
                       'rowplan_sha256': rowplan['sha256'] if rowplan is not None else None,
-                      'training_values_available': nt, 'held_validation_values': len(bank['zh']),
-                      'unselected_training_validation_values': nt-len(selected),
-                      'within_40_fitted_values': bool(len(selected) <= 40), 'kind':kind,
+                      'training_values_available': value_count(bank,np.arange(nt)), 'held_validation_values': int(np.count_nonzero(observation_scales(bank,True)==0)),
+                      'unselected_training_validation_values': value_count(bank,np.setdiff1d(np.arange(nt),selected)),
+                      'derivative_rows_used':len(selected)-value_count(bank,selected),
+                      'within_40_fitted_values': bool(value_count(bank,selected) <= 40), 'kind':kind,
                       'moment_names':moment_names, 'moment_target':current_moments}
             try:
                 print(f'FIT q{q:02d} p={p} rank={rank} start', flush=True)
@@ -417,17 +455,20 @@ def main(gram_dir, out_dir, check=False, warm_dir=None, training_indices=None, m
                                                        moment_constrained,current_moments)
                     record['warm_start'] = seed_receipt
                 fitted = solver.fit(bank['z'][selected], loss[selected], gram,
-                                    bank['sketches'][selected], p, initial=initial)
+                                    bank['sketches'][selected], p, initial=initial,
+                                    derivative_scale_ry=observation_scales(bank)[selected])
                 expanded_map = np.zeros((p,2*nt+extra), dtype=fitted['row_map'].dtype)
                 output_columns = np.r_[selected_channels,2*nt+np.arange(extra)]
                 expanded_map[:,output_columns] = fitted['row_map']
                 fitted['row_map'] = expanded_map
-                fitted.update(values_used=len(selected), selected_training_indices=selected.tolist(),
+                fitted.update(values_used=value_count(bank,selected), selected_training_indices=selected.tolist(),
                               rowplan_sha256=rowplan['sha256'] if rowplan is not None else None)
                 errors = line_errors(bank, fitted, omega, weight, selected)
                 with stem.with_suffix('.npz').open('xb') as stream:
                     np.savez(stream, poles_ry=fitted['poles_ry'], row_map=fitted['row_map'],
                              z_train_ry=bank['z'], z_held_ry=bank['zh'], weights_loss=loss,
+                             derivative_scale_ry=observation_scales(bank),
+                             held_derivative_scale_ry=observation_scales(bank,True),
                              train_channel_indices=training, selected_training_indices=selected,
                              kind=np.asarray(kind),moment_names=np.asarray(moment_names,dtype='U3'),
                              rowplan_sha256=np.asarray(rowplan['sha256'] if rowplan is not None else ''))

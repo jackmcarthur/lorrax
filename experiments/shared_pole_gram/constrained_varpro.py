@@ -92,7 +92,7 @@ def _constrained_eliminate(a, c, data, moments):
                reduced_singular=sb)
 
 
-def _residual_jac(theta, z, sqrt_weights, data, moments):
+def _residual_jac(theta, z, sqrt_weights, data, moments, derivative_scale_ry=None):
     """Exact generalized variable-projection Jacobian with moving constraints.
 
     At full constraint/reduced rank, let lambda=C+^T A^T r, B=A Z,
@@ -103,7 +103,7 @@ def _residual_jac(theta, z, sqrt_weights, data, moments):
     neither normal equations nor finite differences. It retains the exact
     transpose-projection term omitted by the Kaufman approximation.
     """
-    a, au, av = varpro._design(theta,z)
+    a, au, av = varpro._design(theta,z,derivative_scale_ry)
     a = sqrt_weights[:,None]*a
     c, cu, cv = _constraint_design(theta)
     residual, coefficients, state = _constrained_eliminate(a,c,data,moments)
@@ -142,22 +142,23 @@ def _compress_gram(z,weights,gram):
     return sw,moment_scale,compressed[:2*nt],compressed[2*nt:],eigenvalues
 
 
-def real_q_gradient_check(z_ry,weights_loss,channel_gram,sketches,p):
+def real_q_gradient_check(z_ry,weights_loss,channel_gram,sketches,p,derivative_scale_ry=None):
     """AAA-seed exact objective-gradient gate including moving moment constraints."""
     z,weights,gram = np.asarray(z_ry,complex),np.asarray(weights_loss,float),np.asarray(channel_gram).real
     sw,_,data,moments,_ = _compress_gram(z,weights,gram)
-    seed,initializer = varpro._aaa_initial(z/varpro.BANDWIDTH_RY,sketches,p,weights)
+    scales = varpro._row_derivative_scales(z,derivative_scale_ry)
+    seed,initializer = varpro._hermite_initializer(z/varpro.BANDWIDTH_RY,sketches,p,weights,scales)
     theta = np.log(np.r_[seed.real,-seed.imag])
     def rank_check(state):
         # The owner refuses either SVD rank loss before returning this state.
         return {'constraint_rank':3,'reduced_design_rank':state[1]['nullspace'].shape[1]}
     receipt = varpro._gradient_receipt(
-        lambda t:_residual_jac(t,z/varpro.BANDWIDTH_RY,sw,data,moments),theta,rank_check)
+        lambda t:_residual_jac(t,z/varpro.BANDWIDTH_RY,sw,data,moments,scales),theta,rank_check)
     receipt.update(initializer=initializer,bandwidth_ry=varpro.BANDWIDTH_RY)
     return receipt
 
 
-def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
+def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None, derivative_scale_ry=None):
     """Fit damped poles with three exact physical dA moment constraints.
 
     Parameters
@@ -177,6 +178,11 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
     initial : complex ndarray, shape (p,), optional
         Warm poles in Ry; every frequency and width remains free.
 
+    derivative_scale_ry : float ndarray, shape (Nobservations,), optional
+        Zero marks a W value row; h>0 marks h*dW/dz_Ry in W units.
+        The caller supplies data h*2*z_Ry*dW/d(z_Ry**2), not raw Dt.
+        AAA sees only value rows. Held rows are excluded as before.
+
     Returns
     -------
     dict
@@ -188,6 +194,7 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
     start = time.monotonic()
     z = np.asarray(z_ry,complex)
     weights = np.asarray(weights_loss,float)
+    scales = varpro._row_derivative_scales(z,derivative_scale_ry)
     raw = np.asarray(channel_gram)
     if np.iscomplexobj(raw) and np.linalg.norm(raw.imag)>1e-12*max(np.linalg.norm(raw),1e-300):
         raise ValueError('Extended Hermitian-channel Gram must be real')
@@ -208,7 +215,7 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
     # Q=R/b: moments become (M0/b, Mm1, M1/b^2) and C uses dimensionless poles.
     sw,moment_scale,data,moments,eigenvalues = _compress_gram(z,weights,gram)
     if initial is None:
-        seed,initializer = varpro._aaa_initial(scaled_z,sketches,p,weights)
+        seed,initializer = varpro._hermite_initializer(scaled_z,sketches,p,weights,scales)
     else:
         seed = np.asarray(initial,complex)/bandwidth
         initializer = {'method':'warm start'}
@@ -223,12 +230,12 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
     def evaluate(t):
         if 'theta' not in cache or not np.array_equal(t,cache['theta']):
             cache['theta'] = t.copy()
-            cache['value'] = _residual_jac(t,scaled_z,sw,data,moments)
+            cache['value'] = _residual_jac(t,scaled_z,sw,data,moments,scales)
         return cache['value']
 
     result,iteration_receipt = varpro._minimize(evaluate,theta)
     residual,jacobian,(_,state) = evaluate(result.x)
-    a = sw[:,None]*varpro._design(result.x,scaled_z)[0]
+    a = sw[:,None]*varpro._design(result.x,scaled_z,scales)[0]
     zi = state['nullspace']@state['inverse_b']
     row_map = bandwidth*np.hstack((zi*sw[None,:],
                 (state['inverse_c']-zi@a@state['inverse_c'])*moment_scale[None,:]))
@@ -244,7 +251,7 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
     moment_relative = np.sqrt(np.maximum(moment_error2,0)/np.maximum(moment_norm2,1e-300))
     jsv = np.linalg.svd(jacobian,compute_uv=False)
     asv = np.linalg.svd(a,compute_uv=False)
-    csv = np.linalg.svd(np.sqrt(weights)[:,None]*basis(z,poles),compute_uv=False)
+    csv = np.linalg.svd(np.sqrt(weights)[:,None]*basis(z,poles,scales),compute_uv=False)
     bs = state['reduced_singular']
     degeneracy = varpro._degeneracy(row_map,gram,poles)
     eligible = iteration_receipt['success'] and not degeneracy['unresolved_tiny_residue_degeneracy']
@@ -275,7 +282,7 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
             'residue_constraint':'Hermitian real channels with exact parent dA moment equalities',
             'numerical_candidate_eligible':bool(eligible),
             'candidate_scope':'Numerical prerequisites only; unresolved degeneracy or unconverged fit is not a candidate',
-            **iteration_receipt,**degeneracy}
+            **iteration_receipt,**degeneracy,**varpro._hermite_receipt(z,scales)}
 
 
 def synthetic_check():

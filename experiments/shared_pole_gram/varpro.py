@@ -21,14 +21,49 @@ EV = 13.605693122994
 BANDWIDTH_RY = 150.0/EV
 
 
-def basis(z_ry, poles_ry):
+def basis(z_ry, poles_ry, derivative_scale_ry=None):
     """Return conjugate-paired causal phi(z), shape (Nz,p), in 1/Ry."""
     z = np.asarray(z_ry, complex)[:, None]
     pole = np.asarray(poles_ry, complex)[None, :]
-    return 1 / (z - pole) - 1 / (z + pole.conj())
+    value = 1 / (z - pole) - 1 / (z + pole.conj())
+    if derivative_scale_ry is None:
+        return value
+    scale = _row_derivative_scales(z_ry, derivative_scale_ry)
+    derivative = -1/(z-pole)**2 + 1/(z+pole.conj())**2
+    return np.where(scale[:,None]>0, scale[:,None]*derivative, value)
 
 
-def _design(theta, z):
+
+def _row_derivative_scales(z_ry, derivative_scale_ry):
+    """Per-row h in Ry: zero selects W, positive h selects h*dW/dz_Ry."""
+    if derivative_scale_ry is None:
+        return np.zeros(len(z_ry))
+    scale = np.asarray(derivative_scale_ry,float)
+    if scale.shape!=(len(z_ry),) or np.any(scale<0) or not np.all(np.isfinite(scale)):
+        raise ValueError('Derivative scales must be finite nonnegative Ry values, one per observation row')
+    return scale
+
+
+def _hermite_initializer(z, sketches, p, weights, scales):
+    """AAA consumes value rows only; derivatives remain additional loss rows."""
+    values = scales==0
+    if not np.any(values):
+        raise ValueError('AAA initialization requires at least one value row')
+    selected_sketches = None if sketches is None else np.asarray(sketches)[values]
+    return _aaa_initial(z[values],selected_sketches,p,np.asarray(weights)[values])
+
+
+def _hermite_receipt(z_ry, scales):
+    values = scales==0
+    return {'derivative_scale_ry':scales,'observation_rows':len(scales),
+            'value_rows':int(np.sum(values)),'derivative_rows':int(np.sum(~values)),
+            'distinct_value_points':len(np.unique(np.asarray(z_ry)[values])),
+            'distinct_observation_points':len(np.unique(z_ry)),
+            'hermite_data_contract':'W rows or h_Ry*2*z_Ry*dW/d(z_Ry**2) rows; all in W units',
+            'hermite_basis_contract':'value phi or h_Ry*dphi/dz_Ry; physical residues unchanged'}
+
+
+def _design(theta, z, derivative_scale_ry=None):
     """Dimensionless real channel design and analytic log-pole derivatives."""
     p = theta.size // 2
     a, gamma = np.exp(theta[:p]), np.exp(theta[p:])
@@ -37,6 +72,15 @@ def _design(theta, z):
     phi = 1 / minus - 1 / plus
     derivative_u = a * (1 / minus**2 + 1 / plus**2)
     derivative_v = 1j * gamma * (-1 / minus**2 + 1 / plus**2)
+    if derivative_scale_ry is not None:
+        scale = _row_derivative_scales(z,derivative_scale_ry)[:,None]/BANDWIDTH_RY
+        use_derivative = scale>0
+        phi_z = -1/minus**2+1/plus**2
+        derivative_u_z = -2*a*(1/minus**3+1/plus**3)
+        derivative_v_z = 2j*gamma*(1/minus**3-1/plus**3)
+        phi = np.where(use_derivative,scale*phi_z,phi)
+        derivative_u = np.where(use_derivative,scale*derivative_u_z,derivative_u)
+        derivative_v = np.where(use_derivative,scale*derivative_v_z,derivative_v)
     return tuple(np.vstack((x.real, x.imag)) for x in (phi, derivative_u, derivative_v))
 
 
@@ -52,13 +96,13 @@ def _eliminate(design, data):
     return residual, coefficients, inverse, s, int(keep.sum())
 
 
-def _residual_jac(theta, z, sqrt_weights, compressed, exact=False):
+def _residual_jac(theta, z, sqrt_weights, compressed, exact=False, derivative_scale_ry=None):
     """Kaufman Jacobian; exact adds the transpose-projection derivative.
 
     For R=(I-AA+)B, dR=-(I-AA+)dA C-A+^T dA^T R. Kaufman
     omits the second term, which vanishes in the objective gradient.
     """
-    a, derivative_u, derivative_v = _design(theta, z)
+    a, derivative_u, derivative_v = _design(theta, z, derivative_scale_ry)
     a = sqrt_weights[:, None] * a
     r, c, inverse, singular, rank = _eliminate(a, compressed)
     if rank == a.shape[1]:
@@ -339,22 +383,23 @@ def _compress_gram(z, weights, gram):
     return sw,compressed,int(keep.sum()),float(np.maximum(eigenvalues[~keep],0).sum()/norm**2)
 
 
-def real_q_gradient_check(z_ry, weights_loss, channel_gram, sketches, p):
+def real_q_gradient_check(z_ry, weights_loss, channel_gram, sketches, p, derivative_scale_ry=None):
     """AAA-seed real-q finite-difference gate; refuse truncated design ranks."""
     z,weights,gram = np.asarray(z_ry,complex),np.asarray(weights_loss,float),np.asarray(channel_gram).real
     sw,compressed,_,_ = _compress_gram(z,weights,gram)
-    seed,initializer = _aaa_initial(z/BANDWIDTH_RY,sketches,p,weights)
+    scales = _row_derivative_scales(z,derivative_scale_ry)
+    seed,initializer = _hermite_initializer(z/BANDWIDTH_RY,sketches,p,weights,scales)
     theta = np.log(np.r_[seed.real,-seed.imag])
     def rank_check(state):
         if state[2]!=p:
             raise ValueError(f'Real-q gradient gate uncertified: design rank {state[2]} < p={p}')
         return {'design_rank':state[2]}
-    receipt = _gradient_receipt(lambda t:_residual_jac(t,z/BANDWIDTH_RY,sw,compressed,exact=True),theta,rank_check)
+    receipt = _gradient_receipt(lambda t:_residual_jac(t,z/BANDWIDTH_RY,sw,compressed,exact=True,derivative_scale_ry=scales),theta,rank_check)
     receipt.update(initializer=initializer,bandwidth_ry=BANDWIDTH_RY)
     return receipt
 
 
-def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
+def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None, derivative_scale_ry=None):
     """Fit moving damped poles with real Hermitian-channel residue elimination.
 
     Parameters
@@ -372,6 +417,11 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
     initial : complex ndarray, shape (p,), optional
         Warm-start poles in Ry, with positive real and negative imaginary parts.
 
+    derivative_scale_ry : float ndarray, shape (Nobservations,), optional
+        Zero marks a W value row; h>0 marks h*dW/dz_Ry in W units.
+        The caller supplies data h*2*z_Ry*dW/d(z_Ry**2), not raw Dt.
+        AAA sees only value rows. Held rows are excluded as before.
+
     Returns
     -------
     dict
@@ -382,6 +432,7 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
     start = time.monotonic()
     z = np.asarray(z_ry, complex)
     weights = np.asarray(weights_loss, float)
+    scales = _row_derivative_scales(z,derivative_scale_ry)
     raw = np.asarray(channel_gram)
     if np.iscomplexobj(raw) and np.max(np.abs(raw.imag)) > 1e-12 * max(np.linalg.norm(raw), 1e-300):
         raise ValueError("channel_gram must be real Hermitian-channel Gram")
@@ -398,7 +449,7 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
         raise ValueError("channel_gram is not symmetric")
     sw,compressed,gram_rank,discarded_fraction = _compress_gram(z,weights,gram)
     if initial is None:
-        seed, initializer = _aaa_initial(scaled_z, sketches, p,weights)
+        seed, initializer = _hermite_initializer(scaled_z,sketches,p,weights,scales)
     else:
         seed = np.asarray(initial, complex) / bandwidth
         initializer = {"method": "warm start"}
@@ -414,16 +465,16 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
     def evaluate(t):
         if "theta" not in cache or not np.array_equal(t, cache["theta"]):
             cache["theta"] = t.copy()
-            cache["value"] = _residual_jac(t, scaled_z, sw, compressed)
+            cache["value"] = _residual_jac(t, scaled_z, sw, compressed, derivative_scale_ry=scales)
         return cache["value"]
 
     result,iteration_receipt = _minimize(evaluate,theta)
     residual, jacobian, (inverse, singular, rank) = _residual_jac(
-        result.x, scaled_z, sw, compressed, exact=True)
+        result.x, scaled_z, sw, compressed, exact=True, derivative_scale_ry=scales)
     jac_singular = np.linalg.svd(jacobian, compute_uv=False)
     poles = bandwidth * (np.exp(result.x[:p]) - 1j * np.exp(result.x[p:]))
     ordering = np.argsort(poles.real)
-    complex_singular = np.linalg.svd(np.sqrt(weights)[:, None] * basis(z, poles), compute_uv=False)
+    complex_singular = np.linalg.svd(np.sqrt(weights)[:, None] * basis(z, poles, scales), compute_uv=False)
     complex_condition = (float(complex_singular[0] / complex_singular[-1])
                          if p <= z.size and complex_singular[-1] else float("inf"))
     row_map = bandwidth * inverse[ordering] * sw[None,:]
@@ -448,7 +499,7 @@ def fit(z_ry, weights_loss, channel_gram, sketches, p, initial=None):
             "moment_constraints": "none", "residue_constraint": "Hermitian real channels",
             "numerical_candidate_eligible":bool(eligible),
             "candidate_scope":"Numerical prerequisites only; unresolved degeneracy or unconverged fit is not a candidate",
-            **iteration_receipt,**degeneracy}
+            **iteration_receipt,**degeneracy,**_hermite_receipt(z,scales)}
 
 
 def synthetic_check():

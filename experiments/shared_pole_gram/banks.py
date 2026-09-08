@@ -84,23 +84,36 @@ def data_metadata(paths, parents):
             raise ValueError(f'DATA launcher/physical job.step mismatch: {directory}')
         if Path(launch['artifact']).resolve() != receipt_path:
             raise ValueError(f'DATA launcher points to another receipt: {directory}')
-        if rec['schema'] != 'lorrax.run307.values_only_cubic_physical_samples.v1' or rec['coordinate'] != 'canonical_physical_Wc':
+        hermite = rec['schema'] == 'lorrax.run307.hermite_cubic_physical_samples.v1'
+        if rec['schema'] not in ('lorrax.run307.values_only_cubic_physical_samples.v1', 'lorrax.run307.hermite_cubic_physical_samples.v1') or rec['coordinate'] != 'canonical_physical_Wc':
             raise ValueError(f'Unsupported DATA coordinate/schema: {directory}')
-        if rec['units']['z'] != 'Ry' or not rec['values_only'] or rec['geometry']['nmu'] != 896:
+        if rec['units']['z'] != 'Ry' or rec['values_only'] != (not hermite) or rec['geometry']['nmu'] != 896:
             raise ValueError(f'Unsupported DATA units/geometry: {directory}')
         if rec['parent_qrows'] != parents or len(rec['q_receipts']) != 29:
             raise ValueError(f'DATA parent-q contract differs: {directory}')
+        if hermite:
+            if rec['units'].get('derivative') != 'dWc/d(z_Ry^2)':
+                raise ValueError('Unsupported physical derivative units')
+            if rec['datasets'].get('training_derivative') != 'construction_derivative_cubic' or rec['datasets'].get('held_derivative') != 'held_derivative_cubic':
+                raise ValueError('Unsupported Hermite dataset contract')
+            count = sum(len(rec['schedule'][k+'_ev']) for k in ('construction','held'))
+            if rec['schedule']['derivative_output_indices'] != list(range(count)):
+                raise ValueError('Hermite requires one derivative per construction/held point')
+            if len(rec.get('additional_source_artifacts',[])) != 2:
+                raise ValueError('Missing Hermite adapter/quadrature source pins')
         source_evidence = {}
-        for key in ('constructor', 'owner'):
-            expected_sha = rec[key+'_sha256']
-            source_path = Path(rec[key+'_path'])
+        pins = [(key,Path(rec[key+'_path']),rec[key+'_sha256']) for key in ('constructor','owner')]
+        if hermite:
+            pins += [(f'additional_{i}',Path(item['path']),item['sha256'])
+                     for i,item in enumerate(rec['additional_source_artifacts'])]
+        for key,source_path,expected_sha in pins:
             if sha(source_path) == expected_sha:
                 source_evidence[key] = dict(path=str(source_path), sha256=expected_sha)
                 continue
             # Completed banks pin bytes, not the mutable sampler's current HEAD.
             # Inspect at most32 revisions of this named file; the receipt hash
             # must match exact immutable bytes, never a current-code substitute.
-            if key != 'constructor':
+            if key == 'owner':
                 raise ValueError(f'DATA {key} source hash mismatch: {directory}')
             relative = source_path.relative_to(S).as_posix()
             revisions = subprocess.check_output(
@@ -130,7 +143,7 @@ def data_metadata(paths, parents):
         for slot, item in enumerate(rec['q_receipts']):
             if item['q_wedge'] != slot or item['q_full'] != parents[slot] or not item['shape_verified']:
                 raise ValueError(f'DATA q shape/index receipt invalid: {directory}/q{slot:02d}')
-        banks.append(dict(source_evidence=source_evidence, receipt=rec, receipt_path=str(receipt_path), receipt_sha256=sha(receipt_path),
+        banks.append(dict(hermite=hermite, source_evidence=source_evidence, receipt=rec, receipt_path=str(receipt_path), receipt_sha256=sha(receipt_path),
                           launcher_path=str(launcher_path), launcher_sha256=sha(launcher_path),
                           z=zs[0], zh=zs[1]))
     return banks
@@ -165,7 +178,15 @@ def metadata(data_banks=None):
         zs.append((np.asarray(rec['schedule']['construction_ev']) + 1j*rec['sampling_eta_ev'])/EV)
     rec = broad[0][1]
     zhs.append((np.asarray(rec['schedule']['held_ev']) + 1j*rec['sampling_eta_ev'])/EV)
-    return low, broad, np.r_[tuple(zs)], np.r_[tuple(zhs)]
+    # Preserve all existing value indices; derivative twins follow all values.
+    z, zh = np.r_[tuple(zs)], np.r_[tuple(zhs)]
+    ds, dhs = [], []
+    for bank in low.get('data_banks',[]):
+        if bank['hermite']:
+            ds.append(bank['z']); dhs.append(bank['zh'])
+    low['derivative_scale_ry'] = np.r_[np.zeros(len(z)), *[a.imag for a in ds]]
+    low['held_derivative_scale_ry'] = np.r_[np.zeros(len(zh)), *[a.imag for a in dhs]]
+    return low, broad, np.r_[z,*ds], np.r_[zh,*dhs]
 
 
 def load(slot, mesh, eig, owner, broad, data_banks=None):
@@ -173,6 +194,7 @@ def load(slot, mesh, eig, owner, broad, data_banks=None):
     import jax.numpy as jnp
     from file_io.slab_io import SlabIO
     from jax.sharding import PartitionSpec as P
+    derivative_trains, derivative_helds = [], []
     if data_banks:
         if not owner.get('_data_coulomb_authenticated'):
             assert sha(owner['COULOMB']) == owner['COULOMB_SHA']
@@ -190,6 +212,18 @@ def load(slot, mesh, eig, owner, broad, data_banks=None):
             with SlabIO(path, mode='r', mesh=mesh) as io:
                 train = io.read_slab(rec['datasets']['training'], partition_spec=P(None,'x','y'))
                 held = io.read_slab(rec['datasets']['held'], partition_spec=P(None,'x','y'))
+                if bank['hermite']:
+                    import jax
+                    from jax.sharding import NamedSharding
+                    scale_rows = jax.jit(lambda a,c:a*c[:,None,None],
+                        out_shardings=NamedSharding(mesh,P(None,'x','y')))
+                    for key,zrows,target in (('training_derivative',bank['z'],derivative_trains),
+                                             ('held_derivative',bank['zh'],derivative_helds)):
+                        dt = io.read_slab(rec['datasets'][key],partition_spec=P(None,'x','y'))
+                        if dt.shape != (len(zrows),896,896) or dt.dtype != jnp.complex128:
+                            raise ValueError(f'DATA derivative shape/dtype mismatch: {path}')
+                        # Already canonical physical: scale complex rows before H/A.
+                        target.append(scale_rows(dt,jnp.asarray(2*zrows.imag*zrows)))
             if train.shape != (len(bank['z']),896,896) or held.shape != (len(bank['zh']),896,896):
                 raise ValueError(f'DATA actual dataset shape mismatch: {path}')
             if train.dtype != jnp.complex128 or held.dtype != jnp.complex128:
@@ -222,7 +256,7 @@ def load(slot, mesh, eig, owner, broad, data_banks=None):
                 helds.append(io.read_slab('held_value_cubic', partition_spec=P(None, 'x', 'y')))
         paths.append(dict(path=str(path), sha256=item['artifact_sha256'],
                           receipt=str(receipt_path), receipt_sha256=sha(receipt_path)))
-    return jnp.concatenate(trains), jnp.concatenate(helds), v, paths
+    return jnp.concatenate(trains+derivative_trains), jnp.concatenate(helds+derivative_helds), v, paths
 
 
 def loss_weights(z):
