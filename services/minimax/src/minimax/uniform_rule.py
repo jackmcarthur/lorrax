@@ -1124,7 +1124,11 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     # or a coarser check (it is the largest matrix in the reduction loop):
     # the failures were all rotated-ray boxes whose rule was exact at the
     # sampled Im levels and off between them.
-    d_check = box_samples(re_lo, re_hi, im_lo, im_hi, per_unit=8.0, n_im=2 * n_im)
+    # Match the independent product-window certificate's sampling density.
+    # A reduced negative tail passed the former 8-point cloud but exceeded
+    # its requested relative error on the 10-point certificate (Run309).
+    d_check = box_samples(re_lo, re_hi, im_lo, im_hi,
+                          per_unit=10.0, n_im=max(48, 2 * n_im))
     rho, rho_check = fit_of(d), rho_of(d_check)
     fam = _RayFamily(d, theta, S, eps / trunc, rho)
     s, w = fam.interpolatory()
