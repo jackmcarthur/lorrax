@@ -2,7 +2,8 @@
 
 The historical owner inlines its cluster kernel. Extract that exact-hash loop,
 retain its moment whitening/localizer/Gauss rotation, and adapt only complex
-adjoints, variable cluster rank and single-GPU placement. No Sigma owner changes.
+adjoints, variable cluster rank and single-GPU placement. The equivalent state-space
+QR form avoids squaring the near-null moment conditioning. No Sigma owner changes.
 """
 import argparse
 import importlib.util
@@ -46,8 +47,13 @@ def owner_blocks(factor, poles2, groups, mesh):
         'h_host = np.real(0.5 * (h_host_raw + h_host_raw.T.conj()))':'h_host = 0.5 * (h_host_raw + h_host_raw.T.conj())',
         'np.asarray(q, np.float64)':'np.asarray(q, np.complex128)',
         'b = jax.device_put(jnp.real(b), face)':'b = jax.device_put(b, face)',
-        'q.T @ np.diag(lam) @ q':'q.T.conj() @ np.diag(lam) @ q',
         'q @ np.diag(theta) @ q.T - h_host':'q @ np.diag(theta) @ q.T.conj() - h_host',
+        'h = mm(whiten.T.conj(), mm(r1, whiten))':
+            'state = (factor.T.conj() @ whiten) * mask_dev[:,None]\n    state, _ = jnp.linalg.qr(state, mode="reduced")\n    h = state.T.conj() @ (poles2_dev[:,None] * state)',
+        'b = right_multiply(u * sqrtlam[None, :], qdev)':
+            'b = right_multiply(factor @ state, qdev)',
+        'norms = np.real(np.diag(q.T @ np.diag(lam) @ q))':
+            'norms = np.asarray(jax.device_get(jnp.sum(jnp.abs(b)**2,axis=0)))',
     }
     for old,new in changes.items():
         assert old in code,old
@@ -121,7 +127,7 @@ def main():
                     damping_fraction=0,cond=max(x['r0_retained_condition'] for x in local),storage_bytes=int(ck.nbytes+tk.nbytes),
                     jobid=os.getenv('SLURM_JOB_ID'),stepid=os.getenv('SLURM_STEP_ID'),W16_parent_relative_errors=errors,
                     bin_edges_ev=edges.tolist(),clusters=local,rotated_K=len(theta),owner_sha256=OWNER_SHA,
-                    complex_adaptation='Hermitian adjoints and complex localizer eigenvectors; no real gauge assumption',
+                    complex_adaptation='Hermitian adjoints, complex localizer and algebraically equivalent state QR to resolve near-null moment conditioning',
                     criterion='Run146 low_resolvent selection after sqrt(weight) frequency-local Gauss rotation')
                 models[k].append((ck,jnp.asarray(tk)));records[k].append(row)
                 print(json.dumps(dict(q=q,K=k,W16_max=max(errors))),flush=True)
