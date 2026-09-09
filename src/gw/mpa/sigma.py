@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from dataclasses import replace
+from functools import lru_cache
 
 import jax
 import jax.numpy as jnp
@@ -156,17 +157,36 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
     Nonlocal maps refuse here; the caller routes bounded endpoint factors
     through the symmetry service before contraction for those maps.
     """
-    from common.shard_map import shard_map
-    from symmetry_maps import unfold_operator_local
-
     if tables is None:
         tables = _shared_pole_panel_tables(meta, header, q_span, mesh_xy=mesh_xy)
     cert = tables["certificates"]
     if not all(cert[axis]["is_local"] for axis in ("x", "y")):
         raise ValueError("shared-pole nonlocal maps require routed endpoint panels")
 
-    policy = _shared_pole_fixed_q_policy(header)
-    qids = np.asarray(header["q_irr_full_idx"])[slice(*q_span)]
+    arrays = (np.asarray(header["q_irr_full_idx"])[slice(*q_span)],
+              tables["parent_rows"], tables["sym_rows"], tables["q_frac"],
+              cert["x"]["local_perm"], cert["y"]["local_perm"], tables["wraps"],
+              np.asarray(header["qirr"]["sym_idx_q"]))
+    # Only authenticated O(symmetry * mu) host maps enter the code key.
+    # Model factors, poles and open readers never enter this cache.
+    key = tuple((a.dtype.str, a.shape, a.tobytes()) for a in map(np.asarray, arrays))
+    unfold = _shared_pole_panel_unfold_kernel(
+        mesh_xy, tuple(header["grid"]), header["representation"],
+        tables["n_sym_spatial"], int(header["n_q_full"]), key)
+    return tables["rows"], unfold
+
+
+@lru_cache(maxsize=16)
+def _shared_pole_panel_unfold_kernel(mesh_xy, grid, representation, n_sym, n_q_full, key):
+    """Reuse the certified fixed-q projection and local symmetry action."""
+    from common.shard_map import shard_map
+    from symmetry_maps import unfold_operator_local
+
+    qids, parents, sym, qfrac, left, right, wraps, full_sym = (
+        np.frombuffer(raw, dtype=dtype).reshape(shape) for dtype, shape, raw in key)
+    policy = _shared_pole_fixed_q_policy(dict(
+        grid=grid, representation=representation, n_q_full=n_q_full,
+        qirr=dict(n_sym_spatial=n_sym, sym_idx_q=full_sym)))
 
     def body(plus, transposed):
         projected, _ = policy.project_fixed_q(
@@ -174,18 +194,50 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
         transposed, _ = policy.project_fixed_q(
             transposed, qids, transposed_partner=plus, measure=False)
         return unfold_operator_local(
-            projected, irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
-            q_irr_frac=tables["q_frac"],
-            left_local_perm=cert["x"]["local_perm"], left_L_table=tables["wraps"],
-            right_local_perm=cert["y"]["local_perm"], right_L_table=tables["wraps"],
-            n_sym_spatial=tables["n_sym_spatial"],
-            trs_rule="pair_transpose", transposed_parent_local=transposed)
+            projected, irr_idx=parents, sym_idx=sym, q_irr_frac=qfrac,
+            left_local_perm=left, left_L_table=wraps,
+            right_local_perm=right, right_L_table=wraps,
+            n_sym_spatial=n_sym, trs_rule="pair_transpose",
+            transposed_parent_local=transposed)
 
-    unfold = jax.jit(shard_map(
+    return jax.jit(shard_map(
         body, mesh=mesh_xy,
         in_specs=(P(None, "x", "y"), P(None, "x", "y")),
         out_specs=P(None, "x", "y"), check_vma=False))
-    return tables["rows"], unfold
+
+
+@lru_cache(maxsize=32)
+def _shared_pole_local_kernel(mesh_xy, unfold, ffi_key):
+    """Cache code for W(tau); current C, poles and intervals stay operands."""
+    @jax.jit
+    def local_body(X, Y, poles2, ranges, e, t):
+        plus, transposed = synthesize_shared_pole_parents(
+            X, Y, poles2, ranges, e, t, mesh_xy=mesh_xy)
+        return unfold(plus, transposed)
+    return local_body
+
+
+@lru_cache(maxsize=128)
+def _shared_pole_compact_kernel(unfold, first, last):
+    """Retain the admitted compact GEMM width without retaining factor data."""
+    @jax.jit
+    def compact_body(X, Y, poles2, ranges, e, t):
+        return unfold(X[..., first:last], Y[..., first:last],
+                      poles2[:, first:last], ranges-first, e, t)
+    return compact_body
+
+
+@lru_cache(maxsize=16)
+def _shared_pole_accumulation_kernels(mesh_xy, shape):
+    """Reuse the full-q zero and donated panel accumulation programs."""
+    from functools import partial
+    sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+    zeros = jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=sharding)
+
+    @partial(jax.jit, donate_argnums=(0,), out_shardings=sharding)
+    def add_panel(total, rows, values):
+        return total.at[rows].add(values, indices_are_sorted=True, unique_indices=True)
+    return zeros, add_panel
 
 
 def _shared_pole_routed_synthesis(
@@ -267,8 +319,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         raise ValueError("shared-pole panel capacities must be positive")
     if kmax == 0:
         shape = (int(header["n_q_full"]), meta.mu_basis.n_packed, meta.mu_basis.n_packed)
-        zero = jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
-                       out_shardings=NamedSharding(mesh_xy, P(None,"x","y")))
+        zero, _ = _shared_pole_accumulation_kernels(mesh_xy, shape)
         return lambda *_args: zero()
     panels = []
     for lo in range(0, nq, bcap):
@@ -280,11 +331,8 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 meta, header, (lo, hi), mesh_xy=mesh_xy, tables=tables)
             # One compiled body owns phase, both orientations and local
             # unfold. Its actual buffer assignment is queried before I/O.
-            def local_body(X,Y,poles2,ranges,e,t,unfold=unfold):
-                plus,transposed = synthesize_shared_pole_parents(
-                    X,Y,poles2,ranges,e,t,mesh_xy=mesh_xy)
-                return unfold(plus,transposed)
-            kernel = jax.jit(local_body)
+            from ffi import ffi_dial_key
+            kernel = _shared_pole_local_kernel(mesh_xy, unfold, ffi_dial_key())
             widths = sorted({min(ccap,kmax-c0) for c0 in range(0,kmax,ccap)})
             for width in widths:
                 from runtime.aot_memory import aot_kernel_peak_bytes
@@ -325,14 +373,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     if bcap >= nq and ccap >= kmax:
         resident = read_shared_pole_faces(io, (0, nq), meta=meta, header=header)
     shape = (int(header["n_q_full"]), meta.mu_basis.n_packed, meta.mu_basis.n_packed)
-    sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
-    zeros = jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=sharding)
-
-    @partial(jax.jit, donate_argnums=(0,), out_shardings=sharding)
-    def add_panel(total, rows, values):
-        # Every full-q child occurs once in a parent panel, in sorted order.
-        # Expose that fact so complex scatter need not use atomic updates.
-        return total.at[rows].add(values, indices_are_sorted=True, unique_indices=True)
+    zeros, add_panel = _shared_pole_accumulation_kernels(mesh_xy, shape)
 
     diagnostic_done = False
     compact_kernels = {}
@@ -340,6 +381,10 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
 
     def build(_residues, _omega_fields, indices, bounds, _phase_real, E_ref_B, t_node):
         nonlocal cached_indices, cached_bounds, cached_intervals, diagnostic_done
+        # Match the admitted scalar signature; weak Python scalars otherwise
+        # create another executable after the strong-type AOT admission.
+        E_ref_B = jnp.asarray(E_ref_B, dtype=jnp.float64)
+        t_node = jnp.asarray(t_node, dtype=jnp.complex128)
         if not diagnostic_done:
             import json
             policy = _shared_pole_fixed_q_policy(header)
@@ -400,12 +445,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 kernel = unfold
                 if (first, last) != (0, c1-c0):
                     if key not in compact_kernels:
-                        def compact_body(X, Y, poles2, ranges, e, t,
-                                         first=first, last=last, unfold=unfold):
-                            return unfold(
-                                X[..., first:last], Y[..., first:last],
-                                poles2[:, first:last], ranges-first, e, t)
-                        compact = jax.jit(compact_body)
+                        compact = _shared_pole_compact_kernel(unfold, first, last)
                         from runtime.aot_memory import aot_kernel_peak_bytes
                         compiled = compact.lower(
                             X,Y,poles2,ranges,E_ref_B,t_node).compile()
