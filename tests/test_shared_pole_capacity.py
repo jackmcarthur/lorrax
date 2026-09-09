@@ -99,6 +99,25 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(ledger.receipt()['entries'][0]['status'],'PASS')
         self.assertEqual(ledger.receipt()['entries'][0]['resident_bytes_per_rank'],100)
 
+    def test_callee_lifetimes_require_explicit_binding(self):
+        ledger=self.ledger()
+        with self.assertRaisesRegex(ValueError,'unbound caller lifetimes'):
+            _=ledger.live_stages
+        ledger.live_stages=()
+        self.assertEqual(ledger.live_stages,())
+        ledger.reserve('inputs',resident_bytes_per_rank=512,workspace_bytes_per_rank=0)
+        ledger.live_stages=('inputs','inputs')
+        self.assertEqual(ledger.live_stages,('inputs',))
+        with self.assertRaises(MemoryError):
+            ledger.reserve('reader',resident_bytes_per_rank=257,workspace_bytes_per_rank=0,
+                           concurrent_with=ledger.live_stages)
+        with self.assertRaises(ValueError):
+            ledger.live_stages=('unknown',)
+        self.assertEqual(ledger.live_stages,('inputs',))
+        ledger.live_stages=()
+        self.assertEqual(ledger.reserve('sequential',resident_bytes_per_rank=768,
+                         workspace_bytes_per_rank=0,concurrent_with=ledger.live_stages)['status'],'PASS')
+
 
 if __name__=='__main__':
     unittest.main(verbosity=2)
