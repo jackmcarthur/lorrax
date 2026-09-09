@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from common import timing
 from common.collectives import rank0_transaction, psum_replicate
 from file_io.slab_io import SlabIO, mesh_divisible_shape
 from file_io.commit_state import assert_committed, set_commit_state
@@ -298,6 +299,7 @@ def _check_factor(C, poles2, K):
         _refuse("nonfinite, unsorted/nonpositive active poles or invalid inactive sentinel")
 
 
+@timing.timed("shared_pole_store.write_model")
 def write_shared_pole_model(path, C, poles2, K, *, q_span, meta, tables,
                             recipe, receipts):
     """Stage a bounded q batch and finalize automatically at complete K census.
@@ -322,40 +324,42 @@ def write_shared_pole_model(path, C, poles2, K, *, q_span, meta, tables,
         Header; finalized and digest are published only after all parents close.
         Staging plus final datasets use at most twice the compact payload bytes.
     """
-    header = _metadata(meta, tables, recipe, receipts["identity"])
-    mesh = meta.mu_basis.mesh_xy
-    want = NamedSharding(mesh, P(None, "x", None, "y"))
-    if not isinstance(C, jax.Array) or not C.sharding.is_equivalent_to(want, 4):
-        _refuse("constructor factor is not the declared XY handoff")
-    if C.shape[1:3] != (meta.mu_basis.n_packed, 1):
-        _refuse("factor does not use the current packed centroid basis")
-    ledger = _capacity(meta)
-    arg, output, temporary = _conversion_bytes(meta.mu_basis, C.shape, want.spec, unpack=True)
-    # One factor-sized envelope covers eager finite/sentinel check scratch.
-    _admit(ledger, "write_model", output, temporary+arg+3*int(poles2.size)*8,
-           device_panel=max(arg,output,8*int(poles2.size)), native_host=True)
-    K = np.asarray(K)
-    _check_factor(C, poles2, K)
-    lo, hi = _span(q_span, header["n_q_irr"], "q_span")
-    if hi - lo != C.shape[0]:
-        _refuse("q_span does not match factor batch")
-    if Path(path).exists():
-        previous = _read_header(path)
-        if previous["finalized"]:
-            _refuse("finalized models are immutable")
-        for key in header:
-            if key != "finalized" and _json(previous[key]) != _json(header[key]):
-                _refuse(f"staging identity changed: {key}")
-        header = previous
-    else:
-        header.update(written_q=[False] * header["n_q_irr"],
-                      K=[0] * header["n_q_irr"], batches=[], construction_receipts=[])
-    if any(header["written_q"][lo:hi]):
-        _refuse("q_span already committed; never overwrite staged parents")
-    width = int(K.max(initial=0))
-    name = f"staging/q{lo}_{hi}"
-    canonical = meta.mu_basis.unpack_axis(C, 1)
-    canonical.block_until_ready()
+    with timing.section("staging"):
+        header = _metadata(meta, tables, recipe, receipts["identity"])
+        mesh = meta.mu_basis.mesh_xy
+        want = NamedSharding(mesh, P(None, "x", None, "y"))
+        if not isinstance(C, jax.Array) or not C.sharding.is_equivalent_to(want, 4):
+            _refuse("constructor factor is not the declared XY handoff")
+        if C.shape[1:3] != (meta.mu_basis.n_packed, 1):
+            _refuse("factor does not use the current packed centroid basis")
+        ledger = _capacity(meta)
+        arg, output, temporary = _conversion_bytes(meta.mu_basis, C.shape, want.spec, unpack=True)
+        # One factor-sized envelope covers eager finite/sentinel check scratch.
+        _admit(ledger, "write_model", output, temporary+arg+3*int(poles2.size)*8,
+               device_panel=max(arg,output,8*int(poles2.size)), native_host=True)
+        K = np.asarray(K)
+        _check_factor(C, poles2, K)
+        lo, hi = _span(q_span, header["n_q_irr"], "q_span")
+        if hi - lo != C.shape[0]:
+            _refuse("q_span does not match factor batch")
+        if Path(path).exists():
+            previous = _read_header(path)
+            if previous["finalized"]:
+                _refuse("finalized models are immutable")
+            for key in header:
+                if key != "finalized" and _json(previous[key]) != _json(header[key]):
+                    _refuse(f"staging identity changed: {key}")
+            header = previous
+        else:
+            header.update(written_q=[False] * header["n_q_irr"],
+                          K=[0] * header["n_q_irr"], batches=[], construction_receipts=[])
+        if any(header["written_q"][lo:hi]):
+            _refuse("q_span already committed; never overwrite staged parents")
+        width = int(K.max(initial=0))
+        name = f"staging/q{lo}_{hi}"
+    with timing.section("canonical_basis_conversion_and_packing"):
+        canonical = meta.mu_basis.unpack_axis(C, 1)
+        canonical.block_until_ready()
     if not Path(path).exists():
         with SlabIO(path, mode="w", mesh=mesh) as io:
             _write_metadata(io, header)
@@ -370,8 +374,9 @@ def write_shared_pole_model(path, C, poles2, K, *, q_span, meta, tables,
         if width:
             io.create_dataset(name + "/factor", shape=(hi-lo, header["n_mu_logical"], 1, width), dtype=np.complex128)
             io.create_dataset(name + "/poles2", shape=(hi-lo, width), dtype=np.float64)
-            io.write_slab(name + "/factor", canonical)
-            io.write_slab(name + "/poles2", poles2)
+            with timing.section("write_slab"):
+                io.write_slab(name + "/factor", canonical)
+                io.write_slab(name + "/poles2", poles2)
         header["written_q"][lo:hi] = [True] * (hi-lo)
         header["K"][lo:hi] = K.tolist()
         header["batches"].append({"lo": lo, "hi": hi, "width": width, "name": name})
@@ -379,6 +384,8 @@ def write_shared_pole_model(path, C, poles2, K, *, q_span, meta, tables,
         _write_metadata(io, header)
         io.write_attr("written_q", np.asarray(header["written_q"], np.int8))
         _write_header(io, header)
+        with timing.section("sync_writes"):
+            io.sync_writes()
     del canonical
     if all(header["written_q"]):
         return _finalize_model(path, meta=meta, header=header)
@@ -403,6 +410,7 @@ def finalize_shared_pole_model(path, *, meta, expected_identity):
     return _finalize_model(path, meta=meta, header=header)
 
 
+@timing.timed("shared_pole_store.finalize")
 def _finalize_model(path, *, meta, header):
     mesh, basis = meta.mu_basis.mesh_xy, meta.mu_basis
     nq, nmu = header["n_q_irr"], header["n_mu_logical"]
@@ -427,20 +435,23 @@ def _finalize_model(path, *, meta, header):
                 (hi-lo, basis.n_canonical, 1, kmax), mesh, spec)
             if kmax == 0:
                 continue
-            if batch["width"]:
-                factor = io.read_slab(batch["name"] + "/factor",
-                    shape=read_shape, offset=(0, 0, 0, 0), partition_spec=spec)
-                poles = io.read_slab(batch["name"] + "/poles2",
-                    shape=(hi-lo, kmax), offset=(0, 0), partition_spec=P())
-            else:
-                factor = jax.jit(lambda: jnp.zeros(read_shape, jnp.complex128),
-                                 out_shardings=NamedSharding(mesh, spec))()
-                poles = jnp.ones((hi-lo, kmax), jnp.float64)
-            active = jnp.arange(kmax)[None, :] < jnp.asarray(header["K"][lo:hi])[:, None]
-            poles = jnp.where(active, poles, 1.0)
-            io.write_slab("factor", factor, offset=(lo, 0, 0, 0))
-            io.write_slab("poles2_ry2", poles, offset=(lo, 0))
-            io.sync_writes()
+            with timing.section("staging_read_and_padding"):
+                if batch["width"]:
+                    factor = io.read_slab(batch["name"] + "/factor",
+                        shape=read_shape, offset=(0, 0, 0, 0), partition_spec=spec)
+                    poles = io.read_slab(batch["name"] + "/poles2",
+                        shape=(hi-lo, kmax), offset=(0, 0), partition_spec=P())
+                else:
+                    factor = jax.jit(lambda: jnp.zeros(read_shape, jnp.complex128),
+                                     out_shardings=NamedSharding(mesh, spec))()
+                    poles = jnp.ones((hi-lo, kmax), jnp.float64)
+                active = jnp.arange(kmax)[None, :] < jnp.asarray(header["K"][lo:hi])[:, None]
+                poles = jnp.where(active, poles, 1.0)
+            with timing.section("write_slab"):
+                io.write_slab("factor", factor, offset=(lo, 0, 0, 0))
+                io.write_slab("poles2_ry2", poles, offset=(lo, 0))
+            with timing.section("sync_writes"):
+                io.sync_writes()
             del factor, poles
         io.write_attr("K", np.asarray(header["K"], np.int64))
         _write_header(io, header)
@@ -454,10 +465,12 @@ def _finalize_model(path, *, meta, header):
             f.create_dataset("header_json", data=np.bytes_(_json(header)))
             f.create_dataset("final_commit", data=np.bytes_(header["digest"]))
             set_commit_state(f, True)
-    rank0_transaction(path, stage="shared_pole.finalize", write=finish)
-    return _read_header(path)
+    with timing.section("finalisation"):
+        rank0_transaction(path, stage="shared_pole.finalize", write=finish)
+        return _read_header(path)
 
 
+@timing.timed("shared_pole_store.digest")
 def _model_digest(path, header, mesh, *, capacity):
     """Grid-independent SHA256 of metadata and canonical row digests.
 
@@ -483,34 +496,38 @@ def _model_digest(path, header, mesh, *, capacity):
                     _refuse("nonzero K in empty model")
                 digest.update(hashlib.sha256(b"").digest() * nmu)
                 continue
-            poles = io.read_slab("poles2_ry2", shape=(1,kmax), offset=(q,0), partition_spec=P())
-            host_poles = np.asarray(poles)
+            with timing.section("pole_read"):
+                poles = io.read_slab("poles2_ry2", shape=(1,kmax), offset=(q,0), partition_spec=P())
+                host_poles = np.asarray(poles)
             active_count = header["K"][q]
             if np.any(np.diff(host_poles[0, :active_count]) < 0):
                 _refuse("active poles are unsorted across column panels")
             hashers = {}
             for c0 in range(0, kmax, column_cap):
                 c1 = min(kmax, c0+column_cap)
-                C = io.read_slab("factor", shape=(1,ncan,1,c1-c0), offset=(q,0,0,c0),
-                                 partition_spec=P(None,"x",None,None))
-                count = np.asarray([max(0, min(c1-c0, active_count-c0))], np.int64)
-                _check_factor(C, poles[:,c0:c1], count)
-                local = None
-                for shard in C.addressable_shards:
-                    if shard.replica_id != 0:
-                        continue
-                    start = shard.index[1].start or 0
-                    local = np.asarray(shard.data)[0,:,0,:]
-                    for i in range(min(local.shape[0], nmu-start)):
-                        hasher = hashers.setdefault(start+i, hashlib.sha256())
-                        hasher.update(np.asarray(local[i], dtype="<c16").tobytes())
-                del C, shard, local
+                with timing.section("factor_read_and_validation"):
+                    C = io.read_slab("factor", shape=(1,ncan,1,c1-c0), offset=(q,0,0,c0),
+                                     partition_spec=P(None,"x",None,None))
+                    count = np.asarray([max(0, min(c1-c0, active_count-c0))], np.int64)
+                    _check_factor(C, poles[:,c0:c1], count)
+                with timing.section("host_digest_hashing"):
+                    local = None
+                    for shard in C.addressable_shards:
+                        if shard.replica_id != 0:
+                            continue
+                        start = shard.index[1].start or 0
+                        local = np.asarray(shard.data)[0,:,0,:]
+                        for i in range(min(local.shape[0], nmu-start)):
+                            hasher = hashers.setdefault(start+i, hashlib.sha256())
+                            hasher.update(np.asarray(local[i], dtype="<c16").tobytes())
+                    del C, shard, local
             row_hash = np.zeros((nmu,32), np.uint32)
             for row, hasher in hashers.items():
                 row_hash[row] = np.frombuffer(hasher.digest(), np.uint8)
-            row_hash = psum_replicate(row_hash, mesh)
-            digest.update(row_hash.astype(np.uint8).tobytes())
-            digest.update(np.asarray(host_poles, dtype="<f8").tobytes())
+            with timing.section("digest_reduction"):
+                row_hash = psum_replicate(row_hash, mesh)
+                digest.update(row_hash.astype(np.uint8).tobytes())
+                digest.update(np.asarray(host_poles, dtype="<f8").tobytes())
     return digest.hexdigest()
 
 
