@@ -641,6 +641,16 @@ def main(argv=None):
 			f"mu={oneshot_occupation_state.mu_ry * RYD_TO_EV:.8f} eV, "
 			f"width={oneshot_occupation_state.smearing_width_ry:.10f} Ry, "
 			f"occ_hash={oneshot_occupation_state.occ_hash}")
+	if config.sigma.w_model == "shared_pole" and qp_solver is not QPSolver.SELF_CONSISTENT:
+		from .shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
+		from centroid.sampling_metric import full_k_quadrature_weights
+		bind_shared_pole_census(
+			wfns, meta, occupation_state=oneshot_occupation_state,
+			trs_allowed=sym.trs_allowed,
+			state_capacity=wfn.occupation_state_capacity,
+			kweights=full_k_quadrature_weights(wfn, sym))
+		meta.shared_pole_recipe = resolve_shared_pole_recipe(
+			config, wfns, meta, mesh_xy=mesh_xy, print_fn=print0)
 	# Bispinor: σ^B reads V^{i,j} tiles from v_q_bispinor.h5 and
 	# samples ψ at the transverse-centroid Wfns bundle (None when
 	# bispinor=False or centroids_file_current is unset).
