@@ -131,6 +131,9 @@ class CapacityLedger:
         Logical ``nk_tot``, ``nspinor`` and ``n_rmu`` from the current deck.
     mesh_xy : Mesh
         Named processor axes x/y. U=16*Q*(spin*mu)^2/(Px*Py) bytes/rank.
+    device_budget_bytes : int, optional
+        Resolved per-device budget in bytes. Production supplies the deck
+        budget; standalone synthetic callers default conservatively to 3U.
 
     Each reservation owns disjoint device resident/workspace bytes computed by its
     caller for its ACTUAL batch sizes, including packing and native workspace.
@@ -144,7 +147,7 @@ class CapacityLedger:
     copy larger than its device panel (coordinator ruling 11).
     """
 
-    def __init__(self, meta, *, mesh_xy):
+    def __init__(self, meta, *, mesh_xy, device_budget_bytes=None):
         import operator
         geometry = dict(nq=meta.nk_tot, nspinor=meta.nspinor, nmu=meta.n_rmu,
                         px=mesh_xy.shape['x'], py=mesh_xy.shape['y'])
@@ -161,6 +164,13 @@ class CapacityLedger:
         self.U_bytes_per_rank = self._global_unit_bytes / (g['px'] * g['py'])
         self.limit_bytes_per_rank = (shared_real_pole_gates_v1_r3b['capacity']['threshold']
                                      * self.U_bytes_per_rank)
+        # Production supplies the resolved deck budget. Standalone synthetic
+        # callers retain their conservative 3U budget until they supply one.
+        self.device_budget_bytes_per_rank = (
+            int(self.limit_bytes_per_rank) if device_budget_bytes is None
+            else self._bytes(device_budget_bytes))
+        if self.device_budget_bytes_per_rank <= 0:
+            raise ValueError("capacity device budget must be positive")
         self.entries = []
         self._accepted = {}
         self._live_stages = None
@@ -227,27 +237,41 @@ class CapacityLedger:
         total = resident + workspace + sum(
             self._accepted[name]['resident_bytes_per_rank']
             + self._accepted[name]['workspace_bytes_per_rank'] for name in live)
-        passed = total <= self.limit_bytes_per_rank
+        scaling_passed = total <= self.limit_bytes_per_rank
+        # Stream and Sigma are sequential inherited phases, not simultaneous
+        # allocations. Retain the larger recorded peak conservatively.
+        inherited = max((row.get('value', {}).get('shared_bytes_per_rank') or 0
+                         for row in (self.stream_peak, self.sigma_peak)
+                         if isinstance(row.get('value'), dict)), default=0)
+        available = max(0, self.device_budget_bytes_per_rank - inherited)
+        passed = total <= available
         g = self.geometry
         max_ranks = math.floor(self.limit_bytes_per_rank * g['px'] * g['py'] / total) if total else None
         reason = ('actual-batch analytical admission; peak not measured' if passed else
-                  f"aggregate {total} B/rank exceeds {self.limit_bytes_per_rank} B/rank; "
+                  f"aggregate {total} B/rank exceeds available device budget {available} B/rank; "
                   f"geometry Q={g['nq']}, spin={g['nspinor']}, mu={g['nmu']}, "
                   f"Px={g['px']}, Py={g['py']}; at these fixed reservation bytes "
                   f"want Px*Py <= {max_ranks}; reprice actual batches/workspaces "
                   "for any changed geometry, or reduce concurrent live bytes")
         row = gate_receipt('capacity', total / self.U_bytes_per_rank,
-                           passed=passed, reason=reason)
+                           passed=scaling_passed, reason=reason)
+        row['status'] = 'FAIL' if not passed else ('PASS' if scaling_passed else 'WARN')
+        if passed and not scaling_passed:
+            row['reason'] = 'above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured'
         row.update(stage=stage, resident_bytes_per_rank=resident,
                    workspace_bytes_per_rank=workspace,
                    aggregate_bytes_per_rank=total,
                    limit_bytes_per_rank=self.limit_bytes_per_rank,
+                   device_budget_bytes_per_rank=self.device_budget_bytes_per_rank,
+                   inherited_peak_bytes_per_rank=inherited,
+                   available_device_bytes_per_rank=available,
+                   device_budget_status='PASS' if passed else 'FAIL',
                    concurrent_with=sorted(live), live_stages=sorted(live | {stage}),
                    geometry=dict(g), max_mesh_ranks_at_fixed_bytes=max_ranks)
         self.entries.append(row)
         if not passed:
             raise MemoryError(f"GATE shared_pole_capacity: stage={stage}; got: {reason}; "
-                              "why: aggregate live allocation must not exceed 3U")
+                              "why: aggregate live allocation must not exceed the remaining device budget")
         self._accepted[stage] = row
         return copy.deepcopy(row)
 
@@ -312,6 +336,7 @@ class CapacityLedger:
         return copy.deepcopy(dict(geometry=self.geometry,
                                   U_bytes_per_rank=self.U_bytes_per_rank,
                                   limit_bytes_per_rank=self.limit_bytes_per_rank,
+                                  device_budget_bytes_per_rank=self.device_budget_bytes_per_rank,
                                   entries=self.entries, live_stages=self._live_stages,
                                   measured_peak=self.measured_peak,
                                   stream_peak=self.stream_peak,
@@ -351,7 +376,40 @@ def construction_receipt(measurements=None, *, capacity=None):
             'capacity', aggregate, passed=(all(r['status'] == 'PASS' for r in rows)
                                            and measured['status'] != 'FAIL'),
             reason='plan-time ledger rows; independent measured peak recorded separately'))
+        if (result['gates'][-1]['status'] == 'FAIL'
+                and all(r['status'] != 'FAIL' for r in rows)
+                and measured['status'] != 'FAIL'):
+            result['gates'][-1]['status'] = 'WARN'
+            result['gates'][-1]['reason'] = '3U scaling target exceeded; device-budget admissions passed (coordinator ruling24)'
     return result
+
+
+def bind_shared_pole_sc_identity(meta, state, *, occupation_state, print_fn):
+    """Label current SC scratch, without claiming QP provenance (ruling 22).
+
+    ``state`` supplies the current iteration. Reuse the carried occupation
+    digest or the already-bound insulating census digest; compute no new hash.
+    These labels MUST NOT authenticate restart membership or skip construction.
+    """
+    import operator
+
+    iteration = operator.index(state.iteration)
+    if isinstance(state.iteration, bool) or iteration < 0:
+        raise ValueError("GATE shared_pole_sc_identity: iteration must be a nonnegative integer")
+    recipe = meta.shared_pole_recipe
+    occ_hash = (getattr(occupation_state, 'occ_hash', None)
+                if occupation_state is not None else
+                meta.shared_pole_census.get('occupation_sha256'))
+    if not isinstance(occ_hash, str) or not occ_hash:
+        raise ValueError("GATE shared_pole_sc_identity: current occupation label is missing")
+    identity = dict(hamiltonian=f'sc_map_{iteration}:{occ_hash}',
+                    wavefunctions='qp_rotation_unreceipted',
+                    recipe_hash=recipe['recipe_hash'], gate_hash=recipe['gate_hash'],
+                    authentication='NON-AUTHENTICATING')
+    meta.shared_pole_state_identity = identity
+    print_fn(f"shared-pole SC identity NON-AUTHENTICATING: {identity}; "
+             "scratch only; rebuild every map; no restart reuse or publication")
+    return dict(identity)
 
 
 def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
@@ -374,11 +432,18 @@ def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
     Returns
     -------
     dict or None
-        Small path/identity/digest/K handle, or None ONLY for a typed missing
+        Small one-shot path/identity/digest/K handle, or None ONLY for a typed missing
         member in a committed bundle. Stale/corrupt/partial members refuse.
         The authenticated header comes from the same payload validation.
     """
     from pathlib import Path
+
+    if (str(expected_identity.get('iteration_id', '')).startswith('sc_')
+            or expected_identity.get('wavefunctions') == 'qp_rotation_unreceipted'
+            or expected_identity.get('authentication') == 'NON-AUTHENTICATING'
+            or str(expected_identity.get('hamiltonian', '')).startswith('sc_map_')):
+        raise ValueError("GATE shared_pole_sc_restart: SC models are scratch-only and "
+                         "NON-AUTHENTICATING; rebuild A/B/C on every map")
     from file_io.tagged_arrays import (
         read_shared_pole_restart_member, SharedPoleMemberMissing,
         SharedPoleMemberRefused,
@@ -527,7 +592,9 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
     energies = np.asarray(wfns.enk, dtype=np.float64)[:, :stop]
     if hashlib.sha256(energies.tobytes()).hexdigest() != census['energy_sha256']:
         raise ValueError("GATE shared_pole_census: got: stale energies; want: census rebound at current bands; why: SC must rebuild geometry")
-    meta.shared_pole_capacity = CapacityLedger(meta, mesh_xy=mesh_xy)
+    meta.shared_pole_capacity = CapacityLedger(
+        meta, mesh_xy=mesh_xy,
+        device_budget_bytes=int(config.memory.per_device_gb * 2**30))
     recipe = shared_real_pole_v1_r3b
     tier = config.sigma.w_accuracy
     policy = recipe[tier]

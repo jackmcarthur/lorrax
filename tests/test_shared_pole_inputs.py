@@ -262,3 +262,30 @@ def test_minimax_tolerance_does_not_override_bank(tmp_path):
     assert c.screening.minimax_target_error==1e-3
     _,w,m=fixture()
     assert resolve((c,w,m))['bank_rule_tolerance']==1e-8
+
+@pytest.mark.parametrize('tier', ['production', 'relaxed'])
+def test_shared_mp1_refuses_positive_measure(tmp_path, tier):
+    with pytest.raises(ValueError) as caught:
+        parse(tmp_path, 'compute_mode=mpa\nsigma_w_model=shared_pole\n'
+              f'sigma_w_accuracy={tier}\nocc_smearing_family=mp1\n'
+              'occ_smearing_width_ry=.01\nfermi_reference=mp1_fixed_n\n')
+    assert str(caught.value) == (
+        'shared_pole needs a positive spectral measure: MP1 occupations '
+        'are non-monotonic; use occ_smearing_family = fd')
+
+
+@pytest.mark.parametrize('model,family', [('shared_pole', 'fd'), ('mpa', 'fd'), ('mpa', 'mp1')])
+def test_supported_metal_family(tmp_path, model, family):
+    c = parse(tmp_path, f'compute_mode=mpa\nsigma_w_model={model}\n'
+              f'occ_smearing_family={family}\nocc_smearing_width_ry=.01\n'
+              'fermi_reference=mp1_fixed_n\n')
+    assert c.occ_smearing_family == family
+    assert c.occ_broadening_ry == .01
+
+
+@pytest.mark.parametrize('entry', ['occ_smearing_family=fermi_dirac\nocc_smearing_width_ry=.01',
+                                  'occ_smearing_family=fd',
+                                  'occ_smearing_family=fd\nocc_smearing_width_ry=0'])
+def test_fd_grammar_refusal_twins(tmp_path, entry):
+    with pytest.raises(ValueError):
+        parse(tmp_path, 'compute_mode=mpa\n' + entry + '\n')
