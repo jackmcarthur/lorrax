@@ -687,6 +687,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 def _get_chi_fractional_contour_kernel(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int,
     *, layout: str = "legacy", face_shape=None, k_unfold_plan=None,
+    selected_q=None, pair_mode="retarded", bank_carry=False,
 ):
     """Retarded finite-occupation chi0 on one positive-time sweep.
 
@@ -704,6 +705,10 @@ def _get_chi_fractional_contour_kernel(
     ``_get_chi_minimax_kernel``'s own legacy/face dispatcher split — the
     cache-management lines below moved here from the (now pure-builder)
     legacy body, exactly as that split's own precedent.
+
+    Bank selection, pair mode and carry layout are static parts of this
+    same cache key. Current wavefunctions, energies and projection rows
+    remain operands, so rebuilding a bank on the same mesh reuses code.
     """
     from ffi import ffi_dial_key
 
@@ -715,8 +720,13 @@ def _get_chi_fractional_contour_kernel(
         raise ValueError(
             f"_get_chi_fractional_contour_kernel: layout must be 'legacy' "
             f"or 'face', got {layout!r}")
+    selected_q = None if selected_q is None else tuple(int(q) for q in selected_q)
+    if layout == "legacy" and (
+            selected_q is not None or pair_mode != "retarded" or bank_carry):
+        raise ValueError("fractional contour bank selection/carry requires layout='face'")
     cache_key = ("fractional_contour", id(mesh_xy), grid, ffi_dial_key(),
-                 n_out, layout, face_shape, id(k_unfold_plan))
+                 n_out, layout, face_shape, id(k_unfold_plan),
+                 selected_q, pair_mode, bool(bank_carry))
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -728,7 +738,8 @@ def _get_chi_fractional_contour_kernel(
                 "_get_chi_fractional_contour_kernel(layout='face') requires "
                 "face_shape=(nk, nb_full, n_rmu, nspinor)")
         kernel = _get_chi_fractional_contour_kernel_face(
-            mesh_xy, grid, n_out, face_shape, k_unfold_plan=k_unfold_plan)
+            mesh_xy, grid, n_out, face_shape, k_unfold_plan=k_unfold_plan,
+            selected_q=selected_q, pair_mode=pair_mode, bank_carry=bank_carry)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 

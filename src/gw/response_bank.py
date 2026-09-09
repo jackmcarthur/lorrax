@@ -139,7 +139,7 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     time, projections, final weights and energy reference. The output is
     ``[len(q_ids), n_outputs, mu_p, mu_p]`` with both endpoints sharded.
     """
-    from .w_isdf import _get_chi_fractional_contour_kernel_face
+    from .w_isdf import _get_chi_fractional_contour_kernel
 
     if wfns.layout != "face" or int(meta.nspinor) != 1:
         raise ValueError("GATE response_representation: got non-scalar or legacy "
@@ -150,9 +150,9 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     parent = None if carrier is None else carrier.plan
     nk = int(meta.nk_tot) if parent is None else int(parent.n_parent)
     n = int(meta.mu_basis.n_packed)
-    kernel = _get_chi_fractional_contour_kernel_face(
+    kernel = _get_chi_fractional_contour_kernel(
         mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
-        (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
+        layout="face", face_shape=(nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
         k_unfold_plan=parent, selected_q=tuple(q_ids), pair_mode=pair_mode,
         bank_carry=bank_carry)
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
