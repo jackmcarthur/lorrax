@@ -12,6 +12,8 @@ there is no local vendor or alternative eigensolver in this physics owner.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import jax.numpy as jnp
 
 
@@ -218,6 +220,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
         "gram_diagonal_positive": diagonal_ok,
         "gram_valid": gram_ok,
         "gram_min_relative": ratio,
+        "gram_spectrum_relative": gamma / jnp.where(largest > 0, largest, 1)[:, None],
         "retained_rank": count,
         "gram_condition": largest / jnp.min(jnp.where(keep, gamma, jnp.inf), axis=-1),
         "retained_metric_positive": metric_ok,
@@ -287,7 +290,46 @@ def apply_shared_pole_zero_policy(model, *, gates):
     }
 
 
-def sort_shared_pole_columns(model):
+@lru_cache(maxsize=None)
+def _factor_column_permutation(mesh):
+    """Stream a joint pole-column permutation through one y tile at a time.
+
+    A global gather of C replicates the complete K axis on each x row.
+    Instead, each y shard circulates its input tile and selects only the
+    columns belonging to its output tile. The scan carries one input tile
+    and one output tile; neither grows with the number of y shards.
+    """
+    from functools import partial
+    import jax
+    from jax.sharding import PartitionSpec as P
+    from common.shard_map import shard_map
+
+    ny = int(mesh.shape["y"])
+    neighbors = tuple((i, (i+1) % ny) for i in range(ny))
+
+    @jax.jit
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P(None, "x", "y"), P(None, "y")),
+             out_specs=P(None, "x", "y"), check_vma=False)
+    def permute(factor, order):
+        width = factor.shape[-1]
+        def visit(carry, _):
+            tile, output, source = carry
+            local = order - source * width
+            selected = jnp.take_along_axis(
+                tile, jnp.clip(local, 0, width-1)[:, None, :], axis=-1)
+            belongs = (local >= 0) & (local < width)
+            output = jnp.where(belongs[:, None, :], selected, output)
+            tile = jax.lax.ppermute(tile, "y", neighbors)
+            return (tile, output, (source-1) % ny), None
+        (_, output, _), _ = jax.lax.scan(
+            visit, (factor, jnp.zeros_like(factor), jax.lax.axis_index("y")),
+            None, length=ny)
+        return output
+    return permute
+
+
+def sort_shared_pole_columns(model, *, mesh_xy):
     """Sort joint active C/Lambda columns, retaining ties and safe padding.
 
     Returns the same three model arrays and the replicated [b,Kp]
@@ -296,7 +338,7 @@ def sort_shared_pole_columns(model):
     """
     c, poles, active = model
     order = jnp.argsort(jnp.where(active, poles, jnp.inf), axis=-1, stable=True)
-    c = jnp.take_along_axis(c, order[:, None, :], axis=-1)
+    c = _factor_column_permutation(mesh_xy)(c, order)
     poles = jnp.take_along_axis(poles, order, axis=-1)
     active = jnp.take_along_axis(active, order, axis=-1)
     return (jnp.where(active[:, None, :], c, 0), jnp.where(active, poles, 1), active), order
@@ -478,6 +520,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     identity = bank["identity"]
     ledger = meta.shared_pole_capacity
     upstream = ledger.live_stages
+    if "constructor" not in bank.get("workspace_bytes_per_rank", {}):
+        raise ValueError("GATE shared_pole_capacity: got: absent constructor native workspace bound; want: provider-owned bytes for resolved n/2n/R plans; why: compiled carriers alone do not certify aggregate 3U")
     workspace = bank["workspace_bytes_per_rank"]["constructor"]
     header = validate_shared_pole_bank(bank["path"], expected_identity=identity,
                                        mesh_xy=mesh_xy, require_complete=True)
@@ -591,7 +635,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                    for value in retained.values()):
             raise ValueError(f"GATE shared_pole_retained_moments: got: failed at q={q}; want: projected latent moment identity <=1e-10; why: corrected Ritz algebra")
         del pencil, coefficients, selector, active_columns
-        model, permutation = sort_shared_pole_columns(model)
+        model, permutation = sort_shared_pole_columns(model, mesh_xy=mesh_xy)
         expose_live((*model, qi))
         coulomb_sqrt, inverse_sqrt, coulomb_receipt = response_coulomb_powers(
             meta, config, mesh_xy=mesh_xy, bank_io=bank, q_span=span)

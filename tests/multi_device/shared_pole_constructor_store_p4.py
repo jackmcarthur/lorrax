@@ -1,8 +1,7 @@
-"""P4 constructor/store integration with a declared planted Coulomb adapter.
+"""P4 constructor/store integration with an authenticated planted Coulomb resource.
 
-The scratch and compact-model transports are the production store. Only the
-unpublished response Coulomb accessor is replaced by the exact identity on
-the planted centroid support. No real-bank or response-owner claim is made.
+The scratch and compact-model transports are the production store. The response owner reads an exact identity on the planted centroid support
+through its authenticated public accessor. No campaign-bank claim is made.
 """
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,7 +19,6 @@ def run_checks(mesh, directory):
     from symmetry_maps import QirrTables
     from file_io import shared_pole_store as store
     from file_io.slab_io import SlabIO
-    from gw import w_isdf
     from gw.shared_pole_constructor import construct_shared_poles
     from gw.shared_pole_recipe import ROLE_CODES, RECIPE_HASH, GATE_HASH, CapacityLedger
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -81,81 +79,83 @@ def run_checks(mesh, directory):
             M3=packed(((c*t) @ c.conj().T/2)[None], P(None, 'x', 'y')),
             meta=meta, expected_identity=identity, mesh_xy=mesh)
 
-    def exact_coulomb(meta, config, *, mesh_xy, bank_io, q_span):
-        value = packed(np.eye(7, dtype=np.complex128)[None], P(None, 'x', 'y'))
-        return value, value, {"scope": "planted identity adapter; response accessor NOT_MEASURED"}
-
-    original = getattr(w_isdf, "response_coulomb_powers", None)
-    w_isdf.response_coulomb_powers = exact_coulomb
+    import hashlib
+    vpath = directory / "coulomb.h5"
+    ncan = meta.mu_basis.n_canonical
+    value = np.zeros((3, ncan, ncan), np.complex128)
+    value[:, :7, :7] = np.eye(7)
+    v = jax.make_array_from_callback(value.shape, NamedSharding(mesh, P(None, 'x', 'y')),
+                                      lambda index: value[index])
+    with SlabIO(vpath, mode='w', mesh=mesh) as io:
+        io.create_dataset('V', shape=(3, 7, 7), dtype=np.complex128)
+        io.write_slab('V', v)
+    del v
+    coulomb = dict(path=str(vpath), dataset='V',
+                   sha256=hashlib.sha256(vpath.read_bytes()).hexdigest(),
+                   q_irr_full_idx=tables['q_irr_full_idx'].tolist(), basis='canonical')
     meta.shared_pole_capacity.live_stages = ()
     rows = []
-    try:
-        bank = dict(path=path, identity=identity, tables=tables, coulomb={},
-                    resident_bytes_per_rank=0, workspace_bytes_per_rank={"constructor": 0})
-        for layout in ('local', 'distributed'):
-            output = directory / f"model_{layout}.h5"
-            config = SimpleNamespace(backend=SimpleNamespace(linalg=layout))
-            result = construct_shared_poles(bank, {"path": path}, meta, config,
-                                            mesh_xy=mesh, output=output)
-            header = store.validate_shared_pole_model(output, expected_identity=identity,
-                mesh_xy=mesh, capacity=meta.shared_pole_capacity)
-            assert header['K'] == [3, 5, 4], header['K']
-            errors = []
-            with SlabIO(output, mode='r', mesh=mesh) as io:
-                for q, (c, t) in enumerate(expected):
-                    cc, _, pp, _ = store.read_shared_pole_faces(
-                        io, (q, q+1), meta=meta, header=header)
-                    np.testing.assert_allclose(np.asarray(pp)[0, :len(t)], t, rtol=0, atol=1e-10)
-                    diagonal = meta.mu_basis.pack_host(np.sum(abs(c)**2, axis=-1), axis=0)[None, :, None]
-                    target = jax.make_array_from_callback(diagonal.shape,
-                        NamedSharding(mesh, P(None, 'x', None)), lambda index: diagonal[index])
-                    relative = float(jnp.linalg.norm(jnp.sum(abs(cc)**2, axis=-1)-target)/jnp.linalg.norm(target))
-                    assert relative < 1e-10, relative
-                    del cc, pp, target
-                    errors.append(max(result['q_receipts'][q]['constructor']['retained_moment_relative']['M1'] +
-                                      result['q_receipts'][q]['constructor']['retained_moment_relative']['M3']))
-            assert max(errors) < 1e-10
-            assert all(row['status'] != 'FAIL' for receipt in result['q_receipts'] for row in receipt['gates'])
-            # A changed resolved coordinate must refuse before a model write.
-            old_z = recipe['z_ry'].copy()
-            recipe['z_ry'][2] += .01
-            refused = False
-            try:
-                construct_shared_poles(bank, {"path": path}, meta, config,
-                                       mesh_xy=mesh, output=directory/f"stale_{layout}.h5")
-            except ValueError as error:
-                refused = 'changed z' in str(error)
-            finally:
-                recipe['z_ry'][:] = old_z
-            assert refused and not (directory/f"stale_{layout}.h5").exists()
-            rows.append(dict(name='constructor_store_ragged_stale', layout=layout, status='PASS',
-                             K=header['K'], retained_moment_max=max(errors), constructor=result))
-        for layout in ('local', 'distributed'):
-            # Independent red map: upstream already owns the full 3U budget.
-            # Admission must fail before opening any matrix payload or output.
-            ledger = CapacityLedger(meta, mesh_xy=mesh)
-            meta.shared_pole_capacity = ledger
-            ledger.reserve('planted_upstream',
-                           resident_bytes_per_rank=int(ledger.limit_bytes_per_rank),
-                           workspace_bytes_per_rank=0)
-            ledger.live_stages = ('planted_upstream',)
-            config = SimpleNamespace(backend=SimpleNamespace(linalg=layout))
-            output = directory/f"capacity_refused_{layout}.h5"
-            refused = False
-            try:
-                construct_shared_poles(bank, {"path": path}, meta, config,
-                                       mesh_xy=mesh, output=output)
-            except MemoryError as error:
-                refused = 'shared_pole_capacity' in str(error)
-            assert refused and not output.exists()
-            assert ledger.receipt()['entries'][-1]['status'] == 'FAIL'
-            rows.append(dict(name='constructor_capacity_refusal', layout=layout, status='PASS',
-                             capacity=ledger.receipt()))
-    finally:
-        if original is None:
-            del w_isdf.response_coulomb_powers
-        else:
-            w_isdf.response_coulomb_powers = original
+    bank = dict(path=path, identity=identity, tables=tables, coulomb=coulomb,
+                workspace_bytes_per_rank={"constructor": 0})
+    for layout in ('local', 'distributed'):
+        output = directory / f"model_{layout}.h5"
+        config = SimpleNamespace(backend=SimpleNamespace(linalg=layout))
+        result = construct_shared_poles(bank, {"path": path}, meta, config,
+                                        mesh_xy=mesh, output=output)
+        header = store.validate_shared_pole_model(output, expected_identity=identity,
+            mesh_xy=mesh, capacity=meta.shared_pole_capacity)
+        assert header['K'] == [3, 5, 4], header['K']
+        errors = []
+        with SlabIO(output, mode='r', mesh=mesh) as io:
+            for q, (c, t) in enumerate(expected):
+                cc, _, pp, _ = store.read_shared_pole_faces(
+                    io, (q, q+1), meta=meta, header=header)
+                np.testing.assert_allclose(np.asarray(pp)[0, :len(t)], t, rtol=0, atol=1e-10)
+                diagonal = meta.mu_basis.pack_host(np.sum(abs(c)**2, axis=-1), axis=0)[None, :, None]
+                target = jax.make_array_from_callback(diagonal.shape,
+                    NamedSharding(mesh, P(None, 'x', None)), lambda index: diagonal[index])
+                relative = float(jnp.linalg.norm(jnp.sum(abs(cc)**2, axis=-1)-target)/jnp.linalg.norm(target))
+                assert relative < 1e-10, relative
+                del cc, pp, target
+                errors.append(max(result['q_receipts'][q]['constructor']['retained_moment_relative']['M1'] +
+                                  result['q_receipts'][q]['constructor']['retained_moment_relative']['M3']))
+        assert max(errors) < 1e-10
+        assert all(row['status'] != 'FAIL' for receipt in result['q_receipts'] for row in receipt['gates'])
+        # A changed resolved coordinate must refuse before a model write.
+        old_z = recipe['z_ry'].copy()
+        recipe['z_ry'][2] += .01
+        refused = False
+        try:
+            construct_shared_poles(bank, {"path": path}, meta, config,
+                                   mesh_xy=mesh, output=directory/f"stale_{layout}.h5")
+        except ValueError as error:
+            refused = 'changed z' in str(error)
+        finally:
+            recipe['z_ry'][:] = old_z
+        assert refused and not (directory/f"stale_{layout}.h5").exists()
+        rows.append(dict(name='constructor_store_ragged_stale', layout=layout, status='PASS',
+                         K=header['K'], retained_moment_max=max(errors), constructor=result))
+    for layout in ('local', 'distributed'):
+        # Independent red map: upstream already owns the full 3U budget.
+        # Admission must fail before opening any matrix payload or output.
+        ledger = CapacityLedger(meta, mesh_xy=mesh)
+        meta.shared_pole_capacity = ledger
+        ledger.reserve('planted_upstream',
+                       resident_bytes_per_rank=int(ledger.limit_bytes_per_rank),
+                       workspace_bytes_per_rank=0)
+        ledger.live_stages = ('planted_upstream',)
+        config = SimpleNamespace(backend=SimpleNamespace(linalg=layout))
+        output = directory/f"capacity_refused_{layout}.h5"
+        refused = False
+        try:
+            construct_shared_poles(bank, {"path": path}, meta, config,
+                                   mesh_xy=mesh, output=output)
+        except MemoryError as error:
+            refused = 'shared_pole_capacity' in str(error)
+        assert refused and not output.exists()
+        assert ledger.receipt()['entries'][-1]['status'] == 'FAIL'
+        rows.append(dict(name='constructor_capacity_refusal', layout=layout, status='PASS',
+                         capacity=ledger.receipt()))
     return rows
 
 
@@ -171,7 +171,7 @@ def main():
     if jax.process_index() == 0:
         args.output.write_text(json.dumps(dict(status='PASS', checks=rows,
             expected_checks=4, jobid=os.environ['SLURM_JOB_ID'], stepid=os.environ['SLURM_STEP_ID'],
-            scope='P4 constructor and actual scratch/model store; planted Coulomb adapter; no response accessor verification'),
+            scope='P4 constructor and actual scratch/model store plus authenticated response Coulomb accessor; planted positive measure; native workspace NOT_MEASURED'),
             indent=2, allow_nan=False)+'\n')
     finalize_process()
 

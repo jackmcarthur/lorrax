@@ -90,7 +90,7 @@ def run_checks(mesh):
         selector = np.broadcast_to(np.eye(side, dtype=np.complex128)[:, -2:], (2, side, 2))
         retained = retained_moment_identity(pencil, coefficients, model, placed(selector), matmul=mm)
         assert max(float(jnp.max(v)) for v in retained.values()) < 1e-10, retained
-        model, order = sort_shared_pole_columns(model)
+        model, order = sort_shared_pole_columns(model, mesh_xy=mesh)
         factor, t, mask = model
         counts = np.asarray(jnp.sum(mask, axis=-1)).tolist()
         assert counts == [7, 9], (layout, counts)
