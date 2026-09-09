@@ -627,9 +627,12 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         return max(dense+native["total"],4*width*face_bytes+native["total"])
 
     minimum = headroom+live_bytes+2*face_bytes+dense_bytes(1)
-    planning_limit = min(scaling_target,device_available)
-    if minimum > planning_limit:
-        planning_limit = device_available
+    # R24 makes 3U a reported scaling target, not the device admission limit.
+    # Replaying a Green/FFT stream to meet that preference repeats every time
+    # node even when the complete output panel fits. Use the ledger's remaining
+    # device budget, including the inherited stream and ambient/native costs;
+    # larger systems still split q/sample panels before any allocation.
+    planning_limit = device_available
     available = planning_limit-headroom-live_bytes
     qwidth = min(len(qids),int((available-dense_bytes(1))//(2*face_bytes)))
     receipt["panel_budget"] = dict(
@@ -640,7 +643,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         ambient_live_bytes_per_rank=live_bytes,headroom_bytes_per_rank=headroom,
         native_workspace=native,planning_limit_bytes_per_rank=planning_limit,
         minimum_panel_bytes_per_rank=minimum,
-        policy="prefer 3U panels; remaining device budget is the refusal limit (ruling24)")
+        policy="minimize stream replays within remaining device budget; report 3U scaling target (ruling24)")
     if qwidth < 1:
         raise ValueError(f"GATE response_capacity: one q/sample panel needs {minimum} B/rank "
                          f"including live/native costs; remaining device budget is {device_available} B/rank "
@@ -718,6 +721,6 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             del raw
     ledger.live_stages = ambient
     receipt["stream_passes"] = len(receipt["batches"])
-    receipt["batch_reason"] = "full plan admitted" if len(receipt["batches"]) == 1 else "preferred 3U or remaining device-budget panels require bounded replays; see panel_budget and panel_plans"
+    receipt["batch_reason"] = "full plan admitted" if len(receipt["batches"]) == 1 else "remaining device-budget panels require bounded replays; see panel_budget and panel_plans"
     receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
     return _finish_receipt(receipt,meta,header,started)
