@@ -93,11 +93,13 @@ punctilio — it is the failure mode.
 
 from __future__ import annotations
 
+from distrib_la.workspace import workspace_bytes_per_rank
 from distrib_la.dispatch import dispatch_batched_eigh
 from distrib_la.factor import FactorToken, factor, solve
 from distrib_la.loader import dial_key, has_target, probe_target
 from distrib_la.matmul import (
     MATMUL_BACKEND_CHOICES,
+    contract_faces,
     matmul,
     resolve_matmul_backend,
 )
@@ -115,7 +117,8 @@ from distrib_la.plan import (
     ensure_sharding,
     plan,
 )
-from distrib_la.polar import PolarPlan, plan_polar_factor, polar_factor
+from distrib_la.polar import (PolarPlan, plan_polar_factor, polar_factor,
+                             right_singular_vectors, leading_eigenvectors)
 from distrib_la.resolve import (
     BACKEND_CHOICES,
     CHOLESKY_BACKENDS,
@@ -133,11 +136,12 @@ from distrib_la.resolve import (
 
 __all__ = [
     # plan
-    "Plan", "plan", "ensure_sharding", "DONATES",
+    "Plan", "plan", "ensure_sharding", "DONATES", "workspace_bytes_per_rank",
     # polar / SVD
     "PolarPlan", "plan_polar_factor", "polar_factor",
+    "right_singular_vectors", "leading_eigenvectors",
     # distributed matrix multiplication
-    "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES",
+    "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES", "contract_faces",
     # planned N,N GEMM (trace-safe, for hot loops)
     "GemmPlan", "gemm_plan",
     # the batched route toggle and its dial

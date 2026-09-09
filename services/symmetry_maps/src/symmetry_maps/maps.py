@@ -780,15 +780,13 @@ def unfold_isdf_operator(
         for label, global_perm, local_perm, chunk in (
                 ("left", fwd_perm, left_local_perm, left_chunk),
                 ("right", fwd_perm_right, right_local_perm, right_chunk)):
-            target_owner = np.arange(global_perm.shape[1]) // chunk
-            source_owner = global_perm // chunk
-            if not np.array_equal(
-                    source_owner, np.broadcast_to(
-                        target_owner, source_owner.shape)):
+            cert = certify_endpoint_locality(
+                global_perm, mesh=mesh_xy, mesh_axis='x' if label == 'left' else 'y')
+            if not cert['is_local']:
                 raise ValueError(
                     "unfold_isdf_operator: axis-local certification failed: "
                     f"the {label} global source map crosses an axis shard.")
-            if not np.array_equal(local_perm, global_perm % chunk):
+            if not np.array_equal(local_perm, cert['local_perm']):
                 raise ValueError(
                     "unfold_isdf_operator: axis-local certification failed: "
                     f"the {label} local offsets disagree with the global "
@@ -941,6 +939,170 @@ def _permute_isdf_operator_axes_local(
 _UNFOLD_ISDF_OPERATOR_JIT_CACHE: dict = {}
 
 
+def certify_endpoint_locality(source_perm, *, mesh, mesh_axis, active_mask=None):
+    """Authenticate packed endpoint maps and report shard locality.
+
+    source_perm[operation,mu] contains global packed source indices. The
+    optional active_mask[mu] marks physical rows (holes need not be suffixes).
+    Returns a plain dict with is_local, crossing_count and local_perm (None
+    when routing is required). This is an eager certificate of actual maps,
+    not an assumption about how the centroids were generated.
+    """
+    perm = np.asarray(source_perm)
+    if perm.ndim != 2 or perm.dtype.kind not in 'iu':
+        raise ValueError("source_perm must be an integer [operation,mu] table")
+    if mesh_axis not in ('x', 'y') or mesh_axis not in mesh.shape:
+        raise ValueError("endpoint mesh_axis must be x or y")
+    n = perm.shape[1]
+    parts = int(mesh.shape[mesh_axis])
+    if n < 1 or n % parts:
+        raise ValueError("endpoint carrier must tile its mesh axis")
+    if np.any(perm < 0) or np.any(perm >= n):
+        raise ValueError("endpoint source index is outside its packed carrier")
+    if not np.all(np.sort(perm, axis=1) == np.arange(n)):
+        raise ValueError("each endpoint source row must be a permutation")
+    if active_mask is not None:
+        active = np.asarray(active_mask, dtype=bool)
+        if active.shape != (n,) or not np.all(active[perm] == active[None, :]):
+            raise ValueError("endpoint maps must preserve physical rows and packed holes")
+    chunk = n // parts
+    crossing = int(np.count_nonzero(perm // chunk != np.arange(n)[None, :] // chunk))
+    return dict(is_local=crossing == 0, crossing_count=crossing,
+                local_perm=(perm % chunk).astype(np.int32) if crossing == 0 else None,
+                endpoint_extent=n, shard_extent=chunk, mesh_axis=mesh_axis)
+
+
+def endpoint_panel_cost(shape, n_children, *, mesh, mesh_axis, dtype):
+    """Conservative live-byte and ring-traffic bounds for one endpoint panel.
+
+    shape is [parents,mu,spin,Kpanel]. Input, output, two rotating/selection
+    buffers and elementwise scratch are included; the caller budgets both
+    endpoints plus all other live stages against its aggregate limit.
+    The reported bytes are analytical bounds, not a compiled peak receipt.
+    """
+    if len(shape) != 4 or mesh_axis not in ('x', 'y'):
+        raise ValueError("endpoint panel requires [parents,mu,spin,K] and axis x|y")
+    b, m, spin, k = map(int, shape)
+    parts = int(mesh.shape[mesh_axis])
+    if min(b, m, spin, k, int(n_children)) < 1 or m % parts:
+        raise ValueError("endpoint panel extents must be positive and tile its axis")
+    item = np.dtype(dtype).itemsize
+    parent_bytes = b * (m // parts) * spin * k * item
+    child_bytes = int(n_children) * (m // parts) * spin * k * item
+    # Replicated metadata: source offsets, wraps, phases, action and q rows.
+    metadata = int(n_children) * (m * (4 + 24 + 16) + 24 + spin * spin * item)
+    return dict(estimated_live_bytes_per_rank=2 * parent_bytes + 6 * child_bytes + metadata,
+                ring_bytes_per_rank=(parts - 1) * child_bytes,
+                ring_steps=parts - 1, parent_bytes_per_rank=parent_bytes,
+                child_bytes_per_rank=child_bytes)
+
+
+def unfold_endpoint_panel(factor_face, *, irr_idx, sym_idx, q_irr_frac,
+                          source_perm, L_table, spin_action_full,
+                          n_sym_spatial, active_mask, mesh, mesh_axis,
+                          max_live_bytes):
+    """Route and transform a bounded factor panel through the ψ action owner.
+
+    factor_face[parents,mu,spin,Kpanel] uses P(None,mesh_axis,None,None).
+    irr_idx/sym_idx[children] name only the requested bounded child-q panel;
+    source_perm and L_table are complete packed operation tables. No all-star
+    factor cache is constructed. A ring sends one local child panel at a
+    time, using only local source-offset gathers. The same routine also
+    handles shard-local maps. active_mask[mu] authenticates packed holes.
+
+    Returns (child_face, cost), with child_face[children,mu,spin,Kpanel] in
+    the same row-face layout and a plain analytical cost receipt. The caller
+    supplies a byte budget already admitted against all other live stages.
+    A non-local map costs P_axis-1 collective-permutes per panel per call;
+    phase, antiunitary and spin actions delegate to unfold_wavefunction_local.
+
+    For repeated time-node calls, bind immutable metadata in an outer jit::
+
+        route = jax.jit(lambda factors: unfold_endpoint_panel(
+            factors, **fixed_metadata)[0],
+            in_shardings=face_sharding, out_shardings=face_sharding)
+
+    Reuse that callable for factors of the same shape/dtype/sharding. Its
+    first trace performs metadata authentication and budget admission; the
+    executable accepts only factor panels, never cached child factors.
+    Build a new callable when maps, q coordinates, spin actions or budget
+    change (including a new SC state). Metadata must not mutate after binding.
+    Eager calls remain supported and retain the concrete-sharding refusal.
+    """
+    cert = certify_endpoint_locality(source_perm, mesh=mesh,
+                                     mesh_axis=mesh_axis, active_mask=active_mask)
+    irr = np.asarray(irr_idx, dtype=np.int32)
+    sym = np.asarray(sym_idx, dtype=np.int32)
+    perm = np.asarray(source_perm, dtype=np.int32)
+    wraps = np.asarray(L_table)
+    q = np.asarray(q_irr_frac)
+    spin = np.asarray(spin_action_full)
+    active = np.asarray(active_mask, dtype=bool)
+    if (irr.ndim != 1 or sym.shape != irr.shape or len(irr) == 0
+            or np.any(irr < 0) or np.any(irr >= factor_face.shape[0])
+            or np.any(sym < 0) or np.any(sym >= perm.shape[0])):
+        raise ValueError("endpoint panel parent/operation rows are invalid")
+    ns = factor_face.shape[2]
+    if (factor_face.shape[1] != perm.shape[1]
+            or wraps.shape != perm.shape + (3,)
+            or q.shape != (factor_face.shape[0], 3)
+            or spin.shape != (len(irr), ns, ns)):
+        raise ValueError("endpoint panel factor, wrap, q or spin table shape mismatch")
+    cost = endpoint_panel_cost(factor_face.shape, len(irr), mesh=mesh,
+                               mesh_axis=mesh_axis, dtype=factor_face.dtype)
+    if cert['is_local']:
+        cost.update(ring_steps=0, ring_bytes_per_rank=0)
+    if cost['estimated_live_bytes_per_rank'] > int(max_live_bytes):
+        raise ValueError(f"endpoint panel exceeds max_live_bytes: {cost}")
+    spec = P(None, mesh_axis, None, None)
+    sh = NamedSharding(mesh, spec)
+    # Under an outer jit the input is a tracer, without a concrete sharding.
+    # shard_map's in_specs below own its traced layout. Concrete eager inputs
+    # still refuse implicit redistribution of a large endpoint panel.
+    if (not isinstance(factor_face, jax.core.Tracer)
+            and not factor_face.sharding.is_equivalent_to(sh, 4)):
+        raise ValueError("endpoint panel must already have its row-face sharding")
+    parts = int(mesh.shape[mesh_axis])
+    nlocal = cert['shard_extent']
+    selected = perm[sym]
+    # The permutation is already routed below. The common ψ owner applies
+    # its phase/TR/spin rule with an identity local gather afterwards.
+    identity = np.broadcast_to(np.arange(perm.shape[1]) % nlocal, perm.shape)
+    pairs = [(i, (i + 1) % parts) for i in range(parts)]
+
+    @partial(shard_map, mesh=mesh, in_specs=spec, out_specs=spec, check_vma=False)
+    def route(x):
+        owner = jax.lax.axis_index(mesh_axis)
+        target_sources = jax.lax.dynamic_slice_in_dim(
+            jnp.asarray(selected), owner * nlocal, nlocal, axis=1)
+        offsets = target_sources % nlocal
+        def gather_step(carry, step):
+            current, output = carry
+            held_owner = (owner - step) % parts
+            gathered = jnp.take_along_axis(current, offsets[:, :, None, None], axis=1)
+            output = jnp.where((target_sources // nlocal == held_owner)[:, :, None, None],
+                               gathered, output)
+            if not cert['is_local']:
+                current = jax.lax.cond(
+                    step + 1 < parts,
+                    lambda a: jax.lax.ppermute(a, mesh_axis, pairs),
+                    lambda a: a, current)
+            return (current, output), None
+        current = x[irr]
+        (_, output), _ = jax.lax.scan(
+            gather_step, (current, jnp.zeros_like(current)),
+            jnp.arange(1 if cert['is_local'] else parts), unroll=1)
+        result = unfold_wavefunction_local(
+            output, irr_idx=np.arange(len(irr)), sym_idx=sym,
+            k_irr_frac=q[irr], local_perm=identity, L_table=wraps,
+            spin_action_full=spin, n_sym_spatial=n_sym_spatial,
+            spin_axis=2, mu_axis=1, mesh_axis=mesh_axis)
+        mask = jax.lax.dynamic_slice_in_dim(jnp.asarray(active), owner * nlocal,
+                                            nlocal, axis=0)
+        return jnp.where(mask[None, :, None, None], result, 0)
+    return jax.jit(route)(factor_face), cost
+
+
 def _apply_unfold_phase_and_trs_local(
     V_full_local, phase_mu, phase_nu, trs_mask, *, pair_transpose: bool,
 ):
@@ -978,6 +1140,8 @@ def unfold_operator_local(
     right_local_perm,
     right_L_table,
     n_sym_spatial,
+    trs_rule='conj',
+    transposed_parent_local=None,
 ):
     r"""Transport one local rectangular tile from raw parents to full k.
 
@@ -992,9 +1156,12 @@ def unfold_operator_local(
         X_full[q, mu, nu] = exp(2πi q_irr·(L^L_{s,mu} − L^R_{s,nu}))
                             X_ibz[i(q), alpha^L_s(mu), alpha^R_s(nu)],
 
-    conjugated on antiunitary rows — the ``trs_rule="conj"`` action, which is
-    the only one a pair projector with real band weights and two different
-    endpoints has (there is no transposed partner for a rectangular tile).
+    conjugated on antiunitary rows for ``trs_rule="conj"`` (the existing
+    rectangular pair-projector convention). For ``trs_rule="pair_transpose"``
+    the caller supplies ``transposed_parent_local`` at the same face layout:
+    the complete endpoint transpose with spectral weights unchanged. It is
+    selected BEFORE endpoint gathers; the phase owner conjugates endpoint
+    phases without conjugating that operand. No distributed transpose occurs.
 
     Tables are indexed by typed operation row over the COMPLETE padded
     endpoint: ``left_local_perm``/``right_local_perm`` are
@@ -1006,6 +1173,17 @@ def unfold_operator_local(
     orbit-packing certificate (no gather crosses a shard) belongs to the
     caller's plan; this body cannot check it under ``jit`` and does not try.
     """
+    if trs_rule not in ('conj', 'pair_transpose'):
+        raise ValueError("unfold_operator_local trs_rule must be conj|pair_transpose")
+    pair_transpose = trs_rule == 'pair_transpose'
+    if pair_transpose:
+        if transposed_parent_local is None:
+            raise ValueError("pair_transpose requires transposed_parent_local")
+        if (transposed_parent_local.shape != operator_parent_local.shape
+                or transposed_parent_local.dtype != operator_parent_local.dtype):
+            raise ValueError("transposed_parent_local must match parent shape/dtype")
+    elif transposed_parent_local is not None:
+        raise ValueError("transposed_parent_local requires pair_transpose")
     irr = jnp.asarray(irr_idx, dtype=jnp.int32)
     sym = jnp.asarray(sym_idx, dtype=jnp.int32)
     trs_mask = sym >= int(n_sym_spatial)
@@ -1014,6 +1192,10 @@ def unfold_operator_local(
     right_local_q = jnp.take(
         jnp.asarray(right_local_perm, dtype=jnp.int32), sym, axis=0)
     at_irr = jnp.take(operator_parent_local, irr, axis=0)
+    if pair_transpose:
+        at_irr = jnp.where(trs_mask[:, None, None],
+                           jnp.take(transposed_parent_local, irr, axis=0),
+                           at_irr)
     V_full_local = _permute_isdf_operator_axes_local(
         at_irr, None, None, mesh_x=1, mesh_y=1,
         left_local_source_map=left_local_q,
@@ -1038,7 +1220,7 @@ def unfold_operator_local(
     phase_nu = jax.lax.dynamic_slice_in_dim(
         phase_right, y_idx * nu_local, nu_local, axis=1)
     return _apply_unfold_phase_and_trs_local(
-        V_full_local, phase_mu, phase_nu, trs_mask, pair_transpose=False)
+        V_full_local, phase_mu, phase_nu, trs_mask, pair_transpose=pair_transpose)
 
 
 def unfold_wavefunction_local(
