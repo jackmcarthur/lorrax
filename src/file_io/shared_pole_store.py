@@ -282,6 +282,21 @@ def _write_metadata(io, header):
         io.write_attr("operations/" + name, value)
 
 
+@jax.jit
+def _factor_valid(C, poles2, K):
+    """Reduce the factor contract to one scalar without eager array temporaries.
+
+    C keeps its caller's named row/column sharding; poles2 and K carry
+    squared Ry poles and active counts. The result is a replicated boolean.
+    """
+    active = jnp.arange(C.shape[3])[None, :] < K[:, None]
+    return (jnp.all(jnp.isfinite(C)) & jnp.all(jnp.isfinite(poles2))
+          & jnp.all(jnp.where(active, poles2 > 0, poles2 == 1))
+          & jnp.all(jnp.where(active[:, None, None, :], True, C == 0))
+          & jnp.all(jnp.where(active[:, 1:], poles2[:, 1:] >= poles2[:, :-1], True)))
+
+
+@timing.timed("factor_validation")
 def _check_factor(C, poles2, K):
     """Gate the physical active prefix and exact inactive sentinel."""
     if C.dtype != np.complex128 or poles2.dtype != np.float64 or K.dtype != np.int64:
@@ -290,11 +305,7 @@ def _check_factor(C, poles2, K):
         _refuse("factor/poles/count shape mismatch")
     if np.any(K < 0) or np.any(K > C.shape[3]):
         _refuse("K outside factor column capacity")
-    active = jnp.arange(C.shape[3])[None, :] < jnp.asarray(K)[:, None]
-    ok = (jnp.all(jnp.isfinite(C)) & jnp.all(jnp.isfinite(poles2))
-          & jnp.all(jnp.where(active, poles2 > 0, poles2 == 1))
-          & jnp.all(jnp.where(active[:, None, None, :], True, C == 0))
-          & jnp.all(jnp.where(active[:, 1:], poles2[:, 1:] >= poles2[:, :-1], True)))
+    ok = _factor_valid(C, poles2, K)
     if not bool(ok):
         _refuse("nonfinite, unsorted/nonpositive active poles or invalid inactive sentinel")
 
