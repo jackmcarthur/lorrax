@@ -220,6 +220,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
         "gram_diagonal_positive": diagonal_ok,
         "gram_valid": gram_ok,
         "gram_min_relative": ratio,
+        "gram_spectrum_relative": gamma / jnp.where(largest > 0, largest, 1)[:, None],
         "retained_rank": count,
         "gram_condition": largest / jnp.min(jnp.where(keep, gamma, jnp.inf), axis=-1),
         "retained_metric_positive": metric_ok,
