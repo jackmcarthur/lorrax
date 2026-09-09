@@ -463,7 +463,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
         raise ValueError("GATE shared_pole_capacity: missing current-map CapacityLedger")
     concurrent = capacity.live_stages
     accepted = {row["stage"]: row for row in capacity.entries
-                if row["status"] == "PASS"}
+                if row["device_budget_status"] == "PASS"}
     caller_bytes = sum(accepted[name][key] for name in concurrent for key in
                        ("resident_bytes_per_rank", "workspace_bytes_per_rank"))
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
@@ -480,7 +480,14 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
                     capacity_receipt=receipt,route="empty",compiled_peak_status="NOT_APPLICABLE")
     tables = _shared_pole_panel_tables(meta, header, (0,nq), mesh_xy=mesh_xy)
     local = all(c["is_local"] for c in tables["certificates"].values())
-    budget = capacity.limit_bytes_per_rank - caller_bytes
+    # The ledger owns the hardware limit (ruling24); 3U is a scaling
+    # receipt, not a reason to reread resident factors at every tau node.
+    # A zero-byte planning reservation prices the existing ambient set.
+    admission = capacity.reserve(
+        "sigma.panel_budget", resident_bytes_per_rank=0,
+        workspace_bytes_per_rank=0, concurrent_with=concurrent)
+    budget = (admission["available_device_bytes_per_rank"]
+              - admission["aggregate_bytes_per_rank"])
     best = None
     for b in range(1,nq+1):
         # Byte counts are affine in the column width. Price through the
@@ -502,7 +509,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
         "sigma.synthesis", resident_bytes_per_rank=footprint["resident_bytes_per_rank"],
         workspace_bytes_per_rank=footprint["workspace_bytes_per_rank"],
         concurrent_with=concurrent)
-    return dict(status=receipt["status"], unit_bytes=U,
+    return dict(status=receipt["device_budget_status"], unit_bytes=U,
                 peak_live_bytes_per_rank=receipt["aggregate_bytes_per_rank"],
                 peak_in_U=receipt["aggregate_bytes_per_rank"]/U,
                 parent_capacity=b,column_capacity=c,
