@@ -479,6 +479,7 @@ def solve_smearing_occupations(
     E_kn, kweights, n_electrons: float, broadening_ry: float, *,
     state_capacity: float,
     family: str,
+    logical_nband: int | None = None,
     clamp_tol: float = OCCUPATION_CLAMP_TOL_DEFAULT,
 ) -> tuple[jax.Array, jax.Array]:
     """Return ``(mu_ry, f_kn)`` satisfying the fixed-electron constraint.
@@ -493,6 +494,12 @@ def solve_smearing_occupations(
     this MP1-specific setting and retains the exact Fermi-Dirac table.
     The width is the BerkeleyGW half-width for MP1 and kBT for FD, in Ry.
 
+    ``logical_nband`` is the physical prefix of the (nk, nb_carrier)
+    energy array, supplied by the caller's band layout. If omitted, all
+    bands are physical. Only that prefix enters the root and charge count;
+    the returned carrier has exact-zero occupations beyond it. Padding
+    energies are never inspected, and physical occupations are not clipped.
+
     Validation is host-only and reads no eigenvalues.  Root and occupations
     are one fixed-iteration JAX kernel with no Python loop or scalar readback.
     """
@@ -503,6 +510,15 @@ def solve_smearing_occupations(
     if len(shape) != 2 or min(shape, default=0) < 1:
         raise ValueError(
             f"solve_mp1_occupations: E_kn must be nonempty (nk, nb); got {shape}")
+    import operator
+    try:
+        logical = shape[1] if logical_nband is None else operator.index(logical_nband)
+    except TypeError as exc:
+        raise ValueError("occupation solve logical_nband must be an integer") from exc
+    if isinstance(logical_nband, (bool, np.bool_)) or not (1 <= logical <= shape[1]):
+        raise ValueError(
+            "occupation solve logical_nband must lie inside the energy carrier; "
+            f"got {logical_nband!r}, carrier={shape[1]}")
     if w.shape != (shape[0],):
         raise ValueError(
             f"solve_mp1_occupations: kweights must be ({shape[0]},); got {w.shape}")
@@ -520,13 +536,16 @@ def solve_smearing_occupations(
         raise ValueError("solve_mp1_occupations: broadening_ry must be finite and > 0")
     if not np.isfinite(capacity) or capacity <= 0.0:
         raise ValueError("solve_mp1_occupations: state_capacity must be finite and > 0")
-    maximum = capacity * weight_sum * shape[1]
+    maximum = capacity * weight_sum * logical
     if not np.isfinite(target) or not (0.0 < target < maximum):
         raise ValueError(
             f"solve_mp1_occupations: n_electrons={target!r} outside (0, {maximum})")
 
-    return _solve_smearing_kernel(E_kn, w, target, broadening, capacity,
-                                   occupation_clamp_tol(clamp_tol), family)
+    mu, physical_f = _solve_smearing_kernel(
+        jnp.asarray(E_kn, dtype=jnp.float64)[:, :logical], w, target, broadening, capacity,
+        occupation_clamp_tol(clamp_tol), family)
+    return mu, jnp.pad(physical_f, ((0, 0), (0, shape[1] - logical)),
+                       mode="constant", constant_values=0.0)
 
 
 def solve_mp1_occupations(E_kn, kweights, n_electrons, broadening_ry, *,
@@ -867,6 +886,7 @@ class OccupationState:
     @classmethod
     def solve_smearing(cls, E_kn, kweights, n_electrons: float, width_ry: float, *,
                   state_capacity: float, family: str,
+                  logical_nband: int | None = None,
                   clamp_tol: float = OCCUPATION_CLAMP_TOL_DEFAULT,
                   ) -> "OccupationState":
         """Fixed-N state of the selected family through the common bisection.
@@ -876,12 +896,14 @@ class OccupationState:
         frozen interface sketch omitted it; without it the fixed-N invariant
         is wrong by a factor of 2 on scalar decks.
 
-        ``clamp_tol`` is applied inside the root, so ``assert_fixed_n``
-        below tests the table this object actually carries.
+        ``logical_nband`` excludes layout padding inside the solve and
+        returns exact-zero padding. The MP1 ``clamp_tol`` is applied inside
+        its root; ``assert_fixed_n`` tests the table actually carried.
         """
         mu, f = solve_smearing_occupations(
             E_kn, kweights, float(n_electrons), float(width_ry),
             state_capacity=float(state_capacity), family=family,
+            logical_nband=logical_nband,
             clamp_tol=float(clamp_tol))
         state = cls(f_kn=f, mu_ry=float(mu), smearing_family=family,
                     smearing_width_ry=float(width_ry),
