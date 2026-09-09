@@ -727,13 +727,16 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 *fixed,stream_weights(wfns,ft*masks[1],mesh_xy),
                 stream_weights(wfns,ut*masks[1],mesh_xy),jnp.asarray(reference),raw),"real_time")
             receipt["correlation_count"] += len(t)
+            # Cell data are dynamic arguments; reuse one compiled owner for
+            # equal-shaped Laplace cells instead of retracing each closure.
+            if remote:
+                lk,lfixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
+                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,pair_mode="laplace",bank_carry=True)
             for cell,rr in remote:
                 lower,upper = cell["lower"],cell["upper"]
                 refs = np.asarray(cell["references_ry"])
                 tau = np.asarray(rr["t"])
                 projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]
-                lk,lfixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,pair_mode="laplace",bank_carry=True)
                 lw = np.stack([ft*masks[lower],ut*masks[lower]])
                 uw = np.stack([ut*masks[upper],ft*masks[upper]])
                 # Parent selection applies to the k axis, separately for each role.
