@@ -1015,6 +1015,19 @@ def unfold_endpoint_panel(factor_face, *, irr_idx, sym_idx, q_irr_frac,
     supplies a byte budget already admitted against all other live stages.
     A non-local map costs P_axis-1 collective-permutes per panel per call;
     phase, antiunitary and spin actions delegate to unfold_wavefunction_local.
+
+    For repeated time-node calls, bind immutable metadata in an outer jit::
+
+        route = jax.jit(lambda factors: unfold_endpoint_panel(
+            factors, **fixed_metadata)[0],
+            in_shardings=face_sharding, out_shardings=face_sharding)
+
+    Reuse that callable for factors of the same shape/dtype/sharding. Its
+    first trace performs metadata authentication and budget admission; the
+    executable accepts only factor panels, never cached child factors.
+    Build a new callable when maps, q coordinates, spin actions or budget
+    change (including a new SC state). Metadata must not mutate after binding.
+    Eager calls remain supported and retain the concrete-sharding refusal.
     """
     cert = certify_endpoint_locality(source_perm, mesh=mesh,
                                      mesh_axis=mesh_axis, active_mask=active_mask)
@@ -1043,7 +1056,11 @@ def unfold_endpoint_panel(factor_face, *, irr_idx, sym_idx, q_irr_frac,
         raise ValueError(f"endpoint panel exceeds max_live_bytes: {cost}")
     spec = P(None, mesh_axis, None, None)
     sh = NamedSharding(mesh, spec)
-    if not factor_face.sharding.is_equivalent_to(sh, 4):
+    # Under an outer jit the input is a tracer, without a concrete sharding.
+    # shard_map's in_specs below own its traced layout. Concrete eager inputs
+    # still refuse implicit redistribution of a large endpoint panel.
+    if (not isinstance(factor_face, jax.core.Tracer)
+            and not factor_face.sharding.is_equivalent_to(sh, 4)):
         raise ValueError("endpoint panel must already have its row-face sharding")
     parts = int(mesh.shape[mesh_axis])
     nlocal = cert['shard_extent']
@@ -1074,7 +1091,7 @@ def unfold_endpoint_panel(factor_face, *, irr_idx, sym_idx, q_irr_frac,
         current = x[irr]
         (_, output), _ = jax.lax.scan(
             gather_step, (current, jnp.zeros_like(current)),
-            jnp.arange(1 if cert['is_local'] else parts))
+            jnp.arange(1 if cert['is_local'] else parts), unroll=1)
         result = unfold_wavefunction_local(
             output, irr_idx=np.arange(len(irr)), sym_idx=sym,
             k_irr_frac=q[irr], local_perm=identity, L_table=wraps,
