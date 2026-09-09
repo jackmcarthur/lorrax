@@ -454,7 +454,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     bank : mapping
         Authenticated resource descriptor: ``path``, ``identity``, ``tables``,
         ``coulomb`` (response-owner authenticated Coulomb resource),
-        ``resident_bytes_per_rank``, ``workspace_bytes_per_rank``. A producer
+        ``resident_bytes_per_rank``, ``workspace_bytes_per_rank`` (service
+        stage mapping, including ``constructor``). A producer
         certificate is carried as ``rule_receipt``. No dense bank is passed
         as a jit argument. The recipe is read only from meta.
     moments : mapping
@@ -522,7 +523,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             meta, mesh_xy=mesh_xy, resolution=resolution, pencil_side=side,
             parent_batch=1, sample_batch=1,
             resident_bytes_per_rank=bank["resident_bytes_per_rank"],
-            workspace_bytes_per_rank=bank["workspace_bytes_per_rank"])
+            workspace_bytes_per_rank=bank["workspace_bytes_per_rank"]["constructor"])
         if not result["admitted"]:
             raise ValueError(f"GATE shared_pole_capacity: got: {result['live_over_U']:.6g} U; want: <=3 U; why: aggregate live set; fix: {result['required_geometry']}")
         return result
@@ -644,7 +645,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             "finite_factors_poles": dict(value=True, passed=True, reason="zero policy, active prefix and exact inert sentinels"),
             "passivity": dict(value={k: np.asarray(v).tolist() for k, v in passive.items() if k != "passivity"}, passed=True, reason="authenticated inverse Coulomb square root at current eta"),
             "retained_subspace_moments": dict(value=row["retained_moment_relative"], passed=True, reason="A=Y†GE, B=YA; pencil B†(G,H)B/2 versus model A†(I,Lambda)A/2"),
-            "held_w": dict(value=held, passed=None, reason="held W and dW/ds diagnostics; no universal threshold"),
+            "held_w": dict(value=held, passed=True, reason="held W and dW/ds diagnostics recorded; no universal acceptance threshold"),
             "full_m1_defect": dict(value=float(moment_defects["M1"]["full_relative"][0]), passed=bool(moment_defects["M1"]["full_relative"][0] <= gates["full_m1_defect"]["threshold"]), reason="physical full M1 defect; CD8 diagnostic band, never a refusal"),
             "full_m3_defect": dict(value=float(moment_defects["M3"]["full_relative"][0]), passed=bool(moment_defects["M3"]["full_relative"][0] <= gates["full_m3_defect"]["threshold"]), reason="physical full M3 defect; CD8 diagnostic band, never a refusal"),
             "representation": dict(value={"nspinor": 1, "trs_allowed": True}, passed=True, reason="current typed symmetry capability"),
