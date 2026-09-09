@@ -428,7 +428,7 @@ def authenticate_sample_plan(sample_plan, header):
     stored = header["bank_sample_plan"]
     if sample_plan["role_codes"] != stored["role_codes"]:
         raise ValueError("GATE response_sample_identity: role vocabulary differs")
-    for key in ("z_ry", "role", "distinct_id", "held"):
+    for key in ("z_ry", "role", "distinct_id", "held", "support_pair", "fit_ids", "held_ids"):
         values = stored[key]
         if key == "z_ry":
             values = [complex(v["real"], v["imag"]) if isinstance(v, dict)
