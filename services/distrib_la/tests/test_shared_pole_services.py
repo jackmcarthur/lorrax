@@ -73,6 +73,59 @@ def test_face_contraction():
     check_faces(mesh)
 
 
+def check_directions_and_gemm(mesh):
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    import distrib_la as D
+    rng = np.random.default_rng(1910)
+    def unitary():
+        return np.linalg.qr(rng.normal(size=(12, 12))
+                            + 1j * rng.normal(size=(12, 12)))[0]
+    u, v = unitary(), unitary()
+    spectrum = np.array([6, 3, 3*(1-4e-7), .1, .08, .07, .06, .05, .04, .03, .02, .01])
+    w = (u * spectrum) @ v.conj().T
+    herm = (v * spectrum) @ v.conj().T
+    tile = NamedSharding(mesh, P('x', 'y'))
+    def put(a):
+        return jax.make_array_from_callback(a.shape, tile, lambda i: a[i])
+    def error(got, want):
+        return float(jnp.max(jnp.abs(got - put(want))))
+    rows = []
+    for label, backend, route in [('local', 'off', 'batch_reshard'),
+                                   ('distributed', 'distributed', 'auto')]:
+        eig = D.plan('eigh', mesh, backend=backend, n=24, batched_route=route)
+        q, s = D.right_singular_vectors(put(w), .4999999, eigh_plan=eig,
+                                        column_extent=lambda r: 6)
+        assert s.size == 3, (label, s)
+        np.testing.assert_allclose(np.asarray(s), spectrum[:3], rtol=2e-12)
+        projector_error = error(q @ q.conj().T, v[:, :3] @ v[:, :3].conj().T)
+        assert projector_error < 2e-11, projector_error
+        assert float(jnp.max(jnp.abs(q[:, 3:]))) == 0
+        ep = D.plan('eigh', mesh, backend=backend, n=12, batched_route=route)
+        qe, ev = D.leading_eigenvectors(put(herm), 2, eigh_plan=ep,
+                                        column_extent=lambda r: 6)
+        assert ev.size == 3
+        eigen_error = error(qe @ qe.conj().T, v[:, :3] @ v[:, :3].conj().T)
+        assert eigen_error < 2e-11
+        # Exercise rectangular adjoints and both operand orientations.
+        products = []
+        for ta, tb in [('N', 'N'), ('C', 'N'), ('T', 'N'), ('N', 'C'), ('N', 'T'), ('C', 'C')]:
+            a = w[:8, :6] if ta == 'N' else w[:6, :8]
+            b = herm[:6, :10] if tb == 'N' else herm[:10, :6]
+            aa = a if ta == 'N' else (a.conj().T if ta == 'C' else a.T)
+            bb = b if tb == 'N' else (b.conj().T if tb == 'C' else b.T)
+            got = D.matmul(put(a), put(b), mesh=mesh, backend=backend,
+                           batched_route=route, transa=ta, transb=tb)
+            err = error(got, aa @ bb)
+            assert err < 2e-11, (label, ta, tb, err)
+            products.append(dict(transa=ta, transb=tb, error=err))
+        rows.append(dict(plan=label, svd_projector_error=projector_error,
+                         eigen_projector_error=eigen_error, retained_rank=3,
+                         gemm=products))
+    return dict(status='PASS', cases=rows)
+
+
 def main():
     import argparse
     import subprocess
@@ -80,6 +133,8 @@ def main():
     from jax.sharding import Mesh
     ap = argparse.ArgumentParser()
     ap.add_argument('--output', type=Path, required=True)
+    ap.add_argument('--constructor', action='store_true')
+    ap.add_argument('--symmetry', action='store_true')
     args = ap.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     assert jax.process_count() == 4 and jax.device_count() == 4
@@ -88,6 +143,15 @@ def main():
                    step=os.environ.get('SLURM_STEP_ID'),
                    commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
                    source=str(Path(__file__).resolve()), faces=check_faces(mesh, args.output))
+    if args.constructor:
+        receipt['constructor'] = check_directions_and_gemm(mesh)
+    if args.symmetry:
+        import importlib.util
+        path = Path(__file__).resolve().parents[2] / 'symmetry_maps/tests/test_shared_pole_unfold.py'
+        spec = importlib.util.spec_from_file_location('shared_pole_unfold_gate', path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        receipt['symmetry'] = mod.check_shared_pole_unfold(mesh)
     if jax.process_index() == 0:
         (args.output / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
         print(json.dumps(receipt), flush=True)
