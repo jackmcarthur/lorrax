@@ -40,13 +40,14 @@ _PLAN_CACHE: dict[tuple, "PolarPlan"] = {}
 
 def _dilation_svd(A, eigh):
     """Extract ascending singular triplets from [[0,A],[A.H,0]]."""
-    n = A.shape[0]
-    upper = jnp.pad(A, ((0, n), (n, 0)))
+    n = A.shape[-1]
+    upper = jnp.pad(A, ((0, 0),) * (A.ndim - 2) + ((0, n), (n, 0)))
     H = upper + jnp.conj(jnp.swapaxes(upper, -1, -2))
     evals, Q = eigh(H)
-    positive = Q[:, n:]
+    positive = Q[..., n:]
     root2 = jnp.asarray(math.sqrt(2.0), dtype=A.dtype)
-    return jnp.maximum(evals[n:], 0), root2 * positive[:n], root2 * positive[n:]
+    return (jnp.maximum(evals[..., n:], 0), root2 * positive[..., :n, :],
+            root2 * positive[..., n:, :])
 
 
 def _close_spectral_cut(values, count, tolerance):
@@ -64,44 +65,55 @@ def _close_spectral_cut(values, count, tolerance):
 def _direction_input(W, eig, dilation=False):
     if isinstance(W, jax.core.Tracer):
         raise ValueError("spectral direction selection is an eager construction stage")
-    if W.ndim != 2 or W.shape[0] != W.shape[1]:
-        raise ValueError("spectral directions require a square rank-2 matrix")
+    if W.ndim not in (2, 3) or W.shape[-2] != W.shape[-1]:
+        raise ValueError("spectral directions require a square rank-2 matrix or rank-3 batch")
     _validate_dtype(W.dtype)
-    if eig.op != 'eigh' or eig.n not in (None, W.shape[0] * (2 if dilation else 1)):
+    if eig.op != 'eigh' or eig.n not in (None, W.shape[-1] * (2 if dilation else 1)):
         raise ValueError("eigh_plan must match the matrix/dilation extent")
-    tile = NamedSharding(eig.mesh, P('x', 'y'))
-    if not W.sharding.is_equivalent_to(tile, 2):
-        raise ValueError("spectral directions require W already at P('x','y')")
+    tile = NamedSharding(eig.mesh, P(*((None,) * (W.ndim - 2)), 'x', 'y'))
+    if not W.sharding.is_equivalent_to(tile, W.ndim):
+        raise ValueError("spectral directions require W already face-tiled over x/y")
     return tile
 
 
 @lru_cache(maxsize=128)
 def _retained_column_kernel(mesh, count, extent):
-    """Reuse the column-selection executable; never retain input vectors."""
-    tile = NamedSharding(mesh, P('x', 'y'))
-    # Keep the selection and padding in one executable: the intermediate
-    # physical rank need not tile y and must never be replicated at a seam.
+    """Reuse selection; a tuple of counts denotes independent batch rows."""
+    batched = isinstance(count, tuple)
+    tile = NamedSharding(mesh, P(*((None,) if batched else ()), 'x', 'y'))
+    largest = max(count) if batched else count
     @jax.jit(out_shardings=tile)
     def select(q):
-        return jnp.pad(q[:, ::-1][:, :count], ((0, 0), (0, extent - count)))
+        selected = q[..., ::-1][..., :largest]
+        selected = jnp.pad(selected, ((0, 0),) * (q.ndim - 1)
+                           + ((0, extent - largest),))
+        if batched:
+            active = jnp.arange(extent)[None, :] < jnp.asarray(count)[:, None]
+            selected = jnp.where(active[:, None, :], selected, 0)
+        return selected
     return select
 
 
 def _retained_columns(Q, values, count, *, mesh, column_extent):
-    """Select and zero-pad columns on device, with caller-owned capacity."""
-    extent = operator.index(column_extent(count))
-    if extent < count or extent < 1 or extent % int(mesh.shape['y']):
+    """Select per-row physical columns; return their unpadded spectra."""
+    largest = max(count) if isinstance(count, tuple) else count
+    extent = operator.index(column_extent(largest))
+    if extent < largest or extent < 1 or extent % int(mesh.shape['y']):
         raise ValueError("column_extent must cover the rank and tile mesh y")
     select = _retained_column_kernel(mesh, count, extent)
-    return select(Q), jax.device_put(values[:count], NamedSharding(mesh, P()))
+    retained = (tuple(row[:n] for row, n in zip(values, count))
+                if isinstance(count, tuple) else values[:count])
+    return select(Q), jax.device_put(retained, NamedSharding(mesh, P()))
 
 
 @lru_cache(maxsize=16)
-def _direction_svd_kernel(eigh_plan):
+def _direction_svd_kernel(eigh_plan, ndim):
     """Reuse the planned dilation SVD with each current response as input."""
-    tile = NamedSharding(eigh_plan.mesh, P('x', 'y'))
+    tile = NamedSharding(eigh_plan.mesh, P(*((None,) * (ndim - 2)), 'x', 'y'))
 
     def eigh(h):
+        if h.ndim == 3:
+            return eigh_plan.batched(h)
         s, q = eigh_plan.batched(h[None])
         return s[0], q[0]
 
@@ -120,7 +132,8 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
     Parameters
     ----------
     W
-        General square [m,m] float64/complex128 matrix at P('x','y').
+        Square [m,m] or independent [b,m,m] float64/complex128 faces at
+        P('x','y') or P(None,'x','y').
         Singular values carry W's units; vectors are dimensionless.
     tau
         Finite nonnegative relative cutoff; whole adjacent multiplets at
@@ -140,17 +153,22 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         Q[m,r_padded] at P('x','y'), active columns first and zero tails;
         sigma[r] replicated in descending order. r = sigma.size. Only the
         O(m) spectrum crosses the host, never a matrix. Selection is eager.
+        Batched input returns Q[b,m,max(r_padded)] at P(None,'x','y') and
+        a tuple of b unpadded sigma[r_q] arrays. Thus every cut/multiplet
+        remains independent; the matrix tail of each row is exactly zero.
     """
     _direction_input(W, eigh_plan, dilation=True)
     tau = _as_rcond(tau)
     if tau is None:
         raise ValueError("tau must be an explicit relative cutoff")
-    s, v = _direction_svd_kernel(eigh_plan)(W)
-    values = np.asarray(s)[::-1].copy()
+    s, v = _direction_svd_kernel(eigh_plan, W.ndim)(W)
+    values = np.asarray(s)[..., ::-1].copy()
     if not np.all(np.isfinite(values)):
         raise ValueError("nonfinite singular spectrum")
-    count = int(np.count_nonzero(values > tau * values[0]))
-    count = _close_spectral_cut(values, count, multiplet_tol)
+    def cut(row):
+        count = int(np.count_nonzero(row > tau * row[0]))
+        return _close_spectral_cut(row, count, multiplet_tol)
+    count = cut(values) if values.ndim == 1 else tuple(cut(row) for row in values)
     return _retained_columns(v, values, count, mesh=eigh_plan.mesh,
                              column_extent=column_extent)
 
@@ -159,25 +177,31 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
                          multiplet_tol=1e-6):
     """Return leading Hermitian eigenvectors, including the cut multiplet.
 
-    W[m,m] is Hermitian at P('x','y'); r is the requested physical width.
+    W[m,m] or W[b,m,m] is Hermitian on its x/y faces; r is the requested
+    physical width for each row. The leading batch is independent.
     eigh_plan is resolved for m, and column_extent/multiplet_tol and the
     (Q,values) output follow right_singular_vectors. Values retain W's units.
     No Hermitian projection is applied to repair an invalid input.
     """
-    tile = _direction_input(W, eigh_plan)
+    _direction_input(W, eigh_plan)
     r = operator.index(r)
-    if not 1 <= r <= W.shape[0]:
+    if not 1 <= r <= W.shape[-1]:
         raise ValueError("r must lie in [1,m]")
-    defect = jnp.max(jnp.abs(W - jnp.conj(W.T)))
-    scale = jnp.max(jnp.abs(W))
-    if not bool(jnp.isfinite(scale) & (defect <= 1e-12 * scale)):
+    defect = jnp.max(jnp.abs(W - jnp.conj(jnp.swapaxes(W, -1, -2))), axis=(-2, -1))
+    scale = jnp.max(jnp.abs(W), axis=(-2, -1))
+    if not bool(jnp.all(jnp.isfinite(scale) & (defect <= 1e-12 * scale))):
         raise ValueError("leading_eigenvectors requires finite Hermitian W")
-    s, q = eigh_plan.batched(W[None])
-    values = np.asarray(s[0])[::-1].copy()
+    if W.ndim == 2:
+        s, q = eigh_plan.batched(W[None])
+        s, q = s[0], q[0]
+    else:
+        s, q = eigh_plan.batched(W)
+    values = np.asarray(s)[..., ::-1].copy()
     if not np.all(np.isfinite(values)):
         raise ValueError("nonfinite eigenvalue spectrum")
-    count = _close_spectral_cut(values, r, multiplet_tol)
-    return _retained_columns(q[0], values, count, mesh=eigh_plan.mesh,
+    count = (_close_spectral_cut(values, r, multiplet_tol) if values.ndim == 1
+             else tuple(_close_spectral_cut(row, r, multiplet_tol) for row in values))
+    return _retained_columns(q, values, count, mesh=eigh_plan.mesh,
                              column_extent=column_extent)
 
 
