@@ -20,7 +20,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import resolve_mesh, gather_to_host
-from gw.response_bank import response_algebra
+from gw.response_bank import response_algebra, exact_bare_moments
 from gw.w_isdf import _get_chi_fractional_contour_kernel_face
 from gw.wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
 
@@ -116,6 +116,84 @@ def main():
     assert actual.sharding.spec == P(None, None, "x", "y")
     results["selected_stream"] = dict(relative=relative,
         shape=list(actual.shape), memory=str(executable.memory_analysis()))
+
+    # Remote Laplace cell, independently summed over lower/upper band pairs.
+    real_psi = psi.real.astype(np.complex128)
+    lower = np.arange(nb) < 3
+    upper = ~lower
+    times = np.array([0., .3, 1.])
+    laplace = _get_chi_fractional_contour_kernel_face(
+        mesh, (2, 2, 2), 1, (nk, nb, n, 1), selected_q=(0,),
+        pair_mode="laplace")
+    lap_args = (put(times, rep), put(np.ones((1, 3), complex), rep),
+        put(real_psi, NamedSharding(mesh, PSI_MUN_SPEC)),
+        put(real_psi.transpose(0, 3, 1, 2), NamedSharding(mesh, PSI_NMU_SPEC)),
+        put(energy, rep), put(np.stack([f*lower, (1-f)*lower]), rep),
+        put(np.stack([(1-f)*upper, f*upper]), rep), put(np.zeros(2), rep))
+    lap_expected = np.zeros((1, 1, n, n), complex)
+    for ik in range(nk):
+        for i in range(3):
+            for j in range(3, nb):
+                pair = real_psi[ik, 0, :, i] * real_psi[ik, 0, :, j]
+                lap_expected[0, 0] += ((f[ik, i]-f[ik, j])
+                    * np.exp(-(energy[ik, j]-energy[ik, i])*times).sum()
+                    * np.outer(pair, pair.conj()) * 2 / np.sqrt(nk))
+    lap_error = error(laplace(*lap_args)[:, 0], lap_expected[:, 0])
+    assert lap_error < 1e-11, lap_error
+    results["laplace_cell"] = dict(relative=lap_error)
+
+    # Independent explicit band-pair oracle only on this tiny planted test.
+    # Real orbitals make the TRS-even response exact without a star fixture.
+    real_psi = psi.real.astype(np.complex128)
+    wfns = SimpleNamespace(layout="face", green_parent=None,
+        psi_mun=put(real_psi, NamedSharding(mesh, PSI_MUN_SPEC)),
+        psi_nmu=put(real_psi.transpose(0, 3, 1, 2),
+                    NamedSharding(mesh, PSI_NMU_SPEC)),
+        enk=put(energy, rep), occ=put(f, rep),
+        slices=SimpleNamespace(nb_full=nb, b0=0, b4_logical=5))
+    moment_meta = SimpleNamespace(nkx=2, nky=2, nkz=2, nk_tot=nk,
+        nspin=1, nspinor=1, nspinor_wfnfile=1, b_id_4_chi_user=5,
+        mu_basis=SimpleNamespace(n_packed=n))
+    execute = lambda kernel, args, stage: kernel(*args)
+    a0, a1, census = exact_bare_moments(wfns, moment_meta,
+        mesh_xy=mesh, q_ids=(0,), execute=execute)
+    truth = []
+    for power in (1, 3):
+        value = np.zeros((1, n, n), dtype=np.complex128)
+        for ik in range(nk):
+            for i in range(5):
+                for j in range(5):
+                    pair = real_psi[ik, 0, :, i] * real_psi[ik, 0, :, j]
+                    value[0] += ((f[ik, i]-f[ik, j])
+                        * (energy[ik, j]-energy[ik, i])**power
+                        * np.outer(pair, pair.conj()))
+        truth.append(value * 2 / nk)
+    moment_errors = dict(A0=error(a0, truth[0]), A1=error(a1, truth[1]))
+    assert max(moment_errors.values()) < 1e-11, moment_errors
+    wfns.occ = put((f > .5).astype(float), rep)
+    wrong0, _, _ = exact_bare_moments(wfns, moment_meta,
+        mesh_xy=mesh, q_ids=(0,), execute=execute)
+    moment_errors["red_occupation"] = error(wrong0, truth[0])
+    assert moment_errors["red_occupation"] > 1e-3, moment_errors
+    results["six_correlations"] = dict(**moment_errors, census=census)
+    # MP1 permits slight occupation overshoot. Preserve the supplied state
+    # exactly; clamping to FD bounds would change its response moments.
+    overshoot = f.copy()
+    overshoot[:, 0], overshoot[:, 4] = 1.02, -0.02
+    wfns.occ = put(overshoot, rep)
+    mp0, _, _ = exact_bare_moments(wfns, moment_meta,
+        mesh_xy=mesh, q_ids=(0,), execute=execute)
+    mp_truth = np.zeros((1, n, n), complex)
+    for ik in range(nk):
+        for i in range(5):
+            for j in range(5):
+                pair = real_psi[ik, 0, :, i] * real_psi[ik, 0, :, j]
+                mp_truth[0] += ((overshoot[ik, i]-overshoot[ik, j])
+                    * (energy[ik, j]-energy[ik, i])
+                    * np.outer(pair, pair.conj()) * 2 / nk)
+    mp_error = error(mp0, mp_truth)
+    assert mp_error < 1e-11, mp_error
+    results["supplied_occupation_overshoot"] = dict(A0=mp_error)
     if jax.process_index() == 0:
         (root / "selected_stream.hlo").write_text(executable.as_text())
         (root / "receipt.json").write_text(json.dumps(dict(

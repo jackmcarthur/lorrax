@@ -5,9 +5,11 @@ The public bank supports scalar representations; disk conversion belongs to
 the scratch writer. Dense products and solves enter through ``distrib_la``.
 """
 from functools import partial
+import hashlib
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 
@@ -85,3 +87,111 @@ def response_algebra(meta, config, *, mesh_xy, n):
         "units": {"Wc": "Ry", "dWc_ds": "Ry^-1",
                   "M1": "Ry^3", "M3": "Ry^5"},
     }
+
+
+def response_weights(wfns, meta):
+    """Return exact current-state screening-band weights, with carrier bands masked.
+
+    All returned tables are replicated ``[full_k, band]`` arrays. Energy
+    powers use Ry and are evaluated about the mean physical-band energy;
+    the binomial expansion is independent of that reference. No occupation
+    activity floor enters the exact moments.
+    """
+    from common.collectives import gather_to_host
+
+    energy = np.asarray(gather_to_host(wfns.enk), dtype=np.float64)
+    occupied = np.asarray(gather_to_host(wfns.occ), dtype=np.float64)
+    stop = min(int(meta.b_id_4_chi_user), int(wfns.slices.b4_logical))
+    first = int(wfns.slices.b0)
+    count = stop - first
+    logical_count = int(wfns.slices.b4_logical) - first
+    if (energy.shape != occupied.shape or count <= 0
+            or count > energy.shape[1] or not np.isfinite(energy).all()
+            or not np.isfinite(occupied).all()):
+        raise ValueError("GATE response_occupations: got invalid band table; "
+                         "want current finite screening bands; "
+                         "why: exact response uses both occupation sectors")
+    physical = np.arange(energy.shape[1])[None, :] < count
+    f = np.where(physical, occupied, 0.0)
+    u = np.where(physical, 1.0 - occupied, 0.0)
+    reference = float(np.mean(energy[:, :count]))
+    return energy, f, u, reference, {
+        "band_start": first, "band_stop": stop,
+        "band_carrier": energy.shape[1],
+        "energy_sha256": hashlib.sha256(energy[:, :logical_count].tobytes()).hexdigest(),
+        "occupation_sha256": hashlib.sha256(occupied[:, :logical_count].tobytes()).hexdigest(),
+        "energy_min_ry": float(energy[:, :count].min()),
+        "energy_max_ry": float(energy[:, :count].max()),
+        "occupation_activity_floor": 0.0,
+        "discarded_occupation_mass": 0.0,
+    }
+
+
+def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
+                    pair_mode="retarded"):
+    """Bind the existing one-particle Green/FFT primitive to a q batch.
+
+    Returns a jitted kernel and its fixed ψ/energy arguments. Caller supplies
+    time, projections, final weights and energy reference. The output is
+    ``[len(q_ids), n_outputs, mu_p, mu_p]`` with both endpoints sharded.
+    """
+    from .w_isdf import _get_chi_fractional_contour_kernel_face
+
+    if wfns.layout != "face" or int(meta.nspinor) != 1:
+        raise ValueError("GATE response_representation: got non-scalar or legacy "
+                         "wavefunctions; want scalar face carrier; why: bank "
+                         "requires explicit endpoint shardings")
+    carrier = wfns.green_parent
+    source = wfns if carrier is None else carrier
+    parent = None if carrier is None else carrier.plan
+    nk = int(meta.nk_tot) if parent is None else int(parent.n_parent)
+    n = int(meta.mu_basis.n_packed)
+    kernel = _get_chi_fractional_contour_kernel_face(
+        mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
+        (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
+        k_unfold_plan=parent, selected_q=tuple(q_ids), pair_mode=pair_mode)
+    return kernel, (source.psi_mun, source.psi_nmu, source.enk)
+
+
+def stream_weights(wfns, weights, mesh_xy):
+    """Place small band weights and restrict to existing raw parents."""
+    from common.collectives import replicate_to_mesh
+
+    result = replicate_to_mesh(np.asarray(weights), mesh_xy)
+    if wfns.green_parent is not None:
+        result = wfns.green_parent.plan.parent_rows(result)
+    return result
+
+
+def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute):
+    """Compute A0/A1 of scaled chi=A0/s+A1/s² by six correlations.
+
+    The binomial coefficients expand ``(E_u-E_f)`` and its cube. Imaginary
+    particle weights turn the retarded primitive's difference into the sum
+    of both orientations at t=0 (Run183 energy-power owner). ``execute``
+    admits compiled aggregate memory before calling each kernel and records
+    its timing. Returned moments are face-sharded ``[b,mu_p,mu_p]``.
+    """
+    from .w_isdf import _w_solve_pref_scalar
+
+    energy, f, u, reference, census = response_weights(wfns, meta)
+    erel = energy - reference
+    kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
+                                    q_ids=q_ids, n_outputs=1)
+    terms = (((-1., 1, 0), (1., 0, 1)),
+             ((-1., 3, 0), (3., 2, 1), (-3., 1, 2), (1., 0, 3)))
+    totals = []
+    for moment_terms in terms:
+        total = None
+        for coefficient, a, b in moment_terms:
+            weight_f = stream_weights(wfns, f * erel**a, mesh_xy)
+            weight_u = stream_weights(wfns, -1j * u * erel**b, mesh_xy)
+            args = (jnp.asarray([0.]), jnp.asarray([[1. + 0j]]), *fixed,
+                    weight_f.astype(jnp.complex128), weight_u,
+                    jnp.asarray(reference))
+            raw = execute(kernel, args, "moment_correlation")[:, 0]
+            term = (_w_solve_pref_scalar(meta) * coefficient) * raw
+            total = term if total is None else total + term
+            total.block_until_ready()
+        totals.append(total)
+    return (*totals, census)

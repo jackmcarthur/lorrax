@@ -873,7 +873,7 @@ def _get_chi_fractional_contour_kernel_legacy(
 
 def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
-    *, k_unfold_plan=None, selected_q=None,
+    *, k_unfold_plan=None, selected_q=None, pair_mode="retarded",
 ):
     """Face-layout sibling of
     :func:`_get_chi_fractional_contour_kernel_legacy`.  Same Keldysh
@@ -920,6 +920,10 @@ def _get_chi_fractional_contour_kernel_face(
         PSI_NMU_SPEC,
     )
 
+    if pair_mode not in ("retarded", "laplace"):
+        raise ValueError("pair_mode must be retarded or laplace")
+    if pair_mode == "laplace" and selected_q is None:
+        raise ValueError("Laplace bank correlations require selected_q")
     grid = tuple(int(n) for n in kgrid)
     nk = int(np.prod(grid))
     n_out = int(n_out)
@@ -1020,46 +1024,69 @@ def _get_chi_fractional_contour_kernel_face(
 
         def body(accumulators, node):
             time, projection = node
-            tau = jnp.asarray(1j, dtype=jnp.complex128) * time
-            Gf_k = jax.lax.with_sharding_constraint(
-                jnp.conj(build_G_tau(
-                    psi_mun,
-                    psi_nmu,
-                    enk_full,
-                    -tau,
-                    e_ref=energy_reference,
-                    band_weight=occ_f,
-                    layout="face",
-                    gemm=g_plan,
-                    k_unfold_plan=k_unfold_plan,
-                )),
-                G_shard,
-            )
-            Gu_k = jax.lax.with_sharding_constraint(
-                jnp.conj(build_G_tau(
-                    psi_mun,
-                    psi_nmu,
-                    enk_full,
-                    -tau,
-                    e_ref=energy_reference,
-                    band_weight=occ_u,
-                    layout="face",
-                    gemm=g_plan,
-                    k_unfold_plan=k_unfold_plan,
-                )),
-                G_shard,
-            )
-            Gf_R = G_fftn(Gf_k)
-            Gu_R = G_fftn(Gu_k)
-            A_R = jax.lax.with_sharding_constraint(
-                jnp.einsum(
-                    "Rambn,Rambn->Rmn",
-                    Gu_R,
-                    jnp.conj(Gf_R),
-                    optimize=True,
-                ),
-                chi_R_shard,
-            )
+            if pair_mode == "retarded":
+                tau = jnp.asarray(1j, dtype=jnp.complex128) * time
+                Gf_k = jax.lax.with_sharding_constraint(
+                    jnp.conj(build_G_tau(
+                        psi_mun,
+                        psi_nmu,
+                        enk_full,
+                        -tau,
+                        e_ref=energy_reference,
+                        band_weight=occ_f,
+                        layout="face",
+                        gemm=g_plan,
+                        k_unfold_plan=k_unfold_plan,
+                    )),
+                    G_shard,
+                )
+                Gu_k = jax.lax.with_sharding_constraint(
+                    jnp.conj(build_G_tau(
+                        psi_mun,
+                        psi_nmu,
+                        enk_full,
+                        -tau,
+                        e_ref=energy_reference,
+                        band_weight=occ_u,
+                        layout="face",
+                        gemm=g_plan,
+                        k_unfold_plan=k_unfold_plan,
+                    )),
+                    G_shard,
+                )
+                Gf_R = G_fftn(Gf_k)
+                Gu_R = G_fftn(Gu_k)
+                A_R = jax.lax.with_sharding_constraint(
+                    jnp.einsum(
+                        "Rambn,Rambn->Rmn",
+                        Gu_R,
+                        jnp.conj(Gf_R),
+                        optimize=True,
+                    ),
+                    chi_R_shard,
+                )
+            else:
+                # Remote ordered cell: (f_lower u_upper - u_lower f_upper)
+                # exp[-(E_upper-E_lower)t].  Each side remains a
+                # one-particle correlation through the same Green/FFT owner.
+                def green(weight, tau_value, ref):
+                    return G_fftn(jax.lax.with_sharding_constraint(
+                        jnp.conj(build_G_tau(
+                            psi_mun, psi_nmu, enk_full, tau_value,
+                            e_ref=ref, band_weight=weight, layout="face",
+                            gemm=g_plan, k_unfold_plan=k_unfold_plan)),
+                        G_shard))
+
+                lower_f = green(occ_f[0], -time, energy_reference[0])
+                upper_u = green(occ_u[0], time, energy_reference[1])
+                lower_u = green(occ_f[1], -time, energy_reference[0])
+                upper_f = green(occ_u[1], time, energy_reference[1])
+                A_R = jax.lax.with_sharding_constraint(
+                    jnp.einsum("Rambn,Rambn->Rmn", upper_u,
+                               jnp.conj(lower_f), optimize=True)
+                    - jnp.einsum("Rambn,Rambn->Rmn", upper_f,
+                                 jnp.conj(lower_u), optimize=True),
+                    chi_R_shard)
             if selected_q is None:
                 reverse_R = jnp.conj(A_R)
                 updated = tuple(
@@ -1074,7 +1101,9 @@ def _get_chi_fractional_contour_kernel_face(
                 # Upstream G/FFT buffers remain full-grid and must still
                 # enter the admission ledger.
                 contribution = jnp.take(
-                    chi_fftn(-1j * (A_R - jnp.conj(A_R))),
+                    chi_fftn(-1j * (A_R - jnp.conj(A_R))
+                             if pair_mode == "retarded"
+                             else A_R + jnp.conj(A_R)),
                     jnp.asarray(selected_q), axis=0)
                 updated = (accumulators
                            + projection[:, None, None, None]
