@@ -1033,15 +1033,24 @@ def get_shared_sigma_tau_kernel(
         _sigma_shared_tau_kernel_cache[key] = _tau
         return _tau
 
+    profile_stages = _stage_timing_enabled()
+
     def _tau_staged(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
         phase_real, E_ref_A, E_ref_B, t_node,
     ):
-        with timing.section("sigma.tau.w_phase") as sec:
+        if profile_stages:
+            with timing.section("sigma.tau.w_phase") as sec:
+                W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
+                             phase_real, E_ref_B, t_node)
+                sec.watch(W_t)
+        else:
+            # A resident model has a Python storage closure, but its device
+            # kernels still dispatch asynchronously. Only the explicit
+            # stage profiler needs a host wait between W and G*W.
             W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
                          phase_real, E_ref_B, t_node)
-            sec.watch(W_t)
         return sigma_kij(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
             E_A, mask_A, E_ref_A, t_node, W_t)
