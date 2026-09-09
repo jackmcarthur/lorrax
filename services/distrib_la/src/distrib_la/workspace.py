@@ -90,9 +90,11 @@ def _workspace_details(plan, op, shapes, dtype):
         copies = (shapes[0][0] if local and len(shapes[0]) == 3
                   and plan.batched_route != ROUTE_BATCH_RESHARD else 1)
         scratch = copies*(device + (4 if local else 0))
-        return dict(device_bytes=scratch, host_bytes=host, vendor_device_bytes=device,
+        return dict(device_bytes=scratch, host_bytes=host,
+                    vendor_device_bytes=device if local else None,
+                    native_device_bytes=device,
                     dynamic_xla_scratch_bytes=scratch,
-                    local=local, formula='copies*(vendor_device_bytes + local_info(4)); copies=1 for staged/serial calls',
+                    local=local, formula='copies*(native_device_bytes + local_info(4)); Mp native bytes include aligned vendor workspace and a private operand tile',
                     copies=copies,
                     provider='cusolverDn' if local else 'cusolverMp')
     if op not in ('gemm', 'matmul'):
@@ -151,8 +153,8 @@ def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:
     -------
     int
         Device bytes per rank for operation workspace. Mp eigh's dynamic
-        XLA ScratchAllocator allocation is EXACTLY the returned vendor
-        device bytes, not a second buffer. Host workspace and persistent
+        XLA ScratchAllocator allocation is exactly the native query result:
+        aligned vendor workspace plus one private input tile. Host workspace and persistent
         context/communicator resources are separate (see WORKSPACE.md).
         GEMM workspace persists: budget its maximum across planned calls
         plus the largest concurrent eigh scratch. Local GEMM uses a
