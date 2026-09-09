@@ -2875,6 +2875,9 @@ def _resolve_shared_pole_inputs(params):
             "want: finite > 0 eV; why: the causal evaluation needs positive broadening")
     if model != "shared_pole":
         return
+    if coerce_head_correction(params['head_correction']) is not HeadCorrection.OFF:
+        raise ValueError(
+            "shared_pole head correction NOT_MEASURED; use mpa or head_correction = off")
     unused = sorted(named.intersection({
         "mpa_n_poles", "mpa_sampling_alpha", "mpa_sampling_schedule",
         "mpa_pole_solver", "mpa_varpi_near_ry", "mpa_varpi_far_ry",
