@@ -286,8 +286,20 @@ def _write_metadata(io, header):
 def _factor_valid(C, poles2, K):
     """Reduce the factor contract to one scalar without eager array temporaries.
 
-    C keeps its caller's named row/column sharding; poles2 and K carry
-    squared Ry poles and active counts. The result is a replicated boolean.
+    Parameters
+    ----------
+    C : jax.Array, complex128, (batch, mu, spin, columns)
+        Physical factor in Ry^(3/2), retaining the caller's named row/column
+        sharding. Digest callers supply a bounded column panel.
+    poles2 : jax.Array, float64, (batch, columns)
+        Squared poles in Ry^2, replicated or sharded over columns.
+    K : array, int64, (batch,)
+        Replicated active column counts.
+
+    Returns
+    -------
+    jax.Array, bool, ()
+        Replicated conjunction of finiteness, ordering and sentinel checks.
     """
     active = jnp.arange(C.shape[3])[None, :] < K[:, None]
     return (jnp.all(jnp.isfinite(C)) & jnp.all(jnp.isfinite(poles2))
