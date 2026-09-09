@@ -303,3 +303,62 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<double>("beta_re")
         .Attr<double>("beta_im")
         .Attr<int64_t>("ctx_handle"));
+
+// Query-only N,N planning door; all batches reuse one workspace in the
+// execution handler. Sizing never reads the supplied device address token.
+extern "C" int lrx_gemm_workspace_bytes(
+    int64_t ctx_handle, int64_t m, int64_t n, int64_t k, int complex128,
+    uint64_t* device_bytes, uint64_t* host_bytes) {
+    if (!ctx_handle || !device_bytes || !host_bytes ||
+        m < 1 || n < 1 || k < 1 || (complex128 != 0 && complex128 != 1)) return -1;
+    *device_bytes = 0; *host_bytes = 0;
+    using namespace lorrax_ffi::cublasmp_batched_gemm;
+    auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
+    if (m%ctx->p || n%ctx->q || k%ctx->p || k%ctx->q) return -2;
+    try { ensure_cublasmp(ctx); } catch (...) { return -3; }
+    cublasMpMatrixDescriptor_t a=nullptr, b=nullptr, c=nullptr;
+    cublasMpMatmulDescriptor_t mm=nullptr;
+    const auto dtype = complex128 ? CUDA_C_64F : CUDA_R_64F;
+    auto status = cublasMpMatrixDescriptorCreate(m,k,m/ctx->p,k/ctx->q,
+        0,0,m/ctx->p,dtype,ctx->cublasmp_grid,&a);
+    if (status == CUBLASMP_STATUS_SUCCESS)
+        status = cublasMpMatrixDescriptorCreate(k,n,k/ctx->p,n/ctx->q,
+            0,0,k/ctx->p,dtype,ctx->cublasmp_grid,&b);
+    if (status == CUBLASMP_STATUS_SUCCESS)
+        status = cublasMpMatrixDescriptorCreate(m,n,m/ctx->p,n/ctx->q,
+            0,0,m/ctx->p,dtype,ctx->cublasmp_grid,&c);
+    if (status == CUBLASMP_STATUS_SUCCESS)
+        status = cublasMpMatmulDescriptorCreate(&mm,CUBLAS_COMPUTE_64F);
+    cublasOperation_t op = CUBLAS_OP_N;
+    if (status == CUBLASMP_STATUS_SUCCESS)
+        status = lorrax_ffi::cublasmp::set_matmul_descriptor_attribute(mm,
+            CUBLASMP_MATMUL_DESCRIPTOR_ATTRIBUTE_TRANSA,&op,sizeof(op));
+    if (status == CUBLASMP_STATUS_SUCCESS)
+        status = lorrax_ffi::cublasmp::set_matmul_descriptor_attribute(mm,
+            CUBLASMP_MATMUL_DESCRIPTOR_ATTRIBUTE_TRANSB,&op,sizeof(op));
+    // Valid device address token for descriptor-only sizing; not read.
+    const auto* z = reinterpret_cast<const std::complex<double>*>(ctx->d_info);
+    const auto* d = reinterpret_cast<const double*>(ctx->d_info);
+    size_t dw=0, hw=0;
+    if (status == CUBLASMP_STATUS_SUCCESS) {
+        if (complex128) {
+            const std::complex<double> alpha(1,0), beta(1,0);
+            status = mp::MatmulBufferSize<std::complex<double>>(
+                ctx->cublasmp_handle,mm,m,n,k,&alpha,z,1,1,a,
+                z,1,1,b,&beta,z,1,1,c,const_cast<std::complex<double>*>(z),1,1,c,&dw,&hw);
+        } else {
+            const double alpha=1, beta=1;
+            status = mp::MatmulBufferSize<double>(ctx->cublasmp_handle,mm,m,n,k,
+                &alpha,d,1,1,a,d,1,1,b,&beta,
+                d,1,1,c,const_cast<double*>(d),1,1,c,&dw,&hw);
+        }
+    }
+    if (mm) cublasMpMatmulDescriptorDestroy(mm);
+    if (c) cublasMpMatrixDescriptorDestroy(c);
+    if (b) cublasMpMatrixDescriptorDestroy(b);
+    if (a) cublasMpMatrixDescriptorDestroy(a);
+    if (status == CUBLASMP_STATUS_SUCCESS) {
+        *device_bytes=dw; *host_bytes=hw;
+    }
+    return int(status);
+}

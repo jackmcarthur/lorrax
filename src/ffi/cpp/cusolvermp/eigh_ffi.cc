@@ -279,3 +279,80 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nb")
         .Attr<int64_t>("ctx_handle")
         .Attr<bool>("compute_evecs"));
+
+// Query-only planning door. No matrix or workspace allocation and no solve.
+// ctx_handle==0 selects the device-local cuSOLVER route; otherwise the live
+// cuSOLVERMp grid supplies precisely the descriptors used by EighImpl.
+#include <cusolverDn.h>
+#include <algorithm>
+extern "C" int lrx_eigh_workspace_bytes(
+    int64_t ctx_handle, int64_t n, int complex128,
+    uint64_t* device_bytes, uint64_t* host_bytes) {
+    if (!device_bytes || !host_bytes || n < 1 || n > INT32_MAX ||
+        (complex128 != 0 && complex128 != 1)) return -1;
+    *device_bytes = 0; *host_bytes = 0;
+    if (ctx_handle == 0) {
+        cusolverDnHandle_t handle = nullptr;
+        auto status = cusolverDnCreate(&handle);
+        if (status != CUSOLVER_STATUS_SUCCESS) return int(status);
+        int lwork = 0;
+        if (complex128) {
+            status = cusolverDnZheevd_bufferSize(handle, CUSOLVER_EIG_MODE_VECTOR,
+                CUBLAS_FILL_MODE_LOWER, int(n), nullptr, int(n), nullptr, &lwork);
+        } else {
+            status = cusolverDnDsyevd_bufferSize(handle, CUSOLVER_EIG_MODE_VECTOR,
+                CUBLAS_FILL_MODE_LOWER, int(n), nullptr, int(n), nullptr, &lwork);
+        }
+        // JAX selects Jacobi for small matrices. Cover that path as well.
+        if (status == CUSOLVER_STATUS_SUCCESS && n <= 32) {
+            syevjInfo_t info = nullptr;
+            status = cusolverDnCreateSyevjInfo(&info);
+            int jacobi = 0;
+            if (status == CUSOLVER_STATUS_SUCCESS) {
+                if (complex128) status = cusolverDnZheevj_bufferSize(handle,
+                    CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER,
+                    int(n), nullptr, int(n), nullptr, &jacobi, info);
+                else status = cusolverDnDsyevj_bufferSize(handle,
+                    CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER,
+                    int(n), nullptr, int(n), nullptr, &jacobi, info);
+                cusolverDnDestroySyevjInfo(info);
+                lwork = std::max(lwork, jacobi);
+            }
+        }
+        cusolverDnDestroy(handle);
+        if (status == CUSOLVER_STATUS_SUCCESS)
+            *device_bytes = uint64_t(lwork) * (complex128 ? 16 : 8);
+        return int(status);
+    }
+    using namespace lorrax_ffi::cusolvermp;
+    auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
+    if (ctx->p != ctx->q || n % ctx->p || n % ctx->q) return -2;
+    cusolverMpMatrixDescriptor_t a = nullptr, q = nullptr;
+    const auto dtype = complex128 ? CUDA_C_64F : CUDA_R_64F;
+    auto status = cusolverMpCreateMatrixDesc(&a, ctx->grid, dtype,
+        n, n, n/ctx->p, n/ctx->q, 0, 0, n/ctx->p);
+    if (status != CUSOLVER_STATUS_SUCCESS) return int(status);
+    status = cusolverMpCreateMatrixDesc(&q, ctx->grid, dtype,
+        n, n, n/ctx->p, n/ctx->q, 0, 0, n/ctx->p);
+    // Mp sizing rejects null pointers, although it reads no matrix data.
+    // Reuse the context's existing device-info allocation as an address
+    // token; no operand-sized allocation or data access is required.
+    size_t dw = 0, hw = 0;
+    if (status == CUSOLVER_STATUS_SUCCESS) {
+        if (complex128) status = mp::SyevdBufferSize<std::complex<double>>(
+            ctx->handle, 'V', CUBLAS_FILL_MODE_LOWER, n,
+            reinterpret_cast<const std::complex<double>*>(ctx->d_info), 1, 1, a,
+            reinterpret_cast<double*>(ctx->d_info),
+            reinterpret_cast<std::complex<double>*>(ctx->d_info), 1, 1, q, &dw, &hw);
+        else status = mp::SyevdBufferSize<double>(ctx->handle, 'V',
+            CUBLAS_FILL_MODE_LOWER, n, reinterpret_cast<const double*>(ctx->d_info), 1, 1, a,
+            reinterpret_cast<double*>(ctx->d_info), reinterpret_cast<double*>(ctx->d_info),
+            1, 1, q, &dw, &hw);
+    }
+    if (q) cusolverMpDestroyMatrixDesc(q);
+    cusolverMpDestroyMatrixDesc(a);
+    if (status == CUSOLVER_STATUS_SUCCESS) {
+        *device_bytes = dw; *host_bytes = hw;
+    }
+    return int(status);
+}

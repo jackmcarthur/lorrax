@@ -93,6 +93,7 @@ punctilio — it is the failure mode.
 
 from __future__ import annotations
 
+from distrib_la.workspace import workspace_bytes_per_rank
 from distrib_la.dispatch import dispatch_batched_eigh
 from distrib_la.factor import FactorToken, factor, solve
 from distrib_la.loader import dial_key, has_target, probe_target
@@ -135,7 +136,7 @@ from distrib_la.resolve import (
 
 __all__ = [
     # plan
-    "Plan", "plan", "ensure_sharding", "DONATES",
+    "Plan", "plan", "ensure_sharding", "DONATES", "workspace_bytes_per_rank",
     # polar / SVD
     "PolarPlan", "plan_polar_factor", "polar_factor",
     "right_singular_vectors", "leading_eigenvectors",
