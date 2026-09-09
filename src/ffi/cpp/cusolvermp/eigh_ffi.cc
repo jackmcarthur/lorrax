@@ -39,6 +39,17 @@ namespace lorrax_ffi::cusolvermp {
 
 namespace ffi = ::xla::ffi;
 
+// Keep the destructive vendor operand in the same XLA scratch allocation as
+// its workspace. Both the execution and query doors use this byte layout.
+static size_t operand_offset(size_t workspace_bytes) {
+    return (workspace_bytes + 255) & ~size_t(255);
+}
+
+static size_t eigh_scratch_bytes(size_t workspace_bytes, int64_t n,
+                                 const LorraxCusolverMpCtx* ctx, size_t itemsize) {
+    return operand_offset(workspace_bytes) + size_t(n / ctx->p) * (n / ctx->q) * itemsize;
+}
+
 // ---------------------------------------------------------------------------
 //  Profile switch
 // ---------------------------------------------------------------------------
@@ -126,16 +137,22 @@ static ffi::Error EighImpl(
     // still do their own cudaMalloc, so MEM_FRACTION=0.5 remains needed
     // until/unless that's fixed upstream; this at least keeps OUR
     // workspace from double-dipping).
-    auto ws_opt = scratch.Allocate(d_ws_bytes);
+    const size_t scratch_bytes = eigh_scratch_bytes(d_ws_bytes, n, ctx, sizeof(T));
+    auto ws_opt = scratch.Allocate(scratch_bytes);
     if (!ws_opt.has_value()) {
         cusolverMpDestroyMatrixDesc(descA);
         cusolverMpDestroyMatrixDesc(descQ);
         std::ostringstream os;
         os << "eigh: XLA scratch allocator failed to provide "
-           << d_ws_bytes << " bytes";
+           << scratch_bytes << " bytes";
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
     }
     void* d_workspace = *ws_opt;
+    auto* d_operand = reinterpret_cast<T*>(
+        static_cast<char*>(d_workspace) + operand_offset(d_ws_bytes));
+    const size_t operand_bytes = size_t(n / ctx->p) * (n / ctx->q) * sizeof(T);
+    LORRAX_CUDA_CHECK(cudaMemcpyAsync(d_operand, d_A, operand_bytes,
+                                     cudaMemcpyDeviceToDevice, ctx->stream));
 
     // Host workspace stays on Ctx (scratch is device-only).
     if (h_ws_bytes > ctx->h_workspace_bytes) {
@@ -153,11 +170,11 @@ static ffi::Error EighImpl(
     // d_info is never read (mp_st already indicates success); skip the
     // per-call memset.  cuSOLVERMp writes into d_info in Syevd.
 
-    // cuSOLVERMp overwrites A's tile (Householder tridiagonalisation);
-    // const-cast once at the call site.
+    // The public eigh operation does not donate A. cuSOLVERMp overwrites its
+    // operand during tridiagonalisation, so only the private tile may be passed.
     mp_st = mp::Syevd<T>(
         ctx->handle, jobz, CUBLAS_FILL_MODE_LOWER, n,
-        const_cast<T*>(d_A), 1, 1, descA,
+        d_operand, 1, 1, descA,
         d_W,
         d_Q, 1, 1, descQ,
         d_workspace, d_ws_bytes,
@@ -352,7 +369,8 @@ extern "C" int lrx_eigh_workspace_bytes(
     if (q) cusolverMpDestroyMatrixDesc(q);
     cusolverMpDestroyMatrixDesc(a);
     if (status == CUSOLVER_STATUS_SUCCESS) {
-        *device_bytes = dw; *host_bytes = hw;
+        *device_bytes = eigh_scratch_bytes(dw, n, ctx, complex128 ? 16 : 8);
+        *host_bytes = hw;
     }
     return int(status);
 }

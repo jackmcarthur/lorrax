@@ -126,6 +126,11 @@ def check_directions_and_gemm(mesh):
             assert float(jnp.max(jnp.abs(qr[:, 3:]))) == 0
             repeated_errors.append(repeated_error)
         ep = D.plan('eigh', mesh, backend=backend, n=12, batched_route=route)
+        eigen_input = put(herm)
+        full_values, full_vectors = ep(eigen_input)
+        jax.block_until_ready((full_values, full_vectors))
+        input_error = error(eigen_input, herm)
+        assert input_error == 0, (label, 'non-donating eigh mutated its input', input_error)
         qe, ev = D.leading_eigenvectors(put(herm), 2, eigh_plan=ep,
                                         column_extent=lambda r: 6)
         assert ev.size == 3
@@ -145,7 +150,8 @@ def check_directions_and_gemm(mesh):
             products.append(dict(transa=ta, transb=tb, error=err))
         rows.append(dict(plan=label, svd_projector_error=projector_error,
                          changing_input_projector_errors=repeated_errors,
-                         eigen_projector_error=eigen_error, retained_rank=3,
+                         eigen_projector_error=eigen_error,
+                         eigen_input_preservation_error=input_error, retained_rank=3,
                          gemm=products))
     return dict(status='PASS', cases=rows)
 
