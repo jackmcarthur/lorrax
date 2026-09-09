@@ -419,7 +419,7 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
             elif kind == "imaginary":
                 width = min(logical_n, max(1, int(recipe["imaginary_width"])))
                 q, values = distrib_la.leading_eigenvectors(
-                    -w[0], width, eigh_plan=eigh_plan, column_extent=column_extent,
+                    -0.5 * (w[0] + w[0].conj().T), width, eigh_plan=eigh_plan, column_extent=column_extent,
                     multiplet_tol=recipe["multiplet_relative_tolerance"])
             else:
                 raise ValueError(f"GATE shared_pole_role: got: {kind}; want: line or imaginary fitted role; why: unknown tangent semantics")
