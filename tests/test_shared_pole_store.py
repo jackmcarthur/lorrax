@@ -177,6 +177,10 @@ def check_roundtrip(mesh,path,layout="local"):
     assert member['digest']==header['digest']
     assert read_shared_pole_restart_member(restart,
         expected_identity=identity,mesh_xy=mesh,capacity=meta.shared_pole_capacity)==member
+    returned,validated=read_shared_pole_restart_member(restart,
+        expected_identity=identity,mesh_xy=mesh,capacity=meta.shared_pole_capacity,
+        return_header=True)
+    assert returned==member and validated==header
     return header
 
 
