@@ -418,6 +418,35 @@ def _parent_panel_slice(mesh_xy, parent, width):
         out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
 
 
+@lru_cache(maxsize=None)
+def _hermitian_part_kernel(mesh):
+    """Reuse Hermitian projection on current [b,n,n] response faces."""
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    return jax.jit(_hermitian, out_shardings=NamedSharding(mesh, P(None, 'x', 'y')))
+
+
+@lru_cache(maxsize=None)
+def _public_factor_kernel(mesh):
+    """Insert the scalar-spin axis without recreating the executable."""
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    return jax.jit(lambda value: value[:, :, None, :],
+                   out_shardings=NamedSharding(mesh, P(None, 'x', None, 'y')))
+
+
+@lru_cache(maxsize=None)
+def _stack_model_kernel(mesh):
+    """Stack the current admitted factor/pole/count batch on named layouts."""
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    return jax.jit(
+        lambda parts: tuple(jnp.concatenate([row[i] for row in parts], axis=0)
+                            for i in range(3)),
+        out_shardings=(NamedSharding(mesh, P(None, 'x', None, 'y')),
+                       NamedSharding(mesh, P()), NamedSharding(mesh, P())))
+
+
 def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
                       column_extent, logical_n, admit, infinity_carrier):
     """Select each q row independently from a bounded batch of fitted samples.
@@ -429,9 +458,7 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
 
-    hermitian_part = jax.jit(
-        lambda a: 0.5 * (a + _adjoint(a)),
-        out_shardings=NamedSharding(eigh_plan.mesh, P(None, 'x', 'y')))
+    hermitian_part = _hermitian_part_kernel(eigh_plan.mesh)
     fit_roles = _fit_roles(recipe)
     states, masks, roles = [], [], []
     def largest_side():
@@ -673,11 +700,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     eig, svd = eigenplan(n), eigenplan(2*n)
     receipts = []
     receipt_entry_start = 0
-    replicated = NamedSharding(mesh_xy, P())
-    stack_models = jax.jit(
-        lambda parts: tuple(jnp.concatenate([row[i] for row in parts], axis=0)
-                            for i in range(3)),
-        out_shardings=(public_factor, replicated, replicated))
+    stack_models = _stack_model_kernel(mesh_xy)
     from runtime.padding import mesh_divisor
     from gw.shared_pole_local import pack_parent_panels, local_parent_reducer
     # Local dense algebra assigns independent parents to mesh ranks. The
@@ -864,7 +887,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 capacity_entry_start=receipt_entry_start)
             receipt_entry_start = len(ledger.entries)
             receipt.update(identity=identity, constructor=row)
-            public_c = jax.jit(lambda value: value[:, :, None, :], out_shardings=public_factor)(c)
+            public_c = _public_factor_kernel(mesh_xy)(c)
             del model, c, mask
             ready_models.append((public_c, poles, counts))
             retained_panels = (*retained_panels, public_c, poles, counts)
