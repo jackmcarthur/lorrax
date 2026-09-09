@@ -7,6 +7,39 @@ the same Hermite/Ritz equations as the distributed constructor.
 from functools import lru_cache
 
 
+@lru_cache(maxsize=16)
+def plan_local_parent_reducer(mesh_xy, native_eigh, parent_extents, n):
+    """Compile abstract packed panels and price the actual per-rank buffers.
+
+    ``n`` is the padded port dimension; extents are finite/infinity column
+    counts for every padded parent. No physical panels are allocated here.
+    Supports and band-dependent actions remain executable inputs.
+    """
+    import jax
+    import numpy as np
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from runtime.aot_memory import aot_kernel_peak_bytes
+
+    b = len(parent_extents)
+    rf = max(f for f, _ in parent_extents)
+    ri = max(i for _, i in parent_extents)
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    scalar = NamedSharding(mesh_xy, P())
+    def abstract(shape, sharding, dtype=np.complex128):
+        return jax.ShapeDtypeStruct(shape, dtype, sharding=sharding)
+    finite = (abstract((b, rf), scalar),
+              *(abstract((b, n, rf), face) for _ in range(3)))
+    infinity = tuple(abstract((b, n, ri), face) for _ in range(3))
+    active = abstract((b, rf + ri), scalar, np.bool_)
+    compiled = local_parent_reducer(mesh_xy, native_eigh, parent_extents).lower(
+        finite, infinity, active).compile()
+    peak = aot_kernel_peak_bytes(compiled)
+    return compiled, dict(total_bytes_per_rank=peak.total,
+                          compiled_peak_bytes_per_rank=peak.compiled_peak,
+                          resident_increment_bytes_per_rank=peak.resident_increment,
+                          cufft_measured=peak.cufft_measured)
+
+
 def pack_parent_panels(parents, *, mesh_xy):
     """Pack ragged finite/infinity panels without changing physical columns.
 

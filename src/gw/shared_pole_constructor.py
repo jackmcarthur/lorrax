@@ -667,6 +667,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         if _sample_point(recipe, sample_id) != _sample_point(stored_recipe, sample_id):
             raise ValueError("GATE shared_pole_bank_state: got: changed z; want: current physical sample point; why: recipe hashes alone do not bind resolved points")
 
+    local_compiled_price = None
+
     def capacity(side, *, phase=None, policy=None, reserve=True):
         nonlocal current_side, current_phase, workspace
         if phase is not None:
@@ -684,6 +686,16 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         price = shared_pole_byte_terms(
             meta, mesh_xy=mesh_xy, resolution=policy, pencil_side=side,
             parent_batch=batch_width, sample_batch=1, phase=current_phase)
+        if (current_phase == "reduction" and policy.layout == "local"
+                and local_compiled_price is not None):
+            # XLA buffer assignment can exceed the algebraic live-array floor.
+            # Native eigh scratch is already visible in this executable;
+            # persistent service GEMM workspace remains charged separately.
+            excess = max(0, local_compiled_price["total_bytes_per_rank"]
+                         - price["resident_bytes_per_rank"] - native_maxima["eigh"])
+            price["terms_bytes_per_rank"]["compiled_buffer_excess"] = excess
+            price["resident_bytes_per_rank"] += excess
+            price["compiled"] = local_compiled_price
         # Other parents' narrow inputs survive selection and each model's
         # checks; they are additional live storage, never hidden in a limit.
         extra = sum(int(np.prod(a.sharding.shard_shape(a.shape))) * a.dtype.itemsize
@@ -735,7 +747,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     receipt_entry_start = 0
     stack_models = _stack_model_kernel(mesh_xy)
     from runtime.padding import mesh_divisor
-    from gw.shared_pole_local import pack_parent_panels, local_parent_reducer
+    from gw.shared_pole_local import pack_parent_panels, plan_local_parent_reducer
     # Local dense algebra assigns independent parents to mesh ranks. The
     # distributed plan keeps its one-parent face-tiled execution schedule.
     batch_limit = mesh_divisor(mesh_xy) if resolution.layout == "local" else 1
@@ -793,7 +805,16 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         side = finite_width + infinity_width
         batch_width = mesh_divisor(mesh_xy)
         local_policy = linalg_resolution({"linalg": "local"})
+        local_compiled_price = None
         local_price = capacity(side, phase="reduction", policy=local_policy, reserve=False)
+        local_execute = None
+        if resolution.layout == "local" and local_price["device_budget_status"] == "PASS":
+            extents = tuple((sum(st[1].shape[-1] for st in ss), ii[0].shape[-1])
+                            for _, ss, ii, _, _, _ in pending)
+            extents += (extents[-1],) * (batch_width - len(extents))
+            local_execute, local_compiled_price = plan_local_parent_reducer(
+                mesh_xy, eigenplan(side, local_policy).native_fn, extents, n)
+            local_price = capacity(side, policy=local_policy, reserve=False)
         batch_width = 1
         distributed_policy = linalg_resolution({"linalg": "distributed"})
         distributed_price = capacity(side, policy=distributed_policy, reserve=False)
@@ -812,12 +833,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             price = capacity(side, phase="reduction")
             packed = pack_parent_panels([(ss, ii, mask) for _, ss, ii, mask, _, _ in pending],
                                         mesh_xy=mesh_xy)
-            reduce_eigh = eigenplan(finite_width + infinity_width, reducer_resolution)
-            extents = tuple((sum(st[1].shape[-1] for st in ss), ii[0].shape[-1])
-                            for _, ss, ii, _, _, _ in pending)
-            extents += (extents[-1],) * (batch_width - len(extents))
-            batch_results = local_parent_reducer(
-                mesh_xy, reduce_eigh.native_fn, extents)(*packed)
+            batch_results = local_execute(*packed)
             jax.block_until_ready(batch_results)
             del packed
             # Drop selected action panels after the fused boundary. Model
