@@ -18,14 +18,14 @@ import jax.numpy as jnp
 
 
 def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
-                           parent_batch, sample_batch):
+                           parent_batch, sample_batch, phase="reduction"):
     """Price constructor carriers; the map CapacityLedger owns admission.
 
-    Bytes include the actual parent/sample batch, narrow retained actions,
-    original and equilibrated pencils, corrected Ritz eigensolver outputs,
-    sort temporaries and the 2n SVD dilation. Native workspace is separately
-    supplied by the service. No U threshold or independent capacity policy
-    lives in this constructor helper.
+    Selection holds samples, current narrow actions and the n/2n direction
+    solve; it has no R-by-R pencil. Reduction holds the actual selected
+    pencil. Model checks hold factors and bounded samples, with no pencil.
+    Native workspace is separately supplied by the service. No threshold
+    or independent capacity policy lives in this constructor helper.
     """
     import math
 
@@ -35,17 +35,26 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     if min(packed, b, a) <= 0 or r < 0:
         raise ValueError("GATE shared_pole_capacity: got: invalid extents; want: positive basis/batches and nonnegative pencil; why: live-set pricing")
     dense_copies = math.ceil(b / p) if resolution.layout == "local" else b / p
-    directions = math.ceil(16 * dense_copies * (24 * packed**2 + 12 * packed * r))
-    reduction = math.ceil(16 * dense_copies * (14 * r*r + 12 * packed * r))
+    if phase == "selection":
+        dense = 24 * packed**2
+        sample_faces = max(2*a, 2)
+    elif phase == "reduction":
+        dense = 14 * r*r + 12 * packed * r
+        sample_faces = 0
+    elif phase == "model":
+        dense = 8 * packed**2 + 4 * packed * r
+        sample_faces = max(2*a, 2)
+    else:
+        raise ValueError(f"unknown shared-pole capacity phase: {phase}")
     terms = {
-        "sample_and_moment_batch": math.ceil(16*b*(2*a+2)*packed**2/p),
-        "narrow_actions": math.ceil(16*b*6*packed*r/p),
+        "sample_or_moment_batch": math.ceil(16*b*sample_faces*packed**2/p),
+        "narrow_actions": math.ceil(16*b*3*packed*r/p),
         "replicated_scalars": 8*b*(12*r+4*packed),
-        "largest_dense_phase": max(directions, reduction),
+        "phase_dense_temporaries": math.ceil(16*dense_copies*dense),
     }
     return {"terms_bytes_per_rank": terms,
             "resident_bytes_per_rank": sum(terms.values()),
-            "layout": resolution.layout, "pencil_side": r,
+            "layout": resolution.layout, "phase": phase, "pencil_side": r,
             "parent_batch": b, "sample_batch": a}
 
 
@@ -399,13 +408,9 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
     fit_roles = _fit_roles(recipe)
     states, masks, roles = [], [], []
     for sample_id in recipe["fit_ids"]:
-        # Admit before reading/selecting, including the largest possible
-        # next multiplet and all conjugate/duplicate roles of this sample.
-        next_roles = [role for role in fit_roles
-                      if not role["held"] and int(role["sample_id"]) == int(sample_id)]
-        maximum_new = sum(2 if role["role"].startswith("line:") else 1
-                          for role in next_roles) * column_extent(logical_n)
-        admit(infinity_carrier + sum(state[1].shape[-1] for state in states) + maximum_new)
+        # Only current directions survive alongside the next sample/solve.
+        # The selected width is known before its action panels are built.
+        admit(infinity_carrier + sum(state[1].shape[-1] for state in states))
         w, derivative = read_sample(int(sample_id), states)
         for role in fit_roles:
             if role["held"] or int(role["sample_id"]) != int(sample_id):
@@ -432,6 +437,8 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
             # exactly as the latent Hermite construction specifies. No extra
             # sample and no re-selection on the adjoint matrix is performed.
             for conjugate in ((False, True) if kind == "line" and s.imag != 0 else (False,)):
+                admit(infinity_carrier + sum(state[1].shape[-1] for state in states)
+                      + q.shape[-1])
                 transa = "C" if conjugate else "N"
                 output = matmul(w, q, transa=transa)
                 action = matmul(derivative, q, transa=transa)
@@ -523,6 +530,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     native_maxima = {"eigh": 0, "gemm": 0}
     workspace = 0
     current_side = 0
+    current_phase = "selection"
     plans = {}
 
     def eigenplan(side):
@@ -539,9 +547,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             size = distrib_la.workspace_bytes_per_rank(
                 plan, op, shapes, np.complex128)
             native_queries[key] = size
-            native_maxima[op] = max(native_maxima[op], size)
-            # GEMM retains its workspace in the context while eigh uses
-            # transient scratch. They coexist; the provider says to sum.
+        if op == "gemm":
+            native_maxima[op] = max(native_maxima[op], native_queries[key])
             workspace = sum(native_maxima.values())
         return native_queries[key]
     header = validate_shared_pole_bank(bank["path"], expected_identity=identity,
@@ -564,15 +571,22 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         if _sample_point(recipe, sample_id) != _sample_point(stored_recipe, sample_id):
             raise ValueError("GATE shared_pole_bank_state: got: changed z; want: current physical sample point; why: recipe hashes alone do not bind resolved points")
 
-    def capacity(side):
-        nonlocal current_side
+    def capacity(side, *, phase=None):
+        nonlocal current_side, current_phase, workspace
+        if phase is not None:
+            current_phase = phase
         current_side = side
-        for extent in sorted({n, 2*n, side} - {0}):
-            query_workspace("eigh", ((1, extent, extent),), eigenplan(extent))
-        query_workspace("gemm", ((1, n, n), (1, n, n)), eigenplan(n))
+        extents = {n, 2*n} if current_phase == "selection" else (
+            {side} if current_phase == "reduction" else {n})
+        # Eigh scratch is transient: replace it at each phase boundary.
+        # Only the actually used GEMM context workspace persists.
+        native_maxima["eigh"] = max(query_workspace(
+            "eigh", ((1, extent, extent),), eigenplan(extent))
+            for extent in sorted(extents))
+        workspace = sum(native_maxima.values())
         price = shared_pole_byte_terms(
             meta, mesh_xy=mesh_xy, resolution=resolution, pencil_side=side,
-            parent_batch=1, sample_batch=1)
+            parent_batch=1, sample_batch=1, phase=current_phase)
         row = ledger.reserve(f"constructor.plan.{len(ledger.entries)}",
                              resident_bytes_per_rank=price["resident_bytes_per_rank"],
                              workspace_bytes_per_rank=workspace,
@@ -618,6 +632,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     # total irreducible-q count. Store owns the ragged K census and final copy.
     for q in range(int(header["bank_shape"]["nq"])):
         span = (q, q + 1)
+        capacity(0, phase="selection")
         expose_live(())
         with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
             exact = read_shared_pole_bank(moment_io, span, meta=meta,
@@ -627,6 +642,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             exact["M1"][0], width, eigh_plan=eig, column_extent=column_extent,
             multiplet_tol=recipe["multiplet_relative_tolerance"])
         qi = qi[None]
+        capacity(qi.shape[-1], phase="selection")
         infinity = (qi, mm(exact["M1"], qi), mm(exact["M3"], qi))
         del exact
         with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
@@ -643,7 +659,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 infinity_carrier=qi.shape[-1])
         masks.append(jnp.arange(qi.shape[-1]) < infinity_values.shape[-1])
         active_columns = jnp.concatenate(masks)[None]
-        price = capacity(active_columns.shape[-1])
+        # Complete selection kernels before dropping their transient native
+        # scratch from the next phase's admission envelope.
+        jax.block_until_ready((states, infinity))
+        price = capacity(active_columns.shape[-1], phase="reduction")
         pencil = assemble_shared_pole_pencil(states, infinity, matmul=mm)
         del states, masks, infinity
         reduce_eigh = eigenplan(pencil[0].shape[-1])
@@ -666,7 +685,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                    for value in retained.values()):
             raise ValueError(f"GATE shared_pole_retained_moments: got: failed at q={q}; want: projected latent moment identity <=1e-10; why: corrected Ritz algebra")
         del pencil, coefficients, selector, active_columns
+        capacity(model[0].shape[-1], phase="model")
         model, permutation = sort_shared_pole_columns(model, mesh_xy=mesh_xy)
+        query_workspace("gemm", ((1, n, n), (1, n, n)), eig)
+        capacity(current_side)
         expose_live((*model, qi))
         coulomb_sqrt, inverse_sqrt, coulomb_receipt = response_coulomb_powers(
             meta, config, mesh_xy=mesh_xy, bank_io=bank, q_span=span)

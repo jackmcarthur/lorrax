@@ -124,8 +124,12 @@ def run_checks(mesh, directory):
         for receipt in result['q_receipts']:
             queries = receipt['constructor']['native_workspace_queries']
             assert {row['op'] for row in queries} == {'eigh', 'gemm'}
-            maxima = {op: max(row['bytes_per_rank'] for row in queries if row['op'] == op)
-                      for op in ('eigh', 'gemm')}
+            maxima = receipt['constructor']['capacity']['native_workspace']
+            assert maxima['gemm'] == max(row['bytes_per_rank'] for row in queries if row['op'] == 'gemm')
+            assert receipt['constructor']['capacity']['price']['phase'] == 'model'
+            current_eigh = [row['bytes_per_rank'] for row in queries
+                            if row['op'] == 'eigh' and row['shapes'][0][-1] == meta.n_rmu_padded]
+            assert maxima['eigh'] == current_eigh[0]
             assert maxima['eigh'] > 0
             assert receipt['constructor']['capacity']['workspace_bytes_per_rank'] == sum(maxima.values())
         # A changed resolved coordinate must refuse before a model write.

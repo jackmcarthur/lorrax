@@ -146,7 +146,7 @@ def run_checks(mesh):
                             for state in selected]
         assert max(selection_errors) < 1e-10, selection_errors
         assert all(int(jnp.sum(mask)) == 3 for mask in selected_masks)
-        assert admissions == [26]
+        assert admissions == [2, 6, 10]
         rows.append(dict(name="directions_multiplet_dedup", layout=layout, status="PASS",
                          reads=reads, roles=roles, projector_relative=selection_errors))
         models.append(model)
