@@ -40,10 +40,11 @@ def run_checks(mesh, directory):
     meta.n_rmu_padded = meta.mu_basis.n_packed
     recipe.update(recipe_hash=RECIPE_HASH, gate_hash=GATE_HASH,
                   role_codes=ROLE_CODES, fit_ids=[0, 1], held_ids=[2],
-                  z_ry=np.asarray([.2j, .2j, .5+.2j, .8+.2j]),
+                  z_ry=np.asarray([.2j, .2j, .5+.2j, .3+.2j]),
                   role=np.asarray([0, 1, 0, 3], np.int8),
                   distinct_id=np.asarray([0, 0, 1, 2], np.int64),
                   held=np.asarray([False, False, False, True]),
+                  support_pair=np.asarray([[-1, -1], [-1, -1], [-1, -1], [0, 1]], np.int64),
                   census=identity, direction_cutoff=1e-4,
                   imaginary_width=2, infinity_width=1,
                   multiplet_relative_tolerance=1e-6, eta_ev=.25)
@@ -68,7 +69,7 @@ def run_checks(mesh, directory):
         c = .02*(rng.normal(size=(7, rank)) + 1j*rng.normal(size=(7, rank)))
         t = np.linspace(.2, 1.4, rank)
         expected.append((c, t))
-        for sample, z in enumerate((.2j, .5+.2j, .8+.2j)):
+        for sample, z in enumerate((.2j, .5+.2j, .3+.2j)):
             w = (c/(z*z-t)) @ c.conj().T
             dw = -(c/(z*z-t)**2) @ c.conj().T
             store.write_shared_pole_bank(path, q_span=(q, q+1), sample_span=(sample, sample+1),

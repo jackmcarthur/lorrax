@@ -485,7 +485,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                               mesh_xy=mesh_xy)
     # The stored plan must bind the current physical points and role census.
     stored_recipe = header["recipe"]
-    for name in ("recipe_hash", "gate_hash", "fit_ids", "held_ids", "role", "distinct_id", "held", "census"):
+    for name in ("recipe_hash", "gate_hash", "fit_ids", "held_ids", "role", "role_codes",
+                 "distinct_id", "held", "support_pair", "census"):
         current = recipe[name]
         previous = stored_recipe[name]
         if isinstance(current, np.ndarray):
