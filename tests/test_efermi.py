@@ -350,3 +350,38 @@ def test_fd_fixed_n_exact_tail_and_spin_normalization():
     assert 0 < tail[0,1] < tail[0,0] < 1e-8
     scalar = OccupationState.solve_smearing(e, w, 1.5, .01, family='fd', state_capacity=1.)
     np.testing.assert_array_equal(state.f_kn, scalar.f_kn)
+
+
+@pytest.mark.parametrize('family', ['fd', 'mp1'])
+def test_smearing_logical_prefix_excludes_padding_from_fixed_n(family):
+    from gw.efermi import (OccupationState, assert_fixed_n,
+                          legacy_square_mesh_occupation_digests,
+                          solve_smearing_occupations)
+    energies = np.linspace(-1., 3., 86)[None, :] + np.array([[0.], [.01], [-.02]])
+    weights = np.array([.25, .25, .5])
+    physical = OccupationState.solve_smearing(
+        energies, weights, 9., .01, family=family, state_capacity=2.)
+    for padding in (0., -100., np.nan):
+        carrier = np.pad(energies, ((0, 0), (0, 2)), constant_values=padding)
+        padded = OccupationState.solve_smearing(
+            carrier, weights, 9., .01, family=family,
+            state_capacity=2., logical_nband=86)
+        assert padded.f_kn.shape == (3, 88)
+        np.testing.assert_array_equal(np.asarray(padded.f_kn)[:, 86:], 0.)
+        np.testing.assert_array_equal(np.asarray(padded.f_kn)[:, :86], physical.f_kn)
+        assert padded.mu_ry == physical.mu_ry
+        assert padded.occ_hash == physical.occ_hash
+        assert assert_fixed_n(padded, weights, state_capacity=2.) == pytest.approx(9., abs=1e-10)
+        assert legacy_square_mesh_occupation_digests(padded.f_kn, 86)
+    # Charge capacity uses physical bands, not the two storage slots.
+    with pytest.raises(ValueError, match='n_electrons'):
+        solve_smearing_occupations(carrier, weights, 173., .01,
+                                   family=family, state_capacity=2., logical_nband=86)
+
+
+@pytest.mark.parametrize('logical', [0, 89, -1, 86.5, True])
+def test_smearing_logical_prefix_refuses_invalid_extent(logical):
+    from gw.efermi import solve_smearing_occupations
+    with pytest.raises(ValueError, match='logical_nband'):
+        solve_smearing_occupations(np.zeros((2, 88)), [.5, .5], 9., .01,
+                                   family='fd', state_capacity=2., logical_nband=logical)

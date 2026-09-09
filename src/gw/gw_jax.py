@@ -239,6 +239,7 @@ def _oneshot_mpa_occupation_state(config, wfn, wfns, material_class,
 		energies, kweights, float(wfn.num_electrons),
 		float(config.occ_broadening_ry),
 		family=config.occ_smearing_family,
+		logical_nband=wfns.slices.nb_full_logical,
 		state_capacity=spin_degeneracy_factor(wfn),
 		clamp_tol=float(config.occupation_clamp_tol))
 	if mesh_xy is None or process_count() <= 1:
