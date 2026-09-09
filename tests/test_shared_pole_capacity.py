@@ -99,6 +99,56 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(ledger.receipt()['entries'][0]['status'],'PASS')
         self.assertEqual(ledger.receipt()['entries'][0]['resident_bytes_per_rank'],100)
 
+    def test_callee_lifetimes_require_explicit_binding(self):
+        ledger=self.ledger()
+        with self.assertRaisesRegex(ValueError,'unbound caller lifetimes'):
+            _=ledger.live_stages
+        ledger.live_stages=()
+        self.assertEqual(ledger.live_stages,())
+        ledger.reserve('inputs',resident_bytes_per_rank=512,workspace_bytes_per_rank=0)
+        ledger.live_stages=('inputs','inputs')
+        self.assertEqual(ledger.live_stages,('inputs',))
+        with self.assertRaises(MemoryError):
+            ledger.reserve('reader',resident_bytes_per_rank=257,workspace_bytes_per_rank=0,
+                           concurrent_with=ledger.live_stages)
+        with self.assertRaises(ValueError):
+            ledger.live_stages=('unknown',)
+        self.assertEqual(ledger.live_stages,('inputs',))
+        ledger.live_stages=()
+        self.assertEqual(ledger.reserve('sequential',resident_bytes_per_rank=768,
+                         workspace_bytes_per_rank=0,concurrent_with=ledger.live_stages)['status'],'PASS')
+
+    def test_inherited_stream_separate_from_new_objects(self):
+        ledger=self.ledger()
+        ledger.reserve('bank_outputs',resident_bytes_per_rank=768,workspace_bytes_per_rank=0)
+        row=ledger.record_stream_peak(1050,1000,reason='same deck/P and compile method; scalar twin')
+        self.assertEqual(row['status'],'PASS')
+        self.assertEqual(row['value']['incumbent_bytes_per_rank'],1000)
+        receipt=construction_receipt(capacity=ledger)
+        gates={row['name']:row for row in receipt['gates']}
+        self.assertEqual(gates['capacity']['status'],'PASS')
+        self.assertEqual(gates['stream_peak']['status'],'PASS')
+        self.assertEqual(len(ledger.entries),1)
+        with self.assertRaises(ValueError):
+            ledger.live_stages=('stream_peak',)
+
+    def test_stream_regression_refuses_and_cannot_erase_failure(self):
+        ledger=self.ledger()
+        with self.assertRaisesRegex(MemoryError,'inherited stream regressed'):
+            ledger.record_stream_peak(1051,1000,reason='same deck/P and compile method; red twin')
+        self.assertEqual(ledger.receipt()['stream_peak']['status'],'FAIL')
+        with self.assertRaises(ValueError):
+            ledger.record_stream_peak(1000,1000,reason='cannot overwrite earlier failure')
+
+    def test_stream_missing_and_invalid_baseline(self):
+        ledger=self.ledger()
+        self.assertEqual(ledger.record_stream_peak(1000,None,reason='incumbent absent')['status'],
+                         'NOT_MEASURED')
+        with self.assertRaises(ValueError):
+            ledger.record_stream_peak(0,0,reason='invalid incumbent')
+        self.assertEqual(ledger.record_stream_peak(1000,1000,reason='paired measurements')['status'],
+                         'PASS')
+
 
 if __name__=='__main__':
     unittest.main(verbosity=2)
