@@ -428,6 +428,7 @@ class SCInputs:
     #: independently fingerprint the source WFN/zeta artifacts.
     wfn_fingerprint_binding: object | None = None
     charge_zeta_identity: dict | None = None
+    tensors_filename: str | None = None
     print_fn: Callable = print
     # Selected ladder/iteration/verdict lines go to the driver's production
     # record.  Component chatter remains on ``print_fn`` and can still be
@@ -2462,7 +2463,8 @@ def _report_extrapolation_eqp_shift(
 
 
 def _sc_head_frequency_plan(
-        config, quad, *, material_class, certified_fit=None, mesh_xy=None):
+        config, quad, *, material_class, certified_fit=None, mesh_xy=None,
+        shared_pole_recipe=None):
     """Single frequency plan for SC body W and every head provenance arm.
 
     A live screening build takes its ceiling from ``quad``.  A certified-fit
@@ -2473,6 +2475,19 @@ def _sc_head_frequency_plan(
 
     requests = screening_requests_for(config.compute_mode, config)
     mpa_plan = None
+    if config.compute_mode is ComputeMode.MPA and config.sigma.w_model == "shared_pole":
+        if shared_pole_recipe is None:
+            raise ValueError("GATE shared_pole_sc_plan: current-map recipe is missing")
+        # Select existing physical fit coordinates; never rebuild an MPA grid
+        # or call the shared recipe resolver a second time for the head.
+        ids = np.asarray(shared_pole_recipe['distinct_id'])
+        held = np.asarray(shared_pole_recipe['held'])
+        z = np.asarray(shared_pole_recipe['z_ry'])
+        _, first = np.unique(ids[~held], return_index=True)
+        head_omegas = [complex(value) for value in z[~held][np.sort(first)]]
+        if bool(config.do_G0) and 0j not in head_omegas:
+            head_omegas.append(0j)
+        return requests, None, head_omegas
     if config.compute_mode is ComputeMode.MPA:
         from .mpa import sample_plan
         if quad is None:
@@ -2922,9 +2937,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # entry ladder.  Later maps retain only the fit's sample geometry and
     # rebuild screening from their live occupations.
     mpa_mode = inputs.config.compute_mode is ComputeMode.MPA
+    elementwise_mpa = mpa_mode and inputs.config.sigma.w_model == "mpa"
     screening_reuse = None
     certified_fit = None
-    if mpa_mode and inputs.quad is None:
+    if elementwise_mpa and inputs.quad is None:
         if inputs.config.head.correction is HeadCorrection.FULL:
             raise ValueError(
                 "MPA certified-fit reuse with no screening quadrature cannot "
@@ -3128,6 +3144,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             wfn=inputs.wfn,
             wfn_fingerprint_binding=inputs.wfn_fingerprint_binding,
             charge_zeta_identity=inputs.charge_zeta_identity,
+            tensors_filename=inputs.tensors_filename,
             mpa_plan=mpa_plan,
             iteration_head_response=iteration_head_response,
             occupation_state=metal_occ_state,
@@ -3138,7 +3155,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # table so a Schur-folded probe can never drift from the body W it folds.
     requests, mpa_plan, head_omegas = _sc_head_frequency_plan(
         inputs.config, inputs.quad, certified_fit=certified_fit,
-        mesh_xy=inputs.mesh_xy, material_class=inputs.material_class)
+        mesh_xy=inputs.mesh_xy, material_class=inputs.material_class,
+        shared_pole_recipe=getattr(inputs.meta, 'shared_pole_recipe', None))
 
     # Per-iteration QSGW q->0 head.  The opt-in map is stationary even for
     # accelerators that evaluate one carry repeatedly: at iteration zero
@@ -3232,7 +3250,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         velocity_kind = (
             "QSGW finite-link covariant velocity" if forward_links is not None
             else "QP-rotated DFT p-matrix velocity")
-        if mpa_mode:
+        if elementwise_mpa:
             # The fit-sample count comes from the RETURNED plan --
             # ``mpa_z`` is a local inside ``_sc_head_frequency_plan`` and
             # was never visible here (KNOWN_LORRAX_ISSUES 2026-08-19 row;
@@ -3279,7 +3297,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # A live producer runs here, after the current head response exists.
     if screening_reuse is not None:
         W_by_role = screening_reuse
-    elif mpa_mode and inputs.quad is None:
+    elif elementwise_mpa and inputs.quad is None:
         # The external fit is valid only for the occupation state stamped in
         # it.  Once the SC spectrum changes, keep its exactly reconstructed
         # sample geometry but run the canonical producer on this map's live
@@ -3582,7 +3600,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # the Sigma gates and assembled H.  Only at this point is the preceding
     # map's pair safe to unlink.  The newest pair survives convergence for
     # restart/debugging; ordinary screening modes never enter this branch.
-    if inputs.config.compute_mode is ComputeMode.MPA:
+    if elementwise_mpa:
         from .mpa.model import retain_iteration_artifacts
         retain_iteration_artifacts(
             os.path.join(inputs.input_dir, "tmp", "mpa"),
@@ -5663,6 +5681,7 @@ def run_sc_driver(
             {} if int(config.sc.max_iter) > 1 else None),
         wfn_fingerprint_binding=wfn_fingerprint_binding,
         charge_zeta_identity=charge_zeta_identity,
+        tensors_filename=tensors_filename,
         print_fn=print_fn,
         record_fn=record_fn,
     )

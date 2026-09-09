@@ -16,9 +16,9 @@ from gw.shared_pole_recipe import (
 BASE = '[cohsex]\nnval=2\nncond=2\nnumber_bands=10\n'
 
 
-def parse(tmp_path, extra):
+def parse(tmp_path, extra, *, head='off'):
     path = tmp_path / 'deck.in'
-    path.write_text(BASE + extra)
+    path.write_text(BASE + ('' if head is None else f'head_correction={head}\n') + extra)
     return LorraxConfig.from_input_file(str(path), resolve_hardware=False,
                                        runtime_platform='cpu', print_fn=lambda *_: None)
 
@@ -27,6 +27,22 @@ def parse(tmp_path, extra):
 def test_default_mpa(tmp_path, model):
     c = parse(tmp_path, 'compute_mode=mpa\n' + model)
     assert (c.sigma.w_model, c.sigma.w_accuracy) == ('mpa', 'production')
+
+
+@pytest.mark.parametrize('head', [None, 'full', 'no_local_fields'])
+@pytest.mark.parametrize('tier', ['production', 'relaxed'])
+def test_shared_enabled_head_refuses(tmp_path, head, tier):
+    with pytest.raises(ValueError) as caught:
+        parse(tmp_path, f'compute_mode=mpa\nsigma_w_model=shared_pole\nsigma_w_accuracy={tier}\n',
+              head=head)
+    assert str(caught.value) == (
+        'shared_pole head correction NOT_MEASURED; use mpa or head_correction = off')
+
+
+@pytest.mark.parametrize('head', [None, 'full', 'no_local_fields'])
+def test_incumbent_enabled_head_remains_valid(tmp_path, head):
+    c = parse(tmp_path, 'compute_mode=mpa\nsigma_w_model=mpa\n', head=head)
+    assert c.head.correction.value == ('full' if head is None else head)
 
 
 @pytest.mark.parametrize('tier,eps', [('production', 1e-4), ('relaxed', 1e-3)])
@@ -156,7 +172,7 @@ def test_stale_census():
 
 def test_receipt_absence_and_nonfinite():
     rows=construction_receipt()['gates']
-    assert len(rows)==len(shared_real_pole_gates_v1_r3b)==14
+    assert len(rows)==len(shared_real_pole_gates_v1_r3b)==15
     assert all(r['status']=='NOT_MEASURED' for r in rows)
     assert gate_receipt('capacity',passed=True,reason='absent')['status']=='NOT_MEASURED'
     assert gate_receipt('capacity',4,passed=False,reason='4U')['status']=='FAIL'

@@ -160,7 +160,11 @@ def _check_identity(actual, expected):
         if not isinstance(actual.get(name), str) or not actual[name]:
             _refuse(f"identity missing nonempty {name}")
     if _json(actual) != _json(expected):
-        _refuse("stale input/SC identity")
+        mismatches = [f"{key}: got {actual.get(key)!r}, want {expected.get(key)!r}"
+                      for key in sorted(set(actual) | set(expected))
+                      if key not in actual or key not in expected
+                      or _json(actual[key]) != _json(expected[key])]
+        _refuse("stale input/SC identity; " + "; ".join(mismatches))
 
 
 def _read_header(path):
@@ -240,7 +244,7 @@ def _metadata(meta, tables, recipe, identity):
         "n_q_irr": qt.n_q_ibz, "n_q_full": qt.n_q_full,
         "n_mu_logical": basis.n_logical, "nspinor": 1,
         "centroid_digest": centroid_hash,
-        "grid": np.asarray(meta.kgrid).tolist(),
+        "grid": [int(meta.nkx), int(meta.nky), int(meta.nkz)],
         "fft_grid": np.asarray(meta.fft_grid).tolist(),
         "q_order": "canonical-full-flat", "q_shift": [0.0, 0.0, 0.0],
         "q_irr_full_idx": qids.tolist(),
