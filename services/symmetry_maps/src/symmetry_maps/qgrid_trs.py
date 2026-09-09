@@ -539,7 +539,8 @@ class QgridTrsPolicy:
     def n_self_negative(self) -> int:
         return int(np.count_nonzero(self.self_negative_q))
 
-    def project_fixed_q(self, operator, q_full_idx):
+    def project_fixed_q(self, operator, q_full_idx, *,
+                        transposed_partner=None, measure=True):
         """``(operator, removed)`` — the Θ projector, and what it removed.
 
         On a measured-TRS deck this applies the one-element group average
@@ -548,12 +549,42 @@ class QgridTrsPolicy:
         1e-2 defect is the "instrument that measures and proceeds" failure
         wearing a repair's clothes.
 
+        With ``transposed_partner`` (same shape, dtype and rectangular
+        sharding as ``operator``), use the pair-transpose average at the
+        same complex time instead. No transpose or conjugation is formed.
+        ``measure=True`` returns a device vector of per-row Frobenius
+        ``||W-W^T||/||W||`` (zero on non-fixed rows); ``False`` omits the
+        reduction and is suitable inside a collective-free shard_map.
+        This additive path is JIT-compatible; q_full_idx is host metadata.
+
         On a TRS-BROKEN deck it is the identity and ``removed`` is
         ``None``.  There is no warrant for the projection there: the rows
         were solved independently and Θ is not a symmetry of this mean
         field, so ``V_q`` at a TRIM point is whatever the fit produced and
         the reciprocity gate should see it.
         """
+        # At complex time, Θ acts on the residue endpoints, not on the
+        # time weight. The supplied partner is W^T at the SAME tau.
+        if transposed_partner is not None:
+            import jax.numpy as jnp
+
+            if (transposed_partner.shape != operator.shape
+                    or transposed_partner.dtype != operator.dtype):
+                raise ValueError("pair-transpose partner must match operator shape/dtype")
+            fixed = self_negative_q_mask(q_full_idx, kgrid=self.kgrid)
+            if int(operator.shape[0]) != int(fixed.size):
+                raise ValueError("pair-transpose q_full_idx must address every operator row")
+            if not self.trs_measured or not np.any(fixed):
+                return operator, None
+            mask = jnp.asarray(fixed).reshape((-1,) + (1,) * (operator.ndim - 1))
+            out = jnp.where(mask, 0.5 * (operator + transposed_partner), operator)
+            if not measure:
+                return out, None
+            axes = tuple(range(1, operator.ndim))
+            dev = jnp.sqrt(jnp.sum(jnp.abs(operator - transposed_partner)**2, axis=axes))
+            scale = jnp.sqrt(jnp.sum(jnp.abs(operator)**2, axis=axes))
+            relative = dev / jnp.where(scale > 0, scale, 1.0)
+            return out, jnp.where(jnp.asarray(fixed), relative, 0.0)
         if not self.trs_measured:
             return operator, None
         fixed = self_negative_q_mask(q_full_idx, kgrid=self.kgrid)

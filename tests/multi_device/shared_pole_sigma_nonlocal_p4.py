@@ -54,7 +54,12 @@ def main(rt):
     for parent,op in zip(irr,ops):
         factor=C[parent,perm[op],0,:]*np.exp(2j*np.pi*(wraps[op]@q[parent]))[:,None]
         if op>=2:factor=factor.conj()
-        expected.append((factor*weights[parent])@factor.conj().T)
+        value = (factor*weights[parent])@factor.conj().T
+        if parent == 0:
+            partner = C[parent,perm[op],0,:].conj()*np.exp(2j*np.pi*(wraps[op]@q[parent]))[:,None]
+            if op >= 2: partner = partner.conj()
+            value = 0.5*(value+(partner*weights[parent])@partner.conj().T)
+        expected.append(value)
     expected=meta.mu_basis.pack_host(meta.mu_basis.pack_host(np.asarray(expected),axis=1),axis=2)
     args=(None,None,put(np.arange(3,dtype=np.int32),P()),
           put(np.tile([1,4,-np.inf,-np.inf,np.inf,np.inf],(3,1)),P()),

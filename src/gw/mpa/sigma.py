@@ -111,6 +111,22 @@ def synthesize_shared_pole_parents(
         mesh=mesh_xy, return_transpose=True)
 
 
+def _shared_pole_fixed_q_policy(header):
+    """Resolve the policy from the store's authenticated TRS/grid metadata."""
+    from symmetry_maps import QgridTrsPolicy, self_negative_q_mask
+
+    qt = header["qirr"]
+    grid = tuple(header["grid"])
+    # Canonical store validation admits only scalar-trs-even-s and binds
+    # these rows to the measured reference; do not infer TRS from C itself.
+    return QgridTrsPolicy(
+        trs_measured=header["representation"] == "scalar-trs-even-s",
+        kgrid=grid, n_sym_spatial=int(qt["n_sym_spatial"]),
+        unfold_sym_idx=np.asarray(qt["sym_idx_q"]),
+        self_negative_q=self_negative_q_mask(np.arange(header["n_q_full"]), kgrid=grid),
+        n_pair_rewired=0, context="shared-pole Sigma")
+
+
 def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
     """Authenticate packed endpoint maps and one parent's child-row panel."""
     from symmetry_maps import certify_endpoint_locality
@@ -126,7 +142,7 @@ def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
     lo, hi = map(int, q_span)
     parent_map = np.asarray(qt["irr_idx_q"], dtype=np.int32)
     rows = np.flatnonzero((parent_map >= lo) & (parent_map < hi)).astype(np.int32)
-    return dict(rows=rows, parent_rows=parent_map[rows] - lo,
+    return dict(parent_span=(lo, hi), rows=rows, parent_rows=parent_map[rows] - lo,
                 sym_rows=np.asarray(qt["sym_idx_q"], dtype=np.int32)[rows],
                 q_frac=np.asarray(qt["q_irr_frac"], dtype=np.float64)[lo:hi],
                 packed_perm=packed, wraps=wraps, certificates=certificates,
@@ -149,9 +165,16 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
     if not all(cert[axis]["is_local"] for axis in ("x", "y")):
         raise ValueError("shared-pole nonlocal maps require routed endpoint panels")
 
+    policy = _shared_pole_fixed_q_policy(header)
+    qids = np.asarray(header["q_irr_full_idx"])[slice(*q_span)]
+
     def body(plus, transposed):
+        projected, _ = policy.project_fixed_q(
+            plus, qids, transposed_partner=transposed, measure=False)
+        transposed, _ = policy.project_fixed_q(
+            transposed, qids, transposed_partner=plus, measure=False)
         return unfold_operator_local(
-            plus, irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
+            projected, irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
             q_irr_frac=tables["q_frac"],
             left_local_perm=cert["x"]["local_perm"], left_L_table=tables["wraps"],
             right_local_perm=cert["y"]["local_perm"], right_L_table=tables["wraps"],
@@ -180,7 +203,12 @@ def _shared_pole_routed_synthesis(
     operations = header["operations"]
     spin = (np.asarray(operations["spin_real"])
             + 1j * np.asarray(operations["spin_imag"]))[tables["sym_rows"]]
+    policy = _shared_pole_fixed_q_policy(header)
+    parent_ids = np.asarray(header["q_irr_full_idx"])[tables["parent_span"][0]:tables["parent_span"][1]]
+    child_ids = parent_ids[tables["parent_rows"]]
+    fixed = policy.self_negative_q[child_ids]
     children = []
+    partners = []
     for axis, face in (("x", X), ("y", Y)):
         child, _ = unfold_endpoint_panel(
             face, irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
@@ -189,16 +217,33 @@ def _shared_pole_routed_synthesis(
             n_sym_spatial=tables["n_sym_spatial"], active_mask=meta.mu_basis.active_mask,
             mesh=mesh_xy, mesh_axis=axis,
             max_live_bytes=endpoint_budgets[axis])
+        if np.any(fixed):
+            partner, _ = unfold_endpoint_panel(
+                face.conj(), irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
+                q_irr_frac=tables["q_frac"], source_perm=tables["packed_perm"],
+                L_table=tables["wraps"], spin_action_full=spin,
+                n_sym_spatial=tables["n_sym_spatial"], active_mask=meta.mu_basis.active_mask,
+                mesh=mesh_xy, mesh_axis=axis, max_live_bytes=endpoint_budgets[axis])
+            partners.append(partner)
         children.append(child)
     weights = _shared_pole_weights(poles2, intervals, E_ref_B, t_node)
     child_weights = weights[tables["parent_rows"]]
     size = len(tables["rows"])
     small = NamedSharding(mesh_xy, P())
-    return contract_faces(
+    plus = contract_faces(
         *children, jax.device_put(child_weights, small),
         jax.device_put(jnp.zeros(size, jnp.int32), small),
         jax.device_put(jnp.full(size, poles2.shape[1], jnp.int32), small),
         mesh=mesh_xy)
+    if partners:
+        transposed = contract_faces(
+            *partners, jax.device_put(child_weights, small),
+            jax.device_put(jnp.zeros(size, jnp.int32), small),
+            jax.device_put(jnp.full(size, poles2.shape[1], jnp.int32), small),
+            mesh=mesh_xy)
+        plus, _ = policy.project_fixed_q(
+            plus, child_ids, transposed_partner=transposed, measure=False)
+    return plus
 
 
 def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy):
@@ -289,10 +334,44 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         # Expose that fact so complex scatter need not use atomic updates.
         return total.at[rows].add(values, indices_are_sorted=True, unique_indices=True)
 
+    diagnostic_done = False
     cached_indices = cached_bounds = cached_intervals = None
 
     def build(_residues, _omega_fields, indices, bounds, _phase_real, E_ref_B, t_node):
-        nonlocal cached_indices, cached_bounds, cached_intervals
+        nonlocal cached_indices, cached_bounds, cached_intervals, diagnostic_done
+        if not diagnostic_done:
+            import json
+            policy = _shared_pole_fixed_q_policy(header)
+            qids = np.asarray(header["q_irr_full_idx"])
+            receipt = dict(tau_ry_inverse=[1.0, 0.0], E_ref_ry=0.0,
+                           scope="full model, one real tau per map, before fixed-q projection",
+                           reference="CD8 NOT_MEASURED", parents=[])
+            for parent in np.flatnonzero(policy.self_negative_q[qids]):
+                plus = transposed = None
+                for c0 in range(0, kmax, ccap):
+                    c1 = min(c0 + ccap, kmax)
+                    X, Y, poles2, counts = read_shared_pole_faces(
+                        io, (int(parent), int(parent)+1), meta=meta, header=header,
+                        column_span=(c0, c1))
+                    active = max(0, min(c1, len(frequencies[parent])) - c0)
+                    ranges = device_put_process_local(
+                        np.asarray([[0, active]], np.int32), NamedSharding(mesh_xy, P()))
+                    a, b = synthesize_shared_pole_parents(
+                        X, Y, poles2, ranges, 0.0, 1.0+0.0j, mesh_xy=mesh_xy)
+                    plus = a if plus is None else plus + a
+                    transposed = b if transposed is None else transposed + b
+                    jax.block_until_ready((plus, transposed))
+                    del X, Y, poles2, counts, a, b
+                _, relative = policy.project_fixed_q(
+                    plus, qids[parent:parent+1], transposed_partner=transposed)
+                value = float(relative[0])
+                receipt["parents"].append(dict(parent=int(parent), q_full_idx=int(qids[parent]),
+                    asymmetry_relative=value, status="WARN" if value > 1e-6 else "PASS"))
+                del plus, transposed
+            schedule["fixed_q_asymmetry"] = receipt
+            if jax.process_index() == 0:
+                print("shared-pole fixed-q asymmetry: " + json.dumps(receipt), flush=True)
+            diagnostic_done = True
         if indices is not cached_indices or bounds is not cached_bounds:
             cached_intervals = shared_pole_intervals(
                 frequencies, np.asarray(jax.device_get(indices)),
