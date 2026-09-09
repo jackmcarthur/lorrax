@@ -378,6 +378,18 @@ def fd_occupations(E_kn, chemical_potential, broadening_ry):
         / jnp.asarray(broadening_ry, dtype=jnp.float64))
 
 
+@jax.jit
+def fd_negative_derivative(E_kn, chemical_potential, broadening_ry) -> jax.Array:
+    """Return the exact FD weight ``-df/dE = f(1-f)/kBT`` in Ry^-1.
+
+    Energies and chemical potential are in Ry; ``broadening_ry`` is kBT,
+    exactly as in :func:`fd_occupations`, without an MP1 half-width factor.
+    The returned array has the same shape as ``E_kn``.
+    """
+    f = fd_occupations(E_kn, chemical_potential, broadening_ry)
+    return f * (1.0 - f) / jnp.asarray(broadening_ry, dtype=jnp.float64)
+
+
 def _mp1_negative_derivative_values(E, chemical_potential, broadening):
     """``-df/dE`` for BerkeleyGW's first-order MP occupation."""
     x = (E - chemical_potential) / (2.0 * broadening)

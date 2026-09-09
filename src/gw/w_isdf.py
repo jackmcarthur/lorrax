@@ -3795,7 +3795,7 @@ def compute_chi0_static_fractional(
     side of every ordered pair rides at ``k − q_j`` through the caller's
     precomputed flat map ``kminq_rows[j]`` (``common.kq_mapping``), and
     the divided difference ``(f_a(k)−f_b(k−q))/(E_a(k)−E_b(k−q))`` uses
-    the analytic MP1 ``−df/dE`` midpoint limit on accidentally degenerate
+    the selected family's analytic ``−df/dE`` midpoint limit on accidentally degenerate
     pairs.  This is the literal static member of the shared ordered-pair
     evaluator; the metal MPA shifted-origin slot instead calls
     :func:`compute_chi0_direct_fractional` at its stamped nonzero ``z``.
@@ -3825,23 +3825,29 @@ def compute_chi0_direct_fractional(
     This is the ordered-pair escape hatch for isolated points at which the
     damped-contour evaluator is unaffordable.  It shares the static kernel's
     band-pair scan and distributed centroid output.  A zero entry uses the
-    MP1 divided-difference limit; every nonzero entry is evaluated at its
+    selected family's divided-difference limit; every nonzero entry is evaluated at its
     literal complex coordinate.  With one frequency the returned shape is
     ``(n_q,n_mu,n_mu)``; otherwise it is ``(n_z,n_q,n_mu,n_mu)``.
     ``progress_fn``, when supplied, is called as
     ``progress_fn(rows_done, rows_total, elapsed_seconds)`` after each q-row
     result is device-ready.  It changes synchronization only, never values.
     """
-    from gw.efermi import mp1_negative_derivative
+    from gw.efermi import fd_negative_derivative, mp1_negative_derivative
 
+    # The occupation owner stamps config.occ_smearing_family onto this
+    # current state; use that same family for the zero-z diagonal limit.
     family = getattr(occupation_state, "smearing_family", None)
-    if family != "mp1":
+    if family == "mp1":
+        negative_derivative = mp1_negative_derivative
+    elif family == "fd":
+        negative_derivative = fd_negative_derivative
+    else:
         raise ValueError(
             "GATE static_fractional_needs_mp1: direct fractional chi0 "
             "received an unsupported smearing family.\n"
             f"  got:  occupation_state.smearing_family = {family!r}\n"
-            "  want: occupation_state.smearing_family = 'mp1'\n"
-            "  why:  this path's intraband diagonal is the analytic MP1 "
+            "  want: occupation_state.smearing_family = 'mp1' or 'fd'\n"
+            "  why:  this path's intraband diagonal needs the selected family's analytic "
             "-df/dE; a step occupation belongs to the insulating chi0 path\n"
             "  doc:  docs/theory/metallic-mpa-screening.md")
     e = jnp.asarray(wfns.enk, dtype=jnp.float64)
@@ -3869,7 +3875,7 @@ def compute_chi0_direct_fractional(
     if z.ndim != 1 or not z.size or not np.all(np.isfinite(z)):
         raise ValueError(
             "direct fractional chi z_values must be a finite nonempty vector")
-    surface = mp1_negative_derivative(
+    surface = negative_derivative(
         e, float(occupation_state.mu_ry),
         float(occupation_state.smearing_width_ry))
     if wfns.layout == "legacy":
