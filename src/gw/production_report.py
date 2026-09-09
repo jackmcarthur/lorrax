@@ -542,12 +542,14 @@ class GWProductionReport:
                          and tuple(r.get("path", (r["name"],)))
                          == (r["name"],))
 
-        def outer_prefixed(prefix, *, within=None):
+        def outer_prefixed(prefix, *, within=None, excluding=()):
             def selected(row):
                 path = tuple(row.get("path", (row["name"],)))
                 if not row["name"].startswith(prefix):
                     return False
                 if within is not None and (not path or path[0] != within):
+                    return False
+                if any(str(parent).startswith(excluding) for parent in path[:-1]):
                     return False
                 return not any(str(parent).startswith(prefix)
                                for parent in path[:-1])
@@ -564,9 +566,32 @@ class GWProductionReport:
         isdf_support = max(isdf_total - zeta - v_q - restart_load, 0.0)
 
         screening_total = top_level("gw_jax.screening")
-        chi0 = outer_prefixed("chi.", within="gw_jax.screening")
-        w_screen = outer_prefixed("W.", within="gw_jax.screening")
-        screening_support = max(screening_total - chi0 - w_screen, 0.0)
+        # A shared-pole bank may call chi/W owners internally. Its inclusive
+        # band already owns those seconds; do not print them a second time.
+        chi0 = outer_prefixed("chi.", within="gw_jax.screening", excluding=("spole.",))
+        w_screen = outer_prefixed("W.", within="gw_jax.screening", excluding=("spole.",))
+        spole_rows = [r for r in rows if r["name"].startswith("spole.")
+                      and tuple(r.get("path", ()))[:1] == ("gw_jax.screening",)
+                      and not any(str(p).startswith("spole.")
+                                  for p in r.get("path", ())[:-1])]
+        # Preserve the constructor census names and their execution order.
+        # Waits name the NEXT consumer; they drain PREVIOUS asynchronous work.
+        screening_details = []
+        for name in dict.fromkeys(r["name"] for r in spole_rows):
+            label = name.removeprefix("spole.")
+            if label.startswith("device_wait."):
+                label = "wait before " + label.removeprefix("device_wait.")
+            elif label.startswith("rank_wait."):
+                continue  # all process alignment is one disjoint row below
+            elif label == "passivity_held":
+                label = "passivity + held (fused)"
+            screening_details.append(("spole " + label,
+                sum(float(r["inclusive"]) for r in spole_rows if r["name"] == name)))
+        screening_details.append(("spole rank synchronization",
+            sum(float(r["inclusive"]) for r in spole_rows
+                if r["name"].startswith("spole.rank_wait."))))
+        screening_support = max(screening_total - chi0 - w_screen
+                                - sum(value for _, value in screening_details), 0.0)
 
         # The dynamic-Sigma executor opens ``sigma.rule_plan`` (box-rule
         # fitting, cached by box and tolerance) and ``sigma.tau_sweep`` (the
@@ -602,7 +627,8 @@ class GWProductionReport:
             ("minimax quadrature", top_level("gw_jax.minimax_quadrature")),
             ("chi0", chi0),
             ("W", w_screen),
-            ("screening support", screening_support),
+            *screening_details,
+            ("spole other" if spole_rows else "screening support", screening_support),
             ("W persist + q0 head", top_level(
                 "gw_jax.persist_w0", "gw_jax.static_head")),
             ("Sigma rule plan", sigma_plan),
@@ -628,6 +654,10 @@ class GWProductionReport:
             self.emit(f"  {name:<22} {seconds:10.2f}  "
                       f"{100.0 * seconds / wall if wall else 0.0:9.2f}%")
         self.emit(f"  {'total run':<22} {wall:10.2f}  {100.0:9.2f}%")
+        if spole_rows:
+            self.emit("  spole bands: fenced host walls; wait-before rows drain prior device/effect work,")
+            self.emit("  not the named consumer. Rank synchronization is separate. Local passivity/held")
+            self.emit("  share one compiled call; their fused wall is not split into invented timings.")
 
     def warnings(self) -> None:
         if self._warnings_emitted:

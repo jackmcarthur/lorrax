@@ -469,3 +469,35 @@ def test_sigma_residual_subphases_are_not_double_counted(tmp_path):
     assert float(other.split()[-2])==46.
     assert 'Sigma pending inputs' in text
     assert 'Sigma model validation' in text and 'Sigma finalize + writes' in text
+
+
+def test_shared_pole_screening_bands_partition_wall(tmp_path):
+    report = GWProductionReport(str(tmp_path / 'gwjax.out'), runtime=_runtime(),
+                                debug=False, stdout=lambda line: None)
+    parent = ('gw_jax.screening',)
+    rows = [dict(name=parent[0], path=parent, inclusive=100.)]
+    for name, seconds in [('spole.bank', 40.), ('spole.moments', 10.),
+                          ('spole.direction_selection', 20.),
+                          ('spole.device_wait.writer', 7.),
+                          ('spole.rank_wait.writer', 2.),
+                          ('spole.passivity_held', 4.), ('spole.writer', 3.)]:
+        rows.append(dict(name=name, path=parent + (name,), inclusive=seconds))
+    # These are already included in the bank's 40 seconds.
+    for name in ('chi.exec', 'W.exec', 'spole.nested_diagnostic'):
+        rows.append(dict(name=name, path=parent + ('spole.bank', name), inclusive=5.))
+    report.timings(rows, wall=100.)
+    text = (tmp_path / 'gwjax.out').read_text()
+    displayed = {}
+    for line in text.splitlines():
+        if line.endswith('%') and line.strip().split()[-2].replace('.', '').isdigit():
+            label, seconds, _ = line.strip().rsplit(None, 2)
+            displayed[label] = float(seconds)
+    assert displayed['spole other'] == 14.
+    assert displayed['spole wait before writer'] == 7.
+    assert displayed['spole writer'] == 3.
+    assert displayed['spole passivity + held (fused)'] == 4.
+    assert displayed['spole rank synchronization'] == 2.
+    assert 'chi0' not in displayed and 'W' not in displayed
+    assert 'spole nested_diagnostic' not in displayed
+    assert sum(v for k, v in displayed.items() if k != 'total run') == 100.
+    assert 'prior device/effect work' in text
