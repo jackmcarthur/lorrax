@@ -58,7 +58,8 @@ _GATE_ROWS = {
     "full_m1_defect": ("maximum over q of relative full M1 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-4),
     "full_m3_defect": ("maximum over q of relative full M3 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-3),
     "representation": ("scalar N_spinor=1 and authenticated TRS allowed", {"nspinor": 1, "trs_allowed": True}),
-    "capacity": ("aggregate live bytes per rank including workspace <= threshold * U", 3.0),
+    "capacity": ("aggregate live bytes per rank of new shared-pole objects including workspace <= threshold * U", 3.0),
+    "stream_peak": ("inherited response stream peak <= threshold * incumbent MPA stream peak on the same deck and processor geometry, using the same measurement method", 1.05),
     "rule_validity": ("bank and Sigma certificates cover current domains at resolved tolerances", True),
     "sc_rebuild": ("samples, directions, poles, ranks, intervals and rules rebuilt at current bands and occupations", True),
 }
@@ -161,6 +162,7 @@ class CapacityLedger:
         self._accepted = {}
         self._live_stages = None
         self.measured_peak = gate_receipt('capacity', reason='measured peak not supplied')
+        self.stream_peak = gate_receipt('stream_peak', reason='same-deck incumbent comparison not supplied')
 
     @property
     def live_stages(self):
@@ -246,7 +248,7 @@ class CapacityLedger:
         return copy.deepcopy(row)
 
     def record_measured_peak(self, bytes_per_rank, *, reason):
-        """Record an externally measured maximum over ranks, without guessing it."""
+        """Record the new-object maximum over ranks, excluding inherited stream."""
         peak = self._bytes(bytes_per_rank)
         if peak < self.measured_peak.get('bytes_per_rank', 0):
             return self.receipt()['measured_peak']
@@ -256,6 +258,34 @@ class CapacityLedger:
         self.measured_peak['bytes_per_rank'] = peak
         return self.receipt()['measured_peak']
 
+    def record_stream_peak(self, shared_bytes_per_rank, incumbent_bytes_per_rank, *, reason):
+        """Record the inherited stream comparison (coordinator ruling 9).
+
+        Both byte counts must use the same deck, mesh and measurement method;
+        ``reason`` names that scope and both evidence paths/job.steps. Missing
+        counts stay NOT_MEASURED. The inherited stream is not a reservation and
+        cannot be named in ``concurrent_with``. New bank outputs/batches still
+        enter ``reserve('bank_outputs', ...)`` and obey 3U.
+        """
+        if self.stream_peak['status'] != 'NOT_MEASURED':
+            raise ValueError("inherited stream comparison already recorded for this map")
+        shared = None if shared_bytes_per_rank is None else self._bytes(shared_bytes_per_rank)
+        incumbent = None if incumbent_bytes_per_rank is None else self._bytes(incumbent_bytes_per_rank)
+        if incumbent == 0:
+            raise ValueError("incumbent stream peak must be positive")
+        threshold = shared_real_pole_gates_v1_r3b['stream_peak']['threshold']
+        passed = None if shared is None or incumbent is None else shared <= threshold * incumbent
+        self.stream_peak = gate_receipt(
+            'stream_peak', {'shared_bytes_per_rank': shared,
+                            'incumbent_bytes_per_rank': incumbent},
+            passed=passed, reason=reason)
+        self.stream_peak.update(stage='stream_peak', geometry=dict(self.geometry))
+        if passed is False:
+            raise MemoryError(f"GATE shared_pole_stream_peak: shared={shared} B/rank; "
+                              f"incumbent={incumbent} B/rank; limit={threshold} * incumbent; "
+                              f"geometry={self.geometry}; why: inherited stream regressed")
+        return self.receipt()['stream_peak']
+
     def receipt(self):
         """Snapshot ordered stage rows and the independently measured peak."""
         import copy
@@ -263,7 +293,8 @@ class CapacityLedger:
                                   U_bytes_per_rank=self.U_bytes_per_rank,
                                   limit_bytes_per_rank=self.limit_bytes_per_rank,
                                   entries=self.entries, live_stages=self._live_stages,
-                                  measured_peak=self.measured_peak))
+                                  measured_peak=self.measured_peak,
+                                  stream_peak=self.stream_peak))
 
 
 def construction_receipt(measurements=None, *, capacity=None):
@@ -286,6 +317,8 @@ def construction_receipt(measurements=None, *, capacity=None):
         if not isinstance(capacity, CapacityLedger):
             raise TypeError("construction receipt capacity must be the map's CapacityLedger")
         result['capacity'] = capacity.receipt()
+        result['gates'] = [result['capacity']['stream_peak'] if r['name'] == 'stream_peak'
+                           else r for r in result['gates']]
         rows = result['capacity']['entries']
         measured = result['capacity']['measured_peak']
         values = [r['value'] for r in rows]
