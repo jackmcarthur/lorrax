@@ -672,6 +672,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
 
     eig, svd = eigenplan(n), eigenplan(2*n)
     receipts = []
+    receipt_entry_start = 0
     replicated = NamedSharding(mesh_xy, P())
     stack_models = jax.jit(
         lambda parts: tuple(jnp.concatenate([row[i] for row in parts], axis=0)
@@ -858,7 +859,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 "capacity": dict(value=price, passed=True, reason="conservative aggregate constructor live-set price"),
                 "sc_rebuild": dict(value=identity, passed=True, reason="current recipe/census authenticated; directions and Ritz model rebuilt"),
             }
-            receipt = construction_receipt(measurements, capacity=ledger)
+            receipt = construction_receipt(
+                measurements, capacity=ledger,
+                capacity_entry_start=receipt_entry_start)
+            receipt_entry_start = len(ledger.entries)
             receipt.update(identity=identity, constructor=row)
             public_c = jax.jit(lambda value: value[:, :, None, :], out_shardings=public_factor)(c)
             del model, c, mask

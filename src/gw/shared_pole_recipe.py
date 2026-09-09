@@ -330,20 +330,35 @@ class CapacityLedger:
                               f"geometry={self.geometry}; why: inherited {name} regressed")
         return self.receipt()[name]
 
-    def receipt(self):
-        """Snapshot ordered stage rows and the independently measured peak."""
+    def receipt(self, *, entry_start=None):
+        """Snapshot stage rows and peaks, optionally as an indexed ledger segment.
+
+        A segment retains absolute entry indices so ordered constructor receipts
+        reconstruct the prefix without duplicating every earlier reservation.
+        The default remains the complete ledger snapshot.
+        """
+        import operator
+        if entry_start is not None:
+            if isinstance(entry_start, bool):
+                raise ValueError("capacity entry_start must be an integer index")
+            entry_start = operator.index(entry_start)
+            if not 0 <= entry_start <= len(self.entries):
+                raise ValueError("capacity entry_start lies outside the ledger")
         import copy
-        return copy.deepcopy(dict(geometry=self.geometry,
+        snapshot = copy.deepcopy(dict(geometry=self.geometry,
                                   U_bytes_per_rank=self.U_bytes_per_rank,
                                   limit_bytes_per_rank=self.limit_bytes_per_rank,
                                   device_budget_bytes_per_rank=self.device_budget_bytes_per_rank,
-                                  entries=self.entries, live_stages=self._live_stages,
+                                  entries=self.entries[entry_start or 0:], live_stages=self._live_stages,
                                   measured_peak=self.measured_peak,
                                   stream_peak=self.stream_peak,
                                   sigma_peak=self.sigma_peak))
+        if entry_start is not None:
+            snapshot["entry_span"] = [entry_start, len(self.entries)]
+        return snapshot
 
 
-def construction_receipt(measurements=None, *, capacity=None):
+def construction_receipt(measurements=None, *, capacity=None, capacity_entry_start=None):
     """Complete receipt skeleton, explicitly marking every absent gate unmeasured.
 
     ``measurements`` maps names to ``gate_receipt`` keyword dictionaries. Dense
@@ -362,10 +377,11 @@ def construction_receipt(measurements=None, *, capacity=None):
     if capacity is not None:
         if not isinstance(capacity, CapacityLedger):
             raise TypeError("construction receipt capacity must be the map's CapacityLedger")
-        result['capacity'] = capacity.receipt()
+        result['capacity'] = capacity.receipt(entry_start=capacity_entry_start)
         result['gates'] = [result['capacity'][r['name']] if r['name'] in ('stream_peak', 'sigma_peak')
                            else r for r in result['gates']]
-        rows = result['capacity']['entries']
+        # The verdict always covers the full prefix, even for a compact segment.
+        rows = capacity.entries
         measured = result['capacity']['measured_peak']
         values = [r['value'] for r in rows]
         if measured['value'] is not None:
