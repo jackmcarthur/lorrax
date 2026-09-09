@@ -4,7 +4,7 @@ Heavy investigation, 2026-09-09. **Hypothesis 1 holds in the narrower sense of a
 
 Keep AREDUCE's guarded Newton–Schulz metric inverse root (`c0f3e7c`, with capacity follow-up `d411d92`, on branch `lane/sp-areduce-2026-09-07`). Repair input preservation at the native service boundary. Leave the genuine Gram/Ritz eigenproblems in place. Do not claim that the iteration fixes both reported refusals: the Gram-diagonal refusal has a different cause.
 
-Evidence root **R** = `/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/frequency_integration_sandbox/338_aeig_20260909`. All new numerical measurements are P4, one node/four processes/four A100 40 GB GPUs, `cuda_async@0.85`, source `b16fe23ff2d831809ffa53f0765cc0fde3fd0f41` in this worktree. Provisioned branch was `arch/sp-aeig-2026-09-09`; publication is on requested `lane/sp-aeig-2026-09-07`. No numerical source change or installation was made.
+Evidence root **R** = `/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/frequency_integration_sandbox/338_aeig_20260909`. All new numerical measurements are P4, one node/four processes/four A100 40 GB GPUs, `cuda_async@0.85`, numerical source `b16fe23ff2d831809ffa53f0765cc0fde3fd0f41` in this worktree (leg04 HEAD `d8bbd7fc` adds only this report). Provisioned branch was `arch/sp-aeig-2026-09-09`; publication is on requested `lane/sp-aeig-2026-09-07`. No numerical source change or installation was made.
 
 ## Controlled synthetic comparison
 
@@ -14,7 +14,7 @@ Define orthogonality = `||V†V-I||F/sqrt(n)` and residual = `||A_original V-V d
 
 | Spectrum | n | Orthogonality | Residual | Job.step / artifact relative to R |
 |---|---:|---:|---:|---|
-| Uniform [0,2] | 4176 | 6.88529e-15 | 4.33582e-15 | 58128417.20 / `01_synthetic_p4/result.json` |
+| Uniform [0,2] | 4176 | 6.88529e-15 | 4.33582e-15 | 58128417.23 / `04_uniform_campaign_p4/result.json` |
 | Uniform 1 ± 1e-8 | 4176 | 6.66765e-15 | 2.35707e-15 | same |
 | Uniform 1 ± 1e-12 | 4176 | 4.03118e-15 | 3.64606e-15 | same |
 | Exact identity | 4176 | 0 | 0 | same |
@@ -28,7 +28,7 @@ The original AREDUCE measurement is 0.04376881095324085 / 2.13166e-15, job581284
 
 This reproduces the failure signature without physical data, ISDF conditioning, native GEMM, or a non-Hermitian input. It does **not** isolate NVIDIA's internal algorithm from every possible FFI/lifetime interaction: a standalone direct-C vendor reproducer and device-info instrumentation are still useful follow-ups. The pattern is not simply monotonic in spectral width. For A≈I a small residual is especially weak evidence, because many nonorthogonal vectors approximately satisfy Av≈v.
 
-Leg01 used the runtime FFI `bc71923a826255cc…`: a login-side FFI environment assignment was reset by launch setup. Leg02/03 explicitly pinned the campaign FFI **inside the payload**, matching the original failure (`03cefb38e54c3f1a…`). Every result records actual `/proc/self/maps` paths; `hashes.json` records full library/probe hashes. Both FFI builds load the same cuSolverMp0.9.1. This distinction is preserved rather than presenting leg01 as a campaign-native A/B.
+Leg01 used the runtime FFI `bc71923a826255cc…`: a login-side FFI environment assignment was reset by launch setup. Leg02/03 explicitly pinned the campaign FFI **inside the payload**, matching the original failure (`03cefb38e54c3f1a…`). Every result records actual `/proc/self/maps` paths; `hashes.json` records full library/probe hashes. Both FFI builds load the same cuSolverMp0.9.1. Leg04 (58128417.23) repeated all uniform cases with the campaign FFI, reproducing every listed numerical diagnostic exactly. The table uses leg04, so the uniform-versus-repeated comparison holds the FFI binary fixed; leg01 is retained as a separately labelled control.
 
 ## Version and wiring audit
 
