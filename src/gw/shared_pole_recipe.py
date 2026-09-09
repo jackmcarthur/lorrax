@@ -354,6 +354,68 @@ def construction_receipt(measurements=None, *, capacity=None):
     return result
 
 
+def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
+                               mesh_xy, print_fn):
+    """Authenticate one current-map restart member through the store owner.
+
+    Parameters
+    ----------
+    restart_path : path-like
+        Existing committed ISDF bundle; all ranks call this on compute nodes.
+    expected_identity : dict
+        Current identity supplied by the screening owner, never rebuilt here.
+    meta : Meta
+        Current resolved recipe and capacity ledger with bound live_stages.
+    mesh_xy : Mesh
+        Current named processor mesh passed unchanged to the store validator.
+    print_fn : callable
+        Existing rank-safe startup/progress printer.
+
+    Returns
+    -------
+    dict or None
+        Small path/identity/digest/K handle, or None ONLY for a typed missing
+        member in a committed bundle. Stale/corrupt/partial members refuse.
+        The authenticated header comes from the same payload validation.
+    """
+    from pathlib import Path
+    from file_io.tagged_arrays import (
+        read_shared_pole_restart_member, SharedPoleMemberMissing,
+        SharedPoleMemberRefused,
+    )
+
+    recipe = getattr(meta, 'shared_pole_recipe', None)
+    capacity = getattr(meta, 'shared_pole_capacity', None)
+    keys = ('recipe_version', 'recipe_hash', 'gate_version', 'gate_hash',
+            'accuracy', 'eta_ev', 'n')
+    if not isinstance(recipe, dict) or any(recipe.get(key) is None for key in keys):
+        raise ValueError("GATE shared_pole_restart: current resolved recipe is missing")
+    if not isinstance(capacity, CapacityLedger):
+        raise ValueError("GATE shared_pole_restart: current map capacity ledger is missing")
+    capacity.live_stages  # Unknown upstream residency is not zero.
+    try:
+        member, header = read_shared_pole_restart_member(
+            restart_path, expected_identity=expected_identity, mesh_xy=mesh_xy,
+            capacity=capacity, return_header=True)
+    except SharedPoleMemberMissing as exc:
+        print_fn(f"shared-pole restart: {exc}; build and register a new member")
+        return None
+    stored = header.get('recipe', {})
+    # Table hashes bind the deterministic recipe; state identity binds its
+    # energy/occupation/WFN/centroid inputs. Tier, eta and n distinguish the
+    # physical choices without binding mesh-dependent planning bytes into W.
+    for key in keys:
+        if stored.get(key) != recipe[key]:
+            raise SharedPoleMemberRefused(
+                f"GATE shared_pole_restart: recipe {key} mismatch; "
+                f"got {stored.get(key)!r}, want {recipe[key]!r}")
+    path = (Path(restart_path).resolve().parent / member['path']).resolve()
+    print_fn(f"shared-pole restart: authenticated {path}; digest={member['digest']}; "
+             "skip bank, moments and construction")
+    return dict(path=str(path), identity=dict(header['identity']),
+                digest=member['digest'], K=list(header['K']))
+
+
 def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_capacity, kweights):
     """Bind the current physical charge census to the existing metadata bundle.
 
