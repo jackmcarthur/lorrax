@@ -873,7 +873,7 @@ def _get_chi_fractional_contour_kernel_legacy(
 
 def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
-    *, k_unfold_plan=None,
+    *, k_unfold_plan=None, selected_q=None,
 ):
     """Face-layout sibling of
     :func:`_get_chi_fractional_contour_kernel_legacy`.  Same Keldysh
@@ -902,6 +902,11 @@ def _get_chi_fractional_contour_kernel_face(
     production-shape harness).  This function always runs the FULL
     ``nb_full`` contraction; it does not know or care that the caller
     has already zeroed part of the weight.
+
+    ``selected_q`` selects a bounded set of canonical full-grid q IDs.
+    That option returns a stacked ``[parent, output, mu_x, mu_y]`` array at
+    ``P(None,None,'x','y')``; the default retains the incumbent tuple API.
+    Selection happens before output accumulation, not after a full-q bank.
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
@@ -918,6 +923,14 @@ def _get_chi_fractional_contour_kernel_face(
     grid = tuple(int(n) for n in kgrid)
     nk = int(np.prod(grid))
     n_out = int(n_out)
+    if selected_q is not None:
+        selected_q = tuple(int(q) for q in selected_q)
+        if (not selected_q or len(set(selected_q)) != len(selected_q)
+                or min(selected_q) < 0 or max(selected_q) >= nk):
+            raise ValueError(
+                "GATE response_selected_q: got invalid selected_q; want unique "
+                "full-grid indices; why: bank parent rows must be explicit")
+    selected_shard = NamedSharding(mesh_xy, P(None, None, "x", "y"))
     nk_shape, nb_full, n_rmu, ns = (int(v) for v in face_shape)
     # Raw-parent transport (``k_unfold_plan``): the two G's are contracted
     # on the n_parent packed parent faces and unfolded to full k in PACKED
@@ -963,7 +976,8 @@ def _get_chi_fractional_contour_kernel_face(
             psi_mun_shard, psi_nmu_shard,
             rep2, rep2, rep2, rep0,
         ),
-        out_shardings=tuple(chi_R_shard for _ in range(n_out)),
+        out_shardings=(tuple(chi_R_shard for _ in range(n_out))
+                       if selected_q is None else selected_shard),
     )
     def integrate(
         time_nodes,
@@ -994,11 +1008,15 @@ def _get_chi_fractional_contour_kernel_face(
         # sliced twice, so this is not a new sharing, only a name
         # simplification.
         n_mu = psi_mun.shape[2]
+        q_count = nk if selected_q is None else len(selected_q)
         zero = jax.lax.with_sharding_constraint(
-            jnp.zeros((nk, n_mu, n_mu), dtype=jnp.complex128),
+            jnp.zeros((q_count, n_mu, n_mu), dtype=jnp.complex128),
             chi_R_shard,
         )
-        initial = tuple(zero for _ in range(n_out))
+        initial = (tuple(zero for _ in range(n_out)) if selected_q is None
+                   else jax.lax.with_sharding_constraint(
+                       jnp.broadcast_to(zero, (n_out,) + zero.shape),
+                       selected_shard))
 
         def body(accumulators, node):
             time, projection = node
@@ -1042,13 +1060,25 @@ def _get_chi_fractional_contour_kernel_face(
                 ),
                 chi_R_shard,
             )
-            reverse_R = jnp.conj(A_R)
-            updated = tuple(
-                accumulators[i]
-                - 1j * projection[i] * A_R
-                + 1j * projection[i] * reverse_R
-                for i in range(n_out)
-            )
+            if selected_q is None:
+                reverse_R = jnp.conj(A_R)
+                updated = tuple(
+                    accumulators[i]
+                    - 1j * projection[i] * A_R
+                    + 1j * projection[i] * reverse_R
+                    for i in range(n_out)
+                )
+            else:
+                # Linearity permits ONE completed q FFT per node before
+                # retaining the admitted parent/output batch (PROTO4).
+                # Upstream G/FFT buffers remain full-grid and must still
+                # enter the admission ledger.
+                contribution = jnp.take(
+                    chi_fftn(-1j * (A_R - jnp.conj(A_R))),
+                    jnp.asarray(selected_q), axis=0)
+                updated = (accumulators
+                           + projection[:, None, None, None]
+                           * contribution[None])
             return updated, None
 
         final_R, _ = jax.lax.scan(
@@ -1057,7 +1087,10 @@ def _get_chi_fractional_contour_kernel_face(
             (time_nodes, jnp.transpose(projection_rows)),
             unroll=1,
         )
-        return tuple(_finish(value) for value in final_R)
+        if selected_q is None:
+            return tuple(_finish(value) for value in final_R)
+        # Public bank order [parent, sample, mu_x, mu_y].
+        return jnp.swapaxes(final_R, 0, 1)
 
     return integrate
 
