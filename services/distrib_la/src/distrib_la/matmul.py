@@ -29,7 +29,8 @@ from distrib_la.plan import (BATCHED_ROUTE_CHOICES, BATCHED_ROUTE_DEFAULT,
                              ROUTE_BATCH_RESHARD, ensure_sharding)
 from distrib_la.resolve import mesh_key, mesh_platform
 
-__all__ = ["MATMUL_BACKEND_CHOICES", "matmul", "resolve_matmul_backend"]
+__all__ = ["MATMUL_BACKEND_CHOICES", "matmul", "resolve_matmul_backend",
+           "contract_faces"]
 
 MATMUL_BACKEND_CHOICES = (
     "auto", "off", "distributed", "cusolvermp", "cublasmp",
@@ -45,6 +46,77 @@ _TARGETS = {
 _OP_CODE = {"N": 0, "T": 1, "C": 2}
 _CUBLASMP_CACHE: dict = {}
 _RESHARD_CACHE: dict = {}
+
+
+def contract_faces(C_X, C_Y, weights, start, stop, *, mesh: Mesh,
+                   return_transpose: bool = False):
+    """Contract two row faces with replicated column weights, locally.
+
+    Parameters
+    ----------
+    C_X, C_Y
+        Matching arrays [b,m,Kcap] at P(None,'x',None) and
+        P(None,'y',None), or [b,mu,spin,Kcap] at
+        P(None,'x',None,None) and P(None,'y',None,None). The latter merge
+        mu*spin inside this service. No column or batch sharding is allowed.
+    weights
+        Complex [b,Kcap], replicated. Units are supplied by the caller;
+        the service adds no normalization or conjugation to these weights.
+    start, stop
+        Replicated integer [b] column bounds selecting [start,stop).
+        The caller resolves physical intervals and masks inactive columns.
+    mesh
+        Supplied mesh with axes ('x','y'). Both global linalg policies use
+        this same local operation; no provider is resolved or called.
+    return_transpose
+        Also return (conj(C_X)*weights) @ C_Y.T, at the same weights.
+
+    Returns
+    -------
+    W : jax.Array or tuple of jax.Array
+        [b,m,m] at P(None,'x','y'), (C_X*weights) @ C_Y.H, optionally
+        paired with its endpoint-transpose orientation. Each shard_map
+        body contains local GEMMs only, with no collective or provider call.
+    """
+    _mesh_shape(mesh)
+    if C_X.ndim not in (3, 4) or C_Y.shape != C_X.shape:
+        raise ValueError("contract_faces requires matching rank-3/4 faces")
+    if C_X.dtype != C_Y.dtype or C_X.dtype != weights.dtype:
+        raise TypeError("contract_faces factors and weights must share dtype")
+    b, k = C_X.shape[0], C_X.shape[-1]
+    if weights.shape != (b, k) or start.shape != (b,) or stop.shape != (b,):
+        raise ValueError("contract_faces weights [b,K] and bounds [b] required")
+    if start.dtype.kind not in "iu" or stop.dtype.kind not in "iu":
+        raise TypeError("contract_faces interval bounds must be integers")
+    explicit_spin = C_X.ndim == 4
+    xs = P(None, 'x', None, None) if explicit_spin else P(None, 'x', None)
+    ys = P(None, 'y', None, None) if explicit_spin else P(None, 'y', None)
+    # Concrete wrong layouts must not hide an input reshard in the hot path.
+    for value, spec in ((C_X, xs), (C_Y, ys), (weights, P()),
+                        (start, P()), (stop, P())):
+        if not isinstance(value, jax.core.Tracer):
+            want = NamedSharding(mesh, spec)
+            if not value.sharding.is_equivalent_to(want, value.ndim):
+                raise ValueError(f"contract_faces requires input layout {spec}")
+    out = P(None, 'x', 'y')
+
+    @partial(shard_map, mesh=mesh, in_specs=(xs, ys, P(), P(), P()),
+             out_specs=(out, out) if return_transpose else out,
+             check_vma=False)
+    def _local(x, y, d, lo, hi):
+        if explicit_spin:
+            x = x.reshape((b, x.shape[1] * x.shape[2], k))
+            y = y.reshape((b, y.shape[1] * y.shape[2], k))
+        columns = jnp.arange(k)[None, :]
+        d = jnp.where((columns >= lo[:, None]) & (columns < hi[:, None]),
+                      d, 0)
+        w = (x * d[:, None, :]) @ jnp.swapaxes(jnp.conj(y), -1, -2)
+        if return_transpose:
+            wt = (jnp.conj(x) * d[:, None, :]) @ jnp.swapaxes(y, -1, -2)
+            return w, wt
+        return w
+
+    return _local(C_X, C_Y, weights, start, stop)
 
 
 def _mesh_shape(mesh: Mesh) -> tuple[int, int]:

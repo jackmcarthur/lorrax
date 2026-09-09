@@ -98,6 +98,7 @@ from distrib_la.factor import FactorToken, factor, solve
 from distrib_la.loader import dial_key, has_target, probe_target
 from distrib_la.matmul import (
     MATMUL_BACKEND_CHOICES,
+    contract_faces,
     matmul,
     resolve_matmul_backend,
 )
@@ -137,7 +138,7 @@ __all__ = [
     # polar / SVD
     "PolarPlan", "plan_polar_factor", "polar_factor",
     # distributed matrix multiplication
-    "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES",
+    "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES", "contract_faces",
     # planned N,N GEMM (trace-safe, for hot loops)
     "GemmPlan", "gemm_plan",
     # the batched route toggle and its dial
