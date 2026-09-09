@@ -118,6 +118,57 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(ledger.reserve('sequential',resident_bytes_per_rank=768,
                          workspace_bytes_per_rank=0,concurrent_with=ledger.live_stages)['status'],'PASS')
 
+    def test_inherited_stream_separate_from_new_objects(self):
+        ledger=self.ledger()
+        ledger.reserve('bank_outputs',resident_bytes_per_rank=768,workspace_bytes_per_rank=0)
+        row=ledger.record_stream_peak(1050,1000,reason='same deck/P and compile method; scalar twin')
+        self.assertEqual(row['status'],'PASS')
+        self.assertEqual(row['value']['incumbent_bytes_per_rank'],1000)
+        receipt=construction_receipt(capacity=ledger)
+        gates={row['name']:row for row in receipt['gates']}
+        self.assertEqual(gates['capacity']['status'],'PASS')
+        self.assertEqual(gates['stream_peak']['status'],'PASS')
+        self.assertEqual(len(ledger.entries),1)
+        with self.assertRaises(ValueError):
+            ledger.live_stages=('stream_peak',)
+
+    def test_stream_regression_refuses_and_cannot_erase_failure(self):
+        ledger=self.ledger()
+        with self.assertRaisesRegex(MemoryError,'inherited stream_peak regressed'):
+            ledger.record_stream_peak(1051,1000,reason='same deck/P and compile method; red twin')
+        self.assertEqual(ledger.receipt()['stream_peak']['status'],'FAIL')
+        with self.assertRaises(ValueError):
+            ledger.record_stream_peak(1000,1000,reason='cannot overwrite earlier failure')
+
+    def test_stream_missing_and_invalid_baseline(self):
+        ledger=self.ledger()
+        self.assertEqual(ledger.record_stream_peak(1000,None,reason='incumbent absent')['status'],
+                         'NOT_MEASURED')
+        with self.assertRaises(ValueError):
+            ledger.record_stream_peak(0,0,reason='invalid incumbent')
+        self.assertEqual(ledger.record_stream_peak(1000,1000,reason='paired measurements')['status'],
+                         'PASS')
+
+    def test_sigma_inherited_and_second_w_are_separate(self):
+        ledger=self.ledger()
+        ledger.record_sigma_peak(1050,1000,reason='same deck/P/window and compile method; scalar twin')
+        ledger.reserve('faces',resident_bytes_per_rank=512,workspace_bytes_per_rank=0)
+        with self.assertRaises(MemoryError):
+            ledger.reserve('second_w',resident_bytes_per_rank=257,workspace_bytes_per_rank=0,
+                           concurrent_with=('faces',))
+        gates={r['name']:r for r in construction_receipt(capacity=ledger)['gates']}
+        self.assertEqual(gates['sigma_peak']['status'],'PASS')
+        self.assertEqual(gates['capacity']['status'],'FAIL')
+        self.assertEqual(gates['stream_peak']['status'],'NOT_MEASURED')
+
+    def test_sigma_regression_and_missing_baseline(self):
+        ledger=self.ledger()
+        self.assertEqual(ledger.record_sigma_peak(None,1000,reason='shared measurement absent')['status'],
+                         'NOT_MEASURED')
+        with self.assertRaisesRegex(MemoryError,'shared_pole_sigma_peak'):
+            ledger.record_sigma_peak(1051,1000,reason='same deck/P/window; red twin')
+        self.assertEqual(ledger.receipt()['sigma_peak']['status'],'FAIL')
+
 
 if __name__=='__main__':
     unittest.main(verbosity=2)
