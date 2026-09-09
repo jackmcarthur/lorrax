@@ -246,12 +246,18 @@ _ROQ_FIT_NAMES = (
 )
 
 
+_RESPONSE_RULE_NAMES = ("response_bank_rule", "response_laplace_rule")
+
+
 def __getattr__(name: str):
     """PEP 562 lazy door for the solver half.
 
     ``from minimax import noncrossing_grids`` imports scipy at that
     moment and not before.  ``import minimax`` never does.
     """
+    if name in _RESPONSE_RULE_NAMES:
+        from minimax import response_rules as _response
+        return getattr(_response, name)
     if name in _SOLVER_NAMES:
         from minimax import solver as _solver          # noqa: PLC0415
         return getattr(_solver, name)
@@ -287,7 +293,7 @@ def __dir__():
                   | set(_TIME_NODE_SEARCH_NAMES)
                   | set(_MEASURE_WINDOW_NAMES)
                   | set(_WINDOWED_FIT_NAMES)
-                  | set(_ROQ_FIT_NAMES))
+                  | set(_ROQ_FIT_NAMES) | set(_RESPONSE_RULE_NAMES))
 
 
 __all__ = [
@@ -324,4 +330,5 @@ __all__ = [
     *_ROQ_FIT_NAMES,
     # --- the offline solvers (lazy; scipy) ---------------------------------
     *_SOLVER_NAMES,
+    *_RESPONSE_RULE_NAMES,
 ]

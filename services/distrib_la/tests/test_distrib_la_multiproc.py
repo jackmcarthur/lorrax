@@ -677,14 +677,6 @@ def check_distributed_matmul(mesh, dtype="complex128", *,
     # donated, so this is a fresh call with fresh operands.
     At_np = _rng_mat(rng, (2, k, m), dtype)
     Bt_np = _rng_mat(rng, (2, k, n), dtype)
-    if backend == "cublasmp" and ndev > 1:
-        with _raises(ValueError, "not trustworthy"):
-            D.matmul(
-                _put(At_np, mesh, (None, "x", "y")),
-                _put(Bt_np, mesh, (None, "x", "y")),
-                mesh=mesh, transa="C", backend=backend,
-                batched_route=batched_route)
-        return {"nn_residual": rel, "conj_transpose": "refused"}
     got_t = D.matmul(
         _put(At_np, mesh, (None, "x", "y")),
         _put(Bt_np, mesh, (None, "x", "y")),
