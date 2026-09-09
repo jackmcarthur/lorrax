@@ -472,9 +472,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     ----------
     bank : mapping
         Authenticated resource descriptor: ``path``, ``identity``, ``tables``,
-        ``coulomb`` (response-owner authenticated Coulomb resource),
-        ``workspace_bytes_per_rank`` (service
-        stage mapping, including ``constructor``). A producer
+        ``coulomb`` (response-owner authenticated Coulomb resource). Dense
+        workspace is queried from the resolved service plans. A producer
         certificate is carried as ``rule_receipt``. No dense bank is passed
         as a jit argument. The recipe is read only from meta.
     moments : mapping
@@ -496,7 +495,6 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         capacity prices and the store header/digest. Structural failures raise
         before the affected q is written; a partial file is never finalized.
     """
-    from functools import partial
     import numpy as np
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -520,9 +518,32 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     identity = bank["identity"]
     ledger = meta.shared_pole_capacity
     upstream = ledger.live_stages
-    if "constructor" not in bank.get("workspace_bytes_per_rank", {}):
-        raise ValueError("GATE shared_pole_capacity: got: absent constructor native workspace bound; want: provider-owned bytes for resolved n/2n/R plans; why: compiled carriers alone do not certify aggregate 3U")
-    workspace = bank["workspace_bytes_per_rank"]["constructor"]
+    n = int(meta.n_rmu_padded)
+    native_queries = {}
+    native_maxima = {"eigh": 0, "gemm": 0}
+    workspace = 0
+    current_side = 0
+    plans = {}
+
+    def eigenplan(side):
+        if side not in plans:
+            plans[side] = distrib_la.plan(
+                "eigh", mesh_xy, n=side, backend=resolution.eigh_backend,
+                batched_route=resolution.batched_route)
+        return plans[side]
+
+    def query_workspace(op, shapes, plan):
+        nonlocal workspace
+        key = (op, shapes)
+        if key not in native_queries:
+            size = distrib_la.workspace_bytes_per_rank(
+                plan, op, shapes, np.complex128)
+            native_queries[key] = size
+            native_maxima[op] = max(native_maxima[op], size)
+            # GEMM retains its workspace in the context while eigh uses
+            # transient scratch. They coexist; the provider says to sum.
+            workspace = sum(native_maxima.values())
+        return native_queries[key]
     header = validate_shared_pole_bank(bank["path"], expected_identity=identity,
                                        mesh_xy=mesh_xy, require_complete=True)
     moment_header = validate_shared_pole_bank(moments["path"], expected_identity=identity,
@@ -544,6 +565,11 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             raise ValueError("GATE shared_pole_bank_state: got: changed z; want: current physical sample point; why: recipe hashes alone do not bind resolved points")
 
     def capacity(side):
+        nonlocal current_side
+        current_side = side
+        for extent in sorted({n, 2*n, side} - {0}):
+            query_workspace("eigh", ((1, extent, extent),), eigenplan(extent))
+        query_workspace("gemm", ((1, n, n), (1, n, n)), eigenplan(n))
         price = shared_pole_byte_terms(
             meta, mesh_xy=mesh_xy, resolution=resolution, pencil_side=side,
             parent_batch=1, sample_batch=1)
@@ -551,7 +577,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                              resident_bytes_per_rank=price["resident_bytes_per_rank"],
                              workspace_bytes_per_rank=workspace,
                              concurrent_with=upstream)
-        return dict(row, price=price)
+        return dict(row, price=price, native_workspace=dict(native_maxima))
 
     def expose_live(arrays):
         # Callees price only their additional allocations. Supply their
@@ -567,19 +593,26 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         ledger.live_stages = (*upstream, row["stage"])
 
     capacity(0)
-    n = int(meta.n_rmu_padded)
     logical_n = int(meta.n_rmu)
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
     public_factor = NamedSharding(mesh_xy, P(None, "x", None, "y"))
     column_extent = lambda width: padded_axis(
         width, mesh_xy, name="shared_pole_port",
         specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
-    mm = partial(distrib_la.matmul, mesh=mesh_xy, backend="auto",
-                 batched_route=resolution.batched_route)
-    eig = distrib_la.plan("eigh", mesh_xy, n=n, backend=resolution.eigh_backend,
-                          batched_route=resolution.batched_route)
-    svd = distrib_la.plan("eigh", mesh_xy, n=2*n, backend=resolution.eigh_backend,
-                          batched_route=resolution.batched_route)
+    def mm(a, b, **kwargs):
+        # Query the actual effective N,N shapes before the service allocates
+        # transpose staging, output or a larger persistent GEMM workspace.
+        shapes = tuple(value.shape[:-2] + (value.shape[-2:][::-1]
+                       if kwargs.get(trans, "N") != "N" else value.shape[-2:])
+                       for value, trans in ((a, "transa"), (b, "transb")))
+        previous = workspace
+        query_workspace("gemm", shapes, eigenplan(n))
+        if workspace != previous:
+            capacity(current_side)
+        return distrib_la.matmul(a, b, mesh=mesh_xy, backend="auto",
+                                 batched_route=resolution.batched_route, **kwargs)
+
+    eig, svd = eigenplan(n), eigenplan(2*n)
     receipts = []
     # One parent per iteration makes the maximum live set independent of the
     # total irreducible-q count. Store owns the ragged K census and final copy.
@@ -613,9 +646,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         price = capacity(active_columns.shape[-1])
         pencil = assemble_shared_pole_pencil(states, infinity, matmul=mm)
         del states, masks, infinity
-        reduce_eigh = distrib_la.plan("eigh", mesh_xy, n=pencil[0].shape[-1],
-                                     backend=resolution.eigh_backend,
-                                     batched_route=resolution.batched_route)
+        reduce_eigh = eigenplan(pencil[0].shape[-1])
         model, reduction, coefficients = reduce_shared_pole_pencil(
             pencil, active_columns, eigh=reduce_eigh.batched, matmul=mm, gates=gates)
         for name in ("gram_diagonal_positive", "gram_valid", "retained_metric_positive"):
@@ -672,10 +703,14 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         c, poles, mask = model
         counts = jnp.sum(mask, axis=-1, dtype=jnp.int64)
         # All scalar reductions precede rank-selective store formatting.
+        price = capacity(r)
         row = {"q_span": list(span), "roles": roles,
                "K": np.asarray(counts).tolist(), "J": int(np.unique(np.asarray(poles)[np.asarray(mask)]).size),
                "damping_fraction": 0.0, "capacity": price, "coulomb": coulomb_receipt,
                "condition": np.asarray(reduction["gram_condition"]).tolist(),
+               "normalized_gram_spectrum": np.asarray(reduction["gram_spectrum_relative"]).tolist(),
+               "native_workspace_queries": [dict(op=op, shapes=shapes, bytes_per_rank=value)
+                                             for (op, shapes), value in native_queries.items()],
                "retained_moment_relative": {k: np.asarray(v).tolist() for k, v in retained.items()},
                "moment_defects": {k: {a: np.asarray(b).tolist() for a, b in v.items()}
                                   for k, v in moment_defects.items()},
