@@ -58,7 +58,7 @@ _GATE_ROWS = {
     "full_m1_defect": ("maximum over q of relative full M1 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-4),
     "full_m3_defect": ("maximum over q of relative full M3 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-3),
     "representation": ("scalar N_spinor=1 and authenticated TRS allowed", {"nspinor": 1, "trs_allowed": True}),
-    "capacity": ("aggregate live bytes per rank of new shared-pole objects including workspace <= threshold * U", 3.0),
+    "capacity": ("aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U", 3.0),
     "stream_peak": ("inherited response stream peak <= threshold * incumbent MPA stream peak on the same deck and processor geometry, using the same measurement method", 1.05),
     "rule_validity": ("bank and Sigma certificates cover current domains at resolved tolerances", True),
     "sc_rebuild": ("samples, directions, poles, ranks, intervals and rules rebuilt at current bands and occupations", True),
@@ -131,7 +131,7 @@ class CapacityLedger:
     mesh_xy : Mesh
         Named processor axes x/y. U=16*Q*(spin*mu)^2/(Px*Py) bytes/rank.
 
-    Each reservation owns disjoint resident/workspace bytes computed by its
+    Each reservation owns disjoint device resident/workspace bytes computed by its
     caller for its ACTUAL batch sizes, including packing and native workspace.
     ``concurrent_with`` names earlier reservations simultaneously live with it;
     each named footprint is counted once. Historical concurrency is not carried
@@ -139,6 +139,8 @@ class CapacityLedger:
     Sequential stages omit predecessors. Stage names must be unique (include
     batch/phase identifiers when necessary). A refusal is recorded but does not
     create a usable reservation. The ledger owns no arrays or memory allocator.
+    Host I/O staging is reported separately by the store, which refuses a host
+    copy larger than its device panel (coordinator ruling 11).
     """
 
     def __init__(self, meta, *, mesh_xy):
