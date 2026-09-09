@@ -213,9 +213,9 @@ class CapacityLedger:
             raise ValueError("capacity bytes must be nonnegative integers")
         return result
 
-    def reserve(self, stage, *, resident_bytes_per_rank,
+    def quote(self, stage, *, resident_bytes_per_rank,
                 workspace_bytes_per_rank, concurrent_with=()):
-        """Admit actual-batch bytes before allocation, or record FAIL and refuse.
+        """Price actual-batch bytes without reserving or allocating anything.
 
         Returns a detached JSON row. ``concurrent_with`` is an iterable of
         accepted stage names, not their byte totals. Caller-live allocations
@@ -268,9 +268,19 @@ class CapacityLedger:
                    device_budget_status='PASS' if passed else 'FAIL',
                    concurrent_with=sorted(live), live_stages=sorted(live | {stage}),
                    geometry=dict(g), max_mesh_ranks_at_fixed_bytes=max_ranks)
+        return copy.deepcopy(row)
+
+    def reserve(self, stage, *, resident_bytes_per_rank,
+                workspace_bytes_per_rank, concurrent_with=()):
+        """Admit a quote before allocation; record and refuse over-budget work."""
+        import copy
+        row = self.quote(stage, resident_bytes_per_rank=resident_bytes_per_rank,
+                         workspace_bytes_per_rank=workspace_bytes_per_rank,
+                         concurrent_with=concurrent_with)
         self.entries.append(row)
+        passed = row['device_budget_status'] == 'PASS'
         if not passed:
-            raise MemoryError(f"GATE shared_pole_capacity: stage={stage}; got: {reason}; "
+            raise MemoryError(f"GATE shared_pole_capacity: stage={stage}; got: {row['reason']}; "
                               "why: aggregate live allocation must not exceed the remaining device budget")
         self._accepted[stage] = row
         return copy.deepcopy(row)
