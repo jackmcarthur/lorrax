@@ -60,8 +60,8 @@ not pass its matrix gate and is not shipped.
 
 Compiled product temporaries are190,448,384→27,477,816 bytes/rank at Na
 P16, including compiler/native GEMM workspace; operand/output allocations
-are unchanged. These are executable memory-analysis bytes, not an allocator
-peak for a full legacy Dyson solve. The real shared-bank control's allocator
+are unchanged. These are executable memory-analysis bytes. A separate fresh-process
+actual-solver gate is recorded below. The real shared-bank control's allocator
 peak is separately measured and unchanged at4,286,200,816 bytes/rank.
 
 ## Communication and measured consequences
@@ -82,6 +82,7 @@ All artifact paths below are relative to
 | Si strict58128234.5, `07_si_legacy_fix_p4/artifact_check.json` | identical K; every CC†/CΛC†/W(iu) invariant and analytic Sigma array/metric difference exactly0; all4 peaks unchanged |
 | Na kernel58128234.7, `08_na_bank_pair_p16/panel/receipt_rank0.json` | Q29,m896: relative2.91e-15; median71.854→103.829ms; all16 PASS; memory fix, timing regression |
 | Na bank58128234.7, `08_na_bank_pair_p16/after/bank_parity.json` | all1624 W/dW/M1/M3 rows exact, amplitude red detected; all16 peaks unchanged; zero legacy-factory calls |
+| Actual Dyson58128234.9/.10, `10_solver_peak_p4/artifact_check.json` and `11_solver_peak_p16/artifact_check.json` | Independent complex rank-one inverse oracle: relative9.72e-16 atP4,9.08e-16 atP16. P4 all-rank peak34,532,060→30,351,184B. P16 maximum279,382,748→270,567,380B, no rank rises; ranks0–3 unchanged. Fresh processes, production-sized synthetic faces, not physical Na W. |
 | Na bank owner host bands, same leg, `before/` and `after/arch1_stages_rank0.json` |119.880→128.073s bank;19.062→19.400s moments. Same bank source; not attributed to the uncalled product |
 | Five-call P4 NSYS58128234.8, `09_panel_traces_p4/p4/{before,after}/analysis/rank0.json` | NCCL10→40 kernels; summed kernel1.630→2.681ms |
 | Five-call P16 NSYS58128234.7, `09_panel_traces_p4/p16/{before,after}/analysis/rank0.json` | NCCL10→80 kernels; summed kernel0.321193→0.530700s |
@@ -108,5 +109,10 @@ now AFFT's lane; no new kernel or attainable speedup is claimed here.
 Verdict: retain the service-owned memory fix; do not credit it with a bank
 speedup. The actual bank hoist is rejected. Si strict parity and Na bank
 parity are measured; a new Na constructor/Sigma/CD campaign is not claimed.
+The actual-solver peak test is archived verbatim as
+`tests/multi_device/dyson_solver_peak.py`; its measurement harness has the
+same bytes. LU and other workspace can dominate the total solver peak,
+so the large product-temporary reduction is not a comparable reduction
+in the full-solver peak. No physical-sample full-solver peak claim is made.
 Static gate0 fails the same inherited rules/ledger lint on baseline and
 candidate (`logs/gate0_control.log`, `logs/gate0.log`).
