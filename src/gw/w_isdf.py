@@ -1506,50 +1506,6 @@ def _w_residual_report(V_flat, chi_scaled, W, n_ext, n_check: int = 4):
               f"{vals}  max={r.max():.3e}", flush=True)
 
 
-def produce_w_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io):
-    """Produce physical Wc/dWc_ds in the current-map scratch transaction.
-
-    ``sample_plan`` is the resolved IINPUTS flat point/role plan. ``bank_io``
-    names the initialized ISTORE scratch, identity, authenticated canonical
-    Coulomb resource and provider workspace bounds. Runtime samples have
-    shape ``[q_batch,sample_batch,mu_p,mu_p]`` at ``P(None,None,'x','y')``;
-    units are Ry and Ry^-1. See ``gw.response_bank`` for the stage machinery.
-    """
-    from .response_bank import produce_sample_bank
-    return produce_sample_bank(wfns, meta, config, mesh_xy=mesh_xy, sym=sym,
-                               sample_plan=sample_plan, bank_io=bank_io)
-
-
-def compute_response_moments(wfns, meta, config, *, mesh_xy, sym, bank_io):
-    """Write exact physical M1/M3 (Ry^3/Ry^5) from six correlations.
-
-    Runtime moments are ``[q_batch,mu_p,mu_p]`` at ``P(None,'x','y')``.
-    The physical expansion coefficients are 2M1 and 2M3; no M5 is produced.
-    Resources and current-state identity follow :func:`produce_w_bank`.
-    """
-    from .response_bank import compute_moment_bank
-    return compute_moment_bank(wfns, meta, config, mesh_xy=mesh_xy, sym=sym,
-                               bank_io=bank_io)
-
-
-def response_coulomb_powers(meta, config, *, mesh_xy, bank_io, q_span):
-    """Read one authenticated parent batch and return H, H_pinv, receipt.
-
-    H=V^1/2 and H_pinv=V^-1/2 on the numerical PSD support (zero outside).
-    Both outputs are packed complex128 ``[b,mu_p,mu_p]`` face arrays at
-    ``P(None,'x','y')``. They are temporary caller-owned resources, never
-    a retained full-q copy. The receipt binds the Coulomb hash and ranks.
-    """
-    from .response_bank import (_bank_execution, _coulomb_batch, _receipt,
-                                authenticate_coulomb)
-    authenticate_coulomb(bank_io, bank_io["coulomb"]["q_irr_full_idx"])
-    receipt = _receipt("coulomb", {}, bank_io)
-    execute = _bank_execution(meta, mesh_xy, bank_io, receipt)
-    h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute)
-    receipt.update(support_ranks=ranks, completion=True)
-    return h, hi, receipt
-
-
 def _w_solve_pref_scalar(meta) -> float:
     """The physical-state prefactor in front of χ₀ in the Dyson solve.
 
