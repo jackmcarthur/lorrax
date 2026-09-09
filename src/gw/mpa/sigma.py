@@ -22,7 +22,7 @@ from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import SigmaOmegaResult, _residue_for_space, sigma_band_axis
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
-from gw.sigma_box_plan import plan_sigma_windows
+from gw.sigma_box_plan import plan_sigma_windows, sigma_rule_request_cache
 from gw.sigma_plan import resolve_sigma_plan
 from gw.wavefunction_bundle import (
     parent_sigma_operands, sigma_face_kernel_kwargs)
@@ -1360,6 +1360,9 @@ def compute_sigma_c_mpa_omega_grid(
                 reader, header=ledger, capacity=meta.shared_pole_capacity)
             poles2, counts = map(np.asarray, jax.device_get((poles_device, counts_device)))
             del poles_device, counts_device
+            quadrature_cache_dir = sigma_rule_request_cache(
+                quadrature_cache_dir, ledger["identity"], poles2, counts,
+                eta=regularization_width_ry, eps=quadrature_eps)
             frequencies = shared_pole_frequencies(poles2, counts)
             summaries = summarize_shared_poles(
                 poles2, counts, branches,

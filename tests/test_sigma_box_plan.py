@@ -629,7 +629,11 @@ def test_product_window_ranges_keep_one_batch_width_kernel_signature():
 def test_mpa_executor_has_one_tau_kernel_factory():
     root = Path(__file__).resolve().parents[1]
     executor = (root / "src" / "gw" / "mpa" / "sigma.py").read_text()
-    tree = ast.parse(executor)
+    # The capacity regression probe also builds the same factory; it is not
+    # a second execution route. Count the production sweep's factory only.
+    tree = next(node for node in ast.parse(executor).body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "_integrate_sigma_batches")
     calls = [
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call)
@@ -741,6 +745,74 @@ def test_cache_store_refuses_a_non_finite_rule(tmp_path):
     warning = _rule_cache_store(str(tmp_path), bad, 1.0)
     assert warning is not None and "refused" in warning
     assert not list(tmp_path.glob("*.npz"))
+
+
+@pytest.mark.parametrize("field", ["weights", "times", "sup_error", "schema"])
+def test_finite_certificate_corruption_is_refused_and_rebuilt(
+        monkeypatch, tmp_path, field):
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    args = dict(eps=1e-4, reduction_seconds=120., cache_dir=str(tmp_path))
+    plan_sigma_windows(_summaries(), [_branch()], np.array([.2, .5]), .1,
+                       print_fn=lambda *_: None, **args)
+    damaged = sorted(tmp_path.glob("*.npz"))[0]
+    with np.load(damaged) as data:
+        payload = {key: np.asarray(data[key]) for key in data.files}
+    payload[field] = (np.asarray("stale") if field == "schema"
+                      else payload[field] * 0.9)
+    np.savez(damaged, **payload)
+    lines = []
+    _, geometry = plan_sigma_windows(
+        _summaries(), [_branch()], np.array([.2, .5]), .1,
+        print_fn=lines.append, **args)
+    assert any("sigma_rule_integrity" in line for line in lines)
+    assert sum(row["cache_status"] == "miss"
+               for row in geometry["branches"][0]["windows"]) == 1
+    _, repaired = plan_sigma_windows(
+        _summaries(), [_branch()], np.array([.2, .5]), .1,
+        print_fn=lambda *_: None, **args)
+    assert all(row["cache_status"].startswith("hit:")
+               for row in repaired["branches"][0]["windows"])
+
+
+@pytest.mark.parametrize("changed", ["energies", "occupations", "poles", "eta", "eps"])
+def test_current_input_request_cannot_reuse_changed_map_rules(
+        monkeypatch, tmp_path, changed):
+    from gw.sigma_box_plan import sigma_rule_request_cache
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    identity = dict(energies="bands-a", occupations="fd-a", iteration_id="map-1")
+    poles, counts = np.array([[.09, 1.]]), np.array([2])
+    kw = dict(eta=.1, eps=1e-4)
+    first_dir = sigma_rule_request_cache(str(tmp_path), identity, poles, counts, **kw)
+    args = dict(eps=1e-4, reduction_seconds=120., print_fn=lambda *_: None)
+    plan_sigma_windows(_summaries(), [_branch()], np.array([.2, .5]), .1,
+                       cache_dir=first_dir, **args)
+    identity["iteration_id"] = "map-2"
+    assert first_dir == sigma_rule_request_cache(str(tmp_path), identity, poles, counts, **kw)
+    if changed in ("energies", "occupations"):
+        identity[changed] += "-changed"
+    elif changed == "poles":
+        poles[0, 0] += .001
+    else:
+        kw[changed] *= .9
+    new_dir = sigma_rule_request_cache(str(tmp_path), identity, poles, counts, **kw)
+    assert new_dir != first_dir
+    _, geometry = plan_sigma_windows(
+        _summaries(), [_branch()], np.array([.2, .5]), .1,
+        cache_dir=new_dir, **args)
+    assert all(row["cache_status"] == "miss"
+               for row in geometry["branches"][0]["windows"])
+
+
+def test_changed_domain_rebuilds_even_with_same_input_identity(monkeypatch, tmp_path):
+    from gw.sigma_box_plan import _rule_cache_lookup, _rule_cache_store
+    rule = _fake_rule((-2., -.3, .05, .4), 1e-4)
+    assert _rule_cache_store(str(tmp_path), rule, 1.) is None
+    accepted, _ = _rule_cache_lookup(str(tmp_path), rule.box, 1e-4, True,
+                                    noise_amplification_cap=1e9)
+    assert accepted is not None
+    escaped, _ = _rule_cache_lookup(str(tmp_path), (-3., -.3, .05, .4), 1e-4, True,
+                                   noise_amplification_cap=1e9)
+    assert escaped is None
 
 
 def test_cache_lookup_prefers_a_certified_larger_rule_over_a_bad_smaller_one(tmp_path):
