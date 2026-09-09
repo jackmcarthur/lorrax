@@ -3,7 +3,7 @@ from functools import partial
 import numpy as np
 
 
-def check_shared_pole_unfold(mesh):
+def check_shared_pole_unfold(mesh, profile=False):
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -50,6 +50,14 @@ def check_shared_pole_unfold(mesh):
             left_L_table=wraps, right_L_table=wraps, n_sym_spatial=2,
             trs_rule='pair_transpose', transposed_parent_local=at)
     compiled = jax.jit(unfold).lower(w, wt).compile()
+    if profile:
+        import ctypes
+        cudart = ctypes.CDLL('libcudart.so.13')
+        jax.block_until_ready((w, wt))
+        assert cudart.cudaProfilerStart() == 0
+        for _ in range(25):
+            jax.block_until_ready(compiled(w, wt))
+        assert cudart.cudaProfilerStop() == 0
     got = compiled(w, wt)
     local_error = err(got, oracle(perm))
     assert local_error < 3e-12, local_error
