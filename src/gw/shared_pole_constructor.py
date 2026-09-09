@@ -350,22 +350,45 @@ def shared_pole_passivity(model, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, 
             "passivity_max": maximum, "passivity_antihermitian_relative": anti}
 
 
+def _sample_point(recipe, sample_id):
+    """Read a deduplicated physical point from the canonical role arrays."""
+    import numpy as np
+    rows = np.flatnonzero(np.asarray(recipe["distinct_id"]) == sample_id)
+    points = [complex(value["real"], value["imag"]) if isinstance(value, dict)
+              else complex(value) for value in recipe["z_ry"]]
+    values = np.asarray(points)[rows]
+    if not len(rows) or not np.all(values == values[0]):
+        raise ValueError("GATE shared_pole_sample_identity: got: absent/inconsistent point; want: one z per distinct_id; why: roles share bank evaluations only")
+    return complex(values[0])
+
+
+def _fit_roles(recipe):
+    """Ephemeral constructor record view; only flat arrays are serialized."""
+    from gw.shared_pole_recipe import ROLE_CODES
+    names = {code: name for name, code in ROLE_CODES.items()}
+    return [{"sample_id": int(sample), "role": f"{names[int(role)]}:{i}",
+             "held": bool(held)}
+            for i, (sample, role, held) in enumerate(zip(
+                recipe["distinct_id"], recipe["role"], recipe["held"]))]
+
+
 def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
                       column_extent, logical_n, admit, infinity_carrier):
     """Read each distinct fitted sample once, preserving all tangent roles."""
     import distrib_la
 
+    fit_roles = _fit_roles(recipe)
     states, masks, roles = [], [], []
     for sample_id in recipe["fit_ids"]:
         # Admit before reading/selecting, including the largest possible
         # next multiplet and all conjugate/duplicate roles of this sample.
-        next_roles = [role for role in recipe["roles"]
+        next_roles = [role for role in fit_roles
                       if not role["held"] and int(role["sample_id"]) == int(sample_id)]
         maximum_new = sum(2 if role["role"].startswith("line:") else 1
                           for role in next_roles) * column_extent(logical_n)
         admit(infinity_carrier + sum(state[1].shape[-1] for state in states) + maximum_new)
         w, derivative = read_sample(int(sample_id))
-        for role in recipe["roles"]:
+        for role in fit_roles:
             if role["held"] or int(role["sample_id"]) != int(sample_id):
                 continue
             kind = role["role"].split(":", 1)[0]
@@ -385,7 +408,7 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
             if width < 1 or width > logical_n:
                 raise ValueError(f"GATE shared_pole_directions: got: rank {width}; want: 1..{logical_n}; why: empty or padded physical direction set")
             q = q[None]
-            s = complex(recipe["z_ry"][int(sample_id)]) ** 2
+            s = _sample_point(recipe, int(sample_id)) ** 2
             # The line's conjugate state reuses the SAME right directions,
             # exactly as the latent Hermite construction specifies. No extra
             # sample and no re-selection on the adjoint matrix is performed.
@@ -430,7 +453,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     ----------
     bank : mapping
         Authenticated resource descriptor: ``path``, ``identity``, ``tables``,
-        ``coulomb`` (q_span -> inverse square root [b,n,n] face array),
+        ``coulomb`` (response-owner authenticated Coulomb resource),
         ``resident_bytes_per_rank``, ``workspace_bytes_per_rank``. A producer
         certificate is carried as ``rule_receipt``. No dense bank is passed
         as a jit argument. The recipe is read only from meta.
@@ -468,6 +491,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         construction_receipt, shared_real_pole_gates_v1_r3b as gates,
     )
     from common.units import RYD_TO_EV
+    from gw.w_isdf import response_coulomb_powers
 
     recipe = meta.shared_pole_recipe
     if int(meta.nspinor) != 1 or not bool(bank["tables"]["sym"].trs_allowed):
@@ -480,7 +504,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                               mesh_xy=mesh_xy)
     # The stored plan must bind the current physical points and role census.
     stored_recipe = header["recipe"]
-    for name in ("recipe_hash", "gate_hash", "fit_ids", "held_ids", "roles", "census"):
+    for name in ("recipe_hash", "gate_hash", "fit_ids", "held_ids", "role", "distinct_id", "held", "census"):
         current = recipe[name]
         previous = stored_recipe[name]
         if isinstance(current, np.ndarray):
@@ -489,6 +513,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             equal = current == previous
         if not equal:
             raise ValueError(f"GATE shared_pole_bank_state: got: stale {name}; want: current resolved recipe; why: no frozen SC inputs")
+    for sample_id in (*recipe["fit_ids"], *recipe["held_ids"]):
+        if _sample_point(recipe, sample_id) != _sample_point(stored_recipe, sample_id):
+            raise ValueError("GATE shared_pole_bank_state: got: changed z; want: current physical sample point; why: recipe hashes alone do not bind resolved points")
 
     def capacity(side):
         result = shared_pole_capacity(
@@ -568,11 +595,14 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             raise ValueError(f"GATE shared_pole_retained_moments: got: failed at q={q}; want: projected latent moment identity <=1e-10; why: corrected Ritz algebra")
         del pencil, coefficients, selector, active_columns
         model, permutation = sort_shared_pole_columns(model)
-        passive = shared_pole_passivity(model, bank["coulomb"](span),
+        coulomb_sqrt, inverse_sqrt, coulomb_receipt = response_coulomb_powers(
+            meta, config, mesh_xy=mesh_xy, bank_io=bank, q_span=span)
+        passive = shared_pole_passivity(model, inverse_sqrt,
                                        eta_ry=recipe["eta_ev"] / RYD_TO_EV,
                                        matmul=mm, eigh=eig.batched, gates=gates)
         if not bool(jnp.all(passive["passivity"])):
             raise ValueError(f"GATE shared_pole_passivity: got: failed at q={q}; want: 0 <= V-whitened -W(i eta) <= I; why: passive screening")
+        del coulomb_sqrt, inverse_sqrt
         with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
             exact = read_shared_pole_bank(moment_io, span, meta=meta,
                                           header=moment_header, fields=("M1", "M3"))
@@ -581,21 +611,26 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         held = []
         with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
             for sample_id in recipe["held_ids"]:
-                sample = read_shared_pole_bank(bank_io, span, meta=meta, header=header,
+                samples = read_shared_pole_bank(bank_io, span, meta=meta, header=header,
                                                sample_span=(int(sample_id), int(sample_id)+1),
-                                               fields=("Wc",))["Wc"][:, 0]
+                                               fields=("Wc", "dWc_ds"))
                 c, poles, mask = model
-                s = complex(recipe["z_ry"][int(sample_id)]) ** 2
+                s = _sample_point(recipe, int(sample_id)) ** 2
                 weights = jnp.where(mask, 1 / (s-poles), 0)
-                value = mm(c * weights[:, None, :], c, transb="C")
-                error = float(jnp.linalg.norm(value-sample) / jnp.linalg.norm(sample))
-                held.append({"sample_id": int(sample_id), "relative_frobenius": error})
+                diagnostic = {"sample_id": int(sample_id)}
+                for field, weight in (("Wc", weights), ("dWc_ds", -weights**2)):
+                    sample = samples[field][:, 0]
+                    value = mm(c * weight[:, None, :], c, transb="C")
+                    diagnostic[field] = float(jnp.linalg.norm(value-sample) /
+                                              jnp.maximum(jnp.linalg.norm(sample), jnp.finfo(jnp.float64).tiny))
+                held.append(diagnostic)
+                del samples, sample, value
         c, poles, mask = model
         counts = jnp.sum(mask, axis=-1, dtype=jnp.int64)
         # All scalar reductions precede rank-selective store formatting.
         row = {"q_span": list(span), "roles": roles,
                "K": np.asarray(counts).tolist(), "J": int(np.unique(np.asarray(poles)[np.asarray(mask)]).size),
-               "damping_fraction": 0.0, "capacity": price,
+               "damping_fraction": 0.0, "capacity": price, "coulomb": coulomb_receipt,
                "condition": np.asarray(reduction["gram_condition"]).tolist(),
                "retained_moment_relative": {k: np.asarray(v).tolist() for k, v in retained.items()},
                "moment_defects": {k: {a: np.asarray(b).tolist() for a, b in v.items()}
@@ -609,7 +644,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             "finite_factors_poles": dict(value=True, passed=True, reason="zero policy, active prefix and exact inert sentinels"),
             "passivity": dict(value={k: np.asarray(v).tolist() for k, v in passive.items() if k != "passivity"}, passed=True, reason="authenticated inverse Coulomb square root at current eta"),
             "retained_subspace_moments": dict(value=row["retained_moment_relative"], passed=True, reason="A=Y†GE, B=YA; pencil B†(G,H)B/2 versus model A†(I,Lambda)A/2"),
-            "held_w_full_moment_defects": dict(value={"held_W": held, "moments": row["moment_defects"]}, passed=None, reason="diagnostics; historical CD8/CD10 calibration is a separate landing receipt"),
+            "held_w": dict(value=held, passed=None, reason="held W and dW/ds diagnostics; no universal threshold"),
+            "full_m1_defect": dict(value=float(moment_defects["M1"]["full_relative"][0]), passed=bool(moment_defects["M1"]["full_relative"][0] <= gates["full_m1_defect"]["threshold"]), reason="physical full M1 defect; CD8 diagnostic band, never a refusal"),
+            "full_m3_defect": dict(value=float(moment_defects["M3"]["full_relative"][0]), passed=bool(moment_defects["M3"]["full_relative"][0] <= gates["full_m3_defect"]["threshold"]), reason="physical full M3 defect; CD8 diagnostic band, never a refusal"),
             "representation": dict(value={"nspinor": 1, "trs_allowed": True}, passed=True, reason="current typed symmetry capability"),
             "capacity": dict(value=price, passed=True, reason="conservative aggregate constructor live-set price"),
             "sc_rebuild": dict(value=identity, passed=True, reason="current recipe/census authenticated; directions and Ritz model rebuilt"),

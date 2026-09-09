@@ -27,6 +27,7 @@ def run_checks(mesh):
         apply_shared_pole_zero_policy, sort_shared_pole_columns,
         shared_pole_passivity,
         retained_moment_identity,
+        _direction_states,
     )
     from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
 
@@ -121,6 +122,33 @@ def run_checks(mesh):
         rows.append(dict(name="passivity_red_twin", layout=layout, status="PASS",
                          positive_max=np.asarray(passive["passivity_max"]).tolist(),
                          red_max=np.asarray(red["passivity_max"]).tolist()))
+        # A line and imaginary role share z=i*h. The relative near-cut
+        # doublet straddles both the singular cutoff and the requested width.
+        sample = placed(-np.diag([.8, .10000001, .09999999, .01, .008, .006, .004, .002])[None].astype(np.complex128))
+        reads, admissions = [], []
+        def read_once(sample_id):
+            reads.append(sample_id)
+            return sample, sample * .01
+        recipe = dict(fit_ids=[0], held_ids=[], distinct_id=[0, 0],
+                      z_ry=[.2j, .2j], role=[0, 1], held=[False, False],
+                      direction_cutoff=.125, imaginary_width=2,
+                      multiplet_relative_tolerance=1e-6)
+        svd = distrib_la.plan("eigh", mesh, n=16, backend=resolution.eigh_backend,
+                              batched_route=resolution.batched_route)
+        selected, selected_masks, roles = _direction_states(
+            read_once, recipe, eigh_plan=pe, svd_plan=svd, matmul=mm,
+            column_extent=lambda width: 2*((width+1)//2), logical_n=8,
+            admit=admissions.append, infinity_carrier=2)
+        assert reads == [0] and len(selected) == 2
+        assert [role["width"] for role in roles] == [3, 3], roles
+        projector = np.diag([1., 1., 1., 0., 0., 0., 0., 0.])[None]
+        selection_errors = [relative(mm(state[1], state[1], transb="C"), projector)
+                            for state in selected]
+        assert max(selection_errors) < 1e-10, selection_errors
+        assert all(int(jnp.sum(mask)) == 3 for mask in selected_masks)
+        assert admissions == [26]
+        rows.append(dict(name="directions_multiplet_dedup", layout=layout, status="PASS",
+                         reads=reads, roles=roles, projector_relative=selection_errors))
         models.append(model)
 
     # Gate on the actual zero-policy implementation, not a duplicated predicate.
@@ -134,7 +162,7 @@ def run_checks(mesh):
     rows.append(dict(name="zero_weight_red_twin", status="PASS",
                      benign_fraction=np.asarray(good["dropped_factor_weight_fraction"]).tolist(),
                      red_fraction=np.asarray(bad["dropped_factor_weight_fraction"]).tolist()))
-    assert len(rows) == 7
+    assert len(rows) == 9
     return rows
 
 
@@ -147,7 +175,7 @@ def main():
     import jax
     from common.collectives import resolve_mesh
     rows = run_checks(resolve_mesh())
-    result = dict(status="PASS", checks=rows, expected_checks=7,
+    result = dict(status="PASS", checks=rows, expected_checks=9,
                   jobid=os.environ.get("SLURM_JOB_ID"), stepid=os.environ.get("SLURM_STEP_ID"),
                   source_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
                   scope="P4 planted constructor kernels, both dense plans; no production bank, storage or campaign parity")
