@@ -873,7 +873,7 @@ def _get_chi_fractional_contour_kernel_legacy(
 
 def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
-    *, k_unfold_plan=None,
+    *, k_unfold_plan=None, selected_q=None, pair_mode="retarded",
 ):
     """Face-layout sibling of
     :func:`_get_chi_fractional_contour_kernel_legacy`.  Same Keldysh
@@ -902,6 +902,11 @@ def _get_chi_fractional_contour_kernel_face(
     production-shape harness).  This function always runs the FULL
     ``nb_full`` contraction; it does not know or care that the caller
     has already zeroed part of the weight.
+
+    ``selected_q`` selects a bounded set of canonical full-grid q IDs.
+    That option returns a stacked ``[parent, output, mu_x, mu_y]`` array at
+    ``P(None,None,'x','y')``; the default retains the incumbent tuple API.
+    Selection happens before output accumulation, not after a full-q bank.
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
@@ -915,9 +920,24 @@ def _get_chi_fractional_contour_kernel_face(
         PSI_NMU_SPEC,
     )
 
+    if pair_mode not in ("retarded", "laplace"):
+        raise ValueError("pair_mode must be retarded or laplace")
+    if pair_mode == "laplace" and selected_q is None:
+        raise ValueError("Laplace bank correlations require selected_q")
+    if selected_q is not None:
+        from .contour_accumulator import contour_accumulator
+        accumulate_selected = contour_accumulator(mesh_xy)
     grid = tuple(int(n) for n in kgrid)
     nk = int(np.prod(grid))
     n_out = int(n_out)
+    if selected_q is not None:
+        selected_q = tuple(int(q) for q in selected_q)
+        if (not selected_q or len(set(selected_q)) != len(selected_q)
+                or min(selected_q) < 0 or max(selected_q) >= nk):
+            raise ValueError(
+                "GATE response_selected_q: got invalid selected_q; want unique "
+                "full-grid indices; why: bank parent rows must be explicit")
+    selected_shard = NamedSharding(mesh_xy, P(None, None, "x", "y"))
     nk_shape, nb_full, n_rmu, ns = (int(v) for v in face_shape)
     # Raw-parent transport (``k_unfold_plan``): the two G's are contracted
     # on the n_parent packed parent faces and unfolded to full k in PACKED
@@ -963,7 +983,8 @@ def _get_chi_fractional_contour_kernel_face(
             psi_mun_shard, psi_nmu_shard,
             rep2, rep2, rep2, rep0,
         ),
-        out_shardings=tuple(chi_R_shard for _ in range(n_out)),
+        out_shardings=(tuple(chi_R_shard for _ in range(n_out))
+                       if selected_q is None else selected_shard),
     )
     def integrate(
         time_nodes,
@@ -994,61 +1015,100 @@ def _get_chi_fractional_contour_kernel_face(
         # sliced twice, so this is not a new sharing, only a name
         # simplification.
         n_mu = psi_mun.shape[2]
+        q_count = nk if selected_q is None else len(selected_q)
         zero = jax.lax.with_sharding_constraint(
-            jnp.zeros((nk, n_mu, n_mu), dtype=jnp.complex128),
+            jnp.zeros((q_count, n_mu, n_mu), dtype=jnp.complex128),
             chi_R_shard,
         )
-        initial = tuple(zero for _ in range(n_out))
+        initial = (tuple(zero for _ in range(n_out)) if selected_q is None
+                   else jax.lax.with_sharding_constraint(
+                       jnp.broadcast_to(zero, (n_out,) + zero.shape),
+                       selected_shard))
 
         def body(accumulators, node):
             time, projection = node
-            tau = jnp.asarray(1j, dtype=jnp.complex128) * time
-            Gf_k = jax.lax.with_sharding_constraint(
-                jnp.conj(build_G_tau(
-                    psi_mun,
-                    psi_nmu,
-                    enk_full,
-                    -tau,
-                    e_ref=energy_reference,
-                    band_weight=occ_f,
-                    layout="face",
-                    gemm=g_plan,
-                    k_unfold_plan=k_unfold_plan,
-                )),
-                G_shard,
-            )
-            Gu_k = jax.lax.with_sharding_constraint(
-                jnp.conj(build_G_tau(
-                    psi_mun,
-                    psi_nmu,
-                    enk_full,
-                    -tau,
-                    e_ref=energy_reference,
-                    band_weight=occ_u,
-                    layout="face",
-                    gemm=g_plan,
-                    k_unfold_plan=k_unfold_plan,
-                )),
-                G_shard,
-            )
-            Gf_R = G_fftn(Gf_k)
-            Gu_R = G_fftn(Gu_k)
-            A_R = jax.lax.with_sharding_constraint(
-                jnp.einsum(
-                    "Rambn,Rambn->Rmn",
-                    Gu_R,
-                    jnp.conj(Gf_R),
-                    optimize=True,
-                ),
-                chi_R_shard,
-            )
-            reverse_R = jnp.conj(A_R)
-            updated = tuple(
-                accumulators[i]
-                - 1j * projection[i] * A_R
-                + 1j * projection[i] * reverse_R
-                for i in range(n_out)
-            )
+            if pair_mode == "retarded":
+                tau = jnp.asarray(1j, dtype=jnp.complex128) * time
+                Gf_k = jax.lax.with_sharding_constraint(
+                    jnp.conj(build_G_tau(
+                        psi_mun,
+                        psi_nmu,
+                        enk_full,
+                        -tau,
+                        e_ref=energy_reference,
+                        band_weight=occ_f,
+                        layout="face",
+                        gemm=g_plan,
+                        k_unfold_plan=k_unfold_plan,
+                    )),
+                    G_shard,
+                )
+                Gu_k = jax.lax.with_sharding_constraint(
+                    jnp.conj(build_G_tau(
+                        psi_mun,
+                        psi_nmu,
+                        enk_full,
+                        -tau,
+                        e_ref=energy_reference,
+                        band_weight=occ_u,
+                        layout="face",
+                        gemm=g_plan,
+                        k_unfold_plan=k_unfold_plan,
+                    )),
+                    G_shard,
+                )
+                Gf_R = G_fftn(Gf_k)
+                Gu_R = G_fftn(Gu_k)
+                A_R = jax.lax.with_sharding_constraint(
+                    jnp.einsum(
+                        "Rambn,Rambn->Rmn",
+                        Gu_R,
+                        jnp.conj(Gf_R),
+                        optimize=True,
+                    ),
+                    chi_R_shard,
+                )
+            else:
+                # Remote ordered cell: (f_lower u_upper - u_lower f_upper)
+                # exp[-(E_upper-E_lower)t].  Each side remains a
+                # one-particle correlation through the same Green/FFT owner.
+                def green(weight, tau_value, ref):
+                    return G_fftn(jax.lax.with_sharding_constraint(
+                        jnp.conj(build_G_tau(
+                            psi_mun, psi_nmu, enk_full, tau_value,
+                            e_ref=ref, band_weight=weight, layout="face",
+                            gemm=g_plan, k_unfold_plan=k_unfold_plan)),
+                        G_shard))
+
+                lower_f = green(occ_f[0], -time, energy_reference[0])
+                upper_u = green(occ_u[0], time, energy_reference[1])
+                lower_u = green(occ_f[1], -time, energy_reference[0])
+                upper_f = green(occ_u[1], time, energy_reference[1])
+                A_R = jax.lax.with_sharding_constraint(
+                    jnp.einsum("Rambn,Rambn->Rmn", upper_u,
+                               jnp.conj(lower_f), optimize=True)
+                    - jnp.einsum("Rambn,Rambn->Rmn", upper_f,
+                                 jnp.conj(lower_u), optimize=True),
+                    chi_R_shard)
+            if selected_q is None:
+                reverse_R = jnp.conj(A_R)
+                updated = tuple(
+                    accumulators[i]
+                    - 1j * projection[i] * A_R
+                    + 1j * projection[i] * reverse_R
+                    for i in range(n_out)
+                )
+            else:
+                # Linearity permits ONE completed q FFT per node before
+                # retaining the admitted parent/output batch (PROTO4).
+                # Upstream G/FFT buffers remain full-grid and must still
+                # enter the admission ledger.
+                contribution = jnp.take(
+                    chi_fftn(-1j * (A_R - jnp.conj(A_R))
+                             if pair_mode == "retarded"
+                             else A_R + jnp.conj(A_R)),
+                    jnp.asarray(selected_q), axis=0)
+                updated = accumulate_selected(accumulators, contribution, projection)
             return updated, None
 
         final_R, _ = jax.lax.scan(
@@ -1057,7 +1117,10 @@ def _get_chi_fractional_contour_kernel_face(
             (time_nodes, jnp.transpose(projection_rows)),
             unroll=1,
         )
-        return tuple(_finish(value) for value in final_R)
+        if selected_q is None:
+            return tuple(_finish(value) for value in final_R)
+        # Public bank order [parent, sample, mu_x, mu_y].
+        return jnp.swapaxes(final_R, 0, 1)
 
     return integrate
 
@@ -1442,6 +1505,50 @@ def _w_residual_report(V_flat, chi_scaled, W, n_ext, n_check: int = 4):
         vals = "  ".join(f"q{iq}={v:.3e}" for iq, v in enumerate(r))
         print(f"  [W solve] Dyson residual |(1-Vchi)W - V|/|V| ({ns} q): "
               f"{vals}  max={r.max():.3e}", flush=True)
+
+
+def produce_w_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io):
+    """Produce physical Wc/dWc_ds in the current-map scratch transaction.
+
+    ``sample_plan`` is the resolved IINPUTS flat point/role plan. ``bank_io``
+    names the initialized ISTORE scratch, identity, authenticated canonical
+    Coulomb resource and provider workspace bounds. Runtime samples have
+    shape ``[q_batch,sample_batch,mu_p,mu_p]`` at ``P(None,None,'x','y')``;
+    units are Ry and Ry^-1. See ``gw.response_bank`` for the stage machinery.
+    """
+    from .response_bank import produce_sample_bank
+    return produce_sample_bank(wfns, meta, config, mesh_xy=mesh_xy, sym=sym,
+                               sample_plan=sample_plan, bank_io=bank_io)
+
+
+def compute_response_moments(wfns, meta, config, *, mesh_xy, sym, bank_io):
+    """Write exact physical M1/M3 (Ry^3/Ry^5) from six correlations.
+
+    Runtime moments are ``[q_batch,mu_p,mu_p]`` at ``P(None,'x','y')``.
+    The physical expansion coefficients are 2M1 and 2M3; no M5 is produced.
+    Resources and current-state identity follow :func:`produce_w_bank`.
+    """
+    from .response_bank import compute_moment_bank
+    return compute_moment_bank(wfns, meta, config, mesh_xy=mesh_xy, sym=sym,
+                               bank_io=bank_io)
+
+
+def response_coulomb_powers(meta, config, *, mesh_xy, bank_io, q_span):
+    """Read one authenticated parent batch and return H, H_pinv, receipt.
+
+    H=V^1/2 and H_pinv=V^-1/2 on the numerical PSD support (zero outside).
+    Both outputs are packed complex128 ``[b,mu_p,mu_p]`` face arrays at
+    ``P(None,'x','y')``. They are temporary caller-owned resources, never
+    a retained full-q copy. The receipt binds the Coulomb hash and ranks.
+    """
+    from .response_bank import (_bank_execution, _coulomb_batch, _receipt,
+                                authenticate_coulomb)
+    authenticate_coulomb(bank_io, bank_io["coulomb"]["q_irr_full_idx"])
+    receipt = _receipt("coulomb", {}, bank_io)
+    execute = _bank_execution(meta, mesh_xy, bank_io, receipt)
+    h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute)
+    receipt.update(support_ranks=ranks, completion=True)
+    return h, hi, receipt
 
 
 def _w_solve_pref_scalar(meta) -> float:
