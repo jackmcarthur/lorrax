@@ -29,6 +29,7 @@ def main(runtime):
     helpers = runpy.run_path('tests/test_shared_pole_store.py')
     meta, tables, recipe, identity = helpers['_fixture'](mesh)
     _, packed, poles, counts = helpers['_model'](meta)
+    packed[0, :, 0, 1] *= np.exp(1j*np.arange(packed.shape[1]))
     put = lambda a, spec: helpers['_device'](np.asarray(a), mesh, spec)
     path = args.output / 'model.h5'
     header = store.write_shared_pole_model(
@@ -49,15 +50,20 @@ def main(runtime):
     weights = np.where(active, np.exp(-1j*(omega-.6)*(.7+.2j))/(2*omega), 0)
     C = packed[:, :, 0, :]
     expected = np.einsum('qik,qk,qjk->qij', C, weights, C.conj())
+    assert np.max(np.abs(expected[0]-expected[0].T)) > 0.1
+    expected[0] = 0.5*(expected[0]+expected[0].T)
     expected = expected[np.asarray(header['qirr']['irr_idx_q'])]
     oracle = put(expected, P(None, 'x', 'y'))
     results = []
     with SlabIO(path, mode='r', mesh=mesh) as io:
         for b, c in ((3, 5), (1, 2), (2, 3), (3, 1)):
+            schedule = dict(status="PASS", parent_capacity=b, column_capacity=c)
             build = _shared_pole_w_synthesis(
                 io, meta, header, frequencies,
-                dict(status='PASS', parent_capacity=b, column_capacity=c), mesh_xy=mesh)
+                schedule, mesh_xy=mesh)
             got = build(None, None, indices, bounds, phase, e, t)
+            receipt = schedule["fixed_q_asymmetry"]
+            assert receipt["parents"][0]["status"] == "WARN"
             error = float(jax.numpy.max(jax.numpy.abs(got-oracle)))
             assert error < 1e-10, (b, c, error)
             # A changed window must invalidate cached selectors, including
@@ -69,7 +75,8 @@ def main(runtime):
             repeat = float(jax.numpy.max(jax.numpy.abs(again-oracle)))
             assert repeat < 1e-10
             results.append(dict(parent_capacity=b, column_capacity=c,
-                                dense_error=error, restored_window_error=repeat))
+                                dense_error=error, restored_window_error=repeat,
+                                fixed_q_asymmetry=receipt))
             del build, got, zero, again
     report = dict(status='PASS', job_step=os.environ['SLURM_JOB_ID']+'.'+os.environ['SLURM_STEP_ID'],
         scope='P4 canonical store + local full-q synthesis, ragged K, forced q/K panels and window refresh',
