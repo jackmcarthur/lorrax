@@ -104,6 +104,10 @@ def check_roundtrip(mesh,path,layout="local"):
         store.write_shared_pole_model(path,cdev[:1],pdev[:1],count[:1],q_span=(0,1),
             meta=meta,tables=tables,recipe=recipe,receipts={"identity":identity})
     with SlabIO(path,mode='r',mesh=mesh) as io:
+        all_poles,all_counts=store.read_shared_pole_census(io,header=header)
+        np.testing.assert_array_equal(np.asarray(all_poles),poles[:,:5])
+        np.testing.assert_array_equal(np.asarray(all_counts),count)
+        assert store.shared_pole_qirr_tables(header).digest()==tables['qirr'].digest()
         for columns in (None,(1,4),(4,5)):
             cx,cy,lam,k=store.read_shared_pole_faces(io,(0,3),meta=meta,header=header,column_span=columns)
             start,stop=(0,5) if columns is None else columns
@@ -112,6 +116,15 @@ def check_roundtrip(mesh,path,layout="local"):
                 _assert_local(face,packed[:,:,:,start:stop])
             np.testing.assert_array_equal(np.asarray(k),np.clip(count-start,0,stop-start))
             np.testing.assert_array_equal(np.asarray(lam),poles[:,start:stop])
+        # Canonical staging can exceed packed extent; readers must honor the
+        # basis's n_canonical rather than deriving it from logical n or P_x.
+        from dataclasses import replace
+        padded_meta = SimpleNamespace(**vars(meta))
+        padded_meta.mu_basis = replace(meta.mu_basis,
+                                       n_canonical=meta.mu_basis.n_canonical+int(mesh.size))
+        cx,cy,_,_=store.read_shared_pole_faces(io,(0,3),meta=padded_meta,header=header)
+        _assert_local(cx,packed[:,:,:,:5])
+        _assert_local(cy,packed[:,:,:,:5])
     # Independent HDF5 inspection, no live collective handle. Fixture is tiny.
     def oracle():
         import h5py
@@ -124,6 +137,20 @@ def check_roundtrip(mesh,path,layout="local"):
             assert np.all(np.diff(offsets)==1)
             assert 'staging' not in f
     rank0_transaction(path,stage='test.independent_oracle',write=oracle)
+    # Exercise the actual collective validator and restart transaction together.
+    from file_io.tagged_arrays import (register_shared_pole_restart_member,
+                                      read_shared_pole_restart_member)
+    from file_io.commit_state import set_commit_state
+    restart = path.with_name(path.stem+'_restart.h5')
+    def create_restart():
+        import h5py
+        with h5py.File(restart,'w') as f:set_commit_state(f,True)
+    rank0_transaction(restart,stage='test.restart_create',write=create_restart)
+    member=register_shared_pole_restart_member(restart,path,
+        expected_identity=identity,mesh_xy=mesh)
+    assert member['digest']==header['digest']
+    assert read_shared_pole_restart_member(restart,
+        expected_identity=identity,mesh_xy=mesh)==member
     return header
 
 
@@ -184,6 +211,33 @@ def check_sentinel_refusal(mesh,path):
     assert not path.exists()
 
 
+def check_empty_parents(mesh,path):
+    meta,tables,recipe,identity=_fixture(mesh)
+    _,packed,poles,count=_model(meta)
+    packed[0]=0; poles[0]=1; count[0]=0
+    for q in range(3):
+        store.write_shared_pole_model(path,
+            _device(packed[q:q+1],mesh,P(None,'x',None,'y')),
+            _device(poles[q:q+1],mesh,P(None,'y')),count[q:q+1],q_span=(q,q+1),
+            meta=meta,tables=tables,recipe=recipe,receipts={'identity':identity})
+    header=store.validate_shared_pole_model(path,expected_identity=identity,mesh_xy=mesh)
+    with SlabIO(path,mode='r',mesh=mesh) as io:
+        cx,cy,p,k=store.read_shared_pole_faces(io,(0,1),meta=meta,header=header)
+        assert bool(jnp.all(cx==0)) and bool(jnp.all(cy==0))
+        assert bool(jnp.all(p==1)) and int(k[0])==0
+    empty_path=path.with_name('empty_model.h5')
+    store.write_shared_pole_model(empty_path,
+        _device(np.zeros_like(packed),mesh,P(None,'x',None,'y')),
+        _device(np.ones_like(poles),mesh,P(None,'y')),np.zeros_like(count),q_span=(0,3),
+        meta=meta,tables=tables,recipe=recipe,receipts={'identity':identity})
+    header=store.validate_shared_pole_model(empty_path,expected_identity=identity,mesh_xy=mesh)
+    assert header['Kmax']==0
+    with SlabIO(empty_path,mode='r',mesh=mesh) as io:
+        cx,cy,p,k=store.read_shared_pole_faces(io,(0,3),meta=meta,header=header)
+        assert cx.shape[-1]==cy.shape[-1]==p.shape[-1]==0
+        assert bool(jnp.all(k==0))
+
+
 def _test_mesh():
     if len(jax.devices())<4:pytest.skip('requires four devices; production gate uses real P4')
     return Mesh(np.asarray(jax.devices()[:4]).reshape(2,2),('x','y'))
@@ -202,6 +256,8 @@ def test_shared_pole_sentinel_refusal(tmp_path):
 
 
 if __name__=='__main__':
+    import faulthandler
+    faulthandler.dump_traceback_later(90, exit=True)
     from runtime import initialize_communicator_stack,run_main_and_finalize
     initialize_communicator_stack(platform='gpu')
     def main():
@@ -212,6 +268,7 @@ if __name__=='__main__':
         cells=[('roundtrip_local',check_roundtrip),
                ('roundtrip_distributed',lambda m,p:check_roundtrip(m,p,'distributed')),
                ('finalization_resume',check_finalization_resume),
+               ('empty_parents',check_empty_parents),
                ('corruption',check_corruption),('sentinel',check_sentinel_refusal)]
         receipts=[]
         for name,check in cells:

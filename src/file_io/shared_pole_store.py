@@ -18,7 +18,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import rank0_transaction, psum_replicate
-from file_io.slab_io import SlabIO
+from file_io.slab_io import SlabIO, mesh_divisible_shape
 from file_io.commit_state import assert_committed, set_commit_state
 from symmetry_maps import QirrTables, validate_qirr_tables
 
@@ -251,8 +251,6 @@ def write_shared_pole_model(path, C, poles2, K, *, q_span, meta, tables,
     if any(header["written_q"][lo:hi]):
         _refuse("q_span already committed; never overwrite staged parents")
     width = int(K.max(initial=0))
-    if width == 0:
-        _refuse("empty batch has no supported physical pole")
     name = f"staging/q{lo}_{hi}"
     canonical = meta.mu_basis.unpack_axis(C, 1)
     canonical.block_until_ready()
@@ -267,10 +265,11 @@ def write_shared_pole_model(path, C, poles2, K, *, q_span, meta, tables,
             f.require_group(name)
     rank0_transaction(path, stage="shared_pole.stage_group", write=prepare_group)
     with SlabIO(path, mode="a", mesh=mesh) as io:
-        io.create_dataset(name + "/factor", shape=(hi-lo, header["n_mu_logical"], 1, width), dtype=np.complex128)
-        io.create_dataset(name + "/poles2", shape=(hi-lo, width), dtype=np.float64)
-        io.write_slab(name + "/factor", canonical)
-        io.write_slab(name + "/poles2", poles2)
+        if width:
+            io.create_dataset(name + "/factor", shape=(hi-lo, header["n_mu_logical"], 1, width), dtype=np.complex128)
+            io.create_dataset(name + "/poles2", shape=(hi-lo, width), dtype=np.float64)
+            io.write_slab(name + "/factor", canonical)
+            io.write_slab(name + "/poles2", poles2)
         header["written_q"][lo:hi] = [True] * (hi-lo)
         header["K"][lo:hi] = K.tolist()
         header["batches"].append({"lo": lo, "hi": hi, "width": width, "name": name})
@@ -315,16 +314,27 @@ def _finalize_model(path, *, meta, header):
         for batch in header["batches"]:
             # One parent at a time; no all-parent carrier to discover Kmax.
             for q in range(batch["lo"], batch["hi"]):
-                factor = io.read_slab(batch["name"] + "/factor",
-                    shape=(1, basis.n_canonical, 1, kmax),
-                    offset=(q-batch["lo"], 0, 0, 0), partition_spec=P(None,"x",None,None))
-                poles = io.read_slab(batch["name"] + "/poles2",
-                    shape=(1, kmax), offset=(q-batch["lo"],0), partition_spec=P())
+                spec = P(None, "x", None, "y")
+                read_shape = mesh_divisible_shape(
+                    (1, basis.n_canonical, 1, kmax), mesh, spec)
+                if kmax == 0:
+                    continue
+                if batch["width"]:
+                    factor = io.read_slab(batch["name"] + "/factor",
+                        shape=read_shape,
+                        offset=(q-batch["lo"], 0, 0, 0), partition_spec=spec)
+                    poles = io.read_slab(batch["name"] + "/poles2",
+                        shape=(1, kmax), offset=(q-batch["lo"],0), partition_spec=P())
+                else:
+                    factor = jax.jit(lambda: jnp.zeros(read_shape, jnp.complex128),
+                                     out_shardings=NamedSharding(mesh, spec))()
+                    poles = jnp.ones((1,kmax), jnp.float64)
                 active = jnp.arange(kmax)[None,:] < header["K"][q]
                 poles = jnp.where(active, poles, 1.0)
                 io.write_slab("factor", factor, offset=(q,0,0,0))
                 io.write_slab("poles2_ry2", poles, offset=(q,0))
                 io.sync_writes()
+                del factor, poles
         io.write_attr("K", np.asarray(header["K"], np.int64))
         _write_header(io, header)
     header["digest"] = _model_digest(path, header, mesh)
@@ -344,32 +354,51 @@ def _finalize_model(path, *, meta, header):
 def _model_digest(path, header, mesh):
     """Grid-independent SHA256 of metadata and canonical row digests.
 
-    Read one q factor face at a time through SlabIO. Only row hashes (32 bytes
-    per centroid) are exchanged; a full factor is never gathered onto a rank.
+    Read one q and a bounded column panel through SlabIO. Each canonical row
+    hash is updated in column order, so neither column partition nor mesh
+    changes the digest. Only row hashes (32 bytes per centroid) are exchanged.
     """
     identity = {k:v for k,v in header.items() if k not in
                 ("digest", "finalized", "batches", "staging_payload_bytes", "peak_payload_bytes")}
     digest = hashlib.sha256(_json(identity).encode())
     nmu, kmax = header["n_mu_logical"], header["Kmax"]
     ncan = ((nmu + int(mesh.size)-1)//int(mesh.size))*int(mesh.size)
+    column_cap = max(1, (kmax + int(mesh.shape["y"])-1)//int(mesh.shape["y"]))
     with SlabIO(path, mode="r", mesh=mesh) as io:
         for q in range(header["n_q_irr"]):
-            C = io.read_slab("factor", shape=(1,ncan,1,kmax), offset=(q,0,0,0),
-                             partition_spec=P(None,"x",None,None))
+            if kmax == 0:
+                if header["K"][q] != 0:
+                    _refuse("nonzero K in empty model")
+                digest.update(hashlib.sha256(b"").digest() * nmu)
+                continue
             poles = io.read_slab("poles2_ry2", shape=(1,kmax), offset=(q,0), partition_spec=P())
-            _check_factor(C, poles, np.asarray([header["K"][q]], np.int64))
+            host_poles = np.asarray(poles)
+            active_count = header["K"][q]
+            if np.any(np.diff(host_poles[0, :active_count]) < 0):
+                _refuse("active poles are unsorted across column panels")
+            hashers = {}
+            for c0 in range(0, kmax, column_cap):
+                c1 = min(kmax, c0+column_cap)
+                C = io.read_slab("factor", shape=(1,ncan,1,c1-c0), offset=(q,0,0,c0),
+                                 partition_spec=P(None,"x",None,None))
+                count = np.asarray([max(0, min(c1-c0, active_count-c0))], np.int64)
+                _check_factor(C, poles[:,c0:c1], count)
+                local = None
+                for shard in C.addressable_shards:
+                    if shard.replica_id != 0:
+                        continue
+                    start = shard.index[1].start or 0
+                    local = np.asarray(shard.data)[0,:,0,:]
+                    for i in range(min(local.shape[0], nmu-start)):
+                        hasher = hashers.setdefault(start+i, hashlib.sha256())
+                        hasher.update(np.asarray(local[i], dtype="<c16").tobytes())
+                del C, shard, local
             row_hash = np.zeros((nmu,32), np.uint32)
-            for shard in C.addressable_shards:
-                if shard.replica_id != 0:
-                    continue
-                start = shard.index[1].start or 0
-                local = np.asarray(shard.data)[0,:,0,:]
-                for i in range(min(local.shape[0], nmu-start)):
-                    row_hash[start+i] = np.frombuffer(hashlib.sha256(
-                        np.asarray(local[i], dtype="<c16").tobytes()).digest(), np.uint8)
+            for row, hasher in hashers.items():
+                row_hash[row] = np.frombuffer(hasher.digest(), np.uint8)
             row_hash = psum_replicate(row_hash, mesh)
             digest.update(row_hash.astype(np.uint8).tobytes())
-            digest.update(np.asarray(poles, dtype="<f8").tobytes())
+            digest.update(np.asarray(host_poles, dtype="<f8").tobytes())
     return digest.hexdigest()
 
 
@@ -383,8 +412,7 @@ def validate_shared_pole_model(path, *, expected_identity, mesh_xy):
     _check_identity(header["identity"], expected_identity)
     if header["schema"] != SCHEMA or not header["finalized"] or not all(header["written_q"]):
         _refuse("missing final shared-pole commit or incomplete q census")
-    qt = QirrTables(**{k:np.asarray(header["qirr"][k]) for k in _TABLE_KEYS},
-                    n_sym_spatial=header["qirr"]["n_sym_spatial"])
+    qt = shared_pole_qirr_tables(header)
     validate_qirr_tables(qt, header["n_q_irr"], header["n_mu_logical"])
     with h5py.File(path, "r") as f:
         for name, shape, dtype in (
@@ -414,6 +442,32 @@ def validate_shared_pole_model(path, *, expected_identity, mesh_xy):
     return header
 
 
+def shared_pole_qirr_tables(header):
+    """Return the existing symmetry-service table in canonical logical order.
+
+    Runtime endpoint packing/locality certification stays with mu_basis and
+    symmetry_maps; the store never invents a second star-action table.
+    """
+    return QirrTables(
+        **{k:np.asarray(header["qirr"][k]) for k in _TABLE_KEYS},
+        n_sym_spatial=header["qirr"]["n_sym_spatial"]).canonical()
+
+
+def read_shared_pole_census(io, *, header):
+    """Return replicated float64 poles² [Nq,Kmax] and int64 counts [Nq].
+
+    This O(Nq*Kmax) metadata is the window planner's census, not factor data.
+    Counts mask every padded prefix; the sentinel is never a physical pole.
+    """
+    if header["schema"] != SCHEMA or not header["finalized"]:
+        _refuse("pole census requires a validated finalized model")
+    poles = (io.read_slab("poles2_ry2", partition_spec=P()) if header["Kmax"]
+             else jnp.ones((header["n_q_irr"],0),jnp.float64))
+    counts = jnp.asarray(header["K"], dtype=jnp.int64)
+    active = jnp.arange(header["Kmax"])[None,:] < counts[:,None]
+    return jnp.where(active, poles, 1.0), counts
+
+
 def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
     """Read canonical row faces and pack once at the I/O boundary.
 
@@ -427,6 +481,12 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
         _refuse("face reader requires a validated finalized model")
     basis = _check_basis(meta, header)
     lo, hi = _span(q_span, header["n_q_irr"], "q_span")
+    if header["Kmax"] == 0 and column_span is None:
+        shape = (hi-lo,basis.n_packed,1,0)
+        faces = [jax.jit(lambda: jnp.zeros(shape,jnp.complex128),
+                         out_shardings=NamedSharding(io.mesh,P(None,axis,None,None)))()
+                 for axis in ("x","y")]
+        return (*faces,jnp.ones((hi-lo,0),jnp.float64),jnp.zeros(hi-lo,jnp.int64))
     c0, c1 = _span(column_span or (0,header["Kmax"]), header["Kmax"], "column_span")
     counts = jnp.asarray(np.clip(np.asarray(header["K"][lo:hi])-c0,0,c1-c0), dtype=jnp.int64)
     active = jnp.arange(c1-c0)[None,:] < counts[:,None]
@@ -438,11 +498,12 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
         C = basis.pack_axis(C, 1, spec=spec)
         faces.append(jnp.where(active[:,None,None,:] & jnp.asarray(
             basis.active_mask)[None,:,None,None], C, 0.0))
+        del C
     poles = io.read_slab("poles2_ry2", shape=(hi-lo,c1-c0), offset=(lo,c0), partition_spec=P())
     return (*faces, jnp.where(active,poles,1.0), counts)
 
 
-# Append to file_io/shared_pole_store.py. Uses its common metadata helpers.
+# Scratch bank uses the same identity and metadata transactions.
 _BANK_SAMPLE_FIELDS = ("Wc", "dWc_ds")
 _BANK_MOMENT_FIELDS = ("M1", "M3")
 
@@ -477,6 +538,8 @@ def _bank_plan(recipe):
         _refuse("scratch plan arrays must have equal nonempty flat lengths")
     if not np.isin(plan["role"], list(codes.values())).all():
         _refuse("scratch plan has unnamed role codes")
+    if np.any(plan["role"] == codes["infinity"]):
+        _refuse("infinity is a reserved moment role, not a bank sample")
     finite = plan["role"] != codes["infinity"]
     if (not np.isfinite(plan["z_ry"][finite]).all()
             or np.any(plan["distinct_id"][finite] < 0)):
@@ -489,6 +552,21 @@ def _bank_plan(recipe):
         rows = finite & (plan["distinct_id"] == idx)
         if len(np.unique(plan["z_ry"][rows])) != 1:
             _refuse("scratch evaluation ID aliases different physical points")
+        if len(np.unique(plan["held"][rows])) != 1:
+            _refuse("scratch evaluation is both held and fitted")
+    for name in ("support_pair", "fit_ids", "held_ids"):
+        if name not in recipe:
+            _refuse(f"scratch plan lacks canonical {name}")
+        raw = np.asarray(recipe[name])
+        if isinstance(recipe[name], np.ndarray) and raw.dtype != np.int64:
+            _refuse(f"scratch plan {name} must have dtype int64")
+        plan[name] = np.asarray(raw, dtype=np.int64)
+    if plan["support_pair"].shape != (n, 2):
+        _refuse("scratch support_pair must have shape (N,2)")
+    for name, held in (("fit_ids", False), ("held_ids", True)):
+        expected = np.unique(plan["distinct_id"][plan["held"] == held])
+        if not np.array_equal(np.sort(plan[name]), expected):
+            _refuse(f"scratch {name} contradicts typed role rows")
     plan["role_codes"] = codes
     return plan
 
@@ -547,7 +625,7 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
             io.create_dataset(field, shape=(nq, d, d), dtype=np.complex128)
         io.write_attr("sample_written", np.asarray(header["sample_written"], dtype=np.bool_))
         io.write_attr("moment_written", np.asarray(header["moment_written"], dtype=np.bool_))
-        for name in ("z_ry", "role", "distinct_id", "held"):
+        for name in ("z_ry", "role", "distinct_id", "held", "support_pair", "fit_ids", "held_ids"):
             io.write_attr(name, plan[name])
         io.write_attr("role_codes_json", np.bytes_(_json(plan["role_codes"])))
         _write_metadata(io, header)
@@ -591,7 +669,7 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
             _refuse("scratch bank sample transaction mismatch")
         if not np.array_equal(file["moment_written"][()], moments):
             _refuse("scratch bank moment transaction mismatch")
-        for name in ("z_ry", "role", "distinct_id", "held"):
+        for name in ("z_ry", "role", "distinct_id", "held", "support_pair", "fit_ids", "held_ids"):
             if (name not in file or file[name].shape != plan[name].shape
                     or file[name].dtype != plan[name].dtype
                     or not np.array_equal(file[name][()], plan[name], equal_nan=True)):
