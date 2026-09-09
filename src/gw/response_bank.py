@@ -524,7 +524,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
     from file_io.shared_pole_store import write_shared_pole_bank
     header, qids, census = _bank_context(wfns, meta, sym, bank_io, mesh_xy)
     receipt = _receipt("moments", census, bank_io)
-    execute = _bank_execution(meta, mesh_xy, bank_io, receipt)
+    execute = _bank_execution(meta, mesh_xy, bank_io, receipt, config)
     ledger = meta.shared_pole_capacity
     ambient = ledger.live_stages
     started = time.monotonic()
