@@ -32,7 +32,10 @@ from runtime.padding import pad_to_axis
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                             CROSSING_NODE_FLOOR,
                             build_shared_sigma_windows,
-                            summarize_sigma_poles, shared_pole_intervals)
+                            summarize_sigma_poles,
+                            shared_pole_frequencies,
+                            shared_pole_intervals,
+                            summarize_shared_poles)
 
 
 # The pane route is an immutable comparison instrument, not a production
@@ -223,6 +226,71 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         return zeros() if total is None else total
 
     return build
+
+
+def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
+    """Admit factor panels against the caller's aggregate live-byte ledger.
+
+    The canonical current-map CapacityLedger owns aggregate admission.
+    Explicit caller-bound live_stages entries charge caller-live ψ/G/Σ
+    and compiled FFT/native workspace. This stage chooses actual q/K panels
+    from their remaining envelope and reserves before any face allocation.
+    Missing accounting refuses; DESIGN §0/§4 defines the aggregate limit.
+    """
+    capacity = getattr(meta, "shared_pole_capacity", None)
+    if capacity is None:
+        raise ValueError("GATE shared_pole_capacity: missing current-map CapacityLedger")
+    concurrent = capacity.live_stages  # Unbound is unknown, never zero.
+    accepted = {row["stage"]: row for row in capacity.entries
+                if row["status"] == "PASS"}
+    caller_bytes = sum(accepted[name][key] for name in concurrent for key in
+                       ("resident_bytes_per_rank", "workspace_bytes_per_rank"))
+    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    n, m = int(header["n_mu_logical"]), int(meta.mu_basis.n_packed)
+    spin, Q = int(header["nspinor"]), int(header["n_q_full"])
+    nq, kmax = int(header["n_q_irr"]), int(header["Kmax"])
+    U = capacity.U_bytes_per_rank
+    if U != 16 * Q * (spin * n) ** 2 / (px * py):
+        raise ValueError("GATE shared_pole_capacity: store/current-map geometry mismatch")
+    full_w = 16 * Q * (spin * m) ** 2 / (px * py)
+    parent_bytes = 16 * (spin * m) ** 2 / (px * py)
+    parent_map = np.asarray(header["qirr"]["irr_idx_q"], dtype=np.int32)
+    best = None
+    for b in range(1, nq + 1):
+        children = max(int(np.count_nonzero((parent_map >= lo)
+                       & (parent_map < min(lo + b, nq)))) for lo in range(0, nq, b))
+        # Two orientations and the bounded child output may coexist with
+        # full W. Weighted/conjugated faces and scalar masks are included.
+        fixed = caller_bytes + full_w + (2 * b + children) * parent_bytes + 8 * b
+        per_column = 16 * b * spin * m * (3 / px + 2 / py) + 64 * b
+        c = min(kmax, int(max(0, capacity.limit_bytes_per_rank - fixed) // per_column))
+        if c < 1:
+            continue
+        cost = ((nq + b - 1) // b) * ((kmax + c - 1) // c)
+        candidate = (cost, -b * c, b, c, fixed + c * per_column)
+        if best is None or candidate[:2] < best[:2]:
+            best = candidate
+    if best is None:
+        # Record the actual minimum-panel refusal in the one ledger, too.
+        children = max(int(np.count_nonzero(parent_map == q)) for q in range(nq))
+        workspace = ((2 + children) * parent_bytes + 8
+                     + 16 * spin * m * (3 / px + 2 / py) + 64)
+        capacity.reserve(
+            "sigma.synthesis", resident_bytes_per_rank=int(full_w),
+            workspace_bytes_per_rank=int(np.ceil(workspace)),
+            concurrent_with=concurrent)
+        raise AssertionError("capacity admitted a panel rejected by its own envelope")
+    _, _, b, c, peak = best
+    receipt = capacity.reserve(
+        "sigma.synthesis", resident_bytes_per_rank=int(full_w),
+        workspace_bytes_per_rank=int(np.ceil(peak - caller_bytes - full_w)),
+        concurrent_with=concurrent)
+    return dict(status=receipt["status"], unit_bytes=U,
+                peak_live_bytes_per_rank=receipt["aggregate_bytes_per_rank"],
+                peak_in_U=receipt["aggregate_bytes_per_rank"] / U,
+                parent_capacity=b, column_capacity=c,
+                caller_live_bytes_per_rank=caller_bytes, capacity_receipt=receipt,
+                compiled_peak_status="NOT_MEASURED")
 
 
 def _resolve_debug_max_tau_dispatches(*, print_fn=print):
@@ -573,7 +641,7 @@ def _integrate_sigma_batches(
                 max_d, float(jax.device_get(jnp.max(jnp.abs(B_odd)))))
             if odd_residue_off:
                 B_odd = jnp.zeros_like(B_odd)
-        width = int(Omega.shape[0])
+        width = 0 if w_synthesis is not None else int(Omega.shape[0])
         batch = tuple(range(int(lo), int(lo) + width))
         for row in plan:
             selected = (
@@ -586,7 +654,8 @@ def _integrate_sigma_batches(
                 device_put_process_local(x, small)
                 for x in (pole_indices, bounds, phase_real))
             win = row.window
-            B_branch = _residue_for_space(row.space, B, B_odd)
+            B_branch = (None if w_synthesis is not None else
+                        _residue_for_space(row.space, B, B_odd))
             weight = getattr(row, "band_weight", None)
             if weight is None:
                 selector = jnp.asarray(win.mask_A)
@@ -897,6 +966,7 @@ def compute_sigma_c_mpa_omega_grid(
     band_brackets=None,
     band_counts=None,
     fixed_quadrature_session=None,
+    sigma_w_model="mpa",
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -922,11 +992,29 @@ def compute_sigma_c_mpa_omega_grid(
     ``band_counts`` similarly carry the optional disjoint band-convergence
     partition.  They change neither pole interpretation nor window planning.
     """
-    ledger = validate_fit_store(
-        fit_src, expected_identity=fit_identity,
-        expected_screening_diagrams=expected_screening_diagrams)
-    n_poles = int(ledger["n_p"])
-    ordered_residues = bool(ledger["ordered_residues"])
+    if sigma_w_model not in ("mpa", "shared_pole"):
+        raise ValueError(f"sigma_w_model must be mpa or shared_pole; got {sigma_w_model!r}")
+    shared_pole = sigma_w_model == "shared_pole"
+    if shared_pole:
+        from file_io.shared_pole_store import validate_shared_pole_model
+        from file_io.slab_io import SlabIO
+        ledger = validate_shared_pole_model(
+            fit_src, expected_identity=fit_identity, mesh_xy=mesh_xy)
+        recipe = meta.shared_pole_recipe
+        if not np.isclose(regularization_width_ry * RYD_TO_EV,
+                          recipe["eta_ev"], rtol=0, atol=1e-12):
+            raise ValueError("GATE shared_pole_eta: Sigma and current recipe eta differ")
+        quadrature_eps = float(recipe["sigma_tolerance"])
+        n_poles = int(ledger["n_q_irr"])
+        ordered_residues = False
+        schedule = _shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy)
+        print_fn(f"  shared-pole Sigma capacity: {schedule}")
+    else:
+        ledger = validate_fit_store(
+            fit_src, expected_identity=fit_identity,
+            expected_screening_diagrams=expected_screening_diagrams)
+        n_poles = int(ledger["n_p"])
+        ordered_residues = bool(ledger["ordered_residues"])
     odd_residue_off = _resolve_mpa_odd_residue_debug(
         ordered_residues, print_fn=print_fn)
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
@@ -936,6 +1024,8 @@ def compute_sigma_c_mpa_omega_grid(
         occupation_window_threshold=occupation_window_threshold)
         if sigma_branches is None else tuple(sigma_branches))
     plan_mode = resolve_sigma_plan()
+    if shared_pole and plan_mode != "box":
+        raise ValueError("shared-pole Sigma requires the production box planner")
     # ONE collective handle for the census walk, the planner, and the
     # executor walk — the whole Σ stage of this iteration.  The reader
     # does its h5py reads (ledger, unfold tables) before that handle
@@ -944,12 +1034,24 @@ def compute_sigma_c_mpa_omega_grid(
     # (audit A1; hdf5_owner enforces it).  The context manager is the
     # release path: a refusal from the planner or the executor must still
     # close the handle on every rank.
-    with open_pole_reader(fit_src, mesh_xy=mesh_xy) as reader:
+    with (SlabIO(fit_src, mode="r", mesh=mesh_xy) if shared_pole else
+          open_pole_reader(fit_src, mesh_xy=mesh_xy)) as reader:
         # One bounded extrema census serves both routes.  In particular, the
         # production route does not read residues into a host histogram and
         # never constructs a sampled state-pole lattice.
         summaries = []
-        for lo in range(0, n_poles, int(pole_batch_size)):
+        if shared_pole:
+            poles2 = np.asarray(jax.device_get(reader.read_slab(
+                "poles2_ry2", shape=(n_poles, int(ledger["Kmax"])),
+                offset=(0, 0), partition_spec=P())), dtype=np.float64)
+            counts = np.asarray(ledger["K"], dtype=np.int64)
+            frequencies = shared_pole_frequencies(poles2, counts)
+            summaries = summarize_shared_poles(
+                poles2, counts, branches,
+                regularization_width_ry=regularization_width_ry,
+                edge_factor=edge_factor,
+                occupation_window_threshold=occupation_window_threshold)
+        for lo in (() if shared_pole else range(0, n_poles, int(pole_batch_size))):
             hi = min(lo + int(pole_batch_size), n_poles)
             Omega, B, B_odd = reader.read(
                 slice(lo, hi), unfold=True, return_sharded=True,
@@ -989,7 +1091,7 @@ def compute_sigma_c_mpa_omega_grid(
                     reduction_steps=quadrature_reduction_steps,
                     cache_dir=quadrature_cache_dir,
                     print_fn=print_fn, edge_factor=edge_factor,
-                    fixed_rule_session=fixed_quadrature_session)
+                    fixed_rule_session=(None if shared_pole else fixed_quadrature_session))
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
@@ -1046,11 +1148,21 @@ def compute_sigma_c_mpa_omega_grid(
                         f"noise={window['runtime_noise_bound']:.6g}/"
                         f"{window['runtime_noise_budget']:.6g}")
         with timing.section("sigma.tau_sweep"):
-            total = integrate_sigma_store(
-                wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
-                pole_batch_size=pole_batch_size, brackets=band_brackets,
-                band_counts=band_counts, odd_residue_off=odd_residue_off,
-                print_fn=print_fn)
+            if shared_pole:
+                synthesis = _shared_pole_w_synthesis(
+                    reader, meta, ledger, frequencies, schedule, mesh_xy=mesh_xy)
+                total = _integrate_sigma_batches(
+                    wfns, ((0, None, None, None),), n_poles, plan,
+                    omega_grid_ry, meta, mesh_xy, pole_batch_size=n_poles,
+                    brackets=band_brackets, band_counts=band_counts,
+                    w_synthesis=synthesis, print_fn=print_fn)
+                del synthesis
+            else:
+                total = integrate_sigma_store(
+                    wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
+                    pole_batch_size=pole_batch_size, brackets=band_brackets,
+                    band_counts=band_counts, odd_residue_off=odd_residue_off,
+                    print_fn=print_fn)
         if not ordered_residues:
             return total
         # Exact observability twin, shared in algebra with the GN arm in
