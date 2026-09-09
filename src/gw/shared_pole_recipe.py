@@ -58,7 +58,9 @@ _GATE_ROWS = {
     "full_m1_defect": ("maximum over q of relative full M1 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-4),
     "full_m3_defect": ("maximum over q of relative full M3 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-3),
     "representation": ("scalar N_spinor=1 and authenticated TRS allowed", {"nspinor": 1, "trs_allowed": True}),
-    "capacity": ("aggregate live bytes per rank including workspace <= threshold * U", 3.0),
+    "capacity": ("aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U", 3.0),
+    "stream_peak": ("inherited response stream peak <= threshold * incumbent MPA stream peak on the same deck and processor geometry, using the same measurement method", 1.05),
+    "sigma_peak": ("inherited Sigma peak including one incumbent-shaped W <= threshold * incumbent MPA Sigma peak on the same deck, processor geometry and window plan, using the same measurement method", 1.05),
     "rule_validity": ("bank and Sigma certificates cover current domains at resolved tolerances", True),
     "sc_rebuild": ("samples, directions, poles, ranks, intervals and rules rebuilt at current bands and occupations", True),
 }
@@ -130,7 +132,7 @@ class CapacityLedger:
     mesh_xy : Mesh
         Named processor axes x/y. U=16*Q*(spin*mu)^2/(Px*Py) bytes/rank.
 
-    Each reservation owns disjoint resident/workspace bytes computed by its
+    Each reservation owns disjoint device resident/workspace bytes computed by its
     caller for its ACTUAL batch sizes, including packing and native workspace.
     ``concurrent_with`` names earlier reservations simultaneously live with it;
     each named footprint is counted once. Historical concurrency is not carried
@@ -138,6 +140,8 @@ class CapacityLedger:
     Sequential stages omit predecessors. Stage names must be unique (include
     batch/phase identifiers when necessary). A refusal is recorded but does not
     create a usable reservation. The ledger owns no arrays or memory allocator.
+    Host I/O staging is reported separately by the store, which refuses a host
+    copy larger than its device panel (coordinator ruling 11).
     """
 
     def __init__(self, meta, *, mesh_xy):
@@ -161,6 +165,8 @@ class CapacityLedger:
         self._accepted = {}
         self._live_stages = None
         self.measured_peak = gate_receipt('capacity', reason='measured peak not supplied')
+        self.stream_peak = gate_receipt('stream_peak', reason='same-deck incumbent comparison not supplied')
+        self.sigma_peak = gate_receipt('sigma_peak', reason='same-deck/window incumbent comparison not supplied')
 
     @property
     def live_stages(self):
@@ -246,7 +252,7 @@ class CapacityLedger:
         return copy.deepcopy(row)
 
     def record_measured_peak(self, bytes_per_rank, *, reason):
-        """Record an externally measured maximum over ranks, without guessing it."""
+        """Record the new-object maximum over ranks, excluding inherited stream."""
         peak = self._bytes(bytes_per_rank)
         if peak < self.measured_peak.get('bytes_per_rank', 0):
             return self.receipt()['measured_peak']
@@ -256,6 +262,50 @@ class CapacityLedger:
         self.measured_peak['bytes_per_rank'] = peak
         return self.receipt()['measured_peak']
 
+    def record_stream_peak(self, shared_bytes_per_rank, incumbent_bytes_per_rank, *, reason):
+        """Record the inherited stream comparison (coordinator ruling 9).
+
+        Both byte counts must use the same deck, mesh and measurement method;
+        ``reason`` names that scope and both evidence paths/job.steps. Missing
+        counts stay NOT_MEASURED. The inherited stream is not a reservation and
+        cannot be named in ``concurrent_with``. New bank outputs/batches still
+        enter ``reserve('bank_outputs', ...)`` and obey 3U.
+        """
+        return self._record_inherited_peak('stream_peak', shared_bytes_per_rank,
+                                           incumbent_bytes_per_rank, reason=reason)
+
+    def record_sigma_peak(self, shared_bytes_per_rank, incumbent_bytes_per_rank, *, reason):
+        """Record matched inherited Sigma footprint (coordinator ruling 12).
+
+        ``reason`` names the same deck, mesh, window plan and compile-only
+        measurement method with both evidence paths/job.steps. One W replacing
+        the incumbent W is inherited. Faces, weights, reader/routed panels,
+        unfold scratch and any simultaneous second W remain new reservations.
+        """
+        return self._record_inherited_peak('sigma_peak', shared_bytes_per_rank,
+                                           incumbent_bytes_per_rank, reason=reason)
+
+    def _record_inherited_peak(self, name, shared_bytes_per_rank, incumbent_bytes_per_rank, *, reason):
+        if getattr(self, name)['status'] != 'NOT_MEASURED':
+            raise ValueError(f"inherited {name} comparison already recorded for this map")
+        shared = None if shared_bytes_per_rank is None else self._bytes(shared_bytes_per_rank)
+        incumbent = None if incumbent_bytes_per_rank is None else self._bytes(incumbent_bytes_per_rank)
+        if incumbent == 0:
+            raise ValueError("incumbent peak must be positive")
+        threshold = shared_real_pole_gates_v1_r3b[name]['threshold']
+        passed = None if shared is None or incumbent is None else shared <= threshold * incumbent
+        row = gate_receipt(
+            name, {'shared_bytes_per_rank': shared,
+                   'incumbent_bytes_per_rank': incumbent},
+            passed=passed, reason=reason)
+        row.update(stage=name, geometry=dict(self.geometry))
+        setattr(self, name, row)
+        if passed is False:
+            raise MemoryError(f"GATE shared_pole_{name}: shared={shared} B/rank; "
+                              f"incumbent={incumbent} B/rank; limit={threshold} * incumbent; "
+                              f"geometry={self.geometry}; why: inherited {name} regressed")
+        return self.receipt()[name]
+
     def receipt(self):
         """Snapshot ordered stage rows and the independently measured peak."""
         import copy
@@ -263,7 +313,9 @@ class CapacityLedger:
                                   U_bytes_per_rank=self.U_bytes_per_rank,
                                   limit_bytes_per_rank=self.limit_bytes_per_rank,
                                   entries=self.entries, live_stages=self._live_stages,
-                                  measured_peak=self.measured_peak))
+                                  measured_peak=self.measured_peak,
+                                  stream_peak=self.stream_peak,
+                                  sigma_peak=self.sigma_peak))
 
 
 def construction_receipt(measurements=None, *, capacity=None):
@@ -286,6 +338,8 @@ def construction_receipt(measurements=None, *, capacity=None):
         if not isinstance(capacity, CapacityLedger):
             raise TypeError("construction receipt capacity must be the map's CapacityLedger")
         result['capacity'] = capacity.receipt()
+        result['gates'] = [result['capacity'][r['name']] if r['name'] in ('stream_peak', 'sigma_peak')
+                           else r for r in result['gates']]
         rows = result['capacity']['entries']
         measured = result['capacity']['measured_peak']
         values = [r['value'] for r in rows]
