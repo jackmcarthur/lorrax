@@ -564,6 +564,42 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
     return _finish_receipt(receipt,meta,header,started)
 
 
+def _bank_write_spans(marked, q0, sample0, qwidth):
+    """Partition uncommitted fields into disjoint rectangular writer spans.
+
+    ``marked[q,sample,field]`` is the host completion mask for one admitted
+    panel. Rows may share a transaction only when their field masks agree.
+    """
+    iq = 0
+    while iq < len(marked):
+        end = iq+1
+        while (end < min(len(marked),iq+qwidth)
+               and np.array_equal(marked[end],marked[iq])):
+            end += 1
+        ia = 0
+        while ia < marked.shape[1]:
+            fields = tuple(marked[iq,ia])
+            stop = ia+1
+            while stop < marked.shape[1] and tuple(marked[iq,stop]) == fields:
+                stop += 1
+            if not all(fields):
+                yield (q0+iq,q0+end),(sample0+ia,sample0+stop),fields
+            ia = stop
+        iq = end
+
+
+@partial(jax.jit, donate_argnums=(0,))
+def _replace_response_span(raw, value, derivative, iq, start):
+    """Reuse consumed chi/dchi storage for physical Wc/dWc; no arithmetic.
+
+    The donated carry is complex128 ``[2*sample,q,mu_x,mu_y]`` with
+    distributed x/y endpoints. Inputs are ``[sample,mu_x,mu_y]``.
+    """
+    raw = jax.lax.dynamic_update_slice(raw,value[:,None],(start,iq,0,0))
+    return jax.lax.dynamic_update_slice(
+        raw,derivative[:,None],(raw.shape[0]//2+start,iq,0,0))
+
+
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io):
     """Stage A: one windowed stream per admitted sample batch, all parent faces."""
     from file_io.shared_pole_store import write_shared_pole_bank
@@ -634,6 +670,25 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     # larger systems still split q/sample panels before any allocation.
     planning_limit = device_available
     available = planning_limit-headroom-live_bytes
+
+    @lru_cache(maxsize=None)
+    def write_width(qextent, samples_count):
+        # Price the canonical writer's actual conversion, without allocating
+        # another bank. Two payload slices remain live during either write;
+        # the writer also reserves its finite-check/conversion argument.
+        from file_io.shared_pole_store import _conversion_bytes
+        remaining = available-2*samples_count*qextent*face_bytes
+        width = qextent
+        while True:
+            shape = (width,samples_count,meta.mu_basis.n_packed,meta.mu_basis.n_packed)
+            arg,out,temp = _conversion_bytes(meta.mu_basis,shape,
+                P(None,None,"x","y"),unpack=True,operator=True)
+            if 3*arg+out+temp <= remaining:
+                return width
+            if width == 1:
+                raise ValueError("GATE response_capacity: one canonical bank write exceeds remaining device budget")
+            width = max(1,width//2)
+
     qwidth = min(len(qids),int((available-dense_bytes(1))//(2*face_bytes)))
     receipt["panel_budget"] = dict(
         scaling_target_bytes_per_rank=scaling_target,
@@ -707,16 +762,34 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     dchi = raw[a+ia-lo:a+stop-lo,iq-q0]
                     hbatch = jnp.broadcast_to(h,chi.shape)
                     value,ds = execute(samples,(hbatch,chi,dchi),"sample_dyson")
-                    value = None if marked[0] else value[None]
-                    ds = None if marked[1] else ds[None]
-                    io_started = time.monotonic()
-                    header = write_shared_pole_bank(bank_io["path"],q_span=span,
-                        sample_span=(ia,stop),Wc=value,dWc_ds=ds,meta=meta,
-                        expected_identity=bank_io["identity"],mesh_xy=mesh_xy)
-                    receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                    del value,ds,chi,dchi,hbatch
+                    del chi,dchi,hbatch
+                    update_started = time.monotonic()
+                    raw = _replace_response_span(raw,value,ds,iq-q0,ia-lo)
+                    raw.block_until_ready()
+                    receipt["seconds"]["bank_update"] = receipt["seconds"].get("bank_update",0.)+time.monotonic()-update_started
+                    del value,ds
                     ia = stop
                 del h
+            marked = np.asarray(header["sample_written"])[q0:q1,lo:hi]
+            for span,sample_span,fields in _bank_write_spans(
+                    marked,q0,lo,write_width(q1-q0,a)):
+                ia,stop = sample_span
+                wq0,wq1 = span
+                payload_bytes = 2*(wq1-wq0)*(stop-ia)*face_bytes
+                payload_name,_ = _reserve(meta,"bank_write_payload",payload_bytes)
+                ledger.live_stages = ambient+(name,payload_name)
+                io_started = time.monotonic()
+                value = (None if fields[0] else jnp.swapaxes(
+                    raw[ia-lo:stop-lo,wq0-q0:wq1-q0],0,1))
+                ds = (None if fields[1] else jnp.swapaxes(
+                    raw[a+ia-lo:a+stop-lo,wq0-q0:wq1-q0],0,1))
+                header = write_shared_pole_bank(bank_io["path"],q_span=span,
+                    sample_span=sample_span,Wc=value,dWc_ds=ds,meta=meta,
+                    expected_identity=bank_io["identity"],mesh_xy=mesh_xy)
+                receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                receipt.setdefault("write_spans",[]).append(dict(q_span=span,sample_span=sample_span))
+                del value,ds
+                ledger.live_stages = ambient+(name,)
             receipt["batches"].append(dict(q_span=(q0,q1),sample_span=(lo,hi)))
             del raw
     ledger.live_stages = ambient
