@@ -35,7 +35,35 @@ def check_reuse(mesh):
     assert float(jnp.max(jnp.abs(second[1][0]-2*first[1][0])))==0
     for factory in (_hermitian_part_kernel,_public_factor_kernel,_stack_model_kernel):
         assert factory(mesh) is factory(mesh)
-    return dict(status='PASS',scope='P4 ragged panel packing, current support/array red, identical signature executable reuse',pack_specializations=before)
+    # Parent identity and spectral counts must remain live without compiling
+    # another executable when only those small metadata values change.
+    from gw.shared_pole_constructor import _parent_panel_slice
+    from distrib_la.polar import _retained_column_kernel
+    panels=put(np.stack([np.full((8,8),i+1,np.complex128) for i in range(3)]))
+    take=_parent_panel_slice(mesh,4)
+    first_parent=take(panels,np.int32(0))
+    jax.block_until_ready(first_parent)
+    parent_specializations=take._cache_size()
+    next_parent=take(panels,np.int32(2))
+    jax.block_until_ready(next_parent)
+    assert take._cache_size()==parent_specializations
+    assert float(jnp.max(jnp.abs(next_parent-3*first_parent)))==0
+    select=_retained_column_kernel(mesh,True,4)
+    counts=jax.device_put(np.array([2,3,4],np.int64),NamedSharding(mesh,P()))
+    first_selection=select(panels,counts)
+    jax.block_until_ready(first_selection)
+    selection_specializations=select._cache_size()
+    changed_counts=jax.device_put(np.array([4,2,3],np.int64),NamedSharding(mesh,P()))
+    changed_selection=select(panels,changed_counts)
+    jax.block_until_ready(changed_selection)
+    assert select._cache_size()==selection_specializations
+    assert float(jnp.max(jnp.abs(changed_selection-first_selection)))>0
+    for i,count in enumerate((4,2,3)):
+        assert float(jnp.max(jnp.abs(changed_selection[i,:,:count]-(i+1))))==0
+        if count<4:
+            assert float(jnp.max(jnp.abs(changed_selection[i,:,count:])))==0
+    return dict(status='PASS',scope='P4 ragged panel packing, current support/array/parent/count reds, identical signature executable reuse',pack_specializations=before,
+                parent_specializations=parent_specializations,selection_specializations=selection_specializations)
 
 
 if __name__=='__main__':

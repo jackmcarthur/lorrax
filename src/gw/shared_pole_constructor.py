@@ -455,13 +455,28 @@ def _fit_roles(recipe):
 
 
 @lru_cache(maxsize=256)
-def _parent_panel_slice(mesh_xy, parent, width):
+def _parent_panel_slice(mesh_xy, width):
     """Slice [b,n,r] direction/action faces without a host or replicated seam."""
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
     return jax.jit(
-        lambda arrays: jax.tree.map(lambda a: a[parent:parent+1, :, :width], arrays),
+        lambda arrays, parent: jax.tree.map(
+            lambda a: jax.lax.dynamic_slice_in_dim(a, parent, 1, axis=0)[:, :, :width], arrays),
         out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
+
+
+
+@lru_cache(maxsize=None)
+def _parent_result_slice(mesh_xy):
+    """Slice a parent's padded factor and scalar receipts in one executable."""
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    scalar = NamedSharding(mesh_xy, P())
+    return jax.jit(
+        lambda result, parent: jax.tree.map(
+            lambda a: jax.lax.dynamic_slice_in_dim(a, parent, 1, axis=0), result),
+        out_shardings=((face, scalar, scalar), scalar, scalar, scalar))
 
 
 @lru_cache(maxsize=None)
@@ -504,6 +519,8 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
 
+    import numpy as np
+
     hermitian_part = _hermitian_part_kernel(eigh_plan.mesh)
     fit_roles = _fit_roles(recipe)
     states, masks, roles = [], [], []
@@ -537,9 +554,9 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
             widths = tuple(int(v.shape[-1]) for v in values)
             if any(width < 1 or width > logical_n for width in widths):
                 raise ValueError(f"GATE shared_pole_directions: got: ranks {widths}; want: 1..{logical_n}; why: empty or padded physical direction set")
-            slices = tuple(_parent_panel_slice(eigh_plan.mesh, i, column_extent(width))
+            slices = tuple(_parent_panel_slice(eigh_plan.mesh, column_extent(width))
                            for i, width in enumerate(widths))
-            directions = tuple(take(q_batch) for take in slices)
+            directions = tuple(take(q_batch, np.int32(i)) for i, take in enumerate(slices))
             s = _sample_point(recipe, int(sample_id)) ** 2
             # The conjugate state reuses exactly the same right directions.
             for conjugate in ((False, True) if kind == "line" and s.imag != 0 else (False,)):
@@ -548,9 +565,9 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
                 output = matmul(w, q_batch, transa=transa)
                 action = matmul(derivative, q_batch, transa=transa)
                 for i, (q, take, width) in enumerate(zip(directions, slices, widths)):
-                    out, deriv = take((output, action))
+                    out, deriv = take((output, action), np.int32(i))
                     states[i].append((s.conjugate() if conjugate else s, q, out, deriv))
-                    masks[i].append(jnp.arange(q.shape[-1]) < width)
+                    masks[i].append(np.arange(q.shape[-1]) < width)
                     roles[i].append({"sample_id": int(sample_id), "role": role["role"],
                                      "conjugate": conjugate, "width": width,
                                      "carrier_width": q.shape[-1]})
@@ -807,9 +824,11 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             del samples
             for i, values in enumerate(infinity_values):
                 ri = column_extent(values.shape[-1])
-                parent_infinity = _parent_panel_slice(mesh_xy, i, ri)(infinity)
-                masks[i].append(jnp.arange(ri) < values.shape[-1])
-                active_columns = jnp.concatenate(masks[i])[None]
+                parent_infinity = _parent_panel_slice(mesh_xy, ri)(infinity, np.int32(i))
+                masks[i].append(np.arange(ri) < values.shape[-1])
+                active_columns = jax.device_put(
+                    np.fromiter((v for mask in masks[i] for v in mask), dtype=bool)[None],
+                    NamedSharding(mesh_xy, P()))
                 pending.append((q_start+i, states[i], parent_infinity,
                                 active_columns, parent_infinity[0], roles[i]))
             jax.block_until_ready((states, infinity))
@@ -893,8 +912,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                     model, reduction, coefficients = reduce_shared_pole_pencil(
                         pencil, active_columns, eigh=reduce_eigh.batched, matmul=mm, gates=gates)
                 else:
-                    model, reduction, zero, retained = jax.tree.map(
-                        lambda a: a[slot:slot+1], batch_results)
+                    model, reduction, zero, retained = _parent_result_slice(mesh_xy)(
+                        batch_results, np.int32(slot))
                 del states, infinity
             timing.fence("spole.gates")
             with timing.section("spole.gates"):

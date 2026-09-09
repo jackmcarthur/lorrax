@@ -77,20 +77,17 @@ def _direction_input(W, eig, dilation=False):
 
 
 @lru_cache(maxsize=128)
-def _retained_column_kernel(mesh, count, extent):
-    """Reuse selection; a tuple of counts denotes independent batch rows."""
-    batched = isinstance(count, tuple)
+def _retained_column_kernel(mesh, batched, extent):
+    """Select a padded face; current per-row counts are runtime mask inputs."""
     tile = NamedSharding(mesh, P(*((None,) if batched else ()), 'x', 'y'))
-    largest = max(count) if batched else count
     @jax.jit(out_shardings=tile)
-    def select(q):
-        selected = q[..., ::-1][..., :largest]
+    def select(q, count):
+        width = min(extent, q.shape[-1])
+        selected = q[..., ::-1][..., :width]
         selected = jnp.pad(selected, ((0, 0),) * (q.ndim - 1)
-                           + ((0, extent - largest),))
-        if batched:
-            active = jnp.arange(extent)[None, :] < jnp.asarray(count)[:, None]
-            selected = jnp.where(active[:, None, :], selected, 0)
-        return selected
+                           + ((0, extent - width),))
+        active = jnp.arange(extent) < count[..., None]
+        return jnp.where(active[..., None, :], selected, 0)
     return select
 
 
@@ -100,10 +97,11 @@ def _retained_columns(Q, values, count, *, mesh, column_extent):
     extent = operator.index(column_extent(largest))
     if extent < largest or extent < 1 or extent % int(mesh.shape['y']):
         raise ValueError("column_extent must cover the rank and tile mesh y")
-    select = _retained_column_kernel(mesh, count, extent)
+    select = _retained_column_kernel(mesh, isinstance(count, tuple), extent)
     retained = (tuple(row[:n] for row, n in zip(values, count))
                 if isinstance(count, tuple) else values[:count])
-    return select(Q), jax.device_put(retained, NamedSharding(mesh, P()))
+    counts = jax.device_put(np.asarray(count, dtype=np.int64), NamedSharding(mesh, P()))
+    return select(Q, counts), jax.device_put(retained, NamedSharding(mesh, P()))
 
 
 @lru_cache(maxsize=16)
