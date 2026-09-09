@@ -305,7 +305,7 @@ def write_shared_pole_model(path, C, poles2, K, *, q_span, meta, tables,
     Parameters
     ----------
     C : jax.Array, complex128, (b, mu_p, spin, Kp)
-        Physical Ry^(3/2) factor; NamedSharding(mesh_xy,P(None,'x',None,'y')).
+        Physical Ry^(3/2) factor; mu is x-sharded, columns replicated or y-sharded.
     poles2 : jax.Array, float64, (b, Kp)
         Sorted squared poles in Ry², same padded column capacity as C.
     K : array, int64, (b,)
@@ -324,9 +324,12 @@ def write_shared_pole_model(path, C, poles2, K, *, q_span, meta, tables,
     """
     header = _metadata(meta, tables, recipe, receipts["identity"])
     mesh = meta.mu_basis.mesh_xy
-    want = NamedSharding(mesh, P(None, "x", None, "y"))
-    if not isinstance(C, jax.Array) or not C.sharding.is_equivalent_to(want, 4):
-        _refuse("constructor factor is not the declared XY handoff")
+    layouts = (P(None, "x", None, None), P(None, "x", None, "y"))
+    if not isinstance(C, jax.Array) or not any(
+            C.sharding.is_equivalent_to(NamedSharding(mesh, spec), 4)
+            for spec in layouts):
+        _refuse("constructor factor is not a declared row or XY handoff")
+    want = C.sharding
     if C.shape[1:3] != (meta.mu_basis.n_packed, 1):
         _refuse("factor does not use the current packed centroid basis")
     ledger = _capacity(meta)
@@ -407,7 +410,7 @@ def _finalize_model(path, *, meta, header):
     mesh, basis = meta.mu_basis.mesh_xy, meta.mu_basis
     nq, nmu = header["n_q_irr"], header["n_mu_logical"]
     kmax = max(header["K"])
-    panel = 16*basis.n_canonical*((kmax+int(mesh.shape["y"])-1)//int(mesh.shape["y"]))/int(mesh.shape["x"])
+    panel = 16*basis.n_canonical*kmax/int(mesh.shape["x"])
     batch_width = max(v["hi"] - v["lo"] for v in header["batches"])
     _admit(_capacity(meta), "finalize", batch_width*(int(panel)+24*kmax),
            device_panel=batch_width*max(int(panel),8*kmax), native_host=True)
@@ -422,7 +425,7 @@ def _finalize_model(path, *, meta, header):
             # Preserve the constructor's admitted q batch through finalization.
             # Kmax is already known from the committed census; no all-q carrier.
             lo, hi = batch["lo"], batch["hi"]
-            spec = P(None, "x", None, "y")
+            spec = P(None, "x", None, None)
             read_shape = mesh_divisible_shape(
                 (hi-lo, basis.n_canonical, 1, kmax), mesh, spec)
             if kmax == 0:

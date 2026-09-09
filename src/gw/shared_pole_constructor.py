@@ -437,13 +437,17 @@ def _public_factor_kernel(mesh):
 
 @lru_cache(maxsize=None)
 def _stack_model_kernel(mesh):
-    """Stack the current admitted factor/pole/count batch on named layouts."""
+    """Stack the admitted batch, gathering factor columns once at export.
+
+    The row-sharded factor matches the store reader; physics remains XY.
+    The store prices the actual replicated-column handoff before conversion.
+    """
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
     return jax.jit(
         lambda parts: tuple(jnp.concatenate([row[i] for row in parts], axis=0)
                             for i in range(3)),
-        out_shardings=(NamedSharding(mesh, P(None, 'x', None, 'y')),
+        out_shardings=(NamedSharding(mesh, P(None, 'x', None, None)),
                        NamedSharding(mesh, P()), NamedSharding(mesh, P())))
 
 
@@ -931,6 +935,15 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             del public_c, poles, counts
         batch_width = len(selected)
         capacity(ready_models[0][0].shape[-1], phase="model")
+        # Admit the row-sharded export before its column gather executes.
+        export_shape = (batch_width, *ready_models[0][0].shape[1:])
+        export_layout = NamedSharding(mesh_xy, P(None, "x", None, None))
+        export_bytes = (int(np.prod(export_layout.shard_shape(export_shape)))
+                        * ready_models[0][0].dtype.itemsize)
+        ledger.reserve(f"constructor.export.{len(ledger.entries)}",
+                       resident_bytes_per_rank=export_bytes,
+                       workspace_bytes_per_rank=export_bytes,
+                       concurrent_with=(*upstream, ledger.entries[-1]["stage"]))
         public_c, poles, counts = stack_models(tuple(ready_models))
         expose_live((public_c, poles, counts))
         span = (selected[0][0], selected[-1][0] + 1)
