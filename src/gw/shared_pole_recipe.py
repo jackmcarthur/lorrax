@@ -133,7 +133,8 @@ class CapacityLedger:
     Each reservation owns disjoint resident/workspace bytes computed by its
     caller for its ACTUAL batch sizes, including packing and native workspace.
     ``concurrent_with`` names earlier reservations simultaneously live with it;
-    their concurrency dependencies are included transitively, counted once.
+    each named footprint is counted once. Historical concurrency is not carried
+    forward: callers name all allocations live in the current phase.
     Sequential stages omit predecessors. Stage names must be unique (include
     batch/phase identifiers when necessary). A refusal is recorded but does not
     create a usable reservation. The ledger owns no arrays or memory allocator.
@@ -191,7 +192,7 @@ class CapacityLedger:
         for name in concurrent_with:
             if name not in self._accepted:
                 raise ValueError(f"capacity concurrent stage {name!r} has no accepted reservation")
-            live.update(self._accepted[name]['live_stages'])
+            live.add(name)
         resident = self._bytes(resident_bytes_per_rank)
         workspace = self._bytes(workspace_bytes_per_rank)
         total = resident + workspace + sum(

@@ -34,7 +34,7 @@ class CapacityTests(unittest.TestCase):
             self.assertEqual(ledger.reserve(stage,resident_bytes_per_rank=768,
                              workspace_bytes_per_rank=0)['status'],'PASS')
 
-    def test_transitive_concurrency_deduplicates(self):
+    def test_explicit_concurrency_deduplicates_without_stale_lifetimes(self):
         ledger=self.ledger()
         ledger.reserve('inputs',resident_bytes_per_rank=256,workspace_bytes_per_rank=64)
         ledger.reserve('bank',resident_bytes_per_rank=128,workspace_bytes_per_rank=0,
@@ -42,9 +42,12 @@ class CapacityTests(unittest.TestCase):
         row=ledger.reserve('fit',resident_bytes_per_rank=256,workspace_bytes_per_rank=0,
                            concurrent_with=('inputs','bank','inputs'))
         self.assertEqual(row['aggregate_bytes_per_rank'],704)
+        later=ledger.reserve('later',resident_bytes_per_rank=65,workspace_bytes_per_rank=0,
+                             concurrent_with=('fit',))
+        self.assertEqual(later['aggregate_bytes_per_rank'],321)
         with self.assertRaises(MemoryError):
             ledger.reserve('extra',resident_bytes_per_rank=65,workspace_bytes_per_rank=0,
-                           concurrent_with=('fit',))
+                           concurrent_with=('inputs','bank','fit'))
 
     def test_unreserved_and_failed_dependencies_refuse(self):
         ledger=self.ledger()
