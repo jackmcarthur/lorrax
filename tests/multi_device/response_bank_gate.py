@@ -20,7 +20,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import resolve_mesh, gather_to_host
-from gw.response_bank import response_algebra, exact_bare_moments
+from gw.response_bank import response_algebra, exact_bare_moments, _coulomb_algebra
 from gw.w_isdf import _get_chi_fractional_contour_kernel_face
 from gw.wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
 
@@ -82,6 +82,23 @@ def main():
         row["red_double_prefactor"] = error(wrong, expected)
         assert min(row[key] for key in row if key.startswith("red_")) > 0.1
         assert w.sharding.spec == P(None, "x", "y")
+        root_v = _coulomb_algebra(mesh, n, n, layout)
+        got_h, got_hi, negative, ranks = root_v(put(v))
+        row["coulomb_root"] = error(got_h, h)
+        row["coulomb_inverse"] = error(got_hi, np.linalg.inv(h))
+        assert not bool(negative) and np.all(np.asarray(ranks) == n)
+        singular_h = h.copy()
+        singular_h[:, -2:, :] = 0
+        singular_h[:, :, -2:] = 0
+        got_h, got_hi, negative, ranks = root_v(put(singular_h @ singular_h))
+        row["coulomb_supported_root"] = error(got_h, singular_h)
+        row["coulomb_supported_inverse"] = error(got_hi, np.linalg.pinv(singular_h))
+        assert not bool(negative) and np.all(np.asarray(ranks) == n - 2)
+        bad_v = singular_h @ singular_h
+        bad_v[:, -1, -1] = -0.1
+        _, _, negative, _ = root_v(put(bad_v))
+        assert bool(negative), "negative Coulomb eigenvalue was accepted"
+        assert max(row[key] for key in row if key.startswith("coulomb_")) < 1e-11
         row["memory"] = str(executable.memory_analysis())
         row["plan"] = receipt
         results[layout] = row
@@ -116,6 +133,20 @@ def main():
     assert actual.sharding.spec == P(None, None, "x", "y")
     results["selected_stream"] = dict(relative=relative,
         shape=list(actual.shape), memory=str(executable.memory_analysis()))
+
+    carry_kernel = _get_chi_fractional_contour_kernel_face(
+        mesh, (2,2,2), 2, (nk,nb,n,1), selected_q=(0,3,7), bank_carry=True)
+    carry_shard = NamedSharding(mesh,P(None,None,"x","y"))
+    carry = put(np.zeros((2,3,n,n),complex),carry_shard)
+    carry_executable = carry_kernel.lower(*args,carry).compile()
+    carried = carry_executable(*args,carry)
+    twice = carry_executable(*args,carried)
+    carry_error = float(gather_to_host(jnp.linalg.norm(jnp.swapaxes(twice,0,1)-2*reference)
+                                      /jnp.linalg.norm(2*reference)))
+    assert carry_error < 1e-11, carry_error
+    assert carry_executable.memory_analysis().alias_size_in_bytes > 0
+    results["donated_carry"] = dict(relative=carry_error,
+        memory=str(carry_executable.memory_analysis()))
 
     # Remote Laplace cell, independently summed over lower/upper band pairs.
     real_psi = psi.real.astype(np.complex128)

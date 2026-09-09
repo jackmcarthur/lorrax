@@ -873,7 +873,7 @@ def _get_chi_fractional_contour_kernel_legacy(
 
 def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
-    *, k_unfold_plan=None, selected_q=None, pair_mode="retarded",
+    *, k_unfold_plan=None, selected_q=None, pair_mode="retarded", bank_carry=False,
 ):
     """Face-layout sibling of
     :func:`_get_chi_fractional_contour_kernel_legacy`.  Same Keldysh
@@ -922,6 +922,8 @@ def _get_chi_fractional_contour_kernel_face(
 
     if pair_mode not in ("retarded", "laplace"):
         raise ValueError("pair_mode must be retarded or laplace")
+    if bank_carry and selected_q is None:
+        raise ValueError("bank carry requires selected q rows")
     if pair_mode == "laplace" and selected_q is None:
         raise ValueError("Laplace bank correlations require selected_q")
     if selected_q is not None:
@@ -982,7 +984,8 @@ def _get_chi_fractional_contour_kernel_face(
             rep1, rep0,
             psi_mun_shard, psi_nmu_shard,
             rep2, rep2, rep2, rep0,
-        ),
+        ) + ((selected_shard,) if bank_carry else ()),
+        donate_argnums=(8,) if bank_carry else (),
         out_shardings=(tuple(chi_R_shard for _ in range(n_out))
                        if selected_q is None else selected_shard),
     )
@@ -995,6 +998,7 @@ def _get_chi_fractional_contour_kernel_face(
         occ_f,
         occ_u,
         energy_reference,
+        *carry,
     ):
         # occ_f/occ_u are the FINAL band_weight values, applied directly
         # (no further transform here) -- the caller
@@ -1024,6 +1028,9 @@ def _get_chi_fractional_contour_kernel_face(
                    else jax.lax.with_sharding_constraint(
                        jnp.broadcast_to(zero, (n_out,) + zero.shape),
                        selected_shard))
+
+        if bank_carry:
+            initial = carry[0]
 
         def body(accumulators, node):
             time, projection = node
@@ -1119,6 +1126,8 @@ def _get_chi_fractional_contour_kernel_face(
         )
         if selected_q is None:
             return tuple(_finish(value) for value in final_R)
+        if bank_carry:
+            return final_R
         # Public bank order [parent, sample, mu_x, mu_y].
         return jnp.swapaxes(final_R, 0, 1)
 
@@ -1545,7 +1554,7 @@ def response_coulomb_powers(meta, config, *, mesh_xy, bank_io, q_span):
                                 authenticate_coulomb)
     authenticate_coulomb(bank_io, bank_io["coulomb"]["q_irr_full_idx"])
     receipt = _receipt("coulomb", {}, bank_io)
-    execute = _bank_execution(meta, mesh_xy, bank_io, receipt)
+    execute = _bank_execution(meta, mesh_xy, bank_io, receipt, config)
     h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute)
     receipt.update(support_ranks=ranks, completion=True)
     return h, hi, receipt

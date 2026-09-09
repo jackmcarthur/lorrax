@@ -132,7 +132,7 @@ def response_weights(wfns, meta):
 
 
 def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
-                    pair_mode="retarded"):
+                    pair_mode="retarded", bank_carry=False):
     """Bind the existing one-particle Green/FFT primitive to a q batch.
 
     Returns a jitted kernel and its fixed ψ/energy arguments. Caller supplies
@@ -153,7 +153,8 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     kernel = _get_chi_fractional_contour_kernel_face(
         mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
-        k_unfold_plan=parent, selected_q=tuple(q_ids), pair_mode=pair_mode)
+        k_unfold_plan=parent, selected_q=tuple(q_ids), pair_mode=pair_mode,
+        bank_carry=bank_carry)
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
 
 
@@ -258,7 +259,21 @@ def _reserve(meta, stage, resident, workspace=0):
     return name, row
 
 
-def _bank_execution(meta, mesh_xy, bank_io, receipt):
+@lru_cache(maxsize=32)
+def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
+    """Query the dense provider on actual bank shapes, before allocation."""
+    from distrib_la import plan, workspace_bytes_per_rank
+    from .gw_config import linalg_resolution
+    resolution = linalg_resolution({"linalg": layout})
+    policy = plan("eigh", mesh_xy, n=n,
+        backend="off" if layout == "local" else "distributed",
+        batched_route=resolution.batched_route)
+    gemm = workspace_bytes_per_rank(policy,"gemm",((batch,n,n),(batch,n,n)),np.complex128)
+    eig = workspace_bytes_per_rank(policy,"eigh",((1,n,n),),np.complex128) if with_eigh else 0
+    return dict(gemm=gemm,eigh=eig,total=gemm+eig,scope="actual-shape ISERV query; GEMM persistent plus concurrent eigh scratch")
+
+
+def _bank_execution(meta, mesh_xy, bank_io, receipt, config):
     """Compile and admit new dense work; stream outputs are reserved by batch."""
     def execute(kernel, args, stage):
         started = time.monotonic()
@@ -270,8 +285,12 @@ def _bank_execution(meta, mesh_xy, bank_io, receipt):
             raise ValueError("GATE response_capacity: compiled memory unavailable")
         stream = stage in ("real_time", "laplace", "moment_correlation")
         if not stream:
+            layout = config.get("linalg", "local") if hasattr(config,"get") else config.backend.linalg
+            native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
+                with_eigh=stage=="coulomb_sqrt")
+            receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))
             _, row = _reserve(meta, stage, memory.argument_size_in_bytes,
-                memory.output_size_in_bytes + memory.temp_size_in_bytes)
+                memory.output_size_in_bytes + memory.temp_size_in_bytes + native["total"])
             receipt["memory"].append(row)
         receipt["compiled"].append(dict(stage=stage,
             arguments=memory.argument_size_in_bytes, outputs=memory.output_size_in_bytes,
@@ -312,6 +331,11 @@ def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout):
     return sqrt_v
 
 
+@lru_cache(maxsize=8)
+def _coulomb_pack(basis,mesh_xy):
+    return jax.jit(lambda v: basis.pack_operator(v,spec=P(None,"x","y")))
+
+
 def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
     """Read one authenticated canonical V batch; convert through its owner."""
     from file_io.slab_io import SlabIO
@@ -320,7 +344,7 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
     spec = P(None, "x", "y")
     abstract = jax.ShapeDtypeStruct(shape, jnp.complex128,
                                    sharding=NamedSharding(mesh_xy, spec))
-    packed = jax.jit(lambda v: basis.pack_operator(v, spec=spec))
+    packed = _coulomb_pack(basis,mesh_xy)
     compiled = packed.lower(abstract).compile()
     memory = compiled.memory_analysis()
     _reserve(meta, "coulomb_read_pack", memory.argument_size_in_bytes,
@@ -446,8 +470,9 @@ def _receipt(stage, census, bank_io):
         job=os.getenv("SLURM_JOB_ID"), step=os.getenv("SLURM_STEP_ID"),
         coulomb_identity=dict(bank_io["coulomb"]), seconds={}, memory=[],
         completion=False, correlation_count=0, batches=[], compiled=[],
+        native_accumulator_workspace_bytes=0,
         native_workspace_status="NOT_MEASURED",
-        native_workspace_reason="ISERV provider bounds pending; compiled admission only",
+        native_workspace_reason="other external native allocations excluded from compiler/JAX allocator counts",
         peak_bytes=None, peak_reason="execution has not completed",
         moment_convention="S_m = 2 M_(2m+1) in physical coordinates",
         units={"Wc": "Ry", "dWc_ds": "Ry^-1", "M1": "Ry^3", "M3": "Ry^5"})
@@ -484,7 +509,12 @@ def _finish_receipt(receipt, meta, header, started):
     receipt["seconds"]["total"] = time.monotonic()-started
     receipt["bank_complete"] = bool(header["complete"])
     receipt["capacity"] = meta.shared_pole_capacity.receipt()
-    receipt["peak_reason"] = "compiled admission; native measured peak pending ISERV"
+    stats = [d.memory_stats() for d in jax.local_devices()]
+    local_peak = max((v.get("peak_bytes_in_use",0) for v in stats if v),default=0)
+    from jax.experimental import multihost_utils
+    peak = int(np.max(multihost_utils.process_allgather(np.asarray(local_peak,dtype=np.int64))))
+    receipt["peak_bytes"] = peak or None
+    receipt["peak_reason"] = "maximum JAX allocator high-water bytes across ranks; inherited arrays included, external native allocations excluded"
     receipt["plan_hash"] = header["bank_plan_digest"]
     return receipt
 
@@ -501,30 +531,34 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
     _stream_comparison(wfns, meta, mesh_xy, qids, receipt)
     face_bytes = 16*meta.mu_basis.n_packed**2 // mesh_xy.size
     # Two totals, next correlation, arithmetic temporaries and bounded H/solve.
-    name, _ = _reserve(meta, "bank_outputs_moments", (8*len(qids)+16)*face_bytes)
-    ledger.live_stages = ambient+(name,)
     _, moments, receipt["algebra"] = response_algebra(meta, config,
         mesh_xy=mesh_xy, n=meta.mu_basis.n_packed)
-    if not np.asarray(header["moment_written"]).all():
-        a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
-                                      q_ids=tuple(qids), execute=execute)
-        for iq in range(len(qids)):
-            marked = header["moment_written"][iq]
-            if all(marked):
-                continue
-            span = (iq,iq+1)
-            h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, span, execute)
-            del hi
-            m1, m3 = execute(moments, (h,a0[iq:iq+1],a1[iq:iq+1]), "moment_dyson")
-            io_started = time.monotonic()
-            header = write_shared_pole_bank(bank_io["path"], q_span=span,
-                M1=None if marked[0] else m1, M3=None if marked[1] else m3,
-                meta=meta, expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
-            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-            receipt["batches"].append(dict(q_span=span,support_ranks=ranks))
-            del h,m1,m3
-        del a0,a1
-        receipt["correlation_count"] = 6
+    qwidth = max(1,min(len(qids),int((.75*ledger.U_bytes_per_rank/face_bytes-16)/8)))
+    for q0 in range(0,len(qids),qwidth):
+        q1 = min(q0+qwidth,len(qids))
+        ledger.live_stages = ambient
+        name,_ = _reserve(meta,"bank_outputs_moments",(8*(q1-q0)+16)*face_bytes)
+        ledger.live_stages = ambient+(name,)
+        if not np.asarray(header["moment_written"])[q0:q1].all():
+            a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
+                                          q_ids=tuple(qids[q0:q1]), execute=execute)
+            for iq in range(q0,q1):
+                marked = header["moment_written"][iq]
+                if all(marked):
+                    continue
+                span = (iq,iq+1)
+                h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, span, execute)
+                del hi
+                m1, m3 = execute(moments, (h,a0[iq-q0:iq-q0+1],a1[iq-q0:iq-q0+1]), "moment_dyson")
+                io_started = time.monotonic()
+                header = write_shared_pole_bank(bank_io["path"], q_span=span,
+                    M1=None if marked[0] else m1, M3=None if marked[1] else m3,
+                    meta=meta, expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
+                receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                receipt["batches"].append(dict(q_span=span,support_ranks=ranks))
+                del h,m1,m3
+            del a0,a1
+            receipt["correlation_count"] += 6
     ledger.live_stages = ambient
     receipt["completion"] = bool(np.asarray(header["moment_written"]).all())
     return _finish_receipt(receipt,meta,header,started)
@@ -538,7 +572,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     z = bank_points(sample_plan)
     receipt = _receipt("samples",census,bank_io)
     started = time.monotonic()
-    execute = _bank_execution(meta,mesh_xy,bank_io,receipt)
+    execute = _bank_execution(meta,mesh_xy,bank_io,receipt,config)
     ledger = meta.shared_pole_capacity
     ambient = ledger.live_stages
     _stream_comparison(wfns,meta,mesh_xy,qids,receipt)
@@ -547,21 +581,16 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     energy,f,u,reference,_ = response_weights(wfns,meta)
     masks,ft,ut,cells,receipt["windows"] = response_windows(energy,f,u,
         chemical_potential_ry=sample_plan["census"]["mu_ry"])
-    adapter = bank_io.get("rule_adapter")
-    if adapter is None:
-        import minimax
-        bank_rule,laplace_rule = minimax.response_bank_rule,minimax.response_laplace_rule
-        receipt["rule_provider"] = "minimax"
-    else:
-        bank_rule,laplace_rule = adapter.response_bank_rule,adapter.response_laplace_rule
-        receipt["rule_provider"] = "adapter"
+    import minimax
+    bank_rule,laplace_rule = minimax.response_bank_rule,minimax.response_laplace_rule
+    receipt["rule_provider"] = "minimax"
     middle = energy[masks[1]]
     delta = float(middle.max()-middle.min())
     rule = bank_rule(z,delta,rel_tol=sample_plan["bank_rule_tolerance"])
     t,weights = np.asarray(rule["t"]),np.asarray(rule["h"])
-    phase = weights[None,:]*np.exp(1j*z[:,None]*t[None,:])
-    derivative = phase*(1j*t[None,:]/(2*z[:,None]))
-    receipt["rule"] = {k:v for k,v in rule.items() if k not in ("t","h")}
+    phase = np.asarray(rule["projection_value"])
+    derivative = np.asarray(rule["projection_derivative"])
+    receipt["rule"] = {k:v for k,v in rule.items() if k not in ("t","h","projection_value","projection_derivative")}
     receipt["nodes"] = len(t)
     remote = []
     for cell in cells:
@@ -569,61 +598,100 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                          rel_tol=sample_plan["bank_rule_tolerance"])
         remote.append((cell,rr))
     receipt["laplace_cells"] = [{**cell,**{k:v for k,v in rr.items()
-        if k not in ("t","projection_value","projection_derivative")}}
+        if k not in ("t","projection_value","projection_derivative","coefficient_rows")}}
         for cell,rr in remote]
     face_bytes = 16*meta.mu_basis.n_packed**2//mesh_xy.size
-    # At most three carries coexist during remote addition. Leave one quarter
-    # of U for dense service/transport work; the common ledger is authoritative.
-    width = max(1,min(len(z),int(.75*ledger.U_bytes_per_rank/(2*len(qids)*face_bytes))))
-    for lo in range(0,len(z),width):
-        hi = min(lo+width,len(z));a = hi-lo
-        ledger.live_stages = ambient
-        name,_ = _reserve(meta,"bank_outputs",(6*a*len(qids)+32)*face_bytes
-            + int(phase.nbytes+derivative.nbytes))
-        ledger.live_stages = ambient+(name,)
-        kernel,fixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-            q_ids=tuple(qids),n_outputs=2*a)
-        raw = execute(kernel,(jnp.asarray(t),jnp.asarray(np.vstack((phase[lo:hi],derivative[lo:hi]))),
-            *fixed,stream_weights(wfns,ft*masks[1],mesh_xy),
-            stream_weights(wfns,ut*masks[1],mesh_xy),jnp.asarray(reference)),"real_time")
-        receipt["correlation_count"] += len(t)
-        for cell,rr in remote:
-            lower,upper = cell["lower"],cell["upper"]
-            refs = np.asarray(cell["references_ry"])
-            tau = np.asarray(rr["t"])
-            projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]
-            lk,lfixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-                q_ids=tuple(qids),n_outputs=2*a,pair_mode="laplace")
-            lw = np.stack([ft*masks[lower],ut*masks[lower]])
-            uw = np.stack([ut*masks[upper],ft*masks[upper]])
-            # Parent selection applies to the k axis, separately for each role.
-            lw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in lw])
-            uw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in uw])
-            contribution = execute(lk,(jnp.asarray(tau),jnp.asarray(projections),
-                *lfixed,lw,uw,jnp.asarray(refs)),"laplace")
-            raw = raw+contribution
-            raw.block_until_ready();del contribution,lw,uw
-            receipt["correlation_count"] += 2*len(tau)
-        for iq in range(len(qids)):
-            span = (iq,iq+1)
-            if np.asarray(header["sample_written"])[iq,lo:hi].all():
-                continue
-            h,hinv,ranks = _coulomb_batch(meta,config,bank_io,mesh_xy,span,execute)
-            del hinv
-            for ia in range(lo,hi):
-                marked = header["sample_written"][iq][ia]
-                if all(marked):continue
-                value,ds = execute(samples,(h,raw[iq:iq+1,ia-lo],raw[iq:iq+1,a+ia-lo]),"sample_dyson")
-                io_started = time.monotonic()
-                header = write_shared_pole_bank(bank_io["path"],q_span=span,sample_span=(ia,ia+1),
-                    Wc=None if marked[0] else value[:,None],
-                    dWc_ds=None if marked[1] else ds[:,None],meta=meta,
-                    expected_identity=bank_io["identity"],mesh_xy=mesh_xy)
-                receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                del value,ds
-            del h
-        receipt["batches"].append(dict(q_span=(0,len(qids)),sample_span=(lo,hi)))
-        del raw
+    # One donated internal [output,q,x,y] carry spans every window. Public
+    # writer slices are [q,output,x,y]; only that bounded slice is transposed.
+    # Reserve output plus a dense/transport headroom, and batch only when the
+    # common ledger's remaining 3U budget cannot hold the full point plan.
+    layout = config.get("linalg","local") if hasattr(config,"get") else config.backend.linalg
+    native = response_dense_workspace(mesh_xy,meta.mu_basis.n_packed,len(z),layout,with_eigh=True)
+    headroom = 16*face_bytes + native["gemm"] + int(phase.nbytes+derivative.nbytes)
+    inherited_live = sum(row["resident_bytes_per_rank"]+row["workspace_bytes_per_rank"]
+        for row in ledger.entries if row["stage"] in ambient)
+    available = ledger.limit_bytes_per_rank - headroom - inherited_live
+    qwidth = max(1,min(len(qids),int(available//(2*face_bytes))))
+    for q0 in range(0,len(qids),qwidth):
+        q1 = min(q0+qwidth,len(qids))
+        width = len(z)
+        while width > 0:
+            abstract = jax.ShapeDtypeStruct((width,meta.mu_basis.n_packed,meta.mu_basis.n_packed),
+                jnp.complex128,sharding=NamedSharding(mesh_xy,P(None,"x","y")))
+            stats = samples.lower(abstract,abstract,abstract).compile().memory_analysis()
+            if stats is None:
+                raise ValueError("GATE response_capacity: sample solve planning memory unavailable")
+            dense = stats.argument_size_in_bytes+stats.output_size_in_bytes+stats.temp_size_in_bytes
+            # Unpacking/writer checks are bounded by four packed sample faces;
+            # split-padding conversion has its actual extra store reservation.
+            extra = max(dense+native["total"],4*width*face_bytes+native["total"])
+            if 2*width*(q1-q0)*face_bytes+extra <= available:
+                break
+            width -= 1
+        if width == 0:
+            raise ValueError("GATE response_capacity: even one bank sample plus dense workspace exceeds remaining3U")
+        for lo in range(0,len(z),width):
+            hi = min(lo+width,len(z));a = hi-lo
+            ledger.live_stages = ambient
+            name,_ = _reserve(meta,"bank_outputs",2*a*(q1-q0)*face_bytes + headroom)
+            ledger.live_stages = ambient+(name,)
+            kernel,fixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
+                q_ids=tuple(qids[q0:q1]),n_outputs=2*a,bank_carry=True)
+            raw = jax.jit(lambda: jnp.zeros((2*a,q1-q0,meta.mu_basis.n_packed,meta.mu_basis.n_packed),jnp.complex128),
+                out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
+            raw = execute(kernel,(jnp.asarray(t),jnp.asarray(np.vstack((phase[lo:hi],derivative[lo:hi]))),
+                *fixed,stream_weights(wfns,ft*masks[1],mesh_xy),
+                stream_weights(wfns,ut*masks[1],mesh_xy),jnp.asarray(reference),raw),"real_time")
+            receipt["correlation_count"] += len(t)
+            for cell,rr in remote:
+                lower,upper = cell["lower"],cell["upper"]
+                refs = np.asarray(cell["references_ry"])
+                tau = np.asarray(rr["t"])
+                projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]
+                lk,lfixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
+                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,pair_mode="laplace",bank_carry=True)
+                lw = np.stack([ft*masks[lower],ut*masks[lower]])
+                uw = np.stack([ut*masks[upper],ft*masks[upper]])
+                # Parent selection applies to the k axis, separately for each role.
+                lw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in lw])
+                uw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in uw])
+                raw = execute(lk,(jnp.asarray(tau),jnp.asarray(projections),
+                    *lfixed,lw,uw,jnp.asarray(refs),raw),"laplace")
+                del lw,uw
+                receipt["correlation_count"] += 2*len(tau)
+            for iq in range(q0,q1):
+                span = (iq,iq+1)
+                if np.asarray(header["sample_written"])[iq,lo:hi].all():
+                    continue
+                h,hinv,ranks = _coulomb_batch(meta,config,bank_io,mesh_xy,span,execute)
+                del hinv
+                ia = lo
+                while ia < hi:
+                    marked = tuple(header["sample_written"][iq][ia])
+                    stop = ia+1
+                    while stop < hi and tuple(header["sample_written"][iq][stop]) == marked:
+                        stop += 1
+                    if all(marked):
+                        ia = stop
+                        continue
+                    chi = raw[ia-lo:stop-lo,iq-q0]
+                    dchi = raw[a+ia-lo:a+stop-lo,iq-q0]
+                    hbatch = jnp.broadcast_to(h,chi.shape)
+                    value,ds = execute(samples,(hbatch,chi,dchi),"sample_dyson")
+                    value = None if marked[0] else value[None]
+                    ds = None if marked[1] else ds[None]
+                    io_started = time.monotonic()
+                    header = write_shared_pole_bank(bank_io["path"],q_span=span,
+                        sample_span=(ia,stop),Wc=value,dWc_ds=ds,meta=meta,
+                        expected_identity=bank_io["identity"],mesh_xy=mesh_xy)
+                    receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                    del value,ds,chi,dchi,hbatch
+                    ia = stop
+                del h
+            receipt["batches"].append(dict(q_span=(q0,q1),sample_span=(lo,hi)))
+            del raw
     ledger.live_stages = ambient
+    receipt["stream_passes"] = len(receipt["batches"])
+    receipt["batch_reason"] = "full plan admitted" if len(receipt["batches"]) == 1 else "3U output carry plus dense/transport headroom requires bounded replays"
     receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
     return _finish_receipt(receipt,meta,header,started)
