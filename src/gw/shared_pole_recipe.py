@@ -58,7 +58,8 @@ _GATE_ROWS = {
     "full_m1_defect": ("maximum over q of relative full M1 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-4),
     "full_m3_defect": ("maximum over q of relative full M3 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-3),
     "representation": ("scalar N_spinor=1 and authenticated TRS allowed", {"nspinor": 1, "trs_allowed": True}),
-    "capacity": ("aggregate live bytes per rank including workspace <= threshold * U", 3.0),
+    "capacity": ("aggregate live bytes per rank of new shared-pole objects including workspace <= threshold * U", 3.0),
+    "stream_peak": ("inherited response stream peak <= threshold * incumbent MPA stream peak on the same deck and processor geometry, using the same measurement method", 1.05),
     "rule_validity": ("bank and Sigma certificates cover current domains at resolved tolerances", True),
     "sc_rebuild": ("samples, directions, poles, ranks, intervals and rules rebuilt at current bands and occupations", True),
 }
@@ -120,7 +121,183 @@ def gate_receipt(name, value=None, *, passed=None, reason):
             "reason": reason}
 
 
-def construction_receipt(measurements=None):
+class CapacityLedger:
+    """Plan-time aggregate capacity for one SC map (DESIGN §§0,4).
+
+    Parameters
+    ----------
+    meta : Meta
+        Logical ``nk_tot``, ``nspinor`` and ``n_rmu`` from the current deck.
+    mesh_xy : Mesh
+        Named processor axes x/y. U=16*Q*(spin*mu)^2/(Px*Py) bytes/rank.
+
+    Each reservation owns disjoint resident/workspace bytes computed by its
+    caller for its ACTUAL batch sizes, including packing and native workspace.
+    ``concurrent_with`` names earlier reservations simultaneously live with it;
+    each named footprint is counted once. Historical concurrency is not carried
+    forward: callers name all allocations live in the current phase.
+    Sequential stages omit predecessors. Stage names must be unique (include
+    batch/phase identifiers when necessary). A refusal is recorded but does not
+    create a usable reservation. The ledger owns no arrays or memory allocator.
+    """
+
+    def __init__(self, meta, *, mesh_xy):
+        import operator
+        geometry = dict(nq=meta.nk_tot, nspinor=meta.nspinor, nmu=meta.n_rmu,
+                        px=mesh_xy.shape['x'], py=mesh_xy.shape['y'])
+        self.geometry = {}
+        for key, value in geometry.items():
+            if isinstance(value, bool):
+                raise ValueError(f"capacity geometry {key} must be a positive integer")
+            value = operator.index(value)
+            if value <= 0:
+                raise ValueError(f"capacity geometry {key} must be a positive integer")
+            self.geometry[key] = value
+        g = self.geometry
+        self._global_unit_bytes = 16 * g['nq'] * (g['nspinor'] * g['nmu'])**2
+        self.U_bytes_per_rank = self._global_unit_bytes / (g['px'] * g['py'])
+        self.limit_bytes_per_rank = (shared_real_pole_gates_v1_r3b['capacity']['threshold']
+                                     * self.U_bytes_per_rank)
+        self.entries = []
+        self._accepted = {}
+        self._live_stages = None
+        self.measured_peak = gate_receipt('capacity', reason='measured peak not supplied')
+        self.stream_peak = gate_receipt('stream_peak', reason='same-deck incumbent comparison not supplied')
+
+    @property
+    def live_stages(self):
+        """Caller-bound ambient reservations for callees without lifetime args.
+
+        The caller sets an explicit tuple before I/O; () means no upstream
+        allocations are live. Unbound is unknown and refuses. Callees pass the
+        tuple as ``concurrent_with`` to reserve their own disjoint footprint.
+        """
+        if self._live_stages is None:
+            raise ValueError("GATE shared_pole_capacity_lifetimes: got: unbound caller lifetimes; want: explicitly set ledger.live_stages before callee admission; why: unknown upstream bytes are not zero")
+        return self._live_stages
+
+    @live_stages.setter
+    def live_stages(self, stages):
+        if isinstance(stages, str):
+            raise ValueError("live_stages must contain accepted stage names, not a string")
+        names = tuple(dict.fromkeys(stages))
+        for name in names:
+            if name not in self._accepted:
+                raise ValueError(f"capacity live stage {name!r} has no accepted reservation")
+        self._live_stages = names
+
+    @staticmethod
+    def _bytes(value):
+        import operator
+        if isinstance(value, bool):
+            raise ValueError("capacity bytes must be nonnegative integers")
+        try:
+            result = operator.index(value)
+        except TypeError as exc:
+            raise ValueError("capacity bytes must be nonnegative integers") from exc
+        if result < 0:
+            raise ValueError("capacity bytes must be nonnegative integers")
+        return result
+
+    def reserve(self, stage, *, resident_bytes_per_rank,
+                workspace_bytes_per_rank, concurrent_with=()):
+        """Admit actual-batch bytes before allocation, or record FAIL and refuse.
+
+        Returns a detached JSON row. ``concurrent_with`` is an iterable of
+        accepted stage names, not their byte totals. Caller-live allocations
+        must be charged here OR in a named concurrent reservation, never both.
+        No runtime peak is inferred from a successful analytical admission.
+        """
+        import copy
+        if not isinstance(stage, str) or not stage.strip() or stage in self._accepted:
+            raise ValueError(f"capacity stage must be a new nonempty name; got {stage!r}")
+        if isinstance(concurrent_with, str):
+            raise ValueError("concurrent_with must contain stage names, not a string")
+        live = set()
+        for name in concurrent_with:
+            if name not in self._accepted:
+                raise ValueError(f"capacity concurrent stage {name!r} has no accepted reservation")
+            live.add(name)
+        resident = self._bytes(resident_bytes_per_rank)
+        workspace = self._bytes(workspace_bytes_per_rank)
+        total = resident + workspace + sum(
+            self._accepted[name]['resident_bytes_per_rank']
+            + self._accepted[name]['workspace_bytes_per_rank'] for name in live)
+        passed = total <= self.limit_bytes_per_rank
+        g = self.geometry
+        max_ranks = math.floor(self.limit_bytes_per_rank * g['px'] * g['py'] / total) if total else None
+        reason = ('actual-batch analytical admission; peak not measured' if passed else
+                  f"aggregate {total} B/rank exceeds {self.limit_bytes_per_rank} B/rank; "
+                  f"geometry Q={g['nq']}, spin={g['nspinor']}, mu={g['nmu']}, "
+                  f"Px={g['px']}, Py={g['py']}; at these fixed reservation bytes "
+                  f"want Px*Py <= {max_ranks}; reprice actual batches/workspaces "
+                  "for any changed geometry, or reduce concurrent live bytes")
+        row = gate_receipt('capacity', total / self.U_bytes_per_rank,
+                           passed=passed, reason=reason)
+        row.update(stage=stage, resident_bytes_per_rank=resident,
+                   workspace_bytes_per_rank=workspace,
+                   aggregate_bytes_per_rank=total,
+                   limit_bytes_per_rank=self.limit_bytes_per_rank,
+                   concurrent_with=sorted(live), live_stages=sorted(live | {stage}),
+                   geometry=dict(g), max_mesh_ranks_at_fixed_bytes=max_ranks)
+        self.entries.append(row)
+        if not passed:
+            raise MemoryError(f"GATE shared_pole_capacity: stage={stage}; got: {reason}; "
+                              "why: aggregate live allocation must not exceed 3U")
+        self._accepted[stage] = row
+        return copy.deepcopy(row)
+
+    def record_measured_peak(self, bytes_per_rank, *, reason):
+        """Record the new-object maximum over ranks, excluding inherited stream."""
+        peak = self._bytes(bytes_per_rank)
+        if peak < self.measured_peak.get('bytes_per_rank', 0):
+            return self.receipt()['measured_peak']
+        self.measured_peak = gate_receipt(
+            'capacity', peak / self.U_bytes_per_rank,
+            passed=peak <= self.limit_bytes_per_rank, reason=reason)
+        self.measured_peak['bytes_per_rank'] = peak
+        return self.receipt()['measured_peak']
+
+    def record_stream_peak(self, shared_bytes_per_rank, incumbent_bytes_per_rank, *, reason):
+        """Record the inherited stream comparison (coordinator ruling 9).
+
+        Both byte counts must use the same deck, mesh and measurement method;
+        ``reason`` names that scope and both evidence paths/job.steps. Missing
+        counts stay NOT_MEASURED. The inherited stream is not a reservation and
+        cannot be named in ``concurrent_with``. New bank outputs/batches still
+        enter ``reserve('bank_outputs', ...)`` and obey 3U.
+        """
+        if self.stream_peak['status'] != 'NOT_MEASURED':
+            raise ValueError("inherited stream comparison already recorded for this map")
+        shared = None if shared_bytes_per_rank is None else self._bytes(shared_bytes_per_rank)
+        incumbent = None if incumbent_bytes_per_rank is None else self._bytes(incumbent_bytes_per_rank)
+        if incumbent == 0:
+            raise ValueError("incumbent stream peak must be positive")
+        threshold = shared_real_pole_gates_v1_r3b['stream_peak']['threshold']
+        passed = None if shared is None or incumbent is None else shared <= threshold * incumbent
+        self.stream_peak = gate_receipt(
+            'stream_peak', {'shared_bytes_per_rank': shared,
+                            'incumbent_bytes_per_rank': incumbent},
+            passed=passed, reason=reason)
+        self.stream_peak.update(stage='stream_peak', geometry=dict(self.geometry))
+        if passed is False:
+            raise MemoryError(f"GATE shared_pole_stream_peak: shared={shared} B/rank; "
+                              f"incumbent={incumbent} B/rank; limit={threshold} * incumbent; "
+                              f"geometry={self.geometry}; why: inherited stream regressed")
+        return self.receipt()['stream_peak']
+
+    def receipt(self):
+        """Snapshot ordered stage rows and the independently measured peak."""
+        import copy
+        return copy.deepcopy(dict(geometry=self.geometry,
+                                  U_bytes_per_rank=self.U_bytes_per_rank,
+                                  limit_bytes_per_rank=self.limit_bytes_per_rank,
+                                  entries=self.entries, live_stages=self._live_stages,
+                                  measured_peak=self.measured_peak,
+                                  stream_peak=self.stream_peak))
+
+
+def construction_receipt(measurements=None, *, capacity=None):
     """Complete receipt skeleton, explicitly marking every absent gate unmeasured.
 
     ``measurements`` maps names to ``gate_receipt`` keyword dictionaries. Dense
@@ -130,12 +307,30 @@ def construction_receipt(measurements=None):
     unknown = set(measurements) - set(shared_real_pole_gates_v1_r3b)
     if unknown:
         raise ValueError(f"unknown shared-pole receipt predicates: {sorted(unknown)}")
-    return {"schema": RECEIPT_SCHEMA, "recipe_version": RECIPE_VERSION,
+    result = {"schema": RECEIPT_SCHEMA, "recipe_version": RECIPE_VERSION,
             "recipe_hash": RECIPE_HASH, "gate_version": GATE_VERSION,
             "gate_hash": GATE_HASH,
             "gates": [gate_receipt(name, **measurements.get(
                 name, {"reason": "measurement not supplied"}))
                 for name in shared_real_pole_gates_v1_r3b]}
+    if capacity is not None:
+        if not isinstance(capacity, CapacityLedger):
+            raise TypeError("construction receipt capacity must be the map's CapacityLedger")
+        result['capacity'] = capacity.receipt()
+        result['gates'] = [result['capacity']['stream_peak'] if r['name'] == 'stream_peak'
+                           else r for r in result['gates']]
+        rows = result['capacity']['entries']
+        measured = result['capacity']['measured_peak']
+        values = [r['value'] for r in rows]
+        if measured['value'] is not None:
+            values.append(measured['value'])
+        aggregate = max(values, default=None)
+        result['gates'] = [r for r in result['gates'] if r['name'] != 'capacity']
+        result['gates'].append(gate_receipt(
+            'capacity', aggregate, passed=(all(r['status'] == 'PASS' for r in rows)
+                                           and measured['status'] != 'FAIL'),
+            reason='plan-time ledger rows; independent measured peak recorded separately'))
+    return result
 
 
 def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_capacity, kweights):
@@ -249,6 +444,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
     energies = np.asarray(wfns.enk, dtype=np.float64)[:, :stop]
     if hashlib.sha256(energies.tobytes()).hexdigest() != census['energy_sha256']:
         raise ValueError("GATE shared_pole_census: got: stale energies; want: census rebound at current bands; why: SC must rebuild geometry")
+    meta.shared_pole_capacity = CapacityLedger(meta, mesh_xy=mesh_xy)
     recipe = shared_real_pole_v1_r3b
     tier = config.sigma.w_accuracy
     policy = recipe[tier]
@@ -311,6 +507,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
         raise ValueError("GATE shared_pole_held_exclusion: got: held/training collision; want: disjoint physical IDs; why: held diagnostics must be independent")
     n = int(meta.nspinor) * int(meta.n_rmu)
     result = {
+        'role_codes': dict(ROLE_CODES),
         'recipe_version': RECIPE_VERSION, 'recipe_hash': RECIPE_HASH,
         'gate_version': GATE_VERSION, 'gate_hash': GATE_HASH,
         'accuracy': tier, 'accuracy_status': 'NOT_MEASURED',
@@ -339,8 +536,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
         'bank_rule_tolerance': recipe['bank_rule_tolerance'],
         'sigma_tolerance': policy['sigma_tolerance'],
         'moment_convention': recipe['moment_convention'], 'census': dict(census),
-        'U_bytes_per_rank': 16 * int(meta.nk_tot) * n*n / (
-            int(mesh_xy.shape['x']) * int(mesh_xy.shape['y'])),
+        'U_bytes_per_rank': meta.shared_pole_capacity.U_bytes_per_rank,
     }
     result['metadata_array_bytes'] = sum(v.nbytes for v in result.values()
                                          if isinstance(v, np.ndarray))
