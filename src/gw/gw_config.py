@@ -2150,6 +2150,8 @@ _DEFAULTS = {
     # range spelling (docs/dev/crossing-rule-cost-law.md).
     "sigma_omega_patches_ev": "",
     "sigma_regularization_ev": 0.25,
+    "sigma_w_model": "mpa",
+    "sigma_w_accuracy": "production",
     "sigma_window_edge_factor": 1.5,
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
@@ -2841,6 +2843,59 @@ def _print_deck_report(msg: str) -> None:
         print(msg)
 
 
+def _resolve_shared_pole_inputs(params):
+    """Validate the shared-pole deck surface once, preserving explicitness."""
+    from .shared_pole_recipe import shared_real_pole_v1_r3b as recipe
+
+    named = params[_DECK_NAMED_KEYS]
+    for key, choices in (("sigma_w_model", ("mpa", "shared_pole")),
+                         ("sigma_w_accuracy", ("production", "relaxed"))):
+        value = str(params[key]).strip().lower()
+        if value not in choices:
+            raise ValueError(
+                f"GATE shared_pole_enum: {key} got: {value!r}; "
+                f"want: {' | '.join(choices)}; why: unknown W recipe")
+        params[key] = value
+    mode = str(params["compute_mode"]).strip().lower()
+    model = params["sigma_w_model"]
+    if "sigma_w_model" in named and mode != "mpa":
+        raise ValueError(
+            f"GATE shared_pole_applicability: sigma_w_model got: {model!r} "
+            f"with compute_mode={mode!r}; want: compute_mode=mpa; "
+            "why: this key selects the MPA Sigma W representation")
+    if "sigma_w_accuracy" in named and model != "shared_pole":
+        raise ValueError(
+            "GATE shared_pole_applicability: sigma_w_accuracy got: "
+            f"{params['sigma_w_accuracy']!r} with sigma_w_model={model!r}; "
+            "want: sigma_w_model=shared_pole; why: tier has no other consumer")
+    eta = float(params["sigma_regularization_ev"])
+    if not (np.isfinite(eta) and eta > 0.0):
+        raise ValueError(
+            f"GATE sigma_regularization: sigma_regularization_ev got: {eta!r}; "
+            "want: finite > 0 eV; why: the causal evaluation needs positive broadening")
+    if model != "shared_pole":
+        return
+    unused = sorted(named.intersection({
+        "mpa_n_poles", "mpa_sampling_alpha", "mpa_sampling_schedule",
+        "mpa_pole_solver", "mpa_varpi_near_ry", "mpa_varpi_far_ry",
+        "mpa_metal_origin_shift_ry", "mpa_pole_batch_size", "mpa_fit_reuse_file",
+        "mpa_overwrite_completed_artifacts"}))
+    if unused:
+        raise ValueError(
+            f"GATE shared_pole_unused_inputs: got: {', '.join(unused)}; "
+            "want: remove elementwise MPA fit keys; why: shared_pole uses its versioned recipe")
+    tier = params["sigma_w_accuracy"]
+    eps = recipe[tier]["sigma_tolerance"]
+    if "sigma_quadrature_eps" in named and params["sigma_quadrature_eps"] != eps:
+        raise ValueError(
+            "GATE shared_pole_epsilon_conflict: sigma_quadrature_eps got: "
+            f"{params['sigma_quadrature_eps']!r}; want: {eps!r} for "
+            f"sigma_w_accuracy={tier}; why: the recipe owns Sigma tolerance")
+    params["sigma_quadrature_eps"] = eps
+    # minimax_target_error retains its incumbent static-stage meaning; the
+    # bank always consumes recipe['bank_rule_tolerance'] from the resolver.
+
+
 def read_lorrax_input(filename: str) -> dict:
     """Parse a LORRAX input file ([cohsex] section) into a params dict.
 
@@ -3157,6 +3212,8 @@ def read_lorrax_input(filename: str) -> dict:
     else:
         params = dict(_DEFAULTS)
         params[_DECK_NAMED_KEYS] = frozenset()
+
+    _resolve_shared_pole_inputs(params)
 
     # Deck dial interpretation point (INVARIANTS row 19).  Every downstream
     # consumer reads this immutable record; no stage reinterprets ``linalg``.
@@ -4258,6 +4315,8 @@ class DynamicSigmaConfig:
     sigma_at_dft_energies: bool
     #: Uniform denominator-box policy for dynamic Sigma quadrature.  The
     #: cache spelling is "auto" (run tmp), "off", or a deck-relative path.
+    w_model: str = "mpa"
+    w_accuracy: str = "production"
     quadrature_eps: float = 1.0e-4
     quadrature_reduction_seconds: float = 120.0
     #: ``None`` = wall budget; an integer = deterministic pass budget.
@@ -5486,6 +5545,8 @@ class LorraxConfig:
             omega_max_ev=float(_g("sigma_omega_max_ev")),
             omega_step_ev=float(_g("sigma_omega_step_ev")),
             regularization_ev=float(_g("sigma_regularization_ev")),
+            w_model=str(_g("sigma_w_model")),
+            w_accuracy=str(_g("sigma_w_accuracy")),
             window_edge_factor=float(_g("sigma_window_edge_factor")),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             quadrature_eps=float(_g("sigma_quadrature_eps")),
