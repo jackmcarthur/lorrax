@@ -18,7 +18,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import rank0_transaction, psum_replicate
-from file_io.slab_io import SlabIO
+from file_io.slab_io import SlabIO, mesh_divisible_shape
 from file_io.commit_state import assert_committed, set_commit_state
 from symmetry_maps import QirrTables, validate_qirr_tables
 
@@ -32,6 +32,99 @@ _IDENTITY_KEYS = ("iteration_id", "hamiltonian", "energies", "occupations",
 def _refuse(message):
     raise ValueError(f"GATE shared_pole_store: {message}; want: authenticated "
                      "current-map canonical scalar model; fix: rebuild the artifact")
+
+
+def _capacity(meta):
+    """Require the map ledger; unknown caller lifetimes never mean zero."""
+    ledger = getattr(meta, "shared_pole_capacity", None)
+    if ledger is None:
+        _refuse("missing map CapacityLedger before tensor I/O")
+    ledger.live_stages
+    expected = dict(nq=int(meta.nk_tot),nspinor=int(meta.nspinor),
+                    nmu=int(meta.mu_basis.n_logical),
+                    px=int(meta.mu_basis.mesh_xy.shape["x"]),
+                    py=int(meta.mu_basis.mesh_xy.shape["y"]))
+    if ledger.geometry != expected:
+        _refuse("capacity ledger geometry differs from current map")
+    return ledger
+
+
+def _check_io_capacity(ledger, mesh, header):
+    if ledger is None:
+        _refuse("tensor reader requires capacity")
+    expected = dict(nq=len(header["qirr"]["irr_idx_q"]),
+                    nspinor=header["nspinor"],nmu=header["n_mu_logical"],
+                    px=int(mesh.shape["x"]),py=int(mesh.shape["y"]))
+    if ledger.geometry != expected:
+        _refuse("capacity ledger geometry differs from stored model/current mesh")
+    ledger.live_stages
+
+
+def _local_bytes(shape, dtype, mesh, spec):
+    """Maximum local payload bytes for an already divisible named layout."""
+    count = int(np.prod(shape))
+    for axes in spec:
+        if axes is not None:
+            for axis in ((axes,) if isinstance(axes, str) else axes):
+                count //= int(mesh.shape[axis])
+    return count * np.dtype(dtype).itemsize
+
+
+def _conversion_bytes(basis, shape, spec, *, unpack, operator=False):
+    """Compile the existing basis conversion without allocating its operand.
+
+    Return argument, output and compiler temporary bytes per rank. These are
+    the actual pack/unpack kernel's split-padded collective buffers, not a
+    second permutation implementation. Inputs supplied by a writer belong to
+    its caller's live reservation; a reader owns its canonical input too.
+    """
+    argument = _local_bytes(shape, np.complex128, basis.mesh_xy, spec)
+    if basis.is_identity:
+        return argument, argument, 0
+    kernel = (basis._operator_kernel(spec, unpack) if operator
+              else basis._axis_kernel(1, spec, unpack))
+    operand = jax.ShapeDtypeStruct(shape, jnp.complex128,
+                                  sharding=NamedSharding(basis.mesh_xy, spec))
+    stats = kernel.lower(operand).compile().memory_analysis()
+    if stats is None:
+        _refuse("compiler did not supply centroid conversion memory statistics")
+    if int(stats.argument_size_in_bytes) < argument:
+        _refuse("compiler memory statistics are smaller than the rank-local argument")
+    return (int(stats.argument_size_in_bytes), int(stats.output_size_in_bytes),
+            max(0, int(stats.temp_size_in_bytes)-int(stats.alias_size_in_bytes)))
+
+
+def _admit(ledger, stage, resident, workspace=0, *, host_payload=0,
+           device_panel=0, host_metadata=0, native_host=False, io=None):
+    """Reserve device bytes and emit a separate host-staging receipt.
+
+    Caller live_stages must cover ALL supplied device arguments and other
+    arrays retained across this call; store reservations own only additional
+    buffers. Host payload copies never exceed the local device panel.
+    Native phdf5 staging rounds each read/write high-water buffer to 2 MiB.
+    """
+    if ledger is None:
+        _refuse("payload authentication requires the map capacity ledger")
+    high_water = int(device_panel)
+    if io is not None:
+        high_water = max(high_water,getattr(io,"_shared_pole_host_high_water",0))
+        io._shared_pole_host_high_water = high_water
+    host = dict(status="PASS" if host_payload <= device_panel else "FAIL",
+                payload_copy_bytes_per_rank=int(host_payload),
+                device_panel_bytes_per_rank=int(device_panel),
+                metadata_bytes_per_rank=int(host_metadata),
+                native_staging_bytes_per_rank=(2*((high_water+2097151)//2097152)*2097152
+                                               if native_host and high_water else 0),
+                scope="host bytes; excluded from device 3U admission")
+    if host["status"] != "PASS":
+        _refuse("host payload copy exceeds its bounded device panel")
+    row = ledger.reserve(f"store.{stage}.{len(ledger.entries)}",
+                         resident_bytes_per_rank=int(resident),
+                         workspace_bytes_per_rank=int(workspace),
+                         concurrent_with=ledger.live_stages)
+    if jax.process_index() == 0:
+        print("[shared_pole_store capacity] " + _json(dict(device=row, host=host)), flush=True)
+    return row
 
 
 def _json(value):
@@ -232,6 +325,11 @@ def write_shared_pole_model(path, C, poles2, K, *, q_span, meta, tables,
         _refuse("constructor factor is not the declared XY handoff")
     if C.shape[1:3] != (meta.mu_basis.n_packed, 1):
         _refuse("factor does not use the current packed centroid basis")
+    ledger = _capacity(meta)
+    arg, output, temporary = _conversion_bytes(meta.mu_basis, C.shape, want.spec, unpack=True)
+    # One factor-sized envelope covers eager finite/sentinel check scratch.
+    _admit(ledger, "write_model", output, temporary+arg+3*int(poles2.size)*8,
+           device_panel=max(arg,output,8*int(poles2.size)), native_host=True)
     K = np.asarray(K)
     _check_factor(C, poles2, K)
     lo, hi = _span(q_span, header["n_q_irr"], "q_span")
@@ -251,8 +349,6 @@ def write_shared_pole_model(path, C, poles2, K, *, q_span, meta, tables,
     if any(header["written_q"][lo:hi]):
         _refuse("q_span already committed; never overwrite staged parents")
     width = int(K.max(initial=0))
-    if width == 0:
-        _refuse("empty batch has no supported physical pole")
     name = f"staging/q{lo}_{hi}"
     canonical = meta.mu_basis.unpack_axis(C, 1)
     canonical.block_until_ready()
@@ -267,10 +363,11 @@ def write_shared_pole_model(path, C, poles2, K, *, q_span, meta, tables,
             f.require_group(name)
     rank0_transaction(path, stage="shared_pole.stage_group", write=prepare_group)
     with SlabIO(path, mode="a", mesh=mesh) as io:
-        io.create_dataset(name + "/factor", shape=(hi-lo, header["n_mu_logical"], 1, width), dtype=np.complex128)
-        io.create_dataset(name + "/poles2", shape=(hi-lo, width), dtype=np.float64)
-        io.write_slab(name + "/factor", canonical)
-        io.write_slab(name + "/poles2", poles2)
+        if width:
+            io.create_dataset(name + "/factor", shape=(hi-lo, header["n_mu_logical"], 1, width), dtype=np.complex128)
+            io.create_dataset(name + "/poles2", shape=(hi-lo, width), dtype=np.float64)
+            io.write_slab(name + "/factor", canonical)
+            io.write_slab(name + "/poles2", poles2)
         header["written_q"][lo:hi] = [True] * (hi-lo)
         header["K"][lo:hi] = K.tolist()
         header["batches"].append({"lo": lo, "hi": hi, "width": width, "name": name})
@@ -297,7 +394,8 @@ def finalize_shared_pole_model(path, *, meta, expected_identity):
         _refuse("finalization requires every staged parent")
     if header["finalized"]:
         return validate_shared_pole_model(
-            path, expected_identity=expected_identity, mesh_xy=meta.mu_basis.mesh_xy)
+            path, expected_identity=expected_identity, mesh_xy=meta.mu_basis.mesh_xy,
+            capacity=_capacity(meta))
     return _finalize_model(path, meta=meta, header=header)
 
 
@@ -305,6 +403,9 @@ def _finalize_model(path, *, meta, header):
     mesh, basis = meta.mu_basis.mesh_xy, meta.mu_basis
     nq, nmu = header["n_q_irr"], header["n_mu_logical"]
     kmax = max(header["K"])
+    panel = 16*basis.n_canonical*((kmax+int(mesh.shape["y"])-1)//int(mesh.shape["y"]))/int(mesh.shape["x"])
+    _admit(_capacity(meta), "finalize", int(panel)+24*kmax,
+           device_panel=max(int(panel),8*kmax), native_host=True)
     header["Kmax"] = kmax
     header["compact_payload_bytes"] = nq * (16*nmu*kmax + 8*kmax + 8)
     header["staging_payload_bytes"] = sum((v["hi"]-v["lo"]) * v["width"] * (16*nmu+8) for v in header["batches"])
@@ -315,19 +416,30 @@ def _finalize_model(path, *, meta, header):
         for batch in header["batches"]:
             # One parent at a time; no all-parent carrier to discover Kmax.
             for q in range(batch["lo"], batch["hi"]):
-                factor = io.read_slab(batch["name"] + "/factor",
-                    shape=(1, basis.n_canonical, 1, kmax),
-                    offset=(q-batch["lo"], 0, 0, 0), partition_spec=P(None,"x",None,None))
-                poles = io.read_slab(batch["name"] + "/poles2",
-                    shape=(1, kmax), offset=(q-batch["lo"],0), partition_spec=P())
+                spec = P(None, "x", None, "y")
+                read_shape = mesh_divisible_shape(
+                    (1, basis.n_canonical, 1, kmax), mesh, spec)
+                if kmax == 0:
+                    continue
+                if batch["width"]:
+                    factor = io.read_slab(batch["name"] + "/factor",
+                        shape=read_shape,
+                        offset=(q-batch["lo"], 0, 0, 0), partition_spec=spec)
+                    poles = io.read_slab(batch["name"] + "/poles2",
+                        shape=(1, kmax), offset=(q-batch["lo"],0), partition_spec=P())
+                else:
+                    factor = jax.jit(lambda: jnp.zeros(read_shape, jnp.complex128),
+                                     out_shardings=NamedSharding(mesh, spec))()
+                    poles = jnp.ones((1,kmax), jnp.float64)
                 active = jnp.arange(kmax)[None,:] < header["K"][q]
                 poles = jnp.where(active, poles, 1.0)
                 io.write_slab("factor", factor, offset=(q,0,0,0))
                 io.write_slab("poles2_ry2", poles, offset=(q,0))
                 io.sync_writes()
+                del factor, poles
         io.write_attr("K", np.asarray(header["K"], np.int64))
         _write_header(io, header)
-    header["digest"] = _model_digest(path, header, mesh)
+    header["digest"] = _model_digest(path, header, mesh, capacity=_capacity(meta))
     def finish():
         with h5py.File(path, "a") as f:
             set_commit_state(f, False)
@@ -341,50 +453,77 @@ def _finalize_model(path, *, meta, header):
     return _read_header(path)
 
 
-def _model_digest(path, header, mesh):
+def _model_digest(path, header, mesh, *, capacity):
     """Grid-independent SHA256 of metadata and canonical row digests.
 
-    Read one q factor face at a time through SlabIO. Only row hashes (32 bytes
-    per centroid) are exchanged; a full factor is never gathered onto a rank.
+    Read one q and a bounded column panel through SlabIO. Each canonical row
+    hash is updated in column order, so neither column partition nor mesh
+    changes the digest. Only row hashes (32 bytes per centroid) are exchanged.
     """
+    _check_io_capacity(capacity,mesh,header)
     identity = {k:v for k,v in header.items() if k not in
                 ("digest", "finalized", "batches", "staging_payload_bytes", "peak_payload_bytes")}
     digest = hashlib.sha256(_json(identity).encode())
     nmu, kmax = header["n_mu_logical"], header["Kmax"]
     ncan = ((nmu + int(mesh.size)-1)//int(mesh.size))*int(mesh.size)
+    column_cap = max(1, (kmax + int(mesh.shape["y"])-1)//int(mesh.shape["y"]))
+    panel = 16*ncan*min(kmax,column_cap)//int(mesh.shape["x"])
+    _admit(capacity, "digest", panel+8*kmax+256*nmu, panel+24*kmax,
+           host_payload=panel, device_panel=panel, host_metadata=256*nmu+8*kmax,
+           native_host=True)
     with SlabIO(path, mode="r", mesh=mesh) as io:
         for q in range(header["n_q_irr"]):
-            C = io.read_slab("factor", shape=(1,ncan,1,kmax), offset=(q,0,0,0),
-                             partition_spec=P(None,"x",None,None))
+            if kmax == 0:
+                if header["K"][q] != 0:
+                    _refuse("nonzero K in empty model")
+                digest.update(hashlib.sha256(b"").digest() * nmu)
+                continue
             poles = io.read_slab("poles2_ry2", shape=(1,kmax), offset=(q,0), partition_spec=P())
-            _check_factor(C, poles, np.asarray([header["K"][q]], np.int64))
+            host_poles = np.asarray(poles)
+            active_count = header["K"][q]
+            if np.any(np.diff(host_poles[0, :active_count]) < 0):
+                _refuse("active poles are unsorted across column panels")
+            hashers = {}
+            for c0 in range(0, kmax, column_cap):
+                c1 = min(kmax, c0+column_cap)
+                C = io.read_slab("factor", shape=(1,ncan,1,c1-c0), offset=(q,0,0,c0),
+                                 partition_spec=P(None,"x",None,None))
+                count = np.asarray([max(0, min(c1-c0, active_count-c0))], np.int64)
+                _check_factor(C, poles[:,c0:c1], count)
+                local = None
+                for shard in C.addressable_shards:
+                    if shard.replica_id != 0:
+                        continue
+                    start = shard.index[1].start or 0
+                    local = np.asarray(shard.data)[0,:,0,:]
+                    for i in range(min(local.shape[0], nmu-start)):
+                        hasher = hashers.setdefault(start+i, hashlib.sha256())
+                        hasher.update(np.asarray(local[i], dtype="<c16").tobytes())
+                del C, shard, local
             row_hash = np.zeros((nmu,32), np.uint32)
-            for shard in C.addressable_shards:
-                if shard.replica_id != 0:
-                    continue
-                start = shard.index[1].start or 0
-                local = np.asarray(shard.data)[0,:,0,:]
-                for i in range(min(local.shape[0], nmu-start)):
-                    row_hash[start+i] = np.frombuffer(hashlib.sha256(
-                        np.asarray(local[i], dtype="<c16").tobytes()).digest(), np.uint8)
+            for row, hasher in hashers.items():
+                row_hash[row] = np.frombuffer(hasher.digest(), np.uint8)
             row_hash = psum_replicate(row_hash, mesh)
             digest.update(row_hash.astype(np.uint8).tobytes())
-            digest.update(np.asarray(poles, dtype="<f8").tobytes())
+            digest.update(np.asarray(host_poles, dtype="<f8").tobytes())
     return digest.hexdigest()
 
 
-def validate_shared_pole_model(path, *, expected_identity, mesh_xy):
+def validate_shared_pole_model(path, *, expected_identity, mesh_xy, capacity=None):
     """Refuse partial, stale, malformed or changed payload; return header.
 
     Validation is collective and bounded to one irreducible parent face. It
     verifies storage integrity, not the constructor's physical gate claims.
+    With capacity=None only metadata is checked and the returned ephemeral
+    validation_receipt explicitly says NOT_MEASURED; tensor readers and
+    restart membership refuse that receipt. Production callers supply the
+    map ledger with bound caller lifetimes. No receipt is appended to disk.
     """
     header = _read_header(path)
     _check_identity(header["identity"], expected_identity)
     if header["schema"] != SCHEMA or not header["finalized"] or not all(header["written_q"]):
         _refuse("missing final shared-pole commit or incomplete q census")
-    qt = QirrTables(**{k:np.asarray(header["qirr"][k]) for k in _TABLE_KEYS},
-                    n_sym_spatial=header["qirr"]["n_sym_spatial"])
+    qt = shared_pole_qirr_tables(header)
     validate_qirr_tables(qt, header["n_q_irr"], header["n_mu_logical"])
     with h5py.File(path, "r") as f:
         for name, shape, dtype in (
@@ -409,9 +548,47 @@ def validate_shared_pole_model(path, *, expected_identity, mesh_xy):
                 actual = actual.decode()
             if not np.array_equal(actual, expected):
                 _refuse(f"typed operation metadata changed: {key}")
-    if _model_digest(path, header, mesh_xy) != header["digest"]:
+    if capacity is None:
+        # No tensor allocation is permitted without admission. This receipt
+        # must not be mistaken for payload authentication by a restart caller.
+        return dict(header, validation_receipt={"status":"NOT_MEASURED",
+                    "scope":"metadata only; payload digest not authenticated"})
+    if _model_digest(path, header, mesh_xy, capacity=capacity) != header["digest"]:
         _refuse("model payload/identity digest mismatch")
     return header
+
+
+def shared_pole_qirr_tables(header):
+    """Return the existing symmetry-service table in canonical logical order.
+
+    Runtime endpoint packing/locality certification stays with mu_basis and
+    symmetry_maps; the store never invents a second star-action table.
+    """
+    return QirrTables(
+        **{k:np.asarray(header["qirr"][k]) for k in _TABLE_KEYS},
+        n_sym_spatial=header["qirr"]["n_sym_spatial"]).canonical()
+
+
+def read_shared_pole_census(io, *, header, capacity=None):
+    """Return replicated float64 poles² [Nq,Kmax] and int64 counts [Nq].
+
+    This O(Nq*Kmax) metadata is the window planner's census, not factor data.
+    Counts mask every padded prefix; the sentinel is never a physical pole.
+    capacity is the current map ledger with explicitly bound live_stages.
+    """
+    if header.get("validation_receipt", {}).get("status") == "NOT_MEASURED":
+        _refuse("metadata-only validation cannot authorize tensor reads")
+    if header["schema"] != SCHEMA or not header["finalized"]:
+        _refuse("pole census requires a validated finalized model")
+    _check_io_capacity(capacity,io.mesh,header)
+    amount = 8*header["n_q_irr"]*header["Kmax"]
+    _admit(capacity,"read_census",amount+8*header["n_q_irr"],2*amount,
+           device_panel=amount,native_host=True,io=io)
+    poles = (io.read_slab("poles2_ry2", partition_spec=P()) if header["Kmax"]
+             else jnp.ones((header["n_q_irr"],0),jnp.float64))
+    counts = jnp.asarray(header["K"], dtype=jnp.int64)
+    active = jnp.arange(header["Kmax"])[None,:] < counts[:,None]
+    return jnp.where(active, poles, 1.0), counts
 
 
 def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
@@ -423,11 +600,33 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
     the active count *within the returned column slice*, so every consumer
     can mask with arange(Kcap)<K even when column_span starts above zero.
     """
+    if header.get("validation_receipt", {}).get("status") == "NOT_MEASURED":
+        _refuse("metadata-only validation cannot authorize tensor reads")
     if header["schema"] != SCHEMA or not header["finalized"]:
         _refuse("face reader requires a validated finalized model")
     basis = _check_basis(meta, header)
+    ledger = _capacity(meta)
+    if io.mesh is not basis.mesh_xy:
+        _refuse("reader mesh differs from packed basis mesh")
+    _check_io_capacity(ledger,io.mesh,header)
     lo, hi = _span(q_span, header["n_q_irr"], "q_span")
+    if header["Kmax"] == 0 and column_span is None:
+        _admit(ledger,"empty_faces",8*(hi-lo))
+        shape = (hi-lo,basis.n_packed,1,0)
+        faces = [jax.jit(lambda: jnp.zeros(shape,jnp.complex128),
+                         out_shardings=NamedSharding(io.mesh,P(None,axis,None,None)))()
+                 for axis in ("x","y")]
+        return (*faces,jnp.ones((hi-lo,0),jnp.float64),jnp.zeros(hi-lo,jnp.int64))
     c0, c1 = _span(column_span or (0,header["Kmax"]), header["Kmax"], "column_span")
+    totals = []
+    for axis in ("x","y"):
+        shape = (hi-lo,basis.n_canonical,1,c1-c0)
+        totals.append(_conversion_bytes(basis,shape,P(None,axis,None,None),unpack=False))
+    ax,fx,tx = totals[0]; ay,fy,ty = totals[1]
+    metadata = 32*(hi-lo)*(c1-c0)+8*(hi-lo)
+    peak = max(ax+fx+tx, 2*fx, fx+ay+fy+ty, fx+2*fy)
+    _admit(ledger,"read_faces",fx+fy+metadata,max(0,peak-fx-fy),
+           device_panel=max(ax,ay,8*(hi-lo)*(c1-c0)),native_host=True,io=io)
     counts = jnp.asarray(np.clip(np.asarray(header["K"][lo:hi])-c0,0,c1-c0), dtype=jnp.int64)
     active = jnp.arange(c1-c0)[None,:] < counts[:,None]
     faces = []
@@ -438,11 +637,15 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
         C = basis.pack_axis(C, 1, spec=spec)
         faces.append(jnp.where(active[:,None,None,:] & jnp.asarray(
             basis.active_mask)[None,:,None,None], C, 0.0))
+        # Complete masking before allocating the other face: Python reference
+        # release alone does not end an asynchronously dispatched input lifetime.
+        faces[-1].block_until_ready()
+        del C
     poles = io.read_slab("poles2_ry2", shape=(hi-lo,c1-c0), offset=(lo,c0), partition_spec=P())
     return (*faces, jnp.where(active,poles,1.0), counts)
 
 
-# Append to file_io/shared_pole_store.py. Uses its common metadata helpers.
+# Scratch bank uses the same identity and metadata transactions.
 _BANK_SAMPLE_FIELDS = ("Wc", "dWc_ds")
 _BANK_MOMENT_FIELDS = ("M1", "M3")
 
@@ -477,6 +680,8 @@ def _bank_plan(recipe):
         _refuse("scratch plan arrays must have equal nonempty flat lengths")
     if not np.isin(plan["role"], list(codes.values())).all():
         _refuse("scratch plan has unnamed role codes")
+    if np.any(plan["role"] == codes["infinity"]):
+        _refuse("infinity is a reserved moment role, not a bank sample")
     finite = plan["role"] != codes["infinity"]
     if (not np.isfinite(plan["z_ry"][finite]).all()
             or np.any(plan["distinct_id"][finite] < 0)):
@@ -489,6 +694,21 @@ def _bank_plan(recipe):
         rows = finite & (plan["distinct_id"] == idx)
         if len(np.unique(plan["z_ry"][rows])) != 1:
             _refuse("scratch evaluation ID aliases different physical points")
+        if len(np.unique(plan["held"][rows])) != 1:
+            _refuse("scratch evaluation is both held and fitted")
+    for name in ("support_pair", "fit_ids", "held_ids"):
+        if name not in recipe:
+            _refuse(f"scratch plan lacks canonical {name}")
+        raw = np.asarray(recipe[name])
+        if isinstance(recipe[name], np.ndarray) and raw.dtype != np.int64:
+            _refuse(f"scratch plan {name} must have dtype int64")
+        plan[name] = np.asarray(raw, dtype=np.int64)
+    if plan["support_pair"].shape != (n, 2):
+        _refuse("scratch support_pair must have shape (N,2)")
+    for name, held in (("fit_ids", False), ("held_ids", True)):
+        expected = np.unique(plan["distinct_id"][plan["held"] == held])
+        if not np.array_equal(np.sort(plan[name]), expected):
+            _refuse(f"scratch {name} contradicts typed role rows")
     plan["role_codes"] = codes
     return plan
 
@@ -547,7 +767,7 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
             io.create_dataset(field, shape=(nq, d, d), dtype=np.complex128)
         io.write_attr("sample_written", np.asarray(header["sample_written"], dtype=np.bool_))
         io.write_attr("moment_written", np.asarray(header["moment_written"], dtype=np.bool_))
-        for name in ("z_ry", "role", "distinct_id", "held"):
+        for name in ("z_ry", "role", "distinct_id", "held", "support_pair", "fit_ids", "held_ids"):
             io.write_attr(name, plan[name])
         io.write_attr("role_codes_json", np.bytes_(_json(plan["role_codes"])))
         _write_metadata(io, header)
@@ -591,7 +811,7 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
             _refuse("scratch bank sample transaction mismatch")
         if not np.array_equal(file["moment_written"][()], moments):
             _refuse("scratch bank moment transaction mismatch")
-        for name in ("z_ry", "role", "distinct_id", "held"):
+        for name in ("z_ry", "role", "distinct_id", "held", "support_pair", "fit_ids", "held_ids"):
             if (name not in file or file[name].shape != plan[name].shape
                     or file[name].dtype != plan[name].dtype
                     or not np.array_equal(file[name][()], plan[name], equal_nan=True)):
@@ -630,6 +850,8 @@ def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
     header = validate_shared_pole_bank(
         path, expected_identity=expected_identity, mesh_xy=mesh_xy)
     _check_basis(meta, header)
+    if mesh_xy is not meta.mu_basis.mesh_xy:
+        _refuse("writer mesh differs from packed basis mesh")
     if header.get("complete"):
         _refuse("completed scratch bank is immutable")
     # A process may stop after payload/masks close but before the final stamp.
@@ -656,6 +878,8 @@ def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
     if not pending:
         _refuse("scratch write has no payload")
     basis = meta.mu_basis
+    ledger = _capacity(meta)
+    _check_io_capacity(ledger,basis.mesh_xy,header)
     if int(basis.n_logical) != int(shape["d"]):
         _refuse("scratch centroid extent mismatch")
     sample_mask = np.asarray(header["sample_written"], dtype=bool)
@@ -676,6 +900,10 @@ def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
             _refuse(f"scratch {name} requires complex128 packed shape {expected}")
         if not isinstance(array, jax.Array) or not array.sharding.is_equivalent_to(NamedSharding(mesh_xy, spec), array.ndim):
             _refuse(f"scratch {name} requires NamedSharding(mesh_xy, {spec})")
+        arg, output, temporary = _conversion_bytes(basis,array.shape,spec,unpack=True,operator=True)
+        # Factor-sized finite-check envelope, separate from caller input.
+        _admit(ledger,"write_bank_"+name,output,temporary+arg,
+               device_panel=max(arg,output),native_host=True)
         if not bool(jnp.all(jnp.isfinite(array))):
             _refuse(f"scratch {name} contains nonfinite values")
     with SlabIO(path, mode="a", mesh=mesh_xy) as io:
@@ -691,6 +919,7 @@ def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
             # SlabIO's write queue owns canonical until drained. Drain each
             # field so endpoint staging cannot accumulate across fields.
             io.sync_writes()
+            del canonical
             if sample:
                 sample_mask[q0:q1, a0:a1, _BANK_SAMPLE_FIELDS.index(name)] = True
             else:
@@ -718,6 +947,8 @@ def read_shared_pole_bank(io, q_span, *, meta, header, sample_span=None,
     if header.get("schema") != BANK_SCHEMA:
         _refuse("scratch bank reader schema mismatch")
     _check_basis(meta, header)
+    if io.mesh is not meta.mu_basis.mesh_xy:
+        _refuse("reader mesh differs from packed basis mesh")
     fields = tuple(fields)
     if not fields or len(set(fields)) != len(fields) or any(
             f not in _BANK_SAMPLE_FIELDS + _BANK_MOMENT_FIELDS for f in fields):
@@ -730,6 +961,8 @@ def read_shared_pole_bank(io, q_span, *, meta, header, sample_span=None,
     a0, a1 = (_span(sample_span, shape["nsample"], "sample_span")
               if need_samples else (0, 0))
     basis = meta.mu_basis
+    ledger = _capacity(meta)
+    _check_io_capacity(ledger,basis.mesh_xy,header)
     if int(basis.n_logical) != int(shape["d"]):
         _refuse("scratch centroid extent mismatch")
     sample_mask = np.asarray(header["sample_written"], dtype=bool)
@@ -741,14 +974,22 @@ def read_shared_pole_bank(io, q_span, *, meta, header, sample_span=None,
         if not marked.all():
             _refuse(f"scratch bank {name} requested span is incomplete")
     out = {}
+    retained = 0
     for name in fields:
         sample = name in _BANK_SAMPLE_FIELDS
         spec = P(None, None, 'x', 'y') if sample else P(None, 'x', 'y')
         prefix = (q1-q0, a1-a0) if sample else (q1-q0,)
         offset = (q0, a0, 0, 0) if sample else (q0, 0, 0)
+        arg, output, temporary = _conversion_bytes(basis,
+            prefix+(basis.n_canonical,basis.n_canonical),spec,unpack=False,operator=True)
+        _admit(ledger,"read_bank_"+name,retained+arg+output,temporary,
+               device_panel=arg,native_host=True,io=io)
         canonical = io.read_slab(
             name, shape=prefix + (basis.n_canonical, basis.n_canonical),
             valid_shape=prefix + (basis.n_logical, basis.n_logical),
             offset=offset, dtype=np.complex128, partition_spec=spec)
         out[name] = basis.pack_operator(canonical, spec=spec)
+        out[name].block_until_ready()
+        retained += output
+        del canonical
     return out
