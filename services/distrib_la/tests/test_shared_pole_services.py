@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 
-def check_faces(mesh, output=None):
+def check_faces(mesh, output=None, profile=False):
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -41,6 +41,15 @@ def check_faces(mesh, output=None):
         fn = jax.jit(lambda *a: D.contract_faces(
             *a, mesh=mesh, return_transpose=True))
         executable = fn.lower(*args).compile()
+        if profile and not spin:
+            import ctypes
+            cudart = ctypes.CDLL('libcudart.so.13')
+            jax.block_until_ready(args)
+            assert cudart.cudaProfilerStart() == 0
+            for _ in range(25):
+                profiled = executable(*args)
+                jax.block_until_ready(profiled)
+            assert cudart.cudaProfilerStop() == 0
         got, trans = executable(*args)
         err = float(jnp.max(jnp.abs(got - put(want, P(None, 'x', 'y')))))
         terr = float(jnp.max(jnp.abs(trans - put(wt, P(None, 'x', 'y')))))
@@ -135,6 +144,7 @@ def main():
     ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--constructor', action='store_true')
     ap.add_argument('--symmetry', action='store_true')
+    ap.add_argument('--profile', action='store_true')
     args = ap.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     assert jax.process_count() == 4 and jax.device_count() == 4
@@ -142,7 +152,7 @@ def main():
     receipt = dict(job=os.environ.get('SLURM_JOB_ID'),
                    step=os.environ.get('SLURM_STEP_ID'),
                    commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
-                   source=str(Path(__file__).resolve()), faces=check_faces(mesh, args.output))
+                   source=str(Path(__file__).resolve()), faces=check_faces(mesh, args.output, profile=args.profile))
     if args.constructor:
         receipt['constructor'] = check_directions_and_gemm(mesh)
     if args.symmetry:
@@ -151,7 +161,7 @@ def main():
         spec = importlib.util.spec_from_file_location('shared_pole_unfold_gate', path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        receipt['symmetry'] = mod.check_shared_pole_unfold(mesh)
+        receipt['symmetry'] = mod.check_shared_pole_unfold(mesh, profile=args.profile)
     if jax.process_index() == 0:
         (args.output / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
         print(json.dumps(receipt), flush=True)
