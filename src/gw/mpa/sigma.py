@@ -335,6 +335,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         return total.at[rows].add(values, indices_are_sorted=True, unique_indices=True)
 
     diagnostic_done = False
+    compact_kernels = {}
     cached_indices = cached_bounds = cached_intervals = None
 
     def build(_residues, _omega_fields, indices, bounds, _phase_real, E_ref_B, t_node):
@@ -389,7 +390,41 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                     io, (lo, hi), meta=meta, header=header, column_span=(c0, c1))
                 X, Y, poles2, _counts = faces
                 ranges = device_put_process_local(selected, NamedSharding(mesh_xy, P()))
-                child = unfold(X,Y,poles2,ranges,E_ref_B,t_node)
+                # Slice inside the compiled panel body: no extra resident
+                # factor views, and the GEMMs see only this window's live
+                # column envelope instead of multiplying zero-weight tails.
+                live = selected[:, 1] > selected[:, 0]
+                first = int(np.min(selected[live, 0]))
+                last = int(np.max(selected[live, 1]))
+                key = (lo, hi, c1-c0, first, last)
+                kernel = unfold
+                if (first, last) != (0, c1-c0):
+                    if key not in compact_kernels:
+                        def compact_body(X, Y, poles2, ranges, e, t,
+                                         first=first, last=last, unfold=unfold):
+                            return unfold(
+                                X[..., first:last], Y[..., first:last],
+                                poles2[:, first:last], ranges-first, e, t)
+                        compact = jax.jit(compact_body)
+                        from runtime.aot_memory import aot_kernel_peak_bytes
+                        compiled = compact.lower(
+                            X,Y,poles2,ranges,E_ref_B,t_node).compile()
+                        peak = aot_kernel_peak_bytes(compiled)
+                        schedule.setdefault("compiled_compact_panels", []).append(dict(
+                            parent_span=[lo,hi], input_columns=c1-c0,
+                            column_span=[first,last],
+                            compiled_bytes_per_rank=peak.total,
+                            cufft_measured=peak.cufft_measured))
+                        if "capacity_receipt" in schedule:
+                            if not peak.cufft_measured:
+                                raise ValueError("shared-pole compact synthesis workspace query unavailable")
+                            meta.shared_pole_capacity.reserve(
+                                f"sigma.compact.{lo}.{hi}.{c1-c0}.{first}.{last}",
+                                resident_bytes_per_rank=0, workspace_bytes_per_rank=peak.total,
+                                concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
+                        compact_kernels[key] = compact
+                    kernel = compact_kernels[key]
+                child = kernel(X,Y,poles2,ranges,E_ref_B,t_node)
                 if resident is None:
                     child.block_until_ready()
                 del faces, X, Y, poles2, _counts, ranges
@@ -463,7 +498,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
         raise ValueError("GATE shared_pole_capacity: missing current-map CapacityLedger")
     concurrent = capacity.live_stages
     accepted = {row["stage"]: row for row in capacity.entries
-                if row["status"] == "PASS"}
+                if row["device_budget_status"] == "PASS"}
     caller_bytes = sum(accepted[name][key] for name in concurrent for key in
                        ("resident_bytes_per_rank", "workspace_bytes_per_rank"))
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
@@ -480,7 +515,14 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
                     capacity_receipt=receipt,route="empty",compiled_peak_status="NOT_APPLICABLE")
     tables = _shared_pole_panel_tables(meta, header, (0,nq), mesh_xy=mesh_xy)
     local = all(c["is_local"] for c in tables["certificates"].values())
-    budget = capacity.limit_bytes_per_rank - caller_bytes
+    # The ledger owns the hardware limit (ruling24); 3U is a scaling
+    # receipt, not a reason to reread resident factors at every tau node.
+    # A zero-byte planning reservation prices the existing ambient set.
+    admission = capacity.reserve(
+        "sigma.panel_budget", resident_bytes_per_rank=0,
+        workspace_bytes_per_rank=0, concurrent_with=concurrent)
+    budget = (admission["available_device_bytes_per_rank"]
+              - admission["aggregate_bytes_per_rank"])
     best = None
     for b in range(1,nq+1):
         # Byte counts are affine in the column width. Price through the
@@ -502,7 +544,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
         "sigma.synthesis", resident_bytes_per_rank=footprint["resident_bytes_per_rank"],
         workspace_bytes_per_rank=footprint["workspace_bytes_per_rank"],
         concurrent_with=concurrent)
-    return dict(status=receipt["status"], unit_bytes=U,
+    return dict(status=receipt["device_budget_status"], unit_bytes=U,
                 peak_live_bytes_per_rank=receipt["aggregate_bytes_per_rank"],
                 peak_in_U=receipt["aggregate_bytes_per_rank"]/U,
                 parent_capacity=b,column_capacity=c,
