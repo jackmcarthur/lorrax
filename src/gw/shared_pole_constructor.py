@@ -408,61 +408,80 @@ def _fit_roles(recipe):
                 recipe["distinct_id"], recipe["role"], recipe["held"]))]
 
 
+@lru_cache(maxsize=256)
+def _parent_panel_slice(mesh_xy, parent, width):
+    """Slice [b,n,r] direction/action faces without a host or replicated seam."""
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    return jax.jit(
+        lambda arrays: jax.tree.map(lambda a: a[parent:parent+1, :, :width], arrays),
+        out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
+
+
 def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
                       column_extent, logical_n, admit, infinity_carrier):
-    """Read each distinct fitted sample once, preserving all tangent roles."""
+    """Select each q row independently from a bounded batch of fitted samples.
+
+    ``read_sample`` returns W/dW [b,n,n] faces. Only spectra cross the host;
+    output states, masks and role receipts are grouped by physical parent.
+    """
     import distrib_la
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
 
-    # Imaginary W is exactly Hermitian; retain both endpoint shards across
-    # the prescribed roundoff projection before the service's eager gate.
     hermitian_part = jax.jit(
-        lambda a: 0.5 * (a + a.conj().T),
-        out_shardings=NamedSharding(eigh_plan.mesh, P('x', 'y')))
-
+        lambda a: 0.5 * (a + _adjoint(a)),
+        out_shardings=NamedSharding(eigh_plan.mesh, P(None, 'x', 'y')))
     fit_roles = _fit_roles(recipe)
     states, masks, roles = [], [], []
+    def largest_side():
+        return infinity_carrier + max((sum(st[1].shape[-1] for st in row)
+                                       for row in states), default=0)
     for sample_id in recipe["fit_ids"]:
-        # Only current directions survive alongside the next sample/solve.
-        # The selected width is known before its action panels are built.
-        admit(infinity_carrier + sum(state[1].shape[-1] for state in states))
+        admit(largest_side())
         w, derivative = read_sample(int(sample_id), states)
+        if not states:
+            states = [[] for _ in range(w.shape[0])]
+            masks = [[] for _ in states]
+            roles = [[] for _ in states]
         for role in fit_roles:
             if role["held"] or int(role["sample_id"]) != int(sample_id):
                 continue
             kind = role["role"].split(":", 1)[0]
             if kind == "line":
-                q, values = distrib_la.right_singular_vectors(
-                    w[0], recipe["direction_cutoff"], eigh_plan=svd_plan,
+                q_batch, values = distrib_la.right_singular_vectors(
+                    w, recipe["direction_cutoff"], eigh_plan=svd_plan,
                     column_extent=column_extent,
                     multiplet_tol=recipe["multiplet_relative_tolerance"])
             elif kind == "imaginary":
                 width = min(logical_n, max(1, int(recipe["imaginary_width"])))
-                q, values = distrib_la.leading_eigenvectors(
-                    hermitian_part(-w[0]), width, eigh_plan=eigh_plan, column_extent=column_extent,
+                q_batch, values = distrib_la.leading_eigenvectors(
+                    hermitian_part(-w), width, eigh_plan=eigh_plan,
+                    column_extent=column_extent,
                     multiplet_tol=recipe["multiplet_relative_tolerance"])
             else:
                 raise ValueError(f"GATE shared_pole_role: got: {kind}; want: line or imaginary fitted role; why: unknown tangent semantics")
-            width = int(values.shape[-1])
-            if width < 1 or width > logical_n:
-                raise ValueError(f"GATE shared_pole_directions: got: rank {width}; want: 1..{logical_n}; why: empty or padded physical direction set")
-            q = q[None]
+            widths = tuple(int(v.shape[-1]) for v in values)
+            if any(width < 1 or width > logical_n for width in widths):
+                raise ValueError(f"GATE shared_pole_directions: got: ranks {widths}; want: 1..{logical_n}; why: empty or padded physical direction set")
+            slices = tuple(_parent_panel_slice(eigh_plan.mesh, i, column_extent(width))
+                           for i, width in enumerate(widths))
+            directions = tuple(take(q_batch) for take in slices)
             s = _sample_point(recipe, int(sample_id)) ** 2
-            # The line's conjugate state reuses the SAME right directions,
-            # exactly as the latent Hermite construction specifies. No extra
-            # sample and no re-selection on the adjoint matrix is performed.
+            # The conjugate state reuses exactly the same right directions.
             for conjugate in ((False, True) if kind == "line" and s.imag != 0 else (False,)):
-                admit(infinity_carrier + sum(state[1].shape[-1] for state in states)
-                      + q.shape[-1])
+                admit(largest_side() + q_batch.shape[-1])
                 transa = "C" if conjugate else "N"
-                output = matmul(w, q, transa=transa)
-                action = matmul(derivative, q, transa=transa)
-                states.append((s.conjugate() if conjugate else s, q, output, action))
-                masks.append(jnp.arange(q.shape[-1]) < width)
-                roles.append({"sample_id": int(sample_id), "role": role["role"],
-                              "conjugate": conjugate, "width": width,
-                              "carrier_width": q.shape[-1]})
+                output = matmul(w, q_batch, transa=transa)
+                action = matmul(derivative, q_batch, transa=transa)
+                for i, (q, take, width) in enumerate(zip(directions, slices, widths)):
+                    out, deriv = take((output, action))
+                    states[i].append((s.conjugate() if conjugate else s, q, out, deriv))
+                    masks[i].append(jnp.arange(q.shape[-1]) < width)
+                    roles[i].append({"sample_id": int(sample_id), "role": role["role"],
+                                     "conjugate": conjugate, "width": width,
+                                     "carrier_width": q.shape[-1]})
+            del q_batch, directions, output, action
         del w, derivative
     return states, masks, roles
 
@@ -659,8 +678,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     # distributed plan keeps its one-parent face-tiled execution schedule.
     batch_limit = mesh_divisor(mesh_xy) if resolution.layout == "local" else 1
     nq = int(header["bank_shape"]["nq"])
-    for q in range(nq):
-        span = (q, q + 1)
+    for q_start in range(0, nq, batch_limit):
+        q_stop = min(q_start + batch_limit, nq)
+        span = (q_start, q_stop)
+        batch_width = q_stop - q_start
         capacity(0, phase="selection")
         expose_live(())
         with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
@@ -668,33 +689,42 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                           header=moment_header, fields=("M1", "M3"))
         width = min(logical_n, max(1, int(recipe["infinity_width"])))
         qi, infinity_values = distrib_la.leading_eigenvectors(
-            exact["M1"][0], width, eigh_plan=eig, column_extent=column_extent,
+            exact["M1"], width, eigh_plan=eig, column_extent=column_extent,
             multiplet_tol=recipe["multiplet_relative_tolerance"])
-        qi = qi[None]
         capacity(qi.shape[-1], phase="selection")
         infinity = (qi, mm(exact["M1"], qi), mm(exact["M3"], qi))
         del exact
         with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
+            sample_lo = min(int(i) for i in recipe["fit_ids"])
+            sample_hi = max(int(i) for i in recipe["fit_ids"]) + 1
+            expose_live(infinity)
+            samples = read_shared_pole_bank(
+                bank_io, span, meta=meta, header=header,
+                sample_span=(sample_lo, sample_hi))
+            # The store admits this complete bounded scratch batch before
+            # allocation. Charge it while directions/actions are selected;
+            # release it before admitting the dense pencil.
+            retained_panels = tuple(samples.values())
             def read_sample(sample_id, retained_states):
-                expose_live((*infinity, *(panel for state in retained_states for panel in state[1:])))
-                data = read_shared_pole_bank(
-                    bank_io, span, meta=meta, header=header,
-                    sample_span=(sample_id, sample_id + 1))
-                return data["Wc"][:, 0], data["dWc_ds"][:, 0]
+                index = sample_id - sample_lo
+                return samples["Wc"][:, index], samples["dWc_ds"][:, index]
 
             states, masks, roles = _direction_states(
                 read_sample, recipe, eigh_plan=eig, svd_plan=svd, matmul=mm,
                 column_extent=column_extent, logical_n=logical_n, admit=capacity,
                 infinity_carrier=qi.shape[-1])
-        masks.append(jnp.arange(qi.shape[-1]) < infinity_values.shape[-1])
-        active_columns = jnp.concatenate(masks)[None]
-        # Finish the current parent's selected actions before retaining them.
+        del samples
+        for i, values in enumerate(infinity_values):
+            ri = column_extent(values.shape[-1])
+            parent_infinity = _parent_panel_slice(mesh_xy, i, ri)(infinity)
+            masks[i].append(jnp.arange(ri) < values.shape[-1])
+            active_columns = jnp.concatenate(masks[i])[None]
+            pending.append((q_start+i, states[i], parent_infinity,
+                            active_columns, parent_infinity[0], roles[i]))
         jax.block_until_ready((states, infinity))
-        pending.append((q, states, infinity, active_columns, qi, roles))
+        del states, infinity, qi, infinity_values, masks, roles
         retained_panels = tuple(a for _, ss, ii, mask, _, _ in pending
                                 for a in (*ii, mask, *(v for st in ss for v in st[1:])))
-        if len(pending) < batch_limit and q + 1 < nq:
-            continue
         batch_results = None
         if resolution.layout == "local":
             finite_width = max(sum(st[1].shape[-1] for st in item[1]) for item in pending)
