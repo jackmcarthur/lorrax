@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import h5py
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from common.collectives import rank0_transaction
+from common.collectives import barrier, rank0_transaction
 from .commit_state import set_commit_state
 import common.timing as timing
 from runtime.padding import (
@@ -857,6 +857,9 @@ def write_restart_state_to_h5(
         # psi faces to the same portable disk extent.  A legacy file has no
         # way to distinguish physical rows from its mesh pad and stays on its
         # historical full-carrier storage path.
+        # Finish the preceding publication on every rank before opening any
+        # reader. barrier delegates to multihost_utils.sync_global_devices.
+        barrier("restart.band_window.before_read")
         with h5py.File(filename, "r") as f:
             schema = (int(np.asarray(f[BAND_WINDOW_SCHEMA_DATASET])[()])
                       if BAND_WINDOW_SCHEMA_DATASET in f else None)
@@ -871,6 +874,9 @@ def write_restart_state_to_h5(
                 loaded_band_tag = _loaded_band_axis(
                     n_band_logical,
                     mesh if mesh is not None else carrier_divisor)
+        # A fast rank must not open SlabIO for append while a peer still has
+        # this metadata reader open (or has not reached its open yet).
+        barrier("restart.band_window.readers_closed")
 
     if ((psi_full_y_transverse is not None
          or psi_full_y_transverse_mun is not None)
