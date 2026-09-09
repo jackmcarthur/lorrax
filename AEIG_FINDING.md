@@ -1,8 +1,8 @@
 # AEIG: repeated eigenvalues expose a failure; input mutation is a separate defect
 
-Heavy investigation, 2026-09-09. **Hypothesis 1 holds in the narrower sense of a repeated-eigenvalue failure through the cuSolverMp service. Small spectral width alone does not reproduce it. Hypothesis 2 also holds independently: the non-donating eigensolver overwrites its input. Hypothesis 3 is not an available remedy: both the original failure and these tests already load cuSolverMp 0.9.1, the latest published release.**
+Investigation and coupled-iteration follow-up, 2026-09-09. **Hypothesis 1 holds in the narrower sense of a repeated-eigenvalue failure through the cuSolverMp service. Small spectral width alone does not reproduce it. Hypothesis 2 also holds independently: the non-donating eigensolver overwrites its input. Hypothesis 3 is not an available remedy: both the original failure and these tests already load cuSolverMp 0.9.1, the latest published release.**
 
-Use AREDUCE's guarded Newton–Schulz metric inverse root as the metric algorithm. Its combined capacity changes remain withheld under ruling43; this is not a recommendation to integrate those commits wholesale. The native input-preservation repair is available at `ec3e5d4e` on branch `lane/sp-aeig-2026-09-07`. Full distributed Si accuracy gates fail as detailed below, so the combined path is not ready for integration. Leave the genuine Gram/Ritz eigenproblems in place. Do not claim that the iteration fixes both reported refusals: the Gram-diagonal refusal has a different cause.
+The requested coupled Newton–Schulz metric replacement is implemented at `05341b40` on branch `lane/sp-aeig-2026-09-07`; its measured inverse-root residual passes at roundoff, but full Si accuracy remains failed. AREDUCE's original guarded Newton–Schulz correction gave effectively the same result. Its combined capacity changes remain withheld under ruling43; this is not a recommendation to integrate those commits wholesale. The native input-preservation repair is available at `ec3e5d4e` on branch `lane/sp-aeig-2026-09-07`. Full distributed Si accuracy gates fail as detailed below, so the combined path is not ready for integration. Leave the genuine Gram/Ritz eigenproblems in place. Do not claim that the iteration fixes both reported refusals: the Gram-diagonal refusal has a different cause.
 
 Evidence root **R** = `/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/frequency_integration_sandbox/338_aeig_20260909`. All new numerical measurements are P4, one node/four processes/four A100 40 GB GPUs, `cuda_async@0.85`, numerical source `b16fe23ff2d831809ffa53f0765cc0fde3fd0f41` in this worktree (leg04 HEAD `d8bbd7fc` adds only this report). Provisioned branch was `arch/sp-aeig-2026-09-09`; publication is on requested `lane/sp-aeig-2026-09-07`. Legs01–04 made no numerical source change or installation. The continuation below implements and gates a native input-preservation repair.
 
@@ -89,3 +89,31 @@ Source repair **ec3e5d4e72d725fe60ea14f8fd7f35b1e7a61e40**, branch `lane/sp-aeig
 - JAX constructor peak2820050475 bytes on each rank, `memory_rank*.json`. This excludes untracked external allocations and is not a paired full-driver peak gate. Workspace copy costs are explicitly accounted, not asserted free.
 
 The previously banked local-directions/distributed-reduction gates pass; this full distributed route does not. Direction/reduction numerical sensitivity is an unresolved hypothesis, not a proven attribution. The direct vendor failure and input-preservation defect are independently established; neither justifies waiving the remaining model/Sigma differences. No repeated blind relaunch or unrelated optimization is warranted. Open integration gates: strict full-distributed invariants/Sigma and paired full-driver memory. Production d_info handling remains an audit gap, though zero info would not catch this demonstrated failure.
+
+
+## Coordinator23:55Z: coupled Newton–Schulz implemented; remaining discrepancy is unchanged
+
+**Source05341b40 on branch lane/sp-aeig-2026-09-07 is pushed. Do not claim strict Si acceptance or advance to Na.** ACON line ownership was posted before editing in `D/exchange/aeig/CONSTRUCTOR_LINE_CLAIM.md`, claim2071. The only replaced eigensolve is the retained metric inverse root; normalized Gram and sentinel-shifted Ritz eigenvector solves remain unchanged. The previous Run338/09 already avoided the metric eigensolve using AREDUCE's four-step single-variable Newton–Schulz correction. It is incorrect to attribute that run's remaining discrepancy to a metric eigensolve.
+
+The implementation uses Y0=A,Z0=I; T=(3I-ZY)/2,Ynext=YT,Znext=TZ through the resolved distrib_la GEMM. The measured d=||I-A||infinity must be finite and below1. Since d_next<=d² for this Hermitian initial problem, k=ceil(log2(log(target)/log(d))) suffices, with target=min(existing residual tolerance,32*eps64), k=0 within target. This count is selected once from the initial bound, not by testing convergence of matrix residuals on device. The distributed host owner refuses invalid bounds before iterating; traced callers select zero iterations and a compulsory failed predicate with measured norm. Receipt fields include d,k,||ZAZ-I||F and ||ZAZ-I||F/sqrt(R). No new user dial, matrix gather, or eigenvector freezing.
+
+**Controls58128417.29**, `R/11_coupled_si_p4/controls.json`, claim2072: initial bounds0,1e-8,.2,.8,.99 select0,1,5,8,12 iterations; maximum inverse-root error1.7763568394e-15 and maximum normalized residual2.48253415325e-16 against the analytic diagonal result. Bound1 refuses and prints1.0; compiled guard rejects with zero iterations. low_mem_bands=N/A. This attempt's later physical write failed because the runner omitted an output directory; failed artifacts retained and scaffolding issue registered. No numerical source change preceded the corrected attempt.
+
+**Physical Si58128417.30**, `R/12_coupled_si_p4/strict_assessment.json`, with matching stored-reference **low_mem_bands=true**:
+
+| Gate / receipt | Measured result | Disposition |
+|---|---|---|
+| K all8 parents | 2010,1068,1470,1271,1313,1222,1250,1376 | Identical to reference |
+| Initial metric infinity norm | 3.77553158775e-8–1.38325026058e-7 | Convergence assumption comfortably passes |
+| Fixed iteration count | q0:2; other7 parents:1 | Derived from initial bound |
+| Maximum absolute ZAZ-I Frobenius residual | 5.24044084625e-15 | Measured |
+| Maximum normalized residual | 9.46199725146e-17 | Passes existing1e-10 residual gate |
+| Gauge-invariant model maximum | **2.37725903807e-9** | **FAIL**, limit1e-9 |
+| Analytic Sigma maximum / RMS | **0.00573271300760 / 0.000173771937358meV** | **FAIL**, max limit0.001meV |
+| Sigma change vs previous four-step correction | max2.11957775642e-8meV; RMS7.46161488012e-10meV | Coupled update has negligible effect on remaining discrepancy |
+
+The model difference remains in q7 C Lambda C†. Analytic scope is all8external×6×6bands×133energies/all64internalq at fixed G, reference Run334/16_sigma_p4/si_local_score/production_store.npz; old-correction comparison uses Run338/09/score/production_store.npz. Raw artifacts: `distributed/constructor_receipt.json`, `gauge.json`, `sigma_pair.json`, `strict_assessment.json`. All8 retain passivity and clear both original refusals. Per-parent J=K, condition, damping0, storage and passivity are copied into strict_assessment; total padded compact storage94807744B. No timing, paired-memory, CD, Na or Run258/447-call accuracy claim.
+
+This isolates the correction as numerically accurate and rules out choosing between these two Newton–Schulz recurrences as the remedy for the observed discrepancy on this Si input. The precise remaining construction discrepancy is unresolved; do not weaken the gate, relaunch the defective metric eigensolve, or label the replacement alone a full-model fix. Na is not launched because its required strict Si gate failed.
+
+Vendor registration is explicit in KNOWN_LORRAX_ISSUES.md at `src/ffi/cpp/cusolvermp/eigh_ffi.cc:175`, with direct reproducer and job58128417.27. The linked version remains cuSolverMp0.9.1; NVIDIA's published latest at this audit is0.9.1, and the newest advertised nvidia/26.5 module bundles older0.8.0. No newer available version was established and no installation was attempted.
