@@ -604,32 +604,58 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     # One donated internal [output,q,x,y] carry spans every window. Public
     # writer slices are [q,output,x,y]; only that bounded slice is transposed.
     # Reserve output plus a dense/transport headroom, and batch only when the
-    # common ledger's remaining 3U budget cannot hold the full point plan.
+    # common ledger's admitted panel budget cannot hold the full point plan.
     layout = config.get("linalg","local") if hasattr(config,"get") else config.backend.linalg
     native = response_dense_workspace(mesh_xy,meta.mu_basis.n_packed,len(z),layout,with_eigh=True)
     headroom = 16*face_bytes + native["gemm"] + int(phase.nbytes+derivative.nbytes)
-    inherited_live = sum(row["resident_bytes_per_rank"]+row["workspace_bytes_per_rank"]
-        for row in ledger.entries if row["stage"] in ambient)
-    available = ledger.limit_bytes_per_rank - headroom - inherited_live
-    qwidth = max(1,min(len(qids),int(available//(2*face_bytes))))
+    # Ask the ledger owner for R24's remaining device budget. The zero-byte
+    # planning row includes ambient live reservations but allocates nothing.
+    _, budget = _reserve(meta,"bank_planning",0)
+    live_bytes = budget["aggregate_bytes_per_rank"]
+    device_available = budget["available_device_bytes_per_rank"]
+    scaling_target = budget["limit_bytes_per_rank"]
+
+    @lru_cache(maxsize=None)
+    def dense_bytes(width):
+        abstract = jax.ShapeDtypeStruct((width,meta.mu_basis.n_packed,meta.mu_basis.n_packed),
+            jnp.complex128,sharding=NamedSharding(mesh_xy,P(None,"x","y")))
+        stats = samples.lower(abstract,abstract,abstract).compile().memory_analysis()
+        if stats is None:
+            raise ValueError("GATE response_capacity: sample solve planning memory unavailable")
+        dense = stats.argument_size_in_bytes+stats.output_size_in_bytes+stats.temp_size_in_bytes
+        # Preserve the existing dense/native and writer conversion envelopes.
+        return max(dense+native["total"],4*width*face_bytes+native["total"])
+
+    minimum = headroom+live_bytes+2*face_bytes+dense_bytes(1)
+    planning_limit = min(scaling_target,device_available)
+    if minimum > planning_limit:
+        planning_limit = device_available
+    available = planning_limit-headroom-live_bytes
+    qwidth = min(len(qids),int((available-dense_bytes(1))//(2*face_bytes)))
+    receipt["panel_budget"] = dict(
+        scaling_target_bytes_per_rank=scaling_target,
+        device_budget_bytes_per_rank=budget["device_budget_bytes_per_rank"],
+        inherited_peak_bytes_per_rank=budget["inherited_peak_bytes_per_rank"],
+        available_device_bytes_per_rank=device_available,
+        ambient_live_bytes_per_rank=live_bytes,headroom_bytes_per_rank=headroom,
+        native_workspace=native,planning_limit_bytes_per_rank=planning_limit,
+        minimum_panel_bytes_per_rank=minimum,
+        policy="prefer 3U panels; remaining device budget is the refusal limit (ruling24)")
+    if qwidth < 1:
+        raise ValueError(f"GATE response_capacity: one q/sample panel needs {minimum} B/rank "
+                         f"including live/native costs; remaining device budget is {device_available} B/rank "
+                         f"(3U scaling target {scaling_target} B/rank)")
     for q0 in range(0,len(qids),qwidth):
         q1 = min(q0+qwidth,len(qids))
         width = len(z)
-        while width > 0:
-            abstract = jax.ShapeDtypeStruct((width,meta.mu_basis.n_packed,meta.mu_basis.n_packed),
-                jnp.complex128,sharding=NamedSharding(mesh_xy,P(None,"x","y")))
-            stats = samples.lower(abstract,abstract,abstract).compile().memory_analysis()
-            if stats is None:
-                raise ValueError("GATE response_capacity: sample solve planning memory unavailable")
-            dense = stats.argument_size_in_bytes+stats.output_size_in_bytes+stats.temp_size_in_bytes
-            # Unpacking/writer checks are bounded by four packed sample faces;
-            # split-padding conversion has its actual extra store reservation.
-            extra = max(dense+native["total"],4*width*face_bytes+native["total"])
-            if 2*width*(q1-q0)*face_bytes+extra <= available:
-                break
+        while 2*width*(q1-q0)*face_bytes+dense_bytes(width) > available:
             width -= 1
-        if width == 0:
-            raise ValueError("GATE response_capacity: even one bank sample plus dense workspace exceeds remaining3U")
+        planned_bytes = headroom+live_bytes+2*width*(q1-q0)*face_bytes+dense_bytes(width)
+        receipt.setdefault("panel_plans",[]).append(dict(q_span=(q0,q1),sample_width=width,
+            aggregate_bytes_per_rank=planned_bytes,
+            scaling_status="PASS" if planned_bytes <= scaling_target else "WARN",
+            device_budget_status="PASS",scaling_target_bytes_per_rank=scaling_target,
+            available_device_bytes_per_rank=device_available))
         for lo in range(0,len(z),width):
             hi = min(lo+width,len(z));a = hi-lo
             ledger.live_stages = ambient
@@ -692,6 +718,6 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             del raw
     ledger.live_stages = ambient
     receipt["stream_passes"] = len(receipt["batches"])
-    receipt["batch_reason"] = "full plan admitted" if len(receipt["batches"]) == 1 else "3U output carry plus dense/transport headroom requires bounded replays"
+    receipt["batch_reason"] = "full plan admitted" if len(receipt["batches"]) == 1 else "preferred 3U or remaining device-budget panels require bounded replays; see panel_budget and panel_plans"
     receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
     return _finish_receipt(receipt,meta,header,started)
