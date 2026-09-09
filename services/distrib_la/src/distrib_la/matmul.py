@@ -266,13 +266,22 @@ def _cublasmp(mesh, A, B, C, *, alpha: complex, beta: complex,
     from distrib_la._cusolvermp import get_or_init_context
 
     px, py = _mesh_shape(mesh)
-    if (transa != "N" or transb != "N") and px * py > 1:
-        raise ValueError(
-            f"cuBLASMp matmul op={transa}/{transb} on {px}x{py} is "
-            "refused: multi-rank transpose modes are not trustworthy "
-            "(transa returned a wrong result; transb can deadlock). Use "
-            "SLATE/PBLAS, pretranspose into a face-sharded array, or select "
-            "the batch_reshard route.")
+    if transa != "N" or transb != "N":
+        # cuBLASMp's multi-rank native transpose descriptors have produced
+        # wrong answers / deadlock. Move endpoint tiles on device, then use
+        # the certified N,N provider. This is a distributed transpose, not
+        # a local tile transpose and not a host/full-matrix gather.
+        tile = NamedSharding(mesh, P(None, 'x', 'y'))
+        def transpose(a, op):
+            if op == 'N':
+                return a
+            @jax.jit(out_shardings=tile)
+            def move(x):
+                t = jnp.swapaxes(x, -1, -2)
+                return jnp.conj(t) if op == 'C' else t
+            return move(a)
+        A, B = transpose(A, transa), transpose(B, transb)
+        transa, transb = 'N', 'N'
     if A.dtype not in (jnp.dtype("float64"), jnp.dtype("complex128")):
         raise ValueError(
             f"cuBLASMp matmul supports float64/complex128; got {A.dtype}")
@@ -443,10 +452,11 @@ def matmul(
     Provider routes require float64 or complex128, one JAX process per mesh
     cell in y-minor order, exact face tiling, and an available handler.
     cuBLASMp and SLATE additionally require a square mesh; multi-rank
-    cuBLASMp accepts only ``N,N``.
-    Its transpose-A mode returned a wrong answer in the real P=4 gate, while
-    transpose-B can return rank-divergent ``INVALID_VALUE`` and deadlock; both
-    are refused before entering the provider.
+    cuBLASMp implements transpose/adjoint modes by a device face transpose
+    followed by its N,N provider call. Its native transpose descriptors are
+    never used: transpose-A returned wrong answers and transpose-B could
+    deadlock. These explicit endpoint moves carry collective communication
+    and one additional operand-sized distributed buffer per moved operand.
 
     The staged route does not require a provider or square mesh when selected
     with ``backend='off'``, but every physical input face and the output face
