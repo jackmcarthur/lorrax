@@ -636,7 +636,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         if _sample_point(recipe, sample_id) != _sample_point(stored_recipe, sample_id):
             raise ValueError("GATE shared_pole_bank_state: got: changed z; want: current physical sample point; why: recipe hashes alone do not bind resolved points")
 
-    def capacity(side, *, phase=None):
+    def capacity(side, *, phase=None, sample_batch=1):
         nonlocal current_side, current_phase, workspace
         if phase is not None:
             current_phase = phase
@@ -651,7 +651,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         workspace = sum(native_maxima.values())
         price = shared_pole_byte_terms(
             meta, mesh_xy=mesh_xy, resolution=resolution, pencil_side=side,
-            parent_batch=batch_width, sample_batch=1, phase=current_phase)
+            parent_batch=batch_width, sample_batch=sample_batch, phase=current_phase)
         # Other parents' narrow inputs survive selection and each model's
         # checks; they are additional live storage, never hidden in a limit.
         extra = sum(int(np.prod(a.sharding.shard_shape(a.shape))) * a.dtype.itemsize
@@ -777,6 +777,31 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                        for iq, _, _, _, directions, row_roles in pending]
             retained_panels = (*jax.tree.leaves(batch_results),
                                *(item[4] for item in pending))
+        batch_checks = None
+        if batch_results is not None:
+            from gw.shared_pole_local import local_model_checks
+            check_span = (pending[0][0], pending[-1][0]+1)
+            held_ids = tuple(int(i) for i in recipe["held_ids"])
+            sample_lo, sample_hi = min(held_ids), max(held_ids)+1
+            capacity(batch_results[0][0].shape[-1], phase="model",
+                     sample_batch=sample_hi-sample_lo)
+            expose_live(batch_results[0])
+            coulomb_sqrt, inverse_sqrt, batch_coulomb = response_coulomb_powers(
+                meta, config, mesh_xy=mesh_xy, bank_io=bank, q_span=check_span)
+            del coulomb_sqrt
+            expose_live((*batch_results[0], inverse_sqrt))
+            with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
+                held_samples = read_shared_pole_bank(
+                    bank_io, check_span, meta=meta, header=header,
+                    sample_span=(sample_lo, sample_hi), fields=("Wc", "dWc_ds"))
+            indices = jnp.asarray([i-sample_lo for i in held_ids])
+            supports = jnp.asarray([_sample_point(recipe, i)**2 for i in held_ids])
+            batch_checks = local_model_checks(mesh_xy, eig.native_fn)(
+                batch_results[0], inverse_sqrt,
+                held_samples["Wc"][:, indices], held_samples["dWc_ds"][:, indices],
+                supports, jnp.asarray(recipe["eta_ev"] / RYD_TO_EV))
+            batch_checks = jax.tree.map(np.asarray, batch_checks)
+            del inverse_sqrt, held_samples, indices, supports
         batch_width = 1
         selected = pending
         pending = []
@@ -817,41 +842,52 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             del active_columns
             capacity(model[0].shape[-1], phase="model")
             model, permutation = sort_shared_pole_columns(model, mesh_xy=mesh_xy)
-            query_workspace("gemm", ((1, n, n), (1, n, n)), eig)
-            capacity(current_side)
-            expose_live((*model, qi))
-            coulomb_sqrt, inverse_sqrt, coulomb_receipt = response_coulomb_powers(
-                meta, config, mesh_xy=mesh_xy, bank_io=bank, q_span=span)
-            passive = shared_pole_passivity(model, inverse_sqrt,
-                                           eta_ry=recipe["eta_ev"] / RYD_TO_EV,
-                                           matmul=mm, eigh=eig.batched, gates=gates)
+            if batch_checks is None:
+                query_workspace("gemm", ((1, n, n), (1, n, n)), eig)
+                capacity(current_side)
+                expose_live((*model, qi))
+                coulomb_sqrt, inverse_sqrt, coulomb_receipt = response_coulomb_powers(
+                    meta, config, mesh_xy=mesh_xy, bank_io=bank, q_span=span)
+                passive = shared_pole_passivity(model, inverse_sqrt,
+                                               eta_ry=recipe["eta_ev"] / RYD_TO_EV,
+                                               matmul=mm, eigh=eig.batched, gates=gates)
+                del coulomb_sqrt, inverse_sqrt
+            else:
+                passive = {key: value[slot:slot+1] for key, value in batch_checks[0].items()}
+                coulomb_receipt = dict(batch_coulomb)
+                coulomb_receipt["support_ranks"] = batch_coulomb["support_ranks"][slot:slot+1]
             if not bool(jnp.all(passive["passivity"])):
                 raise ValueError(f"GATE shared_pole_passivity: got: failed at q={q}; want: 0 <= V-whitened -W(i eta) <= I; why: passive screening")
-            del coulomb_sqrt, inverse_sqrt
             expose_live((*model, qi))
             with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
                 exact = read_shared_pole_bank(moment_io, span, meta=meta,
                                               header=moment_header, fields=("M1", "M3"))
             moment_defects = _model_diagnostics(model, exact, qi, matmul=mm)
             del exact, qi
-            held = []
-            with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
-                for sample_id in recipe["held_ids"]:
-                    expose_live(model)
-                    samples = read_shared_pole_bank(bank_io, span, meta=meta, header=header,
-                                                   sample_span=(int(sample_id), int(sample_id)+1),
-                                                   fields=("Wc", "dWc_ds"))
-                    c, poles, mask = model
-                    s = _sample_point(recipe, int(sample_id)) ** 2
-                    weights = jnp.where(mask, 1 / (s-poles), 0)
-                    diagnostic = {"sample_id": int(sample_id)}
-                    for field, weight in (("Wc", weights), ("dWc_ds", -weights**2)):
-                        sample = samples[field][:, 0]
-                        value = mm(c * weight[:, None, :], c, transb="C")
-                        diagnostic[field] = float(jnp.linalg.norm(value-sample) /
-                                                  jnp.maximum(jnp.linalg.norm(sample), jnp.finfo(jnp.float64).tiny))
-                    held.append(diagnostic)
-                    del samples, sample, value
+            if batch_checks is None:
+                held = []
+                with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
+                    for sample_id in recipe["held_ids"]:
+                        expose_live(model)
+                        samples = read_shared_pole_bank(bank_io, span, meta=meta, header=header,
+                                                       sample_span=(int(sample_id), int(sample_id)+1),
+                                                       fields=("Wc", "dWc_ds"))
+                        c, poles, mask = model
+                        s = _sample_point(recipe, int(sample_id)) ** 2
+                        weights = jnp.where(mask, 1 / (s-poles), 0)
+                        diagnostic = {"sample_id": int(sample_id)}
+                        for field, weight in (("Wc", weights), ("dWc_ds", -weights**2)):
+                            sample = samples[field][:, 0]
+                            value = mm(c * weight[:, None, :], c, transb="C")
+                            diagnostic[field] = float(jnp.linalg.norm(value-sample) /
+                                                      jnp.maximum(jnp.linalg.norm(sample), jnp.finfo(jnp.float64).tiny))
+                        held.append(diagnostic)
+                        del samples, sample, value
+            else:
+                held = [{"sample_id": sample_id,
+                         "Wc": float(batch_checks[1][slot, 0, i]),
+                         "dWc_ds": float(batch_checks[1][slot, 1, i])}
+                        for i, sample_id in enumerate(held_ids)]
             c, poles, mask = model
             counts = jnp.sum(mask, axis=-1, dtype=jnp.int64)
             # All scalar reductions precede rank-selective store formatting.

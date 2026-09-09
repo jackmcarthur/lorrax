@@ -461,7 +461,7 @@ def _finalize_model(path, *, meta, header):
 def _model_digest(path, header, mesh, *, capacity):
     """Grid-independent SHA256 of metadata and canonical row digests.
 
-    Read one q and a bounded column panel through SlabIO. Each canonical row
+    Read a bounded q batch and column panel through SlabIO. Each canonical row
     hash is updated in column order, so neither column partition nor mesh
     changes the digest. Only row hashes (32 bytes per centroid) are exchanged.
     """
@@ -473,44 +473,54 @@ def _model_digest(path, header, mesh, *, capacity):
     ncan = ((nmu + int(mesh.size)-1)//int(mesh.size))*int(mesh.size)
     column_cap = max(1, (kmax + int(mesh.shape["y"])-1)//int(mesh.shape["y"]))
     panel = 16*ncan*min(kmax,column_cap)//int(mesh.shape["x"])
-    _admit(capacity, "digest", panel+8*kmax+256*nmu, panel+24*kmax,
-           host_payload=panel, device_panel=panel, host_metadata=256*nmu+8*kmax,
-           native_host=True)
+    batch_limit = min(int(mesh.size), header["n_q_irr"])
+    _admit(capacity, "digest", batch_limit*(panel+8*kmax+256*nmu),
+           batch_limit*(panel+24*kmax), host_payload=batch_limit*panel,
+           device_panel=batch_limit*panel,
+           host_metadata=batch_limit*(256*nmu+8*kmax), native_host=True)
     with SlabIO(path, mode="r", mesh=mesh) as io:
-        for q in range(header["n_q_irr"]):
+        for q0 in range(0, header["n_q_irr"], batch_limit):
+            q1 = min(q0+batch_limit, header["n_q_irr"])
+            batch = q1-q0
+            active_counts = np.asarray(header["K"][q0:q1], np.int64)
             if kmax == 0:
-                if header["K"][q] != 0:
+                if np.any(active_counts != 0):
                     _refuse("nonzero K in empty model")
-                digest.update(hashlib.sha256(b"").digest() * nmu)
+                for _ in range(batch):
+                    digest.update(hashlib.sha256(b"").digest() * nmu)
                 continue
-            poles = io.read_slab("poles2_ry2", shape=(1,kmax), offset=(q,0), partition_spec=P())
+            poles = io.read_slab("poles2_ry2", shape=(batch,kmax), offset=(q0,0), partition_spec=P())
             host_poles = np.asarray(poles)
-            active_count = header["K"][q]
-            if np.any(np.diff(host_poles[0, :active_count]) < 0):
-                _refuse("active poles are unsorted across column panels")
-            hashers = {}
+            for row, count in zip(host_poles, active_counts):
+                if np.any(np.diff(row[:count]) < 0):
+                    _refuse("active poles are unsorted across column panels")
+            hashers = [{} for _ in range(batch)]
             for c0 in range(0, kmax, column_cap):
                 c1 = min(kmax, c0+column_cap)
-                C = io.read_slab("factor", shape=(1,ncan,1,c1-c0), offset=(q,0,0,c0),
+                C = io.read_slab("factor", shape=(batch,ncan,1,c1-c0), offset=(q0,0,0,c0),
                                  partition_spec=P(None,"x",None,None))
-                count = np.asarray([max(0, min(c1-c0, active_count-c0))], np.int64)
-                _check_factor(C, poles[:,c0:c1], count)
+                counts = np.clip(active_counts-c0, 0, c1-c0)
+                _check_factor(C, poles[:,c0:c1], counts)
                 local = None
                 for shard in C.addressable_shards:
                     if shard.replica_id != 0:
                         continue
                     start = shard.index[1].start or 0
-                    local = np.asarray(shard.data)[0,:,0,:]
-                    for i in range(min(local.shape[0], nmu-start)):
-                        hasher = hashers.setdefault(start+i, hashlib.sha256())
-                        hasher.update(np.asarray(local[i], dtype="<c16").tobytes())
+                    local = np.asarray(shard.data)[:,:,0,:]
+                    for q in range(batch):
+                        for i in range(min(local.shape[1], nmu-start)):
+                            hasher = hashers[q].setdefault(start+i, hashlib.sha256())
+                            hasher.update(np.asarray(local[q,i], dtype="<c16").tobytes())
                 del C, shard, local
-            row_hash = np.zeros((nmu,32), np.uint32)
-            for row, hasher in hashers.items():
-                row_hash[row] = np.frombuffer(hasher.digest(), np.uint8)
+            row_hash = np.zeros((batch,nmu,32), np.uint32)
+            for q in range(batch):
+                for row, hasher in hashers[q].items():
+                    row_hash[q,row] = np.frombuffer(hasher.digest(), np.uint8)
             row_hash = psum_replicate(row_hash, mesh)
-            digest.update(row_hash.astype(np.uint8).tobytes())
-            digest.update(np.asarray(host_poles, dtype="<f8").tobytes())
+            # Preserve the original q-major row-hashes then poles byte stream.
+            for q in range(batch):
+                digest.update(row_hash[q].astype(np.uint8).tobytes())
+                digest.update(np.asarray(host_poles[q:q+1], dtype="<f8").tobytes())
     return digest.hexdigest()
 
 
