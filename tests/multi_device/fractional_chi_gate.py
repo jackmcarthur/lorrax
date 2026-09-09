@@ -4,6 +4,11 @@ from runtime import initialize_communicator_stack, finalize_process
 
 RUNTIME = initialize_communicator_stack()
 
+import json
+import os
+from pathlib import Path
+import sys
+
 from types import SimpleNamespace
 
 import jax
@@ -15,6 +20,8 @@ from common.collectives import process_count, process_rank, resolve_mesh
 from gw.w_isdf import compute_chi0, compute_chi0_contour_fractional
 from gw.wavefunction_bundle import (
     BandSlices,
+    PSI_MUN_SPEC,
+    PSI_NMU_SPEC,
     PSI_XN_SPEC,
     PSI_XR_SPEC,
     PSI_YN_SPEC,
@@ -53,6 +60,27 @@ def _dense(psi, enk, occ, time, weights, z):
                         * np.outer(M, np.conj(M))[None, :, :]
                     )
     return out / np.sqrt(float(nk))
+
+
+def _direct(psi, enk, occ, surface, z):
+    """Tiny independent ordered-pair resolvent, including the static limit."""
+    nk, nb, _, nmu = psi.shape
+    out = np.zeros((len(z), nk, nmu, nmu), np.complex128)
+    for q in range(nk):
+        for k in range(nk):
+            kmq = (k-q) % nk
+            for a in range(nb):
+                for b in range(nb):
+                    de = enk[k,a]-enk[kmq,b]
+                    fdiff = occ[k,a]-occ[kmq,b]
+                    M = np.einsum("sm,sm->m",psi[k,a],np.conj(psi[kmq,b]))
+                    for iz, point in enumerate(z):
+                        if point == 0 and abs(de) <= 64*np.finfo(float).eps*max(1.,abs(enk[k,a]),abs(enk[kmq,b])):
+                            weight = -0.5*(surface[k,a]+surface[kmq,b])
+                        else:
+                            weight = fdiff/(point+de)
+                        out[iz,q] += weight*np.outer(M,np.conj(M))
+    return out/np.sqrt(float(nk))
 
 
 def main():
@@ -143,22 +171,7 @@ def main():
             occupation_state=state, kminq_rows=kminq),
         tiled=True))
 
-    want_static = np.zeros((nk, nmu, nmu), np.complex128)
-    for q in range(nk):
-        for k in range(nk):
-            kmq = (k - q) % nk
-            for a in range(nb):
-                for b in range(nb):
-                    de = enk[k, a] - enk[kmq, b]
-                    scale = max(1.0, abs(enk[k, a]), abs(enk[kmq, b]))
-                    if abs(de) > 64.0 * np.finfo(np.float64).eps * scale:
-                        divided = (occ_mp1[k, a] - occ_mp1[kmq, b]) / de
-                    else:
-                        divided = -0.5 * (surface[k, a] + surface[kmq, b])
-                    M = np.einsum(
-                        "sm,sm->m", psi[k, a], np.conj(psi[kmq, b]))
-                    want_static[q] += divided * np.outer(M, np.conj(M))
-    want_static /= np.sqrt(float(nk))
+    want_static = _direct(psi,enk,occ_mp1,surface,np.asarray([0j]))[0]
     err_s = float(np.max(np.abs(got_static - want_static)))
     rel_s = err_s / max(float(np.max(np.abs(want_static))), 1.0e-300)
 
@@ -168,19 +181,7 @@ def main():
     varpi1 = 2.0e-5
 
     def _resolvent(z, q):
-        out = np.zeros((nmu, nmu), np.complex128)
-        for k in range(nk):
-            kmq = (k - q) % nk
-            for a in range(nb):
-                for b in range(nb):
-                    delta = enk[kmq, b] - enk[k, a]
-                    fdiff = occ_mp1[k, a] - occ_mp1[kmq, b]
-                    if fdiff == 0.0 and delta == 0.0:
-                        continue
-                    M = np.einsum(
-                        "sm,sm->m", psi[k, a], np.conj(psi[kmq, b]))
-                    out += (fdiff / (z - delta)) * np.outer(M, np.conj(M))
-        return out / np.sqrt(float(nk))
+        return _direct(psi,enk,occ_mp1,surface,np.asarray([z]))[0,q]
 
     shift_rel = (
         np.max(np.abs(_resolvent(1j * varpi1, 1) - _resolvent(0.0, 1)))
@@ -194,6 +195,45 @@ def main():
         )
     if rel_s > 5.0e-12:
         raise AssertionError("finite-q static divided-difference mismatch")
+
+    # Family controls include q=0 exact degeneracies and literal nonzero z.
+    # The FD oracle uses cosh, independently of the sigmoid helper under test.
+    from gw.w_isdf import compute_chi0_direct_fractional
+    occ_fd = 0.5*(1.0-np.tanh((enk-mu)/(2*width)))
+    surface_fd = 1.0/(4*width*np.cosh((enk-mu)/(2*width))**2)
+    direct_z = np.asarray([0j,0.32+0.18j,0.77+0.24j])
+    family_checks = {}
+    face_wfns = Wavefunctions(
+        psi_mun=_put(psi.transpose(0,2,3,1),mesh,PSI_MUN_SPEC),
+        psi_nmu=_put(psi,mesh,PSI_NMU_SPEC),
+        enk=wfns.enk,occ=wfns.occ,slices=slices,layout="face")
+    meta_direct = SimpleNamespace(nk_tot=nk,n_rmu=nmu,nspinor=ns)
+    for family, occupations, derivative in (("mp1",occ_mp1,surface),("fd",occ_fd,surface_fd)):
+        family_state = SimpleNamespace(f_kn=occupations,mu_ry=mu,
+            smearing_family=family,smearing_width_ry=width)
+        expected = _direct(psi,enk,occupations,derivative,direct_z)
+        for layout, carrier in (("legacy",wfns),("face",face_wfns)):
+            actual = np.asarray(multihost_utils.process_allgather(
+                compute_chi0_direct_fractional(carrier,direct_z,meta_direct,mesh,
+                    occupation_state=family_state,kminq_rows=kminq),tiled=True))
+            errors = [float(np.max(np.abs(actual[i]-expected[i]))
+                      /np.max(np.abs(expected[i]))) for i in range(len(direct_z))]
+            assert max(errors) < 5e-12,(family,layout,errors)
+            family_checks[family+"_"+layout] = errors
+    actual_derivative = np.asarray(efermi.fd_negative_derivative(enk,mu,width))
+    fd_error = float(np.max(np.abs(actual_derivative-surface_fd))/np.max(surface_fd))
+    at_mu = float(efermi.fd_negative_derivative(np.asarray(mu),mu,width))
+    assert fd_error < 5e-14 and abs(at_mu-1/(4*width)) < 1e-14
+    try:
+        compute_chi0_direct_fractional(wfns,direct_z,meta_direct,mesh,
+            occupation_state=SimpleNamespace(smearing_family="unsupported"),kminq_rows=kminq)
+    except ValueError as exc:
+        assert "GATE static_fractional_needs_mp1" in str(exc)
+        assert "unsupported" in str(exc) and "'fd'" in str(exc)
+    else:
+        raise AssertionError("unsupported occupation family accepted")
+    if rank == 0:
+        print("[fractional-chi families] "+json.dumps(family_checks),flush=True)
 
     # --- Integer insulator: minimax orientation completion -----------------
     # Flat unit gaps make the one-node (tau=0, alpha=1) inverse exact.  The
@@ -256,6 +296,13 @@ def main():
         raise AssertionError("integer static chi direct Adler-Wiser mismatch")
     if recip_i > 5.0e-12:
         raise AssertionError("integer static chi q reciprocity mismatch")
+    if rank == 0 and len(sys.argv) > 1:
+        (Path(sys.argv[1])/"receipt.json").write_text(json.dumps(dict(
+            status="PASS",job=os.getenv("SLURM_JOB_ID"),step=os.getenv("SLURM_STEP_ID"),
+            contour_relative=relative,static_mp1_relative=rel_s,
+            direct_family_relative=family_checks,fd_derivative_relative=fd_error,
+            fd_derivative_at_mu=at_mu,unsupported_family="REFUSED",
+            integer_relative=rel_i),indent=2))
     multihost_utils.sync_global_devices("fractional_chi_gate_pass")
 
 
