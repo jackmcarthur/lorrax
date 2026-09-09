@@ -3115,7 +3115,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                        if inputs.material_class == "metal" else None)
 
     if inputs.config.sigma.w_model == "shared_pole":
-        from .shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
+        from .shared_pole_recipe import (
+            bind_shared_pole_census, resolve_shared_pole_recipe,
+            bind_shared_pole_sc_identity,
+        )
         from centroid.sampling_metric import full_k_quadrature_weights
         bind_shared_pole_census(
             wfns_qp, inputs.meta, occupation_state=entry_occ_state,
@@ -3124,6 +3127,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             kweights=full_k_quadrature_weights(inputs.wfn, inputs.sym))
         inputs.meta.shared_pole_recipe = resolve_shared_pole_recipe(
             inputs.config, wfns_qp, inputs.meta, mesh_xy=inputs.mesh_xy,
+            print_fn=inputs.print_fn)
+        bind_shared_pole_sc_identity(
+            inputs.meta, state, occupation_state=entry_occ_state,
             print_fn=inputs.print_fn)
 
     def _screening(mpa_plan, iteration_head_response, *, producer=None,

@@ -6,7 +6,9 @@ from types import ModuleType, SimpleNamespace as NS
 import unittest
 from unittest.mock import Mock, patch
 
-from gw.shared_pole_recipe import CapacityLedger, shared_pole_restart_handle
+from gw.shared_pole_recipe import (
+    CapacityLedger, shared_pole_restart_handle, bind_shared_pole_sc_identity,
+)
 
 
 class Missing(ValueError):
@@ -27,9 +29,9 @@ class RestartRecipeTests(unittest.TestCase):
                        shared_pole_recipe=self.recipe)
         self.meta.shared_pole_capacity = CapacityLedger(self.meta, mesh_xy=self.mesh)
         self.meta.shared_pole_capacity.live_stages = ()
-        self.identity = {'iteration_id': 'sc_0000', 'energies': 'current'}
+        self.identity = {'iteration_id': 'oneshot', 'energies': 'current'}
         self.member = dict(path='shared_pole.h5', digest='payload-digest',
-                           schema='schema', iteration_id='sc_0000')
+                           schema='schema', iteration_id='oneshot')
         self.header = dict(recipe=copy.deepcopy(self.recipe), identity=self.identity, K=[2, 0, 3])
         self.reader = Mock(return_value=(self.member, self.header))
         module = ModuleType('file_io.tagged_arrays')
@@ -94,6 +96,44 @@ class RestartRecipeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unbound caller lifetimes'):
             self.call()
         self.reader.assert_not_called()
+
+    def test_sc_labels_are_non_authenticating_and_rebound(self):
+        first = bind_shared_pole_sc_identity(
+            self.meta, NS(iteration=2), occupation_state=NS(occ_hash='current-occ'),
+            print_fn=self.messages.append)
+        self.assertEqual(first['hamiltonian'], 'sc_map_2:current-occ')
+        self.assertEqual(first['wavefunctions'], 'qp_rotation_unreceipted')
+        self.assertEqual(first['authentication'], 'NON-AUTHENTICATING')
+        self.assertIn('NON-AUTHENTICATING', self.messages[-1])
+        second = bind_shared_pole_sc_identity(
+            self.meta, NS(iteration=3), occupation_state=NS(occ_hash='next-occ'),
+            print_fn=self.messages.append)
+        self.assertNotEqual(first['hamiltonian'], second['hamiltonian'])
+        self.assertEqual(self.meta.shared_pole_state_identity, second)
+        self.assertEqual(second['recipe_hash'], self.recipe['recipe_hash'])
+
+    def test_insulating_sc_reuses_existing_census_label(self):
+        self.meta.shared_pole_census = {'occupation_sha256': 'step-occ'}
+        identity = bind_shared_pole_sc_identity(
+            self.meta, NS(iteration=0), occupation_state=None, print_fn=self.messages.append)
+        self.assertEqual(identity['hamiltonian'], 'sc_map_0:step-occ')
+
+    def test_sc_cannot_enter_restart_authentication(self):
+        for identity in ({'iteration_id': 'sc_0000'},
+                         {'wavefunctions': 'qp_rotation_unreceipted'},
+                         {'authentication': 'NON-AUTHENTICATING'},
+                         {'hamiltonian': 'sc_map_0:occ'}):
+            with self.subTest(identity=identity):
+                self.identity = identity
+                with self.assertRaisesRegex(ValueError, 'NON-AUTHENTICATING'):
+                    self.call()
+        self.reader.assert_not_called()
+
+    def test_sc_missing_current_occupation_refuses(self):
+        with self.assertRaisesRegex(ValueError, 'occupation label is missing'):
+            bind_shared_pole_sc_identity(
+                self.meta, NS(iteration=0), occupation_state=NS(occ_hash=None),
+                print_fn=self.messages.append)
 
 
 if __name__ == '__main__':
