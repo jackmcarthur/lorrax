@@ -134,6 +134,20 @@ def main():
     results["selected_stream"] = dict(relative=relative,
         shape=list(actual.shape), memory=str(executable.memory_analysis()))
 
+    carry_kernel = _get_chi_fractional_contour_kernel_face(
+        mesh, (2,2,2), 2, (nk,nb,n,1), selected_q=(0,3,7), bank_carry=True)
+    carry_shard = NamedSharding(mesh,P(None,None,"x","y"))
+    carry = put(np.zeros((2,3,n,n),complex),carry_shard)
+    carry_executable = carry_kernel.lower(*args,carry).compile()
+    carried = carry_executable(*args,carry)
+    twice = carry_executable(*args,carried)
+    carry_error = float(gather_to_host(jnp.linalg.norm(jnp.swapaxes(twice,0,1)-2*reference)
+                                      /jnp.linalg.norm(2*reference)))
+    assert carry_error < 1e-11, carry_error
+    assert carry_executable.memory_analysis().alias_size_in_bytes > 0
+    results["donated_carry"] = dict(relative=carry_error,
+        memory=str(carry_executable.memory_analysis()))
+
     # Remote Laplace cell, independently summed over lower/upper band pairs.
     real_psi = psi.real.astype(np.complex128)
     lower = np.arange(nb) < 3

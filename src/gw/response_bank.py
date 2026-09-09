@@ -132,7 +132,7 @@ def response_weights(wfns, meta):
 
 
 def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
-                    pair_mode="retarded"):
+                    pair_mode="retarded", bank_carry=False):
     """Bind the existing one-particle Green/FFT primitive to a q batch.
 
     Returns a jitted kernel and its fixed ψ/energy arguments. Caller supplies
@@ -153,7 +153,8 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     kernel = _get_chi_fractional_contour_kernel_face(
         mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
-        k_unfold_plan=parent, selected_q=tuple(q_ids), pair_mode=pair_mode)
+        k_unfold_plan=parent, selected_q=tuple(q_ids), pair_mode=pair_mode,
+        bank_carry=bank_carry)
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
 
 
@@ -258,7 +259,21 @@ def _reserve(meta, stage, resident, workspace=0):
     return name, row
 
 
-def _bank_execution(meta, mesh_xy, bank_io, receipt):
+@lru_cache(maxsize=32)
+def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
+    """Query the dense provider on actual bank shapes, before allocation."""
+    from distrib_la import plan, workspace_bytes_per_rank
+    from .gw_config import linalg_resolution
+    resolution = linalg_resolution({"linalg": layout})
+    policy = plan("eigh", mesh_xy, n=n,
+        backend="off" if layout == "local" else "distributed",
+        batched_route=resolution.batched_route)
+    gemm = workspace_bytes_per_rank(policy,"gemm",((batch,n,n),(batch,n,n)),np.complex128)
+    eig = workspace_bytes_per_rank(policy,"eigh",((1,n,n),),np.complex128) if with_eigh else 0
+    return dict(gemm=gemm,eigh=eig,total=gemm+eig,scope="actual-shape ISERV query; GEMM persistent plus concurrent eigh scratch")
+
+
+def _bank_execution(meta, mesh_xy, bank_io, receipt, config):
     """Compile and admit new dense work; stream outputs are reserved by batch."""
     def execute(kernel, args, stage):
         started = time.monotonic()
@@ -270,8 +285,12 @@ def _bank_execution(meta, mesh_xy, bank_io, receipt):
             raise ValueError("GATE response_capacity: compiled memory unavailable")
         stream = stage in ("real_time", "laplace", "moment_correlation")
         if not stream:
+            layout = config.get("linalg", "local") if hasattr(config,"get") else config.backend.linalg
+            native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
+                with_eigh=stage=="coulomb_sqrt")
+            receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))
             _, row = _reserve(meta, stage, memory.argument_size_in_bytes,
-                memory.output_size_in_bytes + memory.temp_size_in_bytes)
+                memory.output_size_in_bytes + memory.temp_size_in_bytes + native["total"])
             receipt["memory"].append(row)
         receipt["compiled"].append(dict(stage=stage,
             arguments=memory.argument_size_in_bytes, outputs=memory.output_size_in_bytes,
@@ -553,7 +572,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     z = bank_points(sample_plan)
     receipt = _receipt("samples",census,bank_io)
     started = time.monotonic()
-    execute = _bank_execution(meta,mesh_xy,bank_io,receipt)
+    execute = _bank_execution(meta,mesh_xy,bank_io,receipt,config)
     ledger = meta.shared_pole_capacity
     ambient = ledger.live_stages
     _stream_comparison(wfns,meta,mesh_xy,qids,receipt)
@@ -582,23 +601,47 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         if k not in ("t","projection_value","projection_derivative","coefficient_rows")}}
         for cell,rr in remote]
     face_bytes = 16*meta.mu_basis.n_packed**2//mesh_xy.size
-    # At most three carries coexist during remote addition. Leave one quarter
-    # of U for dense service/transport work; the common ledger is authoritative.
-    qwidth = max(1,min(len(qids),int(.75*ledger.U_bytes_per_rank/(2*face_bytes))))
+    # One donated internal [output,q,x,y] carry spans every window. Public
+    # writer slices are [q,output,x,y]; only that bounded slice is transposed.
+    # Reserve output plus a dense/transport headroom, and batch only when the
+    # common ledger's remaining 3U budget cannot hold the full point plan.
+    layout = config.get("linalg","local") if hasattr(config,"get") else config.backend.linalg
+    native = response_dense_workspace(mesh_xy,meta.mu_basis.n_packed,len(z),layout,with_eigh=True)
+    headroom = 16*face_bytes + native["gemm"] + int(phase.nbytes+derivative.nbytes)
+    inherited_live = sum(row["resident_bytes_per_rank"]+row["workspace_bytes_per_rank"]
+        for row in ledger.entries if row["stage"] in ambient)
+    available = ledger.limit_bytes_per_rank - headroom - inherited_live
+    qwidth = max(1,min(len(qids),int(available//(2*face_bytes))))
     for q0 in range(0,len(qids),qwidth):
         q1 = min(q0+qwidth,len(qids))
-        width = max(1,min(len(z),int(.75*ledger.U_bytes_per_rank/(2*(q1-q0)*face_bytes))))
+        width = len(z)
+        while width > 0:
+            abstract = jax.ShapeDtypeStruct((width,meta.mu_basis.n_packed,meta.mu_basis.n_packed),
+                jnp.complex128,sharding=NamedSharding(mesh_xy,P(None,"x","y")))
+            stats = samples.lower(abstract,abstract,abstract).compile().memory_analysis()
+            if stats is None:
+                raise ValueError("GATE response_capacity: sample solve planning memory unavailable")
+            dense = stats.argument_size_in_bytes+stats.output_size_in_bytes+stats.temp_size_in_bytes
+            # Unpacking/writer checks are bounded by four packed sample faces;
+            # split-padding conversion has its actual extra store reservation.
+            extra = max(dense+native["total"],4*width*face_bytes+native["total"])
+            if 2*width*(q1-q0)*face_bytes+extra <= available:
+                break
+            width -= 1
+        if width == 0:
+            raise ValueError("GATE response_capacity: even one bank sample plus dense workspace exceeds remaining3U")
         for lo in range(0,len(z),width):
             hi = min(lo+width,len(z));a = hi-lo
             ledger.live_stages = ambient
-            name,_ = _reserve(meta,"bank_outputs",(6*a*(q1-q0)+32)*face_bytes
-                + int(phase.nbytes+derivative.nbytes))
+            name,_ = _reserve(meta,"bank_outputs",2*a*(q1-q0)*face_bytes + headroom)
             ledger.live_stages = ambient+(name,)
             kernel,fixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-                q_ids=tuple(qids[q0:q1]),n_outputs=2*a)
+                q_ids=tuple(qids[q0:q1]),n_outputs=2*a,bank_carry=True)
+            raw = jax.jit(lambda: jnp.zeros((2*a,q1-q0,meta.mu_basis.n_packed,meta.mu_basis.n_packed),jnp.complex128),
+                out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
             raw = execute(kernel,(jnp.asarray(t),jnp.asarray(np.vstack((phase[lo:hi],derivative[lo:hi]))),
                 *fixed,stream_weights(wfns,ft*masks[1],mesh_xy),
-                stream_weights(wfns,ut*masks[1],mesh_xy),jnp.asarray(reference)),"real_time")
+                stream_weights(wfns,ut*masks[1],mesh_xy),jnp.asarray(reference),raw),"real_time")
             receipt["correlation_count"] += len(t)
             for cell,rr in remote:
                 lower,upper = cell["lower"],cell["upper"]
@@ -606,16 +649,15 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 tau = np.asarray(rr["t"])
                 projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]
                 lk,lfixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,pair_mode="laplace")
+                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,pair_mode="laplace",bank_carry=True)
                 lw = np.stack([ft*masks[lower],ut*masks[lower]])
                 uw = np.stack([ut*masks[upper],ft*masks[upper]])
                 # Parent selection applies to the k axis, separately for each role.
                 lw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in lw])
                 uw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in uw])
-                contribution = execute(lk,(jnp.asarray(tau),jnp.asarray(projections),
-                    *lfixed,lw,uw,jnp.asarray(refs)),"laplace")
-                raw = raw+contribution
-                raw.block_until_ready();del contribution,lw,uw
+                raw = execute(lk,(jnp.asarray(tau),jnp.asarray(projections),
+                    *lfixed,lw,uw,jnp.asarray(refs),raw),"laplace")
+                del lw,uw
                 receipt["correlation_count"] += 2*len(tau)
             for iq in range(q0,q1):
                 span = (iq,iq+1)
@@ -632,8 +674,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     if all(marked):
                         ia = stop
                         continue
-                    chi = raw[iq-q0,ia-lo:stop-lo]
-                    dchi = raw[iq-q0,a+ia-lo:a+stop-lo]
+                    chi = raw[ia-lo:stop-lo,iq-q0]
+                    dchi = raw[a+ia-lo:a+stop-lo,iq-q0]
                     hbatch = jnp.broadcast_to(h,chi.shape)
                     value,ds = execute(samples,(hbatch,chi,dchi),"sample_dyson")
                     value = None if marked[0] else value[None]
@@ -649,5 +691,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             receipt["batches"].append(dict(q_span=(q0,q1),sample_span=(lo,hi)))
             del raw
     ledger.live_stages = ambient
+    receipt["stream_passes"] = len(receipt["batches"])
+    receipt["batch_reason"] = "full plan admitted" if len(receipt["batches"]) == 1 else "3U output carry plus dense/transport headroom requires bounded replays"
     receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
     return _finish_receipt(receipt,meta,header,started)
