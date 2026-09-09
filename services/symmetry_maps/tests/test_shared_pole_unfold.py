@@ -86,6 +86,7 @@ def check_shared_pole_unfold(mesh, profile=False):
     assert not cert['is_local'] and cert['local_perm'] is None
     fallback = jnp.zeros_like(got)
     costs = []
+    route_reuse = []
     for a, b in ((0, 3), (3, 5)):
         faces = []
         for axis in ('x', 'y'):
@@ -95,6 +96,32 @@ def check_shared_pole_unfold(mesh, profile=False):
                 source_perm=nonlocal_perm, L_table=wraps, spin_action_full=spin,
                 n_sym_spatial=2, active_mask=active, mesh=mesh, mesh_axis=axis,
                 max_live_bytes=1_000_000)
+            # Bind metadata once, as the Sigma time loop does. Distinct
+            # factor inputs must reuse the same compiled route and cannot
+            # be replaced by a cached child-factor value.
+            traces = []
+            def repeated_route(factors):
+                traces.append(1)
+                return S.unfold_endpoint_panel(
+                    factors, irr_idx=irr, sym_idx=sym, q_irr_frac=q,
+                    source_perm=nonlocal_perm, L_table=wraps,
+                    spin_action_full=spin, n_sym_spatial=2,
+                    active_mask=active, mesh=mesh, mesh_axis=axis,
+                    max_live_bytes=1_000_000)[0]
+            sharding = NamedSharding(mesh, P(None, axis, None, None))
+            reused = jax.jit(repeated_route, in_shardings=sharding,
+                             out_shardings=sharding)
+            reuse_errors = []
+            with jax.log_compiles(True):
+                for scale in (1., 2., -1., 3., .5):
+                    changed = put(c[..., a:b]*scale, P(None, axis, None, None))
+                    repeated = reused(changed)
+                    jax.block_until_ready(repeated)
+                    reuse_errors.append(float(jnp.max(jnp.abs(repeated-scale*child))))
+            assert len(traces) == 1, traces
+            assert max(reuse_errors) < 3e-12, reuse_errors
+            route_reuse.append(dict(axis=axis, k_panel=b-a, calls=5,
+                                    traces=len(traces), errors=reuse_errors))
             faces.append(child); costs.append(cost)
         fallback += D.contract_faces(*faces, put(d[irr, a:b], P()),
                                      put(np.zeros(4, dtype=int), P()),
@@ -111,7 +138,8 @@ def check_shared_pole_unfold(mesh, profile=False):
         raise AssertionError('missing capacity refusal')
     return dict(status='PASS', local_error=local_error, identity_error=identity_error,
                 wrong_conjugation_error=red_error, fallback_error=fallback_error,
-                crossing_count=cert['crossing_count'], panel_costs=costs)
+                crossing_count=cert['crossing_count'], panel_costs=costs,
+                route_reuse=route_reuse)
 
 
 def test_shared_pole_unfold():
