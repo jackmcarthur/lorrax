@@ -45,7 +45,7 @@ def response_algebra(meta, config, *, mesh_xy, n):
     from .w_isdf import _w_solve_pref_scalar
 
     resolution = linalg_resolution(
-        config if hasattr(config, "get") else {"linalg": config.linalg})
+        config if hasattr(config, "get") else {"linalg": config.backend.linalg})
     route = resolution.batched_route
     backend = "off" if resolution.layout == "local" else "distributed"
     lu = plan("solve_lu", mesh_xy, backend=backend, n=n,
@@ -332,7 +332,7 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
         v = compiled(canonical)
         v.block_until_ready()
     del canonical
-    layout = config.get("linalg", "local") if hasattr(config, "get") else config.linalg
+    layout = config.get("linalg", "local") if hasattr(config, "get") else config.backend.linalg
     kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout)
     h, hi, negative, ranks = execute(kernel, (v,), "coulomb_sqrt")
     if bool(negative):
