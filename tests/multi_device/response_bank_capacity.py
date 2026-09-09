@@ -64,6 +64,28 @@ def main():
         status="FAIL" if bound > 3*unit else "NOT_MEASURED",
         omitted="native workspace and application resident buffers",
         job=os.getenv("SLURM_JOB_ID"), step=os.getenv("SLURM_STEP_ID"))
+    if "--compare-incumbent" in sys.argv:
+        # Incumbent fractional MPA screening owner, identical carriers and
+        # node/output counts; only the bank's selected-q route is absent.
+        incumbent = _get_chi_fractional_contour_kernel_face(mesh, (8, 8, 8), 2,
+            (input_k, nb, n, 1), k_unfold_plan=parent)
+        inc_compiled = incumbent.lower(*args).compile()
+        inc_memory = inc_compiled.memory_analysis()
+        inc_bound = (inc_memory.argument_size_in_bytes
+            + inc_memory.output_size_in_bytes + inc_memory.temp_size_in_bytes
+            - inc_memory.alias_size_in_bytes)
+        result["incumbent"] = dict(memory=str(inc_memory),
+            compiler_lower_bound_bytes=inc_bound, compiler_lower_bound_U=inc_bound/unit,
+            scope="existing fractional screening kernel, matched two outputs and1000 nodes")
+        result["stream_peak"] = dict(status="PASS" if bound <= 1.05*inc_bound else "FAIL",
+            ratio=bound/inc_bound, limit=1.05, inherited=True,
+            scope="matched compiled lower bounds, includes output carriers")
+        result["status"] = result["stream_peak"]["status"]
+        result["bank_outputs"] = dict(bytes_per_rank=memory.output_size_in_bytes,
+            U=memory.output_size_in_bytes/unit,
+            status="NOT_MEASURED", reason="output-only; full new-stage ledger still owed")
+        if jax.process_index() == 0:
+            (Path(sys.argv[1])/'incumbent.hlo').write_text(inc_compiled.as_text())
     if jax.process_index() == 0:
         root = Path(sys.argv[1])
         (root/'receipt.json').write_text(json.dumps(result, indent=2))
