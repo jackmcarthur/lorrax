@@ -519,6 +519,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     identity = bank["identity"]
     ledger = meta.shared_pole_capacity
     upstream = ledger.live_stages
+    if "constructor" not in bank.get("workspace_bytes_per_rank", {}):
+        raise ValueError("GATE shared_pole_capacity: got: absent constructor native workspace bound; want: provider-owned bytes for resolved n/2n/R plans; why: compiled carriers alone do not certify aggregate 3U")
     workspace = bank["workspace_bytes_per_rank"]["constructor"]
     header = validate_shared_pole_bank(bank["path"], expected_identity=identity,
                                        mesh_xy=mesh_xy, require_complete=True)
