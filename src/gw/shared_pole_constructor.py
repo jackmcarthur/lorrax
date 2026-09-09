@@ -216,11 +216,9 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
 
     metric = matmul(z, matmul(g, z), transa="C")
     null_identity = _diagonal_face(~keep, g)
-    metric_eigen, metric_vectors = eigh(_hermitian(metric) + null_identity)
-    metric_ok = jnp.all(jnp.isfinite(metric_eigen) & (metric_eigen > 0), axis=-1)
-    correction = matmul(
-        metric_vectors / jnp.sqrt(jnp.where(metric_eigen > 0, metric_eigen, 1))[:, None, :],
-        metric_vectors, transb="C")
+    correction, metric_ok = _metric_inverse_root(
+        _hermitian(metric) + null_identity, matmul=matmul,
+        tolerance=gates["retained_subspace_moments"]["threshold"])
     z = matmul(z, correction) * keep[:, None, :]
     metric = matmul(z, matmul(g, z), transa="C")
     t = _hermitian(matmul(z, matmul(h, z), transa="C"))
@@ -247,6 +245,30 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     # Undo equilibration in the coefficient map used by retained-space checks.
     coefficients = matmul(z, rotation) * active[:, None, :]
     return (c, poles, active), diagnostics, scale[:, :, None] * coefficients
+
+
+def _metric_inverse_root(metric, *, matmul, tolerance):
+    """Compute the near-identity Ritz metric inverse root without eigenvectors.
+
+    For Hermitian M [b,R,R], the row-sum bound ||I-M||_infinity < 1
+    certifies positive definiteness and Newton-Schulz convergence:
+    X_next = X (3 I - M X**2) / 2. All matrices retain the caller's
+    layout. The residual certifies the correction; no eigenvalue is clipped.
+    This avoids asking a vendor eigensolver for an orthonormal basis of
+    a numerically degenerate identity matrix.
+    """
+    import jax
+
+    identity = _diagonal_face(jnp.ones(metric.shape[:1] + metric.shape[-1:]), metric)
+    radius = jnp.max(jnp.sum(jnp.abs(metric - identity), axis=-1), axis=-1)
+    positive = jnp.isfinite(radius) & (radius < 1)
+    def step(_, x):
+        squared = matmul(x, x)
+        return _hermitian(matmul(x, 3 * identity - matmul(metric, squared)) * .5)
+    correction = jax.lax.fori_loop(0, 4, step, identity)
+    residual = matmul(correction, matmul(metric, correction)) - identity
+    error = jnp.linalg.norm(residual, axis=(-2, -1)) / jnp.sqrt(metric.shape[-1])
+    return correction, positive & jnp.isfinite(error) & (error <= tolerance)
 
 
 def retained_moment_identity(pencil, coefficients, model, infinity_selector, *, matmul):
@@ -437,12 +459,18 @@ def _public_factor_kernel(mesh):
 
 @lru_cache(maxsize=None)
 def _stack_model_kernel(mesh):
-    """Stack the current admitted factor/pole/count batch on named layouts."""
+    """Pad and stack the admitted ragged models on their named layouts."""
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
-    return jax.jit(
-        lambda parts: tuple(jnp.concatenate([row[i] for row in parts], axis=0)
-                            for i in range(3)),
+    def stack(parts):
+        width = max(row[0].shape[-1] for row in parts)
+        def pad(value, fill):
+            return jnp.pad(value, ((0, 0),) * (value.ndim - 1)
+                           + ((0, width - value.shape[-1]),), constant_values=fill)
+        return (jnp.concatenate([pad(row[0], 0) for row in parts], axis=0),
+                jnp.concatenate([pad(row[1], 1) for row in parts], axis=0),
+                jnp.concatenate([row[2] for row in parts], axis=0))
+    return jax.jit(stack,
         out_shardings=(NamedSharding(mesh, P(None, 'x', None, 'y')),
                        NamedSharding(mesh, P()), NamedSharding(mesh, P())))
 
@@ -597,17 +625,20 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     retained_panels = ()
     batch_width = 1
     plans = {}
+    reducer_resolution = resolution
 
-    def eigenplan(side):
-        if side not in plans:
-            plans[side] = distrib_la.plan(
-                "eigh", mesh_xy, n=side, backend=resolution.eigh_backend,
-                batched_route=resolution.batched_route)
-        return plans[side]
+    def eigenplan(side, policy=None):
+        policy = resolution if policy is None else policy
+        key = (side, policy.layout)
+        if key not in plans:
+            plans[key] = distrib_la.plan(
+                "eigh", mesh_xy, n=side, backend=policy.eigh_backend,
+                batched_route=policy.batched_route)
+        return plans[key]
 
     def query_workspace(op, shapes, plan):
         nonlocal workspace
-        key = (op, shapes)
+        key = (op, shapes, plan.batched_route, plan.backend)
         if key not in native_queries:
             size = distrib_la.workspace_bytes_per_rank(
                 plan, op, shapes, np.complex128)
@@ -636,29 +667,42 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         if _sample_point(recipe, sample_id) != _sample_point(stored_recipe, sample_id):
             raise ValueError("GATE shared_pole_bank_state: got: changed z; want: current physical sample point; why: recipe hashes alone do not bind resolved points")
 
-    def capacity(side, *, phase=None, sample_batch=1):
+    local_compiled_price = None
+
+    def capacity(side, *, phase=None, policy=None, reserve=True, sample_batch=1):
         nonlocal current_side, current_phase, workspace
         if phase is not None:
             current_phase = phase
         current_side = side
+        policy = (reducer_resolution if current_phase == "reduction" else resolution) if policy is None else policy
         extents = {n, 2*n} if current_phase == "selection" else (
             {side} if current_phase == "reduction" else {n})
         # Eigh scratch is transient: replace it at each phase boundary.
         # Only the actually used GEMM context workspace persists.
         native_maxima["eigh"] = max(query_workspace(
-            "eigh", ((batch_width, extent, extent),), eigenplan(extent))
+            "eigh", ((batch_width, extent, extent),), eigenplan(extent, policy))
             for extent in sorted(extents))
         workspace = sum(native_maxima.values())
         price = shared_pole_byte_terms(
-            meta, mesh_xy=mesh_xy, resolution=resolution, pencil_side=side,
+            meta, mesh_xy=mesh_xy, resolution=policy, pencil_side=side,
             parent_batch=batch_width, sample_batch=sample_batch, phase=current_phase)
+        if (current_phase == "reduction" and policy.layout == "local"
+                and local_compiled_price is not None):
+            # XLA buffer assignment can exceed the algebraic live-array floor.
+            # Native eigh scratch is already visible in this executable;
+            # persistent service GEMM workspace remains charged separately.
+            excess = max(0, local_compiled_price["total_bytes_per_rank"]
+                         - price["resident_bytes_per_rank"] - native_maxima["eigh"])
+            price["terms_bytes_per_rank"]["compiled_buffer_excess"] = excess
+            price["resident_bytes_per_rank"] += excess
+            price["compiled"] = local_compiled_price
         # Other parents' narrow inputs survive selection and each model's
         # checks; they are additional live storage, never hidden in a limit.
         extra = sum(int(np.prod(a.sharding.shard_shape(a.shape))) * a.dtype.itemsize
                     for a in {id(a): a for a in retained_panels}.values())
         price["terms_bytes_per_rank"]["retained_parent_panels"] = extra
         price["resident_bytes_per_rank"] += extra
-        row = ledger.reserve(f"constructor.plan.{len(ledger.entries)}",
+        row = (ledger.reserve if reserve else ledger.quote)(f"constructor.plan.{len(ledger.entries)}",
                              resident_bytes_per_rank=price["resident_bytes_per_rank"],
                              workspace_bytes_per_rank=workspace,
                              concurrent_with=upstream)
@@ -691,18 +735,19 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                        if kwargs.get(trans, "N") != "N" else value.shape[-2:])
                        for value, trans in ((a, "transa"), (b, "transb")))
         previous = workspace
-        query_workspace("gemm", shapes, eigenplan(n))
+        policy = reducer_resolution if current_phase == "reduction" else resolution
+        query_workspace("gemm", shapes, eigenplan(n, policy))
         if workspace != previous:
             capacity(current_side)
         return distrib_la.matmul(a, b, mesh=mesh_xy, backend="auto",
-                                 batched_route=resolution.batched_route, **kwargs)
+                                 batched_route=policy.batched_route, **kwargs)
 
     eig, svd = eigenplan(n), eigenplan(2*n)
     receipts = []
     receipt_entry_start = 0
     stack_models = _stack_model_kernel(mesh_xy)
     from runtime.padding import mesh_divisor
-    from gw.shared_pole_local import pack_parent_panels, local_parent_reducer
+    from gw.shared_pole_local import pack_parent_panels, plan_local_parent_reducer
     # Local dense algebra assigns independent parents to mesh ranks. The
     # distributed plan keeps its one-parent face-tiled execution schedule.
     batch_limit = mesh_divisor(mesh_xy) if resolution.layout == "local" else 1
@@ -755,20 +800,40 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         retained_panels = tuple(a for _, ss, ii, mask, _, _ in pending
                                 for a in (*ii, mask, *(v for st in ss for v in st[1:])))
         batch_results = None
-        if resolution.layout == "local":
-            finite_width = max(sum(st[1].shape[-1] for st in item[1]) for item in pending)
-            infinity_width = max(item[2][0].shape[-1] for item in pending)
-            batch_width = mesh_divisor(mesh_xy)
-            # Reserve the pack/copy plus local pencil before either is built.
-            price = capacity(finite_width + infinity_width, phase="reduction")
-            packed = pack_parent_panels([(ss, ii, mask) for _, ss, ii, mask, _, _ in pending],
-                                        mesh_xy=mesh_xy)
-            reduce_eigh = eigenplan(finite_width + infinity_width)
+        finite_width = max(sum(st[1].shape[-1] for st in item[1]) for item in pending)
+        infinity_width = max(item[2][0].shape[-1] for item in pending)
+        side = finite_width + infinity_width
+        batch_width = mesh_divisor(mesh_xy)
+        local_policy = linalg_resolution({"linalg": "local"})
+        local_compiled_price = None
+        local_price = capacity(side, phase="reduction", policy=local_policy, reserve=False)
+        local_execute = None
+        if resolution.layout == "local" and local_price["device_budget_status"] == "PASS":
             extents = tuple((sum(st[1].shape[-1] for st in ss), ii[0].shape[-1])
                             for _, ss, ii, _, _, _ in pending)
             extents += (extents[-1],) * (batch_width - len(extents))
-            batch_results = local_parent_reducer(
-                mesh_xy, reduce_eigh.native_fn, extents)(*packed)
+            local_execute, local_compiled_price = plan_local_parent_reducer(
+                mesh_xy, eigenplan(side, local_policy).native_fn, extents, n)
+            local_price = capacity(side, policy=local_policy, reserve=False)
+        batch_width = 1
+        distributed_policy = linalg_resolution({"linalg": "distributed"})
+        distributed_price = capacity(side, policy=distributed_policy, reserve=False)
+        use_local = (resolution.layout == "local"
+                     and local_price["device_budget_status"] == "PASS")
+        reducer_resolution = local_policy if use_local else distributed_policy
+        route_receipt = dict(
+            route=reducer_resolution.layout, q_span=[q_start, q_stop],
+            local=local_price, distributed=distributed_price,
+            reason="local fits remaining ledger budget" if use_local else (
+                "explicit distributed policy" if resolution.layout == "distributed"
+                else "local exceeds remaining ledger budget"))
+        if use_local:
+            batch_width = mesh_divisor(mesh_xy)
+            # Admit the selected packed route before either panels or pencil.
+            price = capacity(side, phase="reduction")
+            packed = pack_parent_panels([(ss, ii, mask) for _, ss, ii, mask, _, _ in pending],
+                                        mesh_xy=mesh_xy)
+            batch_results = local_execute(*packed)
             jax.block_until_ready(batch_results)
             del packed
             # Drop selected action panels after the fused boundary. Model
@@ -811,7 +876,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             if batch_results is None:
                 price = capacity(active_columns.shape[-1], phase="reduction")
                 pencil = assemble_shared_pole_pencil(states, infinity, matmul=mm)
-                reduce_eigh = eigenplan(pencil[0].shape[-1])
+                reduce_eigh = eigenplan(pencil[0].shape[-1], reducer_resolution)
                 model, reduction, coefficients = reduce_shared_pole_pencil(
                     pencil, active_columns, eigh=reduce_eigh.batched, matmul=mm, gates=gates)
             else:
@@ -894,11 +959,11 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             price = capacity(r)
             row = {"q_span": list(span), "roles": roles,
                    "K": np.asarray(counts).tolist(), "J": int(np.unique(np.asarray(poles)[np.asarray(mask)]).size),
-                   "damping_fraction": 0.0, "capacity": price, "coulomb": coulomb_receipt,
+                   "damping_fraction": 0.0, "reducer_route": route_receipt, "capacity": price, "coulomb": coulomb_receipt,
                    "condition": np.asarray(reduction["gram_condition"]).tolist(),
                    "normalized_gram_spectrum": np.asarray(reduction["gram_spectrum_relative"])[..., :int(reduction.get("pencil_side", [r])[0])].tolist(),
                    "native_workspace_queries": [dict(op=op, shapes=shapes, bytes_per_rank=value)
-                                                 for (op, shapes), value in native_queries.items()],
+                                                 for (op, shapes, _, _), value in native_queries.items()],
                    "retained_moment_relative": {k: np.asarray(v).tolist() for k, v in retained.items()},
                    "moment_defects": {k: {a: np.asarray(b).tolist() for a, b in v.items()}
                                       for k, v in moment_defects.items()},
@@ -930,7 +995,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             receipts.append(receipt)
             del public_c, poles, counts
         batch_width = len(selected)
-        capacity(ready_models[0][0].shape[-1], phase="model")
+        capacity(max(row[0].shape[-1] for row in ready_models), phase="model")
         public_c, poles, counts = stack_models(tuple(ready_models))
         expose_live((public_c, poles, counts))
         span = (selected[0][0], selected[-1][0] + 1)

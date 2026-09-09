@@ -6,6 +6,20 @@ from gw.shared_pole_recipe import CapacityLedger, construction_receipt
 
 
 class CapacityTests(unittest.TestCase):
+    def test_quote_preserves_ledger_and_matches_admission(self):
+        ledger = self.ledger()
+        ledger.reserve('ambient', resident_bytes_per_rank=128,
+                       workspace_bytes_per_rank=64)
+        for resident, expected in ((576, 'PASS'), (577, 'FAIL')):
+            args = dict(resident_bytes_per_rank=resident,
+                        workspace_bytes_per_rank=0, concurrent_with=('ambient',))
+            quote = ledger.quote('candidate', **args)
+            self.assertEqual(quote['device_budget_status'], expected)
+            self.assertEqual(len(ledger.entries), 1)
+        args['resident_bytes_per_rank'] = 576
+        self.assertEqual(ledger.quote('candidate', **args),
+                         ledger.reserve('candidate', **args))
+
     def ledger(self):
         return CapacityLedger(NS(nk_tot=4,nspinor=1,n_rmu=4),
                               mesh_xy=NS(shape={'x':2,'y':2}))
