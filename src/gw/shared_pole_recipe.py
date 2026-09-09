@@ -384,6 +384,34 @@ def construction_receipt(measurements=None, *, capacity=None):
     return result
 
 
+def bind_shared_pole_sc_identity(meta, state, *, occupation_state, print_fn):
+    """Label current SC scratch, without claiming QP provenance (ruling 22).
+
+    ``state`` supplies the current iteration. Reuse the carried occupation
+    digest or the already-bound insulating census digest; compute no new hash.
+    These labels MUST NOT authenticate restart membership or skip construction.
+    """
+    import operator
+
+    iteration = operator.index(state.iteration)
+    if isinstance(state.iteration, bool) or iteration < 0:
+        raise ValueError("GATE shared_pole_sc_identity: iteration must be a nonnegative integer")
+    recipe = meta.shared_pole_recipe
+    occ_hash = (getattr(occupation_state, 'occ_hash', None)
+                if occupation_state is not None else
+                meta.shared_pole_census.get('occupation_sha256'))
+    if not isinstance(occ_hash, str) or not occ_hash:
+        raise ValueError("GATE shared_pole_sc_identity: current occupation label is missing")
+    identity = dict(hamiltonian=f'sc_map_{iteration}:{occ_hash}',
+                    wavefunctions='qp_rotation_unreceipted',
+                    recipe_hash=recipe['recipe_hash'], gate_hash=recipe['gate_hash'],
+                    authentication='NON-AUTHENTICATING')
+    meta.shared_pole_state_identity = identity
+    print_fn(f"shared-pole SC identity NON-AUTHENTICATING: {identity}; "
+             "scratch only; rebuild every map; no restart reuse or publication")
+    return dict(identity)
+
+
 def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
                                mesh_xy, print_fn):
     """Authenticate one current-map restart member through the store owner.
@@ -404,11 +432,18 @@ def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
     Returns
     -------
     dict or None
-        Small path/identity/digest/K handle, or None ONLY for a typed missing
+        Small one-shot path/identity/digest/K handle, or None ONLY for a typed missing
         member in a committed bundle. Stale/corrupt/partial members refuse.
         The authenticated header comes from the same payload validation.
     """
     from pathlib import Path
+
+    if (str(expected_identity.get('iteration_id', '')).startswith('sc_')
+            or expected_identity.get('wavefunctions') == 'qp_rotation_unreceipted'
+            or expected_identity.get('authentication') == 'NON-AUTHENTICATING'
+            or str(expected_identity.get('hamiltonian', '')).startswith('sc_map_')):
+        raise ValueError("GATE shared_pole_sc_restart: SC models are scratch-only and "
+                         "NON-AUTHENTICATING; rebuild A/B/C on every map")
     from file_io.tagged_arrays import (
         read_shared_pole_restart_member, SharedPoleMemberMissing,
         SharedPoleMemberRefused,

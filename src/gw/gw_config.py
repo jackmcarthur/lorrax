@@ -2875,6 +2875,10 @@ def _resolve_shared_pole_inputs(params):
             "want: finite > 0 eV; why: the causal evaluation needs positive broadening")
     if model != "shared_pole":
         return
+    if str(params.get("occ_smearing_family", "")).strip().lower() == "mp1":
+        raise ValueError(
+            "shared_pole needs a positive spectral measure: MP1 occupations "
+            "are non-monotonic; use occ_smearing_family = fd")
     if coerce_head_correction(params['head_correction']) is not HeadCorrection.OFF:
         raise ValueError(
             "shared_pole head correction NOT_MEASURED; use mpa or head_correction = off")
@@ -4804,13 +4808,11 @@ def _validate_occupation_smearing(screening, family, width_ry):
             "together; WFN.h5 supplies occupations but not their smearing "
             "family or width.")
     if family is not None:
-        if family != "mp1":
+        if family not in ("mp1", "fd"):
             raise ValueError(
-                "occ_smearing_family supports only 'mp1' "
-                f"(Methfessel-Paxton order 1); got {family!r}. Other "
-                "families need their own occupation solve and error "
-                "certificates before they can be honored.")
-        if not width_ry > 0.0:
+                "occ_smearing_family supports 'mp1' (Methfessel-Paxton order 1) "
+                f"or 'fd' (Fermi-Dirac); got {family!r}.")
+        if not (np.isfinite(width_ry) and width_ry > 0.0):
             raise ValueError(
                 "occ_smearing_width_ry must be > 0 for a metal; got "
                 f"{width_ry!r}")
@@ -4862,7 +4864,7 @@ def validate_material_inputs(config, material_class):
                 "use compute_mode=mpa, the occupation-aware path.")
         if family is None or width_ry is None:
             raise ValueError(
-                "metallic WFN occupations require occ_smearing_family=mp1 "
+                "metallic WFN occupations require occ_smearing_family=mp1 or fd "
                 "and occ_smearing_width_ry=<BerkeleyGW width in Ry>; WFN.h5 "
                 "does not store that metadata.")
         if config.sigma.fermi_reference != "mp1_fixed_n":
@@ -4878,7 +4880,7 @@ def validate_material_inputs(config, material_class):
         if config.sigma.fermi_reference == "mp1_fixed_n":
             raise ValueError(
                 "integer WFN occupations identify an insulator, which has "
-                "no fixed-N MP1 chemical potential; choose vbm or midgap.")
+                "no fixed-N chemical potential; choose vbm or midgap.")
         if config.mpa.metal_origin_shift_ry is not None:
             raise ValueError(
                 "mpa_metal_origin_shift_ry is metal-only, but WFN "
