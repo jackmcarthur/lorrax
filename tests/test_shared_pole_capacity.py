@@ -1,0 +1,101 @@
+"""Scalar plan-time capacity checks; no device, HDF5 or dense allocations."""
+import unittest
+from types import SimpleNamespace as NS
+
+from gw.shared_pole_recipe import CapacityLedger, construction_receipt
+
+
+class CapacityTests(unittest.TestCase):
+    def ledger(self):
+        return CapacityLedger(NS(nk_tot=4,nspinor=1,n_rmu=4),
+                              mesh_xy=NS(shape={'x':2,'y':2}))
+
+    def test_geometry_and_exact_boundary(self):
+        ledger=self.ledger()
+        self.assertEqual(ledger.U_bytes_per_rank,256)
+        self.assertEqual(ledger.limit_bytes_per_rank,768)
+        self.assertEqual(ledger.reserve('fit',resident_bytes_per_rank=512,
+                         workspace_bytes_per_rank=256)['status'],'PASS')
+
+    def test_workspace_and_concurrent_refusal(self):
+        ledger=self.ledger()
+        ledger.reserve('inputs',resident_bytes_per_rank=512,workspace_bytes_per_rank=0)
+        with self.assertRaisesRegex(MemoryError,'Px=2, Py=2'):
+            ledger.reserve('fit',resident_bytes_per_rank=128,workspace_bytes_per_rank=129,
+                           concurrent_with=('inputs',))
+        row=ledger.receipt()['entries'][-1]
+        self.assertEqual(row['status'],'FAIL')
+        self.assertEqual(row['aggregate_bytes_per_rank'],769)
+        self.assertEqual(row['max_mesh_ranks_at_fixed_bytes'],3)
+
+    def test_sequential_not_accumulated(self):
+        ledger=self.ledger()
+        for stage in ('bank','constructor','sigma'):
+            self.assertEqual(ledger.reserve(stage,resident_bytes_per_rank=768,
+                             workspace_bytes_per_rank=0)['status'],'PASS')
+
+    def test_transitive_concurrency_deduplicates(self):
+        ledger=self.ledger()
+        ledger.reserve('inputs',resident_bytes_per_rank=256,workspace_bytes_per_rank=64)
+        ledger.reserve('bank',resident_bytes_per_rank=128,workspace_bytes_per_rank=0,
+                       concurrent_with=('inputs',))
+        row=ledger.reserve('fit',resident_bytes_per_rank=256,workspace_bytes_per_rank=0,
+                           concurrent_with=('inputs','bank','inputs'))
+        self.assertEqual(row['aggregate_bytes_per_rank'],704)
+        with self.assertRaises(MemoryError):
+            ledger.reserve('extra',resident_bytes_per_rank=65,workspace_bytes_per_rank=0,
+                           concurrent_with=('fit',))
+
+    def test_unreserved_and_failed_dependencies_refuse(self):
+        ledger=self.ledger()
+        with self.assertRaises(MemoryError):
+            ledger.reserve('failed',resident_bytes_per_rank=769,workspace_bytes_per_rank=0)
+        for dependency in ('unknown','failed'):
+            with self.assertRaises(ValueError):
+                ledger.reserve('fit',resident_bytes_per_rank=0,workspace_bytes_per_rank=0,
+                               concurrent_with=(dependency,))
+
+    def test_invalid_bytes_and_geometry(self):
+        for value in (-1,float('nan'),float('inf'),1.5,True,None):
+            with self.assertRaises(ValueError):
+                self.ledger().reserve('bad',resident_bytes_per_rank=value,workspace_bytes_per_rank=0)
+        with self.assertRaises(ValueError):
+            CapacityLedger(NS(nk_tot=0,nspinor=1,n_rmu=4),mesh_xy=NS(shape={'x':2,'y':2}))
+
+    def test_duplicate_name_and_string_dependency(self):
+        ledger=self.ledger()
+        ledger.reserve('inputs',resident_bytes_per_rank=1,workspace_bytes_per_rank=0)
+        with self.assertRaises(ValueError):
+            ledger.reserve('inputs',resident_bytes_per_rank=1,workspace_bytes_per_rank=0)
+        with self.assertRaises(ValueError):
+            ledger.reserve('fit',resident_bytes_per_rank=1,workspace_bytes_per_rank=0,
+                           concurrent_with='inputs')
+
+    def test_receipt_preserves_fail_and_unmeasured_peak(self):
+        ledger=self.ledger()
+        self.assertEqual(construction_receipt(capacity=ledger)['gates'][-1]['status'],'NOT_MEASURED')
+        with self.assertRaises(MemoryError):
+            ledger.reserve('fit',resident_bytes_per_rank=1000,workspace_bytes_per_rank=0)
+        receipt=construction_receipt(capacity=ledger)
+        self.assertEqual(receipt['gates'][-1]['status'],'FAIL')
+        self.assertEqual(receipt['capacity']['measured_peak']['status'],'NOT_MEASURED')
+
+    def test_measured_peak_independent_of_plan(self):
+        ledger=self.ledger()
+        ledger.reserve('fit',resident_bytes_per_rank=500,workspace_bytes_per_rank=0)
+        self.assertEqual(ledger.record_measured_peak(800,reason='measured max across ranks')['status'],'FAIL')
+        self.assertEqual(ledger.entries[0]['status'],'PASS')
+        self.assertEqual(ledger.record_measured_peak(700,reason='later smaller reading')['status'],'FAIL')
+        self.assertEqual(construction_receipt(capacity=ledger)['gates'][-1]['status'],'FAIL')
+
+    def test_receipt_is_detached(self):
+        ledger=self.ledger()
+        row=ledger.reserve('fit',resident_bytes_per_rank=100,workspace_bytes_per_rank=0)
+        row['resident_bytes_per_rank']=1000
+        ledger.receipt()['entries'][0]['status']='FAIL'
+        self.assertEqual(ledger.receipt()['entries'][0]['status'],'PASS')
+        self.assertEqual(ledger.receipt()['entries'][0]['resident_bytes_per_rank'],100)
+
+
+if __name__=='__main__':
+    unittest.main(verbosity=2)
