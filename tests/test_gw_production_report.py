@@ -412,10 +412,8 @@ def test_low_mem_bands_warning_has_automatic_chunk_number(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert "[config provenance] low_mem_bands = true (deck)" in text
     assert (
-        "low_mem_bands = true is a capacity escape hatch: saves memory "
-        "(band chunks of 24) but takes longer; set false whenever the "
-        "full-band carrier fits, especially for multi-node dynamic Sigma "
-        "sweeps" in text)
+        "low_mem_bands = true: the two-face wavefunction carrier "
+        "(band chunks of 24); required for the raw-parent (k_irr) route" in text)
 
 
 def test_distributed_linalg_reports_2d_layout(tmp_path):
@@ -452,3 +450,22 @@ def test_mpa_trs_route_is_part_of_the_scientific_run_record(tmp_path):
             "no input override") in text
     assert "global time reversal MEASURED BROKEN" in text
     assert "one contour sweep plus the q-negated conjugate partner" in text
+
+
+def test_sigma_residual_subphases_are_not_double_counted(tmp_path):
+    output=[]
+    report=GWProductionReport(str(tmp_path/'gwjax.out'),runtime=_runtime(),debug=False,stdout=output.append)
+    rows=[dict(name='gw_jax.sigma',path=('gw_jax.sigma',),inclusive=100.)]
+    for name,value in [('sigma.rule_plan',10.),('sigma.tau_sweep',20.),
+                       ('sigma.exchange',4.),('sigma.hartree',3.),
+                       ('sigma.input_wait',.5),('sigma.finalize_input_wait',1.5),
+                       ('sigma.model_validate',5.),('sigma.capacity',2.),
+                       ('sigma.branches',1.),('sigma.census',1.),
+                       ('gw_jax.dynamic_sigma_finalize',6.)]:
+        rows.append(dict(name=name,path=('gw_jax.sigma',name),inclusive=value))
+    report.timings(rows,wall=100.)
+    text=(tmp_path/'gwjax.out').read_text()
+    other=next(line for line in text.splitlines() if line.strip().startswith('Sigma other'))
+    assert float(other.split()[-2])==46.
+    assert 'Sigma pending inputs' in text
+    assert 'Sigma model validation' in text and 'Sigma finalize + writes' in text
