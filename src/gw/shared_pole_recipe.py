@@ -14,6 +14,7 @@ import math
 RECIPE_VERSION = "shared_real_pole_v1_r3b"
 GATE_VERSION = "shared_real_pole_gates_v1_r3b"
 RECEIPT_SCHEMA = "lorrax.shared-real-pole.receipt.v1"
+ROLE_CODES = {"line": 0, "imaginary": 1, "infinity": 2, "held_line": 3, "held_imaginary": 4}
 
 shared_real_pole_v1_r3b = {
     "version": RECIPE_VERSION,
@@ -52,8 +53,10 @@ _GATE_ROWS = {
     "passivity": ("V-whitened -Wc(i eta) spectrum in bounds and relative anti-Hermitian part within tolerance",
                   {"eigenvalue_min": -1.0e-10, "eigenvalue_max": 1.0 + 1.0e-8,
                    "antihermitian_relative_max": 1.0e-10}),
-    "retained_subspace_moments": ("relative Q_inf-projected M1 and M3 defects after cut and zero policy <= threshold", 1.0e-10),
-    "held_w_full_moment_defects": ("held W and full M1/M3 diagnostics with extracted CD8/CD10 values and receipt paths; missing extraction blocks landing", None),
+    "retained_subspace_moments": ("relative M1/M3 identity defect in retained Ritz infinity states P_R x_inf, with P_R Gram-metric orthogonal on span(OZ), after cut and zero policy <= threshold; original q_inf defect is diagnostic", 1.0e-10),
+    "held_w": ("held W value/derivative relative defects with coordinates and receipt paths; diagnostic, no universal threshold", None),
+    "full_m1_defect": ("maximum over q of relative full M1 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-4),
+    "full_m3_defect": ("maximum over q of relative full M3 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-3),
     "representation": ("scalar N_spinor=1 and authenticated TRS allowed", {"nspinor": 1, "trs_allowed": True}),
     "capacity": ("aggregate live bytes per rank including workspace <= threshold * U", 3.0),
     "rule_validity": ("bank and Sigma certificates cover current domains at resolved tolerances", True),
@@ -64,6 +67,14 @@ shared_real_pole_gates_v1_r3b = {
            "version": GATE_VERSION}
     for name, (predicate, threshold) in _GATE_ROWS.items()
 }
+
+for _name, _range in (("full_m1_defect", (2.2e-6, 1.9e-5)),
+                      ("full_m3_defect", (3.6e-5, 1.7e-4))):
+    shared_real_pole_gates_v1_r3b[_name].update({
+        "version": "cd8_58061895.50", "diagnostic": True,
+        "calibration_range": _range,
+        "source": "CD8 construction 58061895.50; coordinator ruling5, 2026-09-09",
+    })
 
 
 def table_hash(table):
@@ -95,10 +106,16 @@ def gate_receipt(name, value=None, *, passed=None, reason):
     if passed is not None and type(passed) is not bool:
         raise TypeError("shared-pole receipt passed must be bool or None")
     json.dumps(value, allow_nan=False)
+    def missing(item):
+        if isinstance(item, dict):
+            return not item or any(missing(v) for v in item.values())
+        if isinstance(item, (list, tuple)):
+            return not item or any(missing(v) for v in item)
+        return item is None
     row = shared_real_pole_gates_v1_r3b[name]
-    status = "NOT_MEASURED" if value is None or passed is None else (
-        "PASS" if passed else "FAIL")
-    return {"predicate": row["predicate"], "name": name, "version": GATE_VERSION,
+    status = "NOT_MEASURED" if missing(value) or passed is None else (
+        "PASS" if passed else ("WARN" if row.get("diagnostic") else "FAIL"))
+    return {"predicate": row["predicate"], "name": name, "version": row["version"],
             "value": value, "threshold": row["threshold"], "status": status,
             "reason": reason}
 
@@ -212,9 +229,12 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
     """Resolve DESIGN §5 from current metadata into scalars and small arrays.
 
     ``bind_shared_pole_census`` must have consumed this map's occupation state.
-    Returns a plain dict: ``z_ry`` is complex128 [sample], ``roles`` names each
-    tangent/held role and its physical sample ID, ``fit_ids``/``held_ids`` are
-    disjoint physical IDs. Conjugates are constructor roles, never bank calls.
+    Returns a plain dict with equal-length ``z_ry`` complex128, ``role`` int8,
+    ``distinct_id`` int64 and ``held`` bool arrays [role]. Repeated physical
+    points share a distinct_id; fitting and held IDs are disjoint. Infinity's
+    role code is reserved (moments need no bank evaluation). Conjugates are
+    constructor states, never bank calls. ``support_pair`` int64 [role,2]
+    binds held endpoints; [-1,-1] means not a held midpoint.
     All ranks execute the metadata work; only ``print_fn`` may filter by rank.
     """
     import numpy as np
@@ -265,25 +285,28 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
                   for fraction in recipe['held_line_fractions']]
     held_line = mids[held_pairs]
     held_imag = np.sqrt(imaginary[[0, -2]] * imaginary[[1, -1]])
-    points, roles = [], []
+    points, role_z, role_codes, distinct_ids, held_flags, support_pairs = [], [], [], [], [], []
     def add(real, imag, role, held, pair=None):
         z = complex(real, imag) / RYD_TO_EV
         if z not in points:
             points.append(z)
-        roles.append({'sample_id': points.index(z), 'role': role, 'held': held,
-                      'value': True, 'derivative_s': True, 'support_pair': pair})
+        role_z.append(z)
+        role_codes.append(ROLE_CODES[role])
+        distinct_ids.append(points.index(z))
+        held_flags.append(held)
+        support_pairs.append([-1, -1] if pair is None else pair)
     for i, e in enumerate(line):
-        add(e, height, f'line:{i}', False)
+        add(e, height, 'line', False)
     for i, u in enumerate(imaginary):
-        add(0.0, u, f'imaginary:{i}', False)
+        add(0.0, u, 'imaginary', False)
     for i, e in enumerate(held_line):
         j = held_pairs[i]
-        add(e, height, f'held_line:{i}', True, [j, j+1])
+        add(e, height, 'held_line', True, [j, j+1])
     for i, u in enumerate(held_imag):
-        add(0.0, u, f'held_imaginary:{i}', True,
+        add(0.0, u, 'held_imaginary', True,
             [0, 1] if i == 0 else [count-2, count-1])
-    fit_ids = sorted({r['sample_id'] for r in roles if not r['held']})
-    held_ids = sorted({r['sample_id'] for r in roles if r['held']})
+    fit_ids = sorted({i for i, held in zip(distinct_ids, held_flags) if not held})
+    held_ids = sorted({i for i, held in zip(distinct_ids, held_flags) if held})
     if set(fit_ids) & set(held_ids):
         raise ValueError("GATE shared_pole_held_exclusion: got: held/training collision; want: disjoint physical IDs; why: held diagnostics must be independent")
     n = int(meta.nspinor) * int(meta.n_rmu)
@@ -299,12 +322,16 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
         'line_ev': line, 'imaginary_ev': imaginary,
         'held_line_ev': held_line, 'held_imaginary_ev': held_imag,
         'u_min_ev': umin, 'u_max_ev': umax, 'kappa': kappa,
-        'z_ry': np.asarray(points, dtype=np.complex128), 'roles': roles,
+        'z_ry': np.asarray(role_z, dtype=np.complex128),
+        'role': np.asarray(role_codes, dtype=np.int8),
+        'distinct_id': np.asarray(distinct_ids, dtype=np.int64),
+        'held': np.asarray(held_flags, dtype=np.bool_),
+        'support_pair': np.asarray(support_pairs, dtype=np.int64),
         'fit_ids': np.asarray(fit_ids, dtype=np.int64),
         'held_ids': np.asarray(held_ids, dtype=np.int64),
         'line_count': len(line), 'imaginary_count': count,
         'unique_evaluations': len(points), 'fit_count': len(fit_ids),
-        'held_count': len(held_ids), 'role_count': len(roles),
+        'held_count': len(held_ids), 'role_count': len(role_codes),
         'n': n, 'direction_cutoff': policy['direction_cutoff'],
         'imaginary_width': math.ceil(n * policy['imaginary_width_fraction']),
         'infinity_width': math.ceil(n * policy['infinity_width_fraction']),
@@ -317,7 +344,27 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
     }
     result['metadata_array_bytes'] = sum(v.nbytes for v in result.values()
                                          if isinstance(v, np.ndarray))
+    rules = {
+        'height': 'h=4*eta', 'eta': 'literal sigma_regularization_ev',
+        'plasma': '2*sqrt(4*pi*active_electrons/volume) Ry',
+        'top': 'L=omega_p+3.5 eV', 'spacing': 'eta/0.25',
+        'low_step': '2*eta', 'high_step': '4*eta',
+        'line': '2eta below 12 eV, 4eta above, exact L once; relaxed 8 endpoints',
+        'imaginary': 'log-spaced u_min..u_max; round(log(16*(L/u_min)^2)*log(4000)/(2*pi^2)), min2; tier width ceil(f*n)',
+        'held_line': 'adjacent-support midpoint nearest 25%/65% L; lower-index tie',
+        'held_imaginary': 'geometric midpoint of first/last adjacent imaginary pair',
+        'u_min': 'max(h,logical gap)', 'u_max': 'max(16 eV,L)', 'kappa': 'L/u_min',
+        'infinity': 'ceil(tier infinity fraction*n)', 'direction': 'tier relative singular cutoff',
+        'multiplet': 'whole multiplets within relative 1e-6',
+        'bank': 'fixed Hermite certificate tolerance 1e-8',
+        'sigma': 'tier Sigma tolerance production1e-4/relaxed1e-3',
+        'census': 'current full-band occupations, authenticated k weights/capacity; active band top >= mu-15 eV',
+        'U_bytes': '16*nk_full*(nspinor*nmu)^2/(Px*Py), logical bytes/rank',
+        'metadata': 'sum of replicated metadata array nbytes',
+    }
     for key, value in result.items():
         shown = value.tolist() if isinstance(value, np.ndarray) else value
-        print_fn(f'  [shared-pole recipe {RECIPE_VERSION}] {key}={shown} (DESIGN §5; census/current bands, eta/tier; units in key)')
+        rule = next((v for prefix, v in rules.items() if key.startswith(prefix)),
+                    'canonical role/ID census and versioned recipe; no accuracy inferred from missing evidence')
+        print_fn(f'  [shared-pole recipe {RECIPE_VERSION}] {key}={shown} (rule: {rule})')
     return result

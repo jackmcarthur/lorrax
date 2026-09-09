@@ -120,7 +120,7 @@ def test_geometry_padding_charge_and_holds():
     assert r['census']['borderline_bands']==[0]
     np.testing.assert_allclose(r['line_ev'],np.r_[np.arange(0,12,.5),np.arange(12,21)])
     assert not set(r['fit_ids']) & set(r['held_ids'])
-    assert len(r['roles']) == r['unique_evaluations']
+    assert len(r['role']) == r['unique_evaluations']
     assert r['imaginary_count']==3
     assert r['accuracy_status']=='NOT_MEASURED'
     args[1].enk[:,-1] *= 10
@@ -156,10 +156,93 @@ def test_stale_census():
 
 def test_receipt_absence_and_nonfinite():
     rows=construction_receipt()['gates']
-    assert len(rows)==len(shared_real_pole_gates_v1_r3b)==11
+    assert len(rows)==len(shared_real_pole_gates_v1_r3b)==13
     assert all(r['status']=='NOT_MEASURED' for r in rows)
     assert gate_receipt('capacity',passed=True,reason='absent')['status']=='NOT_MEASURED'
     assert gate_receipt('capacity',4,passed=False,reason='4U')['status']=='FAIL'
     with pytest.raises(ValueError):
         gate_receipt('capacity',float('nan'),passed=True,reason='invalid')
     json.dumps(rows,allow_nan=False)
+
+
+def test_flat_role_serialization_and_deduplication():
+    from gw.shared_pole_recipe import ROLE_CODES
+    r=resolve(fixture(metal=True,top=10))
+    assert r['z_ry'].shape==r['role'].shape==r['held'].shape==r['distinct_id'].shape
+    assert r['z_ry'].dtype==np.complex128
+    assert r['role'].dtype==np.int8 and r['distinct_id'].dtype==np.int64
+    assert r['held'].dtype==np.bool_
+    assert ROLE_CODES==dict(line=0,imaginary=1,infinity=2,held_line=3,held_imaginary=4)
+    assert 2 not in r['role']  # no fake infinity bank call
+    assert r['distinct_id'][0]==r['distinct_id'][r['line_count']]
+    assert len(set(r['distinct_id']))==r['unique_evaluations']
+    for i in set(r['distinct_id']):
+        assert np.unique(r['z_ry'][r['distinct_id']==i]).size==1
+    assert not np.any(r['held'][np.isin(r['distinct_id'],r['fit_ids'])])
+
+
+def test_nested_missing_measurements_and_warning_diagnostics():
+    assert gate_receipt('passivity',{'minimum':None},passed=True,reason='missing')['status']=='NOT_MEASURED'
+    r=gate_receipt('full_m1_defect',3e-4,passed=False,reason='outside calibrated band')
+    assert r['status']=='WARN' and r['version']=='cd8_58061895.50'
+    assert r['threshold']==2e-4
+    assert gate_receipt('full_m3_defect',1e-3,passed=True,reason='measured')['status']=='PASS'
+
+
+def test_band_top_charge_nonuniform_weights_and_unclipped_tail():
+    c,w,m=fixture(metal=True)
+    f=np.array([[1.,1.05,0.,0.],[1.,-.05,0.,0.]])
+    state=NS(f_kn=f,mu_ry=0.,smearing_family='mp1')
+    bind_shared_pole_census(w,m,occupation_state=state,trs_allowed=True,
+                           state_capacity=2.,kweights=[.75,.25])
+    assert m.shared_pole_census['active_electrons']==pytest.approx(1.55)
+    assert m.shared_pole_census['active_bands']==[1,2]
+    assert m.shared_pole_census['borderline_bands']==[0]
+    # Whole-band selection turns on at exactly mu-15 eV; one k row suffices.
+    w.enk[1,0]=-15/RYD_TO_EV
+    bind_shared_pole_census(w,m,occupation_state=state,trs_allowed=True,
+                           state_capacity=2.,kweights=[.75,.25])
+    assert m.shared_pole_census['active_electrons']==pytest.approx(3.55)
+    assert m.shared_pole_census['borderline_bands']==[]
+
+
+@pytest.mark.parametrize('weights', [[.5,.4],[-.1,1.1],[float('nan'),.5],[1.]])
+def test_weight_refusal(weights):
+    c,w,m=fixture()
+    with pytest.raises(ValueError,match='GATE shared_pole_kweights'):
+        bind_shared_pole_census(w,m,occupation_state=None,trs_allowed=True,
+                               state_capacity=2.,kweights=weights)
+
+
+@pytest.mark.parametrize('spin,trs',[(2,True),(1,False)])
+def test_representation_refusal(spin,trs):
+    c,w,m=fixture();m.nspinor=spin
+    with pytest.raises(ValueError,match='GATE shared_pole_representation'):
+        bind_shared_pole_census(w,m,occupation_state=None,trs_allowed=trs,
+                               state_capacity=2.,kweights=[.5,.5])
+
+
+def test_current_map_rebind_at_30mev():
+    c,w,m=fixture();before=resolve((c,w,m))
+    w.enk[:,:3]+=.03/RYD_TO_EV
+    bind_shared_pole_census(w,m,occupation_state=None,trs_allowed=True,
+                           state_capacity=2.,kweights=[.5,.5])
+    after=resolve((c,w,m))
+    assert before['census']['energy_sha256']!=after['census']['energy_sha256']
+    np.testing.assert_allclose(after['z_ry'],before['z_ry'],rtol=1e-14)
+    assert after['census']['mu_ry']-before['census']['mu_ry']==pytest.approx(.03/RYD_TO_EV)
+
+
+def test_exact_applicability_message(tmp_path):
+    with pytest.raises(ValueError) as exc:
+        parse(tmp_path,'compute_mode=cohsex\nsigma_w_model=mpa\n')
+    assert str(exc.value)==("GATE shared_pole_applicability: sigma_w_model got: 'mpa' "
+        "with compute_mode='cohsex'; want: compute_mode=mpa; "
+        "why: this key selects the MPA Sigma W representation")
+
+
+def test_minimax_tolerance_does_not_override_bank(tmp_path):
+    c=parse(tmp_path,'compute_mode=mpa\nsigma_w_model=shared_pole\nminimax_target_error=1e-3\n')
+    assert c.screening.minimax_target_error==1e-3
+    _,w,m=fixture()
+    assert resolve((c,w,m))['bank_rule_tolerance']==1e-8
