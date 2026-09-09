@@ -60,7 +60,7 @@ def _shared_pole_member_record(values):
 
 
 def register_shared_pole_restart_member(
-        restart_path, model_path, *, expected_identity, mesh_xy):
+        restart_path, model_path, *, expected_identity, mesh_xy, capacity=None):
     """Register an authenticated immutable model after its construction.
 
     Parameters
@@ -72,6 +72,9 @@ def register_shared_pole_restart_member(
         Current SC identity passed unchanged to the model's validator.
     mesh_xy : jax.sharding.Mesh
         Current named mesh; every rank participates in validation/transaction.
+    capacity : CapacityLedger, optional
+        Same map ledger with bound caller lifetimes; required for payload
+        authentication. Metadata-only validation cannot register a member.
 
     Returns
     -------
@@ -90,7 +93,10 @@ def register_shared_pole_restart_member(
         if model_path == restart_path:
             raise ValueError("GATE shared_pole_member: model must be a separate file")
         header = validate_shared_pole_model(
-            model_path, expected_identity=expected_identity, mesh_xy=mesh_xy)
+            model_path, expected_identity=expected_identity, mesh_xy=mesh_xy,
+            **({"capacity":capacity} if capacity is not None else {}))
+        if header.get("validation_receipt", {}).get("status") == "NOT_MEASURED":
+            raise ValueError("GATE shared_pole_member: payload authentication requires capacity")
         member.update(_shared_pole_member_record([
             os.path.relpath(model_path, restart_path.parent), header["schema"],
             header["digest"], header["identity"]["iteration_id"]]))
@@ -121,7 +127,7 @@ def register_shared_pole_restart_member(
 
 
 def read_shared_pole_restart_member(
-        restart_path, *, expected_identity, mesh_xy):
+        restart_path, *, expected_identity, mesh_xy, capacity=None):
     """Authenticate current-map membership without expanding factors into W.
 
     Parameters
@@ -132,6 +138,9 @@ def read_shared_pole_restart_member(
         Current SC identity, authenticated by the model format owner.
     mesh_xy : jax.sharding.Mesh
         Current named mesh passed to the model validator on every rank.
+    capacity : CapacityLedger, optional
+        Same map ledger with bound caller lifetimes; required to authenticate
+        payload bytes before accepting the linked digest.
 
     Returns
     -------
@@ -150,7 +159,10 @@ def read_shared_pole_restart_member(
         member = _shared_pole_member_record(h5[SHARED_POLE_MEMBER_DATASET][()])
     header = validate_shared_pole_model(
         restart_path.parent / member["path"],
-        expected_identity=expected_identity, mesh_xy=mesh_xy)
+        expected_identity=expected_identity, mesh_xy=mesh_xy,
+        **({"capacity":capacity} if capacity is not None else {}))
+    if header.get("validation_receipt", {}).get("status") == "NOT_MEASURED":
+        raise ValueError("GATE shared_pole_member: payload authentication requires capacity")
     linked = {"schema": header["schema"], "digest": header["digest"],
               "iteration_id": header["identity"]["iteration_id"]}
     for key, value in linked.items():
