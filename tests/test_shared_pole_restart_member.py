@@ -140,3 +140,56 @@ def test_malformed_member_refuses_before_model_validation(member_case, values, m
     with pytest.raises(ValueError, match=match):
         _read(member_case)
     assert not member_case[5]
+
+
+def test_present_returns_same_validated_header_once(member_case):
+    restart, model, identity, header, mesh, calls = member_case
+    member = _register(member_case)
+    header.update(K=[3, 5, 2], recipe_hash="recipe", gate_hash="gate")
+    calls.clear()
+    before = restart.read_bytes(), model.read_bytes()
+    result, validated = tagged_arrays.read_shared_pole_restart_member(
+        restart, expected_identity=identity, mesh_xy=mesh, return_header=True)
+    assert result == member and validated == header
+    assert calls == [model]
+    assert _read(member_case) == member  # Existing default stays unchanged.
+    assert (restart.read_bytes(), model.read_bytes()) == before
+
+
+def test_missing_has_typed_rebuildable_outcome(member_case):
+    restart, _, identity, _, mesh, calls = member_case
+    before = restart.read_bytes()
+    with pytest.raises(tagged_arrays.SharedPoleMemberMissing) as caught:
+        tagged_arrays.read_shared_pole_restart_member(
+            restart, expected_identity=identity, mesh_xy=mesh, return_header=True)
+    assert caught.value.status == "missing"
+    assert caught.value.reason == "GATE shared_pole_member: restart has no model member"
+    assert not calls and restart.read_bytes() == before
+
+
+def test_refused_preserves_identity_hash_and_corruption_reasons(member_case, monkeypatch):
+    from file_io import shared_pole_store
+
+    _register(member_case)
+    restart, model, identity, _, mesh, _ = member_case
+    before = restart.read_bytes(), model.read_bytes()
+    actual = {key: "current-" + key for key in shared_pole_store._IDENTITY_KEYS}
+    actual.update(recipe_hash="recipe-current", gate_hash="gate-current")
+    reasons = []
+    for key in ("energies", "recipe_hash", "gate_hash"):
+        with pytest.raises(ValueError) as mismatch:
+            shared_pole_store._check_identity(actual, dict(actual, **{key: "changed"}))
+        assert f"{key}: got {actual[key]!r}, want 'changed'" in str(mismatch.value)
+        reasons.append(str(mismatch.value))
+    reasons.append("GATE shared_pole_store: model payload/identity digest mismatch")
+    for reason in reasons:
+        def refuse(*args, **kwargs):
+            raise ValueError(reason)
+        monkeypatch.setattr(shared_pole_store, "validate_shared_pole_model", refuse)
+        with pytest.raises(tagged_arrays.SharedPoleMemberRefused) as caught:
+            tagged_arrays.read_shared_pole_restart_member(
+                restart, expected_identity=identity, mesh_xy=mesh, return_header=True)
+        assert caught.value.status == "refused" and caught.value.reason == reason
+        assert "copy of the bundle" in str(caught.value)
+        assert not isinstance(caught.value, tagged_arrays.SharedPoleMemberMissing)
+    assert (restart.read_bytes(), model.read_bytes()) == before

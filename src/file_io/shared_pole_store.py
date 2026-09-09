@@ -160,7 +160,11 @@ def _check_identity(actual, expected):
         if not isinstance(actual.get(name), str) or not actual[name]:
             _refuse(f"identity missing nonempty {name}")
     if _json(actual) != _json(expected):
-        _refuse("stale input/SC identity")
+        mismatches = [f"{key}: got {actual.get(key)!r}, want {expected.get(key)!r}"
+                      for key in sorted(set(actual) | set(expected))
+                      if key not in actual or key not in expected
+                      or _json(actual[key]) != _json(expected[key])]
+        _refuse("stale input/SC identity; " + "; ".join(mismatches))
 
 
 def _read_header(path):
