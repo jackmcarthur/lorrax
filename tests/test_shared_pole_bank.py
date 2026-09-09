@@ -27,14 +27,17 @@ def _bank_fixture():
     mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ('x', 'y'))
     meta, tables, recipe, identity = _fixture(mesh)
     recipe = deepcopy(recipe)
-    # Fixture-local named codes test transport, not a claimed resolver ABI.
+    # Canonical code table published by IINPUTS under coordinator ruling 4.
     recipe.update(
-        role_codes={"line": 1, "imaginary": 2, "infinity": 3,
-                    "held_line": 4, "held_imaginary": 5},
+        role_codes={"line": 0, "imaginary": 1, "infinity": 2,
+                    "held_line": 3, "held_imaginary": 4},
         z_ry=np.asarray([0.1j, 0.1j, 0.2+0.1j], dtype=np.complex128),
-        role=np.asarray([1, 2, 4], dtype=np.int8),
+        role=np.asarray([0, 1, 3], dtype=np.int8),
         distinct_id=np.asarray([0, 0, 1], dtype=np.int64),
-        held=np.asarray([False, False, True], dtype=np.bool_))
+        held=np.asarray([False, False, True], dtype=np.bool_),
+        support_pair=np.asarray([[-1,-1],[-1,-1],[0,1]], dtype=np.int64),
+        fit_ids=np.asarray([0], dtype=np.int64),
+        held_ids=np.asarray([1], dtype=np.int64))
     return mesh, meta, tables, recipe, identity
 
 

@@ -38,6 +38,27 @@ SHARED_POLE_MEMBER_DATASET = "shared_pole_member"
 _SHARED_POLE_MEMBER_FIELDS = ("path", "schema", "digest", "iteration_id")
 
 
+class SharedPoleMemberMissing(ValueError):
+    """No member in a committed bundle; the caller may construct it once."""
+
+    status = "missing"
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(reason)
+
+
+class SharedPoleMemberRefused(ValueError):
+    """Existing member is incompatible or corrupt; never rebuild in place."""
+
+    status = "refused"
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(f"{reason}; never overwrite this member; run against "
+                         "a copy of the bundle (restart=true)")
+
+
 def _shared_pole_member_record(values):
     """Authenticate the small, ordered restart membership receipt."""
     raw = np.asarray(values)
@@ -60,7 +81,7 @@ def _shared_pole_member_record(values):
 
 
 def register_shared_pole_restart_member(
-        restart_path, model_path, *, expected_identity, mesh_xy):
+        restart_path, model_path, *, expected_identity, mesh_xy, capacity=None):
     """Register an authenticated immutable model after its construction.
 
     Parameters
@@ -72,6 +93,9 @@ def register_shared_pole_restart_member(
         Current SC identity passed unchanged to the model's validator.
     mesh_xy : jax.sharding.Mesh
         Current named mesh; every rank participates in validation/transaction.
+    capacity : CapacityLedger, optional
+        Same map ledger with bound caller lifetimes; required for payload
+        authentication. Metadata-only validation cannot register a member.
 
     Returns
     -------
@@ -90,7 +114,10 @@ def register_shared_pole_restart_member(
         if model_path == restart_path:
             raise ValueError("GATE shared_pole_member: model must be a separate file")
         header = validate_shared_pole_model(
-            model_path, expected_identity=expected_identity, mesh_xy=mesh_xy)
+            model_path, expected_identity=expected_identity, mesh_xy=mesh_xy,
+            **({"capacity":capacity} if capacity is not None else {}))
+        if header.get("validation_receipt", {}).get("status") == "NOT_MEASURED":
+            raise ValueError("GATE shared_pole_member: payload authentication requires capacity")
         member.update(_shared_pole_member_record([
             os.path.relpath(model_path, restart_path.parent), header["schema"],
             header["digest"], header["identity"]["iteration_id"]]))
@@ -121,7 +148,8 @@ def register_shared_pole_restart_member(
 
 
 def read_shared_pole_restart_member(
-        restart_path, *, expected_identity, mesh_xy):
+        restart_path, *, expected_identity, mesh_xy, capacity=None,
+        return_header=False):
     """Authenticate current-map membership without expanding factors into W.
 
     Parameters
@@ -132,33 +160,58 @@ def read_shared_pole_restart_member(
         Current SC identity, authenticated by the model format owner.
     mesh_xy : jax.sharding.Mesh
         Current named mesh passed to the model validator on every rank.
+    capacity : CapacityLedger, optional
+        Same map ledger with bound caller lifetimes; required to authenticate
+        payload bytes before accepting the linked digest.
+    return_header : bool, optional
+        Return (member, header) from the SAME validation when True. The
+        default remains the four-string member dictionary.
 
     Returns
     -------
-    dict
-        Relative path, schema, digest and iteration ID. Missing, partial,
-        changed or stale members refuse before the factor reader is called.
+    dict or tuple of (dict, dict)
+        Present: relative path, schema, digest and iteration ID, optionally
+        paired with the already-authenticated header. No second validation.
+
+    Raises
+    ------
+    SharedPoleMemberMissing
+        status="missing": no member in an existing committed bundle. The
+        caller may construct/register once in that bundle.
+    SharedPoleMemberRefused
+        status="refused": incomplete, malformed, missing linked payload,
+        identity/recipe/gate mismatch or corrupt payload. ``reason`` preserves
+        the exact validator diagnostic. Never classified as missing, and
+        never permission to replace an immutable member.
     """
     from .commit_state import assert_committed
     from .shared_pole_store import validate_shared_pole_model
 
-    restart_path = Path(restart_path).resolve()
-    with h5py.File(restart_path, "r") as h5:
-        assert_committed(h5, path=restart_path)
-        if SHARED_POLE_MEMBER_DATASET not in h5:
-            raise ValueError("GATE shared_pole_member: restart has no model member")
-        member = _shared_pole_member_record(h5[SHARED_POLE_MEMBER_DATASET][()])
-    header = validate_shared_pole_model(
-        restart_path.parent / member["path"],
-        expected_identity=expected_identity, mesh_xy=mesh_xy)
-    linked = {"schema": header["schema"], "digest": header["digest"],
-              "iteration_id": header["identity"]["iteration_id"]}
-    for key, value in linked.items():
-        if member[key] != value:
-            raise ValueError(
-                f"GATE shared_pole_member: linked {key} changed; "
-                f"got {value!r}, want {member[key]!r}; rebuild the SC bundle")
-    return member
+    try:
+        restart_path = Path(restart_path).resolve()
+        with h5py.File(restart_path, "r") as h5:
+            assert_committed(h5, path=restart_path)
+            if SHARED_POLE_MEMBER_DATASET not in h5:
+                raise SharedPoleMemberMissing("GATE shared_pole_member: restart has no model member")
+            member = _shared_pole_member_record(h5[SHARED_POLE_MEMBER_DATASET][()])
+        header = validate_shared_pole_model(
+            restart_path.parent / member["path"],
+            expected_identity=expected_identity, mesh_xy=mesh_xy,
+            **({"capacity":capacity} if capacity is not None else {}))
+        if header.get("validation_receipt", {}).get("status") == "NOT_MEASURED":
+            raise ValueError("GATE shared_pole_member: payload authentication requires capacity")
+        linked = {"schema": header["schema"], "digest": header["digest"],
+                  "iteration_id": header["identity"]["iteration_id"]}
+        for key, value in linked.items():
+            if member[key] != value:
+                raise ValueError(
+                    f"GATE shared_pole_member: linked {key} changed; "
+                    f"got {value!r}, want {member[key]!r}; rebuild the SC bundle")
+        return (member, header) if return_header else member
+    except SharedPoleMemberMissing:
+        raise
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        raise SharedPoleMemberRefused(str(exc)) from exc
 
 
 def _encode_charge_zeta_identity(receipt):
