@@ -312,6 +312,11 @@ def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout):
     return sqrt_v
 
 
+@lru_cache(maxsize=8)
+def _coulomb_pack(basis,mesh_xy):
+    return jax.jit(lambda v: basis.pack_operator(v,spec=P(None,"x","y")))
+
+
 def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
     """Read one authenticated canonical V batch; convert through its owner."""
     from file_io.slab_io import SlabIO
@@ -320,7 +325,7 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
     spec = P(None, "x", "y")
     abstract = jax.ShapeDtypeStruct(shape, jnp.complex128,
                                    sharding=NamedSharding(mesh_xy, spec))
-    packed = jax.jit(lambda v: basis.pack_operator(v, spec=spec))
+    packed = _coulomb_pack(basis,mesh_xy)
     compiled = packed.lower(abstract).compile()
     memory = compiled.memory_analysis()
     _reserve(meta, "coulomb_read_pack", memory.argument_size_in_bytes,
@@ -446,8 +451,9 @@ def _receipt(stage, census, bank_io):
         job=os.getenv("SLURM_JOB_ID"), step=os.getenv("SLURM_STEP_ID"),
         coulomb_identity=dict(bank_io["coulomb"]), seconds={}, memory=[],
         completion=False, correlation_count=0, batches=[], compiled=[],
+        native_accumulator_workspace_bytes=0,
         native_workspace_status="NOT_MEASURED",
-        native_workspace_reason="ISERV provider bounds pending; compiled admission only",
+        native_workspace_reason="other external native allocations excluded from compiler/JAX allocator counts",
         peak_bytes=None, peak_reason="execution has not completed",
         moment_convention="S_m = 2 M_(2m+1) in physical coordinates",
         units={"Wc": "Ry", "dWc_ds": "Ry^-1", "M1": "Ry^3", "M3": "Ry^5"})
@@ -484,7 +490,12 @@ def _finish_receipt(receipt, meta, header, started):
     receipt["seconds"]["total"] = time.monotonic()-started
     receipt["bank_complete"] = bool(header["complete"])
     receipt["capacity"] = meta.shared_pole_capacity.receipt()
-    receipt["peak_reason"] = "compiled admission; native measured peak pending ISERV"
+    stats = [d.memory_stats() for d in jax.local_devices()]
+    local_peak = max((v.get("peak_bytes_in_use",0) for v in stats if v),default=0)
+    from jax.experimental import multihost_utils
+    peak = int(np.max(multihost_utils.process_allgather(np.asarray(local_peak,dtype=np.int64))))
+    receipt["peak_bytes"] = peak or None
+    receipt["peak_reason"] = "maximum JAX allocator high-water bytes across ranks; inherited arrays included, external native allocations excluded"
     receipt["plan_hash"] = header["bank_plan_digest"]
     return receipt
 
@@ -501,30 +512,34 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
     _stream_comparison(wfns, meta, mesh_xy, qids, receipt)
     face_bytes = 16*meta.mu_basis.n_packed**2 // mesh_xy.size
     # Two totals, next correlation, arithmetic temporaries and bounded H/solve.
-    name, _ = _reserve(meta, "bank_outputs_moments", (8*len(qids)+16)*face_bytes)
-    ledger.live_stages = ambient+(name,)
     _, moments, receipt["algebra"] = response_algebra(meta, config,
         mesh_xy=mesh_xy, n=meta.mu_basis.n_packed)
-    if not np.asarray(header["moment_written"]).all():
-        a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
-                                      q_ids=tuple(qids), execute=execute)
-        for iq in range(len(qids)):
-            marked = header["moment_written"][iq]
-            if all(marked):
-                continue
-            span = (iq,iq+1)
-            h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, span, execute)
-            del hi
-            m1, m3 = execute(moments, (h,a0[iq:iq+1],a1[iq:iq+1]), "moment_dyson")
-            io_started = time.monotonic()
-            header = write_shared_pole_bank(bank_io["path"], q_span=span,
-                M1=None if marked[0] else m1, M3=None if marked[1] else m3,
-                meta=meta, expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
-            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-            receipt["batches"].append(dict(q_span=span,support_ranks=ranks))
-            del h,m1,m3
-        del a0,a1
-        receipt["correlation_count"] = 6
+    qwidth = max(1,min(len(qids),int((.75*ledger.U_bytes_per_rank/face_bytes-16)/8)))
+    for q0 in range(0,len(qids),qwidth):
+        q1 = min(q0+qwidth,len(qids))
+        ledger.live_stages = ambient
+        name,_ = _reserve(meta,"bank_outputs_moments",(8*(q1-q0)+16)*face_bytes)
+        ledger.live_stages = ambient+(name,)
+        if not np.asarray(header["moment_written"])[q0:q1].all():
+            a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
+                                          q_ids=tuple(qids[q0:q1]), execute=execute)
+            for iq in range(q0,q1):
+                marked = header["moment_written"][iq]
+                if all(marked):
+                    continue
+                span = (iq,iq+1)
+                h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, span, execute)
+                del hi
+                m1, m3 = execute(moments, (h,a0[iq-q0:iq-q0+1],a1[iq-q0:iq-q0+1]), "moment_dyson")
+                io_started = time.monotonic()
+                header = write_shared_pole_bank(bank_io["path"], q_span=span,
+                    M1=None if marked[0] else m1, M3=None if marked[1] else m3,
+                    meta=meta, expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
+                receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                receipt["batches"].append(dict(q_span=span,support_ranks=ranks))
+                del h,m1,m3
+            del a0,a1
+            receipt["correlation_count"] += 6
     ledger.live_stages = ambient
     receipt["completion"] = bool(np.asarray(header["moment_written"]).all())
     return _finish_receipt(receipt,meta,header,started)
@@ -547,21 +562,16 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     energy,f,u,reference,_ = response_weights(wfns,meta)
     masks,ft,ut,cells,receipt["windows"] = response_windows(energy,f,u,
         chemical_potential_ry=sample_plan["census"]["mu_ry"])
-    adapter = bank_io.get("rule_adapter")
-    if adapter is None:
-        import minimax
-        bank_rule,laplace_rule = minimax.response_bank_rule,minimax.response_laplace_rule
-        receipt["rule_provider"] = "minimax"
-    else:
-        bank_rule,laplace_rule = adapter.response_bank_rule,adapter.response_laplace_rule
-        receipt["rule_provider"] = "adapter"
+    import minimax
+    bank_rule,laplace_rule = minimax.response_bank_rule,minimax.response_laplace_rule
+    receipt["rule_provider"] = "minimax"
     middle = energy[masks[1]]
     delta = float(middle.max()-middle.min())
     rule = bank_rule(z,delta,rel_tol=sample_plan["bank_rule_tolerance"])
     t,weights = np.asarray(rule["t"]),np.asarray(rule["h"])
-    phase = weights[None,:]*np.exp(1j*z[:,None]*t[None,:])
-    derivative = phase*(1j*t[None,:]/(2*z[:,None]))
-    receipt["rule"] = {k:v for k,v in rule.items() if k not in ("t","h")}
+    phase = np.asarray(rule["projection_value"])
+    derivative = np.asarray(rule["projection_derivative"])
+    receipt["rule"] = {k:v for k,v in rule.items() if k not in ("t","h","projection_value","projection_derivative")}
     receipt["nodes"] = len(t)
     remote = []
     for cell in cells:
@@ -569,61 +579,75 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                          rel_tol=sample_plan["bank_rule_tolerance"])
         remote.append((cell,rr))
     receipt["laplace_cells"] = [{**cell,**{k:v for k,v in rr.items()
-        if k not in ("t","projection_value","projection_derivative")}}
+        if k not in ("t","projection_value","projection_derivative","coefficient_rows")}}
         for cell,rr in remote]
     face_bytes = 16*meta.mu_basis.n_packed**2//mesh_xy.size
     # At most three carries coexist during remote addition. Leave one quarter
     # of U for dense service/transport work; the common ledger is authoritative.
-    width = max(1,min(len(z),int(.75*ledger.U_bytes_per_rank/(2*len(qids)*face_bytes))))
-    for lo in range(0,len(z),width):
-        hi = min(lo+width,len(z));a = hi-lo
-        ledger.live_stages = ambient
-        name,_ = _reserve(meta,"bank_outputs",(6*a*len(qids)+32)*face_bytes
-            + int(phase.nbytes+derivative.nbytes))
-        ledger.live_stages = ambient+(name,)
-        kernel,fixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-            q_ids=tuple(qids),n_outputs=2*a)
-        raw = execute(kernel,(jnp.asarray(t),jnp.asarray(np.vstack((phase[lo:hi],derivative[lo:hi]))),
-            *fixed,stream_weights(wfns,ft*masks[1],mesh_xy),
-            stream_weights(wfns,ut*masks[1],mesh_xy),jnp.asarray(reference)),"real_time")
-        receipt["correlation_count"] += len(t)
-        for cell,rr in remote:
-            lower,upper = cell["lower"],cell["upper"]
-            refs = np.asarray(cell["references_ry"])
-            tau = np.asarray(rr["t"])
-            projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]
-            lk,lfixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-                q_ids=tuple(qids),n_outputs=2*a,pair_mode="laplace")
-            lw = np.stack([ft*masks[lower],ut*masks[lower]])
-            uw = np.stack([ut*masks[upper],ft*masks[upper]])
-            # Parent selection applies to the k axis, separately for each role.
-            lw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in lw])
-            uw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in uw])
-            contribution = execute(lk,(jnp.asarray(tau),jnp.asarray(projections),
-                *lfixed,lw,uw,jnp.asarray(refs)),"laplace")
-            raw = raw+contribution
-            raw.block_until_ready();del contribution,lw,uw
-            receipt["correlation_count"] += 2*len(tau)
-        for iq in range(len(qids)):
-            span = (iq,iq+1)
-            if np.asarray(header["sample_written"])[iq,lo:hi].all():
-                continue
-            h,hinv,ranks = _coulomb_batch(meta,config,bank_io,mesh_xy,span,execute)
-            del hinv
-            for ia in range(lo,hi):
-                marked = header["sample_written"][iq][ia]
-                if all(marked):continue
-                value,ds = execute(samples,(h,raw[iq:iq+1,ia-lo],raw[iq:iq+1,a+ia-lo]),"sample_dyson")
-                io_started = time.monotonic()
-                header = write_shared_pole_bank(bank_io["path"],q_span=span,sample_span=(ia,ia+1),
-                    Wc=None if marked[0] else value[:,None],
-                    dWc_ds=None if marked[1] else ds[:,None],meta=meta,
-                    expected_identity=bank_io["identity"],mesh_xy=mesh_xy)
-                receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                del value,ds
-            del h
-        receipt["batches"].append(dict(q_span=(0,len(qids)),sample_span=(lo,hi)))
-        del raw
+    qwidth = max(1,min(len(qids),int(.75*ledger.U_bytes_per_rank/(2*face_bytes))))
+    for q0 in range(0,len(qids),qwidth):
+        q1 = min(q0+qwidth,len(qids))
+        width = max(1,min(len(z),int(.75*ledger.U_bytes_per_rank/(2*(q1-q0)*face_bytes))))
+        for lo in range(0,len(z),width):
+            hi = min(lo+width,len(z));a = hi-lo
+            ledger.live_stages = ambient
+            name,_ = _reserve(meta,"bank_outputs",(6*a*(q1-q0)+32)*face_bytes
+                + int(phase.nbytes+derivative.nbytes))
+            ledger.live_stages = ambient+(name,)
+            kernel,fixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
+                q_ids=tuple(qids[q0:q1]),n_outputs=2*a)
+            raw = execute(kernel,(jnp.asarray(t),jnp.asarray(np.vstack((phase[lo:hi],derivative[lo:hi]))),
+                *fixed,stream_weights(wfns,ft*masks[1],mesh_xy),
+                stream_weights(wfns,ut*masks[1],mesh_xy),jnp.asarray(reference)),"real_time")
+            receipt["correlation_count"] += len(t)
+            for cell,rr in remote:
+                lower,upper = cell["lower"],cell["upper"]
+                refs = np.asarray(cell["references_ry"])
+                tau = np.asarray(rr["t"])
+                projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]
+                lk,lfixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
+                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,pair_mode="laplace")
+                lw = np.stack([ft*masks[lower],ut*masks[lower]])
+                uw = np.stack([ut*masks[upper],ft*masks[upper]])
+                # Parent selection applies to the k axis, separately for each role.
+                lw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in lw])
+                uw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in uw])
+                contribution = execute(lk,(jnp.asarray(tau),jnp.asarray(projections),
+                    *lfixed,lw,uw,jnp.asarray(refs)),"laplace")
+                raw = raw+contribution
+                raw.block_until_ready();del contribution,lw,uw
+                receipt["correlation_count"] += 2*len(tau)
+            for iq in range(q0,q1):
+                span = (iq,iq+1)
+                if np.asarray(header["sample_written"])[iq,lo:hi].all():
+                    continue
+                h,hinv,ranks = _coulomb_batch(meta,config,bank_io,mesh_xy,span,execute)
+                del hinv
+                ia = lo
+                while ia < hi:
+                    marked = tuple(header["sample_written"][iq][ia])
+                    stop = ia+1
+                    while stop < hi and tuple(header["sample_written"][iq][stop]) == marked:
+                        stop += 1
+                    if all(marked):
+                        ia = stop
+                        continue
+                    chi = raw[iq-q0,ia-lo:stop-lo]
+                    dchi = raw[iq-q0,a+ia-lo:a+stop-lo]
+                    hbatch = jnp.broadcast_to(h,chi.shape)
+                    value,ds = execute(samples,(hbatch,chi,dchi),"sample_dyson")
+                    value = None if marked[0] else value[None]
+                    ds = None if marked[1] else ds[None]
+                    io_started = time.monotonic()
+                    header = write_shared_pole_bank(bank_io["path"],q_span=span,
+                        sample_span=(ia,stop),Wc=value,dWc_ds=ds,meta=meta,
+                        expected_identity=bank_io["identity"],mesh_xy=mesh_xy)
+                    receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                    del value,ds,chi,dchi,hbatch
+                    ia = stop
+                del h
+            receipt["batches"].append(dict(q_span=(q0,q1),sample_span=(lo,hi)))
+            del raw
     ledger.live_stages = ambient
     receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
     return _finish_receipt(receipt,meta,header,started)
