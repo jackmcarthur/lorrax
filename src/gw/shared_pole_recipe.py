@@ -159,7 +159,30 @@ class CapacityLedger:
                                      * self.U_bytes_per_rank)
         self.entries = []
         self._accepted = {}
+        self._live_stages = None
         self.measured_peak = gate_receipt('capacity', reason='measured peak not supplied')
+
+    @property
+    def live_stages(self):
+        """Caller-bound ambient reservations for callees without lifetime args.
+
+        The caller sets an explicit tuple before I/O; () means no upstream
+        allocations are live. Unbound is unknown and refuses. Callees pass the
+        tuple as ``concurrent_with`` to reserve their own disjoint footprint.
+        """
+        if self._live_stages is None:
+            raise ValueError("GATE shared_pole_capacity_lifetimes: got: unbound caller lifetimes; want: explicitly set ledger.live_stages before callee admission; why: unknown upstream bytes are not zero")
+        return self._live_stages
+
+    @live_stages.setter
+    def live_stages(self, stages):
+        if isinstance(stages, str):
+            raise ValueError("live_stages must contain accepted stage names, not a string")
+        names = tuple(dict.fromkeys(stages))
+        for name in names:
+            if name not in self._accepted:
+                raise ValueError(f"capacity live stage {name!r} has no accepted reservation")
+        self._live_stages = names
 
     @staticmethod
     def _bytes(value):
@@ -239,7 +262,8 @@ class CapacityLedger:
         return copy.deepcopy(dict(geometry=self.geometry,
                                   U_bytes_per_rank=self.U_bytes_per_rank,
                                   limit_bytes_per_rank=self.limit_bytes_per_rank,
-                                  entries=self.entries, measured_peak=self.measured_peak))
+                                  entries=self.entries, live_stages=self._live_stages,
+                                  measured_peak=self.measured_peak))
 
 
 def construction_receipt(measurements=None, *, capacity=None):
@@ -479,8 +503,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
         'bank_rule_tolerance': recipe['bank_rule_tolerance'],
         'sigma_tolerance': policy['sigma_tolerance'],
         'moment_convention': recipe['moment_convention'], 'census': dict(census),
-        'U_bytes_per_rank': 16 * int(meta.nk_tot) * n*n / (
-            int(mesh_xy.shape['x']) * int(mesh_xy.shape['y'])),
+        'U_bytes_per_rank': meta.shared_pole_capacity.U_bytes_per_rank,
     }
     result['metadata_array_bytes'] = sum(v.nbytes for v in result.values()
                                          if isinstance(v, np.ndarray))
