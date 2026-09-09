@@ -924,6 +924,9 @@ def _get_chi_fractional_contour_kernel_face(
         raise ValueError("pair_mode must be retarded or laplace")
     if pair_mode == "laplace" and selected_q is None:
         raise ValueError("Laplace bank correlations require selected_q")
+    if selected_q is not None:
+        from .contour_accumulator import contour_accumulator
+        accumulate_selected = contour_accumulator(mesh_xy)
     grid = tuple(int(n) for n in kgrid)
     nk = int(np.prod(grid))
     n_out = int(n_out)
@@ -1105,9 +1108,7 @@ def _get_chi_fractional_contour_kernel_face(
                              if pair_mode == "retarded"
                              else A_R + jnp.conj(A_R)),
                     jnp.asarray(selected_q), axis=0)
-                updated = (accumulators
-                           + projection[:, None, None, None]
-                           * contribution[None])
+                updated = accumulate_selected(accumulators, contribution, projection)
             return updated, None
 
         final_R, _ = jax.lax.scan(
