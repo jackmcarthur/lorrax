@@ -22,7 +22,7 @@ def run_checks(mesh, directory):
     from file_io.slab_io import SlabIO
     from gw import w_isdf
     from gw.shared_pole_constructor import construct_shared_poles
-    from gw.shared_pole_recipe import ROLE_CODES, RECIPE_HASH, GATE_HASH
+    from gw.shared_pole_recipe import ROLE_CODES, RECIPE_HASH, GATE_HASH, CapacityLedger
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from test_shared_pole_store import _fixture
 
@@ -48,6 +48,8 @@ def run_checks(mesh, directory):
                   imaginary_width=2, infinity_width=1,
                   multiplet_relative_tolerance=1e-6, eta_ev=.25)
     meta.shared_pole_recipe = recipe
+    meta.shared_pole_capacity = CapacityLedger(meta, mesh_xy=mesh)
+    meta.shared_pole_capacity.live_stages = ()
     path = directory / "bank.h5"
     store.initialize_shared_pole_bank(path, meta=meta, tables=tables,
                                      recipe=recipe, identity=identity, mesh_xy=mesh)
@@ -122,6 +124,27 @@ def run_checks(mesh, directory):
             assert refused and not (directory/f"stale_{layout}.h5").exists()
             rows.append(dict(name='constructor_store_ragged_stale', layout=layout, status='PASS',
                              K=header['K'], retained_moment_max=max(errors), constructor=result))
+        for layout in ('local', 'distributed'):
+            # Independent red map: upstream already owns the full 3U budget.
+            # Admission must fail before opening any matrix payload or output.
+            ledger = CapacityLedger(meta, mesh_xy=mesh)
+            meta.shared_pole_capacity = ledger
+            ledger.reserve('planted_upstream',
+                           resident_bytes_per_rank=int(ledger.limit_bytes_per_rank),
+                           workspace_bytes_per_rank=0)
+            ledger.live_stages = ('planted_upstream',)
+            config = SimpleNamespace(backend=SimpleNamespace(linalg=layout))
+            output = directory/f"capacity_refused_{layout}.h5"
+            refused = False
+            try:
+                construct_shared_poles(bank, {"path": path}, meta, config,
+                                       mesh_xy=mesh, output=output)
+            except MemoryError as error:
+                refused = 'shared_pole_capacity' in str(error)
+            assert refused and not output.exists()
+            assert ledger.receipt()['entries'][-1]['status'] == 'FAIL'
+            rows.append(dict(name='constructor_capacity_refusal', layout=layout, status='PASS',
+                             capacity=ledger.receipt()))
     finally:
         if original is None:
             del w_isdf.response_coulomb_powers
@@ -141,7 +164,7 @@ def main():
     rows = run_checks(resolve_mesh(), args.output.parent)
     if jax.process_index() == 0:
         args.output.write_text(json.dumps(dict(status='PASS', checks=rows,
-            expected_checks=2, jobid=os.environ['SLURM_JOB_ID'], stepid=os.environ['SLURM_STEP_ID'],
+            expected_checks=4, jobid=os.environ['SLURM_JOB_ID'], stepid=os.environ['SLURM_STEP_ID'],
             scope='P4 constructor and actual scratch/model store; planted Coulomb adapter; no response accessor verification'),
             indent=2, allow_nan=False)+'\n')
     finalize_process()

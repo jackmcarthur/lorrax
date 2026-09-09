@@ -126,7 +126,7 @@ def run_checks(mesh):
         # doublet straddles both the singular cutoff and the requested width.
         sample = placed(-np.diag([.8, .10000001, .09999999, .01, .008, .006, .004, .002])[None].astype(np.complex128))
         reads, admissions = [], []
-        def read_once(sample_id):
+        def read_once(sample_id, retained_states):
             reads.append(sample_id)
             return sample, sample * .01
         recipe = dict(fit_ids=[0], held_ids=[], distinct_id=[0, 0],

@@ -15,59 +15,36 @@ from __future__ import annotations
 import jax.numpy as jnp
 
 
-def shared_pole_capacity(meta, *, mesh_xy, resolution, pencil_side,
-                         parent_batch, sample_batch, resident_bytes_per_rank,
-                         workspace_bytes_per_rank):
-    """Price the constructor's simultaneous carriers before allocating them.
+def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
+                           parent_batch, sample_batch):
+    """Price constructor carriers; the map CapacityLedger owns admission.
 
-    The conservative live set includes original and equilibrated pencils,
-    all eigensolver outputs, correction/sort temporaries, narrow actions,
-    sample/moment staging and the 2n Hermitian SVD dilation. External live
-    allocations and provider workspace must be supplied, not inferred zero.
-    Local dense staging prices a complete matrix on its busiest rank;
-    distributed carriers divide by the mesh size. Bytes, not device memory
-    percentages, are compared to DESIGN section 0's aggregate 3U limit.
+    Bytes include the actual parent/sample batch, narrow retained actions,
+    original and equilibrated pencils, corrected Ritz eigensolver outputs,
+    sort temporaries and the 2n SVD dilation. Native workspace is separately
+    supplied by the service. No U threshold or independent capacity policy
+    lives in this constructor helper.
     """
     import math
-    from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b
 
     p = int(mesh_xy.shape["x"]) * int(mesh_xy.shape["y"])
-    n = int(meta.n_rmu) * int(meta.nspinor)
     packed = int(meta.n_rmu_padded) * int(meta.nspinor)
     b, a, r = int(parent_batch), int(sample_batch), int(pencil_side)
-    if min(n, packed, b, a) <= 0 or r < 0:
+    if min(packed, b, a) <= 0 or r < 0:
         raise ValueError("GATE shared_pole_capacity: got: invalid extents; want: positive basis/batches and nonnegative pencil; why: live-set pricing")
-    external = (resident_bytes_per_rank, workspace_bytes_per_rank)
-    if any(not math.isfinite(float(x)) or float(x) < 0 for x in external):
-        raise ValueError("GATE shared_pole_capacity: got: missing/invalid external bytes; want: finite nonnegative resident/workspace bytes; why: aggregate 3U includes upstream allocations")
-    resident, workspace = (int(x) for x in external)
-    local = resolution.layout == "local"
-    dense_copies = math.ceil(b / p) if local else b / p
-    # At selection, the dilation and its eigensolver/copy carriers dominate.
-    # At reduction, fourteen R² and twelve nR slots cover the eager call
-    # boundaries (including originals, return values and sort permutations).
-    sample_bytes = math.ceil(16 * b * (2 * a + 2) * packed**2 / p)
+    dense_copies = math.ceil(b / p) if resolution.layout == "local" else b / p
     directions = math.ceil(16 * dense_copies * (24 * packed**2 + 12 * packed * r))
     reduction = math.ceil(16 * dense_copies * (14 * r*r + 12 * packed * r))
-    narrow_and_io = math.ceil(16 * b * (6 * packed*r + 2 * packed**2) / p)
-    scalar_bytes = 8 * b * (12 * r + 4 * packed)
-    terms = {"external_resident": resident, "provider_workspace": workspace,
-             "sample_and_moment_batch": sample_bytes,
-             "narrow_and_io": narrow_and_io, "replicated_scalars": scalar_bytes,
-             "largest_dense_phase": max(directions, reduction)}
-    total = sum(terms.values())
-    unit = 16 * int(meta.nk_tot) * n*n / p
-    limit = shared_real_pole_gates_v1_r3b["capacity"]["threshold"] * unit
-    return {"terms_bytes_per_rank": terms, "live_bytes_per_rank": total,
-            "U_bytes_per_rank": unit, "limit_bytes_per_rank": limit,
-            "live_over_U": total / unit, "admitted": total <= limit,
+    terms = {
+        "sample_and_moment_batch": math.ceil(16*b*(2*a+2)*packed**2/p),
+        "narrow_actions": math.ceil(16*b*6*packed*r/p),
+        "replicated_scalars": 8*b*(12*r+4*packed),
+        "largest_dense_phase": max(directions, reduction),
+    }
+    return {"terms_bytes_per_rank": terms,
+            "resident_bytes_per_rank": sum(terms.values()),
             "layout": resolution.layout, "pencil_side": r,
-            "parent_batch": b, "sample_batch": a,
-            "required_geometry": (f"need U >= {math.ceil(total / 3)} bytes/rank at "
-                                  f"logical n={n}, full-q={meta.nk_tot}; "
-                                  "distributed R²/U is independent of P; if the "
-                                  "minimal batch exceeds 3U, an out-of-core "
-                                  "eigensolver is required, not fewer directions")}
+            "parent_batch": b, "sample_batch": a}
 
 
 def _adjoint(a):
@@ -387,7 +364,7 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
         maximum_new = sum(2 if role["role"].startswith("line:") else 1
                           for role in next_roles) * column_extent(logical_n)
         admit(infinity_carrier + sum(state[1].shape[-1] for state in states) + maximum_new)
-        w, derivative = read_sample(int(sample_id))
+        w, derivative = read_sample(int(sample_id), states)
         for role in fit_roles:
             if role["held"] or int(role["sample_id"]) != int(sample_id):
                 continue
@@ -454,7 +431,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     bank : mapping
         Authenticated resource descriptor: ``path``, ``identity``, ``tables``,
         ``coulomb`` (response-owner authenticated Coulomb resource),
-        ``resident_bytes_per_rank``, ``workspace_bytes_per_rank`` (service
+        ``workspace_bytes_per_rank`` (service
         stage mapping, including ``constructor``). A producer
         certificate is carried as ``rule_receipt``. No dense bank is passed
         as a jit argument. The recipe is read only from meta.
@@ -499,6 +476,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         raise ValueError("GATE shared_pole_representation: got: non-scalar or TRS-broken state; want: scalar with authenticated TRS; why: shared even-s representation")
     resolution = linalg_resolution({"linalg": config.backend.linalg})
     identity = bank["identity"]
+    ledger = meta.shared_pole_capacity
+    upstream = ledger.live_stages
+    workspace = bank["workspace_bytes_per_rank"]["constructor"]
     header = validate_shared_pole_bank(bank["path"], expected_identity=identity,
                                        mesh_xy=mesh_xy, require_complete=True)
     moment_header = validate_shared_pole_bank(moments["path"], expected_identity=identity,
@@ -519,14 +499,27 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             raise ValueError("GATE shared_pole_bank_state: got: changed z; want: current physical sample point; why: recipe hashes alone do not bind resolved points")
 
     def capacity(side):
-        result = shared_pole_capacity(
+        price = shared_pole_byte_terms(
             meta, mesh_xy=mesh_xy, resolution=resolution, pencil_side=side,
-            parent_batch=1, sample_batch=1,
-            resident_bytes_per_rank=bank["resident_bytes_per_rank"],
-            workspace_bytes_per_rank=bank["workspace_bytes_per_rank"]["constructor"])
-        if not result["admitted"]:
-            raise ValueError(f"GATE shared_pole_capacity: got: {result['live_over_U']:.6g} U; want: <=3 U; why: aggregate live set; fix: {result['required_geometry']}")
-        return result
+            parent_batch=1, sample_batch=1)
+        row = ledger.reserve(f"constructor.plan.{len(ledger.entries)}",
+                             resident_bytes_per_rank=price["resident_bytes_per_rank"],
+                             workspace_bytes_per_rank=workspace,
+                             concurrent_with=upstream)
+        return dict(row, price=price)
+
+    def expose_live(arrays):
+        # Callees price only their additional allocations. Supply their
+        # exact current inputs instead of the future dense-phase envelope,
+        # so a store read does not count its own returned arrays twice.
+        unique = {id(array): array for array in arrays}
+        resident = sum(int(np.prod(array.sharding.shard_shape(array.shape)))
+                       * array.dtype.itemsize for array in unique.values())
+        row = ledger.reserve(f"constructor.live.{len(ledger.entries)}",
+                             resident_bytes_per_rank=resident,
+                             workspace_bytes_per_rank=workspace,
+                             concurrent_with=upstream)
+        ledger.live_stages = (*upstream, row["stage"])
 
     capacity(0)
     n = int(meta.n_rmu_padded)
@@ -547,6 +540,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     # total irreducible-q count. Store owns the ragged K census and final copy.
     for q in range(int(header["bank_shape"]["nq"])):
         span = (q, q + 1)
+        expose_live(())
         with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
             exact = read_shared_pole_bank(moment_io, span, meta=meta,
                                           header=moment_header, fields=("M1", "M3"))
@@ -558,7 +552,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         infinity = (qi, mm(exact["M1"], qi), mm(exact["M3"], qi))
         del exact
         with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
-            def read_sample(sample_id):
+            def read_sample(sample_id, retained_states):
+                expose_live((*infinity, *(panel for state in retained_states for panel in state[1:])))
                 data = read_shared_pole_bank(
                     bank_io, span, meta=meta, header=header,
                     sample_span=(sample_id, sample_id + 1))
@@ -596,6 +591,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             raise ValueError(f"GATE shared_pole_retained_moments: got: failed at q={q}; want: projected latent moment identity <=1e-10; why: corrected Ritz algebra")
         del pencil, coefficients, selector, active_columns
         model, permutation = sort_shared_pole_columns(model)
+        expose_live((*model, qi))
         coulomb_sqrt, inverse_sqrt, coulomb_receipt = response_coulomb_powers(
             meta, config, mesh_xy=mesh_xy, bank_io=bank, q_span=span)
         passive = shared_pole_passivity(model, inverse_sqrt,
@@ -604,6 +600,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         if not bool(jnp.all(passive["passivity"])):
             raise ValueError(f"GATE shared_pole_passivity: got: failed at q={q}; want: 0 <= V-whitened -W(i eta) <= I; why: passive screening")
         del coulomb_sqrt, inverse_sqrt
+        expose_live((*model, qi))
         with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
             exact = read_shared_pole_bank(moment_io, span, meta=meta,
                                           header=moment_header, fields=("M1", "M3"))
@@ -612,6 +609,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         held = []
         with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
             for sample_id in recipe["held_ids"]:
+                expose_live(model)
                 samples = read_shared_pole_bank(bank_io, span, meta=meta, header=header,
                                                sample_span=(int(sample_id), int(sample_id)+1),
                                                fields=("Wc", "dWc_ds"))
@@ -652,13 +650,17 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             "capacity": dict(value=price, passed=True, reason="conservative aggregate constructor live-set price"),
             "sc_rebuild": dict(value=identity, passed=True, reason="current recipe/census authenticated; directions and Ritz model rebuilt"),
         }
-        receipt = construction_receipt(measurements)
+        receipt = construction_receipt(measurements, capacity=ledger)
         receipt.update(identity=identity, constructor=row)
         public_c = jax.jit(lambda value: value[:, :, None, :], out_shardings=public_factor)(c)
+        del model, c, mask
+        expose_live((public_c, poles, counts))
         store_header = write_shared_pole_model(output, public_c, poles, counts,
                                                q_span=span, meta=meta, tables=bank["tables"],
                                                recipe=recipe, receipts=receipt)
         receipts.append(receipt)
-        del model, c, public_c
+        del public_c, poles, counts
+        ledger.live_stages = upstream
     return {"q_receipts": receipts, "model_header": store_header,
+            "capacity": ledger.receipt(),
             "identity": identity, "status": "CONSTRUCTED"}
