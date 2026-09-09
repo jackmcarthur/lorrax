@@ -161,6 +161,50 @@ def assemble_shared_pole_pencil(states, infinity, *, matmul):
     return _hermitian(g), _hermitian(h), jnp.concatenate((output, oi), axis=-1)
 
 
+def _metric_inverse_root(metric, *, matmul, tolerance):
+    """Correct a dimensionless Hermitian metric by coupled Newton–Schulz.
+
+    ``metric`` is [b,R,R], complex128 in the caller's face layout. Products
+    use the resolved distrib_la GEMM. Y starts at A and Z at I; the coupled
+    update T=(3I-ZY)/2, Y=YT, Z=TZ computes A**(-1/2) without eigenvectors.
+    The initial infinity norm bounds the spectral error. For radius d<1,
+    d_next <= d**2*(3+d)/4 <= d**2; choose the entire iteration count from
+    that initial bound, never from an on-device residual convergence test.
+    The returned diagnostics include the measured ZAZ-I residual and guard.
+    """
+    import jax
+
+    identity = _diagonal_face(jnp.ones(metric.shape[:1] + metric.shape[-1:]), metric)
+    radius = jnp.max(jnp.sum(jnp.abs(identity - metric), axis=-1), axis=-1)
+    valid = jnp.isfinite(radius) & (radius < 1)
+    if not isinstance(radius, jax.core.Tracer) and not bool(jnp.all(valid)):
+        raise ValueError(f"GATE shared_pole_metric_inverse_root: got: infinity norm {radius.tolist()}; want: finite norm < 1; why: Newton-Schulz convergence bound")
+    # Aim near float64 roundoff, leaving the physical residual gate intact.
+    target = min(float(tolerance), 32 * jnp.finfo(metric.real.dtype).eps)
+    safe_radius = jnp.where(valid & (radius > target), radius, .5)
+    counts = jnp.maximum(0, jnp.ceil(jnp.log2(
+        jnp.log(target) / jnp.log(safe_radius)))).astype(jnp.int32)
+    counts = jnp.where(valid & (radius > target), counts, 0)
+    iterations = jnp.where(jnp.all(valid), jnp.max(counts), 0)
+
+    def step(_, state):
+        y, z = state
+        t = (3 * identity - matmul(z, y)) * .5
+        return matmul(y, t), matmul(t, z)
+
+    _, correction = jax.lax.fori_loop(0, iterations, step, (metric, identity))
+    residual = matmul(correction, matmul(metric, correction)) - identity
+    absolute = jnp.linalg.norm(residual, axis=(-2, -1))
+    relative = absolute / jnp.sqrt(metric.shape[-1])
+    diagnostics = {
+        "metric_initial_infinity_norm": radius,
+        "metric_inverse_root_iterations": jnp.full(radius.shape, iterations),
+        "metric_inverse_root_residual_fro": absolute,
+        "metric_inverse_root_residual_relative": relative,
+    }
+    return correction, valid & jnp.isfinite(relative) & (relative <= tolerance), diagnostics
+
+
 def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     """Equilibrate the Gram matrix and compute its corrected Ritz model.
 
@@ -216,11 +260,9 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
 
     metric = matmul(z, matmul(g, z), transa="C")
     null_identity = _diagonal_face(~keep, g)
-    metric_eigen, metric_vectors = eigh(_hermitian(metric) + null_identity)
-    metric_ok = jnp.all(jnp.isfinite(metric_eigen) & (metric_eigen > 0), axis=-1)
-    correction = matmul(
-        metric_vectors / jnp.sqrt(jnp.where(metric_eigen > 0, metric_eigen, 1))[:, None, :],
-        metric_vectors, transb="C")
+    correction, metric_ok, metric_diagnostics = _metric_inverse_root(
+        _hermitian(metric) + null_identity, matmul=matmul,
+        tolerance=gates["retained_subspace_moments"]["threshold"])
     z = matmul(z, correction) * keep[:, None, :]
     metric = matmul(z, matmul(g, z), transa="C")
     t = _hermitian(matmul(z, matmul(h, z), transa="C"))
@@ -234,6 +276,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     poles = jnp.where(active, poles, 1.0)
     wanted_metric = _diagonal_face(keep, g)
     diagnostics = {
+        **metric_diagnostics,
         "gram_diagonal_positive": diagonal_ok,
         "gram_valid": gram_ok,
         "gram_min_relative": ratio,
@@ -795,7 +838,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             del states, infinity
             for name in ("gram_diagonal_positive", "gram_valid", "retained_metric_positive"):
                 if not bool(jnp.all(reduction[name])):
-                    raise ValueError(f"GATE shared_pole_{name}: got: failed at q={q}; want: valid Gram and retained metric; why: no PSD repair")
+                    raise ValueError(f"GATE shared_pole_{name}: got: failed at q={q}, metric infinity norm={reduction['metric_initial_infinity_norm']}, inverse-root residual={reduction['metric_inverse_root_residual_relative']}; want: valid Gram and retained metric; why: no PSD repair")
             if batch_results is None:
                 model, zero = apply_shared_pole_zero_policy(model, gates=gates)
             if not bool(jnp.all(zero["zero_policy"])):
@@ -868,6 +911,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                       for k, v in moment_defects.items()},
                    "held_W": held, "permutation": np.asarray(permutation).tolist(),
                    "storage_bytes": int(counts[0]) * (16*logical_n + 8)}
+            row["metric_inverse_root"] = {
+                name: np.asarray(reduction[name]).tolist() for name in (
+                    "metric_initial_infinity_norm", "metric_inverse_root_iterations",
+                    "metric_inverse_root_residual_fro", "metric_inverse_root_residual_relative")}
             measurements = {
                 "normalized_gram_keep": dict(value=int(reduction["retained_rank"][0]), passed=True, reason="normalized Gram cut, current q"),
                 "normalized_gram_validity": dict(value=float(reduction["gram_min_relative"][0]), passed=True, reason="normalized Gram spectrum"),
