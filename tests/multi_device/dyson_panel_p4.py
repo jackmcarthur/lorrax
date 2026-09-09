@@ -64,7 +64,7 @@ def main():
 
     # Production-sized deterministic tile callbacks avoid a replicated
     # all-parent host matrix and deliberately exercise complex orientations.
-    nq, nn = 8, 368
+    nq, nn = (29, 896) if mesh.size == 16 else (8, 368)
     shape=(nq,nn,nn)
     def values(ix,phase):
         axes=[np.arange(s.start or 0,s.stop if s.stop is not None else size)
