@@ -22,7 +22,7 @@ from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import SigmaOmegaResult, _residue_for_space, sigma_band_axis
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
-from gw.sigma_box_plan import plan_sigma_windows
+from gw.sigma_box_plan import plan_sigma_windows, sigma_rule_request_cache
 from gw.sigma_plan import resolve_sigma_plan
 from gw.wavefunction_bundle import (
     parent_sigma_operands, sigma_face_kernel_kwargs)
@@ -334,45 +334,13 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         # Expose that fact so complex scatter need not use atomic updates.
         return total.at[rows].add(values, indices_are_sorted=True, unique_indices=True)
 
-    diagnostic_done = False
     compact_kernels = {}
     cached_indices = cached_bounds = cached_intervals = None
 
     def build(_residues, _omega_fields, indices, bounds, _phase_real, E_ref_B, t_node):
-        nonlocal cached_indices, cached_bounds, cached_intervals, diagnostic_done
-        if not diagnostic_done:
-            import json
-            policy = _shared_pole_fixed_q_policy(header)
-            qids = np.asarray(header["q_irr_full_idx"])
-            receipt = dict(tau_ry_inverse=[1.0, 0.0], E_ref_ry=0.0,
-                           scope="full model, one real tau per map, before fixed-q projection",
-                           reference="CD8 NOT_MEASURED", parents=[])
-            for parent in np.flatnonzero(policy.self_negative_q[qids]):
-                plus = transposed = None
-                for c0 in range(0, kmax, ccap):
-                    c1 = min(c0 + ccap, kmax)
-                    X, Y, poles2, counts = read_shared_pole_faces(
-                        io, (int(parent), int(parent)+1), meta=meta, header=header,
-                        column_span=(c0, c1))
-                    active = max(0, min(c1, len(frequencies[parent])) - c0)
-                    ranges = device_put_process_local(
-                        np.asarray([[0, active]], np.int32), NamedSharding(mesh_xy, P()))
-                    a, b = synthesize_shared_pole_parents(
-                        X, Y, poles2, ranges, 0.0, 1.0+0.0j, mesh_xy=mesh_xy)
-                    plus = a if plus is None else plus + a
-                    transposed = b if transposed is None else transposed + b
-                    jax.block_until_ready((plus, transposed))
-                    del X, Y, poles2, counts, a, b
-                _, relative = policy.project_fixed_q(
-                    plus, qids[parent:parent+1], transposed_partner=transposed)
-                value = float(relative[0])
-                receipt["parents"].append(dict(parent=int(parent), q_full_idx=int(qids[parent]),
-                    asymmetry_relative=value, status="WARN" if value > 1e-6 else "PASS"))
-                del plus, transposed
-            schedule["fixed_q_asymmetry"] = receipt
-            if jax.process_index() == 0:
-                print("shared-pole fixed-q asymmetry: " + json.dumps(receipt), flush=True)
-            diagnostic_done = True
+        nonlocal cached_indices, cached_bounds, cached_intervals
+        # Fixed-q projection remains in the symmetry owner. The extra tau=1
+        # diagnostic replay is covered by the fixed-q acceptance tests.
         if indices is not cached_indices or bounds is not cached_bounds:
             cached_intervals = shared_pole_intervals(
                 frequencies, np.asarray(jax.device_get(indices)),
@@ -1309,9 +1277,10 @@ def compute_sigma_c_mpa_omega_grid(
     if shared_pole:
         from file_io.shared_pole_store import validate_shared_pole_model
         from file_io.slab_io import SlabIO
-        ledger = validate_shared_pole_model(
-            fit_src, expected_identity=fit_identity, mesh_xy=mesh_xy,
-            capacity=meta.shared_pole_capacity)
+        with timing.section("sigma.model_validate"):
+            ledger = validate_shared_pole_model(
+                fit_src, expected_identity=fit_identity, mesh_xy=mesh_xy,
+                capacity=meta.shared_pole_capacity)
         if fit_digest is not None and ledger["digest"] != fit_digest:
             raise ValueError("GATE shared_pole_identity: screening handle digest differs from model")
         recipe = meta.shared_pole_recipe
@@ -1321,7 +1290,8 @@ def compute_sigma_c_mpa_omega_grid(
         quadrature_eps = float(recipe["sigma_tolerance"])
         n_poles = int(ledger["n_q_irr"])
         ordered_residues = False
-        schedule = _shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy)
+        with timing.section("sigma.capacity"):
+            schedule = _shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy)
         print_fn(f"  shared-pole Sigma capacity: {schedule}")
     else:
         ledger = validate_fit_store(
@@ -1332,11 +1302,12 @@ def compute_sigma_c_mpa_omega_grid(
     odd_residue_off = _resolve_mpa_odd_residue_debug(
         ordered_residues, print_fn=print_fn)
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
-    branches = (_branches(
-        wfns, omega_grid_ry, efermi_ry,
-        occupation_state=occupation_state,
-        occupation_window_threshold=occupation_window_threshold)
-        if sigma_branches is None else tuple(sigma_branches))
+    with timing.section("sigma.branches"):
+        branches = (_branches(
+            wfns, omega_grid_ry, efermi_ry,
+            occupation_state=occupation_state,
+            occupation_window_threshold=occupation_window_threshold)
+            if sigma_branches is None else tuple(sigma_branches))
     plan_mode = resolve_sigma_plan()
     if shared_pole and plan_mode != "box":
         raise ValueError("shared-pole Sigma requires the production box planner")
@@ -1356,16 +1327,20 @@ def compute_sigma_c_mpa_omega_grid(
         summaries = []
         if shared_pole:
             from file_io.shared_pole_store import read_shared_pole_census
-            poles_device, counts_device = read_shared_pole_census(
-                reader, header=ledger, capacity=meta.shared_pole_capacity)
-            poles2, counts = map(np.asarray, jax.device_get((poles_device, counts_device)))
-            del poles_device, counts_device
-            frequencies = shared_pole_frequencies(poles2, counts)
-            summaries = summarize_shared_poles(
-                poles2, counts, branches,
-                regularization_width_ry=regularization_width_ry,
-                edge_factor=edge_factor,
-                occupation_window_threshold=occupation_window_threshold)
+            with timing.section("sigma.census"):
+                poles_device, counts_device = read_shared_pole_census(
+                    reader, header=ledger, capacity=meta.shared_pole_capacity)
+                poles2, counts = map(np.asarray, jax.device_get((poles_device, counts_device)))
+                del poles_device, counts_device
+                quadrature_cache_dir = sigma_rule_request_cache(
+                    quadrature_cache_dir, ledger["identity"], poles2, counts,
+                    eta=regularization_width_ry, eps=quadrature_eps)
+                frequencies = shared_pole_frequencies(poles2, counts)
+                summaries = summarize_shared_poles(
+                    poles2, counts, branches,
+                    regularization_width_ry=regularization_width_ry,
+                    edge_factor=edge_factor,
+                    occupation_window_threshold=occupation_window_threshold)
         for lo in (() if shared_pole else range(0, n_poles, int(pole_batch_size))):
             hi = min(lo + int(pole_batch_size), n_poles)
             Omega, B, B_odd = reader.read(

@@ -571,11 +571,24 @@ class GWProductionReport:
         # The dynamic-Sigma executor opens ``sigma.rule_plan`` (box-rule
         # fitting, cached by box and tolerance) and ``sigma.tau_sweep`` (the
         # tau contraction) under gw_jax.sigma or, in a self-consistent run,
-        # under gw_jax.sc_driver; nothing else of Sigma is separately named.
+        # under gw_jax.sc_driver. Shared finalization and the fenced setup
+        # phases below are disjoint from the plan and sweep.
         sigma_total = top_level("gw_jax.sigma", "gw_jax.sc_driver")
         sigma_plan = outer_prefixed("sigma.rule_plan")
         sigma_sweep = outer_prefixed("sigma.tau_sweep")
-        sigma_other = max(sigma_total - sigma_plan - sigma_sweep, 0.0)
+        sigma_details = [
+            ("Sigma pending inputs", outer_prefixed("sigma.input_wait")
+             + outer_prefixed("sigma.finalize_input_wait")),
+            ("Sigma exchange", outer_prefixed("sigma.exchange")),
+            ("Sigma Hartree", outer_prefixed("sigma.hartree")),
+            ("Sigma model validation", outer_prefixed("sigma.model_validate")),
+            ("Sigma capacity", outer_prefixed("sigma.capacity")),
+            ("Sigma branches", outer_prefixed("sigma.branches")),
+            ("Sigma census", outer_prefixed("sigma.census")),
+            ("Sigma finalize + writes", outer_prefixed("gw_jax.dynamic_sigma_finalize")),
+        ]
+        sigma_other = max(sigma_total - sigma_plan - sigma_sweep
+                          - sum(value for _, value in sigma_details), 0.0)
 
         stages = [
             ("runtime bring-up", total(lambda r: r["name"].startswith(
@@ -594,6 +607,7 @@ class GWProductionReport:
                 "gw_jax.persist_w0", "gw_jax.static_head")),
             ("Sigma rule plan", sigma_plan),
             ("Sigma tau sweep", sigma_sweep),
+            *sigma_details,
             ("Sigma other", sigma_other),
             ("mean-field load", top_level("gw_jax.kin_ion_load")),
             ("QP solve + diagonalize", top_level(
