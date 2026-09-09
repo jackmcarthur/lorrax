@@ -28,21 +28,27 @@ def pack_parent_panels(parents, *, mesh_xy):
         batch is padded with copies of its last real parent; callers discard
         those diagnostic/output rows. No full response matrix is retained.
     """
+    return _parent_panel_packer(mesh_xy)(*parents)
+
+
+@lru_cache(maxsize=None)
+def _parent_panel_packer(mesh_xy):
+    """Reuse panel packing by shape; supports and action arrays stay inputs."""
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from runtime.padding import padded_axis
 
-    qtag = padded_axis(len(parents), mesh_xy, name="shared_pole_parent",
-                       specs=((P(('x', 'y')), 0),))
-    finite_width = max(sum(s[1].shape[-1] for s in states)
-                       for states, _, _ in parents)
-    infinity_width = max(inf[0].shape[-1] for _, inf, _ in parents)
     face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     scalar = NamedSharding(mesh_xy, P())
 
     @jax.jit
     def pack(*items):
+        qtag = padded_axis(len(items), mesh_xy, name="shared_pole_parent",
+                           specs=((P(('x', 'y')), 0),))
+        finite_width = max(sum(s[1].shape[-1] for s in states)
+                           for states, _, _ in items)
+        infinity_width = max(inf[0].shape[-1] for _, inf, _ in items)
         finite, infinity, masks = [], [], []
         for states, inf, active in items:
             width = sum(s[1].shape[-1] for s in states)
@@ -67,7 +73,7 @@ def pack_parent_panels(parents, *, mesh_xy):
                    for i in range(4))
         ii = tuple(stack([inf[i] for inf in infinity], face) for i in range(3))
         return ff, ii, stack(masks, scalar)
-    return pack(*parents)
+    return pack
 
 
 @lru_cache(maxsize=None)

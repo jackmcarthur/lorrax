@@ -10,6 +10,37 @@ class CapacityTests(unittest.TestCase):
         return CapacityLedger(NS(nk_tot=4,nspinor=1,n_rmu=4),
                               mesh_xy=NS(shape={'x':2,'y':2}))
 
+    def test_receipt_segments_reconstruct_without_changing_gates(self):
+        ledger = self.ledger()
+        ledger.reserve('first', resident_bytes_per_rank=256, workspace_bytes_per_rank=0)
+        first = construction_receipt(capacity=ledger, capacity_entry_start=0)
+        ledger.reserve('second', resident_bytes_per_rank=128, workspace_bytes_per_rank=0,
+                       concurrent_with=('first',))
+        second = construction_receipt(capacity=ledger, capacity_entry_start=1)
+        complete = construction_receipt(capacity=ledger)
+        self.assertEqual(second['gates'], complete['gates'])
+        self.assertEqual(first['capacity']['entry_span'], [0, 1])
+        self.assertEqual(second['capacity']['entry_span'], [1, 2])
+        self.assertEqual(first['capacity']['entries'] + second['capacity']['entries'],
+                         complete['capacity']['entries'])
+        first['capacity']['entries'][0]['status'] = 'mutated'
+        self.assertEqual(ledger.entries[0]['status'], 'PASS')
+        self.assertNotIn('entry_span', complete['capacity'])
+        for start in (-1, 3, True):
+            with self.assertRaises(ValueError):
+                ledger.receipt(entry_start=start)
+
+    def test_receipt_segment_keeps_earlier_failed_admission(self):
+        ledger = self.ledger()
+        with self.assertRaises(MemoryError):
+            ledger.reserve('failed', resident_bytes_per_rank=769, workspace_bytes_per_rank=0)
+        segment = construction_receipt(capacity=ledger, capacity_entry_start=1)
+        complete = construction_receipt(capacity=ledger)
+        self.assertEqual(segment['capacity']['entries'], [])
+        self.assertEqual(segment['gates'], complete['gates'])
+        capacity_gate = next(row for row in segment['gates'] if row['name'] == 'capacity')
+        self.assertEqual(capacity_gate['status'], 'FAIL')
+
     def test_geometry_and_exact_boundary(self):
         ledger=self.ledger()
         self.assertEqual(ledger.U_bytes_per_rank,256)
