@@ -15,12 +15,74 @@ from __future__ import annotations
 import jax.numpy as jnp
 
 
+def shared_pole_capacity(meta, *, mesh_xy, resolution, pencil_side,
+                         parent_batch, sample_batch, resident_bytes_per_rank,
+                         workspace_bytes_per_rank):
+    """Price the constructor's simultaneous carriers before allocating them.
+
+    The conservative live set includes original and equilibrated pencils,
+    all eigensolver outputs, correction/sort temporaries, narrow actions,
+    sample/moment staging and the 2n Hermitian SVD dilation. External live
+    allocations and provider workspace must be supplied, not inferred zero.
+    Local dense staging prices a complete matrix on its busiest rank;
+    distributed carriers divide by the mesh size. Bytes, not device memory
+    percentages, are compared to DESIGN section 0's aggregate 3U limit.
+    """
+    import math
+    from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b
+
+    p = int(mesh_xy.shape["x"]) * int(mesh_xy.shape["y"])
+    n = int(meta.n_rmu) * int(meta.nspinor)
+    packed = int(meta.n_rmu_padded) * int(meta.nspinor)
+    b, a, r = int(parent_batch), int(sample_batch), int(pencil_side)
+    if min(n, packed, b, a) <= 0 or r < 0:
+        raise ValueError("GATE shared_pole_capacity: got: invalid extents; want: positive basis/batches and nonnegative pencil; why: live-set pricing")
+    external = (resident_bytes_per_rank, workspace_bytes_per_rank)
+    if any(not math.isfinite(float(x)) or float(x) < 0 for x in external):
+        raise ValueError("GATE shared_pole_capacity: got: missing/invalid external bytes; want: finite nonnegative resident/workspace bytes; why: aggregate 3U includes upstream allocations")
+    resident, workspace = (int(x) for x in external)
+    local = resolution.layout == "local"
+    dense_copies = math.ceil(b / p) if local else b / p
+    # At selection, the dilation and its eigensolver/copy carriers dominate.
+    # At reduction, fourteen R² and twelve nR slots cover the eager call
+    # boundaries (including originals, return values and sort permutations).
+    sample_bytes = math.ceil(16 * b * (2 * a + 2) * packed**2 / p)
+    directions = math.ceil(16 * dense_copies * (24 * packed**2 + 12 * packed * r))
+    reduction = math.ceil(16 * dense_copies * (14 * r*r + 12 * packed * r))
+    narrow_and_io = math.ceil(16 * b * (6 * packed*r + 2 * packed**2) / p)
+    scalar_bytes = 8 * b * (12 * r + 4 * packed)
+    terms = {"external_resident": resident, "provider_workspace": workspace,
+             "sample_and_moment_batch": sample_bytes,
+             "narrow_and_io": narrow_and_io, "replicated_scalars": scalar_bytes,
+             "largest_dense_phase": max(directions, reduction)}
+    total = sum(terms.values())
+    unit = 16 * int(meta.nk_tot) * n*n / p
+    limit = shared_real_pole_gates_v1_r3b["capacity"]["threshold"] * unit
+    return {"terms_bytes_per_rank": terms, "live_bytes_per_rank": total,
+            "U_bytes_per_rank": unit, "limit_bytes_per_rank": limit,
+            "live_over_U": total / unit, "admitted": total <= limit,
+            "layout": resolution.layout, "pencil_side": r,
+            "parent_batch": b, "sample_batch": a,
+            "required_geometry": (f"need U >= {math.ceil(total / 3)} bytes/rank at "
+                                  f"logical n={n}, full-q={meta.nk_tot}; "
+                                  "distributed R²/U is independent of P; if the "
+                                  "minimal batch exceeds 3U, an out-of-core "
+                                  "eigensolver is required, not fewer directions")}
+
+
 def _adjoint(a):
     return jnp.conj(jnp.swapaxes(a, -1, -2))
 
 
 def _hermitian(a):
     return (a + _adjoint(a)) * 0.5
+
+
+def _diagonal_face(values, matrix):
+    """Materialize a diagonal directly in the supplied pencil face layout."""
+    import jax
+    return jax.jit(lambda d: jnp.eye(d.shape[-1], dtype=matrix.dtype)[None]
+                   * d[:, None, :], out_shardings=matrix.sharding)(values)
 
 
 def finite_pencil_column(left, right, *, matmul):
@@ -157,7 +219,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     z = u * (keep / jnp.sqrt(jnp.where(keep, gamma, 1)))[:, None, :]
 
     metric = matmul(z, matmul(g, z), transa="C")
-    null_identity = jnp.eye(g.shape[-1], dtype=g.dtype)[None] * (~keep)[:, None, :]
+    null_identity = _diagonal_face(~keep, g)
     metric_eigen, metric_vectors = eigh(_hermitian(metric) + null_identity)
     metric_ok = jnp.all(jnp.isfinite(metric_eigen) & (metric_eigen > 0), axis=-1)
     correction = matmul(
@@ -174,7 +236,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     active = jnp.arange(g.shape[-1])[None, :] >= g.shape[-1] - count[:, None]
     c = matmul(matmul(output, z), rotation) * active[:, None, :]
     poles = jnp.where(active, poles, 1.0)
-    wanted_metric = jnp.eye(g.shape[-1], dtype=g.dtype)[None] * keep[:, None, :]
+    wanted_metric = _diagonal_face(keep, g)
     diagnostics = {
         "gram_diagonal_positive": diagonal_ok,
         "gram_valid": gram_ok,
@@ -286,3 +348,279 @@ def shared_pole_passivity(model, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, 
               & jnp.all(jnp.isfinite(values), axis=-1) & jnp.isfinite(anti))
     return {"passivity": passed, "passivity_min": minimum,
             "passivity_max": maximum, "passivity_antihermitian_relative": anti}
+
+
+def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
+                      column_extent, logical_n, admit, infinity_carrier):
+    """Read each distinct fitted sample once, preserving all tangent roles."""
+    import distrib_la
+
+    states, masks, roles = [], [], []
+    for sample_id in recipe["fit_ids"]:
+        # Admit before reading/selecting, including the largest possible
+        # next multiplet and all conjugate/duplicate roles of this sample.
+        next_roles = [role for role in recipe["roles"]
+                      if not role["held"] and int(role["sample_id"]) == int(sample_id)]
+        maximum_new = sum(2 if role["role"].startswith("line:") else 1
+                          for role in next_roles) * column_extent(logical_n)
+        admit(infinity_carrier + sum(state[1].shape[-1] for state in states) + maximum_new)
+        w, derivative = read_sample(int(sample_id))
+        for role in recipe["roles"]:
+            if role["held"] or int(role["sample_id"]) != int(sample_id):
+                continue
+            kind = role["role"].split(":", 1)[0]
+            if kind == "line":
+                q, values = distrib_la.right_singular_vectors(
+                    w[0], recipe["direction_cutoff"], eigh_plan=svd_plan,
+                    column_extent=column_extent,
+                    multiplet_tol=recipe["multiplet_relative_tolerance"])
+            elif kind == "imaginary":
+                width = min(logical_n, max(1, int(recipe["imaginary_width"])))
+                q, values = distrib_la.leading_eigenvectors(
+                    -w[0], width, eigh_plan=eigh_plan, column_extent=column_extent,
+                    multiplet_tol=recipe["multiplet_relative_tolerance"])
+            else:
+                raise ValueError(f"GATE shared_pole_role: got: {kind}; want: line or imaginary fitted role; why: unknown tangent semantics")
+            width = int(values.shape[-1])
+            if width < 1 or width > logical_n:
+                raise ValueError(f"GATE shared_pole_directions: got: rank {width}; want: 1..{logical_n}; why: empty or padded physical direction set")
+            q = q[None]
+            s = complex(recipe["z_ry"][int(sample_id)]) ** 2
+            # The line's conjugate state reuses the SAME right directions,
+            # exactly as the latent Hermite construction specifies. No extra
+            # sample and no re-selection on the adjoint matrix is performed.
+            for conjugate in ((False, True) if kind == "line" and s.imag != 0 else (False,)):
+                transa = "C" if conjugate else "N"
+                output = matmul(w, q, transa=transa)
+                action = matmul(derivative, q, transa=transa)
+                states.append((s.conjugate() if conjugate else s, q, output, action))
+                masks.append(jnp.arange(q.shape[-1]) < width)
+                roles.append({"sample_id": int(sample_id), "role": role["role"],
+                              "conjugate": conjugate, "width": width,
+                              "carrier_width": q.shape[-1]})
+        del w, derivative
+    return states, masks, roles
+
+
+def _model_diagnostics(model, moments, infinity_directions, *, matmul):
+    """Full and original-infinity projected physical moment diagnostics."""
+    c, poles, _ = model
+    result = {}
+    for name, target, weighted in (("M1", moments["M1"], c),
+                                   ("M3", moments["M3"], c * poles[:, None, :])):
+        value = matmul(weighted, c, transb="C") / 2
+        defect = target - value
+        projected = matmul(infinity_directions,
+                           matmul(defect, infinity_directions), transa="C")
+        projected_target = matmul(infinity_directions,
+                                  matmul(target, infinity_directions), transa="C")
+        norm = jnp.linalg.norm(target, axis=(-2, -1))
+        projected_norm = jnp.linalg.norm(projected_target, axis=(-2, -1))
+        result[name] = {
+            "full_relative": jnp.linalg.norm(defect, axis=(-2, -1)) / norm,
+            "original_infinity_relative": jnp.linalg.norm(projected, axis=(-2, -1)) / projected_norm,
+        }
+    return result
+
+
+def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
+    """Construct and write a current-state, bounded-batch real-pole model.
+
+    Parameters
+    ----------
+    bank : mapping
+        Authenticated resource descriptor: ``path``, ``identity``, ``tables``,
+        ``coulomb`` (q_span -> inverse square root [b,n,n] face array),
+        ``resident_bytes_per_rank``, ``workspace_bytes_per_rank``. A producer
+        certificate is carried as ``rule_receipt``. No dense bank is passed
+        as a jit argument. The recipe is read only from meta.
+    moments : mapping
+        ``path`` to committed physical M1/M3 in the same scratch schema.
+    meta : Meta
+        Current packed centroid basis, scalar representation and the once-
+        resolved ``shared_pole_recipe`` with current state identities.
+    config : LorraxConfig
+        Cached dense policy is read once, before any per-q plans.
+    mesh_xy : Mesh
+        Supplied named x/y mesh, never reconstructed by this driver.
+    output : path-like
+        New immutable compact model file, written by the store owner.
+
+    Returns
+    -------
+    dict
+        Versioned construction receipt with all gate rows, per-q diagnostics,
+        capacity prices and the store header/digest. Structural failures raise
+        before the affected q is written; a partial file is never finalized.
+    """
+    from functools import partial
+    import numpy as np
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    import distrib_la
+    from runtime.padding import padded_axis
+    from file_io.slab_io import SlabIO
+    from file_io.shared_pole_store import (
+        validate_shared_pole_bank, read_shared_pole_bank, write_shared_pole_model,
+    )
+    from gw.gw_config import linalg_resolution
+    from gw.shared_pole_recipe import (
+        construction_receipt, shared_real_pole_gates_v1_r3b as gates,
+    )
+    from common.units import RYD_TO_EV
+
+    recipe = meta.shared_pole_recipe
+    if int(meta.nspinor) != 1 or not bool(bank["tables"]["sym"].trs_allowed):
+        raise ValueError("GATE shared_pole_representation: got: non-scalar or TRS-broken state; want: scalar with authenticated TRS; why: shared even-s representation")
+    resolution = linalg_resolution({"linalg": config.backend.linalg})
+    identity = bank["identity"]
+    header = validate_shared_pole_bank(bank["path"], expected_identity=identity,
+                                       mesh_xy=mesh_xy, require_complete=True)
+    moment_header = validate_shared_pole_bank(moments["path"], expected_identity=identity,
+                                              mesh_xy=mesh_xy)
+    # The stored plan must bind the current physical points and role census.
+    stored_recipe = header["recipe"]
+    for name in ("recipe_hash", "gate_hash", "fit_ids", "held_ids", "roles", "census"):
+        current = recipe[name]
+        previous = stored_recipe[name]
+        if isinstance(current, np.ndarray):
+            equal = np.array_equal(current, previous)
+        else:
+            equal = current == previous
+        if not equal:
+            raise ValueError(f"GATE shared_pole_bank_state: got: stale {name}; want: current resolved recipe; why: no frozen SC inputs")
+
+    def capacity(side):
+        result = shared_pole_capacity(
+            meta, mesh_xy=mesh_xy, resolution=resolution, pencil_side=side,
+            parent_batch=1, sample_batch=1,
+            resident_bytes_per_rank=bank["resident_bytes_per_rank"],
+            workspace_bytes_per_rank=bank["workspace_bytes_per_rank"])
+        if not result["admitted"]:
+            raise ValueError(f"GATE shared_pole_capacity: got: {result['live_over_U']:.6g} U; want: <=3 U; why: aggregate live set; fix: {result['required_geometry']}")
+        return result
+
+    capacity(0)
+    n = int(meta.n_rmu_padded)
+    logical_n = int(meta.n_rmu)
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    public_factor = NamedSharding(mesh_xy, P(None, "x", None, "y"))
+    column_extent = lambda width: padded_axis(
+        width, mesh_xy, name="shared_pole_port",
+        specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
+    mm = partial(distrib_la.matmul, mesh=mesh_xy, backend="auto",
+                 batched_route=resolution.batched_route)
+    eig = distrib_la.plan("eigh", mesh_xy, n=n, backend=resolution.eigh_backend,
+                          batched_route=resolution.batched_route)
+    svd = distrib_la.plan("eigh", mesh_xy, n=2*n, backend=resolution.eigh_backend,
+                          batched_route=resolution.batched_route)
+    receipts = []
+    # One parent per iteration makes the maximum live set independent of the
+    # total irreducible-q count. Store owns the ragged K census and final copy.
+    for q in range(int(header["bank_shape"]["nq"])):
+        span = (q, q + 1)
+        with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
+            exact = read_shared_pole_bank(moment_io, span, meta=meta,
+                                          header=moment_header, fields=("M1", "M3"))
+        width = min(logical_n, max(1, int(recipe["infinity_width"])))
+        qi, infinity_values = distrib_la.leading_eigenvectors(
+            exact["M1"][0], width, eigh_plan=eig, column_extent=column_extent,
+            multiplet_tol=recipe["multiplet_relative_tolerance"])
+        qi = qi[None]
+        infinity = (qi, mm(exact["M1"], qi), mm(exact["M3"], qi))
+        del exact
+        with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
+            def read_sample(sample_id):
+                data = read_shared_pole_bank(
+                    bank_io, span, meta=meta, header=header,
+                    sample_span=(sample_id, sample_id + 1))
+                return data["Wc"][:, 0], data["dWc_ds"][:, 0]
+
+            states, masks, roles = _direction_states(
+                read_sample, recipe, eigh_plan=eig, svd_plan=svd, matmul=mm,
+                column_extent=column_extent, logical_n=logical_n, admit=capacity,
+                infinity_carrier=qi.shape[-1])
+        masks.append(jnp.arange(qi.shape[-1]) < infinity_values.shape[-1])
+        active_columns = jnp.concatenate(masks)[None]
+        price = capacity(active_columns.shape[-1])
+        pencil = assemble_shared_pole_pencil(states, infinity, matmul=mm)
+        del states, masks, infinity
+        reduce_eigh = distrib_la.plan("eigh", mesh_xy, n=pencil[0].shape[-1],
+                                     backend=resolution.eigh_backend,
+                                     batched_route=resolution.batched_route)
+        model, reduction, coefficients = reduce_shared_pole_pencil(
+            pencil, active_columns, eigh=reduce_eigh.batched, matmul=mm, gates=gates)
+        for name in ("gram_diagonal_positive", "gram_valid", "retained_metric_positive"):
+            if not bool(jnp.all(reduction[name])):
+                raise ValueError(f"GATE shared_pole_{name}: got: failed at q={q}; want: valid Gram and retained metric; why: no PSD repair")
+        model, zero = apply_shared_pole_zero_policy(model, gates=gates)
+        if not bool(jnp.all(zero["zero_policy"])):
+            raise ValueError(f"GATE shared_pole_zero_ritz: got: failed at q={q}; want: finite positive response within dropped-weight budget; why: no pole clipping")
+        # E selects the last infinity block of X. Build it as a face array;
+        # only the small row/column coordinate vectors are replicated.
+        r, ri = pencil[0].shape[-1], qi.shape[-1]
+        selector = jax.jit(lambda: (jnp.arange(r)[:, None] ==
+                                   jnp.arange(r-ri, r)[None, :])[None].astype(jnp.complex128),
+                           out_shardings=face)()
+        retained = retained_moment_identity(pencil, coefficients, model, selector, matmul=mm)
+        if not all(bool(jnp.all(value <= gates["retained_subspace_moments"]["threshold"]))
+                   for value in retained.values()):
+            raise ValueError(f"GATE shared_pole_retained_moments: got: failed at q={q}; want: projected latent moment identity <=1e-10; why: corrected Ritz algebra")
+        del pencil, coefficients, selector, active_columns
+        model, permutation = sort_shared_pole_columns(model)
+        passive = shared_pole_passivity(model, bank["coulomb"](span),
+                                       eta_ry=recipe["eta_ev"] / RYD_TO_EV,
+                                       matmul=mm, eigh=eig.batched, gates=gates)
+        if not bool(jnp.all(passive["passivity"])):
+            raise ValueError(f"GATE shared_pole_passivity: got: failed at q={q}; want: 0 <= V-whitened -W(i eta) <= I; why: passive screening")
+        with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
+            exact = read_shared_pole_bank(moment_io, span, meta=meta,
+                                          header=moment_header, fields=("M1", "M3"))
+        moment_defects = _model_diagnostics(model, exact, qi, matmul=mm)
+        del exact, qi
+        held = []
+        with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
+            for sample_id in recipe["held_ids"]:
+                sample = read_shared_pole_bank(bank_io, span, meta=meta, header=header,
+                                               sample_span=(int(sample_id), int(sample_id)+1),
+                                               fields=("Wc",))["Wc"][:, 0]
+                c, poles, mask = model
+                s = complex(recipe["z_ry"][int(sample_id)]) ** 2
+                weights = jnp.where(mask, 1 / (s-poles), 0)
+                value = mm(c * weights[:, None, :], c, transb="C")
+                error = float(jnp.linalg.norm(value-sample) / jnp.linalg.norm(sample))
+                held.append({"sample_id": int(sample_id), "relative_frobenius": error})
+        c, poles, mask = model
+        counts = jnp.sum(mask, axis=-1, dtype=jnp.int64)
+        # All scalar reductions precede rank-selective store formatting.
+        row = {"q_span": list(span), "roles": roles,
+               "K": np.asarray(counts).tolist(), "J": int(np.unique(np.asarray(poles)[np.asarray(mask)]).size),
+               "damping_fraction": 0.0, "capacity": price,
+               "condition": np.asarray(reduction["gram_condition"]).tolist(),
+               "retained_moment_relative": {k: np.asarray(v).tolist() for k, v in retained.items()},
+               "moment_defects": {k: {a: np.asarray(b).tolist() for a, b in v.items()}
+                                  for k, v in moment_defects.items()},
+               "held_W": held, "permutation": np.asarray(permutation).tolist(),
+               "storage_bytes": int(counts[0]) * (16*logical_n + 8)}
+        measurements = {
+            "normalized_gram_keep": dict(value=int(reduction["retained_rank"][0]), passed=True, reason="normalized Gram cut, current q"),
+            "normalized_gram_validity": dict(value=float(reduction["gram_min_relative"][0]), passed=True, reason="normalized Gram spectrum"),
+            "zero_ritz_policy": dict(value=float(zero["dropped_factor_weight_fraction"][0]), passed=True, reason="physical factor weight, sentinels excluded"),
+            "finite_factors_poles": dict(value=True, passed=True, reason="zero policy, active prefix and exact inert sentinels"),
+            "passivity": dict(value={k: np.asarray(v).tolist() for k, v in passive.items() if k != "passivity"}, passed=True, reason="authenticated inverse Coulomb square root at current eta"),
+            "retained_subspace_moments": dict(value=row["retained_moment_relative"], passed=True, reason="A=Y†GE, B=YA; pencil B†(G,H)B/2 versus model A†(I,Lambda)A/2"),
+            "held_w_full_moment_defects": dict(value={"held_W": held, "moments": row["moment_defects"]}, passed=None, reason="diagnostics; historical CD8/CD10 calibration is a separate landing receipt"),
+            "representation": dict(value={"nspinor": 1, "trs_allowed": True}, passed=True, reason="current typed symmetry capability"),
+            "capacity": dict(value=price, passed=True, reason="conservative aggregate constructor live-set price"),
+            "sc_rebuild": dict(value=identity, passed=True, reason="current recipe/census authenticated; directions and Ritz model rebuilt"),
+        }
+        receipt = construction_receipt(measurements)
+        receipt.update(identity=identity, constructor=row)
+        public_c = jax.jit(lambda value: value[:, :, None, :], out_shardings=public_factor)(c)
+        store_header = write_shared_pole_model(output, public_c, poles, counts,
+                                               q_span=span, meta=meta, tables=bank["tables"],
+                                               recipe=recipe, receipts=receipt)
+        receipts.append(receipt)
+        del model, c, public_c
+    return {"q_receipts": receipts, "model_header": store_header,
+            "identity": identity, "status": "CONSTRUCTED"}

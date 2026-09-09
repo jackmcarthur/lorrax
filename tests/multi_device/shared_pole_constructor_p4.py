@@ -26,6 +26,7 @@ def run_checks(mesh):
         assemble_shared_pole_pencil, reduce_shared_pole_pencil,
         apply_shared_pole_zero_policy, sort_shared_pole_columns,
         shared_pole_passivity,
+        retained_moment_identity,
     )
     from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
 
@@ -79,12 +80,15 @@ def run_checks(mesh):
                               backend=resolution.eigh_backend,
                               batched_route=resolution.batched_route)
         active = placed(np.ones((2, side), dtype=bool), replicated)
-        model, diagnostics, _ = reduce_shared_pole_pencil(
+        model, diagnostics, coefficients = reduce_shared_pole_pencil(
             pencil, active, eigh=eig.batched, matmul=mm, gates=gates)
         for name in ("gram_diagonal_positive", "gram_valid", "retained_metric_positive"):
             assert bool(jnp.all(diagnostics[name])), (layout, name)
         model, zero = apply_shared_pole_zero_policy(model, gates=gates)
         assert bool(jnp.all(zero["zero_policy"]))
+        selector = np.broadcast_to(np.eye(side, dtype=np.complex128)[:, -2:], (2, side, 2))
+        retained = retained_moment_identity(pencil, coefficients, model, placed(selector), matmul=mm)
+        assert max(float(jnp.max(v)) for v in retained.values()) < 1e-10, retained
         model, order = sort_shared_pole_columns(model)
         factor, t, mask = model
         counts = np.asarray(jnp.sum(mask, axis=-1)).tolist()
@@ -103,6 +107,7 @@ def run_checks(mesh):
         rows.append(dict(name="ritz_moments_ragged_sorted", layout=layout, status="PASS",
                          K=counts, pole_max_absolute_ry2=pole_error,
                          moment_relative=moment_errors, eig_plan=eig.describe(),
+                         retained_moment_relative={k: np.asarray(v).tolist() for k, v in retained.items()},
                          permutation=np.asarray(order).tolist()))
         pe = distrib_la.plan("eigh", mesh, n=8, backend=resolution.eigh_backend,
                              batched_route=resolution.batched_route)
