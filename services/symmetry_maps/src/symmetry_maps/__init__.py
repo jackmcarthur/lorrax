@@ -224,6 +224,9 @@ from symmetry_maps.maps import (
     unfold_psi,
     unfold_isdf_operator,
     unfold_operator_local,
+    certify_endpoint_locality,
+    endpoint_panel_cost,
+    unfold_endpoint_panel,
     open_spin_block_coefficient,
     unfold_spin_centroid_operator,
     unfold_isdf_one_leg,
@@ -329,6 +332,7 @@ __all__ = [
     # sharded q-axis unfolds
     "slice_q_full_to_ibz", "unfold_isdf_operator",
     "unfold_operator_local", "open_spin_block_coefficient",
+    "certify_endpoint_locality", "endpoint_panel_cost", "unfold_endpoint_panel",
     "unfold_spin_centroid_operator", "unfold_isdf_one_leg",
     "mix_channels_by_proper_rotation",
     # psi unfold / antiunitary rule
