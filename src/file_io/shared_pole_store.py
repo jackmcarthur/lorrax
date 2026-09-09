@@ -240,7 +240,7 @@ def _metadata(meta, tables, recipe, identity):
         "n_q_irr": qt.n_q_ibz, "n_q_full": qt.n_q_full,
         "n_mu_logical": basis.n_logical, "nspinor": 1,
         "centroid_digest": centroid_hash,
-        "grid": np.asarray(meta.kgrid).tolist(),
+        "grid": [int(meta.nkx), int(meta.nky), int(meta.nkz)],
         "fft_grid": np.asarray(meta.fft_grid).tolist(),
         "q_order": "canonical-full-flat", "q_shift": [0.0, 0.0, 0.0],
         "q_irr_full_idx": qids.tolist(),
