@@ -36,7 +36,7 @@ def _fixture(mesh):
     qt = QirrTables(irr_idx_q=np.arange(27,dtype=np.int32)%3,
         sym_idx_q=np.zeros(27,np.int32), q_irr_frac=np.asarray([[0,0,0],[1/3,0,0],[2/3,0,0]]),
         sym_perm=perm,L_table=wraps,n_sym_spatial=2)
-    meta=SimpleNamespace(mu_basis=basis,nspinor=1,kgrid=(3,3,3),fft_grid=(4,4,1),nk_tot=27,n_rmu=7)
+    meta=SimpleNamespace(mu_basis=basis,nspinor=1,nkx=3,nky=3,nkz=3,fft_grid=(4,4,1),nk_tot=27,n_rmu=7)
     from gw.shared_pole_recipe import CapacityLedger
     meta.shared_pole_capacity=CapacityLedger(meta,mesh_xy=mesh)
     meta.shared_pole_capacity.reserve("fixture_live_bound",resident_bytes_per_rank=4096,workspace_bytes_per_rank=0)
@@ -45,6 +45,28 @@ def _fixture(mesh):
     recipe={"version":"shared_real_pole_v1_r3b","gate_version":"shared_real_pole_gates_v1_r3b"}
     identity={key:"planted-"+key for key in store._IDENTITY_KEYS}
     return meta,tables,recipe,identity
+
+
+def check_metadata_without_kgrid(mesh, path=None):
+    """Store metadata consumes declared grid fields on a production Meta."""
+    from common.meta import Meta
+    fixture,tables,recipe,identity=_fixture(mesh)
+    meta=Meta(rank=jax.process_index(),n_proc=jax.process_count(),
+        b_id_0=0,b_id_1=0,b_id_2=1,b_id_3=2,b_id_4=2,
+        fft_grid=fixture.fft_grid,cell_volume=1.0,n_rtot=16,n_rmu=7,
+        npol=1,nfreq=1,nspin=1,nspinor=1,nspinor_wfnfile=1,
+        nkx=3,nky=3,nkz=3,nk_tot=27,mu_basis=fixture.mu_basis)
+    # Meta currently derives this convenience attribute. The store must not
+    # require it when handed the production bundle's declared grid fields.
+    del meta.kgrid
+    assert not hasattr(meta,'kgrid')
+    header=store._metadata(meta,tables,recipe,identity)
+    assert header['grid']==[3,3,3]
+    assert header['n_q_full']==meta.nk_tot
+
+
+def test_shared_pole_metadata_from_production_meta_without_kgrid():
+    check_metadata_without_kgrid(_test_mesh())
 
 
 def _device(host,mesh,spec):
@@ -323,7 +345,8 @@ if __name__=='__main__':
         root=Path(sys.argv[1]);root.mkdir(parents=True,exist_ok=True)
         mesh=_test_mesh()
         assert jax.process_count()==4
-        cells=[('roundtrip_local',check_roundtrip),
+        cells=[('metadata_without_kgrid',check_metadata_without_kgrid),
+               ('roundtrip_local',check_roundtrip),
                ('roundtrip_distributed',lambda m,p:check_roundtrip(m,p,'distributed')),
                ('finalization_resume',check_finalization_resume),
                ('empty_parents',check_empty_parents),
