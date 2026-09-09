@@ -111,43 +111,94 @@ def synthesize_shared_pole_parents(
         mesh=mesh_xy, return_transpose=True)
 
 
-def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy):
-    """Plan a bounded parent panel's complete children with the phase owner.
+def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
+    """Authenticate packed endpoint maps and one parent's child-row panel."""
+    from symmetry_maps import certify_endpoint_locality
 
-    The store header supplies authenticated raw-parent QirrTables. The
-    existing packed-basis owner proves endpoint locality before producing
-    local offsets; failure must take the service-routed factor path, never
-    a clipped gather. Returns full-q row IDs and a compiled panel unfold.
-    """
-    from common.shard_map import shard_map
-    from symmetry_maps import unfold_operator_local
-
-    basis = meta.mu_basis
-    qt = header["qirr"]
-    canonical_perm = np.asarray(qt["sym_perm"], dtype=np.int32)
-    local_perm = basis.layout.axis.pack_local_permutations_host(canonical_perm)
+    basis, qt = meta.mu_basis, header["qirr"]
+    packed = basis.layout.axis.pack_permutations_host(
+        np.asarray(qt["sym_perm"], dtype=np.int32), require_local=False)
+    certificates = {axis: certify_endpoint_locality(
+        packed, mesh=mesh_xy, mesh_axis=axis, active_mask=basis.active_mask)
+        for axis in ("x", "y")}
     wraps = basis.layout.axis.pack_host(
         np.asarray(qt["L_table"], dtype=np.int32), axis=1, fill_value=0)
     lo, hi = map(int, q_span)
     parent_map = np.asarray(qt["irr_idx_q"], dtype=np.int32)
-    q_rows = np.flatnonzero((parent_map >= lo) & (parent_map < hi)).astype(np.int32)
-    parent_rows = parent_map[q_rows] - lo
-    sym_rows = np.asarray(qt["sym_idx_q"], dtype=np.int32)[q_rows]
-    q_frac = np.asarray(qt["q_irr_frac"], dtype=np.float64)[lo:hi]
+    rows = np.flatnonzero((parent_map >= lo) & (parent_map < hi)).astype(np.int32)
+    return dict(rows=rows, parent_rows=parent_map[rows] - lo,
+                sym_rows=np.asarray(qt["sym_idx_q"], dtype=np.int32)[rows],
+                q_frac=np.asarray(qt["q_irr_frac"], dtype=np.float64)[lo:hi],
+                packed_perm=packed, wraps=wraps, certificates=certificates,
+                n_sym_spatial=int(qt["n_sym_spatial"]))
+
+
+def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
+    """Build the collective-free local operator action for a parent panel.
+
+    Returns explicit full-q row IDs and a compiled pair-transpose unfold.
+    Nonlocal maps refuse here; the caller routes bounded endpoint factors
+    through the symmetry service before contraction for those maps.
+    """
+    from common.shard_map import shard_map
+    from symmetry_maps import unfold_operator_local
+
+    if tables is None:
+        tables = _shared_pole_panel_tables(meta, header, q_span, mesh_xy=mesh_xy)
+    cert = tables["certificates"]
+    if not all(cert[axis]["is_local"] for axis in ("x", "y")):
+        raise ValueError("shared-pole nonlocal maps require routed endpoint panels")
 
     def body(plus, transposed):
         return unfold_operator_local(
-            plus, irr_idx=parent_rows, sym_idx=sym_rows, q_irr_frac=q_frac,
-            left_local_perm=local_perm, left_L_table=wraps,
-            right_local_perm=local_perm, right_L_table=wraps,
-            n_sym_spatial=int(qt["n_sym_spatial"]),
+            plus, irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
+            q_irr_frac=tables["q_frac"],
+            left_local_perm=cert["x"]["local_perm"], left_L_table=tables["wraps"],
+            right_local_perm=cert["y"]["local_perm"], right_L_table=tables["wraps"],
+            n_sym_spatial=tables["n_sym_spatial"],
             trs_rule="pair_transpose", transposed_parent_local=transposed)
 
     unfold = jax.jit(shard_map(
         body, mesh=mesh_xy,
         in_specs=(P(None, "x", "y"), P(None, "x", "y")),
         out_specs=P(None, "x", "y"), check_vma=False))
-    return q_rows, unfold
+    return tables["rows"], unfold
+
+
+def _shared_pole_routed_synthesis(
+    X, Y, poles2, intervals, E_ref_B, t_node, *, meta, header, tables, endpoint_budgets, mesh_xy,
+):
+    """Synthesize W after bounded child-factor routing, DESIGN §3.4 fallback.
+
+    Both endpoint actions use the common wavefunction symmetry owner; this
+    conjugates factors for antiunitary children without conjugating the
+    causal time weight. No all-star factor cache is retained.
+    """
+    from distrib_la import contract_faces
+    from symmetry_maps import unfold_endpoint_panel
+
+    operations = header["operations"]
+    spin = (np.asarray(operations["spin_real"])
+            + 1j * np.asarray(operations["spin_imag"]))[tables["sym_rows"]]
+    children = []
+    for axis, face in (("x", X), ("y", Y)):
+        child, _ = unfold_endpoint_panel(
+            face, irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
+            q_irr_frac=tables["q_frac"], source_perm=tables["packed_perm"],
+            L_table=tables["wraps"], spin_action_full=spin,
+            n_sym_spatial=tables["n_sym_spatial"], active_mask=meta.mu_basis.active_mask,
+            mesh=mesh_xy, mesh_axis=axis,
+            max_live_bytes=endpoint_budgets[axis])
+        children.append(child)
+    weights = _shared_pole_weights(poles2, intervals, E_ref_B, t_node)
+    child_weights = weights[tables["parent_rows"]]
+    size = len(tables["rows"])
+    small = NamedSharding(mesh_xy, P())
+    return contract_faces(
+        *children, jax.device_put(child_weights, small),
+        device_put_process_local(np.zeros(size, np.int32), small),
+        device_put_process_local(np.full(size, poles2.shape[1], np.int32), small),
+        mesh=mesh_xy)
 
 
 def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy):
@@ -172,9 +223,15 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     panels = []
     for lo in range(0, nq, bcap):
         hi = min(lo + bcap, nq)
-        rows, unfold = _shared_pole_panel_unfold(meta, header, (lo, hi), mesh_xy=mesh_xy)
+        tables = _shared_pole_panel_tables(meta, header, (lo, hi), mesh_xy=mesh_xy)
+        local = all(c["is_local"] for c in tables["certificates"].values())
+        if local:
+            rows, unfold = _shared_pole_panel_unfold(
+                meta, header, (lo, hi), mesh_xy=mesh_xy, tables=tables)
+        else:
+            rows, unfold = tables["rows"], None
         panels.append((lo, hi, device_put_process_local(
-            rows, NamedSharding(mesh_xy, P())), unfold))
+            rows, NamedSharding(mesh_xy, P())), unfold, tables))
     resident = None
     if bcap >= nq and ccap >= kmax:
         resident = read_shared_pole_faces(io, (0, nq), meta=meta, header=header)
@@ -197,7 +254,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             cached_indices, cached_bounds = indices, bounds
         intervals = cached_intervals
         total = None
-        for lo, hi, rows, unfold in panels:
+        for lo, hi, rows, unfold, tables in panels:
             for c0 in range(0, kmax, ccap):
                 c1 = min(c0 + ccap, kmax)
                 selected = np.clip(intervals[lo:hi] - c0, 0, c1 - c0)
@@ -207,9 +264,16 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                     io, (lo, hi), meta=meta, header=header, column_span=(c0, c1))
                 X, Y, poles2, _counts = faces
                 ranges = device_put_process_local(selected, NamedSharding(mesh_xy, P()))
-                plus, transposed = synthesize_shared_pole_parents(
-                    X, Y, poles2, ranges, E_ref_B, t_node, mesh_xy=mesh_xy)
-                child = unfold(plus, transposed)
+                if unfold is not None:
+                    plus, transposed = synthesize_shared_pole_parents(
+                        X, Y, poles2, ranges, E_ref_B, t_node, mesh_xy=mesh_xy)
+                    child = unfold(plus, transposed)
+                    del plus, transposed
+                else:
+                    child = _shared_pole_routed_synthesis(
+                        X, Y, poles2, ranges, E_ref_B, t_node,
+                        meta=meta, header=header, tables=tables,
+                        endpoint_budgets=schedule["endpoint_budgets"], mesh_xy=mesh_xy)
                 if total is None and lo == 0 and hi == nq:
                     # All children are in canonical full-q order. Avoid a
                     # redundant zero buffer in the resident all-parent case.
@@ -222,74 +286,107 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 # allocate another face carrier (the admitted live set is one).
                 if resident is None:
                     total.block_until_ready()
-                del plus, transposed, child, faces, X, Y, poles2
+                del child, faces, X, Y, poles2
         return zeros() if total is None else total
 
     return build
 
 
-def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
-    """Admit factor panels against the caller's aggregate live-byte ledger.
+def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, local):
+    """Price actual new E buffers; the incumbent's one full W is inherited.
 
-    The canonical current-map CapacityLedger owns aggregate admission.
-    Explicit caller-bound live_stages entries charge caller-live ψ/G/Σ
-    and compiled FFT/native workspace. This stage chooses actual q/K panels
-    from their remaining envelope and reserves before any face allocation.
-    Missing accounting refuses; DESIGN §0/§4 defines the aggregate limit.
+    Coordinator ruling12 separates unchanged spatial/ψ/Σ peak regression
+    from this three-U admission. A child W tile is priced as new even when
+    an all-parent first panel can reuse it as the inherited full W.
+    """
+    from symmetry_maps import endpoint_panel_cost
+
+    m, spin = int(meta.mu_basis.n_packed), int(header["nspinor"])
+    nq = int(header["n_q_irr"])
+    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    parents = np.asarray(header["qirr"]["irr_idx_q"], dtype=np.int32)
+    children = max(int(np.count_nonzero((parents >= lo)
+                   & (parents < min(lo+b, nq)))) for lo in range(0, nq, b))
+    tile = 16 * (spin*m)**2 // (px*py)
+    faces = 16 * b * spin*m*c * (1/px + 1/py)
+    endpoint_budgets = {}
+    traffic = 0
+    if local:
+        peak = ((2*b+children)*tile + 8*b
+                + 16*b*spin*m*c*(3/px+2/py) + 64*b*c)
+    else:
+        costs = {axis: endpoint_panel_cost((b,m,spin,c), children,
+                 mesh=mesh_xy, mesh_axis=axis, dtype=np.complex128)
+                 for axis in ("x", "y")}
+        endpoint_budgets = {axis: row["estimated_live_bytes_per_rank"]
+                            for axis, row in costs.items()}
+        traffic = sum(row["ring_bytes_per_rank"] for row in costs.values())
+        # The service bounds include input, output, rotating and phase
+        # scratch. Extra weighted child faces and child W coexist at GEMM.
+        peak = (sum(endpoint_budgets.values()) + children*tile
+                + 16*children*spin*m*c/px + 64*(b+children)*c)
+    return dict(resident_bytes_per_rank=int(np.ceil(faces)),
+                workspace_bytes_per_rank=int(np.ceil(peak-faces)),
+                endpoint_budgets=endpoint_budgets,
+                routed_bytes_per_panel_per_rank=int(traffic), children=children)
+
+
+def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
+    """Choose bounded panels, then admit through the canonical map ledger.
+
+    Caller-bound live_stages charge other NEW shared-pole objects. Per
+    coordinator ruling12, the unchanged spatial/ψ/Σ footprint and its one
+    full-q W are reported separately against the incumbent (<=1.05x).
+    This schedule never certifies that inherited no-regression gate.
     """
     capacity = getattr(meta, "shared_pole_capacity", None)
     if capacity is None:
         raise ValueError("GATE shared_pole_capacity: missing current-map CapacityLedger")
-    concurrent = capacity.live_stages  # Unbound is unknown, never zero.
+    concurrent = capacity.live_stages
     accepted = {row["stage"]: row for row in capacity.entries
                 if row["status"] == "PASS"}
     caller_bytes = sum(accepted[name][key] for name in concurrent for key in
                        ("resident_bytes_per_rank", "workspace_bytes_per_rank"))
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
-    n, m = int(header["n_mu_logical"]), int(meta.mu_basis.n_packed)
-    spin, Q = int(header["nspinor"]), int(header["n_q_full"])
+    n, spin, Q = (int(header[key]) for key in
+                  ("n_mu_logical", "nspinor", "n_q_full"))
     nq, kmax = int(header["n_q_irr"]), int(header["Kmax"])
     U = capacity.U_bytes_per_rank
-    if U != 16 * Q * (spin * n) ** 2 / (px * py):
+    if U != 16*Q*(spin*n)**2/(px*py):
         raise ValueError("GATE shared_pole_capacity: store/current-map geometry mismatch")
-    full_w = 16 * Q * (spin * m) ** 2 / (px * py)
-    parent_bytes = 16 * (spin * m) ** 2 / (px * py)
-    parent_map = np.asarray(header["qirr"]["irr_idx_q"], dtype=np.int32)
+    tables = _shared_pole_panel_tables(meta, header, (0,nq), mesh_xy=mesh_xy)
+    local = all(c["is_local"] for c in tables["certificates"].values())
+    budget = capacity.limit_bytes_per_rank - caller_bytes
     best = None
-    for b in range(1, nq + 1):
-        children = max(int(np.count_nonzero((parent_map >= lo)
-                       & (parent_map < min(lo + b, nq)))) for lo in range(0, nq, b))
-        # Two orientations and the bounded child output may coexist with
-        # full W. Weighted/conjugated faces and scalar masks are included.
-        fixed = caller_bytes + full_w + (2 * b + children) * parent_bytes + 8 * b
-        per_column = 16 * b * spin * m * (3 / px + 2 / py) + 64 * b
-        c = min(kmax, int(max(0, capacity.limit_bytes_per_rank - fixed) // per_column))
+    for b in range(1,nq+1):
+        # Byte counts are affine in the column width. Price through the
+        # SAME routine used for the admitted row, including routed scratch.
+        one = _shared_pole_panel_cost(meta,header,b,1,mesh_xy=mesh_xy,local=local)
+        two = _shared_pole_panel_cost(meta,header,b,2,mesh_xy=mesh_xy,local=local)
+        keys = ("resident_bytes_per_rank", "workspace_bytes_per_rank")
+        p1, p2 = sum(one[k] for k in keys), sum(two[k] for k in keys)
+        c = min(kmax, int(np.floor((budget-(2*p1-p2))/(p2-p1))))
         if c < 1:
             continue
-        cost = ((nq + b - 1) // b) * ((kmax + c - 1) // c)
-        candidate = (cost, -b * c, b, c, fixed + c * per_column)
+        cost = ((nq+b-1)//b)*((kmax+c-1)//c)
+        candidate = (cost,-b*c,b,c)
         if best is None or candidate[:2] < best[:2]:
             best = candidate
-    if best is None:
-        # Record the actual minimum-panel refusal in the one ledger, too.
-        children = max(int(np.count_nonzero(parent_map == q)) for q in range(nq))
-        workspace = ((2 + children) * parent_bytes + 8
-                     + 16 * spin * m * (3 / px + 2 / py) + 64)
-        capacity.reserve(
-            "sigma.synthesis", resident_bytes_per_rank=int(full_w),
-            workspace_bytes_per_rank=int(np.ceil(workspace)),
-            concurrent_with=concurrent)
-        raise AssertionError("capacity admitted a panel rejected by its own envelope")
-    _, _, b, c, peak = best
+    b,c = (1,1) if best is None else best[2:]
+    footprint = _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,local=local)
     receipt = capacity.reserve(
-        "sigma.synthesis", resident_bytes_per_rank=int(full_w),
-        workspace_bytes_per_rank=int(np.ceil(peak - caller_bytes - full_w)),
+        "sigma.synthesis", resident_bytes_per_rank=footprint["resident_bytes_per_rank"],
+        workspace_bytes_per_rank=footprint["workspace_bytes_per_rank"],
         concurrent_with=concurrent)
     return dict(status=receipt["status"], unit_bytes=U,
                 peak_live_bytes_per_rank=receipt["aggregate_bytes_per_rank"],
-                peak_in_U=receipt["aggregate_bytes_per_rank"] / U,
-                parent_capacity=b, column_capacity=c,
-                caller_live_bytes_per_rank=caller_bytes, capacity_receipt=receipt,
+                peak_in_U=receipt["aggregate_bytes_per_rank"]/U,
+                parent_capacity=b,column_capacity=c,
+                caller_live_bytes_per_rank=caller_bytes,capacity_receipt=receipt,
+                route="local_parent" if local else "routed_child",
+                endpoint_budgets=footprint["endpoint_budgets"],
+                routed_bytes_per_panel_per_rank=footprint["routed_bytes_per_panel_per_rank"],
+                inherited_sigma_peak_status="NOT_MEASURED",
                 compiled_peak_status="NOT_MEASURED")
 
 

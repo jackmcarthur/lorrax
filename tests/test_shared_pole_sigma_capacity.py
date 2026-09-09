@@ -8,7 +8,10 @@ from gw.mpa.sigma import _shared_pole_memory_schedule
 
 def fixture(caller_fraction=0.0):
     mesh = NS(shape={'x': 2, 'y': 2})
-    meta = NS(nk_tot=64, nspinor=1, n_rmu=16, mu_basis=NS(n_packed=16))
+    from common.grouped_layout import identity_square_grouped_shard_layout
+    layout = identity_square_grouped_shard_layout(16,16,(2,2))
+    meta = NS(nk_tot=64,nspinor=1,n_rmu=16,
+              mu_basis=NS(n_packed=16,layout=layout,active_mask=layout.axis.active_mask))
     meta.shared_pole_capacity = CapacityLedger(meta, mesh_xy=mesh)
     ledger = meta.shared_pole_capacity
     ledger.reserve('sigma.inputs', resident_bytes_per_rank=int(caller_fraction*ledger.U_bytes_per_rank),
@@ -16,7 +19,9 @@ def fixture(caller_fraction=0.0):
     ledger.reserve('sigma.spatial', resident_bytes_per_rank=0, workspace_bytes_per_rank=0)
     ledger.live_stages = ('sigma.inputs', 'sigma.spatial')
     header = dict(n_q_full=64, n_q_irr=4, n_mu_logical=16, nspinor=1, Kmax=50,
-                  qirr={'irr_idx_q': np.repeat(np.arange(4), 16)})
+                  qirr=dict(irr_idx_q=np.repeat(np.arange(4),16), sym_perm=np.arange(16)[None,:],
+                            L_table=np.zeros((1,16,3),np.int32), sym_idx_q=np.zeros(64,np.int32),
+                            q_irr_frac=np.zeros((4,3)), n_sym_spatial=1))
     return meta, header, mesh
 
 
@@ -33,7 +38,7 @@ def test_actual_panels_and_concurrency():
 
 
 def test_minimum_refusal_is_ledger_row():
-    meta, h, mesh = fixture(2.0)
+    meta, h, mesh = fixture(2.9)
     with pytest.raises(MemoryError, match='sigma.synthesis'):
         _shared_pole_memory_schedule(meta, h, mesh_xy=mesh)
     assert meta.shared_pole_capacity.entries[-1]['status'] == 'FAIL'
