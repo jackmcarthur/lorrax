@@ -50,6 +50,103 @@ _DEBUG_GN_ODD_RESIDUE_OFF_ENV = "LORRAX_DEBUG_GN_ODD_RESIDUE_OFF"
 _DEBUG_MAX_TAU_DISPATCHES_ENV = "LORRAX_DEBUG_SIGMA_MAX_TAU_DISPATCHES"
 
 
+@jax.jit
+def _shared_pole_weights(poles2, intervals, E_ref_B, t_node):
+    """Causal residue weights exp[-i(Ω-Eref)τ]/(2Ω), DESIGN §3.4.
+
+    Replicated ``poles2[parent,column]`` is in Ry², ``intervals[parent,2]``
+    selects half-open active columns, Eref is Ry and signed complex τ is
+    Ry^-1. Padding is made harmless before exponentiation, including at
+    complex Laplace nodes. Evaluation η belongs to the existing rule only.
+    """
+    columns = jnp.arange(poles2.shape[1])[None, :]
+    selected = ((columns >= intervals[:, :1])
+                & (columns < intervals[:, 1:]))
+    omega = jnp.sqrt(jnp.where(selected, poles2, 1.0))
+    phase = jnp.where(selected, omega - E_ref_B, 0.0)
+    return jnp.where(
+        selected, jnp.exp(-1j * phase * t_node) / (2.0 * omega), 0.0j)
+
+
+def synthesize_shared_pole_parents(
+    C_X, C_Y, poles2, intervals, E_ref_B, t_node, *, mesh_xy,
+):
+    """Synthesize both raw-parent orientations through the face service.
+
+    Parameters
+    ----------
+    C_X, C_Y : jax.Array
+        Complex128 physical factors ``[parent,mu,spin,column]`` with
+        ``P(None,'x',None,None)`` / ``P(None,'y',None,None)`` layouts.
+        Only spin=1 is currently supported; endpoints merge in the service.
+    poles2 : jax.Array
+        Replicated float64 ``[parent,column]`` squared frequencies in Ry².
+    intervals : jax.Array
+        Replicated integer ``[parent,2]`` active half-open column ranges,
+        prepared from the sorted census for this window/panel.
+    E_ref_B, t_node : scalar
+        Window reference in Ry and signed complex time in Ry^-1.
+    mesh_xy : jax.sharding.Mesh
+        Existing mesh with named x/y axes.
+
+    Returns
+    -------
+    Wplus, Wtranspose : jax.Array
+        Parent ``P(None,'x','y')`` tiles ``(C_X d) C_Y†`` and
+        ``(conj(C_X) d) C_Yᵀ`` at the SAME τ (DESIGN §3.4). Never conjugate
+        Wplus to obtain its antiunitary partner: d must retain its phase.
+    """
+    from distrib_la import contract_faces
+
+    if C_X.ndim != 4 or C_Y.ndim != 4:
+        raise ValueError("shared-pole faces require [parent,mu,spin,column]")
+    if C_X.shape[2] != 1 or C_Y.shape[2] != 1:
+        raise ValueError("GATE shared_pole_scalar: shared-pole Sigma requires spin=1")
+    weights = _shared_pole_weights(poles2, intervals, E_ref_B, t_node)
+    return contract_faces(
+        C_X, C_Y, weights, intervals[:, 0], intervals[:, 1],
+        mesh=mesh_xy, return_transpose=True)
+
+
+def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy):
+    """Plan a bounded parent panel's complete children with the phase owner.
+
+    The store header supplies authenticated raw-parent QirrTables. The
+    existing packed-basis owner proves endpoint locality before producing
+    local offsets; failure must take the service-routed factor path, never
+    a clipped gather. Returns full-q row IDs and a compiled panel unfold.
+    """
+    from common.shard_map import shard_map
+    from symmetry_maps import unfold_operator_local
+
+    basis = meta.mu_basis
+    qt = header["qirr"]
+    canonical_perm = np.asarray(qt["sym_perm"], dtype=np.int32)
+    local_perm = basis.layout.axis.pack_local_permutations_host(canonical_perm)
+    wraps = basis.layout.axis.pack_host(
+        np.asarray(qt["L_table"], dtype=np.int32), axis=1, fill_value=0)
+    lo, hi = map(int, q_span)
+    parent_map = np.asarray(qt["irr_idx_q"], dtype=np.int32)
+    q_rows = np.flatnonzero((parent_map >= lo) & (parent_map < hi)).astype(np.int32)
+    parent_rows = parent_map[q_rows] - lo
+    sym_rows = np.asarray(qt["sym_idx_q"], dtype=np.int32)[q_rows]
+    q_frac = np.asarray(qt["q_irr_frac"], dtype=np.float64)[lo:hi]
+
+    def body(plus, transposed):
+        return unfold_operator_local(
+            plus, irr_idx=parent_rows, sym_idx=sym_rows, q_irr_frac=q_frac,
+            left_local_perm=local_perm, left_L_table=wraps,
+            right_local_perm=local_perm, right_L_table=wraps,
+            n_sym_spatial=int(qt["n_sym_spatial"]),
+            trs_rule="pair_transpose", transposed_parent_local=transposed)
+
+    unfold = jax.jit(shard_map(
+        body, mesh=mesh_xy,
+        in_specs=(P(None, "x", "y"), P(None, "x", "y")),
+        out_specs=P(None, "x", "y"), check_vma=False))
+    return q_rows, unfold
+
+
 def _resolve_debug_max_tau_dispatches(*, print_fn=print):
     """Return the debug-only bounded-sweep length, or ``None``.
 
@@ -243,6 +340,7 @@ def _integrate_sigma_batches(
     brackets=None,
     band_counts=None,
     odd_residue_off=False,
+    w_synthesis=None,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs."""
@@ -344,6 +442,7 @@ def _integrate_sigma_batches(
         kgrid=kgrid,
         brackets=brackets,
         pack_brackets=pack_brackets,
+        w_synthesis=w_synthesis,
         **face_kwargs)
     small = NamedSharding(mesh_xy, P())
 
@@ -356,11 +455,16 @@ def _integrate_sigma_batches(
     # step count is exact because window/batch membership is a pure function
     # of the pole ranges the sweep will visit.  Owner request 2026-09-03.
     total_tau = 0
-    for _lo in range(0, int(n_poles), batch_size):
-        _batch = tuple(range(_lo, min(_lo + batch_size, int(n_poles))))
-        for _row in plan:
-            if _batch_rows(_row, _batch) is not None:
-                total_tau += len(np.asarray(_row.window.nodes.t))
+    if w_synthesis is not None:
+        # All parent/column panels finish W inside each tau call. They are
+        # storage work, never additional state-pole product windows.
+        total_tau = sum(len(np.asarray(row.window.nodes.t)) for row in plan)
+    else:
+        for _lo in range(0, int(n_poles), batch_size):
+            _batch = tuple(range(_lo, min(_lo + batch_size, int(n_poles))))
+            for _row in plan:
+                if _batch_rows(_row, _batch) is not None:
+                    total_tau += len(np.asarray(_row.window.nodes.t))
     progress_total = (
         total_tau if debug_max_tau is None
         else min(total_tau, debug_max_tau))
@@ -372,7 +476,7 @@ def _integrate_sigma_batches(
     sweep_wall_start = None
     stop_probe = False
     for lo, Omega, B, B_odd in batches:
-        if getattr(meta, 'mu_basis', None) is not None:
+        if w_synthesis is None and getattr(meta, 'mu_basis', None) is not None:
             # The pole store keeps the canonical centroid order; the run
             # computes in its packed order.  Pack every operator-shaped pole
             # field once per batch at this read seam.  GN-PPM's pole frequency
@@ -394,7 +498,9 @@ def _integrate_sigma_batches(
         width = int(Omega.shape[0])
         batch = tuple(range(int(lo), int(lo) + width))
         for row in plan:
-            selected = _batch_rows(row, batch)
+            selected = (
+                (row.pole_indices, row.bounds, row.phase_real, None)
+                if w_synthesis is not None else _batch_rows(row, batch))
             if selected is None:
                 continue
             pole_indices, bounds, phase_real, _states = selected
