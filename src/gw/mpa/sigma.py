@@ -196,8 +196,8 @@ def _shared_pole_routed_synthesis(
     small = NamedSharding(mesh_xy, P())
     return contract_faces(
         *children, jax.device_put(child_weights, small),
-        device_put_process_local(np.zeros(size, np.int32), small),
-        device_put_process_local(np.full(size, poles2.shape[1], np.int32), small),
+        jax.device_put(jnp.zeros(size, jnp.int32), small),
+        jax.device_put(jnp.full(size, poles2.shape[1], jnp.int32), small),
         mesh=mesh_xy)
 
 
@@ -220,6 +220,11 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     bcap, ccap = int(schedule["parent_capacity"]), int(schedule["column_capacity"])
     if bcap < 1 or ccap < 1:
         raise ValueError("shared-pole panel capacities must be positive")
+    if kmax == 0:
+        shape = (int(header["n_q_full"]), meta.mu_basis.n_packed, meta.mu_basis.n_packed)
+        zero = jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
+                       out_shardings=NamedSharding(mesh_xy, P(None,"x","y")))
+        return lambda *_args: zero()
     panels = []
     for lo in range(0, nq, bcap):
         hi = min(lo + bcap, nq)
@@ -262,7 +267,13 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                         concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
             schedule["compiled_peak_status"] = "PASS"
         else:
-            rows, kernel = tables["rows"], None
+            rows = tables["rows"]
+            # The service accepts traced faces. Bind the immutable map once
+            # per current-map panel, and reuse its executable at every tau.
+            kernel = jax.jit(partial(
+                _shared_pole_routed_synthesis, meta=meta, header=header,
+                tables=tables, endpoint_budgets=schedule["endpoint_budgets"],
+                mesh_xy=mesh_xy))
         panels.append((lo, hi, device_put_process_local(
             rows, NamedSharding(mesh_xy, P())), kernel, tables))
     resident = None
@@ -274,7 +285,9 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
 
     @partial(jax.jit, donate_argnums=(0,), out_shardings=sharding)
     def add_panel(total, rows, values):
-        return total.at[rows].add(values)
+        # Every full-q child occurs once in a parent panel, in sorted order.
+        # Expose that fact so complex scatter need not use atomic updates.
+        return total.at[rows].add(values, indices_are_sorted=True, unique_indices=True)
 
     cached_indices = cached_bounds = cached_intervals = None
 
@@ -297,13 +310,10 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                     io, (lo, hi), meta=meta, header=header, column_span=(c0, c1))
                 X, Y, poles2, _counts = faces
                 ranges = device_put_process_local(selected, NamedSharding(mesh_xy, P()))
-                if unfold is not None:
-                    child = unfold(X,Y,poles2,ranges,E_ref_B,t_node)
-                else:
-                    child = _shared_pole_routed_synthesis(
-                        X, Y, poles2, ranges, E_ref_B, t_node,
-                        meta=meta, header=header, tables=tables,
-                        endpoint_budgets=schedule["endpoint_budgets"], mesh_xy=mesh_xy)
+                child = unfold(X,Y,poles2,ranges,E_ref_B,t_node)
+                if resident is None:
+                    child.block_until_ready()
+                del faces, X, Y, poles2, _counts, ranges
                 if total is None and lo == 0 and hi == nq:
                     # All children are in canonical full-q order. Avoid a
                     # redundant zero buffer in the resident all-parent case.
@@ -316,7 +326,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 # allocate another face carrier (the admitted live set is one).
                 if resident is None:
                     total.block_until_ready()
-                del child, faces, X, Y, poles2
+                del child
         return zeros() if total is None else total
 
     return build
@@ -384,6 +394,11 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
     U = capacity.U_bytes_per_rank
     if U != 16*Q*(spin*n)**2/(px*py):
         raise ValueError("GATE shared_pole_capacity: store/current-map geometry mismatch")
+    if kmax == 0:
+        receipt = capacity.reserve("sigma.synthesis", resident_bytes_per_rank=0,
+                                   workspace_bytes_per_rank=0, concurrent_with=concurrent)
+        return dict(status=receipt["status"],parent_capacity=nq,column_capacity=1,
+                    capacity_receipt=receipt,route="empty",compiled_peak_status="NOT_APPLICABLE")
     tables = _shared_pole_panel_tables(meta, header, (0,nq), mesh_xy=mesh_xy)
     local = all(c["is_local"] for c in tables["certificates"].values())
     budget = capacity.limit_bytes_per_rank - caller_bytes
@@ -1134,6 +1149,7 @@ def compute_sigma_c_mpa_omega_grid(
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
     pole_batch_size=4,
     fit_identity=None,
+    fit_digest=None,
     expected_screening_diagrams=None,
     occupation_state=None,
     sigma_branches=None,
@@ -1173,7 +1189,10 @@ def compute_sigma_c_mpa_omega_grid(
         from file_io.shared_pole_store import validate_shared_pole_model
         from file_io.slab_io import SlabIO
         ledger = validate_shared_pole_model(
-            fit_src, expected_identity=fit_identity, mesh_xy=mesh_xy)
+            fit_src, expected_identity=fit_identity, mesh_xy=mesh_xy,
+            capacity=meta.shared_pole_capacity)
+        if fit_digest is not None and ledger["digest"] != fit_digest:
+            raise ValueError("GATE shared_pole_identity: screening handle digest differs from model")
         recipe = meta.shared_pole_recipe
         if not np.isclose(regularization_width_ry * RYD_TO_EV,
                           recipe["eta_ev"], rtol=0, atol=1e-12):
@@ -1215,10 +1234,11 @@ def compute_sigma_c_mpa_omega_grid(
         # never constructs a sampled state-pole lattice.
         summaries = []
         if shared_pole:
-            poles2 = np.asarray(jax.device_get(reader.read_slab(
-                "poles2_ry2", shape=(n_poles, int(ledger["Kmax"])),
-                offset=(0, 0), partition_spec=P())), dtype=np.float64)
-            counts = np.asarray(ledger["K"], dtype=np.int64)
+            from file_io.shared_pole_store import read_shared_pole_census
+            poles_device, counts_device = read_shared_pole_census(
+                reader, header=ledger, capacity=meta.shared_pole_capacity)
+            poles2, counts = map(np.asarray, jax.device_get((poles_device, counts_device)))
+            del poles_device, counts_device
             frequencies = shared_pole_frequencies(poles2, counts)
             summaries = summarize_shared_poles(
                 poles2, counts, branches,

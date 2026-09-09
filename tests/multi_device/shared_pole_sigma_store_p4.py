@@ -36,7 +36,8 @@ def main(runtime):
         put(poles, P(None, 'y')), counts, q_span=(0, 3),
         meta=meta, tables=tables, recipe=recipe,
         receipts={'identity': identity, 'scope': 'planted W execution parity'})
-    store.validate_shared_pole_model(path, expected_identity=identity, mesh_xy=mesh)
+    header = store.validate_shared_pole_model(
+        path, expected_identity=identity, mesh_xy=mesh, capacity=meta.shared_pole_capacity)
     frequencies = shared_pole_frequencies(poles, counts)
     indices = put(np.arange(3, dtype=np.int32), P())
     bounds_host = np.tile([1., 4., -np.inf, -np.inf, np.inf, np.inf], (3, 1))
@@ -48,6 +49,7 @@ def main(runtime):
     weights = np.where(active, np.exp(-1j*(omega-.6)*(.7+.2j))/(2*omega), 0)
     C = packed[:, :, 0, :]
     expected = np.einsum('qik,qk,qjk->qij', C, weights, C.conj())
+    expected = expected[np.asarray(header['qirr']['irr_idx_q'])]
     oracle = put(expected, P(None, 'x', 'y'))
     results = []
     with SlabIO(path, mode='r', mesh=mesh) as io:

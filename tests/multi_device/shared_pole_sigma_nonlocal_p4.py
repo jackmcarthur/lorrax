@@ -26,11 +26,11 @@ def main(rt):
     cents=meta.mu_basis.canonical_indices[[0,2,4,6,1,3,5]]
     sym=tables['sym']
     meta.mu_basis=PackedCentroidBasis.build(cents,sym,meta.fft_grid,mesh,identity=True)
-    meta.kgrid=(6,1,1)
     perm,wraps=centroid_source_map_and_wrap(cents,sym.sym_matrices,sym.translations,np.asarray(meta.fft_grid),extend_trs=True)
     # Planted lattice wraps make the q-dependent endpoint phase observable.
     wraps=np.asarray(wraps).copy();wraps[1,:,0]=np.arange(7)%2;wraps[3]=wraps[1]
-    irr=np.array([0,1,2,0,1,2],np.int32);ops=np.array([0,0,0,2,3,1],np.int32)
+    irr=np.arange(meta.nk_tot,dtype=np.int32)%3
+    ops=np.resize(np.array([0,0,0,2,3,1],np.int32),meta.nk_tot)
     q=np.array([[.125,0,0],[.25,0,0],[.375,0,0]])
     tables['qirr']=QirrTables(irr_idx_q=irr,sym_idx_q=ops,q_irr_frac=q,
                               sym_perm=perm,L_table=wraps,n_sym_spatial=2)
