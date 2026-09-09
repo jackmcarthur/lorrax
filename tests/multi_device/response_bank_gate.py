@@ -20,7 +20,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import resolve_mesh, gather_to_host
-from gw.response_bank import response_algebra, exact_bare_moments
+from gw.response_bank import response_algebra, exact_bare_moments, _coulomb_algebra
 from gw.w_isdf import _get_chi_fractional_contour_kernel_face
 from gw.wavefunction_bundle import PSI_MUN_SPEC, PSI_NMU_SPEC
 
@@ -82,6 +82,23 @@ def main():
         row["red_double_prefactor"] = error(wrong, expected)
         assert min(row[key] for key in row if key.startswith("red_")) > 0.1
         assert w.sharding.spec == P(None, "x", "y")
+        root_v = _coulomb_algebra(mesh, n, n, layout)
+        got_h, got_hi, negative, ranks = root_v(put(v))
+        row["coulomb_root"] = error(got_h, h)
+        row["coulomb_inverse"] = error(got_hi, np.linalg.inv(h))
+        assert not bool(negative) and np.all(np.asarray(ranks) == n)
+        singular_h = h.copy()
+        singular_h[:, -2:, :] = 0
+        singular_h[:, :, -2:] = 0
+        got_h, got_hi, negative, ranks = root_v(put(singular_h @ singular_h))
+        row["coulomb_supported_root"] = error(got_h, singular_h)
+        row["coulomb_supported_inverse"] = error(got_hi, np.linalg.pinv(singular_h))
+        assert not bool(negative) and np.all(np.asarray(ranks) == n - 2)
+        bad_v = singular_h @ singular_h
+        bad_v[:, -1, -1] = -0.1
+        _, _, negative, _ = root_v(put(bad_v))
+        assert bool(negative), "negative Coulomb eigenvalue was accepted"
+        assert max(row[key] for key in row if key.startswith("coulomb_")) < 1e-11
         row["memory"] = str(executable.memory_analysis())
         row["plan"] = receipt
         results[layout] = row
