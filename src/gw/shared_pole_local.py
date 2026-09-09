@@ -150,7 +150,13 @@ def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
                     reduction['gram_spectrum_relative'], (0, pad))
                 return model, reduction, zero, retained
             return run
-        branches = tuple(branch(nf, ni) for nf, ni in parent_extents)
+        # Padded batch rows reuse the same physical-size program while their
+        # panels remain distinct runtime inputs. Do not retrace copied rows.
+        sizes = tuple(dict.fromkeys(parent_extents))
+        branches = tuple(branch(nf, ni) for nf, ni in sizes)
+        if len(sizes) != len(parent_extents):
+            dispatch = jnp.asarray([sizes.index(size) for size in parent_extents], jnp.int32)
+            index = dispatch[index]
         return jax.lax.switch(index, branches, (finite, infinity, active))
 
     mapped = shard_map(lambda f, i, a, q: jax.lax.map(one, (f, i, a, q)), mesh=mesh_xy,
