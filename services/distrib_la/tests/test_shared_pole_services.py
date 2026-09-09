@@ -111,6 +111,20 @@ def check_directions_and_gemm(mesh):
         projector_error = error(q @ q.conj().T, v[:, :3] @ v[:, :3].conj().T)
         assert projector_error < 2e-11, projector_error
         assert float(jnp.max(jnp.abs(q[:, 3:]))) == 0
+        # Repeated calls at one shape must use the current matrix, including
+        # changed right directions and singular values across SC updates.
+        repeated_errors = []
+        for matrix, vectors, scale in ((w.conj().T, u, 1.), (2*w, v, 2.)):
+            qr, sr = D.right_singular_vectors(put(matrix), .4999999,
+                eigh_plan=eig, column_extent=lambda r: 6)
+            assert sr.size == 3
+            np.testing.assert_allclose(np.asarray(sr), scale*spectrum[:3],
+                                       rtol=2e-12)
+            repeated_error = error(qr @ qr.conj().T,
+                                    vectors[:, :3] @ vectors[:, :3].conj().T)
+            assert repeated_error < 2e-11
+            assert float(jnp.max(jnp.abs(qr[:, 3:]))) == 0
+            repeated_errors.append(repeated_error)
         ep = D.plan('eigh', mesh, backend=backend, n=12, batched_route=route)
         qe, ev = D.leading_eigenvectors(put(herm), 2, eigh_plan=ep,
                                         column_extent=lambda r: 6)
@@ -130,6 +144,7 @@ def check_directions_and_gemm(mesh):
             assert err < 2e-11, (label, ta, tb, err)
             products.append(dict(transa=ta, transb=tb, error=err))
         rows.append(dict(plan=label, svd_projector_error=projector_error,
+                         changing_input_projector_errors=repeated_errors,
                          eigen_projector_error=eigen_error, retained_rank=3,
                          gemm=products))
     return dict(status='PASS', cases=rows)

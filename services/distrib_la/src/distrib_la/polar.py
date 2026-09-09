@@ -8,6 +8,7 @@ all matrix-shaped work stays two-dimensionally sharded at P('x','y').
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 import operator
 import numpy as np
@@ -74,18 +75,42 @@ def _direction_input(W, eig, dilation=False):
     return tile
 
 
-def _retained_columns(Q, values, count, *, mesh, column_extent):
-    """Select and zero-pad columns on device, with caller-owned capacity."""
-    extent = operator.index(column_extent(count))
-    if extent < count or extent < 1 or extent % int(mesh.shape['y']):
-        raise ValueError("column_extent must cover the rank and tile mesh y")
+@lru_cache(maxsize=128)
+def _retained_column_kernel(mesh, count, extent):
+    """Reuse the column-selection executable; never retain input vectors."""
     tile = NamedSharding(mesh, P('x', 'y'))
     # Keep the selection and padding in one executable: the intermediate
     # physical rank need not tile y and must never be replicated at a seam.
     @jax.jit(out_shardings=tile)
     def select(q):
         return jnp.pad(q[:, ::-1][:, :count], ((0, 0), (0, extent - count)))
+    return select
+
+
+def _retained_columns(Q, values, count, *, mesh, column_extent):
+    """Select and zero-pad columns on device, with caller-owned capacity."""
+    extent = operator.index(column_extent(count))
+    if extent < count or extent < 1 or extent % int(mesh.shape['y']):
+        raise ValueError("column_extent must cover the rank and tile mesh y")
+    select = _retained_column_kernel(mesh, count, extent)
     return select(Q), jax.device_put(values[:count], NamedSharding(mesh, P()))
+
+
+@lru_cache(maxsize=16)
+def _direction_svd_kernel(eigh_plan):
+    """Reuse the planned dilation SVD with each current response as input."""
+    tile = NamedSharding(eigh_plan.mesh, P('x', 'y'))
+
+    def eigh(h):
+        s, q = eigh_plan.batched(h[None])
+        return s[0], q[0]
+
+    @jax.jit(out_shardings=(NamedSharding(eigh_plan.mesh, P()), tile))
+    def extract(w):
+        s, _, v = _dilation_svd(w, eigh)
+        return s, v
+
+    return extract
 
 
 def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
@@ -116,18 +141,11 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         sigma[r] replicated in descending order. r = sigma.size. Only the
         O(m) spectrum crosses the host, never a matrix. Selection is eager.
     """
-    tile = _direction_input(W, eigh_plan, dilation=True)
+    _direction_input(W, eigh_plan, dilation=True)
     tau = _as_rcond(tau)
     if tau is None:
         raise ValueError("tau must be an explicit relative cutoff")
-    def eigh(h):
-        s, q = eigh_plan.batched(h[None])
-        return s[0], q[0]
-    @jax.jit(out_shardings=(NamedSharding(eigh_plan.mesh, P()), tile))
-    def extract(w):
-        s, _, v = _dilation_svd(w, eigh)
-        return s, v
-    s, v = extract(W)
+    s, v = _direction_svd_kernel(eigh_plan)(W)
     values = np.asarray(s)[::-1].copy()
     if not np.all(np.isfinite(values)):
         raise ValueError("nonfinite singular spectrum")
