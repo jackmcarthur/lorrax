@@ -235,9 +235,10 @@ def _oneshot_mpa_occupation_state(config, wfn, wfns, material_class,
 			f"(nk,nb), got {energies.shape}")
 	nk = int(energies.shape[0])
 	kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
-	local = OccupationState.solve_mp1(
+	local = OccupationState.solve_smearing(
 		energies, kweights, float(wfn.num_electrons),
 		float(config.occ_broadening_ry),
+		family=config.occ_smearing_family,
 		state_capacity=spin_degeneracy_factor(wfn),
 		clamp_tol=float(config.occupation_clamp_tol))
 	if mesh_xy is None or process_count() <= 1:
@@ -637,7 +638,7 @@ def main(argv=None):
 			and mode.value == "mpa") else None)
 	if oneshot_occupation_state is not None:
 		print0(
-			"  one-shot occupations: fixed-N MP1 state, "
+			f"  one-shot occupations: fixed-N {oneshot_occupation_state.smearing_family} state, "
 			f"mu={oneshot_occupation_state.mu_ry * RYD_TO_EV:.8f} eV, "
 			f"width={oneshot_occupation_state.smearing_width_ry:.10f} Ry, "
 			f"occ_hash={oneshot_occupation_state.occ_hash}")
