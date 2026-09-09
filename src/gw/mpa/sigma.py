@@ -32,7 +32,7 @@ from runtime.padding import pad_to_axis
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                             CROSSING_NODE_FLOOR,
                             build_shared_sigma_windows,
-                            summarize_sigma_poles)
+                            summarize_sigma_poles, shared_pole_intervals)
 
 
 # The pane route is an immutable comparison instrument, not a production
@@ -145,6 +145,84 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy):
         in_specs=(P(None, "x", "y"), P(None, "x", "y")),
         out_specs=P(None, "x", "y"), check_vma=False))
     return q_rows, unfold
+
+
+def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy):
+    """Resolve bounded face reads → parent synthesis → complete full-q W.
+
+    ``schedule`` is the capacity planner's admitted parent/column capacities
+    and receipt. A resident all-parent schedule reads once. Otherwise the
+    same store reader supplies bounded panels per τ; panels change storage
+    and summation order, never the number of spatial calls. Factor arrays
+    live only in this stage closure, never in a global executable cache.
+    """
+    from functools import partial
+    from file_io.shared_pole_store import read_shared_pole_faces
+
+    if schedule["status"] != "PASS":
+        raise ValueError("GATE shared_pole_capacity: an admitted schedule is required")
+    nq = int(header["n_q_irr"])
+    kmax = int(header["Kmax"])
+    bcap, ccap = int(schedule["parent_capacity"]), int(schedule["column_capacity"])
+    if bcap < 1 or ccap < 1:
+        raise ValueError("shared-pole panel capacities must be positive")
+    panels = []
+    for lo in range(0, nq, bcap):
+        hi = min(lo + bcap, nq)
+        rows, unfold = _shared_pole_panel_unfold(meta, header, (lo, hi), mesh_xy=mesh_xy)
+        panels.append((lo, hi, device_put_process_local(
+            rows, NamedSharding(mesh_xy, P())), unfold))
+    resident = None
+    if bcap >= nq and ccap >= kmax:
+        resident = read_shared_pole_faces(io, (0, nq), meta=meta, header=header)
+    shape = (int(header["n_q_full"]), meta.mu_basis.n_packed, meta.mu_basis.n_packed)
+    sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+    zeros = jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=sharding)
+
+    @partial(jax.jit, donate_argnums=(0,), out_shardings=sharding)
+    def add_panel(total, rows, values):
+        return total.at[rows].add(values)
+
+    cached_indices = cached_bounds = cached_intervals = None
+
+    def build(_residues, _omega_fields, indices, bounds, _phase_real, E_ref_B, t_node):
+        nonlocal cached_indices, cached_bounds, cached_intervals
+        if indices is not cached_indices or bounds is not cached_bounds:
+            cached_intervals = shared_pole_intervals(
+                frequencies, np.asarray(jax.device_get(indices)),
+                np.asarray(jax.device_get(bounds)))
+            cached_indices, cached_bounds = indices, bounds
+        intervals = cached_intervals
+        total = None
+        for lo, hi, rows, unfold in panels:
+            for c0 in range(0, kmax, ccap):
+                c1 = min(c0 + ccap, kmax)
+                selected = np.clip(intervals[lo:hi] - c0, 0, c1 - c0)
+                if not np.any(selected[:, 1] > selected[:, 0]):
+                    continue
+                faces = resident if resident is not None else read_shared_pole_faces(
+                    io, (lo, hi), meta=meta, header=header, column_span=(c0, c1))
+                X, Y, poles2, _counts = faces
+                ranges = device_put_process_local(selected, NamedSharding(mesh_xy, P()))
+                plus, transposed = synthesize_shared_pole_parents(
+                    X, Y, poles2, ranges, E_ref_B, t_node, mesh_xy=mesh_xy)
+                child = unfold(plus, transposed)
+                if total is None and lo == 0 and hi == nq:
+                    # All children are in canonical full-q order. Avoid a
+                    # redundant zero buffer in the resident all-parent case.
+                    total = child
+                else:
+                    if total is None:
+                        total = zeros()
+                    total = add_panel(total, rows, child)
+                # Complete this panel before the next collective read can
+                # allocate another face carrier (the admitted live set is one).
+                if resident is None:
+                    total.block_until_ready()
+                del plus, transposed, child, faces, X, Y, poles2
+        return zeros() if total is None else total
+
+    return build
 
 
 def _resolve_debug_max_tau_dispatches(*, print_fn=print):
