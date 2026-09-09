@@ -49,7 +49,9 @@ def run_checks(mesh, directory):
                   multiplet_relative_tolerance=1e-6, eta_ev=.25)
     meta.shared_pole_recipe = recipe
     meta.shared_pole_capacity = CapacityLedger(meta, mesh_xy=mesh)
-    meta.shared_pole_capacity.live_stages = ()
+    meta.shared_pole_capacity.reserve('fixture_bank_inputs',
+        resident_bytes_per_rank=4096, workspace_bytes_per_rank=0)
+    meta.shared_pole_capacity.live_stages = ('fixture_bank_inputs',)
     path = directory / "bank.h5"
     store.initialize_shared_pole_bank(path, meta=meta, tables=tables,
                                      recipe=recipe, identity=identity, mesh_xy=mesh)
@@ -84,6 +86,7 @@ def run_checks(mesh, directory):
 
     original = getattr(w_isdf, "response_coulomb_powers", None)
     w_isdf.response_coulomb_powers = exact_coulomb
+    meta.shared_pole_capacity.live_stages = ()
     rows = []
     try:
         bank = dict(path=path, identity=identity, tables=tables, coulomb={},
@@ -93,7 +96,8 @@ def run_checks(mesh, directory):
             config = SimpleNamespace(backend=SimpleNamespace(linalg=layout))
             result = construct_shared_poles(bank, {"path": path}, meta, config,
                                             mesh_xy=mesh, output=output)
-            header = store.validate_shared_pole_model(output, expected_identity=identity, mesh_xy=mesh)
+            header = store.validate_shared_pole_model(output, expected_identity=identity,
+                mesh_xy=mesh, capacity=meta.shared_pole_capacity)
             assert header['K'] == [3, 5, 4], header['K']
             errors = []
             with SlabIO(output, mode='r', mesh=mesh) as io:
@@ -106,6 +110,7 @@ def run_checks(mesh, directory):
                         NamedSharding(mesh, P(None, 'x', None)), lambda index: diagonal[index])
                     relative = float(jnp.linalg.norm(jnp.sum(abs(cc)**2, axis=-1)-target)/jnp.linalg.norm(target))
                     assert relative < 1e-10, relative
+                    del cc, pp, target
                     errors.append(max(result['q_receipts'][q]['constructor']['retained_moment_relative']['M1'] +
                                       result['q_receipts'][q]['constructor']['retained_moment_relative']['M3']))
             assert max(errors) < 1e-10
