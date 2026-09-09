@@ -408,8 +408,9 @@ def _finalize_model(path, *, meta, header):
     nq, nmu = header["n_q_irr"], header["n_mu_logical"]
     kmax = max(header["K"])
     panel = 16*basis.n_canonical*((kmax+int(mesh.shape["y"])-1)//int(mesh.shape["y"]))/int(mesh.shape["x"])
-    _admit(_capacity(meta), "finalize", int(panel)+24*kmax,
-           device_panel=max(int(panel),8*kmax), native_host=True)
+    batch_width = max(v["hi"] - v["lo"] for v in header["batches"])
+    _admit(_capacity(meta), "finalize", batch_width*(int(panel)+24*kmax),
+           device_panel=batch_width*max(int(panel),8*kmax), native_host=True)
     header["Kmax"] = kmax
     header["compact_payload_bytes"] = nq * (16*nmu*kmax + 8*kmax + 8)
     header["staging_payload_bytes"] = sum((v["hi"]-v["lo"]) * v["width"] * (16*nmu+8) for v in header["batches"])
@@ -418,29 +419,29 @@ def _finalize_model(path, *, meta, header):
         io.create_dataset("factor", shape=(nq, nmu, 1, kmax), dtype=np.complex128)
         io.create_dataset("poles2_ry2", shape=(nq, kmax), dtype=np.float64)
         for batch in header["batches"]:
-            # One parent at a time; no all-parent carrier to discover Kmax.
-            for q in range(batch["lo"], batch["hi"]):
-                spec = P(None, "x", None, "y")
-                read_shape = mesh_divisible_shape(
-                    (1, basis.n_canonical, 1, kmax), mesh, spec)
-                if kmax == 0:
-                    continue
-                if batch["width"]:
-                    factor = io.read_slab(batch["name"] + "/factor",
-                        shape=read_shape,
-                        offset=(q-batch["lo"], 0, 0, 0), partition_spec=spec)
-                    poles = io.read_slab(batch["name"] + "/poles2",
-                        shape=(1, kmax), offset=(q-batch["lo"],0), partition_spec=P())
-                else:
-                    factor = jax.jit(lambda: jnp.zeros(read_shape, jnp.complex128),
-                                     out_shardings=NamedSharding(mesh, spec))()
-                    poles = jnp.ones((1,kmax), jnp.float64)
-                active = jnp.arange(kmax)[None,:] < header["K"][q]
-                poles = jnp.where(active, poles, 1.0)
-                io.write_slab("factor", factor, offset=(q,0,0,0))
-                io.write_slab("poles2_ry2", poles, offset=(q,0))
-                io.sync_writes()
-                del factor, poles
+            # Preserve the constructor's admitted q batch through finalization.
+            # Kmax is already known from the committed census; no all-q carrier.
+            lo, hi = batch["lo"], batch["hi"]
+            spec = P(None, "x", None, "y")
+            read_shape = mesh_divisible_shape(
+                (hi-lo, basis.n_canonical, 1, kmax), mesh, spec)
+            if kmax == 0:
+                continue
+            if batch["width"]:
+                factor = io.read_slab(batch["name"] + "/factor",
+                    shape=read_shape, offset=(0, 0, 0, 0), partition_spec=spec)
+                poles = io.read_slab(batch["name"] + "/poles2",
+                    shape=(hi-lo, kmax), offset=(0, 0), partition_spec=P())
+            else:
+                factor = jax.jit(lambda: jnp.zeros(read_shape, jnp.complex128),
+                                 out_shardings=NamedSharding(mesh, spec))()
+                poles = jnp.ones((hi-lo, kmax), jnp.float64)
+            active = jnp.arange(kmax)[None, :] < jnp.asarray(header["K"][lo:hi])[:, None]
+            poles = jnp.where(active, poles, 1.0)
+            io.write_slab("factor", factor, offset=(lo, 0, 0, 0))
+            io.write_slab("poles2_ry2", poles, offset=(lo, 0))
+            io.sync_writes()
+            del factor, poles
         io.write_attr("K", np.asarray(header["K"], np.int64))
         _write_header(io, header)
     header["digest"] = _model_digest(path, header, mesh, capacity=_capacity(meta))

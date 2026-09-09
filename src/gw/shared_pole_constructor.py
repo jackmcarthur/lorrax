@@ -672,6 +672,11 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
 
     eig, svd = eigenplan(n), eigenplan(2*n)
     receipts = []
+    replicated = NamedSharding(mesh_xy, P())
+    stack_models = jax.jit(
+        lambda parts: tuple(jnp.concatenate([row[i] for row in parts], axis=0)
+                            for i in range(3)),
+        out_shardings=(public_factor, replicated, replicated))
     from runtime.padding import mesh_divisor
     from gw.shared_pole_local import pack_parent_panels, local_parent_reducer
     # Local dense algebra assigns independent parents to mesh ranks. The
@@ -751,6 +756,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         batch_width = 1
         selected = pending
         pending = []
+        ready_models = []
         for slot, (q, states, infinity, active_columns, qi, roles) in enumerate(selected):
             span = (q, q + 1)
             if batch_results is None:
@@ -856,13 +862,22 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             receipt.update(identity=identity, constructor=row)
             public_c = jax.jit(lambda value: value[:, :, None, :], out_shardings=public_factor)(c)
             del model, c, mask
-            expose_live((public_c, poles, counts))
-            store_header = write_shared_pole_model(output, public_c, poles, counts,
-                                                   q_span=span, meta=meta, tables=bank["tables"],
-                                                   recipe=recipe, receipts=receipt)
+            ready_models.append((public_c, poles, counts))
+            retained_panels = (*retained_panels, public_c, poles, counts)
             receipts.append(receipt)
             del public_c, poles, counts
-            ledger.live_stages = upstream
+        batch_width = len(selected)
+        capacity(ready_models[0][0].shape[-1], phase="model")
+        public_c, poles, counts = stack_models(tuple(ready_models))
+        expose_live((public_c, poles, counts))
+        span = (selected[0][0], selected[-1][0] + 1)
+        batch_receipt = {"identity": identity,
+                         "q_receipts": receipts[-len(selected):]}
+        store_header = write_shared_pole_model(
+            output, public_c, poles, counts, q_span=span, meta=meta,
+            tables=bank["tables"], recipe=recipe, receipts=batch_receipt)
+        del public_c, poles, counts, ready_models
+        ledger.live_stages = upstream
         del selected, batch_results
         retained_panels = ()
     return {"q_receipts": receipts, "model_header": store_header,
