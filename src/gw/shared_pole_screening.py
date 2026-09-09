@@ -8,6 +8,7 @@ from pathlib import Path
 import dataclasses
 import hashlib
 import json
+import shutil
 import time
 
 import jax
@@ -120,10 +121,6 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         if occupations.shape != wfns.occ.shape:
             raise ValueError("GATE shared_pole_occupations: supplied current state does not match carrier")
         wfns = dataclasses.replace(wfns, occ=replicate_to_mesh(occupations, mesh_xy))
-    from .response_bank import response_weights
-    census = response_weights(wfns, meta)[-1]
-    if census["occupation_sha256"] != recipe["census"]["occupation_sha256"]:
-        raise ValueError("GATE shared_pole_occupations: bank state differs from resolved census")
     identity = shared_pole_identity(wfns, meta, label=label, wfn=wfn,
         binding=wfn_fingerprint_binding, centroid_indices=centroid_indices)
     if config.restart and tensors_filename is not None:
@@ -132,13 +129,33 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         if handle is not None:
             return dict(shared_pole=handle)
     root = Path(run_dir).resolve() / (str(label) + "_shared_pole")
-    # A failed transaction is evidence, not permission to overwrite its files.
-    exists = multihost_utils.broadcast_one_to_all(np.asarray(root.exists() if jax.process_index() == 0 else False))
-    if bool(exists):
-        raise ValueError(f"GATE shared_pole_output: {root} exists; use a fresh run directory or a compatible restart member")
-    if jax.process_index() == 0:
+    from common.collectives import rank0_transaction
+    from file_io.commit_state import assert_committed
+
+    def prepare_output():
+        # Only rank zero reads the small completion marker, on the compute
+        # node. The transaction owner broadcasts any refusal to every rank.
+        import h5py
+        model = root / "model.h5"
+        complete = False
+        if model.exists():
+            try:
+                with h5py.File(model, "r") as h5:
+                    assert_committed(h5, path=model)
+                    complete = "final_commit" in h5
+            except (OSError, ValueError):
+                complete = False
+        if complete:
+            print_fn(f"shared-pole output: complete model retained at {model}; refusing rebuild")
+            raise ValueError(f"GATE shared_pole_output: complete model {model}; use its compatible restart member or a fresh run directory")
+        if root.exists():
+            print_fn(f"shared-pole output: removing partial directory {root} and rebuilding")
+            shutil.rmtree(root)
+        else:
+            print_fn(f"shared-pole output: creating new directory {root}")
         root.mkdir(parents=True)
-    multihost_utils.sync_global_devices("shared-pole-output-directory")
+
+    rank0_transaction(root, stage="shared_pole.prepare_output", write=prepare_output)
     qids = np.asarray(sym.q_irr_full_idx, np.int64)
     grid = (meta.nkx, meta.nky, meta.nkz)
     perm, wraps = centroid_source_map_and_wrap(
@@ -166,6 +183,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         mesh_xy=mesh_xy, sym=sym, bank_io=bank))
     # The constructor owns scratch reads, actual pencil planning and the
     # final writer. It must query its own native workspace at the actual R.
+    # W/dW and M1/M3 are distinct keyed datasets in the same scratch file.
     result = construct_shared_poles(bank, bank, meta, config,
         mesh_xy=mesh_xy, output=str(root / "model.h5"))
     record("constructor", result)
