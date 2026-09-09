@@ -479,8 +479,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
         'bank_rule_tolerance': recipe['bank_rule_tolerance'],
         'sigma_tolerance': policy['sigma_tolerance'],
         'moment_convention': recipe['moment_convention'], 'census': dict(census),
-        'U_bytes_per_rank': 16 * int(meta.nk_tot) * n*n / (
-            int(mesh_xy.shape['x']) * int(mesh_xy.shape['y'])),
+        'U_bytes_per_rank': meta.shared_pole_capacity.U_bytes_per_rank,
     }
     result['metadata_array_bytes'] = sum(v.nbytes for v in result.values()
                                          if isinstance(v, np.ndarray))

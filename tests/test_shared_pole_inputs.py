@@ -172,7 +172,7 @@ def test_flat_role_serialization_and_deduplication():
     assert r['z_ry'].dtype==np.complex128
     assert r['role'].dtype==np.int8 and r['distinct_id'].dtype==np.int64
     assert r['held'].dtype==np.bool_
-    assert ROLE_CODES==dict(line=0,imaginary=1,infinity=2,held_line=3,held_imaginary=4)
+    assert r['role_codes']==ROLE_CODES==dict(line=0,imaginary=1,infinity=2,held_line=3,held_imaginary=4)
     assert 2 not in r['role']  # no fake infinity bank call
     assert r['distinct_id'][0]==r['distinct_id'][r['line_count']]
     assert len(set(r['distinct_id']))==r['unique_evaluations']
