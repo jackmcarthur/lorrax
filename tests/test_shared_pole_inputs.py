@@ -120,7 +120,9 @@ def fixture(*, metal=False, eta=.25, tier='production', top=20.):
     volume = 4*np.pi*electrons / (((top-3.5)/RYD_TO_EV/2)**2)
     meta = NS(nspin=1,nspinor=1,n_rmu=17,nk_tot=2,cell_volume=volume)
     bind_shared_pole_census(wf,meta,occupation_state=state,trs_allowed=True,state_capacity=2.,kweights=[.5,.5])
-    config = NS(sigma=NS(w_model='shared_pole',w_accuracy=tier,regularization_ev=eta))
+    # Resolver inputs carry the already-resolved positive device budget (R24).
+    config = NS(sigma=NS(w_model='shared_pole',w_accuracy=tier,regularization_ev=eta),
+                memory=NS(per_device_gb=30.))
     return config,wf,meta
 
 
@@ -258,7 +260,7 @@ def test_exact_applicability_message(tmp_path):
 
 
 def test_minimax_tolerance_does_not_override_bank(tmp_path):
-    c=parse(tmp_path,'compute_mode=mpa\nsigma_w_model=shared_pole\nminimax_target_error=1e-3\n')
+    c=parse(tmp_path,'compute_mode=mpa\nsigma_w_model=shared_pole\nminimax_target_error=1e-3\nmemory_per_device_gb=30\n')
     assert c.screening.minimax_target_error==1e-3
     _,w,m=fixture()
     assert resolve((c,w,m))['bank_rule_tolerance']==1e-8
