@@ -404,6 +404,14 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
                       column_extent, logical_n, admit, infinity_carrier):
     """Read each distinct fitted sample once, preserving all tangent roles."""
     import distrib_la
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    # Imaginary W is exactly Hermitian; retain both endpoint shards across
+    # the prescribed roundoff projection before the service's eager gate.
+    hermitian_part = jax.jit(
+        lambda a: 0.5 * (a + a.conj().T),
+        out_shardings=NamedSharding(eigh_plan.mesh, P('x', 'y')))
 
     fit_roles = _fit_roles(recipe)
     states, masks, roles = [], [], []
@@ -424,7 +432,7 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
             elif kind == "imaginary":
                 width = min(logical_n, max(1, int(recipe["imaginary_width"])))
                 q, values = distrib_la.leading_eigenvectors(
-                    -0.5 * (w[0] + w[0].conj().T), width, eigh_plan=eigh_plan, column_extent=column_extent,
+                    hermitian_part(-w[0]), width, eigh_plan=eigh_plan, column_extent=column_extent,
                     multiplet_tol=recipe["multiplet_relative_tolerance"])
             else:
                 raise ValueError(f"GATE shared_pole_role: got: {kind}; want: line or imaginary fitted role; why: unknown tangent semantics")
