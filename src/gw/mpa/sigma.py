@@ -228,10 +228,43 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         if local:
             rows, unfold = _shared_pole_panel_unfold(
                 meta, header, (lo, hi), mesh_xy=mesh_xy, tables=tables)
+            # One compiled body owns phase, both orientations and local
+            # unfold. Its actual buffer assignment is queried before I/O.
+            def local_body(X,Y,poles2,ranges,e,t,unfold=unfold):
+                plus,transposed = synthesize_shared_pole_parents(
+                    X,Y,poles2,ranges,e,t,mesh_xy=mesh_xy)
+                return unfold(plus,transposed)
+            kernel = jax.jit(local_body)
+            widths = sorted({min(ccap,kmax-c0) for c0 in range(0,kmax,ccap)})
+            for width in widths:
+                from runtime.aot_memory import aot_kernel_peak_bytes
+                def abstract(shape,dtype,spec):
+                    return jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh_xy,spec))
+                shape = (hi-lo,meta.mu_basis.n_packed,int(header["nspinor"]),width)
+                compiled = kernel.lower(
+                    abstract(shape,np.complex128,P(None,"x",None,None)),
+                    abstract(shape,np.complex128,P(None,"y",None,None)),
+                    abstract((hi-lo,width),np.float64,P()),
+                    abstract((hi-lo,2),np.int32,P()),
+                    abstract((),np.float64,P()),abstract((),np.complex128,P())).compile()
+                peak = aot_kernel_peak_bytes(compiled)
+                row = dict(parent_span=[lo,hi],column_width=width,
+                           compiled_bytes_per_rank=peak.total,
+                           output_bytes_per_rank=compiled.memory_analysis().output_size_in_bytes,
+                           cufft_measured=peak.cufft_measured)
+                schedule.setdefault("compiled_panels",[]).append(row)
+                if "capacity_receipt" in schedule:
+                    if not peak.cufft_measured:
+                        raise ValueError("shared-pole synthesis native FFT workspace query unavailable")
+                    meta.shared_pole_capacity.reserve(
+                        f"sigma.synthesis.compiled.{lo}.{hi}.{width}",
+                        resident_bytes_per_rank=0,workspace_bytes_per_rank=peak.total,
+                        concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
+            schedule["compiled_peak_status"] = "PASS"
         else:
-            rows, unfold = tables["rows"], None
+            rows, kernel = tables["rows"], None
         panels.append((lo, hi, device_put_process_local(
-            rows, NamedSharding(mesh_xy, P())), unfold, tables))
+            rows, NamedSharding(mesh_xy, P())), kernel, tables))
     resident = None
     if bcap >= nq and ccap >= kmax:
         resident = read_shared_pole_faces(io, (0, nq), meta=meta, header=header)
@@ -265,10 +298,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 X, Y, poles2, _counts = faces
                 ranges = device_put_process_local(selected, NamedSharding(mesh_xy, P()))
                 if unfold is not None:
-                    plus, transposed = synthesize_shared_pole_parents(
-                        X, Y, poles2, ranges, E_ref_B, t_node, mesh_xy=mesh_xy)
-                    child = unfold(plus, transposed)
-                    del plus, transposed
+                    child = unfold(X,Y,poles2,ranges,E_ref_B,t_node)
                 else:
                     child = _shared_pole_routed_synthesis(
                         X, Y, poles2, ranges, E_ref_B, t_node,
@@ -388,6 +418,47 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
                 routed_bytes_per_panel_per_rank=footprint["routed_bytes_per_panel_per_rank"],
                 inherited_sigma_peak_status="NOT_MEASURED",
                 compiled_peak_status="NOT_MEASURED")
+
+
+def _shared_pole_inherited_peak(args, meta, *, mesh_xy, kgrid, brackets,
+                                pack_brackets, face_kwargs):
+    """Compare inherited Sigma lower bounds at the exact current operands.
+
+    The control is the incumbent already-phased W carrier used by the frozen
+    evaluator; the candidate supplies that same full W through the new seam.
+    Both invoke the unchanged G/spatial/projection owner with the SAME ψ,
+    energy/occupation selector, time and output shape. New W synthesis lives
+    in its separate three-U reservation. Native scratch is excluded equally
+    from this compiler-only regression, as required by coordinator ruling12.
+    """
+    from runtime.aot_memory import aot_kernel_peak_bytes
+
+    capacity = meta.shared_pole_capacity
+    m = int(meta.mu_basis.n_packed) * int(meta.nspinor)
+    q = int(meta.nk_tot)
+    small = NamedSharding(mesh_xy, P())
+    W = jax.ShapeDtypeStruct((1,q,m,m), np.complex128,
+                            sharding=NamedSharding(mesh_xy, P(None,None,"x","y")))
+    def scalar(value):
+        return device_put_process_local(np.asarray(value), small)
+    same_args = (*args[:6], W, scalar([0.0+0.0j]), scalar(np.array([0],np.int32)),
+                 scalar([[-np.inf,np.inf,-np.inf,-np.inf,np.inf,np.inf]]),
+                 scalar([False]), args[11], scalar(0.0), args[13])
+    def phased_w(B, _omega, _indices, _bounds, _real, _ref, _time):
+        return B[0]
+    peaks = []
+    for builder in (None, phased_w):
+        kernel = get_shared_sigma_tau_kernel(
+            mesh_xy=mesh_xy,kgrid=kgrid,brackets=brackets,pack_brackets=pack_brackets,
+            w_synthesis=builder,**face_kwargs)
+        compiled = jax.jit(kernel).lower(*same_args).compile()
+        peaks.append(aot_kernel_peak_bytes(compiled).compiled_peak)
+    return capacity.record_sigma_peak(
+        peaks[1],peaks[0],reason=(
+            "Matched current Sigma operands and same spatial owner; compiler-only "
+            "argument+output+temporary-alias lower bounds, native scratch excluded "
+            "equally; control=incumbent phased-W carrier, candidate=shared-pole "
+            "injection with the same full W; first-window shape covers all tau nodes"))
 
 
 def _resolve_debug_max_tau_dispatches(*, print_fn=print):
@@ -780,6 +851,12 @@ def _integrate_sigma_batches(
                     jnp.asarray(win.E_ref_A),
                     jnp.asarray(win.E_ref_B),
                     jnp.asarray(first_t, dtype=jnp.complex128))
+                if w_synthesis is not None:
+                    inherited = _shared_pole_inherited_peak(
+                        prewarm_args,meta,mesh_xy=mesh_xy,kgrid=kgrid,
+                        brackets=brackets,pack_brackets=pack_brackets,
+                        face_kwargs=face_kwargs)
+                    print_fn(f"  shared-pole inherited Sigma peak: {inherited}")
                 if hasattr(tau_kernel, "lower"):
                     tau_kernel.lower(*prewarm_args).compile()
                 else:
