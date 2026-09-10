@@ -307,6 +307,17 @@ def read_isdf_header_from_file(f: h5.File) -> IsdfHeader:
 # Write
 # ---------------------------------------------------------------------------
 
+def write_centroid_coordinates(group, r_mu_fft_idx, r_mu_crystal):
+    """Write the shared spatial-coordinate table below an HDF5 header group.
+
+    Both arrays have shape (n_mu, 3), in FFT-grid and fractional crystal
+    coordinates respectively. Only small host metadata enters this routine.
+    """
+    c = group.create_group('centroids')
+    c.create_dataset('r_mu_fft_idx', data=r_mu_fft_idx)
+    c.create_dataset('r_mu_crystal', data=r_mu_crystal)
+
+
 def write_isdf_header(
     path: str | Path,
     header: IsdfHeader,
@@ -328,9 +339,7 @@ def write_isdf_header(
         g.create_dataset('vertex_mu_L', data=np.int32(header.vertex_mu_L))
         g.create_dataset('zeta_is_done', data=np.bool_(header.zeta_is_done))
         g.create_dataset('zeta_layout', data=np.bytes_(header.zeta_layout))
-        c = g.create_group('centroids')
-        c.create_dataset('r_mu_fft_idx', data=header.r_mu_fft_idx)
-        c.create_dataset('r_mu_crystal', data=header.r_mu_crystal)
+        write_centroid_coordinates(g, header.r_mu_fft_idx, header.r_mu_crystal)
         # G-flat metadata — only written when present.
         if header.gvec_components is not None:
             g.create_dataset('gvec_components', data=header.gvec_components)

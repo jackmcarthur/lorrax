@@ -1038,3 +1038,132 @@ def read_shared_pole_bank(io, q_span, *, meta, header, sample_span=None,
         retained += output
         del canonical
     return out
+
+
+def _export_spatial_header(path, source_wfn, meta, *, kind, source):
+    """Append small BGW/centroid metadata to a collectively created export.
+
+    As for zeta_q.h5, SlabIO has already created the inode with the MPI-IO
+    striping policy. Serial metadata appends never create or replace it.
+    """
+    from file_io.mf_header import copy_mf_header
+    from file_io.isdf_header import write_centroid_coordinates
+
+    def append():
+        copy_mf_header(source_wfn, path, dst_mode="a")
+        with h5py.File(path, "a") as f:
+            group = f.create_group(kind + "_header")
+            indices = np.asarray(meta.mu_basis.canonical_indices, np.int32)
+            write_centroid_coordinates(
+                group, indices, indices / np.asarray(meta.fft_grid, np.float64))
+            group.create_dataset("source_store", data=np.bytes_(str(source)))
+            group.create_dataset("q_order", data=np.bytes_("canonical raw irreducible parents"))
+            if kind == "poles":
+                # b is the factorised plasmon-pole residue, B=b b†;
+                # Lambda is the Omega² analogue. No causal tau weight enters b.
+                f["b"] = f["factor"]  # HDF5 hard link: one payload, v1 readers unchanged.
+                group.create_dataset("representation", data=np.bytes_(
+                    "Wc(z)=b (z_Ry^2-Lambda_Ry2)^-1 b_dagger; "
+                    "b[q,mu,spin,j], Lambda=poles2_ry2[q,j], active j<K[q]; "
+                    "no tau weight, q weight or additional Coulomb factor"))
+            else:
+                group.create_dataset("representation", data=np.bytes_(
+                    "physical Wc(q,z_i), s=z_Ry^2; fixed bank samples, not W+(tau); "
+                    "Wc and dWc_ds[q,sample,mu,nu], M1 and M3[q,mu,nu]; "
+                    "z_ry[role] and distinct_id[role] identify each sample"))
+    rank0_transaction(path, stage="shared_pole.export_headers", write=append)
+
+
+@timing.timed("spole.outputs")
+def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
+                               run_dir, label, tables, print_fn):
+    """Export current-map poles and/or fixed W samples through their writers.
+
+    Large arrays stay XY tiled. One parent (and one frequency for W) is
+    resident at a time. Existing packing, admission, commit and digest owners
+    are reused; the source stores are immutable, including on restart.
+    The bank export retains its derivative and moment companions so it is
+    readable by the existing bank reader. No screening or pole fit is rerun.
+    """
+    source = Path(handle["path"])
+    if source_wfn is None:
+        _refuse("export requires the source WFN path for verbatim mf_header")
+    ledger = _capacity(meta)
+    model = validate_shared_pole_model(source, expected_identity=handle["identity"],
+        mesh_xy=mesh_xy, capacity=ledger)
+    if model["digest"] != handle["digest"]:
+        _refuse("export handle differs from current model")
+    basis = meta.mu_basis
+    outputs = {}
+    targets = {kind: Path(run_dir) / f"{label}_{kind}.h5" for kind, enabled in
+               (("poles", config.write_poles), ("w", config.write_w)) if enabled}
+    for path in targets.values():
+        if path.exists():
+            _refuse(f"export already exists: {path}; use a fresh output directory")
+    bank_source = source.parent / "bank.h5"
+    if config.write_w:
+        if not bank_source.is_file():
+            _refuse(f"write_w needs the current-map bank {bank_source}; "
+                    "a model-only restart cannot supply frequency samples")
+        bank_header = validate_shared_pole_bank(bank_source,
+            expected_identity=handle["identity"], mesh_xy=mesh_xy, require_complete=True)
+    if config.write_poles:
+        path = targets["poles"]
+        spec = P(None, "x", None, "y")
+        shape = mesh_divisible_shape((1, basis.n_canonical, 1, model["Kmax"]), mesh_xy, spec)
+        arg, output, temp = _conversion_bytes(basis, shape, spec, unpack=False)
+        previous = ledger.live_stages
+        with SlabIO(source, mode="r", mesh=mesh_xy) as io:
+            for q, count in enumerate(model["K"]):
+                row = _admit(ledger, "export_poles", arg + output + 24*shape[-1], temp,
+                             device_panel=max(arg, 8*shape[-1]), native_host=True)
+                ledger.live_stages = (*previous, row["stage"])
+                try:
+                    canonical = (io.read_slab("factor", shape=shape,
+                        offset=(q, 0, 0, 0), partition_spec=spec) if model["Kmax"] else
+                        jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
+                            out_shardings=NamedSharding(mesh_xy, spec))())
+                    b = basis.pack_axis(canonical, 1, spec=spec)
+                    poles = (io.read_slab("poles2_ry2", shape=(1, shape[-1]),
+                        offset=(q, 0), partition_spec=P()) if model["Kmax"] else
+                        jnp.ones((1, 0), jnp.float64))
+                    poles = jnp.where(jnp.arange(shape[-1])[None, :] < count, poles, 1.0)
+                    write_shared_pole_model(path, b, poles, np.asarray([count], np.int64),
+                        q_span=(q, q+1), meta=meta, tables=tables,
+                        recipe=model["recipe"], receipts=dict(identity=handle["identity"],
+                            source_model_digest=model["digest"], source_store=str(source)))
+                    del canonical, b, poles
+                finally:
+                    ledger.live_stages = previous
+        _export_spatial_header(path, source_wfn, meta, kind="poles", source=source)
+        outputs["poles"] = dict(path=str(path), payload_bytes=model["compact_payload_bytes"])
+    if config.write_w:
+        path = targets["w"]
+        initialize_shared_pole_bank(path, meta=meta, tables=tables,
+            recipe=bank_header["recipe"], identity=handle["identity"], mesh_xy=mesh_xy)
+        previous = ledger.live_stages
+        with SlabIO(bank_source, mode="r", mesh=mesh_xy) as io:
+            for q in range(bank_header["bank_shape"]["nq"]):
+                for field in _BANK_SAMPLE_FIELDS + _BANK_MOMENT_FIELDS:
+                    sample = field in _BANK_SAMPLE_FIELDS
+                    for i in range(bank_header["bank_shape"]["nsample"] if sample else 1):
+                        span = (i, i+1) if sample else None
+                        values = read_shared_pole_bank(io, (q, q+1), meta=meta,
+                            header=bank_header, sample_span=span, fields=(field,))
+                        value = values[field]
+                        spec = P(None, None, "x", "y") if sample else P(None, "x", "y")
+                        row = _admit(ledger, "export_w_live",
+                            _local_bytes(value.shape, value.dtype, mesh_xy, spec))
+                        ledger.live_stages = (*previous, row["stage"])
+                        try:
+                            write_shared_pole_bank(path, q_span=(q, q+1), sample_span=span,
+                                meta=meta, expected_identity=handle["identity"],
+                                mesh_xy=mesh_xy, **values)
+                            del values, value
+                        finally:
+                            ledger.live_stages = previous
+        _export_spatial_header(path, source_wfn, meta, kind="w", source=bank_source)
+        outputs["w"] = dict(path=str(path), payload_bytes=bank_header["payload_bytes"])
+    for kind, receipt in outputs.items():
+        print_fn(f"write_{kind}: {receipt['path']}; payload={receipt['payload_bytes']} bytes")
+    return outputs

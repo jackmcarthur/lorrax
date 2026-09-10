@@ -99,14 +99,26 @@ def _coulomb_resource(value, meta, sym, mesh_xy, path):
                 q_irr_full_idx=qids.tolist(), sha256=bytes(np.asarray(digest)).hex())
 
 
+def _shared_pole_tables(meta, sym, centroid_indices):
+    """Build raw-parent tables through the canonical symmetry service."""
+    from symmetry_maps import (QirrTables, centroid_source_map_and_wrap,
+                               bgw_integer_q_to_fractional)
+    perm, wraps = centroid_source_map_and_wrap(
+        np.asarray(centroid_indices), sym.sym_matrices, sym.translations,
+        np.asarray(meta.fft_grid), extend_trs=True)
+    qt = QirrTables(irr_idx_q=sym.irr_idx_q, sym_idx_q=sym.sym_idx_q,
+        q_irr_frac=bgw_integer_q_to_fractional(
+            sym.q_irr_kgrid_int, (meta.nkx, meta.nky, meta.nkz)),
+        sym_perm=perm, L_table=wraps, n_sym_spatial=len(sym.sym_matrices))
+    return dict(qirr=qt, q_irr_full_idx=np.asarray(sym.q_irr_full_idx, np.int64), sym=sym)
+
+
 def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         centroid_indices, run_dir, label, wfn,
                         wfn_fingerprint_binding, tensors_filename, occupation_state, print_fn):
     """Build/reuse one immutable current-map model and return its small handle."""
     timing.fence("spole.screening_setup")
     with timing.section("spole.screening_setup"):
-        from symmetry_maps import (QirrTables, centroid_source_map_and_wrap,
-                                   bgw_integer_q_to_fractional)
         from file_io.shared_pole_store import initialize_shared_pole_bank
         from file_io.tagged_arrays import register_shared_pole_restart_member
         from .shared_pole_recipe import shared_pole_restart_handle
@@ -130,6 +142,13 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             handle = shared_pole_restart_handle(tensors_filename,
                 expected_identity=identity, meta=meta, mesh_xy=mesh_xy, print_fn=print_fn)
             if handle is not None:
+                if config.write_w or config.write_poles:
+                    from file_io.shared_pole_store import export_shared_pole_outputs
+                    timing.fence("spole.outputs")
+                    export_shared_pole_outputs(handle, meta=meta, config=config,
+                        mesh_xy=mesh_xy, source_wfn=getattr(wfn, "_filename", None),
+                        run_dir=run_dir, label=label, print_fn=print_fn,
+                        tables=_shared_pole_tables(meta, sym, centroid_indices))
                 return dict(shared_pole=handle)
         root = Path(run_dir).resolve() / (str(label) + "_shared_pole")
         from common.collectives import rank0_transaction
@@ -159,15 +178,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             root.mkdir(parents=True)
 
         rank0_transaction(root, stage="shared_pole.prepare_output", write=prepare_output)
-        qids = np.asarray(sym.q_irr_full_idx, np.int64)
-        grid = (meta.nkx, meta.nky, meta.nkz)
-        perm, wraps = centroid_source_map_and_wrap(
-            np.asarray(centroid_indices), sym.sym_matrices, sym.translations,
-            np.asarray(meta.fft_grid), extend_trs=True)
-        qt = QirrTables(irr_idx_q=sym.irr_idx_q, sym_idx_q=sym.sym_idx_q,
-            q_irr_frac=bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, grid),
-            sym_perm=perm, L_table=wraps, n_sym_spatial=len(sym.sym_matrices))
-        tables = dict(qirr=qt, q_irr_full_idx=qids, sym=sym)
+        tables = _shared_pole_tables(meta, sym, centroid_indices)
     timing.fence("spole.coulomb_staging")
     with timing.section("spole.coulomb_staging"):
         coulomb = _coulomb_resource(V_q, meta, sym, mesh_xy, root / "coulomb.h5")
@@ -204,6 +215,12 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         handle = dict(path=str(root / "model.h5"), identity=identity,
                       digest=header["digest"], K=list(header["K"]))
         ledger.live_stages = ()
+        if config.write_w or config.write_poles:
+            from file_io.shared_pole_store import export_shared_pole_outputs
+            timing.fence("spole.outputs")
+            receipts["outputs"] = export_shared_pole_outputs(handle, meta=meta,
+                config=config, mesh_xy=mesh_xy, source_wfn=getattr(wfn, "_filename", None),
+                run_dir=run_dir, label=label, tables=tables, print_fn=print_fn)
         if tensors_filename is not None:
             receipts["restart_member"] = register_shared_pole_restart_member(
                 tensors_filename, handle["path"], expected_identity=identity,

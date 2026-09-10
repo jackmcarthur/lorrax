@@ -27,6 +27,15 @@ def parse(tmp_path, extra, *, head='off'):
 def test_default_mpa(tmp_path, model):
     c = parse(tmp_path, 'compute_mode=mpa\n' + model)
     assert (c.sigma.w_model, c.sigma.w_accuracy) == ('mpa', 'production')
+    assert not c.write_w and not c.write_poles
+
+
+@pytest.mark.parametrize('key', ['write_w', 'write_poles'])
+def test_shared_output_applicability(tmp_path, key):
+    with pytest.raises(ValueError, match=key + '=true requires'):
+        parse(tmp_path, f'compute_mode=mpa\n{key}=true\n')
+    config = parse(tmp_path, f'compute_mode=mpa\nsigma_w_model=shared_pole\n{key}=true\n')
+    assert getattr(config, key)
 
 
 @pytest.mark.parametrize('head', [None, 'full', 'no_local_fields'])

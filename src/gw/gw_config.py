@@ -1569,6 +1569,9 @@ _DEFAULTS = {
     # Suppressing the write makes the file ABSENT, which is the loudest of
     # the states those guards distinguish.
     "write_restart_tensors": True,
+    # Standalone shared-pole outputs; internal construction stores remain required.
+    "write_w": False,
+    "write_poles": False,
     # ``write_qsgw_datasets``: does this run add the QSGW / QP-ladder
     # appendix to sigma_mnk.h5?  DEFAULT false, and false is exactly
     # today's file — these four datasets have had no producer since
@@ -2874,6 +2877,11 @@ def _resolve_shared_pole_inputs(params):
         params[key] = value
     mode = str(params["compute_mode"]).strip().lower()
     model = params["sigma_w_model"]
+    for key in ("write_w", "write_poles"):
+        if params[key] and (mode != "mpa" or model != "shared_pole"):
+            raise ValueError(
+                f"{key}=true requires compute_mode=mpa and "
+                "sigma_w_model=shared_pole (fixed frequency-bank outputs)")
     if "sigma_w_model" in named and mode != "mpa":
         raise ValueError(
             f"GATE shared_pole_applicability: sigma_w_model got: {model!r} "
@@ -5008,6 +5016,10 @@ class LorraxConfig:
     #: behaviour; see ``_DEFAULTS["write_restart_tensors"]`` for why this is
     #: a COMPLEMENT to q_irr storage and not an alternative to it.
     write_restart_tensors: bool
+    #: Export the fixed Wc sample bank, including derivative/moment companions.
+    write_w: bool
+    #: Export the centroid/pole residue factor b and squared poles Lambda.
+    write_poles: bool
     #: Add the QSGW Σ_xc cube and the QP energy ladders to ``sigma_mnk.h5``.
     #: False (the default) is byte-for-byte today's file; see
     #: ``_DEFAULTS["write_qsgw_datasets"]`` for what each dataset is and
@@ -5827,6 +5839,8 @@ class LorraxConfig:
             occupation_clamp_tol=float(_g("occupation_clamp_tol")),
             restart=bool(_g("restart")),
             write_restart_tensors=bool(_g("write_restart_tensors")),
+            write_w=bool(_g("write_w")),
+            write_poles=bool(_g("write_poles")),
             write_qsgw_datasets=bool(_g("write_qsgw_datasets")),
             restart_q_storage_raw=_restart_q_storage,
             qp_rotations_k_storage=_qp_rot_k_storage,
