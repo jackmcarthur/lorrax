@@ -591,7 +591,44 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     }
 
 
-def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
+def _support_envelope(required, key, session):
+    """Keep a run-local scalar enclosure; never retain samples or a census.
+
+    The reference map uses its current interval without retaining it. The
+    first interacting map seeds the enclosure: an initial DFT gap can be
+    substantially smaller and select a different imaginary support count.
+    Increasing L/u_min is conservative for the imaginary-count heuristic.
+    This is a sampling-geometry enclosure, not an interpolation-error bound;
+    the bank still certifies its current energies at every supplied frequency.
+    """
+    version = "sc_interacting_support_enclosure_20260910"
+    scope = "sampling geometry only; interpolation accuracy not certified"
+    if not session.get("reference_complete", False):
+        session["reference_complete"] = True
+        return dict(version=version, status="initial_reference", epoch=-1,
+                    required=dict(required), retained=dict(required), scope=scope)
+    previous = session.get("envelope")
+    same_policy = previous is not None and session.get("key") == key
+    envelope = dict(required)
+    if same_policy:
+        envelope = {
+            "line_top_ev": max(previous["line_top_ev"], required["line_top_ev"]),
+            "u_min_ev": min(previous["u_min_ev"], required["u_min_ev"]),
+            "u_max_ev": max(previous["u_max_ev"], required["u_max_ev"]),
+        }
+    changed = not same_policy or envelope != previous
+    status = ("initial" if previous is None else
+              "policy_changed" if not same_policy else
+              "expanded" if changed else "hit")
+    epoch = session.get("epoch", -1) + int(changed)
+    session.update(key=key, envelope=envelope, epoch=epoch)
+    return dict(version=version, status=status,
+                epoch=epoch, required=dict(required), retained=dict(envelope),
+                scope=scope)
+
+
+def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
+                              support_session=None):
     """Resolve DESIGN §5 from current metadata into scalars and small arrays.
 
     ``bind_shared_pole_census`` must have consumed this map's occupation state.
@@ -601,6 +638,11 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
     role code is reserved (moments need no bank evaluation). Conjugates are
     constructor states, never bank calls. ``support_pair`` int64 [role,2]
     binds held endpoints; [-1,-1] means not a held midpoint.
+    ``support_session`` optionally retains only scalar support bounds and a
+    policy/basis key across SC maps, after one unretained reference map.
+    Enclosed current intervals regenerate the same points and roles, while
+    the census and capacity ledger remain fresh.
+    Expanding intervals enlarge the envelope; policy changes start a new one.
     All ranks execute the metadata work; only ``print_fn`` may filter by rank.
     """
     import numpy as np
@@ -631,6 +673,19 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
     scale = eta / recipe['reference_eta_ev']
     low_step = recipe['line_low_step_ev'] * scale
     high_step = recipe['line_high_step_ev'] * scale
+    umin, umax = max(height, census['gap_ev']), max(recipe['imaginary_floor_max_ev'], top)
+    if umin >= umax:
+        raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
+    support_receipt = None
+    if support_session is not None:
+        key = (RECIPE_HASH, tier, eta, int(meta.nspinor), int(meta.n_rmu),
+               census['logical_band_count'])
+        support_receipt = _support_envelope(
+            dict(line_top_ev=top, u_min_ev=umin, u_max_ev=umax), key,
+            support_session)
+        retained = support_receipt['retained']
+        top, umin, umax = (retained['line_top_ev'], retained['u_min_ev'],
+                           retained['u_max_ev'])
     if tier == 'relaxed':
         line = np.linspace(0.0, top, policy['line_count'])
     else:
@@ -641,9 +696,6 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
         high = ([edge + i * high_step for i in range(math.ceil((top-edge)/high_step))]
                 if top > edge else [])
         line = np.asarray(low + high + [top], dtype=np.float64)
-    umin, umax = max(height, census['gap_ev']), max(recipe['imaginary_floor_max_ev'], top)
-    if umin >= umax:
-        raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
     kappa = top / umin
     count = max(recipe['imaginary_min_count'], round(
         math.log(16 * kappa**2) * math.log(4 / recipe['imaginary_count_epsilon'])
@@ -712,6 +764,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
         'operator_realization': recipe['operator_realization'],
         'U_bytes_per_rank': meta.shared_pole_capacity.U_bytes_per_rank,
     }
+    if support_receipt is not None:
+        result['support_envelope'] = support_receipt
     result['metadata_array_bytes'] = sum(v.nbytes for v in result.values()
                                          if isinstance(v, np.ndarray))
     rules = {
@@ -732,6 +786,11 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
         'U_bytes': '16*nk_full*(nspinor*nmu)^2/(Px*Py), logical bytes/rank',
         'metadata': 'sum of replicated metadata array nbytes',
     }
+    if support_receipt is not None:
+        rules.update(top='SC high-water envelope of omega_p+3.5 eV',
+                     u_min='SC low-water envelope of max(h,logical gap)',
+                     u_max='SC high-water envelope of max(16 eV,L)',
+                     support_envelope='current required bounds and retained sampling enclosure; not an interpolation-error certificate')
     for key, value in result.items():
         shown = value.tolist() if isinstance(value, np.ndarray) else value
         rule = next((v for prefix, v in rules.items() if key.startswith(prefix)),

@@ -3137,7 +3137,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             kweights=full_k_quadrature_weights(inputs.wfn, inputs.sym))
         inputs.meta.shared_pole_recipe = resolve_shared_pole_recipe(
             inputs.config, wfns_qp, inputs.meta, mesh_xy=inputs.mesh_xy,
-            print_fn=inputs.print_fn)
+            print_fn=inputs.print_fn,
+            support_session=(None if inputs.fixed_quadrature_session is None else
+                             inputs.fixed_quadrature_session.setdefault(
+                                 "shared_pole_supports", {})))
         bind_shared_pole_sc_identity(
             inputs.meta, state, occupation_state=entry_occ_state,
             print_fn=inputs.print_fn)

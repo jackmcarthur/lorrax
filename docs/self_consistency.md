@@ -372,6 +372,59 @@ the current Taylor remainder and updating projections. A missing certificate,
 domain escape or failed bound rebuilds that rule. Lower remote padding cannot
 cross the Taylor convergence boundary. See the [minimax contract](services/minimax.md).
 
+The DFT reference map uses its current support geometry without retaining its
+envelope. The first interacting map initializes three scalar bounds: the largest line endpoint,
+smallest imaginary endpoint and largest imaginary endpoint requested so far.
+The same policy and enclosed current interval regenerate identical training
+and held coordinates. An interval expansion enlarges the envelope; a changed
+policy or basis key starts a new epoch. This warmup avoids locking the
+reference DFT gap's extra imaginary support into all later interacting maps.
+Every map still rebuilds its census,
+capacity ledger, samples, directions and physical ranks. In particular, this
+does not pad a Gram matrix with null vectors or freeze W. Keeping the smallest previously requested
+interacting imaginary endpoint conservatively increases the support-count
+heuristic's condition ratio; it is not an interpolation-error certificate.
+
+### Symmetry of the physical pole model
+
+The versioned physical realization is
+`Wc(q,s) = Pi_Gq [sum_k b(q,k) b(q,k)^dagger / (s - Lambda(q,k))]`,
+where `Pi_Gq` averages all authenticated magnetic little-group operations.
+The stored factors describe the raw latent Ritz model. Sigma time synthesis
+and the MPA Gamma body bind the same adapter in `gw/qgrid_symmetry.py`;
+the standalone symmetry service owns every phase, permutation and operation.
+The recipe's hashed `operator_realization` distinguishes these semantics
+from historical raw stores, which remain readable for analysis.
+
+Each transformed residue is a unitary or conjugate-unitary congruence of a
+positive residue, so averaging preserves residue positivity and real poles.
+At complex frequency or time an antiunitary operation acts on the residue
+endpoints. Its partner is the same-time matrix transpose; conjugating the
+whole value would incorrectly conjugate the scalar resolvent/time weight.
+The MPA head evaluates `V + Pi_Gamma Wc`, with the original bare V.
+
+The projector streams one operation into a fixed-size accumulator, including
+nonlocal endpoint permutations. No factor gains a symmetry axis. Matrix
+intermediates remain distributed over all processors; full and compact
+synthesis executables undergo the current-map memory admission. A child
+stabilizer is conjugate to its parent's stabilizer, so nonlocal factor routing
+can apply the same projection after contraction without enlarging factors.
+
+This changes the symmetry-breaking part of the finite approximation. It does
+not generally preserve every original tangential interpolation condition.
+The constructor's retained-Ritz identities and raw held/moment/passivity
+receipts still certify that raw model; the latter do not certify the realized
+operator's error or its upper passivity bound against an unprojected V.
+Converged spectral comparisons must measure the physical change.
+
+The distinction follows the subspace conditions in Beattie and Gugercin,
+[Model Reduction by Rational Interpolation, Theorem 3.1 and Algorithm 4.1](https://arxiv.org/pdf/1409.2140):
+interpolation fixes specified left/right actions, and a real realization
+requires conjugation closure of both points and directions. Degenerate
+singular-subspace closure alone does not impose the full spatial group.
+The residue-averaging argument above is specific to this implementation;
+it is not a claim that the cited interpolation theorem certifies its error.
+
 An enabled scalar head uses the existing MPA sample-plan, scalar-fit and Sigma
 head owners. Full local fields evaluate the current shared-pole Gamma body,
 one frequency at a time with both matrix axes distributed, and fold the common
@@ -382,12 +435,22 @@ sampling keys configure this scalar head; elementwise-body fit/reuse keys have
 no shared-pole consumer. The shifted finite-q BGW metal head remains unsupported.
 
 Validation on branch `investigate/shared-pole-sc-quadrature-2026-09-10`:
-P4 Si job58148928.6 completed one full-head QSGW map and reused identical chi
-rules in the next response bank, then refused the second W constructor's Gram
-check. Job58148928.8 with tighter resonant quadrature also refused that check.
-This enables the SC/head plumbing and certified quadrature retention; it does
-not establish shared-pole SC convergence or head accuracy. Detailed evidence:
-sandbox `reports/shared_pole_sc_implementation_2026-09-10/report.md`.
+P4 Si job58152308.12, using diagnostic Sigma integration and the historical
+MPA head, converged after 15 fresh-W maps with final max energy change
+0.016 meV over 14 criterion bands. All subsequent chi rules hit with equal
+nodes; Sigma rule rebuild count remained zero. Job58152308.11 verifies the
+service against independent residue congruences and its nonlocal per-rank
+matrix bound. These controls do not establish the corrected head's accuracy
+or the fixed-support converged-QP change. The historical-head warmup control
+(job58152308.34, reader58152308.42) also converged in 15 maps: its maximum
+unshifted change across all 64 by 34 QP energies was 0.084421 meV against
+the dynamic-support control. Twelve final maps had identical support geometry
+and carrier widths; all later chi and Sigma rules were reused. This comparison
+includes the diagnostic-to-production Sigma plumbing and initial rule-size
+variation. Corrected-head, fully covered-grid controls are a separate
+validation. Detailed evidence: sandbox
+`reports/shared_pole_sc_invariants_2026-09-10/report.md`, claim2150, and
+`runs/Si_scalar/35_shared_pole_sc_live_20260910/49_old_head_warmup_sc/report.md`.
 <!-- The optional diagnostic below does not change the production restart contract. -->
 
 ### Inspecting an SC state before shared-pole construction
