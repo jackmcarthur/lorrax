@@ -101,6 +101,7 @@ from distrib_la.matmul import (
     MATMUL_BACKEND_CHOICES,
     contract_faces,
     matmul,
+    matmul_adjoint_pair,
     resolve_matmul_backend,
 )
 from distrib_la.matmul_plan import GemmPlan, gemm_plan
@@ -142,7 +143,7 @@ __all__ = [
     "PolarPlan", "plan_polar_factor", "polar_factor",
     "right_singular_vectors", "leading_eigenvectors",
     # distributed matrix multiplication
-    "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES", "contract_faces",
+    "matmul", "matmul_adjoint_pair", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES", "contract_faces",
     # planned N,N GEMM (trace-safe, for hot loops)
     "GemmPlan", "gemm_plan", "panel_matmul",
     # the batched route toggle and its dial

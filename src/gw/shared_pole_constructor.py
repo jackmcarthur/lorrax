@@ -550,19 +550,26 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
             if any(width < 1 or width > logical_n for width in widths):
                 raise ValueError(f"GATE shared_pole_directions: got: ranks {widths}; want: 1..{logical_n}; why: empty or padded physical direction set")
             s = _sample_point(recipe, int(sample_id)) ** 2
-            # The conjugate state reuses exactly the same right directions.
-            for conjugate in ((False, True) if kind == "line" and s.imag != 0 else (False,)):
-                admit(largest_side() + q_batch.shape[-1])
-                transa = "C" if conjugate else "N"
-                output = matmul(w, q_batch, transa=transa)
-                action = matmul(derivative, q_batch, transa=transa)
+            # Both orientations share Q and the staged A/Q ingress. Each
+            # result remains a separate, incumbent-sized spatial face.
+            conjugates = ((False, True) if kind == "line" and s.imag != 0
+                          else (False,))
+            for port in range(len(conjugates)):
+                admit(largest_side() + (port + 1) * q_batch.shape[-1])
+            if len(conjugates) == 2:
+                outputs = matmul(w, q_batch, adjoint_pair=True)
+                actions = matmul(derivative, q_batch, adjoint_pair=True)
+            else:
+                outputs = (matmul(w, q_batch, transa="N"),)
+                actions = (matmul(derivative, q_batch, transa="N"),)
+            for conjugate, output, action in zip(conjugates, outputs, actions):
                 states.append((s.conjugate() if conjugate else s, q_batch, output, action))
                 counts.append(widths)
                 for i, width in enumerate(widths):
                     roles[i].append({"sample_id": int(sample_id), "role": role["role"],
                                      "conjugate": conjugate, "width": width,
                                      "carrier_width": column_extent(width)})
-            del q_batch, output, action
+            del q_batch, output, action, outputs, actions
         del w, derivative
     return states, np.asarray(counts, dtype=np.int64).T, roles
 
@@ -742,7 +749,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         column_extent = lambda width: padded_axis(
             width, mesh_xy, name="shared_pole_port",
             specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
-        def mm(a, b, **kwargs):
+        def mm(a, b, *, adjoint_pair=False, **kwargs):
             # Query the actual effective N,N shapes before the service allocates
             # transpose staging, output or a larger persistent GEMM workspace.
             shapes = tuple(value.shape[:-2] + (value.shape[-2:][::-1]
@@ -752,7 +759,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             query_workspace("gemm", shapes, eigenplan(n))
             if workspace != previous:
                 capacity(current_side)
-            return distrib_la.matmul(a, b, mesh=mesh_xy, backend="auto",
+            operation = (distrib_la.matmul_adjoint_pair if adjoint_pair
+                         else distrib_la.matmul)
+            return operation(a, b, mesh=mesh_xy, backend="auto",
                                      batched_route=resolution.batched_route, **kwargs)
 
         eig, svd = eigenplan(n), eigenplan(2*n)

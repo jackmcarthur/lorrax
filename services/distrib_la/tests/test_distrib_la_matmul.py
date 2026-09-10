@@ -181,3 +181,23 @@ def test_provider_wrappers_call_library_gemm_not_jax_panels():
         assert target in source or "_GEMM_TARGET" in source
         assert "ffi_call" in source
         assert "all_gather" not in source
+
+
+@pytest.mark.parametrize("batch", [None, 3, 5])
+def test_adjoint_pair_matches_separate_actions_exactly(batch):
+    """Both orientations preserve ragged parents, complex phase and face layout."""
+    import jax
+    mesh = _mesh()
+    rng = np.random.default_rng(9321)
+    prefix = () if batch is None else (batch,)
+    for scale in (1.0, 2.0):
+        a = scale * (rng.normal(size=prefix+(8,8)) +
+                     1j*rng.normal(size=prefix+(8,8)))
+        b = rng.normal(size=prefix+(8,4)) + 1j*rng.normal(size=prefix+(8,4))
+        a, b = _put(a, mesh), _put(b, mesh)
+        pair = D.matmul_adjoint_pair(a, b, mesh=mesh, backend="off")
+        for actual, mode in zip(pair, ("N", "C")):
+            expected = D.matmul(a, b, mesh=mesh, backend="off", transa=mode)
+            jax.block_until_ready((actual, expected))
+            assert actual.sharding == expected.sharding
+            assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
