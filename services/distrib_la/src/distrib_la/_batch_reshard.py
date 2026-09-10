@@ -52,10 +52,10 @@ def validate_batch_reshard_operands(
     collective is entered.  The route accepts a ragged leading batch and
     pads it itself, but the matrix face must already tile the mesh.
     """
-    if op not in ("eigh", "cholesky", "solve_lu"):
+    if op not in ("eigh", "dilation_eigh", "cholesky", "solve_lu"):
         raise ValueError(
             f"batch_reshard: unsupported op {op!r}; expected "
-            "eigh|cholesky|solve_lu")
+            "eigh|dilation_eigh|cholesky|solve_lu")
     expected = 2 if op == "solve_lu" else 1
     if len(ops) != expected:
         raise ValueError(
@@ -224,6 +224,10 @@ def batch_reshard_call(
 
     The returned arrays obey the ordinary :meth:`Plan.batched` layout:
     matrix outputs at ``P(None,'x','y')`` and eigh eigenvalues replicated.
+    The service-internal ``dilation_eigh`` operation transports the original
+    square response and its right singular vectors. Dilation construction
+    and extraction use the polar owner's equations around the same local
+    eigh; its full length-2n spectrum keeps the ordinary vector gather.
     """
     ops = tuple(ops)
     nbatch, batch_pad = validate_batch_reshard_operands(op, mesh, ops)
@@ -237,7 +241,7 @@ def batch_reshard_call(
     fn = _JIT_CACHE.get(key)
     if fn is None:
         in_specs = tuple(P(None, "x", "y") for _ in ops)
-        out_specs = ((P(), P(None, "x", "y")) if op == "eigh"
+        out_specs = ((P(), P(None, "x", "y")) if op in ("eigh", "dilation_eigh")
                      else P(None, "x", "y"))
 
         def _body(*local_faces):
@@ -246,13 +250,19 @@ def batch_reshard_call(
                 for a in local_faces)
             A = local[0]
 
-            if op == "eigh":
+            if op in ("eigh", "dilation_eigh"):
+                if op == "dilation_eigh":
+                    from distrib_la.polar import _hermitian_dilation, _dilation_vectors
+                    n = A.shape[-1]
+                    A = _hermitian_dilation(A)
                 if batch_pad:
                     W, Z = _dense_real_rows(
-                        op, A, nbatch=nbatch, py=py)
+                        "eigh", A, nbatch=nbatch, py=py)
                 else:
                     W, Z = jnp.linalg.eigh(A)
                 W = _replicate_batch_vector(W, px=px, py=py)[:nbatch]
+                if op == "dilation_eigh":
+                    _, Z = _dilation_vectors(Z, n)
                 Z = _batch_to_face(Z, px=px, py=py)[:nbatch]
                 return W, Z
             if op == "cholesky":

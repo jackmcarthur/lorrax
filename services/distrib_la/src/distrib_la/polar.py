@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la.plan import Plan, plan
+from distrib_la.plan import Plan, plan, ROUTE_BATCH_RESHARD
 from distrib_la.resolve import mesh_key
 
 __all__ = ["PolarPlan", "plan_polar_factor", "polar_factor",
@@ -38,16 +38,25 @@ _KERNEL_CACHE: dict[tuple, Callable] = {}
 _PLAN_CACHE: dict[tuple, "PolarPlan"] = {}
 
 
-def _dilation_svd(A, eigh):
-    """Extract ascending singular triplets from [[0,A],[A.H,0]]."""
+def _hermitian_dilation(A):
+    """Form [[0,A],[A.H,0]] without changing the input matrix extent."""
     n = A.shape[-1]
     upper = jnp.pad(A, ((0, 0),) * (A.ndim - 2) + ((0, n), (n, 0)))
-    H = upper + jnp.conj(jnp.swapaxes(upper, -1, -2))
-    evals, Q = eigh(H)
+    return upper + jnp.conj(jnp.swapaxes(upper, -1, -2))
+
+
+def _dilation_vectors(Q, n):
+    """Extract U,V from the positive half of the dilation eigenvectors."""
     positive = Q[..., n:]
-    root2 = jnp.asarray(math.sqrt(2.0), dtype=A.dtype)
-    return (jnp.maximum(evals[..., n:], 0), root2 * positive[..., :n, :],
-            root2 * positive[..., n:, :])
+    root2 = jnp.asarray(math.sqrt(2.0), dtype=Q.dtype)
+    return root2 * positive[..., :n, :], root2 * positive[..., n:, :]
+
+
+def _dilation_svd(A, eigh):
+    """Extract ascending singular triplets from [[0,A],[A.H,0]]."""
+    evals, Q = eigh(_hermitian_dilation(A))
+    u, v = _dilation_vectors(Q, A.shape[-1])
+    return jnp.maximum(evals[..., A.shape[-1]:], 0), u, v
 
 
 def _close_spectral_cut(values, count, tolerance):
@@ -117,6 +126,15 @@ def _direction_svd_kernel(eigh_plan, ndim):
 
     @jax.jit(out_shardings=(NamedSharding(eigh_plan.mesh, P()), tile))
     def extract(w):
+        if eigh_plan.batched_route == ROUTE_BATCH_RESHARD:
+            from distrib_la._batch_reshard import batch_reshard_call
+            # Move W and V; the unchanged 2m eigensystem stays q-local.
+            evals, v = batch_reshard_call(
+                "dilation_eigh", eigh_plan.mesh,
+                (w if w.ndim == 3 else w[None],))
+            if w.ndim == 2:
+                evals, v = evals[0], v[0]
+            return jnp.maximum(evals[..., w.shape[-1]:], 0), v
         s, _, v = _dilation_svd(w, eigh)
         return s, v
 
