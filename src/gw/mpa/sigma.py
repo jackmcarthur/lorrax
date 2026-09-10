@@ -255,75 +255,79 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     and summation order, never the number of spatial calls. Factor arrays
     live only in this stage closure, never in a global executable cache.
     """
-    from functools import partial
-    from file_io.shared_pole_store import read_shared_pole_faces
+    timing.fence('tau.synthesis_plan', sync_ranks=True)
+    with timing.section('tau.synthesis_plan'):
+        from functools import partial
+        from file_io.shared_pole_store import read_shared_pole_faces
 
-    if schedule["status"] != "PASS":
-        raise ValueError("GATE shared_pole_capacity: an admitted schedule is required")
-    nq = int(header["n_q_irr"])
-    kmax = int(header["Kmax"])
-    bcap, ccap = int(schedule["parent_capacity"]), int(schedule["column_capacity"])
-    if bcap < 1 or ccap < 1:
-        raise ValueError("shared-pole panel capacities must be positive")
-    if kmax == 0:
-        shape = (int(header["n_q_full"]), meta.mu_basis.n_packed, meta.mu_basis.n_packed)
-        zero = jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
-                       out_shardings=NamedSharding(mesh_xy, P(None,"x","y")))
-        return lambda *_args: zero()
-    panels = []
-    for lo in range(0, nq, bcap):
-        hi = min(lo + bcap, nq)
-        tables = _shared_pole_panel_tables(meta, header, (lo, hi), mesh_xy=mesh_xy)
-        local = all(c["is_local"] for c in tables["certificates"].values())
-        if local:
-            rows, unfold = _shared_pole_panel_unfold(
-                meta, header, (lo, hi), mesh_xy=mesh_xy, tables=tables)
-            # One compiled body owns phase, both orientations and local
-            # unfold. Its actual buffer assignment is queried before I/O.
-            def local_body(X,Y,poles2,ranges,e,t,unfold=unfold):
-                plus,transposed = synthesize_shared_pole_parents(
-                    X,Y,poles2,ranges,e,t,mesh_xy=mesh_xy)
-                return unfold(plus,transposed)
-            kernel = jax.jit(local_body)
-            widths = sorted({min(ccap,kmax-c0) for c0 in range(0,kmax,ccap)})
-            for width in widths:
-                from runtime.aot_memory import aot_kernel_peak_bytes
-                def abstract(shape,dtype,spec):
-                    return jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh_xy,spec))
-                shape = (hi-lo,meta.mu_basis.n_packed,int(header["nspinor"]),width)
-                compiled = kernel.lower(
-                    abstract(shape,np.complex128,P(None,"x",None,None)),
-                    abstract(shape,np.complex128,P(None,"y",None,None)),
-                    abstract((hi-lo,width),np.float64,P()),
-                    abstract((hi-lo,2),np.int32,P()),
-                    abstract((),np.float64,P()),abstract((),np.complex128,P())).compile()
-                peak = aot_kernel_peak_bytes(compiled)
-                row = dict(parent_span=[lo,hi],column_width=width,
-                           compiled_bytes_per_rank=peak.total,
-                           output_bytes_per_rank=compiled.memory_analysis().output_size_in_bytes,
-                           cufft_measured=peak.cufft_measured)
-                schedule.setdefault("compiled_panels",[]).append(row)
-                if "capacity_receipt" in schedule:
-                    if not peak.cufft_measured:
-                        raise ValueError("shared-pole synthesis native FFT workspace query unavailable")
-                    meta.shared_pole_capacity.reserve(
-                        f"sigma.synthesis.compiled.{lo}.{hi}.{width}",
-                        resident_bytes_per_rank=0,workspace_bytes_per_rank=peak.total,
-                        concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
-            schedule["compiled_peak_status"] = "PASS"
-        else:
-            rows = tables["rows"]
-            # The service accepts traced faces. Bind the immutable map once
-            # per current-map panel, and reuse its executable at every tau.
-            kernel = jax.jit(partial(
-                _shared_pole_routed_synthesis, meta=meta, header=header,
-                tables=tables, endpoint_budgets=schedule["endpoint_budgets"],
-                mesh_xy=mesh_xy))
-        panels.append((lo, hi, device_put_process_local(
-            rows, NamedSharding(mesh_xy, P())), kernel, tables))
-    resident = None
-    if bcap >= nq and ccap >= kmax:
-        resident = read_shared_pole_faces(io, (0, nq), meta=meta, header=header)
+        if schedule["status"] != "PASS":
+            raise ValueError("GATE shared_pole_capacity: an admitted schedule is required")
+        nq = int(header["n_q_irr"])
+        kmax = int(header["Kmax"])
+        bcap, ccap = int(schedule["parent_capacity"]), int(schedule["column_capacity"])
+        if bcap < 1 or ccap < 1:
+            raise ValueError("shared-pole panel capacities must be positive")
+        if kmax == 0:
+            shape = (int(header["n_q_full"]), meta.mu_basis.n_packed, meta.mu_basis.n_packed)
+            zero = jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
+                           out_shardings=NamedSharding(mesh_xy, P(None,"x","y")))
+            return lambda *_args: zero()
+        panels = []
+        for lo in range(0, nq, bcap):
+            hi = min(lo + bcap, nq)
+            tables = _shared_pole_panel_tables(meta, header, (lo, hi), mesh_xy=mesh_xy)
+            local = all(c["is_local"] for c in tables["certificates"].values())
+            if local:
+                rows, unfold = _shared_pole_panel_unfold(
+                    meta, header, (lo, hi), mesh_xy=mesh_xy, tables=tables)
+                # One compiled body owns phase, both orientations and local
+                # unfold. Its actual buffer assignment is queried before I/O.
+                def local_body(X,Y,poles2,ranges,e,t,unfold=unfold):
+                    plus,transposed = synthesize_shared_pole_parents(
+                        X,Y,poles2,ranges,e,t,mesh_xy=mesh_xy)
+                    return unfold(plus,transposed)
+                kernel = jax.jit(local_body)
+                widths = sorted({min(ccap,kmax-c0) for c0 in range(0,kmax,ccap)})
+                for width in widths:
+                    from runtime.aot_memory import aot_kernel_peak_bytes
+                    def abstract(shape,dtype,spec):
+                        return jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh_xy,spec))
+                    shape = (hi-lo,meta.mu_basis.n_packed,int(header["nspinor"]),width)
+                    compiled = kernel.lower(
+                        abstract(shape,np.complex128,P(None,"x",None,None)),
+                        abstract(shape,np.complex128,P(None,"y",None,None)),
+                        abstract((hi-lo,width),np.float64,P()),
+                        abstract((hi-lo,2),np.int32,P()),
+                        abstract((),np.float64,P()),abstract((),np.complex128,P())).compile()
+                    peak = aot_kernel_peak_bytes(compiled)
+                    row = dict(parent_span=[lo,hi],column_width=width,
+                               compiled_bytes_per_rank=peak.total,
+                               output_bytes_per_rank=compiled.memory_analysis().output_size_in_bytes,
+                               cufft_measured=peak.cufft_measured)
+                    schedule.setdefault("compiled_panels",[]).append(row)
+                    if "capacity_receipt" in schedule:
+                        if not peak.cufft_measured:
+                            raise ValueError("shared-pole synthesis native FFT workspace query unavailable")
+                        meta.shared_pole_capacity.reserve(
+                            f"sigma.synthesis.compiled.{lo}.{hi}.{width}",
+                            resident_bytes_per_rank=0,workspace_bytes_per_rank=peak.total,
+                            concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
+                schedule["compiled_peak_status"] = "PASS"
+            else:
+                rows = tables["rows"]
+                # The service accepts traced faces. Bind the immutable map once
+                # per current-map panel, and reuse its executable at every tau.
+                kernel = jax.jit(partial(
+                    _shared_pole_routed_synthesis, meta=meta, header=header,
+                    tables=tables, endpoint_budgets=schedule["endpoint_budgets"],
+                    mesh_xy=mesh_xy))
+            panels.append((lo, hi, device_put_process_local(
+                rows, NamedSharding(mesh_xy, P())), kernel, tables))
+    timing.fence('tau.factor_read', sync_ranks=True)
+    with timing.section('tau.factor_read'):
+        resident = None
+        if bcap >= nq and ccap >= kmax:
+            resident = read_shared_pole_faces(io, (0, nq), meta=meta, header=header)
     shape = (int(header["n_q_full"]), meta.mu_basis.n_packed, meta.mu_basis.n_packed)
     sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
     zeros = jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=sharding)
@@ -339,77 +343,81 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
 
     def build(_residues, _omega_fields, indices, bounds, _phase_real, E_ref_B, t_node):
         nonlocal cached_indices, cached_bounds, cached_intervals
-        # Fixed-q projection remains in the symmetry owner. The extra tau=1
-        # diagnostic replay is covered by the fixed-q acceptance tests.
-        if indices is not cached_indices or bounds is not cached_bounds:
-            cached_intervals = shared_pole_intervals(
-                frequencies, np.asarray(jax.device_get(indices)),
-                np.asarray(jax.device_get(bounds)))
-            cached_indices, cached_bounds = indices, bounds
-        intervals = cached_intervals
-        total = None
-        for lo, hi, rows, unfold, tables in panels:
-            for c0 in range(0, kmax, ccap):
-                c1 = min(c0 + ccap, kmax)
-                selected = np.clip(intervals[lo:hi] - c0, 0, c1 - c0)
-                if not np.any(selected[:, 1] > selected[:, 0]):
-                    continue
-                faces = resident if resident is not None else read_shared_pole_faces(
-                    io, (lo, hi), meta=meta, header=header, column_span=(c0, c1))
-                X, Y, poles2, _counts = faces
-                ranges = device_put_process_local(selected, NamedSharding(mesh_xy, P()))
-                # Slice inside the compiled panel body: no extra resident
-                # factor views, and the GEMMs see only this window's live
-                # column envelope instead of multiplying zero-weight tails.
-                live = selected[:, 1] > selected[:, 0]
-                first = int(np.min(selected[live, 0]))
-                last = int(np.max(selected[live, 1]))
-                key = (lo, hi, c1-c0, first, last)
-                kernel = unfold
-                if (first, last) != (0, c1-c0):
-                    if key not in compact_kernels:
-                        def compact_body(X, Y, poles2, ranges, e, t,
-                                         first=first, last=last, unfold=unfold):
-                            return unfold(
-                                X[..., first:last], Y[..., first:last],
-                                poles2[:, first:last], ranges-first, e, t)
-                        compact = jax.jit(compact_body)
-                        from runtime.aot_memory import aot_kernel_peak_bytes
-                        compiled = compact.lower(
-                            X,Y,poles2,ranges,E_ref_B,t_node).compile()
-                        peak = aot_kernel_peak_bytes(compiled)
-                        schedule.setdefault("compiled_compact_panels", []).append(dict(
-                            parent_span=[lo,hi], input_columns=c1-c0,
-                            column_span=[first,last],
-                            compiled_bytes_per_rank=peak.total,
-                            cufft_measured=peak.cufft_measured))
-                        if "capacity_receipt" in schedule:
-                            if not peak.cufft_measured:
-                                raise ValueError("shared-pole compact synthesis workspace query unavailable")
-                            meta.shared_pole_capacity.reserve(
-                                f"sigma.compact.{lo}.{hi}.{c1-c0}.{first}.{last}",
-                                resident_bytes_per_rank=0, workspace_bytes_per_rank=peak.total,
-                                concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
-                        compact_kernels[key] = compact
-                    kernel = compact_kernels[key]
-                child = kernel(X,Y,poles2,ranges,E_ref_B,t_node)
-                if resident is None:
-                    child.block_until_ready()
-                del faces, X, Y, poles2, _counts, ranges
-                if total is None and lo == 0 and hi == nq:
-                    # All children are in canonical full-q order. Avoid a
-                    # redundant zero buffer in the resident all-parent case.
-                    total = child
-                else:
-                    if total is None:
-                        total = zeros()
-                    total = add_panel(total, rows, child)
-                # Complete this panel before the next collective read can
-                # allocate another face carrier (the admitted live set is one).
-                if resident is None:
-                    total.block_until_ready()
-                del child
-        return zeros() if total is None else total
+        timing.fence("tau.W_synthesis")
+        with timing.section("tau.W_synthesis"):
+            # Fixed-q projection remains in the symmetry owner. The extra tau=1
+            # diagnostic replay is covered by the fixed-q acceptance tests.
+            if indices is not cached_indices or bounds is not cached_bounds:
+                cached_intervals = shared_pole_intervals(
+                    frequencies, np.asarray(jax.device_get(indices)),
+                    np.asarray(jax.device_get(bounds)))
+                cached_indices, cached_bounds = indices, bounds
+            intervals = cached_intervals
+            total = None
+            for lo, hi, rows, unfold, tables in panels:
+                for c0 in range(0, kmax, ccap):
+                    c1 = min(c0 + ccap, kmax)
+                    selected = np.clip(intervals[lo:hi] - c0, 0, c1 - c0)
+                    if not np.any(selected[:, 1] > selected[:, 0]):
+                        continue
+                    faces = resident if resident is not None else read_shared_pole_faces(
+                        io, (lo, hi), meta=meta, header=header, column_span=(c0, c1))
+                    X, Y, poles2, _counts = faces
+                    ranges = device_put_process_local(selected, NamedSharding(mesh_xy, P()))
+                    # Slice inside the compiled panel body: no extra resident
+                    # factor views, and the GEMMs see only this window's live
+                    # column envelope instead of multiplying zero-weight tails.
+                    live = selected[:, 1] > selected[:, 0]
+                    first = int(np.min(selected[live, 0]))
+                    last = int(np.max(selected[live, 1]))
+                    key = (lo, hi, c1-c0, first, last)
+                    kernel = unfold
+                    if (first, last) != (0, c1-c0):
+                        if key not in compact_kernels:
+                            def compact_body(X, Y, poles2, ranges, e, t,
+                                             first=first, last=last, unfold=unfold):
+                                return unfold(
+                                    X[..., first:last], Y[..., first:last],
+                                    poles2[:, first:last], ranges-first, e, t)
+                            compact = jax.jit(compact_body)
+                            from runtime.aot_memory import aot_kernel_peak_bytes
+                            compiled = compact.lower(
+                                X,Y,poles2,ranges,E_ref_B,t_node).compile()
+                            peak = aot_kernel_peak_bytes(compiled)
+                            schedule.setdefault("compiled_compact_panels", []).append(dict(
+                                parent_span=[lo,hi], input_columns=c1-c0,
+                                column_span=[first,last],
+                                compiled_bytes_per_rank=peak.total,
+                                cufft_measured=peak.cufft_measured))
+                            if "capacity_receipt" in schedule:
+                                if not peak.cufft_measured:
+                                    raise ValueError("shared-pole compact synthesis workspace query unavailable")
+                                meta.shared_pole_capacity.reserve(
+                                    f"sigma.compact.{lo}.{hi}.{c1-c0}.{first}.{last}",
+                                    resident_bytes_per_rank=0, workspace_bytes_per_rank=peak.total,
+                                    concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
+                            compact_kernels[key] = compact
+                        kernel = compact_kernels[key]
+                    child = kernel(X,Y,poles2,ranges,E_ref_B,t_node)
+                    if resident is None:
+                        child.block_until_ready()
+                    del faces, X, Y, poles2, _counts, ranges
+                    if total is None and lo == 0 and hi == nq:
+                        # All children are in canonical full-q order. Avoid a
+                        # redundant zero buffer in the resident all-parent case.
+                        total = child
+                    else:
+                        if total is None:
+                            total = zeros()
+                        total = add_panel(total, rows, child)
+                    # Complete this panel before the next collective read can
+                    # allocate another face carrier (the admitted live set is one).
+                    if resident is None:
+                        total.block_until_ready()
+                    del child
+            result = zeros() if total is None else total
+            jax.block_until_ready(result)
+            return result
 
     return build
 
@@ -762,137 +770,139 @@ def _integrate_sigma_batches(
     print_fn,
 ):
     """One spatial executor for streamed fit slabs."""
-    omega = np.asarray(omega_grid_ry, np.float64)
-    if omega.ndim != 1 or not omega.size:
-        raise ValueError("omega_grid_ry must be a nonempty vector")
-    debug_max_tau = _resolve_debug_max_tau_dispatches(print_fn=print_fn)
-    tau_profile = env_bool(
-        "LORRAX_SIGMA_TAU_TIMING", False, print_fn=print_fn)
+    timing.fence('tau.setup', sync_ranks=True)
+    with timing.section('tau.setup'):
+        omega = np.asarray(omega_grid_ry, np.float64)
+        if omega.ndim != 1 or not omega.size:
+            raise ValueError("omega_grid_ry must be a nonempty vector")
+        debug_max_tau = _resolve_debug_max_tau_dispatches(print_fn=print_fn)
+        tau_profile = env_bool(
+            "LORRAX_SIGMA_TAU_TIMING", False, print_fn=print_fn)
 
-    s = wfns.slices
-    sigma_axis = sigma_band_axis(
-        int(s.nb_sigma), mesh_xy, ansatz="dynamic")
-    bracketed = brackets is not None
-    if bracketed:
-        brackets = tuple(
-            (int(lo), None if hi is None else int(hi))
-            for lo, hi in brackets)
-        if not brackets:
-            raise ValueError("MPA Sigma band-bracket plan must be nonempty")
-    face_kwargs = sigma_face_kernel_kwargs(wfns)
-    k_unfold_plan = face_kwargs.get("k_unfold_plan")
-    if wfns.layout == "legacy":
-        # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded
-        # extent.  Identical on an unsplit deck.  UNVERIFIED on a split
-        # one: the public MPA Σ still refuses to run (gw_config.
-        # ComputeMode), so this line is wired for consistency and has
-        # never executed under a split.
-        state_slice = s.full if bracketed else s.sigma_sum
-        psi_coh_xn, psi_coh_yr = wfns.xn(state_slice), wfns.yr(state_slice)
-        psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
-        psi_proj_xr = pad_to_axis(
-            psi_proj_xr, sigma_axis, axis=1)
-        psi_proj_yn = pad_to_axis(
-            psi_proj_yn, sigma_axis, axis=3)
-        spatial_shape = (int(psi_proj_xr.shape[0]),
-                         int(psi_proj_xr.shape[1]),
-                         int(psi_proj_yn.shape[3]))
-    else:
-        # Face carrier (2026-08-22, mechanical port sharing
-        # ppm_tau_kernel's face dispatch — see gw.ppm_sigma._run_sigma_
-        # branch's identically-shaped docstring): psi_mun/psi_nmu are used
-        # UNSLICED for both roles — the accumulator BUILDS at the mesh-
-        # divisible nb_full extent regardless of nb_sigma, and always
-        # will: contract_bands.contract_bands_block_reshard's face arm
-        # The face projector's GEMM plan now takes the requested projection
-        # carrier separately from the resident full-band face.  The producer
-        # selects the logical Sigma window, appends exact-zero rows to the
-        # runtime-owned carrier, and the accumulator is born at that carrier
-        # width.  It stays there until a logical output consumer strips by
-        # ``sigma_axis``; no nondivisible sharded array is ever published.
-        # The projection operands default to the full-k faces; the parent
-        # route below replaces both roles with the parent faces.
-        psi_proj_xr, psi_proj_yn = wfns.psi_nmu, wfns.psi_mun
-        if k_unfold_plan is not None:
-            # Raw parents only: the parent faces feed the G contraction (the
-            # plan transports G to full k) and the projection (the spatial
-            # tail selects, projects, broadcasts).  Bracket packing is not
-            # combined with the route.
-            (psi_coh_xn, psi_coh_yr,
-             psi_proj_xr, psi_proj_yn, _, _) = parent_sigma_operands(wfns)
-            pack_brackets = False
-        elif bracketed and len(brackets) > 1:
-            from gw.wavefunction_bundle import pack_band_window
-            packed = [pack_band_window(wfns, lo, hi, mesh_xy=mesh_xy)
-                      for lo, hi in brackets]
-            psi_coh_xn = tuple(pair[0] for pair in packed)
-            psi_coh_yr = tuple(pair[1] for pair in packed)
-            pack_brackets = True
+        s = wfns.slices
+        sigma_axis = sigma_band_axis(
+            int(s.nb_sigma), mesh_xy, ansatz="dynamic")
+        bracketed = brackets is not None
+        if bracketed:
+            brackets = tuple(
+                (int(lo), None if hi is None else int(hi))
+                for lo, hi in brackets)
+            if not brackets:
+                raise ValueError("MPA Sigma band-bracket plan must be nonempty")
+        face_kwargs = sigma_face_kernel_kwargs(wfns)
+        k_unfold_plan = face_kwargs.get("k_unfold_plan")
+        if wfns.layout == "legacy":
+            # ``sigma_sum``, not ``full`` — the Σ band sum, not the loaded
+            # extent.  Identical on an unsplit deck.  UNVERIFIED on a split
+            # one: the public MPA Σ still refuses to run (gw_config.
+            # ComputeMode), so this line is wired for consistency and has
+            # never executed under a split.
+            state_slice = s.full if bracketed else s.sigma_sum
+            psi_coh_xn, psi_coh_yr = wfns.xn(state_slice), wfns.yr(state_slice)
+            psi_proj_xr, psi_proj_yn = wfns.xr(s.sigma), wfns.yn(s.sigma)
+            psi_proj_xr = pad_to_axis(
+                psi_proj_xr, sigma_axis, axis=1)
+            psi_proj_yn = pad_to_axis(
+                psi_proj_yn, sigma_axis, axis=3)
+            spatial_shape = (int(psi_proj_xr.shape[0]),
+                             int(psi_proj_xr.shape[1]),
+                             int(psi_proj_yn.shape[3]))
         else:
-            psi_coh_xn, psi_coh_yr = wfns.psi_mun, wfns.psi_nmu
+            # Face carrier (2026-08-22, mechanical port sharing
+            # ppm_tau_kernel's face dispatch — see gw.ppm_sigma._run_sigma_
+            # branch's identically-shaped docstring): psi_mun/psi_nmu are used
+            # UNSLICED for both roles — the accumulator BUILDS at the mesh-
+            # divisible nb_full extent regardless of nb_sigma, and always
+            # will: contract_bands.contract_bands_block_reshard's face arm
+            # The face projector's GEMM plan now takes the requested projection
+            # carrier separately from the resident full-band face.  The producer
+            # selects the logical Sigma window, appends exact-zero rows to the
+            # runtime-owned carrier, and the accumulator is born at that carrier
+            # width.  It stays there until a logical output consumer strips by
+            # ``sigma_axis``; no nondivisible sharded array is ever published.
+            # The projection operands default to the full-k faces; the parent
+            # route below replaces both roles with the parent faces.
+            psi_proj_xr, psi_proj_yn = wfns.psi_nmu, wfns.psi_mun
+            if k_unfold_plan is not None:
+                # Raw parents only: the parent faces feed the G contraction (the
+                # plan transports G to full k) and the projection (the spatial
+                # tail selects, projects, broadcasts).  Bracket packing is not
+                # combined with the route.
+                (psi_coh_xn, psi_coh_yr,
+                 psi_proj_xr, psi_proj_yn, _, _) = parent_sigma_operands(wfns)
+                pack_brackets = False
+            elif bracketed and len(brackets) > 1:
+                from gw.wavefunction_bundle import pack_band_window
+                packed = [pack_band_window(wfns, lo, hi, mesh_xy=mesh_xy)
+                          for lo, hi in brackets]
+                psi_coh_xn = tuple(pair[0] for pair in packed)
+                psi_coh_yr = tuple(pair[1] for pair in packed)
+                pack_brackets = True
+            else:
+                psi_coh_xn, psi_coh_yr = wfns.psi_mun, wfns.psi_nmu
+                pack_brackets = False
+            psi_proj_xr = pad_to_axis(
+                psi_proj_xr, sigma_axis, axis=1)
+            psi_proj_yn = pad_to_axis(
+                psi_proj_yn, sigma_axis, axis=3)
+            spatial_shape = (
+                int(meta.nk_tot), sigma_axis.carrier, sigma_axis.carrier)
+            face_kwargs["face_band_extent"] = sigma_axis.carrier
+        if wfns.layout == "legacy":
             pack_brackets = False
-        psi_proj_xr = pad_to_axis(
-            psi_proj_xr, sigma_axis, axis=1)
-        psi_proj_yn = pad_to_axis(
-            psi_proj_yn, sigma_axis, axis=3)
-        spatial_shape = (
-            int(meta.nk_tot), sigma_axis.carrier, sigma_axis.carrier)
-        face_kwargs["face_band_extent"] = sigma_axis.carrier
-    if wfns.layout == "legacy":
-        pack_brackets = False
-    if bracketed:
-        shape = (len(brackets), omega.size, *spatial_shape)
-        output_sharding = NamedSharding(
-            mesh_xy, P(None, None, None, "x", "y"))
-        sigma_shape = (len(brackets), *spatial_shape)
-        sigma_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
-    else:
-        shape = (omega.size, *spatial_shape)
-        output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
-        sigma_shape = spatial_shape
-        sigma_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
-    accumulator = DeviceOmegaAccumulator(
-        omega, shape=shape, sharding=output_sharding,
-        omega_axis=1 if bracketed else 0)
-    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    tau_kernel = get_shared_sigma_tau_kernel(
-        mesh_xy=mesh_xy,
-        kgrid=kgrid,
-        brackets=brackets,
-        pack_brackets=pack_brackets,
-        w_synthesis=w_synthesis,
-        **face_kwargs)
-    small = NamedSharding(mesh_xy, P())
+        if bracketed:
+            shape = (len(brackets), omega.size, *spatial_shape)
+            output_sharding = NamedSharding(
+                mesh_xy, P(None, None, None, "x", "y"))
+            sigma_shape = (len(brackets), *spatial_shape)
+            sigma_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+        else:
+            shape = (omega.size, *spatial_shape)
+            output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+            sigma_shape = spatial_shape
+            sigma_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+        accumulator = DeviceOmegaAccumulator(
+            omega, shape=shape, sharding=output_sharding,
+            omega_axis=1 if bracketed else 0)
+        kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+        tau_kernel = get_shared_sigma_tau_kernel(
+            mesh_xy=mesh_xy,
+            kgrid=kgrid,
+            brackets=brackets,
+            pack_brackets=pack_brackets,
+            w_synthesis=w_synthesis,
+            **face_kwargs)
+        small = NamedSharding(mesh_xy, P())
 
-    n_sweeps = n_tau = 0
-    logical_tau_pairs = 0
-    batch_size = int(pole_batch_size)
-    sweep_started = False
-    max_b = max_d = 0.0
-    # The same bar as the zeta fit and the W roles (common.progress); the
-    # step count is exact because window/batch membership is a pure function
-    # of the pole ranges the sweep will visit.  Owner request 2026-09-03.
-    total_tau = 0
-    if w_synthesis is not None:
-        # All parent/column panels finish W inside each tau call. They are
-        # storage work, never additional state-pole product windows.
-        total_tau = sum(len(np.asarray(row.window.nodes.t)) for row in plan)
-    else:
-        for _lo in range(0, int(n_poles), batch_size):
-            _batch = tuple(range(_lo, min(_lo + batch_size, int(n_poles))))
-            for _row in plan:
-                if _batch_rows(_row, _batch) is not None:
-                    total_tau += len(np.asarray(_row.window.nodes.t))
-    progress_total = (
-        total_tau if debug_max_tau is None
-        else min(total_tau, debug_max_tau))
-    progress = LoopProgress(
-        max(1, progress_total), print_fn, title="Sigma tau sweep",
-        item_name="tau node", max_updates=20)
-    progress.start()
-    profile_before = None
-    sweep_wall_start = None
-    stop_probe = False
+        n_sweeps = n_tau = 0
+        logical_tau_pairs = 0
+        batch_size = int(pole_batch_size)
+        sweep_started = False
+        max_b = max_d = 0.0
+        # The same bar as the zeta fit and the W roles (common.progress); the
+        # step count is exact because window/batch membership is a pure function
+        # of the pole ranges the sweep will visit.  Owner request 2026-09-03.
+        total_tau = 0
+        if w_synthesis is not None:
+            # All parent/column panels finish W inside each tau call. They are
+            # storage work, never additional state-pole product windows.
+            total_tau = sum(len(np.asarray(row.window.nodes.t)) for row in plan)
+        else:
+            for _lo in range(0, int(n_poles), batch_size):
+                _batch = tuple(range(_lo, min(_lo + batch_size, int(n_poles))))
+                for _row in plan:
+                    if _batch_rows(_row, _batch) is not None:
+                        total_tau += len(np.asarray(_row.window.nodes.t))
+        progress_total = (
+            total_tau if debug_max_tau is None
+            else min(total_tau, debug_max_tau))
+        progress = LoopProgress(
+            max(1, progress_total), print_fn, title="Sigma tau sweep",
+            item_name="tau node", max_updates=20)
+        progress.start()
+        profile_before = None
+        sweep_wall_start = None
+        stop_probe = False
     for lo, Omega, B, B_odd in batches:
         if w_synthesis is None and getattr(meta, 'mu_basis', None) is not None:
             # The pole store keeps the canonical centroid order; the run
@@ -921,98 +931,89 @@ def _integrate_sigma_batches(
                 if w_synthesis is not None else _batch_rows(row, batch))
             if selected is None:
                 continue
-            pole_indices, bounds, phase_real, _states = selected
-            pole_indices, bounds, phase_real = (
-                device_put_process_local(x, small)
-                for x in (pole_indices, bounds, phase_real))
-            win = row.window
-            B_branch = (None if w_synthesis is not None else
-                        _residue_for_space(row.space, B, B_odd))
-            weight = getattr(row, "band_weight", None)
-            if weight is None:
-                selector = jnp.asarray(win.mask_A)
-            else:
-                selector = (jnp.asarray(win.mask_A, jnp.float64)
-                            * jnp.reshape(
-                                jnp.asarray(weight, jnp.float64),
-                                np.asarray(win.mask_A).shape))
-            E_A_call = row.E_A
-            if k_unfold_plan is not None:
-                # The G contraction runs on the raw parents: its energy and
-                # selector tables are the parents' rows of the star-invariant
-                # full-k tables (one child per raw row, plan.parent_rows).
-                E_A_call = k_unfold_plan.parent_rows(row.E_A)
-                selector = k_unfold_plan.parent_rows(
-                    jnp.reshape(selector, np.shape(row.E_A)))
+            timing.fence('tau.window_arguments', sync_ranks=True)
+            with timing.section('tau.window_arguments'):
+                pole_indices, bounds, phase_real, _states = selected
+                pole_indices, bounds, phase_real = (
+                    device_put_process_local(x, small)
+                    for x in (pole_indices, bounds, phase_real))
+                win = row.window
+                B_branch = (None if w_synthesis is not None else
+                            _residue_for_space(row.space, B, B_odd))
+                weight = getattr(row, "band_weight", None)
+                if weight is None:
+                    selector = jnp.asarray(win.mask_A)
+                else:
+                    selector = (jnp.asarray(win.mask_A, jnp.float64)
+                                * jnp.reshape(
+                                    jnp.asarray(weight, jnp.float64),
+                                    np.asarray(win.mask_A).shape))
+                E_A_call = row.E_A
+                if k_unfold_plan is not None:
+                    # The G contraction runs on the raw parents: its energy and
+                    # selector tables are the parents' rows of the star-invariant
+                    # full-k tables (one child per raw row, plan.parent_rows).
+                    E_A_call = k_unfold_plan.parent_rows(row.E_A)
+                    selector = k_unfold_plan.parent_rows(
+                        jnp.reshape(selector, np.shape(row.E_A)))
             if not sweep_started:
-                first_t = np.asarray(
-                    jax.device_get(win.nodes.t), np.complex128)[0]
-                prewarm_args = (
-                    psi_coh_xn, psi_coh_yr,
-                    psi_proj_xr, psi_proj_yn,
-                    E_A_call, selector, B_branch, Omega,
-                    pole_indices, bounds, phase_real,
-                    jnp.asarray(win.E_ref_A),
-                    jnp.asarray(win.E_ref_B),
-                    jnp.asarray(first_t, dtype=jnp.complex128))
-                if w_synthesis is not None:
-                    inherited = _shared_pole_inherited_peak(
-                        prewarm_args,meta,mesh_xy=mesh_xy,kgrid=kgrid,
-                        brackets=brackets,pack_brackets=pack_brackets,
-                        face_kwargs=face_kwargs)
-                    print_fn(f"  shared-pole inherited Sigma peak: {inherited}")
-                if hasattr(tau_kernel, "lower"):
-                    tau_kernel.lower(*prewarm_args).compile()
-                else:
-                    # The stage-split diagnostic is a Python dispatcher over
-                    # separately-jitted stages.  Execute one real-shape call
-                    # to prewarm the same kernels the timed sweep will use.
-                    jax.block_until_ready(tau_kernel(*prewarm_args))
-                accumulator.precompile_tau_add(
-                    sigma_shape=sigma_shape,
-                    sigma_sharding=sigma_sharding)
-                print_fn(
-                    "  MPA Sigma sweep begin: shared pane tau kernel "
-                    "prewarmed")
-                profile_before = _tau_profile_snapshot()
-                sweep_wall_start = time.perf_counter()
-                sweep_started = True
-            t_nodes = np.asarray(
-                jax.device_get(win.nodes.t), np.complex128)
-            alpha_nodes = np.asarray(
-                jax.device_get(win.nodes.alpha), np.complex128)
-            if debug_max_tau is not None:
-                remaining = debug_max_tau - n_tau
-                if remaining <= 0:
-                    stop_probe = True
-                    break
-                t_nodes = t_nodes[:remaining]
-                alpha_nodes = alpha_nodes[:remaining]
-            accumulator.begin_window(
-                t_nodes, alpha_nodes,
-                omega_sign=win.omega_sign, prefactor=win.prefactor,
-                e_ref_sum=win.E_ref_A + win.E_ref_B,
-                antihermitian=(win.project_code == 1),
-                omega_indices=row.omega_idx,
-                omega_values=row.omega_abs)
+                timing.fence('tau.initial_compile_and_probe', sync_ranks=True)
+                with timing.section('tau.initial_compile_and_probe'):
+                    first_t = np.asarray(
+                        jax.device_get(win.nodes.t), np.complex128)[0]
+                    prewarm_args = (
+                        psi_coh_xn, psi_coh_yr,
+                        psi_proj_xr, psi_proj_yn,
+                        E_A_call, selector, B_branch, Omega,
+                        pole_indices, bounds, phase_real,
+                        jnp.asarray(win.E_ref_A),
+                        jnp.asarray(win.E_ref_B),
+                        jnp.asarray(first_t, dtype=jnp.complex128))
+                    if w_synthesis is not None:
+                        inherited = _shared_pole_inherited_peak(
+                            prewarm_args,meta,mesh_xy=mesh_xy,kgrid=kgrid,
+                            brackets=brackets,pack_brackets=pack_brackets,
+                            face_kwargs=face_kwargs)
+                        print_fn(f"  shared-pole inherited Sigma peak: {inherited}")
+                    if hasattr(tau_kernel, "lower"):
+                        tau_kernel.lower(*prewarm_args).compile()
+                    else:
+                        # The stage-split diagnostic is a Python dispatcher over
+                        # separately-jitted stages.  Execute one real-shape call
+                        # to prewarm the same kernels the timed sweep will use.
+                        jax.block_until_ready(tau_kernel(*prewarm_args))
+                    accumulator.precompile_tau_add(
+                        sigma_shape=sigma_shape,
+                        sigma_sharding=sigma_sharding)
+                    print_fn(
+                        "  MPA Sigma sweep begin: shared pane tau kernel "
+                        "prewarmed")
+                    profile_before = _tau_profile_snapshot()
+                    sweep_wall_start = time.perf_counter()
+                    sweep_started = True
+            timing.fence('tau.window_setup', sync_ranks=True)
+            with timing.section('tau.window_setup'):
+                t_nodes = np.asarray(
+                    jax.device_get(win.nodes.t), np.complex128)
+                alpha_nodes = np.asarray(
+                    jax.device_get(win.nodes.alpha), np.complex128)
+                if debug_max_tau is not None:
+                    remaining = debug_max_tau - n_tau
+                    if remaining <= 0:
+                        stop_probe = True
+                        break
+                    t_nodes = t_nodes[:remaining]
+                    alpha_nodes = alpha_nodes[:remaining]
+                accumulator.begin_window(
+                    t_nodes, alpha_nodes,
+                    omega_sign=win.omega_sign, prefactor=win.prefactor,
+                    e_ref_sum=win.E_ref_A + win.E_ref_B,
+                    antihermitian=(win.project_code == 1),
+                    omega_indices=row.omega_idx,
+                    omega_values=row.omega_abs)
             for t in t_nodes:
-                if tau_profile:
-                    with timing.section("sigma.tau.kernel") as sec:
-                        sigma_tau = tau_kernel(
-                            psi_coh_xn, psi_coh_yr,
-                            psi_proj_xr, psi_proj_yn,
-                            E_A_call, selector, B_branch, Omega,
-                            pole_indices, bounds, phase_real,
-                            jnp.asarray(win.E_ref_A),
-                            jnp.asarray(win.E_ref_B),
-                            jnp.asarray(t, dtype=jnp.complex128))
-                        sec.watch(sigma_tau)
-                    with timing.section("sigma.tau.accumulator") as sec:
-                        accumulated = accumulator.add_tau(sigma_tau)
-                        sec.watch(accumulated)
-                    with timing.section("sigma.tau.progress"):
-                        progress.step()
-                else:
+                timing.fence("tau.kernel")
+                with timing.section("tau.kernel") as sec:
                     sigma_tau = tau_kernel(
                         psi_coh_xn, psi_coh_yr,
                         psi_proj_xr, psi_proj_yn,
@@ -1021,12 +1022,19 @@ def _integrate_sigma_batches(
                         jnp.asarray(win.E_ref_A),
                         jnp.asarray(win.E_ref_B),
                         jnp.asarray(t, dtype=jnp.complex128))
-                    accumulator.add_tau(sigma_tau)
-                    progress.step(wait=sigma_tau)
+                    sec.watch(sigma_tau)
+                timing.fence("tau.accumulator")
+                with timing.section("tau.accumulator") as sec:
+                    sec.watch(accumulator.add_tau(sigma_tau))
+                timing.fence("tau.progress")
+                with timing.section("tau.progress"):
+                    progress.step()
                 n_tau += 1
-            accumulator.end_window()
-            n_sweeps += 1
-            logical_tau_pairs += len(t_nodes)
+            timing.fence('tau.window_finish', sync_ranks=True)
+            with timing.section('tau.window_finish'):
+                accumulator.end_window()
+                n_sweeps += 1
+                logical_tau_pairs += len(t_nodes)
             if debug_max_tau is not None and n_tau >= debug_max_tau:
                 stop_probe = True
                 break
@@ -1053,40 +1061,42 @@ def _integrate_sigma_batches(
             "Sigma/QP output (intentional rc=0).")
         raise SystemExit(0)
 
-    sigma = accumulator.finalize()
-    if bracketed:
-        sigma = jax.jit(
-            lambda values: jnp.cumsum(values, axis=0),
-            out_shardings=sigma.sharding)(sigma)
-        if band_counts is None:
-            band_counts = tuple(
-                int(s.nb_sigma_sum) if hi is None else int(hi)
-                for _lo, hi in brackets)
-        else:
-            band_counts = tuple(int(count) for count in band_counts)
-        if len(band_counts) != len(brackets):
-            raise ValueError(
-                "MPA Sigma band_counts must align with band brackets")
-    transform_saving = int(logical_tau_pairs - n_tau)
-    print_fn(
-        f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
-        f"({n_poles} poles, batches of {batch_size}); "
-        f"{transform_saving} undispatched logical tau; "
-        f"panes and product windows used one shared tau kernel")
-    ratio = None
-    if max_b or max_d:
-        ratio = max_d / max_b if max_b else np.inf
-        state = "DEBUG ODD OFF (D discarded)" if odd_residue_off else "enabled"
+    timing.fence('tau.finalize', sync_ranks=True)
+    with timing.section('tau.finalize'):
+        sigma = accumulator.finalize()
+        if bracketed:
+            sigma = jax.jit(
+                lambda values: jnp.cumsum(values, axis=0),
+                out_shardings=sigma.sharding)(sigma)
+            if band_counts is None:
+                band_counts = tuple(
+                    int(s.nb_sigma_sum) if hi is None else int(hi)
+                    for _lo, hi in brackets)
+            else:
+                band_counts = tuple(int(count) for count in band_counts)
+            if len(band_counts) != len(brackets):
+                raise ValueError(
+                    "MPA Sigma band_counts must align with band brackets")
+        transform_saving = int(logical_tau_pairs - n_tau)
         print_fn(
-            f"  MPA odd Sigma: measured-broken-TR ordered residues; {state}; "
-            f"max|D|/max|B|={ratio:.12e}")
-    return SigmaOmegaResult(
-        omega_ry=omega,
-        omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
-        sigma_c_kij=sigma,
-        band_axis=sigma_axis,
-        band_counts=(() if band_counts is None else tuple(band_counts)),
-        odd_even_residue_ratio=ratio)
+            f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
+            f"({n_poles} poles, batches of {batch_size}); "
+            f"{transform_saving} undispatched logical tau; "
+            f"panes and product windows used one shared tau kernel")
+        ratio = None
+        if max_b or max_d:
+            ratio = max_d / max_b if max_b else np.inf
+            state = "DEBUG ODD OFF (D discarded)" if odd_residue_off else "enabled"
+            print_fn(
+                f"  MPA odd Sigma: measured-broken-TR ordered residues; {state}; "
+                f"max|D|/max|B|={ratio:.12e}")
+        return SigmaOmegaResult(
+            omega_ry=omega,
+            omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
+            sigma_c_kij=sigma,
+            band_axis=sigma_axis,
+            band_counts=(() if band_counts is None else tuple(band_counts)),
+            odd_even_residue_ratio=ratio)
 
 
 def _attach_ordered_odd_sigma(total, even):
@@ -1439,8 +1449,10 @@ def compute_sigma_c_mpa_omega_grid(
                         f"{window['runtime_noise_budget']:.6g}")
         with timing.section("sigma.tau_sweep"):
             if shared_pole:
-                synthesis = _shared_pole_w_synthesis(
-                    reader, meta, ledger, frequencies, schedule, mesh_xy=mesh_xy)
+                timing.fence('tau.synthesis_setup', sync_ranks=True)
+                with timing.section('tau.synthesis_setup'):
+                    synthesis = _shared_pole_w_synthesis(
+                        reader, meta, ledger, frequencies, schedule, mesh_xy=mesh_xy)
                 total = _integrate_sigma_batches(
                     wfns, ((0, None, None, None),), n_poles, plan,
                     omega_grid_ry, meta, mesh_xy, pole_batch_size=n_poles,

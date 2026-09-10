@@ -536,22 +536,6 @@ def _model_diagnostics(model, moments, infinity_directions, *, matmul):
     return result
 
 
-def _timing_fence(next_band):
-    """Drain prior device/effect work before the named host band, then align ranks.
-
-    The device wait belongs to work already submitted by preceding bands, not
-    to ``next_band``. Live-array/effect drains match ACON's fenced census;
-    separate rank waits expose imbalance instead of charging it to host work.
-    No array is gathered or copied. Names must be identical on every rank.
-    """
-    from common.collectives import barrier
-    with timing.section("spole.device_wait." + next_band):
-        jax.block_until_ready(jax.live_arrays())
-        jax.effects_barrier()
-    with timing.section("spole.rank_wait." + next_band):
-        barrier("spole-timing-" + next_band)
-
-
 def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     """Construct and write a current-state, bounded-batch real-pole model.
 
@@ -582,7 +566,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         capacity prices and the store header/digest. Structural failures raise
         before the affected q is written; a partial file is never finalized.
     """
-    _timing_fence("entry")
+    timing.fence("spole.entry")
     with timing.section("spole.entry"):
         import numpy as np
         import jax
@@ -600,7 +584,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         from common.units import RYD_TO_EV
         from gw.w_isdf import response_coulomb_powers
 
-    _timing_fence("setup")
+    timing.fence("spole.setup")
     with timing.section("spole.setup"):
         recipe = meta.shared_pole_recipe
         if int(meta.nspinor) != 1 or not bool(bank["tables"]["sym"].trs_allowed):
@@ -730,19 +714,19 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         batch_limit = mesh_divisor(mesh_xy) if resolution.layout == "local" else 1
         nq = int(header["bank_shape"]["nq"])
     for q_start in range(0, nq, batch_limit):
-        _timing_fence("batch_admission")
+        timing.fence("spole.batch_admission")
         with timing.section("spole.batch_admission"):
             q_stop = min(q_start + batch_limit, nq)
             span = (q_start, q_stop)
             batch_width = q_stop - q_start
             capacity(0, phase="selection")
             expose_live(())
-        _timing_fence("scratch_read")
+        timing.fence("spole.scratch_read")
         with timing.section("spole.scratch_read"):
             with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
                 exact = read_shared_pole_bank(moment_io, span, meta=meta,
                                               header=moment_header, fields=("M1", "M3"))
-        _timing_fence("infinity_selection")
+        timing.fence("spole.infinity_selection")
         with timing.section("spole.infinity_selection"):
             width = min(logical_n, max(1, int(recipe["infinity_width"])))
             qi, infinity_values = distrib_la.leading_eigenvectors(
@@ -752,7 +736,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             infinity = (qi, mm(exact["M1"], qi), mm(exact["M3"], qi))
             del exact
         with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
-            _timing_fence("sample_batch_read")
+            timing.fence("spole.sample_batch_read")
             with timing.section("spole.sample_batch_read"):
                 sample_lo = min(int(i) for i in recipe["fit_ids"])
                 sample_hi = max(int(i) for i in recipe["fit_ids"]) + 1
@@ -768,13 +752,13 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                     index = sample_id - sample_lo
                     return samples["Wc"][:, index], samples["dWc_ds"][:, index]
 
-            _timing_fence("direction_selection")
+            timing.fence("spole.direction_selection")
             with timing.section("spole.direction_selection"):
                 states, masks, roles = _direction_states(
                     read_sample, recipe, eigh_plan=eig, svd_plan=svd, matmul=mm,
                     column_extent=column_extent, logical_n=logical_n, admit=capacity,
                     infinity_carrier=qi.shape[-1])
-        _timing_fence("direction_pack_and_drain")
+        timing.fence("spole.direction_pack_and_drain")
         with timing.section("spole.direction_pack_and_drain"):
             del samples
             for i, values in enumerate(infinity_values):
@@ -790,14 +774,14 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                     for a in (*ii, mask, *(v for st in ss for v in st[1:])))
             batch_results = None
         if resolution.layout == "local":
-            _timing_fence("reduction_admission")
+            timing.fence("spole.reduction_admission")
             with timing.section("spole.reduction_admission"):
                 finite_width = max(sum(st[1].shape[-1] for st in item[1]) for item in pending)
                 infinity_width = max(item[2][0].shape[-1] for item in pending)
                 batch_width = mesh_divisor(mesh_xy)
                 # Reserve the pack/copy plus local pencil before either is built.
                 price = capacity(finite_width + infinity_width, phase="reduction")
-            _timing_fence("panel_pack")
+            timing.fence("spole.panel_pack")
             with timing.section("spole.panel_pack"):
                 packed = pack_parent_panels([(ss, ii, mask) for _, ss, ii, mask, _, _ in pending],
                                             mesh_xy=mesh_xy)
@@ -805,7 +789,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 extents = tuple((sum(st[1].shape[-1] for st in ss), ii[0].shape[-1])
                                 for _, ss, ii, _, _, _ in pending)
                 extents += (extents[-1],) * (batch_width - len(extents))
-            _timing_fence("gram_reduction")
+            timing.fence("spole.gram_reduction")
             with timing.section("spole.gram_reduction"):
                 batch_results = local_parent_reducer(
                     mesh_xy, reduce_eigh.native_fn, extents)(*packed)
@@ -819,7 +803,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                    *(item[4] for item in pending))
         batch_checks = None
         if batch_results is not None:
-            _timing_fence("reduction_admission")
+            timing.fence("spole.reduction_admission")
             with timing.section("spole.reduction_admission"):
                 from gw.shared_pole_local import local_model_checks
                 check_span = (pending[0][0], pending[-1][0]+1)
@@ -828,19 +812,19 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 capacity(batch_results[0][0].shape[-1], phase="model",
                          sample_batch=sample_hi-sample_lo)
                 expose_live(batch_results[0])
-            _timing_fence("coulomb")
+            timing.fence("spole.coulomb")
             with timing.section("spole.coulomb"):
                 coulomb_sqrt, inverse_sqrt, batch_coulomb = response_coulomb_powers(
                     meta, config, mesh_xy=mesh_xy, bank_io=bank, q_span=check_span)
                 del coulomb_sqrt
-            _timing_fence("sample_batch_read")
+            timing.fence("spole.sample_batch_read")
             with timing.section("spole.sample_batch_read"):
                 expose_live((*batch_results[0], inverse_sqrt))
                 with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
                     held_samples = read_shared_pole_bank(
                         bank_io, check_span, meta=meta, header=header,
                         sample_span=(sample_lo, sample_hi), fields=("Wc", "dWc_ds"))
-            _timing_fence("passivity_held")
+            timing.fence("spole.passivity_held")
             with timing.section("spole.passivity_held"):
                 indices = jnp.asarray([i-sample_lo for i in held_ids])
                 supports = jnp.asarray([_sample_point(recipe, i)**2 for i in held_ids])
@@ -855,7 +839,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         pending = []
         ready_models = []
         for slot, (q, states, infinity, active_columns, qi, roles) in enumerate(selected):
-            _timing_fence("gram_reduction")
+            timing.fence("spole.gram_reduction")
             with timing.section("spole.gram_reduction"):
                 span = (q, q + 1)
                 if batch_results is None:
@@ -868,7 +852,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                     model, reduction, zero, retained = jax.tree.map(
                         lambda a: a[slot:slot+1], batch_results)
                 del states, infinity
-            _timing_fence("gates")
+            timing.fence("spole.gates")
             with timing.section("spole.gates"):
                 for name in ("gram_diagonal_positive", "gram_valid", "retained_metric_positive"):
                     if not bool(jnp.all(reduction[name])):
@@ -893,44 +877,44 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 r = model[0].shape[-1]
                 del active_columns
                 capacity(model[0].shape[-1], phase="model")
-            _timing_fence("sort")
+            timing.fence("spole.sort")
             with timing.section("spole.sort"):
                 model, permutation = sort_shared_pole_columns(model, mesh_xy=mesh_xy)
             if batch_checks is None:
-                _timing_fence("coulomb")
+                timing.fence("spole.coulomb")
                 with timing.section("spole.coulomb"):
                     query_workspace("gemm", ((1, n, n), (1, n, n)), eig)
                     capacity(current_side)
                     expose_live((*model, qi))
                     coulomb_sqrt, inverse_sqrt, coulomb_receipt = response_coulomb_powers(
                         meta, config, mesh_xy=mesh_xy, bank_io=bank, q_span=span)
-                _timing_fence("passivity")
+                timing.fence("spole.passivity")
                 with timing.section("spole.passivity"):
                     passive = shared_pole_passivity(model, inverse_sqrt,
                                                    eta_ry=recipe["eta_ev"] / RYD_TO_EV,
                                                    matmul=mm, eigh=eig.batched, gates=gates)
                     del coulomb_sqrt, inverse_sqrt
             else:
-                _timing_fence("passivity")
+                timing.fence("spole.passivity")
                 with timing.section("spole.passivity"):
                     passive = {key: value[slot:slot+1] for key, value in batch_checks[0].items()}
                     coulomb_receipt = dict(batch_coulomb)
                     coulomb_receipt["support_ranks"] = batch_coulomb["support_ranks"][slot:slot+1]
-            _timing_fence("gates")
+            timing.fence("spole.gates")
             with timing.section("spole.gates"):
                 if not bool(jnp.all(passive["passivity"])):
                     raise ValueError(f"GATE shared_pole_passivity: got: failed at q={q}; want: 0 <= V-whitened -W(i eta) <= I; why: passive screening")
                 expose_live((*model, qi))
-            _timing_fence("moment_read")
+            timing.fence("spole.moment_read")
             with timing.section("spole.moment_read"):
                 with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
                     exact = read_shared_pole_bank(moment_io, span, meta=meta,
                                                   header=moment_header, fields=("M1", "M3"))
-            _timing_fence("moment_diagnostics")
+            timing.fence("spole.moment_diagnostics")
             with timing.section("spole.moment_diagnostics"):
                 moment_defects = _model_diagnostics(model, exact, qi, matmul=mm)
                 del exact, qi
-            _timing_fence("held")
+            timing.fence("spole.held")
             with timing.section("spole.held"):
                 if batch_checks is None:
                     held = []
@@ -956,7 +940,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                              "Wc": float(batch_checks[1][slot, 0, i]),
                              "dWc_ds": float(batch_checks[1][slot, 1, i])}
                             for i, sample_id in enumerate(held_ids)]
-            _timing_fence("receipts")
+            timing.fence("spole.receipts")
             with timing.section("spole.receipts"):
                 c, poles, mask = model
                 counts = jnp.sum(mask, axis=-1, dtype=jnp.int64)
@@ -993,7 +977,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                     capacity_entry_start=receipt_entry_start)
                 receipt_entry_start = len(ledger.entries)
                 receipt.update(identity=identity, constructor=row)
-            _timing_fence("export_prepare")
+            timing.fence("spole.export_prepare")
             with timing.section("spole.export_prepare"):
                 public_c = _public_factor_kernel(mesh_xy)(c)
                 del model, c, mask
@@ -1001,29 +985,29 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 retained_panels = (*retained_panels, public_c, poles, counts)
                 receipts.append(receipt)
                 del public_c, poles, counts
-        _timing_fence("reduction_admission")
+        timing.fence("spole.reduction_admission")
         with timing.section("spole.reduction_admission"):
             batch_width = len(selected)
             capacity(ready_models[0][0].shape[-1], phase="model")
-        _timing_fence("writer_stack")
+        timing.fence("spole.writer_stack")
         with timing.section("spole.writer_stack"):
             public_c, poles, counts = stack_models(tuple(ready_models))
             expose_live((public_c, poles, counts))
             span = (selected[0][0], selected[-1][0] + 1)
             batch_receipt = {"identity": identity,
                              "q_receipts": receipts[-len(selected):]}
-        _timing_fence("writer")
+        timing.fence("spole.writer")
         with timing.section("spole.writer"):
             store_header = write_shared_pole_model(
                 output, public_c, poles, counts, q_span=span, meta=meta,
                 tables=bank["tables"], recipe=recipe, receipts=batch_receipt)
-        _timing_fence("cleanup")
+        timing.fence("spole.cleanup")
         with timing.section("spole.cleanup"):
             del public_c, poles, counts, ready_models
             ledger.live_stages = upstream
             del selected, batch_results
             retained_panels = ()
-    _timing_fence("return")
+    timing.fence("spole.return")
     with timing.section("spole.return"):
         return {"q_receipts": receipts, "model_header": store_header,
                 "capacity": ledger.receipt(),

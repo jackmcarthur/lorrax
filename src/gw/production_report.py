@@ -555,6 +555,37 @@ class GWProductionReport:
                                for parent in path[:-1])
             return total(selected)
 
+        def partition(parent, prefixes, label):
+            """Replace an inclusive band by disjoint descendants and residuals."""
+            parents = [r for r in rows if r["name"] == parent]
+            result = []
+            for owner in parents:
+                path = tuple(owner.get("path", (parent,)))
+                selected = {tuple(r["path"]): r for r in rows
+                            if tuple(r.get("path", ()))[:len(path)] == path
+                            and len(r.get("path", ())) > len(path)
+                            and r["name"].startswith(prefixes)}
+
+                def visit(key, row, title):
+                    children = [p for p in selected if p[:len(key)] == key
+                                and len(p) > len(key)
+                                and not any(q != p and len(q) > len(key)
+                                            and p[:len(q)] == q for q in selected)]
+                    for child in children:
+                        name = selected[child]["name"].split(".", 1)[1]
+                        visit(child, selected[child], label + " " + name)
+                    residual = float(row["inclusive"]) - sum(
+                        float(selected[p]["inclusive"]) for p in children)
+                    result.append((title + (" other" if children else ""),
+                                   max(residual, 0.0)))
+
+                visit(path, owner, label)
+            # A name may occur under the first-call probe and ordinary sweep.
+            totals = {}
+            for name, seconds in result:
+                totals[name] = totals.get(name, 0.0) + seconds
+            return list(totals.items())
+
         isdf_total = top_level("gw_jax.isdf")
         zeta = outer_prefixed(
             "gw_jax.zeta_fit_chunked", within="gw_jax.isdf")
@@ -585,6 +616,9 @@ class GWProductionReport:
                 continue  # all process alignment is one disjoint row below
             elif label == "passivity_held":
                 label = "passivity + held (fused)"
+            if name == "spole.bank" and any(r["name"].startswith("bank.") for r in rows):
+                screening_details.extend(partition("spole.bank", ("bank.",), "bank"))
+                continue
             screening_details.append(("spole " + label,
                 sum(float(r["inclusive"]) for r in spole_rows if r["name"] == name)))
         screening_details.append(("spole rank synchronization",
@@ -632,7 +666,9 @@ class GWProductionReport:
             ("W persist + q0 head", top_level(
                 "gw_jax.persist_w0", "gw_jax.static_head")),
             ("Sigma rule plan", sigma_plan),
-            ("Sigma tau sweep", sigma_sweep),
+            *(partition("sigma.tau_sweep", ("tau.",), "Sigma tau")
+              if any(r["name"].startswith("tau.") for r in rows)
+              else [("Sigma tau sweep", sigma_sweep)]),
             *sigma_details,
             ("Sigma other", sigma_other),
             ("mean-field load", top_level("gw_jax.kin_ion_load")),
@@ -649,11 +685,19 @@ class GWProductionReport:
         accounted = sum(seconds for _name, seconds in stages)
         stages.append(("other driver work", max(float(wall) - accounted, 0.0)))
         self.heading("Major-stage timing")
-        self.emit("  stage                    wall (s)     fraction")
+        detailed = any(r["name"].startswith(("bank.", "tau.")) for r in rows)
+        width = max(22, max((len(name) for name, _ in stages), default=22)) if detailed else 22
+        self.emit(f"  {'stage':<{width}}   wall (s)     fraction")
         for name, seconds in stages:
-            self.emit(f"  {name:<22} {seconds:10.2f}  "
+            self.emit(f"  {name:<{width}} {seconds:10.2f}  "
                       f"{100.0 * seconds / wall if wall else 0.0:9.2f}%")
-        self.emit(f"  {'total run':<22} {wall:10.2f}  {100.0:9.2f}%")
+        self.emit(f"  {'total run':<{width}} {wall:10.2f}  {100.0:9.2f}%")
+        if any(r["name"].startswith(("bank.", "tau.")) for r in rows):
+            self.emit("  bank real_time/laplace = incumbent G/FFT correlation plus bank coefficient carry;")
+            self.emit("  these fused clocks are not FFT-only or evidence of a bandwidth limit.")
+            self.emit("  Sigma tau kernel other includes incumbent G/W convolution, projection and dispatch;")
+            self.emit("  W_synthesis is separately fenced. No pure-GEMM or pure-FFT wall is inferred.")
+            self.emit("  device_wait drains preceding work; rank_wait measures process alignment.")
         if spole_rows:
             self.emit("  spole bands: fenced host walls; wait-before rows drain prior device/effect work,")
             self.emit("  not the named consumer. Rank synchronization is separate. Local passivity/held")

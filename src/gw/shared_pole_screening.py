@@ -13,7 +13,6 @@ import time
 
 import jax
 from common import timing
-from .shared_pole_constructor import _timing_fence
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental import multihost_utils
@@ -104,7 +103,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         centroid_indices, run_dir, label, wfn,
                         wfn_fingerprint_binding, tensors_filename, occupation_state, print_fn):
     """Build/reuse one immutable current-map model and return its small handle."""
-    _timing_fence("screening_setup")
+    timing.fence("spole.screening_setup")
     with timing.section("spole.screening_setup"):
         from symmetry_maps import (QirrTables, centroid_source_map_and_wrap,
                                    bgw_integer_q_to_fractional)
@@ -169,10 +168,10 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             q_irr_frac=bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, grid),
             sym_perm=perm, L_table=wraps, n_sym_spatial=len(sym.sym_matrices))
         tables = dict(qirr=qt, q_irr_full_idx=qids, sym=sym)
-    _timing_fence("coulomb_staging")
+    timing.fence("spole.coulomb_staging")
     with timing.section("spole.coulomb_staging"):
         coulomb = _coulomb_resource(V_q, meta, sym, mesh_xy, root / "coulomb.h5")
-    _timing_fence("bank_setup")
+    timing.fence("spole.bank_setup")
     with timing.section("spole.bank_setup"):
         bank = dict(path=str(root / "bank.h5"), identity=identity,
                     tables=tables, coulomb=coulomb)
@@ -185,11 +184,11 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 (root / (stage + "_receipt.json")).write_text(_json(receipt) + "\n")
             print_fn(f"shared-pole {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
                      f"seconds={receipt.get('seconds', {})}")
-    _timing_fence("bank")
+    timing.fence("spole.bank")
     with timing.section("spole.bank"):
         record("bank", produce_w_bank(wfns, meta, config, mesh_xy=mesh_xy,
             sym=sym, sample_plan=recipe, bank_io=bank))
-    _timing_fence("moments")
+    timing.fence("spole.moments")
     with timing.section("spole.moments"):
         record("moments", compute_response_moments(wfns, meta, config,
             mesh_xy=mesh_xy, sym=sym, bank_io=bank))
@@ -198,7 +197,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     # W/dW and M1/M3 are distinct keyed datasets in the same scratch file.
     result = construct_shared_poles(bank, bank, meta, config,
         mesh_xy=mesh_xy, output=str(root / "model.h5"))
-    _timing_fence("screening_finalize")
+    timing.fence("spole.screening_finalize")
     with timing.section("spole.screening_finalize"):
         record("constructor", result)
         header = result["model_header"]

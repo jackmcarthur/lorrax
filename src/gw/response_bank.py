@@ -12,6 +12,7 @@ from pathlib import Path
 import time
 
 import jax
+from common import timing
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -276,29 +277,35 @@ def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
 def _bank_execution(meta, mesh_xy, bank_io, receipt, config):
     """Compile and admit new dense work; stream outputs are reserved by batch."""
     def execute(kernel, args, stage):
-        started = time.monotonic()
-        executable = kernel.lower(*args).compile()
-        receipt["seconds"]["compilation"] = (receipt["seconds"].get("compilation", 0.)
-            + time.monotonic() - started)
-        memory = executable.memory_analysis()
-        if memory is None:
-            raise ValueError("GATE response_capacity: compiled memory unavailable")
-        stream = stage in ("real_time", "laplace", "moment_correlation")
-        if not stream:
-            layout = config.get("linalg", "local") if hasattr(config,"get") else config.backend.linalg
-            native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
-                with_eigh=stage=="coulomb_sqrt")
-            receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))
-            _, row = _reserve(meta, stage, memory.argument_size_in_bytes,
-                memory.output_size_in_bytes + memory.temp_size_in_bytes + native["total"])
-            receipt["memory"].append(row)
-        receipt["compiled"].append(dict(stage=stage,
-            arguments=memory.argument_size_in_bytes, outputs=memory.output_size_in_bytes,
-            temporaries=memory.temp_size_in_bytes, inherited_stream=stream))
-        started = time.monotonic()
-        result = executable(*args)
-        jax.block_until_ready(result)
-        receipt["seconds"][stage] = receipt["seconds"].get(stage, 0.) + time.monotonic()-started
+        timing.fence('bank.compile.' + stage, sync_ranks=True)
+        with timing.section('bank.compile.' + stage):
+            started = time.monotonic()
+            executable = kernel.lower(*args).compile()
+            receipt["seconds"]["compilation"] = (receipt["seconds"].get("compilation", 0.)
+                + time.monotonic() - started)
+        timing.fence('bank.admission.' + stage, sync_ranks=True)
+        with timing.section('bank.admission.' + stage):
+            memory = executable.memory_analysis()
+            if memory is None:
+                raise ValueError("GATE response_capacity: compiled memory unavailable")
+            stream = stage in ("real_time", "laplace", "moment_correlation")
+            if not stream:
+                layout = config.get("linalg", "local") if hasattr(config,"get") else config.backend.linalg
+                native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
+                    with_eigh=stage=="coulomb_sqrt")
+                receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))
+                _, row = _reserve(meta, stage, memory.argument_size_in_bytes,
+                    memory.output_size_in_bytes + memory.temp_size_in_bytes + native["total"])
+                receipt["memory"].append(row)
+            receipt["compiled"].append(dict(stage=stage,
+                arguments=memory.argument_size_in_bytes, outputs=memory.output_size_in_bytes,
+                temporaries=memory.temp_size_in_bytes, inherited_stream=stream))
+        timing.fence('bank.execute.' + stage, sync_ranks=True)
+        with timing.section('bank.execute.' + stage):
+            started = time.monotonic()
+            result = executable(*args)
+            jax.block_until_ready(result)
+            receipt["seconds"][stage] = receipt["seconds"].get(stage, 0.) + time.monotonic()-started
         return result
     return execute
 
@@ -566,108 +573,122 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
 
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io):
     """Stage A: one windowed stream per admitted sample batch, all parent faces."""
-    from file_io.shared_pole_store import write_shared_pole_bank
-    header,qids,census = _bank_context(wfns,meta,sym,bank_io,mesh_xy)
-    authenticate_sample_plan(sample_plan,header)
-    z = bank_points(sample_plan)
-    receipt = _receipt("samples",census,bank_io)
-    started = time.monotonic()
-    execute = _bank_execution(meta,mesh_xy,bank_io,receipt,config)
-    ledger = meta.shared_pole_capacity
-    ambient = ledger.live_stages
-    _stream_comparison(wfns,meta,mesh_xy,qids,receipt)
-    samples,_,receipt["algebra"] = response_algebra(meta,config,
-        mesh_xy=mesh_xy,n=meta.mu_basis.n_packed)
-    energy,f,u,reference,_ = response_weights(wfns,meta)
-    masks,ft,ut,cells,receipt["windows"] = response_windows(energy,f,u,
-        chemical_potential_ry=sample_plan["census"]["mu_ry"])
-    import minimax
-    bank_rule,laplace_rule = minimax.response_bank_rule,minimax.response_laplace_rule
-    receipt["rule_provider"] = "minimax"
-    middle = energy[masks[1]]
-    delta = float(middle.max()-middle.min())
-    rule = bank_rule(z,delta,rel_tol=sample_plan["bank_rule_tolerance"])
-    t,weights = np.asarray(rule["t"]),np.asarray(rule["h"])
-    phase = np.asarray(rule["projection_value"])
-    derivative = np.asarray(rule["projection_derivative"])
-    receipt["rule"] = {k:v for k,v in rule.items() if k not in ("t","h","projection_value","projection_derivative")}
-    receipt["nodes"] = len(t)
-    remote = []
-    for cell in cells:
-        rr = laplace_rule(cell["delta_min_ry"],cell["delta_max_ry"],z,
-                         rel_tol=sample_plan["bank_rule_tolerance"])
-        remote.append((cell,rr))
-    receipt["laplace_cells"] = [{**cell,**{k:v for k,v in rr.items()
-        if k not in ("t","projection_value","projection_derivative","coefficient_rows")}}
-        for cell,rr in remote]
-    face_bytes = 16*meta.mu_basis.n_packed**2//mesh_xy.size
-    # One donated internal [output,q,x,y] carry spans every window. Public
-    # writer slices are [q,output,x,y]; only that bounded slice is transposed.
-    # Reserve output plus a dense/transport headroom, and batch only when the
-    # common ledger's admitted panel budget cannot hold the full point plan.
-    layout = config.get("linalg","local") if hasattr(config,"get") else config.backend.linalg
-    native = response_dense_workspace(mesh_xy,meta.mu_basis.n_packed,len(z),layout,with_eigh=True)
-    headroom = 16*face_bytes + native["gemm"] + int(phase.nbytes+derivative.nbytes)
-    # Ask the ledger owner for R24's remaining device budget. The zero-byte
-    # planning row includes ambient live reservations but allocates nothing.
-    _, budget = _reserve(meta,"bank_planning",0)
-    live_bytes = budget["aggregate_bytes_per_rank"]
-    device_available = budget["available_device_bytes_per_rank"]
-    scaling_target = budget["limit_bytes_per_rank"]
+    timing.fence('bank.setup', sync_ranks=True)
+    with timing.section('bank.setup'):
+        from file_io.shared_pole_store import write_shared_pole_bank
+        header,qids,census = _bank_context(wfns,meta,sym,bank_io,mesh_xy)
+        authenticate_sample_plan(sample_plan,header)
+        z = bank_points(sample_plan)
+        receipt = _receipt("samples",census,bank_io)
+        started = time.monotonic()
+        execute = _bank_execution(meta,mesh_xy,bank_io,receipt,config)
+        ledger = meta.shared_pole_capacity
+        ambient = ledger.live_stages
+    timing.fence('bank.stream_reference_compile', sync_ranks=True)
+    with timing.section('bank.stream_reference_compile'):
+        _stream_comparison(wfns,meta,mesh_xy,qids,receipt)
+    timing.fence('bank.window_geometry', sync_ranks=True)
+    with timing.section('bank.window_geometry'):
+        samples,_,receipt["algebra"] = response_algebra(meta,config,
+            mesh_xy=mesh_xy,n=meta.mu_basis.n_packed)
+        energy,f,u,reference,_ = response_weights(wfns,meta)
+        masks,ft,ut,cells,receipt["windows"] = response_windows(energy,f,u,
+            chemical_potential_ry=sample_plan["census"]["mu_ry"])
+    timing.fence('bank.quadrature', sync_ranks=True)
+    with timing.section('bank.quadrature'):
+        import minimax
+        bank_rule,laplace_rule = minimax.response_bank_rule,minimax.response_laplace_rule
+        receipt["rule_provider"] = "minimax"
+        middle = energy[masks[1]]
+        delta = float(middle.max()-middle.min())
+        rule = bank_rule(z,delta,rel_tol=sample_plan["bank_rule_tolerance"])
+        t,weights = np.asarray(rule["t"]),np.asarray(rule["h"])
+        phase = np.asarray(rule["projection_value"])
+        derivative = np.asarray(rule["projection_derivative"])
+        receipt["rule"] = {k:v for k,v in rule.items() if k not in ("t","h","projection_value","projection_derivative")}
+        receipt["nodes"] = len(t)
+        remote = []
+        for cell in cells:
+            rr = laplace_rule(cell["delta_min_ry"],cell["delta_max_ry"],z,
+                             rel_tol=sample_plan["bank_rule_tolerance"])
+            remote.append((cell,rr))
+        receipt["laplace_cells"] = [{**cell,**{k:v for k,v in rr.items()
+            if k not in ("t","projection_value","projection_derivative","coefficient_rows")}}
+            for cell,rr in remote]
+    timing.fence('bank.capacity_planning_compile', sync_ranks=True)
+    with timing.section('bank.capacity_planning_compile'):
+        face_bytes = 16*meta.mu_basis.n_packed**2//mesh_xy.size
+        # One donated internal [output,q,x,y] carry spans every window. Public
+        # writer slices are [q,output,x,y]; only that bounded slice is transposed.
+        # Reserve output plus a dense/transport headroom, and batch only when the
+        # common ledger's admitted panel budget cannot hold the full point plan.
+        layout = config.get("linalg","local") if hasattr(config,"get") else config.backend.linalg
+        native = response_dense_workspace(mesh_xy,meta.mu_basis.n_packed,len(z),layout,with_eigh=True)
+        headroom = 16*face_bytes + native["gemm"] + int(phase.nbytes+derivative.nbytes)
+        # Ask the ledger owner for R24's remaining device budget. The zero-byte
+        # planning row includes ambient live reservations but allocates nothing.
+        _, budget = _reserve(meta,"bank_planning",0)
+        live_bytes = budget["aggregate_bytes_per_rank"]
+        device_available = budget["available_device_bytes_per_rank"]
+        scaling_target = budget["limit_bytes_per_rank"]
 
-    @lru_cache(maxsize=None)
-    def dense_bytes(width):
-        abstract = jax.ShapeDtypeStruct((width,meta.mu_basis.n_packed,meta.mu_basis.n_packed),
-            jnp.complex128,sharding=NamedSharding(mesh_xy,P(None,"x","y")))
-        stats = samples.lower(abstract,abstract,abstract).compile().memory_analysis()
-        if stats is None:
-            raise ValueError("GATE response_capacity: sample solve planning memory unavailable")
-        dense = stats.argument_size_in_bytes+stats.output_size_in_bytes+stats.temp_size_in_bytes
-        # Preserve the existing dense/native and writer conversion envelopes.
-        return max(dense+native["total"],4*width*face_bytes+native["total"])
+        @lru_cache(maxsize=None)
+        def dense_bytes(width):
+            abstract = jax.ShapeDtypeStruct((width,meta.mu_basis.n_packed,meta.mu_basis.n_packed),
+                jnp.complex128,sharding=NamedSharding(mesh_xy,P(None,"x","y")))
+            stats = samples.lower(abstract,abstract,abstract).compile().memory_analysis()
+            if stats is None:
+                raise ValueError("GATE response_capacity: sample solve planning memory unavailable")
+            dense = stats.argument_size_in_bytes+stats.output_size_in_bytes+stats.temp_size_in_bytes
+            # Preserve the existing dense/native and writer conversion envelopes.
+            return max(dense+native["total"],4*width*face_bytes+native["total"])
 
-    minimum = headroom+live_bytes+2*face_bytes+dense_bytes(1)
-    # R24 makes 3U a reported scaling target, not the device admission limit.
-    # Replaying a Green/FFT stream to meet that preference repeats every time
-    # node even when the complete output panel fits. Use the ledger's remaining
-    # device budget, including the inherited stream and ambient/native costs;
-    # larger systems still split q/sample panels before any allocation.
-    planning_limit = device_available
-    available = planning_limit-headroom-live_bytes
-    qwidth = min(len(qids),int((available-dense_bytes(1))//(2*face_bytes)))
-    receipt["panel_budget"] = dict(
-        scaling_target_bytes_per_rank=scaling_target,
-        device_budget_bytes_per_rank=budget["device_budget_bytes_per_rank"],
-        inherited_peak_bytes_per_rank=budget["inherited_peak_bytes_per_rank"],
-        available_device_bytes_per_rank=device_available,
-        ambient_live_bytes_per_rank=live_bytes,headroom_bytes_per_rank=headroom,
-        native_workspace=native,planning_limit_bytes_per_rank=planning_limit,
-        minimum_panel_bytes_per_rank=minimum,
-        policy="minimize stream replays within remaining device budget; report 3U scaling target (ruling24)")
-    if qwidth < 1:
-        raise ValueError(f"GATE response_capacity: one q/sample panel needs {minimum} B/rank "
-                         f"including live/native costs; remaining device budget is {device_available} B/rank "
-                         f"(3U scaling target {scaling_target} B/rank)")
+        minimum = headroom+live_bytes+2*face_bytes+dense_bytes(1)
+        # R24 makes 3U a reported scaling target, not the device admission limit.
+        # Replaying a Green/FFT stream to meet that preference repeats every time
+        # node even when the complete output panel fits. Use the ledger's remaining
+        # device budget, including the inherited stream and ambient/native costs;
+        # larger systems still split q/sample panels before any allocation.
+        planning_limit = device_available
+        available = planning_limit-headroom-live_bytes
+        qwidth = min(len(qids),int((available-dense_bytes(1))//(2*face_bytes)))
+        receipt["panel_budget"] = dict(
+            scaling_target_bytes_per_rank=scaling_target,
+            device_budget_bytes_per_rank=budget["device_budget_bytes_per_rank"],
+            inherited_peak_bytes_per_rank=budget["inherited_peak_bytes_per_rank"],
+            available_device_bytes_per_rank=device_available,
+            ambient_live_bytes_per_rank=live_bytes,headroom_bytes_per_rank=headroom,
+            native_workspace=native,planning_limit_bytes_per_rank=planning_limit,
+            minimum_panel_bytes_per_rank=minimum,
+            policy="minimize stream replays within remaining device budget; report 3U scaling target (ruling24)")
+        if qwidth < 1:
+            raise ValueError(f"GATE response_capacity: one q/sample panel needs {minimum} B/rank "
+                             f"including live/native costs; remaining device budget is {device_available} B/rank "
+                             f"(3U scaling target {scaling_target} B/rank)")
     for q0 in range(0,len(qids),qwidth):
-        q1 = min(q0+qwidth,len(qids))
-        width = len(z)
-        while 2*width*(q1-q0)*face_bytes+dense_bytes(width) > available:
-            width -= 1
-        planned_bytes = headroom+live_bytes+2*width*(q1-q0)*face_bytes+dense_bytes(width)
-        receipt.setdefault("panel_plans",[]).append(dict(q_span=(q0,q1),sample_width=width,
-            aggregate_bytes_per_rank=planned_bytes,
-            scaling_status="PASS" if planned_bytes <= scaling_target else "WARN",
-            device_budget_status="PASS",scaling_target_bytes_per_rank=scaling_target,
-            available_device_bytes_per_rank=device_available))
+        timing.fence('bank.panel_admission', sync_ranks=True)
+        with timing.section('bank.panel_admission'):
+            q1 = min(q0+qwidth,len(qids))
+            width = len(z)
+            while 2*width*(q1-q0)*face_bytes+dense_bytes(width) > available:
+                width -= 1
+            planned_bytes = headroom+live_bytes+2*width*(q1-q0)*face_bytes+dense_bytes(width)
+            receipt.setdefault("panel_plans",[]).append(dict(q_span=(q0,q1),sample_width=width,
+                aggregate_bytes_per_rank=planned_bytes,
+                scaling_status="PASS" if planned_bytes <= scaling_target else "WARN",
+                device_budget_status="PASS",scaling_target_bytes_per_rank=scaling_target,
+                available_device_bytes_per_rank=device_available))
         for lo in range(0,len(z),width):
-            hi = min(lo+width,len(z));a = hi-lo
-            ledger.live_stages = ambient
-            name,_ = _reserve(meta,"bank_outputs",2*a*(q1-q0)*face_bytes + headroom)
-            ledger.live_stages = ambient+(name,)
-            kernel,fixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-                q_ids=tuple(qids[q0:q1]),n_outputs=2*a,bank_carry=True)
-            raw = jax.jit(lambda: jnp.zeros((2*a,q1-q0,meta.mu_basis.n_packed,meta.mu_basis.n_packed),jnp.complex128),
-                out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
+            timing.fence('bank.stream_arguments', sync_ranks=True)
+            with timing.section('bank.stream_arguments'):
+                hi = min(lo+width,len(z));a = hi-lo
+                ledger.live_stages = ambient
+                name,_ = _reserve(meta,"bank_outputs",2*a*(q1-q0)*face_bytes + headroom)
+                ledger.live_stages = ambient+(name,)
+                kernel,fixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
+                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,bank_carry=True)
+                raw = jax.jit(lambda: jnp.zeros((2*a,q1-q0,meta.mu_basis.n_packed,meta.mu_basis.n_packed),jnp.complex128),
+                    out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
             raw = execute(kernel,(jnp.asarray(t),jnp.asarray(np.vstack((phase[lo:hi],derivative[lo:hi]))),
                 *fixed,stream_weights(wfns,ft*masks[1],mesh_xy),
                 stream_weights(wfns,ut*masks[1],mesh_xy),jnp.asarray(reference),raw),"real_time")
@@ -678,15 +699,17 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 lk,lfixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
                     q_ids=tuple(qids[q0:q1]),n_outputs=2*a,pair_mode="laplace",bank_carry=True)
             for cell,rr in remote:
-                lower,upper = cell["lower"],cell["upper"]
-                refs = np.asarray(cell["references_ry"])
-                tau = np.asarray(rr["t"])
-                projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]
-                lw = np.stack([ft*masks[lower],ut*masks[lower]])
-                uw = np.stack([ut*masks[upper],ft*masks[upper]])
-                # Parent selection applies to the k axis, separately for each role.
-                lw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in lw])
-                uw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in uw])
+                timing.fence('bank.laplace_arguments', sync_ranks=True)
+                with timing.section('bank.laplace_arguments'):
+                    lower,upper = cell["lower"],cell["upper"]
+                    refs = np.asarray(cell["references_ry"])
+                    tau = np.asarray(rr["t"])
+                    projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]
+                    lw = np.stack([ft*masks[lower],ut*masks[lower]])
+                    uw = np.stack([ut*masks[upper],ft*masks[upper]])
+                    # Parent selection applies to the k axis, separately for each role.
+                    lw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in lw])
+                    uw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in uw])
                 raw = execute(lk,(jnp.asarray(tau),jnp.asarray(projections),
                     *lfixed,lw,uw,jnp.asarray(refs),raw),"laplace")
                 del lw,uw
@@ -712,18 +735,22 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     value,ds = execute(samples,(hbatch,chi,dchi),"sample_dyson")
                     value = None if marked[0] else value[None]
                     ds = None if marked[1] else ds[None]
-                    io_started = time.monotonic()
-                    header = write_shared_pole_bank(bank_io["path"],q_span=span,
-                        sample_span=(ia,stop),Wc=value,dWc_ds=ds,meta=meta,
-                        expected_identity=bank_io["identity"],mesh_xy=mesh_xy)
-                    receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                    timing.fence('bank.write', sync_ranks=True)
+                    with timing.section('bank.write'):
+                        io_started = time.monotonic()
+                        header = write_shared_pole_bank(bank_io["path"],q_span=span,
+                            sample_span=(ia,stop),Wc=value,dWc_ds=ds,meta=meta,
+                            expected_identity=bank_io["identity"],mesh_xy=mesh_xy)
+                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
                     del value,ds,chi,dchi,hbatch
                     ia = stop
                 del h
             receipt["batches"].append(dict(q_span=(q0,q1),sample_span=(lo,hi)))
             del raw
-    ledger.live_stages = ambient
-    receipt["stream_passes"] = len(receipt["batches"])
-    receipt["batch_reason"] = "full plan admitted" if len(receipt["batches"]) == 1 else "remaining device-budget panels require bounded replays; see panel_budget and panel_plans"
-    receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
-    return _finish_receipt(receipt,meta,header,started)
+    timing.fence('bank.finalize', sync_ranks=True)
+    with timing.section('bank.finalize'):
+        ledger.live_stages = ambient
+        receipt["stream_passes"] = len(receipt["batches"])
+        receipt["batch_reason"] = "full plan admitted" if len(receipt["batches"]) == 1 else "remaining device-budget panels require bounded replays; see panel_budget and panel_plans"
+        receipt["completion"] = bool(np.asarray(header["sample_written"]).all())
+        return _finish_receipt(receipt,meta,header,started)

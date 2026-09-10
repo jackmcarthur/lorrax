@@ -501,3 +501,32 @@ def test_shared_pole_screening_bands_partition_wall(tmp_path):
     assert 'spole nested_diagnostic' not in displayed
     assert sum(v for k, v in displayed.items() if k != 'total run') == 100.
     assert 'prior device/effect work' in text
+
+
+def test_nested_bank_and_tau_breakdowns_partition_once(tmp_path):
+    report = GWProductionReport(str(tmp_path / 'gwjax.out'), runtime=_runtime(),
+                                debug=False, stdout=lambda line: None)
+    rows = []
+    def add(path, seconds):
+        rows.append(dict(name=path[-1], path=path, inclusive=seconds))
+    add(('gw_jax.screening',), 50.)
+    add(('gw_jax.screening', 'spole.bank'), 40.)
+    add(('gw_jax.screening', 'spole.bank', 'bank.execute.real_time'), 20.)
+    add(('gw_jax.screening', 'spole.bank', 'bank.write'), 10.)
+    add(('gw_jax.sigma',), 50.)
+    add(('gw_jax.sigma', 'sigma.rule_plan'), 30.)
+    add(('gw_jax.sigma', 'sigma.tau_sweep'), 20.)
+    add(('gw_jax.sigma', 'sigma.tau_sweep', 'tau.kernel'), 15.)
+    add(('gw_jax.sigma', 'sigma.tau_sweep', 'tau.kernel', 'tau.W_synthesis'), 6.)
+    add(('gw_jax.sigma', 'sigma.tau_sweep', 'tau.kernel', 'tau.GW_and_projection'), 8.)
+    report.timings(rows, wall=100.)
+    displayed = {}
+    for line in (tmp_path / 'gwjax.out').read_text().splitlines():
+        if line.endswith('%'):
+            label, seconds, _ = line.strip().rsplit(None, 2)
+            displayed[label] = float(seconds)
+    assert displayed['bank other'] == 10.
+    assert displayed['Sigma rule plan'] == 30.
+    assert displayed['Sigma tau kernel other'] == 1.
+    assert displayed['Sigma tau other'] == 5.
+    assert sum(v for k, v in displayed.items() if k != 'total run') == 100.
