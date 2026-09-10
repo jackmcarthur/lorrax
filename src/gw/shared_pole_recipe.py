@@ -49,6 +49,7 @@ _GATE_ROWS = {
     "normalized_gram_validity": ("gamma_min/gamma_max >= threshold", -1.0e-7),
     "zero_ritz_policy": ("drop lambda <= cutoff only within factor-weight budget",
                          {"lambda_cutoff_ry2": 1.0e-6, "max_dropped_weight_fraction": 1.0e-6}),
+    # Legacy C denotes b: preserve this hashed predicate for stored identities.
     "finite_factors_poles": ("finite complex128 C; finite positive float64 active poles2; int64 K; exact-zero inactive C and positive sentinel", True),
     "passivity": ("V-whitened -Wc(i eta) spectrum in bounds and relative anti-Hermitian part within tolerance",
                   {"eigenvalue_min": -1.0e-10, "eigenvalue_max": 1.0 + 1.0e-8,
