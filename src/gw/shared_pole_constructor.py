@@ -275,10 +275,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     t = t + null_identity * sentinel[:, None, None]
     poles, rotation = eigh(t)
     active = jnp.arange(g.shape[-1])[None, :] >= g.shape[-1] - count[:, None]
-    # Reuse the Ritz map Y for both b=O Y and the retained-space checks.
-    # This keeps every pencil extent and removes the separate O Z product.
-    coefficients = matmul(z, rotation) * active[:, None, :]
-    b = matmul(output, coefficients)
+    b = matmul(matmul(output, z), rotation) * active[:, None, :]
     poles = jnp.where(active, poles, 1.0)
     wanted_metric = _diagonal_face(keep, g)
     diagnostics = {
@@ -294,6 +291,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
         / jnp.sqrt(jnp.maximum(count, 1)),
     }
     # Undo equilibration in the coefficient map used by retained-space checks.
+    coefficients = matmul(z, rotation) * active[:, None, :]
     return (b, poles, active), diagnostics, scale[:, :, None] * coefficients
 
 
