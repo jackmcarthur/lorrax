@@ -135,17 +135,17 @@ def run_checks(mesh):
                       multiplet_relative_tolerance=1e-6)
         svd = distrib_la.plan("eigh", mesh, n=16, backend=resolution.eigh_backend,
                               batched_route=resolution.batched_route)
-        selected, selected_masks, roles = _direction_states(
+        selected, selected_counts, roles = _direction_states(
             read_once, recipe, eigh_plan=pe, svd_plan=svd, matmul=mm,
             column_extent=lambda width: 2*((width+1)//2), logical_n=8,
             admit=admissions.append, infinity_carrier=2)
         assert reads == [0] and len(selected) == 2
-        assert [role["width"] for role in roles] == [3, 3], roles
+        assert [role["width"] for role in roles[0]] == [3, 3], roles
         projector = np.diag([1., 1., 1., 0., 0., 0., 0., 0.])[None]
         selection_errors = [relative(mm(state[1], state[1], transb="C"), projector)
                             for state in selected]
         assert max(selection_errors) < 1e-10, selection_errors
-        assert all(int(jnp.sum(mask)) == 3 for mask in selected_masks)
+        assert selected_counts.tolist() == [[3, 3]]
         assert admissions == [2, 6, 10]
         rows.append(dict(name="directions_multiplet_dedup", layout=layout, status="PASS",
                          reads=reads, roles=roles, projector_relative=selection_errors))

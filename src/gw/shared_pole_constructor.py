@@ -466,27 +466,22 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
     """Select each q row independently from a bounded batch of fitted samples.
 
     ``read_sample`` returns W/dW [b,n,n] faces. Only spectra cross the host;
-    output states, masks and role receipts are grouped by physical parent.
+    Output states keep their batch axis. Counts and role receipts are small
+    host metadata; the packer compacts each parent's original port carriers.
     """
     import distrib_la
-    import jax
-    from jax.sharding import NamedSharding, PartitionSpec as P
-
     import numpy as np
 
     hermitian_part = _hermitian_part_kernel(eigh_plan.mesh)
     fit_roles = _fit_roles(recipe)
-    states, masks, roles = [], [], []
+    states, counts, roles = [], [], []
     def largest_side():
-        return infinity_carrier + max((sum(st[1].shape[-1] for st in row)
-                                       for row in states), default=0)
+        return infinity_carrier + sum(st[1].shape[-1] for st in states)
     for sample_id in recipe["fit_ids"]:
         admit(largest_side())
         w, derivative = read_sample(int(sample_id), states)
-        if not states:
-            states = [[] for _ in range(w.shape[0])]
-            masks = [[] for _ in states]
-            roles = [[] for _ in states]
+        if not roles:
+            roles = [[] for _ in range(w.shape[0])]
         for role in fit_roles:
             if role["held"] or int(role["sample_id"]) != int(sample_id):
                 continue
@@ -507,9 +502,6 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
             widths = tuple(int(v.shape[-1]) for v in values)
             if any(width < 1 or width > logical_n for width in widths):
                 raise ValueError(f"GATE shared_pole_directions: got: ranks {widths}; want: 1..{logical_n}; why: empty or padded physical direction set")
-            slices = tuple(_parent_panel_slice(eigh_plan.mesh, column_extent(width))
-                           for i, width in enumerate(widths))
-            directions = tuple(take(q_batch, np.int32(i)) for i, take in enumerate(slices))
             s = _sample_point(recipe, int(sample_id)) ** 2
             # The conjugate state reuses exactly the same right directions.
             for conjugate in ((False, True) if kind == "line" and s.imag != 0 else (False,)):
@@ -517,16 +509,15 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
                 transa = "C" if conjugate else "N"
                 output = matmul(w, q_batch, transa=transa)
                 action = matmul(derivative, q_batch, transa=transa)
-                for i, (q, take, width) in enumerate(zip(directions, slices, widths)):
-                    out, deriv = take((output, action), np.int32(i))
-                    states[i].append((s.conjugate() if conjugate else s, q, out, deriv))
-                    masks[i].append(np.arange(q.shape[-1]) < width)
+                states.append((s.conjugate() if conjugate else s, q_batch, output, action))
+                counts.append(widths)
+                for i, width in enumerate(widths):
                     roles[i].append({"sample_id": int(sample_id), "role": role["role"],
                                      "conjugate": conjugate, "width": width,
-                                     "carrier_width": q.shape[-1]})
-            del q_batch, directions, output, action
+                                     "carrier_width": column_extent(width)})
+            del q_batch, output, action
         del w, derivative
-    return states, masks, roles
+    return states, np.asarray(counts, dtype=np.int64).T, roles
 
 
 def _model_diagnostics(model, moments, infinity_directions, *, matmul):
@@ -754,38 +745,33 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 index = sample_id - sample_lo
                 return samples["Wc"][:, index], samples["dWc_ds"][:, index]
 
-            states, masks, roles = _direction_states(
+            states, counts, roles = _direction_states(
                 read_sample, recipe, eigh_plan=eig, svd_plan=svd, matmul=mm,
                 column_extent=column_extent, logical_n=logical_n, admit=capacity,
                 infinity_carrier=qi.shape[-1])
         del samples
+        jax.block_until_ready((states, infinity))
+        retained_panels = (*infinity, *(v for st in states for v in st[1:]))
+        finite_width = max(sum(row['carrier_width'] for row in parent) for parent in roles)
+        infinity_width = infinity[0].shape[-1]
+        batch_width = mesh_divisor(mesh_xy) if resolution.layout == "local" else 1
+        # The permutation temporarily has the sum of the batched port
+        # carriers, before compaction to the largest original parent side.
+        price = capacity(sum(st[1].shape[-1] for st in states) + infinity_width,
+                         phase="reduction")
+        packed, extents = pack_parent_panels(
+            states, infinity, counts, [v.shape[-1] for v in infinity_values],
+            mesh_xy=mesh_xy, parent_batch=batch_width)
         for i, values in enumerate(infinity_values):
             ri = column_extent(values.shape[-1])
             parent_infinity = _parent_panel_slice(mesh_xy, ri)(infinity, np.int32(i))
-            masks[i].append(np.arange(ri) < values.shape[-1])
-            # These masks are host metadata from already-host spectral counts;
-            # no device array is gathered to assemble them.
-            active_columns = jax.device_put(
-                np.fromiter((v for mask in masks[i] for v in mask), dtype=bool)[None],
-                NamedSharding(mesh_xy, P()))
-            pending.append((q_start+i, states[i], parent_infinity,
-                            active_columns, parent_infinity[0], roles[i]))
-        jax.block_until_ready((states, infinity))
-        del states, infinity, qi, infinity_values, masks, roles
-        retained_panels = tuple(a for _, ss, ii, mask, _, _ in pending
-                                for a in (*ii, mask, *(v for st in ss for v in st[1:])))
+            pending.append((q_start+i, None, None, None, parent_infinity[0], roles[i]))
+        del states, infinity, qi, infinity_values, counts, roles, parent_infinity
+        retained_panels = (*jax.tree.leaves(packed), *(item[4] for item in pending))
         batch_results = None
         if resolution.layout == "local":
-            finite_width = max(sum(st[1].shape[-1] for st in item[1]) for item in pending)
-            infinity_width = max(item[2][0].shape[-1] for item in pending)
-            batch_width = mesh_divisor(mesh_xy)
-            # Reserve the pack/copy plus local pencil before either is built.
             price = capacity(finite_width + infinity_width, phase="reduction")
-            packed = pack_parent_panels([(ss, ii, mask) for _, ss, ii, mask, _, _ in pending],
-                                        mesh_xy=mesh_xy)
             reduce_eigh = eigenplan(finite_width + infinity_width)
-            extents = tuple((sum(st[1].shape[-1] for st in ss), ii[0].shape[-1])
-                            for _, ss, ii, _, _, _ in pending)
             extents += (extents[-1],) * (batch_width - len(extents))
             batch_results = local_parent_reducer(
                 mesh_xy, reduce_eigh.native_fn, extents)(*packed)
@@ -793,10 +779,15 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             del packed
             # Drop selected action panels after the fused boundary. Model
             # slices below may coexist with the full padded result buffer.
-            pending = [(iq, None, None, None, directions, row_roles)
-                       for iq, _, _, _, directions, row_roles in pending]
             retained_panels = (*jax.tree.leaves(batch_results),
                                *(item[4] for item in pending))
+        else:
+            # The distributed schedule admits one parent; its packed panels
+            # already have the original finite and infinity extents.
+            iq, _, _, _, directions, row_roles = pending[0]
+            finite, infinity, active = jax.tree.map(lambda a: a[:1], packed)
+            pending = [(iq, [finite], infinity, active, directions, row_roles)]
+            del packed
         batch_width = 1
         selected = pending
         pending = []
