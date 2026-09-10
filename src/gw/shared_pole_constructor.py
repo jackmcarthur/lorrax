@@ -12,7 +12,7 @@ there is no local vendor or alternative eigensolver in this physics owner.
 
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import jax
 import jax.numpy as jnp
@@ -568,11 +568,20 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
 
 
 def _model_diagnostics(model, moments, infinity_directions, *, matmul):
-    """Full and original-infinity projected physical moment diagnostics."""
+    """Compare M1=CC.H/2 and M3=C Lambda C.H/2 with physical moments.
+
+    Factors are [b,n,K], moments [b,n,n], and infinity directions [b,n,r],
+    in their existing face layouts. The loop selects from the two resident
+    moments without stacking dense matrices; only [2,b] scalar defects are
+    stacked. The caller compiles this stage with its accounted service GEMM.
+    """
     c, poles, _ = model
-    result = {}
-    for name, target, weighted in (("M1", moments["M1"], c),
-                                   ("M3", moments["M3"], c * poles[:, None, :])):
+
+    def moment_defect(third):
+        target = jax.lax.cond(third, lambda: moments["M3"],
+                              lambda: moments["M1"])
+        weighted = jax.lax.cond(third, lambda: c * poles[:, None, :],
+                                lambda: c)
         value = matmul(weighted, c, transb="C") / 2
         defect = target - value
         projected = matmul(infinity_directions,
@@ -581,11 +590,14 @@ def _model_diagnostics(model, moments, infinity_directions, *, matmul):
                                   matmul(target, infinity_directions), transa="C")
         norm = jnp.linalg.norm(target, axis=(-2, -1))
         projected_norm = jnp.linalg.norm(projected_target, axis=(-2, -1))
-        result[name] = {
-            "full_relative": jnp.linalg.norm(defect, axis=(-2, -1)) / norm,
-            "original_infinity_relative": jnp.linalg.norm(projected, axis=(-2, -1)) / projected_norm,
-        }
-    return result
+        return (jnp.linalg.norm(defect, axis=(-2, -1)) / norm,
+                jnp.linalg.norm(projected, axis=(-2, -1)) / projected_norm)
+
+    full, projected = jax.lax.map(moment_defect, jnp.asarray([False, True]))
+    return {
+        "M1": {"full_relative": full[0], "original_infinity_relative": projected[0]},
+        "M3": {"full_relative": full[1], "original_infinity_relative": projected[1]},
+    }
 
 
 def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
@@ -756,6 +768,11 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                      batched_route=resolution.batched_route, **kwargs)
 
         eig, svd = eigenplan(n), eigenplan(2*n)
+        # Bind once for this construction, outside both parent and support
+        # loops. The GEMM closure owns native workspace accounting; keeping
+        # this jit local also avoids retaining the map's capacity ledger in
+        # a global callable cache across self-consistent reconstructions.
+        model_diagnostics = jax.jit(partial(_model_diagnostics, matmul=mm))
         receipts = []
         receipt_entry_start = 0
         stack_models = _stack_model_kernel(mesh_xy)
@@ -972,7 +989,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                                   header=moment_header, fields=("M1", "M3"))
             timing.fence("spole.moment_diagnostics")
             with timing.section("spole.moment_diagnostics"):
-                moment_defects = _model_diagnostics(model, exact, qi, matmul=mm)
+                moment_defects = model_diagnostics(model, exact, qi)
                 del exact, qi
             timing.fence("spole.held")
             with timing.section("spole.held"):
