@@ -2131,7 +2131,23 @@ _DEFAULTS = {
     # (seconds of planning, more τ nodes): the fast A/B setting.  On Si
     # 4x4x4 one pass costs ~33 s of planning per run (30 passes: 985 s,
     # 378 nodes; the 120 s wall budget reached ~474 nodes).
-    "sigma_quadrature_reduction_steps": None,
+    #
+    # DEFAULT 10, owner ruling 2026-09-10.  The wall budget is not
+    # reproducible: at byte-identical source three Na P16 arms produced
+    # crossing-box node counts of 87, 87 and 86 with different weights,
+    # every one certifying, because the greedy reduction stops wherever
+    # the clock lands.  Σ therefore moved by up to 0.067 meV between runs
+    # of the same code, which manufactured a phantom regression during
+    # integration.  A step budget removes that: two arms at steps=0 gave
+    # byte-identical times and weights for all twelve boxes.
+    #
+    # 10 rather than 0 because τ nodes, not planning seconds, are what
+    # scale with system size and processor count: one FFT convolution per
+    # node in the executor.  On the Na P16 reference, steps=10 gives 278
+    # nodes against the wall budget's 258 and steps=0's 513.  Planning
+    # cost is a fixed per-window price this deck can afford and a later
+    # campaign can attack; τ work is not.
+    "sigma_quadrature_reduction_steps": 10,
     "sigma_quadrature_cache_dir": "auto",
     # OCCUPANCY at which a band leaves a metallic Green's-function branch.
     # The Σ planner cuts on the branch WEIGHT (f on val, 1−f on cond), so
