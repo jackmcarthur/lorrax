@@ -14,25 +14,49 @@ def check_reuse(mesh):
     face = NamedSharding(mesh, P(None, 'x', 'y'))
     def put(value):
         return jax.make_array_from_callback(value.shape, face, lambda i: value[i])
-    def parents(scale, support):
-        result=[]
-        for width in (4, 8, 4):
-            panel=put(np.full((1, 8, width), scale, np.complex128))
-            inf=put(np.full((1, 8, 4), scale*2, np.complex128))
-            result.append(([(support,panel,panel*3,panel*5)],(inf,inf*7,inf*11),jnp.ones((1,width+4),bool)))
-        return result
-    kernel=_parent_panel_packer(mesh)
-    assert kernel is _parent_panel_packer(mesh)
-    first=pack_parent_panels(parents(1.,2+1j),mesh_xy=mesh)
+    counts = np.array([[3, 7], [7, 3], [3, 3]], np.int64)
+    infinity_counts = np.array([3, 4, 3], np.int64)
+    def panels(scale, support, current_counts=counts):
+        states = []
+        for port in range(2):
+            values = scale * (np.arange(3*8*8).reshape(3,8,8) + 1 + 1000*port).astype(np.complex128)
+            values *= np.arange(8)[None,None,:] < current_counts[:,port,None,None]
+            panel = put(values)
+            states.append((support+port, panel, panel*3, panel*5))
+        inf = put(np.broadcast_to(np.arange(4)[None,None,:] < infinity_counts[:,None,None],
+                                  (3,8,4)).astype(np.complex128)*scale*2)
+        return states, (inf, inf*7, inf*11)
+    kernel = _parent_panel_packer(mesh, 12, 4)
+    assert kernel is _parent_panel_packer(mesh, 12, 4)
+    states, infinity = panels(1., 2+1j)
+    first, extents = pack_parent_panels(states, infinity, counts, infinity_counts,
+                                      mesh_xy=mesh, parent_batch=4)
     jax.block_until_ready(first)
-    before=kernel._cache_size()
-    second=pack_parent_panels(parents(2.,3+2j),mesh_xy=mesh)
+    before = kernel._cache_size()
+    states2, infinity2 = panels(2., 3+2j)
+    second, _ = pack_parent_panels(states2, infinity2, counts, infinity_counts,
+                                 mesh_xy=mesh, parent_batch=4)
     jax.block_until_ready(second)
-    assert kernel._cache_size()==before
-    # Supports are runtime values; panel scaling must propagate through all faces.
-    assert float(jnp.max(jnp.abs(second[0][0]-first[0][0])))>1
-    assert float(jnp.max(jnp.abs(second[0][1]-2*first[0][1])))==0
-    assert float(jnp.max(jnp.abs(second[1][0]-2*first[1][0])))==0
+    assert kernel._cache_size() == before
+    assert extents == ((12,4), (12,4), (8,4))
+    # Compare against explicit original per-parent port carriers, including
+    # inactive inter-port columns; a sort of only live columns would fail.
+    for q, widths in enumerate(((4,8), (8,4), (4,4))):
+        expected = jnp.concatenate([state[1][q,:,:width] for state,width in zip(states,widths)], axis=-1)
+        assert float(jnp.max(jnp.abs(first[0][1][q,:,:sum(widths)]-expected))) == 0
+        if sum(widths) < 12:
+            assert float(jnp.max(jnp.abs(first[0][1][q,:,sum(widths):]))) == 0
+    assert float(jnp.max(jnp.abs(first[0][1][3]-first[0][1][2]))) == 0
+    assert float(jnp.max(jnp.abs(second[0][0]-first[0][0]))) > 1
+    assert float(jnp.max(jnp.abs(second[0][1]-2*first[0][1]))) == 0
+    assert float(jnp.max(jnp.abs(second[1][0]-2*first[1][0]))) == 0
+    changed_counts = counts[:, ::-1].copy()
+    changed_states, changed_inf = panels(1., 2+1j, changed_counts)
+    changed, _ = pack_parent_panels(changed_states, changed_inf, changed_counts, infinity_counts,
+                                   mesh_xy=mesh, parent_batch=4)
+    jax.block_until_ready(changed)
+    assert kernel._cache_size() == before
+    assert float(jnp.max(jnp.abs(changed[0][1]-first[0][1]))) > 1
     for factory in (_hermitian_part_kernel,_public_factor_kernel,_stack_model_kernel):
         assert factory(mesh) is factory(mesh)
     # Parent identity and spectral counts must remain live without compiling

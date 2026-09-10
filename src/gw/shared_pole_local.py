@@ -7,72 +7,78 @@ the same Hermite/Ritz equations as the distributed constructor.
 from functools import lru_cache
 
 
-def pack_parent_panels(parents, *, mesh_xy):
-    """Pack ragged finite/infinity panels without changing physical columns.
+def pack_parent_panels(states, infinity, counts, infinity_counts, *, mesh_xy, parent_batch):
+    """Compact batched tangential panels into their original pencil columns.
 
-    Parameters
-    ----------
-    parents : sequence
-        Per-parent ``(states, infinity, active_columns)``. Each state is
-        ``(s,Q,WQ,dWQ)`` with scalar Ry² s and complex128 [1,n,r] face
-        panels. Infinity is three [1,n,r_inf] face panels. Masks are
-        [1,R] replicated booleans, preserving the selected multiplets.
-    mesh_xy : Mesh
-        Named x/y mesh. The returned batch tiles both axes on its q axis.
-
-    Returns
-    -------
-    finite, infinity, active : tuple
-        Face-tiled packed panels with only trailing zero padding, replicated
-        squared support coordinates [b,R_f] and activity masks [b,R]. The
-        batch is padded with copies of its last real parent; callers discard
-        those diagnostic/output rows. No full response matrix is retained.
+    ``states`` contains (s,Q,WQ,dWQ), with s scalar Ry² and complex128
+    [b,n,r_a] face panels. ``counts`` is host int [b,A] from spectral cuts;
+    ``infinity_counts`` is host int [b]. Only O(bR) offsets/masks cross to
+    the device. Panels stay face-tiled through the existing y permutation.
+    Return the packed finite/infinity/mask bundle and original (R_f,r_inf)
+    extents. No physical or native eigensolve dimension changes.
     """
-    return _parent_panel_packer(mesh_xy)(*parents)
+    import numpy as np
+    from runtime.padding import padded_axis
+    from jax.sharding import PartitionSpec as P
+
+    def extent(width):
+        return padded_axis(int(width), mesh_xy, name="shared_pole_port",
+                           specs=((P('x', 'y'), 0), (P('x', 'y'), 1))).carrier
+    carriers = [[extent(n) for n in row] for row in counts]
+    extents = tuple((sum(row), extent(ni))
+                    for row, ni in zip(carriers, infinity_counts))
+    rf = max(nf for nf, _ in extents)
+    ri = infinity[0].shape[-1]
+    widths = [state[1].shape[-1] for state in states]
+    offsets = np.cumsum([0, *widths[:-1]])
+    order = np.empty((len(counts), sum(widths)), np.int32)
+    active = np.zeros((len(counts), rf + ri), bool)
+    for q, (row, retained) in enumerate(zip(carriers, counts)):
+        selected = [int(start)+i for start, width in zip(offsets, row)
+                    for i in range(width)]
+        tail = np.ones(sum(widths), bool)
+        tail[selected] = False
+        order[q] = selected + np.flatnonzero(tail).tolist()
+        start = 0
+        for width, count in zip(row, retained):
+            active[q, start:start+int(count)] = True
+            start += width
+        active[q, rf:rf+int(infinity_counts[q])] = True
+    packed = _parent_panel_packer(mesh_xy, rf, parent_batch)(
+        tuple(states), infinity, order, active,
+        np.asarray([nf for nf, _ in extents], np.int32))
+    return packed, extents
 
 
 @lru_cache(maxsize=None)
-def _parent_panel_packer(mesh_xy):
-    """Reuse panel packing by shape; supports and action arrays stay inputs."""
+def _parent_panel_packer(mesh_xy, finite_width, parent_batch):
+    """One batch pack with dynamic column offsets and physical supports."""
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from runtime.padding import padded_axis
+    from gw.shared_pole_constructor import _factor_column_permutation
 
     face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     scalar = NamedSharding(mesh_xy, P())
+    permute = _factor_column_permutation(mesh_xy)
 
     @jax.jit
-    def pack(*items):
-        qtag = padded_axis(len(items), mesh_xy, name="shared_pole_parent",
-                           specs=((P(('x', 'y')), 0),))
-        finite_width = max(sum(s[1].shape[-1] for s in states)
-                           for states, _, _ in items)
-        infinity_width = max(inf[0].shape[-1] for _, inf, _ in items)
-        finite, infinity, masks = [], [], []
-        for states, inf, active in items:
-            width = sum(s[1].shape[-1] for s in states)
-            ri = inf[0].shape[-1]
-            points = jnp.concatenate([jnp.full((1, s[1].shape[-1]), s[0], jnp.complex128)
-                                      for s in states], axis=-1)
-            panels = tuple(jnp.pad(jnp.concatenate([s[i] for s in states], axis=-1),
-                                   ((0, 0), (0, 0), (0, finite_width-width)))
-                           for i in (1, 2, 3))
-            finite.append((jnp.pad(points, ((0, 0), (0, finite_width-width))), *panels))
-            infinity.append(tuple(jnp.pad(a, ((0, 0), (0, 0), (0, infinity_width-ri)))
-                                  for a in inf))
-            masks.append(jnp.concatenate((
-                jnp.pad(active[:, :width], ((0, 0), (0, finite_width-width))),
-                jnp.pad(active[:, width:], ((0, 0), (0, infinity_width-ri)))), axis=-1))
-        def stack(values, sharding):
-            value = jnp.concatenate(values, axis=0)
-            if qtag.carrier > qtag.logical:
-                value = jnp.concatenate((value, jnp.repeat(value[-1:], qtag.carrier-qtag.logical, axis=0)), axis=0)
+    def pack(states, infinity, order, active, finite_counts):
+        b = states[0][1].shape[0]
+        valid = jnp.arange(finite_width)[None, :] < finite_counts[:, None]
+        points = jnp.concatenate([
+            jnp.full((b, s[1].shape[-1]), s[0], jnp.complex128)
+            for s in states], axis=-1)
+        points = jnp.where(valid, jnp.take_along_axis(points, order, axis=-1)[:, :finite_width], 0)
+        panels = tuple(jnp.where(valid[:, None, :], permute(
+            jnp.concatenate([s[i] for s in states], axis=-1), order)[:, :, :finite_width], 0)
+            for i in (1, 2, 3))
+        def pad(value, sharding):
+            if parent_batch > b:
+                value = jnp.concatenate((value, jnp.repeat(value[-1:], parent_batch-b, axis=0)), axis=0)
             return jax.lax.with_sharding_constraint(value, sharding)
-        ff = tuple(stack([f[i] for f in finite], scalar if i == 0 else face)
-                   for i in range(4))
-        ii = tuple(stack([inf[i] for inf in infinity], face) for i in range(3))
-        return ff, ii, stack(masks, scalar)
+        finite = (pad(points, scalar), *(pad(a, face) for a in panels))
+        return finite, tuple(pad(a, face) for a in infinity), pad(active, scalar)
     return pack
 
 
