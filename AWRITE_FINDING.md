@@ -1,4 +1,4 @@
-# AWRITE finding — heavy lane, implementation prepared; production gates pending
+# AWRITE finding — AFIX base updated; fresh production gates pending
 
 The two outputs reuse the existing stores. `write_poles` produces a standalone v1 model through `write_shared_pole_model`; `b` is an HDF5 hard link to `factor`, not a second tensor. Lambda is `poles2_ry2`, and K selects active columns. b is the factorised plasmon-pole residue, B=b b†, in Wc=b(s−Lambda)⁻¹b†. The causal exp[−i(Omega−Eref)tau]/(2Omega) weight is absent. v1 names, normalization text and gate recipe remain compatible.
 
@@ -26,3 +26,9 @@ Model exports read one canonical parent at P(None,x,None,y), pack with PackedCen
 - Pending: changed-band activity/compile receipts using existing ANEST instrumentation. Driver wall is context only; published same-source range 12.555450169 s, not a confidence bound. Published band spreads: backend 0.340940 s, Gram 0.336710 s, direction 0.246062 s; no saving claimed.
 
 No source changes are claimed landed. No quadrature policy change belongs to this lane; AFIX owns it. No new model fit or new accuracy claim is introduced by serialization.
+
+## Base update requested 2026-09-10
+
+Current implementation incorporates AFIX d6dd0507 by a history-preserving merge. No quadrature-budget code is changed relative to that base. Earlier Si gates 58152292.2–.5 used e6ac7915 and are retained as historical evidence only. Fresh controls and candidate runs use SP-E1 58166522. The explicit output timing section exposes the existing output work to the campaign NVTX instrumentation; no arithmetic changes.
+
+The one-parent residency statement describes the copy loop. The existing authenticator reads bounded parent batches and at most ceil(K/Py) columns before I/O, with local factor panel n*ceil(K/Py)/Px; it exchanges row hashes, not factors.

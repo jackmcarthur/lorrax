@@ -1,6 +1,7 @@
 """Conventions and wiring gates for the shared denominator-box plan."""
 
 import ast
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -357,47 +358,26 @@ def test_sc_rule_padding_is_two_ev_on_state_edges_and_ten_percent_on_poles():
     assert padded["sc_pole_pad_fraction"] == 0.10
 
 
-def test_fixed_sc_refuses_a_rule_above_eps_after_one_retry(monkeypatch):
+@pytest.mark.parametrize("steps", [None, 0, 10])
+def test_fixed_sc_uncertified_start_refuses_without_retry(monkeypatch, steps):
     import dataclasses
     calls = []
 
     def diagnostic_above_eps(box, eps, **kwargs):
-        calls.append(float(kwargs.get("time_budget", -1.0)))
-        return dataclasses.replace(
-            _fake_rule(box, eps, **kwargs), sup_error=5.5 * eps)
+        calls.append((tuple(box), kwargs))
+        return dataclasses.replace(_fake_rule(box, eps), sup_error=5.5 * eps)
 
     monkeypatch.setattr(
         "gw.sigma_box_plan.build_uniform_rule", diagnostic_above_eps)
-    with pytest.raises(RuntimeError, match="5x-budget retry achieved") as err:
+    with pytest.raises(RuntimeError, match="no retry under sigma_quadrature") as err:
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-            eps=1.0e-4, reduction_seconds=120.0,
+            eps=1.0e-4, reduction_seconds=120.0, reduction_steps=steps,
             cache_dir=None, fixed_rule_session={},
             print_fn=lambda *_args, **_kwargs: None)
     assert "do not loosen sigma_quadrature_eps" in str(err.value)
-    # the retry used five times the budget before refusing
-    assert 600.0 in calls and 120.0 in calls
-
-
-def test_fixed_sc_accepts_the_retry_when_it_meets_eps(monkeypatch):
-    import dataclasses
-
-    def meets_eps_with_more_time(box, eps, **kwargs):
-        good = float(kwargs.get("time_budget", 0.0)) >= 600.0
-        return dataclasses.replace(
-            _fake_rule(box, eps, **kwargs),
-            sup_error=(0.5 * eps if good else 5.5 * eps))
-
-    monkeypatch.setattr(
-        "gw.sigma_box_plan.build_uniform_rule", meets_eps_with_more_time)
-    plan, geometry = plan_sigma_windows(
-        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-        eps=1.0e-4, reduction_seconds=120.0,
-        cache_dir=None, fixed_rule_session={},
-        print_fn=lambda *_args, **_kwargs: None)
-    assert len(plan) == 3
-    assert all(row["sup_error"] == pytest.approx(0.5e-4)
-               for row in geometry["branches"][0]["windows"])
+    assert len({box for box, kwargs in calls}) == len(calls)
+    assert all(kwargs["time_budget"] == 120. for box, kwargs in calls)
 
 
 def test_sc_pad_keeps_a_sign_definite_support_sign_definite():
@@ -672,6 +652,7 @@ def test_quadrature_deck_defaults_and_retired_sector_key(tmp_path):
     config = LorraxConfig.from_input_file(
         str(deck), print_fn=lambda *_args, **_kwargs: None)
     assert config.sigma.quadrature_eps == 1.0e-4
+    assert config.sigma.quadrature_reduction_steps is None
     assert config.sigma.quadrature_reduction_seconds == 120.0
     assert config.sigma.quadrature_cache_dir == "auto"
 
@@ -717,7 +698,7 @@ def test_nan_weights_with_finite_sup_are_not_a_certificate(monkeypatch):
             print_fn=lambda *_args, **_kwargs: None)
 
 
-def test_infinite_sup_retries_then_refuses_naming_the_retry(monkeypatch):
+def test_infinite_sup_refuses_without_retry(monkeypatch):
     import dataclasses
     budgets = []
 
@@ -727,12 +708,12 @@ def test_infinite_sup_retries_then_refuses_naming_the_retry(monkeypatch):
             _fake_rule(box, eps, **kwargs), sup_error=float("inf"))
 
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", broken)
-    with pytest.raises(RuntimeError, match="5x-budget retry achieved") as err:
+    with pytest.raises(RuntimeError, match="no retry under sigma_quadrature_reduction_seconds") as err:
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
             eps=1.0e-4, reduction_seconds=120.0,
             cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
-    assert 600.0 in budgets
+    assert budgets and all(budget == 120. for budget in budgets)
     assert "inf" in str(err.value)
 
 
@@ -835,3 +816,131 @@ def test_cache_lookup_prefers_a_certified_larger_rule_over_a_bad_smaller_one(tmp
     assert best is not None
     rule, name = best
     assert name != "rule_bad.npz" and rule.sup_error <= 1.0e-4
+
+
+@pytest.mark.parametrize("steps", [0, 10])
+def test_step_budget_uncertified_start_refuses_without_duplicate_retry(monkeypatch, steps):
+    import dataclasses
+    from gw.sigma_box_plan import _fit_rule
+    calls = []
+
+    def uncertified(box, eps, **kwargs):
+        calls.append(kwargs)
+        return dataclasses.replace(_fake_rule(box, eps), sup_error=5 * eps)
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", uncertified)
+    spec = make_sigma_box_spec(
+        name="crossing", frequencies=(-2., 2.), states=(-.2, .2),
+        pole_stats=((1., 2., .5, 1.),), pole_sign=1., eta_ry=.1)
+    with pytest.raises(RuntimeError, match="no retry under sigma_quadrature_reduction_steps"):
+        _fit_rule(spec, 1e-4, 120., None, .1, reduction_steps=steps)
+    assert len(calls) == 1
+    assert calls[0]["reduction_steps"] == steps
+
+
+def test_explicit_none_reaches_clock_budget(tmp_path):
+    from gw.gw_config import LorraxConfig
+    deck = tmp_path / "clock.in"
+    deck.write_text(_DECK + "sigma_quadrature_reduction_steps = none\n")
+    config = LorraxConfig.from_input_file(str(deck), print_fn=lambda *_: None)
+    assert config.sigma.quadrature_reduction_steps is None
+
+
+def test_all_production_step_defaults_use_deck_owner():
+    import inspect
+    from gw.gw_config import _DEFAULTS, DynamicSigmaConfig
+    from gw.mpa.sigma import compute_sigma_c_mpa_omega_grid
+    expected = _DEFAULTS["sigma_quadrature_reduction_steps"]
+    assert DynamicSigmaConfig.quadrature_reduction_steps == expected
+    assert inspect.signature(compute_sigma_c_mpa_omega_grid).parameters[
+        "quadrature_reduction_steps"].default == expected
+
+
+def test_old_cache_namespace_is_not_opened(monkeypatch, tmp_path):
+    from gw.sigma_box_plan import _rule_cache_lookup
+    (tmp_path / "rule_old.npz").write_bytes(b"old-schema")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("a prior-schema rule must be skipped before np.load")
+
+    monkeypatch.setattr("gw.sigma_box_plan.np.load", forbidden)
+    result, warnings = _rule_cache_lookup(
+        str(tmp_path), (-2., -.3, .05, .4), 1e-4, True,
+        noise_amplification_cap=1e9, reduction_steps=10)
+    assert result is None and not warnings
+
+
+@pytest.mark.parametrize("steps", [None, 0, 10])
+@pytest.mark.parametrize("debug", [False, True])
+def test_receipt_records_operative_budget_and_rule_identity_on_disk(
+        monkeypatch, tmp_path, steps, debug):
+    from gw.production_report import GWProductionReport
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr("gw.sigma_box_plan.process_rank", lambda: 0)
+    monkeypatch.setenv("LORRAX_UNIFORM_RULE_BACKEND", "numpy")
+    path = tmp_path / "gwjax.out"
+    report = GWProductionReport(
+        str(path), runtime=SimpleNamespace(process_index=0),
+        debug=debug, stdout=lambda *_: None)
+    try:
+        plan_sigma_windows(
+            _summaries(), [_branch()], np.array([.2, .5]), .1,
+            eps=1e-4, reduction_seconds=120., reduction_steps=steps,
+            cache_dir=None, print_fn=report.legacy_print)
+    finally:
+        report.close()
+    prefix = "Sigma quadrature receipt: "
+    lines = [line[len(prefix):] for line in path.read_text().splitlines()
+             if line.startswith(prefix)]
+    assert len(lines) == 1
+    receipt = json.loads(lines[0])
+    policy = receipt["reduction_budget"]
+    assert policy["steps"] == steps and policy["seconds"] == 120.
+    assert policy["mode"] == ("seconds" if steps is None else "steps")
+    assert policy["exhaustion"] == (
+        "last_certified_rule" if steps is None else "refuse_on_timeout")
+    assert receipt["backend_policy"] == "numpy"
+    assert receipt["rule_cache_schema"] == "sigma-box-ry-budget-v3"
+    assert receipt["cache_dir"] is None
+    windows = [window for branch in receipt["branches"]
+               for window in branch["windows"]]
+    assert windows
+    for window in windows:
+        assert window["reduction_budget"] == policy
+        assert len(window["node_digest"]) == 16
+        assert window["cache_status"] == "off"
+        assert len(window["box_ry"]) == 4
+        assert window["sup_error"] <= window["eps"]
+
+
+def test_watchdog_refusal_names_both_deck_keys_without_retry(monkeypatch):
+    from gw.sigma_box_plan import _fit_rule
+    calls = []
+
+    def expired(*args, **kwargs):
+        calls.append(kwargs)
+        raise TimeoutError("watchdog")
+
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", expired)
+    spec = make_sigma_box_spec(
+        name="crossing", frequencies=(-2., 2.), states=(-.2, .2),
+        pole_stats=((1., 2., .5, 1.),), pole_sign=1., eta_ry=.1)
+    with pytest.raises(RuntimeError, match="sigma_quadrature_reduction_seconds=20") as exc:
+        _fit_rule(spec, 1e-4, 20., None, .1, reduction_steps=10)
+    assert "sigma_quadrature_reduction_steps=10" in str(exc.value)
+    assert calls == [{"time_budget": 20., "reduction_steps": 10}]
+
+
+def test_cache_never_substitutes_clock_and_step_rules(tmp_path):
+    from gw.sigma_box_plan import _rule_cache_lookup, _rule_cache_store
+    rule = _fake_rule((-2., -.3, .05, .4), 1e-4)
+    _rule_cache_store(str(tmp_path), rule, 1., reduction_steps=None)
+    best, _ = _rule_cache_lookup(
+        str(tmp_path), rule.box, 1e-4, True,
+        noise_amplification_cap=1e9, reduction_steps=10)
+    assert best is None
+    _rule_cache_store(str(tmp_path), rule, 1., reduction_steps=10)
+    best, _ = _rule_cache_lookup(
+        str(tmp_path), rule.box, 1e-4, True,
+        noise_amplification_cap=1e9, reduction_steps=10)
+    assert best is not None

@@ -145,10 +145,11 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 if config.write_w or config.write_poles:
                     from file_io.shared_pole_store import export_shared_pole_outputs
                     timing.fence("spole.outputs")
-                    export_shared_pole_outputs(handle, meta=meta, config=config,
-                        mesh_xy=mesh_xy, source_wfn=getattr(wfn, "_filename", None),
-                        run_dir=run_dir, label=label, print_fn=print_fn,
-                        tables=_shared_pole_tables(meta, sym, centroid_indices))
+                    with timing.section("spole.outputs"):
+                        export_shared_pole_outputs(handle, meta=meta, config=config,
+                            mesh_xy=mesh_xy, source_wfn=getattr(wfn, "_filename", None),
+                            run_dir=run_dir, label=label, print_fn=print_fn,
+                            tables=_shared_pole_tables(meta, sym, centroid_indices))
                 return dict(shared_pole=handle)
         root = Path(run_dir).resolve() / (str(label) + "_shared_pole")
         from common.collectives import rank0_transaction
@@ -218,9 +219,10 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         if config.write_w or config.write_poles:
             from file_io.shared_pole_store import export_shared_pole_outputs
             timing.fence("spole.outputs")
-            receipts["outputs"] = export_shared_pole_outputs(handle, meta=meta,
-                config=config, mesh_xy=mesh_xy, source_wfn=getattr(wfn, "_filename", None),
-                run_dir=run_dir, label=label, tables=tables, print_fn=print_fn)
+            with timing.section("spole.outputs"):
+                receipts["outputs"] = export_shared_pole_outputs(handle, meta=meta,
+                    config=config, mesh_xy=mesh_xy, source_wfn=getattr(wfn, "_filename", None),
+                    run_dir=run_dir, label=label, tables=tables, print_fn=print_fn)
         if tensors_filename is not None:
             receipts["restart_member"] = register_shared_pole_restart_member(
                 tensors_filename, handle["path"], expected_identity=identity,

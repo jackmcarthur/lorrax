@@ -213,7 +213,8 @@ _FREQUENCY_FIT_NAMES = (
 # numerical module lazy, like every other SciPy-backed builder below, so a
 # catalog-only import still pays no solver dependency.
 _UNIFORM_RULE_NAMES = (
-    "UniformRule", "box_samples", "build_uniform_rule",
+    "UniformRule", "box_samples", "build_uniform_rule", "uniform_rule_budget",
+    "uniform_rule_backend_policy",
     "rule_roundoff_amplification", "rule_sup_error",
 )
 

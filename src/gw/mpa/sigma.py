@@ -18,6 +18,7 @@ from common import timing
 from common.progress import LoopProgress
 from common.units import RYD_TO_EV
 from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
+from gw.gw_config import DynamicSigmaConfig
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import SigmaOmegaResult, _residue_for_space, sigma_band_axis
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
@@ -1244,7 +1245,7 @@ def compute_sigma_c_mpa_omega_grid(
     quadrature_reduction_seconds,
     quadrature_cache_dir,
     omega_grid_step_ry,
-    quadrature_reduction_steps=None,
+    quadrature_reduction_steps=DynamicSigmaConfig.quadrature_reduction_steps,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
     pole_batch_size=4,
     fit_identity=None,

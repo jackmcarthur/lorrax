@@ -134,20 +134,56 @@ def test_jax_backend_on_cpu_matches_numpy_on_a_small_crossing_box(monkeypatch):
     assert abs(rule.node_count - ref.node_count) <= 3, (rule.node_count, ref.node_count)
 
 
-def test_step_budget_is_deterministic_and_ignores_the_clock():
-    """``reduction_steps`` makes the accepted rule a function of the inputs:
-    two builds agree bit for bit, and a wall budget passed alongside is
-    ignored (the same rule again), unlike the wall-clock mode whose node
-    count depends on how far the reduction got before the deadline."""
+def test_step_budget_is_deterministic_when_watchdog_allows_completion():
+    """Different nonbinding watchdogs must not select different rule bytes."""
     box = (2.0 * ETA, 400.0 * ETA, ETA, 30.0 * ETA)
-    first = build_uniform_rule(box, 1.0e-4, reduction_steps=3)
-    second = build_uniform_rule(box, 1.0e-4, reduction_steps=3)
-    third = build_uniform_rule(box, 1.0e-4, reduction_steps=3, time_budget=1e-3)
+    first = build_uniform_rule(box, 1.0e-4, reduction_steps=3, backend="numpy")
+    second = build_uniform_rule(
+        box, 1.0e-4, reduction_steps=3, time_budget=120., backend="numpy")
     _check(first, box, 1.0e-4)
     np.testing.assert_array_equal(first.times, second.times)
     np.testing.assert_array_equal(first.weights, second.weights)
-    np.testing.assert_array_equal(first.times, third.times)
-    np.testing.assert_array_equal(first.weights, third.weights)
-    # fewer passes cannot reach fewer nodes than more passes
-    more = build_uniform_rule(box, 1.0e-4, reduction_steps=12)
+    more = build_uniform_rule(box, 1.0e-4, reduction_steps=12, backend="numpy")
     assert more.node_count <= first.node_count
+
+
+def test_step_watchdog_refuses_even_the_zero_pass_start(monkeypatch):
+    import minimax.uniform_rule as owner
+    clock = [0.]
+    original = owner._RayFamily.interpolatory
+
+    def delayed_start(self):
+        result = original(self)
+        clock[0] = 2.
+        return result
+
+    monkeypatch.setattr(owner.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(owner._RayFamily, "interpolatory", delayed_start)
+    with pytest.raises(TimeoutError, match="no clock-selected partial rule"):
+        build_uniform_rule((.1, .3, .02, .02), 1e-4,
+                           reduction_steps=0, time_budget=1., backend="numpy")
+
+
+def test_pass_boundary_watchdog_refuses_instead_of_returning_best():
+    from minimax.uniform_rule import _within_reduction_deadline
+    with pytest.raises(TimeoutError, match="time_budget"):
+        _within_reduction_deadline(-1., 10)
+    assert not _within_reduction_deadline(-1., None)
+
+
+@pytest.mark.parametrize("seconds,steps", [(0., 10), (float("nan"), 0),
+                                         (1., -1), (1., 1.5), (1., True)])
+def test_invalid_budget_refuses_before_build(seconds, steps):
+    from minimax import uniform_rule_budget
+    with pytest.raises(ValueError):
+        uniform_rule_budget(seconds, steps)
+
+
+def test_backend_receipt_uses_the_fitter_policy_resolver(monkeypatch):
+    from minimax import uniform_rule_backend_policy
+    monkeypatch.setenv("LORRAX_UNIFORM_RULE_BACKEND", " AUTO ")
+    assert uniform_rule_backend_policy() == "auto"
+    assert uniform_rule_backend_policy("numpy") == "numpy"
+    monkeypatch.setenv("LORRAX_UNIFORM_RULE_BACKEND", "invalid")
+    with pytest.raises(ValueError, match="must be numpy, jax or auto"):
+        uniform_rule_backend_policy()

@@ -43,7 +43,9 @@ flips ``Im d`` and leaves the real corners alone.
    the off-ray cap is built into the model.  A candidate is kept while the
    sup error on a FINER check cloud stays below ``eps`` and the
    term-cancellation ratio below ``kappa_cap``.  ``time_budget`` bounds the
-   reduction and returns the best accepted rule at the deadline.
+   reduction in legacy clock mode, returning the best accepted rule at a
+   checkpoint. With fixed ``reduction_steps`` it is instead a refusal watchdog;
+   see ``uniform_rule_budget``.
 
 Why the reduction works on the cloud and not on the SVD moments: the
 truncated SVD model is exact only on the ray, and its dropped tail grows like
@@ -561,8 +563,8 @@ class _CloudFit:
         """Gauss-type reduction with lookahead, bounded by ``deadline`` or,
         when ``max_steps`` is given, by that many loop passes (a batch
         attempt or a single-removal round each) -- a budget that depends on
-        the inputs alone, not on the clock, so two machines produce the same
-        rule.
+        the inputs rather than clock-selected work. Bit reproducibility also
+        requires the same numerical backend, libraries and threading.
 
         The start is first polished to the optimum for its node count; if
         even that is not accepted the caller keeps the interpolatory rule.
@@ -606,8 +608,9 @@ class _CloudFit:
         best = (s.copy(), w.copy())
         batch = max(1, int(batch_frac * s.size))
         steps = 0
-        while s.size > 2 and time.perf_counter() < deadline and (
-                max_steps is None or steps < int(max_steps)):
+        while s.size > 2 and (max_steps is None or steps < max_steps):
+            if not _within_reduction_deadline(deadline, max_steps):
+                break
             steps += 1
             order = np.argsort(self.loo_scores(s, w))
             if batch > 1:
@@ -1035,6 +1038,18 @@ class UniformRule:
                 f"kappa {self.kappa_max:.3g}, {self.seconds:.1f} s")
 
 
+def uniform_rule_backend_policy(backend=None):
+    """Return the validated backend policy used by fitting and provenance.
+
+    An explicit policy overrides the environment. Hardware-dependent ``auto``
+    selection remains in the fitter; this receipt names the requested policy.
+    """
+    choice = (backend or os.environ.get("LORRAX_UNIFORM_RULE_BACKEND", "numpy")).strip().lower()
+    if choice not in ("numpy", "jax", "auto"):
+        raise ValueError("LORRAX_UNIFORM_RULE_BACKEND must be numpy, jax or auto")
+    return choice
+
+
 def _select_backend(backend, n_start, cloud_size):
     """``numpy`` | ``jax`` | ``auto`` (env ``LORRAX_UNIFORM_RULE_BACKEND``).
 
@@ -1042,9 +1057,7 @@ def _select_backend(backend, n_start, cloud_size):
     problem is large enough to pay its launch and compile overhead (start
     rank >= 40, cloud >= 2000): the small sign-definite tails finish in a few
     seconds on numpy and would spend longer compiling."""
-    choice = (backend or os.environ.get("LORRAX_UNIFORM_RULE_BACKEND", "numpy")).strip().lower()
-    if choice not in ("numpy", "jax", "auto"):
-        raise ValueError("LORRAX_UNIFORM_RULE_BACKEND must be numpy, jax or auto")
+    choice = uniform_rule_backend_policy(backend)
     if choice == "numpy":
         return "numpy"
     try:
@@ -1055,6 +1068,46 @@ def _select_backend(backend, n_start, cloud_size):
     if choice == "jax":
         return "jax"
     return "jax" if (accelerator and n_start >= 40 and cloud_size >= 2000) else "numpy"
+
+
+def uniform_rule_budget(time_budget=None, reduction_steps=None):
+    """Describe and validate the reduction policy shared by fitters and receipts.
+
+    Steps select numerical work. With steps set, seconds are a cooperative
+    refusal watchdog: expiration never selects a partially reduced rule.
+    Without steps, seconds select the last accepted rule, as historically.
+    Checks occur between basis attempts/removal passes and before return;
+    an entire attempt/pass can overrun. The step supervisor owns a strict
+    wall limit. Neither budget relaxes the error certificate.
+    """
+    if time_budget is not None and (
+            not np.isfinite(time_budget) or float(time_budget) <= 0.0):
+        raise ValueError("time_budget must be finite and > 0 when set")
+    if reduction_steps is not None and (
+            isinstance(reduction_steps, (bool, np.bool_))
+            or not np.isfinite(reduction_steps)
+            or int(reduction_steps) != reduction_steps or reduction_steps < 0):
+        raise ValueError("reduction_steps must be a nonnegative integer or None")
+    return {
+        "mode": "seconds" if reduction_steps is None else "steps",
+        "steps": None if reduction_steps is None else int(reduction_steps),
+        "seconds": None if time_budget is None else float(time_budget),
+        "exhaustion": ("last_certified_rule" if reduction_steps is None
+                       else "refuse_on_timeout"),
+    }
+
+
+def _within_reduction_deadline(deadline, max_steps):
+    """A deterministic fit either finishes its work or refuses at a checkpoint."""
+    if time.perf_counter() < deadline:
+        return True
+    if max_steps is not None:
+        raise TimeoutError(
+            "uniform rule time_budget watchdog expired under reduction_steps; "
+            "no clock-selected partial rule returned. Increase time_budget "
+            "or reduce reduction_steps; a strict wall limit belongs to the "
+            "step supervisor (linear algebra calls are not preempted).")
+    return False
 
 
 def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
@@ -1088,8 +1141,12 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     ``kappa_cap`` is the largest cancellation ratio accepted.  ``time_budget``
     (seconds, from the start of this call) bounds the Gauss reduction and
     returns the best accepted rule at the deadline; the interpolatory rule is
-    always available after about a second, so the budget trades planning
-    wall for node count and nothing else.  Never refuses a finite box.
+    available after initial construction and certification. With
+    ``reduction_steps`` set, the fixed pass count selects numerical work and
+    ``time_budget`` instead refuses an unfinished fit at a checkpoint; it
+    never returns a clock-selected partial rule. Zero passes still certifies
+    the initial rule. Linear algebra calls are not preempted, so this is a
+    cooperative watchdog, not a strict wall bound; see uniform_rule_budget.
     ``backend`` (``numpy`` | ``jax`` | ``auto``, default the environment's
     ``LORRAX_UNIFORM_RULE_BACKEND`` or ``numpy`` when unset) chooses where
     the reduction's inner solves run; see ``_JaxCloudFit``.  Both backends
@@ -1105,7 +1162,10 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     if not (np.isfinite([re_lo, re_hi, im_lo, im_hi]).all() and re_lo <= re_hi
             and 0.0 < im_lo <= im_hi):
         raise ValueError(f"invalid support box {box!r}")
+    budget = uniform_rule_budget(time_budget, reduction_steps)
     t0 = time.perf_counter()
+    deadline = (float("inf") if budget["seconds"] is None
+                else t0 + budget["seconds"])
     if relative is None:
         relative = re_lo > 0.0 or re_hi < 0.0
     # rho_of: the acceptance currency (sup); fit_of: the same currency with
@@ -1142,11 +1202,6 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
             e_, k_ = _score_cloud(fit, s_, w_, d_check, rho_check)
             return e_ <= eps and k_ <= kappa_cap
 
-        # ``reduction_steps`` makes the budget a pass count: the clock is
-        # ignored and the same inputs give the same rule on any machine.
-        deadline = t0 + (
-            float(time_budget)
-            if time_budget is not None and reduction_steps is None else 1e30)
         # The start must be accepted before anything can be removed.  In the
         # relative currency a loose eps (1e-3) with the default eps/10 basis
         # can leave the near corner of a wide box (R ~ 500) above eps even
@@ -1154,6 +1209,8 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
         # at the start and a few seconds, so escalate rather than refuse.
         red = None
         for extra in (1.0, 10.0, 100.0):
+            if reduction_steps is not None:
+                _within_reduction_deadline(deadline, reduction_steps)
             if extra > 1.0:
                 fam = _RayFamily(d, theta, S, eps / (trunc * extra), rho)
                 s, w = fam.interpolatory()
@@ -1176,6 +1233,8 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     else:
         times, weights = fam.to_rule(s, w)
     sup, kappa = rule_sup_error(times, weights, d_check, rho_check)
+    if reduction_steps is not None:
+        _within_reduction_deadline(deadline, reduction_steps)
     return UniformRule(
         times=times, weights=weights, box=(re_lo, re_hi, im_lo, im_hi),
         eps=float(eps), relative=bool(relative), theta_deg=float(np.rad2deg(theta)),

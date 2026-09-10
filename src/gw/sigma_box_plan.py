@@ -38,6 +38,8 @@ from minimax import (
     UniformRule,
     box_samples,
     build_uniform_rule,
+    uniform_rule_budget,
+    uniform_rule_backend_policy,
     rule_roundoff_amplification,
 )
 
@@ -47,7 +49,7 @@ _RUNTIME_NOISE_EPSILON = 6.0e-8
 _RUNTIME_NOISE_SAFETY = 0.05
 _SC_STATE_PAD_EV = 2.0
 _SC_POLE_PAD_FRACTION = 0.10
-_RULE_CACHE_SCHEMA = "sigma-box-ry-noise-v2"
+_RULE_CACHE_SCHEMA = "sigma-box-ry-budget-v3"
 
 
 def _rule_digest(rule, noise_amplification, reduction_steps):
@@ -151,7 +153,10 @@ def _product_geometry(branches, eta, edge_factor):
 
 
 def _state_products(branch, state_edge, pole_edge):
-    """The sole owner of the three-window Cartesian partition."""
+    """Partition state × pole pairs into disjoint resonant and tail products.
+
+    Each Cartesian product factors into G(t) W(t); every pair appears once.
+    """
     crossing = ((branch.space == "cond" and not branch.neg_omega_half)
                 or (branch.space == "val" and branch.neg_omega_half))
     if crossing:
@@ -289,7 +294,8 @@ def _rule_cache_lookup(
     warnings = []
     try:
         names = [name for name in os.listdir(directory)
-                 if name.endswith(".npz")]
+                 if name.startswith(f"rule_{_RULE_CACHE_SCHEMA}_")
+                 and name.endswith(".npz")]
     except OSError as exc:
         path = os.path.abspath(directory)
         warnings.append(
@@ -298,7 +304,7 @@ def _rule_cache_lookup(
             f"path={path} error={type(exc).__name__}: {exc}")
         return None, tuple(warnings)
     best = None
-    for name in names:
+    for name in sorted(names):
         path = os.path.abspath(os.path.join(directory, name))
         try:
             with np.load(path) as data:
@@ -384,7 +390,7 @@ def _rule_cache_store(directory, rule, noise_amplification,
                 "or non-finite rule (nothing written)")
     steps = -1 if reduction_steps is None else int(reduction_steps)
     digest = _rule_digest(rule, noise_amplification, steps)
-    path = os.path.abspath(os.path.join(directory, f"rule_{digest}.npz"))
+    path = os.path.abspath(os.path.join(directory, f"rule_{_RULE_CACHE_SCHEMA}_{digest}.npz"))
     temporary = None
     try:
         os.makedirs(directory, exist_ok=True)
@@ -457,12 +463,13 @@ def _fit_rule(
     spec, eps, reduction_seconds, cache_dir, eta, *, cache_build_widen=True,
     reduction_steps=None,
 ):
+    # Certify 1/d ≈ sum_j w_j exp(i t_j d) over the entire denominator box.
+    policy = uniform_rule_budget(reduction_seconds, reduction_steps)
     requested_box = spec["box"]
     # This is exactly the builder's default currency predicate.  It is used
     # here only to search cache metadata; cache misses still leave the choice
     # to build_uniform_rule(relative=None).
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
-    retry_note = ""
     noise_budget = _RUNTIME_NOISE_SAFETY * eps
     noise_amplification_cap = noise_budget / _RUNTIME_NOISE_EPSILON
     cached, cache_lookup_warnings = _rule_cache_lookup(
@@ -476,12 +483,10 @@ def _fit_rule(
         build_box = (_cache_build_box(requested_box, eta)
                      if cache_dir is not None and cache_build_widen
                      else requested_box)
-        # A step budget replaces the wall clock: deterministic across
-        # machines (sigma_quadrature_reduction_steps).
-        build_kwargs = (
-            {"reduction_steps": int(reduction_steps)}
-            if reduction_steps is not None
-            else {"time_budget": reduction_seconds})
+        # Fixed passes remove clock-selected numerical work. Reproducibility
+        # still depends on the source, numerical backend and cache inventory.
+        build_kwargs = {"time_budget": policy["seconds"],
+                        "reduction_steps": policy["steps"]}
         if relative:
             # For a sign-definite rule the service's kappa is
             # sum|term|/|Q|, while Sigma's noise amplification is
@@ -492,22 +497,27 @@ def _fit_rule(
             # service's ordinary cancellation cap.
             build_kwargs["kappa_cap"] = (
                 noise_amplification_cap / (1.0 + eps))
-        rule = build_uniform_rule(build_box, eps, **build_kwargs)
+        try:
+            rule = build_uniform_rule(build_box, eps, **build_kwargs)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"Sigma box window {spec['name']!r} refused: "
+                f"sigma_quadrature_reduction_seconds={policy['seconds']:g} "
+                f"watchdog expired with sigma_quadrature_reduction_steps="
+                f"{policy['steps']}; no partial rule accepted. Remedy: increase "
+                "sigma_quadrature_reduction_seconds or reduce "
+                "sigma_quadrature_reduction_steps. Checks occur between basis "
+                "attempts/removal passes and before return; the step supervisor "
+                "owns the strict wall limit."
+            ) from exc
         cache_status = "miss" if cache_dir is not None else "off"
-        if not _rule_is_certified(rule, eps):
-            # The reduction budget can expire and return the interpolatory
-            # start.  A budget is not a correctness switch: try once more
-            # with five times the time before refusing.  A non-finite
-            # certificate retries too (it is a failed build, not a verdict).
-            retry_kwargs = dict(build_kwargs)
-            retry_kwargs["time_budget"] = 5.0 * float(reduction_seconds)
-            retry = build_uniform_rule(build_box, eps, **retry_kwargs)
-            retry_note = (f"; the 5x-budget retry achieved sup="
-                          f"{float(retry.sup_error):.6g} with "
-                          f"{int(np.asarray(retry.times).size)} nodes")
-            if _rule_is_certified(retry, eps):
-                rule = retry
-                cache_status += ":retry"
+    # Initial certification precedes removal passes and ignores the legacy
+    # reduction clock. The service already tries three tighter bases. A
+    # failed start cannot be repaired by either more passes or more seconds;
+    # a duplicate build is not a retry in either budget currency.
+    budget_key = ("sigma_quadrature_reduction_seconds"
+                  if policy["mode"] == "seconds" else
+                  "sigma_quadrature_reduction_steps")
 
     # ONE ACCEPTANCE ON EVERY PATH.  One-shot, fixed-SC initialization and
     # its rebuilds all require the certified sup error at or below eps; the
@@ -522,10 +532,10 @@ def _fit_rule(
             f"is not finite ({int(np.asarray(rule.times).size)} nodes on box "
             f"{tuple(round(float(v), 6) for v in rule.box)}, kind "
             f"{spec.get('kind', '?')}, cache={cache_status}{cache_note}"
-            f"{retry_note}). Remedy: a "
+            f"; no retry under {budget_key}: initial certification is "
+            f"independent of the removal budget). Remedy: a "
             f"sign-preserving or split product window (the SC pad now keeps "
-            f"sign-definite supports sign-definite), a longer "
-            f"sigma_quadrature_reduction_seconds, or a certified crossing "
+            f"sign-definite supports sign-definite), or a certified crossing "
             f"rule; do not loosen sigma_quadrature_eps to admit this rule.")
     # Runtime perturbations must be bounded in the SAME currency as the
     # approximation.  ``kappa = sum|term|/|Q|`` is already relative for a
@@ -579,6 +589,7 @@ def _fit_rule(
         "noise_bound": noise_bound, "noise_budget": noise_budget,
         "roundoff_amplification": noise_amplification,
         "node_digest": node_digest,
+        "reduction_budget": policy,
         "cache_write_warning": cache_write_warning,
         "cache_lookup_warnings": cache_lookup_warnings,
         "one_line": rule.one_line(),
@@ -982,6 +993,7 @@ def plan_sigma_windows(
     started = time.perf_counter()
     eta, tolerance = float(eta_ry), float(eps)
     budget = float(reduction_seconds)
+    policy = uniform_rule_budget(budget, reduction_steps)
     edge = float(edge_factor)
     if not np.isfinite(eta) or eta <= 0.0:
         raise ValueError("sigma_quadrature requires eta_ry > 0")
@@ -1048,7 +1060,7 @@ def plan_sigma_windows(
         print_fn(
             f"  Sigma rule reduction: deterministic budget of "
             f"{int(reduction_steps)} passes per window "
-            "(sigma_quadrature_reduction_seconds ignored)")
+            f"(sigma_quadrature_reduction_seconds={budget:g} refusal watchdog)")
     if fixed_rule_session is None:
         fits, fit_rows = fit_sigma_box_specs(
             specs, eta, eps=tolerance, reduction_seconds=budget,
@@ -1122,6 +1134,7 @@ def plan_sigma_windows(
             "factor_growth": list(fit["factor_growth"]),
             "cache_status": fit["cache_status"],
             "fit_seconds": fit["seconds"],
+            "reduction_budget": fit["reduction_budget"],
             "sc_fixed_rule": fixed_rule_session is not None,
             "sc_fixed_padded_box_ry": (
                 None if fixed_rule_session is None else list(
@@ -1141,7 +1154,11 @@ def plan_sigma_windows(
         "planner": "uniform_denominator_boxes",
         "eta_ry": eta, "eps": tolerance,
         "rule_eps": tolerance,
-        "reduction_seconds": budget, "cache_dir": cache_dir,
+        "reduction_seconds": budget, "reduction_steps": reduction_steps,
+        "reduction_mode": policy["mode"],
+        "reduction_budget": policy,
+        "cache_dir": cache_dir, "rule_cache_schema": _RULE_CACHE_SCHEMA,
+        "backend_policy": uniform_rule_backend_policy(),
         "n_windows": len(output),
         "window_tau_pairs": pairs, "distinct_tau_count": distinct,
         "plan_seconds": time.perf_counter() - started,
@@ -1167,6 +1184,10 @@ def plan_sigma_windows(
         })
     else:
         geometry["sc_fixed_quadrature"] = False
+    # Keep the accepted rule identity and its operative policy in the normal
+    # scientific report, including cache-off and repeated SC planning calls.
+    if process_rank() == 0:
+        print_fn("Sigma quadrature receipt: " + json.dumps(geometry, sort_keys=True))
     return output, geometry
 
 

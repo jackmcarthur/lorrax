@@ -1074,13 +1074,13 @@ def _export_spatial_header(path, source_wfn, meta, *, kind, source):
     rank0_transaction(path, stage="shared_pole.export_headers", write=append)
 
 
-@timing.timed("spole.outputs")
 def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                                run_dir, label, tables, print_fn):
     """Export current-map poles and/or fixed W samples through their writers.
 
-    Large arrays stay XY tiled. One parent (and one frequency for W) is
-    resident at a time. Existing packing, admission, commit and digest owners
+    Large arrays stay XY tiled. The copy loop holds one parent (and one
+    frequency for W) at a time; authentication uses the existing bounded
+    parent/column panels and exchanges only row hashes. Existing packing, admission, commit and digest owners
     are reused; the source stores are immutable, including on restart.
     The bank export retains its derivative and moment companions so it is
     readable by the existing bank reader. No screening or pole fit is rerun.
