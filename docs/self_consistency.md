@@ -388,3 +388,23 @@ check. Job58148928.8 with tighter resonant quadrature also refused that check.
 This enables the SC/head plumbing and certified quadrature retention; it does
 not establish shared-pole SC convergence or head accuracy. Detailed evidence:
 sandbox `reports/shared_pole_sc_implementation_2026-09-10/report.md`.
+<!-- The optional diagnostic below does not change the production restart contract. -->
+
+### Inspecting an SC state before shared-pole construction
+
+`tests/bench/shared_pole_sc_invariants.py -i RUN/cohsex.in --output RUN/diagnostics`
+observes a scalar Si P4 replay: rotation unitarity, complete centroid-space
+projector preservation, raw imaginary-axis response Hermiticity and moment
+symmetry. It saves the entering U, energies and occupations in
+`entry_rotation_NNNN.npz`; these are diagnostic state snapshots, not an
+accelerator-history checkpoint. Ordinary ISDF restart arrays are written
+at initialization and do not by themselves checkpoint each SC map.
+
+With `--entry PREVIOUS/entry_rotation_0001.npz`, the diagnostic rebuilds
+that state using the canonical rotation and stops before W/Sigma, after
+checking Gamma spectral projectors and the raw response at individual
+time points. This second mode is restricted to the unshifted scalar Si
+4x4x4 fixture. Use a new run directory with copied restart inputs. An
+off-axis response is not required to be Hermitian; a centroid overlap is
+not the physical Hilbert-space metric; occupied density can change under
+occupied-empty mixing even though the complete rotated space is conserved.
