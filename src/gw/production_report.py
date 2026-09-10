@@ -130,6 +130,11 @@ class GWProductionReport:
         end.  Exceptions still use stderr through the shared fail-fast path.
         """
         text = sep.join(str(v) for v in args)
+        # Every box plan carries a durable policy and accepted-rule receipt,
+        # including ordinary shared-pole runs with debug disabled.
+        if text.startswith("Sigma quadrature receipt: "):
+            self.progress(text)
+            return
         # Fixed-SC quadrature identity is a physics invariant, not backend
         # chatter: retain its compact receipt so every map's exact node set
         # and zero-rebuild claim remain auditable after live stdout is gone.

@@ -155,7 +155,7 @@ no campaign-planner route. The input reference owns the [budget contract](../inp
 
 ```
 sigma_quadrature_eps = 1e-4
-sigma_quadrature_reduction_steps = 10
+sigma_quadrature_reduction_steps = none
 sigma_quadrature_reduction_seconds = 120
 sigma_quadrature_cache_dir = auto
 ```

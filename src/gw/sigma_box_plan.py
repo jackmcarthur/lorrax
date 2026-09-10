@@ -1184,6 +1184,10 @@ def plan_sigma_windows(
         })
     else:
         geometry["sc_fixed_quadrature"] = False
+    # Keep the accepted rule identity and its operative policy in the normal
+    # scientific report, including cache-off and repeated SC planning calls.
+    if process_rank() == 0:
+        print_fn("Sigma quadrature receipt: " + json.dumps(geometry, sort_keys=True))
     return output, geometry
 
 

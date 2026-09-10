@@ -1,6 +1,7 @@
 """Conventions and wiring gates for the shared denominator-box plan."""
 
 import ast
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -651,7 +652,7 @@ def test_quadrature_deck_defaults_and_retired_sector_key(tmp_path):
     config = LorraxConfig.from_input_file(
         str(deck), print_fn=lambda *_args, **_kwargs: None)
     assert config.sigma.quadrature_eps == 1.0e-4
-    assert config.sigma.quadrature_reduction_steps == 10
+    assert config.sigma.quadrature_reduction_steps is None
     assert config.sigma.quadrature_reduction_seconds == 120.0
     assert config.sigma.quadrature_cache_dir == "auto"
 
@@ -870,18 +871,46 @@ def test_old_cache_namespace_is_not_opened(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("steps", [None, 0, 10])
-def test_receipt_records_operative_budget_and_rule_identity(monkeypatch, steps):
+@pytest.mark.parametrize("debug", [False, True])
+def test_receipt_records_operative_budget_and_rule_identity_on_disk(
+        monkeypatch, tmp_path, steps, debug):
+    from gw.production_report import GWProductionReport
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
-    _, receipt = plan_sigma_windows(
-        _summaries(), [_branch()], np.array([.2, .5]), .1,
-        eps=1e-4, reduction_seconds=120., reduction_steps=steps,
-        cache_dir=None, print_fn=lambda *_: None)
+    monkeypatch.setattr("gw.sigma_box_plan.process_rank", lambda: 0)
+    monkeypatch.setenv("LORRAX_UNIFORM_RULE_BACKEND", "numpy")
+    path = tmp_path / "gwjax.out"
+    report = GWProductionReport(
+        str(path), runtime=SimpleNamespace(process_index=0),
+        debug=debug, stdout=lambda *_: None)
+    try:
+        plan_sigma_windows(
+            _summaries(), [_branch()], np.array([.2, .5]), .1,
+            eps=1e-4, reduction_seconds=120., reduction_steps=steps,
+            cache_dir=None, print_fn=report.legacy_print)
+    finally:
+        report.close()
+    prefix = "Sigma quadrature receipt: "
+    lines = [line[len(prefix):] for line in path.read_text().splitlines()
+             if line.startswith(prefix)]
+    assert len(lines) == 1
+    receipt = json.loads(lines[0])
     policy = receipt["reduction_budget"]
     assert policy["steps"] == steps and policy["seconds"] == 120.
     assert policy["mode"] == ("seconds" if steps is None else "steps")
     assert policy["exhaustion"] == (
         "last_certified_rule" if steps is None else "refuse_on_timeout")
+    assert receipt["backend_policy"] == "numpy"
     assert receipt["rule_cache_schema"] == "sigma-box-ry-budget-v3"
+    assert receipt["cache_dir"] is None
+    windows = [window for branch in receipt["branches"]
+               for window in branch["windows"]]
+    assert windows
+    for window in windows:
+        assert window["reduction_budget"] == policy
+        assert len(window["node_digest"]) == 64
+        assert window["cache_status"] == "off"
+        assert len(window["box_ry"]) == 4
+        assert window["sup_error"] <= window["eps"]
 
 
 def test_watchdog_refusal_names_both_deck_keys_without_retry(monkeypatch):

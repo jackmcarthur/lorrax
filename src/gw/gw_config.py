@@ -2124,14 +2124,13 @@ _DEFAULTS = {
     # (relative paths are resolved beside the input deck).
     "sigma_quadrature_eps": 1.0e-4,
     "sigma_quadrature_reduction_seconds": 120.0,
-    # Work policy: fixed removal passes, with seconds as a cooperative
-    # refusal watchdog. The minimax uniform_rule_budget owner defines the
-    # exhaustion semantics; docs/input_reference.md owns the deck contract.
-    # Ten is a default work allowance, not a system-independent cost optimum.
-    # Zero still constructs/certifies the start; explicit "none" selects the
-    # legacy clock-selected rule. Reproducibility also needs fixed source,
-    # backend/libraries/threading and cache inventory.
-    "sigma_quadrature_reduction_steps": 10,
+    # Clock-selected reduction remains the default: fixed passes can refuse
+    # an otherwise certifiable window under the cooperative seconds watchdog.
+    # Explicit nonnegative steps select fixed work (zero still certifies the
+    # start). Clock-mode reproducibility remains unfixed. Budget/exhaustion
+    # semantics live in minimax.uniform_rule_budget; docs/input_reference.md
+    # owns the deck contract. No system-scaled work policy is implied here.
+    "sigma_quadrature_reduction_steps": None,
     "sigma_quadrature_cache_dir": "auto",
     # OCCUPANCY at which a band leaves a metallic Green's-function branch.
     # The Σ planner cuts on the branch WEIGHT (f on val, 1−f on cond), so
