@@ -241,6 +241,32 @@ def check_sentinel_refusal(mesh,path):
     assert not path.exists()
 
 
+def check_factor_validation(mesh, path=None):
+    """Reject each invalid payload, including a pole inversion across y shards."""
+    meta, _, _, _ = _fixture(mesh)
+    _, packed, poles, count = _model(meta)
+    cdev = _device(packed, mesh, P(None, 'x', None, 'y'))
+    pdev = _device(poles, mesh, P(None, 'y'))
+    store._check_factor(cdev, pdev, count)
+    cases = [('factor_nan', 'factor', (1, 0, 0, 0), np.nan),
+             ('factor_inf', 'factor', (1, 0, 0, 0), np.inf),
+             ('inactive_factor', 'factor', (0, 0, 0, 5), 1.),
+             ('pole_nan', 'pole', (1, 0), np.nan),
+             ('pole_zero', 'pole', (1, 0), 0.),
+             ('pole_negative', 'pole', (1, 0), -1.),
+             ('cross_shard_inversion', 'pole', (1, 3), poles[1, 1]/2),
+             ('inactive_pole', 'pole', (0, 5), 2.)]
+    for name, kind, index, value in cases:
+        c, lam = packed.copy(), poles.copy()
+        (c if kind == 'factor' else lam)[index] = value
+        with pytest.raises(ValueError, match='nonfinite|sentinel'):
+            store._check_factor(_device(c, mesh, P(None, 'x', None, 'y')),
+                                _device(lam, mesh, P(None, 'y')), count)
+    compiled = store._factor_valid.lower(cdev, pdev, count).compile()
+    if path is not None:
+        Path(str(path) + f'.rank{jax.process_index()}.hlo.txt').write_text(compiled.as_text())
+
+
 def check_empty_parents(mesh,path):
     meta,tables,recipe,identity=_fixture(mesh)
     _,packed,poles,count=_model(meta)
@@ -354,6 +380,7 @@ if __name__=='__main__':
                ('roundtrip_distributed',lambda m,p:check_roundtrip(m,p,'distributed')),
                ('finalization_resume',check_finalization_resume),
                ('empty_parents',check_empty_parents),
+               ('factor_validation',check_factor_validation),
                ('capacity_controls',check_capacity_controls),
                ('corruption',check_corruption),('sentinel',check_sentinel_refusal)]
         receipts=[]

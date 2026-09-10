@@ -44,6 +44,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common import timing
 from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
 from runtime.padding import PaddedAxis
@@ -560,7 +561,10 @@ def finalize_dynamic_sigma(
                 "finalize_dynamic_sigma: H_T requires scalar V_H")
         v_h_scalar = sig_h
 
-    with timing.section("gw_jax.dynamic_sigma_finalize"):
+    with timing.section("sigma.finalize_input_wait"):
+        jax.block_until_ready((sigma_c_body_omega, sigma_c_body_omega_unextrap,
+                               sig_x, sig_h))
+    with timing.section("gw_jax.dynamic_sigma_finalize") as finalize_section:
         sigma_c_omega = add_head_sigma_diag(
             sigma_c_body_omega, head_sigma_diag_w_kn_ry,
             band_axis=sigma_band_axis)
@@ -719,6 +723,8 @@ def finalize_dynamic_sigma(
             write_qsgw_sigma_cube(
                 sigma_omega_h5_path, sigma_xc_qsgw,
                 config=config, print_fn=print_fn)
+
+        finalize_section.watch(sigma_c_omega, sigma_xc_qsgw, sigma_xc_qsgw_unextrap)
 
     _band_attrs = ((band_extrapolation or {}).get("attrs") or {})
     _band_counts_raw = _band_attrs.get("band_counts")
@@ -1287,15 +1293,20 @@ def compute_sigma_xc(
     else:
         _bispinor_sigma = (
             wfns_transverse is not None and bispinor_v_q_path is not None)
-        sigma_x_result = compute_sigma_x(
-            wfns, V_q, meta, mesh_xy,
-            Gij=Gij,
-            static_head_terms=static_head_terms,
-            wfns_transverse=wfns_transverse,
-            bispinor_v_q_path=bispinor_v_q_path,
-            occupation_state=occupation_state,
-            return_transverse=_bispinor_sigma,
-        )
+        # Charge pending input work to its boundary, not to exchange.
+        with timing.section("sigma.input_wait"):
+            jax.block_until_ready((wfns, wfns_transverse, V_q, Gij))
+        with timing.section("sigma.exchange") as sec:
+            sigma_x_result = compute_sigma_x(
+                wfns, V_q, meta, mesh_xy,
+                Gij=Gij,
+                static_head_terms=static_head_terms,
+                wfns_transverse=wfns_transverse,
+                bispinor_v_q_path=bispinor_v_q_path,
+                occupation_state=occupation_state,
+                return_transverse=_bispinor_sigma,
+            )
+            sec.watch(sigma_x_result)
         if _bispinor_sigma:
             sig_x, sig_x_b = sigma_x_result
             sigma_lorentz = jnp.stack((
@@ -1318,9 +1329,11 @@ def compute_sigma_xc(
         sig_h = jnp.asarray(0, dtype=sig_x.dtype)
         h_transverse = None
     else:
-        sig_h, h_transverse = _compute_live_hartree(
-            config, meta, band_slices, mesh_xy,
-            wfn=wfn, sym=sym, print_fn=print_fn)
+        with timing.section("sigma.hartree") as sec:
+            sig_h, h_transverse = _compute_live_hartree(
+                config, meta, band_slices, mesh_xy,
+                wfn=wfn, sym=sym, print_fn=print_fn)
+            sec.watch(sig_h, h_transverse)
         sig_h = jnp.asarray(sig_h, dtype=sig_x.dtype)
         if hartree_basis_rotation is not None:
             rotation = _place_band_rotation(

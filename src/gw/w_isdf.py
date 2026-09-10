@@ -687,7 +687,6 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 def _get_chi_fractional_contour_kernel(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int,
     *, layout: str = "legacy", face_shape=None, k_unfold_plan=None,
-    selected_q=None, pair_mode="retarded", bank_carry=False,
 ):
     """Retarded finite-occupation chi0 on one positive-time sweep.
 
@@ -705,10 +704,6 @@ def _get_chi_fractional_contour_kernel(
     ``_get_chi_minimax_kernel``'s own legacy/face dispatcher split — the
     cache-management lines below moved here from the (now pure-builder)
     legacy body, exactly as that split's own precedent.
-
-    Bank selection, pair mode and carry layout are static parts of this
-    same cache key. Current wavefunctions, energies and projection rows
-    remain operands, so rebuilding a bank on the same mesh reuses code.
     """
     from ffi import ffi_dial_key
 
@@ -720,13 +715,8 @@ def _get_chi_fractional_contour_kernel(
         raise ValueError(
             f"_get_chi_fractional_contour_kernel: layout must be 'legacy' "
             f"or 'face', got {layout!r}")
-    selected_q = None if selected_q is None else tuple(int(q) for q in selected_q)
-    if layout == "legacy" and (
-            selected_q is not None or pair_mode != "retarded" or bank_carry):
-        raise ValueError("fractional contour bank selection/carry requires layout='face'")
     cache_key = ("fractional_contour", id(mesh_xy), grid, ffi_dial_key(),
-                 n_out, layout, face_shape, id(k_unfold_plan),
-                 selected_q, pair_mode, bool(bank_carry))
+                 n_out, layout, face_shape, id(k_unfold_plan))
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -738,8 +728,7 @@ def _get_chi_fractional_contour_kernel(
                 "_get_chi_fractional_contour_kernel(layout='face') requires "
                 "face_shape=(nk, nb_full, n_rmu, nspinor)")
         kernel = _get_chi_fractional_contour_kernel_face(
-            mesh_xy, grid, n_out, face_shape, k_unfold_plan=k_unfold_plan,
-            selected_q=selected_q, pair_mode=pair_mode, bank_carry=bank_carry)
+            mesh_xy, grid, n_out, face_shape, k_unfold_plan=k_unfold_plan)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
@@ -1308,17 +1297,11 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     ζ-fit's distributed rank-truncate tier
     (:func:`isdf.core._factor_c_q_distributed_rank_truncate`):
 
-    1. **A build** — per q-block, ``A = I − V·(pref·χ)`` as a 2-D block
-       GEMM inside ``shard_map``: rank (x, y) all-gathers V's row block
-       along 'y' (full k for its i rows, μ·μ/Px per rank) and χ's column
-       block along 'x' (full k for its j columns, μ·μ/Py per rank),
-       multiplies locally, and subtracts from its identity tile.  The
-       gathers are STRUCTURAL — inside shard_map the partitioner cannot
-       hoist them into a full-stack gather (the per_q-tier lesson,
-       quality pattern #4).  The q loop is chunked HOST-side so one
-       collective instruction never exceeds ``LORRAX_COLLECTIVE_CHUNK_MB``
-       (the AF transport bound; separate XLA executions cannot be
-       re-combined by a compiler pass).
+    1. **A build** — per q-block, ``A = I − V·(pref·χ)`` through
+       the service's bounded-panel GEMM. Each contraction panel is
+       broadcast along x/y and accumulated into the existing output face;
+       no full row or column operand is gathered. The two live panels
+       share one output-face-sized workspace budget per q.
     2. **Factor + backsolve** — ONE resolved
        :class:`distrib_la.Plan` for ``solve_lu`` with
        ``backend='distributed'`` (ScaLAPACK ``pzgetrf``/``pzgetrs`` on a
@@ -1327,8 +1310,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
 
     **No rank ever materialises a full (μ, μ) tile**: inputs, A, the LU
     factors and W all stay ``P(None,'x','y')`` (per-rank blocks of
-    μ/Px × μ/Py; the largest per-rank transient is the μ·μ/min(Px,Py)
-    gathered GEMM operand).  W lands natively in ``P(None,'x','y')`` —
+    μ/Px × μ/Py; operand-panel residency is bounded by one face).  W lands natively in ``P(None,'x','y')`` —
     no relayout, unlike the local plan.
 
     Padding contract, and why it is exact: V and χ pad rows/cols are
@@ -1414,34 +1396,35 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
         return jnp.where(logical[None, :, :], A_loc,
                          jnp.zeros((), dtype=A_loc.dtype))
 
-    # The two collectives ``_a_local`` emits, per q (2-D block GEMM):
-    #   all_gather('y')  V   (μ/Px, μ/Py) -> (μ/Px, μ)  = μ²/Px · 16 B
-    #   all_gather('x')  χ   (μ/Px, μ/Py) -> (μ, μ/Py)  = μ²/Py · 16 B
-    # The BIGGER of the two sets the q-block (see ``_chunk_q``).
-    per_q_coll = max(n_ext * (n_ext // px), n_ext * (n_ext // py)) * 16
+    # Replacement workspace never grows into a full row/column: the pair
+    # of operand panels shares one face-sized slot, with a one-column floor
+    # for degenerate tiny tiles. The q planner bounds this same live slot.
+    per_q_panel_bytes = 16 * max((n_ext // px) * (n_ext // py),
+                                 n_ext // px + n_ext // py)
+    per_q_coll = per_q_panel_bytes
 
-    @partial(shard_map, mesh=mesh_xy,
-             in_specs=(P(None, 'x', 'y'), P(None, 'x', 'y')),
+    @partial(shard_map, mesh=mesh_xy, in_specs=P(None, 'x', 'y'),
              out_specs=P(None, 'x', 'y'), check_vma=False)
-    def _a_local(V_loc, chi_loc):
-        # A[q,i,j] = δ_ij − Σ_k V[q,i,k]·χs[q,k,j] on my (i on 'x',
-        # j on 'y') tile.  Classic 2-D block GEMM pairing — same shape
-        # of communication as ``isdf.core._distributed_pinv_apply``.
-        # Mask BOTH inputs here, before either gather: the public seam
-        # authenticates their common product-padded extent, while this local
-        # operation makes the exact-zero pad contract structural even if an
-        # upstream padded buffer was poisoned.  No full μ² tile is formed.
-        V_loc = _logical_tile(V_loc)
-        chi_loc = _logical_tile(chi_loc)
-        V_row = jax.lax.all_gather(V_loc, 'y', axis=2, tiled=True)
-        chi_col = jax.lax.all_gather(chi_loc, 'x', axis=1, tiled=True)
-        prod = jnp.einsum('qik,qkj->qij', V_row, chi_col)
+    def _mask_face(value):
+        return _logical_tile(value)
+
+    @partial(shard_map, mesh=mesh_xy, in_specs=P(None, 'x', 'y'),
+             out_specs=P(None, 'x', 'y'), check_vma=False)
+    def _identity_minus(prod):
         i0 = jax.lax.axis_index('x') * (n_ext // px)
         j0 = jax.lax.axis_index('y') * (n_ext // py)
         eye_tile = jnp.equal(
             i0 + jnp.arange(n_ext // px)[:, None],
-            j0 + jnp.arange(n_ext // py)[None, :]).astype(V_loc.dtype)
+            j0 + jnp.arange(n_ext // py)[None, :]).astype(prod.dtype)
         return eye_tile[None, :, :] - prod
+
+    def _a_local(V, chi):
+        from distrib_la import panel_matmul
+        # A = I - V chi. Mask both operands before any communication;
+        # poisoned padding cannot enter physical rows through the product.
+        prod = panel_matmul(_mask_face(V), _mask_face(chi), mesh=mesh_xy,
+                            panel_bytes=V.shape[0] * per_q_panel_bytes)
+        return _identity_minus(prod)
 
     @partial(jax.jit, donate_argnums=(2,), out_shardings=nat)
     def _a_chunk(V_blk, chi_blk, A_acc, q0):
@@ -1476,7 +1459,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
         chi_scaled = _scale(chi_flat, pref)
         A = _zeros_like(V_flat)
         # Host-level q-block loop: ONE XLA execution per block, so the
-        # emitted all_gather payloads are bounded by construction and
+        # emitted operand-panel payloads are bounded by construction and
         # cannot be re-combined by a compiler pass (AF note in
         # isdf/core).  At most two compiled shapes (full + remainder).
         for q0 in range(0, nq_local, qb):

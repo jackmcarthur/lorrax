@@ -12,6 +12,8 @@ import shutil
 import time
 
 import jax
+from common import timing
+from .shared_pole_constructor import _timing_fence
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental import multihost_utils
@@ -102,101 +104,113 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         centroid_indices, run_dir, label, wfn,
                         wfn_fingerprint_binding, tensors_filename, occupation_state, print_fn):
     """Build/reuse one immutable current-map model and return its small handle."""
-    from symmetry_maps import (QirrTables, centroid_source_map_and_wrap,
-                               bgw_integer_q_to_fractional)
-    from file_io.shared_pole_store import initialize_shared_pole_bank
-    from file_io.tagged_arrays import register_shared_pole_restart_member
-    from .shared_pole_recipe import shared_pole_restart_handle
-    from .shared_pole_constructor import construct_shared_poles
-    from .w_isdf import produce_w_bank, compute_response_moments
+    _timing_fence("screening_setup")
+    with timing.section("spole.screening_setup"):
+        from symmetry_maps import (QirrTables, centroid_source_map_and_wrap,
+                                   bgw_integer_q_to_fractional)
+        from file_io.shared_pole_store import initialize_shared_pole_bank
+        from file_io.tagged_arrays import register_shared_pole_restart_member
+        from .shared_pole_recipe import shared_pole_restart_handle
+        from .shared_pole_constructor import construct_shared_poles
+        from .w_isdf import produce_w_bank, compute_response_moments
 
-    started = time.monotonic()
-    recipe, ledger = meta.shared_pole_recipe, meta.shared_pole_capacity
-    # This is the top-level map boundary. All upstream V/psi carriers are
-    # inherited; no newly allocated bank/constructor arrays exist yet.
-    ledger.live_stages = ()
-    if occupation_state is not None:
-        from common.collectives import replicate_to_mesh
-        occupations = np.asarray(occupation_state.f_kn, np.float64)
-        if occupations.shape != wfns.occ.shape:
-            raise ValueError("GATE shared_pole_occupations: supplied current state does not match carrier")
-        wfns = dataclasses.replace(wfns, occ=replicate_to_mesh(occupations, mesh_xy))
-    identity = shared_pole_identity(wfns, meta, label=label, wfn=wfn,
-        binding=wfn_fingerprint_binding, centroid_indices=centroid_indices)
-    if config.restart and tensors_filename is not None:
-        handle = shared_pole_restart_handle(tensors_filename,
-            expected_identity=identity, meta=meta, mesh_xy=mesh_xy, print_fn=print_fn)
-        if handle is not None:
-            return dict(shared_pole=handle)
-    root = Path(run_dir).resolve() / (str(label) + "_shared_pole")
-    from common.collectives import rank0_transaction
-    from file_io.commit_state import assert_committed
+        started = time.monotonic()
+        recipe, ledger = meta.shared_pole_recipe, meta.shared_pole_capacity
+        # This is the top-level map boundary. All upstream V/psi carriers are
+        # inherited; no newly allocated bank/constructor arrays exist yet.
+        ledger.live_stages = ()
+        if occupation_state is not None:
+            from common.collectives import replicate_to_mesh
+            occupations = np.asarray(occupation_state.f_kn, np.float64)
+            if occupations.shape != wfns.occ.shape:
+                raise ValueError("GATE shared_pole_occupations: supplied current state does not match carrier")
+            wfns = dataclasses.replace(wfns, occ=replicate_to_mesh(occupations, mesh_xy))
+        identity = shared_pole_identity(wfns, meta, label=label, wfn=wfn,
+            binding=wfn_fingerprint_binding, centroid_indices=centroid_indices)
+        if config.restart and tensors_filename is not None:
+            handle = shared_pole_restart_handle(tensors_filename,
+                expected_identity=identity, meta=meta, mesh_xy=mesh_xy, print_fn=print_fn)
+            if handle is not None:
+                return dict(shared_pole=handle)
+        root = Path(run_dir).resolve() / (str(label) + "_shared_pole")
+        from common.collectives import rank0_transaction
+        from file_io.commit_state import assert_committed
 
-    def prepare_output():
-        # Only rank zero reads the small completion marker, on the compute
-        # node. The transaction owner broadcasts any refusal to every rank.
-        import h5py
-        model = root / "model.h5"
-        complete = False
-        if model.exists():
-            try:
-                with h5py.File(model, "r") as h5:
-                    assert_committed(h5, path=model)
-                    complete = "final_commit" in h5
-            except (OSError, ValueError):
-                complete = False
-        if complete:
-            print_fn(f"shared-pole output: complete model retained at {model}; refusing rebuild")
-            raise ValueError(f"GATE shared_pole_output: complete model {model}; use its compatible restart member or a fresh run directory")
-        if root.exists():
-            print_fn(f"shared-pole output: removing partial directory {root} and rebuilding")
-            shutil.rmtree(root)
-        else:
-            print_fn(f"shared-pole output: creating new directory {root}")
-        root.mkdir(parents=True)
+        def prepare_output():
+            # Only rank zero reads the small completion marker, on the compute
+            # node. The transaction owner broadcasts any refusal to every rank.
+            import h5py
+            model = root / "model.h5"
+            complete = False
+            if model.exists():
+                try:
+                    with h5py.File(model, "r") as h5:
+                        assert_committed(h5, path=model)
+                        complete = "final_commit" in h5
+                except (OSError, ValueError):
+                    complete = False
+            if complete:
+                print_fn(f"shared-pole output: complete model retained at {model}; refusing rebuild")
+                raise ValueError(f"GATE shared_pole_output: complete model {model}; use its compatible restart member or a fresh run directory")
+            if root.exists():
+                print_fn(f"shared-pole output: removing partial directory {root} and rebuilding")
+                shutil.rmtree(root)
+            else:
+                print_fn(f"shared-pole output: creating new directory {root}")
+            root.mkdir(parents=True)
 
-    rank0_transaction(root, stage="shared_pole.prepare_output", write=prepare_output)
-    qids = np.asarray(sym.q_irr_full_idx, np.int64)
-    grid = (meta.nkx, meta.nky, meta.nkz)
-    perm, wraps = centroid_source_map_and_wrap(
-        np.asarray(centroid_indices), sym.sym_matrices, sym.translations,
-        np.asarray(meta.fft_grid), extend_trs=True)
-    qt = QirrTables(irr_idx_q=sym.irr_idx_q, sym_idx_q=sym.sym_idx_q,
-        q_irr_frac=bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, grid),
-        sym_perm=perm, L_table=wraps, n_sym_spatial=len(sym.sym_matrices))
-    tables = dict(qirr=qt, q_irr_full_idx=qids, sym=sym)
-    coulomb = _coulomb_resource(V_q, meta, sym, mesh_xy, root / "coulomb.h5")
-    bank = dict(path=str(root / "bank.h5"), identity=identity,
-                tables=tables, coulomb=coulomb)
-    initialize_shared_pole_bank(bank["path"], meta=meta, tables=tables,
-        recipe=recipe, identity=identity, mesh_xy=mesh_xy)
-    receipts = dict(identity=identity)
-    def record(stage, receipt):
-        receipts[stage] = receipt
-        if jax.process_index() == 0:
-            (root / (stage + "_receipt.json")).write_text(_json(receipt) + "\n")
-        print_fn(f"shared-pole {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
-                 f"seconds={receipt.get('seconds', {})}")
-    record("bank", produce_w_bank(wfns, meta, config, mesh_xy=mesh_xy,
-        sym=sym, sample_plan=recipe, bank_io=bank))
-    record("moments", compute_response_moments(wfns, meta, config,
-        mesh_xy=mesh_xy, sym=sym, bank_io=bank))
+        rank0_transaction(root, stage="shared_pole.prepare_output", write=prepare_output)
+        qids = np.asarray(sym.q_irr_full_idx, np.int64)
+        grid = (meta.nkx, meta.nky, meta.nkz)
+        perm, wraps = centroid_source_map_and_wrap(
+            np.asarray(centroid_indices), sym.sym_matrices, sym.translations,
+            np.asarray(meta.fft_grid), extend_trs=True)
+        qt = QirrTables(irr_idx_q=sym.irr_idx_q, sym_idx_q=sym.sym_idx_q,
+            q_irr_frac=bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, grid),
+            sym_perm=perm, L_table=wraps, n_sym_spatial=len(sym.sym_matrices))
+        tables = dict(qirr=qt, q_irr_full_idx=qids, sym=sym)
+    _timing_fence("coulomb_staging")
+    with timing.section("spole.coulomb_staging"):
+        coulomb = _coulomb_resource(V_q, meta, sym, mesh_xy, root / "coulomb.h5")
+    _timing_fence("bank_setup")
+    with timing.section("spole.bank_setup"):
+        bank = dict(path=str(root / "bank.h5"), identity=identity,
+                    tables=tables, coulomb=coulomb)
+        initialize_shared_pole_bank(bank["path"], meta=meta, tables=tables,
+            recipe=recipe, identity=identity, mesh_xy=mesh_xy)
+        receipts = dict(identity=identity)
+        def record(stage, receipt):
+            receipts[stage] = receipt
+            if jax.process_index() == 0:
+                (root / (stage + "_receipt.json")).write_text(_json(receipt) + "\n")
+            print_fn(f"shared-pole {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
+                     f"seconds={receipt.get('seconds', {})}")
+    _timing_fence("bank")
+    with timing.section("spole.bank"):
+        record("bank", produce_w_bank(wfns, meta, config, mesh_xy=mesh_xy,
+            sym=sym, sample_plan=recipe, bank_io=bank))
+    _timing_fence("moments")
+    with timing.section("spole.moments"):
+        record("moments", compute_response_moments(wfns, meta, config,
+            mesh_xy=mesh_xy, sym=sym, bank_io=bank))
     # The constructor owns scratch reads, actual pencil planning and the
     # final writer. It must query its own native workspace at the actual R.
     # W/dW and M1/M3 are distinct keyed datasets in the same scratch file.
     result = construct_shared_poles(bank, bank, meta, config,
         mesh_xy=mesh_xy, output=str(root / "model.h5"))
-    record("constructor", result)
-    header = result["model_header"]
-    handle = dict(path=str(root / "model.h5"), identity=identity,
-                  digest=header["digest"], K=list(header["K"]))
-    ledger.live_stages = ()
-    if tensors_filename is not None:
-        receipts["restart_member"] = register_shared_pole_restart_member(
-            tensors_filename, handle["path"], expected_identity=identity,
-            mesh_xy=mesh_xy, capacity=ledger)
-    receipts["seconds"] = time.monotonic() - started
-    receipts["handle"] = handle
-    if jax.process_index() == 0:
-        (root / "construction_receipt.json").write_text(_json(receipts) + "\n")
-    return dict(shared_pole=handle)
+    _timing_fence("screening_finalize")
+    with timing.section("spole.screening_finalize"):
+        record("constructor", result)
+        header = result["model_header"]
+        handle = dict(path=str(root / "model.h5"), identity=identity,
+                      digest=header["digest"], K=list(header["K"]))
+        ledger.live_stages = ()
+        if tensors_filename is not None:
+            receipts["restart_member"] = register_shared_pole_restart_member(
+                tensors_filename, handle["path"], expected_identity=identity,
+                mesh_xy=mesh_xy, capacity=ledger)
+        receipts["seconds"] = time.monotonic() - started
+        receipts["handle"] = handle
+        if jax.process_index() == 0:
+            (root / "construction_receipt.json").write_text(_json(receipts) + "\n")
+        return dict(shared_pole=handle)

@@ -47,6 +47,42 @@ _RUNTIME_NOISE_EPSILON = 6.0e-8
 _RUNTIME_NOISE_SAFETY = 0.05
 _SC_STATE_PAD_EV = 2.0
 _SC_POLE_PAD_FRACTION = 0.10
+_RULE_CACHE_SCHEMA = "sigma-box-ry-noise-v2"
+
+
+def _rule_digest(rule, noise_amplification, reduction_steps):
+    """Authenticate the certificate and its complex128 Ry-inverse nodes."""
+    identity = hashlib.sha256(json.dumps(
+        [_RULE_CACHE_SCHEMA, list(rule.box), float(rule.eps),
+         bool(rule.relative), int(reduction_steps)]).encode())
+    for array in (rule.times, rule.weights):
+        identity.update(np.asarray(array, dtype="<c16").tobytes())
+    identity.update(np.asarray(
+        [rule.sup_error, rule.kappa_max, noise_amplification,
+         rule.theta_deg, rule.rank], dtype="<f8").tobytes())
+    return identity.hexdigest()
+
+
+def sigma_rule_request_cache(directory, identity, poles2, counts, *, eta, eps):
+    """Scope shared-pole rules to authenticated current-map physical inputs.
+
+    ``identity`` is the model's existing energy/occupation/recipe provenance;
+    ``poles2`` [Nq,K] in Ry² and ``counts`` [Nq] are the small host census.
+    Map labels are excluded: equal physical inputs on restart share rules,
+    but changed spectra or occupations cannot inherit a previous map's plan.
+    Domain containment and the executor noise/growth gates still run on hits.
+    """
+    if directory is None:
+        return None
+    inputs = {key: value for key, value in identity.items()
+              if key != "iteration_id"}
+    digest = hashlib.sha256(json.dumps(
+        [_RULE_CACHE_SCHEMA, inputs, float(eta), float(eps)],
+        sort_keys=True).encode())
+    for row, count in zip(poles2, counts):
+        digest.update(np.asarray([count], dtype="<i8").tobytes())
+        digest.update(np.asarray(row[:int(count)], dtype="<f8").tobytes())
+    return os.path.join(directory, "request_" + digest.hexdigest())
 
 
 def resolve_sigma_box_cache_dir(setting, input_dir):
@@ -302,6 +338,13 @@ def _rule_cache_lookup(
                     rank=int(data["rank"]),
                     sup_error=float(data["sup_error"]),
                     kappa_max=float(data["kappa_max"]), seconds=0.0)
+                if (str(data["schema"]) != _RULE_CACHE_SCHEMA
+                        or not _rule_is_certified(rule, eps)
+                        or rule.times.ndim != 1 or rule.weights.ndim != 1
+                        or not np.isfinite(float(data["roundoff_amplification"]))
+                        or str(data["digest"]) != _rule_digest(
+                            rule, float(data["roundoff_amplification"]), cached_steps)):
+                    raise ValueError("GATE sigma_rule_integrity: certificate digest/schema mismatch")
                 if best is None or rule.node_count < best[0].node_count:
                     best = (rule, name)
         except (EOFError, OSError, KeyError, ValueError) as exc:
@@ -340,17 +383,7 @@ def _rule_cache_store(directory, rule, noise_amplification,
         return ("WARNING sigma quadrature cache store refused an uncertified "
                 "or non-finite rule (nothing written)")
     steps = -1 if reduction_steps is None else int(reduction_steps)
-    identity = hashlib.sha256(json.dumps(
-        ["sigma-noise-currency-v1", list(rule.box), float(rule.eps),
-         bool(rule.relative), steps]
-    ).encode())
-    identity.update(np.ascontiguousarray(rule.times).view(np.uint8).tobytes())
-    identity.update(np.ascontiguousarray(rule.weights).view(np.uint8).tobytes())
-    identity.update(np.asarray(
-        [float(rule.sup_error), float(rule.kappa_max),
-         float(noise_amplification), float(rule.theta_deg), float(rule.rank)],
-        dtype=np.float64).tobytes())
-    digest = identity.hexdigest()[:16]
+    digest = _rule_digest(rule, noise_amplification, steps)
     path = os.path.abspath(os.path.join(directory, f"rule_{digest}.npz"))
     temporary = None
     try:
@@ -358,7 +391,8 @@ def _rule_cache_store(directory, rule, noise_amplification,
         temporary = f"{path}.{os.getpid()}.tmp"
         with open(temporary, "wb") as handle:
             np.savez(
-                handle, box=np.asarray(rule.box, np.float64),
+                handle, schema=_RULE_CACHE_SCHEMA, digest=digest,
+                box=np.asarray(rule.box, np.float64),
                 eps=float(rule.eps), relative=bool(rule.relative),
                 times=rule.times, weights=rule.weights,
                 sup_error=float(rule.sup_error),
