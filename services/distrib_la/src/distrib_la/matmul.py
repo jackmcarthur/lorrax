@@ -16,7 +16,7 @@ the provider.
 """
 from __future__ import annotations
 
-from functools import partial
+from functools import lru_cache, partial
 from typing import Union
 
 import jax
@@ -98,12 +98,22 @@ def contract_faces(C_X, C_Y, weights, start, stop, *, mesh: Mesh,
             want = NamedSharding(mesh, spec)
             if not value.sharding.is_equivalent_to(want, value.ndim):
                 raise ValueError(f"contract_faces requires input layout {spec}")
+    return _contract_faces_kernel(mesh, explicit_spin, return_transpose)(
+        C_X, C_Y, weights, start, stop)
+
+
+@lru_cache(maxsize=None)
+def _contract_faces_kernel(mesh, explicit_spin, return_transpose):
+    """Reuse the local weighted C_X C_Y† contraction for a static layout."""
+    xs = P(None, 'x', None, None) if explicit_spin else P(None, 'x', None)
+    ys = P(None, 'y', None, None) if explicit_spin else P(None, 'y', None)
     out = P(None, 'x', 'y')
 
     @partial(shard_map, mesh=mesh, in_specs=(xs, ys, P(), P(), P()),
              out_specs=(out, out) if return_transpose else out,
              check_vma=False)
     def _local(x, y, d, lo, hi):
+        b, k = x.shape[0], x.shape[-1]
         if explicit_spin:
             x = x.reshape((b, x.shape[1] * x.shape[2], k))
             y = y.reshape((b, y.shape[1] * y.shape[2], k))
@@ -116,7 +126,7 @@ def contract_faces(C_X, C_Y, weights, start, stop, *, mesh: Mesh,
             return w, wt
         return w
 
-    return _local(C_X, C_Y, weights, start, stop)
+    return jax.jit(_local)
 
 
 def _mesh_shape(mesh: Mesh) -> tuple[int, int]:
@@ -256,9 +266,25 @@ def _validate_operands(A, B, C, transa: str, transb: str):
     return out
 
 
-def _zeros(shape, dtype, sharding):
+@lru_cache(maxsize=None)
+def _zeros_kernel(shape, dtype, sharding):
+    """Retain the executable, never the allocated (possibly donated) buffer."""
     return jax.jit(
-        lambda: jnp.zeros(shape, dtype=dtype), out_shardings=sharding)()
+        lambda: jnp.zeros(shape, dtype=dtype), out_shardings=sharding)
+
+
+def _zeros(shape, dtype, sharding):
+    return _zeros_kernel(tuple(shape), jnp.dtype(dtype), sharding)()
+
+
+@lru_cache(maxsize=None)
+def _transpose_kernel(op, tile):
+    """Reuse a distributed endpoint transpose for one operation and layout."""
+    @jax.jit(out_shardings=tile)
+    def move(x):
+        t = jnp.swapaxes(x, -1, -2)
+        return jnp.conj(t) if op == 'C' else t
+    return move
 
 
 def _cublasmp(mesh, A, B, C, *, alpha: complex, beta: complex,
@@ -272,15 +298,10 @@ def _cublasmp(mesh, A, B, C, *, alpha: complex, beta: complex,
         # the certified N,N provider. This is a distributed transpose, not
         # a local tile transpose and not a host/full-matrix gather.
         tile = NamedSharding(mesh, P(None, 'x', 'y'))
-        def transpose(a, op):
-            if op == 'N':
-                return a
-            @jax.jit(out_shardings=tile)
-            def move(x):
-                t = jnp.swapaxes(x, -1, -2)
-                return jnp.conj(t) if op == 'C' else t
-            return move(a)
-        A, B = transpose(A, transa), transpose(B, transb)
+        if transa != 'N':
+            A = _transpose_kernel(transa, tile)(A)
+        if transb != 'N':
+            B = _transpose_kernel(transb, tile)(B)
         transa, transb = 'N', 'N'
     if A.dtype not in (jnp.dtype("float64"), jnp.dtype("complex128")):
         raise ValueError(

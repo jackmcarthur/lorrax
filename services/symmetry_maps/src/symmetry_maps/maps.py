@@ -6,7 +6,7 @@
 # module retains the sym-table construction (kpoint_map, R_grid,
 # unfolded_kpts, …) and the kfull-symmap / q-IBZ helpers used by the
 # GW driver.
-from functools import partial
+from functools import lru_cache, partial
 from dataclasses import dataclass
 
 import numpy as np
@@ -1022,12 +1022,10 @@ def unfold_endpoint_panel(factor_face, *, irr_idx, sym_idx, q_irr_frac,
             factors, **fixed_metadata)[0],
             in_shardings=face_sharding, out_shardings=face_sharding)
 
-    Reuse that callable for factors of the same shape/dtype/sharding. Its
-    first trace performs metadata authentication and budget admission; the
-    executable accepts only factor panels, never cached child factors.
-    Build a new callable when maps, q coordinates, spin actions or budget
-    change (including a new SC state). Metadata must not mutate after binding.
-    Eager calls remain supported and retain the concrete-sharding refusal.
+    An outer jit also avoids repeating host metadata authentication and
+    budget admission. Eager calls reuse a service-owned kernel with tables
+    as traced operands, so changed maps, phases and spin actions cannot
+    reuse stale constants. Concrete eager inputs retain the sharding refusal.
     """
     cert = certify_endpoint_locality(source_perm, mesh=mesh,
                                      mesh_axis=mesh_axis, active_mask=active_mask)
@@ -1062,16 +1060,27 @@ def unfold_endpoint_panel(factor_face, *, irr_idx, sym_idx, q_irr_frac,
     if (not isinstance(factor_face, jax.core.Tracer)
             and not factor_face.sharding.is_equivalent_to(sh, 4)):
         raise ValueError("endpoint panel must already have its row-face sharding")
+    route = _endpoint_panel_kernel(mesh, mesh_axis, cert['is_local'],
+                                   int(n_sym_spatial))
+    return route(factor_face, irr, sym, perm, wraps, q, spin, active), cost
+
+
+@lru_cache(maxsize=None)
+def _endpoint_panel_kernel(mesh, mesh_axis, is_local, n_sym_spatial):
+    """Reuse the endpoint action; changing symmetry tables are traced data."""
+    spec = P(None, mesh_axis, None, None)
     parts = int(mesh.shape[mesh_axis])
-    nlocal = cert['shard_extent']
-    selected = perm[sym]
     # The permutation is already routed below. The common ψ owner applies
     # its phase/TR/spin rule with an identity local gather afterwards.
-    identity = np.broadcast_to(np.arange(perm.shape[1]) % nlocal, perm.shape)
     pairs = [(i, (i + 1) % parts) for i in range(parts)]
 
-    @partial(shard_map, mesh=mesh, in_specs=spec, out_specs=spec, check_vma=False)
-    def route(x):
+    @partial(shard_map, mesh=mesh, in_specs=(spec,) + (P(),) * 7,
+             out_specs=spec, check_vma=False)
+    def route(x, irr, sym, perm, wraps, q, spin, active):
+        nlocal = x.shape[1]
+        selected = perm[sym]
+        identity = jnp.broadcast_to(
+            jnp.arange(perm.shape[1]) % nlocal, perm.shape)
         owner = jax.lax.axis_index(mesh_axis)
         target_sources = jax.lax.dynamic_slice_in_dim(
             jnp.asarray(selected), owner * nlocal, nlocal, axis=1)
@@ -1082,7 +1091,7 @@ def unfold_endpoint_panel(factor_face, *, irr_idx, sym_idx, q_irr_frac,
             gathered = jnp.take_along_axis(current, offsets[:, :, None, None], axis=1)
             output = jnp.where((target_sources // nlocal == held_owner)[:, :, None, None],
                                gathered, output)
-            if not cert['is_local']:
+            if not is_local:
                 current = jax.lax.cond(
                     step + 1 < parts,
                     lambda a: jax.lax.ppermute(a, mesh_axis, pairs),
@@ -1091,7 +1100,7 @@ def unfold_endpoint_panel(factor_face, *, irr_idx, sym_idx, q_irr_frac,
         current = x[irr]
         (_, output), _ = jax.lax.scan(
             gather_step, (current, jnp.zeros_like(current)),
-            jnp.arange(1 if cert['is_local'] else parts), unroll=1)
+            jnp.arange(1 if is_local else parts), unroll=1)
         result = unfold_wavefunction_local(
             output, irr_idx=np.arange(len(irr)), sym_idx=sym,
             k_irr_frac=q[irr], local_perm=identity, L_table=wraps,
@@ -1100,7 +1109,7 @@ def unfold_endpoint_panel(factor_face, *, irr_idx, sym_idx, q_irr_frac,
         mask = jax.lax.dynamic_slice_in_dim(jnp.asarray(active), owner * nlocal,
                                             nlocal, axis=0)
         return jnp.where(mask[None, :, None, None], result, 0)
-    return jax.jit(route)(factor_face), cost
+    return jax.jit(route)
 
 
 def _apply_unfold_phase_and_trs_local(
