@@ -160,7 +160,8 @@ sigma_quadrature_reduction_seconds = 120
 sigma_quadrature_cache_dir = auto
 ```
 
-The pass budget trades planning work for node count after an accepted
-interpolatory rule exists; the seconds watchdog refuses at operation boundaries
-without accepting a clock-selected partial result. Neither weakens `eps`. Retarded broadening is
+The default clock budget returns the last certified rule at a pass boundary;
+its reproducibility defect remains live. Explicit integer steps instead trade
+planning work for node count after an accepted interpolatory rule exists, with
+seconds as a cooperative refusal watchdog. Neither mode weakens `eps`. Retarded broadening is
 `sigma_regularization_ev`, literal for every ansatz; there is no pair ceiling.

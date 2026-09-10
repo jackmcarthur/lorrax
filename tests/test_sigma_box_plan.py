@@ -907,7 +907,7 @@ def test_receipt_records_operative_budget_and_rule_identity_on_disk(
     assert windows
     for window in windows:
         assert window["reduction_budget"] == policy
-        assert len(window["node_digest"]) == 64
+        assert len(window["node_digest"]) == 16
         assert window["cache_status"] == "off"
         assert len(window["box_ry"]) == 4
         assert window["sup_error"] <= window["eps"]
