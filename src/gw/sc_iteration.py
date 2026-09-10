@@ -589,6 +589,7 @@ class SCDriverResult:
 
     sigma_result_dft: SigmaResult
     sigma_total_dft: jax.Array
+    qp_energies_ry: np.ndarray  # accepted SC spectrum, same loop k set as Sigma
     rms_history_ev: list[float]
     rotations_written: bool
     static_head_terms_dft: object | None
@@ -5537,8 +5538,7 @@ def run_sc_driver(
     rms_history : list[float]
         RMS ΔE (eV) per iteration.
     rotations_written : bool
-        True when this call wrote ``qp_wfn_rotations.h5`` (the
-        ``config.debug.write_wfn_h5`` artifact dump ran).  The driver's
+        True when this call wrote ``qp_wfn_rotations.h5``.  The driver's
         generic writer reads this fact instead of re-deriving the
         predicate, so it cannot overwrite the authoritative SC file.
     static_head_terms_dft : StaticHeadTerms or None
@@ -5843,19 +5843,21 @@ def run_sc_driver(
     # eigenvalues + U are the *true* QP eigenstates of the SC fixed
     # point (the driver's post-Σ-seam eigh differs slightly because the
     # SC carry applies the band partition).
-    rotations_written = False
-    if config.debug.write_wfn_h5:
-        dump_qp_wfn_artifacts(
-            state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
-            kstar=kstar_io, state_on_ibz=kstar is not None,
-            wfn=wfn, sym=sym, band_slices=band_slices, kgrid=meta.kgrid,
-            logical_band_stop=int(meta.b_id_4_user),
-            output_dir=input_dir,
-            qp_rotations_k_storage=config.qp_rotations_k_storage,
-            print_fn=print_fn,
-            clamp_tol=float(config.occupation_clamp_tol),
-        )
-        rotations_written = True
+    # The small U/E artifact always represents the accepted SC Hamiltonian.
+    # Gating it with the optional full-WFN write lets the generic writer
+    # replace it with the unpartitioned post-Sigma eigensolve.
+    _, _, _, qp_energies_ry = dump_qp_wfn_artifacts(
+        state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
+        kstar=kstar_io, state_on_ibz=kstar is not None,
+        wfn=wfn, sym=sym, band_slices=band_slices, kgrid=meta.kgrid,
+        logical_band_stop=int(meta.b_id_4_user),
+        output_dir=input_dir,
+        qp_rotations_k_storage=config.qp_rotations_k_storage,
+        write_wfn_h5=bool(config.debug.write_wfn_h5),
+        print_fn=print_fn,
+        clamp_tol=float(config.occupation_clamp_tol),
+    )
+    rotations_written = True
     sigma_omega_h5_path = dump_sigma_omega_h5_final(
         state_final, config=config, meta=meta, mesh_xy=mesh_xy,
         input_dir=input_dir, sym=sym,
@@ -6000,6 +6002,7 @@ def run_sc_driver(
     return SCDriverResult(
         sigma_result_dft=sigma_result_dft,
         sigma_total_dft=sigma_total,
+        qp_energies_ry=qp_energies_ry,
         rms_history_ev=rms_history,
         rotations_written=rotations_written,
         static_head_terms_dft=static_head_terms_dft,
@@ -6244,10 +6247,11 @@ def dump_qp_wfn_artifacts(
     kgrid,                               # (nkx, nky, nkz)
     output_dir: str,
     qp_rotations_k_storage: str = "auto",
+    write_wfn_h5: bool = True,
     print_fn: Callable = print,
     clamp_tol: float = _OCCUPATION_CLAMP_TOL_DEFAULT,
-) -> tuple[str, str, float]:
-    """Post-SC artifact dump: WFN_qp.h5 + qp_wfn_rotations.h5.
+) -> tuple[str | None, str, float, np.ndarray]:
+    """Write canonical SC U/E and optionally the full ``WFN_qp.h5``.
 
     Diagonalises the converged ``state.H_qp_dft`` once, then writes:
 
@@ -6314,11 +6318,17 @@ def dump_qp_wfn_artifacts(
     ``logical_band_stop`` is the unpadded end of the sum-band ladder.  It
     is required only when the final map used an energy-only tail scissor.
 
+    ``write_wfn_h5`` controls only the full wavefunction artifact. The small
+    canonical U/E file always carries the accepted, partitioned SC state.
+
     Both files are rank-0-only writes (h5py is single-writer). Each write
     broadcasts its verdict: every rank returns after both files finish,
     or raises the same named failure before the next write.
 
-    Returns ``(qp_wfn_path, qp_rotations_path, efermi_ry)``.
+    Returns ``(qp_wfn_path, qp_rotations_path, efermi_ry, enk_loop_ry)``.
+    The first path is ``None`` when the full wavefunction file was not
+    requested. The existing small loop-k-set energy array also serves the
+    production gap report, without another diagonalization or artifact read.
     """
     from ffi import _services
     _services.ensure_on_path()
@@ -6381,7 +6391,8 @@ def dump_qp_wfn_artifacts(
             enk_full_base_ry=enk_full_base_ry,
         )
     from common.collectives import rank0_transaction
-    rank0_transaction(qp_wfn_path, stage="qp_wfn_h5_write", write=_write_qp_wfn)
+    if write_wfn_h5:
+        rank0_transaction(qp_wfn_path, stage="qp_wfn_h5_write", write=_write_qp_wfn)
 
     def _write_qp_rotations():
         # The tables come from the SERVICE's own accessor, never re-spelled
@@ -6407,13 +6418,15 @@ def dump_qp_wfn_artifacts(
         )
     rank0_transaction(qp_rot_path, stage="qp_rotations_h5_write",
                       write=_write_qp_rotations)
-    print_fn(f"  QP WFN:       {qp_wfn_path}")
+    if write_wfn_h5:
+        print_fn(f"  QP WFN:       {qp_wfn_path}")
     print_fn(f"  QP rotations: {qp_rot_path}")
     _ref_kind = ("fixed-N mu" if (state.occupation_state is not None
                  and str(state.occupation_state.smearing_family) == "mp1")
                  else "midgap")
     print_fn(f"  Final E_F ({_ref_kind}, eV): {efermi_ry * RYD_TO_EV:.6f}")
-    return qp_wfn_path, qp_rot_path, efermi_ry
+    return (qp_wfn_path if write_wfn_h5 else None, qp_rot_path, efermi_ry,
+            enk_loop_ry)
 
 
 __all__ = [

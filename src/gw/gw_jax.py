@@ -1149,6 +1149,7 @@ def main(argv=None):
 	# wrote qp_wfn_rotations.h5; the writer below reads the fact rather
 	# than re-deriving the predicate.
 	rotations_written = False
+	sc_qp_energies_ry = None
 	final_static_head_terms = static_head_terms
 	if qp_solver is QPSolver.SELF_CONSISTENT:
 		# SC-QSGW: iterate ψ-rotation → χ₀ → W → Σ_xc (the same
@@ -1182,6 +1183,7 @@ def main(argv=None):
 		sigma_result = sc_result.sigma_result_dft
 		sigma_total = sc_result.sigma_total_dft
 		rotations_written = sc_result.rotations_written
+		sc_qp_energies_ry = sc_result.qp_energies_ry
 		final_static_head_terms = sc_result.static_head_terms_dft
 		if sigma_result.kset == SIGMA_KSET_STAR_WEDGE:
 			# SC's retained Sigma, its H/E/U and the mean-field operators used
@@ -1667,7 +1669,8 @@ def main(argv=None):
 		config=config, band_slices=band_slices, enk_dft_ry=enk_dft,
 		sigma_result=sigma_result)
 	report.qp_gap(
-		band_slices=band_slices, e_dft_ry=enk_dft, e_qp_ry=E_full)
+		band_slices=band_slices, e_dft_ry=enk_dft,
+		e_qp_ry=(E_full if sc_qp_energies_ry is None else sc_qp_energies_ry))
 	if eqp2_result is not None:
 		report.eqp2_summary(
 			band_slices=band_slices,
