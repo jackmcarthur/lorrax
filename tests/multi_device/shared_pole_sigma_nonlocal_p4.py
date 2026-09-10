@@ -45,17 +45,9 @@ def main(rt):
     forced=dict(status='PASS',parent_capacity=b,column_capacity=c,endpoint_budgets=cost['endpoint_budgets'])
     omega=np.sqrt(poles);selected=(omega>1)&(omega<=4)&(np.arange(4)[None,:]<counts[:,None])
     weights=np.where(selected,np.exp(-1j*(omega-.6)*(.7+.2j))/(2*omega),0)
-    expected=[]
-    for parent,op in zip(irr,ops):
-        factor=C[parent,perm[op],0,:]*np.exp(2j*np.pi*(wraps[op]@q[parent]))[:,None]
-        if op>=6:factor=factor.conj()
-        value = (factor*weights[parent])@factor.conj().T
-        if parent == 0:
-            partner = C[parent,perm[op],0,:].conj()*np.exp(2j*np.pi*(wraps[op]@q[parent]))[:,None]
-            if op >= 6: partner = partner.conj()
-            value = 0.5*(value+(partner*weights[parent])@partner.conj().T)
-        expected.append(value)
-    expected=meta.mu_basis.pack_host(meta.mu_basis.pack_host(np.asarray(expected),axis=1),axis=2)
+    oracle_helpers = runpy.run_path('tests/multi_device/shared_pole_dense_oracle.py')
+    expected = oracle_helpers['full_q_operator'](C, weights, tables, ops)
+    expected=meta.mu_basis.pack_host(meta.mu_basis.pack_host(expected,axis=1),axis=2)
     args=(None,None,put(np.arange(3,dtype=np.int32),P()),
           put(np.tile([1,4,-np.inf,-np.inf,np.inf,np.inf],(3,1)),P()),
           put(np.ones(3),P()),put(np.asarray(.6),P()),put(np.asarray(.7+.2j),P()))

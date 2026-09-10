@@ -13,7 +13,7 @@ import numpy as np
 
 @lru_cache(maxsize=None)
 def _gamma_body(mesh):
-    """Current numerical factors are operands of one retained callable."""
+    """Raw latent body; current factors are operands of one retained callable."""
     from distrib_la import matmul
     from jax.sharding import NamedSharding, PartitionSpec as P
     face = NamedSharding(mesh, P(None, "x", "y"))
@@ -24,6 +24,27 @@ def _gamma_body(mesh):
         weights = jnp.where(active, 1/(s-poles), 0)
         return v+matmul(b*weights[:, None, :], b, mesh=mesh,
                         backend="distributed", transb="C")
+    return evaluate
+
+
+@lru_cache(maxsize=None)
+def _realized_gamma_body(mesh, realize):
+    """One admitted all-P executable for V + Pi_G Wc at complex z².
+
+    Only residue endpoints transform under antiunitary operations. Taking
+    the conjugate of a completed W(z²) would conjugate its causal scalar
+    coefficient as well; its same-time transpose is the required partner.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    raw = _gamma_body(mesh)
+
+    @jax.jit(out_shardings=face)
+    def evaluate(s, b, poles, counts, v):
+        wc = raw(s, b, poles, counts, jnp.zeros_like(v))
+        partner = jax.lax.with_sharding_constraint(jnp.swapaxes(wc, -2, -1), face)
+        wc, _ = realize(wc, partner)
+        return v + wc
     return evaluate
 
 
@@ -39,7 +60,7 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
                            material_class, occupation_state):
     """Return a small MPA head fit and current-map scalar head samples.
 
-    The total Gamma body is V + b(z²-Lambda)^-1 b†, in Ry. Its factor
+    The total Gamma body is V + Pi_G[b(z²-Lambda)^-1 b†], in Ry. Its factor
     matrix and every mu² result are sharded over both processor axes.
     The fit uses unbroadened complex sample coordinates; the existing MPA
     Sigma-head consumer owns its causal evaluation convention.
@@ -51,7 +72,7 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
     from .mpa.sample_plan import plan_z
     from .qsgw_head import IterationHeadSamples, finalize_iteration_head_sample
     from .response_bank import _reserve
-    from .mpa.sigma import _shared_pole_fixed_q_policy
+    from .qgrid_symmetry import shared_pole_operator_realizer
     import distrib_la
 
     if config.head.uses_bgw_metal_q0shift:
@@ -78,13 +99,14 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         if len(parents) != 1:
             raise ValueError("GATE shared_pole_head: expected one Gamma parent")
         iq = int(parents[0])
-        policy = _shared_pole_fixed_q_policy(header)
+        realize = shared_pole_operator_realizer(meta, header,
+            q_full_idx=np.asarray([0]), mesh_xy=mesh_xy)
         with SlabIO(handle["path"], mode="r", mesh=mesh_xy) as io:
             b, poles, counts = read_shared_pole_matrix(io, (iq, iq+1), meta=meta, header=header)
         # The linalg service owns the distributed rectangular products and
         # workspace estimate. No q-local whole-matrix copy is introduced.
         algebra = distrib_la.plan("solve_lu", mesh_xy, backend="distributed", n=b.shape[1])
-        evaluate = _gamma_body(mesh_xy)
+        evaluate = _realized_gamma_body(mesh_xy, realize)
         args = (b, poles, counts, V_q[:1])
         stats = evaluate.lower(jnp.asarray(1j, jnp.complex128), *args).compile().memory_analysis()
         if stats is None:
@@ -99,7 +121,6 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         total = None
         if full:
             value = evaluate(jnp.asarray(point*point, jnp.complex128), *args)
-            value, _ = policy.project_fixed_q(value, np.asarray([0]), measure=False)
             total = value[0]
         samples.append(head_resolver.at(point) if response is None else
             finalize_iteration_head_sample(response, index, total,

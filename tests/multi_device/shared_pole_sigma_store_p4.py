@@ -54,14 +54,9 @@ def main(runtime):
     paired=np.asarray([0,0,6,2,4,0,8,6,10])
     policy=_shared_pole_fixed_q_policy(header)
     assert np.array_equal(policy.unfold_sym_idx,paired) and policy.n_pair_rewired==4, policy.unfold_sym_idx
-    qt=tables['qirr'];expected=[]
-    for parent,op in zip(qt.irr_idx_q,paired):
-        factor=C[parent,qt.sym_perm[op],0,:]*np.exp(2j*np.pi*(qt.L_table[op]@qt.q_irr_frac[parent]))[:,None]
-        if op>=6:factor=factor.conj()
-        value=(factor*weights[parent])@factor.conj().T
-        if parent==0:value=.5*(value+value.T)
-        expected.append(value)
-    expected=meta.mu_basis.pack_host(meta.mu_basis.pack_host(np.asarray(expected),axis=1),axis=2)
+    oracle_helpers = runpy.run_path('tests/multi_device/shared_pole_dense_oracle.py')
+    expected = oracle_helpers['full_q_operator'](C, weights, tables, paired)
+    expected=meta.mu_basis.pack_host(meta.mu_basis.pack_host(expected,axis=1),axis=2)
     from symmetry_maps import q_negation_index
     neg=q_negation_index((3,3,1))
     assert np.max(np.abs(expected-expected[neg].transpose(0,2,1)))<1e-10

@@ -35,6 +35,7 @@ shared_real_pole_v1_r3b = {
     "multiplet_relative_tolerance": 1.0e-6,
     "bank_rule_tolerance": 1.0e-8,
     "moment_convention": "S_m = 2 M_(2m+1); physical M1 and M3 only",
+    "operator_realization": "little-group-reynolds-v1",
     "production": {"direction_cutoff": 1.0e-3, "imaginary_width_fraction": 0.25,
                    "infinity_width_fraction": 0.125, "sigma_tolerance": 1.0e-4},
     "relaxed": {"direction_cutoff": 1.0e-2, "imaginary_width_fraction": 0.125,
@@ -708,6 +709,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
         'bank_rule_tolerance': recipe['bank_rule_tolerance'],
         'sigma_tolerance': policy['sigma_tolerance'],
         'moment_convention': recipe['moment_convention'], 'census': dict(census),
+        'operator_realization': recipe['operator_realization'],
         'U_bytes_per_rank': meta.shared_pole_capacity.U_bytes_per_rank,
     }
     result['metadata_array_bytes'] = sum(v.nbytes for v in result.values()

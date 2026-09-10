@@ -146,13 +146,14 @@ def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
 
 
 def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
-    """Build the collective-free local operator action for a parent panel.
+    """Realize each parent and apply its local child operation.
 
     Returns explicit full-q row IDs and a compiled pair-transpose unfold.
     Nonlocal maps refuse here; the caller routes bounded endpoint factors
     through the symmetry service before contraction for those maps.
     """
     from common.shard_map import shard_map
+    from gw.qgrid_symmetry import shared_pole_operator_realizer
     from symmetry_maps import unfold_operator_local
 
     if tables is None:
@@ -163,6 +164,8 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
 
     policy = _shared_pole_fixed_q_policy(header)
     qids = np.asarray(header["q_irr_full_idx"])[slice(*q_span)]
+    realize = shared_pole_operator_realizer(
+        meta, header, q_full_idx=qids, mesh_xy=mesh_xy)
 
     def body(plus, transposed):
         projected, _ = policy.project_fixed_q(
@@ -177,15 +180,21 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
             n_sym_spatial=tables["n_sym_spatial"],
             trs_rule="pair_transpose", transposed_parent_local=transposed)
 
-    unfold = jax.jit(shard_map(
+    unfold_local = jax.jit(shard_map(
         body, mesh=mesh_xy,
         in_specs=(P(None, "x", "y"), P(None, "x", "y")),
         out_specs=P(None, "x", "y"), check_vma=False))
+
+    @jax.jit
+    def unfold(plus, transposed):
+        return unfold_local(*realize(plus, transposed))
+
     return tables["rows"], unfold
 
 
 def _shared_pole_routed_synthesis(
-    b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, meta, header, tables, endpoint_budgets, mesh_xy,
+    b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, meta, header, tables,
+    endpoint_budgets, realize, mesh_xy,
 ):
     """Synthesize W after bounded child-factor routing, DESIGN §3.4 fallback.
 
@@ -239,7 +248,13 @@ def _shared_pole_routed_synthesis(
             mesh=mesh_xy)
         plus, _ = policy.project_fixed_q(
             plus, child_ids, transposed_partner=transposed, measure=False)
-    return plus
+    # Conjugacy of stabilizers makes child-space averaging equivalent to
+    # averaging the parent before unfolding. This avoids enlarging the
+    # routed factors by a symmetry axis. Both operator orientations remain
+    # distributed over the complete mesh, including the transpose exchange.
+    transposed = jax.lax.with_sharding_constraint(
+        jnp.swapaxes(plus, -1, -2), NamedSharding(mesh_xy, P(None, "x", "y")))
+    return realize(plus, transposed)[0]
 
 
 def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy):
@@ -283,40 +298,43 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                         b_X,b_Y,poles2,ranges,e,t,mesh_xy=mesh_xy)
                     return unfold(plus,transposed)
                 kernel = jax.jit(local_body)
-                widths = sorted({min(ccap,kmax-c0) for c0 in range(0,kmax,ccap)})
-                for width in widths:
-                    from runtime.aot_memory import aot_kernel_peak_bytes
-                    def abstract(shape,dtype,spec):
-                        return jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh_xy,spec))
-                    shape = (hi-lo,meta.mu_basis.n_packed,int(header["nspinor"]),width)
-                    compiled = kernel.lower(
-                        abstract(shape,np.complex128,P(None,"x",None,None)),
-                        abstract(shape,np.complex128,P(None,"y",None,None)),
-                        abstract((hi-lo,width),np.float64,P()),
-                        abstract((hi-lo,2),np.int32,P()),
-                        abstract((),np.float64,P()),abstract((),np.complex128,P())).compile()
-                    peak = aot_kernel_peak_bytes(compiled)
-                    row = dict(parent_span=[lo,hi],column_width=width,
-                               compiled_bytes_per_rank=peak.total,
-                               output_bytes_per_rank=compiled.memory_analysis().output_size_in_bytes,
-                               cufft_measured=peak.cufft_measured)
-                    schedule.setdefault("compiled_panels",[]).append(row)
-                    if "capacity_receipt" in schedule:
-                        if not peak.cufft_measured:
-                            raise ValueError("shared-pole synthesis native FFT workspace query unavailable")
-                        meta.shared_pole_capacity.reserve(
-                            f"sigma.synthesis.compiled.{lo}.{hi}.{width}",
-                            resident_bytes_per_rank=0,workspace_bytes_per_rank=peak.total,
-                            concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
-                schedule["compiled_peak_status"] = "PASS"
             else:
                 rows = tables["rows"]
                 # The service accepts traced faces. Bind the immutable map once
                 # per current-map panel, and reuse its executable at every tau.
+                from gw.qgrid_symmetry import shared_pole_operator_realizer
+                realize = shared_pole_operator_realizer(
+                    meta, header, q_full_idx=rows, mesh_xy=mesh_xy)
                 kernel = jax.jit(partial(
                     _shared_pole_routed_synthesis, meta=meta, header=header,
                     tables=tables, endpoint_budgets=schedule["endpoint_budgets"],
-                    mesh_xy=mesh_xy))
+                    realize=realize, mesh_xy=mesh_xy))
+            widths = sorted({min(ccap,kmax-c0) for c0 in range(0,kmax,ccap)})
+            for width in widths:
+                from runtime.aot_memory import aot_kernel_peak_bytes
+                def abstract(shape,dtype,spec):
+                    return jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh_xy,spec))
+                shape = (hi-lo,meta.mu_basis.n_packed,int(header["nspinor"]),width)
+                compiled = kernel.lower(
+                    abstract(shape,np.complex128,P(None,"x",None,None)),
+                    abstract(shape,np.complex128,P(None,"y",None,None)),
+                    abstract((hi-lo,width),np.float64,P()),
+                    abstract((hi-lo,2),np.int32,P()),
+                    abstract((),np.float64,P()),abstract((),np.complex128,P())).compile()
+                peak = aot_kernel_peak_bytes(compiled)
+                row = dict(parent_span=[lo,hi],column_width=width,
+                           compiled_bytes_per_rank=peak.total,
+                           output_bytes_per_rank=compiled.memory_analysis().output_size_in_bytes,
+                           cufft_measured=peak.cufft_measured)
+                schedule.setdefault("compiled_panels",[]).append(row)
+                if "capacity_receipt" in schedule:
+                    if not peak.cufft_measured:
+                        raise ValueError("shared-pole synthesis native FFT workspace query unavailable")
+                    meta.shared_pole_capacity.reserve(
+                        f"sigma.synthesis.compiled.{lo}.{hi}.{width}",
+                        resident_bytes_per_rank=0,workspace_bytes_per_rank=peak.total,
+                        concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
+            schedule["compiled_peak_status"] = "PASS"
             panels.append((lo, hi, device_put_process_local(
                 rows, NamedSharding(mesh_xy, P())), kernel, tables))
     timing.fence('tau.factor_read', sync_ranks=True)
@@ -438,7 +456,10 @@ def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, local):
     endpoint_budgets = {}
     traffic = 0
     if local:
-        peak = ((2*b+children)*tile + 8*b
+        # Parent, partner and fixed-size group accumulators coexist. The
+        # compiled reservation below measures actual aliases and exchange
+        # scratch; this bound also informs the panel-size search.
+        peak = ((6*b+children)*tile + 8*b
                 + 16*b*spin*m*c*(3/px+2/py) + 64*b*c)
     else:
         costs = {axis: endpoint_panel_cost((b,m,spin,c), children,
@@ -449,7 +470,7 @@ def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, local):
         traffic = sum(row["ring_bytes_per_rank"] for row in costs.values())
         # The service bounds include input, output, rotating and phase
         # scratch. Extra weighted child faces and child W coexist at GEMM.
-        peak = (sum(endpoint_budgets.values()) + children*tile
+        peak = (sum(endpoint_budgets.values()) + 5*children*tile
                 + 16*children*spin*m*c/px + 64*(b+children)*c)
     return dict(resident_bytes_per_rank=int(np.ceil(faces)),
                 workspace_bytes_per_rank=int(np.ceil(peak-faces)),
@@ -500,6 +521,13 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
         # Byte counts are affine in the column width. Price through the
         # SAME routine used for the admitted row, including routed scratch.
         one = _shared_pole_panel_cost(meta,header,b,1,mesh_xy=mesh_xy,local=local)
+        projection_rows = b if local else one["children"]
+        # The physical logical-U bound applies to every NEW projector
+        # matrix, even when orbit packing pads the endpoint carrier. The
+        # pre-existing full-q Sigma output is accounted separately above.
+        projection_bytes = 16*projection_rows*(spin*meta.mu_basis.n_packed)**2/(px*py)
+        if projection_bytes > U:
+            continue
         two = _shared_pole_panel_cost(meta,header,b,2,mesh_xy=mesh_xy,local=local)
         keys = ("resident_bytes_per_rank", "workspace_bytes_per_rank")
         p1, p2 = sum(one[k] for k in keys), sum(two[k] for k in keys)
@@ -512,6 +540,10 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
             best = candidate
     b,c = (1,1) if best is None else best[2:]
     footprint = _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,local=local)
+    projection_rows = b if local else footprint["children"]
+    projection_bytes = 16*projection_rows*(spin*meta.mu_basis.n_packed)**2/(px*py)
+    if projection_bytes > U:
+        raise ValueError("GATE shared_pole_capacity: one parent star exceeds the all-P logical matrix bound")
     receipt = capacity.reserve(
         "sigma.synthesis", resident_bytes_per_rank=footprint["resident_bytes_per_rank"],
         workspace_bytes_per_rank=footprint["workspace_bytes_per_rank"],
@@ -525,6 +557,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
                 endpoint_budgets=footprint["endpoint_budgets"],
                 routed_bytes_per_panel_per_rank=footprint["routed_bytes_per_panel_per_rank"],
                 inherited_sigma_peak_status="NOT_MEASURED",
+                projection_matrix_bytes_per_rank=int(projection_bytes),
                 compiled_peak_status="NOT_MEASURED")
 
 

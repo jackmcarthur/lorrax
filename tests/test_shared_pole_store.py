@@ -55,10 +55,16 @@ def _sigma_fixture(mesh, *, identity_layout=False):
     A triangular cell's C3 plus inversion has orbit sizes 1,6,2 here.
     """
     meta, _, recipe, identity = _fixture(mesh)
+    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
+    recipe = dict(recipe, operator_realization=shared_real_pole_v1_r3b["operator_realization"])
     c3 = np.asarray([[0,-1,0],[1,-1,0],[0,0,1]],np.int32)
     positive = np.stack([np.eye(3,dtype=np.int32),c3,c3@c3])
     rotations = np.concatenate([positive,-positive])
-    sym = SimpleNamespace(sym_matrices=rotations,translations=np.zeros((6,3)),
+    # BGW stores the inverse real-space action mtrx; reciprocal columns
+    # transform with mtrx.T. The triangular generator is not orthogonal in
+    # fractional coordinates, so using the same matrix for both is wrong.
+    mtrx = rotations.transpose(0, 2, 1).copy()
+    sym = SimpleNamespace(sym_matrices=mtrx,translations=np.zeros((6,3)),
         trs_allowed=True,active_symmetry_rows=np.arange(12,dtype=np.int32),
         operation_typing_source='planted triangular scalar fixture')
     sym.operation_rows = lambda rows: (
@@ -67,16 +73,16 @@ def _sigma_fixture(mesh, *, identity_layout=False):
     sym.spinor_action = lambda rows,nspinor: np.ones((len(rows),1,1),np.complex128)
     # Two six-point orbits keep this genuine tiny geometry large enough
     # for the store's fixed digest/I/O workspace within its unchanged gate.
-    cents = np.asarray([[0,0,0],[0,1,0],[1,0,0],[6,6,0],
-                        [0,6,0],[6,0,0],[1,1,0],[0,2,0],[2,0,0],
-                        [5,5,0],[0,5,0],[5,0,0],[2,2,0]],np.int32)
+    cents = np.asarray([[0,0,0], *[
+        (op @ np.asarray([seed,0,0])) % np.asarray([7,7,1])
+        for seed in (1,2) for op in mtrx]], np.int32)
     if identity_layout:
         cents=cents[[0,1,7,4,10,2,8,5,11,3,9,6,12]]
     meta.fft_grid=(7,7,1);meta.n_rmu=len(cents)
     meta.nkx=meta.nky=3;meta.nkz=1;meta.nk_tot=9
     meta.mu_basis=PackedCentroidBasis.build(cents,sym,meta.fft_grid,mesh,identity=identity_layout)
     from symmetry_maps import centroid_source_map_and_wrap
-    perm,wraps=centroid_source_map_and_wrap(cents,rotations,sym.translations,
+    perm,wraps=centroid_source_map_and_wrap(cents,mtrx,sym.translations,
                         np.asarray(meta.fft_grid),extend_trs=True)
     qt=QirrTables(irr_idx_q=np.asarray([0,1,1,1,1,2,1,2,1],np.int32),
         sym_idx_q=np.asarray([0,0,3,2,4,0,5,3,1],np.int32),
