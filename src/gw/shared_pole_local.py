@@ -82,18 +82,6 @@ def _parent_panel_packer(mesh_xy, finite_width, parent_batch):
     return pack
 
 
-def parent_pencil_extents(parent_extents, basis_side):
-    """Group pencil carriers in basis-size blocks, keeping counts as masks.
-
-    Only inert columns are appended. Each bucket spans one padded spatial
-    basis side, so R/basis_side sets the number of programs without a dial.
-    All parents retain the batch's existing infinity carrier.
-    """
-    ri = max(ni for _, ni in parent_extents)
-    return tuple((((nf + ri + basis_side - 1) // basis_side) * basis_side - ri, ri)
-                 for nf, _ in parent_extents)
-
-
 @lru_cache(maxsize=None)
 def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
     """Fuse assembly, corrected Ritz reduction and moment gates per parent.
@@ -102,8 +90,8 @@ def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
     inputs are [b,n,r] face tiles. Factors return as [b,n,R] face tiles;
     poles, masks and gate scalars return replicated. Dense pencil work stays
     q-local and never crosses the host. ``parent_extents`` gives each padded
-    q row its finite/infinity carrier widths. Native eigensolves use one
-    program per basis-size bucket; original physical counts remain masks.
+    q row its original finite/infinity widths; native eigensolves use those
+    widths, because padding a dense Gram can defeat solver convergence.
     Local residency is O(R²+nR) per rank
     for one parent at a time; callers admit the actual packed batch first.
     """
@@ -148,8 +136,9 @@ def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
         finite, infinity, active, index = args
         if parent_extents is None:
             return solve(finite, infinity, active)
-        # Each branch uses one bucket extent. Physical port padding and
-        # bucket padding are inactive columns in the same pencil equations.
+        # cuSolver's native eigh can fail on large artificial zero blocks.
+        # Each branch solves the original selected pencil, including its
+        # original port padding. Only compact outputs acquire q-batch padding.
         rf, ri = finite[1].shape[-1], infinity[0].shape[-1]
         def branch(nf, ni):
             def run(args):
@@ -193,13 +182,6 @@ def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
 
     @jax.jit
     def execute(finite, infinity, active):
-        if parent_extents is not None:
-            old_width = finite[1].shape[-1]
-            extra = max(nf for nf, _ in parent_extents) - old_width
-            finite = (jnp.pad(finite[0], ((0, 0), (0, extra))),
-                      *(jnp.pad(a, ((0, 0), (0, 0), (0, extra))) for a in finite[1:]))
-            active = jnp.concatenate((jnp.pad(active[:, :old_width], ((0, 0), (0, extra))),
-                                      active[:, old_width:]), axis=-1)
         f = (jax.lax.with_sharding_constraint(finite[0], jax.sharding.NamedSharding(mesh_xy, qspec)),
              *(to_batch(a) for a in finite[1:]))
         i = tuple(to_batch(a) for a in infinity)

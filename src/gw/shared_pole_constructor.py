@@ -709,7 +709,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     receipt_entry_start = 0
     stack_models = _stack_model_kernel(mesh_xy)
     from runtime.padding import mesh_divisor
-    from gw.shared_pole_local import pack_parent_panels, local_parent_reducer, parent_pencil_extents
+    from gw.shared_pole_local import pack_parent_panels, local_parent_reducer
     # Local dense algebra assigns independent parents to mesh ranks. The
     # distributed plan keeps its one-parent face-tiled execution schedule.
     batch_limit = mesh_divisor(mesh_xy) if resolution.layout == "local" else 1
@@ -770,10 +770,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         retained_panels = (*jax.tree.leaves(packed), *(item[4] for item in pending))
         batch_results = None
         if resolution.layout == "local":
-            extents = parent_pencil_extents(extents, n)
-            pencil_side = max(nf + ni for nf, ni in extents)
-            price = capacity(pencil_side, phase="reduction")
-            reduce_eigh = eigenplan(pencil_side)
+            price = capacity(finite_width + infinity_width, phase="reduction")
+            reduce_eigh = eigenplan(finite_width + infinity_width)
             extents += (extents[-1],) * (batch_width - len(extents))
             batch_results = local_parent_reducer(
                 mesh_xy, reduce_eigh.native_fn, extents)(*packed)
