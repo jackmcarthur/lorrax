@@ -98,6 +98,18 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         parents = np.flatnonzero(np.asarray(header["q_irr_full_idx"]) == 0)
         if len(parents) != 1:
             raise ValueError("GATE shared_pole_head: expected one Gamma parent")
+        # The hardware ledger can admit a scaling WARN above 3U. That
+        # does not waive the individual matrix bound for the new projector.
+        # Refuse before reading factors or compiling its numerical work.
+        unit = (16*int(header["n_q_full"])*int(header["n_mu_logical"])**2
+                / mesh_xy.size)
+        projection_bytes = 16*meta.mu_basis.n_packed**2 // mesh_xy.size
+        if int(header["nspinor"]) != 1 or ledger.U_bytes_per_rank != unit:
+            raise ValueError("GATE shared_pole_head_capacity: store/current-map geometry mismatch")
+        if projection_bytes > unit:
+            raise ValueError(
+                "GATE shared_pole_head_capacity: Gamma projection exceeds the all-P "
+                f"logical matrix bound ({projection_bytes} > {unit} bytes per rank)")
         iq = int(parents[0])
         realize = shared_pole_operator_realizer(meta, header,
             q_full_idx=np.asarray([0]), mesh_xy=mesh_xy)
