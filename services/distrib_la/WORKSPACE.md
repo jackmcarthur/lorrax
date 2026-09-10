@@ -20,7 +20,12 @@ resources. Query results are cached by context, operation, sizes and dtype;
 no factors or dense operands are cached.
 
 For distributed eigh, the execution handler's dynamic XLA ScratchAllocator
-allocation is **exactly `vendor_device_bytes`**. Do not add it twice. The
+allocation is **exactly `native_device_bytes`**: vendor workspace rounded up
+to 256-byte alignment plus one local operand tile, `n/Px * n/Py * itemsize`.
+The tile preserves the non-donating input contract despite destructive vendor
+tridiagonalisation. Execution and query share the native byte-layout helper;
+do not add the tile or workspace twice. `vendor_device_bytes` is not separately
+reported for this combined native allocation. The
 separate host allocation is `vendor_host_bytes`. The internal receipt helper
 records both. For distributed GEMM, one vendor workspace is retained by the
 context and reused across batch slices. Thus a safe workspace envelope is
