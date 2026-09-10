@@ -402,9 +402,25 @@ at initialization and do not by themselves checkpoint each SC map.
 
 With `--entry PREVIOUS/entry_rotation_0001.npz`, the diagnostic rebuilds
 that state using the canonical rotation and stops before W/Sigma, after
-checking Gamma spectral projectors and the raw response at individual
-time points. This second mode is restricted to the unshifted scalar Si
+checking Gamma spectral projectors, paired-transpose projectors over the
+full k grid, and the raw response at individual time points. This second
+mode is restricted to the unshifted scalar Si
 4x4x4 fixture. Use a new run directory with copied restart inputs. An
 off-axis response is not required to be Hermitian; a centroid overlap is
 not the physical Hilbert-space metric; occupied density can change under
 occupied-empty mixing even though the complete rotated space is conserved.
+
+`--first-map-stages` observes the Gamma real-space kernel of Sigma, Hartree
+and the assembled Hamiltonian, then stops after the first map. Optional
+`--synthesis-pairs` also checks sampled W/tau calls and every integration
+window selector. `--full-k-stages` instead checks the actual full-BZ band
+operators in the DFT basis before selecting the SC star wedge. This last
+check is independent of the later broadcast and can detect star disagreement
+that checking a reconstructed table would hide.
+
+The separate `shared_pole_sc_direction_gauge.py` bench rotates only retained
+near-degenerate support multiplets and measures the actual distributed
+projector change. `shared_pole_conjugate_directions.py` and
+`shared_pole_support_gauge.py` are planted algebra probes for conjugate-port
+closure and support-basis covariance, respectively. They are diagnostic
+counterexamples, not GW accuracy or convergence certificates.

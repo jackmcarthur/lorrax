@@ -17,6 +17,12 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--entry', type=Path,
                         help='reconstruct a saved entering rotation; inspect state and stop before W/Sigma')
+    parser.add_argument('--first-map-stages', action='store_true',
+                        help='observe Gamma band operators across Sigma/H assembly and stop after map zero')
+    parser.add_argument('--full-k-stages', action='store_true',
+                        help='observe full-BZ band-operator star covariance before wedge selection; stop after map zero')
+    parser.add_argument('--synthesis-pairs', action='store_true',
+                        help='observe first three W and projected Sigma time samples in map zero')
     args = parser.parse_args()
     # The real driver owns runtime initialization and all physics execution.
     from gw import gw_jax as driver
@@ -36,6 +42,7 @@ def main():
     contexts = {}
     rotations = 0
     map_inputs = None
+    stage_wfns = None
 
     class StateObserved(Exception):
         pass
@@ -110,7 +117,19 @@ def main():
         mu, nb = old.psi_mun.shape[2:]
         assert mu <= 400 and nb <= 36
         product = gemm_plan(mesh,m=mu,k=nb,n=mu,nq=1,dtype=jnp.complex128)
+        full_product = gemm_plan(mesh,m=mu,k=nb,n=mu,nq=int(meta.nk_tot),dtype=jnp.complex128)
         face = NamedSharding(mesh,P(None,'x','y'))
+        from symmetry_maps import q_negation_index
+        negative = jnp.asarray(q_negation_index((4,4,4)))
+
+        @jax.jit
+        def full_pairs(left,right,weight):
+            value = jax.lax.with_sharding_constraint(
+                full_product(left[:,0]*weight[:,None,:],jnp.conj(right[:,:,0])),face)
+            peer = jnp.take(value,negative,axis=0).swapaxes(-1,-2)
+            norm = jnp.linalg.norm(value,axis=(-2,-1))
+            defect = jnp.linalg.norm(value-peer,axis=(-2,-1))
+            return defect/jnp.maximum(norm,1e-300),defect,norm
 
         @jax.jit
         def gamma(left,right,weight):
@@ -130,6 +149,12 @@ def main():
                               rb.stream_weights(wfns,weight,mesh))
                 emit('gamma_spectral_projector',state=name,weight=label,
                      imaginary_relative=float(imaginary_norm(value)),matrix=stats(value))
+                relative,absolute,norm = full_pairs(
+                    wfns.psi_mun,wfns.psi_nmu,rb.stream_weights(wfns,weight,mesh))
+                emit('full_k_spectral_projector',state=name,weight=label,
+                     pair_relative=host(relative),pair_absolute=host(absolute),norm=host(norm),
+                     negative_index=host(negative),
+                     scope='centroid Bloch-kernel paired transpose, calibrated against immutable DFT state')
             qids = tuple(map(int,np.asarray(inputs.sym.q_irr_full_idx)))
             kernel,fixed = rb.response_stream(wfns,meta,mesh_xy=mesh,q_ids=qids,n_outputs=3)
             common = (jnp.asarray([0.,.3,1.]),jnp.asarray(np.eye(3,dtype=np.complex128)),*fixed,
@@ -146,7 +171,7 @@ def main():
                  scope='existing Green/FFT kernel at individual times; no integration, Dyson solve or pole construction')
 
     def rotate(old, u, **kwargs):
-        nonlocal rotations
+        nonlocal rotations, stage_wfns
         if args.entry is not None:
             from common.collectives import device_put_process_local
             with np.load(args.entry) as saved:
@@ -157,6 +182,7 @@ def main():
                 kwargs['active_slice'] = slice(a_lo,a_hi)
                 kwargs['efermi'] = float(sc._midgap_efermi(saved['enk'][:,:a_hi],int(map_inputs.meta.nelec)))
         new = original_rotate(old, u, **kwargs)
+        stage_wfns = new
         # Small band-space arrays only; no wavefunction/Green host gather.
         uh = np.asarray(gather_to_host(u))
         active = kwargs.get('active_slice') or old.slices.sigma
@@ -258,14 +284,197 @@ def main():
     sc.rotate_wavefunctions = rotate
     original_map = sc.gw_iteration_map
 
+    def band_operator(label, value, wfns=None):
+        """Gamma kernel psi M psi.H: gauge-independent TRS observation.
+
+        Only one Gamma tile and one narrow face are formed, both on all P.
+        This is an operator-symmetry diagnostic, not a physical trace rule.
+        """
+        if value is None or getattr(value, 'ndim', 0) != 3:
+            return
+        wfns = stage_wfns if wfns is None else wfns
+        mu, nb = wfns.psi_mun.shape[2:]
+        assert value.shape[-2:] == (nb, nb) and mu <= 400 and nb <= 36
+        right = gemm_plan(mesh,m=nb,k=nb,n=mu,nq=1,dtype=jnp.complex128)
+        left = gemm_plan(mesh,m=mu,k=nb,n=mu,nq=1,dtype=jnp.complex128)
+        face = NamedSharding(mesh,P(None,'x','y'))
+
+        @jax.jit
+        def project(a, psi_x, psi_y):
+            p = left(psi_x[:1,0],right(a[:1],jnp.conj(psi_y[:1,:,0])))
+            p = jax.lax.with_sharding_constraint(p,face)
+            return (jnp.linalg.norm(jnp.imag(p))/jnp.maximum(jnp.linalg.norm(p),1e-300),
+                    jnp.linalg.norm(jnp.imag(p)),jnp.linalg.norm(p))
+
+        relative, absolute, norm = project(value,wfns.psi_mun,wfns.psi_nmu)
+        emit('gamma_band_operator',label=label,imaginary_relative=float(relative),
+             imaginary_absolute=float(absolute),norm=float(norm),matrix=stats(value[:1]))
+
+    from gw import degen_average
+    original_average = degen_average.average_matrix_diagonal
+    original_sigma = sc.compute_sigma_xc
+    original_partition = sc._apply_scissor_partition_policy
+    original_output_seam = sc._sc_output_tables_on_loop_kset
+    average_index = 0
+    full_k_records = []
+
+    def output_seam(sigma_result, delta_h_qp_full, delta_h_qp_unextrap_full,
+                    sigma_basis_U_full, exact_hartree_full, kstar):
+        if args.full_k_stages:
+            from symmetry_maps import KStarMap
+            # The physical map is meaningful even when the loop itself uses
+            # the identity map. Compare actual full-BZ results before any take.
+            physical = KStarMap.from_sym(map_inputs.sym, int(map_inputs.wfn.ntran))
+            nk, nb, _ = sigma_basis_U_full.shape
+            assert nk == physical.nk_full == 64 and nb <= 36
+
+            @jax.jit
+            def residuals(value, reference):
+                defect = value-reference
+                absolute = jnp.linalg.norm(defect, axis=(-2,-1))
+                norm = jnp.linalg.norm(value, axis=(-2,-1))
+                return (absolute/jnp.maximum(norm, 1e-300), absolute, norm,
+                        jnp.argmax(jnp.abs(defect)), jnp.max(jnp.abs(defect)))
+
+            operators = [('delta_h', delta_h_qp_full),
+                         ('delta_h_unextrapolated', delta_h_qp_unextrap_full)]
+            operators += [(name, getattr(sigma_result, name)) for name in
+                          ('v_h_kij_ry', 'sigma_x_kij_ry', 'sigma_xc_kij_ry')]
+            for label, value in operators:
+                if value is None or getattr(value, 'ndim', 0) != 3:
+                    continue
+                assert value.shape == sigma_basis_U_full.shape
+                # Independent eigenvectors at different k need not share a
+                # QP gauge. Restore the immutable loader's DFT band gauge.
+                dft = sc._rotate_to_dft_basis(value, sigma_basis_U_full, mesh=mesh)
+                reference = physical.broadcast(physical.select(dft))
+                rel, absolute, norm, worst, maximum = residuals(dft, reference)
+                rel, absolute, norm = host(rel), host(absolute), host(norm)
+                location = np.unravel_index(int(worst), tuple(dft.shape))
+                row = dict(label=label, stage='before_sc_output_wedge_selection',
+                           basis='immutable_DFT', canonical_star_spread_relative=float(physical.spread_rel(dft)),
+                           per_k_relative_fro=rel, per_k_absolute_fro_ry=absolute,
+                           per_k_norm_fro_ry=norm, worst_full_k=int(np.argmax(rel)),
+                           max_relative_fro=max(rel), max_absolute_entry_ry=float(maximum),
+                           worst_entry_kij=[int(v) for v in location],
+                           physical_nk_full=physical.nk_full, physical_nk_irr=physical.nk_irr,
+                           loop_nk_full=kstar.nk_full, loop_nk_irr=kstar.nk_irr,
+                           loop_identity=kstar.is_identity,
+                           matrix_shape=list(dft.shape), matrix_entries_per_rank=int(np.prod(dft.shape))//4,
+                           scope='Star relation of actual full-BZ band operators; parent little-group invariance is separate')
+                emit('full_k_band_star', **row)
+                full_k_records.append(row)
+                if jax.process_index() == 0:
+                    (args.output/'full_k_stages.json').write_text(json.dumps(dict(
+                        job_step=os.environ['SLURM_JOB_ID']+'.'+os.environ['SLURM_STEP_ID'],
+                        rows=full_k_records), indent=2)+'\n')
+        return original_output_seam(sigma_result, delta_h_qp_full,
+                                    delta_h_qp_unextrap_full, sigma_basis_U_full,
+                                    exact_hartree_full, kstar)
+
+    def average(value, **kwargs):
+        nonlocal average_index
+        observed = args.first_map_stages and stage_wfns is not None
+        if observed:
+            band_operator(f'degen_{average_index}_before',value)
+        result = original_average(value,**kwargs)
+        if observed:
+            band_operator(f'degen_{average_index}_after',result)
+            band_operator(f'degen_{average_index}_removed',value-result)
+            average_index += 1
+        return result
+
+    def sigma(*pos, **kwargs):
+        result = original_sigma(*pos,**kwargs)
+        if args.first_map_stages:
+            for field in ('v_h_kij_ry','sigma_x_kij_ry','sigma_xc_kij_ry'):
+                band_operator(field,getattr(result,field))
+            cube=result.sigma_c_omega_kij_ry
+            for i in (0,cube.shape[0]//2,cube.shape[0]-1):
+                value=cube[i]
+                band_operator(f'sigma_c_omega_{i}_hermitian',.5*(value+value.conj().swapaxes(-1,-2)))
+        return result
+
+    def partition(value, *pos, **kwargs):
+        if args.first_map_stages:
+            band_operator('H_before_partition',value,map_inputs.wfns_dft)
+        result = original_partition(value,*pos,**kwargs)
+        if args.first_map_stages:
+            band_operator('H_after_partition',result[0],map_inputs.wfns_dft)
+        return result
+
     def observe_map(state, inputs):
         nonlocal map_inputs
         map_inputs = inputs
-        return original_map(state,inputs)
+        result = original_map(state,inputs)
+        if args.first_map_stages:
+            band_operator('kin_ion_dft',inputs.kin_ion_dft,inputs.wfns_dft)
+        if args.first_map_stages or args.full_k_stages:
+            raise StateObserved('first map Sigma/H stages inspected')
+        return result
 
     sc.gw_iteration_map = observe_map
     rb.produce_sample_bank = produce
     rb._bank_execution = execution
+    degen_average.average_matrix_diagonal = average
+    sc.compute_sigma_xc = sigma
+    sc._apply_scissor_partition_policy = partition
+    sc._sc_output_tables_on_loop_kset = output_seam
+    from gw.mpa import sigma as mpa_sigma
+    original_synthesis = mpa_sigma._shared_pole_w_synthesis
+    original_tau = mpa_sigma.get_shared_sigma_tau_kernel
+
+    def synthesis(*pos,**kwargs):
+        build=original_synthesis(*pos,**kwargs)
+        if not args.synthesis_pairs:
+            return build
+        header=pos[2]
+        from symmetry_maps import q_negation_index
+        negative=jnp.asarray(q_negation_index(header['grid']))
+        calls=0
+        @jax.jit
+        def pairs(a):
+            peer=jnp.take(a,negative,axis=0).swapaxes(-1,-2)
+            return jnp.linalg.norm(a-peer,axis=(-2,-1))/jnp.maximum(jnp.linalg.norm(a,axis=(-2,-1)),1e-300)
+        def observed(*values):
+            nonlocal calls
+            result=build(*values)
+            if calls<3:
+                emit('synthesis_q_pairs',call=calls,relative=host(pairs(result)),
+                     time=[float(jnp.real(values[-1])),float(jnp.imag(values[-1]))],
+                     rewired=mpa_sigma._shared_pole_fixed_q_policy(header).n_pair_rewired)
+            calls+=1
+            return result
+        return observed
+
+    def tau(**kwargs):
+        kernel=original_tau(**kwargs)
+        if not args.synthesis_pairs or kwargs.get('w_synthesis') is None:
+            return kernel
+        calls=0
+        seen=set()
+        def observed(*values):
+            nonlocal calls
+            result=kernel(*values)
+            if isinstance(result,jax.core.Tracer):
+                # The inherited-memory comparison traces a synthetic phased-W
+                # kernel. Observe only real execution, never compile tracers.
+                return result
+            # Selector is constructed once per product window in the owner.
+            key=id(values[5])
+            if calls<3 or key not in seen:
+                band_operator(f'sigma_tau_{calls}_hermitian',.5*(result+result.conj().swapaxes(-1,-2)))
+                energy=np.asarray(gather_to_host(values[4]))
+                selector=np.asarray(gather_to_host(values[5])).reshape(energy.shape)
+                emit('sigma_window_selector',call=calls,energy_gamma=energy[0].tolist(),
+                     selector_gamma=selector[0].tolist(),time=[float(jnp.real(values[-1])),float(jnp.imag(values[-1]))])
+                band_operator(f'selector_{calls}',jnp.diag(jnp.asarray(selector[0]))[None].astype(jnp.complex128))
+                seen.add(key)
+            calls+=1
+            return result
+        return observed
+    mpa_sigma._shared_pole_w_synthesis=synthesis
+    mpa_sigma.get_shared_sigma_tau_kernel=tau
     try:
         driver.main(['-i', args.input])
     except StateObserved as exc:
@@ -281,6 +490,12 @@ def main():
         sc.gw_iteration_map = original_map
         rb.produce_sample_bank = original_produce
         rb._bank_execution = original_execution
+        degen_average.average_matrix_diagonal = original_average
+        sc.compute_sigma_xc = original_sigma
+        sc._apply_scissor_partition_policy = original_partition
+        sc._sc_output_tables_on_loop_kset = original_output_seam
+        mpa_sigma._shared_pole_w_synthesis=original_synthesis
+        mpa_sigma.get_shared_sigma_tau_kernel=original_tau
 
 
 if __name__ == '__main__':
