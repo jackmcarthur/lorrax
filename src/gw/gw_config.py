@@ -2879,14 +2879,14 @@ def _resolve_shared_pole_inputs(params):
         raise ValueError(
             "shared_pole needs a positive spectral measure: MP1 occupations "
             "are non-monotonic; use occ_smearing_family = fd")
-    if coerce_head_correction(params['head_correction']) is not HeadCorrection.OFF:
-        raise ValueError(
-            "shared_pole head correction NOT_MEASURED; use mpa or head_correction = off")
-    unused = sorted(named.intersection({
-        "mpa_n_poles", "mpa_sampling_alpha", "mpa_sampling_schedule",
-        "mpa_pole_solver", "mpa_varpi_near_ry", "mpa_varpi_far_ry",
-        "mpa_metal_origin_shift_ry", "mpa_pole_batch_size", "mpa_fit_reuse_file",
-        "mpa_overwrite_completed_artifacts"}))
+    head_enabled = coerce_head_correction(params['head_correction']) is not HeadCorrection.OFF
+    unused_keys = {"mpa_pole_batch_size", "mpa_fit_reuse_file",
+                   "mpa_overwrite_completed_artifacts"}
+    if not head_enabled:
+        unused_keys.update({"mpa_n_poles", "mpa_sampling_alpha", "mpa_sampling_schedule",
+            "mpa_pole_solver", "mpa_varpi_near_ry", "mpa_varpi_far_ry",
+            "mpa_metal_origin_shift_ry"})
+    unused = sorted(named.intersection(unused_keys))
     if unused:
         raise ValueError(
             f"GATE shared_pole_unused_inputs: got: {', '.join(unused)}; "

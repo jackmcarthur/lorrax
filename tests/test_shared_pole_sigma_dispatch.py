@@ -27,7 +27,17 @@ def test_incomplete_handle_never_falls_back_to_incumbent(missing):
 
 
 @pytest.mark.parametrize('policy', [None, 'full', 'no_local_fields'])
-def test_shared_head_enabled_refuses(policy):
+def test_shared_head_enabled_requires_current_fit(policy):
     handle = dict(path='current.h5', identity={}, digest='d')
-    with pytest.raises(ValueError, match='shared_pole head correction NOT_MEASURED'):
+    with pytest.raises(ValueError, match='current body-bound MPA scalar head'):
         _mpa_sigma_model_resources({'shared_pole': handle}, 'shared_pole', policy)
+
+
+def test_shared_head_is_bound_to_current_body():
+    handle = dict(path='current.h5', identity={'iteration_id': 'sc_0002'}, digest='d')
+    head = dict(identity=handle['identity'], body_digest='d', Omega_p=[1j], B_p=[2])
+    roles = dict(shared_pole=handle, mpa_head=head)
+    assert _mpa_sigma_model_resources(roles, 'shared_pole', 'full')[1] is head
+    roles['shared_pole'] = dict(handle, digest='new_W')
+    with pytest.raises(ValueError, match='missing or stale'):
+        _mpa_sigma_model_resources(roles, 'shared_pole', 'full')

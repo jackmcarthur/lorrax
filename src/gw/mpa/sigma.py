@@ -1391,7 +1391,7 @@ def compute_sigma_c_mpa_omega_grid(
                     reduction_steps=quadrature_reduction_steps,
                     cache_dir=quadrature_cache_dir,
                     print_fn=print_fn, edge_factor=edge_factor,
-                    fixed_rule_session=(None if shared_pole else fixed_quadrature_session))
+                    fixed_rule_session=fixed_quadrature_session)
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "

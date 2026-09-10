@@ -933,7 +933,13 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             with timing.section("spole.gates"):
                 for name in ("gram_diagonal_positive", "gram_valid", "retained_metric_positive"):
                     if not bool(jnp.all(reduction[name])):
-                        raise ValueError(f"GATE shared_pole_{name}: got: failed at q={q}, metric infinity norm={reduction['metric_initial_infinity_norm']}, inverse-root residual={reduction['metric_inverse_root_residual_relative']}; want: valid Gram and retained metric; why: no PSD repair")
+                        raise ValueError(
+                            f"GATE shared_pole_{name}: got: failed at q={q}, "
+                            f"Gram min/max={reduction['gram_min_relative']}, "
+                            f"metric infinity norm={reduction['metric_initial_infinity_norm']}, "
+                            f"inverse-root residual={reduction['metric_inverse_root_residual_relative']}; "
+                            f"want: Gram min/max >= {gates['normalized_gram_validity']['threshold']} "
+                            "and valid diagonal/retained metric; why: no PSD repair")
                 if batch_results is None:
                     model, zero = apply_shared_pole_zero_policy(model, gates=gates)
                 if not bool(jnp.all(zero["zero_policy"])):

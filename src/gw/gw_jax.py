@@ -735,8 +735,13 @@ def main(argv=None):
 		if mode.value == "mpa":
 			from .mpa import sample_plan
 			from .mpa.model import make_mpa_plan
-			oneshot_mpa_plan = make_mpa_plan(
-				config, quad, material_class=material_class)
+			if config.sigma.w_model == "shared_pole":
+				from .shared_pole_head import shared_pole_head_plan
+				oneshot_mpa_plan = shared_pole_head_plan(
+					config, meta.shared_pole_recipe, material_class=material_class)
+			else:
+				oneshot_mpa_plan = make_mpa_plan(
+					config, quad, material_class=material_class)
 			oneshot_omegas = np.asarray(
 				sample_plan.plan_z(oneshot_mpa_plan), dtype=np.complex128)
 		else:

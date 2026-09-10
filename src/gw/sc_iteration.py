@@ -2478,6 +2478,15 @@ def _sc_head_frequency_plan(
     if config.compute_mode is ComputeMode.MPA and config.sigma.w_model == "shared_pole":
         if shared_pole_recipe is None:
             raise ValueError("GATE shared_pole_sc_plan: current-map recipe is missing")
+        if getattr(config, "head", None) is not None and config.head.correction is not HeadCorrection.OFF:
+            from .shared_pole_head import shared_pole_head_plan
+            from .mpa.sample_plan import plan_z
+            plan = shared_pole_head_plan(config, shared_pole_recipe,
+                                          material_class=material_class)
+            points = list(map(complex, plan_z(plan)))
+            if bool(config.do_G0) and 0j not in points:
+                points.append(0j)
+            return requests, plan, points
         # Select existing physical fit coordinates; never rebuild an MPA grid
         # or call the shared recipe resolver a second time for the head.
         ids = np.asarray(shared_pole_recipe['distinct_id'])
@@ -3131,6 +3140,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         bind_shared_pole_sc_identity(
             inputs.meta, state, occupation_state=entry_occ_state,
             print_fn=inputs.print_fn)
+        inputs.meta.shared_pole_response_rules = (
+            None if inputs.fixed_quadrature_session is None else
+            inputs.fixed_quadrature_session.setdefault("chi", {}))
 
     def _screening(mpa_plan, iteration_head_response, *, producer=None,
                    quad_override=None):
@@ -3175,7 +3187,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     iteration_static_head_terms = inputs.static_head_terms
     head_occ_kn = None
     pt = getattr(inputs, "parallel_transport", None)
-    fixed_dft_full_head = inputs.fixed_dft_head_response is not None
+    fixed_dft_full_head = (inputs.fixed_dft_head_response is not None or
+        (pt is None and inputs.config.head.correction is HeadCorrection.FULL
+         and inputs.config.sigma.w_model == "shared_pole"))
     if pt is not None or fixed_dft_full_head:
         from .head_correction import compute_static_head_terms_from_sample
         from .qsgw_head import finalize_iteration_head_samples
@@ -3285,6 +3299,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # QSGW velocity-update choice.  Only the small 3x3/vector response is
         # retained; body W remains 2-D sharded as before.
         iteration_head_response = inputs.fixed_dft_head_response
+        if (iteration_head_response is None or
+                (inputs.config.sigma.w_model == "shared_pole"
+                 and tuple(iteration_head_response.omegas) != tuple(head_omegas))):
+            from .qsgw_head import build_dft_head_response
+            iteration_head_response = build_dft_head_response(
+                inputs.wfns_dft, np.asarray(head_omegas, dtype=np.complex128),
+                input_dir=inputs.input_dir, mesh=inputs.mesh_xy, wfn=inputs.wfn,
+                meta=inputs.meta, config=inputs.config)
         head_occ_kn = np.asarray(
             iteration_head_response.sigma_occupations, dtype=np.float64)
         if tuple(iteration_head_response.omegas) != tuple(head_omegas):
@@ -5646,13 +5668,15 @@ def run_sc_driver(
         print_fn=print_fn)
     fixed_dft_head_response = None
     if (parallel_transport is None
-            and config.head.correction is HeadCorrection.FULL):
+            and config.head.correction is HeadCorrection.FULL
+            and config.sigma.w_model != "shared_pole"):
         # ``sc_head_update=off`` freezes this direct DFT response.  Build it
         # once, on the same single-sourced frequency plan every map consumes,
         # then fold it through each iteration's resident W exactly once.
         from .qsgw_head import build_dft_head_response
         _, _, fixed_head_omegas = _sc_head_frequency_plan(
-            config, quad, material_class=material_class)
+            config, quad, material_class=material_class,
+            shared_pole_recipe=getattr(meta, "shared_pole_recipe", None))
         fixed_dft_head_response = build_dft_head_response(
             wfns, np.asarray(fixed_head_omegas, dtype=np.complex128),
             input_dir=input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,

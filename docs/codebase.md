@@ -48,6 +48,7 @@ contracts, equations, shapes, and run policy remain on the owner pages in the
 | `qgrid_symmetry.py` | Resolves q-grid symmetry policy and index tables. |
 | `qsgw_density.py` | Builds density state for QSGW iterations. |
 | `qsgw_head.py` | Builds finite-link velocity and head data for QSGW. |
+| `shared_pole_head.py` | Evaluates current Gamma shared-pole W and routes its scalar head through the common head and MPA owners. |
 | `qsgw_utils.py` | Provides QSGW fixed-point, mixing, and matrix I/O helpers. |
 | `restart_q_storage.py` | Resolves q-axis restart storage and compatibility. |
 | `sc_iteration.py` | Runs one self-consistent iteration map. |

@@ -13,6 +13,7 @@ import time
 
 import jax
 from common import timing
+from common.units import RYD_TO_EV
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -410,8 +411,6 @@ def response_windows(energy, f, u, *, chemical_potential_ry):
     not call this routine. Bounds are extrema over all k/band pairings, so
     they cover every q without constructing a transition table.
     """
-    from common.units import RYD_TO_EV
-
     ft = np.where(np.abs(f) >= 1e-14, f, 0.0)
     ut = np.where(np.abs(u) >= 1e-14, u, 0.0)
     physical = (f != 0) | (u != 0)
@@ -601,7 +600,14 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         receipt["rule_provider"] = "minimax"
         middle = energy[masks[1]]
         delta = float(middle.max()-middle.min())
-        rule = bank_rule(z,delta,rel_tol=sample_plan["bank_rule_tolerance"])
+        session = getattr(meta, "shared_pole_response_rules", None)
+        # Each one-particle endpoint gets 2 eV: a transition edge gets 4 eV.
+        pad = 4.0/RYD_TO_EV if session is not None else 0.0
+        rule = bank_rule(z,delta,rel_tol=sample_plan["bank_rule_tolerance"],
+            previous=None if session is None else session.get("stream"),
+            domain_pad_ry=pad)
+        if session is not None:
+            session["stream"] = rule
         t,weights = np.asarray(rule["t"]),np.asarray(rule["h"])
         phase = np.asarray(rule["projection_value"])
         derivative = np.asarray(rule["projection_derivative"])
@@ -609,8 +615,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         receipt["nodes"] = len(t)
         remote = []
         for cell in cells:
+            key = (cell["lower"], cell["upper"])
             rr = laplace_rule(cell["delta_min_ry"],cell["delta_max_ry"],z,
-                             rel_tol=sample_plan["bank_rule_tolerance"])
+                rel_tol=sample_plan["bank_rule_tolerance"],
+                previous=None if session is None else session.get(key),
+                domain_pad_ry=pad)
+            if session is not None:
+                session[key] = rr
             remote.append((cell,rr))
         receipt["laplace_cells"] = [{**cell,**{k:v for k,v in rr.items()
             if k not in ("t","projection_value","projection_derivative","coefficient_rows")}}

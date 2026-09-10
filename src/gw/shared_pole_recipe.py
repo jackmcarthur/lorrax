@@ -63,13 +63,17 @@ _GATE_ROWS = {
     "stream_peak": ("inherited response stream peak <= threshold * incumbent MPA stream peak on the same deck and processor geometry, using the same measurement method", 1.05),
     "sigma_peak": ("inherited Sigma peak including one incumbent-shaped W <= threshold * incumbent MPA Sigma peak on the same deck, processor geometry and window plan, using the same measurement method", 1.05),
     "rule_validity": ("bank and Sigma certificates cover current domains at resolved tolerances", True),
-    "sc_rebuild": ("samples, directions, poles, ranks, intervals and rules rebuilt at current bands and occupations", True),
+    "sc_rebuild": ("physical samples, directions, poles and ranks rebuilt at current bands and occupations; reused quadrature certified for current domains", True),
 }
 shared_real_pole_gates_v1_r3b = {
     name: {"name": name, "predicate": predicate, "threshold": threshold,
            "version": GATE_VERSION}
     for name, (predicate, threshold) in _GATE_ROWS.items()
 }
+
+# The SC quadrature contract changed independently of all numerical gates.
+shared_real_pole_gates_v1_r3b["sc_rebuild"]["version"] = "sc_quadrature_recertification_20260910"
+
 
 for _name, _range in (("full_m1_defect", (2.2e-6, 1.9e-5)),
                       ("full_m3_defect", (3.6e-5, 1.7e-4))):
@@ -572,6 +576,7 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
         raise ValueError("GATE shared_pole_plasma: got: nonpositive/nonfinite active charge or cell volume; want: positive finite electrons and bohr^3; why: omega_p requires positive density")
     meta.shared_pole_census = {
         "mu_ry": mu, "gap_ev": gap_ev, "partial_at_mu": partial_at_mu,
+        "energy_span_ry": float(energies.max()-energies.min()),
         "active_electrons": electrons, "cell_volume_bohr3": volume,
         "state_capacity": capacity, "k_weights": weights.tolist(),
         "k_weight_sum": float(weights.sum()), "k_weight_rule": "authenticated full-BZ quadrature weights",

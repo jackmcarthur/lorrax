@@ -2,7 +2,8 @@
 
 The response, constructor and persistence owners implement their own stages.
 This helper authenticates the current map and passes only disk handles between
-stages. No sample, direction, pole or quadrature is reused across changed maps.
+stages. Samples, directions and poles are rebuilt across changed maps;
+the SC owner may retain time nodes after current-domain certification.
 """
 from pathlib import Path
 import dataclasses
@@ -101,8 +102,14 @@ def _coulomb_resource(value, meta, sym, mesh_xy, path):
 
 def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         centroid_indices, run_dir, label, wfn,
-                        wfn_fingerprint_binding, tensors_filename, occupation_state, print_fn):
-    """Build/reuse one immutable current-map model and return its small handle."""
+                        wfn_fingerprint_binding, tensors_filename, occupation_state, print_fn,
+                        head_resolver=None, mpa_plan=None, iteration_head_response=None,
+                        material_class=None):
+    """Build current W; only one-shot models may use ISDF restart membership.
+
+    SC labels own separate map scratch. ``restart`` may restore the invariant
+    ISDF basis, but never skips the current response or W construction.
+    """
     timing.fence("spole.screening_setup")
     with timing.section("spole.screening_setup"):
         from symmetry_maps import (QirrTables, centroid_source_map_and_wrap,
@@ -126,11 +133,21 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             wfns = dataclasses.replace(wfns, occ=replicate_to_mesh(occupations, mesh_xy))
         identity = shared_pole_identity(wfns, meta, label=label, wfn=wfn,
             binding=wfn_fingerprint_binding, centroid_indices=centroid_indices)
-        if config.restart and tensors_filename is not None:
+        sc_scratch = str(label).startswith("sc_")
+        if config.restart and tensors_filename is not None and not sc_scratch:
             handle = shared_pole_restart_handle(tensors_filename,
                 expected_identity=identity, meta=meta, mesh_xy=mesh_xy, print_fn=print_fn)
             if handle is not None:
-                return dict(shared_pole=handle)
+                result = dict(shared_pole=handle)
+                from .gw_config import HeadCorrection
+                if config.head.correction is not HeadCorrection.OFF:
+                    from .shared_pole_head import build_shared_pole_head
+                    head, iteration_head = build_shared_pole_head(
+                        handle, None, V_q, wfns, meta, config, mesh_xy=mesh_xy, wfn=wfn,
+                        response=iteration_head_response, head_resolver=head_resolver,
+                        plan=mpa_plan, material_class=material_class, occupation_state=occupation_state)
+                    result.update(mpa_head=head, iteration_head=iteration_head)
+                return result
         root = Path(run_dir).resolve() / (str(label) + "_shared_pole")
         from common.collectives import rank0_transaction
         from file_io.commit_state import assert_committed
@@ -204,7 +221,17 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         handle = dict(path=str(root / "model.h5"), identity=identity,
                       digest=header["digest"], K=list(header["K"]))
         ledger.live_stages = ()
-        if tensors_filename is not None:
+        result = dict(shared_pole=handle)
+        from .gw_config import HeadCorrection
+        if config.head.correction is not HeadCorrection.OFF:
+            from .shared_pole_head import build_shared_pole_head
+            head, iteration_head = build_shared_pole_head(
+                handle, header, V_q, wfns, meta, config, mesh_xy=mesh_xy, wfn=wfn,
+                response=iteration_head_response, head_resolver=head_resolver,
+                plan=mpa_plan, material_class=material_class, occupation_state=occupation_state)
+            result.update(mpa_head=head, iteration_head=iteration_head)
+            record("head", head)
+        if tensors_filename is not None and not sc_scratch:
             receipts["restart_member"] = register_shared_pole_restart_member(
                 tensors_filename, handle["path"], expected_identity=identity,
                 mesh_xy=mesh_xy, capacity=ledger)
@@ -212,4 +239,4 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         receipts["handle"] = handle
         if jax.process_index() == 0:
             (root / "construction_receipt.json").write_text(_json(receipts) + "\n")
-        return dict(shared_pole=handle)
+        return result

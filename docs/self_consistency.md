@@ -347,3 +347,44 @@ first integer in a body row is spin). They describe eqp0 even in the eqp1
 file. The Hamiltonian carry and accelerator are unchanged. The diagonal
 retention mask is `protected | in_range`, including protected multiplet
 members; only non-protected out-of-range diagonals are scissored.
+
+
+## Shared-pole W with retained quadrature
+
+The shared-pole SC path rebuilds the response samples, exact moments, directions,
+Ritz poles and factors from every map's rotated wavefunctions, energies and
+occupations. `restart=true` restores the invariant ISDF basis. SC W models remain
+map-local scratch and are never published as reusable ISDF bundle members.
+
+The run-local fixed-quadrature session holds mathematical integration rules.
+Sigma uses its existing 2 eV state and 10% pole margins, retaining identical
+nodes and weights while recomputing current masks, pole selectors, reference
+energies and W(time). Containment, error currency and separated-factor growth
+are checked at every map; a failed check rebuilds the affected rule. Eta and
+epsilon remain fixed for a session. Disk model identity is not relaxed.
+
+Chi rules pad transition endpoints by up to 4 eV, corresponding to 2 eV on
+each one-particle endpoint. The physical band selection and occupations are
+recomputed without padded masks. The resonant rule recertifies all current
+frequencies, including its infinite-time tail, then updates its projections.
+Remote rules keep their certified inverse-moment rows and anchor, recertifying
+the current Taylor remainder and updating projections. A missing certificate,
+domain escape or failed bound rebuilds that rule. Lower remote padding cannot
+cross the Taylor convergence boundary. See the [minimax contract](services/minimax.md).
+
+An enabled scalar head uses the existing MPA sample-plan, scalar-fit and Sigma
+head owners. Full local fields evaluate the current shared-pole Gamma body,
+one frequency at a time with both matrix axes distributed, and fold the common
+head wings through total W. The head fit is bound to that map's body digest.
+`sc_head_update=off` keeps the DFT direct response and wings; their samples are
+recomputed at the current head frequencies and folded through current W. MPA
+sampling keys configure this scalar head; elementwise-body fit/reuse keys have
+no shared-pole consumer. The shifted finite-q BGW metal head remains unsupported.
+
+Validation on branch `investigate/shared-pole-sc-quadrature-2026-09-10`:
+P4 Si job58148928.6 completed one full-head QSGW map and reused identical chi
+rules in the next response bank, then refused the second W constructor's Gram
+check. Job58148928.8 with tighter resonant quadrature also refused that check.
+This enables the SC/head plumbing and certified quadrature retention; it does
+not establish shared-pole SC convergence or head accuracy. Detailed evidence:
+sandbox `reports/shared_pole_sc_implementation_2026-09-10/report.md`.
