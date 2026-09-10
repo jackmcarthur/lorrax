@@ -177,3 +177,13 @@ def test_invalid_budget_refuses_before_build(seconds, steps):
     from minimax import uniform_rule_budget
     with pytest.raises(ValueError):
         uniform_rule_budget(seconds, steps)
+
+
+def test_backend_receipt_uses_the_fitter_policy_resolver(monkeypatch):
+    from minimax import uniform_rule_backend_policy
+    monkeypatch.setenv("LORRAX_UNIFORM_RULE_BACKEND", " AUTO ")
+    assert uniform_rule_backend_policy() == "auto"
+    assert uniform_rule_backend_policy("numpy") == "numpy"
+    monkeypatch.setenv("LORRAX_UNIFORM_RULE_BACKEND", "invalid")
+    with pytest.raises(ValueError, match="must be numpy, jax or auto"):
+        uniform_rule_backend_policy()

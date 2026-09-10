@@ -1036,6 +1036,18 @@ class UniformRule:
                 f"kappa {self.kappa_max:.3g}, {self.seconds:.1f} s")
 
 
+def uniform_rule_backend_policy(backend=None):
+    """Return the validated backend policy used by fitting and provenance.
+
+    An explicit policy overrides the environment. Hardware-dependent ``auto``
+    selection remains in the fitter; this receipt names the requested policy.
+    """
+    choice = (backend or os.environ.get("LORRAX_UNIFORM_RULE_BACKEND", "numpy")).strip().lower()
+    if choice not in ("numpy", "jax", "auto"):
+        raise ValueError("LORRAX_UNIFORM_RULE_BACKEND must be numpy, jax or auto")
+    return choice
+
+
 def _select_backend(backend, n_start, cloud_size):
     """``numpy`` | ``jax`` | ``auto`` (env ``LORRAX_UNIFORM_RULE_BACKEND``).
 
@@ -1043,9 +1055,7 @@ def _select_backend(backend, n_start, cloud_size):
     problem is large enough to pay its launch and compile overhead (start
     rank >= 40, cloud >= 2000): the small sign-definite tails finish in a few
     seconds on numpy and would spend longer compiling."""
-    choice = (backend or os.environ.get("LORRAX_UNIFORM_RULE_BACKEND", "numpy")).strip().lower()
-    if choice not in ("numpy", "jax", "auto"):
-        raise ValueError("LORRAX_UNIFORM_RULE_BACKEND must be numpy, jax or auto")
+    choice = uniform_rule_backend_policy(backend)
     if choice == "numpy":
         return "numpy"
     try:

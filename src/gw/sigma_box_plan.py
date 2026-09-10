@@ -39,6 +39,7 @@ from minimax import (
     box_samples,
     build_uniform_rule,
     uniform_rule_budget,
+    uniform_rule_backend_policy,
     rule_roundoff_amplification,
 )
 
@@ -1157,7 +1158,7 @@ def plan_sigma_windows(
         "reduction_mode": policy["mode"],
         "reduction_budget": policy,
         "cache_dir": cache_dir, "rule_cache_schema": _RULE_CACHE_SCHEMA,
-        "backend_policy": os.environ.get("LORRAX_UNIFORM_RULE_BACKEND", "numpy"),
+        "backend_policy": uniform_rule_backend_policy(),
         "n_windows": len(output),
         "window_tau_pairs": pairs, "distinct_tau_count": distinct,
         "plan_seconds": time.perf_counter() - started,
