@@ -7,14 +7,18 @@ the same Hermite/Ritz equations as the distributed constructor.
 from functools import lru_cache
 
 
-def pack_parent_panels(states, infinity, counts, infinity_counts, *, mesh_xy, parent_batch):
+def pack_parent_panels(states, infinity, counts, infinity_counts, *, mesh_xy, parent_batch,
+                       layout):
     """Compact batched tangential panels into their original pencil columns.
 
     ``states`` contains (s,Q,WQ,dWQ), with s scalar Ry² and complex128
     [b,n,r_a] face panels. ``counts`` is host int [b,A] from spectral cuts;
     ``infinity_counts`` is host int [b]. Only O(bR) offsets/masks cross to
     the device. Panels stay face-tiled through the existing y permutation.
-    Return the packed finite/infinity/mask bundle and original (R_f,r_inf)
+    In the resolved local layout, identical Q objects (conjugate ports)
+    are packed once; a [b,R_f] column map restores them after movement.
+    The distributed layout retains its original complete Q face.
+    Return the finite/infinity/mask/map bundle and original (R_f,r_inf)
     extents. No physical or native eigensolve dimension changes.
     """
     import numpy as np
@@ -31,6 +35,25 @@ def pack_parent_panels(states, infinity, counts, infinity_counts, *, mesh_xy, pa
     ri = infinity[0].shape[-1]
     widths = [state[1].shape[-1] for state in states]
     offsets = np.cumsum([0, *widths[:-1]])
+    # Object identity is the constructor's explicit reuse of the same Q.
+    # Never merge distinct directions using support or numerical equality.
+    if layout not in ("local", "distributed"):
+        raise ValueError(f"unknown shared-pole panel layout: {layout}")
+    sources = []
+    source_for = []
+    for i, state in enumerate(states):
+        source = next((j for j in sources if layout == "local"
+                       and state[1] is states[j][1]), i)
+        if source == i:
+            sources.append(i)
+        source_for.append(source)
+    sources = tuple(sources)
+    unique_widths = [widths[i] for i in sources]
+    unique_offsets = np.cumsum([0, *unique_widths[:-1]])
+    unique_counts = np.asarray([sum(row[i] for i in sources) for row in carriers], np.int32)
+    unique_width = int(max(unique_counts))
+    unique_order = np.empty((len(counts), sum(unique_widths)), np.int32)
+    columns = np.full((len(counts), rf), -1, np.int32)
     order = np.empty((len(counts), sum(widths)), np.int32)
     active = np.zeros((len(counts), rf + ri), bool)
     for q, (row, retained) in enumerate(zip(carriers, counts)):
@@ -39,19 +62,30 @@ def pack_parent_panels(states, infinity, counts, infinity_counts, *, mesh_xy, pa
         tail = np.ones(sum(widths), bool)
         tail[selected] = False
         order[q] = selected + np.flatnonzero(tail).tolist()
+        selected_q = [int(start)+i for start, port in zip(unique_offsets, sources)
+                      for i in range(row[port])]
+        tail_q = np.ones(sum(unique_widths), bool)
+        tail_q[selected_q] = False
+        unique_order[q] = selected_q + np.flatnonzero(tail_q).tolist()
+        packed_offsets = dict(zip(sources, np.cumsum([0, *[row[i] for i in sources[:-1]]])))
         start = 0
-        for width, count in zip(row, retained):
+        for port, (width, count) in enumerate(zip(row, retained)):
+            source = source_for[port]
+            if (width, count) != (row[source], retained[source]):
+                raise ValueError("identical Q ports must have identical retained counts")
+            columns[q, start:start+width] = packed_offsets[source] + np.arange(width)
             active[q, start:start+int(count)] = True
             start += width
         active[q, rf:rf+int(infinity_counts[q])] = True
-    packed = _parent_panel_packer(mesh_xy, rf, parent_batch)(
+    packed = _parent_panel_packer(mesh_xy, rf, parent_batch, sources, unique_width)(
         tuple(states), infinity, order, active,
-        np.asarray([nf for nf, _ in extents], np.int32))
+        np.asarray([nf for nf, _ in extents], np.int32), unique_order,
+        unique_counts, columns)
     return packed, extents
 
 
 @lru_cache(maxsize=None)
-def _parent_panel_packer(mesh_xy, finite_width, parent_batch):
+def _parent_panel_packer(mesh_xy, finite_width, parent_batch, sources, unique_width):
     """One batch pack with dynamic column offsets and physical supports."""
     import jax
     import jax.numpy as jnp
@@ -63,22 +97,27 @@ def _parent_panel_packer(mesh_xy, finite_width, parent_batch):
     permute = _factor_column_permutation(mesh_xy)
 
     @jax.jit
-    def pack(states, infinity, order, active, finite_counts):
+    def pack(states, infinity, order, active, finite_counts, unique_order,
+             unique_counts, columns):
         b = states[0][1].shape[0]
         valid = jnp.arange(finite_width)[None, :] < finite_counts[:, None]
         points = jnp.concatenate([
             jnp.full((b, s[1].shape[-1]), s[0], jnp.complex128)
             for s in states], axis=-1)
         points = jnp.where(valid, jnp.take_along_axis(points, order, axis=-1)[:, :finite_width], 0)
+        q_valid = jnp.arange(unique_width)[None, :] < unique_counts[:, None]
+        q = jnp.where(q_valid[:, None, :], permute(
+            jnp.concatenate([states[i][1] for i in sources], axis=-1), unique_order)
+            [:, :, :unique_width], 0)
         panels = tuple(jnp.where(valid[:, None, :], permute(
             jnp.concatenate([s[i] for s in states], axis=-1), order)[:, :, :finite_width], 0)
-            for i in (1, 2, 3))
+            for i in (2, 3))
         def pad(value, sharding):
             if parent_batch > b:
                 value = jnp.concatenate((value, jnp.repeat(value[-1:], parent_batch-b, axis=0)), axis=0)
             return jax.lax.with_sharding_constraint(value, sharding)
-        finite = (pad(points, scalar), *(pad(a, face) for a in panels))
-        return finite, tuple(pad(a, face) for a in infinity), pad(active, scalar)
+        finite = (pad(points, scalar), pad(q, face), *(pad(a, face) for a in panels))
+        return finite, tuple(pad(a, face) for a in infinity), pad(active, scalar), pad(columns, scalar)
     return pack
 
 
@@ -133,7 +172,12 @@ def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
         return jax.tree.map(lambda a: a[0], (model, reduction, zero, retained))
 
     def one(args):
-        finite, infinity, active, index = args
+        finite, infinity, active, index, columns = args
+        # Recreate the original Q panel only for this local parent. Copying
+        # columns changes neither directions nor the pencil's arithmetic.
+        q = jnp.where(columns[None, :] >= 0,
+                      jnp.take(finite[1], jnp.maximum(columns, 0), axis=-1), 0)
+        finite = (finite[0], q, finite[2], finite[3])
         if parent_extents is None:
             return solve(finite, infinity, active)
         # cuSolver's native eigh can fail on large artificial zero blocks.
@@ -165,8 +209,8 @@ def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
             index = dispatch[index]
         return jax.lax.switch(index, branches, (finite, infinity, active))
 
-    mapped = shard_map(lambda f, i, a, q: jax.lax.map(one, (f, i, a, q)), mesh=mesh_xy,
-                       in_specs=((qspec,)*4, (qspec,)*3, qspec, qspec),
+    mapped = shard_map(lambda f, i, a, q, c: jax.lax.map(one, (f, i, a, q, c)), mesh=mesh_xy,
+                       in_specs=((qspec,)*4, (qspec,)*3, qspec, qspec, qspec),
                        out_specs=(qspec, qspec, qspec, qspec), check_vma=False)
     # Explicit inverse movement is needed: a generic batch-to-face reshard
     # can rematerialize every parent on every device.
@@ -181,14 +225,15 @@ def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
                         out_specs=P(None, 'x', 'y'), check_vma=False)
 
     @jax.jit
-    def execute(finite, infinity, active):
+    def execute(finite, infinity, active, columns):
         f = (jax.lax.with_sharding_constraint(finite[0], jax.sharding.NamedSharding(mesh_xy, qspec)),
              *(to_batch(a) for a in finite[1:]))
         i = tuple(to_batch(a) for a in infinity)
         active = jax.lax.with_sharding_constraint(active, jax.sharding.NamedSharding(mesh_xy, qspec))
         indices = jax.lax.with_sharding_constraint(jnp.arange(active.shape[0]),
                                                    jax.sharding.NamedSharding(mesh_xy, qspec))
-        model, reduction, zero, retained = mapped(f, i, active, indices)
+        columns = jax.lax.with_sharding_constraint(columns, jax.sharding.NamedSharding(mesh_xy, qspec))
+        model, reduction, zero, retained = mapped(f, i, active, indices, columns)
         b, poles, mask = model
         replicated = jax.sharding.NamedSharding(mesh_xy, P())
         scalars = jax.tree.map(lambda a: jax.lax.with_sharding_constraint(a, replicated),

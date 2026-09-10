@@ -26,16 +26,16 @@ def check_reuse(mesh):
         inf = put(np.broadcast_to(np.arange(4)[None,None,:] < infinity_counts[:,None,None],
                                   (3,8,4)).astype(np.complex128)*scale*2)
         return states, (inf, inf*7, inf*11)
-    kernel = _parent_panel_packer(mesh, 12, 4)
-    assert kernel is _parent_panel_packer(mesh, 12, 4)
+    kernel = _parent_panel_packer(mesh, 12, 4, (0, 1), 12)
+    assert kernel is _parent_panel_packer(mesh, 12, 4, (0, 1), 12)
     states, infinity = panels(1., 2+1j)
     first, extents = pack_parent_panels(states, infinity, counts, infinity_counts,
-                                      mesh_xy=mesh, parent_batch=4)
+                                      mesh_xy=mesh, parent_batch=4, layout="local")
     jax.block_until_ready(first)
     before = kernel._cache_size()
     states2, infinity2 = panels(2., 3+2j)
     second, _ = pack_parent_panels(states2, infinity2, counts, infinity_counts,
-                                 mesh_xy=mesh, parent_batch=4)
+                                 mesh_xy=mesh, parent_batch=4, layout="local")
     jax.block_until_ready(second)
     assert kernel._cache_size() == before
     assert extents == ((12,4), (12,4), (8,4))
@@ -53,10 +53,37 @@ def check_reuse(mesh):
     changed_counts = counts[:, ::-1].copy()
     changed_states, changed_inf = panels(1., 2+1j, changed_counts)
     changed, _ = pack_parent_panels(changed_states, changed_inf, changed_counts, infinity_counts,
-                                   mesh_xy=mesh, parent_batch=4)
+                                   mesh_xy=mesh, parent_batch=4, layout="local")
     jax.block_until_ready(changed)
     assert kernel._cache_size() == before
     assert float(jnp.max(jnp.abs(changed[0][1]-first[0][1]))) > 1
+    # A conjugate port shares Q exactly, but its actions and supports differ.
+    # Compare the original distributed-layout pack with compact local input
+    # expanded after the actual staged movement (including ragged tails).
+    from common.staged_reshard import face_to_batch_reshard
+    from common.shard_map import shard_map
+    paired = [*states, (2-1j, states[0][1], states[0][2]*7, states[0][3]*11)]
+    paired_counts = np.column_stack((counts, counts[:, 0]))
+    compact, _ = pack_parent_panels(paired, infinity, paired_counts, infinity_counts,
+                                    mesh_xy=mesh, parent_batch=4, layout="local")
+    full, _ = pack_parent_panels(paired, infinity, paired_counts, infinity_counts,
+                                 mesh_xy=mesh, parent_batch=4, layout="distributed")
+    assert compact[0][1].shape[-1] == 12 and full[0][1].shape[-1] == 20
+    to_batch = face_to_batch_reshard(mesh)
+    qspec = P(('x', 'y'))
+    def expand(q, columns):
+        return jnp.where(columns[:, None, :] >= 0,
+                         jnp.take_along_axis(q, jnp.maximum(columns, 0)[:, None, :], axis=-1), 0)
+    expand = jax.jit(shard_map(expand, mesh=mesh, in_specs=(qspec, qspec),
+                              out_specs=qspec, check_vma=False))
+    expanded = expand(to_batch(compact[0][1]), jax.device_put(compact[3], NamedSharding(mesh, qspec)))
+    original = to_batch(full[0][1])
+    for left, right in zip(expanded.addressable_shards, original.addressable_shards):
+        assert np.asarray(left.data).tobytes() == np.asarray(right.data).tobytes()
+    for left, right in zip(jax.tree.leaves((compact[0][0], compact[0][2:], compact[1:3])),
+                           jax.tree.leaves((full[0][0], full[0][2:], full[1:3]))):
+        for a, b in zip(left.addressable_shards, right.addressable_shards):
+            assert np.asarray(a.data).tobytes() == np.asarray(b.data).tobytes()
     for factory in (_hermitian_part_kernel,_public_factor_kernel,_stack_model_kernel):
         assert factory(mesh) is factory(mesh)
     # Parent identity and spectral counts must remain live without compiling

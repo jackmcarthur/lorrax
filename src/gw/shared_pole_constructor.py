@@ -828,7 +828,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         with timing.section("spole.panel_pack"):
             packed, extents = pack_parent_panels(
                 states, infinity, counts, [v.shape[-1] for v in infinity_values],
-                mesh_xy=mesh_xy, parent_batch=batch_width)
+                mesh_xy=mesh_xy, parent_batch=batch_width, layout=resolution.layout)
             for i, values in enumerate(infinity_values):
                 ri = column_extent(values.shape[-1])
                 parent_infinity = _parent_panel_slice(mesh_xy, ri)(infinity, np.int32(i))
@@ -858,7 +858,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 # The distributed schedule admits one parent; its packed panels
                 # already have the original finite and infinity extents.
                 iq, _, _, _, directions, row_roles = pending[0]
-                finite, infinity, active = jax.tree.map(lambda a: a[:1], packed)
+                finite, infinity, active, _columns = jax.tree.map(lambda a: a[:1], packed)
                 pending = [(iq, [finite], infinity, active, directions, row_roles)]
                 del packed
         batch_checks = None
