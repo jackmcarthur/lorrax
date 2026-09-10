@@ -315,20 +315,15 @@ def retained_moment_identity(pencil, coefficients, model, infinity_selector, *, 
     y = coefficients * active[:, None, :]
     a = matmul(y, matmul(g, infinity_selector), transa="C")
     projected = matmul(y, a)
-    def moment_defect(third):
-        # The same contraction checks G and H independently. Select the
-        # resident operator rather than stacking two dense pencil matrices.
-        operator = jax.lax.cond(third, lambda: h, lambda: g)
-        weight = jax.lax.cond(third, lambda: poles, lambda: jnp.ones_like(poles))
+    rows = {}
+    for name, operator, weight in (("M1", g, jnp.ones_like(poles)), ("M3", h, poles)):
         exact = matmul(projected, matmul(operator, projected), transa="C") / 2
         reconstructed = matmul(a, a * weight[:, :, None], transa="C") / 2
         norm = jnp.linalg.norm(exact, axis=(-2, -1))
         defect = jnp.linalg.norm(reconstructed - exact, axis=(-2, -1))
-        return jnp.where(norm > 0, defect / jnp.where(norm > 0, norm, 1),
-                         jnp.where(defect == 0, 0, jnp.inf))
-
-    defects = jax.lax.map(moment_defect, jnp.asarray([False, True]))
-    return {"M1": defects[0], "M3": defects[1]}
+        rows[name] = jnp.where(norm > 0, defect / jnp.where(norm > 0, norm, 1),
+                               jnp.where(defect == 0, 0, jnp.inf))
+    return rows
 
 
 def apply_shared_pole_zero_policy(model, *, gates):
