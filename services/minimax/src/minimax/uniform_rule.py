@@ -43,7 +43,9 @@ flips ``Im d`` and leaves the real corners alone.
    the off-ray cap is built into the model.  A candidate is kept while the
    sup error on a FINER check cloud stays below ``eps`` and the
    term-cancellation ratio below ``kappa_cap``.  ``time_budget`` bounds the
-   reduction and returns the best accepted rule at the deadline.
+   reduction in legacy clock mode, returning the best accepted rule at a
+   checkpoint. With fixed ``reduction_steps`` it is instead a refusal watchdog;
+   see ``uniform_rule_budget``.
 
 Why the reduction works on the cloud and not on the SVD moments: the
 truncated SVD model is exact only on the ray, and its dropped tail grows like
