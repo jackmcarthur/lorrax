@@ -1,7 +1,7 @@
 """Tangential Hermite/Ritz construction of physical shared real-pole W.
 
-The physical convention is W(s) = C (s - Lambda)^-1 C.H, s = z_Ry**2;
-S_m = 2 M_(2m+1).  Thus C has units Ry**(3/2), Lambda Ry**2, and
+The physical convention is W(s) = b (s - Lambda)^-1 b.H, s = z_Ry**2;
+S_m = 2 M_(2m+1).  Thus b has units Ry**(3/2), Lambda Ry**2, and
 M1/M3 are physical moments in Ry**3/Ry**5, never bare chi coefficients.
 
 Sample matrices are consumed in bounded batches.  Only narrow direction,
@@ -97,7 +97,7 @@ def finite_pencil_column(left, right, *, matmul):
     -------
     g, h : arrays
         [b,R,r] complex128 face tiles. They are X.H X and X.H T X
-        blocks for X_b = (s_b-T)^-1 C.H Q_b (algorithm guide, section 4).
+        blocks for X_b = (s_b-T)^-1 b.H Q_b (algorithm guide, section 4).
     """
     sa, qa, oa = left
     sb, qb, ob, db = right
@@ -215,7 +215,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     ----------
     pencil : tuple
         G/H [b,R,R] and O [b,n,R], complex128 face tiles. G=X.H X,
-        H=X.H T X, O=C_exact X. R includes inert mesh-padding columns.
+        H=X.H T X, O=b_exact X. R includes inert mesh-padding columns.
     active_columns : array
         [b,R] boolean replicated mask; only declared padding is inactive.
     eigh : callable
@@ -229,14 +229,14 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     Returns
     -------
     model : tuple
-        C [b,n,R], poles2 [b,R], active [b,R]. Inactive poles use 1 Ry**2.
+        b [parent,n,R], poles2 [parent,R], active [parent,R]. Inactive poles use 1 Ry**2.
         Columns have not yet been compacted into the active prefix.
     diagnostics : mapping
         Device-resident predicates and scalars. Caller evaluates all ranks'
         reductions before formatting and refuses failed predicates.
     coefficients : array
         [b,R,R] physical Ritz coefficient map Y, including equilibration and
-        rotation: C=O_original Y and Y.H G_original Y=diag(active).
+        rotation: b=O_original Y and Y.H G_original Y=diag(active).
         Returned for retained-space diagnostics, never a frozen SC basis.
     """
     g, h, output = pencil
@@ -275,7 +275,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     t = t + null_identity * sentinel[:, None, None]
     poles, rotation = eigh(t)
     active = jnp.arange(g.shape[-1])[None, :] >= g.shape[-1] - count[:, None]
-    c = matmul(matmul(output, z), rotation) * active[:, None, :]
+    b = matmul(matmul(output, z), rotation) * active[:, None, :]
     poles = jnp.where(active, poles, 1.0)
     wanted_metric = _diagonal_face(keep, g)
     diagnostics = {
@@ -292,7 +292,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     }
     # Undo equilibration in the coefficient map used by retained-space checks.
     coefficients = matmul(z, rotation) * active[:, None, :]
-    return (c, poles, active), diagnostics, scale[:, :, None] * coefficients
+    return (b, poles, active), diagnostics, scale[:, :, None] * coefficients
 
 
 def retained_moment_identity(pencil, coefficients, model, infinity_selector, *, matmul):
@@ -306,7 +306,7 @@ def retained_moment_identity(pencil, coefficients, model, infinity_selector, *, 
     retained latent states, not the discarded original infinity components.
 
     ``pencil=(G,H,O)`` has face tiles [b,R,R]/[b,n,R]; coefficients is
-    [b,R,Kp], model=(C,Lambda,active), and infinity_selector E [b,R,r_inf].
+    [b,R,Kp], model=(b,Lambda,active), and infinity_selector E [b,R,r_inf].
     All arrays are complex128 face tiles except replicated real Lambda and
     boolean active. Returns relative Frobenius defects, one per q and moment.
     """
@@ -329,22 +329,22 @@ def retained_moment_identity(pencil, coefficients, model, infinity_selector, *, 
 def apply_shared_pole_zero_policy(model, *, gates):
     """Drop low Ritz values only within the resolved factor-weight budget.
 
-    ``model=(C,poles2,active)`` has shapes [b,n,Kp], [b,Kp], [b,Kp].
-    The weight is sum_j ||C_j||**2 (Ry**3), excluding carrier sentinels.
+    ``model=(b,poles2,active)`` has shapes [b,n,Kp], [b,Kp], [b,Kp].
+    The weight is sum_j ||b_j||**2 (Ry**3), excluding carrier sentinels.
     A failed predicate must refuse before export; no pole is clipped.
     """
-    c, poles, active = model
+    b, poles, active = model
     drop = active & (poles <= gates["zero_ritz_policy"]["threshold"]["lambda_cutoff_ry2"])
     keep = active & ~drop
-    weights = jnp.sum(jnp.abs(c) ** 2, axis=-2)
+    weights = jnp.sum(jnp.abs(b) ** 2, axis=-2)
     total = jnp.sum(jnp.where(active, weights, 0), axis=-1)
     lost = jnp.sum(jnp.where(drop, weights, 0), axis=-1)
     fraction = lost / jnp.where(total > 0, total, 1)
     count = jnp.sum(keep, axis=-1, dtype=jnp.int64)
-    finite = jnp.all(jnp.isfinite(c), axis=(-2, -1)) & jnp.all(jnp.isfinite(poles), axis=-1)
+    finite = jnp.all(jnp.isfinite(b), axis=(-2, -1)) & jnp.all(jnp.isfinite(poles), axis=-1)
     admitted = (finite & (total > 0) & (count > 0)
                 & (fraction <= gates["zero_ritz_policy"]["threshold"]["max_dropped_weight_fraction"]))
-    return (jnp.where(keep[:, None, :], c, 0), jnp.where(keep, poles, 1), keep), {
+    return (jnp.where(keep[:, None, :], b, 0), jnp.where(keep, poles, 1), keep), {
         "zero_policy": admitted,
         "dropped_factor_weight_fraction": fraction,
         "dropped_count": jnp.sum(drop, axis=-1, dtype=jnp.int64),
@@ -357,7 +357,7 @@ def apply_shared_pole_zero_policy(model, *, gates):
 def _factor_column_permutation(mesh):
     """Stream a joint pole-column permutation through one y tile at a time.
 
-    A global gather of C replicates the complete K axis on each x row.
+    A global gather of b replicates the complete K axis on each x row.
     Instead, each y shard circulates its input tile and selects only the
     columns belonging to its output tile. The scan carries one input tile
     and one output tile; neither grows with the number of y shards.
@@ -393,29 +393,29 @@ def _factor_column_permutation(mesh):
 
 
 def sort_shared_pole_columns(model, *, mesh_xy):
-    """Sort joint active C/Lambda columns, retaining ties and safe padding.
+    """Sort joint active b/Lambda columns, retaining ties and safe padding.
 
     Returns the same three model arrays and the replicated [b,Kp]
-    permutation. Active entries form a prefix, inactive C is exactly zero,
+    permutation. Active entries form a prefix, inactive b is exactly zero,
     inactive Lambda is 1 Ry**2. Stable sorting preserves equal-pole order.
     """
-    c, poles, active = model
+    b, poles, active = model
     order = jnp.argsort(jnp.where(active, poles, jnp.inf), axis=-1, stable=True)
-    c = _factor_column_permutation(mesh_xy)(c, order)
+    b = _factor_column_permutation(mesh_xy)(b, order)
     poles = jnp.take_along_axis(poles, order, axis=-1)
     active = jnp.take_along_axis(active, order, axis=-1)
-    return (jnp.where(active[:, None, :], c, 0), jnp.where(active, poles, 1), active), order
+    return (jnp.where(active[:, None, :], b, 0), jnp.where(active, poles, 1), active), order
 
 
 def shared_pole_passivity(model, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, gates):
     """Test 0 <= V^-1/2 [-W(i eta)] V^-1/2 <= I on Coulomb support.
 
-    The authenticated inverse square root [b,n,n] and C [b,n,Kp] are
+    The authenticated inverse square root [b,n,n] and b [b,n,Kp] are
     face-tiled complex128. Lambda/active [b,Kp] are replicated. Returns
     device scalars; all ranks must evaluate them before the host refusal.
     """
-    c, poles, active = model
-    whitened = matmul(inverse_coulomb_sqrt, c)
+    b, poles, active = model
+    whitened = matmul(inverse_coulomb_sqrt, b)
     weight = jnp.where(active, 1 / (poles + eta_ry**2), 0)
     response = matmul(whitened * weight[:, None, :], whitened, transb="C")
     herm = _hermitian(response)
@@ -568,21 +568,21 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
 
 
 def _model_diagnostics(model, moments, infinity_directions, *, matmul):
-    """Compare M1=CC.H/2 and M3=C Lambda C.H/2 with physical moments.
+    """Compare M1=bb.H/2 and M3=b Lambda b.H/2 with physical moments.
 
     Factors are [b,n,K], moments [b,n,n], and infinity directions [b,n,r],
     in their existing face layouts. The loop selects from the two resident
     moments without stacking dense matrices; only [2,b] scalar defects are
     stacked. The caller compiles this stage with its accounted service GEMM.
     """
-    c, poles, _ = model
+    b, poles, _ = model
 
     def moment_defect(third):
         target = jax.lax.cond(third, lambda: moments["M3"],
                               lambda: moments["M1"])
-        weighted = jax.lax.cond(third, lambda: c * poles[:, None, :],
-                                lambda: c)
-        value = matmul(weighted, c, transb="C") / 2
+        weighted = jax.lax.cond(third, lambda: b * poles[:, None, :],
+                                lambda: b)
+        value = matmul(weighted, b, transb="C") / 2
         defect = target - value
         projected = matmul(infinity_directions,
                            matmul(defect, infinity_directions), transa="C")
@@ -1001,13 +1001,13 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                             samples = read_shared_pole_bank(bank_io, span, meta=meta, header=header,
                                                            sample_span=(int(sample_id), int(sample_id)+1),
                                                            fields=("Wc", "dWc_ds"))
-                            c, poles, mask = model
+                            b, poles, mask = model
                             s = _sample_point(recipe, int(sample_id)) ** 2
                             weights = jnp.where(mask, 1 / (s-poles), 0)
                             diagnostic = {"sample_id": int(sample_id)}
                             for field, weight in (("Wc", weights), ("dWc_ds", -weights**2)):
                                 sample = samples[field][:, 0]
-                                value = mm(c * weight[:, None, :], c, transb="C")
+                                value = mm(b * weight[:, None, :], b, transb="C")
                                 diagnostic[field] = float(jnp.linalg.norm(value-sample) /
                                                           jnp.maximum(jnp.linalg.norm(sample), jnp.finfo(jnp.float64).tiny))
                             held.append(diagnostic)
@@ -1019,7 +1019,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                             for i, sample_id in enumerate(held_ids)]
             timing.fence("spole.receipts")
             with timing.section("spole.receipts"):
-                c, poles, mask = model
+                b, poles, mask = model
                 counts = jnp.sum(mask, axis=-1, dtype=jnp.int64)
                 # All scalar reductions precede rank-selective store formatting.
                 price = capacity(r)
@@ -1031,7 +1031,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                        "native_workspace_queries": [dict(op=op, shapes=shapes, bytes_per_rank=value)
                                                      for (op, shapes), value in native_queries.items()],
                        "retained_moment_relative": {k: np.asarray(v).tolist() for k, v in retained.items()},
-                       "moment_defects": {k: {a: np.asarray(b).tolist() for a, b in v.items()}
+                       "moment_defects": {k: {a: np.asarray(value).tolist() for a, value in v.items()}
                                           for k, v in moment_defects.items()},
                        "held_W": held, "permutation": np.asarray(permutation).tolist(),
                        "storage_bytes": int(counts[0]) * (16*logical_n + 8)}
@@ -1060,31 +1060,31 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 receipt.update(identity=identity, constructor=row)
             timing.fence("spole.export_prepare")
             with timing.section("spole.export_prepare"):
-                public_c = _public_factor_kernel(mesh_xy)(c)
-                del model, c, mask
-                ready_models.append((public_c, poles, counts))
-                retained_panels = (*retained_panels, public_c, poles, counts)
+                public_b = _public_factor_kernel(mesh_xy)(b)
+                del model, b, mask
+                ready_models.append((public_b, poles, counts))
+                retained_panels = (*retained_panels, public_b, poles, counts)
                 receipts.append(receipt)
-                del public_c, poles, counts
+                del public_b, poles, counts
         timing.fence("spole.reduction_admission")
         with timing.section("spole.reduction_admission"):
             batch_width = len(selected)
             capacity(ready_models[0][0].shape[-1], phase="model")
         timing.fence("spole.writer_stack")
         with timing.section("spole.writer_stack"):
-            public_c, poles, counts = stack_models(tuple(ready_models))
-            expose_live((public_c, poles, counts))
+            public_b, poles, counts = stack_models(tuple(ready_models))
+            expose_live((public_b, poles, counts))
             span = (selected[0][0], selected[-1][0] + 1)
             batch_receipt = {"identity": identity,
                              "q_receipts": receipts[-len(selected):]}
         timing.fence("spole.writer")
         with timing.section("spole.writer"):
             store_header = write_shared_pole_model(
-                output, public_c, poles, counts, q_span=span, meta=meta,
+                output, public_b, poles, counts, q_span=span, meta=meta,
                 tables=bank["tables"], recipe=recipe, receipts=batch_receipt)
         timing.fence("spole.cleanup")
         with timing.section("spole.cleanup"):
-            del public_c, poles, counts, ready_models
+            del public_b, poles, counts, ready_models
             ledger.live_stages = upstream
             del selected, batch_results
             retained_panels = ()

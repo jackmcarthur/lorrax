@@ -72,13 +72,13 @@ def _shared_pole_weights(poles2, intervals, E_ref_B, t_node):
 
 
 def synthesize_shared_pole_parents(
-    C_X, C_Y, poles2, intervals, E_ref_B, t_node, *, mesh_xy,
+    b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, mesh_xy,
 ):
     """Synthesize both raw-parent orientations through the face service.
 
     Parameters
     ----------
-    C_X, C_Y : jax.Array
+    b_X, b_Y : jax.Array
         Complex128 physical factors ``[parent,mu,spin,column]`` with
         ``P(None,'x',None,None)`` / ``P(None,'y',None,None)`` layouts.
         Only spin=1 is currently supported; endpoints merge in the service.
@@ -95,19 +95,19 @@ def synthesize_shared_pole_parents(
     Returns
     -------
     Wplus, Wtranspose : jax.Array
-        Parent ``P(None,'x','y')`` tiles ``(C_X d) C_Y†`` and
-        ``(conj(C_X) d) C_Yᵀ`` at the SAME τ (DESIGN §3.4). Never conjugate
+        Parent ``P(None,'x','y')`` tiles ``(b_X d) b_Y†`` and
+        ``(conj(b_X) d) b_Yᵀ`` at the SAME τ (DESIGN §3.4). Never conjugate
         Wplus to obtain its antiunitary partner: d must retain its phase.
     """
     from distrib_la import contract_faces
 
-    if C_X.ndim != 4 or C_Y.ndim != 4:
+    if b_X.ndim != 4 or b_Y.ndim != 4:
         raise ValueError("shared-pole faces require [parent,mu,spin,column]")
-    if C_X.shape[2] != 1 or C_Y.shape[2] != 1:
+    if b_X.shape[2] != 1 or b_Y.shape[2] != 1:
         raise ValueError("GATE shared_pole_scalar: shared-pole Sigma requires spin=1")
     weights = _shared_pole_weights(poles2, intervals, E_ref_B, t_node)
     return contract_faces(
-        C_X, C_Y, weights, intervals[:, 0], intervals[:, 1],
+        b_X, b_Y, weights, intervals[:, 0], intervals[:, 1],
         mesh=mesh_xy, return_transpose=True)
 
 
@@ -118,7 +118,7 @@ def _shared_pole_fixed_q_policy(header):
     qt = header["qirr"]
     grid = tuple(header["grid"])
     # Canonical store validation admits only scalar-trs-even-s and binds
-    # these rows to the measured reference; do not infer TRS from C itself.
+    # these rows to the measured reference; do not infer TRS from b itself.
     return QgridTrsPolicy(
         trs_measured=header["representation"] == "scalar-trs-even-s",
         kgrid=grid, n_sym_spatial=int(qt["n_sym_spatial"]),
@@ -189,7 +189,7 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
 
 
 def _shared_pole_routed_synthesis(
-    X, Y, poles2, intervals, E_ref_B, t_node, *, meta, header, tables, endpoint_budgets, mesh_xy,
+    b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, meta, header, tables, endpoint_budgets, mesh_xy,
 ):
     """Synthesize W after bounded child-factor routing, DESIGN §3.4 fallback.
 
@@ -209,7 +209,7 @@ def _shared_pole_routed_synthesis(
     fixed = policy.self_negative_q[child_ids]
     children = []
     partners = []
-    for axis, face in (("x", X), ("y", Y)):
+    for axis, face in (("x", b_X), ("y", b_Y)):
         child, _ = unfold_endpoint_panel(
             face, irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
             q_irr_frac=tables["q_frac"], source_perm=tables["packed_perm"],
@@ -282,9 +282,9 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                     meta, header, (lo, hi), mesh_xy=mesh_xy, tables=tables)
                 # One compiled body owns phase, both orientations and local
                 # unfold. Its actual buffer assignment is queried before I/O.
-                def local_body(X,Y,poles2,ranges,e,t,unfold=unfold):
+                def local_body(b_X,b_Y,poles2,ranges,e,t,unfold=unfold):
                     plus,transposed = synthesize_shared_pole_parents(
-                        X,Y,poles2,ranges,e,t,mesh_xy=mesh_xy)
+                        b_X,b_Y,poles2,ranges,e,t,mesh_xy=mesh_xy)
                     return unfold(plus,transposed)
                 kernel = jax.jit(local_body)
                 widths = sorted({min(ccap,kmax-c0) for c0 in range(0,kmax,ccap)})
@@ -362,7 +362,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                         continue
                     faces = resident if resident is not None else read_shared_pole_faces(
                         io, (lo, hi), meta=meta, header=header, column_span=(c0, c1))
-                    X, Y, poles2, _counts = faces
+                    b_X, b_Y, poles2, _counts = faces
                     ranges = device_put_process_local(selected, NamedSharding(mesh_xy, P()))
                     # Slice inside the compiled panel body: no extra resident
                     # factor views, and the GEMMs see only this window's live
@@ -374,15 +374,15 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                     kernel = unfold
                     if (first, last) != (0, c1-c0):
                         if key not in compact_kernels:
-                            def compact_body(X, Y, poles2, ranges, e, t,
+                            def compact_body(b_X, b_Y, poles2, ranges, e, t,
                                              first=first, last=last, unfold=unfold):
                                 return unfold(
-                                    X[..., first:last], Y[..., first:last],
+                                    b_X[..., first:last], b_Y[..., first:last],
                                     poles2[:, first:last], ranges-first, e, t)
                             compact = jax.jit(compact_body)
                             from runtime.aot_memory import aot_kernel_peak_bytes
                             compiled = compact.lower(
-                                X,Y,poles2,ranges,E_ref_B,t_node).compile()
+                                b_X,b_Y,poles2,ranges,E_ref_B,t_node).compile()
                             peak = aot_kernel_peak_bytes(compiled)
                             schedule.setdefault("compiled_compact_panels", []).append(dict(
                                 parent_span=[lo,hi], input_columns=c1-c0,
@@ -398,10 +398,10 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                                     concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
                             compact_kernels[key] = compact
                         kernel = compact_kernels[key]
-                    child = kernel(X,Y,poles2,ranges,E_ref_B,t_node)
+                    child = kernel(b_X,b_Y,poles2,ranges,E_ref_B,t_node)
                     if resident is None:
                         child.block_until_ready()
-                    del faces, X, Y, poles2, _counts, ranges
+                    del faces, b_X, b_Y, poles2, _counts, ranges
                     if total is None and lo == 0 and hi == nq:
                         # All children are in canonical full-q order. Avoid a
                         # redundant zero buffer in the resident all-parent case.

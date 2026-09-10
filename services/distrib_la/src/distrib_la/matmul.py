@@ -48,13 +48,13 @@ _CUBLASMP_CACHE: dict = {}
 _RESHARD_CACHE: dict = {}
 
 
-def contract_faces(C_X, C_Y, weights, start, stop, *, mesh: Mesh,
+def contract_faces(b_X, b_Y, weights, start, stop, *, mesh: Mesh,
                    return_transpose: bool = False):
     """Contract two row faces with replicated column weights, locally.
 
     Parameters
     ----------
-    C_X, C_Y
+    b_X, b_Y
         Matching arrays [b,m,Kcap] at P(None,'x',None) and
         P(None,'y',None), or [b,mu,spin,Kcap] at
         P(None,'x',None,None) and P(None,'y',None,None). The latter merge
@@ -69,30 +69,30 @@ def contract_faces(C_X, C_Y, weights, start, stop, *, mesh: Mesh,
         Supplied mesh with axes ('x','y'). Both global linalg policies use
         this same local operation; no provider is resolved or called.
     return_transpose
-        Also return (conj(C_X)*weights) @ C_Y.T, at the same weights.
+        Also return (conj(b_X)*weights) @ b_Y.T, at the same weights.
 
     Returns
     -------
     W : jax.Array or tuple of jax.Array
-        [b,m,m] at P(None,'x','y'), (C_X*weights) @ C_Y.H, optionally
+        [b,m,m] at P(None,'x','y'), (b_X*weights) @ b_Y.H, optionally
         paired with its endpoint-transpose orientation. Each shard_map
         body contains local GEMMs only, with no collective or provider call.
     """
     _mesh_shape(mesh)
-    if C_X.ndim not in (3, 4) or C_Y.shape != C_X.shape:
+    if b_X.ndim not in (3, 4) or b_Y.shape != b_X.shape:
         raise ValueError("contract_faces requires matching rank-3/4 faces")
-    if C_X.dtype != C_Y.dtype or C_X.dtype != weights.dtype:
+    if b_X.dtype != b_Y.dtype or b_X.dtype != weights.dtype:
         raise TypeError("contract_faces factors and weights must share dtype")
-    b, k = C_X.shape[0], C_X.shape[-1]
+    b, k = b_X.shape[0], b_X.shape[-1]
     if weights.shape != (b, k) or start.shape != (b,) or stop.shape != (b,):
         raise ValueError("contract_faces weights [b,K] and bounds [b] required")
     if start.dtype.kind not in "iu" or stop.dtype.kind not in "iu":
         raise TypeError("contract_faces interval bounds must be integers")
-    explicit_spin = C_X.ndim == 4
+    explicit_spin = b_X.ndim == 4
     xs = P(None, 'x', None, None) if explicit_spin else P(None, 'x', None)
     ys = P(None, 'y', None, None) if explicit_spin else P(None, 'y', None)
     # Concrete wrong layouts must not hide an input reshard in the hot path.
-    for value, spec in ((C_X, xs), (C_Y, ys), (weights, P()),
+    for value, spec in ((b_X, xs), (b_Y, ys), (weights, P()),
                         (start, P()), (stop, P())):
         if not isinstance(value, jax.core.Tracer):
             want = NamedSharding(mesh, spec)
@@ -116,7 +116,7 @@ def contract_faces(C_X, C_Y, weights, start, stop, *, mesh: Mesh,
             return w, wt
         return w
 
-    return _local(C_X, C_Y, weights, start, stop)
+    return _local(b_X, b_Y, weights, start, stop)
 
 
 def _mesh_shape(mesh: Mesh) -> tuple[int, int]:
