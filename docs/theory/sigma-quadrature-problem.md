@@ -151,14 +151,16 @@ plan without gathering a pole field or state-pole product.
 
 The production/default MPA route is the box plan. `LORRAX_SIGMA_PLAN=panes`
 selects the frozen pane implementation only for comparison controls; there is
-no campaign-planner route. Numerical policy is carried by three deck keys:
+no campaign-planner route. The input reference owns the [budget contract](../input_reference.md#sigma):
 
 ```
 sigma_quadrature_eps = 1e-4
+sigma_quadrature_reduction_steps = 10
 sigma_quadrature_reduction_seconds = 120
 sigma_quadrature_cache_dir = auto
 ```
 
-The reduction budget trades planning wall for node count after an accepted
-interpolatory rule exists; it does not weaken `eps`. Retarded broadening is
+The pass budget trades planning work for node count after an accepted
+interpolatory rule exists; the seconds watchdog refuses at operation boundaries
+without accepting a clock-selected partial result. Neither weakens `eps`. Retarded broadening is
 `sigma_regularization_ev`, literal for every ansatz; there is no pair ceiling.

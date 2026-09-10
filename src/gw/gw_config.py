@@ -2124,29 +2124,13 @@ _DEFAULTS = {
     # (relative paths are resolved beside the input deck).
     "sigma_quadrature_eps": 1.0e-4,
     "sigma_quadrature_reduction_seconds": 120.0,
-    # Deterministic alternative to the wall budget: an integer number of
-    # reduction passes per window.  Unset keeps the wall budget; set, the
-    # clock is ignored and the accepted rule (hence the Σ τ-node count) is
-    # a function of the deck alone.  0 = the polished interpolatory start
-    # (seconds of planning, more τ nodes): the fast A/B setting.  On Si
-    # 4x4x4 one pass costs ~33 s of planning per run (30 passes: 985 s,
-    # 378 nodes; the 120 s wall budget reached ~474 nodes).
-    #
-    # DEFAULT 10, owner ruling 2026-09-10.  The wall budget is not
-    # reproducible: at byte-identical source three Na P16 arms produced
-    # crossing-box node counts of 87, 87 and 86 with different weights,
-    # every one certifying, because the greedy reduction stops wherever
-    # the clock lands.  Σ therefore moved by up to 0.067 meV between runs
-    # of the same code, which manufactured a phantom regression during
-    # integration.  A step budget removes that: two arms at steps=0 gave
-    # byte-identical times and weights for all twelve boxes.
-    #
-    # 10 rather than 0 because τ nodes, not planning seconds, are what
-    # scale with system size and processor count: one FFT convolution per
-    # node in the executor.  On the Na P16 reference, steps=10 gives 278
-    # nodes against the wall budget's 258 and steps=0's 513.  Planning
-    # cost is a fixed per-window price this deck can afford and a later
-    # campaign can attack; τ work is not.
+    # Work policy: fixed removal passes, with seconds as a cooperative
+    # refusal watchdog. The minimax uniform_rule_budget owner defines the
+    # exhaustion semantics; docs/input_reference.md owns the deck contract.
+    # Ten is a default work allowance, not a system-independent cost optimum.
+    # Zero still constructs/certifies the start; explicit "none" selects the
+    # legacy clock-selected rule. Reproducibility also needs fixed source,
+    # backend/libraries/threading and cache inventory.
     "sigma_quadrature_reduction_steps": 10,
     "sigma_quadrature_cache_dir": "auto",
     # OCCUPANCY at which a band leaves a metallic Green's-function branch.
@@ -3081,6 +3065,7 @@ def read_lorrax_input(filename: str) -> dict:
                     "writes a one-pole MPA store and uses the shared dynamic "
                     "Sigma route. Remove the key and use "
                     "sigma_quadrature_eps, "
+                    "sigma_quadrature_reduction_steps, "
                     "sigma_quadrature_reduction_seconds, "
                     "sigma_quadrature_cache_dir."
                 )
@@ -3215,7 +3200,10 @@ def read_lorrax_input(filename: str) -> dict:
                 # value parses as bool.
                 params[key] = section.getboolean(key)
             elif key in _NULLABLE_INT:
-                params[key] = section.getint(key)
+                params[key] = (
+                    None if key == "sigma_quadrature_reduction_steps"
+                    and raw.strip().lower() == "none"
+                    else section.getint(key))
             elif key in _NULLABLE_STR:
                 params[key] = str(raw)
             elif isinstance(default, bool):
@@ -4340,11 +4328,11 @@ class DynamicSigmaConfig:
     #: cache spelling is "auto" (run tmp), "off", or a deck-relative path.
     w_model: str = "mpa"
     w_accuracy: str = "production"
-    quadrature_eps: float = 1.0e-4
-    quadrature_reduction_seconds: float = 120.0
+    quadrature_eps: float = _DEFAULTS["sigma_quadrature_eps"]
+    quadrature_reduction_seconds: float = _DEFAULTS["sigma_quadrature_reduction_seconds"]
     #: ``None`` = wall budget; an integer = deterministic pass budget.
-    quadrature_reduction_steps: int | None = None
-    quadrature_cache_dir: str = "auto"
+    quadrature_reduction_steps: int | None = _DEFAULTS["sigma_quadrature_reduction_steps"]
+    quadrature_cache_dir: str = _DEFAULTS["sigma_quadrature_cache_dir"]
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
     #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
     #: patches at ``omega_step_ev``, replacing the contiguous grid.  The

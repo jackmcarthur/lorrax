@@ -826,6 +826,7 @@ mpa_varpi_far_ry = 2.0
 mpa_pole_batch_size = 4
 
 sigma_quadrature_eps = 1e-4
+sigma_quadrature_reduction_steps = 10
 sigma_quadrature_reduction_seconds = 120
 sigma_quadrature_cache_dir = auto
 sigma_regularization_ev = 0.25

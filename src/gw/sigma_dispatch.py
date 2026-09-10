@@ -49,7 +49,7 @@ from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
 from runtime.padding import PaddedAxis
 from .gw_config import (
-    BRACKET_SCHEME_DEFAULT, ComputeMode, SigmaChannel,
+    BRACKET_SCHEME_DEFAULT, ComputeMode, DynamicSigmaConfig, SigmaChannel,
     band_extrapolation_is_consumable,
     mode_builds_channels, refuse_explicit_gij_under_low_mem_bands,
     refuse_unimplemented_compute_mode,
@@ -1511,7 +1511,8 @@ def compute_sigma_xc(
             quadrature_reduction_seconds=float(
                 config.sigma.quadrature_reduction_seconds),
             quadrature_reduction_steps=getattr(
-                config.sigma, "quadrature_reduction_steps", None),
+                config.sigma, "quadrature_reduction_steps",
+                DynamicSigmaConfig.quadrature_reduction_steps),
             quadrature_cache_dir=quadrature_cache_dir,
             omega_grid_step_ry=(
                 float(config.sigma.omega_step_ev) / RYD_TO_EV),
