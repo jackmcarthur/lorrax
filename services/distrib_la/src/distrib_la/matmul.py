@@ -30,7 +30,7 @@ from distrib_la.plan import (BATCHED_ROUTE_CHOICES, BATCHED_ROUTE_DEFAULT,
 from distrib_la.resolve import mesh_key, mesh_platform
 
 __all__ = ["MATMUL_BACKEND_CHOICES", "matmul", "resolve_matmul_backend",
-           "contract_faces", "matmul_adjoint_pair"]
+           "contract_faces"]
 
 MATMUL_BACKEND_CHOICES = (
     "auto", "off", "distributed", "cusolvermp", "cublasmp",
@@ -356,24 +356,7 @@ def _provider_matmul(provider, mesh, A, B, C, *, alpha, beta,
         transa=transa, transb=transb)
 
 
-def _local_product(a, b, c, *, alpha, beta, transa, transb):
-    """Incumbent local GEMM expression, shared by single and paired actions."""
-    if transa != "N":
-        a = jnp.swapaxes(a, -1, -2)
-        if transa == "C":
-            a = jnp.conj(a)
-    if transb != "N":
-        b = jnp.swapaxes(b, -1, -2)
-        if transb == "C":
-            b = jnp.conj(b)
-    d = jnp.asarray(alpha, a.dtype) * jnp.matmul(a, b)
-    if c is not None:
-        d = d + jnp.asarray(beta, a.dtype) * c
-    return d
-
-
-def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb,
-                   adjoint_pair=False):
+def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb):
     from distrib_la._batch_reshard import _batch_to_face, _face_to_batch
 
     px, py = _mesh_shape(mesh)
@@ -385,8 +368,6 @@ def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb,
     key = (mesh_key(mesh), tuple(A.shape), tuple(B.shape),
            None if C is None else tuple(C.shape), str(A.dtype), alpha, beta,
            transa, transb)
-    if adjoint_pair:
-        key += ("adjoint_pair",)
     fn = _RESHARD_CACHE.get(key)
     if fn is None:
         def _body(a, b, c):
@@ -399,14 +380,19 @@ def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb,
             b = _face_to_batch(b, px=px, py=py)
             if c is not None:
                 c = _face_to_batch(c, px=px, py=py)
-            d = _local_product(a, b, c, alpha=alpha, beta=beta,
-                               transa=transa, transb=transb)
-            if adjoint_pair:
-                adjoint = _local_product(a, b, None, alpha=alpha, beta=beta,
-                                         transa="C", transb="N")
-                return (_batch_to_face(d, px=px, py=py)[:nb],
-                        _batch_to_face(adjoint, px=px, py=py)[:nb])
-            return _batch_to_face(d, px=px, py=py)[:nb]
+            if transa != "N":
+                a = jnp.swapaxes(a, -1, -2)
+                if transa == "C":
+                    a = jnp.conj(a)
+            if transb != "N":
+                b = jnp.swapaxes(b, -1, -2)
+                if transb == "C":
+                    b = jnp.conj(b)
+            d = jnp.asarray(alpha, A.dtype) * jnp.matmul(a, b)
+            if c is not None:
+                d = d + jnp.asarray(beta, A.dtype) * c
+            d = _batch_to_face(d, px=px, py=py)
+            return d[:nb]
 
         if has_c:
             @partial(shard_map, mesh=mesh,
@@ -417,8 +403,7 @@ def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb,
         else:
             @partial(shard_map, mesh=mesh,
                      in_specs=(P(None, "x", "y"),) * 2,
-                     out_specs=((P(None, "x", "y"),) * 2 if adjoint_pair
-                                else P(None, "x", "y")), check_vma=False)
+                     out_specs=P(None, "x", "y"), check_vma=False)
             def _local(a, b):
                 return _body(a, b, None)
 
@@ -503,30 +488,6 @@ def matmul(
     A, B, and D matrices (plus C only when ``beta != 0``); C is not allocated
     or exchanged when ``beta=0``.
     """
-    return _matmul(A, B, C, mesh=mesh, alpha=alpha, beta=beta,
-                   transa=transa, transb=transb, backend=backend,
-                   batched_route=batched_route)
-
-
-def matmul_adjoint_pair(A, B, *, mesh: Mesh, backend="auto",
-                        batched_route=BATCHED_ROUTE_DEFAULT):
-    """Return ``(A @ B, A.conj().T @ B)`` with one staged input movement.
-
-    A and B are [batch,n,n] and [batch,n,r] faces at P(None,'x','y'),
-    or their rank-2 counterparts. Each output has B's shape and face layout.
-    Units multiply as in matmul. The staged route shares only ingress;
-    neither operands nor outputs are stacked. Distributed providers retain
-    their existing two calls. All ranks run the same program and shapes.
-    """
-    if A.shape[-2] != A.shape[-1]:
-        raise ValueError("matmul_adjoint_pair requires square A")
-    return _matmul(A, B, None, mesh=mesh, alpha=1.0, beta=0.0,
-                   transa="N", transb="N", backend=backend,
-                   batched_route=batched_route, adjoint_pair=True)
-
-
-def _matmul(A, B, C, *, mesh, alpha, beta, transa, transb, backend,
-            batched_route, adjoint_pair=False):
     transa, transb = str(transa).upper(), str(transb).upper()
     if transa not in _OP_CODE or transb not in _OP_CODE:
         raise ValueError(
@@ -572,17 +533,11 @@ def _matmul(A, B, C, *, mesh, alpha, beta, transa, transb, backend,
         out = _batch_reshard(
             mesh, A, B, C if beta_c != 0 else None,
             alpha=alpha_arg, beta=beta_arg,
-            transa=transa, transb=transb, adjoint_pair=adjoint_pair)
+            transa=transa, transb=transb)
     else:
-        if adjoint_pair:
-            return tuple(matmul(A[0] if single else A, B[0] if single else B,
-                                mesh=mesh, transa=mode, backend=backend,
-                                batched_route=route) for mode in ("N", "C"))
         if C is None:
             C = _zeros(out_shape, A.dtype, sharding)
         out = _provider_matmul(
             provider, mesh, A, B, C, alpha=alpha_arg, beta=beta_arg,
             transa=transa, transb=transb)
-    if adjoint_pair:
-        return tuple(value[0] for value in out) if single else out
     return out[0] if single else out
