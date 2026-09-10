@@ -113,18 +113,9 @@ def synthesize_shared_pole_parents(
 
 def _shared_pole_fixed_q_policy(header):
     """Resolve the policy from the store's authenticated TRS/grid metadata."""
-    from symmetry_maps import QgridTrsPolicy, self_negative_q_mask
+    from gw.qgrid_symmetry import qgrid_trs_policy_from_shared_pole_store
 
-    qt = header["qirr"]
-    grid = tuple(header["grid"])
-    # Canonical store validation admits only scalar-trs-even-s and binds
-    # these rows to the measured reference; do not infer TRS from b itself.
-    return QgridTrsPolicy(
-        trs_measured=header["representation"] == "scalar-trs-even-s",
-        kgrid=grid, n_sym_spatial=int(qt["n_sym_spatial"]),
-        unfold_sym_idx=np.asarray(qt["sym_idx_q"]),
-        self_negative_q=self_negative_q_mask(np.arange(header["n_q_full"]), kgrid=grid),
-        n_pair_rewired=0, context="shared-pole Sigma")
+    return qgrid_trs_policy_from_shared_pole_store(header, announce=False)
 
 
 def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
@@ -142,8 +133,13 @@ def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
     lo, hi = map(int, q_span)
     parent_map = np.asarray(qt["irr_idx_q"], dtype=np.int32)
     rows = np.flatnonzero((parent_map >= lo) & (parent_map < hi)).astype(np.int32)
+    # A finite tangential model need not preserve every spatial little-group
+    # relation exactly. The common TRS policy makes q/-q use one spatial
+    # realization, as for the ordinary W producer. This changes only small
+    # row metadata; the endpoint routing and all-P operator tiles are intact.
+    policy = _shared_pole_fixed_q_policy(header)
     return dict(parent_span=(lo, hi), rows=rows, parent_rows=parent_map[rows] - lo,
-                sym_rows=np.asarray(qt["sym_idx_q"], dtype=np.int32)[rows],
+                sym_rows=policy.unfold_sym_idx[rows],
                 q_frac=np.asarray(qt["q_irr_frac"], dtype=np.float64)[lo:hi],
                 packed_perm=packed, wraps=wraps, certificates=certificates,
                 n_sym_spatial=int(qt["n_sym_spatial"]))

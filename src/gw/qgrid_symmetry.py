@@ -1,7 +1,7 @@
 """The q-grid symmetry decisions, taken once and said out loud.
 
-WHAT THIS MODULE IS.  Two functions, one per decision, and both are
-announcing adapters over ``symmetry_maps``:
+WHAT THIS MODULE IS.  Two decisions, expressed by announcing adapters over
+``symmetry_maps``:
 
 * :func:`resolve_qgrid_symmetry_tables` — does this deck's centroid set
   admit the IBZ q reduction at all?
@@ -9,7 +9,8 @@ announcing adapters over ``symmetry_maps``:
   the q axis of this deck?  The answer comes from the load-time density
   MEASUREMENT (``SymMaps.trs_allowed``), never from an assumption, and it
   arrives as one object the driver consumes rather than a branch the
-  driver takes.
+  driver takes. :func:`qgrid_trs_policy_from_shared_pole_store` adapts the
+  same measured reference after the model store has authenticated it.
 
 Every producer of the q-axis tables in ``gw/`` goes through here; nothing
 else in the monorepo calls ``centroid_source_map_and_wrap``, composes q
@@ -131,6 +132,28 @@ def resolve_qgrid_symmetry_tables(
         # repeat resolves along the run are silent.
         announce_once(res.announce_key, msg, scope="rank0")
     return res
+
+
+def qgrid_trs_policy_from_shared_pole_store(header, *, announce=True):
+    """Recover the measured reference policy from a validated model store.
+
+    The shared-pole store validator binds ``scalar-trs-even-s`` to the
+    measured scalar-TRS reference and authenticates its operation tables.
+    Its consumer has no live SymMaps object; adapt that sealed metadata at
+    the same door as live references, never infer symmetry from fitted b.
+    """
+    from types import SimpleNamespace
+
+    qt = header["qirr"]
+    reference = SimpleNamespace(
+        trs_allowed=header["representation"] == "scalar-trs-even-s",
+        q_irr_full_idx=np.asarray(header["q_irr_full_idx"]),
+        active_symmetry_rows=np.asarray(header["operations"]["authorized_rows"]))
+    return qgrid_trs_policy_for(
+        sym=reference, irr_idx_q=np.asarray(qt["irr_idx_q"]),
+        sym_idx_q=np.asarray(qt["sym_idx_q"]), kgrid=tuple(header["grid"]),
+        n_sym_spatial=int(qt["n_sym_spatial"]), context="shared-pole Sigma",
+        announce=announce)
 
 
 def qgrid_trs_policy_for(

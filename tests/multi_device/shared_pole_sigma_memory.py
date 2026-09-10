@@ -29,6 +29,8 @@ def main(rt):
     meta=NS(nk_tot=Q,nspinor=1,n_rmu=n,mu_basis=NS(n_packed=m,layout=layout,active_mask=layout.axis.active_mask))
     ledger=CapacityLedger(meta,mesh_xy=mesh);meta.shared_pole_capacity=ledger;ledger.live_stages=()
     header=dict(n_q_full=Q,n_q_irr=b,n_mu_logical=n,nspinor=1,Kmax=K,
+        grid=(8,8,8),representation='planted-capacity-only',
+        q_irr_full_idx=list(range(b)),operations=dict(authorized_rows=[0]),
         qirr=dict(irr_idx_q=np.arange(Q,dtype=np.int32)%b,sym_idx_q=np.zeros(Q,np.int32),
                   sym_perm=np.arange(n,dtype=np.int32)[None,:],L_table=np.zeros((1,n,3),np.int32),
                   q_irr_frac=np.zeros((b,3)),n_sym_spatial=1))

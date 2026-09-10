@@ -12,7 +12,7 @@ def main(rt):
     from file_io.slab_io import SlabIO
     from symmetry_maps import QirrTables,centroid_source_map_and_wrap
     from gw.mpa.sigma import (_shared_pole_w_synthesis,_shared_pole_panel_cost,
-                              _shared_pole_panel_tables)
+                              _shared_pole_panel_tables,_shared_pole_fixed_q_policy)
     from gw.mpa.sigma_windows import shared_pole_frequencies
     import pytest
     p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True);a=p.parse_args();a.output.mkdir(exist_ok=True)
@@ -22,42 +22,37 @@ def main(rt):
         'tests/test_grouped_layout.py::test_nonclosed_group_partition_refuses_a_fake_local_gather',
         f'--junitxml={a.output}/metadata_rank{jax.process_index()}.xml'])==0
     h=runpy.run_path('tests/test_shared_pole_store.py')
-    meta,tables,recipe,identity=h['_fixture'](mesh)
-    cents=meta.mu_basis.canonical_indices[[0,2,4,6,1,3,5]]
-    sym=tables['sym']
-    meta.mu_basis=PackedCentroidBasis.build(cents,sym,meta.fft_grid,mesh,identity=True)
-    perm,wraps=centroid_source_map_and_wrap(cents,sym.sym_matrices,sym.translations,np.asarray(meta.fft_grid),extend_trs=True)
-    # Planted lattice wraps make the q-dependent endpoint phase observable.
-    wraps=np.asarray(wraps).copy();wraps[1,:,0]=np.arange(7)%2;wraps[3]=wraps[1]
-    irr=np.arange(meta.nk_tot,dtype=np.int32)%3
-    ops=np.resize(np.array([0,0,0,2,3,1],np.int32),meta.nk_tot)
-    q=np.array([[.125,0,0],[.25,0,0],[.375,0,0]])
-    tables['qirr']=QirrTables(irr_idx_q=irr,sym_idx_q=ops,q_irr_frac=q,
-                              sym_perm=perm,L_table=wraps,n_sym_spatial=2)
+    meta,tables,recipe,identity=h['_sigma_fixture'](mesh,identity_layout=True)
+    qt=tables['qirr'];perm,wraps=qt.sym_perm,qt.L_table
+    irr,q=qt.irr_idx_q,qt.q_irr_frac
+    ops=np.asarray([0,0,6,2,4,0,8,6,10])
     with pytest.raises(ValueError,match='moves canonical row'):
         meta.mu_basis.layout.axis.pack_permutations_host(perm)
     packed_perm=meta.mu_basis.layout.axis.pack_permutations_host(perm,require_local=False)
     C,packed,poles,counts=h['_model'](meta)
+    C=C[...,:4];poles=poles[:,:4];counts=np.minimum(counts,4)
+    packed=meta.mu_basis.pack_host(C,axis=1)
     put=lambda x,spec:h['_device'](np.asarray(x),mesh,spec)
     path=a.output/'model.h5'
     header=store.write_shared_pole_model(path,put(packed,P(None,'x',None,'y')),
         put(poles,P(None,'y')),counts,q_span=(0,3),meta=meta,tables=tables,recipe=recipe,
         receipts={'identity':identity,'scope':'planted nonlocal endpoint algebra'})
     plan=_shared_pole_panel_tables(meta,header,(0,3),mesh_xy=mesh)
+    assert np.array_equal(_shared_pole_fixed_q_policy(header).unfold_sym_idx,ops)
     assert not plan['certificates']['x']['is_local'] and not plan['certificates']['y']['is_local']
     b,c=1,2
     cost=_shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh,local=False)
     forced=dict(status='PASS',parent_capacity=b,column_capacity=c,endpoint_budgets=cost['endpoint_budgets'])
-    omega=np.sqrt(poles);selected=(omega>1)&(omega<=4)&(np.arange(6)[None,:]<counts[:,None])
+    omega=np.sqrt(poles);selected=(omega>1)&(omega<=4)&(np.arange(4)[None,:]<counts[:,None])
     weights=np.where(selected,np.exp(-1j*(omega-.6)*(.7+.2j))/(2*omega),0)
     expected=[]
     for parent,op in zip(irr,ops):
         factor=C[parent,perm[op],0,:]*np.exp(2j*np.pi*(wraps[op]@q[parent]))[:,None]
-        if op>=2:factor=factor.conj()
+        if op>=6:factor=factor.conj()
         value = (factor*weights[parent])@factor.conj().T
         if parent == 0:
             partner = C[parent,perm[op],0,:].conj()*np.exp(2j*np.pi*(wraps[op]@q[parent]))[:,None]
-            if op >= 2: partner = partner.conj()
+            if op >= 6: partner = partner.conj()
             value = 0.5*(value+(partner*weights[parent])@partner.conj().T)
         expected.append(value)
     expected=meta.mu_basis.pack_host(meta.mu_basis.pack_host(np.asarray(expected),axis=1),axis=2)

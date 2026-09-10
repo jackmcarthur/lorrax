@@ -19,6 +19,8 @@ def fixture(caller_fraction=0.0):
     ledger.reserve('sigma.spatial', resident_bytes_per_rank=0, workspace_bytes_per_rank=0)
     ledger.live_stages = ('sigma.inputs', 'sigma.spatial')
     header = dict(n_q_full=64, n_q_irr=4, n_mu_logical=16, nspinor=1, Kmax=50,
+                  grid=(4,4,4),representation='planted-capacity-only',
+                  q_irr_full_idx=[0,16,32,48],operations=dict(authorized_rows=[0]),
                   qirr=dict(irr_idx_q=np.repeat(np.arange(4),16), sym_perm=np.arange(16)[None,:],
                             L_table=np.zeros((1,16,3),np.int32), sym_idx_q=np.zeros(64,np.int32),
                             q_irr_frac=np.zeros((4,3)), n_sym_spatial=1))
