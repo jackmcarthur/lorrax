@@ -318,7 +318,7 @@ def test_incomplete_sigma_coverage_is_an_actionable_final_warning(tmp_path):
     assert "Coverage status : INCOMPLETE" in text
     assert "Grid shortfall  : 0.05000 eV below; 0.15000 eV above" in text
     assert "WARNINGS" in text
-    assert "dynamic Sigma grid is incomplete for protected DFT states" in text
+    assert "dynamic Sigma grid is incomplete for requested DFT output bands" in text
     assert "Sigma(E_DFT) has 4/6 out-of-grid cells" in text
     assert "out-of-range policy=clamp" in text
     assert "sigma_omega_min_ev / sigma_omega_max_ev" in text
