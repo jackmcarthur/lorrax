@@ -147,9 +147,9 @@ def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
                 i = tuple(a[:, :ni] for a in i)
                 mask = jnp.concatenate((mask[:nf], mask[rf:rf+ni]))
                 model, reduction, zero, retained = solve(f, i, mask)
-                c, poles, active = model
+                b, poles, active = model
                 pad = rf + ri - nf - ni
-                model = (jnp.pad(c, ((0, 0), (0, pad))),
+                model = (jnp.pad(b, ((0, 0), (0, pad))),
                          jnp.pad(poles, (0, pad), constant_values=1),
                          jnp.pad(active, (0, pad)))
                 reduction['gram_spectrum_relative'] = jnp.pad(
@@ -171,12 +171,12 @@ def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
     # Explicit inverse movement is needed: a generic batch-to-face reshard
     # can rematerialize every parent on every device.
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
-    def restore(c):
+    def restore(b):
         if py > 1:
-            c = jax.lax.all_to_all(c, 'y', split_axis=2, concat_axis=0, tiled=True)
+            b = jax.lax.all_to_all(b, 'y', split_axis=2, concat_axis=0, tiled=True)
         if px > 1:
-            c = jax.lax.all_to_all(c, 'x', split_axis=1, concat_axis=0, tiled=True)
-        return c
+            b = jax.lax.all_to_all(b, 'x', split_axis=1, concat_axis=0, tiled=True)
+        return b
     restore = shard_map(restore, mesh=mesh_xy, in_specs=qspec,
                         out_specs=P(None, 'x', 'y'), check_vma=False)
 
@@ -189,12 +189,12 @@ def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
         indices = jax.lax.with_sharding_constraint(jnp.arange(active.shape[0]),
                                                    jax.sharding.NamedSharding(mesh_xy, qspec))
         model, reduction, zero, retained = mapped(f, i, active, indices)
-        c, poles, mask = model
+        b, poles, mask = model
         replicated = jax.sharding.NamedSharding(mesh_xy, P())
         scalars = jax.tree.map(lambda a: jax.lax.with_sharding_constraint(a, replicated),
                                (poles, mask, reduction, zero, retained))
         poles, mask, reduction, zero, retained = scalars
-        return (restore(c), poles, mask), reduction, zero, retained
+        return (restore(b), poles, mask), reduction, zero, retained
     return execute
 
 
@@ -221,29 +221,29 @@ def local_model_checks(mesh_xy, native_eigh):
         return a @ (jnp.conj(jnp.swapaxes(b, -1, -2)) if transb == 'C' else b)
 
     def one(args, supports, eta):
-        c, poles, mask, inverse, wc, dw = args
-        model = (c[None], poles[None], mask[None])
+        b, poles, mask, inverse, wc, dw = args
+        model = (b[None], poles[None], mask[None])
         passive = shared_pole_passivity(model, inverse[None], eta_ry=eta,
                                         matmul=mm, eigh=native_eigh, gates=gates)
-        # W(s)=C(s-Lambda)^-1 C.H; dW/ds=-C(s-Lambda)^-2 C.H.
+        # W(s)=b(s-Lambda)^-1 b.H; dW/ds=-b(s-Lambda)^-2 b.H.
         weights = jnp.where(mask[None], 1/(supports[:, None]-poles[None]), 0)
-        factors = c[None] * jnp.stack((weights, -weights**2))[:, :, None, :]
-        values = factors @ jnp.conj(c.T)
+        factors = b[None] * jnp.stack((weights, -weights**2))[:, :, None, :]
+        values = factors @ jnp.conj(b.T)
         exact = jnp.stack((wc, dw))
         errors = jnp.linalg.norm(values-exact, axis=(-2, -1)) / jnp.maximum(
             jnp.linalg.norm(exact, axis=(-2, -1)), jnp.finfo(jnp.float64).tiny)
         return jax.tree.map(lambda a: a[0], passive), errors
 
     mapped = shard_map(
-        lambda c, p, m, inv, w, dw, s, eta: jax.lax.map(
-            lambda row: one(row, s, eta), (c, p, m, inv, w, dw)),
+        lambda b, p, m, inv, w, dw, s, eta: jax.lax.map(
+            lambda row: one(row, s, eta), (b, p, m, inv, w, dw)),
         mesh=mesh_xy, in_specs=(qspec,)*6+(P(), P()),
         out_specs=(qspec, qspec), check_vma=False)
 
     @jax.jit
     def execute(model, inverse, wc, dw, supports, eta):
-        c, poles, mask = model
-        batch = c.shape[0]
+        b, poles, mask = model
+        batch = b.shape[0]
         def pad(a):
             return jnp.concatenate((a, jnp.repeat(a[-1:], batch-a.shape[0], axis=0)), axis=0)
         def sample_move(a):
@@ -255,7 +255,7 @@ def local_model_checks(mesh_xy, native_eigh):
             local = to_batch(face).reshape(b, n, s, n)
             return jnp.transpose(local, (0, 2, 1, 3))
         scalar = NamedSharding(mesh_xy, qspec)
-        out = mapped(to_batch(c), jax.lax.with_sharding_constraint(poles, scalar),
+        out = mapped(to_batch(b), jax.lax.with_sharding_constraint(poles, scalar),
                      jax.lax.with_sharding_constraint(mask, scalar),
                      to_batch(pad(inverse)), sample_move(wc), sample_move(dw), supports, eta)
         return jax.tree.map(lambda a: jax.lax.with_sharding_constraint(
