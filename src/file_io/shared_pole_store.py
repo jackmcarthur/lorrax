@@ -1,7 +1,8 @@
 """Canonical shared real-pole model and construction scratch I/O.
 
-The physical convention is Wc(z) = C (z_Ry**2 - Lambda)**-1 C†.
-C is never divided by sqrt(2 Omega) here. Bulk payloads cross SlabIO only;
+The physical convention is Wc(z) = b (z_Ry**2 - Lambda)**-1 b†.
+The on-disk dataset remains ``factor`` for compatibility; it stores b.
+b is never divided by sqrt(2 Omega) here. Bulk payloads cross SlabIO only;
 centroid packing belongs exclusively to these I/O boundaries. All entry points
 are collective over the supplied mesh, including validation and publication.
 """
@@ -239,6 +240,7 @@ def _metadata(meta, tables, recipe, identity):
     return {
         "schema": SCHEMA, "identity": identity, "recipe": recipe,
         "recipe_hash": hashlib.sha256(_json(recipe).encode()).hexdigest(),
+        # Keep the v1 disk spelling for existing models; its C denotes b.
         "normalization": "Wc=C/(z_Ry^2-Lambda_Ry2)*C_dagger",
         "units": {"factor": "Ry^(3/2)", "poles2_ry2": "Ry^2"},
         "representation": "scalar-trs-even-s", "parent_convention": "raw-parent",
@@ -283,46 +285,46 @@ def _write_metadata(io, header):
 
 
 @jax.jit
-def _factor_valid(C, poles2, K):
+def _factor_valid(b, poles2, K):
     """Reduce the factor contract to one scalar without eager array temporaries.
 
-    C keeps its caller's named row/column sharding; poles2 and K carry
+    b keeps its caller's named row/column sharding; poles2 and K carry
     squared Ry poles and active counts. The result is a replicated boolean.
     """
-    active = jnp.arange(C.shape[3])[None, :] < K[:, None]
-    return (jnp.all(jnp.isfinite(C)) & jnp.all(jnp.isfinite(poles2))
+    active = jnp.arange(b.shape[3])[None, :] < K[:, None]
+    return (jnp.all(jnp.isfinite(b)) & jnp.all(jnp.isfinite(poles2))
           & jnp.all(jnp.where(active, poles2 > 0, poles2 == 1))
-          & jnp.all(jnp.where(active[:, None, None, :], True, C == 0))
+          & jnp.all(jnp.where(active[:, None, None, :], True, b == 0))
           & jnp.all(jnp.where(active[:, 1:], poles2[:, 1:] >= poles2[:, :-1], True)))
 
 
 @timing.timed("factor_validation")
-def _check_factor(C, poles2, K):
+def _check_factor(b, poles2, K):
     """Gate the physical active prefix and exact inactive sentinel."""
-    if C.dtype != np.complex128 or poles2.dtype != np.float64 or K.dtype != np.int64:
-        _refuse(f"dtypes {(C.dtype, poles2.dtype, K.dtype)}")
-    if C.ndim != 4 or poles2.shape != (C.shape[0], C.shape[3]) or K.shape != (C.shape[0],):
+    if b.dtype != np.complex128 or poles2.dtype != np.float64 or K.dtype != np.int64:
+        _refuse(f"dtypes {(b.dtype, poles2.dtype, K.dtype)}")
+    if b.ndim != 4 or poles2.shape != (b.shape[0], b.shape[3]) or K.shape != (b.shape[0],):
         _refuse("factor/poles/count shape mismatch")
-    if np.any(K < 0) or np.any(K > C.shape[3]):
+    if np.any(K < 0) or np.any(K > b.shape[3]):
         _refuse("K outside factor column capacity")
-    ok = _factor_valid(C, poles2, K)
+    ok = _factor_valid(b, poles2, K)
     if not bool(ok):
         _refuse("nonfinite, unsorted/nonpositive active poles or invalid inactive sentinel")
 
 
 @timing.timed("shared_pole_store.write_model")
-def write_shared_pole_model(path, C, poles2, K, *, q_span, meta, tables,
+def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
                             recipe, receipts):
     """Stage a bounded q batch and finalize automatically at complete K census.
 
     Parameters
     ----------
-    C : jax.Array, complex128, (b, mu_p, spin, Kp)
+    b : jax.Array, complex128, (parent, mu_p, spin, Kp)
         Physical Ry^(3/2) factor; NamedSharding(mesh_xy,P(None,'x',None,'y')).
     poles2 : jax.Array, float64, (b, Kp)
-        Sorted squared poles in Ry², same padded column capacity as C.
+        Sorted squared poles in Ry², same padded column capacity as b.
     K : array, int64, (b,)
-        Physical active counts; inactive C=0 and poles2=1 exactly.
+        Physical active counts; inactive b=0 and poles2=1 exactly.
     q_span : slice or pair of int
         Contiguous canonical raw-parent range [start, stop).
     meta, tables, recipe, receipts : bundles / dict
@@ -339,19 +341,19 @@ def write_shared_pole_model(path, C, poles2, K, *, q_span, meta, tables,
         header = _metadata(meta, tables, recipe, receipts["identity"])
         mesh = meta.mu_basis.mesh_xy
         want = NamedSharding(mesh, P(None, "x", None, "y"))
-        if not isinstance(C, jax.Array) or not C.sharding.is_equivalent_to(want, 4):
+        if not isinstance(b, jax.Array) or not b.sharding.is_equivalent_to(want, 4):
             _refuse("constructor factor is not the declared XY handoff")
-        if C.shape[1:3] != (meta.mu_basis.n_packed, 1):
+        if b.shape[1:3] != (meta.mu_basis.n_packed, 1):
             _refuse("factor does not use the current packed centroid basis")
         ledger = _capacity(meta)
-        arg, output, temporary = _conversion_bytes(meta.mu_basis, C.shape, want.spec, unpack=True)
+        arg, output, temporary = _conversion_bytes(meta.mu_basis, b.shape, want.spec, unpack=True)
         # One factor-sized envelope covers eager finite/sentinel check scratch.
         _admit(ledger, "write_model", output, temporary+arg+3*int(poles2.size)*8,
                device_panel=max(arg,output,8*int(poles2.size)), native_host=True)
         K = np.asarray(K)
-        _check_factor(C, poles2, K)
+        _check_factor(b, poles2, K)
         lo, hi = _span(q_span, header["n_q_irr"], "q_span")
-        if hi - lo != C.shape[0]:
+        if hi - lo != b.shape[0]:
             _refuse("q_span does not match factor batch")
         if Path(path).exists():
             previous = _read_header(path)
@@ -369,7 +371,7 @@ def write_shared_pole_model(path, C, poles2, K, *, q_span, meta, tables,
         width = int(K.max(initial=0))
         name = f"staging/q{lo}_{hi}"
     with timing.section("canonical_basis_conversion_and_packing"):
-        canonical = meta.mu_basis.unpack_axis(C, 1)
+        canonical = meta.mu_basis.unpack_axis(b, 1)
         canonical.block_until_ready()
     if not Path(path).exists():
         with SlabIO(path, mode="w", mesh=mesh) as io:
@@ -523,13 +525,13 @@ def _model_digest(path, header, mesh, *, capacity):
             for c0 in range(0, kmax, column_cap):
                 c1 = min(kmax, c0+column_cap)
                 with timing.section('factor_read_and_validation'):
-                    C = io.read_slab("factor", shape=(batch,ncan,1,c1-c0), offset=(q0,0,0,c0),
+                    b = io.read_slab("factor", shape=(batch,ncan,1,c1-c0), offset=(q0,0,0,c0),
                                      partition_spec=P(None,"x",None,None))
                     counts = np.clip(active_counts-c0, 0, c1-c0)
-                    _check_factor(C, poles[:,c0:c1], counts)
+                    _check_factor(b, poles[:,c0:c1], counts)
                 with timing.section('host_digest_hashing'):
                     local = None
-                    for shard in C.addressable_shards:
+                    for shard in b.addressable_shards:
                         if shard.replica_id != 0:
                             continue
                         start = shard.index[1].start or 0
@@ -538,7 +540,7 @@ def _model_digest(path, header, mesh, *, capacity):
                             for i in range(min(local.shape[1], nmu-start)):
                                 hasher = hashers[q].setdefault(start+i, hashlib.sha256())
                                 hasher.update(np.asarray(local[q,i], dtype="<c16").tobytes())
-                    del C, shard, local
+                    del b, shard, local
             row_hash = np.zeros((batch,nmu,32), np.uint32)
             for q in range(batch):
                 for row, hasher in hashers[q].items():
@@ -637,7 +639,7 @@ def read_shared_pole_census(io, *, header, capacity=None):
 def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
     """Read canonical row faces and pack once at the I/O boundary.
 
-    Returns C_X, C_Y, poles2, K with shapes (b,mu_p,spin,Kcap),
+    Returns b_X, b_Y, poles2, K with shapes (b,mu_p,spin,Kcap),
     (b,mu_p,spin,Kcap), (b,Kcap), (b,). Faces use P(None,'x',None,None)
     and P(None,'y',None,None); poles and int64 counts are replicated. K is
     the active count *within the returned column slice*, so every consumer
@@ -675,15 +677,15 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
     faces = []
     for axis in ("x", "y"):
         spec = P(None,axis,None,None)
-        C = io.read_slab("factor", shape=(hi-lo,basis.n_canonical,1,c1-c0),
+        b = io.read_slab("factor", shape=(hi-lo,basis.n_canonical,1,c1-c0),
                          offset=(lo,0,0,c0), partition_spec=spec)
-        C = basis.pack_axis(C, 1, spec=spec)
+        b = basis.pack_axis(b, 1, spec=spec)
         faces.append(jnp.where(active[:,None,None,:] & jnp.asarray(
-            basis.active_mask)[None,:,None,None], C, 0.0))
+            basis.active_mask)[None,:,None,None], b, 0.0))
         # Complete masking before allocating the other face: Python reference
         # release alone does not end an asynchronously dispatched input lifetime.
         faces[-1].block_until_ready()
-        del C
+        del b
     poles = io.read_slab("poles2_ry2", shape=(hi-lo,c1-c0), offset=(lo,c0), partition_spec=P())
     return (*faces, jnp.where(active,poles,1.0), counts)
 
