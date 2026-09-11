@@ -629,7 +629,8 @@ def _cr_varpro_lm(tau, u_grid, g, max_iter=120, tol=1e-14, weights=None,
         tau_s = np.maximum(tau_, 1e-10)
         Phi = np.sin(np.outer(u_grid, tau_s)) * W[:, None]
         U, sig, Vt = np.linalg.svd(Phi, full_matrices=False)
-        sig_inv = np.where(sig > 1e-14 * max(sig[0], 1e-30), 1.0 / sig, 0.0)
+        keep = sig > 1e-14 * max(sig[0], 1e-30)
+        sig_inv = np.divide(1.0, sig, out=np.zeros_like(sig), where=keep)
         w_ = Vt.T @ (sig_inv * (U.T @ g_w))
         r_ = g_w - U @ (U.T @ g_w)
         return w_, r_, np.dot(r_, r_), U
@@ -784,14 +785,16 @@ def solve_crossing(N, A, G_func, tau_max_val, lawson_iter=5):
         tau = np.clip(tau_init.copy(), 1e-10, tau_hi)
         tau, w = _cr_varpro_lm(tau, u_grid, g, tau_hi=tau_hi)
 
+        s_law = np.full(M, 1.0 / M)
         for k in range(lawson_iter):
             Phi = np.sin(np.outer(u_grid, np.maximum(tau, 1e-10)))
-            e = g - Phi @ w
-            ae = np.abs(e)
-            delta = max(1e-2 * np.max(ae), 1e-30)
-            irls_w = 1.0 / np.maximum(ae, delta)
-            irls_w /= np.sum(irls_w)
-            tau, w = _cr_varpro_lm(tau, u_grid, g, weights=irls_w,
+            ae = np.abs(g - Phi @ w)
+            # Lawson's L-infinity update: weights grow where the error is
+            # large.  The former 1/max(|e|, 1e-2 max|e|) is the L1 IRLS weight
+            # and moves the polish away from the sup-norm optimum.
+            s_law = np.maximum(s_law * ae / max(np.sum(s_law * ae), 1e-300),
+                               1e-14)
+            tau, w = _cr_varpro_lm(tau, u_grid, g, weights=s_law,
                                    tau_hi=tau_hi)
 
         tau = np.sort(np.maximum(tau, 1e-10))
@@ -885,7 +888,11 @@ def _cr_delta_from_sines(tau, w, A):
 
 def _cr_a_eff_from_delta(delta, A):
     f = lambda a: a * np.arctan(A / a) - delta
-    lo, hi = 1e-14, 10 * A
+    # a*arctan(A/a) rises monotonically to A: no width solves delta >= A, and
+    # the former upper bracket 10*A misses delta in (0.997 A, A).
+    if not 0.0 < delta < A:
+        return float('nan')
+    lo, hi = 1e-14, 1e8 * A
     try:
         return brentq(f, lo, hi)
     except ValueError:
@@ -896,14 +903,44 @@ def _cr_a_eff_from_delta(delta, A):
         return 0.5 * (lo + hi)
 
 
+def _minimax_weights(Phi, g, w0):
+    """Sup-norm-optimal weights for fixed columns, as an LP correction to w0.
+
+    The residual is scaled to O(1) and the weights are free variables, so the
+    solver's feasibility tolerance is not the rule's error floor.  Returns w0
+    when the LP fails or does not improve the sup."""
+    e0 = g - Phi @ w0
+    s = float(np.max(np.abs(e0)))
+    if not s > 0.0:
+        return w0
+    M, K = Phi.shape
+    ones = np.ones((M, 1))
+    c = np.zeros(K + 1)
+    c[0] = 1.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        res = linprog(c, A_ub=np.block([[-ones, Phi], [-ones, -Phi]]),
+                      b_ub=np.concatenate([e0 / s, -e0 / s]),
+                      bounds=[(0, None)] + [(None, None)] * K, method='highs',
+                      options={'primal_feasibility_tolerance': 1e-10,
+                               'dual_feasibility_tolerance': 1e-10})
+    if not res.success:
+        return w0
+    w = w0 + s * res.x[1:]
+    return w if np.max(np.abs(g - Phi @ w)) < s else w0
+
+
 def _cr_solve_1overx(N, A_dim, u_min=5.0):
+    # 1/u on [u_min, A] is covariant under u -> u/u_min: the frequency cap and
+    # the zeta scan are stated at u_min = 5 and scale with it.
+    tau_cap = _CR_TAU_MAX * 1.5 * 5.0 / u_min
     M = max(250, 8 * N)
     u = np.linspace(u_min, A_dim, M)
     g = 1.0 / u
     fit_len = A_dim - u_min
 
     best_err, best_zeta = np.inf, 1.0
-    for zeta in np.linspace(0.01, 10, 30):
+    for zeta in np.linspace(0.01, 10, 30) * (u_min / 5.0):
         tau = np.arange(1, N + 1) * np.pi / (fit_len + zeta)
         Phi = np.sin(np.outer(u, tau))
         w = np.linalg.lstsq(Phi, g, rcond=None)[0]
@@ -912,12 +949,13 @@ def _cr_solve_1overx(N, A_dim, u_min=5.0):
             best_err, best_zeta = err, zeta
 
     tau = np.arange(1, N + 1) * np.pi / (fit_len + best_zeta)
-    tau = np.clip(tau, 1e-10, _CR_TAU_MAX * 1.5)
+    tau = np.clip(tau, 1e-10, tau_cap)
 
     def _eval(t):
         Phi = np.sin(np.outer(u, np.maximum(t, 1e-10)))
         U, s, Vt = np.linalg.svd(Phi, full_matrices=False)
-        si = np.where(s > 1e-14 * max(s[0], 1e-30), 1 / s, 0)
+        si = np.divide(1.0, s, out=np.zeros_like(s),
+                       where=s > 1e-14 * max(s[0], 1e-30))
         w = Vt.T @ (si * (U.T @ g))
         r = g - U @ (U.T @ g)
         return w, r, r @ r, U
@@ -925,10 +963,10 @@ def _cr_solve_1overx(N, A_dim, u_min=5.0):
     w, r, cost, UU = _eval(tau)
     mu = 1e-6
     for _ in range(100):
-        J = np.empty((M, N))
-        for n in range(N):
-            col = u * np.cos(tau[n] * u) * w[n]
-            J[:, n] = -(col - UU @ (UU.T @ col))
+        # Kaufman Jacobian, every column in one BLAS call (was a per-column
+        # Python loop; 2.2x per iteration at N = 48-240).
+        D = (u[:, None] * np.cos(np.outer(u, tau))) * w[None, :]
+        J = -(D - UU @ (UU.T @ D))
         JtJ = J.T @ J
         dd = np.diag(JtJ).copy()
         dd[dd < 1e-20] = 1e-20
@@ -936,7 +974,7 @@ def _cr_solve_1overx(N, A_dim, u_min=5.0):
             dt = np.linalg.solve(JtJ + mu * np.diag(dd), -J.T @ r)
         except np.linalg.LinAlgError:
             dt = np.linalg.lstsq(JtJ + mu * np.diag(dd), -J.T @ r, rcond=None)[0]
-        tn = np.sort(np.clip(tau + dt, 1e-10, _CR_TAU_MAX * 1.5))
+        tn = np.sort(np.clip(tau + dt, 1e-10, tau_cap))
         wn, rn, cn, Un = _eval(tn)
         if cn < cost:
             tau, w, r, cost, UU = tn, wn, rn, cn, Un
@@ -954,11 +992,18 @@ def _cr_solve_1overx(N, A_dim, u_min=5.0):
     return tau, w_f, err
 
 
-def build_crossing_quadrature(N, xi_eff_target, E_bw, tol=0.05, verbose=True):
+def build_crossing_quadrature(N, xi_eff_target, E_bw, tol=0.05, verbose=True, *,
+                              target_error, u_min=5.0):
     """Build sine quadrature for a GW crossing window.
 
     Fits 1/u on [u_min, A] with N sines, binary-searching A to hit
     the target effective Lorentzian width xi_eff.
+
+    A rule is returned only if the width search converged within ``tol``
+    and the fit error on [u_min, A] is at most ``target_error``; otherwise
+    this raises.  Width alone accepted rules with fit error 0.1-0.2
+    (N = 10-30 at E_bw = 24 eV, xi_eff = 0.25 eV): an effective width is a
+    property of any odd function, not evidence that it approximates 1/u.
 
     Returns
     -------
@@ -967,7 +1012,7 @@ def build_crossing_quadrature(N, xi_eff_target, E_bw, tol=0.05, verbose=True):
     info : dict
         xi_0, xi_eff, a_eff, u_min, A_dim, fit_err, N_over_A
     """
-    u_min = 5.0
+    u_min = float(u_min)
 
     def _try(A_dim):
         if A_dim < u_min + 2 or N > 1.5 * A_dim:
@@ -993,7 +1038,7 @@ def build_crossing_quadrature(N, xi_eff_target, E_bw, tol=0.05, verbose=True):
         A_mid = 0.5 * (A_lo + A_hi)
         tau, w, err, a = _try(A_mid)
 
-        if a is None or a <= 0:
+        if a is None or not a > 0:
             A_hi = A_mid
             continue
 
@@ -1005,8 +1050,23 @@ def build_crossing_quadrature(N, xi_eff_target, E_bw, tol=0.05, verbose=True):
                   f"a_eff={a:.3f}, xi_eff={xi_eff:.4f}, err={err:.2e}")
 
         if abs(xi_eff - xi_eff_target) / xi_eff_target < tol:
-            best_tau, best_w, best_err, best_a, best_A = tau, w, err, a, A_mid
-            break
+            # The rule is judged by its sup error: replace the least-squares
+            # weights by the sup-norm optimum on these nodes.  They move the
+            # effective width a few percent, so the width test is repeated on
+            # them and, if it fails, the search is steered by their width.
+            u_e = np.linspace(u_min, A_mid, 5000)
+            Phi_e = np.sin(np.outer(u_e, tau))
+            w_lp = _minimax_weights(Phi_e, 1.0 / u_e, w)
+            a_lp = _cr_a_eff_from_delta(
+                _cr_delta_from_sines(tau, w_lp, A_mid), A_mid)
+            if not a_lp > 0:
+                best_tau, best_w, best_err, best_a, best_A = tau, w, err, a, A_mid
+                break
+            w, a, xi_eff = w_lp, a_lp, a_lp * xi_0
+            err = float(np.max(np.abs(1.0 / u_e - Phi_e @ w_lp)))
+            if abs(xi_eff - xi_eff_target) / xi_eff_target < tol:
+                best_tau, best_w, best_err, best_a, best_A = tau, w, err, a, A_mid
+                break
 
         if xi_eff > xi_eff_target:
             A_lo = A_mid
@@ -1015,8 +1075,19 @@ def build_crossing_quadrature(N, xi_eff_target, E_bw, tol=0.05, verbose=True):
 
         best_tau, best_w, best_err, best_a, best_A = tau, w, err, a, A_mid
     else:
-        if verbose:
-            print(f"  Warning: did not converge to target within {tol:.0%}")
+        last = ("no A gave a positive width" if best_A is None else
+                f"A={best_A:.4g}, xi_eff={best_a * E_bw / best_A:.4g} eV")
+        raise RuntimeError(
+            f"build_crossing_quadrature: the width search did not reach "
+            f"xi_eff={xi_eff_target:.4g} eV within {tol:.0%} in 30 steps "
+            f"(N={N}, E_bw={E_bw:.4g} eV; last {last})")
+
+    if not best_err <= target_error:
+        raise RuntimeError(
+            f"build_crossing_quadrature: fit error {best_err:.3e} on "
+            f"[{u_min:g}, {best_A:.4g}] exceeds target_error="
+            f"{target_error:.3e} (N={N}, N/A={N / best_A:.3f}); a larger N "
+            f"is needed at this width")
 
     xi_0 = E_bw / best_A
     xi_eff = best_a * xi_0
