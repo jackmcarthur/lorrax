@@ -11,6 +11,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from file_io import restart_bundle as _bundle_reader
 from file_io import mpa_store
+from gw import quadrature_log
 from gw.mpa import evaluator, fit_driver, sample_plan
 
 
@@ -740,6 +741,7 @@ def _evaluate_samples(
                     point["varpi"], omega_m,
                     rel_tol=config.minimax_config.target_error,
                     max_order=config.minimax_config.max_nodes)
+                quadrature_log.record_line(rule, points=1, sweeps=1)
                 chi, chi_reflected = compute_chi0_contour_ordered(
                     wfns, rule["t"], rule["h"],
                     np.asarray([point["z"]], dtype=np.complex128),
@@ -760,6 +762,9 @@ def _evaluate_samples(
                     MinimaxConfig(
                         target_error=config.minimax_config.target_error,
                         max_nodes=config.minimax_config.max_nodes))
+                quadrature_log.record_minimax(
+                    "imag", used, omega_ry=point["varpi"],
+                    target=config.minimax_config.target_error)
                 chi = compute_chi0(
                     wfns, used, meta, mesh_xy,
                     energy_reference=energy_reference)
@@ -778,6 +783,7 @@ def _evaluate_samples(
             # interpolation point at the metal's singular origin; writing a
             # static divided difference into this nonzero slot instead moved
             # the real Na response by up to 0.78% at finite q (claim 0385).
+            quadrature_log.record_direct(z=point["z"])
             chi_w = compute_chi0_direct_fractional(
                 wfns, np.asarray([point["z"]], dtype=np.complex128),
                 meta, mesh_xy, occupation_state=occupation_state,
@@ -797,6 +803,7 @@ def _evaluate_samples(
                 point["varpi"], delta_max + abs(point["omega"]),
                 rel_tol=config.minimax_config.target_error,
                 max_order=config.minimax_config.max_nodes)
+            quadrature_log.record_line(rule, points=1, sweeps=1)
             chi = compute_chi0_contour_fractional(
                 wfns, rule["t"], rule["h"],
                 np.asarray([point["z"]], dtype=np.complex128),
@@ -815,6 +822,8 @@ def _evaluate_samples(
             varpi_i, bandwidth,
             rel_tol=config.minimax_config.target_error,
             max_order=config.minimax_config.max_nodes)
+        quadrature_log.record_line(
+            rule, points=len(points), sweeps=1 if (metal or ordered) else 2)
         t, h = rule["t"], rule["h"]
         if metal:
             # Positive nodes only: the fractional kernel supplies both

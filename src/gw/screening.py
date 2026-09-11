@@ -40,6 +40,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common import collectives, jax_profile
 import common.timing as timing
+from . import quadrature_log
 from .gw_config import (
     ComputeMode, ScreeningDiagrams, coerce_screening_diagrams,
 )
@@ -659,6 +660,10 @@ def compute_screening(
                 f"pass would cost {_n_d}); probe representation err "
                 f"{_err:.1e} vs dedicated {_quad_ded.max_error:.1e} "
                 f"(gate {_gate:.1e}).")
+            quadrature_log.record_minimax(
+                "imag", _quad_ded, omega_ry=_wp, target=_target,
+                nodes=_n_s + _k, error=_err,
+                note=f"fused with the static sweep, {_k} extra nodes")
         elif len(requests) > 1:
             print_fn(
                 "  probe chi0 reuse (ppm_probe_chi_reuse=auto): no single "
@@ -764,6 +769,10 @@ def compute_screening(
                     "z), so this HL probe keeps the incumbent even "
                     "orientation completion; the odd channel of χ₀(Ω) is "
                     "NOT represented here (KNOWN_LORRAX_ISSUES, lane M).")
+        quadrature_log.record_minimax(
+            "imag" if on_imag else "real", quad_used,
+            omega_ry=abs(req.omega_ry.imag if on_imag else req.omega_ry.real),
+            target=config.minimax_config.target_error)
 
         # The probe-ω W runs through the SAME cadence function as the
         # static role (compute_static_w: chi.compile → chi.exec →

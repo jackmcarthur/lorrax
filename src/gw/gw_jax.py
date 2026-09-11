@@ -106,6 +106,7 @@ from .gw_init import (prepare_isdf_and_wavefunctions,
 	                  zeta_fit_band_ranges)
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
+from . import quadrature_log
 from .screening import (
 	compute_screening_model, driver_persists_w0, screening_requests_for)
 from .sigma_dispatch import (
@@ -523,6 +524,8 @@ def _prepare_oneshot_response(
                         if getattr(config, "occ_smearing_family", None)
                         else None),
                     print_fn=print0)
+            quadrature_log.record_minimax(
+                "static", quad, target=config.minimax_config.target_error)
     oneshot_head_response = None
     oneshot_head_requests = None
     oneshot_mpa_plan = None
@@ -1281,6 +1284,7 @@ def _report_final_observables(
             f"polygon_edges={_q0_cert.polygon_edges}; evaluations="
             f"{len(q0_certificates)}; max_final_error_ratio="
             f"{_q0_cert.final_error_ratio:.3e} (<=1 required)")
+    report.quadrature()
     report.sigma_coverage(
         config=config, band_slices=band_slices, enk_dft_ry=enk_dft,
         sigma_result=sigma_result)
@@ -1348,6 +1352,7 @@ def main(argv=None):
 	_t_main = time.perf_counter()
 	_pre_main = timing.process_elapsed_s()
 	timing.reset()
+	quadrature_log.reset()
 	(
 	    config, input_dir, qp_solver, mode, report, production_stdout, print0,
 	    _config_provenance, do_screened) = _open_production_report(

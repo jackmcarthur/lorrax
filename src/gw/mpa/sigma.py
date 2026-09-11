@@ -26,6 +26,7 @@ from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import SigmaOmegaResult, _residue_for_space, sigma_band_axis
 from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
 from gw.ppm_windows import branches_for_omega_grid
+from gw import quadrature_log
 from gw.sigma_box_plan import plan_sigma_windows
 from gw.sigma_plan import resolve_sigma_plan
 from gw.wavefunction_bundle import (
@@ -762,6 +763,7 @@ def compute_sigma_c_mpa_omega_grid(
                     cache_dir=quadrature_cache_dir,
                     print_fn=print_fn, edge_factor=edge_factor,
                     fixed_rule_session=fixed_quadrature_session)
+        quadrature_log.record_sigma_plan(geometry)
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "

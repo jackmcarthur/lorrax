@@ -479,3 +479,58 @@ def test_mpa_trs_route_is_part_of_the_scientific_run_record(tmp_path):
             "no input override") in text
     assert "global time reversal MEASURED BROKEN" in text
     assert "one contour sweep plus the q-negated conjugate partner" in text
+
+
+def test_quadrature_section_reports_chi_and_sigma_rules(tmp_path):
+    from gw import quadrature_log
+
+    def render():
+        output = []
+        report = GWProductionReport(
+            str(tmp_path / "gwjax.out"), runtime=_runtime(), debug=False,
+            stdout=output.append)
+        report.quadrature()
+        report.close()
+        return "\n".join(output)
+
+    quadrature_log.reset()
+    assert render() == ""
+
+    static = SimpleNamespace(
+        x_min=0.0833, x_max=7.03, node_count=13, max_error=1.81e-8,
+        provenance="shipped noncrossing/R256.npz sha256:0b gen abc "
+                   "backend cpu CERTIFIED")
+    imag = SimpleNamespace(
+        x_min=0.0833, x_max=7.03, node_count=8, max_error=1.31e-8,
+        provenance="runtime solve, no artifact sha256:1f gen n/a "
+                   "backend cpu UNCERTIFIED")
+    quadrature_log.record_minimax("static", static, target=5.0e-8)
+    quadrature_log.record_minimax("imag", imag, omega_ry=2.0, target=5.0e-8)
+    quadrature_log.record_line(
+        {"varpi": 0.2, "freq_max": 14.06, "a_dim": 70.3, "n_nodes": 206,
+         "n_panels": 9, "kappa0": 0.999, "rel_tol": 1.0e-6},
+        points=7, sweeps=2)
+    quadrature_log.record_direct(z=2.0e-5j)
+    eta = 0.25 / RYD_TO_EV
+    window = {
+        "name": "cond:resonant", "kind": "crossing",
+        "box_ry": [-50.0 * eta, 24.0 * eta, eta, 1.01 * eta],
+        "node_count": 95, "sup_error": 9.8e-5, "eps": 1.0e-4,
+        "kappa_max": 310.0, "fit_seconds": 42.1, "cache_status": "miss"}
+    quadrature_log.record_sigma_plan({
+        "eta_ry": eta, "eps": 1.0e-4, "n_windows": 1,
+        "window_tau_pairs": 95, "distinct_tau_count": 95,
+        "plan_seconds": 42.5, "branches": [{"windows": [window]}]})
+    text = render()
+    quadrature_log.reset()
+
+    assert "QUADRATURE WINDOWS" in text
+    assert "shipped, certified" in text
+    assert "runtime, UNCERTIFIED" in text
+    assert "omega 2i" in text
+    assert "206x2" in text and "7 points" in text and "<=1e-06" in text
+    assert "ordered-pair scan" in text
+    assert "1 window, 95 (window,tau) pairs" in text
+    row = next(line for line in text.splitlines() if "cond:resonant" in line)
+    assert "crossing" in row and "-50.0..  +24.0" in row
+    assert " 0.980 " in row and "miss" in row

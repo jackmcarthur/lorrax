@@ -26,6 +26,7 @@ from common.scientific_output import (
     symmetry_sampling_lines,
 )
 from common.units import RYD_TO_EV
+from . import quadrature_log
 from .gw_config import qp_solver_semantics
 
 
@@ -90,6 +91,79 @@ def layout_dial_record_lines(
         f"{contraction}; band chunks of {int(config.memory.band_chunk_size)}. "
         "Both layouts contract G and ISDF pair densities on the same parent rows.")
     return tuple(lines)
+
+
+_SIGMA_KIND = {
+    "crossing": "crossing",
+    "sign_definite_positive": "d > 0",
+    "sign_definite_negative": "d < 0",
+}
+
+
+def _chi_rule_line(row: dict) -> str:
+    """One screening rule as a fixed-width report row (energies in Ry)."""
+    kind = row["kind"]
+    if kind == "direct":
+        where = f"z {row['omega_ry']:.4g} + {row['varpi_ry']:.3g}i"
+        return f"{kind:<7} {where:<34} {'-':>7}  {'exact':>9}  ordered-pair scan"
+    if kind == "line":
+        count = row["points"]
+        where = (f"varpi {row['varpi_ry']:.4g}, F {row['freq_max_ry']:.4g}, "
+                 f"{count} point{'' if count == 1 else 's'}")
+        nodes = (f"{row['nodes']}x{row['sweeps']}" if row["sweeps"] > 1
+                 else str(row["nodes"]))
+        return (f"{kind:<7} {where:<34} {nodes:>7}  "
+                f"{'<=' + format(row['target'], '.0e'):>9}  "
+                f"Gauss-Legendre, {row['panels']} panels, "
+                f"A {row['a_dim']:.0f}, kappa0 {row['kappa0']:.2f}")
+    where = (f"x {row['x_min']:.3g}-{row['x_max']:.3g}, "
+             f"R {row['x_max'] / row['x_min']:.3g}")
+    if kind != "static":
+        axis = "i" if kind == "imag" else ""
+        where = f"omega {row['omega_ry']:.4g}{axis}, {where}"
+    source = (f"{row['source']}, "
+              f"{'certified' if row['certified'] else 'UNCERTIFIED'}")
+    if row["note"]:
+        source += f"; {row['note']}"
+    return (f"{kind:<7} {where:<34} {row['nodes']:>7}  "
+            f"{row['error']:>9.2e}  {source}")
+
+
+def _sigma_rule_lines(geometry: dict, plans: int) -> list[str]:
+    """The Sigma plan header and one row per product window (box in eta)."""
+    eta = float(geometry["eta_ry"])
+    count = int(geometry.get("n_windows", 0))
+    head = f"Sigma rules: eta {eta * RYD_TO_EV:.4f} eV"
+    if "eps" in geometry:
+        head += f", eps {float(geometry['eps']):.1e}"
+    head += f"; {count} window{'' if count == 1 else 's'}"
+    if "window_tau_pairs" in geometry:
+        head += f", {geometry['window_tau_pairs']} (window,tau) pairs"
+    if "distinct_tau_count" in geometry:
+        head += f", {geometry['distinct_tau_count']} distinct tau"
+    if "plan_seconds" in geometry:
+        head += f"; plan {float(geometry['plan_seconds']):.1f} s"
+    if plans > 1:
+        head += f" (last of {plans} plans)"
+    lines = [head]
+    windows = [window for branch in geometry.get("branches", ())
+               for window in branch["windows"]]
+    if not windows:
+        return lines
+    width = max(len("window"), *(len(w["name"]) for w in windows))
+    lines.append(
+        f"  {'window':<{width}}  {'kind':<8}  {'Re d / eta':>16}  "
+        f"{'Im d / eta':>12}  {'nodes':>5}  {'sup/eps':>7}  {'kappa':>8}  "
+        f"{'fit s':>6}  cache")
+    for w in windows:
+        lo, hi, gamma_lo, gamma_hi = (float(v) / eta for v in w["box_ry"])
+        lines.append(
+            f"  {w['name']:<{width}}  {_SIGMA_KIND.get(w['kind'], w['kind']):<8}  "
+            f"{lo:+7.1f}..{hi:+7.1f}  {gamma_lo:5.2f}..{gamma_hi:5.2f}  "
+            f"{w['node_count']:>5}  {w['sup_error'] / w['eps']:>7.3f}  "
+            f"{w['kappa_max']:>8.2e}  {w['fit_seconds']:>6.1f}  "
+            f"{w['cache_status']}")
+    return lines
 
 
 class GWProductionReport:
@@ -463,6 +537,23 @@ class GWProductionReport:
             self.emit("Tail calculations: " + " / ".join(
                 f"N{i}={int(value)}" for i, value in enumerate(counts, start=1))
                 + " cumulative bands")
+
+    def quadrature(self) -> None:
+        """Every quadrature rule the run used: screening chi0, then Sigma."""
+        rules = quadrature_log.chi_rules()
+        geometry, plans = quadrature_log.sigma_plan()
+        if not rules and geometry is None:
+            return
+        self.heading("Quadrature windows")
+        if rules:
+            self.emit("Screening chi0 rules (energies in Ry)")
+            self.emit(f"  {'rule':<7} {'where':<34} {'nodes':>7}  "
+                      f"{'max err':>9}  source")
+            for row in rules:
+                self.emit("  " + _chi_rule_line(row))
+        if geometry is not None:
+            for line in _sigma_rule_lines(geometry, plans):
+                self.emit(line)
 
     def files(self, rows: Iterable[tuple[str, str, str]]) -> None:
         self.heading("Output files and inputs")
