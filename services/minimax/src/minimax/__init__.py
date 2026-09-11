@@ -237,6 +237,9 @@ _MEASURE_WINDOW_NAMES = (
 _WINDOWED_FIT_NAMES = (
     "PhaseBoundedReciprocalFit", "fit_phase_bounded_candidates",
 )
+# Levelled (minimax-optimal) noncrossing rules: NumPy only, but lazy like
+# every builder so a catalog-only import pays nothing.
+_LEVELLED_NAMES = ("noncrossing_levelled", "certify_noncrossing")
 _ROQ_FIT_NAMES = (
     "RoqWindow", "RoqGroup", "RoqRule", "RoqBranchEvidence", "RoqPlan",
     "RoqPlanningRefusal",
@@ -273,6 +276,9 @@ def __getattr__(name: str):
     if name in _WINDOWED_FIT_NAMES:
         from minimax import windowed_fit as _windowed_fit  # noqa: PLC0415
         return getattr(_windowed_fit, name)
+    if name in _LEVELLED_NAMES:
+        from minimax import levelled as _levelled  # noqa: PLC0415
+        return getattr(_levelled, name)
     if name in _ROQ_FIT_NAMES:
         from minimax import roq_fit as _roq  # noqa: PLC0415
         return getattr(_roq, name)
@@ -287,7 +293,8 @@ def __dir__():
                   | set(_TIME_NODE_SEARCH_NAMES)
                   | set(_MEASURE_WINDOW_NAMES)
                   | set(_WINDOWED_FIT_NAMES)
-                  | set(_ROQ_FIT_NAMES))
+                  | set(_ROQ_FIT_NAMES)
+                  | set(_LEVELLED_NAMES))
 
 
 __all__ = [
@@ -322,6 +329,8 @@ __all__ = [
     *_WINDOWED_FIT_NAMES,
     # --- measure-weighted ROQ node discovery (lazy; scipy) -----------------
     *_ROQ_FIT_NAMES,
+    # --- levelled noncrossing rules (lazy; numpy) --------------------------
+    *_LEVELLED_NAMES,
     # --- the offline solvers (lazy; scipy) ---------------------------------
     *_SOLVER_NAMES,
 ]

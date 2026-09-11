@@ -490,10 +490,17 @@ def _solve_noncrossing_scaled_cached(logR_key: float, target_key: float,
     cached = _cache.load("noncrossing", payload)
     if cached is not None:
         return cached
-    from minimax import solver as _solver              # noqa: PLC0415
-    tau, w, _n, err = _solver.noncrossing_grids(
-        float(np.exp(logR_key)), float(target_key), N_start=2,
-        N_max=max_nodes)
+    # The levelled Remez rule, not VarPro+Lawson: smallest N whose best
+    # N-term error meets the target, certified by alternation, in
+    # milliseconds.  Measured on the NONCROSS reference (runs/DEV/326):
+    # noncrossing_grids is 2-4x above the best error at its N, uses 1-2
+    # extra nodes at eps >= 1e-8 and up to 24 extra (negative weights,
+    # kappa0 4.8e3) at 1e-10, and takes 0.1-45 s per request.  The cache
+    # payload is unchanged, so a warm cache keeps serving old entries
+    # until it is cleared.
+    from minimax import levelled as _levelled          # noqa: PLC0415
+    tau, w, _n, err = _levelled.noncrossing_levelled(
+        float(np.exp(logR_key)), float(target_key), N_max=max_nodes)
     tau = np.asarray(tau, dtype=np.float64)
     w = np.asarray(w, dtype=np.float64)
     err = float(err)
