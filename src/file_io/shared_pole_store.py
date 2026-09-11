@@ -1120,6 +1120,12 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
     are reused; the source stores are immutable, including on restart.
     The bank export retains its derivative and moment companions so it is
     readable by the existing bank reader. No screening or pole fit is rerun.
+
+    ``write_poles`` is the production export. ``config.debug.write_w`` is a
+    DEBUG dump of the whole frequency sample bank and is not needed for BSE:
+    the exported model evaluates as ``Wc(s) = b (s - Lambda)^-1 b^dagger``
+    with ``s = z^2``, so ``Wc(omega=0) = -b Lambda^-1 b^dagger`` exactly from
+    ``(b, Lambda)``, and the bank itself carries no ``omega = 0`` sample.
     """
     source = Path(handle["path"])
     if source_wfn is None:
@@ -1132,12 +1138,12 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
     basis = meta.mu_basis
     outputs = {}
     targets = {kind: Path(run_dir) / f"{label}_{kind}.h5" for kind, enabled in
-               (("poles", config.write_poles), ("w", config.write_w)) if enabled}
+               (("poles", config.write_poles), ("w", config.debug.write_w)) if enabled}
     for path in targets.values():
         if path.exists():
             _refuse(f"export already exists: {path}; use a fresh output directory")
     bank_source = source.parent / "bank.h5"
-    if config.write_w:
+    if config.debug.write_w:
         if not bank_source.is_file():
             _refuse(f"write_w needs the current-map bank {bank_source}; "
                     "a model-only restart cannot supply frequency samples")
@@ -1173,7 +1179,7 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                     ledger.live_stages = previous
         _export_spatial_header(path, source_wfn, meta, kind="poles", source=source)
         outputs["poles"] = dict(path=str(path), payload_bytes=model["compact_payload_bytes"])
-    if config.write_w:
+    if config.debug.write_w:
         path = targets["w"]
         output_header = initialize_shared_pole_bank(path, meta=meta, tables=tables,
             recipe=bank_header["recipe"], identity=handle["identity"], mesh_xy=mesh_xy)
