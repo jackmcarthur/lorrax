@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import math
 import os
 import sys
 import time
@@ -52,6 +53,24 @@ _PANE_CONTROL_MAX_RANK = 4096
 
 _DEBUG_GN_ODD_RESIDUE_OFF_ENV = "LORRAX_DEBUG_GN_ODD_RESIDUE_OFF"
 _DEBUG_MAX_TAU_DISPATCHES_ENV = "LORRAX_DEBUG_SIGMA_MAX_TAU_DISPATCHES"
+
+
+def _unfenced(name, *, sync_ranks=True):
+    """Do not fence this τ band.
+
+    ``timing.fence`` drains every live array and enters a global barrier so
+    that a host band can be ATTRIBUTED; it is a profiling boundary, never
+    physics (``common/timing.py``).  Production must not pay for it: this
+    executor also serves the incumbent elementwise-MPA route, whose cost is
+    not this campaign's to spend.  A measurement harness rebinds the module
+    attribute ``_band_fence`` to ``timing.fence``, exactly as it already
+    rebinds ``timing.section`` and the store reader, so band-level
+    measurement stays available without a dial, an env var or a fast path.
+    The incumbent route is unfenced whatever a harness installs.
+    """
+
+
+_band_fence = _unfenced
 
 
 @jax.jit
@@ -259,7 +278,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     and summation order, never the number of spatial calls. Factor arrays
     live only in this stage closure, never in a global executable cache.
     """
-    timing.fence('tau.synthesis_plan', sync_ranks=True)
+    _band_fence('tau.synthesis_plan', sync_ranks=True)
     with timing.section('tau.synthesis_plan'):
         from functools import partial
         from file_io.shared_pole_store import read_shared_pole_faces
@@ -360,7 +379,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             schedule["compiled_peak_status"] = "PASS"
             panels.append((lo, hi, device_put_process_local(
                 rows, NamedSharding(mesh_xy, P())), kernels, make_kernel))
-    timing.fence('tau.factor_read', sync_ranks=True)
+    _band_fence('tau.factor_read', sync_ranks=True)
     with timing.section('tau.factor_read'):
         resident = None
         if bcap >= nq and ccap >= kmax:
@@ -379,7 +398,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
 
     def build(_residues, _omega_fields, indices, bounds, _phase_real, E_ref_B, t_node):
         nonlocal cached_indices, cached_bounds, cached_intervals
-        timing.fence("tau.W_synthesis")
+        _band_fence("tau.W_synthesis")
         with timing.section("tau.W_synthesis"):
             # Fixed-q projection remains in the symmetry owner. The extra tau=1
             # diagnostic replay is covered by the fixed-q acceptance tests.
@@ -493,9 +512,13 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
     n, spin, Q = (int(header[key]) for key in
                   ("n_mu_logical", "nspinor", "n_q_full"))
     nq, kmax = int(header["n_q_irr"]), int(header["Kmax"])
-    U = capacity.U_bytes_per_rank
-    if U != 16*Q*(spin*n)**2/(px*py):
+    # Compare the geometry itself, in integers. The derived unit is
+    # 16*Q*(spin*mu)^2 before the mesh divides it; that numerator passes 2**53
+    # at the sizes LORRAX targets, where float equality stops being exact.
+    if tuple(int(capacity.geometry[key]) for key in
+             ("nq", "nspinor", "nmu", "px", "py")) != (Q, spin, n, px, py):
         raise ValueError("GATE shared_pole_capacity: store/current-map geometry mismatch")
+    U = capacity.U_bytes_per_rank
     if kmax == 0:
         receipt = capacity.reserve("sigma.synthesis", resident_bytes_per_rank=0,
                                    workspace_bytes_per_rank=0, concurrent_with=concurrent)
@@ -509,8 +532,8 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
     admission = capacity.reserve(
         "sigma.panel_budget", resident_bytes_per_rank=0,
         workspace_bytes_per_rank=0, concurrent_with=concurrent)
-    budget = (admission["available_device_bytes_per_rank"]
-              - admission["aggregate_bytes_per_rank"])
+    budget = math.floor(admission["available_device_bytes_per_rank"]
+                        - admission["aggregate_bytes_per_rank"])
     best = None
     for b in range(1,nq+1):
         # Byte counts are affine in the column width. Price through the
@@ -520,7 +543,15 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
         two = _shared_pole_panel_cost(meta,header,b,2*multiple,mesh_xy=mesh_xy,local=local)
         keys = ("resident_bytes_per_rank", "workspace_bytes_per_rank")
         p1, p2 = sum(one[k] for k in keys), sum(two[k] for k in keys)
-        c = min(kmax, multiple*int(np.floor((budget-(2*p1-p2))/(p2-p1))))
+        # price(j column multiples) = intercept + j*slope. Both ends are
+        # ceilinged byte counts, so on a small enough panel they can land on
+        # the same integer: a non-positive slope carries no width information
+        # and must not size c (nor divide by zero). Integer floor division
+        # keeps the sizing exact past 2**53.
+        slope, intercept = p2 - p1, 2*p1 - p2
+        if slope <= 0:
+            continue
+        c = min(kmax, multiple*((budget - intercept)//slope))
         if c < 1:
             continue
         cost = ((nq+b-1)//b)*((kmax+c-1)//c)
@@ -783,7 +814,11 @@ def _integrate_sigma_batches(
     print_fn,
 ):
     """One spatial executor for streamed fit slabs."""
-    timing.fence('tau.setup', sync_ranks=True)
+    # Band fences are profiling boundaries (see ``_unfenced``).  This executor
+    # is shared with the incumbent elementwise-MPA route (``w_synthesis is
+    # None``), which is never fenced whatever a harness has installed.
+    fence = _band_fence if w_synthesis is not None else _unfenced
+    fence('tau.setup', sync_ranks=True)
     with timing.section('tau.setup'):
         omega = np.asarray(omega_grid_ry, np.float64)
         if omega.ndim != 1 or not omega.size:
@@ -944,7 +979,7 @@ def _integrate_sigma_batches(
                 if w_synthesis is not None else _batch_rows(row, batch))
             if selected is None:
                 continue
-            timing.fence('tau.window_arguments', sync_ranks=True)
+            fence('tau.window_arguments', sync_ranks=True)
             with timing.section('tau.window_arguments'):
                 pole_indices, bounds, phase_real, _states = selected
                 pole_indices, bounds, phase_real = (
@@ -970,7 +1005,7 @@ def _integrate_sigma_batches(
                     selector = k_unfold_plan.parent_rows(
                         jnp.reshape(selector, np.shape(row.E_A)))
             if not sweep_started:
-                timing.fence('tau.initial_compile_and_probe', sync_ranks=True)
+                fence('tau.initial_compile_and_probe', sync_ranks=True)
                 with timing.section('tau.initial_compile_and_probe'):
                     first_t = np.asarray(
                         jax.device_get(win.nodes.t), np.complex128)[0]
@@ -1004,7 +1039,7 @@ def _integrate_sigma_batches(
                     profile_before = _tau_profile_snapshot()
                     sweep_wall_start = time.perf_counter()
                     sweep_started = True
-            timing.fence('tau.window_setup', sync_ranks=True)
+            fence('tau.window_setup', sync_ranks=True)
             with timing.section('tau.window_setup'):
                 t_nodes = np.asarray(
                     jax.device_get(win.nodes.t), np.complex128)
@@ -1025,7 +1060,7 @@ def _integrate_sigma_batches(
                     omega_indices=row.omega_idx,
                     omega_values=row.omega_abs)
             for t in t_nodes:
-                timing.fence("tau.kernel")
+                fence("tau.kernel")
                 with timing.section("tau.kernel") as sec:
                     sigma_tau = tau_kernel(
                         psi_coh_xn, psi_coh_yr,
@@ -1036,14 +1071,14 @@ def _integrate_sigma_batches(
                         jnp.asarray(win.E_ref_B),
                         jnp.asarray(t, dtype=jnp.complex128))
                     sec.watch(sigma_tau)
-                timing.fence("tau.accumulator")
+                fence("tau.accumulator")
                 with timing.section("tau.accumulator") as sec:
                     sec.watch(accumulator.add_tau(sigma_tau))
-                timing.fence("tau.progress")
+                fence("tau.progress")
                 with timing.section("tau.progress"):
                     progress.step()
                 n_tau += 1
-            timing.fence('tau.window_finish', sync_ranks=True)
+            fence('tau.window_finish', sync_ranks=True)
             with timing.section('tau.window_finish'):
                 accumulator.end_window()
                 n_sweeps += 1
@@ -1074,7 +1109,7 @@ def _integrate_sigma_batches(
             "Sigma/QP output (intentional rc=0).")
         raise SystemExit(0)
 
-    timing.fence('tau.finalize', sync_ranks=True)
+    fence('tau.finalize', sync_ranks=True)
     with timing.section('tau.finalize'):
         sigma = accumulator.finalize()
         if bracketed:
@@ -1462,7 +1497,7 @@ def compute_sigma_c_mpa_omega_grid(
                         f"{window['runtime_noise_budget']:.6g}")
         with timing.section("sigma.tau_sweep"):
             if shared_pole:
-                timing.fence('tau.synthesis_setup', sync_ranks=True)
+                _band_fence('tau.synthesis_setup', sync_ranks=True)
                 with timing.section('tau.synthesis_setup'):
                     synthesis = _shared_pole_w_synthesis(
                         reader, meta, ledger, frequencies, schedule, mesh_xy=mesh_xy)
