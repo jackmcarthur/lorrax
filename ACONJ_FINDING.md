@@ -44,6 +44,16 @@ Former same-Q: applicable true, same reference (6.565503695894222e-17), model
 defect 8.916800421073459e-02, **FAIL**. Complex control: not applicable in
 either policy.
 
+**Na P16 passes every production gate; Si P4 fails two.** Both decks have a
+bit-identical control repeat, so every number is attributable. Na (58209192.20
+candidate, .21 control, .24 control repeat, all EXCLUSIVE): Sigma 0.334 meV,
+QP energies 54.085 ueV at worst over 86 bands with zero rows above 1 meV,
+every one of sixteen rank peaks byte-equal, sum K 38812 -> 38790, Kmax and the
+exported model both smaller. Si: Sigma_c 50.519 meV, QP 5.862 meV at worst over
+34 bands but 0.011 meV over the four frontier bands, 20 of 272 rows over 2 meV
+all at band >= 13, and rank 0's peak +512 B. The two Si failures are left
+FAILING for the owner, not adjusted.
+
 **Si P4 production, against a bit-identical control repeat** (0.000 ueV on all
 272 QP rows, 0.0 meV on every Sigma dataset, byte-equal peaks): every pole
 positive, passivity PASS, all rules certifying, `retained_subspace_moments`
@@ -54,7 +64,7 @@ has that symmetry, and is unchanged to nine significant figures at the other
 five (`reciprocity_probe_si_p4.json`, control 58209192.13 versus candidate
 58209192.6).
 
-**Sigma is not neutral.** Max abs Sigma_c over all (k,m,n,omega) 50.519 meV;
+**Sigma is not neutral on Si.** Max abs Sigma_c over all (k,m,n,omega) 50.519 meV;
 conditioned eqp diagonals 5.037 meV; QP energies max 5.862 meV over 34 bands,
 median 0.487 meV, but **0.011 meV over the four frontier bands** and
 <= 0.058 meV over bands 2-8. Twenty of 272 QP rows exceed 2 meV, all at band
@@ -84,8 +94,11 @@ at the symmetric parents and 1.27 to 1.41 at the rest; the production evidence
 is the post-hoc probe, not the gate. The predicate is a sampled model check,
 not an all-frequency or space-group covariance statement, and it does not
 repair covariance lost to degenerate within-support rotations or
-ill-conditioned Gram truncation. Only the `local` layout is exercised. Na P16
-is still running at the time of writing; see the report. No claim about the Si
+ill-conditioned Gram truncation. It is applicable only at time-reversal-invariant
+momenta — reciprocity gives W(q)^T = W(-q), and the applicable parents are
+exactly the TRIM of each IBZ — so it is a spot check at special momenta, never a
+whole-grid certificate. Only the `local` layout is exercised; both reference
+decks select it. No claim about the Si
 SC failure, about q averaging in Sigma, or that the candidate's Sigma is
 better than the control's — only that it differs by the amounts above. Nothing
 is on `origin/main`.
