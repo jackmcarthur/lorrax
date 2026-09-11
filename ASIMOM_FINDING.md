@@ -98,6 +98,8 @@ peaking at the **frontier** and decaying upward — the opposite band dependence
 
 ## 4. Recommendation
 
+*Written before the experiment; section 5 tested it and every item held.*
+
 1. **Do not raise the Si moment widths on this evidence.** The defect is not in
    the region `M_1`/`M_3` control; the arms already agree to 1e-6 there. The
    guide's "Si prefers ≥ 1.2x" (`algorithm_guide.md` §3, §7) is a sub-0.3 meV
@@ -113,8 +115,65 @@ peaking at the **frontier** and decaying upward — the opposite band dependence
    `src/gw/shared_pole_recipe.py:686` and read nowhere else in `src/`; the Σ
    window planners never see it. Registered in `KNOWN_LORRAX_ISSUES.md`;
    diagnosis only — the owner owns the Σ quadrature.
+4. **Judge a recipe by the model disagreement in the ω window that deck's Σ
+   actually samples.** Added after the experiment, which measured it: that
+   window forecasts the Σ sensitivity for both dials (widths 0.82–0.92 model
+   against 0.814 measured; spacing 0.45–0.75 against 0.494), while the
+   asymptotics — the thing `full_m1/m3_defect` measure, and the thing the
+   widths dial improves 15–25x — forecast nothing. This is item 3's gap seen
+   from the other side: it says what to check in place of what is missing.
 
-## 5. The discriminating run I would like, if a node frees up
+## 5. The discriminating experiment — RUN, and both predictions held
+
+Pool 58209192, four Si P4 legs, one per node, all EXCLUSIVE
+(`placement_audit.py 58209192 36 37 38 39`). Decision rule fixed in advance in
+`PREREGISTERED.md`, pushed to `lane/sp-asimom-prereg-2026-09-11` (`d7b7ad84`)
+before any arm had an `eqp1.dat`. Each rung compares its own control
+(`810c260b`) against its own candidate (`3af53203`) at a different recipe; one
+dial each; the deck is byte-identical across all arms.
+
+| rung | dSigma_c meV | vs stock | full M1 defect | M1 gain | held-W | held-W gain | K cost |
+|---|---|---|---|---|---|---|---|
+| stock | **50.519** | 1.000 | 8.047e-05 | 1.0x | 3.735e-03 | 1.00x | — |
+| widths x1.5 | **41.117** | 0.814 | 2.057e-06 | **39.1x** | 3.643e-03 | 1.03x | +11.8 % |
+| spacing 0.5 | **24.981** | **0.494** | 7.640e-05 | 1.1x | 2.297e-03 | **1.63x** | +10.4 % |
+
+- Widths x1.5: 41.117 meV, above the pre-registered 35 meV line — **prediction
+  holds**, moment width is not the lever.
+- Spacing 0.5: 24.981 meV, at the pre-registered 25.3 meV line — **prediction
+  holds**, but only just: 2.02x, right at the bar.
+
+**The decisive number: raising the moment widths improved the full `M_1` defect
+39.1x and moved Sigma 1.23x.** An intervention, not an observation.
+
+**Why the spacing dial worked.** The model disagreement ratio in the 16-18 eV
+window — the top of Si's Sigma box — predicts the Sigma change for both dials:
+widths 0.82-0.92 model, 0.814 measured; spacing 0.45-0.75 model, 0.494 measured.
+Neither the asymptotics (widths improve them 15x) nor the region above `top_ev`
+predicts it. In Sigma itself at omega = +18 eV: 50519 -> 41118 (widths) ->
+21359 ueV (spacing).
+
+**Noise floor: exactly zero at both new recipes.** Each rung's own control
+repeat is bit-identical to its control -- 0.000 ueV on all 272 QP rows,
+identical K, identical full M1/M3 -- as stock already was. Every rung-to-rung
+difference is attributable to the dial, with nothing to subtract. That is what
+makes the spacing rung's 2.02x safe to read despite sitting on the bar.
+
+**What did not improve:** max |dQP| rose slightly on both rungs (6408, 6468 vs
+5862 ueV). It is dominated by states clamped to the box endpoint, and neither
+dial moves the box. Median fell for widths (312 vs 487 ueV), rows over 2 meV
+fell for spacing (12 vs 20).
+
+**Two corrections to section 3, from the run logs.** (i) Both decks clamp, and
+Na clamps *more*: Si has 1195/2176 (54.9 %) of `Sigma(E_DFT)` cells out of grid,
+Na 42948/44032 (97.5 %). "Na's Sigma grid never samples that region" was too
+strong — what differs is where the endpoint lands relative to each model's
+support (Si +18.0 eV = 0.895 of `top_ev`, in the steep region; Na +5.0 eV =
+0.524, still exact). (ii) A sharper clamp prediction was tested and **failed**:
+clamped states at one k do not share one delta (11-24 distinct among 20-24). The
+clamp fixes the evaluation frequency, not the value.
+
+## 6. The original proposal, for the record
 
 Si P4, one node, 4 GPUs, ~35 min total. Three recipe variants at both sources
 (`810c260b` control and `3af53203` candidate), plus a control repeat:
