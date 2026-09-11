@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from runtime.padding import combined_divisor, round_up
 from common import timing
 from common.collectives import rank0_transaction, psum_replicate
 from file_io.slab_io import SlabIO, mesh_divisible_shape
@@ -640,8 +641,8 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
     """Read canonical row faces and pack once at the I/O boundary.
 
     Returns b_X, b_Y, poles2, K with shapes (b,mu_p,spin,Kcap),
-    (b,mu_p,spin,Kcap), (b,Kcap), (b,). Faces use P(None,'x',None,None)
-    and P(None,'y',None,None); poles and int64 counts are replicated. K is
+    (b,mu_p,spin,Kcap), (b,Kcap), (b,). Faces use P(None,'x',None,'y')
+    and P(None,'y',None,'x'); poles and int64 counts are replicated. K is
     the active count *within the returned column slice*, so every consumer
     can mask with arange(Kcap)<K even when column_span starts above zero.
     """
@@ -659,26 +660,30 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
         _admit(ledger,"empty_faces",8*(hi-lo))
         shape = (hi-lo,basis.n_packed,1,0)
         faces = [jax.jit(lambda: jnp.zeros(shape,jnp.complex128),
-                         out_shardings=NamedSharding(io.mesh,P(None,axis,None,None)))()
+                         out_shardings=NamedSharding(io.mesh,P(None,axis,None,"y" if axis == "x" else "x")))()
                  for axis in ("x","y")]
         return (*faces,jnp.ones((hi-lo,0),jnp.float64),jnp.zeros(hi-lo,jnp.int64))
     c0, c1 = _span(column_span or (0,header["Kmax"]), header["Kmax"], "column_span")
+    # Both orientations share one padded pole extent; counts exclude padding.
+    multiple = combined_divisor(io.mesh.shape["x"], io.mesh.shape["y"])
+    width = round_up(c1-c0, multiple)
     totals = []
     for axis in ("x","y"):
-        shape = (hi-lo,basis.n_canonical,1,c1-c0)
-        totals.append(_conversion_bytes(basis,shape,P(None,axis,None,None),unpack=False))
+        shape = (hi-lo,basis.n_canonical,1,width)
+        totals.append(_conversion_bytes(basis,shape,P(None,axis,None,"y" if axis == "x" else "x"),unpack=False))
     ax,fx,tx = totals[0]; ay,fy,ty = totals[1]
-    metadata = 32*(hi-lo)*(c1-c0)+8*(hi-lo)
+    metadata = 32*(hi-lo)*width+8*(hi-lo)
     peak = max(ax+fx+tx, 2*fx, fx+ay+fy+ty, fx+2*fy)
     _admit(ledger,"read_faces",fx+fy+metadata,max(0,peak-fx-fy),
-           device_panel=max(ax,ay,8*(hi-lo)*(c1-c0)),native_host=True,io=io)
+           device_panel=max(ax,ay,8*(hi-lo)*width),native_host=True,io=io)
     counts = jnp.asarray(np.clip(np.asarray(header["K"][lo:hi])-c0,0,c1-c0), dtype=jnp.int64)
-    active = jnp.arange(c1-c0)[None,:] < counts[:,None]
+    active = jnp.arange(width)[None,:] < counts[:,None]
     faces = []
     for axis in ("x", "y"):
-        spec = P(None,axis,None,None)
-        b = io.read_slab("factor", shape=(hi-lo,basis.n_canonical,1,c1-c0),
-                         offset=(lo,0,0,c0), partition_spec=spec)
+        spec = P(None,axis,None,"y" if axis == "x" else "x")
+        b = io.read_slab("factor", shape=(hi-lo,basis.n_canonical,1,width),
+                         offset=(lo,0,0,c0), valid_shape=(hi-lo,basis.n_logical,1,c1-c0),
+                         partition_spec=spec)
         b = basis.pack_axis(b, 1, spec=spec)
         faces.append(jnp.where(active[:,None,None,:] & jnp.asarray(
             basis.active_mask)[None,:,None,None], b, 0.0))
@@ -686,7 +691,7 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
         # release alone does not end an asynchronously dispatched input lifetime.
         faces[-1].block_until_ready()
         del b
-    poles = io.read_slab("poles2_ry2", shape=(hi-lo,c1-c0), offset=(lo,c0), partition_spec=P())
+    poles = io.read_slab("poles2_ry2", shape=(hi-lo,width), offset=(lo,c0), valid_shape=(hi-lo,c1-c0), partition_spec=P())
     return (*faces, jnp.where(active,poles,1.0), counts)
 
 

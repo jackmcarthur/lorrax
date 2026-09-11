@@ -8,7 +8,7 @@ from symmetry_maps.maps import unfold_endpoint_panel, _endpoint_panel_kernel
 def test_endpoint_tables_are_data_not_cached_constants():
     devices = np.array(jax.devices()[:4])
     mesh = Mesh(devices.reshape(2, 2), ('x', 'y'))
-    tile = NamedSharding(mesh, P(None, 'x', None, None))
+    tile = NamedSharding(mesh, P(None, 'x', None, 'y'))
     x = (np.arange(8).reshape(1, 4, 1, 2) + 1j).astype(complex)
     kw = dict(irr_idx=np.array([0]), sym_idx=np.array([0]),
               q_irr_frac=np.zeros((1, 3)), source_perm=np.arange(4)[None, :],

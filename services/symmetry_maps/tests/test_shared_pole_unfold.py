@@ -90,7 +90,10 @@ def check_shared_pole_unfold(mesh, profile=False):
     for a, b in ((0, 3), (3, 5)):
         faces = []
         for axis in ('x', 'y'):
-            f = put(c[..., a:b], P(None, axis, None, None))
+            width = ((b-a+int(mesh.size)-1)//int(mesh.size))*int(mesh.size)
+            panel = np.pad(c[..., a:b], ((0,0),(0,0),(0,0),(0,width-(b-a))))
+            spec = P(None, axis, None, 'y' if axis == 'x' else 'x')
+            f = put(panel, spec)
             child, cost = S.unfold_endpoint_panel(
                 f, irr_idx=irr, sym_idx=sym, q_irr_frac=q,
                 source_perm=nonlocal_perm, L_table=wraps, spin_action_full=spin,
@@ -108,13 +111,13 @@ def check_shared_pole_unfold(mesh, profile=False):
                     spin_action_full=spin, n_sym_spatial=2,
                     active_mask=active, mesh=mesh, mesh_axis=axis,
                     max_live_bytes=1_000_000)[0]
-            sharding = NamedSharding(mesh, P(None, axis, None, None))
+            sharding = NamedSharding(mesh, spec)
             reused = jax.jit(repeated_route, in_shardings=sharding,
                              out_shardings=sharding)
             reuse_errors = []
             with jax.log_compiles(True):
                 for scale in (1., 2., -1., 3., .5):
-                    changed = put(c[..., a:b]*scale, P(None, axis, None, None))
+                    changed = put(panel*scale, spec)
                     repeated = reused(changed)
                     jax.block_until_ready(repeated)
                     reuse_errors.append(float(jnp.max(jnp.abs(repeated-scale*child))))
@@ -123,13 +126,16 @@ def check_shared_pole_unfold(mesh, profile=False):
             route_reuse.append(dict(axis=axis, k_panel=b-a, calls=5,
                                     traces=len(traces), errors=reuse_errors))
             faces.append(child); costs.append(cost)
-        fallback += D.contract_faces(*faces, put(d[irr, a:b], P()),
-                                     put(np.zeros(4, dtype=int), P()),
-                                     put(np.full(4, b-a), P()), mesh=mesh)
+        # The service test contracts the tiny result with an independent
+        # dense oracle; production uses the planned G face GEMM.
+        dm = put(np.pad(d[irr, a:b], ((0,0),(0,width-(b-a)))), P())
+        fallback += jax.jit(lambda x,y,w: (x[:,:,0,:]*w[:,None,:]) @
+                            y[:,:,0,:].conj().swapaxes(-1,-2),
+                            out_shardings=NamedSharding(mesh,P(None,'x','y')))(*faces,dm)
     fallback_error = err(fallback, oracle(nonlocal_perm))
     assert fallback_error < 3e-12, fallback_error
     try:
-        S.unfold_endpoint_panel(cx, irr_idx=irr, sym_idx=sym, q_irr_frac=q,
+        S.unfold_endpoint_panel(put(panel, P(None,'x',None,'y')), irr_idx=irr, sym_idx=sym, q_irr_frac=q,
             source_perm=nonlocal_perm, L_table=wraps, spin_action_full=spin,
             n_sym_spatial=2, active_mask=active, mesh=mesh, mesh_axis='x', max_live_bytes=1)
     except ValueError as ex:
