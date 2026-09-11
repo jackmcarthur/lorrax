@@ -12,14 +12,32 @@ from minimax.uniform_rule import (
 ETA = 0.02
 
 
+def _dense_boundary(box, times):
+    """An independent cloud: the four edges, uniform at 12 points per half wave
+    of the largest |t| (and of 1/d at the peak), plus geometric points toward
+    small |Re d|.  No code shared with the builder's clouds."""
+    re_lo, re_hi, im_lo, im_hi = box
+    h = min(np.pi / (12.0 * np.max(np.abs(times))), im_lo / 12.0)
+    x = np.linspace(re_lo, re_hi, int((re_hi - re_lo) / h) + 2)
+    if re_lo > 0.0:
+        x = np.union1d(x, np.geomspace(re_lo, re_hi, 20000))
+    if re_hi < 0.0:
+        x = np.union1d(x, -np.geomspace(-re_hi, -re_lo, 20000))
+    y = np.union1d(np.linspace(im_lo, im_hi, int((im_hi - im_lo) / h) + 2),
+                   np.geomspace(im_lo, max(im_hi, im_lo * 1.0001), 2000))
+    return np.concatenate([x + 1j * im_lo, x + 1j * im_hi, re_lo + 1j * y, re_hi + 1j * y])
+
+
 def _check(rule, box, eps):
-    d = box_samples(*box, per_unit=7.0, n_im=8)          # finer than the fit cloud
-    sup, kappa = rule_sup_error(rule.times, rule.weights, d)
-    assert sup <= 3.0 * eps, (sup, eps)                  # fit cloud vs check cloud
+    """The certificate is honest in both directions on an independent dense
+    boundary: the sampled sup (a lower bound of the true sup) meets eps, and
+    the rule's refined sup_error is not below it."""
+    d = _dense_boundary(box, rule.times)
+    rho = np.abs(d) if rule.relative else None
+    sup, kappa = rule_sup_error(rule.times, rule.weights, d, rho)
+    assert sup <= eps, (sup, eps)
+    assert rule.sup_error >= sup * (1.0 - 1.0e-3), (rule.sup_error, sup)
     assert kappa <= 1.0e4
-    if rule.relative:                                    # sign-definite: relative error too
-        sup_rel, _ = rule_sup_error(rule.times, rule.weights, d, np.abs(d))
-        assert sup_rel <= 3.0 * eps, (sup_rel, eps)
     assert np.all(np.isfinite(rule.times)) and np.all(rule.times != 0.0)
     return sup
 
@@ -97,12 +115,27 @@ def test_random_boxes_never_refuse_and_hold_on_a_finer_cloud():
         eps = float(rng.choice([1e-3, 1e-4]))
         box = (lo, hi, ETA, im_hi)
         rule = build_uniform_rule(box, eps, time_budget=5.0)
-        d = box_samples(*box, per_unit=10.0, n_im=48)
-        sup, kappa = rule_sup_error(rule.times, rule.weights, d,
-                                    np.abs(d) if rule.relative else None)
         assert rule.relative == kind.startswith("sd")
-        assert sup <= 1.5 * eps, (kind, box, sup, eps)
-        assert kappa <= 1.0e4 and np.all(rule.times != 0.0)
+        _check(rule, box, eps)
+
+
+def test_thin_boxes_certify_on_the_dense_boundary():
+    """Real-pole windows have Im d in [eta, 1.01 eta].  On real time the rule's
+    error oscillates at its node horizon at every Re d, so a crossing rule must
+    hold far from Re d = 0 too (a geometric far field certified 247x-eps rules);
+    a thin tail must hold at its near corner (1.8x eps on main, 2026-09-11)."""
+    for box in ((-24.0 * ETA, 38.0 * ETA, ETA, 1.01 * ETA),     # Na B06-like crossing
+                (1.05 * ETA, 960.0 * ETA, ETA, 1.01 * ETA)):    # Na tail-like
+        _check(build_uniform_rule(box, 1.0e-4, time_budget=20.0), box, 1.0e-4)
+
+
+def test_far_sign_definite_box_samples_stay_inside_the_box():
+    """The geometric far field used to start at 30 im_lo even when the box
+    starts beyond it, so the angle scan (and, before the boundary cloud, the
+    fit and the certificate) saw points outside the box."""
+    lo, hi = 77.0 * ETA, 243.0 * ETA
+    d = box_samples(lo, hi, ETA, 1.01 * ETA)
+    assert d.real.min() >= lo and d.real.max() <= hi
 
 
 def test_jax_backend_on_cpu_matches_numpy_on_a_small_crossing_box(monkeypatch):
@@ -115,9 +148,6 @@ def test_jax_backend_on_cpu_matches_numpy_on_a_small_crossing_box(monkeypatch):
     ref = build_uniform_rule(box, 1.0e-4, time_budget=30.0, backend="numpy")
     rule = build_uniform_rule(box, 1.0e-4, time_budget=30.0, backend="jax")
     _check(rule, box, 1.0e-4)
-    d = box_samples(*box, per_unit=10.0, n_im=48)
-    sup, kappa = rule_sup_error(rule.times, rule.weights, d)
-    assert sup <= 1.5e-4 and kappa <= 1.0e4
     assert abs(rule.node_count - ref.node_count) <= 3, (rule.node_count, ref.node_count)
 
 

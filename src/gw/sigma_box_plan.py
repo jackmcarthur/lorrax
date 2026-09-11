@@ -37,7 +37,7 @@ from gw.ppm_windows import _SigmaWindow
 from gw.scissor import sc_state_pad_ev
 from minimax import (
     UniformRule,
-    box_samples,
+    boundary_samples,
     build_uniform_rule,
     rule_roundoff_amplification,
 )
@@ -497,8 +497,10 @@ def _fit_rule(
     # approximation.  ``kappa = sum|term|/|Q|`` is already relative for a
     # sign-definite box, but it overstates a crossing box's peak-relative
     # error by ~|d|/eta at its far edge.  Measure rho*sum|term| directly.
-    noise_cloud = box_samples(
-        *rule.box, per_unit=8.0, n_im=48)
+    # the noise mass has a subharmonic logarithm, so its box maximum lies on
+    # the boundary: sample the edges at the rule's own horizon
+    noise_cloud = boundary_samples(
+        rule.box, rule.theta_deg, float(np.max(np.abs(rule.times))), eps)
     noise_rho = (np.abs(noise_cloud) if rule.relative
                  else float(np.min(noise_cloud.imag)))
     noise_amplification = rule_roundoff_amplification(

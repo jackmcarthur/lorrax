@@ -90,26 +90,17 @@ def _re_line(lo, hi, h, near):
     a, b = max(lo, -near), min(hi, near)
     if a < b:
         parts.append(np.arange(a, b + 0.5 * h, h))
-    for sign, edge in ((1.0, hi), (-1.0, lo)):
-        if sign * edge > near:
-            n = int(1.5 * np.log(sign * edge / near) * near / h) + 8
-            parts.append(sign * np.geomspace(near, sign * edge, n))
+    for sign, edge, inner in ((1.0, hi, lo), (-1.0, lo, hi)):
+        # the geometric part starts at the box's own near edge when that lies
+        # beyond `near`: starting at `near` sampled (and certified) points
+        # outside a far sign-definite box, e.g. Na [77, 243] eta at 5 nodes
+        # where the box itself needs 3 (runs/DEV/326, 2026-09-11)
+        start = max(near, sign * inner)
+        if sign * edge > start:
+            n = int(1.5 * np.log(sign * edge / start) * near / h) + 8
+            parts.append(sign * np.geomspace(start, sign * edge, n))
     re = np.concatenate(parts) if parts else np.array([lo, hi])
     return np.sort(np.unique(np.concatenate([re, [lo, hi]])))
-
-
-def _im_levels(theta):
-    """Log-spaced ``Im d`` levels needed on a ray.  On real time the family
-    only decays in ``Im d`` and six levels resolve it.  On a rotated ray it
-    also oscillates in ``Im d`` (phase ``sin(theta) s Im d``), and the members
-    alive longest sit at the small-``|Re d|`` edge with up to ~20 rad of phase
-    across the box, so about four times as many levels are needed.
-
-    Tempting, and why not: six levels everywhere (it is four times cheaper).
-    With six levels on rotated rays, 17 of 80 random boxes in the property
-    test held ``eps`` on the fit cloud and failed it on a finer one -- the
-    rule was exact between the sampled Im levels only."""
-    return 6 if abs(np.sin(theta)) < 0.15 else 24
 
 
 def box_samples(re_lo, re_hi, im_lo, im_hi, per_unit=5.0, n_im=6, near=30.0):
@@ -120,8 +111,9 @@ def box_samples(re_lo, re_hi, im_lo, im_hi, per_unit=5.0, n_im=6, near=30.0):
     ``near * im_lo`` of zero and geometric beyond (``_re_line``).  Higher Im
     levels are smoother and get coarser lines, but never coarser than
     ``4 im_lo / per_unit``: on a rotated ray the fast oscillation is set by
-    the ray's own frequency, not by the level's ``Im d``.  The fit cloud uses
-    the defaults; acceptance uses ``per_unit = 8`` and twice the levels."""
+    the ray's own frequency, not by the level's ``Im d``.  Only the ray-angle
+    scan uses it now (thinned to ~500 points); the fit, the acceptance and
+    the executor noise gate sample the boundary (``_BoundaryCloud``)."""
     im = np.geomspace(im_lo, max(im_hi, im_lo * 1.0001), n_im)
     out = []
     for v in im:
@@ -148,6 +140,158 @@ def _log_density_weights(d):
         q[idx[order]] = np.abs(g)
     q /= max(q.mean(), 1e-300)
     return np.sqrt(q)
+
+
+# ----------------------------------------------------------------- boundary cloud
+#: Fit-cloud density in points per half wave of the live horizon; the
+#: acceptance cloud uses 6.  On 41 production boxes 1.5, 2 and 3 gave node
+#: counts within path noise of one another and none exceeded eps on an
+#: independent audit; 3 cost ~1.5x the reduction wall of 1.5-2
+#: (runs/DEV/326_minimax_fit_review_2026-09-11, A/B rounds 1-2).
+_FIT_POINTS_PER_HALF_WAVE = 2.0
+
+
+def _live_spacing(d, theta, S, eps, p, p_target):
+    """Spacing that resolves every live family member at ``d``.
+
+    ``exp(i t d)`` with ``t = s exp(-i theta)``, ``s <= S``, has modulus
+    ``exp(-s lam(d))``, ``lam = cos(theta) Im d - sin(theta) Re d``, and is
+    alive (above ``eps/10``) for ``s <= min(S, ln(10/eps)/lam)``.  Its local
+    frequency along any direction is at most that horizon, so ``p`` points per
+    half wave need ``pi / (p horizon)``; ``1/d`` varies on ``|d|``, hence the
+    cap ``|d| / p_target``.  On real time the horizon is ``S`` along the whole
+    bottom edge, so the spacing is uniform in ``Re d``; on a rotated ray it
+    grows with ``|Re d|`` and the edge is sampled geometrically."""
+    lam = np.cos(theta) * d.imag - np.sin(theta) * d.real
+    horizon = np.minimum(S, np.log(10.0 / eps) / np.maximum(lam, 1e-300))
+    return np.minimum(np.pi / (p * horizon), np.abs(d) / p_target)
+
+
+def _edge_points(lo, hi, point, theta, S, eps, p, p_target):
+    """Edge parameters in ``[lo, hi]``, ends included, spaced by
+    ``_live_spacing``: the cumulative sample density is integrated on an
+    auxiliary grid refined toward both ends and ``Re d = 0`` and inverted."""
+    if not hi > lo:
+        return np.array([lo])
+    offs = np.geomspace(1e-7 * (hi - lo), hi - lo, 1200)
+    aux = [np.linspace(lo, hi, 4001), lo + offs, hi - offs]
+    if lo > 0.0:
+        aux.append(np.geomspace(lo, hi, 4001))
+    if lo < 0.0 < hi:
+        aux += [offs[offs < hi], -offs[offs < -lo]]
+    u = np.unique(np.clip(np.concatenate(aux), lo, hi))
+    density = 1.0 / _live_spacing(point(u), theta, S, eps, p, p_target)
+    cum = np.concatenate([[0.0], np.cumsum(0.5 * (density[1:] + density[:-1]) * np.diff(u))])
+    pts = np.interp(np.linspace(0.0, cum[-1], max(int(np.ceil(cum[-1])), 2) + 1), cum, u)
+    pts[0], pts[-1] = lo, hi
+    return pts
+
+
+class _BoundaryCloud:
+    """Samples on the four edges of a box, kept in order per edge.
+
+    Why the boundary is enough: the accepted quantity is
+    ``sup rho |Q(d) - 1/d|`` with ``rho = im_lo`` or ``rho = |d|``; both
+    ``im_lo (Q - 1/d)`` and ``d Q(d) - 1`` are analytic on the closed box
+    (``d = 0`` lies below it), so by the maximum modulus principle the sup is
+    attained on the boundary.  The executor-noise mass
+    ``rho sum_k |w_k exp(i t_k d)|`` has a subharmonic logarithm and peaks
+    there too (checked on 300 cached rules).  ``sup`` refines the sampled
+    local maxima by a bracketed golden-section search.
+
+    Tempting, and why not: the level cloud (``box_samples``) for the fit and
+    the acceptance.  On a thin box (``Im d`` in ``[eta, 1.01 eta]``, every
+    real-pole window) its 6 or 24 levels are copies of one line -- 22,093
+    rows for an 11-node Na tail rule that 65 boundary rows fit -- and on real
+    time its geometric far-field spacing misses the rule's error, which
+    oscillates at the node horizon at every ``Re d``: a dense boundary audit
+    found 100 of 2,603 cached rules above eps, up to 247x on unreduced wide
+    boxes (runs/DEV/326_minimax_fit_review_2026-09-11).  Merging the levels
+    instead keeps the far-field gap and returned uncertified wide rules."""
+
+    def __init__(self, box, theta, S, eps, *, p, p_target, top=True):
+        re_lo, re_hi, im_lo, im_hi = box
+        kw = dict(theta=theta, S=S, eps=eps, p=p, p_target=p_target)
+        x = _edge_points(re_lo, re_hi, lambda v: v + 1j * im_lo, **kw)
+        edges = [(x, x + 1j * im_lo)]
+        if im_hi > im_lo:
+            yl = _edge_points(im_lo, im_hi, lambda v: re_lo + 1j * v, **kw)
+            yr = _edge_points(im_lo, im_hi, lambda v: re_hi + 1j * v, **kw)
+            thin = yl.size <= 2 and yr.size <= 2
+            if top or not thin:     # a box thinner than one spacing fits on its bottom edge
+                xt = _edge_points(re_lo, re_hi, lambda v: v + 1j * im_hi, **kw)
+                edges.append((xt, xt + 1j * im_hi))
+            if not thin:
+                edges += [(yl, re_lo + 1j * yl), (yr, re_hi + 1j * yr)]
+        self.edges = edges
+        self.d = np.concatenate([e[1] for e in edges])
+        self.im_lo = im_lo
+
+    def arc_weights(self, relative):
+        """``sqrt`` of each sample's local arc length in ``|dd|`` (``|dd|/|d|``
+        on a relative box), mean 1: the least squares approximates a boundary
+        integral rather than the sampling density."""
+        lengths = np.concatenate([np.abs(np.gradient(u)) for u, _ in self.edges])
+        if relative:
+            lengths = lengths / np.abs(self.d)
+        return np.sqrt(lengths / lengths.mean())
+
+    def _g(self, d, times, weights, relative):
+        Q = _cexp(1j * d[:, None] * np.asarray(times)[None, :]) @ np.asarray(weights)
+        return np.abs(d * Q - 1.0) if relative else self.im_lo * np.abs(Q - 1.0 / d)
+
+    def sup(self, times, weights, relative, iters=20):
+        """``(sup rho |Q - 1/d|, max kappa)``: every sampled local maximum
+        within 10% of the largest (edge ends included) is refined by a
+        golden-section search on its bracket.
+
+        Tempting, and why not: the vertex of the parabola through the three
+        samples (no extra evaluations).  Near the corner of a relative box the
+        error falls 4x within two samples, and the vertex misread the sup by
+        -1.3% and +0.5% where the bracketed search reads the dense value
+        (runs/DEV/326_minimax_fit_review_2026-09-11/tools/diag_refinement.py)."""
+        T = _cexp(1j * self.d[:, None] * np.asarray(times)[None, :]) * np.asarray(weights)[None, :]
+        Q = T.sum(1)
+        g = np.abs(self.d * Q - 1.0) if relative else self.im_lo * np.abs(Q - 1.0 / self.d)
+        kappa = float((np.abs(T).sum(1) / np.maximum(np.abs(Q), 1e-300)).max())
+        best, start = float(g.max()), 0
+        base, step, lo, hi = [], [], [], []
+        for u, pts in self.edges:
+            y = g[start:start + pts.size]
+            start += pts.size
+            if pts.size < 2:
+                continue
+            peak = (np.concatenate([[True], y[1:] >= y[:-1]])
+                    & np.concatenate([y[:-1] >= y[1:], [True]]) & (y >= 0.9 * best))
+            i = np.nonzero(peak)[0]
+            horizontal = pts[0].imag == pts[-1].imag
+            base.append(pts[i] - (u[i] if horizontal else 1j * u[i]))
+            step.append(np.full(i.size, 1.0 if horizontal else 1.0j))
+            lo.append(u[np.maximum(i - 1, 0)])
+            hi.append(u[np.minimum(i + 1, pts.size - 1)])
+        if sum(v.size for v in base):
+            base, step, a, b = map(np.concatenate, (base, step, lo, hi))
+            r = 0.5 * (np.sqrt(5.0) - 1.0)
+            c, e = b - r * (b - a), a + r * (b - a)
+            fc = self._g(base + step * c, times, weights, relative)
+            fe = self._g(base + step * e, times, weights, relative)
+            for _ in range(iters):
+                left = fc > fe                   # the maximum lies in [a, e]
+                a, b = np.where(left, a, c), np.where(left, e, b)
+                x = np.where(left, b - r * (b - a), a + r * (b - a))
+                fx = self._g(base + step * x, times, weights, relative)
+                c, e, fc, fe = (np.where(left, x, e), np.where(left, c, x),
+                                np.where(left, fx, fe), np.where(left, fc, fx))
+            best = max(best, float(fc.max()), float(fe.max()))
+        return best, kappa
+
+
+def boundary_samples(box, theta_deg, horizon, eps, p=6.0):
+    """Boundary samples of ``box`` resolving a rule on the ray ``theta_deg``
+    whose largest ``|t|`` is ``horizon``: the cloud on which the executor's
+    noise mass (and the rule's error) attains its box maximum."""
+    return _BoundaryCloud(tuple(map(float, box)), np.deg2rad(float(theta_deg)),
+                          float(horizon), float(eps), p=p, p_target=8.0).d
 
 
 def _legal_angles(d, margin=0.25):
@@ -1112,20 +1256,19 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     rho_of = (lambda x: np.abs(x)) if relative else (lambda x: np.full(x.size, im_lo))
     fit_of = ((lambda x: np.abs(x) * _log_density_weights(x)) if relative
               else rho_of)
-    d = box_samples(re_lo, re_hi, im_lo, im_hi)
-    _r0, theta, S, _rate = _choose_angle(d, eps, fit_of(d))
-    n_im = _im_levels(theta)
-    if n_im != 6:
-        d = box_samples(re_lo, re_hi, im_lo, im_hi, n_im=n_im)
-    # Acceptance is judged on a cloud finer than the fit cloud in both
-    # directions, so a rule that is exact between fit samples only is
-    # rejected (property test: 17 of 80 random rotated-ray boxes failed a
-    # finer check before this).  Tempting, and why not: use the fit cloud,
-    # or a coarser check (it is the largest matrix in the reduction loop):
-    # the failures were all rotated-ray boxes whose rule was exact at the
-    # sampled Im levels and off between them.
-    d_check = box_samples(re_lo, re_hi, im_lo, im_hi, per_unit=8.0, n_im=2 * n_im)
-    rho, rho_check = fit_of(d), rho_of(d_check)
+    d0 = box_samples(re_lo, re_hi, im_lo, im_hi)
+    _r0, theta, S, _rate = _choose_angle(d0, eps, fit_of(d0))
+    # Fit on the box boundary at the family's live bandwidth; accept on a
+    # boundary cloud twice as fine with every local maximum refined
+    # (_BoundaryCloud says why the boundary suffices).  Acceptance stays finer
+    # than the fit: 17 of 80 random rotated-ray boxes were exact on the fit
+    # samples and off between them before the check was finer.
+    bx = (re_lo, re_hi, im_lo, im_hi)
+    fit_cloud = _BoundaryCloud(bx, theta, S, eps, p=_FIT_POINTS_PER_HALF_WAVE,
+                               p_target=5.0, top=False)
+    check = _BoundaryCloud(bx, theta, S, eps, p=6.0, p_target=8.0)
+    d = fit_cloud.d
+    rho = rho_of(d) * fit_cloud.arc_weights(relative)
     fam = _RayFamily(d, theta, S, eps / trunc, rho)
     s, w = fam.interpolatory()
     if reduce:
@@ -1134,7 +1277,7 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
         im_lo_s, im_hi_s = max(-im_cap / Bp, -0.3 * S), min(im_cap / Bm, 0.3 * S)
 
         def ok(s_, w_):
-            e_, k_ = _score_cloud(fit, s_, w_, d_check, rho_check)
+            e_, k_ = check.sup(fit.phase * s_, w_, relative)
             return e_ <= eps and k_ <= kappa_cap
 
         # ``reduction_steps`` makes the budget a pass count: the clock is
@@ -1156,7 +1299,7 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
             # with weights -i*phase*w: the sup test uses exactly that map
             if _select_backend(backend, w.size, d.size) == "jax":
                 fit = _JaxCloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w,
-                                   rho=rho, check_cloud=(d_check, rho_check, eps, kappa_cap))
+                                   rho=rho, check_cloud=(check.d, rho_of(check.d), eps, kappa_cap))
             else:
                 fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w, rho=rho)
             red = fit.reduce(s, ok, deadline,       # start acceptance ignores the budget
@@ -1170,14 +1313,9 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
             times, weights = fam.to_rule(s, w)
     else:
         times, weights = fam.to_rule(s, w)
-    sup, kappa = rule_sup_error(times, weights, d_check, rho_check)
+    sup, kappa = check.sup(times, weights, relative)
     return UniformRule(
-        times=times, weights=weights, box=(re_lo, re_hi, im_lo, im_hi),
+        times=times, weights=weights, box=bx,
         eps=float(eps), relative=bool(relative), theta_deg=float(np.rad2deg(theta)),
         rank=int(fam.r), sup_error=sup, kappa_max=kappa,
         seconds=time.perf_counter() - t0)
-
-
-def _score_cloud(fit, s, w, d, rho):
-    """Sup error and kappa of the cloud-solver state ``(s, w)`` in rule form."""
-    return rule_sup_error(fit.phase * s, w, d, rho)
