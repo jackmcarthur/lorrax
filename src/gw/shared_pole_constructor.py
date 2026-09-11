@@ -432,6 +432,29 @@ def shared_pole_passivity(model, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, 
             "passivity_max": maximum, "passivity_antihermitian_relative": anti}
 
 
+def shared_pole_reciprocity(value, reference, *, gates):
+    """Check W(s).T=W(s) where held input data have this extra symmetry.
+
+    ``value`` and ``reference`` are matching [...,n,n] complex128 response
+    faces (W in Ry or dW/ds in inverse Ry). Leading axes label parents and
+    samples. Returns scalar arrays on those axes; no matrix is retained.
+    For a real-residue Stieltjes response, transpose symmetry off the real
+    s axis is equivalent to entrywise realness on the negative s axis.
+    Scalar TRS alone does not impose this symmetry at a generic fixed q.
+    This is a sampled model gate, not a certificate at every frequency.
+    """
+    threshold = gates["model_reciprocity"]["threshold"]
+    def defect(a):
+        return jnp.linalg.norm(a-jnp.swapaxes(a, -1, -2), axis=(-2, -1)) / jnp.maximum(
+            jnp.linalg.norm(a, axis=(-2, -1)), jnp.finfo(jnp.float64).tiny)
+    exact, measured = defect(reference), defect(value)
+    applicable = exact <= threshold["reference_relative_max"]
+    passed = (jnp.isfinite(exact) & jnp.isfinite(measured)
+              & (~applicable | (measured <= threshold["model_relative_max"])))
+    return {"passed": passed, "applicable": applicable,
+            "reference_relative": exact, "model_relative": measured}
+
+
 def _sample_point(recipe, sample_id):
     """Read a deduplicated physical point from the canonical role arrays."""
     import numpy as np
@@ -550,19 +573,23 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
             if any(width < 1 or width > logical_n for width in widths):
                 raise ValueError(f"GATE shared_pole_directions: got: ranks {widths}; want: 1..{logical_n}; why: empty or padded physical direction set")
             s = _sample_point(recipe, int(sample_id)) ** 2
-            # The conjugate state reuses exactly the same right directions.
+            # W(s*)=W(s).H: its right singular space is the LEFT space
+            # of W(s). Use WQ=U sigma without another selection or transport.
+            # Column equilibration removes sigma; this also preserves the
+            # conjugate space when the underlying response is real symmetric.
             for conjugate in ((False, True) if kind == "line" and s.imag != 0 else (False,)):
                 admit(largest_side() + q_batch.shape[-1])
                 transa = "C" if conjugate else "N"
-                output = matmul(w, q_batch, transa=transa)
-                action = matmul(derivative, q_batch, transa=transa)
-                states.append((s.conjugate() if conjugate else s, q_batch, output, action))
+                direction = states[-1][2] if conjugate else q_batch
+                output = matmul(w, direction, transa=transa)
+                action = matmul(derivative, direction, transa=transa)
+                states.append((s.conjugate() if conjugate else s, direction, output, action))
                 counts.append(widths)
                 for i, width in enumerate(widths):
                     roles[i].append({"sample_id": int(sample_id), "role": role["role"],
                                      "conjugate": conjugate, "width": width,
                                      "carrier_width": column_extent(width)})
-            del q_batch, output, action
+            del q_batch, direction, output, action
         del w, derivative
     return states, np.asarray(counts, dtype=np.int64).T, roles
 
@@ -995,6 +1022,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             with timing.section("spole.held"):
                 if batch_checks is None:
                     held = []
+                    reciprocity = []
                     with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
                         for sample_id in recipe["held_ids"]:
                             expose_live(model)
@@ -1010,13 +1038,19 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                 value = mm(b * weight[:, None, :], b, transb="C")
                                 diagnostic[field] = float(jnp.linalg.norm(value-sample) /
                                                           jnp.maximum(jnp.linalg.norm(sample), jnp.finfo(jnp.float64).tiny))
+                                reciprocity.append(shared_pole_reciprocity(value, sample, gates=gates))
                             held.append(diagnostic)
                             del samples, sample, value
+                    reciprocity = {key: np.asarray([row[key] for row in reciprocity]).tolist()
+                                   for key in reciprocity[0]}
                 else:
                     held = [{"sample_id": sample_id,
                              "Wc": float(batch_checks[1][slot, 0, i]),
                              "dWc_ds": float(batch_checks[1][slot, 1, i])}
                             for i, sample_id in enumerate(held_ids)]
+                    reciprocity = {key: value[slot].tolist() for key, value in batch_checks[2].items()}
+                if not np.all(reciprocity["passed"]):
+                    raise ValueError(f"GATE shared_pole_model_reciprocity: got: {reciprocity} at q={q}; want: model preserves transpose symmetry of symmetric held data; why: conjugate-port closure must survive reduction")
             timing.fence("spole.receipts")
             with timing.section("spole.receipts"):
                 b, poles, mask = model
@@ -1047,6 +1081,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                     "passivity": dict(value={k: np.asarray(v).tolist() for k, v in passive.items() if k != "passivity"}, passed=True, reason="authenticated inverse Coulomb square root at current eta"),
                     "retained_subspace_moments": dict(value=row["retained_moment_relative"], passed=True, reason="A=Y†GE, B=YA; pencil B†(G,H)B/2 versus model A†(I,Lambda)A/2"),
                     "held_w": dict(value=held, passed=True, reason="held W and dW/ds diagnostics recorded; no universal acceptance threshold"),
+                    "model_reciprocity": dict(value=reciprocity, passed=True, reason="sampled model W/dW transpose symmetry, conditional on symmetric reference; applicability recorded per sample"),
                     "full_m1_defect": dict(value=float(moment_defects["M1"]["full_relative"][0]), passed=bool(moment_defects["M1"]["full_relative"][0] <= gates["full_m1_defect"]["threshold"]), reason="physical full M1 defect; CD8 diagnostic band, never a refusal"),
                     "full_m3_defect": dict(value=float(moment_defects["M3"]["full_relative"][0]), passed=bool(moment_defects["M3"]["full_relative"][0] <= gates["full_m3_defect"]["threshold"]), reason="physical full M3 defect; CD8 diagnostic band, never a refusal"),
                     "representation": dict(value={"nspinor": 1, "trs_allowed": True}, passed=True, reason="current typed symmetry capability"),

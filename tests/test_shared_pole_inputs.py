@@ -183,7 +183,7 @@ def test_stale_census():
 
 def test_receipt_absence_and_nonfinite():
     rows=construction_receipt()['gates']
-    assert len(rows)==len(shared_real_pole_gates_v1_r3b)==15
+    assert len(rows)==len(shared_real_pole_gates_v1_r3b)==16
     assert all(r['status']=='NOT_MEASURED' for r in rows)
     assert gate_receipt('capacity',passed=True,reason='absent')['status']=='NOT_MEASURED'
     assert gate_receipt('capacity',4,passed=False,reason='4U')['status']=='FAIL'
