@@ -104,12 +104,16 @@ def check(mesh):
         imag = float(jnp.linalg.norm(got.imag)/jnp.linalg.norm(got))
         bad_imag = float(jnp.linalg.norm(bad.imag)/jnp.linalg.norm(bad))
         if case == 'real_residues':
-            assert bool(jnp.all(green['applicable'])) and not bool(jnp.all(red['passed']))
+            # The same predicate, same threshold, same reference: green passes
+            # only because the ports changed. Red must be applicable and fail.
+            assert bool(jnp.all(green['applicable'])) and bool(jnp.all(red['applicable']))
+            assert not bool(jnp.any(red['passed']))
             assert imag < 1e-11 and bad_imag > 1e-4
         else:
             assert not bool(jnp.any(green['applicable'])) and imag > .01
         rows.append(dict(case=case, imaginary_relative=imag,
                          same_q_imaginary_relative=bad_imag, projection_relative=projection,
+                         same_q_gates={k: np.asarray(v).tolist() for k, v in red.items()},
                          pencil_side=extents[0][0]+extents[0][1],
                          transported_q_columns=packed[0][1].shape[-1],
                          uncompressed_q_columns=full[0][1].shape[-1],
