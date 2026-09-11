@@ -14,7 +14,9 @@ import jax.numpy as jnp
 import h5py
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from common.collectives import barrier, rank0_transaction
+from common.collectives import (
+    agree_io_error, all_gather_processes, barrier, rank0_transaction,
+)
 from .commit_state import set_commit_state
 import common.timing as timing
 from runtime.padding import (
@@ -188,12 +190,27 @@ def read_shared_pole_restart_member(
     from .shared_pole_store import validate_shared_pole_model
 
     try:
-        restart_path = Path(restart_path).resolve()
-        with h5py.File(restart_path, "r") as h5:
-            assert_committed(h5, path=restart_path)
-            if SHARED_POLE_MEMBER_DATASET not in h5:
-                raise SharedPoleMemberMissing("GATE shared_pole_member: restart has no model member")
-            member = _shared_pole_member_record(h5[SHARED_POLE_MEMBER_DATASET][()])
+        # Agree after serial metadata I/O and before the validator enters
+        # its collective payload digest. Missing is rebuildable only when
+        # every reader sees the same committed bundle with no member.
+        import hashlib
+        restart_path = Path(restart_path).absolute()
+        member, error = None, None
+        try:
+            restart_path = restart_path.resolve()
+            with h5py.File(restart_path, "r") as h5:
+                assert_committed(h5, path=restart_path)
+                if SHARED_POLE_MEMBER_DATASET in h5:
+                    member = _shared_pole_member_record(h5[SHARED_POLE_MEMBER_DATASET][()])
+        except Exception as exc:
+            error = ValueError(exc.reason) if isinstance(exc, SharedPoleMemberRefused) else exc
+        agree_io_error(error, path=restart_path, stage="restart.shared_pole_member/read")
+        receipt = hashlib.sha256(repr(member).encode("utf-8")).digest()
+        receipts = np.asarray(all_gather_processes(np.frombuffer(receipt, np.uint8)))
+        if not np.all(receipts == receipts.reshape(-1, 32)[0]):
+            raise SharedPoleMemberRefused("GATE shared_pole_member: ranks read different membership receipts")
+        if member is None:
+            raise SharedPoleMemberMissing("GATE shared_pole_member: restart has no model member")
         header = validate_shared_pole_model(
             restart_path.parent / member["path"],
             expected_identity=expected_identity, mesh_xy=mesh_xy,
@@ -208,7 +225,7 @@ def read_shared_pole_restart_member(
                     f"GATE shared_pole_member: linked {key} changed; "
                     f"got {value!r}, want {member[key]!r}; rebuild the SC bundle")
         return (member, header) if return_header else member
-    except SharedPoleMemberMissing:
+    except (SharedPoleMemberMissing, SharedPoleMemberRefused):
         raise
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
         raise SharedPoleMemberRefused(str(exc)) from exc

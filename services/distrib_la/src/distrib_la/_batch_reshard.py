@@ -52,10 +52,10 @@ def validate_batch_reshard_operands(
     collective is entered.  The route accepts a ragged leading batch and
     pads it itself, but the matrix face must already tile the mesh.
     """
-    if op not in ("eigh", "dilation_eigh", "cholesky", "solve_lu"):
+    if op not in ("eigh", "checked_eigh", "dilation_eigh", "cholesky", "solve_lu"):
         raise ValueError(
             f"batch_reshard: unsupported op {op!r}; expected "
-            "eigh|dilation_eigh|cholesky|solve_lu")
+            "eigh|checked_eigh|dilation_eigh|cholesky|solve_lu")
     expected = 2 if op == "solve_lu" else 1
     if len(ops) != expected:
         raise ValueError(
@@ -137,6 +137,25 @@ def _pad_leading(a, amount: int):
     return jnp.pad(a, ((0, amount), (0, 0), (0, 0)))
 
 
+def _checked_eigh(a):
+    """Check Hermiticity where eigh already owns local complete matrices.
+
+    The reduction fuses the local transpose/difference, with no face
+    exchange. Invalid local batches skip the solver and return a NaN spectrum;
+    the existing replicated-spectrum readback refuses them on every rank.
+    """
+    defect = jnp.max(jnp.abs(a - jnp.conj(jnp.swapaxes(a, -1, -2))), axis=(-2, -1))
+    scale = jnp.max(jnp.abs(a), axis=(-2, -1))
+    valid = jnp.all(jnp.isfinite(scale) & (defect <= 1e-12 * scale))
+    def solve(value):
+        values, vectors = jnp.linalg.eigh(value)
+        return values, vectors
+    def refuse(value):
+        return (jnp.full(value.shape[:-1], jnp.nan, dtype=value.real.dtype),
+                jnp.zeros_like(value))
+    return jax.lax.cond(valid, solve, refuse, a)
+
+
 def _dense_real_rows(
     op: str, A, B=None, *, nbatch: int, py: int,
 ):
@@ -153,7 +172,7 @@ def _dense_real_rows(
     device = (jax.lax.axis_index("x") * py + jax.lax.axis_index("y"))
     first_q = device * local_nb
 
-    if op == "eigh":
+    if op in ("eigh", "checked_eigh"):
         w0 = jnp.zeros((local_nb, n), dtype=jnp.real(A).dtype)
         z0 = jnp.zeros_like(A)
 
@@ -162,7 +181,7 @@ def _dense_real_rows(
             A1 = jax.lax.dynamic_slice_in_dim(A, i, 1, axis=0)
 
             def _work(a):
-                result = jnp.linalg.eigh(a)
+                result = _checked_eigh(a) if op == "checked_eigh" else jnp.linalg.eigh(a)
                 # EighResult is a named tuple while the neutral branch is a
                 # plain tuple; lax.cond requires identical pytree node types.
                 return result[0], result[1]
@@ -241,7 +260,7 @@ def batch_reshard_call(
     fn = _JIT_CACHE.get(key)
     if fn is None:
         in_specs = tuple(P(None, "x", "y") for _ in ops)
-        out_specs = ((P(), P(None, "x", "y")) if op in ("eigh", "dilation_eigh")
+        out_specs = ((P(), P(None, "x", "y")) if op in ("eigh", "checked_eigh", "dilation_eigh")
                      else P(None, "x", "y"))
 
         def _body(*local_faces):
@@ -250,16 +269,17 @@ def batch_reshard_call(
                 for a in local_faces)
             A = local[0]
 
-            if op in ("eigh", "dilation_eigh"):
+            if op in ("eigh", "checked_eigh", "dilation_eigh"):
                 if op == "dilation_eigh":
                     from distrib_la.polar import _hermitian_dilation, _dilation_vectors
                     n = A.shape[-1]
                     A = _hermitian_dilation(A)
                 if batch_pad:
                     W, Z = _dense_real_rows(
-                        "eigh", A, nbatch=nbatch, py=py)
+                        "checked_eigh" if op == "checked_eigh" else "eigh",
+                        A, nbatch=nbatch, py=py)
                 else:
-                    W, Z = jnp.linalg.eigh(A)
+                    W, Z = _checked_eigh(A) if op == "checked_eigh" else jnp.linalg.eigh(A)
                 W = _replicate_batch_vector(W, px=px, py=py)[:nbatch]
                 if op == "dilation_eigh":
                     _, Z = _dilation_vectors(Z, n)

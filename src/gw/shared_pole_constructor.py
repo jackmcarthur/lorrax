@@ -102,7 +102,9 @@ def finite_pencil_column(left, right, *, matmul):
     sa, qa, oa = left
     sb, qb, ob, db = right
     a = matmul(oa, qb, transa="C")
-    b = matmul(qa, ob, transa="C")
+    # Production assembles the complete square finite block with shared
+    # panels. For distinct left/right blocks the second product is needed.
+    b = _adjoint(a) if qa is qb and oa is ob else matmul(qa, ob, transa="C")
     derivative = matmul(qa, db, transa="C")
     sa = jnp.broadcast_to(sa, (qa.shape[0], qa.shape[-1]))
     sb = jnp.broadcast_to(sb, (qb.shape[0], qb.shape[-1]))
@@ -679,8 +681,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             nonlocal workspace
             key = (op, shapes)
             if key not in native_queries:
-                size = distrib_la.workspace_bytes_per_rank(
-                    plan, op, shapes, np.complex128)
+                size = (distrib_la.matmul_workspace_bytes_per_rank(
+                    mesh_xy, shapes, np.complex128, backend="auto",
+                    batched_route=resolution.batched_route) if op == "gemm" else
+                    distrib_la.workspace_bytes_per_rank(plan, op, shapes, np.complex128))
                 native_queries[key] = size
             if op == "gemm":
                 native_maxima[op] = max(native_maxima[op], native_queries[key])
@@ -706,7 +710,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             if _sample_point(recipe, sample_id) != _sample_point(stored_recipe, sample_id):
                 raise ValueError("GATE shared_pole_bank_state: got: changed z; want: current physical sample point; why: recipe hashes alone do not bind resolved points")
 
-        def capacity(side, *, phase=None, sample_batch=1):
+        def capacity(side, *, phase=None, sample_batch=1, transpose_staging=0):
             nonlocal current_side, current_phase, workspace
             if phase is not None:
                 current_phase = phase
@@ -727,7 +731,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             extra = sum(int(np.prod(a.sharding.shard_shape(a.shape))) * a.dtype.itemsize
                         for a in {id(a): a for a in retained_panels}.values())
             price["terms_bytes_per_rank"]["retained_parent_panels"] = extra
-            price["resident_bytes_per_rank"] += extra
+            price["terms_bytes_per_rank"]["gemm_transpose_staging"] = transpose_staging
+            price["resident_bytes_per_rank"] += extra + transpose_staging
             row = ledger.reserve(f"constructor.plan.{len(ledger.entries)}",
                                  resident_bytes_per_rank=price["resident_bytes_per_rank"],
                                  workspace_bytes_per_rank=workspace,
@@ -755,15 +760,21 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             width, mesh_xy, name="shared_pole_port",
             specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
         def mm(a, b, **kwargs):
-            # Query the actual effective N,N shapes before the service allocates
-            # transpose staging, output or a larger persistent GEMM workspace.
+            # Workspace belongs to the matmul route, not the eigh backend.
+            # Its query excludes operand-sized endpoint transpose staging;
+            # charge those transient faces separately before execution.
             shapes = tuple(value.shape[:-2] + (value.shape[-2:][::-1]
                            if kwargs.get(trans, "N") != "N" else value.shape[-2:])
                            for value, trans in ((a, "transa"), (b, "transb")))
             previous = workspace
-            query_workspace("gemm", shapes, eigenplan(n))
-            if workspace != previous:
-                capacity(current_side)
+            query_workspace("gemm", shapes, None)
+            staging = (sum(int(np.prod(value.shape)) * value.dtype.itemsize
+                           // int(mesh_xy.size)
+                           for value, trans in ((a, "transa"), (b, "transb"))
+                           if kwargs.get(trans, "N") != "N")
+                       if resolution.batched_route != "batch_reshard" else 0)
+            if workspace != previous or staging:
+                capacity(current_side, transpose_staging=staging)
             return distrib_la.matmul(a, b, mesh=mesh_xy, backend="auto",
                                      batched_route=resolution.batched_route, **kwargs)
 

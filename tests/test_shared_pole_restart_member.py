@@ -193,3 +193,16 @@ def test_refused_preserves_identity_hash_and_corruption_reasons(member_case, mon
         assert "copy of the bundle" in str(caught.value)
         assert not isinstance(caught.value, tagged_arrays.SharedPoleMemberMissing)
     assert (restart.read_bytes(), model.read_bytes()) == before
+
+
+def test_refused_is_not_wrapped_twice(member_case, monkeypatch):
+    from file_io import shared_pole_store
+    _register(member_case)
+    original = tagged_arrays.SharedPoleMemberRefused("injected refusal")
+    def refuse(*args, **kwargs):
+        raise original
+    monkeypatch.setattr(shared_pole_store, "validate_shared_pole_model", refuse)
+    with pytest.raises(tagged_arrays.SharedPoleMemberRefused) as caught:
+        _read(member_case)
+    assert caught.value is original
+    assert str(caught.value).count("never overwrite this member") == 1

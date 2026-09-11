@@ -47,9 +47,18 @@ def check_outputs(root):
             g.create_dataset("crystal/avec", data=np.eye(3))
     rank0_transaction(wfn, stage="test.output_wfn", write=make_wfn)
     handle = dict(path=str(source), identity=identity, digest=header['digest'])
-    outputs = store.export_shared_pole_outputs(handle, meta=meta,
-        config=SimpleNamespace(write_w=True, write_poles=True), mesh_xy=mesh,
-        source_wfn=wfn, run_dir=root, label="export", tables=tables, print_fn=print)
+    from unittest.mock import patch
+    with patch.object(store, "SlabIO", wraps=store.SlabIO) as opens, \
+            patch.object(store, "validate_shared_pole_bank",
+                         wraps=store.validate_shared_pole_bank) as validations:
+        outputs = store.export_shared_pole_outputs(handle, meta=meta,
+            config=SimpleNamespace(write_w=True, write_poles=True), mesh_xy=mesh,
+            source_wfn=wfn, run_dir=root, label="export", tables=tables, print_fn=print)
+        destination = str(root / "export_w.h5")
+        writer_opens = [call for call in opens.call_args_list
+                        if str(call.args[0]) == destination]
+        assert [call.kwargs["mode"] for call in writer_opens] == ["w", "a"]
+        assert len(validations.call_args_list) == 1  # source bank, once
     store.validate_shared_pole_model(outputs['poles']['path'], expected_identity=identity,
         mesh_xy=mesh, capacity=meta.shared_pole_capacity)
     store.validate_shared_pole_bank(outputs['w']['path'], expected_identity=identity,

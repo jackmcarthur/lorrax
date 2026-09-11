@@ -509,7 +509,7 @@ def solve_smearing_occupations(
     w = np.asarray(kweights, dtype=np.float64)
     if len(shape) != 2 or min(shape, default=0) < 1:
         raise ValueError(
-            f"solve_mp1_occupations: E_kn must be nonempty (nk, nb); got {shape}")
+            f"solve_smearing_occupations: E_kn must be nonempty (nk, nb); got {shape}")
     import operator
     try:
         logical = shape[1] if logical_nband is None else operator.index(logical_nband)
@@ -521,25 +521,28 @@ def solve_smearing_occupations(
             f"got {logical_nband!r}, carrier={shape[1]}")
     if w.shape != (shape[0],):
         raise ValueError(
-            f"solve_mp1_occupations: kweights must be ({shape[0]},); got {w.shape}")
+            f"solve_smearing_occupations: kweights must be ({shape[0]},); got {w.shape}")
     if not np.all(np.isfinite(w)) or np.any(w < 0.0):
-        raise ValueError("solve_mp1_occupations: kweights must be finite/nonnegative")
+        raise ValueError("solve_smearing_occupations: kweights must be finite/nonnegative")
     weight_sum = float(w.sum())
     if not np.isclose(weight_sum, 1.0, rtol=0.0, atol=1e-10):
         raise ValueError(
-            f"solve_mp1_occupations: kweights must sum to 1; got {weight_sum:.17g}")
+            f"solve_smearing_occupations: kweights must sum to 1; got {weight_sum:.17g}")
 
     target = float(n_electrons)
     broadening = float(broadening_ry)
     capacity = float(state_capacity)
     if not np.isfinite(broadening) or broadening <= 0.0:
-        raise ValueError("solve_mp1_occupations: broadening_ry must be finite and > 0")
+        raise ValueError(
+            "solve_smearing_occupations: broadening_ry "
+            f"({'kBT' if family == 'fd' else 'BerkeleyGW half-width'}, Ry) "
+            "must be finite and > 0")
     if not np.isfinite(capacity) or capacity <= 0.0:
-        raise ValueError("solve_mp1_occupations: state_capacity must be finite and > 0")
+        raise ValueError("solve_smearing_occupations: state_capacity must be finite and > 0")
     maximum = capacity * weight_sum * logical
     if not np.isfinite(target) or not (0.0 < target < maximum):
         raise ValueError(
-            f"solve_mp1_occupations: n_electrons={target!r} outside (0, {maximum})")
+            f"solve_smearing_occupations: n_electrons={target!r} outside (0, {maximum})")
 
     mu, physical_f = _solve_smearing_kernel(
         jnp.asarray(E_kn, dtype=jnp.float64)[:, :logical], w, target, broadening, capacity,

@@ -19,7 +19,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common import timing
-from common.collectives import rank0_transaction, psum_replicate
+from common.collectives import agree_io_error, rank0_transaction, psum_replicate
 from file_io.slab_io import SlabIO, mesh_divisible_shape
 from file_io.commit_state import assert_committed, set_commit_state
 from symmetry_maps import QirrTables, validate_qirr_tables
@@ -530,7 +530,6 @@ def _model_digest(path, header, mesh, *, capacity):
                     counts = np.clip(active_counts-c0, 0, c1-c0)
                     _check_factor(b, poles[:,c0:c1], counts)
                 with timing.section('host_digest_hashing'):
-                    local = None
                     for shard in b.addressable_shards:
                         if shard.replica_id != 0:
                             continue
@@ -540,7 +539,8 @@ def _model_digest(path, header, mesh, *, capacity):
                             for i in range(min(local.shape[1], nmu-start)):
                                 hasher = hashers[q].setdefault(start+i, hashlib.sha256())
                                 hasher.update(np.asarray(local[q,i], dtype="<c16").tobytes())
-                    del b, shard, local
+                    shard = local = None
+                    del b
             row_hash = np.zeros((batch,nmu,32), np.uint32)
             for q in range(batch):
                 for row, hasher in hashers[q].items():
@@ -564,35 +564,43 @@ def validate_shared_pole_model(path, *, expected_identity, mesh_xy, capacity=Non
     restart membership refuse that receipt. Production callers supply the
     map ledger with bound caller lifetimes. No receipt is appended to disk.
     """
-    header = _read_header(path)
-    _check_identity(header["identity"], expected_identity)
-    if header["schema"] != SCHEMA or not header["finalized"] or not all(header["written_q"]):
-        _refuse("missing final shared-pole commit or incomplete q census")
-    qt = shared_pole_qirr_tables(header)
-    validate_qirr_tables(qt, header["n_q_irr"], header["n_mu_logical"])
-    with h5py.File(path, "r") as f:
-        for name, shape, dtype in (
-            ("factor", (header["n_q_irr"],header["n_mu_logical"],1,header["Kmax"]), np.complex128),
-            ("poles2_ry2", (header["n_q_irr"],header["Kmax"]), np.float64),
-            ("K", (header["n_q_irr"],), np.int64)):
-            if name not in f or f[name].shape != shape or f[name].dtype != dtype or f[name].chunks is not None:
-                _refuse(f"dataset {name} shape/dtype/contiguity mismatch")
-        if "final_commit" not in f or f["final_commit"][()].decode() != header["digest"]:
-            _refuse("missing or inconsistent final commit")
-        if not np.array_equal(f["K"][:], header["K"]) or not np.array_equal(f["written_q"][:],header["written_q"]):
-            _refuse("count/completion metadata mismatch")
-        for key in _TABLE_KEYS:
-            if not np.array_equal(f["qirr/"+key][:], np.asarray(header["qirr"][key])):
-                _refuse(f"typed qirr metadata changed: {key}")
-        if (not np.array_equal(f["q_irr_full_idx"][:], header["q_irr_full_idx"])
-                or int(f["qirr/n_sym_spatial"][()]) != header["qirr"]["n_sym_spatial"]):
-            _refuse("typed parent or operation-count metadata changed")
-        for key, expected in header["operations"].items():
-            actual = f["operations/"+key][()]
-            if key == "typing_source":
-                actual = actual.decode()
-            if not np.array_equal(actual, expected):
-                _refuse(f"typed operation metadata changed: {key}")
+    error = None
+    try:
+        header = _read_header(path)
+        _check_identity(header["identity"], expected_identity)
+        if header["schema"] != SCHEMA or not header["finalized"] or not all(header["written_q"]):
+            _refuse("missing final shared-pole commit or incomplete q census")
+        qt = shared_pole_qirr_tables(header)
+        validate_qirr_tables(qt, header["n_q_irr"], header["n_mu_logical"])
+        with h5py.File(path, "r") as f:
+            for name, shape, dtype in (
+                ("factor", (header["n_q_irr"],header["n_mu_logical"],1,header["Kmax"]), np.complex128),
+                ("poles2_ry2", (header["n_q_irr"],header["Kmax"]), np.float64),
+                ("K", (header["n_q_irr"],), np.int64)):
+                if name not in f or f[name].shape != shape or f[name].dtype != dtype or f[name].chunks is not None:
+                    _refuse(f"dataset {name} shape/dtype/contiguity mismatch")
+            if "final_commit" not in f or f["final_commit"][()].decode() != header["digest"]:
+                _refuse("missing or inconsistent final commit")
+            if not np.array_equal(f["K"][:], header["K"]) or not np.array_equal(f["written_q"][:],header["written_q"]):
+                _refuse("count/completion metadata mismatch")
+            for key in _TABLE_KEYS:
+                if not np.array_equal(f["qirr/"+key][:], np.asarray(header["qirr"][key])):
+                    _refuse(f"typed qirr metadata changed: {key}")
+            if (not np.array_equal(f["q_irr_full_idx"][:], header["q_irr_full_idx"])
+                    or int(f["qirr/n_sym_spatial"][()]) != header["qirr"]["n_sym_spatial"]):
+                _refuse("typed parent or operation-count metadata changed")
+            for key, expected in header["operations"].items():
+                actual = f["operations/"+key][()]
+                if key == "typing_source":
+                    actual = actual.decode()
+                if not np.array_equal(actual, expected):
+                    _refuse(f"typed operation metadata changed: {key}")
+    except Exception as exc:
+        error = exc
+    try:
+        agree_io_error(error, path=path, stage="shared_pole_model/metadata")
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
     if capacity is None:
         # No tensor allocation is permitted without admission. This receipt
         # must not be mistaken for payload authentication by a restart caller.
@@ -899,15 +907,44 @@ def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
         _refuse("writer mesh differs from packed basis mesh")
     if header.get("complete"):
         _refuse("completed scratch bank is immutable")
-    # A process may stop after payload/masks close but before the final stamp.
-    # A payload-free call retries only that metadata transaction.
-    if (np.asarray(header["sample_written"], dtype=bool).all()
+    if not (np.asarray(header["sample_written"], dtype=bool).all()
             and np.asarray(header["moment_written"], dtype=bool).all()
             and all(value is None for value in (Wc, dWc_ds, M1, M3))):
+        prepared = _prepare_bank_write(header, q_span=q_span,
+            sample_span=sample_span, meta=meta, mesh_xy=mesh_xy,
+            Wc=Wc, dWc_ds=dWc_ds, M1=M1, M3=M3)
+        with SlabIO(path, mode="a", mesh=mesh_xy) as io:
+            _write_bank_payload(io, header, meta, prepared)
+            _write_bank_masks(io, header)
+    _complete_bank(path, header)
+    return header
+
+
+def _write_bank_masks(io, header):
+    """Publish drained payload masks within the open collective handle."""
+    io.write_attr("sample_written", np.asarray(header["sample_written"], dtype=bool))
+    io.write_attr("moment_written", np.asarray(header["moment_written"], dtype=bool))
+    _write_header(io, header)
+
+
+def _complete_bank(path, header):
+    """Stamp a fully written bank only after its collective handle closes."""
+    if (np.asarray(header["sample_written"], dtype=bool).all()
+            and np.asarray(header["moment_written"], dtype=bool).all()):
         header["complete"] = True
         header["final_commit"] = hashlib.sha256(_json(header).encode()).hexdigest()
         _stamp_header(path, header, "shared_pole_bank.complete")
-        return header
+
+
+def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
+                        sample_span=None, Wc=None, dWc_ds=None,
+                        M1=None, M3=None):
+    """Validate/admit a packed span before opening or mutating a bank."""
+    _check_basis(meta, header)
+    if mesh_xy is not meta.mu_basis.mesh_xy:
+        _refuse("writer mesh differs from packed basis mesh")
+    if header.get("complete"):
+        _refuse("completed scratch bank is immutable")
     shape = header["bank_shape"]
     q0, q1 = _span(q_span, shape["nq"], "q_span")
     has_samples = Wc is not None or dWc_ds is not None
@@ -951,34 +988,36 @@ def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
                device_panel=max(arg,output),native_host=True)
         if not bool(jnp.all(jnp.isfinite(array))):
             _refuse(f"scratch {name} contains nonfinite values")
-    with SlabIO(path, mode="a", mesh=mesh_xy) as io:
-        for name, array in pending:
-            sample = name in _BANK_SAMPLE_FIELDS
-            spec = P(None, None, 'x', 'y') if sample else P(None, 'x', 'y')
-            disk_shape = ((shape["nq"], shape["nsample"]) if sample
-                          else (shape["nq"],)) + (shape["d"], shape["d"])
-            io.create_dataset(name, shape=disk_shape, dtype=np.complex128)
-            canonical = basis.unpack_operator(array, spec=spec)
-            offset = (q0, a0, 0, 0) if sample else (q0, 0, 0)
-            io.write_slab(name, canonical, offset=offset)
-            # SlabIO's write queue owns canonical until drained. Drain each
-            # field so endpoint staging cannot accumulate across fields.
-            io.sync_writes()
-            del canonical
-            if sample:
-                sample_mask[q0:q1, a0:a1, _BANK_SAMPLE_FIELDS.index(name)] = True
-            else:
-                moment_mask[q0:q1, _BANK_MOMENT_FIELDS.index(name)] = True
-        header["sample_written"] = sample_mask.tolist()
-        header["moment_written"] = moment_mask.tolist()
-        io.write_attr("sample_written", sample_mask)
-        io.write_attr("moment_written", moment_mask)
-        _write_header(io, header)
-    if sample_mask.all() and moment_mask.all():
-        header["complete"] = True
-        header["final_commit"] = hashlib.sha256(_json(header).encode()).hexdigest()
-        _stamp_header(path, header, "shared_pole_bank.complete")
-    return header
+    return q0, q1, a0, a1, pending, sample_mask, moment_mask
+
+
+def _write_bank_payload(io, header, meta, prepared):
+    """Write admitted spans; caller publishes masks after the queue drains.
+
+    The prepared arrays carry the public writer's units and face shardings.
+    Authentication/admission stays in the common preparation owner.
+    """
+    q0, q1, a0, a1, pending, sample_mask, moment_mask = prepared
+    shape, basis = header["bank_shape"], meta.mu_basis
+    for name, array in pending:
+        sample = name in _BANK_SAMPLE_FIELDS
+        spec = P(None, None, 'x', 'y') if sample else P(None, 'x', 'y')
+        disk_shape = ((shape["nq"], shape["nsample"]) if sample
+                      else (shape["nq"],)) + (shape["d"], shape["d"])
+        io.create_dataset(name, shape=disk_shape, dtype=np.complex128)
+        canonical = basis.unpack_operator(array, spec=spec)
+        offset = (q0, a0, 0, 0) if sample else (q0, 0, 0)
+        io.write_slab(name, canonical, offset=offset)
+        # SlabIO's write queue owns canonical until drained. Drain each
+        # field so endpoint staging cannot accumulate across fields.
+        io.sync_writes()
+        del canonical
+        if sample:
+            sample_mask[q0:q1, a0:a1, _BANK_SAMPLE_FIELDS.index(name)] = True
+        else:
+            moment_mask[q0:q1, _BANK_MOMENT_FIELDS.index(name)] = True
+    header["sample_written"] = sample_mask.tolist()
+    header["moment_written"] = moment_mask.tolist()
 
 
 def read_shared_pole_bank(io, q_span, *, meta, header, sample_span=None,
@@ -1139,10 +1178,11 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
         outputs["poles"] = dict(path=str(path), payload_bytes=model["compact_payload_bytes"])
     if config.write_w:
         path = targets["w"]
-        initialize_shared_pole_bank(path, meta=meta, tables=tables,
+        output_header = initialize_shared_pole_bank(path, meta=meta, tables=tables,
             recipe=bank_header["recipe"], identity=handle["identity"], mesh_xy=mesh_xy)
         previous = ledger.live_stages
-        with SlabIO(bank_source, mode="r", mesh=mesh_xy) as io:
+        with SlabIO(bank_source, mode="r", mesh=mesh_xy) as io, \
+                SlabIO(path, mode="a", mesh=mesh_xy) as output_io:
             for q in range(bank_header["bank_shape"]["nq"]):
                 for field in _BANK_SAMPLE_FIELDS + _BANK_MOMENT_FIELDS:
                     sample = field in _BANK_SAMPLE_FIELDS
@@ -1156,12 +1196,16 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                             _local_bytes(value.shape, value.dtype, mesh_xy, spec))
                         ledger.live_stages = (*previous, row["stage"])
                         try:
-                            write_shared_pole_bank(path, q_span=(q, q+1), sample_span=span,
-                                meta=meta, expected_identity=handle["identity"],
+                            prepared = _prepare_bank_write(output_header,
+                                q_span=(q, q+1), sample_span=span, meta=meta,
                                 mesh_xy=mesh_xy, **values)
+                            _write_bank_payload(output_io, output_header, meta, prepared)
+                            del prepared
                             del values, value
                         finally:
                             ledger.live_stages = previous
+            _write_bank_masks(output_io, output_header)
+        _complete_bank(path, output_header)
         _export_spatial_header(path, source_wfn, meta, kind="w", source=bank_source)
         outputs["w"] = dict(path=str(path), payload_bytes=bank_header["payload_bytes"])
     for kind, receipt in outputs.items():

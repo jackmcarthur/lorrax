@@ -203,18 +203,27 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
     r = operator.index(r)
     if not 1 <= r <= W.shape[-1]:
         raise ValueError("r must lie in [1,m]")
-    defect = jnp.max(jnp.abs(W - jnp.conj(jnp.swapaxes(W, -1, -2))), axis=(-2, -1))
-    scale = jnp.max(jnp.abs(W), axis=(-2, -1))
-    if not bool(jnp.all(jnp.isfinite(scale) & (defect <= 1e-12 * scale))):
-        raise ValueError("leading_eigenvectors requires finite Hermitian W")
-    if W.ndim == 2:
-        s, q = eigh_plan.batched(W[None])
-        s, q = s[0], q[0]
+    if eigh_plan.batched_route == ROUTE_BATCH_RESHARD:
+        from distrib_la._batch_reshard import batch_reshard_call
+        s, q = batch_reshard_call("checked_eigh", eigh_plan.mesh,
+                                  (W if W.ndim == 3 else W[None],))
+        if W.ndim == 2:
+            s, q = s[0], q[0]
     else:
-        s, q = eigh_plan.batched(W)
+        # A distributed solver never owns complete local rows; checking
+        # arbitrary off-diagonal faces still requires peer communication.
+        defect = jnp.max(jnp.abs(W - jnp.conj(jnp.swapaxes(W, -1, -2))), axis=(-2, -1))
+        scale = jnp.max(jnp.abs(W), axis=(-2, -1))
+        if not bool(jnp.all(jnp.isfinite(scale) & (defect <= 1e-12 * scale))):
+            raise ValueError("leading_eigenvectors requires finite Hermitian W")
+        if W.ndim == 2:
+            s, q = eigh_plan.batched(W[None])
+            s, q = s[0], q[0]
+        else:
+            s, q = eigh_plan.batched(W)
     values = np.asarray(s)[..., ::-1].copy()
     if not np.all(np.isfinite(values)):
-        raise ValueError("nonfinite eigenvalue spectrum")
+        raise ValueError("leading_eigenvectors requires finite Hermitian W and a finite eigenvalue spectrum")
     count = (_close_spectral_cut(values, r, multiplet_tol) if values.ndim == 1
              else tuple(_close_spectral_cut(row, r, multiplet_tol) for row in values))
     return _retained_columns(q, values, count, mesh=eigh_plan.mesh,

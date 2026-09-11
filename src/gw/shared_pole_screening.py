@@ -117,6 +117,11 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         centroid_indices, run_dir, label, wfn,
                         wfn_fingerprint_binding, tensors_filename, occupation_state, print_fn):
     """Build/reuse one immutable current-map model and return its small handle."""
+    source_wfn = None
+    if config.write_w or config.write_poles:
+        source_wfn = getattr(wfn, "path", None)
+        if source_wfn is None or not str(source_wfn).strip():
+            raise ValueError("GATE shared_pole_output: write_w/write_poles require the source WFN path before screening")
     timing.fence("spole.screening_setup")
     with timing.section("spole.screening_setup"):
         from file_io.shared_pole_store import initialize_shared_pole_bank
@@ -147,7 +152,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                     timing.fence("spole.outputs")
                     with timing.section("spole.outputs"):
                         export_shared_pole_outputs(handle, meta=meta, config=config,
-                            mesh_xy=mesh_xy, source_wfn=getattr(wfn, "_filename", None),
+                            mesh_xy=mesh_xy, source_wfn=source_wfn,
                             run_dir=run_dir, label=label, print_fn=print_fn,
                             tables=_shared_pole_tables(meta, sym, centroid_indices))
                 return dict(shared_pole=handle)
@@ -221,7 +226,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             timing.fence("spole.outputs")
             with timing.section("spole.outputs"):
                 receipts["outputs"] = export_shared_pole_outputs(handle, meta=meta,
-                    config=config, mesh_xy=mesh_xy, source_wfn=getattr(wfn, "_filename", None),
+                    config=config, mesh_xy=mesh_xy, source_wfn=source_wfn,
                     run_dir=run_dir, label=label, tables=tables, print_fn=print_fn)
         if tensors_filename is not None:
             receipts["restart_member"] = register_shared_pole_restart_member(

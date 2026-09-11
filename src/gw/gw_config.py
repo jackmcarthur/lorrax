@@ -2865,6 +2865,8 @@ def _resolve_shared_pole_inputs(params):
             raise ValueError(
                 f"{key}=true requires compute_mode=mpa and "
                 "sigma_w_model=shared_pole (fixed frequency-bank outputs)")
+    if (params["write_w"] or params["write_poles"]) and not str(params["wfn_file"]).strip():
+        raise ValueError("write_w/write_poles require a nonempty wfn_file source path")
     if "sigma_w_model" in named and mode != "mpa":
         raise ValueError(
             f"GATE shared_pole_applicability: sigma_w_model got: {model!r} "
@@ -3208,8 +3210,7 @@ def read_lorrax_input(filename: str) -> dict:
                 params[key] = section.getboolean(key)
             elif key in _NULLABLE_INT:
                 params[key] = (
-                    None if key == "sigma_quadrature_reduction_steps"
-                    and raw.strip().lower() == "none"
+                    None if raw.strip().lower() == "none"
                     else section.getint(key))
             elif key in _NULLABLE_STR:
                 params[key] = str(raw)

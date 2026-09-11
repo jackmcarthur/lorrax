@@ -293,9 +293,18 @@ def _rule_cache_lookup(
         return None, ()
     warnings = []
     try:
-        names = [name for name in os.listdir(directory)
-                 if name.startswith(f"rule_{_RULE_CACHE_SCHEMA}_")
-                 and name.endswith(".npz")]
+        entries = [name for name in os.listdir(directory)
+                   if name.startswith("rule_") and name.endswith(".npz")]
+        names = [name for name in entries
+                 if name.startswith(f"rule_{_RULE_CACHE_SCHEMA}_")]
+        stale = sorted(set(entries) - set(names))
+        if stale:
+            warnings.append(
+                "WARNING sigma quadrature cache schema migration: "
+                f"path={os.path.abspath(directory)}; schema={_RULE_CACHE_SCHEMA}; "
+                f"ignored {len(stale)} legacy rule file(s), first={stale[0]}; "
+                "affected windows will be rebuilt. Legacy files are retained "
+                "to preserve prior-run evidence; remove them when no longer needed.")
     except OSError as exc:
         path = os.path.abspath(directory)
         warnings.append(
@@ -308,49 +317,40 @@ def _rule_cache_lookup(
         path = os.path.abspath(os.path.join(directory, name))
         try:
             with np.load(path) as data:
-                if (abs(float(data["eps"]) - eps) > 1.0e-12 * eps
-                        or bool(data["relative"]) != relative):
-                    continue
-                cached_steps = (int(data["reduction_steps"])
-                                if "reduction_steps" in data else -1)
-                if cached_steps != (-1 if reduction_steps is None
-                                    else int(reduction_steps)):
-                    continue
-                # Cache entries pre-dating the executor-noise stamp, or
-                # entries built for a looser consumer, are not compatible.
-                # A cache hit is an acceleration only; it must never hide a
-                # builder attempt that can satisfy the active Sigma gate.
-                if ("roundoff_amplification" not in data
-                        or float(data["roundoff_amplification"])
-                        > noise_amplification_cap):
-                    continue
-                # A cached certificate above eps is not a rule for this
-                # request, whatever its node count; it must not shadow a
-                # buildable accurate one (Na pole-tail, 2026-09-05).
-                if (not np.isfinite(float(data["sup_error"]))
-                        or float(data["sup_error"]) > eps):
-                    continue
+                # Authenticate the stored object before compatibility filtering.
+                # A nearby requested eps may reuse this certificate, but is
+                # never substituted into the digest of its immutable identity.
+                cached_steps = int(data["reduction_steps"])
                 cached_box = tuple(float(value) for value in data["box"])
+                rule = UniformRule(
+                    times=np.asarray(data["times"]),
+                    weights=np.asarray(data["weights"]),
+                    box=cached_box, eps=float(data["eps"]),
+                    relative=bool(data["relative"]),
+                    theta_deg=float(data["theta_deg"]),
+                    rank=int(data["rank"]),
+                    sup_error=float(data["sup_error"]),
+                    kappa_max=float(data["kappa_max"]), seconds=0.0)
+                amplification = float(data["roundoff_amplification"])
+                if (str(data["schema"]) != _RULE_CACHE_SCHEMA
+                        or not _rule_is_certified(rule, rule.eps)
+                        or rule.times.ndim != 1 or rule.weights.ndim != 1
+                        or not np.isfinite(amplification)
+                        or str(data["digest"]) != _rule_digest(
+                            rule, amplification, cached_steps)):
+                    raise ValueError("GATE sigma_rule_integrity: certificate digest/schema mismatch")
+                if (abs(rule.eps - eps) > 1.0e-12 * eps
+                        or rule.relative != relative
+                        or cached_steps != (-1 if reduction_steps is None
+                                            else int(reduction_steps))
+                        or amplification > noise_amplification_cap
+                        or rule.sup_error > eps):
+                    continue
                 if not (cached_box[0] <= box[0]
                         and cached_box[1] >= box[1]
                         and cached_box[2] <= box[2]
                         and cached_box[3] >= box[3]):
                     continue
-                rule = UniformRule(
-                    times=np.asarray(data["times"]),
-                    weights=np.asarray(data["weights"]),
-                    box=cached_box, eps=eps, relative=relative,
-                    theta_deg=float(data["theta_deg"]),
-                    rank=int(data["rank"]),
-                    sup_error=float(data["sup_error"]),
-                    kappa_max=float(data["kappa_max"]), seconds=0.0)
-                if (str(data["schema"]) != _RULE_CACHE_SCHEMA
-                        or not _rule_is_certified(rule, eps)
-                        or rule.times.ndim != 1 or rule.weights.ndim != 1
-                        or not np.isfinite(float(data["roundoff_amplification"]))
-                        or str(data["digest"]) != _rule_digest(
-                            rule, float(data["roundoff_amplification"]), cached_steps)):
-                    raise ValueError("GATE sigma_rule_integrity: certificate digest/schema mismatch")
                 if best is None or rule.node_count < best[0].node_count:
                     best = (rule, name)
         except (EOFError, OSError, KeyError, ValueError) as exc:

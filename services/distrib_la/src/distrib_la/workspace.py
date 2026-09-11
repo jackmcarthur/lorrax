@@ -111,6 +111,18 @@ def _workspace_details(plan, op, shapes, dtype):
         raise ValueError('GEMM shape/dtype differs from its plan')
     if any(v % axis for v, axis in ((m,px),(k,px),(k,py),(n,py))):
         raise ValueError('GEMM shapes must tile the plan mesh')
+    return _gemm_workspace_details(plan.mesh, shapes, dtype, local=local,
+        backend=plan.backend,
+        ctx_handle=plan.ctx_handle if isinstance(plan, GemmPlan) else None)
+
+
+def _gemm_workspace_details(mesh, shapes, dtype, *, local, backend, ctx_handle=None):
+    """Shared query implementation for planned and eager GEMM routes."""
+    import jax
+    from distrib_la._cusolvermp import get_or_init_context
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    m, k, n = shapes[0][-2], shapes[0][-1], shapes[1][-1]
+    batch = shapes[0][0] if len(shapes[0]) == 3 else 1
     if local:
         nb = (batch+px*py-1)//(px*py)
         local_shapes = ((nb,m,k),(nb,k,n))
@@ -119,16 +131,46 @@ def _workspace_details(plan, op, shapes, dtype):
                     dynamic_xla_scratch_bytes=0, local=True,
                     formula='compiled local batched matmul temp_size_in_bytes (workspace upper bound)',
                     provider='XLA local GEMM')
-    backend = plan.backend
     if backend not in ('cusolvermp', 'cublasmp'):
         raise ValueError('distributed GEMM workspace query supports cublasmp only')
-    ctx = (plan.ctx_handle if isinstance(plan, GemmPlan)
-           else get_or_init_context(plan.mesh, col_major=False))
+    ctx = ctx_handle if ctx_handle is not None else get_or_init_context(mesh, col_major=False)
     device, host = _vendor_query(ctx, 'gemm', (m,n,k), dtype.str)
     return dict(device_bytes=device, host_bytes=host, vendor_device_bytes=device,
                 dynamic_xla_scratch_bytes=0, local=False,
                 formula='one vendor workspace shared by all batch slices; retained by native context',
                 provider='cublasMp')
+
+
+def matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend='auto',
+                                    batched_route='batch_reshard'):
+    """Query the actual eager matmul route, independently of any eigh plan.
+
+    ``shapes`` are effective N,N rank-2/3 operand shapes after any endpoint
+    transpose; ``dtype`` is float64/complex128. Returns device workspace
+    bytes per rank. Operand transpose staging and output storage are not
+    workspace and must be admitted separately by the caller.
+    """
+    from distrib_la.matmul import resolve_matmul_backend
+    from distrib_la.plan import ROUTE_BATCH_RESHARD
+    shapes = _shapes(shapes)
+    dtype = np.dtype(dtype)
+    if dtype not in (np.dtype('float64'), np.dtype('complex128')):
+        raise TypeError('workspace query supports float64 and complex128')
+    if any(d.platform != 'gpu' for d in mesh.devices.flat):
+        raise ValueError('workspace query currently supports CUDA plans only')
+    if (len(shapes) != 2 or len(shapes[0]) not in (2, 3)
+            or len(shapes[1]) != len(shapes[0])
+            or shapes[0][:-2] != shapes[1][:-2]
+            or shapes[0][-1] != shapes[1][-2]):
+        raise ValueError('GEMM shapes must be matching N,N matrix or batched operand shapes')
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    m, k, n = shapes[0][-2], shapes[0][-1], shapes[1][-1]
+    if any(v % axis for v, axis in ((m,px),(k,px),(k,py),(n,py))):
+        raise ValueError('GEMM shapes must tile the plan mesh')
+    route = str(batched_route).strip().lower()
+    provider = resolve_matmul_backend(backend, mesh, batched_route=route)
+    return int(_gemm_workspace_details(mesh, shapes, dtype,
+        local=route == ROUTE_BATCH_RESHARD, backend=provider)['device_bytes'])
 
 
 def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:

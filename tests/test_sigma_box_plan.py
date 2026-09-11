@@ -867,7 +867,8 @@ def test_old_cache_namespace_is_not_opened(monkeypatch, tmp_path):
     result, warnings = _rule_cache_lookup(
         str(tmp_path), (-2., -.3, .05, .4), 1e-4, True,
         noise_amplification_cap=1e9, reduction_steps=10)
-    assert result is None and not warnings
+    assert result is None and len(warnings) == 1
+    assert "schema migration" in warnings[0] and "ignored 1 legacy" in warnings[0]
 
 
 @pytest.mark.parametrize("steps", [None, 0, 10])
