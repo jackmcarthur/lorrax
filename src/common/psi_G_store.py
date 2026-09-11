@@ -347,10 +347,9 @@ class PsiGStore:
             # ~1.3 GB/rank wasted by V_q time (agent_h §3 Finding 3).
             self._g_index_dev = self.loader.box_index_dev(
                 k="full_bz", mesh=self.mesh)
-            kgrid = np.asarray(self.meta.kgrid, dtype=np.float64)
             sym = self.loader.symmetry()
             kvecs_frac = np.asarray(
-                sym.kvecs_asints, dtype=np.float64) / kgrid[None, :]
+                sym.unfolded_kpts, dtype=np.float64)
             # Process-local placement — see
             # ``common.collectives.device_put_process_local``: on a
             # multi-process mesh ``jax.device_put(numpy, sharding)``

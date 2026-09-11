@@ -1139,8 +1139,8 @@ def fit_zeta_to_h5(
     # ========== STEP 5: Pre-load G-space for all band chunks (ONCE) ==========
     # This caches the expensive HDF5 read + scatter so we don't repeat it
     # for each r-chunk. Memory cost depends on band_range_full (can be large).
-    kgrid_arr = np.array(meta.kgrid)
-    kvecs_frac = sym.kvecs_asints / kgrid_arr[None, :]
+    # Same physical k representatives as the loader's full-BZ G vectors.
+    kvecs_frac = np.asarray(sym.unfolded_kpts, dtype=np.float64)
 
     # Uniform band chunks over [b_full_start, b_full_end]: N-1 of
     # size ``band_chunk_size`` plus one remainder chunk.  This gives

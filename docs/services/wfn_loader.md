@@ -71,6 +71,17 @@ for the real one, which is exactly what the deleted shim was.
 
 ## Contract
 
+* **k and G are a paired representation.** Full-BZ loading uses canonical
+  fractional k-points in `[0, 1)`, including identity-only files with negative
+  QE k-points. The symmetry map supplies the integer shift
+  `J = k_full - S k_file`; the loader returns `G_full = S G_file - J`,
+  preserving physical `k + G`. Raw IBZ loading preserves the file convention.
+  Bloch phases must use `sym.unfolded_kpts`, the same physical coordinates
+  used to build the full-BZ G table. `kvecs_asints` are lookup indices only:
+  dividing them by `kgrid` also loses a shifted mesh's fractional offset.
+  `tests/test_negative_k_loading.py` checks centroid, streamed and cached
+  wavefunctions against an independent plane-wave sum for signed/rebased
+  inputs and shifted grids, without assuming time-reversal symmetry.
 * **The padding contract is a conjunction.** Band-axis pad rows of ψ are
   zero. G-axis pad columns of ψ are zero AND the matching `gvecs` rows
   beyond `ngk_valid` hold the pad sentinel (the Nyquist-corner Miller

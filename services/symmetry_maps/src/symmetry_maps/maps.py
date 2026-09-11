@@ -1587,8 +1587,13 @@ class SymMaps:
                 self.sym_mats_k if self.trs_allowed else _sym_mats_k)
             self.translations = np.zeros((1, 3), dtype=np.float64)
 
-            # In no-symmetry case, unfolded grid equals irreducible grid
-            self.unfolded_kpts = np.asarray(wfn.kpoints, dtype=float)
+            # Full-BZ wavefunctions use the canonical [0, 1) k representative,
+            # including when the file contains a signed, unreduced QE grid.
+            # get_umklapp_vector then supplies J = k_full - k_file, and the
+            # loader shifts G -> G - J: k + G (and hence psi) is unchanged.
+            # Merely wrapping the Bloch phase would multiply psi by exp(iJ.r).
+            self.unfolded_kpts = np.mod(
+                np.asarray(wfn.kpoints, dtype=float), 1.0)
 
             # Maps: each full k maps to itself; only identity symmetry
             self.irr_idx_k = np.arange(self.unfolded_kpts.shape[0], dtype=np.int32)
