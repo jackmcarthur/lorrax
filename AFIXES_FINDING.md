@@ -1,65 +1,52 @@
-# AFIXES — provisional finding, 2026-09-11
+# AFIXES — lane note, 2026-09-11
 
-Heavy lane. **Prepared repairs; no merge clearance.** Base `810c260b`, branch
-`lane/sp-afixes-2026-09-11`. The assigned SP-M2 allocation `58190627` remains
-PENDING. No AFIXES job.step or numerical measurement exists yet. Syntax parsing
-and `git diff --check` pass; these are not substitutes for the requested gates.
+Branch `lane/sp-afixes-2026-09-11`, control `810c260b`, candidate **`58a1aad1`**
+(was `ff02272a` when this session opened; `58a1aad1` adds the refusal-fidelity
+repair below). Worktree `/pscratch/sd/j/jackm/wt_sp_afixes`.
 
-Evidence directory:
-`/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/frequency_integration_sandbox/364_afixes_20260911/`.
-The detached supervisor's `supervisor.json` owns current execution state.
+Pool **58209192** (`lx-alloc-jackm-SP-INT2`, interactive, 4 nodes), shared with
+ACARRY and ACONJ. The originally assigned SP-M2 pool `58190627` was **cancelled**
+before it ever ran, which is why the prepared supervisor stopped; interactive
+QOS is at its per-user submit limit, so this lane took no new pool.
 
-## Claim dispositions
+Full write-up with every number and its job.step:
+`reports/shared_pole_push_2026-09-07/afixes/report.md`.
+Evidence root: `runs/frequency_integration_sandbox/364_afixes_20260911/`.
 
-| Item | Source finding and disposition | Verification still owed |
+## Dispositions
+
+| Item | Disposition | Evidence |
 |---|---|---|
-| 1a | **Fixed in candidate.** The restart metadata read preceded collective payload authentication with no error agreement. Agree serial-read errors first, then agree the membership hash (including absence), so only unanimous absence is rebuildable. Preserve an existing `SharedPoleMemberRefused` without adding its suffix again. The model validator had a second serial-HDF5/collective boundary; it now agrees metadata failures before digest entry too. | Real P4 rank-local OSError red twin; missing/refused/roundtrip contracts; all-parent production gate. |
-| 1b | **Fixed in candidate.** `b` was assigned; `local` was initialized; only `shard` was potentially unbound. Removing the unsafe deletion and releasing local references by assignment handles an empty shard list. | Empty-addressable-shards digest test; real model authentication. |
-| 2a | **Fixed in candidate.** Reconstruct and authenticate the stored eps/relative and all other certificate fields before compatibility filtering. A one-ULP request can reuse the original immutable stored certificate. | Stored-eps and relative corruption red twins; adjacent-ULP request hit; certifying production rules. |
-| 2b | **Fixed visibility/invalidation; pruning deliberately deferred.** List the bounded directory's old `rule_*.npz` names without loading them and issue a schema-migration warning with directory, count, example, rebuild consequence and retention/removal guidance. Old files remain invalid. Automatic removal/movement would mutate potentially completed evidence runs, contrary to this brief's immutability rule; no new prune dial was introduced. | Legacy filename warning/no-open test and ordinary operator output. |
-| 3 | **Measurement prepared; no production source change.** Source confirms the denser acceptance cloud. Run364/02_cloud_density uses one recorded Na B04 crossing box, NumPy, one BLAS thread, 120 seconds on both arms. It instruments completed removal-pass counts in the existing owner and reports both own-cloud and common-dense-cloud sup errors, retained nodes and planning seconds. | Execute both arms; no measured ratio, slowdown, extra-node count or budget conclusion yet. |
-| 4 | **Fixed in candidate, conditional on exactness gate.** The only production `finite_pencil_column` call passes identical Q/output objects. Reuse `adjoint(O†Q)` there; preserve the general second GEMM when either panel differs. Removing a product is algebraically sound but does not establish bit-exact fitted models or a timing win. | Distinct-panel/aliased-panel contracts; exact Si/Na parents; band control, repeat and candidate timings. |
-| 5a | **Fixed for the production local batch-reshard route; distributed optimization deliberately deferred.** Validate after the eigensolver's existing face-to-batch exchanges, inside the same executable. A local reduction checks the original tolerance; invalid input skips eigh and returns a NaN spectrum so the existing replicated-spectrum readback refuses on every rank. No trust-me flag or Hermitian projection. Arbitrary distributed off-diagonal tiles still require peer information, so that route keeps its safety check. | Optimized HLO on every P4 rank must show no additional all-to-all relative to the ordinary eigensolver; inspect reduction temporaries; invalid Hermitian/NaN twins; production peaks. No HLO result claimed. |
-| 5b | **Fixed in candidate.** GEMM workspace resolves through the same matmul provider/route as execution, independent of the eigh plan. The service retains one vendor-query implementation. Constructor admission separately prices distributed operand-transpose staging; the query is explicitly workspace-only. | Wrong-handle/provider-route contract; real-P4 workspace and production peak gates. |
-| 6a | **Fixed in candidate.** Split the existing bank writer's preparation, admitted payload write and mask/finalization owners. Ordinary callers retain pre-open validation and resumable commits. Export authenticates the source once, initializes its destination once, keeps one append handle through the copy, drains each field, then publishes masks and finalizes after close. No second bank implementation. | Exhaustive planted W/dW/M1/M3 byte parity and destination-open-count contract; production export band/bytes. No export speedup measured. |
-| 6b | **Fixed in candidate.** Reject empty `wfn_file` at deck parsing for requested exports; require the loader's public `path` before screening starts. Both fresh and restart exports use that path. The private `_filename` fallback is gone. | Early-refusal test, config contracts and production outputs. |
-| 6c | **Fixed in candidate.** The `_NULLABLE_INT` branch now accepts `none` uniformly for its members. No budget defaults, currencies or stopping rules changed. | Parameterized nullable-member parse test. |
-| 6d | **Fixed in candidate.** Common solver messages name `solve_smearing_occupations`; invalid width names kBT for FD and BerkeleyGW half-width for MP1, in Ry. | Both-family diagnostic test. |
+| 1a `tagged_arrays.py:218` | **Repaired.** Agree the serial-read error and the membership hash before the collective validator; stop double-wrapping `SharedPoleMemberRefused`. Plus a second defect this session identified: the agreed receipt truncates at 240 characters (`common/collectives.py:1422`) and lost the reason on this tree's long paths. `file_io/commit_state.py:agree_io_refusal` is now the one owner for both readers. | 58209192.8 red (reason truncated), 58209192.11 green on 4 ranks |
+| 1b `shared_pole_store.py:543` | **Repaired; diagnosis narrowed.** Only `shard` could be unbound — `b` is bound at `:531` and `local = None` at `:533`. | `test_digest_empty_addressable_shards`, 58209192.11 |
+| 2a `sigma_box_plan.py:342` | **Repaired.** Authenticate the stored `eps`/`relative`, then filter; an adjacent-ULP request now reuses the certificate instead of discarding it. | `test_cache_one_ulp_request_reuses_authenticated_stored_eps`, 58209192.4 (P1, 150 passed) |
+| 2b `sigma_box_plan.py:297` | **Repaired for visibility and invalidation; pruning deliberately deferred** (removing files would mutate completed evidence, and a prune dial is forbidden). Live example: run 337's Na cache holds **twelve** readable `rule_<digest>.npz` files invisible to the current listing. | `test_old_cache_namespace_is_not_opened`, 58209192.4 |
+| 3 acceptance cloud | **Measured, nothing changed.** 4.99x cloud costs exactly **one removal pass** and **one extra tau node** on two independent Na crossing boxes; the accepted rule is slightly more accurate; planning wall did not rise. Exactly reproducible on repeat. | 58209192.4 and 58209192.12 |
+| 4 `shared_pole_constructor.py:104` | **Repaired.** One production call site, aliased panels, so `b` is identically `a^H`; the general two-GEMM path is kept for distinct panels. | `test_pencil_alias_and_distinct_panels`; Si band below |
+| 5a `polar.py:206` | **Repaired on the production (batch_reshard) route; distributed route deliberately deferred.** The validation now costs **zero** collectives; the pre-check it replaced cost 3 all-gathers + 1 all-reduce and a 3.2x temporary. XLA lowers it as all-gather + all-reduce, **not** all-to-all. | HLO census on every rank, 58209192.11 |
+| 5b `shared_pole_constructor.py:764` | **Repaired.** Workspace resolves through the matmul route, not the eigh plan; transpose staging priced separately and is **zero** on both reference decks. | `test_afixes_workspace.py`, 58209192.11 |
+| 6a `shared_pole_store.py:1149` | **Repaired.** 1624 header validations and 1624 collective opens on Na become one validate and one append handle. | `test_shared_pole_outputs.py` asserts `['w','a']` and one validate; 58209192.11 |
+| 6b `shared_pole_screening.py:150`/`:224` | **Repaired.** Public `wfn.path`, resolved and refused before any screening work; empty `wfn_file` rejected at deck parse. | two contracts, 58209192.11 |
+| 6c `gw_config.py:3211` | **Repaired.** Membership in `_NULLABLE_INT`, not a literal key name. | `test_nullable_integer_none_is_uniform` |
+| 6d `efermi.py:502` | **Repaired.** Messages name `solve_smearing_occupations`; the width names kBT for FD. | `test_smearing_width_diagnostic_names_family` |
 
-## Gate plan and scope
+## Registered, not fixed here
 
-`01_contracts_p4/payload.sh` combines focused contracts, planted export/bank
-checks, rank-skew fault injection, every-rank optimized HLO and the scalar cloud
-experiment in one P4 dispatch. Production arms in `03_si_p4` and `04_na_p16`
-reuse Run350's full-driver ANEST wrapper, Run337's measurement owner and
-Run341's exact-input comparator. Each system has a fresh control, identical
-control repeat, candidate off and outputs-on (W plus poles) arm. Step limits use three times
-the matched historical launcher duration recorded in `arms.json`.
+- `common/collectives.py:1422` — the agreed I/O receipt truncates the reason at
+  240 characters. Not this lane's file; in `KNOWN_LORRAX_ISSUES.md`.
+- `tests/test_sigma_box_plan.py` — P=1-only by construction and unmarked
+  (`sigma_box_plan.py:601` shards windows over `process_count`). At P4 it
+  reports 20 failures that are pure harness artifacts; 150-green at P1 on the
+  same source. In `KNOWN_LORRAX_ISSUES.md`.
 
-All Si/Na parent models must be exact; every rank's peak must not increase;
-every selected rule must certify; Sigma max change must be <=2 meV.
-Bit-identical Sigma is **not** required. Published band spreads remain the
-reference; wall differences alone will not be called a speedup. Existing CD
-receipts may be reused only after the exact-input owner passes. No Run258/CD
-accuracy, storage, J/K/r, passivity value, model condition, or timing number is
-claimed for this unexecuted candidate.
+## Scope
 
-`src/gw/mpa/sigma.py` and production
-`services/minimax/src/minimax/uniform_rule.py` are untouched. No main push,
-history rewrite, pool creation, completed-run mutation, or login-node HDF5/test
-execution occurred. Constructor merge overlap with ACONJ is restricted to the
-finite-product shortcut and workspace/admission helper; direction selection
-and its partner/covariance changes remain owned by ACONJ.
+`src/gw/mpa/sigma.py` untouched (ACARRY). `shared_pole_constructor.py:511-560`
+untouched (ACONJ). `services/minimax/src/minimax/uniform_rule.py` untouched —
+changing the acceptance density is the owner's call. Budget policy, currency,
+defaults and wall-clock termination in `sigma_box_plan.py` untouched. No new
+dial, env var, cache, fast path or magic constant.
 
-## Open items
-
-Compute is the blocking dependency. The prepared supervisor pins SP-M2 and
-stops on missing/failed artifacts, independent of launcher rc. Review its first
-contract results before interpreting any later production data. Full export payload postprocessing uses the existing bounded Run350 comparator
-after the final collective process in each outputs-on step; no later collective
-startup follows the rank-zero comparison.
-
-The deployed `lx status` rejects `--jid`; the runner uses its inherited job
-selector and verifies the printed JID against exact `scontrol` state. Every
-`lx run` still has explicit `--jid 58190627`. If the inherited selector does not
-pin correctly, the supervisor refuses instead of taking another pool.
+**Bit-identical Sigma is not required (ruling 65d).** Never combine figures
+across source assemblies or job.steps: control arms run `810c260b`, candidate
+arms `58a1aad1`, both in the same session on the same pool and node.
