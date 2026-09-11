@@ -1110,6 +1110,56 @@ def _export_spatial_header(path, source_wfn, meta, *, kind, source):
     rank0_transaction(path, stage="shared_pole.export_headers", write=append)
 
 
+#: The exact export names one self-consistent map owns. Used twice and only
+#: here: as the eligibility test for the export just written, and as the scan
+#: pattern that releases its predecessors. A one-shot export ("oneshot_w.h5")
+#: does not match, so it neither scans nor is scanned for.
+_MANAGED_EXPORT = r"sc_[0-9]{4}_(?:poles|w)\.h5"
+
+
+def _retain_current_map_exports(targets, *, run_dir, label, identity, mesh_xy,
+                                print_fn):
+    """Release earlier maps' exports once this map's are proven complete.
+
+    An export is named for its map, so under self-consistency an N-map run
+    would otherwise leave N full banks on disk -- a cost linear in maps. Only
+    the exact managed names ``sc_NNNN_{poles,w}.h5`` are eligible, and only
+    when the export just written is itself one of them, so a one-shot run
+    scans nothing, unlinks nothing and takes no extra collective.
+
+    Order is write, authenticate, then release: the current export is read
+    back through the store's own commit and digest owners before anything is
+    unlinked, so a predecessor is discarded only after its replacement exists
+    and is complete. Scanning rather than unlinking only ``N-1`` also clears
+    managed exports a longer earlier run left in the same scratch directory.
+    This is ``gw.mpa.model.retain_iteration_artifacts``'s rule for the
+    shared-pole exports, through the same removal owner.
+    """
+    import os
+    import re
+    from gw.qsgw_utils import remove_managed
+
+    if not targets or not all(re.fullmatch(_MANAGED_EXPORT, path.name)
+                              for path in targets.values()):
+        return ()
+    for kind, path in targets.items():
+        if kind == "poles":
+            validate_shared_pole_model(path, expected_identity=identity,
+                                       mesh_xy=mesh_xy)
+        else:
+            validate_shared_pole_bank(path, expected_identity=identity,
+                                      mesh_xy=mesh_xy, require_complete=True)
+    root = os.path.abspath(os.fspath(run_dir))
+    removed = remove_managed(
+        root, _MANAGED_EXPORT,
+        keep=[os.path.join(root, path.name) for path in targets.values()],
+        barrier_tag=f"shared_pole_store.retain.{label}", print_fn=print_fn)
+    if removed:
+        print_fn(f"shared-pole exports: retained {label}; released "
+                 + ", ".join(sorted(removed)))
+    return tuple(sorted(removed))
+
+
 def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                                run_dir, label, tables, print_fn):
     """Export current-map poles and/or fixed W samples through their writers.
@@ -1120,6 +1170,9 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
     are reused; the source stores are immutable, including on restart.
     The bank export retains its derivative and moment companions so it is
     readable by the existing bank reader. No screening or pole fit is rerun.
+    A managed self-consistent export releases its predecessors once it is
+    itself authenticated (:func:`_retain_current_map_exports`), so the
+    retained set is one map, not one per map; a one-shot export is untouched.
     """
     source = Path(handle["path"])
     if source_wfn is None:
@@ -1207,4 +1260,6 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
         outputs["w"] = dict(path=str(path), payload_bytes=bank_header["payload_bytes"])
     for kind, receipt in outputs.items():
         print_fn(f"write_{kind}: {receipt['path']}; payload={receipt['payload_bytes']} bytes")
+    _retain_current_map_exports(targets, run_dir=run_dir, label=label,
+        identity=handle["identity"], mesh_xy=mesh_xy, print_fn=print_fn)
     return outputs
