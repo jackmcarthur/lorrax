@@ -25,7 +25,7 @@ shared_real_pole_v1_r3b = {
     "line_break_ev": 12.0,
     "line_low_step_ev": 0.5,
     "line_spacing_rule": "2*eta below 12 eV, 4*eta above; no material branch",
-    "line_high_step_ev": 1.0,
+    "line_high_step_ev": 0.5,
     "plasma_margin_ev": 3.5,
     "imaginary_floor_max_ev": 16.0,
     "imaginary_count_epsilon": 1.0e-3,
