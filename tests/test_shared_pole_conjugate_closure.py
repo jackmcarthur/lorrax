@@ -119,6 +119,15 @@ def check(mesh):
                 scope='P4 production selection/packing/local reduction; planted real and complex measures; former same-Q red twin')
 
 
+def test_conjugate_closure():
+    import jax
+    from jax.sharding import Mesh
+    from lxkit.testing import require_devices
+    require_devices(4, 'cpu')
+    mesh = Mesh(np.asarray(jax.devices('cpu')[:4]).reshape(2, 2), ('x', 'y'))
+    check(mesh)
+
+
 if __name__ == '__main__':
     from runtime import initialize_communicator_stack, run_main_and_finalize
     initialize_communicator_stack(platform='gpu')
