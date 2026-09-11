@@ -13,7 +13,7 @@ in this file, in execution order:
                                                            #   4-branch τ-integration]
                                                            #   ⊕ q→0 head channel        (sigma_dispatch)
     Σ_total         = solve_qp(Σ) | run_sc_driver(...)     # update_H per qp_solver      (qsgw_utils, sc_iteration)
-    E_qp, U_qp      = eigh(kin_ion + Σ_total)              # + degenerate-set averaging  (degen_average)
+    E_qp, U_qp      = eigh(kin_ion + Σ_total)
 	eqp0/eqp1[/eqp2]/σ.dat = write_results(...)            # writers, debug tables       (gw_output)
 
 Two orthogonal config axes pivot the flow: ``compute_mode`` — the
@@ -114,7 +114,6 @@ from .sigma_dispatch import (
 from .qsgw_utils import solve_qp
 from .dynamic_sigma import extract_sigma_diag_logical
 from .degen_average import (
-	average_sigma_components,
 	average_within_degenerate_sets,
 )
 from .head_correction import (
@@ -1270,17 +1269,14 @@ def main(argv=None):
 	omega_grid_ry = (
 		np.asarray(sigma_result.omega_grid_ry, dtype=np.float64)
 		if sigma_result.omega_grid_ry is not None else None)
-	# ---- BGW-style degenerate-set averaging at the H-build seam ----
-	# (mirrors Sigma/shiftenergy.f90; see ``degen_average``).
+	# Average extracted reporting arrays only. Keep every full operator
+	# intact for diagonalization, including the one-shot Hamiltonian.
 	if not config.no_degen_averaging:
-		(sigma_total, sig_sx, sig_coh, sig_h, sig_h_scalar,
-		 h_transverse, sig_x,
-		 sigma_c_at_dft_ev) = average_sigma_components(
-			sigma_total, sig_sx, sig_coh, sig_h, sig_h_scalar,
-			h_transverse, sig_x, sigma_c_at_dft_ev,
-			energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-			tol_ry=float(config.degen_avg_tol_ry),
-			mesh_xy=mesh_xy)
+		if sigma_c_at_dft_ev is not None:
+			sigma_c_at_dft_ev = average_within_degenerate_sets(
+				np.asarray(sigma_c_at_dft_ev, dtype=np.complex128),
+				energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+				tol_ry=float(config.degen_avg_tol_ry))
 		# Head-only debug columns must undergo the SAME DFT-degenerate-set
 		# averaging as the Sigma components they decompose.  After the QP->DFT
 		# diagonal transform an occupied-projector contribution need not be
@@ -1323,12 +1319,12 @@ def main(argv=None):
 	from gw.qsgw_utils import static_sigma_diag_to_host
 	sig_x_diag_ry = static_sigma_diag_to_host(sig_x, mesh_xy)
 
-	# Σ_xc(E_DFT) diagonal (eV) — drives eqp_g0w0.dat (PPM one-shot
-	# only).  Form it AFTER the one canonical conditioning seam above: forming
-	# this sum before ``average_sigma_components`` made eqp_g0w0 retain raw,
-	# unequal degenerate diagonals even while every other live text output used
-	# the conditioned X/C pair.  With averaging disabled the seam is a no-op,
-	# so this same expression deliberately preserves the raw red twin.
+	if not config.no_degen_averaging:
+		sig_x_diag_ry = average_within_degenerate_sets(
+			sig_x_diag_ry, energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+			tol_ry=float(config.degen_avg_tol_ry))
+
+	# Report the sum of the extracted exchange/correlation diagonals.
 	sigma_xc_at_dft_ev = (
 		sig_x_diag_ry * RYD_TO_EV
 		+ sigma_c_at_dft_ev
@@ -1464,6 +1460,16 @@ def main(argv=None):
 	h_transverse_diag_ry = (
 		None if h_transverse is None
 		else static_sigma_diag_to_host(h_transverse, mesh_xy))
+	if not config.no_degen_averaging:
+		(sig_sx_diag_ry, sig_coh_diag_ry, sig_h_scalar_diag_ry,
+		 h_transverse_diag_ry) = (
+			None if diagonal is None else average_within_degenerate_sets(
+				diagonal, energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+				tol_ry=float(config.degen_avg_tol_ry))
+			for diagonal in (sig_sx_diag_ry, sig_coh_diag_ry,
+			                 sig_h_scalar_diag_ry, h_transverse_diag_ry))
+		sig_h_diag_ry = (sig_h_scalar_diag_ry if h_transverse_diag_ry is None
+		                 else sig_h_scalar_diag_ry + h_transverse_diag_ry)
 	sigma_lorentz_diag_skn_ry = None
 	if sigma_lorentz_skij_ry is not None:
 		sigma_lorentz_diag_skn_ry = np.stack([
@@ -1565,8 +1571,8 @@ def main(argv=None):
 			sigma_c_omega=sigma_c_omega,
 			print_fn=print0,
 		)
-		# Degen averaging was applied once at the H-build seam upstream;
-		# the writer just serializes the already-averaged Σ components.
+		# Only extracted reporting diagonals were averaged upstream;
+		# the full Hamiltonian and component operators remain unchanged.
 		write_results(
 			results,
 			sigma_diag_file=config.paths.sigma_diag_file,

@@ -179,12 +179,18 @@ right way to start a loop from a converged one-shot; it is not safe against a
 directory holding valid MPA pole stores it would overwrite.** Point a restart
 at a copy or a variant directory (sandbox rule: never mutate a completed run).
 
-**8. Degeneracies are symmetrized only when exact.** `sc_exact_degeneracy_tol_ev`
-is 0.1 meV, deliberately below any physical splitting (MoS2's SOC-split K pair
-is 1.7–3.6 meV). Do not raise it to make a loop converge; a near-degenerate
-pair that will not settle is a window-edge or state-identity problem
-(protected windows must close multiplets at every k), never a reason for
-damping.
+**8. Keep the computed full SC correction in degenerate subspaces.**
+Averaging only its diagonal while retaining off-diagonals depends on the
+arbitrary DFT basis within a degenerate manifold and can introduce symmetry
+breaking. The iteration map and final Hamiltonian diagonalizations therefore
+retain the full operator; BGW averaging applies only to extracted reporting
+diagonals, controlled by
+`no_degen_averaging`. This does not project a block onto a multiple of the
+identity or impose time reversal.
+
+`sc_exact_degeneracy_tol_ev` remains 0.1 meV for state identity and frontier
+tail grouping. Do not raise it to make a loop converge; protected windows
+must close multiplets at every k, and resolved SOC splittings remain distinct.
 
 **9. Budget.** A healthy loop converges in 13–15 maps. If the residual has
 not fallen below 1 meV by map 20 it will not converge at 60; stop and fix the

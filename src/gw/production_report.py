@@ -241,11 +241,15 @@ class GWProductionReport:
         self.emit("Spin channels  : " + (
             "charge + transverse current (bispinor)"
             if bool(getattr(config, "bispinor", False)) else "charge (scalar)"))
-        self.emit("Degenerate sets: " + (
-            "left in the input gauge" if bool(getattr(
-                config, "no_degen_averaging", False))
-            else "averaged at "
-            f"{float(getattr(config, 'degen_avg_tol_ry', 0.0)) * RYD_TO_EV:.5e} eV"))
+        if solver == "self_consistent":
+            self.emit("Degenerate sets: full SC operators retained; "
+                      "no diagonal averaging in the iteration map")
+        else:
+            self.emit("Degenerate sets: " + (
+                "left in the input gauge" if bool(getattr(
+                    config, "no_degen_averaging", False))
+                else "reporting diagonals averaged at "
+                f"{float(getattr(config, 'degen_avg_tol_ry', 0.0)) * RYD_TO_EV:.5e} eV"))
         self.emit("ISDF state     : " + (
             "restart requested" if bool(getattr(config, "restart", False))
             else "fresh fit requested"))

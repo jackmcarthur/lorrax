@@ -4603,9 +4603,10 @@ class SCConfig:
     - ``history_depth``: rCROP history (m=5 is BGW's QSGW default).
     - ``mixing``: linear-mixing α (``accelerator="linear"`` only).
     - ``dump_dir``: per-iteration E/U-history .npy dump dir (None = off).
-    - ``exact_degeneracy_tol_ev``: maximum splitting for the symmetric
-      accidental-degeneracy average.  The default is 0.1 meV; physical SOC
-      splittings above it remain distinct states.
+    - ``exact_degeneracy_tol_ev``: maximum splitting for SC state-identity
+      and frontier-tail grouping.  The default is 0.1 meV; physical SOC
+      splittings above it remain distinct states. Full SC operators are
+      not diagonally averaged.
     - ``tail_fit``: ``"frontier"`` uses the lowest accidental-degeneracy
       conduction manifold for the energy-only sum-band tail;
       ``"all_conduction"`` is the historical affine-fit diagnostic control;

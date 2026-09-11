@@ -310,12 +310,9 @@ def main():
         emit('gamma_band_operator',label=label,imaginary_relative=float(relative),
              imaginary_absolute=float(absolute),norm=float(norm),matrix=stats(value[:1]))
 
-    from gw import degen_average
-    original_average = degen_average.average_matrix_diagonal
     original_sigma = sc.compute_sigma_xc
     original_partition = sc._apply_scissor_partition_policy
     original_output_seam = sc._sc_output_tables_on_loop_kset
-    average_index = 0
     full_k_records = []
 
     def output_seam(sigma_result, delta_h_qp_full, delta_h_qp_unextrap_full,
@@ -372,18 +369,6 @@ def main():
                                     delta_h_qp_unextrap_full, sigma_basis_U_full,
                                     exact_hartree_full, kstar)
 
-    def average(value, **kwargs):
-        nonlocal average_index
-        observed = args.first_map_stages and stage_wfns is not None
-        if observed:
-            band_operator(f'degen_{average_index}_before',value)
-        result = original_average(value,**kwargs)
-        if observed:
-            band_operator(f'degen_{average_index}_after',result)
-            band_operator(f'degen_{average_index}_removed',value-result)
-            average_index += 1
-        return result
-
     def sigma(*pos, **kwargs):
         result = original_sigma(*pos,**kwargs)
         if args.first_map_stages:
@@ -416,7 +401,6 @@ def main():
     sc.gw_iteration_map = observe_map
     rb.produce_sample_bank = produce
     rb._bank_execution = execution
-    degen_average.average_matrix_diagonal = average
     sc.compute_sigma_xc = sigma
     sc._apply_scissor_partition_policy = partition
     sc._sc_output_tables_on_loop_kset = output_seam
@@ -490,7 +474,6 @@ def main():
         sc.gw_iteration_map = original_map
         rb.produce_sample_bank = original_produce
         rb._bank_execution = original_execution
-        degen_average.average_matrix_diagonal = original_average
         sc.compute_sigma_xc = original_sigma
         sc._apply_scissor_partition_policy = original_partition
         sc._sc_output_tables_on_loop_kset = original_output_seam

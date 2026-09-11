@@ -196,7 +196,7 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
             "(diagonal on-shell), self_consistent (rebuild G/W/Sigma)") in text
     assert "EQP2 treatment  : off (set write_eqp2=true" in text
     assert "RPA Dyson series; minimax imaginary-axis quadrature" in text
-    assert "Degenerate sets: averaged at 1.36057e-05 eV" in text
+    assert "Degenerate sets: reporting diagonals averaged at 1.36057e-05 eV" in text
     assert " Ry" not in text and "Rydberg" not in text
     assert "Coulomb system : 2D slab; Hartree=live G-space" in text
     assert "Full BZ grid   : 2 k points" in text

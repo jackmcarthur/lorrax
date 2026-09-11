@@ -3478,23 +3478,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             if transverse is None else
             _add_exact_four_current_hartree(
                 delta_h_dft, scalar, transverse))
-    # Symmetric averaging is confined to accidental/exact degeneracies.  It
-    # is intentionally NOT tied to ``degen_avg_tol_ry``: that general output
-    # convention may be user-expanded, while QSGW state identity must never
-    # erase a resolved SOC splitting to make a trajectory converge.  Average
-    # the correction, not H itself, so the immutable DFT splitting survives.
-    e_dft_map = inputs.e_dft_active_kn_ry
-    if not ks.is_identity:
-        e_dft_map = ks.select(e_dft_map)
-    if not bool(getattr(inputs.config, "no_degen_averaging", False)):
-        from .degen_average import average_matrix_diagonal
-        delta_h_dft = average_matrix_diagonal(
-            delta_h_dft,
-            energies_kn_ry=np.asarray(e_dft_map, dtype=np.float64),
-            tol_ry=(float(inputs.config.sc.exact_degeneracy_tol_ev)
-                    / RYD_TO_EV),
-            mesh_xy=inputs.mesh_xy,
-        )
+    # Keep the computed full operator. Replacing only its diagonal by a
+    # degenerate-block mean depends on the arbitrary DFT basis within that
+    # block and can create symmetry breaking in the next SC state. BGW
+    # diagonal averaging belongs to the one-shot/output convention.
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
     if (buffer_mask.any()
             and inputs.config.sc.buffer_mode == "carry"
@@ -3524,14 +3511,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 if transverse is None else
                 _add_exact_four_current_hartree(
                     delta_h_dft_n3, scalar, transverse))
-        if not bool(getattr(inputs.config, "no_degen_averaging", False)):
-            delta_h_dft_n3 = average_matrix_diagonal(
-                delta_h_dft_n3,
-                energies_kn_ry=np.asarray(e_dft_map, dtype=np.float64),
-                tol_ry=(float(inputs.config.sc.exact_degeneracy_tol_ev)
-                        / RYD_TO_EV),
-                mesh_xy=inputs.mesh_xy,
-            )
         _report_extrapolation_eqp_shift(
             H_qp_dft_full, inputs.kin_ion_dft + delta_h_dft_n3,
             mesh_xy=inputs.mesh_xy, n_occ=n_occ,
