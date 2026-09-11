@@ -984,11 +984,12 @@ def endpoint_panel_cost(shape, n_children, *, mesh, mesh_axis, dtype):
         raise ValueError("endpoint panel requires [parents,mu,spin,K] and axis x|y")
     b, m, spin, k = map(int, shape)
     parts = int(mesh.shape[mesh_axis])
-    if min(b, m, spin, k, int(n_children)) < 1 or m % parts:
+    column_parts = int(mesh.shape["y" if mesh_axis == "x" else "x"])
+    if min(b, m, spin, k, int(n_children)) < 1 or m % parts or k % column_parts:
         raise ValueError("endpoint panel extents must be positive and tile its axis")
     item = np.dtype(dtype).itemsize
-    parent_bytes = b * (m // parts) * spin * k * item
-    child_bytes = int(n_children) * (m // parts) * spin * k * item
+    parent_bytes = b * (m // parts) * spin * (k // column_parts) * item
+    child_bytes = int(n_children) * (m // parts) * spin * (k // column_parts) * item
     # Replicated metadata: source offsets, wraps, phases, action and q rows.
     metadata = int(n_children) * (m * (4 + 24 + 16) + 24 + spin * spin * item)
     return dict(estimated_live_bytes_per_rank=2 * parent_bytes + 6 * child_bytes + metadata,
@@ -1003,7 +1004,8 @@ def unfold_endpoint_panel(factor_face, *, irr_idx, sym_idx, q_irr_frac,
                           max_live_bytes):
     """Route and transform a bounded factor panel through the ψ action owner.
 
-    factor_face[parents,mu,spin,Kpanel] uses P(None,mesh_axis,None,None).
+    factor_face[parents,mu,spin,Kpanel] tiles mu over mesh_axis and K over
+    the other mesh axis, exactly like the two wavefunction faces.
     irr_idx/sym_idx[children] name only the requested bounded child-q panel;
     source_perm and L_table are complete packed operation tables. No all-star
     factor cache is constructed. A ring sends one local child panel at a
@@ -1052,7 +1054,7 @@ def unfold_endpoint_panel(factor_face, *, irr_idx, sym_idx, q_irr_frac,
         cost.update(ring_steps=0, ring_bytes_per_rank=0)
     if cost['estimated_live_bytes_per_rank'] > int(max_live_bytes):
         raise ValueError(f"endpoint panel exceeds max_live_bytes: {cost}")
-    spec = P(None, mesh_axis, None, None)
+    spec = P(None, mesh_axis, None, "y" if mesh_axis == "x" else "x")
     sh = NamedSharding(mesh, spec)
     # Under an outer jit the input is a tracer, without a concrete sharding.
     # shard_map's in_specs below own its traced layout. Concrete eager inputs
@@ -1068,7 +1070,7 @@ def unfold_endpoint_panel(factor_face, *, irr_idx, sym_idx, q_irr_frac,
 @lru_cache(maxsize=None)
 def _endpoint_panel_kernel(mesh, mesh_axis, is_local, n_sym_spatial):
     """Reuse the endpoint action; changing symmetry tables are traced data."""
-    spec = P(None, mesh_axis, None, None)
+    spec = P(None, mesh_axis, None, "y" if mesh_axis == "x" else "x")
     parts = int(mesh.shape[mesh_axis])
     # The permutation is already routed below. The common ψ owner applies
     # its phase/TR/spin rule with an identity local gather afterwards.

@@ -421,3 +421,17 @@ Re-derived 2026-08-07 from `SymMaps(wfn)`, both decks have 5 stars
 STRONGEST in-tree discriminators, not no-ops. The fix that commit landed is
 unaffected; the corrected tables live in
 `services/symmetry_maps/tests/data/star_tables_e9340d1.json`.
+
+## Shared-pole endpoint panels
+
+`unfold_endpoint_panel` retains both matrix-axis tilings of the wavefunction
+carrier: `[parent,mu,spin,K]` uses `P(None,'x',None,'y')` or
+`P(None,'y',None,'x')`. K must tile the complementary mesh axis.
+`endpoint_panel_cost` prices each rotating panel with that same two-axis
+divisor. The existing spatial ring transports only the rank-local K slice;
+phase, spin and antiunitary actions remain in `unfold_wavefunction_local`.
+The caller keeps the causal weight separate from these factors.
+
+CPU emulated-mesh checks exercise changed tables, nonlocal permutations,
+complex antiunitary actions and capacity refusals. Those tests do not certify
+GPU compiler buffer assignment or application peak memory.

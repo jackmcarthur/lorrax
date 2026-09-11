@@ -32,12 +32,14 @@ def main(rt):
         qirr=dict(irr_idx_q=np.arange(Q,dtype=np.int32)%b,sym_idx_q=np.zeros(Q,np.int32),
                   sym_perm=np.arange(n,dtype=np.int32)[None,:],L_table=np.zeros((1,n,3),np.int32),
                   q_irr_frac=np.zeros((b,3)),n_sym_spatial=1))
+    header.update(representation='scalar-trs-even-s', grid=(8,8,8),
+                  q_irr_full_idx=np.arange(b))
     schedule=_shared_pole_memory_schedule(meta,header,mesh_xy=mesh)
     freq=[np.linspace(.1,10,K)]*b
     def panel(_io,span,*,meta,header,column_span=None):
         lo,hi=span;c0,c1=column_span or (0,K)
         shape=(hi-lo,m,1,c1-c0)
-        specs=(P(None,'x',None,None),P(None,'y',None,None),P(),P())
+        specs=(P(None,'x',None,'y'),P(None,'y',None,'x'),P(),P())
         @partial(jax.jit,out_shardings=tuple(NamedSharding(mesh,s) for s in specs))
         def create():
             C=jnp.broadcast_to((jnp.arange(m)<n)[None,:,None,None],shape).astype(jnp.complex128)/np.sqrt(K)

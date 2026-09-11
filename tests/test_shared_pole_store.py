@@ -138,10 +138,13 @@ def check_roundtrip(mesh,path,layout="local"):
             cx,cy,lam,k=store.read_shared_pole_faces(io,(0,3),meta=meta,header=header,column_span=columns)
             start,stop=(0,5) if columns is None else columns
             for face,axis in ((cx,'x'),(cy,'y')):
-                assert face.sharding.is_equivalent_to(NamedSharding(mesh,P(None,axis,None,None)),4)
-                _assert_local(face,packed[:,:,:,start:stop])
+                assert face.sharding.is_equivalent_to(NamedSharding(mesh,P(None,axis,None,"y" if axis == "x" else "x")),4)
+                expected=np.pad(packed[:,:,:,start:stop],
+                                ((0,0),(0,0),(0,0),(0,face.shape[-1]-(stop-start))))
+                _assert_local(face,expected)
             np.testing.assert_array_equal(np.asarray(k),np.clip(count-start,0,stop-start))
-            np.testing.assert_array_equal(np.asarray(lam),poles[:,start:stop])
+            np.testing.assert_array_equal(np.asarray(lam),np.pad(poles[:,start:stop],
+                ((0,0),(0,lam.shape[-1]-(stop-start))),constant_values=1))
         # Canonical staging can exceed packed extent; readers must honor the
         # basis's n_canonical rather than deriving it from logical n or P_x.
         from dataclasses import replace
@@ -149,8 +152,20 @@ def check_roundtrip(mesh,path,layout="local"):
         padded_meta.mu_basis = replace(meta.mu_basis,
                                        n_canonical=meta.mu_basis.n_canonical+int(mesh.size))
         cx,cy,_,_=store.read_shared_pole_faces(io,(0,3),meta=padded_meta,header=header)
-        _assert_local(cx,packed[:,:,:,:5])
-        _assert_local(cy,packed[:,:,:,:5])
+        _assert_local(cx,packed)
+        _assert_local(cy,packed)
+    # Inspect the actual two-axis pack boundary on every rank. The canonical
+    # owner performs a volume-preserving all-to-all round trip on each face;
+    # it must never turn this into a full-factor all-gather.
+    for axis in ('x','y'):
+        spec=P(None,axis,None,'y' if axis=='x' else 'x')
+        operand=jax.ShapeDtypeStruct((3,meta.mu_basis.n_canonical,1,6),np.complex128,
+                                    sharding=NamedSharding(mesh,spec))
+        compiled=meta.mu_basis._axis_kernel(1,spec,False).lower(operand).compile()
+        hlo=compiled.as_text()
+        assert 'all-gather(' not in hlo
+        assert 'all-to-all(' in hlo
+        Path(str(path)+f'.pack_{axis}_rank{jax.process_index()}.hlo').write_text(hlo)
     # Independent HDF5 inspection, no live collective handle. Fixture is tiny.
     def oracle():
         import h5py
