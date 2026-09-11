@@ -27,7 +27,12 @@ def parse(tmp_path, extra, *, head='off'):
 def test_default_mpa(tmp_path, model):
     c = parse(tmp_path, 'compute_mode=mpa\n' + model)
     assert (c.sigma.w_model, c.sigma.w_accuracy) == ('mpa', 'production')
-    assert not c.write_w and not c.write_poles
+    assert not c.debug.write_w and not c.write_poles
+
+
+def _output_flag(config, key):
+    """``write_w`` is the DEBUG sibling and lives in the ``debug`` group."""
+    return config.debug.write_w if key == 'write_w' else config.write_poles
 
 
 @pytest.mark.parametrize('key', ['write_w', 'write_poles'])
@@ -35,7 +40,34 @@ def test_shared_output_applicability(tmp_path, key):
     with pytest.raises(ValueError, match=key + '=true requires'):
         parse(tmp_path, f'compute_mode=mpa\n{key}=true\n')
     config = parse(tmp_path, f'compute_mode=mpa\nsigma_w_model=shared_pole\n{key}=true\n')
-    assert getattr(config, key)
+    assert _output_flag(config, key)
+
+
+def test_write_w_is_a_debug_key_announced_at_parse_time(tmp_path, capsys):
+    """Owner ruling 2026-09-11: the frequency-bank dump is a debug feature.
+
+    Two halves, both load-bearing.  It is carried in ``DebugConfig`` -- the
+    existing home for debug-only flags, the one ``write_qsgw_datasets``
+    names when it says it is NOT a debug flag -- so there is no top-level
+    ``config.write_w`` to mistake for a production output.  And the notice
+    fires at PARSE time, through the same rank-0 deck reporter the
+    retired-key report uses, not deep inside the Sigma stage: a run that
+    asked for tens of GiB of debug bytes learns so before it spends them.
+    ``write_poles`` stays a production export and says nothing.
+    """
+    quiet = parse(tmp_path, 'compute_mode=mpa\nsigma_w_model=shared_pole\n'
+                            'write_poles=true\nwfn_file=WFN.h5\n')
+    assert quiet.write_poles and not quiet.debug.write_w
+    assert 'WARNING -- DEBUG' not in capsys.readouterr().out
+    assert not hasattr(quiet, 'write_w')
+
+    loud = parse(tmp_path, 'compute_mode=mpa\nsigma_w_model=shared_pole\n'
+                           'write_w=true\nwfn_file=WFN.h5\n')
+    assert loud.debug.write_w
+    report = capsys.readouterr().out
+    assert 'WARNING -- DEBUG' in report and 'write_w = true' in report
+    # The documented reason, not just a scary box.
+    assert 'NOT needed for BSE' in report and 'write_poles' in report
 
 
 @pytest.mark.parametrize('head', [None, 'full', 'no_local_fields'])

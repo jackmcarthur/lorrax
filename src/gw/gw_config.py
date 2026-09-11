@@ -1570,8 +1570,29 @@ _DEFAULTS = {
     # the states those guards distinguish.
     "write_restart_tensors": True,
     # Standalone shared-pole outputs; internal construction stores remain required.
-    "write_w": False,
+    #
+    # ``write_poles`` is the PRODUCTION export and stays top-level beside
+    # ``write_restart_tensors``: it is a supported artifact with a stable
+    # format, and it is complete for a static-W consumer.  The model it
+    # writes is evaluated as ``Wc(s) = b (s - Lambda)^-1 b^dagger`` with
+    # ``s = z^2`` (gw.shared_pole_constructor, the ``weights = 1/(s-poles)``
+    # evaluation), so ``Wc(omega=0) = -b Lambda^-1 b^dagger`` EXACTLY, from
+    # the two datasets this key already exports.  Static screened
+    # ``W(0) = v + Wc(0)``.
+    #
+    # ``write_w`` is a DEBUG dump and lives in ``debug`` for the same reason
+    # ``write_qsgw_datasets`` does not (see its note below): it writes the
+    # whole fixed frequency sample bank, every sample of it, plus the
+    # derivative and moment companions.  Nothing downstream reads it.  It is
+    # also NOT a route to W(0): the bank's line ladder starts at ``E = 0``,
+    # i.e. ``z = 0 + i h`` with ``h = 4 eta``, so its first sample is
+    # ``W(i h)`` and the model above is the only exact ``omega = 0``.
+    # MEASURED on Na P16 (claim 2162, job 58166522.7): the bank export is
+    # 19.44 GiB against the pole export's 1.22 GiB, 16x, for bytes no
+    # consumer opens.  Owner ruling 2026-09-11.
     "write_poles": False,
+    # Debug (shared-pole)
+    "write_w": False,
     # ``write_qsgw_datasets``: does this run add the QSGW / QP-ladder
     # appendix to sigma_mnk.h5?  DEFAULT false, and false is exactly
     # today's file — these four datasets have had no producer since
@@ -2867,6 +2888,26 @@ def _resolve_shared_pole_inputs(params):
                 "sigma_w_model=shared_pole (fixed frequency-bank outputs)")
     if (params["write_w"] or params["write_poles"]) and not str(params["wfn_file"]).strip():
         raise ValueError("write_w/write_poles require a nonempty wfn_file source path")
+    # DEBUG STATUS, ANNOUNCED AT PARSE TIME.  ``write_w`` is off by default
+    # and is a debug dump (``config.debug.write_w``); it is the ONE deck key
+    # here whose cost is measured in tens of GiB, and the run that turned it
+    # on should learn that from the deck report next to the retired-key
+    # report, not from a directory listing hours later.  Same reporter, same
+    # ``WARNING -- DEBUG`` token the head-correction banner uses.
+    if params["write_w"]:
+        _print_deck_report(
+            "\n  ==========================================================\n"
+            "  WARNING -- DEBUG: write_w = true dumps the WHOLE shared-pole\n"
+            "  Wc frequency sample bank (every fixed sample, plus dWc_ds,\n"
+            "  M1 and M3) to <map>_w.h5.  This is a debugging output with\n"
+            "  no consumer in this tree; it is NOT needed for BSE.\n"
+            "  BSE's static W comes from write_poles: Wc(0) = -b Lambda^-1\n"
+            "  b^dagger is exact from the exported (b, Lambda), and\n"
+            "  W(0) = v + Wc(0).  The bank has no omega = 0 sample at all\n"
+            "  (its line ladder starts at z = 0 + 4 i eta).\n"
+            "  MEASURED cost, Na P16 (claim 2162): 19.44 GiB against the\n"
+            "  pole export's 1.22 GiB.  Leave it false for production.\n"
+            "  ==========================================================")
     if "sigma_w_model" in named and mode != "mpa":
         raise ValueError(
             f"GATE shared_pole_applicability: sigma_w_model got: {model!r} "
@@ -4777,6 +4818,13 @@ class DebugConfig:
     sigma_freq_debug_output: bool
     sigma_freq_debug_file: str
     write_wfn_h5: bool
+    #: Dump the WHOLE shared-pole Wc frequency sample bank (every fixed
+    #: sample, plus ``dWc_ds``/M1/M3) to ``<map>_w.h5``.  Debugging only.
+    #: BSE's static W does NOT need this: ``Wc(0) = -b Lambda^-1 b^dagger``
+    #: is exact from ``write_poles``, and no consumer in this tree reads the
+    #: bank.  See ``_DEFAULTS["write_poles"]`` for the derivation and the
+    #: measured 16x size ratio.
+    write_w: bool
 
 
 @dataclass(frozen=True)
@@ -5004,9 +5052,10 @@ class LorraxConfig:
     #: behaviour; see ``_DEFAULTS["write_restart_tensors"]`` for why this is
     #: a COMPLEMENT to q_irr storage and not an alternative to it.
     write_restart_tensors: bool
-    #: Export the fixed Wc sample bank, including derivative/moment companions.
-    write_w: bool
     #: Export the centroid/pole residue factor b and squared poles Lambda.
+    #: The production shared-pole export; complete for a static-W consumer
+    #: (``Wc(0) = -b Lambda^-1 b^dagger``).  The frequency-bank dump is the
+    #: DEBUG sibling and lives at ``config.debug.write_w``.
     write_poles: bool
     #: Add the QSGW Σ_xc cube and the QP energy ladders to ``sigma_mnk.h5``.
     #: False (the default) is byte-for-byte today's file; see
@@ -5754,6 +5803,7 @@ class LorraxConfig:
             sigma_freq_debug_output=bool(_g("sigma_freq_debug_output")),
             sigma_freq_debug_file=str(_g("sigma_freq_debug_file")),
             write_wfn_h5=bool(_g("write_wfn_h5")),
+            write_w=bool(_g("write_w")),
         )
         bse = BSEConfig(
             get_centroids_fi=bool(_g("get_centroids_fi")),
@@ -5827,7 +5877,6 @@ class LorraxConfig:
             occupation_clamp_tol=float(_g("occupation_clamp_tol")),
             restart=bool(_g("restart")),
             write_restart_tensors=bool(_g("write_restart_tensors")),
-            write_w=bool(_g("write_w")),
             write_poles=bool(_g("write_poles")),
             write_qsgw_datasets=bool(_g("write_qsgw_datasets")),
             restart_q_storage_raw=_restart_q_storage,

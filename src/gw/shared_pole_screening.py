@@ -118,7 +118,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         wfn_fingerprint_binding, tensors_filename, occupation_state, print_fn):
     """Build/reuse one immutable current-map model and return its small handle."""
     source_wfn = None
-    if config.write_w or config.write_poles:
+    if config.debug.write_w or config.write_poles:
         source_wfn = getattr(wfn, "path", None)
         if source_wfn is None or not str(source_wfn).strip():
             raise ValueError("GATE shared_pole_output: write_w/write_poles require the source WFN path before screening")
@@ -147,7 +147,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             handle = shared_pole_restart_handle(tensors_filename,
                 expected_identity=identity, meta=meta, mesh_xy=mesh_xy, print_fn=print_fn)
             if handle is not None:
-                if config.write_w or config.write_poles:
+                if config.debug.write_w or config.write_poles:
                     from file_io.shared_pole_store import export_shared_pole_outputs
                     timing.fence("spole.outputs")
                     with timing.section("spole.outputs"):
@@ -221,7 +221,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         handle = dict(path=str(root / "model.h5"), identity=identity,
                       digest=header["digest"], K=list(header["K"]))
         ledger.live_stages = ()
-        if config.write_w or config.write_poles:
+        if config.debug.write_w or config.write_poles:
             from file_io.shared_pole_store import export_shared_pole_outputs
             timing.fence("spole.outputs")
             with timing.section("spole.outputs"):

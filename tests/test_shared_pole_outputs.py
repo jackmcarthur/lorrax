@@ -52,7 +52,8 @@ def check_outputs(root):
             patch.object(store, "validate_shared_pole_bank",
                          wraps=store.validate_shared_pole_bank) as validations:
         outputs = store.export_shared_pole_outputs(handle, meta=meta,
-            config=SimpleNamespace(write_w=True, write_poles=True), mesh_xy=mesh,
+            config=SimpleNamespace(write_poles=True,
+                debug=SimpleNamespace(write_w=True)), mesh_xy=mesh,
             source_wfn=wfn, run_dir=root, label="export", tables=tables, print_fn=print)
         destination = str(root / "export_w.h5")
         writer_opens = [call for call in opens.call_args_list
@@ -84,7 +85,8 @@ def check_outputs(root):
     rank0_transaction(root, stage="test.output_compare", write=compare)
     with pytest.raises(ValueError, match="export already exists"):
         store.export_shared_pole_outputs(handle, meta=meta,
-            config=SimpleNamespace(write_w=True, write_poles=True), mesh_xy=mesh,
+            config=SimpleNamespace(write_poles=True,
+                debug=SimpleNamespace(write_w=True)), mesh_xy=mesh,
             source_wfn=wfn, run_dir=root, label="export", tables=tables, print_fn=print)
 
 
@@ -134,7 +136,10 @@ def check_retention(root):
     root = Path(root)
     mesh, meta, tables, handle = _export_fixture(root / "sc_0000_shared_pole")
     run_dir = root
-    both = SimpleNamespace(write_w=True, write_poles=True)
+    # ``write_w`` is the DEBUG sibling (AWDEBUG): the bank dump is reached
+    # through ``config.debug``, while ``write_poles`` stays top-level.
+    both = SimpleNamespace(write_poles=True,
+                           debug=SimpleNamespace(write_w=True))
 
     def export(label):
         return store.export_shared_pole_outputs(handle, meta=meta, config=both,

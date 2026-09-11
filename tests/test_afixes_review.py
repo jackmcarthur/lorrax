@@ -120,7 +120,8 @@ def test_nullable_integer_none_is_uniform(tmp_path, key):
 def test_output_source_fails_before_any_screening_work():
     from gw.shared_pole_screening import screen_shared_poles
     with pytest.raises(ValueError, match='before screening'):
-        screen_shared_poles(None, None, None, NS(write_w=True, write_poles=False),
+        screen_shared_poles(None, None, None,
+            NS(write_poles=False, debug=NS(write_w=True)),
             mesh_xy=None, sym=None, centroid_indices=None, run_dir=None,
             label=None, wfn=NS(_filename='private-is-not-public'),
             wfn_fingerprint_binding=None, tensors_filename=None,
