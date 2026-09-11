@@ -19,9 +19,9 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common import timing
-from common.collectives import agree_io_error, rank0_transaction, psum_replicate
+from common.collectives import rank0_transaction, psum_replicate
 from file_io.slab_io import SlabIO, mesh_divisible_shape
-from file_io.commit_state import assert_committed, set_commit_state
+from file_io.commit_state import agree_io_refusal, assert_committed, set_commit_state
 from symmetry_maps import QirrTables, validate_qirr_tables
 
 SCHEMA = "lorrax.shared-real-pole.v1"
@@ -597,10 +597,7 @@ def validate_shared_pole_model(path, *, expected_identity, mesh_xy, capacity=Non
                     _refuse(f"typed operation metadata changed: {key}")
     except Exception as exc:
         error = exc
-    try:
-        agree_io_error(error, path=path, stage="shared_pole_model/metadata")
-    except RuntimeError as exc:
-        raise ValueError(str(exc)) from exc
+    agree_io_refusal(error, path=path, stage="shared_pole_model/metadata")
     if capacity is None:
         # No tensor allocation is permitted without admission. This receipt
         # must not be mistaken for payload authentication by a restart caller.

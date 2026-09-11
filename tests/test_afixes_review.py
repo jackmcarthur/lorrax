@@ -42,6 +42,7 @@ def test_cache_authenticates_stored_fields_before_filtering(tmp_path, field):
 
 def test_restart_local_open_error_agrees_before_payload(monkeypatch, tmp_path):
     from file_io import tagged_arrays as tagged, shared_pole_store as store
+    from common import collectives
     events = []
     def broken(*args, **kwargs):
         raise OSError('injected rank-local open')
@@ -52,7 +53,9 @@ def test_restart_local_open_error_agrees_before_payload(monkeypatch, tmp_path):
     def payload(*args, **kwargs):
         pytest.fail('collective payload entered after local read failure')
     monkeypatch.setattr(tagged.h5py, 'File', broken)
-    monkeypatch.setattr(tagged, 'agree_io_error', agree)
+    # The reader agrees through file_io.commit_state.agree_io_refusal, which
+    # resolves THE agreement from common.collectives at call time.
+    monkeypatch.setattr(collectives, 'agree_io_error', agree)
     monkeypatch.setattr(store, 'validate_shared_pole_model', payload)
     with pytest.raises(tagged.SharedPoleMemberRefused, match='injected rank-local open'):
         tagged.read_shared_pole_restart_member(tmp_path/'restart.h5',
@@ -141,3 +144,22 @@ def test_export_empty_deck_source_refuses_during_parsing(tmp_path):
     path.write_text('[cohsex]\ncompute_mode = mpa\nsigma_w_model = shared_pole\nwrite_w = true\nwfn_file =\n')
     with pytest.raises(ValueError, match='nonempty wfn_file'):
         read_lorrax_input(str(path))
+
+
+def test_agreed_refusal_keeps_the_local_reason_when_the_receipt_truncates():
+    """A long path must not push the reason out of the agreed receipt.
+
+    ``common.collectives`` gathers only the first 240 characters of a
+    message, and this tree's run directories routinely spend more than that,
+    so the rank that actually failed re-states its own untruncated
+    diagnostic beside the agreed receipt.
+    """
+    from file_io.commit_state import agree_io_refusal
+    path = '/' + 'd' * 260 + '/restart.h5'
+    reason = 'artifact is not globally committed'
+    with pytest.raises(ValueError) as failing:
+        agree_io_refusal(ValueError(f'GATE io_global_commit: path={path}; '
+                                    f'stage=restart read; {reason}.'),
+                         path=path, stage='restart.shared_pole_member/read')
+    assert 'failing rank=' in str(failing.value) and reason in str(failing.value)
+    agree_io_refusal(None, path=path, stage='restart.shared_pole_member/read')

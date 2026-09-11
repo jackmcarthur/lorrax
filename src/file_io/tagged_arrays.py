@@ -4,6 +4,7 @@ This module reads/writes HDF5 restart files in the v2 format used by gw_jax.
 """
 from __future__ import annotations
 
+import hashlib
 import time
 import os
 from pathlib import Path
@@ -15,7 +16,7 @@ import h5py
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import (
-    agree_io_error, all_gather_processes, barrier, rank0_transaction,
+    all_gather_processes, barrier, rank0_transaction,
 )
 from .commit_state import set_commit_state
 import common.timing as timing
@@ -186,14 +187,13 @@ def read_shared_pole_restart_member(
         the exact validator diagnostic. Never classified as missing, and
         never permission to replace an immutable member.
     """
-    from .commit_state import assert_committed
+    from .commit_state import agree_io_refusal, assert_committed
     from .shared_pole_store import validate_shared_pole_model
 
     try:
         # Agree after serial metadata I/O and before the validator enters
         # its collective payload digest. Missing is rebuildable only when
         # every reader sees the same committed bundle with no member.
-        import hashlib
         restart_path = Path(restart_path).absolute()
         member, error = None, None
         try:
@@ -204,7 +204,8 @@ def read_shared_pole_restart_member(
                     member = _shared_pole_member_record(h5[SHARED_POLE_MEMBER_DATASET][()])
         except Exception as exc:
             error = ValueError(exc.reason) if isinstance(exc, SharedPoleMemberRefused) else exc
-        agree_io_error(error, path=restart_path, stage="restart.shared_pole_member/read")
+        agree_io_refusal(error, path=restart_path,
+                         stage="restart.shared_pole_member/read")
         receipt = hashlib.sha256(repr(member).encode("utf-8")).digest()
         receipts = np.asarray(all_gather_processes(np.frombuffer(receipt, np.uint8)))
         if not np.all(receipts == receipts.reshape(-1, 32)[0]):
