@@ -589,6 +589,7 @@ class SCDriverResult:
 
     sigma_result_dft: SigmaResult
     sigma_total_dft: jax.Array
+    qp_energies_ry: np.ndarray  # accepted SC spectrum, same loop k set as Sigma
     rms_history_ev: list[float]
     rotations_written: bool
     static_head_terms_dft: object | None
@@ -2478,6 +2479,15 @@ def _sc_head_frequency_plan(
     if config.compute_mode is ComputeMode.MPA and config.sigma.w_model == "shared_pole":
         if shared_pole_recipe is None:
             raise ValueError("GATE shared_pole_sc_plan: current-map recipe is missing")
+        if getattr(config, "head", None) is not None and config.head.correction is not HeadCorrection.OFF:
+            from .shared_pole_head import shared_pole_head_plan
+            from .mpa.sample_plan import plan_z
+            plan = shared_pole_head_plan(config, shared_pole_recipe,
+                                          material_class=material_class)
+            points = list(map(complex, plan_z(plan)))
+            if bool(config.do_G0) and 0j not in points:
+                points.append(0j)
+            return requests, plan, points
         # Select existing physical fit coordinates; never rebuild an MPA grid
         # or call the shared recipe resolver a second time for the head.
         ids = np.asarray(shared_pole_recipe['distinct_id'])
@@ -3127,10 +3137,16 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             kweights=full_k_quadrature_weights(inputs.wfn, inputs.sym))
         inputs.meta.shared_pole_recipe = resolve_shared_pole_recipe(
             inputs.config, wfns_qp, inputs.meta, mesh_xy=inputs.mesh_xy,
-            print_fn=inputs.print_fn)
+            print_fn=inputs.print_fn,
+            support_session=(None if inputs.fixed_quadrature_session is None else
+                             inputs.fixed_quadrature_session.setdefault(
+                                 "shared_pole_supports", {})))
         bind_shared_pole_sc_identity(
             inputs.meta, state, occupation_state=entry_occ_state,
             print_fn=inputs.print_fn)
+        inputs.meta.shared_pole_response_rules = (
+            None if inputs.fixed_quadrature_session is None else
+            inputs.fixed_quadrature_session.setdefault("chi", {}))
 
     def _screening(mpa_plan, iteration_head_response, *, producer=None,
                    quad_override=None):
@@ -3175,7 +3191,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     iteration_static_head_terms = inputs.static_head_terms
     head_occ_kn = None
     pt = getattr(inputs, "parallel_transport", None)
-    fixed_dft_full_head = inputs.fixed_dft_head_response is not None
+    fixed_dft_full_head = (inputs.fixed_dft_head_response is not None or
+        (pt is None and inputs.config.head.correction is HeadCorrection.FULL
+         and inputs.config.sigma.w_model == "shared_pole"))
     if pt is not None or fixed_dft_full_head:
         from .head_correction import compute_static_head_terms_from_sample
         from .qsgw_head import finalize_iteration_head_samples
@@ -3285,6 +3303,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # QSGW velocity-update choice.  Only the small 3x3/vector response is
         # retained; body W remains 2-D sharded as before.
         iteration_head_response = inputs.fixed_dft_head_response
+        if (iteration_head_response is None or
+                (inputs.config.sigma.w_model == "shared_pole"
+                 and tuple(iteration_head_response.omegas) != tuple(head_omegas))):
+            from .qsgw_head import build_dft_head_response
+            iteration_head_response = build_dft_head_response(
+                inputs.wfns_dft, np.asarray(head_omegas, dtype=np.complex128),
+                input_dir=inputs.input_dir, mesh=inputs.mesh_xy, wfn=inputs.wfn,
+                meta=inputs.meta, config=inputs.config)
         head_occ_kn = np.asarray(
             iteration_head_response.sigma_occupations, dtype=np.float64)
         if tuple(iteration_head_response.omegas) != tuple(head_omegas):
@@ -3452,23 +3478,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             if transverse is None else
             _add_exact_four_current_hartree(
                 delta_h_dft, scalar, transverse))
-    # Symmetric averaging is confined to accidental/exact degeneracies.  It
-    # is intentionally NOT tied to ``degen_avg_tol_ry``: that general output
-    # convention may be user-expanded, while QSGW state identity must never
-    # erase a resolved SOC splitting to make a trajectory converge.  Average
-    # the correction, not H itself, so the immutable DFT splitting survives.
-    e_dft_map = inputs.e_dft_active_kn_ry
-    if not ks.is_identity:
-        e_dft_map = ks.select(e_dft_map)
-    if not bool(getattr(inputs.config, "no_degen_averaging", False)):
-        from .degen_average import average_matrix_diagonal
-        delta_h_dft = average_matrix_diagonal(
-            delta_h_dft,
-            energies_kn_ry=np.asarray(e_dft_map, dtype=np.float64),
-            tol_ry=(float(inputs.config.sc.exact_degeneracy_tol_ev)
-                    / RYD_TO_EV),
-            mesh_xy=inputs.mesh_xy,
-        )
+    # Keep the computed full operator. Replacing only its diagonal by a
+    # degenerate-block mean depends on the arbitrary DFT basis within that
+    # block and can create symmetry breaking in the next SC state. BGW
+    # diagonal averaging belongs to the one-shot/output convention.
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
     if (buffer_mask.any()
             and inputs.config.sc.buffer_mode == "carry"
@@ -3498,14 +3511,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 if transverse is None else
                 _add_exact_four_current_hartree(
                     delta_h_dft_n3, scalar, transverse))
-        if not bool(getattr(inputs.config, "no_degen_averaging", False)):
-            delta_h_dft_n3 = average_matrix_diagonal(
-                delta_h_dft_n3,
-                energies_kn_ry=np.asarray(e_dft_map, dtype=np.float64),
-                tol_ry=(float(inputs.config.sc.exact_degeneracy_tol_ev)
-                        / RYD_TO_EV),
-                mesh_xy=inputs.mesh_xy,
-            )
         _report_extrapolation_eqp_shift(
             H_qp_dft_full, inputs.kin_ion_dft + delta_h_dft_n3,
             mesh_xy=inputs.mesh_xy, n_occ=n_occ,
@@ -5515,8 +5520,7 @@ def run_sc_driver(
     rms_history : list[float]
         RMS ΔE (eV) per iteration.
     rotations_written : bool
-        True when this call wrote ``qp_wfn_rotations.h5`` (the
-        ``config.debug.write_wfn_h5`` artifact dump ran).  The driver's
+        True when this call wrote ``qp_wfn_rotations.h5``.  The driver's
         generic writer reads this fact instead of re-deriving the
         predicate, so it cannot overwrite the authoritative SC file.
     static_head_terms_dft : StaticHeadTerms or None
@@ -5646,13 +5650,15 @@ def run_sc_driver(
         print_fn=print_fn)
     fixed_dft_head_response = None
     if (parallel_transport is None
-            and config.head.correction is HeadCorrection.FULL):
+            and config.head.correction is HeadCorrection.FULL
+            and config.sigma.w_model != "shared_pole"):
         # ``sc_head_update=off`` freezes this direct DFT response.  Build it
         # once, on the same single-sourced frequency plan every map consumes,
         # then fold it through each iteration's resident W exactly once.
         from .qsgw_head import build_dft_head_response
         _, _, fixed_head_omegas = _sc_head_frequency_plan(
-            config, quad, material_class=material_class)
+            config, quad, material_class=material_class,
+            shared_pole_recipe=getattr(meta, "shared_pole_recipe", None))
         fixed_dft_head_response = build_dft_head_response(
             wfns, np.asarray(fixed_head_omegas, dtype=np.complex128),
             input_dir=input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,
@@ -5819,19 +5825,21 @@ def run_sc_driver(
     # eigenvalues + U are the *true* QP eigenstates of the SC fixed
     # point (the driver's post-Σ-seam eigh differs slightly because the
     # SC carry applies the band partition).
-    rotations_written = False
-    if config.debug.write_wfn_h5:
-        dump_qp_wfn_artifacts(
-            state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
-            kstar=kstar_io, state_on_ibz=kstar is not None,
-            wfn=wfn, sym=sym, band_slices=band_slices, kgrid=meta.kgrid,
-            logical_band_stop=int(meta.b_id_4_user),
-            output_dir=input_dir,
-            qp_rotations_k_storage=config.qp_rotations_k_storage,
-            print_fn=print_fn,
-            clamp_tol=float(config.occupation_clamp_tol),
-        )
-        rotations_written = True
+    # The small U/E artifact always represents the accepted SC Hamiltonian.
+    # Gating it with the optional full-WFN write lets the generic writer
+    # replace it with the unpartitioned post-Sigma eigensolve.
+    _, _, _, qp_energies_ry = dump_qp_wfn_artifacts(
+        state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
+        kstar=kstar_io, state_on_ibz=kstar is not None,
+        wfn=wfn, sym=sym, band_slices=band_slices, kgrid=meta.kgrid,
+        logical_band_stop=int(meta.b_id_4_user),
+        output_dir=input_dir,
+        qp_rotations_k_storage=config.qp_rotations_k_storage,
+        write_wfn_h5=bool(config.debug.write_wfn_h5),
+        print_fn=print_fn,
+        clamp_tol=float(config.occupation_clamp_tol),
+    )
+    rotations_written = True
     sigma_omega_h5_path = dump_sigma_omega_h5_final(
         state_final, config=config, meta=meta, mesh_xy=mesh_xy,
         input_dir=input_dir, sym=sym,
@@ -5976,6 +5984,7 @@ def run_sc_driver(
     return SCDriverResult(
         sigma_result_dft=sigma_result_dft,
         sigma_total_dft=sigma_total,
+        qp_energies_ry=qp_energies_ry,
         rms_history_ev=rms_history,
         rotations_written=rotations_written,
         static_head_terms_dft=static_head_terms_dft,
@@ -6220,10 +6229,11 @@ def dump_qp_wfn_artifacts(
     kgrid,                               # (nkx, nky, nkz)
     output_dir: str,
     qp_rotations_k_storage: str = "auto",
+    write_wfn_h5: bool = True,
     print_fn: Callable = print,
     clamp_tol: float = _OCCUPATION_CLAMP_TOL_DEFAULT,
-) -> tuple[str, str, float]:
-    """Post-SC artifact dump: WFN_qp.h5 + qp_wfn_rotations.h5.
+) -> tuple[str | None, str, float, np.ndarray]:
+    """Write canonical SC U/E and optionally the full ``WFN_qp.h5``.
 
     Diagonalises the converged ``state.H_qp_dft`` once, then writes:
 
@@ -6290,11 +6300,17 @@ def dump_qp_wfn_artifacts(
     ``logical_band_stop`` is the unpadded end of the sum-band ladder.  It
     is required only when the final map used an energy-only tail scissor.
 
+    ``write_wfn_h5`` controls only the full wavefunction artifact. The small
+    canonical U/E file always carries the accepted, partitioned SC state.
+
     Both files are rank-0-only writes (h5py is single-writer). Each write
     broadcasts its verdict: every rank returns after both files finish,
     or raises the same named failure before the next write.
 
-    Returns ``(qp_wfn_path, qp_rotations_path, efermi_ry)``.
+    Returns ``(qp_wfn_path, qp_rotations_path, efermi_ry, enk_loop_ry)``.
+    The first path is ``None`` when the full wavefunction file was not
+    requested. The existing small loop-k-set energy array also serves the
+    production gap report, without another diagonalization or artifact read.
     """
     from ffi import _services
     _services.ensure_on_path()
@@ -6357,7 +6373,8 @@ def dump_qp_wfn_artifacts(
             enk_full_base_ry=enk_full_base_ry,
         )
     from common.collectives import rank0_transaction
-    rank0_transaction(qp_wfn_path, stage="qp_wfn_h5_write", write=_write_qp_wfn)
+    if write_wfn_h5:
+        rank0_transaction(qp_wfn_path, stage="qp_wfn_h5_write", write=_write_qp_wfn)
 
     def _write_qp_rotations():
         # The tables come from the SERVICE's own accessor, never re-spelled
@@ -6383,13 +6400,15 @@ def dump_qp_wfn_artifacts(
         )
     rank0_transaction(qp_rot_path, stage="qp_rotations_h5_write",
                       write=_write_qp_rotations)
-    print_fn(f"  QP WFN:       {qp_wfn_path}")
+    if write_wfn_h5:
+        print_fn(f"  QP WFN:       {qp_wfn_path}")
     print_fn(f"  QP rotations: {qp_rot_path}")
     _ref_kind = ("fixed-N mu" if (state.occupation_state is not None
                  and str(state.occupation_state.smearing_family) == "mp1")
                  else "midgap")
     print_fn(f"  Final E_F ({_ref_kind}, eV): {efermi_ry * RYD_TO_EV:.6f}")
-    return qp_wfn_path, qp_rot_path, efermi_ry
+    return (qp_wfn_path if write_wfn_h5 else None, qp_rot_path, efermi_ry,
+            enk_loop_ry)
 
 
 __all__ = [

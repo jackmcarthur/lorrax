@@ -19,6 +19,8 @@ def fixture(caller_fraction=0.0):
     ledger.reserve('sigma.spatial', resident_bytes_per_rank=0, workspace_bytes_per_rank=0)
     ledger.live_stages = ('sigma.inputs', 'sigma.spatial')
     header = dict(n_q_full=64, n_q_irr=4, n_mu_logical=16, nspinor=1, Kmax=50,
+                  grid=(4,4,4),representation='planted-capacity-only',
+                  q_irr_full_idx=[0,16,32,48],operations=dict(authorized_rows=[0]),
                   qirr=dict(irr_idx_q=np.repeat(np.arange(4),16), sym_perm=np.arange(16)[None,:],
                             L_table=np.zeros((1,16,3),np.int32), sym_idx_q=np.zeros(64,np.int32),
                             q_irr_frac=np.zeros((4,3)), n_sym_spatial=1))
@@ -57,3 +59,28 @@ def test_missing_caller_and_geometry_refuse():
     h['n_mu_logical'] += 1
     with pytest.raises(ValueError, match='geometry mismatch'):
         _shared_pole_memory_schedule(meta, h, mesh_xy=mesh)
+
+
+def test_padded_nonlocal_stars_split_to_preserve_logical_matrix_bound():
+    """Ample hardware memory cannot waive the new operator's scaling bound."""
+    from common.grouped_layout import identity_square_grouped_shard_layout
+    meta, header, mesh = fixture()
+    layout = identity_square_grouped_shard_layout(13, 16, (2, 2))
+    meta.n_rmu = header['n_mu_logical'] = 13
+    meta.mu_basis = NS(n_packed=16, layout=layout,
+                       active_mask=layout.axis.active_mask)
+    meta.shared_pole_capacity = CapacityLedger(meta, mesh_xy=mesh)
+    meta.shared_pole_capacity.reserve('caller', resident_bytes_per_rank=0,
+                                      workspace_bytes_per_rank=0)
+    meta.shared_pole_capacity.live_stages = ('caller',)
+    qt = header['qirr']
+    header['n_q_irr'] = 8
+    header['q_irr_full_idx'] = np.arange(8)*8
+    qt['irr_idx_q'] = np.repeat(np.arange(8), 8)
+    qt['q_irr_frac'] = np.zeros((8, 3))
+    qt['sym_perm'] = np.stack((np.arange(13), np.roll(np.arange(13), 1)))
+    qt['L_table'] = np.zeros((2, 13, 3), np.int32)
+    plan = _shared_pole_memory_schedule(meta, header, mesh_xy=mesh)
+    assert plan['route'] == 'routed_child'
+    assert plan['parent_capacity'] < header['n_q_irr']
+    assert plan['projection_matrix_bytes_per_rank'] <= plan['unit_bytes']

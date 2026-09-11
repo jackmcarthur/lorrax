@@ -290,6 +290,7 @@ from symmetry_maps.qgrid_trs import (
     QgridTrsPolicy,
     build_qgrid_trs_policy,
     little_group_covariance_residual,
+    project_little_group_operator,
     self_negative_q_mask,
     trs_pair_coherent_unfold_sym_idx,
     trs_project_self_negative_q_rows,
@@ -379,7 +380,7 @@ __all__ = [
     # the q-axis TRS POLICY that consumes that measurement, and the
     # covariance statistic the unfold's own contract rests on
     "QgridTrsPolicy", "build_qgrid_trs_policy",
-    "little_group_covariance_residual", "self_negative_q_mask",
+    "little_group_covariance_residual", "project_little_group_operator", "self_negative_q_mask",
     "trs_pair_coherent_unfold_sym_idx", "trs_project_self_negative_q_rows",
     # ---------------------------------------------------------------
     # PRE-SWEEP SPELLINGS.  Aliases, not definitions — see

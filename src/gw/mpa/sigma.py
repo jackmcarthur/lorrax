@@ -147,18 +147,9 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm):
 
 def _shared_pole_fixed_q_policy(header):
     """Resolve the policy from the store's authenticated TRS/grid metadata."""
-    from symmetry_maps import QgridTrsPolicy, self_negative_q_mask
+    from gw.qgrid_symmetry import qgrid_trs_policy_from_shared_pole_store
 
-    qt = header["qirr"]
-    grid = tuple(header["grid"])
-    # Canonical store validation admits only scalar-trs-even-s and binds
-    # these rows to the measured reference; do not infer TRS from b itself.
-    return QgridTrsPolicy(
-        trs_measured=header["representation"] == "scalar-trs-even-s",
-        kgrid=grid, n_sym_spatial=int(qt["n_sym_spatial"]),
-        unfold_sym_idx=np.asarray(qt["sym_idx_q"]),
-        self_negative_q=self_negative_q_mask(np.arange(header["n_q_full"]), kgrid=grid),
-        n_pair_rewired=0, context="shared-pole Sigma")
+    return qgrid_trs_policy_from_shared_pole_store(header, announce=False)
 
 
 def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
@@ -176,21 +167,27 @@ def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
     lo, hi = map(int, q_span)
     parent_map = np.asarray(qt["irr_idx_q"], dtype=np.int32)
     rows = np.flatnonzero((parent_map >= lo) & (parent_map < hi)).astype(np.int32)
+    # A finite tangential model need not preserve every spatial little-group
+    # relation exactly. The common TRS policy makes q/-q use one spatial
+    # realization, as for the ordinary W producer. This changes only small
+    # row metadata; the endpoint routing and all-P operator tiles are intact.
+    policy = _shared_pole_fixed_q_policy(header)
     return dict(parent_span=(lo, hi), rows=rows, parent_rows=parent_map[rows] - lo,
-                sym_rows=np.asarray(qt["sym_idx_q"], dtype=np.int32)[rows],
+                sym_rows=policy.unfold_sym_idx[rows],
                 q_frac=np.asarray(qt["q_irr_frac"], dtype=np.float64)[lo:hi],
                 packed_perm=packed, wraps=wraps, certificates=certificates,
                 n_sym_spatial=int(qt["n_sym_spatial"]))
 
 
 def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
-    """Build the collective-free local operator action for a parent panel.
+    """Realize each parent and apply its local child operation.
 
     Returns explicit full-q row IDs and a compiled pair-transpose unfold.
     Nonlocal maps refuse here; the caller routes bounded endpoint factors
     through the symmetry service before contraction for those maps.
     """
     from common.shard_map import shard_map
+    from gw.qgrid_symmetry import shared_pole_operator_realizer
     from symmetry_maps import unfold_operator_local
 
     if tables is None:
@@ -201,6 +198,8 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
 
     policy = _shared_pole_fixed_q_policy(header)
     qids = np.asarray(header["q_irr_full_idx"])[slice(*q_span)]
+    realize = shared_pole_operator_realizer(
+        meta, header, q_full_idx=qids, mesh_xy=mesh_xy)
 
     def body(plus, transposed):
         projected, _ = policy.project_fixed_q(
@@ -215,15 +214,21 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
             n_sym_spatial=tables["n_sym_spatial"],
             trs_rule="pair_transpose", transposed_parent_local=transposed)
 
-    unfold = jax.jit(shard_map(
+    unfold_local = jax.jit(shard_map(
         body, mesh=mesh_xy,
         in_specs=(P(None, "x", "y"), P(None, "x", "y")),
         out_specs=P(None, "x", "y"), check_vma=False))
+
+    @jax.jit
+    def unfold(plus, transposed):
+        return unfold_local(*realize(plus, transposed))
+
     return tables["rows"], unfold
 
 
 def _shared_pole_routed_synthesis(
-    b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, meta, header, tables, endpoint_budgets, mesh_xy, gemm,
+    b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, meta, header, tables,
+    endpoint_budgets, realize, mesh_xy, gemm,
 ):
     """Synthesize W after bounded child-factor routing, DESIGN §3.4 fallback.
 
@@ -266,7 +271,13 @@ def _shared_pole_routed_synthesis(
         transposed = _shared_pole_contract(*partners, child_weights, gemm=gemm)
         plus, _ = policy.project_fixed_q(
             plus, child_ids, transposed_partner=transposed, measure=False)
-    return plus
+    # Conjugacy of stabilizers makes child-space averaging equivalent to
+    # averaging the parent before unfolding. This avoids enlarging the
+    # routed factors by a symmetry axis. Both operator orientations remain
+    # distributed over the complete mesh, including the transpose exchange.
+    transposed = jax.lax.with_sharding_constraint(
+        jnp.swapaxes(plus, -1, -2), NamedSharding(mesh_xy, P(None, "x", "y")))
+    return realize(plus, transposed)[0]
 
 
 def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy):
@@ -312,8 +323,19 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                     meta, header, (lo, hi), mesh_xy=mesh_xy, tables=tables)
             else:
                 rows, unfold = tables["rows"], None
+            # The realization is the magnetic little-group average the store's
+            # policy authenticates.  On the local branch it is already inside
+            # ``unfold``; on the routed branch the service accepts traced
+            # faces, so bind the immutable map once per current-map panel and
+            # reuse its executable at every tau.
+            realize = None
+            if not local:
+                from gw.qgrid_symmetry import shared_pole_operator_realizer
+                realize = shared_pole_operator_realizer(
+                    meta, header, q_full_idx=rows, mesh_xy=mesh_xy)
 
-            def make_kernel(width, *, tables=tables, unfold=unfold, local=local):
+            def make_kernel(width, *, tables=tables, unfold=unfold, local=local,
+                            realize=realize):
                 nonlocal native_workspace
                 from distrib_la import gemm_plan
 
@@ -343,7 +365,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                     body = partial(
                         _shared_pole_routed_synthesis, meta=meta, header=header,
                         tables=tables, endpoint_budgets=schedule["endpoint_budgets"],
-                        mesh_xy=mesh_xy, gemm=gemm)
+                        realize=realize, mesh_xy=mesh_xy, gemm=gemm)
                 return jax.jit(body)
 
             kernels = {}
@@ -473,7 +495,10 @@ def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, local):
     endpoint_budgets = {}
     traffic = 0
     if local:
-        peak = ((2*b+children)*tile + 8*b
+        # Parent, partner and fixed-size group accumulators coexist. The
+        # compiled reservation below measures actual aliases and exchange
+        # scratch; this bound also informs the panel-size search.
+        peak = ((6*b+children)*tile + 8*b
                 + 80*b*spin*m*c/(px*py) + 64*b*c)
     else:
         costs = {axis: endpoint_panel_cost((b,m,spin,c), children,
@@ -484,7 +509,7 @@ def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, local):
         traffic = sum(row["ring_bytes_per_rank"] for row in costs.values())
         # The service bounds include input, output, rotating and phase
         # scratch. Extra weighted child faces and child W coexist at GEMM.
-        peak = (sum(endpoint_budgets.values()) + children*tile
+        peak = (sum(endpoint_budgets.values()) + 5*children*tile
                 + 16*children*spin*m*c/(px*py) + 64*(b+children)*c)
     return dict(resident_bytes_per_rank=int(np.ceil(faces)),
                 workspace_bytes_per_rank=int(np.ceil(peak-faces)),
@@ -540,6 +565,13 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
         # SAME routine used for the admitted row, including routed scratch.
         multiple = combined_divisor(px,py)
         one = _shared_pole_panel_cost(meta,header,b,multiple,mesh_xy=mesh_xy,local=local)
+        projection_rows = b if local else one["children"]
+        # The physical logical-U bound applies to every NEW projector
+        # matrix, even when orbit packing pads the endpoint carrier. The
+        # pre-existing full-q Sigma output is accounted separately above.
+        projection_bytes = 16*projection_rows*(spin*meta.mu_basis.n_packed)**2/(px*py)
+        if projection_bytes > U:
+            continue
         two = _shared_pole_panel_cost(meta,header,b,2*multiple,mesh_xy=mesh_xy,local=local)
         keys = ("resident_bytes_per_rank", "workspace_bytes_per_rank")
         p1, p2 = sum(one[k] for k in keys), sum(two[k] for k in keys)
@@ -560,6 +592,10 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
             best = candidate
     b,c = (1,1) if best is None else best[2:]
     footprint = _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,local=local)
+    projection_rows = b if local else footprint["children"]
+    projection_bytes = 16*projection_rows*(spin*meta.mu_basis.n_packed)**2/(px*py)
+    if projection_bytes > U:
+        raise ValueError("GATE shared_pole_capacity: one parent star exceeds the all-P logical matrix bound")
     receipt = capacity.reserve(
         "sigma.synthesis", resident_bytes_per_rank=footprint["resident_bytes_per_rank"],
         workspace_bytes_per_rank=footprint["workspace_bytes_per_rank"],
@@ -573,6 +609,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
                 endpoint_budgets=footprint["endpoint_budgets"],
                 routed_bytes_per_panel_per_rank=footprint["routed_bytes_per_panel_per_rank"],
                 inherited_sigma_peak_status="NOT_MEASURED",
+                projection_matrix_bytes_per_rank=int(projection_bytes),
                 compiled_peak_status="NOT_MEASURED")
 
 
@@ -1439,7 +1476,7 @@ def compute_sigma_c_mpa_omega_grid(
                     reduction_steps=quadrature_reduction_steps,
                     cache_dir=quadrature_cache_dir,
                     print_fn=print_fn, edge_factor=edge_factor,
-                    fixed_rule_session=(None if shared_pole else fixed_quadrature_session))
+                    fixed_rule_session=fixed_quadrature_session)
         if plan_mode == "panes":
             print_fn(
                 f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "

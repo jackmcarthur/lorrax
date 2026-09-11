@@ -246,11 +246,15 @@ class GWProductionReport:
         self.emit("Spin channels  : " + (
             "charge + transverse current (bispinor)"
             if bool(getattr(config, "bispinor", False)) else "charge (scalar)"))
-        self.emit("Degenerate sets: " + (
-            "left in the input gauge" if bool(getattr(
-                config, "no_degen_averaging", False))
-            else "averaged at "
-            f"{float(getattr(config, 'degen_avg_tol_ry', 0.0)) * RYD_TO_EV:.5e} eV"))
+        if solver == "self_consistent":
+            self.emit("Degenerate sets: full SC operators retained; "
+                      "no diagonal averaging in the iteration map")
+        else:
+            self.emit("Degenerate sets: " + (
+                "left in the input gauge" if bool(getattr(
+                    config, "no_degen_averaging", False))
+                else "reporting diagonals averaged at "
+                f"{float(getattr(config, 'degen_avg_tol_ry', 0.0)) * RYD_TO_EV:.5e} eV"))
         self.emit("ISDF state     : " + (
             "restart requested" if bool(getattr(config, "restart", False))
             else "fresh fit requested"))
@@ -422,7 +426,7 @@ class GWProductionReport:
             if lower_margin >= 0.0 and upper_margin >= 0.0:
                 self.emit("Coverage status : COMPLETE")
                 self.emit(f"Grid margins    : {lower_margin:.5f} eV below; "
-                          f"{upper_margin:.5f} eV above protected DFT states")
+                          f"{upper_margin:.5f} eV above requested DFT output bands")
             else:
                 self.emit("Coverage status : INCOMPLETE")
                 shortfalls = []
@@ -431,7 +435,7 @@ class GWProductionReport:
                 if upper_margin < 0.0:
                     shortfalls.append(f"{-upper_margin:.5f} eV above")
                 self.emit("Grid shortfall  : " + "; ".join(shortfalls)
-                          + " protected DFT states")
+                          + " requested DFT output bands")
                 coverage = getattr(sigma_result, "omega_coverage", None)
                 policy_name = str(getattr(coverage, "policy", "unknown"))
                 affected = ""
@@ -445,13 +449,14 @@ class GWProductionReport:
                         affected = (f"; Sigma(E_DFT) has {n_uncovered}/"
                                     f"{mask.size} out-of-grid cells")
                 self._retain_warning(
-                    "WARNING: dynamic Sigma grid is incomplete for protected "
-                    "DFT states (" + "; ".join(shortfalls) + f"){affected}; "
+                    "WARNING: dynamic Sigma grid is incomplete for requested "
+                    "DFT output bands (" + "; ".join(shortfalls) + f"){affected}; "
                     f"out-of-range policy={policy_name}. Widen "
                     "sigma_omega_min_ev / sigma_omega_max_ev or add a "
                     "sigma_omega_patches_ev window; use "
                     "LORRAX_OMEGA_OUT_OF_RANGE=refuse when endpoint values "
-                    "must never enter an output.")
+                    "must never enter an output. In SC runs these counts include "
+                    "scissored bands; the SC partition reports protected-band coverage.")
 
         state = "ON" if config.sigma.band_extrapolation else "OFF"
         estimator = (getattr(

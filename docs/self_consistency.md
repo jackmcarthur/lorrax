@@ -179,12 +179,18 @@ right way to start a loop from a converged one-shot; it is not safe against a
 directory holding valid MPA pole stores it would overwrite.** Point a restart
 at a copy or a variant directory (sandbox rule: never mutate a completed run).
 
-**8. Degeneracies are symmetrized only when exact.** `sc_exact_degeneracy_tol_ev`
-is 0.1 meV, deliberately below any physical splitting (MoS2's SOC-split K pair
-is 1.7–3.6 meV). Do not raise it to make a loop converge; a near-degenerate
-pair that will not settle is a window-edge or state-identity problem
-(protected windows must close multiplets at every k), never a reason for
-damping.
+**8. Keep the computed full SC correction in degenerate subspaces.**
+Averaging only its diagonal while retaining off-diagonals depends on the
+arbitrary DFT basis within a degenerate manifold and can introduce symmetry
+breaking. The iteration map and final Hamiltonian diagonalizations therefore
+retain the full operator; BGW averaging applies only to extracted reporting
+diagonals, controlled by
+`no_degen_averaging`. This does not project a block onto a multiple of the
+identity or impose time reversal.
+
+`sc_exact_degeneracy_tol_ev` remains 0.1 meV for state identity and frontier
+tail grouping. Do not raise it to make a loop converge; protected windows
+must close multiplets at every k, and resolved SOC splittings remain distinct.
 
 **9. Budget.** A healthy loop converges in 13–15 maps. If the residual has
 not fallen below 1 meV by map 20 it will not converge at 60; stop and fix the
@@ -347,3 +353,143 @@ first integer in a body row is spin). They describe eqp0 even in the eqp1
 file. The Hamiltonian carry and accelerator are unchanged. The diagonal
 retention mask is `protected | in_range`, including protected multiplet
 members; only non-protected out-of-range diagonals are scissored.
+
+
+## Shared-pole W with retained quadrature
+
+The shared-pole SC path rebuilds the response samples, exact moments, directions,
+Ritz poles and factors from every map's rotated wavefunctions, energies and
+occupations. `restart=true` restores the invariant ISDF basis. SC W models remain
+map-local scratch and are never published as reusable ISDF bundle members.
+
+The run-local fixed-quadrature session holds mathematical integration rules.
+Sigma uses its existing 2 eV state and 10% pole margins, retaining identical
+nodes and weights while recomputing current masks, pole selectors, reference
+energies and W(time). Containment, error currency and separated-factor growth
+are checked at every map; a failed check rebuilds the affected rule. Eta and
+epsilon remain fixed for a session. Disk model identity is not relaxed.
+
+Chi rules pad transition endpoints by up to 4 eV, corresponding to 2 eV on
+each one-particle endpoint. The physical band selection and occupations are
+recomputed without padded masks. The resonant rule recertifies all current
+frequencies, including its infinite-time tail, then updates its projections.
+Remote rules keep their certified inverse-moment rows and anchor, recertifying
+the current Taylor remainder and updating projections. A missing certificate,
+domain escape or failed bound rebuilds that rule. Lower remote padding cannot
+cross the Taylor convergence boundary. See the [minimax contract](services/minimax.md).
+
+The DFT reference map uses its current support geometry without retaining its
+envelope. The first interacting map initializes three scalar bounds: the largest line endpoint,
+smallest imaginary endpoint and largest imaginary endpoint requested so far.
+The same policy and enclosed current interval regenerate identical training
+and held coordinates. An interval expansion enlarges the envelope; a changed
+policy or basis key starts a new epoch. This warmup avoids locking the
+reference DFT gap's extra imaginary support into all later interacting maps.
+Every map still rebuilds its census,
+capacity ledger, samples, directions and physical ranks. In particular, this
+does not pad a Gram matrix with null vectors or freeze W. Keeping the smallest previously requested
+interacting imaginary endpoint conservatively increases the support-count
+heuristic's condition ratio; it is not an interpolation-error certificate.
+
+### Symmetry of the physical pole model
+
+The versioned physical realization is
+`Wc(q,s) = Pi_Gq [sum_k b(q,k) b(q,k)^dagger / (s - Lambda(q,k))]`,
+where `Pi_Gq` averages all authenticated magnetic little-group operations.
+The stored factors describe the raw latent Ritz model. Sigma time synthesis
+and the MPA Gamma body bind the same adapter in `gw/qgrid_symmetry.py`;
+the standalone symmetry service owns every phase, permutation and operation.
+The recipe's hashed `operator_realization` distinguishes these semantics
+from historical raw stores, which remain readable for analysis.
+
+Each transformed residue is a unitary or conjugate-unitary congruence of a
+positive residue, so averaging preserves residue positivity and real poles.
+At complex frequency or time an antiunitary operation acts on the residue
+endpoints. Its partner is the same-time matrix transpose; conjugating the
+whole value would incorrectly conjugate the scalar resolvent/time weight.
+The MPA head evaluates `V + Pi_Gamma Wc`, with the original bare V.
+
+The projector streams one operation into a fixed-size accumulator, including
+nonlocal endpoint permutations. No factor gains a symmetry axis. Matrix
+intermediates remain distributed over all processors; full and compact
+synthesis executables undergo the current-map memory admission. A child
+stabilizer is conjugate to its parent's stabilizer, so nonlocal factor routing
+can apply the same projection after contraction without enlarging factors.
+
+This changes the symmetry-breaking part of the finite approximation. It does
+not generally preserve every original tangential interpolation condition.
+The constructor's retained-Ritz identities and raw held/moment/passivity
+receipts still certify that raw model; the latter do not certify the realized
+operator's error or its upper passivity bound against an unprojected V.
+Converged spectral comparisons must measure the physical change.
+
+The distinction follows the subspace conditions in Beattie and Gugercin,
+[Model Reduction by Rational Interpolation, Theorem 3.1 and Algorithm 4.1](https://arxiv.org/pdf/1409.2140):
+interpolation fixes specified left/right actions, and a real realization
+requires conjugation closure of both points and directions. Degenerate
+singular-subspace closure alone does not impose the full spatial group.
+The residue-averaging argument above is specific to this implementation;
+it is not a claim that the cited interpolation theorem certifies its error.
+
+An enabled scalar head uses the existing MPA sample-plan, scalar-fit and Sigma
+head owners. Full local fields evaluate the current shared-pole Gamma body,
+one frequency at a time with both matrix axes distributed, and fold the common
+head wings through total W. The head fit is bound to that map's body digest.
+`sc_head_update=off` keeps the DFT direct response and wings; their samples are
+recomputed at the current head frequencies and folded through current W. MPA
+sampling keys configure this scalar head; elementwise-body fit/reuse keys have
+no shared-pole consumer. The shifted finite-q BGW metal head remains unsupported.
+
+Validation on branch `investigate/shared-pole-sc-quadrature-2026-09-10`:
+P4 Si job58152308.12, using diagnostic Sigma integration and the historical
+MPA head, converged after 15 fresh-W maps with final max energy change
+0.016 meV over 14 criterion bands. All subsequent chi rules hit with equal
+nodes; Sigma rule rebuild count remained zero. Job58152308.11 verifies the
+service against independent residue congruences and its nonlocal per-rank
+matrix bound. These controls do not establish the corrected head's accuracy
+or the fixed-support converged-QP change. The historical-head warmup control
+(job58152308.34, reader58152308.42) also converged in 15 maps: its maximum
+unshifted change across all 64 by 34 QP energies was 0.084421 meV against
+the dynamic-support control. Twelve final maps had identical support geometry
+and carrier widths; all later chi and Sigma rules were reused. This comparison
+includes the diagnostic-to-production Sigma plumbing and initial rule-size
+variation. Corrected-head, fully covered-grid controls are a separate
+validation. Detailed evidence: sandbox
+`reports/shared_pole_sc_invariants_2026-09-10/report.md`, claim2150, and
+`runs/Si_scalar/35_shared_pole_sc_live_20260910/49_old_head_warmup_sc/report.md`.
+<!-- The optional diagnostic below does not change the production restart contract. -->
+
+### Inspecting an SC state before shared-pole construction
+
+`tests/bench/shared_pole_sc_invariants.py -i RUN/cohsex.in --output RUN/diagnostics`
+observes a scalar Si P4 replay: rotation unitarity, complete centroid-space
+projector preservation, raw imaginary-axis response Hermiticity and moment
+symmetry. It saves the entering U, energies and occupations in
+`entry_rotation_NNNN.npz`; these are diagnostic state snapshots, not an
+accelerator-history checkpoint. Ordinary ISDF restart arrays are written
+at initialization and do not by themselves checkpoint each SC map.
+
+With `--entry PREVIOUS/entry_rotation_0001.npz`, the diagnostic rebuilds
+that state using the canonical rotation and stops before W/Sigma, after
+checking Gamma spectral projectors, paired-transpose projectors over the
+full k grid, and the raw response at individual time points. This second
+mode is restricted to the unshifted scalar Si
+4x4x4 fixture. Use a new run directory with copied restart inputs. An
+off-axis response is not required to be Hermitian; a centroid overlap is
+not the physical Hilbert-space metric; occupied density can change under
+occupied-empty mixing even though the complete rotated space is conserved.
+
+`--first-map-stages` observes the Gamma real-space kernel of Sigma, Hartree
+and the assembled Hamiltonian, then stops after the first map. Optional
+`--synthesis-pairs` also checks sampled W/tau calls and every integration
+window selector. `--full-k-stages` instead checks the actual full-BZ band
+operators in the DFT basis before selecting the SC star wedge. This last
+check is independent of the later broadcast and can detect star disagreement
+that checking a reconstructed table would hide.
+
+The separate `shared_pole_sc_direction_gauge.py` bench rotates only retained
+near-degenerate support multiplets and measures the actual distributed
+projector change. `shared_pole_conjugate_directions.py` and
+`shared_pole_support_gauge.py` are planted algebra probes for conjugate-port
+closure and support-basis covariance, respectively. They are diagnostic
+counterexamples, not GW accuracy or convergence certificates.

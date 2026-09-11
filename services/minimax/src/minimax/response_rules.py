@@ -6,6 +6,7 @@ Run183, with adaptive order and an interval certificate instead of its fixed
 Na gate. No campaign modules or GW implementation are imported.
 """
 from functools import lru_cache
+import hashlib
 import math
 
 import numpy as np
@@ -63,7 +64,57 @@ def _panel_bounds(n, left, right, z, delta_max):
     return vb, db
 
 
-def response_bank_rule(z_ry, delta_max_ry, *, rel_tol=1e-8):
+def _node_digest(rule):
+    """Identify the integration arrays independently of current projections."""
+    digest = hashlib.sha256()
+    for key in ("t", "h", "coefficient_rows"):
+        if key in rule:
+            array = np.ascontiguousarray(rule[key], dtype="<f8")
+            digest.update(key.encode())
+            digest.update(str(array.shape).encode())
+            digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _bank_bounds(z, delta, edges, orders, eta):
+    """Continuum panel errors plus the complete infinite-time tail."""
+    vb, db = np.zeros(z.size), np.zeros(z.size)
+    for left, right, n in zip(edges[:-1], edges[1:], orders):
+        v, d = _panel_bounds(n, left, right, z, delta)
+        vb += v
+        db += d
+    stop = edges[-1]
+    vb += 2*np.exp(-z.imag*stop)/z.imag
+    db += np.exp(-z.imag*stop)*(1+z.imag*stop)/(np.abs(z)*z.imag**2)
+    return eta*vb, eta**3*db
+
+
+def _reuse_bank_rule(previous, z, delta, rel_tol):
+    """Revalidate fixed positive time nodes at the current complex points."""
+    cert = previous["certificate"]
+    if _node_digest(previous) != previous.get("node_digest"):
+        raise ValueError("response rule node digest mismatch")
+    if cert["rel_tol"] != rel_tol:
+        return None, "tolerance changed"
+    if delta > cert["delta_max_ry"]:
+        return None, "transition interval escaped"
+    eta = float(z.imag.min())
+    vb, db = _bank_bounds(z, cert["delta_max_ry"], cert["panel_edges"],
+                          cert["orders"], eta)
+    if max(vb.max(), db.max()) > rel_tol:
+        return None, "current frequency certificate failed"
+    t, h = previous["t"], previous["h"]
+    value = h[None, :]*np.exp(1j*z[:, None]*t)
+    result = dict(previous, projection_value=value,
+                  projection_derivative=value*(1j*t[None, :]/(2*z[:, None])))
+    result["certificate"] = dict(cert, eta_ry=eta,
+        z_ry=[[v.real, v.imag] for v in z], value_bound=vb.tolist(),
+        derivative_bound=db.tolist())
+    return result, "current domain and frequency certificates pass"
+
+
+def response_bank_rule(z_ry, delta_max_ry, *, rel_tol=1e-8,
+                       previous=None, domain_pad_ry=0.0):
     """Positive shared Hermite time rule for current response samples.
 
     Parameters
@@ -75,6 +126,11 @@ def response_bank_rule(z_ry, delta_max_ry, *, rel_tol=1e-8):
     rel_tol : float
         Peak-scaled absolute tolerance: eta*|value error| and
         eta**3*|d/ds error|, eta=min(Im(z)). Not relative W accuracy.
+    previous : dict or None
+        In-memory rule from this owner. Reuse only its integration arrays;
+        recompute projections and certify every current z, including the tail.
+    domain_pad_ry : float
+        Nonnegative extra transition extent when a new rule is necessary.
 
     Returns
     -------
@@ -88,6 +144,14 @@ def response_bank_rule(z_ry, delta_max_ry, *, rel_tol=1e-8):
     delta = float(delta_max_ry)
     if not np.isfinite(delta) or delta < 0:
         raise ValueError('delta_max_ry must be finite and nonnegative')
+    if not np.isfinite(domain_pad_ry) or domain_pad_ry < 0:
+        raise ValueError('domain_pad_ry must be finite and nonnegative')
+    reason = "initial rule"
+    if previous is not None:
+        reused, reason = _reuse_bank_rule(previous, z, delta, rel_tol)
+        if reused is not None:
+            return dict(reused, reuse_status="hit", reuse_reason=reason)
+    delta += domain_pad_ry
     eta = float(z.imag.min())
     stop = _tail_x(rel_tol)/eta
     freq = max(delta+float(np.abs(z.real).max()), eta)
@@ -103,8 +167,6 @@ def response_bank_rule(z_ry, delta_max_ry, *, rel_tol=1e-8):
     edges = np.r_[0., early, np.arange(1, count+1)*width]
     panel_count = len(edges)-1
     nodes, weights, orders = [], [], []
-    vb_total = np.zeros(z.size)
-    db_total = np.zeros(z.size)
     for left, right in zip(edges[:-1], edges[1:]):
         for n in range(2, 257):
             vb, db = _panel_bounds(n, left, right, z, delta)
@@ -117,17 +179,13 @@ def response_bank_rule(z_ry, delta_max_ry, *, rel_tol=1e-8):
         nodes.append(left+(right-left)*(x+1)/2)
         weights.append((right-left)*h/2)
         orders.append(n)
-        vb_total += vb
-        db_total += db
     t, h = np.concatenate(nodes), np.concatenate(weights)
-    vtail = 2*np.exp(-z.imag*stop)/z.imag
-    dtail = np.exp(-z.imag*stop)*(1+z.imag*stop)/(np.abs(z)*z.imag**2)
-    vbound, dbound = eta*(vb_total+vtail), eta**3*(db_total+dtail)
+    vbound, dbound = _bank_bounds(z, delta, edges, orders, eta)
     if max(vbound.max(), dbound.max()) > rel_tol:
         raise RuntimeError('Hermite certificate failed')
     value = h[None, :]*np.exp(1j*z[:, None]*t)
     derivative = value*(1j*t[None, :]/(2*z[:, None]))
-    return dict(t=t, h=h, projection_value=value,
+    result = dict(t=t, h=h, projection_value=value,
                 projection_derivative=derivative,
                 certificate=dict(status='PASS', scope='continuum |delta|<=delta_max; all supplied z',
                     norm='eta*absolute(value), eta**3*absolute(ds); paired branches',
@@ -136,6 +194,9 @@ def response_bank_rule(z_ry, delta_max_ry, *, rel_tol=1e-8):
                     derivative_bound=dbound.tolist(), orders=orders,
                     panel_edges=edges.tolist(), time_max=float(stop),
                     owner='Run212 Hermite / Run307 unequal-decay panels'))
+    return dict(result, node_digest=_node_digest(result),
+                reuse_status="build" if previous is None else "rebuild",
+                reuse_reason=reason)
 
 
 def _row_certificate(t, weights, n, anchor, hi, intervals):
@@ -172,7 +233,42 @@ def _row_certificate(t, weights, n, anchor, hi, intervals):
     return maximum, roundoff
 
 
-def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8):
+def _reuse_laplace_rule(previous, lo, hi, z, rel_tol):
+    """Reuse certified inverse-moment rows; update the Taylor projections."""
+    cert = previous["certificate"]
+    if _node_digest(previous) != previous.get("node_digest"):
+        raise ValueError("response rule node digest mismatch")
+    a, b = cert["delta_ry"]
+    if cert["rel_tol"] != rel_tol:
+        return None, "tolerance changed"
+    if lo < a or hi > b:
+        return None, "transition interval escaped"
+    order, anchor = cert["order"], cert["eta_ry"]
+    x = (z*z+anchor*anchor)/(a*a)
+    rho = np.abs(x)/(1+(anchor/a)**2)
+    if np.any(rho >= 1):
+        return None, "current Taylor domain does not converge"
+    vr, dr = rho**(order+1), rho**order*((order+1)+order*rho)
+    amp = (1+rho)/(1-rho)
+    vb = vr+amp*max(cert["row_relative_bounds"])
+    db = dr+amp**2*max(cert["row_relative_bounds"])
+    if max(vb.max(), db.max()) > rel_tol:
+        return None, "current frequency certificate failed"
+    powers = (z*z+anchor*anchor)[:, None]**np.arange(order+1)
+    dpowers = np.zeros_like(powers)
+    dpowers[:, 1:] = np.arange(1, order+1)*(z*z+anchor*anchor)[:, None]**np.arange(order)
+    rows = previous["coefficient_rows"]
+    result = dict(previous, projection_value=powers@rows,
+                  projection_derivative=dpowers@rows)
+    result["certificate"] = dict(cert, z_ry=[[v.real, v.imag] for v in z],
+        rho=rho.tolist(), value_taylor_bounds=vr.tolist(),
+        derivative_taylor_bounds=dr.tolist(), value_bound=vb.tolist(),
+        derivative_bound=db.tolist())
+    return result, "current domain and frequency certificates pass"
+
+
+def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
+                          previous=None, domain_pad_ry=0.0):
     """Positive NNLS inverse-moment rows and remote response projections.
 
     Parameters
@@ -199,7 +295,20 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8):
     lo, hi = float(delta_lo_ry), float(delta_hi_ry)
     if not np.isfinite(lo+hi) or not 0 < lo <= hi:
         raise ValueError('remote Laplace interval must be finite and positive')
+    if not np.isfinite(domain_pad_ry) or domain_pad_ry < 0:
+        raise ValueError('domain_pad_ry must be finite and nonnegative')
+    reason = "initial rule"
+    if previous is not None:
+        reused, reason = _reuse_laplace_rule(previous, lo, hi, z, rel_tol)
+        if reused is not None:
+            return dict(reused, reuse_status="hit", reuse_reason=reason)
     eta = float(z.imag.min())
+    padded_lo = max(lo-domain_pad_ry, lo/2)
+    # Padding must not move a valid remote cell across its Taylor boundary.
+    # Keeping the physical lower edge still admits later gap increases.
+    if np.all(np.abs(z*z+eta*eta) < padded_lo*padded_lo+eta*eta):
+        lo = padded_lo
+    hi += domain_pad_ry
     anchor = eta/lo
     a0 = 1+anchor*anchor
     x = (z/lo)**2+anchor*anchor
@@ -263,7 +372,7 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8):
     db = dr+amp_d*max(errors)
     if max(vb.max(), db.max()) > rel_tol:
         raise RuntimeError('remote combined certificate failed')
-    return dict(t=t/lo, coefficient_rows=rows/lo**(2*np.arange(order+1)[:, None]+1),
+    result = dict(t=t/lo, coefficient_rows=rows/lo**(2*np.arange(order+1)[:, None]+1),
                 projection_value=value, projection_derivative=derivative,
                 certificate=dict(status='PASS', scope='continuum delta interval; all supplied z',
                     norm='relative value and ds', delta_ry=[lo, hi],
@@ -273,3 +382,6 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8):
                     value_taylor_bounds=vr.tolist(), derivative_taylor_bounds=dr.tolist(),
                     value_bound=vb.tolist(), derivative_bound=db.tolist(),
                     owner='Run183 positive NNLS inverse-moment rows'))
+    return dict(result, node_digest=_node_digest(result),
+                reuse_status="build" if previous is None else "rebuild",
+                reuse_reason=reason)

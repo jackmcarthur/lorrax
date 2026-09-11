@@ -2929,14 +2929,14 @@ def _resolve_shared_pole_inputs(params):
         raise ValueError(
             "shared_pole needs a positive spectral measure: MP1 occupations "
             "are non-monotonic; use occ_smearing_family = fd")
-    if coerce_head_correction(params['head_correction']) is not HeadCorrection.OFF:
-        raise ValueError(
-            "shared_pole head correction NOT_MEASURED; use mpa or head_correction = off")
-    unused = sorted(named.intersection({
-        "mpa_n_poles", "mpa_sampling_alpha", "mpa_sampling_schedule",
-        "mpa_pole_solver", "mpa_varpi_near_ry", "mpa_varpi_far_ry",
-        "mpa_metal_origin_shift_ry", "mpa_pole_batch_size", "mpa_fit_reuse_file",
-        "mpa_overwrite_completed_artifacts"}))
+    head_enabled = coerce_head_correction(params['head_correction']) is not HeadCorrection.OFF
+    unused_keys = {"mpa_pole_batch_size", "mpa_fit_reuse_file",
+                   "mpa_overwrite_completed_artifacts"}
+    if not head_enabled:
+        unused_keys.update({"mpa_n_poles", "mpa_sampling_alpha", "mpa_sampling_schedule",
+            "mpa_pole_solver", "mpa_varpi_near_ry", "mpa_varpi_far_ry",
+            "mpa_metal_origin_shift_ry"})
+    unused = sorted(named.intersection(unused_keys))
     if unused:
         raise ValueError(
             f"GATE shared_pole_unused_inputs: got: {', '.join(unused)}; "
@@ -4656,9 +4656,10 @@ class SCConfig:
     - ``history_depth``: rCROP history (m=5 is BGW's QSGW default).
     - ``mixing``: linear-mixing α (``accelerator="linear"`` only).
     - ``dump_dir``: per-iteration E/U-history .npy dump dir (None = off).
-    - ``exact_degeneracy_tol_ev``: maximum splitting for the symmetric
-      accidental-degeneracy average.  The default is 0.1 meV; physical SOC
-      splittings above it remain distinct states.
+    - ``exact_degeneracy_tol_ev``: maximum splitting for SC state-identity
+      and frontier-tail grouping.  The default is 0.1 meV; physical SOC
+      splittings above it remain distinct states. Full SC operators are
+      not diagonally averaged.
     - ``tail_fit``: ``"frontier"`` uses the lowest accidental-degeneracy
       conduction manifold for the energy-only sum-band tail;
       ``"all_conduction"`` is the historical affine-fit diagnostic control;

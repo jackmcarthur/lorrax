@@ -796,10 +796,12 @@ def _mpa_sigma_model_resources(W_by_role, sigma_w_model, head_correction=None):
         fit_path = handle["path"]
         fit_identity, fit_digest = handle["identity"], handle["digest"]
         if getattr(head_correction, "value", head_correction) != "off":
-            raise ValueError(
-                "GATE shared_pole_head: shared_pole head correction NOT_MEASURED; "
-                "use mpa or head_correction = off")
-        head_fit_path = None
+            head_fit_path = W_by_role.get("mpa_head")
+            if (head_fit_path is None or head_fit_path.get("identity") != fit_identity
+                    or head_fit_path.get("body_digest") != fit_digest):
+                raise ValueError("GATE shared_pole_head: current body-bound MPA scalar head is missing or stale")
+        else:
+            head_fit_path = None
     else:
         try:
             fit_path = W_by_role["mpa_fit"]
@@ -1482,8 +1484,9 @@ def compute_sigma_xc(
         if head_fit_path is None:
             print_fn("  shared-pole scalar head: OFF by explicit head_correction policy")
         else:
-            head = mpa_store.read_head_fit_collective(
-                head_fit_path, mesh_xy=mesh_xy, to_unit="Ry")
+            head = (head_fit_path if isinstance(head_fit_path, dict) else
+                mpa_store.read_head_fit_collective(
+                    head_fit_path, mesh_xy=mesh_xy, to_unit="Ry"))
             compatible_occ_hashes = ()
             if occupation_state is not None:
                 from .efermi import legacy_square_mesh_occupation_digests
@@ -1524,8 +1527,8 @@ def compute_sigma_xc(
             # and the two are indistinguishable in the bytes.
             expected_screening_diagrams=config.screening.diagrams,
             fixed_quadrature_session=(
-                None if sigma_w_model == "shared_pole" or fixed_quadrature_session is None else
-                fixed_quadrature_session.setdefault("mpa", {})),
+                None if fixed_quadrature_session is None else
+                fixed_quadrature_session.setdefault(sigma_w_model, {})),
             print_fn=print_fn)
         head_diag = None
         if head is not None:

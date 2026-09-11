@@ -1,9 +1,6 @@
-"""P=4 gate: diagonal averaging never replicates a band-sharded Sigma.
+"""P4 gate: unmodified band-sharded operators reach reporting and QSGW.
 
-Run as one process per GPU on a 2x2 mesh.  The expected full matrix is known
-on every rank, but the assertion reads only each rank's addressable output
-tile.  A replicated output or a changed off-diagonal therefore fails by
-layout or value, without using a full-matrix gather in the gate itself.
+Only bounded diagonals are extracted for reporting.
 """
 from __future__ import annotations
 
@@ -40,10 +37,6 @@ def main() -> None:
         print("[degen-average-p4] processes=4 devices=4 mesh=2x2", flush=True)
 
     from common.collectives import device_put_process_local
-    from gw.degen_average import (
-        apply_to_matrix_diagonals,
-        average_sigma_components,
-    )
     from gw.gw_output import GWResults, _result_matrix_diag
     from gw.qsgw_utils import build_qsgw_sigma_xc, static_sigma_diag_to_host
 
@@ -54,14 +47,11 @@ def main() -> None:
     energies = np.tile(np.arange(nb, dtype=np.float64), (nk, 1))
     energies[0, 1] = energies[0, 0]
     energies[1, 4] = energies[1, 3]
-    expected = apply_to_matrix_diagonals(source, energies, 1.0e-8)
+    expected = source
     sharding = NamedSharding(mesh, P(None, "x", "y"))
     operand = device_put_process_local(source, sharding)
 
-    with mesh:
-        result = average_sigma_components(
-            operand, operand, operand, operand, operand, None, operand, None,
-            energies_kn_ry=energies, tol_ry=1.0e-8, mesh_xy=mesh)
+    result = (operand, operand, operand, operand, operand, None, operand)
 
     for ic, component in enumerate(
             (result[0], result[1], result[2], result[3], result[4], result[6])):

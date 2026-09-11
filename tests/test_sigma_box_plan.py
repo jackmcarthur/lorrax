@@ -945,3 +945,24 @@ def test_cache_never_substitutes_clock_and_step_rules(tmp_path):
         str(tmp_path), rule.box, 1e-4, True,
         noise_amplification_cap=1e9, reduction_steps=10)
     assert best is not None
+
+
+def test_fixed_crossing_to_relative_recertifies_contained_support(monkeypatch):
+    from gw.sigma_box_plan import _fit_fixed_sc_rules
+    calls = []
+    def build(box, eps, **kw):
+        calls.append(box)
+        return _fake_rule(box, eps, **kw)
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", build)
+    common = dict(name="moving", states=[.1], pole_stats=[(.3,.3,.05,.05)],
+                  pole_sign=1., eta_ry=.1)
+    before = make_sigma_box_spec(frequencies=[.2,.5], **common)
+    after = make_sigma_box_spec(frequencies=[.2,.3], **common)
+    assert before['kind'] == 'crossing' and after['kind'] == 'sign_definite_negative'
+    session = {}
+    kw = dict(eps=1e-4, reduction_seconds=120., cache_dir=None, session=session)
+    _fit_fixed_sc_rules([before], .1, **kw)
+    calls.clear()
+    fit, _, receipt = _fit_fixed_sc_rules([after], .1, **kw)
+    assert len(calls) == 1 and receipt['rebuilt'] == ('moving',)
+    assert fit[0]['relative']

@@ -35,6 +35,7 @@ shared_real_pole_v1_r3b = {
     "multiplet_relative_tolerance": 1.0e-6,
     "bank_rule_tolerance": 1.0e-8,
     "moment_convention": "S_m = 2 M_(2m+1); physical M1 and M3 only",
+    "operator_realization": "little-group-reynolds-v1",
     "production": {"direction_cutoff": 1.0e-3, "imaginary_width_fraction": 0.25,
                    "infinity_width_fraction": 0.125, "sigma_tolerance": 1.0e-4},
     "relaxed": {"direction_cutoff": 1.0e-2, "imaginary_width_fraction": 0.125,
@@ -65,13 +66,17 @@ _GATE_ROWS = {
     "stream_peak": ("inherited response stream peak <= threshold * incumbent MPA stream peak on the same deck and processor geometry, using the same measurement method", 1.05),
     "sigma_peak": ("inherited Sigma peak including one incumbent-shaped W <= threshold * incumbent MPA Sigma peak on the same deck, processor geometry and window plan, using the same measurement method", 1.05),
     "rule_validity": ("bank and Sigma certificates cover current domains at resolved tolerances", True),
-    "sc_rebuild": ("samples, directions, poles, ranks, intervals and rules rebuilt at current bands and occupations", True),
+    "sc_rebuild": ("physical samples, directions, poles and ranks rebuilt at current bands and occupations; reused quadrature certified for current domains", True),
 }
 shared_real_pole_gates_v1_r3b = {
     name: {"name": name, "predicate": predicate, "threshold": threshold,
            "version": GATE_VERSION}
     for name, (predicate, threshold) in _GATE_ROWS.items()
 }
+
+# The SC quadrature contract changed independently of all numerical gates.
+shared_real_pole_gates_v1_r3b["sc_rebuild"]["version"] = "sc_quadrature_recertification_20260910"
+
 
 for _name, _range in (("full_m1_defect", (2.2e-6, 1.9e-5)),
                       ("full_m3_defect", (3.6e-5, 1.7e-4))):
@@ -574,6 +579,7 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
         raise ValueError("GATE shared_pole_plasma: got: nonpositive/nonfinite active charge or cell volume; want: positive finite electrons and bohr^3; why: omega_p requires positive density")
     meta.shared_pole_census = {
         "mu_ry": mu, "gap_ev": gap_ev, "partial_at_mu": partial_at_mu,
+        "energy_span_ry": float(energies.max()-energies.min()),
         "active_electrons": electrons, "cell_volume_bohr3": volume,
         "state_capacity": capacity, "k_weights": weights.tolist(),
         "k_weight_sum": float(weights.sum()), "k_weight_rule": "authenticated full-BZ quadrature weights",
@@ -587,7 +593,44 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     }
 
 
-def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
+def _support_envelope(required, key, session):
+    """Keep a run-local scalar enclosure; never retain samples or a census.
+
+    The reference map uses its current interval without retaining it. The
+    first interacting map seeds the enclosure: an initial DFT gap can be
+    substantially smaller and select a different imaginary support count.
+    Increasing L/u_min is conservative for the imaginary-count heuristic.
+    This is a sampling-geometry enclosure, not an interpolation-error bound;
+    the bank still certifies its current energies at every supplied frequency.
+    """
+    version = "sc_interacting_support_enclosure_20260910"
+    scope = "sampling geometry only; interpolation accuracy not certified"
+    if not session.get("reference_complete", False):
+        session["reference_complete"] = True
+        return dict(version=version, status="initial_reference", epoch=-1,
+                    required=dict(required), retained=dict(required), scope=scope)
+    previous = session.get("envelope")
+    same_policy = previous is not None and session.get("key") == key
+    envelope = dict(required)
+    if same_policy:
+        envelope = {
+            "line_top_ev": max(previous["line_top_ev"], required["line_top_ev"]),
+            "u_min_ev": min(previous["u_min_ev"], required["u_min_ev"]),
+            "u_max_ev": max(previous["u_max_ev"], required["u_max_ev"]),
+        }
+    changed = not same_policy or envelope != previous
+    status = ("initial" if previous is None else
+              "policy_changed" if not same_policy else
+              "expanded" if changed else "hit")
+    epoch = session.get("epoch", -1) + int(changed)
+    session.update(key=key, envelope=envelope, epoch=epoch)
+    return dict(version=version, status=status,
+                epoch=epoch, required=dict(required), retained=dict(envelope),
+                scope=scope)
+
+
+def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
+                              support_session=None):
     """Resolve DESIGN §5 from current metadata into scalars and small arrays.
 
     ``bind_shared_pole_census`` must have consumed this map's occupation state.
@@ -597,6 +640,11 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
     role code is reserved (moments need no bank evaluation). Conjugates are
     constructor states, never bank calls. ``support_pair`` int64 [role,2]
     binds held endpoints; [-1,-1] means not a held midpoint.
+    ``support_session`` optionally retains only scalar support bounds and a
+    policy/basis key across SC maps, after one unretained reference map.
+    Enclosed current intervals regenerate the same points and roles, while
+    the census and capacity ledger remain fresh.
+    Expanding intervals enlarge the envelope; policy changes start a new one.
     All ranks execute the metadata work; only ``print_fn`` may filter by rank.
     """
     import numpy as np
@@ -627,6 +675,19 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
     scale = eta / recipe['reference_eta_ev']
     low_step = recipe['line_low_step_ev'] * scale
     high_step = recipe['line_high_step_ev'] * scale
+    umin, umax = max(height, census['gap_ev']), max(recipe['imaginary_floor_max_ev'], top)
+    if umin >= umax:
+        raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
+    support_receipt = None
+    if support_session is not None:
+        key = (RECIPE_HASH, tier, eta, int(meta.nspinor), int(meta.n_rmu),
+               census['logical_band_count'])
+        support_receipt = _support_envelope(
+            dict(line_top_ev=top, u_min_ev=umin, u_max_ev=umax), key,
+            support_session)
+        retained = support_receipt['retained']
+        top, umin, umax = (retained['line_top_ev'], retained['u_min_ev'],
+                           retained['u_max_ev'])
     if tier == 'relaxed':
         line = np.linspace(0.0, top, policy['line_count'])
     else:
@@ -637,9 +698,6 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
         high = ([edge + i * high_step for i in range(math.ceil((top-edge)/high_step))]
                 if top > edge else [])
         line = np.asarray(low + high + [top], dtype=np.float64)
-    umin, umax = max(height, census['gap_ev']), max(recipe['imaginary_floor_max_ev'], top)
-    if umin >= umax:
-        raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
     kappa = top / umin
     count = max(recipe['imaginary_min_count'], round(
         math.log(16 * kappa**2) * math.log(4 / recipe['imaginary_count_epsilon'])
@@ -705,8 +763,11 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
         'bank_rule_tolerance': recipe['bank_rule_tolerance'],
         'sigma_tolerance': policy['sigma_tolerance'],
         'moment_convention': recipe['moment_convention'], 'census': dict(census),
+        'operator_realization': recipe['operator_realization'],
         'U_bytes_per_rank': meta.shared_pole_capacity.U_bytes_per_rank,
     }
+    if support_receipt is not None:
+        result['support_envelope'] = support_receipt
     result['metadata_array_bytes'] = sum(v.nbytes for v in result.values()
                                          if isinstance(v, np.ndarray))
     rules = {
@@ -727,6 +788,11 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn):
         'U_bytes': '16*nk_full*(nspinor*nmu)^2/(Px*Py), logical bytes/rank',
         'metadata': 'sum of replicated metadata array nbytes',
     }
+    if support_receipt is not None:
+        rules.update(top='SC high-water envelope of omega_p+3.5 eV',
+                     u_min='SC low-water envelope of max(h,logical gap)',
+                     u_max='SC high-water envelope of max(16 eV,L)',
+                     support_envelope='current required bounds and retained sampling enclosure; not an interpolation-error certificate')
     for key, value in result.items():
         shown = value.tolist() if isinstance(value, np.ndarray) else value
         rule = next((v for prefix, v in rules.items() if key.startswith(prefix)),

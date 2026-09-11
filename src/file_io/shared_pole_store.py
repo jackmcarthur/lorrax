@@ -642,6 +642,40 @@ def read_shared_pole_census(io, *, header, capacity=None):
     return jnp.where(active, poles, 1.0), counts
 
 
+def read_shared_pole_matrix(io, q_span, *, meta, header):
+    """Read b[mu_X,K_Y] for bounded matrix evaluation, in packed order.
+
+    Returns complex128 [q,mu,Kp], float64 poles² [q,Kp] and int64 K [q].
+    Unlike the two endpoint faces used by Sigma, this matrix remains on all
+    processors even for one Gamma parent. Only scalar pole tables replicate.
+    """
+    from runtime.padding import padded_axis
+
+    if header.get("validation_receipt", {}).get("status") == "NOT_MEASURED":
+        _refuse("metadata-only validation cannot authorize tensor reads")
+    if header["schema"] != SCHEMA or not header["finalized"]:
+        _refuse("matrix reader requires a finalized model")
+    basis, ledger = _check_basis(meta, header), _capacity(meta)
+    _check_io_capacity(ledger, io.mesh, header)
+    lo, hi = _span(q_span, header["n_q_irr"], "q_span")
+    spec = P(None, "x", None, "y")
+    width = padded_axis(max(1, header["Kmax"]), io.mesh, name="shared_pole_K",
+                        specs=((spec, 3),)).carrier
+    shape = (hi-lo, basis.n_canonical, 1, width)
+    arg, output, temporary = _conversion_bytes(basis, shape, spec, unpack=False)
+    scalar = 32*(hi-lo)*width
+    _admit(ledger, "read_matrix", output+scalar, arg+temporary+output,
+           device_panel=max(arg, scalar), native_host=True, io=io)
+    b = io.read_slab("factor", shape=shape, offset=(lo, 0, 0, 0), partition_spec=spec)
+    b = basis.pack_axis(b, 1, spec=spec)
+    poles = io.read_slab("poles2_ry2", shape=(hi-lo, width), offset=(lo, 0),
+                         partition_spec=P())
+    counts = jnp.asarray(header["K"][lo:hi], jnp.int64)
+    active = jnp.arange(width)[None, :] < counts[:, None]
+    return (jnp.where(active[:, None, :], b[:, :, 0, :], 0),
+            jnp.where(active, poles, 1.0), counts)
+
+
 def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
     """Read canonical row faces and pack once at the I/O boundary.
 

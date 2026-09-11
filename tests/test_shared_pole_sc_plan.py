@@ -47,3 +47,21 @@ def test_incumbent_sc_plan_still_uses_owner(monkeypatch):
     config = NS(compute_mode=ComputeMode.MPA, sigma=NS(w_model='mpa'), do_G0=False)
     requests, plan, z = _sc_head_frequency_plan(config, object(), material_class='metal')
     assert requests == [] and plan is sentinel and z == [1j]
+
+
+def test_shared_full_head_uses_mpa_owner_at_current_energy_span(monkeypatch):
+    from gw.gw_config import HeadCorrection
+    from gw.mpa import model, sample_plan
+    seen = []
+    def owner(config, quad, **kw):
+        seen.append(quad.x_max)
+        return quad.x_max
+    monkeypatch.setattr(model, 'make_mpa_plan', owner)
+    monkeypatch.setattr(sample_plan, 'plan_z', lambda plan: [plan+1j])
+    config = NS(compute_mode=ComputeMode.MPA, sigma=NS(w_model='shared_pole'),
+                head=NS(correction=HeadCorrection.FULL), do_G0=True)
+    for span in (3., 3.2):
+        _, plan, z = _sc_head_frequency_plan(config, None, material_class='insulator',
+            shared_pole_recipe={'census': {'energy_span_ry': span}})
+        assert plan == span and z == [span+1j, 0j]
+    assert seen == [3., 3.2]

@@ -72,12 +72,11 @@ def test_write_w_is_a_debug_key_announced_at_parse_time(tmp_path, capsys):
 
 @pytest.mark.parametrize('head', [None, 'full', 'no_local_fields'])
 @pytest.mark.parametrize('tier', ['production', 'relaxed'])
-def test_shared_enabled_head_refuses(tmp_path, head, tier):
-    with pytest.raises(ValueError) as caught:
-        parse(tmp_path, f'compute_mode=mpa\nsigma_w_model=shared_pole\nsigma_w_accuracy={tier}\n',
+def test_shared_enabled_head_uses_scalar_mpa(tmp_path, head, tier):
+    c = parse(tmp_path, f'compute_mode=mpa\nsigma_w_model=shared_pole\nsigma_w_accuracy={tier}\nmpa_n_poles=6\n',
               head=head)
-    assert str(caught.value) == (
-        'shared_pole head correction NOT_MEASURED; use mpa or head_correction = off')
+    assert c.head.correction.value == ('full' if head is None else head)
+    assert c.mpa.n_poles == 6
 
 
 @pytest.mark.parametrize('head', [None, 'full', 'no_local_fields'])

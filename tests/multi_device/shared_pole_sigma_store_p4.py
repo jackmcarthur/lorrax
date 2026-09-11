@@ -16,7 +16,7 @@ def main(runtime):
     from jax.sharding import PartitionSpec as P
     from file_io import shared_pole_store as store
     from file_io.slab_io import SlabIO
-    from gw.mpa.sigma import _shared_pole_w_synthesis
+    from gw.mpa.sigma import _shared_pole_w_synthesis, _shared_pole_fixed_q_policy
     from gw.mpa.sigma_windows import shared_pole_frequencies
 
     parser = argparse.ArgumentParser()
@@ -27,9 +27,11 @@ def main(runtime):
     assert jax.process_count() == jax.device_count() == 4
     assert mesh.shape['x'] > 1 and mesh.shape['y'] > 1
     helpers = runpy.run_path('tests/test_shared_pole_store.py')
-    meta, tables, recipe, identity = helpers['_fixture'](mesh)
-    _, packed, poles, counts = helpers['_model'](meta)
-    packed[0, :, 0, 1] *= np.exp(1j*np.arange(packed.shape[1]))
+    meta, tables, recipe, identity = helpers['_sigma_fixture'](mesh)
+    C, packed, poles, counts = helpers['_model'](meta)
+    C=C[...,:4];poles=poles[:,:4];counts=np.minimum(counts,4)
+    C[0, :, 0, 1] *= np.exp(1j*np.arange(C.shape[1]))
+    packed=meta.mu_basis.pack_host(C,axis=1)
     put = lambda a, spec: helpers['_device'](np.asarray(a), mesh, spec)
     path = args.output / 'model.h5'
     header = store.write_shared_pole_model(
@@ -46,13 +48,18 @@ def main(runtime):
     phase = put(np.ones(3), P())
     e, t = put(np.asarray(.6), P()), put(np.asarray(.7+.2j), P())
     omega = np.sqrt(poles)
-    active = (omega > 1) & (omega <= 4) & (np.arange(6)[None, :] < counts[:, None])
+    active = (omega > 1) & (omega <= 4) & (np.arange(4)[None, :] < counts[:, None])
     weights = np.where(active, np.exp(-1j*(omega-.6)*(.7+.2j))/(2*omega), 0)
-    C = packed[:, :, 0, :]
-    expected = np.einsum('qik,qk,qjk->qij', C, weights, C.conj())
-    assert np.max(np.abs(expected[0]-expected[0].T)) > 0.1
-    expected[0] = 0.5*(expected[0]+expected[0].T)
-    expected = expected[np.asarray(header['qirr']['irr_idx_q'])]
+    # Independent endpoint oracle, with the known paired operation rows.
+    paired=np.asarray([0,0,6,2,4,0,8,6,10])
+    policy=_shared_pole_fixed_q_policy(header)
+    assert np.array_equal(policy.unfold_sym_idx,paired) and policy.n_pair_rewired==4, policy.unfold_sym_idx
+    oracle_helpers = runpy.run_path('tests/multi_device/shared_pole_dense_oracle.py')
+    expected = oracle_helpers['full_q_operator'](C, weights, tables, paired)
+    expected=meta.mu_basis.pack_host(meta.mu_basis.pack_host(expected,axis=1),axis=2)
+    from symmetry_maps import q_negation_index
+    neg=q_negation_index((3,3,1))
+    assert np.max(np.abs(expected-expected[neg].transpose(0,2,1)))<1e-10
     oracle = put(expected, P(None, 'x', 'y'))
     results = []
     with SlabIO(path, mode='r', mesh=mesh) as io:
@@ -62,8 +69,6 @@ def main(runtime):
                 io, meta, header, frequencies,
                 schedule, mesh_xy=mesh)
             got = build(None, None, indices, bounds, phase, e, t)
-            receipt = schedule["fixed_q_asymmetry"]
-            assert receipt["parents"][0]["status"] == "WARN"
             error = float(jax.numpy.max(jax.numpy.abs(got-oracle)))
             assert error < 1e-10, (b, c, error)
             # A changed window must invalidate cached selectors, including
@@ -76,7 +81,7 @@ def main(runtime):
             assert repeat < 1e-10
             results.append(dict(parent_capacity=b, column_capacity=c,
                                 dense_error=error, restored_window_error=repeat,
-                                fixed_q_asymmetry=receipt))
+                                q_pair_rewired=policy.n_pair_rewired))
             del build, got, zero, again
     report = dict(status='PASS', job_step=os.environ['SLURM_JOB_ID']+'.'+os.environ['SLURM_STEP_ID'],
         scope='P4 canonical store + local full-q synthesis, ragged K, forced q/K panels and window refresh',

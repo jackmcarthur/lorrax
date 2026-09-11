@@ -410,7 +410,7 @@ def sort_shared_pole_columns(model, *, mesh_xy):
 
 
 def shared_pole_passivity(model, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, gates):
-    """Test 0 <= V^-1/2 [-W(i eta)] V^-1/2 <= I on Coulomb support.
+    """Test raw latent-model passivity on the authenticated Coulomb support.
 
     The authenticated inverse square root [b,n,n] and b [b,n,Kp] are
     face-tiled complex128. Lambda/active [b,Kp] are replicated. Returns
@@ -420,6 +420,24 @@ def shared_pole_passivity(model, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, 
     whitened = matmul(inverse_coulomb_sqrt, b)
     weight = jnp.where(active, 1 / (poles + eta_ry**2), 0)
     response = matmul(whitened * weight[:, None, :], whitened, transb="C")
+    return _passivity_response_checks(response, eigh=eigh, gates=gates)
+
+
+def shared_pole_operator_passivity(wc, inverse_coulomb_sqrt, *, matmul, eigh, gates):
+    """Test an evaluated physical Wc(i eta) against the actual V support.
+
+    ``wc`` may include the versioned symmetry realization; no factors of its
+    averaged residues need to be materialized. Both square operands retain
+    their caller's all-P faces. The caller owns evaluation at imaginary eta
+    and memory admission, including the two square GEMMs and eigensolve.
+    """
+    inverse = inverse_coulomb_sqrt
+    response = -matmul(matmul(inverse, wc), inverse)
+    return _passivity_response_checks(response, eigh=eigh, gates=gates)
+
+
+def _passivity_response_checks(response, *, eigh, gates):
+    """Common 0 <= whitened response <= I and Hermiticity gate."""
     herm = _hermitian(response)
     norm = jnp.linalg.norm(herm, axis=(-2, -1))
     anti = jnp.linalg.norm(response - _adjoint(response), axis=(-2, -1))
@@ -971,7 +989,13 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             with timing.section("spole.gates"):
                 for name in ("gram_diagonal_positive", "gram_valid", "retained_metric_positive"):
                     if not bool(jnp.all(reduction[name])):
-                        raise ValueError(f"GATE shared_pole_{name}: got: failed at q={q}, metric infinity norm={reduction['metric_initial_infinity_norm']}, inverse-root residual={reduction['metric_inverse_root_residual_relative']}; want: valid Gram and retained metric; why: no PSD repair")
+                        raise ValueError(
+                            f"GATE shared_pole_{name}: got: failed at q={q}, "
+                            f"Gram min/max={reduction['gram_min_relative']}, "
+                            f"metric infinity norm={reduction['metric_initial_infinity_norm']}, "
+                            f"inverse-root residual={reduction['metric_inverse_root_residual_relative']}; "
+                            f"want: Gram min/max >= {gates['normalized_gram_validity']['threshold']} "
+                            "and valid diagonal/retained metric; why: no PSD repair")
                 if batch_results is None:
                     model, zero = apply_shared_pole_zero_policy(model, gates=gates)
                 if not bool(jnp.all(zero["zero_policy"])):
@@ -1069,6 +1093,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 # All scalar reductions precede rank-selective store formatting.
                 price = capacity(r)
                 row = {"q_span": list(span), "roles": roles,
+                       "diagnostic_operator": "raw-latent-pole-model",
                        "K": np.asarray(counts).tolist(), "J": int(np.unique(np.asarray(poles)[np.asarray(mask)]).size),
                        "damping_fraction": 0.0, "capacity": price, "coulomb": coulomb_receipt,
                        "condition": np.asarray(reduction["gram_condition"]).tolist(),
@@ -1089,12 +1114,12 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                     "normalized_gram_validity": dict(value=float(reduction["gram_min_relative"][0]), passed=True, reason="normalized Gram spectrum"),
                     "zero_ritz_policy": dict(value=float(zero["dropped_factor_weight_fraction"][0]), passed=True, reason="physical factor weight, sentinels excluded"),
                     "finite_factors_poles": dict(value=True, passed=True, reason="zero policy, active prefix and exact inert sentinels"),
-                    "passivity": dict(value={k: np.asarray(v).tolist() for k, v in passive.items() if k != "passivity"}, passed=True, reason="authenticated inverse Coulomb square root at current eta"),
-                    "retained_subspace_moments": dict(value=row["retained_moment_relative"], passed=True, reason="A=Y†GE, B=YA; pencil B†(G,H)B/2 versus model A†(I,Lambda)A/2"),
-                    "held_w": dict(value=held, passed=True, reason="held W and dW/ds diagnostics recorded; no universal acceptance threshold"),
-                    "model_reciprocity": dict(value=reciprocity, passed=True, reason="sampled model W/dW transpose symmetry, conditional on symmetric reference; applicability recorded per sample"),
-                    "full_m1_defect": dict(value=float(moment_defects["M1"]["full_relative"][0]), passed=bool(moment_defects["M1"]["full_relative"][0] <= gates["full_m1_defect"]["threshold"]), reason="physical full M1 defect; CD8 diagnostic band, never a refusal"),
-                    "full_m3_defect": dict(value=float(moment_defects["M3"]["full_relative"][0]), passed=bool(moment_defects["M3"]["full_relative"][0] <= gates["full_m3_defect"]["threshold"]), reason="physical full M3 defect; CD8 diagnostic band, never a refusal"),
+                    "passivity": dict(value={k: np.asarray(v).tolist() for k, v in passive.items() if k != "passivity"}, passed=True, reason="raw latent model; authenticated inverse Coulomb square root at current eta; projected operator not measured"),
+                    "retained_subspace_moments": dict(value=row["retained_moment_relative"], passed=True, reason="raw latent Ritz identity: A=Y†GE, B=YA; pencil B†(G,H)B/2 versus model A†(I,Lambda)A/2"),
+                    "held_w": dict(value=held, passed=True, reason="raw latent W and dW/ds diagnostics; projected operator not measured; no universal acceptance threshold"),
+                    "model_reciprocity": dict(value=reciprocity, passed=True, reason="raw latent model sampled W/dW transpose symmetry, conditional on symmetric reference; projected operator not measured; applicability recorded per sample"),
+                    "full_m1_defect": dict(value=float(moment_defects["M1"]["full_relative"][0]), passed=bool(moment_defects["M1"]["full_relative"][0] <= gates["full_m1_defect"]["threshold"]), reason="raw latent model versus physical full M1; projected moment not measured; CD8 diagnostic band, never a refusal"),
+                    "full_m3_defect": dict(value=float(moment_defects["M3"]["full_relative"][0]), passed=bool(moment_defects["M3"]["full_relative"][0] <= gates["full_m3_defect"]["threshold"]), reason="raw latent model versus physical full M3; projected moment not measured; CD8 diagnostic band, never a refusal"),
                     "representation": dict(value={"nspinor": 1, "trs_allowed": True}, passed=True, reason="current typed symmetry capability"),
                     "capacity": dict(value=price, passed=True, reason="conservative aggregate constructor live-set price"),
                     "sc_rebuild": dict(value=identity, passed=True, reason="current recipe/census authenticated; directions and Ritz model rebuilt"),

@@ -196,7 +196,7 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
             "(diagonal on-shell), self_consistent (rebuild G/W/Sigma)") in text
     assert "EQP2 treatment  : off (set write_eqp2=true" in text
     assert "RPA Dyson series; minimax imaginary-axis quadrature" in text
-    assert "Degenerate sets: averaged at 1.36057e-05 eV" in text
+    assert "Degenerate sets: reporting diagonals averaged at 1.36057e-05 eV" in text
     assert " Ry" not in text and "Rydberg" not in text
     assert "Coulomb system : 2D slab; Hartree=live G-space" in text
     assert "Full BZ grid   : 2 k points" in text
@@ -318,7 +318,7 @@ def test_incomplete_sigma_coverage_is_an_actionable_final_warning(tmp_path):
     assert "Coverage status : INCOMPLETE" in text
     assert "Grid shortfall  : 0.05000 eV below; 0.15000 eV above" in text
     assert "WARNINGS" in text
-    assert "dynamic Sigma grid is incomplete for protected DFT states" in text
+    assert "dynamic Sigma grid is incomplete for requested DFT output bands" in text
     assert "Sigma(E_DFT) has 4/6 out-of-grid cells" in text
     assert "out-of-range policy=clamp" in text
     assert "sigma_omega_min_ev / sigma_omega_max_ev" in text

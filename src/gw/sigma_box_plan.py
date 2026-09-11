@@ -833,6 +833,12 @@ def _fit_fixed_sc_rules(
             reasons[spec["name"]] = "absent from iteration 1"
             continue
         escaped = _box_escape_reasons(entry["fit"]["rule_box"], spec["box"])
+        if bool(entry["fit"]["relative"]) != (spec["kind"] != "crossing"):
+            escaped.append("absolute/relative error currency changed")
+        growth = _factor_growth(entry["fit"]["times"], spec["pole_sign"],
+            spec["states"], spec["pole_stats"], spec["E_ref_A"], spec["E_ref_B"])
+        if max(growth) > _FACTOR_GROWTH_CAP:
+            escaped.append("current separated factors exceed growth bound")
         if escaped:
             rebuild.append(spec)
             reasons[spec["name"]] = "box escape: " + "; ".join(escaped)
