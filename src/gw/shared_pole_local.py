@@ -15,8 +15,8 @@ def pack_parent_panels(states, infinity, counts, infinity_counts, *, mesh_xy, pa
     [b,n,r_a] face panels. ``counts`` is host int [b,A] from spectral cuts;
     ``infinity_counts`` is host int [b]. Only O(bR) offsets/masks cross to
     the device. Panels stay face-tiled through the existing y permutation.
-    In the resolved local layout, identical Q objects (conjugate ports)
-    are packed once; a [b,R_f] column map restores them after movement.
+    In the resolved local layout, reused Q objects and WQ partner directions
+    are transported once; a [b,R_f] column map restores them after movement.
     The distributed layout retains its original complete Q face.
     Return the finite/infinity/mask/map bundle and original (R_f,r_inf)
     extents. No physical or native eigensolve dimension changes.
@@ -41,12 +41,16 @@ def pack_parent_panels(states, infinity, counts, infinity_counts, *, mesh_xy, pa
         raise ValueError(f"unknown shared-pole panel layout: {layout}")
     sources = []
     source_for = []
+    output_for = []
     for i, state in enumerate(states):
+        output_source = next((j for j, previous in enumerate(states[:i])
+                              if layout == "local" and state[1] is previous[2]), None)
         source = next((j for j in sources if layout == "local"
                        and state[1] is states[j][1]), i)
-        if source == i:
+        if source == i and output_source is None:
             sources.append(i)
         source_for.append(source)
+        output_for.append(output_source)
     sources = tuple(sources)
     unique_widths = [widths[i] for i in sources]
     unique_offsets = np.cumsum([0, *unique_widths[:-1]])
@@ -68,12 +72,18 @@ def pack_parent_panels(states, infinity, counts, infinity_counts, *, mesh_xy, pa
         tail_q[selected_q] = False
         unique_order[q] = selected_q + np.flatnonzero(tail_q).tolist()
         packed_offsets = dict(zip(sources, np.cumsum([0, *[row[i] for i in sources[:-1]]])))
+        output_offsets = np.cumsum([0, *row[:-1]])
         start = 0
         for port, (width, count) in enumerate(zip(row, retained)):
-            source = source_for[port]
+            output_source = output_for[port]
+            source = source_for[port] if output_source is None else output_source
             if (width, count) != (row[source], retained[source]):
                 raise ValueError("identical Q ports must have identical retained counts")
-            columns[q, start:start+width] = packed_offsets[source] + np.arange(width)
+            if output_source is None:
+                columns[q, start:start+width] = packed_offsets[source] + np.arange(width)
+            else:
+                # -1 is padding; <=-2 addresses an already transported WQ.
+                columns[q, start:start+width] = -2-output_offsets[source]-np.arange(width)
             active[q, start:start+int(count)] = True
             start += width
         active[q, rf:rf+int(infinity_counts[q])] = True
@@ -173,10 +183,12 @@ def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
 
     def one(args):
         finite, infinity, active, index, columns = args
-        # Recreate the original Q panel only for this local parent. Copying
-        # columns changes neither directions nor the pencil's arithmetic.
+        # Recreate Q only for this parent. Adjoint partners alias an existing
+        # WQ panel, so no second line-direction block crosses this boundary.
         q = jnp.where(columns[None, :] >= 0,
-                      jnp.take(finite[1], jnp.maximum(columns, 0), axis=-1), 0)
+                      jnp.take(finite[1], jnp.maximum(columns, 0), axis=-1),
+                      jnp.where(columns[None, :] <= -2,
+                                jnp.take(finite[2], jnp.maximum(-2-columns, 0), axis=-1), 0))
         finite = (finite[0], q, finite[2], finite[3])
         if parent_extents is None:
             return solve(finite, infinity, active)
@@ -257,7 +269,7 @@ def local_model_checks(mesh_xy, native_eigh):
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.shard_map import shard_map
     from common.staged_reshard import face_to_batch_reshard
-    from gw.shared_pole_constructor import shared_pole_passivity
+    from gw.shared_pole_constructor import shared_pole_passivity, shared_pole_reciprocity
     from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
 
     to_batch = face_to_batch_reshard(mesh_xy)
@@ -277,13 +289,14 @@ def local_model_checks(mesh_xy, native_eigh):
         exact = jnp.stack((wc, dw))
         errors = jnp.linalg.norm(values-exact, axis=(-2, -1)) / jnp.maximum(
             jnp.linalg.norm(exact, axis=(-2, -1)), jnp.finfo(jnp.float64).tiny)
-        return jax.tree.map(lambda a: a[0], passive), errors
+        reciprocity = shared_pole_reciprocity(values, exact, gates=gates)
+        return jax.tree.map(lambda a: a[0], passive), errors, reciprocity
 
     mapped = shard_map(
         lambda b, p, m, inv, w, dw, s, eta: jax.lax.map(
             lambda row: one(row, s, eta), (b, p, m, inv, w, dw)),
         mesh=mesh_xy, in_specs=(qspec,)*6+(P(), P()),
-        out_specs=(qspec, qspec), check_vma=False)
+        out_specs=(qspec, qspec, qspec), check_vma=False)
 
     @jax.jit
     def execute(model, inverse, wc, dw, supports, eta):

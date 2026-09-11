@@ -25,13 +25,15 @@ def check(mesh):
         return jax.make_array_from_callback(a.shape,sh,lambda i:a[i])
     fn=local_model_checks(mesh,distrib_la.plan('eigh',mesh,n=n,backend='off',batched_route='batch_reshard').native_fn)
     args=(tuple(put(a,P(None,'x','y') if i==0 else P()) for i,a in enumerate((c,poles,mask))),put(inv,P(None,'x','y')),put(wc,P(None,None,'x','y')),put(dw,P(None,None,'x','y')),put(supports,P()),put(np.asarray(eta),P()))
-    passive,errors=fn(*args)
+    passive,errors,reciprocity=fn(*args)
+    assert np.all(np.asarray(reciprocity['passed']))
+    assert not np.any(np.asarray(reciprocity['applicable']))
     assert float(jnp.max(errors))<1e-12
     expected=np.linalg.eigvalsh((c/(poles+eta**2)[:,None,:]) @ c.conj().swapaxes(-1,-2))
     np.testing.assert_allclose(np.asarray(passive['passivity_max']),expected[:,-1],rtol=1e-12,atol=1e-15)
     assert np.all(np.asarray(passive['passivity']))
     changed=list(args);changed[2]=args[2]*1.01
-    _,red=fn(*changed)
+    _,red,_=fn(*changed)
     np.testing.assert_allclose(np.asarray(red)[:,0],.01/1.01,rtol=1e-12)
     return dict(status='PASS',max_held_relative=float(jnp.max(errors)),scope='P4 q-local held W/dW, passivity dense identity, changed-input red')
 
