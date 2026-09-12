@@ -1280,27 +1280,31 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
     # a full re-validation is exactly the work a restart exists to avoid.
     # Anything else keeping that name still refuses: the overwrite guard is
     # what protects a one-shot run from a second map writing over it.
-    for kind, path in list(targets.items()):
+    # ``pending`` is what still has to be WRITTEN; ``targets`` stays whole,
+    # because it is also this map's keep-set for retention below and a
+    # retained export must not be released as if it belonged to an earlier map.
+    pending = dict(targets)
+    for kind, path in targets.items():
         if not path.exists():
             continue
         if not _export_is_current(path, identity=handle["identity"],
                                   digest=handle["digest"]):
             _refuse(f"export already exists: {path}; use a fresh output directory")
-        del targets[kind]
+        del pending[kind]
         outputs[kind] = dict(path=str(path), status="retained", reason=(
             "export already written from this model identity and digest; "
             "restart rewrote nothing"))
         print_fn(f"shared-pole export: {kind} at {path} was written from this "
                  "model; retained, not rewritten")
     bank_source = source.parent / "bank.h5"
-    if "w" in targets:
+    if "w" in pending:
         if not bank_source.is_file():
             _refuse(f"write_w needs the current-map bank {bank_source}; "
                     "a model-only restart cannot supply frequency samples")
         bank_header = validate_shared_pole_bank(bank_source,
             expected_identity=handle["identity"], mesh_xy=mesh_xy, require_complete=True)
-    if "poles" in targets:
-        path = targets["poles"]
+    if "poles" in pending:
+        path = pending["poles"]
         spec = P(None, "x", None, "y")
         shape = mesh_divisible_shape((1, basis.n_canonical, 1, model["Kmax"]), mesh_xy, spec)
         arg, output, temp = _conversion_bytes(basis, shape, spec, unpack=False)
@@ -1329,8 +1333,8 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                     ledger.live_stages = previous
         _export_spatial_header(path, source_wfn, meta, kind="poles", source=source)
         outputs["poles"] = dict(path=str(path), payload_bytes=model["compact_payload_bytes"])
-    if "w" in targets:
-        path = targets["w"]
+    if "w" in pending:
+        path = pending["w"]
         output_header = initialize_shared_pole_bank(path, meta=meta, tables=tables,
             recipe=bank_header["recipe"], identity=handle["identity"], mesh_xy=mesh_xy)
         previous = ledger.live_stages
@@ -1362,7 +1366,10 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
         _export_spatial_header(path, source_wfn, meta, kind="w", source=bank_source)
         outputs["w"] = dict(path=str(path), payload_bytes=bank_header["payload_bytes"])
     for kind, receipt in outputs.items():
-        print_fn(f"write_{kind}: {receipt['path']}; payload={receipt['payload_bytes']} bytes")
+        size = receipt.get("payload_bytes")
+        print_fn(f"write_{kind}: {receipt['path']}; "
+                 + (f"payload={size} bytes" if size is not None
+                    else f"status={receipt['status']}"))
     _retain_current_map_exports(targets, run_dir=run_dir, label=label,
         identity=handle["identity"], mesh_xy=mesh_xy, print_fn=print_fn)
     return outputs

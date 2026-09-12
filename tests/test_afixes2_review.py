@@ -285,3 +285,25 @@ def test_one_shot_and_sc_read_the_same_deck_key():
         assert "occ_smearing_family" in source
     config = SimpleNamespace(occ_smearing_family="mp1")
     assert sc_iteration._declared_smearing_family(config) == "mp1"
+
+
+def test_a_retained_export_stays_in_the_retention_keep_set():
+    """Item 4, second order: retention must not release what was retained.
+
+    ``_retain_current_map_exports`` UNLINKS every managed export not in the
+    set it is handed, so the keep-set is this map's whole target set --
+    including an export that was retained rather than rewritten. Dropping a
+    retained kind from that set would delete the file the restart just chose
+    to keep.
+    """
+    from file_io import shared_pole_store
+    tree = ast.parse(Path(shared_pole_store.__file__).read_text())
+    export = next(node for node in ast.walk(tree)
+                  if isinstance(node, ast.FunctionDef)
+                  and node.name == "export_shared_pole_outputs")
+    call = next(node for node in ast.walk(export)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_retain_current_map_exports")
+    assert call.args and isinstance(call.args[0], ast.Name)
+    assert call.args[0].id == "targets", (
+        "retention was handed %r, not the whole target set" % call.args[0].id)
