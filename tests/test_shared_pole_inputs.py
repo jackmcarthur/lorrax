@@ -70,6 +70,43 @@ def test_write_w_is_a_debug_key_announced_at_parse_time(tmp_path, capsys):
     assert 'NOT needed for BSE' in report and 'write_poles' in report
 
 
+def test_shared_pole_self_consistency_refuses_a_headless_deck(tmp_path):
+    """MEASURED (claim 2189): shared-pole SC with the head off dies at map 1.
+
+    Both halves matter.  The refusal fires at PARSE, because the failure it
+    replaces costs a whole SC map (~160 s on the smallest reference deck)
+    and then reports a numerical Gram gate at q=0 that says nothing about
+    the head.  And it is SCOPED to self-consistency: a headless one-shot
+    shared-pole run is not covered by that evidence and must still parse.
+    """
+    sc = ('compute_mode=mpa\nsigma_w_model=shared_pole\n'
+          'qp_solver=self_consistent\n')
+    with pytest.raises(ValueError) as caught:
+        parse(tmp_path, sc, head='off')
+    message = str(caught.value)
+    assert 'GATE shared_pole_self_consistent_needs_a_head' in message
+    # The three keys that together select the refused configuration, so a
+    # deck author can see which one to change.
+    for key in ('sigma_w_model = shared_pole', 'qp_solver = self_consistent',
+                'head_correction = off'):
+        assert key in message, key
+    # The way out the owner ruled for, and the measured reason.
+    assert 'head_correction = full' in message
+    assert 'q = 0' in message and 'map 1' in message
+
+    # The same deck with a head parses.
+    with_head = parse(tmp_path, sc + 'mpa_n_poles=6\n', head='full')
+    assert with_head.sigma.w_model == 'shared_pole'
+    assert with_head.head.correction.value == 'full'
+    assert with_head.qp_solver.value == 'self_consistent'
+
+    # A headless ONE-SHOT shared-pole run is untouched.
+    one_shot = parse(tmp_path, 'compute_mode=mpa\nsigma_w_model=shared_pole\n'
+                               'qp_solver=one_shot_dft\n', head='off')
+    assert one_shot.sigma.w_model == 'shared_pole'
+    assert one_shot.head.correction.value == 'off'
+
+
 @pytest.mark.parametrize('head', [None, 'full', 'no_local_fields'])
 @pytest.mark.parametrize('tier', ['production', 'relaxed'])
 def test_shared_enabled_head_uses_scalar_mpa(tmp_path, head, tier):

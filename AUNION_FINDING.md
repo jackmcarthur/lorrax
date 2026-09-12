@@ -5,9 +5,11 @@ pre-existing defect it inherits and does not cause.** Every conflict is
 resolved keeping both sides; every clean-merge file is reviewed by hand; the
 union imports and passes its contracts at P4; its numerical movement on Si is
 ACONJ's deliberate change and nothing else; it *passes* an every-rank peak gate
-that ACONJ alone failed; and the multi-map shared-pole SC death at map 1 is
-reproduced on two sources that are strict subsets of the union, one of which is
-the SC branch alone, so the union introduces it — no.
+that ACONJ alone failed; and on the owner's preferred deck (an MPA head correction at every
+iteration) the union runs multi-map shared-pole SC **past map 1 and map 2**.
+The map-1 death reported below is a property of a HEADLESS deck, reproduced on
+three sources including the SC branch alone, and the union inherits it rather
+than causing it.
 
 Branch `integ/sp-union-2026-09-11`, tip `9160c501`, base `810c260b`.
 Worktree `/pscratch/sd/j/jackm/wt_sp_union`. Run root
@@ -260,9 +262,41 @@ Gate is −1e−07 (`shared_pole_recipe.py`, ten times `bank_rule_tolerance`).
    actual z ladder within `rel_tol` 1e−8. Worth flagging for whoever fixes it:
    the margin is closing fast — map 0 sat at 96.2% of the certified Δ_max, map 1
    at 98.4% — so a run that got past map 1 would escape within a map or two.
-5. **The gate was not loosened and must not be.** A realized Gram 20× outside
-   the rule's own 1e−8 while the rule's certificate says PASS is the interesting
-   gap, and it is at q=0 specifically. Registered as a pre-existing defect.
+5. **The gate was not loosened and must not be.** −1e−07 is a data-tolerance
+   gate on the bank's own certification, and TASTE 77 exempts the eigensolver
+   and the fit from bit identity, not the bank from its certificate.
+
+### Leg 4 — the same question with the head ON, which is the deck that matters
+
+Owner ruling 2026-09-11: *an MPA head correction at every iteration*. That is
+run 49's deck — `head_correction = full` with `sc_head_update = off`, which
+builds the DFT direct response once and folds it exactly once through each
+iteration's resident W. Run verbatim on the union, changing only `restart`
+(this directory has no ISDF tensors to restore) and `sc_max_iter`, plus run 49's
+own `dipole.h5` symlinked in, because `head_correction = full` refuses without
+one.
+
+**The union passes.** Job `58216796`, P4, `07_sc_head/union_long/map_probe.json`:
+
+| map | wall | result |
+|---:|---:|---|
+| 0 | 273.3 s | **OK** (gap 1.497936 eV, max\|dE\| 1.554223 eV) |
+| 1 | 66.8 s | **OK** |
+| 2 | 46.3 s | **OK** |
+| 3 | 59.8 s | **OK** |
+
+The SC branch alone, run beside it on the same pool with the same deck, matches:
+map 0 368.5 s OK, map 1 66.5 s OK, with identical cache counts. So the union
+reproduces the SC line's validated behaviour exactly, and the headless map-1
+death is a **deck** property.
+
+That rescopes the registered defect to what was actually measured:
+`sigma_w_model = shared_pole` + `qp_solver = self_consistent` +
+`head_correction = off` dies at map 1 on the q=0 Gram gate and should refuse at
+PARSE time rather than 160 s in. It is scoped to SC — a headless **one-shot**
+shared-pole run is untouched by this evidence. The mechanism is consistent: the
+failure is at q=0 on every headless source, which is exactly where the head
+correction acts, and with the head on q=0 is fine.
 
 ### Two probes AMEM could not measure, now measured
 
@@ -270,18 +304,45 @@ Gate is −1e−07 (`shared_pole_recipe.py`, ten times `bank_rule_tolerance`).
 caches with no `cache_clear` anywhere in `src/gw/`. Across the map 0 → map 1
 boundary, on **both** the union and the SC branch alone:
 
-| cache | after map 0 | during map 1 | hits |
-|---|---:|---:|---:|
-| `_parent_panel_packer` | 2 | **3** | **0** |
-| `local_parent_reducer` | 2 | **3** | **0** |
+On the **headless** arms, which never reach map 2, `currsize` goes 2 → 3 across
+the map 0/1 boundary with zero hits on both caches, on the union and on the SC
+branch alike.
 
-The keys change per map and nothing evicts. Two points establish growth, not a
-rate; the slope needs a run that gets past map 1.
+On the **head-on** arm, which does get past map 1, the picture is richer and
+the earlier "zero hits" reading does not survive more maps — reported here
+rather than the convenient version:
+
+| map | `_parent_panel_packer` currsize / hits | `local_parent_reducer` currsize / hits |
+|---:|---:|---:|
+| 0 | 2 / 0 | 2 / 0 |
+| 1 | 4 / 0 | 4 / 0 |
+| 2 | 4 / 2 | 5 / 1 |
+| 3 | 5 / 3 | 7 / 1 |
+
+So partial reuse **does** begin at map 2, but `currsize` still grows
+monotonically and the two caches grow at different rates — the reducer kept
+growing at map 2 while the packer held. Neither has a `cache_clear` anywhere in
+`src/gw/`. This is growth with partial reuse, not a pure leak and not a
+converged cache; the slope over a full run is the number the memory question
+needs.
 
 On-disk scratch, exports off: `sc_0000_shared_pole/` 1.685 GB,
 `sc_0001_shared_pole/` 1.491 GB (partial). The scratch tree is unbounded per
 map on the default path; the union neither improves nor worsens it, and nothing
 here is ARETAIN's export retention, which is bounded and separately tested.
+
+### Leg 5 — Na P16 identity, against the campaign's own `810c260b` control
+
+`03_na_p16/union/gate.json`, union driver job `58212398`, gate `58216796`,
+reference ACONJ's control arm `58209192.21`. **7 of 7 checks PASS.**
+
+* 29 parents, 12 rules all certifying, all model invariants PASS including
+  `model_reciprocity`.
+* **All 16 rank peaks byte-equal to the control** — every delta exactly 0.
+* Σ max change **0.3644 meV** (ACONJ alone: 0.334 meV).
+* QP eqp1, Σ box [−5, 5] eV: delivered 41 rows, median 10.515 µeV, max
+  46.034 µeV; all 2494 rows, median 0.317 µeV, max 82.070 µeV; **zero rows over
+  2 meV either way**.
 
 ## What the union does better than either parent
 

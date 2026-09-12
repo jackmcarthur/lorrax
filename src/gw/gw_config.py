@@ -3951,6 +3951,56 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
         "<D_TT> and this deck is outside its envelope")
 
 
+def refuse_headless_shared_pole_self_consistency(config) -> None:
+    """Refuse shared-pole SC with the head off, at PARSE time.
+
+    MEASURED, 2026-09-11 (AUNION, claim 2189).  ``sigma_w_model =
+    shared_pole`` with ``qp_solver = self_consistent`` and
+    ``head_correction = off`` completes map 0 and then dies inside map 1 on
+    ``GATE shared_pole_gram_valid`` at q=0 -- the parent where the head
+    correction acts.  Three independent sources were measured on the same
+    Si deck and all three fail: the SC quadrature branch alone
+    (Gram min/max -2.294e-07), the seven-lane union (-2.012e-07), and
+    base+ARETAIN; the gate is -1e-07.  The SAME union tip runs the SAME
+    material past map 1 and map 2 with ``head_correction = full``
+    (job 58216796), so this is a property of the deck, not of the source.
+
+    Two reasons it is a REFUSAL rather than a warning.  It is not a
+    production configuration -- headless modes are debug-only by owner
+    ruling 2026-09-01, and the owner's 2026-09-11 preference is an MPA head
+    correction at every iteration.  And discovering it costs a whole map:
+    ~160 s on the smallest reference deck, proportionally more on anything
+    real, after which the run dies with a numerical gate message that says
+    nothing about the head.
+
+    SCOPED TO SELF-CONSISTENCY ON PURPOSE.  A headless shared-pole
+    ONE-SHOT run is not covered by this evidence and is not refused here;
+    it remains a legitimate debug run.
+    """
+    if (getattr(config.sigma, "w_model", "mpa") != "shared_pole"
+            or config.qp_solver is not QPSolver.SELF_CONSISTENT
+            or config.head.correction is not HeadCorrection.OFF):
+        return
+    raise ValueError(
+        "GATE shared_pole_self_consistent_needs_a_head: "
+        "shared-pole self-consistency requires a head correction.\n"
+        "  got:  sigma_w_model = shared_pole, qp_solver = self_consistent, "
+        "head_correction = off\n"
+        "  want: head_correction = full (an MPA head correction at every "
+        "iteration -- owner ruling 2026-09-11), or qp_solver = one_shot_dft "
+        "if a headless shared-pole run is what you meant\n"
+        "  why:  MEASURED.  This combination completes map 0 and then dies "
+        "inside map 1 on GATE shared_pole_gram_valid at q = 0, the parent "
+        "where the head correction acts.  Measured on three independent "
+        "sources (Gram min/max -2.29e-07, -2.01e-07 against a -1e-07 gate); "
+        "the same source runs past map 1 and map 2 with head_correction = "
+        "full.  Refused here rather than one map in, because the failure "
+        "costs a full map and its message names numerics, not the head.  A "
+        "headless one-shot shared-pole run is NOT refused.\n"
+        "  doc:  docs/input_reference.md, head_correction / sigma_w_model; "
+        "KNOWN_LORRAX_ISSUES.md; claim 2189.")
+
+
 def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate four-current modes and require live direct fields for QSGW.
 
@@ -6004,6 +6054,7 @@ class LorraxConfig:
         refuse_unsupported_bgw_metal_q0_treatment(resolved)
         refuse_unsupported_screening_diagrams(resolved)
         refuse_unsupported_bispinor_gw(resolved)
+        refuse_headless_shared_pole_self_consistency(resolved)
         # ONE CANONICAL VOCABULARY FOR THE SELF-ENERGY AXIS, and a note for
         # the other one.  Same position and same reason as the two refusals
         # above: the announcement quotes the RESOLVED axes, which only the
