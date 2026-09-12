@@ -593,3 +593,130 @@ def test_the_adapter_reads_the_measured_verdict_and_nothing_else():
                 "a caller — an argument here is a way to assume TRS again")
             return
     raise AssertionError("qgrid_trs_policy_for is missing from the adapter")
+
+
+# ---------------------------------------------------------------------------
+# 8. The shared-pole tile symmetrisation (AGRAM2, 2026-09-12)
+#
+#    ``gw.qgrid_symmetry.symmetrise_shared_pole_tiles`` puts the bank tiles a
+#    shared-pole pencil is built from into the space the Sigma consumer
+#    already uses (``operator_realization = little-group-reynolds-v1``).  The
+#    action itself is owned by ``symmetry_maps.project_little_group_operator``
+#    and proved at P4 in ``tests/multi_device/qgrid_little_group_p4.py``; what
+#    is pinned HERE is the pair of properties the shared-pole caller depends
+#    on at a q that is NOT the origin -- where the umklapp phases are the
+#    whole difference between a projection and a permutation -- plus the
+#    adapter's own shape refusals.
+# ---------------------------------------------------------------------------
+
+def _glide_little_group_fixture():
+    """A 4x4x4 mesh with a glide (x,y) -> (-x, y+1/2) on 16 centroids.
+
+    The glide wraps centroids out of the cell, so ``L_table`` is nonzero and
+    every projected element carries ``exp(2 pi i q.L)``.  Rows 0/1 are
+    spatial, rows 2/3 are their antiunitary partners, exactly as the packed
+    canonical tables the shared-pole store authenticates.
+    """
+    points = np.array([(x/4, y/4, 0.) for x in range(4) for y in range(4)])
+    pulled = points.copy()
+    pulled[:, 0] *= -1
+    pulled[:, 1] -= .5
+    lattice = np.floor(pulled).astype(np.int32)
+    source = np.array([np.flatnonzero(np.all(np.isclose(points, p), axis=1))[0]
+                       for p in pulled - lattice])
+    eye = np.eye(3, dtype=np.int32)
+    reflection = np.diag([-1, 1, 1]).astype(np.int32)
+    return dict(
+        sym_mats_k=np.stack((eye, reflection, -eye, -reflection)),
+        sym_perm=np.stack((np.arange(16), source,
+                           np.arange(16), source)).astype(np.int32),
+        L_table=np.stack((np.zeros_like(lattice), lattice,
+                          np.zeros_like(lattice), lattice)),
+        active_symmetry_rows=np.arange(4, dtype=np.int32),
+        kgrid=(4, 4, 4), n_sym_spatial=2)
+
+
+def _one_rank_mesh():
+    import jax
+    from jax.sharding import Mesh
+
+    return Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+
+
+def test_little_group_projection_is_idempotent_and_closes_the_trim_transpose():
+    """Idempotent, TRIM-closing, and phase-bearing, all at q != 0.
+
+    ``q_full_idx = 8`` on a 4x4x4 mesh is ``q = (0, 1/2, 0)``: a TRIM, so the
+    little group contains the antiunitary rows and the Reynolds average must
+    CLOSE the transpose -- which is what makes the projection commute with
+    the TRIM transpose closure rather than merely coexist with it.  The last
+    assertion is the one that fails if anyone drops the umklapp phase: with
+    ``L_table`` zeroed the answer moves by order 1, not by order epsilon.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from symmetry_maps import project_little_group_operator, self_negative_q_mask
+
+    tables = _glide_little_group_fixture()
+    mesh = _one_rank_mesh()
+    ids = np.array([8], dtype=np.int32)
+    q = np.array([[0., .5, 0.]])
+    assert bool(np.asarray(self_negative_q_mask(ids, kgrid=tables["kgrid"]))[0])
+
+    rng = np.random.default_rng(2026091201)
+    tile = (rng.normal(size=(1, 16, 16))
+            + 1j*rng.normal(size=(1, 16, 16))).astype(np.complex128)
+    sh = NamedSharding(mesh, P(None, "x", "y"))
+    put = lambda a: jax.device_put(jnp.asarray(a), sh)
+
+    def project(value, **override):
+        operator = put(value)
+        return project_little_group_operator(
+            operator, transposed_partner=put(np.swapaxes(value, -1, -2)),
+            q_full_idx=ids, q_irr_frac=q, mesh=mesh,
+            **{**tables, **override})[0]
+
+    once = np.asarray(project(tile))
+    twice = np.asarray(project(once))
+    scale = np.linalg.norm(once)
+
+    # (a) idempotent: P P = P, to arithmetic.
+    assert np.linalg.norm(twice - once) / scale < 1e-14
+
+    # (b) the TRIM transpose closure is INSIDE the projection, so applying it
+    #     afterwards changes nothing, and applying it first changes nothing.
+    closure = lambda a: .5*(a + np.swapaxes(a, -1, -2))
+    assert np.linalg.norm(closure(once) - once) / scale < 1e-14
+    assert np.linalg.norm(np.asarray(project(closure(tile))) - once) / scale < 1e-14
+
+    # (c) the raw tile is nowhere near covariant, so (a)/(b) are not vacuous.
+    assert np.linalg.norm(tile - once) / scale > .1
+
+    # (d) the exp(2 pi i q.L) umklapp phases are load-bearing at this q.
+    phaseless = np.asarray(project(tile, L_table=np.zeros_like(tables["L_table"])))
+    assert np.linalg.norm(phaseless - once) / scale > .1
+
+
+def test_symmetrise_shared_pole_tiles_refuses_a_mis_shaped_batch():
+    """The adapter's own refusals, before it ever asks for symmetry tables.
+
+    Shape is checked first precisely so a caller that hands over the wrong
+    axis order learns that, rather than a confusing failure from deep inside
+    the store's operation-table authentication.
+    """
+    import sys
+
+    sys.path.insert(0, str(_SRC))
+    from gw.qgrid_symmetry import symmetrise_shared_pole_tiles
+
+    header = {"q_irr_full_idx": np.array([0, 1])}
+    call = lambda arrays, q_span: symmetrise_shared_pole_tiles(
+        arrays, meta=None, header=header, q_span=q_span, mesh_xy=None)
+
+    with pytest.raises(ValueError, match="parent tiles against q_span"):
+        call({"Wc": np.zeros((3, 4, 4))}, (0, 2))
+    with pytest.raises(ValueError, match="want a parent axis"):
+        call({"Wc": np.zeros((2, 4, 5))}, (0, 2))
+    with pytest.raises(ValueError, match="want a parent axis"):
+        call({"Wc": np.zeros((2, 4))}, (0, 2))
