@@ -1,19 +1,40 @@
 # AUNION — the complete seven-lane union, resolved and gated
 
-**VERDICT: the union is SAFE TO MERGE on the evidence below, with one
-pre-existing defect it inherits and does not cause.** Every conflict is
-resolved keeping both sides; every clean-merge file is reviewed by hand; the
-union imports and passes its contracts at P4; its numerical movement on Si is
-ACONJ's deliberate change and nothing else; it *passes* an every-rank peak gate
-that ACONJ alone failed; and on the owner's preferred deck (an MPA head correction at every
-iteration) the union runs **11 shared-pole SC maps** instead of one, to within
-6.3x of the convergence tolerance, before the same q=0 Gram gate stops it. The
-map-1 death is a property of a HEADLESS deck; the residual q=0 fragility is a
-pre-existing defect the union inherits rather than causes, reproduced on three
-sources including the SC branch alone, on which the union is equal or better on
-every comparison.
+**VERDICT: the union is SAFE TO MERGE.**
 
-Branch `integ/sp-union-2026-09-11`, tip `9160c501`, base `810c260b`.
+Every conflict is resolved keeping both sides; every clean-merge file is
+reviewed by hand; the union imports and passes its contracts at P4.
+
+* **Na P16: 7 of 7 gate checks pass** — 29 parents, 12 rules certifying, all
+  sixteen rank peaks byte-equal to the `810c260b` control, Σ 0.364 meV, no QP
+  row over 2 meV out of 2494.
+* **Si P4: 6 of 7, and it is a pass in substance.** The one failing check is the
+  unrestricted Σ_c that ACONJ's accepted deviation already covers; the governing
+  number is the delivered subset — median 9.4 µeV, max 0.86 meV, **zero rows
+  over 2 meV**, with every excursion at a clamped state at least 6.9 eV outside
+  the Σ box. The union reproduces ACONJ's own figures exactly, so the other five
+  lanes move Σ by nothing measurable.
+* **The merge improved an axis:** the union *passes* `every_rank_peak_nonincrease`
+  (−3.2 MB on rank 0) where ACONJ alone failed it (+512 B).
+* **The multi-map SC defect is inherited, not caused.** Headless, it dies at map
+  1 on three sources including the SC branch unmerged. With an MPA head
+  correction at every iteration it runs **11 of the ~12 maps this deck needs**
+  and stops one gate short. The union is equal or better on every comparison
+  against its parents, and the q=0 cause is **OPEN**.
+
+**The working configuration for shared-pole SC on the union is
+`sc_accelerator = linear`**, until the q=0 cause is closed: it converged this
+deck in 14 map calls where every rCROP arm stopped at map 11.
+
+Two hypotheses this lane advanced were **refuted by its own measurements** and
+are retracted in place below rather than quietly dropped — the CROP-amplification
+mechanism (by the conditioning probe) and the trial-fallback premise (by the
+end-to-end gate). Both had the same root: I misread where the trial sits.
+`x_trial = x + f` is the plain step, not an extrapolation. The conditioning guard
+that came out of the first is hardening, not a fix, and says so in its own
+source; the retry that came out of the second was removed.
+
+Branch `integ/sp-union-2026-09-11`, base `810c260b`.
 Worktree `/pscratch/sd/j/jackm/wt_sp_union`. Run root
 `runs/frequency_integration_sandbox/370_aunion_20260911` in the sandbox.
 
@@ -515,6 +536,119 @@ reference ACONJ's control arm `58209192.21`. **7 of 7 checks PASS.**
   46.034 µeV; all 2494 rows, median 0.317 µeV, max 82.070 µeV; **zero rows over
   2 meV either way**.
 
+### Leg 4e — the end-to-end gate, which refuted layer 2's premise too
+
+Run 49's deck under rCROP with both layers in, job `58216796`,
+`13_rcrop_fixed/union/map_probe.json`:
+
+| map | 0–10 | **11** | **12** | **13** |
+|---|---|---|---|---|
+| result | all OK | REFUSED | REFUSED | REFUSED |
+| Gram min/max | — | **−2.12168831e−07** | **−2.12168831e−07** | **−2.12168831e−07** |
+
+Three refusals, **byte-identical to the last digit**, then the bound stopped the
+loop. The machinery did everything it was designed to do — rejected the trial,
+agreed it across ranks, continued, bounded the retries, refused loudly — and the
+retry accomplished nothing, because it could not.
+
+**`x_trial = x + f` IS the plain step**, with the CROP mixing applied afterwards
+to make `x_new`. A fallback that "falls back to the plain step" by leaving `x`
+and `f` unchanged recomputes the identical trial from the identical state and
+gets the identical refusal. The byte-identical Gram across maps 11–13 is that
+no-op, measured. There is nothing cheaper to fall back to because the trial
+already is the cheapest step.
+
+So the retry was removed (`16c66e2b`): the refusal is immediate, carries the
+original gate text and its rank, and says in the message why no retry is
+offered. The real recovery — a **damped** step `x + alpha*f` with `alpha < 1` —
+is named there and explicitly **not implemented**; it is a physics change
+needing its own gating.
+
+**Why the earlier tests passed while the real deck did not**: they planted their
+refusal on a *call counter*, so the retry saw a different answer and appeared to
+recover. A planted transient on a deterministic function models nothing. The
+tests now assert the measured behaviour.
+
+**What this hands AGRAM**: the refusal is perfectly reproducible on an unchanged
+input — the same map refused three times with a byte-identical eigenvalue — so
+it is a **deterministic property of the map-10 state**, not a flaky excursion.
+
+### The working configuration, until the q=0 cause is closed
+
+**`sc_accelerator = linear`.** On this deck, head on, it converged after 14 GW
+map calls at `max|dE| = 0.000092 eV` against a `0.000100 eV` criterion, monotone,
+all four ranks `sc_rc=0`. Every rCROP arm of the same deck stopped at map 11.
+
+## For AGRAM — what is on disk, and what is not
+
+The q=0 cause is open and belongs to AGRAM. Paths rather than analysis.
+
+Run root `runs/frequency_integration_sandbox/370_aunion_20260911`. Four arms ran
+the head-on run 49 deck on the union; `union_bytes` and `10_crop_cond` produced
+**byte-identical** map-11 Gram values, so either is the reproducible one.
+
+| what | where |
+|---|---|
+| per-map constructor receipts, all parents, all gate rows incl. the full `normalized_gram_spectrum` | `07_sc_head/{union_long,union_bytes}/tmp/mpa/sc_NNNN_shared_pole/construction_receipt.json`, maps 0000–0010 |
+| the map-10 model the failing trial was built from | `07_sc_head/union_bytes/tmp/mpa/sc_0010_shared_pole/model.h5` (+ `bank.h5`, `coulomb.h5`) |
+| the map-11 scratch as it stood when the gate fired | `07_sc_head/union_bytes/tmp/mpa/sc_0011_shared_pole/` — bank and moments present, **no `model.h5`**: the constructor is where it dies |
+| per-map QP energies, the SC trajectory in observable form | `07_sc_head/union_long/eqp{0,1}_iter*.dat` |
+| per-map q=0 Gram minimum, worst non-q=0 parent, K, bank rule status and certified margin, as one table | `gram_trajectory.py <arm>` |
+| whether two runs got the same Σ rules | `compare_rule_receipts.py <log A> <log B>` |
+| per-map CROP `cond(G)`, `lambda_min`, `||gamma||_1` | `10_crop_cond/union/crop_conditioning.json` |
+
+**What is NOT on disk, and the one-line change that would put it there.** No SC
+Hamiltonian history: `sc_dump_dir` was deleted from run 49's deck when it was
+copied (it pointed at run 49's own directory) and not repointed. Setting it
+writes the aggregate E-history and each map's full-BZ DFT→QP rotation, which is
+what an offline reconstruction of the map-10 mixed point and the map-11 trial
+input would need. That is a deck line, not a code change.
+
+**Two things worth knowing before starting.** The failure is at q=0 on an
+*insulator* here, and ILAND's Na diagnosis (claim 1969) implicated the same
+parent; and the failing map is a **trial**, whose input is the plain Picard step
+`x + f` from a well-conditioned accepted point — so it is not an exotic
+extrapolated state.
+
+## Memory, in full
+
+**Device: flat.** `peak_bytes_in_use` has exactly one distinct value across all
+twelve maps and all devices, **4,420,365,380 B**. `bytes_in_use` rises
+75,176,268 → 78,090,444 → 78,978,353 over the first three maps — tracking the
+executable caches filling to their plateau — and then holds, alternating
+78,978,353 / 79,015,345 with the trial/accepted role.
+
+**Executable caches: converged, not leaking.** `_parent_panel_packer` plateaus at
+5 from map 3, `local_parent_reducer` at 8 from map 4, hits rising +2 per map
+after that with no further misses, reproduced entry for entry by the SC branch
+alone.
+
+**Host: NOT flat — it grows about 990 MiB and then asymptotes.**
+`jax.Device.memory_stats()` is device-only and these caches hold compiled XLA
+executables that live in host memory, so the flat device peak was never the
+whole answer. Rank-0 `/proc/self/status` per map
+(`13_rcrop_fixed/union/map_probe.json`, job `58216796`):
+
+| map | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| VmRSS MiB | 2722.2 | 3093.8 | 3310.9 | 3515.9 | 3573.5 | 3646.2 | 3668.7 | 3676.7 | 3698.8 | 3708.0 | 3713.7 |
+| increment | — | +371.6 | +217.1 | +205.0 | +57.6 | +72.7 | +22.5 | +8.0 | +22.1 | +9.2 | +5.7 |
+
+`VmHWM` is flat at 4239.4 MiB throughout. The increments fall by two orders of
+magnitude — +372 MiB at map 1, +5.7 MiB at map 10, and about +2 MiB per map over
+the refused maps 11–13 — so the growth tracks the executable caches filling to
+their plateau (packer by map 3, reducer by map 4) and JAX's own compilation
+caches warming, and then nearly stops. **Nearly, not exactly**: the tail is a
+couple of MiB per map rather than zero, which over hundreds of maps is hundreds
+of MiB. That is the quantified form of the residual below, and it is the number
+to watch if an SC run is ever asked to go much longer than this one.
+
+**The residual, unchanged and now with a number on it:** nothing evicts. There is
+no `cache_clear` anywhere in `src/gw/`, so a run whose spectral cuts never
+settle, or several decks in one process, would still grow — and even on a deck
+whose cuts DO settle, host RSS keeps adding ~2 MiB a map after the caches
+plateau.
+
 ## What the union does better than either parent
 
 Three things, all measured:
@@ -526,6 +660,17 @@ Three things, all measured:
 2. **The every-rank peak.** ACONJ alone failed it (+512 B on rank 0); the union
    passes it (−3.2 MB on rank 0, byte-equal on 1–3).
 3. **The Gram margin.** −2.012e−07 against the SC branch's −2.294e−07.
+
+## The two changes that landed, and what each is for
+
+Both on `integ/sp-union-2026-09-11`, both gated, neither adds a gate row or
+moves a hash.
+
+| | what it does | what it is for |
+|---|---|---|
+| `1001ccf6` | refuses `shared_pole` + `self_consistent` + `head_correction = off` at PARSE time | a measured dead configuration, refused in milliseconds instead of 160 s and a numerics message that never mentions the head. Scoped to SC; a headless one-shot still parses |
+| `2c07d77f` | CROP conditioning guard, selector form, bit-identical above the floor | **HARDENING ONLY.** A 1e-12 ridge on a unit-diagonal Gram is not a guard and collinearity near convergence is normal. It does **not** fix the map-11 failure — the probe showed the window was well conditioned there |
+| `3154e735` + `16c66e2b` | a trial whose physics gate refuses stops the run as `GATE sc_trial_refused`, carrying the original text and the rank that raised it, **rank-agreed before anyone branches** | **a better refusal, not a rescue.** The retry in the first cut was measured to be a no-op and removed — see below |
 
 ## Limits — what this does NOT claim
 
