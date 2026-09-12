@@ -170,6 +170,14 @@ def _solve_crop_alpha_v2(Fw: jnp.ndarray, filled_cols: jnp.ndarray) -> jnp.ndarr
     return jnp.concatenate([gamma, jnp.array([alpha_last])])
 
 
+#: Smallest eigenvalue of the unit-diagonal CROP Gram, RELATIVE to its
+#: largest, below which the extrapolation is damped instead of solved.  It is
+#: a condition bound, not a tolerance on anything physical: 1e-8 says "refuse
+#: to amplify this window by more than 1e8".  Above it the solve is the
+#: historical expression, unchanged.
+_CROP_CONDITION_FLOOR = 1.0e-8
+
+
 def _solve_crop_alpha_stacked(Fw: jnp.ndarray) -> jnp.ndarray:
     """``_solve_crop_alpha_v2`` for a STACKED window, no flatten.
 
@@ -213,8 +221,54 @@ def _solve_crop_alpha_stacked(Fw: jnp.ndarray) -> jnp.ndarray:
     # min ||f_trial + F_scaled δ||  ⇒  (FᴴF) δ = −Fᴴ f_trial;  γ = δ/scale.
     G = jnp.tensordot(jnp.conj(F_scaled), F_scaled, axes=(ax, ax))
     b = -jnp.tensordot(jnp.conj(F_scaled), f_trial, axes=(ax, tuple(range(f_trial.ndim))))
-    G = G + 1e-12 * jnp.eye(k, dtype=G.dtype)
-    gamma = jnp.linalg.solve(G, b) / scale
+    # CONDITIONING GUARD.  The columns above are unit norm, so G has a unit
+    # diagonal and its eigenvalues lie in [lambda_min, k].  The fixed 1e-12
+    # ridge is therefore relative -- and that is exactly why it does not
+    # guard: it only starts to matter once lambda_min has ALREADY reached
+    # 1e-12, by which point the solve has amplified by ~1e12.  Near
+    # convergence the residual differences become nearly collinear by
+    # construction, so lambda_min -> 0 is the normal behaviour of a
+    # converging window, not an edge case.
+    #
+    # MEASURED (claim 2189): on Si shared-pole SC eleven maps ran with the
+    # q=0 Gram at ~1e-9 against its -1e-07 gate, then one rCROP TRIAL map
+    # failed at -1.70e-07 while a source whose history differed only at the
+    # 1e-9 level passed the same map at -1.38e-09 and completed 13 maps.
+    #
+    # Why a SELECTOR and not the textbook column drop: this window is a
+    # sharded stacked array and k must stay static, so dropping the oldest
+    # column needs a shape this function cannot have.  The selector gets the
+    # property that matters instead -- above the floor it returns the
+    # unchanged historical expression, BIT-IDENTICAL, which is what lets
+    # this live on a path the incumbent MPA SC route also takes.  Below it,
+    # the ridge is tied to lambda_max rather than being an absolute
+    # constant, so the bound is a pure condition number.
+    #
+    # ||gamma||_1 is deliberately NOT clamped: that bounds the symptom, and
+    # a large well-conditioned gamma is legitimate.
+    #
+    # The flat sibling ``_solve_crop_alpha_v2`` has the same class of defect
+    # (1e-12 on R's diagonal, noted in this docstring) and is NOT changed
+    # here: it is off the self-consistency path and there is no measurement
+    # behind a change to it.
+    #
+    # Judge the condition of the VALID block only.  An unfilled history slot
+    # zeroes its whole column above, so a window that is merely young has an
+    # exactly singular G by construction -- and reading that as
+    # ill-conditioning would damp the first iterates and degenerate the
+    # update to the plain Picard step, which
+    # ``test_first_iterate_is_not_the_picard_step`` exists to catch (it did).
+    # Replacing the invalid rows and columns with the identity's gives those
+    # directions eigenvalue 1 and decouples them, leaving the valid block's
+    # spectrum untouched.
+    identity = jnp.eye(k, dtype=G.dtype)
+    pair = valid_hist[:, None] & valid_hist[None, :]
+    eig = jnp.linalg.eigvalsh(jnp.where(pair, G, identity))
+    well = eig[0] > _CROP_CONDITION_FLOOR * eig[-1]
+    gamma_ok = jnp.linalg.solve(G + 1e-12 * identity, b) / scale
+    gamma_damped = jnp.linalg.solve(
+        G + _CROP_CONDITION_FLOOR * eig[-1] * identity, b) / scale
+    gamma = jnp.where(well, gamma_ok, gamma_damped)
     gamma = jnp.where(valid_hist, gamma, 0.0 + 0.0j)
 
     alpha_last = (1.0 + 0.0j) - jnp.sum(gamma)
