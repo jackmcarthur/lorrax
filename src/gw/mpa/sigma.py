@@ -74,6 +74,32 @@ def _unfenced(name, *, sync_ranks=True):
 _band_fence = _unfenced
 
 
+class _UntimedBand:
+    """An unprofiled tau band: entered, never watched.
+
+    Watching is what costs.  ``TimingSection.__exit__`` runs every watcher
+    (``common/timing.py``), so a per-tau-node section with a watched result
+    is a host synchronization per node -- on the incumbent elementwise-MPA
+    route too, which never asked for the measurement.  The tau profile is
+    requested with ``LORRAX_SIGMA_TAU_TIMING``; without it the sweep enters
+    this object instead and the dispatch stays asynchronous.
+    """
+
+    __slots__ = ()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def watch(self, *_values):
+        """Accept the band's result and do not block on it."""
+
+
+_UNTIMED_BAND = _UntimedBand()
+
+
 @jax.jit
 def _shared_pole_weights(poles2, intervals, E_ref_B, t_node):
     """Causal residue weights exp[-i(Ω-Eref)τ]/(2Ω), DESIGN §3.4.
@@ -869,6 +895,18 @@ def _integrate_sigma_batches(
         tau_profile = env_bool(
             "LORRAX_SIGMA_TAU_TIMING", False, print_fn=print_fn)
 
+        def tau_band(name):
+            """Enter one per-tau-node band.
+
+            The fence is the band-attribution seam and is free in production
+            (``_unfenced`` above, and always so on the incumbent route); the
+            SECTION is what synchronizes, so it is opened only when the tau
+            profile was requested.  ``_print_tau_profile`` consumes exactly
+            these names.
+            """
+            fence(name)
+            return timing.section(name) if tau_profile else _UNTIMED_BAND
+
         s = wfns.slices
         sigma_axis = sigma_band_axis(
             int(s.nb_sigma), mesh_xy, ansatz="dynamic")
@@ -1102,23 +1140,25 @@ def _integrate_sigma_batches(
                     omega_indices=row.omega_idx,
                     omega_values=row.omega_abs)
             for t in t_nodes:
-                fence(_TAU_SWEEP_KERNEL_PHASE)
-                with timing.section(_TAU_SWEEP_KERNEL_PHASE) as sec:
-                    sigma_tau = tau_kernel(
-                        psi_coh_xn, psi_coh_yr,
-                        psi_proj_xr, psi_proj_yn,
-                        E_A_call, selector, B_branch, Omega,
-                        pole_indices, bounds, phase_real,
-                        jnp.asarray(win.E_ref_A),
-                        jnp.asarray(win.E_ref_B),
-                        jnp.asarray(t, dtype=jnp.complex128))
+                tau_args = (
+                    psi_coh_xn, psi_coh_yr,
+                    psi_proj_xr, psi_proj_yn,
+                    E_A_call, selector, B_branch, Omega,
+                    pole_indices, bounds, phase_real,
+                    jnp.asarray(win.E_ref_A),
+                    jnp.asarray(win.E_ref_B),
+                    jnp.asarray(t, dtype=jnp.complex128))
+                with tau_band(_TAU_SWEEP_KERNEL_PHASE) as sec:
+                    sigma_tau = tau_kernel(*tau_args)
                     sec.watch(sigma_tau)
-                fence(_TAU_SWEEP_ACCUMULATOR_PHASE)
-                with timing.section(_TAU_SWEEP_ACCUMULATOR_PHASE) as sec:
+                with tau_band(_TAU_SWEEP_ACCUMULATOR_PHASE) as sec:
+                    # Unprofiled, production ignores this return and keeps the
+                    # incumbent asynchronous path (ppm_accumulators.py:169-170).
                     sec.watch(accumulator.add_tau(sigma_tau))
-                fence(_TAU_SWEEP_PROGRESS_PHASE)
-                with timing.section(_TAU_SWEEP_PROGRESS_PHASE):
-                    progress.step()
+                with tau_band(_TAU_SWEEP_PROGRESS_PHASE):
+                    # Unprofiled, the bar blocks only at its own milestones;
+                    # profiled, the kernel band has already synchronized.
+                    progress.step(wait=None if tau_profile else sigma_tau)
                 n_tau += 1
             fence('tau.window_finish', sync_ranks=True)
             with timing.section('tau.window_finish'):

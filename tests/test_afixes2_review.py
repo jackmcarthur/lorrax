@@ -62,3 +62,70 @@ def test_tau_profile_phases_cover_the_kernel_owner_and_the_sweep():
         sigma._TAU_SWEEP_KERNEL_PHASE,
         sigma._TAU_SWEEP_ACCUMULATOR_PHASE,
         sigma._TAU_SWEEP_PROGRESS_PHASE)
+
+
+def _sigma_tree():
+    import gw.mpa.sigma as sigma
+    return ast.parse(Path(sigma.__file__).read_text())
+
+
+def _tau_node_loop(tree):
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.For) and isinstance(node.target, ast.Name)
+                and node.target.id == "t"
+                and isinstance(node.iter, ast.Name) and node.iter.id == "t_nodes"):
+            return node
+    raise AssertionError("the per-tau-node loop was not found in gw.mpa.sigma")
+
+
+def test_untimed_band_accepts_a_result_without_blocking_on_it():
+    """Item 3: the unprofiled band must not synchronize the host.
+
+    ``TimingSection.__exit__`` runs every watcher, so a per-tau-node section
+    with a watched result is a host sync per node -- on the incumbent
+    elementwise-MPA route too, which never asked for the measurement.
+    """
+    from gw.mpa.sigma import _UNTIMED_BAND
+
+    class Tripwire:
+        def block_until_ready(self):
+            raise AssertionError("the unprofiled tau band blocked on its result")
+
+    with _UNTIMED_BAND as band:
+        band.watch(Tripwire())
+
+
+def test_the_timed_band_still_blocks_on_what_it_watches():
+    """The profiling regime is unchanged: watching is what attributes a band."""
+    from common import timing
+    blocked = []
+    class Watched:
+        def block_until_ready(self):
+            blocked.append(True)
+    with timing.section("afixes2.probe") as sec:
+        sec.watch(Watched())
+    assert blocked == [True]
+
+
+def test_tau_node_loop_times_nothing_outside_the_profile_switch():
+    """Every per-node band goes through ``tau_band``, which reads the switch.
+
+    The merge resolution dropped the ``if tau_profile:`` gate and left a
+    ``timing.section(...) as sec: sec.watch(...)`` on the hot loop. Opening a
+    section directly here is the defect, whatever it is named.
+    """
+    tree = _sigma_tree()
+    loop = _tau_node_loop(tree)
+    opened = [node for node in ast.walk(loop)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr == "section"]
+    assert not opened, "the tau node loop opens a timing.section directly"
+    managers = [item.context_expr for stmt in loop.body
+                if isinstance(stmt, ast.With) for item in stmt.items]
+    assert managers and all(
+        isinstance(m, ast.Call) and isinstance(m.func, ast.Name)
+        and m.func.id == "tau_band" for m in managers)
+    band = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name == "tau_band")
+    assert any(isinstance(n, ast.Name) and n.id == "tau_profile"
+               for n in ast.walk(band)), "tau_band ignores the profile switch"
