@@ -237,10 +237,18 @@ def _solve_crop_alpha_stacked(Fw: jnp.ndarray) -> jnp.ndarray:
     # construction, so lambda_min -> 0 is the normal behaviour of a
     # converging window, not an edge case.
     #
-    # MEASURED (claim 2189): on Si shared-pole SC eleven maps ran with the
-    # q=0 Gram at ~1e-9 against its -1e-07 gate, then one rCROP TRIAL map
-    # failed at -1.70e-07 while a source whose history differed only at the
-    # 1e-9 level passed the same map at -1.38e-09 and completed 13 maps.
+    # This is HARDENING, not a fix for any measured failure, and the
+    # difference matters.  It was written while chasing a q=0 Gram refusal on
+    # Si shared-pole SC (claim 2189) on the theory that a collinear window was
+    # amplifying a 1e-9 history difference.  Instrumenting cond(G) on the live
+    # loop REFUTED that: at the solve that produced the failing input the Gram
+    # had cond 1.77, lambda_min 0.757 and ||gamma||_1 0.065 -- the window was
+    # well conditioned and barely mixing, and the failing evaluation is the
+    # PLAIN step x + f from that point, not an extrapolation.  The guard stays
+    # because the argument for it is independent of that story: a 1e-12 ridge
+    # on a unit-diagonal Gram is not a guard, collinearity near convergence is
+    # the normal end state of a CROP window, and the selector costs nothing
+    # when the window is healthy.  Do not cite it as fixing that refusal.
     #
     # Why a SELECTOR and not the textbook column drop: this window is a
     # sharded stacked array and k must stay static, so dropping the oldest

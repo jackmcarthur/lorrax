@@ -424,6 +424,84 @@ the union stopped at 11. What the evidence supports is that the difference is a
 marginal threshold crossing amplified by the accelerator, not a shared-pole
 regression.
 
+### Leg 4c — the mechanism I proposed, and the measurement that refuted it
+
+Stated here at length because a retracted hypothesis that keeps circulating is
+worse than none.
+
+**What I proposed.** `acceleration.py:213` adds a fixed `1e-12` ridge to a Gram
+whose columns are scaled to unit norm. Near convergence the residual differences
+become nearly collinear, so `lambda_min -> 0` and the solve amplifies. I argued
+that this turned a 1e-9 history difference into a materially different mixed
+Hamiltonian, and that the union's map-11 trial landed past a marginal q=0
+threshold as a result.
+
+**What the instrumentation found.** A probe on `_solve_crop_alpha_stacked`
+recording `lambda_min`, `cond(G)` and `||gamma||_1` per call, on the live loop:
+
+| after map | valid_columns | λ_min | cond(G) | 1e−12/λ_min | ‖γ‖₁ |
+|---|---|---|---|---|---|
+| 2 | 1 | 0 | — | — | 0.0920 |
+| 4 | 2 | 0 | — | — | 0.0569 |
+| 6 | 3 | 0 | — | — | 0.1851 |
+| 8 | 4 | 0 | — | — | 0.2051 |
+| **10** | **5** | **0.7574** | **1.77** | **1.3e−12** | **0.0651** |
+
+Maps 2–8 are a YOUNG window: an unfilled slot zeroes its column, so
+`lambda_min` is exactly 0 for reasons that have nothing to do with
+collinearity. Map 10 is the first full window and the one that matters, because
+it produces the point the map-11 trial evaluates — and **cond(G) is 1.77**, with
+the ridge worth 1.3e−12 and ‖γ‖₁ = 0.065. That arm then died at map 11 with the
+same gate.
+
+**So the hypothesis is refuted at the point where it had to hold.** And the
+reason is visible in the source once pointed out: `x_trial = x + f` is the
+**plain Picard step** from the accepted point; the CROP mixing happens
+afterwards. With a well-conditioned, barely-mixing accepted point, the failing
+evaluation is a Picard step from a nearly-converged state. The accelerator is
+not amplifying anything.
+
+**Consequences, stated so nobody has to re-derive them.**
+
+* The conditioning guard (layer 1) is **hardening, not the fix**. Its own
+  argument stands — a 1e-12 ridge on a unit-diagonal Gram is not a guard, and
+  the selector is bit-identical when the window is healthy — but it must not be
+  cited as fixing this refusal. The source comment says so too.
+* The trial-rejection change (layer 2) is the **operative fix**, and it is
+  correct *independently* of the cause: throwing away eleven converged maps over
+  one refused trial is wrong whatever made the trial refuse.
+* **The cause of the map-11 q=0 Gram failure is OPEN.** No second story is
+  offered in its place.
+
+**One measurement does survive, and is stronger than before.** Three union arms
+of this deck:
+
+| arm | `sc_max_iter` | map-11 Gram |
+|---|---|---|
+| `union_long` | 20 | −1.69705467e−07 |
+| `union_bytes` | 10 | **−2.12168831e−07** |
+| `10_crop_cond` | 8 | **−2.12168831e−07** |
+
+The last two are **byte-identical to each other**. So the outcome is
+deterministic given the Σ quadrature rules, and the rules are exactly what the
+wall-clock reducer varies: `compare_rule_receipts.py` shows all eleven receipts
+differing in every window's `node_digest` and **never** in `node_count`, with
+the same window fitted for 173.5 s in one run and 295.2 s in another against a
+**120 s** budget (`exhaustion: last_certified_rule`), frozen from map 1 by the
+SC session's `hit:sc-fixed`. That the reducer overruns its budget by up to 2.5x
+is a number for the owner's budget redesign, not something touched here.
+
+### Leg 4d — the accelerator test, which converged
+
+`sc_accelerator = linear` on the same head-on deck: **CONVERGED after 14 GW map
+calls**, `max|dE| = 0.000092 eV` against a `0.000100 eV` criterion, monotone
+throughout, zero errors, all four ranks `sc_rc=0`. It passed map 11, where all
+three rCROP arms died. Worth being careful about what that does and does not
+show: it demonstrates the union converges this deck with an accelerator that
+takes no trial step, and it is consistent with the failure being a property of
+the trial evaluation — it does **not** rescue the amplification story, which the
+conditioning probe had already refuted.
+
 ### Leg 5 — Na P16 identity, against the campaign's own `810c260b` control
 
 `03_na_p16/union/gate.json`, union driver job `58212398`, gate `58216796`,
