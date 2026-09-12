@@ -16,8 +16,8 @@ levelled above ``eps`` the returned ``N`` is minimal.
 Algorithm.  Remez exchange.  At each fixed reference the levelled equations
 ``1/x_i = sum_k w_k exp(-t_k x_i) + (-1)^i E`` are solved by variable
 projection: ``(w, E)`` by least squares, ``log t`` by Levenberg-Marquardt.
-Tempting, and why not: the full Newton on ``(log t, w, E)`` that
-``solver._nc_newton_equioscillation`` uses.  The basis trades a node shift
+Tempting, and why not: a full Newton on ``(log t, w, E)``, which is what
+the Remez solver this replaced did.  The basis trades a node shift
 against a weight change; the Newton step is ``O(cond * E)`` in ``log t`` while
 its quadratic error is ``O(step^2) >> E``, so no line-search step lowers the
 residual (measured at ``R = 10, N = 7``: condition 3.7e6, residual stuck at

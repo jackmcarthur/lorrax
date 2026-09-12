@@ -81,66 +81,10 @@ _NC_B = 0.6845
 
 # --- VarPro + Lawson: the warm start for the Remez solver below ---
 
-def _nc_varpro_residual(s, x_grid, g, W_sqrt):
-    """VarPro residual for non-crossing: (I - UU^T)(W * g)."""
-    t = np.exp(s)
-    Phi = np.exp(-np.outer(x_grid, t)) * W_sqrt[:, None]
-    g_w = g * W_sqrt
-    U, sig, Vt = np.linalg.svd(Phi, full_matrices=False)
-    return g_w - U @ (U.T @ g_w)
 
 
-def _nc_solve_once(s_init, x_grid, g, s_lo, s_hi, weights=None):
-    """One VarPro solve for non-crossing (scipy TRF)."""
-    M = len(x_grid)
-    W_sqrt = np.sqrt(weights) if weights is not None else np.ones(M)
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        res = least_squares(
-            _nc_varpro_residual, s_init,
-            args=(x_grid, g, W_sqrt),
-            method='trf',
-            bounds=(np.full_like(s_init, s_lo), np.full_like(s_init, s_hi)),
-            ftol=1e-14, xtol=1e-14, gtol=1e-14,
-            max_nfev=200 * len(s_init),
-        )
-    s = res.x
-
-    t = np.exp(s)
-    Phi = np.exp(-np.outer(x_grid, t))
-    if weights is not None:
-        Phi_w = Phi * W_sqrt[:, None]
-        g_w = g * W_sqrt
-    else:
-        Phi_w = Phi
-        g_w = g
-    w = np.linalg.lstsq(Phi_w, g_w, rcond=None)[0]
-    return s, w
 
 
-def _nc_solve_at_R(N, Ri, s_init, lawson_iter=4):
-    """Solve the non-crossing problem at a single R, given an initial s."""
-    M = max(200, 15 * N)
-    x_grid = np.exp(np.linspace(0, np.log(Ri), M))
-    g = 1.0 / x_grid
-
-    s_lo = -np.log(2.0 * Ri) - 1.0
-    s_hi = np.log(max(5.0 * N, 10.0)) + 1.0
-    s_init = np.clip(s_init, s_lo, s_hi)
-
-    s, w = _nc_solve_once(s_init, x_grid, g, s_lo, s_hi)
-
-    for k in range(lawson_iter):
-        Phi = np.exp(-np.outer(x_grid, np.exp(s)))
-        e = g - Phi @ w
-        ae = np.abs(e)
-        delta = max(1e-2 * np.max(ae), 1e-30)
-        irls_w = 1.0 / np.maximum(ae, delta)
-        irls_w /= np.sum(irls_w)
-        s, w = _nc_solve_once(s, x_grid, g, s_lo, s_hi, weights=irls_w)
-
-    return s, w
 
 
 
@@ -149,222 +93,24 @@ def _nc_solve_at_R(N, Ri, s_init, lawson_iter=4):
 
 # --- Remez exchange solver (enhanced, standalone use) ---
 
-def _nc_hack_init_s(N, R):
-    return np.log(np.pi**2 * (np.arange(1, N + 1) - 0.5) / (2.0 * np.log(4.0 * R)))
 
 
-def _nc_loguni_init_s(N, R):
-    s_lo = -np.log(2.0 * R) - 1.0
-    s_hi = np.log(max(5.0 * N, 10.0)) + 1.0
-    return np.linspace(s_lo + 0.5, s_hi - 0.5, N)
 
 
-def _nc_phi(x, s):
-    t = np.exp(s)
-    return np.exp(-np.outer(x, t)), t
 
 
-def _nc_ls_weights(x, s):
-    P, _ = _nc_phi(x, s)
-    return np.linalg.lstsq(P, 1.0 / x, rcond=None)[0]
 
 
-def _nc_err_curve(x, s, w):
-    P, _ = _nc_phi(x, s)
-    return 1.0 / x - P @ w
 
 
-def _nc_select_alternating_extrema(x, e, m):
-    a = np.abs(e)
-    idx = [0]
-    for i in range(1, len(e) - 1):
-        if a[i] >= a[i - 1] and a[i] >= a[i + 1]:
-            idx.append(i)
-    idx.append(len(e) - 1)
-
-    blocks = []
-    cur = [idx[0]]
-    cur_sign = 1 if e[idx[0]] >= 0 else -1
-    for j in idx[1:]:
-        sgn = 1 if e[j] >= 0 else -1
-        if sgn == cur_sign:
-            cur.append(j)
-        else:
-            blocks.append(max(cur, key=lambda k: abs(e[k])))
-            cur = [j]
-            cur_sign = sgn
-    blocks.append(max(cur, key=lambda k: abs(e[k])))
-    blocks = np.array(blocks, dtype=int)
-
-    if len(blocks) < m:
-        extra = np.linspace(0, len(x) - 1, m, dtype=int)
-        blocks = np.unique(np.concatenate([blocks, extra]))
-
-    if len(blocks) > m:
-        best = None
-        best_score = (-1.0, -1.0)
-        for s0 in range(len(blocks) - m + 1):
-            seg = blocks[s0:s0 + m]
-            score = (float(np.min(np.abs(e[seg]))), float(np.sum(np.abs(e[seg]))))
-            if score > best_score:
-                best_score = score
-                best = seg
-        blocks = best
-
-    signs = np.sign(e[blocks])
-    signs[signs == 0] = 1.0
-    first = signs[0]
-    signs = np.array([first * ((-1.0) ** i) for i in range(len(blocks))], dtype=float)
-    return x[blocks], signs
 
 
-def _nc_newton_equioscillation(xr, signs, s0, w0, lam0, R, maxit=20):
-    N = len(s0)
-    s = np.array(s0, float)
-    w = np.array(w0, float)
-    lam = float(lam0)
-
-    s_lo = -np.log(2.0 * R) - 2.0
-    s_hi = np.log(max(8.0 * N, 10.0)) + 2.0
-    y = 1.0 / xr
-
-    for _ in range(maxit):
-        t = np.exp(s)
-        E = np.exp(-np.outer(xr, t))
-        F = y - E @ w - signs * lam
-        fn = float(np.max(np.abs(F)))
-        if fn < 1e-13:
-            break
-
-        J = np.empty((len(xr), 2 * N + 1))
-        J[:, :N] = (w * t)[None, :] * xr[:, None] * E
-        J[:, N:2 * N] = -E
-        J[:, 2 * N] = -signs
-
-        try:
-            dz = np.linalg.solve(J, -F)
-        except np.linalg.LinAlgError:
-            dz = np.linalg.lstsq(J, -F, rcond=None)[0]
-
-        improved = False
-        for alpha in (1.0, 0.5, 0.25, 0.1, 0.05):
-            sn = np.clip(s + alpha * dz[:N], s_lo, s_hi)
-            order = np.argsort(sn)
-            sn = sn[order]
-            wn = (w + alpha * dz[N:2 * N])[order]
-            lamn = lam + alpha * dz[2 * N]
-
-            tn = np.exp(sn)
-            En = np.exp(-np.outer(xr, tn))
-            Fn = y - En @ wn - signs * lamn
-            if float(np.max(np.abs(Fn))) < fn:
-                s, w, lam = sn, wn, lamn
-                improved = True
-                break
-
-        if not improved:
-            break
-
-        if np.linalg.norm(dz) < 1e-13 * (1.0 + np.linalg.norm(np.concatenate([s, w, [lam]]))):
-            break
-
-    return s, w, lam
 
 
-def _nc_remez_at_R(N, R, s_init, max_outer=6):
-    Md = max(2000, 120 * N)
-    x = np.exp(np.linspace(0.0, np.log(R), Md))
-
-    s = np.sort(np.array(s_init, float))
-
-    try:
-        s2, _ = _nc_solve_at_R(N, R, s, lawson_iter=0)
-        s = np.sort(s2)
-    except (np.linalg.LinAlgError, ValueError, FloatingPointError) as exc:
-        # Falling back to the unrefined initial nodes is a legitimate
-        # recovery, but it silently DEGRADES the tau quadrature that every
-        # chi0 build in the run is evaluated on -- and the resulting error
-        # shows up as a physics discrepancy, never as a failure.  Say so.
-        import warnings
-        warnings.warn(
-            f"minimax: node refinement at N={N}, R={R:.3e} failed "
-            f"({type(exc).__name__}: {exc}); continuing from the unrefined "
-            f"initial nodes.  The tau-quadrature error below is the number "
-            f"to check.",
-            RuntimeWarning, stacklevel=2)
-
-    w = _nc_ls_weights(x, s)
-    e = _nc_err_curve(x, s, w)
-    err = float(np.max(np.abs(e)))
-    best_s, best_w, best_err = s.copy(), w.copy(), err
-    history = [best_err]
-
-    prev_ref = None
-    for _ in range(max_outer):
-        xr, signs = _nc_select_alternating_extrema(x, e, 2 * N + 1)
-
-        if prev_ref is not None and np.max(np.abs(np.log(xr) - np.log(prev_ref))) < 1e-9:
-            break
-        prev_ref = xr.copy()
-
-        lam0 = float(np.median(signs * (1.0 / xr - np.exp(-np.outer(xr, np.exp(s))) @ w)))
-        s2, w2, _ = _nc_newton_equioscillation(xr, signs, s, w, lam0, R, maxit=25)
-
-        e2 = _nc_err_curve(x, s2, w2)
-        err2 = float(np.max(np.abs(e2)))
-        if err2 < best_err * 0.9999:
-            s, w, e = s2, w2, e2
-            best_s, best_w, best_err = s.copy(), w.copy(), err2
-            history.append(best_err)
-        else:
-            break
-
-    t = np.exp(best_s)
-    order = np.argsort(t)
-    return t[order], best_w[order], best_err, history
 
 
-def solve_noncrossing(N, R):
-    """Compute minimax quadrature for 1/x on [1, R] via Remez exchange.
-
-    More accurate than the VarPro+Lawson warm start above,
-    but slower.  Use this for standalone high-accuracy solves.
-
-    Returns
-    -------
-    tau : ndarray (N,)
-    w : ndarray (N,)
-    err : float
-    """
-    sched = [2.0]
-    while sched[-1] < R:
-        sched.append(min(R, sched[-1] * 2.0))
-
-    starts = [
-        _nc_hack_init_s(N, 2.0),
-        _nc_loguni_init_s(N, 2.0),
-    ]
-
-    best = None
-    for s0 in starts:
-        s = np.array(s0, float)
-        t = None
-        w = None
-        err = np.inf
-        for Ri in sched:
-            t, w, err, _ = _nc_remez_at_R(N, Ri, s, max_outer=6)
-            s = np.log(t)
-
-        if best is None or err < best[2]:
-            best = (t, w, err)
-
-    return best
 
 
-def evaluate_noncrossing(x, tau, w):
-    """Evaluate sum_l w_l exp(-tau_l x)."""
-    x = np.asarray(x)
-    return np.exp(-np.outer(x, tau)) @ w
 
 
 # ================================================================
@@ -500,6 +246,12 @@ def solve_noncrossing_imag(N, R, omega_hat, lawson_iter=4):
     return t[order], best_w[order], best_err
 
 
+def evaluate_noncrossing_imag(x, t, w):
+    """Evaluate sum_l w_l exp(-t_l x)."""
+    x = np.asarray(x)
+    return np.exp(-np.outer(x, t)) @ w
+
+
 def noncrossing_imag_grids(R, omega_hat, eps, N_start=2, N_max=60):
     """Find minimum N achieving error < eps.
 
@@ -512,10 +264,6 @@ def noncrossing_imag_grids(R, omega_hat, eps, N_start=2, N_max=60):
     return t, w, N_max, err
 
 
-def evaluate_noncrossing_imag(x, t, w):
-    """Evaluate sum_l w_l exp(-t_l x)."""
-    x = np.asarray(x)
-    return np.exp(-np.outer(x, t)) @ w
 
 
 # ================================================================
@@ -765,297 +513,25 @@ _CR_SLOPE = -14.25
 _CR_TAU_MAX = np.sqrt(2 * np.log(1e3))
 
 
-def predict_N_crossing(xi_eff_target, E_bw, target_error, a_eff_est=1.35):
-    """Predict number of sine-sum nodes for a crossing window.
-
-    Parameters
-    ----------
-    xi_eff_target : float
-        Desired effective Lorentzian broadening (eV).
-    E_bw : float
-        Energy bandwidth of the crossing window (eV).
-    target_error : float
-        Desired L-infinity fit error.
-
-    Returns
-    -------
-    N : int
-    A_est : float
-    """
-    xi_0_est = xi_eff_target / a_eff_est
-    A_est = E_bw / xi_0_est
-    ratio = (np.log(target_error) - _CR_INTERCEPT) / _CR_SLOPE
-    ratio = max(ratio, 0.15)
-    N = int(np.ceil(ratio * A_est))
-    return max(N, 5), A_est
 
 
-def _cr_delta_from_sines(tau, w, A):
-    term = (np.sin(tau * A) - tau * A * np.cos(tau * A)) / (tau ** 2)
-    return A - np.dot(w, term)
 
 
-def _cr_a_eff_from_delta(delta, A):
-    f = lambda a: a * np.arctan(A / a) - delta
-    # a*arctan(A/a) rises monotonically to A: no width solves delta >= A, and
-    # the former upper bracket 10*A misses delta in (0.997 A, A).
-    if not 0.0 < delta < A:
-        return float('nan')
-    lo, hi = 1e-14, 1e8 * A
-    try:
-        return brentq(f, lo, hi)
-    except ValueError:
-        for _ in range(200):
-            mid = 0.5 * (lo + hi)
-            if f(mid) > 0: hi = mid
-            else: lo = mid
-        return 0.5 * (lo + hi)
 
 
-def _minimax_weights(Phi, g, w0):
-    """Sup-norm-optimal weights for fixed columns, as an LP correction to w0.
-
-    The residual is scaled to O(1) and the weights are free variables, so the
-    solver's feasibility tolerance is not the rule's error floor.  Returns w0
-    when the LP fails or does not improve the sup."""
-    e0 = g - Phi @ w0
-    s = float(np.max(np.abs(e0)))
-    if not s > 0.0:
-        return w0
-    M, K = Phi.shape
-    ones = np.ones((M, 1))
-    c = np.zeros(K + 1)
-    c[0] = 1.0
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        res = linprog(c, A_ub=np.block([[-ones, Phi], [-ones, -Phi]]),
-                      b_ub=np.concatenate([e0 / s, -e0 / s]),
-                      bounds=[(0, None)] + [(None, None)] * K, method='highs',
-                      options={'primal_feasibility_tolerance': 1e-10,
-                               'dual_feasibility_tolerance': 1e-10})
-    if not res.success:
-        return w0
-    w = w0 + s * res.x[1:]
-    return w if np.max(np.abs(g - Phi @ w)) < s else w0
 
 
-def _cr_solve_1overx(N, A_dim, u_min=5.0):
-    # 1/u on [u_min, A] is covariant under u -> u/u_min: the frequency cap and
-    # the zeta scan are stated at u_min = 5 and scale with it.
-    tau_cap = _CR_TAU_MAX * 1.5 * 5.0 / u_min
-    M = max(250, 8 * N)
-    u = np.linspace(u_min, A_dim, M)
-    g = 1.0 / u
-    fit_len = A_dim - u_min
-
-    best_err, best_zeta = np.inf, 1.0
-    for zeta in np.linspace(0.01, 10, 30) * (u_min / 5.0):
-        tau = np.arange(1, N + 1) * np.pi / (fit_len + zeta)
-        Phi = np.sin(np.outer(u, tau))
-        w = np.linalg.lstsq(Phi, g, rcond=None)[0]
-        err = np.max(np.abs(g - Phi @ w))
-        if err < best_err:
-            best_err, best_zeta = err, zeta
-
-    tau = np.arange(1, N + 1) * np.pi / (fit_len + best_zeta)
-    tau = np.clip(tau, 1e-10, tau_cap)
-
-    def _eval(t):
-        Phi = np.sin(np.outer(u, np.maximum(t, 1e-10)))
-        U, s, Vt = np.linalg.svd(Phi, full_matrices=False)
-        si = np.divide(1.0, s, out=np.zeros_like(s),
-                       where=s > 1e-14 * max(s[0], 1e-30))
-        w = Vt.T @ (si * (U.T @ g))
-        r = g - U @ (U.T @ g)
-        return w, r, r @ r, U
-
-    w, r, cost, UU = _eval(tau)
-    mu = 1e-6
-    for _ in range(100):
-        # Kaufman Jacobian, every column in one BLAS call (was a per-column
-        # Python loop; 2.2x per iteration at N = 48-240).
-        D = (u[:, None] * np.cos(np.outer(u, tau))) * w[None, :]
-        J = -(D - UU @ (UU.T @ D))
-        JtJ = J.T @ J
-        dd = np.diag(JtJ).copy()
-        dd[dd < 1e-20] = 1e-20
-        try:
-            dt = np.linalg.solve(JtJ + mu * np.diag(dd), -J.T @ r)
-        except np.linalg.LinAlgError:
-            dt = np.linalg.lstsq(JtJ + mu * np.diag(dd), -J.T @ r, rcond=None)[0]
-        tn = np.sort(np.clip(tau + dt, 1e-10, tau_cap))
-        wn, rn, cn, Un = _eval(tn)
-        if cn < cost:
-            tau, w, r, cost, UU = tn, wn, rn, cn, Un
-            mu = max(mu * 0.3, 1e-16)
-        else:
-            mu = min(mu * 5, 1e10)
-        if np.linalg.norm(dt) < 1e-14 * (np.linalg.norm(tau) + 1e-30):
-            break
-
-    u_e = np.linspace(u_min, A_dim, 5000)
-    g_e = 1.0 / u_e
-    Phi = np.sin(np.outer(u_e, tau))
-    w_f = np.linalg.lstsq(Phi, g_e, rcond=None)[0]
-    err = np.max(np.abs(g_e - Phi @ w_f))
-    return tau, w_f, err
 
 
-def build_crossing_quadrature(N, xi_eff_target, E_bw, tol=0.05, verbose=True, *,
-                              target_error, u_min=5.0):
-    """Build sine quadrature for a GW crossing window.
-
-    Fits 1/u on [u_min, A] with N sines, binary-searching A to hit
-    the target effective Lorentzian width xi_eff.
-
-    A rule is returned only if the width search converged within ``tol``
-    and the fit error on [u_min, A] is at most ``target_error``; otherwise
-    this raises.  Width alone accepted rules with fit error 0.1-0.2
-    (N = 10-30 at E_bw = 24 eV, xi_eff = 0.25 eV): an effective width is a
-    property of any odd function, not evidence that it approximates 1/u.
-
-    Returns
-    -------
-    tau : ndarray (N,)
-    w : ndarray (N,)
-    info : dict
-        xi_0, xi_eff, a_eff, u_min, A_dim, fit_err, N_over_A
-    """
-    u_min = float(u_min)
-
-    def _try(A_dim):
-        if A_dim < u_min + 2 or N > 1.5 * A_dim:
-            return None, None, None, None
-        tau, w, err = _cr_solve_1overx(N, A_dim, u_min)
-        delta = _cr_delta_from_sines(tau, w, A_dim)
-        if delta <= 0 or delta > A_dim:
-            return tau, w, err, None
-        a = _cr_a_eff_from_delta(delta, A_dim)
-        return tau, w, err, a
-
-    if verbose:
-        print(f"Target: xi_eff={xi_eff_target:.4f} eV, "
-              f"E_bw={E_bw:.2f} eV, N={N}")
-
-    A_lo = max(u_min + 3, N / 1.0)
-    A_hi = max(N * 5, E_bw / xi_eff_target * 10)
-
-    best_tau, best_w, best_err, best_a = None, None, np.inf, None
-    best_A = None
-
-    for iteration in range(30):
-        A_mid = 0.5 * (A_lo + A_hi)
-        tau, w, err, a = _try(A_mid)
-
-        if a is None or not a > 0:
-            A_hi = A_mid
-            continue
-
-        xi_0 = E_bw / A_mid
-        xi_eff = a * xi_0
-
-        if verbose and iteration < 6:
-            print(f"  iter {iteration}: A={A_mid:.1f}, N/A={N/A_mid:.3f}, "
-                  f"a_eff={a:.3f}, xi_eff={xi_eff:.4f}, err={err:.2e}")
-
-        if abs(xi_eff - xi_eff_target) / xi_eff_target < tol:
-            # The rule is judged by its sup error: replace the least-squares
-            # weights by the sup-norm optimum on these nodes.  They move the
-            # effective width a few percent, so the width test is repeated on
-            # them and, if it fails, the search is steered by their width.
-            u_e = np.linspace(u_min, A_mid, 5000)
-            Phi_e = np.sin(np.outer(u_e, tau))
-            w_lp = _minimax_weights(Phi_e, 1.0 / u_e, w)
-            a_lp = _cr_a_eff_from_delta(
-                _cr_delta_from_sines(tau, w_lp, A_mid), A_mid)
-            if not a_lp > 0:
-                best_tau, best_w, best_err, best_a, best_A = tau, w, err, a, A_mid
-                break
-            w, a, xi_eff = w_lp, a_lp, a_lp * xi_0
-            err = float(np.max(np.abs(1.0 / u_e - Phi_e @ w_lp)))
-            if abs(xi_eff - xi_eff_target) / xi_eff_target < tol:
-                best_tau, best_w, best_err, best_a, best_A = tau, w, err, a, A_mid
-                break
-
-        if xi_eff > xi_eff_target:
-            A_lo = A_mid
-        else:
-            A_hi = A_mid
-
-        best_tau, best_w, best_err, best_a, best_A = tau, w, err, a, A_mid
-    else:
-        last = ("no A gave a positive width" if best_A is None else
-                f"A={best_A:.4g}, xi_eff={best_a * E_bw / best_A:.4g} eV")
-        raise RuntimeError(
-            f"build_crossing_quadrature: the width search did not reach "
-            f"xi_eff={xi_eff_target:.4g} eV within {tol:.0%} in 30 steps "
-            f"(N={N}, E_bw={E_bw:.4g} eV; last {last})")
-
-    if not best_err <= target_error:
-        raise RuntimeError(
-            f"build_crossing_quadrature: fit error {best_err:.3e} on "
-            f"[{u_min:g}, {best_A:.4g}] exceeds target_error="
-            f"{target_error:.3e} (N={N}, N/A={N / best_A:.3f}); a larger N "
-            f"is needed at this width")
-
-    xi_0 = E_bw / best_A
-    xi_eff = best_a * xi_0
-
-    info = {
-        'xi_0': xi_0,
-        'xi_eff': xi_eff,
-        'a_eff': best_a,
-        'u_min': u_min,
-        'A_dim': best_A,
-        'fit_err': best_err,
-        'xi_eff_target': xi_eff_target,
-        'N_over_A': N / best_A,
-    }
-
-    if verbose:
-        print(f"\nResult:")
-        print(f"  A_dim  = {best_A:.1f}  (N/A = {N/best_A:.3f})")
-        print(f"  xi_0   = {xi_0:.5f} eV")
-        print(f"  xi_eff = {xi_eff:.5f} eV  "
-              f"({xi_eff/xi_eff_target:.1%} of target)")
-        print(f"  a_eff  = {best_a:.4f}")
-        print(f"  fit error = {best_err:.2e}")
-
-    return best_tau, best_w, info
 
 
-def evaluate_crossing(x, tau, w, xi_0):
-    """Evaluate F(x) = sum w_l sin(tau_l x / xi_0)."""
-    u = np.asarray(x) / xi_0
-    return np.sin(np.outer(u, tau)) @ w
 
 
 # ================================================================
 # Physical rescaling helpers
 # ================================================================
 
-def rescale_noncrossing(t, w, E_gap):
-    """Rescale canonical [1,R] grids to physical units.
-
-    tau_phys = t / E_gap,  W_phys = w / E_gap.
-    """
-    return t / E_gap, w / E_gap
 
 
-def rescale_crossing(tau, w, xi):
-    """Rescale crossing grids to physical units.
-
-    t_phys = xi * tau,  W_phys = w / xi.
-    """
-    return xi * tau, w / xi
 
 
-def rescale_noncrossing_imag(t, w, E_gap):
-    """Rescale from [1, R] to physical units [E_gap, E_bw].
-
-    Physical: sum w_phys exp(-t_phys E) ≈ E/(E^2+omega_p^2)
-    where omega_p = omega_hat * E_gap.
-
-    t_phys = t / E_gap,  w_phys = w / E_gap.
-    """
-    return t / E_gap, w / E_gap

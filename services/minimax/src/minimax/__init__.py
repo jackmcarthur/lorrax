@@ -168,28 +168,25 @@ from minimax.targets import (
 #: Serving a certified table must not import an optimiser, and this is how
 #: that stays true while keeping the names on the door.
 #:
-#: SEVERAL OF THESE HAVE NO CALLER, AND THAT IS ON PURPOSE FOR NOW.  The
-#: Remez solver, the binary-search crossing builder, the two error models
-#: and the three rescalers are 469 of ``solver.py``'s 1059 lines and
-#: nothing in the tree calls them; the deletion manifest is written up in
-#: ``~/lorrax_service_phase/DELETION_MANIFEST_minimax.md`` and is waiting
-#: on the owner's sign-off.  Until that arrives the extraction must not
-#: SHRINK the surface it moved — a move and a deletion in one commit is
-#: two changes wearing one diff — so every name ``common.minimax``
-#: published is published here.  Sign-off deletes the code and these rows
-#: together, in one commit that is about deletion and nothing else.
+#: THE UNCALLED HALF IS GONE (owner sign-off, 2026-09-12).  This table used
+#: to carry the Remez solver, the binary-search crossing builder, the error
+#: models and the three rescalers because the extraction that moved them was
+#: not allowed to shrink the surface it moved.  Reachability was then
+#: recomputed by SYMBOL from the real consumers — door.py, the two generator
+#: tools, ``gw.minimax_screening`` and this service's tests — and 24
+#: functions, 530 of ``solver.py``'s 1061 lines, were reachable from none of
+#: them.  They are deleted, and these rows with them.  What remains is what
+#: the door actually calls.
 _SOLVER_NAMES = (
     # target functions
     "G_hgl", "G_fermi", "tau_max_hgl", "tau_max_fermi",
     # the two grid drivers the door reaches
     "noncrossing_imag_grids", "crossing_grids",
     # the solvers under them
-    "solve_noncrossing", "solve_noncrossing_imag", "solve_crossing",
-    "evaluate_noncrossing", "evaluate_noncrossing_imag", "evaluate_crossing",
-    # error model + the binary-search crossing builder
-    "predict_N_crossing", "build_crossing_quadrature",
-    # the rescalers
-    "rescale_noncrossing", "rescale_crossing", "rescale_noncrossing_imag",
+    "solve_noncrossing_imag", "solve_crossing",
+    # the imag evaluator: tests/test_minimax_imag_tables.py checks the
+    # shipped complex_laplace alpha.real against _imag_target through it
+    "evaluate_noncrossing_imag",
     # Underscore-private BY HISTORY and on the door anyway, for the same
     # reason `vcoul._minibz_kernel_bare` is: it has a real cross-package
     # consumer.  `tests/test_minimax_imag_tables.py` asserts that the
