@@ -1609,7 +1609,7 @@ def test_every_package_in_the_map_exists(sources):
 #: one production importer, then and now — says ``import minimax as _mm``
 #: and reaches only ``serve`` / ``Quadrature`` / the refusal types, all of
 #: which are top-level names.  The offline solver half (``G_hgl``,
-#: ``noncrossing_grids``, …) is on the door too, behind a PEP-562 lazy
+#: ``crossing_grids``, …) is on the door too, behind a PEP-562 lazy
 #: ``__getattr__``, precisely so that the generator tool and the
 #: certification tier can have those names without anybody writing
 #: ``from minimax.solver import ...`` — which would have been this rule's

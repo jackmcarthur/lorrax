@@ -490,14 +490,13 @@ def _solve_noncrossing_scaled_cached(logR_key: float, target_key: float,
     cached = _cache.load("noncrossing", payload)
     if cached is not None:
         return cached
-    # The levelled Remez rule, not VarPro+Lawson: smallest N whose best
-    # N-term error meets the target, certified by alternation, in
-    # milliseconds.  Measured on the NONCROSS reference (runs/DEV/326):
-    # noncrossing_grids is 2-4x above the best error at its N, uses 1-2
-    # extra nodes at eps >= 1e-8 and up to 24 extra (negative weights,
-    # kappa0 4.8e3) at 1e-10, and takes 0.1-45 s per request.  The cache
-    # payload is unchanged, so a warm cache keeps serving old entries
-    # until it is cleared.
+    # The levelled Remez rule: smallest N whose best N-term error meets
+    # the target, certified by alternation, in milliseconds.  It replaced a
+    # VarPro+Lawson ladder that measured 2-4x above the best error at its
+    # N, used 1-2 extra nodes at eps >= 1e-8 and up to 24 extra (negative
+    # weights, kappa0 4.8e3) at 1e-10, and took 0.1-45 s per request; that
+    # ladder is deleted (runs/DEV/326).  The cache payload is unchanged, so
+    # a warm cache keeps serving old entries until it is cleared.
     from minimax import levelled as _levelled          # noqa: PLC0415
     tau, w, _n, err = _levelled.noncrossing_levelled(
         float(np.exp(logR_key)), float(target_key), N_max=max_nodes)
@@ -573,11 +572,11 @@ def _tolerance_key(error_bound: float) -> float:
     for ``eps_phys * x_min``), and rounding such a value to 14 decimals
     yields exactly 0.0.
 
-    A zero tolerance is not a tight request, it is an UNSATISFIABLE one:
-    ``noncrossing_grids`` exits early on ``err < eps``, which no rule can
-    meet at eps=0, so it silently runs the entire N ladder to N_max and
-    returns the last rule -- measured at 18+ minutes on the sodium SC deck,
-    where it looked like a hang.
+    A zero tolerance is not a tight request, it is an UNSATISFIABLE one.
+    An N-ladder solver exits early on ``err < eps``, which no rule can meet
+    at eps=0, so it silently runs the whole ladder to N_max and returns the
+    last rule -- measured at 18+ minutes on the sodium SC deck, where it
+    looked like a hang.
 
     So: keep the decimal key where it is faithful, and fall back to a
     significant-figure key only where it would underflow. Existing cache

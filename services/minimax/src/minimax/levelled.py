@@ -316,10 +316,11 @@ def _step(sols, n_new, R):
 def noncrossing_levelled(R, eps, N_max=64):
     """Smallest-``N`` levelled rule for ``1/x`` on ``[1, R]`` with sup <= eps.
 
-    Returns ``(tau, weights, N, err)`` like :func:`minimax.solver.noncrossing_grids`;
+    Returns ``(tau, weights, N, err)`` like the other family drivers;
     ``err`` is the refined dense sup of the returned rule.  When ``N_max`` does
     not reach ``eps`` the ``N_max`` rule is returned with its (larger) error,
-    exactly as ``noncrossing_grids`` does, and the caller must compare."""
+    exactly as the VarPro ladder it replaced did, and the caller must
+    compare."""
     R = max(float(R), 1.0 + 1.0e-9)
     eps = float(eps)
     if not (math.isfinite(eps) and eps > 0.0):

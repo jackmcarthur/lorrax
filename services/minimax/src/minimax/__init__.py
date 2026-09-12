@@ -69,7 +69,7 @@ WHO CALLS WHAT
     That 2×2's dispatch, with F6 for the empty cell.
 ``Quadrature`` / ``Provenance``
     What comes back.  ``Provenance.one_line()`` is what the driver logs.
-``G_hgl``, ``noncrossing_grids``, ``crossing_grids``, …
+``G_hgl``, ``crossing_grids``, ``noncrossing_imag_grids``, …
     The OFFLINE solvers, on the door but imported LAZILY (PEP 562): they
     are the only thing here that needs scipy, and a production lookup must
     not pay for it.  A generator campaign touches these; a run does not.
@@ -181,13 +181,12 @@ from minimax.targets import (
 _SOLVER_NAMES = (
     # target functions
     "G_hgl", "G_fermi", "tau_max_hgl", "tau_max_fermi",
-    # the three grid drivers production reached for
-    "noncrossing_grids", "noncrossing_imag_grids", "crossing_grids",
+    # the two grid drivers the door reaches
+    "noncrossing_imag_grids", "crossing_grids",
     # the solvers under them
     "solve_noncrossing", "solve_noncrossing_imag", "solve_crossing",
     "evaluate_noncrossing", "evaluate_noncrossing_imag", "evaluate_crossing",
-    # error models + the binary-search crossing builder
-    "predict_N_noncrossing", "error_estimate_noncrossing",
+    # error model + the binary-search crossing builder
     "predict_N_crossing", "build_crossing_quadrature",
     # the rescalers
     "rescale_noncrossing", "rescale_crossing", "rescale_noncrossing_imag",
@@ -202,9 +201,10 @@ _SOLVER_NAMES = (
     "_imag_target",
 )
 
-# Pure offline fitting routines.  They use SciPy, so keep them behind the
-# same lazy door as the historical solvers: a production table lookup must
-# not import an optimiser.
+# Positive minimax fitting for complex-frequency resolvents, over the
+# analytic sinc rule in ``sector``.  A production surface: the pane/slab
+# Laplace route reaches it as ``minimax.fit_damped_reciprocal``
+# (``gw/mpa/sigma_windows.py::_laplace_nodes``).  SciPy, so lazy.
 _FREQUENCY_FIT_NAMES = (
     "DampedReciprocalFit", "fit_damped_reciprocal",
 )
@@ -217,45 +217,15 @@ _UNIFORM_RULE_NAMES = (
     "rule_roundoff_amplification", "rule_sup_error",
 )
 
-# Delivered-error fitting on a weighted complex support.  Also SciPy
-# (linprog), so it lives behind the same lazy door: a production table
-# lookup must not import an optimiser.
-_RECIPROCAL_FIT_NAMES = (
-    "ReciprocalMeasureProblem", "ComplexTimeRule",
-    "evaluate_rule", "delivered_error", "rule_amplification",
-    "solve_fixed_time_weights",
-    "solve_fixed_time_weights_fast",
-)
-_TIME_NODE_SEARCH_NAMES = (
-    "ComplexTimeSearchOptions", "support_arc",
-    "candidate_time_dictionary", "fit_reciprocal_measure",
-)
-# ``measure_windows`` defines exactly one public name.  The other four this
-# tuple used to carry -- MeasureWindow, WindowErrorBudget,
-# partition_measure_windows, apportion_true_error -- were left behind by a
-# removed windowing API: nothing in the monorepo imports them and the module
-# has not defined them for some time, so `minimax.MeasureWindow` raised
-# AttributeError while sitting in `__all__`.  Removed 2026-09-11.
-_MEASURE_WINDOW_NAMES = ("tail_refined_lattice_measure",)
-_WINDOWED_FIT_NAMES = (
-    "PhaseBoundedReciprocalFit", "fit_phase_bounded_candidates",
-)
 # Levelled (minimax-optimal) noncrossing rules: NumPy only, but lazy like
 # every builder so a catalog-only import pays nothing.
 _LEVELLED_NAMES = ("noncrossing_levelled", "certify_noncrossing")
-_ROQ_FIT_NAMES = (
-    "RoqWindow", "RoqGroup", "RoqRule", "RoqBranchEvidence", "RoqPlan",
-    "RoqPlanningRefusal",
-    "roq_select_times", "fit_roq_group", "fit_roq_branch",
-    "branch_delivered_error", "branch_noise_gate",
-    "plan_measure_adapted_roq",
-)
 
 
 def __getattr__(name: str):
     """PEP 562 lazy door for the solver half.
 
-    ``from minimax import noncrossing_grids`` imports scipy at that
+    ``from minimax import crossing_grids`` imports scipy at that
     moment and not before.  ``import minimax`` never does.
     """
     if name in _SOLVER_NAMES:
@@ -267,24 +237,9 @@ def __getattr__(name: str):
     if name in _UNIFORM_RULE_NAMES:
         from minimax import uniform_rule as _uniform   # noqa: PLC0415
         return getattr(_uniform, name)
-    if name in _RECIPROCAL_FIT_NAMES:
-        from minimax import reciprocal_fit as _measure  # noqa: PLC0415
-        return getattr(_measure, name)
-    if name in _TIME_NODE_SEARCH_NAMES:
-        from minimax import time_node_search as _search  # noqa: PLC0415
-        return getattr(_search, name)
-    if name in _MEASURE_WINDOW_NAMES:
-        from minimax import measure_windows as _windows  # noqa: PLC0415
-        return getattr(_windows, name)
-    if name in _WINDOWED_FIT_NAMES:
-        from minimax import windowed_fit as _windowed_fit  # noqa: PLC0415
-        return getattr(_windowed_fit, name)
     if name in _LEVELLED_NAMES:
         from minimax import levelled as _levelled  # noqa: PLC0415
         return getattr(_levelled, name)
-    if name in _ROQ_FIT_NAMES:
-        from minimax import roq_fit as _roq  # noqa: PLC0415
-        return getattr(_roq, name)
     raise AttributeError(f"module 'minimax' has no attribute {name!r}")
 
 
@@ -292,11 +247,6 @@ def __dir__():
     return sorted(set(globals()) | set(_SOLVER_NAMES)
                   | set(_FREQUENCY_FIT_NAMES)
                   | set(_UNIFORM_RULE_NAMES)
-                  | set(_RECIPROCAL_FIT_NAMES)
-                  | set(_TIME_NODE_SEARCH_NAMES)
-                  | set(_MEASURE_WINDOW_NAMES)
-                  | set(_WINDOWED_FIT_NAMES)
-                  | set(_ROQ_FIT_NAMES)
                   | set(_LEVELLED_NAMES))
 
 
@@ -320,18 +270,10 @@ __all__ = [
     "MinimaxRefusal", "NoCertifiedTable", "AmplificationCap", "UnknownTarget",
     "CatalogUnavailable", "TableUnreadable", "CatalogCorrupt",
     "UncertifiedSolveRefused", "SamplingUnsupported",
-    # --- generic complex-frequency fitting (lazy; scipy) -------------------
+    # --- complex-frequency resolvent fitting (lazy; scipy) -----------------
     *_FREQUENCY_FIT_NAMES,
     # --- uniform denominator-box rules (lazy; scipy) -----------------------
     *_UNIFORM_RULE_NAMES,
-    # --- delivered-error fitting on a weighted support (lazy; scipy) -------
-    *_RECIPROCAL_FIT_NAMES,
-    *_TIME_NODE_SEARCH_NAMES,
-    # --- measure-apportioned window planning (lazy; numpy/scipy) -----------
-    *_MEASURE_WINDOW_NAMES,
-    *_WINDOWED_FIT_NAMES,
-    # --- measure-weighted ROQ node discovery (lazy; scipy) -----------------
-    *_ROQ_FIT_NAMES,
     # --- levelled noncrossing rules (lazy; numpy) --------------------------
     *_LEVELLED_NAMES,
     # --- the offline solvers (lazy; scipy) ---------------------------------

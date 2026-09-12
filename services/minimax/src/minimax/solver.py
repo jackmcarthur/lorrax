@@ -75,20 +75,11 @@ _NC_A = 3.5456
 _NC_B = 0.6845
 
 
-def predict_N_noncrossing(R, target_error):
-    """Predict number of exponential-sum nodes for 1/x on [1, R]."""
-    rate = _NC_A / np.log(R) + _NC_B
-    N = (np.log(target_error) - _NC_LN_C) / (-rate)
-    return max(int(np.ceil(N)), 2)
 
 
-def error_estimate_noncrossing(N, R):
-    """Estimate L-infinity error for N nodes at dynamic range R."""
-    rate = _NC_A / np.log(R) + _NC_B
-    return np.exp(_NC_LN_C - N * rate)
 
 
-# --- VarPro + Lawson solver (used by noncrossing_grids and as warm-start) ---
+# --- VarPro + Lawson: the warm start for the Remez solver below ---
 
 def _nc_varpro_residual(s, x_grid, g, W_sqrt):
     """VarPro residual for non-crossing: (I - UU^T)(W * g)."""
@@ -152,90 +143,8 @@ def _nc_solve_at_R(N, Ri, s_init, lawson_iter=4):
     return s, w
 
 
-def _nc_solve_varpro(N, R, lawson_iter=4):
-    """Compute N-point minimax quadrature for 1/x on [1, R] via VarPro+Lawson.
-
-    Uses continuation in R from R=2 upward, warm-starting each solve.
-
-    Returns
-    -------
-    t : ndarray (N,)
-    w : ndarray (N,)
-    err : float
-    """
-    M_eval = max(1000, 40 * N)
-    x_eval = np.exp(np.linspace(0, np.log(R), M_eval))
-
-    s_lo = -np.log(2.0 * R) - 1.0
-    s_hi = np.log(max(5.0 * N, 10.0)) + 1.0
-
-    def _try_init(s0):
-        R_start = max(2.0, min(np.exp(0.7 * N), R))
-        R_sched = []
-        r_ = R_start
-        while r_ < R:
-            R_sched.append(r_)
-            r_ = min(r_ * 4.0, R)
-        R_sched.append(R)
-
-        s_ = s0.copy()
-        for Ri in R_sched:
-            s_, w_ = _nc_solve_at_R(N, Ri, s_, lawson_iter=lawson_iter)
-
-        t_ = np.exp(s_)
-        approx = np.exp(-np.outer(x_eval, t_)) @ w_
-        err_ = np.max(np.abs(1.0 / x_eval - approx))
-        return s_, w_, err_
-
-    s_hack = np.log(np.pi**2 * (np.arange(1, N + 1) - 0.5) / (2.0 * np.log(4.0 * R)))
-    best_s, best_w, best_err = _try_init(s_hack)
-
-    s_unif = np.linspace(s_lo + 0.5, s_hi - 0.5, N)
-    s2, w2 = _nc_solve_at_R(N, R, s_unif, lawson_iter=lawson_iter)
-    t2 = np.exp(s2)
-    err2 = np.max(np.abs(1.0 / x_eval - np.exp(-np.outer(x_eval, t2)) @ w2))
-    if err2 < best_err:
-        best_s, best_w, best_err = s2, w2, err2
-
-    t = np.exp(best_s)
-    order = np.argsort(t)
-    return t[order], best_w[order], best_err
 
 
-def noncrossing_grids(R, eps, N_start=2, N_max=60):
-    """Find minimum N achieving error < eps on [1, R].
-
-    The Hackbusch error law gives a deterministic rank seed from ``(R,
-    eps)``.  Probe there, then walk toward the first passing rank.  Each rank
-    still takes the same analytic-node VarPro/Lawson refinement and the rule
-    is still accepted only by its measured error; this only avoids solving
-    the known-failing prefix of the ladder.
-
-    Returns
-    -------
-    t, w, N, err
-    """
-    N_start = int(N_start)
-    N_max = int(N_max)
-    if N_start > N_max:
-        raise ValueError("N_start must not exceed N_max")
-
-    seed = int(np.clip(predict_N_noncrossing(R, eps), N_start, N_max))
-    t, w, err = _nc_solve_varpro(seed, R)
-    if err < eps:
-        best = (t, w, seed, err)
-        for N in range(seed - 1, N_start - 1, -1):
-            t, w, err = _nc_solve_varpro(N, R)
-            if err >= eps:
-                break
-            best = (t, w, N, err)
-        return best
-
-    for N in range(seed + 1, N_max + 1):
-        t, w, err = _nc_solve_varpro(N, R)
-        if err < eps:
-            return t, w, N, err
-    return t, w, N_max, err
 
 
 # --- Remez exchange solver (enhanced, standalone use) ---
@@ -418,7 +327,7 @@ def _nc_remez_at_R(N, R, s_init, max_outer=6):
 def solve_noncrossing(N, R):
     """Compute minimax quadrature for 1/x on [1, R] via Remez exchange.
 
-    More accurate than the VarPro+Lawson solver used by noncrossing_grids,
+    More accurate than the VarPro+Lawson warm start above,
     but slower.  Use this for standalone high-accuracy solves.
 
     Returns
