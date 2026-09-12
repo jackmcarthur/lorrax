@@ -10,8 +10,13 @@ import numpy as np
 import pytest
 
 
+#: What opens a timing band: the collector directly, or the tau sweep's own
+#: helper, which fences and then opens the same-named section when profiling.
+_BAND_OPENERS = ("section", "tau_band")
+
+
 def _section_names(module_path):
-    """Every literal name a module opens a ``timing.section`` with.
+    """Every literal name a module opens a timing band with.
 
     Module-level string constants are resolved, because that is exactly how
     a name is supposed to be spelled once and used twice.
@@ -25,8 +30,11 @@ def _section_names(module_path):
                     constants[target.id] = node.value.value
     names = set()
     for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "section" and node.args):
+        if not (isinstance(node, ast.Call) and node.args and (
+                (isinstance(node.func, ast.Attribute)
+                 and node.func.attr in _BAND_OPENERS)
+                or (isinstance(node.func, ast.Name)
+                    and node.func.id in _BAND_OPENERS))):
             continue
         argument = node.args[0]
         if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
