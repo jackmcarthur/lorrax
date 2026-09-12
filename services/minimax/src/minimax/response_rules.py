@@ -296,7 +296,6 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
         bounds and value/derivative Taylor remainders for every supplied z.
         Refuses a nonconvergent Taylor domain or an unmet NNLS certificate.
     """
-    from scipy.optimize import nnls
     z = _inputs(z_ry, rel_tol)
     lo, hi = float(delta_lo_ry), float(delta_hi_ry)
     if not np.isfinite(lo+hi) or not 0 < lo <= hi:
@@ -309,18 +308,54 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
         if reused is not None:
             return dict(reused, reuse_status="hit", reuse_reason=reason)
     eta = float(z.imag.min())
+    lo, hi = _padded_remote_domain(lo, hi, z, eta, domain_pad_ry)
+    result, refusal = _remote_certificate(lo, hi, z, eta, rel_tol)
+    if result is None:
+        raise RuntimeError(refusal)
+    return dict(result, node_digest=_node_digest(result),
+                reuse_status="build" if previous is None else "rebuild",
+                reuse_reason=reason)
+
+
+def _padded_remote_domain(lo, hi, z, eta, domain_pad_ry):
+    """The interval the expansion actually uses, given the SC domain pad.
+
+    ONE OWNER for the pad arithmetic: ``response_remote_max_abs_z`` asks for
+    the cap on exactly this interval, or the chooser and the rule disagree
+    about where the expansion is centred.  Padding must not move a valid
+    remote cell across its Taylor boundary, so the lowered edge is taken only
+    while every sample is still inside it; keeping the physical lower edge
+    otherwise still admits later gap increases.
+    """
     padded_lo = max(lo-domain_pad_ry, lo/2)
-    # Padding must not move a valid remote cell across its Taylor boundary.
-    # Keeping the physical lower edge still admits later gap increases.
     if np.all(np.abs(z*z+eta*eta) < padded_lo*padded_lo+eta*eta):
         lo = padded_lo
-    hi += domain_pad_ry
+    return lo, hi+domain_pad_ry
+
+
+def _remote_certificate(lo, hi, z, eta, rel_tol):
+    """The rule's FULL acceptance on an already-padded domain.
+
+    ``(result, None)`` when all THREE stages pass -- the Taylor order budget,
+    the NNLS row fit at ``row_tol``, and the combined value/derivative bound
+    -- and ``(None, reason)`` when any of them refuses.
+
+    THE SINGLE OWNER OF THE PREDICATE.  ``response_laplace_rule`` calls it to
+    build a rule and ``response_remote_max_abs_z`` calls it to find the
+    largest ``|z|`` the rule will accept, so the domain the recipe publishes
+    is the domain the rule actually has rather than the first stage of it.
+    Inverting stage one alone put every sample at ``rho_max``, where ``order``
+    is the maximum 64, ``row_tol`` is 112x tighter than ``rel_tol`` and
+    ``stop`` is 283 -- which the ladder's 192 nodes could not resolve, so the
+    SC run refused at map 0 (AREBASE 2026-09-12, job 58222998).
+    """
+    from scipy.optimize import nnls
     anchor = eta/lo
     a0 = 1+anchor*anchor
     x = (z/lo)**2+anchor*anchor
     rho = np.abs(x)/a0
     if np.any(rho >= 1):
-        raise ValueError('remote Taylor domain does not converge; repartition in bank owner')
+        return None, 'remote Taylor domain does not converge; repartition in bank owner'
     # N+1 powers for value; derivative remainder is the differentiated
     # geometric remainder, bounded relative to the exact squared resolvent.
     for order in range(1, RESPONSE_TAYLOR_MAX_ORDER + 1):
@@ -329,7 +364,7 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
         if max(vr.max(), dr.max()) <= rel_tol/4:
             break
     else:
-        raise RuntimeError('remote Taylor order budget exceeded')
+        return None, 'remote Taylor order budget exceeded'
     # Propagate positive row-relative errors through complex Taylor powers.
     amp_v = (1+rho)/(1-rho)
     amp_d = ((1+rho)/(1-rho))**2
@@ -368,7 +403,7 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
             break
         last = dict(nodes=node_count, interval_errors=errors)
     else:
-        raise RuntimeError(f'remote NNLS certificate failed: {last}')
+        return None, f'remote NNLS certificate failed: {last}'
     rows = np.asarray(rows)
     powers = x[:, None]**np.arange(order+1)
     dpowers = np.zeros_like(powers)
@@ -377,7 +412,7 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
     vb = vr+amp_v*max(errors)
     db = dr+amp_d*max(errors)
     if max(vb.max(), db.max()) > rel_tol:
-        raise RuntimeError('remote combined certificate failed')
+        return None, 'remote combined certificate failed'
     result = dict(t=t/lo, coefficient_rows=rows/lo**(2*np.arange(order+1)[:, None]+1),
                 projection_value=value, projection_derivative=derivative,
                 certificate=dict(status='PASS', scope='continuum delta interval; all supplied z',
@@ -388,9 +423,8 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
                     value_taylor_bounds=vr.tolist(), derivative_taylor_bounds=dr.tolist(),
                     value_bound=vb.tolist(), derivative_bound=db.tolist(),
                     owner='Run183 positive NNLS inverse-moment rows'))
-    return dict(result, node_digest=_node_digest(result),
-                reuse_status="build" if previous is None else "rebuild",
-                reuse_reason=reason)
+    return result, None
+
 
 
 def response_remote_max_ratio(rel_tol):
@@ -426,22 +460,102 @@ def response_remote_max_ratio(rel_tol):
     return lo
 
 
-def response_remote_max_abs_z(delta_lo_ry, eta_ry, rel_tol):
-    """Largest ``|z|`` a remote cell with this lower edge admits, in Ry.
+#: Bisections between zero and the stage-one bound when the rule refuses at
+#: that bound.  Ten gives the published cap to one part in 1024 of the
+#: stage-one radius, which is finer than any support spacing the recipe emits,
+#: and costs at most eleven rule evaluations -- memoised, so a self-consistent
+#: loop whose cell edges do not move pays them once.
+_REMOTE_CAP_BISECTIONS = 10
 
-    ``response_laplace_rule`` expands about the cell's lower transition edge
-    with ratio ``rho = |(z/lo)**2 + (eta/lo)**2| / (1 + (eta/lo)**2)``.  Using
-    the orientation-free bound ``|(z/lo)**2| <= |z|**2/lo**2`` gives a radius
-    that is safe for a sample anywhere on the line or the imaginary axis:
 
-        |z| <= lo * sqrt(rho_max*(1 + anchor**2) - anchor**2),   anchor = eta/lo
+def _remote_stage_one_bound(lo, eta, rel_tol):
+    """The Taylor-ratio radius alone: ``|z| <= lo*sqrt(rho_max(1+a^2) - a^2)``.
 
-    Returns 0.0 when even the origin is inadmissible, which cannot happen for a
-    physical cell but keeps the caller's arithmetic total.
+    The orientation-free bound ``|(z/lo)**2| <= |z|**2/lo**2`` makes this safe
+    for a sample anywhere on the line or the imaginary axis.  It is the
+    STARTING POINT for the published cap, not the cap: see
+    :func:`response_remote_max_abs_z`.
     """
-    lo = float(delta_lo_ry)
-    if not np.isfinite(lo) or lo <= 0:
-        raise ValueError("response_remote_max_abs_z: delta_lo_ry must be finite and positive")
-    anchor2 = (float(eta_ry) / lo) ** 2
+    anchor2 = (float(eta) / lo) ** 2
     inside = response_remote_max_ratio(rel_tol) * (1.0 + anchor2) - anchor2
     return lo * math.sqrt(inside) if inside > 0 else 0.0
+
+
+@lru_cache(maxsize=256)
+def _remote_cap_accepts(radius, delta_lo_ry, delta_hi_ry, eta_ry, rel_tol,
+                        domain_pad_ry):
+    """Does the RULE accept a sample of this ``|z|`` on this cell?
+
+    Two orientations at the same radius -- the worst real-heavy one at the
+    sample height and the purely imaginary one -- handed to the rule's own
+    predicate through the rule's own padding, so the answer is the rule's and
+    not a model of it.  Memoised because the bisection asks repeatedly and a
+    self-consistent loop asks again with the same edges.
+    """
+    z = np.array([complex(math.sqrt(max(radius*radius - eta_ry*eta_ry, 0.0)),
+                          eta_ry),
+                  complex(0.0, radius)], dtype=complex)
+    lo, hi = _padded_remote_domain(float(delta_lo_ry), float(delta_hi_ry), z,
+                                   float(eta_ry), float(domain_pad_ry))
+    result, _refusal = _remote_certificate(lo, hi, z, float(eta_ry),
+                                           float(rel_tol))
+    return result is not None
+
+
+def response_remote_max_abs_z(delta_lo_ry, delta_hi_ry, eta_ry, rel_tol, *,
+                              domain_pad_ry=0.0):
+    """Largest ``|z|`` in Ry at which ``response_laplace_rule`` ACCEPTS.
+
+    THE PUBLISHED DOMAIN IS THE RULE'S OWN DOMAIN.  The rule's acceptance has
+    three stages -- the Taylor order budget, the NNLS row fit at
+    ``row_tol = rel_tol/(4*amp_d)``, and the combined value/derivative bound --
+    and inverting the first alone is not a domain: a sample exactly at the
+    Taylor radius forces ``order`` to the maximum 64, which makes ``row_tol``
+    112x tighter than ``rel_tol`` and ``stop = 4*(order+1) - ln(row_tol)`` 283,
+    more than the 192-node ladder resolves.  The recipe then emits a support
+    the rule refuses, which is how run 49's Si SC deck died at map 0 with
+    'remote NNLS certificate failed' (AREBASE 2026-09-12, job 58222998).
+
+    So the bound is found, not modelled: start at the Taylor radius, ask
+    :func:`_remote_certificate` -- the rule's own predicate, through the rule's
+    own padding -- and, if it refuses, bisect the radius downward
+    ``_REMOTE_CAP_BISECTIONS`` times, keeping the largest radius that accepts.
+    There is no margin constant and no dial; the number returned is admissible
+    by construction, for a one-shot cell (``domain_pad_ry = 0``) and for the
+    self-consistent one the bank will actually expand about.
+
+    ``domain_pad_ry`` must be the pad the BANK will pass
+    (``gw.response_bank.RESPONSE_DOMAIN_PAD_RY`` under self-consistency, zero
+    otherwise): the pad lowers the expansion edge and raises the upper one, so
+    a cap taken without it is a cap for a different interval.
+
+    Raises when even the smallest bisected radius is refused, which means the
+    cell itself cannot serve any sample and the bank owner must repartition --
+    the caller cannot fix that by choosing smaller supports.
+    """
+    lo, hi = float(delta_lo_ry), float(delta_hi_ry)
+    if not np.isfinite(lo) or lo <= 0:
+        raise ValueError("response_remote_max_abs_z: delta_lo_ry must be finite and positive")
+    if not np.isfinite(hi) or hi < lo:
+        raise ValueError("response_remote_max_abs_z: delta_hi_ry must be finite and >= delta_lo_ry")
+    if not np.isfinite(domain_pad_ry) or domain_pad_ry < 0:
+        raise ValueError("response_remote_max_abs_z: domain_pad_ry must be finite and nonnegative")
+    bound = _remote_stage_one_bound(lo, float(eta_ry), rel_tol)
+    if bound <= 0.0:
+        return 0.0
+    args = (lo, hi, float(eta_ry), float(rel_tol), float(domain_pad_ry))
+    if _remote_cap_accepts(bound, *args):
+        return bound
+    low, high, best = 0.0, bound, 0.0
+    for _ in range(_REMOTE_CAP_BISECTIONS):
+        mid = 0.5 * (low + high)
+        if _remote_cap_accepts(mid, *args):
+            best, low = mid, mid
+        else:
+            high = mid
+    if best <= 0.0:
+        raise RuntimeError(
+            "remote cell admits no sample: response_laplace_rule refuses even "
+            f"|z| = {high:.6g} Ry on delta [{lo:.6g}, {hi:.6g}] Ry with pad "
+            f"{float(domain_pad_ry):.6g}; repartition in the bank owner")
+    return best

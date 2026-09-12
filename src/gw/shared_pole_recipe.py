@@ -72,7 +72,7 @@ shared_real_pole_v2_r1 = {
     # Si P4, job 58217047.5/.6).  The ceiling is not a dial here -- it is read
     # from the bank's own order budget through minimax.response_remote_max_*,
     # so there is exactly one owner of the convergence math.
-    "remote_domain_rule": "every emitted |z| <= minimax.response_remote_max_abs_z(min cell delta_lo, h)",
+    "remote_domain_rule": "every emitted |z| <= minimax.response_remote_max_abs_z(lowest cell [delta_lo, delta_hi], h, bank domain pad)",
     "imaginary_count_epsilon": 1.0e-3,
     "imaginary_min_count": 2,
     "imaginary_count_rule": "max(2, round(log(16*(u_max/u_min)^2)*log(4000)/(2*pi^2)))",
@@ -573,7 +573,8 @@ def _sigma_extent_ev(config):
     return max(abs(float(e)) for e in edges)
 
 
-def _remote_domain_cap(wfns, meta, census, eta_ry, rel_tol, domain_pad_ry=0.0):
+def _remote_domain_cap(wfns, meta, census, eta_ry, rel_tol, domain_pad_ry=0.0,
+                       session=None):
     """Largest sample |z| in eV the bank's remote cells admit, and that edge.
 
     ONE PARTITIONER. ``response_windows`` is the bank's own near/remote split
@@ -582,7 +583,10 @@ def _remote_domain_cap(wfns, meta, census, eta_ry, rel_tol, domain_pad_ry=0.0):
     convergence predicate and answers the radius. Returns ``(None, None)``
     when the deck has no remote cell, in which case no sample can be refused.
 
-    THE DOMAIN THE CAP IS COMPUTED FOR MUST BE THE DOMAIN THE BANK WILL USE.
+    THE PUBLISHED DOMAIN IS THE RULE'S OWN.  ``response_remote_max_abs_z``
+    evaluates ``response_laplace_rule``'s full three-stage acceptance at the
+    radius it returns, through the rule's own padding, so the number here is
+    admissible by construction rather than a model of one stage of it.
     Under self-consistency the bank hands ``response_laplace_rule`` a
     ``domain_pad_ry`` (``response_bank.RESPONSE_DOMAIN_PAD_RY``) so a rule
     reused across maps stays valid while the spectrum drifts, and the rule
@@ -603,12 +607,30 @@ def _remote_domain_cap(wfns, meta, census, eta_ry, rel_tol, domain_pad_ry=0.0):
     _masks, _ft, _ut, cells, _window_receipt = response_windows(
         energy, f, u, chemical_potential_ry=census['mu_ry'])
     if not cells:
-        return None, None
-    delta_lo = min(float(cell['delta_min_ry']) for cell in cells)
-    # ``response_laplace_rule``'s own padded edge, character for character.
+        return None, None, None
+    # The binding cell is the one with the lowest edge; its own upper edge
+    # goes with it, because the rule's NNLS rows are fitted on [lo, hi] and
+    # the admissible radius depends on both.
+    cell = min(cells, key=lambda c: float(c['delta_min_ry']))
+    delta_lo, delta_hi = float(cell['delta_min_ry']), float(cell['delta_max_ry'])
+    # The SERVICE applies the pad and answers with a radius its own rule
+    # accepts; nothing here models the expansion.  That answer is FOUND, by
+    # evaluating the rule -- minutes on a wide cell -- so a self-consistent
+    # loop retains it in the support session it already uses for every other
+    # scalar support bound, keyed on the geometry the answer depends on.  A
+    # map whose cell edges move gets a fresh answer; one whose edges do not
+    # pays once.
+    key = ("remote_cap", round(delta_lo, 12), round(delta_hi, 12),
+           round(float(eta_ry), 12), float(rel_tol), round(float(domain_pad_ry), 12))
+    if session is not None and key in session:
+        cap = session[key]
+    else:
+        cap = response_remote_max_abs_z(delta_lo, delta_hi, eta_ry, rel_tol,
+                                        domain_pad_ry=float(domain_pad_ry))
+        if session is not None:
+            session[key] = cap
     effective_lo = max(delta_lo - float(domain_pad_ry), delta_lo / 2.0)
-    cap = response_remote_max_abs_z(effective_lo, eta_ry, rel_tol)
-    return cap * RYD_TO_EV, effective_lo * RYD_TO_EV
+    return cap * RYD_TO_EV, effective_lo * RYD_TO_EV, delta_hi
 
 
 def _support_report(r, tier, census):
@@ -912,12 +934,13 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     # partition in the tree, not a copy of one here; then ask minimax for the
     # largest |z| its remote Taylor rule can certify for the lowest cell.
     from .response_bank import RESPONSE_DOMAIN_PAD_RY
-    remote_cap_ev, remote_delta_lo_ev = _remote_domain_cap(
+    remote_cap_ev, remote_delta_lo_ev, remote_delta_hi_ry = _remote_domain_cap(
         wfns, meta, census, height / RYD_TO_EV, recipe['bank_rule_tolerance'],
         # The bank pads its remote cells exactly when it keeps a rule session,
         # which is exactly when this resolver is given a support session.
         domain_pad_ry=(0.0 if support_session is None
-                       else RESPONSE_DOMAIN_PAD_RY))
+                       else RESPONSE_DOMAIN_PAD_RY),
+        session=support_session)
     top_uncapped, umax_uncapped = top, umax_zolotarev
     if remote_cap_ev is not None:
         # The ceiling is on |z|. An imaginary sample has |z| = u exactly, but a
@@ -1066,6 +1089,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'remote_cap_ev': remote_cap_ev, 'remote_delta_lo_ev': remote_delta_lo_ev,
         'remote_domain_pad_ev': (0.0 if support_session is None
                                  else RESPONSE_DOMAIN_PAD_RY * RYD_TO_EV),
+        'remote_delta_hi_ry': remote_delta_hi_ry,
         'line_step_ev': step, 'line_growth_fraction': growth,
         'line_ev': line, 'imaginary_ev': imaginary,
         'held_line_ev': held_line, 'held_imaginary_ev': held_imag,
@@ -1107,7 +1131,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'top_uncapped': 'top before the bank remote-domain ceiling',
         'u_max_uncapped': 'u_max before the bank remote-domain ceiling',
         'u_max_bound': 'zolotarev tier rule, or the bank remote-domain cap',
-        'remote_cap': 'minimax.response_remote_max_abs_z at the lowest remote cell edge',
+        'remote_cap': 'largest |z| response_laplace_rule accepts on the lowest remote cell, padded as the bank will pad it',
         'remote_delta': 'lowest remote Laplace cell transition edge, from response_windows',
         'top': 'max(2.25*omega_fine, 1.25*sigma_window)',
         'line_step': '2*eta (tier line_step_eta_factor)',

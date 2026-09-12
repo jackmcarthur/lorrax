@@ -302,8 +302,9 @@ def test_remote_domain_cap_limits_every_emitted_sample():
     edge = r['remote_delta_lo_ev']
     assert edge == pytest.approx(37.0, abs=1e-9)      # 1 - (-36)
     # The ceiling is the bank's, not a local constant: same call, same answer.
-    cap = minimax.response_remote_max_abs_z(edge/RYD_TO_EV, r['height_ry'],
-                                            r['bank_rule_tolerance'])*RYD_TO_EV
+    cap = minimax.response_remote_max_abs_z(
+        edge/RYD_TO_EV, r['remote_delta_hi_ry'], r['height_ry'],
+        r['bank_rule_tolerance'])*RYD_TO_EV
     assert r['remote_cap_ev'] == pytest.approx(cap)
     assert r['top_bound_by'] == 'remote_cap' and r['u_max_bound_by'] == 'remote_cap'
     # u_max is the radius itself; the line top is its real part at height h.
@@ -359,8 +360,9 @@ def test_remote_domain_cap_uses_the_sc_padded_edge():
     assert sc['remote_domain_pad_ev'] == pytest.approx(pad_ev)
     assert sc['remote_delta_lo_ev'] == pytest.approx(max(37.0 - pad_ev, 18.5))
     assert sc['remote_cap_ev'] == pytest.approx(minimax.response_remote_max_abs_z(
-        sc['remote_delta_lo_ev']/RYD_TO_EV, sc['height_ry'],
-        sc['bank_rule_tolerance'])*RYD_TO_EV)
+        one_shot['remote_delta_lo_ev']/RYD_TO_EV, sc['remote_delta_hi_ry'],
+        sc['height_ry'], sc['bank_rule_tolerance'],
+        domain_pad_ry=RESPONSE_DOMAIN_PAD_RY)*RYD_TO_EV)
 
     # The cap BINDS harder under SC, and every emitted sample is inside it.
     assert sc['remote_cap_ev'] < one_shot['remote_cap_ev']
