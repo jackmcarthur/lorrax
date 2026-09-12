@@ -278,11 +278,18 @@ def test_sc_occupation_solve_honours_the_declared_smearing_family(monkeypatch):
 
 
 def test_one_shot_and_sc_read_the_same_deck_key():
-    """One source of truth: both owners resolve the same configured family."""
-    from gw import gw_jax, sc_iteration
-    for module in (gw_jax, sc_iteration):
-        source = Path(module.__file__).read_text()
-        assert "occ_smearing_family" in source
+    """One source of truth: both owners resolve the same configured family.
+
+    ``gw.gw_jax`` initializes the communicator stack at import, so it is read
+    from disk rather than imported: importing a driver module inside a test
+    process refuses at P > 1 (``jax.distributed.initialize() must be called
+    before any JAX calls``), which is a P4 failure a P1 run cannot see.
+    """
+    from gw import sc_iteration
+    root = Path(sc_iteration.__file__).parent
+    one_shot = (root / "gw_jax.py").read_text()
+    assert "family=config.occ_smearing_family" in one_shot
+    assert "occ_smearing_family" in Path(sc_iteration.__file__).read_text()
     config = SimpleNamespace(occ_smearing_family="mp1")
     assert sc_iteration._declared_smearing_family(config) == "mp1"
 
