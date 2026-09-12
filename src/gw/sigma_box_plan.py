@@ -87,6 +87,33 @@ def sigma_rule_request_cache(directory, identity, poles2, counts, *, eta, eps):
     return os.path.join(directory, "request_" + digest.hexdigest())
 
 
+def _receipt_json(receipt):
+    """Serialize the durable quadrature receipt as STRICT JSON.
+
+    The product windows carry open endpoints -- a state tail runs to
+    ``+inf``, a resonant window from ``-inf`` (``_state_products``) -- and
+    ``json.dumps`` spells those ``Infinity``/``-Infinity``, which is a
+    Python extension no other parser reads.  An unbounded endpoint is
+    ``null``, the standard JSON spelling of "no bound"; its side is given by
+    its position in the interval pair, which is how every consumer already
+    reads these.  ``allow_nan=False`` then refuses anything else non-finite
+    rather than emitting a token a strict reader would reject -- the same
+    convention as the store's own encoder (file_io/shared_pole_store.py).
+    """
+    def finite(value):
+        if isinstance(value, float) and not np.isfinite(value):
+            if np.isnan(value):
+                raise ValueError(
+                    "Sigma quadrature receipt: NaN is not an unbounded edge")
+            return None
+        if isinstance(value, dict):
+            return {key: finite(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [finite(item) for item in value]
+        return value
+    return json.dumps(finite(receipt), sort_keys=True, allow_nan=False)
+
+
 def resolve_sigma_box_cache_dir(setting, input_dir):
     """Resolve the deck's uniform-rule cache spelling beside its input.
 
@@ -1186,7 +1213,7 @@ def plan_sigma_windows(
     # Keep the accepted rule identity and its operative policy in the normal
     # scientific report, including cache-off and repeated SC planning calls.
     if process_rank() == 0:
-        print_fn("Sigma quadrature receipt: " + json.dumps(geometry, sort_keys=True))
+        print_fn("Sigma quadrature receipt: " + _receipt_json(geometry))
     return output, geometry
 
 
