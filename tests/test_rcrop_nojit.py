@@ -429,3 +429,203 @@ def test_first_iterate_is_not_the_picard_step():
     assert _norm(np.asarray(res.x) - x_star) < 1e-10
     assert _norm(picard - x_star) > 1.9                   # e ← −2·e
     assert _norm(np.asarray(res.x) - picard) > 1.0
+
+
+def test_crop_conditioning_guard_is_inert_when_the_gram_is_well_conditioned():
+    """The guard must be BIT-IDENTICAL above the floor, not merely close.
+
+    ``mixing.acceleration`` is shared with the incumbent MPA SC route, so a
+    guard that perturbs every well-conditioned solve would move numbers on a
+    path that has nothing to do with the defect it fixes.  The selector form
+    exists precisely so that above the floor the returned array IS the
+    historical expression's output, and this asserts that against a
+    recomputation of that expression rather than against a tolerance.
+    """
+    import jax.numpy as jnp
+    import numpy as np
+    from mixing import acceleration
+
+    rng = np.random.default_rng(20260911)
+    k, n = 4, 37
+    # A window whose differences are comfortably independent.
+    Fw = jnp.asarray(rng.normal(size=(k + 1, n)) + 1j * rng.normal(size=(k + 1, n)))
+    alpha = acceleration._solve_crop_alpha_stacked(Fw)
+
+    # The historical expression, recomputed here in full.
+    ax = tuple(range(1, Fw.ndim))
+    bshape = (k,) + (1,) * (Fw.ndim - 1)
+    f_trial, F_hist = Fw[-1], Fw[:k]
+    valid = jnp.sqrt(jnp.sum(jnp.abs(F_hist) ** 2, axis=ax)) > 1e-14
+    F_prev = jnp.where(valid.reshape(bshape), F_hist - f_trial[None], 0.0 + 0.0j)
+    col = jnp.sqrt(jnp.sum(jnp.abs(F_prev) ** 2, axis=ax))
+    scale = jnp.where(col > 0.0, col, 1.0)
+    F_scaled = F_prev / scale.reshape(bshape)
+    G = jnp.tensordot(jnp.conj(F_scaled), F_scaled, axes=(ax, ax))
+    b = -jnp.tensordot(jnp.conj(F_scaled), f_trial,
+                       axes=(ax, tuple(range(f_trial.ndim))))
+    historical = jnp.linalg.solve(G + 1e-12 * jnp.eye(k, dtype=G.dtype), b) / scale
+    historical = jnp.where(valid, historical, 0.0 + 0.0j)
+
+    eig = np.asarray(jnp.linalg.eigvalsh(G), np.float64)
+    assert eig[0] > acceleration._CROP_CONDITION_FLOOR * eig[-1], (
+        "fixture is not well conditioned; the test would prove nothing")
+    np.testing.assert_array_equal(np.asarray(alpha[:k]), np.asarray(historical))
+    # The affine constraint still holds.
+    np.testing.assert_allclose(complex(np.asarray(alpha).sum()), 1.0 + 0.0j,
+                               rtol=0, atol=1e-12)
+
+
+def test_crop_conditioning_guard_damps_a_near_collinear_window():
+    """Below the floor the coefficients are bounded instead of amplified.
+
+    Near convergence the residual differences become nearly collinear BY
+    CONSTRUCTION, so this is the normal end state of a converging window,
+    not a contrived input.  The unit-diagonal Gram's smallest eigenvalue
+    falls toward the historical 1e-12 ridge, which is why that ridge never
+    guarded anything.
+    """
+    import jax.numpy as jnp
+    import numpy as np
+    from mixing import acceleration
+
+    rng = np.random.default_rng(7)
+    k, n = 4, 29
+    base = rng.normal(size=n) + 1j * rng.normal(size=n)
+    f_trial = base * 1e-6
+    # History differences collinear with `base` to one part in 1e10.
+    rows = [f_trial + base * (1.0 + j) * (1.0 + 1e-10 * rng.normal(size=n))
+            for j in range(k)]
+    Fw = jnp.asarray(np.stack(rows + [f_trial]))
+
+    alpha = np.asarray(acceleration._solve_crop_alpha_stacked(Fw))
+    assert np.all(np.isfinite(alpha))
+    # The damped branch keeps the combination bounded; the historical
+    # expression on this window amplifies without bound.
+    assert np.abs(alpha[:k]).sum() < 1.0e3, np.abs(alpha[:k]).sum()
+    np.testing.assert_allclose(complex(alpha.sum()), 1.0 + 0.0j,
+                               rtol=0, atol=1e-9)
+
+
+def test_crop_conditioning_guard_ignores_unfilled_history_slots():
+    """A YOUNG window is not an ill-conditioned one.
+
+    An unfilled slot zeroes its whole column, so a window that has simply
+    not filled yet has an exactly singular Gram by construction.  Reading
+    that as ill-conditioning damps the first iterates and degenerates the
+    update to the plain Picard step -- which is what
+    ``test_first_iterate_is_not_the_picard_step`` caught on the first cut of
+    this guard.  The condition test therefore judges the VALID block only.
+    """
+    import jax.numpy as jnp
+    import numpy as np
+    from mixing import acceleration
+
+    rng = np.random.default_rng(31337)
+    k, n = 4, 23
+    rows = [rng.normal(size=n) + 1j * rng.normal(size=n) for _ in range(k + 1)]
+    # Only the first history column is filled; the rest are unfilled slots.
+    for j in range(1, k):
+        rows[j] = np.zeros(n, complex)
+    Fw = jnp.asarray(np.stack(rows))
+
+    alpha = np.asarray(acceleration._solve_crop_alpha_stacked(Fw))
+    # The unfilled slots carry no weight ...
+    np.testing.assert_array_equal(alpha[1:k], np.zeros(k - 1, complex))
+    # ... and the one real column is NOT damped away, so the update is not
+    # the plain Picard step (which would be alpha = [0,0,0,0,1]).
+    assert abs(alpha[0]) > 1e-6, alpha
+    np.testing.assert_allclose(complex(alpha.sum()), 1.0 + 0.0j,
+                               rtol=0, atol=1e-12)
+
+
+# ``rcrop_nojit``'s call sequence into ``residual_fn``, which the fixtures
+# below have to target precisely: ONE pre-loop call on x0, then per iteration
+# a TRIAL call on ``x + f`` followed by an ACCEPTED call on the CROP-mixed
+# ``x_new``.  So while nothing is rejected, calls 2, 4, 6 ... are trials and
+# 1, 3, 5 ... are not -- but a REJECTED trial skips its accepted call, after
+# which every subsequent call is another trial, so that parity cannot be
+# relied on once rejections start.  Only the trial is protected: a refusal on
+# the accepted map is a real refusal and must propagate, and getting that
+# wrong is how the first cut of the P4 gate planted its failure on the wrong
+# call.
+
+
+def test_a_refused_trial_stops_the_run_naming_what_was_already_converged():
+    """A refused trial has NO cheaper substitute, and pretending it does wastes maps.
+
+    MEASURED end to end (claim 2191): ``x_trial = x + f`` IS the plain step --
+    the CROP mixing happens afterwards -- so retrying an unchanged ``x`` and
+    ``f`` reproduces the same input and the same refusal exactly.  A first cut
+    of this change retried, and maps 11, 12 and 13 of a real leg refused with a
+    BYTE-IDENTICAL Gram eigenvalue before the bound stopped it: three wasted
+    maps for no information.  What the refusal must preserve instead is the
+    work already done and the reason, which is what this asserts.
+    """
+    import jax.numpy as jnp
+    import pytest
+    from mixing import acceleration
+
+    target = jnp.asarray([1.0, 2.0, 3.0, 4.0]) + 0j
+    base = _nonlinear(-0.55 * jnp.ones(4), target, 0.35)
+    calls = {"n": 0}
+
+    def residual(x):
+        calls["n"] += 1
+        if calls["n"] == 4:                      # the it=1 TRIAL
+            raise ValueError("GATE planted_trial_gate: got: planted; "
+                             "want: a finite trial; why: test")
+        return base(x)
+
+    with pytest.raises(RuntimeError) as caught:
+        acceleration.rcrop_nojit(residual, jnp.zeros(4, complex),
+                                 m=4, maxit=60, tol=1e-10)
+    message = str(caught.value)
+    assert "GATE sc_trial_refused" in message
+    # The refusal that actually happened, carried through with its rank.
+    assert "GATE planted_trial_gate" in message and "rank 0" in message
+    # And the reason a retry is not offered, so nobody adds one back.
+    assert "IS the plain step" in message
+    # It stopped at the refused trial, not after burning more maps on it.
+    assert calls["n"] == 4, calls
+
+
+def test_a_refusal_on_the_ACCEPTED_map_still_propagates_unwrapped():
+    """Only the trial is wrapped; the accepted map's refusal is untouched.
+
+    The two paths must stay distinguishable: a trial refusal is reported as
+    ``GATE sc_trial_refused`` with the original text inside it, while an
+    accepted-map refusal propagates as itself, so an operator can tell which
+    evaluation refused without reading the source.
+    """
+    import jax.numpy as jnp
+    import pytest
+    from mixing import acceleration
+
+    target = jnp.asarray([1.0, 2.0, 3.0, 4.0]) + 0j
+    base = _nonlinear(-0.55 * jnp.ones(4), target, 0.35)
+    calls = {"n": 0}
+
+    def residual(x):
+        calls["n"] += 1
+        if calls["n"] == 3:                      # the it=0 ACCEPTED call
+            raise ValueError("GATE planted_accepted_gate: got: planted; "
+                             "want: -; why: test")
+        return base(x)
+
+    with pytest.raises(ValueError, match="planted_accepted_gate"):
+        acceleration.rcrop_nojit(residual, jnp.zeros(4, complex),
+                                 m=4, maxit=60, tol=1e-10)
+
+
+def test_a_clean_run_reports_no_rejected_trials():
+    """The new field must be inert for every run that never rejects one."""
+    import jax.numpy as jnp
+    import numpy as np
+    from mixing import acceleration
+
+    target = jnp.asarray(np.arange(5, dtype=float) + 1.0) + 0j
+    result = acceleration.rcrop_nojit(_nonlinear(-0.55 * jnp.ones(5), target, 0.35),
+                                      jnp.zeros(5, complex),
+                                      m=3, maxit=40, tol=1e-10)
+    assert result.rejected_trials == ()
+    assert result.converged

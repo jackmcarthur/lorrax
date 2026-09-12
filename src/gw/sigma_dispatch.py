@@ -45,11 +45,12 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common import timing
 from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
 from runtime.padding import PaddedAxis
 from .gw_config import (
-    BRACKET_SCHEME_DEFAULT, ComputeMode, SigmaChannel,
+    BRACKET_SCHEME_DEFAULT, ComputeMode, DynamicSigmaConfig, SigmaChannel,
     band_extrapolation_is_consumable,
     mode_builds_channels, refuse_explicit_gij_under_low_mem_bands,
     refuse_unimplemented_compute_mode,
@@ -561,7 +562,10 @@ def finalize_dynamic_sigma(
                 "finalize_dynamic_sigma: H_T requires scalar V_H")
         v_h_scalar = sig_h
 
-    with timing.section("gw_jax.dynamic_sigma_finalize"):
+    with timing.section("sigma.finalize_input_wait"):
+        jax.block_until_ready((sigma_c_body_omega, sigma_c_body_omega_unextrap,
+                               sig_x, sig_h))
+    with timing.section("gw_jax.dynamic_sigma_finalize") as finalize_section:
         sigma_c_omega = add_head_sigma_diag(
             sigma_c_body_omega, head_sigma_diag_w_kn_ry,
             band_axis=sigma_band_axis)
@@ -721,6 +725,8 @@ def finalize_dynamic_sigma(
                 sigma_omega_h5_path, sigma_xc_qsgw,
                 config=config, print_fn=print_fn)
 
+        finalize_section.watch(sigma_c_omega, sigma_xc_qsgw, sigma_xc_qsgw_unextrap)
+
     _band_attrs = ((band_extrapolation or {}).get("attrs") or {})
     _band_counts_raw = _band_attrs.get("band_counts")
     _band_counts = (tuple(int(v) for v in np.asarray(
@@ -782,6 +788,29 @@ def finalize_dynamic_sigma(
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
+
+def _mpa_sigma_model_resources(W_by_role, sigma_w_model, head_correction=None):
+    """Select the current body and independent scalar-head resources."""
+    fit_identity = fit_digest = None
+    if sigma_w_model == "shared_pole":
+        handle = W_by_role["shared_pole"]
+        fit_path = handle["path"]
+        fit_identity, fit_digest = handle["identity"], handle["digest"]
+        if getattr(head_correction, "value", head_correction) != "off":
+            head_fit_path = W_by_role.get("mpa_head")
+            if (head_fit_path is None or head_fit_path.get("identity") != fit_identity
+                    or head_fit_path.get("body_digest") != fit_digest):
+                raise ValueError("GATE shared_pole_head: current body-bound MPA scalar head is missing or stale")
+        else:
+            head_fit_path = None
+    else:
+        try:
+            fit_path = W_by_role["mpa_fit"]
+        except KeyError as exc:
+            raise KeyError("MPA Sigma requires W_by_role['mpa_fit']") from exc
+        head_fit_path = fit_path
+    return fit_path, head_fit_path, fit_identity, fit_digest
+
 
 def _validate_sigma_stage(
         Gij, config, mode, print_fn):
@@ -1035,15 +1064,20 @@ def _static_sigma_channels(
     else:
         _bispinor_sigma = (
             wfns_transverse is not None and bispinor_v_q_path is not None)
-        sigma_x_result = compute_sigma_x(
-            wfns, V_q, meta, mesh_xy,
-            Gij=Gij,
-            static_head_terms=static_head_terms,
-            wfns_transverse=wfns_transverse,
-            bispinor_v_q_path=bispinor_v_q_path, mu_bases=mu_bases,
-            occupation_state=occupation_state,
-            return_transverse=_bispinor_sigma,
-        )
+        # Charge pending input work to its boundary, not to exchange.
+        with timing.section("sigma.input_wait"):
+            jax.block_until_ready((wfns, wfns_transverse, V_q, Gij))
+        with timing.section("sigma.exchange") as sec:
+            sigma_x_result = compute_sigma_x(
+                wfns, V_q, meta, mesh_xy,
+                Gij=Gij,
+                static_head_terms=static_head_terms,
+                wfns_transverse=wfns_transverse,
+                bispinor_v_q_path=bispinor_v_q_path, mu_bases=mu_bases,
+                occupation_state=occupation_state,
+                return_transverse=_bispinor_sigma,
+            )
+            sec.watch(sigma_x_result)
         if _bispinor_sigma:
             sig_x, sig_x_b = sigma_x_result
             sigma_lorentz = jnp.stack((
@@ -1065,9 +1099,11 @@ def _sigma_hartree_fields(
         sig_h = jnp.asarray(0, dtype=sig_x.dtype)
         h_transverse = None
     else:
-        sig_h, h_transverse = _compute_live_hartree(
-            config, meta, band_slices, mesh_xy,
-            wfn=wfn, sym=sym, print_fn=print_fn)
+        with timing.section("sigma.hartree") as sec:
+            sig_h, h_transverse = _compute_live_hartree(
+                config, meta, band_slices, mesh_xy,
+                wfn=wfn, sym=sym, print_fn=print_fn)
+            sec.watch(sig_h, h_transverse)
         sig_h = jnp.asarray(sig_h, dtype=sig_x.dtype)
         if hartree_basis_rotation is not None:
             rotation = _place_band_rotation(
@@ -1132,10 +1168,9 @@ def _compute_mpa_sigma(
     from .mpa.sigma import compute_sigma_c_mpa_omega_grid
     from .efermi import resolve_sigma_efermi_ry
     from .ppm_windows import sigma_regularization_for_config
-    try:
-        fit_path = W_by_role["mpa_fit"]
-    except KeyError as exc:
-        raise KeyError("MPA Sigma requires W_by_role['mpa_fit']") from exc
+    sigma_w_model = getattr(config.sigma, "w_model", "mpa")
+    fit_path, head_fit_path, fit_identity, fit_digest = _mpa_sigma_model_resources(
+        W_by_role, sigma_w_model, config.head.correction)
     _xi = sigma_regularization_for_config(config)
     print_fn(_xi.describe())
     if material_class == "metal":
@@ -1151,23 +1186,35 @@ def _compute_mpa_sigma(
     from .sigma_box_plan import resolve_sigma_box_cache_dir
     quadrature_cache_dir = resolve_sigma_box_cache_dir(
         config.sigma.quadrature_cache_dir, input_dir)
-    head = _bundle_reader.read_head_fit_collective(
-        fit_path, mesh_xy=mesh_xy, to_unit="Ry")
-    compatible_occ_hashes = ()
-    if occupation_state is not None:
-        from .efermi import legacy_square_mesh_occupation_digests
-        compatible_occ_hashes = legacy_square_mesh_occupation_digests(
-            occupation_state.f_kn, int(meta.b_id_4_user))
-    from .mpa.sigma import assert_head_body_occupation_match
-    head_occ_match = assert_head_body_occupation_match(
-        head.get("occupation_stamps") or {}, occupation_state,
-        compatible_occ_hashes=compatible_occ_hashes)
-    if head_occ_match == "legacy_zero_pad":
-        print_fn(
-            "  MPA scalar head: occupation provenance matched an exact "
-            "legacy square-mesh zero-pad encoding.")
+    # Read and authenticate the cheap scalar head before the expensive body
+    # sweep.  A certified legacy store can differ only by an exact-zero
+    # square-mesh band pad; the helper reproduces that digest from the live
+    # table rather than trusting artifact metadata.
+    head = None
+    if head_fit_path is None:
+        print_fn("  shared-pole scalar head: OFF by explicit head_correction policy")
+    else:
+        head = (head_fit_path if isinstance(head_fit_path, dict) else
+                _bundle_reader.read_head_fit_collective(
+                    head_fit_path, mesh_xy=mesh_xy, to_unit="Ry"))
+        compatible_occ_hashes = ()
+        if occupation_state is not None:
+            from .efermi import legacy_square_mesh_occupation_digests
+            compatible_occ_hashes = legacy_square_mesh_occupation_digests(
+                occupation_state.f_kn, int(meta.b_id_4_user))
+        from .mpa.sigma import assert_head_body_occupation_match
+        head_occ_match = assert_head_body_occupation_match(
+            head.get("occupation_stamps") or {}, occupation_state,
+            compatible_occ_hashes=compatible_occ_hashes)
+        if head_occ_match == "legacy_zero_pad":
+            print_fn(
+                "  MPA scalar head: occupation provenance matched an exact "
+                "legacy square-mesh zero-pad encoding.")
     body = compute_sigma_c_mpa_omega_grid(
         wfns, fit_path, meta, mesh_xy,
+        sigma_w_model=sigma_w_model,
+        fit_identity=fit_identity,
+        fit_digest=fit_digest,
         omega_grid_ry=config.omega_grid_ry,
         efermi_ry=sigma_efermi_ry,
         occupation_state=occupation_state,
@@ -1187,24 +1234,26 @@ def _compute_mpa_sigma(
         expected_screening_diagrams=config.screening.diagrams,
         fixed_quadrature_session=(
             None if fixed_quadrature_session is None else
-            fixed_quadrature_session.setdefault("mpa", {})),
+            fixed_quadrature_session.setdefault(sigma_w_model, {})),
         print_fn=print_fn)
-    if iteration_head is None:
-        sigma_bands = wfns.slices.sigma
-        head_enk = np.asarray(wfns.enk[:, sigma_bands])
-        head_occ = np.asarray(wfns.occ[:, sigma_bands])
-        head_efermi = sigma_efermi_ry
-    else:
-        head_enk = np.asarray(iteration_head.sigma_energies_ry)
-        head_occ = np.asarray(iteration_head.sigma_occupations)
-        head_efermi = float(iteration_head.efermi_ry)
-    head_diag = compute_complex_pole_head_sigma_diag(
-        omega_grid_ry=np.asarray(config.omega_grid_ry),
-        enk_ry=head_enk,
-        efermi_ry=head_efermi,
-        occupations=head_occ,
-        poles_ry=head["Omega_p"], residues_ry=head["B_p"],
-        cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
+    head_diag = None
+    if head is not None:
+        if iteration_head is None:
+            sigma_bands = wfns.slices.sigma
+            head_enk = np.asarray(wfns.enk[:, sigma_bands])
+            head_occ = np.asarray(wfns.occ[:, sigma_bands])
+            head_efermi = sigma_efermi_ry
+        else:
+            head_enk = np.asarray(iteration_head.sigma_energies_ry)
+            head_occ = np.asarray(iteration_head.sigma_occupations)
+            head_efermi = float(iteration_head.efermi_ry)
+        head_diag = compute_complex_pole_head_sigma_diag(
+            omega_grid_ry=np.asarray(config.omega_grid_ry),
+            enk_ry=head_enk,
+            efermi_ry=head_efermi,
+            occupations=head_occ,
+            poles_ry=head["Omega_p"], residues_ry=head["B_p"],
+            cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
     return finalize_dynamic_sigma(
         body.sigma_c_kij, head_diag,
         sigma_band_axis=body.band_axis,

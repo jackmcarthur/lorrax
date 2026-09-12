@@ -1116,3 +1116,21 @@ selects the corresponding local tile GEMM followed by centroid reduce-scatter.
 These reductions do not apply to Green or zeta band sums. SC band rotations
 use `out_spec=P(None,"x",None)` or `P(None,None,"y")` to retain the carrier's
 single-axis centroid sharding. They do not create another Green algorithm.
+
+## Bounded face products with a shared sample operand
+
+`panel_matmul(A, B, mesh=mesh, panel_bytes=bytes_per_rank)` forms `A @ B`
+using contraction-panel broadcasts inside a native `shard_map` scan. A is
+`[q,m,k]` at `P(None,'x','y')`; B is `[q,k,n]` in the same layout or
+`[q,s,k,n]` at `P(None,None,'x','y')`. With a sample axis, the left panel is
+broadcast once before the sample scan. Output faces retain both mesh axes;
+no complete row or column is gathered.
+
+The caller admits the input/output faces and supplies a per-rank byte budget
+for both operand panels. The service chooses a contraction width dividing
+both existing shard extents, with live operand payload
+`itemsize*q*width*(m/Px+n/Py) <= panel_bytes`. This is an operand bound,
+not a claim about total compiled/native workspace. Callers must also admit
+`memory_analysis()` and provider workspace before executing. The service
+adds no physics prefactor, conjugation, or backend-selection dial. The
+local/distributed Dyson solve choice remains with the existing LU plan.

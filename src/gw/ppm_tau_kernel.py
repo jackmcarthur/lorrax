@@ -481,8 +481,30 @@ def get_shared_sigma_tau_kernel(
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
     layout: str = "face", face_shape=None, face_band_extent=None,
     k_unfold_plan=None,
+    w_synthesis=None,
 ) -> Callable[..., jax.Array]:
-    """Build selected multipole W(tau) tiles for the shared complex Sigma contraction."""
+    """Return the GN tau kernel with a selected multipole W(tau) builder.
+
+    All spatial work is the established ``build_G_tau -> fused GW FFT ->
+    contract_bands`` path.  This wrapper changes only the scalar frequency
+    synthesis: several poles and compatible windows are summed into one W
+    tile before that unchanged convolution.  It always uses the single
+    complex projection carrier; HGL's missing sine arm is completed once by
+    :class:`gw.ppm_accumulators.DeviceOmegaAccumulator` after the tau sum.
+
+    This is the entry point ``gw.mpa.sigma`` calls for every dynamic pole
+    model.  ``brackets=None`` retains the ordinary MPA shape; a tuple asks the
+    same spatial kernel for a leading disjoint band-bracket axis.  ``layout``
+    and ``face_shape`` forward to :func:`_get_sigma_kij_kernel` unchanged.
+
+    ``w_synthesis`` optionally supplies the resolved model's W builder with
+    the same seven operands as :func:`build_shared_w_tau`. It must finish
+    the complete full-q ``P(None,'x','y')`` buffer before returning. The
+    dispatcher stays outside jit for this route so a bounded reader can
+    supply q/K panels between compiled local synthesis calls. Storage
+    panels never cause additional spatial calls; the spatial kernel remains
+    the same compiled callable, including its donation of W.
+    """
     kgrid = tuple(int(x) for x in kgrid)
     if brackets is not None:
         brackets = tuple((int(lo), None if hi is None else int(hi))
@@ -492,7 +514,7 @@ def get_shared_sigma_tau_kernel(
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
            brackets, layout, face_shape, face_band_extent,
            k_unfold_plan)
-    if key in _sigma_shared_tau_kernel_cache:
+    if w_synthesis is None and key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
     ensure_jax_compile_cache()
@@ -512,7 +534,10 @@ def get_shared_sigma_tau_kernel(
             phase_real, E_ref_B, t_node)
         return jax.lax.with_sharding_constraint(W_t, q_mu_sharding)
 
-    if not _stage_timing_enabled():
+    if w_synthesis is not None:
+        _build = w_synthesis
+
+    if not _stage_timing_enabled() and w_synthesis is None:
         @jax.jit
         def _tau(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
@@ -528,18 +553,30 @@ def get_shared_sigma_tau_kernel(
         _sigma_shared_tau_kernel_cache[key] = _tau
         return _tau
 
+    profile_stages = _stage_timing_enabled()
+
     def _tau_staged(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
         phase_real, E_ref_A, E_ref_B, t_node,
     ):
-        with timing.section("sigma.tau.w_phase") as sec:
+        if profile_stages:
+            with timing.section("sigma.tau.w_phase") as sec:
+                W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
+                             phase_real, E_ref_B, t_node)
+                sec.watch(W_t)
+        else:
+            # A resident model has a Python storage closure, but its device
+            # kernels still dispatch asynchronously. Only the explicit
+            # stage profiler needs a host wait between W and G*W.
             W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
                          phase_real, E_ref_B, t_node)
-            sec.watch(W_t)
         return sigma_kij(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
             E_A, mask_A, E_ref_A, t_node, W_t)
 
-    _sigma_shared_tau_kernel_cache[key] = _tau_staged
+    # A model builder may own resident faces and an open reader for this SC
+    # map. Never retain that resource closure in the process-wide jit cache.
+    if w_synthesis is None:
+        _sigma_shared_tau_kernel_cache[key] = _tau_staged
     return _tau_staged

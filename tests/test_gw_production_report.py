@@ -196,7 +196,7 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
             "(diagonal on-shell), self_consistent (rebuild G/W/Sigma)") in text
     assert "EQP2 treatment  : off (set write_eqp2=true" in text
     assert "RPA Dyson series; minimax imaginary-axis quadrature" in text
-    assert "Degenerate sets: averaged at 1.36057e-05 eV" in text
+    assert "Degenerate sets: reporting diagonals averaged at 1.36057e-05 eV" in text
     assert " Ry" not in text and "Rydberg" not in text
     assert "Coulomb system : 2D slab; Hartree=live G-space" in text
     assert "Full BZ grid   : 2 k points" in text
@@ -318,7 +318,7 @@ def test_incomplete_sigma_coverage_is_an_actionable_final_warning(tmp_path):
     assert "Coverage status : INCOMPLETE" in text
     assert "Grid shortfall  : 0.05000 eV below; 0.15000 eV above" in text
     assert "WARNINGS" in text
-    assert "dynamic Sigma grid is incomplete for protected DFT states" in text
+    assert "dynamic Sigma grid is incomplete for requested DFT output bands" in text
     assert "Sigma(E_DFT) has 4/6 out-of-grid cells" in text
     assert "out-of-range policy=clamp" in text
     assert "sigma_omega_min_ev / sigma_omega_max_ev" in text
@@ -534,3 +534,82 @@ def test_quadrature_section_reports_chi_and_sigma_rules(tmp_path):
     row = next(line for line in text.splitlines() if "cond:resonant" in line)
     assert "crossing" in row and "-50.0..  +24.0" in row
     assert " 0.980 " in row and "miss" in row
+
+def test_sigma_residual_subphases_are_not_double_counted(tmp_path):
+    output=[]
+    report=GWProductionReport(str(tmp_path/'gwjax.out'),runtime=_runtime(),debug=False,stdout=output.append)
+    rows=[dict(name='gw_jax.sigma',path=('gw_jax.sigma',),inclusive=100.)]
+    for name,value in [('sigma.rule_plan',10.),('sigma.tau_sweep',20.),
+                       ('sigma.exchange',4.),('sigma.hartree',3.),
+                       ('sigma.input_wait',.5),('sigma.finalize_input_wait',1.5),
+                       ('sigma.model_validate',5.),('sigma.capacity',2.),
+                       ('sigma.branches',1.),('sigma.census',1.),
+                       ('gw_jax.dynamic_sigma_finalize',6.)]:
+        rows.append(dict(name=name,path=('gw_jax.sigma',name),inclusive=value))
+    report.timings(rows,wall=100.)
+    text=(tmp_path/'gwjax.out').read_text()
+    other=next(line for line in text.splitlines() if line.strip().startswith('Sigma other'))
+    assert float(other.split()[-2])==46.
+    assert 'Sigma pending inputs' in text
+    assert 'Sigma model validation' in text and 'Sigma finalize + writes' in text
+
+
+def test_shared_pole_screening_bands_partition_wall(tmp_path):
+    report = GWProductionReport(str(tmp_path / 'gwjax.out'), runtime=_runtime(),
+                                debug=False, stdout=lambda line: None)
+    parent = ('gw_jax.screening',)
+    rows = [dict(name=parent[0], path=parent, inclusive=100.)]
+    for name, seconds in [('spole.bank', 40.), ('spole.moments', 10.),
+                          ('spole.direction_selection', 20.),
+                          ('spole.device_wait.writer', 7.),
+                          ('spole.rank_wait.writer', 2.),
+                          ('spole.passivity_held', 4.), ('spole.writer', 3.)]:
+        rows.append(dict(name=name, path=parent + (name,), inclusive=seconds))
+    # These are already included in the bank's 40 seconds.
+    for name in ('chi.exec', 'W.exec', 'spole.nested_diagnostic'):
+        rows.append(dict(name=name, path=parent + ('spole.bank', name), inclusive=5.))
+    report.timings(rows, wall=100.)
+    text = (tmp_path / 'gwjax.out').read_text()
+    displayed = {}
+    for line in text.splitlines():
+        if line.endswith('%') and line.strip().split()[-2].replace('.', '').isdigit():
+            label, seconds, _ = line.strip().rsplit(None, 2)
+            displayed[label] = float(seconds)
+    assert displayed['spole other'] == 14.
+    assert displayed['spole wait before writer'] == 7.
+    assert displayed['spole writer'] == 3.
+    assert displayed['spole passivity + held (fused)'] == 4.
+    assert displayed['spole rank synchronization'] == 2.
+    assert 'chi0' not in displayed and 'W' not in displayed
+    assert 'spole nested_diagnostic' not in displayed
+    assert sum(v for k, v in displayed.items() if k != 'total run') == 100.
+    assert 'prior device/effect work' in text
+
+
+def test_nested_bank_and_tau_breakdowns_partition_once(tmp_path):
+    report = GWProductionReport(str(tmp_path / 'gwjax.out'), runtime=_runtime(),
+                                debug=False, stdout=lambda line: None)
+    rows = []
+    def add(path, seconds):
+        rows.append(dict(name=path[-1], path=path, inclusive=seconds))
+    add(('gw_jax.screening',), 50.)
+    add(('gw_jax.screening', 'spole.bank'), 40.)
+    add(('gw_jax.screening', 'spole.bank', 'bank.execute.real_time'), 20.)
+    add(('gw_jax.screening', 'spole.bank', 'bank.write'), 10.)
+    add(('gw_jax.sigma',), 50.)
+    add(('gw_jax.sigma', 'sigma.rule_plan'), 30.)
+    add(('gw_jax.sigma', 'sigma.tau_sweep'), 20.)
+    add(('gw_jax.sigma', 'sigma.tau_sweep', 'tau.kernel'), 15.)
+    add(('gw_jax.sigma', 'sigma.tau_sweep', 'tau.kernel', 'tau.W_synthesis'), 6.)
+    add(('gw_jax.sigma', 'sigma.tau_sweep', 'tau.kernel', 'tau.GW_and_projection'), 8.)
+    report.timings(rows, wall=100.)
+    displayed = {}
+    for line in (tmp_path / 'gwjax.out').read_text().splitlines():
+        if line.endswith('%'):
+            label, seconds, _ = line.strip().rsplit(None, 2)
+            displayed[label] = float(seconds)
+    assert displayed['bank other'] == 10.
+    assert displayed['Sigma rule plan'] == 30.
+    assert displayed['Sigma tau kernel other'] == 1.
+    assert displayed['Sigma tau other'] == 5.
+    assert sum(v for k, v in displayed.items() if k != 'total run') == 100.

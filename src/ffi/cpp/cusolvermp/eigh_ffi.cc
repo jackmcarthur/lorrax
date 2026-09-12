@@ -39,6 +39,17 @@ namespace lorrax_ffi::cusolvermp {
 
 namespace ffi = ::xla::ffi;
 
+// Keep the destructive vendor operand in the same XLA scratch allocation as
+// its workspace. Both the execution and query doors use this byte layout.
+static size_t operand_offset(size_t workspace_bytes) {
+    return (workspace_bytes + 255) & ~size_t(255);
+}
+
+static size_t eigh_scratch_bytes(size_t workspace_bytes, int64_t n,
+                                 const LorraxCusolverMpCtx* ctx, size_t itemsize) {
+    return operand_offset(workspace_bytes) + size_t(n / ctx->p) * (n / ctx->q) * itemsize;
+}
+
 // ---------------------------------------------------------------------------
 //  Profile switch
 // ---------------------------------------------------------------------------
@@ -126,16 +137,22 @@ static ffi::Error EighImpl(
     // still do their own cudaMalloc, so MEM_FRACTION=0.5 remains needed
     // until/unless that's fixed upstream; this at least keeps OUR
     // workspace from double-dipping).
-    auto ws_opt = scratch.Allocate(d_ws_bytes);
+    const size_t scratch_bytes = eigh_scratch_bytes(d_ws_bytes, n, ctx, sizeof(T));
+    auto ws_opt = scratch.Allocate(scratch_bytes);
     if (!ws_opt.has_value()) {
         cusolverMpDestroyMatrixDesc(descA);
         cusolverMpDestroyMatrixDesc(descQ);
         std::ostringstream os;
         os << "eigh: XLA scratch allocator failed to provide "
-           << d_ws_bytes << " bytes";
+           << scratch_bytes << " bytes";
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
     }
     void* d_workspace = *ws_opt;
+    auto* d_operand = reinterpret_cast<T*>(
+        static_cast<char*>(d_workspace) + operand_offset(d_ws_bytes));
+    const size_t operand_bytes = size_t(n / ctx->p) * (n / ctx->q) * sizeof(T);
+    LORRAX_CUDA_CHECK(cudaMemcpyAsync(d_operand, d_A, operand_bytes,
+                                     cudaMemcpyDeviceToDevice, ctx->stream));
 
     // Host workspace stays on Ctx (scratch is device-only).
     if (h_ws_bytes > ctx->h_workspace_bytes) {
@@ -153,11 +170,11 @@ static ffi::Error EighImpl(
     // d_info is never read (mp_st already indicates success); skip the
     // per-call memset.  cuSOLVERMp writes into d_info in Syevd.
 
-    // cuSOLVERMp overwrites A's tile (Householder tridiagonalisation);
-    // const-cast once at the call site.
+    // The public eigh operation does not donate A. cuSOLVERMp overwrites its
+    // operand during tridiagonalisation, so only the private tile may be passed.
     mp_st = mp::Syevd<T>(
         ctx->handle, jobz, CUBLAS_FILL_MODE_LOWER, n,
-        const_cast<T*>(d_A), 1, 1, descA,
+        d_operand, 1, 1, descA,
         d_W,
         d_Q, 1, 1, descQ,
         d_workspace, d_ws_bytes,
@@ -279,3 +296,81 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nb")
         .Attr<int64_t>("ctx_handle")
         .Attr<bool>("compute_evecs"));
+
+// Query-only planning door. No matrix or workspace allocation and no solve.
+// ctx_handle==0 selects the device-local cuSOLVER route; otherwise the live
+// cuSOLVERMp grid supplies precisely the descriptors used by EighImpl.
+#include <cusolverDn.h>
+#include <algorithm>
+extern "C" int lrx_eigh_workspace_bytes(
+    int64_t ctx_handle, int64_t n, int complex128,
+    uint64_t* device_bytes, uint64_t* host_bytes) {
+    if (!device_bytes || !host_bytes || n < 1 || n > INT32_MAX ||
+        (complex128 != 0 && complex128 != 1)) return -1;
+    *device_bytes = 0; *host_bytes = 0;
+    if (ctx_handle == 0) {
+        cusolverDnHandle_t handle = nullptr;
+        auto status = cusolverDnCreate(&handle);
+        if (status != CUSOLVER_STATUS_SUCCESS) return int(status);
+        int lwork = 0;
+        if (complex128) {
+            status = cusolverDnZheevd_bufferSize(handle, CUSOLVER_EIG_MODE_VECTOR,
+                CUBLAS_FILL_MODE_LOWER, int(n), nullptr, int(n), nullptr, &lwork);
+        } else {
+            status = cusolverDnDsyevd_bufferSize(handle, CUSOLVER_EIG_MODE_VECTOR,
+                CUBLAS_FILL_MODE_LOWER, int(n), nullptr, int(n), nullptr, &lwork);
+        }
+        // JAX selects Jacobi for small matrices. Cover that path as well.
+        if (status == CUSOLVER_STATUS_SUCCESS && n <= 32) {
+            syevjInfo_t info = nullptr;
+            status = cusolverDnCreateSyevjInfo(&info);
+            int jacobi = 0;
+            if (status == CUSOLVER_STATUS_SUCCESS) {
+                if (complex128) status = cusolverDnZheevj_bufferSize(handle,
+                    CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER,
+                    int(n), nullptr, int(n), nullptr, &jacobi, info);
+                else status = cusolverDnDsyevj_bufferSize(handle,
+                    CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER,
+                    int(n), nullptr, int(n), nullptr, &jacobi, info);
+                cusolverDnDestroySyevjInfo(info);
+                lwork = std::max(lwork, jacobi);
+            }
+        }
+        cusolverDnDestroy(handle);
+        if (status == CUSOLVER_STATUS_SUCCESS)
+            *device_bytes = uint64_t(lwork) * (complex128 ? 16 : 8);
+        return int(status);
+    }
+    using namespace lorrax_ffi::cusolvermp;
+    auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
+    if (ctx->p != ctx->q || n % ctx->p || n % ctx->q) return -2;
+    cusolverMpMatrixDescriptor_t a = nullptr, q = nullptr;
+    const auto dtype = complex128 ? CUDA_C_64F : CUDA_R_64F;
+    auto status = cusolverMpCreateMatrixDesc(&a, ctx->grid, dtype,
+        n, n, n/ctx->p, n/ctx->q, 0, 0, n/ctx->p);
+    if (status != CUSOLVER_STATUS_SUCCESS) return int(status);
+    status = cusolverMpCreateMatrixDesc(&q, ctx->grid, dtype,
+        n, n, n/ctx->p, n/ctx->q, 0, 0, n/ctx->p);
+    // Mp sizing rejects null pointers, although it reads no matrix data.
+    // Reuse the context's existing device-info allocation as an address
+    // token; no operand-sized allocation or data access is required.
+    size_t dw = 0, hw = 0;
+    if (status == CUSOLVER_STATUS_SUCCESS) {
+        if (complex128) status = mp::SyevdBufferSize<std::complex<double>>(
+            ctx->handle, 'V', CUBLAS_FILL_MODE_LOWER, n,
+            reinterpret_cast<const std::complex<double>*>(ctx->d_info), 1, 1, a,
+            reinterpret_cast<double*>(ctx->d_info),
+            reinterpret_cast<std::complex<double>*>(ctx->d_info), 1, 1, q, &dw, &hw);
+        else status = mp::SyevdBufferSize<double>(ctx->handle, 'V',
+            CUBLAS_FILL_MODE_LOWER, n, reinterpret_cast<const double*>(ctx->d_info), 1, 1, a,
+            reinterpret_cast<double*>(ctx->d_info), reinterpret_cast<double*>(ctx->d_info),
+            1, 1, q, &dw, &hw);
+    }
+    if (q) cusolverMpDestroyMatrixDesc(q);
+    cusolverMpDestroyMatrixDesc(a);
+    if (status == CUSOLVER_STATUS_SUCCESS) {
+        *device_bytes = eigh_scratch_bytes(dw, n, ctx, complex128 ? 16 : 8);
+        *host_bytes = hw;
+    }
+    return int(status);
+}

@@ -314,11 +314,9 @@ def _write_sample(path, index, value, q_idx, meta, mesh_xy, n_z, *, name=_CHI):
     del value
 
 
-def _fit_head_samples(
-    fit_path, head_samples, z, n_p, grid_hash, mesh_xy, *, model, solve,
-    occupation_state=None,
-):
-    """Publish scalar Wc_head on the body's exact complex-frequency grid.
+def fit_head_samples(head_samples, z, n_p, *, model, solve,
+                     occupation_state=None):
+    """Fit scalar Wc_head in Ry through the canonical MPA scalar fitter.
 
     ``head_correction=off`` is the exact zero model, not an ill-conditioned
     pole-fitting problem.  It still gets a complete scalar-head record because
@@ -355,13 +353,32 @@ def _fit_head_samples(
             "backward_error_max_allowed": float(
                 np.sqrt(np.finfo(np.float64).eps)),
         }
+    if (not all(np.all(np.isfinite(value)) for value in
+                (wc, z, fitted["Omega_p"], fitted["B_p"], fitted["condition"],
+                 fitted["backward_error"], fitted["max_abs_residual"]))):
+        raise ValueError("scalar-head MPA fit is nonfinite")
+    if (fitted["condition"] > provenance.get("condition_max_allowed", np.inf)
+            or fitted["backward_error"] > provenance.get("backward_error_max_allowed", np.inf)):
+        raise ValueError("scalar-head MPA fit exceeds its condition/backward-error gate")
+    return dict(sample_z=np.asarray(z), sample_Wc=wc,
+        Omega_p=fitted["Omega_p"], B_p=fitted["B_p"], model=model,
+        diagnostics=dict(fit_condition=fitted["condition"],
+            fit_backward_error=fitted["backward_error"],
+            fit_max_abs_residual=fitted["max_abs_residual"]),
+        provenance=provenance,
+        occupation_stamps=(None if occupation_state is None else
+            dict(occ_hash=occupation_state.occ_hash, mu_ry=occupation_state.mu_ry)))
+
+
+def _fit_head_samples(fit_path, head_samples, z, n_p, grid_hash, mesh_xy, *,
+                      model, solve, occupation_state=None):
+    """Publish the canonical scalar fit beside the completed MPA body."""
+    head = fit_head_samples(head_samples, z, n_p, model=model, solve=solve,
+                            occupation_state=occupation_state)
     mpa_store.write_head_fit_collective(
-        fit_path, z, wc, fitted["Omega_p"], fitted["B_p"],
-        mesh_xy=mesh_xy, energy_unit="Ry",
-        fit_condition=fitted["condition"],
-        fit_backward_error=fitted["backward_error"],
-        fit_max_abs_residual=fitted["max_abs_residual"],
-        grid_hash=grid_hash, fit_provenance=provenance, model=model,
+        fit_path, head["sample_z"], head["sample_Wc"], head["Omega_p"], head["B_p"],
+        mesh_xy=mesh_xy, energy_unit="Ry", **head["diagnostics"],
+        grid_hash=grid_hash, fit_provenance=head["provenance"], model=model,
         occupation_state=occupation_state)
 
 

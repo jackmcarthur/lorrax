@@ -153,7 +153,7 @@ from __future__ import annotations
 
 import operator
 from dataclasses import dataclass, field
-from functools import partial
+from functools import lru_cache, partial
 from typing import Callable
 
 import jax
@@ -693,9 +693,26 @@ def gemm_plan(
     in_sharding_b = in_sharding_a
     out_sharding = in_sharding_a
 
+    fn_with_c, fn_no_c = _warmed_gemm_kernels(
+        mesh, nq, m, k, n, dtype, alpha_c, beta_c, int(ctx_handle))
+
+    return GemmPlan(
+        mesh=mesh, backend=resolved, m=m, k=k, n=n, nq=nq, dtype=dtype,
+        alpha=alpha_c, beta=beta_c,
+        in_sharding_a=in_sharding_a, in_sharding_b=in_sharding_b,
+        out_sharding=out_sharding, ctx_handle=int(ctx_handle),
+        _fn_with_c=fn_with_c, _fn_no_c=fn_no_c)
+
+
+@lru_cache(maxsize=None)
+def _warmed_gemm_kernels(mesh, nq, m, k, n, dtype, alpha, beta, ctx_handle):
+    """Build and warm provider callables once per complete static signature."""
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    in_sharding_a = NamedSharding(mesh, P(None, "x", "y"))
+    in_sharding_b = out_sharding = in_sharding_a
     fn_with_c = jax.jit(
         _build_kernel(mesh, px=px, py=py, nq=nq, m=m, k=k, n=n, dtype=dtype,
-                     alpha=alpha_c, beta=beta_c, ctx_handle=ctx_handle,
+                     alpha=alpha, beta=beta, ctx_handle=ctx_handle,
                      with_c=True),
         donate_argnums=(2,))
     # A REAL warmup call, not merely a trace: this is what forces the
@@ -707,17 +724,12 @@ def gemm_plan(
              _zeros((nq, m, n), dtype, out_sharding))
 
     fn_no_c = None
-    if beta_c == 0:
+    if beta == 0:
         fn_no_c = jax.jit(_build_kernel(
             mesh, px=px, py=py, nq=nq, m=m, k=k, n=n, dtype=dtype,
-            alpha=alpha_c, beta=beta_c, ctx_handle=ctx_handle,
+            alpha=alpha, beta=beta, ctx_handle=ctx_handle,
             with_c=False))
         fn_no_c(_zeros((nq, m, k), dtype, in_sharding_a),
                _zeros((nq, k, n), dtype, in_sharding_b))
 
-    return GemmPlan(
-        mesh=mesh, backend=resolved, m=m, k=k, n=n, nq=nq, dtype=dtype,
-        alpha=alpha_c, beta=beta_c,
-        in_sharding_a=in_sharding_a, in_sharding_b=in_sharding_b,
-        out_sharding=out_sharding, ctx_handle=int(ctx_handle),
-        _fn_with_c=fn_with_c, _fn_no_c=fn_no_c)
+    return fn_with_c, fn_no_c

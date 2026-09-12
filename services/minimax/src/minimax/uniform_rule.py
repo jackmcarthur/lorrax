@@ -87,6 +87,7 @@ from .fixed_n_start import predict_nodes, start_param
 __all__ = [
     "UniformRule", "build_uniform_rule", "box_samples",
     "rule_roundoff_amplification", "rule_sup_error",
+    "uniform_rule_budget", "uniform_rule_backend_policy",
 ]
 
 
@@ -1256,6 +1257,52 @@ class UniformRule:
                 f"kappa {self.kappa_max:.3g}, {self.seconds:.1f} s")
 
 
+def uniform_rule_backend_policy(backend=None):
+    """Return the validated backend policy used by fitting and provenance.
+
+    An explicit policy overrides the environment. Hardware-dependent ``auto``
+    selection remains in the fitter; this receipt names the requested policy.
+    """
+    choice = (backend or os.environ.get("LORRAX_UNIFORM_RULE_BACKEND", "numpy")).strip().lower()
+    if choice not in ("numpy", "jax", "auto"):
+        raise ValueError("LORRAX_UNIFORM_RULE_BACKEND must be numpy, jax or auto")
+    return choice
+
+
+def uniform_rule_budget(time_budget=None, reduction_steps=None):
+    """Describe and validate the reduction policy shared by fitters and receipts.
+
+    Steps select numerical work, and a fixed-pass build is CLOCK-FREE: the
+    deadline is infinite, so the deck's seconds do not enter the build and
+    cannot refuse a window that certifies.  Without steps, seconds select the
+    last accepted rule at a pass boundary, as historically.  A strict wall
+    limit belongs to the step supervisor.  Neither budget relaxes the error
+    certificate.
+
+    Neither budget reaches the crossing-box placement at all: that path stops
+    on its own certificate (see the module docstring, step 3), so on a
+    crossing box the reported policy describes a fallback that normally does
+    not run.
+    """
+    if time_budget is not None and (
+            not np.isfinite(time_budget) or float(time_budget) <= 0.0):
+        raise ValueError("time_budget must be finite and > 0 when set")
+    if reduction_steps is not None and (
+            isinstance(reduction_steps, (bool, np.bool_))
+            or not np.isfinite(reduction_steps)
+            or int(reduction_steps) != reduction_steps or reduction_steps < 0):
+        raise ValueError("reduction_steps must be a nonnegative integer or None")
+    clock = reduction_steps is None
+    return {
+        "mode": "seconds" if clock else "steps",
+        "steps": None if clock else int(reduction_steps),
+        # A fixed-pass build ignores the deck's seconds entirely: reporting
+        # them would claim a budget that selects nothing.
+        "seconds": float(time_budget) if clock and time_budget is not None else None,
+        "exhaustion": "last_certified_rule" if clock else "fixed_passes",
+    }
+
+
 def _select_backend(backend, n_start, cloud_size):
     """``numpy`` | ``jax`` | ``auto`` (env ``LORRAX_UNIFORM_RULE_BACKEND``).
 
@@ -1263,9 +1310,7 @@ def _select_backend(backend, n_start, cloud_size):
     problem is large enough to pay its launch and compile overhead (start
     rank >= 40, cloud >= 2000): the small sign-definite tails finish in a few
     seconds on numpy and would spend longer compiling."""
-    choice = (backend or os.environ.get("LORRAX_UNIFORM_RULE_BACKEND", "numpy")).strip().lower()
-    if choice not in ("numpy", "jax", "auto"):
-        raise ValueError("LORRAX_UNIFORM_RULE_BACKEND must be numpy, jax or auto")
+    choice = uniform_rule_backend_policy(backend)
     if choice == "numpy":
         return "numpy"
     try:

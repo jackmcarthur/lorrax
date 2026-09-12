@@ -45,6 +45,13 @@ class AccelerationResult(NamedTuple):
     residual_norms: jnp.ndarray  # Residual norm at each iteration
     iterations: int  # Number of iterations performed
     converged: bool  # Whether tolerance was reached
+    #: Accelerator trials whose PHYSICS gate refused, each with the agreed
+    #: refusal text and the iteration it happened at.  Empty for every run
+    #: that never rejected one, so an existing consumer sees no change; a run
+    #: that DID reject one must be able to say so, because a silently
+    #: substituted plain step is a different trajectory from the one the
+    #: deck asked for.  Only ``rcrop_nojit`` populates it.
+    rejected_trials: tuple = ()
 
 
 # -----------------------------------------------------------------------------
@@ -170,6 +177,14 @@ def _solve_crop_alpha_v2(Fw: jnp.ndarray, filled_cols: jnp.ndarray) -> jnp.ndarr
     return jnp.concatenate([gamma, jnp.array([alpha_last])])
 
 
+#: Smallest eigenvalue of the unit-diagonal CROP Gram, RELATIVE to its
+#: largest, below which the extrapolation is damped instead of solved.  It is
+#: a condition bound, not a tolerance on anything physical: 1e-8 says "refuse
+#: to amplify this window by more than 1e8".  Above it the solve is the
+#: historical expression, unchanged.
+_CROP_CONDITION_FLOOR = 1.0e-8
+
+
 def _solve_crop_alpha_stacked(Fw: jnp.ndarray) -> jnp.ndarray:
     """``_solve_crop_alpha_v2`` for a STACKED window, no flatten.
 
@@ -213,8 +228,62 @@ def _solve_crop_alpha_stacked(Fw: jnp.ndarray) -> jnp.ndarray:
     # min ||f_trial + F_scaled δ||  ⇒  (FᴴF) δ = −Fᴴ f_trial;  γ = δ/scale.
     G = jnp.tensordot(jnp.conj(F_scaled), F_scaled, axes=(ax, ax))
     b = -jnp.tensordot(jnp.conj(F_scaled), f_trial, axes=(ax, tuple(range(f_trial.ndim))))
-    G = G + 1e-12 * jnp.eye(k, dtype=G.dtype)
-    gamma = jnp.linalg.solve(G, b) / scale
+    # CONDITIONING GUARD.  The columns above are unit norm, so G has a unit
+    # diagonal and its eigenvalues lie in [lambda_min, k].  The fixed 1e-12
+    # ridge is therefore relative -- and that is exactly why it does not
+    # guard: it only starts to matter once lambda_min has ALREADY reached
+    # 1e-12, by which point the solve has amplified by ~1e12.  Near
+    # convergence the residual differences become nearly collinear by
+    # construction, so lambda_min -> 0 is the normal behaviour of a
+    # converging window, not an edge case.
+    #
+    # This is HARDENING, not a fix for any measured failure, and the
+    # difference matters.  It was written while chasing a q=0 Gram refusal on
+    # Si shared-pole SC (claim 2189) on the theory that a collinear window was
+    # amplifying a 1e-9 history difference.  Instrumenting cond(G) on the live
+    # loop REFUTED that: at the solve that produced the failing input the Gram
+    # had cond 1.77, lambda_min 0.757 and ||gamma||_1 0.065 -- the window was
+    # well conditioned and barely mixing, and the failing evaluation is the
+    # PLAIN step x + f from that point, not an extrapolation.  The guard stays
+    # because the argument for it is independent of that story: a 1e-12 ridge
+    # on a unit-diagonal Gram is not a guard, collinearity near convergence is
+    # the normal end state of a CROP window, and the selector costs nothing
+    # when the window is healthy.  Do not cite it as fixing that refusal.
+    #
+    # Why a SELECTOR and not the textbook column drop: this window is a
+    # sharded stacked array and k must stay static, so dropping the oldest
+    # column needs a shape this function cannot have.  The selector gets the
+    # property that matters instead -- above the floor it returns the
+    # unchanged historical expression, BIT-IDENTICAL, which is what lets
+    # this live on a path the incumbent MPA SC route also takes.  Below it,
+    # the ridge is tied to lambda_max rather than being an absolute
+    # constant, so the bound is a pure condition number.
+    #
+    # ||gamma||_1 is deliberately NOT clamped: that bounds the symptom, and
+    # a large well-conditioned gamma is legitimate.
+    #
+    # The flat sibling ``_solve_crop_alpha_v2`` has the same class of defect
+    # (1e-12 on R's diagonal, noted in this docstring) and is NOT changed
+    # here: it is off the self-consistency path and there is no measurement
+    # behind a change to it.
+    #
+    # Judge the condition of the VALID block only.  An unfilled history slot
+    # zeroes its whole column above, so a window that is merely young has an
+    # exactly singular G by construction -- and reading that as
+    # ill-conditioning would damp the first iterates and degenerate the
+    # update to the plain Picard step, which
+    # ``test_first_iterate_is_not_the_picard_step`` exists to catch (it did).
+    # Replacing the invalid rows and columns with the identity's gives those
+    # directions eigenvalue 1 and decouples them, leaving the valid block's
+    # spectrum untouched.
+    identity = jnp.eye(k, dtype=G.dtype)
+    pair = valid_hist[:, None] & valid_hist[None, :]
+    eig = jnp.linalg.eigvalsh(jnp.where(pair, G, identity))
+    well = eig[0] > _CROP_CONDITION_FLOOR * eig[-1]
+    gamma_ok = jnp.linalg.solve(G + 1e-12 * identity, b) / scale
+    gamma_damped = jnp.linalg.solve(
+        G + _CROP_CONDITION_FLOOR * eig[-1] * identity, b) / scale
+    gamma = jnp.where(well, gamma_ok, gamma_damped)
     gamma = jnp.where(valid_hist, gamma, 0.0 + 0.0j)
 
     alpha_last = (1.0 + 0.0j) - jnp.sum(gamma)
@@ -860,6 +929,46 @@ def rcrop_hermitian(
     )
 
 
+
+#: Retained for the receipt's shape only.  The retry it used to bound was
+#: measured to be a no-op -- see the refusal in ``rcrop_nojit`` -- so the
+#: refusal is now immediate and nothing counts up to this.
+_MAX_CONSECUTIVE_TRIAL_REJECTIONS = 1
+
+
+def _agree_trial_refusal(error):
+    """Agree ACROSS RANKS whether this trial failed, and why.
+
+    Returns ``None`` when every rank succeeded, else the refusal text from the
+    lowest failing rank.  Unlike :func:`common.collectives.agree_io_error` this
+    RETURNS the verdict instead of raising it, because the caller's whole point
+    is to take a different branch rather than die.
+
+    Why it cannot be a bare per-rank ``try``: the refusals this catches --
+    ``GATE shared_pole_gram_valid`` and its siblings -- are raised from inside
+    collectives, so every rank raises them, and a rank that recovered locally
+    while another re-entered the loop would deadlock at the next collective
+    (INVARIANTS 21).  Every rank calls this, every rank gets the same answer,
+    every rank takes the same branch.
+    """
+    from common.collectives import all_gather_processes
+
+    local = "" if error is None else f"{type(error).__name__}: {error}"
+    # A fixed-width byte row per rank: one gather, no ragged object arrays.
+    import numpy as np
+
+    width = 512
+    row = np.zeros(width, np.uint8)
+    encoded = local.encode()[:width]
+    row[:len(encoded)] = np.frombuffer(encoded, np.uint8)
+    rows = np.asarray(all_gather_processes(row))
+    for rank in range(rows.shape[0]):
+        text = bytes(rows[rank]).rstrip(b"\x00").decode(errors="replace")
+        if text:
+            return f"rank {rank}: {text}"
+    return None
+
+
 def rcrop_nojit(
     residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
     x0: jnp.ndarray,
@@ -961,15 +1070,60 @@ def rcrop_nojit(
 
     if res0 <= tol:
         return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
-                                  iterations=0, converged=True)
+                                  iterations=0, converged=True,
+                                  rejected_trials=())
 
     # Broadcast an (m,) per-entry mask against a stack of any rank.
     mask_shape = (m,) + (1,) * len(shape)
 
+    rejected_trials = []
+    consecutive_rejections = 0
     for it in range(maxit):
-        # Trial step
+        # Trial step.
+        #
+        # A trial that fails a PHYSICS gate is a bad extrapolation, not a bad
+        # run.  Before this, a `GATE` refusal raised inside `residual_fn`
+        # aborted the whole loop -- measured on Si shared-pole SC, eleven
+        # converged maps thrown away because one extrapolated Hamiltonian
+        # landed past a marginal q=0 threshold (claim 2189).  Reject the
+        # trial instead and fall back to the plain step from the last
+        # accepted point.  The refusal is AGREED across ranks first; see
+        # `_agree_trial_refusal` for why a bare per-rank try is a deadlock.
         x_trial = _entry(x + f)
-        f_trial = _entry(residual_fn(x_trial))
+        try:
+            f_trial = _entry(residual_fn(x_trial))
+            local_error = None
+        except BaseException as exc:                     # noqa: BLE001
+            f_trial, local_error = None, exc
+        refusal = _agree_trial_refusal(local_error)
+        if refusal is not None:
+            consecutive_rejections += 1
+            rejected_trials.append(dict(iteration=it, refusal=refusal,
+                                        consecutive=consecutive_rejections))
+            if print_fn is not None:
+                print_fn(f"  SC acceleration: trial REJECTED at iteration {it} "
+                         f"({consecutive_rejections} consecutive); falling back "
+                         f"to the plain step from the last accepted point. {refusal}")
+            raise RuntimeError(
+                "GATE sc_trial_refused: the accelerator's trial evaluation "
+                "failed a physics gate, and there is NO cheaper step to fall "
+                "back to.\n"
+                f"  got:  {refusal}\n"
+                "  want: a map that evaluates on the plain step from its own "
+                "accepted input\n"
+                "  why:  MEASURED, 2026-09-11. ``x_trial = x + f`` IS the plain "
+                "step -- the CROP mixing happens afterwards -- so retrying an "
+                "unchanged x and f reproduces the same input and the same "
+                "refusal exactly. An end-to-end leg confirmed it: maps 11, 12 "
+                "and 13 all refused with a BYTE-IDENTICAL Gram eigenvalue "
+                "before the bound stopped the loop, three wasted maps for no "
+                "information. Refusing here instead preserves what a retry "
+                "cannot: the iterations already converged, named in this "
+                "message, and the receipt. A real recovery would have to "
+                "change the step -- a damped x + alpha*f with alpha < 1 -- "
+                "which is a physics change with its own gating and is NOT "
+                "implemented.")
+        consecutive_rejections = 0
 
         # Roll history to chronological order (permutation of the leading,
         # unsharded axis: no communication).
@@ -1014,7 +1168,8 @@ def rcrop_nojit(
                 print_fn(f"rCROP converged in {it+1} iterations")
             return AccelerationResult(
                 x=x_new, residual_norms=jnp.array(res_history),
-                iterations=it+1, converged=True
+                iterations=it+1, converged=True,
+                rejected_trials=tuple(rejected_trials)
             )
 
         x = x_new
@@ -1025,6 +1180,7 @@ def rcrop_nojit(
 
     return AccelerationResult(
         x=x, residual_norms=jnp.array(res_history),
-        iterations=maxit, converged=False
+        iterations=maxit, converged=False,
+        rejected_trials=tuple(rejected_trials)
     )
 

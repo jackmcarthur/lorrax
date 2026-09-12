@@ -112,6 +112,19 @@ def test_invalid_box_refuses():
         build_uniform_rule((1.0, 0.0, 0.1, 1.0), 1.0e-4)
 
 
+def test_physical_negative_tail_holds_independent_certificate():
+    """Run309 tail: the former check returned 8.0851e-5 at eps=7.5e-5."""
+    box = (-11.604310294360761, -0.289400912133283,
+           0.018374661087827496, 0.018374661087827496)
+    eps = 7.5e-5
+    rule = build_uniform_rule(box, eps, time_budget=30.0, backend="numpy")
+    cloud = box_samples(*box, per_unit=10.0, n_im=48)
+    error, amplification = rule_sup_error(
+        rule.times, rule.weights, cloud, np.abs(cloud))
+    assert error <= eps
+    assert amplification <= 1.0e4
+
+
 def test_roundoff_amplification_uses_the_error_currency():
     d = np.asarray([0.0 + 0.1j, 10.0 + 0.1j])
     times = np.asarray([0.2 + 0.0j, 0.7 + 0.0j])
@@ -202,3 +215,21 @@ def test_step_budget_is_deterministic_and_ignores_the_clock():
     # fewer passes cannot reach fewer nodes than more passes
     more = build_uniform_rule(box, 1.0e-4, reduction_steps=12)
     assert more.node_count <= first.node_count
+
+
+@pytest.mark.parametrize("seconds,steps", [(0., 10), (float("nan"), 0),
+                                         (1., -1), (1., 1.5), (1., True)])
+def test_invalid_budget_refuses_before_build(seconds, steps):
+    from minimax import uniform_rule_budget
+    with pytest.raises(ValueError):
+        uniform_rule_budget(seconds, steps)
+
+
+def test_backend_receipt_uses_the_fitter_policy_resolver(monkeypatch):
+    from minimax import uniform_rule_backend_policy
+    monkeypatch.setenv("LORRAX_UNIFORM_RULE_BACKEND", " AUTO ")
+    assert uniform_rule_backend_policy() == "auto"
+    assert uniform_rule_backend_policy("numpy") == "numpy"
+    monkeypatch.setenv("LORRAX_UNIFORM_RULE_BACKEND", "invalid")
+    with pytest.raises(ValueError, match="must be numpy, jax or auto"):
+        uniform_rule_backend_policy()

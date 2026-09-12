@@ -1,7 +1,7 @@
 """The q-grid symmetry decisions, taken once and said out loud.
 
-WHAT THIS MODULE IS.  Two functions, one per decision, and both are
-announcing adapters over ``symmetry_maps``:
+WHAT THIS MODULE IS.  Two decisions, expressed by announcing adapters over
+``symmetry_maps``:
 
 * :func:`resolve_qgrid_symmetry_tables` — does this deck's centroid set
   admit the IBZ q reduction at all?
@@ -9,7 +9,8 @@ announcing adapters over ``symmetry_maps``:
   the q axis of this deck?  The answer comes from the load-time density
   MEASUREMENT (``SymMaps.trs_allowed``), never from an assumption, and it
   arrives as one object the driver consumes rather than a branch the
-  driver takes.
+  driver takes. :func:`qgrid_trs_policy_from_shared_pole_store` adapts the
+  same measured reference after the model store has authenticated it.
 
 Every producer of the q-axis tables in ``gw/`` goes through here; nothing
 else in the monorepo calls ``centroid_source_map_and_wrap``, composes q
@@ -48,6 +49,92 @@ process where lorrax is not importable, so it cannot reach
 from __future__ import annotations
 
 import numpy as np
+
+
+_SHARED_POLE_REALIZERS = {}
+
+
+def shared_pole_operator_realizer(meta, header, *, q_full_idx, mesh_xy):
+    r"""Bind the versioned physical realization of packed shared-pole tiles.
+
+    Stored factors remain the raw latent Ritz model. Physical consumers use
+    ``Pi_G sum_k b_k f_k b_k^dagger`` with the complete authenticated little
+    group at each selected full-grid q. Bind this adapter OUTSIDE a JIT; its
+    returned callable accepts only the current operator and its SAME-TIME
+    transpose. Antiunitary rows act on residue endpoints and never conjugate
+    the complex scalar frequency/time coefficients.
+
+    ``q_full_idx`` can name irreducible parents or already-unfolded children.
+    Tensor readers return packed endpoints; the basis owns the conversion of
+    the authenticated canonical source/wrap tables to that order. Only host
+    symmetry metadata is cached, never factors, poles, W, or head samples.
+
+    Historical raw-model stores remain readable for analysis by the generic
+    store reader, but cannot silently acquire this physical realization.
+    Their recipe must identify this version before a physical consumer binds.
+    Constructor retained-Ritz identities and existing held/moment/passivity
+    receipts concern the raw latent model; they do not certify the projected
+    operator's held error or its upper passivity bound relative to raw V.
+    """
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import project_little_group_operator
+    from .shared_pole_recipe import shared_real_pole_v1_r3b
+
+    expected = shared_real_pole_v1_r3b["operator_realization"]
+    if header.get("recipe", {}).get("operator_realization") != expected:
+        raise ValueError(
+            "GATE shared_pole_realization: missing or unsupported operator_realization; "
+            f"expected {expected!r}, rebuild this model with the current recipe")
+    if (header.get("representation") != "scalar-trs-even-s"
+            or header.get("nspinor") != 1
+            or header.get("q_order") != "canonical-full-flat"
+            or not np.array_equal(header.get("q_shift"), np.zeros(3))):
+        raise ValueError("GATE shared_pole_realization: unsupported scalar q-grid representation")
+    qt, operations = header["qirr"], header["operations"]
+    nsp = int(qt["n_sym_spatial"])
+    canonical_rows = np.arange(2*nsp, dtype=np.int32)
+    if (not np.array_equal(operations["rows"], canonical_rows)
+            or not np.array_equal(operations["antiunitary"], canonical_rows >= nsp)
+            or not operations.get("typing_source")):
+        raise ValueError("GATE shared_pole_realization: unauthenticated canonical operation typing")
+    grid, qids = np.asarray(header["grid"]), np.asarray(q_full_idx)
+    if (grid.shape != (3,) or grid.dtype.kind not in "iu" or np.any(grid <= 0)
+            or qids.ndim != 1 or not qids.size or qids.dtype.kind not in "iu"
+            or np.any(qids < 0) or np.any(qids >= np.prod(grid))
+            or np.unique(qids).size != qids.size):
+        raise ValueError("GATE shared_pole_realization: invalid full-grid q selection")
+    basis = meta.mu_basis
+    if basis.mesh_xy != mesh_xy or int(header["n_mu_logical"]) != basis.n_logical:
+        raise ValueError("GATE shared_pole_realization: model and packed basis carrier differ")
+    kwargs = dict(
+        q_full_idx=qids,
+        q_irr_frac=np.stack(np.unravel_index(qids, tuple(grid)), axis=1)/grid[None, :],
+        sym_mats_k=np.asarray(operations["rotation"]),
+        sym_perm=basis.layout.axis.pack_permutations_host(
+            np.asarray(qt["sym_perm"], np.int32), require_local=False),
+        L_table=basis.layout.axis.pack_host(np.asarray(qt["L_table"], np.int32),
+                                          axis=1, fill_value=0),
+        active_symmetry_rows=np.asarray(operations["authorized_rows"]),
+        active_mask=np.asarray(basis.active_mask),
+    )
+    # Freeze host metadata so a later caller mutation cannot change a retained
+    # callable while its compiled specialization still has the old tables.
+    kwargs = {name: np.array(value, copy=True) for name, value in kwargs.items()}
+    for value in kwargs.values():
+        value.flags.writeable = False
+    grid = tuple(map(int, grid))
+    key = (mesh_xy, nsp, grid, expected,
+           tuple((name, value.shape, value.dtype.str, value.tobytes())
+                 for name, value in kwargs.items()))
+    realize = _SHARED_POLE_REALIZERS.get(key)
+    if realize is None:
+        def realize(operator, transposed_partner):
+            return project_little_group_operator(
+                operator, transposed_partner=transposed_partner,
+                kgrid=grid, n_sym_spatial=nsp, mesh=mesh_xy, **kwargs)
+        _SHARED_POLE_REALIZERS[key] = realize
+    return realize
 
 
 def resolve_qgrid_symmetry_tables(
@@ -132,6 +219,28 @@ def resolve_qgrid_symmetry_tables(
         # repeat resolves along the run are silent.
         announce_once(res.announce_key, msg, scope="rank0")
     return res
+
+
+def qgrid_trs_policy_from_shared_pole_store(header, *, announce=True):
+    """Recover the measured reference policy from a validated model store.
+
+    The shared-pole store validator binds ``scalar-trs-even-s`` to the
+    measured scalar-TRS reference and authenticates its operation tables.
+    Its consumer has no live SymMaps object; adapt that sealed metadata at
+    the same door as live references, never infer symmetry from fitted b.
+    """
+    from types import SimpleNamespace
+
+    qt = header["qirr"]
+    reference = SimpleNamespace(
+        trs_allowed=header["representation"] == "scalar-trs-even-s",
+        q_irr_full_idx=np.asarray(header["q_irr_full_idx"]),
+        active_symmetry_rows=np.asarray(header["operations"]["authorized_rows"]))
+    return qgrid_trs_policy_for(
+        sym=reference, irr_idx_q=np.asarray(qt["irr_idx_q"]),
+        sym_idx_q=np.asarray(qt["sym_idx_q"]), kgrid=tuple(header["grid"]),
+        n_sym_spatial=int(qt["n_sym_spatial"]), context="shared-pole Sigma",
+        announce=announce)
 
 
 def qgrid_trs_policy_for(

@@ -100,13 +100,15 @@ class GroupedShardLayout:
         dst0 = src0[self.canonical_to_packed]
         return np.moveaxis(dst0, 0, axis)
 
-    def pack_permutations_host(self, permutations) -> np.ndarray:
+    def pack_permutations_host(self, permutations, *, require_local: bool = True) -> np.ndarray:
         """Conjugate canonical gather maps into the packed, local view.
 
         ``permutations[s, i]`` is the source row gathered for target ``i``.
         Pad rows map to themselves.  A map that crosses a shard boundary is
-        refused: that means the supplied group partition is not closed under
-        the action and a supposedly local symmetry gather would communicate.
+        refused by default: the supplied partition is then not closed under
+        the action. ``require_local=False`` returns authenticated GLOBAL packed
+        source maps for an explicitly routed endpoint operation; it does not
+        authorize treating those indices as shard-local gathers.
         """
         perm = np.asarray(permutations)
         if perm.ndim != 2 or int(perm.shape[1]) != self.n_logical:
@@ -143,7 +145,7 @@ class GroupedShardLayout:
                     f"{row_i} is not a permutation.")
         owner = target // self.shard_size
         crossing = owner[None, :] != owner[out]
-        if np.any(crossing):
+        if require_local and np.any(crossing):
             row_i, packed_i = np.argwhere(crossing)[0]
             canonical_i = int(self.packed_to_canonical[packed_i])
             raise ValueError(

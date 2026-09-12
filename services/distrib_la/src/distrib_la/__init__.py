@@ -93,15 +93,18 @@ punctilio — it is the failure mode.
 
 from __future__ import annotations
 
+from distrib_la.workspace import workspace_bytes_per_rank, matmul_workspace_bytes_per_rank
 from distrib_la.dispatch import dispatch_batched_eigh
 from distrib_la.factor import FactorToken, factor, solve
 from distrib_la.loader import dial_key, has_target, probe_target
 from distrib_la.matmul import (
     MATMUL_BACKEND_CHOICES,
+    contract_faces,
     matmul,
     resolve_matmul_backend,
 )
 from distrib_la.matmul_plan import GemmPlan, gemm_plan, local_gemm_plan
+from distrib_la._panel_matmul import panel_matmul
 from distrib_la.plan import (
     BATCHED_ROUTE_CHOICES,
     BATCHED_ROUTE_DEFAULT,
@@ -115,7 +118,8 @@ from distrib_la.plan import (
     ensure_sharding,
     plan,
 )
-from distrib_la.polar import PolarPlan, plan_polar_factor, polar_factor
+from distrib_la.polar import (PolarPlan, plan_polar_factor, polar_factor,
+                             right_singular_vectors, leading_eigenvectors)
 from distrib_la.resolve import (
     BACKEND_CHOICES,
     CHOLESKY_BACKENDS,
@@ -133,13 +137,14 @@ from distrib_la.resolve import (
 
 __all__ = [
     # plan
-    "Plan", "plan", "ensure_sharding", "DONATES",
+    "Plan", "plan", "ensure_sharding", "DONATES", "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank",
     # polar / SVD
     "PolarPlan", "plan_polar_factor", "polar_factor",
+    "right_singular_vectors", "leading_eigenvectors",
     # distributed matrix multiplication
-    "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES",
+    "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES", "contract_faces",
     # planned N,N GEMM (trace-safe, for hot loops)
-    "GemmPlan", "gemm_plan", "local_gemm_plan",
+    "GemmPlan", "gemm_plan", "local_gemm_plan", "panel_matmul",
     # the batched route toggle and its dial
     "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
     "ROUTE_BATCH_RESHARD", "BATCHED_ROUTE_CHOICES", "BATCHED_ROUTE_DEFAULT",

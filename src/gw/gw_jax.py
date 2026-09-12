@@ -13,7 +13,7 @@ in this file, in execution order:
                                                            #   4-branch τ-integration]
                                                            #   ⊕ q→0 head channel        (sigma_dispatch)
     Σ_total         = solve_qp(Σ) | run_sc_driver(...)     # update_H per qp_solver      (qsgw_utils, sc_iteration)
-    E_qp, U_qp      = eigh(kin_ion + Σ_total)              # + degenerate-set averaging  (degen_average)
+    E_qp, U_qp      = eigh(kin_ion + Σ_total)
 	eqp0/eqp1[/eqp2]/σ.dat = write_results(...)            # writers, debug tables       (gw_output)
 
 Two orthogonal config axes pivot the flow: ``compute_mode`` — the
@@ -115,7 +115,6 @@ from .sigma_dispatch import (
 from .qsgw_utils import solve_qp
 from .dynamic_sigma import extract_sigma_diag_logical
 from .degen_average import (
-	average_sigma_components,
 	average_within_degenerate_sets,
 )
 from .head_correction import (
@@ -236,9 +235,11 @@ def _oneshot_mpa_occupation_state(config, wfn, wfns, material_class,
 			f"(nk,nb), got {energies.shape}")
 	nk = int(energies.shape[0])
 	kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
-	local = OccupationState.solve_mp1(
+	local = OccupationState.solve_smearing(
 		energies, kweights, float(wfn.num_electrons),
 		float(config.occ_broadening_ry),
+		family=config.occ_smearing_family,
+		logical_nband=wfns.slices.nb_full_logical,
 		state_capacity=spin_degeneracy_factor(wfn),
 		clamp_tol=float(config.occupation_clamp_tol))
 	if mesh_xy is None or process_count() <= 1:
@@ -482,10 +483,20 @@ def _prepare_isdf_carriers(
             and mode.value == "mpa") else None)
     if oneshot_occupation_state is not None:
         print0(
-            "  one-shot occupations: fixed-N MP1 state, "
+            f"  one-shot occupations: fixed-N {oneshot_occupation_state.smearing_family} state, "
             f"mu={oneshot_occupation_state.mu_ry * RYD_TO_EV:.8f} eV, "
             f"width={oneshot_occupation_state.smearing_width_ry:.10f} Ry, "
             f"occ_hash={oneshot_occupation_state.occ_hash}")
+    if config.sigma.w_model == "shared_pole" and qp_solver is not QPSolver.SELF_CONSISTENT:
+        from .shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
+        from centroid.sampling_metric import full_k_quadrature_weights
+        bind_shared_pole_census(
+            wfns, meta, occupation_state=oneshot_occupation_state,
+            trs_allowed=sym.trs_allowed,
+            state_capacity=wfn.occupation_state_capacity,
+            kweights=full_k_quadrature_weights(wfn, sym))
+        meta.shared_pole_recipe = resolve_shared_pole_recipe(
+            config, wfns, meta, mesh_xy=mesh_xy, print_fn=print0)
     wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
     if config.bispinor and wfns_transverse is None:
         raise RuntimeError(
@@ -538,8 +549,13 @@ def _prepare_oneshot_response(
         if mode.value == "mpa":
             from .mpa import sample_plan
             from .mpa.model import make_mpa_plan
-            oneshot_mpa_plan = make_mpa_plan(
-                config, quad, material_class=material_class)
+            if config.sigma.w_model == "shared_pole":
+                from .shared_pole_head import shared_pole_head_plan
+                oneshot_mpa_plan = shared_pole_head_plan(
+                    config, meta.shared_pole_recipe, material_class=material_class)
+            else:
+                oneshot_mpa_plan = make_mpa_plan(
+                    config, quad, material_class=material_class)
             oneshot_omegas = np.asarray(
                 sample_plan.plan_z(oneshot_mpa_plan), dtype=np.complex128)
         else:
@@ -943,14 +959,13 @@ def _sigma_output_fields(
         np.asarray(sigma_result.omega_grid_ry, dtype=np.float64)
         if sigma_result.omega_grid_ry is not None else None)
     if not config.no_degen_averaging:
-        (sigma_total, sig_sx, sig_coh, sig_h, sig_h_scalar,
-         h_transverse, sig_x,
-         sigma_c_at_dft_ev) = average_sigma_components(
-            sigma_total, sig_sx, sig_coh, sig_h, sig_h_scalar,
-            h_transverse, sig_x, sigma_c_at_dft_ev,
-            energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-            tol_ry=float(config.degen_avg_tol_ry),
-            mesh_xy=mesh_xy)
+        # Average extracted reporting arrays only.  Keep every full operator
+        # intact for diagonalization, including the one-shot Hamiltonian.
+        if sigma_c_at_dft_ev is not None:
+            sigma_c_at_dft_ev = average_within_degenerate_sets(
+                np.asarray(sigma_c_at_dft_ev, dtype=np.complex128),
+                energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+                tol_ry=float(config.degen_avg_tol_ry))
         def _average_head_diag(diag):
             arr = np.asarray(diag)
             if arr.ndim == 1:
@@ -983,6 +998,11 @@ def _sigma_output_fields(
             tol_ry=float(config.degen_avg_tol_ry))
     from gw.qsgw_utils import static_sigma_diag_to_host
     sig_x_diag_ry = static_sigma_diag_to_host(sig_x, mesh_xy)
+    if not config.no_degen_averaging:
+        sig_x_diag_ry = average_within_degenerate_sets(
+            sig_x_diag_ry, energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+            tol_ry=float(config.degen_avg_tol_ry))
+    # Report the sum of the extracted exchange/correlation diagonals.
     sigma_xc_at_dft_ev = (
         sig_x_diag_ry * RYD_TO_EV
         + sigma_c_at_dft_ev
@@ -1086,6 +1106,16 @@ def _sigma_diagnostic_fields(
     h_transverse_diag_ry = (
         None if h_transverse is None
         else static_sigma_diag_to_host(h_transverse, mesh_xy))
+    if not config.no_degen_averaging:
+        (sig_sx_diag_ry, sig_coh_diag_ry, sig_h_scalar_diag_ry,
+         h_transverse_diag_ry) = (
+            None if diagonal is None else average_within_degenerate_sets(
+                diagonal, energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+                tol_ry=float(config.degen_avg_tol_ry))
+            for diagonal in (sig_sx_diag_ry, sig_coh_diag_ry,
+                             sig_h_scalar_diag_ry, h_transverse_diag_ry))
+        sig_h_diag_ry = (sig_h_scalar_diag_ry if h_transverse_diag_ry is None
+                         else sig_h_scalar_diag_ry + h_transverse_diag_ry)
     sigma_lorentz_diag_skn_ry = None
     if sigma_lorentz_skij_ry is not None:
         sigma_lorentz_diag_skn_ry = np.stack([
@@ -1227,7 +1257,7 @@ def _close_timing(_pre_main, _t_main, meta, print0):
 def _report_final_observables(
         E_full, band_slices, config, enk_dft, eqp2_result, head_sigma_split_skn_ry,
         q0_certificates, report, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev,
-        sigma_lorentz_diag_skn_ry, sigma_result):
+        sigma_lorentz_diag_skn_ry, sigma_result, sc_qp_energies_ry=None):
     """Report the final Sigma coverage, sector summaries and QP gaps."""
     if sigma_lorentz_diag_skn_ry is not None:
         _labels = ("CC", "CT+TC", "TT")
@@ -1289,7 +1319,8 @@ def _report_final_observables(
         config=config, band_slices=band_slices, enk_dft_ry=enk_dft,
         sigma_result=sigma_result)
     report.qp_gap(
-        band_slices=band_slices, e_dft_ry=enk_dft, e_qp_ry=E_full)
+        band_slices=band_slices, e_dft_ry=enk_dft,
+        e_qp_ry=(E_full if sc_qp_energies_ry is None else sc_qp_energies_ry))
     if eqp2_result is not None:
         report.eqp2_summary(
             band_slices=band_slices,
@@ -1455,7 +1486,9 @@ def main(argv=None):
 	_report_final_observables(
 	    E_full, band_slices, config, enk_dft, eqp2_result, head_sigma_split_skn_ry,
 	    q0_certificates, report, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev,
-	    sigma_lorentz_diag_skn_ry, sigma_result)
+	    sigma_lorentz_diag_skn_ry, sigma_result,
+	    sc_qp_energies_ry=(None if sc_result is None
+	                       else sc_result.qp_energies_ry))
 	(
 	    _file_rows) = _report_file_rows(
 	    args, config, input_dir, report, sigma_omega_h5_path, tensors_filename)

@@ -16,7 +16,7 @@ the provider.
 """
 from __future__ import annotations
 
-from functools import partial
+from functools import lru_cache, partial
 from typing import Union
 
 import jax
@@ -29,7 +29,8 @@ from distrib_la.plan import (BATCHED_ROUTE_CHOICES, BATCHED_ROUTE_DEFAULT,
                              ROUTE_BATCH_RESHARD, ensure_sharding)
 from distrib_la.resolve import mesh_key, mesh_platform
 
-__all__ = ["MATMUL_BACKEND_CHOICES", "matmul", "resolve_matmul_backend"]
+__all__ = ["MATMUL_BACKEND_CHOICES", "matmul", "resolve_matmul_backend",
+           "contract_faces"]
 
 MATMUL_BACKEND_CHOICES = (
     "auto", "off", "distributed", "cusolvermp", "cublasmp",
@@ -45,6 +46,87 @@ _TARGETS = {
 _OP_CODE = {"N": 0, "T": 1, "C": 2}
 _CUBLASMP_CACHE: dict = {}
 _RESHARD_CACHE: dict = {}
+
+
+def contract_faces(b_X, b_Y, weights, start, stop, *, mesh: Mesh,
+                   return_transpose: bool = False):
+    """Contract two row faces with replicated column weights, locally.
+
+    Parameters
+    ----------
+    b_X, b_Y
+        Matching arrays [b,m,Kcap] at P(None,'x',None) and
+        P(None,'y',None), or [b,mu,spin,Kcap] at
+        P(None,'x',None,None) and P(None,'y',None,None). The latter merge
+        mu*spin inside this service. No column or batch sharding is allowed.
+    weights
+        Complex [b,Kcap], replicated. Units are supplied by the caller;
+        the service adds no normalization or conjugation to these weights.
+    start, stop
+        Replicated integer [b] column bounds selecting [start,stop).
+        The caller resolves physical intervals and masks inactive columns.
+    mesh
+        Supplied mesh with axes ('x','y'). Both global linalg policies use
+        this same local operation; no provider is resolved or called.
+    return_transpose
+        Also return (conj(b_X)*weights) @ b_Y.T, at the same weights.
+
+    Returns
+    -------
+    W : jax.Array or tuple of jax.Array
+        [b,m,m] at P(None,'x','y'), (b_X*weights) @ b_Y.H, optionally
+        paired with its endpoint-transpose orientation. Each shard_map
+        body contains local GEMMs only, with no collective or provider call.
+    """
+    _mesh_shape(mesh)
+    if b_X.ndim not in (3, 4) or b_Y.shape != b_X.shape:
+        raise ValueError("contract_faces requires matching rank-3/4 faces")
+    if b_X.dtype != b_Y.dtype or b_X.dtype != weights.dtype:
+        raise TypeError("contract_faces factors and weights must share dtype")
+    b, k = b_X.shape[0], b_X.shape[-1]
+    if weights.shape != (b, k) or start.shape != (b,) or stop.shape != (b,):
+        raise ValueError("contract_faces weights [b,K] and bounds [b] required")
+    if start.dtype.kind not in "iu" or stop.dtype.kind not in "iu":
+        raise TypeError("contract_faces interval bounds must be integers")
+    explicit_spin = b_X.ndim == 4
+    xs = P(None, 'x', None, None) if explicit_spin else P(None, 'x', None)
+    ys = P(None, 'y', None, None) if explicit_spin else P(None, 'y', None)
+    # Concrete wrong layouts must not hide an input reshard in the hot path.
+    for value, spec in ((b_X, xs), (b_Y, ys), (weights, P()),
+                        (start, P()), (stop, P())):
+        if not isinstance(value, jax.core.Tracer):
+            want = NamedSharding(mesh, spec)
+            if not value.sharding.is_equivalent_to(want, value.ndim):
+                raise ValueError(f"contract_faces requires input layout {spec}")
+    return _contract_faces_kernel(mesh, explicit_spin, return_transpose)(
+        b_X, b_Y, weights, start, stop)
+
+
+@lru_cache(maxsize=None)
+def _contract_faces_kernel(mesh, explicit_spin, return_transpose):
+    """Reuse the local weighted b_X b_Y† contraction for a static layout."""
+    xs = P(None, 'x', None, None) if explicit_spin else P(None, 'x', None)
+    ys = P(None, 'y', None, None) if explicit_spin else P(None, 'y', None)
+    out = P(None, 'x', 'y')
+
+    @partial(shard_map, mesh=mesh, in_specs=(xs, ys, P(), P(), P()),
+             out_specs=(out, out) if return_transpose else out,
+             check_vma=False)
+    def _local(x, y, d, lo, hi):
+        b, k = x.shape[0], x.shape[-1]
+        if explicit_spin:
+            x = x.reshape((b, x.shape[1] * x.shape[2], k))
+            y = y.reshape((b, y.shape[1] * y.shape[2], k))
+        columns = jnp.arange(k)[None, :]
+        d = jnp.where((columns >= lo[:, None]) & (columns < hi[:, None]),
+                      d, 0)
+        w = (x * d[:, None, :]) @ jnp.swapaxes(jnp.conj(y), -1, -2)
+        if return_transpose:
+            wt = (jnp.conj(x) * d[:, None, :]) @ jnp.swapaxes(y, -1, -2)
+            return w, wt
+        return w
+
+    return jax.jit(_local)
 
 
 def _mesh_shape(mesh: Mesh) -> tuple[int, int]:
@@ -184,11 +266,25 @@ def _validate_operands(A, B, C, transa: str, transb: str):
     return out
 
 
-@partial(jax.jit, static_argnums=(0, 1, 2))
+@lru_cache(maxsize=None)
+def _zeros_kernel(shape, dtype, sharding):
+    """Retain the executable, never the allocated (possibly donated) buffer."""
+    return jax.jit(
+        lambda: jnp.zeros(shape, dtype=dtype), out_shardings=sharding)
+
+
 def _zeros(shape, dtype, sharding):
-    """Allocate a sharded zero tile with one executable per shape and dtype."""
-    return jax.lax.with_sharding_constraint(
-        jnp.zeros(shape, dtype=dtype), sharding)
+    return _zeros_kernel(tuple(shape), jnp.dtype(dtype), sharding)()
+
+
+@lru_cache(maxsize=None)
+def _transpose_kernel(op, tile):
+    """Reuse a distributed endpoint transpose for one operation and layout."""
+    @jax.jit(out_shardings=tile)
+    def move(x):
+        t = jnp.swapaxes(x, -1, -2)
+        return jnp.conj(t) if op == 'C' else t
+    return move
 
 
 def _cublasmp(mesh, A, B, C, *, alpha: complex, beta: complex,
@@ -196,13 +292,17 @@ def _cublasmp(mesh, A, B, C, *, alpha: complex, beta: complex,
     from distrib_la._cusolvermp import get_or_init_context
 
     px, py = _mesh_shape(mesh)
-    if (transa != "N" or transb != "N") and px * py > 1:
-        raise ValueError(
-            f"cuBLASMp matmul op={transa}/{transb} on {px}x{py} is "
-            "refused: multi-rank transpose modes are not trustworthy "
-            "(transa returned a wrong result; transb can deadlock). Use "
-            "SLATE/PBLAS, pretranspose into a face-sharded array, or select "
-            "the batch_reshard route.")
+    if transa != "N" or transb != "N":
+        # cuBLASMp's multi-rank native transpose descriptors have produced
+        # wrong answers / deadlock. Move endpoint tiles on device, then use
+        # the certified N,N provider. This is a distributed transpose, not
+        # a local tile transpose and not a host/full-matrix gather.
+        tile = NamedSharding(mesh, P(None, 'x', 'y'))
+        if transa != 'N':
+            A = _transpose_kernel(transa, tile)(A)
+        if transb != 'N':
+            B = _transpose_kernel(transb, tile)(B)
+        transa, transb = 'N', 'N'
     if A.dtype not in (jnp.dtype("float64"), jnp.dtype("complex128")):
         raise ValueError(
             f"cuBLASMp matmul supports float64/complex128; got {A.dtype}")
@@ -373,10 +473,11 @@ def matmul(
     Provider routes require float64 or complex128, one JAX process per mesh
     cell in y-minor order, exact face tiling, and an available handler.
     cuBLASMp and SLATE additionally require a square mesh; multi-rank
-    cuBLASMp accepts only ``N,N``.
-    Its transpose-A mode returned a wrong answer in the real P=4 gate, while
-    transpose-B can return rank-divergent ``INVALID_VALUE`` and deadlock; both
-    are refused before entering the provider.
+    cuBLASMp implements transpose/adjoint modes by a device face transpose
+    followed by its N,N provider call. Its native transpose descriptors are
+    never used: transpose-A returned wrong answers and transpose-B could
+    deadlock. These explicit endpoint moves carry collective communication
+    and one additional operand-sized distributed buffer per moved operand.
 
     The staged route does not require a provider or square mesh when selected
     with ``backend='off'``, but every physical input face and the output face

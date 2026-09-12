@@ -52,3 +52,24 @@ are owned by the [non-Hermitian GN-PPM memo](../dev/notes/DERIVATION_gnppm_nonhe
 The standalone package tests live in `services/minimax/tests/`; the monorepo
 layering test enforces the top-level door. Lookup tests must run without SciPy,
 while solver-generation tests may require it.
+
+
+## Response-bank rule sessions
+
+`response_bank_rule(z_ry, delta_max_ry, rel_tol=..., previous=None,
+domain_pad_ry=0)` returns positive real-time nodes and weights, value and
+s-derivative projections, a node digest, and continuum panel/tail bounds.
+`response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, ...)` returns positive
+Laplace nodes and inverse-moment coefficient rows, with continuum row bounds
+and current-frequency Taylor bounds. Both accept the previous in-memory result.
+A hit retains its integration arrays exactly and regenerates projections for
+all supplied frequencies. The bank norm is eta-scaled absolute value/derivative
+error; the remote norm is relative error. Neither certifies W or Sigma accuracy.
+
+`domain_pad_ry` enlarges a newly built transition domain. Remote lower padding
+stops at positivity and cannot cross the Taylor convergence boundary. Reuse
+requires current-domain containment, the same tolerance, an intact node digest
+and passing current-frequency bounds. Otherwise the owner builds a new rule;
+corrupt integration arrays refuse. Receipts report `reuse_status`,
+`reuse_reason`, `node_digest` and the actual certified domain. No wavefunctions,
+response matrices, physical samples or W models live in this session.

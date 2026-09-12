@@ -39,6 +39,8 @@ from minimax import (
     UniformRule,
     boundary_samples,
     build_uniform_rule,
+    uniform_rule_budget,
+    uniform_rule_backend_policy,
     rule_roundoff_amplification,
 )
 
@@ -47,6 +49,42 @@ _FACTOR_GROWTH_CAP = 30.0
 _RUNTIME_NOISE_EPSILON = 6.0e-8
 _RUNTIME_NOISE_SAFETY = 0.05
 _SC_POLE_PAD_FRACTION = 0.10
+_RULE_CACHE_SCHEMA = "sigma-box-ry-budget-v3"
+
+
+def _rule_digest(rule, noise_amplification, reduction_steps):
+    """Authenticate the certificate and its complex128 Ry-inverse nodes."""
+    identity = hashlib.sha256(json.dumps(
+        [_RULE_CACHE_SCHEMA, list(rule.box), float(rule.eps),
+         bool(rule.relative), int(reduction_steps)]).encode())
+    for array in (rule.times, rule.weights):
+        identity.update(np.asarray(array, dtype="<c16").tobytes())
+    identity.update(np.asarray(
+        [rule.sup_error, rule.kappa_max, noise_amplification,
+         rule.theta_deg, rule.rank], dtype="<f8").tobytes())
+    return identity.hexdigest()
+
+
+def sigma_rule_request_cache(directory, identity, poles2, counts, *, eta, eps):
+    """Scope shared-pole rules to authenticated current-map physical inputs.
+
+    ``identity`` is the model's existing energy/occupation/recipe provenance;
+    ``poles2`` [Nq,K] in Ry² and ``counts`` [Nq] are the small host census.
+    Map labels are excluded: equal physical inputs on restart share rules,
+    but changed spectra or occupations cannot inherit a previous map's plan.
+    Domain containment and the executor noise/growth gates still run on hits.
+    """
+    if directory is None:
+        return None
+    inputs = {key: value for key, value in identity.items()
+              if key != "iteration_id"}
+    digest = hashlib.sha256(json.dumps(
+        [_RULE_CACHE_SCHEMA, inputs, float(eta), float(eps)],
+        sort_keys=True).encode())
+    for row, count in zip(poles2, counts):
+        digest.update(np.asarray([count], dtype="<i8").tobytes())
+        digest.update(np.asarray(row[:int(count)], dtype="<f8").tobytes())
+    return os.path.join(directory, "request_" + digest.hexdigest())
 
 
 def resolve_sigma_box_cache_dir(setting, input_dir):
@@ -115,7 +153,10 @@ def _product_geometry(branches, eta, edge_factor):
 
 
 def _state_products(branch, state_edge, pole_edge):
-    """The sole owner of the three-window Cartesian partition."""
+    """Partition state × pole pairs into disjoint resonant and tail products.
+
+    Each Cartesian product factors into G(t) W(t); every pair appears once.
+    """
     crossing = ((branch.space == "cond" and not branch.neg_omega_half)
                 or (branch.space == "val" and branch.neg_omega_half))
     if crossing:
@@ -252,8 +293,18 @@ def _rule_cache_lookup(
         return None, ()
     warnings = []
     try:
-        names = [name for name in os.listdir(directory)
-                 if name.endswith(".npz")]
+        entries = [name for name in os.listdir(directory)
+                   if name.startswith("rule_") and name.endswith(".npz")]
+        names = [name for name in entries
+                 if name.startswith(f"rule_{_RULE_CACHE_SCHEMA}_")]
+        stale = sorted(set(entries) - set(names))
+        if stale:
+            warnings.append(
+                "WARNING sigma quadrature cache schema migration: "
+                f"path={os.path.abspath(directory)}; schema={_RULE_CACHE_SCHEMA}; "
+                f"ignored {len(stale)} legacy rule file(s), first={stale[0]}; "
+                "affected windows will be rebuilt. Legacy files are retained "
+                "to preserve prior-run evidence; remove them when no longer needed.")
     except OSError as exc:
         path = os.path.abspath(directory)
         warnings.append(
@@ -262,46 +313,44 @@ def _rule_cache_lookup(
             f"path={path} error={type(exc).__name__}: {exc}")
         return None, tuple(warnings)
     best = None
-    for name in names:
+    for name in sorted(names):
         path = os.path.abspath(os.path.join(directory, name))
         try:
             with np.load(path) as data:
-                if (abs(float(data["eps"]) - eps) > 1.0e-12 * eps
-                        or bool(data["relative"]) != relative):
-                    continue
-                cached_steps = (int(data["reduction_steps"])
-                                if "reduction_steps" in data else -1)
-                if cached_steps != (-1 if reduction_steps is None
-                                    else int(reduction_steps)):
-                    continue
-                # Cache entries pre-dating the executor-noise stamp, or
-                # entries built for a looser consumer, are not compatible.
-                # A cache hit is an acceleration only; it must never hide a
-                # builder attempt that can satisfy the active Sigma gate.
-                if ("roundoff_amplification" not in data
-                        or float(data["roundoff_amplification"])
-                        > noise_amplification_cap):
-                    continue
-                # A cached certificate above eps is not a rule for this
-                # request, whatever its node count; it must not shadow a
-                # buildable accurate one (Na pole-tail, 2026-09-05).
-                if (not np.isfinite(float(data["sup_error"]))
-                        or float(data["sup_error"]) > eps):
-                    continue
+                # Authenticate the stored object before compatibility filtering.
+                # A nearby requested eps may reuse this certificate, but is
+                # never substituted into the digest of its immutable identity.
+                cached_steps = int(data["reduction_steps"])
                 cached_box = tuple(float(value) for value in data["box"])
+                rule = UniformRule(
+                    times=np.asarray(data["times"]),
+                    weights=np.asarray(data["weights"]),
+                    box=cached_box, eps=float(data["eps"]),
+                    relative=bool(data["relative"]),
+                    theta_deg=float(data["theta_deg"]),
+                    rank=int(data["rank"]),
+                    sup_error=float(data["sup_error"]),
+                    kappa_max=float(data["kappa_max"]), seconds=0.0)
+                amplification = float(data["roundoff_amplification"])
+                if (str(data["schema"]) != _RULE_CACHE_SCHEMA
+                        or not _rule_is_certified(rule, rule.eps)
+                        or rule.times.ndim != 1 or rule.weights.ndim != 1
+                        or not np.isfinite(amplification)
+                        or str(data["digest"]) != _rule_digest(
+                            rule, amplification, cached_steps)):
+                    raise ValueError("GATE sigma_rule_integrity: certificate digest/schema mismatch")
+                if (abs(rule.eps - eps) > 1.0e-12 * eps
+                        or rule.relative != relative
+                        or cached_steps != (-1 if reduction_steps is None
+                                            else int(reduction_steps))
+                        or amplification > noise_amplification_cap
+                        or rule.sup_error > eps):
+                    continue
                 if not (cached_box[0] <= box[0]
                         and cached_box[1] >= box[1]
                         and cached_box[2] <= box[2]
                         and cached_box[3] >= box[3]):
                     continue
-                rule = UniformRule(
-                    times=np.asarray(data["times"]),
-                    weights=np.asarray(data["weights"]),
-                    box=cached_box, eps=eps, relative=relative,
-                    theta_deg=float(data["theta_deg"]),
-                    rank=int(data["rank"]),
-                    sup_error=float(data["sup_error"]),
-                    kappa_max=float(data["kappa_max"]), seconds=0.0)
                 if best is None or rule.node_count < best[0].node_count:
                     best = (rule, name)
         except (EOFError, OSError, KeyError, ValueError) as exc:
@@ -340,25 +389,16 @@ def _rule_cache_store(directory, rule, noise_amplification,
         return ("WARNING sigma quadrature cache store refused an uncertified "
                 "or non-finite rule (nothing written)")
     steps = -1 if reduction_steps is None else int(reduction_steps)
-    identity = hashlib.sha256(json.dumps(
-        ["sigma-noise-currency-v1", list(rule.box), float(rule.eps),
-         bool(rule.relative), steps]
-    ).encode())
-    identity.update(np.ascontiguousarray(rule.times).view(np.uint8).tobytes())
-    identity.update(np.ascontiguousarray(rule.weights).view(np.uint8).tobytes())
-    identity.update(np.asarray(
-        [float(rule.sup_error), float(rule.kappa_max),
-         float(noise_amplification), float(rule.theta_deg), float(rule.rank)],
-        dtype=np.float64).tobytes())
-    digest = identity.hexdigest()[:16]
-    path = os.path.abspath(os.path.join(directory, f"rule_{digest}.npz"))
+    digest = _rule_digest(rule, noise_amplification, steps)
+    path = os.path.abspath(os.path.join(directory, f"rule_{_RULE_CACHE_SCHEMA}_{digest}.npz"))
     temporary = None
     try:
         os.makedirs(directory, exist_ok=True)
         temporary = f"{path}.{os.getpid()}.tmp"
         with open(temporary, "wb") as handle:
             np.savez(
-                handle, box=np.asarray(rule.box, np.float64),
+                handle, schema=_RULE_CACHE_SCHEMA, digest=digest,
+                box=np.asarray(rule.box, np.float64),
                 eps=float(rule.eps), relative=bool(rule.relative),
                 times=rule.times, weights=rule.weights,
                 sup_error=float(rule.sup_error),
@@ -423,12 +463,13 @@ def _fit_rule(
     spec, eps, reduction_seconds, cache_dir, eta, *, cache_build_widen=True,
     reduction_steps=None,
 ):
+    # Certify 1/d ≈ sum_j w_j exp(i t_j d) over the entire denominator box.
+    policy = uniform_rule_budget(reduction_seconds, reduction_steps)
     requested_box = spec["box"]
     # This is exactly the builder's default currency predicate.  It is used
     # here only to search cache metadata; cache misses still leave the choice
     # to build_uniform_rule(relative=None).
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
-    retry_note = ""
     noise_budget = _RUNTIME_NOISE_SAFETY * eps
     noise_amplification_cap = noise_budget / _RUNTIME_NOISE_EPSILON
     cached, cache_lookup_warnings = _rule_cache_lookup(
@@ -442,12 +483,10 @@ def _fit_rule(
         build_box = (_cache_build_box(requested_box, eta)
                      if cache_dir is not None and cache_build_widen
                      else requested_box)
-        # A step budget replaces the wall clock: deterministic across
-        # machines (sigma_quadrature_reduction_steps).
-        build_kwargs = (
-            {"reduction_steps": int(reduction_steps)}
-            if reduction_steps is not None
-            else {"time_budget": reduction_seconds})
+        # Fixed passes remove clock-selected numerical work. Reproducibility
+        # still depends on the source, numerical backend and cache inventory.
+        build_kwargs = {"time_budget": policy["seconds"],
+                        "reduction_steps": policy["steps"]}
         if relative:
             # For a sign-definite rule the service's kappa is
             # sum|term|/|Q|, while Sigma's noise amplification is
@@ -458,22 +497,27 @@ def _fit_rule(
             # service's ordinary cancellation cap.
             build_kwargs["kappa_cap"] = (
                 noise_amplification_cap / (1.0 + eps))
-        rule = build_uniform_rule(build_box, eps, **build_kwargs)
+        try:
+            rule = build_uniform_rule(build_box, eps, **build_kwargs)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"Sigma box window {spec['name']!r} refused: "
+                f"sigma_quadrature_reduction_seconds={policy['seconds']:g} "
+                f"watchdog expired with sigma_quadrature_reduction_steps="
+                f"{policy['steps']}; no partial rule accepted. Remedy: increase "
+                "sigma_quadrature_reduction_seconds or reduce "
+                "sigma_quadrature_reduction_steps. Checks occur between basis "
+                "attempts/removal passes and before return; the step supervisor "
+                "owns the strict wall limit."
+            ) from exc
         cache_status = "miss" if cache_dir is not None else "off"
-        if not _rule_is_certified(rule, eps):
-            # The reduction budget can expire and return the interpolatory
-            # start.  A budget is not a correctness switch: try once more
-            # with five times the time before refusing.  A non-finite
-            # certificate retries too (it is a failed build, not a verdict).
-            retry_kwargs = dict(build_kwargs)
-            retry_kwargs["time_budget"] = 5.0 * float(reduction_seconds)
-            retry = build_uniform_rule(build_box, eps, **retry_kwargs)
-            retry_note = (f"; the 5x-budget retry achieved sup="
-                          f"{float(retry.sup_error):.6g} with "
-                          f"{int(np.asarray(retry.times).size)} nodes")
-            if _rule_is_certified(retry, eps):
-                rule = retry
-                cache_status += ":retry"
+    # Initial certification precedes removal passes and ignores the legacy
+    # reduction clock. The service already tries three tighter bases. A
+    # failed start cannot be repaired by either more passes or more seconds;
+    # a duplicate build is not a retry in either budget currency.
+    budget_key = ("sigma_quadrature_reduction_seconds"
+                  if policy["mode"] == "seconds" else
+                  "sigma_quadrature_reduction_steps")
 
     # ONE ACCEPTANCE ON EVERY PATH.  One-shot, fixed-SC initialization and
     # its rebuilds all require the certified sup error at or below eps; the
@@ -488,10 +532,10 @@ def _fit_rule(
             f"is not finite ({int(np.asarray(rule.times).size)} nodes on box "
             f"{tuple(round(float(v), 6) for v in rule.box)}, kind "
             f"{spec.get('kind', '?')}, cache={cache_status}{cache_note}"
-            f"{retry_note}). Remedy: a "
+            f"; no retry under {budget_key}: initial certification is "
+            f"independent of the removal budget). Remedy: a "
             f"sign-preserving or split product window (the SC pad now keeps "
-            f"sign-definite supports sign-definite), a longer "
-            f"sigma_quadrature_reduction_seconds, or a certified crossing "
+            f"sign-definite supports sign-definite), or a certified crossing "
             f"rule; do not loosen sigma_quadrature_eps to admit this rule.")
     # Runtime perturbations must be bounded in the SAME currency as the
     # approximation.  ``kappa = sum|term|/|Q|`` is already relative for a
@@ -547,6 +591,7 @@ def _fit_rule(
         "noise_bound": noise_bound, "noise_budget": noise_budget,
         "roundoff_amplification": noise_amplification,
         "node_digest": node_digest,
+        "reduction_budget": policy,
         "cache_write_warning": cache_write_warning,
         "cache_lookup_warnings": cache_lookup_warnings,
         "one_line": rule.one_line(),
@@ -800,6 +845,12 @@ def _fit_fixed_sc_rules(
             reasons[spec["name"]] = "absent from iteration 1"
             continue
         escaped = _box_escape_reasons(entry["fit"]["rule_box"], spec["box"])
+        if bool(entry["fit"]["relative"]) != (spec["kind"] != "crossing"):
+            escaped.append("absolute/relative error currency changed")
+        growth = _factor_growth(entry["fit"]["times"], spec["pole_sign"],
+            spec["states"], spec["pole_stats"], spec["E_ref_A"], spec["E_ref_B"])
+        if max(growth) > _FACTOR_GROWTH_CAP:
+            escaped.append("current separated factors exceed growth bound")
         if escaped:
             rebuild.append(spec)
             reasons[spec["name"]] = "box escape: " + "; ".join(escaped)
@@ -960,6 +1011,7 @@ def plan_sigma_windows(
     started = time.perf_counter()
     eta, tolerance = float(eta_ry), float(eps)
     budget = float(reduction_seconds)
+    policy = uniform_rule_budget(budget, reduction_steps)
     edge = float(edge_factor)
     if not np.isfinite(eta) or eta <= 0.0:
         raise ValueError("sigma_quadrature requires eta_ry > 0")
@@ -1032,7 +1084,7 @@ def plan_sigma_windows(
         print_fn(
             f"  Sigma rule reduction: deterministic budget of "
             f"{int(reduction_steps)} passes per window "
-            "(sigma_quadrature_reduction_seconds ignored)")
+            f"(sigma_quadrature_reduction_seconds={budget:g} refusal watchdog)")
     if fixed_rule_session is None:
         fits, fit_rows = fit_sigma_box_specs(
             specs, eta, eps=tolerance, reduction_seconds=budget,
@@ -1106,6 +1158,7 @@ def plan_sigma_windows(
             "factor_growth": list(fit["factor_growth"]),
             "cache_status": fit["cache_status"],
             "fit_seconds": fit["seconds"],
+            "reduction_budget": fit["reduction_budget"],
             "sc_fixed_rule": fixed_rule_session is not None,
             "sc_fixed_padded_box_ry": (
                 None if fixed_rule_session is None else list(
@@ -1125,7 +1178,11 @@ def plan_sigma_windows(
         "planner": "uniform_denominator_boxes",
         "eta_ry": eta, "eps": tolerance,
         "rule_eps": tolerance,
-        "reduction_seconds": budget, "cache_dir": cache_dir,
+        "reduction_seconds": budget, "reduction_steps": reduction_steps,
+        "reduction_mode": policy["mode"],
+        "reduction_budget": policy,
+        "cache_dir": cache_dir, "rule_cache_schema": _RULE_CACHE_SCHEMA,
+        "backend_policy": uniform_rule_backend_policy(),
         "n_windows": len(output),
         "window_tau_pairs": pairs, "distinct_tau_count": distinct,
         "plan_seconds": time.perf_counter() - started,
@@ -1153,6 +1210,10 @@ def plan_sigma_windows(
         })
     else:
         geometry["sc_fixed_quadrature"] = False
+    # Keep the accepted rule identity and its operative policy in the normal
+    # scientific report, including cache-off and repeated SC planning calls.
+    if process_rank() == 0:
+        print_fn("Sigma quadrature receipt: " + json.dumps(geometry, sort_keys=True))
     return output, geometry
 
 

@@ -206,6 +206,14 @@ class GWProductionReport:
         if text.startswith("  Resident ψ "):
             self.emit(text)
             return
+        # Every box plan carries a durable policy and accepted-rule receipt,
+        # including ordinary shared-pole runs with debug disabled.  The
+        # "Quadrature windows" report section renders the LAST plan's
+        # geometry for a reader; this line is the machine-readable receipt of
+        # EVERY plan call, so an SC run keeps one per map.
+        if text.startswith("Sigma quadrature receipt: "):
+            self.progress(text)
+            return
         # Fixed-SC quadrature identity is a physics invariant, not backend
         # chatter: retain its compact receipt so every map's exact node set
         # and zero-rebuild claim remain auditable after live stdout is gone.
@@ -317,11 +325,15 @@ class GWProductionReport:
         self.emit("Spin channels  : " + (
             "charge + transverse current (bispinor)"
             if bool(getattr(config, "bispinor", False)) else "charge (scalar)"))
-        self.emit("Degenerate sets: " + (
-            "left in the input gauge" if bool(getattr(
-                config, "no_degen_averaging", False))
-            else "averaged at "
-            f"{float(getattr(config, 'degen_avg_tol_ry', 0.0)) * RYD_TO_EV:.5e} eV"))
+        if solver == "self_consistent":
+            self.emit("Degenerate sets: full SC operators retained; "
+                      "no diagonal averaging in the iteration map")
+        else:
+            self.emit("Degenerate sets: " + (
+                "left in the input gauge" if bool(getattr(
+                    config, "no_degen_averaging", False))
+                else "reporting diagonals averaged at "
+                f"{float(getattr(config, 'degen_avg_tol_ry', 0.0)) * RYD_TO_EV:.5e} eV"))
         self.emit("ISDF state     : " + (
             "restart requested" if bool(getattr(config, "restart", False))
             else "fresh fit requested"))
@@ -493,7 +505,7 @@ class GWProductionReport:
             if lower_margin >= 0.0 and upper_margin >= 0.0:
                 self.emit("Coverage status : COMPLETE")
                 self.emit(f"Grid margins    : {lower_margin:.5f} eV below; "
-                          f"{upper_margin:.5f} eV above protected DFT states")
+                          f"{upper_margin:.5f} eV above requested DFT output bands")
             else:
                 self.emit("Coverage status : INCOMPLETE")
                 shortfalls = []
@@ -502,7 +514,7 @@ class GWProductionReport:
                 if upper_margin < 0.0:
                     shortfalls.append(f"{-upper_margin:.5f} eV above")
                 self.emit("Grid shortfall  : " + "; ".join(shortfalls)
-                          + " protected DFT states")
+                          + " requested DFT output bands")
                 coverage = getattr(sigma_result, "omega_coverage", None)
                 policy_name = str(getattr(coverage, "policy", "unknown"))
                 affected = ""
@@ -516,13 +528,14 @@ class GWProductionReport:
                         affected = (f"; Sigma(E_DFT) has {n_uncovered}/"
                                     f"{mask.size} out-of-grid cells")
                 self._retain_warning(
-                    "WARNING: dynamic Sigma grid is incomplete for protected "
-                    "DFT states (" + "; ".join(shortfalls) + f"){affected}; "
+                    "WARNING: dynamic Sigma grid is incomplete for requested "
+                    "DFT output bands (" + "; ".join(shortfalls) + f"){affected}; "
                     f"out-of-range policy={policy_name}. Widen "
                     "sigma_omega_min_ev / sigma_omega_max_ev or add a "
                     "sigma_omega_patches_ev window; use "
                     "LORRAX_OMEGA_OUT_OF_RANGE=refuse when endpoint values "
-                    "must never enter an output.")
+                    "must never enter an output. In SC runs these counts include "
+                    "scissored bands; the SC partition reports protected-band coverage.")
 
         state = "ON" if config.sigma.band_extrapolation else "OFF"
         estimator = (getattr(
@@ -635,16 +648,49 @@ class GWProductionReport:
                          and tuple(r.get("path", (r["name"],)))
                          == (r["name"],))
 
-        def outer_prefixed(prefix, *, within=None):
+        def outer_prefixed(prefix, *, within=None, excluding=()):
             def selected(row):
                 path = tuple(row.get("path", (row["name"],)))
                 if not row["name"].startswith(prefix):
                     return False
                 if within is not None and (not path or path[0] != within):
                     return False
+                if any(str(parent).startswith(excluding) for parent in path[:-1]):
+                    return False
                 return not any(str(parent).startswith(prefix)
                                for parent in path[:-1])
             return total(selected)
+
+        def partition(parent, prefixes, label):
+            """Replace an inclusive band by disjoint descendants and residuals."""
+            parents = [r for r in rows if r["name"] == parent]
+            result = []
+            for owner in parents:
+                path = tuple(owner.get("path", (parent,)))
+                selected = {tuple(r["path"]): r for r in rows
+                            if tuple(r.get("path", ()))[:len(path)] == path
+                            and len(r.get("path", ())) > len(path)
+                            and r["name"].startswith(prefixes)}
+
+                def visit(key, row, title):
+                    children = [p for p in selected if p[:len(key)] == key
+                                and len(p) > len(key)
+                                and not any(q != p and len(q) > len(key)
+                                            and p[:len(q)] == q for q in selected)]
+                    for child in children:
+                        name = selected[child]["name"].split(".", 1)[1]
+                        visit(child, selected[child], label + " " + name)
+                    residual = float(row["inclusive"]) - sum(
+                        float(selected[p]["inclusive"]) for p in children)
+                    result.append((title + (" other" if children else ""),
+                                   max(residual, 0.0)))
+
+                visit(path, owner, label)
+            # A name may occur under the first-call probe and ordinary sweep.
+            totals = {}
+            for name, seconds in result:
+                totals[name] = totals.get(name, 0.0) + seconds
+            return list(totals.items())
 
         isdf_total = top_level("gw_jax.isdf")
         zeta = total(lambda r: r["name"] == "gw_jax.zeta_fit_chunked"
@@ -660,18 +706,57 @@ class GWProductionReport:
             isdf_total - zeta - zeta_transverse - v_q - restart_load, 0.0)
 
         screening_total = top_level("gw_jax.screening")
-        chi0 = outer_prefixed("chi.", within="gw_jax.screening")
-        w_screen = outer_prefixed("W.", within="gw_jax.screening")
-        screening_support = max(screening_total - chi0 - w_screen, 0.0)
+        # A shared-pole bank may call chi/W owners internally. Its inclusive
+        # band already owns those seconds; do not print them a second time.
+        chi0 = outer_prefixed("chi.", within="gw_jax.screening", excluding=("spole.",))
+        w_screen = outer_prefixed("W.", within="gw_jax.screening", excluding=("spole.",))
+        spole_rows = [r for r in rows if r["name"].startswith("spole.")
+                      and tuple(r.get("path", ()))[:1] == ("gw_jax.screening",)
+                      and not any(str(p).startswith("spole.")
+                                  for p in r.get("path", ())[:-1])]
+        # Preserve the constructor census names and their execution order.
+        # Waits name the NEXT consumer; they drain PREVIOUS asynchronous work.
+        screening_details = []
+        for name in dict.fromkeys(r["name"] for r in spole_rows):
+            label = name.removeprefix("spole.")
+            if label.startswith("device_wait."):
+                label = "wait before " + label.removeprefix("device_wait.")
+            elif label.startswith("rank_wait."):
+                continue  # all process alignment is one disjoint row below
+            elif label == "passivity_held":
+                label = "passivity + held (fused)"
+            if name == "spole.bank" and any(r["name"].startswith("bank.") for r in rows):
+                screening_details.extend(partition("spole.bank", ("bank.",), "bank"))
+                continue
+            screening_details.append(("spole " + label,
+                sum(float(r["inclusive"]) for r in spole_rows if r["name"] == name)))
+        screening_details.append(("spole rank synchronization",
+            sum(float(r["inclusive"]) for r in spole_rows
+                if r["name"].startswith("spole.rank_wait."))))
+        screening_support = max(screening_total - chi0 - w_screen
+                                - sum(value for _, value in screening_details), 0.0)
 
         # The dynamic-Sigma executor opens ``sigma.rule_plan`` (box-rule
         # fitting, cached by box and tolerance) and ``sigma.tau_sweep`` (the
         # tau contraction) under gw_jax.sigma or, in a self-consistent run,
-        # under gw_jax.sc_driver; nothing else of Sigma is separately named.
+        # under gw_jax.sc_driver. Shared finalization and the fenced setup
+        # phases below are disjoint from the plan and sweep.
         sigma_total = top_level("gw_jax.sigma", "gw_jax.sc_driver")
         sigma_plan = outer_prefixed("sigma.rule_plan")
         sigma_sweep = outer_prefixed("sigma.tau_sweep")
-        sigma_other = max(sigma_total - sigma_plan - sigma_sweep, 0.0)
+        sigma_details = [
+            ("Sigma pending inputs", outer_prefixed("sigma.input_wait")
+             + outer_prefixed("sigma.finalize_input_wait")),
+            ("Sigma exchange", outer_prefixed("sigma.exchange")),
+            ("Sigma Hartree", outer_prefixed("sigma.hartree")),
+            ("Sigma model validation", outer_prefixed("sigma.model_validate")),
+            ("Sigma capacity", outer_prefixed("sigma.capacity")),
+            ("Sigma branches", outer_prefixed("sigma.branches")),
+            ("Sigma census", outer_prefixed("sigma.census")),
+            ("Sigma finalize + writes", outer_prefixed("gw_jax.dynamic_sigma_finalize")),
+        ]
+        sigma_other = max(sigma_total - sigma_plan - sigma_sweep
+                          - sum(value for _, value in sigma_details), 0.0)
 
         stages = [
             ("runtime bring-up", total(lambda r: r["name"].startswith(
@@ -686,11 +771,15 @@ class GWProductionReport:
             ("minimax quadrature", top_level("gw_jax.minimax_quadrature")),
             ("chi0", chi0),
             ("W", w_screen),
-            ("screening support", screening_support),
+            *screening_details,
+            ("spole other" if spole_rows else "screening support", screening_support),
             ("W persist + q0 head", top_level(
                 "gw_jax.persist_w0", "gw_jax.static_head")),
             ("Sigma rule plan", sigma_plan),
-            ("Sigma tau sweep", sigma_sweep),
+            *(partition("sigma.tau_sweep", ("tau.",), "Sigma tau")
+              if any(r["name"].startswith("tau.") for r in rows)
+              else [("Sigma tau sweep", sigma_sweep)]),
+            *sigma_details,
             ("Sigma other", sigma_other),
             ("mean-field load", top_level("gw_jax.kin_ion_load")),
             ("QP solve + diagonalize", top_level(
@@ -706,11 +795,23 @@ class GWProductionReport:
         accounted = sum(seconds for _name, seconds in stages)
         stages.append(("other driver work", max(float(wall) - accounted, 0.0)))
         self.heading("Major-stage timing")
-        self.emit("  stage                    wall (s)     fraction")
+        detailed = any(r["name"].startswith(("bank.", "tau.")) for r in rows)
+        width = max(22, max((len(name) for name, _ in stages), default=22)) if detailed else 22
+        self.emit(f"  {'stage':<{width}}   wall (s)     fraction")
         for name, seconds in stages:
-            self.emit(f"  {name:<22} {seconds:10.2f}  "
+            self.emit(f"  {name:<{width}} {seconds:10.2f}  "
                       f"{100.0 * seconds / wall if wall else 0.0:9.2f}%")
-        self.emit(f"  {'total run':<22} {wall:10.2f}  {100.0:9.2f}%")
+        self.emit(f"  {'total run':<{width}} {wall:10.2f}  {100.0:9.2f}%")
+        if any(r["name"].startswith(("bank.", "tau.")) for r in rows):
+            self.emit("  bank real_time/laplace = incumbent G/FFT correlation plus bank coefficient carry;")
+            self.emit("  these fused clocks are not FFT-only or evidence of a bandwidth limit.")
+            self.emit("  Sigma tau kernel other includes incumbent G/W convolution, projection and dispatch;")
+            self.emit("  W_synthesis is separately fenced. No pure-GEMM or pure-FFT wall is inferred.")
+            self.emit("  device_wait drains preceding work; rank_wait measures process alignment.")
+        if spole_rows:
+            self.emit("  spole bands: fenced host walls; wait-before rows drain prior device/effect work,")
+            self.emit("  not the named consumer. Rank synchronization is separate. Local passivity/held")
+            self.emit("  share one compiled call; their fused wall is not split into invented timings.")
 
     def warnings(self) -> None:
         if self._warnings_emitted:

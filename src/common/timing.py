@@ -585,3 +585,22 @@ def report(
 	wall: float | None = None,
 ) -> None:
 	_GLOBAL_COLLECTOR.report(print_fn=print_fn, title=title, min_percent=min_percent, max_depth=max_depth, wall=wall)
+
+
+def fence(name: str, *, sync_ranks: bool = True) -> None:
+    """Drain earlier device/effect work before a host band, then align ranks.
+
+    Wait rows name the next consumer, not the producer of the pending work.
+    Rank-local CPU work must use ``sync_ranks=False``: independent workers
+    execute different numbers of bands and cannot enter matched collectives.
+    No array is gathered or copied. This is a timing boundary, not a kernel.
+    """
+    import jax
+    from common.collectives import barrier
+    prefix, _, band = name.partition(".")
+    with section(prefix + ".device_wait." + band):
+        jax.block_until_ready(jax.live_arrays())
+        jax.effects_barrier()
+    if sync_ranks:
+        with section(prefix + ".rank_wait." + band):
+            barrier("timing-" + name)

@@ -880,6 +880,16 @@ def compute_screening_model(
     if mode is ComputeMode.MPA:
         if static_only:
             return {}
+        if config.sigma.w_model == "shared_pole":
+            from .shared_pole_screening import screen_shared_poles
+            return screen_shared_poles(
+                wfns, V_q, meta, config, mesh_xy=mesh_xy, sym=sym,
+                centroid_indices=centroid_indices, run_dir=run_dir, label=label,
+                wfn=wfn, wfn_fingerprint_binding=wfn_fingerprint_binding,
+                tensors_filename=tensors_filename, occupation_state=occupation_state,
+                print_fn=print_fn, head_resolver=head_resolver, mpa_plan=mpa_plan,
+                iteration_head_response=iteration_head_response,
+                material_class=material_class)
         reuse_path = getattr(config.mpa, "fit_reuse_file", None)
         if reuse_path is not None:
             if mpa_plan is None:
