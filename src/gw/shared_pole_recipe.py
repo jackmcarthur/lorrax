@@ -38,9 +38,16 @@ shared_real_pole_v2_r1 = {
     # structure (e-h continuum and the collective pole) lives at and below
     # omega_fine, and above it W_c is a smooth tail whose only scale is omega.
     "line_step_eta_factor": 2.0,
-    "line_growth_fraction": 0.25,
+    # 0.25 was the design value; it was measured on Si (job 58217047.8) to put
+    # the second held line point at 23.206 eV -- INSIDE that deck's 30.325 eV
+    # Sigma reach -- at 15.10x the incumbent's dWc/ds, because the local step
+    # there had grown to ~2.4h. 0.15 keeps the tail step nearer the sample
+    # height where Sigma still weights the model. Na never fired the trigger
+    # (worst in-reach ratio 2.76); this is a Si-driven value applied to both,
+    # because the rule is material-independent by construction.
+    "line_growth_fraction": 0.15,
     "line_spacing_rule": ("2*eta to omega_fine=max(omega_p, E_g+active depth), "
-                          "then step*(1+0.25) per interval; no absolute energy, "
+                          "then step*(1+0.15) per interval; no absolute energy, "
                           "no material branch"),
     # top clears BOTH the plasmon and the frequencies Sigma actually samples.
     # 2.25*omega_fine: |W_c| has fallen to ~1/2.25^2 of its static scale, where

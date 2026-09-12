@@ -198,7 +198,8 @@ def test_geometry_padding_charge_and_holds():
     # Uniform 2*eta to omega_fine, then a step that grows by 1.25 per interval.
     np.testing.assert_allclose(r['line_ev'][:21],np.arange(0,10.5,.5))
     steps=np.diff(r['line_ev'][20:-1])
-    np.testing.assert_allclose(steps[1:]/steps[:-1],1.25,rtol=1e-12)
+    np.testing.assert_allclose(steps[1:]/steps[:-1],
+                               1+r['line_growth_fraction'],rtol=1e-12)
     assert r['line_ev'][-1]==pytest.approx(22.5)
     assert not set(r['fit_ids']) & set(r['held_ids'])
     assert len(r['role']) == r['unique_evaluations']
@@ -285,8 +286,11 @@ def test_sigma_window_can_set_the_top():
     assert wide['sigma_window_ev']==pytest.approx(41)   # + active depth 1
     assert wide['top_bound_by']=='sigma_window'
     assert wide['top_ev']==pytest.approx(51.25)         # 1.25 * 41
-    # The cost of reaching 51 eV is logarithmic, not linear, in the extent.
-    assert wide['line_count'] - plain['line_count'] <= 5
+    # The cost of reaching 51 eV is logarithmic, not linear, in the extent:
+    # compare against what CONTINUING the uniform 2*eta step would have cost,
+    # rather than a bare constant that moves whenever the growth rate is tuned.
+    uniform = (wide['top_ev'] - plain['top_ev'])/plain['line_step_ev']
+    assert wide['line_count'] - plain['line_count'] < 0.25*uniform
     assert wide['omega_fine_ev']==plain['omega_fine_ev']  # structure scale unmoved
 
 
