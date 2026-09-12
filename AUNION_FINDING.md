@@ -6,10 +6,12 @@ resolved keeping both sides; every clean-merge file is reviewed by hand; the
 union imports and passes its contracts at P4; its numerical movement on Si is
 ACONJ's deliberate change and nothing else; it *passes* an every-rank peak gate
 that ACONJ alone failed; and on the owner's preferred deck (an MPA head correction at every
-iteration) the union runs multi-map shared-pole SC **past map 1 and map 2**.
-The map-1 death reported below is a property of a HEADLESS deck, reproduced on
-three sources including the SC branch alone, and the union inherits it rather
-than causing it.
+iteration) the union runs **11 shared-pole SC maps** instead of one, to within
+6.3x of the convergence tolerance, before the same q=0 Gram gate stops it. The
+map-1 death is a property of a HEADLESS deck; the residual q=0 fragility is a
+pre-existing defect the union inherits rather than causes, reproduced on three
+sources including the SC branch alone, on which the union is equal or better on
+every comparison.
 
 Branch `integ/sp-union-2026-09-11`, tip `9160c501`, base `810c260b`.
 Worktree `/pscratch/sd/j/jackm/wt_sp_union`. Run root
@@ -276,19 +278,34 @@ iteration's resident W. Run verbatim on the union, changing only `restart`
 own `dipole.h5` symlinked in, because `head_correction = full` refuses without
 one.
 
-**The union passes.** Job `58216796`, P4, `07_sc_head/union_long/map_probe.json`:
+**The head is worth eleven maps, not one — but it is not a fix.** Job
+`58216796`, P4, `07_sc_head/union_long/map_probe.json`:
 
-| map | wall | result |
-|---:|---:|---|
-| 0 | 273.3 s | **OK** (gap 1.497936 eV, max\|dE\| 1.554223 eV) |
-| 1 | 66.8 s | **OK** |
-| 2 | 46.3 s | **OK** |
-| 3 | 59.8 s | **OK** |
+| map | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | **11** |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| result | OK | OK | OK | OK | OK | OK | OK | OK | OK | OK | OK | **FAIL** |
+| wall s | 273.3 | 66.8 | 46.3 | 59.8 | 43.1 | 37.1 | 33.7 | 33.1 | 33.2 | 33.2 | 33.3 | 12.0 |
 
-The SC branch alone, run beside it on the same pool with the same deck, matches:
-map 0 368.5 s OK, map 1 66.5 s OK, with identical cache counts. So the union
-reproduces the SC line's validated behaviour exactly, and the headless map-1
-death is a **deck** property.
+Map 11 fails on the same gate at the same parent:
+`Gram min/max = -1.69705467e-07, metric infinity norm = 5.90116457e-08`,
+gate −1e−07 — **1.7x over, against the headless 2.0x**.
+
+**And it was converging.** `max|dE|` across the eleven maps: 1.554223, 0.426751,
+0.329176, 0.050301, 0.044914, 0.022727, 0.014035, 0.006549, 0.002750, 0.000947,
+**0.000632 eV**, against `sc_tol_ev = 1e-4`. It died one or two iterations short,
+on a spectrum that had almost stopped moving. So the failure is **not** driven
+by a large spectral excursion — a nearly stationary map still trips it.
+
+The SC branch alone, run beside it on the same pool with the same deck, tracks
+it map for map (walls 368.5 / 66.5 / 45.9 / 59.7 / 43.7 / 36.8 / 34.6 / 34.6 /
+34.4 …, identical cache counts at every map). So this is source-independent: the
+union reproduces the SC line exactly, and neither source converges this deck.
+
+**What that establishes, stated exactly.** Not "the union runs multi-map
+shared-pole SC" — it runs 11 of the ~12 maps this deck needs and stops one gate
+short. The head is worth an order of magnitude in depth and confirms the
+mechanism is at q=0 where the head acts; it defers the fragility rather than
+removing it.
 
 That rescopes the registered defect to what was actually measured:
 `sigma_w_model = shared_pole` + `qp_solver = self_consistent` +
@@ -319,17 +336,93 @@ rather than the convenient version:
 | 2 | 4 / 2 | 5 / 1 |
 | 3 | 5 / 3 | 7 / 1 |
 
-So partial reuse **does** begin at map 2, but `currsize` still grows
-monotonically and the two caches grow at different rates — the reducer kept
-growing at map 2 while the packer held. Neither has a `cache_clear` anywhere in
-`src/gw/`. This is growth with partial reuse, not a pure leak and not a
-converged cache; the slope over a full run is the number the memory question
-needs.
+Over the full eleven maps both caches **converge**:
+
+| map | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| packer currsize / hits | 2/0 | 4/0 | 4/2 | 5/3 | 5/5 | 5/7 | 5/9 | 5/11 | 5/13 | 5/15 | 5/17 |
+| reducer currsize / hits | 2/0 | 4/0 | 5/1 | 7/1 | 8/2 | 8/4 | 8/6 | 8/8 | 8/10 | 8/12 | 8/14 |
+
+The packer plateaus at 5 from map 3, the reducer at 8 from map 4, and from there
+hits rise +2 per map on both with **no further misses**. The SC branch alone
+reproduces every entry.
+
+So on this deck these are **converged caches, not leaks**: the per-map spectral
+cuts really do change the key at first, but the key SET is finite for an SC run
+whose spectrum settles. The earlier "2 → 3 with zero hits" reading was an
+artefact of the headless arms dying at map 1 and is withdrawn.
+
+The residual, which is why the register row stays open: **nothing evicts**. A
+run whose cuts never settle, or several decks in one process, would still grow,
+and there is no `cache_clear` anywhere in `src/gw/`. The two caches also plateau
+at different sizes (5 vs 8), consistent with `local_parent_reducer` keying on
+`parent_extents` — a per-parent tuple — where `_parent_panel_packer` keys only
+on widths and batch counts.
 
 On-disk scratch, exports off: `sc_0000_shared_pole/` 1.685 GB,
 `sc_0001_shared_pole/` 1.491 GB (partial). The scratch tree is unbounded per
 map on the default path; the union neither improves nor worsens it, and nothing
 here is ARETAIN's export retention, which is bounded and separately tested.
+
+### Leg 4b — where the map-11 failure actually comes from
+
+Two checks on receipts already on disk, no extra compute.
+
+**It is a jump, and nothing the constructor sees is moving.** Per-map q=0
+`normalized_gram_validity` (`gram_trajectory.py` over the eleven
+`construction_receipt.json`s):
+
+| map | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | **11** |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| q=0 `gram_min` | −1.31e−09 | −1.56e−08 | −3.05e−09 | −1.05e−09 | −1.16e−09 | −2.75e−09 | −4.27e−09 | −1.71e−09 | −1.68e−09 | −1.93e−09 | −1.79e−09 | **−1.70e−07** |
+| bank rule | build | hit | hit | hit | hit | hit | hit | hit | hit | hit | hit | hit |
+| certified margin | 96.2% | 98.6% | 98.9% | 99.2% | 99.2% | 99.2% | 99.2% | 99.2% | 99.2% | 99.2% | 99.2% | 99.2% |
+| K(q=0) | 2010 | 1896 | 1877 | 1867 | 1867 | 1871 | 1868 | 1868 | 1868 | 1868 | 1868 | — |
+
+Two orders of magnitude inside the gate for eleven maps, stationary from map 7,
+then a ~95× jump. **The "certified margin closing fast" reading earlier in this
+document is withdrawn**: it was two points, and on eleven the margin plateaus at
+99.2% from map 3. The rule is `hit` with the same 670 nodes and the same
+`node_digest` at every map including the failing one — no escape, no rebuild.
+The SC state identity is byte-stable too: "3 reassignments at k=5, total=4",
+`protected=1-14`, `in_range=1-12`, identical at every map.
+
+**The discrete thing is in the traceback**: the failure is at
+`mixing/acceleration.py:972`, `f_trial = _entry(residual_fn(x_trial))`. Map 11
+is an rCROP **trial** map — the extrapolated Hamiltonian, not an accepted one.
+The probe's maps alternate `role=trial` / `role=accepted_input_map`, which is
+rCROP calling the map twice per iteration.
+
+**And the SC branch alone passed the same map.** Same deck, same pool:
+
+| map | 9 | 10 | **11** | 12 | end |
+|---|---|---|---|---|---|
+| union | −1.93e−09 | −1.79e−09 | **−1.70e−07 FAIL** | — | — |
+| SC branch alone | −1.84e−09 | −1.65e−09 | **−1.38e−09 OK** | −1.60e−09 OK | 13 maps, no Gram failure, `max\|dE\|` 0.000105 eV against a 0.000100 eV criterion — budget exhausted, 5% short |
+
+The two agree to within a factor of ~1.2 at every one of the first eleven maps,
+with the union sometimes better (maps 0, 7) and sometimes worse (map 5) — no
+systematic bias — and then differ by 123× at map 11 alone, with span, nodes,
+rule status and K identical.
+
+**The reading, stated as a hypothesis with its test.** Near convergence
+(`max|dE|` 6.3e−4 eV against a 1e−4 tolerance) a depth-5 rCROP history is nearly
+linearly dependent, so the extrapolation is ill-conditioned and the trial point
+is a badly amplified function of the history. ACONJ's span change makes the
+union's history differ from the SC branch's at the 1e−9 level; an
+ill-conditioned extrapolation can turn that into a materially different trial
+Hamiltonian, and the union's trial landed where the q=0 RPA measure is
+marginally non-positive. That is a threshold crossing at a marginal condition,
+not a systematic degradation — consistent with the stationary receipts, the
+absence of any discrete physics event, the failure being on a trial map, and the
+lack of bias over eleven maps. **It is a hypothesis, and the leg that tests it
+is `sc_accelerator = linear`, which never extrapolates.**
+
+What this does NOT let anyone say: that the union and its parent are
+interchangeable on this deck. They are not — the parent completed 13 maps and
+the union stopped at 11. What the evidence supports is that the difference is a
+marginal threshold crossing amplified by the accelerator, not a shared-pole
+regression.
 
 ### Leg 5 — Na P16 identity, against the campaign's own `810c260b` control
 
