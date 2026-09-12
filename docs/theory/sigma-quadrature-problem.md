@@ -89,7 +89,7 @@ weighted residuals while missing a low-mass Na state at the Fermi level by
 
 ## 4. Rule and error currency
 
-`build_uniform_rule(box, eps, time_budget=...)` chooses the error currency:
+`build_uniform_rule(box, eps)` chooses the error currency:
 
 - sign-definite boxes use `sup |d| |Q(d)-1/d| <= eps` (relative);
 - boxes crossing `Re d=0` use
@@ -114,6 +114,45 @@ cloud's adaptive sampling density, so the statistic remains a function of the
 box and rule only. The planner also requires a maximum separately factored log
 growth of 30. A refusal is final. It does not trigger a hidden tighter-`eps`
 retry or a second quadrature family.
+
+### How the rule is constructed
+
+The two currencies are met by two different constructions, and neither reads
+a clock.
+
+A **crossing** box is solved at a predicted node count. `1/d` on such a box is
+a band-limited object: the rule needs time support `T ~ ln(c/eps)/eta` to
+resolve the peak and about `W T / 2 pi` nodes to cover an effective width `W`,
+where `W` saturates once one real side is much longer than the other because
+the nodes that cover the long side leave the real axis and damp it.
+`minimax.fixed_n_start.predict_nodes` evaluates that count and
+`start_param` places it: node density is the live-band Nyquist spacing
+times a measured profile that rises from 1 to 2 between the head and the tail,
+`Im s` takes the sign that damps the wider real edge and saturates at the
+off-ray cap, and the rule ends at the amplitude floor rather than at the
+horizon. One variable-projection Levenberg-Marquardt solve then polishes the
+placement, and the certificate decides. If it fails the count is raised 10%
+and the placement repeated, which is necessary because the count law was
+fitted on boxes whose reduction converged and therefore reads low on the
+widest ones.
+
+A **sign-definite** box is solved by removal, because `1/d` there is a
+Braess-Hackbusch exponential sum whose count is logarithmic in the corner
+dynamic range and small enough that removal terminates quickly: the
+interpolatory rule at the ray rank is polished, then nodes are removed one at
+a time (in batches while far above the target) with the survivors re-solved,
+until no accepted removal remains. Across the corpus that end is reached in
+0.4-3.0 s, the widest box (`R = 3522`) in 1.6 s.
+
+The reason the two differ is cost, not taste. Removal asks for roughly
+`rank/2` removals times `K` candidate solves times 60-180 LM steps. On a wide
+crossing box that is of order `1e5` solves against a problem whose entire
+content is a few hundred GFLOP, and it does not finish; measured on the widest
+corpus box it was still running after nine minutes. That is what a wall-clock
+budget used to cut short, at the cost of making the delivered node count a
+function of machine load. Placing the count asks for one solve instead, and
+over the 41-box corpus delivers 34.6% fewer crossing nodes than the budgeted
+removal it replaced.
 
 ## 5. Causal conjugation and executor conventions
 
@@ -155,10 +194,13 @@ no campaign-planner route. Numerical policy is carried by three deck keys:
 
 ```
 sigma_quadrature_eps = 1e-4
-sigma_quadrature_reduction_seconds = 120
 sigma_quadrature_cache_dir = auto
 ```
 
-The reduction budget trades planning wall for node count after an accepted
-interpolatory rule exists; it does not weaken `eps`. Retarded broadening is
+There is no reduction budget. A crossing window stops when its placed rule
+meets the certificate and a sign-definite window when its reduction has no
+accepted removal left, so the delivered node count is a function of the box
+and `eps` alone, not of how loaded the machine was. The keys `sigma_quadrature_reduction_seconds` and
+`sigma_quadrature_reduction_steps` are retired, and a deck that still names
+one is refused rather than silently ignored. Retarded broadening is
 `sigma_regularization_ev`, literal for every ansatz; there is no pair ceiling.

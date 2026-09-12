@@ -246,9 +246,11 @@ line.
 
 **15. One quadrature acceptance on every path.** The one-shot planner, the
 fixed-SC initializer and its rebuilds all require the certified sup error at
-or below `sigma_quadrature_eps`; a build that misses gets one retry with five
-times the reduction budget and then refuses, naming the window, its box,
-the achieved sup, the node count and the remedy. The 2026-09-03 bypass
+or below `sigma_quadrature_eps`; a build that misses refuses, naming the
+window, its box, the achieved sup, the node count and the remedy. There is no
+retry: the builder takes no budget, so a second call with the same inputs
+returns the same rule. The retry it replaced existed only because a wall
+clock could cut the first attempt short. The 2026-09-03 bypass
 (`enforce_sup_error=False`) let Na retain a conduction pole-tail rule at
 sup=0.0405 against eps=1e-4 with 906 nodes in every self-consistent arm; its
 actual support has a 24-node rule at eps (sandbox lane QUADCHECK). The cause

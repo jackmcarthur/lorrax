@@ -620,6 +620,18 @@ This is linear in energy bandwidth, not quadratic. Reducing $\eta$ lengthens
 the time interval and can raise the cost nearly in inverse proportion when
 the fitted poles themselves are narrow.
 
+The crossing rule is built by placing this many nodes directly rather than by
+reducing down to them: `minimax.fixed_n_start` predicts $N_\times$ from the
+box, places the nodes at the live-band Nyquist density with $\operatorname{Im}
+s$ damping the wider real edge, polishes once, and raises the count by 10 %
+until the sup certificate is met. Sign-definite windows keep the
+Bremer-Gimbutas-Rokhlin removal, which terminates on its own in 0.4-3.0 s
+because their counts are logarithmic in the corner dynamic range. Neither
+path reads a clock, so the delivered $\tau$-node count is a function of the
+box and $\epsilon$ alone. On the Si $4\times4\times4$ GN-PPM deck this took
+the $\Sigma$ rule plan from 134.7 s to 16.9 s and the $\tau$ nodes from 456
+to 357, moving the quasiparticle energies by at most 11 $\mu$eV.
+
 The pane-control sector and crossing tolerances bound the same dimensionless
 residual $|1-dQ(d)|$. They are frozen comparison constants, not deck controls.
 Historically, loosening only the crossing budget from
@@ -826,7 +838,6 @@ mpa_varpi_far_ry = 2.0
 mpa_pole_batch_size = 4
 
 sigma_quadrature_eps = 1e-4
-sigma_quadrature_reduction_seconds = 120
 sigma_quadrature_cache_dir = auto
 sigma_regularization_ev = 0.25
 sigma_window_edge_factor = 1.5

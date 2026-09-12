@@ -54,7 +54,7 @@ def test_sign_definite_box_is_laplace_cheap():
     # error (the currency of a sign-definite box) with Im d up to 30 eta this
     # is 17 nodes; Hackbusch's real-interval tables give ~12 for R = 200.
     box = (2.0 * ETA, 400.0 * ETA, ETA, 30.0 * ETA)
-    rule = build_uniform_rule(box, 1.0e-4, time_budget=30.0)
+    rule = build_uniform_rule(box, 1.0e-4)
     _check(rule, box, 1.0e-4)
     assert rule.relative
     assert rule.theta_deg < -40.0                        # rotated toward imaginary time
@@ -63,7 +63,7 @@ def test_sign_definite_box_is_laplace_cheap():
 
 def test_negative_sign_definite_box_rotates_the_other_way():
     box = (-100.0 * ETA, -4.0 * ETA, ETA, 20.0 * ETA)
-    rule = build_uniform_rule(box, 1.0e-4, time_budget=30.0)
+    rule = build_uniform_rule(box, 1.0e-4)
     _check(rule, box, 1.0e-4)
     assert rule.relative
     assert rule.theta_deg >= 40.0                        # the scan's grid includes 40 exactly
@@ -74,7 +74,7 @@ def test_crossing_box_count_follows_bandwidth():
     # Symmetric crossing box of real width B = 40 eta: real-time ray,
     # count near the Gauss estimate 0.5*(B/eta)*ln(10/eps)/pi ~= 73 for 1e-4.
     box = (-20.0 * ETA, 20.0 * ETA, ETA, 10.0 * ETA)
-    rule = build_uniform_rule(box, 1.0e-4, time_budget=60.0)
+    rule = build_uniform_rule(box, 1.0e-4)
     _check(rule, box, 1.0e-4)
     assert abs(rule.theta_deg) < 1.0
     assert rule.node_count <= 100                        # interpolatory would be ~150
@@ -86,7 +86,7 @@ def test_wide_crossing_box_does_not_ship_the_rank_on_a_short_budget():
     rank.  Placing the predicted count instead makes a short budget give a
     reduced rule; the certificate is unchanged (runs/DEV/327, lane struct)."""
     box = (-60.0 * ETA, 60.0 * ETA, ETA, 10.0 * ETA)
-    rule = build_uniform_rule(box, 1.0e-4, time_budget=60.0)
+    rule = build_uniform_rule(box, 1.0e-4)
     _check(rule, box, 1.0e-4)
     assert rule.node_count <= 0.75 * rule.rank, (rule.node_count, rule.rank)
 
@@ -147,7 +147,7 @@ def test_random_boxes_never_refuse_and_hold_on_a_finer_cloud():
             hi = ETA * rng.uniform(0.1, 3); lo = -ETA * rng.uniform(10, 45)
         eps = float(rng.choice([1e-3, 1e-4]))
         box = (lo, hi, ETA, im_hi)
-        rule = build_uniform_rule(box, eps, time_budget=2.0)
+        rule = build_uniform_rule(box, eps)
         assert rule.relative == kind.startswith("sd")
         _check(rule, box, eps)
 
@@ -159,7 +159,7 @@ def test_thin_boxes_certify_on_the_dense_boundary():
     a thin tail must hold at its near corner (1.8x eps on main, 2026-09-11)."""
     for box in ((-14.0 * ETA, 22.0 * ETA, ETA, 1.01 * ETA),     # Na B06-like crossing
                 (1.05 * ETA, 240.0 * ETA, ETA, 1.01 * ETA)):    # Na tail-like
-        _check(build_uniform_rule(box, 1.0e-4, time_budget=10.0), box, 1.0e-4)
+        _check(build_uniform_rule(box, 1.0e-4), box, 1.0e-4)
 
 
 def test_far_sign_definite_box_samples_stay_inside_the_box():
@@ -179,26 +179,32 @@ def test_jax_backend_on_cpu_matches_numpy_on_a_small_crossing_box(monkeypatch):
     pytest.importorskip("jax")
     monkeypatch.setenv("JAX_PLATFORMS", "cpu")
     box = (-8.0 * ETA, 8.0 * ETA, ETA, 5.0 * ETA)          # rank ~35: both finish in seconds
-    ref = build_uniform_rule(box, 1.0e-4, time_budget=30.0, backend="numpy")
-    rule = build_uniform_rule(box, 1.0e-4, time_budget=30.0, backend="jax")
+    ref = build_uniform_rule(box, 1.0e-4, backend="numpy")
+    rule = build_uniform_rule(box, 1.0e-4, backend="jax")
     _check(rule, box, 1.0e-4)
     assert abs(rule.node_count - ref.node_count) <= 3, (rule.node_count, ref.node_count)
 
 
-def test_step_budget_is_deterministic_and_ignores_the_clock():
-    """``reduction_steps`` makes the accepted rule a function of the inputs:
-    two builds agree bit for bit, and a wall budget passed alongside is
-    ignored (the same rule again), unlike the wall-clock mode whose node
-    count depends on how far the reduction got before the deadline."""
-    box = (2.0 * ETA, 60.0 * ETA, ETA, 10.0 * ETA)
-    first = build_uniform_rule(box, 1.0e-4, reduction_steps=3)
-    second = build_uniform_rule(box, 1.0e-4, reduction_steps=3)
-    third = build_uniform_rule(box, 1.0e-4, reduction_steps=3, time_budget=1e-3)
-    _check(first, box, 1.0e-4)
-    np.testing.assert_array_equal(first.times, second.times)
-    np.testing.assert_array_equal(first.weights, second.weights)
-    np.testing.assert_array_equal(first.times, third.times)
-    np.testing.assert_array_equal(first.weights, third.weights)
-    # fewer passes cannot reach fewer nodes than more passes
-    more = build_uniform_rule(box, 1.0e-4, reduction_steps=12)
-    assert more.node_count <= first.node_count
+def test_the_rule_is_a_function_of_the_inputs_alone():
+    """No clock, no pass count: two builds of one box agree bit for bit.
+
+    This is the property the wall-clock budget destroyed.  A crossing box
+    stops when its placement certifies and a sign-definite box when its
+    reduction runs out of accepted removals, so neither the machine nor the
+    load can change the delivered node count.
+    """
+    for box in ((2.0 * ETA, 60.0 * ETA, ETA, 10.0 * ETA),     # sign-definite
+                (-14.0 * ETA, 14.0 * ETA, ETA, 4.0 * ETA)):   # crossing
+        first = build_uniform_rule(box, 1.0e-4)
+        second = build_uniform_rule(box, 1.0e-4)
+        _check(first, box, 1.0e-4)
+        np.testing.assert_array_equal(first.times, second.times)
+        np.testing.assert_array_equal(first.weights, second.weights)
+
+
+def test_the_builder_takes_no_budget_argument():
+    """The retired spelling must fail loudly, not be swallowed by **kwargs."""
+    box = (-8.0 * ETA, 8.0 * ETA, ETA, 4.0 * ETA)
+    for dead in ("time_budget", "reduction_steps"):
+        with pytest.raises(TypeError):
+            build_uniform_rule(box, 1.0e-4, **{dead: 10})

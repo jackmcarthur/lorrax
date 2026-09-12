@@ -38,10 +38,11 @@ flips ``Im d`` and leaves the real corners alone.
    and it terminates on the CERTIFICATE, never on a clock.  It exists
    because the reduction below asks for ~``rank/2`` removals times ``K``
    candidates times 60-180 LM steps -- of order 1e5 solves and 100+ TFLOP --
-   on a problem whose whole content is a few hundred GFLOP, so on a wide box
-   it cannot finish and used to ship at the interpolatory rank.
-4. **Reduction** (sign-definite boxes, and any crossing box the placement
-   fails). Bremer-Gimbutas-Rokhlin style: nodes are removed one at a
+   on a problem whose whole content is a few hundred GFLOP.  On a wide box it
+   does not finish (still running after nine minutes on the widest corpus
+   box), so it is not this path's fallback: when the bracket is exhausted the
+   rule is the interpolatory one at the ray rank, polished once.
+4. **Reduction** (sign-definite boxes only). Bremer-Gimbutas-Rokhlin style: nodes are removed one at a
    time (batches while far above the target), the survivors re-solved by a
    variable-projection Levenberg-Marquardt on the CLOUD residual
    ``sum_k w_k exp(i t_k d) - 1/d``.  Candidates are ranked by the
@@ -52,9 +53,9 @@ flips ``Im d`` and leaves the real corners alone.
    the cancellation ratio), ``Im s`` is parametrised as ``c + h tanh(y)`` so
    the off-ray cap is built into the model.  A candidate is kept while the
    sup error on a FINER check cloud stays below ``eps`` and the
-   term-cancellation ratio below ``kappa_cap``.  ``time_budget`` bounds this
-   step and returns the best accepted rule at the deadline — it does not
-   reach step 3, which stops on its certificate.
+   term-cancellation ratio below ``kappa_cap``.  It runs to its natural end,
+   the point where no accepted removal remains, which on a sign-definite box
+   is 0.4-3.0 s.
 
 Why the reduction works on the cloud and not on the SVD moments: the
 truncated SVD model is exact only on the ray, and its dropped tail grows like
@@ -65,8 +66,8 @@ sampled denominators for that reason.
 Counts: a crossing box returns what ``fixed_n_start.predict_nodes`` asks for
 (or the first 10 % rung above it that certifies), roughly ``W T / 2 pi`` for
 an effective width ``W`` and support ``T = ln(c/eps)/eta`` -- measured 34.6 %
-below what the budgeted reduction shipped over the 41-box corpus, and no
-longer a function of how fast the machine is;
+below what the clock-bounded reduction used to ship over the 41-box corpus,
+and not a function of how fast the machine is;
 ``O(log(re_hi/re_lo))`` for a sign-definite box.  The count is set by the box
 width in units of ``eta``, so nothing in this module can go below the
 geometry of the window it is given.
@@ -730,8 +731,8 @@ class _CloudFit:
         """Successive halving: every start gets a short solve (``rank_steps``),
         the ``keep`` best continue to ``nstep`` steps with early exit on
         acceptance; the accepted solve with the smallest residual wins (or
-        None).  A full solve for every candidate would cost ``K`` times the
-        budget per removal; the short solve ranks them well enough."""
+        None).  A full solve for every candidate would cost ``K`` times as
+        much per removal; the short solve ranks them well enough."""
         stop = lambda a, b, r: ok(a, b) and r <= self.eps
         short = []
         for s0 in starts:
@@ -759,12 +760,11 @@ class _CloudFit:
         larger trunc (eps/100) instead -- it costs 4-5 nodes and kappa and
         still misses (measured 2.6e-4 at eps 1e-4 on the Na val:bulk box).
 
-        No deadline is taken: the rounds are bounded by construction (~30 s
-        on an R ~ 1e4 box) and a rule must exist at any budget.  The reduction
-        and the fixed-N fast path share this so they judge a node count the
-        same way -- polishing the placement without the rounds measured +11 %
-        nodes over the corpus, because placements that need them missed and
-        fell through to a reduction with its budget already part spent
+        The rounds are bounded by construction (~30 s on an R ~ 1e4 box).
+        The reduction and the fixed-N placement share this routine so they
+        judge a node count the same way: polishing the placement without the
+        rounds measured +11 % nodes over the corpus, because placements that
+        need them missed and fell through to the reduction
         (run DEV/327, results/ab_fixed_n).
 
         The first accepted state is returned immediately: a further round can
@@ -796,13 +796,15 @@ class _CloudFit:
             accepted = ok(s, w)
         return s, w, accepted
 
-    def reduce(self, s, ok, deadline, batch_frac=0.10, K=6, nstep=60, keep=2,
-               max_steps=None):
-        """Gauss-type reduction with lookahead, bounded by ``deadline`` or,
-        when ``max_steps`` is given, by that many loop passes (a batch
-        attempt or a single-removal round each) -- a budget that depends on
-        the inputs alone, not on the clock, so two machines produce the same
-        rule.
+    def reduce(self, s, ok, batch_frac=0.10, K=6, nstep=60, keep=2):
+        """Gauss-type reduction with lookahead, run to its natural end.
+
+        It stops when no accepted removal remains, which is a property of the
+        inputs, so two machines produce the same rule.  There is no clock and
+        no pass cap: this is reached only on a sign-definite box, where the
+        reduction finishes on its own in 0.4-3.0 s across the corpus -- the
+        widest (R = 3522) in 1.6 s -- and a 120 s budget never once bound.
+        A crossing box does not come here at all; see ``build_uniform_rule``.
 
         The start is first polished to the optimum for its node count; if
         even that is not accepted the caller keeps the interpolatory rule.
@@ -812,24 +814,20 @@ class _CloudFit:
         acceptance would leave a marginal state the single removals inherit.
         Each failed batch halves it.  At batch 1 the ``K`` best leave-one-out
         candidates are tried by successive halving, then the next ``2K``;
-        when neither yields an accepted rule the reduction stops.  ``best`` is
-        always the last accepted state, so the deadline can fall anywhere.
+        when neither yields an accepted rule the reduction stops, and
+        ``best`` -- always the last accepted state -- is what it returns.
 
         Tempting, and why not: single removals from the start (``r`` is ~300
-        on a wide crossing box, and ~150 removals times ``K`` solves never
-        finish in the budget), or a fixed batch (one failure at batch 30
-        would end the batch phase 30 nodes early)."""
-        # The start's acceptance is not subject to the deadline: the budget
-        # bounds the REDUCTION, and a rule must exist at any budget.
+        on a wide crossing box, and ~150 removals times ``K`` solves do not
+        finish -- measured still running after nine minutes on x160_thin1,
+        which is what made this loop unusable there), or a fixed batch (one
+        failure at batch 30 would end the batch phase 30 nodes early)."""
         s, w, accepted = self.polish(s, ok, nstep=nstep)
         if not accepted:
             return None                                             # caller keeps the start
         best = (s.copy(), w.copy())
         batch = max(1, int(batch_frac * s.size))
-        steps = 0
-        while s.size > 2 and time.perf_counter() < deadline and (
-                max_steps is None or steps < int(max_steps)):
-            steps += 1
+        while s.size > 2:
             order = np.argsort(self.loo_scores(s, w))
             if batch > 1:
                 drop, protected = [], set()
@@ -918,7 +916,7 @@ class _JaxCloudFit(_CloudFit):
     for every solve -- a tall-skinny complex QR on the GPU is 5-15 ms, no
     faster than numpy, and the batch does not help cuSOLVER.  (3) Putting the
     removal loop itself inside ``lax.while_loop`` -- the per-removal host
-    decision (leave-one-out ranking, successive halving, deadline) is a few
+    decision (leave-one-out ranking, successive halving) is a few
     hundred microseconds and keeps the numpy ``reduce`` shared, which is what
     keeps the two backends provably the same algorithm.
     """
@@ -1279,8 +1277,7 @@ def _select_backend(backend, n_start, cloud_size):
 
 
 def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
-                       reduce=True, time_budget=None, relative=None,
-                       backend=None, reduction_steps=None):
+                       reduce=True, relative=None, backend=None):
     """Rule for ``1/d`` on ``box = (re_lo, re_hi, im_lo, im_hi)`` with
     ``Im d > 0``.
 
@@ -1306,14 +1303,10 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     off it): the SVD basis is a basis of the ray only, and nodes that wander
     far off it buy accuracy on the fit cloud with growth the check cloud then
     catches.  ``trunc`` is the start rule's extra accuracy (``eps/trunc``).
-    ``kappa_cap`` is the largest cancellation ratio accepted.  ``time_budget``
-    (seconds, from the start of this call) bounds the Gauss REDUCTION and
-    returns the best accepted rule at the deadline; the interpolatory rule is
-    always available after about a second, so the budget trades planning
-    wall for node count and nothing else.  It does NOT reach the crossing
-    placement, which stops on its own certificate — so on a crossing box the
-    node count no longer depends on the clock, and passing a budget there
-    changes nothing unless the placement fails and the reduction takes over.
+    ``kappa_cap`` is the largest cancellation ratio accepted.  Nothing here
+    reads a clock: a crossing box stops when its placement certifies and a
+    sign-definite box when its reduction runs out of accepted removals, so
+    the same inputs give the same rule on any machine and at any load.
     Never refuses a finite box.
     ``backend`` (``numpy`` | ``jax`` | ``auto``, default the environment's
     ``LORRAX_UNIFORM_RULE_BACKEND`` or ``numpy`` when unset) chooses where
@@ -1368,8 +1361,6 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
         def sup_ratio(s_, w_):
             return check.sup(fam.phase * s_, w_, relative)[0] / eps
 
-        budget = (float(time_budget)
-                  if time_budget is not None and reduction_steps is None else 1e30)
         # The start must be accepted before anything can be removed.  In the
         # relative currency a loose eps (1e-3) with the default eps/10 basis
         # can leave the near corner of a wide box (R ~ 500) above eps even
@@ -1382,13 +1373,15 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
         # times 60-180 LM steps -- of order 10^5 solves, 100+ TFLOP, on a
         # problem whose whole content is a few hundred GFLOP (the cloud is
         # 141-3256 points and the ray grid 185-1754, so one least-squares is
-        # 0.1-3 GFLOP and the family SVD at most 0.06 TFLOP).  It cannot
-        # finish, which is the only reason a wall-clock budget was ever needed
-        # and why the widest boxes shipped at the interpolatory rank.
+        # 0.1-3 GFLOP and the family SVD at most 0.06 TFLOP).  It does not
+        # finish on a wide box, and cutting it short with a clock was the
+        # whole reason this function used to take a wall-clock budget -- a
+        # parameter that made the delivered node count a function of machine
+        # load, which is how a quadrature rule stopped being reproducible.
         #
-        # Placing the count directly asks for ONE solve, so the budget stops
-        # being load bearing: this path terminates on the certificate, never
-        # on a clock, and the same inputs give the same rule on any machine.
+        # Placing the count asks for ONE solve instead, so the clock is not
+        # needed and is gone: this path stops on its certificate and the same
+        # inputs give the same rule on any machine at any load.
         # Measured against this same builder with the path removed, 41 boxes
         # paired on one node at 16 threads:
         #     crossing nodes 2186 against 3341, -34.6 %
@@ -1436,26 +1429,37 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
                 if n_k >= fam.r:
                     break
                 n_k = int(np.ceil(n_k * _FIXED_N_GROWTH))
-        # ``reduction_steps`` makes the budget a pass count: the clock is
-        # ignored and the same inputs give the same rule on any machine.
-        deadline = t0 + budget
-        for extra in (1.0, 10.0, 100.0):
-            if red is not None:
-                break
-            if extra > 1.0:
-                fam = _RayFamily(d, theta, S, eps / (trunc * extra), rho)
-                s, w = fam.interpolatory()
-            # the cloud solver works in the executor's convention t = phase*s
-            # with weights -i*phase*w: the sup test uses exactly that map
-            if _select_backend(backend, w.size, d.size) == "jax":
-                fit = _JaxCloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w,
-                                   rho=rho, check_cloud=(check.d, rho_of(check.d), eps, kappa_cap))
-            else:
-                fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w, rho=rho)
-            red = fit.reduce(s, ok, deadline,       # start acceptance ignores the budget
-                             max_steps=reduction_steps)
-            if red is not None:
-                break
+            if red is None:
+                # The bracket is the whole crossing path: the reduction is NOT
+                # its fallback.  Removing one node at a time with a
+                # K-candidate lookahead does not finish on a box this wide
+                # (measured still running after nine minutes on x160_thin1),
+                # and needing a clock to cut that short is what put a
+                # wall-clock budget in this function in the first place.  The
+                # interpolatory rule at the ray rank, polished once, is
+                # bounded by construction and is what the budgeted reduction
+                # actually shipped on these boxes anyway.
+                fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps,
+                                w_ref=w, rho=rho)
+                s_r, w_r, accepted = fit.polish(s, ok)
+                if accepted:
+                    red = (s_r, w_r)
+        else:
+            for extra in (1.0, 10.0, 100.0):
+                if extra > 1.0:
+                    fam = _RayFamily(d, theta, S, eps / (trunc * extra), rho)
+                    s, w = fam.interpolatory()
+                # the cloud solver works in the executor's convention
+                # t = phase*s with weights -i*phase*w: the sup test uses
+                # exactly that map
+                if _select_backend(backend, w.size, d.size) == "jax":
+                    fit = _JaxCloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w,
+                                       rho=rho, check_cloud=(check.d, rho_of(check.d), eps, kappa_cap))
+                else:
+                    fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w, rho=rho)
+                red = fit.reduce(s, ok)
+                if red is not None:
+                    break
         if red is not None:
             s, w_fit = red
             times, weights = fam.phase * s, w_fit          # A w - b = scale (Q - 1/d): w is the rule weight

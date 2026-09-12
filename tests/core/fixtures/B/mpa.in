@@ -20,7 +20,6 @@ sigma_omega_patches_ev = -12:0, 1:12
 sigma_omega_step_ev = 1
 sigma_regularization_ev = 0.25
 sigma_quadrature_eps = 1e-3
-sigma_quadrature_reduction_seconds = 20
 write_restart_tensors = true
 write_qsgw_datasets = true
 sigma_freq_debug_output = false

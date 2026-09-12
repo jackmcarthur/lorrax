@@ -1751,15 +1751,6 @@ _DEFAULTS = {
     # by default; "off" disables caching and any other spelling is a path
     # (relative paths are resolved beside the input deck).
     "sigma_quadrature_eps": 1.0e-4,
-    "sigma_quadrature_reduction_seconds": 120.0,
-    # Deterministic alternative to the wall budget: an integer number of
-    # reduction passes per window.  Unset keeps the wall budget; set, the
-    # clock is ignored and the accepted rule (hence the Σ τ-node count) is
-    # a function of the deck alone.  0 = the polished interpolatory start
-    # (seconds of planning, more τ nodes): the fast A/B setting.  On Si
-    # 4x4x4 one pass costs ~33 s of planning per run (30 passes: 985 s,
-    # 378 nodes; the 120 s wall budget reached ~474 nodes).
-    "sigma_quadrature_reduction_steps": None,
     "sigma_quadrature_cache_dir": "auto",
     # OCCUPANCY at which a band leaves a metallic Green's-function branch.
     # The Σ planner cuts on the branch WEIGHT (f on val, 1−f on cond), so
@@ -2027,7 +2018,6 @@ _NULLABLE_BOOL = frozenset({
 _NULLABLE_INT = frozenset({
     "zeta_nband",
     "mpa_sampling_alpha",
-    "sigma_quadrature_reduction_steps",
     # The band-count family's three "the deck did not say" slots.  They are
     # nullable for the same reason ``zeta_nband`` is — ``None`` has to be
     # distinguishable from any integer a deck could write — and integer for
@@ -2549,11 +2539,6 @@ def _input_response(
         window_edge_factor=float(params["sigma_window_edge_factor"]),
         fermi_reference=str(params["fermi_reference"]).strip().lower(),
         quadrature_eps=float(params["sigma_quadrature_eps"]),
-        quadrature_reduction_seconds=float(
-            params["sigma_quadrature_reduction_seconds"]),
-        quadrature_reduction_steps=(
-            None if params["sigma_quadrature_reduction_steps"] is None
-            else int(params["sigma_quadrature_reduction_steps"])),
         quadrature_cache_dir=str(
             params["sigma_quadrature_cache_dir"]).strip(),
         sigma_at_dft_extrapolate=bool(params["sigma_at_dft_extrapolate"]),
@@ -2974,15 +2959,25 @@ def _report_early_retired_keys(
             "the key; stored, folded, and ISDF Hartree paths no longer "
             "exist."
         )
+    for legacy_key in ("sigma_quadrature_reduction_seconds",
+                       "sigma_quadrature_reduction_steps"):
+        if section.get(legacy_key, fallback=None) is not None:
+            raise ValueError(
+                f"Input key '{legacy_key}' is retired: the Sigma box-rule "
+                "builder no longer takes a budget of any kind.  A crossing "
+                "window stops when its placement meets the certificate and a "
+                "sign-definite window when its reduction runs out of accepted "
+                "removals, so the delivered node count is a function of the "
+                "deck alone and no longer of how loaded the machine was.  "
+                "Remove the key; sigma_quadrature_eps still sets the accuracy."
+            )
     for legacy_key in ("ppm_sigma_target_error", "ppm_sigma_max_nodes"):
         if section.get(legacy_key, fallback=None) is not None:
             raise ValueError(
                 f"Input key '{legacy_key}' is retired: GN/HL-PPM now "
                 "writes a one-pole MPA store and uses the shared dynamic "
                 "Sigma route. Remove the key and use "
-                "sigma_quadrature_eps, "
-                "sigma_quadrature_reduction_seconds, "
-                "sigma_quadrature_cache_dir."
+                "sigma_quadrature_eps, sigma_quadrature_cache_dir."
             )
     return (retired)
 
@@ -3736,9 +3731,6 @@ class DynamicSigmaConfig:
     #: Uniform denominator-box policy for dynamic Sigma quadrature.  The
     #: cache spelling is "auto" (run tmp), "off", or a deck-relative path.
     quadrature_eps: float = 1.0e-4
-    quadrature_reduction_seconds: float = 120.0
-    #: ``None`` = wall budget; an integer = deterministic pass budget.
-    quadrature_reduction_steps: int | None = None
     quadrature_cache_dir: str = "auto"
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
     #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
@@ -3789,15 +3781,6 @@ class DynamicSigmaConfig:
                 "fermi_reference must be 'vbm', 'midgap' or 'mp1_fixed_n'.")
         if not 0.0 < self.quadrature_eps < 1.0:
             raise ValueError("sigma_quadrature_eps must lie in (0, 1).")
-        if not (np.isfinite(self.quadrature_reduction_seconds)
-                and self.quadrature_reduction_seconds > 0.0):
-            raise ValueError(
-                "sigma_quadrature_reduction_seconds must be finite and > 0.")
-        if self.quadrature_reduction_steps is not None and (
-                int(self.quadrature_reduction_steps) < 0):
-            raise ValueError(
-                "sigma_quadrature_reduction_steps must be >= 0 when set "
-                "(0 = the polished interpolatory start, no reduction).")
         if not str(self.quadrature_cache_dir).strip():
             raise ValueError(
                 "sigma_quadrature_cache_dir must be 'auto', 'off', or a path.")

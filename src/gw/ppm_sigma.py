@@ -978,10 +978,6 @@ def compute_sigma_c_ppm_omega_grid(
         regularization_width_ry=regularization_width_ry,
         edge_factor=float(sigma_cfg.window_edge_factor),
         quadrature_eps=float(sigma_cfg.quadrature_eps),
-        quadrature_reduction_seconds=float(
-            sigma_cfg.quadrature_reduction_seconds),
-        quadrature_reduction_steps=getattr(
-            sigma_cfg, "quadrature_reduction_steps", None),
         quadrature_cache_dir=quadrature_cache_dir,
         omega_grid_step_ry=float(sigma_cfg.omega_step_ev) / RYD_TO_EV,
         pole_batch_size=int(mpa_cfg.pole_batch_size),

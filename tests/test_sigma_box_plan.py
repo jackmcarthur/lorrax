@@ -70,7 +70,7 @@ def _plan(monkeypatch, branch=None, **kwargs):
              else branch.omega_abs)
     return plan_sigma_windows(
         _summaries(), [branch], omega, 0.1,
-        eps=1.0e-4, reduction_seconds=120.0,
+        eps=1.0e-4,
         cache_dir=None, print_fn=lambda *_args, **_kwargs: None,
         **kwargs)
 
@@ -154,7 +154,7 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
 
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
     args = dict(
-        eps=1.0e-4, reduction_seconds=120.0,
+        eps=1.0e-4,
         cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
     first, first_geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
@@ -184,7 +184,7 @@ def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
     session = {}
     args = dict(
-        eps=1.0e-4, reduction_seconds=120.0, cache_dir=None,
+        eps=1.0e-4, cache_dir=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
     first, first_geometry = plan_sigma_windows(
@@ -227,7 +227,7 @@ def test_sc_fixed_session_rebuilds_an_escaped_window_and_counts_it(monkeypatch):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
     session = {}
     args = dict(
-        eps=1.0e-4, reduction_seconds=120.0, cache_dir=None,
+        eps=1.0e-4, cache_dir=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
     plan_sigma_windows(
@@ -269,7 +269,7 @@ def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
     session = {}
     args = dict(
-        eps=1.0e-4, reduction_seconds=120.0, cache_dir=None,
+        eps=1.0e-4, cache_dir=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
     _, first_geometry = plan_sigma_windows(
@@ -315,7 +315,7 @@ def test_sc_fixed_session_rebuilds_a_window_absent_from_iteration_one(
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
     session = {}
     args = dict(
-        eps=1.0e-4, reduction_seconds=120.0, cache_dir=None,
+        eps=1.0e-4, cache_dir=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
     _first, first_geometry = plan_sigma_windows(
@@ -358,47 +358,35 @@ def test_sc_rule_padding_scales_with_state_energy_and_ten_percent_on_poles():
     assert padded["sc_pole_pad_fraction"] == 0.10
 
 
-def test_fixed_sc_refuses_a_rule_above_eps_after_one_retry(monkeypatch):
+def test_fixed_sc_refuses_a_rule_above_eps_without_retrying(monkeypatch):
+    """A refusal is now a statement about the box, not about the clock.
+
+    The builder takes no budget, so calling it again with the same inputs
+    returns the same rule; the 5x-budget retry this replaced existed only
+    because the first attempt could have been cut short by a deadline.
+    """
     import dataclasses
     calls = []
 
     def diagnostic_above_eps(box, eps, **kwargs):
-        calls.append(float(kwargs.get("time_budget", -1.0)))
+        calls.append(kwargs)
         return dataclasses.replace(
             _fake_rule(box, eps, **kwargs), sup_error=5.5 * eps)
 
     monkeypatch.setattr(
         "gw.sigma_box_plan.build_uniform_rule", diagnostic_above_eps)
-    with pytest.raises(RuntimeError, match="5x-budget retry achieved") as err:
+    with pytest.raises(RuntimeError, match="exceeds eps") as err:
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-            eps=1.0e-4, reduction_seconds=120.0,
+            eps=1.0e-4,
             cache_dir=None, fixed_rule_session={},
             print_fn=lambda *_args, **_kwargs: None)
     assert "do not loosen sigma_quadrature_eps" in str(err.value)
-    # the retry used five times the budget before refusing
-    assert 600.0 in calls and 120.0 in calls
-
-
-def test_fixed_sc_accepts_the_retry_when_it_meets_eps(monkeypatch):
-    import dataclasses
-
-    def meets_eps_with_more_time(box, eps, **kwargs):
-        good = float(kwargs.get("time_budget", 0.0)) >= 600.0
-        return dataclasses.replace(
-            _fake_rule(box, eps, **kwargs),
-            sup_error=(0.5 * eps if good else 5.5 * eps))
-
-    monkeypatch.setattr(
-        "gw.sigma_box_plan.build_uniform_rule", meets_eps_with_more_time)
-    plan, geometry = plan_sigma_windows(
-        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-        eps=1.0e-4, reduction_seconds=120.0,
-        cache_dir=None, fixed_rule_session={},
-        print_fn=lambda *_args, **_kwargs: None)
-    assert len(plan) == 3
-    assert all(row["sup_error"] == pytest.approx(0.5e-4)
-               for row in geometry["branches"][0]["windows"])
+    assert not any("time_budget" in kw or "reduction_steps" in kw
+                   for kw in calls)
+    # Three windows, three builder calls: one each, nothing tried twice.
+    # The retry this replaced would have made it six.
+    assert len(calls) == 3
 
 
 def test_sc_pad_keeps_a_sign_definite_support_sign_definite():
@@ -425,7 +413,7 @@ def test_one_shot_preserves_the_historical_sup_error_refusal(monkeypatch):
     with pytest.raises(RuntimeError, match="rule sup error"):
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-            eps=1.0e-4, reduction_seconds=120.0,
+            eps=1.0e-4,
             cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
 
 
@@ -442,7 +430,7 @@ def test_crossing_noise_gate_uses_peak_relative_term_mass(monkeypatch):
         "gw.sigma_box_plan.build_uniform_rule", large_relative_kappa)
     plan, geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-        eps=1.0e-4, reduction_seconds=120.0,
+        eps=1.0e-4,
         cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
     assert len(plan) == 3
     assert geometry["branches"][0]["windows"][0]["kappa_max"] == 1.0e6
@@ -468,7 +456,7 @@ def test_executor_noise_gate_refuses_large_term_mass(monkeypatch):
     with pytest.raises(RuntimeError, match="runtime-noise"):
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-            eps=1.0e-4, reduction_seconds=120.0,
+            eps=1.0e-4,
             cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
 
 
@@ -482,7 +470,7 @@ def test_sign_definite_builder_receives_executor_noise_cap(monkeypatch):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", conditioned)
     plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-        eps=1.0e-4, reduction_seconds=120.0,
+        eps=1.0e-4,
         cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
     expected = (0.05 * 1.0e-4) / (6.0e-8 * (1.0 + 1.0e-4))
     crossing = [kwargs for box, kwargs in calls if box[0] <= 0.0 <= box[1]]
@@ -499,7 +487,7 @@ def test_cache_rule_missing_active_noise_cap_does_not_shadow_builder(
         monkeypatch, tmp_path):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
     args = dict(
-        eps=1.0e-4, reduction_seconds=120.0,
+        eps=1.0e-4,
         cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
     plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
@@ -538,7 +526,7 @@ def test_corrupt_cache_entry_is_announced_and_repaired(
         monkeypatch, tmp_path):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
     args = dict(
-        eps=1.0e-4, reduction_seconds=120.0,
+        eps=1.0e-4,
         cache_dir=str(tmp_path))
     plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
@@ -577,7 +565,7 @@ def test_each_cache_write_failure_is_announced_without_rejecting_rule(
     lines = []
     plan, geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-        eps=1.0e-4, reduction_seconds=120.0,
+        eps=1.0e-4,
         cache_dir=str(tmp_path), print_fn=lines.append)
 
     assert len(plan) == 3
@@ -596,7 +584,7 @@ def test_no_pair_ceiling(monkeypatch):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
     plan, geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-        eps=1.0e-4, reduction_seconds=120.0,
+        eps=1.0e-4,
         cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
     assert "pair_ceiling" not in geometry and geometry["window_tau_pairs"] > 5
 
@@ -669,19 +657,26 @@ def test_quadrature_deck_defaults_and_retired_sector_key(tmp_path):
     config = LorraxConfig.from_input_file(
         str(deck), print_fn=lambda *_args, **_kwargs: None)
     assert config.sigma.quadrature_eps == 1.0e-4
-    assert config.sigma.quadrature_reduction_seconds == 120.0
     assert config.sigma.quadrature_cache_dir == "auto"
 
     deck.write_text(
         _DECK
         + "sigma_quadrature_eps = 2e-4\n"
-        + "sigma_quadrature_reduction_seconds = 30\n"
         + "sigma_quadrature_cache_dir = off\n")
     config = LorraxConfig.from_input_file(
         str(deck), print_fn=lambda *_args, **_kwargs: None)
     assert config.sigma.quadrature_eps == 2.0e-4
-    assert config.sigma.quadrature_reduction_seconds == 30.0
     assert config.sigma.quadrature_cache_dir == "off"
+
+    # A deck that still names a reduction budget is refused, not ignored:
+    # the builder has no budget of any kind and silently dropping the key
+    # would leave the deck author believing it did something.
+    for retired in ("sigma_quadrature_reduction_seconds = 30",
+                    "sigma_quadrature_reduction_steps = 8"):
+        deck.write_text(_DECK + retired + "\n")
+        with pytest.raises(ValueError, match="retired"):
+            LorraxConfig.from_input_file(
+                str(deck), print_fn=lambda *_args, **_kwargs: None)
 
     deck.write_text(_DECK + "mpa_sigma_sector_target_error = 1e-4\n")
     with pytest.raises(ValueError, match="retired.*sigma_quadrature_eps"):
@@ -709,34 +704,31 @@ def test_nan_weights_with_finite_sup_are_not_a_certificate(monkeypatch):
     with pytest.raises(RuntimeError, match="is not finite"):
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-            eps=1.0e-4, reduction_seconds=120.0,
+            eps=1.0e-4,
             cache_dir=None, fixed_rule_session={},
             print_fn=lambda *_args, **_kwargs: None)
 
 
-def test_infinite_sup_retries_then_refuses_naming_the_retry(monkeypatch):
+def test_infinite_sup_refuses_and_names_the_value(monkeypatch):
     import dataclasses
-    budgets = []
 
     def broken(box, eps, **kwargs):
-        budgets.append(float(kwargs.get("time_budget", -1.0)))
         return dataclasses.replace(
             _fake_rule(box, eps, **kwargs), sup_error=float("inf"))
 
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", broken)
-    with pytest.raises(RuntimeError, match="5x-budget retry achieved") as err:
+    with pytest.raises(RuntimeError, match="exceeds eps") as err:
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-            eps=1.0e-4, reduction_seconds=120.0,
+            eps=1.0e-4,
             cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
-    assert 600.0 in budgets
     assert "inf" in str(err.value)
 
 
 def test_cache_store_refuses_a_non_finite_rule(tmp_path):
     import dataclasses
     from gw.sigma_box_plan import _rule_cache_store
-    rule = _fake_rule((-2.0, -0.3, 0.05, 0.4), 1.0e-4, time_budget=1.0)
+    rule = _fake_rule((-2.0, -0.3, 0.05, 0.4), 1.0e-4)
     bad = dataclasses.replace(
         rule, times=np.array(rule.times, dtype=np.complex128) * np.nan)
     warning = _rule_cache_store(str(tmp_path), bad, 1.0)
@@ -748,7 +740,7 @@ def test_cache_lookup_prefers_a_certified_larger_rule_over_a_bad_smaller_one(tmp
     import dataclasses
     from gw.sigma_box_plan import _rule_cache_lookup, _rule_cache_store
     box = (-2.0, -0.3, 0.05, 0.4)
-    good = _fake_rule(box, 1.0e-4, time_budget=1.0)
+    good = _fake_rule(box, 1.0e-4)
     small_bad = dataclasses.replace(
         good, times=np.array(good.times[:2]), weights=np.array(good.weights[:2]),
         sup_error=0.04)
