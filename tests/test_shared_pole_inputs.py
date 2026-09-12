@@ -166,7 +166,9 @@ def fixture(*, metal=False, eta=.25, tier='production', plasma_seed=10., box=(-5
     state = NS(f_kn=occ,mu_ry=0.,smearing_family='fixed') if metal else None
     seed_electrons = 1. if metal else 2.
     volume = 4*np.pi*seed_electrons / ((plasma_seed/RYD_TO_EV/2)**2)
-    meta = NS(nspin=1,nspinor=1,n_rmu=17,nk_tot=2,cell_volume=volume)
+    # b_id_4_chi_user is what response_weights masks the screening bands by;
+    # the resolver now reaches the bank's own window partitioner through it.
+    meta = NS(nspin=1,nspinor=1,n_rmu=17,nk_tot=2,cell_volume=volume,b_id_4_chi_user=3)
     bind_shared_pole_census(wf,meta,occupation_state=state,trs_allowed=True,state_capacity=2.,kweights=[.5,.5])
     # Resolver inputs carry the already-resolved positive device budget (R24).
     config = NS(sigma=NS(w_model='shared_pole',w_accuracy=tier,regularization_ev=eta,
@@ -230,6 +232,48 @@ def test_active_set_fixed_point_admits_a_deep_band():
     assert deep['active_depth_ev']==pytest.approx(20)
     assert deep['omega_fine_ev']==pytest.approx(16.5*np.sqrt(2))
     assert deep['census']['borderline_bands']==[]
+
+
+def test_remote_domain_cap_limits_every_emitted_sample():
+    """A deck with a remote Laplace cell caps BOTH the line top and u_max.
+
+    The bank expands its remote cells about the lowest transition edge and
+    refuses a sample outside that Taylor domain (`response_laplace_rule`), so
+    the recipe -- which is what emits samples -- asks the bank's own
+    partitioner where the edge is and stays inside it. Without the cap this
+    deck would emit u_max = 58.3 eV against an edge at 37 eV and the bank
+    would refuse the run, which is what happened on Si P4 (job 58217047.5).
+    """
+    import minimax
+    # One occupied band at -36 eV, past response_windows' -35 eV near edge, so
+    # a remote cell forms with delta_lo = (lowest empty) - (deepest occupied).
+    energies = np.array([[-36., -20., -1., 1.], [-36., -20., -1., 2.]])/RYD_TO_EV
+    occ = np.array([[1., 1., 1., 0.]]*2)
+    wf = NS(enk=energies, occ=occ,
+            slices=NS(b0=0, b4_logical=4, val=slice(0, 3), cond_all_logical=slice(3, 4)))
+    volume = 4*np.pi*2/((16.5/RYD_TO_EV/2)**2)
+    meta = NS(nspin=1, nspinor=1, n_rmu=17, nk_tot=2, cell_volume=volume,
+              b_id_4_chi_user=4)
+    bind_shared_pole_census(wf, meta, occupation_state=None, trs_allowed=True,
+                            state_capacity=2., kweights=[.5, .5])
+    config = NS(sigma=NS(w_model='shared_pole', w_accuracy='production',
+                         regularization_ev=.25, omega_min_ev=-5., omega_max_ev=5.,
+                         parsed_omega_patches_ev=list),
+                memory=NS(per_device_gb=30.))
+    r = resolve((config, wf, meta))
+    edge = r['remote_delta_lo_ev']
+    assert edge == pytest.approx(37.0, abs=1e-9)      # 1 - (-36)
+    # The ceiling is the bank's, not a local constant: same call, same answer.
+    cap = minimax.response_remote_max_abs_z(edge/RYD_TO_EV, r['height_ry'],
+                                            r['bank_rule_tolerance'])*RYD_TO_EV
+    assert r['remote_cap_ev'] == pytest.approx(cap)
+    assert r['top_bound_by'] == 'remote_cap' and r['u_max_bound_by'] == 'remote_cap'
+    # u_max is the radius itself; the line top is its real part at height h.
+    assert r['u_max_ev'] == pytest.approx(cap)
+    assert r['top_ev'] == pytest.approx(np.sqrt(cap**2 - r['height_ev']**2))
+    # Both uncapped rules wanted more, and every emitted sample is now inside.
+    assert r['top_uncapped_ev'] > cap and r['u_max_uncapped_ev'] > cap
+    assert np.all(np.abs(r['z_ry'])*RYD_TO_EV <= cap*(1+1e-12))
 
 
 def test_sigma_window_can_set_the_top():

@@ -24,7 +24,8 @@ def inputs(gap=.7, *, eta=.25, tier="production", plasma_seed=10.):
               slices=NS(b0=0, b4_logical=3, val=slice(0, 2),
                         cond_all_logical=slice(2, 3)))
     volume = 4*np.pi*2 / ((plasma_seed/RYD_TO_EV/2)**2)
-    meta = NS(nspin=1, nspinor=1, n_rmu=17, nk_tot=2, cell_volume=volume)
+    meta = NS(nspin=1, nspinor=1, n_rmu=17, nk_tot=2, cell_volume=volume,
+              b_id_4_chi_user=3)
     rebind(wfns, meta)
     return config, wfns, meta
 

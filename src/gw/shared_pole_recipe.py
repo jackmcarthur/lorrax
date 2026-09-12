@@ -56,6 +56,14 @@ shared_real_pole_v2_r1 = {
     # Zolotarev count turns over at kappa = 16.096, and 2.5*omega_fine leaves
     # Na at 3 nodes (kappa 15.12) and Si at 4 (kappa 41.5).
     "imaginary_top_factor": 2.5,
+    # The bank's remote Laplace cells expand about their lowest transition
+    # edge, and that expansion has a convergence domain the SAMPLE PLAN must
+    # respect: a support above it is refused by response_laplace_rule with an
+    # instruction to repartition that the bank owner never acts on (ARECIPE,
+    # Si P4, job 58217047.5/.6).  The ceiling is not a dial here -- it is read
+    # from the bank's own order budget through minimax.response_remote_max_*,
+    # so there is exactly one owner of the convergence math.
+    "remote_domain_rule": "every emitted |z| <= minimax.response_remote_max_abs_z(min cell delta_lo, h)",
     "imaginary_count_epsilon": 1.0e-3,
     "imaginary_min_count": 2,
     "imaginary_count_rule": "max(2, round(log(16*(u_max/u_min)^2)*log(4000)/(2*pi^2)))",
@@ -556,6 +564,28 @@ def _sigma_extent_ev(config):
     return max(abs(float(e)) for e in edges)
 
 
+def _remote_domain_cap(wfns, meta, census, eta_ry, rel_tol):
+    """Largest sample |z| in eV the bank's remote cells admit, and that edge.
+
+    ONE PARTITIONER. ``response_windows`` is the bank's own near/remote split
+    and needs only bands, occupations and mu -- exactly what this resolver
+    already has -- so it is called, not reimplemented; ``minimax`` owns the
+    convergence predicate and answers the radius. Returns ``(None, None)``
+    when the deck has no remote cell, in which case no sample can be refused.
+    """
+    from common.units import RYD_TO_EV
+    from minimax import response_remote_max_abs_z
+    from .response_bank import response_weights, response_windows
+    energy, f, u, _reference, _receipt = response_weights(wfns, meta)
+    _masks, _ft, _ut, cells, _window_receipt = response_windows(
+        energy, f, u, chemical_potential_ry=census['mu_ry'])
+    if not cells:
+        return None, None
+    delta_lo = min(float(cell['delta_min_ry']) for cell in cells)
+    cap = response_remote_max_abs_z(delta_lo, eta_ry, rel_tol)
+    return cap * RYD_TO_EV, delta_lo * RYD_TO_EV
+
+
 def _support_report(r, tier, census):
     """The human-readable resolved support geometry, for the run log.
 
@@ -586,13 +616,22 @@ def _support_report(r, tier, census):
         f"{r['sigma_extent_ev']:.3f} + active depth {r['active_depth_ev']:.3f}",
         f"  Top support         : {r['top_ev']:.3f} eV, set by {bound}",
         f"                        max(2.25*omega_fine = {plasmon_term:.3f}, "
-        f"1.25*Sigma window = {window_term:.3f})",
+        f"1.25*Sigma window = {window_term:.3f})"
+        + ("" if r.get('remote_cap_ev') is None else
+           f", capped at {r['remote_cap_ev']:.3f}"),
         f"  Line supports       : {r['line_count']} -- step {r['line_step_ev']:.3f} eV "
         f"(2*eta) to {r['omega_fine_ev']:.3f} eV, then x"
         f"{1.0 + r['line_growth_fraction']:.2f} per step to {r['top_ev']:.3f} eV",
         f"  Imaginary supports  : {r['imaginary_count']} -- {r['u_min_ev']:.3f} to "
-        f"{r['u_max_ev']:.3f} eV, log-spaced (kappa = {r['kappa']:.1f})",
+        f"{r['u_max_ev']:.3f} eV, log-spaced (kappa = {r['kappa']:.1f}), "
+        f"u_max set by the {r.get('u_max_bound_by', 'zolotarev')} rule"
+        + ("" if r.get('u_max_bound_by') != 'remote_cap' else
+           f" (Zolotarev would have asked {r['u_max_uncapped_ev']:.3f})"),
         f"  Sample height       : {r['height_ev']:.3f} eV = 4*eta",
+        ("  Bank remote domain  : |z| <= %.3f eV, from the lowest remote cell "
+         "edge %.3f eV" % (r['remote_cap_ev'], r['remote_delta_lo_ev'])
+         if r.get('remote_cap_ev') is not None else
+         "  Bank remote domain  : no remote cell; no sample ceiling"),
         "  Bank cost grows with the top support and as 1/height: widening",
         "  sigma_omega_min_ev/max_ev, or adding a sigma_omega_patches_ev",
         "  window over a semicore state, raises the top support with it.",
@@ -835,7 +874,47 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     top = top_terms[top_bound_by]
     step = policy.get('line_step_eta_factor', recipe['line_step_eta_factor']) * eta
     growth = policy.get('line_growth_fraction', recipe['line_growth_fraction'])
-    umin, umax = max(height, census['gap_ev']), recipe['imaginary_top_factor'] * fine
+    umin = max(height, census['gap_ev'])
+    umax_zolotarev = recipe['imaginary_top_factor'] * fine
+    # THE BANK'S DOMAIN IS A CEILING ON EVERY SAMPLE.  Reuse the bank's own
+    # partitioner -- response_windows needs only bands, occupations and mu, the
+    # same inputs this resolver already uses -- so there is one near/remote
+    # partition in the tree, not a copy of one here; then ask minimax for the
+    # largest |z| its remote Taylor rule can certify for the lowest cell.
+    remote_cap_ev, remote_delta_lo_ev = _remote_domain_cap(
+        wfns, meta, census, height / RYD_TO_EV, recipe['bank_rule_tolerance'])
+    top_uncapped, umax_uncapped = top, umax_zolotarev
+    if remote_cap_ev is not None:
+        # The ceiling is on |z|. An imaginary sample has |z| = u exactly, but a
+        # line sample sits at E + i*h, so the admissible REAL part is
+        # sqrt(cap^2 - h^2) -- capping E at the radius would put the last
+        # support just outside the domain it was capped to.
+        line_cap_ev = math.sqrt(max(remote_cap_ev**2 - height**2, 0.0))
+        if line_cap_ev < top:
+            top, top_bound_by = line_cap_ev, 'remote_cap'
+        if remote_cap_ev < umax_zolotarev:
+            umax_zolotarev = remote_cap_ev
+    umax = umax_zolotarev
+    u_max_bound_by = ('remote_cap' if remote_cap_ev is not None
+                      and umax <= remote_cap_ev * (1 + 1e-12)
+                      and umax < recipe['imaginary_top_factor'] * fine * (1 - 1e-12)
+                      else 'zolotarev')
+    if remote_cap_ev is not None and remote_cap_ev < sigma_window:
+        # NOT something the recipe may paper over: the deck is asking Sigma for
+        # W at frequencies the bank cannot serve at all, so the near window has
+        # to grow (bank owner) or the Sigma grid has to shrink (deck).
+        print_fn(
+            "\n  ==========================================================\n"
+            "  WARNING: the Sigma grid reaches W at "
+            f"{sigma_window:.3f} eV, ABOVE the bank's remote Taylor domain\n"
+            f"  ({remote_cap_ev:.3f} eV, set by the lowest remote cell edge "
+            f"{remote_delta_lo_ev:.3f} eV).\n"
+            "  The shared-pole support is capped there, so W above it is\n"
+            "  carried by M1/M3 alone and the Sigma box samples an\n"
+            "  unconstrained region.  Fix by growing the bank's near window\n"
+            "  (repartition, KNOWN_LORRAX_ISSUES) or narrowing\n"
+            "  sigma_omega_min_ev/max_ev; the recipe cannot resolve it.\n"
+            "  ==========================================================")
     if umin >= umax:
         raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
     support_receipt = None
@@ -855,7 +934,17 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     # fit's pointwise support, where the model is unconstrained and the
     # accuracy cliff lives -- is silent in every other receipt (ASIMOM 2026-09-11).
     required_top = recipe['sigma_window_top_factor'] * sigma_window
-    if top < required_top * (1.0 - 1.0e-12):
+    capped = remote_cap_ev is not None and top <= remote_cap_ev * (1.0 + 1.0e-12)
+    if capped and top < required_top * (1.0 - 1.0e-12) and top >= sigma_window:
+        # The bank's domain trimmed the design margin but still covers every W
+        # frequency Sigma asks for. A note, not a refusal: the support is
+        # sufficient, only the headroom is smaller than the recipe wanted.
+        print_fn(f"  [shared-pole recipe {RECIPE_VERSION}] note: the bank's remote "
+                 f"domain trimmed the top support to {top:.3f} eV, so the Sigma "
+                 f"window margin is {top/sigma_window:.3f}x rather than "
+                 f"{recipe['sigma_window_top_factor']}x; the window "
+                 f"({sigma_window:.3f} eV) is still covered")
+    elif not capped and top < required_top * (1.0 - 1.0e-12):
         raise ValueError(
             f"GATE shared_pole_support_window: got: line top {top:.6g} eV below "
             f"{recipe['sigma_window_top_factor']}*(Sigma box extent "
@@ -937,6 +1026,9 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'omega_fine_ev': fine, 'active_depth_ev': depth_act,
         'sigma_extent_ev': sigma_extent, 'sigma_window_ev': sigma_window,
         'top_ev': top, 'top_bound_by': top_bound_by,
+        'top_uncapped_ev': top_uncapped, 'u_max_uncapped_ev': umax_uncapped,
+        'u_max_bound_by': u_max_bound_by,
+        'remote_cap_ev': remote_cap_ev, 'remote_delta_lo_ev': remote_delta_lo_ev,
         'line_step_ev': step, 'line_growth_fraction': growth,
         'line_ev': line, 'imaginary_ev': imaginary,
         'held_line_ev': held_line, 'held_imaginary_ev': held_imag,
@@ -975,6 +1067,11 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'sigma_extent': 'max |edge| of the Sigma omega grid (patches when set, else the box)',
         'sigma_window': 'Sigma extent + active depth: the top W frequency Sigma samples',
         'top_bound': 'which term of the top max() bound it',
+        'top_uncapped': 'top before the bank remote-domain ceiling',
+        'u_max_uncapped': 'u_max before the bank remote-domain ceiling',
+        'u_max_bound': 'zolotarev tier rule, or the bank remote-domain cap',
+        'remote_cap': 'minimax.response_remote_max_abs_z at the lowest remote cell edge',
+        'remote_delta': 'lowest remote Laplace cell transition edge, from response_windows',
         'top': 'max(2.25*omega_fine, 1.25*sigma_window)',
         'line_step': '2*eta (tier line_step_eta_factor)',
         'line_growth': 'geometric step ratio beyond omega_fine (tier)',

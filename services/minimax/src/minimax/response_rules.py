@@ -12,6 +12,12 @@ import math
 import numpy as np
 from numpy.polynomial.legendre import leggauss
 
+# The remote Taylor rule's order budget, published because the SAMPLE PLAN has
+# to respect it: a sample whose geometric ratio needs more than this many terms
+# is refused, and the caller that chooses sample points cannot know that from a
+# literal buried in a loop.  See `response_remote_max_ratio`.
+RESPONSE_TAYLOR_MAX_ORDER = 64
+
 
 @lru_cache(maxsize=256)
 def _legendre(n):
@@ -317,7 +323,7 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
         raise ValueError('remote Taylor domain does not converge; repartition in bank owner')
     # N+1 powers for value; derivative remainder is the differentiated
     # geometric remainder, bounded relative to the exact squared resolvent.
-    for order in range(1, 65):
+    for order in range(1, RESPONSE_TAYLOR_MAX_ORDER + 1):
         vr = rho**(order+1)
         dr = rho**order*((order+1)+order*rho)
         if max(vr.max(), dr.max()) <= rel_tol/4:
@@ -385,3 +391,57 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
     return dict(result, node_digest=_node_digest(result),
                 reuse_status="build" if previous is None else "rebuild",
                 reuse_reason=reason)
+
+
+def response_remote_max_ratio(rel_tol):
+    """Largest geometric ratio the remote Taylor rule can certify at ``rel_tol``.
+
+    The rule keeps the first ``order`` terms and accepts when both the value
+    remainder ``rho**(order+1)`` and the derivative remainder
+    ``rho**order*((order+1)+order*rho)`` fall to ``rel_tol/4``, with
+    ``order`` capped at :data:`RESPONSE_TAYLOR_MAX_ORDER`.  The derivative
+    remainder is the binding one, so the admissible ratio is the root of
+
+        rho**N * ((N+1) + N*rho) = rel_tol/4,      N = RESPONSE_TAYLOR_MAX_ORDER
+
+    which is monotone in rho and solved here by bisection.  This is the same
+    predicate ``response_laplace_rule`` applies; it is exposed so a caller that
+    CHOOSES sample points can stay inside the domain instead of discovering the
+    refusal after a bank has already been planned.
+
+    At the campaign's ``rel_tol = 1e-8`` it returns 0.68199.
+    """
+    tol = float(rel_tol) / 4.0
+    if not np.isfinite(tol) or tol <= 0:
+        raise ValueError("response_remote_max_ratio: rel_tol must be finite and positive")
+    n = RESPONSE_TAYLOR_MAX_ORDER
+    def remainder(rho):
+        return rho**n * ((n + 1) + n * rho)
+    lo, hi = 0.0, 1.0
+    if remainder(1.0 - 1e-15) <= tol:          # no ratio is excluded
+        return 1.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if remainder(mid) <= tol else (lo, mid)
+    return lo
+
+
+def response_remote_max_abs_z(delta_lo_ry, eta_ry, rel_tol):
+    """Largest ``|z|`` a remote cell with this lower edge admits, in Ry.
+
+    ``response_laplace_rule`` expands about the cell's lower transition edge
+    with ratio ``rho = |(z/lo)**2 + (eta/lo)**2| / (1 + (eta/lo)**2)``.  Using
+    the orientation-free bound ``|(z/lo)**2| <= |z|**2/lo**2`` gives a radius
+    that is safe for a sample anywhere on the line or the imaginary axis:
+
+        |z| <= lo * sqrt(rho_max*(1 + anchor**2) - anchor**2),   anchor = eta/lo
+
+    Returns 0.0 when even the origin is inadmissible, which cannot happen for a
+    physical cell but keeps the caller's arithmetic total.
+    """
+    lo = float(delta_lo_ry)
+    if not np.isfinite(lo) or lo <= 0:
+        raise ValueError("response_remote_max_abs_z: delta_lo_ry must be finite and positive")
+    anchor2 = (float(eta_ry) / lo) ** 2
+    inside = response_remote_max_ratio(rel_tol) * (1.0 + anchor2) - anchor2
+    return lo * math.sqrt(inside) if inside > 0 else 0.0
