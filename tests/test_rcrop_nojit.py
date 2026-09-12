@@ -538,16 +538,16 @@ def test_crop_conditioning_guard_ignores_unfilled_history_slots():
                                rtol=0, atol=1e-12)
 
 
-# ``rcrop_nojit``'s call sequence into ``residual_fn``, which these fixtures
-# have to target precisely: ONE pre-loop call on x0, then per iteration a
-# TRIAL call on ``x + f`` followed by an ACCEPTED call on the CROP-mixed
-# ``x_new``.  So calls 2, 4, 6 ... are trials and 1, 3, 5 ... are not.  Only
-# the trial is protected -- a refusal on the accepted map is a real refusal
-# and must propagate -- and getting that wrong is how the first cut of the
-# P4 gate planted its failure on the wrong call.
-# Valid only while NO trial is rejected: a rejected trial skips its
-# accepted call, after which every subsequent call is a trial.
-_TRIAL_CALLS = (2, 4, 6, 8, 10, 12)
+# ``rcrop_nojit``'s call sequence into ``residual_fn``, which the fixtures
+# below have to target precisely: ONE pre-loop call on x0, then per iteration
+# a TRIAL call on ``x + f`` followed by an ACCEPTED call on the CROP-mixed
+# ``x_new``.  So while nothing is rejected, calls 2, 4, 6 ... are trials and
+# 1, 3, 5 ... are not -- but a REJECTED trial skips its accepted call, after
+# which every subsequent call is another trial, so that parity cannot be
+# relied on once rejections start.  Only the trial is protected: a refusal on
+# the accepted map is a real refusal and must propagate, and getting that
+# wrong is how the first cut of the P4 gate planted its failure on the wrong
+# call.
 
 
 def test_a_trial_that_fails_a_physics_gate_is_rejected_not_fatal():
