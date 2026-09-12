@@ -1216,6 +1216,26 @@ def _retain_current_map_exports(targets, *, run_dir, label, identity, mesh_xy,
     return tuple(sorted(removed))
 
 
+def _export_is_current(path, *, identity, digest):
+    """Whether an existing export was written from THIS model.
+
+    Metadata only, and bounded: both writers stamp the model identity into
+    the export's header, and the pole writer stamps the source model digest
+    into every construction receipt beside it.  An export that is not
+    committed, or carries another identity or digest, is not this model's
+    and the caller refuses it rather than deciding on its behalf.
+    """
+    try:
+        header = _read_header(path)
+    except (OSError, ValueError, KeyError):
+        return False
+    if _json(header.get("identity")) != _json(dict(identity)):
+        return False
+    stamped = {row.get("receipt", {}).get("source_model_digest")
+               for row in header.get("construction_receipts", ())}
+    return stamped <= {digest, None}
+
+
 def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                                run_dir, label, tables, print_fn):
     """Export current-map poles and/or fixed W samples through their writers.
@@ -1250,17 +1270,36 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
     outputs = {}
     targets = {kind: Path(run_dir) / f"{label}_{kind}.h5" for kind, enabled in
                (("poles", config.write_poles), ("w", config.debug.write_w)) if enabled}
-    for path in targets.values():
-        if path.exists():
+    # A RESTART MUST NOT RE-EXPORT OVER ITS OWN EXPORT.  The export is
+    # written only once a map is complete, so a committed file on disk is a
+    # finished export; a restart that rebuilds nothing has nothing new to
+    # write, and rewriting it would cost a full bank (20.9 GB on the Na
+    # reference) to reproduce bytes that are already there.  Skipping is a
+    # receipt line, not silence, and the question is answered from the
+    # export's own stamped provenance rather than by re-reading tensors --
+    # a full re-validation is exactly the work a restart exists to avoid.
+    # Anything else keeping that name still refuses: the overwrite guard is
+    # what protects a one-shot run from a second map writing over it.
+    for kind, path in list(targets.items()):
+        if not path.exists():
+            continue
+        if not _export_is_current(path, identity=handle["identity"],
+                                  digest=handle["digest"]):
             _refuse(f"export already exists: {path}; use a fresh output directory")
+        del targets[kind]
+        outputs[kind] = dict(path=str(path), status="retained", reason=(
+            "export already written from this model identity and digest; "
+            "restart rewrote nothing"))
+        print_fn(f"shared-pole export: {kind} at {path} was written from this "
+                 "model; retained, not rewritten")
     bank_source = source.parent / "bank.h5"
-    if config.debug.write_w:
+    if "w" in targets:
         if not bank_source.is_file():
             _refuse(f"write_w needs the current-map bank {bank_source}; "
                     "a model-only restart cannot supply frequency samples")
         bank_header = validate_shared_pole_bank(bank_source,
             expected_identity=handle["identity"], mesh_xy=mesh_xy, require_complete=True)
-    if config.write_poles:
+    if "poles" in targets:
         path = targets["poles"]
         spec = P(None, "x", None, "y")
         shape = mesh_divisible_shape((1, basis.n_canonical, 1, model["Kmax"]), mesh_xy, spec)
@@ -1290,7 +1329,7 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                     ledger.live_stages = previous
         _export_spatial_header(path, source_wfn, meta, kind="poles", source=source)
         outputs["poles"] = dict(path=str(path), payload_bytes=model["compact_payload_bytes"])
-    if config.debug.write_w:
+    if "w" in targets:
         path = targets["w"]
         output_header = initialize_shared_pole_bank(path, meta=meta, tables=tables,
             recipe=bank_header["recipe"], identity=handle["identity"], mesh_xy=mesh_xy)

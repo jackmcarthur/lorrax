@@ -217,3 +217,33 @@ def test_screening_writes_no_receipt_outside_an_agreed_transaction():
               if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
               and node.func.id == "rank0_transaction"]
     assert len(routed) >= 3, "the receipt writes are not routed"
+
+
+def test_an_existing_export_from_this_model_is_retained_not_rewritten(monkeypatch):
+    """Item 4: ``restart = true`` with ``write_poles`` must not die.
+
+    The restart branch re-runs ``export_shared_pole_outputs`` and the writer
+    refused "export already exists", so a restart that rebuilds nothing died
+    after the head build. An export is written only once a map is complete,
+    so a committed file stamped with this model's identity and digest is the
+    export this run would write; it is retained with a receipt line. A file
+    stamped with anything else still refuses.
+    """
+    from file_io import shared_pole_store as store
+    identity = dict(hamiltonian="h", wavefunctions="w")
+    header = dict(identity=identity, construction_receipts=[
+        dict(q_span=[0, 1], receipt=dict(source_model_digest="digest-a"))])
+    monkeypatch.setattr(store, "_read_header", lambda _path: header)
+    assert store._export_is_current(
+        Path("x.h5"), identity=identity, digest="digest-a")
+    assert not store._export_is_current(
+        Path("x.h5"), identity=identity, digest="digest-b")
+    assert not store._export_is_current(
+        Path("x.h5"), identity=dict(hamiltonian="other"), digest="digest-a")
+
+    def uncommitted(_path):
+        raise ValueError("not committed")
+
+    monkeypatch.setattr(store, "_read_header", uncommitted)
+    assert not store._export_is_current(
+        Path("x.h5"), identity=identity, digest="digest-a")
