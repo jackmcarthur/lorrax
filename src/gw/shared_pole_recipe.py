@@ -635,7 +635,7 @@ def _remote_domain_cap(wfns, meta, census, eta_ry, rel_tol, domain_pad_ry=0.0,
     return cap * RYD_TO_EV, effective_lo * RYD_TO_EV, delta_hi, receipt
 
 
-def _support_report(r, tier, census):
+def _support_report(r, tier, census, cap_cost=None):
     """The human-readable resolved support geometry, for the run log.
 
     This is the user-facing surface of the recipe: it states which electrons
@@ -686,12 +686,12 @@ def _support_report(r, tier, census):
              "the edge the bank's own expansion will use)"
              % r['remote_domain_pad_ev'])
          + ("" if not r.get('remote_cap_search') else
-            "; found by %d rule evaluation(s) in %.1f s, to %.0f%% of the "
-            "orientation-free radius %.3f eV"
-            % (r['remote_cap_search']['evaluations'],
-               r['remote_cap_search']['seconds'],
-               100.0*r['remote_cap_search']['relative_precision'],
-               r['remote_cap_search']['stage_one_ry']*RYD_TO_EV))
+            "; found to %.0f%% of the orientation-free radius %.3f eV%s"
+            % (100.0*r['remote_cap_search']['relative_precision'],
+               r['remote_cap_search']['stage_one_ry']*RYD_TO_EV,
+               "" if not cap_cost else
+               ", by %d rule evaluation(s) in %.1f s"
+               % (cap_cost['evaluations'], cap_cost['seconds'])))
          if r.get('remote_cap_ev') is not None else
          "  Bank remote domain  : no remote cell; no sample ceiling"),
         "  Bank cost grows with the top support and as 1/height: widening",
@@ -1143,7 +1143,16 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'remote_delta_hi_ry': remote_delta_hi_ry,
         # The cap is FOUND by evaluating the rule, so the receipt says how
         # many evaluations it took and what they cost.
-        'remote_cap_search': remote_cap_receipt,
+        # DETERMINISTIC FIELDS ONLY.  This record is hashed into the model
+        # store's `recipe_hash`, and two stagings of the SAME map must agree:
+        # the search's `evaluations` and `seconds` differ between the map that
+        # pays for it and the one that reads it back from the support session,
+        # which is a `staging identity changed: recipe` refusal (measured,
+        # job 58229045).  The cost is reported in the SHARED-POLE SUPPORT
+        # block instead, where a receipt belongs.
+        'remote_cap_search': (None if remote_cap_receipt is None else
+                              {k: remote_cap_receipt[k] for k in
+                               ('cap_ry', 'stage_one_ry', 'relative_precision')}),
         # Non-empty only when a retained SC envelope had to be pulled back to
         # this map's admissible cap; the shrink must be visible in the receipt.
         'envelope_clamped_to_cap': envelope_clamp,
@@ -1212,7 +1221,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                      u_min='SC low-water envelope of max(h,logical gap)',
                      u_max='SC high-water envelope of 2.5*omega_fine',
                      support_envelope='current required bounds and retained sampling enclosure; not an interpolation-error certificate')
-    print_fn(_support_report(result, tier, census))
+    print_fn(_support_report(result, tier, census, remote_cap_receipt))
     for key, value in result.items():
         shown = value.tolist() if isinstance(value, np.ndarray) else value
         rule = next((v for prefix, v in rules.items() if key.startswith(prefix)),
