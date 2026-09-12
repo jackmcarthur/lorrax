@@ -601,13 +601,13 @@ def _remote_domain_cap(wfns, meta, census, eta_ry, rel_tol, domain_pad_ry=0.0,
     One-shot passes ``domain_pad_ry = 0`` and is unchanged.
     """
     from common.units import RYD_TO_EV
-    from minimax import response_remote_max_abs_z
+    from minimax import response_remote_cap_receipt
     from .response_bank import response_weights, response_windows
     energy, f, u, _reference, _receipt = response_weights(wfns, meta)
     _masks, _ft, _ut, cells, _window_receipt = response_windows(
         energy, f, u, chemical_potential_ry=census['mu_ry'])
     if not cells:
-        return None, None, None
+        return None, None, None, None
     # The binding cell is the one with the lowest edge; its own upper edge
     # goes with it, because the rule's NNLS rows are fitted on [lo, hi] and
     # the admissible radius depends on both.
@@ -623,14 +623,16 @@ def _remote_domain_cap(wfns, meta, census, eta_ry, rel_tol, domain_pad_ry=0.0,
     key = ("remote_cap", round(delta_lo, 12), round(delta_hi, 12),
            round(float(eta_ry), 12), float(rel_tol), round(float(domain_pad_ry), 12))
     if session is not None and key in session:
-        cap = session[key]
+        receipt = session[key]
     else:
-        cap = response_remote_max_abs_z(delta_lo, delta_hi, eta_ry, rel_tol,
-                                        domain_pad_ry=float(domain_pad_ry))
+        receipt = response_remote_cap_receipt(
+            delta_lo, delta_hi, eta_ry, rel_tol,
+            domain_pad_ry=float(domain_pad_ry))
         if session is not None:
-            session[key] = cap
+            session[key] = receipt
+    cap = receipt["cap_ry"]
     effective_lo = max(delta_lo - float(domain_pad_ry), delta_lo / 2.0)
-    return cap * RYD_TO_EV, effective_lo * RYD_TO_EV, delta_hi
+    return cap * RYD_TO_EV, effective_lo * RYD_TO_EV, delta_hi, receipt
 
 
 def _support_report(r, tier, census):
@@ -642,6 +644,7 @@ def _support_report(r, tier, census):
     bank can see WHY it is long, and a user on an unfamiliar material can see
     what the recipe decided for it. The full key/rule dump follows it.
     """
+    from common.units import RYD_TO_EV
     recipe = shared_real_pole_v2_r1
     plasmon_term = recipe['plasma_top_factor'] * r['omega_fine_ev']
     window_term = recipe['sigma_window_top_factor'] * r['sigma_window_ev']
@@ -682,6 +685,13 @@ def _support_report(r, tier, census):
              " (already lowered by the SC rule session's %.3f eV pad, which is "
              "the edge the bank's own expansion will use)"
              % r['remote_domain_pad_ev'])
+         + ("" if not r.get('remote_cap_search') else
+            "; found by %d rule evaluation(s) in %.1f s, to %.0f%% of the "
+            "orientation-free radius %.3f eV"
+            % (r['remote_cap_search']['evaluations'],
+               r['remote_cap_search']['seconds'],
+               100.0*r['remote_cap_search']['relative_precision'],
+               r['remote_cap_search']['stage_one_ry']*RYD_TO_EV))
          if r.get('remote_cap_ev') is not None else
          "  Bank remote domain  : no remote cell; no sample ceiling"),
         "  Bank cost grows with the top support and as 1/height: widening",
@@ -934,7 +944,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     # partition in the tree, not a copy of one here; then ask minimax for the
     # largest |z| its remote Taylor rule can certify for the lowest cell.
     from .response_bank import RESPONSE_DOMAIN_PAD_RY
-    remote_cap_ev, remote_delta_lo_ev, remote_delta_hi_ry = _remote_domain_cap(
+    (remote_cap_ev, remote_delta_lo_ev, remote_delta_hi_ry,
+     remote_cap_receipt) = _remote_domain_cap(
         wfns, meta, census, height / RYD_TO_EV, recipe['bank_rule_tolerance'],
         # The bank pads its remote cells exactly when it keeps a rule session,
         # which is exactly when this resolver is given a support session.
@@ -1090,6 +1101,9 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'remote_domain_pad_ev': (0.0 if support_session is None
                                  else RESPONSE_DOMAIN_PAD_RY * RYD_TO_EV),
         'remote_delta_hi_ry': remote_delta_hi_ry,
+        # The cap is FOUND by evaluating the rule, so the receipt says how
+        # many evaluations it took and what they cost.
+        'remote_cap_search': remote_cap_receipt,
         'line_step_ev': step, 'line_growth_fraction': growth,
         'line_ev': line, 'imaginary_ev': imaginary,
         'held_line_ev': held_line, 'held_imaginary_ev': held_imag,

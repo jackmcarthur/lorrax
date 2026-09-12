@@ -8,6 +8,7 @@ Na gate. No campaign modules or GW implementation are imported.
 from functools import lru_cache
 import hashlib
 import math
+import time
 
 import numpy as np
 from numpy.polynomial.legendre import leggauss
@@ -463,12 +464,12 @@ def response_remote_max_ratio(rel_tol):
     return lo
 
 
-#: Bisections between zero and the stage-one bound when the rule refuses at
-#: that bound.  Ten gives the published cap to one part in 1024 of the
-#: stage-one radius, which is finer than any support spacing the recipe emits,
-#: and costs at most eleven rule evaluations -- memoised, so a self-consistent
-#: loop whose cell edges do not move pays them once.
-_REMOTE_CAP_BISECTIONS = 10
+#: The published PRECISION of the cap, relative to the stage-one radius.  The
+#: bisection stops when the bracket is this narrow, which is 5-6 rule
+#: evaluations rather than a fixed ten, and one percent is far finer than any
+#: support spacing the recipe emits.  It is a statement about the number the
+#: service publishes, not a knob: a caller cannot ask for a different one.
+REMOTE_CAP_RELATIVE_PRECISION = 0.01
 
 
 def _remote_stage_one_bound(lo, eta, rel_tol):
@@ -505,32 +506,41 @@ def _remote_cap_accepts(radius, delta_lo_ry, delta_hi_ry, eta_ry, rel_tol,
     return result is not None
 
 
-def response_remote_max_abs_z(delta_lo_ry, delta_hi_ry, eta_ry, rel_tol, *,
-                              domain_pad_ry=0.0):
-    """Largest ``|z|`` in Ry at which ``response_laplace_rule`` ACCEPTS.
+def response_remote_cap_receipt(delta_lo_ry, delta_hi_ry, eta_ry, rel_tol, *,
+                                domain_pad_ry=0.0):
+    """The published remote-domain cap and how it was found.
 
     THE PUBLISHED DOMAIN IS THE RULE'S OWN DOMAIN.  The rule's acceptance has
     three stages -- the Taylor order budget, the NNLS row fit at
     ``row_tol = rel_tol/(4*amp_d)``, and the combined value/derivative bound --
-    and inverting the first alone is not a domain: a sample exactly at the
-    Taylor radius forces ``order`` to the maximum 64, which makes ``row_tol``
-    112x tighter than ``rel_tol`` and ``stop = 4*(order+1) - ln(row_tol)`` 283,
-    more than the 192-node ladder resolves.  The recipe then emits a support
-    the rule refuses, which is how run 49's Si SC deck died at map 0 with
-    'remote NNLS certificate failed' (AREBASE 2026-09-12, job 58222998).
+    and inverting the first alone is not a domain.  Worse, that first stage is
+    the ORIENTATION-FREE bound ``|(z/lo)**2| <= |z|**2/lo**2``, so the radius it
+    returns is admissible for no orientation at all: a one-shot deck accepted
+    it only because its largest emitted sample sits on the imaginary axis,
+    where ``rho`` is smaller.  Measured on the Si P4 remote cell, the rule
+    REFUSES at the stage-one radius 33.426 eV and accepts at 32.022 eV
+    (AREBASE 2026-09-12, job 58224871).
 
-    So the bound is found, not modelled: start at the Taylor radius, ask
+    So the bound is found, not modelled: start at the stage-one radius, ask
     :func:`_remote_certificate` -- the rule's own predicate, through the rule's
-    own padding -- and, if it refuses, bisect the radius downward
-    ``_REMOTE_CAP_BISECTIONS`` times, keeping the largest radius that accepts.
-    There is no margin constant and no dial; the number returned is admissible
-    by construction, for a one-shot cell (``domain_pad_ry = 0``) and for the
-    self-consistent one the bank will actually expand about.
+    own padding -- and, if it refuses, bisect the radius downward until the
+    bracket is :data:`REMOTE_CAP_RELATIVE_PRECISION` of that radius, keeping
+    the largest radius that accepts.  No margin constant and no dial; the
+    number is admissible by construction, for a one-shot cell
+    (``domain_pad_ry = 0``) and for the self-consistent one the bank will
+    actually expand about.
 
     ``domain_pad_ry`` must be the pad the BANK will pass
     (``gw.response_bank.RESPONSE_DOMAIN_PAD_RY`` under self-consistency, zero
     otherwise): the pad lowers the expansion edge and raises the upper one, so
     a cap taken without it is a cap for a different interval.
+
+    Returns ``dict(cap_ry, stage_one_ry, relative_precision, evaluations,
+    seconds)``.  ``evaluations`` counts the rule evaluations this call made --
+    zero extra when a previous call already answered the same geometry, since
+    the predicate is memoised -- and ``seconds`` is what they cost, because
+    the answer is found rather than modelled and the caller should be able to
+    see that in its receipt.
 
     Raises when even the smallest bisected radius is refused, which means the
     cell itself cannot serve any sample and the bank owner must repartition --
@@ -543,22 +553,42 @@ def response_remote_max_abs_z(delta_lo_ry, delta_hi_ry, eta_ry, rel_tol, *,
         raise ValueError("response_remote_max_abs_z: delta_hi_ry must be finite and >= delta_lo_ry")
     if not np.isfinite(domain_pad_ry) or domain_pad_ry < 0:
         raise ValueError("response_remote_max_abs_z: domain_pad_ry must be finite and nonnegative")
+    started, evaluations = time.perf_counter(), 0
     bound = _remote_stage_one_bound(lo, float(eta_ry), rel_tol)
+    receipt = dict(stage_one_ry=bound,
+                   relative_precision=REMOTE_CAP_RELATIVE_PRECISION)
     if bound <= 0.0:
-        return 0.0
+        return dict(receipt, cap_ry=0.0, evaluations=0, seconds=0.0)
     args = (lo, hi, float(eta_ry), float(rel_tol), float(domain_pad_ry))
+    cached = _remote_cap_accepts.cache_info().misses
     if _remote_cap_accepts(bound, *args):
-        return bound
+        evaluations = _remote_cap_accepts.cache_info().misses - cached
+        return dict(receipt, cap_ry=bound, evaluations=evaluations,
+                    seconds=time.perf_counter() - started)
     low, high, best = 0.0, bound, 0.0
-    for _ in range(_REMOTE_CAP_BISECTIONS):
+    while high - low > REMOTE_CAP_RELATIVE_PRECISION * bound:
         mid = 0.5 * (low + high)
         if _remote_cap_accepts(mid, *args):
             best, low = mid, mid
         else:
             high = mid
+    evaluations = _remote_cap_accepts.cache_info().misses - cached
     if best <= 0.0:
         raise RuntimeError(
             "remote cell admits no sample: response_laplace_rule refuses even "
             f"|z| = {high:.6g} Ry on delta [{lo:.6g}, {hi:.6g}] Ry with pad "
             f"{float(domain_pad_ry):.6g}; repartition in the bank owner")
-    return best
+    return dict(receipt, cap_ry=best, evaluations=evaluations,
+                seconds=time.perf_counter() - started)
+
+
+def response_remote_max_abs_z(delta_lo_ry, delta_hi_ry, eta_ry, rel_tol, *,
+                              domain_pad_ry=0.0):
+    """Largest ``|z|`` in Ry at which ``response_laplace_rule`` ACCEPTS.
+
+    The bare number of :func:`response_remote_cap_receipt`, which owns the
+    derivation and the provenance.
+    """
+    return response_remote_cap_receipt(
+        delta_lo_ry, delta_hi_ry, eta_ry, rel_tol,
+        domain_pad_ry=domain_pad_ry)["cap_ry"]

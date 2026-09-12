@@ -255,7 +255,9 @@ _ROQ_FIT_NAMES = (
 
 _RESPONSE_RULE_NAMES = ("response_bank_rule", "response_laplace_rule",
                         "response_remote_max_ratio", "response_remote_max_abs_z",
-                        "RESPONSE_TAYLOR_MAX_ORDER")
+                        "response_remote_cap_receipt",
+                        "RESPONSE_TAYLOR_MAX_ORDER",
+                        "REMOTE_CAP_RELATIVE_PRECISION")
 
 
 def __getattr__(name: str):
