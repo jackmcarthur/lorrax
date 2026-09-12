@@ -190,3 +190,30 @@ def test_shared_tau_kernel_cache_writes_all_honour_the_cache_flag():
         assert any(isinstance(n, ast.Name) and n.id == "cache"
                    for guard in guards for n in ast.walk(guard.test)), \
             "a cache write is not guarded by the cache flag"
+
+
+def test_screening_writes_no_receipt_outside_an_agreed_transaction():
+    """Item 11: a rank-0 write with no agreement is a hang, not an error.
+
+    ``record`` and the final ``construction_receipt.json`` wrote under a
+    bare ``process_index() == 0``. A rank-0 I/O error (quota, EIO on
+    purge-eligible scratch) then raises on rank 0 while ranks 1..P-1 enter
+    ``timing.fence("spole.moments")`` and hang to walltime (INVARIANTS 21).
+    The sibling write in the same function already used
+    ``rank0_transaction``, which broadcasts the verdict.
+    """
+    from gw import shared_pole_screening
+    tree = ast.parse(Path(shared_pole_screening.__file__).read_text())
+    screen = next(node for node in ast.walk(tree)
+                  if isinstance(node, ast.FunctionDef)
+                  and node.name == "screen_shared_poles")
+    guards = [node for node in ast.walk(screen) if isinstance(node, ast.If)
+              and any(isinstance(inner, ast.Attribute)
+                      and inner.attr == "process_index"
+                      for inner in ast.walk(node.test))]
+    assert not guards, \
+        "screen_shared_poles gates I/O on a bare rank test"
+    routed = [node for node in ast.walk(screen)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+              and node.func.id == "rank0_transaction"]
+    assert len(routed) >= 3, "the receipt writes are not routed"

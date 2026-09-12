@@ -216,9 +216,17 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             recipe=recipe, identity=identity, mesh_xy=mesh_xy)
         receipts = dict(identity=identity)
         def record(stage, receipt):
+            # EVERY RANK LEAVES THIS CALL THE SAME WAY.  A bare
+            # ``process_index() == 0`` write raises on rank 0 alone (quota,
+            # EIO on purge-eligible scratch) while ranks 1..P-1 walk into
+            # the next ``timing.fence`` and hang to walltime (INVARIANTS 21).
+            # ``rank0_transaction`` does the same serial write and
+            # broadcasts its verdict, exactly as the sibling write above.
             receipts[stage] = receipt
-            if jax.process_index() == 0:
-                (root / (stage + "_receipt.json")).write_text(_json(receipt) + "\n")
+            path = root / (stage + "_receipt.json")
+            rank0_transaction(
+                path, stage=f"shared_pole.receipt.{stage}",
+                write=lambda: path.write_text(_json(receipt) + "\n"))
             print_fn(f"shared-pole {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
                      f"seconds={receipt.get('seconds', {})}")
     timing.fence("spole.bank")
@@ -264,6 +272,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 mesh_xy=mesh_xy, capacity=ledger)
         receipts["seconds"] = time.monotonic() - started
         receipts["handle"] = handle
-        if jax.process_index() == 0:
-            (root / "construction_receipt.json").write_text(_json(receipts) + "\n")
+        summary = root / "construction_receipt.json"
+        rank0_transaction(
+            summary, stage="shared_pole.construction_receipt",
+            write=lambda: summary.write_text(_json(receipts) + "\n"))
         return result
