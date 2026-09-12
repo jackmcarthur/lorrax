@@ -983,15 +983,19 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             with timing.section("spole.passivity_held"):
                 indices = jnp.asarray([i-sample_lo for i in held_ids])
                 supports = jnp.asarray([_sample_point(recipe, i)**2 for i in held_ids])
-                held_pair = symmetrise(check_span,
-                                       Wc=held_samples["Wc"][:, indices],
-                                       dWc_ds=held_samples["dWc_ds"][:, indices])
+                # HELD DATA STAYS RAW.  These receipts are a statement about
+                # the RAW LATENT MODEL against the raw physical sample (the
+                # store's own words: "projected operator not measured"), and
+                # both sides must sit in one space.  Projecting only the
+                # reference turns ``model_reciprocity`` from vacuously
+                # inapplicable into a live check of an object nothing
+                # projects -- see KNOWN_LORRAX_ISSUES, AGRAM2 2026-09-12.
                 batch_checks = local_model_checks(mesh_xy, eig.native_fn)(
                     batch_results[0], inverse_sqrt,
-                    held_pair["Wc"], held_pair["dWc_ds"],
+                    held_samples["Wc"][:, indices], held_samples["dWc_ds"][:, indices],
                     supports, jnp.asarray(recipe["eta_ev"] / RYD_TO_EV))
                 batch_checks = jax.tree.map(np.asarray, batch_checks)
-                del inverse_sqrt, held_samples, held_pair, indices, supports
+                del inverse_sqrt, held_samples, indices, supports
         batch_width = 1
         selected = pending
         pending = []
@@ -1094,16 +1098,15 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                             s = _sample_point(recipe, int(sample_id)) ** 2
                             weights = jnp.where(mask, 1 / (s-poles), 0)
                             diagnostic = {"sample_id": int(sample_id)}
-                            projected = symmetrise(span, Wc=samples["Wc"][:, 0],
-                                                   dWc_ds=samples["dWc_ds"][:, 0])
+                            # Raw, for the same reason as the batched arm.
                             for field, weight in (("Wc", weights), ("dWc_ds", -weights**2)):
-                                sample = projected[field]
+                                sample = samples[field][:, 0]
                                 value = mm(b * weight[:, None, :], b, transb="C")
                                 diagnostic[field] = float(jnp.linalg.norm(value-sample) /
                                                           jnp.maximum(jnp.linalg.norm(sample), jnp.finfo(jnp.float64).tiny))
                                 reciprocity.append(shared_pole_reciprocity(value, sample, gates=gates))
                             held.append(diagnostic)
-                            del samples, projected, sample, value
+                            del samples, sample, value
                     reciprocity = {key: np.asarray([row[key] for row in reciprocity]).tolist()
                                    for key in reciprocity[0]}
                 else:
