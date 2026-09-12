@@ -137,6 +137,77 @@ def shared_pole_operator_realizer(meta, header, *, q_full_idx, mesh_xy):
     return realize
 
 
+def symmetrise_shared_pole_tiles(arrays, *, meta, header, q_span, mesh_xy):
+    r"""Reynolds-project stored parent tiles onto their own little groups.
+
+    THE CONSISTENCY THIS CLOSES.  Every Sigma consumer already realizes the
+    stored model through :func:`shared_pole_operator_realizer` -- the recipe
+    names that realization (``operator_realization``) and
+    ``gw/mpa/sigma.py`` and ``gw/shared_pole_head.py`` apply it.  The bank
+    tiles the model is FIT to, and on which the Loewner pencil's passivity
+    certificate is taken, were never projected, so the fit and its
+    certificate lived in a space the consumer does not use.  The residual
+    little-group defect of the FITTED ISDF basis then entered the Gram
+    spectrum amplified by the pencil size: measured at 1.7e-08 relative on
+    ``Wc``, on ``M1`` and on ``M3`` alike at q=0 on Si (the exact bare
+    moments take no quadrature, which is what places the floor in the basis
+    rather than in the response rule), against a q=0 amplification of
+    ~1140 -- and that product is the order of the -1e-07 Gram gate.
+
+    EVERY TILE THAT ENTERS ONE PENCIL IS PROJECTED TOGETHER.  The confluent
+    blocks use ``dWc_ds`` while the off-diagonals use ``Wc`` and the infinity
+    columns use ``M1``/``M3``, so a pencil assembled from a mixture of
+    projected and unprojected tiles carries an inconsistency the pencil reads
+    as non-passivity.  Measured on the map-11 rCROP trial that refused three
+    times byte-identically at -2.12e-07: projecting ``Wc`` alone gives
+    -4.92e-08, ``dWc_ds`` alone -2.12e-07 (inert), and the two together
+    -8.40e-10 -- 250.9x, and 2.1x on an accepted map.
+
+    ``arrays`` maps name -> ``[n_q, n, n]`` or ``[n_q, n_sample, n, n]`` with
+    the parent axis first; ``q_span`` is the half-open parent range those
+    tiles were read with, indexing ``header['q_irr_full_idx']``.  Returns a
+    dict with the same keys, shapes and shardings.  The projection is an
+    average of congruences of the authenticated little group, so it preserves
+    positivity and the real poles; it moves an approximate model by the size
+    of its own symmetry defect, which is why the caller gates Sigma.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    lo, hi = int(q_span[0]), int(q_span[1])
+    # Shape refusals first: they are free and they are the ones a caller trips.
+    for name, value in arrays.items():
+        if value.ndim not in (3, 4) or value.shape[-1] != value.shape[-2]:
+            raise ValueError(
+                f"GATE shared_pole_symmetrisation: {name} has shape "
+                f"{tuple(value.shape)}; want a parent axis, an optional sample "
+                "axis and a square centroid pair")
+        if int(value.shape[0]) != hi - lo:
+            raise ValueError(
+                f"GATE shared_pole_symmetrisation: {name} carries "
+                f"{value.shape[0]} parent tiles against q_span {(lo, hi)}")
+    qids = np.asarray(header["q_irr_full_idx"], dtype=np.int64)[lo:hi]
+    realize = shared_pole_operator_realizer(
+        meta, header, q_full_idx=qids, mesh_xy=mesh_xy)
+
+    def project(tile):
+        # The same-time transposed partner is what the antiunitary rows act
+        # on; it is never inferred from the values being projected.
+        return realize(tile, jnp.swapaxes(tile, -2, -1))[0]
+
+    out = {}
+    for name, value in arrays.items():
+        if value.ndim == 3:
+            out[name] = project(value)
+        else:
+            out[name] = jax.lax.with_sharding_constraint(
+                jnp.stack([project(value[:, i])
+                           for i in range(int(value.shape[1]))], axis=1),
+                NamedSharding(mesh_xy, P(None, None, "x", "y")))
+    return out
+
+
 def resolve_qgrid_symmetry_tables(
     *,
     sym,
