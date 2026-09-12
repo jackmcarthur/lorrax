@@ -158,7 +158,22 @@ _FIT_POINTS_PER_HALF_WAVE = 2.0
 # initial solve while every eventual winner sat at or below 1.9.  Rounds 3-6
 # are about four sevenths of a polish and rescued nothing.
 _FIXED_N_ROUNDS = 2
+_FIXED_N_STEPS = 30
 _FIXED_N_GATE = 3.0
+# The count law is fitted on converged reductions, which censors the widest
+# boxes and makes it read low there by up to 1.56x (x120_thin0 certifies at
+# 207 against 133 predicted).  Growing until the certificate passes costs a
+# few solves -- each one gated, so a placement in the wrong basin is abandoned
+# after its first solve -- and needs no refit.  1.10^7 = 1.95 covers the
+# measured shortfall with room to spare.
+_FIXED_N_GROWTH = 1.10
+_FIXED_N_BRACKET = 8
+# The LM is the whole cost of this path (one 60-step solve is 12.2 s on the
+# widest box at 16 threads, against 1 s for the angle scan, the family SVD and
+# the interpolatory weights put together, and 32 ms for a certificate).  From
+# a structural start 30 steps reach the same sup as 60 on every corpus box
+# that ever certifies -- lm30 against lm60 reads 1.9/1.9, 1.0/1.0, 1.1/1.1,
+# 1.4/1.4 -- so the second thirty are bought and thrown away (results/e9).
 
 
 def _live_spacing(d, theta, S, eps, p, p_target):
@@ -1337,31 +1352,34 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
         # can leave the near corner of a wide box (R ~ 500) above eps even
         # after the Lawson rounds; a basis one order tighter costs ~2 nodes
         # at the start and a few seconds, so escalate rather than refuse.
-        # Fixed-N fast path, crossing boxes only.  The reduction below starts
-        # at the interpolatory rank and removes nodes one at a time, so a wide
-        # box spends its whole budget and ships whatever it had reached: four
-        # corpus boxes never left the rank at 120 s.  Placing the PREDICTED
-        # count where certified rules put their nodes (see fixed_n_start) and
-        # polishing it is far cheaper than reducing to the same count, and on
-        # a box the reduction cannot finish it is the only way to get there.
+        # Crossing boxes: place the count, then bracket it upward.
         #
-        # Measured on the 41-box corpus against this same builder with the
-        # path removed, both arms run back to back on one node (the reduction
-        # is time budgeted, so a stored count from another session is not a
-        # baseline -- replaying the pristine builder against its own stored
-        # numbers read +12.7 %):
-        #     crossing nodes 2851 against 3269, -12.8 %
-        #     planning wall  1100 s against 2317 s, -52.5 % (max 192 s / 163 s)
-        #     12 boxes win 536 nodes, 10 give back 118, sign-definite untouched
-        # The wins are where the reduction ran out of budget: x120_tall0 50
-        # against 185, x120_tall1 50 against 184, x160_tall0 161 against 263.
-        # Every rule still passes the check cloud, and an independent
-        # dense-boundary audit of all 41 agreed with the certificate.
+        # The reduction below removes nodes one at a time with a K-candidate
+        # lookahead, so it asks for roughly ``rank/2`` removals times K solves
+        # times 60-180 LM steps -- of order 10^5 solves, 100+ TFLOP, on a
+        # problem whose whole content is a few hundred GFLOP (the cloud is
+        # 141-3256 points and the ray grid 185-1754, so one least-squares is
+        # 0.1-3 GFLOP and the family SVD at most 0.06 TFLOP).  It cannot
+        # finish, which is the only reason a wall-clock budget was ever needed
+        # and why the widest boxes shipped at the interpolatory rank.
         #
-        # The attempt shares the caller's budget, so `time_budget` keeps
-        # meaning what it says -- seconds from the start of this call.  Giving
-        # the attempt its own allowance on top bought 2 % more nodes for 1.8x
-        # the worst-case wall, which is the wrong trade for a planner.
+        # Placing the count directly asks for ONE solve, so the budget stops
+        # being load bearing: this path terminates on the certificate, never
+        # on a clock, and the same inputs give the same rule on any machine.
+        # Measured against this same builder with the path removed, 41 boxes
+        # paired on one node at 16 threads:
+        #     crossing nodes 2186 against 3341, -34.6 %
+        #     planning wall   497 s against 2426 s, -79.5 %
+        #     worst box 109 s against 209 s, median 4.0 s, sign-definite equal
+        # Audit: all 41 re-certified on an independent dense boundary cloud,
+        # 0 optimistic certificates.  Thread count matters as much as any of
+        # this -- the same solve is 47 ms per LM step at 16 threads, 216 ms at
+        # 4 and 148 ms at 64 -- so a planner should give a fit ~16 cores.
+        # ``predict_nodes`` was fitted only on boxes whose reduction converged,
+        # which censored exactly the wide ones, so it reads low there (x120_thin0
+        # certifies at 207 against 133 predicted, x120_thin1 at 221 against 164).
+        # Growing the count until it certifies costs a few cheap solves and
+        # removes the bias without refitting the law on four points.
         #
         # Tempting, and why not: (1) hand a certified placement to the
         # reduction as its START rather than returning it.  It looks free --
@@ -1373,17 +1391,11 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
         # instead of an n_k-node rule: mu = alpha eps |b| / |w_ref| is then
         # wrong by the size ratio and the polish misses (4.8 eps against 0.9
         # on x080_tall0, +19 % nodes over the corpus).
-        # Evidence: run DEV/327, results/ab_shared (shipped) against
-        # ab_baseline, with ab_rung, ab_gate, ab_start, ab_polish, ab_fixed_n
-        # the steps that got here and tools/compare_arms.py the pairing.
-        fast_deadline = t0 + 0.5 * budget
         red = None
         if not relative:
-            n_pred = predict_nodes(bx, eps, relative)
-            for rung in (1.0, 1.03, 1.06):
-                if time.perf_counter() >= fast_deadline:
-                    break
-                n_k = int(min(np.ceil(n_pred * rung), fam.r))
+            n_k = predict_nodes(bx, eps, relative)
+            for _attempt in range(_FIXED_N_BRACKET):
+                n_k = int(min(n_k, fam.r))
                 if n_k < 2:
                     break
                 # w_ref sets the Tikhonov scale, so it must be the weights of
@@ -1393,16 +1405,14 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
                                 w_ref=w_ref_n, rho=rho)
                 s_k, w_k, accepted = fit.polish(
                     start_param(bx, eps, theta, S, im_lo_s, im_hi_s, n_k), ok,
-                    rounds=_FIXED_N_ROUNDS, gate=(sup_ratio, _FIXED_N_GATE))
+                    nstep=_FIXED_N_STEPS, rounds=_FIXED_N_ROUNDS,
+                    gate=(sup_ratio, _FIXED_N_GATE))
                 if accepted:
                     red = (s_k, w_k)
                     break
-                if sup_ratio(s_k, w_k) > _FIXED_N_GATE:
-                    # Not a near miss: the rungs exist to give a placement that
-                    # is a couple of nodes short the nodes it needs, and a box
-                    # this far out is in the wrong basin at 1.03x too (measured
-                    # 32 and 39 eps on x120_thin1 and x120_thin0).
+                if n_k >= fam.r:
                     break
+                n_k = int(np.ceil(n_k * _FIXED_N_GROWTH))
         # ``reduction_steps`` makes the budget a pass count: the clock is
         # ignored and the same inputs give the same rule on any machine.
         deadline = t0 + budget
