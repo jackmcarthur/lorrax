@@ -383,6 +383,86 @@ def test_remote_domain_cap_uses_the_sc_padded_edge():
     assert ratio(np.abs(sc['z_ry']).max()) <= rho_max*(1 + 1e-12)
 
 
+def test_retained_envelope_is_clamped_to_a_fallen_cap(monkeypatch):
+    """A convenience never overrides an admissibility constraint.
+
+    The retained SC support envelope only ever RAISES the top, while the
+    bank's remote Taylor domain -- which is a hard admissibility constraint,
+    a sample outside it is one the rule cannot serve -- FALLS as the spectrum
+    drifts.  A later map therefore inherits a top its own bank would refuse,
+    and `shared_pole_support_window` compared the retained top against the
+    current cap and died: run 49's Si SC deck reached map 2 that way
+    (AREBASE 2026-09-12, job 58224871).  The envelope is clamped back to the
+    cap, the resulting Sigma-window shortfall takes the warn-not-refuse path,
+    and the receipt records the shrink.  Owner ruling 2026-09-12.
+    """
+    energies = np.array([[-36., -20., -1., 1.], [-36., -20., -1., 2.]])/RYD_TO_EV
+    occ = np.array([[1., 1., 1., 0.]]*2)
+    wf = NS(enk=energies, occ=occ,
+            slices=NS(b0=0, b4_logical=4, val=slice(0, 3), cond_all_logical=slice(3, 4)))
+    volume = 4*np.pi*2/((16.5/RYD_TO_EV/2)**2)
+
+    def resolved(session, cap_ry, log):
+        meta = NS(nspin=1, nspinor=1, n_rmu=17, nk_tot=2, cell_volume=volume,
+                  b_id_4_chi_user=4)
+        bind_shared_pole_census(wf, meta, occupation_state=None, trs_allowed=True,
+                                state_capacity=2., kweights=[.5, .5])
+        config = NS(sigma=NS(w_model='shared_pole', w_accuracy='production',
+                             regularization_ev=.25, omega_min_ev=-5., omega_max_ev=5.,
+                             parsed_omega_patches_ev=list),
+                    memory=NS(per_device_gb=30.))
+        # Pin the SERVICE's answer so the test is about the clamp, not about
+        # the search: map 0 gets a wide domain, map 1 a narrower one.
+        monkeypatch.setattr(
+            'minimax.response_rules.response_remote_cap_receipt',
+            lambda *a, **k: dict(cap_ry=cap_ry, stage_one_ry=cap_ry,
+                                 relative_precision=.01, evaluations=0, seconds=0.))
+        return resolve_shared_pole_recipe(
+            config, wf, meta, mesh_xy=NS(shape={'x': 2, 'y': 2}),
+            print_fn=log.append, support_session=session)
+
+    # Both caps BIND on this deck (its uncapped top is above 33 eV, see
+    # test_remote_domain_cap_limits_every_emitted_sample), and the second is
+    # narrower: that is the situation a drifting SC spectrum produces.
+    wide, narrow = 33.0/RYD_TO_EV, 25.0/RYD_TO_EV
+    session = {}
+    # The FIRST call is the unretained reference map (`_support_envelope`); the
+    # second seeds the enclosure.  Both are at the wide cap, so neither can
+    # clamp, and the enclosure now holds the wide top.
+    resolved(session, wide, [])
+    first_log = []
+    first = resolved(session, wide, first_log)
+    assert first['envelope_clamped_to_cap'] == {}
+    assert not any('CLAMPED' in str(line) for line in first_log)
+
+    # A map whose remote cell edges MOVED gets a fresh answer from the
+    # service; the session only spares a map whose edges did not.  Drop the
+    # retained cap so this call asks again, which is the situation the clamp
+    # exists for.
+    for key in [k for k in session if isinstance(k, tuple) and k[0] == 'remote_cap']:
+        del session[key]
+    second_log = []
+    second = resolved(session, narrow, second_log)
+    clamp = second['envelope_clamped_to_cap']
+    assert clamp, "a retained top above a fallen cap must be clamped"
+    assert clamp['line_top_before_ev'] == pytest.approx(first['top_ev'])
+    assert clamp['line_top_ev'] < clamp['line_top_before_ev']
+    assert second['top_ev'] == pytest.approx(clamp['line_top_ev'])
+    assert second['top_bound_by'] == 'remote_cap'
+    # Every emitted sample is inside the CURRENT cap, which is the point.
+    assert np.all(np.abs(second['z_ry']) <= narrow*(1 + 1e-12))
+    assert second['remote_cap_ev'] == pytest.approx(narrow*RYD_TO_EV)
+    # The shrink is visible, and it is a note, not a refusal.
+    assert any('CLAMPED' in str(line) for line in second_log)
+
+    # A retained top BELOW the cap is untouched: the envelope still grows
+    # within the cap, it just never grows through it.
+    for key in [k for k in session if isinstance(k, tuple) and k[0] == 'remote_cap']:
+        del session[key]
+    third = resolved(session, wide, [])
+    assert third['envelope_clamped_to_cap'] == {}
+
+
 def test_sigma_window_can_set_the_top():
     """A patch over a deep state raises the support, rather than being clamped."""
     plain=resolve(fixture(plasma_seed=10.))

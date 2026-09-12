@@ -953,6 +953,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                        else RESPONSE_DOMAIN_PAD_RY),
         session=support_session)
     top_uncapped, umax_uncapped = top, umax_zolotarev
+    line_cap_ev = None
     if remote_cap_ev is not None:
         # The ceiling is on |z|. An imaginary sample has |z| = u exactly, but a
         # line sample sits at E + i*h, so the admissible REAL part is
@@ -987,6 +988,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     if umin >= umax:
         raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
     support_receipt = None
+    envelope_clamp = {}
     if support_session is not None:
         key = (RECIPE_HASH, tier, eta, int(meta.nspinor), int(meta.n_rmu),
                census['logical_band_count'])
@@ -996,9 +998,47 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         retained = support_receipt['retained']
         top, fine, umin, umax = (retained['line_top_ev'], retained['omega_fine_ev'],
                                  retained['u_min_ev'], retained['u_max_ev'])
+        # THE CAP IS AN ADMISSIBILITY CONSTRAINT; THE ENVELOPE IS A CONVENIENCE.
+        # A sample outside the bank's remote Taylor domain is one the rule
+        # cannot serve, while the retained envelope exists only to keep the
+        # support geometry stable across SC maps -- so the envelope may grow
+        # WITHIN the cap and never through it.  The two pull opposite ways:
+        # the envelope only ever rises, and the cap falls as the spectrum
+        # drifts, so a later map can inherit a top its own bank would refuse.
+        # Clamping here is what lets the Sigma-window shortfall take
+        # ARECIPE's warn-not-refuse path below instead of dying on
+        # GATE shared_pole_support_window (owner ruling 2026-09-12; run 49's
+        # Si SC deck reached map 2 with a retained top of 29.591 eV above that
+        # map's own cap).
+        if line_cap_ev is not None and top > line_cap_ev * (1.0 + 1.0e-12):
+            envelope_clamp = dict(line_top_before_ev=top, line_top_ev=line_cap_ev)
+            top, top_bound_by = line_cap_ev, 'remote_cap'
+        if remote_cap_ev is not None and umax > remote_cap_ev * (1.0 + 1.0e-12):
+            envelope_clamp.update(u_max_before_ev=umax, u_max_ev=remote_cap_ev)
+            umax, u_max_bound_by = remote_cap_ev, 'remote_cap'
+        if envelope_clamp:
+            print_fn(
+                f"  [shared-pole recipe {RECIPE_VERSION}] the retained support "
+                "envelope was CLAMPED to this map's admissible cap: "
+                + "; ".join(
+                    f"{name} {envelope_clamp[name + '_before_ev']:.4f} -> "
+                    f"{envelope_clamp[name + '_ev']:.4f} eV"
+                    for name in ('line_top', 'u_max')
+                    if name + '_before_ev' in envelope_clamp)
+                + f" (bank remote domain {remote_cap_ev:.4f} eV). The envelope "
+                  "may grow within the cap, never through it.")
+            if umin >= umax:
+                raise ValueError(
+                    f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV "
+                    "after clamping the retained envelope to the bank's remote "
+                    f"domain ({remote_cap_ev:.4f} eV); want: u_min < u_max; why: "
+                    "the admissible domain no longer contains an imaginary "
+                    "support interval -- the bank's near window must grow")
     # SELF-CONSISTENCY, not a user gate: `top` is constructed as a max that
-    # INCLUDES the Sigma-window term and the envelope only ever raises it, so
-    # this is unreachable by construction.  It names both numbers if it fires,
+    # INCLUDES the Sigma-window term, the envelope only ever raises it, and a
+    # retained envelope above this map's cap has just been clamped back to it,
+    # so `capped` holds whenever a cap exists and the refusal below is
+    # unreachable by construction.  It names both numbers if it fires,
     # because the failure it guards against -- Sigma evaluating W above the
     # fit's pointwise support, where the model is unconstrained and the
     # accuracy cliff lives -- is silent in every other receipt (ASIMOM 2026-09-11).
@@ -1104,6 +1144,9 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         # The cap is FOUND by evaluating the rule, so the receipt says how
         # many evaluations it took and what they cost.
         'remote_cap_search': remote_cap_receipt,
+        # Non-empty only when a retained SC envelope had to be pulled back to
+        # this map's admissible cap; the shrink must be visible in the receipt.
+        'envelope_clamped_to_cap': envelope_clamp,
         'line_step_ev': step, 'line_growth_fraction': growth,
         'line_ev': line, 'imaginary_ev': imaginary,
         'held_line_ev': held_line, 'held_imaginary_ev': held_imag,
