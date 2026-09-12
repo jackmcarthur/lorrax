@@ -87,22 +87,32 @@ def test_g_face_contraction_preserves_causal_transpose(tau):
         assert value.sharding.is_equivalent_to(NamedSharding(mesh,P(None,'x','y')),3)
 
 
-@pytest.mark.parametrize('parent_capacity,column_capacity', [(2,5),(1,3)])
-def test_synthesis_uses_same_carrier_for_resident_and_panels(
-        monkeypatch, parent_capacity, column_capacity):
+def _synthesis_fixture(monkeypatch):
+    """The carrier fixture: a real header, CPU stubs and a face reader.
+
+    The header is the SHIPPED minimum, not a smaller one: every shared-pole
+    consumer resolves its fixed-q policy through
+    ``qgrid_trs_policy_from_shared_pole_store`` (``operations``), binds the
+    physical realization through ``shared_pole_operator_realizer``
+    (``recipe``) and checks the packed basis geometry (``n_mu_logical``).
+    A header missing them does not exercise the synthesis; it raises
+    ``KeyError`` before reaching it.
+    """
     import distrib_la
     from file_io import shared_pole_store
-    from gw.mpa.sigma import _shared_pole_w_synthesis
     from common.grouped_layout import identity_square_grouped_shard_layout
+    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
     import runtime.aot_memory
     mesh = _mesh()
     tile = NamedSharding(mesh,P(None,'x','y'))
     layout = identity_square_grouped_shard_layout(8,8,(2,2))
-    meta = SimpleNamespace(mu_basis=SimpleNamespace(
+    meta = SimpleNamespace(nk_tot=8,nspinor=1,n_rmu=8,mu_basis=SimpleNamespace(
         n_packed=8,layout=layout,active_mask=np.ones(8,bool)))
     parents = np.arange(8,dtype=np.int32)%2
-    header = dict(n_q_irr=2,n_q_full=8,Kmax=5,nspinor=1,
+    header = dict(n_q_irr=2,n_q_full=8,n_mu_logical=8,Kmax=5,nspinor=1,
         representation='scalar-trs-even-s',grid=(2,2,2),q_irr_full_idx=np.arange(2),
+        operations=dict(authorized_rows=[0]),
+        recipe=dict(operator_realization=shared_real_pole_v1_r3b["operator_realization"]),
         qirr=dict(irr_idx_q=parents,sym_idx_q=np.zeros(8,np.int32),
                   sym_perm=np.arange(8,dtype=np.int32)[None,:],
                   L_table=np.zeros((1,8,3),np.int32),q_irr_frac=np.zeros((2,3)),
@@ -133,6 +143,18 @@ def test_synthesis_uses_same_carrier_for_resident_and_panels(
                 put(p,P()),put(np.full(hi-lo,last-first),P()))
 
     monkeypatch.setattr(shared_pole_store,'read_shared_pole_faces',read)
+    return SimpleNamespace(mesh=mesh,meta=meta,header=header,parents=parents,
+                           factor=factor,omega=omega,reads=reads,put=put)
+
+
+@pytest.mark.parametrize('parent_capacity,column_capacity', [(2,5),(1,3)])
+def test_synthesis_uses_same_carrier_for_resident_and_panels(
+        monkeypatch, parent_capacity, column_capacity):
+    from gw.mpa.sigma import _shared_pole_w_synthesis
+    fx = _synthesis_fixture(monkeypatch)
+    mesh, meta, header = fx.mesh, fx.meta, fx.header
+    parents, factor, omega, reads, put = (
+        fx.parents, fx.factor, fx.omega, fx.reads, fx.put)
     schedule=dict(status='PASS',parent_capacity=parent_capacity,
                   column_capacity=column_capacity,endpoint_budgets={})
     build=_shared_pole_w_synthesis(None,meta,header,omega,schedule,mesh_xy=mesh)
