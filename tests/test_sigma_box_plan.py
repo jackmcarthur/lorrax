@@ -758,22 +758,39 @@ def test_finite_certificate_corruption_is_refused_and_rebuilt(
                for row in repaired["branches"][0]["windows"])
 
 
-@pytest.mark.parametrize("changed", ["energies", "occupations", "poles", "eta", "eps"])
+def _sc_identity(iteration, occ_hash="fd-a"):
+    """The PRODUCTION self-consistent identity shape.
+
+    ``gw/shared_pole_recipe.shared_pole_sc_identity`` builds exactly this:
+    the map label is the prefix of ``hamiltonian``, not a separate key, so a
+    stub without it cannot see whether the map label was stripped.
+    """
+    return dict(hamiltonian=f"sc_map_{iteration}:{occ_hash}",
+                wavefunctions="qp_rotation_unreceipted",
+                recipe_hash="recipe-a", gate_hash="gate-a",
+                authentication="NON-AUTHENTICATING")
+
+
+@pytest.mark.parametrize("changed", ["hamiltonian", "recipe_hash", "poles", "eta", "eps"])
 def test_current_input_request_cannot_reuse_changed_map_rules(
         monkeypatch, tmp_path, changed):
     from gw.sigma_box_plan import sigma_rule_request_cache
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
-    identity = dict(energies="bands-a", occupations="fd-a", iteration_id="map-1")
+    identity = _sc_identity(1)
     poles, counts = np.array([[.09, 1.]]), np.array([2])
     kw = dict(eta=.1, eps=1e-4)
     first_dir = sigma_rule_request_cache(str(tmp_path), identity, poles, counts, **kw)
     args = dict(eps=1e-4, reduction_seconds=120., print_fn=lambda *_: None)
     plan_sigma_windows(_summaries(), [_branch()], np.array([.2, .5]), .1,
                        cache_dir=first_dir, **args)
-    identity["iteration_id"] = "map-2"
-    assert first_dir == sigma_rule_request_cache(str(tmp_path), identity, poles, counts, **kw)
-    if changed in ("energies", "occupations"):
-        identity[changed] += "-changed"
+    # THE NEXT SC MAP, same physics: same namespace, or the on-disk cache is
+    # dead across maps (review item 10).
+    assert first_dir == sigma_rule_request_cache(
+        str(tmp_path), _sc_identity(2), poles, counts, **kw)
+    if changed == "hamiltonian":
+        identity = _sc_identity(2, occ_hash="fd-b")
+    elif changed == "recipe_hash":
+        identity = dict(identity, recipe_hash="recipe-b")
     elif changed == "poles":
         poles[0, 0] += .001
     else:

@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import pickle
+import re
 import time
 
 from ffi import _services
@@ -65,19 +66,47 @@ def _rule_digest(rule, noise_amplification, reduction_steps):
     return identity.hexdigest()
 
 
+#: The self-consistent identity spells its Hamiltonian
+#: ``sc_map_{iteration}:{occ_hash}`` (gw/shared_pole_recipe.py), so the map
+#: label lives INSIDE a value, not only in the ``iteration_id`` key.
+_SC_MAP_LABEL = re.compile(r"^sc_map_\d+:")
+
+
+def _map_invariant_identity(identity):
+    """The identity with its SC map label removed, physics intact.
+
+    Stripping only ``iteration_id`` was a no-op under self-consistency: the
+    iteration number is also the prefix of ``hamiltonian``, so every map
+    opened a fresh ``request_<hex>`` namespace, logged a cache lookup
+    failure, and could never serve a containment-compatible rule stored one
+    directory over.  What remains -- the occupation hash the label prefixes,
+    the recipe and gate hashes, the census poles and eta/eps digested by the
+    caller -- is the physical input the rule depends on, and every hit is
+    still re-checked for box containment and the requested error currency
+    before it is used.
+    """
+    inputs = {}
+    for key, value in identity.items():
+        if key == "iteration_id":
+            continue
+        inputs[key] = (_SC_MAP_LABEL.sub("", value)
+                       if isinstance(value, str) else value)
+    return inputs
+
+
 def sigma_rule_request_cache(directory, identity, poles2, counts, *, eta, eps):
     """Scope shared-pole rules to authenticated current-map physical inputs.
 
     ``identity`` is the model's existing energy/occupation/recipe provenance;
     ``poles2`` [Nq,K] in Ry² and ``counts`` [Nq] are the small host census.
-    Map labels are excluded: equal physical inputs on restart share rules,
-    but changed spectra or occupations cannot inherit a previous map's plan.
+    Map labels are excluded (:func:`_map_invariant_identity`): equal physical
+    inputs on restart and across SC maps share rules, but changed spectra or
+    occupations cannot inherit a previous map's plan.
     Domain containment and the executor noise/growth gates still run on hits.
     """
     if directory is None:
         return None
-    inputs = {key: value for key, value in identity.items()
-              if key != "iteration_id"}
+    inputs = _map_invariant_identity(identity)
     digest = hashlib.sha256(json.dumps(
         [_RULE_CACHE_SCHEMA, inputs, float(eta), float(eps)],
         sort_keys=True).encode())
