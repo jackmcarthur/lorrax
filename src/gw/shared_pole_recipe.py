@@ -573,7 +573,7 @@ def _sigma_extent_ev(config):
     return max(abs(float(e)) for e in edges)
 
 
-def _remote_domain_cap(wfns, meta, census, eta_ry, rel_tol):
+def _remote_domain_cap(wfns, meta, census, eta_ry, rel_tol, domain_pad_ry=0.0):
     """Largest sample |z| in eV the bank's remote cells admit, and that edge.
 
     ONE PARTITIONER. ``response_windows`` is the bank's own near/remote split
@@ -581,6 +581,20 @@ def _remote_domain_cap(wfns, meta, census, eta_ry, rel_tol):
     already has -- so it is called, not reimplemented; ``minimax`` owns the
     convergence predicate and answers the radius. Returns ``(None, None)``
     when the deck has no remote cell, in which case no sample can be refused.
+
+    THE DOMAIN THE CAP IS COMPUTED FOR MUST BE THE DOMAIN THE BANK WILL USE.
+    Under self-consistency the bank hands ``response_laplace_rule`` a
+    ``domain_pad_ry`` (``response_bank.RESPONSE_DOMAIN_PAD_RY``) so a rule
+    reused across maps stays valid while the spectrum drifts, and the rule
+    then expands about ``max(lo - pad, lo/2)`` instead of ``lo``.  A lower
+    edge means a LARGER geometric ratio at the same ``|z|``, so a cap taken
+    on the unpadded edge admits samples the padded expansion cannot certify:
+    the first SC map refuses with 'remote Taylor order budget exceeded' on a
+    support the one-shot cap was happy with (measured on run 49's Si SC deck,
+    AREBASE 2026-09-12).  Capping on the padded edge is self-consistent --
+    every emitted ``|z|`` then lies inside the padded domain, which is
+    exactly the predicate the rule uses to decide the pad applies at all.
+    One-shot passes ``domain_pad_ry = 0`` and is unchanged.
     """
     from common.units import RYD_TO_EV
     from minimax import response_remote_max_abs_z
@@ -591,8 +605,10 @@ def _remote_domain_cap(wfns, meta, census, eta_ry, rel_tol):
     if not cells:
         return None, None
     delta_lo = min(float(cell['delta_min_ry']) for cell in cells)
-    cap = response_remote_max_abs_z(delta_lo, eta_ry, rel_tol)
-    return cap * RYD_TO_EV, delta_lo * RYD_TO_EV
+    # ``response_laplace_rule``'s own padded edge, character for character.
+    effective_lo = max(delta_lo - float(domain_pad_ry), delta_lo / 2.0)
+    cap = response_remote_max_abs_z(effective_lo, eta_ry, rel_tol)
+    return cap * RYD_TO_EV, effective_lo * RYD_TO_EV
 
 
 def _support_report(r, tier, census):
@@ -638,7 +654,12 @@ def _support_report(r, tier, census):
            f" (Zolotarev would have asked {r['u_max_uncapped_ev']:.3f})"),
         f"  Sample height       : {r['height_ev']:.3f} eV = 4*eta",
         ("  Bank remote domain  : |z| <= %.3f eV, from the lowest remote cell "
-         "edge %.3f eV" % (r['remote_cap_ev'], r['remote_delta_lo_ev'])
+         "edge %.3f eV%s" % (
+             r['remote_cap_ev'], r['remote_delta_lo_ev'],
+             "" if not r.get('remote_domain_pad_ev') else
+             " (already lowered by the SC rule session's %.3f eV pad, which is "
+             "the edge the bank's own expansion will use)"
+             % r['remote_domain_pad_ev'])
          if r.get('remote_cap_ev') is not None else
          "  Bank remote domain  : no remote cell; no sample ceiling"),
         "  Bank cost grows with the top support and as 1/height: widening",
@@ -890,8 +911,13 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     # same inputs this resolver already uses -- so there is one near/remote
     # partition in the tree, not a copy of one here; then ask minimax for the
     # largest |z| its remote Taylor rule can certify for the lowest cell.
+    from .response_bank import RESPONSE_DOMAIN_PAD_RY
     remote_cap_ev, remote_delta_lo_ev = _remote_domain_cap(
-        wfns, meta, census, height / RYD_TO_EV, recipe['bank_rule_tolerance'])
+        wfns, meta, census, height / RYD_TO_EV, recipe['bank_rule_tolerance'],
+        # The bank pads its remote cells exactly when it keeps a rule session,
+        # which is exactly when this resolver is given a support session.
+        domain_pad_ry=(0.0 if support_session is None
+                       else RESPONSE_DOMAIN_PAD_RY))
     top_uncapped, umax_uncapped = top, umax_zolotarev
     if remote_cap_ev is not None:
         # The ceiling is on |z|. An imaginary sample has |z| = u exactly, but a
@@ -1038,6 +1064,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'top_uncapped_ev': top_uncapped, 'u_max_uncapped_ev': umax_uncapped,
         'u_max_bound_by': u_max_bound_by,
         'remote_cap_ev': remote_cap_ev, 'remote_delta_lo_ev': remote_delta_lo_ev,
+        'remote_domain_pad_ev': (0.0 if support_session is None
+                                 else RESPONSE_DOMAIN_PAD_RY * RYD_TO_EV),
         'line_step_ev': step, 'line_growth_fraction': growth,
         'line_ev': line, 'imaginary_ev': imaginary,
         'held_line_ev': held_line, 'held_imaginary_ev': held_imag,

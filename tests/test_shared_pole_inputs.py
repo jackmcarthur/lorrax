@@ -314,6 +314,73 @@ def test_remote_domain_cap_limits_every_emitted_sample():
     assert np.all(np.abs(r['z_ry'])*RYD_TO_EV <= cap*(1+1e-12))
 
 
+def test_remote_domain_cap_uses_the_sc_padded_edge():
+    """Under SC the cap must be taken on the edge the BANK will expand about.
+
+    ``response_bank`` hands ``response_laplace_rule`` a
+    ``RESPONSE_DOMAIN_PAD_RY`` (4 eV) whenever it keeps a rule session, i.e.
+    exactly under self-consistency, and the rule then expands about
+    ``max(lo - pad, lo/2)``.  A lower edge is a LARGER geometric ratio at the
+    same ``|z|``, so a cap taken on the unpadded edge admits samples the
+    padded expansion cannot certify: run 49's Si SC deck died at map 0 with
+    'remote Taylor order budget exceeded' on exactly that (AREBASE, job
+    58222998).  Same deck, same resolver, with and without a support session.
+    """
+    import minimax
+    from gw.response_bank import RESPONSE_DOMAIN_PAD_RY
+
+    energies = np.array([[-36., -20., -1., 1.], [-36., -20., -1., 2.]])/RYD_TO_EV
+    occ = np.array([[1., 1., 1., 0.]]*2)
+    wf = NS(enk=energies, occ=occ,
+            slices=NS(b0=0, b4_logical=4, val=slice(0, 3), cond_all_logical=slice(3, 4)))
+    volume = 4*np.pi*2/((16.5/RYD_TO_EV/2)**2)
+
+    def resolved(session):
+        meta = NS(nspin=1, nspinor=1, n_rmu=17, nk_tot=2, cell_volume=volume,
+                  b_id_4_chi_user=4)
+        bind_shared_pole_census(wf, meta, occupation_state=None, trs_allowed=True,
+                                state_capacity=2., kweights=[.5, .5])
+        config = NS(sigma=NS(w_model='shared_pole', w_accuracy='production',
+                             regularization_ev=.25, omega_min_ev=-5., omega_max_ev=5.,
+                             parsed_omega_patches_ev=list),
+                    memory=NS(per_device_gb=30.))
+        return resolve_shared_pole_recipe(
+            config, wf, meta, mesh_xy=NS(shape={'x': 2, 'y': 2}),
+            print_fn=lambda *_: None, support_session=session)
+
+    one_shot, sc = resolved(None), resolved({})
+    pad_ev = RESPONSE_DOMAIN_PAD_RY*RYD_TO_EV
+
+    # One-shot is UNCHANGED: the raw edge, no pad.
+    assert one_shot['remote_delta_lo_ev'] == pytest.approx(37.0, abs=1e-9)
+    assert one_shot['remote_domain_pad_ev'] == 0.0
+
+    # SC caps on the padded edge, which is the rule's own max(lo - pad, lo/2).
+    assert sc['remote_domain_pad_ev'] == pytest.approx(pad_ev)
+    assert sc['remote_delta_lo_ev'] == pytest.approx(max(37.0 - pad_ev, 18.5))
+    assert sc['remote_cap_ev'] == pytest.approx(minimax.response_remote_max_abs_z(
+        sc['remote_delta_lo_ev']/RYD_TO_EV, sc['height_ry'],
+        sc['bank_rule_tolerance'])*RYD_TO_EV)
+
+    # The cap BINDS harder under SC, and every emitted sample is inside it.
+    assert sc['remote_cap_ev'] < one_shot['remote_cap_ev']
+    assert np.all(np.abs(sc['z_ry'])*RYD_TO_EV <= sc['remote_cap_ev']*(1+1e-12))
+
+    # THE POINT: the SC samples would have been REFUSED by the padded rule had
+    # the unpadded cap been used.  Take the one-shot supports, pad the edge the
+    # way the bank does, and ask the rule's own predicate.
+    padded_lo = max(37.0 - pad_ev, 18.5)/RYD_TO_EV
+    rho_max = minimax.response_remote_max_ratio(sc['bank_rule_tolerance'])
+    eta = sc['height_ry']
+    def ratio(z_ry):
+        anchor = eta/padded_lo
+        return np.abs((z_ry/padded_lo)**2 + anchor**2)/(1 + anchor**2)
+    assert ratio(np.abs(one_shot['z_ry']).max()) > rho_max
+    # u_max IS the radius, so the largest SC sample sits exactly on rho_max and
+    # the comparison is a rounding question, not a margin question.
+    assert ratio(np.abs(sc['z_ry']).max()) <= rho_max*(1 + 1e-12)
+
+
 def test_sigma_window_can_set_the_top():
     """A patch over a deep state raises the support, rather than being clamped."""
     plain=resolve(fixture(plasma_seed=10.))

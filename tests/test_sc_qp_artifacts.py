@@ -8,6 +8,9 @@ import pytest
 
 from gw import sc_iteration
 from file_io import qp_wfn
+# main moved the QP-rotation READERS into the shared restart bundle; the
+# writer and the WFN authentication stayed in qp_wfn.
+from file_io import restart_bundle as qp_reader
 
 
 @pytest.mark.parametrize("write_full_wfn", [False, True])
@@ -52,7 +55,7 @@ def test_small_qp_artifact_preserves_accepted_hamiltonian(
         output_dir=str(tmp_path), write_wfn_h5=write_full_wfn,
         print_fn=lambda *_a: None)
 
-    artifact = qp_wfn.read_qp_rotations_artifact(qp_path)
+    artifact = qp_reader.read_qp_rotations_artifact(qp_path)
     qp_wfn.authenticate_qp_rotations_source_wfn(
         artifact, wfn, artifact_path=qp_path)
     u, e = artifact["U_mnk"], artifact["E_qp_nk_rydberg"]

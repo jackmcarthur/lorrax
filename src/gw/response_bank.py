@@ -14,6 +14,17 @@ import time
 import jax
 from common import timing
 from common.units import RYD_TO_EV
+
+#: Domain pad the SC rule session hands the response rules, in Ry.  Each
+#: one-particle endpoint gets 2 eV, so a transition edge gets 4 eV: a rule
+#: reused across SC maps has to stay valid while the spectrum drifts.  It is
+#: published because the SAMPLE CHOOSER has to respect the same padded domain
+#: -- ``gw.shared_pole_recipe._remote_domain_cap`` caps every emitted |z| for
+#: the padded remote cell, not the unpadded one, or the first SC map refuses
+#: with 'remote Taylor order budget exceeded' on samples the one-shot cap
+#: admitted.  One number, two readers.
+RESPONSE_DOMAIN_PAD_RY = 4.0 / RYD_TO_EV
+
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -601,8 +612,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         middle = energy[masks[1]]
         delta = float(middle.max()-middle.min())
         session = getattr(meta, "shared_pole_response_rules", None)
-        # Each one-particle endpoint gets 2 eV: a transition edge gets 4 eV.
-        pad = 4.0/RYD_TO_EV if session is not None else 0.0
+        pad = RESPONSE_DOMAIN_PAD_RY if session is not None else 0.0
         rule = bank_rule(z,delta,rel_tol=sample_plan["bank_rule_tolerance"],
             previous=None if session is None else session.get("stream"),
             domain_pad_ry=pad)
