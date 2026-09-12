@@ -2380,7 +2380,15 @@ def _parse_input_keys(section):
             if kind is bool:
                 value = section.getboolean(key)
             elif kind is int:
-                value = section.getint(key)
+                # A nullable integer accepts the literal ``none``: that
+                # spelling is how a deck says "unset" for a key whose
+                # ``None`` has to stay distinguishable from any integer it
+                # could otherwise carry (see ``_NULLABLE_INT``).  Without
+                # this branch every such key dies in ``getint`` with
+                # "invalid literal for int() with base 10: 'none'".
+                value = (None if key in _NULLABLE_INT
+                         and raw.strip().lower() == "none"
+                         else section.getint(key))
             elif kind is float:
                 value = section.getfloat(key)
             else:

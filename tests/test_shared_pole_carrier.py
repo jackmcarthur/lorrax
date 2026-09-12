@@ -103,7 +103,7 @@ def _synthesis_fixture(monkeypatch):
     import distrib_la
     from file_io import shared_pole_store
     from common.grouped_layout import identity_square_grouped_shard_layout
-    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
+    from gw.shared_pole_recipe import shared_real_pole_v2_r1
     import runtime.aot_memory
     mesh = _mesh()
     tile = NamedSharding(mesh,P(None,'x','y'))
@@ -123,7 +123,7 @@ def _synthesis_fixture(monkeypatch):
                         translation=[[0.,0.,0.]]*2,
                         spin_real=[[[1.]],[[1.]]],spin_imag=[[[0.]],[[0.]]],
                         authorized_rows=[0],typing_source='test-fixture'),
-        recipe=dict(operator_realization=shared_real_pole_v1_r3b["operator_realization"]),
+        recipe=dict(operator_realization=shared_real_pole_v2_r1["operator_realization"]),
         # Both canonical row halves: the spatial identity and its
         # antiunitary partner, which the realizer requires to be covered.
         qirr=dict(irr_idx_q=parents,sym_idx_q=np.zeros(8,np.int32),

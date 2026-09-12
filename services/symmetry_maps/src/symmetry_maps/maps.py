@@ -530,9 +530,12 @@ def unfold_isdf_operator(
                 ("right", fwd_perm_right, right_local_perm, right_chunk)):
             # ONE certification owner (certify_endpoint_locality), applied to
             # the rows this call actually uses: a table row no operation
-            # selects need not be axis-local.
+            # selects need not be axis-local.  BOTH tables are selected --
+            # the offsets are compared against the certificate's own
+            # ``local_perm``, which is computed on the selected rows only.
+            global_perm, local_perm = global_perm[sym_np], local_perm[sym_np]
             cert = certify_endpoint_locality(
-                global_perm[sym_np], mesh=mesh_xy,
+                global_perm, mesh=mesh_xy,
                 mesh_axis='x' if label == 'left' else 'y')
             if not cert['is_local']:
                 raise ValueError(

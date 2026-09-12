@@ -21,14 +21,17 @@ def test_small_qp_artifact_preserves_accepted_hamiltonian(
                    [0.0, 0.0, 1.9]]], dtype=np.complex128)
     state = SimpleNamespace(H_qp_dft=h, occupation_state=None, outputs=None)
     points = np.zeros((1, 3))
-    wfn = SimpleNamespace(
-        energies=np.array([[[-0.7, 0.3, 1.5]]]), kpoints=points,
-        nelec=1, nspinor=1, nbands=3, nkpts=1, path=None,
-        occupation_state_capacity=2.0)
     sym = SimpleNamespace(
         unfolded_kpts=points, kirr_fullids=np.array([0]),
         irr_idx_k=np.array([0]), sym_idx_k=np.array([0]),
         sym_mats_k=np.stack([np.eye(3), -np.eye(3)]))
+    # ``dump_qp_wfn_artifacts`` reduces the full BZ to the FILE wedge through
+    # ``wfn.symmetry()``, so the fake WFN has to answer that the same way the
+    # loader's does -- with this deck's own tables.
+    wfn = SimpleNamespace(
+        energies=np.array([[[-0.7, 0.3, 1.5]]]), kpoints=points,
+        nelec=1, nspinor=1, nbands=3, nkpts=1, path=None,
+        occupation_state_capacity=2.0, symmetry=lambda: sym)
 
     def diagonalize(hamiltonian, n_occ, mesh):
         assert hamiltonian is h
