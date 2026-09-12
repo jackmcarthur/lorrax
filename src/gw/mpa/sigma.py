@@ -672,9 +672,12 @@ def _shared_pole_inherited_peak(args, meta, *, mesh_xy, kgrid, brackets,
         return B[0]
     peaks = []
     for builder in (None, phased_w):
+        # The control leg lowers the INCUMBENT route on a run that never
+        # dispatches it: it must not leave its executable in the process-wide
+        # kernel cache for a later caller to pick up (``cache=False``).
         kernel = get_shared_sigma_tau_kernel(
             mesh_xy=mesh_xy,kgrid=kgrid,brackets=brackets,pack_brackets=pack_brackets,
-            w_synthesis=builder,**face_kwargs)
+            w_synthesis=builder,cache=False,**face_kwargs)
         compiled = jax.jit(kernel).lower(*same_args).compile()
         peaks.append(aot_kernel_peak_bytes(compiled).compiled_peak)
     return capacity.record_sigma_peak(
@@ -1097,7 +1100,15 @@ def _integrate_sigma_batches(
                         jnp.asarray(win.E_ref_A),
                         jnp.asarray(win.E_ref_B),
                         jnp.asarray(first_t, dtype=jnp.complex128))
-                    if w_synthesis is not None:
+                    if w_synthesis is not None and tau_profile:
+                        # COMPILE-ONLY MEASUREMENT, not admission.  Two extra
+                        # AOT trace+lower+compile passes per SC map produce a
+                        # receipt no reservation in this stage consumes: every
+                        # Sigma reservation is taken in the synthesis planner
+                        # before the sweep opens.  It runs on the campaign's
+                        # profiling switch (LORRAX_SIGMA_TAU_TIMING) like the
+                        # rest of this executor's measurement work; unrequested
+                        # the ledger row stays NOT_MEASURED and says so.
                         inherited = _shared_pole_inherited_peak(
                             prewarm_args,meta,mesh_xy=mesh_xy,kgrid=kgrid,
                             brackets=brackets,pack_brackets=pack_brackets,

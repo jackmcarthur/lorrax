@@ -129,3 +129,56 @@ def test_tau_node_loop_times_nothing_outside_the_profile_switch():
                 if isinstance(node, ast.FunctionDef) and node.name == "tau_band")
     assert any(isinstance(n, ast.Name) and n.id == "tau_profile"
                for n in ast.walk(band)), "tau_band ignores the profile switch"
+
+
+def test_inherited_sigma_peak_is_gated_and_never_caches_its_control():
+    """Item 17: the double compile is gated, and its control is uncached.
+
+    ``_shared_pole_inherited_peak`` lowered and compiled the full spatial tau
+    kernel twice -- once for the incumbent route, once for the shared-pole
+    injection -- on every shared-pole Sigma stage, with no gate, dial or env
+    var, only to produce a ``record_sigma_peak`` receipt.  The
+    ``w_synthesis=None`` leg also inserted the INCUMBENT executable into the
+    process-wide ``_sigma_shared_tau_kernel_cache`` on a run that never
+    dispatches that route.
+    """
+    import inspect
+    from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
+    tree = _sigma_tree()
+    call = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_shared_pole_inherited_peak")
+    guards = [node for node in ast.walk(tree) if isinstance(node, ast.If)
+              and any(inner is call for stmt in node.body
+                      for inner in ast.walk(stmt))]
+    assert guards, "the inherited-peak compile has no enclosing guard"
+    assert any(isinstance(n, ast.Name) and n.id == "tau_profile"
+               for guard in guards for n in ast.walk(guard.test)), \
+        "the inherited-peak compile is not gated on the profile switch"
+    peak = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "_shared_pole_inherited_peak")
+    uncached = [kw for node in ast.walk(peak) if isinstance(node, ast.Call)
+                for kw in node.keywords
+                if kw.arg == "cache" and getattr(kw.value, "value", None) is False]
+    assert uncached, "the control leg must ask for cache=False"
+    assert "cache" in inspect.signature(get_shared_sigma_tau_kernel).parameters
+
+
+def test_shared_tau_kernel_cache_writes_all_honour_the_cache_flag():
+    """Neither the fused nor the staged return may write a cache entry."""
+    from gw import ppm_tau_kernel
+    tree = ast.parse(Path(ppm_tau_kernel.__file__).read_text())
+    writes = [node for node in ast.walk(tree)
+              if isinstance(node, ast.Assign)
+              and any(isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
+                      and t.value.id == "_sigma_shared_tau_kernel_cache"
+                      for t in node.targets)]
+    assert writes, "no shared tau kernel cache write found"
+    for write in writes:
+        guards = [node for node in ast.walk(tree) if isinstance(node, ast.If)
+                  and any(inner is write for stmt in node.body
+                          for inner in ast.walk(stmt))]
+        assert any(isinstance(n, ast.Name) and n.id == "cache"
+                   for guard in guards for n in ast.walk(guard.test)), \
+            "a cache write is not guarded by the cache flag"

@@ -985,6 +985,7 @@ def get_shared_sigma_tau_kernel(
     pack_brackets: bool = True,
     k_unfold_plan=None,
     w_synthesis=None,
+    cache: bool = True,
 ) -> Callable[..., jax.Array]:
     """Return the GN tau kernel with a selected multipole W(tau) builder.
 
@@ -1000,6 +1001,12 @@ def get_shared_sigma_tau_kernel(
     same spatial kernel for a leading disjoint band-bracket axis.  ``layout``,
     ``face_shape`` and ``pack_brackets`` forward to
     :func:`_get_sigma_kij_kernel` unchanged.
+
+    ``cache=False`` builds the kernel without reading or writing the
+    process-wide incumbent cache.  A compile-only measurement of the
+    incumbent route on a run that never dispatches it is the caller for
+    that: it must not leave its control executable behind for a later
+    caller to pick up.
 
     ``w_synthesis`` optionally supplies the resolved model's W builder with
     the same seven operands as :func:`build_shared_w_tau`. It must finish
@@ -1018,7 +1025,7 @@ def get_shared_sigma_tau_kernel(
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
            brackets, layout, face_shape, face_band_extent,
            bool(pack_brackets), k_unfold_plan)
-    if w_synthesis is None and key in _sigma_shared_tau_kernel_cache:
+    if w_synthesis is None and cache and key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
     ensure_jax_compile_cache()
@@ -1054,7 +1061,8 @@ def get_shared_sigma_tau_kernel(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                 E_A, mask_A, E_ref_A, t_node, W_t)
 
-        _sigma_shared_tau_kernel_cache[key] = _tau
+        if cache:
+            _sigma_shared_tau_kernel_cache[key] = _tau
         return _tau
 
     profile_stages = _stage_timing_enabled()
@@ -1081,6 +1089,6 @@ def get_shared_sigma_tau_kernel(
 
     # A model builder may own resident faces and an open reader for this SC
     # map. Never retain that resource closure in the process-wide jit cache.
-    if w_synthesis is None:
+    if w_synthesis is None and cache:
         _sigma_shared_tau_kernel_cache[key] = _tau_staged
     return _tau_staged
