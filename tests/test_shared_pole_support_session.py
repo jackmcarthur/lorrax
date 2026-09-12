@@ -8,15 +8,24 @@ from common.units import RYD_TO_EV
 from gw.shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
 
 
-def inputs(gap=.7, *, eta=.25, tier="production", top=20.):
+def inputs(gap=.7, *, eta=.25, tier="production", plasma_seed=10.):
+    """``plasma_seed`` is omega_p of the shallow occupied band alone, in eV.
+
+    It stays under 14.1, so the 20 eV band never joins the active set and the
+    geometry these tests exercise is the shallow manifold's, not a fixed-point
+    flip (that transition is covered in test_shared_pole_inputs).
+    """
     config = NS(sigma=NS(w_model="shared_pole", w_accuracy=tier,
-                         regularization_ev=eta), memory=NS(per_device_gb=30.))
+                         regularization_ev=eta, omega_min_ev=-5., omega_max_ev=5.,
+                         parsed_omega_patches_ev=list),
+                memory=NS(per_device_gb=30.))
     wfns = NS(enk=np.array([[-20., -gap/2, gap/2, 999.]]*2)/RYD_TO_EV,
               occ=np.array([[1., 1., 0., 0.]]*2),
               slices=NS(b0=0, b4_logical=3, val=slice(0, 2),
                         cond_all_logical=slice(2, 3)))
-    volume = 4*np.pi*2 / (((top-3.5)/RYD_TO_EV/2)**2)
-    meta = NS(nspin=1, nspinor=1, n_rmu=17, nk_tot=2, cell_volume=volume)
+    volume = 4*np.pi*2 / ((plasma_seed/RYD_TO_EV/2)**2)
+    meta = NS(nspin=1, nspinor=1, n_rmu=17, nk_tot=2, cell_volume=volume,
+              b_id_4_chi_user=3)
     rebind(wfns, meta)
     return config, wfns, meta
 
@@ -54,7 +63,7 @@ def test_gap_growth_keeps_points_roles_but_rebinds_current_state():
     reference = resolve(args, session)
     assert reference["imaginary_count"] == 4
     assert_same_geometry(reference, resolve(args))
-    args[1].enk[:, 1:3] = np.array([-.74, .74])/RYD_TO_EV
+    args[1].enk[:, 1:3] = np.array([-.8, .8])/RYD_TO_EV
     rebind(args[1], args[2])
     first = resolve(args, session)
     assert first["support_envelope"]["status"] == "initial"
@@ -92,12 +101,12 @@ def test_gap_shrink_expands_once_then_growth_stays_enclosed():
 
 
 def test_plasma_interval_expands_and_never_shrinks():
-    session, first = interacting_session(inputs(top=20.))
-    expanded = resolve(inputs(top=24.), session)
+    session, first = interacting_session(inputs(plasma_seed=10.))
+    expanded = resolve(inputs(plasma_seed=12.), session)
     assert expanded["support_envelope"]["status"] == "expanded"
     assert expanded["top_ev"] > first["top_ev"]
     assert expanded["u_max_ev"] > first["u_max_ev"]
-    contracted = resolve(inputs(top=18.), session)
+    contracted = resolve(inputs(plasma_seed=9.), session)
     assert_same_geometry(expanded, contracted)
     assert contracted["plasma_ev"] < expanded["plasma_ev"]
     assert contracted["support_envelope"]["required"]["line_top_ev"] < contracted["top_ev"]
@@ -133,7 +142,7 @@ def test_current_census_is_required_even_with_an_existing_envelope():
 def test_session_does_not_bypass_invalid_current_interval():
     session, _ = interacting_session(inputs())
     with pytest.raises(ValueError, match="GATE shared_pole_interval"):
-        resolve(inputs(eta=5.), session)
+        resolve(inputs(eta=7.), session)
 
 
 def test_enclosed_recipe_preserves_distinct_causal_training_and_holdout_points():
@@ -156,12 +165,12 @@ def test_independent_resolution_remains_current_and_has_no_session_receipt():
 
 def test_reference_interval_is_not_retained_by_first_interacting_map():
     session = {}
-    reference = resolve(inputs(.7, top=24.), session)
+    reference = resolve(inputs(.7, plasma_seed=12.), session)
     assert reference["support_envelope"]["status"] == "initial_reference"
     assert reference["support_envelope"]["epoch"] == -1
     assert session == {"reference_complete": True}
-    current = resolve(inputs(1.5, top=20.), session)
-    assert_same_geometry(current, resolve(inputs(1.5, top=20.)))
+    current = resolve(inputs(1.5, plasma_seed=10.), session)
+    assert_same_geometry(current, resolve(inputs(1.5, plasma_seed=10.)))
     assert current["top_ev"] < reference["top_ev"]
     assert current["u_min_ev"] > reference["u_min_ev"]
     assert current["support_envelope"]["status"] == "initial"

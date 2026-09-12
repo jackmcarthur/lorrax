@@ -42,7 +42,7 @@ def _fixture(mesh):
     meta.shared_pole_capacity.reserve("fixture_live_bound",resident_bytes_per_rank=4096,workspace_bytes_per_rank=0)
     meta.shared_pole_capacity.live_stages=("fixture_live_bound",)
     tables={"qirr":qt,"q_irr_full_idx":np.arange(3,dtype=np.int64),"sym":sym}
-    recipe={"version":"shared_real_pole_v1_r3b","gate_version":"shared_real_pole_gates_v1_r3b"}
+    recipe={"version":"shared_real_pole_v2_r1","gate_version":"shared_real_pole_gates_v1_r3b"}
     identity={key:"planted-"+key for key in store._IDENTITY_KEYS}
     return meta,tables,recipe,identity
 
@@ -55,8 +55,8 @@ def _sigma_fixture(mesh, *, identity_layout=False):
     A triangular cell's C3 plus inversion has orbit sizes 1,6,2 here.
     """
     meta, _, recipe, identity = _fixture(mesh)
-    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
-    recipe = dict(recipe, operator_realization=shared_real_pole_v1_r3b["operator_realization"])
+    from gw.shared_pole_recipe import shared_real_pole_v2_r1
+    recipe = dict(recipe, operator_realization=shared_real_pole_v2_r1["operator_realization"])
     c3 = np.asarray([[0,-1,0],[1,-1,0],[0,0,1]],np.int32)
     positive = np.stack([np.eye(3,dtype=np.int32),c3,c3@c3])
     rotations = np.concatenate([positive,-positive])

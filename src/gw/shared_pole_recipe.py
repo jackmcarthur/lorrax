@@ -11,36 +11,86 @@ import hashlib
 import json
 import math
 
-RECIPE_VERSION = "shared_real_pole_v1_r3b"
+RECIPE_VERSION = "shared_real_pole_v2_r1"
 GATE_VERSION = "shared_real_pole_gates_v1_r3b"
 RECEIPT_SCHEMA = "lorrax.shared-real-pole.receipt.v1"
 ROLE_CODES = {"line": 0, "imaginary": 1, "infinity": 2, "held_line": 3, "held_imaginary": 4}
 
-shared_real_pole_v1_r3b = {
+# SCALE-FREE BY CONSTRUCTION.  Every dial below is a multiple of eta, of the
+# plasma frequency of the screening-active electrons, of the band energies, or
+# of the Sigma omega-box, or a dimensionless fraction.  There is no absolute
+# energy in this table, so the same recipe resolves sensibly for a material
+# with any bandwidth and any plasmon.  v1_r3b's four absolute constants
+# (line_break_ev 12, plasma_margin_ev 3.5, imaginary_floor_max_ev 16,
+# active_depth_ev 15) each encoded one of the two campaign decks: the 12 eV
+# break fell BELOW Si's 16.6 eV plasmon and ABOVE Na's 6.05 eV one, so Si
+# sampled its own plasmon on the coarse branch, and the 15 eV depth sat 0.04 eV
+# from Na's 2p semicore.
+shared_real_pole_v2_r1 = {
     "version": RECIPE_VERSION,
     "height_eta_factor": 4.0,
-    "reference_eta_ev": 0.25,
-    "active_depth_ev": 15.0,
-    "borderline_depth_ev": 25.0,
-    "line_break_ev": 12.0,
-    "line_low_step_ev": 0.5,
-    "line_spacing_rule": "2*eta below 12 eV, 4*eta above; no material branch",
-    "line_high_step_ev": 1.0,
-    "plasma_margin_ev": 3.5,
-    "imaginary_floor_max_ev": 16.0,
+    # An electron screens at a frequency only if it is bound by less than that
+    # frequency: the active set is the fixed point of depth <= factor*omega_p
+    # over the set including the candidate band.  Factor 1 needs no calibration.
+    "active_plasma_factor": 1.0,
+    "borderline_plasma_factor": 2.0,
+    # Fine spacing 2*eta on [0, omega_fine], then geometric growth: the
+    # structure (e-h continuum and the collective pole) lives at and below
+    # omega_fine, and above it W_c is a smooth tail whose only scale is omega.
+    "line_step_eta_factor": 2.0,
+    # MEASURED, not assumed. 0.15 was tried on Si because the held-W trigger
+    # fired (the second held line point at 23.206 eV, inside that deck's
+    # 30.325 eV Sigma reach, at 15.10x the incumbent's dWc/ds). It works as a
+    # model-fidelity dial -- the tail held point improves 6.18x -- but it moves
+    # the DELIVERED Sigma by at most 0.98 meV with no row over 2 meV, for
+    # +8.3% sum K, +10.8% Kmax and +24 MB of W storage (job 58217047 Si arms
+    # .8 vs xi15). Below the campaign's 2-5 meV accuracy scale and its 2x cost
+    # scale, so the default stays 0.25 and 0.15 is recorded as the measured
+    # alternative in algorithm_guide.md section 7.
+    "line_growth_fraction": 0.25,
+    "line_spacing_rule": ("2*eta to omega_fine=max(omega_p, E_g+active depth), "
+                          "then step*(1+0.25) per interval; no absolute energy, "
+                          "no material branch"),
+    # top clears BOTH the plasmon and the frequencies Sigma actually samples.
+    # 2.25*omega_fine: |W_c| has fallen to ~1/2.25^2 of its static scale, where
+    # M1/M3 carry it.  1.25*(Sigma box extent + active occupied depth): the W
+    # frequency Sigma needs at evaluation energy E is |E - E_n'|, so the top of
+    # that window is the box edge plus the depth of the screening manifold.
+    "plasma_top_factor": 2.25,
+    "sigma_window_top_factor": 1.25,
+    # -W_c(i u) is in its 1/u^2 tail by ~2 omega_p, so the LAST node belongs
+    # just past that, not at it.  2.5 is within 6% of the only measured-good
+    # u_max (Na 16.0 eV = 2.65 omega_p; u_max at the line top, 1.58 omega_p,
+    # was 2.9x worse) and changes neither reference deck's node count: the
+    # Zolotarev count turns over at kappa = 16.096, and 2.5*omega_fine leaves
+    # Na at 3 nodes (kappa 15.12) and Si at 4 (kappa 41.5).
+    "imaginary_top_factor": 2.5,
+    # The bank's remote Laplace cells expand about their lowest transition
+    # edge, and that expansion has a convergence domain the SAMPLE PLAN must
+    # respect: a support above it is refused by response_laplace_rule with an
+    # instruction to repartition that the bank owner never acts on (ARECIPE,
+    # Si P4, job 58217047.5/.6).  The ceiling is not a dial here -- it is read
+    # from the bank's own order budget through minimax.response_remote_max_*,
+    # so there is exactly one owner of the convergence math.
+    "remote_domain_rule": "every emitted |z| <= minimax.response_remote_max_abs_z(min cell delta_lo, h)",
     "imaginary_count_epsilon": 1.0e-3,
     "imaginary_min_count": 2,
-    "imaginary_count_rule": "max(2, round(log(16*(L/u_min)^2)*log(4000)/(2*pi^2)))",
-    "held_line_fractions": (0.25, 0.65),
+    "imaginary_count_rule": "max(2, round(log(16*(u_max/u_min)^2)*log(4000)/(2*pi^2)))",
+    # One held line point per spacing law, at that law's own midpoint.
+    "held_line_fine_fraction": 0.5,
+    "held_line_rule": "midpoints nearest 0.5*omega_fine and sqrt(omega_fine*top)",
     "multiplet_relative_tolerance": 1.0e-6,
     "bank_rule_tolerance": 1.0e-8,
     "moment_convention": "S_m = 2 M_(2m+1); physical M1 and M3 only",
     "operator_realization": "little-group-reynolds-v1",
     "production": {"direction_cutoff": 1.0e-3, "imaginary_width_fraction": 0.25,
                    "infinity_width_fraction": 0.125, "sigma_tolerance": 1.0e-4},
+    # A tier is COARSER DIALS, not a different shape: a linspace over a
+    # relative top would step 7.4 eV across a Si-like plasmon.
     "relaxed": {"direction_cutoff": 1.0e-2, "imaginary_width_fraction": 0.125,
                 "infinity_width_fraction": 0.0625, "sigma_tolerance": 1.0e-3,
-                "line_count": 8, "imaginary_count": 2},
+                "line_step_eta_factor": 4.0, "line_growth_fraction": 0.5,
+                "imaginary_count": 2},
 }
 
 # Each entry is (predicate description, threshold); the public table adds name
@@ -93,7 +143,7 @@ def table_hash(table):
                                      allow_nan=False).encode()).hexdigest()
 
 
-RECIPE_HASH = table_hash(shared_real_pole_v1_r3b)
+RECIPE_HASH = table_hash(shared_real_pole_v2_r1)
 GATE_HASH = table_hash(shared_real_pole_gates_v1_r3b)
 
 
@@ -505,6 +555,116 @@ def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
                 digest=member['digest'], K=list(header['K']))
 
 
+# A resolvable ladder never reaches this; a census or deck error does.
+_LINE_COUNT_CEILING = 4096
+
+
+def _sigma_extent_ev(config):
+    """The largest |omega| the Sigma grid evaluates, in eV.
+
+    Patches, when set, ARE the grid, so they replace the contiguous box rather
+    than extending it; `parsed_omega_patches_ev` stays the single owner of that
+    spelling. Out-of-grid states are clamped to an endpoint by the Sigma
+    consumer, so this extent bounds every frequency Sigma asks W for.
+    """
+    patches = config.sigma.parsed_omega_patches_ev()
+    edges = ([e for patch in patches for e in patch] if patches
+             else [config.sigma.omega_min_ev, config.sigma.omega_max_ev])
+    return max(abs(float(e)) for e in edges)
+
+
+def _remote_domain_cap(wfns, meta, census, eta_ry, rel_tol):
+    """Largest sample |z| in eV the bank's remote cells admit, and that edge.
+
+    ONE PARTITIONER. ``response_windows`` is the bank's own near/remote split
+    and needs only bands, occupations and mu -- exactly what this resolver
+    already has -- so it is called, not reimplemented; ``minimax`` owns the
+    convergence predicate and answers the radius. Returns ``(None, None)``
+    when the deck has no remote cell, in which case no sample can be refused.
+    """
+    from common.units import RYD_TO_EV
+    from minimax import response_remote_max_abs_z
+    from .response_bank import response_weights, response_windows
+    energy, f, u, _reference, _receipt = response_weights(wfns, meta)
+    _masks, _ft, _ut, cells, _window_receipt = response_windows(
+        energy, f, u, chemical_potential_ry=census['mu_ry'])
+    if not cells:
+        return None, None
+    delta_lo = min(float(cell['delta_min_ry']) for cell in cells)
+    cap = response_remote_max_abs_z(delta_lo, eta_ry, rel_tol)
+    return cap * RYD_TO_EV, delta_lo * RYD_TO_EV
+
+
+def _support_report(r, tier, census):
+    """The human-readable resolved support geometry, for the run log.
+
+    This is the user-facing surface of the recipe: it states which electrons
+    were judged to screen, where the structure ends, how far Sigma reaches, and
+    which of the two floors set the top support -- so a user looking at a long
+    bank can see WHY it is long, and a user on an unfamiliar material can see
+    what the recipe decided for it. The full key/rule dump follows it.
+    """
+    recipe = shared_real_pole_v2_r1
+    plasmon_term = recipe['plasma_top_factor'] * r['omega_fine_ev']
+    window_term = recipe['sigma_window_top_factor'] * r['sigma_window_ev']
+    bound = ('the PLASMON floor' if r['top_bound_by'] == 'plasmon'
+             else 'the SIGMA WINDOW')
+    lines = [
+        "",
+        "  ==========================================================",
+        f"  SHARED-POLE SUPPORT ({RECIPE_VERSION}, {tier})",
+        f"  Screening electrons : {census['active_electrons']:.3f} in "
+        f"{len(census['active_bands'])} active band(s), omega_p = {r['plasma_ev']:.3f} eV",
+        f"                        active set = depth <= "
+        f"{census['active_threshold_ev']:.3f} eV (fixed point); deepest active "
+        f"{r['active_depth_ev']:.3f} eV",
+        f"  Structure scale     : omega_fine = {r['omega_fine_ev']:.3f} eV = "
+        f"max(omega_p {r['plasma_ev']:.3f}, E_g {census['gap_ev']:.3f} + depth "
+        f"{r['active_depth_ev']:.3f})",
+        f"  Sigma asks W up to  : {r['sigma_window_ev']:.3f} eV = grid extent "
+        f"{r['sigma_extent_ev']:.3f} + active depth {r['active_depth_ev']:.3f}",
+        f"  Top support         : {r['top_ev']:.3f} eV, set by {bound}",
+        f"                        max(2.25*omega_fine = {plasmon_term:.3f}, "
+        f"1.25*Sigma window = {window_term:.3f})"
+        + ("" if r.get('remote_cap_ev') is None else
+           f", capped at {r['remote_cap_ev']:.3f}"),
+        f"  Line supports       : {r['line_count']} -- step {r['line_step_ev']:.3f} eV "
+        f"(2*eta) to {r['omega_fine_ev']:.3f} eV, then x"
+        f"{1.0 + r['line_growth_fraction']:.2f} per step to {r['top_ev']:.3f} eV",
+        f"  Imaginary supports  : {r['imaginary_count']} -- {r['u_min_ev']:.3f} to "
+        f"{r['u_max_ev']:.3f} eV, log-spaced (kappa = {r['kappa']:.1f}), "
+        f"u_max set by the {r.get('u_max_bound_by', 'zolotarev')} rule"
+        + ("" if r.get('u_max_bound_by') != 'remote_cap' else
+           f" (Zolotarev would have asked {r['u_max_uncapped_ev']:.3f})"),
+        f"  Sample height       : {r['height_ev']:.3f} eV = 4*eta",
+        ("  Bank remote domain  : |z| <= %.3f eV, from the lowest remote cell "
+         "edge %.3f eV" % (r['remote_cap_ev'], r['remote_delta_lo_ev'])
+         if r.get('remote_cap_ev') is not None else
+         "  Bank remote domain  : no remote cell; no sample ceiling"),
+        "  Bank cost grows with the top support and as 1/height: widening",
+        "  sigma_omega_min_ev/max_ev, or adding a sigma_omega_patches_ev",
+        "  window over a semicore state, raises the top support with it.",
+    ]
+    envelope = r.get('support_envelope')
+    if envelope is not None and envelope['status'] != 'initial_reference':
+        lines.append(f"  SC enclosure {envelope['status']} at epoch {envelope['epoch']}: "
+                     "the retained bounds above may exceed this map's own.")
+    lines.append("  ==========================================================")
+    return "\n".join(lines)
+
+
+def _plasma_ev(electrons, volume_bohr3):
+    """omega_p = 2 sqrt(4 pi n_e) Ry in eV, for a charge in one cell.
+
+    The single owner of the plasma equation: the census uses it to decide which
+    bands screen and the resolver uses it to place the supports, so the two can
+    never disagree about what omega_p means.
+    """
+    from common.units import RYD_TO_EV
+    return 2.0 * math.sqrt(4.0 * math.pi * float(electrons)
+                           / float(volume_bohr3)) * RYD_TO_EV
+
+
 def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_capacity, kweights):
     """Bind the current physical charge census to the existing metadata bundle.
 
@@ -527,8 +687,12 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
 
     Notes
     -----
-    The plasma equation is omega_p = sqrt(4*pi*n_e) Ha, with n_e obtained
-    from capacity-weighted occupations of bands with max_k E_nk >= mu-15 eV.
+    The plasma equation is omega_p = sqrt(4*pi*n_e) Ha, with n_e obtained from
+    the capacity-weighted occupations of the SCREENING-ACTIVE bands: the fixed
+    point of ``depth <= active_plasma_factor * omega_p(set)``, grown greedily
+    from the shallowest occupied band. No absolute depth is involved, so a
+    semicore manifold is excluded because it is deep relative to the plasmon
+    its own charge would produce, and included when it is not.
     All occupations of each active band are retained, including tails above mu. The bundle
     uses the supplied authenticated full-BZ quadrature weights. This census
     must be rebound at every SC map, after that map's occupation solve.
@@ -568,19 +732,44 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     crossing = (np.min(energies, axis=0) <= mu) & (np.max(energies, axis=0) >= mu)
     partial_at_mu = bool(np.any(np.any(partial, axis=0) & crossing))
     depth = (mu - np.max(energies, axis=0)) * RYD_TO_EV
-    recipe = shared_real_pole_v1_r3b
-    active = depth <= recipe['active_depth_ev']
-    borderline = ((depth > recipe['active_depth_ev'])
-                  & (depth <= recipe['borderline_depth_ev']))
-    electrons = float(capacity * np.sum(weights[:, None] * np.where(active, occupations, 0.0)))
+    recipe = shared_real_pole_v2_r1
     volume = float(meta.cell_volume)
-    if not (math.isfinite(mu) and math.isfinite(volume) and volume > 0
-            and math.isfinite(electrons) and electrons > 0):
+    # WHICH ELECTRONS SCREEN.  An electron participates in the collective mode
+    # only if its binding energy is below that mode's frequency, so the active
+    # set is the fixed point of `depth <= factor * omega_p(set)`.  Grown
+    # greedily from the shallowest occupied band, inclusively (a band is tested
+    # against the plasma frequency of the set that CONTAINS it), the ascent is
+    # monotone in both depth and omega_p and terminates at the band list.  No
+    # absolute depth: a semicore state is excluded because it is deep compared
+    # with the plasmon its own inclusion would produce, not because of a
+    # hard-coded eV.
+    charge = capacity * (weights[:, None] * occupations).sum(axis=0)
+    candidates = [b for b in np.argsort(depth, kind='stable') if charge[b] > 0.0]
+    if not candidates or not (math.isfinite(volume) and volume > 0):
+        raise ValueError("GATE shared_pole_plasma: got: nonpositive/nonfinite active charge or cell volume; want: positive finite electrons and bohr^3; why: omega_p requires positive density")
+    active_idx, electrons = [candidates[0]], float(charge[candidates[0]])
+    for b in candidates[1:]:
+        trial = electrons + float(charge[b])
+        if depth[b] > recipe['active_plasma_factor'] * _plasma_ev(trial, volume):
+            break
+        active_idx.append(int(b))
+        electrons = trial
+    threshold_ev = recipe['active_plasma_factor'] * _plasma_ev(electrons, volume)
+    active = np.zeros(depth.shape, dtype=bool)
+    active[np.asarray(active_idx, dtype=int)] = True
+    borderline = (~active) & (charge > 0.0) & (
+        depth <= recipe['borderline_plasma_factor'] * threshold_ev)
+    active_depth_ev = float(mu * RYD_TO_EV - np.min(energies[:, active]) * RYD_TO_EV)
+    if not (math.isfinite(mu) and math.isfinite(electrons) and electrons > 0
+            and math.isfinite(active_depth_ev)):
         raise ValueError("GATE shared_pole_plasma: got: nonpositive/nonfinite active charge or cell volume; want: positive finite electrons and bohr^3; why: omega_p requires positive density")
     meta.shared_pole_census = {
         "mu_ry": mu, "gap_ev": gap_ev, "partial_at_mu": partial_at_mu,
         "energy_span_ry": float(energies.max()-energies.min()),
         "active_electrons": electrons, "cell_volume_bohr3": volume,
+        "active_manifold_depth_ev": active_depth_ev,
+        "active_threshold_ev": threshold_ev,
+        "active_rule": "fixed point of band depth <= active_plasma_factor*omega_p(set)",
         "state_capacity": capacity, "k_weights": weights.tolist(),
         "k_weight_sum": float(weights.sum()), "k_weight_rule": "authenticated full-BZ quadrature weights",
         "occupation_source": ("logical insulating step" if occupation_state is None
@@ -603,7 +792,7 @@ def _support_envelope(required, key, session):
     This is a sampling-geometry enclosure, not an interpolation-error bound;
     the bank still certifies its current energies at every supplied frequency.
     """
-    version = "sc_interacting_support_enclosure_20260910"
+    version = "sc_interacting_support_enclosure_20260911"
     scope = "sampling geometry only; interpolation accuracy not certified"
     if not session.get("reference_complete", False):
         session["reference_complete"] = True
@@ -613,8 +802,13 @@ def _support_envelope(required, key, session):
     same_policy = previous is not None and session.get("key") == key
     envelope = dict(required)
     if same_policy:
+        # omega_fine joins the enclosure because it is now a support BOUNDARY,
+        # not only a reported scale: the uniform region ends there, so an
+        # enclosure that did not retain it would regenerate a different ladder
+        # whenever omega_p moved between SC maps.
         envelope = {
             "line_top_ev": max(previous["line_top_ev"], required["line_top_ev"]),
+            "omega_fine_ev": max(previous["omega_fine_ev"], required["omega_fine_ev"]),
             "u_min_ev": min(previous["u_min_ev"], required["u_min_ev"]),
             "u_max_ev": max(previous["u_max_ev"], required["u_max_ev"]),
         }
@@ -662,20 +856,74 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     meta.shared_pole_capacity = CapacityLedger(
         meta, mesh_xy=mesh_xy,
         device_budget_bytes=int(config.memory.per_device_gb * 2**30))
-    recipe = shared_real_pole_v1_r3b
+    recipe = shared_real_pole_v2_r1
     tier = config.sigma.w_accuracy
     policy = recipe[tier]
     eta = float(config.sigma.regularization_ev)
     if not math.isfinite(eta) or eta <= 0:
         raise ValueError("GATE shared_pole_eta: got: invalid eta; want: finite positive sigma_regularization_ev; why: causal sampling height")
     height = recipe['height_eta_factor'] * eta
-    plasma_ry = 2.0 * math.sqrt(4.0 * math.pi * census['active_electrons']
-                               / census['cell_volume_bohr3'])
-    top = plasma_ry * RYD_TO_EV + recipe['plasma_margin_ev']
-    scale = eta / recipe['reference_eta_ev']
-    low_step = recipe['line_low_step_ev'] * scale
-    high_step = recipe['line_high_step_ev'] * scale
-    umin, umax = max(height, census['gap_ev']), max(recipe['imaginary_floor_max_ev'], top)
+    plasma_ev = _plasma_ev(census['active_electrons'], census['cell_volume_bohr3'])
+    plasma_ry = plasma_ev / RYD_TO_EV
+    depth_act = float(census['active_manifold_depth_ev'])
+    # omega_fine: where the STRUCTURE stops.  The collective pole sits at
+    # omega_p; the first interband continuum runs to E_g + the depth of the
+    # screening manifold.  omega_p alone is the wrong anchor for a dilute
+    # system (a molecule in a large cell has a small omega_p and transitions
+    # well above it), so take the larger.
+    fine = max(plasma_ev, census['gap_ev'] + depth_act)
+    # The W frequency Sigma samples at evaluation energy E is |E - E_n'|, so
+    # the top of that window is the box edge plus the active occupied depth.
+    # Patches, when set, are the box.
+    sigma_extent = _sigma_extent_ev(config)
+    sigma_window = sigma_extent + depth_act
+    top_terms = {'plasmon': recipe['plasma_top_factor'] * fine,
+                 'sigma_window': recipe['sigma_window_top_factor'] * sigma_window}
+    top_bound_by = max(top_terms, key=top_terms.get)
+    top = top_terms[top_bound_by]
+    step = policy.get('line_step_eta_factor', recipe['line_step_eta_factor']) * eta
+    growth = policy.get('line_growth_fraction', recipe['line_growth_fraction'])
+    umin = max(height, census['gap_ev'])
+    umax_zolotarev = recipe['imaginary_top_factor'] * fine
+    # THE BANK'S DOMAIN IS A CEILING ON EVERY SAMPLE.  Reuse the bank's own
+    # partitioner -- response_windows needs only bands, occupations and mu, the
+    # same inputs this resolver already uses -- so there is one near/remote
+    # partition in the tree, not a copy of one here; then ask minimax for the
+    # largest |z| its remote Taylor rule can certify for the lowest cell.
+    remote_cap_ev, remote_delta_lo_ev = _remote_domain_cap(
+        wfns, meta, census, height / RYD_TO_EV, recipe['bank_rule_tolerance'])
+    top_uncapped, umax_uncapped = top, umax_zolotarev
+    if remote_cap_ev is not None:
+        # The ceiling is on |z|. An imaginary sample has |z| = u exactly, but a
+        # line sample sits at E + i*h, so the admissible REAL part is
+        # sqrt(cap^2 - h^2) -- capping E at the radius would put the last
+        # support just outside the domain it was capped to.
+        line_cap_ev = math.sqrt(max(remote_cap_ev**2 - height**2, 0.0))
+        if line_cap_ev < top:
+            top, top_bound_by = line_cap_ev, 'remote_cap'
+        if remote_cap_ev < umax_zolotarev:
+            umax_zolotarev = remote_cap_ev
+    umax = umax_zolotarev
+    u_max_bound_by = ('remote_cap' if remote_cap_ev is not None
+                      and umax <= remote_cap_ev * (1 + 1e-12)
+                      and umax < recipe['imaginary_top_factor'] * fine * (1 - 1e-12)
+                      else 'zolotarev')
+    if remote_cap_ev is not None and remote_cap_ev < sigma_window:
+        # NOT something the recipe may paper over: the deck is asking Sigma for
+        # W at frequencies the bank cannot serve at all, so the near window has
+        # to grow (bank owner) or the Sigma grid has to shrink (deck).
+        print_fn(
+            "\n  ==========================================================\n"
+            "  WARNING: the Sigma grid reaches W at "
+            f"{sigma_window:.3f} eV, ABOVE the bank's remote Taylor domain\n"
+            f"  ({remote_cap_ev:.3f} eV, set by the lowest remote cell edge "
+            f"{remote_delta_lo_ev:.3f} eV).\n"
+            "  The shared-pole support is capped there, so W above it is\n"
+            "  carried by M1/M3 alone and the Sigma box samples an\n"
+            "  unconstrained region.  Fix by growing the bank's near window\n"
+            "  (repartition, KNOWN_LORRAX_ISSUES) or narrowing\n"
+            "  sigma_omega_min_ev/max_ev; the recipe cannot resolve it.\n"
+            "  ==========================================================")
     if umin >= umax:
         raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
     support_receipt = None
@@ -683,29 +931,72 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         key = (RECIPE_HASH, tier, eta, int(meta.nspinor), int(meta.n_rmu),
                census['logical_band_count'])
         support_receipt = _support_envelope(
-            dict(line_top_ev=top, u_min_ev=umin, u_max_ev=umax), key,
-            support_session)
+            dict(line_top_ev=top, omega_fine_ev=fine, u_min_ev=umin, u_max_ev=umax),
+            key, support_session)
         retained = support_receipt['retained']
-        top, umin, umax = (retained['line_top_ev'], retained['u_min_ev'],
-                           retained['u_max_ev'])
-    if tier == 'relaxed':
-        line = np.linspace(0.0, top, policy['line_count'])
-    else:
-        edge = min(recipe['line_break_ev'], top)
-        # Each segment has an exact endpoint, included once; no accumulated
-        # stepping error and no thinning to satisfy a historical sample count.
-        low = [i * low_step for i in range(math.ceil(edge / low_step))]
-        high = ([edge + i * high_step for i in range(math.ceil((top-edge)/high_step))]
-                if top > edge else [])
-        line = np.asarray(low + high + [top], dtype=np.float64)
-    kappa = top / umin
+        top, fine, umin, umax = (retained['line_top_ev'], retained['omega_fine_ev'],
+                                 retained['u_min_ev'], retained['u_max_ev'])
+    # SELF-CONSISTENCY, not a user gate: `top` is constructed as a max that
+    # INCLUDES the Sigma-window term and the envelope only ever raises it, so
+    # this is unreachable by construction.  It names both numbers if it fires,
+    # because the failure it guards against -- Sigma evaluating W above the
+    # fit's pointwise support, where the model is unconstrained and the
+    # accuracy cliff lives -- is silent in every other receipt (ASIMOM 2026-09-11).
+    required_top = recipe['sigma_window_top_factor'] * sigma_window
+    capped = remote_cap_ev is not None and top <= remote_cap_ev * (1.0 + 1.0e-12)
+    if capped and top < required_top * (1.0 - 1.0e-12) and top >= sigma_window:
+        # The bank's domain trimmed the design margin but still covers every W
+        # frequency Sigma asks for. A note, not a refusal: the support is
+        # sufficient, only the headroom is smaller than the recipe wanted.
+        print_fn(f"  [shared-pole recipe {RECIPE_VERSION}] note: the bank's remote "
+                 f"domain trimmed the top support to {top:.3f} eV, so the Sigma "
+                 f"window margin is {top/sigma_window:.3f}x rather than "
+                 f"{recipe['sigma_window_top_factor']}x; the window "
+                 f"({sigma_window:.3f} eV) is still covered")
+    elif not capped and top < required_top * (1.0 - 1.0e-12):
+        raise ValueError(
+            f"GATE shared_pole_support_window: got: line top {top:.6g} eV below "
+            f"{recipe['sigma_window_top_factor']}*(Sigma box extent "
+            f"{sigma_extent:.6g} eV + active occupied depth {depth_act:.6g} eV) "
+            f"= {required_top:.6g} eV; want: pointwise support covering every W "
+            "frequency Sigma samples; why: above the top support the model is "
+            "pinned only by M1/M3 and its error rises by orders of magnitude")
+    # ONE LADDER, TWO LAWS.  Uniform 2*eta while the structure lasts, then a
+    # step that grows by (1+growth) per interval, so the count beyond the
+    # plasmon is logarithmic in `top` and a deep-band material pays a handful
+    # of supports, not hundreds.  The step is continuous at omega_fine: the
+    # first geometric step IS 2*eta, so the plasmon's upper shoulder is still
+    # resolved at or below the sample height.
+    low = [i * step for i in range(math.ceil(fine / step))]
+    if len(low) > 1 and fine - low[-1] < 0.5 * step:
+        low.pop()                      # omega_fine absorbs a stub interval
+    tail = []
+    while True:
+        # k = 0 is omega_fine itself, so the uniform region ends ON the
+        # structure scale and the growth starts from there.
+        nxt = fine + (step / growth) * ((1.0 + growth) ** len(tail) - 1.0)
+        if not (nxt < top):
+            break
+        tail.append(nxt)
+        if len(low) + len(tail) > _LINE_COUNT_CEILING:
+            raise ValueError(f"GATE shared_pole_line_count: got: over {_LINE_COUNT_CEILING} line supports for top={top:.6g} eV at step={step:.6g} eV; want: a resolvable ladder; why: a runaway support list is a deck or census error, not a recipe")
+    # The exact endpoint REPLACES the last ladder point when the gap left is
+    # under half the local step; appending it there would put two samples a few
+    # tens of meV apart at height h = 4*eta, a near-duplicate Hermite block.
+    ladder = low + tail
+    if len(ladder) > 1 and (top - ladder[-1]) < 0.5 * (ladder[-1] - ladder[-2]):
+        ladder = ladder[:-1]
+    line = np.asarray(ladder + [top], dtype=np.float64)
+    kappa = umax / umin
     count = max(recipe['imaginary_min_count'], round(
         math.log(16 * kappa**2) * math.log(4 / recipe['imaginary_count_epsilon'])
         / (2 * math.pi**2))) if tier == 'production' else policy['imaginary_count']
     imaginary = np.geomspace(umin, umax, count)
     mids = 0.5 * (line[:-1] + line[1:])
-    held_pairs = [int(np.argmin(abs(mids - fraction*top)))
-                  for fraction in recipe['held_line_fractions']]
+    # One held line point per spacing law, at that law's own midpoint:
+    # arithmetic inside the uniform region, geometric inside the geometric one.
+    held_targets = (recipe['held_line_fine_fraction'] * fine, math.sqrt(fine * top))
+    held_pairs = [int(np.argmin(abs(mids - target))) for target in held_targets]
     held_line = mids[held_pairs]
     held_imag = np.sqrt(imaginary[[0, -2]] * imaginary[[1, -1]])
     points, role_z, role_codes, distinct_ids, held_flags, support_pairs = [], [], [], [], [], []
@@ -740,9 +1031,14 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'accuracy': tier, 'accuracy_status': 'NOT_MEASURED',
         'accuracy_reason': 'resolved geometry has no authenticated matching campaign receipt',
         'eta_ev': eta, 'height_ev': height, 'height_ry': height / RYD_TO_EV,
-        'plasma_ev': plasma_ry * RYD_TO_EV, 'plasma_ry': plasma_ry,
-        'top_ev': top, 'spacing_scale': scale, 'low_step_ev': low_step,
-        'high_step_ev': high_step,
+        'plasma_ev': plasma_ev, 'plasma_ry': plasma_ry,
+        'omega_fine_ev': fine, 'active_depth_ev': depth_act,
+        'sigma_extent_ev': sigma_extent, 'sigma_window_ev': sigma_window,
+        'top_ev': top, 'top_bound_by': top_bound_by,
+        'top_uncapped_ev': top_uncapped, 'u_max_uncapped_ev': umax_uncapped,
+        'u_max_bound_by': u_max_bound_by,
+        'remote_cap_ev': remote_cap_ev, 'remote_delta_lo_ev': remote_delta_lo_ev,
+        'line_step_ev': step, 'line_growth_fraction': growth,
         'line_ev': line, 'imaginary_ev': imaginary,
         'held_line_ev': held_line, 'held_imaginary_ev': held_imag,
         'u_min_ev': umin, 'u_max_ev': umax, 'kappa': kappa,
@@ -770,29 +1066,44 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         result['support_envelope'] = support_receipt
     result['metadata_array_bytes'] = sum(v.nbytes for v in result.values()
                                          if isinstance(v, np.ndarray))
+    # Longest prefix FIRST: the lookup below takes the first match, so
+    # 'line_step_ev' must not be answered by the 'line' rule.
     rules = {
         'height': 'h=4*eta', 'eta': 'literal sigma_regularization_ev',
         'plasma': '2*sqrt(4*pi*active_electrons/volume) Ry',
-        'top': 'L=omega_p+3.5 eV', 'spacing': 'eta/0.25',
-        'low_step': '2*eta', 'high_step': '4*eta',
-        'line': '2eta below 12 eV, 4eta above, exact L once; relaxed 8 endpoints',
-        'imaginary': 'log-spaced u_min..u_max; round(log(16*(L/u_min)^2)*log(4000)/(2*pi^2)), min2; tier width ceil(f*n)',
-        'held_line': 'adjacent-support midpoint nearest 25%/65% L; lower-index tie',
+        'omega_fine': 'max(omega_p, E_g + active occupied depth)',
+        'active_depth': 'mu - lowest energy of the screening-active manifold',
+        'sigma_extent': 'max |edge| of the Sigma omega grid (patches when set, else the box)',
+        'sigma_window': 'Sigma extent + active depth: the top W frequency Sigma samples',
+        'top_bound': 'which term of the top max() bound it',
+        'top_uncapped': 'top before the bank remote-domain ceiling',
+        'u_max_uncapped': 'u_max before the bank remote-domain ceiling',
+        'u_max_bound': 'zolotarev tier rule, or the bank remote-domain cap',
+        'remote_cap': 'minimax.response_remote_max_abs_z at the lowest remote cell edge',
+        'remote_delta': 'lowest remote Laplace cell transition edge, from response_windows',
+        'top': 'max(2.25*omega_fine, 1.25*sigma_window)',
+        'line_step': '2*eta (tier line_step_eta_factor)',
+        'line_growth': 'geometric step ratio beyond omega_fine (tier)',
+        'line': 'uniform step to omega_fine, then step*(1+growth) per interval, exact top once',
+        'imaginary': 'log-spaced u_min..u_max; round(log(16*(u_max/u_min)^2)*log(4000)/(2*pi^2)), min2; tier width ceil(f*n)',
+        'held_line': 'adjacent-support midpoint nearest 0.5*omega_fine and sqrt(omega_fine*top); lower-index tie',
         'held_imaginary': 'geometric midpoint of first/last adjacent imaginary pair',
-        'u_min': 'max(h,logical gap)', 'u_max': 'max(16 eV,L)', 'kappa': 'L/u_min',
+        'u_min': 'max(h,logical gap)', 'u_max': '2.5*omega_fine', 'kappa': 'u_max/u_min',
         'infinity': 'ceil(tier infinity fraction*n)', 'direction': 'tier relative singular cutoff',
         'multiplet': 'whole multiplets within relative 1e-6',
         'bank': 'fixed Hermite certificate tolerance 1e-8',
         'sigma': 'tier Sigma tolerance production1e-4/relaxed1e-3',
-        'census': 'current full-band occupations, authenticated k weights/capacity; active band top >= mu-15 eV',
+        'census': 'current full-band occupations, authenticated k weights/capacity; active set is the fixed point of depth <= omega_p(set)',
         'U_bytes': '16*nk_full*(nspinor*nmu)^2/(Px*Py), logical bytes/rank',
         'metadata': 'sum of replicated metadata array nbytes',
     }
     if support_receipt is not None:
-        rules.update(top='SC high-water envelope of omega_p+3.5 eV',
+        rules.update(top='SC high-water envelope of max(2.25*omega_fine, 1.25*sigma_window)',
+                     omega_fine='SC high-water envelope of max(omega_p, E_g + active depth)',
                      u_min='SC low-water envelope of max(h,logical gap)',
-                     u_max='SC high-water envelope of max(16 eV,L)',
+                     u_max='SC high-water envelope of 2.5*omega_fine',
                      support_envelope='current required bounds and retained sampling enclosure; not an interpolation-error certificate')
+    print_fn(_support_report(result, tier, census))
     for key, value in result.items():
         shown = value.tolist() if isinstance(value, np.ndarray) else value
         rule = next((v for prefix, v in rules.items() if key.startswith(prefix)),

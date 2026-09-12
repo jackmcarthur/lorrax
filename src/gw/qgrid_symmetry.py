@@ -79,9 +79,9 @@ def shared_pole_operator_realizer(meta, header, *, q_full_idx, mesh_xy):
     from ffi import _services
     _services.ensure_on_path()
     from symmetry_maps import project_little_group_operator
-    from .shared_pole_recipe import shared_real_pole_v1_r3b
+    from .shared_pole_recipe import shared_real_pole_v2_r1
 
-    expected = shared_real_pole_v1_r3b["operator_realization"]
+    expected = shared_real_pole_v2_r1["operator_realization"]
     if header.get("recipe", {}).get("operator_realization") != expected:
         raise ValueError(
             "GATE shared_pole_realization: missing or unsupported operator_realization; "
