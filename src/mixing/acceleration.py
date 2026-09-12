@@ -930,11 +930,10 @@ def rcrop_hermitian(
 
 
 
-#: How many consecutive trial rejections before the loop gives up.  A trial
-#: whose physics gate fails is a bad EXTRAPOLATION and the plain step from the
-#: last accepted point is a fine substitute; a map that fails on every input is
-#: a broken map and must still say so, loudly, rather than spin.
-_MAX_CONSECUTIVE_TRIAL_REJECTIONS = 3
+#: Retained for the receipt's shape only.  The retry it used to bound was
+#: measured to be a no-op -- see the refusal in ``rcrop_nojit`` -- so the
+#: refusal is now immediate and nothing counts up to this.
+_MAX_CONSECUTIVE_TRIAL_REJECTIONS = 1
 
 
 def _agree_trial_refusal(error):
@@ -1105,21 +1104,25 @@ def rcrop_nojit(
                 print_fn(f"  SC acceleration: trial REJECTED at iteration {it} "
                          f"({consecutive_rejections} consecutive); falling back "
                          f"to the plain step from the last accepted point. {refusal}")
-            if consecutive_rejections >= _MAX_CONSECUTIVE_TRIAL_REJECTIONS:
-                raise RuntimeError(
-                    "GATE sc_trial_rejections_exhausted: "
-                    f"{consecutive_rejections} consecutive accelerator trials "
-                    "failed their physics gate, so the map -- not the "
-                    "extrapolation -- is refusing.\n"
-                    f"  got:  {refusal}\n"
-                    "  want: a map that evaluates on its own accepted input\n"
-                    "  why:  a rejected trial substitutes the plain step, which "
-                    "is a fine answer for a bad extrapolation and no answer at "
-                    "all for a bad map.")
-            # The plain step is the substitute: keep `x` and `f` as they are,
-            # so the next iteration re-extrapolates from the last ACCEPTED
-            # point rather than from a refused one.
-            continue
+            raise RuntimeError(
+                "GATE sc_trial_refused: the accelerator's trial evaluation "
+                "failed a physics gate, and there is NO cheaper step to fall "
+                "back to.\n"
+                f"  got:  {refusal}\n"
+                "  want: a map that evaluates on the plain step from its own "
+                "accepted input\n"
+                "  why:  MEASURED, 2026-09-11. ``x_trial = x + f`` IS the plain "
+                "step -- the CROP mixing happens afterwards -- so retrying an "
+                "unchanged x and f reproduces the same input and the same "
+                "refusal exactly. An end-to-end leg confirmed it: maps 11, 12 "
+                "and 13 all refused with a BYTE-IDENTICAL Gram eigenvalue "
+                "before the bound stopped the loop, three wasted maps for no "
+                "information. Refusing here instead preserves what a retry "
+                "cannot: the iterations already converged, named in this "
+                "message, and the receipt. A real recovery would have to "
+                "change the step -- a damped x + alpha*f with alpha < 1 -- "
+                "which is a physics change with its own gating and is NOT "
+                "implemented.")
         consecutive_rejections = 0
 
         # Roll history to chronological order (permutation of the leading,

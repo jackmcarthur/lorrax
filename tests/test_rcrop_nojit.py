@@ -550,24 +550,23 @@ def test_crop_conditioning_guard_ignores_unfilled_history_slots():
 # call.
 
 
-def test_a_trial_that_fails_a_physics_gate_is_rejected_not_fatal():
-    """A bad EXTRAPOLATION must not throw away the converged maps behind it.
+def test_a_refused_trial_stops_the_run_naming_what_was_already_converged():
+    """A refused trial has NO cheaper substitute, and pretending it does wastes maps.
 
-    MEASURED (claim 2189): on Si shared-pole SC eleven maps converged to
-    max|dE| 6.3e-4 eV and the twelfth trial -- an rCROP extrapolation --
-    tripped ``GATE shared_pole_gram_valid`` at q=0, which aborted the run.
-    The plain step from the last accepted point is a fine substitute for a
-    refused extrapolation; the run continuing is the whole point.
+    MEASURED end to end (claim 2191): ``x_trial = x + f`` IS the plain step --
+    the CROP mixing happens afterwards -- so retrying an unchanged ``x`` and
+    ``f`` reproduces the same input and the same refusal exactly.  A first cut
+    of this change retried, and maps 11, 12 and 13 of a real leg refused with a
+    BYTE-IDENTICAL Gram eigenvalue before the bound stopped it: three wasted
+    maps for no information.  What the refusal must preserve instead is the
+    work already done and the reason, which is what this asserts.
     """
     import jax.numpy as jnp
-    import numpy as np
+    import pytest
     from mixing import acceleration
 
-    # NONLINEAR on purpose: CROP solves an affine residual exactly in one
-    # step, so an affine fixture converges before it ever reaches a later
-    # trial and the plant never fires.
-    target = jnp.asarray(np.arange(6, dtype=float) + 1.0) + 0j
-    base = _nonlinear(-0.55 * jnp.ones(6), target, 0.35)
+    target = jnp.asarray([1.0, 2.0, 3.0, 4.0]) + 0j
+    base = _nonlinear(-0.55 * jnp.ones(4), target, 0.35)
     calls = {"n": 0}
 
     def residual(x):
@@ -577,31 +576,33 @@ def test_a_trial_that_fails_a_physics_gate_is_rejected_not_fatal():
                              "want: a finite trial; why: test")
         return base(x)
 
-    result = acceleration.rcrop_nojit(residual, jnp.zeros(6, complex),
-                                      m=4, maxit=60, tol=1e-10)
-    np.testing.assert_allclose(np.asarray(result.x), np.asarray(target),
-                               rtol=0, atol=1e-8)
-    assert result.converged
-    assert len(result.rejected_trials) == 1, result.rejected_trials
-    row = result.rejected_trials[0]
-    assert "GATE planted_trial_gate" in row["refusal"], row
-    assert row["iteration"] == 1 and row["consecutive"] == 1, row
+    with pytest.raises(RuntimeError) as caught:
+        acceleration.rcrop_nojit(residual, jnp.zeros(4, complex),
+                                 m=4, maxit=60, tol=1e-10)
+    message = str(caught.value)
+    assert "GATE sc_trial_refused" in message
+    # The refusal that actually happened, carried through with its rank.
+    assert "GATE planted_trial_gate" in message and "rank 0" in message
+    # And the reason a retry is not offered, so nobody adds one back.
+    assert "IS the plain step" in message
+    # It stopped at the refused trial, not after burning more maps on it.
+    assert calls["n"] == 4, calls
 
 
-def test_a_refusal_on_the_ACCEPTED_map_still_propagates():
-    """Only the trial is protected; the accepted map is the physics.
+def test_a_refusal_on_the_ACCEPTED_map_still_propagates_unwrapped():
+    """Only the trial is wrapped; the accepted map's refusal is untouched.
 
-    A substituted plain step is an answer for a bad extrapolation. It is not
-    an answer for a map that refuses on its own accepted input, and pretending
-    otherwise would turn a physics refusal into a silent trajectory change.
+    The two paths must stay distinguishable: a trial refusal is reported as
+    ``GATE sc_trial_refused`` with the original text inside it, while an
+    accepted-map refusal propagates as itself, so an operator can tell which
+    evaluation refused without reading the source.
     """
     import jax.numpy as jnp
-    import numpy as np
     import pytest
     from mixing import acceleration
 
-    target = jnp.asarray(np.arange(6, dtype=float) + 1.0) + 0j
-    base = _nonlinear(-0.55 * jnp.ones(6), target, 0.35)
+    target = jnp.asarray([1.0, 2.0, 3.0, 4.0]) + 0j
+    base = _nonlinear(-0.55 * jnp.ones(4), target, 0.35)
     calls = {"n": 0}
 
     def residual(x):
@@ -612,44 +613,8 @@ def test_a_refusal_on_the_ACCEPTED_map_still_propagates():
         return base(x)
 
     with pytest.raises(ValueError, match="planted_accepted_gate"):
-        acceleration.rcrop_nojit(residual, jnp.zeros(6, complex),
+        acceleration.rcrop_nojit(residual, jnp.zeros(4, complex),
                                  m=4, maxit=60, tol=1e-10)
-
-
-def test_consecutive_trial_rejections_still_refuse_loudly():
-    """A rejected trial substitutes the plain step; a broken MAP must not.
-
-    The fallback is only defensible while the refusal is a property of the
-    extrapolation. If every trial refuses, the loop has to stop rather than
-    spin on a substitute.
-    """
-    import jax.numpy as jnp
-    import numpy as np
-    import pytest
-    from mixing import acceleration
-
-    target = jnp.asarray(np.arange(4, dtype=float) + 1.0) + 0j
-    base = _nonlinear(-0.55 * jnp.ones(4), target, 0.35)
-    calls = {"n": 0}
-
-    def every_trial_refuses(x):
-        # Refuse EVERYTHING after the pre-loop call.  A rejected trial
-        # ``continue``s without making its accepted call, so once the
-        # rejections start every subsequent call is another trial and the
-        # even/odd table above no longer applies -- which is why this
-        # fixture cannot use it.
-        calls["n"] += 1
-        if calls["n"] > 1:
-            raise ValueError("GATE planted_always: got: planted; want: -; why: test")
-        return base(x)
-
-    with pytest.raises(RuntimeError) as caught:
-        acceleration.rcrop_nojit(every_trial_refuses, jnp.zeros(4, complex),
-                                 m=3, maxit=20, tol=1e-10)
-    message = str(caught.value)
-    assert "GATE sc_trial_rejections_exhausted" in message
-    assert "GATE planted_always" in message
-    assert str(acceleration._MAX_CONSECUTIVE_TRIAL_REJECTIONS) in message
 
 
 def test_a_clean_run_reports_no_rejected_trials():
