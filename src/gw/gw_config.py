@@ -1776,12 +1776,34 @@ _DEFAULTS = {
     # (relative paths are resolved beside the input deck).
     "sigma_quadrature_eps": 1.0e-4,
     "sigma_quadrature_reduction_seconds": 120.0,
-    # Clock-selected reduction remains the default: fixed passes can refuse
-    # an otherwise certifiable window under the cooperative seconds watchdog.
-    # Explicit nonnegative steps select fixed work (zero still certifies the
-    # start). Clock-mode reproducibility remains unfixed. Budget/exhaustion
-    # semantics live in minimax.uniform_rule_budget; docs/input_reference.md
-    # owns the deck contract. No system-scaled work policy is implied here.
+    # DEFAULT None (clock mode), and NOT the owner's 10 of e6ac7915, on
+    # main's quadrature redo.  Read this before changing it back.
+    #
+    # The 10-pass default was measured against a builder in which EVERY box
+    # went through the greedy reduction, where the clock was load bearing:
+    # at byte-identical source three Na P16 arms gave crossing-box node
+    # counts of 87, 87 and 86 with different weights, every one certifying,
+    # and Sigma moved by up to 0.067 meV between runs of the same code.
+    #
+    # main's redo (6ca16119..cf35d907) removes that mechanism where it
+    # mattered.  A CROSSING box now takes ``fixed_n_start``'s placement and
+    # stops on its own certificate, never on a clock, so the spread the
+    # default existed to kill cannot occur there.  A SIGN-DEFINITE box still
+    # runs the reduction under ``sigma_quadrature_reduction_seconds``, but
+    # that loop terminates on its own in 1-4 s (minimax/fixed_n_start.py),
+    # three orders below the 120 s budget, so the deadline selects nothing
+    # in practice -- while a 10-pass cap WOULD truncate it and ship more
+    # nodes than main's uncapped run.
+    #
+    # So: clock-free by construction on crossing boxes, clock-free in
+    # practice on sign-definite ones, and a step cap would now cost nodes
+    # rather than buy determinism.  An explicit integer still selects the
+    # fixed-pass mode, which is CLOCK-FREE (minimax.uniform_rule_budget):
+    # the seconds cannot refuse a window that certifies.  Making the
+    # sign-definite arm deterministic BY CONSTRUCTION is an open owner
+    # decision (drop its deadline; that loop provably terminates) and is
+    # written up in runs/frequency_integration_sandbox/375_arebase_20260912/
+    # QUADRATURE_COLLISIONS.md, item C6.
     "sigma_quadrature_reduction_steps": None,
     "sigma_quadrature_cache_dir": "auto",
     # OCCUPANCY at which a band leaves a metallic Green's-function branch.

@@ -26,7 +26,8 @@ from file_io.restart_bundle import (
 from gw.gw_config import DynamicSigmaConfig
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import SigmaOmegaResult, _residue_for_space, sigma_band_axis
-from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
+from gw.ppm_tau_kernel import (TAU_KERNEL_PROFILE_PHASES,
+                               get_shared_sigma_tau_kernel)
 from gw.ppm_windows import branches_for_omega_grid
 from gw import quadrature_log
 from gw.sigma_box_plan import plan_sigma_windows, sigma_rule_request_cache
@@ -76,6 +77,32 @@ def _unfenced(name, *, sync_ranks=True):
 
 
 _band_fence = _unfenced
+
+
+class _UntimedBand:
+    """An unprofiled tau band: entered, never watched.
+
+    Watching is what costs.  ``TimingSection.__exit__`` runs every watcher
+    (``common/timing.py``), so a per-tau-node section with a watched result
+    is a host synchronization per node -- on the incumbent elementwise-MPA
+    route too, which never asked for the measurement.  The tau profile is
+    requested with ``LORRAX_SIGMA_TAU_TIMING``; without it the sweep enters
+    this object instead and the dispatch stays asynchronous.
+    """
+
+    __slots__ = ()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def watch(self, *_values):
+        """Accept the band's result and do not block on it."""
+
+
+_UNTIMED_BAND = _UntimedBand()
 
 
 @jax.jit
@@ -339,8 +366,8 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 realize = shared_pole_operator_realizer(
                     meta, header, q_full_idx=rows, mesh_xy=mesh_xy)
 
-            def make_kernel(width, *, tables=tables, unfold=unfold, local=local,
-                            realize=realize):
+            def make_kernel(width, *, span=(lo, hi), tables=tables,
+                            unfold=unfold, local=local, realize=realize):
                 nonlocal native_workspace
                 from distrib_la import gemm_plan
 
@@ -355,8 +382,12 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 # throwaway A/B/C operands before the actual factor read.
                 warm_bytes = 16*count*(2*m*width+m*m)//int(mesh_xy.size)
                 if "capacity_receipt" in schedule:
+                    # Span-qualified like its sigma.synthesis.compiled
+                    # sibling below: a ledger stage is an identity, and two
+                    # panels of equal (count, width) are two reservations.
                     meta.shared_pole_capacity.reserve(
-                        f"sigma.gemm_warm.{count}.{width}", resident_bytes_per_rank=0,
+                        f"sigma.gemm_warm.{span[0]}.{span[1]}.{count}.{width}",
+                        resident_bytes_per_rank=0,
                         workspace_bytes_per_rank=2*warm_bytes+native_workspace,
                         concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
                 gemm = gemm_plan(mesh_xy, m=m, k=width, n=m, nq=count,
@@ -646,9 +677,12 @@ def _shared_pole_inherited_peak(args, meta, *, mesh_xy, kgrid, brackets,
         return B[0]
     peaks = []
     for builder in (None, phased_w):
+        # The control leg lowers the INCUMBENT route on a run that never
+        # dispatches it: it must not leave its executable in the process-wide
+        # kernel cache for a later caller to pick up (``cache=False``).
         kernel = get_shared_sigma_tau_kernel(
             mesh_xy=mesh_xy,kgrid=kgrid,brackets=brackets,
-            w_synthesis=builder,**face_kwargs)
+            w_synthesis=builder,cache=False,**face_kwargs)
         compiled = jax.jit(kernel).lower(*same_args).compile()
         peaks.append(aot_kernel_peak_bytes(compiled).compiled_peak)
     return capacity.record_sigma_peak(
@@ -687,17 +721,17 @@ def _resolve_debug_max_tau_dispatches(*, print_fn=print):
     return count
 
 
-_TAU_PROFILE_PHASES = (
-    "sigma.tau.w_phase",
-    "sigma.tau.w_prep",
-    "sigma.tau.G_build",
-    "sigma.tau.G_ifft",
-    "sigma.tau.GW_mult_fft",
-    "sigma.tau.GW_conv_ffi",
-    "sigma.tau.project_rs",
-    "sigma.tau.kernel",
-    "sigma.tau.accumulator",
-    "sigma.tau.progress",
+# The sweep's OWN bands, spelled once and opened under these names below.
+# The kernel-internal bands are owned by ``gw.ppm_tau_kernel``; importing its
+# tuple rather than restating it is what keeps the profile complete.
+_TAU_SWEEP_KERNEL_PHASE = "tau.kernel"
+_TAU_SWEEP_ACCUMULATOR_PHASE = "tau.accumulator"
+_TAU_SWEEP_PROGRESS_PHASE = "tau.progress"
+
+_TAU_PROFILE_PHASES = TAU_KERNEL_PROFILE_PHASES + (
+    _TAU_SWEEP_KERNEL_PHASE,
+    _TAU_SWEEP_ACCUMULATOR_PHASE,
+    _TAU_SWEEP_PROGRESS_PHASE,
 )
 
 
@@ -869,6 +903,18 @@ def _integrate_sigma_batches(
         tau_profile = env_bool(
             "LORRAX_SIGMA_TAU_TIMING", False, print_fn=print_fn)
 
+        def tau_band(name):
+            """Enter one per-tau-node band.
+
+            The fence is the band-attribution seam and is free in production
+            (``_unfenced`` above, and always so on the incumbent route); the
+            SECTION is what synchronizes, so it is opened only when the tau
+            profile was requested.  ``_print_tau_profile`` consumes exactly
+            these names.
+            """
+            fence(name)
+            return timing.section(name) if tau_profile else _UNTIMED_BAND
+
         s = wfns.slices
         sigma_axis = sigma_band_axis(
             int(s.nb_sigma), mesh_xy, ansatz="dynamic")
@@ -1006,7 +1052,15 @@ def _integrate_sigma_batches(
                         jnp.asarray(win.E_ref_A),
                         jnp.asarray(win.E_ref_B),
                         jnp.asarray(first_t, dtype=jnp.complex128))
-                    if w_synthesis is not None:
+                    if w_synthesis is not None and tau_profile:
+                        # COMPILE-ONLY MEASUREMENT, not admission.  Two extra
+                        # AOT trace+lower+compile passes per SC map produce a
+                        # receipt no reservation in this stage consumes: every
+                        # Sigma reservation is taken in the synthesis planner
+                        # before the sweep opens.  It runs on the campaign's
+                        # profiling switch (LORRAX_SIGMA_TAU_TIMING) like the
+                        # rest of this executor's measurement work; unrequested
+                        # the ledger row stays NOT_MEASURED and says so.
                         inherited = _shared_pole_inherited_peak(
                             prewarm_args,meta,mesh_xy=mesh_xy,kgrid=kgrid,
                             brackets=brackets,
@@ -1049,23 +1103,25 @@ def _integrate_sigma_batches(
                     omega_indices=row.omega_idx,
                     omega_values=row.omega_abs)
             for t in t_nodes:
-                fence("tau.kernel")
-                with timing.section("tau.kernel") as sec:
-                    sigma_tau = tau_kernel(
-                        psi_coh_xn, psi_coh_yr,
-                        psi_proj_xr, psi_proj_yn,
-                        E_A_call, selector, B_branch, Omega,
-                        pole_indices, bounds, phase_real,
-                        jnp.asarray(win.E_ref_A),
-                        jnp.asarray(win.E_ref_B),
-                        jnp.asarray(t, dtype=jnp.complex128))
+                tau_args = (
+                    psi_coh_xn, psi_coh_yr,
+                    psi_proj_xr, psi_proj_yn,
+                    E_A_call, selector, B_branch, Omega,
+                    pole_indices, bounds, phase_real,
+                    jnp.asarray(win.E_ref_A),
+                    jnp.asarray(win.E_ref_B),
+                    jnp.asarray(t, dtype=jnp.complex128))
+                with tau_band(_TAU_SWEEP_KERNEL_PHASE) as sec:
+                    sigma_tau = tau_kernel(*tau_args)
                     sec.watch(sigma_tau)
-                fence("tau.accumulator")
-                with timing.section("tau.accumulator") as sec:
+                with tau_band(_TAU_SWEEP_ACCUMULATOR_PHASE) as sec:
+                    # Unprofiled, production ignores this return and keeps the
+                    # incumbent asynchronous path (ppm_accumulators.py:169-170).
                     sec.watch(accumulator.add_tau(sigma_tau))
-                fence("tau.progress")
-                with timing.section("tau.progress"):
-                    progress.step()
+                with tau_band(_TAU_SWEEP_PROGRESS_PHASE):
+                    # Unprofiled, the bar blocks only at its own milestones;
+                    # profiled, the kernel band has already synchronized.
+                    progress.step(wait=None if tau_profile else sigma_tau)
                 n_tau += 1
             fence('tau.window_finish', sync_ranks=True)
             with timing.section('tau.window_finish'):

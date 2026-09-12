@@ -656,10 +656,27 @@ def read_shared_pole_matrix(io, q_span, *, meta, header):
     if header["schema"] != SCHEMA or not header["finalized"]:
         _refuse("matrix reader requires a finalized model")
     basis, ledger = _check_basis(meta, header), _capacity(meta)
+    # Both guards belong to the reader this one was extracted from
+    # (:func:`read_shared_pole_faces`) and are not optional here: a packed
+    # basis is bound to the mesh it was packed on, and a dataset validated
+    # as empty has no slab to read.
+    if io.mesh is not basis.mesh_xy:
+        _refuse("reader mesh differs from packed basis mesh")
     _check_io_capacity(ledger, io.mesh, header)
     lo, hi = _span(q_span, header["n_q_irr"], "q_span")
     spec = P(None, "x", None, "y")
-    width = padded_axis(max(1, header["Kmax"]), io.mesh, name="shared_pole_K",
+    if header["Kmax"] == 0:
+        # A model with zero retained poles is a state every other consumer
+        # supports (gw/mpa/sigma.py, the census, the exporter). Asking
+        # read_slab for a >= 1 wide slab of a dataset just validated as
+        # empty is not a read this reader may make.
+        _admit(ledger, "empty_matrix", 8*(hi-lo))
+        zeros = jax.jit(
+            lambda: jnp.zeros((hi-lo, basis.n_packed, 0), jnp.complex128),
+            out_shardings=NamedSharding(io.mesh, P(None, "x", "y")))
+        return (zeros(), jnp.ones((hi-lo, 0), jnp.float64),
+                jnp.zeros(hi-lo, jnp.int64))
+    width = padded_axis(header["Kmax"], io.mesh, name="shared_pole_K",
                         specs=((spec, 3),)).carrier
     shape = (hi-lo, basis.n_canonical, 1, width)
     arg, output, temporary = _conversion_bytes(basis, shape, spec, unpack=False)
@@ -1199,6 +1216,26 @@ def _retain_current_map_exports(targets, *, run_dir, label, identity, mesh_xy,
     return tuple(sorted(removed))
 
 
+def _export_is_current(path, *, identity, digest):
+    """Whether an existing export was written from THIS model.
+
+    Metadata only, and bounded: both writers stamp the model identity into
+    the export's header, and the pole writer stamps the source model digest
+    into every construction receipt beside it.  An export that is not
+    committed, or carries another identity or digest, is not this model's
+    and the caller refuses it rather than deciding on its behalf.
+    """
+    try:
+        header = _read_header(path)
+    except (OSError, ValueError, KeyError):
+        return False
+    if _json(header.get("identity")) != _json(dict(identity)):
+        return False
+    stamped = {row.get("receipt", {}).get("source_model_digest")
+               for row in header.get("construction_receipts", ())}
+    return stamped <= {digest, None}
+
+
 def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                                run_dir, label, tables, print_fn):
     """Export current-map poles and/or fixed W samples through their writers.
@@ -1233,18 +1270,41 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
     outputs = {}
     targets = {kind: Path(run_dir) / f"{label}_{kind}.h5" for kind, enabled in
                (("poles", config.write_poles), ("w", config.debug.write_w)) if enabled}
-    for path in targets.values():
-        if path.exists():
+    # A RESTART MUST NOT RE-EXPORT OVER ITS OWN EXPORT.  The export is
+    # written only once a map is complete, so a committed file on disk is a
+    # finished export; a restart that rebuilds nothing has nothing new to
+    # write, and rewriting it would cost a full bank (20.9 GB on the Na
+    # reference) to reproduce bytes that are already there.  Skipping is a
+    # receipt line, not silence, and the question is answered from the
+    # export's own stamped provenance rather than by re-reading tensors --
+    # a full re-validation is exactly the work a restart exists to avoid.
+    # Anything else keeping that name still refuses: the overwrite guard is
+    # what protects a one-shot run from a second map writing over it.
+    # ``pending`` is what still has to be WRITTEN; ``targets`` stays whole,
+    # because it is also this map's keep-set for retention below and a
+    # retained export must not be released as if it belonged to an earlier map.
+    pending = dict(targets)
+    for kind, path in targets.items():
+        if not path.exists():
+            continue
+        if not _export_is_current(path, identity=handle["identity"],
+                                  digest=handle["digest"]):
             _refuse(f"export already exists: {path}; use a fresh output directory")
+        del pending[kind]
+        outputs[kind] = dict(path=str(path), status="retained", reason=(
+            "export already written from this model identity and digest; "
+            "restart rewrote nothing"))
+        print_fn(f"shared-pole export: {kind} at {path} was written from this "
+                 "model; retained, not rewritten")
     bank_source = source.parent / "bank.h5"
-    if config.debug.write_w:
+    if "w" in pending:
         if not bank_source.is_file():
             _refuse(f"write_w needs the current-map bank {bank_source}; "
                     "a model-only restart cannot supply frequency samples")
         bank_header = validate_shared_pole_bank(bank_source,
             expected_identity=handle["identity"], mesh_xy=mesh_xy, require_complete=True)
-    if config.write_poles:
-        path = targets["poles"]
+    if "poles" in pending:
+        path = pending["poles"]
         spec = P(None, "x", None, "y")
         shape = mesh_divisible_shape((1, basis.n_canonical, 1, model["Kmax"]), mesh_xy, spec)
         arg, output, temp = _conversion_bytes(basis, shape, spec, unpack=False)
@@ -1273,8 +1333,8 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                     ledger.live_stages = previous
         _export_spatial_header(path, source_wfn, meta, kind="poles", source=source)
         outputs["poles"] = dict(path=str(path), payload_bytes=model["compact_payload_bytes"])
-    if config.debug.write_w:
-        path = targets["w"]
+    if "w" in pending:
+        path = pending["w"]
         output_header = initialize_shared_pole_bank(path, meta=meta, tables=tables,
             recipe=bank_header["recipe"], identity=handle["identity"], mesh_xy=mesh_xy)
         previous = ledger.live_stages
@@ -1306,7 +1366,10 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
         _export_spatial_header(path, source_wfn, meta, kind="w", source=bank_source)
         outputs["w"] = dict(path=str(path), payload_bytes=bank_header["payload_bytes"])
     for kind, receipt in outputs.items():
-        print_fn(f"write_{kind}: {receipt['path']}; payload={receipt['payload_bytes']} bytes")
+        size = receipt.get("payload_bytes")
+        print_fn(f"write_{kind}: {receipt['path']}; "
+                 + (f"payload={size} bytes" if size is not None
+                    else f"status={receipt['status']}"))
     _retain_current_map_exports(targets, run_dir=run_dir, label=label,
         identity=handle["identity"], mesh_xy=mesh_xy, print_fn=print_fn)
     return outputs

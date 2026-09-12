@@ -87,25 +87,48 @@ def test_g_face_contraction_preserves_causal_transpose(tau):
         assert value.sharding.is_equivalent_to(NamedSharding(mesh,P(None,'x','y')),3)
 
 
-@pytest.mark.parametrize('parent_capacity,column_capacity', [(2,5),(1,3)])
-def test_synthesis_uses_same_carrier_for_resident_and_panels(
-        monkeypatch, parent_capacity, column_capacity):
+def _synthesis_fixture(monkeypatch):
+    """The carrier fixture: a real header, CPU stubs and a face reader.
+
+    The header is the SHIPPED minimum, not a smaller one. The synthesis
+    resolves its fixed-q policy through
+    ``qgrid_trs_policy_from_shared_pole_store`` (``operations``), binds the
+    physical realization through ``shared_pole_operator_realizer``
+    (``recipe``, ``q_order``, ``q_shift`` and the canonical operation
+    typing) and checks the packed basis geometry (``n_mu_logical``). A
+    header missing any of those does not exercise the synthesis: it refuses
+    or raises ``KeyError`` before reaching it. Every field here is the shape
+    ``file_io.shared_pole_store._metadata`` writes.
+    """
     import distrib_la
     from file_io import shared_pole_store
-    from gw.mpa.sigma import _shared_pole_w_synthesis
     from common.grouped_layout import identity_square_grouped_shard_layout
+    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
     import runtime.aot_memory
     mesh = _mesh()
     tile = NamedSharding(mesh,P(None,'x','y'))
     layout = identity_square_grouped_shard_layout(8,8,(2,2))
-    meta = SimpleNamespace(mu_basis=SimpleNamespace(
-        n_packed=8,layout=layout,active_mask=np.ones(8,bool)))
+    meta = SimpleNamespace(nk_tot=8,nspinor=1,n_rmu=8,mu_basis=SimpleNamespace(
+        n_packed=8,n_logical=8,n_canonical=8,mesh_xy=mesh,layout=layout,
+        active_mask=np.ones(8,bool)))
     parents = np.arange(8,dtype=np.int32)%2
-    header = dict(n_q_irr=2,n_q_full=8,Kmax=5,nspinor=1,
+    # One spatial operation (the identity) and its antiunitary partner: the
+    # realizer authenticates rows 0..2*n_sym_spatial-1 with the antiunitary
+    # half flagged, exactly as the writer records them.
+    header = dict(n_q_irr=2,n_q_full=8,n_mu_logical=8,Kmax=5,nspinor=1,
         representation='scalar-trs-even-s',grid=(2,2,2),q_irr_full_idx=np.arange(2),
+        q_order='canonical-full-flat',q_shift=[0.,0.,0.],
+        operations=dict(rows=[0,1],antiunitary=[False,True],
+                        rotation=[np.eye(3,dtype=np.int32).tolist()]*2,
+                        translation=[[0.,0.,0.]]*2,
+                        spin_real=[[[1.]],[[1.]]],spin_imag=[[[0.]],[[0.]]],
+                        authorized_rows=[0],typing_source='test-fixture'),
+        recipe=dict(operator_realization=shared_real_pole_v1_r3b["operator_realization"]),
+        # Both canonical row halves: the spatial identity and its
+        # antiunitary partner, which the realizer requires to be covered.
         qirr=dict(irr_idx_q=parents,sym_idx_q=np.zeros(8,np.int32),
-                  sym_perm=np.arange(8,dtype=np.int32)[None,:],
-                  L_table=np.zeros((1,8,3),np.int32),q_irr_frac=np.zeros((2,3)),
+                  sym_perm=np.tile(np.arange(8,dtype=np.int32),(2,1)),
+                  L_table=np.zeros((2,8,3),np.int32),q_irr_frac=np.zeros((2,3)),
                   n_sym_spatial=1))
     # Exercise orchestration on CPU without pretending to test a native plan.
     monkeypatch.setattr(distrib_la,'plan',lambda *_a,**_kw: None)
@@ -133,6 +156,18 @@ def test_synthesis_uses_same_carrier_for_resident_and_panels(
                 put(p,P()),put(np.full(hi-lo,last-first),P()))
 
     monkeypatch.setattr(shared_pole_store,'read_shared_pole_faces',read)
+    return SimpleNamespace(mesh=mesh,meta=meta,header=header,parents=parents,
+                           factor=factor,omega=omega,reads=reads,put=put)
+
+
+@pytest.mark.parametrize('parent_capacity,column_capacity', [(2,5),(1,3)])
+def test_synthesis_uses_same_carrier_for_resident_and_panels(
+        monkeypatch, parent_capacity, column_capacity):
+    from gw.mpa.sigma import _shared_pole_w_synthesis
+    fx = _synthesis_fixture(monkeypatch)
+    mesh, meta, header = fx.mesh, fx.meta, fx.header
+    parents, factor, omega, reads, put = (
+        fx.parents, fx.factor, fx.omega, fx.reads, fx.put)
     schedule=dict(status='PASS',parent_capacity=parent_capacity,
                   column_capacity=column_capacity,endpoint_budgets={})
     build=_shared_pole_w_synthesis(None,meta,header,omega,schedule,mesh_xy=mesh)
@@ -149,3 +184,87 @@ def test_synthesis_uses_same_carrier_for_resident_and_panels(
     before=len(reads)
     jax.block_until_ready(build(*args))
     assert len(reads)==before*(1 if parent_capacity==2 else 2)
+
+def test_equal_size_panels_each_reserve_their_own_warm_stage(monkeypatch):
+    """Two panels of equal (count, width) are two ledger reservations.
+
+    A ledger stage name is an identity (``CapacityLedger.reserve`` refuses a
+    repeat), so the warm-GEMM stage has to carry its parent span exactly as
+    its ``sigma.synthesis.compiled`` sibling does.  Unqualified, the second
+    equal-size panel re-reserves the first panel's stage and planning dies on
+    any deck whose Sigma schedule has two such panels -- which is every
+    multi-panel deck with equal parent spans.  The other multi-panel tests
+    omit ``capacity_receipt`` and therefore never reserve at all.
+    """
+    from gw.mpa.sigma import _shared_pole_w_synthesis
+    from gw.shared_pole_recipe import CapacityLedger
+    fx = _synthesis_fixture(monkeypatch)
+    mesh, meta, header = fx.mesh, fx.meta, fx.header
+    # A budget large enough that only the stage IDENTITY can refuse here.
+    meta.shared_pole_capacity = CapacityLedger(
+        meta, mesh_xy=mesh, device_budget_bytes=1 << 30)
+    # parent_capacity 1 over two irreducible parents: two panels, one parent
+    # each, one shared column width -- equal (count, width), distinct spans.
+    schedule=dict(status='PASS',parent_capacity=1,column_capacity=5,
+                  endpoint_budgets={},capacity_receipt=dict(concurrent_with=()))
+    _shared_pole_w_synthesis(None,meta,header,fx.omega,schedule,mesh_xy=mesh)
+    warm = [row['stage'] for row in meta.shared_pole_capacity.entries
+            if row['stage'].startswith('sigma.gemm_warm.')]
+    assert len(warm) == 2 and len(set(warm)) == 2, warm
+    assert all(row['status'] != 'FAIL' for row in meta.shared_pole_capacity.entries)
+
+
+def _matrix_reader_fixture(monkeypatch, mesh, *, Kmax, basis_mesh=None):
+    from file_io import shared_pole_store as store
+    import hashlib
+    indices = np.arange(12, dtype=np.int32).reshape(4, 3)
+    basis = SimpleNamespace(mesh_xy=basis_mesh or mesh, n_logical=4,
+                            n_canonical=4, n_packed=4,
+                            canonical_indices=indices, is_identity=True,
+                            active_mask=np.ones(4, bool),
+                            pack_axis=lambda b, *_a, **_kw: b)
+    header = dict(schema=store.SCHEMA, finalized=True, n_q_irr=2,
+                  n_mu_logical=4, nspinor=1, Kmax=Kmax, K=[Kmax, 0],
+                  centroid_digest=hashlib.sha256(
+                      indices.astype('<i4').tobytes()).hexdigest())
+    meta = SimpleNamespace(mu_basis=basis, nspinor=1)
+    monkeypatch.setattr(store, '_capacity', lambda _meta: None)
+    monkeypatch.setattr(store, '_check_io_capacity', lambda *_a: None)
+    monkeypatch.setattr(store, '_admit', lambda *_a, **_kw: None)
+    return store, meta, header
+
+
+def test_matrix_reader_returns_an_empty_model_without_reading_a_slab(monkeypatch):
+    """Review item 16: ``Kmax == 0`` is a state, not a one-column read.
+
+    The matrix reader was extracted from ``read_shared_pole_faces`` and
+    dropped its empty-model early return, so a model with zero retained
+    poles asked ``read_slab`` for a >= 1 wide slab of a dataset the
+    validator had just accepted as empty.
+    """
+    mesh = _mesh()
+    store, meta, header = _matrix_reader_fixture(monkeypatch, mesh, Kmax=0)
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("an empty model must not reach read_slab")
+
+    b, poles, counts = store.read_shared_pole_matrix(
+        SimpleNamespace(mesh=mesh, read_slab=refuse), (0, 2),
+        meta=meta, header=header)
+    assert b.shape == (2, 4, 0) and poles.shape == (2, 0)
+    assert b.sharding.is_equivalent_to(NamedSharding(mesh, P(None, 'x', 'y')), 3)
+    np.testing.assert_array_equal(counts, np.zeros(2, np.int64))
+
+
+def test_matrix_reader_refuses_a_mesh_the_basis_was_not_packed_on(monkeypatch):
+    """The sibling reader's mesh refusal, dropped in the same extraction."""
+    mesh = _mesh()
+    # jax interns Mesh, so an identical 2x2 rebuild IS the same object; a
+    # different shape is what makes this a different mesh.
+    other = Mesh(np.asarray(jax.devices('cpu')[:4]).reshape(4, 1), ('x', 'y'))
+    store, meta, header = _matrix_reader_fixture(
+        monkeypatch, mesh, Kmax=5, basis_mesh=other)
+    with pytest.raises(Exception, match="reader mesh differs"):
+        store.read_shared_pole_matrix(
+            SimpleNamespace(mesh=mesh, read_slab=lambda *_a, **_kw: None),
+            (0, 2), meta=meta, header=header)

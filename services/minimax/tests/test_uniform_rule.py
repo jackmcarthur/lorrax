@@ -217,6 +217,24 @@ def test_step_budget_is_deterministic_and_ignores_the_clock():
     assert more.node_count <= first.node_count
 
 
+def test_a_fixed_pass_build_ignores_an_expired_clock(monkeypatch):
+    """Steps mode is clock-free: an expired deadline selects nothing.
+
+    Review item 6. The seconds watchdog used to raise inside a fixed-pass
+    build, so a slow start refused a window that certifies -- which is why
+    the owner's deterministic default was reverted on the branch. A fixed
+    pass count is the whole budget; the deck's seconds do not enter it.
+    """
+    import minimax.uniform_rule as owner
+    monkeypatch.setattr(owner.time, "perf_counter", lambda: 1.0e12)
+    rule = build_uniform_rule((.1, .3, .02, .02), 1e-4,
+                              reduction_steps=0, time_budget=1., backend="numpy")
+    assert rule.sup_error <= 1e-4
+    assert owner.uniform_rule_budget(1., 0) == {
+        "mode": "steps", "steps": 0, "seconds": None,
+        "exhaustion": "fixed_passes"}
+
+
 @pytest.mark.parametrize("seconds,steps", [(0., 10), (float("nan"), 0),
                                          (1., -1), (1., 1.5), (1., True)])
 def test_invalid_budget_refuses_before_build(seconds, steps):

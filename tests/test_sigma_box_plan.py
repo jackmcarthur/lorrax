@@ -378,7 +378,10 @@ def test_fixed_sc_uncertified_start_refuses_without_retry(monkeypatch, steps):
             print_fn=lambda *_args, **_kwargs: None)
     assert "do not loosen sigma_quadrature_eps" in str(err.value)
     assert len({box for box, kwargs in calls}) == len(calls)
-    assert all(kwargs["time_budget"] == 120. for box, kwargs in calls)
+    # A fixed-pass build is clock-free, so the deck's seconds never reach the
+    # service; clock mode still hands it the deadline (review item 6).
+    assert all(kwargs["time_budget"] == (120. if steps is None else None)
+               for box, kwargs in calls)
 
 
 def test_sc_pad_keeps_a_sign_definite_support_sign_definite():
@@ -756,22 +759,39 @@ def test_finite_certificate_corruption_is_refused_and_rebuilt(
                for row in repaired["branches"][0]["windows"])
 
 
-@pytest.mark.parametrize("changed", ["energies", "occupations", "poles", "eta", "eps"])
+def _sc_identity(iteration, occ_hash="fd-a"):
+    """The PRODUCTION self-consistent identity shape.
+
+    ``gw/shared_pole_recipe.shared_pole_sc_identity`` builds exactly this:
+    the map label is the prefix of ``hamiltonian``, not a separate key, so a
+    stub without it cannot see whether the map label was stripped.
+    """
+    return dict(hamiltonian=f"sc_map_{iteration}:{occ_hash}",
+                wavefunctions="qp_rotation_unreceipted",
+                recipe_hash="recipe-a", gate_hash="gate-a",
+                authentication="NON-AUTHENTICATING")
+
+
+@pytest.mark.parametrize("changed", ["hamiltonian", "recipe_hash", "poles", "eta", "eps"])
 def test_current_input_request_cannot_reuse_changed_map_rules(
         monkeypatch, tmp_path, changed):
     from gw.sigma_box_plan import sigma_rule_request_cache
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
-    identity = dict(energies="bands-a", occupations="fd-a", iteration_id="map-1")
+    identity = _sc_identity(1)
     poles, counts = np.array([[.09, 1.]]), np.array([2])
     kw = dict(eta=.1, eps=1e-4)
     first_dir = sigma_rule_request_cache(str(tmp_path), identity, poles, counts, **kw)
     args = dict(eps=1e-4, reduction_seconds=120., print_fn=lambda *_: None)
     plan_sigma_windows(_summaries(), [_branch()], np.array([.2, .5]), .1,
                        cache_dir=first_dir, **args)
-    identity["iteration_id"] = "map-2"
-    assert first_dir == sigma_rule_request_cache(str(tmp_path), identity, poles, counts, **kw)
-    if changed in ("energies", "occupations"):
-        identity[changed] += "-changed"
+    # THE NEXT SC MAP, same physics: same namespace, or the on-disk cache is
+    # dead across maps (review item 10).
+    assert first_dir == sigma_rule_request_cache(
+        str(tmp_path), _sc_identity(2), poles, counts, **kw)
+    if changed == "hamiltonian":
+        identity = _sc_identity(2, occ_hash="fd-b")
+    elif changed == "recipe_hash":
+        identity = dict(identity, recipe_hash="recipe-b")
     elif changed == "poles":
         poles[0, 0] += .001
     else:
@@ -897,10 +917,12 @@ def test_receipt_records_operative_budget_and_rule_identity_on_disk(
     assert len(lines) == 1
     receipt = json.loads(lines[0])
     policy = receipt["reduction_budget"]
-    assert policy["steps"] == steps and policy["seconds"] == 120.
+    assert policy["steps"] == steps
+    # A fixed-pass build is clock-free, so it reports no operative seconds.
+    assert policy["seconds"] == (120. if steps is None else None)
     assert policy["mode"] == ("seconds" if steps is None else "steps")
     assert policy["exhaustion"] == (
-        "last_certified_rule" if steps is None else "refuse_on_timeout")
+        "last_certified_rule" if steps is None else "fixed_passes")
     assert receipt["backend_policy"] == "numpy"
     assert receipt["rule_cache_schema"] == "sigma-box-ry-budget-v3"
     assert receipt["cache_dir"] is None
@@ -915,22 +937,70 @@ def test_receipt_records_operative_budget_and_rule_identity_on_disk(
         assert window["sup_error"] <= window["eps"]
 
 
-def test_watchdog_refusal_names_both_deck_keys_without_retry(monkeypatch):
+def test_durable_receipt_is_strict_json_with_null_open_edges(monkeypatch, tmp_path):
+    """Review item 18: the receipt line must parse in a strict JSON reader.
+
+    ``_state_products`` gives the product windows open endpoints (a state
+    tail to +inf, a resonant window from -inf), and the default
+    ``json.dumps`` spells those ``Infinity``/``-Infinity`` -- a Python
+    extension, so ``jq`` and every non-Python parser fail on the one line
+    ``production_report.py`` was changed to retain durably.
+    """
+    from gw.production_report import GWProductionReport
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr("gw.sigma_box_plan.process_rank", lambda: 0)
+    path = tmp_path / "gwjax.out"
+    report = GWProductionReport(
+        str(path), runtime=SimpleNamespace(process_index=0),
+        debug=False, stdout=lambda *_: None)
+    try:
+        plan_sigma_windows(
+            _summaries(), [_branch()], np.array([.2, .5]), .1,
+            eps=1e-4, reduction_seconds=120., cache_dir=None,
+            print_fn=report.legacy_print)
+    finally:
+        report.close()
+    prefix = "Sigma quadrature receipt: "
+    line, = [l[len(prefix):] for l in path.read_text().splitlines()
+             if l.startswith(prefix)]
+    assert "Infinity" not in line and "NaN" not in line
+    receipt = json.loads(line, parse_constant=_refuse_json_constant)
+    windows = [w for b in receipt["branches"] for w in b["windows"]]
+    edges = [edge for w in windows
+             for edge in w["state_interval_ry"] + w["pole_interval_ry"]]
+    assert any(edge is None for edge in edges), \
+        "the fixture must exercise at least one open endpoint"
+    assert all(edge is None or isinstance(edge, float) for edge in edges)
+
+
+def _refuse_json_constant(token):
+    raise AssertionError(f"non-standard JSON constant in the receipt: {token}")
+
+
+def test_fixed_pass_build_hands_the_service_no_deadline(monkeypatch):
+    """A fixed-pass build is clock-free: the deck's seconds never reach it.
+
+    Review item 6: the seconds watchdog used to refuse an otherwise
+    certifiable window under ``reduction_steps``, which is why the owner's
+    deterministic default was reverted. The remedy is that steps mode does
+    not consult the clock at all, so the builder is handed no time budget.
+    """
     from gw.sigma_box_plan import _fit_rule
     calls = []
 
-    def expired(*args, **kwargs):
+    def record(*args, **kwargs):
         calls.append(kwargs)
-        raise TimeoutError("watchdog")
+        return _fake_rule(*args, **kwargs)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", expired)
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", record)
     spec = make_sigma_box_spec(
         name="crossing", frequencies=(-2., 2.), states=(-.2, .2),
         pole_stats=((1., 2., .5, 1.),), pole_sign=1., eta_ry=.1)
-    with pytest.raises(RuntimeError, match="sigma_quadrature_reduction_seconds=20") as exc:
-        _fit_rule(spec, 1e-4, 20., None, .1, reduction_steps=10)
-    assert "sigma_quadrature_reduction_steps=10" in str(exc.value)
-    assert calls == [{"time_budget": 20., "reduction_steps": 10}]
+    _fit_rule(spec, 1e-4, 20., None, .1, reduction_steps=10)
+    assert [(c["time_budget"], c["reduction_steps"]) for c in calls] == [(None, 10)]
+    calls.clear()
+    _fit_rule(spec, 1e-4, 20., None, .1, reduction_steps=None)
+    assert [(c["time_budget"], c["reduction_steps"]) for c in calls] == [(20., None)]
 
 
 def test_cache_never_substitutes_clock_and_step_rules(tmp_path):

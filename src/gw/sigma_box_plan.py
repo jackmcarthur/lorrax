@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import pickle
+import re
 import time
 
 from ffi import _services
@@ -65,19 +66,47 @@ def _rule_digest(rule, noise_amplification, reduction_steps):
     return identity.hexdigest()
 
 
+#: The self-consistent identity spells its Hamiltonian
+#: ``sc_map_{iteration}:{occ_hash}`` (gw/shared_pole_recipe.py), so the map
+#: label lives INSIDE a value, not only in the ``iteration_id`` key.
+_SC_MAP_LABEL = re.compile(r"^sc_map_\d+:")
+
+
+def _map_invariant_identity(identity):
+    """The identity with its SC map label removed, physics intact.
+
+    Stripping only ``iteration_id`` was a no-op under self-consistency: the
+    iteration number is also the prefix of ``hamiltonian``, so every map
+    opened a fresh ``request_<hex>`` namespace, logged a cache lookup
+    failure, and could never serve a containment-compatible rule stored one
+    directory over.  What remains -- the occupation hash the label prefixes,
+    the recipe and gate hashes, the census poles and eta/eps digested by the
+    caller -- is the physical input the rule depends on, and every hit is
+    still re-checked for box containment and the requested error currency
+    before it is used.
+    """
+    inputs = {}
+    for key, value in identity.items():
+        if key == "iteration_id":
+            continue
+        inputs[key] = (_SC_MAP_LABEL.sub("", value)
+                       if isinstance(value, str) else value)
+    return inputs
+
+
 def sigma_rule_request_cache(directory, identity, poles2, counts, *, eta, eps):
     """Scope shared-pole rules to authenticated current-map physical inputs.
 
     ``identity`` is the model's existing energy/occupation/recipe provenance;
     ``poles2`` [Nq,K] in Ry² and ``counts`` [Nq] are the small host census.
-    Map labels are excluded: equal physical inputs on restart share rules,
-    but changed spectra or occupations cannot inherit a previous map's plan.
+    Map labels are excluded (:func:`_map_invariant_identity`): equal physical
+    inputs on restart and across SC maps share rules, but changed spectra or
+    occupations cannot inherit a previous map's plan.
     Domain containment and the executor noise/growth gates still run on hits.
     """
     if directory is None:
         return None
-    inputs = {key: value for key, value in identity.items()
-              if key != "iteration_id"}
+    inputs = _map_invariant_identity(identity)
     digest = hashlib.sha256(json.dumps(
         [_RULE_CACHE_SCHEMA, inputs, float(eta), float(eps)],
         sort_keys=True).encode())
@@ -85,6 +114,33 @@ def sigma_rule_request_cache(directory, identity, poles2, counts, *, eta, eps):
         digest.update(np.asarray([count], dtype="<i8").tobytes())
         digest.update(np.asarray(row[:int(count)], dtype="<f8").tobytes())
     return os.path.join(directory, "request_" + digest.hexdigest())
+
+
+def _receipt_json(receipt):
+    """Serialize the durable quadrature receipt as STRICT JSON.
+
+    The product windows carry open endpoints -- a state tail runs to
+    ``+inf``, a resonant window from ``-inf`` (``_state_products``) -- and
+    ``json.dumps`` spells those ``Infinity``/``-Infinity``, which is a
+    Python extension no other parser reads.  An unbounded endpoint is
+    ``null``, the standard JSON spelling of "no bound"; its side is given by
+    its position in the interval pair, which is how every consumer already
+    reads these.  ``allow_nan=False`` then refuses anything else non-finite
+    rather than emitting a token a strict reader would reject -- the same
+    convention as the store's own encoder (file_io/shared_pole_store.py).
+    """
+    def finite(value):
+        if isinstance(value, float) and not np.isfinite(value):
+            if np.isnan(value):
+                raise ValueError(
+                    "Sigma quadrature receipt: NaN is not an unbounded edge")
+            return None
+        if isinstance(value, dict):
+            return {key: finite(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [finite(item) for item in value]
+        return value
+    return json.dumps(finite(receipt), sort_keys=True, allow_nan=False)
 
 
 def resolve_sigma_box_cache_dir(setting, input_dir):
@@ -483,8 +539,10 @@ def _fit_rule(
         build_box = (_cache_build_box(requested_box, eta)
                      if cache_dir is not None and cache_build_widen
                      else requested_box)
-        # Fixed passes remove clock-selected numerical work. Reproducibility
-        # still depends on the source, numerical backend and cache inventory.
+        # Fixed passes remove clock-selected numerical work: the budget owner
+        # reports no seconds in steps mode, so the builder gets no deadline.
+        # Reproducibility still depends on the source, numerical backend and
+        # cache inventory.
         build_kwargs = {"time_budget": policy["seconds"],
                         "reduction_steps": policy["steps"]}
         if relative:
@@ -497,19 +555,10 @@ def _fit_rule(
             # service's ordinary cancellation cap.
             build_kwargs["kappa_cap"] = (
                 noise_amplification_cap / (1.0 + eps))
-        try:
-            rule = build_uniform_rule(build_box, eps, **build_kwargs)
-        except TimeoutError as exc:
-            raise RuntimeError(
-                f"Sigma box window {spec['name']!r} refused: "
-                f"sigma_quadrature_reduction_seconds={policy['seconds']:g} "
-                f"watchdog expired with sigma_quadrature_reduction_steps="
-                f"{policy['steps']}; no partial rule accepted. Remedy: increase "
-                "sigma_quadrature_reduction_seconds or reduce "
-                "sigma_quadrature_reduction_steps. Checks occur between basis "
-                "attempts/removal passes and before return; the step supervisor "
-                "owns the strict wall limit."
-            ) from exc
+        # Neither budget can refuse a certifiable window: a fixed-pass build
+        # is clock-free and a clock build returns its last accepted rule at a
+        # pass boundary (minimax.uniform_rule_budget).
+        rule = build_uniform_rule(build_box, eps, **build_kwargs)
         cache_status = "miss" if cache_dir is not None else "off"
     # Initial certification precedes removal passes and ignores the legacy
     # reduction clock. The service already tries three tighter bases. A
@@ -1084,7 +1133,7 @@ def plan_sigma_windows(
         print_fn(
             f"  Sigma rule reduction: deterministic budget of "
             f"{int(reduction_steps)} passes per window "
-            f"(sigma_quadrature_reduction_seconds={budget:g} refusal watchdog)")
+            f"(clock-free; sigma_quadrature_reduction_seconds is unused)")
     if fixed_rule_session is None:
         fits, fit_rows = fit_sigma_box_specs(
             specs, eta, eps=tolerance, reduction_seconds=budget,
@@ -1213,7 +1262,7 @@ def plan_sigma_windows(
     # Keep the accepted rule identity and its operative policy in the normal
     # scientific report, including cache-off and repeated SC planning calls.
     if process_rank() == 0:
-        print_fn("Sigma quadrature receipt: " + json.dumps(geometry, sort_keys=True))
+        print_fn("Sigma quadrature receipt: " + _receipt_json(geometry))
     return output, geometry
 
 
