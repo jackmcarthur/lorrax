@@ -2,6 +2,7 @@
 import numpy as np
 import pytest
 
+from minimax.fixed_n_start import predict_nodes, start_param
 from minimax.uniform_rule import (
     box_samples,
     build_uniform_rule,
@@ -71,6 +72,31 @@ def test_crossing_box_count_follows_bandwidth():
     _check(rule, box, 1.0e-4)
     assert abs(rule.theta_deg) < 1.0
     assert rule.node_count <= 100                        # interpolatory would be ~150
+
+
+def test_wide_crossing_box_does_not_ship_the_rank_on_a_short_budget():
+    """The reduction removes nodes one at a time, so before the fixed-N path a
+    wide box spent its whole budget and shipped close to the interpolatory
+    rank.  Placing the predicted count instead makes a short budget give a
+    reduced rule; the certificate is unchanged (runs/DEV/327, lane struct)."""
+    box = (-60.0 * ETA, 60.0 * ETA, ETA, 10.0 * ETA)
+    rule = build_uniform_rule(box, 1.0e-4, time_budget=60.0)
+    _check(rule, box, 1.0e-4)
+    assert rule.node_count <= 0.75 * rule.rank, (rule.node_count, rule.rank)
+
+
+def test_predicted_placement_stays_on_the_ray_and_inside_the_caps():
+    """start_param's contract: exactly n ordered nodes, Re s strictly inside
+    (0, horizon) -- s = 0 is a zero time node the executor refuses -- and Im s
+    within the off-ray caps it was given."""
+    box = (-40.0 * ETA, 20.0 * ETA, ETA, 5.0 * ETA)
+    horizon, cap = 3.0, 0.05
+    s = start_param(box, 1.0e-4, 0.0, horizon, -cap, cap, 24)
+    assert s.size == 24
+    assert np.all(s.real > 0.0) and np.all(s.real < horizon)
+    assert np.all(np.abs(s.imag) <= cap)
+    assert np.all(np.diff(s.real) > 0.0)
+    assert predict_nodes(box, 1.0e-4) >= 2
 
 
 def test_invalid_box_refuses():

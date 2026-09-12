@@ -68,6 +68,8 @@ from numpy.linalg import lstsq, svd
 from scipy.linalg import cho_factor, cho_solve, solve_triangular
 from scipy.linalg import qr as _pivoted_qr
 
+from .fixed_n_start import predict_nodes, start_param
+
 __all__ = [
     "UniformRule", "build_uniform_rule", "box_samples",
     "rule_roundoff_amplification", "rule_sup_error",
@@ -149,6 +151,14 @@ def _log_density_weights(d):
 #: independent audit; 3 cost ~1.5x the reduction wall of 1.5-2
 #: (runs/DEV/326_minimax_fit_review_2026-09-11, A/B rounds 1-2).
 _FIT_POINTS_PER_HALF_WAVE = 2.0
+# Fixed-N fast path (crossing boxes): how hard to try before giving the box
+# back to the reduction.  Measured over the 41-box corpus (run DEV/327,
+# results/e9): every placement that ever certified did so by the second
+# Lawson round, and the ones that never certified sat above 4.6 eps after the
+# initial solve while every eventual winner sat at or below 1.9.  Rounds 3-6
+# are about four sevenths of a polish and rescued nothing.
+_FIXED_N_ROUNDS = 2
+_FIXED_N_GATE = 3.0
 
 
 def _live_spacing(d, theta, S, eps, p, p_target):
@@ -481,19 +491,25 @@ class _RayFamily:
         """The ``r`` basis functions at ray positions ``s`` (cosine series)."""
         return self.A @ self._T(s)
 
-    def interpolatory(self):
-        """``r`` nodes by pivoted QR on the interior Lobatto points, weights
-        by least squares against the basis integrals.  About 1.3-1.5x the
-        Gauss count; ready in about a second."""
+    def interpolatory(self, k=None):
+        """``k`` nodes (default the full rank ``r``) by pivoted QR on the
+        interior Lobatto points, weights by least squares against the basis
+        integrals.  At ``r`` this is the start rule, about 1.3-1.5x the Gauss
+        count and ready in about a second.  Below ``r`` it is a poor rule --
+        the QR keeps its nodes in the head, where certified rules run out to
+        the amplitude floor -- but its weights are the right SIZE for ``k``
+        nodes, which is what the cloud fit needs to set its Tikhonov scale."""
         # The Lobatto grid contains s = 0; a node there is a zero time node,
         # which the executor refuses ("served quadrature has invalid or zero
         # time nodes"), so the end points are never offered.  Tempting, and
         # why not: s = 0 is often the best-conditioned pivot, and it was the
         # first thing the QR picked before this line existed.
         cand = self.s_grid[1:-1]
-        _, _, piv = _pivoted_qr(self.U(cand.astype(complex)), mode="economic", pivoting=True)
-        s = np.sort(cand[piv[:self.r]]).astype(complex)
-        w = lstsq(self.U(s), self.m, rcond=None)[0]
+        k = self.r if k is None else min(int(k), self.r)
+        _, _, piv = _pivoted_qr(self.U(cand.astype(complex))[:k], mode="economic",
+                                pivoting=True)
+        s = np.sort(cand[piv[:k]]).astype(complex)
+        w = lstsq(self.U(s)[:k], self.m[:k], rcond=None)[0]
         return s, w
 
     def to_rule(self, s, w):
@@ -699,6 +715,56 @@ class _CloudFit:
                 found = (s_t, w_t, res)
         return found
 
+    def polish(self, s, ok, nstep=60, rounds=6, gate=None):
+        """Solve at this node count; ``(s, w, accepted)``.
+
+        A least-squares polish is L2-optimal, and on a sign-definite box in
+        the relative currency its sup sits at the near corner, 3-7x above
+        the L2 level (the corner is a small region in the log measure that
+        carries the slowest ray members).  Lawson's reweighting -- rows
+        re-weighted by their own residual and re-solved -- moves the L2
+        optimum toward the minimax one; a handful of tempered rounds is
+        enough to bring the corner under eps.  Tempting, and why not: a
+        larger trunc (eps/100) instead -- it costs 4-5 nodes and kappa and
+        still misses (measured 2.6e-4 at eps 1e-4 on the Na val:bulk box).
+
+        No deadline is taken: the rounds are bounded by construction (~30 s
+        on an R ~ 1e4 box) and a rule must exist at any budget.  The reduction
+        and the fixed-N fast path share this so they judge a node count the
+        same way -- polishing the placement without the rounds measured +11 %
+        nodes over the corpus, because placements that need them missed and
+        fell through to a reduction with its budget already part spent
+        (run DEV/327, results/ab_fixed_n).
+
+        The first accepted state is returned immediately: a further round can
+        take a certified rule back above ``eps`` (measured 1.1 -> 6.1 eps on
+        x120_tall0, and 0.86 -> 11.0 on na_B06), so the rounds must never run
+        past acceptance.
+
+        ``gate`` is ``(sup_ratio, threshold)`` for a caller that would rather
+        give up than pay for the rounds: after the initial solve, a sup above
+        ``threshold`` abandons.  The rounds rescue a placement that is already
+        close and nothing else -- across the corpus every placement that ever
+        certified did so by the second round, while the ones that never
+        certified sat at 4.6 to 39 eps after the initial solve (results/e9)."""
+        s, w, _res = self.newton(np.asarray(s, complex), steps=nstep)
+        accepted = ok(s, w)
+        if not accepted and gate is not None:
+            sup_ratio, threshold = gate
+            if sup_ratio(s, w) > threshold:
+                return s, w, False
+        for _round in range(rounds):
+            if accepted:
+                break
+            E = np.abs(self.A(s) @ w - self.b)
+            factor = np.clip(np.sqrt(E / max(E.mean(), 1e-300)), 0.5, 2.0)
+            self.scale = self.scale * factor
+            self.scale *= self.nb / max(np.linalg.norm(self.scale / self.d), 1e-300)
+            self.b = self.scale / self.d
+            s, w, _res = self.newton(s, steps=nstep)
+            accepted = ok(s, w)
+        return s, w, accepted
+
     def reduce(self, s, ok, deadline, batch_frac=0.10, K=6, nstep=60, keep=2,
                max_steps=None):
         """Gauss-type reduction with lookahead, bounded by ``deadline`` or,
@@ -722,29 +788,10 @@ class _CloudFit:
         on a wide crossing box, and ~150 removals times ``K`` solves never
         finish in the budget), or a fixed batch (one failure at batch 30
         would end the batch phase 30 nodes early)."""
-        s, w, _res = self.newton(s.astype(complex), steps=nstep)     # polish the start
-        # A least-squares polish is L2-optimal, and on a sign-definite box in
-        # the relative currency its sup sits at the near corner, 3-7x above
-        # the L2 level (the corner is a small region in the log measure that
-        # carries the slowest ray members).  Lawson's reweighting -- rows
-        # re-weighted by their own residual and re-solved -- moves the L2
-        # optimum toward the minimax one; a handful of tempered rounds is
-        # enough to bring the corner under eps.  Tempting, and why not: a
-        # larger trunc (eps/100) instead -- it costs 4-5 nodes and kappa and
-        # still misses (measured 2.6e-4 at eps 1e-4 on the Na val:bulk box).
         # The start's acceptance is not subject to the deadline: the budget
-        # bounds the REDUCTION, and a rule must exist at any budget (the
-        # rounds are bounded by construction, ~30 s on an R ~ 1e4 box).
-        for _round in range(6):
-            if ok(s, w):
-                break
-            E = np.abs(self.A(s) @ w - self.b)
-            factor = np.clip(np.sqrt(E / max(E.mean(), 1e-300)), 0.5, 2.0)
-            self.scale = self.scale * factor
-            self.scale *= self.nb / max(np.linalg.norm(self.scale / self.d), 1e-300)
-            self.b = self.scale / self.d
-            s, w, _res = self.newton(s, steps=nstep)
-        if not ok(s, w):
+        # bounds the REDUCTION, and a rule must exist at any budget.
+        s, w, accepted = self.polish(s, ok, nstep=nstep)
+        if not accepted:
             return None                                             # caller keeps the start
         best = (s.copy(), w.copy())
         batch = max(1, int(batch_frac * s.size))
@@ -1280,18 +1327,88 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
             e_, k_ = check.sup(fit.phase * s_, w_, relative)
             return e_ <= eps and k_ <= kappa_cap
 
-        # ``reduction_steps`` makes the budget a pass count: the clock is
-        # ignored and the same inputs give the same rule on any machine.
-        deadline = t0 + (
-            float(time_budget)
-            if time_budget is not None and reduction_steps is None else 1e30)
+        def sup_ratio(s_, w_):
+            return check.sup(fam.phase * s_, w_, relative)[0] / eps
+
+        budget = (float(time_budget)
+                  if time_budget is not None and reduction_steps is None else 1e30)
         # The start must be accepted before anything can be removed.  In the
         # relative currency a loose eps (1e-3) with the default eps/10 basis
         # can leave the near corner of a wide box (R ~ 500) above eps even
         # after the Lawson rounds; a basis one order tighter costs ~2 nodes
         # at the start and a few seconds, so escalate rather than refuse.
+        # Fixed-N fast path, crossing boxes only.  The reduction below starts
+        # at the interpolatory rank and removes nodes one at a time, so a wide
+        # box spends its whole budget and ships whatever it had reached: four
+        # corpus boxes never left the rank at 120 s.  Placing the PREDICTED
+        # count where certified rules put their nodes (see fixed_n_start) and
+        # polishing it is far cheaper than reducing to the same count, and on
+        # a box the reduction cannot finish it is the only way to get there.
+        #
+        # Measured on the 41-box corpus against this same builder with the
+        # path removed, both arms run back to back on one node (the reduction
+        # is time budgeted, so a stored count from another session is not a
+        # baseline -- replaying the pristine builder against its own stored
+        # numbers read +12.7 %):
+        #     crossing nodes 2851 against 3269, -12.8 %
+        #     planning wall  1100 s against 2317 s, -52.5 % (max 192 s / 163 s)
+        #     12 boxes win 536 nodes, 10 give back 118, sign-definite untouched
+        # The wins are where the reduction ran out of budget: x120_tall0 50
+        # against 185, x120_tall1 50 against 184, x160_tall0 161 against 263.
+        # Every rule still passes the check cloud, and an independent
+        # dense-boundary audit of all 41 agreed with the certificate.
+        #
+        # The attempt shares the caller's budget, so `time_budget` keeps
+        # meaning what it says -- seconds from the start of this call.  Giving
+        # the attempt its own allowance on top bought 2 % more nodes for 1.8x
+        # the worst-case wall, which is the wrong trade for a planner.
+        #
+        # Tempting, and why not: (1) hand a certified placement to the
+        # reduction as its START rather than returning it.  It looks free --
+        # x080_thin1 certifies at 141 where the reduction reaches 132 -- but
+        # over the corpus it moved nothing for 1.4x the wall: the reduction
+        # stalls in the placement's basin and does not find the rank start's.
+        # (2) The same path on sign-definite boxes: theirs already reduces in
+        # 1-4 s and it measured +37 % nodes.  (3) w_ref from the rank-r start
+        # instead of an n_k-node rule: mu = alpha eps |b| / |w_ref| is then
+        # wrong by the size ratio and the polish misses (4.8 eps against 0.9
+        # on x080_tall0, +19 % nodes over the corpus).
+        # Evidence: run DEV/327, results/ab_shared (shipped) against
+        # ab_baseline, with ab_rung, ab_gate, ab_start, ab_polish, ab_fixed_n
+        # the steps that got here and tools/compare_arms.py the pairing.
+        fast_deadline = t0 + 0.5 * budget
         red = None
+        if not relative:
+            n_pred = predict_nodes(bx, eps, relative)
+            for rung in (1.0, 1.03, 1.06):
+                if time.perf_counter() >= fast_deadline:
+                    break
+                n_k = int(min(np.ceil(n_pred * rung), fam.r))
+                if n_k < 2:
+                    break
+                # w_ref sets the Tikhonov scale, so it must be the weights of
+                # an n_k-node rule (see the note above).
+                _s_ref, w_ref_n = fam.interpolatory(n_k)
+                fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps,
+                                w_ref=w_ref_n, rho=rho)
+                s_k, w_k, accepted = fit.polish(
+                    start_param(bx, eps, theta, S, im_lo_s, im_hi_s, n_k), ok,
+                    rounds=_FIXED_N_ROUNDS, gate=(sup_ratio, _FIXED_N_GATE))
+                if accepted:
+                    red = (s_k, w_k)
+                    break
+                if sup_ratio(s_k, w_k) > _FIXED_N_GATE:
+                    # Not a near miss: the rungs exist to give a placement that
+                    # is a couple of nodes short the nodes it needs, and a box
+                    # this far out is in the wrong basin at 1.03x too (measured
+                    # 32 and 39 eps on x120_thin1 and x120_thin0).
+                    break
+        # ``reduction_steps`` makes the budget a pass count: the clock is
+        # ignored and the same inputs give the same rule on any machine.
+        deadline = t0 + budget
         for extra in (1.0, 10.0, 100.0):
+            if red is not None:
+                break
             if extra > 1.0:
                 fam = _RayFamily(d, theta, S, eps / (trunc * extra), rho)
                 s, w = fam.interpolatory()
