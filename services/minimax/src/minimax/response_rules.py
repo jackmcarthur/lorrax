@@ -311,7 +311,7 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
     lo, hi = _padded_remote_domain(lo, hi, z, eta, domain_pad_ry)
     result, refusal = _remote_certificate(lo, hi, z, eta, rel_tol)
     if result is None:
-        raise RuntimeError(refusal)
+        raise refusal
     return dict(result, node_digest=_node_digest(result),
                 reuse_status="build" if previous is None else "rebuild",
                 reuse_reason=reason)
@@ -338,7 +338,10 @@ def _remote_certificate(lo, hi, z, eta, rel_tol):
 
     ``(result, None)`` when all THREE stages pass -- the Taylor order budget,
     the NNLS row fit at ``row_tol``, and the combined value/derivative bound
-    -- and ``(None, reason)`` when any of them refuses.
+    -- and ``(None, exception)`` when any of them refuses.  The refusal is an
+    exception INSTANCE, not a string, so the caller that raises it keeps each
+    stage's own class: a nonconvergent domain is a ``ValueError`` about the
+    inputs, an unmet certificate a ``RuntimeError`` about the fit.
 
     THE SINGLE OWNER OF THE PREDICATE.  ``response_laplace_rule`` calls it to
     build a rule and ``response_remote_max_abs_z`` calls it to find the
@@ -355,7 +358,7 @@ def _remote_certificate(lo, hi, z, eta, rel_tol):
     x = (z/lo)**2+anchor*anchor
     rho = np.abs(x)/a0
     if np.any(rho >= 1):
-        return None, 'remote Taylor domain does not converge; repartition in bank owner'
+        return None, ValueError('remote Taylor domain does not converge; repartition in bank owner')
     # N+1 powers for value; derivative remainder is the differentiated
     # geometric remainder, bounded relative to the exact squared resolvent.
     for order in range(1, RESPONSE_TAYLOR_MAX_ORDER + 1):
@@ -364,7 +367,7 @@ def _remote_certificate(lo, hi, z, eta, rel_tol):
         if max(vr.max(), dr.max()) <= rel_tol/4:
             break
     else:
-        return None, 'remote Taylor order budget exceeded'
+        return None, RuntimeError('remote Taylor order budget exceeded')
     # Propagate positive row-relative errors through complex Taylor powers.
     amp_v = (1+rho)/(1-rho)
     amp_d = ((1+rho)/(1-rho))**2
@@ -403,7 +406,7 @@ def _remote_certificate(lo, hi, z, eta, rel_tol):
             break
         last = dict(nodes=node_count, interval_errors=errors)
     else:
-        return None, f'remote NNLS certificate failed: {last}'
+        return None, RuntimeError(f'remote NNLS certificate failed: {last}')
     rows = np.asarray(rows)
     powers = x[:, None]**np.arange(order+1)
     dpowers = np.zeros_like(powers)
@@ -412,7 +415,7 @@ def _remote_certificate(lo, hi, z, eta, rel_tol):
     vb = vr+amp_v*max(errors)
     db = dr+amp_d*max(errors)
     if max(vb.max(), db.max()) > rel_tol:
-        return None, 'remote combined certificate failed'
+        return None, RuntimeError('remote combined certificate failed')
     result = dict(t=t/lo, coefficient_rows=rows/lo**(2*np.arange(order+1)[:, None]+1),
                 projection_value=value, projection_derivative=derivative,
                 certificate=dict(status='PASS', scope='continuum delta interval; all supplied z',
