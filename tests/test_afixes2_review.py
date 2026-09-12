@@ -5,6 +5,7 @@ Tiny host-only checks. The device contracts for the same items are the
 """
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -247,3 +248,40 @@ def test_an_existing_export_from_this_model_is_retained_not_rewritten(monkeypatc
     monkeypatch.setattr(store, "_read_header", uncommitted)
     assert not store._export_is_current(
         Path("x.h5"), identity=identity, digest="digest-a")
+
+
+def test_sc_occupation_solve_honours_the_declared_smearing_family(monkeypatch):
+    """Item 8: a physics collision, not a naming one.
+
+    ``gw_config`` REFUSES a shared-pole metallic deck that declares
+    ``occ_smearing_family = mp1`` ("shared_pole needs a positive spectral
+    measure"), but the SC map called ``solve_mp1_occupations``
+    unconditionally and stamped ``mp1`` on the state: the shared-pole bank
+    was built from exactly the occupations the deck was forced to disclaim.
+    Only the one-shot owner (``gw.gw_jax``) read the declared family.
+    """
+    from gw import sc_iteration
+    assert sc_iteration._declared_smearing_family(
+        SimpleNamespace(occ_smearing_family="FD ")) == "fd"
+    assert sc_iteration._declared_smearing_family(
+        SimpleNamespace(occ_smearing_family=None)) is None
+    tree = ast.parse(Path(sc_iteration.__file__).read_text())
+    assert not [node for node in ast.walk(tree)
+                if isinstance(node, ast.Name)
+                and node.id == "solve_mp1_occupations"], \
+        "the SC map still has an MP1-only occupation solver"
+    solves = [node for node in ast.walk(tree)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+              and node.func.id == "solve_smearing_occupations"]
+    assert solves and all(
+        any(kw.arg == "family" for kw in call.keywords) for call in solves)
+
+
+def test_one_shot_and_sc_read_the_same_deck_key():
+    """One source of truth: both owners resolve the same configured family."""
+    from gw import gw_jax, sc_iteration
+    for module in (gw_jax, sc_iteration):
+        source = Path(module.__file__).read_text()
+        assert "occ_smearing_family" in source
+    config = SimpleNamespace(occ_smearing_family="mp1")
+    assert sc_iteration._declared_smearing_family(config) == "mp1"
