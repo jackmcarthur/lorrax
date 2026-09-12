@@ -90,13 +90,15 @@ def test_g_face_contraction_preserves_causal_transpose(tau):
 def _synthesis_fixture(monkeypatch):
     """The carrier fixture: a real header, CPU stubs and a face reader.
 
-    The header is the SHIPPED minimum, not a smaller one: every shared-pole
-    consumer resolves its fixed-q policy through
+    The header is the SHIPPED minimum, not a smaller one. The synthesis
+    resolves its fixed-q policy through
     ``qgrid_trs_policy_from_shared_pole_store`` (``operations``), binds the
     physical realization through ``shared_pole_operator_realizer``
-    (``recipe``) and checks the packed basis geometry (``n_mu_logical``).
-    A header missing them does not exercise the synthesis; it raises
-    ``KeyError`` before reaching it.
+    (``recipe``, ``q_order``, ``q_shift`` and the canonical operation
+    typing) and checks the packed basis geometry (``n_mu_logical``). A
+    header missing any of those does not exercise the synthesis: it refuses
+    or raises ``KeyError`` before reaching it. Every field here is the shape
+    ``file_io.shared_pole_store._metadata`` writes.
     """
     import distrib_la
     from file_io import shared_pole_store
@@ -107,15 +109,26 @@ def _synthesis_fixture(monkeypatch):
     tile = NamedSharding(mesh,P(None,'x','y'))
     layout = identity_square_grouped_shard_layout(8,8,(2,2))
     meta = SimpleNamespace(nk_tot=8,nspinor=1,n_rmu=8,mu_basis=SimpleNamespace(
-        n_packed=8,layout=layout,active_mask=np.ones(8,bool)))
+        n_packed=8,n_logical=8,n_canonical=8,mesh_xy=mesh,layout=layout,
+        active_mask=np.ones(8,bool)))
     parents = np.arange(8,dtype=np.int32)%2
+    # One spatial operation (the identity) and its antiunitary partner: the
+    # realizer authenticates rows 0..2*n_sym_spatial-1 with the antiunitary
+    # half flagged, exactly as the writer records them.
     header = dict(n_q_irr=2,n_q_full=8,n_mu_logical=8,Kmax=5,nspinor=1,
         representation='scalar-trs-even-s',grid=(2,2,2),q_irr_full_idx=np.arange(2),
-        operations=dict(authorized_rows=[0]),
+        q_order='canonical-full-flat',q_shift=[0.,0.,0.],
+        operations=dict(rows=[0,1],antiunitary=[False,True],
+                        rotation=[np.eye(3,dtype=np.int32).tolist()]*2,
+                        translation=[[0.,0.,0.]]*2,
+                        spin_real=[[[1.]],[[1.]]],spin_imag=[[[0.]],[[0.]]],
+                        authorized_rows=[0],typing_source='test-fixture'),
         recipe=dict(operator_realization=shared_real_pole_v1_r3b["operator_realization"]),
+        # Both canonical row halves: the spatial identity and its
+        # antiunitary partner, which the realizer requires to be covered.
         qirr=dict(irr_idx_q=parents,sym_idx_q=np.zeros(8,np.int32),
-                  sym_perm=np.arange(8,dtype=np.int32)[None,:],
-                  L_table=np.zeros((1,8,3),np.int32),q_irr_frac=np.zeros((2,3)),
+                  sym_perm=np.tile(np.arange(8,dtype=np.int32),(2,1)),
+                  L_table=np.zeros((2,8,3),np.int32),q_irr_frac=np.zeros((2,3)),
                   n_sym_spatial=1))
     # Exercise orchestration on CPU without pretending to test a native plan.
     monkeypatch.setattr(distrib_la,'plan',lambda *_a,**_kw: None)
@@ -246,7 +259,9 @@ def test_matrix_reader_returns_an_empty_model_without_reading_a_slab(monkeypatch
 def test_matrix_reader_refuses_a_mesh_the_basis_was_not_packed_on(monkeypatch):
     """The sibling reader's mesh refusal, dropped in the same extraction."""
     mesh = _mesh()
-    other = Mesh(np.asarray(jax.devices('cpu')[:4]).reshape(2, 2), ('x', 'y'))
+    # jax interns Mesh, so an identical 2x2 rebuild IS the same object; a
+    # different shape is what makes this a different mesh.
+    other = Mesh(np.asarray(jax.devices('cpu')[:4]).reshape(4, 1), ('x', 'y'))
     store, meta, header = _matrix_reader_fixture(
         monkeypatch, mesh, Kmax=5, basis_mesh=other)
     with pytest.raises(Exception, match="reader mesh differs"):
