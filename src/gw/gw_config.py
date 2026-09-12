@@ -2868,7 +2868,7 @@ def _print_deck_report(msg: str) -> None:
 
 def _resolve_shared_pole_inputs(params):
     """Validate the shared-pole deck surface once, preserving explicitness."""
-    from .shared_pole_recipe import shared_real_pole_v1_r3b as recipe
+    from .shared_pole_recipe import shared_real_pole_v2_r1 as recipe
 
     named = params[_DECK_NAMED_KEYS]
     for key, choices in (("sigma_w_model", ("mpa", "shared_pole")),
@@ -2951,6 +2951,29 @@ def _resolve_shared_pole_inputs(params):
     params["sigma_quadrature_eps"] = eps
     # minimax_target_error retains its incumbent static-stage meaning; the
     # bank always consumes recipe['bank_rule_tolerance'] from the resolver.
+    #
+    # THE SIGMA GRID IS A W-SAMPLING KEY, ANNOUNCED AT PARSE TIME.  The
+    # shared-pole fit is pinned pointwise only up to its top line support, and
+    # above it the model is constrained by M1/M3 alone; its error there rises
+    # by orders of magnitude within a couple of eV (ASIMOM, 2026-09-11).  The
+    # recipe therefore sizes the support from this grid, so widening the box or
+    # adding a semicore patch lengthens the bank.  Nothing here can print the
+    # resolved numbers -- omega_p needs the wavefunctions -- so this states the
+    # coupling and points at the block that does.
+    patches = str(params.get("sigma_omega_patches_ev", "")).strip()
+    extent = (patches if patches else
+              f"{float(params['sigma_omega_min_ev']):g} .. "
+              f"{float(params['sigma_omega_max_ev']):g} eV")
+    _print_deck_report(
+        "\n  ==========================================================\n"
+        "  NOTE: sigma_w_model = shared_pole sizes its W frequency\n"
+        f"  support from the Sigma grid ({extent}) plus the depth of the\n"
+        "  screening electrons, so a wider grid -- or a\n"
+        "  sigma_omega_patches_ev window over a semicore state -- means a\n"
+        "  longer bank, not a clamped one.  The resolved supports, the\n"
+        "  plasmon and which term set the top are printed in the\n"
+        f"  SHARED-POLE SUPPORT block ({recipe['version']}) at run time.\n"
+        "  ==========================================================")
 
 
 def read_lorrax_input(filename: str) -> dict:

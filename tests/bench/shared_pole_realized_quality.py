@@ -35,7 +35,7 @@ def main():
     from file_io.slab_io import SlabIO
     from gw.qgrid_symmetry import shared_pole_operator_realizer
     from gw.shared_pole_constructor import _sample_point, shared_pole_operator_passivity
-    from gw.shared_pole_recipe import (CapacityLedger, shared_real_pole_v1_r3b,
+    from gw.shared_pole_recipe import (CapacityLedger, shared_real_pole_v2_r1,
                                        shared_real_pole_gates_v1_r3b as gates)
     from gw.response_bank import _reserve
     from gw.w_isdf import response_coulomb_powers
@@ -78,7 +78,7 @@ def main():
         raise ValueError("audit Coulomb receipt does not name this frozen map")
     descriptor = dict(path=str(paths["bank"]), identity=header["identity"], coulomb=coulomb)
     requested = deepcopy(header)
-    realization = shared_real_pole_v1_r3b["operator_realization"]
+    realization = shared_real_pole_v2_r1["operator_realization"]
     requested["recipe"]["operator_realization"] = realization
     recipe = bank["recipe"]
     eta = float(recipe["eta_ev"])/RYD_TO_EV

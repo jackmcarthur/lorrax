@@ -25,7 +25,7 @@ def main():
     from file_io import shared_pole_store as store
     from gw.qgrid_symmetry import shared_pole_operator_realizer
     from gw.shared_pole_head import _realized_gamma_body
-    from gw.shared_pole_recipe import shared_real_pole_v1_r3b, RECIPE_HASH, table_hash
+    from gw.shared_pole_recipe import shared_real_pole_v2_r1, RECIPE_HASH, table_hash
 
     mesh = driver.RUNTIME.mesh
     assert jax.process_count() == jax.device_count() == 4
@@ -139,7 +139,7 @@ def main():
     legacy_recipe.pop("operator_realization")
     legacy_header = store._metadata(meta, tables, legacy_recipe, identity)
     assert legacy_header["recipe_hash"] != header["recipe_hash"]
-    legacy_table = dict(shared_real_pole_v1_r3b)
+    legacy_table = dict(shared_real_pole_v2_r1)
     legacy_table.pop("operator_realization")
     assert table_hash(legacy_table) != RECIPE_HASH
     # The evaluated-operator seam must retain exactly the raw factor gate's

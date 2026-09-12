@@ -148,20 +148,30 @@ def test_epsilon_conflict(tmp_path):
         parse(tmp_path, 'compute_mode=mpa\nsigma_w_model=shared_pole\nsigma_w_accuracy=relaxed\nsigma_quadrature_eps=1e-4\n')
 
 
-def fixture(*, metal=False, eta=.25, tier='production', top=20.):
+def fixture(*, metal=False, eta=.25, tier='production', plasma_seed=10., box=(-5., 5.),
+            patches=()):
+    """Two k, three logical bands: a shallow frontier band and one at depth 20 eV.
+
+    ``plasma_seed`` is omega_p of the SEED band alone (the shallowest occupied
+    one), in eV; the volume is set from it. The deep band's membership is then
+    an OUTPUT of the active-set fixed point, not a fixture assumption: it joins
+    when its 20 eV depth is at or under omega_p of the enlarged set. That is
+    the knob these tests turn.
+    """
     energies = np.array([[-20., -1., 1., 1000.], [-20., 1., 2., -1000.]]) / RYD_TO_EV
     if not metal:
         energies[:, 1] = -1 / RYD_TO_EV
     occ = np.array([[1., .75 if metal else 1., 0., 1.], [1., .25 if metal else 1., 0., 1.]])
     wf = NS(enk=energies, occ=occ, slices=NS(b0=0,b4_logical=3,val=slice(0,2),cond_all_logical=slice(2,3)))
     state = NS(f_kn=occ,mu_ry=0.,smearing_family='fixed') if metal else None
-    # Set volume so the known active electron count yields the desired top.
-    electrons = 1. if metal else 2.
-    volume = 4*np.pi*electrons / (((top-3.5)/RYD_TO_EV/2)**2)
+    seed_electrons = 1. if metal else 2.
+    volume = 4*np.pi*seed_electrons / ((plasma_seed/RYD_TO_EV/2)**2)
     meta = NS(nspin=1,nspinor=1,n_rmu=17,nk_tot=2,cell_volume=volume)
     bind_shared_pole_census(wf,meta,occupation_state=state,trs_allowed=True,state_capacity=2.,kweights=[.5,.5])
     # Resolver inputs carry the already-resolved positive device budget (R24).
-    config = NS(sigma=NS(w_model='shared_pole',w_accuracy=tier,regularization_ev=eta),
+    config = NS(sigma=NS(w_model='shared_pole',w_accuracy=tier,regularization_ev=eta,
+                         omega_min_ev=box[0],omega_max_ev=box[1],
+                         parsed_omega_patches_ev=lambda p=tuple(patches): list(p)),
                 memory=NS(per_device_gb=30.))
     return config,wf,meta
 
@@ -174,36 +184,90 @@ def test_geometry_padding_charge_and_holds():
     args=fixture()
     r=resolve(args)
     assert r['n']==17 and r['imaginary_width']==5 and r['infinity_width']==3
+    # omega_p(seed) = 10 eV; the 20 eV band would only lift it to 14.14, so it
+    # stays out and lands in the 2*threshold diagnostic band instead.
     assert r['census']['active_electrons']==2
-    assert r['census']['borderline_bands']==[0]
-    np.testing.assert_allclose(r['line_ev'],np.r_[np.arange(0,12,.5),np.arange(12,21)])
+    assert r['census']['active_bands']==[1] and r['census']['borderline_bands']==[0]
+    assert r['plasma_ev']==pytest.approx(10) and r['active_depth_ev']==pytest.approx(1)
+    assert r['omega_fine_ev']==pytest.approx(10)      # max(10, gap 2 + depth 1)
+    assert r['sigma_window_ev']==pytest.approx(6)     # box 5 + active depth 1
+    assert r['top_bound_by']=='plasmon'               # 2.25*10 beats 1.25*6
+    assert r['top_ev']==pytest.approx(22.5)
+    # Uniform 2*eta to omega_fine, then a step that grows by 1.25 per interval.
+    np.testing.assert_allclose(r['line_ev'][:21],np.arange(0,10.5,.5))
+    steps=np.diff(r['line_ev'][20:-1])
+    np.testing.assert_allclose(steps[1:]/steps[:-1],1.25,rtol=1e-12)
+    assert r['line_ev'][-1]==pytest.approx(22.5)
     assert not set(r['fit_ids']) & set(r['held_ids'])
     assert len(r['role']) == r['unique_evaluations']
-    assert r['imaginary_count']==3
+    assert r['imaginary_count']==3 and r['u_max_ev']==pytest.approx(25)
+    # One held point per spacing law, each the adjacent-support midpoint
+    # nearest its own target: 0.5*omega_fine = 5 in the uniform region,
+    # sqrt(omega_fine*top) = 15 in the geometric one.
+    mids=.5*(r['line_ev'][:-1]+r['line_ev'][1:])
+    np.testing.assert_allclose(r['held_line_ev'],
+                               [mids[np.argmin(abs(mids-5.))],
+                                mids[np.argmin(abs(mids-np.sqrt(10*22.5)))]],rtol=0)
+    assert r['held_line_ev'][0]==pytest.approx(4.75)
+    assert abs(r['held_line_ev'][1]-15.) < 1.4   # inside one local step of 15
     assert r['accuracy_status']=='NOT_MEASURED'
+    # An empty band far above mu carries no charge and cannot move the geometry.
     args[1].enk[:,-1] *= 10
     np.testing.assert_array_equal(resolve(args)['line_ev'],r['line_ev'])
 
 
+def test_active_set_fixed_point_admits_a_deep_band():
+    """The 20 eV band joins exactly when omega_p of the set CONTAINING it clears it."""
+    # seed 10 eV -> trial omega_p = 10*sqrt(2) = 14.14 < 20: excluded.
+    out=resolve(fixture(plasma_seed=10.))
+    assert out['census']['active_electrons']==2 and out['active_depth_ev']==pytest.approx(1)
+    # seed 16.5 eV -> trial 23.33 >= 20: the deep band screens after all, and
+    # omega_fine follows it (max(23.33, gap 2 + depth 20)).
+    deep=resolve(fixture(plasma_seed=16.5))
+    assert deep['census']['active_electrons']==4
+    assert deep['census']['active_bands']==[0,1]
+    assert deep['plasma_ev']==pytest.approx(16.5*np.sqrt(2))
+    assert deep['active_depth_ev']==pytest.approx(20)
+    assert deep['omega_fine_ev']==pytest.approx(16.5*np.sqrt(2))
+    assert deep['census']['borderline_bands']==[]
+
+
+def test_sigma_window_can_set_the_top():
+    """A patch over a deep state raises the support, rather than being clamped."""
+    plain=resolve(fixture(plasma_seed=10.))
+    assert plain['top_bound_by']=='plasmon' and plain['top_ev']==pytest.approx(22.5)
+    wide=resolve(fixture(plasma_seed=10.,patches=[(-40.,-30.),(-5.,5.)]))
+    assert wide['sigma_extent_ev']==pytest.approx(40)
+    assert wide['sigma_window_ev']==pytest.approx(41)   # + active depth 1
+    assert wide['top_bound_by']=='sigma_window'
+    assert wide['top_ev']==pytest.approx(51.25)         # 1.25 * 41
+    # The cost of reaching 51 eV is logarithmic, not linear, in the extent.
+    assert wide['line_count'] - plain['line_count'] <= 5
+    assert wide['omega_fine_ev']==plain['omega_fine_ev']  # structure scale unmoved
+
+
 def test_metal_and_eta_scaling():
-    r=resolve(fixture(metal=True,eta=.1,top=10))
-    assert r['height_ev']==.4 and r['low_step_ev']==.2
+    r=resolve(fixture(metal=True,eta=.1,plasma_seed=10.))
+    assert r['height_ev']==pytest.approx(.4) and r['line_step_ev']==pytest.approx(.2)
     assert r['census']['partial_at_mu']
-    assert r['line_ev'][-1]==pytest.approx(10)
-    r=resolve(fixture(eta=.1,top=10))
-    assert r['low_step_ev']==.2 and not r['census']['partial_at_mu']
+    assert r['top_ev']==pytest.approx(22.5)   # 2.25*10, the metal has no gap
+    r=resolve(fixture(eta=.1,plasma_seed=10.))
+    assert r['line_step_ev']==pytest.approx(.2) and not r['census']['partial_at_mu']
 
 
 def test_relaxed():
     r=resolve(fixture(tier='relaxed',eta=.1))
-    assert r['line_count']==8 and r['imaginary_count']==2
+    # Same shape, coarser dials: step 4*eta and a 1.5 growth ratio.
+    assert r['line_step_ev']==pytest.approx(.4) and r['line_growth_fraction']==.5
+    np.testing.assert_allclose(r['line_ev'][:26],np.arange(0,10.4,.4),atol=1e-12)
+    assert r['line_ev'][-1]==pytest.approx(22.5) and r['imaginary_count']==2
     assert r['held_count']==3  # duplicate imaginary held roles share one call
     assert r['imaginary_width']==3 and r['infinity_width']==2
 
 
 def test_inverted_interval():
     with pytest.raises(ValueError,match='GATE shared_pole_interval'):
-        resolve(fixture(eta=5,top=20))
+        resolve(fixture(eta=7,plasma_seed=10.))  # h=28 eV above u_max=25
 
 
 def test_stale_census():
@@ -225,7 +289,7 @@ def test_receipt_absence_and_nonfinite():
 
 def test_flat_role_serialization_and_deduplication():
     from gw.shared_pole_recipe import ROLE_CODES
-    r=resolve(fixture(metal=True,top=10))
+    r=resolve(fixture(metal=True,plasma_seed=10.))
     assert r['z_ry'].shape==r['role'].shape==r['held'].shape==r['distinct_id'].shape
     assert r['z_ry'].dtype==np.complex128
     assert r['role'].dtype==np.int8 and r['distinct_id'].dtype==np.int64
@@ -248,19 +312,24 @@ def test_nested_missing_measurements_and_warning_diagnostics():
 
 
 def test_band_top_charge_nonuniform_weights_and_unclipped_tail():
-    c,w,m=fixture(metal=True)
+    c,w,m=fixture(metal=True,plasma_seed=10.)
     f=np.array([[1.,1.05,0.,0.],[1.,-.05,0.,0.]])
     state=NS(f_kn=f,mu_ry=0.,smearing_family='mp1')
     bind_shared_pole_census(w,m,occupation_state=state,trs_allowed=True,
                            state_capacity=2.,kweights=[.75,.25])
+    # Unclipped tail charge: 2*(.75*1.05 + .25*(-.05)) = 1.55, and the empty
+    # band carries none, so it is not a screening band at all.
     assert m.shared_pole_census['active_electrons']==pytest.approx(1.55)
-    assert m.shared_pole_census['active_bands']==[1,2]
+    assert m.shared_pole_census['active_bands']==[1]
     assert m.shared_pole_census['borderline_bands']==[0]
-    # Whole-band selection turns on at exactly mu-15 eV; one k row suffices.
-    w.enk[1,0]=-15/RYD_TO_EV
+    # Whole-band selection turns on at the band TOP: raising one k row of the
+    # deep band to -10 eV brings its depth under omega_p of the enlarged set
+    # (1.55 + 2 = 3.55 electrons, omega_p = 10*sqrt(3.55) = 18.8 eV > 10).
+    w.enk[1,0]=-10/RYD_TO_EV
     bind_shared_pole_census(w,m,occupation_state=state,trs_allowed=True,
                            state_capacity=2.,kweights=[.75,.25])
     assert m.shared_pole_census['active_electrons']==pytest.approx(3.55)
+    assert m.shared_pole_census['active_bands']==[0,1]
     assert m.shared_pole_census['borderline_bands']==[]
 
 
