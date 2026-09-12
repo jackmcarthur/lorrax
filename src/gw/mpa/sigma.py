@@ -22,7 +22,8 @@ from file_io.mpa_store import PoleReader, open_pole_reader, validate_fit_store
 from gw.gw_config import DynamicSigmaConfig
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import SigmaOmegaResult, _residue_for_space, sigma_band_axis
-from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
+from gw.ppm_tau_kernel import (TAU_KERNEL_PROFILE_PHASES,
+                               get_shared_sigma_tau_kernel)
 from gw.ppm_windows import branches_for_omega_grid
 from gw.sigma_box_plan import plan_sigma_windows, sigma_rule_request_cache
 from gw.sigma_plan import resolve_sigma_plan
@@ -686,17 +687,17 @@ def _resolve_debug_max_tau_dispatches(*, print_fn=print):
     return count
 
 
-_TAU_PROFILE_PHASES = (
-    "sigma.tau.w_phase",
-    "sigma.tau.w_prep",
-    "sigma.tau.G_build",
-    "sigma.tau.G_ifft",
-    "sigma.tau.GW_mult_fft",
-    "sigma.tau.GW_conv_ffi",
-    "sigma.tau.project_rs",
-    "sigma.tau.kernel",
-    "sigma.tau.accumulator",
-    "sigma.tau.progress",
+# The sweep's OWN bands, spelled once and opened under these names below.
+# The kernel-internal bands are owned by ``gw.ppm_tau_kernel``; importing its
+# tuple rather than restating it is what keeps the profile complete.
+_TAU_SWEEP_KERNEL_PHASE = "tau.kernel"
+_TAU_SWEEP_ACCUMULATOR_PHASE = "tau.accumulator"
+_TAU_SWEEP_PROGRESS_PHASE = "tau.progress"
+
+_TAU_PROFILE_PHASES = TAU_KERNEL_PROFILE_PHASES + (
+    _TAU_SWEEP_KERNEL_PHASE,
+    _TAU_SWEEP_ACCUMULATOR_PHASE,
+    _TAU_SWEEP_PROGRESS_PHASE,
 )
 
 
@@ -1101,8 +1102,8 @@ def _integrate_sigma_batches(
                     omega_indices=row.omega_idx,
                     omega_values=row.omega_abs)
             for t in t_nodes:
-                fence("tau.kernel")
-                with timing.section("tau.kernel") as sec:
+                fence(_TAU_SWEEP_KERNEL_PHASE)
+                with timing.section(_TAU_SWEEP_KERNEL_PHASE) as sec:
                     sigma_tau = tau_kernel(
                         psi_coh_xn, psi_coh_yr,
                         psi_proj_xr, psi_proj_yn,
@@ -1112,11 +1113,11 @@ def _integrate_sigma_batches(
                         jnp.asarray(win.E_ref_B),
                         jnp.asarray(t, dtype=jnp.complex128))
                     sec.watch(sigma_tau)
-                fence("tau.accumulator")
-                with timing.section("tau.accumulator") as sec:
+                fence(_TAU_SWEEP_ACCUMULATOR_PHASE)
+                with timing.section(_TAU_SWEEP_ACCUMULATOR_PHASE) as sec:
                     sec.watch(accumulator.add_tau(sigma_tau))
-                fence("tau.progress")
-                with timing.section("tau.progress"):
+                fence(_TAU_SWEEP_PROGRESS_PHASE)
+                with timing.section(_TAU_SWEEP_PROGRESS_PHASE):
                     progress.step()
                 n_tau += 1
             fence('tau.window_finish', sync_ranks=True)
