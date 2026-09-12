@@ -147,28 +147,31 @@ def test_step_budget_is_deterministic_when_watchdog_allows_completion():
     assert more.node_count <= first.node_count
 
 
-def test_step_watchdog_refuses_even_the_zero_pass_start(monkeypatch):
+def test_a_fixed_pass_build_ignores_an_expired_clock(monkeypatch):
+    """Steps mode is clock-free: an expired deadline selects nothing.
+
+    Review item 6. The seconds watchdog used to raise inside a fixed-pass
+    build, so a slow start refused a window that certifies -- which is why
+    the owner's deterministic default was reverted on the branch. A fixed
+    pass count is the whole budget; the deck's seconds do not enter it.
+    """
     import minimax.uniform_rule as owner
-    clock = [0.]
-    original = owner._RayFamily.interpolatory
-
-    def delayed_start(self):
-        result = original(self)
-        clock[0] = 2.
-        return result
-
-    monkeypatch.setattr(owner.time, "perf_counter", lambda: clock[0])
-    monkeypatch.setattr(owner._RayFamily, "interpolatory", delayed_start)
-    with pytest.raises(TimeoutError, match="no clock-selected partial rule"):
-        build_uniform_rule((.1, .3, .02, .02), 1e-4,
-                           reduction_steps=0, time_budget=1., backend="numpy")
+    monkeypatch.setattr(owner.time, "perf_counter", lambda: 1.0e12)
+    rule = build_uniform_rule((.1, .3, .02, .02), 1e-4,
+                              reduction_steps=0, time_budget=1., backend="numpy")
+    assert rule.sup_error <= 1e-4
+    assert owner.uniform_rule_budget(1., 0) == {
+        "mode": "steps", "steps": 0, "seconds": None,
+        "exhaustion": "fixed_passes"}
 
 
-def test_pass_boundary_watchdog_refuses_instead_of_returning_best():
-    from minimax.uniform_rule import _within_reduction_deadline
-    with pytest.raises(TimeoutError, match="time_budget"):
-        _within_reduction_deadline(-1., 10)
-    assert not _within_reduction_deadline(-1., None)
+def test_clock_mode_stops_at_its_deadline_and_returns_the_best():
+    from minimax.uniform_rule import _within_reduction_deadline, uniform_rule_budget
+    assert not _within_reduction_deadline(-1.)
+    assert _within_reduction_deadline(float("inf"))
+    assert uniform_rule_budget(120., None) == {
+        "mode": "seconds", "steps": None, "seconds": 120.,
+        "exhaustion": "last_certified_rule"}
 
 
 @pytest.mark.parametrize("seconds,steps", [(0., 10), (float("nan"), 0),

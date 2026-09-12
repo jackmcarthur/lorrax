@@ -377,7 +377,10 @@ def test_fixed_sc_uncertified_start_refuses_without_retry(monkeypatch, steps):
             print_fn=lambda *_args, **_kwargs: None)
     assert "do not loosen sigma_quadrature_eps" in str(err.value)
     assert len({box for box, kwargs in calls}) == len(calls)
-    assert all(kwargs["time_budget"] == 120. for box, kwargs in calls)
+    # A fixed-pass build is clock-free, so the deck's seconds never reach the
+    # service; clock mode still hands it the deadline (review item 6).
+    assert all(kwargs["time_budget"] == (120. if steps is None else None)
+               for box, kwargs in calls)
 
 
 def test_sc_pad_keeps_a_sign_definite_support_sign_definite():
@@ -652,7 +655,7 @@ def test_quadrature_deck_defaults_and_retired_sector_key(tmp_path):
     config = LorraxConfig.from_input_file(
         str(deck), print_fn=lambda *_args, **_kwargs: None)
     assert config.sigma.quadrature_eps == 1.0e-4
-    assert config.sigma.quadrature_reduction_steps is None
+    assert config.sigma.quadrature_reduction_steps == 10
     assert config.sigma.quadrature_reduction_seconds == 120.0
     assert config.sigma.quadrature_cache_dir == "auto"
 
@@ -896,10 +899,12 @@ def test_receipt_records_operative_budget_and_rule_identity_on_disk(
     assert len(lines) == 1
     receipt = json.loads(lines[0])
     policy = receipt["reduction_budget"]
-    assert policy["steps"] == steps and policy["seconds"] == 120.
+    assert policy["steps"] == steps
+    # A fixed-pass build is clock-free, so it reports no operative seconds.
+    assert policy["seconds"] == (120. if steps is None else None)
     assert policy["mode"] == ("seconds" if steps is None else "steps")
     assert policy["exhaustion"] == (
-        "last_certified_rule" if steps is None else "refuse_on_timeout")
+        "last_certified_rule" if steps is None else "fixed_passes")
     assert receipt["backend_policy"] == "numpy"
     assert receipt["rule_cache_schema"] == "sigma-box-ry-budget-v3"
     assert receipt["cache_dir"] is None
@@ -914,22 +919,30 @@ def test_receipt_records_operative_budget_and_rule_identity_on_disk(
         assert window["sup_error"] <= window["eps"]
 
 
-def test_watchdog_refusal_names_both_deck_keys_without_retry(monkeypatch):
+def test_fixed_pass_build_hands_the_service_no_deadline(monkeypatch):
+    """A fixed-pass build is clock-free: the deck's seconds never reach it.
+
+    Review item 6: the seconds watchdog used to refuse an otherwise
+    certifiable window under ``reduction_steps``, which is why the owner's
+    deterministic default was reverted. The remedy is that steps mode does
+    not consult the clock at all, so the builder is handed no time budget.
+    """
     from gw.sigma_box_plan import _fit_rule
     calls = []
 
-    def expired(*args, **kwargs):
+    def record(*args, **kwargs):
         calls.append(kwargs)
-        raise TimeoutError("watchdog")
+        return _fake_rule(*args, **kwargs)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", expired)
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", record)
     spec = make_sigma_box_spec(
         name="crossing", frequencies=(-2., 2.), states=(-.2, .2),
         pole_stats=((1., 2., .5, 1.),), pole_sign=1., eta_ry=.1)
-    with pytest.raises(RuntimeError, match="sigma_quadrature_reduction_seconds=20") as exc:
-        _fit_rule(spec, 1e-4, 20., None, .1, reduction_steps=10)
-    assert "sigma_quadrature_reduction_steps=10" in str(exc.value)
-    assert calls == [{"time_budget": 20., "reduction_steps": 10}]
+    _fit_rule(spec, 1e-4, 20., None, .1, reduction_steps=10)
+    assert [(c["time_budget"], c["reduction_steps"]) for c in calls] == [(None, 10)]
+    calls.clear()
+    _fit_rule(spec, 1e-4, 20., None, .1, reduction_steps=None)
+    assert [(c["time_budget"], c["reduction_steps"]) for c in calls] == [(20., None)]
 
 
 def test_cache_never_substitutes_clock_and_step_rules(tmp_path):

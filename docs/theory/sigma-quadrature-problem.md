@@ -155,13 +155,14 @@ no campaign-planner route. The input reference owns the [budget contract](../inp
 
 ```
 sigma_quadrature_eps = 1e-4
-sigma_quadrature_reduction_steps = none
+sigma_quadrature_reduction_steps = 10
 sigma_quadrature_reduction_seconds = 120
 sigma_quadrature_cache_dir = auto
 ```
 
-The default clock budget returns the last certified rule at a pass boundary;
-its reproducibility defect remains live. Explicit integer steps instead trade
-planning work for node count after an accepted interpolatory rule exists, with
-seconds as a cooperative refusal watchdog. Neither mode weakens `eps`. Retarded broadening is
+The default is a fixed pass count, which is clock-free and therefore
+reproducible; explicit `none` selects the legacy clock budget, which returns
+the last certified rule at a pass boundary and whose reproducibility defect
+is why it is no longer the default. Steps trade planning work for node count
+after an accepted interpolatory rule exists. Neither mode weakens `eps`. Retarded broadening is
 `sigma_regularization_ev`, literal for every ansatz; there is no pair ceiling.

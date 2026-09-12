@@ -2148,13 +2148,25 @@ _DEFAULTS = {
     # (relative paths are resolved beside the input deck).
     "sigma_quadrature_eps": 1.0e-4,
     "sigma_quadrature_reduction_seconds": 120.0,
-    # Clock-selected reduction remains the default: fixed passes can refuse
-    # an otherwise certifiable window under the cooperative seconds watchdog.
-    # Explicit nonnegative steps select fixed work (zero still certifies the
-    # start). Clock-mode reproducibility remains unfixed. Budget/exhaustion
-    # semantics live in minimax.uniform_rule_budget; docs/input_reference.md
-    # owns the deck contract. No system-scaled work policy is implied here.
-    "sigma_quadrature_reduction_steps": None,
+    # DEFAULT 10, owner ruling 2026-09-10 (e6ac7915).  The wall budget is
+    # not reproducible: at byte-identical source three Na P16 arms produced
+    # crossing-box node counts of 87, 87 and 86 with different weights,
+    # every one certifying, because the greedy reduction stops wherever the
+    # clock lands.  Sigma therefore moved by up to 0.067 meV between runs of
+    # the same code, which manufactured a phantom regression during
+    # integration.  A step budget removes the clock: two arms at steps=0
+    # gave byte-identical times and weights for all twelve boxes.
+    #
+    # 10 rather than 0 because tau nodes, not planning seconds, are what
+    # scale with system size and processor count: one FFT convolution per
+    # node in the executor.  On the Na P16 reference, steps=10 gives 278
+    # nodes against the wall budget's 258 and steps=0's 513.
+    #
+    # A fixed-pass build is CLOCK-FREE (minimax.uniform_rule_budget), so the
+    # seconds below cannot refuse a window that certifies -- which was the
+    # reason 32579a39 reverted this default, and is repaired at the owner.
+    # Explicit "none" selects the historical clock-selected mode.
+    "sigma_quadrature_reduction_steps": 10,
     "sigma_quadrature_cache_dir": "auto",
     # OCCUPANCY at which a band leaves a metallic Green's-function branch.
     # The Σ planner cuts on the branch WEIGHT (f on val, 1−f on cond), so

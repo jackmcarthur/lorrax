@@ -483,8 +483,10 @@ def _fit_rule(
         build_box = (_cache_build_box(requested_box, eta)
                      if cache_dir is not None and cache_build_widen
                      else requested_box)
-        # Fixed passes remove clock-selected numerical work. Reproducibility
-        # still depends on the source, numerical backend and cache inventory.
+        # Fixed passes remove clock-selected numerical work: the budget owner
+        # reports no seconds in steps mode, so the builder gets no deadline.
+        # Reproducibility still depends on the source, numerical backend and
+        # cache inventory.
         build_kwargs = {"time_budget": policy["seconds"],
                         "reduction_steps": policy["steps"]}
         if relative:
@@ -497,19 +499,10 @@ def _fit_rule(
             # service's ordinary cancellation cap.
             build_kwargs["kappa_cap"] = (
                 noise_amplification_cap / (1.0 + eps))
-        try:
-            rule = build_uniform_rule(build_box, eps, **build_kwargs)
-        except TimeoutError as exc:
-            raise RuntimeError(
-                f"Sigma box window {spec['name']!r} refused: "
-                f"sigma_quadrature_reduction_seconds={policy['seconds']:g} "
-                f"watchdog expired with sigma_quadrature_reduction_steps="
-                f"{policy['steps']}; no partial rule accepted. Remedy: increase "
-                "sigma_quadrature_reduction_seconds or reduce "
-                "sigma_quadrature_reduction_steps. Checks occur between basis "
-                "attempts/removal passes and before return; the step supervisor "
-                "owns the strict wall limit."
-            ) from exc
+        # Neither budget can refuse a certifiable window: a fixed-pass build
+        # is clock-free and a clock build returns its last accepted rule at a
+        # pass boundary (minimax.uniform_rule_budget).
+        rule = build_uniform_rule(build_box, eps, **build_kwargs)
         cache_status = "miss" if cache_dir is not None else "off"
     # Initial certification precedes removal passes and ignores the legacy
     # reduction clock. The service already tries three tighter bases. A
@@ -1066,7 +1059,7 @@ def plan_sigma_windows(
         print_fn(
             f"  Sigma rule reduction: deterministic budget of "
             f"{int(reduction_steps)} passes per window "
-            f"(sigma_quadrature_reduction_seconds={budget:g} refusal watchdog)")
+            f"(clock-free; sigma_quadrature_reduction_seconds is unused)")
     if fixed_rule_session is None:
         fits, fit_rows = fit_sigma_box_specs(
             specs, eta, eps=tolerance, reduction_seconds=budget,

@@ -104,8 +104,12 @@ def test_pencil_alias_and_distinct_panels():
         np.testing.assert_allclose(h, np.asarray(s)[None,None,:]*expected-a, atol=1e-12)
 
 
+# ``sigma_quadrature_reduction_steps`` is deliberately NOT here: since the
+# owner's 2026-09-10 ruling its default is a fixed pass count and explicit
+# ``none`` selects the historical clock mode, so ``none`` is a choice rather
+# than a spelling of the default. tests/test_sigma_box_plan.py owns both.
 @pytest.mark.parametrize('key', ['zeta_nband','mpa_sampling_alpha',
-    'sigma_quadrature_reduction_steps','number_bands_chi','number_bands_sigma','nband'])
+    'number_bands_chi','number_bands_sigma','nband'])
 def test_nullable_integer_none_is_uniform(tmp_path, key):
     from gw.gw_config import read_lorrax_input
     path=tmp_path/'input.in'

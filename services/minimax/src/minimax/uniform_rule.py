@@ -44,8 +44,8 @@ flips ``Im d`` and leaves the real corners alone.
    sup error on a FINER check cloud stays below ``eps`` and the
    term-cancellation ratio below ``kappa_cap``.  ``time_budget`` bounds the
    reduction in legacy clock mode, returning the best accepted rule at a
-   checkpoint. With fixed ``reduction_steps`` it is instead a refusal watchdog;
-   see ``uniform_rule_budget``.
+   checkpoint. A fixed ``reduction_steps`` build is CLOCK-FREE and ignores
+   it; see ``uniform_rule_budget``.
 
 Why the reduction works on the cloud and not on the SVD moments: the
 truncated SVD model is exact only on the ray, and its dropped tail grows like
@@ -609,7 +609,7 @@ class _CloudFit:
         batch = max(1, int(batch_frac * s.size))
         steps = 0
         while s.size > 2 and (max_steps is None or steps < max_steps):
-            if not _within_reduction_deadline(deadline, max_steps):
+            if not _within_reduction_deadline(deadline):
                 break
             steps += 1
             order = np.argsort(self.loo_scores(s, w))
@@ -1073,12 +1073,12 @@ def _select_backend(backend, n_start, cloud_size):
 def uniform_rule_budget(time_budget=None, reduction_steps=None):
     """Describe and validate the reduction policy shared by fitters and receipts.
 
-    Steps select numerical work. With steps set, seconds are a cooperative
-    refusal watchdog: expiration never selects a partially reduced rule.
-    Without steps, seconds select the last accepted rule, as historically.
-    Checks occur between basis attempts/removal passes and before return;
-    an entire attempt/pass can overrun. The step supervisor owns a strict
-    wall limit. Neither budget relaxes the error certificate.
+    Steps select numerical work, and a fixed-pass build is CLOCK-FREE: the
+    pass count alone bounds the reduction, so the deck's seconds do not
+    enter it and cannot refuse a window that certifies. Without steps,
+    seconds select the last accepted rule at a pass boundary, as
+    historically. A strict wall limit belongs to the step supervisor.
+    Neither budget relaxes the error certificate.
     """
     if time_budget is not None and (
             not np.isfinite(time_budget) or float(time_budget) <= 0.0):
@@ -1088,26 +1088,27 @@ def uniform_rule_budget(time_budget=None, reduction_steps=None):
             or not np.isfinite(reduction_steps)
             or int(reduction_steps) != reduction_steps or reduction_steps < 0):
         raise ValueError("reduction_steps must be a nonnegative integer or None")
+    clock = reduction_steps is None
     return {
-        "mode": "seconds" if reduction_steps is None else "steps",
-        "steps": None if reduction_steps is None else int(reduction_steps),
-        "seconds": None if time_budget is None else float(time_budget),
-        "exhaustion": ("last_certified_rule" if reduction_steps is None
-                       else "refuse_on_timeout"),
+        "mode": "seconds" if clock else "steps",
+        "steps": None if clock else int(reduction_steps),
+        # A fixed-pass build ignores the deck's seconds entirely: reporting
+        # them would claim a budget that selects nothing.
+        "seconds": float(time_budget) if clock and time_budget is not None else None,
+        "exhaustion": "last_certified_rule" if clock else "fixed_passes",
     }
 
 
-def _within_reduction_deadline(deadline, max_steps):
-    """A deterministic fit either finishes its work or refuses at a checkpoint."""
-    if time.perf_counter() < deadline:
-        return True
-    if max_steps is not None:
-        raise TimeoutError(
-            "uniform rule time_budget watchdog expired under reduction_steps; "
-            "no clock-selected partial rule returned. Increase time_budget "
-            "or reduce reduction_steps; a strict wall limit belongs to the "
-            "step supervisor (linear algebra calls are not preempted).")
-    return False
+def _within_reduction_deadline(deadline):
+    """Clock mode stops at its deadline; a fixed-pass build has none.
+
+    In steps mode ``uniform_rule_budget`` reports no seconds, so ``deadline``
+    is infinite here and the reduction is selected by the pass count alone.
+    That is the whole point of the step budget: at byte-identical source the
+    clock stopped the greedy reduction wherever it landed, so node counts and
+    weights differed between runs and Sigma moved by up to 0.067 meV.
+    """
+    return time.perf_counter() < deadline
 
 
 def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
@@ -1142,11 +1143,11 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     (seconds, from the start of this call) bounds the Gauss reduction and
     returns the best accepted rule at the deadline; the interpolatory rule is
     available after initial construction and certification. With
-    ``reduction_steps`` set, the fixed pass count selects numerical work and
-    ``time_budget`` instead refuses an unfinished fit at a checkpoint; it
-    never returns a clock-selected partial rule. Zero passes still certifies
-    the initial rule. Linear algebra calls are not preempted, so this is a
-    cooperative watchdog, not a strict wall bound; see uniform_rule_budget.
+    ``reduction_steps`` set, the fixed pass count is the WHOLE budget:
+    ``time_budget`` does not enter the build, so no clock can stop a
+    reduction part way and no window that certifies can be refused for
+    being slow. Zero passes still certifies the initial rule. A strict wall
+    limit belongs to the step supervisor; see uniform_rule_budget.
     ``backend`` (``numpy`` | ``jax`` | ``auto``, default the environment's
     ``LORRAX_UNIFORM_RULE_BACKEND`` or ``numpy`` when unset) chooses where
     the reduction's inner solves run; see ``_JaxCloudFit``.  Both backends
@@ -1209,8 +1210,6 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
         # at the start and a few seconds, so escalate rather than refuse.
         red = None
         for extra in (1.0, 10.0, 100.0):
-            if reduction_steps is not None:
-                _within_reduction_deadline(deadline, reduction_steps)
             if extra > 1.0:
                 fam = _RayFamily(d, theta, S, eps / (trunc * extra), rho)
                 s, w = fam.interpolatory()
@@ -1233,8 +1232,6 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     else:
         times, weights = fam.to_rule(s, w)
     sup, kappa = rule_sup_error(times, weights, d_check, rho_check)
-    if reduction_steps is not None:
-        _within_reduction_deadline(deadline, reduction_steps)
     return UniformRule(
         times=times, weights=weights, box=(re_lo, re_hi, im_lo, im_hi),
         eps=float(eps), relative=bool(relative), theta_deg=float(np.rad2deg(theta)),
