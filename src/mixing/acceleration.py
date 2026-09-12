@@ -45,6 +45,13 @@ class AccelerationResult(NamedTuple):
     residual_norms: jnp.ndarray  # Residual norm at each iteration
     iterations: int  # Number of iterations performed
     converged: bool  # Whether tolerance was reached
+    #: Accelerator trials whose PHYSICS gate refused, each with the agreed
+    #: refusal text and the iteration it happened at.  Empty for every run
+    #: that never rejected one, so an existing consumer sees no change; a run
+    #: that DID reject one must be able to say so, because a silently
+    #: substituted plain step is a different trajectory from the one the
+    #: deck asked for.  Only ``rcrop_nojit`` populates it.
+    rejected_trials: tuple = ()
 
 
 # -----------------------------------------------------------------------------
@@ -914,6 +921,47 @@ def rcrop_hermitian(
     )
 
 
+
+#: How many consecutive trial rejections before the loop gives up.  A trial
+#: whose physics gate fails is a bad EXTRAPOLATION and the plain step from the
+#: last accepted point is a fine substitute; a map that fails on every input is
+#: a broken map and must still say so, loudly, rather than spin.
+_MAX_CONSECUTIVE_TRIAL_REJECTIONS = 3
+
+
+def _agree_trial_refusal(error):
+    """Agree ACROSS RANKS whether this trial failed, and why.
+
+    Returns ``None`` when every rank succeeded, else the refusal text from the
+    lowest failing rank.  Unlike :func:`common.collectives.agree_io_error` this
+    RETURNS the verdict instead of raising it, because the caller's whole point
+    is to take a different branch rather than die.
+
+    Why it cannot be a bare per-rank ``try``: the refusals this catches --
+    ``GATE shared_pole_gram_valid`` and its siblings -- are raised from inside
+    collectives, so every rank raises them, and a rank that recovered locally
+    while another re-entered the loop would deadlock at the next collective
+    (INVARIANTS 21).  Every rank calls this, every rank gets the same answer,
+    every rank takes the same branch.
+    """
+    from common.collectives import all_gather_processes
+
+    local = "" if error is None else f"{type(error).__name__}: {error}"
+    # A fixed-width byte row per rank: one gather, no ragged object arrays.
+    import numpy as np
+
+    width = 512
+    row = np.zeros(width, np.uint8)
+    encoded = local.encode()[:width]
+    row[:len(encoded)] = np.frombuffer(encoded, np.uint8)
+    rows = np.asarray(all_gather_processes(row))
+    for rank in range(rows.shape[0]):
+        text = bytes(rows[rank]).rstrip(b"\x00").decode(errors="replace")
+        if text:
+            return f"rank {rank}: {text}"
+    return None
+
+
 def rcrop_nojit(
     residual_fn: Callable[[jnp.ndarray], jnp.ndarray],
     x0: jnp.ndarray,
@@ -1015,15 +1063,56 @@ def rcrop_nojit(
 
     if res0 <= tol:
         return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
-                                  iterations=0, converged=True)
+                                  iterations=0, converged=True,
+                                  rejected_trials=())
 
     # Broadcast an (m,) per-entry mask against a stack of any rank.
     mask_shape = (m,) + (1,) * len(shape)
 
+    rejected_trials = []
+    consecutive_rejections = 0
     for it in range(maxit):
-        # Trial step
+        # Trial step.
+        #
+        # A trial that fails a PHYSICS gate is a bad extrapolation, not a bad
+        # run.  Before this, a `GATE` refusal raised inside `residual_fn`
+        # aborted the whole loop -- measured on Si shared-pole SC, eleven
+        # converged maps thrown away because one extrapolated Hamiltonian
+        # landed past a marginal q=0 threshold (claim 2189).  Reject the
+        # trial instead and fall back to the plain step from the last
+        # accepted point.  The refusal is AGREED across ranks first; see
+        # `_agree_trial_refusal` for why a bare per-rank try is a deadlock.
         x_trial = _entry(x + f)
-        f_trial = _entry(residual_fn(x_trial))
+        try:
+            f_trial = _entry(residual_fn(x_trial))
+            local_error = None
+        except BaseException as exc:                     # noqa: BLE001
+            f_trial, local_error = None, exc
+        refusal = _agree_trial_refusal(local_error)
+        if refusal is not None:
+            consecutive_rejections += 1
+            rejected_trials.append(dict(iteration=it, refusal=refusal,
+                                        consecutive=consecutive_rejections))
+            if print_fn is not None:
+                print_fn(f"  SC acceleration: trial REJECTED at iteration {it} "
+                         f"({consecutive_rejections} consecutive); falling back "
+                         f"to the plain step from the last accepted point. {refusal}")
+            if consecutive_rejections >= _MAX_CONSECUTIVE_TRIAL_REJECTIONS:
+                raise RuntimeError(
+                    "GATE sc_trial_rejections_exhausted: "
+                    f"{consecutive_rejections} consecutive accelerator trials "
+                    "failed their physics gate, so the map -- not the "
+                    "extrapolation -- is refusing.\n"
+                    f"  got:  {refusal}\n"
+                    "  want: a map that evaluates on its own accepted input\n"
+                    "  why:  a rejected trial substitutes the plain step, which "
+                    "is a fine answer for a bad extrapolation and no answer at "
+                    "all for a bad map.")
+            # The plain step is the substitute: keep `x` and `f` as they are,
+            # so the next iteration re-extrapolates from the last ACCEPTED
+            # point rather than from a refused one.
+            continue
+        consecutive_rejections = 0
 
         # Roll history to chronological order (permutation of the leading,
         # unsharded axis: no communication).
@@ -1068,7 +1157,8 @@ def rcrop_nojit(
                 print_fn(f"rCROP converged in {it+1} iterations")
             return AccelerationResult(
                 x=x_new, residual_norms=jnp.array(res_history),
-                iterations=it+1, converged=True
+                iterations=it+1, converged=True,
+                rejected_trials=tuple(rejected_trials)
             )
 
         x = x_new
@@ -1079,6 +1169,7 @@ def rcrop_nojit(
 
     return AccelerationResult(
         x=x, residual_norms=jnp.array(res_history),
-        iterations=maxit, converged=False
+        iterations=maxit, converged=False,
+        rejected_trials=tuple(rejected_trials)
     )
 

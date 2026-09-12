@@ -536,3 +536,131 @@ def test_crop_conditioning_guard_ignores_unfilled_history_slots():
     assert abs(alpha[0]) > 1e-6, alpha
     np.testing.assert_allclose(complex(alpha.sum()), 1.0 + 0.0j,
                                rtol=0, atol=1e-12)
+
+
+# ``rcrop_nojit``'s call sequence into ``residual_fn``, which these fixtures
+# have to target precisely: ONE pre-loop call on x0, then per iteration a
+# TRIAL call on ``x + f`` followed by an ACCEPTED call on the CROP-mixed
+# ``x_new``.  So calls 2, 4, 6 ... are trials and 1, 3, 5 ... are not.  Only
+# the trial is protected -- a refusal on the accepted map is a real refusal
+# and must propagate -- and getting that wrong is how the first cut of the
+# P4 gate planted its failure on the wrong call.
+# Valid only while NO trial is rejected: a rejected trial skips its
+# accepted call, after which every subsequent call is a trial.
+_TRIAL_CALLS = (2, 4, 6, 8, 10, 12)
+
+
+def test_a_trial_that_fails_a_physics_gate_is_rejected_not_fatal():
+    """A bad EXTRAPOLATION must not throw away the converged maps behind it.
+
+    MEASURED (claim 2189): on Si shared-pole SC eleven maps converged to
+    max|dE| 6.3e-4 eV and the twelfth trial -- an rCROP extrapolation --
+    tripped ``GATE shared_pole_gram_valid`` at q=0, which aborted the run.
+    The plain step from the last accepted point is a fine substitute for a
+    refused extrapolation; the run continuing is the whole point.
+    """
+    import jax.numpy as jnp
+    import numpy as np
+    from mixing import acceleration
+
+    # NONLINEAR on purpose: CROP solves an affine residual exactly in one
+    # step, so an affine fixture converges before it ever reaches a later
+    # trial and the plant never fires.
+    target = jnp.asarray(np.arange(6, dtype=float) + 1.0) + 0j
+    base = _nonlinear(-0.55 * jnp.ones(6), target, 0.35)
+    calls = {"n": 0}
+
+    def residual(x):
+        calls["n"] += 1
+        if calls["n"] == 4:                      # the it=1 TRIAL
+            raise ValueError("GATE planted_trial_gate: got: planted; "
+                             "want: a finite trial; why: test")
+        return base(x)
+
+    result = acceleration.rcrop_nojit(residual, jnp.zeros(6, complex),
+                                      m=4, maxit=60, tol=1e-10)
+    np.testing.assert_allclose(np.asarray(result.x), np.asarray(target),
+                               rtol=0, atol=1e-8)
+    assert result.converged
+    assert len(result.rejected_trials) == 1, result.rejected_trials
+    row = result.rejected_trials[0]
+    assert "GATE planted_trial_gate" in row["refusal"], row
+    assert row["iteration"] == 1 and row["consecutive"] == 1, row
+
+
+def test_a_refusal_on_the_ACCEPTED_map_still_propagates():
+    """Only the trial is protected; the accepted map is the physics.
+
+    A substituted plain step is an answer for a bad extrapolation. It is not
+    an answer for a map that refuses on its own accepted input, and pretending
+    otherwise would turn a physics refusal into a silent trajectory change.
+    """
+    import jax.numpy as jnp
+    import numpy as np
+    import pytest
+    from mixing import acceleration
+
+    target = jnp.asarray(np.arange(6, dtype=float) + 1.0) + 0j
+    base = _nonlinear(-0.55 * jnp.ones(6), target, 0.35)
+    calls = {"n": 0}
+
+    def residual(x):
+        calls["n"] += 1
+        if calls["n"] == 3:                      # the it=0 ACCEPTED call
+            raise ValueError("GATE planted_accepted_gate: got: planted; "
+                             "want: -; why: test")
+        return base(x)
+
+    with pytest.raises(ValueError, match="planted_accepted_gate"):
+        acceleration.rcrop_nojit(residual, jnp.zeros(6, complex),
+                                 m=4, maxit=60, tol=1e-10)
+
+
+def test_consecutive_trial_rejections_still_refuse_loudly():
+    """A rejected trial substitutes the plain step; a broken MAP must not.
+
+    The fallback is only defensible while the refusal is a property of the
+    extrapolation. If every trial refuses, the loop has to stop rather than
+    spin on a substitute.
+    """
+    import jax.numpy as jnp
+    import numpy as np
+    import pytest
+    from mixing import acceleration
+
+    target = jnp.asarray(np.arange(4, dtype=float) + 1.0) + 0j
+    base = _nonlinear(-0.55 * jnp.ones(4), target, 0.35)
+    calls = {"n": 0}
+
+    def every_trial_refuses(x):
+        # Refuse EVERYTHING after the pre-loop call.  A rejected trial
+        # ``continue``s without making its accepted call, so once the
+        # rejections start every subsequent call is another trial and the
+        # even/odd table above no longer applies -- which is why this
+        # fixture cannot use it.
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise ValueError("GATE planted_always: got: planted; want: -; why: test")
+        return base(x)
+
+    with pytest.raises(RuntimeError) as caught:
+        acceleration.rcrop_nojit(every_trial_refuses, jnp.zeros(4, complex),
+                                 m=3, maxit=20, tol=1e-10)
+    message = str(caught.value)
+    assert "GATE sc_trial_rejections_exhausted" in message
+    assert "GATE planted_always" in message
+    assert str(acceleration._MAX_CONSECUTIVE_TRIAL_REJECTIONS) in message
+
+
+def test_a_clean_run_reports_no_rejected_trials():
+    """The new field must be inert for every run that never rejects one."""
+    import jax.numpy as jnp
+    import numpy as np
+    from mixing import acceleration
+
+    target = jnp.asarray(np.arange(5, dtype=float) + 1.0) + 0j
+    result = acceleration.rcrop_nojit(_nonlinear(-0.55 * jnp.ones(5), target, 0.35),
+                                      jnp.zeros(5, complex),
+                                      m=3, maxit=40, tol=1e-10)
+    assert result.rejected_trials == ()
+    assert result.converged
