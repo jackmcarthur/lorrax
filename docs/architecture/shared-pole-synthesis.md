@@ -16,10 +16,11 @@ current-map identity. Existing completed models and receipts are not rewritten.
 BLAS `C` accumulators, adjoint operation codes `"C"`, and stage labels A/B/C
 are unrelated and retain their names.
 
-G and W share the weighted outer-product mathematics, but currently do not
-call one contraction implementation. G owns `build_G`/`build_G_tau` in
-`gw/greens_function_kernel.py`. W calls `distrib_la.contract_faces` from
-`gw/mpa/sigma.py`. They already feed the same Sigma spatial executor.
+G and W share the weighted outer-product mathematics, and W now calls G's
+implementation: `gw/mpa/sigma.py::_shared_pole_contract` routes through
+`build_G(..., layout='face')` in `gw/greens_function_kernel.py`.
+`distrib_la.contract_faces` still exists as a service entry point but has no
+caller left in `src/`. They feed the same Sigma spatial executor.
 
 | Aspect | G | Shared-pole W | Reason for difference |
 |---|---|---|---|
@@ -34,10 +35,14 @@ call one contraction implementation. G owns `build_G`/`build_G_tau` in
 `low_mem_bands` selects the face wavefunction carrier and refuses an explicit
 `Gij`; it does not switch shared-pole factor storage at the Sigma reader.
 The constructor/writer hands off `b[parent,mu,spin,K]` at
-`P(None,'x',None,'y')`, but `read_shared_pole_faces` returns two arrays at
-`P(None,'x',None,None)` and `P(None,'y',None,None)`. K is replicated inside
-each bounded panel, as are poles and interval metadata. W itself is correctly
-`P(None,'x','y')`; that output fact does not certify its input storage.
+`P(None,'x',None,'y')`, and `read_shared_pole_faces` returns two arrays at
+`P(None,'x',None,'y')` and `P(None,'y',None,'x')`
+(`file_io/shared_pole_store.py`): both axes are tiled, mu against K, in the
+two orientations the face contraction consumes. The one-axis faces
+`P(None,'x',None,None)` / `P(None,'y',None,None)` this page used to describe
+are not what the shipped reader returns. Poles and interval metadata are
+replicated inside each bounded panel. W itself is `P(None,'x','y')`; that
+output fact does not certify its input storage.
 In contrast, persistent psi uses `(parent,spin,mu,band)` at
 `P(None,None,'x','y')` and `(parent,band,spin,mu)` at `P(None,'x',None,'y')`.
 
