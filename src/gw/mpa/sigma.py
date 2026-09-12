@@ -334,8 +334,8 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 realize = shared_pole_operator_realizer(
                     meta, header, q_full_idx=rows, mesh_xy=mesh_xy)
 
-            def make_kernel(width, *, tables=tables, unfold=unfold, local=local,
-                            realize=realize):
+            def make_kernel(width, *, span=(lo, hi), tables=tables,
+                            unfold=unfold, local=local, realize=realize):
                 nonlocal native_workspace
                 from distrib_la import gemm_plan
 
@@ -350,8 +350,12 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 # throwaway A/B/C operands before the actual factor read.
                 warm_bytes = 16*count*(2*m*width+m*m)//int(mesh_xy.size)
                 if "capacity_receipt" in schedule:
+                    # Span-qualified like its sigma.synthesis.compiled
+                    # sibling below: a ledger stage is an identity, and two
+                    # panels of equal (count, width) are two reservations.
                     meta.shared_pole_capacity.reserve(
-                        f"sigma.gemm_warm.{count}.{width}", resident_bytes_per_rank=0,
+                        f"sigma.gemm_warm.{span[0]}.{span[1]}.{count}.{width}",
+                        resident_bytes_per_rank=0,
                         workspace_bytes_per_rank=2*warm_bytes+native_workspace,
                         concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
                 gemm = gemm_plan(mesh_xy, m=m, k=width, n=m, nq=count,

@@ -171,3 +171,31 @@ def test_synthesis_uses_same_carrier_for_resident_and_panels(
     before=len(reads)
     jax.block_until_ready(build(*args))
     assert len(reads)==before*(1 if parent_capacity==2 else 2)
+
+def test_equal_size_panels_each_reserve_their_own_warm_stage(monkeypatch):
+    """Two panels of equal (count, width) are two ledger reservations.
+
+    A ledger stage name is an identity (``CapacityLedger.reserve`` refuses a
+    repeat), so the warm-GEMM stage has to carry its parent span exactly as
+    its ``sigma.synthesis.compiled`` sibling does.  Unqualified, the second
+    equal-size panel re-reserves the first panel's stage and planning dies on
+    any deck whose Sigma schedule has two such panels -- which is every
+    multi-panel deck with equal parent spans.  The other multi-panel tests
+    omit ``capacity_receipt`` and therefore never reserve at all.
+    """
+    from gw.mpa.sigma import _shared_pole_w_synthesis
+    from gw.shared_pole_recipe import CapacityLedger
+    fx = _synthesis_fixture(monkeypatch)
+    mesh, meta, header = fx.mesh, fx.meta, fx.header
+    # A budget large enough that only the stage IDENTITY can refuse here.
+    meta.shared_pole_capacity = CapacityLedger(
+        meta, mesh_xy=mesh, device_budget_bytes=1 << 30)
+    # parent_capacity 1 over two irreducible parents: two panels, one parent
+    # each, one shared column width -- equal (count, width), distinct spans.
+    schedule=dict(status='PASS',parent_capacity=1,column_capacity=5,
+                  endpoint_budgets={},capacity_receipt=dict(concurrent_with=()))
+    _shared_pole_w_synthesis(None,meta,header,fx.omega,schedule,mesh_xy=mesh)
+    warm = [row['stage'] for row in meta.shared_pole_capacity.entries
+            if row['stage'].startswith('sigma.gemm_warm.')]
+    assert len(warm) == 2 and len(set(warm)) == 2, warm
+    assert all(row['status'] != 'FAIL' for row in meta.shared_pole_capacity.entries)
