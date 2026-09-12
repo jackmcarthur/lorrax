@@ -199,3 +199,57 @@ def test_equal_size_panels_each_reserve_their_own_warm_stage(monkeypatch):
             if row['stage'].startswith('sigma.gemm_warm.')]
     assert len(warm) == 2 and len(set(warm)) == 2, warm
     assert all(row['status'] != 'FAIL' for row in meta.shared_pole_capacity.entries)
+
+
+def _matrix_reader_fixture(monkeypatch, mesh, *, Kmax, basis_mesh=None):
+    from file_io import shared_pole_store as store
+    import hashlib
+    indices = np.arange(12, dtype=np.int32).reshape(4, 3)
+    basis = SimpleNamespace(mesh_xy=basis_mesh or mesh, n_logical=4,
+                            n_canonical=4, n_packed=4,
+                            canonical_indices=indices, is_identity=True,
+                            active_mask=np.ones(4, bool),
+                            pack_axis=lambda b, *_a, **_kw: b)
+    header = dict(schema=store.SCHEMA, finalized=True, n_q_irr=2,
+                  n_mu_logical=4, nspinor=1, Kmax=Kmax, K=[Kmax, 0],
+                  centroid_digest=hashlib.sha256(
+                      indices.astype('<i4').tobytes()).hexdigest())
+    meta = SimpleNamespace(mu_basis=basis, nspinor=1)
+    monkeypatch.setattr(store, '_capacity', lambda _meta: None)
+    monkeypatch.setattr(store, '_check_io_capacity', lambda *_a: None)
+    monkeypatch.setattr(store, '_admit', lambda *_a, **_kw: None)
+    return store, meta, header
+
+
+def test_matrix_reader_returns_an_empty_model_without_reading_a_slab(monkeypatch):
+    """Review item 16: ``Kmax == 0`` is a state, not a one-column read.
+
+    The matrix reader was extracted from ``read_shared_pole_faces`` and
+    dropped its empty-model early return, so a model with zero retained
+    poles asked ``read_slab`` for a >= 1 wide slab of a dataset the
+    validator had just accepted as empty.
+    """
+    mesh = _mesh()
+    store, meta, header = _matrix_reader_fixture(monkeypatch, mesh, Kmax=0)
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("an empty model must not reach read_slab")
+
+    b, poles, counts = store.read_shared_pole_matrix(
+        SimpleNamespace(mesh=mesh, read_slab=refuse), (0, 2),
+        meta=meta, header=header)
+    assert b.shape == (2, 4, 0) and poles.shape == (2, 0)
+    assert b.sharding.is_equivalent_to(NamedSharding(mesh, P(None, 'x', 'y')), 3)
+    np.testing.assert_array_equal(counts, np.zeros(2, np.int64))
+
+
+def test_matrix_reader_refuses_a_mesh_the_basis_was_not_packed_on(monkeypatch):
+    """The sibling reader's mesh refusal, dropped in the same extraction."""
+    mesh = _mesh()
+    other = Mesh(np.asarray(jax.devices('cpu')[:4]).reshape(2, 2), ('x', 'y'))
+    store, meta, header = _matrix_reader_fixture(
+        monkeypatch, mesh, Kmax=5, basis_mesh=other)
+    with pytest.raises(Exception, match="reader mesh differs"):
+        store.read_shared_pole_matrix(
+            SimpleNamespace(mesh=mesh, read_slab=lambda *_a, **_kw: None),
+            (0, 2), meta=meta, header=header)

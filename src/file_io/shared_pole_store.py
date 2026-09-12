@@ -656,10 +656,27 @@ def read_shared_pole_matrix(io, q_span, *, meta, header):
     if header["schema"] != SCHEMA or not header["finalized"]:
         _refuse("matrix reader requires a finalized model")
     basis, ledger = _check_basis(meta, header), _capacity(meta)
+    # Both guards belong to the reader this one was extracted from
+    # (:func:`read_shared_pole_faces`) and are not optional here: a packed
+    # basis is bound to the mesh it was packed on, and a dataset validated
+    # as empty has no slab to read.
+    if io.mesh is not basis.mesh_xy:
+        _refuse("reader mesh differs from packed basis mesh")
     _check_io_capacity(ledger, io.mesh, header)
     lo, hi = _span(q_span, header["n_q_irr"], "q_span")
     spec = P(None, "x", None, "y")
-    width = padded_axis(max(1, header["Kmax"]), io.mesh, name="shared_pole_K",
+    if header["Kmax"] == 0:
+        # A model with zero retained poles is a state every other consumer
+        # supports (gw/mpa/sigma.py, the census, the exporter). Asking
+        # read_slab for a >= 1 wide slab of a dataset just validated as
+        # empty is not a read this reader may make.
+        _admit(ledger, "empty_matrix", 8*(hi-lo))
+        zeros = jax.jit(
+            lambda: jnp.zeros((hi-lo, basis.n_packed, 0), jnp.complex128),
+            out_shardings=NamedSharding(io.mesh, P(None, "x", "y")))
+        return (zeros(), jnp.ones((hi-lo, 0), jnp.float64),
+                jnp.zeros(hi-lo, jnp.int64))
+    width = padded_axis(header["Kmax"], io.mesh, name="shared_pole_K",
                         specs=((spec, 3),)).carrier
     shape = (hi-lo, basis.n_canonical, 1, width)
     arg, output, temporary = _conversion_bytes(basis, shape, spec, unpack=False)
