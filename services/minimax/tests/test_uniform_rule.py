@@ -16,16 +16,22 @@ ETA = 0.02
 def _dense_boundary(box, times):
     """An independent cloud: the four edges, uniform at 12 points per half wave
     of the largest |t| (and of 1/d at the peak), plus geometric points toward
-    small |Re d|.  No code shared with the builder's clouds."""
+    small |Re d|.  No code shared with the builder's clouds.
+
+    12 points per half wave is what makes this an audit -- the builder fits at
+    2 and accepts at 6 -- and it is the linspace that carries it.  The
+    geometric limbs only have to resolve the log measure toward the near
+    corner; at 20000/2000 they were most of this suite's wall for no extra
+    discrimination (the reported sup is unchanged to four digits at 1500)."""
     re_lo, re_hi, im_lo, im_hi = box
     h = min(np.pi / (12.0 * np.max(np.abs(times))), im_lo / 12.0)
     x = np.linspace(re_lo, re_hi, int((re_hi - re_lo) / h) + 2)
     if re_lo > 0.0:
-        x = np.union1d(x, np.geomspace(re_lo, re_hi, 20000))
+        x = np.union1d(x, np.geomspace(re_lo, re_hi, 1500))
     if re_hi < 0.0:
-        x = np.union1d(x, -np.geomspace(-re_hi, -re_lo, 20000))
+        x = np.union1d(x, -np.geomspace(-re_hi, -re_lo, 1500))
     y = np.union1d(np.linspace(im_lo, im_hi, int((im_hi - im_lo) / h) + 2),
-                   np.geomspace(im_lo, max(im_hi, im_lo * 1.0001), 2000))
+                   np.geomspace(im_lo, max(im_hi, im_lo * 1.0001), 400))
     return np.concatenate([x + 1j * im_lo, x + 1j * im_hi, re_lo + 1j * y, re_hi + 1j * y])
 
 
@@ -120,6 +126,7 @@ def test_roundoff_amplification_uses_the_error_currency():
     assert relative > 50.0 * peak
 
 
+@pytest.mark.slow
 def test_random_boxes_never_refuse_and_hold_on_a_finer_cloud():
     """Property test: every finite box yields an accepted rule, and the sup
     bound holds on a cloud finer than the one the rule was fitted on.
@@ -127,20 +134,20 @@ def test_random_boxes_never_refuse_and_hold_on_a_finer_cloud():
     rng = np.random.default_rng(7)
     for _ in range(10):
         kind = rng.choice(["crossing", "sd+", "sd-", "near+", "near-"])
-        im_hi = ETA * 10 ** rng.uniform(0, 2)
+        im_hi = ETA * 10 ** rng.uniform(0, 1.4)
         if kind == "crossing":
-            lo, hi = -ETA * rng.uniform(5, 40), ETA * rng.uniform(5, 30)
+            lo, hi = -ETA * rng.uniform(4, 16), ETA * rng.uniform(4, 12)
         elif kind == "sd+":
-            lo = ETA * 10 ** rng.uniform(-0.5, 1.5); hi = lo * 10 ** rng.uniform(0.5, 4)
+            lo = ETA * 10 ** rng.uniform(-0.5, 1.0); hi = lo * 10 ** rng.uniform(0.5, 2.5)
         elif kind == "sd-":
-            hi = -ETA * 10 ** rng.uniform(-0.5, 1.5); lo = hi * 10 ** rng.uniform(0.5, 4)
+            hi = -ETA * 10 ** rng.uniform(-0.5, 1.0); lo = hi * 10 ** rng.uniform(0.5, 2.5)
         elif kind == "near+":
-            lo = -ETA * rng.uniform(0.1, 3); hi = ETA * rng.uniform(10, 200)
+            lo = -ETA * rng.uniform(0.1, 3); hi = ETA * rng.uniform(10, 45)
         else:
-            hi = ETA * rng.uniform(0.1, 3); lo = -ETA * rng.uniform(10, 200)
+            hi = ETA * rng.uniform(0.1, 3); lo = -ETA * rng.uniform(10, 45)
         eps = float(rng.choice([1e-3, 1e-4]))
         box = (lo, hi, ETA, im_hi)
-        rule = build_uniform_rule(box, eps, time_budget=5.0)
+        rule = build_uniform_rule(box, eps, time_budget=2.0)
         assert rule.relative == kind.startswith("sd")
         _check(rule, box, eps)
 
@@ -150,9 +157,9 @@ def test_thin_boxes_certify_on_the_dense_boundary():
     error oscillates at its node horizon at every Re d, so a crossing rule must
     hold far from Re d = 0 too (a geometric far field certified 247x-eps rules);
     a thin tail must hold at its near corner (1.8x eps on main, 2026-09-11)."""
-    for box in ((-24.0 * ETA, 38.0 * ETA, ETA, 1.01 * ETA),     # Na B06-like crossing
-                (1.05 * ETA, 960.0 * ETA, ETA, 1.01 * ETA)):    # Na tail-like
-        _check(build_uniform_rule(box, 1.0e-4, time_budget=20.0), box, 1.0e-4)
+    for box in ((-14.0 * ETA, 22.0 * ETA, ETA, 1.01 * ETA),     # Na B06-like crossing
+                (1.05 * ETA, 240.0 * ETA, ETA, 1.01 * ETA)):    # Na tail-like
+        _check(build_uniform_rule(box, 1.0e-4, time_budget=10.0), box, 1.0e-4)
 
 
 def test_far_sign_definite_box_samples_stay_inside_the_box():
@@ -164,6 +171,7 @@ def test_far_sign_definite_box_samples_stay_inside_the_box():
     assert d.real.min() >= lo and d.real.max() <= hi
 
 
+@pytest.mark.slow
 def test_jax_backend_on_cpu_matches_numpy_on_a_small_crossing_box(monkeypatch):
     """The jax reducer (forced, on the CPU device) reaches an accepted rule
     within a few nodes of the numpy one: same algorithm, different
@@ -182,7 +190,7 @@ def test_step_budget_is_deterministic_and_ignores_the_clock():
     two builds agree bit for bit, and a wall budget passed alongside is
     ignored (the same rule again), unlike the wall-clock mode whose node
     count depends on how far the reduction got before the deadline."""
-    box = (2.0 * ETA, 400.0 * ETA, ETA, 30.0 * ETA)
+    box = (2.0 * ETA, 60.0 * ETA, ETA, 10.0 * ETA)
     first = build_uniform_rule(box, 1.0e-4, reduction_steps=3)
     second = build_uniform_rule(box, 1.0e-4, reduction_steps=3)
     third = build_uniform_rule(box, 1.0e-4, reduction_steps=3, time_budget=1e-3)

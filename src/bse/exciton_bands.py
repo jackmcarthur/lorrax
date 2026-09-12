@@ -109,20 +109,25 @@ import os
 import time
 from functools import partial
 
-import h5py
-import numpy as np
-
 # THE startup call (runtime module docstring): env defaults, SLURM-aware
 # ``jax.distributed.initialize``, CPU fallback, the run's clique-warmed
 # square ('x','y') mesh, compile cache, rank-0 report.  Must run
 # BEFORE this module's own ``import jax`` and any ``jax.devices()`` /
-# mesh creation so a multi-node srun yields the full global device set.
+# mesh creation so a multi-node srun yields the full global device set,
+# and before ``import numpy``: importing runtime is what sets
+# OPENBLAS_THREAD_TIMEOUT, which OpenBLAS reads in the constructor that
+# runs with numpy (runtime.tune_blas_threading; enforced by
+# tests/test_runtime_blas_env.py).
 # This driver names ``--px/--py``; ``create_mesh_xy_from_flags(px, py)`` in
 # main() hands back this startup mesh when they are omitted (the default
 # since 2026-08-27) and refuses any explicit shape that is not it, so the
 # mesh every NamedSharding embeds is the one the report above describes.
 from runtime import (debug_print, debug_print_enabled,
                      initialize_communicator_stack, rank0_print)
+
+import h5py                                                         # noqa: E402
+import numpy as np                                                  # noqa: E402
+
 RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
 import jax

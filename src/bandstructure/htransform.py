@@ -1,18 +1,23 @@
 import os
 import argparse
-import numpy as np
 
 # THE startup call (runtime module docstring): env defaults, fail-fast
 # hook, jax.distributed, CPU fallback, the run's clique-warmed ('x','y')
 # mesh, compile cache, rank-0 report.  MUST run before this module's own
-# `import jax`; idempotent, so importing htransform as a LIBRARY from an
-# already-started driver (bse.exciton_bands does) returns the same stack.
+# `import jax` AND before `import numpy`: importing runtime is what sets
+# OPENBLAS_THREAD_TIMEOUT, and OpenBLAS reads it in the constructor that
+# runs with numpy (runtime.tune_blas_threading; tests/test_runtime_blas_env.py
+# enforces this order).  Idempotent, so importing htransform as a LIBRARY
+# from an already-started driver (bse.exciton_bands does) returns the same
+# stack.
 from runtime import (
     debug_print,
     debug_print_enabled,
     initialize_communicator_stack,
     rank0_print,
 )
+
+import numpy as np                                                  # noqa: E402
 RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 
 import jax

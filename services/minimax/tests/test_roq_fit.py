@@ -92,7 +92,14 @@ def test_production_rank_interpolates_and_accepts_exact_search_score(
 
     monkeypatch.setattr(roq_fit, "_rank_ceiling", lambda group: 100)
     monkeypatch.setattr(roq_fit, "_prepare_subspace",
-                        lambda group, base_nodes, max_rank: None)
+                        # (basis, singular values): the production code reads
+                        # prepared[1] to clamp the ceiling at the measure's own
+                        # numerical rank.  A flat spectrum leaves the ceiling
+                        # where _rank_ceiling put it, which is what this cell
+                        # is about; returning None here made the stub stale
+                        # against that clamp and the cell raised TypeError.
+                        lambda group, base_nodes, max_rank: (
+                            None, np.ones(int(max_rank) if max_rank else 64)))
     monkeypatch.setattr(roq_fit, "_fit_prepared", fake_fit)
     angle_probe = fake_fit(groups[0], None, 12, quick=True)
     angle_probe = roq_fit.RoqRule(
@@ -184,6 +191,7 @@ def frozen_na_plans():
             plan_measure_adapted_roq(windows, eta))
 
 
+@pytest.mark.slow
 def test_frozen_na_angle_selection_and_branch_consolidation(frozen_na_plans):
     plan, _ = frozen_na_plans
     valence = next(row for row in plan.branches if row.branch == "val")
@@ -202,6 +210,7 @@ def test_frozen_na_angle_selection_and_branch_consolidation(frozen_na_plans):
     assert valence_rule.angle_deg < 0.0
 
 
+@pytest.mark.slow
 def test_frozen_na_plan_is_bit_deterministic(frozen_na_plans):
     first, second = frozen_na_plans
     assert len(first.rules) == len(second.rules)
@@ -214,6 +223,7 @@ def test_frozen_na_plan_is_bit_deterministic(frozen_na_plans):
         np.testing.assert_array_equal(left.weights, right.weights)
 
 
+@pytest.mark.slow
 def test_frozen_na_node_accuracy_and_noise_acceptance(frozen_na_plans):
     plan, _ = frozen_na_plans
     assert sum(rule.rank for rule in plan.rules) == 89

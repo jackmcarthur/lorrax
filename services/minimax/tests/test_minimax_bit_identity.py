@@ -37,7 +37,11 @@ _CENSUS_TABLES = {
     "noncrossing/noncrossing_R_10p000000_eps_1p0em06.npz": 47,
     "noncrossing/noncrossing_R_46p415888_eps_1p0em06.npz": 10,
     "noncrossing/noncrossing_R_21p544347_eps_1p0em06.npz": 8,
-    "crossing/crossing_hgl_A_40p000000_eps_1p0em06_epsq_1p0em03.npz": 6,
+    # The A=24 request stopped rounding up to the A=40 table when a table AT
+    # A_core = 24.0 shipped at a tighter eps (1.8e-08): the selector now takes
+    # the exact range match, which is the better answer and exactly the
+    # conditioning-floor caveat census 2.3 wrote down.  Re-pinned 2026-09-11.
+    "crossing/crossing_hgl_A_24p000000_eps_1p8em08_epsq_1p0em03.npz": 38,
 }
 
 #: Requests taken verbatim from the census's deck and suite tables, with
@@ -59,7 +63,7 @@ _CENSUS_REQUESTS = [
     # the production crossing request, which pins at A_core = 24.0 exactly
     # for as long as the conditioning floor stays engaged (census §2.3)
     (("crossing", "hgl", 24.0, 1.0e-6, 500, 1.0e-3),
-     "crossing/crossing_hgl_A_40p000000_eps_1p0em06_epsq_1p0em03.npz"),
+     "crossing/crossing_hgl_A_24p000000_eps_1p8em08_epsq_1p0em03.npz"),
 ]
 
 
@@ -128,7 +132,7 @@ def test_the_served_error_is_the_payloads_and_not_the_catalogs_claim():
     assert q.max_error == raw_err               # and the payload is the source
 
 
-def test_the_whole_measured_surface_is_six_tables_of_thirty_one():
+def test_the_whole_measured_surface_is_four_tables_of_thirty_four():
     """The census's most useful single number, pinned.
 
     Everything the frozen decks, the campaign decks and the suite ever
@@ -144,7 +148,7 @@ def test_the_whole_measured_surface_is_six_tables_of_thirty_one():
                      error_bound=error_bound, n_max=n_max, **kw)
         served.add(q.provenance.catalog_entry)
     assert served <= set(_CENSUS_TABLES), served - set(_CENSUS_TABLES)
-    assert len(M.catalog()) == 31
+    assert len(M.catalog()) == 34
 
 
 def test_the_table_hash_is_stable_across_reads():

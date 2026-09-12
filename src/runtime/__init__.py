@@ -167,6 +167,7 @@ __all__ = [
     "set_default_xla_gpu_autotune",
     "announce_cpu_collectives",
     "skip_gpu_plugin_discovery",
+    "tune_blas_threading",
     "init_jax_distributed",
     "fallback_to_cpu_if_no_gpu_backend",
     "install_failfast_excepthook",
@@ -208,6 +209,12 @@ _DEMOTIONS: list = []
 #: OOM mitigation is actually armed rather than assuming it is.
 _MALLOC_TUNE: dict = {"applied": None, "mmap_mb": None, "trim_mb": None,
                       "reason": None}
+
+#: Filled in by :func:`tune_blas_threading`, which runs at IMPORT time rather
+#: than from :func:`bootstrap` — OpenBLAS reads its environment once, in the
+#: library constructor, and that runs at the first ``import numpy``.
+_BLAS_TUNE: dict = {"applied": None, "timeout": None, "reason": None,
+                    "numpy_already_imported": None}
 
 #: Filled in by :func:`init_jax_distributed`: which of the two
 #: ``jax.distributed.initialize()`` forms actually ran.  A module global (not
@@ -1028,6 +1035,80 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
             f"node; this run has no GPU.")
         announce_cpu_collectives()
     return True
+
+
+def tune_blas_threading() -> bool:
+    """Stop OpenBLAS's idle workers from spinning.  Returns True when the
+    tuning was applied; a path that leaves it unapplied because numpy was
+    already imported announces itself, because by then it cannot be fixed
+    in-process (QUALITY_PATTERNS #5/#7).
+
+    WHY.  OpenBLAS keeps its worker threads in a busy-wait after a call
+    finishes so the next call finds them hot.  That is the right default for
+    a tight loop of BLAS calls and the wrong one for every driver here, which
+    interleaves short LAPACK calls with substantial Python/numpy work: the
+    spinning workers hold the cores the calling thread needs, and small
+    factorisations collapse.  MEASURED on the Sigma box-rule planner
+    (``minimax.uniform_rule``, scipy-openblas 0.3.34, 4 threads): one
+    140x140 ``cho_factor`` took 28.7 ms in situ against 0.067 ms standalone,
+    a factor of 400, and 230 of them were most of the build.  Setting the
+    timeout takes one crossing-box build from 15.02 s to 2.87 s (5.2x) with
+    an identical node count, and the 41-box corpus from 1720 s to 303 s
+    (run DEV/327, results/spin_step30; claims 2192/2193).
+
+    The cost is real but small and in the other regime: 200 back-to-back
+    ``cholesky(300)`` calls with NOTHING between them measured 96.1 -> 117.2
+    ms (+22 %), because there the spin is doing its job.  Sustained large
+    GEMM is unaffected (zgemm 2000/4000 at 352/367 GFLOP/s either way).  No
+    LORRAX driver is a tight BLAS loop, so the default is on.
+
+    ``OPENBLAS_THREAD_TIMEOUT`` is log2 of the spin count and is read ONCE,
+    in OpenBLAS's constructor, which runs at the first ``import numpy`` —
+    so this cannot live in :func:`set_default_env` (that runs from
+    :func:`bootstrap`, long after the driver's own ``import numpy``) and is
+    called at import of this module instead.  Every driver therefore has to
+    import ``runtime`` before numpy; ``tests/test_runtime_blas_env.py``
+    enforces that so the ordering cannot rot.  ``setdefault`` throughout: a
+    caller who exports ``OPENBLAS_THREAD_TIMEOUT`` wins.
+
+    Knobs: ``LORRAX_BLAS_TUNE=0`` disables; ``OPENBLAS_THREAD_TIMEOUT``
+    set by the caller is honoured as-is.  Thread COUNT is deliberately not
+    set here — it is workload-dependent and belongs to the launcher.
+    """
+    import sys as _sys
+    already = "numpy" in _sys.modules
+    _BLAS_TUNE["numpy_already_imported"] = already
+    if _env_falsy("LORRAX_BLAS_TUNE"):
+        _BLAS_TUNE.update(applied=False, reason="disabled by LORRAX_BLAS_TUNE")
+        return False
+    if already:
+        # Too late to matter: OpenBLAS read its environment in the
+        # constructor that ran with numpy.  Say so rather than report a
+        # tuning that is not in force.
+        _BLAS_TUNE.update(
+            applied=False,
+            reason="numpy was imported before runtime; OpenBLAS already read "
+                   "its environment")
+        _record_demotion(
+            "BLAS spin tuning was NOT applied: numpy was imported before the "
+            "runtime module, so OPENBLAS_THREAD_TIMEOUT came too late. Host "
+            "LAPACK-heavy work (the Sigma box-rule planner above all) runs "
+            "the slow way — measured 5.2x on that planner. Import runtime "
+            "before numpy in this entry point.")
+        return False
+    os.environ.setdefault("OPENBLAS_THREAD_TIMEOUT", "1")
+    _BLAS_TUNE.update(applied=True,
+                      timeout=os.environ["OPENBLAS_THREAD_TIMEOUT"],
+                      reason=None)
+    return True
+
+
+# Run it NOW, at import of this module, not from bootstrap(): OpenBLAS reads
+# OPENBLAS_THREAD_TIMEOUT in its constructor, which runs at the first
+# `import numpy`, and every driver imports runtime before numpy (enforced by
+# tests/test_runtime_blas_env.py).  This is the one startup action that
+# cannot wait for the startup call.
+tune_blas_threading()
 
 
 # glibc mallopt parameter numbers (malloc.h).
@@ -2517,6 +2598,7 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
         f["compile_cache"] = {"error": f"{type(exc).__name__}: {exc}"}
     f["compile_cache_error"] = cache_error
     f["malloc_tune"] = dict(_MALLOC_TUNE)
+    f["blas_tune"] = dict(_BLAS_TUNE)
     import sys as _sys
     f["failfast"] = bool(getattr(_sys, "_lorrax_failfast_installed", False))
     f["failfast_env"] = os.environ.get("LORRAX_FAILFAST")

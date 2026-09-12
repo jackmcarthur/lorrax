@@ -31,7 +31,17 @@ flips ``Im d`` and leaves the real corners alone.
    log-density (every decade of ``|d|`` counts once) and the start is
    polished by a few Lawson reweighting rounds toward the sup, because the
    L2 optimum leaves the near corner 3-7x above ``eps``.
-3. **Reduction.** Bremer-Gimbutas-Rokhlin style: nodes are removed one at a
+3. **Placement (crossing boxes).** ``fixed_n_start`` predicts the count the
+   box needs and places exactly that many nodes where certified rules put
+   theirs; one polish either certifies it or the count grows 10 % and the
+   placement is tried again.  This is what a crossing box normally returns,
+   and it terminates on the CERTIFICATE, never on a clock.  It exists
+   because the reduction below asks for ~``rank/2`` removals times ``K``
+   candidates times 60-180 LM steps -- of order 1e5 solves and 100+ TFLOP --
+   on a problem whose whole content is a few hundred GFLOP, so on a wide box
+   it cannot finish and used to ship at the interpolatory rank.
+4. **Reduction** (sign-definite boxes, and any crossing box the placement
+   fails). Bremer-Gimbutas-Rokhlin style: nodes are removed one at a
    time (batches while far above the target), the survivors re-solved by a
    variable-projection Levenberg-Marquardt on the CLOUD residual
    ``sum_k w_k exp(i t_k d) - 1/d``.  Candidates are ranked by the
@@ -42,8 +52,9 @@ flips ``Im d`` and leaves the real corners alone.
    the cancellation ratio), ``Im s`` is parametrised as ``c + h tanh(y)`` so
    the off-ray cap is built into the model.  A candidate is kept while the
    sup error on a FINER check cloud stays below ``eps`` and the
-   term-cancellation ratio below ``kappa_cap``.  ``time_budget`` bounds the
-   reduction and returns the best accepted rule at the deadline.
+   term-cancellation ratio below ``kappa_cap``.  ``time_budget`` bounds this
+   step and returns the best accepted rule at the deadline — it does not
+   reach step 3, which stops on its certificate.
 
 Why the reduction works on the cloud and not on the SVD moments: the
 truncated SVD model is exact only on the ray, and its dropped tail grows like
@@ -51,11 +62,14 @@ truncated SVD model is exact only on the ray, and its dropped tail grows like
 the box error was 1e-3.  Every acceptance decision below is a sup norm on
 sampled denominators for that reason.
 
-Counts: about ``0.5 r`` for a crossing box with ``r ~ 1.9 (B/eta)
-ln(10/eps)/13.8`` (``B`` the real width; ~0.67 r at a 15 s budget, ~0.5 r at
-120 s); ``O(log(re_hi/re_lo))`` for a sign-definite box.  The count is set by
-the box width in units of ``eta``, so nothing in this module can go below
-the geometry of the window it is given.
+Counts: a crossing box returns what ``fixed_n_start.predict_nodes`` asks for
+(or the first 10 % rung above it that certifies), roughly ``W T / 2 pi`` for
+an effective width ``W`` and support ``T = ln(c/eps)/eta`` -- measured 34.6 %
+below what the budgeted reduction shipped over the 41-box corpus, and no
+longer a function of how fast the machine is;
+``O(log(re_hi/re_lo))`` for a sign-definite box.  The count is set by the box
+width in units of ``eta``, so nothing in this module can go below the
+geometry of the window it is given.
 """
 from __future__ import annotations
 
@@ -151,29 +165,31 @@ def _log_density_weights(d):
 #: independent audit; 3 cost ~1.5x the reduction wall of 1.5-2
 #: (runs/DEV/326_minimax_fit_review_2026-09-11, A/B rounds 1-2).
 _FIT_POINTS_PER_HALF_WAVE = 2.0
-# Fixed-N fast path (crossing boxes): how hard to try before giving the box
-# back to the reduction.  Measured over the 41-box corpus (run DEV/327,
-# results/e9): every placement that ever certified did so by the second
-# Lawson round, and the ones that never certified sat above 4.6 eps after the
-# initial solve while every eventual winner sat at or below 1.9.  Rounds 3-6
-# are about four sevenths of a polish and rescued nothing.
-_FIXED_N_ROUNDS = 2
+# ------------------------------------------------------ fixed-N placement
+# How hard the placement tries at one node count, and how the count grows.
+# All four measured over the 41-box corpus (run DEV/327; claims 2192/2193).
+#
+# The LM is the entire cost of this path: on the widest box one 60-step solve
+# is 12.2 s, against 1 s for the angle scan, the family SVD and the
+# interpolatory weights together, and 32 ms for a certificate.  From a
+# structural start 30 steps reach the same sup as 60 on every box that ever
+# certifies (lm30 against lm60: 1.9/1.9, 1.0/1.0, 1.1/1.1, 1.4/1.4), so the
+# second thirty are bought and thrown away.
 _FIXED_N_STEPS = 30
+# Every placement that ever certified did so by the SECOND Lawson round;
+# rounds 3-6 are about four sevenths of a polish and rescued nothing.
+_FIXED_N_ROUNDS = 2
+# After the initial solve a placement that never certifies sits above 4.6 eps
+# while every eventual winner sits at or below 1.9, so a sup above this is in
+# the wrong basin and is abandoned rather than polished.
 _FIXED_N_GATE = 3.0
-# The count law is fitted on converged reductions, which censors the widest
-# boxes and makes it read low there by up to 1.56x (x120_thin0 certifies at
-# 207 against 133 predicted).  Growing until the certificate passes costs a
-# few solves -- each one gated, so a placement in the wrong basin is abandoned
-# after its first solve -- and needs no refit.  1.10^7 = 1.95 covers the
-# measured shortfall with room to spare.
+# ``predict_nodes`` is fitted on converged reductions, which censors the
+# widest boxes and makes it read low there by up to 1.56x (x120_thin0
+# certifies at 207 against 133 predicted).  Growing until the certificate
+# passes removes that bias without refitting the law on four points, and
+# 1.10^7 = 1.95 covers the measured shortfall with room to spare.
 _FIXED_N_GROWTH = 1.10
 _FIXED_N_BRACKET = 8
-# The LM is the whole cost of this path (one 60-step solve is 12.2 s on the
-# widest box at 16 threads, against 1 s for the angle scan, the family SVD and
-# the interpolatory weights put together, and 32 ms for a certificate).  From
-# a structural start 30 steps reach the same sup as 60 on every corpus box
-# that ever certifies -- lm30 against lm60 reads 1.9/1.9, 1.0/1.0, 1.1/1.1,
-# 1.4/1.4 -- so the second thirty are bought and thrown away (results/e9).
 
 
 def _live_spacing(d, theta, S, eps, p, p_target):
@@ -1291,10 +1307,14 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     far off it buy accuracy on the fit cloud with growth the check cloud then
     catches.  ``trunc`` is the start rule's extra accuracy (``eps/trunc``).
     ``kappa_cap`` is the largest cancellation ratio accepted.  ``time_budget``
-    (seconds, from the start of this call) bounds the Gauss reduction and
+    (seconds, from the start of this call) bounds the Gauss REDUCTION and
     returns the best accepted rule at the deadline; the interpolatory rule is
     always available after about a second, so the budget trades planning
-    wall for node count and nothing else.  Never refuses a finite box.
+    wall for node count and nothing else.  It does NOT reach the crossing
+    placement, which stops on its own certificate — so on a crossing box the
+    node count no longer depends on the clock, and passing a budget there
+    changes nothing unless the placement fails and the reduction takes over.
+    Never refuses a finite box.
     ``backend`` (``numpy`` | ``jax`` | ``auto``, default the environment's
     ``LORRAX_UNIFORM_RULE_BACKEND`` or ``numpy`` when unset) chooses where
     the reduction's inner solves run; see ``_JaxCloudFit``.  Both backends
@@ -1338,8 +1358,11 @@ def build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
         Bm = max(-re_lo, 1e-3 * im_lo)
         im_lo_s, im_hi_s = max(-im_cap / Bp, -0.3 * S), min(im_cap / Bm, 0.3 * S)
 
+        # Both read fam.phase, not fit.phase: every _CloudFit below is built
+        # with fam.phase, and closing over `fit` would make acceptance depend
+        # on which solver happened to be bound last.
         def ok(s_, w_):
-            e_, k_ = check.sup(fit.phase * s_, w_, relative)
+            e_, k_ = check.sup(fam.phase * s_, w_, relative)
             return e_ <= eps and k_ <= kappa_cap
 
         def sup_ratio(s_, w_):

@@ -79,4 +79,10 @@ testpaths = ["tests"]
 markers = [
     "services: a standalone service's own suite, staged into the main one",
     "minimax: the minimax service suite",
+    "slow: an integration guard that plans or fits a production-sized problem — correct, kept, and deselected from the default run because it costs tens of seconds where the rest of this suite costs tenths",
 ]
+# The default run is the DEVELOPER LOOP and is meant to stay under ~10 s, so a
+# wrong edit is caught while it is still being typed.  `-m slow` runs the
+# integration guards; the monorepo census runs everything either way (it sets
+# its own addopts and does not inherit this line).
+addopts = "-m 'not slow'"

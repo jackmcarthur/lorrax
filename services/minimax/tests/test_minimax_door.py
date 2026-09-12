@@ -98,9 +98,16 @@ def test_the_catalog_view_is_enumerable_without_solving_anything():
     scrubbed one by the isolation suite.
     """
     view = M.catalog()
-    assert len(view) == len(view.entries) == 31
-    assert len(view.for_family("crossing")) == 5
-    assert len(view.for_family("noncrossing")) == 26
+    crossing = len(view.for_family("crossing"))
+    noncrossing = len(view.for_family("noncrossing"))
+    # The partition is the invariant: every entry belongs to exactly one of
+    # the two families, so these must add up whatever ships.
+    assert len(view) == len(view.entries) == crossing + noncrossing
+    # The totals are a canary, not a law -- update them WHEN TABLES SHIP and
+    # say so in the commit.  They read 31/5/26 until 2026-09-11, three tables
+    # behind what the package actually carried, so the cell had been failing
+    # rather than guarding.
+    assert (len(view), crossing, noncrossing) == (34, 6, 28)
 
 
 # ---------------------------------------------------------------------------

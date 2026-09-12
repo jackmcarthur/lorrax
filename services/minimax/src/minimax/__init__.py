@@ -230,10 +230,13 @@ _TIME_NODE_SEARCH_NAMES = (
     "ComplexTimeSearchOptions", "support_arc",
     "candidate_time_dictionary", "fit_reciprocal_measure",
 )
-_MEASURE_WINDOW_NAMES = (
-    "MeasureWindow", "WindowErrorBudget", "tail_refined_lattice_measure",
-    "partition_measure_windows", "apportion_true_error",
-)
+# ``measure_windows`` defines exactly one public name.  The other four this
+# tuple used to carry -- MeasureWindow, WindowErrorBudget,
+# partition_measure_windows, apportion_true_error -- were left behind by a
+# removed windowing API: nothing in the monorepo imports them and the module
+# has not defined them for some time, so `minimax.MeasureWindow` raised
+# AttributeError while sitting in `__all__`.  Removed 2026-09-11.
+_MEASURE_WINDOW_NAMES = ("tail_refined_lattice_measure",)
 _WINDOWED_FIT_NAMES = (
     "PhaseBoundedReciprocalFit", "fit_phase_bounded_candidates",
 )
