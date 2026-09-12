@@ -5,10 +5,26 @@ Lane ARECIPE. Branch `lane/sp-arecipe-2026-09-11`, worktree
 `9160c501`. Run directory
 `runs/frequency_integration_sandbox/369_arecipe_20260911/`.
 
-**Status: source changed, metadata tests green on CPU, no GPU leg run yet.**
-§8 states what is claimed and what is not. Predictions and decision rules are
-fixed in `369_arecipe_20260911/PREREGISTERED.md`, written and pushed before any
-leg of this lane exists.
+**Status: COMPLETE. Nine legs landed, all EXCLUSIVE, both decks measured.**
+The design argument below stands as written; the measured outcome, the one
+falsified prediction, the source defect this lane found and the ξ decision are
+in `reports/shared_pole_push_2026-09-07/arecipe/report.md` §§8–13, which is the
+owner of the results. Predictions were fixed before each run in
+`369_arecipe_20260911/PREREGISTERED.md` and `PREREGISTERED_CAP.md`; neither was
+edited afterwards.
+
+**Headline.** Na 21 → 20 line supports, +10.4 % K, Σ unmoved (139 µeV, zero
+rows over 2 meV). Si 34 → 44, +29.8 % K, and the Σ movement is confined to the
+region the incumbent could not support pointwise — where both arms cover they
+agree to 1.08 meV with zero rows over the bar. One pre-registered cost law was
+falsified (K tracks support *spread*, not count) and replaced with a measured
+one; one source defect was found and closed on the recipe side. CD is routed to
+lane AIRKA and is the outstanding verdict.
+
+Two corrections to the design text below, both made before the runs and both
+recorded where they happened rather than silently applied: `imaginary_top_factor`
+moved 2.0 → 2.5 on a recomputed Zolotarev turnover, and a fourth rule — the
+bank's remote-domain cap — was added after Si was refused without it.
 
 ---
 
