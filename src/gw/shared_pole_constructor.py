@@ -692,6 +692,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         from gw.shared_pole_recipe import (
             construction_receipt, shared_real_pole_gates_v1_r3b as gates,
         )
+        from gw.qgrid_symmetry import symmetrise_shared_pole_tiles
         from common.units import RYD_TO_EV
         from gw.w_isdf import response_coulomb_powers
 
@@ -829,6 +830,24 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         # this jit local also avoids retaining the map's capacity ledger in
         # a global callable cache across self-consistent reconstructions.
         model_diagnostics = jax.jit(partial(_model_diagnostics, matmul=mm))
+        # EVERY TILE THAT ENTERS A PENCIL IS PROJECTED, AND TOGETHER.  The
+        # stored bank is the raw physical sample; the little-group Reynolds
+        # projection this recipe names (``operator_realization``) is what the
+        # Sigma consumer evaluates, so the fit and the passivity certificate
+        # are taken in the same space rather than one the run never uses.
+        # ``symmetry_maps.project_little_group_operator`` is the single owner
+        # of the action, reached through the one gw door.
+        if (not np.array_equal(header["q_irr_full_idx"],
+                               moment_header["q_irr_full_idx"])
+                or header["qirr"]["digest"] != moment_header["qirr"]["digest"]):
+            raise ValueError(
+                "GATE shared_pole_symmetrisation: bank and moment stores carry "
+                "different q_irr parents or centroid symmetry tables; one "
+                "little group must serve every tile of one pencil")
+
+        def symmetrise(q_span, **arrays):
+            return symmetrise_shared_pole_tiles(
+                arrays, meta=meta, header=header, q_span=q_span, mesh_xy=mesh_xy)
         receipts = []
         receipt_entry_start = 0
         stack_models = _stack_model_kernel(mesh_xy)
@@ -851,6 +870,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
                 exact = read_shared_pole_bank(moment_io, span, meta=meta,
                                               header=moment_header, fields=("M1", "M3"))
+            exact = symmetrise(span, M1=exact["M1"], M3=exact["M3"])
         timing.fence("spole.infinity_selection")
         with timing.section("spole.infinity_selection"):
             width = min(logical_n, max(1, int(recipe["infinity_width"])))
@@ -875,7 +895,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 retained_panels = tuple(samples.values())
                 def read_sample(sample_id, retained_states):
                     index = sample_id - sample_lo
-                    return samples["Wc"][:, index], samples["dWc_ds"][:, index]
+                    pair = symmetrise(span, Wc=samples["Wc"][:, index],
+                                      dWc_ds=samples["dWc_ds"][:, index])
+                    return pair["Wc"], pair["dWc_ds"]
 
             timing.fence("spole.direction_selection")
             with timing.section("spole.direction_selection"):
@@ -961,12 +983,15 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             with timing.section("spole.passivity_held"):
                 indices = jnp.asarray([i-sample_lo for i in held_ids])
                 supports = jnp.asarray([_sample_point(recipe, i)**2 for i in held_ids])
+                held_pair = symmetrise(check_span,
+                                       Wc=held_samples["Wc"][:, indices],
+                                       dWc_ds=held_samples["dWc_ds"][:, indices])
                 batch_checks = local_model_checks(mesh_xy, eig.native_fn)(
                     batch_results[0], inverse_sqrt,
-                    held_samples["Wc"][:, indices], held_samples["dWc_ds"][:, indices],
+                    held_pair["Wc"], held_pair["dWc_ds"],
                     supports, jnp.asarray(recipe["eta_ev"] / RYD_TO_EV))
                 batch_checks = jax.tree.map(np.asarray, batch_checks)
-                del inverse_sqrt, held_samples, indices, supports
+                del inverse_sqrt, held_samples, held_pair, indices, supports
         batch_width = 1
         selected = pending
         pending = []
@@ -1049,6 +1074,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
                     exact = read_shared_pole_bank(moment_io, span, meta=meta,
                                                   header=moment_header, fields=("M1", "M3"))
+                exact = symmetrise(span, M1=exact["M1"], M3=exact["M3"])
             timing.fence("spole.moment_diagnostics")
             with timing.section("spole.moment_diagnostics"):
                 moment_defects = model_diagnostics(model, exact, qi)
@@ -1068,14 +1094,16 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                             s = _sample_point(recipe, int(sample_id)) ** 2
                             weights = jnp.where(mask, 1 / (s-poles), 0)
                             diagnostic = {"sample_id": int(sample_id)}
+                            projected = symmetrise(span, Wc=samples["Wc"][:, 0],
+                                                   dWc_ds=samples["dWc_ds"][:, 0])
                             for field, weight in (("Wc", weights), ("dWc_ds", -weights**2)):
-                                sample = samples[field][:, 0]
+                                sample = projected[field]
                                 value = mm(b * weight[:, None, :], b, transb="C")
                                 diagnostic[field] = float(jnp.linalg.norm(value-sample) /
                                                           jnp.maximum(jnp.linalg.norm(sample), jnp.finfo(jnp.float64).tiny))
                                 reciprocity.append(shared_pole_reciprocity(value, sample, gates=gates))
                             held.append(diagnostic)
-                            del samples, sample, value
+                            del samples, projected, sample, value
                     reciprocity = {key: np.asarray([row[key] for row in reciprocity]).tolist()
                                    for key in reciprocity[0]}
                 else:
