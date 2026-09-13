@@ -139,64 +139,91 @@ def empty_samples(n_ports, k_max):
                 active=jnp.zeros(k_max, bool), m=jnp.int32(0))
 
 
-def block_cg(apply_t, rhs, shift, *, maxiter, tol):
-    """Coupled block CG for (T-shift I)X=B, retaining all requested columns.
+def make_block_qr(sharding):
+    """Device-only TSQR; pair arrays stay tiled, only small R factors gather.
 
-    The block Galerkin recurrence solves (P†AP) alpha=R†R and
-    (Rold†Rold) beta=Rnew†Rnew. Columns are normalized initially and masked
-    when converged. Small singular/indefinite block systems refuse explicitly;
-    they never remove a requested tangent or change the model order.
-    Shapes, units and sharding follow column_cg. Both solver paths are kept
-    as distinct algorithms for the preregistered cost attribution.
+    Uses ARKC's measured TSQR construction (w_omega_chain_cost, 5d748a6b),
+    with its small-R SVD on device to support the fixed CG loop. Numerical
+    null search vectors are zeroed at eps*r, independently of model order.
     """
-    axes = tuple(range(1, rhs.ndim))
-    broad = (rhs.shape[0],) + (1,)*len(axes)
+    from common.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+    axes, count = tuple(sharding.mesh.axis_names), sharding.mesh.size
 
-    def inner(a, b):
-        return jnp.einsum('acvk,bcvk->ab', a.conj(), b)
+    def local(block):
+        r = block.shape[0]
+        matrix = block.reshape(r,-1).T
+        if matrix.shape[0] < r:
+            raise ValueError('block QR requires at least r local pair rows')
+        qlocal, rlocal = jnp.linalg.qr(matrix,mode='reduced')
+        small = jax.lax.all_gather(rlocal,axes,axis=0,tiled=False).reshape(count*r,r)
+        qsmall, rr = jnp.linalg.qr(small,mode='reduced')
+        section = jax.lax.dynamic_slice_in_dim(qsmall,jax.lax.axis_index(axes)*r,r,axis=0)
+        u, values, _ = jnp.linalg.svd(rr,full_matrices=False)
+        keep = values > jnp.finfo(values.dtype).eps*r*values[0]
+        q = (qlocal @ section @ (u*keep[None,:])).T.reshape(block.shape)
+        return q,keep
 
-    def combine(p, c):
-        return jnp.einsum('ab,acvk->bcvk', c, p)
+    return jax.jit(shard_map(local,mesh=sharding.mesh,in_specs=sharding.spec,
+                             out_specs=(sharding.spec,P()),check_vma=False))
 
-    bnorm = jnp.sqrt(jnp.sum(jnp.abs(rhs)**2, axis=axes))
-    b = rhs/jnp.where(bnorm > 0, bnorm, 1).reshape(broad)
-    live = bnorm > 0
-    initial = (jnp.zeros_like(b), b, b, inner(b,b), live,
-               jnp.zeros(rhs.shape[0],jnp.int32), jnp.int32(0),
-               jnp.int32(0), jnp.zeros_like(live))
 
-    def step(_, state):
+def block_cg(apply_t, rhs, shift, *, maxiter, tol, orthonormalize):
+    """QR-stabilized coupled CG for (T-shift I)X=B with fixed storage.
+
+    The block Galerkin step solves (P†AP) alpha=P†R. The next search
+    block is Rnew-P(P†AP)^-1 AP†Rnew, then TSQR normalizes it. This
+    equivalent CG recurrence avoids inversion of the nearly singular R†R.
+    Converged RHS columns become no-ops; search-space numerical nulls are
+    counted separately and never remove a requested model tangent.
+    Shapes, units and sharding follow column_cg.
+    """
+    axes = tuple(range(1,rhs.ndim))
+    broad = (rhs.shape[0],)+(1,)*len(axes)
+
+    def inner(a,b):
+        return jnp.einsum('acvk,bcvk->ab',a.conj(),b)
+
+    def combine(p,c):
+        return jnp.einsum('ab,acvk->bcvk',c,p)
+
+    bnorm = jnp.sqrt(jnp.sum(jnp.abs(rhs)**2,axis=axes))
+    b = rhs/jnp.where(bnorm>0,bnorm,1).reshape(broad)
+    live = bnorm>0
+    p,search = orthonormalize(b)
+    initial = (jnp.zeros_like(b),b,p,search,live,
+               jnp.zeros(rhs.shape[0],jnp.int32),jnp.int32(0),jnp.int32(0),
+               jnp.zeros_like(live),jnp.int32(rhs.shape[0]))
+
+    def step(_,state):
         def advance(state):
-            x,r,p,gamma,live,iterations,useful,issued,broken = state
+            x,r,p,search,live,iterations,useful,issued,broken,minimum = state
             ap = apply_t(p)-shift*p
-            mask = live[:,None] & live[None,:]
+            mask = search[:,None] & search[None,:]
             pap = inner(p,ap)
-            pap = jnp.where(mask,(pap+pap.conj().T)*.5,0)+jnp.diag(~live)
-            old = jnp.where(mask,(gamma+gamma.conj().T)*.5,0)+jnp.diag(~live)
-            bad = (jnp.linalg.eigvalsh(pap)[0] <= 0) | (jnp.linalg.eigvalsh(old)[0] <= 0)
-            alpha = jnp.linalg.solve(pap,gamma)
+            pap = jnp.where(mask,(pap+pap.conj().T)*.5,0)+jnp.diag(~search)
+            bad = (jnp.linalg.eigvalsh(pap)[0]<=0) | ~jnp.any(search)
+            alpha = jnp.linalg.solve(pap,inner(p,r))
             xn = x+combine(p,alpha)
             rn = r-combine(ap,alpha)
             rr = jnp.sum(jnp.abs(rn)**2,axis=axes)
-            next_live = live & (rr > tol*tol) & ~bad
+            next_live = live & (rr>tol*tol) & ~bad
             rn = jnp.where(next_live.reshape(broad),rn,0)
-            gn = inner(rn,rn)
-            beta = jnp.linalg.solve(old,gn)
-            pn = rn+combine(p,beta)
+            beta = jnp.linalg.solve(pap,inner(ap,rn))
+            pn,search_new = orthonormalize(rn-combine(p,beta))
             finite = jnp.all(jnp.isfinite(xn)) & jnp.all(jnp.isfinite(pn))
             bad = bad | ~finite
-            pn = jnp.where((next_live & ~bad).reshape(broad),pn,0)
-            return (xn,rn,pn,gn,next_live & ~bad,iterations+live,
-                    useful+jnp.sum(live,dtype=jnp.int32),issued+rhs.shape[0],
-                    broken | (live & bad))
+            return (xn,rn,pn,search_new,next_live & ~bad,iterations+live,
+                    useful+jnp.sum(search,dtype=jnp.int32),issued+rhs.shape[0],
+                    broken | (live & bad),jnp.minimum(minimum,jnp.sum(search,dtype=jnp.int32)))
         return jax.lax.cond(jnp.any(state[4]),advance,lambda x:x,state)
 
-    x,_,_,_,_,iterations,useful,issued,broken = jax.lax.fori_loop(0,maxiter,step,initial)
+    x,_,_,_,_,iterations,useful,issued,broken,minimum = jax.lax.fori_loop(0,maxiter,step,initial)
     x = x*bnorm.reshape(broad)
     residual = rhs-(apply_t(x)-shift*x)
     relative = jnp.sqrt(jnp.sum(jnp.abs(residual)**2,axis=axes))/jnp.where(bnorm>0,bnorm,1)
     return x,dict(iterations=iterations,relative=relative,breakdown=broken,
-                  matvec_columns=issued+rhs.shape[0],
+                  matvec_columns=issued+rhs.shape[0],search_rank_min=minimum,
                   useful_matvec_columns=useful+jnp.sum(bnorm>0),rhs_solves=jnp.sum(bnorm>0))
 
 
