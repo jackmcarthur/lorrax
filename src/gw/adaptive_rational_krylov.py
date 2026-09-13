@@ -147,6 +147,7 @@ def append_samples(state, shift, q, y, gram):
     Reused-support detection is returned as a refusal flag, never regularized.
     """
     m, active = state['m'], state['active']
+    zero = jnp.int32(0)
     den = shift - state['xi'].conj()
     reused = jnp.any(active & (den == 0))
     a = state['Y'].conj().T @ q
@@ -154,15 +155,15 @@ def append_samples(state, shift, q, y, gram):
     cross_s = jnp.where(active[:, None], (a - b) / jnp.where(den != 0, den, 1)[:, None], 0)
     cross_h = shift * cross_s - a
     update = jax.lax.dynamic_update_slice
-    s = update(state['S'], cross_s, (0, m))
-    s = update(s, cross_s.conj().T, (m, 0))
+    s = update(state['S'], cross_s, (zero, m))
+    s = update(s, cross_s.conj().T, (m, zero))
     s = update(s, gram, (m, m))
-    h = update(state['H'], cross_h, (0, m))
-    h = update(h, cross_h.conj().T, (m, 0))
+    h = update(state['H'], cross_h, (zero, m))
+    h = update(h, cross_h.conj().T, (m, zero))
     hnew = shift * gram - y.conj().T @ q
     h = update(h, (hnew + hnew.conj().T) * .5, (m, m))
     out = dict(xi=update(state['xi'], jnp.full(q.shape[1], shift), (m,)),
-               Q=update(state['Q'], q, (0, m)), Y=update(state['Y'], y, (0, m)),
+               Q=update(state['Q'], q, (zero, m)), Y=update(state['Y'], y, (zero, m)),
                S=s, H=h,
                active=update(active, jnp.ones(q.shape[1], bool), (m,)),
                m=m + q.shape[1])
