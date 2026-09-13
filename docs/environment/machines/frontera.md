@@ -79,7 +79,7 @@ slower than the concurrent Lustre read at N=8/N=32, growing linearly in N
 (jobs 7882128 / 7882121). Stripe the tar wide instead.
 
 Full measurement record, instruments and falsification protocol:
-`docs/dev/archive/cold_start_2026-07.md`.
+`docs/dev/notes/cold_start_2026-07.md`.
 
 ## 4. Distributed eigh on rtx (GPU leg)
 

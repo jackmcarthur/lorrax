@@ -21,8 +21,7 @@ exactly degenerate, and an fH window boundary that cut a pair failed at the
 **eV scale** off-grid, producing a spurious "Λ-valley dip" in E₁(Q) that the
 delivered exciton band structure faithfully tracked.  Between-pair boundary
 min-gaps on that deck ranged from 2194 meV down to **5.9 meV** at the 31|32
-boundary (``docs/dev/archive/frontera_campaign/wk_REL/reference/perlmutter/
-EXCITON_AND_PERF_SALVAGE.md``).  5.9 meV is the scale this guard has to
+boundary (``docs/dev/notes/EXCITON_AND_PERF_SALVAGE_2026-07.md``).  5.9 meV is the scale this guard has to
 resolve, which is why the default tolerance is 1 meV and not BGW's 1e-6 Ry
 (14 µeV): 14 µeV separates *exactly* degenerate states, and the question here
 is not "are these the same eigenvalue" but "is this boundary safe to cut".

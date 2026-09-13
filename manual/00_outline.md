@@ -85,7 +85,7 @@ G bibliography (all method citations; the home for every "Appendix G" reference)
 ## Source-material map (freq chapter)
 
 Reading order: `docs/theory/minimax-quadrature.md` (spine, incl. LORRAX-fitted error
-laws) → `docs/dev/archive/ctsp_revised.md` (derivation prose, CD analogy) →
+laws) → `docs/dev/notes/ctsp_revised.md` (derivation prose, CD analogy) →
 `docs/theory/physics.md` §6.9 (Σ code narrative) →
 `docs/dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md` (window-edge algebra; ±ω prose
 unreliable) → Kim-2020 appendix transcription (primary source) →

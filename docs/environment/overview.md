@@ -464,7 +464,7 @@ Frontera node (job 7882076) for libraries that are then discarded.
 device node is visible) answers the discovery with a stub; no jax file is
 modified and the same venv still runs GPU jobs.
 `LORRAX_CPU_SKIP_GPU_PLUGINS=0` restores the old behaviour, and says so.
-Full measurement record: `docs/dev/archive/cold_start_2026-07.md`.
+Full measurement record: `docs/dev/notes/cold_start_2026-07.md`.
 
 ### 2.3 Device selection and multi-host
 

@@ -1,1 +1,0 @@
-ladder_rung1_notes.md
