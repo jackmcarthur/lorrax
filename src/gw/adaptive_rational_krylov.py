@@ -663,7 +663,7 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
 def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                              cg_maxiter, cg_tol, pair_shape, block_callback=None,
                              normalization_alpha=1., metric_support_rtol=0.,
-                             infinity_columns=0):
+                             infinity_columns=0, seed_blocks=0, candidate_count=None):
     """Compile the daytime P1/P2/P3 repeated-support construction on Si.
 
     Fixed buffers hold the finite sample pencil and the sharded truth basis.
@@ -681,16 +681,19 @@ def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
     interpolation floor: limit=min(1e-8,max(1e-10,10*floor)). Both models
     and the limit are evaluated at every prefix; the sample error is never
     used to set its own floor. Exact order and Gram guards are unchanged.
+    seed_blocks accepts fixed runtime tangent panels, support indices and live
+    widths before adaptive selection. candidate_count restricts the adaptive
+    scan to the leading supports, while anchors may use the complete list.
     """
     if r_add < 1 or (k_max-infinity_columns) % r_add or infinity_columns<0:
         raise ValueError('capacity must be a positive multiple of block width')
     physical = max(2, r_add)
-    n_outer = (k_max-infinity_columns) // r_add
+    n_outer = (k_max-infinity_columns) // r_add + seed_blocks
     qr = make_block_qr(sh.X)
     zero = jnp.int32(0)
 
     @jax.jit
-    def run(operands, g0, supports, requested):
+    def run(operands, g0, supports, requested, seed_q=None, seed_support=None, seed_width=None):
         nr = g0.shape[0]
         norm = ((1-normalization_alpha)*g0/jnp.trace(g0).real +
                 normalization_alpha*jnp.eye(nr)/nr)
@@ -744,9 +747,21 @@ def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
         def step(carry,index):
             def accept(carry):
                 state,basis,exact_s,exact_h,old_dy,done=carry
-                best,q,scores,values=fixed_support_tangents(state,g0,supports,whiten,r_add=r_add)
+                def adaptive(_):
+                    best,q,scores,values=fixed_support_tangents(state,g0,supports if candidate_count is None else supports[:candidate_count],whiten,r_add=r_add)
+                    if candidate_count is not None:scores=jnp.pad(scores,(0,supports.shape[0]-candidate_count))
+                    return best,q,scores,values,jnp.int32(r_add)
+                if seed_blocks:
+                    # Fixed bank-derived anchor directions precede line selection.
+                    # Partly filled seed panels advance by their actual width.
+                    def seeded(_):
+                        best=seed_support[index]
+                        return best,seed_q[index],jnp.zeros(supports.shape[0]),jnp.zeros(r_add),seed_width[index]
+                    best,q,scores,values,count=jax.lax.cond(index<seed_blocks,seeded,adaptive,None)
+                else:
+                    best,q,scores,values,count=adaptive(None)
                 shift=supports[best]
-                live_new=jnp.arange(r_add)<requested-state['m']
+                live_new=jnp.arange(r_add)<jnp.minimum(count,requested-state['m'])
                 q=q*live_new[None,:]
                 qp=jnp.pad(q,((0,0),(0,physical-r_add)))
                 xp,cg=solve(apply_b(qp,operands),shift)
@@ -783,7 +798,7 @@ def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                     jn=abs(shift)**2*gram-shift.conjugate()*(y.conj().T@q)-shift*(q.conj().T@y)+q.conj().T@g0@q
                     jj=update(jj,(jn+jn.conj().T)*.5,(state['m'],state['m']))
                     new=dict(new,S=ss,H=hh,TX_gram=jj,BTX=update(state['BTX'],znew,(zero,state['m'])))
-                m=jnp.minimum(new['m'],requested);live=jnp.arange(k_max)<m
+                m=state['m']+jnp.sum(live_new,dtype=jnp.int32);live=jnp.arange(k_max)<m
                 new=dict(new,m=m,active=live,xi=jnp.where(live,new['xi'],0),
                     Q=new['Q']*live[None,:],Y=new['Y']*live[None,:],
                     S=new['S']*(live[:,None]&live[None,:]),
