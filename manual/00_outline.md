@@ -89,5 +89,5 @@ laws) → `docs/dev/archive/ctsp_revised.md` (derivation prose, CD analogy) →
 `docs/theory/physics.md` §6.9 (Σ code narrative) →
 `docs/dev/notes/GN_PPM_MINIMAX_SIGMA_GUIDE_REVISED.md` (window-edge algebra; ±ω prose
 unreliable) → Kim-2020 appendix transcription (primary source) →
-`src/common/minimax_assets/README.md` + `reports/sigma_ppm_tighten_2026-07-04`
+`services/minimax/src/minimax/minimax_assets/README.md` + `reports/sigma_ppm_tighten_2026-07-04`
 (error conventions; the per-pole-term −ω identity correction).

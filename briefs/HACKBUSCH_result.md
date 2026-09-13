@@ -29,12 +29,19 @@ and the base branch still has catalog wiring.  The on-demand path was bypassed
 only in the benchmark as the lane brief permits.  A production-wide planner
 wall remains to be measured after the separate on-demand-only wiring lands.
 
+> SUPERSEDED 2026-09-12.  The rule this brief speeds up is gone: the
+> noncrossing family is served by `minimax.levelled`, a levelled Remez
+> exchange that returns the smallest N whose best N-term error meets the
+> target, and `noncrossing_grids` with its rank ladder was deleted in
+> 3261461a.  The measurement below stands as the record of why the ladder
+> was not worth keeping.
+
 ## Change
 
 The per-rank solver already used the deterministic Hackbusch analytic node
 distribution
 `pi^2 (k-1/2) / (2 log(4R))`; the cost defect was the outer loop solving every
-rank from 2 upward.  `noncrossing_grids` now seeds that ladder with the
+rank from 2 upward.  `noncrossing_grids` seeded that ladder with the
 existing deterministic `(R, eps)` error law, then walks up or down to the
 first measured passing rank.  Node refinement, achieved-error acceptance,
 noise/factor gates at the consumer, and the returned rule are unchanged.  No

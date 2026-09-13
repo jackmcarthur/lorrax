@@ -314,7 +314,7 @@ Default remains `false`, meaning the code reuses bundled tables when possible. S
 it to `true` forces fresh exact quadrature generation.
 
 When enabled, screening and sigma window construction first consult
-`src/common/minimax_assets/catalog.json` and load the smallest safe precomputed table:
+`services/minimax/src/minimax/minimax_assets/catalog.json` and load the smallest safe precomputed table:
 - range rounded up
 - error target rounded down to a stricter or equal shipped tolerance
 - `max_nodes` still enforced

@@ -183,10 +183,19 @@ when two windows reuse the same scalar node set.
 ## 6. Ownership and tuning
 
 `services/minimax` owns target definitions, catalog lookup, provenance,
-certification, and offline solvers. `gw.minimax_screening` owns physical
-intervals, energy references, and rescaling. `gw.ppm_sigma` owns PPM causal
-branches and window selectors. The shared Green-function and convolution
-kernels own no quadrature policy.
+certification, the offline solvers, and the denominator-box rule builder.
+`gw.minimax_screening` owns physical intervals, energy references, and
+rescaling. `gw.ppm_sigma` owns PPM causal branches and window selectors.
+`gw.sigma_box_plan` owns the Σ box-plan conventions — product windows, the
+error currency, causal conjugation and the rule cache. The shared
+Green-function and convolution kernels own no quadrature policy.
+
+SCOPE. This page is the χ side: the scalar rules for static, imaginary-axis
+and real-frequency PPM screening, served from the shipped catalog. Σ does not
+use them. Its frequency integral is built from one certified rule per product
+window on the denominator box, which is a different construction with a
+different error currency; see
+[the Σ quadrature problem](sigma-quadrature-problem.md).
 
 Exact tolerances and node caps are documented in the
 [input reference](../input_reference.md). When a wider band interval exceeds

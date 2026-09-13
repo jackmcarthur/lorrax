@@ -14,6 +14,7 @@ only by the offline/runtime solvers.
 | `catalog()` / `nearest_certified(...)` | Enumerate certified coverage and suggest nearby covered requests without solving. |
 | `family_for_character(...)`, `TARGETS`, `FAMILIES` | Define the accepted target and family vocabulary as data. |
 | `Quadrature`, `Provenance` | Return nodes, weights, measured error, certification state, source, and artifact identity. |
+| `build_uniform_rule(box, eps)` | Builds and certifies one denominator-box rule for `1/d` on `[re_lo, re_hi] x [im_lo, im_hi]`. A production surface, not a lookup: it takes no clock and no pass count, and returns when its own boundary certificate is met, so the same box and tolerance give the same rule on any machine. `gw.sigma_box_plan` is the consumer. |
 | offline solver names | Lazily expose table-generation machinery; using them does not make the result a shipped certified rule. |
 
 `LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE` controls the escape hatch and currently
@@ -21,6 +22,14 @@ defaults to enabled. Every runtime solve is labelled
 `runtime-uncertified`, announces that it is not reproducible across hosts, and
 carries no certified table identity. The complete spelling and boolean grammar
 are owned by the [environment-variable registry](../dev/env_vars.md).
+
+## Two surfaces, not one
+
+The catalog half answers `lookup`/`serve` from shipped tables and is what the
+rest of this page describes. The box-rule half (`build_uniform_rule`) solves a
+fresh problem every call and ships no tables: Σ's windows are deck-dependent,
+so there is nothing to tabulate. They share only the package door and the
+convention that a rule carries its own measured error.
 
 ## Catalog and selection
 
