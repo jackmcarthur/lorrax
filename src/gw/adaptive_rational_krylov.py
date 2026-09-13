@@ -20,6 +20,71 @@ import jax.scipy.linalg as jsl
 METRIC_SUPPORT_RTOL = 1e-3
 
 
+def dictionary_projection_pivots(gram, *, k_max):
+    """Select actual dictionary states by their orthogonal projection defect.
+
+    Parameters
+    ----------
+    gram : complex array, shape (N_dictionary, N_dictionary)
+        X_dictionary†X_dictionary, including confluent and infinity blocks.
+        Columns retain their physical normalization: no diagonal scaling.
+    k_max : int
+        Number of requested pivots, fixed at trace time.
+
+    Returns
+    -------
+    indices, scores, valid : arrays, shape (k_max,)
+        Pivot indices, squared state residuals, and positive finite pivot flags.
+        No order is selected by a threshold. Invalid pivots are reported.
+
+    This is P0a's pivoted Cholesky criterion ||(I-P_X)x_j||², authorized
+    separately from P1's equation residual. It needs no operator actions.
+    """
+    n = gram.shape[0]
+    if not 0 < k_max <= n:
+        raise ValueError('requested pivot count must fit the dictionary')
+    initial = (jnp.zeros((n, k_max), gram.dtype),
+               jnp.real(jnp.diag(gram)), jnp.zeros(n, bool))
+
+    def step(carry, m):
+        factors, residual, selected = carry
+        pivot = jnp.argmax(jnp.where(selected, -jnp.inf, residual))
+        score = residual[pivot]
+        valid = jnp.isfinite(score) & (score > 0)
+        column = (gram[:, pivot] - factors @ factors[pivot].conj()) / jnp.sqrt(
+            jnp.where(valid, score, 1))
+        factors = jax.lax.dynamic_update_slice(factors, column[:, None],
+                                               (jnp.int32(0), m))
+        residual = residual - jnp.abs(column)**2
+        selected = selected.at[pivot].set(True)
+        return (factors, residual, selected), (pivot, score, valid)
+
+    return jax.lax.scan(step, initial, jnp.arange(k_max, dtype=jnp.int32))[1]
+
+
+def fixed_support_tangents(state, g0, supports, whiten, *, r_add):
+    """Exact reduced eigenproblem at every fixed support, with reuse allowed.
+
+    Unlike the first wave this scans every supplied support and uses the
+    same lambda_max(R†R,G_norm) merit on both contours. Each support gets
+    one LU factorization and its adjoint solves. No pair arrays appear.
+    whiten satisfies whiten† G_norm whiten=I on the declared metric support.
+    Returns support index, Euclidean-normalized tangent block, all maxima,
+    and the winning block eigenvalues. Ties use the first supplied support.
+    """
+    def candidate(s):
+        factor = masked_factor(state, s)
+        rr = whiten.conj().T @ residual_action(state, g0, s, whiten, factor)
+        values, vectors = jnp.linalg.eigh((rr + rr.conj().T)*.5)
+        q = whiten @ vectors[:, -r_add:][:, ::-1]
+        q = jnp.linalg.qr(q, mode='reduced')[0]
+        return values[-1], q, values[-r_add:][::-1]
+
+    scores, tangents, eigenvalues = jax.lax.map(candidate, supports)
+    best = jnp.argmax(scores)
+    return best, tangents[best], scores, eigenvalues[best]
+
+
 def screening_operands(data):
     """Pack the existing RPA operands and positive transition square root.
 
@@ -537,4 +602,130 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
 
         return jax.lax.scan(step,initial,jnp.arange(n_outer,dtype=jnp.int32))
 
+    return run
+
+
+def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
+                             cg_maxiter, cg_tol, pair_shape, block_callback=None,
+                             normalization_alpha=1., metric_support_rtol=0.):
+    """Compile the daytime P1/P2/P3 repeated-support construction on Si.
+
+    Fixed buffers hold the finite sample pencil and the sharded truth basis.
+    Every support is reconsidered after every accepted block. A logical width
+    of one uses a zero second physical RHS for the existing snapshot geometry;
+    all issued T columns and nonzero derivative RHS are counted. The final
+    block is masked to the exact requested order. Real-support derivatives
+    use a further shifted solve, so confluent overlaps need no stored basis.
+
+    Returned callable takes (operands,G0,supports,K_requested). The production
+    free diagonal is operands[0]**4. Pair-space truth is diagnostic only.
+    normalization_alpha defines (1-alpha)G0/tr(G0)+alpha I/Nr. A positive
+    support cut is a separately declared P3 fallback, never an order selector.
+    """
+    if r_add < 1 or k_max % r_add:
+        raise ValueError('capacity must be a positive multiple of block width')
+    physical = max(2, r_add)
+    n_outer = k_max // r_add
+    qr = make_block_qr(sh.X)
+    zero = jnp.int32(0)
+
+    @jax.jit
+    def run(operands, g0, supports, requested):
+        nr = g0.shape[0]
+        norm = ((1-normalization_alpha)*g0/jnp.trace(g0).real +
+                normalization_alpha*jnp.eye(nr)/nr)
+        ev, uv = jnp.linalg.eigh((norm+norm.conj().T)*.5)
+        keep = ev > ev[-1]*metric_support_rtol
+        whiten = uv*jnp.where(keep, 1/jnp.sqrt(jnp.where(keep,ev,1)), 0)[None,:]
+        state = empty_samples(nr,k_max)
+        basis = jax.lax.with_sharding_constraint(
+            jnp.zeros((k_max,)+pair_shape,jnp.complex128),sh.X)
+        ds = jnp.zeros((k_max,k_max),jnp.complex128)
+        dy = jnp.zeros((nr,k_max),jnp.complex128)
+        invalid = (requested<=0)|(requested>k_max)|jnp.any(~jnp.isfinite(whiten))
+        initial = (state,basis,ds,ds,dy,invalid)
+
+        def solve(rhs,s):
+            def real(_):
+                x,cg=preconditioned_block_cg(lambda v:apply_t(v,operands),-rhs,
+                    s.real,operands[0].real**4,maxiter=cg_maxiter,tol=cg_tol,
+                    orthonormalize=qr)
+                return x,{k:cg[k] for k in ('iterations','relative','breakdown','matvec_columns','rhs_solves')}
+            def complex_(_):
+                x,cg=complex_shifted_cg(lambda v:apply_t(v,operands),rhs,s,
+                    maxiter=cg_maxiter,tol=cg_tol,orthonormalize=qr,
+                    diagonal=operands[0].real**4)
+                return x,{k:cg[k] for k in ('iterations','relative','breakdown','matvec_columns','rhs_solves')}
+            return jax.lax.cond(s.imag==0,real,complex_,None)
+
+        def step(carry,index):
+            def accept(carry):
+                state,basis,exact_s,exact_h,old_dy,done=carry
+                best,q,scores,values=fixed_support_tangents(state,g0,supports,whiten,r_add=r_add)
+                shift=supports[best]
+                live_new=jnp.arange(r_add)<requested-state['m']
+                q=q*live_new[None,:]
+                qp=jnp.pad(q,((0,0),(0,physical-r_add)))
+                xp,cg=solve(apply_b(qp,operands),shift)
+                x=xp[:r_add];y=apply_bh(xp,operands)[:,:r_add]
+                def derivative(_):
+                    w,cgd=solve(xp,shift)
+                    return -apply_bh(w,operands)[:,:r_add],cgd
+                def no_derivative(_):
+                    return jnp.zeros_like(y),dict(iterations=jnp.zeros(physical,jnp.int32),
+                        relative=jnp.zeros(physical),breakdown=jnp.zeros(physical,bool),
+                        matvec_columns=jnp.int32(0),rhs_solves=jnp.int64(0))
+                deriv,cgd=jax.lax.cond(shift.imag==0,derivative,no_derivative,None)
+                confluent=-(state['Q'].conj().T@deriv+old_dy.conj().T@q)*.5
+                gram=jnp.einsum('acvk,bcvk->ab',x.conj(),x)
+                new,reused=append_samples(state,shift,q,y,gram,confluent)
+                m=jnp.minimum(new['m'],requested);live=jnp.arange(k_max)<m
+                new=dict(new,m=m,active=live,xi=jnp.where(live,new['xi'],0),
+                    Q=new['Q']*live[None,:],Y=new['Y']*live[None,:],
+                    S=new['S']*(live[:,None]&live[None,:]),
+                    H=new['H']*(live[:,None]&live[None,:]))
+                old_dy=jax.lax.dynamic_update_slice(old_dy,deriv,(zero,state['m']))
+                basis=jax.lax.with_sharding_constraint(jax.lax.dynamic_update_slice(
+                    basis,x,(state['m'],zero,zero,zero)),sh.X)
+                tx=apply_t(xp,operands)[:r_add]
+                cs=jnp.einsum('acvk,bcvk->ab',basis.conj(),x)
+                ch=jnp.einsum('acvk,bcvk->ab',basis.conj(),tx)
+                update=jax.lax.dynamic_update_slice
+                exact_s=update(exact_s,cs,(zero,state['m']))
+                exact_s=update(exact_s,cs.conj().T,(state['m'],zero))
+                exact_h=update(exact_h,ch,(zero,state['m']))
+                exact_h=update(exact_h,ch.conj().T,(state['m'],zero))
+                theta,factor,g=ritz_model(new)
+                predicted=factor@((factor.conj().T@new['Q'])/
+                    jnp.where(live[None,:],new['xi'][None,:]-theta[:,None],1))
+                err=jnp.linalg.norm(predicted-2*new['Y'],axis=0)/jnp.maximum(jnp.linalg.norm(2*new['Y'],axis=0),1e-300)
+                interpolation=jnp.max(jnp.where(live,err,0))
+                ratio=g[0]/jnp.max(jnp.where(live,g,0))
+                cg_error=jnp.maximum(jnp.max(cg['relative']),jnp.max(cgd['relative']))
+                failure=(jnp.int32(~jnp.isfinite(ratio)|(ratio<=1e-12))*2+
+                    jnp.int32(~jnp.isfinite(interpolation)|(interpolation>1e-10))*4+
+                    jnp.int32(jnp.any(cg['breakdown'])|jnp.any(cgd['breakdown'])|(cg_error>cg_tol))*8+
+                    jnp.int32(theta[0]<=0)*16)
+                receipt=dict(m=m,support_index=best,shift=shift,score=scores[best],
+                    all_support_scores=scores,block_eigenvalues=values,
+                    interpolation=interpolation,gram_ratio=ratio,failure=failure,
+                    gram_relative=jnp.linalg.norm(exact_s-new['S'])/jnp.linalg.norm(exact_s),
+                    h_relative=jnp.linalg.norm(exact_h-new['H'])/jnp.linalg.norm(exact_h),
+                    rhs_solves=(cg['rhs_solves']+cgd['rhs_solves']).astype(jnp.int32),
+                    derivative_rhs=cgd['rhs_solves'].astype(jnp.int32),
+                    matvec_columns=(cg['matvec_columns']+cgd['matvec_columns']+physical).astype(jnp.int32),
+                    cg_iterations=cg['iterations'],cg_relative=cg['relative'],
+                    derivative_relative=cgd['relative'])
+                if block_callback is not None:jax.debug.callback(block_callback,receipt)
+                return (new,basis,exact_s,exact_h,old_dy,(failure!=0)|(m>=requested)),receipt
+            def skip(carry):
+                return carry,dict(m=jnp.int32(0),support_index=jnp.int64(0),shift=jnp.complex128(0),
+                    score=jnp.float64(0),all_support_scores=jnp.zeros(supports.shape[0]),
+                    block_eigenvalues=jnp.zeros(r_add),interpolation=jnp.float64(0),gram_ratio=jnp.float64(0),
+                    failure=jnp.int32(0),gram_relative=jnp.float64(0),h_relative=jnp.float64(0),
+                    rhs_solves=jnp.int32(0),derivative_rhs=jnp.int32(0),matvec_columns=jnp.int32(0),
+                    cg_iterations=jnp.zeros(physical,jnp.int32),cg_relative=jnp.zeros(physical),
+                    derivative_relative=jnp.zeros(physical))
+            return jax.lax.cond(carry[-1],skip,accept,carry)
+        return jax.lax.scan(step,initial,jnp.arange(n_outer,dtype=jnp.int32))
     return run
