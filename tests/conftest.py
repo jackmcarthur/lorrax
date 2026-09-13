@@ -693,6 +693,28 @@ def _service_of(item) -> str:
 _GATE_NOTE = pytest.StashKey[list]()
 
 
+def pytest_ignore_collect(collection_path, config):
+    """Avoid importing census-only modules during the default core gate.
+
+    Some historical modules initialize distributed JAX at import time.  The
+    core driver parents must stay free of MPI/JAX initialization so their
+    fresh child interpreters can own the four-rank runtime.
+    """
+    if _explicit_selection(config) or collection_path.suffix != ".py":
+        return None
+    root = _Path(__file__).resolve().parents[1]
+    try:
+        relative = collection_path.relative_to(root).as_posix()
+    except ValueError:
+        return None
+    if relative.startswith("tests/core/") or collection_path.name == "conftest.py":
+        return None
+    roster = (core_manifest.CORE_EXTENDED_NODES
+              if config.getoption("--core-extended") else core_manifest.CORE_NODES)
+    paths = {node.split("::", 1)[0] for node in roster}
+    return True if relative not in paths else None
+
+
 def _apply_default_gate(config, items):
     """Narrow a bare ``pytest`` to the explicit core roster."""
     stood_down = _explicit_selection(config)
