@@ -122,6 +122,16 @@ def screening_operands(data):
     Delta is in Ry. Zero padded transitions retain zero vertices; negative
     physical transitions must be refused by the deck gate before this call.
     """
+    if 'fd_sqrt_weight' in data:
+        from bse.bse_w_exact import fd_rpa_operands
+        args = fd_rpa_operands(data)
+        # The authenticated owner makes inactive/negative-energy transitions
+        # exactly decoupled. Use a zero extension of T on that null carrier;
+        # its arbitrary padding energy must not set the CG norm-equivalence
+        # bound. No nonzero Fermi difference is clipped or made binary.
+        delta = jnp.where(data['fd_sqrt_weight'][None,...]>0,
+                          data['fd_signed_diagonal'][0],0.)
+        return jnp.sqrt(delta.real).astype(jnp.complex128),args
     delta = data['eps_c'].T[None, :, None, :] - data['eps_v'].T[None, None, :, :]
     half = jnp.sqrt(jnp.maximum(delta.real, 0)).astype(jnp.complex128)
     args = tuple(data[k] for k in ('psi_c_X', 'psi_c_Y', 'psi_v_X', 'psi_v_Y',
@@ -153,12 +163,14 @@ def build_screening_actions(matvec, gen, snapshot, sh, *, nk, nspinor):
         half, args = operands
         drive = jax.lax.with_sharding_constraint(jnp.broadcast_to(q.T[:, :, None],
                                                    (q.shape[1], q.shape[0], nk)), sh.S)
-        return jax.lax.with_sharding_constraint(root_g * half * gen(drive, args[0], args[2], args[7]), sh.X)
+        weight = args[-2][None,...] if len(args)==12 else 1.
+        return jax.lax.with_sharding_constraint(root_g * half * weight * gen(drive, args[0], args[2], args[7]), sh.X)
 
     @jax.jit
     def apply_bh(x, operands):
         half, args = operands
-        return snapshot(half * x / root_g, args[1], args[3], args[7])
+        weight = args[-2][None,...] if len(args)==12 else 1.
+        return snapshot(half * weight * x / root_g, args[1], args[3], args[7])
 
     return apply_t, apply_b, apply_bh
 
@@ -389,6 +401,18 @@ def residual_action(state, g0, s, v, factor):
     def solve(rhs, adjoint=False):
         return scale[:, None] * jsl.lu_solve(lu, scale[:, None] * rhs,
                                              trans=2 if adjoint else 0)
+
+    if 'TX_gram' in state:
+        # Polynomial/infinity states break TX=X Xi-BQ. Keep the two
+        # additional contractions Z=B†TX and J=(TX)†TX instead. For
+        # A_s=sX-TX, R=B-A_s(sS-H)^-1Y† and R†R follows directly.
+        y, z = state['Y'], state['BTX']
+        c = solve(y.conj().T @ v)
+        cross = s*y-z
+        agram = abs(s)**2*state['S']-(s+s.conjugate())*state['H']+state['TX_gram']
+        t = g0@v-cross@c
+        u = cross.conj().T@v-agram@c
+        return t-y@solve(u,adjoint=True)
 
     q, y, gram, xi = state['Q'], state['Y'], state['S'], state['xi']
     c = solve(y.conj().T @ v)
@@ -638,7 +662,8 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
 
 def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                              cg_maxiter, cg_tol, pair_shape, block_callback=None,
-                             normalization_alpha=1., metric_support_rtol=0.):
+                             normalization_alpha=1., metric_support_rtol=0.,
+                             infinity_columns=0):
     """Compile the daytime P1/P2/P3 repeated-support construction on Si.
 
     Fixed buffers hold the finite sample pencil and the sharded truth basis.
@@ -657,10 +682,10 @@ def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
     and the limit are evaluated at every prefix; the sample error is never
     used to set its own floor. Exact order and Gram guards are unchanged.
     """
-    if r_add < 1 or k_max % r_add:
+    if r_add < 1 or (k_max-infinity_columns) % r_add or infinity_columns<0:
         raise ValueError('capacity must be a positive multiple of block width')
     physical = max(2, r_add)
-    n_outer = k_max // r_add
+    n_outer = (k_max-infinity_columns) // r_add
     qr = make_block_qr(sh.X)
     zero = jnp.int32(0)
 
@@ -676,9 +701,32 @@ def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
         basis = jax.lax.with_sharding_constraint(
             jnp.zeros((k_max,)+pair_shape,jnp.complex128),sh.X)
         ds = jnp.zeros((k_max,k_max),jnp.complex128)
+        dh = jnp.zeros_like(ds)
         dy = jnp.zeros((nr,k_max),jnp.complex128)
-        invalid = (requested<=0)|(requested>k_max)|jnp.any(~jnp.isfinite(whiten))
-        initial = (state,basis,ds,ds,dy,invalid)
+        if infinity_columns:
+            # Only this fixed moment block touches pair space at startup.
+            # G1 q_inf and q_inf†G2 q_inf cost one T application to Bq_inf;
+            # a full Nr-by-Nr M5 contraction is unnecessary.
+            _,ug=jnp.linalg.eigh((g0+g0.conj().T)*.5)
+            qi=ug[:,-infinity_columns:]
+            xx=apply_b(qi,operands);tx=apply_t(xx,operands)
+            z=apply_bh(tx,operands)
+            sg=qi.conj().T@g0@qi;hg=qi.conj().T@z
+            jg=jnp.einsum('acvk,bcvk->ab',tx.conj(),tx)
+            state=dict(state,m=jnp.int32(infinity_columns),
+                active=jnp.arange(k_max)<infinity_columns,
+                xi=state['xi'].at[:infinity_columns].set(jnp.inf+0j),
+                Q=state['Q'].at[:,:infinity_columns].set(qi),
+                Y=state['Y'].at[:,:infinity_columns].set(g0@qi),
+                S=state['S'].at[:infinity_columns,:infinity_columns].set((sg+sg.conj().T)*.5),
+                H=state['H'].at[:infinity_columns,:infinity_columns].set((hg+hg.conj().T)*.5),
+                BTX=jnp.zeros((nr,k_max),jnp.complex128).at[:,:infinity_columns].set(z),
+                TX_gram=jnp.zeros_like(ds).at[:infinity_columns,:infinity_columns].set(jg))
+            basis=jax.lax.with_sharding_constraint(basis.at[:infinity_columns].set(xx),sh.X)
+            ds=ds.at[:infinity_columns,:infinity_columns].set(jnp.einsum('acvk,bcvk->ab',xx.conj(),xx))
+            dh=dh.at[:infinity_columns,:infinity_columns].set(jnp.einsum('acvk,bcvk->ab',xx.conj(),tx))
+        invalid = (requested<=infinity_columns)|(requested>k_max)|jnp.any(~jnp.isfinite(whiten))
+        initial = (state,basis,ds,dh,dy,invalid)
 
         def solve(rhs,s):
             def real(_):
@@ -714,11 +762,34 @@ def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                 confluent=-(state['Q'].conj().T@deriv+old_dy.conj().T@q)*.5
                 gram=jnp.einsum('acvk,bcvk->ab',x.conj(),x)
                 new,reused=append_samples(state,shift,q,y,gram,confluent)
+                if infinity_columns:
+                    polynomial=state['active']&jnp.isinf(state['xi'])
+                    # Cross terms against Bq_inf, followed by finite/infinity
+                    # cross terms of (TX)†TX. No stored truth is read here.
+                    cs0=jax.lax.dynamic_slice_in_dim(new['S'],state['m'],r_add,axis=1)
+                    ch0=jax.lax.dynamic_slice_in_dim(new['H'],state['m'],r_add,axis=1)
+                    cs0=jnp.where(polynomial[:,None],state['Q'].conj().T@y,cs0)
+                    znew=shift*y-g0@q
+                    ch0=jnp.where(polynomial[:,None],state['Q'].conj().T@znew,ch0)
+                    update=jax.lax.dynamic_update_slice
+                    ss=update(new['S'],cs0,(zero,state['m']));ss=update(ss,cs0.conj().T,(state['m'],zero));ss=update(ss,gram,(state['m'],state['m']))
+                    hh=update(new['H'],ch0,(zero,state['m']));hh=update(hh,ch0.conj().T,(state['m'],zero))
+                    hn=shift*gram-y.conj().T@q;hh=update(hh,(hn+hn.conj().T)*.5,(state['m'],state['m']))
+                    xi=jnp.where(jnp.isfinite(state['xi']),state['xi'],0)
+                    cj=(xi.conj()*shift)[:,None]*cs0-xi.conj()[:,None]*(state['Y'].conj().T@q)-shift*(state['Q'].conj().T@y)+state['Q'].conj().T@g0@q
+                    cj=jnp.where(polynomial[:,None],shift*(state['Q'].conj().T@znew)-state['BTX'].conj().T@q,cj)
+                    cj=jnp.where(state['active'][:,None],cj,0)
+                    jj=update(state['TX_gram'],cj,(zero,state['m']));jj=update(jj,cj.conj().T,(state['m'],zero))
+                    jn=abs(shift)**2*gram-shift.conjugate()*(y.conj().T@q)-shift*(q.conj().T@y)+q.conj().T@g0@q
+                    jj=update(jj,(jn+jn.conj().T)*.5,(state['m'],state['m']))
+                    new=dict(new,S=ss,H=hh,TX_gram=jj,BTX=update(state['BTX'],znew,(zero,state['m'])))
                 m=jnp.minimum(new['m'],requested);live=jnp.arange(k_max)<m
                 new=dict(new,m=m,active=live,xi=jnp.where(live,new['xi'],0),
                     Q=new['Q']*live[None,:],Y=new['Y']*live[None,:],
                     S=new['S']*(live[:,None]&live[None,:]),
                     H=new['H']*(live[:,None]&live[None,:]))
+                if infinity_columns:
+                    new=dict(new,BTX=new['BTX']*live[None,:],TX_gram=new['TX_gram']*(live[:,None]&live[None,:]))
                 old_dy=jax.lax.dynamic_update_slice(old_dy,deriv,(zero,state['m']))
                 basis=jax.lax.with_sharding_constraint(jax.lax.dynamic_update_slice(
                     basis,x,(state['m'],zero,zero,zero)),sh.X)
@@ -731,16 +802,18 @@ def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                 exact_h=update(exact_h,ch,(zero,state['m']))
                 exact_h=update(exact_h,ch.conj().T,(state['m'],zero))
                 theta,factor,g=ritz_model(new)
+                finite=live&jnp.isfinite(new['xi'])
+                shifts=jnp.where(finite,new['xi'],0)
                 predicted=factor@((factor.conj().T@new['Q'])/
-                    jnp.where(live[None,:],new['xi'][None,:]-theta[:,None],1))
+                    jnp.where(finite[None,:],shifts[None,:]-theta[:,None],1))
                 err=jnp.linalg.norm(predicted-2*new['Y'],axis=0)/jnp.maximum(jnp.linalg.norm(2*new['Y'],axis=0),1e-300)
-                interpolation=jnp.max(jnp.where(live,err,0))
+                interpolation=jnp.max(jnp.where(finite,err,0))
                 direct=dict(new,S=exact_s,H=exact_h)
                 td,cd,_=ritz_model(direct)
                 predicted_direct=cd@((cd.conj().T@new['Q'])/
-                    jnp.where(live[None,:],new['xi'][None,:]-td[:,None],1))
+                    jnp.where(finite[None,:],shifts[None,:]-td[:,None],1))
                 direct_error=jnp.linalg.norm(predicted_direct-2*new['Y'],axis=0)/jnp.maximum(jnp.linalg.norm(2*new['Y'],axis=0),1e-300)
-                replay_floor=jnp.max(jnp.where(live,direct_error,0))
+                replay_floor=jnp.max(jnp.where(finite,direct_error,0))
                 interpolation_limit=jnp.minimum(1e-8,jnp.maximum(1e-10,10*replay_floor))
                 ratio=g[0]/jnp.max(jnp.where(live,g,0))
                 cg_error=jnp.maximum(jnp.max(cg['relative']),jnp.max(cgd['relative']))
@@ -758,7 +831,8 @@ def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                     h_relative=jnp.linalg.norm(exact_h-new['H'])/jnp.linalg.norm(exact_h),
                     rhs_solves=(cg['rhs_solves']+cgd['rhs_solves']).astype(jnp.int32),
                     derivative_rhs=cgd['rhs_solves'].astype(jnp.int32),
-                    matvec_columns=(cg['matvec_columns']+cgd['matvec_columns']+physical).astype(jnp.int32),
+                    matvec_columns=(cg['matvec_columns']+cgd['matvec_columns']+physical+
+                                    jnp.where(state['m']==infinity_columns,infinity_columns,0)).astype(jnp.int32),
                     cg_iterations=cg['iterations'],cg_relative=cg['relative'],
                     derivative_relative=cgd['relative'])
                 if block_callback is not None:jax.debug.callback(block_callback,receipt)
