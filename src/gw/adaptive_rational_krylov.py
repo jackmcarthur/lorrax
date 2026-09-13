@@ -377,7 +377,8 @@ def append_infinity(state, qinf, g0, g1):
 
 def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                         n_grid, shortlist, n_power, cg_maxiter, cg_tol,
-                        pair_shape, store_truth, block_callback=None, pair_diagonal=None):
+                        pair_shape, store_truth, block_callback=None, pair_diagonal=None,
+                        absolute_residual=False, metric_support_rtol=METRIC_SUPPORT_RTOL):
     """Compile §§11–13's fixed-shape outer scan and per-column CG masks.
 
     The returned callable accepts runtime (operands, G0, grid, spectral_ends,
@@ -391,6 +392,8 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
     the production preconditioner; planted generic operators may omit it.
     An optional host diagnostic callback receives only the small receipt once
     per attempted block. It never controls selection or changes the model.
+    absolute_residual selects the preregistered R†R comparison; the numerical
+    metric support is fixed at trace time and never selects the model order.
     """
     if n_grid < shortlist:
         raise ValueError('candidate grid must cover the shortlist')
@@ -403,9 +406,11 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
         nr = g0.shape[0]
         state = empty_samples(nr, k_max)
         evals, evecs = jnp.linalg.eigh((g0+g0.conj().T)*.5)
-        metric_live = evals > evals[-1]*METRIC_SUPPORT_RTOL
+        metric_live = evals > evals[-1]*metric_support_rtol
         invroot = jnp.where(metric_live, 1/jnp.sqrt(jnp.where(metric_live, evals, 1)), 0)
         whiten = evecs * invroot[None, :]
+        if absolute_residual:
+            whiten = jnp.eye(nr, dtype=g0.dtype)
         seed = evecs[:, -r_add:]
         trial = jnp.sin(jnp.arange(nr)[:, None] * (jnp.arange(r_add)[None, :]+1) + .7).astype(jnp.complex128)
         truth_size = k_max if store_truth else 0
