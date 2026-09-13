@@ -2,9 +2,9 @@
 psp/vnl_ops.py — Fast VNL operator: build once, apply many times.
 
 All channels × atoms × betas are concatenated into a single dense
-projector matrix Z of shape (total_R, nG).  E is a block-diagonal
-(nspinor, nspinor, total_R, total_R) matrix.  The VNL operator is
-then a single set of einsums with no Python loops.
+projector matrix Z of shape (total_R, nG). E may be a dense block-diagonal
+(nspinor, nspinor, total_R, total_R) matrix or compact channel SOC blocks.
+The ordinary action shares one coupling contraction for both formats.
 
 Radial form factors use table lookup on a uniform q-grid (linear
 interpolation) instead of spline evaluation. This keeps the production
@@ -32,6 +32,73 @@ from common.gauss_legendre import (
     gauss_legendre_interval,
 )
 from runtime.padding import padded_axis
+
+
+@functools.partial(jax.tree_util.register_dataclass,
+                   data_fields=('groups',),
+                   meta_fields=('spans', 'nspinor', 'total_R'))
+@dataclass(frozen=True)
+class CompactVNLCoupling:
+    """SOC matrices once per channel, with canonical contiguous row spans."""
+    groups: tuple
+    spans: tuple
+    nspinor: int
+    total_R: int
+
+
+def compact_vnl_coupling(setup):
+    """Plan the ordinary VNL action from authenticated coupled row metadata."""
+    max_rows = max((ch.R for ch in setup.channels), default=1)
+    blocks = _coupled_projector_row_blocks(setup, max_rows)
+    groups, spans = [], []
+    cursor = 0
+    for ich, ch in enumerate(setup.channels):
+        rows = [(start, stop) for start, stop, channel in blocks if channel == ich]
+        if not rows:
+            continue
+        for start, stop in rows:
+            if start != cursor:
+                raise ValueError('compact VNL requires canonical contiguous channel rows')
+            cursor = stop
+        E = np.asarray(ch.E)[:setup.nspinor, :setup.nspinor]
+        if E.shape != (setup.nspinor, setup.nspinor, ch.R, ch.R):
+            raise ValueError('compact VNL coupling has inconsistent SOC block shape')
+        groups.append(jnp.asarray(E))
+        spans.append((rows[0][0], rows[-1][1]))
+    return CompactVNLCoupling(tuple(groups), tuple(spans),
+                              int(setup.nspinor), int(setup.total_R))
+
+
+def apply_projector_coupling(coefficients, coupling):
+    """Apply E to ``coefficients[row,spin,vector]`` in either representation."""
+    if not isinstance(coupling, CompactVNLCoupling):
+        return jnp.einsum('stRQ,Qtv->Rsv', coupling, coefficients, optimize=True)
+    results = []
+    for E, (start, stop) in zip(coupling.groups, coupling.spans):
+        block = coefficients[start:stop].reshape(
+            -1, E.shape[-1], *coefficients.shape[1:])
+        # Fold atom and vector into one GEMM axis; avoid a separate tiny
+        # batched GEMM per atom, as well as dynamic gather/scatter kernels.
+        block = jnp.einsum('strq,aqtv->arsv', E, block, optimize=True)
+        results.append(block.reshape(stop-start, *coefficients.shape[1:]))
+    return (jnp.concatenate(results, axis=0) if results
+            else jnp.zeros_like(coefficients))
+
+
+def projector_coupling_diagonal(Z, coupling):
+    """Spin-summed diagonal of Z† E Z, retaining within-block off-diagonals."""
+    if not isinstance(coupling, CompactVNLCoupling):
+        result = jnp.zeros(Z.shape[1], dtype=Z.real.dtype)
+        for spin in range(coupling.shape[0]):
+            result = result + jnp.real(jnp.sum(
+                jnp.conj(Z) * (coupling[spin, spin] @ Z), axis=0))
+        return result
+    result = jnp.zeros(Z.shape[1], dtype=Z.real.dtype)
+    for E, (start, stop) in zip(coupling.groups, coupling.spans):
+        block_Z = Z[start:stop].reshape(-1, E.shape[-1], Z.shape[1])
+        EZ = jnp.einsum('ssrq,aqg->arg', E, block_Z, optimize=True)
+        result = result + jnp.real(jnp.sum(jnp.conj(block_Z) * EZ, axis=(0, 1)))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2283,7 +2350,7 @@ def apply_vnl(psi_G, Z, E_super):
     E_super : (nspinor, nspinor, total_R, total_R)
     """
     P = jnp.einsum('RG,vsG->Rsv', jnp.conj(Z), psi_G, optimize=True)
-    D = jnp.einsum('stRQ,Qtv->Rsv', E_super, P, optimize=True)
+    D = apply_projector_coupling(P, E_super)
     return jnp.einsum('RG,Rsv->vsG', Z, D, optimize=True)
 
 
@@ -2291,7 +2358,7 @@ def apply_vnl(psi_G, Z, E_super):
 def vnl_matrix(psi_G, Z, E_super):
     """V_NL matrix elements <m|V_NL|n>.   Returns (nb, nb)."""
     P = jnp.einsum('RG,nsG->Rsn', jnp.conj(Z), psi_G, optimize=True)
-    D = jnp.einsum('stRQ,Qtn->Rsn', E_super, P, optimize=True)
+    D = apply_projector_coupling(P, E_super)
     return jnp.einsum('Rsm,Rsn->mn', jnp.conj(P), D, optimize=True)
 
 

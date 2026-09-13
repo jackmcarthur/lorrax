@@ -42,8 +42,8 @@ No volume prefactors.  Ortho-FFT convention for local potentials:
 (V ψ)_G = FFT_ortho(V(r) · IFFT_ortho(ψ_box))_G.
 
 ngkmax padding: setup_H_k_from_kvec accepts ngkmax to pad all arrays
-to uniform size.  Combined with warmup_jit() from davidson.py, this
-ensures one JIT compilation serves all k-points.  Mask field on
+to uniform size. Explicit Hamiltonian operands let the planned Davidson
+solve reuse compilation across k-points. The mask field on
 HamiltonianK zeros padding in apply_H_k and build_matrix_k.
 """
 from __future__ import annotations
@@ -81,7 +81,7 @@ class HamiltonianK:
 
     # Nonlocal: Kleinman–Bylander projectors (dense, all channels concatenated)
     vnl_Z: jax.Array                # (total_R, nG) complex128
-    vnl_E: jax.Array                # (nspinor, nspinor, total_R, total_R) complex128
+    vnl_E: object                   # dense array or CompactVNLCoupling pytree
 
     # Preconditioner diagonal (for Davidson): h_diag = T + v_of_0 + V_NL_diag
     h_diag: jax.Array               # (nG_padded,) float64 — QE's g_psi convention
@@ -730,19 +730,8 @@ def build_h_diag(
     """
     v_of_0 = jnp.mean(V_loc_r)
 
-    # V_NL diagonal: sum over spinor channels and projectors
-    # ⟨G,s|V_NL|G,s⟩ = Σ_{R,Q} conj(Z[R,G]) E[s,s,R,Q] Z[Q,G]
-    # For the diagonal, sum over s:
-    nspinor = vnl_E.shape[0]
-    vnl_diag = jnp.zeros(T_diag.shape[0], dtype=jnp.float64)
-    for s in range(nspinor):
-        # E_ss[R,Q] = vnl_E[s,s,R,Q]
-        E_ss = vnl_E[s, s]  # (total_R, total_R)
-        # Σ_R,Q conj(Z[R,G]) E_ss[R,Q] Z[Q,G]
-        EZ = E_ss @ vnl_Z  # (total_R, nG)
-        vnl_diag = vnl_diag + jnp.real(
-            jnp.sum(jnp.conj(vnl_Z) * EZ, axis=0)
-        )
+    from psp.vnl_ops import projector_coupling_diagonal
+    vnl_diag = projector_coupling_diagonal(vnl_Z, vnl_E)
 
     return T_diag + v_of_0 + vnl_diag
 
@@ -761,6 +750,7 @@ def setup_H_k(
     V_loc_r: jax.Array | None = None,
     ngkmax: int | None = None,
     gvectors: PaddedGVectors | None = None,
+    *, compact_vnl: bool = False,
 ) -> HamiltonianK:
     """Assemble all per-k Hamiltonian data (SymMaps path).
 
@@ -777,6 +767,8 @@ def setup_H_k(
         this is only needed when a caller wants a still larger uniform
         size; a smaller value is refused rather than silently truncating
         a k's physical G-sphere.
+    compact_vnl : bool — use compact SOC coupling blocks in vnl_E.
+        Opt-in for callers that pass the coupling pytree through unchanged.
     gvectors : PaddedGVectors, optional — reuse one table across a sweep.
     """
     tab = padded_gvectors(wfn, k="full_bz") if gvectors is None else gvectors
@@ -814,7 +806,9 @@ def setup_H_k(
     # zero them so apply_vnl / build_h_diag never see spurious overlap.
     vnl_Z = jnp.where(mask[None, :], kdata.Z, jnp.zeros((), dtype=kdata.Z.dtype))
 
-    h_diag = (build_h_diag(T_diag, V_loc_r, vnl_Z, kdata.E_super)
+    vnl_E = (vnl_ops.compact_vnl_coupling(vnl_setup)
+             if compact_vnl else kdata.E_super)
+    h_diag = (build_h_diag(T_diag, V_loc_r, vnl_Z, vnl_E)
               if V_loc_r is not None else T_diag)
     h_diag = jnp.where(mask, h_diag, jnp.asarray(1e10, dtype=h_diag.dtype))
 
@@ -823,7 +817,7 @@ def setup_H_k(
         V_scf=V_scf,
         Gx=Gx, Gy=Gy, Gz=Gz,
         vnl_Z=vnl_Z,
-        vnl_E=kdata.E_super,
+        vnl_E=vnl_E,
         h_diag=h_diag,
         mask=mask,
         nG=nG_actual,
@@ -839,6 +833,7 @@ def setup_H_k_from_kvec(
     meta,
     V_loc_r: jax.Array | None = None,
     ngkmax: int | None = None,
+    *, compact_vnl: bool = False,
 ) -> HamiltonianK:
     """Assemble per-k Hamiltonian data (standalone, no SymMaps / WFN.h5).
 
@@ -852,6 +847,8 @@ def setup_H_k_from_kvec(
     V_loc_r : (nx, ny, nz) — ionic local potential alone, for h_diag.
     ngkmax : int, optional — pad all arrays to this size for uniform JIT.
         If None, no padding (arrays have natural nG length).
+    compact_vnl : bool — use compact SOC coupling blocks in vnl_E.
+        Dense remains the default for consumers requiring an array.
     """
     import psp.vnl_ops as vnl_ops
 
@@ -881,7 +878,8 @@ def setup_H_k_from_kvec(
     # Tail-G mask: padded Z entries are non-zero (computed at K=kvec) —
     # mask them so apply_vnl / Q-projections never see spurious overlap.
     vnl_Z = jnp.where(mask[None, :], kdata.Z, jnp.zeros((), dtype=kdata.Z.dtype))
-    vnl_E = kdata.E_super
+    vnl_E = (vnl_ops.compact_vnl_coupling(vnl_setup)
+             if compact_vnl else kdata.E_super)
 
     h_diag = (build_h_diag(T_diag, V_loc_r, vnl_Z, vnl_E)
               if V_loc_r is not None else T_diag)
@@ -945,7 +943,8 @@ def apply_H_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
 
     # ── V_NL: Kleinman–Bylander (project → D → unproject) ───────────
     P = jnp.einsum('RG,vsG->Rsv', jnp.conj(vnl_Z), psi_G, optimize=True)
-    D = jnp.einsum('stRQ,Qtv->Rsv', vnl_E, P, optimize=True)
+    from psp.vnl_ops import apply_projector_coupling
+    D = apply_projector_coupling(P, vnl_E)
     H_G = H_G + jnp.einsum('RG,Rsv->vsG', vnl_Z, D, optimize=True) * mask_f
 
     return H_G
@@ -998,10 +997,38 @@ def apply_H_k_from_G(psi_G, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
 
     # V_NL on the G-sphere directly.
     P = jnp.einsum('RG,vsG->Rsv', jnp.conj(vnl_Z), psi_G_m, optimize=True)
-    D = jnp.einsum('stRQ,Qtv->Rsv', vnl_E, P, optimize=True)
+    from psp.vnl_ops import apply_projector_coupling
+    D = apply_projector_coupling(P, vnl_E)
     H_G = H_G + jnp.einsum('RG,Rsv->vsG', vnl_Z, D, optimize=True) * mask_f
 
     return H_G
+
+
+@functools.partial(jax.jit, static_argnames=('vector_batch',))
+def apply_H_k_batched(psi_G, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E,
+                      mask, *, vector_batch=32):
+    """Bound FFT producer memory while applying the ordinary sparse-G H.
+
+    Complete vector blocks run in a fixed-shape map; an exact-width tail
+    avoids evaluating H on zero vectors. The output retains input ordering.
+    """
+    if vector_batch <= 0:
+        raise ValueError('vector_batch must be positive')
+    def one(block):
+        return apply_H_k_from_G(block, T_diag, V_scf, Gx, Gy, Gz,
+                               vnl_Z, vnl_E, mask)
+    count, tail = divmod(psi_G.shape[0], vector_batch)
+    parts = []
+    if count:
+        blocks = psi_G[:count*vector_batch].reshape(
+            count, vector_batch, *psi_G.shape[1:])
+        parts.append(jax.lax.map(one, blocks).reshape(
+            count*vector_batch, *psi_G.shape[1:]))
+    if tail:
+        parts.append(one(psi_G[count*vector_batch:]))
+    if not parts:
+        return jnp.zeros_like(psi_G)
+    return parts[0] if len(parts) == 1 else jnp.concatenate(parts, axis=0)
 
 
 @jax.jit

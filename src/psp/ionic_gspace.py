@@ -57,11 +57,14 @@ def species_structure_factors(
         tau_padded, natoms = inputs   # (max_atoms, 3), scalar
 
         def _one_atom(S, i):
-            phase = jnp.exp(-2j * jnp.pi * (G_crys_flat @ tau_padded[i]))
-            return S + phase * (i < natoms), None
+            def add_atom(current):
+                phase = jnp.exp(-2j * jnp.pi * (G_crys_flat @ tau_padded[i]))
+                return current + phase
+            return jax.lax.cond(i < natoms, add_atom, lambda current: current, S), None
 
+        # Guard the expensive phase, preserving scan's reverse-mode support.
         S_sp, _ = jax.lax.scan(_one_atom, jnp.zeros(N, jnp.complex128),
-                                jnp.arange(max_atoms), unroll=1)
+                             jnp.arange(max_atoms), unroll=1)
         return None, S_sp
 
     _, S_all = jax.lax.scan(_one_species, None,
