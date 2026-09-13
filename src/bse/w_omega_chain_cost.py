@@ -8,6 +8,52 @@ from __future__ import annotations
 import numpy as np
 
 
+def orthonormalize_seed(seed, sharding):
+    """TSQR of the excitation-space seed without forming its normal equations.
+
+    Parameters
+    ----------
+    seed : jax.Array
+        Complex seed block, shape (p, c, v, k), with the supplied NamedSharding.
+        Every local excitation tile must contain at least p rows.
+    sharding : jax.sharding.NamedSharding
+        Existing pair-basis layout. Only the small p-by-p local R factors are
+        gathered across its named mesh axes; the excitation-space Q stays tiled.
+
+    Returns
+    -------
+    q : jax.Array
+        Orthonormal block with the same shape and sharding as seed.
+    r : numpy.ndarray
+        Replicated host p-by-p factor satisfying seed = q @ r, in column form.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
+    from common.shard_map import shard_map
+
+    axes = tuple(sharding.mesh.axis_names)
+    count = sharding.mesh.size
+
+    def local(block):
+        p = block.shape[0]
+        matrix = block.reshape(p, -1).T
+        if matrix.shape[0] < p:
+            raise ValueError('TSQR cost probe requires at least p local pair rows')
+        q_local, r_local = jnp.linalg.qr(matrix, mode='reduced')
+        small = jax.lax.all_gather(r_local, axes, axis=0, tiled=False).reshape(count*p, p)
+        q_small, r = jnp.linalg.qr(small, mode='reduced')
+        start = jax.lax.axis_index(axes) * p
+        section = jax.lax.dynamic_slice_in_dim(q_small, start, p, axis=0)
+        q = (q_local @ section).T.reshape(block.shape)
+        return q, r
+
+    mapped = shard_map(local, mesh=sharding.mesh, in_specs=sharding.spec,
+                       out_specs=(sharding.spec, P()), check_vma=False)
+    q, r = jax.jit(mapped)(seed)
+    return q, np.asarray(jax.device_get(r))
+
+
 def solve_chain_resolvent(alpha, beta, r0, z, *, m_use=None):
     """Solve (z² I - T) C = [R0; 0] by block elimination.
 
