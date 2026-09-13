@@ -142,6 +142,12 @@ def pytest_configure(config):
     file.  After the pin there is no way left to ask how many GPUs the node
     had, which is why a ``mesh`` cell could never find four.
     """
+    # Collection hooks on this conftest are scoped to tests/.  Register the
+    # core filter globally so sibling services/ cannot import census modules.
+    from types import ModuleType
+    collection_plugin = ModuleType("lorrax_core_collection")
+    collection_plugin.pytest_ignore_collect = _ignore_core_collect
+    config.pluginmanager.register(collection_plugin, "lorrax_core_collection")
     os.environ.setdefault(
         harness.SESSION_DEVICES_ENV,
         ",".join(harness.session_devices(
@@ -693,7 +699,7 @@ def _service_of(item) -> str:
 _GATE_NOTE = pytest.StashKey[list]()
 
 
-def pytest_ignore_collect(collection_path, config):
+def _ignore_core_collect(collection_path, config):
     """Avoid importing census-only modules during the default core gate.
 
     Some historical modules initialize distributed JAX at import time.  The
