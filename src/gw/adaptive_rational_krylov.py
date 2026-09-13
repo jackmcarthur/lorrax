@@ -139,12 +139,14 @@ def empty_samples(n_ports, k_max):
                 active=jnp.zeros(k_max, bool), m=jnp.int32(0))
 
 
-def append_samples(state, shift, q, y, gram):
+def append_samples(state, shift, q, y, gram, confluent_output=None):
     """Insert §4 cross terms and the directly contracted confluent Gram block.
 
     q/y are (Nr,r), gram is Xnew†Xnew (r,r); state uses maximum shapes.
-    Every accepted block must use a support distinct from all older supports.
-    Reused-support detection is returned as a refusal flag, never regularized.
+    A support coinciding with an old conjugate support needs confluent_output
+    = F'(shift)q, obtained by one further resolvent action on Xnew, or by a
+    derivative oracle in a reproduction gate. Without it the returned flag
+    refuses the block. No difference quotient denominator is regularized.
     """
     m, active = state['m'], state['active']
     zero = jnp.int32(0)
@@ -153,6 +155,10 @@ def append_samples(state, shift, q, y, gram):
     a = state['Y'].conj().T @ q
     b = state['Q'].conj().T @ y
     cross_s = jnp.where(active[:, None], (a - b) / jnp.where(den != 0, den, 1)[:, None], 0)
+    if confluent_output is not None:
+        cross_s = jnp.where((active & (den == 0))[:, None],
+                            -state['Q'].conj().T @ confluent_output, cross_s)
+        reused = jnp.bool_(False)
     cross_h = shift * cross_s - a
     update = jax.lax.dynamic_update_slice
     s = update(state['S'], cross_s, (zero, m))
