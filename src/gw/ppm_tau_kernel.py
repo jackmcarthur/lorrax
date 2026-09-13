@@ -295,13 +295,13 @@ def _get_sigma_kij_kernel(
     _, nb, mu, ns = face_shape
     g_plan = gemm_plan(mesh_xy, m=mu * ns, k=nb, n=mu * ns,
                        nq=k_unfold_plan.n_parent, dtype=jnp.complex128, layout=layout,
-                       enable_active_range=(layout == "face"))
+                       enable_active_range=True)
 
     def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t, band_range=None):
         """Apply boolean identity masks or signed occupation weights without clipping."""
         options = dict(e_ref=ref, layout=layout, gemm=g_plan,
                        k_unfold_plan=k_unfold_plan, band_range=band_range,
-                       trim_zero_bands=(layout == "face"))
+                       trim_zero_bands=True)
         options["mask" if sel.dtype == jnp.bool_ else "band_weight"] = sel
         if energy_windows:
             options.update(E_min=E_min, E_max=E_max)
@@ -324,7 +324,7 @@ def _get_sigma_kij_kernel(
                            else mask_A * in_range.astype(mask_A.dtype))
             G_k = build_g(psi_coh_xn, psi_coh_yr, E_A, mask_bracket,
                          E_min, E_max, E_ref_A, t_node,
-                         band_range=(lo, hi) if layout == "face" else None)
+                         band_range=(lo, hi))
             projected = conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
             return None, projected
 

@@ -7,15 +7,16 @@ Only the projected Sigma outputs acquire a leading bracket axis. The Green
 and FFT temporaries remain within the loop body; projected output sharding
 is explicitly `P(None, None, 'x', 'y')`.
 
-The face Green plan enables the shared [active-range GEMM service](active_gemm_ranges.md).
+Both face and axis Green plans enable the shared [active-range GEMM service](active_gemm_ranges.md).
 After forming the exact phases and selector weights, `build_G_tau` finds
 nonzero support bounds for each parent k. There is no numerical threshold:
 only exact zero columns outside that interval are omitted. Explicit bracket
 bounds further restrict the interval. Interior holes retain zero weights;
 this is an interval contraction rather than arbitrary sparse compaction.
 The same range is used for the conjugated endpoint needed by antiunitary
-transport. Both bracketed and unbracketed face Sigma paths use this owner.
-The existing axis-layout route retains its original contraction.
+transport. Both bracketed and unbracketed Sigma paths use this owner. Face products
+use native distributed descriptor views; axis products use local CPU/GPU
+JAX interval decomposition. Neither changes the wavefunction carrier layout.
 
 The wavefunction allocation shapes and distributed Green tiles stay fixed.
 Only native contraction dimensions change. Do not replace the sequential

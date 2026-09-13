@@ -21,7 +21,7 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
             "share (nk, nb, nspinor); got "
             f"{psi_mun.shape} and {psi_nmu.shape}.")
     A = merge_spin_centroid(psi_mun, 1, 2)          # (nk, mu*s, n) P(_,'x','y')
-    if phases is not None:
+    if phases is not None and band_range is None:
         w = phases.astype(A.dtype)                  # (nk, n)
         A = A * w[:, None, :]
     B = merge_spin_centroid(jnp.conj(psi_nmu), 2, 3)  # (nk, n, mu*s) P(_,'x','y')
@@ -34,7 +34,7 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
     if in_sharding_b is not None:
         B = lax.with_sharding_constraint(B, in_sharding_b)
     G_flat = (gemm(A, B) if band_range is None
-              else gemm.active_range(A, B, *band_range))
+              else gemm.active_range(A, B, *band_range, weights=phases))
     # (nk, mu*s, mu*s), distributed over both centroid axes.
     G = split_spin_centroid(G_flat, 1, s_, mu_l_)
     G = split_spin_centroid(G, 3, s_, mu_r_)
