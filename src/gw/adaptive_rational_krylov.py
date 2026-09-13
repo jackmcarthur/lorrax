@@ -378,7 +378,8 @@ def append_infinity(state, qinf, g0, g1):
 def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                         n_grid, shortlist, n_power, cg_maxiter, cg_tol,
                         pair_shape, store_truth, block_callback=None, pair_diagonal=None,
-                        absolute_residual=False, metric_support_rtol=METRIC_SUPPORT_RTOL):
+                        absolute_residual=False, metric_support_rtol=METRIC_SUPPORT_RTOL,
+                        hybrid_candidates=False):
     """Compile §§11–13's fixed-shape outer scan and per-column CG masks.
 
     The returned callable accepts runtime (operands, G0, grid, spectral_ends,
@@ -427,12 +428,24 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
 
                 def choose(_):
                     indicators = log_support_indicator(grid, state['xi'], theta, state['active'])
-                    _, ids = jax.lax.top_k(indicators, shortlist)
+                    if hybrid_candidates:
+                        # Equal fixed shortlist shares make both contours enter
+                        # Extension B's max merit; no pair solve in this scan.
+                        on_axis = grid.imag == 0
+                        _, ia = jax.lax.top_k(jnp.where(on_axis, indicators, -jnp.inf), shortlist//2)
+                        _, ib = jax.lax.top_k(jnp.where(~on_axis, indicators, -jnp.inf), shortlist//2)
+                        ids = jnp.concatenate((ia, ib))
+                    else:
+                        _, ids = jax.lax.top_k(indicators, shortlist)
 
                     def candidate(i):
                         s = grid[i]
                         q, value = residual_tangents(state, g0, s, whiten, trial, n_power=n_power)
-                        return q, value * (b-s.real)/(a-s.real)
+                        score = value * (b-s.real)/(a-s.real)
+                        if hybrid_candidates:
+                            distance = jnp.abs(s-jnp.clip(s.real,a,b))
+                            score = jnp.where(s.imag==0,score,jnp.sqrt(jnp.maximum(value,0))/distance)
+                        return q, score
 
                     qs, scores = jax.lax.map(candidate, ids)
                     best = jnp.argmax(scores)
@@ -441,13 +454,25 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                 shift, q, score = jax.lax.cond(state['m']==0,
                     lambda _: (-jnp.sqrt(a*b)+0j, seed, jnp.float64(1)), choose, None)
                 rhs = -apply_b(q, operands)
-                if pair_diagonal is None:
-                    x,cg = block_cg(lambda v:apply_t(v,operands),rhs,shift.real,
-                                    maxiter=cg_maxiter,tol=cg_tol,orthonormalize=orthonormalize)
+                def real_solve(_):
+                    if pair_diagonal is None:
+                        x,cg = block_cg(lambda v:apply_t(v,operands),rhs,shift.real,
+                                        maxiter=cg_maxiter,tol=cg_tol,orthonormalize=orthonormalize)
+                    else:
+                        x,cg = preconditioned_block_cg(lambda v:apply_t(v,operands),rhs,
+                            shift.real,pair_diagonal(operands),maxiter=cg_maxiter,tol=cg_tol,
+                            orthonormalize=orthonormalize)
+                    return x,{key:cg[key] for key in ('iterations','relative','breakdown','matvec_columns','rhs_solves')}
+
+                def complex_solve(_):
+                    x,cg = complex_shifted_cg(lambda v:apply_t(v,operands),-rhs,shift,
+                        maxiter=cg_maxiter,tol=cg_tol,orthonormalize=orthonormalize)
+                    return x,{key:cg[key] for key in ('iterations','relative','breakdown','matvec_columns','rhs_solves')}
+
+                if hybrid_candidates:
+                    x,cg = jax.lax.cond(shift.imag==0,real_solve,complex_solve,None)
                 else:
-                    x,cg = preconditioned_block_cg(lambda v:apply_t(v,operands),rhs,
-                        shift.real,pair_diagonal(operands),maxiter=cg_maxiter,tol=cg_tol,
-                        orthonormalize=orthonormalize)
+                    x,cg = real_solve(None)
                 y = apply_bh(x, operands)
                 gram = jnp.einsum('acvk,bcvk->ab', x.conj(), x)
                 new, reused = append_samples(state, shift, q, y, gram)
