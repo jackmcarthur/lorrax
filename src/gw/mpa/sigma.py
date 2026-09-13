@@ -201,7 +201,9 @@ def _batch_rows(row, batch):
     particular pane/product window selects.  Inactive rows therefore occupy
     the remaining batch slots with an impossible ``a`` interval.  All windows
     over a resident batch then call the same jitted callable with identical
-    shapes, dtypes, and shardings; only the selector values change.
+    shapes, dtypes, and shardings; only the selector values change. The
+    returned int32 count bounds the occupied prefix so empty slots do not
+    execute the pole-field arithmetic.
     """
     batch = tuple(int(p) for p in batch)
     local = {int(p): i for i, p in enumerate(batch)}
@@ -231,7 +233,7 @@ def _batch_rows(row, batch):
         pole_indices,
         bounds,
         phase_real,
-        None,
+        np.int32(count),
     )
 
 
@@ -351,10 +353,10 @@ def _integrate_sigma_batches(
             selected = _batch_rows(row, batch)
             if selected is None:
                 continue
-            pole_indices, bounds, phase_real, _states = selected
-            pole_indices, bounds, phase_real = (
+            pole_indices, bounds, phase_real, active_count = selected
+            pole_indices, bounds, phase_real, active_count = (
                 device_put_process_local(x, small)
-                for x in (pole_indices, bounds, phase_real))
+                for x in (pole_indices, bounds, phase_real, active_count))
             win = row.window
             B_branch = _residue_for_space(row.space, B, B_odd)
             weight = getattr(row, "band_weight", None)
@@ -378,7 +380,7 @@ def _integrate_sigma_batches(
                     pole_indices, bounds, phase_real,
                     jnp.asarray(win.E_ref_A),
                     jnp.asarray(win.E_ref_B),
-                    jnp.asarray(first_t, dtype=jnp.complex128))
+                    jnp.asarray(first_t, dtype=jnp.complex128), active_count)
                 if hasattr(tau_kernel, "lower"):
                     tau_kernel.lower(*prewarm_args).compile()
                 else:
@@ -423,7 +425,7 @@ def _integrate_sigma_batches(
                             pole_indices, bounds, phase_real,
                             jnp.asarray(win.E_ref_A),
                             jnp.asarray(win.E_ref_B),
-                            jnp.asarray(t, dtype=jnp.complex128))
+                            jnp.asarray(t, dtype=jnp.complex128), active_count)
                         sec.watch(sigma_tau)
                     with timing.section("sigma.tau.accumulator") as sec:
                         accumulated = accumulator.add_tau(sigma_tau)
@@ -438,7 +440,7 @@ def _integrate_sigma_batches(
                         pole_indices, bounds, phase_real,
                         jnp.asarray(win.E_ref_A),
                         jnp.asarray(win.E_ref_B),
-                        jnp.asarray(t, dtype=jnp.complex128))
+                        jnp.asarray(t, dtype=jnp.complex128), active_count)
                     accumulator.add_tau(sigma_tau)
                     progress.step(wait=sigma_tau)
                 n_tau += 1

@@ -605,10 +605,10 @@ def test_product_window_ranges_keep_one_batch_width_kernel_signature():
     broad = _batch_rows(_range_row((0, 1, 2)), (0, 1, 2, 3))
     narrow = _batch_rows(_range_row((2,)), (0, 1, 2, 3))
     for selected in (broad, narrow):
-        pole_indices, bounds, phase_real, states = selected
+        pole_indices, bounds, phase_real, count = selected
         assert pole_indices.shape == phase_real.shape == (4,)
         assert bounds.shape == (4, 6)
-        assert states is None
+        assert count == (3 if selected is broad else 1)
     np.testing.assert_array_equal(broad[0][:3], [0, 1, 2])
     np.testing.assert_array_equal(narrow[0][:1], [2])
     assert np.isposinf(narrow[1][1:, 0]).all()

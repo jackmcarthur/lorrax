@@ -15,6 +15,7 @@ only sequences them.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import lru_cache
 import os
 
 import jax
@@ -218,6 +219,36 @@ def _compute_analytic_head_diag(
     return np.asarray(head_sigma_diag_ry)
 
 
+@lru_cache(maxsize=16)
+def _band_count_kernel(sharding):
+    """Reuse one dynamic bracket extraction per output layout."""
+    return jax.jit(
+        lambda a, i: jax.lax.dynamic_index_in_dim(a, i, keepdims=False),
+        out_shardings=sharding)
+
+
+def _combine_extrapolation(a, w):
+    """Apply scalar or symmetric per-state weights in bracket order."""
+    w = jnp.asarray(w, dtype=a.dtype)
+    if w.ndim == 1:
+        return jnp.tensordot(w, a, axes=(0, 0))
+    # Form only one (nk, nb, nb) weight matrix at a time. The small static
+    # bracket loop preserves the established elementwise summation order.
+    acc = None
+    for b in range(w.shape[0]):
+        wb = w[b]
+        wsym = 0.5 * (wb[:, :, None] + wb[:, None, :])
+        term = a[b] * wsym[None, ...]
+        acc = term if acc is None else acc + term
+    return acc
+
+
+@lru_cache(maxsize=16)
+def _extrapolation_kernel(sharding):
+    """Reuse the ordered affine combination with weights as operands."""
+    return jax.jit(_combine_extrapolation, out_shardings=sharding)
+
+
 def _band_count_point(cube, i: int):
     """``cube[i]`` with the TRAILING (ω, k, m, n) sharding preserved.
 
@@ -234,7 +265,7 @@ def _band_count_point(cube, i: int):
     if len(spec) != int(getattr(cube, "ndim", 0)):
         return cube[i]
     out = NamedSharding(sharding.mesh, P(*spec[1:]))
-    return jax.jit(lambda a: a[i], out_shardings=out)(cube)
+    return _band_count_kernel(out)(cube, jnp.asarray(i, dtype=jnp.int32))
 
 
 def _extrapolated_point(cube, weights):
@@ -285,29 +316,14 @@ def _extrapolated_point(cube, weights):
             f"_extrapolated_point: weights must be (3,) [band_index_only] or "
             f"(3, nk, nb) [spectral_shell], got shape {w.shape}")
 
-    def _combine(a):
-        if w.ndim == 1:
-            return jnp.tensordot(jnp.asarray(w, dtype=a.dtype), a, axes=(0, 0))
-        # Per-state coefficients.  Symmetrised to (nk, nb, nb) ONE BRACKET AT
-        # A TIME: the full (3, nk, nb, nb) block would be three times the
-        # footprint of the thing it multiplies, and on a large deck that is
-        # hundreds of MB of nothing.
-        acc = None
-        for b in range(w.shape[0]):
-            wb = jnp.asarray(w[b], dtype=a.dtype)          # (nk, nb)
-            wsym = 0.5 * (wb[:, :, None] + wb[:, None, :])  # (nk, nb, nb)
-            term = a[b] * wsym[None, ...]
-            acc = term if acc is None else acc + term
-        return acc
-
     sharding = getattr(cube, "sharding", None)
     if not isinstance(sharding, NamedSharding):
-        return _combine(cube)
+        return _combine_extrapolation(cube, w)
     spec = tuple(sharding.spec)
     if len(spec) != int(getattr(cube, "ndim", 0)):
-        return _combine(cube)
+        return _combine_extrapolation(cube, w)
     out = NamedSharding(sharding.mesh, P(*spec[1:]))
-    return jax.jit(_combine, out_shardings=out)(cube)
+    return _extrapolation_kernel(out)(cube, w)
 
 
 def _report_band_extrapolation(

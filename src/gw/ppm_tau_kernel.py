@@ -266,33 +266,6 @@ def get_sigma_spatial_kernel(
 _NO_BRACKETS = None
 
 
-def _stack_channels(outs, mesh_xy: Mesh):
-    """Stack a per-bracket list of kernel outputs on a new LEADING axis.
-
-    The τ kernel's output is either one complex array (merged Laplace plan)
-    or the ``(S_R, S_I)`` pair (crossing plan), so the stack has to be
-    channel-wise; a single ``jnp.stack`` on the tuple would build a
-    (2, n_brk, ...) object and silently swap the two axes' meaning.
-
-    The bracket axis is pinned REPLICATED and the (nk, m_X, n_Y) sharding
-    the reduce-scatter projector produced is restated explicitly rather than
-    left to XLA's propagation through the concatenate: the accumulator reads
-    ``addressable_shards``/``.sharding`` off this array and places every
-    host tile by that index, so a silently drifted layout would misplace
-    tiles rather than fail.
-    """
-    spec = P(None, None, 'x', 'y')
-
-    def _one(chan):
-        return jax.lax.with_sharding_constraint(
-            jnp.stack(chan, axis=0), NamedSharding(mesh_xy, spec))
-
-    if isinstance(outs[0], tuple):
-        return tuple(_one([o[c] for o in outs])
-                     for c in range(len(outs[0])))
-    return _one(outs)
-
-
 def _get_sigma_kij_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int], merged_x: bool = True,
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
@@ -345,23 +318,27 @@ def _get_sigma_kij_kernel(
         """Mask each bracket on the last band axis while retaining one Green tile at a time."""
         nb_full = int(mask_A.shape[-1])
         idx = jnp.arange(nb_full)
-        outs = []
-        prev = None
-        for lo, hi in brackets:
-            if prev is not None:
-                (psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                 E_A, mask_A, W_prep, prev) = jax.lax.optimization_barrier(
-                    (psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                     E_A, mask_A, W_prep, prev))
-            hi_ = nb_full if hi is None else hi
-            in_range = (idx >= lo) & (idx < hi_)
+        endpoints = jnp.asarray(
+            [(lo, nb_full if hi is None else hi) for lo, hi in brackets],
+            dtype=jnp.int32)
+
+        def one(_, bounds):
+            lo, hi = bounds
+            in_range = (idx >= lo) & (idx < hi)
             mask_bracket = (mask_A & in_range if mask_A.dtype == jnp.bool_
                            else mask_A * in_range.astype(mask_A.dtype))
             G_k = build_g(psi_coh_xn, psi_coh_yr, E_A, mask_bracket,
                          E_min, E_max, E_ref_A, t_node)
-            prev = conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
-            outs.append(prev)
-        return _stack_channels(outs, mesh_xy)
+            projected = conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
+            return None, projected
+
+        # Only the small band-projected outputs acquire a bracket axis.
+        # G and its FFT/convolution temporaries stay inside the loop body.
+        _, outs = jax.lax.scan(one, None, endpoints, unroll=1)
+        sharding = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
+        return jax.tree.map(
+            lambda value: jax.lax.with_sharding_constraint(value, sharding),
+            outs)
 
     if not _stage_timing_enabled():
         _build_g = _g_from_selector
@@ -441,14 +418,16 @@ def _get_sigma_kij_kernel(
 
 
 def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
-                       phase_real, E_ref_B, t_node):
+                       phase_real, E_ref_B, t_node, active_count=None):
     """Build one W(tau) tile from selected multipole fields.
 
     ``bounds`` rows are ``(a_gt, a_le, gamma_ge, gamma_gt, gamma_lt,
     gamma_le)``.  Each row selects one pole field; ``phase_real`` chooses
     the accepted near-axis functional ``Re(Omega)`` for that row, otherwise
     the fitted complex pole is used.  The pole axis is never materialized in
-    W: the loop carries one ``(q, mu, nu)`` tile.
+    W: the loop carries one ``(q, mu, nu)`` tile. ``active_count`` is a
+    replicated dynamic scalar naming the occupied selector prefix; omitted
+    counts evaluate every selector row.
     """
     def _add(index, W_t):
         pole = jax.lax.dynamic_index_in_dim(
@@ -473,7 +452,8 @@ def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
             jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
 
     return jax.lax.fori_loop(
-        0, pole_indices.shape[0], _add, jnp.zeros_like(B_poles[0]))
+        0, (pole_indices.shape[0] if active_count is None else active_count),
+        _add, jnp.zeros_like(B_poles[0]))
 
 
 def get_shared_sigma_tau_kernel(
@@ -506,10 +486,10 @@ def get_shared_sigma_tau_kernel(
 
     @jax.jit
     def _build(B_poles, Omega_poles, pole_indices, bounds,
-               phase_real, E_ref_B, t_node):
+               phase_real, E_ref_B, t_node, active_count=None):
         W_t = build_shared_w_tau(
             B_poles, Omega_poles, pole_indices, bounds,
-            phase_real, E_ref_B, t_node)
+            phase_real, E_ref_B, t_node, active_count)
         return jax.lax.with_sharding_constraint(W_t, q_mu_sharding)
 
     if not _stage_timing_enabled():
@@ -517,10 +497,10 @@ def get_shared_sigma_tau_kernel(
         def _tau(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
             E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
-            phase_real, E_ref_A, E_ref_B, t_node,
+            phase_real, E_ref_A, E_ref_B, t_node, active_count=None,
         ):
             W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
-                         phase_real, E_ref_B, t_node)
+                         phase_real, E_ref_B, t_node, active_count)
             return sigma_kij(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                 E_A, mask_A, E_ref_A, t_node, W_t)
@@ -531,11 +511,11 @@ def get_shared_sigma_tau_kernel(
     def _tau_staged(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
-        phase_real, E_ref_A, E_ref_B, t_node,
+        phase_real, E_ref_A, E_ref_B, t_node, active_count=None,
     ):
         with timing.section("sigma.tau.w_phase") as sec:
             W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
-                         phase_real, E_ref_B, t_node)
+                         phase_real, E_ref_B, t_node, active_count)
             sec.watch(W_t)
         return sigma_kij(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
