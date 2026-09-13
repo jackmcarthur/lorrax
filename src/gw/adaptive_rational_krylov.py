@@ -467,8 +467,14 @@ def ritz_model(state):
     scale = jnp.where(active, 1 / jnp.sqrt(jnp.where(diag > 0, diag, 1)), 1)
     gram = jnp.where(mask, state['S'] * scale[:, None] * scale[None, :], 0)
     gram = gram + jnp.diag((~active) * (state['S'].shape[0] + 1.))
-    g, u = jnp.linalg.eigh(gram)
-    w = scale[:, None] * u / jnp.sqrt(g)[None, :]
+    g = jnp.linalg.eigvalsh(gram)
+    # Cholesky coordinates avoid the padded eigensolver's loss of Gram
+    # orthogonality. The eigenvalues above remain an independent rank guard;
+    # no column is dropped and the Galerkin subspace is unchanged.
+    chol = jnp.linalg.cholesky(gram)
+    inverse_adjoint = jsl.solve_triangular(
+        chol.conj().T, jnp.eye(gram.shape[0], dtype=gram.dtype), lower=False)
+    w = scale[:, None] * inverse_adjoint
     h = w.conj().T @ state['H'] @ w
     live = jnp.arange(g.size) < state['m']
     bound = jnp.linalg.norm(h) + 1.
@@ -682,7 +688,9 @@ def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
     and the limit are evaluated at every prefix; the sample error is never
     used to set its own floor. Exact order and Gram guards are unchanged.
     seed_blocks accepts fixed runtime tangent panels, support indices and live
-    widths before adaptive selection. candidate_count restricts the adaptive
+    widths before adaptive selection: seed_q=(seed_blocks,Nr,r_add),
+    seed_support=(seed_blocks,) and seed_width=(seed_blocks,).
+    candidate_count restricts the adaptive
     scan to the leading supports, while anchors may use the complete list.
     """
     if r_add < 1 or (k_max-infinity_columns) % r_add or infinity_columns<0:
