@@ -124,6 +124,12 @@ _LIB_PATHS: Dict[str, str] = {}
 # inside the .so on the input buffer's element type.
 # ---------------------------------------------------------------------------
 _CUDA_TARGET_SYMBOLS = {
+    "lorrax_active_subspace_store":        "ActiveSubspaceStoreFfi",
+    "lorrax_active_subspace_eigh":         "ActiveSubspaceEighFfi",
+    "lorrax_active_subspace_project":      "ActiveSubspaceProjectFfi",
+    "lorrax_active_subspace_reconstruct":  "ActiveSubspaceReconstructFfi",
+    "lorrax_active_subspace_ortho":        "ActiveSubspaceOrthoFfi",
+
     "lorrax_cublasmp_batched_gemm":       "CublasMpBatchedGemmFfi",
     "lorrax_cusolvermp_eigh":             "EighMpFfi",
     "lorrax_cusolvermp_batched_potrf":    "CusolverMpBatchedPotrfFfi",
@@ -795,3 +801,18 @@ def dial_key() -> tuple:
     """
     return tuple((spec["env"], os.environ.get(spec["env"]))
                  for _, spec in sorted(_PLATFORMS.items()))
+
+
+def active_eigh_workspace(capacity: int) -> int:
+    """Query the declared local eigensolver scratch; no vendor edge escapes here."""
+    lib = get_lib("CUDA")
+    try:
+        query = lib.lrx_active_eigh_lwork
+    except AttributeError as exc:
+        raise LibraryUnusable("active subspace requires a rebuilt CUDA provider") from exc
+    query.argtypes = [ctypes.c_int]
+    query.restype = ctypes.c_int
+    size = int(query(capacity))
+    if size <= 0:
+        raise LibraryUnusable(f"active eigensolver workspace query failed: {size}")
+    return size

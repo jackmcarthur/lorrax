@@ -402,6 +402,14 @@ find_library(CUSOLVER_LIBRARY cusolver
     PATHS "${CUDA_TOOLKIT_ROOT}/lib64" "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
           "${CUDA_TOOLKIT_ROOT}/lib"
     NO_DEFAULT_PATH)
+get_filename_component(_single_gpu_math_dir "${CUSOLVER_LIBRARY}" DIRECTORY)
+find_library(CUBLAS_LIBRARY cublas
+    PATHS "${_single_gpu_math_dir}" "${CUDA_TOOLKIT_ROOT}/lib64"
+          "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib" "${CUDA_TOOLKIT_ROOT}/lib"
+    NO_DEFAULT_PATH)
+if(NOT CUBLAS_LIBRARY)
+    message(FATAL_ERROR "libcublas (single-GPU active subspace) not found")
+endif()
 if(NOT CUSOLVER_LIBRARY)
     message(FATAL_ERROR "libcusolver (single-GPU) not found")
 endif()
@@ -597,6 +605,8 @@ endif()
 # ----------------------------------------------------------------------------
 set(LORRAX_FFI_SOURCES
     common/api.cc
+    active_subspace/active_eigh.cc
+    active_subspace/active_ops.cc
     cusolvermp/context.cc
     cusolvermp/eigh_ffi.cc
     cusolvermp/batched_potrf_ffi.cc
@@ -794,6 +804,7 @@ target_link_libraries(lorrax_ffi PRIVATE
     "${NCCL_LIBRARY}"
     "${CUDART_LIBRARY}"
     "${CUSOLVER_LIBRARY}"
+    "${CUBLAS_LIBRARY}"
     Threads::Threads
 )
 # CAL is only linked for the <=0.6.x comm path; NCCL-native cuSOLVERMp

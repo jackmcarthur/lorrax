@@ -77,6 +77,7 @@ one sentence and a link.
 | **where a module may live, and what it may import** | [The three levels](architecture/layers.md) | L1/L2/L3 assignment, the import direction, the sanctioned exceptions, and what deliberately is *not* unified. |
 | **where a source module or service package lives** | [Codebase](codebase.md) | the one-line inventory of every GW, common, centroid, file-I/O, and service source package. |
 | **which capabilities are services** | [Substrate services](architecture/services.md) | the service inventory, layering boundary, and which services expose or hide backend choice. Individual caller contracts live on the service pages below. |
+| **how a fixed-memory local Davidson solve is planned** | [`planned local Davidson`](services/davidson.md) | callable/data API, active storage, scratch planning, status and device contract. |
 | **how distributed dense linear algebra is requested** | [`distrib_la`](services/distrib_la.md) | the top-level API, plan/factor/solve and matmul contracts, backend resolution, layouts, and refusals. |
 | **how crystal symmetry data is represented and applied** | [`symmetry_maps`](services/symmetry_maps.md) | the top-level API, canonical maps and actions, storage boundaries, unfold contracts, and TRS checks. |
 | **how Coulomb kernels and q=0 cell averages are selected** | [`vcoul`](services/vcoul.md) | dimensional kernels, exact slab q=0 default, explicit debug alternatives, tensor-cell sampling, and refusals. |

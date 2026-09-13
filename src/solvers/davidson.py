@@ -23,7 +23,7 @@ Algorithm (after QE cegterg.f90):
   1. init_fn builds the starting subspace
   2. Each iteration: Gram projection → generalized eigh via Cholesky →
      Ritz vectors → residuals → precond_fn → expand
-  3. Fixed block-size expansion (avoids JIT recompilation)
+  3. Rank-revealing expansion (growing shapes specialize JIT kernels)
   4. Restart to Ritz vectors when subspace exceeds m_max
 
 Usage
@@ -180,6 +180,19 @@ def _chol_floor(S):
     return _CHOL_REL_EPS * jnp.maximum(scale, _TINY)
 
 
+def _rank_whitener(S):
+    """One rank cutoff and coefficient construction for both Davidson routes."""
+    e, U = jnp.linalg.eigh(S)                 # ascending, e real
+    e = e[::-1]
+    U = U[:, ::-1]                            # descending
+    thresh = _RANK_DROP_RTOL * jnp.maximum(e[0], 0.0)
+    keep = e > thresh
+    rank = jnp.sum(keep.astype(jnp.int32))
+    inv_sqrt = jnp.where(keep, 1.0 / jnp.sqrt(jnp.maximum(e, _TINY)), 0.0)
+    M = U * inv_sqrt[None, :].astype(U.dtype)     # M[i, m] = U[i,m]·e_m^-1/2
+    return M, rank
+
+
 def _whiten_rank_revealing(S, P):
     """Whiten P by its Gram matrix S, dropping numerically null directions.
 
@@ -202,14 +215,7 @@ def _whiten_rank_revealing(S, P):
     Shape-agnostic: P is ``(m, *trailing)`` and only the batch axis is
     contracted, so trailing sharding is untouched.
     """
-    e, U = jnp.linalg.eigh(S)                 # ascending, e real
-    e = e[::-1]
-    U = U[:, ::-1]                            # descending
-    thresh = _RANK_DROP_RTOL * jnp.maximum(e[0], 0.0)
-    keep = e > thresh
-    rank = jnp.sum(keep.astype(jnp.int32))
-    inv_sqrt = jnp.where(keep, 1.0 / jnp.sqrt(jnp.maximum(e, _TINY)), 0.0)
-    M = U * inv_sqrt[None, :].astype(U.dtype)     # M[i, m] = U[i,m]·e_m^-1/2
+    M, rank = _rank_whitener(S)
     P_w = jnp.einsum('im,i...->m...', M, P, optimize=True)
     return P_w, rank
 

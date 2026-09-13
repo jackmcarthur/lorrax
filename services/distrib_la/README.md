@@ -99,3 +99,13 @@ never a fallback.
 The canonical API, sharding contracts, route schedule, refusals, warm-up
 behavior, tests, and backend limitations are documented in
 [`../../docs/services/distrib_la.md`](../../docs/services/distrib_la.md).
+
+
+For iterative algorithms on one CUDA device, `plan_local_subspace(capacity=...,
+n_eig=...)` resolves fixed-capacity active-prefix eigensolves, projections,
+CGS2, reconstruction, and aliased row stores. This route is complex128 and
+process-local; it refuses distributed operands and requires the corresponding
+canonical provider handlers. Its workspaces are available through
+`LocalSubspacePlan.workspace_specs`. Runtime size descriptors synchronize to
+the host inside FFI. The LORRAX consumer contract is documented in
+[`planned local Davidson`](../../docs/services/davidson.md).
