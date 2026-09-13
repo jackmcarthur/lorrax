@@ -139,6 +139,35 @@ def empty_samples(n_ports, k_max):
                 active=jnp.zeros(k_max, bool), m=jnp.int32(0))
 
 
+def complex_shifted_cg(apply_t, rhs, shift, *, maxiter, tol):
+    """Solve (shift I-T)x=rhs using a Hermitian positive normal operator.
+
+    For shift=c+id, D=(T-cI)^2+d²I and x=(conj(shift)I-T)D^-1 rhs.
+    This Extension B action retains CG's fixed storage and convergence masks;
+    it squares the shifted condition number, which the measured iteration
+    count exposes. Nonzero d is required. The final receipt reports the true
+    original-system residual, not the normal-equation stopping residual.
+    Each D application costs two T columns per RHS; both final T actions are
+    included. No contour-dependent tolerance or pole modification is used.
+    """
+    def normal(v):
+        av = apply_t(v) - shift.real * v
+        return apply_t(av) - shift.real * av + shift.imag**2 * v
+
+    y, receipt = column_cg(normal, rhs, jnp.float64(0), maxiter=maxiter, tol=tol)
+    x = shift.conjugate() * y - apply_t(y)
+    residual = rhs - (shift * x - apply_t(x))
+    axes = tuple(range(1, rhs.ndim))
+    b2 = jnp.sum(jnp.abs(rhs)**2, axis=axes)
+    relative = jnp.sqrt(jnp.sum(jnp.abs(residual)**2, axis=axes) /
+                         jnp.where(b2 > 0, b2, 1))
+    receipt = dict(receipt, normal_relative=receipt['relative'], relative=relative,
+                   matvec_columns=2*receipt['matvec_columns'] + 2*rhs.shape[0],
+                   useful_matvec_columns=2*receipt['useful_matvec_columns'] +
+                                           2*jnp.sum(b2 > 0))
+    return x, receipt
+
+
 def append_samples(state, shift, q, y, gram, confluent_gram=None):
     """Insert §4 cross terms and the directly contracted confluent Gram block.
 
