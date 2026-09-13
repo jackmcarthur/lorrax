@@ -451,15 +451,21 @@ class GemmPlan:
                       self.out_sharding)
         return self._fn_with_c(A, B, c_or_out)
 
-    def active_range(self, A, B, lo, hi, C=None, *, out=None):
-        """Contract exactly A[..., lo:hi] @ B[..., lo:hi, :] without packing.
+    def active_range(self, A, B, lo, hi, C=None, *, out=None, weights=None):
+        """Contract exact intervals, optionally scaling columns by weights[nq,K].
 
-        Construct with ``enable_active_range=True``. Full input allocations
-        and their all-processor layouts stay fixed; bounds are replicated
-        integer scalars or arrays of shape (nq,). Each nonempty original contraction-owner intersection uses
-        one native descriptor view. Native reads the packed bounds to the host
-        because vendor dimensions are host scalars; no full operand moves.
-        C/out have the same beta and donation semantics as ``__call__``.
+        Construct with ``enable_active_range=True``. Full allocation shapes
+        and output placement stay fixed; bounds are replicated integer scalars
+        or arrays of shape (nq,). The face backend uses native descriptor views
+        without packing and reads only bound metadata to the host. The local
+        backend uses CUDA cuBLAS pointer views or bounded CPU JAX panels.
+        Equal parent intervals retain a batched dot; full bounds use the
+        original dense operation. Neither route multiplies inactive tails.
+
+        Require 0 <= lo <= hi <= K. Invalid Python integer bounds raise eagerly;
+        invalid traced bounds raise in the native provider or produce an
+        all-NaN result on the callback-free local backend. C/out have the same
+        beta and donation semantics as ``__call__``.
         """
         if self._active_fn_with_c is None:
             raise ValueError("gemm_plan: active_range requires enable_active_range=True")
@@ -469,6 +475,8 @@ class GemmPlan:
             raise ValueError("gemm_plan.active_range: out= requires beta==0")
         _check_operand(self, "A", A, (self.nq, self.m, self.k), self.in_sharding_a)
         _check_operand(self, "B", B, (self.nq, self.k, self.n), self.in_sharding_b)
+        if isinstance(lo, int) and isinstance(hi, int) and not 0 <= lo <= hi <= self.k:
+            raise ValueError("gemm_plan.active_range: require 0 <= lo <= hi <= K")
         indices = tuple(jnp.asarray(v) for v in (lo, hi))
         if any(v.shape not in ((), (self.nq,)) or not jnp.issubdtype(v.dtype, jnp.integer)
                for v in indices):
@@ -478,13 +486,29 @@ class GemmPlan:
         # (e.g. 2**32 to zero) while packing the native int32 operands.
         valid = jnp.all((raw_bounds >= 0) & (raw_bounds <= self.k))
         bounds = jnp.where(valid, raw_bounds, -1).astype(jnp.int32)
+        if self.backend == "local":
+            bounds = jnp.broadcast_to(bounds, (self.nq, 2))
+        if weights is not None:
+            weights = jnp.asarray(weights)
+            if self.dtype.kind != "c" and jnp.issubdtype(weights.dtype, jnp.complexfloating):
+                raise TypeError("gemm_plan.active_range: complex weights require a complex plan")
+            weights = weights.astype(self.dtype)
+            if weights.shape != (self.nq, self.k):
+                raise ValueError("gemm_plan.active_range: weights must have shape(nq,K)")
+        active_args = (A, B, bounds)
+        if self.backend == "local":
+            if weights is None:
+                weights = jnp.ones((self.nq, self.k), dtype=self.dtype)
+            active_args = (*active_args, weights)
+        elif weights is not None:
+            active_args = (A * weights[:, None, :], B, bounds)
         c = C if C is not None else out
         if c is None:
             if self._active_fn_no_c is None:
                 raise ValueError("gemm_plan.active_range: C is required when beta != 0")
-            return self._active_fn_no_c(A, B, bounds)
+            return self._active_fn_no_c(*active_args)
         _check_operand(self, "C/out", c, (self.nq, self.m, self.n), self.out_sharding)
-        return self._active_fn_with_c(A, B, bounds, c)
+        return self._active_fn_with_c(*active_args, c)
 
     def local_call(self, A, B, C=None, *, out=None):
         """The SAME planned N,N GEMM as :meth:`__call__`, callable from
@@ -583,8 +607,14 @@ def _axis_matmul(a, b, c=None, *, alpha, beta, reduction_axis=None):
 
 
 def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
-                    dtype, alpha=1.0, beta=0.0, reduction_axis=None, out_spec=None) -> GemmPlan:
-    """Warm A(q,m_X,k) B(q,k,n_Y) → D(q,m_X,n_Y) with a replicated contraction axis."""
+                    dtype, alpha=1.0, beta=0.0, reduction_axis=None, out_spec=None,
+                    enable_active_range=False) -> GemmPlan:
+    """Warm a local product on CPU/GPU while retaining output axis shards.
+
+    ``enable_active_range`` supports replicated K and a two-axis output, using
+    the same ``GemmPlan.active_range`` API as the distributed face backend.
+    Reduction-axis and single-axis-output plans retain dense behavior only.
+    """
     m, k, n, nq = (_as_extent(label, value) for label, value in
                    (("m", m), ("k", k), ("n", n), ("nq", nq)))
     dtype = jnp.dtype(dtype)
@@ -610,6 +640,20 @@ def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
         raise ValueError("local_gemm_plan: reduction_axis must be x, y or None")
     if reduction_axis is not None and k % mesh.shape[reduction_axis]:
         raise ValueError("local_gemm_plan: contraction extent must tile its reduction axis")
+    if enable_active_range and (reduction_axis is not None or out_spec != P(None, "x", "y")):
+        raise NotImplementedError("local_gemm_plan active_range requires replicated K and two-axis output")
+    if enable_active_range and k > 2**31 - 1:
+        raise ValueError("local_gemm_plan active_range storage K exceeds int32 bounds")
+    active_impl = None
+    if enable_active_range:
+        if mesh.devices.flat[0].platform == "gpu":
+            from distrib_la._active_local_cuda import (active_local_cuda,
+                                                       require_active_local_cuda)
+            require_active_local_cuda()
+            active_impl = active_local_cuda
+        else:
+            from distrib_la._active_local import active_local_matmul
+            active_impl = active_local_matmul
     a_sh, b_sh, out_sh = (NamedSharding(mesh, spec)
                            for spec in (a_spec, b_spec, out_spec))
     local = partial(_axis_matmul, alpha=alpha, beta=beta, reduction_axis=reduction_axis)
@@ -624,10 +668,36 @@ def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
         no_c = jax.jit(shard_map(local, mesh=mesh,
             in_specs=(a_spec, b_spec), out_specs=out_spec, check_vma=False))
         no_c(_zeros((nq, m, k), dtype, a_sh), _zeros((nq, k, n), dtype, b_sh))
-    return GemmPlan(mesh=mesh, backend="local", m=m, k=k, n=n, nq=nq,
+    plan = GemmPlan(mesh=mesh, backend="local", m=m, k=k, n=n, nq=nq,
                     dtype=dtype, alpha=alpha, beta=beta,
                     in_sharding_a=a_sh, in_sharding_b=b_sh, out_sharding=out_sh,
                     ctx_handle=0, _fn_with_c=with_c, _fn_no_c=no_c, reduction_axis=reduction_axis)
+    if not enable_active_range:
+        return plan
+    from dataclasses import replace
+    active = partial(active_impl, alpha=alpha, beta=beta)
+    a0, b0 = _zeros((nq, m, k), dtype, a_sh), _zeros((nq, k, n), dtype, b_sh)
+    # Exercise a genuine partial interval before returning the plan. Full
+    # ranges deliberately bypass the active CUDA target and would not warm it.
+    warm_hi = k - 1 if k > 1 else k
+    bounds = _zeros((nq, 2), jnp.int32, NamedSharding(mesh, P())).at[:, 1].set(warm_hi)
+    weights = _zeros((nq, k), dtype, NamedSharding(mesh, P())) + 1
+    if beta == 0:
+        active_no_c = jax.jit(shard_map(active, mesh=mesh,
+            in_specs=(a_spec, b_spec, P(), P()), out_specs=out_spec, check_vma=False))
+        jax.block_until_ready(active_no_c(a0, b0, bounds, weights))
+        # Local out= leaves its storage live, just as the dense local plan does.
+        def active_with_c(a, b, limits, weight, c):
+            return active_no_c(a, b, limits, weight)
+    else:
+        active_no_c = None
+        active_with_c = jax.jit(shard_map(active, mesh=mesh,
+            in_specs=(a_spec, b_spec, P(), P(), out_spec), out_specs=out_spec,
+            check_vma=False), donate_argnums=(4,))
+        jax.block_until_ready(active_with_c(a0, b0, bounds, weights,
+            _zeros((nq, m, n), dtype, out_sh)))
+    return replace(plan, _active_fn_with_c=active_with_c,
+                   _active_fn_no_c=active_no_c)
 
 
 def gemm_plan(
@@ -698,11 +768,10 @@ def gemm_plan(
         ``beta != 0`` compiles only the donated-``C`` kernel, and every
         call must then supply ``C``.
     """
-    if enable_active_range and layout != "face":
-        raise NotImplementedError("gemm_plan active_range requires the cuBLASMp face backend")
     if layout == "axis":
         return local_gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
-                               alpha=alpha, beta=beta, reduction_axis=reduction_axis, out_spec=out_spec)
+                               alpha=alpha, beta=beta, reduction_axis=reduction_axis, out_spec=out_spec,
+                               enable_active_range=enable_active_range)
     if layout != "face":
         raise ValueError(f"gemm_plan: unknown psi layout {layout!r}")
     if out_spec is not None and out_spec != P(None, "x", "y"):
@@ -799,7 +868,8 @@ def gemm_plan(
     fn_active_no_c = (jax.jit(_build_active_kernel(plan, with_c=False))
                       if beta_c == 0 else None)
     bounds = _zeros((1, 2), jnp.int32, NamedSharding(mesh, P()))
-    bounds = bounds.at[0, 1].set(k)
+    # The full-range fast path calls the old target; warm descriptor views.
+    bounds = bounds.at[0, 1].set(k - 1 if k > 1 else k)
     a0 = _zeros((nq, m, k), dtype, in_sharding_a)
     b0 = _zeros((nq, k, n), dtype, in_sharding_b)
     jax.block_until_ready(fn_active_c(a0, b0, bounds,

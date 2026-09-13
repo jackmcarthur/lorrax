@@ -607,6 +607,7 @@ set(LORRAX_FFI_SOURCES
     common/api.cc
     active_subspace/active_eigh.cc
     active_subspace/active_ops.cc
+    cublas/local_active_gemm_ffi.cc
     cusolvermp/context.cc
     cusolvermp/eigh_ffi.cc
     cusolvermp/batched_potrf_ffi.cc

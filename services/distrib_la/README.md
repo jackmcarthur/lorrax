@@ -89,6 +89,17 @@ exchanged when `beta == 0`. Provider routes require an exact y-minor 2-D
 `('x','y')` process grid; cuBLASMp and SLATE require it to be square, while
 PBLAS also supports rectangular grids.
 
+`gemm_plan(...)` is the fixed-shape, trace-safe surface for hot loops.  With
+`enable_active_range=True`, `plan.active_range(A, B, lo, hi, weights=...)`
+contracts only the exact live interval while retaining the full allocation
+and output sharding.  Optional `weights` has shape `(q, K)` and scales live
+contraction lanes inside the service.  Face operands use cuBLASMp descriptor
+views on CUDA.  Axis operands with replicated `K` use classic cuBLAS pointer
+views on CUDA and exact JAX panels on CPU.  Distributed face execution on CPU
+has no planned active ScaLAPACK kernel yet and refuses.  The interval API,
+restrictions, and validation are documented in
+[`active GEMM ranges`](../../docs/dev/active_gemm_ranges.md).
+
 No shared library is needed to import the package, inspect capabilities, or
 use native routes. To grant an FFI capability, point `LORRAX_FFI_SO` (CUDA)
 or `LORRAX_FFI_HOST_SO` (CPU) at a provider library that exports the handler

@@ -48,13 +48,17 @@ backend='auto', batched_route='batch_reshard')``
     plan. The default performs x/y face-to-batch exchanges, local GEMM, then
     y/x inverse exchanges; explicit ``auto`` dispatches to cuBLASMp, PBLAS or
     SLATE. ``backend='off'`` makes the staged route provider-free.
-``gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0) ->
-GemmPlan``
+``gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0,
+layout='face', enable_active_range=False) -> GemmPlan``
     Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE, for a caller
     that will call it many times from inside its own ``jax.jit``/
     ``lax.scan`` (G construction, per-tau Sigma projection).  ``GemmPlan(A,
-    B, C=None, *, out=None)`` is trace-safe: cuBLASMp only, one replicated
-    leading batch (holds k), no transpose modes.
+    B, C=None, *, out=None)`` is trace-safe. With active ranges enabled,
+    ``GemmPlan.active_range(A, B, lo, hi, C=None, *, out=None, weights=None)``
+    contracts an exact dynamic interval in the fixed-size operands. Optional
+    ``weights`` has shape ``(nq, k)``. The face layout uses cuBLASMp descriptor
+    views; the axis layout uses local cuBLAS pointer views on CUDA and bounded
+    JAX dot panels on CPU. See ``docs/dev/active_gemm_ranges.md``.
 ``factor(op, A, mesh, ...) -> FactorToken`` / ``solve(token, B)``
     Factor once, back-solve many.  The token is opaque and carries the
     handle (scalapack's ``ipiv``, cuSOLVERMp's raw buffer, SLATE's

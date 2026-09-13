@@ -205,7 +205,7 @@ hang documented at the top applies to the dilation extent 2n as well.
 | `dispatch_batched_eigh(A, mesh, backend, *, batched_route='batch_reshard')` | The one legacy entry point kept for `gw.qsgw_density`; it passes the same public route selection into `plan`. |
 | `matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N', backend='auto', batched_route='batch_reshard')` | Top-level distributed GEMM. Rank 2 uses `P('x','y')`; rank 3 uses `P(None,'x','y')`. The default stages complete local matrices; explicit `auto` uses the distributed provider chosen by `backend`. |
 | `resolve_matmul_backend(requested, mesh, *, batched_route='batch_reshard') -> str`, `MATMUL_BACKEND_CHOICES` | Raising GEMM-provider probe and its public vocabulary. `cusolvermp` is an accepted alias for `cublasmp`; `off` is legal only for the provider-free staged route. |
-| `gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0) -> GemmPlan` | Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE — the `matmul` analogue of `plan_polar_factor`. `GemmPlan(A, B, C=None, *, out=None)` is trace-safe: safe inside a caller's own `jax.jit`/`lax.scan`. |
+| `gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0, layout='face', enable_active_range=False) -> GemmPlan` | Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE — the `matmul` analogue of `plan_polar_factor`. `GemmPlan(A, B, C=None, *, out=None)` is trace-safe. Opt-in `GemmPlan.active_range(A, B, lo, hi, C=None, *, out=None, weights=None)` contracts exact dynamic intervals without changing operand allocation shapes; optional weights have shape `(nq,K)`. |
 
 Two phases and they stay two: only platform and handler guards can fire at
 resolve time — operand dtype, rank and extent are trace-time facts — so a
@@ -508,13 +508,13 @@ rank-divergent `INVALID_VALUE` and deadlock. Both are refused before the
 provider call; pretranspose into the ordinary face layout, select PBLAS/SLATE,
 or use the staged route.
 
-## Planned GEMM — a trace-safe cuBLASMp N,N call for hot loops
+## Planned GEMM — trace-safe N,N calls for hot loops
 
 `matmul()` resolves its provider and probes capability at every call. That
 is correct for an eager call site, but a caller that runs G construction
 or a per-tau Sigma projection inside its own `jax.jit`/`lax.scan` needs the
 same two-phase split `Plan`/`PolarPlan` already give the solver ops: an
-EAGER phase (dlopen, probe, mesh geometry, cuBLASMp communicator) that runs
+EAGER phase (provider resolution, mesh geometry and kernel warmup) that runs
 ONCE, and a closure built from its result that touches none of that.
 `gemm_plan`/`GemmPlan` (`distrib_la.matmul_plan`) is that split for GEMM,
 modelled directly on `plan_polar_factor`/`PolarPlan` — the one existing
@@ -522,11 +522,31 @@ precedent for driving an FFI call from inside a composed, jitted kernel.
 
 ```python
 plan = distrib_la.gemm_plan(
-    mesh, m=m, k=k, n=n, nq=nq, dtype=dtype, backend='auto')
-# ... hoisted out of the k/tau loop; by here the cuBLASMp communicator
-# exists and both kernel variants have already run once on dummy data ...
+    mesh, m=m, k=k, n=n, nq=nq, dtype=dtype, layout=layout,
+    backend='auto', enable_active_range=True)
+# ... hoisted out of the k/tau loop; by here its kernels are warm ...
 D = plan(A, B)                 # inside jit/scan: no dlopen, no probe
+D_active = plan.active_range(A, B, lo, hi, weights=w)  # w.shape == (nq, k)
 ```
+
+The exact active-interval contract, native descriptor-view design, validation
+and workspace limits are owned by [Active ranges in planned distributed
+GEMM](../dev/active_gemm_ranges.md). The service has two implementations
+behind the same opt-in method:
+
+| layout | contraction placement | active-range kernel |
+|---|---|---|
+| `face` | band axis distributed over the two-dimensional mesh | cuBLASMp; each original owner intersection is an exact descriptor view |
+| `axis`, CUDA | complete band axis local, centroid axes sharded | classic cuBLAS pointer/leading-dimension views; no packing or communication |
+| `axis`, CPU | complete band axis local, centroid axes sharded | JAX dot panels capped at 256 bands; no communication |
+
+The axis implementations have no processor exchange. CUDA applies optional
+weights to the fixed-size A tile once before the pointer-view FFI; it does not
+remove that weighted-A allocation. CPU applies weights inside only the
+selected, bounded panels. The face implementation is CUDA-only because the
+planned ScaLAPACK and SLATE GEMM providers do not exist in this tree. Thus a
+CPU `layout='face'` plan refuses by name; there is no silent fallback that
+would materialize a full matrix on each rank.
 
 Deliberately narrower than `matmul()`:
 
@@ -541,7 +561,7 @@ Deliberately narrower than `matmul()`:
   batch — flatten it into m/k/n, or call the SAME plan `ns` times in a
   small, statically unrolled Python loop. `nq=1` is a legal,
   zero-overhead rank-2-equivalent plan.
-* **cuBLASMp only, today** — `lorrax_scalapack_batched_gemm` and
+* **cuBLASMp only for the face layout, today** — `lorrax_scalapack_batched_gemm` and
   `lorrax_slate_batched_gemm` are claimed by `distrib_la.loader`'s target
   table but have no C++ definition anywhere in this tree
   (`KNOWN_LORRAX_ISSUES.md`, "services/distrib_la loader vs src/ffi" row;
@@ -549,7 +569,7 @@ Deliberately narrower than `matmul()`:
   only `CublasMpBatchedGemmFfi`). A request that `resolve_matmul_backend`
   would send to either provider refuses at `gemm_plan()` construction, by
   name, using the same capability probe `matmul()` uses.
-* **Provider route only** — `backend='off'` refuses by name.
+* **The face layout is provider-only** — `backend='off'` refuses by name.
   `batch_reshard` materializes complete A, B, C and D on every device; the
   reason to reach for a *planned* GEMM at all is a G/Sigma-sized operand
   that must never be that, so this surface never selects it.
@@ -577,7 +597,8 @@ buffer's stale content would silently be scaled by `beta` and folded into
 the result. Pass `C=` on such a plan instead, where the accumulate is
 explicit at the call site.
 
-**Verified**, `services/distrib_la/tests/test_distrib_la_matmul_plan.py`
+The full-range planned path is **verified** by
+`services/distrib_la/tests/test_distrib_la_matmul_plan.py`
 (emulated CPU mesh — the eager refusal ladder only: `backend='off'`, a
 resolved non-cuBLASMp provider, mesh topology, dtype, malformed shapes;
 real execution cannot be reached without a CUDA mesh) and
@@ -590,6 +611,17 @@ path, and across five repeated calls with fresh operands. `matmul_cublasmp`
 in the same suite (the pre-existing `matmul()` path, unchanged by this
 work) passed on the same real 2x2 mesh in the same run, confirming no
 regression.
+
+The active-range paths have separate coverage. The P4 CUDA provider tests in
+`services/distrib_la/tests/test_active_gemm_range.py` check scalar and
+per-parent bounds, owner crossings, empty intervals, nontrivial alpha/beta,
+and poisoned inactive inputs. The local tests in
+`services/distrib_la/tests/test_local_active_gemm_range.py` exercise the same
+public method on CPU and CUDA, including optional complex weights, poisoned
+inactive tails, and reuse of one compiled executable across changed bounds.
+CUDA selects the classic-cuBLAS handler; CPU selects the bounded JAX-panel
+route. See the active-range owner page for the evidence boundary; these
+service tests do not turn a CPU face layout into a supported route.
 
 ## Tests
 
@@ -1105,11 +1137,15 @@ replicated global pivot.
 
 ## Parent wavefunction contractions
 
-`gemm_plan(..., layout="face" | "axis")` resolves the carrier's contraction
-once. Face selects distributed GEMM; axis selects `local_gemm_plan`, returning
-the same `GemmPlan` interface. The default axis operands are
+`gemm_plan(..., layout="face" | "axis", enable_active_range=True)` resolves
+the carrier's full and exact-interval contractions once. Face selects the
+distributed cuBLASMp GEMM; axis selects `local_gemm_plan`, returning the same
+`GemmPlan` and `active_range` interfaces. The default axis operands are
 `A(q,m_X,k)` and `B(q,k,n_Y)`, with complete local k and output
-`D(q,m_X,n_Y)`. There is no collective in this band contraction.
+`D(q,m_X,n_Y)`. There is no collective in this band contraction. CUDA active
+intervals use local cuBLAS pointer views with a fixed XLA-owned workspace;
+CPU active intervals use bounded JAX dot panels. A CPU face-layout plan remains
+unsupported because there is no planned PBLAS/SLATE GEMM provider.
 
 For projection of a tiled centroid operator, `reduction_axis="y"` or `"x"`
 selects the corresponding local tile GEMM followed by centroid reduce-scatter.
