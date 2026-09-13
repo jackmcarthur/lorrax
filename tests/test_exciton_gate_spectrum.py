@@ -39,9 +39,10 @@ def test_gamma_gate_reports_the_overlap_spectrum():
     undiagnosable.  With the line, ``[0.9985 0.4626]`` reads immediately as one
     boundary direction lost to a cut degenerate multiplet.
     """
-    import bse.exciton_bands as eb
-
-    src = Path(eb.__file__).read_text(encoding="utf-8")
+    # This is a source assertion; importing the CLI would start a second
+    # distributed runtime inside pytest's already active local JAX process.
+    source = Path(__file__).resolve().parents[1] / "src/bse/exciton_bands.py"
+    src = source.read_text(encoding="utf-8")
     assert "overlap svals at the worst k" in src
     assert "sv_worst" in src and "k_worst" in src
 
