@@ -43,8 +43,18 @@ from jax.sharding import Mesh                                    # noqa: E402
 
 jax.config.update("jax_enable_x64", True)
 
-from bse import head_resolvent as hr                             # noqa: E402
-from common.chi_from_dipole import compute_S_omega               # noqa: E402
+@pytest.fixture(autouse=True)
+def _local_head_modules(monkeypatch):
+    """Load local algebra helpers without taking the child-driver runtime.
+
+    These tests use a one-device mesh in each pytest process.  Importing the
+    head helper during collection otherwise starts a four-rank JAX service
+    on the same port that the core GW child drivers must subsequently own.
+    """
+    global hr, compute_S_omega
+    monkeypatch.setenv("_LORRAX_JAX_DISTRIBUTED_DONE", "1")
+    from bse import head_resolvent as hr
+    from common.chi_from_dipole import compute_S_omega
 
 
 class Dims(NamedTuple):
