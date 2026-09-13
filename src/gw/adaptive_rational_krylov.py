@@ -386,7 +386,7 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                         n_grid, shortlist, n_power, cg_maxiter, cg_tol,
                         pair_shape, store_truth, block_callback=None, pair_diagonal=None,
                         absolute_residual=False, metric_support_rtol=METRIC_SUPPORT_RTOL,
-                        hybrid_candidates=False):
+                        hybrid_candidates=False, hybrid_alpha=1.):
     """Compile §§11–13's fixed-shape outer scan and per-column CG masks.
 
     The returned callable accepts runtime (operands, G0, grid, spectral_ends,
@@ -451,7 +451,8 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                         score = value * (b-s.real)/(a-s.real)
                         if hybrid_candidates:
                             distance = jnp.abs(s-jnp.clip(s.real,a,b))
-                            score = jnp.where(s.imag==0,score,jnp.sqrt(jnp.maximum(value,0))/distance)
+                            score = jnp.where(s.imag==0,score,
+                                hybrid_alpha*jnp.sqrt(jnp.maximum(value,0))/distance)
                         return q, score
 
                     qs, scores = jax.lax.map(candidate, ids)
