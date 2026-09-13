@@ -51,7 +51,10 @@ from psp.gvec_utils import (
     compute_ngkmax, reorder_to_qe,
 )
 from psp.scf_potential import build_dft_potentials
-from solvers.davidson import davidson, warmup_davidson_jit
+from solvers import plan_local_davidson
+from solvers.davidson import DEFAULT_M_MAX_FACTOR
+from solvers.davidson_fixed import CONVERGED
+from psp.dft_operators import apply_H_k_batched
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -297,16 +300,17 @@ def run_nscf(
         if verbose:
             print("\n── Davidson ──")
 
-        t1 = time.perf_counter()
-        warmup_davidson_jit(nbnd, (nspinor, ngkmax))
-        H_k0 = setup_H_k_from_kvec(kpoints[0], V_scf, vnl_setup, crystal, None,
-                                     V_loc_r=V_loc, ngkmax=ngkmax)
-        apply_H0 = make_apply_H(H_k0)
-        m_max = 4 * nbnd
-        for m in range(nbnd, m_max + nbnd, nbnd):
-            apply_H0(jnp.zeros((min(m, m_max), nspinor, ngkmax), dtype=jnp.complex128))
-        if verbose:
-            print(f"  JIT warmup: {time.perf_counter()-t1:.2f}s")
+        def apply_davidson_H(data, vectors):
+            return apply_H_k_batched(vectors, *data[:8])
+
+        def precondition_davidson(data, residual, values, vectors):
+            return make_dft_preconditioner(data[8])(residual, values)
+
+        plan = plan_local_davidson(
+            apply_davidson_H, precondition_davidson,
+            n_eig=nbnd, capacity=DEFAULT_M_MAX_FACTOR * nbnd,
+            vector_shape=(nspinor, ngkmax))
+        executable = None
 
         rank = jax.process_index()
         n_proc = jax.process_count()
@@ -320,30 +324,46 @@ def run_nscf(
             all_evecs = np.zeros((nk, nbnd, nspinor, ngkmax), dtype=np.complex128)
 
         t_dav = time.perf_counter()
-        for ik in range(nk):
-            if ik % n_proc != rank:
+        # Setup contains host-selected G-sphere shapes. Stage each round in
+        # the same order on every rank so compile agreement is respected;
+        # retain only this rank's k-point, then solve concurrently.
+        for first in range(0, nk, n_proc):
+            owned = None
+            for ik in range(first, min(first + n_proc, nk)):
+                H_k = setup_H_k_from_kvec(
+                    kpoints[ik], V_scf, vnl_setup, crystal, None,
+                    V_loc_r=V_loc, ngkmax=ngkmax, compact_vnl=True)
+                data = (H_k.T_diag, H_k.V_scf, H_k.Gx, H_k.Gy, H_k.Gz,
+                        H_k.vnl_Z, H_k.vnl_E, H_k.mask, H_k.h_diag)
+                initial, initial_h = make_pw_init(H_k.T_diag, nspinor, verbose=False)(
+                    lambda vectors: apply_davidson_H(data, vectors), nbnd)
+                del initial_h
+                if executable is None:
+                    t_compile = time.perf_counter()
+                    executable = plan.solve.lower(data, initial, tol, 100, 20).compile()
+                    if verbose:
+                        print(f"  Davidson lowering + compilation: "
+                              f"{time.perf_counter()-t_compile:.2f}s")
+                        print(f"  Davidson compiled workspace: {executable.memory_analysis()}")
+                if ik % n_proc == rank:
+                    owned = (ik, H_k, data, initial)
+            if owned is None:
                 continue
+            ik, H_k, data, initial = owned
             tk = time.perf_counter()
-            H_k = setup_H_k_from_kvec(kpoints[ik], V_scf, vnl_setup, crystal, None,
-                                        V_loc_r=V_loc, ngkmax=ngkmax)
-            apply_H = make_apply_H(H_k)
-            precond = make_dft_preconditioner(H_k.h_diag)
-            init = make_pw_init(H_k.T_diag, nspinor, verbose=False)
-
-            evals, evecs = davidson(
-                apply_H, n_eig=nbnd, precond_fn=precond, init_fn=init,
-                verbose=False, tol=tol)
-
+            evals, evecs, info = executable(data, initial, tol, 100, 20)
+            evals = np.asarray(evals)
+            if int(info.status) != CONVERGED:
+                raise RuntimeError(
+                    f"NSCF Davidson k={ik} did not converge: status="
+                    f"{int(info.status)}, iterations={int(info.iterations)}")
             eigenvalues[ik] = evals
             evecs_np = np.asarray(evecs)
             qe_evecs = reorder_to_qe(evecs_np, H_k, gvecs_per_k[ik])
-            # Pad/copy into the fixed (nbnd, nspinor, ngkmax) slot
             ng_k = qe_evecs.shape[-1]
             local_coeffs[ik, :, :, :ng_k] = qe_evecs
-
             if do_pseudobands:
                 all_evecs[ik] = evecs_np
-
             if verbose and (ik < 3 or ik == nk - 1 or (ik + 1) % 16 == 0):
                 print(f"  [rank {rank}] k={ik:3d}/{nk}: "
                       f"{time.perf_counter()-tk:.3f}s  evals[0]={evals[0]:.6f} Ry")
@@ -352,9 +372,9 @@ def run_nscf(
         # owner and every other rank left that slot zero, so the cross-rank
         # reduction is a plain sum.
         #
-        # ``all_gather_processes`` + ``.sum(0)`` is BIT-IDENTICAL to what this
-        # loop did by hand, which is why it is what landed: this workstream
-        # cannot gate ``run_nscf`` at P>1.  It is also P-LINEAR in memory —
+        # This migration retains the existing all-gather result assembly;
+        # its replacement is separate from the P4 planned-solver validation.
+        # It is P-LINEAR in memory —
         # the gather materialises ``(P, nk, nbnd, nspinor, ngkmax)`` on every
         # rank, 26 MB x P at the MoS2 4x4 / 128-band deck.  The right call is
         # ``collectives.psum_replicate(buf, mesh)``, one all-reduce and no

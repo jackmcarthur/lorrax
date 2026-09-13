@@ -114,11 +114,12 @@ def test_sentinel_is_resolved_before_both_consumers(capsys, kind):
         mv, n, n_eig=4, max_iter=max_iter, n_reorth=LZ.FULL_REORTH,
         reorth=kind, seed=3))
     line = capsys.readouterr().out
-    assert f"n_reorth={max_iter}" in line, (
-        f"the sentinel reached the announce unresolved: {line!r}")
     expect = LZ.reorth_collective_count(kind, max_iter, max_iter)
-    assert f"-> {expect} reorth all-reduces" in line, (
-        f"announced count is not the full-reorth count ({expect}): {line!r}")
+    if jax.process_index() == 0:
+        assert f"n_reorth={max_iter}" in line, (
+            f"the sentinel reached the announce unresolved: {line!r}")
+        assert f"-> {expect} reorth all-reduces" in line, (
+            f"announced count is not the full-reorth count ({expect}): {line!r}")
 
     # the mask the batched route applies is built from the RESOLVED width
     resolved = LZ.resolve_n_reorth(LZ.FULL_REORTH, max_iter)
@@ -211,8 +212,9 @@ def test_krylov_clamp_caps_at_the_vector_space(capsys):
     ev, _ = jax.block_until_ready(
         LZ.lanczos_eig_jit(mv, n, n_eig=3, max_iter=64, seed=3))
     line = capsys.readouterr().out
-    assert f"max_iter={n}" in line, (
-        f"64 iterations were not clamped to n={n}: {line!r}")
+    if jax.process_index() == 0:
+        assert f"max_iter={n}" in line, (
+            f"64 iterations were not clamped to n={n}: {line!r}")
     assert "max_iter=64" not in line
     ev = np.asarray(ev)
     assert np.all(np.isfinite(ev))
@@ -228,7 +230,8 @@ def test_block_krylov_clamp_caps_at_floor_n_over_bs(capsys):
     ev, _ = jax.block_until_ready(LZ.block_lanczos_eig_jit(
         mvb, n, n_eig=3, block_size=bs, max_iter=99, seed=5))
     line = capsys.readouterr().out
-    assert f"max_iter={n // bs}" in line, line
+    if jax.process_index() == 0:
+        assert f"max_iter={n // bs}" in line, line
     ev = np.asarray(ev)
     assert np.all(np.isfinite(ev))
     assert ev.min() > lam.min() - 1e-6, (ev.min(), lam.min())

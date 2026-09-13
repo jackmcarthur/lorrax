@@ -777,8 +777,41 @@ def _cgs2_block(Q_all, Z, sel):
     return _pass(_pass(Z))
 
 
+def _resolve_subspace_plan(plan, capacity, n_eig, *, vector_sharding=None,
+                           max_block_size=None):
+    """Resolve substrate policy before the recurrence is staged.
+
+    Distributed callers supply their plan before their outer JIT. ``False``
+    selects the fixed-shape reference arithmetic for numerical A/B gates.
+    """
+    if plan is False:
+        return None
+    if plan is None:
+        from distrib_la import plan_subspace
+        plan = plan_subspace(capacity=capacity, n_eig=n_eig,
+                             vector_sharding=vector_sharding,
+                             max_block_size=max_block_size)
+    if plan.capacity != capacity or plan.n_eig != n_eig:
+        raise ValueError(
+            f"Lanczos subspace plan requires capacity={capacity}, n_eig={n_eig}")
+    return plan
+
+
+def _planned_ritz(plan, basis, projected, active, n_eig, structured_vectors=False):
+    """Solve/reconstruct only the completed Krylov interval; no basis slice."""
+    values, coefficients = plan.eigh(projected, active)
+    template = jnp.zeros((n_eig, *basis.shape[1:]), basis.dtype)
+    vectors, _ = plan.reconstruct(
+        basis, basis, coefficients, active, template, compute_image=False)
+    if not structured_vectors:
+        vectors = vectors.reshape(n_eig, -1)
+    norms = jnp.sqrt(jnp.sum(jnp.abs(vectors)**2, axis=tuple(range(1, vectors.ndim)), keepdims=True))
+    return values, vectors / jnp.maximum(norms, 1e-15)
+
+
 def _block_lanczos_step(j, Q_all, alpha_all, beta_all, *, matvec, kind,
-                        n_slots: int, n_reorth: int, bs: int):
+                        n_slots: int, n_reorth: int, bs: int,
+                        subspace_plan=None, structured_vectors=False):
     """One block-Lanczos iteration, shared by both jitted block variants.
 
     Reads ``Q_all[j]``, writes ``alpha_all[j]``, ``beta_all[j]`` and
@@ -790,7 +823,32 @@ def _block_lanczos_step(j, Q_all, alpha_all, beta_all, *, matvec, kind,
     byte-identical bodies including the ``mgs`` fallback sweep, and a reorth
     fix applied to one of them would silently have missed the other.
     """
-    Q_j = Q_all[j]                                     # (n, bs)
+    row_basis = subspace_plan is not None
+    if row_basis:
+        Q_j = Q_all[j]
+        Z = matvec(Q_j if structured_vectors else Q_j.reshape(bs, -1)).reshape(Q_j.shape)
+        axes = tuple(range(1, Q_j.ndim))
+        overlap = lambda q, z: jnp.tensordot(jnp.conj(q), z, axes=(axes, axes))
+        combine = lambda q, c: jnp.tensordot(c.T, q, axes=(1, 0))
+        alpha_j = overlap(Q_j, Z)
+        Z = Z - combine(Q_j, alpha_j)
+        prev = jnp.maximum(j - 1, 0)
+        Z = jnp.where(j > 0, Z - combine(Q_all[prev], jnp.conj(beta_all[prev]).T), Z)
+        first = jnp.maximum(0, j - n_reorth)
+        if kind == "cgs2":
+            stop = j + int(_REORTH_INCLUDE_CURRENT)
+            Z = subspace_plan.orthogonalize(
+                Q_all.reshape(n_slots * bs, *Q_all.shape[2:]), Z,
+                (stop - first) * bs, start=first * bs)
+        else:
+            def sweep(i, z):
+                valid = i <= j if _REORTH_INCLUDE_CURRENT else i < j
+                c = jnp.where(valid, overlap(Q_all[i], z), jnp.zeros((bs, bs), z.dtype))
+                return z - combine(Q_all[i], c)
+            Z = lax.fori_loop(first, j + 1, sweep, Z)
+        Q_next, beta_j = subspace_plan.qr(Z)
+        return Q_all.at[j + 1].set(Q_next), alpha_all.at[j].set(alpha_j), beta_all.at[j].set(beta_j)
+    Q_j = Q_all[j]  # (n, bs)
     # Block matvec over (bs, n) → (bs, n); transpose to (n, bs).
     Z = matvec(Q_j.T).T
 
@@ -1058,8 +1116,15 @@ def lanczos_eig_jit(
     seed: int = 42,
     n_reorth: int = FULL_REORTH,
     reorth: str | None = None,
+    subspace_plan=None,
+    vector_shape=None,
+    structured_vectors=False,
 ) -> tuple[jax.Array, jax.Array]:
     """JIT-compiled Lanczos using lax.fori_loop.
+
+    ``subspace_plan`` declares active algebra and vector placement; distributed
+    callers resolve it before their outer JIT. Its capacity is ``max_iter+1``
+    after the dimension clamp. See ``docs/services/lanczos.md``.
 
     Parameters
     ----------
@@ -1098,6 +1163,10 @@ def lanczos_eig_jit(
     # Krylov-exhaustion clamp, then the sentinel — in that order, because the
     # window resolves against the depth the loop can actually reach.
     max_iter = max(1, min(int(max_iter), int(n)))
+    subspace_plan = _resolve_subspace_plan(subspace_plan, max_iter + 1, n_eig)
+    vector_shape = (int(n),) if vector_shape is None else tuple(vector_shape)
+    if int(np.prod(vector_shape)) != int(n):
+        raise ValueError('Lanczos vector_shape must contain n elements')
     n_reorth = resolve_n_reorth(n_reorth, max_iter)
     kind = reorth_kind(reorth)
     _announce_reorth("lanczos_eig_jit", kind, max_iter, n_reorth)
@@ -1106,11 +1175,15 @@ def lanczos_eig_jit(
 
     q0 = jax.random.normal(k1, (n,), dtype=jnp.float64)
     q0 = q0 + 1j * jax.random.normal(k2, (n,), dtype=jnp.float64)
-    q0 = q0 / jnp.linalg.norm(q0)
+    if structured_vectors:
+        q0 = q0.reshape(vector_shape)
+    q0 = q0 / jnp.sqrt(jnp.sum(jnp.abs(q0)**2))
 
     # +1 column so the last iteration does not overwrite Q[:, max_iter-1] (P1).
-    Q = jnp.zeros((n, max_iter + 1), dtype=jnp.complex128)
-    Q = Q.at[:, 0].set(q0)
+    row_basis = subspace_plan is not None
+    Q = jnp.zeros(((max_iter + 1, *vector_shape) if row_basis else (n, max_iter + 1)),
+                  dtype=jnp.complex128)
+    Q = Q.at[0].set(q0.reshape(vector_shape)) if row_basis else Q.at[:, 0].set(q0)
     alpha = jnp.zeros((max_iter,), dtype=jnp.float64)
     beta = jnp.zeros((max_iter,), dtype=jnp.float64)
     # |Im α_j| — carried alongside α, checked once after the loop.  Two extra
@@ -1123,35 +1196,44 @@ def lanczos_eig_jit(
 
         # ONE complex dot product.  ``.real`` drives the recurrence; ``.imag``
         # is the Hermitian-form residual that used to be discarded here.
-        alpha_c = jnp.vdot(q_prev, z)
+        alpha_c = jnp.sum(jnp.conj(q_prev) * z)
         alpha_j = alpha_c.real
         alpha = alpha.at[j].set(alpha_j)
         alpha_im = alpha_im.at[j].set(jnp.abs(alpha_c.imag))
 
         z = z - alpha_j * q_prev
-        q_prev_prev = Q[:, jnp.maximum(j - 1, 0)]
+        q_prev_prev = (Q[jnp.maximum(j - 1, 0)].reshape(q_prev.shape) if row_basis
+                       else Q[:, jnp.maximum(j - 1, 0)])
         beta_prev = jnp.where(j > 0, beta[j - 1], 0.0)
         z = z - beta_prev * q_prev_prev
 
         if kind == "cgs2":
             # Same basis window as the sweep below, two batched passes, two
             # collectives — see the route section at the top of this module.
-            z = _cgs2_vec(Q, z, _reorth_window(j, max_iter + 1, n_reorth))
+            if row_basis:
+                first = jnp.maximum(0, j - n_reorth)
+                stop = j + int(_REORTH_INCLUDE_CURRENT)
+                z = subspace_plan.orthogonalize(
+                    Q, z.reshape(1, *vector_shape), stop - first,
+                    start=first).reshape(q_prev.shape)
+            else:
+                z = _cgs2_vec(Q, z, _reorth_window(j, max_iter + 1, n_reorth))
         else:
             def reorth_body(i, z_acc):
                 valid = i <= j if _REORTH_INCLUDE_CURRENT else i < j
-                q_i = Q[:, i]
-                proj = jnp.where(valid, jnp.vdot(q_i, z_acc), 0.0 + 0j)
+                q_i = Q[i].reshape(q_prev.shape) if row_basis else Q[:, i]
+                proj = jnp.where(valid, jnp.sum(jnp.conj(q_i) * z_acc), 0.0 + 0j)
                 return z_acc - proj * q_i
 
             start_idx = jnp.maximum(0, j - n_reorth)
             z = lax.fori_loop(start_idx, j + 1, reorth_body, z)
 
-        beta_j = jnp.linalg.norm(z)
+        beta_j = jnp.sqrt(jnp.sum(jnp.abs(z)**2))
         beta = beta.at[j].set(beta_j)
 
         q_next = z / jnp.maximum(beta_j, 1e-15)
-        Q = Q.at[:, j + 1].set(q_next)
+        Q = (Q.at[j + 1].set(q_next.reshape(vector_shape)) if row_basis
+             else Q.at[:, j + 1].set(q_next))
 
         return (Q, alpha, beta, alpha_im, q_next)
 
@@ -1165,6 +1247,10 @@ def lanczos_eig_jit(
     off_diag = beta[:-1]
     T = T + jnp.diag(off_diag, 1) + jnp.diag(off_diag, -1)
 
+    if row_basis:
+        T = jnp.pad(T.astype(jnp.complex128), ((0, 1), (0, 1)))
+        return _planned_ritz(subspace_plan, Q, T, max_iter, n_eig, structured_vectors)
+
     evals_T, vecs_T = jnp.linalg.eigh(T)
     idx = jnp.argsort(evals_T)[:n_eig]
     eigenvalues = evals_T[idx]
@@ -1176,19 +1262,25 @@ def lanczos_eig_jit(
     return eigenvalues, eigenvectors
 
 
-def _build_block_tridiag(alpha_all, beta_all, max_iter: int, bs: int):
+def _build_block_tridiag(alpha_all, beta_all, max_iter: int, bs: int,
+                        *, capacity=None, active_blocks=None):
     """Build the block-tridiagonal T from per-iter (bs,bs) blocks.
 
     Done inside the jit by ``lax.fori_loop`` so the trace-time HLO stays
     O(1) instead of unrolling ``max_iter`` slot updates. Used by both
     the fixed-iter and convergence-driven block Lanczos paths.
     """
-    T_size = bs * max_iter
+    T_size = bs * max_iter if capacity is None else capacity
+    used = max_iter if active_blocks is None else active_blocks
     T = jnp.zeros((T_size, T_size), dtype=jnp.complex128)
+
+    def diagonal(j):
+        block = alpha_all[j]
+        return (block + block.conj().T) * 0.5 if capacity is not None else block
 
     def body(j, T):
         s = j * bs
-        T = lax.dynamic_update_slice(T, alpha_all[j], (s, s))
+        T = lax.dynamic_update_slice(T, diagonal(j), (s, s))
         # Off-diagonal beta only when j+1 < max_iter (zero alpha/beta past
         # the end keeps the slot a no-op even when j is at the boundary).
         T = lax.dynamic_update_slice(T, beta_all[j], (s + bs, s))
@@ -1196,11 +1288,13 @@ def _build_block_tridiag(alpha_all, beta_all, max_iter: int, bs: int):
             T, jnp.conj(beta_all[j]).T, (s, s + bs))
         return T
 
-    T = lax.fori_loop(0, max_iter - 1, body, T)
+    T = lax.fori_loop(0, used - 1, body, T)
     # Final diagonal block (no off-diagonal past the end).
-    s_last = (max_iter - 1) * bs
-    T = lax.dynamic_update_slice(T, alpha_all[max_iter - 1], (s_last, s_last))
-    return (T + jnp.conj(T).T) * 0.5
+    s_last = (used - 1) * bs
+    T = lax.dynamic_update_slice(T, diagonal(used - 1), (s_last, s_last))
+    # Planned off-diagonals are already conjugate partners. Hermitize only
+    # completed diagonal blocks instead of sweeping the full capacity.
+    return T if capacity is not None else (T + jnp.conj(T).T) * 0.5
 
 
 def block_lanczos_eig_jit(
@@ -1212,6 +1306,9 @@ def block_lanczos_eig_jit(
     seed: int = 42,
     n_reorth: int = FULL_REORTH,
     reorth: str | None = None,
+    subspace_plan=None,
+    vector_shape=None,
+    structured_vectors=False,
 ) -> tuple[jax.Array, jax.Array]:
     """JIT-compiled block Lanczos using ``lax.fori_loop``.
 
@@ -1269,6 +1366,12 @@ def block_lanczos_eig_jit(
     """
     bs = int(block_size)
     max_iter = max(1, min(int(max_iter), int(n) // bs))
+    subspace_plan = _resolve_subspace_plan(
+        subspace_plan, (max_iter + 1) * bs, n_eig,
+        max_block_size=max(bs, n_eig))
+    vector_shape = (int(n),) if vector_shape is None else tuple(vector_shape)
+    if int(np.prod(vector_shape)) != int(n):
+        raise ValueError('Lanczos vector_shape must contain n elements')
     n_reorth = resolve_n_reorth(n_reorth, int(max_iter))
     T_size = bs * int(max_iter)
     kind = reorth_kind(reorth)
@@ -1279,13 +1382,18 @@ def block_lanczos_eig_jit(
     k1, k2 = jax.random.split(key)
     Q0 = (jax.random.normal(k1, (n, bs), dtype=jnp.float64)
           + 1j * jax.random.normal(k2, (n, bs), dtype=jnp.float64))
-    Q0, _ = jnp.linalg.qr(Q0)                          # (n, bs)
+    Q0 = (subspace_plan.qr(Q0.T.reshape(bs, *vector_shape))[0]
+          if subspace_plan is not None else jnp.linalg.qr(Q0)[0])
 
-    # Ring buffer of all Q-blocks: (max_iter + 1, n, bs) — the +1 slot holds the
+    # All Q-blocks: planned (max_iter + 1, bs, n), reference (M+1,n,bs).
+    # The +1 slot holds the
     # final Q_next so the last iteration does NOT overwrite Q_{max_iter-1} (the
     # slot-overwrite bug, solver_program P1: it corrupted the last Krylov block
     # in the eigenvector reconstruction).  alpha/beta: (max_iter, bs, bs).
-    Q_all = jnp.zeros((int(max_iter) + 1, n, bs), dtype=jnp.complex128)
+    row_basis = subspace_plan is not None
+    basis_shape = ((int(max_iter) + 1, bs, *vector_shape) if row_basis
+                   else (int(max_iter) + 1, n, bs))
+    Q_all = jnp.zeros(basis_shape, dtype=jnp.complex128)
     Q_all = Q_all.at[0].set(Q0)
     alpha_all = jnp.zeros((int(max_iter), bs, bs), dtype=jnp.complex128)
     beta_all = jnp.zeros((int(max_iter), bs, bs), dtype=jnp.complex128)
@@ -1293,7 +1401,8 @@ def block_lanczos_eig_jit(
     def body(j, carry):
         return _block_lanczos_step(
             j, *carry, matvec=matvec, kind=kind,
-            n_slots=int(max_iter) + 1, n_reorth=n_reorth, bs=bs)
+            n_slots=int(max_iter) + 1, n_reorth=n_reorth, bs=bs,
+            subspace_plan=subspace_plan, structured_vectors=structured_vectors)
 
     Q_all, alpha_all, beta_all = lax.fori_loop(
         0, int(max_iter), body, (Q_all, alpha_all, beta_all))
@@ -1303,7 +1412,12 @@ def block_lanczos_eig_jit(
                      form="block")
 
     # Block-tridiagonal T built inside-jit (no Python loop unroll).
-    T = _build_block_tridiag(alpha_all, beta_all, int(max_iter), bs)
+    T = _build_block_tridiag(
+        alpha_all, beta_all, int(max_iter), bs,
+        capacity=subspace_plan.capacity if row_basis else None)
+    if row_basis:
+        return _planned_ritz(subspace_plan, Q_all.reshape(-1, *vector_shape), T,
+                             max_iter * bs, n_eig, structured_vectors)
 
     evals_T, vecs_T = jnp.linalg.eigh(T)
     idx = jnp.argsort(evals_T)[:n_eig]
@@ -1331,6 +1445,9 @@ def block_lanczos_eig_jit_converged(
     seed: int = 42,
     n_reorth: int = FULL_REORTH,
     reorth: str | None = None,
+    subspace_plan=None,
+    vector_shape=None,
+    structured_vectors=False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Convergence-driven block Lanczos via ``lax.while_loop``.
 
@@ -1360,6 +1477,12 @@ def block_lanczos_eig_jit_converged(
     # past floor(n/bs) blocks the residual collapses and QR manufactures
     # junk directions with arbitrary (even sub-spectrum) Ritz values.
     M = max(1, min(int(max_iter), int(n) // bs))
+    subspace_plan = _resolve_subspace_plan(
+        subspace_plan, (M + 1) * bs, n_eig,
+        max_block_size=max(bs, n_eig))
+    vector_shape = (int(n),) if vector_shape is None else tuple(vector_shape)
+    if int(np.prod(vector_shape)) != int(n):
+        raise ValueError('Lanczos vector_shape must contain n elements')
     T_size = bs * M
     n_reorth = resolve_n_reorth(n_reorth, M)
     kind = reorth_kind(reorth)
@@ -1372,10 +1495,14 @@ def block_lanczos_eig_jit_converged(
     k1, k2 = jax.random.split(key)
     Q0 = (jax.random.normal(k1, (n, bs), dtype=jnp.float64)
           + 1j * jax.random.normal(k2, (n, bs), dtype=jnp.float64))
-    Q0, _ = jnp.linalg.qr(Q0)
+    Q0 = (subspace_plan.qr(Q0.T.reshape(bs, *vector_shape))[0]
+          if subspace_plan is not None else jnp.linalg.qr(Q0)[0])
 
     # +1 Krylov slot so the final block does not overwrite Q_{M-1} (P1).
-    Q_all = jnp.zeros((M + 1, n, bs), dtype=jnp.complex128).at[0].set(Q0)
+    row_basis = subspace_plan is not None
+    basis_shape = (M + 1, bs, *vector_shape) if row_basis else (M + 1, n, bs)
+    Q_all = jnp.zeros(basis_shape, dtype=jnp.complex128)
+    Q_all = Q_all.at[0].set(Q0)
     alpha_all = jnp.zeros((M, bs, bs), dtype=jnp.complex128)
     beta_all = jnp.zeros((M, bs, bs), dtype=jnp.complex128)
     last_evals = jnp.full((n_eig,), jnp.inf, dtype=jnp.float64)
@@ -1384,7 +1511,8 @@ def block_lanczos_eig_jit_converged(
     def step(j, Q_all, alpha_all, beta_all):
         return _block_lanczos_step(
             j, Q_all, alpha_all, beta_all, matvec=matvec, kind=kind,
-            n_slots=M + 1, n_reorth=n_reorth, bs=bs)
+            n_slots=M + 1, n_reorth=n_reorth, bs=bs,
+            subspace_plan=subspace_plan, structured_vectors=structured_vectors)
 
     def cond(state):
         j, _, _, _, _, conv = state
@@ -1404,11 +1532,16 @@ def block_lanczos_eig_jit_converged(
 
         def _check_branch(args):
             alpha_all, beta_all, last_evals, j_done = args
-            T = _mask_inactive_tail(
-                _build_block_tridiag(alpha_all, beta_all, M, bs),
-                (j_done + 1) * bs)                            # completed iters × bs
-            ev = jnp.linalg.eigvalsh(T)
-            ev = jnp.sort(ev)[:n_eig]
+            if row_basis:
+                T = _build_block_tridiag(
+                    alpha_all, beta_all, M, bs,
+                    capacity=subspace_plan.capacity, active_blocks=j_done + 1)
+                ev, _ = subspace_plan.eigh(T, (j_done + 1) * bs)
+            else:
+                T = _mask_inactive_tail(
+                    _build_block_tridiag(alpha_all, beta_all, M, bs),
+                    (j_done + 1) * bs)
+                ev = jnp.sort(jnp.linalg.eigvalsh(T))[:n_eig]
             scale = jnp.maximum(jnp.abs(ev), atol)
             delta = jnp.max(jnp.abs(ev - last_evals) / scale)
             new_conv = delta < rtol
@@ -1432,6 +1565,14 @@ def block_lanczos_eig_jit_converged(
     # contribute 0 to both the deviation and the scale — no mask needed.
     _emit_alpha_herm("block_lanczos_eig_jit_converged",
                      *_block_alpha_stats(alpha_all), form="block")
+
+    if row_basis:
+        T = _build_block_tridiag(
+            alpha_all, beta_all, M, bs,
+            capacity=subspace_plan.capacity, active_blocks=j_final)
+        values, vectors = _planned_ritz(
+            subspace_plan, Q_all.reshape(-1, *vector_shape), T, j_final * bs, n_eig, structured_vectors)
+        return values, vectors, j_final
 
     # Final eigh — same inactive-tail mask as the convergence check.
     T = _mask_inactive_tail(

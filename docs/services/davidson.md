@@ -1,11 +1,12 @@
-# Planned local Davidson
+# Planned Davidson
 
-`solvers.plan_local_davidson` builds a complex128 Davidson solver for one
-Hamiltonian on one CUDA device. The complete solve is a single compiled
+`solvers.plan_davidson` builds a complex128 Davidson solver with fixed
+capacity and explicit operator data. `plan_local_davidson` specializes the
+same implementation to one Hamiltonian on one device. The complete solve is a single compiled
 `lax.while_loop`; different k-points are explicit data arguments to that
 same executable. Its native operations enter through
-[`distrib_la`](distrib_la.md). The existing `solvers.davidson` API supports
-host-driven and distributed callers.
+[`distrib_la`](distrib_la.md). The `solvers.davidson` host API delegates to this same implementation;
+there is no growing-shape production Davidson loop or shape-warmup ladder.
 
 ## API
 
@@ -35,16 +36,38 @@ positive scalar tolerance are dynamic arguments, not compilation keys.
 
 The operator must accept full `n_eig` blocks and power-of-two tail widths.
 Only retained corrections are sent to it. The preconditioner receives a
-full residual block. Neither callback may contain inter-rank collectives:
-independent Hamiltonians can take different numbers of iterations. This
-local route refuses distributed vector operands, also under an outer JIT.
-CPU and distributed-vector Davidson remain outside this route's contract.
+full residual block. For an independent local k-point solve, callbacks must not contain inter-rank
+collectives: those solves can stop at different iterations. For distributed
+vectors, pass `vector_sharding=NamedSharding(mesh, P(None, "x", "y", None))`
+to `plan_davidson`. The first axis is the replicated subspace row axis;
+trailing vector axes retain that layout in every persistent buffer. Explicit
+shard maps flatten only each rank's local vector tile. CGS2 uses two batched
+reductions of coefficient panels, never a vector gather. Incremental projection
+reduces only new matrix entries so retained global entries are not counted P times.
+Correction and normalization conditional outputs explicitly retain vector
+sharding. Without these constraints, GSPMD gathered whole correction blocks
+at conditional boundaries despite correctly sharded final outputs. The P4
+diagonal-operator HLO regression checks synchronous and asynchronous gather
+names and exercises shaped X/Y vector axes.
+
+The CPU service uses active NumPy BLAS/LAPACK callbacks as a compatibility
+implementation. It preserves fixed compiled shapes and active arithmetic, but
+host transfer costs and private LAPACK workspace are not covered by the CUDA
+memory/performance contract. There is no silent GPU-to-CPU fallback.
+
+For the host convenience API, pass `data=payload` and callbacks taking that
+payload first when arrays are distributed; closing over non-addressable arrays
+is not supported by JAX. `LAST_RUN` records a final snapshot with explicit
+status, rather than per-iteration host transfers. Native callers should use
+`DavidsonInfo` directly.
 
 `DavidsonInfo` contains `status`, `iterations`, `matvecs`, `restarts`,
 `active_size`, and per-root residual norms. CONVERGED means every norm is
 less than `tolerance * max(1, abs(eigenvalue))`. Other statuses distinguish
 an exhausted iteration budget, no independent directions, a deficient
-initial block, nonfinite computation, and an invalid tolerance. Inspect the
+initial block, nonfinite computation, an invalid tolerance, and a stalled residual. The optional dynamic fifth
+argument `stall_patience` stops after that many iterations without a 1%
+reduction of the largest residual (zero disables it). Inspect the
 status: an invalid initial block or zero iteration budget does not return
 certified Ritz pairs. Matvec counts include initial vectors.
 
@@ -68,9 +91,9 @@ The handlers copy small dimension descriptors to the host and synchronize
 the stream. Thus the Python iteration is fully staged, but native calls
 still have host size synchronization; this is not a host-free CUDA graph.
 
-Projection updates only new rows/columns. CGS2 and Ritz reconstruction use
-only the active prefix. Rank discovery shares the legacy solver's relative
-Gram cutoff; subsequent normalization processes only retained directions.
+Projection updates only new rows/columns. CGS2 accepts an active count and optional window start; Ritz reconstruction
+uses only the active prefix. Rank discovery uses the shared relative
+Gram cutoff in `solvers/subspace_numerics.py`; subsequent normalization processes only retained directions.
 The H application decomposes a partial block into exact power-of-two pieces.
 There is no projected eigensolve or vector GEMM over the unused capacity.
 
@@ -98,3 +121,25 @@ data, rank-one correction tails, poisoned inactive storage, and distributed
 input refusal. The PSP benchmarks use the production Hamiltonian application;
 they are solver comparisons, not a QE total-potential certification or a
 certification of the complete NSCF writer/scheduler.
+
+## Shared subspace service
+
+`distrib_la.plan_subspace(capacity=..., n_eig=..., vector_sharding=...,
+max_block_size=...)` owns provider resolution for Davidson and Lanczos.
+`max_block_size` defaults to `n_eig`; Lanczos declares its correction width
+separately when it differs from the requested Ritz-vector count. `start` and
+`active` arguments mean interval start and **count**, including an empty window.
+The provider includes active Gram, reconstruction, CGS2, projected eigensolve,
+aliased store and incremental projection operations.
+
+The same service provides stable block TSQR for Lanczos. Each rank factors
+its local vector tile, exchanges only reduced R factors, and applies its
+small factor from the stacked-R QR. Nearly dependent blocks do not use
+normal equations. `qr_stacked_r` bounds the replicated coefficient stack;
+QR backend temporaries appear in the compiled memory schedule. Local tiles
+shorter than the block width contribute their reduced R height.
+
+Native-provider consumers must rebuild the canonical provider with this
+source revision: active Gram is a new target, and the window descriptors
+for reconstruction/CGS2 have changed. The provider probe refuses a missing
+target; it does not silently select padded math or a CPU fallback.

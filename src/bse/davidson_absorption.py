@@ -36,7 +36,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from solvers.davidson import davidson, warmup_davidson_jit
+from solvers.davidson import davidson
 from .absorption_common import (exciton_dipole_projections, slice_dipole_to_bse_window, write_eigenvalues_dat)
 from file_io.restart_bundle import (load_dipole_h5)
 from .bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace
@@ -136,7 +136,7 @@ def main(argv=None):
     # Multi-host: jit closures over sharded arrays raise
     # "Closing over jax.Array that spans non-addressable devices".
     # Pass psi_*, eps_*, W_R, V_q0 as arguments to the jit'd function;
-    # the outer apply_H is plain python that forwards them at call time.
+    # the whole Davidson solve receives those arrays through explicit data.
     @jax.jit
     def matvec_scan(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y):
         def body(carry, x_one):
@@ -146,9 +146,11 @@ def main(argv=None):
         _, HX = jax.lax.scan(body, None, X)
         return HX
 
-    def apply_H(X):
-        return matvec_scan(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                           eps_c, eps_v, W_R, V_q0, M_X, M_Y)
+    operator_data = (psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                     eps_c, eps_v, W_R, V_q0, M_X, M_Y)
+
+    def apply_H(solver_data, X):
+        return matvec_scan(X, *solver_data[0])
 
     # ── Initial subspace ───────────────────────────────────────────────
     V0 = init_bse_subspace(
@@ -166,16 +168,17 @@ def main(argv=None):
         eps_c, eps_v, epsilon_shift=1e-3, sharding=delta_E_sh,
     )
 
-    # ── Warmup Ritz JIT at all subspace sizes ─────────────────────────
-    warmup_davidson_jit(
-        args.n_eig, (nc_pad, nv_pad, nk),
-        m_max=4 * args.n_eig, dtype=jnp.complex128, sharding=sh.X,
-    )
+    solver_data = (operator_data, precond_fn.data)
+    precond_apply = precond_fn.apply
+
+    def apply_precond(payload, R, values, X):
+        return precond_apply(payload[1], R, values, X)
 
     # ── Davidson ────────────────────────────────────────────────────
     t0 = time.time()
     eigvals, eigvecs = davidson(
-        apply_H, n_eig=args.n_eig, precond_fn=precond_fn, X0=V0,
+        apply_H, n_eig=args.n_eig, precond_fn=apply_precond, X0=V0,
+        data=solver_data,
         m_max=4 * args.n_eig, max_iter=args.max_iter, tol=args.tol,
         verbose=rank0,
     )

@@ -19,15 +19,15 @@ that span devices belonging to other processes. The helpers below therefore:
 - ``init_bse_subspace`` calls ``multihost_utils.process_allgather`` on the
   eps tensors before reading them on host. Each process replicates the
   full eps; this is cheap (eps is tiny, ~kilobytes).
-- ``bse_diagonal_precond`` closes only over a python-side ``delta_E_host``
-  (numpy) and rebuilds the device tensor inside the jit'd function from
-  ``eps_c`` and ``eps_v`` passed at *call time* — the closure does not
-  capture any global jax.Array.
+- ``bse_diagonal_precond`` separates its array ``data`` from its jitted
+  ``apply`` callable. Planned solvers pass that data explicitly; ``__call__``
+  retains the host convenience interface for existing callers.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import partial
-from typing import Optional
+from typing import Callable, Optional
 import weakref
 
 import jax
@@ -441,6 +441,21 @@ def build_bse_exact_diagonal(
 #  Diagonal preconditioner: 1 / (ΔE − λ + ε)
 # ═══════════════════════════════════════════════════════════════════════
 
+@dataclass(frozen=True)
+class BSEDiagonalPreconditioner:
+    """A diagonal preconditioner with explicit distributed array operands.
+
+    ``apply(data, R, Lambda, X=None)`` is suitable inside a whole-solver JIT.
+    ``preconditioner(R, Lambda, X=None)`` is the host convenience form.
+    """
+
+    data: tuple
+    apply: Callable
+
+    def __call__(self, R, Lambda, X=None):
+        return self.apply(self.data, R, Lambda, X)
+
+
 def bse_diagonal_precond(
     eps_c,
     eps_v,
@@ -459,11 +474,10 @@ def bse_diagonal_precond(
 
     Multi-process safety
     --------------------
-    The jit'd ``_impl`` does NOT close over ``eps_c`` / ``eps_v``; instead
-    the outer plain-Python ``precond_fn`` captures them and forwards as
-    arguments at call time. This avoids the "Closing over jax.Array that
-    spans non-addressable devices" runtime error multi-process JAX raises
-    when sharded arrays are baked into a jit closure.
+    The returned object's ``data`` holds eps_c, eps_v, and optional diag_H.
+    Its ``apply(data, R, Lambda, X=None)`` callable closes only over static
+    settings. Pass both parts explicitly to a planned solver; calling the
+    convenience ``__call__`` inside a new JIT would capture its data.
 
     Parameters
     ----------
@@ -476,11 +490,13 @@ def bse_diagonal_precond(
 
     Returns
     -------
-    precond_fn : (R, Lambda) → P
-        R, P shape (m, nc, nv, nk); Lambda shape (m,).
+    precond_fn : BSEDiagonalPreconditioner
+        Callable as (R, Lambda, X=None) → P. R, P shape (m, nc, nv, nk);
+        Lambda shape (m,). Its data/apply split supports whole-solver JIT.
     """
     @jax.jit
-    def _impl(R, Lambda, eps_c_in, eps_v_in, diag_in, X):
+    def _impl(data, R, Lambda, X=None):
+        eps_c_in, eps_v_in, diag_in = data
         if diag_in is None:
             # ΔE[c, v, k] = E_c[k] − E_v[k]; same convention as bse_simple's
             # D term.  The BARE route: correct, cheap, and an approximation.
@@ -522,13 +538,10 @@ def bse_diagonal_precond(
                                  keepdims=True))
         return P_out / jnp.maximum(norms, 1e-30)
 
-    def precond_fn(R, Lambda, X=None):
-        return _impl(R, Lambda, eps_c, eps_v, diag_H, X)
-
-    return precond_fn
+    return BSEDiagonalPreconditioner((eps_c, eps_v, diag_H), _impl)
 
 
-__all__ = ["init_bse_subspace", "bse_diagonal_precond",
+__all__ = ["init_bse_subspace", "bse_diagonal_precond", "BSEDiagonalPreconditioner",
            "build_bse_exact_diagonal", "clear_exact_diagonal_memo",
            "exact_diagonal_memo_stats", "resolve_precond_route",
            "EXACT_PRECOND_AUTO_MIN_DIM"]

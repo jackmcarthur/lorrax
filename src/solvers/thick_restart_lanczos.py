@@ -52,9 +52,10 @@ at more than one shape:
   reused for every subsequent cycle by an outer ``lax.fori_loop``;
 * one program for the final Ritz reconstruction.
 
-Contrast ``solvers.davidson``, whose subspace grows ``n_eig, 2·n_eig, …`` and
-which therefore traces ``_ritz_and_residuals`` and ``_ortho_expand`` once per
-subspace width.
+The planned Davidson solver now uses the same fixed-capacity service.
+The original host-driven Davidson implementation specialized its Ritz and
+orthogonalization kernels at each growing subspace width; that historical
+baseline motivated the shared active-algebra interface.
 
 THE ARROWHEAD, WHICH IS THE WHOLE METHOD
 ----------------------------------------
@@ -70,9 +71,10 @@ retained information.
 ORTHOGONALISATION
 -----------------
 Full reorthogonalisation against every slot ``i ≤ j``, by two classical
-Gram-Schmidt passes (CGS2) written as GEMMs — the machinery from
-``perf/reorth-batch-2026-08-08``, transplanted rather than re-derived, with the
-window mask set to ``arange(m_max+1) <= j``.  This is **two collectives per
+Gram-Schmidt passes (CGS2). The active subspace service contracts only that
+prefix, retaining the batched-reduction design from
+``perf/reorth-batch-2026-08-08``. The fixed-shape reference uses a mask
+``arange(m_max+1) <= j`` instead. This is **two collectives per
 Lanczos step** carrying an ``(m_max+1,)`` payload, against the shipped MGS
 sweep's ``j+1`` collectives each carrying a 16-byte scalar.  Thick restart does
 not merely benefit from this, it *requires* full reorthogonalisation: the
@@ -161,9 +163,14 @@ def thick_restart_lanczos_eig(
     dtype=jnp.complex128,
     X0: jax.Array | None = None,
     sharding=None,
+    subspace_plan=None,
     _drop_arrowhead: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Lowest ``n_eig`` eigenpairs by thick-restart Lanczos.
+
+    The active-algebra plan has capacity ``m_max+1`` and returns ``n_keep``
+    pairs for restart. Its native contractions skip uninitialized/stale basis
+    slots. ``subspace_plan=False`` retains the padded reference arithmetic.
 
     Parameters
     ----------
@@ -218,6 +225,9 @@ def thick_restart_lanczos_eig(
 
     tr = tuple(int(t) for t in trailing_shape)
     M = m_max + 1                      # +1 slot for the residual vector
+    from solvers.lanczos import _resolve_subspace_plan
+    subspace_plan = _resolve_subspace_plan(
+        subspace_plan, M, n_keep, vector_sharding=sharding)
 
     # ── starting vector ────────────────────────────────────────────────
     if X0 is not None:
@@ -252,7 +262,8 @@ def thick_restart_lanczos_eig(
         # Full reorthogonalisation subsumes the -beta_{j-1} q_{j-1} term AND
         # the arrowhead couplings to the retained Ritz block, which is why
         # thick restart needs it rather than merely benefiting from it.
-        z = _cgs2(Q, z, _window(j, M))
+        z = (_cgs2(Q, z, _window(j, M)) if subspace_plan is None else
+             subspace_plan.orthogonalize(Q, z[None], j + 1)[0])
         b = jnp.sqrt(jnp.sum(jnp.abs(z) ** 2)).real
         beta = beta.at[j].set(b)
         Q = Q.at[j + 1].set(z / jnp.maximum(b, 1e-300))
@@ -295,15 +306,23 @@ def thick_restart_lanczos_eig(
         """
         _tally('restart')
         T = 0.5 * (T + jnp.conj(T).T)
-        theta, Y = jnp.linalg.eigh(T)
-        theta_k = theta[:n_keep]
-        Y_k = Y[:, :n_keep]                       # (m_max, n_keep)
-        # New basis vectors are Ritz vectors of the OLD basis.
-        Qk = jnp.einsum('mn,m...->n...', Y_k, Q[:m_max], optimize=True)
-        # Slot n_keep is the residual vector the last step produced.
-        Q_new = (jnp.zeros_like(Q)
-                 .at[:n_keep].set(Qk)
-                 .at[n_keep].set(Q[m_max]))
+        if subspace_plan is None:
+            theta, Y = jnp.linalg.eigh(T)
+            theta_k = theta[:n_keep]
+            Y_k = Y[:, :n_keep]
+            Qk = jnp.einsum('mn,m...->n...', Y_k, Q[:m_max], optimize=True)
+            Q_new = (jnp.zeros_like(Q)
+                     .at[:n_keep].set(Qk)
+                     .at[n_keep].set(Q[m_max]))
+        else:
+            theta_k, Y_k = subspace_plan.eigh(
+                jnp.pad(T, ((0, 1), (0, 1))), m_max)
+            template = jnp.zeros((n_keep,) + tr, dtype)
+            Qk, _ = subspace_plan.reconstruct(
+                Q, Q, Y_k, m_max, template, compute_image=False)
+            # Unused old slots need no zero sweep: the next cycle's active
+            # interval excludes them until each is replaced by a new vector.
+            Q_new = Q.at[:n_keep].set(Qk).at[n_keep].set(Q[m_max])
         # s_i = beta_last * conj(Y[m_max-1, i]) — the arrowhead couplings.
         s_arrow = beta_last.astype(dtype) * jnp.conj(Y_k[m_max - 1, :])
         if _drop_arrowhead:

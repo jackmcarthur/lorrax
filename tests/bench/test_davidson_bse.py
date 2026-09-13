@@ -37,7 +37,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 jax.config.update("jax_enable_x64", True)
 
 from common.fft_helpers import make_sharded_ifftn_3d
-from solvers.davidson import davidson, warmup_davidson_jit
+from solvers.davidson import davidson
 
 from bse.bse_io import (load_bse_data_from_restart_sharded)
 from file_io.restart_bundle import (_find_restart_file)
@@ -125,11 +125,11 @@ def _load_data_and_matvec(
     else:
         W_R = data["W_q"]
 
-    # Bind (psi_*, eps_*, W_R, V_q0) to a single-argument apply_H(X).
+    # Keep all distributed arrays in explicit operator_data for the solver.
     # Davidson hands back X with shape (m, nc, nv, nk) and sharding
     # P(None, "x", "y", None); matvec_simple already wraps that with
     # with_sharding_constraint internally and returns HX with the same
-    # spec. Pure jit on a closure preserves XLA partitioning.
+    # spec. No distributed array becomes a closed-over compiled constant.
     psi_c_X = data["psi_c_X"]
     psi_c_Y = data["psi_c_Y"]
     psi_v_X = data["psi_v_X"]
@@ -140,13 +140,13 @@ def _load_data_and_matvec(
     M_X = data["M_X"]  # hoisted V-term pair-amps (audit P3)
     M_Y = data["M_Y"]
 
-    def apply_H(X):
-        return matvec_simple(
-            X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-            eps_c, eps_v, W_R, V_q0, M_X, M_Y,
-        )
+    operator_data = (psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                     eps_c, eps_v, W_R, V_q0, M_X, M_Y)
 
-    return mesh_xy, sh, data, apply_H
+    def apply_H(solver_data, X):
+        return matvec_simple(X, *solver_data[0])
+
+    return mesh_xy, sh, data, apply_H, operator_data
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -228,7 +228,7 @@ def main():
     include_W = not args.no_W
 
     t0 = time.perf_counter()
-    mesh_xy, sh, data, apply_H = _load_data_and_matvec(
+    mesh_xy, sh, data, apply_H, operator_data = _load_data_and_matvec(
         args.input, args.n_val, args.n_cond, args.n_occ, args.eqp, include_W,
     )
     nc_pad = int(data["n_cond_pad"])
@@ -253,17 +253,11 @@ def main():
         sharding=delta_E_sh,
     )
 
-    # ── warmup the Ritz-projection JIT ───────────────────────────────
-    t1 = time.perf_counter()
-    warmup_davidson_jit(
-        args.n_eig, (nc_pad, nv_pad, nk),
-        m_max=4 * args.n_eig, dtype=jnp.complex128, sharding=sh.X,
-    )
-    # Warm up apply_H at the two batch sizes Davidson uses (n_eig and
-    # 2·n_eig … expansion). Cheap because matvec is already jit'd.
-    HV0 = apply_H(V0)
-    jax.block_until_ready(HV0)
-    print(f"JIT warmup: {time.perf_counter()-t1:.2f}s")
+    solver_data = (operator_data, precond_fn.data)
+    precond_apply = precond_fn.apply
+
+    def apply_precond(payload, R, values, X):
+        return precond_apply(payload[1], R, values, X)
 
     # ── Davidson run ────────────────────────────────────────────────
     print("\n── Davidson ──")
@@ -271,7 +265,8 @@ def main():
     eigvals, eigvecs = davidson(
         apply_H,
         n_eig=args.n_eig,
-        precond_fn=precond_fn,
+        precond_fn=apply_precond,
+        data=solver_data,
         X0=V0,
         m_max=4 * args.n_eig,
         max_iter=args.max_iter,
@@ -307,7 +302,7 @@ def main():
     rep_full = NamedSharding(mesh_xy, P())
     eigvecs_rep = jax.jit(lambda x: x, out_shardings=rep_full)(eigvecs)
     jax.block_until_ready(eigvecs_rep)
-    from solvers.davidson import _to_host as _dav_to_host
+    from common.collectives import gather_to_host as _dav_to_host
     eigvecs_np = _dav_to_host(eigvecs_rep)[:, :n_cond, :n_val, :]
     lorrax_density = np.abs(eigvecs_np) ** 2
     cos_sim = _cosine_similarity_density(lorrax_density, bgw_density)

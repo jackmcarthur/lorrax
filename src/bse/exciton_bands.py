@@ -318,6 +318,12 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
         n_reorth = max_iter
     matvec = build_bse_stack_matvec(mesh_xy, nkx, nky, nkz, kernel="bse",
                                     head_tensor=head_tensor)
+    from distrib_la import plan_subspace
+    lanczos_depth = max(1, min(int(max_iter), n_flat // int(block_size)))
+    lanczos_plan = plan_subspace(
+        capacity=(lanczos_depth + 1) * int(block_size), n_eig=n_eig,
+        max_block_size=max(int(block_size), n_eig),
+        vector_sharding=NamedSharding(mesh_xy, P(None, "x", "y", None)))
     # Filled at TRACE time by the sink below (see the module note on the
     # persistable-scan fix); the static half of the α-Hermiticity report.
     alpha_labels: list = []
@@ -345,7 +351,6 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                 extra = (D_head, M_head) if head_tensor else ()
                 HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                             eps_c, eps_v, W_R, V, M_X, M_Y, *extra)
-                HX = HX.reshape(block_size, -1)
                 return HX
 
             # The α-Hermiticity report leaves the trace as DATA, not as a host
@@ -358,7 +363,9 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
             with alpha_herm_sink() as _sink:
                 evs, _ = block_lanczos_eig_jit(
                     matvec_block, n_flat, n_eig=n_eig, block_size=block_size,
-                    max_iter=max_iter, n_reorth=n_reorth)
+                    max_iter=max_iter, n_reorth=n_reorth,
+                    subspace_plan=lanczos_plan,
+                    vector_shape=(nc_pad, nv_pad, nk), structured_vectors=True)
             _labels, _payload = split_alpha_sink(_sink)
             alpha_labels[:] = _labels
             return carry, (evs[:n_eig].real, _payload)

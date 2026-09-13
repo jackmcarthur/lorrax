@@ -1,10 +1,10 @@
-"""Planned block Davidson for one k-point on one CUDA device.
+"""Planned block Davidson with local or distributed vector storage.
 
 The complete iteration is one ``lax.while_loop`` with fixed-capacity storage.
 Only active vectors enter projections, orthogonalization, reconstruction and
 H applications. ``distrib_la`` owns the runtime-size native linear algebra;
 its small host size synchronizations are part of this explicit local route.
-The existing distributed/host Davidson interface remains separate.
+The public host interface delegates to this same iteration.
 """
 from __future__ import annotations
 
@@ -15,10 +15,10 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from distrib_la import plan_local_subspace
-from solvers.davidson import _rank_whitener
+from distrib_la import plan_subspace
+from solvers.subspace_numerics import _rank_whitener
 
-RUNNING, CONVERGED, ITERATION_LIMIT, NO_DIRECTIONS, BAD_INITIAL, NONFINITE, BAD_TOLERANCE = range(7)
+RUNNING, CONVERGED, ITERATION_LIMIT, NO_DIRECTIONS, BAD_INITIAL, NONFINITE, BAD_TOLERANCE, STALLED = range(8)
 
 
 class DavidsonInfo(NamedTuple):
@@ -42,10 +42,8 @@ class _State(NamedTuple):
     residuals: jax.Array
     matvecs: jax.Array
     restarts: jax.Array
-
-
-def _gram(a, b):
-    return jnp.einsum('i...,j...->ij', a.conj(), b)
+    best_residual: jax.Array
+    stalled: jax.Array
 
 
 def _take(a, start, size):
@@ -56,17 +54,17 @@ def _put(a, b, start):
     return jax.lax.dynamic_update_slice_in_dim(a, b, start, axis=0)
 
 
-def _active_blocks(count, block, state, operation):
+def _active_blocks(count, block, state, operation, constrain=lambda x: x):
     """Full blocks followed by binary-sized tails; no padded H application."""
     count = jnp.asarray(count, jnp.int32)
     state = jax.lax.fori_loop(
         jnp.int32(0), count // block,
-        lambda i, s: operation(i*block, block, s), state)
+        lambda i, s: constrain(operation(i*block, block, s)), constrain(state))
     offset = (count // block)*block
     for bit in reversed(range((block-1).bit_length())):
         width = 1 << bit
         use = count-offset >= width
-        state = jax.lax.cond(use, lambda s: operation(offset, width, s), lambda s: s, state)
+        state = constrain(jax.lax.cond(use, lambda s: constrain(operation(offset, width, s)), constrain, state))
         offset += jnp.where(use, width, 0).astype(jnp.int32)
     return state
 
@@ -108,16 +106,19 @@ class DavidsonPlan:
 
 
 def _whiten(p, normalizer):
-    coefficients, rank = _rank_whitener(_gram(p, p))
+    coefficients, rank = _rank_whitener(normalizer.gram(p, p, p.shape[0]))
     rank = rank.astype(jnp.int32)
     def retained(p):
         result, _ = normalizer.reconstruct(
             p, p, coefficients, p.shape[0], p, columns=rank, compute_image=False)
         return normalizer.normalize(result, rank)
-    return jax.lax.cond(rank > 0, retained, jnp.zeros_like, p), rank
+    result = jax.lax.cond(rank > 0,
+        lambda p: normalizer.constrain(retained(p)),
+        lambda p: normalizer.constrain(jnp.zeros_like(p)), p)
+    return normalizer.constrain(result), rank
 
 
-def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, data, tolerance, budget):
+def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, data, tolerance, budget, stall_patience):
     """Only small correction blocks cross conditionals; capacity buffers alias."""
     def step(st):
         v, hv, h, m = st.basis, st.images, st.projected, st.size
@@ -130,6 +131,11 @@ def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, dat
                            jnp.where(st.iterations+1 >= budget, ITERATION_LIMIT, RUNNING))
         finite = jnp.all(jnp.isfinite(e)) & jnp.all(jnp.isfinite(norms))
         status = jnp.where(finite, status, NONFINITE).astype(jnp.int32)
+        improved = jnp.max(norms) < .99*st.best_residual
+        best = jnp.where(improved, jnp.max(norms), st.best_residual)
+        stalled = jnp.where(improved, 0, st.stalled+1).astype(jnp.int32)
+        status = jnp.where((status == RUNNING) & (stall_patience > 0) &
+                           (stalled >= stall_patience), STALLED, status).astype(jnp.int32)
         restart = (status == RUNNING) & (m+block > capacity)
 
         def correction(_):
@@ -138,14 +144,17 @@ def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, dat
             p = jax.lax.cond(
                 restart, lambda p: normalizer.orthogonalize(x, p, block),
                 lambda p: subspace.orthogonalize(v, p, m), p)
+            p = normalizer.constrain(p)
             p, rank = _whiten(p, normalizer)
             hp = _active_blocks(rank, block, jnp.zeros_like(p),
-                                lambda i, w, hp: _put(hp, apply_h(data, _take(p, i, w)), i))
-            return p, hp, rank, finite_correction & jnp.all(jnp.isfinite(hp))
+                                lambda i, w, hp: _put(hp, apply_h(data, _take(p, i, w)), i),
+                                constrain=normalizer.constrain)
+            return normalizer.constrain(p), normalizer.constrain(hp), rank, finite_correction & jnp.all(jnp.isfinite(hp))
 
         p, hp, rank, finite_correction = jax.lax.cond(
             status == RUNNING, correction,
-            lambda _: (jnp.zeros_like(x), jnp.zeros_like(x), jnp.int32(0), jnp.bool_(True)), None)
+            lambda _: (normalizer.constrain(jnp.zeros_like(x)), normalizer.constrain(jnp.zeros_like(x)), jnp.int32(0), jnp.bool_(True)), None)
+        p, hp = normalizer.constrain(p), normalizer.constrain(hp)
         # These operations alias the capacity buffers. Carrying them through
         # lax.cond generated full-capacity copies even in the identity branch.
         reset_count = jnp.where(restart, block, 0).astype(jnp.int32)
@@ -157,22 +166,22 @@ def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, dat
         status = jnp.where((status == RUNNING) & (rank == 0), NO_DIRECTIONS, status)
         status = jnp.where(finite_correction, status, NONFINITE).astype(jnp.int32)
         return _State(v, hv, h, base+rank, st.iterations+1, status, x, e, norms,
-                      st.matvecs+rank, st.restarts+restart.astype(jnp.int32))
+                      st.matvecs+rank, st.restarts+restart.astype(jnp.int32), best, stalled)
     return step
 
 
-def plan_local_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape):
+def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vector_sharding=None):
     """Plan a complex128 local solver before solver compilation.
 
     ``apply_h(data, vectors)`` preserves ``(rows, *vector_shape)`` and must
     accept full blocks and power-of-two tail widths. ``precondition(data,
     residuals, eigenvalues, vectors)`` returns a full correction block.
-    Both must be JAX-traceable and free of inter-rank collectives: different
-    k-points may stop after different numbers of iterations.
+    Both must be JAX-traceable. Distributed vectors use synchronized collective
+    iterations; independent k-points use separate local plans.
 
     ``capacity >= 2*n_eig`` is explicit; no iteration changes an array shape.
     There is no hidden default capacity or persistent compilation cache.
-    This opt-in CUDA route does not replace distributed Davidson callers.
+    The service resolves CUDA active BLAS or the CPU compatibility provider.
     """
     if not isinstance(n_eig, int) or not isinstance(capacity, int):
         raise TypeError('n_eig and capacity must be Python integers')
@@ -181,11 +190,11 @@ def plan_local_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape)
         raise ValueError('vector_shape must contain positive Python integers')
     if not 1 <= n_eig <= prod(vector_shape) or capacity < 2*n_eig:
         raise ValueError('require 1 <= n_eig <= vector size and capacity >= 2*n_eig')
-    subspace = plan_local_subspace(capacity=capacity, n_eig=n_eig)
-    normalizer = plan_local_subspace(capacity=n_eig, n_eig=n_eig)
+    subspace = plan_subspace(capacity=capacity, n_eig=n_eig, vector_sharding=vector_sharding)
+    normalizer = plan_subspace(capacity=n_eig, n_eig=n_eig, vector_sharding=vector_sharding)
     block = n_eig
 
-    def solve(data, initial, tolerance=1e-8, max_iterations=100):
+    def solve(data, initial, tolerance=1e-8, max_iterations=100, stall_patience=0):
         if initial.shape != (block,)+vector_shape or initial.dtype != jnp.complex128:
             raise ValueError('initial shape/dtype differs from the declared complex128 plan')
         if jnp.ndim(tolerance) != 0 or jnp.ndim(max_iterations) != 0:
@@ -193,8 +202,15 @@ def plan_local_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape)
         if not jnp.issubdtype(jnp.asarray(max_iterations).dtype, jnp.integer):
             raise TypeError('max_iterations must be an integer')
         x, rank = _whiten(initial, normalizer)
-        hx = apply_h(data, x)
+        # A deficient seed is refused; do not apply H to its zero tail.
+        hx = normalizer.constrain(jax.lax.cond(
+            rank == block, lambda x: normalizer.constrain(apply_h(data, x)),
+            lambda x: normalizer.constrain(jnp.zeros_like(x)), x))
         v = jnp.zeros((capacity,)+vector_shape, x.dtype)
+        if vector_sharding is not None:
+            v = jax.lax.with_sharding_constraint(v, vector_sharding)
+            x = jax.lax.with_sharding_constraint(x, vector_sharding)
+            hx = jax.lax.with_sharding_constraint(hx, vector_sharding)
         v, hv = subspace.store(v, jnp.zeros_like(v), x, hx, 0, block)
         h = subspace.project(v, hv, block, jnp.zeros((capacity, capacity), x.dtype), 0, block)
         status = jnp.where(rank != block, BAD_INITIAL,
@@ -202,13 +218,24 @@ def plan_local_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape)
         status = jnp.where(jnp.isfinite(tolerance) & (tolerance > 0), status, BAD_TOLERANCE)
         status = jnp.where(jnp.all(jnp.isfinite(initial)) & jnp.all(jnp.isfinite(hx)), status, NONFINITE).astype(jnp.int32)
         state = _State(v, hv, h, jnp.int32(block), jnp.int32(0), status, x,
-                       jnp.zeros(block), jnp.full(block, jnp.inf), jnp.int32(block), jnp.int32(0))
+                       jnp.zeros(block), jnp.full(block, jnp.inf), jnp.where(rank == block, block, 0).astype(jnp.int32), jnp.int32(0), jnp.asarray(jnp.inf), jnp.int32(0))
         result = jax.lax.while_loop(
             lambda st: (st.status == RUNNING) & (st.iterations < max_iterations),
-            _make_step(apply_h, precondition, subspace, normalizer, block, capacity, data, tolerance, max_iterations), state)
+            _make_step(apply_h, precondition, subspace, normalizer, block, capacity, data, tolerance, max_iterations, stall_patience), state)
         info = DavidsonInfo(result.status, result.iterations, result.matvecs,
                             result.restarts, result.size, result.residuals)
         return result.values, result.vectors, info
 
-    solve = jax.jit(solve, in_shardings=jax.sharding.SingleDeviceSharding(jax.local_devices()[0]))
+    if vector_sharding is not None:
+        # Constrain persistent allocations inside the compiled function; only
+        # the small projected matrices and convergence scalars are replicated.
+        solve = jax.jit(solve)
+    else:
+        solve = jax.jit(solve, in_shardings=jax.sharding.SingleDeviceSharding(jax.local_devices()[0]))
     return DavidsonPlan(n_eig, capacity, vector_shape, subspace, normalizer, solve)
+
+
+def plan_local_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape):
+    """One-device specialization of :func:`plan_davidson` (same algorithm)."""
+    return plan_davidson(apply_h, precondition, n_eig=n_eig,
+                         capacity=capacity, vector_shape=vector_shape)

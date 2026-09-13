@@ -28,6 +28,7 @@ import os
 import sys
 
 import pytest
+import jax
 
 _SRC = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
@@ -140,8 +141,9 @@ def test_alpha_gate_ok_line_reports_the_ratio_and_the_tolerance(
         "lanczos_eig_jit", "vec", 3.165e-14 * _SCALE, _SCALE, 23)
     assert ok is True
     out = capsys.readouterr().out
-    assert "alpha non-Hermitian part / max|alpha| = 3.165e-14" in out
-    assert "(tol 1e-09, worst j=23)  OK" in out
+    if jax.process_index() == 0:
+        assert "alpha non-Hermitian part / max|alpha| = 3.165e-14" in out
+        assert "(tol 1e-09, worst j=23)  OK" in out
 
 
 def test_the_tolerance_is_still_the_derived_one():

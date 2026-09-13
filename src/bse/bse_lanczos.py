@@ -322,14 +322,13 @@ def solve_bse_sharded(
     else:
         W_R = data["W_q"]
 
-    # ── Davidson path: doesn't fit inside a single jit wrap (Python-side
-    # iteration + on-the-fly Ritz solve), so build matvec + W_R outside and
-    # delegate to the shape-agnostic ``solvers.davidson.davidson``.  Returns
+    # ── Davidson path: pass resident operator/preconditioner arrays as
+    # explicit operands of the fixed-capacity solve. Returns
     # the same `(eigenvalues, eigenvectors, n_iter_done)` tuple as the
     # Lanczos path so callers don't branch — see the RETURN CONVENTION note at
     # the bottom of this branch for what "the same tuple" has to mean.
     if solver_kind == "davidson":
-        from solvers.davidson import davidson, warmup_davidson_jit
+        from solvers.davidson import davidson
         from .bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace
 
         psi_c_X = data["psi_c_X"]; psi_c_Y = data["psi_c_Y"]
@@ -339,10 +338,12 @@ def solve_bse_sharded(
         M_X     = data["M_X"];     M_Y     = data["M_Y"]  # hoisted V-term pair-amps (P3)
         # W_R already built above (donated top-level ifft).
 
-        def apply_H(V):    # V: (m, nc_pad, nv_pad, nk) sharded P(None,"x","y",None)
+        operator_data = (psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                         eps_c, eps_v, W_R, V_q0, M_X, M_Y)
+
+        def apply_H(solver_data, V):
             V = jax.lax.with_sharding_constraint(V, sh.X)
-            return matvec_ring(V, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                               eps_c, eps_v, W_R, V_q0, M_X, M_Y)
+            return matvec_ring(V, *solver_data[0])
 
         bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
         # ── preconditioner route ──────────────────────────────────────
@@ -381,6 +382,12 @@ def solve_bse_sharded(
             eps_c, eps_v, sharding=NamedSharding(mesh_xy, P("x", "y", None)),
             epsilon_shift=davidson_eps_shift_Ry,
             diag_H=_diag_H, olsen=davidson_olsen)
+        solver_data = (operator_data, precond_fn.data)
+        precond_apply = precond_fn.apply
+
+        def apply_precond(payload, R, values, X):
+            return precond_apply(payload[1], R, values, X)
+
         X0 = init_bse_subspace(
             eps_c, eps_v, n_eig=n_eig,
             n_cond=int(data["n_cond"]), n_val=int(data["n_val"]),
@@ -392,7 +399,7 @@ def solve_bse_sharded(
         # LORRAX_DAV_MVSCAN=w1,w2,...  time apply_H at each block width, so
         #   the matvec-count currency can be converted to seconds honestly:
         #   a width-20 block matvec is NOT 20 independent width-1 matvecs.
-        # LORRAX_DAV_TRACE=<path.npz>  dump the per-iteration history.
+        # LORRAX_DAV_TRACE=<path.npz>  dump the final solver snapshot.
         import os as _os
         _mvscan = _os.environ.get("LORRAX_DAV_MVSCAN", "")
         if _mvscan:
@@ -403,11 +410,11 @@ def solve_bse_sharded(
             for _w in [int(x) for x in _mvscan.split(",") if x.strip()]:
                 _Vw = jnp.repeat(X0[:1], _w, axis=0) if _w > n_eig else X0[:_w]
                 _Vw = jax.lax.with_sharding_constraint(_Vw, sh.X)
-                _ = apply_H(_Vw); _.block_until_ready()          # warm
+                _ = apply_H(solver_data, _Vw); _.block_until_ready()          # warm
                 _reps = 5
                 _t0 = _t.perf_counter()
                 for _ in range(_reps):
-                    _o = apply_H(_Vw)
+                    _o = apply_H(solver_data, _Vw)
                 _o.block_until_ready()
                 _dt = (_t.perf_counter() - _t0) / _reps
                 if _per1 is None:
@@ -416,25 +423,15 @@ def solve_bse_sharded(
                       f"{(_dt/_w)/_per1:8.3f}", flush=True)
                 del _Vw, _o
 
-        # Pre-compile _ritz_and_residuals at every subspace size m ∈ {n_eig,
-        # 2·n_eig, …, m_max} so the Davidson loop does not pay 4 separate
-        # XLA compiles as the subspace grows between restarts. Compiles
-        # ~2 s otherwise; with warmup this is a one-time up-front cost.
+        # One fixed-capacity solve replaces the former shape warmup ladder.
         from solvers.davidson import DEFAULT_M_MAX_FACTOR
         m_max_warm = (int(davidson_m_max) if davidson_m_max
                       else DEFAULT_M_MAX_FACTOR * n_eig)
-        warmup_davidson_jit(
-            n_eig=n_eig,
-            trailing_shape=tuple(X0.shape[1:]),
-            m_max=m_max_warm,
-            dtype=X0.dtype,
-            sharding=bse_sharding,
-        )
-
         print(f"Davidson: m_max={m_max_warm} ({m_max_warm // n_eig}x n_eig), "
               f"storing 2*m_max = {2 * m_max_warm} trial vectors", flush=True)
         eigenvalues, eigenvectors = davidson(
-            apply_H, n_eig=n_eig, precond_fn=precond_fn, X0=X0,
+            apply_H, n_eig=n_eig, precond_fn=apply_precond, X0=X0,
+            data=solver_data,
             m_max=m_max_warm,
             max_iter=max_iter, tol=atol if atol > 0 else 1e-8,
             verbose=True,
@@ -462,33 +459,15 @@ def solve_bse_sharded(
                 n_distinct_programs=_np.asarray(len(_DAV_TRACES)),
                 total_matvec_applications=_np.asarray(_DAV_MV[0]),
             )
-            print(f"[dav-instr] history -> {_trace_path}", flush=True)
+            print(f"[dav-instr] final snapshot -> {_trace_path}", flush=True)
 
-        # ── RETURN CONVENTION ────────────────────────────────────────────────
-        # Match the Lanczos return CONVENTION, not merely its shape.  The
-        # Lanczos routes below pin ``out_shardings=(rep_eig, …)`` with
-        # ``rep_eig = NamedSharding(mesh_xy, P())``, i.e. eigenvalues and
-        # eigenvectors come back REPLICATED.  Davidson's ``X`` inherits the
-        # SOLVE sharding ``P(None,"x","y",None)`` instead (it is
-        # ``jnp.einsum('mn,m...->n...', x, V)`` over a sharded ``V``), and the
-        # reshape below does not change that.  Two solvers reachable from one
-        # ``--solver`` flag were therefore returning different layouts under one
-        # documented tuple, and every consumer that believed the docstring was
-        # holding a live grenade: ``--solver davidson --write-eigs`` died on
-        # EVERY rank at P>1 in ``bse_io.write_eigenvectors_stream``'s
-        # ``device_get`` ("Fetching value for `jax.Array` that spans
-        # non-addressable (non process local) devices").
-        #
-        # ``bse_io`` now fetches through ``gather_to_host`` and so survives any
-        # layout — but that is the WRITER being defensive, and it does not make
-        # the tuple honest for the next consumer.  This is the other half: the
-        # convention is declared here and enforced here, so "the same tuple as
-        # the Lanczos path" is true of the sharding as well as the shape.
-        # Cost: the same replicated eigenvector set the Lanczos path has always
-        # returned (n_eig × nc_pad × nv_pad × nk complex128 per rank).
-        rep_eig_dav = NamedSharding(mesh_xy, P())
-        eigenvectors = jax.jit(lambda a: a, out_shardings=rep_eig_dav)(
-            eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk))
+        # Keep the physical (c, v) axes distributed across all processors.
+        # The writer gathers explicitly when serializing eigenvectors.
+        root_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y", None))
+        eigenvectors = jax.jit(
+            lambda a: a.reshape(n_eig, 1, nc_pad, nv_pad, nk),
+            out_shardings=root_sharding,
+        )(eigenvectors)
         # ``davidson`` returns eigenvalues as a HOST numpy array (it needs them
         # on the host for its own convergence test), where Lanczos returns a
         # replicated device array.  ``replicate_to_mesh`` declares the identical
@@ -535,6 +514,9 @@ def solve_bse_sharded(
         apps = m_max + n_restarts * per_cycle
         bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
         rep_tr = NamedSharding(mesh_xy, P())
+        from distrib_la import plan_subspace
+        trlan_plan = plan_subspace(
+            capacity=m_max + 1, n_eig=n_keep, vector_sharding=bse_sharding)
 
         print(f"Thick-restart Lanczos: n_eig={n_eig} m_max={m_max} "
               f"n_keep={n_keep} restarts={n_restarts} -> {apps} matvec "
@@ -553,9 +535,8 @@ def solve_bse_sharded(
                 sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
                 sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y,
             ),
-            # Replicated out, matching the Lanczos path's contract, so
-            # --write-eigs is addressable at P>1 for this solver.
-            out_shardings=(rep_tr, rep_tr, rep_tr),
+            # Keep Ritz vectors distributed; the streaming writer owns host I/O.
+            out_shardings=(rep_tr, bse_sharding, rep_tr),
         )
         def _trlan_run(pcx, pcy, pvx, pvy, ec, ev, WR, Vq0, MX, MY):
             def apply_H(V):
@@ -566,6 +547,7 @@ def solve_bse_sharded(
                 apply_H, (nc_pad, nv_pad, nk),
                 n_eig=n_eig, m_max=m_max, n_keep=n_keep,
                 n_restarts=n_restarts, sharding=bse_sharding,
+                subspace_plan=trlan_plan,
             )
 
         eigenvalues, eigenvectors, alpha_im = _trlan_run(
@@ -578,6 +560,13 @@ def solve_bse_sharded(
         # an echo of the budget (CONVERGENCE_CENSUS recommendation 2).
         return eigenvalues, eigenvectors, jnp.int32(apps)
 
+    from distrib_la import plan_subspace
+    lanczos_vector_shape = (nc_pad, nv_pad, nk)
+    lanczos_depth = max(1, min(int(max_iter), n_flat // bs))
+    lanczos_plan = plan_subspace(
+        capacity=(lanczos_depth + 1) * bs, n_eig=n_eig,
+        max_block_size=max(bs, n_eig),
+        vector_sharding=NamedSharding(mesh_xy, P(None, "x", "y", None)))
     rep_eig = NamedSharding(mesh_xy, P())  # eigenvalues / eigenvectors come back replicated.
     # The static half of the α-Hermiticity reports the Krylov solve collects
     # (solver name + α form).  Filled at TRACE time by ``_full_run`` below and
@@ -599,7 +588,7 @@ def solve_bse_sharded(
         ),
         # Fourth entry covers the α-Hermiticity payload: a pytree prefix, so
         # ``rep_eig`` applies to each of its (replicated, scalar) leaves.
-        out_shardings=(rep_eig, rep_eig, rep_eig, rep_eig),
+        out_shardings=(rep_eig, sh.X, rep_eig, rep_eig),
         # NB: arg 6 is now W_R (already ifft'd, DONATED at its own top-level
         # boundary above) rather than W_q.  Donating it HERE is still declined
         # — there is no aliasable same-shape output of a Lanczos solve — which
@@ -626,22 +615,26 @@ def solve_bse_sharded(
                     X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                     eps_c, eps_v, W_R, V_q0, M_X, M_Y,
                 )
-                return HX.reshape(-1)
+                return HX[0]
             if rtol > 0.0:
                 # Convergence-driven path: route through the block-Lanczos
                 # while_loop with bs=1 (mathematically the same as a
                 # single-vector Lanczos with early exit).
                 def matvec_block(V_block):
-                    return matvec(V_block.reshape(-1)).reshape(1, -1)
+                    return matvec(V_block[0])[None]
                 return block_lanczos_eig_jit_converged(
                     matvec_block, n_flat, n_eig=n_eig,
                     block_size=1, max_iter=max_iter,
                     rtol=rtol, atol=atol, check_every=check_every,
                     n_reorth=n_reorth, reorth=_reorth,
+                    subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
+                    structured_vectors=True,
                 )
             evs, evecs = lanczos_eig_jit(
                 matvec, n_flat, n_eig=n_eig, max_iter=max_iter,
                 n_reorth=n_reorth, reorth=_reorth,
+                subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
+                    structured_vectors=True,
             )
             return evs, evecs, jnp.int32(N_ITER_NOT_MEASURED)
         else:
@@ -656,7 +649,6 @@ def solve_bse_sharded(
                     X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                     eps_c, eps_v, W_R, V_q0, M_X, M_Y,
                 )
-                HX = HX.reshape(bs, -1)
                 return HX
             if rtol > 0.0:
                 # Convergence-driven: ``lax.while_loop`` exits when the
@@ -666,12 +658,16 @@ def solve_bse_sharded(
                     block_size=bs, max_iter=max_iter,
                     rtol=rtol, atol=atol, check_every=check_every,
                     n_reorth=n_reorth, reorth=_reorth,
+                    subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
+                    structured_vectors=True,
                 )
             else:
                 evs, evecs = block_lanczos_eig_jit(
                     matvec_block, n_flat, n_eig=n_eig,
                     block_size=bs, max_iter=max_iter, n_reorth=n_reorth,
                     reorth=_reorth,
+                    subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
+                    structured_vectors=True,
                 )
                 return evs, evecs, jnp.int32(N_ITER_NOT_MEASURED)
 

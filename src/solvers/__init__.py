@@ -1,6 +1,6 @@
 """solvers — generic iterative eigensolvers and spectral methods (no physics dependencies)."""
-from solvers.davidson_fixed import DavidsonPlan, DavidsonInfo, plan_local_davidson
-from solvers.davidson import davidson, warmup_davidson_jit
+from solvers.davidson_fixed import DavidsonPlan, DavidsonInfo, plan_local_davidson, plan_davidson
+from solvers.davidson import davidson
 from solvers.lanczos import block_lanczos_eig, simple_lanczos_eig, lanczos_eig_jit
 from solvers.chebyshev import (
     jackson_coefficients,
@@ -17,7 +17,7 @@ from solvers.quadrature import feast_ellipse_quadrature
 __all__ = [
     "DavidsonPlan", "DavidsonInfo", "plan_local_davidson",
     "davidson",
-    "warmup_davidson_jit",
+    "plan_davidson",
     "block_lanczos_eig",
     "simple_lanczos_eig",
     "lanczos_eig_jit",
