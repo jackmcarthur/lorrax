@@ -223,7 +223,7 @@ def _gemm_attrs(*, px, py, nq, m, k, n, alpha, beta, ctx_handle,
         ctx_handle=int(ctx_handle))
 
 
-def _local_gemm_call(a, b, c, *, attrs: dict, out_t, with_c: bool):
+def _local_gemm_call(a, b, c, *, attrs: dict, out_t, with_c: bool, bounds=None):
     """The bare transpose/``ffi_call``/transpose body — LOCAL per-rank
     tiles in, LOCAL per-rank tile out, no ``shard_map`` and no ``jax.jit``
     of its own.  This is the whole GEMM: everything above it (a
@@ -237,9 +237,11 @@ def _local_gemm_call(a, b, c, *, attrs: dict, out_t, with_c: bool):
     at, bt = (jnp.transpose(x, (0, 2, 1)) for x in (a, b))
     ct = (jnp.transpose(c, (0, 2, 1)) if with_c
           else jnp.zeros(out_t.shape, dtype=out_t.dtype))
-    dt = jax.ffi.ffi_call(
-        _TARGETS["cublasmp"], out_t,
-        input_output_aliases={2: 0})(at, bt, ct, **attrs)
+    target = (_TARGETS["cublasmp"] if bounds is None
+              else "lorrax_cublasmp_active_range_gemm")
+    operands = (at, bt, ct) if bounds is None else (at, bt, ct, bounds)
+    dt = jax.ffi.ffi_call(target, out_t,
+        input_output_aliases={2: 0})(*operands, **attrs)
     return jnp.transpose(dt, (0, 2, 1))
 
 
@@ -291,6 +293,26 @@ def _build_kernel(mesh, *, px, py, nq, m, k, n, dtype, alpha, beta,
                                 with_c=False)
     _CUBLASMP_CACHE[key] = _local
     return _local
+
+
+def _build_active_kernel(plan, *, with_c):
+    """Full storage operands; exact native owner-intersection contraction."""
+    px, py = _mesh_shape(plan.mesh)
+    spec = P(None, "x", "y")
+    attrs = _gemm_attrs(px=px, py=py, nq=plan.nq, m=plan.m, k=plan.k,
+        n=plan.n, alpha=plan.alpha, beta=plan.beta,
+        ctx_handle=plan.ctx_handle, with_c=with_c)
+    out_t = jax.ShapeDtypeStruct((plan.nq, plan.n // py, plan.m // px), plan.dtype)
+
+    def apply(a, b, bounds, c):
+        return _local_gemm_call(a, b, c, attrs=attrs, out_t=out_t,
+                               with_c=with_c, bounds=bounds)
+
+    if with_c:
+        return shard_map(apply, mesh=plan.mesh,
+            in_specs=(spec, spec, P(), spec), out_specs=spec, check_vma=False)
+    return shard_map(lambda a, b, bounds: apply(a, b, bounds, None),
+        mesh=plan.mesh, in_specs=(spec, spec, P()), out_specs=spec, check_vma=False)
 
 
 def _check_local_operand(plan: "GemmPlan", label: str, x,
@@ -368,6 +390,8 @@ class GemmPlan:
     _fn_with_c: Callable = field(compare=False, hash=False)
     _fn_no_c: Callable | None = field(compare=False, hash=False)
     reduction_axis: str | None = None
+    _active_fn_with_c: Callable | None = field(default=None, compare=False, hash=False)
+    _active_fn_no_c: Callable | None = field(default=None, compare=False, hash=False)
 
     def describe(self) -> str:
         """One line for a run banner: what resolved, and to what shape."""
@@ -426,6 +450,41 @@ class GemmPlan:
         _check_operand(self, "C/out", c_or_out, (self.nq, self.m, self.n),
                       self.out_sharding)
         return self._fn_with_c(A, B, c_or_out)
+
+    def active_range(self, A, B, lo, hi, C=None, *, out=None):
+        """Contract exactly A[..., lo:hi] @ B[..., lo:hi, :] without packing.
+
+        Construct with ``enable_active_range=True``. Full input allocations
+        and their all-processor layouts stay fixed; bounds are replicated
+        integer scalars or arrays of shape (nq,). Each nonempty original contraction-owner intersection uses
+        one native descriptor view. Native reads the packed bounds to the host
+        because vendor dimensions are host scalars; no full operand moves.
+        C/out have the same beta and donation semantics as ``__call__``.
+        """
+        if self._active_fn_with_c is None:
+            raise ValueError("gemm_plan: active_range requires enable_active_range=True")
+        if C is not None and out is not None:
+            raise ValueError("gemm_plan.active_range: pass C or out, not both")
+        if out is not None and self.beta != 0:
+            raise ValueError("gemm_plan.active_range: out= requires beta==0")
+        _check_operand(self, "A", A, (self.nq, self.m, self.k), self.in_sharding_a)
+        _check_operand(self, "B", B, (self.nq, self.k, self.n), self.in_sharding_b)
+        indices = tuple(jnp.asarray(v) for v in (lo, hi))
+        if any(v.shape not in ((), (self.nq,)) or not jnp.issubdtype(v.dtype, jnp.integer)
+               for v in indices):
+            raise TypeError("gemm_plan.active_range: bounds must be integer scalars or shape(nq,)")
+        raw_bounds = jnp.stack(jnp.broadcast_arrays(*indices), axis=-1).reshape(-1, 2)
+        # Preserve invalid wide integers as a refusal, rather than wrapping
+        # (e.g. 2**32 to zero) while packing the native int32 operands.
+        valid = jnp.all((raw_bounds >= 0) & (raw_bounds <= self.k))
+        bounds = jnp.where(valid, raw_bounds, -1).astype(jnp.int32)
+        c = C if C is not None else out
+        if c is None:
+            if self._active_fn_no_c is None:
+                raise ValueError("gemm_plan.active_range: C is required when beta != 0")
+            return self._active_fn_no_c(A, B, bounds)
+        _check_operand(self, "C/out", c, (self.nq, self.m, self.n), self.out_sharding)
+        return self._active_fn_with_c(A, B, bounds, c)
 
     def local_call(self, A, B, C=None, *, out=None):
         """The SAME planned N,N GEMM as :meth:`__call__`, callable from
@@ -585,6 +644,7 @@ def gemm_plan(
     layout="face",
     reduction_axis=None,
     out_spec=None,
+    enable_active_range: bool = False,
 ) -> GemmPlan:
     """Eagerly resolve, probe, warm and COMPILE one N,N GEMM shape, ONCE.
 
@@ -638,6 +698,8 @@ def gemm_plan(
         ``beta != 0`` compiles only the donated-``C`` kernel, and every
         call must then supply ``C``.
     """
+    if enable_active_range and layout != "face":
+        raise NotImplementedError("gemm_plan active_range requires the cuBLASMp face backend")
     if layout == "axis":
         return local_gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
                                alpha=alpha, beta=beta, reduction_axis=reduction_axis, out_spec=out_spec)
@@ -686,6 +748,14 @@ def gemm_plan(
                 f"gemm_plan: {label}={extent} does not tile the "
                 f"{px}x{py} mesh (needs divisor {divisor})")
 
+    if enable_active_range:
+        if k > 2**31 - 1:
+            raise ValueError("gemm_plan active_range storage K exceeds int32 bounds")
+        from distrib_la.loader import probe_target
+        usable, reason = probe_target("lorrax_cublasmp_active_range_gemm", "CUDA")
+        if not usable:
+            raise RuntimeError(f"gemm_plan active_range unavailable: {reason}")
+
     from distrib_la._cusolvermp import get_or_init_context
     ctx_handle = get_or_init_context(mesh, col_major=False)
 
@@ -715,9 +785,26 @@ def gemm_plan(
         fn_no_c(_zeros((nq, m, k), dtype, in_sharding_a),
                _zeros((nq, k, n), dtype, in_sharding_b))
 
-    return GemmPlan(
+    plan = GemmPlan(
         mesh=mesh, backend=resolved, m=m, k=k, n=n, nq=nq, dtype=dtype,
         alpha=alpha_c, beta=beta_c,
         in_sharding_a=in_sharding_a, in_sharding_b=in_sharding_b,
         out_sharding=out_sharding, ctx_handle=int(ctx_handle),
         _fn_with_c=fn_with_c, _fn_no_c=fn_no_c)
+
+    if not enable_active_range:
+        return plan
+    from dataclasses import replace
+    fn_active_c = jax.jit(_build_active_kernel(plan, with_c=True), donate_argnums=(3,))
+    fn_active_no_c = (jax.jit(_build_active_kernel(plan, with_c=False))
+                      if beta_c == 0 else None)
+    bounds = _zeros((1, 2), jnp.int32, NamedSharding(mesh, P()))
+    bounds = bounds.at[0, 1].set(k)
+    a0 = _zeros((nq, m, k), dtype, in_sharding_a)
+    b0 = _zeros((nq, k, n), dtype, in_sharding_b)
+    jax.block_until_ready(fn_active_c(a0, b0, bounds,
+        _zeros((nq, m, n), dtype, out_sharding)))
+    if fn_active_no_c is not None:
+        jax.block_until_ready(fn_active_no_c(a0, b0, bounds))
+    return replace(plan, _active_fn_with_c=fn_active_c,
+                   _active_fn_no_c=fn_active_no_c)

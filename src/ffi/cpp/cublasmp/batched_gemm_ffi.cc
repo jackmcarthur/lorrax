@@ -19,6 +19,10 @@
 // the call is effectively in-place (D === C), which matches standard
 // BLAS semantics.
 
+#include <algorithm>
+#include <climits>
+#include <type_traits>
+#include <vector>
 #include <complex>
 #include <cstdint>
 #include <cstdio>
@@ -70,7 +74,8 @@ static ffi::Error BatchedGemmImpl(
     T alpha, T beta,
     cudaStream_t xla_stream,
     LorraxCusolverMpCtx* ctx,
-    const T* d_A, const T* d_B, const T* d_C_in, T* d_C_out)
+    const T* d_A, const T* d_B, const T* d_C_in, T* d_C_out,
+    int64_t contraction_owner = -1, int64_t contraction_offset = 0, int64_t active_k = -1)
 {
     ensure_cublasmp(ctx);
 
@@ -81,6 +86,18 @@ static ffi::Error BatchedGemmImpl(
     // sharding convention).
     const int Px = ctx->p;
     const int Py = ctx->q;
+    const bool view = contraction_owner >= 0;
+    const int64_t contraction_k = view ? active_k : k;
+    const int row = ctx->grid_layout_col_major ? ctx->rank % Px : ctx->rank / Py;
+    const int col = ctx->grid_layout_col_major ? ctx->rank / Px : ctx->rank % Py;
+    // A/B keep their original allocation strides. A view only changes the
+    // descriptor's logical band extent, owner, and base pointer.
+    if (view) {
+        if (col == contraction_owner) d_A += contraction_offset * lld_A;
+        if (row == contraction_owner) d_B += contraction_offset;
+        nb_a = active_k;
+        mb_b = active_k;
+    }
     const int64_t A_local_cols = (opA == CUBLAS_OP_N ? k : m + Py - 1) / Py;
     const int64_t B_local_cols = (opB == CUBLAS_OP_N ? n : k + Py - 1) / Py;
     const int64_t C_local_cols = (n + Py - 1) / Py;
@@ -101,19 +118,19 @@ static ffi::Error BatchedGemmImpl(
 
     cublasMpMatrixDescriptor_t descA = nullptr, descB = nullptr, descC = nullptr;
     const int64_t A_rows = (opA == CUBLAS_OP_N) ? m : k;
-    const int64_t A_cols = (opA == CUBLAS_OP_N) ? k : m;
-    const int64_t B_rows = (opB == CUBLAS_OP_N) ? k : n;
+    const int64_t A_cols = (opA == CUBLAS_OP_N) ? contraction_k : m;
+    const int64_t B_rows = (opB == CUBLAS_OP_N) ? contraction_k : n;
     const int64_t B_cols = (opB == CUBLAS_OP_N) ? n : k;
     (void)A_rows; (void)A_cols; (void)B_rows; (void)B_cols;
 
     LORRAX_CUBLASMP_CHECK(
         cublasMpMatrixDescriptorCreate(
-            A_rows, A_cols, mb_a, nb_a, 0, 0, lld_A,
+            A_rows, A_cols, mb_a, nb_a, 0, view ? contraction_owner : 0, lld_A,
             mp::CudaDataTypeOf<T>::value, ctx->cublasmp_grid, &descA),
         "cublasMpMatrixDescriptorCreate(A)");
     LORRAX_CUBLASMP_CHECK(
         cublasMpMatrixDescriptorCreate(
-            B_rows, B_cols, mb_b, nb_b, 0, 0, lld_B,
+            B_rows, B_cols, mb_b, nb_b, view ? contraction_owner : 0, 0, lld_B,
             mp::CudaDataTypeOf<T>::value, ctx->cublasmp_grid, &descB),
         "cublasMpMatrixDescriptorCreate(B)");
     LORRAX_CUBLASMP_CHECK(
@@ -148,7 +165,7 @@ static ffi::Error BatchedGemmImpl(
     // Size workspace using the first slice's pointers; reuse for all q.
     size_t d_ws = 0, h_ws = 0;
     cublasMpStatus_t mp_st = mp::MatmulBufferSize<T>(
-        ctx->cublasmp_handle, matmulDesc, m, n, k,
+        ctx->cublasmp_handle, matmulDesc, m, n, contraction_k,
         &alpha,
         d_A,     1, 1, descA,
         d_B,     1, 1, descB,
@@ -174,7 +191,7 @@ static ffi::Error BatchedGemmImpl(
         const T* B_q = d_B     + q * B_slice;
         T*       C_q = d_C_out + q * C_slice;
         mp_st = mp::Matmul<T>(
-            ctx->cublasmp_handle, matmulDesc, m, n, k,
+            ctx->cublasmp_handle, matmulDesc, m, n, contraction_k,
             &alpha,
             A_q, 1, 1, descA,
             B_q, 1, 1, descB,
@@ -272,6 +289,142 @@ static ffi::Error BatchedGemmDispatch(
     }
 }
 
+
+// Empty contractions still obey beta*C without touching any A/B element.
+// The existing context owns the local BLAS handle and destroys it on teardown.
+template <typename T>
+static ffi::Error ScaleEmpty(cudaStream_t stream, LorraxCusolverMpCtx* ctx,
+                            const T* src, T* dst, int64_t count, T beta) {
+    FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(ctx->stream, stream, ctx->ev_xla_in));
+    if (beta == T(0)) {
+        LORRAX_CUDA_CHECK(cudaMemsetAsync(dst, 0, count*sizeof(T), ctx->stream));
+    } else {
+        if (src != dst)
+            LORRAX_CUDA_CHECK(cudaMemcpyAsync(dst, src, count*sizeof(T),
+                                             cudaMemcpyDeviceToDevice, ctx->stream));
+        if (beta != T(1)) {
+            if (!ctx->local_blas_handle) {
+                cublasHandle_t handle = nullptr;
+                const auto status = cublasCreate(&handle);
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    if (handle) cublasDestroy(handle);
+                    return ffi::Error::Internal("active GEMM: local cuBLAS handle creation failed");
+                }
+                ctx->local_blas_handle = handle;
+            }
+            if (cublasSetStream(ctx->local_blas_handle, ctx->stream) != CUBLAS_STATUS_SUCCESS)
+                return ffi::Error::Internal("active GEMM: local cuBLAS stream binding failed");
+            for (int64_t offset=0; offset<count;) {
+                const int length = static_cast<int>(std::min<int64_t>(count-offset, INT_MAX));
+                cublasStatus_t status;
+                if constexpr (std::is_same_v<T,double>)
+                    status = cublasDscal(ctx->local_blas_handle,length,&beta,dst+offset,1);
+                else
+                    status = cublasZscal(ctx->local_blas_handle,length,
+                        reinterpret_cast<const cuDoubleComplex*>(&beta),
+                        reinterpret_cast<cuDoubleComplex*>(dst+offset),1);
+                if (status != CUBLAS_STATUS_SUCCESS)
+                    return ffi::Error::Internal("active GEMM: empty output scaling failed");
+                offset += length;
+            }
+        }
+    }
+    return cross_stream_wait_pooled(stream,ctx->stream,ctx->ev_ctx_out);
+}
+
+template <typename T>
+static ffi::Error ActiveRangeImpl(
+    cudaStream_t stream, LorraxCusolverMpCtx* ctx,
+    const T* a, const T* b, const T* cin, T* out,
+    const std::vector<int32_t>& bounds, int64_t n_bounds,
+    int64_t nq,int64_t m,int64_t n,int64_t k,
+    int64_t mb_a,int64_t nb_a,int64_t mb_b,int64_t nb_b,
+    int64_t mb_c,int64_t nb_c,int64_t lda,int64_t ldb,int64_t ldc,
+    T alpha,T beta) {
+    bool common = true;
+    for (int64_t i=1;i<n_bounds;++i)
+        common = common && bounds[2*i]==bounds[0] && bounds[2*i+1]==bounds[1];
+    const int64_t groups = common ? 1 : nq;
+    const int64_t group_nq = common ? nq : 1;
+    const int64_t a_stride=lda*(k/ctx->q), b_stride=ldb*(n/ctx->q), c_stride=ldc*(n/ctx->q);
+    const int64_t slab=k/ctx->p;
+    for (int64_t group=0;group<groups;++group) {
+        const int64_t lo=bounds[common ? 0 : 2*group];
+        const int64_t hi=bounds[common ? 1 : 2*group+1];
+        const T* ag=a+group*a_stride;
+        const T* bg=b+group*b_stride;
+        const T* cg=cin+group*c_stride;
+        T* dg=out+group*c_stride;
+        if (lo==hi) {
+            FFI_RETURN_IF_ERROR(ScaleEmpty(stream,ctx,cg,dg,group_nq*c_stride,beta));
+            continue;
+        }
+        if (lo==0 && hi==k) {
+            // Preserve the original dense call and its floating-point order.
+            FFI_RETURN_IF_ERROR(BatchedGemmImpl<T>(group_nq,m,n,k,mb_a,nb_a,mb_b,nb_b,
+                mb_c,nb_c,lda,ldb,ldc,CUBLAS_OP_N,CUBLAS_OP_N,alpha,beta,
+                stream,ctx,ag,bg,cg,dg));
+            continue;
+        }
+        bool first=true;
+        for (int owner=0;owner<ctx->p;++owner) {
+            const int64_t begin=std::max<int64_t>(lo,owner*slab);
+            const int64_t end=std::min<int64_t>(hi,(owner+1)*slab);
+            if (begin>=end) continue;
+            FFI_RETURN_IF_ERROR(BatchedGemmImpl<T>(group_nq,m,n,k,mb_a,nb_a,mb_b,nb_b,
+                mb_c,nb_c,lda,ldb,ldc,CUBLAS_OP_N,CUBLAS_OP_N,alpha,first ? beta : T(1),
+                stream,ctx,ag,bg,first ? cg : dg,dg,owner,begin-owner*slab,end-begin));
+            first=false;
+        }
+    }
+    return ffi::Error::Success();
+}
+
+// Full physical allocation shapes and strides, with scalar or per-batch
+// replicated bounds. Each exact original-owner intersection has a descriptor
+// view; there is no selected-operand allocation and no padded contraction K.
+static ffi::Error ActiveRangeDispatch(
+    cudaStream_t stream, ffi::AnyBuffer A, ffi::AnyBuffer B,
+    ffi::AnyBuffer C_in, ffi::BufferR2<ffi::S32> bounds,
+    ffi::Result<ffi::AnyBuffer> C_out,
+    int64_t nq,int64_t m,int64_t n,int64_t k,
+    int64_t mb_a,int64_t nb_a,int64_t mb_b,int64_t nb_b,
+    int64_t mb_c,int64_t nb_c,int64_t lda,int64_t ldb,int64_t ldc,
+    int64_t transa_code,int64_t transb_code,
+    double alpha_re,double alpha_im,double beta_re,double beta_im,
+    int64_t ctx_handle) {
+    auto* ctx=reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
+    if (!ctx || ctx->p<=0 || ctx->p!=ctx->q || transa_code!=0 || transb_code!=0 ||
+        bounds.dimensions()[1]!=2 || (bounds.dimensions()[0]!=1 && bounds.dimensions()[0]!=nq) ||
+        k<=0 || k%ctx->p!=0)
+        return ffi::Error::InvalidArgument("active GEMM requires square N,N faces and bounds(1|nq,2)");
+    if (A.element_type()!=B.element_type() || A.element_type()!=C_in.element_type() ||
+        A.element_type()!=C_out->element_type())
+        return ffi::Error::InvalidArgument("active GEMM operand dtype mismatch");
+    const int64_t n_bounds=bounds.dimensions()[0];
+    std::vector<int32_t> intervals(2*n_bounds);
+    LORRAX_CUDA_CHECK(cudaMemcpyAsync(intervals.data(),bounds.typed_data(),
+        intervals.size()*sizeof(int32_t),cudaMemcpyDeviceToHost,stream));
+    LORRAX_CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (int64_t i=0;i<n_bounds;++i)
+        if (intervals[2*i]<0 || intervals[2*i]>intervals[2*i+1] || intervals[2*i+1]>k)
+            return ffi::Error::InvalidArgument("active GEMM requires 0 <= lo <= hi <= storage K");
+    if (A.element_type()==ffi::DataType::F64)
+        return ActiveRangeImpl<double>(stream,ctx,
+            static_cast<const double*>(A.untyped_data()),static_cast<const double*>(B.untyped_data()),
+            static_cast<const double*>(C_in.untyped_data()),static_cast<double*>(C_out->untyped_data()),
+            intervals,n_bounds,nq,m,n,k,mb_a,nb_a,mb_b,nb_b,mb_c,nb_c,lda,ldb,ldc,alpha_re,beta_re);
+    if (A.element_type()==ffi::DataType::C128) {
+        using T=std::complex<double>;
+        return ActiveRangeImpl<T>(stream,ctx,
+            static_cast<const T*>(A.untyped_data()),static_cast<const T*>(B.untyped_data()),
+            static_cast<const T*>(C_in.untyped_data()),static_cast<T*>(C_out->untyped_data()),
+            intervals,n_bounds,nq,m,n,k,mb_a,nb_a,mb_b,nb_b,mb_c,nb_c,lda,ldb,ldc,
+            T(alpha_re,alpha_im),T(beta_re,beta_im));
+    }
+    return ffi::Error::InvalidArgument("active GEMM supports float64/complex128");
+}
+
 }  // namespace lorrax_ffi::cublasmp_batched_gemm
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -282,6 +435,37 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()      // A
         .Arg<xla::ffi::AnyBuffer>()      // B
         .Arg<xla::ffi::AnyBuffer>()      // C (for beta*C)
+        .Ret<xla::ffi::AnyBuffer>()      // C_out
+        .Attr<int64_t>("nq")
+        .Attr<int64_t>("m")
+        .Attr<int64_t>("n")
+        .Attr<int64_t>("k")
+        .Attr<int64_t>("mb_a")
+        .Attr<int64_t>("nb_a")
+        .Attr<int64_t>("mb_b")
+        .Attr<int64_t>("nb_b")
+        .Attr<int64_t>("mb_c")
+        .Attr<int64_t>("nb_c")
+        .Attr<int64_t>("lld_a")
+        .Attr<int64_t>("lld_b")
+        .Attr<int64_t>("lld_c")
+        .Attr<int64_t>("transa")
+        .Attr<int64_t>("transb")
+        .Attr<double>("alpha_re")
+        .Attr<double>("alpha_im")
+        .Attr<double>("beta_re")
+        .Attr<double>("beta_im")
+        .Attr<int64_t>("ctx_handle"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    CublasMpActiveRangeGemmFfi,
+    lorrax_ffi::cublasmp_batched_gemm::ActiveRangeDispatch,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()      // A
+        .Arg<xla::ffi::AnyBuffer>()      // B
+        .Arg<xla::ffi::AnyBuffer>()      // C (for beta*C)
+        .Arg<xla::ffi::BufferR2<xla::ffi::S32>>() // (1|nq,2) bounds
         .Ret<xla::ffi::AnyBuffer>()      // C_out
         .Attr<int64_t>("nq")
         .Attr<int64_t>("m")

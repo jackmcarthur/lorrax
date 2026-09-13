@@ -16,6 +16,7 @@
 #endif
 #include <cusolverMp.h>
 #include <cublasmp.h>
+#include <cublas_v2.h>
 
 namespace lorrax_ffi::cusolvermp {
 
@@ -77,6 +78,8 @@ struct LorraxCusolverMpCtx {
     // Lazily populated by ensure_cublasmp(): the first fused-kernel
     // call builds the handle/grid, subsequent calls reuse them.
     cublasMpHandle_t  cublasmp_handle = nullptr;
+    // Local empty-contraction scaling, bound to this context stream.
+    cublasHandle_t local_blas_handle = nullptr;
     cublasMpGrid_t    cublasmp_grid   = nullptr;
 };
 

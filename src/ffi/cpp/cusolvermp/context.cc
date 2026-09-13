@@ -348,6 +348,7 @@ void destroy_context(int64_t ctx_handle) {
 
     // cuBLASMp first (it shares the CAL comm with cuSOLVERMp — tear down
     // the client handles before we destroy the comm underneath them).
+    if (ctx->local_blas_handle) { cublasDestroy(ctx->local_blas_handle); ctx->local_blas_handle = nullptr; }
     if (ctx->cublasmp_grid)   { cublasMpGridDestroy(ctx->cublasmp_grid);     ctx->cublasmp_grid = nullptr; }
     if (ctx->cublasmp_handle) { cublasMpDestroy(ctx->cublasmp_handle);       ctx->cublasmp_handle = nullptr; }
     if (ctx->grid)     { cusolverMpDestroyGrid(ctx->grid);       ctx->grid = nullptr; }
