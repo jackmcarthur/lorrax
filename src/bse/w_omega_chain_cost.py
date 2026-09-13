@@ -9,7 +9,12 @@ import numpy as np
 
 
 def orthonormalize_seed(seed, sharding):
-    """TSQR of the excitation-space seed without forming its normal equations.
+    """Rank-revealing TSQR of a seed or residual excitation block.
+
+    The small R-factor SVD removes numerical null directions at its standard
+    backward-error floor. Forming a Gram matrix would square the conditioning;
+    retaining arbitrary QR columns at rank exhaustion would break Lanczos
+    orthogonality. No excitation-space array is gathered.
 
     Parameters
     ----------
@@ -23,7 +28,8 @@ def orthonormalize_seed(seed, sharding):
     Returns
     -------
     q : jax.Array
-        Orthonormal block with the same shape and sharding as seed.
+        Orthonormal retained columns, with zero columns for numerical null
+        directions, in the same shape and sharding as seed.
     r : numpy.ndarray
         Replicated host p-by-p factor satisfying seed = q @ r, in column form.
     """
@@ -51,7 +57,14 @@ def orthonormalize_seed(seed, sharding):
     mapped = shard_map(local, mesh=sharding.mesh, in_specs=sharding.spec,
                        out_specs=(sharding.spec, P()), check_vma=False)
     q, r = jax.jit(mapped)(seed)
-    return q, np.asarray(jax.device_get(r))
+    r = np.asarray(jax.device_get(r))
+    u, singular, vh = np.linalg.svd(r, full_matrices=False)
+    keep = singular > np.finfo(singular.dtype).eps * max(r.shape) * singular[0]
+    # Rotate only the replicated p-by-p factors; Q remains in its pair layout.
+    rotation = jnp.asarray(u * keep[None, :])
+    q = jax.lax.with_sharding_constraint(
+        jnp.einsum('acvk,ab->bcvk', q, rotation), sharding)
+    return q, (singular * keep)[:, None] * vh
 
 
 def solve_chain_resolvent(alpha, beta, r0, z, *, m_use=None):
