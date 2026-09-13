@@ -78,42 +78,47 @@ static ffi::Error project(cudaStream_t stream, B v, B hv, B h, I active, R out,
 }
 static ffi::Error reconstruct(cudaStream_t stream, B v, B hv, B c, I active,
                               R x, R hx, ScratchResult scratch) {
-  if (active.dimensions()[0] != 3 || v.dimensions()[0] < 1 ||
+  if (active.dimensions()[0] != 4 || v.dimensions()[0] < 1 ||
       v.dimensions()[0] > INT_MAX || v.dimensions()[1] < 1 ||
       v.dimensions()[1] > INT_MAX || x->dimensions()[0] > INT_MAX)
     return ffi::Error::InvalidArgument(
         "reconstruct descriptor/dimension overflow");
-  int q[3];
+  int q[4];
   CUDA(cudaMemcpyAsync(q, active.typed_data(), sizeof(q),
                        cudaMemcpyDeviceToHost, stream));
   CUDA(cudaStreamSynchronize(stream));
   int cap = v.dimensions()[0], d = v.dimensions()[1], b = x->dimensions()[0],
-      m = q[0], columns = q[1];
+      m = q[0], columns = q[1], start = q[3];
   if (hv.dimensions()[0] != cap || hv.dimensions()[1] != d ||
       c.dimensions()[0] != cap || c.dimensions()[1] != b ||
       x->dimensions()[1] != d || hx->dimensions()[0] != b ||
       hx->dimensions()[1] != d)
     return ffi::Error::InvalidArgument("reconstruct buffer geometry");
-  if (m < 1 || m > cap || columns < 1 || columns > b)
+  if (m < 0 || start < 0 || int64_t(start) + m > cap || columns < 0 || columns > b)
     return ffi::Error::InvalidArgument("reconstruct active geometry");
   BLAS(cublasSetStream(handle(), stream));
   BLAS(cublasSetWorkspace(handle(), scratch->typed_data(),
                           scratch->dimensions()[0]));
   const cuDoubleComplex one{1, 0}, zero{0, 0};
+  if (!m || !columns) {
+    CUDA(cudaMemsetAsync(ptr(x), 0, int64_t(b)*d*sizeof(cuDoubleComplex), stream));
+    CUDA(cudaMemsetAsync(ptr(hx), 0, int64_t(b)*d*sizeof(cuDoubleComplex), stream));
+    return ffi::Error::Success();
+  }
   if (columns < b) {
     CUDA(cudaMemsetAsync(ptr(x) + int64_t(columns) * d, 0,
                          int64_t(b - columns) * d * sizeof(cuDoubleComplex),
                          stream));
   }
   BLAS(cublasZgemm(handle(), CUBLAS_OP_N, CUBLAS_OP_N, d, columns, m, &one,
-                   ptr(v), d, ptr(c), cap, &zero, ptr(x), d));
+                   ptr(v) + int64_t(start)*d, d, ptr(c) + start, cap, &zero, ptr(x), d));
   if (q[2]) {
     if (columns < b)
       CUDA(cudaMemsetAsync(ptr(hx) + int64_t(columns) * d, 0,
                            int64_t(b - columns) * d * sizeof(cuDoubleComplex),
                            stream));
     BLAS(cublasZgemm(handle(), CUBLAS_OP_N, CUBLAS_OP_N, d, columns, m, &one,
-                     ptr(hv), d, ptr(c), cap, &zero, ptr(hx), d));
+                     ptr(hv) + int64_t(start)*d, d, ptr(c) + start, cap, &zero, ptr(hx), d));
   } else {
     CUDA(cudaMemsetAsync(ptr(hx), 0, int64_t(b) * d * sizeof(cuDoubleComplex),
                          stream));
@@ -122,22 +127,23 @@ static ffi::Error reconstruct(cudaStream_t stream, B v, B hv, B c, I active,
 }
 static ffi::Error orthogonalize(cudaStream_t stream, B v, B p, I active, R out,
                                 R work, ScratchResult scratch) {
-  if (active.dimensions()[0] != 1 || v.dimensions()[0] < 1 ||
+  if (active.dimensions()[0] != 2 || v.dimensions()[0] < 1 ||
       v.dimensions()[0] > INT_MAX || v.dimensions()[1] < 1 ||
       v.dimensions()[1] > INT_MAX || p.dimensions()[0] < 1 ||
       p.dimensions()[0] > INT_MAX)
     return ffi::Error::InvalidArgument(
         "orthogonalize descriptor/dimension overflow");
-  int m;
-  CUDA(cudaMemcpyAsync(&m, active.typed_data(), sizeof(m),
+  int q[2];
+  CUDA(cudaMemcpyAsync(q, active.typed_data(), sizeof(q),
                        cudaMemcpyDeviceToHost, stream));
   CUDA(cudaStreamSynchronize(stream));
+  int start = q[0], m = q[1];
   int cap = v.dimensions()[0], d = v.dimensions()[1], b = p.dimensions()[0];
   if (p.dimensions()[1] != d || out->dimensions()[0] != b ||
       out->dimensions()[1] != d || work->dimensions()[0] != cap ||
       work->dimensions()[1] != b)
     return ffi::Error::InvalidArgument("orthogonalize buffer geometry");
-  if (m < 1 || m > cap)
+  if (m < 0 || start < 0 || int64_t(start) + m > cap)
     return ffi::Error::InvalidArgument("ortho active geometry");
   BLAS(cublasSetStream(handle(), stream));
   BLAS(cublasSetWorkspace(handle(), scratch->typed_data(),
@@ -146,12 +152,37 @@ static ffi::Error orthogonalize(cudaStream_t stream, B v, B p, I active, R out,
   CUDA(cudaMemcpyAsync(out->typed_data(), p.typed_data(),
                        int64_t(b) * d * sizeof(cuDoubleComplex),
                        cudaMemcpyDeviceToDevice, stream));
+  if (!m) return ffi::Error::Success();
   for (int pass = 0; pass < 2; ++pass) {
-    BLAS(cublasZgemm(handle(), CUBLAS_OP_C, CUBLAS_OP_N, m, b, d, &one, ptr(v),
+    BLAS(cublasZgemm(handle(), CUBLAS_OP_C, CUBLAS_OP_N, m, b, d, &one, ptr(v) + int64_t(start)*d,
                      d, ptr(out), d, &zero, ptr(work), cap));
     BLAS(cublasZgemm(handle(), CUBLAS_OP_N, CUBLAS_OP_N, d, b, m, &minus,
-                     ptr(v), d, ptr(work), cap, &one, ptr(out), d));
+                     ptr(v) + int64_t(start)*d, d, ptr(work), cap, &one, ptr(out), d));
   }
+  return ffi::Error::Success();
+}
+static ffi::Error gram(cudaStream_t stream, B v, B p, I range, R out,
+                       ScratchResult scratch) {
+  if (range.dimensions()[0] != 2 || v.dimensions()[0] < 1 ||
+      v.dimensions()[0] > INT_MAX || v.dimensions()[1] < 1 ||
+      v.dimensions()[1] > INT_MAX || p.dimensions()[0] < 1 ||
+      p.dimensions()[0] > INT_MAX)
+    return ffi::Error::InvalidArgument("gram descriptor/dimension overflow");
+  int q[2];
+  CUDA(cudaMemcpyAsync(q, range.typed_data(), sizeof(q), cudaMemcpyDeviceToHost, stream));
+  CUDA(cudaStreamSynchronize(stream));
+  int cap = v.dimensions()[0], d = v.dimensions()[1], b = p.dimensions()[0];
+  int start = q[0], count = q[1];
+  if (p.dimensions()[1] != d || out->dimensions()[0] != cap ||
+      out->dimensions()[1] != b || start < 0 || count < 0 || int64_t(start)+count > cap)
+    return ffi::Error::InvalidArgument("gram buffer/range geometry");
+  CUDA(cudaMemsetAsync(ptr(out), 0, int64_t(cap)*b*sizeof(cuDoubleComplex), stream));
+  if (!count) return ffi::Error::Success();
+  BLAS(cublasSetStream(handle(), stream));
+  BLAS(cublasSetWorkspace(handle(), scratch->typed_data(), scratch->dimensions()[0]));
+  const cuDoubleComplex one{1,0}, zero{0,0};
+  BLAS(cublasZgemm(handle(), CUBLAS_OP_C, CUBLAS_OP_N, count, b, d, &one,
+                  ptr(v)+int64_t(start)*d, d, ptr(p), d, &zero, ptr(out)+start, cap));
   return ffi::Error::Success();
 }
 // XLA aliases the first two operands to the two results. Only the active
@@ -227,3 +258,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceStoreFfi, store,
                                   .Arg<I>()
                                   .Ret<B>()
                                   .Ret<B>());
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceGramFfi, gram,
+    ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+      .Arg<B>().Arg<B>().Arg<I>().Ret<B>().Ret<Scratch>());

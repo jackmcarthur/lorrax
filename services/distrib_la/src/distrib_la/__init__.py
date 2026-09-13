@@ -93,6 +93,7 @@ punctilio — it is the failure mode.
 
 from __future__ import annotations
 
+from distrib_la.subspace import plan_subspace
 from distrib_la.active_subspace import LocalSubspacePlan, plan_local_subspace
 from distrib_la.dispatch import dispatch_batched_eigh
 from distrib_la.factor import FactorToken, factor, solve
@@ -133,7 +134,7 @@ from distrib_la.resolve import (
 )
 
 __all__ = [
-    "LocalSubspacePlan", "plan_local_subspace",
+    "LocalSubspacePlan", "plan_local_subspace", "plan_subspace",
     # plan
     "Plan", "plan", "ensure_sharding", "DONATES",
     # polar / SVD

@@ -128,6 +128,7 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_active_subspace_eigh":         "ActiveSubspaceEighFfi",
     "lorrax_active_subspace_project":      "ActiveSubspaceProjectFfi",
     "lorrax_active_subspace_reconstruct":  "ActiveSubspaceReconstructFfi",
+    "lorrax_active_subspace_gram": "ActiveSubspaceGramFfi",
     "lorrax_active_subspace_ortho":        "ActiveSubspaceOrthoFfi",
 
     "lorrax_cublasmp_batched_gemm":       "CublasMpBatchedGemmFfi",
