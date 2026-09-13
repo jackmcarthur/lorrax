@@ -194,7 +194,8 @@ def preconditioned_block_cg(apply_t, rhs, shift, diagonal, *, maxiter, tol,
                   useful_matvec_columns=receipt['useful_matvec_columns']+jnp.sum(b2>0))
 
 
-def complex_shifted_cg(apply_t, rhs, shift, *, maxiter, tol, orthonormalize):
+def complex_shifted_cg(apply_t, rhs, shift, *, maxiter, tol, orthonormalize,
+                       diagonal=None):
     """Solve (shift I-T)x=rhs using a Hermitian positive normal operator.
 
     For shift=c+id, D=(T-cI)^2+d²I and x=(conj(shift)I-T)D^-1 rhs.
@@ -203,14 +204,20 @@ def complex_shifted_cg(apply_t, rhs, shift, *, maxiter, tol, orthonormalize):
     count exposes. Nonzero d is required. The final receipt reports the true
     original-system residual, not the normal-equation stopping residual.
     Each D application costs two T columns per RHS; both final T actions are
-    included. No contour-dependent tolerance or pole modification is used.
+    included. An optional free transition-square diagonal preconditions D by
+    (Delta²-Re shift)²+(Im shift)². The original-system tolerance is unchanged.
     """
     def normal(v):
         av = apply_t(v) - shift.real * v
         return apply_t(av) - shift.real * av + shift.imag**2 * v
 
-    y, receipt = block_cg(normal, rhs, jnp.float64(0), maxiter=maxiter, tol=tol,
-                          orthonormalize=orthonormalize)
+    if diagonal is None:
+        y, receipt = block_cg(normal, rhs, jnp.float64(0), maxiter=maxiter, tol=tol,
+                              orthonormalize=orthonormalize)
+    else:
+        normal_diagonal = (diagonal-shift.real)**2+shift.imag**2
+        y, receipt = preconditioned_block_cg(normal, rhs, jnp.float64(0),
+            normal_diagonal, maxiter=maxiter, tol=tol, orthonormalize=orthonormalize)
     x = shift.conjugate() * y - apply_t(y)
     residual = rhs - (shift * x - apply_t(x))
     axes = tuple(range(1, rhs.ndim))
@@ -387,7 +394,7 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
     a failure sets done and skips every subsequent pair-space solve.  The
     caller must refuse any nonzero failure flag before exporting a model.
     Spectral ends and grid are in Ry²; no Sigma information enters selection.
-    Only Extension A is enabled here. store_truth retains Si's sharded X and
+    Extension B optionally adds complex candidates. store_truth retains Si's sharded X and
     direct Gram/H diagnostics; the sample-only algorithm never reads X.
     pair_diagonal supplies the free positive transition-square diagonal for
     the production preconditioner; planted generic operators may omit it.
@@ -466,7 +473,8 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
 
                 def complex_solve(_):
                     x,cg = complex_shifted_cg(lambda v:apply_t(v,operands),-rhs,shift,
-                        maxiter=cg_maxiter,tol=cg_tol,orthonormalize=orthonormalize)
+                        maxiter=cg_maxiter,tol=cg_tol,orthonormalize=orthonormalize,
+                        diagonal=None if pair_diagonal is None else pair_diagonal(operands))
                     return x,{key:cg[key] for key in ('iterations','relative','breakdown','matvec_columns','rhs_solves')}
 
                 if hybrid_candidates:
