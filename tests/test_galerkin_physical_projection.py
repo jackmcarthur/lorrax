@@ -9,7 +9,8 @@ if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
 
     _visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     _kwargs = {"local_device_ids": [0]} if _visible and "," not in _visible else {}
-    _jax_boot.distributed.initialize(**_kwargs)
+    if not _jax_boot.distributed.is_initialized():
+        _jax_boot.distributed.initialize(**_kwargs)
 
 import jax
 import numpy as np

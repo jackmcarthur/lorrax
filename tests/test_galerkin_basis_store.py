@@ -11,7 +11,8 @@ if int(os.environ.get("SLURM_NTASKS", "1")) > 1:
     import jax as _jax_boot
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     kwargs = {"local_device_ids": [0]} if visible and "," not in visible else {}
-    _jax_boot.distributed.initialize(**kwargs)
+    if not _jax_boot.distributed.is_initialized():
+        _jax_boot.distributed.initialize(**kwargs)
 
 import h5py
 import jax
