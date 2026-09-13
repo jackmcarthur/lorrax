@@ -15,6 +15,10 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsl
 
+# Numerical oscillator-strength support for §9 whitening. This fixed support
+# guard never selects the delivered rational-model order.
+METRIC_SUPPORT_RTOL = 1e-3
+
 
 def screening_operands(data):
     """Pack the existing RPA operands and positive transition square root.
@@ -399,7 +403,7 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
         nr = g0.shape[0]
         state = empty_samples(nr, k_max)
         evals, evecs = jnp.linalg.eigh((g0+g0.conj().T)*.5)
-        metric_live = evals > evals[-1]*1e-12
+        metric_live = evals > evals[-1]*METRIC_SUPPORT_RTOL
         invroot = jnp.where(metric_live, 1/jnp.sqrt(jnp.where(metric_live, evals, 1)), 0)
         whiten = evecs * invroot[None, :]
         seed = evecs[:, -r_add:]
