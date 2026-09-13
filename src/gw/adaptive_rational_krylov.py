@@ -292,7 +292,7 @@ def append_infinity(state, qinf, g0, g1):
 
 def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                         n_grid, shortlist, n_power, cg_maxiter, cg_tol,
-                        pair_shape, store_truth):
+                        pair_shape, store_truth, block_callback=None):
     """Compile §§11–13's fixed-shape outer scan and per-column CG masks.
 
     The returned callable accepts runtime (operands, G0, grid, spectral_ends,
@@ -302,6 +302,8 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
     Spectral ends and grid are in Ry²; no Sigma information enters selection.
     Only Extension A is enabled here. store_truth retains Si's sharded X and
     direct Gram/H diagnostics; the sample-only algorithm never reads X.
+    An optional host diagnostic callback receives only the small receipt once
+    per attempted block. It never controls selection or changes the model.
     """
     if n_grid < shortlist:
         raise ValueError('candidate grid must cover the shortlist')
@@ -383,6 +385,8 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                                rhs_solves=cg['rhs_solves'].astype(jnp.int32),
                                matvec_columns=matvecs.astype(jnp.int32),cg_iterations=cg['iterations'],
                                cg_relative=cg['relative'])
+                if block_callback is not None:
+                    jax.debug.callback(block_callback, receipt)
                 return (new,theta,basis,exact_s,exact_h,(failure!=0)|(new['m']>=requested)),receipt
 
             def skip(carry):
