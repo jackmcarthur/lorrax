@@ -631,6 +631,9 @@ def run_gw_jax(run_dir, input_name, platform=None, extra_env=None,
     if platform is None:
         platform = requested_platform()
     env = os.environ.copy()
+    # A fresh interpreter must initialize its own JAX distributed runtime.
+    # This sentinel protects re-imports in one process, not child processes.
+    env.pop("_LORRAX_JAX_DISTRIBUTED_DONE", None)
     cache_setting = env.get(
         "ISDF_JAX_CACHE_DIR", str(REPO_ROOT / ".pytest_jax_cache"))
     if cache_setting.strip():
