@@ -255,3 +255,137 @@ def ritz_model(state):
     theta, v = jnp.linalg.eigh((h + h.conj().T) * .5)
     factor = jnp.sqrt(2.) * state['Y'] @ w @ v
     return theta, factor * live[None, :], g
+
+
+def append_infinity(state, qinf, g0, g1):
+    """Append states B qinf using G0=B†B and G1=B†TB (M1/M3).
+
+    For finite X, X†TBq = conj(xi)Y†q - Q†G0q.  This is the
+    coordinator's fixed-budget A2: these columns were reserved inside K.
+    No truncation follows; residual selection must finish before this append.
+    """
+    m, zero = state['m'], jnp.int32(0)
+    update = jax.lax.dynamic_update_slice
+    gi = state['Y'].conj().T @ qinf
+    hi = state['xi'].conj()[:, None] * gi - state['Q'].conj().T @ g0 @ qinf
+    gram = update(state['S'], gi, (zero, m))
+    gram = update(gram, gi.conj().T, (m, zero))
+    gram = update(gram, qinf.conj().T @ g0 @ qinf, (m, m))
+    h = update(state['H'], hi, (zero, m))
+    h = update(h, hi.conj().T, (m, zero))
+    h = update(h, qinf.conj().T @ g1 @ qinf, (m, m))
+    return dict(xi=update(state['xi'], jnp.full(qinf.shape[1], jnp.inf+0j), (m,)),
+                Q=update(state['Q'], qinf, (zero, m)),
+                Y=update(state['Y'], g0 @ qinf, (zero, m)), S=gram, H=h,
+                active=update(state['active'], jnp.ones(qinf.shape[1], bool), (m,)),
+                m=m+qinf.shape[1])
+
+
+def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
+                        n_grid, shortlist, n_power, cg_maxiter, cg_tol,
+                        pair_shape, store_truth):
+    """Compile §§11–13's fixed-shape outer scan and per-column CG masks.
+
+    The returned callable accepts runtime (operands, G0, grid, spectral_ends,
+    K_requested). Every block records order, interpolation and Gram guards;
+    a failure sets done and skips every subsequent pair-space solve.  The
+    caller must refuse any nonzero failure flag before exporting a model.
+    Spectral ends and grid are in Ry²; no Sigma information enters selection.
+    Only Extension A is enabled here. store_truth retains Si's sharded X and
+    direct Gram/H diagnostics; the sample-only algorithm never reads X.
+    """
+    if n_grid < shortlist:
+        raise ValueError('candidate grid must cover the shortlist')
+    n_outer = (k_max + r_add - 1) // r_add
+    zero = jnp.int32(0)
+
+    @jax.jit
+    def run(operands, g0, grid, spectral_ends, requested):
+        nr = g0.shape[0]
+        state = empty_samples(nr, k_max)
+        evals, evecs = jnp.linalg.eigh((g0+g0.conj().T)*.5)
+        metric_live = evals > evals[-1]*1e-12
+        invroot = jnp.where(metric_live, 1/jnp.sqrt(jnp.where(metric_live, evals, 1)), 0)
+        whiten = evecs * invroot[None, :]
+        seed = evecs[:, -r_add:]
+        trial = jnp.sin(jnp.arange(nr)[:, None] * (jnp.arange(r_add)[None, :]+1) + .7).astype(jnp.complex128)
+        truth_size = k_max if store_truth else 0
+        basis = jax.lax.with_sharding_constraint(jnp.zeros((truth_size,)+pair_shape, jnp.complex128), sh.X)
+        exact_s = jnp.zeros((truth_size, truth_size), jnp.complex128)
+        exact_h = jnp.zeros_like(exact_s)
+        invalid = (requested % r_add != 0) | (requested > k_max) | (requested <= 0)
+        initial = (state, jnp.zeros(k_max), basis, exact_s, exact_h, invalid)
+
+        def step(carry, index):
+            def accept(carry):
+                state, theta, basis, exact_s, exact_h, done = carry
+                a, b = spectral_ends
+
+                def choose(_):
+                    indicators = log_support_indicator(grid, state['xi'], theta, state['active'])
+                    _, ids = jax.lax.top_k(indicators, shortlist)
+
+                    def candidate(i):
+                        s = grid[i]
+                        q, value = residual_tangents(state, g0, s, whiten, trial, n_power=n_power)
+                        return q, value * (b-s.real)/(a-s.real)
+
+                    qs, scores = jax.lax.map(candidate, ids)
+                    best = jnp.argmax(scores)
+                    return grid[ids[best]], qs[best], scores[best].real
+
+                shift, q, score = jax.lax.cond(state['m']==0,
+                    lambda _: (-jnp.sqrt(a*b)+0j, seed, jnp.float64(1)), choose, None)
+                rhs = -apply_b(q, operands)
+                x, cg = column_cg(lambda v: apply_t(v, operands), rhs, shift.real,
+                                   maxiter=cg_maxiter, tol=cg_tol)
+                y = apply_bh(x, operands)
+                gram = jnp.einsum('acvk,bcvk->ab', x.conj(), x)
+                new, reused = append_samples(state, shift, q, y, gram)
+                theta, factor, g = ritz_model(new)
+                live = new['active']
+                predicted = factor @ ((factor.conj().T @ new['Q']) /
+                    jnp.where(live[None, :], new['xi'][None, :]-theta[:, None], 1))
+                error = jnp.linalg.norm(predicted-2*new['Y'],axis=0) / jnp.maximum(jnp.linalg.norm(2*new['Y'],axis=0),1e-300)
+                interpolation = jnp.max(jnp.where(live,error,0))
+                gmax = jnp.max(jnp.where(live,g,0))
+                ratio = g[0]/gmax
+                failure = (jnp.int32(reused)*1 + jnp.int32(~jnp.all(jnp.isfinite(g)) | (ratio <= 1e-12))*2
+                           + jnp.int32(~jnp.isfinite(interpolation) | (interpolation>1e-10))*4
+                           + jnp.int32(jnp.any(cg['breakdown']) | (jnp.max(cg['relative'])>cg_tol))*8
+                           + jnp.int32(theta[0]<=0)*16)
+                gs, gh = jnp.float64(0), jnp.float64(0)
+                matvecs = cg['matvec_columns']
+                if store_truth:
+                    basis = jax.lax.with_sharding_constraint(jax.lax.dynamic_update_slice(
+                        basis,x,(state['m'],zero,zero,zero)),sh.X)
+                    tx = apply_t(x,operands)
+                    cs = jnp.einsum('acvk,bcvk->ab',basis.conj(),x)
+                    ch = jnp.einsum('acvk,bcvk->ab',basis.conj(),tx)
+                    exact_s = jax.lax.dynamic_update_slice(exact_s,cs,(zero,state['m']))
+                    exact_s = jax.lax.dynamic_update_slice(exact_s,cs.conj().T,(state['m'],zero))
+                    exact_h = jax.lax.dynamic_update_slice(exact_h,ch,(zero,state['m']))
+                    exact_h = jax.lax.dynamic_update_slice(exact_h,ch.conj().T,(state['m'],zero))
+                    gs = jnp.linalg.norm(exact_s-new['S'])/jnp.linalg.norm(exact_s)
+                    gh = jnp.linalg.norm(exact_h-new['H'])/jnp.linalg.norm(exact_h)
+                    matvecs = matvecs+r_add
+                receipt = dict(m=new['m'],shift=shift,score=score,interpolation=interpolation,
+                               gram_ratio=ratio,gram_relative=gs,h_relative=gh,failure=failure,
+                               rhs_solves=cg['rhs_solves'].astype(jnp.int32),
+                               matvec_columns=matvecs.astype(jnp.int32),cg_iterations=cg['iterations'],
+                               cg_relative=cg['relative'])
+                return (new,theta,basis,exact_s,exact_h,(failure!=0)|(new['m']>=requested)),receipt
+
+            def skip(carry):
+                receipt=dict(m=jnp.int32(0),shift=jnp.complex128(0),score=jnp.float64(0),
+                             interpolation=jnp.float64(0),gram_ratio=jnp.float64(0),
+                             gram_relative=jnp.float64(0),h_relative=jnp.float64(0),failure=jnp.int32(0),
+                             rhs_solves=jnp.int32(0),matvec_columns=jnp.int32(0),
+                             cg_iterations=jnp.zeros(r_add,jnp.int32),cg_relative=jnp.zeros(r_add))
+                return carry,receipt
+
+            return jax.lax.cond(carry[-1],skip,accept,carry)
+
+        return jax.lax.scan(step,initial,jnp.arange(n_outer,dtype=jnp.int32))
+
+    return run
