@@ -71,8 +71,9 @@ def solve_chain_resolvent(alpha, beta, r0, z, *, m_use=None):
     """Solve (z² I - T) C = [R0; 0] by block elimination.
 
     T is the Hermitian block-tridiagonal Lanczos operator used by
-    ``w_omega_chain.eval_w_omega_chain``. Complex z² off the real axis makes
-    every principal shifted block nonsingular; no inter-block pivot is needed.
+    ``w_omega_chain.eval_w_omega_chain``. Complex z² off the real axis, or
+    negative real z² for this positive-semidefinite operator, makes every
+    principal shifted block nonsingular; no inter-block pivot is needed.
 
     Parameters
     ----------
@@ -84,7 +85,7 @@ def solve_chain_resolvent(alpha, beta, r0, z, *, m_use=None):
     r0 : numpy.ndarray
         Replicated host seed factor, shape (p, p).
     z : complex
-        Frequency in Ry. Its square must have nonzero imaginary part.
+        Frequency in Ry. Its square must be off the nonnegative real axis.
     m_use : int, optional
         Number of chain blocks consumed, at most m.
 
@@ -104,8 +105,8 @@ def solve_chain_resolvent(alpha, beta, r0, z, *, m_use=None):
     if alpha.shape[1:] != (p, p) or beta.shape != alpha.shape or r0.shape != (p, p):
         raise ValueError('inconsistent chain block shapes')
     z2 = complex(z) ** 2
-    if z2.imag == 0:
-        raise ValueError('cost probe requires z squared off the real spectrum')
+    if z2.imag == 0 and z2.real >= 0:
+        raise ValueError('cost probe requires z squared off the nonnegative spectrum')
     eye = np.eye(p, dtype=np.complex128)
     upper_solutions = np.empty((max(0, m-1), p, p), dtype=np.complex128)
     values = np.empty((m, p, p), dtype=np.complex128)
