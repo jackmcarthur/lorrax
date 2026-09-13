@@ -20,7 +20,7 @@ import jax.scipy.linalg as jsl
 METRIC_SUPPORT_RTOL = 1e-3
 
 
-def dictionary_projection_pivots(gram, *, k_max):
+def dictionary_projection_pivots(gram, *, k_max, initial_indices=None):
     """Select actual dictionary states by their orthogonal projection defect.
 
     Parameters
@@ -30,6 +30,9 @@ def dictionary_projection_pivots(gram, *, k_max):
         Columns retain their physical normalization: no diagonal scaling.
     k_max : int
         Number of requested pivots, fixed at trace time.
+    initial_indices : integer array, optional
+        Mandatory dictionary atoms, in insertion order, counted inside K.
+        Remaining pivots use the same unscaled projection-distance criterion.
 
     Returns
     -------
@@ -45,10 +48,17 @@ def dictionary_projection_pivots(gram, *, k_max):
         raise ValueError('requested pivot count must fit the dictionary')
     initial = (jnp.zeros((n, k_max), gram.dtype),
                jnp.real(jnp.diag(gram)), jnp.zeros(n, bool))
+    anchors = jnp.asarray([] if initial_indices is None else initial_indices,
+                          dtype=jnp.int64)
+    if anchors.size > k_max:
+        raise ValueError('mandatory atoms exceed the requested order')
 
     def step(carry, m):
         factors, residual, selected = carry
         pivot = jnp.argmax(jnp.where(selected, -jnp.inf, residual))
+        if anchors.size:
+            pivot = jnp.where(m < anchors.size,
+                              anchors[jnp.minimum(m, anchors.size-1)],pivot)
         score = residual[pivot]
         valid = jnp.isfinite(score) & (score > 0)
         column = (gram[:, pivot] - factors @ factors[pivot].conj()) / jnp.sqrt(
@@ -83,6 +93,27 @@ def fixed_support_tangents(state, g0, supports, whiten, *, r_add):
     scores, tangents, eigenvalues = jax.lax.map(candidate, supports)
     best = jnp.argmax(scores)
     return best, tangents[best], scores, eigenvalues[best]
+
+
+def dictionary_equation_pivot(state, g0, shifts, tangents, column_ids, used):
+    """P0b: maximize ||R(shift_a)q_aj||² over unselected finite atoms.
+
+    shifts=(N_blocks,), tangents=(N_blocks,Nr,max_width), and column_ids=
+    (N_blocks,max_width), with -1 marking padding. used=(N_dictionary,).
+    Each block has one reduced factorization. Conjugate partners remain
+    separately indexed atoms; there is no continuum support selection.
+    Infinity is reserved and appended after this finite-only criterion.
+    """
+    def block(args):
+        s,q,ids=args
+        applied=residual_action(state,g0,s,q,masked_factor(state,s))
+        score=jnp.real(jnp.sum(q.conj()*applied,axis=0))
+        available=(ids>=0)&~used[jnp.maximum(ids,0)]
+        return jnp.where(available,score,-jnp.inf)
+    scores=jax.lax.map(block,(shifts,tangents,column_ids))
+    flat=jnp.argmax(scores)
+    group,within=flat//column_ids.shape[1],flat%column_ids.shape[1]
+    return column_ids[group,within],scores[group,within],scores
 
 
 def screening_operands(data):
@@ -621,6 +652,10 @@ def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
     free diagonal is operands[0]**4. Pair-space truth is diagnostic only.
     normalization_alpha defines (1-alpha)G0/tr(G0)+alpha I/Nr. A positive
     support cut is a separately declared P3 fallback, never an order selector.
+    Coordinator 2026-09-13 20:27 authorizes an independent stored-basis
+    interpolation floor: limit=min(1e-8,max(1e-10,10*floor)). Both models
+    and the limit are evaluated at every prefix; the sample error is never
+    used to set its own floor. Exact order and Gram guards are unchanged.
     """
     if r_add < 1 or k_max % r_add:
         raise ValueError('capacity must be a positive multiple of block width')
@@ -700,15 +735,25 @@ def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                     jnp.where(live[None,:],new['xi'][None,:]-theta[:,None],1))
                 err=jnp.linalg.norm(predicted-2*new['Y'],axis=0)/jnp.maximum(jnp.linalg.norm(2*new['Y'],axis=0),1e-300)
                 interpolation=jnp.max(jnp.where(live,err,0))
+                direct=dict(new,S=exact_s,H=exact_h)
+                td,cd,_=ritz_model(direct)
+                predicted_direct=cd@((cd.conj().T@new['Q'])/
+                    jnp.where(live[None,:],new['xi'][None,:]-td[:,None],1))
+                direct_error=jnp.linalg.norm(predicted_direct-2*new['Y'],axis=0)/jnp.maximum(jnp.linalg.norm(2*new['Y'],axis=0),1e-300)
+                replay_floor=jnp.max(jnp.where(live,direct_error,0))
+                interpolation_limit=jnp.minimum(1e-8,jnp.maximum(1e-10,10*replay_floor))
                 ratio=g[0]/jnp.max(jnp.where(live,g,0))
                 cg_error=jnp.maximum(jnp.max(cg['relative']),jnp.max(cgd['relative']))
                 failure=(jnp.int32(~jnp.isfinite(ratio)|(ratio<=1e-12))*2+
-                    jnp.int32(~jnp.isfinite(interpolation)|(interpolation>1e-10))*4+
+                    jnp.int32(~jnp.isfinite(interpolation)|~jnp.isfinite(replay_floor)|
+                              (interpolation>interpolation_limit))*4+
                     jnp.int32(jnp.any(cg['breakdown'])|jnp.any(cgd['breakdown'])|(cg_error>cg_tol))*8+
                     jnp.int32(theta[0]<=0)*16)
                 receipt=dict(m=m,support_index=best,shift=shift,score=scores[best],
                     all_support_scores=scores,block_eigenvalues=values,
                     interpolation=interpolation,gram_ratio=ratio,failure=failure,
+                    stored_basis_interpolation=replay_floor,interpolation_limit=interpolation_limit,
+                    at_floor=interpolation>1e-10,
                     gram_relative=jnp.linalg.norm(exact_s-new['S'])/jnp.linalg.norm(exact_s),
                     h_relative=jnp.linalg.norm(exact_h-new['H'])/jnp.linalg.norm(exact_h),
                     rhs_solves=(cg['rhs_solves']+cgd['rhs_solves']).astype(jnp.int32),
@@ -722,6 +767,7 @@ def build_fixed_support_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                 return carry,dict(m=jnp.int32(0),support_index=jnp.int64(0),shift=jnp.complex128(0),
                     score=jnp.float64(0),all_support_scores=jnp.zeros(supports.shape[0]),
                     block_eigenvalues=jnp.zeros(r_add),interpolation=jnp.float64(0),gram_ratio=jnp.float64(0),
+                    stored_basis_interpolation=jnp.float64(0),interpolation_limit=jnp.float64(0),at_floor=jnp.bool_(False),
                     failure=jnp.int32(0),gram_relative=jnp.float64(0),h_relative=jnp.float64(0),
                     rhs_solves=jnp.int32(0),derivative_rhs=jnp.int32(0),matvec_columns=jnp.int32(0),
                     cg_iterations=jnp.zeros(physical,jnp.int32),cg_relative=jnp.zeros(physical),
