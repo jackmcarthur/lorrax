@@ -7,10 +7,19 @@ Only the projected Sigma outputs acquire a leading bracket axis. The Green
 and FFT temporaries remain within the loop body; projected output sharding
 is explicitly `P(None, None, 'x', 'y')`.
 
-This removes repeated graph bodies, not the masked bands in the Green GEMM.
-The contraction still uses its configured full band extent. Changing that
-requires a separate tiled implementation through the common Green owner.
-Do not pad a stack of Green functions to replace the sequential loop.
+The face Green plan enables the shared [active-range GEMM service](active_gemm_ranges.md).
+After forming the exact phases and selector weights, `build_G_tau` finds
+nonzero support bounds for each parent k. There is no numerical threshold:
+only exact zero columns outside that interval are omitted. Explicit bracket
+bounds further restrict the interval. Interior holes retain zero weights;
+this is an interval contraction rather than arbitrary sparse compaction.
+The same range is used for the conjugated endpoint needed by antiunitary
+transport. Both bracketed and unbracketed face Sigma paths use this owner.
+The existing axis-layout route retains its original contraction.
+
+The wavefunction allocation shapes and distributed Green tiles stay fixed.
+Only native contraction dimensions change. Do not replace the sequential
+bracket scan with a stack of Green functions.
 
 `gw.mpa.sigma._batch_rows` returns fixed-width pole-index, bound, and phase
 arrays plus an int32 active-prefix count. Production passes that count as a
@@ -29,6 +38,10 @@ operation sequence.
 
 Validation is deliberately split:
 
+- `tests/multi_device/active_band_sigma_gate.py` compares bracketed and
+  unbracketed projected tau kernels with frozen full-band owners, including
+  scalar/spinor carriers, time reversal, signed/complex selectors, per-parent
+  ranges, empty parents, and interior holes.
 - `tests/test_gw_fixed_shape.py` verifies one compiled executable accepts
   changed active counts and skips poisoned inactive pole rows, and that
   postprocessing accepts changed indices and weights.

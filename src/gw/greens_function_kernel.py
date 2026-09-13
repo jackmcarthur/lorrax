@@ -8,7 +8,8 @@ import jax.numpy as jnp
 from common.contract_bands import merge_spin_centroid, split_spin_centroid
 
 
-def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None):
+def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
+                  band_range=None):
     """Contract band-replicated faces locally or band-distributed faces with their GEMM plan."""
     if Gij is not None:
         raise NotImplementedError("Green faces support diagonal band weights, not dense Gij.")
@@ -32,21 +33,25 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None):
         A = lax.with_sharding_constraint(A, in_sharding_a)
     if in_sharding_b is not None:
         B = lax.with_sharding_constraint(B, in_sharding_b)
-    G_flat = gemm(A, B)                              # (nk, mu*s, mu*s) P(_,'x','y')
+    G_flat = (gemm(A, B) if band_range is None
+              else gemm.active_range(A, B, *band_range))
+    # (nk, mu*s, mu*s), distributed over both centroid axes.
     G = split_spin_centroid(G_flat, 1, s_, mu_l_)
     G = split_spin_centroid(G, 3, s_, mu_r_)
     return G
 
 
 def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
-           gemm=None, k_unfold_plan=None, right_k_unfold_plan=None, real_weights=None):
+           gemm=None, k_unfold_plan=None, right_k_unfold_plan=None, real_weights=None,
+           band_range=None):
     """Build parent operators and transport both typed endpoints without processor exchange."""
     if layout not in ('face', 'axis'):
         raise ValueError("build_G requires canonical faces with layout=face or axis.")
     if gemm is None:
         raise ValueError("build_G requires a GEMM plan or typed parent plan-provided GEMM callable.")
     G = _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases,
-                      mesh=None if k_unfold_plan is None else k_unfold_plan.mesh_xy)
+                      mesh=None if k_unfold_plan is None else k_unfold_plan.mesh_xy,
+                      band_range=band_range)
     if k_unfold_plan is None:
         return G
     transposed = None
@@ -59,7 +64,8 @@ def build_G(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face',
                 (jnp.any(jnp.imag(phases) != 0) if real_weights is None
                  else ~jnp.asarray(real_weights)),
                 lambda _: _build_G_face(jnp.conj(psi_xn), jnp.conj(psi_yr),
-                                        gemm=gemm, Gij=Gij, phases=phases, mesh=k_unfold_plan.mesh_xy),
+                                        gemm=gemm, Gij=Gij, phases=phases, mesh=k_unfold_plan.mesh_xy,
+                                        band_range=band_range),
                 lambda _: jnp.conj(G), operand=None)
     return k_unfold_plan.unfold_operator(
         G, operator_transpose=transposed, right_plan=right_k_unfold_plan)
@@ -144,7 +150,8 @@ def windowed_exp_iEt(E, t, E_min=None, E_max=None, *, e_ref=0.0):
 
 def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                 band_weight=None, E_min=None, E_max=None,
-                layout='face', gemm=None, k_unfold_plan=None):
+                layout='face', gemm=None, k_unfold_plan=None, band_range=None,
+                trim_zero_bands=False):
     """Contract phases exp(-t*(energy-reference)) with energy windows, identity masks and signed weights."""
     real_weights = not jnp.issubdtype(jnp.result_type(t), jnp.complexfloating)
     if not real_weights:
@@ -175,6 +182,19 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
         mask = jnp.reshape(mask, enk.shape)
         phases = jnp.where(mask, phases,
                            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
+    if trim_zero_bands:
+        # Exact support, separately for every parent k. No numerical cutoff:
+        # interior holes retain their zero weights, while outer zero columns
+        # never enter the distributed contraction.
+        nb = phases.shape[-1]
+        index = jnp.arange(nb, dtype=jnp.int32)
+        live = phases != 0
+        lo = jnp.min(jnp.where(live, index, nb), axis=-1)
+        hi = jnp.max(jnp.where(live, index + 1, 0), axis=-1)
+        if band_range is not None:
+            lo = jnp.maximum(lo, band_range[0])
+            hi = jnp.minimum(hi, band_range[1])
+        band_range = (jnp.minimum(lo, hi), hi)
     return build_G(
         psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
-        k_unfold_plan=k_unfold_plan, real_weights=real_weights)
+        k_unfold_plan=k_unfold_plan, real_weights=real_weights, band_range=band_range)

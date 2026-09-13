@@ -81,6 +81,7 @@ one sentence and a link.
 | **how Lanczos active storage and reorthogonalization are planned** | [`planned Lanczos`](services/lanczos.md) | Active windows, row-oriented basis, restart and sharding. |
 | **how compact pseudopotential coupling is applied** | [`PSP coupling`](services/psp_compact_coupling.md) | Canonical SOC channel blocks, opt-in rollout and memory scope. |
 | **how GW fixed-shape kernels avoid unused work** | [`GW kernels`](dev/gw_fixed_shape_kernels.md) | Bracket scan, active pole counts and reusable postprocessing. |
+| **how GEMM contracts active intervals in fixed distributed buffers** | [`active GEMM ranges`](dev/active_gemm_ranges.md) | interval API, descriptor views, batch support, native workspace and validation. |
 | **how distributed dense linear algebra is requested** | [`distrib_la`](services/distrib_la.md) | the top-level API, plan/factor/solve and matmul contracts, backend resolution, layouts, and refusals. |
 | **how crystal symmetry data is represented and applied** | [`symmetry_maps`](services/symmetry_maps.md) | the top-level API, canonical maps and actions, storage boundaries, unfold contracts, and TRS checks. |
 | **how Coulomb kernels and q=0 cell averages are selected** | [`vcoul`](services/vcoul.md) | dimensional kernels, exact slab q=0 default, explicit debug alternatives, tensor-cell sampling, and refusals. |

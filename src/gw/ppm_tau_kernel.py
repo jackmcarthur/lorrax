@@ -294,23 +294,18 @@ def _get_sigma_kij_kernel(
     from distrib_la import gemm_plan
     _, nb, mu, ns = face_shape
     g_plan = gemm_plan(mesh_xy, m=mu * ns, k=nb, n=mu * ns,
-                       nq=k_unfold_plan.n_parent, dtype=jnp.complex128, layout=layout)
+                       nq=k_unfold_plan.n_parent, dtype=jnp.complex128, layout=layout,
+                       enable_active_range=(layout == "face"))
 
-    def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t):
+    def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t, band_range=None):
         """Apply boolean identity masks or signed occupation weights without clipping."""
-        if sel.dtype == jnp.bool_:
-            if energy_windows:
-                return build_G_tau(
-                    xn, yr, E, 1j * t, e_ref=ref, mask=sel,
-                    E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan, k_unfold_plan=k_unfold_plan)
-            return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, mask=sel,
-                               layout=layout, gemm=g_plan, k_unfold_plan=k_unfold_plan)
+        options = dict(e_ref=ref, layout=layout, gemm=g_plan,
+                       k_unfold_plan=k_unfold_plan, band_range=band_range,
+                       trim_zero_bands=(layout == "face"))
+        options["mask" if sel.dtype == jnp.bool_ else "band_weight"] = sel
         if energy_windows:
-            return build_G_tau(
-                xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
-                E_min=E_min, E_max=E_max, layout=layout, gemm=g_plan, k_unfold_plan=k_unfold_plan)
-        return build_G_tau(xn, yr, E, 1j * t, e_ref=ref, band_weight=sel,
-                           layout=layout, gemm=g_plan, k_unfold_plan=k_unfold_plan)
+            options.update(E_min=E_min, E_max=E_max)
+        return build_G_tau(xn, yr, E, 1j * t, **options)
 
     def _bracketed_face(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                         E_A, mask_A, E_min, E_max, E_ref_A, t_node,
@@ -328,7 +323,8 @@ def _get_sigma_kij_kernel(
             mask_bracket = (mask_A & in_range if mask_A.dtype == jnp.bool_
                            else mask_A * in_range.astype(mask_A.dtype))
             G_k = build_g(psi_coh_xn, psi_coh_yr, E_A, mask_bracket,
-                         E_min, E_max, E_ref_A, t_node)
+                         E_min, E_max, E_ref_A, t_node,
+                         band_range=(lo, hi) if layout == "face" else None)
             projected = conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
             return None, projected
 
