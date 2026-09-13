@@ -139,6 +139,67 @@ def empty_samples(n_ports, k_max):
                 active=jnp.zeros(k_max, bool), m=jnp.int32(0))
 
 
+def block_cg(apply_t, rhs, shift, *, maxiter, tol):
+    """Coupled block CG for (T-shift I)X=B, retaining all requested columns.
+
+    The block Galerkin recurrence solves (P†AP) alpha=R†R and
+    (Rold†Rold) beta=Rnew†Rnew. Columns are normalized initially and masked
+    when converged. Small singular/indefinite block systems refuse explicitly;
+    they never remove a requested tangent or change the model order.
+    Shapes, units and sharding follow column_cg. Both solver paths are kept
+    as distinct algorithms for the preregistered cost attribution.
+    """
+    axes = tuple(range(1, rhs.ndim))
+    broad = (rhs.shape[0],) + (1,)*len(axes)
+
+    def inner(a, b):
+        return jnp.einsum('acvk,bcvk->ab', a.conj(), b)
+
+    def combine(p, c):
+        return jnp.einsum('ab,acvk->bcvk', c, p)
+
+    bnorm = jnp.sqrt(jnp.sum(jnp.abs(rhs)**2, axis=axes))
+    b = rhs/jnp.where(bnorm > 0, bnorm, 1).reshape(broad)
+    live = bnorm > 0
+    initial = (jnp.zeros_like(b), b, b, inner(b,b), live,
+               jnp.zeros(rhs.shape[0],jnp.int32), jnp.int32(0),
+               jnp.int32(0), jnp.zeros_like(live))
+
+    def step(_, state):
+        def advance(state):
+            x,r,p,gamma,live,iterations,useful,issued,broken = state
+            ap = apply_t(p)-shift*p
+            mask = live[:,None] & live[None,:]
+            pap = inner(p,ap)
+            pap = jnp.where(mask,(pap+pap.conj().T)*.5,0)+jnp.diag(~live)
+            old = jnp.where(mask,(gamma+gamma.conj().T)*.5,0)+jnp.diag(~live)
+            bad = (jnp.linalg.eigvalsh(pap)[0] <= 0) | (jnp.linalg.eigvalsh(old)[0] <= 0)
+            alpha = jnp.linalg.solve(pap,gamma)
+            xn = x+combine(p,alpha)
+            rn = r-combine(ap,alpha)
+            rr = jnp.sum(jnp.abs(rn)**2,axis=axes)
+            next_live = live & (rr > tol*tol) & ~bad
+            rn = jnp.where(next_live.reshape(broad),rn,0)
+            gn = inner(rn,rn)
+            beta = jnp.linalg.solve(old,gn)
+            pn = rn+combine(p,beta)
+            finite = jnp.all(jnp.isfinite(xn)) & jnp.all(jnp.isfinite(pn))
+            bad = bad | ~finite
+            pn = jnp.where((next_live & ~bad).reshape(broad),pn,0)
+            return (xn,rn,pn,gn,next_live & ~bad,iterations+live,
+                    useful+jnp.sum(live,dtype=jnp.int32),issued+rhs.shape[0],
+                    broken | (live & bad))
+        return jax.lax.cond(jnp.any(state[4]),advance,lambda x:x,state)
+
+    x,_,_,_,_,iterations,useful,issued,broken = jax.lax.fori_loop(0,maxiter,step,initial)
+    x = x*bnorm.reshape(broad)
+    residual = rhs-(apply_t(x)-shift*x)
+    relative = jnp.sqrt(jnp.sum(jnp.abs(residual)**2,axis=axes))/jnp.where(bnorm>0,bnorm,1)
+    return x,dict(iterations=iterations,relative=relative,breakdown=broken,
+                  matvec_columns=issued+rhs.shape[0],
+                  useful_matvec_columns=useful+jnp.sum(bnorm>0),rhs_solves=jnp.sum(bnorm>0))
+
+
 def complex_shifted_cg(apply_t, rhs, shift, *, maxiter, tol):
     """Solve (shift I-T)x=rhs using a Hermitian positive normal operator.
 
