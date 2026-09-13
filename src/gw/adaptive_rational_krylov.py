@@ -453,6 +453,10 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                             distance = jnp.abs(s-jnp.clip(s.real,a,b))
                             score = jnp.where(s.imag==0,score,
                                 hybrid_alpha*jnp.sqrt(jnp.maximum(value,0))/distance)
+                        # An exhausted contour gives top_k only masked slots.
+                        # Those slots must not reintroduce an accepted support;
+                        # its repeated block needs a separate confluent solve.
+                        score = jnp.where(jnp.isfinite(indicators[i]), score, -jnp.inf)
                         return q, score
 
                     qs, scores = jax.lax.map(candidate, ids)
