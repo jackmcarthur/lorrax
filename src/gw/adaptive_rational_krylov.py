@@ -63,72 +63,6 @@ def build_screening_actions(matvec, gen, snapshot, sh, *, nk, nspinor):
     return apply_t, apply_b, apply_bh
 
 
-def column_cg(apply_t, rhs, shift, *, maxiter, tol):
-    """Solve (T-shift I)x=rhs by batched independent Hermitian CG.
-
-    Parameters
-    ----------
-    apply_t : callable
-        Matrix-free T action, preserving rhs shape and named sharding.
-    rhs : jax.Array
-        Complex128 (r, *pair_shape), pair dimensions distributed on x/y.
-    shift : scalar
-        Real negative squared frequency in Ry²; caller validates this.
-    maxiter : int
-        Compile-time bound. Converged columns have zero search directions.
-    tol : float
-        Relative Euclidean residual tolerance per nonzero RHS.
-
-    Returns
-    -------
-    x, receipt : tuple
-        Solution and small arrays counting iterations, useful/issued matvec
-        columns, final true residuals, and breakdowns. The final residual
-        matvec is counted. This is column-CG, not a block-Gram CG recurrence.
-    """
-    axes = tuple(range(1, rhs.ndim))
-    broad = (rhs.shape[0],) + (1,) * len(axes)
-
-    def dot(a, b):
-        return jnp.sum(jnp.conj(a) * b, axis=axes).real
-
-    b2 = dot(rhs, rhs)
-    threshold = tol * tol * b2
-    live = b2 > 0
-    initial = (jnp.zeros_like(rhs), rhs, rhs, b2, live,
-               jnp.zeros(rhs.shape[0], jnp.int32), jnp.int32(0),
-               jnp.int32(0), jnp.zeros_like(live))
-
-    def step(_, state):
-        def advance(state):
-            x, r, p, rr, live, iterations, useful, issued, broken = state
-            ap = apply_t(p) - shift * p
-            pap = dot(p, ap)
-            bad = live & ((pap <= 0) | ~jnp.isfinite(pap))
-            moving = live & ~bad
-            alpha = jnp.where(moving, rr / jnp.where(moving, pap, 1), 0)
-            x = x + alpha.reshape(broad) * p
-            r = r - alpha.reshape(broad) * ap
-            rr_new = dot(r, r)
-            next_live = moving & (rr_new > threshold)
-            beta = jnp.where(next_live, rr_new / jnp.where(rr > 0, rr, 1), 0)
-            p = jnp.where(next_live.reshape(broad), r + beta.reshape(broad) * p, 0)
-            return (x, r, p, rr_new, next_live, iterations + live,
-                    useful + jnp.sum(live, dtype=jnp.int32),
-                    issued + rhs.shape[0], broken | bad)
-
-        return jax.lax.cond(jnp.any(state[4]), advance, lambda x: x, state)
-
-    x, _, _, _, _, iterations, useful, issued, broken = jax.lax.fori_loop(
-        0, maxiter, step, initial)
-    residual = rhs - (apply_t(x) - shift * x)
-    relative = jnp.sqrt(dot(residual, residual) / jnp.where(b2 > 0, b2, 1))
-    return x, dict(iterations=iterations, relative=relative, breakdown=broken,
-                   matvec_columns=issued + rhs.shape[0],
-                   useful_matvec_columns=useful + jnp.sum(b2 > 0),
-                   rhs_solves=jnp.sum(b2 > 0))
-
-
 def empty_samples(n_ports, k_max):
     """Allocate §2's reduced buffers (complex128) with zero inactive columns."""
     return dict(xi=jnp.zeros(k_max, jnp.complex128),
@@ -176,7 +110,7 @@ def block_cg(apply_t, rhs, shift, *, maxiter, tol, orthonormalize):
     equivalent CG recurrence avoids inversion of the nearly singular R†R.
     Converged RHS columns become no-ops; search-space numerical nulls are
     counted separately and never remove a requested model tangent.
-    Shapes, units and sharding follow column_cg.
+    Arrays are complex128 (r,c,v,k), in Ry², tiled by their existing named mesh.
     """
     axes = tuple(range(1,rhs.ndim))
     broad = (rhs.shape[0],)+(1,)*len(axes)
@@ -227,7 +161,36 @@ def block_cg(apply_t, rhs, shift, *, maxiter, tol, orthonormalize):
                   useful_matvec_columns=useful+jnp.sum(bnorm>0),rhs_solves=jnp.sum(bnorm>0))
 
 
-def complex_shifted_cg(apply_t, rhs, shift, *, maxiter, tol):
+def preconditioned_block_cg(apply_t, rhs, shift, diagonal, *, maxiter, tol,
+                            orthonormalize):
+    """Symmetric free-diagonal preconditioning of the negative-axis solve.
+
+    diagonal is the positive transition-square operator Delta² in Ry²,
+    with broadcast-compatible pair sharding. P=Delta²-shift is positive.
+    The norm-equivalence factor converts the requested original-system tol
+    into an internal scaled tolerance; no empirical threshold is introduced.
+    The separately checked original-system residual costs one extra T block.
+    """
+    positive = diagonal-shift
+    root = jax.lax.rsqrt(positive)
+    inner_tol = tol*jnp.sqrt(jnp.min(positive)/jnp.max(positive))
+
+    def scaled(v):
+        return root*(apply_t(root*v)-shift*root*v)
+
+    y,receipt = block_cg(scaled,root*rhs,jnp.float64(0),maxiter=maxiter,
+                         tol=inner_tol,orthonormalize=orthonormalize)
+    x = root*y
+    residual = rhs-(apply_t(x)-shift*x)
+    axes = tuple(range(1,rhs.ndim))
+    b2 = jnp.sum(jnp.abs(rhs)**2,axis=axes)
+    relative = jnp.sqrt(jnp.sum(jnp.abs(residual)**2,axis=axes)/jnp.where(b2>0,b2,1))
+    return x,dict(receipt,relative=relative,internal_tolerance=inner_tol,
+                  matvec_columns=receipt['matvec_columns']+rhs.shape[0],
+                  useful_matvec_columns=receipt['useful_matvec_columns']+jnp.sum(b2>0))
+
+
+def complex_shifted_cg(apply_t, rhs, shift, *, maxiter, tol, orthonormalize):
     """Solve (shift I-T)x=rhs using a Hermitian positive normal operator.
 
     For shift=c+id, D=(T-cI)^2+d²I and x=(conj(shift)I-T)D^-1 rhs.
@@ -242,7 +205,8 @@ def complex_shifted_cg(apply_t, rhs, shift, *, maxiter, tol):
         av = apply_t(v) - shift.real * v
         return apply_t(av) - shift.real * av + shift.imag**2 * v
 
-    y, receipt = column_cg(normal, rhs, jnp.float64(0), maxiter=maxiter, tol=tol)
+    y, receipt = block_cg(normal, rhs, jnp.float64(0), maxiter=maxiter, tol=tol,
+                          orthonormalize=orthonormalize)
     x = shift.conjugate() * y - apply_t(y)
     residual = rhs - (shift * x - apply_t(x))
     axes = tuple(range(1, rhs.ndim))
@@ -409,7 +373,7 @@ def append_infinity(state, qinf, g0, g1):
 
 def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                         n_grid, shortlist, n_power, cg_maxiter, cg_tol,
-                        pair_shape, store_truth, block_callback=None):
+                        pair_shape, store_truth, block_callback=None, pair_diagonal=None):
     """Compile §§11–13's fixed-shape outer scan and per-column CG masks.
 
     The returned callable accepts runtime (operands, G0, grid, spectral_ends,
@@ -419,6 +383,8 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
     Spectral ends and grid are in Ry²; no Sigma information enters selection.
     Only Extension A is enabled here. store_truth retains Si's sharded X and
     direct Gram/H diagnostics; the sample-only algorithm never reads X.
+    pair_diagonal supplies the free positive transition-square diagonal for
+    the production preconditioner; planted generic operators may omit it.
     An optional host diagnostic callback receives only the small receipt once
     per attempted block. It never controls selection or changes the model.
     """
@@ -426,6 +392,7 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
         raise ValueError('candidate grid must cover the shortlist')
     n_outer = (k_max + r_add - 1) // r_add
     zero = jnp.int32(0)
+    orthonormalize = make_block_qr(sh.X)
 
     @jax.jit
     def run(operands, g0, grid, spectral_ends, requested):
@@ -465,8 +432,13 @@ def build_adaptive_loop(apply_t, apply_b, apply_bh, sh, *, k_max, r_add,
                 shift, q, score = jax.lax.cond(state['m']==0,
                     lambda _: (-jnp.sqrt(a*b)+0j, seed, jnp.float64(1)), choose, None)
                 rhs = -apply_b(q, operands)
-                x, cg = column_cg(lambda v: apply_t(v, operands), rhs, shift.real,
-                                   maxiter=cg_maxiter, tol=cg_tol)
+                if pair_diagonal is None:
+                    x,cg = block_cg(lambda v:apply_t(v,operands),rhs,shift.real,
+                                    maxiter=cg_maxiter,tol=cg_tol,orthonormalize=orthonormalize)
+                else:
+                    x,cg = preconditioned_block_cg(lambda v:apply_t(v,operands),rhs,
+                        shift.real,pair_diagonal(operands),maxiter=cg_maxiter,tol=cg_tol,
+                        orthonormalize=orthonormalize)
                 y = apply_bh(x, operands)
                 gram = jnp.einsum('acvk,bcvk->ab', x.conj(), x)
                 new, reused = append_samples(state, shift, q, y, gram)
