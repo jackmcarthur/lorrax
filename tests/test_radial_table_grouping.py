@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 from psp.species import SpeciesData
-from psp.radial_tables import build_all_tables
+from psp.radial_tables import build_all_tables, qe_beta_radial_scheme
 from psp.radial import radial_jax
 
 @pytest.mark.parametrize('projectors,second,third', [(False,False,False),(True,False,False),(True,True,False),(True,True,True)])
@@ -15,6 +15,17 @@ def test_grouped_tables_match_independent_rows(monkeypatch, projectors, second, 
     flags=dict(projectors=projectors,second_derivatives=second,third_derivatives=third)
     got=build_all_tables([sp],4.,65,**flags)
     kernel=radial_jax.spherical_hankel_table_batch_jax
+    if projectors:
+        # Independent per-projector recurrence inputs catch a shared family
+        # selection or scatter error in both batched and single-row builds.
+        n, weights = qe_beta_radial_scheme(sp.r, sp.rab, sp.kkbeta)
+        for ip, ell in enumerate(ls):
+            for key, order in [('proj_tables', 0), ('deriv_tables', 1)]:
+                radial = beta[ip, :n] * sp.r[:n] ** order
+                reference = np.asarray(kernel(int(ell + order), sp.r[:n],
+                                              radial[None, :], got['q'], weights))[0]
+                np.testing.assert_allclose(got[key][0][ip], reference,
+                                           rtol=2e-12, atol=2e-11)
     def separate(l,r,rows,q,w):
         return np.concatenate([np.asarray(kernel(l,r,row[None,:],q,w)) for row in rows])
     monkeypatch.setattr(radial_jax,'spherical_hankel_table_batch_jax',separate)
