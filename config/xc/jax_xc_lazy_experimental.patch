@@ -1,0 +1,18 @@
+--- a/jax_xc/__init__.py
++++ b/jax_xc/__init__.py
+@@ -5,6 +5,14 @@
+ # You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+ from .functionals import *  # noqa
+-from . import experimental  # noqa
++# Experimental functional differentiation needs optional autofd.  Import it
++# only when requested; core generated libxc kernels do not use that package.
++def __getattr__(name):
++    if name == "experimental":
++        from importlib import import_module
++        module = import_module(".experimental", __name__)
++        globals()[name] = module
++        return module
++    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ __version__ = "0.0.11"

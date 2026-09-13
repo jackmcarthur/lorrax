@@ -41,8 +41,24 @@ def pbe_functional():
 
     eps_xc_fn(rho, sigma) → energy per electron in Ry.
     """
-    from jax_xc_local.pbe import pbe_xc
-    return pbe_xc, XCLevel.GGA
+    # The upstream public factories take a callable spatial density.  We
+    # already have rho and sigma from the periodic FFT grid, so use its
+    # generated scalar kernels and vectorize over grid points here.
+    from jax_xc.impl import gga_x_pbe, gga_c_pbe
+    from jax_xc.utils import get_p
+
+    exchange = get_p("gga_x_pbe", False)
+    correlation = get_p("gga_c_pbe", False)
+
+    def scalar_eps(rho, sigma):
+        return 2.0 * (gga_x_pbe.unpol(exchange, rho, sigma)
+                      + gga_c_pbe.unpol(correlation, rho, sigma))
+
+    def eps_xc(rho, sigma):
+        rho, sigma = jnp.broadcast_arrays(rho, sigma)
+        return jax.vmap(scalar_eps)(rho.reshape(-1), sigma.reshape(-1)).reshape(rho.shape)
+
+    return eps_xc, XCLevel.GGA
 
 
 # ═══════════════════════════════════════════════════════════════════════
