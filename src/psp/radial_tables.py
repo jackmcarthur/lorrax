@@ -351,10 +351,10 @@ def build_all_tables(
     the projector/deriv rows it would throw away cost ~8.3 s of the
     8.5 s build, the l=0 rows 0.2 s (measured 2026-08-28, WSL CPU x64).
 
-    Per-species the per-projector forward (F_l) and analytic-deriv
-    raw-Hankel (H_{l+1}) tables are produced in two batched JAX kernel
-    families — one per unique l (resp. l+1).  Contact setup adds the
-    opt-in l+2 family; a finite-transfer q2 jet adds the opt-in l+3 family.
+    Per species, forward F_l and analytic derivative H_(l+1) rows sharing
+    a Bessel order are transformed together on the exact kkbeta mesh.
+    Contact setup joins the opt-in l+2 rows; a finite-transfer q2 jet joins
+    the opt-in l+3 rows. Output tables retain the original projector order.
     All Bessel evaluation
     + integrand reduction lives on GPU; only the (n_proj_s, n_q)
     result moves back to host.  Replaces a per-projector scipy.special
@@ -457,37 +457,32 @@ def build_all_tables(
         # Deriv raw H_{l+1}: integrand is β(r) = (β/r)·r, Bessel order l_p+1
         beta_full = beta_over_r * sp.r[None, :kkb]                      # (n_proj, kkb)
 
-        for l_val in np.unique(ls):
-            idx = np.where(ls == l_val)[0]
-            F_block = spherical_hankel_table_batch_jax(
-                int(l_val), rb_j,
-                jnp.asarray(beta_over_r[idx], dtype=jnp.float64),
-                q_j, wb_j,
-            )
-            F_table[idx] = np.asarray(F_block)
-
-        for l_val in np.unique(ls + 1):
-            idx = np.where(ls + 1 == l_val)[0]
-            H_block = spherical_hankel_table_batch_jax(
-                int(l_val), rb_j,
-                jnp.asarray(beta_full[idx], dtype=jnp.float64),
-                q_j, wb_j,
-            )
-            H_table[idx] = np.asarray(H_block)
+        # Share each Bessel-order evaluation across forward/derivative
+        # families on this species' exact kkbeta mesh. Only the small radial
+        # input rows are joined; no q×r array is duplicated per family.
+        families = [beta_over_r, beta_full]
+        if second_derivatives:
+            families.append(beta_full * sp.r[None, :kkb])
+        if third_derivatives:
+            families.append(beta_full * sp.r[None, :kkb] ** 2)
+        family_tables = [F_table, H_table]
+        family_tables.extend(np.zeros_like(F_table) for _ in families[2:])
+        orders = np.unique(np.concatenate([ls + order for order in range(len(families))]))
+        for l_val in orders:
+            requests = [(order, np.flatnonzero(ls + order == l_val))
+                        for order in range(len(families))]
+            requests = [(order, idx) for order, idx in requests if len(idx)]
+            radial_rows = np.concatenate([families[order][idx] for order, idx in requests])
+            transformed = np.asarray(spherical_hankel_table_batch_jax(
+                int(l_val), rb_j, jnp.asarray(radial_rows, dtype=jnp.float64),
+                q_j, wb_j))
+            offset = 0
+            for order, idx in requests:
+                family_tables[order][idx] = transformed[offset:offset + len(idx)]
+                offset += len(idx)
 
         if second_derivatives:
-            J_table = np.zeros((n_proj, n_q), dtype=np.float64)
-            # Second derivative recurrence: J_{l+2} uses r*beta(r).
-            for l_val in np.unique(ls + 2):
-                idx = np.where(ls + 2 == l_val)[0]
-                J_block = spherical_hankel_table_batch_jax(
-                    int(l_val), rb_j,
-                    jnp.asarray(beta_full[idx] * sp.r[None, :kkb],
-                                dtype=jnp.float64),
-                    q_j, wb_j,
-                )
-                J_table[idx] = np.asarray(J_block)
-
+            J_table = family_tables[2]
             Gpp_table = np.empty_like(F_table)
             for ip, l_val in enumerate(ls):
                 origin_moment = float(np.sum(
@@ -496,17 +491,7 @@ def build_all_tables(
                     q, int(l_val), H_table[ip], J_table[ip], origin_moment)
 
             if third_derivatives:
-                K_table = np.zeros((n_proj, n_q), dtype=np.float64)
-                # Third derivative recurrence: K_{l+3} uses r^2*beta(r).
-                for l_val in np.unique(ls + 3):
-                    idx = np.where(ls + 3 == l_val)[0]
-                    K_block = spherical_hankel_table_batch_jax(
-                        int(l_val), rb_j,
-                        jnp.asarray(beta_full[idx] * sp.r[None, :kkb] ** 2,
-                                    dtype=jnp.float64),
-                        q_j, wb_j,
-                    )
-                    K_table[idx] = np.asarray(K_block)
+                K_table = family_tables[3]
                 Gppp_table = np.empty_like(F_table)
                 for ip, l_val in enumerate(ls):
                     Gppp_table[ip] = _reduced_projector_third_derivative(
