@@ -1,8 +1,11 @@
-"""Semantics for compact omega folds in the Sigma accumulator.
+"""Check the addition of frequency-weighted Σ(τ) matrices into Σ(ω).
 
-The ordinary suite exercises the same kernels on one CPU device. A P4 run
-uses a real 2x2 band mesh, so the anti-Hermitian checks cross the ``x``/``y``
-band shards. Performance measurements live in Run394 rather than this file.
+The tests cover updating every output frequency or only a requested subset,
+including consecutive, nonconsecutive, descending, and empty selections. The
+ordinary suite runs on one CPU device. The four-GPU run distributes the two
+band axes over a 2 by 2 processor mesh, so its anti-Hermitian completion also
+checks communication between band-matrix shards. Runtime measurements are
+recorded separately in Run394.
 """
 from __future__ import annotations
 

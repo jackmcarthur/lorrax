@@ -1,10 +1,15 @@
-"""Shared on-device omega accumulator for dynamic Sigma.
+"""Accumulate time-domain Sigma matrices into dynamic Sigma at real frequencies.
 
-``DeviceOmegaAccumulator`` is the sole consumer of transient sigma(tau)
-tiles for both MPA and one-pole GN/HL-PPM stores.  It folds directly into the
-sharded omega cube and retains no tau history or host-side projection path.
-The anti-Hermitian window completion is used only by the shared ``panes``
-control planner; production denominator-box windows are fully causal.
+For each quadrature node, the spatial kernel produces one ``sigma(tau)``
+matrix. ``DeviceOmegaAccumulator`` multiplies that matrix by the scalar
+coefficient for each requested real frequency and immediately adds the result
+to ``sigma(omega)``. It serves both MPA and one-pole GN/HL-PPM data and never
+stores a history of time-domain matrices or moves them to a host calculation.
+
+Some one-sided control quadratures first sum their time-node contributions into
+a temporary ``Z`` and then add ``(Z - Z†) / (2i)`` to the result. That
+temporary contains only the frequencies selected by the control window. All
+matrices retain the result's distribution over the two band axes.
 """
 
 from __future__ import annotations
@@ -20,17 +25,19 @@ import numpy as np
 from common.collectives import device_put_process_local
 
 def _omega_coefficient(xp, omega, t, alpha, sign, prefactor, e_ref=0.0):
-    """Frequency coefficient shared by the host and device folds."""
+    """Return the scalar multiplying ``sigma(t)`` at each output frequency."""
     return ((prefactor * alpha)
             * xp.exp(-1j * (e_ref - sign * omega) * t))
 
 
 @lru_cache(maxsize=8)
 def _antiherm_band_fn(sharding: NamedSharding):
-    """``Z -> (Z − Z†)/2i`` on the trailing (i, j) axes, output re-sharded back.
+    """Convert a one-sided sum ``Z`` to ``(Z-Z†)/(2i)`` on its band axes.
 
-    Cached per sharding so the resharding collective is compiled once per Σ
-    stage rather than once per window.
+    The two trailing axes are the outgoing and incoming band indices. The
+    result keeps their requested distribution across ranks. Reusing this JAX
+    function for the same distribution avoids rebuilding it for every planned
+    frequency window.
     """
     return jax.jit(
         lambda Z: (Z - jnp.conj(jnp.swapaxes(Z, -1, -2))) / 2j,
@@ -46,7 +53,7 @@ def _device_output_zeros(shape, sharding):
 
 
 def _omega_fold(acc, sigma, coeff, omega_axis):
-    """Add ``coeff[omega] * sigma`` with an explicit omega-axis position."""
+    """Add one time-domain Sigma matrix to every represented frequency."""
     coeff_shape = ((1,) * omega_axis + (coeff.shape[0],)
                    + (1,) * (acc.ndim - omega_axis - 1))
     return acc + coeff.reshape(coeff_shape) * jnp.expand_dims(
@@ -55,7 +62,7 @@ def _omega_fold(acc, sigma, coeff, omega_axis):
 
 def _active_omega_fold(acc, sigma, coeff, indices, omega_axis,
                        contiguous=False):
-    """Update distinct selected frequency rows in the original node order."""
+    """Add one Sigma matrix at frequencies named by distinct output indices."""
     if contiguous:
         selected = jax.lax.dynamic_slice_in_dim(
             acc, indices[0], coeff.shape[0], axis=omega_axis)
@@ -105,15 +112,20 @@ def _device_output_add(sharding):
 
 
 class DeviceOmegaAccumulator:
-    """Fold one transient sigma(tau) tile into a sharded omega cube.
+    """Build real-frequency Sigma without retaining time-domain matrices.
 
-    No tau history is retained.  A full/Laplace window accumulates directly
-    into the result. A one-sided sine window uses a temporary containing only
-    its active frequencies,
-    applies ``(Z-Z†)/(2i)`` once after its last tau, then adds it to the same
-    result.  ``alpha`` is the quadrature weight before reference rephasing;
-    combining ``E_ref_sum`` and omega in one exponential avoids separately
-    overflowing two factors whose product is well conditioned.
+    ``begin_window`` records a sequence of quadrature nodes and the output
+    frequencies they contribute to. Each call to ``add_tau`` consumes the
+    spatial Sigma matrix for the next node and updates those output frequencies
+    in the declared order.
+
+    Most windows update the final result immediately. A one-sided window first
+    forms ``Z(omega) = sum_t coefficient(omega, t) * sigma(t)`` for only its
+    selected frequencies. ``end_window`` then computes
+    ``(Z-Z†)/(2i)`` on the band indices and adds it to the final result.
+    ``alpha`` is the quadrature weight before the reference energy is included.
+    Combining ``E_ref_sum`` and omega in one exponential avoids separately
+    evaluating two large factors whose product is well conditioned.
     """
 
     def __init__(self, omega_vec, *, shape, sharding, omega_axis):
@@ -131,8 +143,9 @@ class DeviceOmegaAccumulator:
             raise ValueError(
                 "DeviceOmegaAccumulator: shape[omega_axis] must equal "
                 "n_omega")
-        # Per-rank ω-cube: nω·nk·(nb_pad/p_x)·(nb_pad/p_y)·16 bytes (c128),
-        # A crossing window additionally holds only its active omega planes.
+        # Each rank stores every output frequency and parent-k point for its
+        # assigned block of the two band axes. A one-sided window additionally
+        # stores Z for only the output frequencies that window selects.
         self._total = _device_output_zeros(self._shape, sharding)()
         self._window = None
         self._coeff = None
@@ -172,8 +185,9 @@ class DeviceOmegaAccumulator:
             np.complex128)
         self._coeff = active
         self._indices = indices
-        # Frequency values may be abs/rephased; only storage coordinates
-        # decide contiguity. Descending or gapped selections retain order.
+        # omega_values enters the coefficient. omega_indices says where the
+        # resulting contributions belong in the output. A descending or gapped
+        # index list is read and written by explicit index in the given order.
         omega_partition = (
             self._sharding.spec[self._omega_axis]
             if self._omega_axis < len(self._sharding.spec) else None)
@@ -191,10 +205,15 @@ class DeviceOmegaAccumulator:
             tuple(window_shape), self._sharding)() if antihermitian else None)
 
     def precompile_tau_add(self, *, sigma_shape, sigma_sharding):
-        """Warm each cheap frequency-fold signature once, without a tau tile.
+        """Compile the next time-node update without evaluating a Sigma matrix.
 
-        Call after ``begin_window`` to warm its exact active width. Returns
-        whether a signature was newly warmed by this accumulator instance.
+        JAX reuses compiled code when the operation, array shapes, data types,
+        and distribution across ranks match. Call this after ``begin_window``;
+        it compiles the update for that window's number of selected frequencies
+        once per accumulator. The return value is true only on this
+        accumulator's first request for that combination; JAX may satisfy the
+        request from an executable already held in a process or persistent
+        cache.
         """
         sigma = jax.ShapeDtypeStruct(
             tuple(int(n) for n in sigma_shape), jnp.complex128,
@@ -247,8 +266,9 @@ class DeviceOmegaAccumulator:
             self._window = _device_omega_add(
                 self._sharding, self._omega_axis)(
                 self._window, sigma_tau, coeff)
-        # The caller may block on the updated accumulator when profiling.
-        # Production ignores this return and keeps the incumbent async path.
+        # Returning the updated array lets timing code wait for the addition as
+        # well as the spatial Sigma calculation. Normal execution waits only at
+        # progress milestones and otherwise leaves JAX work asynchronous.
         return self._total if self._window is None else self._window
 
 
@@ -273,13 +293,12 @@ class DeviceOmegaAccumulator:
         self._contiguous = False
 
     def add_direct(self, sigma_omega, omega_index, *, coefficient=1.0):
-        """Add one exact direct-frequency tile outside the tau lifecycle.
+        """Add a Sigma matrix already evaluated at one output frequency.
 
-        Direct reciprocal terms already carry their complete denominator,
-        so there is no tau coefficient or open window.  Reusing the ordinary
-        sharded omega-add primitive keeps the output layout and accumulation
-        order identical to tau contributions while making the separate cost
-        currency explicit at the call site.
+        A direct reciprocal-space term already includes its complete
+        denominator, so it needs no time-node coefficient. The update retains
+        the same output distribution and numerical addition order as the
+        quadrature contributions.
         """
         if self._coeff is not None:
             raise RuntimeError(

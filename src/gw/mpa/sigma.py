@@ -56,12 +56,13 @@ _DEBUG_MAX_TAU_DISPATCHES_ENV = "LORRAX_DEBUG_SIGMA_MAX_TAU_DISPATCHES"
 
 
 def _resolve_debug_max_tau_dispatches(*, print_fn=print):
-    """Return the debug-only bounded-sweep length, or ``None``.
+    """Return how many time nodes a debug timing run should evaluate.
 
-    A bounded sweep is a performance instrument, not a quadrature rule: the
-    executor exits cleanly after the requested number of real-shape tau
-    node evaluations and never returns a partial Sigma cube to an output
-    consumer. The environment variable retains its historical spelling.
+    This limit measures the real spatial calculation and frequency update for
+    the requested number of nodes. It does not define a quadrature rule. After
+    reaching the limit, the program exits without sending the incomplete Sigma
+    result to any scientific output. The environment variable retains its
+    historical spelling.
     """
     raw = os.environ.get(_DEBUG_MAX_TAU_DISPATCHES_ENV)
     if raw is None or not raw.strip():
@@ -122,7 +123,7 @@ def _debug_probe_print(line):
 
 
 def _print_tau_profile(before, *, n_tau, print_fn=_debug_probe_print):
-    """Print post-prewarm timing deltas for the staged tau diagnostic."""
+    """Print stage times after the first required JAX compilation finishes."""
     after = _tau_profile_snapshot()
     print_fn("--- Sigma tau phase profile (post-prewarm, blocking) ---")
     print_fn(f"{'Phase':<31} {'Count':>7} {'Total[s]':>11} {'s/node':>13}")
@@ -196,15 +197,15 @@ def _bounded_pole_batch_size(value):
 
 
 def _batch_rows(row, batch):
-    """Relocalize one window's pole ranges into a fixed batch-width carrier.
+    """Describe this window's selected poles within the current device batch.
 
-    The tau kernel's executable signature must not depend on how many poles a
-    particular pane/product window selects.  Inactive rows therefore occupy
-    the remaining batch slots with an impossible ``a`` interval.  All windows
-    over a resident batch then call the same jitted callable with identical
-    shapes, dtypes, and shardings; only the selector values change. The
-    returned int32 count bounds the occupied prefix so empty slots do not
-    execute the pole-field arithmetic.
+    The returned arrays always have one row for every pole in the resident
+    batch. Unused rows receive bounds that cannot select a finite pole. Windows
+    selecting different numbers of poles can therefore call the same compiled
+    JAX operation because their array shapes, data types, and distribution
+    across ranks remain equal. The returned int32 count tells the operation how
+    many leading rows contain real selections, so it skips arithmetic for the
+    unused rows.
     """
     batch = tuple(int(p) for p in batch)
     local = {int(p): i for i, p in enumerate(batch)}
@@ -371,9 +372,12 @@ def _integrate_sigma_batches(
             E_A_call = k_unfold_plan.parent_rows(row.E_A)
             selector = k_unfold_plan.parent_rows(
                 jnp.reshape(selector, np.shape(row.E_A)))
-            # These operands are invariant over this window. Keep the
-            # expensive spatial executable independent of omega width;
-            # only the inexpensive frequency fold specializes on that width.
+            # These arrays do not change between time nodes in this planned
+            # window. The spatial operation sees no output-frequency array, so
+            # selecting a different number of output frequencies does not give
+            # that expensive operation a new input shape. Only multiplication
+            # by the frequency coefficients and addition to Sigma(omega)
+            # depends on the selection length.
             tau_arguments = (
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                 E_A_call, selector, B_branch, Omega,
@@ -403,8 +407,9 @@ def _integrate_sigma_batches(
                     tau_kernel.lower(
                         *tau_arguments, first_t, active_count).compile()
                 else:
-                    # The staged timing diagnostic prewarms its separate
-                    # kernels with one real-shape call on every rank.
+                    # The staged timing mode consists of several JAX functions
+                    # rather than one compiled function. Evaluate one ordinary
+                    # time node on every rank before starting its timing table.
                     jax.block_until_ready(tau_kernel(
                         *tau_arguments, first_t, active_count))
             accumulator.precompile_tau_add(
@@ -448,9 +453,10 @@ def _integrate_sigma_batches(
     progress.finish()
 
     if debug_max_tau is not None:
-        # Close every outstanding asynchronous accumulator/end-window update
-        # before stopping the measurement clock.  The partial cube dies here;
-        # it is never wrapped in SigmaOmegaResult or handed to an output path.
+        # Wait for the spatial calculation, coefficient additions, and any
+        # one-sided (Z-Z†)/(2i) operation before stopping the clock. This
+        # incomplete Sigma result is discarded here and never reaches a
+        # scientific output object.
         jax.block_until_ready(accumulator.finalize())
         elapsed = time.perf_counter() - sweep_wall_start
         _debug_probe_print(
@@ -467,8 +473,9 @@ def _integrate_sigma_batches(
     sigma = accumulator.finalize()
     from symmetry_maps import unfold_file_wedge_band_operator
     k_axis = 2 if bracketed else 1
-    # Transpose is complex-linear, so transport follows the complete omega
-    # fold without conjugating quadrature coefficients or storing tau tiles.
+    # The symmetry transport is linear over complex values. Applying it after
+    # all time-node contributions therefore neither conjugates the quadrature
+    # coefficients nor requires storing the individual time-domain matrices.
     sigma = jax.jit(lambda value: jnp.moveaxis(
         unfold_file_wedge_band_operator(
             k_unfold_plan.sym, jnp.moveaxis(value, k_axis, 0),

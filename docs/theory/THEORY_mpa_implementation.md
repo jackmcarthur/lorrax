@@ -726,61 +726,104 @@ Green-function builder or convolution. This is also the extension seam: an
 alternative two-point $G$ or $W$ may supply the same tiles, while a genuine
 three-point vertex requires a different contraction rather than another flag.
 
-Only one $G(t)$, one $W(t)$, and one Sigma tile are live per node. The tile is
-folded directly into every requested real frequency and discarded; no time
-history is written. The number of output frequencies therefore changes the
-cheap fold and storage work approximately linearly, not the expensive node
-count. Widening the output interval changes the denominator geometry and can
-increase that node count.
+At a time node $t_j$, the spatial calculation produces a matrix
+$\Sigma^{(j)}_{mn\mathbf k}$ that has no output-frequency axis. Its contribution
+to an output frequency $\omega_l$ is
 
-`gw.ppm_accumulators.DeviceOmegaAccumulator` owns that fold as a strict window
-lifecycle. `begin_window` validates the time nodes and weights, and accepts
-optional distinct output-frequency indices paired with frequency values. It then
-forms the scalar coefficients for exactly those frequencies. An ordered list
-covering the complete output grid takes the dense path. An ascending consecutive
-interval on the unpartitioned frequency axis uses one dynamic slice/update pair;
-gapped or differently ordered distinct indices retain the general indexed path
-and their declared coefficient order. `add_tau` consumes one spatial tile and
-folds it immediately in node order. `end_window` requires that every declared
-node was consumed and applies the one-sided completion once, when needed.
-`finalize` refuses while a window is open. Direct-frequency terms use
-`add_direct` outside this lifecycle.
+$$
+\Sigma_{mn\mathbf k}(\omega_l)
+\mathrel{+}=c_{jl}\,\Sigma^{(j)}_{mn\mathbf k},
+\qquad
+c_{jl}=p\,\alpha_j
+e^{-i(E_{\mathrm{ref}}-s\omega_l)t_j},
+$$
 
-The scalar executor does not stack Sigma tiles. Each call produces one spatial
-tile, folds it into the donated accumulator, and releases it before evaluating
-the next node. The expensive shared $G\times W$ kernel therefore has no active
-output-frequency dimension in its executable signature. Exact frequency widths
-specialize only the separate, cheap accumulator fold; a repeated width reuses
-that compiled fold. Resident pole-batch shape can still specialize the spatial
-kernel independently.
+where $\alpha_j$ is the quadrature weight and $p$ and $s$ come from the
+particular denominator representation. The program applies this update as soon
+as the spatial matrix is available. It therefore needs one $G(t_j)$, one
+$W(t_j)$, and one spatial Sigma matrix at a time, and it stores no list of
+matrices from earlier time nodes. Adding output frequencies increases the
+coefficient arithmetic and output storage. It does not by itself add spatial
+$G\times W$ evaluations. Moving the endpoints of the frequency interval can
+still change the denominator geometry and hence the number of time nodes.
 
-For the one-sided completion, let $S_{\mathrm{local}}$ be the number of complex
-entries in one rank's spatial Sigma tile, including any bracket and parent-k
-axes but excluding frequency. The persistent full result costs
+`gw.ppm_accumulators.DeviceOmegaAccumulator` owns these updates. A planned
+Sigma window may cover the whole output grid or only part of it. For a partial
+window, the planner supplies pairs `(omega_indices[l], omega_values[l])`.
+`omega_indices` names the frequency entries of the final result to update, while
+`omega_values` supplies the physical frequencies used in $c_{jl}$. The indices
+must be distinct, and their order determines which coefficient is paired with
+which output-frequency entry.
+
+`begin_window` checks the time nodes, quadrature weights, and frequency pairs,
+then evaluates all $c_{jl}$. If the selected output positions form one ascending
+consecutive interval, JAX reads that interval from the result and writes the
+updated interval back. For a gapped or differently ordered selection, JAX reads
+and writes the named frequency entries individually. The frequency dimension is
+present on every rank, so neither operation moves a band matrix to one rank.
+`add_tau` applies the coefficients for the next $t_j$ to the newly computed
+spatial Sigma matrix. `end_window` checks that exactly the declared number of
+matrices was consumed. `finalize` returns the result only when no window remains
+open. Contributions already evaluated directly at one real frequency enter
+through `add_direct` and do not use the time-node coefficients.
+
+Some one-sided quadrature rules require one additional operation. For their
+$N_{\mathrm{sel}}$ selected frequencies, the accumulator first forms the
+temporary
+
+$$
+Z_{lmn\mathbf k}=\sum_j c_{jl}\Sigma^{(j)}_{mn\mathbf k}.
+$$
+
+After the last time node, it computes
+$[Z_l-Z_l^\dagger]/(2i)$ on the two band indices and adds that matrix to the
+corresponding frequency entries of the final result. The temporary contains only
+these $N_{\mathrm{sel}}$ frequencies. Other quadrature rules add each
+$c_{jl}\Sigma^{(j)}$ directly to the final result and need no such temporary.
+
+JAX compiles an operation separately when its input shapes, data types, or
+distribution over ranks change. The expensive spatial operation always returns
+the same Sigma matrix shape regardless of how many output frequencies a window
+selects. Only the multiplication by $c_{jl}$ and addition to
+$\Sigma(\omega_l)$ uses an array whose length is $N_{\mathrm{sel}}$. For each
+distinct combination of operation, shapes, data types, and rank distribution,
+the accumulator requests a compiled executable only the first time that
+combination appears. JAX may satisfy even that first request from its process or
+persistent compilation cache. A different number of resident poles can still
+require another compiled spatial operation because it changes a separate input
+shape. The final result is also passed back into each update so JAX may reuse its
+device storage rather than allocate another full result.
+
+Let $S_{\mathrm{local}}$ be the number of complex entries in one rank's share
+of a spatial Sigma matrix, including any bracket and parent-$\mathbf k$ axes but
+excluding frequency. The final result remains allocated throughout the
+calculation and costs
 
 $$
 M_{\mathrm{total}}=16 n_\omega S_{\mathrm{local}}\ \text{bytes},
 $$
 
-and a window with $m$ active frequencies uses a compact completion buffer
+The temporary $Z$ for a one-sided window with $N_{\mathrm{sel}}$ selected
+frequencies costs
 
 $$
-M_{\mathrm{window}}=16 m S_{\mathrm{local}}\ \text{bytes}.
+M_Z=16 N_{\mathrm{sel}} S_{\mathrm{local}}\ \text{bytes}.
 $$
 
-Thus the persistent accumulator storage while that window is open is
-$16(n_\omega+m)S_{\mathrm{local}}$ bytes. This excludes the one live spatial
-tile, shared-kernel scratch, and any completion scratch needed while closing the
-window. Frequencies outside the window are neither stored in the completion
-buffer nor touched by its scalar fold. The frequency axis is replicated; the
-two band axes retain their `x`/`y` sharding, so this compaction does not gather
-a band-space object onto fewer ranks.
+Thus the arrays retained by the accumulator while such a window is open occupy
+$16(n_\omega+N_{\mathrm{sel}})S_{\mathrm{local}}$ bytes per rank. This formula
+does not include the current spatial Sigma matrix, workspace used by the shared
+$G\times W$ calculation, or temporary storage needed while computing
+$[Z-Z^\dagger]/(2i)$. Every rank stores all $n_\omega$ frequency positions but
+only its assigned block of the two band indices. Both the final result and $Z$
+therefore remain distributed over all $P$ ranks; no rank receives a complete
+band-space matrix.
 
 Pole fields are stored on the q wedge, read through SlabIO in batches of at
 most four, and unfolded on device. Four is a memory bound, not a spectral
 classification. If a logical window touches both four-pole batches, its
-spatial sweep is executed once for each batch. The physical time-node
-evaluation census is therefore
+spatial sweep is executed once for each batch. The total number of spatial
+$\Sigma(t_j)$ evaluations is therefore
 
 $$
 N_{\mathrm{eval}}=
@@ -790,7 +833,7 @@ $$
 where $m_w$ is the number of pole batches touched by window $w$. The current
 eight-pole Si plan has eight logical windows, 12 physical sweeps, and 446
 time-node evaluations. This count belongs to the quadrature and pole-window
-geometry; compact frequency folding does not change it.
+geometry. Updating fewer output-frequency entries does not change it.
 
 Spatial symmetry reduces storage and all non-FFT work on the irreducible q
 wedge. Inputs are unfolded before the k-grid FFT convolution: time-reversal or
@@ -948,14 +991,15 @@ Use these dependencies when moving beyond the validated profile.
 - **A wider Sigma interval.** Both $T$ and the crossing beat bandwidth $F$
   grow. Crossing rank is approximately linear in the added bandwidth; sector
   ranks grow logarithmically until a window boundary changes. A finer output
-  step at fixed endpoints adds fold/storage work but no new time nodes.
+  step at fixed endpoints adds coefficient arithmetic and output storage but no
+  new time nodes.
 
 - **A smaller $\eta$.** This changes the retarded observable and raises the
   crossing cost. Sweep it as a physical convergence parameter. Do not
   compensate by changing fitted $\Gamma_p$ or the chi line heights.
 
 - **A different edge factor.** This changes only the core/sector partition.
-  Compare the physical dispatch census before running, then gate the complete
+  Compare the time-node evaluation count before running, then gate the complete
   Sigma result. Zero is not intrinsically invalid, but a sector rectangle that
   reaches the origin will refuse.
 
@@ -996,7 +1040,7 @@ Use these dependencies when moving beyond the validated profile.
 | sample and pole bytes | `file_io.mpa_store` through SlabIO |
 | Sigma geometry and scalar windows | `gw.mpa.sigma_windows` |
 | shared $G\times W$ spatial kernel | `gw.ppm_tau_kernel` |
-| device frequency fold and window lifecycle | `gw.ppm_accumulators` |
+| accumulation from time nodes into real-frequency Sigma | `gw.ppm_accumulators` |
 | dynamic-Sigma output and QSGW finalization | `gw.sigma_dispatch` and `gw.dynamic_sigma` |
 
 This boundary is intentional. Scalar quadrature services know no bands,
