@@ -422,7 +422,8 @@ from ffi.fft import (  # noqa: E402
 # Pick by resident layout; callers do not independently transpose to reach a
 # different member.  Public k-leading T/W/U remain k-leading: that handler
 # coalesces loads into resident rows and writes k-leading output, with no global
-# pack or transpose.  The service selects the implementation using its existing capability policy.  The full family contract lives in ``ffi/fft.py``.
+# pack or transpose. The service selects the implementation using its existing
+# capability policy. The full family contract lives in ``ffi/fft.py``.
 # ============================================================================
 
 
@@ -502,7 +503,8 @@ def make_fused_conv_klead(
     transform in one traversal, and emits the result in Sigma's native
     k-leading layout from its coalesced store.
     It is an accelerator behind ``LORRAX_CONV_KLEAD_FFI``; callers retain the
-    plan-based member as the off/unsupported path.  The ordinary make_flat_k_gw_conv factory also selects this implementation
+    plan-based member as the off/unsupported path. The ordinary
+    ``make_flat_k_gw_conv`` factory also selects this implementation
     when its service policy requests it and the runtime grid is supported.
     """
     from ffi.fft import make_conv_klead_ffi as _impl

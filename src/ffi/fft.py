@@ -95,8 +95,8 @@ axis**, because that decides which memory layout the one kernel must read.
 THE CHOICE IS THE CALLER'S RESIDENT LAYOUT, AND IT IS MEASURED, NOT A TASTE.
 The k-leading member keeps public T, W and U k-leading.  Its kernel coalesces
 the load into resident shared-memory rows and writes k-leading output; there is
-no global pack or transpose.  No production Sigma caller exists until the
-separate caller seam lands.
+no global pack or transpose. The ordinary GW convolution factory selects it
+when LORRAX_CONV_KLEAD_FFI requests it and its capability policy permits it.
 The k-strided member reads a k-major tile through cuFFT's advanced data
 layout (``cufftPlanMany64`` istride=T, idist=1), which is exactly right for
 the Σ τ kernel: its ``dot`` layout is k-major, so the handler REMOVES a
@@ -163,7 +163,7 @@ __all__ = [
     "conv_kminor_available", "conv_kminor_scale", "make_conv_kminor_ffi",
     "conv_kminor_plan", "conv_kminor_row_fits",
     "conv_kminor_out_shape", "conv_kminor_out_spec",
-    # The direct k-leading fused-conv candidate (no production Sigma caller).
+    # The optional direct k-leading convolution implementation.
     "CONV_KLEAD_TARGET", "CONV_KLEAD_GATE",
     "conv_klead_mode", "conv_klead_enabled", "require_conv_klead",
     "conv_klead_available", "conv_klead_plan", "conv_klead_row_fits",
@@ -187,8 +187,7 @@ GW_CONV_TARGET = "lorrax_mklfft_gw_conv"
 #: does not exist and a cpu mesh would resolve to nothing instead of refusing.
 CONV_KMINOR_TARGET = "lorrax_cufft_conv_kminor"
 #: CUDA-only direct k-leading candidate.  Unlike GW_CONV_TARGET this is one
-#: SMEM-resident traversal rather than a cuFFT advanced-layout plan.  No
-#: production Sigma caller exists until its separate caller seam lands.
+#: shared-memory traversal rather than a cuFFT advanced-layout plan.
 CONV_KLEAD_TARGET = "lorrax_cufft_conv_klead"
 #: CUDA-only ISDF post-pair contraction.  Unlike the broadcast members, both
 #: operands are full-rank and the two spin axes disappear from the result.
@@ -509,11 +508,11 @@ def make_gw_conv_ffi(
     that constructs this factory has already decided to use the handler, so
     "which flag is set" is not the question being asked here.
     """
-    require_fft_ffi(mesh, GW_CONV_TARGET)
     use_direct, _ = conv_klead_plan(mesh, kgrid)
     if use_direct:
         return make_conv_klead_ffi(
             mesh, kgrid, g_spec, v_spec, norm=norm, mult=mult)
+    require_fft_ffi(mesh, GW_CONV_TARGET)
     nkx, nky, nkz = (int(v) for v in kgrid)
     nk = nkx * nky * nkz
     g_flat = validate_flat_spec(g_spec, "G")

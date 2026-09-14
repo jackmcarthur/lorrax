@@ -1,4 +1,4 @@
-"""GPU service routing and convolution values on a distributed band mesh."""
+"""Convolution service values, CUDA routing, and CPU fallback on a mesh."""
 
 import numpy as np
 import pytest
@@ -25,13 +25,17 @@ def runtime_mesh():
 ])
 def test_convolution_service_matches_numpy(grid, mode, target, monkeypatch, runtime_mesh):
     if jax.default_backend() != "gpu":
-        pytest.skip("CUDA convolution comparison")
+        if mode == "on":
+            pytest.skip("Explicit direct convolution requires CUDA")
+        target = "lorrax_mklfft_gw_conv"
     monkeypatch.setenv("LORRAX_CONV_KLEAD_FFI", mode)
     mesh = runtime_mesh
     px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
     nk, mu, nu = int(np.prod(grid)), 4 * px, 5 * py
     rng = np.random.default_rng(815)
-    shape = (nk, 2, mu, 2, nu)
+    # BSE trial and spin-product axes need not be equal.
+    a, b = (3, 4) if grid == (3, 5, 2) else (2, 2)
+    shape = (nk, a, mu, b, nu)
     g = rng.normal(size=shape) + 1j * rng.normal(size=shape)
     w = rng.normal(size=(nk, mu, nu)) + 1j * rng.normal(size=(nk, mu, nu))
     g_spec, w_spec = P(None, None, "x", None, "y"), P(None, "x", "y")
@@ -46,8 +50,11 @@ def test_convolution_service_matches_numpy(grid, mode, target, monkeypatch, runt
     compiled = run.lower(gd, wd).compile()
     hlo = compiled.as_text()
     assert f'custom_call_target="{target}"' in hlo
-    assert "all-gather(" not in hlo
-    assert "all-to-all(" not in hlo
+    other = ("lorrax_cufft_conv_klead" if target == "lorrax_mklfft_gw_conv"
+             else "lorrax_mklfft_gw_conv")
+    assert f'custom_call_target="{other}"' not in hlo
+    assert "all-gather" not in hlo
+    assert "all-to-all" not in hlo
     gr = np.fft.ifftn(g.reshape((*grid, *shape[1:])), axes=(0, 1, 2), norm="ortho")
     wr = np.fft.ifftn(w.reshape((*grid, mu, nu)), axes=(0, 1, 2), norm="ortho")
     reference = np.fft.fftn(gr * wr[:, :, :, None, :, None, :] * mult,
