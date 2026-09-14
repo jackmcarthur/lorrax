@@ -32,6 +32,7 @@ from gw.qsgw_head import (
     reduced_covector_to_cartesian,
     rotate_velocity_active_to_qp,
     rotate_velocity_to_qp,
+    uniform_current_response_sharded,
 )
 from gw.head_correction import static_hall_linear_response
 
@@ -889,3 +890,110 @@ def test_s_tensor_uses_k_dependent_occupations_not_band_cut():
                     velocity[:, k, c, v].conj(), velocity[:, k, c, v]
                 )
     np.testing.assert_allclose(got, ref, rtol=5e-14, atol=5e-14)
+
+
+def test_uniform_current_response_is_ordered_ward_completed_and_causal():
+    rng = np.random.default_rng(91426)
+    nk, nb = 2, 5
+    raw = rng.normal(size=(nk, 3, nb, nb)) + 1j * rng.normal(
+        size=(nk, 3, nb, nb))
+    gamma = 0.5 * (raw + raw.conj().swapaxes(-1, -2))
+    energies = np.asarray((
+        (-1.7, -0.8, 0.4, 1.3, 2.8),
+        (-1.5, -0.6, 0.7, 1.8, 3.1),
+    ))
+    occupations = np.asarray(((1, 1, 0, 0, 0),) * nk, dtype=np.float64)
+    z = np.asarray((0.0, 0.37 + 0.19j, 0.37 - 0.19j,
+                    -0.37 - 0.19j, 1.0e7j), dtype=np.complex128)
+    volume = 31.0
+    got, got_infinity = uniform_current_response_sharded(
+        jnp.asarray(gamma), jnp.asarray(energies), jnp.asarray(occupations), z,
+        mesh=_mesh(), nb_logical=nb, cell_volume=volume, nk_tot=nk,
+        nspin=1, nspinor_wfn=2)
+    got = np.asarray(got)
+    got_infinity = np.asarray(got_infinity)
+
+    prefactor = 1.0 / (volume * nk)  # C=2/(1*2)=1.
+    ref = np.zeros_like(got)
+    ref_infinity = np.zeros((3, 3), dtype=np.complex128)
+    for k in range(nk):
+        for m in range(nb):
+            for n in range(nb):
+                delta = energies[k, m] - energies[k, n]
+                fd = occupations[k, n] - occupations[k, m]
+                if delta <= 1.0e-10 or fd <= 0.0:
+                    continue
+                A = np.outer(gamma[k, :, m, n].conj(),
+                             gamma[k, :, m, n])
+                pi_zero = -prefactor * fd * (A + A.T) / delta
+                ref_infinity -= pi_zero
+                for iz, frequency in enumerate(z):
+                    # Independent two-resolvent Kubo oracle.  The kernel
+                    # under test uses the analytically combined symmetric /
+                    # antisymmetric expression instead.
+                    pi_z = prefactor * fd * (
+                        A / (frequency - delta)
+                        - A.T / (frequency + delta))
+                    ref[iz] += pi_z - pi_zero
+
+    np.testing.assert_array_equal(got[0], np.zeros((3, 3)))
+    np.testing.assert_allclose(got, ref, rtol=4e-14, atol=4e-14)
+    np.testing.assert_allclose(
+        got_infinity, ref_infinity, rtol=4e-14, atol=4e-14)
+    np.testing.assert_allclose(got[2], got[1].conj().T,
+                               rtol=4e-14, atol=4e-14)
+    np.testing.assert_allclose(got[3], got[1].T,
+                               rtol=4e-14, atol=4e-14)
+    np.testing.assert_allclose(got_infinity, got_infinity.T,
+                               rtol=4e-14, atol=4e-14)
+    # The leading Hall-odd tail is O(1/z), so a small off-diagonal element
+    # can have a larger componentwise relative error at finite z even when
+    # the whole response has reached the contact scale.
+    np.testing.assert_allclose(got[-1], got_infinity,
+                               rtol=4e-7, atol=5e-9)
+
+    frequency = z[1]
+    sigma_h = np.zeros(3, dtype=np.complex128)
+    for k in range(nk):
+        for m in range(nb):
+            for n in range(nb):
+                delta = energies[k, m] - energies[k, n]
+                fd = occupations[k, n] - occupations[k, m]
+                if delta <= 1.0e-10 or fd <= 0.0:
+                    continue
+                g = gamma[k, :, m, n]
+                cross = np.asarray((
+                    np.conj(g[1]) * g[2] - np.conj(g[2]) * g[1],
+                    np.conj(g[2]) * g[0] - np.conj(g[0]) * g[2],
+                    np.conj(g[0]) * g[1] - np.conj(g[1]) * g[0],
+                ))
+                sigma_h += (1.0j * prefactor / HALFALPHA) * fd * cross / (
+                    delta * delta - frequency * frequency)
+    epsilon = np.zeros((3, 3, 3), dtype=np.float64)
+    epsilon[0, 1, 2] = epsilon[1, 2, 0] = epsilon[2, 0, 1] = 1.0
+    epsilon[0, 2, 1] = epsilon[2, 1, 0] = epsilon[1, 0, 2] = -1.0
+    hall_prediction = 1.0j * HALFALPHA * frequency * np.einsum(
+        "bai,b->ai", epsilon, sigma_h)
+    np.testing.assert_allclose(
+        0.5 * (got[1] - got[1].T), hall_prediction,
+        rtol=5e-14, atol=5e-14)
+
+    # Red twin: forcing the ordered products real destroys the magnetic
+    # antisymmetric response while leaving every symmetric Ward check intact.
+    anti = 0.5 * (got[1] - got[1].T)
+    assert np.max(np.abs(anti)) > 1.0e-5
+
+    bad_fractional = occupations.copy()
+    bad_fractional[0, 1] = 0.5
+    with pytest.raises(ValueError, match="exact binary occupations"):
+        uniform_current_response_sharded(
+            gamma, energies, bad_fractional, [0.1j], mesh=_mesh(),
+            nb_logical=nb, cell_volume=volume, nk_tot=nk,
+            nspin=1, nspinor_wfn=2)
+    bad_inverted = occupations.copy()
+    bad_inverted[0] = (1, 0, 1, 0, 0)
+    with pytest.raises(ValueError, match="ordered by energy"):
+        uniform_current_response_sharded(
+            gamma, energies, bad_inverted, [0.1j], mesh=_mesh(),
+            nb_logical=nb, cell_volume=volume, nk_tot=nk,
+            nspin=1, nspinor_wfn=2)
