@@ -332,6 +332,14 @@ int64_t create_context(int rank, int world_size,
     throw_if_cuda(cudaEventCreateWithFlags(&ctx->ev_ctx_out,
                                            cudaEventDisableTiming),
                   "cudaEventCreate(ev_ctx_out)");
+    throw_if_cuda(cudaEventCreateWithFlags(&ctx->active_subspace_ev_xla_in,
+                                           cudaEventDisableTiming),
+                  "cudaEventCreate(active_subspace_ev_xla_in)");
+    throw_if_cuda(cudaEventCreateWithFlags(&ctx->active_subspace_ev_ctx_out,
+                                           cudaEventDisableTiming),
+                  "cudaEventCreate(active_subspace_ev_ctx_out)");
+    ctx->active_subspace_host_ranges.resize(
+        static_cast<size_t>(2) * static_cast<size_t>(world_size));
 
     // Workspace scratchpads start empty; grown on demand in the FFI.
     ctx->d_workspace = nullptr;
@@ -363,6 +371,14 @@ void destroy_context(int64_t ctx_handle) {
 #endif
     if (ctx->ev_xla_in)  { cudaEventDestroy(ctx->ev_xla_in);     ctx->ev_xla_in = nullptr; }
     if (ctx->ev_ctx_out) { cudaEventDestroy(ctx->ev_ctx_out);    ctx->ev_ctx_out = nullptr; }
+    if (ctx->active_subspace_ev_xla_in) {
+        cudaEventDestroy(ctx->active_subspace_ev_xla_in);
+        ctx->active_subspace_ev_xla_in = nullptr;
+    }
+    if (ctx->active_subspace_ev_ctx_out) {
+        cudaEventDestroy(ctx->active_subspace_ev_ctx_out);
+        ctx->active_subspace_ev_ctx_out = nullptr;
+    }
     if (ctx->stream)   { cudaStreamDestroy(ctx->stream);         ctx->stream = nullptr; }
     if (ctx->nccl_comm){ ncclCommDestroy(ctx->nccl_comm);        ctx->nccl_comm = nullptr; }
     if (ctx->d_info)  { cudaFree(ctx->d_info);                   ctx->d_info = nullptr; }
