@@ -383,10 +383,10 @@ static ffi::Error ActiveRangeImpl(
 // Full physical allocation shapes and strides, with scalar or per-batch
 // replicated bounds. Each exact original-owner intersection has a descriptor
 // view; there is no selected-operand allocation and no padded contraction K.
-static ffi::Error ActiveRangeDispatch(
+static ffi::Error ActiveRangeDispatchWithBounds(
     cudaStream_t stream, ffi::AnyBuffer A, ffi::AnyBuffer B,
-    ffi::AnyBuffer C_in, ffi::BufferR2<ffi::S32> bounds,
-    ffi::Result<ffi::AnyBuffer> C_out,
+    ffi::AnyBuffer C_in, ffi::Result<ffi::AnyBuffer> C_out,
+    const std::vector<int32_t>& intervals, int64_t n_bounds,
     int64_t nq,int64_t m,int64_t n,int64_t k,
     int64_t mb_a,int64_t nb_a,int64_t mb_b,int64_t nb_b,
     int64_t mb_c,int64_t nb_c,int64_t lda,int64_t ldb,int64_t ldc,
@@ -395,17 +395,12 @@ static ffi::Error ActiveRangeDispatch(
     int64_t ctx_handle) {
     auto* ctx=reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
     if (!ctx || ctx->p<=0 || ctx->p!=ctx->q || transa_code!=0 || transb_code!=0 ||
-        bounds.dimensions()[1]!=2 || (bounds.dimensions()[0]!=1 && bounds.dimensions()[0]!=nq) ||
+        (n_bounds!=1 && n_bounds!=nq) ||
         k<=0 || k%ctx->p!=0)
         return ffi::Error::InvalidArgument("active GEMM requires square N,N faces and bounds(1|nq,2)");
     if (A.element_type()!=B.element_type() || A.element_type()!=C_in.element_type() ||
         A.element_type()!=C_out->element_type())
         return ffi::Error::InvalidArgument("active GEMM operand dtype mismatch");
-    const int64_t n_bounds=bounds.dimensions()[0];
-    std::vector<int32_t> intervals(2*n_bounds);
-    LORRAX_CUDA_CHECK(cudaMemcpyAsync(intervals.data(),bounds.typed_data(),
-        intervals.size()*sizeof(int32_t),cudaMemcpyDeviceToHost,stream));
-    LORRAX_CUDA_CHECK(cudaStreamSynchronize(stream));
     for (int64_t i=0;i<n_bounds;++i)
         if (intervals[2*i]<0 || intervals[2*i]>intervals[2*i+1] || intervals[2*i+1]>k)
             return ffi::Error::InvalidArgument("active GEMM requires 0 <= lo <= hi <= storage K");
@@ -423,6 +418,57 @@ static ffi::Error ActiveRangeDispatch(
             T(alpha_re,alpha_im),T(beta_re,beta_im));
     }
     return ffi::Error::InvalidArgument("active GEMM supports float64/complex128");
+}
+
+static ffi::Error ActiveRangeDispatch(
+    cudaStream_t stream, ffi::AnyBuffer A, ffi::AnyBuffer B,
+    ffi::AnyBuffer C_in, ffi::BufferR2<ffi::S32> bounds,
+    ffi::Result<ffi::AnyBuffer> C_out,
+    int64_t nq,int64_t m,int64_t n,int64_t k,
+    int64_t mb_a,int64_t nb_a,int64_t mb_b,int64_t nb_b,
+    int64_t mb_c,int64_t nb_c,int64_t lda,int64_t ldb,int64_t ldc,
+    int64_t transa_code,int64_t transb_code,
+    double alpha_re,double alpha_im,double beta_re,double beta_im,
+    int64_t ctx_handle) {
+    if (bounds.dimensions()[1]!=2 ||
+        (bounds.dimensions()[0]!=1 && bounds.dimensions()[0]!=nq))
+        return ffi::Error::InvalidArgument(
+            "active GEMM requires square N,N faces and bounds(1|nq,2)");
+    const int64_t n_bounds=bounds.dimensions()[0];
+    std::vector<int32_t> intervals(2*n_bounds);
+    LORRAX_CUDA_CHECK(cudaMemcpyAsync(intervals.data(),bounds.typed_data(),
+        intervals.size()*sizeof(int32_t),cudaMemcpyDeviceToHost,stream));
+    LORRAX_CUDA_CHECK(cudaStreamSynchronize(stream));
+    return ActiveRangeDispatchWithBounds(stream,A,B,C_in,C_out,intervals,n_bounds,
+        nq,m,n,k,mb_a,nb_a,mb_b,nb_b,mb_c,nb_c,lda,ldb,ldc,
+        transa_code,transb_code,alpha_re,alpha_im,beta_re,beta_im,ctx_handle);
+}
+
+static ffi::Error PreparedActiveRangeDispatch(
+    cudaStream_t stream, ffi::AnyBuffer A, ffi::AnyBuffer B,
+    ffi::AnyBuffer C_in, ffi::Result<ffi::AnyBuffer> C_out,
+    int64_t nq,int64_t m,int64_t n,int64_t k,
+    int64_t mb_a,int64_t nb_a,int64_t mb_b,int64_t nb_b,
+    int64_t mb_c,int64_t nb_c,int64_t lda,int64_t ldb,int64_t ldc,
+    int64_t transa_code,int64_t transb_code,
+    double alpha_re,double alpha_im,double beta_re,double beta_im,
+    int64_t ctx_handle, ffi::Span<const int64_t> active_bounds) {
+    const size_t pair_count=active_bounds.size()/2;
+    if (nq<1 || active_bounds.size()%2!=0 ||
+        (pair_count!=1 && pair_count!=static_cast<size_t>(nq)))
+        return ffi::Error::InvalidArgument(
+            "prepared active GEMM active_bounds must contain 1 or nq pairs");
+    const int64_t n_bounds=static_cast<int64_t>(pair_count);
+    std::vector<int32_t> intervals(active_bounds.size());
+    for (size_t i=0;i<active_bounds.size();++i) {
+        if (active_bounds[i]<0 || active_bounds[i]>INT_MAX)
+            return ffi::Error::InvalidArgument(
+                "prepared active GEMM bounds must fit nonnegative int32");
+        intervals[i]=static_cast<int32_t>(active_bounds[i]);
+    }
+    return ActiveRangeDispatchWithBounds(stream,A,B,C_in,C_out,intervals,n_bounds,
+        nq,m,n,k,mb_a,nb_a,mb_b,nb_b,mb_c,nb_c,lda,ldb,ldc,
+        transa_code,transb_code,alpha_re,alpha_im,beta_re,beta_im,ctx_handle);
 }
 
 }  // namespace lorrax_ffi::cublasmp_batched_gemm
@@ -456,6 +502,37 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<double>("beta_re")
         .Attr<double>("beta_im")
         .Attr<int64_t>("ctx_handle"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    CublasMpPreparedActiveRangeGemmFfi,
+    lorrax_ffi::cublasmp_batched_gemm::PreparedActiveRangeDispatch,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()      // A
+        .Arg<xla::ffi::AnyBuffer>()      // B
+        .Arg<xla::ffi::AnyBuffer>()      // C (for beta*C)
+        .Ret<xla::ffi::AnyBuffer>()      // C_out
+        .Attr<int64_t>("nq")
+        .Attr<int64_t>("m")
+        .Attr<int64_t>("n")
+        .Attr<int64_t>("k")
+        .Attr<int64_t>("mb_a")
+        .Attr<int64_t>("nb_a")
+        .Attr<int64_t>("mb_b")
+        .Attr<int64_t>("nb_b")
+        .Attr<int64_t>("mb_c")
+        .Attr<int64_t>("nb_c")
+        .Attr<int64_t>("lld_a")
+        .Attr<int64_t>("lld_b")
+        .Attr<int64_t>("lld_c")
+        .Attr<int64_t>("transa")
+        .Attr<int64_t>("transb")
+        .Attr<double>("alpha_re")
+        .Attr<double>("alpha_im")
+        .Attr<double>("beta_re")
+        .Attr<double>("beta_im")
+        .Attr<int64_t>("ctx_handle")
+        .Attr<xla::ffi::Span<const int64_t>>("active_bounds"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     CublasMpActiveRangeGemmFfi,

@@ -56,9 +56,12 @@ layout='face', enable_active_range=False) -> GemmPlan``
     B, C=None, *, out=None)`` is trace-safe. With active ranges enabled,
     ``GemmPlan.active_range(A, B, lo, hi, C=None, *, out=None, weights=None)``
     contracts an exact dynamic interval in the fixed-size operands. Optional
-    ``weights`` has shape ``(nq, k)``. The face layout uses cuBLASMp descriptor
-    views; the axis layout uses local cuBLAS pointer views on CUDA and bounded
-    JAX dot panels on CPU. See ``docs/dev/active_gemm_ranges.md``.
+    ``weights`` has shape ``(nq, k)``. When bounds are known before tracing,
+    ``GemmPlan.prepare_active_range(lo, hi)`` returns a callable with the same
+    operand, weighting and accumulation contract but no runtime bounds
+    operands. The face layout uses cuBLASMp descriptor views; the axis layout
+    uses local cuBLAS pointer views on CUDA and bounded JAX dot panels on CPU.
+    See ``docs/dev/active_gemm_ranges.md``.
 ``factor(op, A, mesh, ...) -> FactorToken`` / ``solve(token, B)``
     Factor once, back-solve many.  The token is opaque and carries the
     handle (scalapack's ``ipiv``, cuSOLVERMp's raw buffer, SLATE's

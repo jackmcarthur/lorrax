@@ -272,6 +272,7 @@ def _get_sigma_kij_kernel(
     layout: str = "face", face_shape=None, face_band_extent=None,
     energy_windows: bool = False,
     k_unfold_plan=None,
+    _g_plan=None, _prepared_active_gemm=None,
 ) -> Callable[..., jax.Array]:
     """Build Green functions with band-range masks and contract each bracket against one prepared W."""
     if layout not in ("face", "axis") or face_shape is None or k_unfold_plan is None:
@@ -281,7 +282,7 @@ def _get_sigma_kij_kernel(
            ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
            face_band_extent, bool(energy_windows),
            k_unfold_plan)
-    if key in _sigma_kij_kernel_cache:
+    if _prepared_active_gemm is None and key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     from .greens_function_kernel import build_G_tau
     # G, W and projection faces share the run's packed centroid order,
@@ -293,15 +294,19 @@ def _get_sigma_kij_kernel(
 
     from distrib_la import gemm_plan
     _, nb, mu, ns = face_shape
-    g_plan = gemm_plan(mesh_xy, m=mu * ns, k=nb, n=mu * ns,
-                       nq=k_unfold_plan.n_parent, dtype=jnp.complex128, layout=layout,
-                       enable_active_range=True)
+    g_plan = _g_plan
+    if g_plan is None:
+        g_plan = gemm_plan(
+            mesh_xy, m=mu * ns, k=nb, n=mu * ns,
+            nq=k_unfold_plan.n_parent, dtype=jnp.complex128, layout=layout,
+            enable_active_range=True)
 
     def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t, band_range=None):
         """Apply boolean identity masks or signed occupation weights without clipping."""
         options = dict(e_ref=ref, layout=layout, gemm=g_plan,
                        k_unfold_plan=k_unfold_plan, band_range=band_range,
-                       trim_zero_bands=True)
+                       trim_zero_bands=True,
+                       prepared_active_gemm=_prepared_active_gemm)
         options["mask" if sel.dtype == jnp.bool_ else "band_weight"] = sel
         if energy_windows:
             options.update(E_min=E_min, E_max=E_max)
@@ -336,6 +341,21 @@ def _get_sigma_kij_kernel(
             lambda value: jax.lax.with_sharding_constraint(value, sharding),
             outs)
 
+    def finish(kernel):
+        if _prepared_active_gemm is None:
+            def prepare_active_range(lo, hi):
+                if brackets is not None or energy_windows:
+                    raise ValueError("Prepared Sigma bounds require unbracketed selector windows")
+                return _get_sigma_kij_kernel(
+                    mesh_xy=mesh_xy, kgrid=kgrid, merged_x=merged_x,
+                    brackets=brackets, layout=layout, face_shape=face_shape,
+                    face_band_extent=face_band_extent, energy_windows=energy_windows,
+                    k_unfold_plan=k_unfold_plan, _g_plan=g_plan,
+                    _prepared_active_gemm=g_plan.prepare_active_range(lo, hi))
+            kernel.prepare_active_range = prepare_active_range
+            _sigma_kij_kernel_cache[key] = kernel
+        return kernel
+
     if not _stage_timing_enabled():
         _build_g = _g_from_selector
 
@@ -369,8 +389,7 @@ def _get_sigma_kij_kernel(
                     psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                     E_A, mask_A, None, None, E_ref_A, t_node, W_q)
 
-        _sigma_kij_kernel_cache[key] = kernel
-        return kernel
+        return finish(kernel)
 
     if brackets is not None:
         raise NotImplementedError(
@@ -407,8 +426,7 @@ def _get_sigma_kij_kernel(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                 E_A, mask_A, None, None, E_ref_A, t_node, W_q)
 
-    _sigma_kij_kernel_cache[key] = staged
-    return staged
+    return finish(staged)
 
 
 
@@ -456,9 +474,15 @@ def get_shared_sigma_tau_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
     layout: str = "face", face_shape=None, face_band_extent=None,
-    k_unfold_plan=None,
+    k_unfold_plan=None, _sigma_kij=None,
 ) -> Callable[..., jax.Array]:
-    """Build selected multipole W(tau) tiles for the shared complex Sigma contraction."""
+    """Build selected multipole W(tau) tiles for the shared Sigma contraction.
+
+    The returned callable's ``prepare_active_range(lo, hi)`` constructs an
+    uncached variant sharing its GEMM plan and spatial kernels. The caller
+    owns that variant's lifetime and must certify exact phase support across
+    the times it will use. Distinct intervals can require distinct compiles.
+    """
     kgrid = tuple(int(x) for x in kgrid)
     if brackets is not None:
         brackets = tuple((int(lo), None if hi is None else int(hi))
@@ -468,17 +492,29 @@ def get_shared_sigma_tau_kernel(
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
            brackets, layout, face_shape, face_band_extent,
            k_unfold_plan)
-    if key in _sigma_shared_tau_kernel_cache:
+    if _sigma_kij is None and key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
     ensure_jax_compile_cache()
     q_mu_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
 
-    sigma_kij = _get_sigma_kij_kernel(
+    sigma_kij = _sigma_kij if _sigma_kij is not None else _get_sigma_kij_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
         brackets=brackets, layout=layout, face_shape=face_shape,
         face_band_extent=face_band_extent,
         k_unfold_plan=k_unfold_plan)
+
+    def finish(kernel):
+        if _sigma_kij is None:
+            def prepare_active_range(lo, hi):
+                return get_shared_sigma_tau_kernel(
+                    mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
+                    layout=layout, face_shape=face_shape,
+                    face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan,
+                    _sigma_kij=sigma_kij.prepare_active_range(lo, hi))
+            kernel.prepare_active_range = prepare_active_range
+            _sigma_shared_tau_kernel_cache[key] = kernel
+        return kernel
 
     @jax.jit
     def _build(B_poles, Omega_poles, pole_indices, bounds,
@@ -501,8 +537,7 @@ def get_shared_sigma_tau_kernel(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                 E_A, mask_A, E_ref_A, t_node, W_t)
 
-        _sigma_shared_tau_kernel_cache[key] = _tau
-        return _tau
+        return finish(_tau)
 
     def _tau_staged(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
@@ -517,5 +552,4 @@ def get_shared_sigma_tau_kernel(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
             E_A, mask_A, E_ref_A, t_node, W_t)
 
-    _sigma_shared_tau_kernel_cache[key] = _tau_staged
-    return _tau_staged
+    return finish(_tau_staged)

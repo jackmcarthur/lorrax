@@ -8,6 +8,8 @@ remains a CUDA/cuBLASMp service and is covered separately.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -17,6 +19,7 @@ from lxkit.testing import require_devices
 
 import distrib_la as D
 from common.collectives import device_put_process_local
+from distrib_la.matmul_plan import _prepare_host_bounds
 
 
 def _mesh() -> Mesh:
@@ -283,6 +286,91 @@ def test_local_active_range_refuses_complex_weights_for_real_plan():
 
     with pytest.raises(TypeError, match="complex weights require a complex plan"):
         plan.active_range(a, b, 0, k, weights=weights)
+
+
+def test_prepared_local_active_range_captures_bounds_outside_jit():
+    """Prepared CPU calls have no runtime bounds and preserve weighted slices."""
+    mesh = _mesh()
+    nq, m, k, n = 3, 8, 19, 12
+    rng = np.random.default_rng(20260919)
+    a = _values(rng, (nq, m, k), np.complex128)
+    b = _values(rng, (nq, k, n), np.complex128)
+    weights = _values(rng, (nq, k), np.complex128)
+    lo = np.asarray([1, 7, 14], np.int64)
+    hi = np.asarray([18, 7, 19], np.int64)
+    aa, bb = _poison_outside(a, b, lo, hi)
+    poisoned_weights = weights.copy()
+    for iq, (begin, end) in enumerate(zip(lo, hi)):
+        poisoned_weights[iq, :begin] = np.nan
+        poisoned_weights[iq, end:] = np.nan
+
+    alpha = 0.6 - 0.15j
+    plan = D.local_gemm_plan(
+        mesh, m=m, k=k, n=n, nq=nq, dtype=np.complex128, alpha=alpha,
+        enable_active_range=True,
+    )
+    prepared = plan.prepare_active_range(lo, hi)
+
+    @jax.jit
+    def apply(a_arg, b_arg, weight_arg):
+        return prepared(a_arg, b_arg, weights=weight_arg)
+
+    got = apply(
+        _put(aa, plan.in_sharding_a),
+        _put(bb, plan.in_sharding_b),
+        _put(poisoned_weights, NamedSharding(mesh, P())),
+    )
+    expected = np.empty((nq, m, n), np.complex128)
+    for iq, (begin, end) in enumerate(zip(lo, hi)):
+        expected[iq] = alpha * (
+            (a[iq, :, begin:end] * weights[iq, None, begin:end])
+            @ b[iq, begin:end, :]
+        )
+    _assert_allclose(got, expected)
+    assert got.sharding == plan.out_sharding
+
+
+def test_prepare_active_range_validates_eager_bounds_and_accumulate_contract():
+    """The factory refuses invalid metadata and retains beta*C semantics."""
+    mesh = _mesh()
+    nq, m, k, n = 2, 8, 16, 12
+    rng = np.random.default_rng(20260920)
+    beta = -0.375
+    a = _values(rng, (nq, m, k), np.float64)
+    b = _values(rng, (nq, k, n), np.float64)
+    c = _values(rng, (nq, m, n), np.float64)
+    plan = D.local_gemm_plan(
+        mesh, m=m, k=k, n=n, nq=nq, dtype=np.float64, beta=beta,
+        enable_active_range=True,
+    )
+
+    for lo, hi in ((-1, 3), (8, 7), (0, k + 1)):
+        with pytest.raises(ValueError, match="0 <= lo <= hi <= K"):
+            plan.prepare_active_range(lo, hi)
+    with pytest.raises(TypeError, match=r"integer scalars or shape\(nq,\)"):
+        plan.prepare_active_range(np.zeros(nq + 1, np.int32), k)
+
+    prepared = plan.prepare_active_range(3, 13)
+    with pytest.raises(ValueError, match="C is required"):
+        prepared(
+            _put(a, plan.in_sharding_a),
+            _put(b, plan.in_sharding_b),
+        )
+    got = prepared(
+        _put(a, plan.in_sharding_a),
+        _put(b, plan.in_sharding_b),
+        C=_put(c, plan.out_sharding),
+    )
+    expected = a[:, :, 3:13] @ b[:, 3:13, :] + beta * c
+    _assert_allclose(got, expected)
+
+
+def test_prepare_active_range_refuses_bounds_outside_native_int32_metadata():
+    """Host validation cannot wrap an otherwise valid large bound to int32."""
+    int32_max = np.iinfo(np.int32).max
+    synthetic_plan = SimpleNamespace(nq=1, k=int32_max + 2)
+    with pytest.raises(ValueError, match="fit signed int32"):
+        _prepare_host_bounds(synthetic_plan, 0, int32_max + 1)
 
 
 def test_local_active_range_refuses_unimplemented_collective_variants():
