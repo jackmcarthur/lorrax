@@ -755,6 +755,17 @@ window, the planner supplies pairs `(omega_indices[l], omega_values[l])`.
 must be distinct, and their order determines which coefficient is paired with
 which output-frequency entry.
 
+The default denominator-box rule treats the positive- and negative-frequency
+branches separately. Every state/pole window on one branch selects that
+branch's entire frequency half-grid, and its contributions are added directly
+to the final result. If the two halves have equal length, this reduces the
+frequency-dependent multiplication and result-update traffic for one window by
+about a factor of two relative to updating the complete grid. It does not use a
+$Z$ temporary. The pane control rule can instead select a much narrower set of
+frequencies. Its one-sided windows are the case that uses $Z$, so the memory
+reduction for $Z$ is set by the pane width and must not be attributed to the
+default box rule.
+
 `begin_window` checks the time nodes, quadrature weights, and frequency pairs,
 then evaluates all $c_{jl}$. If the selected output positions form one ascending
 consecutive interval, JAX reads that interval from the result and writes the
@@ -810,19 +821,24 @@ $$
 M_Z=16 N_{\mathrm{sel}} S_{\mathrm{local}}\ \text{bytes}.
 $$
 
-Thus the arrays retained by the accumulator while such a window is open occupy
-$16(n_\omega+N_{\mathrm{sel}})S_{\mathrm{local}}$ bytes per rank. This formula
-does not include the current spatial Sigma matrix, workspace used by the shared
-$G\times W$ calculation, or temporary storage needed while computing
-$[Z-Z^\dagger]/(2i)$. Every rank stores all $n_\omega$ frequency positions but
-only its assigned block of the two band indices. Both the final result and $Z$
-therefore remain distributed over all $P$ ranks; no rank receives a complete
-band-space matrix.
+Thus the persistent arrays held by the accumulator while a one-sided pane is
+open occupy
+$16(n_\omega+N_{\mathrm{sel}})S_{\mathrm{local}}$ bytes per rank. At the end of
+that pane, the calculation of $[Z-Z^\dagger]/(2i)$ can temporarily require both
+$Z$ and its transformed result, as well as communication workspace
+for transposing the distributed band axes. The persistent-array formula is
+therefore not a peak-memory bound. It also excludes the current spatial Sigma
+matrix, workspace used by the shared $G\times W$ calculation, and the later
+symmetry expansion from parent $\mathbf k$ points to the full grid. Every rank
+stores all $n_\omega$ frequency positions but only its assigned block of the
+two band indices. Both the final result and $Z$ therefore remain distributed
+over all $P$ ranks; no rank receives a complete band-space matrix.
 
-Pole fields are stored on the q wedge, read through SlabIO in batches of at
-most four, and unfolded on device. Four is a memory bound, not a spectral
-classification. If a logical window touches both four-pole batches, its
-spatial sweep is executed once for each batch. The total number of spatial
+Pole fields are stored on the q wedge, read through SlabIO, and unfolded on
+device. The default resident batch contains four poles; the explicit supported
+range is one through eight. This is a memory choice, not a spectral
+classification. If a logical window touches more than one resident pole batch,
+its spatial sweep is executed once for each batch. The total number of spatial
 $\Sigma(t_j)$ evaluations is therefore
 
 $$
