@@ -29,6 +29,7 @@ __all__ = [
     "head_s_tensor_sharded",
     "head_wings_sharded",
     "raw_hall_pseudovector_sharded",
+    "uniform_current_response_sharded",
     "static_gauge_hall_transaction",
     "static_head_wings_sharded",
     "head_samples_from_s",
@@ -1888,6 +1889,248 @@ def head_s_tensor_sharded(
         jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
     )
     return interband + drude[None, :, :] * inv_z2[:, None, None]
+
+
+def _uniform_current_response_kernel(
+    mesh: Mesh, *, nb_logical: int,
+) -> Callable:
+    r"""Distributed energy-ordered uniform-current bubble.
+
+    The returned first value is the insulating Ward completion
+    ``K_TT(z) = Pi_TT(z) - Pi_TT(0)``.  The second is its high-frequency
+    limit ``-Pi_TT(0)``.  Only the small Cartesian tensors are replicated;
+    both band axes stay on the processor mesh.
+    """
+    key = ("uniform_current_response", id(mesh), int(nb_logical))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ax_x, ax_y = _mesh_xy(mesh)
+
+    def _local(
+        gamma_local, e_bra, e_ket, f_bra, f_ket, frequencies, deps_tol,
+    ):
+        nx, ny = gamma_local.shape[-2:]
+        ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
+        iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
+        logical = (
+            (ix[:, None] < nb_logical)
+            & (iy[None, :] < nb_logical)
+        )[None, :, :]
+        delta = e_bra[:, :, None] - e_ket[:, None, :]
+        f_diff = f_ket[:, None, :] - f_bra[:, :, None]
+        ordered = logical & (delta > deps_tol) & (f_diff > 0.0)
+        safe_delta = jnp.where(ordered, delta, 1.0)
+        weight = jnp.where(ordered, f_diff, 0.0)
+
+        # gamma[a,k,m,n] = <m,k|Gamma_a|n,k>.  A_ab below therefore
+        # equals <n|Gamma_a|m><m|Gamma_b|n> for the energy-ordered pair
+        # Delta=E_m-E_n>0.
+        pair = jnp.einsum(
+            "akij,bkij->abkij", jnp.conj(gamma_local), gamma_local,
+            optimize=True)
+        pair_real = jnp.real(pair)
+        pair_imag = jnp.imag(pair)
+
+        # -Pi(0), the constant high-frequency limit of the Ward-completed
+        # response.  It is symmetric and real before the collective.
+        contact_local = jnp.einsum(
+            "abkij,kij->ab", pair_real, 2.0 * weight / safe_delta,
+            optimize=True)
+        contact = jax.lax.psum(contact_local, (ax_x, ax_y))
+
+        def _one(frequency):
+            denom = jnp.square(safe_delta) - jnp.square(frequency)
+            # K=Pi(z)-Pi(0), written without cancellation at small z:
+            #   K^S_ab = -2 z^2 Re(A_ab)/(Delta(Delta^2-z^2))
+            #   K^A_ab = -2 i z Im(A_ab)/(Delta^2-z^2).
+            # The first is symmetric, the second antisymmetric.  This
+            # ordered form is required when time reversal is broken.
+            symmetric_weight = jnp.where(
+                ordered,
+                -2.0 * weight * jnp.square(frequency)
+                / (safe_delta * denom),
+                0.0 + 0.0j)
+            antisymmetric_weight = jnp.where(
+                ordered,
+                -2.0j * weight * frequency / denom,
+                0.0 + 0.0j)
+            local = (
+                jnp.einsum(
+                    "abkij,kij->ab", pair_real, symmetric_weight,
+                    optimize=True)
+                + jnp.einsum(
+                    "abkij,kij->ab", pair_imag, antisymmetric_weight,
+                    optimize=True)
+            )
+            completed = jax.lax.psum(local, (ax_x, ax_y))
+            # Make the insulating Ward identity structural at z=0.
+            return jnp.where(frequency == 0.0 + 0.0j,
+                             jnp.zeros_like(completed), completed)
+
+        n_frequency = int(frequencies.shape[0])
+        block = min(_HEAD_WING_FREQUENCY_BLOCK, n_frequency)
+        n_padded = ((n_frequency + block - 1) // block) * block
+        frequency_blocks = jnp.pad(
+            frequencies, (0, n_padded - n_frequency),
+            constant_values=jnp.asarray(1.0j, dtype=frequencies.dtype),
+        ).reshape(-1, block)
+
+        def _block(_carry, frequency_block):
+            return _carry, jax.vmap(_one)(frequency_block)
+
+        _, response_blocks = jax.lax.scan(
+            _block, None, frequency_blocks, unroll=1)
+        response = response_blocks.reshape(n_padded, 3, 3)[:n_frequency]
+        unsafe = jnp.any(
+            logical
+            & (jnp.abs(delta) <= deps_tol)
+            & (jnp.abs(f_bra[:, :, None] - f_ket[:, None, :]) > 1.0e-12))
+        return (
+            response,
+            contact,
+            jax.lax.psum(unsafe.astype(jnp.int32), (ax_x, ax_y)),
+        )
+
+    sm = shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(
+            P(None, None, "x", "y"),
+            P(None, "x"),
+            P(None, "y"),
+            P(None, "x"),
+            P(None, "y"),
+            P(None),
+            P(),
+        ),
+        out_specs=(P(None, None, None), P(None, None), P()),
+        check_vma=False,
+    )
+    kernel = jax.jit(sm)
+    _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def uniform_current_response_sharded(
+    current_raw,
+    energies_kn_ry,
+    occupations_kn,
+    frequencies_ry,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    cell_volume: float,
+    nk_tot: int,
+    nspin: int,
+    nspinor_wfn: int,
+    degeneracy_tolerance_ry: float = 1.0e-10,
+):
+    r"""Return the leading-q electronic TT response and its contact limit.
+
+    ``current_raw[k,a,m,n]`` is a dimensionless Hermitian current vertex.
+    It may be the production photon vertex ``<m|alpha_a|n>`` or the canonical
+    gauge current ``Gamma_a=(alpha_FS/2) dH_Ry/dk_a``; provenance must name
+    which operator was supplied because the nonlocal ICL term makes them
+    different.  For an insulating, positive-energy retained band manifold,
+    this function evaluates the energy-ordered paramagnetic bubble and
+    applies its Ward contact by subtraction,
+
+    ``K_TT(z) = Pi_TT(z) - Pi_TT(0)``.
+
+    The result is a pair ``(K_TT, K_TT_infinity)`` with shapes ``(nz,3,3)``
+    and ``(3,3)``.  Both are in the native four-current response units
+    ``1/(Ry*bohr^3)`` and include the single full-BZ normalization
+    ``C/(cell_volume*nk_tot)``, where
+    ``C=2/(nspin*nspinor_wfn)``.  ``K_TT(0)`` is exactly zero and
+    ``K_TT_infinity=-Pi_TT(0)`` must be retained by a dynamic Dyson consumer:
+    only ``W_TT(z)-W_TT(infinity)`` belongs to a decaying contour integrand.
+
+    This subtraction is the exact insulating Ward completion of the supplied
+    finite band manifold.  It is not an independently evaluated diamagnetic
+    contact and does not supply negative-energy/complement closure, spatial
+    ``q^2`` current response, current wings, or photon retardation.
+    Frequencies are explicit complex Ry coordinates; no eta is added here.
+    """
+    gamma = jnp.asarray(current_raw, dtype=jnp.complex128)
+    energies_host = np.asarray(energies_kn_ry, dtype=np.float64)
+    occupations_host = np.asarray(occupations_kn, dtype=np.float64)
+    e = jnp.asarray(energies_host, dtype=jnp.float64)
+    f = jnp.asarray(occupations_host, dtype=jnp.float64)
+    z_host = np.atleast_1d(np.asarray(frequencies_ry, dtype=np.complex128))
+    if (z_host.ndim != 1 or z_host.size == 0
+            or not np.all(np.isfinite(z_host))):
+        raise ValueError("frequencies_ry must be a nonempty finite vector")
+    if (gamma.ndim != 4 or int(gamma.shape[1]) != 3
+            or int(gamma.shape[2]) != int(gamma.shape[3])):
+        raise ValueError(
+            "current_raw must have shape (nk,3,nb,nb); got "
+            f"{gamma.shape}")
+    if e.shape != f.shape or tuple(e.shape) not in (
+            (int(gamma.shape[0]), int(nb_logical)),
+            (int(gamma.shape[0]), int(gamma.shape[2]))):
+        raise ValueError(
+            f"energy/occupation shapes {e.shape}/{f.shape} do not match "
+            f"current_raw {gamma.shape} and nb_logical={int(nb_logical)}")
+    if not (0 < int(nb_logical) <= int(gamma.shape[2])):
+        raise ValueError("nb_logical must lie in the stored band extent")
+    if int(gamma.shape[0]) != int(nk_tot) or int(nk_tot) <= 0:
+        raise ValueError(
+            "uniform current response requires one current-vertex row per "
+            "full-BZ k point before the sole 1/Nk normalization")
+    if (not np.isfinite(float(cell_volume)) or float(cell_volume) <= 0.0
+            or int(nspin) <= 0 or int(nspinor_wfn) <= 0):
+        raise ValueError("cell volume and state multiplicities must be positive")
+    if (not np.isfinite(float(degeneracy_tolerance_ry))
+            or float(degeneracy_tolerance_ry) <= 0.0):
+        raise ValueError("degeneracy_tolerance_ry must be finite and positive")
+    logical_f = occupations_host[:, :int(nb_logical)]
+    logical_e = energies_host[:, :int(nb_logical)]
+    if (not np.all(np.isfinite(logical_e))
+            or not np.all(np.isfinite(logical_f))):
+        raise ValueError("energies and occupations must be finite")
+    if np.any((logical_f != 0.0) & (logical_f != 1.0)):
+        raise ValueError(
+            "uniform current response is insulating-only and requires "
+            "exact binary occupations; fractional/Drude response is absent")
+    occupied_counts = np.sum(logical_f, axis=1, dtype=np.int64)
+    if (np.any(occupied_counts <= 0)
+            or np.any(occupied_counts >= int(nb_logical))
+            or np.any(occupied_counts != occupied_counts[0])):
+        raise ValueError(
+            "uniform current response requires one nonempty, constant "
+            "occupied manifold and one nonempty empty manifold at every k")
+    for ik, n_occ in enumerate(occupied_counts):
+        occupied = logical_e[ik, logical_f[ik] == 1.0]
+        empty = logical_e[ik, logical_f[ik] == 0.0]
+        if float(np.max(occupied)) >= float(np.min(empty)):
+            raise ValueError(
+                "uniform current response requires ground-state insulating "
+                f"occupations ordered by energy; k row {ik} is inverted")
+
+    if int(e.shape[1]) != int(gamma.shape[2]):
+        from runtime.padding import pad_axis
+        e = pad_axis(e, int(gamma.shape[2]), axis=1).array
+        f = pad_axis(f, int(gamma.shape[2]), axis=1).array
+    vertex = jnp.transpose(gamma, (1, 0, 2, 3))
+    vertex, e, f, _ = _pad_head_band_manifold(
+        vertex, e, f, jnp.zeros_like(e), mesh=mesh)
+    response_raw, infinity_raw, unsafe = _uniform_current_response_kernel(
+        mesh, nb_logical=int(nb_logical))(
+            vertex, e, e, f, f,
+            jnp.asarray(z_host, dtype=jnp.complex128),
+            jnp.asarray(float(degeneracy_tolerance_ry), dtype=jnp.float64),
+        )
+    if int(np.asarray(unsafe)):
+        raise ValueError(
+            "GATE uniform_current_response_degenerate: differently occupied "
+            "states are degenerate within degeneracy_tolerance_ry")
+    capacity = 2.0 / (float(nspin) * float(nspinor_wfn))
+    prefactor = capacity / (float(cell_volume) * float(nk_tot))
+    return (
+        jnp.asarray(prefactor * response_raw, dtype=jnp.complex128),
+        jnp.asarray(prefactor * infinity_raw, dtype=jnp.complex128),
+    )
 
 
 def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
