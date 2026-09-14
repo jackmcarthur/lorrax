@@ -15,6 +15,15 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from distrib_la.active_subspace import LocalSubspacePlan, plan_local_subspace
 
 
+def _merge_projection(h, delta, start, count, active):
+    """Retain old global entries; only the newly reduced panel replaces them."""
+    row = jnp.arange(h.shape[0])
+    new = (row >= start) & (row < start+count)
+    mask = ((new[:, None] & (row[None, :] < active)) |
+            (new[None, :] & (row[:, None] < active)))
+    return jnp.where(mask, delta, h)
+
+
 @dataclass(frozen=True)
 class CpuSubspacePlan:
     capacity: int
@@ -85,6 +94,10 @@ class CpuSubspacePlan:
                 out[start:start+count, :m] = panel.conj().T
             return out
         return jax.pure_callback(work, jax.ShapeDtypeStruct(h.shape, h.dtype), v, hv, h, active, start, count)
+
+    def store_project(self, v, hv, p, hp, h, start, count):
+        v, hv = self.store(v, hv, p, hp, start, count)
+        return v, hv, self.project(v, hv, start+count, h, start, count)
 
     def qr(self, rows):
         flat = rows.reshape(rows.shape[0], -1)
@@ -174,11 +187,20 @@ class DistributedSubspacePlan:
             return jax.lax.psum(delta, self.axes)
         spec = self.vector_sharding.spec
         delta = self._map(body, (spec, spec, P(), P(), P()), P())(v, hv, active, start, count)
-        row = jnp.arange(self.capacity)
-        new = (row >= start) & (row < start+count)
-        mask = ((new[:, None] & (row[None, :] < active)) |
-                (new[None, :] & (row[:, None] < active)))
-        return jnp.where(mask, delta, h)
+        return _merge_projection(h, delta, start, count, active)
+
+    def store_project(self, v, hv, p, hp, h, start, count):
+        def body(v, hv, p, hp, start, count):
+            v, hv, delta = self.local.store_project(
+                v, hv, p, hp,
+                jnp.zeros((self.capacity, self.capacity), jnp.complex128),
+                start, count)
+            return v, hv, jax.lax.psum(delta, self.axes)
+        spec = self.vector_sharding.spec
+        v, hv, delta = self._map(
+            body, (spec, spec, spec, spec, P(), P()), (spec, spec, P()))(
+                v, hv, p, hp, start, count)
+        return v, hv, _merge_projection(h, delta, start, count, start+count)
 
     def reconstruct(self, v, hv, c, active, template, *, columns=None, compute_image=True, start=0):
         columns = template.shape[0] if columns is None else columns

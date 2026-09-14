@@ -125,6 +125,7 @@ _LIB_PATHS: Dict[str, str] = {}
 # ---------------------------------------------------------------------------
 _CUDA_TARGET_SYMBOLS = {
     "lorrax_active_subspace_store":        "ActiveSubspaceStoreFfi",
+    "lorrax_active_subspace_store_project": "ActiveSubspaceStoreProjectFfi",
     "lorrax_active_subspace_eigh":         "ActiveSubspaceEighFfi",
     "lorrax_active_subspace_project":      "ActiveSubspaceProjectFfi",
     "lorrax_active_subspace_reconstruct":  "ActiveSubspaceReconstructFfi",
