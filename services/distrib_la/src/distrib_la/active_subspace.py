@@ -113,6 +113,30 @@ class LocalSubspacePlan:
                          jnp.array([active, start, count], jnp.int32))
         return result
 
+    def store_project(self, v, hv, p, hp, h, start, count):
+        """Insert a block and project its new rows/columns in one native call.
+
+        The active prefix ends at ``start + count``. An empty insertion leaves
+        all outputs unchanged. Only one host read of the range is required;
+        the basis, images and projected matrix have declared output aliases.
+        """
+        if (v.shape != hv.shape or p.shape != hp.shape or
+                v.shape[0] != self.capacity or v.shape[1:] != p.shape[1:] or
+                h.shape != (self.capacity, self.capacity)):
+            raise ValueError('store/project buffer geometry differs from plan')
+        vf, hf = self._flat(v), self._flat(hv)
+        call = jax.ffi.ffi_call(
+            'lorrax_active_subspace_store_project',
+            (_spec(vf), _spec(hf), _spec(h), self.workspace_specs['blas']),
+            input_layouts=[(0, 1), (0, 1), (0, 1), (0, 1), (1, 0), (0,)],
+            output_layouts=[(0, 1), (0, 1), (1, 0), (0,)],
+            input_output_aliases={0: 0, 1: 1, 4: 2},
+            vmap_method='sequential')
+        vv, hh, projected, _ = call(
+            vf, hf, self._flat(p), self._flat(hp), self._flat(h),
+            jnp.array([start, count], jnp.int32))
+        return vv.reshape(v.shape), hh.reshape(hv.shape), projected
+
     def reconstruct(self, v, hv, c, active, template, *, columns=None, compute_image=True, start=0):
         if v.shape != hv.shape or v.shape[0] != self.capacity or c.shape != (self.capacity, template.shape[0]):
             raise ValueError('active reconstruction buffer geometry differs from plan')
@@ -188,7 +212,7 @@ def plan_local_subspace(*, capacity: int, n_eig: int, max_block_size: int | None
         raise ValueError('local active subspace requires JAX x64')
     if jax.local_devices()[0].platform != 'gpu':
         raise ValueError('local active subspace currently requires CUDA')
-    for op in ('eigh', 'project', 'reconstruct', 'ortho', 'store', 'gram'):
+    for op in ('eigh', 'project', 'reconstruct', 'ortho', 'store', 'gram', 'store_project'):
         result = probe_target('lorrax_active_subspace_'+op, 'CUDA')
         if not result.ok:
             raise RuntimeError(f'active subspace provider unavailable: {result}')
