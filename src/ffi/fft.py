@@ -479,8 +479,12 @@ def make_gw_conv_ffi(
     norm: str | None = 'ortho',
     mult: float = 1.0,
 ) -> Callable:
-    """FUSED flat-k convolution, **k-LEADING** — the family's k-strided member
-    (the FFTW3 ABI on cpu, cuFFT + fused multiply kernel on CUDA).
+    """Fused convolution for arrays whose leading axis is k.
+
+    The service selects the direct CUDA implementation when the existing
+    LORRAX_CONV_KLEAD_FFI policy and runtime grid allow it. Otherwise it uses
+    the plan-based FFTW3/cuFFT implementation. Both preserve the same shapes,
+    distribution, normalization, and input-output alias contract.
 
     Its sibling is :func:`make_conv_kminor_ffi`, which computes the same
     expression for a caller whose tile keeps k MINOR-most; see the module
@@ -506,6 +510,10 @@ def make_gw_conv_ffi(
     "which flag is set" is not the question being asked here.
     """
     require_fft_ffi(mesh, GW_CONV_TARGET)
+    use_direct, _ = conv_klead_plan(mesh, kgrid)
+    if use_direct:
+        return make_conv_klead_ffi(
+            mesh, kgrid, g_spec, v_spec, norm=norm, mult=mult)
     nkx, nky, nkz = (int(v) for v in kgrid)
     nk = nkx * nky * nkz
     g_flat = validate_flat_spec(g_spec, "G")
@@ -559,9 +567,9 @@ def make_gw_conv_ffi(
 # rows itself and emits U k-leading without an output pack.
 # It transforms W inside the call because Sigma has no solve-wide W_R cache.
 #
-# Default OFF.  This is a callable candidate, but no production Sigma caller
-# exists until its separate seam lands.  `auto` is a safe capability choice;
-# `on` is the certification mode and never demotes.
+# Default OFF. make_gw_conv_ffi uses this optional implementation when
+# requested. The service owns capability and grid checks; callers retain
+# their ordinary distributed array layout. `on` refuses unsupported inputs.
 CONV_KLEAD_GATE = Gate(
     env="LORRAX_CONV_KLEAD_FFI",
     target=CONV_KLEAD_TARGET,
@@ -576,20 +584,20 @@ CONV_KLEAD_GATE = Gate(
         "and the conservative shared-memory floor"),
     auto_on_msg=(
         "[conv_klead] auto -> ON: k-leading fused-convolution candidate "
-        "({target}) available; no production Sigma caller yet.  Each direct "
+        "({target}) available. Each convolution factory "
         "call still resolves its runtime k-grid axes and conservative "
         "row-residency floor."),
     auto_off_msg=(
         "[conv_klead] auto -> OFF: k-leading fused-convolution candidate "
-        "unavailable; no production Sigma caller yet.  Reason: {reason}"),
+        "unavailable; retaining the plan-based convolution. Reason: {reason}"),
     off_announce_msg=(
         "[LORRAX_CONV_KLEAD_FFI] =0: k-leading fused-convolution candidate "
-        "disabled; no production Sigma caller yet."),
+        "disabled; using the plan-based convolution."),
     label={"CUDA": "direct k-leading fused conv CUDA"},
     resolved_msg={
         "CUDA": (
             "[conv_klead] k-leading fused-convolution candidate available; "
-            "no production Sigma caller yet.  Direct CUDA FFI handler "
+            "Direct CUDA FFI handler "
             "({target}): one SMEM-resident traversal, "
             "runtime twiddle-ring extents, zero global transposes, "
             "k-leading store, c128 only."),
