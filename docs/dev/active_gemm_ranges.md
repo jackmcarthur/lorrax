@@ -8,6 +8,13 @@ before multiplication; complex weights require a complex-valued plan. Bounds are
 shape `(nq,)`. Allocation shapes stay `(nq,m,K)`, `(nq,K,n)` and `(nq,m,n)`;
 output is always `P(None,x,y)` for the active-range API.
 
+When the interval is already known on the host, call
+`prepared = plan.prepare_active_range(lo, hi)` outside a compiled loop and
+then use `prepared(A, B, C=None, *, out=None, weights=None)`. Preparation makes
+an immutable copy of the scalar or per-parent bounds. The returned callable
+has no bounds array among its runtime operands, but retains the same
+alpha/beta, C/out, weighting, shape and sharding contract as `active_range`.
+
 `low_mem_bands=true` selects distributed face operands; `false` selects
 local axis products with replicated bands. Both production tau paths derive
 exact per-parent support intervals after applying energy windows and selector
@@ -48,6 +55,13 @@ beta semantics without reading A/B. Native context workspace is separate from
 XLA memory accounting; the context grows it as needed. Range-descriptor caching
 across invocations is not implemented.
 
+The prepared target `lorrax_cublasmp_prepared_active_range_gemm` receives the
+validated intervals as immutable FFI metadata. It enters the same descriptor
+view implementation as the dynamic target, without copying bounds from the
+device or synchronizing the CUDA stream to read them. Requesting a prepared
+callable probes this target eagerly. Its first operand call still compiles the
+bound-specific executable.
+
 ## Local CUDA kernel
 
 `distrib_la._active_local_cuda.active_local_cuda` invokes
@@ -69,6 +83,11 @@ and accumulation buffers; it does not claim to eliminate this baseline tile.
 When all parents request the full interval, a JAX conditional retains the
 original weighted dense dot and its evaluation order.
 
+The prepared target `lorrax_cublas_local_prepared_active_range_gemm` uses the
+same pointer and leading-dimension implementation with immutable FFI metadata.
+It removes the per-call device-to-host bounds copy and stream synchronization;
+it does not remove the full weighted-A tile or the 4 MiB FFI scratch result.
+
 ## Local CPU kernel
 
 `distrib_la._active_local.active_local_matmul` uses existing JAX dot lowering
@@ -84,6 +103,25 @@ parents into the original output shape. Full intervals use the original dense
 dot. Slice scratch and dot launches remain real costs and must be measured.
 This kernel also ran on GPUs as a development control, but production CUDA
 axis plans select the local cuBLAS implementation.
+
+Prepared CPU calls close over the validated bounds and use this same panel
+kernel. They remain callback-free and accept no runtime bounds operand.
+
+## Prepared callable lifetime and compilation
+
+The caller owns every callable returned by `prepare_active_range`. There is no
+process-global cache of bound vectors and no mutable native handle carrying
+the interval. Retaining a callable retains only its plan and immutable host
+metadata until JAX compiles it on first use. Each distinct captured interval
+may create another executable, so this interface is intended for intervals
+that recur across many calls. Dynamic or frequently changing intervals should
+continue to use `active_range`.
+
+Preparation itself does not execute a GEMM or allocate full-size dummy
+operands. A full-range prepared call selects the original dense operation so
+its established numerical order is unchanged. Explicit preparation still
+performs the CUDA capability probe immediately, even for full bounds, so a
+requested unavailable provider cannot be hidden by that dense fast path.
 
 ## API boundaries and verification
 
@@ -101,14 +139,18 @@ full intervals would bypass the active native handlers.
 
 - `services/distrib_la/tests/test_active_gemm_range.py`: distributed CUDA
   scalar/per-parent intervals, owner crossings, alpha/beta, full/empty bounds,
-  poisoned inactive operands and bitwise full-range parity.
+  poisoned inactive operands, bitwise full-range parity, and immutable
+  prepared metadata after mutation of the caller's original bounds arrays.
 - `services/distrib_la/tests/test_local_active_gemm_range.py`: local CPU/CUDA
   intervals, non-power-of-two capacities, complex weights, poisoned inactive
-  A/B/weights, empty parents, one compiled scan and invalid-bound behavior.
+  A/B/weights, empty parents, one compiled scan, prepared calls without
+  runtime bounds operands, and invalid-bound behavior.
 - `tests/multi_device/active_band_sigma_gate.py`: typed scalar/spinor tau
   projections, time reversal, selectors, energy windows and bracket additivity.
 
-Run391 and Run392 in the sandbox own numerical, HLO and timing evidence.
+Run391 and Run392 own the dynamic and local active-range numerical, HLO and
+timing evidence. Run396 owns prepared-bound provider and service acceptance
+plus physical full-driver parity and timing evidence.
 CPU emulation verifies local JAX semantics; it is not real CPU/MPI or Frontera
 certification. The deployed MPI adapter must be available and attested before
 claiming the complete CPU driver route.

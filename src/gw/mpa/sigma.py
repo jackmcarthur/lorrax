@@ -262,6 +262,11 @@ def _integrate_sigma_batches(
     tau_profile = env_bool(
         "LORRAX_SIGMA_TAU_TIMING", False, print_fn=print_fn)
 
+    prepared_bounds = env_bool(
+        "LORRAX_SIGMA_PREPARED_BOUNDS", False, print_fn=print_fn)
+    if prepared_bounds and brackets is not None:
+        raise ValueError("LORRAX_SIGMA_PREPARED_BOUNDS requires unbracketed Sigma windows")
+
     s = wfns.slices
     sigma_axis = sigma_band_axis(
         int(s.nb_sigma), mesh_xy, ansatz="dynamic")
@@ -304,6 +309,12 @@ def _integrate_sigma_batches(
         brackets=brackets,
         **face_kwargs)
     small = NamedSharding(mesh_xy, P())
+    # Lifetime is one integration: new energies/occupations in a later SC map
+    # must be checked again. No G/W arrays or tau histories enter these caches.
+    prepared_rows = {}
+    prepared_kernels = {}
+    tau_capacity = max((len(row.window.nodes.t) for row in plan), default=0)
+    dynamic_tau_kernel = tau_kernel
 
     n_sweeps = n_tau = 0
     logical_tau_pairs = 0
@@ -351,7 +362,7 @@ def _integrate_sigma_batches(
                 B_odd = jnp.zeros_like(B_odd)
         width = int(Omega.shape[0])
         batch = tuple(range(int(lo), int(lo) + width))
-        for row in plan:
+        for row_index, row in enumerate(plan):
             selected = _batch_rows(row, batch)
             if selected is None:
                 continue
@@ -394,6 +405,34 @@ def _integrate_sigma_batches(
                     break
                 t_nodes = t_nodes[:remaining]
                 alpha_nodes = alpha_nodes[:remaining]
+            tau_kernel = dynamic_tau_kernel
+            if prepared_bounds:
+                from gw.greens_function_kernel import prepare_tau_band_range
+                # Certify the full quadrature even for a truncated timing probe,
+                # so subsequent pole batches reuse the same exact decision.
+                if row_index not in prepared_rows:
+                    started = time.perf_counter()
+                    evolution_times = np.zeros(tau_capacity, np.complex128)
+                    row_times = np.asarray(jax.device_get(win.nodes.t), np.complex128)
+                    evolution_times[:len(row_times)] = 1j * row_times
+                    lo_band, hi_band, invariant = jax.device_get(prepare_tau_band_range(
+                        E_A_call, selector, jnp.asarray(win.E_ref_A),
+                        device_put_process_local(evolution_times, small),
+                        jnp.asarray(len(row_times), dtype=jnp.int32)))
+                    if bool(np.all(invariant)):
+                        interval = tuple(zip(np.asarray(lo_band).tolist(),
+                                             np.asarray(hi_band).tolist()))
+                        if interval not in prepared_kernels:
+                            prepared_kernels[interval] = dynamic_tau_kernel.prepare_active_range(
+                                lo_band, hi_band)
+                        prepared_rows[row_index] = prepared_kernels[interval]
+                        route = "prepared"
+                    else:
+                        prepared_rows[row_index] = dynamic_tau_kernel
+                        route = "dynamic (support changes with tau)"
+                    print_fn(f"  Sigma window {row_index}: {route} band bounds; "
+                             f"preparation {time.perf_counter() - started:.6f} s")
+                tau_kernel = prepared_rows[row_index]
             accumulator.begin_window(
                 t_nodes, alpha_nodes,
                 omega_sign=win.omega_sign, prefactor=win.prefactor,
