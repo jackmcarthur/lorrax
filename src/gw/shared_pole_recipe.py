@@ -629,6 +629,49 @@ def _support_envelope(required, key, session):
                 scope=scope)
 
 
+def parse_support_sites(text):
+    """Parse ``sigma_w_support_sites_ev`` into the two explicit site ladders.
+
+    ``""`` is the production ladder: this returns ``None`` and the resolver's
+    own rule stands untouched. Any other value spells both ladders in eV as
+    ``"<line list> | <imaginary list>"``, replacing the 2*eta/4*eta line rule
+    and the Zolotarev imaginary geometric ladder together. Sites are strictly
+    increasing; line sites are >= 0 and imaginary sites > 0, with at least two
+    imaginary sites so the held geometric midpoints stay defined. The height
+    (4*eta), the held fractions, the widths and every gate are unchanged, so an
+    override run is the same construction on a different support set.
+    """
+    text = str(text).strip()
+    if not text:
+        return None
+    parts = text.split('|')
+    if len(parts) != 2:
+        raise ValueError(f"GATE shared_pole_support_sites: got: {text!r}; want: '<line eV list> | <imaginary eV list>'; why: the override replaces both ladders or neither")
+
+    def sites(raw, name, floor, minimum):
+        try:
+            values = [float(v) for v in raw.replace(',', ' ').split()]
+        except ValueError:
+            raise ValueError(f"GATE shared_pole_support_sites: got: {raw!r} for {name}; want: comma-separated eV numbers; why: the ladder is an explicit site list") from None
+        if len(values) < minimum:
+            raise ValueError(f"GATE shared_pole_support_sites: got: {len(values)} {name} sites; want: at least {minimum}; why: the held midpoints need adjacent pairs")
+        if any(not math.isfinite(v) or v < floor for v in values):
+            raise ValueError(f"GATE shared_pole_support_sites: got: {values} for {name}; want: finite sites >= {floor} eV; why: a support off the causal quadrant has no bank evaluation")
+        if any(b <= a for a, b in zip(values, values[1:])):
+            raise ValueError(f"GATE shared_pole_support_sites: got: {values} for {name}; want: strictly increasing; why: repeated sites collapse the pencil")
+        return values
+
+    line = sites(parts[0], 'line', 0.0, 2)
+    imaginary = sites(parts[1], 'imaginary', 0.0, 2)
+    if imaginary[0] <= 0.0:
+        raise ValueError(f"GATE shared_pole_support_sites: got: imaginary site {imaginary[0]} eV; want: > 0; why: the imaginary ladder is geometric")
+    # repr round-trips a double exactly, so the canonical text that enters
+    # recipe_hash is the geometry the stream samples, to the last bit.
+    canonical = (','.join(repr(v) for v in line) + '|'
+                 + ','.join(repr(v) for v in imaginary))
+    return {'line_ev': line, 'imaginary_ev': imaginary, 'text': canonical}
+
+
 def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                               support_session=None):
     """Resolve DESIGN §5 from current metadata into scalars and small arrays.
@@ -669,6 +712,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     if not math.isfinite(eta) or eta <= 0:
         raise ValueError("GATE shared_pole_eta: got: invalid eta; want: finite positive sigma_regularization_ev; why: causal sampling height")
     height = recipe['height_eta_factor'] * eta
+    override = parse_support_sites(getattr(config.sigma, 'w_support_sites_ev', ''))
     plasma_ry = 2.0 * math.sqrt(4.0 * math.pi * census['active_electrons']
                                / census['cell_volume_bohr3'])
     top = plasma_ry * RYD_TO_EV + recipe['plasma_margin_ev']
@@ -681,7 +725,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     support_receipt = None
     if support_session is not None:
         key = (RECIPE_HASH, tier, eta, int(meta.nspinor), int(meta.n_rmu),
-               census['logical_band_count'])
+               census['logical_band_count'],
+               '' if override is None else override['text'])
         support_receipt = _support_envelope(
             dict(line_top_ev=top, u_min_ev=umin, u_max_ev=umax), key,
             support_session)
@@ -703,6 +748,16 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         math.log(16 * kappa**2) * math.log(4 / recipe['imaginary_count_epsilon'])
         / (2 * math.pi**2))) if tier == 'production' else policy['imaginary_count']
     imaginary = np.geomspace(umin, umax, count)
+    if override is not None:
+        # Both ladders are replaced together; height, held fractions, widths,
+        # zero policy and every gate stay the resolver's own. u_min/u_max/kappa
+        # follow the delivered imaginary ladder so the reported scalars and the
+        # sampled geometry cannot disagree.
+        line = np.asarray(override['line_ev'], dtype=np.float64)
+        imaginary = np.asarray(override['imaginary_ev'], dtype=np.float64)
+        count = int(imaginary.size)
+        umin, umax = float(imaginary[0]), float(imaginary[-1])
+        kappa = top / umin
     mids = 0.5 * (line[:-1] + line[1:])
     held_pairs = [int(np.argmin(abs(mids - fraction*top)))
                   for fraction in recipe['held_line_fractions']]
@@ -733,9 +788,19 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     if set(fit_ids) & set(held_ids):
         raise ValueError("GATE shared_pole_held_exclusion: got: held/training collision; want: disjoint physical IDs; why: held diagnostics must be independent")
     n = int(meta.nspinor) * int(meta.n_rmu)
+    # A support override is a different physical sampling geometry, so it must
+    # be a different recipe identity: restart membership, the bank header and
+    # the model identity all authenticate through these two fields, and an
+    # unchanged hash would let a store built on one ladder be reused on another.
+    version, table = RECIPE_VERSION, RECIPE_HASH
+    if override is not None:
+        version = RECIPE_VERSION + '+support_sites'
+        table = hashlib.sha256(
+            (RECIPE_HASH + '|' + override['text']).encode()).hexdigest()
     result = {
         'role_codes': dict(ROLE_CODES),
-        'recipe_version': RECIPE_VERSION, 'recipe_hash': RECIPE_HASH,
+        'recipe_version': version, 'recipe_hash': table,
+        'support_sites_override': '' if override is None else override['text'],
         'gate_version': GATE_VERSION, 'gate_hash': GATE_HASH,
         'accuracy': tier, 'accuracy_status': 'NOT_MEASURED',
         'accuracy_reason': 'resolved geometry has no authenticated matching campaign receipt',
@@ -771,6 +836,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     result['metadata_array_bytes'] = sum(v.nbytes for v in result.values()
                                          if isinstance(v, np.ndarray))
     rules = {
+        'support_sites': 'sigma_w_support_sites_ev; "" = the resolver ladder, else explicit line|imaginary eV sites folded into recipe_version/recipe_hash',
         'height': 'h=4*eta', 'eta': 'literal sigma_regularization_ev',
         'plasma': '2*sqrt(4*pi*active_electrons/volume) Ry',
         'top': 'L=omega_p+3.5 eV', 'spacing': 'eta/0.25',

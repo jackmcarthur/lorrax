@@ -2175,6 +2175,12 @@ _DEFAULTS = {
     "sigma_regularization_ev": 0.25,
     "sigma_w_model": "mpa",
     "sigma_w_accuracy": "production",
+    # "" = the shared-pole resolver's own line and imaginary ladders.
+    # "<line eV list> | <imaginary eV list>" replaces both with explicit
+    # sites (gw.shared_pole_recipe.parse_support_sites); the height, held
+    # fractions, widths and gates are unchanged, and the sites enter
+    # recipe_version/recipe_hash so no store crosses ladders on restart.
+    "sigma_w_support_sites_ev": "",
     "sigma_window_edge_factor": 1.5,
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
@@ -2918,6 +2924,12 @@ def _resolve_shared_pole_inputs(params):
             "GATE shared_pole_applicability: sigma_w_accuracy got: "
             f"{params['sigma_w_accuracy']!r} with sigma_w_model={model!r}; "
             "want: sigma_w_model=shared_pole; why: tier has no other consumer")
+    if "sigma_w_support_sites_ev" in named and model != "shared_pole":
+        raise ValueError(
+            "GATE shared_pole_applicability: sigma_w_support_sites_ev got: "
+            f"{params['sigma_w_support_sites_ev']!r} with sigma_w_model={model!r}; "
+            "want: sigma_w_model=shared_pole; why: only the shared-pole "
+            "resolver has support ladders to replace")
     eta = float(params["sigma_regularization_ev"])
     if not (np.isfinite(eta) and eta > 0.0):
         raise ValueError(
@@ -2941,6 +2953,26 @@ def _resolve_shared_pole_inputs(params):
         raise ValueError(
             f"GATE shared_pole_unused_inputs: got: {', '.join(unused)}; "
             "want: remove elementwise MPA fit keys; why: shared_pole uses its versioned recipe")
+    # Refuse a malformed ladder at parse time, not five minutes into the
+    # stream, and announce the override the way write_w is announced: the
+    # deck no longer gets the resolver's certified support rule.
+    from .shared_pole_recipe import parse_support_sites
+    override = parse_support_sites(params["sigma_w_support_sites_ev"])
+    if override is not None:
+        params["sigma_w_support_sites_ev"] = override["text"]
+        _print_deck_report(
+            "\n  ==========================================================\n"
+            "  WARNING -- DEBUG: sigma_w_support_sites_ev replaces BOTH\n"
+            "  shared-pole support ladders with explicit sites:\n"
+            f"    line      {override['line_ev']} eV\n"
+            f"    imaginary {override['imaginary_ev']} eV\n"
+            "  The resolver's 2*eta/4*eta line rule and its Zolotarev\n"
+            "  imaginary count are NOT used.  Height (4*eta), held\n"
+            "  fractions, widths, zero policy and every gate are unchanged.\n"
+            "  The sites enter recipe_version/recipe_hash, so a store built\n"
+            "  on another ladder refuses on restart.  This is a support\n"
+            "  study dial; leave it empty for production.\n"
+            "  ==========================================================")
     tier = params["sigma_w_accuracy"]
     eps = recipe[tier]["sigma_tolerance"]
     if "sigma_quadrature_eps" in named and params["sigma_quadrature_eps"] != eps:
@@ -4427,6 +4459,11 @@ class DynamicSigmaConfig:
     #: cache spelling is "auto" (run tmp), "off", or a deck-relative path.
     w_model: str = "mpa"
     w_accuracy: str = "production"
+    #: ``sigma_w_support_sites_ev``: "" (default, the shared-pole
+    #: resolver's own ladders) or "<line eV list> | <imaginary eV list>",
+    #: an explicit support geometry for support-rule studies.  Parsed and
+    #: gated by ``gw.shared_pole_recipe.parse_support_sites``.
+    w_support_sites_ev: str = _DEFAULTS["sigma_w_support_sites_ev"]
     quadrature_eps: float = _DEFAULTS["sigma_quadrature_eps"]
     quadrature_reduction_seconds: float = _DEFAULTS["sigma_quadrature_reduction_seconds"]
     #: ``None`` = wall budget; an integer = deterministic pass budget.
@@ -5668,6 +5705,7 @@ class LorraxConfig:
             regularization_ev=float(_g("sigma_regularization_ev")),
             w_model=str(_g("sigma_w_model")),
             w_accuracy=str(_g("sigma_w_accuracy")),
+            w_support_sites_ev=str(_g("sigma_w_support_sites_ev")),
             window_edge_factor=float(_g("sigma_window_edge_factor")),
             fermi_reference=str(_g("fermi_reference")).strip().lower(),
             quadrature_eps=float(_g("sigma_quadrature_eps")),
