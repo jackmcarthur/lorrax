@@ -25,8 +25,6 @@ def _omega_coefficient(xp, omega, t, alpha, sign, prefactor, e_ref=0.0):
             * xp.exp(-1j * (e_ref - sign * omega) * t))
 
 
-
-
 @lru_cache(maxsize=8)
 def _antiherm_band_fn(sharding: NamedSharding):
     """``Z -> (Z − Z†)/2i`` on the trailing (i, j) axes, output re-sharded back.
@@ -38,8 +36,6 @@ def _antiherm_band_fn(sharding: NamedSharding):
         lambda Z: (Z - jnp.conj(jnp.swapaxes(Z, -1, -2))) / 2j,
         out_shardings=sharding,
     )
-
-
 
 
 @lru_cache(maxsize=8)
@@ -55,6 +51,42 @@ def _omega_fold(acc, sigma, coeff, omega_axis):
                    + (1,) * (acc.ndim - omega_axis - 1))
     return acc + coeff.reshape(coeff_shape) * jnp.expand_dims(
         sigma, axis=omega_axis)
+
+
+def _active_omega_fold(acc, sigma, coeff, indices, omega_axis,
+                       contiguous=False):
+    """Update distinct selected frequency rows in the original node order."""
+    if contiguous:
+        selected = jax.lax.dynamic_slice_in_dim(
+            acc, indices[0], coeff.shape[0], axis=omega_axis)
+        updated = _omega_fold(selected, sigma, coeff, omega_axis)
+        return jax.lax.dynamic_update_slice_in_dim(
+            acc, updated, indices[0], axis=omega_axis)
+    selected = jnp.take(acc, indices, axis=omega_axis)
+    updated = _omega_fold(selected, sigma, coeff, omega_axis)
+    where = (slice(None),) * omega_axis + (indices,)
+    return acc.at[where].set(updated, unique_indices=True)
+
+
+@lru_cache(maxsize=16)
+def _device_active_omega_add(sharding, omega_axis, contiguous=False):
+    return jax.jit(
+        lambda acc, sigma, coeff, indices: _active_omega_fold(
+            acc, sigma, coeff, indices, omega_axis, contiguous),
+        donate_argnums=(0,), out_shardings=sharding)
+
+
+@lru_cache(maxsize=16)
+def _device_active_window_add(sharding, omega_axis, contiguous=False):
+    def add(total, window, indices):
+        if contiguous:
+            selected = jax.lax.dynamic_slice_in_dim(
+                total, indices[0], window.shape[omega_axis], axis=omega_axis)
+            return jax.lax.dynamic_update_slice_in_dim(
+                total, selected + window, indices[0], axis=omega_axis)
+        where = (slice(None),) * omega_axis + (indices,)
+        return total.at[where].add(window, unique_indices=True)
+    return jax.jit(add, donate_argnums=(0,), out_shardings=sharding)
 
 
 @lru_cache(maxsize=16)
@@ -76,7 +108,8 @@ class DeviceOmegaAccumulator:
     """Fold one transient sigma(tau) tile into a sharded omega cube.
 
     No tau history is retained.  A full/Laplace window accumulates directly
-    into the result.  A one-sided sine window uses one temporary omega cube,
+    into the result. A one-sided sine window uses a temporary containing only
+    its active frequencies,
     applies ``(Z-Z†)/(2i)`` once after its last tau, then adds it to the same
     result.  ``alpha`` is the quadrature weight before reference rephasing;
     combining ``E_ref_sum`` and omega in one exponential avoids separately
@@ -99,11 +132,15 @@ class DeviceOmegaAccumulator:
                 "DeviceOmegaAccumulator: shape[omega_axis] must equal "
                 "n_omega")
         # Per-rank ω-cube: nω·nk·(nb_pad/p_x)·(nb_pad/p_y)·16 bytes (c128),
-        # ×2 while a crossing window holds its temporary cube open.
+        # A crossing window additionally holds only its active omega planes.
         self._total = _device_output_zeros(self._shape, sharding)()
         self._window = None
         self._coeff = None
         self._index = 0
+        self._indices = None
+        self._indices_device = None
+        self._contiguous = False
+        self._compiled_adds = set()
 
     def begin_window(self, t, alpha, *, omega_sign, prefactor,
                      e_ref_sum=0.0, antihermitian=False,
@@ -125,43 +162,87 @@ class DeviceOmegaAccumulator:
             if (indices.ndim != 1 or omega.shape != indices.shape
                     or np.any(indices < 0) or np.any(indices >= self._omega.size)):
                 raise ValueError("invalid active frequency indices/values")
+            if np.unique(indices).size != indices.size:
+                raise ValueError("active frequency indices must be distinct")
+            if np.array_equal(indices, np.arange(self._omega.size)):
+                indices = None
         active = np.asarray(_omega_coefficient(
             np, omega[None, :], t[:, None], alpha[:, None],
             float(omega_sign), float(prefactor), float(e_ref_sum)),
             np.complex128)
-        if indices is None:
-            self._coeff = active
-        else:
-            self._coeff = np.zeros(
-                (t.size, self._omega.size), dtype=np.complex128)
-            self._coeff[:, indices] = active
+        self._coeff = active
+        self._indices = indices
+        # Frequency values may be abs/rephased; only storage coordinates
+        # decide contiguity. Descending or gapped selections retain order.
+        omega_partition = (
+            self._sharding.spec[self._omega_axis]
+            if self._omega_axis < len(self._sharding.spec) else None)
+        self._contiguous = bool(
+            indices is not None and indices.size > 0
+            and omega_partition is None
+            and np.all(np.diff(indices) == 1))
+        self._indices_device = device_put_process_local(
+            np.asarray([] if indices is None else indices, np.int32),
+            self._replicated)
         self._index = 0
+        window_shape = list(self._shape)
+        window_shape[self._omega_axis] = omega.size
         self._window = (_device_output_zeros(
-            self._shape, self._sharding)() if antihermitian else None)
+            tuple(window_shape), self._sharding)() if antihermitian else None)
 
     def precompile_tau_add(self, *, sigma_shape, sigma_sharding):
-        """Compile the accumulator fold before the timed tau sweep marker."""
+        """Warm each cheap frequency-fold signature once, without a tau tile.
+
+        Call after ``begin_window`` to warm its exact active width. Returns
+        whether a signature was newly warmed by this accumulator instance.
+        """
         sigma = jax.ShapeDtypeStruct(
             tuple(int(n) for n in sigma_shape), jnp.complex128,
             sharding=sigma_sharding)
+        n_omega = (self._omega.size if self._coeff is None
+                   else self._coeff.shape[1])
+        if n_omega == 0:
+            return False
         coeff = jax.ShapeDtypeStruct(
-            (self._omega.size,), jnp.complex128,
+            (n_omega,), jnp.complex128,
             sharding=self._replicated)
-        _device_omega_add(self._sharding, self._omega_axis).lower(
-            self._total, sigma, coeff).compile()
+        if self._window is None and self._indices is not None:
+            run = _device_active_omega_add(
+                self._sharding, self._omega_axis, self._contiguous)
+            arguments = (self._total, sigma, coeff, self._indices_device)
+        else:
+            carry = self._total if self._window is None else self._window
+            run = _device_omega_add(self._sharding, self._omega_axis)
+            arguments = (carry, sigma, coeff)
+        signature = (run, tuple(
+            (tuple(x.shape), str(x.dtype), x.sharding) for x in arguments))
+        if signature in self._compiled_adds:
+            return False
+        run.lower(*arguments).compile()
+        self._compiled_adds.add(signature)
+        return True
+
 
     def add_tau(self, sigma_tau):
         if self._coeff is None:
             raise RuntimeError("no open frequency window")
         if self._index >= self._coeff.shape[0]:
             raise RuntimeError("more sigma(tau) tiles than quadrature nodes")
+        if self._coeff.shape[1] == 0:
+            self._index += 1
+            return self._total
         coeff = device_put_process_local(
             self._coeff[self._index], self._replicated)
         self._index += 1
         if self._window is None:
-            self._total = _device_omega_add(
-                self._sharding, self._omega_axis)(
-                self._total, sigma_tau, coeff)
+            if self._indices is None:
+                self._total = _device_omega_add(
+                    self._sharding, self._omega_axis)(
+                    self._total, sigma_tau, coeff)
+            else:
+                self._total = _device_active_omega_add(
+                    self._sharding, self._omega_axis, self._contiguous)(
+                    self._total, sigma_tau, coeff, self._indices_device)
         else:
             self._window = _device_omega_add(
                 self._sharding, self._omega_axis)(
@@ -170,18 +251,26 @@ class DeviceOmegaAccumulator:
         # Production ignores this return and keeps the incumbent async path.
         return self._total if self._window is None else self._window
 
+
     def end_window(self):
         if self._coeff is None:
             raise RuntimeError("no open frequency window")
         if self._index != self._coeff.shape[0]:
             raise RuntimeError("frequency window ended before all tau nodes")
-        if self._window is not None:
+        if self._window is not None and self._coeff.shape[1] != 0:
             completed = _antiherm_band_fn(self._sharding)(self._window)
-            self._total = _device_output_add(self._sharding)(
-                self._total, completed)
+            if self._indices is None:
+                self._total = _device_output_add(self._sharding)(
+                    self._total, completed)
+            else:
+                self._total = _device_active_window_add(
+                    self._sharding, self._omega_axis, self._contiguous)(
+                    self._total, completed, self._indices_device)
         self._window = None
         self._coeff = None
         self._index = 0
+        self._indices = self._indices_device = None
+        self._contiguous = False
 
     def add_direct(self, sigma_omega, omega_index, *, coefficient=1.0):
         """Add one exact direct-frequency tile outside the tau lifecycle.
