@@ -32,6 +32,183 @@ _PHOTON_BLOCK_SELECTIONS = (PHOTON_BLOCKS_ALL, PHOTON_BLOCKS_CURRENT)
 _photon_sigma_kernel_cache: dict[tuple[object, ...], object] = {}
 
 
+def photon_head_alpha_operator(geom):
+    r"""Return the production spatial ``gamma-tilde`` vertex sweep operator.
+
+    The input of :func:`common.mtxel_sweep.sweep_matrix_elements` must be the
+    four-component WFN produced by the run's kinetic-balance loader.  This
+    operator applies the same :func:`common.gamma_matrices.gamma_apply`
+    matrices as :func:`_make_lorentz_convolution`, yielding
+    ``<m k|alpha_A|n k>`` for ``A=1,2,3``.  It intentionally excludes the
+    ICL pseudopotential term in the uniform-gauge response ``Gamma_raw``:
+    that response vertex is a different operator from the photon Sigma
+    vertex used by the existing production convolution.
+    """
+    from common.gamma_matrices import gamma_apply, gamma_perm_phase
+    from common.mtxel_sweep import Operator
+
+    if int(geom.ns) != 4:
+        raise ValueError(
+            "photon head alpha vertices require kinetic-balance "
+            f"four-spinors; geom.ns={int(geom.ns)}")
+    vertices = tuple(gamma_perm_phase(A) for A in (1, 2, 3))
+
+    def apply(psi_n, gvec, gmask, bidx, kvec):
+        del gvec, bidx, kvec
+        psi = psi_n * gmask[None, None, None, :].astype(psi_n.dtype)
+        applied = jnp.stack(
+            tuple(gamma_apply(psi, perm, phase, axis=2)
+                  for perm, phase in vertices), axis=-1)
+        return applied
+
+    return Operator(
+        apply=apply, post=1.0, ncomp=3,
+        key=("photon_head_alpha", int(geom.ngkmax), int(geom.ns)))
+
+
+def contract_ordered_tt_head_sigma(
+    gamma_ext_m,
+    f_plus_ext_m,
+    f_minus_ext_m,
+    occupations_km,
+    *,
+    nk_tot: int,
+    cell_volume_bohr3: float,
+    intermediate_mask_km=None,
+):
+    r"""Contract an ordered, cell-averaged transverse head into diagonal Sigma.
+
+    This is the small final consumer for a full-frequency ``q=0`` photon
+    head.  The inputs use the production photon-current convention
+
+    ``gamma_ext_m[k,A,n,m] = <n k | Gamma_A | m k>``
+
+    with ``A=1,2,3``.  These are the production ``gamma-tilde`` vertices
+    projected through the run's kinetic-balance four-spinor WFN carrier;
+    they are not the pseudopotential uniform-gauge ``Gamma_raw`` operator.
+    ``f_plus_ext_m`` and ``f_minus_ext_m`` are the two ordered contour
+    functions evaluated at ``epsilon_n-epsilon_m+i*eta``.  Their shape is
+    ``(nk,n_external,n_intermediate,3,3)`` and their raw cell-moment unit is
+    ``Ry*bohr^3``.
+
+    The Green pole chooses ``F_-`` with weight ``f_m`` and ``F_+`` with
+    weight ``1-f_m``.  The returned array has shape ``(nk,n_external)``.
+    The completed head matrices are raw cell moments.  This consumer applies
+    ``+1/(cell_volume_bohr3*nk_tot)`` exactly once.  The positive correlation
+    sign follows the ordered ``iGW`` contour convention; it must not be
+    copied from the static convolution's occupied-G exchange sign.
+
+    ``F_+`` and ``F_-`` must be formed from the decaying retarded remainder
+    ``H(z)=W(z)-W(infinity)``.  Any nonzero instantaneous ``W(infinity)``
+    belongs in :func:`contract_instantaneous_tt_head_exchange`, rather than
+    in this ordered contour contraction.
+    """
+    gamma = jnp.asarray(gamma_ext_m, dtype=jnp.complex128)
+    f_plus = jnp.asarray(f_plus_ext_m, dtype=jnp.complex128)
+    f_minus = jnp.asarray(f_minus_ext_m, dtype=jnp.complex128)
+    occupations = jnp.asarray(occupations_km, dtype=jnp.float64)
+    if gamma.ndim != 4 or int(gamma.shape[1]) != 3:
+        raise ValueError(
+            "gamma_ext_m must have shape (nk,3,n_external,n_intermediate); "
+            f"got {tuple(gamma.shape)}")
+    expected_f = (gamma.shape[0], gamma.shape[2], gamma.shape[3], 3, 3)
+    if tuple(f_plus.shape) != expected_f or tuple(f_minus.shape) != expected_f:
+        raise ValueError(
+            "ordered TT functions must both have shape "
+            f"{expected_f}; got {tuple(f_plus.shape)} and "
+            f"{tuple(f_minus.shape)}")
+    expected_occ = (gamma.shape[0], gamma.shape[3])
+    if tuple(occupations.shape) != expected_occ:
+        raise ValueError(
+            f"occupations_km must have shape {expected_occ}; got "
+            f"{tuple(occupations.shape)}")
+    if int(nk_tot) <= 0:
+        raise ValueError(f"nk_tot must be positive; got {nk_tot}")
+    if not np.isfinite(float(cell_volume_bohr3)) or float(cell_volume_bohr3) <= 0:
+        raise ValueError(
+            "cell_volume_bohr3 must be finite and positive; got "
+            f"{cell_volume_bohr3}")
+    if intermediate_mask_km is None:
+        mask = jnp.ones(expected_occ, dtype=jnp.float64)
+    else:
+        mask = jnp.asarray(intermediate_mask_km, dtype=jnp.float64)
+        if tuple(mask.shape) != expected_occ:
+            raise ValueError(
+                f"intermediate_mask_km must have shape {expected_occ}; got "
+                f"{tuple(mask.shape)}")
+
+    ordered = (
+        occupations[:, None, :, None, None] * f_minus
+        + (jnp.float64(1.0) - occupations[:, None, :, None, None]) * f_plus
+    )
+    per_intermediate = jnp.einsum(
+        "kanm,knmab,kbnm->knm", gamma, ordered, jnp.conj(gamma),
+        optimize=True)
+    return jnp.sum(per_intermediate * mask[:, None, :], axis=-1) / (
+        float(cell_volume_bohr3) * float(nk_tot))
+
+
+def contract_instantaneous_tt_head_exchange(
+    gamma_ext_m,
+    interaction_tt,
+    occupations_km,
+    *,
+    nk_tot: int,
+    cell_volume_bohr3: float,
+    intermediate_mask_km=None,
+):
+    r"""Contract an instantaneous cell-averaged TT head with occupied states.
+
+    ``interaction_tt`` is either one ``(3,3)`` matrix or a ``(nk,3,3)``
+    raw cell moment in ``Ry*bohr^3``.  This routine is used independently for the bare TT
+    exchange and for a contact-induced ``W(infinity)-D`` change, keeping the
+    constant term out of the finite-pole contour.
+    """
+    gamma = jnp.asarray(gamma_ext_m, dtype=jnp.complex128)
+    occupations = jnp.asarray(occupations_km, dtype=jnp.float64)
+    interaction = jnp.asarray(interaction_tt, dtype=jnp.complex128)
+    if gamma.ndim != 4 or int(gamma.shape[1]) != 3:
+        raise ValueError(
+            "gamma_ext_m must have shape (nk,3,n_external,n_intermediate); "
+            f"got {tuple(gamma.shape)}")
+    expected_occ = (gamma.shape[0], gamma.shape[3])
+    if tuple(occupations.shape) != expected_occ:
+        raise ValueError(
+            f"occupations_km must have shape {expected_occ}; got "
+            f"{tuple(occupations.shape)}")
+    if interaction.ndim == 2:
+        if tuple(interaction.shape) != (3, 3):
+            raise ValueError(
+                "interaction_tt must have shape (3,3) or (nk,3,3); "
+                f"got {tuple(interaction.shape)}")
+        interaction = jnp.broadcast_to(
+            interaction[None, :, :], (gamma.shape[0], 3, 3))
+    elif tuple(interaction.shape) != (gamma.shape[0], 3, 3):
+        raise ValueError(
+            "interaction_tt must have shape (3,3) or "
+            f"({gamma.shape[0]},3,3); got {tuple(interaction.shape)}")
+    if int(nk_tot) <= 0:
+        raise ValueError(f"nk_tot must be positive; got {nk_tot}")
+    if not np.isfinite(float(cell_volume_bohr3)) or float(cell_volume_bohr3) <= 0:
+        raise ValueError(
+            "cell_volume_bohr3 must be finite and positive; got "
+            f"{cell_volume_bohr3}")
+    if intermediate_mask_km is None:
+        mask = jnp.ones(expected_occ, dtype=jnp.float64)
+    else:
+        mask = jnp.asarray(intermediate_mask_km, dtype=jnp.float64)
+        if tuple(mask.shape) != expected_occ:
+            raise ValueError(
+                f"intermediate_mask_km must have shape {expected_occ}; got "
+                f"{tuple(mask.shape)}")
+    per_intermediate = jnp.einsum(
+        "kanm,kab,kbnm->knm", gamma, interaction, jnp.conj(gamma),
+        optimize=True)
+    weights = occupations * mask
+    return -jnp.sum(per_intermediate * weights[:, None, :], axis=-1) / (
+        float(cell_volume_bohr3) * float(nk_tot))
+
+
 @dataclass(frozen=True)
 class StaticPhotonHeadSigmaDiagnostics:
     """Exact diagonal contraction of the final q=0 Lorentz-block updates.
