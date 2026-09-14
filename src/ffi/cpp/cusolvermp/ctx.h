@@ -2,6 +2,8 @@
 #pragma once
 
 #include <cstddef>
+#include <mutex>
+#include <vector>
 #include <cuda_runtime.h>
 #include <nccl.h>
 // LORRAX_FFI_HAVE_CAL defaults to 1 (unset -> Perlmutter/Cray behaviour).
@@ -81,6 +83,18 @@ struct LorraxCusolverMpCtx {
     // Local empty-contraction scaling, bound to this context stream.
     cublasHandle_t local_blas_handle = nullptr;
     cublasMpGrid_t    cublasmp_grid   = nullptr;
+
+    // The distributed active-subspace operation has its own event pair so a
+    // concurrently submitted cuSolverMp or cuBLASMp operation cannot replace
+    // either cross-stream record before its wait is enqueued.  The mutex also
+    // protects the preallocated host copy of all ranks' [start, count] values.
+    // Callers must still issue communicator operations in the same order on
+    // every rank; a local mutex cannot impose a global order on independent
+    // host threads.
+    cudaEvent_t active_subspace_ev_xla_in = nullptr;
+    cudaEvent_t active_subspace_ev_ctx_out = nullptr;
+    std::mutex active_subspace_mutex;
+    std::vector<int32_t> active_subspace_host_ranges;
 };
 
 // Grow (d_workspace, h_workspace) if needed; keeps largest allocation.
