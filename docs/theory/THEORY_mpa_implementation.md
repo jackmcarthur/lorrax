@@ -733,20 +733,64 @@ cheap fold and storage work approximately linearly, not the expensive node
 count. Widening the output interval changes the denominator geometry and can
 increase that node count.
 
+`gw.ppm_accumulators.DeviceOmegaAccumulator` owns that fold as a strict window
+lifecycle. `begin_window` validates the time nodes and weights, and accepts
+optional distinct output-frequency indices paired with frequency values. It then
+forms the scalar coefficients for exactly those frequencies. An ordered list
+covering the complete output grid takes the dense path. An ascending consecutive
+interval on the unpartitioned frequency axis uses one dynamic slice/update pair;
+gapped or differently ordered distinct indices retain the general indexed path
+and their declared coefficient order. `add_tau` consumes one spatial tile and
+folds it immediately in node order. `end_window` requires that every declared
+node was consumed and applies the one-sided completion once, when needed.
+`finalize` refuses while a window is open. Direct-frequency terms use
+`add_direct` outside this lifecycle.
+
+The scalar executor does not stack Sigma tiles. Each call produces one spatial
+tile, folds it into the donated accumulator, and releases it before evaluating
+the next node. The expensive shared $G\times W$ kernel therefore has no active
+output-frequency dimension in its executable signature. Exact frequency widths
+specialize only the separate, cheap accumulator fold; a repeated width reuses
+that compiled fold. Resident pole-batch shape can still specialize the spatial
+kernel independently.
+
+For the one-sided completion, let $S_{\mathrm{local}}$ be the number of complex
+entries in one rank's spatial Sigma tile, including any bracket and parent-k
+axes but excluding frequency. The persistent full result costs
+
+$$
+M_{\mathrm{total}}=16 n_\omega S_{\mathrm{local}}\ \text{bytes},
+$$
+
+and a window with $m$ active frequencies uses a compact completion buffer
+
+$$
+M_{\mathrm{window}}=16 m S_{\mathrm{local}}\ \text{bytes}.
+$$
+
+Thus the persistent accumulator storage while that window is open is
+$16(n_\omega+m)S_{\mathrm{local}}$ bytes. This excludes the one live spatial
+tile, shared-kernel scratch, and any completion scratch needed while closing the
+window. Frequencies outside the window are neither stored in the completion
+buffer nor touched by its scalar fold. The frequency axis is replicated; the
+two band axes retain their `x`/`y` sharding, so this compaction does not gather
+a band-space object onto fewer ranks.
+
 Pole fields are stored on the q wedge, read through SlabIO in batches of at
 most four, and unfolded on device. Four is a memory bound, not a spectral
 classification. If a logical window touches both four-pole batches, its
-spatial sweep is executed once for each batch. The physical dispatch census is
-therefore
+spatial sweep is executed once for each batch. The physical time-node
+evaluation census is therefore
 
 $$
-N_{\mathrm{physical}}=
+N_{\mathrm{eval}}=
 \sum_w N_w\,m_w,
 $$
 
 where $m_w$ is the number of pole batches touched by window $w$. The current
-eight-pole Si plan has eight logical windows, 12 physical sweeps, and 446 time
-dispatches.
+eight-pole Si plan has eight logical windows, 12 physical sweeps, and 446
+time-node evaluations. This count belongs to the quadrature and pole-window
+geometry; compact frequency folding does not change it.
 
 Spatial symmetry reduces storage and all non-FFT work on the irreducible q
 wedge. Inputs are unfolded before the k-grid FFT convolution: time-reversal or
@@ -952,6 +996,7 @@ Use these dependencies when moving beyond the validated profile.
 | sample and pole bytes | `file_io.mpa_store` through SlabIO |
 | Sigma geometry and scalar windows | `gw.mpa.sigma_windows` |
 | shared $G\times W$ spatial kernel | `gw.ppm_tau_kernel` |
+| device frequency fold and window lifecycle | `gw.ppm_accumulators` |
 | dynamic-Sigma output and QSGW finalization | `gw.sigma_dispatch` and `gw.dynamic_sigma` |
 
 This boundary is intentional. Scalar quadrature services know no bands,

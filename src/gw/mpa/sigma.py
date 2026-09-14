@@ -60,7 +60,8 @@ def _resolve_debug_max_tau_dispatches(*, print_fn=print):
 
     A bounded sweep is a performance instrument, not a quadrature rule: the
     executor exits cleanly after the requested number of real-shape tau
-    dispatches and never returns a partial Sigma cube to an output consumer.
+    node evaluations and never returns a partial Sigma cube to an output
+    consumer. The environment variable retains its historical spelling.
     """
     raw = os.environ.get(_DEBUG_MAX_TAU_DISPATCHES_ENV)
     if raw is None or not raw.strip():
@@ -78,7 +79,7 @@ def _resolve_debug_max_tau_dispatches(*, print_fn=print):
     print_fn(
         "WARNING -- DEBUG: "
         f"{_DEBUG_MAX_TAU_DISPATCHES_ENV}={count}; the MPA Sigma executor "
-        "will stop after that many tau dispatches and WILL NOT produce "
+        "will stop after that many tau node evaluations and WILL NOT produce "
         "scientific Sigma/QP output.")
     return count
 
@@ -124,7 +125,7 @@ def _print_tau_profile(before, *, n_tau, print_fn=_debug_probe_print):
     """Print post-prewarm timing deltas for the staged tau diagnostic."""
     after = _tau_profile_snapshot()
     print_fn("--- Sigma tau phase profile (post-prewarm, blocking) ---")
-    print_fn(f"{'Phase':<31} {'Count':>7} {'Total[s]':>11} {'s/dispatch':>13}")
+    print_fn(f"{'Phase':<31} {'Count':>7} {'Total[s]':>11} {'s/node':>13}")
     for name in _TAU_PROFILE_PHASES:
         count0, seconds0 = before.get(name, (0, 0.0))
         count1, seconds1 = after.get(name, (0, 0.0))
@@ -370,33 +371,14 @@ def _integrate_sigma_batches(
             E_A_call = k_unfold_plan.parent_rows(row.E_A)
             selector = k_unfold_plan.parent_rows(
                 jnp.reshape(selector, np.shape(row.E_A)))
-            if not sweep_started:
-                first_t = np.asarray(
-                    jax.device_get(win.nodes.t), np.complex128)[0]
-                prewarm_args = (
-                    psi_coh_xn, psi_coh_yr,
-                    psi_proj_xr, psi_proj_yn,
-                    E_A_call, selector, B_branch, Omega,
-                    pole_indices, bounds, phase_real,
-                    jnp.asarray(win.E_ref_A),
-                    jnp.asarray(win.E_ref_B),
-                    jnp.asarray(first_t, dtype=jnp.complex128), active_count)
-                if hasattr(tau_kernel, "lower"):
-                    tau_kernel.lower(*prewarm_args).compile()
-                else:
-                    # The stage-split diagnostic is a Python dispatcher over
-                    # separately-jitted stages.  Execute one real-shape call
-                    # to prewarm the same kernels the timed sweep will use.
-                    jax.block_until_ready(tau_kernel(*prewarm_args))
-                accumulator.precompile_tau_add(
-                    sigma_shape=sigma_shape,
-                    sigma_sharding=sigma_sharding)
-                print_fn(
-                    "  MPA Sigma sweep begin: shared pane tau kernel "
-                    "prewarmed")
-                profile_before = _tau_profile_snapshot()
-                sweep_wall_start = time.perf_counter()
-                sweep_started = True
+            # These operands are invariant over this window. Keep the
+            # expensive spatial executable independent of omega width;
+            # only the inexpensive frequency fold specializes on that width.
+            tau_arguments = (
+                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
+                E_A_call, selector, B_branch, Omega,
+                pole_indices, bounds, phase_real,
+                jnp.asarray(win.E_ref_A), jnp.asarray(win.E_ref_B))
             t_nodes = np.asarray(
                 jax.device_get(win.nodes.t), np.complex128)
             alpha_nodes = np.asarray(
@@ -415,16 +397,30 @@ def _integrate_sigma_batches(
                 antihermitian=(win.project_code == 1),
                 omega_indices=row.omega_idx,
                 omega_values=row.omega_abs)
+            if not sweep_started:
+                first_t = jnp.asarray(t_nodes[0], dtype=jnp.complex128)
+                if hasattr(tau_kernel, "lower"):
+                    tau_kernel.lower(
+                        *tau_arguments, first_t, active_count).compile()
+                else:
+                    # The staged timing diagnostic prewarms its separate
+                    # kernels with one real-shape call on every rank.
+                    jax.block_until_ready(tau_kernel(
+                        *tau_arguments, first_t, active_count))
+            accumulator.precompile_tau_add(
+                sigma_shape=sigma_shape, sigma_sharding=sigma_sharding)
+            if not sweep_started:
+                print_fn(
+                    "  MPA Sigma sweep begin: shared pane tau kernel "
+                    "first signature prewarmed")
+                profile_before = _tau_profile_snapshot()
+                sweep_wall_start = time.perf_counter()
+                sweep_started = True
             for t in t_nodes:
                 if tau_profile:
                     with timing.section("sigma.tau.kernel") as sec:
                         sigma_tau = tau_kernel(
-                            psi_coh_xn, psi_coh_yr,
-                            psi_proj_xr, psi_proj_yn,
-                            E_A_call, selector, B_branch, Omega,
-                            pole_indices, bounds, phase_real,
-                            jnp.asarray(win.E_ref_A),
-                            jnp.asarray(win.E_ref_B),
+                            *tau_arguments,
                             jnp.asarray(t, dtype=jnp.complex128), active_count)
                         sec.watch(sigma_tau)
                     with timing.section("sigma.tau.accumulator") as sec:
@@ -434,15 +430,10 @@ def _integrate_sigma_batches(
                         progress.step()
                 else:
                     sigma_tau = tau_kernel(
-                        psi_coh_xn, psi_coh_yr,
-                        psi_proj_xr, psi_proj_yn,
-                        E_A_call, selector, B_branch, Omega,
-                        pole_indices, bounds, phase_real,
-                        jnp.asarray(win.E_ref_A),
-                        jnp.asarray(win.E_ref_B),
+                        *tau_arguments,
                         jnp.asarray(t, dtype=jnp.complex128), active_count)
-                    accumulator.add_tau(sigma_tau)
-                    progress.step(wait=sigma_tau)
+                    accumulated = accumulator.add_tau(sigma_tau)
+                    progress.step(wait=accumulated)
                 n_tau += 1
             accumulator.end_window()
             n_sweeps += 1
@@ -463,8 +454,8 @@ def _integrate_sigma_batches(
         jax.block_until_ready(accumulator.finalize())
         elapsed = time.perf_counter() - sweep_wall_start
         _debug_probe_print(
-            f"  DEBUG bounded Sigma tau sweep: {n_tau} dispatches in "
-            f"{elapsed:.6f} s ({elapsed / max(1, n_tau):.6f} s/dispatch)")
+            f"  DEBUG bounded Sigma tau sweep: {n_tau} node evaluations in "
+            f"{elapsed:.6f} s ({elapsed / max(1, n_tau):.6f} s/node)")
         if tau_profile:
             _print_tau_profile(
                 profile_before, n_tau=n_tau)
@@ -497,7 +488,7 @@ def _integrate_sigma_batches(
                 "MPA Sigma band_counts must align with band brackets")
     transform_saving = int(logical_tau_pairs - n_tau)
     print_fn(
-        f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
+        f"  MPA Sigma: {n_tau} tau node evaluations in {n_sweeps} sweeps "
         f"({n_poles} poles, batches of {batch_size}); "
         f"{transform_saving} undispatched logical tau; "
         f"panes and product windows used one shared tau kernel")
