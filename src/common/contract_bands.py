@@ -17,17 +17,12 @@ as a rank-local shard between the two collectives.
 That is the ``layout="legacy"`` (default) body, byte-identical to the
 code this module shipped before ``low_mem_bands`` existed.
 ``layout="face"`` (the two-face carrier, ``gw.wavefunction_bundle``)
-solves the SAME projection with a completely different mechanism — two
-planned ``distrib_la.gemm_plan`` N,N GEMMs, no shard_map, no
-psum_scatter — because face's ψ operands are 2-D sharded on BOTH mesh
-axes from the start, unlike legacy's ``psi_xr``/``psi_yn`` (band axis
-replicated going in, sharded only at the output).  See
-:func:`contract_bands_block_reshard`'s own docstring and
-``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md``.  Face's
-``channels="split_reim"`` arm (2026-08-22) is the dynamic PPM/MPA
-Σ_c(τ) two-channel plan, consumed by ``gw.ppm_tau_kernel``'s own face
-dispatch — see this module's :func:`_face_project_kernel` for the
-mechanism.
+uses two ``distrib_la.band_projection_plan`` products. Each keeps its left
+operand distributed in place and exchanges small output-band panels of its
+right operand before a local product and reduce-scatter. The panels include
+all parent k points. See :func:`_face_project_kernel` and the distrib_la
+service documentation for the memory bound. ``channels="split_reim"``
+projects the real and imaginary operator channels separately.
 
 Structure (per rank, inside one shard_map)::
 
@@ -287,7 +282,7 @@ def bands_gemm_ffi_enabled() -> bool:
 
 #: ``(nk, nb_full, n_rmu, nspinor)`` — the four static ints
 #: :func:`contract_bands_block_reshard`'s face path needs to build its two
-#: ``distrib_la.gemm_plan``s EAGERLY (their shapes are fixed at
+#: ``distrib_la.band_projection_plan``s eagerly (their shapes are fixed at
 #: construction; unlike the legacy shard_map body, which is
 #: shape-polymorphic).  A plain 4-tuple rather than a new dataclass: this
 #: is the only site that reads it, and every field already has a home
@@ -304,11 +299,10 @@ def _face_project_kernel(
     band_extent=None,
     layout="face",
 ):
-    """The face-layout Σ projector: TWO planned N,N GEMMs, no shard_map,
-    no psum_scatter — cuBLASMp's own distributed algorithm does the
-    reduction the legacy body does by hand.  See the module docstring's
-    face-layout section and reports/gwjax_low_mem_bands_audit_2026-08-22/
-    report.md §5 ("Sigma = conj(psi_nmu) @ (O @ psi_mun)").
+    """Project a distributed operator with two planned band products.
+
+    Face layout exchanges small band panels while keeping the left operand
+    stationary; axis layout uses the existing local products and reductions.
 
         T[s,μ,n]     = Σ_{s',ν} O[s,μ,s',ν] · psi_mun[s',ν,n]      (GEMM 1)
         Σ[m,n]       = Σ_{s,μ}  conj(psi_nmu)[m,s,μ] · T[s,μ,n]    (GEMM 2)
@@ -333,16 +327,15 @@ def _face_project_kernel(
     ``(S_R, S_I)`` — both complex (ψ is complex even though the channel
     weight is real).  No f64-split de-promotion trick here: that lever
     exists on the legacy XLA-einsum body to dodge XLA's real-operand
-    promotion inside a mixed-dtype ``jnp.dot``; a planned cuBLASMp GEMM
+    promotion inside a mixed-dtype ``jnp.dot``; the planned product
     is typed ``complex128`` at construction regardless of the operand's
-    algebraic content, so there is nothing to de-promote — running the
-    SAME complex chain twice (once per channel) is already the minimal
-    form.  ``extra`` (BSE/Σ-channel stack axis) stays unsupported here —
+    algebraic content. Both channels use the same complex product.
+    ``extra`` (BSE/Σ-channel stack axis) stays unsupported here —
     see :func:`contract_bands_block_reshard`'s own guard; the dynamic
     Σ_c(τ) band-bracket stack rides a Python loop over this kernel
     instead (``ppm_tau_kernel._stack_channels``), not this axis.
     """
-    from distrib_la import gemm_plan
+    from distrib_la import band_projection_plan
 
     ax_x, ax_y = axes
     nk, nb_full, n_rmu_left, ns = (int(v) for v in face_shape)
@@ -358,9 +351,9 @@ def _face_project_kernel(
             f"{face_shape} and {right_face_shape}")
     mu_s_left = n_rmu_left * ns
     mu_s_right = n_rmu_right * ns
-    plan1 = gemm_plan(mesh_xy, m=mu_s_left, k=mu_s_right, n=nb_project, nq=nk,
+    plan1 = band_projection_plan(mesh_xy, m=mu_s_left, k=mu_s_right, n=nb_project, nq=nk,
                       dtype=jnp.complex128, layout=layout, reduction_axis="y")
-    plan2 = gemm_plan(mesh_xy, m=nb_project, k=mu_s_left, n=nb_project, nq=nk,
+    plan2 = band_projection_plan(mesh_xy, m=nb_project, k=mu_s_left, n=nb_project, nq=nk,
                       dtype=jnp.complex128, layout=layout, reduction_axis="x")
 
     def _check(psi_nmu, O, psi_mun):
@@ -466,13 +459,9 @@ def contract_bands_block_reshard(
         BYTE-IDENTICAL to the code this module shipped before
         ``low_mem_bands`` existed.
         ``"face"``: the two-face carrier's ``psi_nmu``/``psi_mun``
-        operands (``gw.wavefunction_bundle``) — a completely different
-        mechanism (two planned ``distrib_la.gemm_plan`` N,N GEMMs, no
-        shard_map, no psum_scatter; see :func:`_face_project_kernel`),
-        because those operands are 2-D sharded on BOTH mesh axes from the
-        start (unlike legacy's ``psi_xr``/``psi_yn``, whose band axis is
-        REPLICATED going in and only becomes sharded at the output) — the
-        collective-based algorithm below is not expressible on them.
+        operands (``gw.wavefunction_bundle``), with both axes distributed
+        from the start. Two planned band products exchange small panels
+        rather than the centroid operator; see :func:`_face_project_kernel`.
         Requires ``face_shape``; ``channels`` may be ``"none"`` or
         ``"split_reim"`` (2026-08-22 — the dynamic PPM/MPA Σ_c(τ)
         two-channel plan, ported: see :func:`_face_project_kernel`).

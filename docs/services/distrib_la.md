@@ -1189,3 +1189,41 @@ operations, so standalone dummy executions would be redundant. Keep the
 default when deliberately moving first-use work ahead of a timed hot loop.
 The centroid C builder requests `warmup=False` in both band layouts; it does
 not change its GEMM backend or replicate any additional matrix dimension.
+
+
+## Band projection with small communication panels
+
+`band_projection_plan(mesh, *, m, k, n, nq, dtype, layout="face",
+reduction_axis="y", panel_columns=64)` returns a trace-safe callable `plan(A, B)`
+for `A @ B`. Unlike the general GEMM interface it has no accumulation, active
+interval, or output-alias argument. Inputs must already have the declared
+shape, dtype and sharding; the service does not redistribute large inputs.
+
+On a square p×p face mesh, A has shape `(nq, M_X, K_Y)` and B has shape
+`(nq, K_X, N_Y)`. Each loop iteration slices a band panel of B, exchanges it
+across the transpose of the logical rank grid, gathers columns over X,
+multiplies by the stationary A shard, and reduce-scatters over Y. All nq
+matrices share each collective. A remains distributed across all processors.
+The output retains `(nq, M_X, N_Y)`.
+
+The default gathered width is at most 64 columns, except for a mesh wider
+than 64 where one column per row is required. With actual gathered width w,
+panel/intermediate scratch scales as `nq*(M+K)*w/p` elements, plus the
+output and compiler bookkeeping. It does not require an M×K communication
+buffer. The final panel overlaps the preceding panel when needed; every dot
+uses valid columns, and overwrite-only output makes recomputation safe.
+The loop has fixed shapes and uses `lax.fori_loop` and dynamic slices.
+
+Face layout requires square meshes and M, K, N divisible by the mesh side.
+`reduction_axis` controls the existing axis-layout fallback; the face product
+always reduces its K_Y partial sums over Y. The algorithm is ordinary JAX
+on CPU/GPU with no additional native provider or custom FFT. The shared
+operator-to-band consumer uses it for face-layout static and dynamic Sigma;
+`low_mem_bands=false` retains the existing axis implementation.
+
+The focused gate is `tests/multi_device/band_projection_panels.py`; it covers
+panel tails, physical mesh permutation, both dtypes/layouts and rectangular
+left/right endpoints. Performance depends on output-band width and network:
+the small-panel memory bound deliberately trades more iterations for lower
+communication storage. P4 Si full-driver timing is recorded in sandbox
+Run421; it is not a universal large-system speedup guarantee.
