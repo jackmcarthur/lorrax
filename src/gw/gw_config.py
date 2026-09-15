@@ -1280,6 +1280,26 @@ def linalg_resolution(params) -> LinalgResolution:
     return resolve_linalg(params)
 
 
+#: Whole-matrix local algebra (``distrib_la`` batch_reshard) is taken at or below
+#: these matrix extents whatever the ``linalg`` dial; above them the dial decides.
+#: Measured on 40 GB A100, complex128, P16 (PERF pool 58384731, sandbox run
+#: frequency_integration_sandbox/428_perf_20260915): the bank Dyson stack
+#: [32,2400,2400] takes 3.47 s local against 15.8 s through cuBLASMp/cuSOLVERMp.
+LOCAL_DENSE_EXTENT = {"gemm": 4096, "solve": 4096, "eigh": 4096}
+
+
+def dense_layout(resolution: LinalgResolution, op: str, extent: int) -> str:
+    """Execution layout ('local' or 'distributed') of one dense operation.
+
+    ``op`` is ``gemm``, ``solve`` or ``eigh`` and ``extent`` its largest matrix
+    edge.  At or below :data:`LOCAL_DENSE_EXTENT` every device holds whole
+    matrices; above it the deck's ``linalg`` dial decides.
+    """
+    if int(extent) <= LOCAL_DENSE_EXTENT[op]:
+        return "local"
+    return resolution.layout
+
+
 def distrib_la_batched_route_choices() -> tuple[str, ...]:
     """User-facing batch-route vocabulary from the ``distrib_la`` door.
 
