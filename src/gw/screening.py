@@ -180,12 +180,19 @@ def photon_role_quadratures(requests, *, quad, config, sym, print_fn=print,
     orientations are carried.  :func:`gw.w_isdf.compute_photon_response_roles`
     consumes it and owns only the mechanics.
 
-    ``ordered`` is true exactly where the scalar route sets
-    ``ordered_orientations``: an imaginary-axis role on a deck whose measured
-    verdict is false.  It matters more here than there — CT is the
-    magnetisation-odd channel itself, so without it the cross block is zero by
-    construction at every frequency, which is the state the bare-transverse
-    family declares by name.
+    ``ordered`` is true on EVERY imaginary-axis role, whatever the measured
+    time-reversal verdict — deliberately NOT the scalar route's rule.  The
+    scalar charge block's odd-in-omega part vanishes under time reversal, so
+    the scalar route may skip it there.  The charge–current block's does not:
+    its odd-in-omega part is the continuity channel
+    (``q · chi_{j rho} = omega chi_{rho rho}``), present on any deck, and on a
+    time-reversal-symmetric deck it is the WHOLE of chi_CT at imaginary
+    frequency (chi_TC = -chi_CT^H, chi_CT(0) = 0).  The even rule returns zero
+    for it.  Planted proof against the exact Lehmann sum:
+    ``tests/test_photon_ordered_orientations.py::
+    test_even_rule_deletes_the_charge_current_block_under_time_reversal``.
+    The measured verdict still decides what the charge block's odd part is —
+    zero or not — but that is the kernel's output, not a routing choice.
 
     ``tt_contact`` is the owner's 2026-09-15 convention on every finite-ω role:
     subtract the frequency-independent diamagnetic Γ row
@@ -215,24 +222,24 @@ def photon_role_quadratures(requests, *, quad, config, sym, print_fn=print,
         if on_imag:
             quad_used = build_imag_quadrature(
                 quad, abs(req.omega_ry.imag), config.minimax_config,
-                print_fn=print_fn, with_odd_kernel=tr_odd)
-            plan.append((req.role, quad_used, tr_odd,
+                print_fn=print_fn, with_odd_kernel=True)
+            plan.append((req.role, quad_used, True,
                          PHOTON_TT_CONTACT_STATIC_REFERENCE))
             if with_same_frequency_contact_arm:
-                plan.append((f"{req.role}_samefreq", quad_used, tr_odd,
+                plan.append((f"{req.role}_samefreq", quad_used, True,
                              PHOTON_TT_CONTACT_SAME_FREQUENCY))
         else:
             quad_used = build_real_quadrature(
                 quad, abs(req.omega_ry.real), config.minimax_config,
                 print_fn=print_fn)
-            if tr_odd:
-                print_fn(
-                    f"  W[{req.role}]: measured time-reversal verdict is "
-                    "BROKEN, but a REAL-axis probe cannot carry the TR-odd "
-                    "residue (W(z)^H = W(conj z) is Hermitian at real z), so "
-                    "the packed current blocks keep the even orientation "
-                    "completion on this role; chi_CT's odd channel is NOT "
-                    "represented here.")
+            print_fn(
+                f"  W[{req.role}]: a REAL-axis probe cannot carry the "
+                "odd-in-omega residue (W(z)^H = W(conj z) at real z), so the "
+                "packed current blocks keep the even orientation completion "
+                "on this role; chi_CT's odd (continuity) channel is NOT "
+                "represented here"
+                + (" and neither is the magnetisation-odd part of chi_CC."
+                   if tr_odd else "."))
             plan.append((req.role, quad_used, False,
                          PHOTON_TT_CONTACT_STATIC_REFERENCE))
             if with_same_frequency_contact_arm:
