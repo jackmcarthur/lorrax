@@ -122,3 +122,22 @@ def test_remote_padding_does_not_cross_taylor_boundary():
     truth = delta/(delta**2-z[0]**2)
     got = np.exp(-delta[:, None]*rule['t'])@rule['projection_value'][0]
     assert np.max(abs(got/truth-1)) < 1e-6
+
+
+def test_ordered_remote_rows_carry_the_odd_kernel():
+    z = np.array([0.3+0.07j, 1.1+0.07j, 0.9j])
+    lo, hi = 3.4, 6.0
+    even = minimax.response_laplace_rule(lo, hi, z, rel_tol=1e-8)
+    rule = minimax.response_laplace_rule(lo, hi, z, rel_tol=1e-8, ordered=True)
+    if len(rule["t"]) == len(even["t"]):
+        for key in ("t", "projection_value", "projection_derivative"):
+            np.testing.assert_array_equal(rule[key], even[key])
+    d = np.geomspace(*rule["certificate"]["delta_ry"], 257)[:, None]
+    basis = np.exp(-d*rule["t"][None, :])
+    zz = z[None, :]
+    odd = zz/(d*d-zz*zz)
+    np.testing.assert_allclose(basis@rule["odd_projection_value"].T, odd, rtol=1e-7)
+    np.testing.assert_allclose(basis@rule["odd_projection_derivative"].T,
+                               1/(2*zz)/(d*d-zz*zz)+zz/(d*d-zz*zz)**2, rtol=1e-7)
+    # Red twin: the even rows do not represent the odd kernel.
+    assert np.max(np.abs(basis@rule["projection_value"].T-odd)/np.abs(odd)) > 1e-2

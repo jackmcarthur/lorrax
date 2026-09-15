@@ -147,3 +147,56 @@ def check_bank_roundtrip(mesh, path):
     Path(path).mkdir(parents=True, exist_ok=True)
     test_bank_partial_resume_and_immutable_completion(Path(path))
     test_bank_stale_identity_and_invalid_spans(Path(path))
+
+
+def test_ordered_bank_carries_odd_moments(tmp_path):
+    """An ordered bank stores M0/M2 beside M1/M3 (one source for the infinity
+    block); a time-reversal-symmetric bank keeps its two moment fields only."""
+    from types import SimpleNamespace
+    mesh, meta, tables, recipe, identity = _bank_fixture()
+    even_path = tmp_path / "scratch_even_fields.h5"
+    even = initialize_shared_pole_bank(
+        even_path, meta=meta, tables=tables, recipe=recipe, identity=identity, mesh_xy=mesh)
+    assert "odd_moments" not in even and "ordered" not in even
+    assert np.asarray(even["moment_written"]).shape == (even["bank_shape"]["nq"], 2)
+    M = _matrix(meta, mesh, samples=False, value=7)
+    with pytest.raises(ValueError, match="no M0 field"):
+        write_shared_pole_bank(even_path, q_span=(0, 1), M0=M, meta=meta,
+                               expected_identity=identity, mesh_xy=mesh)
+    with SlabIO(even_path, mode="r", mesh=mesh) as io:
+        with pytest.raises(ValueError, match="distinct"):
+            read_shared_pole_bank(io, (0, 1), meta=meta, header=even, fields=("M0",))
+    sym = SimpleNamespace(**vars(tables["sym"]))
+    sym.trs_allowed = False
+    path = tmp_path / "scratch_ordered.h5"
+    header = initialize_shared_pole_bank(
+        path, meta=meta, tables=dict(tables, sym=sym), recipe=recipe,
+        identity=identity, mesh_xy=mesh)
+    assert header["ordered"] and header["odd_moments"]
+    assert header["representation"] == "charge-ordered-z"
+    nq = header["bank_shape"]["nq"]
+    assert np.asarray(header["moment_written"]).shape == (nq, 4)
+    W = _matrix(meta, mesh, samples=True, value=3)
+    D = _matrix(meta, mesh, samples=True, value=-5)
+    moments = {name: _matrix(meta, mesh, samples=False, value=value)
+               for name, value in (("M0", 1), ("M1", 11), ("M2", -2), ("M3", 13))}
+    for q in range(nq):
+        for sample in range(2):
+            write_shared_pole_bank(
+                path, q_span=(q, q+1), sample_span=(sample, sample+1), Wc=W, dWc_ds=D,
+                meta=meta, expected_identity=identity, mesh_xy=mesh)
+        header = write_shared_pole_bank(
+            path, q_span=(q, q+1), M1=moments["M1"], M3=moments["M3"],
+            meta=meta, expected_identity=identity, mesh_xy=mesh)
+        assert not header["complete"]
+        header = write_shared_pole_bank(
+            path, q_span=(q, q+1), M0=moments["M0"], M2=moments["M2"],
+            meta=meta, expected_identity=identity, mesh_xy=mesh)
+    header = validate_shared_pole_bank(
+        path, expected_identity=identity, mesh_xy=mesh, require_complete=True)
+    assert header["complete"] and header["final_commit"]
+    with SlabIO(path, mode="r", mesh=mesh) as io:
+        actual = read_shared_pole_bank(io, (nq-1, nq), meta=meta, header=header,
+                                       fields=("M0", "M1", "M2", "M3"))
+    for name, expected in moments.items():
+        assert bool(jnp.all(actual[name] == expected))

@@ -417,11 +417,11 @@ def _get_chi_fractional_contour_kernel_face(
 
     from common.wfn_layout import psi_specs
     PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(layout)
-    if pair_mode not in ("retarded", "laplace"):
-        raise ValueError("pair_mode must be retarded or laplace")
+    if pair_mode not in ("retarded", "laplace", "laplace_ordered"):
+        raise ValueError("pair_mode must be retarded, laplace or laplace_ordered")
     if bank_carry and selected_q is None:
         raise ValueError("bank carry requires selected q rows")
-    if pair_mode == "laplace" and selected_q is None:
+    if pair_mode != "retarded" and selected_q is None:
         raise ValueError("Laplace bank correlations require selected_q")
     if selected_q is not None:
         from .contour_accumulator import contour_accumulator
@@ -554,8 +554,14 @@ def _get_chi_fractional_contour_kernel_face(
             )
 
         def laplace_correlation(time, occ_f, occ_u, energy_reference):
-            # Remote cell: (f_lower u_upper - u_lower f_upper) exp[-(E_upper-E_lower)t].
-            # Each side remains a one-particle correlation through the same Green/FFT owner.
+            """Remote cell: even (forward - reverse) and odd (forward + reverse) rows.
+
+            forward = f_lower u_upper and reverse = f_upper u_lower pairs, each
+            P e^{-Delta t}. The even kernel d/(d^2-z^2) weights forward - reverse;
+            the odd kernel z/(d^2-z^2) does not change sign with the transition
+            energy, so it weights forward + reverse. Each side remains a
+            one-particle correlation through the same Green/FFT owner.
+            """
             def green(weight, tau_value, ref):
                 return G_fftn(jax.lax.with_sharding_constraint(
                     jnp.conj(build_G_tau(
@@ -568,17 +574,19 @@ def _get_chi_fractional_contour_kernel_face(
             upper_u = green(occ_u[0], time, energy_reference[1])
             lower_u = green(occ_f[1], -time, energy_reference[0])
             upper_f = green(occ_u[1], time, energy_reference[1])
-            return jax.lax.with_sharding_constraint(
-                jnp.einsum("Rambn,Rambn->Rmn", upper_u,
-                           jnp.conj(lower_f), optimize=True)
-                - jnp.einsum("Rambn,Rambn->Rmn", upper_f,
-                             jnp.conj(lower_u), optimize=True),
-                chi_R_shard)
+            forward = jnp.einsum("Rambn,Rambn->Rmn", upper_u,
+                                 jnp.conj(lower_f), optimize=True)
+            reverse = jnp.einsum("Rambn,Rambn->Rmn", upper_f,
+                                 jnp.conj(lower_u), optimize=True)
+            return (jax.lax.with_sharding_constraint(forward - reverse, chi_R_shard),
+                    jax.lax.with_sharding_constraint(forward + reverse, chi_R_shard))
 
         def body(accumulators, node):
             time, projection = node
-            A_R = (retarded_correlation(time) if pair_mode == "retarded"
-                   else laplace_correlation(time, occ_f, occ_u, energy_reference))
+            if pair_mode == "retarded":
+                A_R = retarded_correlation(time)
+            else:
+                A_R, A_odd_R = laplace_correlation(time, occ_f, occ_u, energy_reference)
             if selected_q is not None:
                 # Linearity permits ONE completed q FFT per node before
                 # retaining the admitted parent/output batch.
@@ -587,7 +595,19 @@ def _get_chi_fractional_contour_kernel_face(
                              if pair_mode == "retarded"
                              else A_R + jnp.conj(A_R)),
                     jnp.asarray(selected_q), axis=0)
-                return accumulate_selected(accumulators, contribution, projection), None
+                if pair_mode != "laplace_ordered":
+                    return accumulate_selected(accumulators, contribution, projection), None
+                # Both orientations with independent weights.  The partner
+                # orientation is conj in R space BEFORE the q transform
+                # (conj(A)(R) -> conj(A_{-q})), exactly as the retarded stream
+                # forms it; no q-negation gather.  Rows are [even outputs; odd
+                # outputs] on one shared node.
+                half = projection.shape[0] // 2
+                odd = jnp.take(chi_fftn(A_odd_R - jnp.conj(A_odd_R)),
+                               jnp.asarray(selected_q), axis=0)
+                return accumulate_selected(
+                    accumulate_selected(accumulators, contribution, projection[:half]),
+                    odd, projection[half:]), None
             reverse_R = jnp.conj(A_R)
             updated = tuple(
                 accumulators[i]

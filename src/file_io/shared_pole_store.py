@@ -37,6 +37,17 @@ def _refuse(message):
                      "current-map canonical scalar model; fix: rebuild the artifact")
 
 
+def charge_representation(meta):
+    """True when the bank operator is the spin-traced charge response.
+
+    Scalar and two-component (noncollinear) decks both give one ``[q, mu, mu]``
+    charge operator: the response stream traces both spinor endpoints. A
+    kinetic-balance bispinor lift (``nspinor = 4``) is a different operator.
+    """
+    nspinor = int(meta.nspinor)
+    return nspinor == 1 or nspinor == 2 == int(meta.nspinor_wfnfile)
+
+
 def _capacity(meta):
     """Require the map ledger; unknown caller lifetimes never mean zero."""
     ledger = getattr(meta, "shared_pole_capacity", None)
@@ -206,7 +217,7 @@ def _check_basis(meta, header):
     return basis
 
 
-def _metadata(meta, tables, recipe, identity):
+def _metadata(meta, tables, recipe, identity, ordered=None):
     """Authenticate small scientific identities; no tensor data is gathered.
 
     ``tables`` is a plain mapping with canonical ``qirr`` (QirrTables),
@@ -215,11 +226,17 @@ def _metadata(meta, tables, recipe, identity):
     """
     _check_identity(identity, identity)
     basis = meta.mu_basis
-    if int(meta.nspinor) != 1:
+    if not charge_representation(meta):
         _refuse(f"unsupported Nspinor={meta.nspinor}")
     sym = tables["sym"]
-    if not bool(sym.trs_allowed):
-        _refuse("TRS-broken representation is unsupported")
+    # A bank (ordered=None) follows the measured TRS state; a model store
+    # states its representation and must agree with it.
+    bank = ordered is None
+    if bank:
+        ordered = not bool(sym.trs_allowed)
+    elif bool(sym.trs_allowed) == bool(ordered):
+        _refuse("ordered representation requires authenticated broken TRS" if ordered
+                else "TRS-broken representation is unsupported")
     qt = tables["qirr"].logical(basis.n_logical).canonical()
     validate_qirr_tables(qt, qt.n_q_ibz, basis.n_logical)
     qids = np.asarray(tables["q_irr_full_idx"])
@@ -238,15 +255,21 @@ def _metadata(meta, tables, recipe, identity):
         _refuse("missing resolved recipe and gate versions")
     centroid_hash = hashlib.sha256(np.asarray(
         basis.canonical_indices, dtype="<i4").tobytes()).hexdigest()
-    return {
+    header = {
         "schema": SCHEMA, "identity": identity, "recipe": recipe,
         "recipe_hash": hashlib.sha256(_json(recipe).encode()).hexdigest(),
         # Keep the v1 disk spelling for existing models; its C denotes b.
-        "normalization": "Wc=C/(z_Ry^2-Lambda_Ry2)*C_dagger",
+        "normalization": ("Wc_q=sum_q C C_dagger/(2W(z_Ry-W))-sum_(-q) conj(C) C^T/(2W(z_Ry+W)), W=sqrt(Lambda_Ry2)"
+                          if ordered and not bank else "Wc=C/(z_Ry^2-Lambda_Ry2)*C_dagger"),
         "units": {"factor": "Ry^(3/2)", "poles2_ry2": "Ry^2"},
-        "representation": "scalar-trs-even-s", "parent_convention": "raw-parent",
+        # An ordered bank is not even in s; consumers that need the TRS form
+        # (constructor, operator realizer) refuse this representation by name.
+        # An ordered model store keeps positive poles per parent.
+        "representation": (("charge-ordered-z" if bank else "scalar-ordered-ph")
+                           if ordered else "scalar-trs-even-s"),
+        "parent_convention": "raw-parent",
         "n_q_irr": qt.n_q_ibz, "n_q_full": qt.n_q_full,
-        "n_mu_logical": basis.n_logical, "nspinor": 1,
+        "n_mu_logical": basis.n_logical, "nspinor": int(meta.nspinor),
         "centroid_digest": centroid_hash,
         "grid": [int(meta.nkx), int(meta.nky), int(meta.nkz)],
         "fft_grid": np.asarray(meta.fft_grid).tolist(),
@@ -263,6 +286,9 @@ def _metadata(meta, tables, recipe, identity):
                        "typing_source": str(sym.operation_typing_source)},
         "finalized": False,
     }
+    if ordered:
+        header["ordered"] = True
+    return header
 
 
 def _write_metadata(io, header):
@@ -315,7 +341,7 @@ def _check_factor(b, poles2, K):
 
 @timing.timed("shared_pole_store.write_model")
 def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
-                            recipe, receipts):
+                            recipe, receipts, ordered=False):
     """Stage a bounded q batch and finalize automatically at complete K census.
 
     Parameters
@@ -339,7 +365,7 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         Staging plus final datasets use at most twice the compact payload bytes.
     """
     with timing.section("staging"):
-        header = _metadata(meta, tables, recipe, receipts["identity"])
+        header = _metadata(meta, tables, recipe, receipts["identity"], ordered)
         mesh = meta.mu_basis.mesh_xy
         want = NamedSharding(mesh, P(None, "x", None, "y"))
         if not isinstance(b, jax.Array) or not b.sharding.is_equivalent_to(want, 4):
@@ -754,6 +780,15 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
 # Scratch bank uses the same identity and metadata transactions.
 _BANK_SAMPLE_FIELDS = ("Wc", "dWc_ds")
 _BANK_MOMENT_FIELDS = ("M1", "M3")
+# An ordered bank also carries the time-reversal-odd z-moments the constructor
+# reads: M0 at 1/z and M2 at 1/z^3, with M_k = C_(k+1)/2 for the coefficient
+# C_(k+1) of Wc at 1/z^(k+1) (the convention that already gives S_m = 2 M_(2m+1)).
+_BANK_ODD_MOMENT_FIELDS = ("M0", "M2")
+
+
+def _bank_moment_fields(header):
+    """Moment datasets of one bank: M1/M3, plus M0/M2 when it carries odd moments."""
+    return _BANK_MOMENT_FIELDS + (_BANK_ODD_MOMENT_FIELDS if header.get("odd_moments") else ())
 
 
 def _bank_plan(recipe):
@@ -850,6 +885,11 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
         _refuse("scratch bank already exists; validate it before resuming")
     plan = _bank_plan(recipe)
     header = _metadata(meta, tables, recipe, identity)
+    odd = bool(header.get("ordered"))
+    if odd:
+        # One source of truth for the infinity block: the ordered bank itself.
+        header["odd_moments"] = True
+    fields = _bank_moment_fields(header)
     parents = (tables["q_irr_full_idx"] if isinstance(tables, dict)
                else tables.q_irr_full_idx)
     nq, nsample, d = len(parents), _bank_nsample(plan), int(meta.mu_basis.n_logical)
@@ -860,16 +900,18 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
         bank_sample_plan=plan,
         bank_plan_digest=hashlib.sha256(_json(plan).encode()).hexdigest(),
         sample_written=np.zeros((nq, nsample, 2), dtype=bool).tolist(),
-        moment_written=np.zeros((nq, 2), dtype=bool).tolist(),
+        moment_written=np.zeros((nq, len(fields)), dtype=bool).tolist(),
         complete=False, final_commit=None,
-        units={"Wc": "Ry", "dWc_ds": "Ry^-1", "M1": "Ry^3", "M3": "Ry^5"},
+        units={"Wc": "Ry", "dWc_ds": "Ry^-1", "M1": "Ry^3", "M3": "Ry^5",
+               **({"M0": "Ry^2", "M2": "Ry^4"} if odd else {})},
         derivative_variable="s=z_Ry^2",
-        moment_convention="S_m = 2 M_(2m+1); physical M1 and M3 only",
-        payload_bytes=16 * nq * (2 * nsample + 2) * d * d)
+        moment_convention=("S_m = 2 M_(2m+1); physical M1 and M3; odd M0 (1/z) and M2 (1/z^3), M_k = C_(k+1)/2"
+                           if odd else "S_m = 2 M_(2m+1); physical M1 and M3 only"),
+        payload_bytes=16 * nq * (2 * nsample + len(fields)) * d * d)
     with SlabIO(path, mode="w", mesh=mesh_xy) as io:
         for field in _BANK_SAMPLE_FIELDS:
             io.create_dataset(field, shape=(nq, nsample, d, d), dtype=np.complex128)
-        for field in _BANK_MOMENT_FIELDS:
+        for field in fields:
             io.create_dataset(field, shape=(nq, d, d), dtype=np.complex128)
         io.write_attr("sample_written", np.asarray(header["sample_written"], dtype=np.bool_))
         io.write_attr("moment_written", np.asarray(header["moment_written"], dtype=np.bool_))
@@ -905,10 +947,11 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
     nq, nsample = int(shape["nq"]), int(shape["nsample"])
     samples = np.asarray(header["sample_written"], dtype=bool)
     moments = np.asarray(header["moment_written"], dtype=bool)
-    if samples.shape != (nq, nsample, 2) or moments.shape != (nq, 2):
+    moment_fields = _bank_moment_fields(header)
+    if samples.shape != (nq, nsample, 2) or moments.shape != (nq, len(moment_fields)):
         _refuse("scratch bank malformed written masks")
     if (nq != header["n_q_irr"] or nsample != _bank_nsample(plan)
-            or shape["d"] != header["n_mu_logical"] or header["nspinor"] != 1):
+            or shape["d"] != header["n_mu_logical"] or header["nspinor"] not in (1, 2)):
         _refuse("scratch bank geometry/representation mismatch")
     # Geometry only: never load a matrix through the metadata handle.
     with h5py.File(path, "r") as file:
@@ -924,7 +967,7 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
                 _refuse(f"scratch bank typed plan {name} digest mismatch")
         if file["role_codes_json"][()].decode() != _json(plan["role_codes"]):
             _refuse("scratch bank role code table mismatch")
-        for name in _BANK_SAMPLE_FIELDS + _BANK_MOMENT_FIELDS:
+        for name in _BANK_SAMPLE_FIELDS + moment_fields:
             expected = ((nq, nsample) if name in _BANK_SAMPLE_FIELDS else (nq,)) + (shape["d"],) * 2
             if (name not in file or file[name].shape != expected
                     or file[name].dtype != np.dtype(np.complex128)
@@ -943,7 +986,7 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
 
 
 def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
-                           dWc_ds=None, M1=None, M3=None, meta,
+                           dWc_ds=None, M1=None, M3=None, M0=None, M2=None, meta,
                            expected_identity, mesh_xy):
     """Write one bounded q/sample batch and commit masks after collective close.
 
@@ -962,10 +1005,10 @@ def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
         _refuse("completed scratch bank is immutable")
     if not (np.asarray(header["sample_written"], dtype=bool).all()
             and np.asarray(header["moment_written"], dtype=bool).all()
-            and all(value is None for value in (Wc, dWc_ds, M1, M3))):
+            and all(value is None for value in (Wc, dWc_ds, M1, M3, M0, M2))):
         prepared = _prepare_bank_write(header, q_span=q_span,
             sample_span=sample_span, meta=meta, mesh_xy=mesh_xy,
-            Wc=Wc, dWc_ds=dWc_ds, M1=M1, M3=M3)
+            Wc=Wc, dWc_ds=dWc_ds, M1=M1, M3=M3, M0=M0, M2=M2)
         with SlabIO(path, mode="a", mesh=mesh_xy) as io:
             _write_bank_payload(io, header, meta, prepared)
             _write_bank_masks(io, header)
@@ -991,7 +1034,7 @@ def _complete_bank(path, header):
 
 def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
                         sample_span=None, Wc=None, dWc_ds=None,
-                        M1=None, M3=None):
+                        M1=None, M3=None, M0=None, M2=None):
     """Validate/admit a packed span before opening or mutating a bank."""
     _check_basis(meta, header)
     if mesh_xy is not meta.mu_basis.mesh_xy:
@@ -1008,7 +1051,8 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
     a0, a1 = (_span(sample_span, shape["nsample"], "sample_span")
               if has_samples else (0, 0))
     pending = [(name, value) for name, value in
-               (("Wc", Wc), ("dWc_ds", dWc_ds), ("M1", M1), ("M3", M3))
+               (("Wc", Wc), ("dWc_ds", dWc_ds), ("M1", M1), ("M3", M3),
+                ("M0", M0), ("M2", M2))
                if value is not None]
     if not pending:
         _refuse("scratch write has no payload")
@@ -1023,7 +1067,9 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
     # must not leave an otherwise legal first field queued in the same call.
     for name, array in pending:
         sample = name in _BANK_SAMPLE_FIELDS
-        fields = _BANK_SAMPLE_FIELDS if sample else _BANK_MOMENT_FIELDS
+        fields = _BANK_SAMPLE_FIELDS if sample else _bank_moment_fields(header)
+        if name not in fields:
+            _refuse(f"scratch bank has no {name} field (odd moments belong to an ordered bank)")
         marked = (sample_mask[q0:q1, a0:a1, fields.index(name)] if sample
                   else moment_mask[q0:q1, fields.index(name)])
         if marked.any():
@@ -1068,7 +1114,7 @@ def _write_bank_payload(io, header, meta, prepared):
         if sample:
             sample_mask[q0:q1, a0:a1, _BANK_SAMPLE_FIELDS.index(name)] = True
         else:
-            moment_mask[q0:q1, _BANK_MOMENT_FIELDS.index(name)] = True
+            moment_mask[q0:q1, _bank_moment_fields(header).index(name)] = True
     header["sample_written"] = sample_mask.tolist()
     header["moment_written"] = moment_mask.tolist()
 
@@ -1088,8 +1134,9 @@ def read_shared_pole_bank(io, q_span, *, meta, header, sample_span=None,
         _refuse("reader mesh differs from packed basis mesh")
     fields = tuple(fields)
     if not fields or len(set(fields)) != len(fields) or any(
-            f not in _BANK_SAMPLE_FIELDS + _BANK_MOMENT_FIELDS for f in fields):
-        _refuse("scratch bank fields must be distinct Wc/dWc_ds/M1/M3 names")
+            f not in _BANK_SAMPLE_FIELDS + _bank_moment_fields(header) for f in fields):
+        _refuse("scratch bank fields must be distinct Wc/dWc_ds/M1/M3 names "
+                "(M0/M2 on a bank with odd moments)")
     shape = header["bank_shape"]
     q0, q1 = _span(q_span, shape["nq"], "q_span")
     need_samples = any(name in _BANK_SAMPLE_FIELDS for name in fields)
@@ -1107,7 +1154,7 @@ def read_shared_pole_bank(io, q_span, *, meta, header, sample_span=None,
     for name in fields:
         marked = (sample_mask[q0:q1, a0:a1, _BANK_SAMPLE_FIELDS.index(name)]
                   if name in _BANK_SAMPLE_FIELDS
-                  else moment_mask[q0:q1, _BANK_MOMENT_FIELDS.index(name)])
+                  else moment_mask[q0:q1, _bank_moment_fields(header).index(name)])
         if not marked.all():
             _refuse(f"scratch bank {name} requested span is incomplete")
     out = {}
@@ -1341,7 +1388,7 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
         with SlabIO(bank_source, mode="r", mesh=mesh_xy) as io, \
                 SlabIO(path, mode="a", mesh=mesh_xy) as output_io:
             for q in range(bank_header["bank_shape"]["nq"]):
-                for field in _BANK_SAMPLE_FIELDS + _BANK_MOMENT_FIELDS:
+                for field in _BANK_SAMPLE_FIELDS + _bank_moment_fields(bank_header):
                     sample = field in _BANK_SAMPLE_FIELDS
                     for i in range(bank_header["bank_shape"]["nsample"] if sample else 1):
                         span = (i, i+1) if sample else None
