@@ -1173,3 +1173,19 @@ selects the corresponding local tile GEMM followed by centroid reduce-scatter.
 These reductions do not apply to Green or zeta band sums. SC band rotations
 use `out_spec=P(None,"x",None)` or `P(None,None,"y")` to retain the carrier's
 single-axis centroid sharding. They do not create another Green algorithm.
+
+## GEMM plans without dummy execution
+
+`gemm_plan(..., warmup=False)` and `local_gemm_plan(..., warmup=False)`
+create the same trace-safe callables as the default `warmup=True`, but do
+not allocate dummy matrix operands or compile/run standalone warmup GEMMs.
+Shape validation, backend checks and distributed communicator setup still
+happen at plan construction. The first real call pays executable compilation
+and native descriptor/workspace initialization. Dense and active-range calls,
+accumulation and donation keep the existing contracts.
+
+Use this option when a one-shot outer JIT compiles the GEMM with its surrounding
+operations, so standalone dummy executions would be redundant. Keep the
+default when deliberately moving first-use work ahead of a timed hot loop.
+The centroid C builder requests `warmup=False` in both band layouts; it does
+not change its GEMM backend or replicate any additional matrix dimension.

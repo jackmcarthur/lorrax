@@ -17,7 +17,8 @@ TRACE-SAFE closure built from its result.
 inside a composed, jitted kernel: shape/mesh/backend are fixed and resolved
 EAGERLY, and the returned :class:`GemmPlan` is called with only
 static-shape/dtype/layout checks (safe on a tracer) plus a pre-built,
-pre-compiled ``jax.jit`` executable.
+``jax.jit`` callable. By default the callable is also compiled and exercised
+on dummy operands; ``warmup=False`` defers that work to the real caller.
 
 Contract, deliberately narrower than :func:`distrib_la.matmul`:
 
@@ -777,7 +778,7 @@ def _axis_matmul(a, b, c=None, *, alpha, beta, reduction_axis=None):
 
 def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
                     dtype, alpha=1.0, beta=0.0, reduction_axis=None, out_spec=None,
-                    enable_active_range=False) -> GemmPlan:
+                    enable_active_range=False, warmup: bool = True) -> GemmPlan:
     """Warm a local product on CPU/GPU while retaining output axis shards.
 
     ``enable_active_range`` supports replicated K and a two-axis output, using
@@ -829,14 +830,16 @@ def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
     with_c = jax.jit(shard_map(local, mesh=mesh,
         in_specs=(a_spec, b_spec, out_spec), out_specs=out_spec,
         check_vma=False), donate_argnums=(2,) if beta != 0 else ())
-    with_c(_zeros((nq, m, k), dtype, a_sh),
-           _zeros((nq, k, n), dtype, b_sh),
-           _zeros((nq, m, n), dtype, out_sh))
+    if warmup:
+        with_c(_zeros((nq, m, k), dtype, a_sh),
+               _zeros((nq, k, n), dtype, b_sh),
+               _zeros((nq, m, n), dtype, out_sh))
     no_c = None
     if beta == 0:
         no_c = jax.jit(shard_map(local, mesh=mesh,
             in_specs=(a_spec, b_spec), out_specs=out_spec, check_vma=False))
-        no_c(_zeros((nq, m, k), dtype, a_sh), _zeros((nq, k, n), dtype, b_sh))
+        if warmup:
+            no_c(_zeros((nq, m, k), dtype, a_sh), _zeros((nq, k, n), dtype, b_sh))
     plan = GemmPlan(mesh=mesh, backend="local", m=m, k=k, n=n, nq=nq,
                     dtype=dtype, alpha=alpha, beta=beta,
                     in_sharding_a=a_sh, in_sharding_b=b_sh, out_sharding=out_sh,
@@ -845,16 +848,12 @@ def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
         return plan
     from dataclasses import replace
     active = partial(active_impl, alpha=alpha, beta=beta)
-    a0, b0 = _zeros((nq, m, k), dtype, a_sh), _zeros((nq, k, n), dtype, b_sh)
     # Exercise a genuine partial interval before returning the plan. Full
     # ranges deliberately bypass the active CUDA target and would not warm it.
     warm_hi = k - 1 if k > 1 else k
-    bounds = _zeros((nq, 2), jnp.int32, NamedSharding(mesh, P())).at[:, 1].set(warm_hi)
-    weights = _zeros((nq, k), dtype, NamedSharding(mesh, P())) + 1
     if beta == 0:
         active_no_c = jax.jit(shard_map(active, mesh=mesh,
             in_specs=(a_spec, b_spec, P(), P()), out_specs=out_spec, check_vma=False))
-        jax.block_until_ready(active_no_c(a0, b0, bounds, weights))
         # Local out= leaves its storage live, just as the dense local plan does.
         def active_with_c(a, b, limits, weight, c):
             return active_no_c(a, b, limits, weight)
@@ -863,8 +862,15 @@ def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
         active_with_c = jax.jit(shard_map(active, mesh=mesh,
             in_specs=(a_spec, b_spec, P(), P(), out_spec), out_specs=out_spec,
             check_vma=False), donate_argnums=(4,))
-        jax.block_until_ready(active_with_c(a0, b0, bounds, weights,
-            _zeros((nq, m, n), dtype, out_sh)))
+    if warmup:
+        a0, b0 = _zeros((nq, m, k), dtype, a_sh), _zeros((nq, k, n), dtype, b_sh)
+        bounds = _zeros((nq, 2), jnp.int32, NamedSharding(mesh, P())).at[:, 1].set(warm_hi)
+        weights = _zeros((nq, k), dtype, NamedSharding(mesh, P())) + 1
+        if active_no_c is not None:
+            jax.block_until_ready(active_no_c(a0, b0, bounds, weights))
+        else:
+            jax.block_until_ready(active_with_c(a0, b0, bounds, weights,
+                _zeros((nq, m, n), dtype, out_sh)))
     return replace(plan, _active_fn_with_c=active_with_c,
                    _active_fn_no_c=active_no_c)
 
@@ -884,16 +890,23 @@ def gemm_plan(
     reduction_axis=None,
     out_spec=None,
     enable_active_range: bool = False,
+    warmup: bool = True,
 ) -> GemmPlan:
-    """Eagerly resolve, probe, warm and COMPILE one N,N GEMM shape, ONCE.
+    """Resolve one trace-safe N,N GEMM shape; optionally warm its execution.
 
-    Hoist this call out of every per-k/per-tau loop — G build, Sigma
+    With ``warmup=True`` (the default), hoist this call out of every per-k/per-tau loop — G build, Sigma
     projection, Hartree.  By the time this returns, the cuBLASMp
     communicator exists and both kernel variants (donated-``C``, and —
     when ``beta==0`` — internal-zero-``C``) are compiled AND HAVE RUN ONCE
     on real dummy data, so :meth:`GemmPlan.__call__` never dlopens, never
     probes, never builds a ``jax.jit`` wrapper, and never traces for the
     first time from inside somebody else's ``lax.scan``.
+
+    ``warmup=False`` retains eager validation, provider probing and communicator
+    setup, but allocates no dummy matrix operands and compiles no standalone
+    GEMM executable. The first actual call pays compilation and descriptor
+    initialization. This avoids redundant warmup executables when a one-shot
+    outer JIT compiles the GEMM together with its surrounding operations.
 
     Parameters
     ----------
@@ -940,7 +953,7 @@ def gemm_plan(
     if layout == "axis":
         return local_gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
                                alpha=alpha, beta=beta, reduction_axis=reduction_axis, out_spec=out_spec,
-                               enable_active_range=enable_active_range)
+                               enable_active_range=enable_active_range, warmup=warmup)
     if layout != "face":
         raise ValueError(f"gemm_plan: unknown psi layout {layout!r}")
     if out_spec is not None and out_spec != P(None, "x", "y"):
@@ -1010,9 +1023,10 @@ def gemm_plan(
     # cuBLASMp matmul descriptor build and workspace allocation to happen
     # now, eagerly, rather than on this plan's first use inside a caller's
     # scan.  The buffers are throwaway (c0 is DONATED away by this call).
-    fn_with_c(_zeros((nq, m, k), dtype, in_sharding_a),
-             _zeros((nq, k, n), dtype, in_sharding_b),
-             _zeros((nq, m, n), dtype, out_sharding))
+    if warmup:
+        fn_with_c(_zeros((nq, m, k), dtype, in_sharding_a),
+                 _zeros((nq, k, n), dtype, in_sharding_b),
+                 _zeros((nq, m, n), dtype, out_sharding))
 
     fn_no_c = None
     if beta_c == 0:
@@ -1020,8 +1034,9 @@ def gemm_plan(
             mesh, px=px, py=py, nq=nq, m=m, k=k, n=n, dtype=dtype,
             alpha=alpha_c, beta=beta_c, ctx_handle=ctx_handle,
             with_c=False))
-        fn_no_c(_zeros((nq, m, k), dtype, in_sharding_a),
-               _zeros((nq, k, n), dtype, in_sharding_b))
+        if warmup:
+            fn_no_c(_zeros((nq, m, k), dtype, in_sharding_a),
+                   _zeros((nq, k, n), dtype, in_sharding_b))
 
     plan = GemmPlan(
         mesh=mesh, backend=resolved, m=m, k=k, n=n, nq=nq, dtype=dtype,
@@ -1036,14 +1051,15 @@ def gemm_plan(
     fn_active_c = jax.jit(_build_active_kernel(plan, with_c=True), donate_argnums=(3,))
     fn_active_no_c = (jax.jit(_build_active_kernel(plan, with_c=False))
                       if beta_c == 0 else None)
-    bounds = _zeros((1, 2), jnp.int32, NamedSharding(mesh, P()))
-    # The full-range fast path calls the old target; warm descriptor views.
-    bounds = bounds.at[0, 1].set(k - 1 if k > 1 else k)
-    a0 = _zeros((nq, m, k), dtype, in_sharding_a)
-    b0 = _zeros((nq, k, n), dtype, in_sharding_b)
-    jax.block_until_ready(fn_active_c(a0, b0, bounds,
-        _zeros((nq, m, n), dtype, out_sharding)))
-    if fn_active_no_c is not None:
-        jax.block_until_ready(fn_active_no_c(a0, b0, bounds))
+    if warmup:
+        bounds = _zeros((1, 2), jnp.int32, NamedSharding(mesh, P()))
+        # The full-range fast path calls the old target; warm descriptor views.
+        bounds = bounds.at[0, 1].set(k - 1 if k > 1 else k)
+        a0 = _zeros((nq, m, k), dtype, in_sharding_a)
+        b0 = _zeros((nq, k, n), dtype, in_sharding_b)
+        jax.block_until_ready(fn_active_c(a0, b0, bounds,
+            _zeros((nq, m, n), dtype, out_sharding)))
+        if fn_active_no_c is not None:
+            jax.block_until_ready(fn_active_no_c(a0, b0, bounds))
     return replace(plan, _active_fn_with_c=fn_active_c,
                    _active_fn_no_c=fn_active_no_c)

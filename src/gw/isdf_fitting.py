@@ -402,7 +402,7 @@ def fit_zeta_to_h5(
             _face_gemm = _gemm_plan(
                 mesh_xy, m=_mu_gemm * _ns_face, k=_nb_face,
                 n=_mu_gemm * _ns_face, nq=int(k_unfold_plan.n_parent),
-                dtype=jnp.complex128, layout=layout)
+                dtype=jnp.complex128, layout=layout, warmup=False)
             print_fn(f"  {_face_gemm.describe()}")
             _off = int(band_range_full[0])
             _idx = np.arange(_nb_face)
