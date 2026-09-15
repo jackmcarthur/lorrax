@@ -1152,3 +1152,26 @@ selects the corresponding local tile GEMM followed by centroid reduce-scatter.
 These reductions do not apply to Green or zeta band sums. SC band rotations
 use `out_spec=P(None,"x",None)` or `P(None,None,"y")` to retain the carrier's
 single-axis centroid sharding. They do not create another Green algorithm.
+
+## Dense workspace queries
+
+`workspace_bytes_per_rank(plan, op, shapes, dtype)` and
+`matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend, batched_route)` return the device
+workspace bytes per rank of a resolved CUDA `Plan`/`GemmPlan` or GEMM route, without allocating an
+operand, a result or the workspace. Query collectively on the actual mesh before admitting operands;
+float64 and complex128 only; an unsupported provider refuses.
+
+- `eigh`: pass `((n, n),)` or `((batch, n, n),)`. The distributed provider allocates exactly the
+  returned bytes: vendor workspace rounded to 256-byte alignment plus one private operand tile of
+  `n/Px * n/Py * itemsize`, which keeps the non-donating input contract (`DONATES['eigh'] == ()`)
+  despite destructive tridiagonalisation. Do not add the tile again. Local eigh returns the
+  cuSolverDn divide-and-conquer workspace, with the Jacobi maximum for small matrices.
+- `gemm`: pass `((m, k), (k, n))` or batched shapes after any transpose staging. One vendor workspace
+  per context is reused across batch slices, so the envelope for a construction is
+  `max(GEMM workspace) + max(concurrent eigh scratch)`. The staged route returns compiled local
+  matmul temporaries from a shape-only compile.
+
+The native doors are `lrx_eigh_workspace_bytes` and `lrx_gemm_workspace_bytes` (sizing calls with the
+execution descriptors; a context info pointer is the non-null address token and is never read).
+Operand and output carriers, transpose staging, communication buffers and persistent context
+resources are the caller's to admit.

@@ -99,6 +99,7 @@ from __future__ import annotations
 
 from distrib_la.subspace import plan_subspace
 from distrib_la.active_subspace import LocalSubspacePlan, plan_local_subspace
+from distrib_la.workspace import workspace_bytes_per_rank, matmul_workspace_bytes_per_rank
 from distrib_la.dispatch import dispatch_batched_eigh
 from distrib_la.factor import FactorToken, factor, solve
 from distrib_la.loader import dial_key, has_target, probe_target
@@ -141,6 +142,8 @@ __all__ = [
     "LocalSubspacePlan", "plan_local_subspace", "plan_subspace",
     # plan
     "Plan", "plan", "ensure_sharding", "DONATES",
+    # native dense workspace queries (no allocation)
+    "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank",
     # polar / SVD
     "PolarPlan", "plan_polar_factor", "polar_factor",
     # distributed matrix multiplication
