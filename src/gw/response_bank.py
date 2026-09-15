@@ -360,9 +360,10 @@ def _bank_execution(meta, mesh_xy, bank_io, receipt, config):
             stream = stage in ("real_time", "laplace", "moment_correlation")
             if not stream:
                 layout = config.get("linalg", "local") if hasattr(config,"get") else config.backend.linalg
-                if stage in ("sample_dyson", "moment_dyson"):
+                if stage in ("sample_dyson", "moment_dyson", "coulomb_sqrt"):
                     from .gw_config import dense_layout, linalg_resolution
-                    layout = dense_layout(linalg_resolution({"linalg": layout}), "solve", args[0].shape[-1])
+                    layout = dense_layout(linalg_resolution({"linalg": layout}),
+                        "eigh" if stage == "coulomb_sqrt" else "solve", args[0].shape[-1])
                 native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
                     with_eigh=stage=="coulomb_sqrt")
                 receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))
@@ -386,8 +387,9 @@ def _bank_execution(meta, mesh_xy, bank_io, receipt, config):
 def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout):
     """One cached service plan for H=V^(1/2) and its supported inverse."""
     from distrib_la import matmul, plan
-    from .gw_config import linalg_resolution
-    resolution = linalg_resolution({"linalg": layout})
+    from .gw_config import dense_layout, linalg_resolution
+    resolution = linalg_resolution({"linalg": dense_layout(
+        linalg_resolution({"linalg": layout}), "eigh", n_packed)})
     backend = "off" if resolution.layout == "local" else "distributed"
     eig = plan("eigh", mesh_xy, backend=backend, n=n_packed,
                batched_route=resolution.batched_route)
@@ -413,6 +415,13 @@ def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout):
 @lru_cache(maxsize=8)
 def _coulomb_pack(basis,mesh_xy):
     return jax.jit(lambda v: basis.pack_operator(v,spec=P(None,"x","y")))
+
+
+@lru_cache(maxsize=8)
+def _face_row(mesh_xy):
+    """One leading row [1,n,n] of a [b,n,n] panel, kept on the x/y face."""
+    return jax.jit(lambda a, i: jax.lax.dynamic_slice_in_dim(a, i, 1, axis=0),
+                   out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
 
 
 def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
@@ -615,7 +624,8 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
     ordered = not bool(sym.trs_allowed)
     _, moments, receipt["algebra"] = response_algebra(meta, config,
         mesh_xy=mesh_xy, n=meta.mu_basis.n_packed, **({"ordered": True} if ordered else {}))
-    per_q = 12 if ordered else 8
+    # Outputs per q, plus one resident Coulomb root per q.
+    per_q = 13 if ordered else 9
     qwidth = max(1,min(len(qids),int((.75*ledger.U_bytes_per_rank/face_bytes-16)/per_q)))
     for q0 in range(0,len(qids),qwidth):
         q1 = min(q0+qwidth,len(qids))
@@ -629,13 +639,15 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
             else:
                 a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
                                           q_ids=tuple(qids[q0:q1]), execute=execute)
+            # One Coulomb read and root for the q batch, not one per q.
+            roots, _, panel_ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, (q0, q1), execute)
             for iq in range(q0,q1):
                 marked = header["moment_written"][iq]
                 if all(marked):
                     continue
                 span = (iq,iq+1)
-                h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, span, execute)
-                del hi
+                h = _face_row(mesh_xy)(roots, np.int32(iq-q0))
+                ranks = panel_ranks[iq-q0:iq-q0+1]
                 odd = {}
                 if ordered:
                     part = slice(iq-q0, iq-q0+1)
@@ -653,7 +665,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
                 receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
                 receipt["batches"].append(dict(q_span=span,support_ranks=ranks))
                 del h,m1,m3,odd
-            del a0,a1
+            del a0,a1,roots
             receipt["correlation_count"] += 10 if ordered else 6
     ledger.live_stages = ambient
     receipt["completion"] = bool(np.asarray(header["moment_written"]).all())
@@ -813,7 +825,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # Dyson GEMMs follow the routed layout; the Coulomb eigh keeps its own.
         dyson_layout = dense_layout(linalg_resolution({"linalg": layout}), "solve", meta.mu_basis.n_packed)
         native = dict(response_dense_workspace(mesh_xy,meta.mu_basis.n_packed,len(z),dyson_layout,with_eigh=False))
-        native["eigh"] = response_dense_workspace(mesh_xy,meta.mu_basis.n_packed,len(z),layout,with_eigh=True)["eigh"]
+        eigh_layout = dense_layout(linalg_resolution({"linalg": layout}), "eigh", meta.mu_basis.n_packed)
+        native["eigh"] = response_dense_workspace(mesh_xy,meta.mu_basis.n_packed,len(z),eigh_layout,with_eigh=True)["eigh"]
         native["total"] = native["gemm"] + native["eigh"]
         headroom = 16*face_bytes + native["gemm"] + int(phase.nbytes+derivative.nbytes)
         # Ask the ledger owner for R24's remaining device budget. The zero-byte
@@ -842,7 +855,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # larger systems still split q/sample panels before any allocation.
         planning_limit = device_available
         available = planning_limit-headroom-live_bytes
-        qwidth = min(len(qids),int((available-dense_bytes(1))//(2*face_bytes)))
+        # Per q: two sample outputs at width one and one resident Coulomb root.
+        qwidth = min(len(qids),int((available-dense_bytes(1))//(3*face_bytes)))
         receipt["panel_budget"] = dict(
             scaling_target_bytes_per_rank=scaling_target,
             device_budget_bytes_per_rank=budget["device_budget_bytes_per_rank"],
@@ -861,9 +875,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         with timing.section('bank.panel_admission'):
             q1 = min(q0+qwidth,len(qids))
             width = len(z)
-            while 2*width*(q1-q0)*face_bytes+dense_bytes(width) > available:
+            while (2*width+1)*(q1-q0)*face_bytes+dense_bytes(width) > available:
                 width -= 1
-            planned_bytes = headroom+live_bytes+2*width*(q1-q0)*face_bytes+dense_bytes(width)
+            planned_bytes = headroom+live_bytes+(2*width+1)*(q1-q0)*face_bytes+dense_bytes(width)
             receipt.setdefault("panel_plans",[]).append(dict(q_span=(q0,q1),sample_width=width,
                 aggregate_bytes_per_rank=planned_bytes,
                 scaling_status="PASS" if planned_bytes <= scaling_target else "WARN",
@@ -874,7 +888,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             with timing.section('bank.stream_arguments'):
                 hi = min(lo+width,len(z));a = hi-lo
                 ledger.live_stages = ambient
-                name,_ = _reserve(meta,"bank_outputs",2*a*(q1-q0)*face_bytes + headroom)
+                name,_ = _reserve(meta,"bank_outputs",(2*a+1)*(q1-q0)*face_bytes + headroom)
                 ledger.live_stages = ambient+(name,)
                 kernel,fixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
                     q_ids=tuple(qids[q0:q1]),n_outputs=2*a,bank_carry=True,ordered=ordered)
@@ -913,12 +927,14 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     *lfixed,lw,uw,jnp.asarray(refs),raw),"laplace")
                 del lw,uw
                 receipt["correlation_count"] += 2*len(tau)
-            for iq in range(q0,q1):
+            pending = [iq for iq in range(q0,q1)
+                       if not np.asarray(header["sample_written"])[iq,lo:hi].all()]
+            if pending:
+                # One Coulomb read and root for the q panel, not one per q.
+                roots,_,_ = _coulomb_batch(meta,config,bank_io,mesh_xy,(q0,q1),execute)
+            for iq in pending:
                 span = (iq,iq+1)
-                if np.asarray(header["sample_written"])[iq,lo:hi].all():
-                    continue
-                h,hinv,ranks = _coulomb_batch(meta,config,bank_io,mesh_xy,span,execute)
-                del hinv
+                h = _face_row(mesh_xy)(roots,np.int32(iq-q0))
                 ia = lo
                 while ia < hi:
                     marked = tuple(header["sample_written"][iq][ia])
@@ -946,6 +962,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     del value,ds,chi,dchi,hbatch
                     ia = stop
                 del h
+            if pending:
+                del roots
             receipt["batches"].append(dict(q_span=(q0,q1),sample_span=(lo,hi)))
             del raw
     timing.fence('bank.finalize', sync_ranks=True)
