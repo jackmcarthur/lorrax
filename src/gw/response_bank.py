@@ -765,6 +765,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         ordered = not bool(sym.trs_allowed)
         if ordered:
             receipt["ordered"] = True
+        # Odd-channel census and ordered per-node cost probe are diagnostics: they run
+        # only under the debug output switch (owner ruling: no debug work by default).
+        debug = bool(getattr(getattr(config, "debug", None), "sigma_freq_debug_output", False))
         started = time.monotonic()
         execute = _bank_execution(meta,mesh_xy,bank_io,receipt,config)
         ledger = meta.shared_pole_capacity
@@ -920,7 +923,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     # Parent selection applies to the k axis, separately for each role.
                     lw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in lw])
                     uw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in uw])
-                if ordered and "ordered_cost_probe" not in receipt:
+                if ordered and debug and "ordered_cost_probe" not in receipt:
                     receipt["ordered_cost_probe"] = _ordered_cost_probe(
                         wfns,meta,mesh_xy,int(qids[q0]),tau,projections,lw,uw,refs,2*a)
                 raw = execute(lk,(jnp.asarray(tau),jnp.asarray(projections),
@@ -948,7 +951,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     dchi = raw[a+ia-lo:a+stop-lo,iq-q0]
                     hbatch = jnp.broadcast_to(h,chi.shape)
                     value,ds = execute(samples,(hbatch,chi,dchi),"sample_dyson")
-                    if ordered and _self_negative(int(qids[iq]),meta):
+                    if ordered and debug and _self_negative(int(qids[iq]),meta):
                         _tr_odd_census(receipt,samples,h,chi,dchi,value,z[ia:stop],int(qids[iq]))
                     value = None if marked[0] else value[None]
                     ds = None if marked[1] else ds[None]
