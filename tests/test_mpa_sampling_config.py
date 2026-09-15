@@ -192,6 +192,55 @@ def test_metal_evaluator_refuses_before_creating_output(tmp_path):
     assert not run_dir.exists()
 
 
+# --- Time-reversal-broken metals (TRINT 2026-09-15) -------------------------
+# The metal route fits one residue (no odd channel) to FT_q[chi^T] samples, so a
+# measured-broken-TR metal refuses by name; TRS metals and TR-broken insulators
+# are unaffected.
+
+
+def test_time_reversal_broken_metal_refuses_before_creating_output(tmp_path):
+    config = _config(tmp_path, _METAL_KEYS)
+    run_dir = tmp_path / "must_not_exist"
+    with pytest.raises(ValueError, match="mpa_ordered_metal"):
+        model.build_mpa_fit(
+            run_dir, "metal", wfns=None, V_q=None, quad=None,
+            sym=SimpleNamespace(trs_allowed=False), centroid_indices=None,
+            head_resolver=None, config=config, meta=None, mesh_xy=None,
+            occupation_state=object(), material_class="metal")
+    assert not run_dir.exists()
+
+
+@pytest.mark.parametrize("material_class,trs_allowed,refuses", [
+    ("metal", False, True), ("metal", True, False),
+    ("insulator", False, False), ("insulator", True, False)])
+def test_time_reversal_metal_gate_census(material_class, trs_allowed, refuses):
+    if refuses:
+        with pytest.raises(ValueError, match="mpa_ordered_metal"):
+            model._require_metal_time_reversal(material_class, trs_allowed)
+    else:
+        model._require_metal_time_reversal(material_class, trs_allowed)
+
+
+def _samples_seam(material_class, trs_allowed, occupation_state):
+    return model._evaluate_samples(
+        None, None, None, None, None, None, material_class=material_class,
+        sym=SimpleNamespace(trs_allowed=trs_allowed), energy_reference=0.0,
+        occupation_state=occupation_state, write_full=None, write_wedge=None,
+        static_gamma_override=None, gamma_row=None, kminq_rows=None,
+        write_reflected=None)
+
+
+def test_time_reversal_broken_metal_refuses_at_the_sample_seam():
+    with pytest.raises(ValueError, match="mpa_ordered_metal"):
+        _samples_seam("metal", False, object())
+
+
+def test_time_reversal_broken_insulator_still_takes_the_ordered_route():
+    # Past the metal gate, the ordered route's own writer requirement fires.
+    with pytest.raises(ValueError, match="requires a reflected writer"):
+        _samples_seam("insulator", False, None)
+
+
 # --- Metal deck-key cross-validation (W4) ---------------------------------
 # A parsed key either has a consumer or refuses by name; the metal pair is
 # required together, and both are off-dials under an insulator.
