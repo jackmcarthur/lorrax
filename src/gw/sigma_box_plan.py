@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import pickle
 import time
 
@@ -47,6 +48,82 @@ _FACTOR_GROWTH_CAP = 30.0
 _RUNTIME_NOISE_EPSILON = 6.0e-8
 _RUNTIME_NOISE_SAFETY = 0.05
 _SC_POLE_PAD_FRACTION = 0.10
+_RULE_CACHE_SCHEMA = "sigma-box-ry-v4"
+
+
+def _rule_digest(rule, noise_amplification):
+    """Authenticate the certificate and its complex128 Ry-inverse nodes."""
+    identity = hashlib.sha256(json.dumps(
+        [_RULE_CACHE_SCHEMA, list(rule.box), float(rule.eps),
+         bool(rule.relative)]).encode())
+    for array in (rule.times, rule.weights):
+        identity.update(np.asarray(array, dtype="<c16").tobytes())
+    identity.update(np.asarray(
+        [rule.sup_error, rule.kappa_max, noise_amplification,
+         rule.theta_deg, rule.rank], dtype="<f8").tobytes())
+    return identity.hexdigest()
+
+
+#: The self-consistent identity spells its Hamiltonian
+#: ``sc_map_{iteration}:{occ_hash}`` (gw/shared_pole_recipe.py), so the map
+#: label lives inside a value, not only in the ``iteration_id`` key.
+_SC_MAP_LABEL = re.compile(r"^sc_map_\d+:")
+
+
+def _map_invariant_identity(identity):
+    """The identity with its SC map label removed, physics intact.
+
+    Stripping only ``iteration_id`` left the map number in ``hamiltonian``, so
+    every SC map opened a fresh request namespace and could never serve a
+    containment-compatible rule stored by an earlier map. What remains is the
+    physical input the rule depends on; every hit is still re-checked for box
+    containment and error currency before use.
+    """
+    return {key: (_SC_MAP_LABEL.sub("", value) if isinstance(value, str) else value)
+            for key, value in identity.items() if key != "iteration_id"}
+
+
+def _receipt_json(receipt):
+    """Serialize the durable quadrature receipt as strict JSON.
+
+    Product windows carry open endpoints (a state tail to ``+inf``, a resonant
+    window from ``-inf``); ``json.dumps`` would spell them ``Infinity``, which
+    no strict parser reads. An unbounded endpoint is ``null`` and its side is
+    its position in the interval pair; any other non-finite value refuses.
+    """
+    def finite(value):
+        if isinstance(value, float) and not np.isfinite(value):
+            if np.isnan(value):
+                raise ValueError("Sigma quadrature receipt: NaN is not an unbounded edge")
+            return None
+        if isinstance(value, dict):
+            return {key: finite(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [finite(item) for item in value]
+        return value
+    return json.dumps(finite(receipt), sort_keys=True, allow_nan=False)
+
+
+def sigma_rule_request_cache(directory, identity, poles2, counts, *, eta, eps):
+    """Scope shared-pole rules to authenticated current-map physical inputs.
+
+    ``identity`` is the model's energy/occupation/recipe provenance;
+    ``poles2`` [Nq,K] in Ry**2 and ``counts`` [Nq] are the small host census.
+    Map labels are excluded (:func:`_map_invariant_identity`): equal physical
+    inputs on restart and across SC maps share rules, but changed spectra or
+    occupations cannot inherit a previous map's plan.
+    Domain containment and the executor noise/growth gates still run on hits.
+    """
+    if directory is None:
+        return None
+    inputs = _map_invariant_identity(identity)
+    digest = hashlib.sha256(json.dumps(
+        [_RULE_CACHE_SCHEMA, inputs, float(eta), float(eps)],
+        sort_keys=True).encode())
+    for row, count in zip(poles2, counts):
+        digest.update(np.asarray([count], dtype="<i8").tobytes())
+        digest.update(np.asarray(row[:int(count)], dtype="<f8").tobytes())
+    return os.path.join(directory, "request_" + digest.hexdigest())
 
 
 def resolve_sigma_box_cache_dir(setting, input_dir):
@@ -242,18 +319,27 @@ def _rule_cache_lookup(
 ):
     """Return the smallest compatible rule plus any unreadable-path warnings.
 
-    Only ``schema >= 2`` entries are served.  Entries written before
-    2026-09-11 were reduced against a wall clock, so how many nodes they
-    carry depended on how loaded the machine was when they were built;
-    serving one now would hand a run a worse rule than the builder makes and
-    make the cache the reason.  They are ignored, not deleted.
+    Only ``_RULE_CACHE_SCHEMA`` entries are served, and each is authenticated
+    against its stored digest before any compatibility filter reads it.
+    Other schemas (including clock-reduced entries written before
+    2026-09-11) are ignored with one warning, not deleted.
     """
     if directory is None:
         return None, ()
     warnings = []
     try:
-        names = [name for name in os.listdir(directory)
-                 if name.endswith(".npz")]
+        entries = [name for name in os.listdir(directory)
+                   if name.startswith("rule_") and name.endswith(".npz")]
+        names = [name for name in entries
+                 if name.startswith(f"rule_{_RULE_CACHE_SCHEMA}_")]
+        stale = sorted(set(entries) - set(names))
+        if stale:
+            warnings.append(
+                "WARNING sigma quadrature cache schema migration: "
+                f"path={os.path.abspath(directory)}; schema={_RULE_CACHE_SCHEMA}; "
+                f"ignored {len(stale)} rule file(s) of another schema, first={stale[0]}; "
+                "affected windows will be rebuilt. The files are retained "
+                "as prior-run evidence.")
     except OSError as exc:
         path = os.path.abspath(directory)
         warnings.append(
@@ -262,43 +348,43 @@ def _rule_cache_lookup(
             f"path={path} error={type(exc).__name__}: {exc}")
         return None, tuple(warnings)
     best = None
-    for name in names:
+    for name in sorted(names):
         path = os.path.abspath(os.path.join(directory, name))
         try:
             with np.load(path) as data:
-                if (abs(float(data["eps"]) - eps) > 1.0e-12 * eps
-                        or bool(data["relative"]) != relative):
-                    continue
-                if "schema" not in data or int(data["schema"]) < 2:
-                    continue
-                # Cache entries pre-dating the executor-noise stamp, or
-                # entries built for a looser consumer, are not compatible.
-                # A cache hit is an acceleration only; it must never hide a
-                # builder attempt that can satisfy the active Sigma gate.
-                if ("roundoff_amplification" not in data
-                        or float(data["roundoff_amplification"])
-                        > noise_amplification_cap):
-                    continue
-                # A cached certificate above eps is not a rule for this
-                # request, whatever its node count; it must not shadow a
-                # buildable accurate one (Na pole-tail, 2026-09-05).
-                if (not np.isfinite(float(data["sup_error"]))
-                        or float(data["sup_error"]) > eps):
-                    continue
+                # Authenticate the stored object before compatibility filtering.
+                # A nearby requested eps may reuse this certificate, but is
+                # never substituted into the digest of its immutable identity.
                 cached_box = tuple(float(value) for value in data["box"])
+                rule = UniformRule(
+                    times=np.asarray(data["times"]),
+                    weights=np.asarray(data["weights"]),
+                    box=cached_box, eps=float(data["eps"]),
+                    relative=bool(data["relative"]),
+                    theta_deg=float(data["theta_deg"]),
+                    rank=int(data["rank"]),
+                    sup_error=float(data["sup_error"]),
+                    kappa_max=float(data["kappa_max"]), seconds=0.0)
+                amplification = float(data["roundoff_amplification"])
+                if (str(data["schema"]) != _RULE_CACHE_SCHEMA
+                        or not _rule_is_certified(rule, rule.eps)
+                        or rule.times.ndim != 1 or rule.weights.ndim != 1
+                        or not np.isfinite(amplification)
+                        or str(data["digest"]) != _rule_digest(rule, amplification)):
+                    raise ValueError("GATE sigma_rule_integrity: certificate digest/schema mismatch")
+                # A cached certificate above eps, or one built for a looser
+                # noise consumer, is not a rule for this request whatever its
+                # node count (Na pole-tail, 2026-09-05).
+                if (abs(rule.eps - eps) > 1.0e-12 * eps
+                        or rule.relative != relative
+                        or amplification > noise_amplification_cap
+                        or rule.sup_error > eps):
+                    continue
                 if not (cached_box[0] <= box[0]
                         and cached_box[1] >= box[1]
                         and cached_box[2] <= box[2]
                         and cached_box[3] >= box[3]):
                     continue
-                rule = UniformRule(
-                    times=np.asarray(data["times"]),
-                    weights=np.asarray(data["weights"]),
-                    box=cached_box, eps=eps, relative=relative,
-                    theta_deg=float(data["theta_deg"]),
-                    rank=int(data["rank"]),
-                    sup_error=float(data["sup_error"]),
-                    kappa_max=float(data["kappa_max"]), seconds=0.0)
                 if best is None or rule.node_count < best[0].node_count:
                     best = (rule, name)
         except (EOFError, OSError, KeyError, ValueError) as exc:
@@ -335,32 +421,24 @@ def _rule_cache_store(directory, rule, noise_amplification):
             and np.isfinite(float(noise_amplification))):
         return ("WARNING sigma quadrature cache store refused an uncertified "
                 "or non-finite rule (nothing written)")
-    identity = hashlib.sha256(json.dumps(
-        ["sigma-noise-currency-v2", list(rule.box), float(rule.eps),
-         bool(rule.relative)]
-    ).encode())
-    identity.update(np.ascontiguousarray(rule.times).view(np.uint8).tobytes())
-    identity.update(np.ascontiguousarray(rule.weights).view(np.uint8).tobytes())
-    identity.update(np.asarray(
-        [float(rule.sup_error), float(rule.kappa_max),
-         float(noise_amplification), float(rule.theta_deg), float(rule.rank)],
-        dtype=np.float64).tobytes())
-    digest = identity.hexdigest()[:16]
-    path = os.path.abspath(os.path.join(directory, f"rule_{digest}.npz"))
+    digest = _rule_digest(rule, noise_amplification)
+    path = os.path.abspath(os.path.join(
+        directory, f"rule_{_RULE_CACHE_SCHEMA}_{digest}.npz"))
     temporary = None
     try:
         os.makedirs(directory, exist_ok=True)
         temporary = f"{path}.{os.getpid()}.tmp"
         with open(temporary, "wb") as handle:
             np.savez(
-                handle, box=np.asarray(rule.box, np.float64),
+                handle, schema=_RULE_CACHE_SCHEMA, digest=digest,
+                box=np.asarray(rule.box, np.float64),
                 eps=float(rule.eps), relative=bool(rule.relative),
                 times=rule.times, weights=rule.weights,
                 sup_error=float(rule.sup_error),
                 kappa_max=float(rule.kappa_max),
                 roundoff_amplification=float(noise_amplification),
                 theta_deg=float(rule.theta_deg), rank=int(rule.rank),
-                seconds=float(rule.seconds), schema=2)
+                seconds=float(rule.seconds))
         os.replace(temporary, path)
     except OSError as exc:
         if temporary is not None:
@@ -767,6 +845,8 @@ def _fit_fixed_sc_rules(
             reasons[spec["name"]] = "absent from iteration 1"
             continue
         escaped = _box_escape_reasons(entry["fit"]["rule_box"], spec["box"])
+        if bool(entry["fit"]["relative"]) != (spec["kind"] != "crossing"):
+            escaped.append("absolute/relative error currency changed")
         if escaped:
             rebuild.append(spec)
             reasons[spec["name"]] = "box escape: " + "; ".join(escaped)
@@ -1071,7 +1151,7 @@ def plan_sigma_windows(
         "planner": "uniform_denominator_boxes",
         "eta_ry": eta, "eps": tolerance,
         "rule_eps": tolerance,
-        "cache_dir": cache_dir,
+        "cache_dir": cache_dir, "rule_cache_schema": _RULE_CACHE_SCHEMA,
         "n_windows": len(output),
         "window_tau_pairs": pairs, "distinct_tau_count": distinct,
         "plan_seconds": time.perf_counter() - started,
@@ -1099,6 +1179,10 @@ def plan_sigma_windows(
         })
     else:
         geometry["sc_fixed_quadrature"] = False
+    # Keep the accepted rule identity in the normal scientific report,
+    # including cache-off and repeated SC planning calls.
+    if process_rank() == 0:
+        print_fn("Sigma quadrature receipt: " + _receipt_json(geometry))
     return output, geometry
 
 

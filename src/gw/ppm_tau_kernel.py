@@ -47,6 +47,30 @@ _sigma_shared_tau_kernel_cache: dict[
 ] = {}
 
 
+# THE names of the staged tau diagnostic's bands, owned here because this
+# module is what opens the sections.  ``gw.mpa.sigma`` aggregates exactly
+# this tuple; a name that is not spelled the same in both places is a row
+# that silently disappears from the profile, so both ends read these.
+TAU_PHASE_W_PHASE = "sigma.tau.w_phase"
+TAU_PHASE_W_PREP = "sigma.tau.w_prep"
+TAU_PHASE_G_BUILD = "sigma.tau.G_build"
+TAU_PHASE_G_IFFT = "sigma.tau.G_ifft"
+TAU_PHASE_GW_MULT_FFT = "sigma.tau.GW_mult_fft"
+TAU_PHASE_GW_CONV_FFI = "sigma.tau.GW_conv_ffi"
+TAU_PHASE_PROJECT_RS = "sigma.tau.project_rs"
+
+#: In dispatch order within one tau node.
+TAU_KERNEL_PROFILE_PHASES = (
+    TAU_PHASE_W_PHASE,
+    TAU_PHASE_W_PREP,
+    TAU_PHASE_G_BUILD,
+    TAU_PHASE_G_IFFT,
+    TAU_PHASE_GW_MULT_FFT,
+    TAU_PHASE_GW_CONV_FFI,
+    TAU_PHASE_PROJECT_RS,
+)
+
+
 def _stage_timing_enabled() -> bool:
     """``LORRAX_SIGMA_TAU_TIMING=1`` selects the stage-split instrumented τ kernel.
 
@@ -232,7 +256,7 @@ def get_sigma_spatial_kernel(
         """
         if use_fused_ffi:
             return W_q
-        with timing.section("sigma.tau.w_prep") as sec:
+        with timing.section(TAU_PHASE_W_PREP) as sec:
             V_R = _V_ifft_j(W_q)
             sec.watch(V_R)
         return V_R
@@ -240,17 +264,17 @@ def get_sigma_spatial_kernel(
     def conv_project_staged(psi_proj_xr, psi_proj_yn, G_k, W_prep):
         """Diagnostic split of the same spatial operation sequence."""
         if use_fused_ffi:
-            with timing.section("sigma.tau.GW_conv_ffi") as sec:
+            with timing.section(TAU_PHASE_GW_CONV_FFI) as sec:
                 sigma_k = _conv_j(G_k, W_prep)
                 sec.watch(sigma_k)
         else:
-            with timing.section("sigma.tau.G_ifft") as sec:
+            with timing.section(TAU_PHASE_G_IFFT) as sec:
                 G_R = _G_ifft_j(G_k)
                 sec.watch(G_R)
-            with timing.section("sigma.tau.GW_mult_fft") as sec:
+            with timing.section(TAU_PHASE_GW_MULT_FFT) as sec:
                 sigma_k = _mult_fft_j(G_R, W_prep)
                 sec.watch(sigma_k)
-        with timing.section("sigma.tau.project_rs") as sec:
+        with timing.section(TAU_PHASE_PROJECT_RS) as sec:
             out = _project_j(psi_proj_xr, sigma_k, psi_proj_yn)
             sec.watch(out)
         return out
@@ -382,7 +406,7 @@ def _get_sigma_kij_kernel(
     build_g = jax.jit(_g_from_selector)
 
     def _build_g_timed(xn, yr, E, mask, E_min, E_max, ref, t):
-        with timing.section("sigma.tau.G_build") as sec:
+        with timing.section(TAU_PHASE_G_BUILD) as sec:
             G_k = build_g(xn, yr, E, mask, E_min, E_max, ref, t)
             sec.watch(G_k)
         return G_k
@@ -457,8 +481,23 @@ def get_shared_sigma_tau_kernel(
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
     layout: str = "face", face_shape=None, face_band_extent=None,
     k_unfold_plan=None,
+    w_synthesis=None,
+    cache: bool = True,
 ) -> Callable[..., jax.Array]:
-    """Build selected multipole W(tau) tiles for the shared complex Sigma contraction."""
+    """Build selected multipole W(tau) tiles for the shared complex Sigma contraction.
+
+    ``w_synthesis`` optionally replaces the resident-pole builder with the
+    resolved shared-pole model's W builder. It takes the same eight operands
+    as the resident builder (``..., t_node, active_count``), returns the
+    complete full-q ``P(None,'x','y')`` tile, and runs outside jit so a
+    bounded reader can supply q/K panels between compiled calls; kernels
+    built with it are never cached, because the builder owns resources.
+
+    ``cache=False`` builds the kernel without reading or writing the
+    process-wide incumbent cache: a compile-only measurement of the
+    incumbent route on a run that never dispatches it must not leave its
+    control executable behind for a later caller.
+    """
     kgrid = tuple(int(x) for x in kgrid)
     if brackets is not None:
         brackets = tuple((int(lo), None if hi is None else int(hi))
@@ -468,7 +507,7 @@ def get_shared_sigma_tau_kernel(
     key = (id(mesh_xy), kgrid, _stage_timing_enabled(), ffi_dial_key(),
            brackets, layout, face_shape, face_band_extent,
            k_unfold_plan)
-    if key in _sigma_shared_tau_kernel_cache:
+    if w_synthesis is None and cache and key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
     ensure_jax_compile_cache()
@@ -488,7 +527,10 @@ def get_shared_sigma_tau_kernel(
             phase_real, E_ref_B, t_node, active_count)
         return jax.lax.with_sharding_constraint(W_t, q_mu_sharding)
 
-    if not _stage_timing_enabled():
+    if w_synthesis is not None:
+        _build = w_synthesis
+
+    if not _stage_timing_enabled() and w_synthesis is None:
         @jax.jit
         def _tau(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
@@ -501,21 +543,34 @@ def get_shared_sigma_tau_kernel(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                 E_A, mask_A, E_ref_A, t_node, W_t)
 
-        _sigma_shared_tau_kernel_cache[key] = _tau
+        if cache:
+            _sigma_shared_tau_kernel_cache[key] = _tau
         return _tau
+
+    profile_stages = _stage_timing_enabled()
 
     def _tau_staged(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
         phase_real, E_ref_A, E_ref_B, t_node, active_count=None,
     ):
-        with timing.section("sigma.tau.w_phase") as sec:
+        if profile_stages:
+            with timing.section(TAU_PHASE_W_PHASE) as sec:
+                W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
+                             phase_real, E_ref_B, t_node, active_count)
+                sec.watch(W_t)
+        else:
+            # A resident model has a Python storage closure, but its device
+            # kernels still dispatch asynchronously. Only the explicit
+            # stage profiler needs a host wait between W and G*W.
             W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
                          phase_real, E_ref_B, t_node, active_count)
-            sec.watch(W_t)
         return sigma_kij(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
             E_A, mask_A, E_ref_A, t_node, W_t)
 
-    _sigma_shared_tau_kernel_cache[key] = _tau_staged
+    # A model builder may own resident faces and an open reader for this SC
+    # map. Never retain that resource closure in the process-wide jit cache.
+    if w_synthesis is None and cache:
+        _sigma_shared_tau_kernel_cache[key] = _tau_staged
     return _tau_staged

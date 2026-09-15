@@ -756,3 +756,62 @@ def test_cache_lookup_prefers_a_certified_larger_rule_over_a_bad_smaller_one(tmp
     assert best is not None
     rule, name = best
     assert name != "rule_bad.npz" and rule.sup_error <= 1.0e-4
+
+
+# Shared-pole rule-request namespace and durable receipt (union review items 10 and 18).
+def _sc_identity(iteration, occ_hash="fd-a"):
+    """The PRODUCTION self-consistent identity shape.
+
+    ``gw/shared_pole_recipe.shared_pole_sc_identity`` builds exactly this:
+    the map label is the prefix of ``hamiltonian``, not a separate key, so a
+    stub without it cannot see whether the map label was stripped.
+    """
+    return dict(hamiltonian=f"sc_map_{iteration}:{occ_hash}",
+                wavefunctions="qp_rotation_unreceipted",
+                recipe_hash="recipe-a", gate_hash="gate-a",
+                authentication="NON-AUTHENTICATING")
+
+
+@pytest.mark.parametrize("changed", ["hamiltonian", "recipe_hash", "poles", "eta", "eps"])
+def test_current_input_request_cannot_reuse_changed_map_rules(
+        monkeypatch, tmp_path, changed):
+    from gw.sigma_box_plan import sigma_rule_request_cache
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    identity = _sc_identity(1)
+    poles, counts = np.array([[.09, 1.]]), np.array([2])
+    kw = dict(eta=.1, eps=1e-4)
+    first_dir = sigma_rule_request_cache(str(tmp_path), identity, poles, counts, **kw)
+    args = dict(eps=1e-4, print_fn=lambda *_: None)
+    plan_sigma_windows(_summaries(), [_branch()], np.array([.2, .5]), .1,
+                       cache_dir=first_dir, **args)
+    # THE NEXT SC MAP, same physics: same namespace, or the on-disk cache is
+    # dead across maps (review item 10).
+    assert first_dir == sigma_rule_request_cache(
+        str(tmp_path), _sc_identity(2), poles, counts, **kw)
+    if changed == "hamiltonian":
+        identity = _sc_identity(2, occ_hash="fd-b")
+    elif changed == "recipe_hash":
+        identity = dict(identity, recipe_hash="recipe-b")
+    elif changed == "poles":
+        poles[0, 0] += .001
+    else:
+        kw[changed] *= .9
+    new_dir = sigma_rule_request_cache(str(tmp_path), identity, poles, counts, **kw)
+    assert new_dir != first_dir
+    _, geometry = plan_sigma_windows(
+        _summaries(), [_branch()], np.array([.2, .5]), .1,
+        cache_dir=new_dir, **args)
+    assert all(row["cache_status"] == "miss"
+               for row in geometry["branches"][0]["windows"])
+
+
+def test_changed_domain_rebuilds_even_with_same_input_identity(monkeypatch, tmp_path):
+    from gw.sigma_box_plan import _rule_cache_lookup, _rule_cache_store
+    rule = _fake_rule((-2., -.3, .05, .4), 1e-4)
+    assert _rule_cache_store(str(tmp_path), rule, 1.) is None
+    accepted, _ = _rule_cache_lookup(str(tmp_path), rule.box, 1e-4, True,
+                                    noise_amplification_cap=1e9)
+    assert accepted is not None
+    escaped, _ = _rule_cache_lookup(str(tmp_path), (-3., -.3, .05, .4), 1e-4, True,
+                                   noise_amplification_cap=1e9)
+    assert escaped is None
