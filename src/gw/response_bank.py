@@ -43,11 +43,13 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False):
         Neither routine Hermitizes its inputs or outputs.
     """
     from distrib_la import matmul, plan
-    from .gw_config import linalg_resolution
+    from .gw_config import dense_layout, linalg_resolution
     from .w_isdf import _w_solve_pref_scalar
 
-    resolution = linalg_resolution(
+    dial = linalg_resolution(
         config if hasattr(config, "get") else {"linalg": config.backend.linalg})
+    # Whole matrices per device at or below the measured extent, whatever the dial.
+    resolution = linalg_resolution({"linalg": dense_layout(dial, "solve", n)})
     route = resolution.batched_route
     backend = "off" if resolution.layout == "local" else "distributed"
     lu = plan("solve_lu", mesh_xy, backend=backend, n=n,
@@ -358,6 +360,9 @@ def _bank_execution(meta, mesh_xy, bank_io, receipt, config):
             stream = stage in ("real_time", "laplace", "moment_correlation")
             if not stream:
                 layout = config.get("linalg", "local") if hasattr(config,"get") else config.backend.linalg
+                if stage in ("sample_dyson", "moment_dyson"):
+                    from .gw_config import dense_layout, linalg_resolution
+                    layout = dense_layout(linalg_resolution({"linalg": layout}), "solve", args[0].shape[-1])
                 native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
                     with_eigh=stage=="coulomb_sqrt")
                 receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))
@@ -804,7 +809,12 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # Reserve output plus a dense/transport headroom, and batch only when the
         # common ledger's admitted panel budget cannot hold the full point plan.
         layout = config.get("linalg","local") if hasattr(config,"get") else config.backend.linalg
-        native = response_dense_workspace(mesh_xy,meta.mu_basis.n_packed,len(z),layout,with_eigh=True)
+        from .gw_config import dense_layout, linalg_resolution
+        # Dyson GEMMs follow the routed layout; the Coulomb eigh keeps its own.
+        dyson_layout = dense_layout(linalg_resolution({"linalg": layout}), "solve", meta.mu_basis.n_packed)
+        native = dict(response_dense_workspace(mesh_xy,meta.mu_basis.n_packed,len(z),dyson_layout,with_eigh=False))
+        native["eigh"] = response_dense_workspace(mesh_xy,meta.mu_basis.n_packed,len(z),layout,with_eigh=True)["eigh"]
+        native["total"] = native["gemm"] + native["eigh"]
         headroom = 16*face_bytes + native["gemm"] + int(phase.nbytes+derivative.nbytes)
         # Ask the ledger owner for R24's remaining device budget. The zero-byte
         # planning row includes ambient live reservations but allocates nothing.
