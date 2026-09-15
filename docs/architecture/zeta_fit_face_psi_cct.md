@@ -3342,3 +3342,13 @@ band contraction. Canonical zeta files do not encode a processor grid.
 Independent fresh fits can amplify different GEMM reduction orders in a
 conditioned CCT solve. The campaign report distinguishes copied-zeta exact
 QP gates from own-zeta micro-eV gates and retains the stricter array residual.
+
+## C startup
+
+C creates its GEMM plan with `warmup=False`. The service still validates the
+plan and initializes the communicator before tracing, but C's enclosing JIT
+performs the first actual GEMM execution. This avoids compiling and executing
+two dummy GEMMs immediately before compiling C itself. No contractions,
+weights, symmetry operations or output shardings change. The option applies
+to both `low_mem_bands` layouts; other GEMM callers retain their warmup default.
+See [the service contract](../services/distrib_la.md#gemm-plans-without-dummy-execution).
