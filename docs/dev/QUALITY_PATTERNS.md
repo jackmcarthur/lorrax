@@ -68,6 +68,27 @@ reconciliation of observed vs modeled resources.** When measured ≠ modeled,
 neither "the model is roughly right" nor "overhead" is an acceptable
 resolution — the delta has a closed form and a line number.
 
+### Compiled-object lifetime in services
+
+A repeated service operation owns a persistent transformed callable. Build
+`jit`, `shard_map`, `vmap`, `pmap` or autodiff wrappers at module scope or
+inside a cached builder keyed by the complete static signature. Numerical
+inputs remain traced operands; never cache output arrays or donated buffers.
+A local transformation inside an already retained outer trace is safe.
+
+Keys must separate device placement and mesh axes, layouts, static shapes,
+dtypes, operation flags and native context handles whenever the builder
+captures them. Hashable `Mesh` / `NamedSharding` values retain their devices
+and compare by value; reconstructing an equivalent layout must hit the same
+builder. Existing caches that do not retain a mesh use the service's
+`mesh_key`. Test both equivalent reconstructions and different placements,
+as well as changed input values, before claiming reuse is correct.
+
+Planning alone is not an exemption: repeated equivalent plans must reuse
+compiled kernels and provider warmup. A solver session may own its kernels
+when its mathematical target is fixed for that session; document that
+lifetime rather than describing every nested transform as a cache miss.
+
 ## 6. The broken-promise class — approval at resolve, failure at call
 `resolve_backend` approved slate cholesky on a mesh the call rejects (L-1);
 the distributed tier's gate approved 'distributed' while the body hard-coded
