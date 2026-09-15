@@ -135,6 +135,116 @@ def screening_requests_for(
         f"screening_requests_for: unknown compute mode {mode!r}")
 
 
+#: Debug/diagnostic env hook (``docs/dev/env_vars.md`` §3).  Comma-separated
+#: probe frequencies in eV for the PACKED four-current response: a bare number
+#: is the imaginary axis, a ``r`` suffix the real axis.  Unset (the default)
+#: leaves the packed route exactly where it is — one static role.  It adds
+#: roles to a DIAGNOSTIC report only: Σ consumes the static role either way, so
+#: this switch changes what is printed and dumped, never a production number.
+PHOTON_ROLE_PROBE_ENV = "LORRAX_PHOTON_ROLE_PROBE"
+
+
+def photon_role_probe_requests() -> list[ScreeningRequest]:
+    """``[static, probe_*]`` from :data:`PHOTON_ROLE_PROBE_ENV`, or ``[]``."""
+    import os
+    from common import RYD_TO_EV
+
+    raw = os.environ.get(PHOTON_ROLE_PROBE_ENV, "").strip()
+    if not raw:
+        return []
+    out = [ScreeningRequest(omega_ry=0.0 + 0.0j, role="static")]
+    for index, token in enumerate(t.strip() for t in raw.split(",")):
+        if not token:
+            continue
+        on_real = token.endswith("r")
+        value = float(token[:-1] if on_real else token) / float(RYD_TO_EV)
+        out.append(ScreeningRequest(
+            omega_ry=(complex(value, 0.0) if on_real else complex(0.0, value)),
+            role=f"probe{index}"))
+    if len(out) == 1:
+        raise ValueError(
+            f"{PHOTON_ROLE_PROBE_ENV} was set but named no frequency; "
+            "unset it or give a comma-separated list in eV.")
+    return out
+
+
+def photon_role_quadratures(requests, *, quad, config, sym, print_fn=print,
+                            with_same_frequency_contact_arm=False):
+    """``((role, quad, ordered, tt_contact), …)`` for the PACKED four-current response.
+
+    One source of truth with the scalar route and nothing more: the same
+    request list :func:`screening_requests_for` returns, the same
+    ``build_imag_quadrature`` / ``build_real_quadrature`` refit on the same
+    static interval, and the same MEASURED time-reversal verdict
+    (:func:`_trs_verdict`) that decides whether the ordered, magnetisation-odd
+    orientations are carried.  :func:`gw.w_isdf.compute_photon_response_roles`
+    consumes it and owns only the mechanics.
+
+    ``ordered`` is true exactly where the scalar route sets
+    ``ordered_orientations``: an imaginary-axis role on a deck whose measured
+    verdict is false.  It matters more here than there — CT is the
+    magnetisation-odd channel itself, so without it the cross block is zero by
+    construction at every frequency, which is the state the bare-transverse
+    family declares by name.
+
+    ``tt_contact`` is the owner's 2026-09-15 convention on every finite-ω role:
+    subtract the frequency-independent diamagnetic Γ row
+    (``w_isdf.PHOTON_TT_CONTACT_STATIC_REFERENCE``), which keeps the transverse
+    head alive at finite ω.  ``with_same_frequency_contact_arm`` adds, beside
+    each finite-ω role, a secondary role carrying the other reading; the
+    difference between the two IS the q → 0 transverse head, and measuring it
+    is the point of the arm.
+    """
+    from .minimax_screening import build_imag_quadrature, build_real_quadrature
+    from .w_isdf import (PHOTON_TT_CONTACT_SAME_FREQUENCY,
+                         PHOTON_TT_CONTACT_STATIC_REFERENCE)
+
+    tr_odd = _trs_verdict(sym) is False
+    plan = []
+    for req in requests:
+        if req.role == "static":
+            plan.append((req.role, quad, False,
+                         PHOTON_TT_CONTACT_STATIC_REFERENCE))
+            continue
+        on_imag = abs(complex(req.omega_ry).imag) > 0.0
+        on_real = abs(complex(req.omega_ry).real) > 0.0
+        if on_imag and on_real:
+            raise ValueError(
+                f"photon_role_quadratures: complex-axis ω={req.omega_ry!r} "
+                "not supported — ω must be pure real or pure imag.")
+        if on_imag:
+            quad_used = build_imag_quadrature(
+                quad, abs(req.omega_ry.imag), config.minimax_config,
+                print_fn=print_fn, with_odd_kernel=tr_odd)
+            plan.append((req.role, quad_used, tr_odd,
+                         PHOTON_TT_CONTACT_STATIC_REFERENCE))
+            if with_same_frequency_contact_arm:
+                plan.append((f"{req.role}_samefreq", quad_used, tr_odd,
+                             PHOTON_TT_CONTACT_SAME_FREQUENCY))
+        else:
+            quad_used = build_real_quadrature(
+                quad, abs(req.omega_ry.real), config.minimax_config,
+                print_fn=print_fn)
+            if tr_odd:
+                print_fn(
+                    f"  W[{req.role}]: measured time-reversal verdict is "
+                    "BROKEN, but a REAL-axis probe cannot carry the TR-odd "
+                    "residue (W(z)^H = W(conj z) is Hermitian at real z), so "
+                    "the packed current blocks keep the even orientation "
+                    "completion on this role; chi_CT's odd channel is NOT "
+                    "represented here.")
+            plan.append((req.role, quad_used, False,
+                         PHOTON_TT_CONTACT_STATIC_REFERENCE))
+            if with_same_frequency_contact_arm:
+                plan.append((f"{req.role}_samefreq", quad_used, False,
+                             PHOTON_TT_CONTACT_SAME_FREQUENCY))
+        quadrature_log.record_minimax(
+            "imag" if on_imag else "real", quad_used,
+            omega_ry=abs(req.omega_ry.imag if on_imag else req.omega_ry.real),
+            target=config.minimax_config.target_error)
+    return tuple(plan)
+
+
 # ---------------------------------------------------------------------------
 # Static W with the IBZ fast path
 # ---------------------------------------------------------------------------

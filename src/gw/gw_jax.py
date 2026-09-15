@@ -108,7 +108,8 @@ from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
 from . import quadrature_log
 from .screening import (
-	compute_screening_model, driver_persists_w0, screening_requests_for)
+	compute_screening_model, driver_persists_w0, photon_role_probe_requests,
+	photon_role_quadratures, screening_requests_for)
 from .sigma_dispatch import (
 	SIGMA_KSET_FULL_BZ, SIGMA_KSET_STAR_WEDGE, compute_sigma_xc,
 	sigma_result_on_kset)
@@ -671,9 +672,22 @@ def _run_oneshot_screening(
                                 "the packed bare-transverse route needs the incumbent "
                                 "static W(omega=0) on the charge block; the screening "
                                 "model returned no 'static' role.")
-                from .w_isdf import compute_static_photon_response
-                photon_response = compute_static_photon_response(
-                    wfns_screening, wfns_transverse, quad, bispinor_v_q_path,
+                from .w_isdf import (
+                    compute_photon_response_roles, photon_role_block_report)
+                # The packed response's frequency axis.  DIAGNOSTIC: the probe
+                # roles are built, reported and dropped; Sigma consumes the
+                # static role exactly as it does with the hook unset.
+                _probe_requests = (photon_role_probe_requests()
+                                   if _screens_current else [])
+                _role_quads = (
+                    photon_role_quadratures(
+                        _probe_requests, quad=quad, config=config, sym=sym,
+                        print_fn=print0,
+                        with_same_frequency_contact_arm=True)
+                    if _probe_requests else (("static", quad, False),))
+                _responses = compute_photon_response_roles(
+                    _role_quads,
+                    wfns_screening, wfns_transverse, bispinor_v_q_path,
                     meta, mesh_xy,
                     screen_current=_screens_current,
                     mu_bases=isdf.mu_bases,
@@ -688,6 +702,13 @@ def _run_oneshot_screening(
                     distrib_la_batched_route=(
                         config.backend.distrib_la_batched_route),
                     print_fn=print0)
+                if _probe_requests:
+                    photon_role_block_report(
+                        _responses, mesh_xy, print_fn=print0,
+                        dump_path=os.path.join(tmp_dir, "photon_roles.npz"),
+                        dump_q=(0, 6))
+                photon_response = _responses["static"]
+                _responses = None
                 _W_charge = None
                 if not _dynamic_packed:
                     W_by_role = {}

@@ -403,7 +403,7 @@ def test_packed_dyson_order_prefactor_hermiticity_and_bare_limit(monkeypatch):
 def test_q_star_unfold_all_blocks_ward_contact_and_daggers():
     """Scalar phase/conjugation then Lambda tensor mixing preserves every Hermitian companion."""
     from gw.photon_layout import PhotonBasisLayout,pack_photon_operator
-    from gw.w_isdf import StaticPhotonResponse,photon_blocks_full_q,_subtract_static_tt_contact
+    from gw.w_isdf import StaticPhotonResponse,photon_blocks_full_q,_subtract_tt_contact
     from gw.qgrid_symmetry import qgrid_trs_policy_for
     from symmetry_maps import bgw_integer_q_to_fractional
     mesh = _mesh()
@@ -442,7 +442,7 @@ def test_q_star_unfold_all_blocks_ward_contact_and_daggers():
     for a,b in keys:
         np.testing.assert_allclose(restored[a,b],np.asarray(restored[b,a]).conj().swapaxes(-1,-2),atol=3e-12)
     raw = rng.normal(size=(nq,nmu,nmu))+1j*rng.normal(size=(nq,nmu,nmu))
-    np.testing.assert_allclose(_subtract_static_tt_contact(jnp.asarray(raw)),raw-raw[:1],atol=2e-14)
+    np.testing.assert_allclose(_subtract_tt_contact(jnp.asarray(raw)),raw-raw[:1],atol=2e-14)
 
 
 def test_parent_chi_equals_literal_full_k_for_all_16_blocks(monkeypatch):

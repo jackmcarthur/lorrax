@@ -366,7 +366,7 @@ already held.
 |---|---|---|---|
 | one no-pair block `χ^{IJ}_0` | `w_isdf.compute_no_pair_dirac_current_block` (`:1665`) | `(nq, μ_L, μ_R)` c128 | `P(None,'x','y')` |
 | the sixteen blocks (`screen_current = True` only) | `compute_experimental_no_pair_photon_chi0` (`:1788`); T1/T2/T3 share one transverse bundle | — | — |
-| TT Ward subtraction | `_subtract_static_tt_contact` (`:1776`), applied inside the sixteen-block builder | `Π(q_irr) − Π(Γ)` before Dyson/star unfold | covariant contact follows typed block transport |
+| TT Ward subtraction | `_subtract_tt_contact`, applied inside the sixteen-block builder | `Π(q_irr) − Π(Γ)` before Dyson/star unfold | covariant contact follows typed block transport |
 | packed `V`, `χ_0`, `W` | `photon_layout.pack_photon_operator` (`:219`), `w_isdf.solve_w` (`:1431`) | `(nq, N_packed, N_packed)` c128 | `P(None,'x','y')` |
 
 `N_packed` is `PhotonBasisLayout.packed_extent` (`photon_layout.py:107-109`),
