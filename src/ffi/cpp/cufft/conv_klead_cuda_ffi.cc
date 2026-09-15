@@ -9,10 +9,10 @@
 // at fixed k from global memory and scatter them into the odd-stride resident
 // T bank, transposing inside shared memory while assembling each k-row.  The
 // resident bank is the staging tile; there is no second copy.  Once resident,
-// the direct
-// twiddle-ring passes are unchanged: runtime axis extents, no per-size
-// compilation, odd shared row stride, device-derived residency, and a named
-// refusal.
+// the transforms use runtime axis extents, odd shared row stride, and
+// device-derived residency. A separately compiled butterfly arm handles
+// grids with axes in {1,2,4}; other grids retain the general DFT arm.
+// Neither arm compiles again when the runtime grid changes.
 //
 // This remains one kernel implementation.  The plan-based k-leading member
 // (lorrax_mklfft_gw_conv) remains the caller's unsupported-shape fallback.
@@ -57,6 +57,9 @@ extern const unsigned char _binary_lrx_conv_klead_sm80_cubin_end[];
 static constexpr int kAxisMax = 24;
 static constexpr int kSmemPreferred = 32768;
 static constexpr int kEptMax = 8;
+// The small-grid planner uses at most two outputs/thread. Keep larger
+// variants on the general path instead of compiling unused butterflies.
+static constexpr int kSmallEptMax = 2;
 static constexpr int kEptPref = 4;
 static constexpr int kMaxBlock = 512;
 static constexpr int kBlockTarget = 256;
@@ -159,7 +162,7 @@ static std::string cu_err(CUresult r) {
 static const char* kKernelSrc = R"__lrx__(
 struct __align__(16) lrx_c2 { double x, y; };
 
-template <int EPT, int AXIS>
+template <int EPT, int AXIS, bool SMALL>
 __device__ __forceinline__ void lrx_pass(
     const lrx_c2* rowp, const lrx_c2* twv,
     int nk, int lane, int tpr, int n0, int n1, int n2,
@@ -180,19 +183,46 @@ __device__ __forceinline__ void lrx_pass(
             } else {
                 base = (kx[e] * n1 + ky[e]) * n2; mid = kz[e];
             }
-            double ar = 0.0, ai = 0.0;
-            int m = 0;
-            for (int j = 0; j < len; ++j) {
-                const lrx_c2 v = rowp[base + j * stride];
-                const lrx_c2 w = twv[m];
-                const double wi = sgn * w.y;
-                ar += v.x * w.x - v.y * wi;
-                ai += v.x * wi + v.y * w.x;
-                m += mid;
-                if (m >= len) m -= len;
+            // Exact small-axis butterflies avoid twiddle loads and complex
+            // multiplies. Other axis lengths retain the general DFT below.
+            if (SMALL && len == 2) {
+                const lrx_c2 v0 = rowp[base];
+                const lrx_c2 v1 = rowp[base + stride];
+                const double sign = mid == 0 ? 1.0 : -1.0;
+                acc[e] = {v0.x + sign * v1.x, v0.y + sign * v1.y};
+                continue;
             }
-            acc[e].x = ar;
-            acc[e].y = ai;
+            if (SMALL && len == 4) {
+                const lrx_c2 v0 = rowp[base];
+                const lrx_c2 v1 = rowp[base + stride];
+                const lrx_c2 v2 = rowp[base + 2 * stride];
+                const lrx_c2 v3 = rowp[base + 3 * stride];
+                if ((mid & 1) == 0) {
+                    const double sign = mid == 0 ? 1.0 : -1.0;
+                    acc[e] = {(v0.x + v2.x) + sign * (v1.x + v3.x),
+                              (v0.y + v2.y) + sign * (v1.y + v3.y)};
+                } else {
+                    const double sign = mid == 1 ? sgn : -sgn;
+                    acc[e] = {(v0.x - v2.x) + sign * (v1.y - v3.y),
+                              (v0.y - v2.y) - sign * (v1.x - v3.x)};
+                }
+                continue;
+            }
+            if (!SMALL) {
+                double ar = 0.0, ai = 0.0;
+                int m = 0;
+                for (int j = 0; j < len; ++j) {
+                    const lrx_c2 v = rowp[base + j * stride];
+                    const lrx_c2 w = twv[m];
+                    const double wi = sgn * w.y;
+                    ar += v.x * w.x - v.y * wi;
+                    ai += v.x * wi + v.y * w.x;
+                    m += mid;
+                    if (m >= len) m -= len;
+                }
+                acc[e].x = ar;
+                acc[e].y = ai;
+            }
         }
     }
 }
@@ -208,7 +238,7 @@ __device__ __forceinline__ void lrx_writeback(
     }
 }
 
-template <int EPT>
+template <int EPT, bool SMALL>
 __device__ __forceinline__ void lrx_conv_body(
     const lrx_c2* tin, const lrx_c2* __restrict__ wgt, lrx_c2* uout,
     long long Tg, long long Tv, long long mx, long long b, long long my,
@@ -229,17 +259,18 @@ __device__ __forceinline__ void lrx_conv_body(
     long long* wrow = (long long*)(tw + ntw);
 
     // Store O(n) twiddle rings; lrx_pass advances (mid*j)%len by add/sub.
-    // This avoids an O(n^2) table and per-size radix specializations in the
-    // validated <=24 envelope.
-    for (int i = tid; i < ntw; i += nthr) {
-        int m, len;
-        if (i < n0) { m = i; len = n0; }
-        else if (i < n0 + n1) { m = i - n0; len = n1; }
-        else { m = i - n0 - n1; len = n2; }
-        double s, c;
-        sincospi(-2.0 * (double)m / (double)len, &s, &c);
-        tw[i].x = c;
-        tw[i].y = s;
+    // The butterfly arm needs no twiddles; retain the same shared offsets.
+    if (!SMALL) {
+        for (int i = tid; i < ntw; i += nthr) {
+            int m, len;
+            if (i < n0) { m = i; len = n0; }
+            else if (i < n0 + n1) { m = i - n0; len = n1; }
+            else { m = i - n0 - n1; len = n2; }
+            double s, c;
+            sincospi(-2.0 * (double)m / (double)len, &s, &c);
+            tw[i].x = c;
+            tw[i].y = s;
+        }
     }
     const lrx_c2* twx = tw;
     const lrx_c2* twy = tw + n0;
@@ -330,9 +361,9 @@ __device__ __forceinline__ void lrx_conv_body(
     }
 #define LRX_INVERSE_PASS(AX, TWV, LEN)                              \
     if ((LEN) > 1) {                                                \
-        lrx_pass<EPT, AX>(trow, TWV, nk, lane, tpr, n0, n1, n2,    \
+        lrx_pass<EPT, AX, SMALL>(trow, TWV, nk, lane, tpr, n0, n1, n2,    \
                           kx, ky, kz, -1.0, ta);                    \
-        lrx_pass<EPT, AX>(wline, TWV, nk, lane, tpr, n0, n1, n2,  \
+        lrx_pass<EPT, AX, SMALL>(wline, TWV, nk, lane, tpr, n0, n1, n2,  \
                           kx, ky, kz, -1.0, wa);                    \
         __syncthreads();                                            \
         if (--rem == 0) { LRX_MULT }                               \
@@ -342,7 +373,7 @@ __device__ __forceinline__ void lrx_conv_body(
     }
 #define LRX_FORWARD_PASS(AX, TWV, LEN)                              \
     if ((LEN) > 1) {                                                \
-        lrx_pass<EPT, AX>(trow, TWV, nk, lane, tpr, n0, n1, n2,    \
+        lrx_pass<EPT, AX, SMALL>(trow, TWV, nk, lane, tpr, n0, n1, n2,    \
                           kx, ky, kz, 1.0, ta);                     \
         __syncthreads();                                            \
         if (--rem == 0) { LRX_SCALE }                              \
@@ -397,27 +428,28 @@ __device__ __forceinline__ void lrx_conv_body(
 }
 
 #define LRX_MAX_BLOCK 512
-#define LRX_ENTRY(N)                                                     \
+#define LRX_ENTRY(N, TAG, SMALL)                                                     \
 extern "C" __global__ __launch_bounds__(LRX_MAX_BLOCK)                  \
-void lrx_conv_klead_c128_e##N(                                          \
+void lrx_conv_klead_c128_##TAG##e##N(                                          \
     const lrx_c2* tin, const lrx_c2* __restrict__ wgt, lrx_c2* uout,    \
     long long Tg, long long Tv, long long mx, long long b, long long my,\
     int nk, int n0, int n1, int n2, int SP, double scale)               \
 {                                                                        \
     extern __shared__ lrx_c2 sm[];                                      \
-    lrx_conv_body<N>(tin, wgt, uout, Tg, Tv, mx, b, my, nk,             \
+    lrx_conv_body<N, SMALL>(tin, wgt, uout, Tg, Tv, mx, b, my, nk,             \
                      n0, n1, n2, SP, scale, sm);                         \
 }
 
-LRX_ENTRY(1) LRX_ENTRY(2) LRX_ENTRY(3) LRX_ENTRY(4)
-LRX_ENTRY(5) LRX_ENTRY(6) LRX_ENTRY(7) LRX_ENTRY(8)
+LRX_ENTRY(1, , false) LRX_ENTRY(2, , false) LRX_ENTRY(3, , false) LRX_ENTRY(4, , false)
+LRX_ENTRY(5, , false) LRX_ENTRY(6, , false) LRX_ENTRY(7, , false) LRX_ENTRY(8, , false)
+LRX_ENTRY(1, small_, true) LRX_ENTRY(2, small_, true)
 #undef LRX_ENTRY
 )__lrx__";
 
 static std::mutex g_mu;
 
 struct KernelArms {
-    CUfunction fn[kEptMax] = {nullptr};
+    CUfunction fn[(kEptMax + kSmallEptMax)] = {nullptr};
     int smem_max = 0;
 };
 
@@ -554,9 +586,10 @@ static ffi::Error ensure_kernels(const KernelArms** out) {
     cr = api.ModuleLoadData(&mod, image_data);
     if (cr != CUDA_SUCCESS) return fail_sticky("cuModuleLoadData", cu_err(cr));
     KernelArms arms;
-    for (int e = 1; e <= kEptMax; ++e) {
+    for (int e = 1; e <= (kEptMax + kSmallEptMax); ++e) {
         char name[64];
-        std::snprintf(name, sizeof(name), "lrx_conv_klead_c128_e%d", e);
+        std::snprintf(name, sizeof(name), "lrx_conv_klead_c128_%se%d",
+                      e > kEptMax ? "small_" : "", (e - 1) % kEptMax + 1);
         cr = api.ModuleGetFunction(&arms.fn[e - 1], mod, name);
         if (cr != CUDA_SUCCESS) {
             api.ModuleUnload(mod);
@@ -587,7 +620,7 @@ static ffi::Error ensure_kernels(const KernelArms** out) {
             "[conv_klead] AOT_SM80_HIT: loaded embedded sm_80 cubin "
             "(%zu B, device %d, %d arms); NVRTC skipped; dynamic shared max "
             "%d B\n",
-            image_size, dev, kEptMax, arms.smem_max);
+            image_size, dev, (kEptMax + kSmallEptMax), arms.smem_max);
     } else if (log_enabled()) {
         std::fprintf(stderr,
             "[conv_klead] NVRTC kernels compiled for sm_%d%d in %.3f ms "
@@ -595,7 +628,7 @@ static ffi::Error ensure_kernels(const KernelArms** out) {
             "device %d, %d arms); dynamic shared max %d B\n",
             cc_major, cc_minor, nvrtc_compile_ms, image_size,
             used_cubin ? "cubin" : "ptx",
-            dev, kEptMax, arms.smem_max);
+            dev, (kEptMax + kSmallEptMax), arms.smem_max);
     }
     auto res = cache.emplace(ctx, arms);
     *out = &res.first->second;
@@ -784,8 +817,13 @@ static ffi::Error ConvKLeadDispatch(
            << " blocks exceeds grid.x; split a trailing axis.";
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
+    // Keep the general kernel free of butterfly branches and their register
+    // cost. Both arms are built once; runtime extents never trigger a rebuild.
+    const auto small_axis = [](int64_t n) { return n == 1 || n == 2 || n == 4; };
+    const bool small = cfg.ept <= kSmallEptMax &&
+                       small_axis(nkx) && small_axis(nky) && small_axis(nkz);
     CUresult cr = driver_api().LaunchKernel(
-        arms->fn[cfg.ept - 1], static_cast<unsigned>(nblocks), 1, 1,
+        arms->fn[(small ? kEptMax : 0) + cfg.ept - 1], static_cast<unsigned>(nblocks), 1, 1,
         static_cast<unsigned>(cfg.tpr), static_cast<unsigned>(cfg.rb), 1,
         static_cast<unsigned>(cfg.smem), reinterpret_cast<CUstream>(stream),
         args, nullptr);

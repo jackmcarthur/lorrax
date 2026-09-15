@@ -82,6 +82,35 @@ Since 2026-08-01 both default ON; `fft_ffi_enabled()` False (an explicit
 `=0`) makes `make_flat_k_fft` REFUSE rather than select the deleted XLA
 arm.
 
+### Direct CUDA convolution
+
+`make_gw_conv_ffi` can select `lorrax_cufft_conv_klead` through
+`LORRAX_CONV_KLEAD_FFI`; the [environment registry](env_vars.md) owns its
+default and capability policy. The public arrays remain
+`G[k,a,mu_X,b,nu_Y]` and `W[k,mu_X,nu_Y]`. Loads and stores use that
+layout directly, with transforms staged in shared memory. The output can
+reuse G's buffer; the handler does not allocate another full matrix or
+gather the distributed spatial axes.
+
+When every k-grid axis is 1, 2, or 4, the handler selects a butterfly kernel.
+Length-two transforms use sums and differences; length-four transforms add
+quarter-turn complex rotations. This arm needs no twiddle table generation
+or reads. Other grids use the general per-axis DFT kernel. The two arms are
+compiled separately so the butterfly branches do not increase the general
+kernel's register use. They share the implementation of loading, scaling,
+launch planning, and storing, with identical shared-memory reservations.
+Only the one- and two-output-per-thread butterfly variants needed by the
+current planner are built; larger launches retain the general kernel.
+Both arms are embedded for sm_80 or compiled together once per CUDA context
+on other architectures; runtime grid changes do not trigger new native
+compilation. The FFI signature and JAX cache keys are unchanged.
+
+This is a CUDA implementation change. The CPU FFTW implementation and the
+plan-based CUDA fallback are unchanged. Reordering arithmetic can change
+roundoff; `tests/multi_device/test_gw_conv_service.py` checks NumPy FFT
+parity, singleton and mixed axes, both service routes, output sharding, and
+absence of full-array gathers.
+
 ## 2. Raison d'être: the layout anchor, stated structurally
 
 XLA's `fft` custom-call requires the transformed axes **minor-most**.  The Σ

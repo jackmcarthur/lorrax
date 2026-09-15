@@ -17,7 +17,11 @@ def runtime_mesh():
     return initialize_communicator_stack().mesh
 
 
-@pytest.mark.parametrize("grid", [(3, 3, 1), (4, 4, 4), (3, 5, 2), (8, 8, 8)])
+@pytest.mark.parametrize("grid", [
+    (1, 1, 1), (1, 2, 4), (4, 1, 2), (2, 4, 1), (1, 4, 4), (2, 4, 4),
+    (3, 3, 1), (2, 2, 2), (4, 4, 4), (4, 2, 3), (3, 4, 2),
+    (2, 3, 4), (3, 5, 2), (8, 8, 8),
+])
 @pytest.mark.parametrize("mode,target", [
     ("off", "lorrax_mklfft_gw_conv"),
     ("on", "lorrax_cufft_conv_klead"),
@@ -34,7 +38,7 @@ def test_convolution_service_matches_numpy(grid, mode, target, monkeypatch, runt
     nk, mu, nu = int(np.prod(grid)), 4 * px, 5 * py
     rng = np.random.default_rng(815)
     # BSE trial and spin-product axes need not be equal.
-    a, b = (3, 4) if grid == (3, 5, 2) else (2, 2)
+    a, b = (3, 4) if grid in ((3, 5, 2), (1, 2, 4)) else (2, 2)
     shape = (nk, a, mu, b, nu)
     g = rng.normal(size=shape) + 1j * rng.normal(size=shape)
     w = rng.normal(size=(nk, mu, nu)) + 1j * rng.normal(size=(nk, mu, nu))
