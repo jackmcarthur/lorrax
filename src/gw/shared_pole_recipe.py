@@ -96,8 +96,26 @@ def table_hash(table):
 RECIPE_HASH = table_hash(shared_real_pole_v1_r3b)
 GATE_HASH = table_hash(shared_real_pole_gates_v1_r3b)
 
+# Time-reversal-broken ordered route (particle-hole pencil in z). A separate
+# table keeps the TRS table, its hash and every stored TRS identity unchanged.
+ORDERED_GATE_VERSION = "shared_real_pole_gates_ordered_v1"
+shared_real_pole_gates_ordered_v1 = {
+    name: dict(row) for name, row in shared_real_pole_gates_v1_r3b.items()}
+for _name, (_predicate, _threshold) in {
+    "representation": ("scalar N_spinor=1, authenticated TRS broken, ordered bank: positive poles per parent, hole side from the parent of -q transposed",
+                       {"nspinor": 1, "trs_allowed": False, "ordered": True}),
+    "passivity": ("Hermitian part of the V-whitened -Wc(i eta) of the signed particle-hole model in bounds; the anti-Hermitian part is the odd channel, reported only",
+                  {"eigenvalue_min": -1.0e-10, "eigenvalue_max": 1.0 + 1.0e-8}),
+    "retained_subspace_moments": ("relative projected z-moment m0..m3 defect of the signed particle-hole model on the infinity directions <= threshold; NOT_MEASURED for a finite-state bank without odd moments", 1.0e-10),
+    "model_reciprocity": ("not applicable: time-reversal-broken samples carry no transpose symmetry", None),
+}.items():
+    shared_real_pole_gates_ordered_v1[_name] = {
+        "name": _name, "predicate": _predicate, "threshold": _threshold,
+        "version": ORDERED_GATE_VERSION}
+ORDERED_GATE_HASH = table_hash(shared_real_pole_gates_ordered_v1)
 
-def gate_receipt(name, value=None, *, passed=None, reason):
+
+def gate_receipt(name, value=None, *, passed=None, reason, table=None):
     """Record a consumer-measured gate; missing data can never produce PASS.
 
     Parameters
@@ -122,7 +140,7 @@ def gate_receipt(name, value=None, *, passed=None, reason):
         if isinstance(item, (list, tuple)):
             return not item or any(missing(v) for v in item)
         return item is None
-    row = shared_real_pole_gates_v1_r3b[name]
+    row = (shared_real_pole_gates_v1_r3b if table is None else table)[name]
     status = "NOT_MEASURED" if missing(value) or passed is None else (
         "PASS" if passed else ("WARN" if row.get("diagnostic") else "FAIL"))
     return {"predicate": row["predicate"], "name": name, "version": row["version"],
@@ -366,22 +384,25 @@ class CapacityLedger:
         return snapshot
 
 
-def construction_receipt(measurements=None, *, capacity=None, capacity_entry_start=None):
+def construction_receipt(measurements=None, *, capacity=None, capacity_entry_start=None,
+                         ordered=False):
     """Complete receipt skeleton, explicitly marking every absent gate unmeasured.
 
     ``measurements`` maps names to ``gate_receipt`` keyword dictionaries. Dense
     consumers supply measurements; creating this skeleton certifies no physics.
     """
     measurements = {} if measurements is None else measurements
-    unknown = set(measurements) - set(shared_real_pole_gates_v1_r3b)
+    table = shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
+    unknown = set(measurements) - set(table)
     if unknown:
         raise ValueError(f"unknown shared-pole receipt predicates: {sorted(unknown)}")
     result = {"schema": RECEIPT_SCHEMA, "recipe_version": RECIPE_VERSION,
-            "recipe_hash": RECIPE_HASH, "gate_version": GATE_VERSION,
-            "gate_hash": GATE_HASH,
-            "gates": [gate_receipt(name, **measurements.get(
+            "recipe_hash": RECIPE_HASH,
+            "gate_version": ORDERED_GATE_VERSION if ordered else GATE_VERSION,
+            "gate_hash": ORDERED_GATE_HASH if ordered else GATE_HASH,
+            "gates": [gate_receipt(name, table=table, **measurements.get(
                 name, {"reason": "measurement not supplied"}))
-                for name in shared_real_pole_gates_v1_r3b]}
+                for name in table]}
     if capacity is not None:
         if not isinstance(capacity, CapacityLedger):
             raise TypeError("construction receipt capacity must be the map's CapacityLedger")
@@ -397,7 +418,7 @@ def construction_receipt(measurements=None, *, capacity=None, capacity_entry_sta
         aggregate = max(values, default=None)
         result['gates'] = [r for r in result['gates'] if r['name'] != 'capacity']
         result['gates'].append(gate_receipt(
-            'capacity', aggregate, passed=(all(r['status'] == 'PASS' for r in rows)
+            'capacity', aggregate, table=table, passed=(all(r['status'] == 'PASS' for r in rows)
                                            and measured['status'] != 'FAIL'),
             reason='plan-time ledger rows; independent measured peak recorded separately'))
         if (result['gates'][-1]['status'] == 'FAIL'
@@ -545,8 +566,8 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
             or not np.all(np.isfinite(energies))
             or not np.all(np.isfinite(occupations))):
         raise ValueError("GATE shared_pole_census: got: inconsistent/nonfinite energy or occupation table; want: current full-BZ logical tables; why: physical charge needs authenticated weights")
-    if int(meta.nspinor) != 1 or int(meta.nspin) != 1 or not trs_allowed:
-        raise ValueError("GATE shared_pole_representation: got: non-scalar or TRS-broken census; want: nspin=nspinor=1 and TRS allowed; why: both-endpoint spin action is not yet supported")
+    if int(meta.nspinor) != 1 or int(meta.nspin) != 1:
+        raise ValueError("GATE shared_pole_representation: got: non-scalar census; want: nspin=nspinor=1 (TRS-broken scalar decks take the ordered route); why: both-endpoint spin action is not yet supported")
     capacity = float(state_capacity)
     if capacity != 2.0:
         raise ValueError("GATE shared_pole_census: got: scalar state capacity other than 2; want: authenticated spin-restricted scalar capacity; why: charge normalization")
@@ -801,7 +822,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'role_codes': dict(ROLE_CODES),
         'recipe_version': version, 'recipe_hash': table,
         'support_sites_override': '' if override is None else override['text'],
-        'gate_version': GATE_VERSION, 'gate_hash': GATE_HASH,
+        'gate_version': GATE_VERSION if census['trs_allowed'] else ORDERED_GATE_VERSION,
+        'gate_hash': GATE_HASH if census['trs_allowed'] else ORDERED_GATE_HASH,
         'accuracy': tier, 'accuracy_status': 'NOT_MEASURED',
         'accuracy_reason': 'resolved geometry has no authenticated matching campaign receipt',
         'eta_ev': eta, 'height_ev': height, 'height_ry': height / RYD_TO_EV,

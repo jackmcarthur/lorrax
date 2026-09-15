@@ -165,6 +165,59 @@ def assemble_shared_pole_pencil(states, infinity, *, matmul):
     return _hermitian(g), _hermitian(h), jnp.concatenate((output, oi), axis=-1)
 
 
+def ordered_infinity_pencil_column(finite, infinity, *, matmul):
+    """Infinity rows of the linear particle-hole pencil (z s3 - M).
+
+    ``finite=(z,Q,O)`` carries complex z in Ry ([R] or [b,R]) and [b,n,R]
+    face panels. ``infinity=(Q_inf, M0 Q_inf, M1 Q_inf, M2 Q_inf, M3 Q_inf)``
+    with physical z-moments Wc(z) = sum_n 2 M_n z^-(n+1); M0 and M2 are odd
+    under time reversal. States are k0 = s3 C^H Q and k1 = s3 M s3 C^H Q.
+    Returns G/H infinity-finite rows [b,2r,R], the [b,2r,2r] infinity
+    blocks and the outputs C k [b,n,2r]. No full moment matrix is retained.
+    """
+    z, q, output = finite
+    qi, m0qi, m1qi, m2qi, m3qi = infinity
+    z = jnp.broadcast_to(z, (q.shape[0], q.shape[-1]))[:, None, :]
+    fi = matmul(qi, output, transa="C")
+    q0 = 2 * matmul(m0qi, q, transa="C")
+    q1 = 2 * matmul(m1qi, q, transa="C")
+    g = jnp.concatenate((fi, fi * z - q0), axis=-2)
+    h = jnp.concatenate((fi * z - q0, fi * z * z - q0 * z - q1), axis=-2)
+    p0, p1, p2, p3 = (2 * matmul(qi, m, transa="C") for m in (m0qi, m1qi, m2qi, m3qi))
+    gii = jnp.concatenate((jnp.concatenate((p0, p1), axis=-1),
+                           jnp.concatenate((p1, p2), axis=-1)), axis=-2)
+    hii = jnp.concatenate((jnp.concatenate((p1, p2), axis=-1),
+                           jnp.concatenate((p2, p3), axis=-1)), axis=-2)
+    return g, h, gii, hii, 2 * jnp.concatenate((m0qi, m1qi), axis=-1)
+
+
+def assemble_ordered_shared_pole_pencil(states, infinity, *, matmul):
+    """Assemble G=X^H s3 X, H=X^H M X and O=C X for time-reversal-broken data.
+
+    ``states`` holds ``(z,Q,WQ,dW/dz Q)`` with complex z in Ry, not s=z**2.
+    The resolvent-identity column of ``finite_pencil_column`` is exact for
+    the linear pencil (z s3 - M) as written. ``infinity`` is None for a
+    finite-state bank, else the five panels of
+    ``ordered_infinity_pencil_column``. Returns Hermitian G, H and O.
+    """
+    q = jnp.concatenate([state[1] for state in states], axis=-1)
+    output = jnp.concatenate([state[2] for state in states], axis=-1)
+    derivative = jnp.concatenate([state[3] for state in states], axis=-1)
+    z = jnp.concatenate([jnp.broadcast_to(jnp.asarray(state[0], jnp.complex128),
+                         (state[1].shape[0], state[1].shape[-1]))
+                         for state in states], axis=-1)
+    finite = (z, q, output)
+    g, h = finite_pencil_column(finite, (z, q, output, derivative), matmul=matmul)
+    if infinity is not None:
+        gi, hi, gii, hii, oi = ordered_infinity_pencil_column(finite, infinity, matmul=matmul)
+        g = jnp.concatenate((jnp.concatenate((g, _adjoint(gi)), axis=-1),
+                             jnp.concatenate((gi, gii), axis=-1)), axis=-2)
+        h = jnp.concatenate((jnp.concatenate((h, _adjoint(hi)), axis=-1),
+                             jnp.concatenate((hi, hii), axis=-1)), axis=-2)
+        output = jnp.concatenate((output, oi), axis=-1)
+    return _hermitian(g), _hermitian(h), output
+
+
 def _metric_inverse_root(metric, *, matmul, tolerance):
     """Correct a dimensionless Hermitian metric by coupled Newton–Schulz.
 
@@ -295,6 +348,135 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     # Undo equilibration in the coefficient map used by retained-space checks.
     coefficients = matmul(z, rotation) * active[:, None, :]
     return (b, poles, active), diagnostics, scale[:, :, None] * coefficients
+
+
+def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
+    """H-metric Ritz reduction of the particle-hole pencil.
+
+    ``pencil=(G,H,O)`` from ``assemble_ordered_shared_pole_pencil``. H is
+    the definite member, so today's diagonal, normalized-spectrum validity,
+    keep cut and metric correction apply to H. With Y^H H Y = I and
+    Y^H G Y = diag(mu), Wc_r(z) = sum_j c_j c_j^H/(z mu_j - 1), c = O Y.
+    Poles 1/mu are real because mu is a Hermitian spectrum; each residue is
+    sign(mu) times a PSD matrix; poles are real iff H > 0 on the retained span.
+    Positive modes form the stored parent model b = sqrt(2) c/mu,
+    poles2 = mu**-2 (residue b b^H/(2 Omega), as the even store). Negative
+    modes belong to the parent of -q and are kept only in the signed model.
+    |mu| <= keep*max|mu| (poles at infinity: a constant -c c^H; dropped
+    directions give c = 0) is excluded and its output weight is reported.
+
+    Returns (b [b,n,R], poles2 [b,R], active [b,R]), the signed model
+    (c [b,n,R], mu [b,R], retained [b,R]) and device diagnostics.
+    """
+    g, h, output = pencil
+    diagonal = jnp.real(jnp.diagonal(h, axis1=-2, axis2=-1))
+    diagonal_ok = jnp.all(jnp.where(active_columns,
+                                  jnp.isfinite(diagonal) & (diagonal > 0),
+                                  diagonal == 0), axis=-1)
+    scale = jnp.where(active_columns,
+                      1 / jnp.sqrt(jnp.where(diagonal > 0, diagonal, 1)), 0)
+    g = scale[:, :, None] * g * scale[:, None, :]
+    h = scale[:, :, None] * h * scale[:, None, :]
+    output = output * scale[:, None, :]
+    gamma, u = eigh(_hermitian(h))
+    largest = gamma[:, -1]
+    ratio = gamma[:, 0] / jnp.where(largest > 0, largest, 1)
+    gram_ok = ((largest > 0) & jnp.all(jnp.isfinite(gamma), axis=-1)
+               & (ratio >= gates["normalized_gram_validity"]["threshold"]))
+    keep = gamma > gates["normalized_gram_keep"]["threshold"] * largest[:, None]
+    keep = keep & (largest[:, None] > 0)
+    count = jnp.sum(keep, axis=-1, dtype=jnp.int64)
+    z = u * (keep / jnp.sqrt(jnp.where(keep, gamma, 1)))[:, None, :]
+    metric = matmul(z, matmul(h, z), transa="C")
+    null_identity = _diagonal_face(~keep, h)
+    correction, metric_ok, metric_diagnostics = _metric_inverse_root(
+        _hermitian(metric) + null_identity, matmul=matmul,
+        tolerance=gates["retained_subspace_moments"]["threshold"])
+    z = matmul(z, correction) * keep[:, None, :]
+    metric = matmul(z, matmul(h, z), transa="C")
+    t = _hermitian(matmul(z, matmul(g, z), transa="C"))
+    mu, rotation = eigh(t)
+    c = matmul(output, matmul(z, rotation))
+    cut = gates["normalized_gram_keep"]["threshold"] * jnp.max(jnp.abs(mu), axis=-1)
+    retained = jnp.abs(mu) > cut[:, None]
+    positive = retained & (mu > 0)
+    weight = jnp.sum(jnp.abs(c) ** 2, axis=-2)
+    total = jnp.sum(weight, axis=-1)
+    infinite = jnp.sum(jnp.where(retained, 0, weight), axis=-1) / jnp.where(total > 0, total, 1)
+    safe = jnp.where(positive, mu, 1)
+    b = c * (jnp.sqrt(2.0) / safe * positive)[:, None, :]
+    poles2 = jnp.where(positive, 1 / safe**2, 1.0)
+    wanted_metric = _diagonal_face(keep, h)
+    diagnostics = {
+        **metric_diagnostics,
+        "gram_diagonal_positive": diagonal_ok,
+        "gram_valid": gram_ok,
+        "gram_min_relative": ratio,
+        "gram_spectrum_relative": gamma / jnp.where(largest > 0, largest, 1)[:, None],
+        "retained_rank": count,
+        "gram_condition": largest / jnp.min(jnp.where(keep, gamma, jnp.inf), axis=-1),
+        "retained_metric_positive": metric_ok,
+        "retained_metric_relative": jnp.linalg.norm(metric - wanted_metric, axis=(-2, -1))
+        / jnp.sqrt(jnp.maximum(count, 1)),
+        "positive_count": jnp.sum(positive, axis=-1, dtype=jnp.int64),
+        "negative_count": jnp.sum(retained & (mu < 0), axis=-1, dtype=jnp.int64),
+        "infinite_weight_fraction": infinite,
+        "infinite_weight_ok": infinite <= gates["zero_ritz_policy"]["threshold"]["max_dropped_weight_fraction"],
+    }
+    return (b, poles2, positive), (c, mu, retained), diagnostics
+
+
+def ordered_moment_identity(signed, infinity, *, matmul):
+    """Projected z-moments of the signed model against the bank's M0..M3.
+
+    m_n(model) = sum_j c_j c_j^H mu_j^-(n+1) on Q_inf, relative Frobenius
+    defect scaled by |Q^H 2M1 Q|. Galerkin with k0, k1 in the span matches
+    n = 0..3. ``infinity`` is the five-panel tuple; returns {m0..m3: [b]}.
+    """
+    c, mu, retained = signed
+    qi, *moments = infinity
+    a = matmul(qi, c, transa="C")
+    inverse = jnp.where(retained, 1 / jnp.where(retained, mu, 1), 0)
+    scale = jnp.linalg.norm(2 * matmul(qi, moments[1], transa="C"), axis=(-2, -1))
+    rows = {}
+    for n, m in enumerate(moments):
+        exact = 2 * matmul(qi, m, transa="C")
+        value = matmul(a * (inverse ** (n + 1))[:, None, :], a, transb="C")
+        rows[f"m{n}"] = jnp.linalg.norm(value - exact, axis=(-2, -1)) / jnp.where(scale > 0, scale, 1)
+    return rows
+
+
+def ordered_shared_pole_value(model, partner, z, *, matmul):
+    """Evaluate the ordered carrier Wc_p(z) from stored positive-pole factors.
+
+    ``model`` and ``partner`` are (b [b,n,K], poles2 [b,K], active [b,K]) for
+    parent p and for the parent of -q (the same tuple at q = -q). Returns
+    b diag(1/(2W(z-W))) b^H - conj(b~) diag(1/(2W~(z+W~))) b~^T. At p = -q
+    this is sum Re(bb^H)/(z^2-W^2) + i Im(bb^H) z/(W(z^2-W^2)): the odd channel
+    is one extra contraction of the same vector, with no extra storage.
+    """
+    b, poles2, active = model
+    bt, poles2t, activet = partner
+    w = jnp.sqrt(jnp.where(active, poles2, 1.0))
+    wt = jnp.sqrt(jnp.where(activet, poles2t, 1.0))
+    d = jnp.where(active, 1 / (2 * w * (z - w)), 0)
+    dt = jnp.where(activet, 1 / (2 * wt * (z + wt)), 0)
+    return (matmul(b * d[:, None, :], b, transb="C")
+            - matmul(bt.conj() * dt[:, None, :], bt.conj(), transb="C"))
+
+
+def signed_shared_pole_passivity(signed, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, gates):
+    """Hermitian-part passivity of the signed particle-hole model at z = i eta.
+
+    -Wc_r(i eta) = sum_j c_j c_j^H/(1 - i eta mu_j); its Hermitian part sums
+    both signs of real frequency and lies in [0, I] after V whitening for a
+    stable response. The anti-Hermitian part is the odd channel: reported.
+    """
+    c, mu, retained = signed
+    whitened = matmul(inverse_coulomb_sqrt, c)
+    weight = jnp.where(retained, 1 / (1 - 1j * eta_ry * mu), 0)
+    response = matmul(whitened * weight[:, None, :], whitened, transb="C")
+    return _passivity_response_checks(response, eigh=eigh, gates=gates)
 
 
 def retained_moment_identity(pencil, coefficients, model, infinity_selector, *, matmul):
@@ -444,9 +626,10 @@ def _passivity_response_checks(response, *, eigh, gates):
     anti = anti / jnp.where(norm > 0, 2 * norm, 1)
     values, _ = eigh(herm)
     minimum, maximum = values[:, 0], values[:, -1]
+    limit = gates["passivity"]["threshold"].get("antihermitian_relative_max")
     passed = ((minimum >= gates["passivity"]["threshold"]["eigenvalue_min"])
               & (maximum <= gates["passivity"]["threshold"]["eigenvalue_max"])
-              & (anti <= gates["passivity"]["threshold"]["antihermitian_relative_max"])
+              & (True if limit is None else anti <= limit)
               & jnp.all(jnp.isfinite(values), axis=-1) & jnp.isfinite(anti))
     return {"passivity": passed, "passivity_min": minimum,
             "passivity_max": maximum, "passivity_antihermitian_relative": anti}
@@ -552,7 +735,7 @@ def _stack_model_kernel(mesh):
 
 
 def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
-                      column_extent, logical_n, admit, infinity_carrier):
+                      column_extent, logical_n, admit, infinity_carrier, ordered=False):
     """Select each q row independently from a bounded batch of fitted samples.
 
     ``read_sample`` returns W/dW [b,n,n] faces. Only spectra cross the host;
@@ -592,17 +775,23 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
             widths = tuple(int(v.shape[-1]) for v in values)
             if any(width < 1 or width > logical_n for width in widths):
                 raise ValueError(f"GATE shared_pole_directions: got: ranks {widths}; want: 1..{logical_n}; why: empty or padded physical direction set")
-            s = _sample_point(recipe, int(sample_id)) ** 2
+            s = (_sample_point(recipe, int(sample_id)) if ordered
+                 else _sample_point(recipe, int(sample_id)) ** 2)
             # W(s*)=W(s).H: its right singular space is the LEFT space
             # of W(s). Use WQ=U sigma without another selection or transport.
             # Column equilibration removes sigma; this also preserves the
             # conjugate space when the underlying response is real symmetric.
-            for conjugate in ((False, True) if kind == "line" and s.imag != 0 else (False,)):
+            # Ordered data: nodes are z; every role takes its conjugate partner
+            # (Wc(conj z) = Wc(z)^H holds without time reversal) and actions
+            # use dW/dz = 2 z dW/ds.
+            for conjugate in ((False, True) if (ordered or kind == "line") and s.imag != 0 else (False,)):
                 admit(largest_side() + q_batch.shape[-1])
                 transa = "C" if conjugate else "N"
                 direction = states[-1][2] if conjugate else q_batch
                 output = matmul(w, direction, transa=transa)
                 action = matmul(derivative, direction, transa=transa)
+                if ordered:
+                    action = action * (2 * (s.conjugate() if conjugate else s))
                 states.append((s.conjugate() if conjugate else s, direction, output, action))
                 counts.append(widths)
                 for i, width in enumerate(widths):
@@ -691,6 +880,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         from gw.gw_config import linalg_resolution
         from gw.shared_pole_recipe import (
             construction_receipt, shared_real_pole_gates_v1_r3b as gates,
+            shared_real_pole_gates_ordered_v1,
         )
         from common.units import RYD_TO_EV
         from gw.w_isdf import response_coulomb_powers
@@ -698,8 +888,12 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     timing.fence("spole.setup")
     with timing.section("spole.setup"):
         recipe = meta.shared_pole_recipe
-        if int(meta.nspinor) != 1 or not bool(bank["tables"]["sym"].trs_allowed):
-            raise ValueError("GATE shared_pole_representation: got: non-scalar or TRS-broken state; want: scalar with authenticated TRS; why: shared even-s representation")
+        # Time-reversal-broken scalar states take the ordered particle-hole route.
+        ordered = not bool(bank["tables"]["sym"].trs_allowed)
+        if int(meta.nspinor) != 1:
+            raise ValueError("GATE shared_pole_representation: got: non-scalar state; want: scalar (TRS-broken scalar states take the ordered route); why: both-endpoint spin action is not yet supported")
+        if ordered:
+            gates = shared_real_pole_gates_ordered_v1
         resolution = linalg_resolution({"linalg": config.backend.linalg})
         identity = bank["identity"]
         ledger = meta.shared_pole_capacity
@@ -754,6 +948,11 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         for sample_id in (*recipe["fit_ids"], *recipe["held_ids"]):
             if _sample_point(recipe, sample_id) != _sample_point(stored_recipe, sample_id):
                 raise ValueError("GATE shared_pole_bank_state: got: changed z; want: current physical sample point; why: recipe hashes alone do not bind resolved points")
+        if bool(header.get("ordered", False)) != ordered:
+            raise ValueError(f"GATE shared_pole_representation: got: bank ordered={bool(header.get('ordered', False))} with trs_allowed={not ordered}; want: an ordered bank exactly when time reversal is broken (both orientations, -q as its own parent); why: particle-hole pairing across parents")
+        # Odd z-moments M0/M2 certify the ordered infinity block; a finite-state
+        # ordered bank builds without it and records the moments NOT_MEASURED.
+        odd_moments = ordered and bool(header.get("odd_moments", False))
 
         def capacity(side, *, phase=None, sample_batch=1, transpose_staging=0):
             nonlocal current_side, current_phase, workspace
@@ -836,7 +1035,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         from gw.shared_pole_local import pack_parent_panels, local_parent_reducer
         # Local dense algebra assigns independent parents to mesh ranks. The
         # distributed plan keeps its one-parent face-tiled execution schedule.
-        batch_limit = mesh_divisor(mesh_xy) if resolution.layout == "local" else 1
+        # The ordered route runs the one-parent distributed schedule.
+        local_layout = resolution.layout == "local" and not ordered
+        batch_limit = mesh_divisor(mesh_xy) if local_layout else 1
         nq = int(header["bank_shape"]["nq"])
     for q_start in range(0, nq, batch_limit):
         timing.fence("spole.batch_admission")
@@ -850,7 +1051,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         with timing.section("spole.scratch_read"):
             with SlabIO(moments["path"], mode="r", mesh=mesh_xy) as moment_io:
                 exact = read_shared_pole_bank(moment_io, span, meta=meta,
-                                              header=moment_header, fields=("M1", "M3"))
+                                              header=moment_header,
+                                              fields=("M0", "M1", "M2", "M3") if odd_moments else ("M1", "M3"))
         timing.fence("spole.infinity_selection")
         with timing.section("spole.infinity_selection"):
             width = min(logical_n, max(1, int(recipe["infinity_width"])))
@@ -858,7 +1060,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 exact["M1"], width, eigh_plan=eig, column_extent=column_extent,
                 multiplet_tol=recipe["multiplet_relative_tolerance"])
             capacity(qi.shape[-1], phase="selection")
-            infinity = (qi, mm(exact["M1"], qi), mm(exact["M3"], qi))
+            infinity = ((qi, mm(exact["M0"], qi), mm(exact["M1"], qi), mm(exact["M2"], qi), mm(exact["M3"], qi))
+                        if odd_moments else (qi, mm(exact["M1"], qi), mm(exact["M3"], qi)))
             del exact
         with SlabIO(bank["path"], mode="r", mesh=mesh_xy) as bank_io:
             timing.fence("spole.sample_batch_read")
@@ -882,7 +1085,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 states, counts, roles = _direction_states(
                     read_sample, recipe, eigh_plan=eig, svd_plan=svd, matmul=mm,
                     column_extent=column_extent, logical_n=logical_n, admit=capacity,
-                    infinity_carrier=qi.shape[-1])
+                    infinity_carrier=qi.shape[-1], ordered=ordered)
         timing.fence("spole.direction_pack_and_drain")
         with timing.section("spole.direction_pack_and_drain"):
             del samples
@@ -890,7 +1093,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             retained_panels = (*infinity, *(v for st in states for v in st[1:]))
             finite_width = max(sum(row['carrier_width'] for row in parent) for parent in roles)
             infinity_width = infinity[0].shape[-1]
-            batch_width = mesh_divisor(mesh_xy) if resolution.layout == "local" else 1
+            batch_width = mesh_divisor(mesh_xy) if local_layout else 1
             # The permutation temporarily has the sum of the batched port
             # carriers, before compaction to the largest original parent side.
         timing.fence("spole.reduction_admission")
@@ -901,7 +1104,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         with timing.section("spole.panel_pack"):
             packed, extents = pack_parent_panels(
                 states, infinity, counts, [v.shape[-1] for v in infinity_values],
-                mesh_xy=mesh_xy, parent_batch=batch_width, layout=resolution.layout)
+                mesh_xy=mesh_xy, parent_batch=batch_width,
+                layout=resolution.layout if not ordered else "distributed")
             for i, values in enumerate(infinity_values):
                 ri = column_extent(values.shape[-1])
                 parent_infinity = _parent_panel_slice(mesh_xy, ri)(infinity, np.int32(i))
@@ -909,7 +1113,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
             del states, infinity, qi, infinity_values, counts, roles, parent_infinity
             retained_panels = (*jax.tree.leaves(packed), *(item[4] for item in pending))
             batch_results = None
-        if resolution.layout == "local":
+        if local_layout:
             timing.fence("spole.reduction_admission")
             with timing.section("spole.reduction_admission"):
                 price = capacity(finite_width + infinity_width, phase="reduction")
@@ -932,6 +1136,12 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 # already have the original finite and infinity extents.
                 iq, _, _, _, directions, row_roles = pending[0]
                 finite, infinity, active, _columns = jax.tree.map(lambda a: a[:1], packed)
+                if ordered:
+                    # k0 and k1 double the infinity columns; a finite-state bank has none.
+                    rf = active.shape[-1] - infinity[0].shape[-1]
+                    active = (jnp.concatenate((active, active[:, rf:]), axis=-1)
+                              if odd_moments else active[:, :rf])
+                    infinity = infinity if odd_moments else None
                 pending = [(iq, [finite], infinity, active, directions, row_roles)]
                 del packed
         batch_checks = None
@@ -977,10 +1187,18 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 span = (q, q + 1)
                 if batch_results is None:
                     price = capacity(active_columns.shape[-1], phase="reduction")
-                    pencil = assemble_shared_pole_pencil(states, infinity, matmul=mm)
-                    reduce_eigh = eigenplan(pencil[0].shape[-1])
-                    model, reduction, coefficients = reduce_shared_pole_pencil(
-                        pencil, active_columns, eigh=reduce_eigh.batched, matmul=mm, gates=gates)
+                    if ordered:
+                        pencil = assemble_ordered_shared_pole_pencil(states, infinity, matmul=mm)
+                        reduce_eigh = eigenplan(pencil[0].shape[-1])
+                        model, signed, reduction = reduce_ordered_shared_pole_pencil(
+                            pencil, active_columns, eigh=reduce_eigh.batched, matmul=mm, gates=gates)
+                        ordered_retained = (ordered_moment_identity(signed, infinity, matmul=mm)
+                                            if odd_moments else {})
+                    else:
+                        pencil = assemble_shared_pole_pencil(states, infinity, matmul=mm)
+                        reduce_eigh = eigenplan(pencil[0].shape[-1])
+                        model, reduction, coefficients = reduce_shared_pole_pencil(
+                            pencil, active_columns, eigh=reduce_eigh.batched, matmul=mm, gates=gates)
                 else:
                     model, reduction, zero, retained = _parent_result_slice(mesh_xy)(
                         batch_results, np.int32(slot))
@@ -998,9 +1216,13 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                             "and valid diagonal/retained metric; why: no PSD repair")
                 if batch_results is None:
                     model, zero = apply_shared_pole_zero_policy(model, gates=gates)
+                    if ordered:
+                        zero["zero_policy"] = zero["zero_policy"] & reduction["infinite_weight_ok"]
                 if not bool(jnp.all(zero["zero_policy"])):
                     raise ValueError(f"GATE shared_pole_zero_ritz: got: failed at q={q}; want: finite positive response within dropped-weight budget; why: no pole clipping")
-                if batch_results is None:
+                if batch_results is None and ordered:
+                    retained = ordered_retained
+                elif batch_results is None:
                     # E selects the last infinity block of X. Build it as a face array;
                     # only the small row/column coordinate vectors are replicated.
                     r, ri = pencil[0].shape[-1], qi.shape[-1]
@@ -1011,8 +1233,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 if not all(bool(jnp.all(value <= gates["retained_subspace_moments"]["threshold"]))
                            for value in retained.values()):
                     raise ValueError(f"GATE shared_pole_retained_moments: got: failed at q={q}; want: projected latent moment identity <=1e-10; why: corrected Ritz algebra")
-                if batch_results is None:
+                if batch_results is None and not ordered:
                     del pencil, coefficients, selector
+                elif ordered:
+                    del pencil
                 r = model[0].shape[-1]
                 del active_columns
                 capacity(model[0].shape[-1], phase="model")
@@ -1029,9 +1253,12 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                         meta, config, mesh_xy=mesh_xy, bank_io=bank, q_span=span)
                 timing.fence("spole.passivity")
                 with timing.section("spole.passivity"):
-                    passive = shared_pole_passivity(model, inverse_sqrt,
+                    passive = (signed_shared_pole_passivity(
+                                   signed, inverse_sqrt, eta_ry=recipe["eta_ev"] / RYD_TO_EV,
+                                   matmul=mm, eigh=eig.batched, gates=gates) if ordered else
+                               shared_pole_passivity(model, inverse_sqrt,
                                                    eta_ry=recipe["eta_ev"] / RYD_TO_EV,
-                                                   matmul=mm, eigh=eig.batched, gates=gates)
+                                                   matmul=mm, eigh=eig.batched, gates=gates))
                     del coulomb_sqrt, inverse_sqrt
             else:
                 timing.fence("spole.passivity")
@@ -1051,7 +1278,15 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                                   header=moment_header, fields=("M1", "M3"))
             timing.fence("spole.moment_diagnostics")
             with timing.section("spole.moment_diagnostics"):
-                moment_defects = model_diagnostics(model, exact, qi)
+                if ordered:
+                    # Signed model moments: M1 = sum c c^H mu^-2 / 2, M3 = sum c c^H mu^-4 / 2.
+                    c_signed, mu_signed, kept = signed
+                    inverse = jnp.where(kept, 1 / jnp.where(kept, jnp.abs(mu_signed), 1), 0)
+                    moment_defects = model_diagnostics(
+                        (c_signed * inverse[:, None, :], inverse**2, kept), exact, qi)
+                    del c_signed, mu_signed, kept, inverse
+                else:
+                    moment_defects = model_diagnostics(model, exact, qi)
                 del exact, qi
             timing.fence("spole.held")
             with timing.section("spole.held"):
@@ -1067,27 +1302,36 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                             b, poles, mask = model
                             s = _sample_point(recipe, int(sample_id)) ** 2
                             weights = jnp.where(mask, 1 / (s-poles), 0)
+                            if ordered:
+                                # Signed particle-hole model at z; dW/ds = (dW/dz)/(2z).
+                                b, mu_signed, mask = signed
+                                z = _sample_point(recipe, int(sample_id))
+                                weights = jnp.where(mask, 1 / (z * mu_signed - 1), 0)
+                                derivative = jnp.where(mask, -mu_signed / (z * mu_signed - 1)**2 / (2 * z), 0)
                             diagnostic = {"sample_id": int(sample_id)}
-                            for field, weight in (("Wc", weights), ("dWc_ds", -weights**2)):
+                            for field, weight in (("Wc", weights), ("dWc_ds", derivative if ordered else -weights**2)):
                                 sample = samples[field][:, 0]
                                 value = mm(b * weight[:, None, :], b, transb="C")
                                 diagnostic[field] = float(jnp.linalg.norm(value-sample) /
                                                           jnp.maximum(jnp.linalg.norm(sample), jnp.finfo(jnp.float64).tiny))
-                                reciprocity.append(shared_pole_reciprocity(value, sample, gates=gates))
+                                if not ordered:
+                                    reciprocity.append(shared_pole_reciprocity(value, sample, gates=gates))
                             held.append(diagnostic)
                             del samples, sample, value
-                    reciprocity = {key: np.asarray([row[key] for row in reciprocity]).tolist()
-                                   for key in reciprocity[0]}
+                    reciprocity = ({key: np.asarray([row[key] for row in reciprocity]).tolist()
+                                    for key in reciprocity[0]} if not ordered else {})
                 else:
                     held = [{"sample_id": sample_id,
                              "Wc": float(batch_checks[1][slot, 0, i]),
                              "dWc_ds": float(batch_checks[1][slot, 1, i])}
                             for i, sample_id in enumerate(held_ids)]
                     reciprocity = {key: value[slot].tolist() for key, value in batch_checks[2].items()}
-                if not np.all(reciprocity["passed"]):
+                if not ordered and not np.all(reciprocity["passed"]):
                     raise ValueError(f"GATE shared_pole_model_reciprocity: got: {reciprocity} at q={q}; want: model preserves transpose symmetry of symmetric held data; why: conjugate-port closure must survive reduction")
             timing.fence("spole.receipts")
             with timing.section("spole.receipts"):
+                if ordered:
+                    del signed
                 b, poles, mask = model
                 counts = jnp.sum(mask, axis=-1, dtype=jnp.int64)
                 # All scalar reductions precede rank-selective store formatting.
@@ -1105,6 +1349,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                           for k, v in moment_defects.items()},
                        "held_W": held, "permutation": np.asarray(permutation).tolist(),
                        "storage_bytes": int(counts[0]) * (16*logical_n + 8)}
+                if ordered:
+                    row["ordered"] = {key: np.asarray(reduction[key]).tolist() for key in (
+                        "positive_count", "negative_count", "infinite_weight_fraction")}
+                    row["ordered"]["odd_moments"] = odd_moments
                 row["metric_inverse_root"] = {
                     name: np.asarray(reduction[name]).tolist() for name in (
                         "metric_initial_infinity_norm", "metric_inverse_root_iterations",
@@ -1114,19 +1362,19 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                     "normalized_gram_validity": dict(value=float(reduction["gram_min_relative"][0]), passed=True, reason="normalized Gram spectrum"),
                     "zero_ritz_policy": dict(value=float(zero["dropped_factor_weight_fraction"][0]), passed=True, reason="physical factor weight, sentinels excluded"),
                     "finite_factors_poles": dict(value=True, passed=True, reason="zero policy, active prefix and exact inert sentinels"),
-                    "passivity": dict(value={k: np.asarray(v).tolist() for k, v in passive.items() if k != "passivity"}, passed=True, reason="raw latent model; authenticated inverse Coulomb square root at current eta; projected operator not measured"),
-                    "retained_subspace_moments": dict(value=row["retained_moment_relative"], passed=True, reason="raw latent Ritz identity: A=Y†GE, B=YA; pencil B†(G,H)B/2 versus model A†(I,Lambda)A/2"),
+                    "passivity": dict(value={k: np.asarray(v).tolist() for k, v in passive.items() if k != "passivity"}, passed=True, reason=("signed particle-hole model, Hermitian part at i eta; anti-Hermitian part is the odd channel, reported" if ordered else "raw latent model; authenticated inverse Coulomb square root at current eta; projected operator not measured")),
+                    "retained_subspace_moments": dict(value=row["retained_moment_relative"], passed=True, reason=(("signed model z-moments m0..m3 on infinity directions" if odd_moments else "finite-state ordered bank without odd moments: infinity block uncertified") if ordered else "raw latent Ritz identity: A=Y†GE, B=YA; pencil B†(G,H)B/2 versus model A†(I,Lambda)A/2")),
                     "held_w": dict(value=held, passed=True, reason="raw latent W and dW/ds diagnostics; projected operator not measured; no universal acceptance threshold"),
-                    "model_reciprocity": dict(value=reciprocity, passed=True, reason="raw latent model sampled W/dW transpose symmetry, conditional on symmetric reference; projected operator not measured; applicability recorded per sample"),
+                    "model_reciprocity": (dict(value=None, passed=None, reason="not applicable: time-reversal-broken samples carry no transpose symmetry") if ordered else dict(value=reciprocity, passed=True, reason="raw latent model sampled W/dW transpose symmetry, conditional on symmetric reference; projected operator not measured; applicability recorded per sample")),
                     "full_m1_defect": dict(value=float(moment_defects["M1"]["full_relative"][0]), passed=bool(moment_defects["M1"]["full_relative"][0] <= gates["full_m1_defect"]["threshold"]), reason="raw latent model versus physical full M1; projected moment not measured; CD8 diagnostic band, never a refusal"),
                     "full_m3_defect": dict(value=float(moment_defects["M3"]["full_relative"][0]), passed=bool(moment_defects["M3"]["full_relative"][0] <= gates["full_m3_defect"]["threshold"]), reason="raw latent model versus physical full M3; projected moment not measured; CD8 diagnostic band, never a refusal"),
-                    "representation": dict(value={"nspinor": 1, "trs_allowed": True}, passed=True, reason="current typed symmetry capability"),
+                    "representation": dict(value=({"nspinor": 1, "trs_allowed": False, "ordered": True} if ordered else {"nspinor": 1, "trs_allowed": True}), passed=True, reason="current typed symmetry capability"),
                     "capacity": dict(value=price, passed=True, reason="conservative aggregate constructor live-set price"),
                     "sc_rebuild": dict(value=identity, passed=True, reason="current recipe/census authenticated; directions and Ritz model rebuilt"),
                 }
                 receipt = construction_receipt(
                     measurements, capacity=ledger,
-                    capacity_entry_start=receipt_entry_start)
+                    capacity_entry_start=receipt_entry_start, ordered=ordered)
                 receipt_entry_start = len(ledger.entries)
                 receipt.update(identity=identity, constructor=row)
             timing.fence("spole.export_prepare")
@@ -1152,7 +1400,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         with timing.section("spole.writer"):
             store_header = write_shared_pole_model(
                 output, public_b, poles, counts, q_span=span, meta=meta,
-                tables=bank["tables"], recipe=recipe, receipts=batch_receipt)
+                tables=bank["tables"], recipe=recipe, receipts=batch_receipt, ordered=ordered)
         timing.fence("spole.cleanup")
         with timing.section("spole.cleanup"):
             del public_b, poles, counts, ready_models

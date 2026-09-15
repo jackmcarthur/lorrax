@@ -309,12 +309,22 @@ def test_weight_refusal(weights):
                                state_capacity=2.,kweights=weights)
 
 
-@pytest.mark.parametrize('spin,trs',[(2,True),(1,False)])
+@pytest.mark.parametrize('spin,trs',[(2,True),(2,False)])
 def test_representation_refusal(spin,trs):
     c,w,m=fixture();m.nspinor=spin
     with pytest.raises(ValueError,match='GATE shared_pole_representation'):
         bind_shared_pole_census(w,m,occupation_state=None,trs_allowed=trs,
                                state_capacity=2.,kweights=[.5,.5])
+
+
+def test_trs_broken_scalar_census_takes_the_ordered_gate_table():
+    from gw.shared_pole_recipe import GATE_HASH, ORDERED_GATE_HASH
+    c,w,m=fixture()
+    assert resolve((c,w,m))['gate_hash']==GATE_HASH
+    bind_shared_pole_census(w,m,occupation_state=None,trs_allowed=False,
+                           state_capacity=2.,kweights=[.5,.5])
+    assert m.shared_pole_census['trs_allowed'] is False
+    assert resolve((c,w,m))['gate_hash']==ORDERED_GATE_HASH
 
 
 def test_current_map_rebind_at_30mev():

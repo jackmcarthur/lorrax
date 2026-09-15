@@ -206,7 +206,7 @@ def _check_basis(meta, header):
     return basis
 
 
-def _metadata(meta, tables, recipe, identity):
+def _metadata(meta, tables, recipe, identity, ordered=False):
     """Authenticate small scientific identities; no tensor data is gathered.
 
     ``tables`` is a plain mapping with canonical ``qirr`` (QirrTables),
@@ -218,8 +218,9 @@ def _metadata(meta, tables, recipe, identity):
     if int(meta.nspinor) != 1:
         _refuse(f"unsupported Nspinor={meta.nspinor}")
     sym = tables["sym"]
-    if not bool(sym.trs_allowed):
-        _refuse("TRS-broken representation is unsupported")
+    if bool(sym.trs_allowed) == bool(ordered):
+        _refuse("ordered representation requires authenticated broken TRS" if ordered
+                else "TRS-broken representation is unsupported")
     qt = tables["qirr"].logical(basis.n_logical).canonical()
     validate_qirr_tables(qt, qt.n_q_ibz, basis.n_logical)
     qids = np.asarray(tables["q_irr_full_idx"])
@@ -242,9 +243,11 @@ def _metadata(meta, tables, recipe, identity):
         "schema": SCHEMA, "identity": identity, "recipe": recipe,
         "recipe_hash": hashlib.sha256(_json(recipe).encode()).hexdigest(),
         # Keep the v1 disk spelling for existing models; its C denotes b.
-        "normalization": "Wc=C/(z_Ry^2-Lambda_Ry2)*C_dagger",
+        "normalization": ("Wc_q=sum_q C C_dagger/(2W(z_Ry-W))-sum_(-q) conj(C) C^T/(2W(z_Ry+W)), W=sqrt(Lambda_Ry2)"
+                          if ordered else "Wc=C/(z_Ry^2-Lambda_Ry2)*C_dagger"),
         "units": {"factor": "Ry^(3/2)", "poles2_ry2": "Ry^2"},
-        "representation": "scalar-trs-even-s", "parent_convention": "raw-parent",
+        "representation": "scalar-ordered-ph" if ordered else "scalar-trs-even-s",
+        "parent_convention": "raw-parent",
         "n_q_irr": qt.n_q_ibz, "n_q_full": qt.n_q_full,
         "n_mu_logical": basis.n_logical, "nspinor": 1,
         "centroid_digest": centroid_hash,
@@ -315,7 +318,7 @@ def _check_factor(b, poles2, K):
 
 @timing.timed("shared_pole_store.write_model")
 def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
-                            recipe, receipts):
+                            recipe, receipts, ordered=False):
     """Stage a bounded q batch and finalize automatically at complete K census.
 
     Parameters
@@ -339,7 +342,7 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         Staging plus final datasets use at most twice the compact payload bytes.
     """
     with timing.section("staging"):
-        header = _metadata(meta, tables, recipe, receipts["identity"])
+        header = _metadata(meta, tables, recipe, receipts["identity"], ordered)
         mesh = meta.mu_basis.mesh_xy
         want = NamedSharding(mesh, P(None, "x", None, "y"))
         if not isinstance(b, jax.Array) or not b.sharding.is_equivalent_to(want, 4):
