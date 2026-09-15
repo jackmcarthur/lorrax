@@ -62,11 +62,6 @@ layout='face', enable_active_range=False) -> GemmPlan``
     operands. The face layout uses cuBLASMp descriptor views; the axis layout
     uses local cuBLAS pointer views on CUDA and bounded JAX dot panels on CPU.
     See ``docs/dev/active_gemm_ranges.md``.
-``band_projection_plan(mesh, *, m, k, n, nq, dtype, layout="face",
-panel_columns=64, algorithm="auto")``
-    Plan A@B using bounded output-band panels for narrow outputs, retaining
-    the CUDA vendor route for wide outputs. Explicit panels preserve the
-    scratch bound; axis layout retains the existing local product.
 ``factor(op, A, mesh, ...) -> FactorToken`` / ``solve(token, B)``
     Factor once, back-solve many.  The token is opaque and carries the
     handle (scalapack's ``ipiv``, cuSOLVERMp's raw buffer, SLATE's
@@ -116,7 +111,6 @@ from distrib_la.matmul import (
     resolve_matmul_backend,
 )
 from distrib_la.matmul_plan import GemmPlan, gemm_plan, local_gemm_plan
-from distrib_la.projection import BandProjectionPlan, band_projection_plan
 from distrib_la.plan import (
     BATCHED_ROUTE_CHOICES,
     BATCHED_ROUTE_DEFAULT,
@@ -147,7 +141,6 @@ from distrib_la.resolve import (
 )
 
 __all__ = [
-    "BandProjectionPlan", "band_projection_plan",
     "LocalSubspacePlan", "plan_local_subspace", "plan_subspace",
     "plan_orthogonalization",
     # plan
