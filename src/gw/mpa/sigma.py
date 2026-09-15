@@ -432,7 +432,9 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 from runtime.aot_memory import aot_kernel_peak_bytes
                 def abstract(shape,dtype,spec):
                     return jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh_xy,spec))
-                shape = (hi-lo,meta.mu_basis.n_packed,int(header["nspinor"]),width)
+                # The stored operator is the spin-traced charge response: its
+                # factor spin axis is 1 on scalar and two-component decks.
+                shape = (hi-lo,meta.mu_basis.n_packed,1,width)
                 compiled = kernel.lower(
                     abstract(shape,np.complex128,P(None,"x",None,"y")),
                     abstract(shape,np.complex128,P(None,"y",None,"x")),
@@ -547,7 +549,9 @@ def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, local):
     """
     from symmetry_maps import endpoint_panel_cost
 
-    m, spin = int(meta.mu_basis.n_packed), int(header["nspinor"])
+    # Factors and W tiles are mu x mu charge operators (factor spin axis 1)
+    # on scalar and two-component decks; G alone carries the spinor axes.
+    m, spin = int(meta.mu_basis.n_packed), 1
     nq = int(header["n_q_irr"])
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
     parents = np.asarray(header["qirr"]["irr_idx_q"], dtype=np.int32)
@@ -634,7 +638,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
         # The physical logical-U bound applies to every NEW projector
         # matrix, even when orbit packing pads the endpoint carrier. The
         # pre-existing full-q Sigma output is accounted separately above.
-        projection_bytes = 16*projection_rows*(spin*meta.mu_basis.n_packed)**2/(px*py)
+        projection_bytes = 16*projection_rows*meta.mu_basis.n_packed**2/(px*py)
         if projection_bytes > U:
             continue
         two = _shared_pole_panel_cost(meta,header,b,2*multiple,mesh_xy=mesh_xy,local=local)
@@ -658,7 +662,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy):
     b,c = (1,1) if best is None else best[2:]
     footprint = _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,local=local)
     projection_rows = b if local else footprint["children"]
-    projection_bytes = 16*projection_rows*(spin*meta.mu_basis.n_packed)**2/(px*py)
+    projection_bytes = 16*projection_rows*meta.mu_basis.n_packed**2/(px*py)
     if projection_bytes > U:
         raise ValueError("GATE shared_pole_capacity: one parent star exceeds the all-P logical matrix bound")
     receipt = capacity.reserve(
@@ -691,7 +695,9 @@ def _shared_pole_inherited_peak(args, meta, *, mesh_xy, kernel_for):
     from runtime.aot_memory import aot_kernel_peak_bytes
 
     capacity = meta.shared_pole_capacity
-    m = int(meta.mu_basis.n_packed) * int(meta.nspinor)
+    # The spatial kernel broadcasts a mu x mu W over G's spinor axes
+    # (ppm_tau_kernel prep_w: ifftn(W_q)[:, None, :, None, :]).
+    m = int(meta.mu_basis.n_packed)
     q = int(meta.nk_tot)
     small = NamedSharding(mesh_xy, P())
     W = jax.ShapeDtypeStruct((1,q,m,m), np.complex128,

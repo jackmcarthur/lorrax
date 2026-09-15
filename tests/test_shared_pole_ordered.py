@@ -469,3 +469,103 @@ def test_sigma_hole_branch_routes_minus_q_transpose_at_generic_q():
         assert rel(plus[row], lplus) < 1e-12
         assert rel(valence[row], lminus) < 1e-12
     assert rel(valence[1], plus[1].T) > 1e-2
+
+
+def test_two_component_ordered_store_synthesizes_lehmann_sums(tmp_path):
+    """Two-component magnet store (N_spinor = 2, time reversal broken) on a (3,1,1)
+    grid with independent q/-q parents and Gamma. The charge operator is mu x mu, so
+    the stored factor keeps spin axis 1 and the header records the source N_spinor.
+    Written and read back through the store, Sigma's synthesis gives W_+(q) and the
+    hole kernel W_+(-q)^T; both equal the exact plants' Lehmann sums (< 1e-12)."""
+    import jax
+    from types import SimpleNamespace
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from lxkit.testing import require_devices
+    from common.centroid_basis import PackedCentroidBasis
+    from symmetry_maps import QirrTables, centroid_source_map_and_wrap
+    from file_io import shared_pole_store as store
+    from file_io.slab_io import SlabIO
+    from gw.shared_pole_recipe import CapacityLedger, shared_real_pole_v1_r3b
+    from gw.qgrid_symmetry import shared_pole_operator_realizer
+    from gw.mpa.sigma import (
+        shared_pole_hole_kernel, shared_pole_minus_q_index, synthesize_shared_pole_parents)
+    require_devices(4, "cpu")
+    mesh = Mesh(np.asarray(jax.devices("cpu")[:4]).reshape(2, 2), ("x", "y"))
+    rotations = np.eye(3, dtype=np.int32)[None]
+    sym = SimpleNamespace(sym_matrices=rotations, translations=np.zeros((1, 3)),
+                          trs_allowed=False, active_symmetry_rows=np.arange(1, dtype=np.int32),
+                          operation_typing_source="planted two-component magnet fixture")
+    sym.operation_rows = lambda rows: (
+        np.asarray([rotations[0] * (-1 if r >= 1 else 1) for r in rows]),
+        np.zeros((len(rows), 3)), np.asarray(rows) >= 1)
+    sym.spinor_action = lambda rows, nspinor: np.ones((len(rows), 1, 1), np.complex128)
+    cents = np.asarray([[1, 0, 0], [0, 1, 0], [2, 0, 0], [0, 2, 0], [3, 1, 0], [1, 3, 0], [2, 2, 0]], np.int32)
+    grid = (4, 4, 1)
+    basis = PackedCentroidBasis.build(cents, sym, grid, mesh)
+    perm, wraps = centroid_source_map_and_wrap(cents, rotations, sym.translations,
+                                               np.asarray(grid, np.int32), extend_trs=True)
+    qt = QirrTables(irr_idx_q=np.arange(3, dtype=np.int32), sym_idx_q=np.zeros(3, np.int32),
+                    q_irr_frac=np.asarray([[0, 0, 0], [1/3, 0, 0], [2/3, 0, 0]]),
+                    sym_perm=perm, L_table=wraps, n_sym_spatial=1)
+    meta = SimpleNamespace(mu_basis=basis, nspinor=2, nspinor_wfnfile=2, nkx=3, nky=1, nkz=1,
+                           fft_grid=grid, nk_tot=3, n_rmu=len(cents))
+    assert store.charge_representation(meta)
+    meta.shared_pole_capacity = CapacityLedger(meta, mesh_xy=mesh, device_budget_bytes=1 << 30)
+    meta.shared_pole_capacity.reserve("fixture_live_bound", resident_bytes_per_rank=4096,
+                                      workspace_bytes_per_rank=0)
+    meta.shared_pole_capacity.live_stages = ("fixture_live_bound",)
+    tables = {"qirr": qt, "q_irr_full_idx": np.arange(3, dtype=np.int64), "sym": sym}
+    recipe = {"version": "shared_real_pole_v1_r3b", "gate_version": "shared_real_pole_gates_ordered_v1",
+              "operator_realization": shared_real_pole_v1_r3b["operator_realization"]}
+    identity = {key: "planted-" + key for key in store._IDENTITY_KEYS}
+
+    rng = np.random.default_rng(31)
+    n = basis.n_logical
+    gamma = _trim(rng, 6, n, eps=.4)
+    q, mq = _generic_pair(rng, 6, n)
+    plants = (gamma, q, mq)
+    width, factors, poles, counts = 8, [], [], []
+    for plant in plants:
+        model, _, _, _ = _ordered(plant, .9 + .35j)
+        active = np.asarray(model[2][0])
+        b, p2 = np.asarray(model[0][0])[:, active], np.asarray(model[1][0])[active]
+        order = np.argsort(p2)
+        b, p2 = b[:, order], p2[order]
+        assert b.shape[-1] <= width
+        factors.append(np.pad(b, ((0, 0), (0, width - b.shape[-1]))))
+        poles.append(np.pad(p2, (0, width - p2.shape[-1]), constant_values=1.))
+        counts.append(b.shape[-1])
+    packed = basis.pack_host(np.stack(factors)[:, :, None, :], axis=1)
+    put = lambda x, spec: jax.make_array_from_callback(
+        np.shape(x), NamedSharding(mesh, spec), lambda idx: np.asarray(x)[idx])
+    path = tmp_path / "model_two_component_ordered.h5"
+    written = store.write_shared_pole_model(
+        path, put(packed, P(None, "x", None, "y")), put(np.stack(poles), P(None, "y")),
+        np.asarray(counts, np.int64), q_span=(0, 3), meta=meta, tables=tables, recipe=recipe,
+        receipts={"identity": identity, "scope": "planted two-component"}, ordered=True)
+    assert written["finalized"]
+    header = store.validate_shared_pole_model(path, expected_identity=identity, mesh_xy=mesh,
+                                              capacity=meta.shared_pole_capacity)
+    assert header["representation"] == "scalar-ordered-ph" and header["nspinor"] == 2
+    with SlabIO(path, mode="r", mesh=mesh) as io:
+        b_X, b_Y, p2, K = store.read_shared_pole_faces(io, (0, 3), meta=meta, header=header)
+    assert b_X.shape[2] == 1 and np.asarray(K).tolist() == counts
+    gemm = jax.jit(lambda x, y: x @ y, out_shardings=NamedSharding(mesh, P(None, "x", "y")))
+    E, tau = .3, .7 + .2j
+    bounds = np.stack([np.zeros(3), np.asarray(counts)], axis=1).astype(np.int32)
+    plus, transposed = jax.jit(lambda x, y, p, r: synthesize_shared_pole_parents(
+        x, y, p, r, E, tau, mesh_xy=mesh, gemm=gemm))(b_X, b_Y, p2, put(bounds, P()))
+    # The Sigma realization gate admits the two-component charge store.
+    realize = shared_pole_operator_realizer(meta, header, q_full_idx=np.arange(3), mesh_xy=mesh)
+    realized = realize(plus, transposed)[0]
+    valence = shared_pole_hole_kernel(mesh)(plus, put(shared_pole_minus_q_index((3, 1, 1)), P()))
+    unpack = jax.jit(lambda a: basis.unpack_operator(a, spec=P(None, "x", "y")))
+    plus, realized, valence = (np.asarray(unpack(a))[:, :n, :n] for a in (plus, realized, valence))
+    for row, plant in enumerate(plants):
+        w, residues = plant.modes()
+        lplus = sum(r * np.exp(-1j * (wn - E) * tau) for wn, r in zip(w, residues) if wn > 0)
+        lminus = sum(r * np.exp(-1j * (-wn - E) * tau) for wn, r in zip(w, residues) if wn < 0)
+        assert rel(plus[row], lplus) < 1e-12
+        assert rel(realized[row], lplus) < 1e-12
+        assert rel(valence[row], lminus) < 1e-12
+    assert rel(valence[1], plus[1].T) > 1e-2
