@@ -37,7 +37,7 @@ def _plan_or_skip(distrib_la, mesh, n, backend):
 
 
 @pytest.mark.parametrize("backend", ["off", "scalapack", "slate"])
-def test_planned_eigh_keeps_the_operand(backend):
+def test_planned_eigh_and_leading_eigenvectors_keep_the_operand(backend):
     import distrib_la
 
     mesh = _mesh()
@@ -50,6 +50,11 @@ def test_planned_eigh_keeps_the_operand(backend):
 
     values, vectors = plan.batched(operand)
     jax.block_until_ready((values, vectors))
+    np.testing.assert_array_equal(np.asarray(operand), before)
+
+    directions, kept = distrib_la.leading_eigenvectors(
+        operand, 3, eigh_plan=plan, column_extent=lambda width: width + width % 2)
+    jax.block_until_ready((directions, kept))
     np.testing.assert_array_equal(np.asarray(operand), before)
 
     # Negative control: an operand that IS changed must fail the same comparison.

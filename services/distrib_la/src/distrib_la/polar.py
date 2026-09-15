@@ -8,18 +8,21 @@ all matrix-shaped work stays two-dimensionally sharded at P('x','y').
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 import operator
+import numpy as np
 from typing import Callable
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la.plan import Plan, plan
+from distrib_la.plan import Plan, plan, ROUTE_BATCH_RESHARD
 from distrib_la.resolve import mesh_key
 
-__all__ = ["PolarPlan", "plan_polar_factor", "polar_factor"]
+__all__ = ["PolarPlan", "plan_polar_factor", "polar_factor",
+           "right_singular_vectors", "leading_eigenvectors"]
 
 
 _SUPPORTED_DTYPES = (jnp.dtype(jnp.float64), jnp.dtype(jnp.complex128))
@@ -33,6 +36,198 @@ _KERNEL_CACHE: dict[tuple, Callable] = {}
 # repeat backend probing/dlopen.  Explicit planning remains the preferred
 # spelling when the operation is called from another traced function.
 _PLAN_CACHE: dict[tuple, "PolarPlan"] = {}
+
+
+def _hermitian_dilation(A):
+    """Form [[0,A],[A.H,0]] without changing the input matrix extent."""
+    n = A.shape[-1]
+    upper = jnp.pad(A, ((0, 0),) * (A.ndim - 2) + ((0, n), (n, 0)))
+    return upper + jnp.conj(jnp.swapaxes(upper, -1, -2))
+
+
+def _dilation_vectors(Q, n):
+    """Extract U,V from the positive half of the dilation eigenvectors."""
+    positive = Q[..., n:]
+    root2 = jnp.asarray(math.sqrt(2.0), dtype=Q.dtype)
+    return root2 * positive[..., :n, :], root2 * positive[..., n:, :]
+
+
+def _dilation_svd(A, eigh):
+    """Extract ascending singular triplets from [[0,A],[A.H,0]]."""
+    evals, Q = eigh(_hermitian_dilation(A))
+    u, v = _dilation_vectors(Q, A.shape[-1])
+    return jnp.maximum(evals[..., A.shape[-1]:], 0), u, v
+
+
+def _close_spectral_cut(values, count, tolerance):
+    """Keep the entire adjacent relative-gap multiplet at a descending cut."""
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("multiplet_tol must be finite and nonnegative")
+    while 0 < count < len(values):
+        a, b = values[count - 1:count + 1]
+        if abs(a - b) > tolerance * max(abs(a), abs(b)):
+            break
+        count += 1
+    return count
+
+
+def _direction_input(W, eig, dilation=False):
+    if isinstance(W, jax.core.Tracer):
+        raise ValueError("spectral direction selection is an eager construction stage")
+    if W.ndim not in (2, 3) or W.shape[-2] != W.shape[-1]:
+        raise ValueError("spectral directions require a square rank-2 matrix or rank-3 batch")
+    _validate_dtype(W.dtype)
+    if eig.op != 'eigh' or eig.n not in (None, W.shape[-1] * (2 if dilation else 1)):
+        raise ValueError("eigh_plan must match the matrix/dilation extent")
+    tile = NamedSharding(eig.mesh, P(*((None,) * (W.ndim - 2)), 'x', 'y'))
+    if not W.sharding.is_equivalent_to(tile, W.ndim):
+        raise ValueError("spectral directions require W already face-tiled over x/y")
+    return tile
+
+
+@lru_cache(maxsize=128)
+def _retained_column_kernel(mesh, batched, extent):
+    """Select a padded face; current per-row counts are runtime mask inputs."""
+    tile = NamedSharding(mesh, P(*((None,) if batched else ()), 'x', 'y'))
+    @jax.jit(out_shardings=tile)
+    def select(q, count):
+        width = min(extent, q.shape[-1])
+        selected = q[..., ::-1][..., :width]
+        selected = jnp.pad(selected, ((0, 0),) * (q.ndim - 1)
+                           + ((0, extent - width),))
+        active = jnp.arange(extent) < count[..., None]
+        return jnp.where(active[..., None, :], selected, 0)
+    return select
+
+
+def _retained_columns(Q, values, count, *, mesh, column_extent):
+    """Select per-row physical columns; return their unpadded spectra."""
+    largest = max(count) if isinstance(count, tuple) else count
+    extent = operator.index(column_extent(largest))
+    if extent < largest or extent < 1 or extent % int(mesh.shape['y']):
+        raise ValueError("column_extent must cover the rank and tile mesh y")
+    select = _retained_column_kernel(mesh, isinstance(count, tuple), extent)
+    retained = (tuple(row[:n] for row, n in zip(values, count))
+                if isinstance(count, tuple) else values[:count])
+    counts = jax.device_put(np.asarray(count, dtype=np.int64), NamedSharding(mesh, P()))
+    return select(Q, counts), jax.device_put(retained, NamedSharding(mesh, P()))
+
+
+@lru_cache(maxsize=16)
+def _direction_svd_kernel(eigh_plan, ndim):
+    """Reuse the planned dilation SVD with each current response as input."""
+    tile = NamedSharding(eigh_plan.mesh, P(*((None,) * (ndim - 2)), 'x', 'y'))
+
+    def eigh(h):
+        if h.ndim == 3:
+            return eigh_plan.batched(h)
+        s, q = eigh_plan.batched(h[None])
+        return s[0], q[0]
+
+    @jax.jit(out_shardings=(NamedSharding(eigh_plan.mesh, P()), tile))
+    def extract(w):
+        if eigh_plan.batched_route == ROUTE_BATCH_RESHARD:
+            from distrib_la._batch_reshard import batch_reshard_call
+            # Move W and V; the unchanged 2m eigensystem stays q-local.
+            evals, v = batch_reshard_call(
+                "dilation_eigh", eigh_plan.mesh,
+                (w if w.ndim == 3 else w[None],))
+            if w.ndim == 2:
+                evals, v = evals[0], v[0]
+            return jnp.maximum(evals[..., w.shape[-1]:], 0), v
+        s, _, v = _dilation_svd(w, eigh)
+        return s, v
+
+    return extract
+
+
+def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
+                           multiplet_tol=1e-6):
+    """Return right singular directions with sigma/sigma_max > tau.
+
+    Parameters
+    ----------
+    W
+        Square [m,m] or independent [b,m,m] float64/complex128 faces at
+        P('x','y') or P(None,'x','y').
+        Singular values carry W's units; vectors are dimensionless.
+    tau
+        Finite nonnegative relative cutoff; whole adjacent multiplets at
+        relative gap <= multiplet_tol survive a boundary crossing.
+    eigh_plan
+        Resolved service eigh Plan for 2m. Its batched route owns the
+        local/distributed policy, including dilation workspace.
+    column_extent
+        Eager callable from physical retained rank to caller-planned padded
+        width, which must tile y. Padding policy belongs to the caller.
+    multiplet_tol
+        Relative adjacent spectral-gap tolerance, default 1e-6.
+
+    Returns
+    -------
+    Q, sigma
+        Q[m,r_padded] at P('x','y'), active columns first and zero tails;
+        sigma[r] replicated in descending order. r = sigma.size. Only the
+        O(m) spectrum crosses the host, never a matrix. Selection is eager.
+        Batched input returns Q[b,m,max(r_padded)] at P(None,'x','y') and
+        a tuple of b unpadded sigma[r_q] arrays. Thus every cut/multiplet
+        remains independent; the matrix tail of each row is exactly zero.
+    """
+    _direction_input(W, eigh_plan, dilation=True)
+    tau = _as_rcond(tau)
+    if tau is None:
+        raise ValueError("tau must be an explicit relative cutoff")
+    s, v = _direction_svd_kernel(eigh_plan, W.ndim)(W)
+    values = np.asarray(s)[..., ::-1].copy()
+    if not np.all(np.isfinite(values)):
+        raise ValueError("nonfinite singular spectrum")
+    def cut(row):
+        count = int(np.count_nonzero(row > tau * row[0]))
+        return _close_spectral_cut(row, count, multiplet_tol)
+    count = cut(values) if values.ndim == 1 else tuple(cut(row) for row in values)
+    return _retained_columns(v, values, count, mesh=eigh_plan.mesh,
+                             column_extent=column_extent)
+
+
+def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
+                         multiplet_tol=1e-6):
+    """Return leading Hermitian eigenvectors, including the cut multiplet.
+
+    W[m,m] or W[b,m,m] is Hermitian on its x/y faces; r is the requested
+    physical width for each row. The leading batch is independent.
+    eigh_plan is resolved for m, and column_extent/multiplet_tol and the
+    (Q,values) output follow right_singular_vectors. Values retain W's units.
+    No Hermitian projection is applied to repair an invalid input.
+    """
+    _direction_input(W, eigh_plan)
+    r = operator.index(r)
+    if not 1 <= r <= W.shape[-1]:
+        raise ValueError("r must lie in [1,m]")
+    if eigh_plan.batched_route == ROUTE_BATCH_RESHARD:
+        from distrib_la._batch_reshard import batch_reshard_call
+        s, q = batch_reshard_call("checked_eigh", eigh_plan.mesh,
+                                  (W if W.ndim == 3 else W[None],))
+        if W.ndim == 2:
+            s, q = s[0], q[0]
+    else:
+        # A distributed solver never owns complete local rows; checking
+        # arbitrary off-diagonal faces still requires peer communication.
+        defect = jnp.max(jnp.abs(W - jnp.conj(jnp.swapaxes(W, -1, -2))), axis=(-2, -1))
+        scale = jnp.max(jnp.abs(W), axis=(-2, -1))
+        if not bool(jnp.all(jnp.isfinite(scale) & (defect <= 1e-12 * scale))):
+            raise ValueError("leading_eigenvectors requires finite Hermitian W")
+        if W.ndim == 2:
+            s, q = eigh_plan.batched(W[None])
+            s, q = s[0], q[0]
+        else:
+            s, q = eigh_plan.batched(W)
+    values = np.asarray(s)[..., ::-1].copy()
+    if not np.all(np.isfinite(values)):
+        raise ValueError("leading_eigenvectors requires finite Hermitian W and a finite eigenvalue spectrum")
+    count = (_close_spectral_cut(values, r, multiplet_tol) if values.ndim == 1
+             else tuple(_close_spectral_cut(row, r, multiplet_tol) for row in values))
+    return _retained_columns(q, values, count, mesh=eigh_plan.mesh,
+                             column_extent=column_extent)
 
 
 def _as_extent(n) -> int:
@@ -202,21 +397,7 @@ def _kernel_for(polar_plan: PolarPlan, dtype) -> Callable:
     def _polar(A):
         A = jax.lax.with_sharding_constraint(A, tile)
 
-        # One allocated 2n x 2n tile, rather than four concatenated operands.
-        # upper is the upper-right block; upper + upper.H is the dilation.
-        upper = jnp.pad(A, ((0, n), (n, 0)))
-        H = upper + jnp.conj(jnp.swapaxes(upper, -1, -2))
-        H = jax.lax.with_sharding_constraint(H, tile)
-
-        evals, Q = eigh(H)
-
-        # eigh is ascending.  Its upper half is the non-negative dilation
-        # spectrum; reverse to standard descending singular-value order.
-        s_ascending = jnp.maximum(evals[n:], 0)
-        positive = Q[:, n:]
-        root2 = jnp.asarray(math.sqrt(2.0), dtype=dtype)
-        U = root2 * positive[:n]
-        V = root2 * positive[n:]
+        s_ascending, U, V = _dilation_svd(A, eigh)
 
         # Dilation zero modes mix the independent left/right null spaces.
         # Mask before GEMM to produce the unique partial isometry rather than
