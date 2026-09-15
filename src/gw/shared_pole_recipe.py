@@ -61,7 +61,10 @@ _GATE_ROWS = {
                           {"reference_relative_max": 1.0e-12, "model_relative_max": 1.0e-10}),
     "full_m1_defect": ("maximum over q of relative full M1 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-4),
     "full_m3_defect": ("maximum over q of relative full M3 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-3),
-    "representation": ("scalar N_spinor=1 and authenticated TRS allowed", {"nspinor": 1, "trs_allowed": True}),
+    # The stored operator is the spin-traced mu x mu charge response on scalar and
+    # two-component decks alike; only G carries the spinor axes.
+    "representation": ("charge operator from N_spinor in (1, 2) and authenticated TRS allowed",
+                       {"nspinor": (1, 2), "trs_allowed": True}),
     "capacity": ("aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U", 3.0),
     "stream_peak": ("inherited response stream peak <= threshold * incumbent MPA stream peak on the same deck and processor geometry, using the same measurement method", 1.05),
     "sigma_peak": ("inherited Sigma peak including one incumbent-shaped W <= threshold * incumbent MPA Sigma peak on the same deck, processor geometry and window plan, using the same measurement method", 1.05),
@@ -102,8 +105,8 @@ ORDERED_GATE_VERSION = "shared_real_pole_gates_ordered_v1"
 shared_real_pole_gates_ordered_v1 = {
     name: dict(row) for name, row in shared_real_pole_gates_v1_r3b.items()}
 for _name, (_predicate, _threshold) in {
-    "representation": ("scalar N_spinor=1, authenticated TRS broken, ordered bank: positive poles per parent, hole side from the parent of -q transposed",
-                       {"nspinor": 1, "trs_allowed": False, "ordered": True}),
+    "representation": ("charge operator from N_spinor in (1, 2), authenticated TRS broken, ordered bank: positive poles per parent, hole side from the parent of -q transposed",
+                       {"nspinor": (1, 2), "trs_allowed": False, "ordered": True}),
     "passivity": ("Hermitian part of the V-whitened -Wc(i eta) of the signed particle-hole model in bounds; the anti-Hermitian part is the odd channel, reported only",
                   {"eigenvalue_min": -1.0e-10, "eigenvalue_max": 1.0 + 1.0e-8}),
     "retained_subspace_moments": ("relative projected z-moment m0..m3 defect of the signed particle-hole model on the infinity directions <= threshold; NOT_MEASURED for a finite-state bank without odd moments", 1.0e-10),
@@ -112,7 +115,55 @@ for _name, (_predicate, _threshold) in {
     shared_real_pole_gates_ordered_v1[_name] = {
         "name": _name, "predicate": _predicate, "threshold": _threshold,
         "version": ORDERED_GATE_VERSION}
+# The ordered row measures a PROJECTED z-moment identity on the original infinity
+# directions: exact only for the full Galerkin span, projection accuracy after the keep
+# and retention cuts. It is therefore diagnostic with a calibration band, as full_m1 and
+# full_m3 are, and its verdict is computed from the measured defects -- never asserted.
+# Band: measured CrI3 q=1 construction (m0 4.8e-9, m1 6.8e-11, m2 1.2e-5, m3 1.3e-7,
+# claim 2357) against the hand-caught failure this row exists for (m3 own-norm 0.632 from
+# spurious 100-1000 Ry poles, TRMOM 2026-09-15).
+shared_real_pole_gates_ordered_v1["retained_subspace_moments"].update({
+    "diagnostic": True, "calibration_range": (1.2e-5, 1.0e-3),
+    "source": "CrI3 q=1 58385920 vs claim 2357; TRMOM spurious-pole case 0.632",
+})
+
 ORDERED_GATE_HASH = table_hash(shared_real_pole_gates_ordered_v1)
+
+
+def representation_row_passed(measured, threshold):
+    """True when every measured representation field matches its threshold.
+
+    ``nspinor`` may be a tuple of admitted values; every other field compares equal.
+    The constructor used to write ``passed=True`` as a literal here, so a deck that
+    violated the row recorded PASS.
+    """
+    for key, want in threshold.items():
+        got = measured.get(key)
+        if isinstance(want, tuple):
+            if got not in want:
+                return False
+        elif bool(got) != bool(want) if isinstance(want, bool) else got != want:
+            return False
+    return True
+
+
+def retained_moment_row_passed(measured, row):
+    """Verdict for the retained-moment row from the measured per-order defects.
+
+    ``measured`` maps order name to a value or list of values. A diagnostic row with a
+    calibration band passes at the band ceiling; otherwise the row's own threshold applies.
+    ``None`` (nothing measured) is not a pass.
+    """
+    import numpy as _np
+
+    if not measured:
+        return None
+    ceiling = (row.get("calibration_range") or (None, row.get("threshold")))[1]
+    if ceiling is None:
+        return None
+    worst = max(float(_np.max(_np.abs(_np.asarray(value, dtype=float))))
+                for value in measured.values())
+    return bool(worst <= float(ceiling))
 
 
 def gate_receipt(name, value=None, *, passed=None, reason, table=None):
