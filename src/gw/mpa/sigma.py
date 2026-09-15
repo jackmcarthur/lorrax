@@ -165,6 +165,46 @@ def shared_pole_hole_kernel(mesh_xy):
                    out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
 
 
+_EVEN_PART_ENV = "LORRAX_DEBUG_SHARED_POLE_EVEN_PART"
+
+
+def debug_shared_pole_even_part(ordered):
+    """DEBUG-ONLY: the LORRAX_DEBUG_SHARED_POLE_EVEN_PART choice ("all", "exclude_q0") or None.
+
+    Sigma then consumes the even part W^even_q = [W_q + W_-q^T]/2 of an ordered store, the odd-channel
+    diagnostic Sigma[W] - Sigma[W^even]. Refuses unknown values and TRS stores (W is already even).
+    """
+    import os
+    value = os.environ.get(_EVEN_PART_ENV, "").strip().lower()
+    if value in ("", "0", "off", "false", "no"):
+        return None
+    if value not in ("all", "exclude_q0"):
+        raise ValueError(f"{_EVEN_PART_ENV}={value!r}: want all or exclude_q0 (debug-only)")
+    if not ordered:
+        raise ValueError(f"{_EVEN_PART_ENV}={value!r}: refuses on a time-reversal-symmetric store, whose W is already even")
+    if jax.process_index() == 0:
+        print(f"WARNING -- DEBUG: {_EVEN_PART_ENV}={value}: Sigma consumes W^even = [W_q + W_-q^T]/2 "
+              f"of the ordered store{' except at q = 0' if value == 'exclude_q0' else ''}; not a physical result", flush=True)
+    return value
+
+
+def shared_pole_even_part_kernel(mesh_xy, *, exclude_q0):
+    """DEBUG-ONLY W(tau) of the even part of an ordered store, for both causal branches.
+
+    The even part is itself an ordered store: parent q holds {b_j(q)/sqrt2 at Omega_j(q)} and
+    {conj(b_j(-q))/sqrt2 at Omega_j(-q)}. Its particle W at q is [W_+(q) + W_+(-q)^T]/2, and its hole
+    side, W^even_+(-q)^T, is the same matrix, so one full-q tile serves both branches. ``exclude_q0``
+    keeps the ordered W at q = 0 (canonical row 0): W_+(0) for conduction windows, W_+(0)^T for valence.
+    """
+    def even(w_full, minus_q, valence):
+        mirrored = jnp.swapaxes(w_full[minus_q], -1, -2)
+        half = 0.5 * (w_full + mirrored)
+        if not exclude_q0:
+            return half
+        return half.at[0].set(jnp.where(valence, mirrored[0], w_full[0]))
+    return jax.jit(even, out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
+
+
 def _shared_pole_fixed_q_policy(header):
     """Resolve the policy from the store's authenticated TRS/grid metadata."""
     from gw.qgrid_symmetry import qgrid_trs_policy_from_shared_pole_store
@@ -433,10 +473,13 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     zeros = jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=sharding)
     # Ordered stores: conduction windows use W_+(q), valence windows W_+(-q)^T.
     ordered = header.get("representation") == "scalar-ordered-ph"
+    even_part = debug_shared_pole_even_part(ordered)
     if ordered:
         hole_kernel = shared_pole_hole_kernel(mesh_xy)
         minus_q = device_put_process_local(
             shared_pole_minus_q_index(header["grid"]), NamedSharding(mesh_xy, P()))
+        if even_part:
+            even_kernel = shared_pole_even_part_kernel(mesh_xy, exclude_q0=even_part == "exclude_q0")
 
     @partial(jax.jit, donate_argnums=(0,), out_shardings=sharding)
     def add_panel(total, rows, values):
@@ -495,7 +538,9 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                         total.block_until_ready()
                     del child
             result = zeros() if total is None else total
-            if ordered and _residues == "val":
+            if ordered and even_part:
+                result = even_kernel(result, minus_q, _residues == "val")
+            elif ordered and _residues == "val":
                 result = hole_kernel(result, minus_q)
             jax.block_until_ready(result)
             return result
