@@ -545,11 +545,14 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
             or not np.all(np.isfinite(energies))
             or not np.all(np.isfinite(occupations))):
         raise ValueError("GATE shared_pole_census: got: inconsistent/nonfinite energy or occupation table; want: current full-BZ logical tables; why: physical charge needs authenticated weights")
-    if int(meta.nspinor) != 1 or int(meta.nspin) != 1 or not trs_allowed:
-        raise ValueError("GATE shared_pole_representation: got: non-scalar or TRS-broken census; want: nspin=nspinor=1 and TRS allowed; why: both-endpoint spin action is not yet supported")
+    from file_io.shared_pole_store import charge_representation
+    # trs_allowed is recorded, not gated: a measured break selects the ordered
+    # bank, and consumers that need the even form refuse by name.
+    if not charge_representation(meta) or int(meta.nspin) != 1:
+        raise ValueError("GATE shared_pole_representation: got: collinear-spin or bispinor census; want: nspin=1 with a scalar or two-component charge operator; why: both-endpoint spin action is not yet supported")
     capacity = float(state_capacity)
-    if capacity != 2.0:
-        raise ValueError("GATE shared_pole_census: got: scalar state capacity other than 2; want: authenticated spin-restricted scalar capacity; why: charge normalization")
+    if capacity * int(meta.nspinor) != 2.0:
+        raise ValueError("GATE shared_pole_census: got: state capacity times Nspinor other than 2; want: authenticated spin-restricted capacity; why: charge normalization")
     val = energies[:, wfns.slices.val]
     cond = energies[:, wfns.slices.cond_all_logical]
     if not val.size or not cond.size:
@@ -787,7 +790,9 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     held_ids = sorted({i for i, held in zip(distinct_ids, held_flags) if held})
     if set(fit_ids) & set(held_ids):
         raise ValueError("GATE shared_pole_held_exclusion: got: held/training collision; want: disjoint physical IDs; why: held diagnostics must be independent")
-    n = int(meta.nspinor) * int(meta.n_rmu)
+    # The operator is the spin-traced charge response [q, mu, mu] on scalar
+    # and two-component decks alike (shared_pole_store.charge_representation).
+    n = int(meta.n_rmu)
     # A support override is a different physical sampling geometry, so it must
     # be a different recipe identity: restart membership, the bank header and
     # the model identity all authenticate through these two fields, and an

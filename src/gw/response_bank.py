@@ -143,10 +143,12 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     """
     from .w_isdf import _get_chi_fractional_contour_kernel_face
 
-    if wfns.layout != "face" or int(meta.nspinor) != 1:
-        raise ValueError("GATE response_representation: got non-scalar or legacy "
-                         "wavefunctions; want scalar face carrier; why: bank "
-                         "requires explicit endpoint shardings")
+    from file_io.shared_pole_store import charge_representation
+
+    if wfns.layout != "face" or not charge_representation(meta):
+        raise ValueError("GATE response_representation: got bispinor or legacy "
+                         "wavefunctions; want scalar or two-component charge face "
+                         "carrier; why: bank requires explicit endpoint shardings")
     carrier = wfns.green_parent
     source = wfns if carrier is None else carrier
     parent = None if carrier is None else carrier.plan
@@ -206,11 +208,14 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute):
 
 def _bank_context(wfns, meta, sym, bank_io, mesh_xy):
     """Authenticate A/B's existing scratch transaction and physical state."""
-    from file_io.shared_pole_store import validate_shared_pole_bank
+    from file_io.shared_pole_store import (charge_representation,
+                                           validate_shared_pole_bank)
 
-    if int(meta.nspinor) != 1 or not bool(sym.trs_allowed):
-        raise ValueError("GATE response_representation: want scalar and "
-                         "authenticated TRS; odd/open-spin bank is unsupported")
+    # The measured time-reversal verdict selects the orientation (callers
+    # read sym.trs_allowed); only the operator representation refuses here.
+    if not charge_representation(meta):
+        raise ValueError("GATE response_representation: want scalar or "
+                         "two-component charge operator; bispinor bank is unsupported")
     header = validate_shared_pole_bank(bank_io["path"],
         expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
     qids = np.asarray(sym.q_irr_full_idx, dtype=np.int64)
@@ -530,6 +535,10 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
     from file_io.shared_pole_store import write_shared_pole_bank
     header, qids, census = _bank_context(wfns, meta, sym, bank_io, mesh_xy)
     receipt = _receipt("moments", census, bank_io)
+    if not bool(sym.trs_allowed):
+        # M1/M3 are the 1/s and 1/s^2 coefficients; the odd channel starts at
+        # 1/z^3, so the same six correlations stay exact on an ordered bank.
+        receipt["ordered"] = True
     execute = _bank_execution(meta, mesh_xy, bank_io, receipt, config)
     ledger = meta.shared_pole_capacity
     ambient = ledger.live_stages
@@ -570,6 +579,80 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
     return _finish_receipt(receipt,meta,header,started)
 
 
+def _self_negative(q_full, meta):
+    """True where q = -q on the canonical C-ordered full grid (a TRIM parent)."""
+    grid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    return all((2*int(i)) % n == 0 for i, n in zip(np.unravel_index(q_full, grid), grid))
+
+
+@jax.jit
+def _census_scalars(chi, w, w_even):
+    def mx(a):
+        return jnp.max(jnp.abs(a))
+    sym = 0.5*(chi + chi.T)
+    odd = 0.5*(chi - chi.T)
+    return jnp.stack([mx(odd)/mx(sym),
+                      jnp.linalg.norm(odd)/jnp.linalg.norm(sym),
+                      mx(chi - chi.conj().T)/mx(chi),
+                      mx(w - w.conj().T)/mx(w),
+                      mx(w_even - w_even.conj().T)/mx(w_even),
+                      mx(w - w.T)/mx(w)])
+
+
+def _tr_odd_census(receipt, samples, h, chi, dchi, value, z, q_full):
+    """Measure the time-reversal-odd channel of an ordered bank at q = -q.
+
+    At a self-negative q an imaginary-axis chi0 is real, and its transpose-
+    antisymmetric part is the odd channel. Records that part against the
+    symmetric part (max and Frobenius), the Hermiticity of the ordered
+    W = V + Wc, of the even-route W from the symmetric part through the same
+    Coulomb root and Dyson algebra, and max|W - W^T|/max|W|. Scalars only;
+    every rank computes, rank 0 prints one line per sample.
+    """
+    imaginary = np.flatnonzero(np.real(np.asarray(z)) == 0.0)
+    if not imaginary.size:
+        return
+    v = (h @ h)[0]
+    names = ("chi_odd_max_rel", "chi_odd_fro_rel", "chi_hermiticity_rel",
+             "w_hermiticity_rel", "w_even_route_hermiticity_rel", "w_transpose_rel")
+    for s in imaginary.tolist():
+        sym = 0.5*(chi[s] + chi[s].T)
+        dsym = 0.5*(dchi[s] + dchi[s].T)
+        w_even = v + samples(h, sym[None], dsym[None])[0][0]
+        values = np.asarray(_census_scalars(chi[s], v + value[s], w_even), dtype=np.float64)
+        row = dict(q_full=q_full, z_ry=[float(z[s].real), float(z[s].imag)],
+                   **{k: float(x) for k, x in zip(names, values)})
+        receipt.setdefault("tr_odd_census", []).append(row)
+        if jax.process_index() == 0:
+            print("TRBANK tr_odd_census " + " ".join(f"{k}={row[k]}" for k in row), flush=True)
+
+
+def _ordered_cost_probe(wfns, meta, mesh_xy, qid, tau, projections, lw, uw, refs, n_out):
+    """Warm seconds per remote Laplace node, even versus ordered kernel.
+
+    Same deck, geometry, q parent, band weights and first nodes; each kernel
+    runs once to compile and once timed. The difference is the ordered
+    per-node work (one more chi FFT, q gather and accumulation); node counts
+    come from the rule certificate. Receipt-only; nothing is written.
+    """
+    nodes = min(4, len(tau))
+    seconds = {}
+    for mode, rows in (("laplace", projections[:n_out]), ("laplace_ordered", projections)):
+        kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=(qid,),
+                                        n_outputs=n_out, pair_mode=mode)
+        args = (jnp.asarray(tau[:nodes]), jnp.asarray(rows[:, :nodes]), *fixed,
+                lw, uw, jnp.asarray(refs))
+        jax.block_until_ready(kernel(*args))
+        timing.fence('bank.ordered_cost_probe', sync_ranks=True)
+        started = time.monotonic()
+        jax.block_until_ready(kernel(*args))
+        seconds[mode] = (time.monotonic() - started)/nodes
+    return dict(q_full=qid, nodes=nodes, seconds_per_node_even=seconds["laplace"],
+                seconds_per_node_ordered=seconds["laplace_ordered"],
+                ratio=seconds["laplace_ordered"]/seconds["laplace"],
+                scope="warm rank-0 wall seconds per remote Laplace node, one q parent, after a synchronized fence")
+
+
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io):
     """Stage A: one windowed stream per admitted sample batch, all parent faces."""
     timing.fence('bank.setup', sync_ranks=True)
@@ -579,6 +662,12 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         authenticate_sample_plan(sample_plan,header)
         z = bank_points(sample_plan)
         receipt = _receipt("samples",census,bank_io)
+        # Time reversal measured broken: both particle-hole orientations keep
+        # independent weights. The retarded stream already forms the partner as
+        # conj in R space (the -q orientation); remote cells add the odd kernel.
+        ordered = not bool(sym.trs_allowed)
+        if ordered:
+            receipt["ordered"] = True
         started = time.monotonic()
         execute = _bank_execution(meta,mesh_xy,bank_io,receipt,config)
         ledger = meta.shared_pole_capacity
@@ -619,12 +708,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             rr = laplace_rule(cell["delta_min_ry"],cell["delta_max_ry"],z,
                 rel_tol=sample_plan["bank_rule_tolerance"],
                 previous=None if session is None else session.get(key),
-                domain_pad_ry=pad)
+                domain_pad_ry=pad,**({"ordered": True} if ordered else {}))
             if session is not None:
                 session[key] = rr
             remote.append((cell,rr))
         receipt["laplace_cells"] = [{**cell,**{k:v for k,v in rr.items()
-            if k not in ("t","projection_value","projection_derivative","coefficient_rows")}}
+            if k not in ("t","projection_value","projection_derivative","coefficient_rows",
+                         "odd_projection_value","odd_projection_derivative")}}
             for cell,rr in remote]
     timing.fence('bank.capacity_planning_compile', sync_ranks=True)
     with timing.section('bank.capacity_planning_compile'):
@@ -708,7 +798,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             # equal-shaped Laplace cells instead of retracing each closure.
             if remote:
                 lk,lfixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,pair_mode="laplace",bank_carry=True)
+                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,
+                    pair_mode="laplace_ordered" if ordered else "laplace",bank_carry=True)
             for cell,rr in remote:
                 timing.fence('bank.laplace_arguments', sync_ranks=True)
                 with timing.section('bank.laplace_arguments'):
@@ -716,11 +807,18 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     refs = np.asarray(cell["references_ry"])
                     tau = np.asarray(rr["t"])
                     projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]
+                    if ordered:
+                        # Rows [even value, even ds, odd value, odd ds].
+                        projections = np.vstack((projections,
+                            -np.vstack((rr["odd_projection_value"][lo:hi],rr["odd_projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]))
                     lw = np.stack([ft*masks[lower],ut*masks[lower]])
                     uw = np.stack([ut*masks[upper],ft*masks[upper]])
                     # Parent selection applies to the k axis, separately for each role.
                     lw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in lw])
                     uw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in uw])
+                if ordered and "ordered_cost_probe" not in receipt:
+                    receipt["ordered_cost_probe"] = _ordered_cost_probe(
+                        wfns,meta,mesh_xy,int(qids[q0]),tau,projections,lw,uw,refs,2*a)
                 raw = execute(lk,(jnp.asarray(tau),jnp.asarray(projections),
                     *lfixed,lw,uw,jnp.asarray(refs),raw),"laplace")
                 del lw,uw
@@ -744,6 +842,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     dchi = raw[a+ia-lo:a+stop-lo,iq-q0]
                     hbatch = jnp.broadcast_to(h,chi.shape)
                     value,ds = execute(samples,(hbatch,chi,dchi),"sample_dyson")
+                    if ordered and _self_negative(int(qids[iq]),meta):
+                        _tr_odd_census(receipt,samples,h,chi,dchi,value,z[ia:stop],int(qids[iq]))
                     value = None if marked[0] else value[None]
                     ds = None if marked[1] else ds[None]
                     timing.fence('bank.write', sync_ranks=True)
