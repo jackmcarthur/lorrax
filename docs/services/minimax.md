@@ -61,3 +61,41 @@ are owned by the [non-Hermitian GN-PPM memo](../dev/notes/DERIVATION_gnppm_nonhe
 The standalone package tests live in `services/minimax/tests/`; the monorepo
 layering test enforces the top-level door. Lookup tests must run without SciPy,
 while solver-generation tests may require it.
+
+
+## Response-bank rule sessions
+
+`response_bank_rule(z_ry, delta_max_ry, rel_tol=..., previous=None,
+domain_pad_ry=0)` returns positive real-time nodes and weights, value and
+s-derivative projections, a node digest, and continuum panel/tail bounds.
+`response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, ...)` returns positive
+Laplace nodes and inverse-moment coefficient rows, with continuum row bounds
+and current-frequency Taylor bounds. Both accept the previous in-memory result.
+A hit retains its integration arrays exactly and regenerates projections for
+all supplied frequencies. The bank norm is eta-scaled absolute value/derivative
+error; the remote norm is relative error. Neither certifies W or Sigma accuracy.
+
+`domain_pad_ry` enlarges a newly built transition domain. Remote lower padding
+stops at positivity and cannot cross the Taylor convergence boundary. Reuse
+requires current-domain containment, the same tolerance, an intact node digest
+and passing current-frequency bounds. Otherwise the owner builds a new rule;
+corrupt integration arrays refuse. Receipts report `reuse_status`,
+`reuse_reason`, `node_digest` and the actual certified domain. No wavefunctions,
+response matrices, physical samples or W models live in this session.
+
+### Response-rule currencies and certificates
+
+Frequencies and transition intervals are in Ry, times in inverse Ry, derivatives with respect to `s = z²`.
+
+- `response_bank_rule` (real-time Hermite panels): positive `(t, h)` returning `h e^{izt}` and the derivative
+  row `h e^{izt}·it/(2z)`. The currency is peak-scaled absolute error (`η·|value|`, `η³·|derivative|`,
+  `η = min Im z`); the certificate bounds the full signed transition interval and both exponential branches,
+  tail and panel budgets included. It does not certify relative W or Σ accuracy.
+- `response_laplace_rule` (remote cells): a nonnegative NNLS fit of `δ/(δ²+η²)^{n+1}` on a positive time
+  dictionary, refined until the interval certificate passes (endpoint errors plus a second-derivative bound
+  from the log-derivatives of each positive term, never the training grid alone). With
+  `q = (s+η²)/(δ²+η²)` the value Taylor remainder is bounded by `ρ^{N+1}` and the derivative remainder by
+  `ρ^N((N+1)+Nρ)`, `ρ = sup|q|`; a nonconvergent Taylor domain refuses and must be repartitioned by the bank.
+
+Neither rule sees band masks, occupations or response arrays. `tests/test_response_rules.py` checks analytic
+kernels, the missing `1/(2z)` derivative red twin, positivity and refusals.
