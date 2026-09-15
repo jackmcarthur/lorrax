@@ -19,7 +19,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 
-def response_algebra(meta, config, *, mesh_xy, n):
+def response_algebra(meta, config, *, mesh_xy, n, ordered=False):
     """Plan physical Dyson samples and exact high-frequency moments.
 
     Parameters
@@ -82,6 +82,25 @@ def response_algebra(meta, config, *, mesh_xy, n):
         b1 = congruence(h, a1)
         return (0.5 * congruence(h, b0),
                 0.5 * congruence(h, b1 + mm(b0, b0)))
+
+    if ordered:
+        @partial(jax.jit, in_shardings=(face, face, face, face, face),
+                 out_shardings=(face, face, face, face))
+        def moments(h, a0, a1, o0, o1):
+            # chi_scaled = o0/z + a0/z^2 + o1/z^3 + a1/z^4 with no time-
+            # reversal or reality assumption; X_k = H chi_k H and
+            # Wc = H X (I-X)^-1 H. Coefficients C1..C4 of 1/z..1/z^4 keep
+            # every X1 cross term (o0 vanishes only in a complete basis).
+            # Returns m0=C1, M1=C2/2, m2=C3, M3=C4/2; with o0=o1=0 the
+            # even pair reduces to the incumbent M1/M3 exactly.
+            x1, x2, x3, x4 = (congruence(h, v) for v in (o0, a0, o1, a1))
+            x11 = mm(x1, x1)
+            c2 = x2 + x11
+            c3 = x3 + mm(x1, x2) + mm(x2, x1) + mm(x11, x1)
+            c4 = (x4 + mm(x1, x3) + mm(x3, x1) + mm(x2, x2) + mm(x11, x2)
+                  + mm(mm(x1, x2), x1) + mm(x2, x11) + mm(x11, x11))
+            return (congruence(h, x1), 0.5 * congruence(h, c2),
+                    congruence(h, c3), 0.5 * congruence(h, c4))
 
     return samples, moments, {
         "linalg": resolution.layout,
@@ -172,7 +191,7 @@ def stream_weights(wfns, weights, mesh_xy):
     return result
 
 
-def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute):
+def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False):
     """Compute A0/A1 of scaled chi=A0/s+A1/s² by six correlations.
 
     The binomial coefficients expand ``(E_u-E_f)`` and its cube. Imaginary
@@ -203,7 +222,67 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute):
             total = term if total is None else total + term
             total.block_until_ready()
         totals.append(total)
+    if not ordered:
+        return (*totals, census)
+    # Odd coefficients of 1/z and 1/z^3: sum (P - conj P_{-q}) Delta^m, m=0,2.
+    # Real particle weights keep the retarded difference -i(X - conj X), so
+    # the chi coefficient is i*raw. Four more correlations, same kernel.
+    for moment_terms in (((1., 0, 0),), ((1., 2, 0), (-2., 1, 1), (1., 0, 2))):
+        total = None
+        for coefficient, a, b in moment_terms:
+            weight_f = stream_weights(wfns, f * erel**a, mesh_xy)
+            weight_u = stream_weights(wfns, u * erel**b, mesh_xy)
+            args = (jnp.asarray([0.]), jnp.asarray([[1. + 0j]]), *fixed,
+                    weight_f.astype(jnp.complex128), weight_u.astype(jnp.complex128),
+                    jnp.asarray(reference))
+            raw = execute(kernel, args, "moment_correlation")[:, 0]
+            term = (1j * _w_solve_pref_scalar(meta) * coefficient) * raw
+            total = term if total is None else total + term
+            total.block_until_ready()
+        totals.append(total)
     return (*totals, census)
+
+
+@jax.jit
+def _odd_moment_ratios(m0, m1, m2, m3):
+    return jnp.stack([jnp.linalg.norm(m0) / jnp.linalg.norm(m1),
+                      jnp.linalg.norm(m2) / jnp.linalg.norm(m3)])
+
+
+def _odd_moment_writer(meta, bank_io, mesh_xy, nq):
+    """Open ``moments_odd.h5`` beside bank.h5; canonical order like the bank."""
+    from file_io.slab_io import SlabIO
+    basis = meta.mu_basis
+    unpack = jax.jit(lambda v: basis.unpack_operator(v, spec=P(None, "x", "y")))
+    shape = (1, basis.n_packed, basis.n_packed)
+    abstract = jax.ShapeDtypeStruct(shape, jnp.complex128,
+                                   sharding=NamedSharding(mesh_xy, P(None, "x", "y")))
+    stats = unpack.lower(abstract).compile().memory_analysis()
+    _reserve(meta, "odd_moment_staging", stats.argument_size_in_bytes,
+             stats.output_size_in_bytes + stats.temp_size_in_bytes)
+    io = SlabIO(str(Path(bank_io["path"]).with_name("moments_odd.h5")), mode="w", mesh=mesh_xy)
+    io.__enter__()
+    return io, unpack, nq
+
+
+def _write_odd_moments(writer, meta, iq, m0, m1, m2, m3, receipt):
+    """Write m0 (1/z) and m2 (1/z^3) for one parent; record the truncation ratio."""
+    io, unpack, nq = writer
+    basis = meta.mu_basis
+    for name, value in (("m0", m0), ("m2", m2)):
+        canonical = unpack(value)
+        canonical.block_until_ready()
+        io.write_slab(name, canonical, offset=(iq, 0, 0),
+                      global_shape=(nq, basis.n_canonical, basis.n_canonical),
+                      valid_shape=(1, basis.n_logical, basis.n_logical))
+        io.sync_writes()
+        del canonical
+    ratios = np.asarray(_odd_moment_ratios(m0, m1, m2, m3), dtype=np.float64)
+    row = dict(q_parent=int(iq), m0_over_M1_fro=float(ratios[0]),
+               m2_over_M3_fro=float(ratios[1]))
+    receipt.setdefault("odd_moments", []).append(row)
+    if jax.process_index() == 0:
+        print("TRBANK odd_moments " + " ".join(f"{k}={row[k]}" for k in row), flush=True)
 
 
 def _bank_context(wfns, meta, sym, bank_io, mesh_xy):
@@ -546,16 +625,23 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
     _stream_comparison(wfns, meta, mesh_xy, qids, receipt)
     face_bytes = 16*meta.mu_basis.n_packed**2 // mesh_xy.size
     # Two totals, next correlation, arithmetic temporaries and bounded H/solve.
+    ordered = not bool(sym.trs_allowed)
     _, moments, receipt["algebra"] = response_algebra(meta, config,
-        mesh_xy=mesh_xy, n=meta.mu_basis.n_packed)
-    qwidth = max(1,min(len(qids),int((.75*ledger.U_bytes_per_rank/face_bytes-16)/8)))
+        mesh_xy=mesh_xy, n=meta.mu_basis.n_packed, **({"ordered": True} if ordered else {}))
+    per_q = 12 if ordered else 8
+    qwidth = max(1,min(len(qids),int((.75*ledger.U_bytes_per_rank/face_bytes-16)/per_q)))
+    odd_writer = _odd_moment_writer(meta, bank_io, mesh_xy, len(qids)) if ordered else None
     for q0 in range(0,len(qids),qwidth):
         q1 = min(q0+qwidth,len(qids))
         ledger.live_stages = ambient
-        name,_ = _reserve(meta,"bank_outputs_moments",(8*(q1-q0)+16)*face_bytes)
+        name,_ = _reserve(meta,"bank_outputs_moments",(per_q*(q1-q0)+16)*face_bytes)
         ledger.live_stages = ambient+(name,)
         if not np.asarray(header["moment_written"])[q0:q1].all():
-            a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
+            if ordered:
+                a0, a1, o0, o1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
+                    q_ids=tuple(qids[q0:q1]), execute=execute, ordered=True)
+            else:
+                a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
                                           q_ids=tuple(qids[q0:q1]), execute=execute)
             for iq in range(q0,q1):
                 marked = header["moment_written"][iq]
@@ -564,7 +650,13 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
                 span = (iq,iq+1)
                 h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, span, execute)
                 del hi
-                m1, m3 = execute(moments, (h,a0[iq-q0:iq-q0+1],a1[iq-q0:iq-q0+1]), "moment_dyson")
+                if ordered:
+                    part = slice(iq-q0, iq-q0+1)
+                    m0, m1, m2, m3 = execute(moments, (h,a0[part],a1[part],o0[part],o1[part]), "moment_dyson")
+                    _write_odd_moments(odd_writer, meta, iq, m0, m1, m2, m3, receipt)
+                    del m0, m2
+                else:
+                    m1, m3 = execute(moments, (h,a0[iq-q0:iq-q0+1],a1[iq-q0:iq-q0+1]), "moment_dyson")
                 io_started = time.monotonic()
                 header = write_shared_pole_bank(bank_io["path"], q_span=span,
                     M1=None if marked[0] else m1, M3=None if marked[1] else m3,
@@ -573,8 +665,11 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
                 receipt["batches"].append(dict(q_span=span,support_ranks=ranks))
                 del h,m1,m3
             del a0,a1
-            receipt["correlation_count"] += 6
+            receipt["correlation_count"] += 10 if ordered else 6
     ledger.live_stages = ambient
+    if odd_writer is not None:
+        odd_writer[0].__exit__(None, None, None)
+        receipt["odd_moments_file"] = str(Path(bank_io["path"]).with_name("moments_odd.h5"))
     receipt["completion"] = bool(np.asarray(header["moment_written"]).all())
     return _finish_receipt(receipt,meta,header,started)
 
