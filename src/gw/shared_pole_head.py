@@ -95,6 +95,15 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
             from file_io.shared_pole_store import validate_shared_pole_model
             header = validate_shared_pole_model(handle["path"], expected_identity=handle["identity"],
                 mesh_xy=mesh_xy, capacity=ledger)
+        if str(header.get("representation", "")) != "scalar-trs-even-s":
+            raise ValueError(
+                "GATE shared_pole_head_ordered: got representation "
+                f"{header.get('representation')!r}; want scalar-trs-even-s; why: the Gamma "
+                "body evaluates the time-reversal-even form b (s - Lambda)^-1 b^dagger, which "
+                "is not the signed particle-hole model an ordered store declares, so an "
+                "ordered head would be silently wrong on the dominant Sigma term. The signed "
+                "Gamma head belongs to the head branch and is pending there; until it lands, "
+                "run an ordered deck with head_correction = off and qp_solver = one_shot_dft.")
         parents = np.flatnonzero(np.asarray(header["q_irr_full_idx"]) == 0)
         if len(parents) != 1:
             raise ValueError("GATE shared_pole_head: expected one Gamma parent")
