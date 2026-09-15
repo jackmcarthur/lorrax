@@ -740,34 +740,35 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
         return jnp.where(logical[None, :, :], A_loc,
                          jnp.zeros((), dtype=A_loc.dtype))
 
-    # The two collectives ``_a_local`` emits, per q (2-D block GEMM):
-    #   all_gather('y')  V   (μ/Px, μ/Py) -> (μ/Px, μ)  = μ²/Px · 16 B
-    #   all_gather('x')  χ   (μ/Px, μ/Py) -> (μ, μ/Py)  = μ²/Py · 16 B
-    # The BIGGER of the two sets the q-block (see ``_chunk_q``).
-    per_q_coll = max(n_ext * (n_ext // px), n_ext * (n_ext // py)) * 16
+    # Replacement workspace never grows into a full row/column: the pair
+    # of operand panels shares one face-sized slot, with a one-column floor
+    # for degenerate tiny tiles. The q planner bounds this same live slot.
+    per_q_panel_bytes = 16 * max((n_ext // px) * (n_ext // py),
+                                 n_ext // px + n_ext // py)
+    per_q_coll = per_q_panel_bytes
 
-    @partial(shard_map, mesh=mesh_xy,
-             in_specs=(P(None, 'x', 'y'), P(None, 'x', 'y')),
+    @partial(shard_map, mesh=mesh_xy, in_specs=P(None, 'x', 'y'),
              out_specs=P(None, 'x', 'y'), check_vma=False)
-    def _a_local(V_loc, chi_loc):
-        # A[q,i,j] = δ_ij − Σ_k V[q,i,k]·χs[q,k,j] on my (i on 'x',
-        # j on 'y') tile.  Classic 2-D block GEMM pairing — same shape
-        # of communication as ``isdf.core._distributed_pinv_apply``.
-        # Mask BOTH inputs here, before either gather: the public seam
-        # authenticates their common product-padded extent, while this local
-        # operation makes the exact-zero pad contract structural even if an
-        # upstream padded buffer was poisoned.  No full μ² tile is formed.
-        V_loc = _logical_tile(V_loc)
-        chi_loc = _logical_tile(chi_loc)
-        V_row = jax.lax.all_gather(V_loc, 'y', axis=2, tiled=True)
-        chi_col = jax.lax.all_gather(chi_loc, 'x', axis=1, tiled=True)
-        prod = jnp.einsum('qik,qkj->qij', V_row, chi_col)
+    def _mask_face(value):
+        return _logical_tile(value)
+
+    @partial(shard_map, mesh=mesh_xy, in_specs=P(None, 'x', 'y'),
+             out_specs=P(None, 'x', 'y'), check_vma=False)
+    def _identity_minus(prod):
         i0 = jax.lax.axis_index('x') * (n_ext // px)
         j0 = jax.lax.axis_index('y') * (n_ext // py)
         eye_tile = jnp.equal(
             i0 + jnp.arange(n_ext // px)[:, None],
-            j0 + jnp.arange(n_ext // py)[None, :]).astype(V_loc.dtype)
+            j0 + jnp.arange(n_ext // py)[None, :]).astype(prod.dtype)
         return eye_tile[None, :, :] - prod
+
+    def _a_local(V, chi):
+        from distrib_la import panel_matmul
+        # A = I - V chi. Mask both operands before any communication;
+        # poisoned padding cannot enter physical rows through the product.
+        prod = panel_matmul(_mask_face(V), _mask_face(chi), mesh=mesh_xy,
+                            panel_bytes=V.shape[0] * per_q_panel_bytes)
+        return _identity_minus(prod)
 
     @partial(jax.jit, donate_argnums=(2,), out_shardings=nat)
     def _a_chunk(V_blk, chi_blk, A_acc, q0):
