@@ -224,6 +224,9 @@ from symmetry_maps.maps import (
     unfold_psi,
     unfold_isdf_operator,
     unfold_operator_local,
+    certify_endpoint_locality,
+    endpoint_panel_cost,
+    unfold_endpoint_panel,
     open_spin_block_coefficient,
     unfold_spin_centroid_operator,
     unfold_isdf_one_leg,
@@ -286,6 +289,7 @@ from symmetry_maps.qgrid_trs import (
     QgridTrsPolicy,
     build_qgrid_trs_policy,
     little_group_covariance_residual,
+    project_little_group_operator,
     self_negative_q_mask,
     trs_pair_coherent_unfold_sym_idx,
     trs_project_self_negative_q_rows,
@@ -328,6 +332,7 @@ __all__ = [
     # sharded q-axis unfolds
     "slice_q_full_to_ibz", "unfold_isdf_operator",
     "unfold_operator_local", "open_spin_block_coefficient",
+    "certify_endpoint_locality", "endpoint_panel_cost", "unfold_endpoint_panel",
     "unfold_spin_centroid_operator", "unfold_isdf_one_leg",
     "mix_lorentz_blocks",
     # psi unfold / antiunitary rule
@@ -374,7 +379,7 @@ __all__ = [
     # the q-axis TRS POLICY that consumes that measurement, and the
     # covariance statistic the unfold's own contract rests on
     "QgridTrsPolicy", "build_qgrid_trs_policy",
-    "little_group_covariance_residual", "self_negative_q_mask",
+    "little_group_covariance_residual", "project_little_group_operator", "self_negative_q_mask",
     "trs_pair_coherent_unfold_sym_idx", "trs_project_self_negative_q_rows",
     # ---------------------------------------------------------------
     # PRE-SWEEP SPELLINGS.  Aliases, not definitions — see

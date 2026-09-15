@@ -83,6 +83,7 @@ __all__ = [
     "QgridTrsPolicy",
     "build_qgrid_trs_policy",
     "little_group_covariance_residual",
+    "project_little_group_operator",
     "self_negative_q_mask",
     "trs_pair_coherent_unfold_sym_idx",
     "trs_project_self_negative_q_rows",
@@ -319,6 +320,172 @@ def _covariance_residual_fn():
 _COVARIANCE_OPS_BUDGET = 64
 
 
+def _little_group_operations(q_full_idx, *, kgrid, sym_mats_k,
+                             active_symmetry_rows):
+    """Exact, complete stabilizers on an unshifted rectangular q mesh.
+
+    The caller supplies authenticated canonical operation rows. Reciprocal
+    matrices already contain the antiunitary minus. Integer common-denominator
+    coordinates keep the test exact also when mesh dimensions differ.
+    """
+    grid = np.asarray(kgrid)
+    reps = np.asarray(q_full_idx)
+    rotations = np.asarray(sym_mats_k)
+    active = np.asarray(active_symmetry_rows)
+    if (grid.shape != (3,) or grid.dtype.kind not in "iu"
+            or np.any(grid <= 0)):
+        raise ValueError("little-group kgrid must contain three positive integers")
+    if (reps.ndim != 1 or reps.size == 0 or reps.dtype.kind not in "iu"
+            or np.any(reps < 0) or np.any(reps >= np.prod(grid))
+            or np.unique(reps).size != reps.size):
+        raise ValueError("little-group q_full_idx must name distinct valid mesh rows")
+    if (rotations.ndim != 3 or rotations.shape[1:] != (3, 3)
+            or rotations.dtype.kind not in "iu"):
+        raise ValueError("little-group reciprocal matrices must be integer [row,3,3]")
+    if (active.ndim != 1 or active.size == 0 or active.dtype.kind not in "iu"
+            or np.unique(active).size != active.size or np.any(active < 0)
+            or np.any(active >= rotations.shape[0])):
+        raise ValueError("little-group authorized rows must be distinct valid canonical IDs")
+    denominator = int(np.lcm.reduce(grid.astype(np.int64)))
+    coords = np.stack(np.unravel_index(reps, tuple(grid)), axis=1)
+    scaled = coords * (denominator // grid)[None, :]
+    return [active[np.all(
+        (rotations[active] @ point - point) % denominator == 0, axis=1)]
+        for point in scaled]
+
+
+_LITTLE_GROUP_PROJECTORS = {}
+
+
+def project_little_group_operator(
+    operator, *, transposed_partner, q_full_idx, q_irr_frac, sym_mats_k,
+    sym_perm, L_table, active_symmetry_rows, kgrid, n_sym_spatial, mesh,
+    active_mask=None,
+):
+    r"""Reynolds projection of scalar parent operators at one complex time.
+
+    Every AUTHORIZED unitary and antiunitary stabilizer of each q contributes
+    once. At the same complex time the latter transforms residue endpoints,
+    not the scalar time weight: supply ``transposed_partner = operator.T``.
+    Returns ``(average, average.T)`` in ``P(None,'x','y')``. No TRS or spatial
+    operation is inferred from the values being projected.
+
+    ``sym_perm`` and ``L_table`` are the canonical centroid source/wrap action
+    in the operator's actual (possibly orbit-packed) endpoint order. Inputs
+    must be authenticated group tables; the service checks their carrier,
+    row identities and q indexing, but does not discover a physical group.
+    Numerical arrays remain dynamic operands of a cached callable.
+
+    One fixed-shape ``fori_loop`` streams into one parent-sized accumulator.
+    The canonical permutation backend uses volume-preserving all-to-all for
+    nonlocal endpoint maps; each matrix intermediate has at most b*M*M/P
+    entries on a rank. There is no operation axis on a matrix or factor.
+    Aggregate live memory still includes the inputs and permutation scratch.
+
+    Applied pole by pole this is an average of PSD residue congruences, hence
+    preserves positivity and the real poles. It changes the symmetry-breaking
+    part of an approximate model; callers must measure that scientific change.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from ._shard_map import shard_map
+    from .maps import (_apply_unfold_phase_and_trs_local,
+                       _permute_isdf_operator_axes_local,
+                       certify_endpoint_locality)
+
+    shape = tuple(operator.shape)
+    if (len(shape) != 3 or shape[1] != shape[2]
+            or transposed_partner.shape != operator.shape
+            or transposed_partner.dtype != operator.dtype
+            or np.dtype(operator.dtype).kind != "c"):
+        raise ValueError("little-group projection requires matching complex square parent tiles")
+    b, m, _ = shape
+    qids, qfrac = np.asarray(q_full_idx), np.asarray(q_irr_frac)
+    perm, wraps = np.asarray(sym_perm), np.asarray(L_table)
+    rotations, active = np.asarray(sym_mats_k), np.asarray(active_symmetry_rows)
+    nsp = int(n_sym_spatial)
+    if (nsp < 1 or rotations.shape != (2*nsp, 3, 3)
+            or perm.shape != (2*nsp, m) or wraps.shape != (2*nsp, m, 3)
+            or perm.dtype.kind not in "iu" or wraps.dtype.kind not in "iu"):
+        raise ValueError("little-group source/wrap/reciprocal tables must cover both canonical row halves")
+    if (qids.shape != (b,) or qfrac.shape != (b, 3)
+            or not np.all(np.isfinite(qfrac))):
+        raise ValueError("little-group q metadata must address every parent tile")
+    stabilizers = _little_group_operations(
+        qids, kgrid=kgrid, sym_mats_k=rotations,
+        active_symmetry_rows=active)
+    coords = np.stack(np.unravel_index(qids, tuple(kgrid)), axis=1)
+    delta = qfrac - coords/np.asarray(kgrid)[None, :]
+    if not np.allclose(delta, np.rint(delta), rtol=0., atol=1e-12):
+        raise ValueError("little-group q_irr_frac disagrees with canonical mesh rows")
+    identity = [int(s) for s in active if s < nsp
+                and np.array_equal(rotations[s], np.eye(3, dtype=int))
+                and np.array_equal(perm[s], np.arange(m))
+                and np.all(wraps[s] == 0)]
+    if not identity or any(rows.size == 0 for rows in stabilizers):
+        raise ValueError("little-group authorized operations must include the identity")
+    mask = np.ones(m, dtype=bool) if active_mask is None else np.asarray(active_mask, dtype=bool)
+    if mask.shape != (m,):
+        raise ValueError("little-group active_mask must address the centroid carrier")
+    # Content and placement key. No JAX value enters a process-global cache.
+    key = (shape, np.dtype(operator.dtype).str, mesh, nsp, tuple(kgrid),
+           tuple((x.shape, x.dtype.str, x.tobytes()) for x in
+                 (qids, qfrac, rotations, perm, wraps, active, mask)))
+    compiled = _LITTLE_GROUP_PROJECTORS.get(key)
+    if compiled is None:
+        certificates = {axis: certify_endpoint_locality(
+            perm, mesh=mesh, mesh_axis=axis, active_mask=mask)
+            for axis in ("x", "y")}
+        px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+        if (not all(c["is_local"] for c in certificates.values())
+                and m % (px*py)):
+            raise ValueError("little-group nonlocal operator carrier must already divide Px*Py")
+        counts = np.asarray([rows.size for rows in stabilizers], dtype=np.int32)
+        steps = int(counts.max())
+        ops = np.full((steps, b), identity[0], dtype=np.int32)
+        valid = np.zeros((steps, b), dtype=np.float64)
+        for parent, rows in enumerate(stabilizers):
+            ops[:rows.size, parent] = rows
+            valid[:rows.size, parent] = 1./rows.size
+        sh = NamedSharding(mesh, P(None, "x", "y"))
+
+        def local(plus, partner):
+            x, y = jax.lax.axis_index("x"), jax.lax.axis_index("y")
+            ml, nl = plus.shape[1:]
+            def step(index, total):
+                rows = jnp.asarray(ops)[index]
+                anti = rows >= nsp
+                source = jnp.where(anti[:, None, None], partner, plus)
+                selected_perm = jnp.asarray(perm)[rows]
+                left = certificates["x"]["local_perm"]
+                right = certificates["y"]["local_perm"]
+                transformed = _permute_isdf_operator_axes_local(
+                    source, selected_perm, selected_perm, mesh_x=px, mesh_y=py,
+                    left_local_source_map=(None if left is None else jnp.asarray(left)[rows]),
+                    right_local_source_map=(None if right is None else jnp.asarray(right)[rows]))
+                phase = jnp.exp(2j*jnp.pi*jnp.einsum(
+                    "qi,qmi->qm", jnp.asarray(qfrac), jnp.asarray(wraps)[rows]))
+                phase_x = jax.lax.dynamic_slice_in_dim(phase, x*ml, ml, axis=1)
+                phase_y = jax.lax.dynamic_slice_in_dim(phase, y*nl, nl, axis=1)
+                transformed = _apply_unfold_phase_and_trs_local(
+                    transformed, phase_x, phase_y, anti, pair_transpose=True)
+                return total + jnp.asarray(valid)[index, :, None, None]*transformed
+            return jax.lax.fori_loop(0, steps, step, jnp.zeros_like(plus))
+
+        mapped = shard_map(local, mesh=mesh,
+                           in_specs=(P(None, "x", "y"),)*2,
+                           out_specs=P(None, "x", "y"), check_vma=False)
+        @jax.jit
+        def project(plus, partner):
+            average = mapped(plus, partner)
+            transposed = jax.lax.with_sharding_constraint(
+                jnp.swapaxes(average, -2, -1), sh)
+            return average, transposed
+        compiled = _LITTLE_GROUP_PROJECTORS[key] = project
+    return compiled(operator, transposed_partner)
+
+
 def little_group_covariance_residual(
     V_ibz,
     *,
@@ -457,13 +624,12 @@ def little_group_covariance_residual(
 
     # Little group of each retained parent, in INTEGER mesh coordinates so
     # the ``≡ mod grid`` is exact (no float tolerance anywhere).
+    stabilizers = _little_group_operations(
+        reps, kgrid=grid, sym_mats_k=S_all, active_symmetry_rows=active)
     pairs: list[tuple[int, int]] = []
     for p in keep:
-        qc = coords[int(p)]
-        images = (S @ qc) % grid[None, :]
-        for search_row in np.flatnonzero(
-                np.all(images == qc[None, :], axis=1)):
-            s = int(active[int(search_row)])
+        for row in stabilizers[int(p)]:
+            s = int(row)
             is_identity = (
                 s < n_spatial
                 and np.array_equal(S_all[s], np.eye(3, dtype=np.int64))
@@ -541,7 +707,8 @@ class QgridTrsPolicy:
     def n_self_negative(self) -> int:
         return int(np.count_nonzero(self.self_negative_q))
 
-    def project_fixed_q(self, operator, q_full_idx):
+    def project_fixed_q(self, operator, q_full_idx, *,
+                        transposed_partner=None, measure=True):
         """``(operator, removed)`` — the Θ projector, and what it removed.
 
         On a measured-TRS deck this applies the one-element group average
@@ -550,12 +717,42 @@ class QgridTrsPolicy:
         1e-2 defect is the "instrument that measures and proceeds" failure
         wearing a repair's clothes.
 
+        With ``transposed_partner`` (same shape, dtype and rectangular
+        sharding as ``operator``), use the pair-transpose average at the
+        same complex time instead. No transpose or conjugation is formed.
+        ``measure=True`` returns a device vector of per-row Frobenius
+        ``||W-W^T||/||W||`` (zero on non-fixed rows); ``False`` omits the
+        reduction and is suitable inside a collective-free shard_map.
+        This additive path is JIT-compatible; q_full_idx is host metadata.
+
         On a TRS-BROKEN deck it is the identity and ``removed`` is
         ``None``.  There is no warrant for the projection there: the rows
         were solved independently and Θ is not a symmetry of this mean
         field, so ``V_q`` at a TRIM point is whatever the fit produced and
         the reciprocity gate should see it.
         """
+        # At complex time, Θ acts on the residue endpoints, not on the
+        # time weight. The supplied partner is W^T at the SAME tau.
+        if transposed_partner is not None:
+            import jax.numpy as jnp
+
+            if (transposed_partner.shape != operator.shape
+                    or transposed_partner.dtype != operator.dtype):
+                raise ValueError("pair-transpose partner must match operator shape/dtype")
+            fixed = self_negative_q_mask(q_full_idx, kgrid=self.kgrid)
+            if int(operator.shape[0]) != int(fixed.size):
+                raise ValueError("pair-transpose q_full_idx must address every operator row")
+            if not self.trs_measured or not np.any(fixed):
+                return operator, None
+            mask = jnp.asarray(fixed).reshape((-1,) + (1,) * (operator.ndim - 1))
+            out = jnp.where(mask, 0.5 * (operator + transposed_partner), operator)
+            if not measure:
+                return out, None
+            axes = tuple(range(1, operator.ndim))
+            dev = jnp.sqrt(jnp.sum(jnp.abs(operator - transposed_partner)**2, axis=axes))
+            scale = jnp.sqrt(jnp.sum(jnp.abs(operator)**2, axis=axes))
+            relative = dev / jnp.where(scale > 0, scale, 1.0)
+            return out, jnp.where(jnp.asarray(fixed), relative, 0.0)
         if not self.trs_measured:
             return operator, None
         fixed = self_negative_q_mask(q_full_idx, kgrid=self.kgrid)
