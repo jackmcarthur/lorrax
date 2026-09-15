@@ -1962,10 +1962,12 @@ def compute_photon_response_roles(
     the identical reason.
 
     THE HEAD AT ω ≠ 0.  ``build_static_photon_head_response`` is a static
-    object and this tip has no dynamic packed photon head, so a
-    finite-frequency role carries the ω = 0 Γ-cell completion FROZEN.  That is
-    stamped into ``approximation`` as ``frozen_static_head``: a consumer must
-    not read a finite-ω role as head-converged.
+    object and this tip has no dynamic packed photon head.  A finite-ω EVEN
+    role carries the ω = 0 Γ-cell completion frozen (``frozen_static_head``).
+    A finite-ω ORDERED role — every imaginary-axis role, see
+    :func:`gw.screening.photon_role_quadratures` — is not Hermitian on a
+    magnet and cannot take that fold, so its q = 0 rows are withheld
+    (``q0_rows_withheld_no_dynamic_head``); its q ≠ 0 rows are unaffected.
     """
     from common import collectives
     role_quads = tuple(
@@ -2042,19 +2044,37 @@ def compute_photon_response_roles(
         # (``photon_layout._q0_update_program``, donate_argnums=(0,)), so every
         # role but the last hands it a duplicate and keeps the bare V alive for
         # the next role's Dyson solve.
-        (V_packed, W_role, head_completion) = _complete_static_photon_head(
-            coupled_head,
-            V_bare if index == last else _duplicate_packed(V_bare, mesh_xy),
-            W_packed, wfns_charge, config, mesh_xy, wfn,
-            meta, layout, hall, wfn_fingerprint_binding, photon_g0_vectors,
-            plans, print_fn)
+        # A finite-omega ORDERED role is not Hermitian on a magnet, and the
+        # Gamma-cell completion is derived for a Hermitian static response: it
+        # refuses by name (GATE static_gauge_head_fold_hermiticity, measured
+        # 7.0e-5 on CrI3), and folding it into the Hermitian part alone would
+        # be an invented object.  This tip has no dynamic packed photon head.
+        # So the role's q = 0 rows are WITHHELD — stamped, never reported as W
+        # and never consumed — while its q != 0 rows, which the completion
+        # never touches, are the measurement (coordinator ruling 2026-09-15 on
+        # the lane's ASK; the dynamic Hall head is the owner's scope call).
+        # This is not a headless mode: nothing downstream receives these q = 0
+        # rows.  One rule, decided by what the role is, never by trying the
+        # fold and falling back.
+        skip_head = bool(coupled_head and index > 0 and ordered)
+        if skip_head:
+            V_packed, W_role, head_completion = V_bare, W_packed, None
+        else:
+            (V_packed, W_role, head_completion) = _complete_static_photon_head(
+                coupled_head,
+                V_bare if index == last else _duplicate_packed(V_bare, mesh_xy),
+                W_packed, wfns_charge, config, mesh_xy, wfn,
+                meta, layout, hall, wfn_fingerprint_binding, photon_g0_vectors,
+                plans, print_fn)
         stamp = (
             (("gamma_completed_no_pair_static_photon_v1" if coupled_head
               else "DEBUG_headless_no_pair_static_photon_v1")
              if screen_current else
              ("gamma_completed_bare_transverse_photon_v1" if coupled_head
               else "DEBUG_headless_bare_transverse_photon_v1"))
-            + ("_frozen_static_head" if (coupled_head and index > 0) else "")
+            + ("_frozen_static_head"
+               if (coupled_head and index > 0 and not skip_head) else "")
+            + ("_q0_rows_withheld_no_dynamic_head" if skip_head else "")
             + ("_ordered" if ordered else "")
             + (f"_{tt_contact}" if (screen_current and index > 0) else ""))
         responses[role] = StaticPhotonResponse(
@@ -2204,7 +2224,8 @@ def photon_role_block_report(responses, mesh_xy, *, print_fn=print,
                              "all q, per role\n")
                 for role, row in table.items():
                     handle.write(
-                        f"{role}\t" + "\t".join(
+                        f"{role}\t{responses[role].approximation}\t"
+                        + "\t".join(
                             f"{name}={row[name]:.10e}"
                             for name in _PHOTON_CHANNEL_CLASS) + "\n")
             print_fn(f"  [photon roles] wrote {dump_path} "
