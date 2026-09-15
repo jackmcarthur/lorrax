@@ -608,6 +608,8 @@ set(LORRAX_FFI_SOURCES
     active_subspace/active_eigh.cc
     active_subspace/active_ops.cc
     cublas/local_active_gemm_ffi.cc
+    common/contour_accumulate.cu
+    common/contour_accumulate_ffi.cc
     cusolvermp/context.cc
     cusolvermp/eigh_ffi.cc
     cusolvermp/batched_potrf_ffi.cc
