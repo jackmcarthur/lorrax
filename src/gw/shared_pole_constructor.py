@@ -905,6 +905,24 @@ def _parent_result_slice(mesh_xy):
 
 
 @lru_cache(maxsize=None)
+def _stack_faces_kernel(mesh):
+    """Concatenate [b,n,n] response faces along the leading axis on the x/y face."""
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    return jax.jit(lambda faces: jnp.concatenate(faces, axis=0),
+                   out_shardings=NamedSharding(mesh, P(None, 'x', 'y')))
+
+
+@lru_cache(maxsize=256)
+def _sample_rows_kernel(mesh, rows, width):
+    """Leading ``rows`` rows and first ``width`` columns of a [B,n,r] face."""
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    return jax.jit(lambda q, start: jax.lax.dynamic_slice_in_dim(q, start, rows, axis=0)[:, :, :width],
+                   out_shardings=NamedSharding(mesh, P(None, 'x', 'y')))
+
+
+@lru_cache(maxsize=None)
 def _hermitian_part_kernel(mesh):
     """Reuse Hermitian projection on current [b,n,n] response faces."""
     import jax
@@ -971,6 +989,12 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
     Output states keep their batch axis. Counts and role receipts are small
     host metadata; the packer compacts each parent's original port carriers.
 
+    The spectral cuts of consecutive fitted samples share one service call per
+    role kind, with as many [n,n] rows per call as the mesh has devices (one
+    whole matrix per device on the local route); a parent batch that already
+    fills the mesh keeps one sample per call. Each sample is read once, every
+    row keeps its own cut and carrier, and states keep fit order.
+
     Ordered data pair every state X(z) on direction Q with its particle-hole
     mirror X(-z) on the SAME Q, the layout ``reduce_ordered_shared_pole_pencil``
     cuts in. The mirror needs W(-conj z) and dW/ds(-conj z): for purely
@@ -982,7 +1006,8 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
     import distrib_la
     import numpy as np
 
-    hermitian_part = _hermitian_part_kernel(eigh_plan.mesh)
+    mesh = eigh_plan.mesh
+    hermitian_part = _hermitian_part_kernel(mesh)
     fit_roles = _fit_roles(recipe)
     fit_ids = [int(i) for i in recipe["fit_ids"]]
     mirror_source = {}
@@ -1001,90 +1026,118 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
     mirrors, mirror_counts, mirror_roles = [], [], []
     def largest_side():
         return infinity_carrier + sum(st[1].shape[-1] for st in (*states, *mirrors))
-    for sample_id in fit_ids:
-        if sample_id in skip:
-            continue
-        admit(largest_side())
-        w, derivative = read_sample(int(sample_id), states)
-        if not roles:
-            roles = [[] for _ in range(w.shape[0])]
-            mirror_roles = [[] for _ in range(w.shape[0])]
-        first = len(states)
-        for role in fit_roles:
-            if role["held"] or int(role["sample_id"]) != int(sample_id):
-                continue
+    order = [sample_id for sample_id in fit_ids if sample_id not in skip]
+    owned = {sample_id: [(index, role) for index, role in enumerate(fit_roles)
+                         if not role["held"] and int(role["sample_id"]) == int(sample_id)]
+             for sample_id in order}
+    for sample_id in order:
+        for _, role in owned[sample_id]:
             kind = role["role"].split(":", 1)[0]
-            if kind == "line":
-                q_batch, values = distrib_la.right_singular_vectors(
-                    w, recipe["direction_cutoff"], eigh_plan=svd_plan,
-                    column_extent=column_extent,
-                    multiplet_tol=recipe["multiplet_relative_tolerance"])
-            elif kind == "imaginary":
-                width = min(logical_n, max(1, int(recipe["imaginary_width"])))
-                q_batch, values = distrib_la.leading_eigenvectors(
-                    hermitian_part(-w), width, eigh_plan=eigh_plan,
-                    column_extent=column_extent,
-                    multiplet_tol=recipe["multiplet_relative_tolerance"])
-            else:
+            if kind not in ("line", "imaginary"):
                 raise ValueError(f"GATE shared_pole_role: got: {kind}; want: line or imaginary fitted role; why: unknown tangent semantics")
-            widths = tuple(int(v.shape[-1]) for v in values)
-            if any(width < 1 or width > logical_n for width in widths):
-                raise ValueError(f"GATE shared_pole_directions: got: ranks {widths}; want: 1..{logical_n}; why: empty or padded physical direction set")
-            s = (_sample_point(recipe, int(sample_id)) if ordered
-                 else _sample_point(recipe, int(sample_id)) ** 2)
-            # W(s*)=W(s).H: its right singular space is the LEFT space
-            # of W(s). Use WQ=U sigma without another selection or transport.
-            # Column equilibration removes sigma; this also preserves the
-            # conjugate space when the underlying response is real symmetric.
-            # Ordered data: nodes are z; every role takes its conjugate partner
-            # (Wc(conj z) = Wc(z)^H holds without time reversal) and actions
-            # use dW/dz = 2 z dW/ds.
-            for conjugate in ((False, True) if (ordered or kind == "line") and s.imag != 0 else (False,)):
-                admit(largest_side() + q_batch.shape[-1])
-                transa = "C" if conjugate else "N"
-                state_widths = widths
-                if conjugate and ordered and (kind == "imaginary" or s.real == 0):
-                    # Dedupe before the cut: only partner directions orthogonal to Q survive.
-                    direction, state_widths = _odd_partner_directions(
-                        states[-1][1], states[-1][2], recipe["direction_cutoff"], eigh_plan=eigh_plan,
-                        matmul=matmul, column_extent=column_extent,
-                        multiplet_tol=recipe["multiplet_relative_tolerance"])
-                    if direction is None:
-                        continue
-                else:
-                    direction = states[-1][2] if conjugate else q_batch
-                output = matmul(w, direction, transa=transa)
-                action = matmul(derivative, direction, transa=transa)
-                if ordered:
-                    action = action * (2 * (s.conjugate() if conjugate else s))
-                states.append((s.conjugate() if conjugate else s, direction, output, action))
-                conjugates.append(conjugate)
-                counts.append(state_widths)
-                for i, width in enumerate(state_widths):
-                    roles[i].append({"sample_id": int(sample_id), "role": role["role"],
-                                     "conjugate": conjugate, "width": width,
-                                     "carrier_width": column_extent(width)})
-            del q_batch, direction, output, action
-        if ordered and len(states) > first:
-            if _sample_point(recipe, int(sample_id)).real == 0:
-                w_m, d_m = w, derivative
-            elif read_mirror is not None:
-                w_m, d_m = read_mirror(int(sample_id))
+    pending = list(order)
+    while pending:
+        admit(largest_side())
+        head = read_sample(int(pending[0]), states)
+        rows = int(head[0].shape[0])
+        chunk = max(1, int(mesh.size) // rows)
+        group, pending = pending[:chunk], pending[chunk:]
+        reads = {group[0]: head}
+        for sample_id in group[1:]:
+            reads[sample_id] = read_sample(int(sample_id), states)
+        del head
+        spectra = {}
+        for kind in ("line", "imaginary"):
+            entries = [(sample_id, index) for sample_id in group
+                       for index, role in owned[sample_id] if role["role"].split(":", 1)[0] == kind]
+            if not entries:
+                continue
+            stack = _stack_faces_kernel(mesh)(tuple(reads[sample_id][0] for sample_id, _ in entries))
+            if kind == "line":
+                q_all, values = distrib_la.right_singular_vectors(
+                    stack, recipe["direction_cutoff"], eigh_plan=svd_plan,
+                    column_extent=column_extent,
+                    multiplet_tol=recipe["multiplet_relative_tolerance"])
             else:
-                w_m, d_m = read_sample(mirror_source[int(sample_id)], states)
-            # W(-z) = W(-conj z)^H on Q; W(-conj z) on the partner's O; in both
-            # cases dW/dz at the mirror node is -2 node dW/ds(-conj z) (adjoint on Q).
-            for index in range(first, len(states)):
-                node, direction = states[index][0], states[index][1]
-                admit(largest_side() + direction.shape[-1])
-                transa = "N" if conjugates[index] else "C"
-                mirrors.append((-node, direction, matmul(w_m, direction, transa=transa),
-                                matmul(d_m, direction, transa=transa) * (-2 * node)))
-                mirror_counts.append(counts[index])
-                for i in range(len(roles)):
-                    mirror_roles[i].append(dict(roles[i][index], mirror=True))
-            del w_m, d_m
-        del w, derivative
+                width = min(logical_n, max(1, int(recipe["imaginary_width"])))
+                q_all, values = distrib_la.leading_eigenvectors(
+                    hermitian_part(-stack), width, eigh_plan=eigh_plan,
+                    column_extent=column_extent,
+                    multiplet_tol=recipe["multiplet_relative_tolerance"])
+            del stack
+            for i, key in enumerate(entries):
+                row_values = tuple(values[i * rows:(i + 1) * rows])
+                extent = column_extent(max(int(v.shape[-1]) for v in row_values))
+                spectra[key] = (_sample_rows_kernel(mesh, rows, extent)(q_all, np.int32(i * rows)), row_values)
+            del q_all, values
+        for sample_id in group:
+            admit(largest_side())
+            w, derivative = reads.pop(sample_id)
+            if not roles:
+                roles = [[] for _ in range(w.shape[0])]
+                mirror_roles = [[] for _ in range(w.shape[0])]
+            first = len(states)
+            for index, role in owned[sample_id]:
+                kind = role["role"].split(":", 1)[0]
+                q_batch, values = spectra.pop((sample_id, index))
+                widths = tuple(int(v.shape[-1]) for v in values)
+                if any(width < 1 or width > logical_n for width in widths):
+                    raise ValueError(f"GATE shared_pole_directions: got: ranks {widths}; want: 1..{logical_n}; why: empty or padded physical direction set")
+                s = (_sample_point(recipe, int(sample_id)) if ordered
+                     else _sample_point(recipe, int(sample_id)) ** 2)
+                # W(s*)=W(s).H: its right singular space is the LEFT space
+                # of W(s). Use WQ=U sigma without another selection or transport.
+                # Column equilibration removes sigma; this also preserves the
+                # conjugate space when the underlying response is real symmetric.
+                # Ordered data: nodes are z; every role takes its conjugate partner
+                # (Wc(conj z) = Wc(z)^H holds without time reversal) and actions
+                # use dW/dz = 2 z dW/ds.
+                for conjugate in ((False, True) if (ordered or kind == "line") and s.imag != 0 else (False,)):
+                    admit(largest_side() + q_batch.shape[-1])
+                    transa = "C" if conjugate else "N"
+                    state_widths = widths
+                    if conjugate and ordered and (kind == "imaginary" or s.real == 0):
+                        # Dedupe before the cut: only partner directions orthogonal to Q survive.
+                        direction, state_widths = _odd_partner_directions(
+                            states[-1][1], states[-1][2], recipe["direction_cutoff"], eigh_plan=eigh_plan,
+                            matmul=matmul, column_extent=column_extent,
+                            multiplet_tol=recipe["multiplet_relative_tolerance"])
+                        if direction is None:
+                            continue
+                    else:
+                        direction = states[-1][2] if conjugate else q_batch
+                    output = matmul(w, direction, transa=transa)
+                    action = matmul(derivative, direction, transa=transa)
+                    if ordered:
+                        action = action * (2 * (s.conjugate() if conjugate else s))
+                    states.append((s.conjugate() if conjugate else s, direction, output, action))
+                    conjugates.append(conjugate)
+                    counts.append(state_widths)
+                    for i, width in enumerate(state_widths):
+                        roles[i].append({"sample_id": int(sample_id), "role": role["role"],
+                                         "conjugate": conjugate, "width": width,
+                                         "carrier_width": column_extent(width)})
+                del q_batch, direction, output, action
+            if ordered and len(states) > first:
+                if _sample_point(recipe, int(sample_id)).real == 0:
+                    w_m, d_m = w, derivative
+                elif read_mirror is not None:
+                    w_m, d_m = read_mirror(int(sample_id))
+                else:
+                    w_m, d_m = read_sample(mirror_source[int(sample_id)], states)
+                # W(-z) = W(-conj z)^H on Q; W(-conj z) on the partner's O; in both
+                # cases dW/dz at the mirror node is -2 node dW/ds(-conj z) (adjoint on Q).
+                for index in range(first, len(states)):
+                    node, direction = states[index][0], states[index][1]
+                    admit(largest_side() + direction.shape[-1])
+                    transa = "N" if conjugates[index] else "C"
+                    mirrors.append((-node, direction, matmul(w_m, direction, transa=transa),
+                                    matmul(d_m, direction, transa=transa) * (-2 * node)))
+                    mirror_counts.append(counts[index])
+                    for i in range(len(roles)):
+                        mirror_roles[i].append(dict(roles[i][index], mirror=True))
+                del w_m, d_m
+            del w, derivative
     if ordered:
         states, counts = states + mirrors, counts + mirror_counts
         roles = [row + mirror_row for row, mirror_row in zip(roles, mirror_roles)]
@@ -1165,7 +1218,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         from file_io.shared_pole_store import (
             validate_shared_pole_bank, read_shared_pole_bank, write_shared_pole_model,
         )
-        from gw.gw_config import linalg_resolution
+        from gw.gw_config import dense_layout, linalg_resolution
         from gw.shared_pole_recipe import (
             construction_receipt, shared_real_pole_gates_v1_r3b as gates,
             shared_real_pole_gates_ordered_v1,
@@ -1201,18 +1254,21 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
 
         def eigenplan(side):
             if side not in plans:
+                # Whole matrices per device at or below the measured eigh extent.
+                routed = linalg_resolution({"linalg": dense_layout(resolution, "eigh", side)})
                 plans[side] = distrib_la.plan(
-                    "eigh", mesh_xy, n=side, backend=resolution.eigh_backend,
-                    batched_route=resolution.batched_route)
+                    "eigh", mesh_xy, n=side, backend=routed.eigh_backend,
+                    batched_route=routed.batched_route)
             return plans[side]
 
-        def query_workspace(op, shapes, plan):
+        def query_workspace(op, shapes, plan, route=None):
             nonlocal workspace
-            key = (op, shapes)
+            route = resolution.batched_route if route is None else route
+            key = (op, shapes) if route == resolution.batched_route else (op, shapes, route)
             if key not in native_queries:
                 size = (distrib_la.matmul_workspace_bytes_per_rank(
                     mesh_xy, shapes, np.complex128, backend="auto",
-                    batched_route=resolution.batched_route) if op == "gemm" else
+                    batched_route=route) if op == "gemm" else
                     distrib_la.workspace_bytes_per_rank(plan, op, shapes, np.complex128))
                 native_queries[key] = size
             if op == "gemm":
@@ -1258,7 +1314,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 for extent in sorted(extents))
             workspace = sum(native_maxima.values())
             price = shared_pole_byte_terms(
-                meta, mesh_xy=mesh_xy, resolution=resolution, pencil_side=side,
+                meta, mesh_xy=mesh_xy, pencil_side=side,
+                resolution=(linalg_resolution({"linalg": dense_layout(resolution, "eigh", 2*n)})
+                            if current_phase == "selection" else resolution),
                 parent_batch=batch_width, sample_batch=sample_batch, phase=current_phase)
             # Other parents' narrow inputs survive selection and each model's
             # checks; they are additional live storage, never hidden in a limit.
@@ -1301,16 +1359,21 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                            if kwargs.get(trans, "N") != "N" else value.shape[-2:])
                            for value, trans in ((a, "transa"), (b, "transb")))
             previous = workspace
-            query_workspace("gemm", shapes, None)
+            # Route by extent and batch (gw_config.dense_layout): whole matrices per
+            # device when small, the provider for a single large matrix.
+            route = linalg_resolution({"linalg": dense_layout(
+                resolution, "gemm", max(max(shape[-2:]) for shape in shapes),
+                batch=int(a.shape[0]), mesh_size=int(mesh_xy.size))}).batched_route
+            query_workspace("gemm", shapes, None, route=route)
             staging = (sum(int(np.prod(value.shape)) * value.dtype.itemsize
                            // int(mesh_xy.size)
                            for value, trans in ((a, "transa"), (b, "transb"))
                            if kwargs.get(trans, "N") != "N")
-                       if resolution.batched_route != "batch_reshard" else 0)
+                       if route != "batch_reshard" else 0)
             if workspace != previous or staging:
                 capacity(current_side, transpose_staging=staging)
             return distrib_la.matmul(a, b, mesh=mesh_xy, backend="auto",
-                                     batched_route=resolution.batched_route, **kwargs)
+                                     batched_route=route, **kwargs)
 
         eig, svd = eigenplan(n), eigenplan(2*n)
         # Bind once for this construction, outside both parent and support
@@ -1370,19 +1433,24 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                     index = sample_id - sample_lo
                     return samples["Wc"][:, index], samples["dWc_ds"][:, index]
 
-                read_mirror = None
+                read_mirror = mirror_panel = None
                 if ordered:
                     from gw.mpa.sigma import shared_pole_minus_q_index
                     parents_full = [int(v) for v in header["q_irr_full_idx"]]
                     minus_full = shared_pole_minus_q_index(tuple(int(v) for v in header["grid"]))
                     partner = parents_full.index(int(minus_full[parents_full[q_start]]))
 
+                    # The -q parent's fitted sample panel, read once for this parent.
+                    mirror_panel = read_shared_pole_bank(
+                        bank_io, (partner, partner + 1), meta=meta, header=header,
+                        sample_span=(sample_lo, sample_hi))
+                    retained_panels = (*retained_panels, *mirror_panel.values())
+
                     def read_mirror(sample_id):
                         # W_q(-conj z) = conj W_-q(z), and dW/ds likewise: one sample of the -q parent.
-                        part = read_shared_pole_bank(
-                            bank_io, (partner, partner + 1), meta=meta, header=header,
-                            sample_span=(int(sample_id), int(sample_id) + 1))
-                        return jnp.conj(part["Wc"][:, 0]), jnp.conj(part["dWc_ds"][:, 0])
+                        index = int(sample_id) - sample_lo
+                        return (jnp.conj(mirror_panel["Wc"][:, index]),
+                                jnp.conj(mirror_panel["dWc_ds"][:, index]))
 
             timing.fence("spole.direction_selection")
             with timing.section("spole.direction_selection"):
@@ -1393,6 +1461,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         timing.fence("spole.direction_pack_and_drain")
         with timing.section("spole.direction_pack_and_drain"):
             del samples
+            read_mirror = mirror_panel = None
             jax.block_until_ready((states, infinity))
             retained_panels = (*infinity, *(v for st in states for v in st[1:]))
             finite_width = max(sum(row['carrier_width'] for row in parent) for parent in roles)

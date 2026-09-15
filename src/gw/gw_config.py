@@ -1284,19 +1284,29 @@ def linalg_resolution(params) -> LinalgResolution:
 #: these matrix extents whatever the ``linalg`` dial; above them the dial decides.
 #: Measured on 40 GB A100, complex128, P16 (PERF pool 58384731, sandbox run
 #: frequency_integration_sandbox/428_perf_20260915): the bank Dyson stack
-#: [32,2400,2400] takes 3.47 s local against 15.8 s through cuBLASMp/cuSOLVERMp.
-LOCAL_DENSE_EXTENT = {"gemm": 4096, "solve": 4096, "eigh": 4096}
+#: [32,2400,2400] takes 3.47 s local against 15.8 s through cuBLASMp/cuSOLVERMp;
+#: one eigh takes 1.40 s on one device against 2.22 s on the 4-node cuSOLVERMp
+#: mesh at 5368 (7.29 s against 7.65 s at 10736), and the n=2400 dilation SVD
+#: (eigh at 4800) 0.76 s against 1.93 s.  A single GEMM at 5368 takes 1.00 s on
+#: one device against 0.215 s on the P16 provider.
+LOCAL_DENSE_EXTENT = {"gemm": 4096, "solve": 4096, "eigh": 8192}
 
 
-def dense_layout(resolution: LinalgResolution, op: str, extent: int) -> str:
+def dense_layout(resolution: LinalgResolution, op: str, extent: int, *,
+                 batch: int | None = None, mesh_size: int | None = None) -> str:
     """Execution layout ('local' or 'distributed') of one dense operation.
 
     ``op`` is ``gemm``, ``solve`` or ``eigh`` and ``extent`` its largest matrix
     edge.  At or below :data:`LOCAL_DENSE_EXTENT` every device holds whole
-    matrices; above it the deck's ``linalg`` dial decides.
+    matrices; above it the deck's ``linalg`` dial decides, except that a GEMM
+    whose leading ``batch`` is smaller than ``mesh_size`` would put a single
+    whole matrix on one device and takes the distributed provider instead.
     """
     if int(extent) <= LOCAL_DENSE_EXTENT[op]:
         return "local"
+    if (op == "gemm" and batch is not None and mesh_size is not None
+            and int(batch) < int(mesh_size)):
+        return "distributed"
     return resolution.layout
 
 
