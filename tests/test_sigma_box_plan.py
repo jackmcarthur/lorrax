@@ -1,5 +1,6 @@
 """Conventions and wiring gates for the shared denominator-box plan."""
 
+import json
 import ast
 from pathlib import Path
 from types import SimpleNamespace
@@ -770,6 +771,46 @@ def _sc_identity(iteration, occ_hash="fd-a"):
                 wavefunctions="qp_rotation_unreceipted",
                 recipe_hash="recipe-a", gate_hash="gate-a",
                 authentication="NON-AUTHENTICATING")
+
+
+def test_durable_receipt_is_strict_json_with_null_open_edges(monkeypatch, tmp_path):
+    """Review item 18: the receipt line must parse in a strict JSON reader.
+
+    ``_state_products`` gives the product windows open endpoints (a state
+    tail to +inf, a resonant window from -inf), and the default
+    ``json.dumps`` spells those ``Infinity``/``-Infinity`` -- a Python
+    extension, so ``jq`` and every non-Python parser fail on the one line
+    ``production_report.py`` was changed to retain durably.
+    """
+    from gw.production_report import GWProductionReport
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr("gw.sigma_box_plan.process_rank", lambda: 0)
+    path = tmp_path / "gwjax.out"
+    report = GWProductionReport(
+        str(path), runtime=SimpleNamespace(process_index=0),
+        debug=False, stdout=lambda *_: None)
+    try:
+        plan_sigma_windows(
+            _summaries(), [_branch()], np.array([.2, .5]), .1,
+            eps=1e-4, cache_dir=None,
+            print_fn=report.legacy_print)
+    finally:
+        report.close()
+    prefix = "Sigma quadrature receipt: "
+    line, = [l[len(prefix):] for l in path.read_text().splitlines()
+             if l.startswith(prefix)]
+    assert "Infinity" not in line and "NaN" not in line
+    receipt = json.loads(line, parse_constant=_refuse_json_constant)
+    windows = [w for b in receipt["branches"] for w in b["windows"]]
+    edges = [edge for w in windows
+             for edge in w["state_interval_ry"] + w["pole_interval_ry"]]
+    assert any(edge is None for edge in edges), \
+        "the fixture must exercise at least one open endpoint"
+    assert all(edge is None or isinstance(edge, float) for edge in edges)
+
+
+def _refuse_json_constant(token):
+    raise AssertionError(f"non-standard JSON constant in the receipt: {token}")
 
 
 @pytest.mark.parametrize("changed", ["hamiltonian", "recipe_hash", "poles", "eta", "eps"])

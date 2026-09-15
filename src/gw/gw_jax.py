@@ -483,10 +483,20 @@ def _prepare_isdf_carriers(
             and mode.value == "mpa") else None)
     if oneshot_occupation_state is not None:
         print0(
-            "  one-shot occupations: fixed-N MP1 state, "
+            f"  one-shot occupations: fixed-N {oneshot_occupation_state.smearing_family} state, "
             f"mu={oneshot_occupation_state.mu_ry * RYD_TO_EV:.8f} eV, "
             f"width={oneshot_occupation_state.smearing_width_ry:.10f} Ry, "
             f"occ_hash={oneshot_occupation_state.occ_hash}")
+    if config.sigma.w_model == "shared_pole" and qp_solver is not QPSolver.SELF_CONSISTENT:
+        from .shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
+        from centroid.sampling_metric import full_k_quadrature_weights
+        bind_shared_pole_census(
+            wfns, meta, occupation_state=oneshot_occupation_state,
+            trs_allowed=sym.trs_allowed,
+            state_capacity=wfn.occupation_state_capacity,
+            kweights=full_k_quadrature_weights(wfn, sym))
+        meta.shared_pole_recipe = resolve_shared_pole_recipe(
+            config, wfns, meta, mesh_xy=mesh_xy, print_fn=print0)
     wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
     if config.bispinor and wfns_transverse is None:
         raise RuntimeError(
@@ -538,9 +548,14 @@ def _prepare_oneshot_response(
         from .qsgw_head import build_dft_head_response
         if mode.value == "mpa":
             from .mpa import sample_plan
-            from .mpa.model import make_mpa_plan
-            oneshot_mpa_plan = make_mpa_plan(
-                config, quad, material_class=material_class)
+            if config.sigma.w_model == "shared_pole":
+                from .shared_pole_head import shared_pole_head_plan
+                oneshot_mpa_plan = shared_pole_head_plan(
+                    config, meta.shared_pole_recipe, material_class=material_class)
+            else:
+                from .mpa.model import make_mpa_plan
+                oneshot_mpa_plan = make_mpa_plan(
+                    config, quad, material_class=material_class)
             oneshot_omegas = np.asarray(
                 sample_plan.plan_z(oneshot_mpa_plan), dtype=np.complex128)
         else:
@@ -1241,7 +1256,7 @@ def _close_timing(_pre_main, _t_main, meta, print0):
 def _report_final_observables(
         E_full, band_slices, config, enk_dft, eqp2_result, head_sigma_split_skn_ry,
         q0_certificates, report, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev,
-        sigma_lorentz_diag_skn_ry, sigma_result):
+        sigma_lorentz_diag_skn_ry, sigma_result, sc_qp_energies_ry):
     """Report the final Sigma coverage, sector summaries and QP gaps."""
     if sigma_lorentz_diag_skn_ry is not None:
         _labels = ("CC", "CT+TC", "TT")
@@ -1303,7 +1318,8 @@ def _report_final_observables(
         config=config, band_slices=band_slices, enk_dft_ry=enk_dft,
         sigma_result=sigma_result)
     report.qp_gap(
-        band_slices=band_slices, e_dft_ry=enk_dft, e_qp_ry=E_full)
+        band_slices=band_slices, e_dft_ry=enk_dft,
+        e_qp_ry=(E_full if sc_qp_energies_ry is None else sc_qp_energies_ry))
     if eqp2_result is not None:
         report.eqp2_summary(
             band_slices=band_slices,
@@ -1469,7 +1485,8 @@ def main(argv=None):
 	_report_final_observables(
 	    E_full, band_slices, config, enk_dft, eqp2_result, head_sigma_split_skn_ry,
 	    q0_certificates, report, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev,
-	    sigma_lorentz_diag_skn_ry, sigma_result)
+	    sigma_lorentz_diag_skn_ry, sigma_result,
+	    None if sc_result is None else sc_result.qp_energies_ry)
 	(
 	    _file_rows) = _report_file_rows(
 	    args, config, input_dir, report, sigma_omega_h5_path, tensors_filename)
