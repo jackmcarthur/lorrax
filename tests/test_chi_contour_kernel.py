@@ -634,7 +634,7 @@ def test_metal_plan_dispatch_census(monkeypatch):
             slices=SimpleNamespace(b0=0)), routes, quad,
         config, meta=SimpleNamespace(b_id_4_chi_user=3), mesh_xy=None,
         material_class="metal",
-        sym=SimpleNamespace(trs_allowed=False), energy_reference=0.0,
+        sym=SimpleNamespace(trs_allowed=True), energy_reference=0.0,  # TRS metal; TR-broken metals refuse (mpa_ordered_metal)
         occupation_state=state,
         write_full=lambda p, chi: written.append(("full", p["role"])),
         write_wedge=lambda p, chi: written.append(("wedge", p["role"])),

@@ -167,6 +167,7 @@ def validate_reused_mpa_fit(
         },
         expected_screening_diagrams=config.screening.diagrams,
     )
+    _require_metal_time_reversal(material_class, sym.trs_allowed)
     expected_ordered = bool(
         material_class == "insulator" and not bool(sym.trs_allowed))
     extents = {
@@ -661,6 +662,19 @@ def _require_metal_occupations(material_class, occupation_state):
             "OccupationState was passed.")
 
 
+def _require_metal_time_reversal(material_class, trs_allowed):
+    """One owner of the time-reversal-broken metal refusal (build entry before
+    any inode, the _evaluate_samples seam, and fit reuse)."""
+    if material_class == "metal" and not bool(trs_allowed):
+        raise ValueError(
+            "GATE mpa_ordered_metal: got a metal MPA plan with global time "
+            "reversal MEASURED BROKEN; want an insulator (ordered route) or a "
+            "time-reversal-symmetric metal; why: the metal route fits one "
+            "residue with no odd channel, and its pair-kernel and stream "
+            "samples are FT_q[chi^T], the transposed orientation "
+            "(KNOWN_LORRAX_ISSUES 2026-09-15 TRINT).")
+
+
 def chi0_orientation_route(material_class: str, *, trs_allowed: bool) -> str:
     """Return the single run-record description of the MPA chi0 route."""
     if str(material_class) != "insulator":
@@ -719,6 +733,7 @@ def _evaluate_samples(
             "measured verdict. Construct SymMaps from WfnLoader instead of "
             "asserting time reversal in the MPA consumer.")
     trs_allowed = bool(sym.trs_allowed)
+    _require_metal_time_reversal(material_class, trs_allowed)
     ordered = bool(not metal and not trs_allowed)
     if ordered and write_reflected is None:
         raise ValueError(
@@ -908,6 +923,8 @@ def build_mpa_fit(
     # refusal is now the only gate on the deck path: the driver-level
     # UNIMPLEMENTED_MODES row was deleted when the metal pipeline ran E2E.
     _require_metal_occupations(material_class, occupation_state)
+    if hasattr(sym, "trs_allowed"):
+        _require_metal_time_reversal(material_class, sym.trs_allowed)
     if wc_source is not None and material_class == "metal":
         raise ValueError(
             "GATE w_bse_insulators_only: an alternate ladder wc_source "
