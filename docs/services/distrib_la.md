@@ -1171,6 +1171,25 @@ not a claim about total compiled/native workspace. Callers must also admit
 adds no physics prefactor, conjugation, or backend-selection dial. The
 local/distributed Dyson solve choice remains with the existing LU plan.
 
+## Face-pinned block glue
+
+Eager slicing, concatenation and `a + a^H` of face-sharded operands return replicated arrays: a
+`[b, R, R]` block then occupies `16 R^2` bytes on every rank instead of `16 R^2/(Px Py)`.
+`distrib_la.blocks` runs the same elementwise program with the operand's own face as output sharding
+and keeps one executable per (function, layout, statics), so values are bitwise equal to the eager form.
+
+| call | result |
+|---|---|
+| `hermitian_part(a)` | `(a + a^H)/2` for `[b, R, R]` |
+| `hermitian_block(block, off, corner)` | `[[block, off^H], [off, corner]]`, `[b, R + r, R + r]` |
+| `join_columns(a, b)` | column panels `[b, n, R]` and `[b, n, r]` concatenated |
+| `diagonal_like(values, like)` | `diag(values)` in `like`'s dtype and face |
+| `on_face(fn, out, *operands, **static)` | a module-level caller function with outputs placed on `out` |
+
+Traced operands (inside `jit`/`shard_map`) and unsharded host arrays take the plain function. No helper
+gathers, pads or reshards. The shared-pole constructor uses these for both the even and the ordered pencil
+(`tests/test_shared_pole_pencil_faces.py`).
+
 ## Dense workspace queries
 
 `workspace_bytes_per_rank(plan, op, shapes, dtype)` and

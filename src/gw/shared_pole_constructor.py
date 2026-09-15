@@ -16,6 +16,8 @@ from functools import lru_cache, partial
 
 import jax
 import jax.numpy as jnp
+from distrib_la import (diagonal_like, face_sharding, hermitian_block, hermitian_part,
+                        join_columns, on_face)
 from common import timing
 
 
@@ -65,18 +67,12 @@ def _adjoint(a):
     return jnp.conj(jnp.swapaxes(a, -1, -2))
 
 
-def _hermitian(a):
-    return (a + _adjoint(a)) * 0.5
+def _scale_rows(s, g):
+    return s[:, None, :] * g
 
 
-def _diagonal_face(values, matrix):
-    """Materialize a diagonal directly in the supplied pencil face layout."""
-    import jax
-    def build(d):
-        return jnp.eye(d.shape[-1], dtype=matrix.dtype)[None] * d[:, None, :]
-    if isinstance(matrix, jax.core.Tracer):
-        return build(values)
-    return jax.jit(build, out_shardings=matrix.sharding)(values)
+def _subtract(x, y):
+    return x - y
 
 
 def finite_pencil_column(left, right, *, matmul):
@@ -110,25 +106,12 @@ def finite_pencil_column(left, right, *, matmul):
     derivative = matmul(qa, db, transa="C")
     sa = jnp.broadcast_to(sa, (qa.shape[0], qa.shape[-1]))
     sb = jnp.broadcast_to(sb, (qb.shape[0], qb.shape[-1]))
-    kernels = _face_column_kernels(_face_of(a))
-    if kernels is None:
-        g = _finite_column_g(a, b, derivative, sa, sb)
-        return g, sb[:, None, :] * g - a
     # On the face the [b,R,r] intermediates (denominator, confluent mask, a - a^H)
     # stay per-rank tiles; eager broadcasting of the replicated supports and
-    # a - a^H would replicate them. Multiply and subtract stay separate kernels.
-    g = kernels["g"](a, b, derivative, sa, sb)
-    return g, kernels["sub"](kernels["scale_rows"](sb, g), a)
-
-
-def _face_of(array):
-    """The array's NamedSharding when it is a concrete face-sharded array, else None."""
-    import jax
-    from jax.sharding import NamedSharding
-    if isinstance(array, jax.core.Tracer):
-        return None
-    sharding = getattr(array, "sharding", None)
-    return sharding if isinstance(sharding, NamedSharding) and len(sharding.spec) == array.ndim else None
+    # a - a^H would replicate them. Multiply and subtract stay separate programs.
+    face = face_sharding(a)
+    g = on_face(_finite_column_g, face, a, b, derivative, sa, sb)
+    return g, on_face(_subtract, face, on_face(_scale_rows, face, sb, g), a)
 
 
 def _finite_column_g(a, b, derivative, sa, sb):
@@ -142,25 +125,6 @@ def _finite_column_g(a, b, derivative, sa, sb):
     confluent = jnp.abs(denominator) <= 8 * jnp.finfo(jnp.float64).eps * scale
     safe = jnp.where(confluent, 1.0 + 0j, denominator)
     return jnp.where(confluent, -derivative, (a - b) / safe)
-
-
-def _pencil_block(block, off, corner):
-    """[[block, off^H], [off, corner]] of the pencil with its infinity rows."""
-    return jnp.concatenate((jnp.concatenate((block, _adjoint(off)), axis=-1),
-                            jnp.concatenate((off, corner), axis=-1)), axis=-2)
-
-
-@lru_cache(maxsize=None)
-def _face_column_kernels(face):
-    """Face-pinned executables of the pencil assembly glue (None off the face)."""
-    if face is None:
-        return None
-    return dict(g=jax.jit(_finite_column_g, out_shardings=face),
-                scale_rows=jax.jit(lambda s, g: s[:, None, :] * g, out_shardings=face),
-                sub=jax.jit(lambda x, y: x - y, out_shardings=face),
-                block=jax.jit(_pencil_block, out_shardings=face),
-                hermitian=jax.jit(_hermitian, out_shardings=face),
-                join=jax.jit(_join_columns, out_shardings=face))
 
 
 def infinity_pencil_column(finite, infinity, *, matmul):
@@ -202,11 +166,10 @@ def assemble_shared_pole_pencil(states, infinity, *, matmul):
     # support coordinates remain column-specific, including repeated roles.
     g, h = finite_pencil_column(finite, (s, q, output, derivative), matmul=matmul)
     gi, hi, gii, hii, oi = infinity_pencil_column(finite, infinity, matmul=matmul)
-    g = jnp.concatenate((jnp.concatenate((g, _adjoint(gi)), axis=-1),
-                         jnp.concatenate((gi, gii), axis=-1)), axis=-2)
-    h = jnp.concatenate((jnp.concatenate((h, _adjoint(hi)), axis=-1),
-                         jnp.concatenate((hi, hii), axis=-1)), axis=-2)
-    return _hermitian(g), _hermitian(h), jnp.concatenate((output, oi), axis=-1)
+    # Face blocks: eager concatenation with the adjoint (y/x) infinity rows and eager
+    # a + a^H would return a replicated [b,side,side] G and H on every rank.
+    g, h = hermitian_block(g, gi, gii), hermitian_block(h, hi, hii)
+    return hermitian_part(g), hermitian_part(h), join_columns(output, oi)
 
 
 def ordered_infinity_pencil_column(finite, infinity, *, matmul):
@@ -258,17 +221,12 @@ def assemble_ordered_shared_pole_pencil(states, infinity, *, matmul):
     del derivative
     # Pinned to the face: eager concatenation with the adjoint (y/x) infinity rows and
     # eager a + a^H return a replicated [b,side,side] G and H resident on every rank.
-    kernels = _face_column_kernels(_face_of(g))
-    block = _pencil_block if kernels is None else kernels["block"]
-    hermitian = _hermitian if kernels is None else kernels["hermitian"]
     if infinity is not None:
         gi, hi, gii, hii, oi = ordered_infinity_pencil_column(finite, infinity, matmul=matmul)
-        g = block(g, gi, gii)
-        h = block(h, hi, hii)
+        g, h = hermitian_block(g, gi, gii), hermitian_block(h, hi, hii)
         del gi, hi, gii, hii
-        output = (_join_columns(output, oi) if kernels is None
-                  else _face_column_kernels(_face_of(output))["join"](output, oi))
-    return hermitian(g), hermitian(h), output, z
+        output = join_columns(output, oi)
+    return hermitian_part(g), hermitian_part(h), output, z
 
 
 def _metric_inverse_root(metric, *, matmul, tolerance):
@@ -284,7 +242,7 @@ def _metric_inverse_root(metric, *, matmul, tolerance):
     """
     import jax
 
-    identity = _diagonal_face(jnp.ones(metric.shape[:1] + metric.shape[-1:]), metric)
+    identity = diagonal_like(jnp.ones(metric.shape[:1] + metric.shape[-1:]), metric)
     radius = jnp.max(jnp.sum(jnp.abs(identity - metric), axis=-1), axis=-1)
     valid = jnp.isfinite(radius) & (radius < 1)
     if not isinstance(radius, jax.core.Tracer) and not bool(jnp.all(valid)):
@@ -359,7 +317,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     g = scale[:, :, None] * g * scale[:, None, :]
     h = scale[:, :, None] * h * scale[:, None, :]
     output = output * scale[:, None, :]
-    gamma, u = eigh(_hermitian(g))
+    gamma, u = eigh(hermitian_part(g))
     largest = gamma[:, -1]
     ratio = gamma[:, 0] / jnp.where(largest > 0, largest, 1)
     gram_ok = ((largest > 0) & jnp.all(jnp.isfinite(gamma), axis=-1)
@@ -370,13 +328,13 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     z = u * (keep / jnp.sqrt(jnp.where(keep, gamma, 1)))[:, None, :]
 
     metric = matmul(z, matmul(g, z), transa="C")
-    null_identity = _diagonal_face(~keep, g)
+    null_identity = diagonal_like(~keep, g)
     correction, metric_ok, metric_diagnostics = _metric_inverse_root(
-        _hermitian(metric) + null_identity, matmul=matmul,
+        hermitian_part(metric) + null_identity, matmul=matmul,
         tolerance=gates["retained_subspace_moments"]["threshold"])
     z = matmul(z, correction) * keep[:, None, :]
     metric = matmul(z, matmul(g, z), transa="C")
-    t = _hermitian(matmul(z, matmul(h, z), transa="C"))
+    t = hermitian_part(matmul(z, matmul(h, z), transa="C"))
     # The norm puts the inert spectrum strictly below every physical Ritz
     # value, including negative physical values which must reach zero policy.
     sentinel = -(jnp.linalg.norm(t, axis=(-2, -1)) + 1)
@@ -385,7 +343,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     active = jnp.arange(g.shape[-1])[None, :] >= g.shape[-1] - count[:, None]
     b = matmul(matmul(output, z), rotation) * active[:, None, :]
     poles = jnp.where(active, poles, 1.0)
-    wanted_metric = _diagonal_face(keep, g)
+    wanted_metric = diagonal_like(keep, g)
     diagnostics = {
         **metric_diagnostics,
         "gram_diagonal_positive": diagonal_ok,
@@ -433,35 +391,8 @@ def _paired_output(a, inverse, *, half, finite, n_inf):
 
 def _restricted_block(ww, wv, vv):
     """Hermitian [[ww, wv], [wv^H, vv]] of the restricted paired pencil."""
-    return _hermitian(jnp.concatenate(
+    return hermitian_part(jnp.concatenate(
         (jnp.concatenate((ww, wv), axis=-1), jnp.concatenate((_adjoint(wv), vv), axis=-1)), axis=-2))
-
-
-def _join_columns(a, b):
-    return jnp.concatenate((a, b), axis=-1)
-
-
-@lru_cache(maxsize=None)
-def _paired_kernels(face, output_face, half, finite, n_inf):
-    """Glue of the paired reduction with every large result on the x/y face.
-
-    Eager slicing, concatenation and a + a^H of face-sharded operands return
-    replicated arrays (measured on a 2x2 host mesh,
-    runs/frequency_integration_sandbox/425_trint_20260915/logs/eager_sharding_probe.log).
-    The same elementwise arithmetic compiled with face output shardings keeps
-    each [b,R,R] block at 16 R^2/(Px Py) bytes per rank. Unsharded callers
-    (host tests) get the plain functions.
-    """
-    statics = dict(half=half, finite=finite, n_inf=n_inf)
-    member, outputs = partial(_paired_member, **statics), partial(_paired_output, **statics)
-    if face is None:
-        return member, outputs, _hermitian, _restricted_block, _join_columns
-    output_face = face if output_face is None else output_face
-    return (jax.jit(member, out_shardings=(face, face, face)),
-            jax.jit(outputs, out_shardings=(output_face, output_face)),
-            jax.jit(_hermitian, out_shardings=face),
-            jax.jit(_restricted_block, out_shardings=face),
-            jax.jit(_join_columns, out_shardings=output_face))
 
 
 def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
@@ -489,8 +420,6 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     Returns (b [b,n,R], poles2 [b,R], active [b,R]), the signed model
     (c [b,n,R], mu [b,R], retained [b,R]) and device diagnostics.
     """
-    from jax.sharding import NamedSharding
-
     g, h, output, points = pencil
     side, finite = int(g.shape[-1]), int(points.shape[-1])
     half, n_inf = finite // 2, (side - finite) // 2
@@ -501,17 +430,19 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
               & jnp.all(active_columns[:, finite + n_inf:] == active_columns[:, finite:finite + n_inf]))
     if not bool(paired):
         raise ValueError("GATE shared_pole_orientation_pair: got: finite columns not in mirrored halves; want: [X(z); X(-z)] on one direction set and paired k0/k1 columns; why: the ordered cut acts in the paired basis")
-    face = g.sharding if isinstance(getattr(g, "sharding", None), NamedSharding) else None
-    output_face = output.sharding if isinstance(getattr(output, "sharding", None), NamedSharding) else None
-    member, outputs, hermitian, block, join = _paired_kernels(face, output_face, half, finite, n_inf)
+    face = face_sharding(g)
+    output_face = face if face_sharding(output) is None else face_sharding(output)
+    statics = dict(half=half, finite=finite, n_inf=n_inf)
 
     live_f = active_columns[:, :half]
     inverse = jnp.where(live_f, 1 / jnp.where(live_f, 2 * points[:, :half], 1), 0)
     # Every large result below stays on the x/y face; eager slicing, concatenation
     # and a + a^H come out replicated ([b,R,R] per rank), which is what ran CrI3 out of memory.
-    g_ww, g_wv, g_vv = member(g, inverse)
-    h_ww, h_wv, h_vv = member(h, inverse)
-    o_w, o_v = outputs(output, inverse)
+    members = None if face is None else (face,) * 3
+    g_ww, g_wv, g_vv = on_face(_paired_member, members, g, inverse, **statics)
+    h_ww, h_wv, h_vv = on_face(_paired_member, members, h, inverse, **statics)
+    o_w, o_v = on_face(_paired_output, None if output_face is None else (output_face,) * 2,
+                       output, inverse, **statics)
     active = jnp.concatenate((live_f, active_columns[:, finite:finite + n_inf]), axis=-1)
     diagonal = jnp.real(jnp.diagonal(h_vv, axis1=-2, axis2=-1))
     diagonal_ok = jnp.all(jnp.where(active, jnp.isfinite(diagonal) & (diagonal > 0), diagonal == 0), axis=-1)
@@ -520,7 +451,7 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     g_ww, g_wv, g_vv, h_ww, h_wv, h_vv = (sandwich(a) for a in (g_ww, g_wv, g_vv, h_ww, h_wv, h_vv))
     o_w, o_v = o_w * scale[:, None, :], o_v * scale[:, None, :]
     validity = gates["normalized_gram_validity"]["threshold"]
-    gamma, u = eigh(hermitian(h_vv))
+    gamma, u = eigh(hermitian_part(h_vv))
     largest = gamma[:, -1]
     ratio = gamma[:, 0] / jnp.where(largest > 0, largest, 1)
     keep = (gamma > gates["normalized_gram_keep"]["threshold"] * largest[:, None]) & (largest[:, None] > 0)
@@ -528,15 +459,15 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     z = u * (keep / jnp.sqrt(jnp.where(keep, gamma, 1)))[:, None, :]
     del u
     metric = matmul(z, matmul(h_vv, z), transa="C")
-    null_identity = _diagonal_face(~keep, h_vv)
+    null_identity = diagonal_like(~keep, h_vv)
     correction, metric_ok, metric_diagnostics = _metric_inverse_root(
-        hermitian(metric) + null_identity, matmul=matmul,
+        hermitian_part(metric) + null_identity, matmul=matmul,
         tolerance=gates["retained_subspace_moments"]["threshold"])
     del null_identity
     z = matmul(z, correction) * keep[:, None, :]
     del correction
     metric = matmul(z, matmul(h_vv, z), transa="C")
-    wanted_metric = _diagonal_face(keep, h_vv)
+    wanted_metric = diagonal_like(keep, h_vv)
     metric_relative = (jnp.linalg.norm(metric - wanted_metric, axis=(-2, -1))
                        / jnp.sqrt(jnp.maximum(count, 1)))
     del wanted_metric, h_vv
@@ -547,11 +478,11 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     # t_s the even route's Z^H H_s Z; once time reversal is broken the halves mix and a
     # w combination can lie in span(v), so a second relative keep cut on H_r removes
     # exactly those redundant combinations before the H-metric Ritz step.
-    h_r = block(project(z, h_ww), project(z, h_wv), metric)
+    h_r = on_face(_restricted_block, face, project(z, h_ww), project(z, h_wv), metric)
     del h_ww, h_wv, metric
-    g_r = block(project(z, g_ww), project(z, g_wv), project(z, g_vv))
+    g_r = on_face(_restricted_block, face, project(z, g_ww), project(z, g_wv), project(z, g_vv))
     del g_ww, g_wv, g_vv
-    o_r = join(matmul(o_w, z), matmul(o_v, z))
+    o_r = join_columns(matmul(o_w, z), matmul(o_v, z))
     del o_w, o_v, z
     gamma_r, u_r = eigh(h_r)
     top_r = gamma_r[:, -1]
@@ -560,8 +491,8 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     count_r = jnp.sum(keep_r, axis=-1, dtype=jnp.int64)
     y = u_r * (keep_r / jnp.sqrt(jnp.where(keep_r, gamma_r, 1)))[:, None, :]
     del u_r
-    null_r = _diagonal_face(~keep_r, h_r)
-    metric_r = hermitian(matmul(y, matmul(h_r, y), transa="C")) + null_r
+    null_r = diagonal_like(~keep_r, h_r)
+    metric_r = hermitian_part(matmul(y, matmul(h_r, y), transa="C")) + null_r
     # The restricted sources are released before the second metric correction.
     del null_r, h_r
     correction_r, metric_r_ok, _ = _metric_inverse_root(
@@ -569,7 +500,7 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     del metric_r
     y = matmul(y, correction_r) * keep_r[:, None, :]
     del correction_r
-    mu, rotation = eigh(hermitian(matmul(y, matmul(g_r, y), transa="C")))
+    mu, rotation = eigh(hermitian_part(matmul(y, matmul(g_r, y), transa="C")))
     del g_r
     c = matmul(o_r, matmul(y, rotation))
     del o_r, y, rotation
@@ -641,7 +572,7 @@ def ordered_pole_bound_ry(m1, inverse_coulomb_sqrt, *, energy_span_ry, gap_ry, m
     """
     if not float(gap_ry) > 0:
         return jnp.full((m1.shape[0],), jnp.inf)
-    whitened = _hermitian(matmul(inverse_coulomb_sqrt, matmul(2 * m1, inverse_coulomb_sqrt)))
+    whitened = hermitian_part(matmul(inverse_coulomb_sqrt, matmul(2 * m1, inverse_coulomb_sqrt)))
     top = eigh(whitened)[0][:, -1]
     return float(energy_span_ry) + jnp.maximum(top, 0) / float(gap_ry)
 
@@ -820,7 +751,7 @@ def shared_pole_operator_passivity(wc, inverse_coulomb_sqrt, *, matmul, eigh, ga
 
 def _passivity_response_checks(response, *, eigh, gates):
     """Common 0 <= whitened response <= I and Hermiticity gate."""
-    herm = _hermitian(response)
+    herm = hermitian_part(response)
     norm = jnp.linalg.norm(herm, axis=(-2, -1))
     anti = jnp.linalg.norm(response - _adjoint(response), axis=(-2, -1))
     anti = anti / jnp.where(norm > 0, 2 * norm, 1)
@@ -910,7 +841,7 @@ def _hermitian_part_kernel(mesh):
     """Reuse Hermitian projection on current [b,n,n] response faces."""
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
-    return jax.jit(_hermitian, out_shardings=NamedSharding(mesh, P(None, 'x', 'y')))
+    return jax.jit(hermitian_part, out_shardings=NamedSharding(mesh, P(None, 'x', 'y')))
 
 
 @lru_cache(maxsize=None)

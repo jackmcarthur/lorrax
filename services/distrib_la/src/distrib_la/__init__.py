@@ -59,6 +59,13 @@ layout='face', enable_active_range=False) -> GemmPlan``
     ``weights`` has shape ``(nq, k)``. The face layout uses cuBLASMp descriptor
     views; the axis layout uses local cuBLAS pointer views on CUDA and bounded
     JAX dot panels on CPU. See ``docs/dev/active_gemm_ranges.md``.
+``hermitian_part(a)``, ``hermitian_block(block, off, corner)``, ``join_columns(a, b)``, ``diagonal_like(values, like)``, ``on_face(fn, out, *operands, **static)``
+    Block glue for stacked ``[b, R, R]`` operators and ``[b, n, R]`` panels
+    that keeps each result on its operand's ``('x','y')`` face. Eager
+    concatenation and ``a + a^H`` of face-sharded arrays come out replicated;
+    these run the same elementwise program with face output shardings, so
+    values are bitwise equal. Traced or unsharded operands take the plain
+    function.
 ``factor(op, A, mesh, ...) -> FactorToken`` / ``solve(token, B)``
     Factor once, back-solve many.  The token is opaque and carries the
     handle (scalapack's ``ipiv``, cuSOLVERMp's raw buffer, SLATE's
@@ -97,6 +104,8 @@ punctilio — it is the failure mode.
 
 from __future__ import annotations
 
+from distrib_la.blocks import (diagonal_like, face_sharding, hermitian_block,
+                               hermitian_part, join_columns, on_face)
 from distrib_la.subspace import plan_subspace
 from distrib_la.active_subspace import LocalSubspacePlan, plan_local_subspace
 from distrib_la.workspace import workspace_bytes_per_rank, matmul_workspace_bytes_per_rank
@@ -143,6 +152,9 @@ from distrib_la.resolve import (
 
 __all__ = [
     "LocalSubspacePlan", "plan_local_subspace", "plan_subspace",
+    # face-pinned block glue for stacked [b, R, R] operators
+    "face_sharding", "on_face", "hermitian_part", "hermitian_block",
+    "join_columns", "diagonal_like",
     # plan
     "Plan", "plan", "ensure_sharding", "DONATES",
     # native dense workspace queries (no allocation)
