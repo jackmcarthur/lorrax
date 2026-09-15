@@ -300,6 +300,84 @@ def test_direction_states_pair_a_harness_recipe_on_the_same_directions():
         assert rel((c[:, kept] / (zz * mu[kept] - 1)) @ adj(c[:, kept]), plant.F(zz)) < 1e-10
 
 
+def test_dedupe_drops_duplicate_partners_and_equals_even_on_symmetric_data():
+    """On a TRS plant the imaginary-role and Re z = 0 partners of W Q lie in span(Q); the dedupe drops them, and the
+    ordered model built through _direction_states, pack, assemble and reduce equals the even model at the production
+    cut (the planted analogue of the MoS2 P3 gate)."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from lxkit.testing import require_devices
+    import distrib_la as D
+    from runtime.padding import padded_axis
+    from gw.shared_pole_constructor import (
+        _direction_states, assemble_ordered_shared_pole_pencil, reduce_ordered_shared_pole_pencil,
+        assemble_shared_pole_pencil, reduce_shared_pole_pencil, apply_shared_pole_zero_policy)
+    from gw.shared_pole_local import pack_parent_panels
+    from gw.shared_pole_recipe import (shared_real_pole_gates_ordered_v1 as ordered_gates,
+                                       shared_real_pole_gates_v1_r3b as even_gates)
+    require_devices(4, "cpu")
+    mesh = Mesh(np.asarray(jax.devices("cpu")[:4]).reshape(2, 2), ("x", "y"))
+    n = 8
+    plant = _trim(np.random.default_rng(43), 6, n, eps=0.)
+    face = NamedSharding(mesh, P(None, "x", "y"))
+
+    def put(a):
+        a = np.ascontiguousarray(np.asarray(a, np.complex128)[None])
+        return jax.make_array_from_callback(a.shape, face, lambda i: a[i])
+
+    extent = lambda width: padded_axis(width, mesh, name="dedupe_port",
+                                       specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
+    ep = D.plan("eigh", mesh, n=n, backend="off", batched_route="batch_reshard")
+    sp = D.plan("eigh", mesh, n=2 * n, backend="off", batched_route="batch_reshard")
+    mm = lambda a, b, **kw: D.matmul(a, b, mesh=mesh, backend="off", batched_route="batch_reshard", **kw)
+    nodes = [.9 + .35j, 1.7 + .6j, .5j, .35j, -np.conj(.9 + .35j), -np.conj(1.7 + .6j)]
+    roles = [0, 0, 1, 0, 0, 0]
+
+    def recipe(ordered):
+        k = 6 if ordered else 4
+        return dict(fit_ids=list(range(k)), distinct_id=list(range(k)), role=roles[:k], held=[False] * k,
+                    z_ry=[dict(real=v.real, imag=v.imag) for v in nodes[:k]], direction_cutoff=1e-3,
+                    imaginary_width=4, multiplet_relative_tolerance=1e-6)
+
+    def reader(i, _states):
+        zz = nodes[i]
+        return put(plant.F(zz)), put(plant.dF(zz) / (2 * zz))
+
+    qi = np.linalg.eigh(plant.moment(1))[1][:, -2:]
+    models, ranks = {}, {}
+    for label, ordered in (("even", False), ("ordered", True)):
+        states, counts, rows = _direction_states(
+            reader, recipe(ordered), eigh_plan=ep, svd_plan=sp, matmul=mm, column_extent=extent, logical_n=n,
+            admit=lambda side: None, infinity_carrier=2, ordered=ordered)
+        if ordered:
+            assert len(states) == 12
+            infinity = tuple(put(a) for a in (qi, *(plant.moment(k) / 2 @ qi for k in range(4))))
+        else:
+            infinity = tuple(put(a) for a in (qi, plant.moment(1) / 2 @ qi, plant.moment(3) / 2 @ qi))
+        packed, _ = pack_parent_panels(states, infinity, counts, [2], mesh_xy=mesh, parent_batch=1, layout="distributed")
+        finite, infinity_p, active, _ = jax.tree.map(lambda a: a[:1], packed)
+        if ordered:
+            rf = active.shape[-1] - infinity_p[0].shape[-1]
+            active = jnp.concatenate((active, active[:, rf:]), axis=-1)
+            pencil = assemble_ordered_shared_pole_pencil([finite], infinity_p, matmul=mm)
+            model, _, diag = reduce_ordered_shared_pole_pencil(pencil, active, eigh=ep.batched, matmul=mm,
+                                                               gates=ordered_gates)
+            model, _ = apply_shared_pole_zero_policy(model, gates=ordered_gates)
+        else:
+            pencil = assemble_shared_pole_pencil([finite], infinity_p, matmul=mm)
+            model, diag, _ = reduce_shared_pole_pencil(pencil, active, eigh=ep.batched, matmul=mm, gates=even_gates)
+            model, _ = apply_shared_pole_zero_policy(model, gates=even_gates)
+        b, poles, act = (np.asarray(a)[0] for a in model)
+        models[label] = (b[:, act], poles[act])
+        ranks[label] = int(np.asarray(diag["retained_rank"])[0])
+    assert ranks["ordered"] == ranks["even"] < pencil[0].shape[-1]
+    assert models["ordered"][0].shape[-1] == models["even"][0].shape[-1]
+    for zz in ZS:
+        value = lambda m: (m[0] / (zz**2 - m[1])) @ adj(m[0])
+        assert rel(value(models["ordered"]), value(models["even"])) < 1e-10
+
+
 def test_generic_q_positive_halves_assemble_the_galerkin_model():
     from gw.shared_pole_constructor import ordered_shared_pole_value
     mm, _ = _ops()

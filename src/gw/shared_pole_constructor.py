@@ -829,6 +829,35 @@ def _stack_model_kernel(mesh):
                        NamedSharding(mesh, P()), NamedSharding(mesh, P())))
 
 
+def _odd_partner_directions(q, output, cutoff, *, eigh_plan, matmul, column_extent, multiplet_tol):
+    """Partner directions of O = W Q orthogonal to Q above the recipe direction cutoff.
+
+    For a role whose conjugate node brings no new tangent under time reversal
+    (imaginary z, or a line role with Re z = 0), W Q lies in span(Q) on
+    time-reversal-symmetric data and the partner would only duplicate Q. The
+    component of O orthogonal to Q is rank-revealed against the largest
+    singular value of O with the same relative cutoff used for line directions;
+    on a magnet the surviving directions carry the odd channel. Only spectra
+    cross to the host. Returns (orthonormal directions [b,n,r], widths) or
+    (None, None) when nothing survives.
+    """
+    import distrib_la
+    import numpy as np
+
+    hermitian_part = _hermitian_part_kernel(eigh_plan.mesh)
+    remainder = output - matmul(q, matmul(q, output, transa="C"))
+    top = np.asarray(eigh_plan.batched(hermitian_part(matmul(output, output, transb="C")))[0])[..., -1]
+    perp = hermitian_part(matmul(remainder, remainder, transb="C"))
+    values = np.asarray(eigh_plan.batched(perp)[0])[..., ::-1]
+    counts = [int(np.sum(row > float(cutoff) ** 2 * float(t)))
+              for row, t in zip(np.atleast_2d(values), np.atleast_1d(top))]
+    if max(counts) == 0:
+        return None, None
+    directions, kept = distrib_la.leading_eigenvectors(
+        perp, max(counts), eigh_plan=eigh_plan, column_extent=column_extent, multiplet_tol=multiplet_tol)
+    return directions, tuple(int(v.shape[-1]) for v in kept)
+
+
 def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
                       column_extent, logical_n, admit, infinity_carrier, ordered=False,
                       read_mirror=None):
@@ -909,15 +938,25 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
             for conjugate in ((False, True) if (ordered or kind == "line") and s.imag != 0 else (False,)):
                 admit(largest_side() + q_batch.shape[-1])
                 transa = "C" if conjugate else "N"
-                direction = states[-1][2] if conjugate else q_batch
+                state_widths = widths
+                if conjugate and ordered and (kind == "imaginary" or s.real == 0):
+                    # Dedupe before the cut: only partner directions orthogonal to Q survive.
+                    direction, state_widths = _odd_partner_directions(
+                        states[-1][1], states[-1][2], recipe["direction_cutoff"], eigh_plan=eigh_plan,
+                        matmul=matmul, column_extent=column_extent,
+                        multiplet_tol=recipe["multiplet_relative_tolerance"])
+                    if direction is None:
+                        continue
+                else:
+                    direction = states[-1][2] if conjugate else q_batch
                 output = matmul(w, direction, transa=transa)
                 action = matmul(derivative, direction, transa=transa)
                 if ordered:
                     action = action * (2 * (s.conjugate() if conjugate else s))
                 states.append((s.conjugate() if conjugate else s, direction, output, action))
                 conjugates.append(conjugate)
-                counts.append(widths)
-                for i, width in enumerate(widths):
+                counts.append(state_widths)
+                for i, width in enumerate(state_widths):
                     roles[i].append({"sample_id": int(sample_id), "role": role["role"],
                                      "conjugate": conjugate, "width": width,
                                      "carrier_width": column_extent(width)})
