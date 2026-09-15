@@ -176,8 +176,10 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                       for name in ("irr_idx", "sym_idx", "k_parent_frac", "spin_action_full")):
         raise ValueError("chi family plans disagree on the raw-parent k action.")
 
-    _Gv_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
-    _Gc_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
+    # Fold the two 1/sqrt(nk) input normalizations into the quadrature
+    # coefficients. This avoids scaling two full Green tensors per node.
+    _Gv_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='backward')
+    _Gc_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='backward')
     _chi_fftn_local = make_flat_k_fftn(mesh_xy, kgrid, _chi_spec, norm='ortho')
 
     _rep0 = P()
@@ -286,7 +288,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                              for i, a in enumerate(accs)), None
 
             final_R, _ = jax.lax.scan(
-                _body, acc0, (nodes.t, jnp.transpose(nodes.alpha)), unroll=1)
+                _body, acc0, (nodes.t, jnp.transpose(nodes.alpha / nk)), unroll=1)
             return tuple(_finish_chi(f) for f in final_R)
 
         return minimax_tau_integrate_chi_multi
@@ -326,7 +328,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             return jax.lax.fori_loop(0, n_vertices, vertex_step, accumulators, unroll=1), None
 
         final_R, _ = jax.lax.scan(
-            _body, zero, (nodes.t, nodes.alpha), unroll=1)
+            _body, zero, (nodes.t, nodes.alpha / nk), unroll=1)
         return tuple(_finish_chi(final_R[index]) for index in range(n_vertices))
 
     _base_in = (_nodes_shard, _psi_mun_shard, _psi_nmu_shard,
@@ -433,7 +435,7 @@ def _get_chi_fractional_contour_kernel_face(
             f"{k_unfold_plan.n_full} != prod(kgrid)={nk}.")
 
     G_fftn = make_flat_k_fftn(
-        mesh_xy, grid, G_FFT7D_SPEC, norm="ortho")
+        mesh_xy, grid, G_FFT7D_SPEC, norm="backward")
     chi_fftn = make_flat_k_fftn(
         mesh_xy, grid, CHI_Q_SPEC, norm="ortho")
     G_shard = NamedSharding(mesh_xy, G_FLATK_SPEC)
@@ -533,7 +535,7 @@ def _get_chi_fractional_contour_kernel_face(
         final_R, _ = jax.lax.scan(
             body,
             initial,
-            (time_nodes, jnp.transpose(projection_rows)),
+            (time_nodes, jnp.transpose(projection_rows / nk)),
             unroll=1,
         )
         return tuple(_finish(value) for value in final_R)

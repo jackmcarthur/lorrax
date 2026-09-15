@@ -243,9 +243,13 @@ def _make_lorentz_convolution(mesh_xy, kgrid, scale, q0_only):
     from common.gamma_matrices import gamma_apply
     from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
     if not q0_only:
-        inverse_g = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
-        forward_g = make_flat_k_fftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='ortho')
-        inverse_v = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='ortho')
+        inverse_g = make_flat_k_ifftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='forward')
+        forward_g = make_flat_k_fftn(mesh_xy, kgrid, G_FFT7D_SPEC, norm='backward')
+        inverse_v = make_flat_k_ifftn(mesh_xy, kgrid, V_FFT5D_SPEC, norm='forward')
+
+        # Two inverse transforms and one forward transform were orthonormal.
+        # Apply their combined normalization with the existing output scale.
+        scale = scale / float(np.prod(kgrid)) ** 1.5
 
     @jax.jit
     def convolve(G_k, interactions, prefactor, vertices):

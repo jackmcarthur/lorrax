@@ -310,3 +310,25 @@ the measured 22.28 vs 8.90 ms flat-k-vs-minor gap, `audit_gpu_fft.log:104`,
 `:108`) but it is emitted as a fusion, not as a `transpose`.**  The header
 sentence and the census's verdict line both need correcting — neither file
 was owned this wave.
+
+
+## Normalization in chi and Lorentz Sigma
+
+The chi tau integrators use unnormalized forward transforms for their two
+Green functions (`norm="backward"`). Their product acquires the combined
+`1/Nk` factor through the small quadrature coefficient table. The final
+response transform remains orthonormal. This applies to charge and current
+vertices, multiple response outputs, and fractional-occupation contours,
+with either wavefunction band layout. It avoids two full Green scaling
+passes per node; it does not change the quadrature or FFT algorithm.
+
+The Lorentz Sigma convolution similarly uses unnormalized input inverse
+transforms (`norm="forward"`) and an unnormalized output forward transform.
+The existing output multiplier carries their combined `Nk**(-1.5)` factor.
+The q=0-only branch has no FFT and retains its original normalization.
+The scalar fused cuFFT convolution already combines these scale factors.
+
+These changes use the existing cuFFT/FFTW service, preserve FFT scaling and
+spatial sharding, and introduce no native provider or grid specialization.
+Reassociation can change floating-point rounding; numerical parity is not
+a bitwise guarantee. No history of large tau-dependent matrices is stored.

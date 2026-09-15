@@ -202,11 +202,12 @@ def _gamma_matrix_from_perm_phase(perm: jax.Array | None,
 
 def _gamma_double_contract_take(P_l_conj, P_r, perm_L, phase_L,
                                 perm_R, phase_R, spin_axes):
-    """Original ``take + multiply`` implementation.  Two ``gamma_apply``
-    calls each materialise a fresh rank-5 buffer (the ``jnp.take`` with
-    a runtime perm can't reuse its input).  Verified to drive 5
-    concurrent rank-5 slots in XLA's BufferAssignment on MoS2 3×3.
-    See ``gw/gflat_memory_model.py`` for the slot accounting."""
+    """Apply the two monomial vertices and reduce their spin axes.
+
+    XLA can fuse the gathers, phases, product and reduction. Intermediate
+    storage must be measured in the compiled caller; Python array expressions
+    do not imply separate full-tensor allocations.
+    """
     a_axis, b_axis = spin_axes
     P_r_p = P_r
     if perm_L is not None:
@@ -318,12 +319,13 @@ def gamma_double_contract(
     ``gamma_contract_mode`` (set once at config-build time by
     ``set_gamma_contract_mode``):
 
-      * ``take``   (default) — ``jnp.take`` + multiply chain (the
-                   historical impl; ~5 concurrent rank-5 slots).
-      * ``einsum`` — single 4-tensor ``jnp.einsum`` with materialised
-                   4×4 γ̃ matrices (predicted 3 concurrent rank-5 slots).
-      * ``scan``   — ``lax.scan`` over ns² spin pairs, rank-3 slices
-                   only (predicted 2 concurrent rank-5 slots).
+      * ``take``   (default) — gathers, phases and a spin reduction.
+      * ``einsum`` — a 4-tensor contraction with dense 4×4 γ̃ matrices.
+      * ``scan``   — ``lax.scan`` over ns² spin pairs with rank-3 slices.
+
+    The latter two currently support only spin_axes=(1, 2); both fall back
+    to ``take`` for chi's (1, 3) layout. Measure compiled buffer assignments
+    and timing before choosing a strategy; fusion can eliminate intermediates.
 
     The three are mathematically identical; the variation is purely
     in how XLA lays out intermediate buffers.
