@@ -1,0 +1,321 @@
+"""Bounded q-local execution of the shared-pole pencil owners.
+
+Only narrow Q/WQ/dWQ panels enter this boundary. The common staged movement
+puts complete parents on distinct mesh ranks; local dense kernels implement
+the same Hermite/Ritz equations as the distributed constructor.
+"""
+from functools import lru_cache
+
+
+def pack_parent_panels(states, infinity, counts, infinity_counts, *, mesh_xy, parent_batch,
+                       layout):
+    """Compact batched tangential panels into their original pencil columns.
+
+    ``states`` contains (s,Q,WQ,dWQ), with s scalar Ry² and complex128
+    [b,n,r_a] face panels. ``counts`` is host int [b,A] from spectral cuts;
+    ``infinity_counts`` is host int [b]. Only O(bR) offsets/masks cross to
+    the device. Panels stay face-tiled through the existing y permutation.
+    In the resolved local layout, reused Q objects and WQ partner directions
+    are transported once; a [b,R_f] column map restores them after movement.
+    The distributed layout retains its original complete Q face.
+    Return the finite/infinity/mask/map bundle and original (R_f,r_inf)
+    extents. No physical or native eigensolve dimension changes.
+    """
+    import numpy as np
+    from runtime.padding import padded_axis
+    from jax.sharding import PartitionSpec as P
+
+    def extent(width):
+        return padded_axis(int(width), mesh_xy, name="shared_pole_port",
+                           specs=((P('x', 'y'), 0), (P('x', 'y'), 1))).carrier
+    carriers = [[extent(n) for n in row] for row in counts]
+    extents = tuple((sum(row), extent(ni))
+                    for row, ni in zip(carriers, infinity_counts))
+    rf = max(nf for nf, _ in extents)
+    ri = infinity[0].shape[-1]
+    widths = [state[1].shape[-1] for state in states]
+    offsets = np.cumsum([0, *widths[:-1]])
+    # Object identity is the constructor's explicit reuse of the same Q.
+    # Never merge distinct directions using support or numerical equality.
+    if layout not in ("local", "distributed"):
+        raise ValueError(f"unknown shared-pole panel layout: {layout}")
+    sources = []
+    source_for = []
+    output_for = []
+    for i, state in enumerate(states):
+        output_source = next((j for j, previous in enumerate(states[:i])
+                              if layout == "local" and state[1] is previous[2]), None)
+        source = next((j for j in sources if layout == "local"
+                       and state[1] is states[j][1]), i)
+        if source == i and output_source is None:
+            sources.append(i)
+        source_for.append(source)
+        output_for.append(output_source)
+    sources = tuple(sources)
+    unique_widths = [widths[i] for i in sources]
+    unique_offsets = np.cumsum([0, *unique_widths[:-1]])
+    unique_counts = np.asarray([sum(row[i] for i in sources) for row in carriers], np.int32)
+    unique_width = int(max(unique_counts))
+    unique_order = np.empty((len(counts), sum(unique_widths)), np.int32)
+    columns = np.full((len(counts), rf), -1, np.int32)
+    order = np.empty((len(counts), sum(widths)), np.int32)
+    active = np.zeros((len(counts), rf + ri), bool)
+    for q, (row, retained) in enumerate(zip(carriers, counts)):
+        selected = [int(start)+i for start, width in zip(offsets, row)
+                    for i in range(width)]
+        tail = np.ones(sum(widths), bool)
+        tail[selected] = False
+        order[q] = selected + np.flatnonzero(tail).tolist()
+        selected_q = [int(start)+i for start, port in zip(unique_offsets, sources)
+                      for i in range(row[port])]
+        tail_q = np.ones(sum(unique_widths), bool)
+        tail_q[selected_q] = False
+        unique_order[q] = selected_q + np.flatnonzero(tail_q).tolist()
+        packed_offsets = dict(zip(sources, np.cumsum([0, *[row[i] for i in sources[:-1]]])))
+        output_offsets = np.cumsum([0, *row[:-1]])
+        start = 0
+        for port, (width, count) in enumerate(zip(row, retained)):
+            output_source = output_for[port]
+            source = source_for[port] if output_source is None else output_source
+            if (width, count) != (row[source], retained[source]):
+                raise ValueError("identical Q ports must have identical retained counts")
+            if output_source is None:
+                columns[q, start:start+width] = packed_offsets[source] + np.arange(width)
+            else:
+                # -1 is padding; <=-2 addresses an already transported WQ.
+                columns[q, start:start+width] = -2-output_offsets[source]-np.arange(width)
+            active[q, start:start+int(count)] = True
+            start += width
+        active[q, rf:rf+int(infinity_counts[q])] = True
+    packed = _parent_panel_packer(mesh_xy, rf, parent_batch, sources, unique_width)(
+        tuple(states), infinity, order, active,
+        np.asarray([nf for nf, _ in extents], np.int32), unique_order,
+        unique_counts, columns)
+    return packed, extents
+
+
+@lru_cache(maxsize=None)
+def _parent_panel_packer(mesh_xy, finite_width, parent_batch, sources, unique_width):
+    """One batch pack with dynamic column offsets and physical supports."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from gw.shared_pole_constructor import _factor_column_permutation
+
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    scalar = NamedSharding(mesh_xy, P())
+    permute = _factor_column_permutation(mesh_xy)
+
+    @jax.jit
+    def pack(states, infinity, order, active, finite_counts, unique_order,
+             unique_counts, columns):
+        b = states[0][1].shape[0]
+        valid = jnp.arange(finite_width)[None, :] < finite_counts[:, None]
+        points = jnp.concatenate([
+            jnp.full((b, s[1].shape[-1]), s[0], jnp.complex128)
+            for s in states], axis=-1)
+        points = jnp.where(valid, jnp.take_along_axis(points, order, axis=-1)[:, :finite_width], 0)
+        q_valid = jnp.arange(unique_width)[None, :] < unique_counts[:, None]
+        q = jnp.where(q_valid[:, None, :], permute(
+            jnp.concatenate([states[i][1] for i in sources], axis=-1), unique_order)
+            [:, :, :unique_width], 0)
+        panels = tuple(jnp.where(valid[:, None, :], permute(
+            jnp.concatenate([s[i] for s in states], axis=-1), order)[:, :, :finite_width], 0)
+            for i in (2, 3))
+        def pad(value, sharding):
+            if parent_batch > b:
+                value = jnp.concatenate((value, jnp.repeat(value[-1:], parent_batch-b, axis=0)), axis=0)
+            return jax.lax.with_sharding_constraint(value, sharding)
+        finite = (pad(points, scalar), pad(q, face), *(pad(a, face) for a in panels))
+        return finite, tuple(pad(a, face) for a in infinity), pad(active, scalar), pad(columns, scalar)
+    return pack
+
+
+@lru_cache(maxsize=None)
+def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
+    """Fuse assembly, corrected Ritz reduction and moment gates per parent.
+
+    The callable consumes the output of ``pack_parent_panels``. All matrix
+    inputs are [b,n,r] face tiles. Factors return as [b,n,R] face tiles;
+    poles, masks and gate scalars return replicated. Dense pencil work stays
+    q-local and never crosses the host. ``parent_extents`` gives each padded
+    q row its original finite/infinity widths; native eigensolves use those
+    widths, because padding a dense Gram can defeat solver convergence.
+    Local residency is O(R²+nR) per rank
+    for one parent at a time; callers admit the actual packed batch first.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
+    from common.shard_map import shard_map
+    from common.staged_reshard import face_to_batch_reshard
+    from gw.shared_pole_constructor import (
+        assemble_shared_pole_pencil, reduce_shared_pole_pencil,
+        apply_shared_pole_zero_policy, retained_moment_identity,
+    )
+    from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
+
+    to_batch = face_to_batch_reshard(mesh_xy)
+    qspec = P(('x', 'y'))
+
+    def mm(a, b, *, transa='N', transb='N'):
+        # Same local dot primitive used by the resolved service's local plan.
+        def transpose(value, trans):
+            if trans == 'N':
+                return value
+            value = jnp.swapaxes(value, -1, -2)
+            return value.conj() if trans == 'C' else value
+        return jnp.matmul(transpose(a, transa), transpose(b, transb))
+
+    def solve(finite, infinity, active):
+        # The physics owners retain their ordinary leading batch dimension.
+        finite = tuple(a[None] for a in finite)
+        infinity = tuple(a[None] for a in infinity)
+        pencil = assemble_shared_pole_pencil([finite], infinity, matmul=mm)
+        model, reduction, coefficients = reduce_shared_pole_pencil(
+            pencil, active[None], eigh=native_eigh, matmul=mm, gates=gates)
+        model, zero = apply_shared_pole_zero_policy(model, gates=gates)
+        r, ri = pencil[0].shape[-1], infinity[0].shape[-1]
+        selector = (jnp.arange(r)[:, None] == jnp.arange(r-ri, r)[None, :])[None].astype(jnp.complex128)
+        retained = retained_moment_identity(pencil, coefficients, model, selector, matmul=mm)
+        reduction['pencil_side'] = jnp.full((1,), r, jnp.int64)
+        return jax.tree.map(lambda a: a[0], (model, reduction, zero, retained))
+
+    def one(args):
+        finite, infinity, active, index, columns = args
+        # Recreate Q only for this parent. Adjoint partners alias an existing
+        # WQ panel, so no second line-direction block crosses this boundary.
+        q = jnp.where(columns[None, :] >= 0,
+                      jnp.take(finite[1], jnp.maximum(columns, 0), axis=-1),
+                      jnp.where(columns[None, :] <= -2,
+                                jnp.take(finite[2], jnp.maximum(-2-columns, 0), axis=-1), 0))
+        finite = (finite[0], q, finite[2], finite[3])
+        if parent_extents is None:
+            return solve(finite, infinity, active)
+        # cuSolver's native eigh can fail on large artificial zero blocks.
+        # Each branch solves the original selected pencil, including its
+        # original port padding. Only compact outputs acquire q-batch padding.
+        rf, ri = finite[1].shape[-1], infinity[0].shape[-1]
+        def branch(nf, ni):
+            def run(args):
+                f, i, mask = args
+                f = (f[0][:nf], *(a[:, :nf] for a in f[1:]))
+                i = tuple(a[:, :ni] for a in i)
+                mask = jnp.concatenate((mask[:nf], mask[rf:rf+ni]))
+                model, reduction, zero, retained = solve(f, i, mask)
+                b, poles, active = model
+                pad = rf + ri - nf - ni
+                model = (jnp.pad(b, ((0, 0), (0, pad))),
+                         jnp.pad(poles, (0, pad), constant_values=1),
+                         jnp.pad(active, (0, pad)))
+                reduction['gram_spectrum_relative'] = jnp.pad(
+                    reduction['gram_spectrum_relative'], (0, pad))
+                return model, reduction, zero, retained
+            return run
+        # Padded batch rows reuse the same physical-size program while their
+        # panels remain distinct runtime inputs. Do not retrace copied rows.
+        sizes = tuple(dict.fromkeys(parent_extents))
+        branches = tuple(branch(nf, ni) for nf, ni in sizes)
+        if len(sizes) != len(parent_extents):
+            dispatch = jnp.asarray([sizes.index(size) for size in parent_extents], jnp.int32)
+            index = dispatch[index]
+        return jax.lax.switch(index, branches, (finite, infinity, active))
+
+    mapped = shard_map(lambda f, i, a, q, c: jax.lax.map(one, (f, i, a, q, c)), mesh=mesh_xy,
+                       in_specs=((qspec,)*4, (qspec,)*3, qspec, qspec, qspec),
+                       out_specs=(qspec, qspec, qspec, qspec), check_vma=False)
+    # Explicit inverse movement is needed: a generic batch-to-face reshard
+    # can rematerialize every parent on every device.
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+    def restore(b):
+        if py > 1:
+            b = jax.lax.all_to_all(b, 'y', split_axis=2, concat_axis=0, tiled=True)
+        if px > 1:
+            b = jax.lax.all_to_all(b, 'x', split_axis=1, concat_axis=0, tiled=True)
+        return b
+    restore = shard_map(restore, mesh=mesh_xy, in_specs=qspec,
+                        out_specs=P(None, 'x', 'y'), check_vma=False)
+
+    @jax.jit
+    def execute(finite, infinity, active, columns):
+        f = (jax.lax.with_sharding_constraint(finite[0], jax.sharding.NamedSharding(mesh_xy, qspec)),
+             *(to_batch(a) for a in finite[1:]))
+        i = tuple(to_batch(a) for a in infinity)
+        active = jax.lax.with_sharding_constraint(active, jax.sharding.NamedSharding(mesh_xy, qspec))
+        indices = jax.lax.with_sharding_constraint(jnp.arange(active.shape[0]),
+                                                   jax.sharding.NamedSharding(mesh_xy, qspec))
+        columns = jax.lax.with_sharding_constraint(columns, jax.sharding.NamedSharding(mesh_xy, qspec))
+        model, reduction, zero, retained = mapped(f, i, active, indices, columns)
+        b, poles, mask = model
+        replicated = jax.sharding.NamedSharding(mesh_xy, P())
+        scalars = jax.tree.map(lambda a: jax.lax.with_sharding_constraint(a, replicated),
+                               (poles, mask, reduction, zero, retained))
+        poles, mask, reduction, zero, retained = scalars
+        return (restore(b), poles, mask), reduction, zero, retained
+    return execute
+
+
+@lru_cache(maxsize=None)
+def local_model_checks(mesh_xy, native_eigh):
+    """Check held W/dW and V-whitened passivity with independent local parents.
+
+    Model faces are [b,n,K], inverse Coulomb faces [b,n,n], held samples
+    [b,s,n,n], and squared Ry supports [s]. Complete parents move once to
+    ranks; all held-point products stay inside the local mapped body. Only
+    small diagnostic arrays return replicated. Callers admit padded batches.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.shard_map import shard_map
+    from common.staged_reshard import face_to_batch_reshard
+    from gw.shared_pole_constructor import shared_pole_passivity, shared_pole_reciprocity
+    from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
+
+    to_batch = face_to_batch_reshard(mesh_xy)
+    qspec = P(('x', 'y'))
+    def mm(a, b, *, transb='N'):
+        return a @ (jnp.conj(jnp.swapaxes(b, -1, -2)) if transb == 'C' else b)
+
+    def one(args, supports, eta):
+        b, poles, mask, inverse, wc, dw = args
+        model = (b[None], poles[None], mask[None])
+        passive = shared_pole_passivity(model, inverse[None], eta_ry=eta,
+                                        matmul=mm, eigh=native_eigh, gates=gates)
+        # W(s)=b(s-Lambda)^-1 b.H; dW/ds=-b(s-Lambda)^-2 b.H.
+        weights = jnp.where(mask[None], 1/(supports[:, None]-poles[None]), 0)
+        factors = b[None] * jnp.stack((weights, -weights**2))[:, :, None, :]
+        values = factors @ jnp.conj(b.T)
+        exact = jnp.stack((wc, dw))
+        errors = jnp.linalg.norm(values-exact, axis=(-2, -1)) / jnp.maximum(
+            jnp.linalg.norm(exact, axis=(-2, -1)), jnp.finfo(jnp.float64).tiny)
+        reciprocity = shared_pole_reciprocity(values, exact, gates=gates)
+        return jax.tree.map(lambda a: a[0], passive), errors, reciprocity
+
+    mapped = shard_map(
+        lambda b, p, m, inv, w, dw, s, eta: jax.lax.map(
+            lambda row: one(row, s, eta), (b, p, m, inv, w, dw)),
+        mesh=mesh_xy, in_specs=(qspec,)*6+(P(), P()),
+        out_specs=(qspec, qspec, qspec), check_vma=False)
+
+    @jax.jit
+    def execute(model, inverse, wc, dw, supports, eta):
+        b, poles, mask = model
+        batch = b.shape[0]
+        def pad(a):
+            return jnp.concatenate((a, jnp.repeat(a[-1:], batch-a.shape[0], axis=0)), axis=0)
+        def sample_move(a):
+            a = pad(a)
+            b, s, n, _ = a.shape
+            # Keep spatial x tiles contiguous while folding the replicated
+            # sample axis into M for the canonical volume-preserving move.
+            face = jnp.transpose(a, (0, 2, 1, 3)).reshape(b, n*s, n)
+            local = to_batch(face).reshape(b, n, s, n)
+            return jnp.transpose(local, (0, 2, 1, 3))
+        scalar = NamedSharding(mesh_xy, qspec)
+        out = mapped(to_batch(b), jax.lax.with_sharding_constraint(poles, scalar),
+                     jax.lax.with_sharding_constraint(mask, scalar),
+                     to_batch(pad(inverse)), sample_move(wc), sample_move(dw), supports, eta)
+        return jax.tree.map(lambda a: jax.lax.with_sharding_constraint(
+            a, NamedSharding(mesh_xy, P())), out)
+    return execute
