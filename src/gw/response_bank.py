@@ -48,8 +48,11 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False):
 
     dial = linalg_resolution(
         config if hasattr(config, "get") else {"linalg": config.backend.linalg})
-    # Whole matrices per device at or below the measured extent, whatever the dial.
+    # Sample stacks fill the mesh: whole matrices per device at or below the measured
+    # extent. The moment Dyson is one q at a time and keeps the dial.
     resolution = linalg_resolution({"linalg": dense_layout(dial, "solve", n)})
+    moment_resolution = linalg_resolution({"linalg": dense_layout(
+        dial, "gemm", n, batch=1, mesh_size=int(mesh_xy.size))})
     route = resolution.batched_route
     backend = "off" if resolution.layout == "local" else "distributed"
     lu = plan("solve_lu", mesh_xy, backend=backend, n=n,
@@ -63,6 +66,14 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False):
 
     def congruence(h, a):
         return mm(mm(h, a), h)
+
+    def mm_m(a, b):
+        return matmul(a, b, mesh=mesh_xy,
+                      backend="off" if moment_resolution.layout == "local" else "distributed",
+                      batched_route=moment_resolution.batched_route)
+
+    def congruence_m(h, a):
+        return mm_m(mm_m(h, a), h)
 
     @partial(jax.jit, in_shardings=(face, face, face),
              out_shardings=(face, face))
@@ -80,10 +91,10 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False):
     def moments(h, a0, a1):
         # chi_scaled=A0/s+A1/s²; whitened Dyson coefficients are
         # B0=H A0 H, B1=H A1 H, S0=B0, S1=B1+B0².
-        b0 = congruence(h, a0)
-        b1 = congruence(h, a1)
-        return (0.5 * congruence(h, b0),
-                0.5 * congruence(h, b1 + mm(b0, b0)))
+        b0 = congruence_m(h, a0)
+        b1 = congruence_m(h, a1)
+        return (0.5 * congruence_m(h, b0),
+                0.5 * congruence_m(h, b1 + mm_m(b0, b0)))
 
     if ordered:
         @partial(jax.jit, in_shardings=(face, face, face, face, face),
@@ -96,17 +107,18 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False):
             # Returns M0=C1/2, M1=C2/2, M2=C3/2, M3=C4/2 (M_k = C_(k+1)/2, the
             # constructor's convention); with o0=o1=0 the even pair reduces
             # to the incumbent M1/M3 exactly.
-            x1, x2, x3, x4 = (congruence(h, v) for v in (o0, a0, o1, a1))
-            x11 = mm(x1, x1)
+            x1, x2, x3, x4 = (congruence_m(h, v) for v in (o0, a0, o1, a1))
+            x11 = mm_m(x1, x1)
             c2 = x2 + x11
-            c3 = x3 + mm(x1, x2) + mm(x2, x1) + mm(x11, x1)
-            c4 = (x4 + mm(x1, x3) + mm(x3, x1) + mm(x2, x2) + mm(x11, x2)
-                  + mm(mm(x1, x2), x1) + mm(x2, x11) + mm(x11, x11))
-            return (0.5 * congruence(h, x1), 0.5 * congruence(h, c2),
-                    0.5 * congruence(h, c3), 0.5 * congruence(h, c4))
+            c3 = x3 + mm_m(x1, x2) + mm_m(x2, x1) + mm_m(x11, x1)
+            c4 = (x4 + mm_m(x1, x3) + mm_m(x3, x1) + mm_m(x2, x2) + mm_m(x11, x2)
+                  + mm_m(mm_m(x1, x2), x1) + mm_m(x2, x11) + mm_m(x11, x11))
+            return (0.5 * congruence_m(h, x1), 0.5 * congruence_m(h, c2),
+                    0.5 * congruence_m(h, c3), 0.5 * congruence_m(h, c4))
 
     algebra = {
         "linalg": resolution.layout,
+        "moment_linalg": moment_resolution.layout,
         "solve": lu.describe(),
         "batched_route": route,
         "prefactor": pref,
@@ -360,7 +372,9 @@ def _bank_execution(meta, mesh_xy, bank_io, receipt, config):
                 if stage in ("sample_dyson", "moment_dyson", "coulomb_sqrt"):
                     from .gw_config import dense_layout, linalg_resolution
                     layout = dense_layout(linalg_resolution({"linalg": layout}),
-                        "eigh" if stage == "coulomb_sqrt" else "solve", args[0].shape[-1])
+                        {"coulomb_sqrt": "eigh", "sample_dyson": "solve", "moment_dyson": "gemm"}[stage],
+                        args[0].shape[-1], **({"batch": args[0].shape[0], "mesh_size": mesh_xy.size}
+                                             if stage == "moment_dyson" else {}))
                 native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
                     with_eigh=stage=="coulomb_sqrt")
                 receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))

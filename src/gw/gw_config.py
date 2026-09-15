@@ -1297,15 +1297,20 @@ def dense_layout(resolution: LinalgResolution, op: str, extent: int, *,
     """Execution layout ('local' or 'distributed') of one dense operation.
 
     ``op`` is ``gemm``, ``solve`` or ``eigh`` and ``extent`` its largest matrix
-    edge.  At or below :data:`LOCAL_DENSE_EXTENT` every device holds whole
-    matrices; above it the deck's ``linalg`` dial decides, except that a GEMM
-    whose leading ``batch`` is smaller than ``mesh_size`` would put a single
-    whole matrix on one device and takes the distributed provider instead.
+    edge.  An eigh at or below :data:`LOCAL_DENSE_EXTENT` runs on whole matrices
+    per device whatever the batch.  GEMM and solve stacks do so only when their
+    leading ``batch`` fills the mesh (``batch`` None means the caller's stacks
+    do): a smaller batch pays a whole-matrix exchange per call (measured: the
+    CrI3 single-q moment Dyson, 112.7 s local against 27.8 s on the provider,
+    PERF 58386600).  Otherwise the deck's ``linalg`` dial decides, except that a
+    GEMM batch smaller than the mesh above the extent takes the distributed
+    provider rather than put one whole matrix on one device.
     """
-    if int(extent) <= LOCAL_DENSE_EXTENT[op]:
+    fills = batch is None or mesh_size is None or int(batch) >= int(mesh_size)
+    small = int(extent) <= LOCAL_DENSE_EXTENT[op]
+    if small and (op == "eigh" or fills):
         return "local"
-    if (op == "gemm" and batch is not None and mesh_size is not None
-            and int(batch) < int(mesh_size)):
+    if op == "gemm" and not fills and not small:
         return "distributed"
     return resolution.layout
 
