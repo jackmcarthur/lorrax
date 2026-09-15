@@ -1071,7 +1071,7 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
                 spectra[key] = (_sample_rows_kernel(mesh, rows, extent)(q_all, np.int32(i * rows)), row_values)
             del q_all, values
         for sample_id in group:
-            admit(largest_side())
+            # The chunk was priced before its reads; each state's growth is priced below.
             w, derivative = reads.pop(sample_id)
             if not roles:
                 roles = [[] for _ in range(w.shape[0])]
