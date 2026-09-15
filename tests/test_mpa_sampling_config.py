@@ -235,7 +235,7 @@ def test_insulator_with_mp1_fermi_reference_refuses(tmp_path):
 
 
 def test_uncertified_smearing_family_refuses_by_name(tmp_path):
-    with pytest.raises(ValueError, match="only 'mp1'"):
+    with pytest.raises(ValueError, match=r"supports 'mp1' .* or 'fd' .*got 'fermi_dirac'"):
         _config(
             tmp_path,
             _METAL_KEYS.replace(

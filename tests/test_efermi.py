@@ -331,3 +331,57 @@ def test_wfn_occupation_consistency_discriminates_width():
     with pytest.raises(ValueError, match="degauss/2"):
         assert_wfn_occupation_consistency(
             st, stored_wrong, w, state_capacity=1.0, num_electrons=100.5)
+
+
+def test_fd_fixed_n_exact_tail_and_spin_normalization():
+    from gw.efermi import OccupationState, fd_occupations
+    from scipy.special import expit
+    e = np.array([[-1., -.02, .01, .2, 1.], [-.8, -.01, .04, .3, 1.2]])
+    w = np.array([.25, .75])
+    state = OccupationState.solve_smearing(
+        e, w, 3., .01, family='fd', state_capacity=2.)
+    assert state.smearing_family == 'fd'
+    assert abs(2*np.einsum('k,kn->', w, np.asarray(state.f_kn))-3.) < 1e-10
+    np.testing.assert_allclose(state.f_kn, expit((state.mu_ry-e)/.01), atol=1e-15, rtol=1e-14)
+    assert np.all(np.diff(np.asarray(state.f_kn), axis=1) <= 0)
+    assert np.all((np.asarray(state.f_kn)>=0) & (np.asarray(state.f_kn)<=1))
+    # FD retains physical tails even below the MP1 clamp default1e-8.
+    tail = np.asarray(fd_occupations(np.array([[.2, .3]]), 0., .01))
+    assert 0 < tail[0,1] < tail[0,0] < 1e-8
+    scalar = OccupationState.solve_smearing(e, w, 1.5, .01, family='fd', state_capacity=1.)
+    np.testing.assert_array_equal(state.f_kn, scalar.f_kn)
+
+
+@pytest.mark.parametrize('family', ['fd', 'mp1'])
+def test_smearing_logical_prefix_excludes_padding_from_fixed_n(family):
+    from gw.efermi import (OccupationState, assert_fixed_n,
+                          legacy_square_mesh_occupation_digests,
+                          solve_smearing_occupations)
+    energies = np.linspace(-1., 3., 86)[None, :] + np.array([[0.], [.01], [-.02]])
+    weights = np.array([.25, .25, .5])
+    physical = OccupationState.solve_smearing(
+        energies, weights, 9., .01, family=family, state_capacity=2.)
+    for padding in (0., -100., np.nan):
+        carrier = np.pad(energies, ((0, 0), (0, 2)), constant_values=padding)
+        padded = OccupationState.solve_smearing(
+            carrier, weights, 9., .01, family=family,
+            state_capacity=2., logical_nband=86)
+        assert padded.f_kn.shape == (3, 88)
+        np.testing.assert_array_equal(np.asarray(padded.f_kn)[:, 86:], 0.)
+        np.testing.assert_array_equal(np.asarray(padded.f_kn)[:, :86], physical.f_kn)
+        assert padded.mu_ry == physical.mu_ry
+        assert padded.occ_hash == physical.occ_hash
+        assert assert_fixed_n(padded, weights, state_capacity=2.) == pytest.approx(9., abs=1e-10)
+        assert legacy_square_mesh_occupation_digests(padded.f_kn, 86)
+    # Charge capacity uses physical bands, not the two storage slots.
+    with pytest.raises(ValueError, match='n_electrons'):
+        solve_smearing_occupations(carrier, weights, 173., .01,
+                                   family=family, state_capacity=2., logical_nband=86)
+
+
+@pytest.mark.parametrize('logical', [0, 89, -1, 86.5, True])
+def test_smearing_logical_prefix_refuses_invalid_extent(logical):
+    from gw.efermi import solve_smearing_occupations
+    with pytest.raises(ValueError, match='logical_nband'):
+        solve_smearing_occupations(np.zeros((2, 88)), [.5, .5], 9., .01,
+                                   family='fd', state_capacity=2., logical_nband=logical)

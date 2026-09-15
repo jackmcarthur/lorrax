@@ -69,6 +69,7 @@ should be collapsed into the other.
 from __future__ import annotations
 
 import hashlib
+from functools import partial
 from dataclasses import dataclass
 
 import numpy as np
@@ -88,7 +89,8 @@ __all__ = [
     "mp1_negative_derivative", "mp1_occupations",
     "occupation_clamp_tol", "occupation_digest", "occupation_weight_floor",
     "occupied_band_count", "resolve_sigma_efermi_ry",
-    "solve_mp1_occupations", "step_occupations",
+    "solve_mp1_occupations", "solve_smearing_occupations", "fd_occupations",
+    "step_occupations",
 ]
 
 
@@ -117,7 +119,7 @@ def resolve_sigma_efermi_ry(fermi_reference, *, occupation_state, wfn):
     which is the worst shape for a defect to have, because the one deck
     that would expose it is the one nobody runs by default.
 
-      ``mp1_fixed_n``  the fixed-N MP1 chemical potential of THIS
+      ``mp1_fixed_n``  the fixed-N chemical potential of the chosen family for THIS
                        iteration.  Requires an ``occupation_state``; a
                        metal has one and ``gw_config`` refuses the
                        combination without it.
@@ -138,7 +140,7 @@ def resolve_sigma_efermi_ry(fermi_reference, *, occupation_state, wfn):
     if name == "mp1_fixed_n":
         if occupation_state is None:
             raise ValueError(
-                "fermi_reference = mp1_fixed_n names the fixed-N MP1 "
+                "fermi_reference = mp1_fixed_n names the fixed-N "
                 "chemical potential, but no occupation_state reached the "
                 "Sigma dispatch.  The QSGW driver passes one; a direct "
                 "caller must construct it from the current spectrum.")
@@ -348,7 +350,7 @@ def _mp1_values(E, chemical_potential, broadening, clamp_tol):
     """BerkeleyGW v4 MP1 formula on float64 JAX operands, tail-clamped.
 
     THE CLAMP IS APPLIED HERE, AT THE POINT OF EVALUATION, and therefore
-    inside the fixed-N root as well: ``_solve_mp1_kernel``'s ``count(mu)``
+    inside the fixed-N root as well: ``_solve_smearing_kernel``'s ``count(mu)``
     calls this function, so the mu it finds is the one that makes the
     CLAMPED table hit the electron target.  Clamping the table after the
     root instead would round the tail and then fail
@@ -362,6 +364,30 @@ def _mp1_values(E, chemical_potential, broadening, clamp_tol):
     return clamp_occupation_tail(
         0.5 * (1.0 - jax.lax.erf(x)) - correction / (2.0 * jnp.sqrt(jnp.pi)),
         clamp_tol)
+
+
+def fd_occupations(E_kn, chemical_potential, broadening_ry):
+    """Exact Fermi-Dirac f(E) on (nk, nb) energies in Ry, without tail clamping.
+
+    ``broadening_ry`` is kBT, not MP1's half-width. The stable sigmoid
+    evaluates 1/(1+exp((E-mu)/kBT)) without overflowing either tail.
+    """
+    return jax.nn.sigmoid(
+        (jnp.asarray(chemical_potential, dtype=jnp.float64)
+         - jnp.asarray(E_kn, dtype=jnp.float64))
+        / jnp.asarray(broadening_ry, dtype=jnp.float64))
+
+
+@jax.jit
+def fd_negative_derivative(E_kn, chemical_potential, broadening_ry) -> jax.Array:
+    """Return the exact FD weight ``-df/dE = f(1-f)/kBT`` in Ry^-1.
+
+    Energies and chemical potential are in Ry; ``broadening_ry`` is kBT,
+    exactly as in :func:`fd_occupations`, without an MP1 half-width factor.
+    The returned array has the same shape as ``E_kn``.
+    """
+    f = fd_occupations(E_kn, chemical_potential, broadening_ry)
+    return f * (1.0 - f) / jnp.asarray(broadening_ry, dtype=jnp.float64)
 
 
 def _mp1_negative_derivative_values(E, chemical_potential, broadening):
@@ -413,12 +439,12 @@ def mp1_negative_derivative(
         jnp.asarray(broadening_ry, dtype=jnp.float64))
 
 
-@jax.jit
-def _solve_mp1_kernel(E, w, target, broadening, capacity, clamp_tol):
+@partial(jax.jit, static_argnames=("family",))
+def _solve_smearing_kernel(E, w, target, broadening, capacity, clamp_tol, family):
     """Pure fixed-shape device root plus final occupations.
 
-    ONE ``_mp1_values`` FOR BOTH THE COUNT AND THE TABLE, so the clamp is
-    inside the root: mu is chosen to make the clamped table hit ``target``.
+    The selected family evaluates both the count and the returned table.
+    MP1 clamps its tail inside the root; FD retains its exact thermal tail.
     """
     E = jnp.asarray(E, dtype=jnp.float64)
     w = jnp.asarray(w, dtype=jnp.float64)
@@ -426,12 +452,14 @@ def _solve_mp1_kernel(E, w, target, broadening, capacity, clamp_tol):
     broadening = jnp.asarray(broadening, dtype=jnp.float64)
     capacity = jnp.asarray(capacity, dtype=jnp.float64)
     clamp_tol = jnp.asarray(clamp_tol, dtype=jnp.float64)
-    tail = _MP1_BRACKET_WIDTHS * broadening
+    values = (fd_occupations if family == "fd" else
+              lambda e, mu, width: _mp1_values(e, mu, width, clamp_tol))
+    tail = (64.0 if family == "fd" else _MP1_BRACKET_WIDTHS) * broadening
     bracket0 = (jnp.min(E) - tail, jnp.max(E) + tail)
 
     def count(mu):
         return capacity * jnp.einsum(
-            "k,kn->", w, _mp1_values(E, mu, broadening, clamp_tol))
+            "k,kn->", w, values(E, mu, broadening))
 
     def bisect(_iteration, bracket):
         lo, hi = bracket
@@ -444,12 +472,14 @@ def _solve_mp1_kernel(E, w, target, broadening, capacity, clamp_tol):
     lo, hi = jax.lax.fori_loop(
         0, _MP1_BISECTION_STEPS, bisect, bracket0)
     mu = 0.5 * (lo + hi)
-    return mu, _mp1_values(E, mu, broadening, clamp_tol)
+    return mu, values(E, mu, broadening)
 
 
-def solve_mp1_occupations(
+def solve_smearing_occupations(
     E_kn, kweights, n_electrons: float, broadening_ry: float, *,
     state_capacity: float,
+    family: str,
+    logical_nband: int | None = None,
     clamp_tol: float = OCCUPATION_CLAMP_TOL_DEFAULT,
 ) -> tuple[jax.Array, jax.Array]:
     """Return ``(mu_ry, f_kn)`` satisfying the fixed-electron constraint.
@@ -460,42 +490,73 @@ def solve_mp1_occupations(
     ``state_capacity=1``; a restricted scalar state has 2.  Use the
     canonical ``spin_degeneracy_factor(wfn)``.
 
-    ``clamp_tol`` snaps the far tail to exact 0/1 INSIDE the root, so the
-    returned ``(mu, f_kn)`` pair satisfies the fixed-electron constraint on
-    the clamped table (:func:`clamp_occupation_tail`).  ``0.0`` disables it.
+    For MP1, ``clamp_tol`` snaps the far tail inside the root; FD ignores
+    this MP1-specific setting and retains the exact Fermi-Dirac table.
+    The width is the BerkeleyGW half-width for MP1 and kBT for FD, in Ry.
+
+    ``logical_nband`` is the physical prefix of the (nk, nb_carrier)
+    energy array, supplied by the caller's band layout. If omitted, all
+    bands are physical. Only that prefix enters the root and charge count;
+    the returned carrier has exact-zero occupations beyond it. Padding
+    energies are never inspected, and physical occupations are not clipped.
 
     Validation is host-only and reads no eigenvalues.  Root and occupations
     are one fixed-iteration JAX kernel with no Python loop or scalar readback.
     """
+    if family not in ("mp1", "fd"):
+        raise ValueError("occupation solve family must be 'mp1' or 'fd'")
     shape = tuple(int(s) for s in np.shape(E_kn))
     w = np.asarray(kweights, dtype=np.float64)
     if len(shape) != 2 or min(shape, default=0) < 1:
         raise ValueError(
-            f"solve_mp1_occupations: E_kn must be nonempty (nk, nb); got {shape}")
+            f"solve_smearing_occupations: E_kn must be nonempty (nk, nb); got {shape}")
+    import operator
+    try:
+        logical = shape[1] if logical_nband is None else operator.index(logical_nband)
+    except TypeError as exc:
+        raise ValueError("occupation solve logical_nband must be an integer") from exc
+    if isinstance(logical_nband, (bool, np.bool_)) or not (1 <= logical <= shape[1]):
+        raise ValueError(
+            "occupation solve logical_nband must lie inside the energy carrier; "
+            f"got {logical_nband!r}, carrier={shape[1]}")
     if w.shape != (shape[0],):
         raise ValueError(
-            f"solve_mp1_occupations: kweights must be ({shape[0]},); got {w.shape}")
+            f"solve_smearing_occupations: kweights must be ({shape[0]},); got {w.shape}")
     if not np.all(np.isfinite(w)) or np.any(w < 0.0):
-        raise ValueError("solve_mp1_occupations: kweights must be finite/nonnegative")
+        raise ValueError("solve_smearing_occupations: kweights must be finite/nonnegative")
     weight_sum = float(w.sum())
     if not np.isclose(weight_sum, 1.0, rtol=0.0, atol=1e-10):
         raise ValueError(
-            f"solve_mp1_occupations: kweights must sum to 1; got {weight_sum:.17g}")
+            f"solve_smearing_occupations: kweights must sum to 1; got {weight_sum:.17g}")
 
     target = float(n_electrons)
     broadening = float(broadening_ry)
     capacity = float(state_capacity)
     if not np.isfinite(broadening) or broadening <= 0.0:
-        raise ValueError("solve_mp1_occupations: broadening_ry must be finite and > 0")
+        raise ValueError(
+            "solve_smearing_occupations: broadening_ry "
+            f"({'kBT' if family == 'fd' else 'BerkeleyGW half-width'}, Ry) "
+            "must be finite and > 0")
     if not np.isfinite(capacity) or capacity <= 0.0:
-        raise ValueError("solve_mp1_occupations: state_capacity must be finite and > 0")
-    maximum = capacity * weight_sum * shape[1]
+        raise ValueError("solve_smearing_occupations: state_capacity must be finite and > 0")
+    maximum = capacity * weight_sum * logical
     if not np.isfinite(target) or not (0.0 < target < maximum):
         raise ValueError(
-            f"solve_mp1_occupations: n_electrons={target!r} outside (0, {maximum})")
+            f"solve_smearing_occupations: n_electrons={target!r} outside (0, {maximum})")
 
-    return _solve_mp1_kernel(E_kn, w, target, broadening, capacity,
-                             occupation_clamp_tol(clamp_tol))
+    mu, physical_f = _solve_smearing_kernel(
+        jnp.asarray(E_kn, dtype=jnp.float64)[:, :logical], w, target, broadening, capacity,
+        occupation_clamp_tol(clamp_tol), family)
+    return mu, jnp.pad(physical_f, ((0, 0), (0, shape[1] - logical)),
+                       mode="constant", constant_values=0.0)
+
+
+def solve_mp1_occupations(E_kn, kweights, n_electrons, broadening_ry, *,
+                          state_capacity, clamp_tol=OCCUPATION_CLAMP_TOL_DEFAULT):
+    """MP1 specialization of the common fixed-N bisection owner."""
+    return solve_smearing_occupations(
+        E_kn, kweights, n_electrons, broadening_ry, family="mp1",
+        state_capacity=state_capacity, clamp_tol=clamp_tol)
 
 
 @jax.jit
@@ -793,7 +854,7 @@ class OccupationState:
 
     f_kn: jax.Array          # (nk, nb), float64, never clipped
     mu_ry: float             # fixed-N chemical potential, or step E_F
-    smearing_family: str     # "mp1" | "fixed" ("fixed" = insulating step)
+    smearing_family: str     # "mp1" | "fd" | "fixed" ("fixed" = insulating step)
     smearing_width_ry: float # broadening_ry; 0.0 for "fixed"
     n_electrons: float       # physical electron target (capacity-weighted)
     occ_hash: str = ""       # sha256[:16] of f_kn bytes; derived, see below
@@ -805,17 +866,17 @@ class OccupationState:
                 f"OccupationState: f_kn must be nonempty (nk, nb); got {f.shape}")
         if not np.all(np.isfinite(f)):
             raise ValueError("OccupationState: f_kn must be finite")
-        if self.smearing_family not in ("mp1", "fixed"):
+        if self.smearing_family not in ("mp1", "fd", "fixed"):
             raise ValueError(
-                "OccupationState: smearing_family must be 'mp1' or 'fixed'; "
+                "OccupationState: smearing_family must be 'mp1', 'fd' or 'fixed'; "
                 f"got {self.smearing_family!r}")
         width = float(self.smearing_width_ry)
         if self.smearing_family == "fixed" and width != 0.0:
             raise ValueError(
                 f"OccupationState: family 'fixed' requires width 0.0; got {width!r}")
-        if self.smearing_family == "mp1" and not (np.isfinite(width) and width > 0.0):
+        if self.smearing_family in ("mp1", "fd") and not (np.isfinite(width) and width > 0.0):
             raise ValueError(
-                f"OccupationState: family 'mp1' requires width > 0; got {width!r}")
+                f"OccupationState: family {self.smearing_family!r} requires width > 0; got {width!r}")
         if not np.isfinite(self.mu_ry):
             raise ValueError(f"OccupationState: mu_ry must be finite; got {self.mu_ry!r}")
         digest = occupation_digest(f)
@@ -826,29 +887,40 @@ class OccupationState:
         object.__setattr__(self, "occ_hash", digest)
 
     @classmethod
-    def solve_mp1(cls, E_kn, kweights, n_electrons: float, width_ry: float, *,
-                  state_capacity: float,
+    def solve_smearing(cls, E_kn, kweights, n_electrons: float, width_ry: float, *,
+                  state_capacity: float, family: str,
+                  logical_nband: int | None = None,
                   clamp_tol: float = OCCUPATION_CLAMP_TOL_DEFAULT,
                   ) -> "OccupationState":
-        """Fixed-N MP1 state via :func:`solve_mp1_occupations` (one solver).
+        """Fixed-N state of the selected family through the common bisection.
 
         ``state_capacity`` follows the module convention (1 for a fully
         relativistic spinor state, 2 for a restricted scalar one).  The
         frozen interface sketch omitted it; without it the fixed-N invariant
         is wrong by a factor of 2 on scalar decks.
 
-        ``clamp_tol`` is applied inside the root, so ``assert_fixed_n``
-        below tests the table this object actually carries.
+        ``logical_nband`` excludes layout padding inside the solve and
+        returns exact-zero padding. The MP1 ``clamp_tol`` is applied inside
+        its root; ``assert_fixed_n`` tests the table actually carried.
         """
-        mu, f = solve_mp1_occupations(
+        mu, f = solve_smearing_occupations(
             E_kn, kweights, float(n_electrons), float(width_ry),
-            state_capacity=float(state_capacity),
+            state_capacity=float(state_capacity), family=family,
+            logical_nband=logical_nband,
             clamp_tol=float(clamp_tol))
-        state = cls(f_kn=f, mu_ry=float(mu), smearing_family="mp1",
+        state = cls(f_kn=f, mu_ry=float(mu), smearing_family=family,
                     smearing_width_ry=float(width_ry),
                     n_electrons=float(n_electrons))
         assert_fixed_n(state, kweights, state_capacity=float(state_capacity))
         return state
+
+    @classmethod
+    def solve_mp1(cls, E_kn, kweights, n_electrons, width_ry, *,
+                  state_capacity, clamp_tol=OCCUPATION_CLAMP_TOL_DEFAULT):
+        """Construct the MP1 specialization through the common solver."""
+        return cls.solve_smearing(
+            E_kn, kweights, n_electrons, width_ry, family="mp1",
+            state_capacity=state_capacity, clamp_tol=clamp_tol)
 
     @classmethod
     def step(cls, E_kn, kweights, n_occ_bands: float, *,

@@ -810,6 +810,22 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
     )
 
 
+def _declared_smearing_family(config):
+    """The deck's declared occupation-smearing family, or None.
+
+    ONE SOURCE. The one-shot owner reads exactly this key
+    (``gw.gw_jax._solve_metallic_occupations``), a metal is required to
+    declare ``mp1`` or ``fd`` (``gw_config.validate_material_inputs``) and a
+    shared-pole metal is REFUSED if it declares ``mp1``
+    (``gw_config``: "shared_pole needs a positive spectral measure"). A
+    self-consistent map that solves MP1 regardless builds its bank on the
+    occupations the deck was forced to disclaim, which is the collision
+    this function exists to remove.
+    """
+    family = getattr(config, "occ_smearing_family", None)
+    return None if family is None else str(family).strip().lower()
+
+
 def _solve_occupation_state(
     inputs: SCInputs,
     energies_kn_ry,
@@ -862,7 +878,7 @@ def _solve_occupation_state(
             f"storage <= energy bands; got {nb_logical}, {nb_storage}, "
             f"{energies.shape[1]}.")
 
-    from .efermi import assert_fixed_n, solve_mp1_occupations
+    from .efermi import assert_fixed_n, solve_smearing_occupations
 
     nk = int(energies.shape[0])
     kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
@@ -872,11 +888,15 @@ def _solve_occupation_state(
     capacity = float(inputs.wfn.occupation_state_capacity)
     target_electrons = float(inputs.wfn.num_electrons)
     width_ry = inputs.config.occ_broadening_ry
-    mu_ry, occ_logical = solve_mp1_occupations(
+    # An insulator declares no family; its smeared-head dial is a broadening
+    # quadrature, not an occupation family, and keeps the historical MP1.
+    family = _declared_smearing_family(inputs.config) or "mp1"
+    mu_ry, occ_logical = solve_smearing_occupations(
         energies[:, :nb_logical],
         kweights,
         target_electrons,
         width_ry,
+        family=family,
         state_capacity=capacity,
         clamp_tol=float(inputs.config.occupation_clamp_tol),
     )
@@ -889,7 +909,7 @@ def _solve_occupation_state(
     occ_state = OccupationState(
         f_kn=occ_kn,
         mu_ry=float(mu_ry),
-        smearing_family="mp1",
+        smearing_family=family,
         smearing_width_ry=float(width_ry),
         n_electrons=target_electrons,
     )
@@ -1668,19 +1688,20 @@ def run_fixed_sigma_evsc(
     # chemical potential and three-way valence/crossing/conduction split as
     # the main SC map.  On an insulator this closure is never called and the
     # established fixed-band-cut midgap path remains exact.
-    use_mp1 = bool(getattr(config, "occ_smearing_family", None))
-    if use_mp1:
+    _family = _declared_smearing_family(config)
+    if _family is not None:
         from psp.get_DFT_mtxels import spin_degeneracy_factor
-        from .efermi import solve_mp1_occupations
+        from .efermi import solve_smearing_occupations
 
         _state_capacity = float(spin_degeneracy_factor(wfn))
         _kweights = np.full(nk, 1.0 / nk, dtype=np.float64)
 
         def _occupation_state(e_kn_ry):
-            return solve_mp1_occupations(
+            return solve_smearing_occupations(
                 np.asarray(e_kn_ry, dtype=np.float64), _kweights,
                 float(wfn.num_electrons),
                 float(config.occ_broadening_ry),
+                family=_family,
                 state_capacity=_state_capacity,
                 clamp_tol=float(config.occupation_clamp_tol))
 
@@ -1715,7 +1736,7 @@ def run_fixed_sigma_evsc(
 
     def _candidate_efermi(H):
         e_candidate, _ = _eigh(H)
-        if use_mp1:
+        if _family is not None:
             mu_ry, _ = _occupation_state(e_candidate)
             return float(mu_ry)
         return float(_midgap_efermi(e_candidate, n_occ))
@@ -1734,7 +1755,7 @@ def run_fixed_sigma_evsc(
             e_in_j, U_dft_to_qp = _eigh(H_dft)
             e_in_ry = np.asarray(e_in_j, dtype=np.float64)
 
-        if use_mp1:
+        if _family is not None:
             from .scissor import classify_scissor_bands
             _, f_in = _occupation_state(e_in_ry)
             band_classes = classify_scissor_bands(f_in)
@@ -5578,17 +5599,18 @@ def run_sc_driver(
     # window against wfn.efermi (midgap, +2.79 eV on sodium) emptied the
     # partition — 0/48 in range — so every band was scissored by a fit
     # with zero samples and H_qp came back all-zero.
-    if getattr(config, "occ_smearing_family", None):
+    if _declared_smearing_family(config) is not None:
         from psp.get_DFT_mtxels import spin_degeneracy_factor
-        from .efermi import solve_mp1_occupations
+        from .efermi import solve_smearing_occupations
         _e_part = np.asarray(enk_dft, dtype=np.float64)
         # enk_dft here is the unfolded full-BZ table: uniform weights,
         # the same convention as _solve_head_occupations.
-        _mu_ry, _ = solve_mp1_occupations(
+        _mu_ry, _ = solve_smearing_occupations(
             _e_part,
             np.full(_e_part.shape[0], 1.0 / _e_part.shape[0]),
             float(wfn.num_electrons),
             float(config.occ_broadening_ry),
+            family=_declared_smearing_family(config),
             state_capacity=float(spin_degeneracy_factor(wfn)),
             clamp_tol=float(config.occupation_clamp_tol))
         efermi_ev = float(_mu_ry) * RYD_TO_EV
@@ -6053,20 +6075,23 @@ def final_qp_eigenstates(
     # width and capacity as the loop; uniform weights on the state's own
     # k-set, the _solve_head_occupations convention.
     if (state.occupation_state is not None
-            and str(state.occupation_state.smearing_family) == "mp1"):
+            and str(state.occupation_state.smearing_family) in ("mp1", "fd")):
         if state_capacity is None:
             raise ValueError(
                 "final_qp_eigenstates: a metallic occupation_state needs "
                 "state_capacity (spin_degeneracy_factor(wfn)) to place the "
                 "final mu; got None. The caller has the WFN in scope.")
-        from .efermi import solve_mp1_occupations
+        from .efermi import solve_smearing_occupations
         _E_np = np.asarray(E_ry, dtype=np.float64)
         _st = state.occupation_state
-        _mu_ry, _ = solve_mp1_occupations(
+        # The STATE carries its own family; re-solving mu in a different one
+        # is the shadow accounting this module exists to avoid.
+        _mu_ry, _ = solve_smearing_occupations(
             _E_np,
             np.full(_E_np.shape[0], 1.0 / _E_np.shape[0]),
             float(_st.n_electrons),
             float(_st.smearing_width_ry),
+            family=str(_st.smearing_family),
             state_capacity=float(state_capacity),
             # SAME clamp as the loop's solve, for the same reason
             # ``state_capacity`` is a kwarg here: ``SCState`` carries the
