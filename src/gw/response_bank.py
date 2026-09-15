@@ -172,12 +172,14 @@ def response_weights(wfns, meta):
 
 
 def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
-                    pair_mode="retarded", bank_carry=False, node_weights=False):
+                    pair_mode="retarded", bank_carry=False, node_weights=False, ordered=False):
     """Bind the existing one-particle Green/FFT primitive to a q batch.
 
     Returns a jitted kernel and its fixed ψ/energy arguments. Caller supplies
     time, projections, final weights and energy reference. The output is
     ``[len(q_ids), n_outputs, mu_p, mu_p]`` with both endpoints sharded.
+    ``ordered`` (time reversal measured broken) returns the physical
+    orientation ``chi_q = FT_q[chi]`` that Sigma's contraction assumes.
     """
     from .w_isdf import _get_chi_fractional_contour_kernel_face
 
@@ -196,7 +198,7 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
         k_unfold_plan=parent, selected_q=tuple(q_ids), pair_mode=pair_mode,
-        bank_carry=bank_carry, node_weights=node_weights)
+        bank_carry=bank_carry, node_weights=node_weights, ordered=ordered)
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
 
 
@@ -237,7 +239,7 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False):
     # All correlations in one stream call: node i carries correlation i's band
     # weights at t=0 and projection row i selects it (other rows add exact zeros).
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
-                                    n_outputs=len(rows), node_weights=True)
+                                    n_outputs=len(rows), node_weights=True, ordered=ordered)
     weight_f = jnp.stack([stream_weights(wfns, f * erel**a, mesh_xy).astype(jnp.complex128)
                           for a, _, _ in rows])
     weight_u = jnp.stack([stream_weights(wfns, phase * u * erel**b, mesh_xy).astype(jnp.complex128)
@@ -771,6 +773,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # Time reversal measured broken: both particle-hole orientations keep
         # independent weights. The retarded stream already forms the partner as
         # conj in R space (the -q orientation); remote cells add the odd kernel.
+        # ordered=True stores the physical orientation W_q = FT_q[W].
         ordered = not bool(sym.trs_allowed)
         if ordered:
             receipt["ordered"] = True
@@ -903,7 +906,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 name,_ = _reserve(meta,"bank_outputs",(2*a+1)*(q1-q0)*face_bytes + headroom)
                 ledger.live_stages = ambient+(name,)
                 kernel,fixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,bank_carry=True)
+                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,bank_carry=True,ordered=ordered)
                 raw = jax.jit(lambda: jnp.zeros((2*a,q1-q0,meta.mu_basis.n_packed,meta.mu_basis.n_packed),jnp.complex128),
                     out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
             raw = execute(kernel,(jnp.asarray(t),jnp.asarray(np.vstack((phase[lo:hi],derivative[lo:hi]))),
