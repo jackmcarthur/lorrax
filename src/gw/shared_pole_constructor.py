@@ -354,6 +354,67 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     return (b, poles, active), diagnostics, scale[:, :, None] * coefficients
 
 
+def _paired_member(a, inverse, *, half, finite, n_inf):
+    """One pencil member [b,R,R] in the paired basis: its (ww, wv, vv) blocks."""
+    def columns(x):
+        w = jnp.concatenate(((x[..., :half] + x[..., half:finite]) / 2, x[..., finite + n_inf:]), axis=-1)
+        v = jnp.concatenate(((x[..., :half] - x[..., half:finite]) * inverse[:, None, :],
+                             x[..., finite:finite + n_inf]), axis=-1)
+        return w, v
+
+    def rows(x):
+        w = jnp.concatenate(((x[:, :half] + x[:, half:finite]) / 2, x[:, finite + n_inf:]), axis=1)
+        v = jnp.concatenate((jnp.conj(inverse)[:, :, None] * (x[:, :half] - x[:, half:finite]),
+                             x[:, finite:finite + n_inf]), axis=1)
+        return w, v
+
+    w, v = columns(a)
+    ww, _ = rows(w)
+    wv, vv = rows(v)
+    return ww, wv, vv
+
+
+def _paired_output(a, inverse, *, half, finite, n_inf):
+    """Output columns O [b,n,R] in the paired basis: (w, v)."""
+    w = jnp.concatenate(((a[..., :half] + a[..., half:finite]) / 2, a[..., finite + n_inf:]), axis=-1)
+    v = jnp.concatenate(((a[..., :half] - a[..., half:finite]) * inverse[:, None, :],
+                         a[..., finite:finite + n_inf]), axis=-1)
+    return w, v
+
+
+def _restricted_block(ww, wv, vv):
+    """Hermitian [[ww, wv], [wv^H, vv]] of the restricted paired pencil."""
+    return _hermitian(jnp.concatenate(
+        (jnp.concatenate((ww, wv), axis=-1), jnp.concatenate((_adjoint(wv), vv), axis=-1)), axis=-2))
+
+
+def _join_columns(a, b):
+    return jnp.concatenate((a, b), axis=-1)
+
+
+@lru_cache(maxsize=None)
+def _paired_kernels(face, output_face, half, finite, n_inf):
+    """Glue of the paired reduction with every large result on the x/y face.
+
+    Eager slicing, concatenation and a + a^H of face-sharded operands return
+    replicated arrays (measured on a 2x2 host mesh,
+    runs/frequency_integration_sandbox/425_trint_20260915/logs/eager_sharding_probe.log).
+    The same elementwise arithmetic compiled with face output shardings keeps
+    each [b,R,R] block at 16 R^2/(Px Py) bytes per rank. Unsharded callers
+    (host tests) get the plain functions.
+    """
+    statics = dict(half=half, finite=finite, n_inf=n_inf)
+    member, outputs = partial(_paired_member, **statics), partial(_paired_output, **statics)
+    if face is None:
+        return member, outputs, _hermitian, _restricted_block, _join_columns
+    output_face = face if output_face is None else output_face
+    return (jax.jit(member, out_shardings=(face, face, face)),
+            jax.jit(outputs, out_shardings=(output_face, output_face)),
+            jax.jit(_hermitian, out_shardings=face),
+            jax.jit(_restricted_block, out_shardings=face),
+            jax.jit(_join_columns, out_shardings=output_face))
+
+
 def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     """Paired-basis Ritz reduction of the particle-hole pencil.
 
@@ -391,81 +452,77 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
               & jnp.all(active_columns[:, finite + n_inf:] == active_columns[:, finite:finite + n_inf]))
     if not bool(paired):
         raise ValueError("GATE shared_pole_orientation_pair: got: finite columns not in mirrored halves; want: [X(z); X(-z)] on one direction set and paired k0/k1 columns; why: the ordered cut acts in the paired basis")
-    spec = g.sharding if isinstance(getattr(g, "sharding", None), NamedSharding) else None
-
-    def tile(*arrays):
-        if spec is None:
-            return arrays
-        return jax.jit(lambda *xs: tuple(jax.lax.with_sharding_constraint(x, spec) for x in xs))(*arrays)
+    face = g.sharding if isinstance(getattr(g, "sharding", None), NamedSharding) else None
+    output_face = output.sharding if isinstance(getattr(output, "sharding", None), NamedSharding) else None
+    member, outputs, hermitian, block, join = _paired_kernels(face, output_face, half, finite, n_inf)
 
     live_f = active_columns[:, :half]
     inverse = jnp.where(live_f, 1 / jnp.where(live_f, 2 * points[:, :half], 1), 0)
-
-    def columns(a):
-        w = jnp.concatenate(((a[..., :half] + a[..., half:finite]) / 2, a[..., finite + n_inf:]), axis=-1)
-        v = jnp.concatenate(((a[..., :half] - a[..., half:finite]) * inverse[:, None, :],
-                             a[..., finite:finite + n_inf]), axis=-1)
-        return w, v
-
-    def rows(a):
-        w = jnp.concatenate(((a[:, :half] + a[:, half:finite]) / 2, a[:, finite + n_inf:]), axis=1)
-        v = jnp.concatenate((jnp.conj(inverse)[:, :, None] * (a[:, :half] - a[:, half:finite]),
-                             a[:, finite:finite + n_inf]), axis=1)
-        return w, v
-
-    g_w, g_v = columns(g)
-    h_w, h_v = columns(h)
-    g_ww, _ = rows(g_w)
-    g_wv, g_vv = rows(g_v)
-    h_ww, _ = rows(h_w)
-    h_wv, h_vv = rows(h_v)
-    o_w, o_v = columns(output)
-    del g_w, g_v, h_w, h_v
+    # Every large result below stays on the x/y face; eager slicing, concatenation
+    # and a + a^H come out replicated ([b,R,R] per rank), which is what ran CrI3 out of memory.
+    g_ww, g_wv, g_vv = member(g, inverse)
+    h_ww, h_wv, h_vv = member(h, inverse)
+    o_w, o_v = outputs(output, inverse)
     active = jnp.concatenate((live_f, active_columns[:, finite:finite + n_inf]), axis=-1)
     diagonal = jnp.real(jnp.diagonal(h_vv, axis1=-2, axis2=-1))
     diagonal_ok = jnp.all(jnp.where(active, jnp.isfinite(diagonal) & (diagonal > 0), diagonal == 0), axis=-1)
     scale = jnp.where(active, 1 / jnp.sqrt(jnp.where(diagonal > 0, diagonal, 1)), 0)
     sandwich = lambda a: scale[:, :, None] * a * scale[:, None, :]
-    g_ww, g_wv, g_vv, h_ww, h_wv, h_vv = tile(*(sandwich(a) for a in (g_ww, g_wv, g_vv, h_ww, h_wv, h_vv)))
-    o_w, o_v = tile(o_w * scale[:, None, :], o_v * scale[:, None, :])
+    g_ww, g_wv, g_vv, h_ww, h_wv, h_vv = (sandwich(a) for a in (g_ww, g_wv, g_vv, h_ww, h_wv, h_vv))
+    o_w, o_v = o_w * scale[:, None, :], o_v * scale[:, None, :]
     validity = gates["normalized_gram_validity"]["threshold"]
-    gamma, u = eigh(_hermitian(h_vv))
+    gamma, u = eigh(hermitian(h_vv))
     largest = gamma[:, -1]
     ratio = gamma[:, 0] / jnp.where(largest > 0, largest, 1)
     keep = (gamma > gates["normalized_gram_keep"]["threshold"] * largest[:, None]) & (largest[:, None] > 0)
     count = jnp.sum(keep, axis=-1, dtype=jnp.int64)
     z = u * (keep / jnp.sqrt(jnp.where(keep, gamma, 1)))[:, None, :]
+    del u
     metric = matmul(z, matmul(h_vv, z), transa="C")
     null_identity = _diagonal_face(~keep, h_vv)
     correction, metric_ok, metric_diagnostics = _metric_inverse_root(
-        _hermitian(metric) + null_identity, matmul=matmul,
+        hermitian(metric) + null_identity, matmul=matmul,
         tolerance=gates["retained_subspace_moments"]["threshold"])
+    del null_identity
     z = matmul(z, correction) * keep[:, None, :]
+    del correction
     metric = matmul(z, matmul(h_vv, z), transa="C")
+    wanted_metric = _diagonal_face(keep, h_vv)
+    metric_relative = (jnp.linalg.norm(metric - wanted_metric, axis=(-2, -1))
+                       / jnp.sqrt(jnp.maximum(count, 1)))
+    del wanted_metric, h_vv
     project = lambda a: matmul(z, matmul(a, z), transa="C")
     # Restricted paired pencil on span(Z) in both halves. Its v-block is the metric
     # (identity after correction). On time-reversal-symmetric data H_r = diag(t_s, I),
     # t_s the even route's Z^H H_s Z; once time reversal is broken the halves mix and a
     # w combination can lie in span(v), so a second relative keep cut on H_r removes
     # exactly those redundant combinations before the H-metric Ritz step.
-    block = lambda ww, wv, vv: _hermitian(jnp.concatenate(
-        (jnp.concatenate((ww, wv), axis=-1), jnp.concatenate((_adjoint(wv), vv), axis=-1)), axis=-2))
-    h_r, g_r = tile(block(project(h_ww), project(h_wv), metric),
-                    block(project(g_ww), project(g_wv), project(g_vv)))
-    (o_r,) = tile(jnp.concatenate((matmul(o_w, z), matmul(o_v, z)), axis=-1))
+    h_r = block(project(h_ww), project(h_wv), metric)
+    del h_ww, h_wv, metric
+    g_r = block(project(g_ww), project(g_wv), project(g_vv))
+    del g_ww, g_wv, g_vv
+    o_r = join(matmul(o_w, z), matmul(o_v, z))
+    del o_w, o_v, z
     gamma_r, u_r = eigh(h_r)
     top_r = gamma_r[:, -1]
     ratio_r = gamma_r[:, 0] / jnp.where(top_r > 0, top_r, 1)
     keep_r = (gamma_r > gates["normalized_gram_keep"]["threshold"] * top_r[:, None]) & (top_r[:, None] > 0)
     count_r = jnp.sum(keep_r, axis=-1, dtype=jnp.int64)
     y = u_r * (keep_r / jnp.sqrt(jnp.where(keep_r, gamma_r, 1)))[:, None, :]
+    del u_r
     null_r = _diagonal_face(~keep_r, h_r)
+    metric_r = hermitian(matmul(y, matmul(h_r, y), transa="C")) + null_r
+    # The restricted sources are released before the second metric correction.
+    del null_r, h_r
     correction_r, metric_r_ok, _ = _metric_inverse_root(
-        _hermitian(matmul(y, matmul(h_r, y), transa="C")) + null_r, matmul=matmul,
-        tolerance=gates["retained_subspace_moments"]["threshold"])
+        metric_r, matmul=matmul, tolerance=gates["retained_subspace_moments"]["threshold"])
+    del metric_r
     y = matmul(y, correction_r) * keep_r[:, None, :]
-    mu, rotation = eigh(_hermitian(matmul(y, matmul(g_r, y), transa="C")))
+    del correction_r
+    mu, rotation = eigh(hermitian(matmul(y, matmul(g_r, y), transa="C")))
+    del g_r
     c = matmul(o_r, matmul(y, rotation))
+    del o_r, y, rotation
     cut = gates["normalized_gram_keep"]["threshold"] * jnp.max(jnp.abs(mu), axis=-1)
     retained = jnp.abs(mu) > cut[:, None]
     positive = retained & (mu > 0)
@@ -478,7 +535,6 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     budget = gates["zero_ritz_policy"]["threshold"]["max_dropped_weight_fraction"]
     gram_ok = ((largest > 0) & jnp.all(jnp.isfinite(gamma), axis=-1) & (ratio >= validity)
                & jnp.all(jnp.isfinite(gamma_r), axis=-1) & (ratio_r >= validity))
-    wanted_metric = _diagonal_face(keep, h_vv)
     diagnostics = {
         **metric_diagnostics,
         "gram_diagonal_positive": diagonal_ok,
@@ -490,8 +546,7 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
         "retained_rank": count,
         "gram_condition": largest / jnp.min(jnp.where(keep, gamma, jnp.inf), axis=-1),
         "retained_metric_positive": metric_ok & metric_r_ok,
-        "retained_metric_relative": jnp.linalg.norm(metric - wanted_metric, axis=(-2, -1))
-        / jnp.sqrt(jnp.maximum(count, 1)),
+        "retained_metric_relative": metric_relative,
         "positive_count": jnp.sum(positive, axis=-1, dtype=jnp.int64),
         "negative_count": jnp.sum(retained & (mu < 0), axis=-1, dtype=jnp.int64),
         "infinite_weight_fraction": infinite,
