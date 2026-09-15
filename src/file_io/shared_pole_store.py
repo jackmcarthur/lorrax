@@ -1374,7 +1374,8 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                     write_shared_pole_model(path, b, poles, np.asarray([count], np.int64),
                         q_span=(q, q+1), meta=meta, tables=tables,
                         recipe=model["recipe"], receipts=dict(identity=handle["identity"],
-                            source_model_digest=model["digest"], source_store=str(source)))
+                            source_model_digest=model["digest"], source_store=str(source)),
+                        ordered=bool(model.get("ordered", False)))
                     del canonical, b, poles
                 finally:
                     ledger.live_stages = previous
