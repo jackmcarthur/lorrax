@@ -187,7 +187,7 @@ class SlabIO:
     underlying ``PhdfCtx``.
     """
 
-    def __init__(self, path, *, mode: str = "w", mesh=None) -> None:
+    def __init__(self, path, *, mode: str, mesh=None) -> None:
         self.path = str(path) if not isinstance(path, str) else path
         self.mode = mode
         if mesh is None:

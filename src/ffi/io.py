@@ -92,7 +92,7 @@ def _platform_for_mesh(mesh: Mesh) -> str:
 _MODE_FLAGS = {"w": 0, "a": 1, "r": 2}
 
 
-def open_file(path: str, *, mesh: Mesh, mode: str = "w") -> int:
+def open_file(path: str, *, mesh: Mesh, mode: str) -> int:
     """Collective open/create of a parallel-HDF5 file.
 
     Parameters
@@ -105,7 +105,8 @@ def open_file(path: str, *, mesh: Mesh, mode: str = "w") -> int:
         ``jax.process_count()``.
     mode
         ``'w'`` truncate+create, ``'a'`` append-or-create, ``'r'``
-        read-only.
+        read-only.  Required: a default of ``'w'`` let a read that forgot the
+        keyword truncate the file it meant to read.
 
     Returns
     -------
