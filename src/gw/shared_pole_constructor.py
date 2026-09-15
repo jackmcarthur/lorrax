@@ -105,10 +105,35 @@ def finite_pencil_column(left, right, *, matmul):
     a = matmul(oa, qb, transa="C")
     # Production assembles the complete square finite block with shared
     # panels. For distinct left/right blocks the second product is needed.
-    b = _adjoint(a) if qa is qb and oa is ob else matmul(qa, ob, transa="C")
+    shared = qa is qb and oa is ob
+    b = None if shared else matmul(qa, ob, transa="C")
     derivative = matmul(qa, db, transa="C")
     sa = jnp.broadcast_to(sa, (qa.shape[0], qa.shape[-1]))
     sb = jnp.broadcast_to(sb, (qb.shape[0], qb.shape[-1]))
+    kernels = _face_column_kernels(_face_of(a))
+    if kernels is None:
+        g = _finite_column_g(a, b, derivative, sa, sb)
+        return g, sb[:, None, :] * g - a
+    # On the face the [b,R,r] intermediates (denominator, confluent mask, a - a^H)
+    # stay per-rank tiles; eager broadcasting of the replicated supports and
+    # a - a^H would replicate them. Multiply and subtract stay separate kernels.
+    g = kernels["g"](a, b, derivative, sa, sb)
+    return g, kernels["sub"](kernels["scale_rows"](sb, g), a)
+
+
+def _face_of(array):
+    """The array's NamedSharding when it is a concrete face-sharded array, else None."""
+    import jax
+    from jax.sharding import NamedSharding
+    if isinstance(array, jax.core.Tracer):
+        return None
+    sharding = getattr(array, "sharding", None)
+    return sharding if isinstance(sharding, NamedSharding) and len(sharding.spec) == array.ndim else None
+
+
+def _finite_column_g(a, b, derivative, sa, sb):
+    """G block of one resolvent-identity column; b = a^H when None (shared panels)."""
+    b = _adjoint(a) if b is None else b
     denominator = sb[:, None, :] - jnp.conj(sa[:, :, None])
     # This is the inherited floating-point equality test for confluent s,
     # not a physical support-merging tolerance. Roles are never merged.
@@ -116,8 +141,26 @@ def finite_pencil_column(left, right, *, matmul):
                                         jnp.abs(sb[:, None, :])))
     confluent = jnp.abs(denominator) <= 8 * jnp.finfo(jnp.float64).eps * scale
     safe = jnp.where(confluent, 1.0 + 0j, denominator)
-    g = jnp.where(confluent, -derivative, (a - b) / safe)
-    return g, sb[:, None, :] * g - a
+    return jnp.where(confluent, -derivative, (a - b) / safe)
+
+
+def _pencil_block(block, off, corner):
+    """[[block, off^H], [off, corner]] of the pencil with its infinity rows."""
+    return jnp.concatenate((jnp.concatenate((block, _adjoint(off)), axis=-1),
+                            jnp.concatenate((off, corner), axis=-1)), axis=-2)
+
+
+@lru_cache(maxsize=None)
+def _face_column_kernels(face):
+    """Face-pinned executables of the pencil assembly glue (None off the face)."""
+    if face is None:
+        return None
+    return dict(g=jax.jit(_finite_column_g, out_shardings=face),
+                scale_rows=jax.jit(lambda s, g: s[:, None, :] * g, out_shardings=face),
+                sub=jax.jit(lambda x, y: x - y, out_shardings=face),
+                block=jax.jit(_pencil_block, out_shardings=face),
+                hermitian=jax.jit(_hermitian, out_shardings=face),
+                join=jax.jit(_join_columns, out_shardings=face))
 
 
 def infinity_pencil_column(finite, infinity, *, matmul):
@@ -212,14 +255,20 @@ def assemble_ordered_shared_pole_pencil(states, infinity, *, matmul):
                          for state in states], axis=-1)
     finite = (z, q, output)
     g, h = finite_pencil_column(finite, (z, q, output, derivative), matmul=matmul)
+    del derivative
+    # Pinned to the face: eager concatenation with the adjoint (y/x) infinity rows and
+    # eager a + a^H return a replicated [b,side,side] G and H resident on every rank.
+    kernels = _face_column_kernels(_face_of(g))
+    block = _pencil_block if kernels is None else kernels["block"]
+    hermitian = _hermitian if kernels is None else kernels["hermitian"]
     if infinity is not None:
         gi, hi, gii, hii, oi = ordered_infinity_pencil_column(finite, infinity, matmul=matmul)
-        g = jnp.concatenate((jnp.concatenate((g, _adjoint(gi)), axis=-1),
-                             jnp.concatenate((gi, gii), axis=-1)), axis=-2)
-        h = jnp.concatenate((jnp.concatenate((h, _adjoint(hi)), axis=-1),
-                             jnp.concatenate((hi, hii), axis=-1)), axis=-2)
-        output = jnp.concatenate((output, oi), axis=-1)
-    return _hermitian(g), _hermitian(h), output, z
+        g = block(g, gi, gii)
+        h = block(h, hi, hii)
+        del gi, hi, gii, hii
+        output = (_join_columns(output, oi) if kernels is None
+                  else _face_column_kernels(_face_of(output))["join"](output, oi))
+    return hermitian(g), hermitian(h), output, z
 
 
 def _metric_inverse_root(metric, *, matmul, tolerance):
