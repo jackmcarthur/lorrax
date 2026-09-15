@@ -115,6 +115,22 @@ def minus_index(lat):
     return [((-i) % lat.n1) * lat.n2 + ((-j) % lat.n2) for i in range(lat.n1) for j in range(lat.n2)]
 
 
+def mode_momenta(lat, a):
+    """Momentum index of each supercell mode vector a[:, j], a(r + R) = exp(i p.R) a(r), and its residual."""
+    ns, home = lat.ns, a[:lat.ns]
+    shifts = [np.exp(1j * (cell[0] * lat.a[0] + cell[1] * lat.a[1]) @ lat.kvec(pf))
+              for pf in lat.kfrac for cell in lat.cells]
+    phases = np.asarray(shifts).reshape(lat.nk, lat.nk)              # [p, cell]
+    index, residual = [], []
+    for j in range(a.shape[1]):
+        rows = [np.linalg.norm(np.kron(phases[p], home[:, j]) - a[:, j]) / np.linalg.norm(a[:, j])
+                for p in range(lat.nk)]
+        index.append(int(np.argmin(rows)))
+        residual.append(float(min(rows)))
+    assert ns == home.shape[0]
+    return np.asarray(index), np.asarray(residual)
+
+
 def cpu_flat_k_fft(monkeypatch):
     """Route the flat-k FFT factories through the jnp emulation the CPU tests use."""
     import jax.numpy as jnp

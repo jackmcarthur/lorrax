@@ -176,6 +176,26 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm):
     return value[:, 0, :, 0, :]
 
 
+def shared_pole_minus_q_index(grid):
+    """Canonical-full-flat index of -q (mod the mesh) for every full-grid q."""
+    grid = tuple(int(v) for v in grid)
+    coords = np.stack(np.unravel_index(np.arange(int(np.prod(grid))), grid), axis=0)
+    return np.ravel_multi_index(
+        tuple((-coords) % np.asarray(grid)[:, None]), grid).astype(np.int32)
+
+
+def shared_pole_hole_kernel(mesh_xy):
+    """Compile the valence-branch W of an ordered (time-reversal-broken) store.
+
+    An ordered store keeps each parent's positive poles. The occupied branch
+    evolves R_-(q) = R_+(-q)^T, so its W at one tau is the complete full-q
+    W_+ gathered at -q on the replicated q axis and transposed in its endpoint
+    faces. No residue contraction is repeated; q = -q rows give W_+(q)^T.
+    """
+    return jax.jit(lambda w_full, minus_q: jnp.swapaxes(w_full[minus_q], -1, -2),
+                   out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
+
+
 def _shared_pole_fixed_q_policy(header):
     """Resolve the policy from the store's authenticated TRS/grid metadata."""
     from gw.qgrid_symmetry import qgrid_trs_policy_from_shared_pole_store
@@ -444,6 +464,12 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     shape = (int(header["n_q_full"]), meta.mu_basis.n_packed, meta.mu_basis.n_packed)
     sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
     zeros = jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=sharding)
+    # Ordered stores: conduction windows use W_+(q), valence windows W_+(-q)^T.
+    ordered = header.get("representation") == "scalar-ordered-ph"
+    if ordered:
+        hole_kernel = shared_pole_hole_kernel(mesh_xy)
+        minus_q = device_put_process_local(
+            shared_pole_minus_q_index(header["grid"]), NamedSharding(mesh_xy, P()))
 
     @partial(jax.jit, donate_argnums=(0,), out_shardings=sharding)
     def add_panel(total, rows, values):
@@ -503,9 +529,12 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                         total.block_until_ready()
                     del child
             result = zeros() if total is None else total
+            if ordered and _residues == "val":
+                result = hole_kernel(result, minus_q)
             jax.block_until_ready(result)
             return result
 
+    build.ordered = ordered
     return build
 
 
@@ -1025,7 +1054,10 @@ def _integrate_sigma_batches(
                     device_put_process_local(x, small)
                     for x in (pole_indices, bounds, phase_real, active_count))
                 win = row.window
-                B_branch = (None if w_synthesis is not None else
+                # An ordered shared-pole builder receives the branch space and
+                # routes valence windows to W_+(-q)^T; every other route is unchanged.
+                B_branch = ((row.space if getattr(w_synthesis, "ordered", False) else None)
+                            if w_synthesis is not None else
                             _residue_for_space(row.space, B, B_odd))
                 weight = getattr(row, "band_weight", None)
                 if weight is None:
