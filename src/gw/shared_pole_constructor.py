@@ -32,7 +32,8 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     import math
 
     p = int(mesh_xy.shape["x"]) * int(mesh_xy.shape["y"])
-    packed = int(meta.n_rmu_padded) * int(meta.nspinor)
+    # Constructor carriers are mu x mu charge operators on every admitted deck.
+    packed = int(meta.n_rmu_padded)
     b, a, r = int(parent_batch), int(sample_batch), int(pencil_side)
     if min(packed, b, a) <= 0 or r < 0:
         raise ValueError("GATE shared_pole_capacity: got: invalid extents; want: positive basis/batches and nonnegative pencil; why: live-set pricing")
@@ -890,8 +891,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         recipe = meta.shared_pole_recipe
         # Time-reversal-broken scalar states take the ordered particle-hole route.
         ordered = not bool(bank["tables"]["sym"].trs_allowed)
-        if int(meta.nspinor) != 1:
-            raise ValueError("GATE shared_pole_representation: got: non-scalar state; want: scalar (TRS-broken scalar states take the ordered route); why: both-endpoint spin action is not yet supported")
+        from file_io.shared_pole_store import charge_representation
+        # Scalar and two-component decks share one mu x mu charge operator.
+        if not charge_representation(meta):
+            raise ValueError("GATE shared_pole_representation: got: bispinor or unsupported state; want: scalar or two-component charge operator (TRS-broken states take the ordered route); why: both-endpoint spin action is not yet supported")
         if ordered:
             gates = shared_real_pole_gates_ordered_v1
         resolution = linalg_resolution({"linalg": config.backend.linalg})
@@ -1368,7 +1371,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                     "model_reciprocity": (dict(value=None, passed=None, reason="not applicable: time-reversal-broken samples carry no transpose symmetry") if ordered else dict(value=reciprocity, passed=True, reason="raw latent model sampled W/dW transpose symmetry, conditional on symmetric reference; projected operator not measured; applicability recorded per sample")),
                     "full_m1_defect": dict(value=float(moment_defects["M1"]["full_relative"][0]), passed=bool(moment_defects["M1"]["full_relative"][0] <= gates["full_m1_defect"]["threshold"]), reason="raw latent model versus physical full M1; projected moment not measured; CD8 diagnostic band, never a refusal"),
                     "full_m3_defect": dict(value=float(moment_defects["M3"]["full_relative"][0]), passed=bool(moment_defects["M3"]["full_relative"][0] <= gates["full_m3_defect"]["threshold"]), reason="raw latent model versus physical full M3; projected moment not measured; CD8 diagnostic band, never a refusal"),
-                    "representation": dict(value=({"nspinor": 1, "trs_allowed": False, "ordered": True} if ordered else {"nspinor": 1, "trs_allowed": True}), passed=True, reason="current typed symmetry capability"),
+                    "representation": dict(value=({"nspinor": int(meta.nspinor), "trs_allowed": False, "ordered": True} if ordered else {"nspinor": int(meta.nspinor), "trs_allowed": True}), passed=True, reason="current typed symmetry capability; spin-traced charge operator"),
                     "capacity": dict(value=price, passed=True, reason="conservative aggregate constructor live-set price"),
                     "sc_rebuild": dict(value=identity, passed=True, reason="current recipe/census authenticated; directions and Ritz model rebuilt"),
                 }
