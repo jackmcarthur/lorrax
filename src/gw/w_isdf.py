@@ -874,7 +874,7 @@ def _get_chi_fractional_contour_kernel_legacy(
 def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
     *, k_unfold_plan=None, selected_q=None, pair_mode="retarded", bank_carry=False,
-    ordered=False,
+    node_weights=False, ordered=False,
 ):
     """Face-layout sibling of
     :func:`_get_chi_fractional_contour_kernel_legacy`.  Same Keldysh
@@ -937,6 +937,10 @@ def _get_chi_fractional_contour_kernel_face(
         raise ValueError("bank carry requires selected q rows")
     if pair_mode != "retarded" and selected_q is None:
         raise ValueError("Laplace bank correlations require selected_q")
+    # ``node_weights``: occ_f/occ_u carry a leading node axis, so one scan evaluates
+    # several independently weighted correlations (the bank's exact moments).
+    if node_weights and (pair_mode != "retarded" or bank_carry or selected_q is None):
+        raise ValueError("per-node band weights require the retarded selected-q stream without carry")
     if ordered and selected_q is None:
         raise ValueError("ordered (physical-orientation) correlations require selected_q")
     if selected_q is not None:
@@ -984,6 +988,7 @@ def _get_chi_fractional_contour_kernel_face(
     G_shard = NamedSharding(mesh_xy, G_FLATK_SPEC)
     chi_R_shard = NamedSharding(mesh_xy, CHI_R_SPEC)
     rep2 = NamedSharding(mesh_xy, P(None, None))
+    rep3 = NamedSharding(mesh_xy, P(None, None, None))
     rep1 = NamedSharding(mesh_xy, P(None))
     rep0 = NamedSharding(mesh_xy, P())
     psi_mun_shard = NamedSharding(mesh_xy, PSI_MUN_SPEC)
@@ -1002,7 +1007,7 @@ def _get_chi_fractional_contour_kernel_face(
         in_shardings=(
             rep1, rep0,
             psi_mun_shard, psi_nmu_shard,
-            rep2, rep2, rep2, rep0,
+            rep2, *((rep3, rep3) if node_weights else (rep2, rep2)), rep0,
         ) + ((selected_shard,) if bank_carry else ()),
         donate_argnums=(8,) if bank_carry else (),
         out_shardings=(tuple(chi_R_shard for _ in range(n_out))
@@ -1064,11 +1069,12 @@ def _get_chi_fractional_contour_kernel_face(
             return jax.lax.with_sharding_constraint(g, G_shard)
 
         def body(accumulators, node):
-            time, projection = node
+            time, projection = node[:2]
+            weight_f, weight_u = node[2:] if node_weights else (occ_f, occ_u)
             if pair_mode == "retarded":
                 tau = jnp.asarray(1j, dtype=jnp.complex128) * time
-                Gf_k = green_k(occ_f, -tau, energy_reference)
-                Gu_k = green_k(occ_u, -tau, energy_reference)
+                Gf_k = green_k(weight_f, -tau, energy_reference)
+                Gu_k = green_k(weight_u, -tau, energy_reference)
                 Gf_R = G_fftn(Gf_k)
                 Gu_R = G_fftn(Gu_k)
                 A_R = jax.lax.with_sharding_constraint(
@@ -1151,7 +1157,8 @@ def _get_chi_fractional_contour_kernel_face(
         final_R, _ = jax.lax.scan(
             body,
             initial,
-            (time_nodes, jnp.transpose(projection_rows)),
+            (time_nodes, jnp.transpose(projection_rows),
+             *((occ_f, occ_u) if node_weights else ())),
             unroll=1,
         )
         if selected_q is None:

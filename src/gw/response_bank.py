@@ -160,7 +160,7 @@ def response_weights(wfns, meta):
 
 
 def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
-                    pair_mode="retarded", bank_carry=False, ordered=False):
+                    pair_mode="retarded", bank_carry=False, node_weights=False, ordered=False):
     """Bind the existing one-particle Green/FFT primitive to a q batch.
 
     Returns a jitted kernel and its fixed ψ/energy arguments. Caller supplies
@@ -186,7 +186,7 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
         k_unfold_plan=parent, selected_q=tuple(q_ids), pair_mode=pair_mode,
-        bank_carry=bank_carry, ordered=ordered)
+        bank_carry=bank_carry, node_weights=node_weights, ordered=ordered)
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
 
 
@@ -213,42 +213,39 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False):
 
     energy, f, u, reference, census = response_weights(wfns, meta)
     erel = energy - reference
-    kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
-                                    q_ids=q_ids, n_outputs=1, ordered=ordered)
     terms = (((-1., 1, 0), (1., 0, 1)),
              ((-1., 3, 0), (3., 2, 1), (-3., 1, 2), (1., 0, 3)))
-    totals = []
-    for moment_terms in terms:
+    # (scale, terms, particle phase): imaginary particle weights for the even pair.
+    groups = [(1., moment_terms, -1j) for moment_terms in terms]
+    if ordered:
+        # Odd coefficients of 1/z and 1/z^3: sum (P - conj P_{-q}) Delta^m, m=0,2.
+        # Real particle weights keep the retarded difference -i(X - conj X), so
+        # the chi coefficient is i*raw.
+        groups += [(1j, moment_terms, 1.) for moment_terms in
+                   (((1., 0, 0),), ((1., 2, 0), (-2., 1, 1), (1., 0, 2)))]
+    rows = [(a, b, phase) for _, moment_terms, phase in groups for _, a, b in moment_terms]
+    # All correlations in one stream call: node i carries correlation i's band
+    # weights at t=0 and projection row i selects it (other rows add exact zeros).
+    kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
+                                    n_outputs=len(rows), node_weights=True, ordered=ordered)
+    weight_f = jnp.stack([stream_weights(wfns, f * erel**a, mesh_xy).astype(jnp.complex128)
+                          for a, _, _ in rows])
+    weight_u = jnp.stack([stream_weights(wfns, phase * u * erel**b, mesh_xy).astype(jnp.complex128)
+                          for _, b, phase in rows])
+    args = (jnp.zeros(len(rows)), jnp.eye(len(rows), dtype=jnp.complex128), *fixed,
+            weight_f, weight_u, jnp.asarray(reference))
+    raw = execute(kernel, args, "moment_correlation")
+    del weight_f, weight_u
+    totals, index = [], 0
+    for scale, moment_terms, _ in groups:
         total = None
-        for coefficient, a, b in moment_terms:
-            weight_f = stream_weights(wfns, f * erel**a, mesh_xy)
-            weight_u = stream_weights(wfns, -1j * u * erel**b, mesh_xy)
-            args = (jnp.asarray([0.]), jnp.asarray([[1. + 0j]]), *fixed,
-                    weight_f.astype(jnp.complex128), weight_u,
-                    jnp.asarray(reference))
-            raw = execute(kernel, args, "moment_correlation")[:, 0]
-            term = (_w_solve_pref_scalar(meta) * coefficient) * raw
+        for coefficient, _, _ in moment_terms:
+            term = (scale * _w_solve_pref_scalar(meta) * coefficient) * raw[:, index]
             total = term if total is None else total + term
-            total.block_until_ready()
+            index += 1
+        total.block_until_ready()
         totals.append(total)
-    if not ordered:
-        return (*totals, census)
-    # Odd coefficients of 1/z and 1/z^3: sum (P - conj P_{-q}) Delta^m, m=0,2.
-    # Real particle weights keep the retarded difference -i(X - conj X), so
-    # the chi coefficient is i*raw. Four more correlations, same kernel.
-    for moment_terms in (((1., 0, 0),), ((1., 2, 0), (-2., 1, 1), (1., 0, 2))):
-        total = None
-        for coefficient, a, b in moment_terms:
-            weight_f = stream_weights(wfns, f * erel**a, mesh_xy)
-            weight_u = stream_weights(wfns, u * erel**b, mesh_xy)
-            args = (jnp.asarray([0.]), jnp.asarray([[1. + 0j]]), *fixed,
-                    weight_f.astype(jnp.complex128), weight_u.astype(jnp.complex128),
-                    jnp.asarray(reference))
-            raw = execute(kernel, args, "moment_correlation")[:, 0]
-            term = (1j * _w_solve_pref_scalar(meta) * coefficient) * raw
-            total = term if total is None else total + term
-            total.block_until_ready()
-        totals.append(total)
+    del raw
     return (*totals, census)
 
 
@@ -624,8 +621,9 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
     ordered = not bool(sym.trs_allowed)
     _, moments, receipt["algebra"] = response_algebra(meta, config,
         mesh_xy=mesh_xy, n=meta.mu_basis.n_packed, **({"ordered": True} if ordered else {}))
-    # Outputs per q, plus one resident Coulomb root per q.
-    per_q = 13 if ordered else 9
+    # Per q: every correlation of the one stream call, the totals, arithmetic
+    # temporaries and one resident Coulomb root.
+    per_q = 18 if ordered else 12
     qwidth = max(1,min(len(qids),int((.75*ledger.U_bytes_per_rank/face_bytes-16)/per_q)))
     for q0 in range(0,len(qids),qwidth):
         q1 = min(q0+qwidth,len(qids))
