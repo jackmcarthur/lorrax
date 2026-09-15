@@ -1205,6 +1205,30 @@ _DEFAULTS = {
     # Suppressing the write makes the file ABSENT, which is the loudest of
     # the states those guards distinguish.
     "write_restart_tensors": True,
+    # Standalone shared-pole outputs; internal construction stores remain required.
+    #
+    # ``write_poles`` is the PRODUCTION export and stays top-level beside
+    # ``write_restart_tensors``: it is a supported artifact with a stable
+    # format, and it is complete for a static-W consumer.  The model it
+    # writes is evaluated as ``Wc(s) = b (s - Lambda)^-1 b^dagger`` with
+    # ``s = z^2`` (gw.shared_pole_constructor, the ``weights = 1/(s-poles)``
+    # evaluation), so ``Wc(omega=0) = -b Lambda^-1 b^dagger`` EXACTLY, from
+    # the two datasets this key already exports.  Static screened
+    # ``W(0) = v + Wc(0)``.
+    #
+    # ``write_w`` is a DEBUG dump and lives in ``debug`` for the same reason
+    # ``write_qsgw_datasets`` does not (see its note below): it writes the
+    # whole fixed frequency sample bank, every sample of it, plus the
+    # derivative and moment companions.  Nothing downstream reads it.  It is
+    # also NOT a route to W(0): the bank's line ladder starts at ``E = 0``,
+    # i.e. ``z = 0 + i h`` with ``h = 4 eta``, so its first sample is
+    # ``W(i h)`` and the model above is the only exact ``omega = 0``.
+    # MEASURED on Na P16 (claim 2162, job 58166522.7): the bank export is
+    # 19.44 GiB against the pole export's 1.22 GiB, 16x, for bytes no
+    # consumer opens.  Owner ruling 2026-09-11.
+    "write_poles": False,
+    # Debug (shared-pole)
+    "write_w": False,
     # ``write_qsgw_datasets``: does this run add the QSGW / QP-ladder
     # appendix to sigma_mnk.h5?  DEFAULT false, and false is exactly
     # today's file — these four datasets have had no producer since
@@ -1769,6 +1793,14 @@ _DEFAULTS = {
     # range spelling (docs/dev/crossing-rule-cost-law.md).
     "sigma_omega_patches_ev": "",
     "sigma_regularization_ev": 0.25,
+    "sigma_w_model": "mpa",
+    "sigma_w_accuracy": "production",
+    # "" = the shared-pole resolver's own line and imaginary ladders.
+    # "<line eV list> | <imaginary eV list>" replaces both with explicit
+    # sites (gw.shared_pole_recipe.parse_support_sites); the height, held
+    # fractions, widths and gates are unchanged, and the sites enter
+    # recipe_version/recipe_hash so no store crosses ladders on restart.
+    "sigma_w_support_sites_ev": "",
     "sigma_window_edge_factor": 1.5,
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
@@ -2300,6 +2332,119 @@ def _input_key_type(key, default):
     return str
 
 
+def _resolve_shared_pole_inputs(params):
+    """Validate the shared-pole deck surface once, preserving explicitness."""
+    from .shared_pole_recipe import shared_real_pole_v1_r3b as recipe
+
+    named = params[_DECK_NAMED_KEYS]
+    for key, choices in (("sigma_w_model", ("mpa", "shared_pole")),
+                         ("sigma_w_accuracy", ("production", "relaxed"))):
+        value = str(params[key]).strip().lower()
+        if value not in choices:
+            raise ValueError(
+                f"GATE shared_pole_enum: {key} got: {value!r}; "
+                f"want: {' | '.join(choices)}; why: unknown W recipe")
+        params[key] = value
+    mode = str(params["compute_mode"]).strip().lower()
+    model = params["sigma_w_model"]
+    for key in ("write_w", "write_poles"):
+        if params[key] and (mode != "mpa" or model != "shared_pole"):
+            raise ValueError(
+                f"{key}=true requires compute_mode=mpa and "
+                "sigma_w_model=shared_pole (fixed frequency-bank outputs)")
+    if (params["write_w"] or params["write_poles"]) and not str(params["wfn_file"]).strip():
+        raise ValueError("write_w/write_poles require a nonempty wfn_file source path")
+    # DEBUG STATUS, ANNOUNCED AT PARSE TIME.  ``write_w`` is off by default
+    # and is a debug dump (``config.debug.write_w``); it is the ONE deck key
+    # here whose cost is measured in tens of GiB, and the run that turned it
+    # on should learn that from the deck report next to the retired-key
+    # report, not from a directory listing hours later.  Same reporter, same
+    # ``WARNING -- DEBUG`` token the head-correction banner uses.
+    if params["write_w"]:
+        _print_deck_report(
+            "\n  ==========================================================\n"
+            "  WARNING -- DEBUG: write_w = true dumps the WHOLE shared-pole\n"
+            "  Wc frequency sample bank (every fixed sample, plus dWc_ds,\n"
+            "  M1 and M3) to <map>_w.h5.  This is a debugging output with\n"
+            "  no consumer in this tree; it is NOT needed for BSE.\n"
+            "  BSE's static W comes from write_poles: Wc(0) = -b Lambda^-1\n"
+            "  b^dagger is exact from the exported (b, Lambda), and\n"
+            "  W(0) = v + Wc(0).  The bank has no omega = 0 sample at all\n"
+            "  (its line ladder starts at z = 0 + 4 i eta).\n"
+            "  MEASURED cost, Na P16 (claim 2162): 19.44 GiB against the\n"
+            "  pole export's 1.22 GiB.  Leave it false for production.\n"
+            "  ==========================================================")
+    if "sigma_w_model" in named and mode != "mpa":
+        raise ValueError(
+            f"GATE shared_pole_applicability: sigma_w_model got: {model!r} "
+            f"with compute_mode={mode!r}; want: compute_mode=mpa; "
+            "why: this key selects the MPA Sigma W representation")
+    if "sigma_w_accuracy" in named and model != "shared_pole":
+        raise ValueError(
+            "GATE shared_pole_applicability: sigma_w_accuracy got: "
+            f"{params['sigma_w_accuracy']!r} with sigma_w_model={model!r}; "
+            "want: sigma_w_model=shared_pole; why: tier has no other consumer")
+    if "sigma_w_support_sites_ev" in named and model != "shared_pole":
+        raise ValueError(
+            "GATE shared_pole_applicability: sigma_w_support_sites_ev got: "
+            f"{params['sigma_w_support_sites_ev']!r} with sigma_w_model={model!r}; "
+            "want: sigma_w_model=shared_pole; why: only the shared-pole "
+            "resolver has support ladders to replace")
+    eta = float(params["sigma_regularization_ev"])
+    if not (np.isfinite(eta) and eta > 0.0):
+        raise ValueError(
+            f"GATE sigma_regularization: sigma_regularization_ev got: {eta!r}; "
+            "want: finite > 0 eV; why: the causal evaluation needs positive broadening")
+    if model != "shared_pole":
+        return
+    if str(params.get("occ_smearing_family", "")).strip().lower() == "mp1":
+        raise ValueError(
+            "shared_pole needs a positive spectral measure: MP1 occupations "
+            "are non-monotonic; use occ_smearing_family = fd")
+    head_enabled = coerce_head_correction(params['head_correction']) is not HeadCorrection.OFF
+    unused_keys = {"mpa_pole_batch_size", "mpa_fit_reuse_file",
+                   "mpa_overwrite_completed_artifacts"}
+    if not head_enabled:
+        unused_keys.update({"mpa_n_poles", "mpa_sampling_alpha", "mpa_sampling_schedule",
+            "mpa_pole_solver", "mpa_varpi_near_ry", "mpa_varpi_far_ry",
+            "mpa_metal_origin_shift_ry"})
+    unused = sorted(named.intersection(unused_keys))
+    if unused:
+        raise ValueError(
+            f"GATE shared_pole_unused_inputs: got: {', '.join(unused)}; "
+            "want: remove elementwise MPA fit keys; why: shared_pole uses its versioned recipe")
+    # Refuse a malformed ladder at parse time, not five minutes into the
+    # stream, and announce the override the way write_w is announced: the
+    # deck no longer gets the resolver's certified support rule.
+    from .shared_pole_recipe import parse_support_sites
+    override = parse_support_sites(params["sigma_w_support_sites_ev"])
+    if override is not None:
+        params["sigma_w_support_sites_ev"] = override["text"]
+        _print_deck_report(
+            "\n  ==========================================================\n"
+            "  WARNING -- DEBUG: sigma_w_support_sites_ev replaces BOTH\n"
+            "  shared-pole support ladders with explicit sites:\n"
+            f"    line      {override['line_ev']} eV\n"
+            f"    imaginary {override['imaginary_ev']} eV\n"
+            "  The resolver's 2*eta/4*eta line rule and its Zolotarev\n"
+            "  imaginary count are NOT used.  Height (4*eta), held\n"
+            "  fractions, widths, zero policy and every gate are unchanged.\n"
+            "  The sites enter recipe_version/recipe_hash, so a store built\n"
+            "  on another ladder refuses on restart.  This is a support\n"
+            "  study dial; leave it empty for production.\n"
+            "  ==========================================================")
+    tier = params["sigma_w_accuracy"]
+    eps = recipe[tier]["sigma_tolerance"]
+    if "sigma_quadrature_eps" in named and params["sigma_quadrature_eps"] != eps:
+        raise ValueError(
+            "GATE shared_pole_epsilon_conflict: sigma_quadrature_eps got: "
+            f"{params['sigma_quadrature_eps']!r}; want: {eps!r} for "
+            f"sigma_w_accuracy={tier}; why: the recipe owns Sigma tolerance")
+    params["sigma_quadrature_eps"] = eps
+    # minimax_target_error retains its incumbent static-stage meaning; the
+    # bank always consumes recipe['bank_rule_tolerance'] from the resolver.
+
+
 def _normalize_input_string(value):
     """Produce the existing lowercase spelling for a normalized string key."""
     return value.strip().lower() if isinstance(value, str) else value
@@ -2323,7 +2468,8 @@ def _parse_input_keys(section):
             if kind is bool:
                 value = section.getboolean(key)
             elif kind is int:
-                value = section.getint(key)
+                value = (None if key in _NULLABLE_INT and str(raw).strip().lower() == "none"
+                         else section.getint(key))
             elif kind is float:
                 value = section.getfloat(key)
             else:
@@ -2536,6 +2682,9 @@ def _input_response(
         omega_max_ev=float(params["sigma_omega_max_ev"]),
         omega_step_ev=float(params["sigma_omega_step_ev"]),
         regularization_ev=float(params["sigma_regularization_ev"]),
+        w_model=str(params["sigma_w_model"]),
+        w_accuracy=str(params["sigma_w_accuracy"]),
+        w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
         window_edge_factor=float(params["sigma_window_edge_factor"]),
         fermi_reference=str(params["fermi_reference"]).strip().lower(),
         quadrature_eps=float(params["sigma_quadrature_eps"]),
@@ -2711,6 +2860,7 @@ def _input_storage(
         sigma_freq_debug_output=bool(params["sigma_freq_debug_output"]),
         sigma_freq_debug_file=str(params["sigma_freq_debug_file"]),
         write_wfn_h5=bool(params["write_wfn_h5"]),
+        write_w=bool(params["write_w"]),
     )
     bse = BSEConfig(
         get_centroids_fi=bool(params["get_centroids_fi"]),
@@ -2771,6 +2921,7 @@ def _assemble_input_config(
         occupation_clamp_tol=float(params["occupation_clamp_tol"]),
         restart=bool(params["restart"]),
         write_restart_tensors=bool(params["write_restart_tensors"]),
+        write_poles=bool(params["write_poles"]),
         write_qsgw_datasets=bool(params["write_qsgw_datasets"]),
         restart_q_storage_raw=_restart_q_storage,
         qp_rotations_k_storage=_qp_rot_k_storage,
@@ -2827,6 +2978,7 @@ def _apply_input_envelope(
     refuse_unsupported_bgw_metal_q0_treatment(resolved)
     refuse_unsupported_screening_diagrams(resolved)
     refuse_unsupported_bispinor_gw(resolved)
+    refuse_headless_shared_pole_self_consistency(resolved)
     announce_legacy_sigma_axis_keys(
         _named_keys, resolved.compute_mode, resolved.qp_solver,
         print_fn=print_fn)
@@ -3124,6 +3276,7 @@ def read_lorrax_input(filename: str) -> dict:
     else:
         params = dict(_DEFAULTS)
         params[_DECK_NAMED_KEYS] = frozenset()
+    _resolve_shared_pole_inputs(params)
     params[_LINALG_RESOLUTION] = resolve_linalg(params)
     _counts = resolve_band_counts(params, deck_named=params[_DECK_NAMED_KEYS])
     params[_BAND_COUNTS] = _counts
@@ -3414,6 +3567,56 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
         "StaticHeadTerms); NO transverse q=Gamma head on the incumbent "
         "route -- the packed Gamma-cell completion is the only producer of "
         "<D_TT> and this deck is outside its envelope")
+
+
+def refuse_headless_shared_pole_self_consistency(config) -> None:
+    """Refuse shared-pole SC with the head off, at PARSE time.
+
+    MEASURED, 2026-09-11 (AUNION, claim 2189).  ``sigma_w_model =
+    shared_pole`` with ``qp_solver = self_consistent`` and
+    ``head_correction = off`` completes map 0 and then dies inside map 1 on
+    ``GATE shared_pole_gram_valid`` at q=0 -- the parent where the head
+    correction acts.  Three independent sources were measured on the same
+    Si deck and all three fail: the SC quadrature branch alone
+    (Gram min/max -2.294e-07), the seven-lane union (-2.012e-07), and
+    base+ARETAIN; the gate is -1e-07.  The SAME union tip runs the SAME
+    material past map 1 and map 2 with ``head_correction = full``
+    (job 58216796), so this is a property of the deck, not of the source.
+
+    Two reasons it is a REFUSAL rather than a warning.  It is not a
+    production configuration -- headless modes are debug-only by owner
+    ruling 2026-09-01, and the owner's 2026-09-11 preference is an MPA head
+    correction at every iteration.  And discovering it costs a whole map:
+    ~160 s on the smallest reference deck, proportionally more on anything
+    real, after which the run dies with a numerical gate message that says
+    nothing about the head.
+
+    SCOPED TO SELF-CONSISTENCY ON PURPOSE.  A headless shared-pole
+    ONE-SHOT run is not covered by this evidence and is not refused here;
+    it remains a legitimate debug run.
+    """
+    if (getattr(config.sigma, "w_model", "mpa") != "shared_pole"
+            or config.qp_solver is not QPSolver.SELF_CONSISTENT
+            or config.head.correction is not HeadCorrection.OFF):
+        return
+    raise ValueError(
+        "GATE shared_pole_self_consistent_needs_a_head: "
+        "shared-pole self-consistency requires a head correction.\n"
+        "  got:  sigma_w_model = shared_pole, qp_solver = self_consistent, "
+        "head_correction = off\n"
+        "  want: head_correction = full (an MPA head correction at every "
+        "iteration -- owner ruling 2026-09-11), or qp_solver = one_shot_dft "
+        "if a headless shared-pole run is what you meant\n"
+        "  why:  MEASURED.  This combination completes map 0 and then dies "
+        "inside map 1 on GATE shared_pole_gram_valid at q = 0, the parent "
+        "where the head correction acts.  Measured on three independent "
+        "sources (Gram min/max -2.29e-07, -2.01e-07 against a -1e-07 gate); "
+        "the same source runs past map 1 and map 2 with head_correction = "
+        "full.  Refused here rather than one map in, because the failure "
+        "costs a full map and its message names numerics, not the head.  A "
+        "headless one-shot shared-pole run is NOT refused.\n"
+        "  doc:  docs/input_reference.md, head_correction / sigma_w_model; "
+        "KNOWN_LORRAX_ISSUES.md; claim 2189.")
 
 
 def refuse_unsupported_bispinor_gw(config) -> None:
@@ -3730,6 +3933,13 @@ class DynamicSigmaConfig:
     sigma_at_dft_energies: bool
     #: Uniform denominator-box policy for dynamic Sigma quadrature.  The
     #: cache spelling is "auto" (run tmp), "off", or a deck-relative path.
+    w_model: str = "mpa"
+    w_accuracy: str = "production"
+    #: ``sigma_w_support_sites_ev``: "" (default, the shared-pole
+    #: resolver's own ladders) or "<line eV list> | <imaginary eV list>",
+    #: an explicit support geometry for support-rule studies.  Parsed and
+    #: gated by ``gw.shared_pole_recipe.parse_support_sites``.
+    w_support_sites_ev: str = _DEFAULTS["sigma_w_support_sites_ev"]
     quadrature_eps: float = 1.0e-4
     quadrature_cache_dir: str = "auto"
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
@@ -4102,6 +4312,13 @@ class DebugConfig:
     sigma_freq_debug_output: bool
     sigma_freq_debug_file: str
     write_wfn_h5: bool
+    #: Dump the WHOLE shared-pole Wc frequency sample bank (every fixed
+    #: sample, plus ``dWc_ds``/M1/M3) to ``<map>_w.h5``.  Debugging only.
+    #: BSE's static W does NOT need this: ``Wc(0) = -b Lambda^-1 b^dagger``
+    #: is exact from ``write_poles``, and no consumer in this tree reads the
+    #: bank.  See ``_DEFAULTS["write_poles"]`` for the derivation and the
+    #: measured 16x size ratio.
+    write_w: bool
 
 
 @dataclass(frozen=True)
@@ -4293,6 +4510,11 @@ class LorraxConfig:
     #: behaviour; see ``_DEFAULTS["write_restart_tensors"]`` for why this is
     #: a COMPLEMENT to q_irr storage and not an alternative to it.
     write_restart_tensors: bool
+    #: Export the centroid/pole residue factor b and squared poles Lambda.
+    #: The production shared-pole export; complete for a static-W consumer
+    #: (``Wc(0) = -b Lambda^-1 b^dagger``).  The frequency-bank dump is the
+    #: DEBUG sibling and lives at ``config.debug.write_w``.
+    write_poles: bool
     #: Add the QSGW Σ_xc cube and the QP energy ladders to ``sigma_mnk.h5``.
     #: False (the default) is byte-for-byte today's file; see
     #: ``_DEFAULTS["write_qsgw_datasets"]`` for what each dataset is and
