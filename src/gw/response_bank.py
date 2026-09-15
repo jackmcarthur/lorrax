@@ -158,12 +158,14 @@ def response_weights(wfns, meta):
 
 
 def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
-                    pair_mode="retarded", bank_carry=False):
+                    pair_mode="retarded", bank_carry=False, ordered=False):
     """Bind the existing one-particle Green/FFT primitive to a q batch.
 
     Returns a jitted kernel and its fixed ψ/energy arguments. Caller supplies
     time, projections, final weights and energy reference. The output is
     ``[len(q_ids), n_outputs, mu_p, mu_p]`` with both endpoints sharded.
+    ``ordered`` (time reversal measured broken) returns the physical
+    orientation ``chi_q = FT_q[chi]`` that Sigma's contraction assumes.
     """
     from .w_isdf import _get_chi_fractional_contour_kernel_face
 
@@ -182,7 +184,7 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
         k_unfold_plan=parent, selected_q=tuple(q_ids), pair_mode=pair_mode,
-        bank_carry=bank_carry)
+        bank_carry=bank_carry, ordered=ordered)
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
 
 
@@ -210,7 +212,7 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False):
     energy, f, u, reference, census = response_weights(wfns, meta)
     erel = energy - reference
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
-                                    q_ids=q_ids, n_outputs=1)
+                                    q_ids=q_ids, n_outputs=1, ordered=ordered)
     terms = (((-1., 1, 0), (1., 0, 1)),
              ((-1., 3, 0), (3., 2, 1), (-3., 1, 2), (1., 0, 3)))
     totals = []
@@ -742,6 +744,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # Time reversal measured broken: both particle-hole orientations keep
         # independent weights. The retarded stream already forms the partner as
         # conj in R space (the -q orientation); remote cells add the odd kernel.
+        # ordered=True stores the physical orientation W_q = FT_q[W].
         ordered = not bool(sym.trs_allowed)
         if ordered:
             receipt["ordered"] = True
@@ -864,7 +867,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 name,_ = _reserve(meta,"bank_outputs",2*a*(q1-q0)*face_bytes + headroom)
                 ledger.live_stages = ambient+(name,)
                 kernel,fixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,bank_carry=True)
+                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,bank_carry=True,ordered=ordered)
                 raw = jax.jit(lambda: jnp.zeros((2*a,q1-q0,meta.mu_basis.n_packed,meta.mu_basis.n_packed),jnp.complex128),
                     out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
             raw = execute(kernel,(jnp.asarray(t),jnp.asarray(np.vstack((phase[lo:hi],derivative[lo:hi]))),
