@@ -710,10 +710,13 @@ def _tr_odd_census(receipt, samples, h, chi, dchi, value, z, q_full):
     v = (h @ h)[0]
     names = ("chi_odd_max_rel", "chi_odd_fro_rel", "chi_hermiticity_rel",
              "w_hermiticity_rel", "w_even_route_hermiticity_rel", "w_transpose_rel")
+    # The Dyson owner requires face-sharded [1,n,n] operands.
+    symmetric = jax.jit(lambda c, dc: (0.5*(c + jnp.swapaxes(c, -1, -2)),
+                                       0.5*(dc + jnp.swapaxes(dc, -1, -2))),
+                        out_shardings=(h.sharding, h.sharding))
     for s in imaginary.tolist():
-        sym = 0.5*(chi[s] + chi[s].T)
-        dsym = 0.5*(dchi[s] + dchi[s].T)
-        w_even = v + samples(h, sym[None], dsym[None])[0][0]
+        sym, dsym = symmetric(chi[s:s+1], dchi[s:s+1])
+        w_even = v + samples(h, sym, dsym)[0][0]
         values = np.asarray(_census_scalars(chi[s], v + value[s], w_even), dtype=np.float64)
         row = dict(q_full=q_full, z_ry=[float(z[s].real), float(z[s].imag)],
                    **{k: float(x) for k, x in zip(names, values)})
