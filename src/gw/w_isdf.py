@@ -874,6 +874,7 @@ def _get_chi_fractional_contour_kernel_legacy(
 def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
     *, k_unfold_plan=None, selected_q=None, pair_mode="retarded", bank_carry=False,
+    ordered=False,
 ):
     """Face-layout sibling of
     :func:`_get_chi_fractional_contour_kernel_legacy`.  Same Keldysh
@@ -907,6 +908,16 @@ def _get_chi_fractional_contour_kernel_face(
     That option returns a stacked ``[parent, output, mu_x, mu_y]`` array at
     ``P(None,None,'x','y')``; the default retains the incumbent tuple API.
     Selection happens before output accumulation, not after a full-q bank.
+
+    Orientation. With ``FT_q[f](mu,nu) = sum_R f(r_mu, r_nu+R) e^{iq.R}`` (the
+    transform under which Sigma's ``G_{k-q} W_q`` contraction is exact), the
+    incumbent trace returns ``FT_q[chi^T]``: ``conj(build_G_tau(w, t))`` is
+    ``build_G_tau(conj w, conj t)^T`` and the forward q FFT labels ``-q``.
+    ``ordered=True`` (time reversal measured broken) and ``laplace_ordered``
+    return the physical ``FT_q[chi]``: G is built as ``build_G_tau(conj w,
+    conj t)`` and the rows are gathered at ``-q``, exactly the incumbent row
+    ``-q`` transposed. Time-reversal-symmetric banks keep the incumbent trace,
+    where the two orientations are equal.
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
@@ -926,6 +937,8 @@ def _get_chi_fractional_contour_kernel_face(
         raise ValueError("bank carry requires selected q rows")
     if pair_mode != "retarded" and selected_q is None:
         raise ValueError("Laplace bank correlations require selected_q")
+    if ordered and selected_q is None:
+        raise ValueError("ordered (physical-orientation) correlations require selected_q")
     if selected_q is not None:
         from .contour_accumulator import contour_accumulator
         accumulate_selected = contour_accumulator(mesh_xy)
@@ -939,6 +952,12 @@ def _get_chi_fractional_contour_kernel_face(
             raise ValueError(
                 "GATE response_selected_q: got invalid selected_q; want unique "
                 "full-grid indices; why: bank parent rows must be explicit")
+    physical = bool(ordered) or pair_mode == "laplace_ordered"
+    gather_q = selected_q
+    if physical:
+        coords = np.unravel_index(np.asarray(selected_q), grid)
+        gather_q = tuple(int(i) for i in np.ravel_multi_index(
+            tuple((-c) % n for c, n in zip(coords, grid)), grid))
     selected_shard = NamedSharding(mesh_xy, P(None, None, "x", "y"))
     nk_shape, nb_full, n_rmu, ns = (int(v) for v in face_shape)
     # Raw-parent transport (``k_unfold_plan``): the two G's are contracted
@@ -1032,38 +1051,24 @@ def _get_chi_fractional_contour_kernel_face(
         if bank_carry:
             initial = carry[0]
 
+        def green_k(weight, t, ref):
+            # Incumbent: conj(G(w, t)) = G(conj w, conj t)^T. Physical: G(conj w, conj t).
+            if physical:
+                g = build_G_tau(psi_mun, psi_nmu, enk_full, jnp.conj(t), e_ref=ref,
+                                band_weight=jnp.conj(weight), layout="face",
+                                gemm=g_plan, k_unfold_plan=k_unfold_plan)
+            else:
+                g = jnp.conj(build_G_tau(psi_mun, psi_nmu, enk_full, t, e_ref=ref,
+                                         band_weight=weight, layout="face",
+                                         gemm=g_plan, k_unfold_plan=k_unfold_plan))
+            return jax.lax.with_sharding_constraint(g, G_shard)
+
         def body(accumulators, node):
             time, projection = node
             if pair_mode == "retarded":
                 tau = jnp.asarray(1j, dtype=jnp.complex128) * time
-                Gf_k = jax.lax.with_sharding_constraint(
-                    jnp.conj(build_G_tau(
-                        psi_mun,
-                        psi_nmu,
-                        enk_full,
-                        -tau,
-                        e_ref=energy_reference,
-                        band_weight=occ_f,
-                        layout="face",
-                        gemm=g_plan,
-                        k_unfold_plan=k_unfold_plan,
-                    )),
-                    G_shard,
-                )
-                Gu_k = jax.lax.with_sharding_constraint(
-                    jnp.conj(build_G_tau(
-                        psi_mun,
-                        psi_nmu,
-                        enk_full,
-                        -tau,
-                        e_ref=energy_reference,
-                        band_weight=occ_u,
-                        layout="face",
-                        gemm=g_plan,
-                        k_unfold_plan=k_unfold_plan,
-                    )),
-                    G_shard,
-                )
+                Gf_k = green_k(occ_f, -tau, energy_reference)
+                Gu_k = green_k(occ_u, -tau, energy_reference)
                 Gf_R = G_fftn(Gf_k)
                 Gu_R = G_fftn(Gu_k)
                 A_R = jax.lax.with_sharding_constraint(
@@ -1080,12 +1085,7 @@ def _get_chi_fractional_contour_kernel_face(
                 # exp[-(E_upper-E_lower)t].  Each side remains a
                 # one-particle correlation through the same Green/FFT owner.
                 def green(weight, tau_value, ref):
-                    return G_fftn(jax.lax.with_sharding_constraint(
-                        jnp.conj(build_G_tau(
-                            psi_mun, psi_nmu, enk_full, tau_value,
-                            e_ref=ref, band_weight=weight, layout="face",
-                            gemm=g_plan, k_unfold_plan=k_unfold_plan)),
-                        G_shard))
+                    return G_fftn(green_k(weight, tau_value, ref))
 
                 lower_f = green(occ_f[0], -time, energy_reference[0])
                 upper_u = green(occ_u[0], time, energy_reference[1])
@@ -1129,18 +1129,19 @@ def _get_chi_fractional_contour_kernel_face(
                     chi_fftn(-1j * (A_R - jnp.conj(A_R))
                              if pair_mode == "retarded"
                              else A_R + jnp.conj(A_R)),
-                    jnp.asarray(selected_q), axis=0)
+                    jnp.asarray(gather_q), axis=0)
                 if pair_mode != "laplace_ordered":
                     updated = accumulate_selected(accumulators, contribution, projection)
                 else:
                     # Both orientations with independent weights.  The
                     # partner orientation is conj in R space BEFORE the q
                     # transform (conj(A)(R) -> conj(A_{-q})), exactly as the
-                    # retarded stream forms it; no q-negation gather.  Rows
+                    # retarded stream forms it; the -q gather is the physical
+                    # orientation (see the docstring), not a partner.  Rows
                     # are [even outputs; odd outputs] on one shared node.
                     half = projection.shape[0] // 2
                     odd = jnp.take(chi_fftn(A_odd_R - jnp.conj(A_odd_R)),
-                                   jnp.asarray(selected_q), axis=0)
+                                   jnp.asarray(gather_q), axis=0)
                     updated = accumulate_selected(
                         accumulate_selected(accumulators, contribution,
                                             projection[:half]),
