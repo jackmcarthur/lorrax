@@ -4,7 +4,7 @@ _services.ensure_on_path()
 from distrib_la import mesh_key as _mesh_key
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Callable
@@ -46,6 +46,22 @@ _w_solve_cache: dict = {}
 _STATIC_FRACTIONAL_PAIR_TILE = 32
 
 
+def _conjugate_partner_orientation(forward_R, reverse_R=None):
+    """Return the +Δ-pole partner of the kernel's own orientation, in R space.
+
+    The kernel's own object is the −Δ-pole orientation
+    (``DERIVATION_gnppm_nonhermitian.md`` §2).  Its partner is
+    ``conj(A_{-q})``; in R space, where the τ scan accumulates, ``q → −q``
+    is the elementwise conjugate, so the partner is available WITHOUT the
+    scalar route's ``q_neg_index`` gather.  With Hermitian vertices the
+    partner's own R-space object is the endpoint-swapped contraction; with
+    identity vertices the swap is the transpose of the same array.
+    """
+    if reverse_R is None:
+        return jnp.conj(forward_R)
+    return jnp.conj(jnp.swapaxes(reverse_R, -1, -2))
+
+
 def _complete_static_vertex_orientations(forward_R, reverse_R=None):
     """Return both ordered Hermitian-vertex orientations in R space; see docs/architecture/four_current_wiring.md."""
     if reverse_R is None:
@@ -64,8 +80,18 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             layout: str = "face", face_shape=None,
                             right_face_shape=None,
                             vertex_pairs=None,
+                            ordered_orientations: bool = False,
                             k_unfold_plan=None):
-    """Build the face or parent minimax response with vertices applied after unfold."""
+    """Build the face or parent minimax response with vertices applied after unfold.
+
+    ``ordered_orientations`` gives the two particle–hole orientations
+    INDEPENDENT node weights — ``γ_l`` on the kernel's own (−Δ-pole)
+    orientation and ``conj(γ_l)`` on its partner — which is what the
+    time-reversal-odd channel needs (``DERIVATION_gnppm_nonhermitian.md``
+    §2).  With real ``γ`` the two weights coincide and the result is the
+    even completion; the even path keeps its own single-weight arithmetic so
+    that it stays bit-identical.
+    """
     nkx, nky, nkz = kgrid
     nk = nkx * nky * nkz
     n_out = int(n_out)
@@ -79,6 +105,12 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         raise ValueError(
             f"_get_chi_minimax_kernel: layout must be 'face', "
             f"got {layout!r}")
+    ordered_orientations = bool(ordered_orientations)
+    if ordered_orientations and (complex_contour or vertex_pairs is None):
+        raise ValueError(
+            "ordered_orientations is the vertex-pair route's own completion; "
+            "the scalar contour route completes at -q through "
+            "compute_chi0_imag_ordered instead.")
     vertex_classes = None
     if vertex_pairs is not None:
         vertex_pairs = tuple(tuple(int(v) for v in pair) for pair in vertex_pairs)
@@ -90,7 +122,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             raise ValueError("Vertex outputs must share one family pair and one static rule.")
     cache_key = (_mesh_key(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
-                 vertex_classes, (tuple(id(p) for p in k_unfold_plan)
+                 vertex_classes, ordered_orientations,
+                 (tuple(id(p) for p in k_unfold_plan)
                                if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)))
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
@@ -103,13 +136,20 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
         right_face_shape=right_face_shape,
         vertex_pairs=vertex_pairs,
+        ordered_orientations=ordered_orientations,
         k_unfold_plan=k_unfold_plan, layout=layout)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
 
-def _contract_chi_vertices(Gv_R, Gc_R, operands, identities, complex_contour):
-    """Contract Hermitian endpoint vertices and complete their ordered orientations."""
+def _contract_chi_vertices(Gv_R, Gc_R, operands, identities, complex_contour,
+                           ordered_orientations=False):
+    """Contract Hermitian endpoint vertices and complete their ordered orientations.
+
+    With ``ordered_orientations`` the two orientations are returned SEPARATELY,
+    ``(own, partner)``, so the caller can weight them with ``γ`` and
+    ``conj(γ)`` instead of one real ``α``.
+    """
     from common.gamma_matrices import gamma_double_contract
     left_identity, right_identity = identities
     reverse = None
@@ -133,6 +173,8 @@ def _contract_chi_vertices(Gv_R, Gc_R, operands, identities, complex_contour):
             perm_R=None if left_identity else perm_l,
             phase_R=None if left_identity else phase_l,
             spin_axes=(1, 3))
+    if ordered_orientations:
+        return forward, _conjugate_partner_orientation(forward, reverse)
     return (forward if complex_contour else
             _complete_static_vertex_orientations(forward, reverse))
 
@@ -140,6 +182,7 @@ def _contract_chi_vertices(Gv_R, Gc_R, operands, identities, complex_contour):
 def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                                  face_shape, *, right_face_shape=None,
                                  vertex_pairs=None,
+                                 ordered_orientations=False,
                                  k_unfold_plan=None, layout="face"):
     """Build masked valence/conduction Green functions and integrate both response orientations."""
     from common.fft_helpers import make_flat_k_fftn
@@ -316,11 +359,25 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
             def vertex_step(index, acc):
                 operands = None if tables is None else tuple(table[index] for table in tables)
-                chi_tau = _contract_chi_vertices(
-                    Gv_R, Gc_R, operands, identities, complex_contour)
-                chi_tau = jax.lax.with_sharding_constraint(chi_tau, _chi_R_shard)
+                contribution = _contract_chi_vertices(
+                    Gv_R, Gc_R, operands, identities, complex_contour,
+                    ordered_orientations=ordered_orientations)
                 previous = jax.lax.dynamic_index_in_dim(acc, index, axis=0, keepdims=False)
-                value = previous + alpha_scalar * chi_tau
+                if ordered_orientations:
+                    # γ on the kernel's own (−Δ-pole) orientation and conj(γ)
+                    # on its +Δ-pole partner: the ONE line that carries the
+                    # time-reversal-odd channel.  Real γ reproduces the even
+                    # rule (to the arithmetic order, not to the bit — the even
+                    # path above is the one that keeps the incumbent bits).
+                    own, partner = (
+                        jax.lax.with_sharding_constraint(term, _chi_R_shard)
+                        for term in contribution)
+                    value = (previous + alpha_scalar * own
+                             + jnp.conj(alpha_scalar) * partner)
+                else:
+                    chi_tau = jax.lax.with_sharding_constraint(
+                        contribution, _chi_R_shard)
+                    value = previous + alpha_scalar * chi_tau
                 return jax.lax.dynamic_update_index_in_dim(acc, value, index, axis=0)
 
             return jax.lax.fori_loop(0, n_vertices, vertex_step, accumulators, unroll=1), None
@@ -986,8 +1043,29 @@ def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
     )
 
 
-def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
-    """Nodes/operands of the ordered imaginary-axis route (see below)."""
+def _ordered_node_weights(quad, E_gap):
+    """``γ_l = -(α_l - i β_l) e^{-τ_l E_gap}`` — the ordered node weight.
+
+    One source of truth for the two routes that need it: the scalar
+    imaginary-axis route (:func:`compute_chi0_imag_ordered`) and the
+    vertex-pair route (:func:`compute_no_pair_dirac_current_blocks`).
+    ``γ`` weights the kernel's OWN (−Δ-pole) orientation; its partner
+    receives ``conj(γ) ≈ -1/(x - iω_p)``.  See
+    ``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` §2.
+    """
+    tau = np.asarray(quad.tau, dtype=np.float64)
+    alpha = np.asarray(quad.alpha, dtype=np.float64)
+    beta = np.asarray(quad.alpha_odd, dtype=np.float64)
+    if tau.shape != alpha.shape or tau.shape != beta.shape:
+        raise ValueError(
+            "ordered chi0: tau, alpha and alpha_odd must share one "
+            f"node axis; got {tau.shape}, {alpha.shape}, {beta.shape}")
+    return tau, -(alpha - 1j * beta) * np.exp(-tau * E_gap)
+
+
+def _refuse_missing_odd_kernel(quad):
+    """The one named refusal for a route asked to carry the TR-odd channel
+    without the odd quadrature weights that carry it."""
     if getattr(quad, "alpha_odd", None) is None:
         raise ValueError(
             "GATE chi0_imag_ordered_needs_odd_kernel: the ordered response "
@@ -997,6 +1075,11 @@ def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
             "  why:  without odd weights the time-reversal-odd response "
             "channel is zero by construction\n"
             "  doc:  docs/dev/notes/DERIVATION_gnppm_nonhermitian.md")
+
+
+def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
+    """Nodes/operands of the ordered imaginary-axis route (see below)."""
+    _refuse_missing_odd_kernel(quad)
     s = wfns.slices
     enk_v = wfns.enk[:, s.val]
     enk_c = wfns.enk[:, s.cond]
@@ -1006,18 +1089,11 @@ def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
     vmax = float(np.max(enk_v_host))
     cmin = float(np.min(enk_c_host))
     E_gap = cmin - vmax
-    tau = np.asarray(quad.tau, dtype=np.float64)
-    alpha = np.asarray(quad.alpha, dtype=np.float64)
-    beta = np.asarray(quad.alpha_odd, dtype=np.float64)
-    if tau.shape != alpha.shape or tau.shape != beta.shape:
-        raise ValueError(
-            "chi0_imag_ordered: tau, alpha and alpha_odd must share one "
-            f"node axis; got {tau.shape}, {alpha.shape}, {beta.shape}")
     # gamma_l = -(alpha_l - i beta_l) e^{-tau_l E_gap}: the resolvent
     # -1/(x + i omega_p) of the kernel's OWN orientation (the -Delta pole,
     # DERIVATION_gnppm_nonhermitian.md section 2).  The conjugate partner
     # receives conj(gamma) through the q-negated conjugate below.
-    gamma = -(alpha - 1j * beta) * np.exp(-tau * E_gap)
+    tau, gamma = _ordered_node_weights(quad, E_gap)
     nodes = MinimaxNodes(
         t=jnp.asarray(tau, dtype=jnp.complex128),
         alpha=jnp.asarray(gamma, dtype=jnp.complex128),
@@ -1073,12 +1149,13 @@ def precompile_chi0_imag_ordered(wfns, quad, meta, mesh_xy, *,
 def compute_no_pair_dirac_current_block(
     wfns_left, wfns_right, quad, meta, mesh_xy, *,
     vertex_left: int, vertex_right: int, energy_reference=0.0,
+    ordered=False,
 ):
     """Return one paramagnetic no-pair block without a Ward contact."""
     return compute_no_pair_dirac_current_blocks(
         wfns_left, wfns_right, quad, meta, mesh_xy,
         vertex_pairs=((vertex_left, vertex_right),),
-        energy_reference=energy_reference)[0]
+        energy_reference=energy_reference, ordered=ordered)[0]
 
 
 def _require_current_chi_endpoints(wfns_left, wfns_right):
@@ -1107,9 +1184,19 @@ def _require_current_chi_endpoints(wfns_left, wfns_right):
 
 def compute_no_pair_dirac_current_blocks(
     wfns_left, wfns_right, quad, meta, mesh_xy, *,
-    vertex_pairs, energy_reference=0.0,
+    vertex_pairs, energy_reference=0.0, ordered=False,
 ):
-    """Integrate one centroid-family class with shared Greens and return q-IBZ blocks."""
+    """Integrate one centroid-family class with shared Greens and return q-IBZ blocks.
+
+    ``ordered=True`` is the time-reversal-odd route for this kernel: the two
+    particle–hole orientations carry ``γ`` and ``conj(γ)`` instead of one real
+    ``α`` (``_ordered_node_weights``).  Unlike the scalar route it needs NO
+    ``q_neg_index``: the partner orientation is built locally in R space, where
+    ``q → −q`` is the elementwise conjugate
+    (:func:`_conjugate_partner_orientation`).  CT is the magnetisation-odd
+    channel, so on a broken-time-reversal deck this flag is what makes it
+    nonzero at ω ≠ 0.
+    """
     left, right = _require_current_chi_endpoints(wfns_left, wfns_right)
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
@@ -1124,11 +1211,15 @@ def compute_no_pair_dirac_current_blocks(
     cmin = float(np.min(enk_c_host))
     E_gap = cmin - vmax
 
-    tau = np.asarray(quad.tau, dtype=np.float64)
-    # Fold the one-orientation prefactor (-exp(-τ·E_gap)) into alpha.  The
-    # kernel adds the exact forward and reverse ordered transitions before
-    # the final q FFT; retaining the historical -2 here would double count.
-    alpha_chi = -1.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
+    if ordered:
+        _refuse_missing_odd_kernel(quad)
+        tau, alpha_chi = _ordered_node_weights(quad, E_gap)
+    else:
+        tau = np.asarray(quad.tau, dtype=np.float64)
+        # Fold the one-orientation prefactor (-exp(-τ·E_gap)) into alpha.  The
+        # kernel adds the exact forward and reverse ordered transitions before
+        # the final q FFT; retaining the historical -2 here would double count.
+        alpha_chi = -1.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
     nodes = MinimaxNodes(
         t=jnp.asarray(tau, dtype=jnp.complex128),
         alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
@@ -1140,6 +1231,7 @@ def compute_no_pair_dirac_current_blocks(
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, layout=left.layout, face_shape=left_shape,
         right_face_shape=right_shape, vertex_pairs=vertex_pairs,
+        ordered_orientations=bool(ordered),
         k_unfold_plan=(left.plan, right.plan))
     mask_v = left.plan.parent_rows(wfns_left.band_mask(s.val))
     mask_c = left.plan.parent_rows(wfns_left.band_mask(s.cond))
@@ -1163,19 +1255,71 @@ STATIC_PHOTON_NO_PAIR_MODEL = NO_PAIR_DIRAC_CURRENT_MODEL
 
 
 @partial(jax.jit, donate_argnums=(0,))
-def _subtract_static_tt_contact(chi_tt):
-    """Subtract the Γ contact on q-IBZ before its typed star transport."""
+def _subtract_tt_contact(chi_tt):
+    """Subtract THIS frequency's own Γ contact on q-IBZ, before star transport.
+
+    The owner's standing Ward ruling (2026-09-05) is ``Π(q) − Π(0)`` applied on
+    the irreducible-zone representatives and unfolded; the centroid-diagonal
+    contact is rejected.  At ω = 0 this is the certified behaviour and the only
+    reading.  At ω ≠ 0 it becomes the SAME-FREQUENCY reading, which forces
+    ``χ_TT(q = 0, ω) = 0`` at every ω — i.e. it **suppresses the transverse head
+    at finite frequency**.  See :data:`PHOTON_TT_CONTACT_SAME_FREQUENCY`.
+    """
     corrected = chi_tt - chi_tt[0:1]
     # Make the q=0 cancellation structural rather than roundoff-dependent.
     return corrected.at[0].set(jnp.zeros_like(corrected[0]))
+
+
+@partial(jax.jit, donate_argnums=(0,))
+def _subtract_reference_tt_contact(chi_tt, contact):
+    """Subtract a FIXED contact — the ω = 0 Γ row — at every frequency.
+
+    The diamagnetic term of the current–current response is frequency
+    independent (it is the ``n/m`` contact), and the exact ``q → 0``
+    cancellation is against that constant.  So this reading keeps
+    ``χ_TT(q = 0, ω) = χ_TT(0, ω) − χ_TT(0, 0)``, which is the transverse head
+    at finite ω rather than zero.  It agrees with
+    :func:`_subtract_tt_contact` exactly at ω = 0, where ``contact`` IS that
+    frequency's own row.  See :data:`PHOTON_TT_CONTACT_STATIC_REFERENCE`.
+    """
+    return chi_tt - contact
+
+
+#: The two readings of the Ward ruling at finite frequency.  Neither is
+#: certified at q → 0 until a DYNAMIC packed photon head exists; they bracket
+#: it, and their difference IS the q → 0 transverse head contribution, which is
+#: why this lane measures it rather than choosing.  Stamped into the response
+#: provenance so a row can say what it depended on.
+PHOTON_TT_CONTACT_SAME_FREQUENCY = "same_frequency_ward_contact_v1"
+PHOTON_TT_CONTACT_STATIC_REFERENCE = "static_reference_ward_contact_v1"
+PHOTON_TT_CONTACTS = (PHOTON_TT_CONTACT_SAME_FREQUENCY,
+                      PHOTON_TT_CONTACT_STATIC_REFERENCE)
 
 
 def compute_experimental_no_pair_photon_chi0(
     wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout, *,
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
+    ordered=False,
+    tt_contact_reference=None,
+    capture_tt_contact=False,
 ):
-    """Build all sixteen no-pair blocks with an experimental TT proxy; see docs/architecture/four_current_wiring.md."""
+    """Build all sixteen no-pair blocks with an experimental TT proxy; see docs/architecture/four_current_wiring.md.
+
+    ``ordered=True`` routes every one of the sixteen blocks through the
+    time-reversal-odd vertex-pair kernel.  It is required at ω ≠ 0 on a deck
+    whose measured time-reversal verdict is false, because CT is exactly the
+    magnetisation-odd channel; at ω = 0 the odd weights vanish
+    (``β ∝ ω_p/(x² + ω_p²)``) and the result reduces to the even build.
+
+    ``tt_contact_reference`` selects the OTHER reading of the Ward contact: a
+    mapping ``{(A, B): chi_AB[0:1]}`` captured at ω = 0, subtracted at every
+    frequency instead of that frequency's own Γ row
+    (:data:`PHOTON_TT_CONTACT_STATIC_REFERENCE`).  ``capture_tt_contact``
+    returns that mapping alongside the packed operator so the ω = 0 role can
+    supply it to the finite-ω roles.  The two readings agree exactly at ω = 0
+    and their difference at ω ≠ 0 is the q → 0 transverse head.
+    """
     from .photon_layout import pack_photon_operator
 
     layout.assert_mesh(mesh_xy)
@@ -1207,20 +1351,32 @@ def compute_experimental_no_pair_photon_chi0(
     pending_classes = iter(classes)
     blocks = {}
 
+    captured: dict = {}
+
     def get_block(A, B):
         if not blocks:
             pairs = next(pending_classes)
             values = compute_no_pair_dirac_current_blocks(
                 families[A], families[B], quad, meta, mesh_xy,
-                vertex_pairs=pairs, energy_reference=energy_reference)
+                vertex_pairs=pairs, energy_reference=energy_reference,
+                ordered=ordered)
             blocks.update(zip(pairs, values))
         chi_ab = blocks.pop((A, B))
-        if A and B:
-            return _subtract_static_tt_contact(chi_ab)
-        return chi_ab
+        if not (A and B):
+            return chi_ab
+        if capture_tt_contact:
+            captured[(A, B)] = chi_ab[0:1]
+        if tt_contact_reference is None:
+            return _subtract_tt_contact(chi_ab)
+        return _subtract_reference_tt_contact(
+            chi_ab, tt_contact_reference[(A, B)])
 
     order = tuple(pair for pairs in classes for pair in pairs)
-    return pack_photon_operator(get_block, nq, layout, mesh_xy, block_order=order)
+    packed = pack_photon_operator(
+        get_block, nq, layout, mesh_xy, block_order=order)
+    if capture_tt_contact:
+        return packed, captured
+    return packed
 
 
 #: Provenance of the unscreened-current packed body.  The bare-transverse
@@ -1532,18 +1688,40 @@ def _report_static_photon_body(
 def _screen_static_photon_body(
         screen_current, wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
         current_contact, energy_reference, V_packed, distrib_la_batched_route, W_charge,
-        sym, nq):
-    """Produce the screened packed operator on the existing photon basis."""
+        sym, nq, ordered=False, print_fn=print,
+        tt_contact_reference=None, capture_tt_contact=False):
+    """Produce the screened packed operator, and the TT contact rows if asked.
+
+    Returns ``(W_packed, captured_tt_contact)``; the second is ``{}`` unless
+    ``capture_tt_contact`` is set."""
     from .photon_layout import (
         PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
         pack_photon_operator)
     from .v_q_bispinor import (ZERO_TILES)
     from file_io.restart_bundle import (BispinorVqReader)
+    captured_contact: dict = {}
     if screen_current:
         chi_packed = compute_experimental_no_pair_photon_chi0(
             wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
             current_contact=current_contact,
-            energy_reference=energy_reference)
+            energy_reference=energy_reference, ordered=ordered,
+            tt_contact_reference=tt_contact_reference,
+            capture_tt_contact=capture_tt_contact)
+        if capture_tt_contact:
+            chi_packed, captured_contact = chi_packed
+        # Sixteen reductions on an array that is already resident (< 1 s of a
+        # ~350 s stage): the ONLY observable this route has of the two channels
+        # it exists for.  chi_CT and chi_TT are zero by DECLARATION on the
+        # bare-transverse family, so printing their norms here is what
+        # distinguishes "built and small" from "not built".
+        # EVERY rank computes these: photon_block_view runs a jitted program on
+        # a sharded array, so guarding the COMPUTE on process 0 would be a
+        # rank-divergent collective (INVARIANTS 21).  Only the print is guarded.
+        _chi_norms = photon_class_norms(chi_packed, layout, mesh_xy)
+        if jax.process_index() == 0:
+            print_fn(_format_class_norms(
+                "chi0" + (" (ordered)" if ordered else ""), _chi_norms),
+                flush=True)
 
         W_packed = solve_w(
             V_packed, chi_packed, meta, mesh_xy,
@@ -1608,13 +1786,22 @@ def _screen_static_photon_body(
     # channels transform as vectors and require their own derived relation.
     from common import sanity
     sanity.refuse_nonfinite("static packed photon W", W_packed)
-    if not sanity.check_hermitian(
-            "static packed photon W[q=0]", W_packed[0], rtol=1.0e-6,
-            always=True):
+    # HERMITICITY, and the one condition under which it is owed.  Exactly the
+    # scalar route's scope rule (``screening._gate_w``): with both ordered
+    # orientations summed, the anti-Hermitian part of chi0 carries a factor
+    # omega and vanishes identically at omega = 0 for any deck, so the even
+    # (static) build is gated unconditionally.  An ORDERED role is built at
+    # omega != 0 on a deck whose measured time-reversal verdict is false, where
+    # a non-Hermitian W is the physics rather than a fault -- CT is that
+    # channel.  There the same residual is REPORTED with its number, never
+    # refused.  Duplicating the scalar gate's threshold, not its text.
+    hermitian_residual = sanity.check_hermitian(
+        "packed photon W[q=0]", W_packed[0], rtol=1.0e-6, always=True)
+    if not hermitian_residual and not ordered:
         raise ValueError(
             "static packed photon W[q=0] failed the canonical Hermiticity "
             "gate before coupled head/body folding")
-    return W_packed
+    return W_packed, captured_contact
 
 
 def _complete_static_photon_head(
@@ -1698,45 +1885,331 @@ def compute_static_photon_response(
     print_fn=print,
 ) -> StaticPhotonResponse:
     """Produce the static photon response; see docs/architecture/four_current_wiring.md."""
+    return compute_photon_response_roles(
+        (("static", quad, False),),
+        wfns_charge, wfns_transverse, bispinor_v_q_path, meta, mesh_xy,
+        screen_current=screen_current, mu_bases=mu_bases, W_charge=W_charge,
+        wfn=wfn, config=config, photon_g0_vectors=photon_g0_vectors,
+        wf_binding_charge=wf_binding_charge,
+        wf_binding_transverse=wf_binding_transverse,
+        wfn_fingerprint_binding=wfn_fingerprint_binding,
+        current_contact=current_contact, energy_reference=energy_reference,
+        dyson_solver=dyson_solver,
+        distrib_la_batched_route=distrib_la_batched_route,
+        print_fn=print_fn)["static"]
+
+
+def _duplicate_packed(packed, mesh_xy):
+    """A donation-safe duplicate of a packed operator, on its own sharding.
+
+    The Γ-cell completion donates the packed operand it is handed.  With one
+    role that is free; with a role list the bare ``V`` must survive into the
+    next role's Dyson solve, so it is duplicated rather than re-read (a
+    re-read is 118 s and a second 13 GB materialisation on the CrI3 deck).
+    """
+    native = NamedSharding(mesh_xy, P(None, "x", "y"))
+    with mesh_xy:
+        return jax.jit(lambda x: x + jnp.zeros((), dtype=x.dtype),
+                       out_shardings=native)(packed)
+
+
+def compute_photon_response_roles(
+    role_quads,
+    wfns_charge, wfns_transverse, bispinor_v_q_path,
+    meta, mesh_xy, *,
+    screen_current: bool,
+    mu_bases,
+    W_charge=None,
+    wfn=None,
+    config=None,
+    photon_g0_vectors=None,
+    wf_binding_charge=None,
+    wf_binding_transverse=None,
+    wfn_fingerprint_binding=None,
+    current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
+    energy_reference=0.0,
+    dyson_solver: str = "distributed",
+    distrib_la_batched_route: str = "batch_reshard",
+    print_fn=print,
+) -> dict:
+    """Produce ``{role: StaticPhotonResponse}`` — the packed response on a frequency axis.
+
+    ``role_quads`` is a sequence of ``(role, quad, ordered)`` — optionally
+    ``(role, quad, ordered, tt_contact)`` — one entry per W a Σ scheme needs,
+    built by :func:`gw.screening.photon_role_quadratures`: the same request
+    list, the same quadrature builders and the same measured time-reversal
+    verdict the scalar route uses.  This function owns only the mechanics.
+
+    THE TT CONTACT.  The owner ruled on 2026-09-15 that the contact removed at
+    every frequency is the FREQUENCY-INDEPENDENT diamagnetic term, i.e. the
+    ω = 0 Γ row — :data:`PHOTON_TT_CONTACT_STATIC_REFERENCE`, the default here.
+    The ω = 0 role is therefore built FIRST and captures that row for every
+    later role; a role list with a finite-ω role and no ω = 0 role is refused.
+    The same-frequency reading is kept as a named secondary arm because the
+    difference between the two IS the q → 0 transverse head.
+
+    ONE BODY READ.  ``V_packed`` and the ``v_q_bispinor`` tiles are
+    frequency-blind, so they are read ONCE for every role.  On the CrI3 deck
+    that is a 13.27 GB operator and a 118 s read; doing it per role would be
+    the largest avoidable cost on this path.
+
+    LIVE-SET BOUND ACROSS ROLES — packed, this is binding rather than
+    advisory.  ``V_packed`` and ``W_packed`` are each ``16·nq·N²/P`` bytes per
+    rank with ``N = n_C + 3·n_T``, and every extra role adds another ``W``.  So
+    every role's ``W`` but the last is spilled to host RAM once its gate has
+    passed and restored after the loop — the identical discipline
+    :func:`gw.screening.compute_screening` applies to the scalar roles, and for
+    the identical reason.
+
+    THE HEAD AT ω ≠ 0.  ``build_static_photon_head_response`` is a static
+    object and this tip has no dynamic packed photon head, so a
+    finite-frequency role carries the ω = 0 Γ-cell completion FROZEN.  That is
+    stamped into ``approximation`` as ``frozen_static_head``: a consumer must
+    not read a finite-ω role as head-converged.
+    """
+    from common import collectives
+    role_quads = tuple(
+        (str(entry[0]), entry[1], bool(entry[2]),
+         str(entry[3]) if len(entry) > 3
+         else PHOTON_TT_CONTACT_STATIC_REFERENCE)
+        for entry in role_quads)
+    if not role_quads:
+        raise ValueError("compute_photon_response_roles: no roles requested.")
+    for _role, _quad, _ordered, _contact in role_quads:
+        if _contact not in PHOTON_TT_CONTACTS:
+            raise ValueError(
+                f"compute_photon_response_roles: role {_role!r} names an "
+                f"unknown TT contact {_contact!r}; want one of "
+                f"{PHOTON_TT_CONTACTS}")
+    if role_quads[0][0] != "static" and any(
+            entry[3] == PHOTON_TT_CONTACT_STATIC_REFERENCE
+            for entry in role_quads[1:]):
+        raise ValueError(
+            "GATE packed_static_reference_contact_needs_static_role: the "
+            "owner's TT contact convention subtracts the omega = 0 Gamma row "
+            "at every frequency, so the static role must be built FIRST to "
+            "supply it.\n"
+            f"  got:  first role = {role_quads[0][0]!r}\n"
+            "  want: a 'static' role at the head of the role list")
     (coupled_head, screen_current, hall, head_policy) = _resolve_static_photon_policy(
         config, screen_current, dyson_solver, W_charge, wfn, photon_g0_vectors,
         wf_binding_charge, wf_binding_transverse, wfn_fingerprint_binding, wfns_charge,
         wfns_transverse, meta, mesh_xy, print_fn)
-    (plans, sym, policy, nq, layout, V_packed) = _read_static_photon_body(
+    (plans, sym, policy, nq, layout, V_bare) = _read_static_photon_body(
         wfns_charge, wfns_transverse, meta, bispinor_v_q_path, mesh_xy, mu_bases)
     _report_static_photon_body(
         screen_current, current_contact, head_policy, layout, nq, print_fn)
-    (W_packed) = _screen_static_photon_body(
-        screen_current, wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
-        current_contact, energy_reference, V_packed, distrib_la_batched_route, W_charge,
-        sym, nq)
-    (V_packed, W_packed, head_completion) = _complete_static_photon_head(
-        coupled_head, V_packed, W_packed, wfns_charge, config, mesh_xy, wfn, meta, layout,
-        hall, wfn_fingerprint_binding, photon_g0_vectors, plans, print_fn)
+    if len(role_quads) > 1 and jax.process_index() == 0:
+        n_ranks = max(int(jax.process_count()), 1)
+        per_role = 16.0 * nq * int(layout.packed_extent) ** 2 / n_ranks
+        print_fn(
+            f"  [photon response] frequency axis: {len(role_quads)} roles "
+            f"({', '.join(role for role, _, _, _ in role_quads)}); each W is "
+            f"{per_role / 1e9:.4f} GB/rank, so every role but the last is "
+            "spilled to host RAM after its gate", flush=True)
 
-    if screen_current:
-        return StaticPhotonResponse(
-            layout=layout, V_packed=V_packed, W_packed=W_packed,
-            current_contact=current_contact,
+    responses: dict = {}
+    last = len(role_quads) - 1
+    static_contact: dict = {}
+    for index, (role, quad_role, ordered, tt_contact) in enumerate(role_quads):
+        if ordered and not screen_current:
+            raise ValueError(
+                "GATE packed_ordered_needs_current_blocks: the ordered "
+                "(time-reversal-odd) kernel only has a home in the SCREENED "
+                "current blocks; the bare-transverse family declares them "
+                "zero.\n  got:  ordered = true, screen_current = false\n"
+                "  want: bispinor_gw = full_static_cohsex")
+        # The omega = 0 role captures the diamagnetic Gamma row the owner's
+        # convention subtracts everywhere; later roles that ask for that
+        # convention consume it.  At omega = 0 the two readings ARE the same
+        # row, so the static role is built with the incumbent subtraction and
+        # is bit-unchanged.
+        reference = (static_contact
+                     if (index > 0
+                         and tt_contact == PHOTON_TT_CONTACT_STATIC_REFERENCE)
+                     else None)
+        W_packed, captured = _screen_static_photon_body(
+            screen_current, wfns_charge, wfns_transverse, quad_role, meta,
+            mesh_xy, layout, current_contact, energy_reference, V_bare,
+            distrib_la_batched_route, W_charge, sym, nq, ordered=ordered,
+            print_fn=print_fn, tt_contact_reference=reference,
+            capture_tt_contact=(index == 0 and screen_current))
+        if index == 0:
+            static_contact = captured
+        # The Gamma-cell completion is frequency-blind (its head response is a
+        # static object), so V comes back equal on every role; only W carries
+        # the role.  It DONATES the packed operand it is given
+        # (``photon_layout._q0_update_program``, donate_argnums=(0,)), so every
+        # role but the last hands it a duplicate and keeps the bare V alive for
+        # the next role's Dyson solve.
+        (V_packed, W_role, head_completion) = _complete_static_photon_head(
+            coupled_head,
+            V_bare if index == last else _duplicate_packed(V_bare, mesh_xy),
+            W_packed, wfns_charge, config, mesh_xy, wfn,
+            meta, layout, hall, wfn_fingerprint_binding, photon_g0_vectors,
+            plans, print_fn)
+        stamp = (
+            (("gamma_completed_no_pair_static_photon_v1" if coupled_head
+              else "DEBUG_headless_no_pair_static_photon_v1")
+             if screen_current else
+             ("gamma_completed_bare_transverse_photon_v1" if coupled_head
+              else "DEBUG_headless_bare_transverse_photon_v1"))
+            + ("_frozen_static_head" if (coupled_head and index > 0) else "")
+            + ("_ordered" if ordered else "")
+            + (f"_{tt_contact}" if (screen_current and index > 0) else ""))
+        responses[role] = StaticPhotonResponse(
+            layout=layout, V_packed=V_packed,
+            W_packed=(W_role if index == last
+                      else collectives.spill_to_host(W_role)),
+            current_contact=(current_contact if screen_current
+                             else STATIC_PHOTON_BARE_CURRENT_CONTACT),
             qgrid_policy=policy, family_plans=plans,
             head_completion=head_completion,
-            current_model=STATIC_PHOTON_NO_PAIR_MODEL,
-            approximation=(
-                "gamma_completed_no_pair_static_photon_v1"
-                if coupled_head
-                else "DEBUG_headless_no_pair_static_photon_v1"),
+            current_model=(STATIC_PHOTON_NO_PAIR_MODEL if screen_current
+                           else STATIC_PHOTON_BARE_CURRENT_MODEL),
+            approximation=stamp,
         )
-    return StaticPhotonResponse(
-        layout=layout, V_packed=V_packed, W_packed=W_packed,
-        current_contact=STATIC_PHOTON_BARE_CURRENT_CONTACT,
-        qgrid_policy=policy, family_plans=plans,
-        head_completion=head_completion,
-        current_model=STATIC_PHOTON_BARE_CURRENT_MODEL,
-        approximation=(
-            "gamma_completed_bare_transverse_photon_v1"
-            if coupled_head
-            else "DEBUG_headless_bare_transverse_photon_v1"),
-    )
+    for role, response in responses.items():
+        if isinstance(response.W_packed, collectives.HostSpill):
+            responses[role] = replace(
+                response,
+                W_packed=collectives.restore_from_host(response.W_packed))
+    return responses
+
+
+#: Lorentz channel names, in the packed order the layout uses.
+_PHOTON_CHANNEL_CLASS = ("CC", "CT", "TC", "TT")
+
+
+def photon_class_norms(operator, layout, mesh_xy):
+    """Frobenius norms of the four channel classes of one packed operator.
+
+    Whole-q reductions on the sharded blocks: no transpose, no gather, and
+    sixteen `vdot`s over an array that is already resident.  It is the cheapest
+    honest observable of the channel the packed route exists for — on the
+    bare-transverse family CT and TT are zero BY DECLARATION, so a number here
+    is the statement that they are not.
+    """
+    from .photon_layout import photon_block_view
+
+    totals = {name: 0.0 for name in _PHOTON_CHANNEL_CLASS}
+    for A in range(4):
+        for B in range(4):
+            block = photon_block_view(operator, layout, A, B, mesh_xy)
+            name = _PHOTON_CHANNEL_CLASS[(1 if A else 0) * 2 + (1 if B else 0)]
+            totals[name] += float(jnp.real(jnp.vdot(block, block)))
+    return {name: float(np.sqrt(value)) for name, value in totals.items()}
+
+
+def photon_class_norms_per_q(operator, layout, mesh_xy):
+    """``{class: (nq,) host array}`` of per-q Frobenius norms.
+
+    The q-resolved twin of :func:`photon_class_norms`.  It is what a q-shell
+    statement needs — the TT contact conventions differ by a q-INDEPENDENT
+    constant in chi, so their effect on W is a q-dependent thing that a single
+    whole-q norm cannot show — and it costs one reduction per block with no
+    gather of the operator itself.
+    """
+    from .photon_layout import photon_block_view
+    from common.collectives import gather_to_host
+
+    nq = int(operator.shape[0])
+    totals = {name: np.zeros(nq) for name in _PHOTON_CHANNEL_CLASS}
+    for A in range(4):
+        for B in range(4):
+            block = photon_block_view(operator, layout, A, B, mesh_xy)
+            value = gather_to_host(
+                jnp.sum(jnp.abs(block) ** 2, axis=(1, 2)))
+            name = _PHOTON_CHANNEL_CLASS[(1 if A else 0) * 2 + (1 if B else 0)]
+            totals[name] = totals[name] + np.asarray(value, dtype=np.float64)
+    return {name: np.sqrt(value) for name, value in totals.items()}
+
+
+def _format_class_norms(label, norms):
+    reference = norms["CC"]
+    ratios = ("" if reference <= 0.0 else "  " + " ".join(
+        f"{name}/CC={norms[name] / reference:.4e}"
+        for name in ("CT", "TC", "TT")))
+    return (f"  [photon response] {label} by channel class: "
+            + " ".join(f"{name}={norms[name]:.6e}"
+                       for name in _PHOTON_CHANNEL_CLASS) + ratios)
+
+
+def photon_role_block_report(responses, mesh_xy, *, print_fn=print,
+                             dump_path=None, dump_q=(0,)):
+    """Report the four channel classes of ``W^c = W − V``, role by role.
+
+    DIAGNOSTIC ONLY.  It reads operators the roles already built, changes
+    nothing, and is what makes the CT channel observable: on the
+    bare-transverse family CT is zero by declaration, so a number here is the
+    first evidence that it is not.
+
+    The per-class Frobenius norms are whole-q reductions on the sharded
+    blocks — no transpose, no gather.  ``dump_path`` additionally gathers the
+    named q slices of ``W^c`` to the host so the Cauchy–Schwarz / positivity
+    gate can act on them off line: that gate needs the whole packed matrix at
+    one q, split at ``n_C``, which a norm cannot supply.
+    """
+    from .photon_layout import photon_block_view
+    from common.collectives import gather_to_host
+
+    table = {}
+    dumps = {}
+    for role, response in responses.items():
+        W_c = response.W_packed - response.V_packed
+        table[role] = photon_class_norms(W_c, response.layout, mesh_xy)
+        per_q = photon_class_norms_per_q(W_c, response.layout, mesh_xy)
+        for name, value in per_q.items():
+            dumps[f"perq_{role}_{name}"] = value
+        if dump_path is not None:
+            # Dump BLOCK VIEWS, never the raw packed matrix.  The packed
+            # layout is device-interleaved — each shard holds its slice of
+            # every channel consecutively, so a gathered (N, N) array is
+            # P·M·Pᵀ for a permutation P, and slicing it at n_C reads four
+            # channels' rows mixed together.  ``photon_block_view`` is the
+            # only conversion, and the consumer reassembles from the sixteen
+            # named blocks.
+            for q in dump_q:
+                for A in range(4):
+                    for B in range(4):
+                        block = photon_block_view(
+                            W_c, response.layout, A, B, mesh_xy)
+                        dumps[f"{role}_q{int(q)}_{A}{B}"] = gather_to_host(
+                            block[int(q)])
+        del W_c
+    if jax.process_index() == 0:
+        reference = max(
+            (row["CC"] for row in table.values() if row["CC"] > 0.0),
+            default=0.0)
+        print_fn("  [photon roles] |W - V| by channel class "
+                 "(Frobenius over all q; ratios to this run's CC):",
+                 flush=True)
+        for role, row in table.items():
+            ratios = ("" if reference <= 0.0 else "  ratios " + " ".join(
+                f"{name}/CC={row[name] / reference:.4e}"
+                for name in ("CT", "TC", "TT")))
+            print_fn(
+                f"    role={role:<10s} "
+                + " ".join(f"{name}={row[name]:.6e}"
+                           for name in _PHOTON_CHANNEL_CLASS)
+                + ratios, flush=True)
+        if dump_path is not None and dumps:
+            np.savez(dump_path, **dumps)
+            # A sidecar the run record cannot swallow.  ``print_fn`` here is
+            # the driver's legacy sink, which drops component chatter unless
+            # LORRAX_DEBUG_PRINT is set; these norms are the measurement, so
+            # they are written where a later reader will find them.
+            with open(str(dump_path) + ".txt", "w") as handle:
+                handle.write("# |W - V| by channel class, Frobenius over "
+                             "all q, per role\n")
+                for role, row in table.items():
+                    handle.write(
+                        f"{role}\t" + "\t".join(
+                            f"{name}={row[name]:.10e}"
+                            for name in _PHOTON_CHANNEL_CLASS) + "\n")
+            print_fn(f"  [photon roles] wrote {dump_path} "
+                     f"({len(dumps)} arrays) and its .txt sidecar", flush=True)
+    return table
 
 
 def _chi0_multi_kernel_args(wfns, tau, alpha_rows, energy_reference):
