@@ -45,11 +45,27 @@ def main():
                 for layout in ('face', 'axis'):
                     for axis in ('x','y'):
                         plan = band_projection_plan(mesh,m=m,k=k,n=n,nq=nq,
-                            dtype=dtype,layout=layout,reduction_axis=axis,panel_columns=limit)
+                            dtype=dtype,layout=layout,reduction_axis=axis,panel_columns=limit,algorithm="panels")
                         result = plan(put(a,plan.in_sharding_a),put(b,plan.in_sharding_b))
                         error = max(float(np.max(np.abs(np.asarray(s.data)-ref[s.index]))) for s in result.addressable_shards)
                         assert error < 2e-12, (layout,axis,error)
                         rows.append(dict(reverse=reverse,dtype=np.dtype(dtype).name,n=n,panel_limit=limit,layout=layout,axis=axis,error=error))
+    # Auto selection uses the measured narrow-output regime on CUDA.
+    # Explicit panels remain available when the scratch bound is preferred.
+    from distrib_la import BandProjectionPlan
+    narrow = band_projection_plan(mesh0,m=16*p,k=16*p,n=2*p,nq=1,dtype=np.complex128)
+    assert isinstance(narrow, BandProjectionPlan)
+    wide = band_projection_plan(mesh0,m=16*p,k=16*p,n=4*p,nq=1,dtype=np.complex128)
+    if jax.default_backend() == 'gpu' and 'NVIDIA' in jax.devices()[0].device_kind:
+        assert not isinstance(wide, BandProjectionPlan)
+    else:
+        assert isinstance(wide, BandProjectionPlan)
+    try:
+        band_projection_plan(mesh0,m=p,k=p,n=p,nq=1,dtype=np.complex128,algorithm='invalid')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('invalid algorithm accepted')
     # Static two-sided operator projection with distinct left/right endpoints.
     from common.contract_bands import _face_project_kernel
     nq, nb, ns, ml, mr = 2, 3*p, 2, 5*p, 7*p

@@ -17,9 +17,10 @@ as a rank-local shard between the two collectives.
 That is the ``layout="legacy"`` (default) body, byte-identical to the
 code this module shipped before ``low_mem_bands`` existed.
 ``layout="face"`` (the two-face carrier, ``gw.wavefunction_bundle``)
-uses two ``distrib_la.band_projection_plan`` products. Each keeps its left
-operand distributed in place and exchanges small output-band panels of its
-right operand before a local product and reduce-scatter. The panels include
+uses two ``distrib_la.band_projection_plan`` products. For narrow outputs,
+each keeps its left operand distributed in place and exchanges small band
+panels before a local product and reduce-scatter. Wide CUDA outputs retain
+the vendor product. The panels include
 all parent k points. See :func:`_face_project_kernel` and the distrib_la
 service documentation for the memory bound. ``channels="split_reim"``
 projects the real and imaginary operator channels separately.
@@ -301,8 +302,9 @@ def _face_project_kernel(
 ):
     """Project a distributed operator with two planned band products.
 
-    Face layout exchanges small band panels while keeping the left operand
-    stationary; axis layout uses the existing local products and reductions.
+    Narrow face products exchange small band panels while keeping the left
+    operand stationary; wide CUDA products retain the vendor route. Axis
+    layout uses the existing local products and reductions.
 
         T[s,μ,n]     = Σ_{s',ν} O[s,μ,s',ν] · psi_mun[s',ν,n]      (GEMM 1)
         Σ[m,n]       = Σ_{s,μ}  conj(psi_nmu)[m,s,μ] · T[s,μ,n]    (GEMM 2)
@@ -460,8 +462,8 @@ def contract_bands_block_reshard(
         ``low_mem_bands`` existed.
         ``"face"``: the two-face carrier's ``psi_nmu``/``psi_mun``
         operands (``gw.wavefunction_bundle``), with both axes distributed
-        from the start. Two planned band products exchange small panels
-        rather than the centroid operator; see :func:`_face_project_kernel`.
+        from the start. Planned band products select small-panel or vendor
+        execution in the service; see :func:`_face_project_kernel`.
         Requires ``face_shape``; ``channels`` may be ``"none"`` or
         ``"split_reim"`` (2026-08-22 — the dynamic PPM/MPA Σ_c(τ)
         two-channel plan, ported: see :func:`_face_project_kernel`).

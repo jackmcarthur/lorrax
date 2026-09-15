@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from distrib_la._shard_map import shard_map
+from distrib_la.resolve import mesh_platform
 from distrib_la.matmul_plan import (
     _as_extent, _axis_matmul, _check_operand, _mesh_shape, _validate_dtype,
     gemm_plan,
@@ -39,8 +40,17 @@ class BandProjectionPlan:
 
 
 def band_projection_plan(mesh, *, m, k, n, nq, dtype,
-                         layout='face', reduction_axis='y', panel_columns=64):
+                         layout='face', reduction_axis='y', panel_columns=64,
+                         algorithm='auto'):
     """Plan a band projection for distributed or replicated band carriers.
+
+    ``algorithm="auto"`` uses panels on CUDA only when N <= K/8,
+    otherwise retaining the existing vendor product. This conservative
+    aspect-ratio rule avoids measured wide-band regressions; it is not a
+    universal performance model. Non-CUDA face products retain JAX panels.
+    ``algorithm="panels"`` explicitly requests the bounded scratch contract;
+    ``algorithm="gemm"`` explicitly requests the existing GEMM provider.
+    ``panel_columns`` bounds scratch only for the panel algorithm.
 
     ``reduction_axis`` controls axis-layout placement only. Face layout
     always reduces its K_Y partial products over Y on a square mesh.
@@ -55,6 +65,8 @@ def band_projection_plan(mesh, *, m, k, n, nq, dtype,
     as M*K. Tail chunks overlap rather than pad or multiply unused zeros;
     beta accumulation is intentionally absent so repeated writes are safe.
     """
+    if algorithm not in ('auto', 'panels', 'gemm'):
+        raise ValueError('band projection algorithm must be auto, panels or gemm')
     if layout == 'axis':
         return gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
                          layout=layout, reduction_axis=reduction_axis)
@@ -67,6 +79,10 @@ def band_projection_plan(mesh, *, m, k, n, nq, dtype,
     px, py = _mesh_shape(mesh)
     if px != py or any(size % px for size in (m, k, n)):
         raise ValueError('band projection faces require a square mesh and divisible extents')
+    if algorithm == 'gemm' or (
+            algorithm == 'auto' and 8 * n > k and mesh_platform(mesh) == 'CUDA'):
+        return gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
+                         layout='face', warmup=False)
     spec = P(None, 'x', 'y')
     sharding = NamedSharding(mesh, spec)
     nlocal = n // py

@@ -1194,12 +1194,21 @@ not change its GEMM backend or replicate any additional matrix dimension.
 ## Band projection with small communication panels
 
 `band_projection_plan(mesh, *, m, k, n, nq, dtype, layout="face",
-reduction_axis="y", panel_columns=64)` returns a trace-safe callable `plan(A, B)`
+reduction_axis="y", panel_columns=64, algorithm="auto")` returns a trace-safe callable `plan(A, B)`
 for `A @ B`. Unlike the general GEMM interface it has no accumulation, active
 interval, or output-alias argument. Inputs must already have the declared
 shape, dtype and sharding; the service does not redistribute large inputs.
 
-On a square p×p face mesh, A has shape `(nq, M_X, K_Y)` and B has shape
+Automatic selection uses JAX panels on CUDA when `N <= K/8` and the existing
+vendor GEMM otherwise. The cutoff conservatively retains only the measured
+narrow-output regime: Run422 found 64-column panels slower for wide output
+spaces on P4. It is not a universal crossover prediction. Non-CUDA face
+products retain the JAX implementation. `algorithm="panels"` explicitly
+requests the panel memory bound, including for wide outputs;
+`algorithm="gemm"` requests the existing vendor plan and its memory footprint.
+This choice is resolved once when constructing the plan, outside the hot loop.
+
+For the panel algorithm, on a square p×p face mesh, A has shape `(nq, M_X, K_Y)` and B has shape
 `(nq, K_X, N_Y)`. Each loop iteration slices a band panel of B, exchanges it
 across the transpose of the logical rank grid, gathers columns over X,
 multiplies by the stationary A shard, and reduce-scatters over Y. All nq
@@ -1226,4 +1235,5 @@ panel tails, physical mesh permutation, both dtypes/layouts and rectangular
 left/right endpoints. Performance depends on output-band width and network:
 the small-panel memory bound deliberately trades more iterations for lower
 communication storage. P4 Si full-driver timing is recorded in sandbox
-Run421; it is not a universal large-system speedup guarantee.
+Run421; P4/P16 synthetic scaling and the wide-band counterexample are in
+Run422. Neither establishes a universal large-system speedup guarantee.

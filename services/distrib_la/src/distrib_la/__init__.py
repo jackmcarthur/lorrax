@@ -63,9 +63,10 @@ layout='face', enable_active_range=False) -> GemmPlan``
     uses local cuBLAS pointer views on CUDA and bounded JAX dot panels on CPU.
     See ``docs/dev/active_gemm_ranges.md``.
 ``band_projection_plan(mesh, *, m, k, n, nq, dtype, layout="face",
-panel_columns=64)``
-    Plan A@B with bounded output-band panels. The face layout keeps A
-    stationary; axis layout retains the existing local product.
+panel_columns=64, algorithm="auto")``
+    Plan A@B using bounded output-band panels for narrow outputs, retaining
+    the CUDA vendor route for wide outputs. Explicit panels preserve the
+    scratch bound; axis layout retains the existing local product.
 ``factor(op, A, mesh, ...) -> FactorToken`` / ``solve(token, B)``
     Factor once, back-solve many.  The token is opaque and carries the
     handle (scalapack's ``ipiv``, cuSOLVERMp's raw buffer, SLATE's
