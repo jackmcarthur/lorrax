@@ -19,7 +19,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 
-def response_algebra(meta, config, *, mesh_xy, n):
+def response_algebra(meta, config, *, mesh_xy, n, ordered=False):
     """Plan physical Dyson samples and exact high-frequency moments.
 
     Parameters
@@ -83,6 +83,25 @@ def response_algebra(meta, config, *, mesh_xy, n):
         return (0.5 * congruence(h, b0),
                 0.5 * congruence(h, b1 + mm(b0, b0)))
 
+    if ordered:
+        @partial(jax.jit, in_shardings=(face, face, face, face, face),
+                 out_shardings=(face, face, face, face))
+        def moments(h, a0, a1, o0, o1):
+            # chi_scaled = o0/z + a0/z^2 + o1/z^3 + a1/z^4 with no time-
+            # reversal or reality assumption; X_k = H chi_k H and
+            # Wc = H X (I-X)^-1 H. Coefficients C1..C4 of 1/z..1/z^4 keep
+            # every X1 cross term (o0 vanishes only in a complete basis).
+            # Returns m0=C1, M1=C2/2, m2=C3, M3=C4/2; with o0=o1=0 the
+            # even pair reduces to the incumbent M1/M3 exactly.
+            x1, x2, x3, x4 = (congruence(h, v) for v in (o0, a0, o1, a1))
+            x11 = mm(x1, x1)
+            c2 = x2 + x11
+            c3 = x3 + mm(x1, x2) + mm(x2, x1) + mm(x11, x1)
+            c4 = (x4 + mm(x1, x3) + mm(x3, x1) + mm(x2, x2) + mm(x11, x2)
+                  + mm(mm(x1, x2), x1) + mm(x2, x11) + mm(x11, x11))
+            return (congruence(h, x1), 0.5 * congruence(h, c2),
+                    congruence(h, c3), 0.5 * congruence(h, c4))
+
     return samples, moments, {
         "linalg": resolution.layout,
         "solve": lu.describe(),
@@ -143,10 +162,12 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     """
     from .w_isdf import _get_chi_fractional_contour_kernel_face
 
-    if wfns.layout != "face" or int(meta.nspinor) != 1:
-        raise ValueError("GATE response_representation: got non-scalar or legacy "
-                         "wavefunctions; want scalar face carrier; why: bank "
-                         "requires explicit endpoint shardings")
+    from file_io.shared_pole_store import charge_representation
+
+    if wfns.layout != "face" or not charge_representation(meta):
+        raise ValueError("GATE response_representation: got bispinor or legacy "
+                         "wavefunctions; want scalar or two-component charge face "
+                         "carrier; why: bank requires explicit endpoint shardings")
     carrier = wfns.green_parent
     source = wfns if carrier is None else carrier
     parent = None if carrier is None else carrier.plan
@@ -170,7 +191,7 @@ def stream_weights(wfns, weights, mesh_xy):
     return result
 
 
-def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute):
+def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False):
     """Compute A0/A1 of scaled chi=A0/s+A1/s² by six correlations.
 
     The binomial coefficients expand ``(E_u-E_f)`` and its cube. Imaginary
@@ -201,16 +222,79 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute):
             total = term if total is None else total + term
             total.block_until_ready()
         totals.append(total)
+    if not ordered:
+        return (*totals, census)
+    # Odd coefficients of 1/z and 1/z^3: sum (P - conj P_{-q}) Delta^m, m=0,2.
+    # Real particle weights keep the retarded difference -i(X - conj X), so
+    # the chi coefficient is i*raw. Four more correlations, same kernel.
+    for moment_terms in (((1., 0, 0),), ((1., 2, 0), (-2., 1, 1), (1., 0, 2))):
+        total = None
+        for coefficient, a, b in moment_terms:
+            weight_f = stream_weights(wfns, f * erel**a, mesh_xy)
+            weight_u = stream_weights(wfns, u * erel**b, mesh_xy)
+            args = (jnp.asarray([0.]), jnp.asarray([[1. + 0j]]), *fixed,
+                    weight_f.astype(jnp.complex128), weight_u.astype(jnp.complex128),
+                    jnp.asarray(reference))
+            raw = execute(kernel, args, "moment_correlation")[:, 0]
+            term = (1j * _w_solve_pref_scalar(meta) * coefficient) * raw
+            total = term if total is None else total + term
+            total.block_until_ready()
+        totals.append(total)
     return (*totals, census)
+
+
+@jax.jit
+def _odd_moment_ratios(m0, m1, m2, m3):
+    return jnp.stack([jnp.linalg.norm(m0) / jnp.linalg.norm(m1),
+                      jnp.linalg.norm(m2) / jnp.linalg.norm(m3)])
+
+
+def _odd_moment_writer(meta, bank_io, mesh_xy, nq):
+    """Open ``moments_odd.h5`` beside bank.h5; canonical order like the bank."""
+    from file_io.slab_io import SlabIO
+    basis = meta.mu_basis
+    unpack = jax.jit(lambda v: basis.unpack_operator(v, spec=P(None, "x", "y")))
+    shape = (1, basis.n_packed, basis.n_packed)
+    abstract = jax.ShapeDtypeStruct(shape, jnp.complex128,
+                                   sharding=NamedSharding(mesh_xy, P(None, "x", "y")))
+    stats = unpack.lower(abstract).compile().memory_analysis()
+    _reserve(meta, "odd_moment_staging", stats.argument_size_in_bytes,
+             stats.output_size_in_bytes + stats.temp_size_in_bytes)
+    io = SlabIO(str(Path(bank_io["path"]).with_name("moments_odd.h5")), mode="w", mesh=mesh_xy)
+    io.__enter__()
+    return io, unpack, nq
+
+
+def _write_odd_moments(writer, meta, iq, m0, m1, m2, m3, receipt):
+    """Write m0 (1/z) and m2 (1/z^3) for one parent; record the truncation ratio."""
+    io, unpack, nq = writer
+    basis = meta.mu_basis
+    for name, value in (("m0", m0), ("m2", m2)):
+        canonical = unpack(value)
+        canonical.block_until_ready()
+        io.write_slab(name, canonical, offset=(iq, 0, 0),
+                      global_shape=(nq, basis.n_canonical, basis.n_canonical),
+                      valid_shape=(1, basis.n_logical, basis.n_logical))
+        io.sync_writes()
+        del canonical
+    ratios = np.asarray(_odd_moment_ratios(m0, m1, m2, m3), dtype=np.float64)
+    row = dict(q_parent=int(iq), m0_over_M1_fro=float(ratios[0]),
+               m2_over_M3_fro=float(ratios[1]))
+    receipt.setdefault("odd_moments", []).append(row)
+    if jax.process_index() == 0:
+        print("TRBANK odd_moments " + " ".join(f"{k}={row[k]}" for k in row), flush=True)
 
 
 def _bank_context(wfns, meta, sym, bank_io, mesh_xy):
     """Authenticate A/B's existing scratch transaction and physical state."""
-    from file_io.shared_pole_store import validate_shared_pole_bank
+    from file_io.shared_pole_store import (charge_representation,
+                                           validate_shared_pole_bank)
 
-    if int(meta.nspinor) != 1 or not bool(sym.trs_allowed):
-        raise ValueError("GATE response_representation: want scalar and "
-                         "authenticated TRS; odd/open-spin bank is unsupported")
+    # The measured time-reversal verdict selects the orientation (callers
+    # read sym.trs_allowed); only the operator representation refuses here.
+    if not charge_representation(meta):
+        raise ValueError("GATE response_representation: want scalar or "
+                         "two-component charge operator; bispinor bank is unsupported")
     header = validate_shared_pole_bank(bank_io["path"],
         expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
     qids = np.asarray(sym.q_irr_full_idx, dtype=np.int64)
@@ -530,6 +614,10 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
     from file_io.shared_pole_store import write_shared_pole_bank
     header, qids, census = _bank_context(wfns, meta, sym, bank_io, mesh_xy)
     receipt = _receipt("moments", census, bank_io)
+    if not bool(sym.trs_allowed):
+        # M1/M3 are the 1/s and 1/s^2 coefficients; the odd channel starts at
+        # 1/z^3, so the same six correlations stay exact on an ordered bank.
+        receipt["ordered"] = True
     execute = _bank_execution(meta, mesh_xy, bank_io, receipt, config)
     ledger = meta.shared_pole_capacity
     ambient = ledger.live_stages
@@ -537,16 +625,23 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
     _stream_comparison(wfns, meta, mesh_xy, qids, receipt)
     face_bytes = 16*meta.mu_basis.n_packed**2 // mesh_xy.size
     # Two totals, next correlation, arithmetic temporaries and bounded H/solve.
+    ordered = not bool(sym.trs_allowed)
     _, moments, receipt["algebra"] = response_algebra(meta, config,
-        mesh_xy=mesh_xy, n=meta.mu_basis.n_packed)
-    qwidth = max(1,min(len(qids),int((.75*ledger.U_bytes_per_rank/face_bytes-16)/8)))
+        mesh_xy=mesh_xy, n=meta.mu_basis.n_packed, **({"ordered": True} if ordered else {}))
+    per_q = 12 if ordered else 8
+    qwidth = max(1,min(len(qids),int((.75*ledger.U_bytes_per_rank/face_bytes-16)/per_q)))
+    odd_writer = _odd_moment_writer(meta, bank_io, mesh_xy, len(qids)) if ordered else None
     for q0 in range(0,len(qids),qwidth):
         q1 = min(q0+qwidth,len(qids))
         ledger.live_stages = ambient
-        name,_ = _reserve(meta,"bank_outputs_moments",(8*(q1-q0)+16)*face_bytes)
+        name,_ = _reserve(meta,"bank_outputs_moments",(per_q*(q1-q0)+16)*face_bytes)
         ledger.live_stages = ambient+(name,)
         if not np.asarray(header["moment_written"])[q0:q1].all():
-            a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
+            if ordered:
+                a0, a1, o0, o1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
+                    q_ids=tuple(qids[q0:q1]), execute=execute, ordered=True)
+            else:
+                a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
                                           q_ids=tuple(qids[q0:q1]), execute=execute)
             for iq in range(q0,q1):
                 marked = header["moment_written"][iq]
@@ -555,7 +650,13 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
                 span = (iq,iq+1)
                 h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, span, execute)
                 del hi
-                m1, m3 = execute(moments, (h,a0[iq-q0:iq-q0+1],a1[iq-q0:iq-q0+1]), "moment_dyson")
+                if ordered:
+                    part = slice(iq-q0, iq-q0+1)
+                    m0, m1, m2, m3 = execute(moments, (h,a0[part],a1[part],o0[part],o1[part]), "moment_dyson")
+                    _write_odd_moments(odd_writer, meta, iq, m0, m1, m2, m3, receipt)
+                    del m0, m2
+                else:
+                    m1, m3 = execute(moments, (h,a0[iq-q0:iq-q0+1],a1[iq-q0:iq-q0+1]), "moment_dyson")
                 io_started = time.monotonic()
                 header = write_shared_pole_bank(bank_io["path"], q_span=span,
                     M1=None if marked[0] else m1, M3=None if marked[1] else m3,
@@ -564,10 +665,90 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
                 receipt["batches"].append(dict(q_span=span,support_ranks=ranks))
                 del h,m1,m3
             del a0,a1
-            receipt["correlation_count"] += 6
+            receipt["correlation_count"] += 10 if ordered else 6
     ledger.live_stages = ambient
+    if odd_writer is not None:
+        odd_writer[0].__exit__(None, None, None)
+        receipt["odd_moments_file"] = str(Path(bank_io["path"]).with_name("moments_odd.h5"))
     receipt["completion"] = bool(np.asarray(header["moment_written"]).all())
     return _finish_receipt(receipt,meta,header,started)
+
+
+def _self_negative(q_full, meta):
+    """True where q = -q on the canonical C-ordered full grid (a TRIM parent)."""
+    grid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    return all((2*int(i)) % n == 0 for i, n in zip(np.unravel_index(q_full, grid), grid))
+
+
+@jax.jit
+def _census_scalars(chi, w, w_even):
+    def mx(a):
+        return jnp.max(jnp.abs(a))
+    sym = 0.5*(chi + chi.T)
+    odd = 0.5*(chi - chi.T)
+    return jnp.stack([mx(odd)/mx(sym),
+                      jnp.linalg.norm(odd)/jnp.linalg.norm(sym),
+                      mx(chi - chi.conj().T)/mx(chi),
+                      mx(w - w.conj().T)/mx(w),
+                      mx(w_even - w_even.conj().T)/mx(w_even),
+                      mx(w - w.T)/mx(w)])
+
+
+def _tr_odd_census(receipt, samples, h, chi, dchi, value, z, q_full):
+    """Measure the time-reversal-odd channel of an ordered bank at q = -q.
+
+    At a self-negative q an imaginary-axis chi0 is real, and its transpose-
+    antisymmetric part is the odd channel. Records that part against the
+    symmetric part (max and Frobenius), the Hermiticity of the ordered
+    W = V + Wc, of the even-route W from the symmetric part through the same
+    Coulomb root and Dyson algebra, and max|W - W^T|/max|W|. Scalars only;
+    every rank computes, rank 0 prints one line per sample.
+    """
+    imaginary = np.flatnonzero(np.real(np.asarray(z)) == 0.0)
+    if not imaginary.size:
+        return
+    v = (h @ h)[0]
+    names = ("chi_odd_max_rel", "chi_odd_fro_rel", "chi_hermiticity_rel",
+             "w_hermiticity_rel", "w_even_route_hermiticity_rel", "w_transpose_rel")
+    # The Dyson owner requires face-sharded [1,n,n] operands.
+    symmetric = jax.jit(lambda c, dc: (0.5*(c + jnp.swapaxes(c, -1, -2)),
+                                       0.5*(dc + jnp.swapaxes(dc, -1, -2))),
+                        out_shardings=(h.sharding, h.sharding))
+    for s in imaginary.tolist():
+        sym, dsym = symmetric(chi[s:s+1], dchi[s:s+1])
+        w_even = v + samples(h, sym, dsym)[0][0]
+        values = np.asarray(_census_scalars(chi[s], v + value[s], w_even), dtype=np.float64)
+        row = dict(q_full=q_full, z_ry=[float(z[s].real), float(z[s].imag)],
+                   **{k: float(x) for k, x in zip(names, values)})
+        receipt.setdefault("tr_odd_census", []).append(row)
+        if jax.process_index() == 0:
+            print("TRBANK tr_odd_census " + " ".join(f"{k}={row[k]}" for k in row), flush=True)
+
+
+def _ordered_cost_probe(wfns, meta, mesh_xy, qid, tau, projections, lw, uw, refs, n_out):
+    """Warm seconds per remote Laplace node, even versus ordered kernel.
+
+    Same deck, geometry, q parent, band weights and first nodes; each kernel
+    runs once to compile and once timed. The difference is the ordered
+    per-node work (one more chi FFT, q gather and accumulation); node counts
+    come from the rule certificate. Receipt-only; nothing is written.
+    """
+    nodes = min(4, len(tau))
+    seconds = {}
+    for mode, rows in (("laplace", projections[:n_out]), ("laplace_ordered", projections)):
+        kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=(qid,),
+                                        n_outputs=n_out, pair_mode=mode)
+        args = (jnp.asarray(tau[:nodes]), jnp.asarray(rows[:, :nodes]), *fixed,
+                lw, uw, jnp.asarray(refs))
+        jax.block_until_ready(kernel(*args))
+        timing.fence('bank.ordered_cost_probe', sync_ranks=True)
+        started = time.monotonic()
+        jax.block_until_ready(kernel(*args))
+        seconds[mode] = (time.monotonic() - started)/nodes
+    return dict(q_full=qid, nodes=nodes, seconds_per_node_even=seconds["laplace"],
+                seconds_per_node_ordered=seconds["laplace_ordered"],
+                ratio=seconds["laplace_ordered"]/seconds["laplace"],
+                scope="warm rank-0 wall seconds per remote Laplace node, one q parent, after a synchronized fence")
 
 
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io):
@@ -579,6 +760,12 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         authenticate_sample_plan(sample_plan,header)
         z = bank_points(sample_plan)
         receipt = _receipt("samples",census,bank_io)
+        # Time reversal measured broken: both particle-hole orientations keep
+        # independent weights. The retarded stream already forms the partner as
+        # conj in R space (the -q orientation); remote cells add the odd kernel.
+        ordered = not bool(sym.trs_allowed)
+        if ordered:
+            receipt["ordered"] = True
         started = time.monotonic()
         execute = _bank_execution(meta,mesh_xy,bank_io,receipt,config)
         ledger = meta.shared_pole_capacity
@@ -619,12 +806,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             rr = laplace_rule(cell["delta_min_ry"],cell["delta_max_ry"],z,
                 rel_tol=sample_plan["bank_rule_tolerance"],
                 previous=None if session is None else session.get(key),
-                domain_pad_ry=pad)
+                domain_pad_ry=pad,**({"ordered": True} if ordered else {}))
             if session is not None:
                 session[key] = rr
             remote.append((cell,rr))
         receipt["laplace_cells"] = [{**cell,**{k:v for k,v in rr.items()
-            if k not in ("t","projection_value","projection_derivative","coefficient_rows")}}
+            if k not in ("t","projection_value","projection_derivative","coefficient_rows",
+                         "odd_projection_value","odd_projection_derivative")}}
             for cell,rr in remote]
     timing.fence('bank.capacity_planning_compile', sync_ranks=True)
     with timing.section('bank.capacity_planning_compile'):
@@ -708,7 +896,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             # equal-shaped Laplace cells instead of retracing each closure.
             if remote:
                 lk,lfixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,pair_mode="laplace",bank_carry=True)
+                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,
+                    pair_mode="laplace_ordered" if ordered else "laplace",bank_carry=True)
             for cell,rr in remote:
                 timing.fence('bank.laplace_arguments', sync_ranks=True)
                 with timing.section('bank.laplace_arguments'):
@@ -716,11 +905,18 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     refs = np.asarray(cell["references_ry"])
                     tau = np.asarray(rr["t"])
                     projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]
+                    if ordered:
+                        # Rows [even value, even ds, odd value, odd ds].
+                        projections = np.vstack((projections,
+                            -np.vstack((rr["odd_projection_value"][lo:hi],rr["odd_projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]))
                     lw = np.stack([ft*masks[lower],ut*masks[lower]])
                     uw = np.stack([ut*masks[upper],ft*masks[upper]])
                     # Parent selection applies to the k axis, separately for each role.
                     lw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in lw])
                     uw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in uw])
+                if ordered and "ordered_cost_probe" not in receipt:
+                    receipt["ordered_cost_probe"] = _ordered_cost_probe(
+                        wfns,meta,mesh_xy,int(qids[q0]),tau,projections,lw,uw,refs,2*a)
                 raw = execute(lk,(jnp.asarray(tau),jnp.asarray(projections),
                     *lfixed,lw,uw,jnp.asarray(refs),raw),"laplace")
                 del lw,uw
@@ -744,6 +940,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     dchi = raw[a+ia-lo:a+stop-lo,iq-q0]
                     hbatch = jnp.broadcast_to(h,chi.shape)
                     value,ds = execute(samples,(hbatch,chi,dchi),"sample_dyson")
+                    if ordered and _self_negative(int(qids[iq]),meta):
+                        _tr_odd_census(receipt,samples,h,chi,dchi,value,z[ia:stop],int(qids[iq]))
                     value = None if marked[0] else value[None]
                     ds = None if marked[1] else ds[None]
                     timing.fence('bank.write', sync_ranks=True)

@@ -309,11 +309,24 @@ def test_weight_refusal(weights):
                                state_capacity=2.,kweights=weights)
 
 
-@pytest.mark.parametrize('spin,trs',[(2,True),(2,False)])
-def test_representation_refusal(spin,trs):
-    c,w,m=fixture();m.nspinor=spin
+@pytest.mark.parametrize('nspinor,wfn_nspinor,nspin',[(4,2,1),(2,1,1),(1,1,2)])
+def test_representation_refusal(nspinor,wfn_nspinor,nspin):
+    # Bispinor lift, a two-component operator without a two-component
+    # source, and collinear spin all stay refused.
+    c,w,m=fixture();m.nspinor=nspinor;m.nspinor_wfnfile=wfn_nspinor;m.nspin=nspin
     with pytest.raises(ValueError,match='GATE shared_pole_representation'):
-        bind_shared_pole_census(w,m,occupation_state=None,trs_allowed=trs,
+        bind_shared_pole_census(w,m,occupation_state=None,trs_allowed=True,
+                               state_capacity=2.,kweights=[.5,.5])
+
+
+def test_two_component_time_reversal_broken_census_binds():
+    # A measured break is recorded, not refused: the bank becomes ordered.
+    c,w,m=fixture();m.nspinor=2;m.nspinor_wfnfile=2
+    bind_shared_pole_census(w,m,occupation_state=None,trs_allowed=False,
+                           state_capacity=1.,kweights=[.5,.5])
+    assert m.shared_pole_census['trs_allowed'] is False
+    with pytest.raises(ValueError,match='GATE shared_pole_census'):
+        bind_shared_pole_census(w,m,occupation_state=None,trs_allowed=False,
                                state_capacity=2.,kweights=[.5,.5])
 
 

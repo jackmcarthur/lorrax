@@ -920,11 +920,11 @@ def _get_chi_fractional_contour_kernel_face(
         PSI_NMU_SPEC,
     )
 
-    if pair_mode not in ("retarded", "laplace"):
-        raise ValueError("pair_mode must be retarded or laplace")
+    if pair_mode not in ("retarded", "laplace", "laplace_ordered"):
+        raise ValueError("pair_mode must be retarded, laplace or laplace_ordered")
     if bank_carry and selected_q is None:
         raise ValueError("bank carry requires selected q rows")
-    if pair_mode == "laplace" and selected_q is None:
+    if pair_mode != "retarded" and selected_q is None:
         raise ValueError("Laplace bank correlations require selected_q")
     if selected_q is not None:
         from .contour_accumulator import contour_accumulator
@@ -1091,12 +1091,27 @@ def _get_chi_fractional_contour_kernel_face(
                 upper_u = green(occ_u[0], time, energy_reference[1])
                 lower_u = green(occ_f[1], -time, energy_reference[0])
                 upper_f = green(occ_u[1], time, energy_reference[1])
-                A_R = jax.lax.with_sharding_constraint(
-                    jnp.einsum("Rambn,Rambn->Rmn", upper_u,
-                               jnp.conj(lower_f), optimize=True)
-                    - jnp.einsum("Rambn,Rambn->Rmn", upper_f,
-                                 jnp.conj(lower_u), optimize=True),
-                    chi_R_shard)
+                if pair_mode == "laplace":
+                    A_R = jax.lax.with_sharding_constraint(
+                        jnp.einsum("Rambn,Rambn->Rmn", upper_u,
+                                   jnp.conj(lower_f), optimize=True)
+                        - jnp.einsum("Rambn,Rambn->Rmn", upper_f,
+                                     jnp.conj(lower_u), optimize=True),
+                        chi_R_shard)
+                else:
+                    # Ordered remote cell.  forward = f_lower u_upper and
+                    # reverse = f_upper u_lower pairs, each P e^{-Delta t}.
+                    # Even kernel d/(d^2-z^2) weights forward - reverse; the
+                    # odd kernel z/(d^2-z^2) does not change sign with the
+                    # transition energy, so it weights forward + reverse.
+                    forward = jnp.einsum("Rambn,Rambn->Rmn", upper_u,
+                                         jnp.conj(lower_f), optimize=True)
+                    reverse = jnp.einsum("Rambn,Rambn->Rmn", upper_f,
+                                         jnp.conj(lower_u), optimize=True)
+                    A_R = jax.lax.with_sharding_constraint(
+                        forward - reverse, chi_R_shard)
+                    A_odd_R = jax.lax.with_sharding_constraint(
+                        forward + reverse, chi_R_shard)
             if selected_q is None:
                 reverse_R = jnp.conj(A_R)
                 updated = tuple(
@@ -1115,7 +1130,21 @@ def _get_chi_fractional_contour_kernel_face(
                              if pair_mode == "retarded"
                              else A_R + jnp.conj(A_R)),
                     jnp.asarray(selected_q), axis=0)
-                updated = accumulate_selected(accumulators, contribution, projection)
+                if pair_mode != "laplace_ordered":
+                    updated = accumulate_selected(accumulators, contribution, projection)
+                else:
+                    # Both orientations with independent weights.  The
+                    # partner orientation is conj in R space BEFORE the q
+                    # transform (conj(A)(R) -> conj(A_{-q})), exactly as the
+                    # retarded stream forms it; no q-negation gather.  Rows
+                    # are [even outputs; odd outputs] on one shared node.
+                    half = projection.shape[0] // 2
+                    odd = jnp.take(chi_fftn(A_odd_R - jnp.conj(A_odd_R)),
+                                   jnp.asarray(selected_q), axis=0)
+                    updated = accumulate_selected(
+                        accumulate_selected(accumulators, contribution,
+                                            projection[:half]),
+                        odd, projection[half:])
             return updated, None
 
         final_R, _ = jax.lax.scan(

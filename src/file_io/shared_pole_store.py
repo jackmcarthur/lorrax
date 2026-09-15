@@ -37,6 +37,17 @@ def _refuse(message):
                      "current-map canonical scalar model; fix: rebuild the artifact")
 
 
+def charge_representation(meta):
+    """True when the bank operator is the spin-traced charge response.
+
+    Scalar and two-component (noncollinear) decks both give one ``[q, mu, mu]``
+    charge operator: the response stream traces both spinor endpoints. A
+    kinetic-balance bispinor lift (``nspinor = 4``) is a different operator.
+    """
+    nspinor = int(meta.nspinor)
+    return nspinor == 1 or nspinor == 2 == int(meta.nspinor_wfnfile)
+
+
 def _capacity(meta):
     """Require the map ledger; unknown caller lifetimes never mean zero."""
     ledger = getattr(meta, "shared_pole_capacity", None)
@@ -215,10 +226,15 @@ def _metadata(meta, tables, recipe, identity, ordered=False):
     """
     _check_identity(identity, identity)
     basis = meta.mu_basis
-    if int(meta.nspinor) != 1:
+    if not charge_representation(meta):
         _refuse(f"unsupported Nspinor={meta.nspinor}")
     sym = tables["sym"]
-    if bool(sym.trs_allowed) == bool(ordered):
+    # A bank (ordered=None) follows the measured TRS state; a model store
+    # states its representation and must agree with it.
+    bank = ordered is None
+    if bank:
+        ordered = not bool(sym.trs_allowed)
+    elif bool(sym.trs_allowed) == bool(ordered):
         _refuse("ordered representation requires authenticated broken TRS" if ordered
                 else "TRS-broken representation is unsupported")
     qt = tables["qirr"].logical(basis.n_logical).canonical()
@@ -239,17 +255,21 @@ def _metadata(meta, tables, recipe, identity, ordered=False):
         _refuse("missing resolved recipe and gate versions")
     centroid_hash = hashlib.sha256(np.asarray(
         basis.canonical_indices, dtype="<i4").tobytes()).hexdigest()
-    return {
+    header = {
         "schema": SCHEMA, "identity": identity, "recipe": recipe,
         "recipe_hash": hashlib.sha256(_json(recipe).encode()).hexdigest(),
         # Keep the v1 disk spelling for existing models; its C denotes b.
         "normalization": ("Wc_q=sum_q C C_dagger/(2W(z_Ry-W))-sum_(-q) conj(C) C^T/(2W(z_Ry+W)), W=sqrt(Lambda_Ry2)"
-                          if ordered else "Wc=C/(z_Ry^2-Lambda_Ry2)*C_dagger"),
+                          if ordered and not bank else "Wc=C/(z_Ry^2-Lambda_Ry2)*C_dagger"),
         "units": {"factor": "Ry^(3/2)", "poles2_ry2": "Ry^2"},
-        "representation": "scalar-ordered-ph" if ordered else "scalar-trs-even-s",
+        # An ordered bank is not even in s; consumers that need the TRS form
+        # (constructor, operator realizer) refuse this representation by name.
+        # An ordered model store keeps positive poles per parent.
+        "representation": (("charge-ordered-z" if bank else "scalar-ordered-ph")
+                           if ordered else "scalar-trs-even-s"),
         "parent_convention": "raw-parent",
         "n_q_irr": qt.n_q_ibz, "n_q_full": qt.n_q_full,
-        "n_mu_logical": basis.n_logical, "nspinor": 1,
+        "n_mu_logical": basis.n_logical, "nspinor": int(meta.nspinor),
         "centroid_digest": centroid_hash,
         "grid": [int(meta.nkx), int(meta.nky), int(meta.nkz)],
         "fft_grid": np.asarray(meta.fft_grid).tolist(),
@@ -266,6 +286,9 @@ def _metadata(meta, tables, recipe, identity, ordered=False):
                        "typing_source": str(sym.operation_typing_source)},
         "finalized": False,
     }
+    if ordered:
+        header["ordered"] = True
+    return header
 
 
 def _write_metadata(io, header):
@@ -894,7 +917,7 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
     if samples.shape != (nq, nsample, 2) or moments.shape != (nq, 2):
         _refuse("scratch bank malformed written masks")
     if (nq != header["n_q_irr"] or nsample != _bank_nsample(plan)
-            or shape["d"] != header["n_mu_logical"] or header["nspinor"] != 1):
+            or shape["d"] != header["n_mu_logical"] or header["nspinor"] not in (1, 2)):
         _refuse("scratch bank geometry/representation mismatch")
     # Geometry only: never load a matrix through the metadata handle.
     with h5py.File(path, "r") as file:
