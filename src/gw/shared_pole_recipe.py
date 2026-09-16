@@ -33,14 +33,18 @@ shared_real_pole_v1_r3b = {
     "imaginary_count_rule": "max(2, round(log(16*(L/u_min)^2)*log(4000)/(2*pi^2)))",
     "held_line_fractions": (0.25, 0.65),
     "multiplet_relative_tolerance": 1.0e-6,
-    "bank_rule_tolerance": 1.0e-8,
     "moment_convention": "S_m = 2 M_(2m+1); physical M1 and M3 only",
     "operator_realization": "little-group-reynolds-v1",
+    # bank_rule_tolerance is tier-owned (METAL 2026-09-16): the remote-cell certificate
+    # floor on a deep-semicore metal (Fe: even rows 3.4e-9 against 1e-8/4/amp) is a
+    # deck property; production keeps 1e-8 bit for bit, relaxed admits 1e-7.
     "production": {"direction_cutoff": 1.0e-3, "imaginary_width_fraction": 0.25,
-                   "infinity_width_fraction": 0.125, "sigma_tolerance": 1.0e-4},
+                   "infinity_width_fraction": 0.125, "sigma_tolerance": 1.0e-4,
+                   "bank_rule_tolerance": 1.0e-8},
     "relaxed": {"direction_cutoff": 1.0e-2, "imaginary_width_fraction": 0.125,
                 "infinity_width_fraction": 0.0625, "sigma_tolerance": 1.0e-3,
-                "line_count": 8, "imaginary_count": 2},
+                "line_count": 8, "imaginary_count": 2,
+                "bank_rule_tolerance": 1.0e-7},
 }
 
 # Each entry is (predicate description, threshold); the public table adds name
@@ -939,7 +943,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'imaginary_width': math.ceil(n * policy['imaginary_width_fraction']),
         'infinity_width': math.ceil(n * policy['infinity_width_fraction']),
         'multiplet_relative_tolerance': recipe['multiplet_relative_tolerance'],
-        'bank_rule_tolerance': recipe['bank_rule_tolerance'],
+        'bank_rule_tolerance': policy['bank_rule_tolerance'],
         'sigma_tolerance': policy['sigma_tolerance'],
         'moment_convention': recipe['moment_convention'], 'census': dict(census),
         'operator_realization': recipe['operator_realization'],

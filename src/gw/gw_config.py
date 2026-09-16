@@ -2442,7 +2442,8 @@ def _resolve_shared_pole_inputs(params):
             f"sigma_w_accuracy={tier}; why: the recipe owns Sigma tolerance")
     params["sigma_quadrature_eps"] = eps
     # minimax_target_error retains its incumbent static-stage meaning; the
-    # bank always consumes recipe['bank_rule_tolerance'] from the resolver.
+    # bank always consumes the tier's bank_rule_tolerance from the resolver
+    # (production 1e-8, relaxed 1e-7; gw.shared_pole_recipe).
 
 
 def _normalize_input_string(value):
