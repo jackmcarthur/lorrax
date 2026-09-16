@@ -156,6 +156,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         from gw.gw_config import linalg_resolution
         from gw.shared_pole_recipe import (
             representation_row_passed, retained_moment_row_passed,
+            reciprocity_row_verdict,
             construction_receipt, shared_real_pole_gates_v1_r3b as gates,
             shared_real_pole_gates_ordered_v1,
         )
@@ -657,6 +658,11 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                         "metric_inverse_root_residual_fro", "metric_inverse_root_residual_relative")}
                 representation_value = ({"nspinor": int(meta.nspinor), "trs_allowed": False, "ordered": True}
                                        if ordered else {"nspinor": int(meta.nspinor), "trs_allowed": True})
+                # The reciprocity row compares nothing on a sample whose held
+                # reference is not itself transpose symmetric, so the receipt
+                # must say how many records were actually evaluated instead of
+                # asserting a literal pass (INVARIANTS 23).
+                recip_applicable = np.asarray(reciprocity.get("applicable", []), dtype=bool).ravel()
                 measurements = {
                     "normalized_gram_keep": dict(value=int(reduction["retained_rank"][0]), passed=True, reason="normalized Gram cut, current q"),
                     "normalized_gram_validity": dict(value=float(reduction["gram_min_relative"][0]), passed=True, reason="normalized Gram spectrum"),
@@ -665,7 +671,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                     "passivity": dict(value={k: np.asarray(v).tolist() for k, v in passive.items() if k != "passivity"}, passed=True, reason=("signed particle-hole model, Hermitian part at i eta; anti-Hermitian part is the odd channel, reported" if ordered else "raw latent model; authenticated inverse Coulomb square root at current eta; projected operator not measured")),
                     "retained_subspace_moments": dict(value=row["retained_moment_relative"], passed=retained_moment_row_passed(row["retained_moment_relative"], gates["retained_subspace_moments"]), reason=(("signed model z-moments m0..m3 on the original infinity directions, each order against its own norm; projection-accuracy diagnostic beside full_m1/full_m3, not a refusal" if odd_moments else "finite-state ordered bank without odd moments: infinity block uncertified") if ordered else "raw latent Ritz identity: A=Y†GE, B=YA; pencil B†(G,H)B/2 versus model A†(I,Lambda)A/2")),
                     "held_w": dict(value=held, passed=True, reason="raw latent W and dW/ds diagnostics; projected operator not measured; no universal acceptance threshold"),
-                    "model_reciprocity": (dict(value=None, passed=None, reason="not applicable: time-reversal-broken samples carry no transpose symmetry") if ordered else dict(value=reciprocity, passed=True, reason="raw latent model sampled W/dW transpose symmetry, conditional on symmetric reference; projected operator not measured; applicability recorded per sample")),
+                    "model_reciprocity": (dict(value=None, passed=None, reason="not applicable: time-reversal-broken samples carry no transpose symmetry") if ordered else dict(value=reciprocity, passed=reciprocity_row_verdict(reciprocity), reason=f"raw latent model sampled W/dW transpose symmetry, conditional on a symmetric reference: {int(recip_applicable.sum())} of {int(recip_applicable.size)} held records evaluated at reference_relative_max={gates['model_reciprocity']['threshold']['reference_relative_max']:g}; NOT_MEASURED when none was; projected operator not measured")),
                     "full_m1_defect": dict(value=float(moment_defects["M1"]["full_relative"][0]), passed=bool(moment_defects["M1"]["full_relative"][0] <= gates["full_m1_defect"]["threshold"]), reason="raw latent model versus physical full M1; projected moment not measured; CD8 diagnostic band, never a refusal"),
                     "full_m3_defect": dict(value=float(moment_defects["M3"]["full_relative"][0]), passed=bool(moment_defects["M3"]["full_relative"][0] <= gates["full_m3_defect"]["threshold"]), reason="raw latent model versus physical full M3; projected moment not measured; CD8 diagnostic band, never a refusal"),
                     "representation": dict(value=representation_value, passed=representation_row_passed(representation_value, gates["representation"]["threshold"]), reason="current typed symmetry capability against the gate threshold"),

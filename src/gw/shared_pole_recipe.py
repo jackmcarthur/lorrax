@@ -166,6 +166,42 @@ def retained_moment_row_passed(measured, row):
     return bool(worst <= float(ceiling))
 
 
+def reciprocity_row_verdict(measured):
+    """Verdict for the model-reciprocity row from its per-sample records.
+
+    ``measured`` is the constructor's per-sample record with ``passed`` and
+    ``applicable`` entries (scalars or nested lists over held samples and
+    fields). The predicate is CONDITIONAL: it compares the model's transpose
+    symmetry against the held reference's only where that reference has the
+    symmetry, so on a sample whose reference does not, nothing is compared.
+
+    Returns ``True`` only when at least one record was evaluated and every
+    evaluated record passed, ``False`` when an evaluated record failed, and
+    ``None`` when nothing was evaluated -- which :func:`gate_receipt` records
+    as NOT_MEASURED rather than PASS.
+
+    The constructor used to write ``passed=True`` as a literal here, so a run
+    whose reference was never symmetric enough to compare recorded a PASS for a
+    row that had compared nothing. Measured on the Si reference deck: at q=0 the
+    held reference defect is ~5e-08 against a ``reference_relative_max`` of
+    1e-12, so the row was NOT_MEASURED on every map and both accelerators while
+    reading as PASS (SCGRAM-A, 2026-09-16). This is the same defect
+    :func:`representation_row_passed` exists to fix, and INVARIANTS 23: an
+    absent measurement is never PASS.
+    """
+    import numpy as _np
+
+    if not measured:
+        return None
+    applicable = _np.asarray(measured.get("applicable", []), dtype=bool).ravel()
+    passed = _np.asarray(measured.get("passed", []), dtype=bool).ravel()
+    if applicable.size == 0 or applicable.size != passed.size:
+        return None
+    if not applicable.any():
+        return None
+    return bool(passed[applicable].all())
+
+
 def gate_receipt(name, value=None, *, passed=None, reason, table=None):
     """Record a consumer-measured gate; missing data can never produce PASS.
 
