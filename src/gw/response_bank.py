@@ -675,6 +675,49 @@ def _census_scalars(chi, w, w_even):
                       mx(w - w.T)/mx(w)])
 
 
+@jax.jit
+def _reciprocity_scalars(value):
+    """``max|W - W^T| / max|W|`` for each sample of one parent's batch."""
+    defect = jnp.max(jnp.abs(value - jnp.swapaxes(value, -1, -2)), axis=(-2, -1))
+    scale = jnp.max(jnp.abs(value), axis=(-2, -1))
+    return defect / jnp.where(scale > 0, scale, 1)
+
+
+def _reciprocity_census(receipt, value, z_batch, q_full, parent, meta):
+    """Record the reciprocity defect ``W_q(z) = W_q(z)^T`` at REAL supports.
+
+    ONLY AT A SELF-NEGATIVE (TRIM) PARENT, where ``W_q = W_q^T`` is an exact
+    property of one stored tile. At a generic q the exact relation is
+    ``W_q^T = W_{-q}``, ACROSS parents, and a tile's own transpose defect is
+    O(1) by correct physics (1.3-1.8 on this deck) — recording it there would
+    label correct physics as a defect.
+
+    Where it applies, the transpose-antisymmetric part is pure error with a
+    known-zero target. At a real support (``z = iu``, so ``s = z**2`` is real)
+    such a tile is additionally real, so the same number is then its
+    Hermiticity defect. Off the real axis W must NOT be Hermitian, so the
+    transpose form is the one that is meaningful at every support.
+
+    This row REFUSES NOTHING. It is recorded because it is the quantity that
+    fails first when a self-consistent loop amplifies an off-manifold
+    reciprocity-violating mode, and nothing else in the construction measures
+    it: the shared-pole Gram gate sees it only after the Loewner pencil has
+    amplified it by ~1e2 (KNOWN_LORRAX_ISSUES 2026-09-16 SCGRAM-A/SCGRAM-B).
+    Every rank evaluates it; no rank-conditional device work (INVARIANTS 21).
+    """
+    if not _self_negative(int(q_full), meta):
+        return
+    points = np.asarray(z_batch)
+    rows = [i for i, z in enumerate(points) if z.real == 0.0]
+    if not rows:
+        return
+    scalars = np.asarray(_reciprocity_scalars(value))
+    receipt.setdefault("reciprocity_real_supports", []).extend(
+        dict(q_parent=int(parent), q_full=int(q_full),
+             u_ry=float(points[i].imag), defect=float(scalars[i]))
+        for i in rows)
+
+
 def _tr_odd_census(receipt, samples, h, chi, dchi, value, z, q_full):
     """Measure the time-reversal-odd channel of an ordered bank at q = -q.
 
@@ -922,6 +965,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     dchi = raw[a+ia-lo:a+stop-lo,iq-q0]
                     hbatch = jnp.broadcast_to(h,chi.shape)
                     value,ds = execute(samples,(hbatch,chi,dchi),"sample_dyson")
+                    _reciprocity_census(receipt,value,z[ia:stop],int(qids[iq]),iq,meta)
                     if ordered and _self_negative(int(qids[iq]),meta):
                         _tr_odd_census(receipt,samples,h,chi,dchi,value,z[ia:stop],int(qids[iq]))
                     value = None if marked[0] else value[None]
