@@ -82,7 +82,9 @@ __all__ = [
     "OCCUPATION_CLAMP_TOL_DEFAULT",
     "OCCUPATION_CLAMP_TOL_MAX",
     "OCCUPATION_WINDOW_THRESHOLD_DEFAULT",
+    "FERMI_WINDOW_WIDTHS",
     "MP1_LOBE_EXTREMUM",
+    "FermiPartition", "fermi_energy_partition",
     "OccupationState", "assert_fixed_n", "assert_wfn_occupation_consistency",
     "band_in_occupation_window", "clamp_occupation_tail", "fermi_level_step",
     "legacy_square_mesh_occupation_digests",
@@ -92,6 +94,119 @@ __all__ = [
     "solve_mp1_occupations", "solve_smearing_occupations", "fd_occupations",
     "step_occupations",
 ]
+
+
+# ---------------------------------------------------------------------------
+#  The Fermi ENERGY partition (owner, 2026-09-16).  chi over pairs (m, n)
+#  with weight f_m - f_n splits by the sign of (e - mu), not by occupation:
+#  every cross-mu pair has Delta = e_above - e_below > 0 and
+#      f_m - f_n = f_m (1 - f_n) - f_n (1 - f_m)
+#  factorizes into two products of one-particle sums,
+#      A  = sum_{e>mu} (1-f) e^{-(e-mu) tau},   B  = sum_{e<mu} f     e^{+(e-mu) tau},
+#      A' = sum_{e>mu}   f   e^{-(e-mu) tau},   B' = sum_{e<mu} (1-f) e^{+(e-mu) tau},
+#      chi_cross(tau) = A o B - A' o B',
+#  every exponential decaying for ANY occupations (the sign of e - mu is the
+#  sign of the exponent).  Same-side pairs do not factorize; their weight is
+#  exponentially small unless one state lies within a few smearing widths of
+#  mu, so they stay pairwise inside the window |e - mu| < w.  ONE owner: the
+#  stream (Laplace cells) takes the four factor tables from here and the
+#  pair kernel takes its band cut from here.
+# ---------------------------------------------------------------------------
+
+#: Fermi window half-width in smearing widths: ``w = 10 * width``.  For
+#: Fermi-Dirac ``width = kT = 1/beta`` so ``w = 10/beta`` and dropping the
+#: first same-side pair outside the window costs ``e^{-beta w} = 4.5e-5`` of
+#: its weight (below 1 meV of an eV-scale Sigma); for MP1 the clamped table
+#: is EXACTLY 0/1 beyond ``8.62 * width`` (clamp_occupation_tail), so the
+#: dropped block is exactly zero.
+FERMI_WINDOW_WIDTHS = 10.0
+
+
+@dataclass(frozen=True)
+class FermiPartition:
+    """Energy partition of one occupation state about ``mu`` (see the owner note above)."""
+    mu_ry: float
+    width_ry: float
+    family: str
+    window_ry: float            # w = FERMI_WINDOW_WIDTHS * width
+    below: np.ndarray           # (nk, nb) bool, e < mu
+    near: np.ndarray            # (nk, nb) bool, |e - mu| < w
+    lower_weights: np.ndarray   # (2, nk, nb): [f * below, (1-f) * below]   -> B, B'
+    upper_weights: np.ndarray   # (2, nk, nb): [(1-f) * above, f * above]   -> A, A'
+    band_cut_hi: int            # every band >= band_cut_hi is above mu + w at EVERY k
+    band_cut_lo: int            # every band <  band_cut_lo is below mu - w at EVERY k
+    truncation_bound: float     # relative weight of the first dropped same-side pair
+
+    @property
+    def above(self):
+        return ~self.below
+
+    @property
+    def n_near(self) -> int:
+        return int(np.count_nonzero(self.near))
+
+    @property
+    def n_states(self) -> int:
+        return int(self.near.size)
+
+    def describe(self) -> str:
+        return (f"Fermi partition: mu={self.mu_ry:.6f} Ry, {self.family} width={self.width_ry:g} Ry, "
+                f"window w={self.window_ry:g} Ry ({FERMI_WINDOW_WIDTHS:g} widths); "
+                f"{self.n_near}/{self.n_states} (k,band) states inside; bands [{self.band_cut_lo}, "
+                f"{self.band_cut_hi}) reach the window; same-side truncation bound {self.truncation_bound:.2e}")
+
+
+def fermi_energy_partition(E_kn, f_kn, *, mu_ry, width_ry, family,
+                           window_widths=FERMI_WINDOW_WIDTHS) -> FermiPartition:
+    """Partition ``(k, band)`` states by the sign of ``e - mu`` and derive the Fermi window.
+
+    ``family`` is the occupation state's ``smearing_family``; ``"fixed"`` (an
+    insulating step table) has no Fermi window and is refused, because a
+    step table's same-side pairs all carry weight exactly zero and its
+    consumers keep the incumbent path bit for bit.
+    """
+    E = np.asarray(E_kn, dtype=np.float64)
+    f = np.asarray(f_kn, dtype=np.float64)
+    if E.ndim != 2 or f.shape != E.shape:
+        raise ValueError(
+            f"fermi_energy_partition: E_kn and f_kn must share a (nk, nb) shape; got {E.shape} and {f.shape}")
+    if family not in ("mp1", "fd"):
+        raise ValueError(
+            "GATE fermi_partition_family: got smearing_family "
+            f"{family!r}; want 'mp1' or 'fd'; why: a step table has no Fermi window (its same-side "
+            "pair weights are exactly zero) and keeps the incumbent path")
+    width = float(width_ry)
+    if not (np.isfinite(width) and width > 0.0):
+        raise ValueError(f"fermi_energy_partition: width_ry must be finite and > 0; got {width_ry!r}")
+    mu = float(mu_ry)
+    w = float(window_widths) * width
+    below = E < mu
+    above = ~below
+    near = np.abs(E - mu) < w
+    nb = E.shape[1]
+    # Bands sorted ascending at every k: the first band above mu + w at each k,
+    # maximized over k, is the lowest band index that is outside-above everywhere.
+    first_above = np.where(np.any(E > mu + w, axis=1), np.argmax(E > mu + w, axis=1), nb)
+    band_cut_hi = int(np.max(first_above))
+    last_below = np.where(np.any(E < mu - w, axis=1), nb - 1 - np.argmax((E < mu - w)[:, ::-1], axis=1), -1)
+    band_cut_lo = int(np.min(last_below) + 1)
+    if family == "fd":
+        truncation = float(np.exp(-float(window_widths)))
+    else:
+        # MP1: the clamped table is exactly 0/1 beyond 8.62 widths (occupation_clamp_tol default).
+        truncation = 0.0 if window_widths >= 8.62 else float(np.abs(
+            0.5 * (1.0 - _erf(window_widths / 2.0)) - (window_widths / 2.0) * np.exp(-(window_widths / 2.0) ** 2)
+            / (2.0 * np.sqrt(np.pi))))
+    lower = np.stack([f * below, (1.0 - f) * below])
+    upper = np.stack([(1.0 - f) * above, f * above])
+    return FermiPartition(
+        mu_ry=mu, width_ry=width, family=str(family), window_ry=w, below=below, near=near,
+        lower_weights=lower, upper_weights=upper, band_cut_hi=band_cut_hi, band_cut_lo=band_cut_lo,
+        truncation_bound=truncation)
+
+
+def _erf(x):
+    return float(jax.lax.erf(jnp.asarray(x, dtype=jnp.float64)))
 
 
 #: The three legal ``fermi_reference`` values and what each NAMES.  Kept
