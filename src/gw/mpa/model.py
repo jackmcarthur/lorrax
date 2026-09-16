@@ -670,9 +670,10 @@ def _require_metal_time_reversal(material_class, trs_allowed):
             "GATE mpa_ordered_metal: got a metal MPA plan with global time "
             "reversal MEASURED BROKEN; want an insulator (ordered route) or a "
             "time-reversal-symmetric metal; why: the metal route fits one "
-            "residue with no odd channel, and its pair-kernel and stream "
-            "samples are FT_q[chi^T], the transposed orientation "
-            "(KNOWN_LORRAX_ISSUES 2026-09-15 TRINT).")
+            "residue with no odd channel, and its physical-orientation "
+            "samples (pair kernel and fractional contour, ordered=True) have "
+            "no time-reversal-broken metal gate yet "
+            "(KNOWN_LORRAX_ISSUES 2026-09-15 TRINT; METAL 2026-09-16).")
 
 
 def chi0_orientation_route(material_class: str, *, trs_allowed: bool) -> str:
@@ -735,6 +736,10 @@ def _evaluate_samples(
     trs_allowed = bool(sym.trs_allowed)
     _require_metal_time_reversal(material_class, trs_allowed)
     ordered = bool(not metal and not trs_allowed)
+    # Metal kernels: the physical orientation FT_q[chi] when time reversal is
+    # measured broken (the refusal above keeps this False on main until a
+    # time-reversal-broken metal gate exists); the incumbent trace otherwise.
+    metal_physical = bool(metal and not trs_allowed)
     if ordered and write_reflected is None:
         raise ValueError(
             "measured-broken-TR MPA sampling requires a reflected writer")
@@ -824,7 +829,8 @@ def _evaluate_samples(
                     int(meta.b_id_4_chi_user) - int(wfns.slices.b0)),
                 progress_fn=lambda q_done, q_total, elapsed: print_fn(
                     "  MPA direct chi0 shifted-origin q row "
-                    f"{q_done}/{q_total} complete in {elapsed:.3f} s"))
+                    f"{q_done}/{q_total} complete in {elapsed:.3f} s"),
+                ordered=metal_physical)
             if static_gamma_override is not None and gamma_row is not None:
                 chi_w = chi_w.at[gamma_row].set(static_gamma_override[0])
             write_wedge(point, chi_w)
@@ -842,7 +848,8 @@ def _evaluate_samples(
                 meta, mesh_xy,
                 occupations=occupation_state.f_kn,
                 energy_reference=float(occupation_state.mu_ry),
-                occupation_window_threshold=occ_window)
+                occupation_window_threshold=occ_window,
+                ordered=metal_physical)
             write_full(point, chi)
 
     for varpi_i, points in routes["lines"]:
@@ -864,7 +871,8 @@ def _evaluate_samples(
                 wfns, t, h, z, meta, mesh_xy,
                 occupations=occupation_state.f_kn,
                 energy_reference=float(occupation_state.mu_ry),
-                occupation_window_threshold=occ_window)
+                occupation_window_threshold=occ_window,
+                ordered=metal_physical)
         elif ordered:
             values, reflected_values = compute_chi0_contour_ordered(
                 wfns, t, h, z, meta, mesh_xy, q_neg_index=q_neg,
