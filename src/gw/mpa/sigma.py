@@ -157,8 +157,13 @@ def synthesize_shared_pole_parents(
     if b_X.shape[2] != 1 or b_Y.shape[2] != 1:
         raise ValueError("GATE shared_pole_scalar: shared-pole Sigma requires spin=1")
     weights = _shared_pole_weights(poles2, intervals, E_ref_B, t_node)
-    return (_shared_pole_contract(b_X, b_Y, weights, gemm=gemm),
-            _shared_pole_contract(b_X.conj(), b_Y.conj(), weights, gemm=gemm))
+    plus = _shared_pole_contract(b_X, b_Y, weights, gemm=gemm)
+    # Both faces store the same physical b. Thus (b d b†)^T = b* d b^T
+    # even for complex d: transpose the all-mesh operator, never conjugate
+    # its causal phase or contract the same pole columns a second time.
+    transposed = jax.lax.with_sharding_constraint(
+        jnp.swapaxes(plus, -1, -2), NamedSharding(mesh_xy, P(None, "x", "y")))
+    return plus, transposed
 
 
 def _shared_pole_contract(b_X, b_Y, weights, *, gemm):

@@ -161,9 +161,11 @@ def main(runtime):
     compiled=synth.lower(*operands).compile()
     hlo=compiled.as_text()
     collective_lines=[line for line in hlo.splitlines() if re.search(
-        r'\b(all-gather|all-reduce|all-to-all|collective-permute|reduce-scatter)\(',line)]
-    assert not any('all-gather(' in line for line in collective_lines),collective_lines
-    assert 'lorrax_cublasmp_batched_gemm' in hlo
+        r'\b(all-gather|all-reduce|all-to-all|collective-permute|reduce-scatter)'
+        r'(?:-start|-done)?\(',line)]
+    assert not any('all-gather' in line for line in collective_lines),collective_lines
+    assert hlo.count('custom_call_target="lorrax_cublasmp_batched_gemm"') == 1
+    assert any('collective-permute' in line for line in collective_lines),collective_lines
     # Native GEMM communication is inside the provider, not visible as HLO
     # collectives. The separate reader/packing gate owns its all-to-all proof.
     memory=compiled.memory_analysis()
