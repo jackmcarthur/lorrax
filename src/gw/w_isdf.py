@@ -2790,6 +2790,7 @@ def compute_chi0_direct_fractional(
     progress_fn=None,
     ordered=False,
     print_fn=None,
+    fermi_window=False,
 ):
     """Exact finite-occupation chi0 at selected complex frequencies; see docs/architecture/four_current_wiring.md.
 
@@ -2800,12 +2801,18 @@ def compute_chi0_direct_fractional(
     The incumbent trace, ``FT_q[chi^T]``, is kept bit for bit when
     ``ordered=False``; the two agree under time reversal.
 
-    Fermi window.  For dynamic ``z_values`` (no static point) the pair scan
-    skips the tile block whose bands all lie above ``mu + w`` at every k
+    Fermi window (``fermi_window=True``, OPT-IN; the full pair scan is the
+    default).  For dynamic ``z_values`` (no static point) the pair scan skips
+    the tile block whose bands all lie above ``mu + w`` at every k
     (``gw.efermi.fermi_energy_partition``): those pairs are same-side and
     outside the window, and their weights are exactly zero for a clamped
     MP1 table (below ``e^{-10}`` for Fermi-Dirac).  A static point keeps the
     full scan because its diagonal limit carries the unclamped ``-df/dE``.
+    The window becomes the default for metals only when (a) the remote
+    Laplace cells have a certified mu-cell rule (today
+    ``minimax.response_laplace_rule`` refuses ``|z| >= delta_lo``, and
+    ``delta_lo -> 0`` at the Fermi surface) and (b) the ferromagnetic Fe deck
+    holds W at the production tier (owner condition, 2026-09-16).
     """
     from gw.efermi import (fd_negative_derivative, fermi_energy_partition,
                            mp1_negative_derivative)
@@ -2864,7 +2871,7 @@ def compute_chi0_direct_fractional(
         e, float(occupation_state.mu_ry),
         float(occupation_state.smearing_width_ry))
     band_cut = None
-    if np.all(z != 0.0):
+    if fermi_window and np.all(z != 0.0):
         partition = fermi_energy_partition(
             jax.device_get(e)[:, :nb_log], jax.device_get(f)[:, :nb_log],
             mu_ry=float(occupation_state.mu_ry),
