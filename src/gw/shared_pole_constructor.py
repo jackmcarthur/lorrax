@@ -279,7 +279,6 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         capacity(0)
         logical_n = int(meta.n_rmu)
         face = NamedSharding(mesh_xy, P(None, "x", "y"))
-        public_factor = NamedSharding(mesh_xy, P(None, "x", None, "y"))
         column_extent = lambda width: padded_axis(
             width, mesh_xy, name="shared_pole_port",
             specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
@@ -356,7 +355,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 # allocation. Charge it while directions/actions are selected;
                 # release it before admitting the dense pencil.
                 retained_panels = tuple(samples.values())
-                def read_sample(sample_id, retained_states):
+                def read_sample(sample_id):
                     index = sample_id - sample_lo
                     return samples["Wc"][:, index], samples["dWc_ds"][:, index]
 

@@ -8,11 +8,8 @@ concatenation and a + a^H of face-sharded operands come out replicated.
 
 from __future__ import annotations
 
-from functools import lru_cache, partial
-
-import jax
 import jax.numpy as jnp
-from distrib_la import (diagonal_like, face_sharding, hermitian_block, hermitian_part,
+from distrib_la import (face_sharding, hermitian_block, hermitian_part,
                         join_columns, on_face)
 
 

@@ -13,9 +13,8 @@ import shutil
 import time
 
 import jax
-from common import timing
-import jax.numpy as jnp
 import numpy as np
+from common import timing
 from jax.experimental import multihost_utils
 from jax.sharding import PartitionSpec as P
 

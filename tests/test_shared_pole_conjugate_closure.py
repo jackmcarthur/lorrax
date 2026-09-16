@@ -46,7 +46,7 @@ def check(mesh):
                       held=[False, False], z_ry=np.sqrt(points), direction_cutoff=.8,
                       multiplet_relative_tolerance=1e-6)
         states, counts, roles = _direction_states(
-            lambda i, live: tuple(put(a) for a in sample(points[i])), recipe,
+            lambda i: tuple(put(a) for a in sample(points[i])), recipe,
             eigh_plan=ep, svd_plan=sp, matmul=mm, column_extent=extent,
             logical_n=8, admit=lambda side: None, infinity_carrier=2)
         assert states[1][1] is states[0][2] and states[3][1] is states[2][2]

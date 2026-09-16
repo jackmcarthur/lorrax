@@ -274,7 +274,7 @@ def test_direction_states_pair_a_harness_recipe_on_the_same_directions():
                   imaginary_width=4, multiplet_relative_tolerance=1e-6)
     reads = []
 
-    def reader(i, _states):
+    def reader(i):
         reads.append(i)
         zz = nodes[i]
         return put(plant.F(zz)), put(plant.dF(zz) / (2 * zz))
@@ -341,7 +341,7 @@ def test_dedupe_drops_duplicate_partners_and_equals_even_on_symmetric_data():
                     z_ry=[dict(real=v.real, imag=v.imag) for v in nodes[:k]], direction_cutoff=1e-3,
                     imaginary_width=4, multiplet_relative_tolerance=1e-6)
 
-    def reader(i, _states):
+    def reader(i):
         zz = nodes[i]
         return put(plant.F(zz)), put(plant.dF(zz) / (2 * zz))
 

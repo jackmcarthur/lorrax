@@ -341,7 +341,7 @@ def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
     return dict(gemm=gemm,eigh=eig,total=gemm+eig,scope="actual-shape ISERV query; GEMM persistent plus concurrent eigh scratch")
 
 
-def _bank_execution(meta, mesh_xy, bank_io, receipt, config):
+def _bank_execution(meta, mesh_xy, receipt, config):
     """Compile and admit new dense work; stream outputs are reserved by batch."""
     def execute(kernel, args, stage):
         timing.fence('bank.compile.' + stage, sync_ranks=True)
@@ -600,7 +600,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
         # M1/M3 are the 1/s and 1/s^2 coefficients; the odd channel starts at
         # 1/z^3, so the same six correlations stay exact on an ordered bank.
         receipt["ordered"] = True
-    execute = _bank_execution(meta, mesh_xy, bank_io, receipt, config)
+    execute = _bank_execution(meta, mesh_xy, receipt, config)
     ledger = meta.shared_pole_capacity
     ambient = ledger.live_stages
     started = time.monotonic()
@@ -792,7 +792,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         if ordered:
             receipt["ordered"] = True
         started = time.monotonic()
-        execute = _bank_execution(meta,mesh_xy,bank_io,receipt,config)
+        execute = _bank_execution(meta, mesh_xy, receipt, config)
         ledger = meta.shared_pole_capacity
         ambient = ledger.live_stages
     timing.fence('bank.stream_reference_compile', sync_ranks=True)

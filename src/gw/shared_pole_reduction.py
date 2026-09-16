@@ -7,11 +7,9 @@ basis, its second cut and the signed model for the ordered route (SP 13, SP 14).
 
 from __future__ import annotations
 
-from functools import lru_cache, partial
-
 import jax
 import jax.numpy as jnp
-from distrib_la import (diagonal_like, face_sharding, hermitian_block, hermitian_part,
+from distrib_la import (diagonal_like, face_sharding, hermitian_part,
                         join_columns, on_face)
 from gw.shared_pole_pencil import _adjoint
 

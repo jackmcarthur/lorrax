@@ -10,8 +10,7 @@ from functools import lru_cache, partial
 
 import jax
 import jax.numpy as jnp
-from distrib_la import (diagonal_like, face_sharding, hermitian_block, hermitian_part,
-                        join_columns, on_face)
+from distrib_la import hermitian_part
 from gw.shared_pole_pencil import _adjoint
 
 
