@@ -28,6 +28,35 @@ has not been exercised recently.*
 
 ## 1. Entry point: `lx` {#1-entry-point-lx}
 
+### Network transport at startup
+
+Before initializing JAX/NCCL, `runtime.network_env` checks the participating
+nodes. A one-node **step** inside a larger allocation remains a one-node run:
+the policy uses `SLURM_STEP_NUM_NODES`, or expands `SLURM_STEP_NODELIST`, never
+the allocation-wide node count. Open MPI local/world group sizes can also
+establish single-node versus multi-node placement without starting MPI here.
+Unknown topology leaves the environment unchanged.
+
+On multi-node Perlmutter CUDA runs, startup requests the site's OFI/CXI
+configuration. It names the plugin by absolute path through `NCCL_NET_PLUGIN`,
+so no change to Python's already-initialized library search path is needed.
+The plugin and its machine settings have one owner in `runtime.network_env`.
+The currently supported site installation is supplied by `nccl/2.29.2-cu13`.
+A missing required plugin produces an actionable startup error before GPU
+communicators are created.
+
+Single-node runs receive no additional network settings. Explicit `NCCL_NET`
+or `NCCL_NET_PLUGIN` settings bypass site selection entirely; individually
+specified tuning settings also take precedence. CPU, ROCm, and other sites
+retain their existing transport configuration. This is a machine-topology
+decision, independent of matrix sizes or drivers. Other clusters must supply
+their supported NCCL environment rather than inherit Perlmutter's OFI choice.
+
+Startup prints one rank-zero line with placement and requested policy.
+`runtime.network_env.network_configuration()` records the decision; NCCL's
+own transport log attests the provider actually loaded. Initialize LORRAX's
+runtime before creating GPU backends or native communicators.
+
 **`lx` is how you run things on Perlmutter.** Never on a login node, never
 `sbatch`. It allocates if nothing is live, attaches if something is, and
 calling it twice never double-allocates.

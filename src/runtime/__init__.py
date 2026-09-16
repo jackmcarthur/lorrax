@@ -750,6 +750,8 @@ def set_default_env(*, platform: str = "gpu") -> None:
     xla_platform = (
         "cpu" if platform == "cpu" or resolved_platforms == "cpu" else "gpu")
     set_default_xla_gpu_autotune(platform=xla_platform)
+    from runtime.network_env import configure_gpu_network
+    configure_gpu_network(platform=xla_platform, say=rank0_print)
 
 
 #: The four values jaxlib accepts for ``XLA_PYTHON_CLIENT_ALLOCATOR``.

@@ -28,6 +28,18 @@ Fallback aliases remain grouped with their owner rows—notably
 
 ## What this page is, and what it is not
 
+Network startup machine facts and overrides (behavior is owned by
+[`Perlmutter startup`](../environment/machines/perlmutter.md#network-transport-at-startup)):
+
+| Spelling | Default | Class | Parse grammar |
+|---|---|---|---|
+| `SLURM_STEP_NUM_NODES` | unset | launch topology | Positive integer participating step-node count; invalid values use the host-list fallback. |
+| `SLURM_STEP_NODELIST` | unset | launch topology | Slurm host-list expression, expanded by `scontrol show hostnames`. |
+| `OMPI_COMM_WORLD_SIZE`, `OMPI_COMM_WORLD_LOCAL_SIZE` | unset | launch topology | Positive integers; equality establishes one shared node, local less than world establishes multiple nodes without assuming uniform placement. |
+| `NERSC_HOST` | unset | machine identity | Exact `perlmutter` selects the supported site profile when multi-node CUDA placement is established. |
+| `NCCL_NET`, `NCCL_NET_PLUGIN` | site defaults only for multi-node Perlmutter CUDA | transport override | Presence preserves the caller's configuration and bypasses automatic site selection, including empty values. Plugin may be an absolute library filename. |
+| `NCCL_NET_GDR_LEVEL`, `FI_CXI_DISABLE_HOST_REGISTER`, `NCCL_CROSS_NIC`, `NCCL_SOCKET_IFNAME` | site profile when selected | machine transport settings | Existing values are preserved verbatim; otherwise the supported site profile supplies defaults. |
+
 **This page owns four columns and nothing else: the SPELLING, the DEFAULT,
 the CLASS, and the PARSE GRAMMAR of every variable LORRAX reads.** Those four
 are what `tests/test_env_registry.py` enforces and what nothing else in the
