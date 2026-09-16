@@ -291,7 +291,7 @@ def test_sc_defaults(tmp_path):
 def test_sc_input_keys(tmp_path):
     sc = _config(
         tmp_path,
-        "sc_max_iter = 7\nsc_tol_ev = 1e-6\nsc_accelerator = linear\n"
+        "sc_max_iter = 7\nsc_tol_ev = 1e-6\nsc_accelerator = rcrop\n"
         "sc_history_depth = 3\nsc_mixing = 0.5\nsc_dump_dir = sc_hist\n"
         "sc_exact_degeneracy_tol_ev = 5e-5\n"
         "sc_tail_fit = buffer_edges\nsc_buffer_nbands = 3\n"
@@ -299,7 +299,7 @@ def test_sc_input_keys(tmp_path):
     assert (sc.max_iter, sc.tol_ev, sc.accelerator, sc.history_depth,
             sc.mixing, sc.dump_dir, sc.exact_degeneracy_tol_ev,
             sc.tail_fit, sc.buffer_nbands, sc.buffer_mode) == (
-                7, 1.0e-6, "linear", 3, 0.5, "sc_hist", 5.0e-5,
+                7, 1.0e-6, "rcrop", 3, 0.5, "sc_hist", 5.0e-5,
                 "buffer_edges", 3, "one_sided")
 
 
@@ -325,7 +325,7 @@ def test_sc_buffer_controls_refuse_invalid_values(tmp_path):
 def test_sc_env_overrides_deprecated(tmp_path, monkeypatch):
     monkeypatch.setenv("LORRAX_SC_MAX_ITER", "3")
     monkeypatch.setenv("LORRAX_SC_TOL_EV", "1e-10")
-    monkeypatch.setenv("LORRAX_SC_ACCEL", "linear")
+    monkeypatch.setenv("LORRAX_SC_ACCEL", "rcrop")
     monkeypatch.setenv("LORRAX_SC_DEPTH", "2")
     monkeypatch.setenv("LORRAX_SC_MIXING", "0.25")
     monkeypatch.setenv("LORRAX_SC_DUMP_DIR", "/tmp/sc_dump")
@@ -336,7 +336,7 @@ def test_sc_env_overrides_deprecated(tmp_path, monkeypatch):
         str(path), print_fn=lambda *a, **k: lines.append(" ".join(map(str, a)))
     ).sc
     assert (sc.max_iter, sc.tol_ev, sc.accelerator, sc.history_depth,
-            sc.mixing, sc.dump_dir) == (3, 1.0e-10, "linear", 2, 0.25,
+            sc.mixing, sc.dump_dir) == (3, 1.0e-10, "rcrop", 2, 0.25,
                                         "/tmp/sc_dump")
     assert any("deprecated env override" in l for l in lines)
 
@@ -344,6 +344,28 @@ def test_sc_env_overrides_deprecated(tmp_path, monkeypatch):
 def test_sc_bad_accelerator_rejected(tmp_path):
     with pytest.raises(ValueError, match="sc_accelerator"):
         _config(tmp_path, "sc_accelerator = bogus\n")
+
+
+def test_sc_accelerator_linear_refuses_by_name(tmp_path):
+    """rcrop is the only supported accelerator; `linear` refuses BY NAME.
+
+    Undamped linear self-consistency amplifies the input's
+    time-reversal-reality error 6-8x per map and refuses at map 3 on
+    scalar Si; damping makes it worse (claim 2391).  The deck spelling
+    and the deprecated env override are two doors onto the same field,
+    so both are checked.
+    """
+    with pytest.raises(ValueError, match="sc_accelerator_rcrop_only") as got:
+        _config(tmp_path, "sc_accelerator = linear\n")
+    assert "linear" in str(got.value)
+    assert "rcrop" in str(got.value)
+
+
+def test_sc_accelerator_env_override_cannot_select_linear(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("LORRAX_SC_ACCEL", "linear")
+    with pytest.raises(ValueError, match="sc_accelerator_rcrop_only"):
+        _config(tmp_path)
 
 
 # ---------------------------------------------------------------------------

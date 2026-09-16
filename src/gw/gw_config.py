@@ -1102,22 +1102,25 @@ _DEFAULTS = {
     # k-points.  Two measurements paid for the flip, both on
     # ``gnppm_debug`` (file wedge 9, star wedge 5, so the two differ):
     #
-    #   1. EQUIVALENCE, with ``sc_accelerator = linear``, ``sc_mixing = 1``:
-    #      the on and off arms agree to **1e-6 meV** -- the ``%15.9f``
-    #      print floor -- on E_QP at EVERY iterate and in the final
-    #      eqp0/eqp1, with identical k coordinates.  The map is exactly
-    #      k-set invariant, so the two arms have the same fixed point.
+    #   1. EQUIVALENCE, measured on the undamped plain fixed point
+    #      (``x_{n+1} = F(x_n)``, then still selectable as
+    #      ``sc_accelerator = linear`` with ``sc_mixing = 1``; that
+    #      spelling is now refused by GATE sc_accelerator_rcrop_only and
+    #      the measurement stands as history): the on and off arms agree
+    #      to **1e-6 meV** -- the ``%15.9f`` print floor -- on E_QP at
+    #      EVERY iterate and in the final eqp0/eqp1, with identical k
+    #      coordinates.  The map is exactly k-set invariant, so the two
+    #      arms have the same fixed point.
     #
-    #   2. THE TRAJECTORY IS NOT, under the DEFAULT accelerator.  With
-    #      rCROP the same pair diverges to 24.45 meV by map call 5 and
-    #      113.3 meV in the final eqp0.  That is not a defect: rCROP's
-    #      least-squares mixing minimises a residual norm summed over the
-    #      loop's OWN k-set, so on the star wedge each orbit is counted
-    #      once and on the full BZ with its multiplicity.  Different
-    #      weights, different coefficients, same fixed point.  It does mean
-    #      an UNCONVERGED rCROP run's iterates move when this flag moves --
-    #      relevant given that the accepted Si QSGW run is on record as not
-    #      converged.
+    #   2. THE TRAJECTORY IS NOT, under rCROP.  The same pair diverges to
+    #      24.45 meV by map call 5 and 113.3 meV in the final eqp0.  That
+    #      is not a defect: rCROP's least-squares mixing minimises a
+    #      residual norm summed over the loop's OWN k-set, so on the star
+    #      wedge each orbit is counted once and on the full BZ with its
+    #      multiplicity.  Different weights, different coefficients, same
+    #      fixed point.  It does mean an UNCONVERGED rCROP run's iterates
+    #      move when this flag moves -- relevant given that the accepted
+    #      Si QSGW run is on record as not converged.
     #
     # This had rotted invisibly (crash at the eqp writer, the two wedges
     # conflated) because no committed deck ran the SC path at all.  One now
@@ -1385,9 +1388,15 @@ _DEFAULTS = {
     # still honored as deprecated overrides.
     "sc_max_iter": 20,
     "sc_tol_ev": 1.0e-4,
-    "sc_accelerator": "rcrop",   # rcrop | linear
+    # rcrop is the ONLY supported value; `linear` refuses by name at
+    # ``SCConfig.__post_init__`` (GATE sc_accelerator_rcrop_only).
+    "sc_accelerator": "rcrop",
     "sc_history_depth": 5,       # rCROP history depth
-    "sc_mixing": 1.0,            # linear-mixing α (accelerator=linear only)
+    # Linear-mixing α.  Read only by the diagnostic
+    # ``sc_iteration._run_linear_mixing``, which no deck can now select, so
+    # this key changes nothing in a deck; it is retained for that path's
+    # direct callers (tests) rather than removed out from under them.
+    "sc_mixing": 1.0,
     "sc_dump_dir": "",           # E/U-history npy dump dir ("" = off)
     # Symmetric correction averaging is legal only for accidental/exact
     # degeneracies.  This 0.1 meV owner-set ceiling is deliberately more
@@ -4185,7 +4194,7 @@ class SCConfig:
     """Self-consistency loop knobs (read only when qp_solver=self_consistent); see docs/architecture/decisions.md."""
     max_iter: int
     tol_ev: float
-    accelerator: str      # "rcrop" | "linear"
+    accelerator: str      # "rcrop" — the only supported value
     history_depth: int
     mixing: float
     dump_dir: str | None
@@ -4209,10 +4218,19 @@ class SCConfig:
             raise ValueError("sc_max_iter must be >= 1.")
         if self.tol_ev <= 0.0:
             raise ValueError("sc_tol_ev must be > 0.")
-        if self.accelerator not in ("rcrop", "linear"):
+        if self.accelerator != "rcrop":
             raise ValueError(
-                f"sc_accelerator must be 'rcrop' or 'linear'; "
-                f"got {self.accelerator!r}.")
+                "GATE sc_accelerator_rcrop_only: rcrop is the only "
+                "supported self-consistency accelerator.\n"
+                f"  got:  sc_accelerator = {self.accelerator!r}\n"
+                "  want: sc_accelerator = 'rcrop' (the default)\n"
+                "  fix:  delete the key, or set it to 'rcrop'\n"
+                "  why:  undamped linear self-consistency amplifies the "
+                "input's ~4e-10 time-reversal-reality error 6-8x per map "
+                "and refuses at map 3 on scalar Si, damping makes it worse "
+                "(sc_mixing 0.5 refuses at map 2, 0.3 at map 1), and rCROP "
+                "holds that floor 450x lower over ten maps.\n"
+                "  doc:  docs/self_consistency.md; claim 2391")
         if self.history_depth < 1:
             raise ValueError("sc_history_depth must be >= 1.")
         if not (0.0 < self.mixing <= 1.0):

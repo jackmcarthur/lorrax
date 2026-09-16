@@ -1142,7 +1142,10 @@ damping parameter — `sc_mixing = 1.0` diverges and `0.5` was picked by
 hand — and the accelerating tail is what wins at any tighter tolerance,
 which a fixed `~0.3-0.4`-per-call linear contraction cannot follow. Claim
 201's ruling, adopted here: **`sc_accelerator = rcrop` with the entry
-solve is the production route for metallic QSGW.**
+solve is the production route for metallic QSGW.** Since 2026-09-16 it is
+also the only route: `sc_accelerator = linear` refuses by name, so the
+linear arms quoted in this section are history, not selectable controls
+(see the key's row in [input_reference.md](../input_reference.md)).
 
 Its iterates differ from 7.4's by design — those arms ran the carried
 occupation rule at `bf57701b`, this one the entry solve at `178f62b8` —

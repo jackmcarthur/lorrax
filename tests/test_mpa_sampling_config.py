@@ -435,7 +435,9 @@ def test_an_insulating_store_carries_no_occ_attrs(tmp_path):
 _SC_KEYS = (
     "qp_solver = self_consistent\n"
     "self_consistent = true\n"
-    "sc_accelerator = linear\n"
+    # rcrop is the only accelerator a deck may name
+    # (GATE sc_accelerator_rcrop_only).
+    "sc_accelerator = rcrop\n"
     "sc_head_update = parallel_transport\n"
 )
 

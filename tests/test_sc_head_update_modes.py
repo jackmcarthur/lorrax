@@ -71,10 +71,13 @@ memory_per_device_gb = 4.0
 """
 
 # The three keys the fractional-occupation rule already required before
-# this mode existed; only the head-mode value is under test below.
+# this mode existed; only the head-mode value is under test below.  rcrop is
+# the only accelerator a deck may name (GATE sc_accelerator_rcrop_only), and
+# it is legal on a metal since the entry-solve rule -- see
+# ``test_rcrop_is_legal_on_a_metallic_deck`` below.
 _FRACTIONAL = (
     "qp_solver = self_consistent\n"
-    "sc_accelerator = linear\n"
+    "sc_accelerator = rcrop\n"
     "occ_broadening = 0.13605693122994\n"
 )
 

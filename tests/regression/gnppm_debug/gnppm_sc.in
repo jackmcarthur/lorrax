@@ -29,17 +29,20 @@
 # (2.762e-01 is exactly that set's recorded closure residual.)  That
 # leaves gnppm_debug, whose 399-centroid set IS orbit-closed.
 #
-# LINEAR MIXING, DELIBERATELY, and it is the reason this deck is a
-# regression rather than a snapshot.  With `sc_accelerator = linear` and
-# `sc_mixing = 1` the iteration is exactly `x_{n+1} = F(x_n)`, and F is
-# k-set invariant: the on/off arms agree to 1e-6 meV -- the `%15.9f` print
-# floor -- at every iterate.  Under the DEFAULT rCROP they do not, because
-# rCROP's least-squares mixing minimises a residual summed over the loop's
-# own k-set (each orbit once on the star wedge, with its multiplicity on
-# the full BZ).  Same fixed point, different path: measured 24.45 meV
-# apart by map call 5 and 113.3 meV in the final eqp0 on this deck.  A
-# deck that pinned the rCROP path would be pinning the accelerator's
-# k-weighting, not the wedge algebra.
+# rCROP, BECAUSE IT IS THE ONLY ACCELERATOR A DECK MAY NAME (owner
+# 2026-09-16; GATE sc_accelerator_rcrop_only).  This deck ran
+# `sc_accelerator = linear` with `sc_mixing = 1` until then, because that
+# makes the iteration exactly `x_{n+1} = F(x_n)` and F is k-set invariant,
+# so the `sc_on_ibz` on/off arms agreed to 1e-6 meV -- the `%15.9f` print
+# floor -- at EVERY iterate.  rCROP's least-squares mixing minimises a
+# residual summed over the loop's OWN k-set (each orbit once on the star
+# wedge, with its multiplicity on the full BZ), so the two arms share a
+# fixed point but not a path: measured 24.45 meV apart by map call 5 and
+# 113.3 meV in the final eqp0 on this deck.  So this deck remains a PATH
+# gate -- it proves the SC route runs and the two wedges do not conflate --
+# and it is no longer an arm-vs-arm iterate comparison.  That comparison
+# is history (`tests/KNOWN_FAILURES.md`, "`sc_on_ibz = true` HAS ROTTED");
+# the boundary itself is pinned by `tests/test_sc_on_ibz_wedges.py`.
 #
 # `sc_on_ibz` IS NOT SET HERE.  It takes the default, so this deck is what
 # makes the default a tested thing rather than a declared one.
@@ -60,8 +63,7 @@ bispinor = false
 qp_solver = self_consistent
 sc_max_iter = 2
 sc_tol_ev = 1.0e-3
-sc_accelerator = linear
-sc_mixing = 1.0
+sc_accelerator = rcrop
 use_ppm_sigma = true
 screening_method = minimax
 ppm_omega_p = 2.0

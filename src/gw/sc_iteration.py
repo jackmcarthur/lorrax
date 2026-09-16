@@ -4560,16 +4560,20 @@ def run_self_consistency(
     Parameters
     ----------
     accelerator
-        ``"rcrop"`` (default) — Anderson-style restart-CROP acceleration
-        from :mod:`mixing.acceleration`.  Order ``history_depth``.
-        Required for QSGW on dense band manifolds: the Jacobian's
-        cycle-direction eigenvalue is typically ≲ −3 for systems with
-        many bands near the gap (PPM ω-grid stiffness), which means a
-        plain fixed-point hits a 2-cycle and even α=0.5 linear damping
-        only shrinks the cycle amplitude rather than killing it.
-        ``"linear"`` — plain α-mixing with damping ``mixing``.  Useful
-        for diagnosis (very small α reaches the fixed point monotonically
-        but is slow).
+        ``"rcrop"`` (default, and the only value a DECK can select —
+        ``gw_config.SCConfig`` refuses every other spelling through GATE
+        ``sc_accelerator_rcrop_only``) — Anderson-style restart-CROP
+        acceleration from :mod:`mixing.acceleration`.  Order
+        ``history_depth``.  Required for QSGW on dense band manifolds:
+        the Jacobian's cycle-direction eigenvalue is typically ≲ −3 for
+        systems with many bands near the gap (PPM ω-grid stiffness),
+        which means a plain fixed-point hits a 2-cycle and even α=0.5
+        linear damping only shrinks the cycle amplitude rather than
+        killing it.  ``"linear"`` — plain α-mixing with damping
+        ``mixing``.  IN-PROCESS DIAGNOSTIC ONLY: it is kept for direct
+        callers that want the unaccelerated control trajectory, and
+        undamped it amplifies the input's time-reversal-reality error
+        6-8x per map (claim 2391), which is why no deck may ask for it.
     history_depth
         rCROP history depth (only used when ``accelerator="rcrop"``).
         ``m=5`` is BGW's QSGW default.

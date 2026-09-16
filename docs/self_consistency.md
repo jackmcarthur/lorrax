@@ -15,7 +15,9 @@ defined in [input_reference.md](input_reference.md); the drivers are in
 ## What the loop does
 
 One map is `H → rotate ψ → χ₀ → W → screening model (poles) → Σ(ω) → H'`.
-The map is iterated with rCROP (`sc_accelerator = rcrop`, history 5) until
+The map is iterated with rCROP (`sc_accelerator = rcrop`, history 5, the only
+supported accelerator — see the key's row in
+[input_reference.md](input_reference.md)) until
 every non-scissored band moves by less than `sc_tol_ev`. Within the active
 subspace (`nval + ncond` bands around E_F) each band is in one of three
 classes (`gw/band_partition.py`):
@@ -90,7 +92,7 @@ and must be chosen per material.
 qp_solver = self_consistent
 sc_max_iter = 30             # deck; default 20 (13–15 maps when healthy)
 sc_tol_ev = 1e-4             # default
-sc_accelerator = rcrop       # default
+sc_accelerator = rcrop       # default, and the only supported value
 sc_history_depth = 5         # default
 nval = 8                     # deck; default 5
 ncond = 8                    # deck; default 5

@@ -72,6 +72,7 @@ do not implicitly suppress tests.
 {"nodeid":"tests/test_star_wedge_measured_values.py::test_the_committed_kin_ion_fixtures_carry_their_measured_deviation[bispinor_debug]","reason":"committed kin_ion fixtures gained wedge-storage stamps; measured table needs regeneration","owner":"GW/fixtures"}
 {"nodeid":"tests/test_star_wedge_measured_values.py::test_the_committed_kin_ion_fixtures_carry_their_measured_deviation[cohsex_debug]","reason":"committed kin_ion fixtures gained wedge-storage stamps; measured table needs regeneration","owner":"GW/fixtures"}
 {"nodeid":"tests/test_star_wedge_measured_values.py::test_the_committed_kin_ion_fixtures_carry_their_measured_deviation[gnppm_debug]","reason":"committed kin_ion fixtures gained wedge-storage stamps; measured table needs regeneration","owner":"GW/fixtures"}
+{"nodeid":"tests/core/test_driver_references.py::test_b_mpa_one_update_matches_references","reason":"mpa_sc1 SC reference family is the retired linear trajectory; needs an owner-authorized re-baseline on rCROP (POSTLAND 2026-09-16)","owner":"GW/fixtures"}
 ```
 <!-- executable-xfails:end -->
 
@@ -3320,3 +3321,47 @@ FFI libraries: 1 failed / 301 passed / 8 skipped at `6fafd126`, and 1 failed
 / 304 passed / 8 skipped after it, the same cell each time. Pairing
 `test_sanity_gates_jax.py` before it reproduces the failure; pairing
 `test_jax_cache_contract.py` before it does not.
+
+### 2026-09-16 POSTLAND — `mpa_sc1`'s SC reference family is the retired linear trajectory
+
+`sc_accelerator = linear` now refuses by name (GATE `sc_accelerator_rcrop_only`,
+`gw_config.SCConfig.__post_init__`), so `tests/core/fixtures/B/mpa_sc1.in` moves to `rcrop`.
+That deck is the tree's only pinned SC numerical reference, and it is deliberately UNCONVERGED
+(`sc_max_iter = 2`, `sc_tol_ev = 0.5` eV), so its pinned outputs are a property of the
+trajectory, not of the fixed point. Under rCROP the trajectory is different by construction —
+the same statement `gw_config.py` makes about `sc_on_ibz` (24.45 meV by map call 5, 113.3 meV
+in the final eqp0 on gnppm_debug).
+
+MEASURED, jobid 58428871, one P4 leg on the provider built from main 186ea73c
+(`runs/frequency_integration_sandbox/439_postland_20260916/logs/core_b_branch2.log`):
+
+* `mpa_eqp0.dat` and `mpa_eqp1.dat` — the ONE-SHOT references — still match. The move is
+  confined to the SC deck.
+* `mpa_sc1_eqp0.dat`: 3/3 rows differ. `-10.675633941` against the pinned `-10.765562252`,
+  `1.972298564` against `1.970824424`, `9.225258815` against `9.226464252`. Max absolute
+  difference **89.93 meV** against `MPA_EQP_ATOL_EV = 0.2 meV`.
+* `test_b_retained_escape_grows_grid_in_the_same_map` PASSES after moving its split anchor
+  from `role=linear` to `role=initial` (rCROP's name for map call 0, `_run_rcrop._role_of`);
+  every assertion it makes after the split is structural, so nothing there was re-baselined.
+
+NOT RE-BASELINED HERE, and that is the point. Regenerating `mpa_sc1_eqp0.dat`,
+`mpa_sc1_eqp1.dat`, `mpa_sc1_sigma.dat`, `mpa_sc1_sigma.h5`, `mpa_sc1.out`, the four
+`eqp*_iter*.dat`, `WFN_qp.h5` and `qp_wfn_rotations.h5` from this lane's own run, and
+restamping `tests/core/fixtures/B/PROVENANCE.json`, would make the reference equal to the
+output of the code under test (TASTE 22). The pinned literals in the cell body —
+`residuals == [3.640626335, 0.3476362983]`, `gain == 0.185133`,
+`rebuilds_this_iteration=6, rebuilds_total=6`, `"SC done: 2 GW map calls"`, and the two
+`role=linear` regexes — are the same trajectory and move with it.
+
+**Owner decision required**, two ways:
+1. Re-baseline on rCROP at `sc_max_iter = 2`: cheapest, but the new pin is again a trajectory
+   pin, and the cell costs 4 map calls instead of 2 (rCROP makes a trial and an accepted call
+   per iteration).
+2. Converge the deck first (raise `sc_max_iter`, drop `sc_tol_ev`) and re-baseline once at the
+   fixed point: the pin then measures the MAP rather than the accelerator, and survives any
+   future accelerator change. Costs more GPU seconds per suite run.
+
+Until one is taken, the cell is a strict xfail in the executable ledger above, owner
+`GW/fixtures`. `test_fixture_bytes_match_the_portable_stamp[B]` was already red on main
+186ea73c (the committed stamp is stale for reasons predating this lane), so the deck's own
+byte change does not alter that cell's verdict.
