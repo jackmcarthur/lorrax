@@ -17,11 +17,12 @@ only by the offline/runtime solvers.
 | `build_uniform_rule(box, eps)` | Builds and certifies one denominator-box rule for `1/d` on `[re_lo, re_hi] x [im_lo, im_hi]`. A production surface, not a lookup: it takes no clock and no pass count, and returns when its own boundary certificate is met, so the same box and tolerance give the same rule on any machine. `gw.sigma_box_plan` is the consumer. |
 | offline solver names | Lazily expose table-generation machinery; using them does not make the result a shipped certified rule. |
 
-`LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE` controls the escape hatch and currently
-defaults to enabled. Every runtime solve is labelled
-`runtime-uncertified`, announces that it is not reproducible across hosts, and
-carries no certified table identity. The complete spelling and boolean grammar
-are owned by the [environment-variable registry](../dev/env_vars.md).
+There is no escape hatch and no shipped-table branch: `serve` computes every
+screening rule in process, announces it once naming the request, the achieved
+error, the measured sum of |w| and kappa_0, and certifies it with a de la
+Vallee Poussin alternation certificate. `LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE`
+retired with that branch on 2026-09-16 and is read nowhere; its row in the
+[environment-variable registry](../dev/env_vars.md) says so.
 
 ## Two surfaces, not one
 

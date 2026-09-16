@@ -82,10 +82,12 @@ class CatalogCorrupt(MinimaxRefusal):
 class UncertifiedSolveRefused(MinimaxRefusal):
     """F5 — a runtime solve was required and the escape hatch is closed.
 
-    R1 ships in two stages and this refusal is stage 2's whole surface.
-    In stage 1 (today) ``LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE`` defaults to
-    ``1``, so this is raised only when a deck or a test closes the hatch
-    on purpose — which is exactly the FALSE case the suite ships.
+    HISTORICAL.  This was stage 2's whole surface while ``door.serve`` had
+    a shipped-table branch and ``LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE`` chose
+    between it and an in-process solve.  Both were removed on 2026-09-16:
+    with no table path left, "refuse rather than solve" can only mean
+    "refuse everything", so nothing raises this any more.  It is kept as a
+    name so an external catcher does not break.
     """
 
 

@@ -54,7 +54,6 @@ from .minimax_config import MinimaxConfig                     # noqa: E402
 #: publishes this module as part of its public surface for exactly this
 #: consumer; binding it here keeps the call sites short without spending
 #: the door rule to do it.
-_beta_selector = _mm.beta_selector
 
 
 _TINY = 1.0e-12
@@ -1001,7 +1000,6 @@ def solve_laplace_minimax_interval(
     *,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
-    use_shipped_tables: bool = True,
 ) -> LaplaceMinimaxQuadrature:
     """Fit ``1/x ≈ sum alpha_l exp(-tau_l x)`` on ``[x_min, x_max]``.
 
@@ -1021,7 +1019,6 @@ def solve_laplace_minimax_interval(
     served = _mm.serve(
         family="noncrossing", target="inverse",
         range_value=R, error_bound=scaled_target_error, n_max=max_nodes,
-        use_shipped=bool(use_shipped_tables),
     )
     tau_hat, w_hat, err_hat = served.nodes, served.weights, served.max_error
 
@@ -1039,14 +1036,9 @@ def solve_laplace_minimax_interval(
     )
 
 
-#: The most recent refusal from the ``complex_laplace`` selector, kept so
-#: that a caller (or a test, or the census shim) can read WHY a request
-#: fell through to the runtime solve without the door having to raise.
-#: Under R1 stage 2 this refusal becomes the error; today it is only the
-#: explanation, because arming the refusal is a separate, staged decision
-#: and this commit changes nothing about what the default path computes
-#: except where a certified table now answers.
-LAST_IMAG_TABLE_REFUSAL: _beta_selector.TableRefusal | None = None
+#: The ``complex_laplace`` selector and its refusal record are gone with the
+#: shipped-table path (2026-09-16): there is nothing to fall through FROM, so
+#: there is no refusal to read.  Every imaginary-axis rule is solved here.
 
 
 #: Ceiling on the nodes the odd-kernel augmentation may add to a served
@@ -1123,8 +1115,6 @@ def solve_laplace_minimax_imag_interval(
     *,
     target_error: float = 1.0e-6,
     max_nodes: int = 64,
-    use_shipped_tables: bool = True,
-    beta_clause: str = _beta_selector.HEIGHT,
     print_fn=None,
     with_odd_kernel: bool = False,
 ) -> LaplaceMinimaxQuadrature:
@@ -1160,8 +1150,6 @@ def solve_laplace_minimax_imag_interval(
     uncertified runtime solve, through the same cache, with the same key.
     """
 
-    global LAST_IMAG_TABLE_REFUSAL
-
     x_min = max(float(x_min), _TINY)
     x_max = max(float(x_max), x_min * (1.0 + 1.0e-9))
     omega_p = float(omega_p)
@@ -1181,40 +1169,14 @@ def solve_laplace_minimax_imag_interval(
     # the axis for a certified table, and fall through to the door's
     # announced escape hatch when it refuses.  A refusal costs an
     # explanation and nothing else; under R1 stage 2 it becomes the error.
-    picked = None
-    if use_shipped_tables:
-        picked = _beta_selector.select(
-            range_value=R,
-            beta=omega_hat,
-            beta_clause=beta_clause,
-            target_error=scaled_target_error,
-            max_nodes=max_nodes,
-        )
-    if isinstance(picked, _beta_selector.TableSelection):
-        LAST_IMAG_TABLE_REFUSAL = None
-        _beta_selector.announce(picked, print_fn=print_fn)
-        # The catalog's own alias: Re 1/(u - i beta) = u/(u^2 + beta^2) is
-        # ``minimax._imag_target`` character for character, so this
-        # consumer takes the real part of the same certified payload the
-        # Sigma-side complex consumer takes whole.
-        tau_hat = np.asarray(picked.tau, dtype=np.float64)
-        w_hat = np.ascontiguousarray(np.real(picked.alpha), dtype=np.float64)
-        err_hat = float(picked.certified_error)
-        provenance = picked.one_line()
-    else:
-        LAST_IMAG_TABLE_REFUSAL = picked
-        # `use_shipped=use_shipped_tables`, not the default: with the deck
-        # key clear the caller asked for the uncertified path explicitly,
-        # and the door should announce THAT rather than report a miss it
-        # was never allowed to look for.
-        served = _mm.serve(
-            family="noncrossing_imag", target="inverse_imag",
-            range_value=R, error_bound=scaled_target_error, n_max=max_nodes,
-            omega_hat=omega_hat, use_shipped=use_shipped_tables,
-        )
-        tau_hat, w_hat, err_hat = (served.nodes, served.weights,
-                                   served.max_error)
-        provenance = served.provenance.one_line()
+    served = _mm.serve(
+        family="noncrossing_imag", target="inverse_imag",
+        range_value=R, error_bound=scaled_target_error, n_max=max_nodes,
+        omega_hat=omega_hat,
+    )
+    tau_hat, w_hat, err_hat = (served.nodes, served.weights,
+                               served.max_error)
+    provenance = served.provenance.one_line()
 
     tau = tau_hat / x_min
     alpha = w_hat / x_min
@@ -1226,20 +1188,12 @@ def solve_laplace_minimax_imag_interval(
     if with_odd_kernel:
         tau = np.asarray(tau, dtype=np.float64)
         alpha = np.asarray(alpha, dtype=np.float64)
-        if isinstance(picked, _beta_selector.TableSelection):
-            # One certified payload, both parts: the complex table fits
-            # 1/(u - i beta) in modulus, so its imaginary part on the same
-            # nodes IS the odd kernel, at the certified modulus error.
-            alpha_odd = np.ascontiguousarray(
-                np.imag(picked.alpha), dtype=np.float64) / x_min
-            err_odd = float(picked.modulus_error) / x_min
-        else:
-            tau_full, beta, n_extra, err_odd = _augment_odd_kernel_nodes(
-                tau, x_min, x_max, omega_p,
-                gate_error=max(float(target_error), float(err_abs)))
-            alpha = np.concatenate([alpha, np.zeros(n_extra)])
-            tau = tau_full
-            alpha_odd = beta
+        tau_full, beta, n_extra, err_odd = _augment_odd_kernel_nodes(
+            tau, x_min, x_max, omega_p,
+            gate_error=max(float(target_error), float(err_abs)))
+        alpha = np.concatenate([alpha, np.zeros(n_extra)])
+        tau = tau_full
+        alpha_odd = beta
 
     return LaplaceMinimaxQuadrature(
         x_min=x_min,
@@ -1261,7 +1215,6 @@ def solve_phase_minimax_bandwidth(
     max_nodes: int = 500,
     eps_q: float = 1.0e-3,
     target_kind: str = "hgl",
-    use_shipped_tables: bool = True,
 ) -> CrossingMinimaxQuadrature:
     """Fit crossing regularization target on ``[0, A_dim]`` as ``sum alpha_l sin(tau_l u)``.
 
@@ -1281,7 +1234,7 @@ def solve_phase_minimax_bandwidth(
     served = _mm.serve(
         family="crossing", target=kind,
         range_value=A_dim, error_bound=target_error, n_max=max_nodes,
-        eps_q=eps_q, use_shipped=bool(use_shipped_tables),
+        eps_q=eps_q,
     )
     tau_hat, w_hat, err = served.nodes, served.weights, served.max_error
     return CrossingMinimaxQuadrature(
@@ -1408,7 +1361,6 @@ def build_static_quadrature(wfns, minimax_config, *,
         x_max,
         target_error=float(minimax_config.target_error),
         max_nodes=int(minimax_config.max_nodes),
-        use_shipped_tables=bool(minimax_config.use_shipped_tables),
     )
     if print_fn is not None:
         R = quad.x_max / quad.x_min
@@ -1437,7 +1389,6 @@ def build_imag_quadrature(quad, omega_p, minimax_config, *, print_fn=None,
         quad.x_min, quad.x_max, float(omega_p),
         target_error=float(minimax_config.target_error),
         max_nodes=int(minimax_config.max_nodes),
-        use_shipped_tables=bool(minimax_config.use_shipped_tables),
         print_fn=print_fn,
         with_odd_kernel=bool(with_odd_kernel),
     )

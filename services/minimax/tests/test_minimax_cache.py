@@ -260,7 +260,6 @@ def test_a_solve_writes_the_versioned_entry_and_reuses_it(isolated_cache,
     assertion below is about provenance and bytes.
     """
     pytest.importorskip("scipy")
-    monkeypatch.setenv(M.RUNTIME_SOLVE_ENV, "1")
     first = M.solve_uncertified(family="crossing", target="hgl",
                                 range_value=10.0, error_bound=1.0e-4,
                                 n_max=30, eps_q=1.0e-3)

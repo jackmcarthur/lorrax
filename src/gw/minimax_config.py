@@ -19,13 +19,8 @@ class MinimaxConfig:
 
     target_error: float = 1.0e-6
     max_nodes: int = 64
-    regenerate_tables: bool = False
     energy_reference: str | float | int | None = "midgap"
     crossing_max_nodes: int = 500
     crossing_eps_q: float = 1.0e-3
-
-    @property
-    def use_shipped_tables(self) -> bool:
-        return not bool(self.regenerate_tables)
 
 

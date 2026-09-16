@@ -116,14 +116,12 @@ from minimax._catalog import (
 #: shipped catalog quietly becomes unreachable bytes.
 from minimax import beta_selector, damped_line_selector, family_axes
 from minimax.door import (
-    RUNTIME_SOLVE_ENV,
     catalog,
     family_for_character,
     lookup,
     nearest_certified,
     noncrossing_kappa0,
     reset_announcements,
-    runtime_solve_allowed,
     serve,
     solve_uncertified,
 )
@@ -263,7 +261,7 @@ __all__ = [
     # --- lookup, and only lookup -------------------------------------------
     "beta_selector", "damped_line_selector", "family_axes",
     "lookup", "nearest_certified", "catalog", "serve", "solve_uncertified",
-    "runtime_solve_allowed", "RUNTIME_SOLVE_ENV", "reset_announcements",
+    "reset_announcements",
     # --- the catalog algebra, for the certification tier and the census ----
     "CatalogEntry", "catalog_view", "load_catalog_dict", "parse_catalog",
     "parse_entry", "select_entry", "nearest_below", "clear_caches",
