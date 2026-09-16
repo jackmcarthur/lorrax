@@ -109,6 +109,8 @@ _L3_MODULES = frozenset({
     "runtime.jax_support", "runtime.pjrt_log_filter",
     # stdlib-only package-origin sealing at the first runtime boundary
     "runtime.source_closure",
+    # stdlib-only site network policy resolved before backend initialization
+    "runtime.network_env",
     # ``runtime.env_flags`` — THE boolean-env grammar, and its level is the
     # whole reason it is here rather than in ``gw.gw_config``.  The parsers
     # that still swallowed an unrecognised token silently
