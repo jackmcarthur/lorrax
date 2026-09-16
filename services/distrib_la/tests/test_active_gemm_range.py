@@ -75,3 +75,73 @@ def test_active_full_range_is_bitwise_original_dense(dtype):
         active=plan.active_range(a,b,lo,hi)
         for expected,actual in zip(dense.addressable_shards,active.addressable_shards):
             np.testing.assert_array_equal(np.asarray(expected.data),np.asarray(actual.data))
+
+
+def test_prepared_active_range_captures_per_parent_bounds_and_full_range():
+    """Prepared cuBLASMp calls retain immutable bounds and beta*C semantics."""
+    if jax.process_count() != 4:
+        pytest.skip('Requires four processes and four GPUs')
+    mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ('x', 'y'))
+    sharding = NamedSharding(mesh, P(None, 'x', 'y'))
+    rng = np.random.default_rng(20260921)
+    nq, m, k, n = 3, 32, 64, 48
+    alpha, beta = 0.7 + 0.2j, -0.3 + 0.1j
+
+    def values(shape):
+        return (rng.standard_normal(shape) +
+                1j * rng.standard_normal(shape)).astype(np.complex128)
+
+    a = values((nq, m, k))
+    b = values((nq, k, n))
+    c = values((nq, m, n))
+    weights = values((nq, k))
+    lo = np.asarray([5, 30, 37], np.int64)
+    hi = np.asarray([11, 38, 37], np.int64)
+    captured_lo, captured_hi = lo.copy(), hi.copy()
+    plan = gemm_plan(
+        mesh, m=m, k=k, n=n, nq=nq, dtype=jnp.complex128,
+        alpha=alpha, beta=beta, enable_active_range=True)
+    prepared = plan.prepare_active_range(lo, hi)
+    # Mutating caller-owned arrays after preparation cannot alter FFI metadata.
+    lo[:] = 0
+    hi[:] = k
+
+    poisoned_a, poisoned_b, poisoned_weights = a.copy(), b.copy(), weights.copy()
+    expected = np.empty_like(c)
+    for iq, (begin, end) in enumerate(zip(captured_lo, captured_hi)):
+        poisoned_a[iq, :, :begin] = np.nan
+        poisoned_a[iq, :, end:] = np.nan
+        poisoned_b[iq, :begin, :] = np.nan
+        poisoned_b[iq, end:, :] = np.nan
+        poisoned_weights[iq, :begin] = np.nan
+        poisoned_weights[iq, end:] = np.nan
+        expected[iq] = (
+            alpha * ((a[iq, :, begin:end] *
+                      weights[iq, None, begin:end]) @ b[iq, begin:end, :])
+            + beta * c[iq]
+        )
+
+    def put(value):
+        return device_put_process_local(value, sharding)
+
+    @jax.jit
+    def apply(a_arg, b_arg, c_arg, weight_arg):
+        return prepared(a_arg, b_arg, C=c_arg, weights=weight_arg)
+
+    actual = apply(
+        put(poisoned_a), put(poisoned_b), put(c),
+        device_put_process_local(poisoned_weights,
+                                 NamedSharding(mesh, P())))
+    assert tuple(actual.sharding.spec) == (None, 'x', 'y')
+    for shard in actual.addressable_shards:
+        np.testing.assert_allclose(
+            np.asarray(shard.data), expected[shard.index],
+            rtol=2e-12, atol=2e-12)
+
+    full = plan.prepare_active_range(0, k)
+    dense = plan(put(a), put(b), C=put(c))
+    full_result = full(put(a), put(b), C=put(c))
+    for expected_shard, actual_shard in zip(
+            dense.addressable_shards, full_result.addressable_shards):
+        np.testing.assert_array_equal(
+            np.asarray(expected_shard.data), np.asarray(actual_shard.data))

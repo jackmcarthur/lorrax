@@ -205,7 +205,7 @@ hang documented at the top applies to the dilation extent 2n as well.
 | `dispatch_batched_eigh(A, mesh, backend, *, batched_route='batch_reshard')` | The one legacy entry point kept for `gw.qsgw_density`; it passes the same public route selection into `plan`. |
 | `matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N', backend='auto', batched_route='batch_reshard')` | Top-level distributed GEMM. Rank 2 uses `P('x','y')`; rank 3 uses `P(None,'x','y')`. The default stages complete local matrices; explicit `auto` uses the distributed provider chosen by `backend`. |
 | `resolve_matmul_backend(requested, mesh, *, batched_route='batch_reshard') -> str`, `MATMUL_BACKEND_CHOICES` | Raising GEMM-provider probe and its public vocabulary. `cusolvermp` is an accepted alias for `cublasmp`; `off` is legal only for the provider-free staged route. |
-| `gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0, layout='face', enable_active_range=False) -> GemmPlan` | Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE — the `matmul` analogue of `plan_polar_factor`. `GemmPlan(A, B, C=None, *, out=None)` is trace-safe. Opt-in `GemmPlan.active_range(A, B, lo, hi, C=None, *, out=None, weights=None)` contracts exact dynamic intervals without changing operand allocation shapes; optional weights have shape `(nq,K)`. |
+| `gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0, layout='face', enable_active_range=False) -> GemmPlan` | Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE — the `matmul` analogue of `plan_polar_factor`. `GemmPlan(A, B, C=None, *, out=None)` is trace-safe. Opt-in `GemmPlan.active_range(A, B, lo, hi, C=None, *, out=None, weights=None)` contracts exact dynamic intervals without changing operand allocation shapes; optional weights have shape `(nq,K)`. `GemmPlan.prepare_active_range(lo, hi)` captures eager bounds and returns the same operand interface without runtime bound operands. |
 
 Two phases and they stay two: only platform and handler guards can fire at
 resolve time — operand dtype, rank and extent are trace-time facts — so a
@@ -527,6 +527,8 @@ plan = distrib_la.gemm_plan(
 # ... hoisted out of the k/tau loop; by here its kernels are warm ...
 D = plan(A, B)                 # inside jit/scan: no dlopen, no probe
 D_active = plan.active_range(A, B, lo, hi, weights=w)  # w.shape == (nq, k)
+prepared = plan.prepare_active_range(lo, hi)  # eager, outside jit/scan
+D_prepared = prepared(A, B, weights=w)        # no runtime bounds operands
 ```
 
 The exact active-interval contract, native descriptor-view design, validation
@@ -547,6 +549,25 @@ selected, bounded panels. The face implementation is CUDA-only because the
 planned ScaLAPACK and SLATE GEMM providers do not exist in this tree. Thus a
 CPU `layout='face'` plan refuses by name; there is no silent fallback that
 would materialize a full matrix on each rank.
+
+Use `prepare_active_range(lo, hi)` when an interval is known on the host and
+will be reused. It validates integer scalar or `(nq,)` bounds immediately and
+returns `prepared(A, B, C=None, *, out=None, weights=None)`. The returned
+callable captures a private immutable copy of the bounds. CUDA passes that
+copy as native FFI metadata, avoiding a device-to-host bounds copy and the
+associated stream synchronization on each call; CPU closes over the same
+constants in the JAX panel kernel. An explicit prepared CUDA request probes
+the prepared provider target before returning.
+
+Each prepared callable is owned by its caller and compiles lazily on first
+use. Constructing it neither runs a dummy GEMM nor allocates matrix-shaped
+warmup operands. Different bounds can therefore produce different compiled
+executables, so callers should retain and reuse the callable for each interval
+they need rather than creating one inside a loop. The service keeps no global
+cache of bound variants. Full-range prepared calls retain the existing dense
+operation, including its numerical order. CUDA local calls retain the full
+weighted-A allocation; preparing bounds only removes the runtime metadata
+transfer and synchronization.
 
 Deliberately narrower than `matmul()`:
 
@@ -1212,3 +1233,18 @@ The native doors are `lrx_eigh_workspace_bytes` and `lrx_gemm_workspace_bytes` (
 execution descriptors; a context info pointer is the non-null address token and is never read).
 Operand and output carriers, transpose staging, communication buffers and persistent context
 resources are the caller's to admit.
+## GEMM plans without dummy execution
+
+`gemm_plan(..., warmup=False)` and `local_gemm_plan(..., warmup=False)`
+create the same trace-safe callables as the default `warmup=True`, but do
+not allocate dummy matrix operands or compile/run standalone warmup GEMMs.
+Shape validation, backend checks and distributed communicator setup still
+happen at plan construction. The first real call pays executable compilation
+and native descriptor/workspace initialization. Dense and active-range calls,
+accumulation and donation keep the existing contracts.
+
+Use this option when a one-shot outer JIT compiles the GEMM with its surrounding
+operations, so standalone dummy executions would be redundant. Keep the
+default when deliberately moving first-use work ahead of a timed hot loop.
+The centroid C builder requests `warmup=False` in both band layouts; it does
+not change its GEMM backend or replicate any additional matrix dimension.

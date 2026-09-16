@@ -78,6 +78,7 @@ one sentence and a link.
 | **where a source module or service package lives** | [Codebase](codebase.md) | the one-line inventory of every GW, common, centroid, file-I/O, and service source package. |
 | **which capabilities are services** | [Substrate services](architecture/services.md) | the service inventory, layering boundary, and which services expose or hide backend choice. Individual caller contracts live on the service pages below. |
 | **how fixed-memory Davidson and shared subspace algebra are planned** | [`planned Davidson`](services/davidson.md) | callable/data API, active storage, scratch planning, status and device contract. |
+| **how reusable block orthogonalization is planned** | [`orthogonalization`](services/orthogonalization.md) | CGS2 interval API, native coefficient reductions, aliases and workspace scope. |
 | **how Lanczos active storage and reorthogonalization are planned** | [`planned Lanczos`](services/lanczos.md) | Active windows, row-oriented basis, restart and sharding. |
 | **how compact pseudopotential coupling is applied** | [`PSP coupling`](services/psp_compact_coupling.md) | Canonical SOC channel blocks, opt-in rollout and memory scope. |
 | **how GW fixed-shape kernels avoid unused work** | [`GW kernels`](dev/gw_fixed_shape_kernels.md) | Bracket scan, active pole counts and reusable postprocessing. |

@@ -399,10 +399,12 @@ def fit_zeta_to_h5(
                     or int(psi_nmu_parent.shape[2]) != _ns_face):
                 raise ValueError("fit_zeta_to_h5: parent face band/spin extents differ.")
             _mu_gemm = int(k_unfold_plan.n_centroid_packed)
+            # C's enclosing JIT compiles this GEMM; standalone dummy warmup
+            # would compile and execute it again without reusing that executable.
             _face_gemm = _gemm_plan(
                 mesh_xy, m=_mu_gemm * _ns_face, k=_nb_face,
                 n=_mu_gemm * _ns_face, nq=int(k_unfold_plan.n_parent),
-                dtype=jnp.complex128, layout=layout)
+                dtype=jnp.complex128, layout=layout, warmup=False)
             print_fn(f"  {_face_gemm.describe()}")
             _off = int(band_range_full[0])
             _idx = np.arange(_nb_face)

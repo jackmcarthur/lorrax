@@ -19,6 +19,19 @@ def _spec(array):
     return jax.ShapeDtypeStruct(array.shape, array.dtype)
 
 
+def _orthogonalization_range(start, count, capacity):
+    """Refuse invalid wide metadata instead of wrapping it into a valid int32."""
+    start, count = jnp.asarray(start), jnp.asarray(count)
+    if (start.ndim or count.ndim or
+            not jnp.issubdtype(start.dtype, jnp.integer) or
+            not jnp.issubdtype(count.dtype, jnp.integer)):
+        raise TypeError('orthogonalization start/count must be integer scalars')
+    valid = ((start >= 0) & (start <= capacity) & (count >= 0) &
+             (count <= capacity) & (start+count <= capacity))
+    descriptor = jnp.stack((start.astype(jnp.int32), count.astype(jnp.int32)))
+    return jnp.where(valid, descriptor, jnp.full((2,), -1, jnp.int32))
+
+
 def _flat(array, *, local_shard=False):
     if array.dtype != jnp.complex128:
         raise TypeError('active subspace currently requires complex128')
@@ -136,9 +149,57 @@ class LocalSubspacePlan:
         call = jax.ffi.ffi_call(
             'lorrax_active_subspace_ortho', (_spec(self._flat(p)), work, self.workspace_specs['blas']),
             input_layouts=[(0, 1), (0, 1), (0,)],
-            output_layouts=[(0, 1), (1, 0), (0,)], vmap_method='sequential')
-        result, _, _ = call(self._flat(v), self._flat(p), jnp.array([start, active], jnp.int32))
+            output_layouts=[(0, 1), (1, 0), (0,)], input_output_aliases={1: 0},
+            vmap_method='sequential')
+        result, _, _ = call(self._flat(v), self._flat(p),
+                             _orthogonalization_range(start, active, self.capacity))
         return result.reshape(p.shape)
+
+    def distributed_orthogonalize(self, v, p, active, *, start, context, world):
+        """Two native CGS passes; only active coefficients cross the mesh."""
+        if p.shape[0] > (self.max_block_size or self.n_eig):
+            raise ValueError('orthogonalization block exceeds planned scratch width')
+        if v.shape[0] != self.capacity or v.shape[1:] != p.shape[1:]:
+            raise ValueError('active orthogonalization buffer geometry differs from plan')
+        flat = self._flat(p)
+        outputs = (_spec(flat),
+                   jax.ShapeDtypeStruct((self.capacity*p.shape[0],), jnp.complex128),
+                   jax.ShapeDtypeStruct((2*world,), jnp.int32),
+                   self.workspace_specs['blas'])
+        call = jax.ffi.ffi_call(
+            'lorrax_active_subspace_distributed_ortho', outputs,
+            input_layouts=[(0, 1), (0, 1), (0,)],
+            output_layouts=[(0, 1), (0,), (0,), (0,)],
+            input_output_aliases={1: 0}, has_side_effect=True,
+            vmap_method='sequential')
+        result, _, _, _ = call(self._flat(v), flat,
+            _orthogonalization_range(start, active, self.capacity), ctx_handle=context)
+        return result.reshape(p.shape)
+
+    def subtract_projection(self, v, p, coefficients, active, *, start=0,
+                            next_gram=False):
+        """Subtract in place, optionally forming the next local overlap matrix."""
+        if (v.shape[0] != self.capacity or v.shape[1:] != p.shape[1:] or
+                coefficients.shape != (self.capacity, p.shape[0]) or
+                not 1 <= p.shape[0] <= (self.max_block_size or self.n_eig)):
+            raise ValueError('projection subtraction differs from planned geometry')
+        flat = self._flat(p)
+        if next_gram:
+            outputs = (_spec(flat), _spec(coefficients), self.workspace_specs['blas'])
+            layouts = [(0, 1), (1, 0), (0,)]
+            aliases = {1: 0, 2: 1}
+        else:
+            outputs = (_spec(flat), self.workspace_specs['blas'])
+            layouts, aliases = [(0, 1), (0,)], {1: 0}
+        call = jax.ffi.ffi_call(
+            'lorrax_active_subspace_subtract'+('_gram' if next_gram else ''),
+            outputs, input_layouts=[(0, 1), (0, 1), (1, 0), (0,)],
+            output_layouts=layouts, input_output_aliases=aliases,
+            vmap_method='sequential')
+        result = call(self._flat(v), flat, self._flat(coefficients),
+                      _orthogonalization_range(start, active, self.capacity))
+        return ((result[0].reshape(p.shape), result[1]) if next_gram
+                else result[0].reshape(p.shape))
 
 
     def gram(self, v, p, active, *, start=0):
@@ -192,7 +253,7 @@ def plan_local_subspace(*, capacity: int, n_eig: int, max_block_size: int | None
         result = probe_target('lorrax_active_subspace_'+op, 'CUDA')
         if not result.ok:
             raise RuntimeError(f'active subspace provider unavailable: {result}')
-    if max_block_size is not None and (not isinstance(max_block_size, int) or max_block_size < 1):
-        raise ValueError('max_block_size must be a positive Python integer')
+    if max_block_size is not None and (not isinstance(max_block_size, int) or not 1 <= max_block_size < 2**31):
+        raise ValueError('max_block_size must be a positive Python integer below 2**31')
     return LocalSubspacePlan(capacity, n_eig, active_eigh_workspace(capacity),
                              max_block_size=max_block_size)

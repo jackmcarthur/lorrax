@@ -143,3 +143,8 @@ Native-provider consumers must rebuild the canonical provider with this
 source revision: active Gram is a new target, and the window descriptors
 for reconstruction/CGS2 have changed. The provider probe refuses a missing
 target; it does not silently select padded math or a CPU fallback.
+
+The reusable [orthogonalization service](orthogonalization.md) owns the CGS2
+provider, coefficient communication, and correction-buffer alias contracts.
+Its standalone planner omits eigensolver workspace and is available to callers
+that only need to project a block out of an existing basis.

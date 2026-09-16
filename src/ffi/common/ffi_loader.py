@@ -102,8 +102,10 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cusolvermp_batched_potrs":    "CusolverMpBatchedPotrsFfi",
     "lorrax_cusolvermp_batched_solve_lu": "CusolverMpBatchedSolveLuFfi",
     "lorrax_cublas_local_active_range_gemm": "CublasLocalActiveRangeGemmFfi",
+    "lorrax_cublas_local_prepared_active_range_gemm": "CublasLocalPreparedActiveRangeGemmFfi",
     "lorrax_cublasmp_batched_gemm":       "CublasMpBatchedGemmFfi",
     "lorrax_cublasmp_active_range_gemm":  "CublasMpActiveRangeGemmFfi",
+    "lorrax_cublasmp_prepared_active_range_gemm": "CublasMpPreparedActiveRangeGemmFfi",
     "lorrax_cublasmp_batched_w_solve":    "CublasMpBatchedWSolveFfi",
     # cuFFT strided flat-k batched-FFT handlers (cpp/cufft) — the CUDA
     # platform mirror of the mklfft host handlers below.  The target STRINGS

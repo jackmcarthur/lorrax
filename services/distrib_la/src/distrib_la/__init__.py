@@ -56,9 +56,12 @@ layout='face', enable_active_range=False) -> GemmPlan``
     B, C=None, *, out=None)`` is trace-safe. With active ranges enabled,
     ``GemmPlan.active_range(A, B, lo, hi, C=None, *, out=None, weights=None)``
     contracts an exact dynamic interval in the fixed-size operands. Optional
-    ``weights`` has shape ``(nq, k)``. The face layout uses cuBLASMp descriptor
-    views; the axis layout uses local cuBLAS pointer views on CUDA and bounded
-    JAX dot panels on CPU. See ``docs/dev/active_gemm_ranges.md``.
+    ``weights`` has shape ``(nq, k)``. When bounds are known before tracing,
+    ``GemmPlan.prepare_active_range(lo, hi)`` returns a callable with the same
+    operand, weighting and accumulation contract but no runtime bounds
+    operands. The face layout uses cuBLASMp descriptor views; the axis layout
+    uses local cuBLAS pointer views on CUDA and bounded JAX dot panels on CPU.
+    See ``docs/dev/active_gemm_ranges.md``.
 ``hermitian_part(a)``, ``hermitian_block(block, off, corner)``, ``join_columns(a, b)``, ``diagonal_like(values, like)``, ``on_face(fn, out, *operands, **static)``
     Block glue for stacked ``[b, R, R]`` operators and ``[b, n, R]`` panels
     that keeps each result on its operand's ``('x','y')`` face. Eager
@@ -106,7 +109,7 @@ from __future__ import annotations
 
 from distrib_la.blocks import (diagonal_like, face_sharding, hermitian_block,
                                hermitian_part, join_columns, on_face)
-from distrib_la.subspace import plan_subspace
+from distrib_la.subspace import plan_orthogonalization, plan_subspace
 from distrib_la.active_subspace import LocalSubspacePlan, plan_local_subspace
 from distrib_la.workspace import workspace_bytes_per_rank, matmul_workspace_bytes_per_rank
 from distrib_la.dispatch import dispatch_batched_eigh
@@ -152,6 +155,7 @@ from distrib_la.resolve import (
 
 __all__ = [
     "LocalSubspacePlan", "plan_local_subspace", "plan_subspace",
+    "plan_orthogonalization",
     # face-pinned block glue for stacked [b, R, R] operators
     "face_sharding", "on_face", "hermitian_part", "hermitian_block",
     "join_columns", "diagonal_like",
