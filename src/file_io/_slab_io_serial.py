@@ -221,7 +221,10 @@ class _SerialBackend(_DatasetGeometry):
     #: journal_stack`` for why the door does not name a library of its own.
     journal_stack = STACK_H5PY
 
-    def __init__(self, path: str, mesh: Mesh, mode: str = "w") -> None:
+    def __init__(self, path: str, mesh: Mesh, *, mode: str) -> None:
+        # No default, for the reason given at ``_FfiBackend.__init__``: a
+        # ``"w"`` default replaces the inode a mode-less caller meant to
+        # read (KNOWN_LORRAX_ISSUES 2026-09-15 TRREF).
         # The tier is selectable only at P == 1, and it says so here rather
         # than trusting its one caller.  A fallback for a broken
         # multi-process launch is exactly what this must not become: at

@@ -36,3 +36,28 @@ def test_open_file_refuses_a_missing_mode():
     with pytest.raises(TypeError, match="mode"):
         _binds(ffi_io.open_file, "file.h5", mesh=object())
     _binds(ffi_io.open_file, "file.h5", mode="r", mesh=object())
+
+
+@pytest.mark.parametrize(
+    "module,name",
+    (("file_io._slab_io_ffi", "_FfiBackend"),
+     ("file_io._slab_io_serial", "_SerialBackend")),
+)
+def test_each_transport_backend_refuses_a_missing_mode(module, name):
+    """The same door one layer down.
+
+    ``SlabIO`` always passes ``mode=``, so these defaults were unreachable
+    — but an unreachable truncating default is the defect waiting for its
+    next direct caller, and both backends are constructed directly by
+    ``tests/test_slab_io_emulated_mesh.py``.  Binding only; nothing opens.
+    """
+    import importlib
+
+    backend = getattr(importlib.import_module(module), name)
+    parameter = inspect.signature(backend).parameters["mode"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+    with pytest.raises(TypeError, match="mode"):
+        _binds(backend, "file.h5", mesh=object())
+    for mode in ("r", "a", "w"):
+        _binds(backend, "file.h5", mesh=object(), mode=mode)

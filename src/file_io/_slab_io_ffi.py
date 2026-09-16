@@ -1779,7 +1779,14 @@ class _FfiBackend(_DatasetGeometry):
     #: subject is which library touched the file.
     journal_stack = _J_FFI
 
-    def __init__(self, path: str, mesh: Mesh, mode: str = "w") -> None:
+    def __init__(self, path: str, mesh: Mesh, *, mode: str) -> None:
+        # ``mode`` carries NO DEFAULT, for the reason ``SlabIO`` and
+        # ``ffi.io.open_file`` carry none: a default of ``"w"`` sends a
+        # caller that forgot the keyword down the replace path (rank-0
+        # unlink + H5Fcreate TRUNC) and destroys the file it meant to read
+        # (KNOWN_LORRAX_ISSUES 2026-09-15 TRREF).  The public door was
+        # closed on 2026-09-15 (f6709333); this is the same door one layer
+        # down, where a future direct constructor would walk into it again.
         # Lazy import — keeps file_io importable without the FFI built.
         from ffi.phdf5 import open_file as _open_file, close_file as _close_file
         from ffi.common import ffi_loader as _loader
