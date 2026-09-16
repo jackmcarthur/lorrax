@@ -10,7 +10,7 @@ def test_moment_diagnostics_tracks_current_poles_and_projected_defects():
     import jax
     import jax.numpy as jnp
 
-    from gw.shared_pole_constructor import _model_diagnostics
+    from gw.shared_pole_directions import _model_diagnostics
 
     def matmul(a, b, *, transa="N", transb="N"):
         if transa == "C":

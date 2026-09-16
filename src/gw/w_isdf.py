@@ -974,7 +974,7 @@ def response_coulomb_powers(meta, config, *, mesh_xy, bank_io, q_span):
                                 authenticate_coulomb)
     authenticate_coulomb(bank_io, bank_io["coulomb"]["q_irr_full_idx"])
     receipt = _receipt("coulomb", {}, bank_io)
-    execute = _bank_execution(meta, mesh_xy, bank_io, receipt, config)
+    execute = _bank_execution(meta, mesh_xy, receipt, config)
     h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute)
     receipt.update(support_ranks=ranks, completion=True)
     return h, hi, receipt

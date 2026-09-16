@@ -10,10 +10,10 @@ def check(mesh):
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     import distrib_la as D
-    from gw.shared_pole_constructor import (
-        _direction_states, assemble_shared_pole_pencil, reduce_shared_pole_pencil,
-        shared_pole_reciprocity, shared_pole_passivity,
-    )
+    from gw.shared_pole_directions import _direction_states
+    from gw.shared_pole_gates import shared_pole_passivity, shared_pole_reciprocity
+    from gw.shared_pole_pencil import assemble_shared_pole_pencil
+    from gw.shared_pole_reduction import reduce_shared_pole_pencil
     from gw.shared_pole_local import pack_parent_panels, local_parent_reducer
     from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
     from runtime.padding import padded_axis
@@ -46,7 +46,7 @@ def check(mesh):
                       held=[False, False], z_ry=np.sqrt(points), direction_cutoff=.8,
                       multiplet_relative_tolerance=1e-6)
         states, counts, roles = _direction_states(
-            lambda i, live: tuple(put(a) for a in sample(points[i])), recipe,
+            lambda i: tuple(put(a) for a in sample(points[i])), recipe,
             eigh_plan=ep, svd_plan=sp, matmul=mm, column_extent=extent,
             logical_n=8, admit=lambda side: None, infinity_carrier=2)
         assert states[1][1] is states[0][2] and states[3][1] is states[2][2]

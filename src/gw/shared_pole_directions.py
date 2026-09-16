@@ -7,17 +7,18 @@ model diagnostics evaluated against the bank moments.
 
 from __future__ import annotations
 
-from functools import lru_cache, partial
+from functools import lru_cache
 
+import distrib_la
 import jax
 import jax.numpy as jnp
-from distrib_la import (diagonal_like, face_sharding, hermitian_block, hermitian_part,
-                        join_columns, on_face)
+import numpy as np
+from distrib_la import hermitian_part
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 
 def _sample_point(recipe, sample_id):
     """Read a deduplicated physical point from the canonical role arrays."""
-    import numpy as np
     rows = np.flatnonzero(np.asarray(recipe["distinct_id"]) == sample_id)
     points = [complex(value["real"], value["imag"]) if isinstance(value, dict)
               else complex(value) for value in recipe["z_ry"]]
@@ -40,8 +41,6 @@ def _fit_roles(recipe):
 @lru_cache(maxsize=256)
 def _parent_panel_slice(mesh_xy, width):
     """Slice [b,n,r] direction/action faces without a host or replicated seam."""
-    import jax
-    from jax.sharding import NamedSharding, PartitionSpec as P
     return jax.jit(
         lambda arrays, parent: jax.tree.map(
             lambda a: jax.lax.dynamic_slice_in_dim(a, parent, 1, axis=0)[:, :, :width], arrays),
@@ -52,8 +51,6 @@ def _parent_panel_slice(mesh_xy, width):
 @lru_cache(maxsize=None)
 def _parent_result_slice(mesh_xy):
     """Slice a parent's padded factor and scalar receipts in one executable."""
-    import jax
-    from jax.sharding import NamedSharding, PartitionSpec as P
     face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     scalar = NamedSharding(mesh_xy, P())
     return jax.jit(
@@ -65,16 +62,12 @@ def _parent_result_slice(mesh_xy):
 @lru_cache(maxsize=None)
 def _hermitian_part_kernel(mesh):
     """Reuse Hermitian projection on current [b,n,n] response faces."""
-    import jax
-    from jax.sharding import NamedSharding, PartitionSpec as P
     return jax.jit(hermitian_part, out_shardings=NamedSharding(mesh, P(None, 'x', 'y')))
 
 
 @lru_cache(maxsize=None)
 def _public_factor_kernel(mesh):
     """Insert the scalar-spin axis without recreating the executable."""
-    import jax
-    from jax.sharding import NamedSharding, PartitionSpec as P
     return jax.jit(lambda value: value[:, :, None, :],
                    out_shardings=NamedSharding(mesh, P(None, 'x', None, 'y')))
 
@@ -82,8 +75,6 @@ def _public_factor_kernel(mesh):
 @lru_cache(maxsize=None)
 def _stack_model_kernel(mesh):
     """Stack the current admitted factor/pole/count batch on named layouts."""
-    import jax
-    from jax.sharding import NamedSharding, PartitionSpec as P
     return jax.jit(
         lambda parts: tuple(jnp.concatenate([row[i] for row in parts], axis=0)
                             for i in range(3)),
@@ -103,13 +94,10 @@ def _odd_partner_directions(q, output, cutoff, *, eigh_plan, matmul, column_exte
     cross to the host. Returns (orthonormal directions [b,n,r], widths) or
     (None, None) when nothing survives.
     """
-    import distrib_la
-    import numpy as np
-
-    hermitian_part = _hermitian_part_kernel(eigh_plan.mesh)
+    hermitian_kernel = _hermitian_part_kernel(eigh_plan.mesh)
     remainder = output - matmul(q, matmul(q, output, transa="C"))
-    top = np.asarray(eigh_plan.batched(hermitian_part(matmul(output, output, transb="C")))[0])[..., -1]
-    perp = hermitian_part(matmul(remainder, remainder, transb="C"))
+    top = np.asarray(eigh_plan.batched(hermitian_kernel(matmul(output, output, transb="C")))[0])[..., -1]
+    perp = hermitian_kernel(matmul(remainder, remainder, transb="C"))
     values = np.asarray(eigh_plan.batched(perp)[0])[..., ::-1]
     counts = [int(np.sum(row > float(cutoff) ** 2 * float(t)))
               for row, t in zip(np.atleast_2d(values), np.atleast_1d(top))]
@@ -125,7 +113,7 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
                       read_mirror=None):
     """Select each q row independently from a bounded batch of fitted samples.
 
-    ``read_sample`` returns W/dW [b,n,n] faces. Only spectra cross the host;
+    ``read_sample(sample_id)`` returns W/dW [b,n,n] faces. Only spectra cross the host;
     Output states keep their batch axis. Counts and role receipts are small
     host metadata; the packer compacts each parent's original port carriers.
 
@@ -137,10 +125,7 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
     one fitted recipe id at -conj(z), which then selects no directions of its
     own. Mirrors follow all original states in the same order.
     """
-    import distrib_la
-    import numpy as np
-
-    hermitian_part = _hermitian_part_kernel(eigh_plan.mesh)
+    hermitian_kernel = _hermitian_part_kernel(eigh_plan.mesh)
     fit_roles = _fit_roles(recipe)
     fit_ids = [int(i) for i in recipe["fit_ids"]]
     mirror_source = {}
@@ -163,7 +148,7 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
         if sample_id in skip:
             continue
         admit(largest_side())
-        w, derivative = read_sample(int(sample_id), states)
+        w, derivative = read_sample(int(sample_id))
         if not roles:
             roles = [[] for _ in range(w.shape[0])]
             mirror_roles = [[] for _ in range(w.shape[0])]
@@ -180,7 +165,7 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
             elif kind == "imaginary":
                 width = min(logical_n, max(1, int(recipe["imaginary_width"])))
                 q_batch, values = distrib_la.leading_eigenvectors(
-                    hermitian_part(-w), width, eigh_plan=eigh_plan,
+                    hermitian_kernel(-w), width, eigh_plan=eigh_plan,
                     column_extent=column_extent,
                     multiplet_tol=recipe["multiplet_relative_tolerance"])
             else:
@@ -229,7 +214,7 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
             elif read_mirror is not None:
                 w_m, d_m = read_mirror(int(sample_id))
             else:
-                w_m, d_m = read_sample(mirror_source[int(sample_id)], states)
+                w_m, d_m = read_sample(mirror_source[int(sample_id)])
             # W(-z) = W(-conj z)^H on Q; W(-conj z) on the partner's O; in both
             # cases dW/dz at the mirror node is -2 node dW/ds(-conj z) (adjoint on Q).
             for index in range(first, len(states)):

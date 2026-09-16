@@ -298,22 +298,32 @@ def _resource_hash(path, size, mtime_ns):
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def authenticate_coulomb(bank_io, qids):
-    """Authenticate bounded-read Coulomb resource against its fixed identity."""
+def resource_digest(path):
+    """SHA256 of one immutable resource: read on rank 0, broadcast to all.
+
+    The producer stamps a resource with this and every consumer checks it with
+    the same call, so the two cannot drift. Every rank leaves it with the same
+    string, which is what keeps a refusal from being rank-conditional
+    (INVARIANTS 21).
+    """
     from jax.experimental import multihost_utils
 
-    resource = bank_io["coulomb"]
-    if resource["basis"] != "canonical" or not np.array_equal(
-            resource["q_irr_full_idx"], qids):
-        raise ValueError("GATE response_coulomb_identity: wrong basis/q order")
-    path = Path(resource["path"])
+    path = Path(path)
     stat = path.stat()
     digest = np.zeros(32, dtype=np.uint8)
     if jax.process_index() == 0:
         digest[:] = np.frombuffer(bytes.fromhex(_resource_hash(
             str(path), stat.st_size, stat.st_mtime_ns)), dtype=np.uint8)
-    digest = multihost_utils.broadcast_one_to_all(digest)
-    if bytes(np.asarray(digest)).hex() != resource["sha256"]:
+    return bytes(np.asarray(multihost_utils.broadcast_one_to_all(digest))).hex()
+
+
+def authenticate_coulomb(bank_io, qids):
+    """Authenticate bounded-read Coulomb resource against its fixed identity."""
+    resource = bank_io["coulomb"]
+    if resource["basis"] != "canonical" or not np.array_equal(
+            resource["q_irr_full_idx"], qids):
+        raise ValueError("GATE response_coulomb_identity: wrong basis/q order")
+    if resource_digest(resource["path"]) != resource["sha256"]:
         raise ValueError("GATE response_coulomb_identity: content hash differs")
 
 
@@ -341,17 +351,15 @@ def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
     return dict(gemm=gemm,eigh=eig,total=gemm+eig,scope="actual-shape ISERV query; GEMM persistent plus concurrent eigh scratch")
 
 
-def _bank_execution(meta, mesh_xy, bank_io, receipt, config):
+def _bank_execution(meta, mesh_xy, receipt, config):
     """Compile and admit new dense work; stream outputs are reserved by batch."""
     def execute(kernel, args, stage):
-        timing.fence('bank.compile.' + stage, sync_ranks=True)
-        with timing.section('bank.compile.' + stage):
+        with timing.fenced_section('bank.compile.' + stage):
             started = time.monotonic()
             executable = kernel.lower(*args).compile()
             receipt["seconds"]["compilation"] = (receipt["seconds"].get("compilation", 0.)
                 + time.monotonic() - started)
-        timing.fence('bank.admission.' + stage, sync_ranks=True)
-        with timing.section('bank.admission.' + stage):
+        with timing.fenced_section('bank.admission.' + stage):
             memory = executable.memory_analysis()
             if memory is None:
                 raise ValueError("GATE response_capacity: compiled memory unavailable")
@@ -367,8 +375,7 @@ def _bank_execution(meta, mesh_xy, bank_io, receipt, config):
             receipt["compiled"].append(dict(stage=stage,
                 arguments=memory.argument_size_in_bytes, outputs=memory.output_size_in_bytes,
                 temporaries=memory.temp_size_in_bytes, inherited_stream=stream))
-        timing.fence('bank.execute.' + stage, sync_ranks=True)
-        with timing.section('bank.execute.' + stage):
+        with timing.fenced_section('bank.execute.' + stage):
             started = time.monotonic()
             result = executable(*args)
             jax.block_until_ready(result)
@@ -600,7 +607,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io):
         # M1/M3 are the 1/s and 1/s^2 coefficients; the odd channel starts at
         # 1/z^3, so the same six correlations stay exact on an ordered bank.
         receipt["ordered"] = True
-    execute = _bank_execution(meta, mesh_xy, bank_io, receipt, config)
+    execute = _bank_execution(meta, mesh_xy, receipt, config)
     ledger = meta.shared_pole_capacity
     ambient = ledger.live_stages
     started = time.monotonic()
@@ -777,8 +784,7 @@ def _ordered_cost_probe(wfns, meta, mesh_xy, qid, tau, projections, lw, uw, refs
 
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io):
     """Stage A: one windowed stream per admitted sample batch, all parent faces."""
-    timing.fence('bank.setup', sync_ranks=True)
-    with timing.section('bank.setup'):
+    with timing.fenced_section('bank.setup'):
         from file_io.shared_pole_store import write_shared_pole_bank
         header,qids,census = _bank_context(wfns,meta,sym,bank_io,mesh_xy)
         authenticate_sample_plan(sample_plan,header)
@@ -792,21 +798,18 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         if ordered:
             receipt["ordered"] = True
         started = time.monotonic()
-        execute = _bank_execution(meta,mesh_xy,bank_io,receipt,config)
+        execute = _bank_execution(meta, mesh_xy, receipt, config)
         ledger = meta.shared_pole_capacity
         ambient = ledger.live_stages
-    timing.fence('bank.stream_reference_compile', sync_ranks=True)
-    with timing.section('bank.stream_reference_compile'):
+    with timing.fenced_section('bank.stream_reference_compile'):
         _stream_comparison(wfns,meta,mesh_xy,qids,receipt)
-    timing.fence('bank.window_geometry', sync_ranks=True)
-    with timing.section('bank.window_geometry'):
+    with timing.fenced_section('bank.window_geometry'):
         samples,_,receipt["algebra"] = response_algebra(meta,config,
             mesh_xy=mesh_xy,n=meta.mu_basis.n_packed)
         energy,f,u,reference,_ = response_weights(wfns,meta)
         masks,ft,ut,cells,receipt["windows"] = response_windows(energy,f,u,
             chemical_potential_ry=sample_plan["census"]["mu_ry"])
-    timing.fence('bank.quadrature', sync_ranks=True)
-    with timing.section('bank.quadrature'):
+    with timing.fenced_section('bank.quadrature'):
         import minimax
         bank_rule,laplace_rule = minimax.response_bank_rule,minimax.response_laplace_rule
         receipt["rule_provider"] = "minimax"
@@ -839,8 +842,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             if k not in ("t","projection_value","projection_derivative","coefficient_rows",
                          "odd_projection_value","odd_projection_derivative")}}
             for cell,rr in remote]
-    timing.fence('bank.capacity_planning_compile', sync_ranks=True)
-    with timing.section('bank.capacity_planning_compile'):
+    with timing.fenced_section('bank.capacity_planning_compile'):
         face_bytes = 16*meta.mu_basis.n_packed**2//mesh_xy.size
         # One donated internal [output,q,x,y] carry spans every window. Public
         # writer slices are [q,output,x,y]; only that bounded slice is transposed.
@@ -890,8 +892,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                              f"including live/native costs; remaining device budget is {device_available} B/rank "
                              f"(3U scaling target {scaling_target} B/rank)")
     for q0 in range(0,len(qids),qwidth):
-        timing.fence('bank.panel_admission', sync_ranks=True)
-        with timing.section('bank.panel_admission'):
+        with timing.fenced_section('bank.panel_admission'):
             q1 = min(q0+qwidth,len(qids))
             width = len(z)
             while 2*width*(q1-q0)*face_bytes+dense_bytes(width) > available:
@@ -903,8 +904,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 device_budget_status="PASS",scaling_target_bytes_per_rank=scaling_target,
                 available_device_bytes_per_rank=device_available))
         for lo in range(0,len(z),width):
-            timing.fence('bank.stream_arguments', sync_ranks=True)
-            with timing.section('bank.stream_arguments'):
+            with timing.fenced_section('bank.stream_arguments'):
                 hi = min(lo+width,len(z));a = hi-lo
                 ledger.live_stages = ambient
                 name,_ = _reserve(meta,"bank_outputs",2*a*(q1-q0)*face_bytes + headroom)
@@ -924,8 +924,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     q_ids=tuple(qids[q0:q1]),n_outputs=2*a,
                     pair_mode="laplace_ordered" if ordered else "laplace",bank_carry=True)
             for cell,rr in remote:
-                timing.fence('bank.laplace_arguments', sync_ranks=True)
-                with timing.section('bank.laplace_arguments'):
+                with timing.fenced_section('bank.laplace_arguments'):
                     lower,upper = cell["lower"],cell["upper"]
                     refs = np.asarray(cell["references_ry"])
                     tau = np.asarray(rr["t"])
@@ -970,8 +969,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         _tr_odd_census(receipt,samples,h,chi,dchi,value,z[ia:stop],int(qids[iq]))
                     value = None if marked[0] else value[None]
                     ds = None if marked[1] else ds[None]
-                    timing.fence('bank.write', sync_ranks=True)
-                    with timing.section('bank.write'):
+                    with timing.fenced_section('bank.write'):
                         io_started = time.monotonic()
                         header = write_shared_pole_bank(bank_io["path"],q_span=span,
                             sample_span=(ia,stop),Wc=value,dWc_ds=ds,meta=meta,
@@ -982,8 +980,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 del h
             receipt["batches"].append(dict(q_span=(q0,q1),sample_span=(lo,hi)))
             del raw
-    timing.fence('bank.finalize', sync_ranks=True)
-    with timing.section('bank.finalize'):
+    with timing.fenced_section('bank.finalize'):
         ledger.live_stages = ambient
         receipt["stream_passes"] = len(receipt["batches"])
         receipt["batch_reason"] = "full plan admitted" if len(receipt["batches"]) == 1 else "remaining device-budget panels require bounded replays; see panel_budget and panel_plans"

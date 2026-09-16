@@ -10,8 +10,7 @@ from functools import lru_cache, partial
 
 import jax
 import jax.numpy as jnp
-from distrib_la import (diagonal_like, face_sharding, hermitian_block, hermitian_part,
-                        join_columns, on_face)
+from distrib_la import hermitian_part
 from gw.shared_pole_pencil import _adjoint
 
 
@@ -177,9 +176,11 @@ def _factor_column_permutation(mesh):
             output = jnp.where(belongs[:, None, :], selected, output)
             tile = jax.lax.ppermute(tile, "y", neighbors)
             return (tile, output, (source-1) % ny), None
+        # unroll=1 (the default): the carry is a whole face tile, so unrolling
+        # would hold one copy per y shard instead of one.
         (_, output, _), _ = jax.lax.scan(
             visit, (factor, jnp.zeros_like(factor), jax.lax.axis_index("y")),
-            None, length=ny)
+            None, length=ny, unroll=1)
         return output
     return permute
 

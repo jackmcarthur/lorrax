@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from functools import wraps
 from typing import Any, Callable
 
@@ -604,3 +605,17 @@ def fence(name: str, *, sync_ranks: bool = True) -> None:
     if sync_ranks:
         with section(prefix + ".rank_wait." + band):
             barrier("timing-" + name)
+
+
+@contextmanager
+def fenced_section(name: str, *, sync_ranks: bool = True):
+    """``fence(name)`` and then ``section(name)``, so the name is written once.
+
+    A fully profiled stage is a sequence of these: the fence attributes the
+    device and rank waits to the band that is about to start, and the section
+    then times the band itself.  Spelling the pair by hand let the two names
+    drift apart, which silently files a band's waits under a different band.
+    """
+    fence(name, sync_ranks=sync_ranks)
+    with section(name) as node:
+        yield node

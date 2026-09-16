@@ -7,9 +7,13 @@ tables instead of copying the thresholds into bank/constructor/store/Sigma code.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
+import operator
+
+import numpy as np
 
 RECIPE_VERSION = "shared_real_pole_v1_r3b"
 GATE_VERSION = "shared_real_pole_gates_v1_r3b"
@@ -140,9 +144,13 @@ def representation_row_passed(measured, threshold):
     for key, want in threshold.items():
         got = measured.get(key)
         if isinstance(want, tuple):
-            if got not in want:
-                return False
-        elif bool(got) != bool(want) if isinstance(want, bool) else got != want:
+            matched = got in want
+        elif isinstance(want, bool):
+            # A JSON round trip brings a flag back as 0/1, so compare truth.
+            matched = bool(got) == bool(want)
+        else:
+            matched = got == want
+        if not matched:
             return False
     return True
 
@@ -154,14 +162,12 @@ def retained_moment_row_passed(measured, row):
     calibration band passes at the band ceiling; otherwise the row's own threshold applies.
     ``None`` (nothing measured) is not a pass.
     """
-    import numpy as _np
-
     if not measured:
         return None
     ceiling = (row.get("calibration_range") or (None, row.get("threshold")))[1]
     if ceiling is None:
         return None
-    worst = max(float(_np.max(_np.abs(_np.asarray(value, dtype=float))))
+    worst = max(float(np.max(np.abs(np.asarray(value, dtype=float))))
                 for value in measured.values())
     return bool(worst <= float(ceiling))
 
@@ -189,12 +195,10 @@ def reciprocity_row_verdict(measured):
     :func:`representation_row_passed` exists to fix, and INVARIANTS 23: an
     absent measurement is never PASS.
     """
-    import numpy as _np
-
     if not measured:
         return None
-    applicable = _np.asarray(measured.get("applicable", []), dtype=bool).ravel()
-    passed = _np.asarray(measured.get("passed", []), dtype=bool).ravel()
+    applicable = np.asarray(measured.get("applicable", []), dtype=bool).ravel()
+    passed = np.asarray(measured.get("passed", []), dtype=bool).ravel()
     if applicable.size == 0 or applicable.size != passed.size:
         return None
     if not applicable.any():
@@ -261,7 +265,6 @@ class CapacityLedger:
     """
 
     def __init__(self, meta, *, mesh_xy, device_budget_bytes=None):
-        import operator
         geometry = dict(nq=meta.nk_tot, nspinor=meta.nspinor, nmu=meta.n_rmu,
                         px=mesh_xy.shape['x'], py=mesh_xy.shape['y'])
         self.geometry = {}
@@ -315,7 +318,6 @@ class CapacityLedger:
 
     @staticmethod
     def _bytes(value):
-        import operator
         if isinstance(value, bool):
             raise ValueError("capacity bytes must be nonnegative integers")
         try:
@@ -335,7 +337,6 @@ class CapacityLedger:
         must be charged here OR in a named concurrent reservation, never both.
         No runtime peak is inferred from a successful analytical admission.
         """
-        import copy
         if not isinstance(stage, str) or not stage.strip() or stage in self._accepted:
             raise ValueError(f"capacity stage must be a new nonempty name; got {stage!r}")
         if isinstance(concurrent_with, str):
@@ -450,14 +451,12 @@ class CapacityLedger:
         reconstruct the prefix without duplicating every earlier reservation.
         The default remains the complete ledger snapshot.
         """
-        import operator
         if entry_start is not None:
             if isinstance(entry_start, bool):
                 raise ValueError("capacity entry_start must be an integer index")
             entry_start = operator.index(entry_start)
             if not 0 <= entry_start <= len(self.entries):
                 raise ValueError("capacity entry_start lies outside the ledger")
-        import copy
         snapshot = copy.deepcopy(dict(geometry=self.geometry,
                                   U_bytes_per_rank=self.U_bytes_per_rank,
                                   limit_bytes_per_rank=self.limit_bytes_per_rank,
@@ -516,6 +515,94 @@ def construction_receipt(measurements=None, *, capacity=None, capacity_entry_sta
     return result
 
 
+def build_construction_row(model, counts, diagnostics, *, span, roles, price,
+                           coulomb, native_queries, identity, gates, nspinor,
+                           logical_n, pencil_side, ordered, odd_moments):
+    """Host view of one constructed parent, and the gate rows it measures.
+
+    The constructor has finished q: it holds the model, the device diagnostics
+    the reduction and the checks produced, and the host lists from the held-W
+    and moment stages. This turns those into the two JSON objects the receipt
+    needs -- the per-q ``constructor`` block and the ``measurements`` mapping
+    :func:`construction_receipt` consumes -- so that the driver above it is the
+    physics and this is the bookkeeping.
+
+    Parameters
+    ----------
+    model : tuple
+        ``(b, poles2, active)`` as exported, after the zero policy and the sort.
+    counts : array
+        Active pole count per parent in this row, int64 [b].
+    diagnostics : mapping
+        ``reduction``, ``zero``, ``passive``, ``retained``, ``moment_defects``
+        from the reduction and the gates, and the host ``held``,
+        ``reciprocity`` and ``permutation`` records.
+    price, coulomb, native_queries, identity : mapping / iterable
+        The capacity row for this parent, the Coulomb receipt, the constructor's
+        native workspace queries, and the current state identity.
+    gates : mapping
+        The canonical TRS or ordered gate table, already selected by the caller.
+    nspinor, logical_n, pencil_side : int
+        Deck spin count, logical centroid count, and this parent's pencil side.
+    ordered, odd_moments : bool
+        The route and whether its bank carried the odd z-moments.
+
+    Returns
+    -------
+    (row, measurements)
+    """
+    _, poles, mask = model
+    reduction = diagnostics["reduction"]
+    zero, passive = diagnostics["zero"], diagnostics["passive"]
+    retained, moment_defects = diagnostics["retained"], diagnostics["moment_defects"]
+    held, reciprocity = diagnostics["held"], diagnostics["reciprocity"]
+    r = int(pencil_side)
+    row = {"q_span": list(span), "roles": roles,
+           "diagnostic_operator": "raw-latent-pole-model",
+           "K": np.asarray(counts).tolist(), "J": int(np.unique(np.asarray(poles)[np.asarray(mask)]).size),
+           "damping_fraction": 0.0, "capacity": price, "coulomb": coulomb,
+           "condition": np.asarray(reduction["gram_condition"]).tolist(),
+           "normalized_gram_spectrum": np.asarray(reduction["gram_spectrum_relative"])[..., :int(reduction.get("pencil_side", [r])[0])].tolist(),
+           "native_workspace_queries": [dict(op=op, shapes=shapes, bytes_per_rank=value)
+                                         for (op, shapes), value in native_queries.items()],
+           "retained_moment_relative": {k: np.asarray(v).tolist() for k, v in retained.items()},
+           "moment_defects": {k: {a: np.asarray(value).tolist() for a, value in v.items()}
+                              for k, v in moment_defects.items()},
+           "held_W": held, "permutation": np.asarray(diagnostics["permutation"]).tolist(),
+           "storage_bytes": int(counts[0]) * (16*logical_n + 8)}
+    if ordered:
+        row["ordered"] = {key: np.asarray(reduction[key]).tolist() for key in (
+            "positive_count", "negative_count", "infinite_weight_fraction",
+            "paired_rank", "paired_min_relative")}
+        row["ordered"]["odd_moments"] = odd_moments
+    row["metric_inverse_root"] = {
+        name: np.asarray(reduction[name]).tolist() for name in (
+            "metric_initial_infinity_norm", "metric_inverse_root_iterations",
+            "metric_inverse_root_residual_fro", "metric_inverse_root_residual_relative")}
+    representation_value = ({"nspinor": nspinor, "trs_allowed": False, "ordered": True}
+                            if ordered else {"nspinor": nspinor, "trs_allowed": True})
+    # The reciprocity row compares nothing on a sample whose held reference is
+    # not itself transpose symmetric, so the receipt must say how many records
+    # were actually evaluated instead of asserting a literal pass (INVARIANTS 23).
+    recip_applicable = np.asarray(reciprocity.get("applicable", []), dtype=bool).ravel()
+    measurements = {
+        "normalized_gram_keep": dict(value=int(reduction["retained_rank"][0]), passed=True, reason="normalized Gram cut, current q"),
+        "normalized_gram_validity": dict(value=float(reduction["gram_min_relative"][0]), passed=True, reason="normalized Gram spectrum"),
+        "zero_ritz_policy": dict(value=float(zero["dropped_factor_weight_fraction"][0]), passed=True, reason="physical factor weight, sentinels excluded"),
+        "finite_factors_poles": dict(value=True, passed=True, reason="zero policy, active prefix and exact inert sentinels"),
+        "passivity": dict(value={k: np.asarray(v).tolist() for k, v in passive.items() if k != "passivity"}, passed=True, reason=("signed particle-hole model, Hermitian part at i eta; anti-Hermitian part is the odd channel, reported" if ordered else "raw latent model; authenticated inverse Coulomb square root at current eta; projected operator not measured")),
+        "retained_subspace_moments": dict(value=row["retained_moment_relative"], passed=retained_moment_row_passed(row["retained_moment_relative"], gates["retained_subspace_moments"]), reason=(("signed model z-moments m0..m3 on the original infinity directions, each order against its own norm; projection-accuracy diagnostic beside full_m1/full_m3, not a refusal" if odd_moments else "finite-state ordered bank without odd moments: infinity block uncertified") if ordered else "raw latent Ritz identity: A=Y†GE, B=YA; pencil B†(G,H)B/2 versus model A†(I,Lambda)A/2")),
+        "held_w": dict(value=held, passed=True, reason="raw latent W and dW/ds diagnostics; projected operator not measured; no universal acceptance threshold"),
+        "model_reciprocity": (dict(value=None, passed=None, reason="not applicable: time-reversal-broken samples carry no transpose symmetry") if ordered else dict(value=reciprocity, passed=reciprocity_row_verdict(reciprocity), reason=f"raw latent model sampled W/dW transpose symmetry, conditional on a symmetric reference: {int(recip_applicable.sum())} of {int(recip_applicable.size)} held records evaluated at reference_relative_max={gates['model_reciprocity']['threshold']['reference_relative_max']:g}; NOT_MEASURED when none was; projected operator not measured")),
+        "full_m1_defect": dict(value=float(moment_defects["M1"]["full_relative"][0]), passed=bool(moment_defects["M1"]["full_relative"][0] <= gates["full_m1_defect"]["threshold"]), reason="raw latent model versus physical full M1; projected moment not measured; CD8 diagnostic band, never a refusal"),
+        "full_m3_defect": dict(value=float(moment_defects["M3"]["full_relative"][0]), passed=bool(moment_defects["M3"]["full_relative"][0] <= gates["full_m3_defect"]["threshold"]), reason="raw latent model versus physical full M3; projected moment not measured; CD8 diagnostic band, never a refusal"),
+        "representation": dict(value=representation_value, passed=representation_row_passed(representation_value, gates["representation"]["threshold"]), reason="current typed symmetry capability against the gate threshold"),
+        "capacity": dict(value=price, passed=True, reason="conservative aggregate constructor live-set price"),
+        "sc_rebuild": dict(value=identity, passed=True, reason="current recipe/census authenticated; directions and Ritz model rebuilt"),
+    }
+    return row, measurements
+
+
 def bind_shared_pole_sc_identity(meta, state, *, occupation_state, print_fn):
     """Label current SC scratch, without claiming QP provenance (ruling 22).
 
@@ -523,7 +610,6 @@ def bind_shared_pole_sc_identity(meta, state, *, occupation_state, print_fn):
     digest or the already-bound insulating census digest; compute no new hash.
     These labels MUST NOT authenticate restart membership or skip construction.
     """
-    import operator
 
     iteration = operator.index(state.iteration)
     if isinstance(state.iteration, bool) or iteration < 0:
@@ -641,7 +727,6 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     uses the supplied authenticated full-BZ quadrature weights. This census
     must be rebound at every SC map, after that map's occupation solve.
     """
-    import numpy as np
     from common.units import RYD_TO_EV
 
     stop = wfns.slices.b4_logical - wfns.slices.b0
@@ -801,7 +886,6 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     Expanding intervals enlarge the envelope; policy changes start a new one.
     All ranks execute the metadata work; only ``print_fn`` may filter by rank.
     """
-    import numpy as np
     from common.units import RYD_TO_EV
 
     if config.sigma.w_model != "shared_pole":

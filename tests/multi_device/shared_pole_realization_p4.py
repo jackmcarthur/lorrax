@@ -145,7 +145,7 @@ def main():
     # The evaluated-operator seam must retain exactly the raw factor gate's
     # spectrum/thresholds, while rejecting both overscreening and non-Hermiticity.
     import distrib_la
-    from gw.shared_pole_constructor import shared_pole_passivity, shared_pole_operator_passivity
+    from gw.shared_pole_gates import shared_pole_operator_passivity, shared_pole_passivity
     from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
     eig = distrib_la.plan("eigh", mesh, n=8, backend="distributed")
     def mm(a, b, **kwargs):

@@ -83,7 +83,7 @@ def test_digest_empty_addressable_shards(monkeypatch):
 
 def test_pencil_alias_and_distinct_panels():
     import jax.numpy as jnp
-    from gw.shared_pole_constructor import finite_pencil_column
+    from gw.shared_pole_pencil import finite_pencil_column
     rng = np.random.default_rng(714)
     arrays = [jnp.asarray(rng.normal(size=(1, 4, 3)) +
                           1j*rng.normal(size=(1, 4, 3))) for _ in range(5)]

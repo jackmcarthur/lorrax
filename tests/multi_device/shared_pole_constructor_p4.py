@@ -22,13 +22,13 @@ def run_checks(mesh):
     from jax.sharding import NamedSharding, PartitionSpec as P
     import distrib_la
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_constructor import (
-        assemble_shared_pole_pencil, reduce_shared_pole_pencil,
-        apply_shared_pole_zero_policy, sort_shared_pole_columns,
-        shared_pole_passivity,
-        retained_moment_identity,
-        _direction_states,
-    )
+    from gw.shared_pole_directions import _direction_states
+    from gw.shared_pole_gates import (apply_shared_pole_zero_policy,
+                                      retained_moment_identity,
+                                      shared_pole_passivity,
+                                      sort_shared_pole_columns)
+    from gw.shared_pole_pencil import assemble_shared_pole_pencil
+    from gw.shared_pole_reduction import reduce_shared_pole_pencil
     from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
 
     assert jax.process_count() == 4
@@ -126,7 +126,7 @@ def run_checks(mesh):
         # doublet straddles both the singular cutoff and the requested width.
         sample = placed(-np.diag([.8, .10000001, .09999999, .01, .008, .006, .004, .002])[None].astype(np.complex128))
         reads, admissions = [], []
-        def read_once(sample_id, retained_states):
+        def read_once(sample_id):
             reads.append(sample_id)
             return sample, sample * .01
         recipe = dict(fit_ids=[0], held_ids=[], distinct_id=[0, 0],
