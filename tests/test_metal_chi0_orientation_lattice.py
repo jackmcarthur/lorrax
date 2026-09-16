@@ -21,6 +21,8 @@ jax = pytest.importorskip("jax")
 import jax.numpy as jnp  # noqa: E402
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 
+from common.collectives import device_put_process_local  # noqa: E402
+
 jax.config.update("jax_enable_x64", True)
 
 
@@ -153,7 +155,7 @@ def _setup(real_hopping):
 def _pair_outputs(lat, e, psi_sc, f, surface, z, ordered):
     from gw import w_isdf
     mesh = Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
-    put = lambda a: jax.device_put(jnp.asarray(a), NamedSharding(mesh, P()))
+    put = lambda a: device_put_process_local(np.asarray(a), NamedSharding(mesh, P()))
     psi_cell = np.sqrt(lat.nk) * psi_sc[:, :, :lat.ns]
     psi_mun = put(psi_cell.transpose(0, 2, 1)[:, None, :, :])
     psi_nmu = put(psi_cell[:, :, None, :])
@@ -171,7 +173,7 @@ def _pair_outputs(lat, e, psi_sc, f, surface, z, ordered):
 def _contour_outputs(lat, e, psi_sc, f, ordered, times, e_ref):
     from gw import w_isdf
     mesh = Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
-    put = lambda a: jax.device_put(jnp.asarray(a), NamedSharding(mesh, P()))
+    put = lambda a: device_put_process_local(np.asarray(a), NamedSharding(mesh, P()))
     psi_cell = np.sqrt(lat.nk) * psi_sc[:, :, :lat.ns]
     psi_mun = put(psi_cell.transpose(0, 2, 1)[:, None, :, :])
     psi_nmu = put(psi_cell[:, :, None, :])

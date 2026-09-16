@@ -14,6 +14,8 @@ jax = pytest.importorskip("jax")
 import jax.numpy as jnp  # noqa: E402
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 
+from common.collectives import device_put_process_local  # noqa: E402
+
 from gw.efermi import FERMI_WINDOW_WIDTHS, fermi_energy_partition, fd_occupations, mp1_occupations  # noqa: E402
 
 jax.config.update("jax_enable_x64", True)
@@ -45,7 +47,7 @@ def _scan(psi_mun, psi_nmu, e, f, s, z, band_cut):
                              in_specs=(PSI_MUN_SPEC, PSI_NMU_SPEC, P(None, None), P(None, None), P(None, None), P(None)),
                              out_specs=P(None, "x", "y"), check_vma=False))
     rep = NamedSharding(mesh, P())
-    put = lambda a: jax.device_put(jnp.asarray(a), rep)
+    put = lambda a: device_put_process_local(np.asarray(a), rep)
     return np.asarray(kern(put(psi_mun), put(psi_nmu), put(e), put(f), put(s), put(z)))
 
 
