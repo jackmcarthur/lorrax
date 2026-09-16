@@ -159,8 +159,10 @@ def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, dat
         # lax.cond generated full-capacity copies even in the identity branch.
         reset_count = jnp.where(restart, block, 0).astype(jnp.int32)
         base = jnp.where(restart, block, m).astype(jnp.int32)
-        v, hv, h = subspace.store_project(v, hv, x, hx, h, 0, reset_count)
-        v, hv, h = subspace.store_project(v, hv, p, hp, h, base, rank)
+        v, hv = subspace.store(v, hv, x, hx, 0, reset_count)
+        h = subspace.project(v, hv, base, h, jnp.where(restart, 0, base), reset_count)
+        v, hv = subspace.store(v, hv, p, hp, base, rank)
+        h = subspace.project(v, hv, base+rank, h, base, rank)
         status = jnp.where((status == RUNNING) & (rank == 0), NO_DIRECTIONS, status)
         status = jnp.where(finite_correction, status, NONFINITE).astype(jnp.int32)
         return _State(v, hv, h, base+rank, st.iterations+1, status, x, e, norms,
@@ -209,9 +211,8 @@ def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vecto
             v = jax.lax.with_sharding_constraint(v, vector_sharding)
             x = jax.lax.with_sharding_constraint(x, vector_sharding)
             hx = jax.lax.with_sharding_constraint(hx, vector_sharding)
-        v, hv, h = subspace.store_project(
-            v, jnp.zeros_like(v), x, hx,
-            jnp.zeros((capacity, capacity), x.dtype), 0, block)
+        v, hv = subspace.store(v, jnp.zeros_like(v), x, hx, 0, block)
+        h = subspace.project(v, hv, block, jnp.zeros((capacity, capacity), x.dtype), 0, block)
         status = jnp.where(rank != block, BAD_INITIAL,
                            jnp.where(max_iterations <= 0, ITERATION_LIMIT, RUNNING))
         status = jnp.where(jnp.isfinite(tolerance) & (tolerance > 0), status, BAD_TOLERANCE)

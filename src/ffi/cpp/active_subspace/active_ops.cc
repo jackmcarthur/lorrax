@@ -103,50 +103,40 @@ private:
   LorraxCusolverMpCtx *ctx_;
   bool armed_ = false;
 };
-// Apply the two projection GEMMs after the caller has validated the buffers
-// and copied the small range descriptor to the host.  The fused store/project
-// handler uses this helper so it does not need a second device-to-host copy or
-// stream synchronization between inserting vectors and projecting them.
-static ffi::Error project_host(cudaStream_t stream, B v, B hv, int cap, int d,
-                               int m, int start, int r, R out,
-                               ScratchResult scratch) {
+static ffi::Error project(cudaStream_t stream, B v, B hv, B h, I active, R out,
+                          ScratchResult scratch) {
+  if (active.dimensions()[0] != 3 || v.dimensions()[0] < 1 ||
+      v.dimensions()[0] > INT_MAX || v.dimensions()[1] < 1 ||
+      v.dimensions()[1] > INT_MAX)
+    return ffi::Error::InvalidArgument("project descriptor/dimension overflow");
+  int q[3];
+  CUDA(cudaMemcpyAsync(q, active.typed_data(), sizeof(q),
+                       cudaMemcpyDeviceToHost, stream));
+  CUDA(cudaStreamSynchronize(stream));
+  int cap = v.dimensions()[0], d = v.dimensions()[1], m = q[0], start = q[1],
+      r = q[2];
+  if (hv.dimensions()[0] != cap || hv.dimensions()[1] != d ||
+      h.dimensions()[0] != cap || h.dimensions()[1] != cap ||
+      out->dimensions()[0] != cap || out->dimensions()[1] != cap)
+    return ffi::Error::InvalidArgument("project buffer geometry");
+  if (m > cap || m < 1 || start < 0 || r < 0 || int64_t(start) + r != m)
+    return ffi::Error::InvalidArgument("project active geometry");
   BLAS(cublasSetStream(handle(), stream));
   BLAS(cublasSetWorkspace(handle(), scratch->typed_data(),
                           scratch->dimensions()[0]));
+  if (out->typed_data() != h.typed_data())
+    return ffi::Error::InvalidArgument(
+        "active projection requires declared input/output alias");
   const cuDoubleComplex one{1, 0}, zero{0, 0};
   if (r) {
-    BLAS(cublasZgemm(handle(), CUBLAS_OP_C, CUBLAS_OP_N, m, r, d, &one,
-                     ptr(v), d, ptr(hv) + int64_t(start) * d, d, &zero,
+    BLAS(cublasZgemm(handle(), CUBLAS_OP_C, CUBLAS_OP_N, m, r, d, &one, ptr(v),
+                     d, ptr(hv) + int64_t(start) * d, d, &zero,
                      ptr(out) + int64_t(start) * cap, cap));
     BLAS(cublasZgemm(handle(), CUBLAS_OP_C, CUBLAS_OP_N, r, m, d, &one,
                      ptr(hv) + int64_t(start) * d, d, ptr(v), d, &zero,
                      ptr(out) + start, cap));
   }
   return ffi::Error::Success();
-}
-
-static ffi::Error project(cudaStream_t stream, B v, B hv, B h, I active,
-                          R out, ScratchResult scratch) {
-  if (active.dimensions()[0] != 3 || v.dimensions()[0] < 1 ||
-      v.dimensions()[0] > INT_MAX || v.dimensions()[1] < 1 ||
-      v.dimensions()[1] > INT_MAX)
-    return ffi::Error::InvalidArgument("project descriptor/dimension overflow");
-  int cap = v.dimensions()[0], d = v.dimensions()[1];
-  if (hv.dimensions()[0] != cap || hv.dimensions()[1] != d ||
-      h.dimensions()[0] != cap || h.dimensions()[1] != cap ||
-      out->dimensions()[0] != cap || out->dimensions()[1] != cap)
-    return ffi::Error::InvalidArgument("project buffer geometry");
-  if (out->typed_data() != h.typed_data())
-    return ffi::Error::InvalidArgument(
-        "active projection requires declared input/output alias");
-  int q[3];
-  CUDA(cudaMemcpyAsync(q, active.typed_data(), sizeof(q),
-                       cudaMemcpyDeviceToHost, stream));
-  CUDA(cudaStreamSynchronize(stream));
-  int m = q[0], start = q[1], r = q[2];
-  if (m > cap || m < 1 || start < 0 || r < 0 || int64_t(start) + r != m)
-    return ffi::Error::InvalidArgument("project active geometry");
-  return project_host(stream, v, hv, cap, d, m, start, r, out, scratch);
 }
 static ffi::Error reconstruct(cudaStream_t stream, B v, B hv, B c, I active,
                               R x, R hx, ScratchResult scratch) {
@@ -464,21 +454,6 @@ static ffi::Error gram(cudaStream_t stream, B v, B p, I range, R out,
                   ptr(v)+int64_t(start)*d, d, ptr(p), d, &zero, ptr(out)+start, cap));
   return ffi::Error::Success();
 }
-// Copy an already validated insertion range. Only the selected rows are
-// touched; the allocated capacity beyond them remains unchanged.
-static ffi::Error store_host(cudaStream_t stream, B p, B hp, int64_t start,
-                             int64_t count, int64_t d, R out, R hout) {
-  if (count) {
-    CUDA(cudaMemcpyAsync(ptr(out) + start * d, ptr(p),
-                         count * d * sizeof(cuDoubleComplex),
-                         cudaMemcpyDeviceToDevice, stream));
-    CUDA(cudaMemcpyAsync(ptr(hout) + start * d, ptr(hp),
-                         count * d * sizeof(cuDoubleComplex),
-                         cudaMemcpyDeviceToDevice, stream));
-  }
-  return ffi::Error::Success();
-}
-
 // XLA aliases the first two operands to the two results. Only the active
 // inserted block is copied; neither the capacity tail nor a false branch is.
 static ffi::Error store(cudaStream_t stream, B v, B hv, B p, B hp, I range,
@@ -501,57 +476,15 @@ static ffi::Error store(cudaStream_t stream, B v, B hv, B p, B hp, I range,
   if (start < 0 || count < 0 || count > p.dimensions()[0] ||
       start + count > v.dimensions()[0])
     return ffi::Error::InvalidArgument("active store range outside capacity");
-  return store_host(stream, p, hp, start, count, d, out, hout);
-}
-
-// Insert p/hp and update the corresponding projected row and column of h.
-// Davidson always performs these operations as a pair. Reading [start,count]
-// once preserves runtime range validation while avoiding the second host wait.
-// A zero count is an exact no-op, including when start is zero.
-static ffi::Error store_project(cudaStream_t stream, B v, B hv, B p, B hp, B h,
-                                I range, R out, R hout, R h_out,
-                                ScratchResult scratch) {
-  if (range.dimensions()[0] != 2 || v.dimensions()[0] < 1 ||
-      v.dimensions()[0] > INT_MAX || v.dimensions()[1] < 1 ||
-      v.dimensions()[1] > INT_MAX)
-    return ffi::Error::InvalidArgument(
-        "active store/project descriptor/dimension overflow");
-
-  int64_t cap = v.dimensions()[0], d = v.dimensions()[1];
-  if (hv.dimensions()[0] != cap || hv.dimensions()[1] != d ||
-      p.dimensions()[0] != hp.dimensions()[0] ||
-      p.dimensions()[1] != hp.dimensions()[1] ||
-      p.dimensions()[1] != d || h.dimensions()[0] != cap ||
-      h.dimensions()[1] != cap || out->dimensions()[0] != cap ||
-      out->dimensions()[1] != d || hout->dimensions()[0] != cap ||
-      hout->dimensions()[1] != d || h_out->dimensions()[0] != cap ||
-      h_out->dimensions()[1] != cap)
-    return ffi::Error::InvalidArgument("active store/project buffer geometry");
-  if (out->typed_data() != v.typed_data() ||
-      hout->typed_data() != hv.typed_data() ||
-      h_out->typed_data() != h.typed_data())
-    return ffi::Error::InvalidArgument(
-        "active store/project requires declared input/output aliases");
-
-  int q[2];
-  CUDA(cudaMemcpyAsync(q, range.typed_data(), sizeof(q),
-                       cudaMemcpyDeviceToHost, stream));
-  CUDA(cudaStreamSynchronize(stream));
-  int64_t start = q[0], count = q[1];
-  if (start < 0 || count < 0 || count > p.dimensions()[0] ||
-      start + count > cap)
-    return ffi::Error::InvalidArgument(
-        "active store/project range outside capacity");
-  if (!count)
-    return ffi::Error::Success();
-
-  auto error = store_host(stream, p, hp, start, count, d, out, hout);
-  if (!error.success())
-    return error;
-  return project_host(stream, v, hv, static_cast<int>(cap),
-                      static_cast<int>(d), static_cast<int>(start + count),
-                      static_cast<int>(start), static_cast<int>(count), h_out,
-                      scratch);
+  if (count) {
+    CUDA(cudaMemcpyAsync(ptr(out) + start * d, ptr(p),
+                         count * d * sizeof(cuDoubleComplex),
+                         cudaMemcpyDeviceToDevice, stream));
+    CUDA(cudaMemcpyAsync(ptr(hout) + start * d, ptr(hp),
+                         count * d * sizeof(cuDoubleComplex),
+                         cudaMemcpyDeviceToDevice, stream));
+  }
+  return ffi::Error::Success();
 }
 } // namespace lorrax_ffi::active_subspace
 using namespace lorrax_ffi::active_subspace;
@@ -630,20 +563,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceStoreFfi, store,
                                   .Arg<I>()
                                   .Ret<B>()
                                   .Ret<B>());
-
-XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceStoreProjectFfi, store_project,
-                              ffi::Ffi::Bind()
-                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
-                                  .Arg<B>()
-                                  .Arg<B>()
-                                  .Arg<B>()
-                                  .Arg<B>()
-                                  .Arg<B>()
-                                  .Arg<I>()
-                                  .Ret<B>()
-                                  .Ret<B>()
-                                  .Ret<B>()
-                                  .Ret<Scratch>());
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceGramFfi, gram,
     ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()

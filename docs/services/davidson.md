@@ -103,17 +103,6 @@ now exposes aliased active-range stores, and projections alias their projected
 matrix. Only small correction blocks cross conditionals. Initial reservation
 and zero fills remain fixed-size allocations; iteration does not grow them.
 
-Davidson uses `store_project(v, hv, p, hp, h, start, count)` to insert a block
-and update its projected Hamiltonian panel together. The returned tuple is
-`(v, hv, h)`. Nonempty insertions define the active prefix as `start + count`;
-empty insertions preserve all three arrays. The CUDA handler reads and checks
-the range once, then performs the same copies and GEMMs as the separate
-operations. It still synchronizes once to read that range. This removes a
-second metadata transfer and wait, without changing the GEMM dimensions or
-allocating another vector buffer. The distributed service reduces only the
-projection result and keeps vectors partitioned; it never reduces the already
-global entries of `h` again. The CPU provider composes its existing operations.
-
 ## Provider and verification scope
 
 Rebuild the canonical CUDA `src/ffi/cpp/CMakeLists.txt` target to obtain the
@@ -142,9 +131,6 @@ separately when it differs from the requested Ritz-vector count. `start` and
 `active` arguments mean interval start and **count**, including an empty window.
 The provider includes active Gram, reconstruction, CGS2, projected eigensolve,
 aliased store and incremental projection operations.
-`store_project` combines the latter pair for consumers that immediately
-project an inserted block. It requires `ActiveSubspaceStoreProjectFfi` in the
-CUDA provider; standalone store and projection remain available.
 
 The same service provides stable block TSQR for Lanczos. Each rank factors
 its local vector tile, exchanges only reduced R factors, and applies its
