@@ -129,11 +129,14 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         source_wfn = getattr(wfn, "path", None)
         if source_wfn is None or not str(source_wfn).strip():
             raise ValueError("GATE shared_pole_output: write_w/write_poles require the source WFN path before screening")
-    from .mpa.model import _require_metal_time_reversal
-    # screening.py dispatches here before any MPA gate, so GATE mpa_ordered_metal
-    # would never fire on this route. Same owner, same message, same reason. It is
-    # the first physics gate, before any response, bank or store work.
-    _require_metal_time_reversal(material_class, getattr(sym, "trs_allowed", True))
+    # A time-reversal-broken metal runs on this route (METAL 2026-09-16): the
+    # ordered bank keeps both particle-hole orientations with the odd channel
+    # (8d3ad5fe) and its kernels return the physical orientation FT_q[chi]
+    # (86307cff). GATE mpa_ordered_metal stays on the MPA route, which fits one
+    # residue with no odd channel (gw.mpa.model._require_metal_time_reversal).
+    if material_class == "metal" and not bool(getattr(sym, "trs_allowed", True)):
+        print_fn("  shared-pole screening: time-reversal-broken METAL; ordered bank "
+                 "(both orientations, odd channel) with fractional occupations")
     timing.fence("spole.screening_setup")
     with timing.section("spole.screening_setup"):
         from file_io.shared_pole_store import initialize_shared_pole_bank
