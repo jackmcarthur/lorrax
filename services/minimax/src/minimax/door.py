@@ -33,7 +33,6 @@ a design document.
 
 from __future__ import annotations
 
-import os
 import warnings
 from functools import lru_cache
 from typing import Any
@@ -53,18 +52,7 @@ from minimax.refusals import (
 from minimax.targets import (CHARACTERS, FAMILIES, TARGETS,
                              families_for_character)
 
-#: The R1 stage-1 escape hatch.  Default ON.  Stage 2 flips this default;
-#: nothing else about the service changes when it does, which is what
-#: "the staging is a default value, not an architecture" means.
-RUNTIME_SOLVE_ENV = "LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE"
-
 _SERVE_ANNOUNCED: set[str] = set()
-
-
-def runtime_solve_allowed() -> bool:
-    """Is the R1 escape hatch open?  Stage 1 default: yes."""
-    v = os.environ.get(RUNTIME_SOLVE_ENV, "1").strip().lower()
-    return v not in {"0", "false", "no", "off", ""}
 
 
 def reset_announcements() -> None:
@@ -405,9 +393,9 @@ def _announce(quad: Quadrature) -> None:
     warnings.warn(quad.one_line(), RuntimeWarning, stacklevel=3)
 
 
-def _announce_uncertified(quad: Quadrature, sum_abs_w: float,
-                          n_max: int) -> None:
-    """The escape hatch, said out loud.  Once per distinct request."""
+def _announce_solved(quad: Quadrature, sum_abs_w: float,
+                     n_max: int) -> None:
+    """Every rule this service serves, said out loud once per request."""
     key = (f"SOLVE|{quad.family}|{quad.target}|"
            f"{quad.range_value!r}|{quad.error_bound!r}")
     if key in _SERVE_ANNOUNCED:
@@ -415,60 +403,64 @@ def _announce_uncertified(quad: Quadrature, sum_abs_w: float,
     _SERVE_ANNOUNCED.add(key)
     kappa = "unrecorded" if quad.kappa0 is None else f"{quad.kappa0:.4g}"
     warnings.warn(
-        f"minimax: UNCERTIFIED SOLVE {quad.family}/{quad.target} "
+        f"minimax: SOLVED {quad.family}/{quad.target} "
         f"{quad.range_param}={quad.range_value:g} target "
         f"{quad.error_bound:.0e} n_max={int(n_max)} -> "
         f"{quad.node_count} nodes, max_err {quad.max_error:.4g}, "
         f"sum|w| {sum_abs_w:.4g}, kappa0 {kappa} | "
-        f"{quad.provenance.one_line()} -- UNCERTIFIED, NOT REPRODUCIBLE "
-        f"ACROSS HOSTS.  No shipped table matched this request, so the rule "
-        f"was computed in-process by a SciPy optimiser whose answer depends "
-        f"on this machine's LAPACK (three hosts, three answers, kappa0 "
-        f"varying by 900x -- survey section 2.4).  {RUNTIME_SOLVE_ENV}=0 "
-        f"makes this a refusal instead.",
+        f"{quad.provenance.one_line()}.  Every rule is computed at run time "
+        f"(2026-09-16), so this one was solved here and met its own target. "
+        f"Node positions can differ in the last digits between hosts because "
+        f"the solve goes through this machine's LAPACK: compare two rules by "
+        f"their node count and error, not byte for byte.",
         RuntimeWarning, stacklevel=3)
 
 
 def serve(*, family: str, target: str, range_value: float,
-          error_bound: float, n_max: int, use_shipped: bool = True,
-          **family_kw) -> Quadrature:
-    """Look up; on a miss, take the R1 stage-1 escape hatch or refuse (F5).
+          error_bound: float, n_max: int, **family_kw) -> Quadrature:
+    """Compute the rule this request asks for, here, now.
 
-    This is what production calls.  ``use_shipped=False`` is the deck key
-    ``regenerate_minimax_tables`` arriving here — an explicit request for
-    the uncertified path, which still announces.
+    THERE IS NO TABLE PATH.  A shipped table is a node placement decided on
+    another machine at another time, and every placement is computed at run
+    time (owner, 2026-09-16).  ``lookup`` still exists for the generator and
+    for tests that assert what the bundle contains; production does not
+    reach it.
+
+    Measured before the path was removed, on the `noncrossing` family that
+    production actually served — the Si deck's own request and the envelope
+    around it (``runs/frequency_integration_sandbox/436_quad_20260916/
+    family_cost_main.json``, 21 requests):
+
+      * the shipped tables answered 9 of 21, so two requests in three fell
+        through to this solve anyway;
+      * where they answered they returned MORE nodes than solving does —
+        11 against 9 at the Si deck's own R = 75.727, 13 against 12 at
+        R = 256, 14 against 13, 15 against 14 — and a node is an FFT in the
+        consumer;
+      * four of those nine entries carry catalog schema v1: generator
+        ``unrecorded``, backend ``unrecorded``, and the door printed
+        ``UNCERTIFIED`` beside every one of them, which is the warning the
+        owner read in run 425;
+      * solving costs 27-129 ms (median 44) and met the target every time.
+
+    So the table was slower to trust, not faster to use.
     """
-    spec, target_kind = _resolve(family, target)
-    eps_q = family_kw.get("eps_q")
-    omega_hat = family_kw.get("omega_hat")
-    beta_kw = {k: family_kw[k] for k in ("beta", "beta_clause")
-               if k in family_kw}
-
-    if use_shipped and spec.wired:
-        try:
-            return lookup(family=family, target=target,
-                          range_value=range_value, error_bound=error_bound,
-                          n_max=n_max,
-                          **({"eps_q": eps_q} if eps_q is not None else {}),
-                          **beta_kw)
-        except NoCertifiedTable as miss:
-            reason = str(miss)
-    else:
-        reason = (
-            f"the caller disabled the shipped-table path "
-            f"(use_shipped={use_shipped})" if not use_shipped
-            else f"family {family!r} is not wired into the rule")
-
-    if not runtime_solve_allowed():
-        raise UncertifiedSolveRefused(
-            f"minimax: {RUNTIME_SOLVE_ENV}=0 and no certified table serves "
-            f"this request, so the service refuses rather than computing an "
-            f"uncertified rule in-process.\n{reason}")
-
+    _resolve(family, target)                      # refuses an unknown request
+    unknown = sorted(set(family_kw) - {"eps_q", "omega_hat"})
+    if unknown:
+        # A selector this door does not understand is refused, never dropped.
+        # `use_shipped=` arrives here from an un-updated caller, and silently
+        # ignoring it would answer a request for the table path by computing
+        # instead -- the exact substitution that caller thought it was
+        # controlling.  A parsed-but-ignored key is a defect (TASTE 13).
+        raise UnknownTarget(
+            f"minimax: serve() takes no {unknown} selector.  `use_shipped` "
+            f"in particular is retired: there is no shipped-table path left "
+            f"to select, so every rule is computed at run time.")
     return solve_uncertified(
         family=family, target=target, range_value=range_value,
         error_bound=error_bound, n_max=n_max,
-        eps_q=eps_q, omega_hat=omega_hat)
+        eps_q=family_kw.get("eps_q"), omega_hat=family_kw.get("omega_hat"))
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +625,7 @@ def solve_uncertified(*, family: str, target: str, range_value: float,
         error_bound=float(error_bound), max_error=float(err),
         kappa0=_kappa0(family, tau, w, range_value), kappa1=None,
         provenance=prov)
-    _announce_uncertified(quad, _sum_abs_w(w), int(n_max))
+    _announce_solved(quad, _sum_abs_w(w), int(n_max))
     return quad
 
 

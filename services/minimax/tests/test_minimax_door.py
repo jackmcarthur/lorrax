@@ -343,127 +343,80 @@ def test_final_run33_two_pane_requests_are_publicly_certified():
 
 
 # ---------------------------------------------------------------------------
-#  3.  R1 staging — the escape hatch
+#  3.  There is no table path — every rule is computed at run time
 # ---------------------------------------------------------------------------
+#  The shipped-table branch, the ``use_shipped`` selector and the
+#  LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE hatch were removed on 2026-09-16: a
+#  shipped table is a node placement decided on another machine at another
+#  time, and the owner's rule is that every placement is computed at run
+#  time.  The measurement that justified it — on the `noncrossing` family
+#  production actually served — is in ``serve``'s own docstring.  These
+#  cells pin what replaced them.
 
-def test_the_escape_hatch_defaults_open(monkeypatch):
-    """STAGE 1's whole content: no deck changes behaviour in a refactor.
+def test_serve_never_consults_a_shipped_table(isolated_cache):
+    """A request the catalog DOES cover is still solved here.
 
-    The refusal machinery ships, the announcements ship, and the default
-    is such that a run which worked yesterday works today — because the
-    imaginary-axis family has no shipped tables and arming the refusal
-    before generating it would have made the extraction a
-    physics-stopping commit.
-    """
-    monkeypatch.delenv(M.RUNTIME_SOLVE_ENV, raising=False)
-    assert M.runtime_solve_allowed() is True
-
-
-@pytest.mark.parametrize("value", ["0", "false", "no", "off", "OFF"])
-def test_the_escape_hatch_closes_on_every_spelling(monkeypatch, value):
-    monkeypatch.setenv(M.RUNTIME_SOLVE_ENV, value)
-    assert M.runtime_solve_allowed() is False
-
-
-def test_f5_a_miss_with_the_hatch_closed_is_a_refusal(monkeypatch,
-                                                      isolated_cache):
-    """STAGE 2, exercised without arming it.
-
-    The flip is one default value, so the behaviour it produces can be
-    tested today by setting the flag — which is what makes "the staging is
-    a default, not an architecture" a checkable statement rather than a
-    reassuring one.  The refusal carries the ORIGINAL miss inside it, so
-    the reader learns which table was wanted and not merely that something
-    was refused.
-    """
-    monkeypatch.setenv(M.RUNTIME_SOLVE_ENV, "0")
-    with pytest.raises(M.UncertifiedSolveRefused) as excinfo:
-        M.serve(family="crossing", target="hgl", range_value=83.0,
-                error_bound=1.0e-6, n_max=500, eps_q=1.0e-3)
-    text = str(excinfo.value)
-    assert M.RUNTIME_SOLVE_ENV in text
-    assert "no certified crossing table for A_dim=83" in text
-    assert "nearest certified below: A_dim=60" in text
-
-
-def test_f5_false_case_with_the_hatch_open_it_solves_and_says_so(
-        monkeypatch, isolated_cache):
-    """The FALSE case for F5, and the loudest line in the service.
-
-    A solve must name the request, the achieved error, the measured Σ|w|
-    and κ₀, and the words *uncertified, not reproducible across hosts* —
-    because the comfortable failure mode of this whole design is that the
-    hatch stays open forever and nobody notices.  The defence is that
-    every log says so.
-
-    A_dim = 20 rather than 83: the point of this cell is the ANNOUNCEMENT,
-    and a small bandwidth solves in a second where the G2 gate's 83 takes
-    the better part of a minute.
+    R = 10 at 1e-6 is a shipped entry — the lookup cells above serve it from
+    ``noncrossing_R_10p000000_eps_1p0em06.npz`` — so this is the true
+    negative for "the table path is gone": if any table branch survived,
+    this provenance would read ``shipped``.
     """
     pytest.importorskip("scipy")
-    monkeypatch.setenv(M.RUNTIME_SOLVE_ENV, "1")
+    q = M.serve(family="noncrossing", target="inverse", range_value=10.0,
+                error_bound=1.0e-6, n_max=64)
+    assert q.provenance.source != "shipped"
+    assert q.provenance.source in ("runtime-uncertified", "cache")
+    assert q.max_error <= 1.0e-6
+
+
+def test_a_retired_use_shipped_selector_refuses_rather_than_being_ignored(
+        isolated_cache):
+    """An un-updated caller must hear that the dial is gone.
+
+    Silently dropping ``use_shipped=False`` would answer a request to AVOID
+    the tables by computing — the right answer for the wrong reason — and
+    dropping ``use_shipped=True`` would answer a request FOR them the same
+    way.  Both are the parsed-but-ignored-key defect.
+    """
+    with pytest.raises(M.UnknownTarget) as excinfo:
+        M.serve(family="noncrossing", target="inverse", range_value=10.0,
+                error_bound=1.0e-6, n_max=64, use_shipped=False)
+    assert "use_shipped" in str(excinfo.value)
+
+
+def test_the_solve_announces_itself_once_with_its_numbers(isolated_cache):
+    """The loudest line in the service, and what it says now.
+
+    It still names the request, the achieved error, the measured Σ|w| and
+    κ₀.  What it no longer says is that a shipped table failed to match:
+    nothing was looked up.
+
+    A_dim = 20 rather than 83 because the point of this cell is the
+    ANNOUNCEMENT, and a small bandwidth solves in about a second.
+    """
+    pytest.importorskip("scipy")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         q = M.serve(family="crossing", target="hgl", range_value=20.0,
-                    error_bound=1.0e-6, n_max=60, eps_q=1.0e-3,
-                    use_shipped=False)
-    assert q.provenance.source == "runtime-uncertified"
-    assert q.provenance.certified is False
+                    error_bound=1.0e-6, n_max=60, eps_q=1.0e-3)
+    assert q.provenance.source in ("runtime-uncertified", "cache")
     assert q.kappa0 is not None
-    lines = [str(w.message) for w in caught
-             if "UNCERTIFIED SOLVE" in str(w.message)]
+    lines = [str(w.message) for w in caught if "SOLVED" in str(w.message)]
     assert len(lines) == 1, lines
     line = lines[0]
     assert "crossing/hgl A_dim=20" in line
     assert "sum|w|" in line and "kappa0" in line
-    assert "NOT REPRODUCIBLE ACROSS HOSTS" in line
-    assert M.RUNTIME_SOLVE_ENV in line
+    assert "computed at run time" in line
 
 
-def test_serve_prefers_the_certified_table_over_the_hatch(isolated_cache):
-    """The ordering that makes stage 1 worth having at all: the hatch is a
-    FALLBACK, not a parallel path.  A request the catalog covers must
-    never reach the solver."""
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        q = M.serve(family="crossing", target="hgl", range_value=40.0,
-                    error_bound=1.0e-6, n_max=500, eps_q=1.0e-3)
-    assert q.provenance.source == "shipped"
-    assert not [w for w in caught if "UNCERTIFIED SOLVE" in str(w.message)]
+def test_a_family_with_no_in_process_solver_refuses_rather_than_hanging():
+    """``complex_laplace`` has no in-process solver.
 
-
-def test_use_shipped_false_is_an_explicit_request_for_the_hatch(
-        monkeypatch, isolated_cache):
-    """``regenerate_minimax_tables`` arriving at the door.
-
-    It is an EXPLICIT request for the uncertified path, so it bypasses the
-    catalog — and it still announces, because "the user asked for it" is a
-    reason not to refuse and not a reason to go quiet.
+    With the table path gone there is nothing left to serve this family
+    with, so the request refuses and names the generator — which was always
+    the real fix for it, rather than a flag.
     """
-    pytest.importorskip("scipy")
-    monkeypatch.setenv(M.RUNTIME_SOLVE_ENV, "1")
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        q = M.serve(family="noncrossing", target="inverse", range_value=10.0,
-                    error_bound=1.0e-6, n_max=64, use_shipped=False)
-    assert q.provenance.source in ("runtime-uncertified", "cache")
-    assert [w for w in caught if "UNCERTIFIED SOLVE" in str(w.message)]
-
-
-def test_a_family_with_no_in_process_solver_refuses_rather_than_hanging(
-        monkeypatch):
-    """``complex_laplace`` has no in-process solver, so the hatch cannot
-    rescue a request no shipped table covers.  The refusal names the
-    generator instead of the flag, because the flag is not the fix here.
-
-    The request is fully specified and OFF the tabulated β ladder: since
-    the beta axis landed, an under-specified request refuses earlier and
-    for a different reason (``UnknownTarget``, not the hatch), so it would
-    no longer exercise this path at all.
-    """
-    monkeypatch.setenv(M.RUNTIME_SOLVE_ENV, "1")
     with pytest.raises(M.UncertifiedSolveRefused) as excinfo:
         M.serve(family="complex_laplace", target="complex_laplace",
-                range_value=21.544346900318832, error_bound=1.0e-6, n_max=64,
-                beta=7.5, beta_clause=M.beta_selector.HEIGHT)
+                range_value=21.544346900318832, error_bound=1.0e-6, n_max=64)
     assert "generate_imag_minimax_assets.py" in str(excinfo.value)

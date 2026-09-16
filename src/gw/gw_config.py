@@ -1679,7 +1679,6 @@ _DEFAULTS = {
     "occ_broadening": 0.0,
     "minimax_target_error": 1.0e-6,
     "minimax_max_nodes": 64,
-    "regenerate_minimax_tables": False,
     "minimax_energy_reference": "midgap",
     # PPM
     # ppm_model picks the two-point pole-fit ansatz:
@@ -2493,7 +2492,6 @@ def _input_response(
         occ_broadening_ev=float(params["occ_broadening"]),
         minimax_target_error=float(params["minimax_target_error"]),
         minimax_max_nodes=int(params["minimax_max_nodes"]),
-        regenerate_minimax_tables=bool(params["regenerate_minimax_tables"]),
         minimax_energy_reference=str(params["minimax_energy_reference"]).strip().lower(),
         diagrams=coerce_screening_diagrams(params["screening_diagrams"]),
         ladder_probe_chunk=int(params["ladder_probe_chunk"]),
@@ -2884,8 +2882,11 @@ def _report_early_retired_keys(
     """Produce the early retired-key findings after dedicated refusals."""
     if section.get("use_shipped_minimax_tables", fallback=None) is not None:
         raise ValueError(
-            "Input key 'use_shipped_minimax_tables' is no longer supported. "
-            "Use 'regenerate_minimax_tables = true/false' instead.")
+            "Input key 'use_shipped_minimax_tables' is no longer supported, "
+            "and neither is its replacement 'regenerate_minimax_tables': "
+            "there are no shipped minimax tables on the production path any "
+            "more.  Every screening rule is computed in process at run time "
+            "and certified there.  Remove the key.")
     retired = []                         # (key, what the run does with it)
     if section.get("chunk_size", fallback=None) is not None:
         import warnings
@@ -2958,6 +2959,14 @@ def _report_early_retired_keys(
             "always built live in G-space from the run's WFN.  Remove "
             "the key; stored, folded, and ISDF Hartree paths no longer "
             "exist."
+        )
+    if section.get("regenerate_minimax_tables", fallback=None) is not None:
+        raise ValueError(
+            "Input key 'regenerate_minimax_tables' is retired: there are no "
+            "shipped minimax tables on the production path any more.  Every "
+            "screening rule is computed in process at run time and certified "
+            "there, so there is nothing to regenerate and nothing to reuse.  "
+            "Remove the key."
         )
     for legacy_key in ("sigma_quadrature_reduction_seconds",
                        "sigma_quadrature_reduction_steps"):
@@ -3653,7 +3662,6 @@ class ScreeningConfig:
     occ_broadening_ev: float      # BGW MP1 width; 0 keeps step occupations
     minimax_target_error: float
     minimax_max_nodes: int
-    regenerate_minimax_tables: bool
     minimax_energy_reference: str  # "midgap" | "vbm"
     diagrams: ScreeningDiagrams = ScreeningDiagrams.W_RPA
     # w_bse / w_rpa_resolvent only (both reach the ladder facade) —
@@ -4503,7 +4511,6 @@ class LorraxConfig:
         return MinimaxConfig(
             target_error=self.screening.minimax_target_error,
             max_nodes=self.screening.minimax_max_nodes,
-            regenerate_tables=self.screening.regenerate_minimax_tables,
             energy_reference=self.screening.minimax_energy_reference,
         )
 
