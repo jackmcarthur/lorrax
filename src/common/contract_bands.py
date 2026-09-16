@@ -29,6 +29,13 @@ replicated going in, sharded only at the output).  See
 dispatch — see this module's :func:`_face_project_kernel` for the
 mechanism.
 
+Current GW also passes ``layout="axis"`` for ``low_mem_bands=false``.
+Both face and axis use the same planned two-GEMM projection below. The
+linear-algebra service implements axis plans as local GEMMs followed by
+reduce-scatter, and face plans through the distributed native provider.
+The legacy body is not the current GW axis route. See
+``distrib_la.matmul_plan.local_gemm_plan`` for the axis collectives.
+
 Structure (per rank, inside one shard_map)::
 
     right    = einsum(O_local, ψ_right_local)     contract (s', ν_Y-local)
@@ -462,6 +469,9 @@ def contract_bands_block_reshard(
         Mesh axis names ``(ax_x, ax_y)``; ax_x shards μ/m, ax_y shards
         ν/n.  Default matches every production mesh.
     layout
+        ``"axis"``: current ``low_mem_bands=false`` carrier. Uses the same
+        planned projection as face; the service selects local GEMMs and
+        centroid reduce-scatter. Requires ``face_shape`` and ``extra="none"``.
         ``"legacy"`` (default): the shard_map + psum_scatter body below,
         BYTE-IDENTICAL to the code this module shipped before
         ``low_mem_bands`` existed.
