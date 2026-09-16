@@ -9,7 +9,25 @@ from runtime import network_env as net
 
 def environment(**updates):
     return dict(NERSC_HOST='perlmutter', JAX_PLATFORMS='cuda,cpu',
-                SLURM_STEP_NUM_NODES='4', **updates)
+                SLURM_STEP_NUM_NODES='4', SLURM_NETWORK='no_vni', **updates)
+
+
+@pytest.mark.parametrize('setting', [None, '', 'depth=64', 'not_no_vni'])
+def test_uncertified_launch_does_not_enable_ofi(setting):
+    env = environment()
+    if setting is None:
+        del env['SLURM_NETWORK']
+    else:
+        env['SLURM_NETWORK'] = setting
+    result = net.plan_network_environment(env, is_file=lambda _: pytest.fail())
+    assert result['applied'] == {}
+    assert 'requires launch-time' in result['policy']
+
+
+def test_no_vni_token_can_accompany_other_network_options():
+    env = environment()
+    env['SLURM_NETWORK'] = 'depth=64, no_vni'
+    assert net.plan_network_environment(env, is_file=lambda _: True)['policy'] == 'Perlmutter OFI'
 
 
 def test_single_node_step_inside_four_node_allocation():

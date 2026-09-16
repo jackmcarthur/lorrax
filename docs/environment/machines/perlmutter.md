@@ -37,8 +37,22 @@ the allocation-wide node count. Open MPI local/world group sizes can also
 establish single-node versus multi-node placement without starting MPI here.
 Unknown topology leaves the environment unchanged.
 
-On multi-node Perlmutter CUDA runs, startup requests the site's OFI/CXI
-configuration. It names the plugin by absolute path through `NCCL_NET_PLUGIN`,
+On multi-node Perlmutter CUDA runs launched with `SLURM_NETWORK=no_vni`,
+startup requests the site's OFI/CXI configuration. Set this on the launcher,
+not inside the Python payload:
+
+```bash
+SLURM_NETWORK=no_vni lx run -N 4 -G 4 -n 16 -- python3 -m gw.gw_jax -i cohsex.in
+```
+
+Full MPI-I/O plus NCCL GW initialization failed without this Slurm setting
+(`OFI EP enable failed: No space left on device`); a GEMM-only probe had
+passed and was insufficient. Without the launch setting, automatic selection
+leaves the existing transport policy unchanged and prints the prerequisite.
+Python cannot repair an already-created step's VNI allocation. Explicit
+transport overrides remain the caller's responsibility.
+
+It names the plugin by absolute path through `NCCL_NET_PLUGIN`,
 so no change to Python's already-initialized library search path is needed.
 The plugin and its machine settings have one owner in `runtime.network_env`.
 The currently supported site installation is supplied by `nccl/2.29.2-cu13`.

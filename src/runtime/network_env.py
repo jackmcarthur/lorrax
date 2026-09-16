@@ -72,6 +72,14 @@ def plan_network_environment(env, *, platform='gpu', is_file=None):
         return result
     if multiple is not True or env.get('NERSC_HOST') != 'perlmutter':
         return result
+    # This must be supplied to srun, before the step is created. Setting it
+    # here would be too late to change the Slingshot VNI allocation. Mixed
+    # MPI I/O + NCCL initialization failed without it in full GW runs.
+    network_options = {value.strip() for value in
+                       env.get('SLURM_NETWORK', '').split(',')}
+    if 'no_vni' not in network_options:
+        result['policy'] = 'unchanged (automatic OFI requires launch-time SLURM_NETWORK=no_vni)'
+        return result
     # An absolute plugin name avoids changing LD_LIBRARY_PATH after Python
     # has started, which cannot reliably change the loader's search path.
     exists = is_file or (lambda path: Path(path).is_file())
