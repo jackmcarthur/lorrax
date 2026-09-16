@@ -10,6 +10,21 @@ reversal is broken). `n` is the packed centroid count (`meta.mu_basis.n_packed`)
 `s = z²`. `b` is the stored factor (dataset `factor`). `Ω_j > 0` are poles and `Λ = diag(Ω_j²)`. `R_±` are residues
 and `M_k` the physical high-frequency moments.
 
+## 0 Where the code is
+
+| section | owner |
+|---|---|
+| §2 the response bank | `gw.response_bank`, driven by `gw.shared_pole_screening` |
+| §3 directions | `gw.shared_pole_directions` |
+| §4, §5 the two pencils | `gw.shared_pole_pencil` |
+| §4, §6 reduction, paired basis and cut | `gw.shared_pole_reduction` |
+| §6 dedupe, §9 measured gates | `gw.shared_pole_gates` |
+| the chain that calls them, per parent | `gw.shared_pole_constructor` |
+| §10 the byte model and its ledger rows | `gw.shared_pole_capacity` |
+| §7 the store | `file_io.shared_pole_store` |
+| §8 the Σ consumer | `gw.mpa.sigma` |
+| the recipe, the gate tables and the receipt | `gw.shared_pole_recipe` |
+
 ## 1 The object
 
 Σ needs `W_c(q, z) = W(q, z) − v(q)` on the `n × n` centroid basis. With the RPA response `χ = χ⁰ + χ⁰ v χ`,
@@ -237,6 +252,7 @@ Per rank on an `x × y` mesh with `P = Px Py` and pencil side `R`:
 
 $$ \text{reduction} \approx 16\,\big(14 R^2 + 12 n R\big)/P + 16\cdot 3 n r/P + \text{native eigh workspace}, \tag{SP 17} $$
 
-(`shared_pole_byte_terms`). Every `[b, R, R]` block stays on the x/y face (§6). The native cuSOLVERMp eigh adds a
+(`shared_pole_capacity.shared_pole_byte_terms`; `ConstructorCapacity` beside it turns those terms into the map
+ledger's rows). Every `[b, R, R]` block stays on the x/y face (§6). The native cuSOLVERMp eigh adds a
 private operand tile of `n²/P` next to its workspace, which `distrib_la.workspace_bytes_per_rank` includes; a byte
 model without that tile under-counts the measured CrI3 q=1 construction peak (2.140 against 2.907 GiB per rank).
