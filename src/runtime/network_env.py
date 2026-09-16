@@ -72,9 +72,11 @@ def plan_network_environment(env, *, platform='gpu', is_file=None):
         return result
     if multiple is not True or env.get('NERSC_HOST') != 'perlmutter':
         return result
-    # This must be supplied to srun, before the step is created. Setting it
-    # here would be too late to change the Slingshot VNI allocation. Mixed
-    # MPI I/O + NCCL initialization failed without it in full GW runs.
+    # SLURM_NETWORK=no_vni must reach srun before it creates the step. Mixed
+    # MPI I/O and OFI/NCCL initialization failed without this launch setting;
+    # changing os.environ here cannot repair an existing Slingshot VNI
+    # allocation. Preserve the current transport unless the prerequisite is
+    # present. See docs/environment/machines/perlmutter.md for the launch recipe.
     network_options = {value.strip() for value in
                        env.get('SLURM_NETWORK', '').split(',')}
     if 'no_vni' not in network_options:

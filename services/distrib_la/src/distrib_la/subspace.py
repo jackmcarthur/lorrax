@@ -208,6 +208,9 @@ class DistributedSubspacePlan:
             def body(v, p, active, start):
                 start, active = _orthogonalization_range(start, active, self.capacity)
                 c = jax.lax.psum(self.local.gram(v, p, active, start=start), self.axes)
+                # Form the second pass's local overlaps while updating p in
+                # place, avoiding a separate vector-sized projection buffer.
+                # They still need a global sum before the second subtraction.
                 p, c = self.local.subtract_projection(
                     v, p, c, active, start=start, next_gram=True)
                 c = jax.lax.psum(c, self.axes)
