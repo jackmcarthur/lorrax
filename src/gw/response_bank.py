@@ -298,22 +298,32 @@ def _resource_hash(path, size, mtime_ns):
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def authenticate_coulomb(bank_io, qids):
-    """Authenticate bounded-read Coulomb resource against its fixed identity."""
+def resource_digest(path):
+    """SHA256 of one immutable resource: read on rank 0, broadcast to all.
+
+    The producer stamps a resource with this and every consumer checks it with
+    the same call, so the two cannot drift. Every rank leaves it with the same
+    string, which is what keeps a refusal from being rank-conditional
+    (INVARIANTS 21).
+    """
     from jax.experimental import multihost_utils
 
-    resource = bank_io["coulomb"]
-    if resource["basis"] != "canonical" or not np.array_equal(
-            resource["q_irr_full_idx"], qids):
-        raise ValueError("GATE response_coulomb_identity: wrong basis/q order")
-    path = Path(resource["path"])
+    path = Path(path)
     stat = path.stat()
     digest = np.zeros(32, dtype=np.uint8)
     if jax.process_index() == 0:
         digest[:] = np.frombuffer(bytes.fromhex(_resource_hash(
             str(path), stat.st_size, stat.st_mtime_ns)), dtype=np.uint8)
-    digest = multihost_utils.broadcast_one_to_all(digest)
-    if bytes(np.asarray(digest)).hex() != resource["sha256"]:
+    return bytes(np.asarray(multihost_utils.broadcast_one_to_all(digest))).hex()
+
+
+def authenticate_coulomb(bank_io, qids):
+    """Authenticate bounded-read Coulomb resource against its fixed identity."""
+    resource = bank_io["coulomb"]
+    if resource["basis"] != "canonical" or not np.array_equal(
+            resource["q_irr_full_idx"], qids):
+        raise ValueError("GATE response_coulomb_identity: wrong basis/q order")
+    if resource_digest(resource["path"]) != resource["sha256"]:
         raise ValueError("GATE response_coulomb_identity: content hash differs")
 
 

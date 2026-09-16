@@ -237,7 +237,12 @@ def shared_pole_even_part_kernel(mesh_xy, *, exclude_q0):
 
 
 def _shared_pole_fixed_q_policy(header):
-    """Resolve the policy from the store's authenticated TRS/grid metadata."""
+    """Resolve the policy from the store's authenticated TRS/grid metadata.
+
+    Resolved once per panel, in `_shared_pole_panel_tables`, and carried in its
+    `policy` entry: the unfold and the routed synthesis both need it and both
+    take those tables, so neither resolves a second copy of the same header.
+    """
     from gw.qgrid_symmetry import qgrid_trs_policy_from_shared_pole_store
 
     return qgrid_trs_policy_from_shared_pole_store(header, announce=False)
@@ -264,7 +269,7 @@ def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
     # row metadata; the endpoint routing and all-P operator tiles are intact.
     policy = _shared_pole_fixed_q_policy(header)
     return dict(parent_span=(lo, hi), rows=rows, parent_rows=parent_map[rows] - lo,
-                sym_rows=policy.unfold_sym_idx[rows],
+                sym_rows=policy.unfold_sym_idx[rows], policy=policy,
                 q_frac=np.asarray(qt["q_irr_frac"], dtype=np.float64)[lo:hi],
                 packed_perm=packed, wraps=wraps, certificates=certificates,
                 n_sym_spatial=int(qt["n_sym_spatial"]))
@@ -287,7 +292,7 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
     if not all(cert[axis]["is_local"] for axis in ("x", "y")):
         raise ValueError("shared-pole nonlocal maps require routed endpoint panels")
 
-    policy = _shared_pole_fixed_q_policy(header)
+    policy = tables["policy"]
     qids = np.asarray(header["q_irr_full_idx"])[slice(*q_span)]
     realize = shared_pole_operator_realizer(
         meta, header, q_full_idx=qids, mesh_xy=mesh_xy)
@@ -332,7 +337,7 @@ def _shared_pole_routed_synthesis(
     operations = header["operations"]
     spin = (np.asarray(operations["spin_real"])
             + 1j * np.asarray(operations["spin_imag"]))[tables["sym_rows"]]
-    policy = _shared_pole_fixed_q_policy(header)
+    policy = tables["policy"]
     parent_ids = np.asarray(header["q_irr_full_idx"])[tables["parent_span"][0]:tables["parent_span"][1]]
     child_ids = parent_ids[tables["parent_rows"]]
     fixed = policy.self_negative_q[child_ids]

@@ -7,9 +7,13 @@ tables instead of copying the thresholds into bank/constructor/store/Sigma code.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
+import operator
+
+import numpy as np
 
 RECIPE_VERSION = "shared_real_pole_v1_r3b"
 GATE_VERSION = "shared_real_pole_gates_v1_r3b"
@@ -140,9 +144,13 @@ def representation_row_passed(measured, threshold):
     for key, want in threshold.items():
         got = measured.get(key)
         if isinstance(want, tuple):
-            if got not in want:
-                return False
-        elif bool(got) != bool(want) if isinstance(want, bool) else got != want:
+            matched = got in want
+        elif isinstance(want, bool):
+            # A JSON round trip brings a flag back as 0/1, so compare truth.
+            matched = bool(got) == bool(want)
+        else:
+            matched = got == want
+        if not matched:
             return False
     return True
 
@@ -154,14 +162,12 @@ def retained_moment_row_passed(measured, row):
     calibration band passes at the band ceiling; otherwise the row's own threshold applies.
     ``None`` (nothing measured) is not a pass.
     """
-    import numpy as _np
-
     if not measured:
         return None
     ceiling = (row.get("calibration_range") or (None, row.get("threshold")))[1]
     if ceiling is None:
         return None
-    worst = max(float(_np.max(_np.abs(_np.asarray(value, dtype=float))))
+    worst = max(float(np.max(np.abs(np.asarray(value, dtype=float))))
                 for value in measured.values())
     return bool(worst <= float(ceiling))
 
@@ -189,12 +195,10 @@ def reciprocity_row_verdict(measured):
     :func:`representation_row_passed` exists to fix, and INVARIANTS 23: an
     absent measurement is never PASS.
     """
-    import numpy as _np
-
     if not measured:
         return None
-    applicable = _np.asarray(measured.get("applicable", []), dtype=bool).ravel()
-    passed = _np.asarray(measured.get("passed", []), dtype=bool).ravel()
+    applicable = np.asarray(measured.get("applicable", []), dtype=bool).ravel()
+    passed = np.asarray(measured.get("passed", []), dtype=bool).ravel()
     if applicable.size == 0 or applicable.size != passed.size:
         return None
     if not applicable.any():
@@ -261,7 +265,6 @@ class CapacityLedger:
     """
 
     def __init__(self, meta, *, mesh_xy, device_budget_bytes=None):
-        import operator
         geometry = dict(nq=meta.nk_tot, nspinor=meta.nspinor, nmu=meta.n_rmu,
                         px=mesh_xy.shape['x'], py=mesh_xy.shape['y'])
         self.geometry = {}
@@ -315,7 +318,6 @@ class CapacityLedger:
 
     @staticmethod
     def _bytes(value):
-        import operator
         if isinstance(value, bool):
             raise ValueError("capacity bytes must be nonnegative integers")
         try:
@@ -335,7 +337,6 @@ class CapacityLedger:
         must be charged here OR in a named concurrent reservation, never both.
         No runtime peak is inferred from a successful analytical admission.
         """
-        import copy
         if not isinstance(stage, str) or not stage.strip() or stage in self._accepted:
             raise ValueError(f"capacity stage must be a new nonempty name; got {stage!r}")
         if isinstance(concurrent_with, str):
@@ -450,14 +451,12 @@ class CapacityLedger:
         reconstruct the prefix without duplicating every earlier reservation.
         The default remains the complete ledger snapshot.
         """
-        import operator
         if entry_start is not None:
             if isinstance(entry_start, bool):
                 raise ValueError("capacity entry_start must be an integer index")
             entry_start = operator.index(entry_start)
             if not 0 <= entry_start <= len(self.entries):
                 raise ValueError("capacity entry_start lies outside the ledger")
-        import copy
         snapshot = copy.deepcopy(dict(geometry=self.geometry,
                                   U_bytes_per_rank=self.U_bytes_per_rank,
                                   limit_bytes_per_rank=self.limit_bytes_per_rank,
@@ -552,8 +551,6 @@ def build_construction_row(model, counts, diagnostics, *, span, roles, price,
     -------
     (row, measurements)
     """
-    import numpy as np
-
     _, poles, mask = model
     reduction = diagnostics["reduction"]
     zero, passive = diagnostics["zero"], diagnostics["passive"]
@@ -613,7 +610,6 @@ def bind_shared_pole_sc_identity(meta, state, *, occupation_state, print_fn):
     digest or the already-bound insulating census digest; compute no new hash.
     These labels MUST NOT authenticate restart membership or skip construction.
     """
-    import operator
 
     iteration = operator.index(state.iteration)
     if isinstance(state.iteration, bool) or iteration < 0:
@@ -731,7 +727,6 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     uses the supplied authenticated full-BZ quadrature weights. This census
     must be rebound at every SC map, after that map's occupation solve.
     """
-    import numpy as np
     from common.units import RYD_TO_EV
 
     stop = wfns.slices.b4_logical - wfns.slices.b0
@@ -891,7 +886,6 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     Expanding intervals enlarge the envelope; policy changes start a new one.
     All ranks execute the metadata work; only ``print_fn`` may filter by rank.
     """
-    import numpy as np
     from common.units import RYD_TO_EV
 
     if config.sigma.w_model != "shared_pole":

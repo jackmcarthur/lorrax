@@ -15,7 +15,6 @@ import time
 import jax
 import numpy as np
 from common import timing
-from jax.experimental import multihost_utils
 from jax.sharding import PartitionSpec as P
 
 
@@ -66,7 +65,7 @@ def _coulomb_resource(value, meta, sym, mesh_xy, path):
     Only one parent is unpacked at a time; no full-q canonical copy exists.
     """
     from file_io.slab_io import SlabIO
-    from .response_bank import _reserve, _resource_hash
+    from .response_bank import _reserve, resource_digest
     basis = meta.mu_basis
     qids = np.asarray(sym.q_irr_full_idx, np.int64)
     if value.shape != (meta.nk_tot, basis.n_packed, basis.n_packed):
@@ -89,14 +88,8 @@ def _coulomb_resource(value, meta, sym, mesh_xy, path):
                           valid_shape=(1, basis.n_logical, basis.n_logical))
             io.sync_writes()
             del canonical
-    stat = path.stat()
-    digest = np.zeros(32, np.uint8)
-    if jax.process_index() == 0:
-        digest[:] = np.frombuffer(bytes.fromhex(_resource_hash(
-            str(path), stat.st_size, stat.st_mtime_ns)), np.uint8)
-    digest = multihost_utils.broadcast_one_to_all(digest)
     return dict(path=str(path), dataset="V_canonical_qwedge", basis="canonical",
-                q_irr_full_idx=qids.tolist(), sha256=bytes(np.asarray(digest)).hex())
+                q_irr_full_idx=qids.tolist(), sha256=resource_digest(path))
 
 
 def _shared_pole_tables(meta, sym, centroid_indices):
