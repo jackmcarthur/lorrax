@@ -28,8 +28,9 @@ def _packed_operator(meta, mesh, logical):
 
 
 def test_ordered_bank_moments_round_trip_into_the_constructor(tmp_path):
-    from gw.shared_pole_constructor import (
-        assemble_ordered_shared_pole_pencil, ordered_moment_identity, reduce_ordered_shared_pole_pencil)
+    from gw.shared_pole_gates import ordered_moment_identity
+    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil
+    from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
 
     mesh, meta, tables, recipe, identity = _bank_fixture()

@@ -66,7 +66,8 @@ def _states(mesh, rng, nodes, n=4, r=2):
 
 def test_even_and_ordered_pencils_come_out_on_the_face():
     import distrib_la as D
-    from gw.shared_pole_constructor import assemble_ordered_shared_pole_pencil, assemble_shared_pole_pencil
+    from gw.shared_pole_pencil import (assemble_ordered_shared_pole_pencil,
+                                       assemble_shared_pole_pencil)
 
     mesh, rng = _mesh(), np.random.default_rng(11)
     matmul = partial(D.matmul, mesh=mesh, backend="off")

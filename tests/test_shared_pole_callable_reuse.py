@@ -10,7 +10,9 @@ def check_reuse(mesh):
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from gw.shared_pole_local import pack_parent_panels, _parent_panel_packer
-    from gw.shared_pole_constructor import _hermitian_part_kernel, _public_factor_kernel, _stack_model_kernel
+    from gw.shared_pole_directions import (_hermitian_part_kernel,
+                                           _public_factor_kernel,
+                                           _stack_model_kernel)
     face = NamedSharding(mesh, P(None, 'x', 'y'))
     def put(value):
         return jax.make_array_from_callback(value.shape, face, lambda i: value[i])
@@ -88,7 +90,7 @@ def check_reuse(mesh):
         assert factory(mesh) is factory(mesh)
     # Parent identity and spectral counts must remain live without compiling
     # another executable when only those small metadata values change.
-    from gw.shared_pole_constructor import _parent_panel_slice
+    from gw.shared_pole_directions import _parent_panel_slice
     from distrib_la.polar import _retained_column_kernel
     panels=put(np.stack([np.full((8,8),i+1,np.complex128) for i in range(3)]))
     take=_parent_panel_slice(mesh,4)

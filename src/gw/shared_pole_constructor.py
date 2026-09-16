@@ -12,13 +12,26 @@ there is no local vendor or alternative eigensolver in this physics owner.
 
 from __future__ import annotations
 
-from functools import lru_cache, partial
+from functools import partial
 
 import jax
 import jax.numpy as jnp
-from distrib_la import (diagonal_like, face_sharding, hermitian_block, hermitian_part,
-                        join_columns, on_face)
 from common import timing
+from gw.shared_pole_directions import (_direction_states, _model_diagnostics,
+                                       _parent_panel_slice, _parent_result_slice,
+                                       _public_factor_kernel, _sample_point,
+                                       _stack_model_kernel)
+from gw.shared_pole_gates import (apply_shared_pole_zero_policy,
+                                  ordered_moment_identity,
+                                  retained_moment_identity,
+                                  shared_pole_passivity,
+                                  shared_pole_reciprocity,
+                                  signed_shared_pole_passivity,
+                                  sort_shared_pole_columns)
+from gw.shared_pole_pencil import (assemble_ordered_shared_pole_pencil,
+                                   assemble_shared_pole_pencil)
+from gw.shared_pole_reduction import (reduce_ordered_shared_pole_pencil,
+                                      reduce_shared_pole_pencil)
 
 
 def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
@@ -63,54 +76,6 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
             "parent_batch": b, "sample_batch": a}
 
 
-
-
-# The construction is split by concern; this module stays the door its callers name.
-from gw.shared_pole_pencil import (  # noqa: F401  (re-exported for existing callers)
-    _adjoint,
-    _finite_column_g,
-    _scale_rows,
-    _subtract,
-    assemble_ordered_shared_pole_pencil,
-    assemble_shared_pole_pencil,
-    finite_pencil_column,
-    infinity_pencil_column,
-    ordered_infinity_pencil_column,
-)
-from gw.shared_pole_reduction import (  # noqa: F401  (re-exported for existing callers)
-    _metric_inverse_root,
-    _paired_member,
-    _paired_output,
-    _restricted_block,
-    reduce_ordered_shared_pole_pencil,
-    reduce_shared_pole_pencil,
-)
-from gw.shared_pole_gates import (  # noqa: F401  (re-exported for existing callers)
-    _factor_column_permutation,
-    _passivity_response_checks,
-    apply_shared_pole_zero_policy,
-    ordered_moment_identity,
-    ordered_pole_bound_ry,
-    ordered_shared_pole_value,
-    retained_moment_identity,
-    shared_pole_operator_passivity,
-    shared_pole_passivity,
-    shared_pole_reciprocity,
-    signed_shared_pole_passivity,
-    sort_shared_pole_columns,
-)
-from gw.shared_pole_directions import (  # noqa: F401  (re-exported for existing callers)
-    _direction_states,
-    _fit_roles,
-    _hermitian_part_kernel,
-    _model_diagnostics,
-    _odd_partner_directions,
-    _parent_panel_slice,
-    _parent_result_slice,
-    _public_factor_kernel,
-    _sample_point,
-    _stack_model_kernel,
-)
 
 def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     """Construct and write a current-state, bounded-batch real-pole model.

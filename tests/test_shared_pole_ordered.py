@@ -99,8 +99,8 @@ def _states(plant, points, ordered=True):
 
 def _ordered(plant, points, r_inf=1):
     import jax.numpy as jnp
-    from gw.shared_pole_constructor import (
-        assemble_ordered_shared_pole_pencil, reduce_ordered_shared_pole_pencil)
+    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil
+    from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     mm, eigh = _ops()
     qi = np.linalg.eigh(plant.moment(1))[1][:, -r_inf:]
@@ -129,7 +129,7 @@ def _signed_value(signed, z):
 
 
 def test_ordered_full_order_exact_with_real_poles_and_paired_carrier():
-    from gw.shared_pole_constructor import ordered_shared_pole_value, signed_shared_pole_passivity
+    from gw.shared_pole_gates import ordered_shared_pole_value, signed_shared_pole_passivity
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     mm, eigh = _ops()
     plant = _trim(np.random.default_rng(20260915), 6, 3, eps=.4)
@@ -156,7 +156,7 @@ def test_ordered_full_order_exact_with_real_poles_and_paired_carrier():
 
 
 def test_ordered_projected_moments_at_reduced_order():
-    from gw.shared_pole_constructor import ordered_moment_identity
+    from gw.shared_pole_gates import ordered_moment_identity
     mm, _ = _ops()
     plant = _trim(np.random.default_rng(7), 12, 3, eps=.4)
     _, signed, diag, infinity = _ordered(plant, .9 + .35j, r_inf=2)
@@ -174,7 +174,7 @@ def test_ordered_projected_moments_at_reduced_order():
 
 
 def test_ordered_pole_bound_covers_rpa_poles():
-    from gw.shared_pole_constructor import ordered_pole_bound_ry
+    from gw.shared_pole_gates import ordered_pole_bound_ry
     mm, eigh = _ops()
     for seed in (31, 32, 33):
         plant, D, V = _physical(np.random.default_rng(seed), 6, 4)
@@ -192,8 +192,9 @@ def test_ordered_equals_even_at_an_active_keep_cut_on_time_reversal_symmetric_da
     """Two supports over-span the latent space, so the relative keep cut removes
     directions; the paired-basis cut keeps exactly the even route's span (P3)."""
     import jax.numpy as jnp
-    from gw.shared_pole_constructor import (assemble_shared_pole_pencil, reduce_shared_pole_pencil,
-                                            apply_shared_pole_zero_policy)
+    from gw.shared_pole_gates import apply_shared_pole_zero_policy
+    from gw.shared_pole_pencil import assemble_shared_pole_pencil
+    from gw.shared_pole_reduction import reduce_shared_pole_pencil
     from gw.shared_pole_recipe import (shared_real_pole_gates_v1_r3b as gates,
                                        shared_real_pole_gates_ordered_v1 as ordered_gates)
     mm, eigh = _ops()
@@ -219,7 +220,8 @@ def test_ordered_equals_even_at_an_active_keep_cut_on_time_reversal_symmetric_da
 
 def test_ordered_equals_even_construction_on_time_reversal_symmetric_data():
     import jax.numpy as jnp
-    from gw.shared_pole_constructor import assemble_shared_pole_pencil, reduce_shared_pole_pencil
+    from gw.shared_pole_pencil import assemble_shared_pole_pencil
+    from gw.shared_pole_reduction import reduce_shared_pole_pencil
     from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
     mm, eigh = _ops()
     plant = _trim(np.random.default_rng(11), 12, 3, eps=0.)
@@ -249,8 +251,9 @@ def test_direction_states_pair_a_harness_recipe_on_the_same_directions():
     from lxkit.testing import require_devices
     import distrib_la as D
     from runtime.padding import padded_axis
-    from gw.shared_pole_constructor import (
-        _direction_states, assemble_ordered_shared_pole_pencil, reduce_ordered_shared_pole_pencil)
+    from gw.shared_pole_directions import _direction_states
+    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil
+    from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil
     from gw.shared_pole_local import pack_parent_panels
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     require_devices(4, "cpu")
@@ -311,9 +314,12 @@ def test_dedupe_drops_duplicate_partners_and_equals_even_on_symmetric_data():
     from lxkit.testing import require_devices
     import distrib_la as D
     from runtime.padding import padded_axis
-    from gw.shared_pole_constructor import (
-        _direction_states, assemble_ordered_shared_pole_pencil, reduce_ordered_shared_pole_pencil,
-        assemble_shared_pole_pencil, reduce_shared_pole_pencil, apply_shared_pole_zero_policy)
+    from gw.shared_pole_directions import _direction_states
+    from gw.shared_pole_gates import apply_shared_pole_zero_policy
+    from gw.shared_pole_pencil import (assemble_ordered_shared_pole_pencil,
+                                       assemble_shared_pole_pencil)
+    from gw.shared_pole_reduction import (reduce_ordered_shared_pole_pencil,
+                                          reduce_shared_pole_pencil)
     from gw.shared_pole_local import pack_parent_panels
     from gw.shared_pole_recipe import (shared_real_pole_gates_ordered_v1 as ordered_gates,
                                        shared_real_pole_gates_v1_r3b as even_gates)
@@ -380,7 +386,7 @@ def test_dedupe_drops_duplicate_partners_and_equals_even_on_symmetric_data():
 
 
 def test_generic_q_positive_halves_assemble_the_galerkin_model():
-    from gw.shared_pole_constructor import ordered_shared_pole_value
+    from gw.shared_pole_gates import ordered_shared_pole_value
     mm, _ = _ops()
     q, mq = _generic_pair(np.random.default_rng(13), 12, 3)
     for z in ZS:

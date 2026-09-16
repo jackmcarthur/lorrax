@@ -100,7 +100,7 @@ def _parent_panel_packer(mesh_xy, finite_width, parent_batch, sources, unique_wi
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from gw.shared_pole_constructor import _factor_column_permutation
+    from gw.shared_pole_gates import _factor_column_permutation
 
     face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     scalar = NamedSharding(mesh_xy, P())
@@ -149,10 +149,10 @@ def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
     from jax.sharding import PartitionSpec as P
     from common.shard_map import shard_map
     from common.staged_reshard import face_to_batch_reshard
-    from gw.shared_pole_constructor import (
-        assemble_shared_pole_pencil, reduce_shared_pole_pencil,
-        apply_shared_pole_zero_policy, retained_moment_identity,
-    )
+    from gw.shared_pole_gates import (apply_shared_pole_zero_policy,
+                                      retained_moment_identity)
+    from gw.shared_pole_pencil import assemble_shared_pole_pencil
+    from gw.shared_pole_reduction import reduce_shared_pole_pencil
     from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
 
     to_batch = face_to_batch_reshard(mesh_xy)
@@ -269,7 +269,7 @@ def local_model_checks(mesh_xy, native_eigh):
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.shard_map import shard_map
     from common.staged_reshard import face_to_batch_reshard
-    from gw.shared_pole_constructor import shared_pole_passivity, shared_pole_reciprocity
+    from gw.shared_pole_gates import shared_pole_passivity, shared_pole_reciprocity
     from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
 
     to_batch = face_to_batch_reshard(mesh_xy)
