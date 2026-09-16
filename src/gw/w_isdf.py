@@ -365,8 +365,13 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 def _get_chi_fractional_contour_kernel(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int,
     *, layout: str = "face", face_shape=None, k_unfold_plan=None,
+    ordered=False,
 ):
-    """Build the face or parent retarded response on one positive-time sweep."""
+    """Build the face or parent retarded response on one positive-time sweep.
+
+    ``ordered=True`` returns the physical orientation ``FT_q[chi]`` on every
+    full-grid row (:func:`_get_chi_fractional_contour_kernel_face`).
+    """
     from ffi import ffi_dial_key
 
     grid = tuple(int(n) for n in kgrid)
@@ -377,8 +382,9 @@ def _get_chi_fractional_contour_kernel(
         raise ValueError(
             f"_get_chi_fractional_contour_kernel: layout must be 'face' "
             f"got {layout!r}")
+    ordered = bool(ordered)
     cache_key = ("fractional_contour", _mesh_key(mesh_xy), grid, ffi_dial_key(),
-                 n_out, layout, face_shape, id(k_unfold_plan))
+                 n_out, layout, face_shape, id(k_unfold_plan), ordered)
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -387,7 +393,8 @@ def _get_chi_fractional_contour_kernel(
             "_get_chi_fractional_contour_kernel(layout='face') requires "
             "face_shape=(nk, nb_full, n_rmu, nspinor)")
     kernel = _get_chi_fractional_contour_kernel_face(
-        mesh_xy, grid, n_out, face_shape, k_unfold_plan=k_unfold_plan, layout=layout)
+        mesh_xy, grid, n_out, face_shape, k_unfold_plan=k_unfold_plan,
+        layout=layout, ordered=ordered)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
@@ -410,8 +417,9 @@ def _get_chi_fractional_contour_kernel_face(
     ``ordered=True`` (time reversal measured broken) and ``laplace_ordered``
     return the physical ``FT_q[chi]``: G is built as ``build_G_tau(conj w,
     conj t)`` and the rows are gathered at ``-q``, exactly the incumbent row
-    ``-q`` transposed. Time-reversal-symmetric banks keep the incumbent trace,
-    where the two orientations are equal.
+    ``-q`` transposed. Without ``selected_q`` the finished full-grid rows are
+    permuted by the q negation instead of gathered. Time-reversal-symmetric
+    banks keep the incumbent trace, where the two orientations are equal.
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
@@ -433,8 +441,6 @@ def _get_chi_fractional_contour_kernel_face(
         raise ValueError("bank carry requires selected q rows")
     if pair_mode != "retarded" and selected_q is None:
         raise ValueError("Laplace bank correlations require selected_q")
-    if ordered and selected_q is None:
-        raise ValueError("ordered (physical-orientation) correlations require selected_q")
     if selected_q is not None:
         from .contour_accumulator import contour_accumulator
         accumulate_selected = contour_accumulator(mesh_xy)
@@ -450,10 +456,16 @@ def _get_chi_fractional_contour_kernel_face(
                 "full-grid indices; why: bank parent rows must be explicit")
     physical = bool(ordered) or pair_mode == "laplace_ordered"
     gather_q = selected_q
+    negate_full_q = None
     if physical:
-        coords = np.unravel_index(np.asarray(selected_q), grid)
-        gather_q = tuple(int(i) for i in np.ravel_multi_index(
+        rows = np.arange(nk) if selected_q is None else np.asarray(selected_q)
+        coords = np.unravel_index(rows, grid)
+        negated = tuple(int(i) for i in np.ravel_multi_index(
             tuple((-c) % n for c, n in zip(coords, grid)), grid))
+        if selected_q is None:
+            negate_full_q = negated
+        else:
+            gather_q = negated
     selected_shard = NamedSharding(mesh_xy, P(None, None, "x", "y"))
     nk_shape, nb_full, n_rmu, ns = (int(v) for v in face_shape)
     # Raw-parent transport (``k_unfold_plan``): the two G's are contracted
@@ -491,7 +503,12 @@ def _get_chi_fractional_contour_kernel_face(
     g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
                        nq=nk_shape, dtype=jnp.complex128, layout=layout)
     def _finish(value):
-        return chi_fftn(value)
+        value = chi_fftn(value)
+        if negate_full_q is None:
+            return value
+        # Physical orientation on the full grid: the finished row q is the
+        # transform's row -q (see the docstring); q is unsharded here.
+        return jnp.take(value, jnp.asarray(negate_full_q), axis=0)
 
     @partial(
         jax.jit,
@@ -2223,8 +2240,14 @@ def compute_chi0_contour_fractional(
     occupations=None,
     energy_reference=0.0,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+    ordered=False,
 ):
-    """Evaluate retarded finite-occupation chi0 at complex frequencies; see docs/architecture/four_current_wiring.md."""
+    """Evaluate retarded finite-occupation chi0 at complex frequencies; see docs/architecture/four_current_wiring.md.
+
+    ``ordered=True`` (time reversal measured broken) returns the physical
+    orientation ``FT_q[chi]`` on every full-grid row; the incumbent trace,
+    ``FT_q[chi^T]``, is kept bit for bit otherwise (equal under time reversal).
+    """
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     args, n_out = _chi0_fractional_contour_args(
@@ -2237,7 +2260,7 @@ def compute_chi0_contour_fractional(
         occupation_window_threshold,
     )
     kernel = _get_chi_fractional_contour_kernel(
-        mesh_xy, kgrid, n_out, **_chi_parent_face_kwargs(wfns))
+        mesh_xy, kgrid, n_out, ordered=ordered, **_chi_parent_face_kwargs(wfns))
     values = kernel(*args)
     return values[0] if n_out == 1 else values
 
@@ -2250,9 +2273,20 @@ def _fractional_pair_scan_face(
     psi_mun_a, psi_nmu_a, psi_mun_b, psi_nmu_b, energy_a, energy_b,
     occ_a, occ_b, surface_a, surface_b, z_values, *,
     nb_full, nb_logical, tile, unfold_x=None, unfold_y=None, roll_b=None,
-    k_unfold_plan=None,
+    k_unfold_plan=None, ordered=False,
 ):
-    """Stream ordered band-pair tiles from canonical faces with optional typed parent transport."""
+    """Stream ordered band-pair tiles from canonical faces with optional typed parent transport.
+
+    Orientation (same convention as ``_get_chi_fractional_contour_kernel_face``:
+    ``FT_q[f](mu,nu) = sum_R f(r_mu, r_nu+R) e^{iq.R}``).  The incumbent trace
+    accumulates ``w · rho_ab(mu) · conj rho_ab(nu)`` with
+    ``rho_ab = psi_{a,k} conj psi_{b,k-q}``, which is ``FT_q[chi^T]``.
+    ``ordered=True`` (time reversal measured broken) returns the physical
+    ``FT_q[chi]``: the ``b`` role is rolled to ``k+q`` (the caller passes the
+    ``-q`` row's ``k-q`` map) and the conjugation moves to the ``mu`` density,
+    exactly the incumbent row ``-q`` transposed.  Under time reversal the two
+    orientations are equal and the incumbent trace is kept bit for bit.
+    """
     # The k extent of the PAIR SUM is the energy table's (full BZ).  With
     # raw parents (``unfold_x``/``unfold_y`` given) the ψ operands carry
     # n_parent rows and every band tile is unfolded to full k after its
@@ -2357,6 +2391,12 @@ def _fractional_pair_scan_face(
             "ksma,ksmb->kmab", pa_x, jnp.conj(pb_x), optimize=True)
         density_y = jnp.einsum(
             "ksna,ksnb->knab", pa_y, jnp.conj(pb_y), optimize=True)
+        if ordered:
+            # Physical orientation: rows at -q (b rolled to k+q by the
+            # caller) with the conjugation on the mu density; see docstring.
+            return jnp.einsum(
+                "zkab,kmab,knab->zmn", weights, jnp.conj(density_x),
+                density_y, optimize=True)
         return jnp.einsum(
             "zkab,kmab,knab->zmn", weights, density_x, jnp.conj(density_y),
             optimize=True)
@@ -2551,16 +2591,22 @@ def _get_chi_static_fractional_gamma_kernel_face(
 
 def _get_chi_fractional_q_kernel_face(
     mesh_xy: Mesh, *, nb_full: int, nb_logical: int, pair_tile: int,
-    n_z: int, k_unfold_plan=None, layout="face",
+    n_z: int, k_unfold_plan=None, layout="face", ordered=False,
 ):
-    """Roll the unfolded b endpoint to k−q inside the ordered-pair contraction."""
+    """Roll the unfolded b endpoint to k−q inside the ordered-pair contraction.
+
+    ``ordered=True`` returns the physical orientation ``FT_q[chi]``; the
+    caller then passes the ``-q`` row's ``k-q`` map (the ``k+q`` map) as
+    ``kminq_idx`` (:func:`_fractional_pair_scan_face`).
+    """
     from common.shard_map import shard_map
     from common.wfn_layout import psi_specs
     PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(layout)
 
     tile = int(pair_tile)
+    ordered = bool(ordered)
     key = ("direct_fractional_q_face", _mesh_key(mesh_xy), int(nb_full),
-           int(nb_logical), tile, int(n_z), id(k_unfold_plan), layout)
+           int(nb_logical), tile, int(n_z), id(k_unfold_plan), layout, ordered)
     hit = _chi_minimax_kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -2576,7 +2622,8 @@ def _get_chi_fractional_q_kernel_face(
             return _fractional_pair_scan_face(
                 psi_mun, psi_nmu, psi_mun_b, psi_nmu_b, energies, eb,
                 occupations, fb, surface_weight, sb, z_values,
-                nb_full=nb_full, nb_logical=nb_logical, tile=tile)
+                nb_full=nb_full, nb_logical=nb_logical, tile=tile,
+                ordered=ordered)
         in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None), P(None, None),
                     P(None, None), P(None, None), P(None))
     else:
@@ -2597,7 +2644,7 @@ def _get_chi_fractional_q_kernel_face(
                 occupations, fb, surface_weight, sb, z_values,
                 nb_full=nb_full, nb_logical=nb_logical, tile=tile,
                 unfold_x=unfold_x, unfold_y=unfold_y, roll_b=kminq_idx,
-                k_unfold_plan=k_unfold_plan)
+                k_unfold_plan=k_unfold_plan, ordered=ordered)
         in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None), P(None, None),
                     P(None, None), P(None, None), P(None)) + _PARENT_UNFOLD_SPECS
 
@@ -2695,12 +2742,13 @@ def compute_chi0_static_fractional(
     occupation_state,
     kminq_rows,
     nb_logical=None,
+    ordered=False,
 ):
     """Exact static finite-occupation chi0 for every stored q row; see docs/architecture/four_current_wiring.md."""
     return compute_chi0_direct_fractional(
         wfns, np.asarray([0.0j], dtype=np.complex128), meta, mesh_xy,
         occupation_state=occupation_state, kminq_rows=kminq_rows,
-        nb_logical=nb_logical)
+        nb_logical=nb_logical, ordered=ordered)
 
 
 def compute_chi0_direct_fractional(
@@ -2713,8 +2761,17 @@ def compute_chi0_direct_fractional(
     kminq_rows,
     nb_logical=None,
     progress_fn=None,
+    ordered=False,
 ):
-    """Exact finite-occupation chi0 at selected complex frequencies; see docs/architecture/four_current_wiring.md."""
+    """Exact finite-occupation chi0 at selected complex frequencies; see docs/architecture/four_current_wiring.md.
+
+    ``ordered=True`` (time reversal measured broken) returns the physical
+    orientation ``FT_q[chi]`` for every row: the pair kernel runs on the
+    ``-q`` row's ``k-q`` map (the inverse permutation of ``kminq_rows``) with
+    the conjugation on the ``mu`` density (:func:`_fractional_pair_scan_face`).
+    The incumbent trace, ``FT_q[chi^T]``, is kept bit for bit when
+    ``ordered=False``; the two agree under time reversal.
+    """
     from gw.efermi import fd_negative_derivative, mp1_negative_derivative
 
     # The occupation owner stamps config.occ_smearing_family onto this
@@ -2754,6 +2811,15 @@ def compute_chi0_direct_fractional(
         raise ValueError(
             "static fractional chi kminq_rows must have shape (n_q, nk="
             f"{e.shape[0]}); got {kmq.shape}")
+    if ordered:
+        # The -q row's k-q map is the k+q map: the inverse permutation.
+        if not np.all(np.sort(kmq, axis=1) == np.arange(kmq.shape[1])[None, :]):
+            raise ValueError(
+                "GATE direct_fractional_ordered_rows: got a kminq row that is "
+                "not a permutation of the full k grid; want one full-grid "
+                "k-q map per q row; why: the physical orientation gathers "
+                "the -q row through the inverse permutation")
+        kmq = np.argsort(kmq, axis=1, kind="stable").astype(np.int32)
     z = np.asarray(z_values, dtype=np.complex128)
     if z.ndim != 1 or not z.size or not np.all(np.isfinite(z)):
         raise ValueError(
@@ -2786,7 +2852,7 @@ def compute_chi0_direct_fractional(
     kernel = _get_chi_fractional_q_kernel_face(
         mesh_xy, nb_full=nb_full, nb_logical=nb_log,
         pair_tile=_STATIC_FRACTIONAL_PAIR_TILE, n_z=z.size,
-        k_unfold_plan=plan, layout=wfns.layout)
+        k_unfold_plan=plan, layout=wfns.layout, ordered=ordered)
     rows = []
     for q_row, row in enumerate(kmq):
         started = time.monotonic()
@@ -2812,6 +2878,7 @@ def precompile_chi0_contour_fractional(
     occupations=None,
     energy_reference=0.0,
     occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+    ordered=False,
 ):
     """AOT sibling of compute_chi0_contour_fractional."""
     ensure_jax_compile_cache()
@@ -2826,7 +2893,8 @@ def precompile_chi0_contour_fractional(
         occupation_window_threshold,
     )
     _get_chi_fractional_contour_kernel(
-        mesh_xy, kgrid, n_out, **_chi_face_kwargs(wfns)).lower(*args).compile()
+        mesh_xy, kgrid, n_out, ordered=ordered,
+        **_chi_face_kwargs(wfns)).lower(*args).compile()
 
 
 def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
