@@ -40,6 +40,38 @@ def _height_eta_factor():
     return value
 
 
+def resolve_direction_cutoff(tier_value):
+    """Relative singular cutoff for line-support directions; the tier's value unless opened.
+
+    This is how many singular vectors a line support contributes: it is the
+    relative cut applied to the right singular values of W at that support
+    (``shared_pole_directions`` line role), and to the ordered partner dedupe.
+    It does NOT touch the imaginary supports, which take a fixed
+    ``ceil(n*imaginary_width_fraction)`` directions, nor infinity.
+
+    Deliberately NOT in RECIPE_HASH. The cut is a reduction parameter, not a
+    sampling one: ``_bank_plan`` reads only the point/role/held arrays, so the
+    cut cannot change which frequencies a bank stores or what it stores there,
+    and ``sigma_w_accuracy`` already moves it between tiers without moving
+    RECIPE_HASH. A bank is therefore reusable across cuts, which is the point.
+    Identity is still recorded: the store/bank header's own ``recipe_hash`` is
+    a digest of the whole RESOLVED recipe dict, which carries this value, so a
+    model always authenticates the cut it was built with.
+
+    Experiment dial only; unset reproduces the tier rule exactly.
+    """
+    raw = os.environ.get("LORRAX_DEBUG_SHARED_POLE_DIRECTION_CUTOFF", "").strip()
+    if not raw:
+        return tier_value
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"GATE shared_pole_direction_cutoff: got: {raw!r}; want: a finite float in (0, 1); why: the cut is a RELATIVE singular-value threshold") from None
+    if not math.isfinite(value) or not 0.0 < value < 1.0:
+        raise ValueError(f"GATE shared_pole_direction_cutoff: got: {value}; want: 0 < cut < 1; why: a nonpositive cut retains numerical null directions and a cut >= 1 retains none")
+    return value
+
+
 shared_real_pole_v1_r3b = {
     "version": RECIPE_VERSION,
     "height_eta_factor": _height_eta_factor(),
@@ -923,7 +955,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'line_count': len(line), 'imaginary_count': count,
         'unique_evaluations': len(points), 'fit_count': len(fit_ids),
         'held_count': len(held_ids), 'role_count': len(role_codes),
-        'n': n, 'direction_cutoff': policy['direction_cutoff'],
+        'n': n, 'direction_cutoff': resolve_direction_cutoff(policy['direction_cutoff']),
         'imaginary_width': math.ceil(n * policy['imaginary_width_fraction']),
         'infinity_width': math.ceil(n * policy['infinity_width_fraction']),
         'multiplet_relative_tolerance': recipe['multiplet_relative_tolerance'],
