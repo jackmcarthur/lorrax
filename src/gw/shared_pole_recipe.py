@@ -10,15 +10,39 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 
 RECIPE_VERSION = "shared_real_pole_v1_r3b"
 GATE_VERSION = "shared_real_pole_gates_v1_r3b"
 RECEIPT_SCHEMA = "lorrax.shared-real-pole.receipt.v1"
 ROLE_CODES = {"line": 0, "imaginary": 1, "infinity": 2, "held_line": 3, "held_imaginary": 4}
 
+
+def _height_eta_factor():
+    """Sampling-contour height in units of eta; 4.0 unless an experiment lowers it.
+
+    The height is the imaginary offset of every real-line bank support, and a
+    construction cannot place a pole nearer the real axis than the line it was
+    sampled on, so this factor sets the model's pole floor. It is read here, at
+    the one site that owns the recipe table, and lands in ``height_eta_factor``,
+    so it enters RECIPE_HASH: a bank or store built at one height can never be
+    reused at another. Experiment dial only; the default is the production rule.
+    """
+    raw = os.environ.get("LORRAX_DEBUG_SHARED_POLE_HEIGHT_FACTOR", "").strip()
+    if not raw:
+        return 4.0
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"GATE shared_pole_height_factor: got: {raw!r}; want: a finite positive float; why: the sampling height is h = factor*eta") from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"GATE shared_pole_height_factor: got: {value}; want: finite positive; why: a support on or below the real axis has no causal bank evaluation")
+    return value
+
+
 shared_real_pole_v1_r3b = {
     "version": RECIPE_VERSION,
-    "height_eta_factor": 4.0,
+    "height_eta_factor": _height_eta_factor(),
     "reference_eta_ev": 0.25,
     "active_depth_ev": 15.0,
     "borderline_depth_ev": 25.0,
@@ -915,7 +939,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                                          if isinstance(v, np.ndarray))
     rules = {
         'support_sites': 'sigma_w_support_sites_ev; "" = the resolver ladder, else explicit line|imaginary eV sites folded into recipe_version/recipe_hash',
-        'height': 'h=4*eta', 'eta': 'literal sigma_regularization_ev',
+        'height': 'h=height_eta_factor*eta (4 by default)', 'eta': 'literal sigma_regularization_ev',
         'plasma': '2*sqrt(4*pi*active_electrons/volume) Ry',
         'top': 'L=omega_p+3.5 eV', 'spacing': 'eta/0.25',
         'low_step': '2*eta', 'high_step': '4*eta',
