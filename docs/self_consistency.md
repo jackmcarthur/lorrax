@@ -57,7 +57,7 @@ interpretable. A production self-consistent run must satisfy:
   ceiling refuses, the owner decides `zeta_rcond`, the run does not drop to a
   smaller basis;
 - `use_band_extrapolation = true` (the default), named explicitly;
-- on metals the MPA route only (GN-PPM refuses fractional occupations by design, owner ruling 2026-09-03); the two-level (frozen-W inner) loop is discontinued and stays a diagnostic branch;
+- on metals the MPA route only (GN-PPM refuses metals by name, `GATE gn_ppm_refuses_metals`, owner rulings 2026-09-03 and 2026-09-17), with Fermi-Dirac occupations and `sc_head_update = off` (next section); the two-level (frozen-W inner) loop is discontinued and stays a diagnostic branch;
 - band-structure interpolation (htransform) fitting the whole WFN band set and
   returning at least **16 corrected conduction bands**, guard bands ≥ 8. A
   band-structure workflow must request its own dense uniform NSCF/WFN for
@@ -80,6 +80,29 @@ interpretable. A production self-consistent run must satisfy:
   9.327 and 8.117 meV. This non-monotone deep-pair error is a known finite-mesh
   interpolation limitation outside the publication window, not a state-label
   or f-transform-scale correction.
+
+## Metals: velocity head updates are disabled (owner ruling 2026-09-17)
+
+On a metal the self-consistent loop runs with the existing MPA head model
+only. Every velocity head update and every other nontrivial metal head
+correction outside that model is **disabled by named refusal** pending the
+owner's replacement head model. The code is kept, not deleted. The metal
+test is the one owner, `gw_config.infer_material_class` on the WFN
+occupations, and the refusal fires at `validate_material_inputs` before
+anything is built.
+
+| Status on a metal | What | Where |
+|---|---|---|
+| **kept** | fixed DFT direct response (dipole.h5 velocity, S/Y/Z wings, no surface weights, no Thomas-Fermi value), folded through each map's W and fitted as one scalar MPA head | `qsgw_head.build_dft_head_response`; `mpa.model.fit_head_samples`; `shared_pole_head.build_shared_pole_head`; closed-form Sigma head in `head_correction` |
+| disabled | `sc_head_update = parallel_transport` (finite-link covariant velocity, ΔH manifold) and `dft_velocity` (DFT p-matrix velocity rotated per map) | `sc_iteration.load_head_velocity_source`, `qsgw_head.build_iteration_head_response` |
+| disabled (reached only through the above) | Drude tensor added as D/(ω+iη)²; tetrahedron Fermi-surface weights; the near-degenerate interband branch on those weights; Thomas-Fermi static head and its wing fold | `qsgw_head.head_drude_tensor_sharded`, `sc_iteration._solve_head_occupations`, `qsgw_head._interband_degenerate_weight`, `qsgw_head._fold_static_kappa2` |
+| disabled | `occ_broadening > 0` beside a metal width (the MP1 smeared-head dial) | parse, `gw_config._validate_occupation_smearing` |
+
+Both refusals carry `GATE metal_sc_head_update_disabled`. Metallic
+occupations are Fermi-Dirac only (`occ_smearing_width_ry` is kBT; the family
+key is removed), and every metal occupation solve in the map (entry state,
+WFN startup gate, density rebuild, certified-fit replay) uses that family.
+Insulators keep `parallel_transport` and `dft_velocity` unchanged.
 
 ## The diagnostic deck the study converged on
 
