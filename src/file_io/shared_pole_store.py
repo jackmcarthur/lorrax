@@ -28,6 +28,7 @@ from symmetry_maps import QirrTables, validate_qirr_tables
 
 SCHEMA = "lorrax.shared-real-pole.v1"
 BANK_SCHEMA = "lorrax.shared-real-pole-bank.v1"
+SECTOR_SCHEMA = "lorrax.shared-real-pole-sectors.v1"
 _TABLE_KEYS = ("irr_idx_q", "sym_idx_q", "q_irr_frac", "sym_perm", "L_table")
 _IDENTITY_KEYS = ("iteration_id", "hamiltonian", "energies", "occupations",
                   "wavefunctions", "centroids")
@@ -273,6 +274,8 @@ def _metadata(meta, tables, recipe, identity, ordered=None, *, basis=None, secto
         _refuse("missing resolved recipe and gate versions")
     centroid_hash = hashlib.sha256(np.asarray(
         basis.canonical_indices, dtype="<i4").tobytes()).hexdigest()
+    if sector is not None:
+        recipe = dict(recipe, operator_realization="raw-sector-endpoint-v1")
     header = {
         "schema": SCHEMA, "identity": identity, "recipe": recipe,
         "recipe_hash": hashlib.sha256(_json(recipe).encode()).hexdigest(),
@@ -680,6 +683,84 @@ def validate_shared_pole_model(path, *, expected_identity, mesh_xy, capacity=Non
     if _model_digest(path, header, mesh_xy, capacity=capacity) != header["digest"]:
         _refuse("model payload/identity digest mismatch")
     return header
+
+
+def write_shared_pole_sector_manifest(path, *, models, bank, identity, receipts, mesh_xy):
+    """Publish one immutable handle only after all four endpoint stores close.
+
+    ``models`` maps CC/TT/CT_C/CT_T to (path, finalized header). The bank
+    supplies the independently retained W_infinity-V constant in physical Ry.
+    This small manifest binds resources; bulk reads keep their SlabIO owner.
+    """
+    if set(models) != {'CC','TT','CT_C','CT_T'}:
+        _refuse('sector publication requires CC, TT and both CT endpoints')
+    handles={}
+    for sector,(filename,header) in models.items():
+        _check_identity(header['identity'],identity)
+        if (not header.get('finalized') or header.get('sector')!=sector or not header.get('digest')
+                or not header.get('ordered')
+                or header['recipe'].get('operator_realization')!='raw-sector-endpoint-v1'):
+            _refuse(f'unfinalized or mistyped sector {sector}')
+        handles[sector]=dict(path=str(Path(filename).resolve()),identity=identity,
+                             digest=header['digest'],K=header['K'])
+    left,right=models['CT_C'][1],models['CT_T'][1]
+    for key in ('K','Kmax','q_irr_full_idx','ordered'):
+        if _json(left.get(key))!=_json(right.get(key)):
+            _refuse(f'CT endpoint publication disagrees on {key}')
+    validate_shared_pole_bank(bank['path'],expected_identity=identity,
+                              mesh_xy=mesh_xy,require_complete=True)
+    content=dict(schema=SECTOR_SCHEMA,representation='sector-ordered-ph',identity=identity,
+        operator_realization='raw-sector-endpoint-v1',
+        sectors=handles,constant=dict(path=str(Path(bank['path']).resolve()),
+            identity=identity,field='constant'),construction=receipts)
+    digest=hashlib.sha256(_json(content).encode()).hexdigest()
+    header=dict(content,digest=digest)
+    path=Path(path)
+    def publish():
+        if path.exists():
+            _refuse('finalized sector manifests are immutable')
+        path.write_text(_json(header)+'\n')
+    rank0_transaction(path,stage='shared_pole.sector_manifest',write=publish)
+    return dict(path=str(path.resolve()),identity=identity,digest=digest,
+                representation=header['representation'],sectors=handles,constant=content['constant'])
+
+
+def validate_shared_pole_sector_manifest(path, *, expected_identity, mesh_xy, capacity=None):
+    """Authenticate the manifest and each bound current-map model resource."""
+    header=None
+    error=None
+    try:
+        header=json.loads(Path(path).read_text())
+    except Exception as exc:
+        error=exc
+    agree_io_refusal(error,path=path,stage='shared_pole.sector_manifest.read')
+    _check_identity(header.get('identity'),expected_identity)
+    if (header.get('schema')!=SECTOR_SCHEMA or header.get('representation')!='sector-ordered-ph'
+            or header.get('operator_realization')!='raw-sector-endpoint-v1'):
+        _refuse('unsupported sector manifest')
+    content={k:v for k,v in header.items() if k!='digest'}
+    if hashlib.sha256(_json(content).encode()).hexdigest()!=header.get('digest'):
+        _refuse('sector manifest digest mismatch')
+    if set(header.get('sectors',{}))!={'CC','TT','CT_C','CT_T'}:
+        _refuse('incomplete sector manifest')
+    model_headers={}
+    for sector,handle in header['sectors'].items():
+        _check_identity(handle['identity'],expected_identity)
+        model=validate_shared_pole_model(handle['path'],expected_identity=expected_identity,
+                                        mesh_xy=mesh_xy,capacity=capacity)
+        if (model.get('sector')!=sector or not model.get('ordered')
+                or model['recipe'].get('operator_realization')!='raw-sector-endpoint-v1'
+                or model['digest']!=handle['digest']
+                or model['K']!=handle['K']):
+            _refuse(f'sector manifest binding mismatch: {sector}')
+        model_headers[sector]=model
+    constant=header['constant']
+    _check_identity(constant['identity'],expected_identity)
+    if constant['field']!='constant':
+        _refuse('sector constant must name W_infinity-V')
+    validate_shared_pole_bank(constant['path'],expected_identity=expected_identity,
+                              mesh_xy=mesh_xy,require_complete=True)
+    return dict(header,model_headers=model_headers)
 
 
 def shared_pole_qirr_tables(header):

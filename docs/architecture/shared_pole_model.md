@@ -147,7 +147,56 @@ $$ \mathcal G = X^\dagger \sigma_3 X,\qquad \mathcal H = X^\dagger M X, \tag{SP 
 
 with nodes `{z, z̄, −z̄, −z}` and `∂W/∂z = 2z ∂W/∂s`. Every state `X(z)` on `Q` is followed, after all originals, by
 its mirror `X(−z)` on the same `Q`; `W_q(−z̄) = conj W_{−q}(z)`, so the mirror is one sample of parent `−q`. Poles
-`1/μ` are real iff the projected `ℋ ≻ 0`, which a stable RPA (`M ≻ 0`) guarantees.
+`ℋ ≻ 0` on the retained span is sufficient for Hermitian whitening, real
+finite poles `1/μ`, and residues with the sign of the pole. A stable RPA
+(`M ≻ 0`) guarantees this condition. Reality alone is insufficient to infer
+stability: `G = I`, `H = diag(1,-1)` has real generalized eigenvalues despite
+indefinite H. The constructor admits the positive retained metric; it does
+not certify stability of discarded or unprobed physical states.
+
+### Signed photon interaction and contact
+
+The photon bank uses the physical paramagnetic response
+`χp(z) = C (z J − H0)^−1 C†`, with particle/hole signature J and positive
+transition energies in H0. The columns of C include the square roots of
+positive occupation differences and the physical response prefactor; the
+ordered negative-frequency residues have the opposite sign. Cartesian
+current vertices stay in C, with their physical complex phases.
+
+In `response_bank.response_algebra`, `χ = χp − D`, where
+`D = cell_volume * TT_contact`, and `W = (I − V χ)^−1 V`.
+The bare photon V is Hermitian and signed. If the contact solve exists,
+`U = W∞ = (I + V D)^−1 V` is Hermitian. The resolvent identity gives
+
+$$ W(z)-U = U C [z J-(H_0+C^\dagger U C)]^{-1} C^\dagger U. $$
+
+Thus positivity of `H0 + C† U C` is a sufficient stable-realization
+condition even for indefinite U. With this condition and Hermitian U,
+the ordered residue at Ω has sign(Ω) times a positive semidefinite
+matrix; a diagonal TT block inherits this property. Neither an indefinite
+U alone nor a real spectrum proves the condition. Positive and negative
+frequency sides must retain their ordered partner convention.
+
+The scalar positive-V bound on the V-whitened `−Herm Wc(iη)` in `[0,I]`
+does not apply to signed V. Its absence does not remove the retained-H
+stability, finite-factor, zero-weight, partner or moment checks. Cross-sector
+Cauchy–Schwarz applies to a positive spectral metric, not an arbitrary
+complex-frequency W block. The separate constant `U−V` contributes to
+Sigma independently of the pole model of `W−U`.
+
+Sector stores stamp their actual realization as `raw-sector-endpoint-v1`
+in the authenticated model recipe and sector manifest. This names raw
+physical charge/current endpoints with their own centroid bases, followed
+by the stored symmetry endpoint action. It performs no scalar little-group
+averaging. CC and TT have independent poles; CT_C and CT_T share one
+retained mask and pole ordering, with each endpoint passing its own lost
+weight check. The manifest binds all four stores and the current-map
+`W∞−V` bank constant.
+Positive retained `H` certifies each projected realization. Since CC, TT
+and CT are fitted independently, this does not certify positive spectral
+residues of the assembled photon matrix: a CT-only pole can have a nonzero
+cross residue while its CC and TT diagonal residues vanish. Assess the
+assembled model through sector and integrated-Sigma accuracy receipts.
 
 **Infinity block.** `k₀ = σ₃ C^† Q_∞` and `k₁ = σ₃ M σ₃ C^† Q_∞` need all four moments of (SP 8):
 

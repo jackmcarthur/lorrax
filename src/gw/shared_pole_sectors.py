@@ -88,17 +88,17 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
 
 
 def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
-    """Build diagonal sector spans with the current map's round program.
+    """Construct current-map CC, TT and joint-span CT models and their stores.
 
     The bank contains W-W_infinity and its ordered moments. CC uses n_C
     rows, TT uses 3*n_T rows, with the same physical supports and separate
     directions, reductions and 1.8*n budgets. All retained arrays count
     against the existing whole-map capacity ledger.
 
-    This entry is deliberately fail-closed at the unresolved signed-photon
-    acceptance boundary. A scalar V-whitened passivity bound cannot be
-    asserted for a signed transverse V. No model is published as accepted
-    while that physics definition is absent.
+    Signed stability is the positive retained H of the ordered pencil; see
+    docs/architecture/shared_pole_model.md. Scalar positive-V upper passivity
+    is inapplicable. Held W and moment residuals are diagnostics; physical
+    accuracy is measured independently on the integrated sector Sigma.
     """
     import jax
     import numpy as np
@@ -106,9 +106,13 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     from common import timing
     from common.collectives import rank0_transaction
     from file_io.slab_io import SlabIO
-    from file_io.shared_pole_store import validate_shared_pole_bank, _metadata
-    from gw.shared_pole_local import parent_rounds
+    from file_io.shared_pole_store import (validate_shared_pole_bank, _metadata,
+        write_shared_pole_model,write_shared_pole_sector_manifest)
+    from gw.shared_pole_local import parent_rounds,batch_to_face,canonical_factors,face_rows
     from gw.shared_pole_screening import _json
+    from gw.shared_pole_directions import _sample_point
+    from jax.sharding import NamedSharding,PartitionSpec as P
+    from runtime.padding import padded_axis
     from symmetry_maps import minus_q_parent_partners
 
     header=validate_shared_pole_bank(bank['path'],expected_identity=bank['identity'],
@@ -121,10 +125,14 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         qt['sym_idx_q'],kgrid=header['grid'],sym_mats_k=np.asarray(operations['rotation']),
         antiunitary=np.asarray(operations['antiunitary'],bool),
         authorized_rows=operations['authorized_rows'])
-    endpoints=[_metadata(meta,table,recipe,bank['identity'],True,basis=basis,sector=sector)
+    sector_headers=[_metadata(meta,table,recipe,bank['identity'],True,basis=basis,sector=sector)
                for table,basis,sector in zip(bank['sector_tables'],bank['mu_bases'],('CC','TT'))]
     fit_span=(int(min(recipe['fit_ids'])),int(max(recipe['fit_ids']))+1)
-    receipts=[]
+    receipts=[];stores={};placed=[]
+    root=Path(output).parent
+    to_face=batch_to_face(mesh_xy)
+    ledger=meta.shared_pole_capacity
+    upstream=ledger.live_stages
     for ids,real,slots in parent_rounds(header['n_q_irr'],mesh_xy.size,partner):
         sectors=[];retained=[]
         for family,name in enumerate(('CC','TT')):
@@ -135,7 +143,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     samples=read_sector_round(io,meta,bank,header,ids,(family,family),
                         sample_span=fit_span,retained=(*retained,*exact.values()))
                 geometry=dict(components=3 if family else 1,basis=bank['mu_bases'][family],
-                    ids=ids,real=real,header=endpoints[family],partner_parent=partner,
+                    ids=ids,real=real,header=sector_headers[family],partner_parent=partner,
                     partner_row=row,slots=slots,sym=bank['tables']['sym'],sample_lo=fit_span[0],
                     sector=name)
                 model=construct_diagonal_sector_round(samples,exact,meta,config,geometry,
@@ -153,11 +161,129 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 rank0_transaction(path,stage='sector.diagonal_receipt',
                     write=lambda:path.write_text(_json(dict(identity=bank['identity'],
                         status='DIAGONAL_SPANS_ONLY',rounds=receipts))+'\n'))
-        # Publishing TT/CT using the scalar positive-V acceptance receipt
-        # would falsely certify a signed operator. Keep the refusal explicit.
-        raise ValueError('GATE shared_pole_sector_acceptance: CC/TT spans constructed; '
-            'signed transverse passivity definition unresolved; no accepted sector stores, '
-            'CT production orchestration or Sigma map published')
+        with timing.fenced_section('spole.sector.CT'):
+            with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
+                ct=read_sector_round(io,meta,bank,header,ids,(0,1),sample_span=fit_span,
+                                      retained=retained)
+                tc=read_sector_round(io,meta,bank,header,ids,(1,0),sample_span=fit_span,
+                                      retained=(*retained,*ct.values()))
+                cm=read_sector_round(io,meta,bank,header,ids,(0,1),fields=('M0','M1','M2','M3'),
+                                      retained=(*retained,*ct.values(),*tc.values()))
+            cross=construct_cross_sector_round(sectors,(ct,tc),cm,meta,config,mesh_xy=mesh_xy,
+                sample_lo=fit_span[0],partner_slots=slots,real=real)
+            with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
+                c1=read_sector_round(io,meta,bank,header,ids,(0,0),fields=('M1',),
+                    retained=(*retained,*ct.values(),*tc.values(),*cm.values(),*jax.tree.leaves(cross['models'])))['M1']
+                t1=read_sector_round(io,meta,bank,header,ids,(1,1),fields=('M1',),
+                    retained=(*retained,*ct.values(),*tc.values(),*cm.values(),c1,*jax.tree.leaves(cross['models'])))['M1']
+            cauchy=sector_moment_cauchy((c1,cm['M1'],t1),sectors,mesh_xy=mesh_xy)
+            del c1,t1
+            del ct,tc,cm
+        models=(sectors[0]['model'],sectors[1]['model'],*cross['models'])
+        signed=(tuple((s['signed'][0],s['signed'][0],*s['signed'][1:]) for s in sectors)
+                +(cross['signed'],))
+        budget=cross['budget']
+        budget.retained_panels=tuple(jax.tree.leaves((models,signed)))
+        budget.live(())
+        # Each held tile is read, scored, and released before the next support.
+        held_rows={name:[] for name in ('CC','TT','CT')}
+        for name,endpoint_pair,model in zip(held_rows,((0,0),(1,1),(0,1)),signed):
+            for sample_id in recipe['held_ids']:
+                sample_id=int(sample_id)
+                with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
+                    held=read_sector_round(io,meta,bank,header,ids,endpoint_pair,
+                                           sample_span=(sample_id,sample_id+1))
+                errors=sector_held_errors(model,held,_sample_point(recipe,sample_id),mesh_xy=mesh_xy)
+                held_rows[name].append(dict(sample_id=sample_id,
+                    Wc=np.asarray(errors)[:real,0].tolist(),dWc_ds=np.asarray(errors)[:real,1].tolist()))
+                del held
+        for key,value in cauchy.items():
+            values=np.asarray(value)[:real]
+            expected_infinity=(key=='cauchy_schwarz_squared') & np.isposinf(values)
+            if not np.all(np.isfinite(values) | expected_infinity):
+                raise ValueError(f'GATE shared_pole_sector_nonfinite: spectral moment {key}')
+        row_receipt=dict(parents=ids[:real],held=held_rows,
+            CT_gram_min_relative=np.asarray(cross['diagnostics']['gram_min_relative'])[:real].tolist(),
+            CT_retained_metric_positive=np.asarray(cross['diagnostics']['retained_metric_positive'])[:real].tolist(),
+            CT_zero_policy=np.asarray(cross['zero']['zero_policy'])[:real].tolist(),
+            spectral_moment_cauchy={key:[float(v) if np.isfinite(v) else 'OUTSIDE_METRIC_SUPPORT'
+                for v in np.asarray(value)[:real]] for key,value in cauchy.items()},
+            scalar_upper_passivity='NOT_APPLICABLE_SIGNED_V',
+            stability_scope='retained ordered H; exact full-space stability not established',
+            sigma_accuracy='NOT_MEASURED')
+        receipts.append(row_receipt)
+        # Stage each canonical parent once. One round of face factors is live;
+        # no all-parent factor stack or full photon operator is materialized.
+        for name,family,model in zip(('CC','TT','CT_C','CT_T'),(0,1,0,1),models):
+            poles,active=jax.tree.map(lambda a:np.asarray(jax.device_put(a,NamedSharding(mesh_xy,P()))),model[1:])
+            counts=active.sum(axis=-1,dtype=np.int64)
+            width=padded_axis(int(counts[:real].max()),mesh_xy,name='shared_pole_port',
+                specs=((P('x','y'),0),(P('x','y'),1))).carrier
+            factor=face_rows(mesh_xy,tuple(range(real)),width)(to_face(model[0]))
+            for slot,q in enumerate(ids[:real]):
+                public=canonical_factors(mesh_xy,(slot,),components=3 if family else 1)(factor)
+                filename=root/(name+'.h5')
+                store_header=write_shared_pole_model(filename,public,
+                    jax.device_put(poles[slot:slot+1,:width],NamedSharding(mesh_xy,P())),
+                    counts[slot:slot+1],q_span=(q,q+1),meta=meta,tables=bank['sector_tables'][family],
+                    recipe=recipe,receipts=dict(identity=bank['identity'],constructor=row_receipt),
+                    ordered=True,basis=bank['mu_bases'][family],sector=name)
+                stores[name]=(str(filename),store_header)
+                del public
+            del factor
+        placed.extend(ids[:real])
+        budget.retained_panels=()
+        ledger.live_stages=upstream
+        del sectors,cross,models,signed,retained
+    if sorted(placed)!=list(range(header['n_q_irr'])):
+        raise ValueError('GATE shared_pole_sector_rounds: each parent must be written once')
+    handle=write_shared_pole_sector_manifest(root/'sectors.json',models=stores,bank=bank,
+        identity=bank['identity'],receipts=dict(rounds=receipts,status='CONSTRUCTED',
+            acceptance='signed-retained-H-v1',sigma_accuracy='NOT_MEASURED'),mesh_xy=mesh_xy)
+    return dict(handle=handle,identity=bank['identity'],status='CONSTRUCTED',
+                q_receipts=receipts,capacity=ledger.receipt())
+
+
+def sector_held_errors(signed, samples, z, *, mesh_xy):
+    """Relative W and dW/ds diagnostics at one held physical complex z.
+
+    Signed endpoints are (C_L,C_R,mu,active), parent-sharded; sample tiles
+    have one support. Only the resulting two scalars per parent replicate.
+    """
+    import jax
+    from common.shard_map import shard_map
+    from jax.sharding import NamedSharding,PartitionSpec as P
+    from gw.shared_pole_local import _mm
+    def body(left,right,mu,active,w,d):
+        denominator=z*mu-1
+        weights=jnp.where(active,1/denominator,0)
+        slopes=jnp.where(active,-mu/denominator**2/(2*z),0)
+        result=[]
+        for coefficient,exact in ((weights,w[:,0]),(slopes,d[:,0])):
+            value=_mm(left*coefficient[:,None,:],right,transb='C')
+            norm=jnp.linalg.norm(exact,axis=(-2,-1))
+            result.append(jnp.linalg.norm(value-exact,axis=(-2,-1))/jnp.maximum(norm,jnp.finfo(norm.dtype).tiny))
+        return jnp.stack(result,axis=-1)
+    spec=P(('x','y'))
+    value=jax.jit(shard_map(body,mesh=mesh_xy,in_specs=(spec,)*6,
+                            out_specs=spec,check_vma=False))(*signed,samples['Wc'],samples['dWc_ds'])
+    return jax.device_put(value,NamedSharding(mesh_xy,P()))
+
+
+def sector_moment_cauchy(metrics, sectors, *, mesh_xy):
+    """Report the Cauchy–Schwarz diagnostic of the common physical M1 metric."""
+    import jax
+    from common.shard_map import shard_map
+    from jax.sharding import NamedSharding,PartitionSpec as P
+    from gw.shared_pole_local import _mm
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    plans=[s['budget'].eigenplan(m.shape[-1]).native_fn for s,m in zip(sectors,(metrics[0],metrics[2]))]
+    def body(c,ct,t):
+        return sector_cauchy_schwarz((c,ct,t),eigh_charge=plans[0],eigh_current=plans[1],matmul=_mm,gates=gates)
+    spec=P(('x','y'))
+    result=jax.jit(shard_map(body,mesh=mesh_xy,in_specs=(spec,)*3,
+                             out_specs=spec,check_vma=False))(*metrics)
+    return jax.tree.map(lambda a:jax.device_put(a,NamedSharding(mesh_xy,P())),result)
 
 
 def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *, mesh_xy,
@@ -239,9 +365,135 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
                              f"Gram min/max={reduction['gram_min_relative'][:geometry['real']].tolist()}; no repair")
     if not np.all(zero['zero_policy'][:geometry['real']]):
         raise ValueError(f"GATE shared_pole_sector_zero_ritz: sector={geometry['sector']}")
+    # The returned planner must not retain the just-consumed full sample and
+    # moment arrays through its accounting view after the caller releases them.
+    budget.retained_panels=tuple(retained)
     return dict(model=model,signed=signed,coefficients=y,states=states,infinity=infinity,
                 tables=tables,roles=roles,diagnostics=diagnostics,vectors=vectors,
                 endpoint_action=(*action,rotation),recipe=recipe,budget=budget)
+
+
+def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
+                                 mesh_xy, sample_lo, partner_slots, real):
+    """Run CT on the two current-map diagonal spans, keeping both outputs.
+
+    ``samples=(CT,TC)`` contains the native rectangular Wc/dWc_ds rounds;
+    moments is the CT M0..M3 round. All operators are parent-sharded. The
+    signed physical photon interaction is admitted by the unchanged positive
+    retained-H checks, not by the scalar positive-V upper passivity bound.
+    """
+    import copy
+    import jax
+    import numpy as np
+    from common.shard_map import shard_map
+    from jax.sharding import NamedSharding,PartitionSpec as P
+    from gw.gw_config import linalg_resolution
+    from gw.shared_pole_capacity import ConstructorCapacity
+    from gw.shared_pole_local import _batch_put
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+
+    charge, transverse = sectors
+    ct, tc = samples
+    retained = jax.tree.leaves(tuple((s['model'],s['signed'],s['coefficients'],
+        s['infinity'],tuple(state[1:] for state in s['states'])) for s in sectors))
+    local_meta = copy.copy(meta)
+    local_meta.n_rmu_padded = sum(s['model'][0].shape[-2] for s in sectors)
+    budget = ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
+        mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,upstream=())
+    budget.batch_width = charge['model'][0].shape[0]
+    budget.retained_panels = (*retained,*ct.values(),*tc.values(),*moments.values())
+    # Cross assembly still has the original rectangular pencil. The sum
+    # prices its envelope even when the retained joint pair is much smaller.
+    original_side = sum(s['coefficients'].shape[-2] for s in sectors)
+    budget.plan(original_side,phase='reduction')
+    actions=[]
+    for source, forward, reverse, left, right in (
+            (charge,tc,ct,transverse,charge),
+            (transverse,ct,tc,charge,transverse)):
+        actions.append(cross_round_actions((forward['Wc'],reverse['Wc'],
+            forward['dWc_ds'],reverse['dWc_ds']),source['states'],source['roles'],
+            source['recipe'],sample_lo=sample_lo,mesh_xy=mesh_xy,
+            partner_slots=partner_slots,
+            endpoint_actions=(left['endpoint_action'],right['endpoint_action'])))
+
+    spec=P(('x','y'))
+    packed=[]
+    for sector in sectors:
+        # Drop only exactly inactive carrier columns. This is a storage
+        # compaction of the retained span, not a second physical rank cut.
+        width=int(jnp.max(jnp.sum(sector['signed'][2],axis=-1)))
+        def compact(y,signed):
+            c,mu,active=signed
+            order=jnp.argsort(~active,axis=-1,stable=True)[:,:width]
+            return (jnp.take_along_axis(y,order[:,None,:],axis=-1),
+                (jnp.take_along_axis(c,order[:,None,:],axis=-1),
+                 jnp.take_along_axis(mu,order,axis=-1),
+                 jnp.take_along_axis(active,order,axis=-1)))
+        compact=jax.jit(shard_map(compact,mesh=mesh_xy,in_specs=(spec,spec),
+                                  out_specs=(spec,spec),check_vma=False))
+        y,signed=compact(sector['coefficients'],sector['signed'])
+        packed.append((_batch_put(mesh_xy,sector['tables']['points']),
+            _batch_put(mesh_xy,sector['tables']['order']),
+            (tuple(s[1] for s in sector['states']),tuple(s[2] for s in sector['states'])),
+            sector['infinity'],y,signed))
+    side=sum(s[4].shape[-1] for s in packed)
+    budget.retained_panels=(*budget.retained_panels,*jax.tree.leaves((actions,packed)))
+    budget.plan(max(side,original_side),phase='reduction')
+    signed,diagnostics=reduce_cross_round(*packed,tuple(actions),
+        tuple(moments[f'M{i}'] for i in range(4)),mesh_xy=mesh_xy,
+        native_eigh=budget.eigenplan(side).native_fn,gates=gates)
+    for name in ('gram_valid','retained_metric_positive'):
+        if not bool(jnp.all(diagnostics[name][:real])):
+            raise ValueError(f'GATE shared_pole_sector_{name}: sector=CT; no repair')
+    models,zero=positive_cross_models(signed,mesh_xy=mesh_xy,gates=gates)
+    if not bool(jnp.all(zero['zero_policy'][:real])):
+        raise ValueError('GATE shared_pole_sector_zero_ritz: sector=CT')
+    budget.retained_panels=tuple(retained)
+    replicated=NamedSharding(mesh_xy,P())
+    return dict(models=models,signed=signed,
+                diagnostics=jax.tree.map(lambda a:jax.device_put(a,replicated),diagnostics),
+                zero=jax.tree.map(lambda a:jax.device_put(a,replicated),zero),budget=budget)
+
+
+def positive_cross_models(signed, *, mesh_xy, gates):
+    """Positive-pole CT endpoint models with the same ordering and zero mask.
+
+    Finite/infinite and low-pole dropped weight are checked independently
+    on each physical endpoint; a large charge norm cannot hide a lost current
+    factor. The signed model remains available for held-frequency checks.
+    """
+    import jax
+    from common.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+    from gw.shared_pole_gates import apply_shared_pole_zero_policy,sort_shared_pole_columns
+
+    def body(left,right,mu,active):
+        cut=gates['normalized_gram_keep']['threshold']*jnp.max(jnp.abs(jnp.where(active,mu,0)),axis=-1)
+        retained=active & (jnp.abs(mu)>cut[:,None])
+        positive=retained & (mu>0)
+        safe=jnp.where(positive,mu,1)
+        models=[];checks=[]
+        for c in (left,right):
+            weight=jnp.sum(jnp.abs(c)**2,axis=-2)
+            total=jnp.sum(jnp.where(active,weight,0),axis=-1)
+            lost=jnp.sum(jnp.where(active & ~retained,weight,0),axis=-1)
+            infinite=lost/jnp.where(total>0,total,1)
+            b=c*(jnp.sqrt(2.)/safe*positive)[:,None,:]
+            model,zero=apply_shared_pole_zero_policy((b,jnp.where(positive,1/safe**2,1),positive),gates=gates)
+            zero['infinite_weight_fraction']=infinite
+            zero['zero_policy'] &= infinite<=gates['zero_ritz_policy']['threshold']['max_dropped_weight_fraction']
+            models.append(model);checks.append(zero)
+        # The physical pole cutoff sets one mask independently of endpoint
+        # weight. Admit only if BOTH endpoint loss budgets pass, then use one
+        # permutation for the two files, including degenerate poles.
+        same=jnp.all(models[0][2]==models[1][2],axis=-1)
+        charge,order=sort_shared_pole_columns(models[0])
+        current=(jnp.take_along_axis(models[1][0],order[:,None,:],axis=-1),charge[1],charge[2])
+        return (charge,current),dict(zero_policy=same & checks[0]['zero_policy'] & checks[1]['zero_policy'],
+                                  charge=checks[0],current=checks[1])
+    spec=P(('x','y'))
+    return jax.jit(shard_map(body,mesh=mesh_xy,in_specs=(spec,)*4,
+                              out_specs=(spec,spec),check_vma=False))(*signed)
 
 
 def cross_round_actions(samples, states, roles, recipe, *, sample_lo, mesh_xy,
