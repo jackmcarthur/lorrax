@@ -516,8 +516,8 @@ def _get_chi_fractional_contour_kernel_face(
 
     from common.wfn_layout import psi_specs
     PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(layout)
-    if pair_mode not in ("retarded", "laplace", "laplace_ordered"):
-        raise ValueError("pair_mode must be retarded, laplace or laplace_ordered")
+    if pair_mode not in ("retarded", "laplace", "laplace_ordered", "kms_static"):
+        raise ValueError("pair_mode must be retarded, laplace, laplace_ordered or kms_static")
     if bank_carry and selected_q is None:
         raise ValueError("bank carry requires selected q rows")
     if pair_mode != "retarded" and selected_q is None:
@@ -685,10 +685,27 @@ def _get_chi_fractional_contour_kernel_face(
             return (jax.lax.with_sharding_constraint(forward - reverse, chi_R_shard),
                     jax.lax.with_sharding_constraint(forward + reverse, chi_R_shard))
 
+        def kms_static_correlation(time):
+            # The zero-Matsubara FD reference uses the SAME endpoint Green
+            # builder and FFTs. Log weights are KMS-bounded even at a crossing;
+            # no valence/conduction partition or gap enters this correlation.
+            beta, mu = energy_reference
+            eps = enk_full - mu
+            lower = jnp.where(occ_f != 0,
+                jnp.exp(eps*time-jnp.logaddexp(0., beta*eps)), 0.)
+            upper = jnp.where(occ_u != 0,
+                jnp.exp(-eps*time-jnp.logaddexp(0., -beta*eps)), 0.)
+            gf = G_fftn(green_k(lower, 0., mu))
+            gu = G_fftn(green_k(upper, 0., mu, current=True))
+            return jax.lax.with_sharding_constraint(
+                jnp.einsum("Rambn,Rambn->Rmn", gu, gf.conj()), chi_R_shard)
+
         def body(accumulators, node):
             time, projection = node
             if pair_mode == "retarded":
                 A_R = retarded_correlation(time)
+            elif pair_mode == "kms_static":
+                A_R = kms_static_correlation(time)
             else:
                 A_R, A_odd_R = laplace_correlation(time, occ_f, occ_u, energy_reference)
             if selected_q is not None:
@@ -697,6 +714,7 @@ def _get_chi_fractional_contour_kernel_face(
                 contribution = jnp.take(
                     chi_fftn(-1j * (A_R - jnp.conj(A_R))
                              if pair_mode == "retarded"
+                             else -(A_R + jnp.conj(A_R)) if pair_mode == "kms_static"
                              else A_R + jnp.conj(A_R)),
                     jnp.asarray(gather_q), axis=0)
                 if pair_mode != "laplace_ordered":

@@ -117,18 +117,19 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
         algebra["moment_convention"] += "; odd M0 (1/z) and M2 (1/z^3), M_k = C_(k+1)/2"
         algebra["units"].update(M0="Ry^2", M2="Ry^4")
     if photon:
+        volume = float(meta.cell_volume)
         @partial(jax.jit, in_shardings=(face, face), out_shardings=face)
         def infinity(v, contact):
             # chi(z)=chi_param(z)-contact, so W_inf=(I+V contact)^-1 V.
             identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), v.shape)
-            return lu.batched(identity + mm(v, contact), v.copy())
+            return lu.batched(identity + mm(v, volume * contact), v.copy())
 
         @partial(jax.jit, in_shardings=(face, face, face, face),
                  out_shardings=(face, face))
         def samples(v, chi_raw, dchi_raw, contact):
             # Signed photon Dyson: W=(I-V chi)^-1 V. No square root of V_TT.
             # dW/ds=W (dchi/ds) W, with no adjoint at complex frequency.
-            chi = pref * chi_raw - contact
+            chi = pref * chi_raw - volume * contact
             identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), chi.shape)
             w = lu.batched(identity - mm(v, chi), v.copy())
             return w - v, mm(mm(w, pref * dchi_raw), w)
@@ -240,6 +241,83 @@ def prepare_photon_carriers(wfns, wfns_transverse, mu_bases, *,
         endpoints.append(tuple(pack_photon_faces(faces, layout, mesh_xy,
             orientation=orientation, wfn_layout=wfns.layout) for faces in (bare, current)))
     return (*endpoints, wfns.enk)
+
+
+def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
+                          occupation_state, sample_plan, execute, receipt):
+    r"""Build Pi_grid(0,0), centroid D and their TT sum once per bank.
+
+    The FD zero-Matsubara stream contains ``-D`` on diagonal transitions.
+    Therefore ``Pi_grid=Pi_FD+D`` removes that contribution; the prescribed
+    contact is then ``Pi_grid+D``. Both quantities here are physical density
+    responses (one factor ``1/Omega``). ``response_algebra`` converts the
+    contact to the convention of the stored ``V/ Omega`` at insertion.
+    For a step-occupation insulator the same stream uses its ordinary
+    Laplace weights and D is exactly zero. It never assigns a gap to a metal.
+    All returned packed operators are ``[1,N,N]`` at ``P(None,'x','y')``.
+    """
+    from common.shard_map import shard_map
+    from .static_gauge_response import (fermi_dirac_current_drude,
+                                         photon_diagonal_current_faces)
+    from .w_isdf import _w_solve_pref_scalar, matsubara_rule
+
+    energy, f, u, _, census = response_weights(wfns, meta)
+    live = (np.arange(energy.shape[1])[None, :]
+            < census["band_stop"]-census["band_start"])
+    live = np.broadcast_to(live, energy.shape)
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    if occupation_state is not None:
+        if not np.array_equal(np.asarray(occupation_state.f_kn), np.asarray(wfns.occ)):
+            raise ValueError("GATE photon_contact_state: bank and FD occupations differ")
+        beta, mu, _, rule = matsubara_rule(wfns, occupation_state, (0,),
+            rel_tol=sample_plan["bank_rule_tolerance"])
+        kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
+            q_ids=(0,), n_outputs=1, pair_mode="kms_static", vertex=vertex)
+        raw = execute(kernel, (jnp.asarray(rule["t"]), jnp.asarray(rule["weights"]),
+            *fixed, jnp.asarray(live), jnp.asarray(live), jnp.asarray([beta, mu])), "static_reference")
+        currents = photon_diagonal_current_faces(vertex, mesh_xy=mesh_xy,
+            layout=layout, wfn_layout=wfns.layout)
+        currents = (currents[0] * jnp.asarray(live)[:, None, :],
+                    currents[1] * jnp.asarray(live)[:, :, None])
+        census_state = sample_plan["census"]
+        drude = fermi_dirac_current_drude(currents, occupation_state,
+            state_capacity=census_state["state_capacity"], cell_volume=meta.cell_volume,
+            kweights=census_state["k_weights"], mesh_xy=mesh_xy)[None]
+        receipt["static_rule"] = rule["certificate"]
+        count = len(rule["t"])
+    else:
+        if np.any((f != 0) & (f != 1)):
+            raise ValueError("GATE photon_contact_state: fractional bank needs its FD state")
+        from .minimax_screening import solve_laplace_minimax_interval
+        lo, hi = float(energy[f > 0].max()), float(energy[u > 0].min())
+        gap = hi-lo
+        if gap <= 0:
+            raise ValueError("GATE photon_contact_state: gapless state needs FD occupations")
+        quad = solve_laplace_minimax_interval(gap,
+            float(energy[u > 0].max()-energy[f > 0].min()),
+            target_error=sample_plan["bank_rule_tolerance"])
+        kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
+            q_ids=(0,), n_outputs=1, pair_mode="laplace_ordered", vertex=vertex)
+        projections = np.stack((-quad.alpha*np.exp(-gap*quad.tau), np.zeros_like(quad.tau)))
+        raw = execute(kernel, (jnp.asarray(quad.tau), jnp.asarray(projections), *fixed,
+            jnp.asarray(np.stack((f, np.zeros_like(f)))),
+            jnp.asarray(np.stack((u, np.zeros_like(u)))), jnp.asarray([lo, hi])), "static_reference")
+        drude = jax.jit(lambda: jnp.zeros((1, layout.packed_extent, layout.packed_extent), complex),
+                        out_shardings=face)()
+        receipt["static_rule"] = dict(provenance=quad.provenance, max_error=quad.max_error)
+        count = len(quad.tau)
+    # Remove charge rows/columns locally; only TT has a body contact.
+    width = layout.carrier_extent(0)//layout.mesh_side
+    tt_only = shard_map(lambda x: x.at[:, :width, :].set(0).at[:, :, :width].set(0),
+        mesh=mesh_xy, in_specs=P(None, "x", "y"), out_specs=P(None, "x", "y"), check_vma=False)
+    pi_fd = jax.jit(tt_only)(raw[:, 0] * (_w_solve_pref_scalar(meta)/float(meta.cell_volume)))
+    pi_grid = pi_fd + drude
+    contact = pi_grid + drude
+    jax.block_until_ready((pi_grid, drude, contact))
+    receipt["correlation_count"] += count
+    receipt["contact"] = dict(equation="Pi_grid(0,0)+D", diagonal_reference="Pi_FD=Pi_grid-D",
+        units="physical response density, 1/Omega", scope="built once for this bank state")
+    return pi_grid, drude, contact
 
 
 def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
@@ -463,7 +541,7 @@ def _bank_execution(meta, mesh_xy, receipt, config):
             memory = executable.memory_analysis()
             if memory is None:
                 raise ValueError("GATE response_capacity: compiled memory unavailable")
-            stream = stage in ("real_time", "laplace", "moment_correlation")
+            stream = stage in ("real_time", "laplace", "moment_correlation", "static_reference")
             if not stream:
                 layout = config.get("linalg", "local") if hasattr(config,"get") else config.backend.linalg
                 native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
