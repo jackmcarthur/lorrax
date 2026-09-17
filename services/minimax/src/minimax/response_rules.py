@@ -304,6 +304,15 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
                           previous=None, domain_pad_ry=0.0, ordered=False):
     """Positive NNLS inverse-moment rows and remote response projections.
 
+    The rule expands 1/(delta**2-z**2) in x = z**2+eta**2 about
+    delta**2+eta**2, eta = min(Im z), with Taylor ratio
+    rho = |x|/(delta_lo**2+eta**2) evaluated at every supplied z. It refuses
+    rho >= 1, takes the order where rho**(N+1) <= rel_tol/4 and amplifies row
+    errors by (1+rho)/(1-rho). Domain contract: the bank owner
+    (``gw.response_bank.response_windows``) repartitions so that every remote
+    cell it requests has rho <= ``REMOTE_RHO_MAX`` (0.3) at the bank's own
+    samples, moving the nearer remote states into its real-time stream.
+
     Parameters
     ----------
     delta_lo_ry, delta_hi_ry : float
@@ -355,7 +364,8 @@ def response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
     x = (z/lo)**2+anchor*anchor
     rho = np.abs(x)/a0
     if np.any(rho >= 1):
-        raise ValueError('remote Taylor domain does not converge; repartition in bank owner')
+        raise ValueError('remote Taylor domain does not converge; repartition in bank owner '
+                         '(gw.response_bank.response_windows, rho <= REMOTE_RHO_MAX)')
     # N+1 powers for value; derivative remainder is the differentiated
     # geometric remainder, bounded relative to the exact squared resolvent.
     for order in range(1, 65):
