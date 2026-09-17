@@ -1267,8 +1267,39 @@ def _bank_stack_rows(mesh, spec):
                    out_shardings=NamedSharding(mesh, spec))
 
 
+def _read_photon_bank_sector(io, name, prefix, offset, spec, header, sector, ledger, retained):
+    """Read only C/T rectangles; never load the full photon panel to slice it.
+
+    Native union reads select the row windows. Each column window is one
+    union read; JAX joins those columns while retaining the requested face
+    or parent layout. The resulting axis order is the stored mesh-major
+    channel order restricted to the named family (including zero padding).
+    """
+    layout = header["photon_layout"]
+    side = int(layout["mesh_side"])
+    c, t = (int(v)//side for v in layout["carrier_extents"][:2])
+    stride = c+3*t
+    widths = tuple(c if family == "C" else 3*t for family in sector)
+    starts = tuple(0 if family == "C" else c for family in sector)
+    output_shape = prefix+(side*widths[0],side*widths[1])
+    output_bytes = _local_bytes(output_shape,np.complex128,io.mesh,spec)
+    _admit(ledger,"read_bank_sector_"+name,retained+output_bytes,output_bytes,
+           device_panel=output_bytes,native_host=True,io=io)
+    columns = []
+    for column in range(side):
+        shape = prefix+widths
+        offsets = [offset[:-2]+(row*stride+starts[0],column*stride+starts[1])
+                   for row in range(side)]
+        array = io.read_slabs(name,shape=shape,offsets=np.asarray(offsets,np.int64),
+            valid_shapes=np.asarray([shape]*side,np.int64),partition_spec=spec,
+            window_axis=len(prefix),dtype=np.complex128)
+        columns.append(array.reshape(prefix+(side*widths[0],widths[1])))
+    return jax.jit(lambda *values: jnp.concatenate(values,axis=-1),
+        out_shardings=NamedSharding(io.mesh,spec))(*columns)
+
+
 def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
-                          fields=("Wc", "dWc_ds"), q_ids=None, partition_spec=None):
+                          fields=("Wc", "dWc_ds"), q_ids=None, partition_spec=None, sector=None):
     """Read committed bounded scratch fields into packed distributed operators.
 
     Returns a plain dict of complex128 arrays. Samples require explicit
@@ -1300,6 +1331,9 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
                 "(M0/M2 on a bank with odd moments)")
     shape = header["bank_shape"]
     layout = _bank_layout(partition_spec)
+    if sector is not None and ("photon_layout" not in header or len(sector) != 2
+                              or any(v not in ("C", "T") for v in sector)):
+        _refuse("sector bank read requires photon metadata and endpoint labels C/T")
     if (q_span is None) == (q_ids is None):
         _refuse("scratch bank read takes exactly one of q_span or q_ids")
     if q_ids is None:
@@ -1346,6 +1380,11 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
         for q, count in runs:
             prefix = (count, a1-a0) if sample else (count,)
             offset = (q, a0, 0, 0) if sample else (q, 0, 0)
+            if sector is not None:
+                row = _read_photon_bank_sector(io, name, prefix, offset, spec, header, sector, ledger, retained)
+                retained += _local_bytes(row.shape, row.dtype, mesh, spec)
+                rows.append(row)
+                continue
             d = shape["d"] if "photon_layout" in header else basis.n_canonical
             logical = shape["d"] if "photon_layout" in header else basis.n_logical
             if "photon_layout" in header:
