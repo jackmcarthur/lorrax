@@ -864,11 +864,18 @@ def _solve_occupation_state(
         raise ValueError(
             f"QSGW head occupation energies must be (nk,nb), got {energies.shape}.")
     if pt is None:
-        # Head-off MPA metal: the current DFT/QP energy ladder is already the
-        # canonical body carrier.  No padding or velocity-storage width
-        # exists, so solve every band in that ladder directly.
-        nb_logical = int(energies.shape[1])
-        nb_storage = nb_logical
+        # No velocity source: the current DFT/QP energy ladder is the
+        # canonical body carrier, padded to the mesh past the logical top
+        # (``BandSlices.b4_logical``).  Solve the logical bands only and give
+        # the padding exact zeros, as the one-shot owner does with
+        # ``logical_nband``.  MP1's tail clamp used to zero the padding rows
+        # by accident; exact Fermi-Dirac (every metal, owner ruling
+        # 2026-09-17) leaves them tiny but nonzero, which the Sigma head's
+        # occupation provenance (``legacy_square_mesh_occupation_digests``)
+        # correctly refuses.
+        slices = inputs.band_slices
+        nb_logical = int(slices.b4_logical) - int(slices.b0)
+        nb_storage = int(energies.shape[1])
     else:
         nb_logical = int(pt.nb_logical)
         # The velocity is the one large dataset BOTH head modes carry; the

@@ -28,6 +28,8 @@ def _inputs(material_class: str):
         # inputs; it is no longer a deck key under config.mpa.
         material_class=material_class,
         parallel_transport=None,
+        # Four logical bands on a carrier that callers may pad to the mesh.
+        band_slices=SimpleNamespace(b0=0, b4_logical=4),
         wfn=SimpleNamespace(
             num_electrons=2.0,
             occupation_state_capacity=1.0,
@@ -61,6 +63,32 @@ def test_a_metal_without_a_declared_family_is_never_solved_as_mp1():
     inputs.config.occ_smearing_family = None
     with pytest.raises(ValueError, match="GATE metal_occupations_fermi_dirac"):
         _solve_occupation_state(inputs, _energies())
+
+
+def test_mesh_padding_rows_get_exact_zero_fermi_dirac_occupations():
+    """P16 Na shared-pole SC (Run446, 58449999.22): the carrier was padded 86 -> 88
+    and the solve covered the padding. MP1's clamp zeroed those rows; exact
+    Fermi-Dirac left them tiny but nonzero, and the Sigma head provenance
+    refused ("live occupations are nonzero outside logical_nband")."""
+    from gw.efermi import legacy_square_mesh_occupation_digests
+    energies = np.concatenate(
+        [_energies(), np.full((3, 2), 1.0, dtype=np.float64)], axis=1)
+    state = _solve_occupation_state(_inputs("metal"), energies)
+    f = np.asarray(state.f_kn)
+    assert f.shape == (3, 6)
+    assert np.all(f[:, 4:] == 0.0)
+    np.testing.assert_array_equal(
+        f[:, :4], np.asarray(_solve_occupation_state(_inputs("metal"), _energies()).f_kn))
+    legacy_square_mesh_occupation_digests(f, 4)          # must not raise
+    # The instrument can see the defect: the whole-carrier solve refuses.
+    from gw.efermi import OccupationState
+    whole = OccupationState.solve_smearing(
+        energies, np.full(3, 1.0 / 3.0), 2.0, 0.01, state_capacity=1.0,
+        family="fd", clamp_tol=1.0e-12)
+    assert np.any(np.asarray(whole.f_kn)[:, 4:] != 0.0)
+    import pytest
+    with pytest.raises(ValueError, match="nonzero outside logical_nband"):
+        legacy_square_mesh_occupation_digests(whole.f_kn, 4)
 
 
 def test_head_off_mpa_metal_has_no_surface_table():
