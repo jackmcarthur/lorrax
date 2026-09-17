@@ -13,7 +13,6 @@ import distrib_la
 import jax
 import jax.numpy as jnp
 import numpy as np
-from distrib_la import hermitian_part
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 
@@ -26,16 +25,6 @@ def _sample_point(recipe, sample_id):
     if not len(rows) or not np.all(values == values[0]):
         raise ValueError("GATE shared_pole_sample_identity: got: absent/inconsistent point; want: one z per distinct_id; why: roles share bank evaluations only")
     return complex(values[0])
-
-
-def _fit_roles(recipe):
-    """Ephemeral constructor record view; only flat arrays are serialized."""
-    from gw.shared_pole_recipe import ROLE_CODES
-    names = {code: name for name, code in ROLE_CODES.items()}
-    return [{"sample_id": int(sample), "role": f"{names[int(role)]}:{i}",
-             "held": bool(held)}
-            for i, (sample, role, held) in enumerate(zip(
-                recipe["distinct_id"], recipe["role"], recipe["held"]))]
 
 
 @lru_cache(maxsize=None)
@@ -167,7 +156,7 @@ def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan,
     def widths_of(values):
         return tuple(int(np.asarray(v).size) for v in values)
 
-    states, counts, flags, originals_of = [], [], [], []
+    states, counts, flags = [], [], []
     roles = [[] for _ in range(ranks)]
     mirror_roles = [[] for _ in range(ranks)]
     mirrors, mirror_counts = [], []
