@@ -1146,6 +1146,27 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # conj in R space (the -q orientation); remote cells add the odd kernel.
         # ordered=True stores the physical orientation W_q = FT_q[W].
         ordered = vertex is not None or not bool(sym.trs_allowed)
+        literal_mirrors = vertex is not None
+        if literal_mirrors and header.get("mirror_mode") != "literal_same_operator_v1":
+            raise ValueError("GATE response_mirror_contract: photon production requires a new literal-mirror bank")
+        if literal_mirrors:
+            from symmetry_maps.maps import q_negation_index
+            negative = np.asarray(q_negation_index((int(meta.nkx), int(meta.nky), int(meta.nkz))), dtype=np.int64)
+            mirror_qids = negative[qids]
+            receipt["mirror_contract"] = dict(header["mirror_contract"],
+                mode=header["mirror_mode"], support_count=len(z),
+                operator_provenance=bank_io["mirror_operator_provenance"],
+                original_parent_count=len(qids),
+                full_q_rows=len(set(qids.tolist()+mirror_qids.tolist())),
+                green_stream="union of exact q and minus-q output rows in the same response panel",
+                dyson="original parent V/contact for both orientations; same moment operator")
+
+        def panel_rows(first, last):
+            rows = qids[first:last].tolist()
+            if literal_mirrors:
+                rows = list(dict.fromkeys(rows+mirror_qids[first:last].tolist()))
+            return tuple(rows)
+
         n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
         if ordered:
             receipt["ordered"] = True
@@ -1188,7 +1209,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             # Preserve the existing dense/native and writer conversion envelopes.
             return max(dense+native["total"],4*width*face_bytes+native["total"])
 
-        minimum = headroom+live_bytes+2*face_bytes+dense_bytes(1)
+        minimum = headroom+live_bytes+2*max(len(panel_rows(i,i+1)) for i in range(len(qids)))*face_bytes+dense_bytes(1)
         # R24 makes 3U a reported scaling target, not the device admission limit.
         # Replaying a Green/FFT stream to meet that preference repeats every time
         # node even when the complete output panel fits. Use the ledger's remaining
@@ -1197,6 +1218,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         planning_limit = device_available
         available = planning_limit-headroom-live_bytes
         qwidth = min(len(qids),int((available-dense_bytes(1))//(2*face_bytes)))
+        while qwidth > 0 and any(2*len(panel_rows(i,min(i+qwidth,len(qids))))*face_bytes+dense_bytes(1) > available
+                                  for i in range(0,len(qids),qwidth)):
+            qwidth -= 1
         receipt["panel_budget"] = dict(
             scaling_target_bytes_per_rank=scaling_target,
             device_budget_bytes_per_rank=budget["device_budget_bytes_per_rank"],
@@ -1213,11 +1237,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     for q0 in range(0,len(qids),qwidth):
         with timing.fenced_section('bank.panel_admission'):
             q1 = min(q0+qwidth,len(qids))
+            response_rows = panel_rows(q0,q1)
+            row_index = {q: i for i,q in enumerate(response_rows)}
             width = len(z)
-            while 2*width*(q1-q0)*face_bytes+dense_bytes(width) > available:
+            while 2*width*len(response_rows)*face_bytes+dense_bytes(width) > available:
                 width -= 1
-            planned_bytes = headroom+live_bytes+2*width*(q1-q0)*face_bytes+dense_bytes(width)
-            receipt.setdefault("panel_plans",[]).append(dict(q_span=(q0,q1),sample_width=width,
+            planned_bytes = headroom+live_bytes+2*width*len(response_rows)*face_bytes+dense_bytes(width)
+            receipt.setdefault("panel_plans",[]).append(dict(q_span=(q0,q1),sample_width=width, response_q_full_idx=response_rows,
                 aggregate_bytes_per_rank=planned_bytes,
                 scaling_status="PASS" if planned_bytes <= scaling_target else "WARN",
                 device_budget_status="PASS",scaling_target_bytes_per_rank=scaling_target,
@@ -1226,10 +1252,10 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             with timing.fenced_section('bank.stream_arguments'):
                 hi = min(lo+width,len(z));a = hi-lo
                 ledger.live_stages = ambient
-                name,_ = _reserve(meta,"bank_outputs",2*a*(q1-q0)*face_bytes + headroom)
+                name,_ = _reserve(meta,"bank_outputs",2*a*len(response_rows)*face_bytes + headroom)
                 ledger.live_stages = ambient+(name,)
             raw = integrate_response_panel(wfns, meta, mesh_xy, rules,
-                q_ids=tuple(qids[q0:q1]), sample_span=(lo, hi), execute=execute,
+                q_ids=response_rows, sample_span=(lo, hi), execute=execute,
                 receipt=receipt, ordered=ordered, vertex=vertex)
             for iq in range(q0,q1):
                 span = (iq,iq+1)
@@ -1252,28 +1278,41 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     if all(marked):
                         ia = stop
                         continue
-                    chi = raw[ia-lo:stop-lo,iq-q0]
-                    dchi = raw[a+ia-lo:a+stop-lo,iq-q0]
-                    hbatch = jnp.broadcast_to(h,chi.shape)
-                    operands = (hbatch,chi,dchi) + (() if vertex is None else
-                        (jnp.broadcast_to(contact,chi.shape),))
-                    value,ds = execute(samples,operands,"sample_dyson")
-                    if vertex is not None:
-                        value = value - constant
-                        _photon_sample_norms(receipt, value, iq, ia, bank_io["photon_layout"], mesh_xy)
-                    else:
-                        _reciprocity_census(receipt,value,z[ia:stop],int(qids[iq]),iq,meta)
-                    if vertex is None and ordered and _self_negative(int(qids[iq]),meta):
-                        _tr_odd_census(receipt,samples,h,chi,dchi,value,z[ia:stop],int(qids[iq]))
-                    value = None if marked[0] else value[None]
-                    ds = None if marked[1] else ds[None]
-                    with timing.fenced_section('bank.write'):
-                        io_started = time.monotonic()
-                        header = write_shared_pole_bank(bank_io["path"],q_span=span,
-                            sample_span=(ia,stop),Wc=value,dWc_ds=ds,meta=meta,
-                            expected_identity=bank_io["identity"],mesh_xy=mesh_xy)
-                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                    del value,ds,chi,dchi,hbatch
+                    # Exact PH partners are formed at the bare-response level.
+                    # Dyson always uses this original parent's V and contact;
+                    # no spatial reconstruction of a screened operator enters.
+                    for mirror in range(2 if literal_mirrors else 1):
+                        field0 = 2*mirror
+                        if marked[field0] and marked[field0+1]:
+                            continue
+                        row = row_index[int(mirror_qids[iq] if mirror else qids[iq])]
+                        chi = raw[ia-lo:stop-lo,row]
+                        dchi = raw[a+ia-lo:a+stop-lo,row]
+                        if mirror:
+                            chi, dchi = jnp.conj(chi), jnp.conj(dchi)
+                        hbatch = jnp.broadcast_to(h,chi.shape)
+                        operands = (hbatch,chi,dchi) + (() if vertex is None else
+                            (jnp.broadcast_to(contact,chi.shape),))
+                        value,ds = execute(samples,operands,"mirror_dyson" if mirror else "sample_dyson")
+                        if vertex is not None:
+                            value = value - constant
+                            if not mirror:
+                                _photon_sample_norms(receipt, value, iq, ia, bank_io["photon_layout"], mesh_xy)
+                        else:
+                            _reciprocity_census(receipt,value,z[ia:stop],int(qids[iq]),iq,meta)
+                        if vertex is None and ordered and _self_negative(int(qids[iq]),meta):
+                            _tr_odd_census(receipt,samples,h,chi,dchi,value,z[ia:stop],int(qids[iq]))
+                        value = None if marked[field0] else value[None]
+                        ds = None if marked[field0+1] else ds[None]
+                        payload = (dict(Wc_mirror=value,dWc_mirror_ds=ds) if mirror
+                                   else dict(Wc=value,dWc_ds=ds))
+                        with timing.fenced_section('bank.write'):
+                            io_started = time.monotonic()
+                            header = write_shared_pole_bank(bank_io["path"],q_span=span,
+                                sample_span=(ia,stop),**payload,meta=meta,
+                                expected_identity=bank_io["identity"],mesh_xy=mesh_xy)
+                            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                        del value,ds,chi,dchi,hbatch,operands,payload
                     ia = stop
                 del h
             receipt["batches"].append(dict(q_span=(q0,q1),sample_span=(lo,hi)))
@@ -1396,6 +1435,11 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                 partition_spec=P(None,"x","y"), dtype=np.complex128)
                 for key in ("Pi_grid", "Drude", "TT_contact"))
     receipt["static_reference"] = reference
+    bank["mirror_operator_provenance"] = dict(coulomb=bank["coulomb"],
+        static_reference=reference,
+        static_reference_commit=(initial["final_commit"] if bank.get("static_reference") is not None else None),
+        state_identity=bank["identity"],
+        moments="M0,M1,M2,M3 and constant computed with the identical photon_v and contact arrays")
     # Persist the contact's two physically defined pieces as bank diagnostics;
     # the constructor consumes the separately committed constant, not these.
     with SlabIO(bank["path"], mode="a", mesh=mesh_xy) as io:
