@@ -140,10 +140,12 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 antiunitary=np.asarray(operations["antiunitary"], dtype=bool),
                 authorized_rows=operations["authorized_rows"])
             source, wraps = np.asarray(qt["sym_perm"]), np.asarray(qt["L_table"])
-            realized = [p for p, row in enumerate(partner_row)
-                        if not np.array_equal(source[row], np.arange(source.shape[1])) or np.any(wraps[row])]
-            if realized:
-                raise ValueError(f"GATE minus_q_partner: got: parents {realized} reach -q through rows {partner_row[realized].tolist()} with a centroid permutation or umklapp wrap; want: -q read as a raw parent; why: this constructor reads the partner's raw samples, and the realized partner R_s[W_q(p')] is not implemented here")
+            # W_{-q(p)} = R_s[W_q(p')]: a raw read when row s moves nothing.
+            moved = [not np.array_equal(source[row], np.arange(source.shape[1])) or bool(np.any(wraps[row]))
+                     for row in partner_row]
+            if any(moved):
+                from gw.qgrid_symmetry import shared_pole_partner_realizer
+                realize_partner = shared_pole_partner_realizer(meta, header, mesh_xy=mesh_xy)
 
         budget.plan(0)
         logical_n = int(meta.n_rmu)
@@ -206,14 +208,17 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
 
                 read_mirror = None
                 if ordered:
-                    partner = int(partner_parent[q_start])
+                    partner, partner_s = int(partner_parent[q_start]), int(partner_row[q_start])
 
                     def read_mirror(sample_id):
-                        # W_q(-conj z) = conj W_-q(z), and dW/ds likewise: one sample of the -q parent.
+                        # W_q(-conj z) = conj W_-q(z) with W_-q = R_s[W_q(p')], and dW/ds likewise.
                         part = read_shared_pole_bank(
                             bank_io, (partner, partner + 1), meta=meta, header=header,
                             sample_span=(int(sample_id), int(sample_id) + 1))
-                        return jnp.conj(part["Wc"][:, 0]), jnp.conj(part["dWc_ds"][:, 0])
+                        w, d = part["Wc"][:, 0], part["dWc_ds"][:, 0]
+                        if moved[q_start]:
+                            w, d = (realize_partner(v, partner_s, partner) for v in (w, d))
+                        return jnp.conj(w), jnp.conj(d)
 
             with timing.fenced_section("spole.direction_selection"):
                 states, counts, roles = _direction_states(

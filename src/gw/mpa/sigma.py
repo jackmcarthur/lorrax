@@ -247,16 +247,10 @@ def _shared_pole_fixed_q_policy(header):
 
 def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
     """Authenticate packed endpoint maps and one parent's child-row panel."""
-    from symmetry_maps import certify_endpoint_locality
+    from gw.qgrid_symmetry import shared_pole_packed_action
 
-    basis, qt = meta.mu_basis, header["qirr"]
-    packed = basis.layout.axis.pack_permutations_host(
-        np.asarray(qt["sym_perm"], dtype=np.int32), require_local=False)
-    certificates = {axis: certify_endpoint_locality(
-        packed, mesh=mesh_xy, mesh_axis=axis, active_mask=basis.active_mask)
-        for axis in ("x", "y")}
-    wraps = basis.layout.axis.pack_host(
-        np.asarray(qt["L_table"], dtype=np.int32), axis=1, fill_value=0)
+    qt = header["qirr"]
+    packed, wraps, certificates = shared_pole_packed_action(meta, header, mesh_xy=mesh_xy)
     lo, hi = map(int, q_span)
     parent_map = np.asarray(qt["irr_idx_q"], dtype=np.int32)
     rows = np.flatnonzero((parent_map >= lo) & (parent_map < hi)).astype(np.int32)
