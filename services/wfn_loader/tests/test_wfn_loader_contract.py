@@ -10,11 +10,11 @@ a pointer with zero cells; see its docstring for the census.
 WHAT IS NEW HERE, and why each gap was worth closing (survey
 w1_wfn_loader, §2 and §8):
 
-* ``adopt_mesh``'s FOUR narrowing conditions.  Survey concept 2 — a
-  documented MAY-RAISE with four early returns and, before this file,
+* ``adopt_mesh``'s narrowing conditions.  Survey concept 2 — a
+  documented MAY-RAISE with three early returns and, before this file,
   zero executing tests.  Each condition gets a cell that fails if the
   condition is deleted, and the positive arm proves the narrowing did NOT
-  fire, so the four negatives are not four tautologies.
+  fire, so the four negative cells are not four tautologies.
 * ``bands()``.  One caller in the whole tree and, before this file, one
   cell asserting the CHUNK BOUNDARIES and nothing about the ψ it yields.
 * ``load`` / ``load_process_local`` band-range refusals, and the
@@ -934,13 +934,14 @@ def test_the_deleted_tier_refusal_beats_the_unknown_backend_refusal(
 
 
 # ===========================================================================
-#  NEW — adopt_mesh: FOUR narrowing conditions (survey concept 2)
+#  NEW — adopt_mesh: THREE narrowing conditions (survey concept 2)
 # ===========================================================================
 #  ``adopt_mesh`` is the late-mesh-binding door: kmeans sizes its mesh from
 #  the FFT grid the WFN declares, so the loader is necessarily built
 #  mesh-less and lands on the per-rank eager read even though every ψ load
 #  it will do is mesh-wide (scorecard BD.2).  It is DELIBERATELY NARROW —
-#  four early returns — and before this file every one of them was
+#  three early returns (a single-process run is no longer one, 2026-09-17)
+#  — and before this file every one of them was
 #  untested.  A narrowing condition nobody exercises is a condition that
 #  can be deleted without a red test, which for THIS method means a loader
 #  silently switching transports mid-life in a run that asked for a
@@ -1025,26 +1026,34 @@ def test_adopt_mesh_narrowing_3_a_loader_already_sharded_keeps_its_mesh(
         assert loader._mesh is None
 
 
-def test_adopt_mesh_narrowing_4_a_single_process_run_keeps_the_mesh_less_contract(
-        synth_wfn_path):
-    """Condition 3: ``jax.process_count() <= 1``.
+def test_adopt_mesh_single_process_run_adopts_and_serves_the_one_k_doors(
+        gnppm_wfn):
+    """Single process: the mesh is ADOPTED and the backend stays eager.
 
-    NOT patched — this really is a single-process pytest.  The contract
-    the callers were built against is that a P=1 run gets the mesh-less
-    replicated load, so no band-axis mesh padding appears that was not
-    there before.  Asserted on the LOAD as well as on the backend name,
-    because "the name did not change" would still pass on a loader that
-    had quietly taken the mesh.
+    NOT patched — this really is a single-process pytest.  kmeans builds its
+    loader mesh-less and adopts right after ``dist.build_mesh``.  A former
+    narrowing kept a P=1 loader mesh-less, and the pivoted-Cholesky prune
+    then refused in ``full_k_box_index_one_dev`` ("requires the loader's
+    mesh", JID 58454563.6), although gwjax builds the same loader state at
+    P=1 with ``mesh=``.  Asserted: the mesh is taken, the re-pick keeps
+    ``eager``, a 1x1 mesh adds no band padding, and the one-k child index
+    matches the full table for every k.
     """
     import jax
     assert int(jax.process_count()) == 1, (
         "this cell is about the single-process arm and this session has "
         f"{jax.process_count()} processes; the P>1 arm is leg L-c")
-    with WfnLoader(synth_wfn_path, backend="auto") as loader:
-        assert loader.adopt_mesh(_mesh_1x1()) == "eager"
-        assert loader._mesh is None
+    mesh = _mesh_1x1()
+    with WfnLoader(gnppm_wfn, backend="auto") as loader:
+        assert loader._mesh is None and loader.backend == "eager"
+        assert loader.adopt_mesh(mesh) == "eager"
+        for child in range(int(loader.symmetry().nk_tot)):
+            np.testing.assert_array_equal(
+                np.asarray(loader.full_k_box_index_one_dev(child)),
+                loader.box_index(k=[child]))
+        assert loader._mesh is mesh
         psi = np.asarray(loader.load(bands=(0, 3), k="ibz"))
-        assert psi.shape[1] == 3, "a mesh got adopted: the band axis padded"
+        assert psi.shape[1] == 3, "a 1x1 mesh padded the band axis"
 
 
 def test_adopt_mesh_positive_arm_reaches_the_re_pick(

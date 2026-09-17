@@ -668,18 +668,19 @@ class WfnLoader:
         (scorecard BD.2).  Calling this right after ``dist.build_mesh``
         gives it the same collective phdf5 route htransform picks.
 
-        Deliberately narrow: only a MULTI-PROCESS run, and only a loader
-        constructed with ``backend="auto"`` that resolved to ``eager``,
-        switches — an explicit ``backend=`` request (A/B forcing) is
-        never overridden, a loader already on a sharded backend keeps
-        its mesh, and a single-process run (however many host devices)
-        keeps the mesh-less replicated-load contract its callers were
-        built against (no band-axis mesh padding appears that was not
-        there before).  The switch is safe mid-life because the phdf5
-        collective context is created lazily on the first ``load`` and
-        the eager state kept so far (the ``coeffs`` dataset HANDLE — no
-        data) remains valid for ``load_process_local``.  Returns the
-        backend now in force.
+        Deliberately narrow: only a loader constructed with
+        ``backend="auto"`` that resolved to ``eager`` adopts — an explicit
+        ``backend=`` request (A/B forcing) is never overridden and a loader
+        already on a sharded backend keeps its mesh.  A single-process run
+        adopts the mesh too, so it holds the same loader state as a driver
+        that constructed with ``mesh=`` (gwjax, htransform): the one-k
+        parent-stream doors (``full_k_box_index_one_dev``,
+        ``unfold_parent_to_full_k``) need it at every P, and the re-pick
+        still resolves ``eager`` there.  The switch is safe mid-life
+        because the phdf5 collective context is created lazily on the
+        first ``load`` and the eager state kept so far (the ``coeffs``
+        dataset HANDLE — no data) remains valid for
+        ``load_process_local``.  Returns the backend now in force.
 
         MAY RAISE since 2026-08-06: it re-runs :meth:`_auto_pick_backend`,
         which refuses at P>1 rather than demoting, and startup — this is
@@ -689,11 +690,6 @@ class WfnLoader:
         if mesh is None or self._mesh is not None:
             return self.backend
         if not self._backend_was_auto or self.backend != "eager":
-            return self.backend
-        try:
-            if int(jax.process_count()) <= 1:
-                return self.backend
-        except Exception:
             return self.backend
         self._mesh = mesh
         backend = self._auto_pick_backend()
