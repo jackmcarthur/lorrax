@@ -111,7 +111,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         wfn_fingerprint_binding, tensors_filename, occupation_state, print_fn,
                         head_resolver=None, mpa_plan=None, iteration_head_response=None,
                         material_class=None, wfns_transverse=None,
-                        bispinor_v_q_path=None, mu_bases=None):
+                        bispinor_v_q_path=None, mu_bases=None,
+                        photon_static_reference=None):
     """Build current W; only one-shot models may use ISDF restart membership.
 
     SC labels own separate map scratch. ``restart`` may restore the invariant
@@ -222,6 +223,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                     tables=tables, coulomb=coulomb)
         if photon:
             bank.update(photon_layout=photon_layout, mu_bases=mu_bases,
+                        static_reference=photon_static_reference,
                         bispinor_v_q_path=bispinor_v_q_path,
                         sector_tables=(tables, _shared_pole_tables(
                             meta, sym, mu_bases[1].canonical_indices)))
@@ -273,6 +275,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                       digest=header["digest"], K=list(header["K"]))
         ledger.live_stages = ()
         result = dict(shared_pole=handle)
+        if photon:
+            result['photon_static_reference'] = receipts['bank']['static_reference']
         from .gw_config import HeadCorrection
         if config.head.correction is not HeadCorrection.OFF:
             from .shared_pole_head import build_shared_pole_head

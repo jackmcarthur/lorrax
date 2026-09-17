@@ -3154,7 +3154,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         used_producer = (inputs.screening_model_fn
                          if producer is None else producer)
         used_quad = inputs.quad if quad_override is None else quad_override
-        return used_producer(
+        produced = used_producer(
             inputs.config.compute_mode, wfns_qp, inputs.V_q,
             quad=used_quad, e_ref=inputs.e_ref, sym=inputs.sym,
             centroid_indices=inputs.centroid_indices, config=inputs.config,
@@ -3173,10 +3173,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             material_class=inputs.material_class,
             **(dict(wfns_transverse=wfns_transverse_qp,
                     bispinor_v_q_path=inputs.bispinor_v_q_path,
-                    mu_bases=inputs.mu_bases)
+                    mu_bases=inputs.mu_bases,
+                    photon_static_reference=(None if inputs.screening_seed_cache is None else
+                        inputs.screening_seed_cache.get('photon_static_reference')))
                if inputs.config.sigma.w_model == "shared_pole"
                and wfns_transverse_qp is not None else {}),
             print_fn=inputs.print_fn)
+        if (inputs.screening_seed_cache is not None and isinstance(produced, dict)
+                and produced.get('photon_static_reference') is not None):
+            # Only the immutable initial contact survives. Current samples,
+            # moments and all three pole models belong to this map.
+            inputs.screening_seed_cache.setdefault(
+                'photon_static_reference', produced['photon_static_reference'])
+        return produced
 
     # Per-mode screening plan.  The q->0 head uses this exact frequency/role
     # table so a Schur-folded probe can never drift from the body W it folds.
