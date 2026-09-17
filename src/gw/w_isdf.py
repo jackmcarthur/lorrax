@@ -1110,12 +1110,32 @@ def _chi_layout_operands(wfns, eref):
 # ----------------------------------------------------------------------------
 
 def _gap_edges(wfns, energy_reference):
-    """Return ``(eref, vmax, cmin)``: the step partition's valence maximum and conduction minimum about ``energy_reference``, host floats in Ry."""
+    """Return ``(eref, vmax, cmin)``: the step partition's valence maximum and conduction minimum about ``energy_reference``, host floats in Ry.
+
+    This zero-temperature imaginary-time producer is bounded only for a
+    positive gap: every node factor ``e^{-(e_c - e_v) tau}`` and the prefold
+    ``e^{-tau E_gap}`` decay when ``cmin > vmax`` and grow without bound for
+    an overlapping valence/conduction pair.  The gap is checked here, on the
+    replicated energy table every rank reads, so the refusal is collective.
+    """
     s = wfns.slices
     eref = 0.0 if energy_reference is None else float(energy_reference)
     enk_v_host = np.asarray(jax.device_get(wfns.enk[:, s.val]), dtype=np.float64) - eref
     enk_c_host = np.asarray(jax.device_get(wfns.enk[:, s.cond]), dtype=np.float64) - eref
-    return eref, float(np.max(enk_v_host)), float(np.min(enk_c_host))
+    vmax, cmin = float(np.max(enk_v_host)), float(np.min(enk_c_host))
+    if not cmin > vmax:
+        raise ValueError(
+            "GATE chi0_laplace_needs_gap: the zero-temperature imaginary-time "
+            "chi0 received overlapping valence and conduction energies.\n"
+            f"  got:  cmin - vmax = {cmin - vmax!r} Ry over slices.val / "
+            "slices.cond\n"
+            "  want: cmin - vmax > 0\n"
+            "  why:  the node factors e^{-(e_c - e_v) tau} of an overlapping "
+            "pair grow with tau; the sum diverges instead of converging\n"
+            "  fix:  a gapless system takes the fractional-occupation routes "
+            "(mpa_material_class = metal)\n"
+            "  doc:  docs/architecture/four_current_wiring.md")
+    return eref, vmax, cmin
 
 
 def _minimax_chi_operands(wfns, eref, vmax, cmin, t, alpha):

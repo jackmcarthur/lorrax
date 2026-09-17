@@ -171,6 +171,52 @@ def test_static_insulator_matches_the_integer_limit_of_the_ordered_pair_ssot(
     assert got_recip < 3.0e-13
 
 
+def test_gapped_imaginary_time_producer_refuses_overlapping_bands(monkeypatch):
+    """The zero-temperature Laplace producer is bounded only for a positive gap.
+
+    Positive control: the toy insulator (cmin - vmax = 1.1 Ry) runs.  Negative
+    control: one conduction energy moved below the valence maximum refuses by
+    name in every gapped wrapper before any kernel executes.
+    """
+    import common.fft_helpers as fft_helpers
+    import distrib_la
+    monkeypatch.setattr(distrib_la, "gemm_plan", _local_gemm_plan)
+    monkeypatch.setattr(
+        fft_helpers, "make_flat_k_fftn", _emulated_flat_k_fftn)
+    mesh = _mesh_xy()
+    psi, enk, slices, wfns = _toy(mesh)
+    meta = SimpleNamespace(nkx=2, nky=1, nkz=1, nk_tot=2)
+    quad = SimpleNamespace(tau=np.asarray([0.1, 0.7]),
+                           alpha=np.asarray([0.6, 0.4]),
+                           alpha_odd=np.asarray([0.2, 0.1]))
+    assert np.all(np.isfinite(np.asarray(jax.device_get(
+        w_isdf.compute_chi0(wfns, quad, meta, mesh)))))
+
+    overlap = np.array(enk)
+    overlap[1, 2] = -0.45        # a conduction energy below vmax = -0.40
+    bad = Wavefunctions(
+        psi_mun=wfns.psi_mun, psi_nmu=wfns.psi_nmu,
+        enk=_put(overlap, mesh, P(None, None)), occ=wfns.occ,
+        slices=slices, layout="face")
+    calls = (
+        lambda: w_isdf.compute_chi0(bad, quad, meta, mesh),
+        lambda: w_isdf.precompile_chi0(bad, quad, meta, mesh),
+        lambda: w_isdf.compute_chi0_multi(
+            bad, quad.tau, np.stack([quad.alpha, quad.alpha]), meta, mesh),
+        lambda: w_isdf.compute_chi0_imag_ordered(
+            bad, quad, meta, mesh, q_neg_index=np.asarray([0, 1])),
+        lambda: w_isdf.compute_chi0_contour(
+            bad, 1j * quad.tau, np.ones((1, 2)), np.ones(2, np.int8),
+            np.asarray([0.3j]), meta, mesh),
+        lambda: w_isdf.compute_chi0_contour_ordered(
+            bad, quad.tau, quad.alpha, np.asarray([0.3j]), meta, mesh,
+            q_neg_index=np.asarray([0, 1])),
+    )
+    for call in calls:
+        with pytest.raises(ValueError, match="GATE chi0_laplace_needs_gap"):
+            call()
+
+
 def test_complex_contour_matches_direct_k_minus_q_sum(monkeypatch):
     import common.fft_helpers as fft_helpers
     import distrib_la
