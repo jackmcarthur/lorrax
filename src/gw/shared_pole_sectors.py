@@ -120,10 +120,10 @@ def joint_sector_pencil(charge, transverse, cross, *, matmul):
     block = lambda a, b, d: jnp.concatenate((
         jnp.concatenate((a, b), axis=-1),
         jnp.concatenate((adj(b), d), axis=-1)), axis=-2)
-    ic = jnp.broadcast_to(jnp.eye(vc.shape[-1], dtype=metric.dtype),
-                          vc.shape + (vc.shape[-1],))
-    it = jnp.broadcast_to(jnp.eye(vt.shape[-1], dtype=metric.dtype),
-                          vt.shape + (vt.shape[-1],))
+    # Inactive columns of a batched retained span are exactly zero. Their
+    # metric is zero too; assigning them an identity invents latent states.
+    ic = jnp.eye(vc.shape[-1], dtype=metric.dtype)[None] * jnp.any(yc != 0, axis=-2)[:, None, :]
+    it = jnp.eye(vt.shape[-1], dtype=metric.dtype)[None] * jnp.any(yt != 0, axis=-2)[:, None, :]
     return (block(ic, metric, it),
             block(ic * vc[:, None, :], value, it * vt[:, None, :]),
             jnp.concatenate((matmul(oc, yc), matmul(ct, yt)), axis=-1),

@@ -178,7 +178,8 @@ def run_checks(mesh):
     assert abs(good_value-.16)<1e-12 and abs(red_value-1.44)<1e-12
     rows.append(dict(name='cauchy_schwarz',value=good_value,red_value=red_value))
     rows.extend(run_span_checks(mesh))
-    assert len(rows)==11
+    rows.extend(run_current_partner_checks(mesh))
+    assert len(rows)==12
     return rows
 
 
@@ -194,8 +195,8 @@ def main():
     rows=run_checks(mesh)
     rows.extend(run_store_checks(mesh,args.output.parent))
     rows.extend(run_sigma_checks(mesh))
-    assert len(rows)==19
-    result=dict(status='PASS',checks=rows,expected_checks=19,
+    assert len(rows)==20
+    result=dict(status='PASS',checks=rows,expected_checks=20,
                 job=os.environ.get('SLURM_JOB_ID'),step=os.environ.get('SLURM_STEP_ID'),
                 source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
                 scope='P4 sector algebra, bitwise storage and direct band-sum tau Sigma; no frequency integration or production deck')
@@ -273,6 +274,49 @@ def run_span_checks(mesh):
     assert max(errors)<1e-10,errors
     return [dict(name='ordered_retained_span_and_cross_infinity',cross_absolute_error=cross_error,
                  output_metric_ritz_errors=errors)]
+
+
+def run_current_partner_checks(mesh):
+    """Current-component rotation and centroid phase at a nonzero complex node."""
+    import jax
+    import numpy as np
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from gw.shared_pole_directions import _round_kernels
+
+    rng=np.random.default_rng(473)
+    w=rng.normal(size=(4,1,6,6))+1j*rng.normal(size=(4,1,6,6))
+    dw=rng.normal(size=w.shape)+1j*rng.normal(size=w.shape)
+    x=rng.normal(size=(4,2,6,2))+1j*rng.normal(size=(4,2,6,2))
+    alpha=np.tile(np.array([3,4,5,0,1,2],np.int32),(4,1))
+    phase=np.repeat(np.exp(1j*np.arange(8).reshape(4,2)*.2),3,axis=1)
+    angle=.37
+    rotation=np.tile(np.array([[np.cos(angle),-np.sin(angle),0],
+                               [np.sin(angle),np.cos(angle),0],[0,0,1]])[None],(4,1,1))
+    partner=[1,0,3,2]
+    spec=NamedSharding(mesh,P(('x','y')))
+    put=lambda a:jax.make_array_from_callback(a.shape,spec,lambda ix:a[ix])
+    rep=lambda a:jax.device_put(np.asarray(a),NamedSharding(mesh,P()))
+    scales=np.array([-2*(.7+.4j),-2*(.7-.4j)])
+    program=_round_kernels(mesh).exchange((False,True),tuple(enumerate(partner)),3)
+    got=program(*(put(a) for a in (w,dw,x,alpha,np.argsort(alpha).astype(np.int32),phase)),
+                rep(np.int32(0)),rep(scales),put(rotation))
+    errors=[];red=[]
+    for slot,p in enumerate(partner):
+        r=np.diag(phase[slot])@np.eye(6)[alpha[slot]]@np.kron(np.eye(2),rotation[slot])
+        for k in range(2):
+            for derivative,a in enumerate((w[p,0],dw[p,0])):
+                exact=r@a@r.conj().T
+                exact=(exact.T if k==0 else exact.conj())@x[slot,k]
+                exact*=scales[k] if derivative else 1
+                actual=jax.experimental.multihost_utils.process_allgather(got[2*k+derivative], tiled=True)[slot]
+                errors.append(float(np.max(np.abs(actual-exact))))
+                if not derivative:
+                    wrong=(a.T if k==0 else a.conj())@x[slot,k]
+                    red.append(float(np.linalg.norm(wrong-exact)))
+    assert max(errors)<1e-11,errors
+    assert min(red)>1,red
+    return [dict(name='current_symmetric_partner',absolute_error=max(errors),
+                 omitted_action_red_min=min(red))]
 
 
 def run_store_checks(mesh,root):

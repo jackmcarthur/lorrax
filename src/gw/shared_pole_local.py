@@ -112,7 +112,7 @@ def canonical_factors(mesh_xy, order):
     return jax.jit(stack, out_shardings=NamedSharding(mesh_xy, P(None, 'x', None, 'y')))
 
 
-def partner_realization(meta, header, ids, partner_parent, partner_row, *, mesh_xy):
+def partner_realization(meta, header, ids, partner_parent, partner_row, *, mesh_xy, components=1):
     """Per-slot packed action of each parent's -q partner row, in batch layout.
 
     For slot r (parent ids[r], partner p', row s): ``alpha[r]`` the packed source
@@ -131,6 +131,10 @@ def partner_realization(meta, header, ids, partner_parent, partner_row, *, mesh_
     inverse = np.argsort(alpha, axis=1).astype(np.int32)
     phase = np.exp(2j * np.pi * np.einsum('ri,rmi->rm', q_frac[parents],
                                           np.asarray([wraps[s] for s in rows], np.float64)))
+    if components != 1:
+        alpha = (alpha[:, :, None] * components + np.arange(components)).reshape(len(ids), -1).astype(np.int32)
+        inverse = np.argsort(alpha, axis=1).astype(np.int32)
+        phase = np.repeat(phase, components, axis=1)
     return (_batch_put(mesh_xy, alpha), _batch_put(mesh_xy, inverse),
             _batch_put(mesh_xy, phase.astype(np.complex128)))
 
