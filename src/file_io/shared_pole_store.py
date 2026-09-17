@@ -70,6 +70,9 @@ def _check_io_capacity(ledger, mesh, header):
     expected = dict(nq=len(header["qirr"]["irr_idx_q"]),
                     nspinor=header["nspinor"],nmu=header["n_mu_logical"],
                     px=int(mesh.shape["x"]),py=int(mesh.shape["y"]))
+    if "capacity_geometry" in header:
+        expected = dict(header["capacity_geometry"], px=int(mesh.shape["x"]),
+                        py=int(mesh.shape["y"]))
     if ledger.geometry != expected:
         _refuse("capacity ledger geometry differs from stored model/current mesh")
     ledger.live_stages
@@ -206,9 +209,9 @@ def _stamp_header(path, header, stage):
     rank0_transaction(path, stage=stage, write=publish)
 
 
-def _check_basis(meta, header):
+def _check_basis(meta, header, basis=None):
     """Authenticate scientific centroid order independently of mesh padding."""
-    basis = meta.mu_basis
+    basis = meta.mu_basis if basis is None else basis
     digest = hashlib.sha256(np.asarray(
         basis.canonical_indices, dtype="<i4").tobytes()).hexdigest()
     if (basis.n_logical != header["n_mu_logical"]
@@ -218,17 +221,21 @@ def _check_basis(meta, header):
     return basis
 
 
-def _metadata(meta, tables, recipe, identity, ordered=None):
+def _metadata(meta, tables, recipe, identity, ordered=None, *, basis=None, sector=None):
     """Authenticate small scientific identities; no tensor data is gathered.
 
     ``tables`` is a plain mapping with canonical ``qirr`` (QirrTables),
-    ``q_irr_full_idx`` and the generating ``sym`` (SymMaps). ``meta.mu_basis``
-    owns logical centroid identity and the I/O packing; ``meta.nspinor`` is 1.
+    ``q_irr_full_idx`` and the generating ``sym`` (SymMaps). The endpoint
+    basis owns logical centroid identity and I/O packing. Sector factors
+    use the complete bispinor map's capacity ledger.
     """
     _check_identity(identity, identity)
-    basis = meta.mu_basis
-    if not charge_representation(meta):
-        _refuse(f"unsupported Nspinor={meta.nspinor}")
+    basis = meta.mu_basis if basis is None else basis
+    if sector is None:
+        if not charge_representation(meta):
+            _refuse(f"unsupported Nspinor={meta.nspinor}")
+    elif sector not in ("CC", "TT", "CT_C", "CT_T") or int(meta.nspinor) != 4:
+        _refuse("sector factors require Nspinor=4 and CC/TT/CT_C/CT_T")
     sym = tables["sym"]
     # A bank (ordered=None) follows the measured TRS state; a model store
     # states its representation and must agree with it.
@@ -287,6 +294,10 @@ def _metadata(meta, tables, recipe, identity, ordered=None):
                        "typing_source": str(sym.operation_typing_source)},
         "finalized": False,
     }
+    if sector is not None:
+        header.update(sector=sector, factor_components=3 if sector in ("TT", "CT_T") else 1,
+                      capacity_geometry=dict(_capacity(meta).geometry))
+        header["representation"] = "sector-ordered-ph" if ordered else "sector-trs-even-s"
     if ordered:
         header["ordered"] = True
     return header
@@ -342,7 +353,7 @@ def _check_factor(b, poles2, K):
 
 @timing.timed("shared_pole_store.write_model")
 def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
-                            recipe, receipts, ordered=False):
+                            recipe, receipts, ordered=False, basis=None, sector=None):
     """Stage a bounded q batch and finalize automatically at complete K census.
 
     Parameters
@@ -358,6 +369,14 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
     meta, tables, recipe, receipts : bundles / dict
         Packed basis, canonical tables, resolved recipe, and construction
         receipts including ``identity`` with current SC/input content identities.
+    basis : PackedCentroidBasis, optional
+        Scientific endpoint basis; defaults to meta.mu_basis. Current
+        endpoints supply the existing transverse basis. Capacity remains
+        charged to the complete map's ledger, not a fictitious sector map.
+    sector : str, optional
+        CC, TT, CT_C or CT_T on Nspinor=4 maps. TT and CT_T have three
+        component rows. CT_C and CT_T store the two factors of one CT
+        model; the construction owner must bind their common pole census.
 
     Returns
     -------
@@ -366,15 +385,18 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         Staging plus final datasets use at most twice the compact payload bytes.
     """
     with timing.section("staging"):
-        header = _metadata(meta, tables, recipe, receipts["identity"], ordered)
-        mesh = meta.mu_basis.mesh_xy
+        basis = meta.mu_basis if basis is None else basis
+        header = _metadata(meta, tables, recipe, receipts["identity"], ordered,
+                           basis=basis, sector=sector)
+        components = header.get("factor_components", 1)
+        mesh = basis.mesh_xy
         want = NamedSharding(mesh, P(None, "x", None, "y"))
         if not isinstance(b, jax.Array) or not b.sharding.is_equivalent_to(want, 4):
             _refuse("constructor factor is not the declared XY handoff")
-        if b.shape[1:3] != (meta.mu_basis.n_packed, 1):
+        if b.shape[1:3] != (basis.n_packed, components):
             _refuse("factor does not use the current packed centroid basis")
         ledger = _capacity(meta)
-        arg, output, temporary = _conversion_bytes(meta.mu_basis, b.shape, want.spec, unpack=True)
+        arg, output, temporary = _conversion_bytes(basis, b.shape, want.spec, unpack=True)
         # One factor-sized envelope covers eager finite/sentinel check scratch.
         _admit(ledger, "write_model", output, temporary+arg+3*int(poles2.size)*8,
                device_panel=max(arg,output,8*int(poles2.size)), native_host=True)
@@ -399,7 +421,7 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         width = int(K.max(initial=0))
         name = f"staging/q{lo}_{hi}"
     with timing.section("canonical_basis_conversion_and_packing"):
-        canonical = meta.mu_basis.unpack_axis(b, 1)
+        canonical = basis.unpack_axis(b, 1)
         canonical.block_until_ready()
     if not Path(path).exists():
         with SlabIO(path, mode="w", mesh=mesh) as io:
@@ -413,7 +435,7 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
     rank0_transaction(path, stage="shared_pole.stage_group", write=prepare_group)
     with SlabIO(path, mode="a", mesh=mesh) as io:
         if width:
-            io.create_dataset(name + "/factor", shape=(hi-lo, header["n_mu_logical"], 1, width), dtype=np.complex128)
+            io.create_dataset(name + "/factor", shape=(hi-lo, header["n_mu_logical"], components, width), dtype=np.complex128)
             io.create_dataset(name + "/poles2", shape=(hi-lo, width), dtype=np.float64)
             with timing.section("write_slab"):
                 io.write_slab(name + "/factor", canonical)
@@ -429,11 +451,11 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
             io.sync_writes()
     del canonical
     if all(header["written_q"]):
-        return _finalize_model(path, meta=meta, header=header)
+        return _finalize_model(path, meta=meta, header=header, basis=basis)
     return header
 
 
-def finalize_shared_pole_model(path, *, meta, expected_identity):
+def finalize_shared_pole_model(path, *, meta, expected_identity, basis=None):
     """Resume finalization from a successfully closed, complete staging census.
 
     A native write failure retains the global incomplete marker and refuses;
@@ -441,31 +463,33 @@ def finalize_shared_pole_model(path, *, meta, expected_identity):
     """
     header = _read_header(path)
     _check_identity(header["identity"], expected_identity)
-    _check_basis(meta, header)
+    basis = _check_basis(meta, header, basis)
     if header["schema"] != SCHEMA or not all(header["written_q"]):
         _refuse("finalization requires every staged parent")
     if header["finalized"]:
         return validate_shared_pole_model(
             path, expected_identity=expected_identity, mesh_xy=meta.mu_basis.mesh_xy,
             capacity=_capacity(meta))
-    return _finalize_model(path, meta=meta, header=header)
+    return _finalize_model(path, meta=meta, header=header, basis=basis)
 
 
 @timing.timed("shared_pole_store.finalize")
-def _finalize_model(path, *, meta, header):
-    mesh, basis = meta.mu_basis.mesh_xy, meta.mu_basis
+def _finalize_model(path, *, meta, header, basis=None):
+    basis = meta.mu_basis if basis is None else basis
+    mesh = basis.mesh_xy
+    components = header.get("factor_components", 1)
     nq, nmu = header["n_q_irr"], header["n_mu_logical"]
     kmax = max(header["K"])
-    panel = 16*basis.n_canonical*((kmax+int(mesh.shape["y"])-1)//int(mesh.shape["y"]))/int(mesh.shape["x"])
+    panel = 16*components*basis.n_canonical*((kmax+int(mesh.shape["y"])-1)//int(mesh.shape["y"]))/int(mesh.shape["x"])
     batch_width = max(v["hi"] - v["lo"] for v in header["batches"])
     _admit(_capacity(meta), "finalize", batch_width*(int(panel)+24*kmax),
            device_panel=batch_width*max(int(panel),8*kmax), native_host=True)
     header["Kmax"] = kmax
-    header["compact_payload_bytes"] = nq * (16*nmu*kmax + 8*kmax + 8)
-    header["staging_payload_bytes"] = sum((v["hi"]-v["lo"]) * v["width"] * (16*nmu+8) for v in header["batches"])
+    header["compact_payload_bytes"] = nq * (16*nmu*components*kmax + 8*kmax + 8)
+    header["staging_payload_bytes"] = sum((v["hi"]-v["lo"]) * v["width"] * (16*nmu*components+8) for v in header["batches"])
     header["peak_payload_bytes"] = header["compact_payload_bytes"] + header["staging_payload_bytes"]
     with SlabIO(path, mode="a", mesh=mesh) as io:
-        io.create_dataset("factor", shape=(nq, nmu, 1, kmax), dtype=np.complex128)
+        io.create_dataset("factor", shape=(nq, nmu, components, kmax), dtype=np.complex128)
         io.create_dataset("poles2_ry2", shape=(nq, kmax), dtype=np.float64)
         for batch in header["batches"]:
             # Preserve the constructor's admitted q batch through finalization.
@@ -473,7 +497,7 @@ def _finalize_model(path, *, meta, header):
             lo, hi = batch["lo"], batch["hi"]
             spec = P(None, "x", None, "y")
             read_shape = mesh_divisible_shape(
-                (hi-lo, basis.n_canonical, 1, kmax), mesh, spec)
+                (hi-lo, basis.n_canonical, components, kmax), mesh, spec)
             if kmax == 0:
                 continue
             with timing.section("staging_read_and_padding"):
@@ -524,14 +548,15 @@ def _model_digest(path, header, mesh, *, capacity):
                 ("digest", "finalized", "batches", "staging_payload_bytes", "peak_payload_bytes")}
     digest = hashlib.sha256(_json(identity).encode())
     nmu, kmax = header["n_mu_logical"], header["Kmax"]
+    components = header.get("factor_components", 1)
     ncan = ((nmu + int(mesh.size)-1)//int(mesh.size))*int(mesh.size)
     column_cap = max(1, (kmax + int(mesh.shape["y"])-1)//int(mesh.shape["y"]))
-    panel = 16*ncan*min(kmax,column_cap)//int(mesh.shape["x"])
+    panel = 16*components*ncan*min(kmax,column_cap)//int(mesh.shape["x"])
     batch_limit = min(int(mesh.size), header["n_q_irr"])
-    _admit(capacity, "digest", batch_limit*(panel+8*kmax+256*nmu),
+    _admit(capacity, "digest", batch_limit*(panel+8*kmax+256*nmu*components),
            batch_limit*(panel+24*kmax), host_payload=batch_limit*panel,
            device_panel=batch_limit*panel,
-           host_metadata=batch_limit*(256*nmu+8*kmax), native_host=True)
+           host_metadata=batch_limit*(256*nmu*components+8*kmax), native_host=True)
     with SlabIO(path, mode="r", mesh=mesh) as io:
         for q0 in range(0, header["n_q_irr"], batch_limit):
             q1 = min(q0+batch_limit, header["n_q_irr"])
@@ -541,7 +566,7 @@ def _model_digest(path, header, mesh, *, capacity):
                 if np.any(active_counts != 0):
                     _refuse("nonzero K in empty model")
                 for _ in range(batch):
-                    digest.update(hashlib.sha256(b"").digest() * nmu)
+                    digest.update(hashlib.sha256(b"").digest() * (nmu*components))
                 continue
             with timing.section('pole_read'):
                 poles = io.read_slab("poles2_ry2", shape=(batch,kmax), offset=(q0,0), partition_spec=P())
@@ -553,7 +578,7 @@ def _model_digest(path, header, mesh, *, capacity):
             for c0 in range(0, kmax, column_cap):
                 c1 = min(kmax, c0+column_cap)
                 with timing.section('factor_read_and_validation'):
-                    b = io.read_slab("factor", shape=(batch,ncan,1,c1-c0), offset=(q0,0,0,c0),
+                    b = io.read_slab("factor", shape=(batch,ncan,components,c1-c0), offset=(q0,0,0,c0),
                                      partition_spec=P(None,"x",None,None))
                     counts = np.clip(active_counts-c0, 0, c1-c0)
                     _check_factor(b, poles[:,c0:c1], counts)
@@ -562,14 +587,16 @@ def _model_digest(path, header, mesh, *, capacity):
                         if shard.replica_id != 0:
                             continue
                         start = shard.index[1].start or 0
-                        local = np.asarray(shard.data)[:,:,0,:]
+                        local = np.asarray(shard.data)
                         for q in range(batch):
                             for i in range(min(local.shape[1], nmu-start)):
-                                hasher = hashers[q].setdefault(start+i, hashlib.sha256())
-                                hasher.update(np.asarray(local[q,i], dtype="<c16").tobytes())
+                                for component in range(components):
+                                    row = (start+i)*components+component
+                                    hasher = hashers[q].setdefault(row, hashlib.sha256())
+                                    hasher.update(np.asarray(local[q,i,component], dtype="<c16").tobytes())
                     shard = local = None
                     del b
-            row_hash = np.zeros((batch,nmu,32), np.uint32)
+            row_hash = np.zeros((batch,nmu*components,32), np.uint32)
             for q in range(batch):
                 for row, hasher in hashers[q].items():
                     row_hash[q,row] = np.frombuffer(hasher.digest(), np.uint8)
@@ -598,11 +625,20 @@ def validate_shared_pole_model(path, *, expected_identity, mesh_xy, capacity=Non
         _check_identity(header["identity"], expected_identity)
         if header["schema"] != SCHEMA or not header["finalized"] or not all(header["written_q"]):
             _refuse("missing final shared-pole commit or incomplete q census")
+        sector = header.get("sector")
+        components = header.get("factor_components", 1)
+        if sector is not None:
+            if (sector not in ("CC", "TT", "CT_C", "CT_T") or header["nspinor"] != 4
+                    or components != (3 if sector in ("TT", "CT_T") else 1)
+                    or "capacity_geometry" not in header):
+                _refuse("invalid sector endpoint metadata")
+        elif components != 1:
+            _refuse("component factors require an explicit sector identity")
         qt = shared_pole_qirr_tables(header)
         validate_qirr_tables(qt, header["n_q_irr"], header["n_mu_logical"])
         with h5py.File(path, "r") as f:
             for name, shape, dtype in (
-                ("factor", (header["n_q_irr"],header["n_mu_logical"],1,header["Kmax"]), np.complex128),
+                ("factor", (header["n_q_irr"],header["n_mu_logical"],header.get("factor_components",1),header["Kmax"]), np.complex128),
                 ("poles2_ry2", (header["n_q_irr"],header["Kmax"]), np.float64),
                 ("K", (header["n_q_irr"],), np.int64)):
                 if name not in f or f[name].shape != shape or f[name].dtype != dtype or f[name].chunks is not None:
@@ -678,6 +714,8 @@ def read_shared_pole_matrix(io, q_span, *, meta, header):
     """
     from runtime.padding import padded_axis
 
+    if header.get("sector") is not None:
+        _refuse("scalar matrix reader cannot consume a sector endpoint; use the face reader")
     if header.get("validation_receipt", {}).get("status") == "NOT_MEASURED":
         _refuse("metadata-only validation cannot authorize tensor reads")
     if header["schema"] != SCHEMA or not header["finalized"]:
@@ -720,7 +758,7 @@ def read_shared_pole_matrix(io, q_span, *, meta, header):
             jnp.where(active, poles, 1.0), counts)
 
 
-def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
+def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None, basis=None):
     """Read canonical row faces and pack once at the I/O boundary.
 
     Returns b_X, b_Y, poles2, K with shapes (b,mu_p,spin,Kcap),
@@ -733,7 +771,8 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
         _refuse("metadata-only validation cannot authorize tensor reads")
     if header["schema"] != SCHEMA or not header["finalized"]:
         _refuse("face reader requires a validated finalized model")
-    basis = _check_basis(meta, header)
+    basis = _check_basis(meta, header, basis)
+    components = header.get("factor_components", 1)
     ledger = _capacity(meta)
     if io.mesh is not basis.mesh_xy:
         _refuse("reader mesh differs from packed basis mesh")
@@ -741,7 +780,7 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
     lo, hi = _span(q_span, header["n_q_irr"], "q_span")
     if header["Kmax"] == 0 and column_span is None:
         _admit(ledger,"empty_faces",8*(hi-lo))
-        shape = (hi-lo,basis.n_packed,1,0)
+        shape = (hi-lo,basis.n_packed,components,0)
         faces = [jax.jit(lambda: jnp.zeros(shape,jnp.complex128),
                          out_shardings=NamedSharding(io.mesh,P(None,axis,None,"y" if axis == "x" else "x")))()
                  for axis in ("x","y")]
@@ -752,7 +791,7 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
     width = round_up(c1-c0, multiple)
     totals = []
     for axis in ("x","y"):
-        shape = (hi-lo,basis.n_canonical,1,width)
+        shape = (hi-lo,basis.n_canonical,components,width)
         totals.append(_conversion_bytes(basis,shape,P(None,axis,None,"y" if axis == "x" else "x"),unpack=False))
     ax,fx,tx = totals[0]; ay,fy,ty = totals[1]
     metadata = 32*(hi-lo)*width+8*(hi-lo)
@@ -764,8 +803,8 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
     faces = []
     for axis in ("x", "y"):
         spec = P(None,axis,None,"y" if axis == "x" else "x")
-        b = io.read_slab("factor", shape=(hi-lo,basis.n_canonical,1,width),
-                         offset=(lo,0,0,c0), valid_shape=(hi-lo,basis.n_logical,1,c1-c0),
+        b = io.read_slab("factor", shape=(hi-lo,basis.n_canonical,components,width),
+                         offset=(lo,0,0,c0), valid_shape=(hi-lo,basis.n_logical,components,c1-c0),
                          partition_spec=spec)
         b = basis.pack_axis(b, 1, spec=spec)
         faces.append(jnp.where(active[:,None,None,:] & jnp.asarray(
@@ -776,6 +815,41 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
         del b
     poles = io.read_slab("poles2_ry2", shape=(hi-lo,width), offset=(lo,c0), valid_shape=(hi-lo,c1-c0), partition_spec=P())
     return (*faces, jnp.where(active,poles,1.0), counts)
+
+
+def read_shared_pole_cross_faces(readers, q_span, *, meta, headers, bases,
+                                 column_span=None):
+    """Read both CT endpoint factors with one authenticated pole census.
+
+    ``readers``, ``headers`` and ``bases`` are charge/current pairs. The
+    returned (b_C_X,b_T_Y,poles2,K) has the ordinary public face layouts.
+    TC is obtained by exchanging endpoint roles, never stored separately.
+    The two files carry the same iteration, parent order and exact poles.
+    All factors remain XY sharded and only pole metadata is compared.
+    """
+    left, right = headers
+    if left.get("sector") != "CT_C" or right.get("sector") != "CT_T":
+        _refuse("CT requires CT_C and CT_T endpoint stores")
+    for key in ("identity", "K", "Kmax", "q_irr_full_idx", "ordered"):
+        if _json(left.get(key)) != _json(right.get(key)):
+            _refuse(f"CT endpoint stores disagree on {key}")
+    c = read_shared_pole_faces(readers[0], q_span, meta=meta, header=left,
+                               column_span=column_span, basis=bases[0])
+    ledger = _capacity(meta)
+    previous = ledger.live_stages
+    amount = (sum(_local_bytes(a.shape, a.dtype, readers[0].mesh, a.sharding.spec)
+                  for a in c[:2]) + sum(a.size*a.dtype.itemsize for a in c[2:]))
+    row = _admit(ledger, "cross_charge_faces", amount)
+    ledger.live_stages = (*previous, row["stage"])
+    try:
+        t = read_shared_pole_faces(readers[1], q_span, meta=meta, header=right,
+                                   column_span=column_span, basis=bases[1])
+    finally:
+        ledger.live_stages = previous
+    if not bool(jnp.all(jax.lax.bitcast_convert_type(c[2], jnp.uint64) ==
+                        jax.lax.bitcast_convert_type(t[2], jnp.uint64))):
+        _refuse("CT endpoint stores disagree on exact pole bits")
+    return c[0], t[1], c[2], c[3]
 
 
 # Scratch bank uses the same identity and metadata transactions.
