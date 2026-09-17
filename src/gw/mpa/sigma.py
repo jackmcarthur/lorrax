@@ -968,6 +968,7 @@ def _integrate_sigma_batches(
     band_counts=None,
     odd_residue_off=False,
     w_synthesis=None,
+    tau_kernel_factory=None,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs."""
@@ -1044,6 +1045,8 @@ def _integrate_sigma_batches(
 
         def tau_kernel_for(builder, cache=True):
             # The one tau-kernel factory call: the inherited-peak probe reuses it.
+            if tau_kernel_factory is not None:
+                return tau_kernel_factory(builder, sigma_axis)
             return get_shared_sigma_tau_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
                 w_synthesis=builder, cache=cache, **face_kwargs)
@@ -1185,7 +1188,7 @@ def _integrate_sigma_batches(
                     prewarm_args = (
                         *tau_arguments,
                         jnp.asarray(first_t, dtype=jnp.complex128), active_count)
-                    if w_synthesis is not None and tau_profile:
+                    if w_synthesis is not None and tau_profile and tau_kernel_factory is None:
                         # COMPILE-ONLY MEASUREMENT, not admission.  Two extra
                         # AOT trace+lower+compile passes per SC map produce a
                         # receipt no reservation in this stage consumes: every
@@ -1482,6 +1485,7 @@ def compute_sigma_c_mpa_omega_grid(
     band_counts=None,
     fixed_quadrature_session=None,
     sigma_w_model="mpa",
+    sector_context=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -1527,7 +1531,8 @@ def compute_sigma_c_mpa_omega_grid(
         n_poles = int(ledger["n_q_irr"])
         ordered_residues = False
         with timing.section("sigma.capacity"):
-            schedule = _shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy)
+            schedule = (_shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy)
+                        if sector_context is None else sector_context["schedule"](ledger))
         print_fn(f"  shared-pole Sigma capacity: {schedule}")
     else:
         ledger = validate_fit_store(
@@ -1676,13 +1681,17 @@ def compute_sigma_c_mpa_omega_grid(
             if shared_pole:
                 _band_fence('tau.synthesis_setup', sync_ranks=True)
                 with timing.section('tau.synthesis_setup'):
-                    synthesis = _shared_pole_w_synthesis(
+                    synthesis = (_shared_pole_w_synthesis(
                         reader, meta, ledger, frequencies, schedule, mesh_xy=mesh_xy)
+                        if sector_context is None else sector_context["synthesis"](
+                            reader, ledger, frequencies, schedule))
                 total = _integrate_sigma_batches(
                     wfns, ((0, None, None, None),), n_poles, plan,
                     omega_grid_ry, meta, mesh_xy, pole_batch_size=n_poles,
                     brackets=band_brackets, band_counts=band_counts,
-                    w_synthesis=synthesis, print_fn=print_fn)
+                    w_synthesis=synthesis,
+                    tau_kernel_factory=(None if sector_context is None else
+                                        sector_context["tau_kernel"]), print_fn=print_fn)
                 del synthesis
             else:
                 total = integrate_sigma_store(
