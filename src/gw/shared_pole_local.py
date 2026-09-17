@@ -94,8 +94,8 @@ def face_rows(mesh_xy, rows, width=None):
 
 
 @lru_cache(maxsize=None)
-def canonical_factors(mesh_xy, order):
-    """The store's handoff [nq, mu_X, 1, K_Y] from round factor blocks [real_r, mu_X, W_r_Y].
+def canonical_factors(mesh_xy, order, components=1):
+    """Store handoff [nq, mu_X, component, K_Y] from flattened endpoint rows.
 
     Blocks are padded with zero columns to the widest, joined in round order and
     placed in canonical parent order (``order[i]`` is the joined row of parent i).
@@ -108,7 +108,8 @@ def canonical_factors(mesh_xy, order):
     def stack(*parts):
         width = max(part.shape[-1] for part in parts)
         whole = jnp.concatenate([jnp.pad(part, ((0, 0), (0, 0), (0, width - part.shape[-1]))) for part in parts])
-        return whole[jnp.asarray(index)][:, :, None, :]
+        whole = whole[jnp.asarray(index)]
+        return whole.reshape(whole.shape[0], whole.shape[1] // components, components, width)
     return jax.jit(stack, out_shardings=NamedSharding(mesh_xy, P(None, 'x', None, 'y')))
 
 

@@ -184,6 +184,20 @@ Cauchy–Schwarz applies to a positive spectral metric, not an arbitrary
 complex-frequency W block. The separate constant `U−V` contributes to
 Sigma independently of the pole model of `W−U`.
 
+Sector stores stamp their actual realization as `raw-sector-endpoint-v1`
+in the authenticated model recipe and sector manifest. This names raw
+physical charge/current endpoints with their own centroid bases, followed
+by the stored symmetry endpoint action. It performs no scalar little-group
+averaging. CC and TT have independent poles; CT_C and CT_T share one
+retained mask and pole ordering, with each endpoint passing its own lost
+weight check. The manifest binds all four stores and the current-map
+`W∞−V` bank constant.
+Positive retained `H` certifies each projected realization. Since CC, TT
+and CT are fitted independently, this does not certify positive spectral
+residues of the assembled photon matrix: a CT-only pole can have a nonzero
+cross residue while its CC and TT diagonal residues vanish. Assess the
+assembled model through sector and integrated-Sigma accuracy receipts.
+
 **Infinity block.** `k₀ = σ₃ C^† Q_∞` and `k₁ = σ₃ M σ₃ C^† Q_∞` need all four moments of (SP 8):
 
 $$ \mathcal G_{\infty\infty} = \begin{pmatrix} P_0 & P_1\\ P_1 & P_2 \end{pmatrix},\quad

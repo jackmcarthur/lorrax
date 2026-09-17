@@ -196,8 +196,13 @@ def main():
     rows.extend(run_store_checks(mesh,args.output.parent))
     rows.extend(run_sigma_checks(mesh))
     rows.extend(run_signed_contact_checks(mesh))
-    assert len(rows)==25
-    result=dict(status='PASS',checks=rows,expected_checks=25,
+    rows.extend(run_extent_span_checks(mesh))
+    if jax.process_index()==0:
+        print(json.dumps(dict(status="ALGEBRA_PASS",checks=rows[-2:])),flush=True)
+    from shared_pole_sector_constructor_p4 import check_sector_constructor
+    rows.append(check_sector_constructor(mesh,args.output.parent))
+    assert len(rows)==27
+    result=dict(status='PASS',checks=rows,expected_checks=27,
                 job=os.environ.get('SLURM_JOB_ID'),step=os.environ.get('SLURM_STEP_ID'),
                 source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
                 scope='P4 sector algebra, bitwise storage and direct band-sum tau Sigma; no frequency integration or production deck')
@@ -387,6 +392,71 @@ def run_span_checks(mesh):
     assert ct_error<1e-10,ct_error
     return [dict(name='ordered_retained_span_and_cross_infinity',cross_absolute_error=cross_error,
                  output_metric_ritz_errors=errors,joint_round_held_error=ct_error)]
+
+
+
+def run_extent_span_checks(mesh):
+    """Unequal finite/infinity extents retain their original round-pencil rows."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import distrib_la
+    from common.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+    from gw.shared_pole_local import _batch_put, _mm, reduce_round, round_tables
+    rng=np.random.default_rng(480)
+    plus=rng.normal(size=(2,2))+.2j*rng.normal(size=(2,2))
+    c=np.concatenate((plus,plus.conj()),axis=1)
+    j=np.diag([1.,1.,-1.,-1.]); h=np.diag([.6,1.4,.6,1.4])
+    counts=np.array([[1,1],[2,2],[1,1],[2,2]])
+    ni=np.array([1,2,2,1]); nodes=(.7+.4j,-.7-.4j)
+    tables=round_tables(counts,(2,2),nodes,ni,2,column_extent=lambda n:n,
+                        ordered=True,odd_moments=True)
+    put=lambda a:_batch_put(mesh,np.asarray(a))
+    states=[]; latent=[]
+    for a,z in enumerate(nodes):
+        qs=[];outs=[];ders=[];xs=[]
+        for r in range(mesh.size):
+            q=np.eye(2,dtype=complex);q[:,counts[r,a]:]=0
+            x=np.linalg.solve(z*j-h,c.conj().T@q)
+            qs.append(q);outs.append(c@x);ders.append(-c@np.linalg.solve(z*j-h,j@x));xs.append(x)
+        states.append((z,put(qs),put(outs),put(ders)));latent.append(np.array(xs))
+    qs=[];ks=[]
+    for r in range(mesh.size):
+        q=np.eye(2,dtype=complex);q[:,ni[r]:]=0
+        qs.append(q);ks.append(j@c.conj().T@q)
+    ks=np.array(ks);full=np.concatenate((*latent,ks,j@h@ks),axis=-1)
+    power=j@c.conj().T;infinity=[put(qs)]
+    for _ in range(4):
+        infinity.append(put(np.array([(c@power/2)@q for q in qs])))
+        power=j@h@power
+    native=distrib_la.plan('eigh',mesh,n=8,backend='off').native_fn
+    model,signed,vectors,diag,y=reduce_round(tuple(states),tuple(infinity),tables,real=4,
+        mesh_xy=mesh,native_eigh=native,ordered=True,odd_moments=True,keep_budget=None,retain_span=True)
+    assert np.all(np.asarray(diag[0]['gram_valid']))
+    assert np.all(np.asarray(diag[0]['retained_metric_positive']))
+    adj=lambda a:np.swapaxes(a.conj(),-1,-2)
+    pencil=tuple(put(a) for a in (adj(full)@j@full,adj(full)@h@full,c@full))
+    def check(p,y,s):
+        factor,mu,active=s;eye=jnp.eye(y.shape[-1])[None]
+        return jnp.stack((jnp.max(jnp.abs(_mm(p[2],y)-factor*active[:,None,:]),axis=(-2,-1)),
+            jnp.max(jnp.abs(_mm(y,_mm(p[1],y),transa='C')-eye*active[:,None,:]),axis=(-2,-1)),
+            jnp.max(jnp.abs(_mm(y,_mm(p[0],y),transa='C')-eye*(mu*active)[:,None,:]),axis=(-2,-1))),axis=-1)
+    check=jax.jit(shard_map(check,mesh=mesh,in_specs=(P(('x','y')),)*3,
+                            out_specs=P(('x','y')),check_vma=False))
+    errors=float(jnp.max(check(pencil,y,signed)))
+    assert errors<1e-9,errors
+    # A trailing-only embedding moves the second finite half and both
+    # infinity blocks for parent zero. It must fail the same identities.
+    def wrong(y):
+        indices=jnp.array([0,2,4,6,1,3,5,7])
+        return jnp.take(y,indices,axis=-2)
+    wrong=jax.jit(shard_map(wrong,mesh=mesh,in_specs=P(('x','y')),
+                            out_specs=P(('x','y')),check_vma=False))
+    red=float(jnp.max(check(pencil,wrong(y),signed)))
+    assert red>1e-3,red
+    return [dict(name='own_extent_retained_span_rows',maximum_identity_error=errors,
+                 wrong_row_embedding_error=red,extents=tables['extents'].tolist())]
 
 
 def run_current_partner_checks(mesh):
