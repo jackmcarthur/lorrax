@@ -34,7 +34,12 @@ def odd_reciprocal(A: float, tolerance: float, *, eta: float = 0.8,
     return make_rule(A, tolerance, eta=eta, precision=precision)
 
 
-def damped_line_reciprocal(span: float, height: float, tolerance: float):
-    """Conservative positive-time rule for ``1/(x+i*height)``, ``|x|<=span``."""
+def damped_line_reciprocal(bandwidth_over_broadening: float, tolerance: float):
+    """Rule for ``1/(u+i)`` on ``|u|<=bandwidth_over_broadening``.
+
+    The error request is absolute in the normalized variable ``u=x/height``.
+    For physical ``1/(x+i*height)`` with absolute error ``eps``, pass
+    ``(span/height, height*eps)`` and use ``rule.rescaled(height)``.
+    """
     from minimax.analytic_line import make_rule
-    return make_rule(span, height, tolerance)
+    return make_rule(bandwidth_over_broadening, 1.0, tolerance)

@@ -61,14 +61,17 @@ are owned by the [non-Hermitian GN-PPM memo](../dev/notes/DERIVATION_gnppm_nonhe
 
 The lazy package door exposes `positive_reciprocal(R, tolerance)`,
 `odd_reciprocal(A, tolerance)`, and
-`damped_line_reciprocal(span, height, tolerance)`. All three use dimensionless
+`damped_line_reciprocal(bandwidth_over_broadening, tolerance)`. All three use dimensionless
 **absolute** error and return an object with `times` and `evaluate(x)`.
 The positive rule has positive `strengths` in the stable shifted convention
 `sum strengths * exp(-(x-1)*times)`; the old unshifted coefficients are
 `strengths * exp(times)`. The odd rule has `weights` in
 `sum weights * sin(x*times)`. The line rule has complex `weights` in
-`sum weights * exp(i*x*times)` for `1/(x+i*height)`; damping is already in
-the coefficients. No driver is routed to these constructors yet.
+`sum weights * exp(i*u*times)` for `1/(u+i)` on
+`|u|<=bandwidth_over_broadening`; damping is already in the coefficients.
+To approximate physical `1/(x+i*height)` to absolute error `eps`, construct
+with `(span/height, height*eps)` and call `rule.rescaled(height)`.
+No driver is routed to these constructors yet.
 
 The positive constructor prescribes elliptic interpolation abscissae, solves
 their moments in elevated precision, and optionally applies two measured
