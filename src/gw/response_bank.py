@@ -1365,6 +1365,8 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     ledger.live_stages = ambient+(name,)
     receipt["memory"].append(row)
     before = time.monotonic()
+    if jax.process_index() == 0:
+        print("photon bank: preparing shared vertex endpoints and bare V", flush=True)
     vertex = prepare_photon_carriers(wfns, wfns_transverse, mu_bases,
                                      mesh_xy=mesh_xy, layout=layout)
     bank["photon_v"] = photon_bare_operator(wfns, wfns_transverse, meta,
@@ -1372,6 +1374,8 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     jax.block_until_ready((vertex, bank["photon_v"]))
     receipt["seconds"]["endpoints_and_V"] = time.monotonic()-before
     before = time.monotonic()
+    if jax.process_index() == 0:
+        print("photon bank: centroid D and static grid reference", flush=True)
     grid, drude, contact = photon_static_contact(wfns, meta, mesh_xy=mesh_xy,
         layout=layout, vertex=vertex, occupation_state=occupation_state,
         sample_plan=sample_plan, execute=execute, receipt=receipt)
@@ -1384,10 +1388,14 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     receipt["seconds"]["static_contact"] = time.monotonic()-before
     del grid, drude
     before = time.monotonic()
+    if jax.process_index() == 0:
+        print("photon bank: exact moments and W_infinity", flush=True)
     receipt["moments"] = compute_moment_bank(wfns, meta, config, mesh_xy=mesh_xy,
         sym=sym, bank_io=bank, vertex=vertex, contact=contact)
     receipt["seconds"]["moments"] = time.monotonic()-before
     before = time.monotonic()
+    if jax.process_index() == 0:
+        print("photon bank: ordered samples and derivatives", flush=True)
     receipt["samples"] = produce_sample_bank(wfns, meta, config, mesh_xy=mesh_xy,
         sym=sym, sample_plan=sample_plan, bank_io=bank, vertex=vertex, contact=contact)
     receipt["seconds"]["samples"] = time.monotonic()-before

@@ -674,16 +674,23 @@ def _get_chi_fractional_contour_kernel_face(
             def green(weight, tau_value, ref, *, current=False):
                 return G_fftn(green_k(weight, tau_value, ref, current=current))
 
-            lower_f = green(occ_f[0], -time, energy_reference[0])
-            upper_u = green(occ_u[0], time, energy_reference[1], current=True)
-            lower_u = green(occ_f[1], -time, energy_reference[0])
-            upper_f = green(occ_u[1], time, energy_reference[1], current=True)
-            forward = jnp.einsum("Rambn,Rambn->Rmn", upper_u,
-                                 jnp.conj(lower_f), optimize=True)
-            reverse = jnp.einsum("Rambn,Rambn->Rmn", upper_f,
-                                 jnp.conj(lower_u), optimize=True)
-            return (jax.lax.with_sharding_constraint(forward - reverse, chi_R_shard),
-                    jax.lax.with_sharding_constraint(forward + reverse, chi_R_shard))
+            # Accumulate the two occupation orientations sequentially. Four
+            # simultaneously live full spin Green tensors exceed a P4 card on
+            # the metallic photon bank. This loop performs the same four
+            # Green builds/FFTs and keeps only one pair plus two scalar-spin
+            # contractions alive; it adds no nodes or transforms.
+            initial = jax.lax.with_sharding_constraint(
+                jnp.zeros((nk, n_mu, n_mu), jnp.complex128), chi_R_shard)
+            def orientation(carry, index):
+                lower = green(occ_f[index], -time, energy_reference[0])
+                upper = green(occ_u[index], time, energy_reference[1], current=True)
+                value = jax.lax.with_sharding_constraint(
+                    jnp.einsum("Rambn,Rambn->Rmn", upper, lower.conj()), chi_R_shard)
+                even, odd = carry
+                return (even + jnp.where(index == 0, value, -value), odd + value), None
+            result, _ = jax.lax.scan(orientation, (initial, initial), jnp.arange(2))
+            return result
+
 
         def kms_static_correlation(time):
             # The zero-Matsubara FD reference uses the SAME endpoint Green

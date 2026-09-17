@@ -173,3 +173,19 @@ def check_photon_bank_store(mesh, path):
             sample_span=(0,ns),fields=('Wc','constant'),partition_spec=P(('x','y'),None,None,None))
     from common.collectives import gather_to_host
     np.testing.assert_array_equal(gather_to_host(got['Wc']),raw[[0,1,2,2]])
+    # Bounded native hyperslabs keep only the selected endpoint families.
+    def indices(family):
+        c,t=layout.carrier_extents[:2]
+        width=layout.packed_extent//layout.mesh_side
+        chunks=[]
+        for rank in range(layout.mesh_side):
+            lo=rank*width+(0 if family=='C' else c//layout.mesh_side)
+            count=(c if family=='C' else 3*t)//layout.mesh_side
+            chunks.extend(range(lo,lo+count))
+        return np.asarray(chunks)
+    for sector in (('C','C'),('C','T'),('T','C'),('T','T')):
+        with SlabIO(path,mode='r',mesh=mesh) as io:
+            got=store.read_shared_pole_bank(io,q_ids=[0,1,2,2],meta=meta,header=header,
+                sample_span=(0,ns),fields=('Wc',),partition_spec=P(('x','y')),sector=sector)
+        expected=raw[[0,1,2,2]][...,indices(sector[0]),:][...,indices(sector[1])]
+        np.testing.assert_array_equal(gather_to_host(got['Wc']),expected)
