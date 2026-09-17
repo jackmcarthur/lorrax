@@ -99,6 +99,37 @@ def check_fractional_vertex_stream_supercell(mesh, put):
             reference.append(np.einsum("mArnB,r->AmBn", coefficient, phase).reshape(8, 8))
         np.testing.assert_allclose(gather_to_host(value), reference, rtol=3e-11, atol=3e-11)
 
+    # Remote windows retain independent even/odd orientations with fractional
+    # occupations on BOTH sides. The vertex stays on the upper endpoint in
+    # the reverse occupation term; swapping it conjugates the wrong channel.
+    lower, upper = e < mu, e >= mu
+    refs = np.array([e[lower].max(), e[upper].min()])
+    tau = np.array([0.23, 0.71])
+    projections = np.zeros((8, 2), complex)
+    projections[:2] = np.eye(2)
+    projections[6:] = np.eye(2)
+    laplace = _get_chi_fractional_contour_kernel_face(mesh, (lat.n1, lat.n2, 1),
+        4, (lat.nk, 8, 8, 4), selected_q=tuple(range(lat.nk)),
+        pair_mode="laplace_ordered", vertex=True)
+    result = laplace(put(tau), put(projections), mun, nmu, put(e),
+        put(np.stack([f*lower, (1-f)*lower])),
+        put(np.stack([(1-f)*upper, f*upper])), put(refs))
+    reference = np.empty((lat.nk, 4, 8, 8), complex)
+    flat_f = f.reshape(-1)
+    forward = flat_f[:, None]*(1-flat_f[None, :])
+    backward = (1-flat_f[:, None])*flat_f[None, :]
+    pairs = lower.reshape(-1)[:, None] & upper.reshape(-1)[None, :]
+    for it, t in enumerate(tau):
+        for offset, weights, parity in ((0, forward-backward, 1), (2, forward+backward, -1)):
+            weights = weights*pairs*np.exp((delta+refs[1]-refs[0])*t)
+            c = np.einsum("ab,abmA,abrnB->mArnB", weights, rho[:, :, 0], rho.conj())
+            c = c + parity*c.conj()
+            for iq, q in enumerate(lat.kfrac):
+                phase = np.exp(2j*np.pi*(lat.cells @ q))
+                reference[iq, offset+it] = np.einsum("mArnB,r->AmBn", c, phase).reshape(8, 8)
+    np.testing.assert_allclose(np.asarray(gather_to_host(result))/np.sqrt(lat.nk),
+                               reference, rtol=3e-12, atol=3e-13)
+
 
 def test_fractional_vertex_stream_supercell(cpu_standins):
     mesh = Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
