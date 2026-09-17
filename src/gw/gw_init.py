@@ -2671,15 +2671,11 @@ def _compute_photon_vq(
                 )
     from file_io.restart_bundle import read_photon_charge
     V_q_raw = read_photon_charge(bispinor_h5_path, mesh_xy)
+    # Both views stay on the canonical file carrier, as on the scalar route:
+    # ``_finalize_vq_views`` is the one packing owner.
     G0_all = photon_g0_vectors[0]
     if not uses_coupled_photon_head(cfg):
         photon_g0_vectors = None
-    if int(V_q_raw.shape[-1]) < int(meta.n_rmu_padded):
-        pad = int(meta.n_rmu_padded) - int(V_q_raw.shape[-1])
-        V_q_raw = jnp.pad(V_q_raw, ((0, 0), (0, pad), (0, pad)))
-    if G0_all is not None and int(G0_all.shape[-1]) < int(meta.n_rmu_padded):
-        G0_all = jnp.pad(G0_all,
-                         ((0, 0), (0, int(meta.n_rmu_padded) - int(G0_all.shape[-1]))))
     head_channel = None
     if str(getattr(cfg.head, 'mc_average_placement', 'off')) != 'off':
         raise NotImplementedError(
