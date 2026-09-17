@@ -237,7 +237,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         placed.extend(ids[:real])
         budget.retained_panels=()
         ledger.live_stages=upstream
-        del sectors,cross,models,signed,retained
+        del sectors,cross,models,signed,retained,model
     if sorted(placed)!=list(range(header['n_q_irr'])):
         raise ValueError('GATE shared_pole_sector_rounds: each parent must be written once')
     handle=write_shared_pole_sector_manifest(root/'sectors.json',models=stores,bank=bank,
@@ -333,7 +333,13 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
                                mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,upstream=())
     budget.batch_width=len(geometry['ids'])
     budget.retained_panels=tuple(retained)
-    budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1])
+    # Four photon sample fields at every fit support and four moment fields
+    # are resident during selection. Derive the face count from these exact
+    # read dictionaries so admission prices the live panel set.
+    selection_faces=(sum(int(panel.shape[1]) for panel in samples.values())
+                     +len(moments))
+    budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1],
+                selection_faces=selection_faces)
     eig=budget.eigenplan(local_meta.n_rmu_padded)
     svd=budget.eigenplan(2*local_meta.n_rmu_padded)
     extent=lambda width:padded_axis(width,mesh_xy,name='shared_pole_port',
