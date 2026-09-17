@@ -372,7 +372,7 @@ weight is the Fermi-Dirac `-df/dE`.  On the Na Fermi-Dirac deck
 matches the retired scan with the FD diagonal to `3.5e-7` relative Frobenius
 at `minimax_target_error = 1e-6` (16 nodes); the retired tetrahedron table
 differs from the FD diagonal by `4.2e-3` at Γ, and dropping the diagonal
-altogether moves it by `3.6e-2` (claim CHI3GAMMA).  Gate for the remaining
+altogether moves it by `3.6e-2` (claim 2421).  Gate for the remaining
 scan: `tests/multi_device/fractional_chi_gate.py` checks nonzero-`z` rows for
 both occupation families and both carrier layouts against a dense
 ordered-pair oracle.
