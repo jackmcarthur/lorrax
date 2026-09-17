@@ -43,10 +43,11 @@ Twins (``--plant``), both must be red:
                  degenerate doublet
 Each twin refuses to run if its plant would change nothing.
 
-Refusals.  On a deck where time reversal is broken (``SymMaps.trs_allowed``
-is False, the WfnLoader verdict), these quantities contain physics and have
-no known-zero target.  The gate refuses there and measures nothing.  It also
-refuses spinor decks and a centroid set that is not orbit-closed.
+Refusals.  On a deck where time reversal is broken (``WfnLoader.trs_holds``
+is False, the only source of ``SymMaps.trs_allowed``, read before the tables
+are built), these quantities contain physics and have no known-zero target.
+The gate refuses there and measures nothing.  It also refuses spinor decks
+and a centroid set that is not orbit-closed.
 
 Exit codes: 0 PASS, 1 FAIL, 3 REFUSED.  Run on a compute node, one rank per
 GPU, square mesh (Si 4x4x4 scalar at P4 is the certified geometry)::
@@ -170,12 +171,16 @@ def main(argv=None):
 
     try:
         # ---- scope: time reversal, representation, orbit closure ---------
+        # The loader's measured verdict is the only source of
+        # SymMaps.trs_allowed, and it exists before the symmetry tables do:
+        # refuse on it first, so a deck whose tables cannot be built without
+        # time reversal still gets the physics refusal.
         wfn = WfnLoader(args.wfn, mesh=mesh)
-        sym = wfn.symmetry()
-        receipt["trs_allowed"] = bool(sym.trs_allowed)
+        receipt["trs_holds"] = wfn.trs_holds
         receipt["nspinor"] = int(wfn.nspinor)
-        if not sym.trs_allowed:
-            _refuse("time_reversal", "SymMaps.trs_allowed = False (WfnLoader.trs_holds)",
+        if wfn.trs_holds is not True:
+            _refuse("time_reversal",
+                    f"WfnLoader.trs_holds = {wfn.trs_holds} (the SymMaps.trs_allowed verdict)",
                     "a time-reversal-symmetric deck",
                     "with time reversal broken, |X_k^T - X_-k| and the TRIM-parent "
                     "|Im G_p| contain physics and have no known-zero target, so "
@@ -184,6 +189,8 @@ def main(argv=None):
             _refuse("representation", f"nspinor = {int(wfn.nspinor)}", "nspinor = 1",
                     "the known-zero relation X_k^T = X_-k is the scalar one; the "
                     "spinor form needs the Kramers operator and is not built here")
+        sym = wfn.symmetry()
+        receipt["trs_allowed"] = bool(sym.trs_allowed)
         centroids = load_centroid_basis(args.centroids, wfn.fft_grid, sym=sym)
         if not centroids.orbit_closed:
             _refuse("centroids", "a centroid set that is not orbit-closed",
