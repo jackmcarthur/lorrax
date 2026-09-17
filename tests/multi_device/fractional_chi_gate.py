@@ -58,8 +58,8 @@ def _dense(psi, enk, occ, time, weights, z):
     return out / np.sqrt(float(nk))
 
 
-def _direct(psi, enk, occ, surface, z):
-    """Tiny independent ordered-pair resolvent, including the static limit."""
+def _direct(psi, enk, occ, z):
+    """Tiny independent ordered-pair resolvent at nonzero z."""
     nk, nb, _, nmu = psi.shape
     out = np.zeros((len(z), nk, nmu, nmu), np.complex128)
     for q in range(nk):
@@ -71,11 +71,7 @@ def _direct(psi, enk, occ, surface, z):
                     fdiff = occ[k,a]-occ[kmq,b]
                     M = np.einsum("sm,sm->m",psi[k,a],np.conj(psi[kmq,b]))
                     for iz, point in enumerate(z):
-                        if point == 0 and abs(de) <= 64*np.finfo(float).eps*max(1.,abs(enk[k,a]),abs(enk[kmq,b])):
-                            weight = -0.5*(surface[k,a]+surface[kmq,b])
-                        else:
-                            weight = fdiff/(point+de)
-                        out[iz,q] += weight*np.outer(M,np.conj(M))
+                        out[iz,q] += fdiff/(point+de)*np.outer(M,np.conj(M))
     return out/np.sqrt(float(nk))
 
 
@@ -143,74 +139,28 @@ def main():
     if relative > 5.0e-12:
         raise AssertionError("fractional chi dense Kubo mismatch")
 
-    # --- W1: the finite-q static divided-difference row -------------------
+    # --- The MPA metal near-origin producer at literal nonzero z -----------
+    # Both occupation families and both carrier layouts against the oracle;
+    # z = 0 refuses by name (static chi0 is compute_chi0_matsubara at n = 0).
     from gw import efermi
     from gw.w_isdf import compute_chi0_direct_fractional
 
     mu, width = 0.15, 0.08
     occ_mp1 = np.asarray(jax.device_get(
         efermi.mp1_occupations(enk, mu, width)))
-    surface = np.asarray(jax.device_get(
-        efermi.mp1_negative_derivative(enk, mu, width)))
-    wfns_mp1 = Wavefunctions(
-        psi_mun=wfns.psi_mun,
-        psi_nmu=wfns.psi_nmu,
-        enk=wfns.enk,
-        occ=_put(occ_mp1, mesh, P(None, None)),
-        slices=slices,
-        layout="face",
-    )
-    state = SimpleNamespace(
-        f_kn=occ_mp1, mu_ry=mu, smearing_family="mp1",
-        smearing_width_ry=width)
-    kminq = np.stack([[(k - q) % nk for k in range(nk)] for q in range(nk)])
-    got_static = np.asarray(multihost_utils.process_allgather(
-        compute_chi0_direct_fractional(
-            wfns_mp1, np.asarray([0.0j]), SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
-            occupation_state=state, kminq_rows=kminq),
-        tiled=True))
-
-    want_static = _direct(psi,enk,occ_mp1,surface,np.asarray([0j]))[0]
-    err_s = float(np.max(np.abs(got_static - want_static)))
-    rel_s = err_s / max(float(np.max(np.abs(want_static))), 1.0e-300)
-
-    # W1.a-2 consistency: the exact-static value stored in the shifted
-    # origin slot differs from chi(i*varpi_1) by O((varpi_1/gap)^2) at
-    # finite q.  Resolvent oracle, finite-q row q=1.
-    varpi1 = 2.0e-5
-
-    def _resolvent(z, q):
-        return _direct(psi,enk,occ_mp1,surface,np.asarray([z]))[0,q]
-
-    shift_rel = (
-        np.max(np.abs(_resolvent(1j * varpi1, 1) - _resolvent(0.0, 1)))
-        / np.max(np.abs(_resolvent(0.0, 1))))
-    if rank == 0:
-        print(
-            "[fractional-chi] static finite-q max_rel={:.3e}; "
-            "origin-shift consistency (q=1) rel={:.3e}".format(
-                rel_s, shift_rel),
-            flush=True,
-        )
-    if rel_s > 5.0e-12:
-        raise AssertionError("finite-q static divided-difference mismatch")
-
-    # Family controls include q=0 exact degeneracies and literal nonzero z.
-    # The FD oracle uses cosh, independently of the sigmoid helper under test.
-    from gw.w_isdf import compute_chi0_direct_fractional
     occ_fd = 0.5*(1.0-np.tanh((enk-mu)/(2*width)))
-    surface_fd = 1.0/(4*width*np.cosh((enk-mu)/(2*width))**2)
-    direct_z = np.asarray([0j,0.32+0.18j,0.77+0.24j])
+    kminq = np.stack([[(k - q) % nk for k in range(nk)] for q in range(nk)])
+    direct_z = np.asarray([2.0e-5j,0.32+0.18j,0.77+0.24j])
     family_checks = {}
     face_wfns = Wavefunctions(
         psi_mun=_put(psi.transpose(0,2,3,1),mesh,PSI_MUN_SPEC),
         psi_nmu=_put(psi,mesh,PSI_NMU_SPEC),
         enk=wfns.enk,occ=wfns.occ,slices=slices,layout="face")
     meta_direct = SimpleNamespace(nk_tot=nk,n_rmu=nmu,nspinor=ns)
-    for family, occupations, derivative in (("mp1",occ_mp1,surface),("fd",occ_fd,surface_fd)):
+    for family, occupations in (("mp1",occ_mp1),("fd",occ_fd)):
         family_state = SimpleNamespace(f_kn=occupations,mu_ry=mu,
             smearing_family=family,smearing_width_ry=width)
-        expected = _direct(psi,enk,occupations,derivative,direct_z)
+        expected = _direct(psi,enk,occupations,direct_z)
         for layout, carrier in (("legacy",wfns),("face",face_wfns)):
             actual = np.asarray(multihost_utils.process_allgather(
                 compute_chi0_direct_fractional(carrier,direct_z,meta_direct,mesh,
@@ -219,18 +169,14 @@ def main():
                       /np.max(np.abs(expected[i]))) for i in range(len(direct_z))]
             assert max(errors) < 5e-12,(family,layout,errors)
             family_checks[family+"_"+layout] = errors
-    actual_derivative = np.asarray(efermi.fd_negative_derivative(enk,mu,width))
-    fd_error = float(np.max(np.abs(actual_derivative-surface_fd))/np.max(surface_fd))
-    at_mu = float(efermi.fd_negative_derivative(np.asarray(mu),mu,width))
-    assert fd_error < 5e-14 and abs(at_mu-1/(4*width)) < 1e-14
     try:
-        compute_chi0_direct_fractional(wfns,direct_z,meta_direct,mesh,
-            occupation_state=SimpleNamespace(smearing_family="unsupported"),kminq_rows=kminq)
+        compute_chi0_direct_fractional(wfns,np.asarray([0j]),meta_direct,mesh,
+            occupation_state=SimpleNamespace(f_kn=occ_fd,mu_ry=mu,
+                smearing_family="fd",smearing_width_ry=width),kminq_rows=kminq)
     except ValueError as exc:
-        assert "GATE static_fractional_needs_mp1" in str(exc)
-        assert "unsupported" in str(exc) and "'fd'" in str(exc)
+        assert "GATE direct_fractional_needs_nonzero_z" in str(exc)
     else:
-        raise AssertionError("unsupported occupation family accepted")
+        raise AssertionError("direct fractional chi0 accepted z = 0")
     if rank == 0:
         print("[fractional-chi families] "+json.dumps(family_checks),flush=True)
 

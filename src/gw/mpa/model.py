@@ -8,11 +8,15 @@ import os
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
+from ffi import _services
+
+_services.ensure_on_path()
+import minimax  # noqa: E402
 
 from file_io import restart_bundle as _bundle_reader
 from file_io import mpa_store
 from gw import quadrature_log
-from gw.mpa import evaluator, fit_driver, sample_plan
+from gw.mpa import fit_driver, sample_plan
 
 
 _CHI = "chi_qmunu_z"
@@ -774,7 +778,7 @@ def _evaluate_samples(
                     wfns, quad, meta, mesh_xy,
                     energy_reference=energy_reference)
             elif ordered and point["character"] == "imag":
-                rule = evaluator.damped_line_rule(
+                rule = minimax.damped_line_rule(
                     point["varpi"], omega_m,
                     rel_tol=config.minimax_config.target_error,
                     max_order=config.minimax_config.max_nodes)
@@ -837,7 +841,7 @@ def _evaluate_samples(
         else:
             # Far pure-imaginary point: the fractional contour is cheap at
             # O(1) Ry line heights (31 nodes at varpi=1, tol 1e-6).
-            rule = evaluator.damped_line_rule(
+            rule = minimax.damped_line_rule(
                 point["varpi"], delta_max + abs(point["omega"]),
                 rel_tol=config.minimax_config.target_error,
                 max_order=config.minimax_config.max_nodes)
@@ -857,7 +861,7 @@ def _evaluate_samples(
         bandwidth = (
             (delta_max if metal else omega_m)
             + float(np.max(np.abs(z.real))))
-        rule = evaluator.damped_line_rule(
+        rule = minimax.damped_line_rule(
             varpi_i, bandwidth,
             rel_tol=config.minimax_config.target_error,
             max_order=config.minimax_config.max_nodes)
@@ -924,8 +928,8 @@ def build_mpa_fit(
     difference the store records is the provenance stamp below.
     """
     # The former blanket metal gate (mpa_metal_evaluator_unavailable) is
-    # discharged: occupation-weighted chi (fractional contour + finite-q
-    # divided difference) and the weighted Sigma branches landed in Wave 1.
+    # discharged: occupation-weighted chi (fractional contour + the finite-q
+    # ordered-pair origin sample) and the weighted Sigma branches landed in Wave 1.
     # A metal plan still refuses without an OccupationState — here, before
     # any inode exists, and again at the _evaluate_samples seam — and that
     # refusal is now the only gate on the deck path: the driver-level

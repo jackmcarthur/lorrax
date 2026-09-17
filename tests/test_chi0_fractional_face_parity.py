@@ -1,6 +1,6 @@
 """Check finite-occupation response with nondivisible band windows and metallic tails.
 
-All three responses are compared with independent NumPy band-pair sums.
+Both responses are compared with independent NumPy band-pair sums.
 The native four-rank CLI exercises the vendor FFT omitted by CPU workers.
 """
 from __future__ import annotations
@@ -21,10 +21,7 @@ def _crand(rng, *shape):
 
 
 #: (ns, seed) — nb_full=24, n_rmu=4, kgrid=(2,2,1) (nk=4) held fixed across
-#: cases; both mesh-divisible for a 2x2 mesh.  ``nb_narrow=17`` (Gamma
-#: kernel's own energies-table width) is deliberately NOT a multiple of 2
-#: (the mesh) and NOT equal to nb_full=24 (the face carrier's own extent)
-#: — the case the caller-side zero-pad exists for.
+#: cases; both mesh-divisible for a 2x2 mesh.
 _CASES = (
     ("ns1", dict(ns=1, seed=11)),
     ("ns2", dict(ns=2, seed=12)),
@@ -33,13 +30,11 @@ _CASES_BY_NAME = {name: kwargs for name, kwargs in _CASES}
 
 _NB_FULL = 24
 _N_RMU = 4
-_NB_NARROW = 17
-_NB_LOGICAL_GAMMA = 17     # == e.shape[1] here: the Gamma kernel's full window
 _NB_LOGICAL_DIRECT = 19    # < nb_full=24: exercises the mask with no caller-pad
 
 
-def _direct_pairs(psi_x, psi_y, energies, occupations, surface, rows, z, nb):
-    """Evaluate the literal Kubo sum with its static coincident-energy limit."""
+def _direct_pairs(psi_x, psi_y, energies, occupations, rows, z, nb):
+    """Evaluate the literal Kubo sum at nonzero z."""
     import numpy as np
     out = np.zeros((len(z), len(rows), psi_x.shape[-1], psi_y.shape[-1]), complex)
     for q, row in enumerate(rows):
@@ -51,11 +46,7 @@ def _direct_pairs(psi_x, psi_y, energies, occupations, surface, rows, z, nb):
                     dx = np.einsum("sm,sm->m", psi_x[k, a], psi_x[kmq, b].conj())
                     dy = np.einsum("sn,sn->n", psi_y[k, a], psi_y[kmq, b].conj())
                     for iz, freq in enumerate(z):
-                        if freq == 0 and de == 0:
-                            weight = -0.5 * (surface[k, a] + surface[kmq, b])
-                        else:
-                            weight = df / (de + freq)
-                        out[iz, q] += weight * np.outer(dx, dy.conj())
+                        out[iz, q] += df / (de + freq) * np.outer(dx, dy.conj())
     return out / np.sqrt(len(energies))
 
 
@@ -96,11 +87,8 @@ def _worker(case_name: str) -> int:
     from gw.w_isdf import (
         compute_chi0_contour_fractional,
         compute_chi0_direct_fractional,
-        compute_chi0_static_fractional_gamma,
     )
-    from gw.efermi import (
-        OccupationState, mp1_negative_derivative, mp1_occupations,
-    )
+    from gw.efermi import OccupationState, mp1_occupations
 
     ns, seed = (_CASES_BY_NAME[case_name]["ns"],
                 _CASES_BY_NAME[case_name]["seed"])
@@ -128,9 +116,9 @@ def _worker(case_name: str) -> int:
     psi_rmu_Y = jnp.asarray(_crand(rng, nk, nb_full, ns, n_rmu))
     psi_rmuT_X = jnp.asarray(_crand(rng, nk, n_rmu, nb_full, ns))
 
-    # ---- energies: an injected EXACT degeneracy (bands 2,3 at k=0) so
-    # the diagonal_limit / surface_weight branch is genuinely exercised,
-    # not just the generic separated branch.  ALSO a deep semicore tail
+    # ---- energies: an injected EXACT degeneracy (bands 3,4 at k=0), whose
+    # equal-occupation pair must contribute exactly zero at nonzero z.
+    # ALSO a deep semicore tail
     # (bands 0-2) and a deep virtual tail (bands nb_full-3..nb_full-1),
     # far outside the near-EF window -- forces the derived f_slice/
     # u_slice to be genuinely NARROWER than [0, nb_full) on each side
@@ -151,7 +139,6 @@ def _worker(case_name: str) -> int:
     mu = float(np.median(enk))
     width = 0.15
     f_kn = mp1_occupations(enk_full, mu, width)
-    surface = mp1_negative_derivative(enk_full, mu, width)
 
     slices = BandSlices.from_band_edges(0, 0, nb_full // 2, nb_full, nb_full)
 
@@ -178,26 +165,15 @@ def _worker(case_name: str) -> int:
 
     out = {"case": case_name, "ns": ns}
 
-    # ---- Part B, Gamma: nb_narrow=17 < nb_full=24, non-mesh-divisible --
-    e_narrow = enk_full[:, :_NB_NARROW]
-    f_narrow = f_kn[:, :_NB_NARROW]
-    s_narrow = surface[:, :_NB_NARROW]
     psi_x = np.asarray(psi_rmuT_X).conj().transpose(0, 2, 3, 1)
     psi_y = np.asarray(psi_rmu_Y)
-    gamma_reference = _direct_pairs(
-        psi_x, psi_y, np.asarray(e_narrow), np.asarray(f_narrow),
-        np.asarray(s_narrow), [np.arange(nk)], [0.0], _NB_LOGICAL_GAMMA)[0]
-    gamma_face = jax.block_until_ready(compute_chi0_static_fractional_gamma(
-        wfns_face, e_narrow, f_narrow, s_narrow, meta, mesh,
-        nb_logical=_NB_LOGICAL_GAMMA))
-    out["gamma"] = _cmp(gamma_reference, gamma_face)
 
     # ---- Part B, finite-q/finite-z: z != 0, exercises the dynamic branch
     kminq_rows = np.stack([
         rng.permutation(nk).astype(np.int32) for _ in range(2)])
     z_direct = np.asarray([0.03 + 0.01j], dtype=np.complex128)
     direct_reference = _direct_pairs(
-        psi_x, psi_y, np.asarray(enk_full), np.asarray(f_kn), np.asarray(surface),
+        psi_x, psi_y, np.asarray(enk_full), np.asarray(f_kn),
         kminq_rows, z_direct, _NB_LOGICAL_DIRECT)[0]
     direct_face = jax.block_until_ready(compute_chi0_direct_fractional(
         wfns_face, z_direct, meta, mesh, occupation_state=occ_state,
@@ -268,7 +244,7 @@ def test_fractional_chi0_face_matches_legacy(name, kwargs):
     if "skip" in out:
         pytest.skip(f"fractional chi0 face-layout parity gate: {out['skip']}")
     skipped = []
-    for quantity in ("gamma", "direct", "contour"):
+    for quantity in ("direct", "contour"):
         result = out[quantity]
         if "skip" in result:
             skipped.append(f"{quantity}: {result['skip']}")
@@ -278,7 +254,7 @@ def test_fractional_chi0_face_matches_legacy(name, kwargs):
             f"{quantity} face vs legacy parity FAILED: max relative diff "
             f"{result['max_rel']:.3e} (case {name})")
     if skipped:
-        # gamma/direct (this port's own genuinely new mechanism) still
+        # direct (this port's own genuinely new mechanism) still
         # ran and were asserted above; only note the narrower scope.
         print("PARTIAL SCOPE (see stdout, not a pass/fail signal): "
               + "; ".join(skipped))
@@ -320,7 +296,7 @@ def _cli_main():
             p0(f"SKIP {name}: {rc['skip']}")
             continue
         case_fail = False
-        for quantity in ("gamma", "direct", "contour"):
+        for quantity in ("direct", "contour"):
             result = rc.get(quantity, {})
             if "skip" in result:
                 p0(f"SKIP {name}/{quantity}: {result['skip']}")

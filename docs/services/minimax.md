@@ -1,20 +1,35 @@
-# minimax — certified quadrature lookup
+# minimax — numerical quadrature service
 
 `services/minimax/` is an independently installable NumPy service. Consumers
 use `import minimax`; importing its submodules from LORRAX is a layering
-failure. Importing the package does not import JAX or SciPy. SciPy is loaded
-only by the offline/runtime solvers.
+failure. Importing the package does not import JAX or SciPy. Constructors
+load their numerical dependencies only when called.
+
+This is one **public namespace**, not one numerical algorithm: callers select
+the constructor matching their kernel, domain and error currency. The
+regularized screening rules, MPA causal rules, Sigma denominator boxes,
+shared-pole value/derivative rules and Matsubara response remain separate
+because their certificates answer different questions. The three analytic
+reciprocal constructors are eligible only for exact-match one-dimensional
+targets; none is currently a production dispatch route.
+`gw.mpa.evaluator` keeps import-compatible aliases for old callers and tests;
+production node selection calls `minimax` directly.
 
 ## Caller contract
 
 | Surface | Contract |
 |---|---|
 | `lookup(...)` | Searches shipped certified tables only and raises a named F1–F4 refusal on an invalid or uncovered request; it never solves. |
-| `serve(...)` | Calls `lookup` first, then either announces and performs an uncertified runtime solve or raises F5 when that escape hatch is disabled. |
+| `serve(...)` | Computes and announces a screening rule in process. It does not consult shipped tables. The result carries achieved error and provenance. |
 | `catalog()` / `nearest_certified(...)` | Enumerate certified coverage and suggest nearby covered requests without solving. |
 | `family_for_character(...)`, `TARGETS`, `FAMILIES` | Define the accepted target and family vocabulary as data. |
 | `Quadrature`, `Provenance` | Return nodes, weights, measured error, certification state, source, and artifact identity. |
 | `build_uniform_rule(box, eps)` | Builds and certifies one denominator-box rule for `1/d` on `[re_lo, re_hi] x [im_lo, im_hi]`. A production surface, not a lookup: it takes no clock and no pass count, and returns when its own boundary certificate is met, so the same box and tolerance give the same rule on any machine. `gw.sigma_box_plan` is the consumer. |
+| `response_bank_rule(...)` / `response_laplace_rule(...)` | Build the shared-pole W time rule and remote inverse-moment rows, with separate value and derivative contracts. `gw.response_bank` is the consumer. |
+| `matsubara_response_rule(...)` | Builds a finite-temperature KMS-paired imaginary-time rule. |
+| `augment_odd_laplace(...)` | Adds the odd GN-PPM resolvent channel on the existing even rule's time nodes, refusing a missed sampled gate. |
+| `damped_line_rule(...)` / `damped_rectangle_rule(...)` / `damped_rectangle_gauss_rule(...)` / `damped_rectangle_positive_rule(...)` | Build MPA's positive-time line and rectangle rules. The rectangle constructors retain their respective geometric and error contracts; GW passes scalar bounds and receives time nodes and weights. |
+| `positive_reciprocal(...)` / `odd_reciprocal(...)` / `damped_line_reciprocal(...)` | Experimental analytic constructions for three specific one-dimensional reciprocal domains; none is a general replacement for a production target with a different kernel or error currency. |
 | offline solver names | Lazily expose table-generation machinery; using them does not make the result a shipped certified rule. |
 
 There is no escape hatch and no shipped-table branch: `serve` computes every
@@ -24,13 +39,25 @@ Vallee Poussin alternation certificate. `LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE`
 retired with that branch on 2026-09-16 and is read nowhere; its row in the
 [environment-variable registry](../dev/env_vars.md) says so.
 
-## Two surfaces, not one
+## One service, distinct target contracts
 
-The catalog half answers `lookup`/`serve` from shipped tables and is what the
-rest of this page describes. The box-rule half (`build_uniform_rule`) solves a
-fresh problem every call and ships no tables: Σ's windows are deck-dependent,
-so there is nothing to tabulate. They share only the package door and the
-convention that a rule carries its own measured error.
+`lookup` remains available to inspect historical certified assets;
+production `serve` computes the screening rule in process. Sigma's
+deck-dependent denominator rectangles use `build_uniform_rule`, while the
+shared-pole W bank needs both response values and derivatives at its current
+complex frequencies. MPA's damped line and rectangle builders also live here;
+`gw.mpa.evaluator` retains only the exact scalar kernel and compatibility
+exports, and `gw.mpa.sigma_windows` calls the service directly. The three experimental reciprocal constructors cover
+one-dimensional domains only. Keeping these targets distinct prevents an
+apparently shorter API from applying a valid rule to the wrong function.
+
+The damped builders accept physical frequencies and damping heights in one
+energy unit and return positive times in the inverse unit. Their default
+relative tolerance is `DEFAULT_DAMPED_REL_TOL`; the line builder also exposes
+`DEFAULT_WAVELENGTHS_PER_PANEL`. The common Legendre interval nodes are cached
+inside the service, so repeated panel widths do not redo the polynomial
+eigensolve. The scalar MPA kernel remains in `gw.mpa.evaluator` as a physics
+oracle, not a node selector.
 
 ## Catalog and selection
 
@@ -43,19 +70,52 @@ is not treated as a silent cache miss.
 
 ## Boundary with LORRAX's odd imaginary-axis kernel
 
-The certified service tables and their bytes are unchanged by the magnetic
-GN-PPM odd-kernel path. `gw.minimax_screening` is the adapter: when
-`solve_laplace_minimax_imag_interval(..., with_odd_kernel=True)` cannot obtain
-the odd component from a certified complex rule, it keeps the served even
-nodes, greedily adds at most `ODD_KERNEL_MAX_EXTRA_NODES`, and fits
-`omega_p / (x**2 + omega_p**2)` to the same requested error. The adapter marks
-those extra weights in `LaplaceMinimaxQuadrature.alpha_odd`; it refuses if the
-fit misses the gate. This augmentation is a runtime LORRAX fit, not a new
-certified service table.
+The magnetic GN-PPM odd channel is determined by
+`minimax.augment_odd_laplace`: it retains the served even nodes and greedily
+adds at most 16 nodes to fit `omega_p / (x**2 + omega_p**2)` to the requested
+absolute error. Candidate exponential columns are built once and reused
+across weight-only Lawson fits. `gw.minimax_screening` only converts physical
+units and appends zero even weights on the added nodes; the service refuses
+if the odd gate is missed. The augmentation is a sampled runtime fit, not a
+new continuum-certified table.
 
 `gw.w_isdf.compute_chi0_imag_ordered` requires `alpha_odd` and consumes the
 even and odd weights on one node axis. The derivation and limiting identities
 are owned by the [non-Hermitian GN-PPM memo](../dev/notes/DERIVATION_gnppm_nonhermitian.md).
+
+## Experimental reciprocal constructors (not production dispatch)
+
+The lazy package door exposes `positive_reciprocal(R, tolerance)`,
+`odd_reciprocal(A, tolerance)`, and
+`damped_line_reciprocal(bandwidth_over_broadening, tolerance)`. All three use dimensionless
+**absolute** error and return an object with `times` and `evaluate(x)`.
+The positive rule has positive `strengths` in the stable shifted convention
+`sum strengths * exp(-(x-1)*times)`; the old unshifted coefficients are
+`strengths * exp(times)`. The odd rule has `weights` in
+`sum weights * sin(x*times)`. The line rule has complex `weights` in
+`sum weights * exp(i*u*times)` for `1/(u+i)` on
+`|u|<=bandwidth_over_broadening`; damping is already in the coefficients.
+To approximate physical `1/(x+i*height)` to absolute error `eps`, construct
+with `(span/height, height*eps)` and call `rule.rescaled(height)`.
+No driver is routed to these constructors yet.
+
+The positive constructor prescribes elliptic interpolation abscissae, solves
+their moments in elevated precision, and optionally applies two measured
+error-envelope corrections. Its reported extremum is a numerical audit, not
+an interval certificate. The sine rule's pole-aware interpolation provides an
+exact-arithmetic bound equal to its reported core plus correction bounds.
+The line rule is a conservative composite Gauss-Legendre quadrature of the
+causal positive-time integral: its tail is `exp(-height*T)/height` and its
+panel bound follows the standard Gaussian `2n`-derivative remainder summed
+over panels. It does **not** implement the discussion's proposed one-sided
+csc correction, whose complete certificate has not been derived. The
+comparison and its exact source pin are in the sandbox report
+`reports/analytic_quadrature_2026-09-16/report.md`.
+
+`import minimax` remains NumPy-only. Calling the positive or sine constructor
+loads optional SciPy, and positive construction also needs mpmath (the `solve`
+extra). These are exploratory rules, not catalog entries; the catalog's
+provenance and production selection promises remain unchanged.
 
 ## Verification
 

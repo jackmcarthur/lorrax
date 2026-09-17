@@ -919,13 +919,10 @@ def _interband_degenerate_weight(
     numerator (``f_diff -> -f'(E_mid) * dE`` as the two energies coalesce),
     ``f_diff / dE -> 0.5*(s_bra + s_ket)``, where ``s = -f'`` is the
     caller's own MP1 Fermi-surface weight (:func:`gw.efermi.
-    mp1_negative_derivative`) -- the SAME divided-difference-to-derivative
-    limit :func:`gw.w_isdf.compute_chi0_direct_fractional`'s
-    ``_fractional_pair_scan_face`` already takes for its own ``z=0`` diagonal
-    limit (``w_isdf.py`` ``diagonal_limit = -0.5*(sa+sb)``; the sign here
-    is ``+`` rather than ``-`` because this module's ``f_diff`` is built
-    ket-minus-bra where that scan's ``df`` is a-minus-b -- same physical
-    limit, opposite index convention).  The ``z``-dependence keeps its
+    mp1_negative_derivative`) -- the divided-difference-to-derivative limit
+    that the static chi0 body reaches through its Fermi-Dirac tau factors
+    (:func:`gw.w_isdf.compute_chi0_matsubara` at ``n = 0``).  The
+    ``z``-dependence keeps its
     finite-``z`` form throughout: only ``dE`` is taken to a limit, never
     ``z`` -- a resonance (``z`` near ``dE`` at a NON-degenerate pair) is a
     different singularity and is untouched by this branch.
@@ -2616,6 +2613,7 @@ def build_iteration_head_response(
     config,
     wfns_qp=None,
     eta_ry: float | None = None,
+    occupation_state=None,
 ) -> IterationHeadResponse:
     """Build current-basis direct head and, when requested, its wings.
 
@@ -2625,6 +2623,10 @@ def build_iteration_head_response(
     unused and may be None.  Everything downstream of the velocity —
     the per-iteration rotation into the QP basis, S(z), the Drude term, the
     ISDF wings, the static κ² — is the SAME code on both routes.
+
+    ``occupation_state`` is the map's solved state (``occupations_qp_kn`` is
+    its ``f_kn``); the static Γ body is ``gw.w_isdf.compute_chi0_matsubara``
+    at ``n = 0`` on it, which refuses any family but Fermi-Dirac.
     """
     v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
     if forward_links is not None:
@@ -2694,16 +2696,19 @@ def build_iteration_head_response(
             nspin=int(wfn.nspin),
             nspinor=normalization_nspinor,
         )
-        from gw.w_isdf import compute_chi0_static_fractional_gamma
-        static_chi_body_gamma = compute_chi0_static_fractional_gamma(
+        # chi0(q=0; i nu_0) from the one static producer: the finite-
+        # temperature Matsubara sweep, whose tau factors carry the Fermi-
+        # surface -df/dE.  Row 0 of the flat q grid is Gamma; the (1, mu, mu)
+        # slice is the override shape its consumers set.
+        from gw.w_isdf import compute_chi0_matsubara
+        static_chi_body_gamma = compute_chi0_matsubara(
             wfns_qp,
-            energies_qp_kn_ry,
-            occupations_qp_kn,
-            surface_weight_qp_kn,
             meta,
             mesh,
-            nb_logical=int(nb_logical),
-        )
+            occupation_state=occupation_state,
+            nu_indices=(0,),
+            rel_tol=float(config.minimax_config.target_error),
+        )[0:1]
     static_kappa2 = None
     if surface_weight_qp_kn is not None:
         capacity = 2.0 / (

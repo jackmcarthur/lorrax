@@ -116,9 +116,10 @@ for the real one, which is exactly what the deleted shim was.
   phase is one separate device vector; zero translations skip it. No dense
   full-k phase, G-vector, or FFT-index table exists on this path. The
   four-component lift derives child G on device from the same parent row.
-* **Late mesh binding is narrow.** `adopt_mesh` switches only a
-  multi-process, auto-picked, currently-eager loader; explicit requests
-  are never overridden.
+* **Late mesh binding is narrow.** `adopt_mesh` binds only an auto-picked,
+  currently-eager loader, at every P (a P=1 kmeans loader needs the mesh for
+  the one-k parent stream, as gwjax's does); explicit requests are never
+  overridden.
 * **The loader instance is open to attribute attachment.** `psp` attaches
   `grid_rho` at runtime; `__slots__`/strict `__setattr__` are forbidden
   forever (see Antipatterns).

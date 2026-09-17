@@ -40,7 +40,7 @@ dependencies = ["numpy"]
 # `minimax.solver` is imported lazily behind the R1 escape hatch, so this
 # extra is what a generator campaign installs and what a production lookup
 # does not.
-solve = ["scipy>=1.16.0"]
+solve = ["scipy>=1.16.0", "mpmath>=1.3"]
 test = ["pytest>=8.0.0", "numpy", "scipy>=1.16.0", "lxkit"]
 
 [tool.setuptools.packages.find]

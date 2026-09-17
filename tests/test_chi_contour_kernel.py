@@ -107,10 +107,10 @@ def test_static_insulator_matches_the_integer_limit_of_the_ordered_pair_ssot(
 
     Every valence/conduction gap is exactly one Ry, so the one-node
     ``tau=0, alpha=1`` quadrature is exact rather than an approximation.
-    The reference is the finite-occupation owner's literal ordered-pair
-    scan at integer occupations.  This cell therefore isolates the
-    transition-orientation completion from minimax error, Dyson, V, and
-    any time-reversal gauge assumption.
+    The reference is the literal ordered-pair divided difference at integer
+    occupations (a numpy sum sharing no code with the producer).  This cell
+    therefore isolates the transition-orientation completion from minimax
+    error, Dyson, V, and any time-reversal gauge assumption.
     """
     import common.fft_helpers as fft_helpers
     import distrib_la
@@ -146,19 +146,10 @@ def test_static_insulator_matches_the_integer_limit_of_the_ordered_pair_ssot(
     got = np.asarray(jax.device_get(
         w_isdf.compute_chi0(wfns, quad, meta, mesh)))
 
-    # Integer-occupation limit of the exact finite-q SSOT.  Same-side
-    # degenerate pairs have df=0 and an exactly-zero supplied surface limit.
-    pair_kernel = w_isdf._get_chi_fractional_q_kernel_face(
-        mesh, nb_full=nb, nb_logical=nb, pair_tile=nb, n_z=1)
-    surface = jnp.zeros_like(wfns.enk)
-    rows = []
-    for q in range(nk):
-        kmq = jnp.asarray([(k - q) % nk for k in range(nk)])
-        row = pair_kernel(
-            wfns.psi_mun, wfns.psi_nmu, kmq, wfns.enk, wfns.occ, surface,
-            jnp.zeros((1,), dtype=jnp.complex128))
-        rows.append(row[0])
-    ordered = np.asarray(jax.device_get(jnp.stack(rows)))
+    # Integer-occupation limit of the ordered-pair divided difference.
+    # Same-side degenerate pairs have df=0 and a zero diagonal limit.
+    kminq = np.stack([[(k - q) % nk for k in range(nk)] for q in range(nk)])
+    ordered = _dense_static_finite_q(psi, enk, occ, kminq)
 
     neg = np.asarray([(-q) % nk for q in range(nk)])
     got_recip = np.max(np.abs(got - np.conj(got[neg]))) / np.max(np.abs(got))
@@ -375,66 +366,15 @@ def test_fractional_contour_matches_kubo_on_oriented_three_point_grid(
     assert u_slice == slice(1, 4)
 
 
-def test_static_fractional_gamma_matches_divided_difference():
-    """The z=0 metal body includes ordered pairs and the FS diagonal."""
-    mesh = _mesh_xy()
-    psi, enk, slices, base = _toy(mesh)
-    occ = np.array([
-        [1.0, 0.83, 0.14, -0.01],
-        [1.0, 0.69, 0.22, 0.00],
-    ])
-    surface = np.array([
-        [0.01, 0.42, 0.31, -0.02],
-        [0.02, 0.37, 0.28, -0.01],
-    ])
-    wfns = Wavefunctions(
-        psi_mun=base.psi_mun,
-        psi_nmu=base.psi_nmu,
-        enk=base.enk,
-        occ=_put(occ, mesh, P(None, None)),
-        slices=slices,
-        layout="face",
-    )
-    got = w_isdf.compute_chi0_static_fractional_gamma(
-        wfns,
-        enk,
-        occ,
-        surface,
-        SimpleNamespace(nk_tot=enk.shape[0], n_rmu=psi.shape[-1]),
-        mesh,
-        nb_logical=enk.shape[1],
-    )
-    got = np.asarray(jax.device_get(got))[0]
-
-    want = np.zeros_like(got)
-    for k in range(enk.shape[0]):
-        for a in range(enk.shape[1]):
-            for b in range(enk.shape[1]):
-                divided = (
-                    -surface[k, a]
-                    if a == b
-                    else (occ[k, a] - occ[k, b])
-                    / (enk[k, a] - enk[k, b])
-                )
-                density = np.einsum(
-                    "sm,sm->m", psi[k, a], np.conj(psi[k, b]))
-                want += divided * np.outer(density, np.conj(density))
-    want /= np.sqrt(float(enk.shape[0]))
-    np.testing.assert_allclose(got, want, rtol=3e-13, atol=3e-13)
-
-
-def _mp1_tables(enk, mu, width):
-    """Consistent (f, -df/dE) tables from the production MP1 helpers."""
+def _mp1_occupations(enk, mu, width):
+    """Fractional occupations from the production MP1 helper."""
     from gw import efermi
 
-    f = np.asarray(jax.device_get(efermi.mp1_occupations(enk, mu, width)))
-    s = np.asarray(jax.device_get(
-        efermi.mp1_negative_derivative(enk, mu, width)))
-    return f, s
+    return np.asarray(jax.device_get(efermi.mp1_occupations(enk, mu, width)))
 
 
-def _dense_static_finite_q(psi, enk, occ, surface, kminq_rows):
-    """Divided-difference oracle: a at k, b at k-q, MP1 midpoint diagonal."""
+def _dense_static_finite_q(psi, enk, occ, kminq_rows):
+    """Integer-occupation divided-difference oracle: a at k, b at k-q, zero degenerate limit."""
     n_q = kminq_rows.shape[0]
     nk, nb = enk.shape
     nmu = psi.shape[-1]
@@ -449,7 +389,7 @@ def _dense_static_finite_q(psi, enk, occ, surface, kminq_rows):
                     if abs(de) > 64.0 * np.finfo(np.float64).eps * scale:
                         divided = (occ[k, a] - occ[kmq, b]) / de
                     else:
-                        divided = -0.5 * (surface[k, a] + surface[kmq, b])
+                        divided = 0.0
                     density = np.einsum(
                         "sm,sm->m", psi[k, a], np.conj(psi[kmq, b]))
                     out[j] += divided * np.outer(density, np.conj(density))
@@ -475,8 +415,8 @@ def _dense_dynamic_finite_q(psi, enk, occ, kminq_rows, z):
     return out / np.sqrt(float(nk))
 
 
-def test_static_fractional_finite_q_matches_divided_difference():
-    """The finite-q static kernel: b rides at k-q; Gamma row = Gamma kernel.
+def test_direct_fractional_finite_q_matches_the_ordered_pair_resolvent():
+    """The near-origin producer: b rides at k-q, literal nonzero z; z = 0 refuses.
 
     Scope: CPU emulated mesh, 3-point 1-D k grid.  The production wedge-row
     to kq_map-column alignment is asserted separately by the Gamma-identity
@@ -492,10 +432,10 @@ def test_static_fractional_finite_q_matches_divided_difference():
         [-1.3, -0.4, 0.20, 1.1],
         [-1.1, -0.2, 0.20, 1.4],
         [-1.4, -0.1, 0.70, 1.2],
-    ])  # E[0,2] == E[1,2]: a degenerate (k, k-q) pair at q=2 exercises
-    # the -df/dE midpoint limit at finite q.
+    ])  # E[0,2] == E[1,2]: a degenerate (k, k-q) pair at q=2 with equal
+    # occupations contributes exactly zero at nonzero z.
     mu, width = 0.15, 0.08
-    occ, surface = _mp1_tables(enk, mu, width)
+    occ = _mp1_occupations(enk, mu, width)
     slices = BandSlices.from_band_edges(0, 0, 2, nb, nb)
     wfns = Wavefunctions(
         psi_mun=_put(psi.transpose(0, 2, 3, 1), mesh, PSI_MUN_SPEC),
@@ -509,28 +449,11 @@ def test_static_fractional_finite_q_matches_divided_difference():
         f_kn=occ, mu_ry=mu, smearing_family="mp1", smearing_width_ry=width)
     kminq = np.stack([[(k - q) % nk for k in range(nk)] for q in range(nk)])
 
-    got = w_isdf.compute_chi0_direct_fractional(
-        wfns, np.asarray([0.0j]), SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
-        occupation_state=state, kminq_rows=kminq)
-    got = np.asarray(jax.device_get(got))
-    want = _dense_static_finite_q(psi, enk, occ, surface, kminq)
-    np.testing.assert_allclose(got, want, rtol=3e-13, atol=3e-13)
-
-    # The refactored Gamma kernel and the finite-q kernel with an identity
-    # map are the same computation (value-level parity of the shared body).
-    gamma = w_isdf.compute_chi0_static_fractional_gamma(
-        wfns, enk, occ, surface,
-        SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh, nb_logical=nb)
-    np.testing.assert_allclose(
-        np.asarray(jax.device_get(gamma))[0], got[0], rtol=1e-13, atol=1e-13)
-
-    with pytest.raises(ValueError, match="static_fractional_needs_mp1"):
+    with pytest.raises(ValueError, match="direct_fractional_needs_nonzero_z"):
         w_isdf.compute_chi0_direct_fractional(
-            wfns, np.asarray([0.0j]), SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
-            occupation_state=SimpleNamespace(
-                f_kn=occ, mu_ry=mu, smearing_family="fixed",
-                smearing_width_ry=0.0),
-            kminq_rows=kminq)
+            wfns, np.asarray([2.0e-5j, 0.0j]),
+            SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
+            occupation_state=state, kminq_rows=kminq)
 
     shifted_z = 2.0e-5j
     progress = []

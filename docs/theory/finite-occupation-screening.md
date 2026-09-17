@@ -5,8 +5,8 @@
 authoritative owner of everything this note used to state — the
 `f_a(1-f_b)` weight factorization and its cancellation analysis, the
 positive-time contour kernel and its `q`/`-q` orientation identity, the
-`build_G_tau(band_weight=)` seam, the exact static divided-difference
-kernels at `Gamma` and finite `q`, the support-derived rule bandwidths, the
+`build_G_tau(band_weight=)` seam, the static finite-temperature response at
+`Gamma` and finite `q`, the support-derived rule bandwidths, the
 staged separable rational-`f` target, and the relation of the finite-`q`
 body to the `q -> 0` heads — plus the metal frequency plan, the
 occupation-weighted `Sigma`, and the QSGW occupation state.

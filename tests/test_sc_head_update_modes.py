@@ -510,3 +510,65 @@ def test_the_map_entry_solves_its_own_occupations():
         f"state.occupation_state is read {len(reads)} times in "
         "gw_iteration_map; the entry-solve rule allows exactly the two "
         "reads of the mu-drift diagnostic (guard + subtraction)")
+
+
+# ---------------------------------------------------------------------------
+# 4. The static Gamma body comes from the one static chi0 producer
+# ---------------------------------------------------------------------------
+
+def _gamma_body_response(fx, state):
+    return build_iteration_head_response(
+        None, None, None,
+        jnp.asarray(fx.velocity), jnp.asarray(fx.U),
+        jnp.asarray(fx.energies), jnp.asarray(fx.occupations), fx.omegas,
+        surface_weight_qp_kn=jnp.asarray(fx.surface),
+        mesh=_mesh(), kgrid=_KGRID, bvec_cart=fx.bvec, nb_logical=fx.nb,
+        sigma_energies_ry=fx.energies, efermi_ry=0.21, wfn=fx.wfn,
+        meta=fx.meta, config=fx.config, wfns_qp=fx.wfns_qp, eta_ry=0.05,
+        occupation_state=state)
+
+
+def test_the_static_gamma_body_is_matsubara_chi0_at_n_zero(monkeypatch):
+    """A zero head frequency takes chi0(q=0; i nu_0) from compute_chi0_matsubara.
+
+    Row 0 of the flat q grid, on the map's own occupation state and the
+    deck's minimax tolerance, is the (1, mu, mu) override the static W and
+    MPA consumers set.  Control: without a zero frequency the producer is
+    never called.  An MP1 state reaches the real producer and refuses by name.
+    """
+    from gw import w_isdf
+
+    fx = _head_fixture(5150)
+    fx.config = SimpleNamespace(
+        head=SimpleNamespace(wcoul0_eta=0.0),
+        minimax_config=SimpleNamespace(target_error=3.0e-7))
+    state = SimpleNamespace(smearing_family="fd", f_kn=fx.occupations,
+                            mu_ry=0.21, smearing_width_ry=0.05)
+    stack = np.arange(4 * 4 * 4, dtype=np.complex128).reshape(4, 4, 4)
+    calls = []
+
+    def producer(wfns, meta, mesh, **kwargs):
+        calls.append((wfns, meta, kwargs))
+        return jnp.asarray(stack)
+
+    monkeypatch.setattr(qsgw_head, "static_head_wings_sharded",
+                        lambda *args, **kwargs: (None, None))
+
+    real = w_isdf.compute_chi0_matsubara
+    monkeypatch.setattr(w_isdf, "compute_chi0_matsubara", producer)
+    control = _gamma_body_response(fx, state)
+    assert calls == [] and control.static_chi_body_gamma is None
+
+    fx.omegas = np.asarray([0.0 + 0.0j, 0.77 + 0.05j])
+    got = _gamma_body_response(fx, state)
+    assert len(calls) == 1
+    wfns, meta, kwargs = calls[0]
+    assert wfns is fx.wfns_qp and meta is fx.meta
+    assert kwargs == dict(occupation_state=state, nu_indices=(0,), rel_tol=3.0e-7)
+    np.testing.assert_array_equal(np.asarray(got.static_chi_body_gamma), stack[0:1])
+
+    monkeypatch.setattr(w_isdf, "compute_chi0_matsubara", real)
+    mp1 = SimpleNamespace(smearing_family="mp1", f_kn=fx.occupations,
+                          mu_ry=0.21, smearing_width_ry=0.05)
+    with pytest.raises(ValueError, match="chi0_matsubara_needs_fermi_dirac"):
+        _gamma_body_response(fx, mp1)

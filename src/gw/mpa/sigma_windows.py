@@ -24,7 +24,7 @@ import minimax
 
 from gw.efermi import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
                        band_in_occupation_window, occupation_weight_floor)
-from gw.mpa.evaluator import damped_rectangle_positive_rule
+from minimax import damped_rectangle_positive_rule
 from gw.minimax_screening import MinimaxNodes
 from gw.ppm_windows import _SigmaBranch, _SigmaWindow, _omega_clusters
 

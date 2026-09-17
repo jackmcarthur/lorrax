@@ -149,10 +149,10 @@ def _setup(real_hopping):
     band = e[:, 0]
     mu, kT = float(np.median(band)), float(np.ptp(band) / 3.0)
     f = 1.0 / (1.0 + np.exp((e - mu) / kT))
-    return lat, e, psi_sc, mu, f, f * (1 - f) / kT
+    return lat, e, psi_sc, mu, f
 
 
-def _pair_outputs(lat, e, psi_sc, f, surface, z, ordered):
+def _pair_outputs(lat, e, psi_sc, f, z, ordered):
     from gw import w_isdf
     mesh = Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
     put = lambda a: device_put_process_local(np.asarray(a), NamedSharding(mesh, P()))
@@ -166,7 +166,7 @@ def _pair_outputs(lat, e, psi_sc, f, surface, z, ordered):
         row = lat.kminq(iq)
         if ordered:
             row = np.argsort(row, kind="stable").astype(np.int32)
-        out[iq] = np.asarray(kern(psi_mun, psi_nmu, put(row), put(e), put(f), put(surface), put(z)))
+        out[iq] = np.asarray(kern(psi_mun, psi_nmu, put(row), put(e), put(f), put(z)))
     return out
 
 
@@ -190,10 +190,10 @@ TIMES = np.asarray([0.37, 1.13, 2.9])
 
 @pytest.mark.parametrize("real_hopping", [False, True], ids=["tr_broken", "trs_control"])
 def test_pair_kernel_orientation(cpu_standins, real_hopping):
-    lat, e, psi_sc, mu, f, surface = _setup(real_hopping)
+    lat, e, psi_sc, mu, f = _setup(real_hopping)
     cands = _candidates(lat, [_kubo(psi_sc, e, f, z) for z in Z])
-    incumbent = _pair_outputs(lat, e, psi_sc, f, surface, Z, ordered=False)
-    physical = _pair_outputs(lat, e, psi_sc, f, surface, Z, ordered=True)
+    incumbent = _pair_outputs(lat, e, psi_sc, f, Z, ordered=False)
+    physical = _pair_outputs(lat, e, psi_sc, f, Z, ordered=True)
     assert _resid(physical, cands["FT_q[chi]"]) < 1e-12
     assert _resid(incumbent, cands["FT_q[chi^T]"]) < 1e-12
     # ordered = incumbent row -q transposed (same products, summed in another order: roundoff).
@@ -207,7 +207,7 @@ def test_pair_kernel_orientation(cpu_standins, real_hopping):
 
 @pytest.mark.parametrize("real_hopping", [False, True], ids=["tr_broken", "trs_control"])
 def test_full_q_contour_orientation(cpu_standins, real_hopping):
-    lat, e, psi_sc, mu, f, _ = _setup(real_hopping)
+    lat, e, psi_sc, mu, f = _setup(real_hopping)
     N = psi_sc.shape[-1]
 
     def g_sc(weight, t):

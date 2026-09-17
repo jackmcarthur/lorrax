@@ -19,7 +19,7 @@ stays here is everything that knows about physics.  Concretely:
 * ``MinimaxNodes`` and the complex128 / ``time_axis`` convention stay,
   because they are a jax pytree in this package's sign convention and
   keeping them out of the service is what keeps the service jax-free;
-* the χ₀/Σ quadrature builders, ``_lawson_weights_fit``, ``resolve_minimax_energy_reference`` and the
+* the χ₀/Σ quadrature builders, ``resolve_minimax_energy_reference`` and the
   GN-PPM fit all stay.
 
 Every quadrature the service serves now carries a ``provenance`` string
@@ -1040,73 +1040,6 @@ def solve_laplace_minimax_interval(
 #: there is no refusal to read.  Every imaginary-axis rule is solved here.
 
 
-#: Ceiling on the nodes the odd-kernel augmentation may add to a served
-#: imaginary-axis rule.  Measured 2026-09-01 on MoS2-, CrI3- and Si-like
-#: (x_min, x_max, omega_p) triples: 5, 1 and 5 extras reach 1e-6 from the 7,
-#: 11 and 11 even nodes; a weights-only refit on the even nodes alone stalls
-#: at 1.8e-3 / 1.3e-5 / 5.7e-4.  Beyond this ceiling the rule refuses by
-#: name rather than ship an odd channel it cannot represent.
-ODD_KERNEL_MAX_EXTRA_NODES = 16
-
-
-def _augment_odd_kernel_nodes(tau, x_min, x_max, omega_p, *,
-                              gate_error: float,
-                              max_extra: int = ODD_KERNEL_MAX_EXTRA_NODES,
-                              n_grid: int = 4096, n_candidates: int = 48):
-    """Nodes and weights for ``omega_p/(x^2+omega_p^2)`` on ``[x_min, x_max]``.
-
-    The served even rule's nodes are kept as they are and the odd kernel is
-    represented on them PLUS the fewest extra nodes, drawn greedily from a
-    geometric candidate grid around the even nodes, that bring the measured
-    sup-norm error under ``gate_error`` -- weights-only Lawson fits and a
-    greedy node augmentation, because the even nodes do not resolve the odd
-    kernel on their own (weights-only refits on a static grid plateaued near
-    1e-4 for the even probe integrand, job 7885097).
-
-    Returns ``(tau_full, beta, k_extra, max_err)``; the first ``len(tau)``
-    entries of ``tau_full`` are the input nodes unchanged.  Raises when the
-    ceiling is hit: an odd channel represented to 1e-3 is not the physics
-    the caller asked for, and there is no even-rule fallback that is
-    correct here.
-    """
-    tau_s = np.asarray(tau, dtype=np.float64)
-    x = np.geomspace(float(x_min), float(x_max), int(n_grid))
-    wp = float(omega_p)
-    f_odd = wp / (x * x + wp * wp)
-    cand = np.geomspace(float(np.min(tau_s)) / 8.0,
-                        float(np.max(tau_s)) * 8.0, int(n_candidates))
-    cur = tau_s.copy()
-    beta, err = _lawson_weights_fit(cur, f_odd, x)
-    k = 0
-    while err > float(gate_error) and k < int(max_extra):
-        best = None
-        for c in cand:
-            if np.any(np.abs(np.log(c / cur)) < 1.0e-9):
-                continue
-            b_try, e_try = _lawson_weights_fit(np.append(cur, c), f_odd, x)
-            if best is None or e_try < best[1]:
-                best = (c, e_try, b_try)
-        if best is None:
-            break
-        cur = np.append(cur, best[0])
-        beta, err = best[2], best[1]
-        k += 1
-    if err > float(gate_error):
-        raise RuntimeError(
-            "GATE odd_kernel_representation: the odd probe kernel missed "
-            "the configured representation accuracy.\n"
-            f"  got:  sup_error = {err:.3e}, target = "
-            f"{float(gate_error):.3e}, extra_nodes = {k}, "
-            f"max_extra = {int(max_extra)}, interval = "
-            f"[{float(x_min):.6g}, {float(x_max):.6g}] Ry, "
-            f"omega_p = {wp:.6g} Ry\n"
-            "  want: sup_error <= minimax_target_error\n"
-            "  why:  a less accurate odd rule would model broken-TR W at "
-            "lower accuracy than the served even rule\n"
-            "  doc:  docs/dev/notes/DERIVATION_gnppm_nonhermitian.md")
-    return cur, np.asarray(beta, dtype=np.float64), int(k), float(err)
-
-
 def solve_laplace_minimax_imag_interval(
     x_min: float,
     x_max: float,
@@ -1127,7 +1060,7 @@ def solve_laplace_minimax_imag_interval(
     ``-1/(x+i*omega_p)`` whose real part this rule has always fitted -- and
     returns it in ``alpha_odd`` on the same nodes: the certified complex
     table's ``Im alpha`` when one answers, otherwise the even nodes plus a
-    few greedily added ones (:func:`_augment_odd_kernel_nodes`), with the
+    few greedily added ones (by ``minimax.augment_odd_laplace``), with the
     even weights zero on the extras so the even accumulation is unchanged.
 
     ``target_error`` is the requested physical L-infinity absolute error.
@@ -1187,9 +1120,9 @@ def solve_laplace_minimax_imag_interval(
     if with_odd_kernel:
         tau = np.asarray(tau, dtype=np.float64)
         alpha = np.asarray(alpha, dtype=np.float64)
-        tau_full, beta, n_extra, err_odd = _augment_odd_kernel_nodes(
+        tau_full, beta, n_extra, err_odd = _mm.augment_odd_laplace(
             tau, x_min, x_max, omega_p,
-            gate_error=max(float(target_error), float(err_abs)))
+            tolerance=max(float(target_error), float(err_abs)))
         alpha = np.concatenate([alpha, np.zeros(n_extra)])
         tau = tau_full
         alpha_odd = beta
@@ -1406,33 +1339,6 @@ def build_imag_quadrature(quad, omega_p, minimax_config, *, print_fn=None,
                 f"err~{quad_imag.max_error_odd:.1e} (gate "
                 f"{max(float(minimax_config.target_error), float(quad_imag.max_error)):.1e})")
     return quad_imag
-
-
-def _lawson_weights_fit(tau, f_x, x, n_iter: int = 60):
-    """Weights-only sup-norm fit of ``f(x) ≈ Σ α_l exp(-τ_l x)``.
-
-    Lawson's algorithm (iteratively reweighted least squares whose weights
-    converge toward the L∞ solution) with column scaling for conditioning.
-    Returns ``(alpha, max_err)`` — the best iterate by measured sup error.
-    Host-side numpy/LAPACK, deterministic for identical inputs — the same
-    per-rank replication contract the minimax solvers themselves rely on.
-    """
-    E = np.exp(-np.outer(x, tau))                  # (n_grid, L)
-    s = np.linalg.norm(E, axis=0)
-    s[s == 0.0] = 1.0
-    Es = E / s
-    w = np.ones(x.shape[0])
-    best_a, best_e = None, np.inf
-    for _ in range(int(n_iter)):
-        sw = np.sqrt(w)
-        a, *_ = np.linalg.lstsq(Es * sw[:, None], f_x * sw, rcond=None)
-        r = Es @ a - f_x
-        err = float(np.max(np.abs(r)))
-        if err < best_e:
-            best_a, best_e = a / s, err
-        w *= np.abs(r) + 1.0e-30
-        w /= w.sum()
-    return np.asarray(best_a, dtype=np.float64), best_e
 
 
 def build_real_quadrature(quad, Omega, minimax_config, *, print_fn=None):

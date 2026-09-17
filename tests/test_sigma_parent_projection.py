@@ -280,19 +280,13 @@ def _worker() -> int:
             raise
         frac_contour = "skip: host FFT FFI backend unavailable"
 
-    # The two fractional PAIR SCANS (static Γ, direct q) need ψ itself at
-    # every k: on the parents-only bundle each band tile is unfolded from
-    # the packed parents inside the scan (symmetry_maps.
-    # unfold_wavefunction_local).  No FFT is involved, so this runs on CPU.
+    # The fractional PAIR SCAN (direct q) needs ψ itself at every k: on the
+    # parents-only bundle each band tile is unfolded from the packed parents
+    # inside the scan (symmetry_maps.unfold_wavefunction_local).  No FFT is
+    # involved, so this runs on CPU.
     from gw.efermi import OccupationState, mp1_negative_derivative
-    from gw.w_isdf import (
-        compute_chi0_direct_fractional, compute_chi0_static_fractional_gamma)
+    from gw.w_isdf import compute_chi0_direct_fractional
     surf = mp1_negative_derivative(enk_j, mu_f, 0.15)
-    g_full = np.asarray(jax.block_until_ready(compute_chi0_static_fractional_gamma(
-        wfns_full, enk_j, f_kn, surf, meta, mesh, nb_logical=nb - 1)))
-    g_par = np.asarray(jax.block_until_ready(compute_chi0_static_fractional_gamma(
-        wfns_par, enk_j, f_kn, surf, meta, mesh, nb_logical=nb - 1)))
-    frac_gamma = float(np.max(np.abs(g_par - g_full))) / float(np.max(np.abs(g_full)))
     kfrac_i = np.rint(kfrac * np.asarray(kgrid)).astype(int)
     kminq = np.asarray([[2 * ((kfrac_i[k, 0] - kfrac_i[q, 0]) % 2)
                          + ((kfrac_i[k, 1] - kfrac_i[q, 1]) % 2)
@@ -365,7 +359,6 @@ def _worker() -> int:
         "conj_rule_rel_on_unitary_rows": conj_rel_uni,
         "parents_only_bundle_names_full_k_shapes": parents_only_ok,
         "fractional_contour_parents_vs_full_rel": frac_contour,
-        "fractional_static_gamma_parents_vs_full_rel": frac_gamma,
         "fractional_direct_q_parents_vs_full_rel": frac_direct,
     }))
     return 0
@@ -416,7 +409,6 @@ def test_parent_sigma_route_matches_full_k_and_uses_the_transpose_rule():
     assert out["conj_rule_rel_on_unitary_rows"] < _TOL, out
     assert out["conj_rule_rel_on_tr_rows"] > 0.1, out
     assert out["parents_only_bundle_names_full_k_shapes"] is True, out
-    assert out["fractional_static_gamma_parents_vs_full_rel"] < 1.0e-10, out
     assert out["sc_rotation_parents_vs_full_rel"] < 1.0e-10, out
     assert out["fractional_direct_q_parents_vs_full_rel"] < 1.0e-10, out
     assert out["head_wings_parents_vs_full_rel"] < 1.0e-10, out

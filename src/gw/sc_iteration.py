@@ -3259,6 +3259,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # over the full Px*Py mesh and frequency-blocked in each ring.
             wfns_qp=wfns_qp,
             eta_ry=(0.0 if mpa_mode else None),
+            occupation_state=entry_occ_state,
         )
         velocity_kind = (
             "QSGW finite-link covariant velocity" if forward_links is not None
@@ -3376,7 +3377,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 
     # Under mpa_material_class = metal the finite-q body above went through
     # build_mpa_fit(occupation_state=...) — fractional contour lines and the
-    # divided-difference origin rows.  Insulating decks keep the historical
+    # ordered-pair shifted-origin rows.  Insulating decks keep the historical
     # valence/conduction cut (occupation_state=None).
 
     # Σ_xc dispatch — mode-orthogonal.  ``write_sigma_omega_h5=False``

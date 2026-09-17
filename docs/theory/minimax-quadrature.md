@@ -6,10 +6,11 @@ a positive causal crossing rule, and complex-sector rules instead; see
 [Multipole frequency integration](THEORY_mpa_implementation.md).
 
 The physics owner supplies an energy interval and a target function. The
-`minimax` service supplies immutable nodes, weights, achieved error,
-amplification, and provenance. Production lookup does not silently solve a
-new table; a missing certified asset refuses unless the explicit uncertified
-escape hatch is enabled.
+`minimax` service supplies nodes, weights, achieved error, amplification,
+and provenance. Production `serve` now computes screening rules in process;
+historical table lookup remains a separate inspection API. The other target
+contracts, including Sigma boxes and the shared-pole W bank, are listed in
+the [service API](../services/minimax.md#caller-contract).
 
 ## 1. Why reciprocal kernels are separated
 
@@ -92,8 +93,10 @@ served even nodes plus the fewest greedily added nodes (weights-only fits,
 the even weights zero on the extras, so the even accumulation is the served
 rule unchanged) and gated at the even rule's error; measured 2026-09-01 the
 even nodes alone stall at \(10^{-3}\)–\(10^{-5}\) and one to five extras
-reach \(10^{-6}\). Owner: `minimax_screening.solve_laplace_minimax_imag_interval(with_odd_kernel=True)`;
-physics in [`DERIVATION_gnppm_nonhermitian.md`](../dev/notes/DERIVATION_gnppm_nonhermitian.md).
+reach \(10^{-6}\).
+Numerical owner: `minimax.augment_odd_laplace`; physical adapter:
+`minimax_screening.solve_laplace_minimax_imag_interval(with_odd_kernel=True)`.
+Physics: [`DERIVATION_gnppm_nonhermitian.md`](../dev/notes/DERIVATION_gnppm_nonhermitian.md).
 This quadrature supplies the ordered probe only. The fit owner forms the
 Hermitian `B` and odd Hermitian `D`, and the Sigma owner selects `B+D` for
 empty/conduction branches and `B-D` for occupied/valence branches; the
