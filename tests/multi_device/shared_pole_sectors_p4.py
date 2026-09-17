@@ -192,11 +192,12 @@ def main():
     mesh=resolve_mesh()
     rows=run_checks(mesh)
     rows.extend(run_store_checks(mesh,args.output.parent))
-    assert len(rows)==17
-    result=dict(status='PASS',checks=rows,expected_checks=17,
+    rows.extend(run_sigma_checks(mesh))
+    assert len(rows)==18
+    result=dict(status='PASS',checks=rows,expected_checks=18,
                 job=os.environ.get('SLURM_JOB_ID'),step=os.environ.get('SLURM_STEP_ID'),
                 source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
-                scope='P4 sector algebra, factor consumer and bitwise storage; no complete Sigma or production deck')
+                scope='P4 sector algebra, bitwise storage and direct band-sum tau Sigma; no frequency integration or production deck')
     if jax.process_index()==0:
         args.output.write_text(json.dumps(result,indent=2)+'\n')
         print(json.dumps(result),flush=True)
@@ -224,22 +225,34 @@ def run_store_checks(mesh,root):
                                       workspace_bytes_per_rank=0)
     meta.shared_pole_capacity.live_stages=('fixture_live_bound',)
     canonical,_,poles,counts=fixture._model(meta)
+    from common.centroid_basis import PackedCentroidBasis
+    current_basis=PackedCentroidBasis.build(meta.mu_basis.canonical_indices[:4],
+                                           tables['sym'],meta.fft_grid,mesh)
+    from symmetry_maps import QirrTables,centroid_source_map_and_wrap
+    perm,wraps=centroid_source_map_and_wrap(current_basis.canonical_indices,
+        tables['sym'].sym_matrices,tables['sym'].translations,np.asarray(meta.fft_grid),extend_trs=True)
+    qt=tables['qirr']
+    current_tables=dict(tables,qirr=QirrTables(irr_idx_q=qt.irr_idx_q,sym_idx_q=qt.sym_idx_q,
+        q_irr_frac=qt.q_irr_frac,sym_perm=perm,L_table=wraps,n_sym_spatial=qt.n_sym_spatial))
     headers={}
     for sector in ('CC','TT','CT_C','CT_T'):
         components=3 if sector in ('TT','CT_T') else 1
-        factor=np.concatenate([canonical*(1+1j*i) for i in range(components)],axis=2)
-        packed=meta.mu_basis.pack_host(factor,axis=1)
+        basis=current_basis if components==3 else meta.mu_basis
+        factor=np.concatenate([canonical[:,:basis.n_logical]*(1+1j*i)
+                               for i in range(components)],axis=2)
+        packed=basis.pack_host(factor,axis=1)
         path=root/f'{sector}_{suffix}.h5'
         header=store.write_shared_pole_model(path,
             fixture._device(packed,mesh,P(None,'x',None,'y')),
             fixture._device(poles,mesh,P()),counts,q_span=(0,3),meta=meta,
-            tables=tables,recipe=recipe,receipts=dict(identity=identity),sector=sector,
-            ordered=sector.startswith('CT'))
+            tables=current_tables if components==3 else tables,recipe=recipe,
+            receipts=dict(identity=identity),sector=sector,
+            ordered=sector.startswith('CT'),basis=basis)
         headers[sector]=header
         store.validate_shared_pole_model(path,expected_identity=identity,mesh_xy=mesh,
                                         capacity=meta.shared_pole_capacity)
         with SlabIO(path,mode='r',mesh=mesh) as io:
-            x,y,p,k=store.read_shared_pole_faces(io,(0,3),meta=meta,header=header)
+            x,y,p,k=store.read_shared_pole_faces(io,(0,3),meta=meta,header=header,basis=basis)
             fixture._assert_local(x,packed)
             fixture._assert_local(y,packed)
             np.testing.assert_array_equal(np.asarray(p),poles)
@@ -248,14 +261,14 @@ def run_store_checks(mesh,root):
     with SlabIO(root/f'CT_C_{suffix}.h5',mode='r',mesh=mesh) as ci, \
             SlabIO(root/f'CT_T_{suffix}.h5',mode='r',mesh=mesh) as ti:
         x,y,p,k=store.read_shared_pole_cross_faces((ci,ti),(0,3),meta=meta,
-            headers=(headers['CT_C'],headers['CT_T']),bases=(meta.mu_basis,meta.mu_basis))
+            headers=(headers['CT_C'],headers['CT_T']),bases=(meta.mu_basis,current_basis))
         fixture._assert_local(x,meta.mu_basis.pack_host(canonical,axis=1))
         fixture._assert_local(y,packed)
         np.testing.assert_array_equal(np.asarray(p),poles)
         bad=dict(headers['CT_T'],K=[2,5,2])
         try:
             store.read_shared_pole_cross_faces((ci,ti),(0,3),meta=meta,
-                headers=(headers['CT_C'],bad),bases=(meta.mu_basis,meta.mu_basis))
+                headers=(headers['CT_C'],bad),bases=(meta.mu_basis,current_basis))
         except ValueError as error:
             assert 'disagree on K' in str(error)
         else:
@@ -277,6 +290,93 @@ def run_store_checks(mesh,root):
         raise AssertionError('scalar headless SC refusal changed')
     rows.append(dict(name='headless_bispinor_metal_scope',passed=True))
     return rows
+
+
+def run_sigma_checks(mesh):
+    """Nonzero-time sector Sigma versus a literal band/q sum, including FD weights.
+
+    This checks the actual FFT and band projection with distinct internal
+    bare and external vertex faces. It does not certify tau quadrature.
+    """
+    import sys
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import distrib_la
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from gw.mpa.sigma import synthesize_shared_pole_parents, shared_pole_hole_kernel
+    from gw.ppm_tau_kernel import get_shared_sigma_tau_kernel
+    from gw.wavefunction_bundle import BandSlices, parent_sigma_operands, sigma_face_kernel_kwargs
+    sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+    from multi_device.full_photon_head_sigma_gate import _bundle
+    # Four identity-group momenta and four ports, with one C and three T
+    # ports. Random spinors and unequal q factors break time reversal.
+    rng=np.random.default_rng(1471)
+    nk,nb,nmu,ns=4,4,4,4
+    bare=rng.normal(size=(nk,nb,ns,nmu))+1j*rng.normal(size=(nk,nb,ns,nmu))
+    bare*=.1
+    pauli=(np.array([[0,1],[1,0]]),np.array([[0,-1j],[1j,0]]),np.diag([1,-1]))
+    gamma=[np.eye(4)]+[np.block([[np.zeros((2,2)),a],[a,np.zeros((2,2))]]) for a in pauli]
+    external=np.stack([np.einsum('st,knt->kns',gamma[a],bare[:,:,:,a]) for a in range(4)],axis=-1)
+    energy=np.linspace(.1,1.2,nk*nb).reshape(nk,nb)
+    occ=1/(1+np.exp((energy-.6)/.2))
+    slices=BandSlices.from_band_edges(0,0,0,nb,nb)
+    wfns=_bundle(mesh,bare,energy,occ,slices)
+    proj=_bundle(mesh,external,energy,occ,slices)
+    xn,yr,_,_,_,_=parent_sigma_operands(wfns)
+    _,_,xr,yn,_,_=parent_sigma_operands(proj)
+    def put(a,spec=P()):
+        a=np.asarray(a)
+        return jax.make_array_from_callback(a.shape,NamedSharding(mesh,spec),lambda ix:a[ix])
+    sectors=[]
+    for sector,om in (('CC',np.array([.4,.9])),('TT',np.array([.6,1.1])),('CT',np.array([.7,1.3]))):
+        c=np.zeros((nk,nmu,2),complex);t=np.zeros_like(c)
+        if sector in ('CC','CT'):
+            c[:,:1]=rng.normal(size=(nk,1,2))+1j*rng.normal(size=(nk,1,2))
+        if sector in ('TT','CT'):
+            t[:,1:]=rng.normal(size=(nk,3,2))+1j*rng.normal(size=(nk,3,2))
+        pairs=[(c,c)] if sector=='CC' else [(t,t)] if sector=='TT' else [(c,t),(t,c)]
+        for left,right in pairs:
+            sectors.append((left,right,om))
+    gemm=distrib_la.gemm_plan(mesh,m=nmu,n=nmu,k=2,nq=nk,dtype=np.complex128)
+    faces=[(put(c[:,:,None],P(None,'x',None,'y')),put(t[:,:,None],P(None,'y',None,'x')),
+            put(np.broadcast_to(om**2,(nk,2))),put(np.tile([0,2],(nk,1)).astype(np.int32)))
+           for c,t,om in sectors]
+    synth=jax.jit(lambda x,y,p,i,time:synthesize_shared_pole_parents(x,y,p,i,jnp.array(0.),time,
+                                      mesh_xy=mesh,gemm=gemm)[0])
+    hole=shared_pole_hole_kernel(mesh)
+    minus=(-np.arange(nk))%nk
+    def build(space,_omega,_indices,_bounds,_phase,_ref,time,_count=None):
+        w=sum(synth(*f,time) for f in faces)
+        return hole(w,put(minus.astype(np.int32))) if space=='val' else w
+    kernel=get_shared_sigma_tau_kernel(mesh_xy=mesh,kgrid=(nk,1,1),brackets=None,
+                                      w_synthesis=build,**sigma_face_kernel_kwargs(wfns))
+    time=.35-.2j
+    errors={}
+    for space in ('cond','val'):
+        e=energy if space=='cond' else -energy
+        weight=1-occ if space=='cond' else occ
+        actual=kernel(xn,yr,xr,yn,put(e),put(weight),space,None,
+            put(np.zeros(1,np.int32)),put(np.zeros((1,6))),put(np.zeros(1,bool)),
+            put(0.),put(0.),put(time))
+        w=sum(np.einsum('qmp,p,qnp->qmn',c,np.exp(-1j*om*time)/(2*om),t.conj())
+              for c,t,om in sectors)
+        if space=='val': w=w[minus].swapaxes(-1,-2)
+        expected=np.zeros((nk,nb,nb),complex)
+        for k in range(nk):
+            for q in range(nk):
+                km=(k-q)%nk
+                # Explicit transition vertices, intermediate-band sum,
+                # and sector W contraction: no real-space FFT in oracle.
+                v=np.einsum('ism,lsm->ilm',external[k].conj(),bare[km])
+                u=np.einsum('lsn,jsn->ljn',bare[km].conj(),external[k])
+                expected[k]-=np.einsum('ilm,l,mn,ljn->ij',v,
+                    weight[km]*np.exp(-1j*e[km]*time),w[q],u)/nk
+        error=float(jnp.max(jnp.abs(actual-put(expected,P(None,'x','y')))))
+        assert error<1e-11,(space,error)
+        errors[space]=error
+    return [dict(name='sector_tau_sigma_direct_band_sum',absolute_errors=errors,
+                 fractional_occupations=True,complex_time=[time.real,time.imag])]
 
 
 if __name__=='__main__':
