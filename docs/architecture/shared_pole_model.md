@@ -262,6 +262,28 @@ metric-correction predicates, infinity norms and inverse-root residuals.
 The second metric fields use the `paired_metric_` prefix. Reporting these
 values changes neither the keep cuts nor acceptance.
 
+### Spatial mirror consistency on approximate input
+
+The ordered mirror construction in `shared_pole_directions.py` combines
+literal same-q samples with `conj(R_s W_partner(z))`. This substitution
+requires covariance of the **represented** interaction and response under
+the authenticated spatial action, in addition to particle-hole symmetry.
+An approximately covariant fitted interaction need not satisfy this identity
+exactly. A positive literal principal Gram block therefore does not certify
+the combined mirror block, and extending support coverage cannot repair an
+inconsistent input operator.
+
+The Fe photon CC continuation (sandbox claim2450, P4 jobs58484260.3–.21)
+localizes its finite negative Gram to this seam: same-state quadrature
+refinement preserves the defect, whereas bare V and solved charge ζ already
+have inversion/PH residuals. The common LR+RL normal equations contain a
+smaller input-projector covariance residual that the ill-conditioned fit
+amplifies. Native convolution agrees with the literal unfolded reference.
+This is a diagnosed representation limitation, not a physical instability
+verdict or a licensed symmetry/PSD projection. A same-state literal mirror
+response comparison remains the next causal counterfactual; no production
+mirror construction or acceptance threshold has been changed.
+
 Fast CPU tests (4 host devices where a mesh is needed):
 
 | test | pins |
