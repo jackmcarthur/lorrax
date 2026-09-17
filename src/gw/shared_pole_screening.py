@@ -110,7 +110,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         centroid_indices, run_dir, label, wfn,
                         wfn_fingerprint_binding, tensors_filename, occupation_state, print_fn,
                         head_resolver=None, mpa_plan=None, iteration_head_response=None,
-                        material_class=None):
+                        material_class=None, wfns_transverse=None,
+                        bispinor_v_q_path=None, mu_bases=None):
     """Build current W; only one-shot models may use ISDF restart membership.
 
     SC labels own separate map scratch. ``restart`` may restore the invariant

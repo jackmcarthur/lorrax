@@ -3171,6 +3171,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             iteration_head_response=iteration_head_response,
             occupation_state=metal_occ_state,
             material_class=inputs.material_class,
+            **(dict(wfns_transverse=wfns_transverse_qp,
+                    bispinor_v_q_path=inputs.bispinor_v_q_path,
+                    mu_bases=inputs.mu_bases)
+               if inputs.config.sigma.w_model == "shared_pole"
+               and wfns_transverse_qp is not None else {}),
             print_fn=inputs.print_fn)
 
     # Per-mode screening plan.  The q->0 head uses this exact frequency/role
