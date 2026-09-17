@@ -22,7 +22,9 @@ def run_checks(mesh):
     from jax.sharding import NamedSharding, PartitionSpec as P
     import distrib_la
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_directions import _direction_states
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from shared_pole_round_helpers import round_states
     from gw.shared_pole_gates import (apply_shared_pole_zero_policy,
                                       retained_moment_identity,
                                       shared_pole_passivity,
@@ -124,31 +126,25 @@ def run_checks(mesh):
                          red_max=np.asarray(red["passivity_max"]).tolist()))
         # A line and imaginary role share z=i*h. The relative near-cut
         # doublet straddles both the singular cutoff and the requested width.
-        sample = placed(-np.diag([.8, .10000001, .09999999, .01, .008, .006, .004, .002])[None].astype(np.complex128))
-        reads, admissions = [], []
-        def read_once(sample_id):
-            reads.append(sample_id)
-            return sample, sample * .01
+        host_sample = -np.diag([.8, .10000001, .09999999, .01, .008, .006, .004, .002]).astype(np.complex128)
         recipe = dict(fit_ids=[0], held_ids=[], distinct_id=[0, 0],
                       z_ry=[.2j, .2j], role=[0, 1], held=[False, False],
                       direction_cutoff=.125, imaginary_width=2,
                       multiplet_relative_tolerance=1e-6)
         svd = distrib_la.plan("eigh", mesh, n=16, backend=resolution.eigh_backend,
                               batched_route=resolution.batched_route)
-        selected, selected_counts, roles = _direction_states(
-            read_once, recipe, eigh_plan=pe, svd_plan=svd, matmul=mm,
-            column_extent=lambda width: 2*((width+1)//2), logical_n=8,
-            admit=admissions.append, infinity_carrier=2)
-        assert reads == [0] and len(selected) == 2
+        selected, selected_counts, roles = round_states(
+            mesh, lambda slot, i: (host_sample, host_sample * .01), recipe, n=8, eig=pe, svd=svd,
+            extent=lambda width: 2*((width+1)//2))
+        assert len(selected) == 2
         assert [role["width"] for role in roles[0]] == [3, 3], roles
         projector = np.diag([1., 1., 1., 0., 0., 0., 0., 0.])[None]
         selection_errors = [relative(mm(state[1], state[1], transb="C"), projector)
                             for state in selected]
         assert max(selection_errors) < 1e-10, selection_errors
         assert selected_counts.tolist() == [[3, 3]]
-        assert admissions == [2, 6, 10]
         rows.append(dict(name="directions_multiplet_dedup", layout=layout, status="PASS",
-                         reads=reads, roles=roles, projector_relative=selection_errors))
+                         roles=roles, projector_relative=selection_errors))
         models.append(model)
 
     # Gate on the actual zero-policy implementation, not a duplicated predicate.

@@ -287,9 +287,15 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
     is applied to repair an invalid input.
     """
     layout = _direction_input(W, eigh_plan)
-    r = operator.index(r)
-    if not 1 <= r <= W.shape[-1]:
-        raise ValueError("r must lie in [1,m]")
+    if isinstance(r, (tuple, list, np.ndarray)):
+        # One width per row of the flattened batch; 0 retains nothing for that row.
+        r = tuple(operator.index(v) for v in np.asarray(r).reshape(-1))
+        if W.ndim < 3 or len(r) != int(np.prod(W.shape[:-2])) or not all(0 <= v <= W.shape[-1] for v in r) or max(r) < 1:
+            raise ValueError("per-row r needs one width in [0,m] per row of the batch, at least one positive")
+    else:
+        r = operator.index(r)
+        if not 1 <= r <= W.shape[-1]:
+            raise ValueError("r must lie in [1,m]")
     if real_rows is not None and layout != 'batch':
         raise ValueError("real_rows applies to a batch-layout stack only")
     if W.ndim > 3:
@@ -320,8 +326,13 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
     values = np.asarray(s)[..., ::-1].copy()
     if not np.all(np.isfinite(values)):
         raise ValueError("leading_eigenvectors requires finite Hermitian W and a finite eigenvalue spectrum")
-    count = (_close_spectral_cut(values, r, multiplet_tol) if values.ndim == 1
-             else _real_row_counts(values, lambda row: _close_spectral_cut(row, r, multiplet_tol), real_rows))
+    if isinstance(r, tuple):
+        count = tuple(_close_spectral_cut(row, width, multiplet_tol)
+                      if width and (real_rows is None or i < real_rows) else 0
+                      for i, (row, width) in enumerate(zip(values, r)))
+    else:
+        count = (_close_spectral_cut(values, r, multiplet_tol) if values.ndim == 1
+                 else _real_row_counts(values, lambda row: _close_spectral_cut(row, r, multiplet_tol), real_rows))
     return _retained_columns(q, values, count, mesh=eigh_plan.mesh,
                              column_extent=column_extent, layout=layout)
 

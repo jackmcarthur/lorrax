@@ -6,6 +6,112 @@ the same Hermite/Ritz equations as the distributed constructor.
 """
 from functools import lru_cache
 
+# Batch layout: rank x*Py + y owns whole parents; every other axis is unsharded.
+BATCH = ('x', 'y')
+
+
+def parent_rounds(nq, ranks, partner=None):
+    """Rounds of ``ranks`` parent slots, one parent per rank, in canonical order.
+
+    Without ``partner`` a round is the next contiguous run of parents. With
+    ``partner`` (int [nq], an involution: the raw parent that carries each
+    parent's -q) a round is partner-closed: a parent enters with its partner,
+    so the mirror exchange of a round never leaves it. A short round repeats its
+    last real parent in the synthetic slots, which are never solved.
+
+    Returns ``[(ids, real, slots)]``: ``ids`` the ``ranks`` parent ids, ``real``
+    the number of leading real slots, ``slots[r]`` the slot of slot r's
+    partner (synthetic slots pair with themselves).
+    """
+    import numpy as np
+
+    if partner is None:
+        groups = [[q] for q in range(nq)]
+    else:
+        partner = [int(v) for v in partner]
+        if any(partner[partner[q]] != q for q in range(nq)):
+            raise ValueError("GATE minus_q_partner: got: a partner table that is not an involution; want: "
+                             "partner[partner[p]] == p; why: the round exchange pairs slots")
+        groups, seen = [], set()
+        for q in range(nq):
+            if q not in seen:
+                group = [q] if partner[q] == q else [q, partner[q]]
+                seen.update(group)
+                groups.append(group)
+    rounds, current = [], []
+    for group in groups:
+        if len(group) > ranks:
+            raise ValueError(f"GATE shared_pole_round: got: a partner pair on a mesh of {ranks} rank; "
+                             "want: at least two ranks for an ordered deck with -q != q; why: one parent per rank")
+        if len(current) + len(group) > ranks:
+            rounds.append(current)
+            current = []
+        current += group
+    if current:
+        rounds.append(current)
+    out = []
+    for ids in rounds:
+        real = len(ids)
+        slots = [ids.index(partner[q]) if partner is not None else r for r, q in enumerate(ids)]
+        ids = ids + [ids[-1]] * (ranks - real)
+        slots = slots + list(range(real, ranks))
+        out.append((ids, real, np.asarray(slots, np.int64)))
+    return out
+
+
+@lru_cache(maxsize=None)
+def batch_to_face(mesh_xy):
+    """[B, m, r] at P(('x','y'), None, None) -> the face P(None, 'x', 'y'): y then x all_to_all."""
+    import jax
+    from jax.sharding import PartitionSpec as P
+    from common.shard_map import shard_map
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+
+    def restore(a):
+        if py > 1:
+            a = jax.lax.all_to_all(a, 'y', split_axis=2, concat_axis=0, tiled=True)
+        if px > 1:
+            a = jax.lax.all_to_all(a, 'x', split_axis=1, concat_axis=0, tiled=True)
+        return a
+    return jax.jit(shard_map(restore, mesh=mesh_xy, in_specs=P(BATCH), out_specs=P(None, 'x', 'y'),
+                             check_vma=False))
+
+
+@lru_cache(maxsize=None)
+def face_rows(mesh_xy, rows):
+    """Select parent rows of a face stack [B, m_X, r_Y] on its replicated leading axis."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    index = tuple(int(r) for r in rows)
+    return jax.jit(lambda a: a[jnp.asarray(index)], out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
+
+
+def partner_realization(meta, header, ids, partner_parent, partner_row, *, mesh_xy):
+    """Per-slot packed action of each parent's -q partner row, in batch layout.
+
+    For slot r (parent ids[r], partner p', row s): ``alpha[r]`` the packed source
+    permutation of s, ``inverse[r]`` its inverse, ``phase[r]`` = exp(2 pi i
+    q(p') . L_s) on the packed rows, so R_s[W] = Phi Pi W Pi^T Phi^*. Host tables
+    only; each rank receives its own slot's rows.
+    """
+    import jax
+    import numpy as np
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from gw.qgrid_symmetry import shared_pole_packed_action
+
+    packed, wraps, _ = shared_pole_packed_action(meta, header, mesh_xy=mesh_xy)
+    q_frac = np.asarray(header["qirr"]["q_irr_frac"], dtype=np.float64)
+    rows = [int(partner_row[q]) for q in ids]
+    parents = [int(partner_parent[q]) for q in ids]
+    alpha = np.asarray([packed[s] for s in rows], np.int32)
+    inverse = np.argsort(alpha, axis=1).astype(np.int32)
+    phase = np.exp(2j * np.pi * np.einsum('ri,rmi->rm', q_frac[parents],
+                                          np.asarray([wraps[s] for s in rows], np.float64)))
+    batch = NamedSharding(mesh_xy, P(BATCH))
+    put = lambda a: jax.make_array_from_callback(a.shape, batch, lambda idx: a[idx])
+    return put(alpha), put(inverse), put(phase.astype(np.complex128))
+
 
 def pack_parent_panels(states, infinity, counts, infinity_counts, *, mesh_xy, parent_batch,
                        layout):

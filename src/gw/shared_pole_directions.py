@@ -82,157 +82,224 @@ def _stack_model_kernel(mesh):
                        NamedSharding(mesh, P()), NamedSharding(mesh, P())))
 
 
-def _odd_partner_directions(q, output, cutoff, *, eigh_plan, matmul, column_extent, multiplet_tol):
-    """Partner directions of O = W Q orthogonal to Q above the recipe direction cutoff.
+@lru_cache(maxsize=None)
+def _round_kernels(mesh):
+    """Rank-local programs on batch-layout round stacks [P, ...] (one parent per rank).
 
-    For a role whose conjugate node brings no new tangent under time reversal
-    (imaginary z, or a line role with Re z = 0), W Q lies in span(Q) on
-    time-reversal-symmetric data and the partner would only duplicate Q. The
-    component of O orthogonal to Q is rank-revealed against the largest
-    singular value of O with the same relative cutoff used for line directions;
-    on a magnet the surviving directions carry the odd channel. Only spectra
-    cross to the host. Returns (orthonormal directions [b,n,r], widths) or
-    (None, None) when nothing survives.
+    Every array argument carries its parent axis over ('x','y'); scalars are
+    replicated. No program moves a whole matrix between ranks; the mirror
+    exchange moves only [n, r] panels between partner ranks.
     """
-    hermitian_kernel = _hermitian_part_kernel(eigh_plan.mesh)
-    remainder = output - matmul(q, matmul(q, output, transa="C"))
-    top = np.asarray(eigh_plan.batched(hermitian_kernel(matmul(output, output, transb="C")))[0])[..., -1]
-    perp = hermitian_kernel(matmul(remainder, remainder, transb="C"))
-    values = np.asarray(eigh_plan.batched(perp)[0])[..., ::-1]
-    counts = [int(np.sum(row > float(cutoff) ** 2 * float(t)))
-              for row, t in zip(np.atleast_2d(values), np.atleast_1d(top))]
-    if max(counts) == 0:
-        return None, None
-    directions, kept = distrib_la.leading_eigenvectors(
-        perp, max(counts), eigh_plan=eigh_plan, column_extent=column_extent, multiplet_tol=multiplet_tol)
-    return directions, tuple(int(v.shape[-1]) for v in kept)
+    from types import SimpleNamespace
+    from common.shard_map import shard_map
+
+    batch, rep = P(('x', 'y')), P()
+    adjoint = lambda a: jnp.conj(jnp.swapaxes(a, -1, -2))
+
+    def program(fn, specs, out):
+        return jax.jit(shard_map(fn, mesh=mesh, in_specs=specs, out_specs=out, check_vma=False))
+
+    def sample(stack, j):
+        return jax.lax.dynamic_index_in_dim(stack, j, axis=1, keepdims=False)
+
+    @lru_cache(maxsize=None)
+    def take(indices):
+        return program(lambda w: jnp.take(w, jnp.asarray(indices), axis=1), (batch,), batch)
+
+    @lru_cache(maxsize=None)
+    def act(conjugate):
+        # Output and action of state x at sample j: W x, dW x (adjoints for a conjugate state).
+        def body(w, dw, j, x, scale):
+            a, d = sample(w, j), sample(dw, j)
+            if conjugate:
+                a, d = adjoint(a), adjoint(d)
+            return a @ x, (d @ x) * scale
+        return program(body, (batch, batch, rep, batch, rep), (batch, batch))
+
+    @lru_cache(maxsize=None)
+    def exchange(flags, perm):
+        """Mirror products with the partner rank's samples, R_s realized on the panels.
+
+        ``xs`` [P, k, n, r]: the states of one sample, ``flags[k]`` True for a
+        conjugate state. Slot r sends Pi^T Phi x to its partner, which returns
+        W^T y (original) or conj(W) y (conjugate) and the same for dW; slot r
+        applies Phi^* Pi: (R_s W)^T x and conj(R_s W) x, R_s W = Phi Pi W Pi^T Phi^*.
+        """
+        def body(w, dw, xs, alpha, inverse, phase, j, scales):
+            y = jnp.take_along_axis(phase[:, None, :, None] * xs, inverse[:, None, :, None], axis=-2)
+            y = jax.lax.ppermute(y, BATCH_AXES, perm)
+            a, d = sample(w, j), sample(dw, j)
+            outs = []
+            for k, conjugate in enumerate(flags):
+                op_a = jnp.conj(a) if conjugate else jnp.swapaxes(a, -1, -2)
+                op_d = jnp.conj(d) if conjugate else jnp.swapaxes(d, -1, -2)
+                outs += [op_a @ y[:, k], op_d @ y[:, k]]
+            back = jax.lax.ppermute(jnp.stack(outs, axis=1), BATCH_AXES, perm)
+            back = jnp.conj(phase)[:, None, :, None] * jnp.take_along_axis(back, alpha[:, None, :, None], axis=-2)
+            return tuple(back[:, i] * (scales[i // 2] if i % 2 else 1) for i in range(2 * len(flags)))
+        return program(body, (batch,) * 6 + (rep, rep), (batch,) * (2 * len(flags)))
+
+    def dedupe(q, o):
+        # O W-output of the direction set Q: the part of O outside span(Q), and O O^H for its scale.
+        rest = o - q @ (adjoint(q) @ o)
+        herm = lambda a: (a + adjoint(a)) / 2
+        return herm(o @ adjoint(o)), herm(rest @ adjoint(rest))
+
+    column = program(lambda q, e: jax.lax.dynamic_index_in_dim(q, e, axis=1, keepdims=False), (batch, rep), batch)
+    apply = program(lambda m, q: m @ q, (batch, batch), batch)
+    negative_hermitian = program(lambda a: -(a + adjoint(a)) / 2, (batch,), batch)
+    return SimpleNamespace(
+        take=take, column=column, negative_hermitian=negative_hermitian, exchange=exchange, act=act, apply=apply,
+        dedupe=program(dedupe, (batch, batch), (batch, batch)))
 
 
-def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
-                      column_extent, logical_n, admit, infinity_carrier, ordered=False,
-                      read_mirror=None):
-    """Select each q row independently from a bounded batch of fitted samples.
+BATCH_AXES = ('x', 'y')
 
-    ``read_sample(sample_id)`` returns W/dW [b,n,n] faces. Only spectra cross the host;
-    Output states keep their batch axis. Counts and role receipts are small
-    host metadata; the packer compacts each parent's original port carriers.
 
-    Ordered data pair every state X(z) on direction Q with its particle-hole
-    mirror X(-z) on the SAME Q, the layout ``reduce_ordered_shared_pole_pencil``
-    cuts in. The mirror needs W(-conj z) and dW/ds(-conj z): for purely
-    imaginary z it is the sample itself; otherwise ``read_mirror(id)``
-    (production: the conjugated sample of the parent of -q) or, when None, the
-    one fitted recipe id at -conj(z), which then selects no directions of its
-    own. Mirrors follow all original states in the same order.
+def select_round_states(samples, recipe, *, sample_lo, real, mesh_xy, eigh_plan, svd_plan,
+                        column_extent, logical_n, ordered=False, exchange=None):
+    """Directions, outputs and actions of one round of parents, batched per role (SP 3, SP 13).
+
+    ``samples`` holds ``Wc``/``dWc_ds`` [P, S, n, n] in batch layout (rank r owns
+    round slot r), sample ``sample_lo + j`` at index j; slots ``>= real`` are
+    synthetic. Line supports select right singular vectors (cutoff, per-support
+    cap), imaginary supports leading eigenvectors of -Herm W, each role in ONE
+    batched call over the round's [slot x sample] stack; only spectra cross the
+    host. States follow the per-sample order of the paired layout: per sample
+    the role state and, when its node is off the real s axis, the conjugate
+    state on O = W Q (ordered imaginary or Re z = 0 roles: the partner directions
+    of O orthogonal to Q, per-slot widths, 0 allowed); after all originals the
+    ordered mirrors X(-node) on the same directions. A mirror of a Re z = 0
+    sample uses its own sample; any other mirror uses the partner parent's
+    sample through ``exchange = (slots, alpha, inverse, phase)``
+    (``shared_pole_local.partner_realization``): W_q(-conj z) = conj(R_s[W_q(p')](z)).
+
+    Returns ``(states, counts, roles)``: panels [P, n, r] in batch layout, counts
+    int [P, A], and per-slot role records.
     """
-    hermitian_kernel = _hermitian_part_kernel(eigh_plan.mesh)
-    fit_roles = _fit_roles(recipe)
+    from gw.shared_pole_recipe import ROLE_CODES
+
+    k = _round_kernels(eigh_plan.mesh)
+    W, dW = samples["Wc"], samples["dWc_ds"]
+    ranks = int(W.shape[0])
+    names = {code: name for name, code in ROLE_CODES.items()}
     fit_ids = [int(i) for i in recipe["fit_ids"]]
-    mirror_source = {}
-    if ordered and read_mirror is None:
-        points = {i: _sample_point(recipe, i) for i in fit_ids}
-        for j in fit_ids:
-            # The first fitted id of a pair is the original; its -conj(z) partner is the mirror.
-            if points[j].real == 0 or j in mirror_source.values():
-                continue
-            matches = [k for k in fit_ids if points[k] == -points[j].conjugate()]
-            if len(matches) != 1:
-                raise ValueError(f"GATE shared_pole_orientation_pair: got: {len(matches)} fitted supports at -conj(z) for sample {j}; want: exactly one mirror sample or read_mirror; why: the ordered cut acts on paired particle-hole states")
-            mirror_source[j] = matches[0]
-    skip = set(mirror_source.values())
-    states, counts, roles, conjugates = [], [], [], []
-    mirrors, mirror_counts, mirror_roles = [], [], []
-    def largest_side():
-        return infinity_carrier + sum(st[1].shape[-1] for st in (*states, *mirrors))
-    for sample_id in fit_ids:
-        if sample_id in skip:
-            continue
-        admit(largest_side())
-        w, derivative = read_sample(int(sample_id))
-        if not roles:
-            roles = [[] for _ in range(w.shape[0])]
-            mirror_roles = [[] for _ in range(w.shape[0])]
+    entries = [(int(sample), names[int(role)] + f":{i}")
+               for i, (sample, role, held) in enumerate(zip(recipe["distinct_id"], recipe["role"], recipe["held"]))
+               if not held]
+    entries = [(sid, label) for sid in fit_ids for sample, label in entries if sample == sid]
+    kinds = {kind: [(sid, label) for sid, label in entries if label.split(":", 1)[0] == kind]
+             for kind in ("line", "imaginary")}
+    if len(kinds["line"]) + len(kinds["imaginary"]) != len(entries):
+        raise ValueError("GATE shared_pole_role: got: a fitted role other than line or imaginary; want: line or imaginary fitted role; why: unknown tangent semantics")
+    tol = recipe["multiplet_relative_tolerance"]
+    put = lambda value: jax.device_put(value, NamedSharding(mesh_xy, P()))
+    selected = {}
+    if kinds["line"]:
+        stack = k.take(tuple(sid - sample_lo for sid, _ in kinds["line"]))(W)
+        selected["line"] = distrib_la.right_singular_vectors(
+            stack, recipe["direction_cutoff"], eigh_plan=svd_plan, column_extent=column_extent,
+            multiplet_tol=tol, real_rows=real, max_rank=recipe.get("line_direction_cap"))
+        del stack
+    if kinds["imaginary"]:
+        stack = k.negative_hermitian(k.take(tuple(sid - sample_lo for sid, _ in kinds["imaginary"]))(W))
+        width = min(logical_n, max(1, int(recipe["imaginary_width"])))
+        selected["imaginary"] = distrib_la.leading_eigenvectors(
+            stack, width, eigh_plan=eigh_plan, column_extent=column_extent, multiplet_tol=tol, real_rows=real)
+        del stack
+
+    def widths_of(values):
+        return tuple(int(np.asarray(v).size) for v in values)
+
+    states, counts, flags, originals_of = [], [], [], []
+    roles = [[] for _ in range(ranks)]
+    mirror_roles = [[] for _ in range(ranks)]
+    mirrors, mirror_counts = [], []
+    for sid in fit_ids:
         first = len(states)
-        for role in fit_roles:
-            if role["held"] or int(role["sample_id"]) != int(sample_id):
-                continue
-            kind = role["role"].split(":", 1)[0]
-            if kind == "line":
-                q_batch, values = distrib_la.right_singular_vectors(
-                    w, recipe["direction_cutoff"], eigh_plan=svd_plan,
-                    column_extent=column_extent,
-                    multiplet_tol=recipe["multiplet_relative_tolerance"],
-                    max_rank=recipe.get("line_direction_cap"))
-            elif kind == "imaginary":
-                width = min(logical_n, max(1, int(recipe["imaginary_width"])))
-                q_batch, values = distrib_la.leading_eigenvectors(
-                    hermitian_kernel(-w), width, eigh_plan=eigh_plan,
-                    column_extent=column_extent,
-                    multiplet_tol=recipe["multiplet_relative_tolerance"])
-            else:
-                raise ValueError(f"GATE shared_pole_role: got: {kind}; want: line or imaginary fitted role; why: unknown tangent semantics")
-            widths = tuple(int(v.shape[-1]) for v in values)
-            if any(width < 1 or width > logical_n for width in widths):
-                raise ValueError(f"GATE shared_pole_directions: got: ranks {widths}; want: 1..{logical_n}; why: empty or padded physical direction set")
-            s = (_sample_point(recipe, int(sample_id)) if ordered
-                 else _sample_point(recipe, int(sample_id)) ** 2)
-            # W(s*)=W(s).H: its right singular space is the LEFT space
-            # of W(s). Use WQ=U sigma without another selection or transport.
-            # Column equilibration removes sigma; this also preserves the
-            # conjugate space when the underlying response is real symmetric.
-            # Ordered data: nodes are z; every role takes its conjugate partner
-            # (Wc(conj z) = Wc(z)^H holds without time reversal) and actions
-            # use dW/dz = 2 z dW/ds.
-            for conjugate in ((False, True) if (ordered or kind == "line") and s.imag != 0 else (False,)):
-                admit(largest_side() + q_batch.shape[-1])
-                transa = "C" if conjugate else "N"
-                state_widths = widths
-                if conjugate and ordered and (kind == "imaginary" or s.real == 0):
-                    # Dedupe before the cut: only partner directions orthogonal to Q survive.
-                    direction, state_widths = _odd_partner_directions(
-                        states[-1][1], states[-1][2], recipe["direction_cutoff"], eigh_plan=eigh_plan,
-                        matmul=matmul, column_extent=column_extent,
-                        multiplet_tol=recipe["multiplet_relative_tolerance"])
-                    if direction is None:
-                        continue
-                else:
-                    direction = states[-1][2] if conjugate else q_batch
-                output = matmul(w, direction, transa=transa)
-                action = matmul(derivative, direction, transa=transa)
-                if ordered:
-                    action = action * (2 * (s.conjugate() if conjugate else s))
-                states.append((s.conjugate() if conjugate else s, direction, output, action))
-                conjugates.append(conjugate)
-                counts.append(state_widths)
-                for i, width in enumerate(state_widths):
-                    roles[i].append({"sample_id": int(sample_id), "role": role["role"],
-                                     "conjugate": conjugate, "width": width,
-                                     "carrier_width": column_extent(width)})
-            del q_batch, direction, output, action
+        z = _sample_point(recipe, sid)
+        j = put(np.int32(sid - sample_lo))
+        for kind in ("line", "imaginary"):
+            for e, (esid, label) in enumerate(kinds[kind]):
+                if esid != sid:
+                    continue
+                q_all, values = selected[kind]
+                direction = k.column(q_all, put(np.int32(e)))
+                widths = widths_of(tuple(row[e] for row in values))
+                if any(w < 1 or w > logical_n for w in widths[:real]):
+                    raise ValueError(f"GATE shared_pole_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
+                s = z if ordered else z ** 2
+                for conjugate in ((False, True) if (ordered or kind == "line") and s.imag != 0 else (False,)):
+                    state_widths = widths
+                    if conjugate and ordered and (kind == "imaginary" or s.real == 0):
+                        direction, state_widths = _round_partner_directions(
+                            states[-1][1], states[-1][2], recipe["direction_cutoff"], real=real,
+                            kernels=k, eigh_plan=eigh_plan, column_extent=column_extent, tol=tol)
+                        if direction is None:
+                            continue
+                    elif conjugate:
+                        direction = states[-1][2]
+                    scale = put(np.complex128(2 * (s.conjugate() if conjugate else s) if ordered else 1.0))
+                    output, action = k.act(bool(conjugate))(W, dW, j, direction, scale)
+                    states.append((s.conjugate() if conjugate else s, direction, output, action))
+                    flags.append(conjugate)
+                    counts.append(state_widths)
+                    for r, width in enumerate(state_widths):
+                        roles[r].append({"sample_id": sid, "role": label, "conjugate": conjugate,
+                                         "width": int(width), "carrier_width": column_extent(int(width))})
         if ordered and len(states) > first:
-            if _sample_point(recipe, int(sample_id)).real == 0:
-                w_m, d_m = w, derivative
-            elif read_mirror is not None:
-                w_m, d_m = read_mirror(int(sample_id))
+            # W(-z) = W(-conj z)^H on Q; W(-conj z) on the partner's O. dW/dz at the
+            # mirror node is -2 node dW/ds(-conj z).
+            span = range(first, len(states))
+            if z.real == 0:
+                results = []
+                for index in span:
+                    node = states[index][0]
+                    results.append(k.act(not flags[index])(W, dW, j, states[index][1],
+                                                           put(np.complex128(-2 * node))))
             else:
-                w_m, d_m = read_sample(mirror_source[int(sample_id)])
-            # W(-z) = W(-conj z)^H on Q; W(-conj z) on the partner's O; in both
-            # cases dW/dz at the mirror node is -2 node dW/ds(-conj z) (adjoint on Q).
-            for index in range(first, len(states)):
-                node, direction = states[index][0], states[index][1]
-                admit(largest_side() + direction.shape[-1])
-                transa = "N" if conjugates[index] else "C"
-                mirrors.append((-node, direction, matmul(w_m, direction, transa=transa),
-                                matmul(d_m, direction, transa=transa) * (-2 * node)))
+                slots, alpha, inverse, phase = exchange
+                program = k.exchange(tuple(flags[index] for index in span),
+                                     tuple((int(r), int(slots[r])) for r in range(ranks)))
+                xs = jnp.stack([states[index][1] for index in span], axis=1)
+                flat = program(W, dW, xs, alpha, inverse, phase, j,
+                               put(np.asarray([-2 * states[index][0] for index in span], np.complex128)))
+                results = [(flat[2 * i], flat[2 * i + 1]) for i in range(len(span))]
+                del xs
+            for index, (output, action) in zip(span, results):
+                mirrors.append((-states[index][0], states[index][1], output, action))
                 mirror_counts.append(counts[index])
-                for i in range(len(roles)):
-                    mirror_roles[i].append(dict(roles[i][index], mirror=True))
-            del w_m, d_m
-        del w, derivative
+                for r in range(ranks):
+                    mirror_roles[r].append(dict(roles[r][index], mirror=True))
     if ordered:
         states, counts = states + mirrors, counts + mirror_counts
         roles = [row + mirror_row for row, mirror_row in zip(roles, mirror_roles)]
     return states, np.asarray(counts, dtype=np.int64).T, roles
+
+
+def _round_partner_directions(q, output, cutoff, *, real, kernels, eigh_plan, column_extent, tol):
+    """Partner directions of O = W Q orthogonal to Q above the direction cutoff, per slot.
+
+    For a role whose conjugate node brings no new tangent under time reversal
+    (imaginary z, or Re z = 0), O lies in span(Q) on time-reversal-symmetric data.
+    The component of O outside span(Q) is rank-revealed against the largest
+    singular value of O with the line cutoff; on a magnet the survivors carry the
+    odd channel. Each slot keeps its own count (0 allowed); only spectra cross the
+    host. Returns (directions [P, n, r], widths) or (None, None) when no slot has any.
+    """
+    top, perp = kernels.dedupe(q, output)
+    m = int(perp.shape[-1])
+    _, largest = distrib_la.leading_eigenvectors(top, 1, eigh_plan=eigh_plan, column_extent=column_extent,
+                                                 multiplet_tol=tol, real_rows=real)
+    _, spectrum = distrib_la.leading_eigenvectors(perp, m, eigh_plan=eigh_plan, column_extent=column_extent,
+                                                  multiplet_tol=tol, real_rows=real)
+    counts = tuple(int(np.sum(np.asarray(values) > float(cutoff) ** 2 * float(np.asarray(t)[0])))
+                   if i < real else 0 for i, (values, t) in enumerate(zip(spectrum, largest)))
+    if max(counts) == 0:
+        return None, None
+    directions, kept = distrib_la.leading_eigenvectors(perp, counts, eigh_plan=eigh_plan, column_extent=column_extent,
+                                                       multiplet_tol=tol, real_rows=real)
+    return directions, tuple(int(np.asarray(v).size) for v in kept)
 
 
 def _model_diagnostics(model, moments, infinity_directions, *, matmul):

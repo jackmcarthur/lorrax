@@ -240,18 +240,18 @@ def test_ordered_equals_even_construction_on_time_reversal_symmetric_data():
         assert rel(_signed_value(signed, -z), even) < 1e-12
 
 
-def test_direction_states_pair_a_harness_recipe_on_the_same_directions():
-    """A recipe that lists each -conj(z) line support as a fitted id (TRMODEL/TRINT
-    harnesses) builds mirrors on the originals' directions; the -conj(z) ids select
-    nothing of their own, an imaginary support mirrors on its own sample, and the
-    production pack/assemble/reduce path reproduces the TR-broken plant."""
+def test_round_selection_pairs_mirrors_on_the_same_directions():
+    """Round selection on a q = -q TR-broken plant (every slot its own partner, identity realization):
+    each mirror X(-node) sits on its original's directions, an imaginary support mirrors on its own
+    sample, the conjugate O panels are the next state's directions, and the production
+    pack/assemble/reduce path reproduces the plant."""
     import jax
     import jax.numpy as jnp
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from lxkit.testing import require_devices
     import distrib_la as D
     from runtime.padding import padded_axis
-    from gw.shared_pole_directions import _direction_states
+    from shared_pole_round_helpers import round_states
     from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil
     from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil
     from gw.shared_pole_local import pack_parent_panels
@@ -271,24 +271,18 @@ def test_direction_states_pair_a_harness_recipe_on_the_same_directions():
     ep = D.plan("eigh", mesh, n=n, backend="off", batched_route="batch_reshard")
     sp = D.plan("eigh", mesh, n=2 * n, backend="off", batched_route="batch_reshard")
     mm = lambda a, b, **kw: D.matmul(a, b, mesh=mesh, backend="off", batched_route="batch_reshard", **kw)
-    nodes = [.9 + .35j, 1.7 + .6j, .5j, -np.conj(.9 + .35j), -np.conj(1.7 + .6j)]
-    recipe = dict(fit_ids=[0, 1, 2, 3, 4], distinct_id=[0, 1, 2, 3, 4], role=[0, 0, 1, 0, 0], held=[False] * 5,
+    nodes = [.9 + .35j, 1.7 + .6j, .5j]
+    recipe = dict(fit_ids=[0, 1, 2], distinct_id=[0, 1, 2], role=[0, 0, 1], held=[False] * 3,
                   z_ry=[dict(real=v.real, imag=v.imag) for v in nodes], direction_cutoff=1e-3,
                   imaginary_width=4, multiplet_relative_tolerance=1e-6)
-    reads = []
-
-    def reader(i):
-        reads.append(i)
-        zz = nodes[i]
-        return put(plant.F(zz)), put(plant.dF(zz) / (2 * zz))
-
-    states, counts, roles = _direction_states(
-        reader, recipe, eigh_plan=ep, svd_plan=sp, matmul=mm, column_extent=extent, logical_n=n,
-        admit=lambda side: None, infinity_carrier=2, ordered=True)
+    states, counts, roles = round_states(
+        mesh, lambda slot, i: (plant.F(nodes[i]), plant.dF(nodes[i]) / (2 * nodes[i])), recipe,
+        n=n, eig=ep, svd=sp, extent=extent, ordered=True)
     half = len(states) // 2
-    assert len(states) == 12 and sorted(reads) == [0, 1, 2, 3, 4]
+    assert len(states) == 12
     for i in range(half):
         assert states[half + i][0] == -states[i][0] and states[half + i][1] is states[i][1]
+    assert states[1][1] is states[0][2] and states[3][1] is states[2][2]
     assert all(row.get("mirror") for row in roles[0][half:]) and not any(row.get("mirror") for row in roles[0][:half])
     qi = np.linalg.eigh(plant.moment(1))[1][:, -2:]
     infinity = tuple(put(a) for a in (qi, *(plant.moment(k) / 2 @ qi for k in range(4))))
@@ -306,7 +300,7 @@ def test_direction_states_pair_a_harness_recipe_on_the_same_directions():
 
 def test_dedupe_drops_duplicate_partners_and_equals_even_on_symmetric_data():
     """On a TRS plant the imaginary-role and Re z = 0 partners of W Q lie in span(Q); the dedupe drops them, and the
-    ordered model built through _direction_states, pack, assemble and reduce equals the even model at the production
+    ordered model built through the round selection, pack, assemble and reduce equals the even model at the production
     cut (the planted analogue of the MoS2 P3 gate)."""
     import jax
     import jax.numpy as jnp
@@ -314,7 +308,7 @@ def test_dedupe_drops_duplicate_partners_and_equals_even_on_symmetric_data():
     from lxkit.testing import require_devices
     import distrib_la as D
     from runtime.padding import padded_axis
-    from gw.shared_pole_directions import _direction_states
+    from shared_pole_round_helpers import round_states
     from gw.shared_pole_gates import apply_shared_pole_zero_policy
     from gw.shared_pole_pencil import (assemble_ordered_shared_pole_pencil,
                                        assemble_shared_pole_pencil)
@@ -338,25 +332,20 @@ def test_dedupe_drops_duplicate_partners_and_equals_even_on_symmetric_data():
     ep = D.plan("eigh", mesh, n=n, backend="off", batched_route="batch_reshard")
     sp = D.plan("eigh", mesh, n=2 * n, backend="off", batched_route="batch_reshard")
     mm = lambda a, b, **kw: D.matmul(a, b, mesh=mesh, backend="off", batched_route="batch_reshard", **kw)
-    nodes = [.9 + .35j, 1.7 + .6j, .5j, .35j, -np.conj(.9 + .35j), -np.conj(1.7 + .6j)]
-    roles = [0, 0, 1, 0, 0, 0]
+    nodes = [.9 + .35j, 1.7 + .6j, .5j, .35j]
+    roles = [0, 0, 1, 0]
 
     def recipe(ordered):
-        k = 6 if ordered else 4
-        return dict(fit_ids=list(range(k)), distinct_id=list(range(k)), role=roles[:k], held=[False] * k,
-                    z_ry=[dict(real=v.real, imag=v.imag) for v in nodes[:k]], direction_cutoff=1e-3,
+        return dict(fit_ids=list(range(4)), distinct_id=list(range(4)), role=roles, held=[False] * 4,
+                    z_ry=[dict(real=v.real, imag=v.imag) for v in nodes], direction_cutoff=1e-3,
                     imaginary_width=4, multiplet_relative_tolerance=1e-6)
-
-    def reader(i):
-        zz = nodes[i]
-        return put(plant.F(zz)), put(plant.dF(zz) / (2 * zz))
 
     qi = np.linalg.eigh(plant.moment(1))[1][:, -2:]
     models, ranks = {}, {}
     for label, ordered in (("even", False), ("ordered", True)):
-        states, counts, rows = _direction_states(
-            reader, recipe(ordered), eigh_plan=ep, svd_plan=sp, matmul=mm, column_extent=extent, logical_n=n,
-            admit=lambda side: None, infinity_carrier=2, ordered=ordered)
+        states, counts, rows = round_states(
+            mesh, lambda slot, i: (plant.F(nodes[i]), plant.dF(nodes[i]) / (2 * nodes[i])), recipe(ordered),
+            n=n, eig=ep, svd=sp, extent=extent, ordered=ordered)
         if ordered:
             assert len(states) == 12
             infinity = tuple(put(a) for a in (qi, *(plant.moment(k) / 2 @ qi for k in range(4))))

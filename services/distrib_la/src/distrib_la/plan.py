@@ -211,6 +211,15 @@ def ensure_sharding(x, sharding: NamedSharding):
     return device_put_process_local(x, sharding)
 
 
+def _is_batch_layout(A, mesh) -> bool:
+    """A rank-3 stack at P(('x','y'), None, None) on a mesh with more than one rank."""
+    if getattr(A, "ndim", 0) != 3 or int(mesh.shape["x"]) * int(mesh.shape["y"]) == 1:
+        return False
+    have = getattr(A, "sharding", None)
+    return have is not None and have.is_equivalent_to(
+        NamedSharding(mesh, P(("x", "y"), None, None)), 3)
+
+
 def _eigh_columns(backend: str, lam, Q):
     """Normalise an FFI eigh result to TRUE column eigenvectors.
 
@@ -567,6 +576,12 @@ class Plan:
         module exists to make once — the same reason there is no
         ``backend=`` on a call and only on :func:`plan`.
         """
+        if (self.op == "eigh" and _route is None and not isinstance(A, jax.core.Tracer)
+                and _is_batch_layout(A, self.mesh)):
+            # Whole matrices already live on their ranks: only the local kernel can
+            # serve them, whatever the plan's route (no movement, one at a time).
+            from distrib_la._batch_reshard import batch_layout_eigh_call
+            return batch_layout_eigh_call("eigh", self.mesh, A)
         route = self.route_for(A.shape, A.dtype) if _route is None else _route
         if route not in BATCHED_ROUTES:
             raise ValueError(

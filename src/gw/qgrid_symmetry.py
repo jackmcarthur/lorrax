@@ -146,7 +146,8 @@ def shared_pole_packed_action(meta, header, *, mesh_xy):
     source permutation ``qirr.sym_perm`` and umklapp wraps ``qirr.L_table``
     moved to the packed basis order, and ``symmetry_maps.certify_endpoint_locality``
     for the x and y face axes. One construction of these tables serves the
-    Sigma unfold and the constructor's partner realization.
+    Sigma unfold and the constructor's partner exchange
+    (``gw.shared_pole_local.partner_realization``).
     """
     from symmetry_maps import certify_endpoint_locality
 
@@ -159,55 +160,6 @@ def shared_pole_packed_action(meta, header, *, mesh_xy):
     wraps = basis.layout.axis.pack_host(
         np.asarray(qt["L_table"], dtype=np.int32), axis=1, fill_value=0)
     return packed, wraps, certificates
-
-
-def shared_pole_partner_realizer(meta, header, *, mesh_xy):
-    """Realize a raw parent's operator stack at a unitary image: ``R_s[W_q(p)]`` on the face.
-
-    The constructor's ordered mirror needs ``W_{-q(p)} = R_s[W_q(p')]`` when
-    ``-q`` of a parent is a star member (``symmetry_maps.minus_q_parent_partners``).
-    This is the Sigma unfold body (``symmetry_maps.unfold_operator_local``) on
-    face tiles ``[S, mu_X, nu_Y]``: the packed permutation of row ``s`` on both
-    endpoints and the umklapp phases at the parent's q. Raw latent operators,
-    no little-group projection (that stays at the consumer). Row-local maps
-    only: a nonlocal packed permutation refuses by name. Returns
-    ``realize(stack, row, parent)``; ``row`` must be unitary.
-    """
-    import jax
-    import jax.numpy as jnp
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    from common.shard_map import shard_map
-    from symmetry_maps import unfold_operator_local
-
-    _, wraps, certificates = shared_pole_packed_action(meta, header, mesh_xy=mesh_xy)
-    if not all(certificates[axis]["is_local"] for axis in ("x", "y")):
-        raise ValueError("GATE minus_q_partner: got: a packed operation that moves centroids across face tiles; "
-                         "want: tile-local packed permutations; why: the partner realization runs on each rank's tile")
-    qt, operations = header["qirr"], header["operations"]
-    nsp = int(qt["n_sym_spatial"])
-    q_frac = np.asarray(qt["q_irr_frac"], dtype=np.float64)
-    antiunitary = np.asarray(operations["antiunitary"], dtype=bool)
-    left, right = certificates["x"]["local_perm"], certificates["y"]["local_perm"]
-    face, replicated = P(None, "x", "y"), P()
-    kernels = {}
-
-    def realize(stack, row, parent):
-        row, parent = int(row), int(parent)
-        if antiunitary[row] or row >= nsp:
-            raise ValueError(f"GATE minus_q_partner: got: antiunitary row {row}; want: a unitary operation; "
-                             "why: the realization conjugates nothing")
-        rows = int(stack.shape[0])
-        if rows not in kernels:
-            irr = np.arange(rows, dtype=np.int32)
-            body = shard_map(lambda a, sym, q: unfold_operator_local(
-                a, irr_idx=irr, sym_idx=sym, q_irr_frac=q, left_local_perm=left, left_L_table=wraps,
-                right_local_perm=right, right_L_table=wraps, n_sym_spatial=nsp),
-                mesh=mesh_xy, in_specs=(face, replicated, replicated), out_specs=face, check_vma=False)
-            kernels[rows] = jax.jit(body)
-        put = lambda value: jax.device_put(value, NamedSharding(mesh_xy, replicated))
-        return kernels[rows](stack, put(np.full(rows, row, np.int32)),
-                             put(np.repeat(q_frac[parent][None], rows, axis=0)))
-    return realize
 
 
 def resolve_qgrid_symmetry_tables(

@@ -152,7 +152,7 @@ def assemble_ordered_shared_pole_pencil(states, infinity, *, matmul):
     """Assemble G=X^H s3 X, H=X^H M X and O=C X for time-reversal-broken data.
 
     ``states`` holds ``(z,Q,WQ,dW/dz Q)`` with complex z in Ry, not s=z**2,
-    in the paired layout of ``_direction_states(ordered=True)``: every state
+    in the paired layout of ``select_round_states(ordered=True)``: every state
     X(z) followed, after all originals, by its mirror X(-z) on the same
     directions. The resolvent-identity column of ``finite_pencil_column`` is
     exact for the linear pencil (z s3 - M) as written. ``infinity`` is None for

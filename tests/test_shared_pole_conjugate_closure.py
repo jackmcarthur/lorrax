@@ -10,7 +10,7 @@ def check(mesh):
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     import distrib_la as D
-    from gw.shared_pole_directions import _direction_states
+    from shared_pole_round_helpers import round_states
     from gw.shared_pole_gates import shared_pole_passivity, shared_pole_reciprocity
     from gw.shared_pole_pencil import assemble_shared_pole_pencil
     from gw.shared_pole_reduction import reduce_shared_pole_pencil
@@ -45,10 +45,8 @@ def check(mesh):
         recipe = dict(fit_ids=[0, 1], distinct_id=[0, 1], role=[0, 0],
                       held=[False, False], z_ry=np.sqrt(points), direction_cutoff=.8,
                       multiplet_relative_tolerance=1e-6)
-        states, counts, roles = _direction_states(
-            lambda i: tuple(put(a) for a in sample(points[i])), recipe,
-            eigh_plan=ep, svd_plan=sp, matmul=mm, column_extent=extent,
-            logical_n=8, admit=lambda side: None, infinity_carrier=2)
+        states, counts, roles = round_states(
+            mesh, lambda slot, i: sample(points[i]), recipe, n=8, eig=ep, svd=sp, extent=extent)
         assert states[1][1] is states[0][2] and states[3][1] is states[2][2]
         m1, m3 = c @ adj(c)/2, (c*poles) @ adj(c)/2
         qi = np.linalg.eigh(m1)[1][:, -2:]
@@ -122,7 +120,7 @@ def check(mesh):
                          minimum_pole=float(jnp.min(jnp.where(active,t,jnp.inf))),
                          gates={k:np.asarray(v).tolist() for k,v in green.items()}))
     return dict(status='PASS', rows=rows,
-                scope='P4 production selection/packing/local reduction; planted real and complex measures; former same-Q red twin')
+                scope='P4 production round selection/packing/local reduction; planted real and complex measures; former same-Q red twin')
 
 
 def test_conjugate_closure():
