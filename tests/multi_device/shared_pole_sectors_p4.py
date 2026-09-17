@@ -177,7 +177,8 @@ def run_checks(mesh):
     red_value=float(jnp.max(red['cauchy_schwarz_squared']))
     assert abs(good_value-.16)<1e-12 and abs(red_value-1.44)<1e-12
     rows.append(dict(name='cauchy_schwarz',value=good_value,red_value=red_value))
-    assert len(rows)==10
+    rows.extend(run_span_checks(mesh))
+    assert len(rows)==11
     return rows
 
 
@@ -193,8 +194,8 @@ def main():
     rows=run_checks(mesh)
     rows.extend(run_store_checks(mesh,args.output.parent))
     rows.extend(run_sigma_checks(mesh))
-    assert len(rows)==18
-    result=dict(status='PASS',checks=rows,expected_checks=18,
+    assert len(rows)==19
+    result=dict(status='PASS',checks=rows,expected_checks=19,
                 job=os.environ.get('SLURM_JOB_ID'),step=os.environ.get('SLURM_STEP_ID'),
                 source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
                 scope='P4 sector algebra, bitwise storage and direct band-sum tau Sigma; no frequency integration or production deck')
@@ -202,6 +203,76 @@ def main():
         args.output.write_text(json.dumps(result,indent=2)+'\n')
         print(json.dumps(result),flush=True)
     finalize_process()
+
+
+def run_span_checks(mesh):
+    """Original-pencil coefficient handoff and CT infinity blocks against latent states."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import distrib_la
+    from common.shard_map import shard_map
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from gw.shared_pole_local import _mm
+    from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    from gw.shared_pole_sectors import ordered_cross_pencil
+
+    spec=P(('x','y'))
+    layout=NamedSharding(mesh,spec)
+    adj=lambda a:a.conj().T
+    rng=np.random.default_rng(472)
+    signature=np.diag([1.,1.,-1.,-1.]).astype(complex)
+    m=np.diag([.6,1.4,.8,1.7]).astype(complex)
+    c=rng.normal(size=(2,4))+.3j*rng.normal(size=(2,4))
+    t=rng.normal(size=(3,4))+.3j*rng.normal(size=(3,4))
+    z=np.array([.7+.4j,1.2+.6j,-.7-.4j,-1.2-.6j])
+    def family(a):
+        q0=rng.normal(size=(len(a),2))+.2j*rng.normal(size=(len(a),2))
+        q=np.concatenate((q0,q0),axis=1)
+        qi=np.eye(len(a),dtype=complex)[:,:1]
+        x=np.column_stack([np.linalg.solve(v*signature-m,adj(a)@q[:,k]) for k,v in enumerate(z)])
+        k0=signature@adj(a)@qi
+        full=np.concatenate((x,k0,signature@m@k0),axis=1)
+        return q,qi,x,full
+    qc,ic,xc,fullc=family(c)
+    qt,it,xt,fullt=family(t)
+    moments=[]
+    power=signature@adj(t)
+    for _ in range(4):
+        moments.append(c@power/2)
+        power=signature@m@power
+    derivative=np.column_stack([-c@np.linalg.solve(v*signature-m,signature@xt[:,k]) for k,v in enumerate(z)])
+    def put(a):
+        a=np.broadcast_to(a,(mesh.size,)+np.shape(a)).copy()
+        return jax.make_array_from_callback(a.shape,layout,lambda ix:a[ix])
+    cross=jax.jit(shard_map(lambda cc,tt,actions,mom:ordered_cross_pencil(cc,tt,actions,mom,matmul=_mm),
+        mesh=mesh,in_specs=(spec,)*4,out_specs=spec,check_vma=False))
+    got=cross((put(z),put(qc),put(ic)),(put(z),put(qt),put(it)),
+              (put(t@xc),put(c@xt),put(derivative)),tuple(put(v) for v in moments))
+    expected=(adj(fullc)@signature@fullt,adj(fullc)@m@fullt,t@fullc,c@fullt)
+    cross_error=max(float(jnp.max(jnp.abs(a-put(b)))) for a,b in zip(got,expected))
+    assert cross_error<1e-11,cross_error
+    pencil=(put(adj(fullc)@signature@fullc),put(adj(fullc)@m@fullc),put(c@fullc),put(z))
+    native=distrib_la.plan('eigh',mesh,n=fullc.shape[-1],backend='off').native_fn
+    def reduce(p,a):
+        return reduce_ordered_shared_pole_pencil(p,a,eigh=native,matmul=_mm,gates=gates,retain_span=True)
+    run=jax.jit(shard_map(reduce,mesh=mesh,in_specs=(spec,spec),out_specs=spec,check_vma=False))
+    model,signed,diag,y=run(pencil,put(np.ones(fullc.shape[-1],bool)))
+    assert bool(jnp.all(diag['gram_valid'])) and bool(jnp.all(diag['retained_metric_positive']))
+    def check(p,y,s):
+        factor,mu,active=s
+        metric=_mm(y,_mm(p[1],y),transa='C')
+        value=_mm(y,_mm(p[0],y),transa='C')
+        eye=jnp.eye(y.shape[-1])[None]
+        return (jnp.max(jnp.abs(_mm(p[2],y)-factor*active[:,None,:]),axis=(-2,-1)),
+                jnp.max(jnp.abs(metric-eye*active[:,None,:]),axis=(-2,-1)),
+                jnp.max(jnp.abs(value-eye*(mu*active)[:,None,:]),axis=(-2,-1)))
+    check=jax.jit(shard_map(check,mesh=mesh,in_specs=(spec,)*3,out_specs=spec,check_vma=False))
+    errors=[float(jnp.max(v)) for v in check(pencil,y,signed)]
+    assert max(errors)<1e-10,errors
+    return [dict(name='ordered_retained_span_and_cross_infinity',cross_absolute_error=cross_error,
+                 output_metric_ritz_errors=errors)]
 
 
 def run_store_checks(mesh,root):
