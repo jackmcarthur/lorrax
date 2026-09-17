@@ -216,6 +216,10 @@ _UNIFORM_RULE_NAMES = (
 # every builder so a catalog-only import pays nothing.
 _LEVELLED_NAMES = ("noncrossing_levelled", "certify_noncrossing")
 
+# Experimental constructors remain lazy: catalog lookup stays NumPy-only.
+_ANALYTIC_NAMES = ("positive_reciprocal", "odd_reciprocal",
+                   "damped_line_reciprocal")
+
 
 _RESPONSE_RULE_NAMES = ("response_bank_rule", "response_laplace_rule")
 
@@ -248,6 +252,9 @@ def __getattr__(name: str):
     if name in _LEVELLED_NAMES:
         from minimax import levelled as _levelled  # noqa: PLC0415
         return getattr(_levelled, name)
+    if name in _ANALYTIC_NAMES:
+        from minimax import analytic as _analytic
+        return getattr(_analytic, name)
     raise AttributeError(f"module 'minimax' has no attribute {name!r}")
 
 
@@ -256,7 +263,7 @@ def __dir__():
                   | set(_FREQUENCY_FIT_NAMES)
                   | set(_UNIFORM_RULE_NAMES)
                   | set(_LEVELLED_NAMES) | set(_RESPONSE_RULE_NAMES)
-                  | set(_MATSUBARA_RULE_NAMES))
+                  | set(_MATSUBARA_RULE_NAMES) | set(_ANALYTIC_NAMES))
 
 
 __all__ = [
@@ -285,6 +292,8 @@ __all__ = [
     *_UNIFORM_RULE_NAMES,
     # --- levelled noncrossing rules (lazy; numpy) --------------------------
     *_LEVELLED_NAMES,
+    # --- exploratory reciprocal constructors (lazy; scipy/mpmath) ---------
+    *_ANALYTIC_NAMES,
     # --- the offline solvers (lazy; scipy) ---------------------------------
     *_SOLVER_NAMES,
     *_RESPONSE_RULE_NAMES,

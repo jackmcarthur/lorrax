@@ -57,6 +57,37 @@ certified service table.
 even and odd weights on one node axis. The derivation and limiting identities
 are owned by the [non-Hermitian GN-PPM memo](../dev/notes/DERIVATION_gnppm_nonhermitian.md).
 
+## Experimental reciprocal constructors (not production dispatch)
+
+The lazy package door exposes `positive_reciprocal(R, tolerance)`,
+`odd_reciprocal(A, tolerance)`, and
+`damped_line_reciprocal(span, height, tolerance)`. All three use dimensionless
+**absolute** error and return an object with `times` and `evaluate(x)`.
+The positive rule has positive `strengths` in the stable shifted convention
+`sum strengths * exp(-(x-1)*times)`; the old unshifted coefficients are
+`strengths * exp(times)`. The odd rule has `weights` in
+`sum weights * sin(x*times)`. The line rule has complex `weights` in
+`sum weights * exp(i*x*times)` for `1/(x+i*height)`; damping is already in
+the coefficients. No driver is routed to these constructors yet.
+
+The positive constructor prescribes elliptic interpolation abscissae, solves
+their moments in elevated precision, and optionally applies two measured
+error-envelope corrections. Its reported extremum is a numerical audit, not
+an interval certificate. The sine rule's pole-aware interpolation provides an
+exact-arithmetic bound equal to its reported core plus correction bounds.
+The line rule is a conservative composite Gauss-Legendre quadrature of the
+causal positive-time integral: its tail is `exp(-height*T)/height` and its
+panel bound follows the standard Gaussian `2n`-derivative remainder summed
+over panels. It does **not** implement the discussion's proposed one-sided
+csc correction, whose complete certificate has not been derived. The
+comparison and its exact source pin are in the sandbox report
+`reports/analytic_quadrature_2026-09-16/report.md`.
+
+`import minimax` remains NumPy-only. Calling the positive or sine constructor
+loads optional SciPy, and positive construction also needs mpmath (the `solve`
+extra). These are exploratory rules, not catalog entries; the catalog's
+provenance and production selection promises remain unchanged.
+
 ## Verification
 
 The standalone package tests live in `services/minimax/tests/`; the monorepo
