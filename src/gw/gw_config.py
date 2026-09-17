@@ -4416,6 +4416,19 @@ def validate_material_inputs(config, material_class):
     family = config.occ_smearing_family
     width_ry = config.occ_smearing_width_ry
     if material_class == "metal":
+        if config.compute_mode is ComputeMode.GN_PPM:
+            raise ValueError(
+                "GATE gn_ppm_refuses_metals: WFN occupations identify a "
+                "metal, and GN-PPM is not allowed for metals (owner ruling "
+                "2026-09-17).\n"
+                "  got:  compute_mode = gn_ppm on fractional WFN occupations\n"
+                "  want: compute_mode = mpa with sigma_w_model = shared_pole "
+                "(the production metal model; plain mpa stays as the "
+                "comparison)\n"
+                "  why:  GN-PPM stays for insulators only; its Sigma driver "
+                "splits bands by a 0/1 step at a derived Fermi level "
+                "(gw.ppm_sigma.assert_gapped_occupations_for_ppm)\n"
+                "  doc:  docs/input_reference.md, compute_mode")
         if config.compute_mode is not ComputeMode.MPA:
             raise ValueError(
                 "GATE fractional_occupations_require_mpa: WFN occupations "

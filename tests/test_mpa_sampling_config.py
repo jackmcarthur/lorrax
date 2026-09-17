@@ -307,7 +307,21 @@ def test_a_legal_metal_deck_parses_and_carries_the_pair(tmp_path):
     assert config.sigma.fermi_reference == "mp1_fixed_n"
 
 
-@pytest.mark.parametrize("mode", ("x_only", "cohsex", "gn_ppm", "hl_ppm"))
+def test_gn_ppm_refuses_a_metal_by_name_citing_the_owner_ruling(tmp_path):
+    config = _config(
+        tmp_path, _METAL_KEYS.replace("compute_mode = mpa", "compute_mode = gn_ppm"))
+    with pytest.raises(ValueError) as excinfo:
+        validate_material_inputs(config, "metal")
+    message = str(excinfo.value)
+    assert message.startswith("GATE gn_ppm_refuses_metals:")
+    assert "owner ruling 2026-09-17" in message
+    assert "sigma_w_model = shared_pole" in message
+    # The insulator route keeps GN-PPM.
+    insulator = _config(tmp_path, "compute_mode = gn_ppm\n")
+    validate_material_inputs(insulator, "insulator")
+
+
+@pytest.mark.parametrize("mode", ("x_only", "cohsex", "hl_ppm"))
 def test_a_metal_deck_refuses_every_mode_without_an_occupation_aware_head(
         tmp_path, mode):
     with pytest.raises(ValueError) as excinfo:
