@@ -51,14 +51,16 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
         config if hasattr(config, "get") else {"linalg": config.backend.linalg})
     route = resolution.batched_route
     backend = "off" if resolution.layout == "local" else "distributed"
+    ledger = getattr(meta, "shared_pole_capacity", None)
+    budget = None if photon or ledger is None else int(ledger.device_budget_bytes_per_rank)
     lu = plan("solve_lu", mesh_xy, backend=backend, n=n,
-              batched_route=route)
+              batched_route=route, budget_bytes=budget)
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
     pref = _w_solve_pref_scalar(meta)
 
     def mm(a, b):
         return matmul(a, b, mesh=mesh_xy, backend=backend,
-                      batched_route=route)
+                      batched_route=route, budget_bytes=budget)
 
     def congruence(h, a):
         return mm(mm(h, a), h)
@@ -114,6 +116,9 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
         "units": {"Wc": "Ry", "dWc_ds": "Ry^-1",
                   "M1": "Ry^3", "M3": "Ry^5"},
     }
+    if budget is not None:
+        algebra["dense_budget_bytes_per_rank"] = budget
+        algebra["route_policy"] = "distrib_la capacity decision on each actual batch"
     if ordered:
         algebra["moment_convention"] += "; odd M0 (1/z) and M2 (1/z^3), M_k = C_(k+1)/2"
         algebra["units"].update(M0="Ry^2", M2="Ry^4")
@@ -517,20 +522,27 @@ def _reserve(meta, stage, resident, workspace=0):
 
 
 @lru_cache(maxsize=32)
-def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
+def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh, budget_bytes=None):
     """Query the dense provider on actual bank shapes, before allocation."""
-    from distrib_la import plan, workspace_bytes_per_rank
+    from distrib_la import plan, workspace_bytes_per_rank, matmul_workspace_bytes_per_rank
     from .gw_config import linalg_resolution
     resolution = linalg_resolution({"linalg": layout})
-    policy = plan("eigh", mesh_xy, n=n,
+    policy = plan("eigh" if with_eigh else "solve_lu", mesh_xy, n=n,
         backend="off" if layout == "local" else "distributed",
-        batched_route=resolution.batched_route)
-    gemm = workspace_bytes_per_rank(policy,"gemm",((batch,n,n),(batch,n,n)),np.complex128)
-    eig = workspace_bytes_per_rank(policy,"eigh",((1,n,n),),np.complex128) if with_eigh else 0
-    return dict(gemm=gemm,eigh=eig,total=gemm+eig,scope="actual-shape ISERV query; GEMM persistent plus concurrent eigh scratch")
+        batched_route=resolution.batched_route, budget_bytes=budget_bytes)
+    shape = (batch, n, n)
+    selected = policy.route_for(shape, np.complex128,
+        **({"rhs_shape": shape} if not with_eigh else {}))
+    gemm = matmul_workspace_bytes_per_rank(mesh_xy, (shape, shape), np.complex128,
+        backend="off" if layout == "local" else "distributed",
+        batched_route=resolution.batched_route, budget_bytes=budget_bytes)
+    eig = workspace_bytes_per_rank(policy,"eigh",(shape,),np.complex128) if with_eigh else 0
+    return dict(gemm=gemm,eigh=eig,total=gemm+eig,solve_or_eigh_route=selected,
+        budget_bytes=budget_bytes,shape=shape,
+        scope="actual-shape service query; GEMM persistent plus concurrent eigh scratch")
 
 
-def _bank_execution(meta, mesh_xy, receipt, config):
+def _bank_execution(meta, mesh_xy, receipt, config, *, budget_bytes=None):
     """Compile and admit new dense work; stream outputs are reserved by batch."""
     def execute(kernel, args, stage):
         with timing.fenced_section('bank.compile.' + stage):
@@ -546,7 +558,9 @@ def _bank_execution(meta, mesh_xy, receipt, config):
             if not stream:
                 layout = config.get("linalg", "local") if hasattr(config,"get") else config.backend.linalg
                 native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
-                    with_eigh=stage=="coulomb_sqrt")
+                    with_eigh=stage=="coulomb_sqrt",
+                    budget_bytes=(int(meta.shared_pole_capacity.device_budget_bytes_per_rank)
+                                  if stage == "coulomb_sqrt" else budget_bytes))
                 receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))
                 _, row = _reserve(meta, stage, memory.argument_size_in_bytes,
                     memory.output_size_in_bytes + memory.temp_size_in_bytes + native["total"])
@@ -564,14 +578,14 @@ def _bank_execution(meta, mesh_xy, receipt, config):
 
 
 @lru_cache(maxsize=8)
-def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout):
+def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout, budget_bytes=None):
     """One cached service plan for H=V^(1/2) and its supported inverse."""
     from distrib_la import matmul, plan
     from .gw_config import linalg_resolution
     resolution = linalg_resolution({"linalg": layout})
     backend = "off" if resolution.layout == "local" else "distributed"
     eig = plan("eigh", mesh_xy, backend=backend, n=n_packed,
-               batched_route=resolution.batched_route)
+               batched_route=resolution.batched_route, budget_bytes=budget_bytes)
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
     rep = NamedSharding(mesh_xy, P())
 
@@ -583,10 +597,12 @@ def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout):
         supported = lam > tolerance * scale
         root = jnp.sqrt(jnp.where(supported, lam, 0.0))
         h = matmul(vectors * root[:, None, :], vectors, transb="C",
-                   mesh=mesh_xy, backend=backend, batched_route=resolution.batched_route)
+                   mesh=mesh_xy, backend=backend,
+                   batched_route=resolution.batched_route, budget_bytes=budget_bytes)
         inverse = jnp.where(supported, 1.0 / jnp.where(supported, root, 1.0), 0.0)
         hi = matmul(vectors * inverse[:, None, :], vectors, transb="C",
-                    mesh=mesh_xy, backend=backend, batched_route=resolution.batched_route)
+                    mesh=mesh_xy, backend=backend,
+                    batched_route=resolution.batched_route, budget_bytes=budget_bytes)
         return h, hi, jnp.any(lam < -tolerance * scale), jnp.sum(supported, axis=-1)
     return sqrt_v
 
@@ -620,7 +636,8 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
         v.block_until_ready()
     del canonical
     layout = config.get("linalg", "local") if hasattr(config, "get") else config.backend.linalg
-    kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout)
+    kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout,
+        int(meta.shared_pole_capacity.device_budget_bytes_per_rank))
     h, hi, negative, ranks = execute(kernel, (v,), "coulomb_sqrt")
     if bool(negative):
         raise ValueError("GATE response_coulomb_psd: resolved negative eigenvalue")
@@ -841,13 +858,16 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                         vertex=None, contact=None):
     """Stage B: six exact correlations, physical recurrence, scratch write."""
     from file_io.shared_pole_store import write_shared_pole_bank
+    from .shared_pole_local import face_rows
     header, qids, census = _bank_context(wfns, meta, sym, bank_io, mesh_xy)
     receipt = _receipt("moments", census, bank_io)
     if not bool(sym.trs_allowed):
         # M1/M3 are the 1/s and 1/s^2 coefficients; the odd channel starts at
         # 1/z^3, so the same six correlations stay exact on an ordered bank.
         receipt["ordered"] = True
-    execute = _bank_execution(meta, mesh_xy, receipt, config)
+    execute = _bank_execution(meta, mesh_xy, receipt, config,
+        budget_bytes=(int(meta.shared_pole_capacity.device_budget_bytes_per_rank)
+                      if vertex is None else None))
     ledger = meta.shared_pole_capacity
     ambient = ledger.live_stages
     started = time.monotonic()
@@ -859,7 +879,8 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
     ordered = vertex is not None or not bool(sym.trs_allowed)
     _, moments, receipt["algebra"] = response_algebra(meta, config,
         mesh_xy=mesh_xy, n=n, ordered=ordered, photon=vertex is not None)
-    per_q = 12 if ordered else 8
+    # Scalar panels retain one Coulomb root per parent.
+    per_q = (12 if ordered else 8) + int(vertex is None)
     qwidth = max(1,min(len(qids),int((.75*ledger.U_bytes_per_rank/face_bytes-16)/per_q)))
     for q0 in range(0,len(qids),qwidth):
         q1 = min(q0+qwidth,len(qids))
@@ -873,13 +894,21 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
             else:
                 a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
                                           q_ids=tuple(qids[q0:q1]), execute=execute)
+            if vertex is None:
+                roots, inverse, panel_ranks = _coulomb_batch(
+                    meta, config, bank_io, mesh_xy, (q0, q1), execute)
+                del inverse
             for iq in range(q0,q1):
                 marked = header["moment_written"][iq]
                 if all(marked):
                     continue
                 span = (iq,iq+1)
-                h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, span, execute)
-                del hi
+                if vertex is None:
+                    h = face_rows(mesh_xy, (iq-q0,))(roots)
+                    ranks = panel_ranks[iq-q0:iq-q0+1]
+                else:
+                    h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, span, execute)
+                    del hi
                 odd = {}
                 if ordered:
                     part = slice(iq-q0, iq-q0+1)
@@ -904,6 +933,8 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                 receipt["batches"].append(dict(q_span=span,support_ranks=ranks))
                 del h,m1,m3,odd
             del a0,a1
+            if vertex is None:
+                del roots
             receipt["correlation_count"] += 10 if ordered else 6
     ledger.live_stages = ambient
     receipt["completion"] = bool(np.asarray(header["moment_written"]).all())
@@ -1135,6 +1166,7 @@ def integrate_response_panel(wfns, meta, mesh_xy, rules, *, q_ids, sample_span,
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
                         vertex=None, contact=None):
     """Stage A: one windowed stream per admitted sample batch, all parent faces."""
+    from .shared_pole_local import face_rows
     with timing.fenced_section('bank.setup'):
         from file_io.shared_pole_store import write_shared_pole_bank
         header,qids,census = _bank_context(wfns,meta,sym,bank_io,mesh_xy)
@@ -1150,7 +1182,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         if ordered:
             receipt["ordered"] = True
         started = time.monotonic()
-        execute = _bank_execution(meta, mesh_xy, receipt, config)
+        execute = _bank_execution(meta, mesh_xy, receipt, config,
+            budget_bytes=(int(meta.shared_pole_capacity.device_budget_bytes_per_rank)
+                      if vertex is None else None))
         ledger = meta.shared_pole_capacity
         ambient = ledger.live_stages
     with timing.fenced_section('bank.stream_reference_compile'):
@@ -1168,7 +1202,15 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # Reserve output plus a dense/transport headroom, and batch only when the
         # common ledger's admitted panel budget cannot hold the full point plan.
         layout = config.get("linalg","local") if hasattr(config,"get") else config.backend.linalg
-        native = response_dense_workspace(mesh_xy,n,len(z),layout,with_eigh=vertex is None)
+        dense_budget = int(ledger.device_budget_bytes_per_rank) if vertex is None else None
+        native = response_dense_workspace(mesh_xy,n,len(z),layout,with_eigh=False,
+            budget_bytes=dense_budget)
+        if vertex is None:
+            root_native = response_dense_workspace(mesh_xy,n,len(qids),layout,
+                with_eigh=True, budget_bytes=dense_budget)
+            native = dict(native, eigh=root_native["eigh"],
+                          total=max(native["gemm"], root_native["gemm"])+root_native["eigh"])
+        root_faces = int(vertex is None)
         headroom = 16*face_bytes + native["gemm"] + int(phase.nbytes+derivative.nbytes)
         # Ask the ledger owner for R24's remaining device budget. The zero-byte
         # planning row includes ambient live reservations but allocates nothing.
@@ -1188,7 +1230,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             # Preserve the existing dense/native and writer conversion envelopes.
             return max(dense+native["total"],4*width*face_bytes+native["total"])
 
-        minimum = headroom+live_bytes+2*face_bytes+dense_bytes(1)
+        minimum = headroom+live_bytes+(2+root_faces)*face_bytes+dense_bytes(1)
         # R24 makes 3U a reported scaling target, not the device admission limit.
         # Replaying a Green/FFT stream to meet that preference repeats every time
         # node even when the complete output panel fits. Use the ledger's remaining
@@ -1196,7 +1238,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # larger systems still split q/sample panels before any allocation.
         planning_limit = device_available
         available = planning_limit-headroom-live_bytes
-        qwidth = min(len(qids),int((available-dense_bytes(1))//(2*face_bytes)))
+        # Two sample outputs and one retained Coulomb root per parent.
+        qwidth = min(len(qids),int((available-dense_bytes(1))//((2+root_faces)*face_bytes)))
         receipt["panel_budget"] = dict(
             scaling_target_bytes_per_rank=scaling_target,
             device_budget_bytes_per_rank=budget["device_budget_bytes_per_rank"],
@@ -1214,9 +1257,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         with timing.fenced_section('bank.panel_admission'):
             q1 = min(q0+qwidth,len(qids))
             width = len(z)
-            while 2*width*(q1-q0)*face_bytes+dense_bytes(width) > available:
+            while (2*width+root_faces)*(q1-q0)*face_bytes+dense_bytes(width) > available:
                 width -= 1
-            planned_bytes = headroom+live_bytes+2*width*(q1-q0)*face_bytes+dense_bytes(width)
+            planned_bytes = headroom+live_bytes+(2*width+root_faces)*(q1-q0)*face_bytes+dense_bytes(width)
             receipt.setdefault("panel_plans",[]).append(dict(q_span=(q0,q1),sample_width=width,
                 aggregate_bytes_per_rank=planned_bytes,
                 scaling_status="PASS" if planned_bytes <= scaling_target else "WARN",
@@ -1226,18 +1269,24 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             with timing.fenced_section('bank.stream_arguments'):
                 hi = min(lo+width,len(z));a = hi-lo
                 ledger.live_stages = ambient
-                name,_ = _reserve(meta,"bank_outputs",2*a*(q1-q0)*face_bytes + headroom)
+                name,_ = _reserve(meta,"bank_outputs",(2*a+root_faces)*(q1-q0)*face_bytes + headroom)
                 ledger.live_stages = ambient+(name,)
             raw = integrate_response_panel(wfns, meta, mesh_xy, rules,
                 q_ids=tuple(qids[q0:q1]), sample_span=(lo, hi), execute=execute,
                 receipt=receipt, ordered=ordered, vertex=vertex)
-            for iq in range(q0,q1):
+            pending = [iq for iq in range(q0,q1)
+                       if not np.asarray(header["sample_written"])[iq,lo:hi].all()]
+            if pending and vertex is None:
+                roots, inverse, _ = _coulomb_batch(
+                    meta, config, bank_io, mesh_xy, (q0, q1), execute)
+                del inverse
+            for iq in pending:
                 span = (iq,iq+1)
-                if np.asarray(header["sample_written"])[iq,lo:hi].all():
-                    continue
-                h,hinv,ranks = _coulomb_batch(meta,config,bank_io,mesh_xy,span,execute)
-                del hinv
-                if vertex is not None:
+                if vertex is None:
+                    h = face_rows(mesh_xy, (iq-q0,))(roots)
+                else:
+                    h, hinv, ranks = _coulomb_batch(meta,config,bank_io,mesh_xy,span,execute)
+                    del hinv
                     from file_io.shared_pole_store import read_shared_pole_bank
                     from file_io.slab_io import SlabIO
                     with SlabIO(bank_io["path"], mode="r", mesh=mesh_xy) as io:
@@ -1276,6 +1325,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     del value,ds,chi,dchi,hbatch
                     ia = stop
                 del h
+            if pending and vertex is None:
+                del roots
             receipt["batches"].append(dict(q_span=(q0,q1),sample_span=(lo,hi)))
             del raw
     with timing.fenced_section('bank.finalize'):

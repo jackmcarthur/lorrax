@@ -419,6 +419,25 @@ def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb):
     return fn(A, B, C) if has_c else fn(A, B)
 
 
+def _capacity_route(mesh, shapes, dtype, route, budget_bytes):
+    """One shape-only route decision for execution and its workspace query."""
+    if route != "auto" or budget_bytes is None:
+        return route
+    from distrib_la.workspace import fits_local
+    from types import SimpleNamespace
+    ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
+    nb = int(shapes[0][0]) if len(shapes[0]) == 3 else 1
+    # A short batch repeatedly exchanges a whole matrix onto only a subset of
+    # ranks; retain the provider for the surrounding single-parent products.
+    if nb < ranks:
+        return route
+    local = -(-nb // ranks)
+    a, b = ((local, *tuple(int(v) for v in shape)[-2:]) for shape in shapes)
+    d = (local, a[1], b[2])
+    return (ROUTE_BATCH_RESHARD if fits_local(
+        SimpleNamespace(mesh=mesh), "gemm", (a, b, d), dtype, budget_bytes) else route)
+
+
 def matmul(
     A: jax.Array,
     B: jax.Array,
@@ -471,7 +490,8 @@ def matmul(
         route becomes a capacity decision: when one rank's whole local A, B
         and D matrices (``ceil(batch/P)`` of each) plus the local GEMM
         temporary fit (:func:`distrib_la.workspace.fits_local`), the staged
-        route runs; otherwise the provider. Pass a value every rank shares.
+        route runs; otherwise the provider. Batches shorter than the mesh retain
+        the provider. Pass a value every rank shares.
 
     Returns
     -------
@@ -508,17 +528,9 @@ def matmul(
         raise ValueError("C is required when beta is nonzero")
     out_shape = _validate_operands(A, B, C, transa, transb)
     route = str(batched_route).strip().lower()
-    if route == "auto" and budget_bytes is not None:
-        from distrib_la.workspace import fits_local
-        from types import SimpleNamespace
-        ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
-        nb = int(A.shape[0]) if A.ndim == 3 else 1
-        local = -(-nb // ranks)
-        a = (local,) + _op_shape((int(A.shape[-2]), int(A.shape[-1])), transa)
-        b = (local,) + _op_shape((int(B.shape[-2]), int(B.shape[-1])), transb)
-        d = (local, a[1], b[2])
-        if fits_local(SimpleNamespace(mesh=mesh), "gemm", (a, b, d), A.dtype, budget_bytes):
-            route = ROUTE_BATCH_RESHARD
+    shapes = (tuple(A.shape[:-2]) + _op_shape(A.shape[-2:], transa),
+              tuple(B.shape[:-2]) + _op_shape(B.shape[-2:], transb))
+    route = _capacity_route(mesh, shapes, A.dtype, route, budget_bytes)
     provider = resolve_matmul_backend(backend, mesh, batched_route=route)
     px, py = _mesh_shape(mesh)
     m_out, n_out = int(out_shape[-2]), int(out_shape[-1])

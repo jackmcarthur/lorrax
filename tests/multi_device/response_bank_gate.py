@@ -105,6 +105,28 @@ def main():
         if jax.process_index() == 0:
             (root / f"dyson_{layout}.hlo").write_text(executable.as_text())
 
+    # Capacity routing must solve a non-Hermitian complex system correctly on
+    # both routes, including a ragged batch and a nonsquare right-hand side.
+    from distrib_la import plan
+    batch = int(mesh.size) + 1
+    matrix = (np.eye(n)[None] * (2 + .3j)
+              + .01 * (rng.normal(size=(batch, n, n))
+                       + 1j * rng.normal(size=(batch, n, n))))
+    known = rng.normal(size=(batch, n, n+4)) + 1j*rng.normal(size=(batch, n, n+4))
+    rhs = matrix @ known
+    results["capacity_lu"] = {}
+    for label, budget in (("distributed", 1), ("local", 1024**2)):
+        solver = plan("solve_lu", mesh, n=n, backend="distributed",
+                      batched_route="auto", budget_bytes=budget)
+        route = solver.route_for(matrix.shape, matrix.dtype, rhs_shape=rhs.shape)
+        assert (route == "batch_reshard") == (label == "local"), route
+        actual = solver.batched(put(matrix), put(rhs))
+        relative = error(actual, known)
+        assert relative <= 1e-12, (label, relative)
+        assert actual.sharding.spec == P(None, "x", "y")
+        results["capacity_lu"][label] = dict(route=route, relative=relative,
+                                            rhs_shape=list(rhs.shape))
+
     # Same fractional one-particle stream, selected noncontiguous parents.
     # Complex moment weights exercise both Keldysh orientations at t=0.
     nk, nb = 8, 8

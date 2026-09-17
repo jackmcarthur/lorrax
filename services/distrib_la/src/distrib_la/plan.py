@@ -355,7 +355,7 @@ class Plan:
     budget_bytes
         Device bytes per rank the caller admits for one batched call, or
         ``None``. With ``'auto'`` requested and a budget given, the route is
-        decided per stack by capacity (:meth:`route_for`): a stack whose
+        decided per stack by capacity (:meth:`route_for`): an eigh/LU stack whose
         per-rank whole matrices fit runs route (c), otherwise the provider.
     """
 
@@ -451,17 +451,18 @@ class Plan:
             return ROUTE_BACKEND_BATCHED
         return ROUTE_SCAN
 
-    def route_for(self, shape, dtype) -> str:
+    def route_for(self, shape, dtype, *, rhs_shape=None) -> str:
         """The route :meth:`batched` takes for one operand stack.
 
         :attr:`batched_route` is the answer for every stack except one case:
-        ``'auto'`` requested on a provider eigh plan WITH a ``budget_bytes``. Then
+        ``'auto'`` requested on a provider eigh/LU plan WITH ``budget_bytes``. Then
         capacity decides whatever the deck dial said: when the per-rank whole
         matrices of the stack (``ceil(nb/P)`` of them, input and output) and
         the local kernel's workspace fit the budget
         (:func:`distrib_la.workspace.fits_local`), the stack runs route (c);
         otherwise the provider route. The budget is a caller value every rank
-        shares, so every rank takes the same route.
+        shares, so every rank takes the same route. LU requires ``rhs_shape``
+        for pricing the actual right-hand side, and a batch that fills the mesh.
         """
         static = self.batched_route
         if (self.requested_batched_route != "auto" or self.budget_bytes is None
@@ -472,9 +473,16 @@ class Plan:
         nb = shape[0] if len(shape) == 3 else 1
         ranks = int(self.mesh.shape["x"]) * int(self.mesh.shape["y"])
         local = (-(-nb // ranks), shape[-2], shape[-1])
-        live = (local, local) if self.op in ("eigh", "solve_lu") else (local,)
-        if self.op == "eigh" and fits_local(
-                self, "eigh", live, dtype, self.budget_bytes):
+        # A short LU batch would move whole matrices onto fewer than all ranks
+        # for every surrounding product. Keep the provider for that shape.
+        if self.op == "solve_lu" and (nb < ranks or rhs_shape is None):
+            return static
+        live = (local, local)
+        if self.op == "solve_lu":
+            rhs = (local[0], *tuple(int(v) for v in rhs_shape)[-2:])
+            live = (local, rhs, rhs)  # A, RHS and solution; LU scratch queried below.
+        if self.op in ("eigh", "solve_lu") and fits_local(
+                self, self.op, live, dtype, self.budget_bytes):
             return ROUTE_BATCH_RESHARD
         return static
 
@@ -582,7 +590,9 @@ class Plan:
             # serve them, whatever the plan's route (no movement, one at a time).
             from distrib_la._batch_reshard import batch_layout_eigh_call
             return batch_layout_eigh_call("eigh", self.mesh, A)
-        route = self.route_for(A.shape, A.dtype) if _route is None else _route
+        route = (self.route_for(A.shape, A.dtype,
+                    **({"rhs_shape": args[0].shape} if self.op == "solve_lu" and args else {}))
+                 if _route is None else _route)
         if route not in BATCHED_ROUTES:
             raise ValueError(
                 f"unknown batched route {route!r} "

@@ -36,17 +36,18 @@ def _vendor_query(ctx, op, sizes, dtype):
 
 
 @lru_cache(maxsize=128)
-def _local_gemm_temp(shapes, dtype, device):
-    """Compile the local batched matmul shape, without executing/allocating it."""
+def _local_gemm_temp(shapes, dtype, device, operation='gemm'):
+    """Compile the local dense operation without executing/allocating it."""
     import jax
     import jax.numpy as jnp
     from jax.sharding import SingleDeviceSharding
     sh = SingleDeviceSharding(device)
-    fn = jax.jit(jnp.matmul, in_shardings=(sh, sh), out_shardings=sh)
+    kernel = jnp.linalg.solve if operation == 'solve_lu' else jnp.matmul
+    fn = jax.jit(kernel, in_shardings=(sh, sh), out_shardings=sh)
     args = tuple(jax.ShapeDtypeStruct(s, np.dtype(dtype), sharding=sh) for s in shapes)
     memory = fn.lower(*args).compile().memory_analysis()
     if memory is None:
-        raise RuntimeError('local GEMM compiler did not return workspace accounting')
+        raise RuntimeError(f'local {operation} compiler did not return workspace accounting')
     return int(memory.temp_size_in_bytes)
 
 
@@ -142,7 +143,7 @@ def _gemm_workspace_details(mesh, shapes, dtype, *, local, backend, ctx_handle=N
 
 
 def matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend='auto',
-                                    batched_route='batch_reshard'):
+                                    batched_route='batch_reshard', budget_bytes=None):
     """Query the actual eager matmul route, independently of any eigh plan.
 
     ``shapes`` are effective N,N rank-2/3 operand shapes after any endpoint
@@ -150,7 +151,7 @@ def matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend='auto',
     bytes per rank. Operand transpose staging and output storage are not
     workspace and must be admitted separately by the caller.
     """
-    from distrib_la.matmul import resolve_matmul_backend
+    from distrib_la.matmul import resolve_matmul_backend, _capacity_route
     from distrib_la.plan import ROUTE_BATCH_RESHARD
     shapes = _shapes(shapes)
     dtype = np.dtype(dtype)
@@ -168,6 +169,7 @@ def matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend='auto',
     if any(v % axis for v, axis in ((m,px),(k,px),(k,py),(n,py))):
         raise ValueError('GEMM shapes must tile the plan mesh')
     route = str(batched_route).strip().lower()
+    route = _capacity_route(mesh, shapes, dtype, route, budget_bytes)
     provider = resolve_matmul_backend(backend, mesh, batched_route=route)
     return int(_gemm_workspace_details(mesh, shapes, dtype,
         local=route == ROUTE_BATCH_RESHARD, backend=provider)['device_bytes'])
@@ -193,7 +195,10 @@ def _local_kernel_workspace(mesh, op, shapes, dtype):
         return 8 * (1 + 6*n + 2*n*n) + 4 * (3 + 5*n)
     if op in ('gemm', 'matmul'):
         return _local_gemm_temp(tuple(shapes[:2]), dtype.str, jax.local_devices()[0])
-    raise ValueError('fits_local op must be eigh or gemm')
+    if op == 'solve_lu':
+        return _local_gemm_temp(tuple(shapes[:2]), dtype.str,
+                                jax.local_devices()[0], operation=op)
+    raise ValueError('fits_local op must be eigh, gemm or solve_lu')
 
 
 def fits_local(plan, op, shapes, dtype, budget_bytes) -> bool:
@@ -203,7 +208,7 @@ def fits_local(plan, op, shapes, dtype, budget_bytes) -> bool:
     ----------
     plan : Plan or GemmPlan
         Supplies the mesh (platform decides which workspace model applies).
-    op : {'eigh', 'gemm'}
+    op : {'eigh', 'gemm', 'solve_lu'}
         The local kernel route (c) or a batch-layout operand runs.
     shapes : tuple of tuples
         The caller's whole per-rank live set of dense operands, e.g.
