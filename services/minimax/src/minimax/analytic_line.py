@@ -33,6 +33,22 @@ class DampedLineRule:
     def node_count(self) -> int:
         return self.times.size
 
+    def rescaled(self, height: float) -> DampedLineRule:
+        """Convert a unit-height rule to physical ``1/(x+i*height)``.
+
+        The returned span and absolute tolerance are in physical units;
+        its times and weights both scale inversely with ``height``.
+        """
+        height = float(height)
+        if self.height != 1.0:
+            raise ValueError("Rescale only a normalized unit-height rule")
+        if not math.isfinite(height) or height <= 0:
+            raise ValueError("height must be finite and positive")
+        return DampedLineRule(self.span * height, height,
+                              self.tolerance / height, self.times / height,
+                              self.weights / height, self.order, self.panels,
+                              self.panel_bound / height, self.tail_bound / height)
+
     def evaluate(self, x, block: int = 256):
         """Evaluate ``sum_j weights[j] exp(i*x*times[j])``."""
         if block < 1:
