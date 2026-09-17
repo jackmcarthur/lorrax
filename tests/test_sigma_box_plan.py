@@ -18,7 +18,7 @@ from gw.sigma_box_plan import (
     make_sigma_box_spec,
     plan_sigma_windows,
 )
-from minimax import UniformRule
+from minimax import UniformRule, analytic_line_box_rule
 
 
 def _branch(tag="positive conduction", *, space="cond", negative=False):
@@ -64,13 +64,14 @@ def _fake_rule(box, eps, **_kwargs):
         kappa_max=1.2, seconds=0.01)
 
 
-def _plan(monkeypatch, branch=None, **kwargs):
+def _plan(monkeypatch, branch=None, summaries=None, **kwargs):
     monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
     branch = _branch() if branch is None else branch
     omega = (-branch.omega_abs if branch.neg_omega_half
              else branch.omega_abs)
     return plan_sigma_windows(
-        _summaries(), [branch], omega, 0.1,
+        _summaries() if summaries is None else summaries,
+        [branch], omega, 0.1,
         eps=1.0e-4,
         cache_dir=None, print_fn=lambda *_args, **_kwargs: None,
         **kwargs)
@@ -101,6 +102,40 @@ def test_three_product_partition_uses_raw_tuple_boxes(monkeypatch):
     np.testing.assert_array_equal(plan[2].window.mask_A, [[True, True]])
     np.testing.assert_array_equal(plan[0].pole_indices, [0])
     np.testing.assert_array_equal(plan[2].pole_indices, [1])
+
+
+def test_ppm_flat_crossing_line_nodes_reach_sigma_executor(monkeypatch):
+    ppm_summaries = (
+        (0, {"all": (0.3, 0.3, 0.0, 0.0),
+             "shallow": (0.3, 0.3, 0.0, 0.0), "deep": None}),
+        (1, {"all": (1.0, 1.0, 0.0, 0.0),
+             "shallow": None, "deep": (1.0, 1.0, 0.0, 0.0)}),
+    )
+    plan, geometry = _plan(monkeypatch, summaries=ppm_summaries,
+                           analytic_line=True)
+    report = geometry["branches"][0]["windows"]
+    assert report[0]["cache_status"] == "analytic-line"
+    assert report[1]["cache_status"] != "analytic-line"
+    box = tuple(report[0]["box_ry"])
+    rule = analytic_line_box_rule(box, 1.0e-4)
+    nodes = plan[0].window.nodes
+    np.testing.assert_allclose(np.asarray(nodes.t), rule.times, rtol=0, atol=0)
+    np.testing.assert_allclose(
+        np.asarray(nodes.alpha),
+        rule.weights * np.exp(-box[2] * rule.times), rtol=2e-15, atol=0)
+    x = np.linspace(box[0], box[1], 1025)
+    d = x + 1j * box[2]
+    q = np.exp(1j * d[:, None] * rule.times) @ rule.weights
+    assert np.max(np.abs(box[2] * (q - 1 / d))) < 1.0e-4
+    # A double application of damping would pass shape checks, but not this.
+    wrong = np.exp(1j * d[:, None] * rule.times) @ np.asarray(nodes.alpha)
+    assert np.max(np.abs(box[2] * (wrong - 1 / d))) > 1.0e-3
+
+
+def test_analytic_line_request_keeps_damped_poles_on_box_rule(monkeypatch):
+    _plan_rows, geometry = _plan(monkeypatch, analytic_line=True)
+    assert all(row["cache_status"] != "analytic-line"
+               for row in geometry["branches"][0]["windows"])
 
 
 @pytest.mark.parametrize(

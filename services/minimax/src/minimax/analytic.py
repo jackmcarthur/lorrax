@@ -1,10 +1,10 @@
-"""Experimental reciprocal quadrature constructors, with one normalized API.
+"""Reciprocal quadrature constructors, with one normalized API.
 
 All tolerances are *absolute* on dimensionless domains.  Constructors have
 different guarantees: the sine and line rules have exact-arithmetic continuum
 bounds; the positive Laplace rule has a high-precision numerical extremum
-audit, not an interval-arithmetic certificate.  No production dispatch uses
-these constructors until the owner chooses a replacement route.
+audit, not an interval-arithmetic certificate. Sigma PPM uses the damped-line
+constructor for real-pole crossing windows.
 """
 from __future__ import annotations
 
@@ -43,3 +43,40 @@ def damped_line_reciprocal(bandwidth_over_broadening: float, tolerance: float):
     """
     from minimax.analytic_line import make_rule
     return make_rule(bandwidth_over_broadening, 1.0, tolerance)
+
+
+def analytic_line_box_rule(box, eps):
+    """Executor-form rule for a crossing denominator on one fixed-height line.
+
+    The normalized analytic rule includes ``exp(-height*t)`` in its weights;
+    Sigma's executor puts that damping in ``exp(i*t*d)`` instead.  Undoing it
+    here yields the same quadrature without counting it twice.  The rule is
+    deliberately limited to a flat imaginary edge and a real interval that
+    crosses zero; rectangles and relative-error tails have other contracts.
+    """
+    from time import perf_counter
+    import numpy as np
+    from minimax.uniform_rule import UniformRule, rule_sup_error
+
+    re_lo, re_hi, im_lo, im_hi = map(float, box)
+    if not (np.isfinite([re_lo, re_hi, im_lo, im_hi]).all()
+            and re_lo <= 0 <= re_hi and 0 < im_lo == im_hi
+            and np.isfinite(eps) and 0 < eps < 1):
+        raise ValueError("analytic line box needs a finite crossing interval, "
+                         "one positive height, and 0 < eps < 1")
+    started = perf_counter()
+    height = im_lo
+    span = max(abs(re_lo), abs(re_hi))
+    # Leave room for float64 evaluation of the executor convention.
+    physical = damped_line_reciprocal(span / height, 0.8 * eps).rescaled(height)
+    times = np.asarray(physical.times, np.float64)
+    weights = np.asarray(physical.weights * np.exp(height * times), np.complex128)
+    sample = np.linspace(re_lo, re_hi, 513) + 1j * height
+    sampled_error, kappa = rule_sup_error(times, weights, sample,
+                                          np.full(sample.size, height))
+    sup_error = max(height * physical.bound, sampled_error)
+    if not np.isfinite(sup_error) or sup_error > eps:
+        raise RuntimeError("analytic line rule missed the requested executor error")
+    return UniformRule(times, weights, tuple(map(float, box)), float(eps),
+                       False, 0.0, 0, float(sup_error), float(kappa),
+                       perf_counter() - started)
