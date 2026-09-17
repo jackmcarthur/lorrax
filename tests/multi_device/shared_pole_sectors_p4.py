@@ -217,7 +217,7 @@ def run_span_checks(mesh):
     from gw.shared_pole_local import _mm
     from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
-    from gw.shared_pole_sectors import ordered_cross_pencil
+    from gw.shared_pole_sectors import ordered_cross_pencil, reduce_cross_round
 
     spec=P(('x','y'))
     layout=NamedSharding(mesh,spec)
@@ -272,8 +272,29 @@ def run_span_checks(mesh):
     check=jax.jit(shard_map(check,mesh=mesh,in_specs=(spec,)*3,out_specs=spec,check_vma=False))
     errors=[float(jnp.max(v)) for v in check(pencil,y,signed)]
     assert max(errors)<1e-10,errors
+    pencil_t=(put(adj(fullt)@signature@fullt),put(adj(fullt)@m@fullt),put(t@fullt),put(z))
+    _,signed_t,diag_t,yt=run(pencil_t,put(np.ones(fullt.shape[-1],bool)))
+    assert bool(jnp.all(diag_t['gram_valid']))
+    def sector(a,q,qi,x,y,signed):
+        power=signature@adj(a)
+        infinity=[put(qi)]
+        for _ in range(4):
+            infinity.append(put((a@power/2)@qi))
+            power=signature@m@power
+        return (put(z),put(np.arange(len(z),dtype=np.int32)),((put(q),),(put(a@x),)),tuple(infinity),y,signed)
+    ct,ctdiag=reduce_cross_round(sector(c,qc,ic,xc,y,signed),sector(t,qt,it,xt,yt,signed_t),
+        (((put(t@xc),put(np.zeros_like(t@xc))),),((put(c@xt),put(derivative)),)),
+        tuple(put(v) for v in moments),mesh_xy=mesh,native_eigh=native,gates=gates)
+    assert bool(jnp.all(ctdiag['gram_valid'])) and bool(jnp.all(ctdiag['retained_metric_positive']))
+    cc,tt,mu,active=ct
+    def evaluate(a,b,mu,active):
+        return _mm(a*jnp.where(active,1/((.8+.3j)*mu-1),0)[:,None,:],b,transb='C')
+    evaluate=jax.jit(shard_map(evaluate,mesh=mesh,in_specs=(spec,)*4,out_specs=spec,check_vma=False))
+    exact=c@np.linalg.solve((.8+.3j)*signature-m,adj(t))
+    ct_error=float(jnp.max(jnp.abs(evaluate(cc,tt,mu,active)-put(exact))))
+    assert ct_error<1e-10,ct_error
     return [dict(name='ordered_retained_span_and_cross_infinity',cross_absolute_error=cross_error,
-                 output_metric_ritz_errors=errors)]
+                 output_metric_ritz_errors=errors,joint_round_held_error=ct_error)]
 
 
 def run_current_partner_checks(mesh):

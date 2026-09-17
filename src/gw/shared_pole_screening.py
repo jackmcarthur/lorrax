@@ -118,6 +118,14 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     ISDF basis, but never skips the current response or W construction.
     """
     source_wfn = None
+    photon = int(meta.nspinor) == 4
+    photon_layout = None
+    if photon:
+        from .photon_layout import PhotonBasisLayout
+        if wfns_transverse is None or bispinor_v_q_path is None or mu_bases is None:
+            raise ValueError("GATE shared_pole_sectors: both current-map endpoint bundles and photon V are required")
+        photon_layout = PhotonBasisLayout.from_centroid_extents(
+            mu_bases[0].n_logical, mu_bases[1].n_logical, mesh_xy)
     if config.debug.write_w or config.write_poles:
         source_wfn = getattr(wfn, "path", None)
         if source_wfn is None or not str(source_wfn).strip():
@@ -148,10 +156,12 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             if occupations.shape != wfns.occ.shape:
                 raise ValueError("GATE shared_pole_occupations: supplied current state does not match carrier")
             wfns = dataclasses.replace(wfns, occ=replicate_to_mesh(occupations, mesh_xy))
+            if photon:
+                wfns_transverse = dataclasses.replace(wfns_transverse, occ=wfns.occ)
         identity = shared_pole_identity(wfns, meta, label=label, wfn=wfn,
             binding=wfn_fingerprint_binding, centroid_indices=centroid_indices)
         sc_scratch = str(label).startswith("sc_")
-        if config.restart and tensors_filename is not None and not sc_scratch:
+        if config.restart and tensors_filename is not None and not sc_scratch and not photon:
             handle = shared_pole_restart_handle(tensors_filename,
                 expected_identity=identity, meta=meta, mesh_xy=mesh_xy, print_fn=print_fn)
             if handle is not None:
@@ -205,12 +215,19 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         rank0_transaction(root, stage="shared_pole.prepare_output", write=prepare_output)
         tables = _shared_pole_tables(meta, sym, centroid_indices)
     with timing.fenced_section("spole.coulomb_staging"):
-        coulomb = _coulomb_resource(V_q, meta, sym, mesh_xy, root / "coulomb.h5")
+        coulomb = (None if photon else
+                   _coulomb_resource(V_q, meta, sym, mesh_xy, root / "coulomb.h5"))
     with timing.fenced_section("spole.bank_setup"):
         bank = dict(path=str(root / "bank.h5"), identity=identity,
                     tables=tables, coulomb=coulomb)
+        if photon:
+            bank.update(photon_layout=photon_layout, mu_bases=mu_bases,
+                        bispinor_v_q_path=bispinor_v_q_path,
+                        sector_tables=(tables, _shared_pole_tables(
+                            meta, sym, mu_bases[1].canonical_indices)))
         initialize_shared_pole_bank(bank["path"], meta=meta, tables=tables,
-            recipe=recipe, identity=identity, mesh_xy=mesh_xy)
+            recipe=recipe, identity=identity, mesh_xy=mesh_xy,
+            **(dict(photon_layout=photon_layout, mu_bases=mu_bases) if photon else {}))
         receipts = dict(identity=identity)
         def record(stage, receipt):
             # EVERY RANK LEAVES THIS CALL THE SAME WAY.  A bare
@@ -227,11 +244,18 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             print_fn(f"shared-pole {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
                      f"seconds={receipt.get('seconds', {})}")
     with timing.fenced_section("spole.bank"):
-        record("bank", produce_w_bank(wfns, meta, config, mesh_xy=mesh_xy,
-            sym=sym, sample_plan=recipe, bank_io=bank))
-    with timing.fenced_section("spole.moments"):
-        record("moments", compute_response_moments(wfns, meta, config,
-            mesh_xy=mesh_xy, sym=sym, bank_io=bank))
+        if photon:
+            from .response_bank import compute_photon_bank
+            record("bank", compute_photon_bank(wfns, wfns_transverse, meta, config,
+                mesh_xy=mesh_xy, sym=sym, mu_bases=mu_bases, layout=photon_layout,
+                occupation_state=occupation_state, sample_plan=recipe, bank_io=bank))
+        else:
+            record("bank", produce_w_bank(wfns, meta, config, mesh_xy=mesh_xy,
+                sym=sym, sample_plan=recipe, bank_io=bank))
+    if not photon:
+        with timing.fenced_section("spole.moments"):
+            record("moments", compute_response_moments(wfns, meta, config,
+                mesh_xy=mesh_xy, sym=sym, bank_io=bank))
     # The constructor owns scratch reads, actual pencil planning and the
     # final writer. It must query its own native workspace at the actual R.
     # W/dW and M1/M3 are distinct keyed datasets in the same scratch file.

@@ -10,6 +10,199 @@ neither move an operator to the host nor prescribe a processor mesh.
 import jax.numpy as jnp
 
 
+def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *, mesh_xy,
+                                     retained=()):
+    """Run the production selection/reduction program for CC or TT.
+
+    Samples and M0..M3 are parent-local stacks, [P,S,n,n] and [P,n,n].
+    ``geometry`` carries the existing recipe, endpoint basis/tables/header,
+    round ids/real/partner slots and symmetry partner rows. TT uses
+    n=3*n_T with mu-major Cartesian rows. The unchanged recipe fractions
+    set its widths and 1.8*n pole budget. Capacity remains the whole-map
+    ledger; no fictitious independent sector allowance is created.
+
+    Returns the sorted positive model, signed model, original-pencil span,
+    selected state/infinity panels and replicated diagnostics. The latter
+    are needed by the CT joint projection in the same map, never cached.
+    """
+    import copy
+    import math
+    import jax
+    import numpy as np
+    import distrib_la
+    from runtime.padding import padded_axis
+    from jax.sharding import PartitionSpec as P
+    from gw.gw_config import linalg_resolution
+    from gw.shared_pole_capacity import ConstructorCapacity
+    from gw.shared_pole_directions import _round_kernels,select_round_states
+    from gw.shared_pole_local import partner_realization,round_tables,reduce_round,_batch_put
+    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
+
+    components=int(geometry['components'])
+    basis=geometry['basis']
+    n=components*basis.n_logical
+    local_meta=copy.copy(meta)
+    local_meta.mu_basis=basis
+    local_meta.n_rmu=n
+    local_meta.n_rmu_padded=components*basis.n_packed
+    recipe=dict(meta.shared_pole_recipe,n=n)
+    policy=shared_real_pole_v1_r3b[recipe['accuracy']]
+    for field in ('imaginary_width','infinity_width','line_direction_cap','pole_budget'):
+        fraction=policy.get(field+'_fraction')
+        recipe[field]=None if fraction is None else math.ceil(n*fraction)
+    budget=ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
+                               mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,upstream=())
+    budget.batch_width=len(geometry['ids'])
+    budget.retained_panels=tuple(retained)
+    budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1])
+    eig=budget.eigenplan(local_meta.n_rmu_padded)
+    svd=budget.eigenplan(2*local_meta.n_rmu_padded)
+    extent=lambda width:padded_axis(width,mesh_xy,name='shared_pole_port',
+        specs=((P('x','y'),0),(P('x','y'),1))).carrier
+    qi,values=distrib_la.leading_eigenvectors(moments['M1'],min(n,recipe['infinity_width']),
+        eigh_plan=eig,column_extent=extent,multiplet_tol=recipe['multiplet_relative_tolerance'],
+        real_rows=geometry['real'])
+    kernels=_round_kernels(mesh_xy)
+    infinity=(qi,*(kernels.apply(moments[name],qi) for name in ('M0','M1','M2','M3')))
+    action=partner_realization(local_meta,geometry['header'],geometry['ids'],
+        geometry['partner_parent'],geometry['partner_row'],mesh_xy=mesh_xy,components=components)
+    rotation=(None if components==1 else _batch_put(mesh_xy,geometry['sym'].cartesian_action(
+        np.asarray(geometry['partner_row'])[geometry['ids']],axial=False,time_odd=True)))
+    states,counts,roles=select_round_states(samples,recipe,sample_lo=geometry['sample_lo'],
+        real=geometry['real'],mesh_xy=mesh_xy,eigh_plan=eig,svd_plan=svd,column_extent=extent,
+        logical_n=n,ordered=True,exchange=(geometry['slots'],*action),current_rotation=rotation)
+    tables=round_tables(counts,[s[1].shape[-1] for s in states],[s[0] for s in states],
+        [v.shape[-1] for v in values],qi.shape[-1],column_extent=extent,ordered=True,odd_moments=True)
+    side=tables['active'].shape[-1]
+    budget.retained_panels=(*retained,*infinity,*(v for s in states for v in s[1:]),
+                            *samples.values(),*moments.values())
+    budget.plan(side,phase='reduction')
+    reduced=reduce_round(states,infinity,tables,real=geometry['real'],mesh_xy=mesh_xy,
+        native_eigh=budget.eigenplan(side).native_fn,ordered=True,odd_moments=True,
+        keep_budget=recipe['pole_budget'],retain_span=True)
+    model,signed,vectors,diagnostics,y=reduced
+    reduction,zero,_,_=jax.tree.map(np.asarray,diagnostics)
+    for name in ('orientation_paired','gram_diagonal_positive','gram_valid','retained_metric_positive'):
+        if not np.all(reduction[name][:geometry['real']]):
+            raise ValueError(f"GATE shared_pole_sector_{name}: sector={geometry['sector']}, "
+                             f"parents={geometry['ids'][:geometry['real']]}, "
+                             f"Gram min/max={reduction['gram_min_relative'][:geometry['real']].tolist()}; no repair")
+    if not np.all(zero['zero_policy'][:geometry['real']]):
+        raise ValueError(f"GATE shared_pole_sector_zero_ritz: sector={geometry['sector']}")
+    return dict(model=model,signed=signed,coefficients=y,states=states,infinity=infinity,
+                tables=tables,roles=roles,diagnostics=diagnostics,vectors=vectors,
+                endpoint_action=(*action,rotation),recipe=recipe,budget=budget)
+
+
+def cross_round_actions(samples, states, roles, recipe, *, sample_lo, mesh_xy,
+                        partner_slots, endpoint_actions):
+    """Apply rectangular samples to the diagonal sectors' selected directions.
+
+    ``samples=(W_LR,W_RL,dW_LR/ds,dW_RL/ds)`` are parent-local
+    [P,S,n_L,n_R] (reverse blocks have reversed endpoint extents).
+    ``states``/``roles`` are the existing selection round's source states.
+    ``endpoint_actions`` is ((alpha,inverse,phase,rotation)_L, ..._R);
+    a charge endpoint has rotation=None, a current endpoint uses the
+    symmetry service's polar time-odd [P,3,3] action and mu-major rows.
+    Only direction/output panels cross ranks, through the same partner
+    permutation as the diagonal-sector construction. Outputs follow the
+    paired state order and the derivative is d/dz, report equation 5.3.
+    """
+    import jax
+    from common.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+    from gw.shared_pole_directions import _sample_point
+
+    batch=P(('x','y'))
+    perm=tuple((i,int(p)) for i,p in enumerate(partner_slots))
+    left,right=endpoint_actions
+
+    def rotate(panel, rotation, transpose):
+        if rotation is None:
+            return panel
+        shape=panel.shape
+        panel=panel.reshape(shape[0],shape[1]//3,3,shape[-1])
+        return jnp.einsum('bij,bmir->bmjr' if transpose else 'bij,bmjr->bmir',
+                          rotation,panel).reshape(shape)
+
+    outputs=[]
+    for state,role in zip(states,roles[0]):
+        sid=int(role['sample_id'])
+        z=_sample_point(recipe,sid)
+        conjugate=bool(role.get('conjugate',False))
+        mirror=bool(role.get('mirror',False))
+        exchange=mirror and z.real!=0
+        use_adjoint=not conjugate if mirror and not exchange else conjugate
+        node=state[0]
+
+        def apply(w,wr,d,dr,q,left,right):
+            a,b=w[:,sid-sample_lo],wr[:,sid-sample_lo]
+            da,db=d[:,sid-sample_lo],dr[:,sid-sample_lo]
+            if exchange:
+                alpha,inverse,phase,rotation=right
+                q=rotate(jnp.take_along_axis(phase[:,:,None]*q,inverse[:,:,None],axis=1),rotation,True)
+                q=jax.lax.ppermute(q,('x','y'),perm)
+                if conjugate:
+                    a,da=jnp.conj(a),jnp.conj(da)
+                else:
+                    a,da=jnp.swapaxes(b,-1,-2),jnp.swapaxes(db,-1,-2)
+            elif use_adjoint:
+                a,da=jnp.swapaxes(jnp.conj(b),-1,-2),jnp.swapaxes(jnp.conj(db),-1,-2)
+            o,d_o=a@q,(da@q)*(2*node)
+            if exchange:
+                alpha,inverse,phase,rotation=left
+                def back(x):
+                    x=jax.lax.ppermute(x,('x','y'),perm)
+                    return rotate(jnp.conj(phase)[:,:,None]*jnp.take_along_axis(x,alpha[:,:,None],axis=1),rotation,False)
+                o,d_o=back(o),back(d_o)
+            return o,d_o
+
+        program=jax.jit(shard_map(apply,mesh=mesh_xy,in_specs=(batch,)*7,
+                                  out_specs=(batch,batch),check_vma=False))
+        outputs.append(program(*samples,state[1],left,right))
+    return tuple(outputs)
+
+
+def reduce_cross_round(charge, transverse, cross, moments, *, mesh_xy, native_eigh, gates):
+    """Construct CT on the two retained original-pencil spans, one parent per rank.
+
+    Each sector tuple contains (points, order, states, infinity, Y, signed),
+    where ``states`` is (Q tuple, WQ tuple), ``signed`` is (c,mu,active),
+    and all operands carry the round's leading parent sharding. ``cross``
+    contains the TC-on-C and CT-on-T (output, derivative) panel tuples;
+    ``moments`` is M0_CT..M3_CT. No full operator leaves the admitted
+    parent-local program. Returns two signed CT endpoint factors, inverse
+    poles, active columns and the unchanged joint-metric diagnostics.
+    """
+    import jax
+    from common.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+    from gw.shared_pole_local import _mm
+
+    def body(charge,transverse,cross,moments):
+        def unpack(sector,actions):
+            points,order,states,infinity,y,signed=sector
+            def pack(panels):
+                return jnp.take(jnp.concatenate(panels,axis=-1),order[0],axis=-1,mode='fill',fill_value=0)
+            return points,pack(states[0]),infinity[0],pack(tuple(a[0] for a in actions)),pack(tuple(a[1] for a in actions))
+        zc,qc,ic,tc,dtc=unpack(charge,cross[0])
+        zt,qt,it,ct,dct=unpack(transverse,cross[1])
+        g,h,otc,oct=ordered_cross_pencil((zc,qc,ic),(zt,qt,it),(tc,ct,dct),moments,matmul=_mm)
+        # The diagonal output panels are O_original. Reconstruct their
+        # infinity columns from the same physical moments already in hand.
+        def diagonal(sector):
+            _,order,states,infinity,y,signed=sector
+            own=jnp.take(jnp.concatenate(states[1],axis=-1),order[0],axis=-1,mode='fill',fill_value=0)
+            return jnp.concatenate((own,2*infinity[1],2*infinity[2]),axis=-1)
+        cc=(charge[4],charge[5][1],diagonal(charge),otc)
+        tt=(transverse[4],transverse[5][1],diagonal(transverse),oct)
+        return reduce_sector_pencil(joint_sector_pencil(cc,tt,(h,g),matmul=_mm),
+                                   eigh=native_eigh,matmul=_mm,gates=gates)
+    spec=P(('x','y'))
+    return jax.jit(shard_map(body,mesh=mesh_xy,in_specs=(spec,)*4,
+                            out_specs=(spec,spec),check_vma=False))(charge,transverse,cross,moments)
+
+
 def ordered_cross_pencil(charge, transverse, cross_actions, cross_moments, *, matmul):
     """Assemble rectangular G_CT, H_CT and both cross outputs, report A.1/5.4.
 
