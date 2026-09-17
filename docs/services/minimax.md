@@ -2,8 +2,18 @@
 
 `services/minimax/` is an independently installable NumPy service. Consumers
 use `import minimax`; importing its submodules from LORRAX is a layering
-failure. Importing the package does not import JAX or SciPy. SciPy is loaded
-only by the offline/runtime solvers.
+failure. Importing the package does not import JAX or SciPy. Constructors
+load their numerical dependencies only when called.
+
+This is one **public namespace**, not one numerical algorithm: callers select
+the constructor matching their kernel, domain and error currency. The
+regularized screening rules, MPA causal rules, Sigma denominator boxes,
+shared-pole value/derivative rules and Matsubara response remain separate
+because their certificates answer different questions. The three analytic
+reciprocal constructors are eligible only for exact-match one-dimensional
+targets; none is currently a production dispatch route.
+`gw.mpa.evaluator` keeps import-compatible aliases for old callers and tests;
+production node selection calls `minimax` directly.
 
 ## Caller contract
 

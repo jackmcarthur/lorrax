@@ -1,8 +1,8 @@
 """MPA scalar oracle and physical door to the minimax quadrature service.
 
-The four positive-time rule builders are owned by ``minimax.damped_rules``.
-The names below remain for existing GW consumers and tests; no node selection
-or error-bound calculation is duplicated here.
+The four positive-time rule builders are exposed through the public ``minimax``
+API. The names below remain as import-compatible aliases for existing callers
+and tests; no node selection or error-bound calculation is duplicated here.
 """
 from __future__ import annotations
 
