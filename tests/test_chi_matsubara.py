@@ -121,6 +121,8 @@ def test_matsubara_chi0_refuses_what_it_cannot_represent(monkeypatch):
         "chi0_matsubara_occupations": dict(occupation_state=SimpleNamespace(
             f_kn=f + 1e-7, mu_ry=state.mu_ry, smearing_family="fd", smearing_width_ry=state.smearing_width_ry)),
         "chi0_matsubara_vertex": dict(occupation_state=state, vertex="current"),
+        "chi0_matsubara_occupation_extent": dict(occupation_state=SimpleNamespace(
+            f_kn=f[:, :3], mu_ry=state.mu_ry, smearing_family="fd", smearing_width_ry=state.smearing_width_ry)),
     }
     for gate, kwargs in calls.items():
         with pytest.raises(ValueError, match=gate):

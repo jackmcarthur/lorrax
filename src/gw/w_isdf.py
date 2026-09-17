@@ -1486,6 +1486,14 @@ def matsubara_rule(wfns, occupation_state, nu_indices, *, rel_tol):
     live_stop = int(wfns.slices.cond.stop)
     energies = np.asarray(jax.device_get(wfns.enk), dtype=np.float64)[:, :live_stop]
     occupied = np.asarray(jax.device_get(occupation_state.f_kn), dtype=np.float64)[:, :live_stop]
+    if occupied.shape != energies.shape:
+        raise ValueError(
+            "GATE chi0_matsubara_occupation_extent: the occupation table does not "
+            "cover the chi band window.\n"
+            f"  got:  f_kn[:, :{live_stop}] {occupied.shape} against enk {energies.shape}\n"
+            "  want: one occupation per (k, band) of wfns.enk up to slices.cond.stop\n"
+            "  why:  every tau factor is rebuilt from these energies and checked "
+            "against this table")
     fermi_dirac = np.exp(-np.logaddexp(0.0, beta * (energies - mu)))
     mismatch = float(np.max(np.abs(occupied - fermi_dirac)))
     if not mismatch <= MATSUBARA_OCCUPATION_TOLERANCE:
