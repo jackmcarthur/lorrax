@@ -25,6 +25,15 @@ previous static screened-current approximation. The constant carries no extra
 volume factor, transverse sign or Coulomb-hole half. Photon heads remain a
 separate, unsupported part of this sector handle.
 
+At the driver dispatch, the manifest path is selected as a handle but is not
+opened as a scalar model: `compute_sector_sigma` validates it before the scalar
+HDF5 consumer branch. The bare exchange owner adds charge V and, when both
+the transverse carrier and bispinor V are present, transverse V once. The
+sector constant is then added to the dynamic body once. Sector handles require
+`head_correction = off`; the existing bispinor plus finite-temperature
+occupation exception permits that setting in self-consistent maps. A material
+map still requires the constructor to publish an accepted sector handle.
+
 ## Memory and scope
 
 One rectangular endpoint class is evaluated at a time. Factor reads use bounded
