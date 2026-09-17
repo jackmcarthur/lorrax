@@ -68,6 +68,26 @@ def test_q_negation_index_is_the_c_order_involution():
     np.testing.assert_array_equal(neg[neg], np.arange(neg.size))
 
 
+def test_q_negation_index_matches_a_hand_written_4x3x2_table():
+    """The one -q map of the shared-pole constructor and Sigma, against a table written out by hand.
+
+    Flat index 6i + 2j + k; -q is ((-i) % 4, (-j) % 3, (-k) % 2). RED TWIN: the Fortran-order
+    involution on the same grid is a different permutation, so a transposed convention fails here.
+    """
+    table = [0, 1, 4, 5, 2, 3,
+             18, 19, 22, 23, 20, 21,
+             12, 13, 16, 17, 14, 15,
+             6, 7, 10, 11, 8, 9]
+    neg = q_negation_index((4, 3, 2))
+    assert neg.dtype == np.int32
+    assert neg.tolist() == table
+    np.testing.assert_array_equal(neg[neg], np.arange(24))
+    fortran = np.ravel_multi_index(
+        ((-np.stack(np.unravel_index(np.arange(24), (4, 3, 2), order="F"))) % np.asarray((4, 3, 2))[:, None]),
+        (4, 3, 2), order="F")
+    assert fortran.tolist() != table
+
+
 def test_nonnested_8x8_to_12x12_has_the_exact_4x4_intersection():
     """RED TWIN: 8→12 shares 4 points/axis, not all 8 and not a prefix."""
     coarse_grid = np.array((8, 8, 1), dtype=np.int64)

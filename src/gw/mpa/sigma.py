@@ -181,14 +181,6 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm):
     return value[:, 0, :, 0, :]
 
 
-def shared_pole_minus_q_index(grid):
-    """Canonical-full-flat index of -q (mod the mesh) for every full-grid q."""
-    grid = tuple(int(v) for v in grid)
-    coords = np.stack(np.unravel_index(np.arange(int(np.prod(grid))), grid), axis=0)
-    return np.ravel_multi_index(
-        tuple((-coords) % np.asarray(grid)[:, None]), grid).astype(np.int32)
-
-
 def shared_pole_hole_kernel(mesh_xy):
     """Compile the valence-branch W of an ordered (time-reversal-broken) store.
 
@@ -520,9 +512,10 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     ordered = header.get("representation") == "scalar-ordered-ph"
     even_part = debug_shared_pole_even_part(ordered)
     if ordered:
+        from symmetry_maps import q_negation_index
         hole_kernel = shared_pole_hole_kernel(mesh_xy)
         minus_q = device_put_process_local(
-            shared_pole_minus_q_index(header["grid"]), NamedSharding(mesh_xy, P()))
+            q_negation_index(tuple(int(v) for v in header["grid"])), NamedSharding(mesh_xy, P()))
         if even_part:
             even_kernel = shared_pole_even_part_kernel(mesh_xy, exclude_q0=even_part == "exclude_q0")
 

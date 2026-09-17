@@ -22,7 +22,8 @@ def test_ordered_sigma_matches_real_space_igw_and_the_swapped_routing_does_not(m
     import jax.numpy as jnp
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     import gw.ppm_tau_kernel as tau_kernel
-    from gw.mpa.sigma import shared_pole_hole_kernel, shared_pole_minus_q_index, synthesize_shared_pole_parents
+    from gw.mpa.sigma import shared_pole_hole_kernel, synthesize_shared_pole_parents
+    from symmetry_maps import q_negation_index
     from gw.wavefunction_bundle import BandSlices, parent_sigma_operands, sigma_face_kernel_kwargs
     from multi_device.full_photon_head_sigma_gate import _bundle
 
@@ -47,7 +48,7 @@ def test_ordered_sigma_matches_real_space_igw_and_the_swapped_routing_does_not(m
     mu_f = 0.5 * (e[:, 0].max() + e[:, 1].min())
     omega, a, pencil = rpa_modes(psi, e, lat.n_occ, lat.coulomb())
     minus = minus_index(lat)
-    assert shared_pole_minus_q_index((lat.n1, lat.n2, 1)).tolist() == minus
+    assert q_negation_index((lat.n1, lat.n2, 1)).tolist() == minus
 
     # Instrument: the ordered store in the physical orientation reproduces FT_q[W_c(z)].
     momentum, residual = mode_momenta(lat, a)

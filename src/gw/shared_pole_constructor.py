@@ -191,9 +191,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
 
                 read_mirror = None
                 if ordered:
-                    from gw.mpa.sigma import shared_pole_minus_q_index
+                    from symmetry_maps import q_negation_index
                     parents_full = [int(v) for v in header["q_irr_full_idx"]]
-                    minus_full = shared_pole_minus_q_index(tuple(int(v) for v in header["grid"]))
+                    minus_full = q_negation_index(tuple(int(v) for v in header["grid"]))
                     partner = parents_full.index(int(minus_full[parents_full[q_start]]))
 
                     def read_mirror(sample_id):

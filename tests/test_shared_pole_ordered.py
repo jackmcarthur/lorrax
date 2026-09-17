@@ -439,14 +439,15 @@ def test_sigma_hole_branch_routes_minus_q_transpose_at_generic_q():
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from lxkit.testing import require_devices
     from gw.mpa.sigma import (
-        shared_pole_hole_kernel, shared_pole_minus_q_index, synthesize_shared_pole_parents)
+        shared_pole_hole_kernel, synthesize_shared_pole_parents)
+    from symmetry_maps import q_negation_index
     require_devices(4, "cpu")
     mesh = Mesh(np.asarray(jax.devices("cpu")[:4]).reshape(2, 2), ("x", "y"))
     rng = np.random.default_rng(29)
     gamma = _trim(rng, 6, 4, eps=.4)
     q, mq = _generic_pair(rng, 6, 4)
     plants = (gamma, q, mq)
-    minus_q = shared_pole_minus_q_index((3, 1, 1))
+    minus_q = q_negation_index((3, 1, 1))
     assert minus_q.tolist() == [0, 2, 1]
     width, factors, poles, bounds = 8, [], [], []
     for plant in plants:
@@ -488,13 +489,13 @@ def test_two_component_ordered_store_synthesizes_lehmann_sums(tmp_path):
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from lxkit.testing import require_devices
     from common.centroid_basis import PackedCentroidBasis
-    from symmetry_maps import QirrTables, centroid_source_map_and_wrap
+    from symmetry_maps import QirrTables, centroid_source_map_and_wrap, q_negation_index
     from file_io import shared_pole_store as store
     from file_io.slab_io import SlabIO
     from gw.shared_pole_recipe import CapacityLedger, shared_real_pole_v1_r3b
     from gw.qgrid_symmetry import shared_pole_operator_realizer
     from gw.mpa.sigma import (
-        shared_pole_hole_kernel, shared_pole_minus_q_index, synthesize_shared_pole_parents)
+        shared_pole_hole_kernel, synthesize_shared_pole_parents)
     require_devices(4, "cpu")
     mesh = Mesh(np.asarray(jax.devices("cpu")[:4]).reshape(2, 2), ("x", "y"))
     rotations = np.eye(3, dtype=np.int32)[None]
@@ -564,7 +565,7 @@ def test_two_component_ordered_store_synthesizes_lehmann_sums(tmp_path):
     # The Sigma realization gate admits the two-component charge store.
     realize = shared_pole_operator_realizer(meta, header, q_full_idx=np.arange(3), mesh_xy=mesh)
     realized = realize(plus, transposed)[0]
-    valence = shared_pole_hole_kernel(mesh)(plus, put(shared_pole_minus_q_index((3, 1, 1)), P()))
+    valence = shared_pole_hole_kernel(mesh)(plus, put(q_negation_index((3, 1, 1)), P()))
     unpack = jax.jit(lambda a: basis.unpack_operator(a, spec=P(None, "x", "y")))
     plus, realized, valence = (np.asarray(unpack(a))[:, :n, :n] for a in (plus, realized, valence))
     for row, plant in enumerate(plants):
@@ -586,13 +587,14 @@ def test_debug_even_part_kernel_equals_union_store_synthesis():
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from lxkit.testing import require_devices
     from gw.mpa.sigma import (
-        shared_pole_even_part_kernel, shared_pole_hole_kernel, shared_pole_minus_q_index, synthesize_shared_pole_parents)
+        shared_pole_even_part_kernel, shared_pole_hole_kernel, synthesize_shared_pole_parents)
+    from symmetry_maps import q_negation_index
     require_devices(4, "cpu")
     mesh = Mesh(np.asarray(jax.devices("cpu")[:4]).reshape(2, 2), ("x", "y"))
     rng = np.random.default_rng(41)
     q, mq = _generic_pair(rng, 6, 4)
     plants = (_physical(rng, 6, 4)[0], q, mq)
-    minus = shared_pole_minus_q_index((3, 1, 1)).tolist()
+    minus = q_negation_index((3, 1, 1)).tolist()
     models = []
     for plant in plants:
         model, _, _, _ = _ordered(plant, .9 + .35j)
