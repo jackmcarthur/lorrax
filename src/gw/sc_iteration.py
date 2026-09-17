@@ -3375,6 +3375,22 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 nk_tot=int(inputs.meta.nk_tot),
             )
 
+    # The head enters Sigma band-diagonally, so its occupations must be one
+    # value per exactly degenerate multiplet of the ladder Sigma is diagonal
+    # in; otherwise this map's H breaks the little group and inversion times
+    # time reversal, and the next map's screening loses reciprocity.
+    if iteration_head is not None:
+        from .head_correction import refuse_split_multiplet_head_occupations
+        refuse_split_multiplet_head_occupations(
+            iteration_head.sigma_energies_ry, iteration_head.sigma_occupations,
+            where=f"SC map {int(state.iteration)} dynamic head")
+        if head_occ_kn is not None and bool(inputs.config.do_G0):
+            nb_sigma = int(inputs.meta.nb_sigma)
+            refuse_split_multiplet_head_occupations(
+                np.asarray(wfns_qp.enk[:, :nb_sigma]),
+                np.asarray(head_occ_kn)[:, :nb_sigma],
+                where=f"SC map {int(state.iteration)} static head")
+
     # Under mpa_material_class = metal the finite-q body above went through
     # build_mpa_fit(occupation_state=...) — fractional contour lines and the
     # ordered-pair shifted-origin rows.  Insulating decks keep the historical
