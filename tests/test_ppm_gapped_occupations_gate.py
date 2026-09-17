@@ -1,11 +1,12 @@
 """The GN/HL plasmon-pole Sigma refuses a metallic occupation table.
 
-WHY THE DECK KEY IS NOT ENOUGH.  ``gw_config._validate_metal_compute_mode``
-already refuses ``mpa_material_class = metal`` outside ``compute_mode = mpa``
--- but ``insulator`` is the DEFAULT, so a metallic system run without the key
-reaches this driver with nothing objecting.  A deck key is a DECLARATION;
-whether a band crosses E_F is a property of the SPECTRUM, and only the second
-one can be measured here.
+WHY THE MATERIAL DOOR IS NOT ENOUGH.  ``gw_config.validate_material_inputs``
+refuses GN-PPM on fractional WFN occupations (``GATE gn_ppm_refuses_metals``,
+owner ruling 2026-09-17), but a WFN written with integer occupations can still
+carry a band crossing the step table's Fermi level.  Whether a band crosses
+E_F is a property of the SPECTRUM, and only that can be measured here.  There
+is no override: the former ``LORRAX_PPM_ALLOW_CROSSING_BANDS`` hatch was the
+one way to run GN-PPM on a metal and was removed with the ruling.
 
 WHAT THE DRIVER DOES IF IT RUNS ANYWAY.  ``_prepare_sigma_state`` derives
 ``vbm = max(enk | occupied)`` and ``cbm = min(enk | empty)``.  With a
@@ -35,9 +36,10 @@ import pytest
 pytest.importorskip("jax")
 
 from gw.ppm_sigma import (                                       # noqa: E402
-    _PPM_METAL_ENV,
     assert_gapped_occupations_for_ppm,
 )
+
+_REMOVED_OVERRIDE = "LORRAX_PPM_ALLOW_CROSSING_BANDS"
 
 
 def _gapped(nk=6, nb=10, n_occ=4):
@@ -63,13 +65,13 @@ def test_a_gapped_table_passes_and_reports_zero(monkeypatch):
     NUMBER rather than merely not raising, so "checked and clean" and "never
     reached" are distinguishable.
     """
-    monkeypatch.delenv(_PPM_METAL_ENV, raising=False)
+    monkeypatch.delenv(_REMOVED_OVERRIDE, raising=False)
     assert assert_gapped_occupations_for_ppm(
         _gapped(), print_fn=lambda *_a: None) == 0
 
 
 def test_a_crossing_band_refuses_by_name_and_says_which_band(monkeypatch):
-    monkeypatch.delenv(_PPM_METAL_ENV, raising=False)
+    monkeypatch.delenv(_REMOVED_OVERRIDE, raising=False)
     with pytest.raises(ValueError) as exc:
         assert_gapped_occupations_for_ppm(
             _metallic(crossing=(4,)), print_fn=lambda *_a: None)
@@ -77,28 +79,26 @@ def test_a_crossing_band_refuses_by_name_and_says_which_band(monkeypatch):
     assert "GATE ppm_sigma_gapped_occupations" in msg
     assert "[4]" in msg, msg
     # It must name the SUPPORTED route, not merely say no.
-    assert "compute_mode = mpa" in msg and "mpa_material_class = metal" in msg
+    assert "compute_mode = mpa" in msg and "sigma_w_model = shared_pole" in msg
+    assert "owner ruling 2026-09-17" in msg
     # and the mechanism, so the reader can tell this from a shape complaint
     assert "vbm > cbm" in msg
 
 
 def test_several_crossing_bands_are_all_counted(monkeypatch):
-    monkeypatch.delenv(_PPM_METAL_ENV, raising=False)
+    monkeypatch.delenv(_REMOVED_OVERRIDE, raising=False)
     with pytest.raises(ValueError, match=r"3 Fermi-crossing"):
         assert_gapped_occupations_for_ppm(
             _metallic(nb=12, crossing=(3, 4, 5)), print_fn=lambda *_a: None)
 
 
-def test_the_override_continues_loudly_rather_than_silently(monkeypatch):
-    """An escape hatch that says nothing is an escape hatch nobody can audit."""
-    monkeypatch.setenv(_PPM_METAL_ENV, "1")
-    said: list[str] = []
-    n = assert_gapped_occupations_for_ppm(
-        _metallic(crossing=(4,)), print_fn=said.append)
-    assert n == 1
-    blob = " ".join(said)
-    assert _PPM_METAL_ENV in blob
-    assert "debugging override" in blob
+def test_the_removed_override_no_longer_admits_a_crossing_spectrum(monkeypatch):
+    """Owner ruling 2026-09-17: GN-PPM is not allowed for metals, so the
+    former debugging hatch refuses exactly like the unset case."""
+    monkeypatch.setenv(_REMOVED_OVERRIDE, "1")
+    with pytest.raises(ValueError, match="GATE ppm_sigma_gapped_occupations"):
+        assert_gapped_occupations_for_ppm(
+            _metallic(crossing=(4,)), print_fn=lambda *_a: None)
 
 
 def test_the_gate_is_called_before_the_state_prep_that_needs_it():
