@@ -253,6 +253,15 @@ Every construction receipt row carries version, value, threshold and PASS/FAIL/W
 | `capacity`, `stream_peak`, `sigma_peak` | device admission within budget; inherited peaks recorded separately | capacity yes |
 | `rule_validity`, `sc_rebuild` | bank and Σ certificates cover the current domains; SC rebuilds from current bands | yes |
 
+Ordered `gram_valid` tests both the equilibrated `H'_vv` spectrum and the
+restricted paired `H_r` spectrum. A passing `gram_min_relative` alone does
+not certify this gate: `paired_min_relative` must also pass, both spectra
+must be finite, and the first spectral maximum must be positive. Ordered
+refusals print every scalar diagnostic, including separate first and paired
+metric-correction predicates, infinity norms and inverse-root residuals.
+The second metric fields use the `paired_metric_` prefix. Reporting these
+values changes neither the keep cuts nor acceptance.
+
 Fast CPU tests (4 host devices where a mesh is needed):
 
 | test | pins |
