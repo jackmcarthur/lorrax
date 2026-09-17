@@ -138,7 +138,6 @@ and refused by name; see the
 | `ppm_omega_p` | `2.0` | Second PPM probe frequency (Ry): i*omega_p for GN, real omega_p for HL. |
 | `ppm_fallback_omega` | `2.0` | Positive real fallback pole (Ry) for elements with no valid Omega^2 fit. |
 | `ppm_head_omega_h_ry` | None | Override the q->0 head pole Omega_h (Ry) directly; None = compute normally. BGW comparison aid. |
-| `ppm_probe_chi_reuse` | `"off"` | Retired 2026-09-17. `auto` refuses by name (`GATE ppm_probe_chi_reuse_retired`, `gw.screening`); the GN-PPM probe chi0 is always its own dedicated imaginary-axis pass. The key is still parsed and leaves input resolution with its next change. |
 | `ppm_invalid_mode` | `"static_limit"` | Invalid-pole treatment: static_limit (default, BGW mode 3) | zero (BGW 0) | 2ry (BGW 2). |
 
 ## Sigma

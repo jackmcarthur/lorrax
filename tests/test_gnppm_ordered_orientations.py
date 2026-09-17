@@ -38,7 +38,6 @@ from gw import w_isdf  # noqa: E402
 from gw.mpa import evaluator as mpa_evaluator  # noqa: E402
 from gw.mpa import pade_fit as mpa_pade_fit  # noqa: E402
 from gw.ppm_sigma import _residue_for_space  # noqa: E402
-from gw.screening import refuse_retired_probe_chi_reuse  # noqa: E402
 from gw.wavefunction_bundle import (  # noqa: E402
     BandSlices,
     PSI_MUN_SPEC,
@@ -853,12 +852,21 @@ def test_scalar_head_annihilates_the_odd_part_of_the_head_tensor():
 #  8. Refusals and the odd-kernel rule.
 # ---------------------------------------------------------------------------
 
-def test_retired_probe_chi_reuse_refuses_by_name():
-    """The fused probe path is gone on every deck; only the default passes."""
-    with pytest.raises(ValueError, match="ppm_probe_chi_reuse_retired"):
-        refuse_retired_probe_chi_reuse("auto")
-    refuse_retired_probe_chi_reuse("off")
-    refuse_retired_probe_chi_reuse(" OFF ")
+def test_retired_probe_chi_reuse_key_refuses_at_parse(tmp_path):
+    """The fused probe path is gone and its deck key left input resolution:
+    any value, the old default included, refuses at parse as an unknown key."""
+    from gw.gw_config import LorraxConfig, _DEFAULTS
+    assert "ppm_probe_chi_reuse" not in _DEFAULTS
+    import gw.screening as screening
+    assert not hasattr(screening, "refuse_retired_probe_chi_reuse")
+    for value in ("auto", "off"):
+        deck = tmp_path / f"probe_{value}.in"
+        deck.write_text("[cohsex]\nnval = 2\nncond = 2\nnband = 10\n"
+                        "memory_per_device_gb = 4.0\n"
+                        f"ppm_probe_chi_reuse = {value}\n")
+        with pytest.raises(ValueError, match="ppm_probe_chi_reuse"):
+            LorraxConfig.from_input_file(
+                str(deck), print_fn=lambda *args, **kwargs: None)
 
 
 @pytest.mark.parametrize("x_min,x_max", [(0.12, 6.0), (0.0687, 8.0), (0.04, 10.0)])

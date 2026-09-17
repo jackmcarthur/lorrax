@@ -210,7 +210,7 @@ def test_the_production_call_sites_all_thread_the_verdict():
     src = inspect.getsource(screening.compute_screening)
     calls = re.findall(r"_gate_w\((?:[^()]|\([^()]*\))*\)", src)
     # Static role and dedicated probe role; the reused-probe role left with
-    # ppm_probe_chi_reuse (2026-09-17).
+    # the retired fused probe path (2026-09-17).
     assert len(calls) == 2, f"expected 2 _gate_w call sites, found {calls}"
     for call in calls:
         assert "trs_allowed=" in call, call

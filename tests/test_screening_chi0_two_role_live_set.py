@@ -188,12 +188,8 @@ def test_a_scheduler_that_never_spills_is_caught():
 # 3. The production seam: gw.screening.compute_screening itself
 # ---------------------------------------------------------------------------
 
-class _StubPPM:
-    probe_chi_reuse = "off"
-
-
 class _StubConfig:
-    ppm = _StubPPM()
+    ppm = None
     minimax_config = None
 
 

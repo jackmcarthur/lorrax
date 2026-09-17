@@ -1728,25 +1728,6 @@ _DEFAULTS = {
     # ε_head averaging convention as a source of disagreement.
     # None = compute Ω_h normally (analytic for HL, 2-pt fit for GN).
     "ppm_head_omega_h_ry": None,
-    # Probe-χ₀ reuse (GN model only).  The probe-ω screening pass rebuilds
-    # χ₀ with its own imaginary-axis minimax nodes — a second full τ sweep
-    # (Gv/Gc build + FFTs + contraction per node) costing nearly as much
-    # as the static pass (scorecard BC: 9.6 s vs 9.1 s at b300/P=16).
-    #   "off"  (default) — dedicated probe quadrature, today's exact path.
-    #   "auto" — represent the probe integrand x/(x²+ωp²) on the STATIC
-    #        pass's τ nodes plus the MINIMAL augmentation from the
-    #        dedicated quadrature's node set (Lawson-weighted fits;
-    #        minimax_screening.refit_imag_alpha_augmented) at an error no
-    #        worse than max(dedicated err, target_error); the probe χ₀
-    #        then accumulates as a second weighted sum inside ONE fused τ
-    #        sweep — shared nodes' tensors are computed once and only the
-    #        k extras cost new compute.  Guaranteed fallback: with every
-    #        extra node in, the exact dedicated weights are installed.
-    # Numerics: same quadrature-error contract, different bits — NOT
-    # bit-identical to "off" (pinned-baseline decks must keep "off" until
-    # their references are re-pinned).  HL probes (real axis) always take
-    # the dedicated path.
-    "ppm_probe_chi_reuse": "off",
     # Multipole W sampling / bounded Sigma consumption.
     "mpa_n_poles": 8,
     "mpa_sampling_alpha": None,
@@ -2026,7 +2007,6 @@ _NORMALIZE_STR = {
     "linalg",
     "ppm_invalid_mode",
     "ppm_model",
-    "ppm_probe_chi_reuse",
     # ``restart_q_storage`` normalises here and is VALIDATED at parse time.
     "restart_q_storage",
     # ``qp_rotations_k_storage`` normalises and validates the same way, for
@@ -2648,7 +2628,6 @@ def _input_response(
         head_omega_h_ry=(
             float(params["ppm_head_omega_h_ry"])
             if params["ppm_head_omega_h_ry"] is not None else None),
-        probe_chi_reuse=str(params["ppm_probe_chi_reuse"]).strip().lower(),
         invalid_mode=str(params["ppm_invalid_mode"] or "static_limit").strip().lower(),
     )
     mpa = MPAConfig(
@@ -4083,12 +4062,6 @@ class PPMConfig:
     omega_p: float                # probe ω (Ry); imag for GN, real for HL
     fallback_omega: float
     head_omega_h_ry: float | None # override Ω_h directly (BGW comparisons)
-    #: Probe-χ₀ reuse: "off" (dedicated probe quadrature, exact historical
-    #: path) | "auto" (weights-only refit on the static τ nodes, probe χ₀
-    #: folded into the static sweep when the error gate passes — see
-    #: _DEFAULTS["ppm_probe_chi_reuse"]).
-    probe_chi_reuse: str
-
     invalid_mode: str             # "zero" | "2ry" | "static_limit" | "infinity"(alias)
 
     def __post_init__(self):
@@ -4102,10 +4075,6 @@ class PPMConfig:
         ):
             raise ValueError(
                 f"ppm.invalid_mode: unknown value {self.invalid_mode!r}")
-        if self.probe_chi_reuse not in ("off", "auto"):
-            raise ValueError(
-                "ppm_probe_chi_reuse must be 'off' or 'auto'; "
-                f"got {self.probe_chi_reuse!r}.")
 
 
 @dataclass(frozen=True)

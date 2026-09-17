@@ -559,8 +559,6 @@ def compute_screening(
     # refuse in ``_trs_verdict`` rather than selecting a branch. See
     # ``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md``.
     _tr_odd = _trs_verdict(sym) is False
-    refuse_retired_probe_chi_reuse(
-        str(getattr(config.ppm, "probe_chi_reuse", "off")))
     # Bar/ETA cadence over the W roles; long phases inside also announce via
     # ``timing.section(..., announce=True)`` (see the note at module top).
     bar = LoopProgress(
@@ -898,27 +896,6 @@ _TR_ODD_W_HERMITICITY_CAUSE = (
     "an index/shard mixing fault.  Judge it against the same run's ω = 0 "
     "role, which is gated unconditionally."
 )
-
-
-def refuse_retired_probe_chi_reuse(reuse_mode: str) -> None:
-    """``ppm_probe_chi_reuse = auto`` is retired (owner-approved hold 3, 2026-09-17).
-
-    It folded the GN-PPM probe χ₀ into the static τ sweep as a second weight
-    row on augmented nodes.  Every imaginary frequency of the finite-temperature
-    Matsubara producer comes from one τ sweep by construction, so the fused
-    path has no remaining purpose; the dedicated probe pass is the GN-PPM route.
-    The deck key itself is resolved in ``gw_config`` and retires with the next
-    input-resolution change; until then ``auto`` refuses here by name.
-    """
-    if str(reuse_mode).strip().lower() != "off":
-        raise ValueError(
-            "GATE ppm_probe_chi_reuse_retired: the fused GN-PPM probe chi0 "
-            "path is removed.\n"
-            f"  got:  ppm_probe_chi_reuse = {reuse_mode!r}\n"
-            "  want: ppm_probe_chi_reuse = off (the default), or delete the key\n"
-            "  why:  the probe chi0 is built by its own dedicated imaginary-axis "
-            "pass; the fused static-sweep accumulator no longer exists\n"
-            "  doc:  docs/input_reference.md")
 
 
 def _trs_verdict(sym) -> bool:
