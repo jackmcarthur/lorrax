@@ -1337,6 +1337,8 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     ``constant`` field is W_infinity-V. M0..M3 use the same convention as the
     ordered charge bank. Both CT and TC are retained. The scalar producer,
     memory planner, quadrature, transaction masks and reader are shared.
+    Later SC maps supply ``bank_io['static_reference']`` with the initial
+    bank's ``path`` and ``identity`` to keep its contact fixed.
     """
     from file_io.shared_pole_store import validate_shared_pole_bank
     from file_io.slab_io import SlabIO
@@ -1377,9 +1379,23 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     before = time.monotonic()
     if jax.process_index() == 0:
         print("photon bank: centroid D and static grid reference", flush=True)
-    grid, drude, contact = photon_static_contact(wfns, meta, mesh_xy=mesh_xy,
-        layout=layout, vertex=vertex, occupation_state=occupation_state,
-        sample_plan=sample_plan, execute=execute, receipt=receipt)
+    reference = bank.get("static_reference")
+    if reference is None:
+        grid, drude, contact = photon_static_contact(wfns, meta, mesh_xy=mesh_xy,
+            layout=layout, vertex=vertex, occupation_state=occupation_state,
+            sample_plan=sample_plan, execute=execute, receipt=receipt)
+        reference = {key: bank[key] for key in ("path", "identity")}
+    else:
+        initial = validate_shared_pole_bank(reference["path"],
+            expected_identity=reference["identity"], mesh_xy=mesh_xy, require_complete=True)
+        for key in ("photon_layout", "photon_centroid_digests"):
+            if initial.get(key) != header[key]:
+                raise ValueError(f"GATE photon_static_reference: initial/current {key} differs")
+        with SlabIO(reference["path"], mode="r", mesh=mesh_xy) as io:
+            grid, drude, contact = (io.read_slab(key, shape=(1,n,n),
+                partition_spec=P(None,"x","y"), dtype=np.complex128)
+                for key in ("Pi_grid", "Drude", "TT_contact"))
+    receipt["static_reference"] = reference
     # Persist the contact's two physically defined pieces as bank diagnostics;
     # the constructor consumes the separately committed constant, not these.
     with SlabIO(bank["path"], mode="a", mesh=mesh_xy) as io:
