@@ -51,52 +51,84 @@ _PRODUCER_TOKEN = object()
 HALL_SOURCE_NONE = "none: sigma_H = 0 (no static_gauge_hall_file)"
 
 
-def fermi_dirac_current_drude(current_kn_a, occupation_state, *,
-                              state_capacity, cell_volume, kweights):
-    r"""Return the fixed-state body-contact tensor D, not a head update.
+def fermi_dirac_current_drude(current_faces, occupation_state, *,
+                              state_capacity, cell_volume, kweights, mesh_xy):
+    r"""Return centroid-resolved D from the bank's diagonal current densities.
 
-    Computes ``D_ab=C/Omega sum_kn w_k (-f'_kn) j_kn,a j_kn,b`` with
-    ``-f'=f(1-f)/kT`` from the authoritative Fermi-Dirac occupation state.
-    For a uniform full grid ``w_k=1/Nk``. The caller builds this once from
-    the initial state and retains it through SC maps.
+    Implements ``D_mu,nu = C/Omega sum_kn w_k (-f'_kn)
+    j_kn(mu) conj(j_kn(nu))``, with ``-f'=f(1-f)/kT``. The packed
+    centroid axis includes the current component. Charge slots must be zero.
+    This body contact is built once per bank; it is not a head update.
 
     Parameters
     ----------
-    current_kn_a : jax.Array
-        Real diagonal Hermitian-current matrix elements ``[k,band,3]``.
-        Currents use the same units as the paramagnetic TT response.
-        These linear-size tables may be sharded; the tensor is replicated.
+    current_faces : tuple of jax.Array
+        Diagonal transition densities at the same endpoints as the stream:
+        ``[k,mu,band]`` at ``P(None,'x','y')`` and ``[k,band,nu]`` at
+        ``P(None,'x','y')``. Only linear-size carriers redistribute.
     occupation_state : OccupationState
-        Fixed initial FD occupations and smearing width in Ry.
+        The bank's FD occupations and smearing width in Ry.
     state_capacity : float
-        Physical occupancy per normalized state, from the WFN loader.
+        Physical occupancy per normalized state from the WFN loader.
     cell_volume : float
         Cell volume in bohr cubed.
     kweights : array_like
-        Normalized full-BZ quadrature weights ``[k]``.
-
-    Returns
-    -------
-    jax.Array
-        Real ``[3,3]`` Drude tensor. No symmetry averaging is performed.
+        Normalized full-BZ weights ``[k]``; uniform grid uses ``1/Nk``.
+    mesh_xy : Mesh
+        Named x/y mesh. The result is complex ``[mu,nu]`` at ``P('x','y')``.
     """
+    from common.shard_map import shard_map
+
     if occupation_state.smearing_family != "fd":
         raise ValueError("GATE photon_contact_fd: TT metal contact requires FD state")
     width = float(occupation_state.smearing_width_ry)
     capacity, volume = float(state_capacity), float(cell_volume)
-    current = jnp.asarray(current_kn_a)
+    left, right = current_faces
     f = jnp.asarray(occupation_state.f_kn)
     weights = np.asarray(kweights, dtype=np.float64)
-    if current.shape != (*f.shape, 3) or jnp.iscomplexobj(current):
-        raise ValueError("GATE photon_contact_current: want real diagonal [k,band,3] currents")
+    if (left.ndim != 3 or right.ndim != 3
+            or (left.shape[0], left.shape[2]) != f.shape
+            or right.shape[:2] != f.shape):
+        raise ValueError("GATE photon_contact_current: want diagonal current faces [k,mu,n], [k,n,nu]")
     if (not np.isfinite([width, capacity, volume]).all()
             or min(width, capacity, volume) <= 0
             or weights.shape != (f.shape[0],) or not np.isfinite(weights).all()
             or np.any(weights < 0) or not np.isclose(weights.sum(), 1, rtol=0, atol=1e-12)):
         raise ValueError("GATE photon_contact_state: invalid FD scale, volume or k weights")
-    return (capacity / volume) * jnp.einsum(
-        "kn,kna,knb->ab", jnp.asarray(weights)[:, None] * f * (1-f) / width,
-        current, current, optimize=True)
+    # Replicate only the band axis of these O(k*n*mu) carriers. Every
+    # quadratic output remains tiled over BOTH mesh axes throughout.
+    contract = shard_map(
+        lambda l, r, w: jnp.einsum("kmn,kn,knv->mv", l, w, r.conj()),
+        mesh=mesh_xy, in_specs=(P(None, "x", None), P(None, None, "y"), P()),
+        out_specs=P("x", "y"), check_vma=False)
+    weight = (capacity / volume) * jnp.asarray(weights)[:, None] * f * (1-f) / width
+    return jax.jit(contract)(left, right, weight)
+
+
+def photon_diagonal_current_faces(vertex, *, mesh_xy, layout, wfn_layout="face"):
+    """Contract psi-dagger J psi at each centroid of the stream endpoints.
+
+    ``vertex`` is the output of ``prepare_photon_carriers``. The two
+    linear-size current faces keep its band/centroid sharding. The charge
+    channel and internal padding are exactly zero, so their outer product
+    has TT support only. No uniform-current embedding is performed.
+    """
+    from common.shard_map import shard_map
+    from common.wfn_layout import psi_specs
+    from functools import partial
+
+    nmu_spec, mun_spec = psi_specs(wfn_layout)
+    @partial(shard_map, mesh=mesh_xy,
+             in_specs=((mun_spec, mun_spec), (nmu_spec, nmu_spec)),
+             out_specs=(P(None, "x", "y") if wfn_layout == "face" else P(None, "x", None),
+                        P(None, "x", "y") if wfn_layout == "face" else P(None, None, "y")),
+             check_vma=False)
+    def currents(mun, nmu):
+        left = jnp.sum(mun[0].conj() * mun[1], axis=1)
+        right = jnp.sum(nmu[0].conj() * nmu[1], axis=2)
+        charge_width = layout.carrier_extent(0) // layout.mesh_side
+        return left.at[:, :charge_width, :].set(0), right.at[:, :, :charge_width].set(0)
+    return jax.jit(currents)(vertex[0], vertex[1])
 
 
 def _canonical_wfn_sha256(value) -> str:

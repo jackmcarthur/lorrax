@@ -130,6 +130,22 @@ def check_fractional_vertex_stream_supercell(mesh, put):
     np.testing.assert_allclose(np.asarray(gather_to_host(result))/np.sqrt(lat.nk),
                                reference, rtol=3e-12, atol=3e-13)
 
+    # Static FD reference at q=0. The same stream includes the -f' diagonal
+    # contribution; removing it yields the finite-grid interband Pi_grid.
+    import minimax
+    rule = minimax.matsubara_response_rule(1/0.7, float(e.max()-e.min()), (0,))
+    static = _get_chi_fractional_contour_kernel_face(mesh, (lat.n1, lat.n2, 1),
+        1, (lat.nk, 8, 8, 4), selected_q=(0,), pair_mode="kms_static",
+        ordered=True, vertex=True)
+    result = static(put(rule["t"]), put(rule["weights"]), mun, nmu, put(e),
+                    put(np.ones_like(f)), put(np.ones_like(f)), put(np.array([1/0.7, mu])))
+    weights = np.divide(df, delta, out=np.zeros_like(df), where=delta != 0)
+    np.fill_diagonal(weights, -f.reshape(-1)*(1-f.reshape(-1))/0.7)
+    correlation = np.einsum("ab,abmA,abrnB->mArnB", weights, rho[:, :, 0], rho.conj())
+    reference = np.sum(correlation, axis=2).transpose(1, 0, 3, 2).reshape(8, 8)
+    np.testing.assert_allclose(np.asarray(gather_to_host(result))[0, 0]/np.sqrt(lat.nk),
+                               reference, rtol=2e-8, atol=2e-9)
+
 
 def test_fractional_vertex_stream_supercell(cpu_standins):
     mesh = Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
