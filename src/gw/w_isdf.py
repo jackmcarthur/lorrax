@@ -1103,39 +1103,106 @@ def _chi_layout_operands(wfns, eref):
             mask_v, mask_c, enk_full)
 
 
-def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
-    """Compute χ₀(q) from a wavefunction bundle and minimax quadrature; see docs/architecture/four_current_wiring.md."""
-    ensure_jax_compile_cache()
-    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+# ----------------------------------------------------------------------------
+# Gapped imaginary-time response (step occupations): host prep and wrappers.
+# Every public entry below builds its nodes through ``_minimax_chi_operands``
+# and runs the one kernel through ``_run_minimax_chi``.
+# ----------------------------------------------------------------------------
 
+def _gap_edges(wfns, energy_reference):
+    """Return ``(eref, vmax, cmin)``: the step partition's valence maximum and conduction minimum about ``energy_reference``, host floats in Ry."""
     s = wfns.slices
-    enk_v = wfns.enk[:, s.val]
-    enk_c = wfns.enk[:, s.cond]
     eref = 0.0 if energy_reference is None else float(energy_reference)
-    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64) - eref
-    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64) - eref
-    vmax = float(np.max(enk_v_host))
-    cmin = float(np.min(enk_c_host))
-    E_gap = cmin - vmax
+    enk_v_host = np.asarray(jax.device_get(wfns.enk[:, s.val]), dtype=np.float64) - eref
+    enk_c_host = np.asarray(jax.device_get(wfns.enk[:, s.cond]), dtype=np.float64) - eref
+    return eref, float(np.max(enk_v_host)), float(np.min(enk_c_host))
 
-    tau = np.asarray(quad.tau, dtype=np.float64)
-    # Fold the one-orientation prefactor (-exp(-τ·E_gap)) into α.  The
-    # kernel adds A_R + conj(A_R), the two ordered particle-hole
-    # orientations, before this weight is applied.  ``MinimaxNodes`` carries
-    # both in complex128; τ has Im=0 for the Laplace quad.
-    alpha_chi = -1.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
+
+def _minimax_chi_operands(wfns, eref, vmax, cmin, t, alpha):
+    """Pack complex128 nodes with the face operands and the two edge references."""
     nodes = MinimaxNodes(
-        t=jnp.asarray(tau, dtype=jnp.complex128),
-        alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
+        t=jnp.asarray(t, dtype=jnp.complex128),
+        alpha=jnp.asarray(alpha, dtype=jnp.complex128),
     )
-
-    kernel = _get_chi_minimax_kernel(
-        mesh_xy, kgrid, **_chi_parent_face_kwargs(wfns))
-    return kernel(
+    return (
         nodes, *_chi_layout_operands(wfns, eref),
         jnp.asarray(vmax, dtype=jnp.float64),
         jnp.asarray(cmin, dtype=jnp.float64),
     )
+
+
+def _run_minimax_chi(wfns, meta, mesh_xy, args, *, kwargs, n_out=1,
+                     complex_contour=False, compile_only=False):
+    """Execute, or only lower and compile, the gapped response kernel on ``args``."""
+    ensure_jax_compile_cache()
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    kernel = _get_chi_minimax_kernel(
+        mesh_xy, kgrid, n_out=n_out, complex_contour=complex_contour,
+        **kwargs)
+    if compile_only:
+        kernel.lower(*args).compile()
+        return None
+    return kernel(*args)
+
+
+def _laplace_chi_args(wfns, tau, alpha_rows, energy_reference):
+    """Real-node operands with the one-orientation prefold in every weight row; see docs/architecture/four_current_wiring.md."""
+    eref, vmax, cmin = _gap_edges(wfns, energy_reference)
+    E_gap = cmin - vmax
+    tau = np.asarray(tau, dtype=np.float64)
+    alpha_rows = np.asarray(alpha_rows, dtype=np.float64)
+    if alpha_rows.ndim != 2 or alpha_rows.shape[1] != tau.shape[0]:
+        raise ValueError(
+            f"chi0 Laplace: alpha_rows shape {alpha_rows.shape} does not "
+            f"match tau nodes ({tau.shape[0]},) — every row must be a "
+            f"weight vector on quad.tau.")
+    # Fold the one-orientation prefactor (-exp(-τ·E_gap)) into α.  The
+    # kernel adds A_R + conj(A_R), the two ordered particle-hole
+    # orientations, before this weight is applied.
+    alpha_chi = -1.0 * alpha_rows * np.exp(-tau * E_gap)[None, :]
+    n_out = alpha_chi.shape[0]
+    return _minimax_chi_operands(
+        wfns, eref, vmax, cmin, tau,
+        alpha_chi[0] if n_out == 1 else alpha_chi), n_out
+
+
+def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
+    """Compute χ₀(q) from a wavefunction bundle and minimax quadrature; see docs/architecture/four_current_wiring.md."""
+    args, _ = _laplace_chi_args(
+        wfns, quad.tau, np.asarray(quad.alpha)[None, :], energy_reference)
+    return _run_minimax_chi(
+        wfns, meta, mesh_xy, args, kwargs=_chi_parent_face_kwargs(wfns))
+
+
+def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
+    """AOT lower+compile of the χ₀ minimax kernel at the real input shapes/shardings — warms the JAX in-process cache so the first ``compute_chi0`` call is execution-only; see docs/architecture/four_current_wiring.md."""
+    if len(np.asarray(quad.tau)) == 0:
+        return  # compute_chi0 falls through to a static-zeros path — nothing to compile
+    args, _ = _laplace_chi_args(
+        wfns, quad.tau, np.asarray(quad.alpha)[None, :], energy_reference)
+    _run_minimax_chi(wfns, meta, mesh_xy, args,
+                     kwargs=_chi_parent_face_kwargs(wfns), compile_only=True)
+
+
+def compute_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
+                       energy_reference=0.0):
+    """χ₀ at several weight vectors over ONE τ sweep — see
+    ``_get_chi_minimax_kernel(n_out>=2)``.  Returns an ``n_out``-tuple of
+    flat-q (nq, μ, μ) arrays, one per row of ``alpha_rows``."""
+    args, n_out = _laplace_chi_args(wfns, tau, alpha_rows, energy_reference)
+    return _run_minimax_chi(wfns, meta, mesh_xy, args, n_out=n_out,
+                            kwargs=_chi_parent_face_kwargs(wfns))
+
+
+def precompile_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
+                          energy_reference=None):
+    """AOT lower+compile sibling of :func:`precompile_chi0` for the
+    multi-output kernel."""
+    if len(np.asarray(tau)) == 0:
+        return
+    args, n_out = _laplace_chi_args(wfns, tau, alpha_rows, energy_reference)
+    _run_minimax_chi(wfns, meta, mesh_xy, args, n_out=n_out,
+                     kwargs=_chi_parent_face_kwargs(wfns), compile_only=True)
 
 
 def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
@@ -1149,14 +1216,7 @@ def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
             "  why:  without odd weights the time-reversal-odd response "
             "channel is zero by construction\n"
             "  doc:  docs/dev/notes/DERIVATION_gnppm_nonhermitian.md")
-    s = wfns.slices
-    enk_v = wfns.enk[:, s.val]
-    enk_c = wfns.enk[:, s.cond]
-    eref = 0.0 if energy_reference is None else float(energy_reference)
-    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64) - eref
-    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64) - eref
-    vmax = float(np.max(enk_v_host))
-    cmin = float(np.min(enk_c_host))
+    eref, vmax, cmin = _gap_edges(wfns, energy_reference)
     E_gap = cmin - vmax
     tau = np.asarray(quad.tau, dtype=np.float64)
     alpha = np.asarray(quad.alpha, dtype=np.float64)
@@ -1170,31 +1230,30 @@ def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
     # DERIVATION_gnppm_nonhermitian.md section 2).  The conjugate partner
     # receives conj(gamma) through the q-negated conjugate below.
     gamma = -(alpha - 1j * beta) * np.exp(-tau * E_gap)
-    nodes = MinimaxNodes(
-        t=jnp.asarray(tau, dtype=jnp.complex128),
-        alpha=jnp.asarray(gamma, dtype=jnp.complex128),
-    )
-    return (
-        nodes, *_chi_layout_operands(wfns, eref),
-        jnp.asarray(vmax, dtype=jnp.float64),
-        jnp.asarray(cmin, dtype=jnp.float64),
-    )
+    return _minimax_chi_operands(wfns, eref, vmax, cmin, tau, gamma)
 
 
 def compute_chi0_imag_ordered(wfns, quad, meta, mesh_xy, *, q_neg_index,
                               energy_reference=0.0):
     """χ₀(q; iω_p) with BOTH particle-hole orientations carrying their own frequency weight — the route for a deck whose measured time-reversal verdict is false; see docs/architecture/four_current_wiring.md."""
-    ensure_jax_compile_cache()
-    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     args = _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference)
-    kernel = _get_chi_minimax_kernel(
-        mesh_xy, kgrid, n_out=1, complex_contour=True,
-        **_chi_face_kwargs(wfns))
-    F_q = kernel(*args)
+    F_q = _run_minimax_chi(wfns, meta, mesh_xy, args, complex_contour=True,
+                           kwargs=_chi_face_kwargs(wfns))
     # On the imaginary axis -conj(z) = z: the partner is the same sweep.
     q_neg = _q_negation_operand(
         q_neg_index, F_q.shape[0], caller="compute_chi0_imag_ordered")
     return _complete_ordered(F_q, F_q, q_neg)
+
+
+def precompile_chi0_imag_ordered(wfns, quad, meta, mesh_xy, *,
+                                 energy_reference=None):
+    """AOT sibling of :func:`compute_chi0_imag_ordered` (the contour
+    kernel's compile; the completion gather is negligible)."""
+    if len(np.asarray(quad.tau)) == 0:
+        return
+    args = _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference)
+    _run_minimax_chi(wfns, meta, mesh_xy, args, complex_contour=True,
+                     kwargs=_chi_face_kwargs(wfns), compile_only=True)
 
 
 def _q_negation_operand(q_neg_index, nq, *, caller):
@@ -1216,19 +1275,119 @@ def _complete_ordered(F_q_z, F_q_reflected, q_neg):
     return F_q_z + jnp.conj(jnp.take(F_q_reflected, q_neg, axis=0))
 
 
-def precompile_chi0_imag_ordered(wfns, quad, meta, mesh_xy, *,
-                                 energy_reference=None):
-    """AOT sibling of :func:`compute_chi0_imag_ordered` (the contour
-    kernel's compile; the completion gather is negligible)."""
-    if len(np.asarray(quad.tau)) == 0:
-        return
-    ensure_jax_compile_cache()
-    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    args = _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference)
-    kernel = _get_chi_minimax_kernel(
-        mesh_xy, kgrid, n_out=1, complex_contour=True,
-        **_chi_face_kwargs(wfns))
-    kernel.lower(*args).compile()
+def _chi0_contour_alpha_rows(tau, weight_rows, frequency_sign, z_values,
+                             E_gap):
+    """Complete contour weights for both independent-particle resolvents; see docs/architecture/four_current_wiring.md."""
+    tau = np.asarray(tau, dtype=np.complex128)
+    weight_rows = np.asarray(weight_rows, dtype=np.complex128)
+    frequency_sign = np.asarray(frequency_sign)
+    z_values = np.asarray(z_values, dtype=np.complex128)
+    if (tau.ndim != 1 or z_values.ndim != 1 or z_values.size == 0 or
+            frequency_sign.shape != tau.shape or
+            weight_rows.shape != (z_values.size, tau.size)):
+        raise ValueError(
+            "chi0 contour requires tau/sign (L,), z (n_out,), and "
+            "weight_rows (n_out,L)")
+    if not np.all(np.isin(frequency_sign, (-1, 1))):
+        raise ValueError("chi0 contour frequency_sign must contain only +/-1")
+    exponent = -tau[None, :] * (
+        float(E_gap) - frequency_sign[None, :] * z_values[:, None])
+    return -weight_rows * np.exp(exponent)
+
+
+def _chi0_contour_kernel_args(wfns, tau, weight_rows, frequency_sign,
+                              z_values, energy_reference):
+    """Prepare complex-frequency rows and the existing sharded operands."""
+    eref, vmax, cmin = _gap_edges(wfns, energy_reference)
+    tau = np.asarray(tau, dtype=np.complex128)
+    alpha_rows = _chi0_contour_alpha_rows(
+        tau, weight_rows, frequency_sign, z_values, cmin - vmax)
+    return _minimax_chi_operands(
+        wfns, eref, vmax, cmin, tau,
+        alpha_rows[0] if alpha_rows.shape[0] == 1 else alpha_rows,
+    ), alpha_rows.shape[0]
+
+
+def compute_chi0_contour(wfns, tau, weight_rows, frequency_sign, z_values,
+                         meta, mesh_xy, *, energy_reference=0.0):
+    """Evaluate several complex-frequency chi0 values in one node sweep; see docs/architecture/four_current_wiring.md."""
+    args, n_out = _chi0_contour_kernel_args(
+        wfns, tau, weight_rows, frequency_sign, z_values, energy_reference)
+    return _run_minimax_chi(wfns, meta, mesh_xy, args, n_out=n_out,
+                            complex_contour=True,
+                            kwargs=_chi_parent_face_kwargs(wfns))
+
+
+def compute_chi0_contour_ordered(
+    wfns,
+    time,
+    weights,
+    z_values,
+    meta,
+    mesh_xy,
+    *,
+    q_neg_index,
+    energy_reference=0.0,
+    return_reflected=False,
+):
+    """Evaluate magnetic contour samples with both ordered orientations; see docs/architecture/four_current_wiring.md."""
+    time = np.asarray(time, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    z = np.asarray(z_values, dtype=np.complex128)
+    if (time.ndim != 1 or time.size == 0 or weights.shape != time.shape
+            or z.ndim != 1 or z.size == 0):
+        raise ValueError(
+            "compute_chi0_contour_ordered: time/weights must be nonempty "
+            f"(L,) arrays and z_values a nonempty (n_z,) array; got "
+            f"{time.shape}, {weights.shape}, {z.shape}.")
+    if (not np.all(np.isfinite(time)) or not np.all(np.isfinite(weights))
+            or not np.all(np.isfinite(z)) or np.any(time <= 0.0)
+            or np.any(np.imag(z) <= 0.0)):
+        raise ValueError(
+            "GATE chi0_contour_ordered_domain: nodes and weights must be "
+            "finite, every time node must be positive, and every z value "
+            "must be finite with Im(z) > 0. FALSE case: the damped-line "
+            "quadrature and upper-half-plane MPA samples satisfy all three "
+            "conditions.")
+
+    # The reflected point remains in the upper half plane.  Both rows use
+    # the kernel's native ``-1/(z+Delta)`` orientation: negative imaginary
+    # time, frequency sign -1, and weights -i*h.  This is the orientation
+    # whose imaginary-axis limit is exactly compute_chi0_imag_ordered's
+    # ``-(alpha-i*beta)`` carrier.  Their partner relation is applied only
+    # after this single response-kernel invocation.
+    z_sweep = np.concatenate((z, -np.conj(z)))
+    tau = -1j * time
+    signs = -np.ones(time.size, dtype=np.int8)
+    weight_rows = np.broadcast_to(
+        -1j * weights, (z_sweep.size, time.size))
+
+    args, n_out = _chi0_contour_kernel_args(
+        wfns, tau, weight_rows, signs, z_sweep, energy_reference)
+    orientations = _run_minimax_chi(wfns, meta, mesh_xy, args, n_out=n_out,
+                                    complex_contour=True,
+                                    kwargs=_chi_face_kwargs(wfns))
+    if not isinstance(orientations, tuple):  # n_out == 2*n_z >= 2
+        orientations = (orientations,)
+
+    q_neg_jax = _q_negation_operand(
+        q_neg_index, orientations[0].shape[0],
+        caller="compute_chi0_contour_ordered")
+    completed = tuple(
+        _complete_ordered(
+            orientations[i], orientations[z.size + i], q_neg_jax)
+        for i in range(z.size)
+    )
+    primary = completed[0] if z.size == 1 else completed
+    if not return_reflected:
+        return primary
+    reflected = tuple(
+        _complete_ordered(
+            orientations[z.size + i], orientations[i], q_neg_jax)
+        for i in range(z.size)
+    )
+    reflected = reflected[0] if z.size == 1 else reflected
+    return primary, reflected
 
 
 def compute_no_pair_dirac_current_block(
@@ -1898,202 +2057,6 @@ def compute_static_photon_response(
             if coupled_head
             else "DEBUG_headless_bare_transverse_photon_v1"),
     )
-
-
-def _chi0_multi_kernel_args(wfns, tau, alpha_rows, energy_reference):
-    """Shared host prep for the multi-output χ₀ paths (compute + precompile); see docs/architecture/four_current_wiring.md."""
-    s = wfns.slices
-    enk_v = wfns.enk[:, s.val]
-    enk_c = wfns.enk[:, s.cond]
-    eref = 0.0 if energy_reference is None else float(energy_reference)
-    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64) - eref
-    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64) - eref
-    vmax = float(np.max(enk_v_host))
-    cmin = float(np.min(enk_c_host))
-    E_gap = cmin - vmax
-    tau = np.asarray(tau, dtype=np.float64)
-    alpha_rows = np.asarray(alpha_rows, dtype=np.float64)
-    if alpha_rows.ndim != 2 or alpha_rows.shape[1] != tau.shape[0]:
-        raise ValueError(
-            f"chi0 multi: alpha_rows shape {alpha_rows.shape} does not "
-            f"match tau nodes ({tau.shape[0]},) — every row must be a "
-            f"weight vector on quad.tau.")
-    alpha_chi = -1.0 * alpha_rows * np.exp(-tau * E_gap)[None, :]
-    nodes = MinimaxNodes(
-        t=jnp.asarray(tau, dtype=jnp.complex128),
-        alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
-    )
-    args = (
-        nodes, *_chi_layout_operands(wfns, eref),
-        jnp.asarray(vmax, dtype=jnp.float64),
-        jnp.asarray(cmin, dtype=jnp.float64),
-    )
-    return args, alpha_rows.shape[0]
-
-
-def compute_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
-                       energy_reference=0.0):
-    """χ₀ at several weight vectors over ONE τ sweep — see
-    ``_get_chi_minimax_kernel(n_out>=2)``.  Returns an ``n_out``-tuple of
-    flat-q (nq, μ, μ) arrays, one per row of ``alpha_rows``."""
-    ensure_jax_compile_cache()
-    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    args, n_out = _chi0_multi_kernel_args(
-        wfns, tau, alpha_rows, energy_reference)
-    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, n_out=n_out,
-                                     **_chi_parent_face_kwargs(wfns))
-    return kernel(*args)
-
-
-def precompile_chi0_multi(wfns, tau, alpha_rows, meta, mesh_xy, *,
-                          energy_reference=None):
-    """AOT lower+compile sibling of :func:`precompile_chi0` for the
-    multi-output kernel."""
-    ensure_jax_compile_cache()
-    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    if len(np.asarray(tau)) == 0:
-        return
-    args, n_out = _chi0_multi_kernel_args(
-        wfns, tau, alpha_rows, energy_reference)
-    kernel = _get_chi_minimax_kernel(mesh_xy, kgrid, n_out=n_out,
-                                     **_chi_parent_face_kwargs(wfns))
-    kernel.lower(*args).compile()
-
-
-def _chi0_contour_alpha_rows(tau, weight_rows, frequency_sign, z_values,
-                             E_gap):
-    """Complete contour weights for both independent-particle resolvents; see docs/architecture/four_current_wiring.md."""
-    tau = np.asarray(tau, dtype=np.complex128)
-    weight_rows = np.asarray(weight_rows, dtype=np.complex128)
-    frequency_sign = np.asarray(frequency_sign)
-    z_values = np.asarray(z_values, dtype=np.complex128)
-    if (tau.ndim != 1 or z_values.ndim != 1 or z_values.size == 0 or
-            frequency_sign.shape != tau.shape or
-            weight_rows.shape != (z_values.size, tau.size)):
-        raise ValueError(
-            "chi0 contour requires tau/sign (L,), z (n_out,), and "
-            "weight_rows (n_out,L)")
-    if not np.all(np.isin(frequency_sign, (-1, 1))):
-        raise ValueError("chi0 contour frequency_sign must contain only +/-1")
-    exponent = -tau[None, :] * (
-        float(E_gap) - frequency_sign[None, :] * z_values[:, None])
-    return -weight_rows * np.exp(exponent)
-
-
-def _chi0_contour_kernel_args(wfns, tau, weight_rows, frequency_sign,
-                              z_values, energy_reference):
-    """Prepare complex-frequency rows and the existing sharded operands."""
-    s = wfns.slices
-    enk_v = wfns.enk[:, s.val]
-    enk_c = wfns.enk[:, s.cond]
-    eref = 0.0 if energy_reference is None else float(energy_reference)
-    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64) - eref
-    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64) - eref
-    vmax = float(np.max(enk_v_host))
-    cmin = float(np.min(enk_c_host))
-    tau = np.asarray(tau, dtype=np.complex128)
-    alpha_rows = _chi0_contour_alpha_rows(
-        tau, weight_rows, frequency_sign, z_values, cmin - vmax)
-    nodes = MinimaxNodes(
-        t=jnp.asarray(tau, dtype=jnp.complex128),
-        alpha=jnp.asarray(
-            alpha_rows[0] if alpha_rows.shape[0] == 1 else alpha_rows,
-            dtype=jnp.complex128),
-    )
-    args = (
-        nodes, *_chi_layout_operands(wfns, eref),
-        jnp.asarray(vmax, dtype=jnp.float64),
-        jnp.asarray(cmin, dtype=jnp.float64),
-    )
-    return args, alpha_rows.shape[0]
-
-
-def compute_chi0_contour(wfns, tau, weight_rows, frequency_sign, z_values,
-                         meta, mesh_xy, *, energy_reference=0.0):
-    """Evaluate several complex-frequency chi0 values in one node sweep; see docs/architecture/four_current_wiring.md."""
-    ensure_jax_compile_cache()
-    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    args, n_out = _chi0_contour_kernel_args(
-        wfns, tau, weight_rows, frequency_sign, z_values, energy_reference)
-    kernel = _get_chi_minimax_kernel(
-        mesh_xy, kgrid, n_out=n_out, complex_contour=True,
-        **_chi_parent_face_kwargs(wfns))
-    return kernel(*args)
-
-
-def compute_chi0_contour_ordered(
-    wfns,
-    time,
-    weights,
-    z_values,
-    meta,
-    mesh_xy,
-    *,
-    q_neg_index,
-    energy_reference=0.0,
-    return_reflected=False,
-):
-    """Evaluate magnetic contour samples with both ordered orientations; see docs/architecture/four_current_wiring.md."""
-    time = np.asarray(time, dtype=np.float64)
-    weights = np.asarray(weights, dtype=np.float64)
-    z = np.asarray(z_values, dtype=np.complex128)
-    if (time.ndim != 1 or time.size == 0 or weights.shape != time.shape
-            or z.ndim != 1 or z.size == 0):
-        raise ValueError(
-            "compute_chi0_contour_ordered: time/weights must be nonempty "
-            f"(L,) arrays and z_values a nonempty (n_z,) array; got "
-            f"{time.shape}, {weights.shape}, {z.shape}.")
-    if (not np.all(np.isfinite(time)) or not np.all(np.isfinite(weights))
-            or not np.all(np.isfinite(z)) or np.any(time <= 0.0)
-            or np.any(np.imag(z) <= 0.0)):
-        raise ValueError(
-            "GATE chi0_contour_ordered_domain: nodes and weights must be "
-            "finite, every time node must be positive, and every z value "
-            "must be finite with Im(z) > 0. FALSE case: the damped-line "
-            "quadrature and upper-half-plane MPA samples satisfy all three "
-            "conditions.")
-
-    # The reflected point remains in the upper half plane.  Both rows use
-    # the kernel's native ``-1/(z+Delta)`` orientation: negative imaginary
-    # time, frequency sign -1, and weights -i*h.  This is the orientation
-    # whose imaginary-axis limit is exactly compute_chi0_imag_ordered's
-    # ``-(alpha-i*beta)`` carrier.  Their partner relation is applied only
-    # after this single response-kernel invocation.
-    z_sweep = np.concatenate((z, -np.conj(z)))
-    tau = -1j * time
-    signs = -np.ones(time.size, dtype=np.int8)
-    weight_rows = np.broadcast_to(
-        -1j * weights, (z_sweep.size, time.size))
-
-    ensure_jax_compile_cache()
-    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    args, n_out = _chi0_contour_kernel_args(
-        wfns, tau, weight_rows, signs, z_sweep, energy_reference)
-    kernel = _get_chi_minimax_kernel(
-        mesh_xy, kgrid, n_out=n_out, complex_contour=True,
-        **_chi_face_kwargs(wfns))
-    orientations = kernel(*args)
-    if not isinstance(orientations, tuple):  # n_out == 2*n_z >= 2
-        orientations = (orientations,)
-
-    q_neg_jax = _q_negation_operand(
-        q_neg_index, orientations[0].shape[0],
-        caller="compute_chi0_contour_ordered")
-    completed = tuple(
-        _complete_ordered(
-            orientations[i], orientations[z.size + i], q_neg_jax)
-        for i in range(z.size)
-    )
-    primary = completed[0] if z.size == 1 else completed
-    if not return_reflected:
-        return primary
-    reflected = tuple(
-        _complete_ordered(
-            orientations[z.size + i], orientations[i], q_neg_jax)
-        for i in range(z.size)
-    )
-    reflected = reflected[0] if z.size == 1 else reflected
-    return primary, reflected
 
 
 def _occupation_support_slices(
@@ -2828,37 +2791,6 @@ def compute_chi0_direct_fractional(
         rows.append(value)
     values = jnp.stack(rows, axis=1)
     return values[0] if z.size == 1 else values
-
-
-def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
-    """AOT lower+compile of the χ₀ minimax kernel at the real input shapes/shardings — warms the JAX in-process cache so the first ``compute_chi0`` call is execution-only; see docs/architecture/four_current_wiring.md."""
-    ensure_jax_compile_cache()
-    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    eref = 0.0 if energy_reference is None else float(energy_reference)
-    s = wfns.slices
-    enk_v = wfns.enk[:, s.val]
-    enk_c = wfns.enk[:, s.cond]
-    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64) - eref
-    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64) - eref
-    vmax = float(np.max(enk_v_host))
-    cmin = float(np.min(enk_c_host))
-    E_gap = cmin - vmax
-    tau = np.asarray(quad.tau, dtype=np.float64)
-    if len(tau) == 0:
-        return  # compute_chi0 falls through to a static-zeros path — nothing to compile
-    alpha_chi = -1.0 * np.asarray(quad.alpha, dtype=np.float64) * np.exp(-tau * E_gap)
-    nodes = MinimaxNodes(
-        t=jnp.asarray(tau, dtype=jnp.complex128),
-        alpha=jnp.asarray(alpha_chi, dtype=jnp.complex128),
-    )
-
-    kernel = _get_chi_minimax_kernel(
-        mesh_xy, kgrid, **_chi_parent_face_kwargs(wfns))
-    kernel.lower(
-        nodes, *_chi_layout_operands(wfns, eref),
-        jnp.asarray(vmax, dtype=jnp.float64),
-        jnp.asarray(cmin, dtype=jnp.float64),
-    ).compile()
 
 
 def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,

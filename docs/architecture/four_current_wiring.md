@@ -1925,9 +1925,11 @@ artifact only when its value is exactly zero: then the Hall response is
 identically absent and the packed operator is the same charge/TT block
 diagonal model as the unnamed case.  Any nonzero component still refuses.
 
-### `src/gw/w_isdf.py` — `_chi0_multi_kernel_args`
+### `src/gw/w_isdf.py` — `_laplace_chi_args`
 
-Shared host prep for the multi-output χ₀ paths (compute + precompile).
+Real-node operands for :func:`compute_chi0`, :func:`compute_chi0_multi`
+and their precompile siblings (one row is squeezed to the single-output
+kernel's 1-D weights).
 
 ``tau``: (L,) node vector (the fused static∪extra union on the probe-
 reuse path).  ``alpha_rows``: (n_out, L) RAW quadrature weights, one
