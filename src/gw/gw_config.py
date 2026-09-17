@@ -3590,6 +3590,10 @@ def refuse_headless_shared_pole_self_consistency(config) -> None:
     real, after which the run dies with a numerical gate message that says
     nothing about the head.
 
+    The 2026-09-17 bispinor-metal proof permits heads off while its head
+    model is pending. This exception uses the existing bispinor and FD
+    settings; it does not bypass any bank or Gram validity gate.
+
     SCOPED TO SELF-CONSISTENCY ON PURPOSE.  A headless shared-pole
     ONE-SHOT run is not covered by this evidence and is not refused here;
     it remains a legitimate debug run.
@@ -3597,6 +3601,9 @@ def refuse_headless_shared_pole_self_consistency(config) -> None:
     if (getattr(config.sigma, "w_model", "mpa") != "shared_pole"
             or config.qp_solver is not QPSolver.SELF_CONSISTENT
             or config.head.correction is not HeadCorrection.OFF):
+        return
+    if (bool(getattr(config, "bispinor", False))
+            and getattr(config, "occ_smearing_width_ry", None) is not None):
         return
     raise ValueError(
         "GATE shared_pole_self_consistent_needs_a_head: "

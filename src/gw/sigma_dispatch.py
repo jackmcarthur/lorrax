@@ -796,6 +796,10 @@ def _mpa_sigma_model_resources(W_by_role, sigma_w_model, head_correction=None):
         handle = W_by_role["shared_pole"]
         fit_path = handle["path"]
         fit_identity, fit_digest = handle["identity"], handle["digest"]
+        if (handle.get("representation") == "sector-ordered-ph"
+                and getattr(head_correction, "value", head_correction) != "off"):
+            raise NotImplementedError(
+                "GATE shared_pole_sector_head: the ordered sector consumer requires head_correction=off")
         if getattr(head_correction, "value", head_correction) != "off":
             head_fit_path = W_by_role.get("mpa_head")
             if (head_fit_path is None or head_fit_path.get("identity") != fit_identity
@@ -1018,17 +1022,19 @@ def _static_sigma_channels(
     photon_head_sigma_basis = None
     sigma_lorentz = None
     sig_x_b = None
-    if packed_photon_replaces_charge_sigma(config):
+    sector_dynamic = (W_by_role.get("shared_pole", {}).get("representation")
+                      == "sector-ordered-ph")
+    if not sector_dynamic and packed_photon_replaces_charge_sigma(config):
         (sig_x, sig_sx, sig_coh, photon_head_sigma_diag, photon_head_sigma_basis, sigma_lorentz) = _packed_static_sigma_channels(
             Gij, builds_static_screened, config, hartree_basis_rotation, mesh_xy, meta, mode,
             occupation_state, photon_head_sigma_basis, photon_head_sigma_diag, photon_response,
             print_fn, static_head_terms, wfns, wfns_transverse)
-    elif uses_dynamic_packed_photon_route(config):
+    elif not sector_dynamic and uses_dynamic_packed_photon_route(config):
         (sig_x, sig_sx, sig_coh, photon_head_sigma_diag, photon_head_sigma_basis, sigma_lorentz) = _packed_dynamic_sigma_channels(
             Gij, V_q, builds_static_screened, config, hartree_basis_rotation, mesh_xy, meta, mode,
             occupation_state, photon_head_sigma_basis, photon_head_sigma_diag, photon_response,
             print_fn, static_head_terms, wfns, wfns_transverse)
-    elif uses_static_photon_response(config):
+    elif not sector_dynamic and uses_static_photon_response(config):
         raise NotImplementedError(
             f"packed four-current mode with compute_mode = "
             f"{getattr(mode, 'value', mode)} has no Sigma branch.  The "
@@ -1160,7 +1166,7 @@ def _compute_mpa_sigma(
         W_by_role, band_slices, config, e_qp_ev, fixed_quadrature_session, h_transverse,
         input_dir, iteration_head, material_class, mesh_xy, meta, occupation_state,
         omit_v_h, print_fn, sig_h, sig_x, sigma_lorentz, sym, v_h_scalar, wfn, wfns,
-        write_sigma_omega_h5):
+        write_sigma_omega_h5, wfns_transverse, mu_bases):
     """Produce the MPA Sigma result with authenticated head and body inputs."""
     from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store
@@ -1206,11 +1212,7 @@ def _compute_mpa_sigma(
             print_fn(
                 "  MPA scalar head: occupation provenance matched an exact "
                 "legacy square-mesh zero-pad encoding.")
-    body = compute_sigma_c_mpa_omega_grid(
-        wfns, fit_path, meta, mesh_xy,
-        sigma_w_model=sigma_w_model,
-        fit_identity=fit_identity,
-        fit_digest=fit_digest,
+    body_options = dict(
         omega_grid_ry=config.omega_grid_ry,
         efermi_ry=sigma_efermi_ry,
         occupation_state=occupation_state,
@@ -1228,6 +1230,19 @@ def _compute_mpa_sigma(
             None if fixed_quadrature_session is None else
             fixed_quadrature_session.setdefault(sigma_w_model, {})),
         print_fn=print_fn)
+    sector_handle = W_by_role.get("shared_pole", {})
+    if sector_handle.get("representation") == "sector-ordered-ph":
+        from .mpa.sector_sigma import compute_sector_sigma
+        body = compute_sector_sigma(
+            sector_handle, (wfns, wfns_transverse), mu_bases, meta, mesh_xy,
+            **body_options)
+        # Static-only diagnostics cannot label a frequency-dependent sector
+        # result. The complete dynamic operator is retained by the finalizer.
+        sigma_lorentz = None
+    else:
+        body = compute_sigma_c_mpa_omega_grid(
+            wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
+            fit_identity=fit_identity, fit_digest=fit_digest, **body_options)
     head_diag = None
     if head is not None:
         if iteration_head is None:
@@ -1386,7 +1401,8 @@ def compute_sigma_xc(
         return _compute_mpa_sigma(
             W_by_role, band_slices, config, e_qp_ev, fixed_quadrature_session, h_transverse,
             input_dir, iteration_head, material_class, mesh_xy, meta, occupation_state, omit_v_h,
-            print_fn, sig_h, sig_x, sigma_lorentz, sym, v_h_scalar, wfn, wfns, write_sigma_omega_h5)
+            print_fn, sig_h, sig_x, sigma_lorentz, sym, v_h_scalar, wfn, wfns,
+            write_sigma_omega_h5, wfns_transverse, mu_bases)
     return _compute_ppm_sigma(
         V_q, W_by_role, W_static, band_slices, config, e_qp_ev, fixed_quadrature_session,
         h_transverse, head_resolver, input_dir, iteration_head, mesh_xy, meta, mode,

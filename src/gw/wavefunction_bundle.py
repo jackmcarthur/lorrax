@@ -770,8 +770,16 @@ def rotate_wavefunctions(
     efermi: float | None,
     mesh_xy: Mesh,
     active_slice: slice | None = None,
+    occupations=None,
 ) -> Wavefunctions:
-    """Rotate the active band columns, preserve inactive wavefunctions, and rebuild energies and occupations."""
+    """Rotate the active band columns, preserve inactive wavefunctions, and rebuild energies and occupations.
+
+    ``occupations`` is the caller's one occupation state on the rotated
+    ladder, ``(nk, nb_full)``: a metal's entry-solved Fermi-Dirac table.  It
+    becomes the bundle's ``occ`` and its parent carrier's ``occ``, so every
+    consumer of either bundle reads that state.  ``None`` keeps the step
+    rebuilt from ``efermi``; giving both is two owners and refuses.
+    """
     if wfns_dft.layout not in _LAYOUTS:
         raise ValueError("rotate_wavefunctions requires the two-face carrier.")
     sigma_slice = wfns_dft.slices.sigma
@@ -833,8 +841,24 @@ def rotate_wavefunctions(
                     jnp.asarray(enk_active_new, dtype=wfns_dft.enk.dtype))
         rep2 = NamedSharding(mesh_xy, P(None, None))
         enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
-        occ_full = jax.lax.with_sharding_constraint(
-            _build_occ(enk_full, wfns_dft.slices, efermi), rep2)
+        if occupations is None:
+            occ_full = _build_occ(enk_full, wfns_dft.slices, efermi)
+        else:
+            if efermi is not None:
+                raise ValueError(
+                    "GATE rotate_occupation_owner: got both efermi and an "
+                    "occupation state; want exactly one; why: a step rebuilt "
+                    "from efermi beside a supplied state is two owners of "
+                    "the same table.")
+            occ_full = jnp.asarray(occupations, dtype=wfns_dft.occ.dtype)
+            if tuple(occ_full.shape) != tuple(enk_full.shape):
+                raise ValueError(
+                    "GATE rotate_occupation_owner: got occupation table "
+                    f"{tuple(occ_full.shape)} for energies "
+                    f"{tuple(enk_full.shape)}; want the carrier's (nk, nb); "
+                    "why: the bundle and its parent carrier index the same "
+                    "bands.")
+        occ_full = jax.lax.with_sharding_constraint(occ_full, rep2)
 
     # As above, the host DFT binding cannot follow a QP-rotated carrier.
     rotated = Wavefunctions(

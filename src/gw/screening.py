@@ -687,6 +687,10 @@ def compute_screening_model(
     wfn=None,
     wfn_fingerprint_binding=None,
     charge_zeta_identity=None,
+    wfns_transverse=None,
+    bispinor_v_q_path=None,
+    mu_bases=None,
+    photon_static_reference=None,
     head_resolver=None,
     head_channel=None,
     mpa_plan=None,
@@ -748,7 +752,9 @@ def compute_screening_model(
                 tensors_filename=tensors_filename, occupation_state=occupation_state,
                 print_fn=print_fn, head_resolver=head_resolver, mpa_plan=mpa_plan,
                 iteration_head_response=iteration_head_response,
-                material_class=material_class)
+                material_class=material_class, wfns_transverse=wfns_transverse,
+                photon_static_reference=photon_static_reference,
+                bispinor_v_q_path=bispinor_v_q_path, mu_bases=mu_bases)
         reuse_path = getattr(config.mpa, "fit_reuse_file", None)
         if reuse_path is not None:
             if mpa_plan is None:

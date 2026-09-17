@@ -112,7 +112,7 @@ def canonical_factors(mesh_xy, order):
     return jax.jit(stack, out_shardings=NamedSharding(mesh_xy, P(None, 'x', None, 'y')))
 
 
-def partner_realization(meta, header, ids, partner_parent, partner_row, *, mesh_xy):
+def partner_realization(meta, header, ids, partner_parent, partner_row, *, mesh_xy, components=1):
     """Per-slot packed action of each parent's -q partner row, in batch layout.
 
     For slot r (parent ids[r], partner p', row s): ``alpha[r]`` the packed source
@@ -131,6 +131,10 @@ def partner_realization(meta, header, ids, partner_parent, partner_row, *, mesh_
     inverse = np.argsort(alpha, axis=1).astype(np.int32)
     phase = np.exp(2j * np.pi * np.einsum('ri,rmi->rm', q_frac[parents],
                                           np.asarray([wraps[s] for s in rows], np.float64)))
+    if components != 1:
+        alpha = (alpha[:, :, None] * components + np.arange(components)).reshape(len(ids), -1).astype(np.int32)
+        inverse = np.argsort(alpha, axis=1).astype(np.int32)
+        phase = np.repeat(phase, components, axis=1)
     return (_batch_put(mesh_xy, alpha), _batch_put(mesh_xy, inverse),
             _batch_put(mesh_xy, phase.astype(np.complex128)))
 
@@ -211,13 +215,14 @@ def _batch_put(mesh_xy, a):
     return jax.make_array_from_callback(a.shape, NamedSharding(mesh_xy, P(BATCH)), lambda idx: a[idx])
 
 
-def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordered, odd_moments, keep_budget):
+def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordered, odd_moments, keep_budget,
+                 retain_span=False):
     """Run ``round_program`` on one round: host tables in, round-order results out."""
     import numpy as np
 
     put = lambda a: _batch_put(mesh_xy, np.asarray(a))
     program = round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments),
-                            None if keep_budget is None else int(keep_budget))
+                            None if keep_budget is None else int(keep_budget), bool(retain_span))
     live = np.arange(len(tables["own"])) < int(real)
     return program(put(live), put(tables["points"]), put(tables["order"]), put(tables["active"]),
                    tuple(st[1] for st in states), tuple(st[2] for st in states),
@@ -225,7 +230,7 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
 
 
 @lru_cache(maxsize=None)
-def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget):
+def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retain_span=False):
     """Pack, assemble, reduce, gate and sort a round of parents, each on its own rank.
 
     One program over batch layout: rank r packs slot r's Q, WQ, dWQ panels by
@@ -259,8 +264,12 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget):
         finite = [(points, q, o, d)]
         if ordered:
             pencil = assemble_ordered_shared_pole_pencil(finite, infinity if odd_moments else None, matmul=_mm)
-            model, signed, reduction = reduce_ordered_shared_pole_pencil(
-                pencil, active, eigh=native_eigh, matmul=_mm, gates=gates, keep_budget=keep_budget)
+            reduced = reduce_ordered_shared_pole_pencil(
+                pencil, active, eigh=native_eigh, matmul=_mm, gates=gates, keep_budget=keep_budget,
+                retain_span=retain_span)
+            model, signed, reduction = reduced[:3]
+            if retain_span:
+                coefficients = reduced[3]
             retained = ordered_moment_identity(signed, infinity, matmul=_mm) if odd_moments else {}
             model, zero = apply_shared_pole_zero_policy(model, gates=gates)
             zero["zero_policy"] = zero["zero_policy"] & reduction["infinite_weight_ok"]
@@ -276,7 +285,10 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget):
                                                 matmul=_mm)
             signed = ()
         model, permutation = sort_shared_pole_columns(model)
-        return model, signed, (reduction, zero, retained, permutation)
+        result = model, signed, (reduction, zero, retained, permutation)
+        if retain_span:
+            return (*result, coefficients)
+        return result
 
     def body(live, points, order, active, qs, os, ds, infinity):
         def pack(panels):
@@ -291,8 +303,12 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget):
 
     @jax.jit
     def execute(live, points, order, active, qs, os, ds, infinity):
-        model, signed, diagnostics = mapped(live, points, order, active, qs, os, ds, infinity)
-        return model, signed, _gather(replicated, model[1:]), _gather(replicated, diagnostics)
+        reduced = mapped(live, points, order, active, qs, os, ds, infinity)
+        model, signed, diagnostics = reduced[:3]
+        result = model, signed, _gather(replicated, model[1:]), _gather(replicated, diagnostics)
+        if retain_span:
+            return (*result, reduced[3])
+        return result
     return execute
 
 
