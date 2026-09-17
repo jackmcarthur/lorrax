@@ -48,6 +48,44 @@ def _realized_gamma_body(mesh, realize):
     return evaluate
 
 
+def refuse_unsupported_shared_pole_head(config, *, trs_allowed, nspinor):
+    """Refuse, at input resolution, a full shared-pole head the Gamma body cannot evaluate.
+
+    Called once from ``gw_jax._load_system_inputs`` right after the WFN
+    symmetry is final and before any basis, bank or constructor exists.  The
+    same refusal used to fire inside :func:`build_shared_pole_head`, after
+    the bank, moments and constructor had run and ``model.h5`` was committed,
+    so a rerun in that directory then refused on the committed model (Q0HEAD
+    2026-09-16).  ``trs_allowed`` is the final ``SymMaps.trs_allowed`` the
+    store's representation follows; ``nspinor`` is the WFN's.
+    """
+    from .gw_config import HeadCorrection
+    if (config.sigma.w_model != "shared_pole"
+            or config.head.correction is not HeadCorrection.FULL):
+        return
+    _refuse_head_representation(trs_allowed=trs_allowed, nspinor=nspinor)
+
+
+def _refuse_head_representation(*, trs_allowed, nspinor):
+    """The one owner of what the full Gamma head evaluates: TRS-even, N_spinor = 1."""
+    remedy = ("A one-shot deck runs with head_correction = off. A self-consistent "
+              "shared-pole deck requires the head (refuse_headless_shared_pole_self_consistency), "
+              "so it has no valid setting on this system until that head lands.")
+    if not bool(trs_allowed):
+        raise ValueError(
+            "GATE shared_pole_head_ordered: got time-reversal-broken symmetry (an ordered "
+            "store, representation scalar-ordered-ph); want scalar-trs-even-s; why: the Gamma "
+            "body evaluates the time-reversal-even form b (s - Lambda)^-1 b^dagger, which is "
+            "not the signed particle-hole model an ordered store declares, so an ordered head "
+            "would be silently wrong on the dominant Sigma term. The signed Gamma head is "
+            "pending. " + remedy)
+    if int(nspinor) != 1:
+        raise ValueError(
+            f"GATE shared_pole_head_nspinor: got N_spinor = {int(nspinor)}; want 1; why: the "
+            "full Gamma head has been run only on N_spinor = 1 stores, and the two-component "
+            "store's spin-traced charge head has no validated evaluation yet. " + remedy)
+
+
 def shared_pole_head_plan(config, recipe, *, material_class):
     """Use the MPA sample-plan owner on the current logical energy span."""
     from .mpa.model import make_mpa_plan
@@ -95,15 +133,11 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
             from file_io.shared_pole_store import validate_shared_pole_model
             header = validate_shared_pole_model(handle["path"], expected_identity=handle["identity"],
                 mesh_xy=mesh_xy, capacity=ledger)
-        if str(header.get("representation", "")) != "scalar-trs-even-s":
-            raise ValueError(
-                "GATE shared_pole_head_ordered: got representation "
-                f"{header.get('representation')!r}; want scalar-trs-even-s; why: the Gamma "
-                "body evaluates the time-reversal-even form b (s - Lambda)^-1 b^dagger, which "
-                "is not the signed particle-hole model an ordered store declares, so an "
-                "ordered head would be silently wrong on the dominant Sigma term. The signed "
-                "Gamma head belongs to the head branch and is pending there; until it lands, "
-                "run an ordered deck with head_correction = off and qp_solver = one_shot_dft.")
+        # Decks are refused at input resolution (refuse_unsupported_shared_pole_head);
+        # this re-reads the same owner on the store actually opened.
+        _refuse_head_representation(
+            trs_allowed=str(header.get("representation", "")) == "scalar-trs-even-s",
+            nspinor=int(header["nspinor"]))
         parents = np.flatnonzero(np.asarray(header["q_irr_full_idx"]) == 0)
         if len(parents) != 1:
             raise ValueError("GATE shared_pole_head: expected one Gamma parent")
@@ -113,7 +147,7 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         unit = (16*int(header["n_q_full"])*int(header["n_mu_logical"])**2
                 / mesh_xy.size)
         projection_bytes = 16*meta.mu_basis.n_packed**2 // mesh_xy.size
-        if int(header["nspinor"]) != 1 or ledger.U_bytes_per_rank != unit:
+        if ledger.U_bytes_per_rank != unit:
             raise ValueError("GATE shared_pole_head_capacity: store/current-map geometry mismatch")
         if projection_bytes > unit:
             raise ValueError(
