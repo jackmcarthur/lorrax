@@ -879,13 +879,15 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
     ordered = vertex is not None or not bool(sym.trs_allowed)
     _, moments, receipt["algebra"] = response_algebra(meta, config,
         mesh_xy=mesh_xy, n=n, ordered=ordered, photon=vertex is not None)
-    # Scalar panels retain one Coulomb root per parent.
-    per_q = (12 if ordered else 8) + int(vertex is None)
+    # Preserve the moment stream's parent panels: retaining roots must not
+    # add correlation/FFT passes. Admit the extra root storage separately.
+    per_q = 12 if ordered else 8
+    root_faces = int(vertex is None)
     qwidth = max(1,min(len(qids),int((.75*ledger.U_bytes_per_rank/face_bytes-16)/per_q)))
     for q0 in range(0,len(qids),qwidth):
         q1 = min(q0+qwidth,len(qids))
         ledger.live_stages = ambient
-        name,_ = _reserve(meta,"bank_outputs_moments",(per_q*(q1-q0)+16)*face_bytes)
+        name,_ = _reserve(meta,"bank_outputs_moments",((per_q+root_faces)*(q1-q0)+16)*face_bytes)
         ledger.live_stages = ambient+(name,)
         if not np.asarray(header["moment_written"])[q0:q1].all():
             if ordered:
