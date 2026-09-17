@@ -2100,22 +2100,6 @@ def _complete_contour_ordered(F_q_z, F_q_reflected, q_neg):
     return F_q_z + jnp.conj(jnp.take(F_q_reflected, q_neg, axis=0))
 
 
-def precompile_chi0_contour(wfns, tau, weight_rows, frequency_sign,
-                            z_values, meta, mesh_xy, *,
-                            energy_reference=None):
-    """AOT sibling of :func:`compute_chi0_contour`."""
-    if len(np.asarray(tau)) == 0:
-        return
-    ensure_jax_compile_cache()
-    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    args, n_out = _chi0_contour_kernel_args(
-        wfns, tau, weight_rows, frequency_sign, z_values, energy_reference)
-    kernel = _get_chi_minimax_kernel(
-        mesh_xy, kgrid, n_out=n_out, complex_contour=True,
-        **_chi_parent_face_kwargs(wfns))
-    kernel.lower(*args).compile()
-
-
 def _occupation_support_slices(
         occupations,
         occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT):
@@ -2865,36 +2849,6 @@ def compute_chi0_direct_fractional(
         rows.append(value)
     values = jnp.stack(rows, axis=1)
     return values[0] if z.size == 1 else values
-
-
-def precompile_chi0_contour_fractional(
-    wfns,
-    time_nodes,
-    weight_rows,
-    z_values,
-    meta,
-    mesh_xy,
-    *,
-    occupations=None,
-    energy_reference=0.0,
-    occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
-    ordered=False,
-):
-    """AOT sibling of compute_chi0_contour_fractional."""
-    ensure_jax_compile_cache()
-    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    args, n_out = _chi0_fractional_contour_args(
-        wfns,
-        time_nodes,
-        weight_rows,
-        z_values,
-        occupations,
-        energy_reference,
-        occupation_window_threshold,
-    )
-    _get_chi_fractional_contour_kernel(
-        mesh_xy, kgrid, n_out, ordered=ordered,
-        **_chi_face_kwargs(wfns)).lower(*args).compile()
 
 
 def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
