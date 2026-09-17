@@ -339,6 +339,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                         raise ValueError(
                             f"GATE shared_pole_{name}: got: failed at q={q}, "
                             f"Gram min/max={reduction['gram_min_relative']}, "
+                            f"paired H_r min/max={reduction.get('paired_min_relative', 'n/a')}, "
                             f"metric infinity norm={reduction['metric_initial_infinity_norm']}, "
                             f"inverse-root residual={reduction['metric_inverse_root_residual_relative']}; "
                             f"want: Gram min/max >= {gates['normalized_gram_validity']['threshold']} "
