@@ -100,9 +100,12 @@ def check_sector_constructor(mesh, root):
         spec=P(None,None,'x','y') if samples else P(None,'x','y')
         return jax.make_array_from_callback(a.shape,NamedSharding(mesh,spec),lambda ix:a[ix])
     values=[value(z) for z in recipe['z_ry']]
+    mirrors=[value(-z.conjugate()) for z in recipe['z_ry']]
     moments=[out@np.linalg.matrix_power(j@h,k)@j@out.conj().T/2 for k in range(4)]
     store.write_shared_pole_bank(path,q_span=(0,nq),sample_span=(0,4),
         Wc=packed([a[0] for a in values],True),dWc_ds=packed([a[1] for a in values],True),
+        Wc_mirror=packed([a[0] for a in mirrors],True),
+        dWc_mirror_ds=packed([a[1] for a in mirrors],True),
         constant=packed(u-v),**{f'M{k}':packed(m) for k,m in enumerate(moments)},
         meta=meta,expected_identity=identity,mesh_xy=mesh)
     result=construct_sector_poles(bank,meta,SimpleNamespace(backend=SimpleNamespace(linalg='local')),

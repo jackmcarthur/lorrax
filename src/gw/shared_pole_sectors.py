@@ -52,7 +52,7 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
     out={}
     try:
         for field in fields:
-            sample=field in ('Wc','dWc_ds')
+            sample=field in ('Wc','dWc_ds','Wc_mirror','dWc_mirror_ds')
             if sample and (sample_span is None or sample_span[1] <= sample_span[0]):
                 raise ValueError('sector sample reads require a nonempty bounded sample_span')
             spans=([(i,i+1) for i in range(*sample_span)] if sample else [None])
@@ -117,6 +117,9 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
 
     header=validate_shared_pole_bank(bank['path'],expected_identity=bank['identity'],
                                     mesh_xy=mesh_xy,require_complete=True)
+    if header.get('mirror_mode')!='literal_same_operator_v1':
+        raise ValueError('GATE shared_pole_sector_mirror: photon bank requires authenticated literal same-operator mirrors')
+    sample_fields=('Wc','dWc_ds','Wc_mirror','dWc_mirror_ds')
     recipe=meta.shared_pole_recipe
     if header['identity'] != bank['identity']:
         raise ValueError('GATE shared_pole_bank_state: current sector bank identity mismatch')
@@ -141,7 +144,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     exact=read_sector_round(io,meta,bank,header,ids,(family,family),
                         fields=('M0','M1','M2','M3'),retained=retained)
                     samples=read_sector_round(io,meta,bank,header,ids,(family,family),
-                        sample_span=fit_span,retained=(*retained,*exact.values()))
+                        sample_span=fit_span,fields=sample_fields,retained=(*retained,*exact.values()))
                 geometry=dict(components=3 if family else 1,basis=bank['mu_bases'][family],
                     ids=ids,real=real,header=sector_headers[family],partner_parent=partner,
                     partner_row=row,slots=slots,sym=bank['tables']['sym'],sample_lo=fit_span[0],
@@ -164,9 +167,9 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         with timing.fenced_section('spole.sector.CT'):
             with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
                 ct=read_sector_round(io,meta,bank,header,ids,(0,1),sample_span=fit_span,
-                                      retained=retained)
+                                      fields=sample_fields,retained=retained)
                 tc=read_sector_round(io,meta,bank,header,ids,(1,0),sample_span=fit_span,
-                                      retained=(*retained,*ct.values()))
+                                      fields=sample_fields,retained=(*retained,*ct.values()))
                 cm=read_sector_round(io,meta,bank,header,ids,(0,1),fields=('M0','M1','M2','M3'),
                                       retained=(*retained,*ct.values(),*tc.values()))
             cross=construct_cross_sector_round(sectors,(ct,tc),cm,meta,config,mesh_xy=mesh_xy,
@@ -410,8 +413,10 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     for source, forward, reverse, left, right in (
             (charge,tc,ct,transverse,charge),
             (transverse,ct,tc,charge,transverse)):
-        actions.append(cross_round_actions((forward['Wc'],reverse['Wc'],
-            forward['dWc_ds'],reverse['dWc_ds']),source['states'],source['roles'],
+        panels=(forward['Wc'],reverse['Wc'],forward['dWc_ds'],reverse['dWc_ds'],
+                forward['Wc_mirror'],reverse['Wc_mirror'],
+                forward['dWc_mirror_ds'],reverse['dWc_mirror_ds'])
+        actions.append(cross_round_actions(panels,source['states'],source['roles'],
             source['recipe'],sample_lo=sample_lo,mesh_xy=mesh_xy,
             partner_slots=partner_slots,
             endpoint_actions=(left['endpoint_action'],right['endpoint_action'])))
@@ -502,13 +507,16 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_lo, mesh_xy,
 
     ``samples=(W_LR,W_RL,dW_LR/ds,dW_RL/ds)`` are parent-local
     [P,S,n_L,n_R] (reverse blocks have reversed endpoint extents).
+    With literal mirrors, four matching W/dW panels at ``-conj(z)`` follow.
     ``states``/``roles`` are the existing selection round's source states.
     ``endpoint_actions`` is ((alpha,inverse,phase,rotation)_L, ..._R);
     a charge endpoint has rotation=None, a current endpoint uses the
     symmetry service's polar time-odd [P,3,3] action and mu-major rows.
-    Only direction/output panels cross ranks, through the same partner
-    permutation as the diagonal-sector construction. Outputs follow the
-    paired state order and the derivative is d/dz, report equation 5.3.
+    Literal mirror panels already belong to the original q operator and
+    require no partner-rank exchange or spatial action. The legacy four-panel
+    route exchanges only direction/output panels through the authenticated
+    partner permutation. Outputs follow the paired state order and the
+    derivative is d/dz, report equation 5.3.
     """
     import jax
     from common.shard_map import shard_map
@@ -516,6 +524,9 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_lo, mesh_xy,
     from gw.shared_pole_directions import _sample_point
 
     batch=P(('x','y'))
+    literal=len(samples)==8
+    if len(samples) not in (4,8):
+        raise ValueError('GATE shared_pole_sector_mirror: expected four direct or eight direct/mirror panels')
     perm=tuple((i,int(p)) for i,p in enumerate(partner_slots))
     left,right=endpoint_actions
 
@@ -533,14 +544,23 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_lo, mesh_xy,
         z=_sample_point(recipe,sid)
         conjugate=bool(role.get('conjugate',False))
         mirror=bool(role.get('mirror',False))
-        exchange=mirror and z.real!=0
+        exchange=mirror and z.real!=0 and not literal
         use_adjoint=not conjugate if mirror and not exchange else conjugate
         node=state[0]
 
-        def apply(w,wr,d,dr,q,left,right):
+        def apply(*args):
+            *panels,q,left,right=args
+            w,wr,d,dr=panels[:4]
             a,b=w[:,sid-sample_lo],wr[:,sid-sample_lo]
             da,db=d[:,sid-sample_lo],dr[:,sid-sample_lo]
-            if exchange:
+            if literal and mirror:
+                wm,wrm,dwm,dwrm=panels[4:]
+                if conjugate:
+                    a,da=wm[:,sid-sample_lo],dwm[:,sid-sample_lo]
+                else:
+                    a=jnp.swapaxes(jnp.conj(wrm[:,sid-sample_lo]),-1,-2)
+                    da=jnp.swapaxes(jnp.conj(dwrm[:,sid-sample_lo]),-1,-2)
+            elif exchange:
                 alpha,inverse,phase,rotation=right
                 q=rotate(jnp.take_along_axis(phase[:,:,None]*q,inverse[:,:,None],axis=1),rotation,True)
                 q=jax.lax.ppermute(q,('x','y'),perm)
@@ -559,7 +579,7 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_lo, mesh_xy,
                 o,d_o=back(o),back(d_o)
             return o,d_o
 
-        program=jax.jit(shard_map(apply,mesh=mesh_xy,in_specs=(batch,)*7,
+        program=jax.jit(shard_map(apply,mesh=mesh_xy,in_specs=(batch,)*(len(samples)+3),
                                   out_specs=(batch,batch),check_vma=False))
         outputs.append(program(*samples,state[1],left,right))
     return tuple(outputs)
