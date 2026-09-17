@@ -695,13 +695,20 @@ def _sc_output_tables_on_loop_kset(
             f"{np.shape(U_loop)[0]} rows, expected {kstar.nk_irr} on the "
             "loop k-set")
     if exact_loop is not None:
+        expected_bands = tuple(int(n) for n in np.shape(delta_h_qp)[-2:])
         for name in ("scalar_dft", "transverse_dft"):
             value = getattr(exact_loop, name)
-            if value is not None and int(np.shape(value)[0]) != int(
-                    kstar.nk_irr):
+            if value is None:
+                continue
+            if int(np.shape(value)[0]) != int(kstar.nk_irr):
                 raise ValueError(
                     f"SC output seam: exact Hartree {name} has "
                     f"{np.shape(value)[0]} rows, expected {kstar.nk_irr}")
+            if tuple(int(n) for n in np.shape(value)[-2:]) != expected_bands:
+                raise ValueError(
+                    f"SC output seam: exact Hartree {name} has band matrix "
+                    f"{np.shape(value)[-2:]}, expected logical SC matrix "
+                    f"{expected_bands}")
     return (
         sigma_loop, U_loop, exact_loop, delta_h_qp,
         delta_h_qp_unextrap)
@@ -2028,7 +2035,7 @@ def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array, *,
 _PSI_G_CACHE: dict = {}
 
 
-def _dft_psi_sphere(inputs):
+def _dft_psi_sphere(inputs, *, full_density: bool = False):
     """DFT ψ(G) on the SC k-set, loaded ONCE and cached.
 
     The SC bundle carries ψ at ISDF CENTROIDS, which cannot reconstruct
@@ -2060,6 +2067,8 @@ def _dft_psi_sphere(inputs):
             f"{b_hi - b_lo} bands but the SC carry is {nb_sigma} wide.  These "
             f"describe the same active subspace and a mismatch means one of "
             f"them is b0-relative where the other is global.")
+    if full_density:
+        b_hi = int(inputs.band_slices.b4_logical)
     # Key on the GLOBAL RANGE, not on its width: two windows of equal
     # extent at different b0 are different ψ and must not share a cache
     # entry.
@@ -2145,7 +2154,8 @@ def _kstar(inputs):
 # module docstrings worry about — it is the matrix-element sweep, which
 # alone exceeds this deck's whole chi0+W screening (5.51 s/iteration).
 @timing.timed("vh.rebuild")
-def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
+def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
+                              efermi_ry: float) -> SCExactHartree:
     """Exact direct Hartree in the DFT basis from iteration-i orbitals.
 
     The cycle this closes::
@@ -2167,8 +2177,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
 
     No mixing: straight rho_out feedback, by owner ruling (2026-08-04).
     """
-    from gw.efermi import (fermi_level_step, occupied_band_count,
-                           step_occupations)
+    from gw.efermi import occupied_band_count
     from gw.qsgw_density import rho_from_wfns
     from common.four_current_model import resolve_four_current_representation
     from psp.get_DFT_mtxels import spin_degeneracy_factor
@@ -2179,8 +2188,25 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
                                     sweep_matrix_elements)
     from psp.dft_operators import padded_gvectors
 
-    psi_G, bidx = _dft_psi_sphere(inputs)
-    nk, nb = int(psi_G.shape[0]), int(psi_G.shape[1])
+    psi_G, bidx = _dft_psi_sphere(inputs, full_density=True)
+    nk = int(psi_G.shape[0])
+    # Density uses the full logical loaded ladder, including physical bands
+    # above the QP window.  The loader returns its mesh-padded carrier.
+    nb_logical = int(inputs.band_slices.nb_sigma)
+    nb_full_logical = int(inputs.band_slices.nb_full_logical)
+    from common.wfn_layout import band_sphere_spec
+    from runtime.padding import authenticate_axis, padded_axis, strip_axis
+    full_band_axis = padded_axis(
+        nb_full_logical, inputs.mesh_xy, name='SC density band sphere',
+        spec=band_sphere_spec(), axis=1)
+    authenticate_axis(psi_G, full_band_axis, axis=1,
+                      where='SC exact Hartree density band sphere')
+    if tuple(np.shape(occupations_full)) != (int(inputs.wfns_dft.enk.shape[0]),
+                                             full_band_axis.carrier):
+        raise ValueError(
+            'SC exact Hartree occupations must be the full rotated bundle '
+            f'carrier {(int(inputs.wfns_dft.enk.shape[0]), full_band_axis.carrier)}; '
+            f'got {np.shape(occupations_full)}')
     from centroid.sampling_metric import full_k_quadrature_weights
     kweights = (full_k_quadrature_weights(inputs.wfn, inputs.wfn.symmetry())
                 if inputs.sym.parent_k_domain == "full_bz" else
@@ -2188,31 +2214,18 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
     kweights = kweights / kweights.sum()
     rows = jnp.asarray(inputs.sym.kirr_fullids, dtype=jnp.int32)
     U_qp = jnp.take(U_qp, rows, axis=0)
-    E_qp_ry = jnp.take(E_qp_ry, rows, axis=0)
-
-    # E stays on the device: both are jit kernels over ``E`` (``gw.efermi``
-    # header) and only E_F and the degeneracy flag cross.
-    if inputs.material_class == "metal":
-        # Metal ρ: fixed-N occupations of the declared family (Fermi-Dirac
-        # on every metal, owner ruling 2026-09-17) solved on THIS iteration's
-        # QP spectrum (W3 update point), at the deck's ONE width.  The step
-        # path below cannot represent a metal (partial fill /
-        # degenerate-manifold refusal), and the constructor owns the fixed-N
-        # invariant.
-        occ_state = OccupationState.solve_smearing(
-            E_qp_ry, kweights, float(inputs.wfn.num_electrons),
-            inputs.config.occ_broadening_ry,
-            family=_declared_smearing_family(inputs.config),
-            state_capacity=float(spin_degeneracy_factor(inputs.wfn)),
-            clamp_tol=float(inputs.config.occupation_clamp_tol))
-        e_f = occ_state.mu_ry
-        occ = occ_state.f_kn
-        inputs.print_fn(
-            f"    V_H rebuild: metal {occ_state.smearing_family} occupations, "
-            f"mu={e_f * RYD_TO_EV:.8f} eV [occ_hash {occ_state.occ_hash}]")
-    else:
-        e_f = fermi_level_step(E_qp_ry, kweights, float(inputs.meta.nelec))
-        occ = step_occupations(E_qp_ry, e_f)
+    occ = jnp.take(jnp.asarray(occupations_full), rows, axis=0)
+    if int(U_qp.shape[1]) != nb_logical or int(U_qp.shape[2]) != nb_logical:
+        raise ValueError(
+            f'SC exact Hartree active rotation must be {nb_logical} square; '
+            f'got {U_qp.shape[-2:]}')
+    from .wavefunction_bundle import _face_embed_active_U
+    U_density = _face_embed_active_U(
+        U_qp, nb_full=full_band_axis.carrier, a_lo=0,
+        mesh_xy=inputs.mesh_xy)
+    inputs.print_fn(
+        f'    V_H rebuild: current-map full-band occupations, '
+        f'mu={float(efermi_ry) * RYD_TO_EV:.8f} eV')
 
     f_spin = spin_degeneracy_factor(inputs.wfn)
     grid = tuple(int(v) for v in inputs.wfn.fft_grid)
@@ -2222,7 +2235,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
     charge_ns = (int(psi_G.shape[2]) if representation.charge_bispinor
                  else int(inputs.wfn.nspinor))
     fields = rho_from_wfns(
-        psi_G, occ, kweights, U=U_qp, mesh=inputs.mesh_xy,
+        psi_G, occ, kweights, U=U_density, mesh=inputs.mesh_xy,
         box_index=bidx, fft_grid=grid,
         cell_volume=float(inputs.wfn.cell_volume),
         spin_degeneracy=f_spin,
@@ -2266,16 +2279,21 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
                 tt_metric_sign=float(COULOMB_GAUGE_TT_SIGN))
 
     gtab = padded_gvectors(inputs.wfn, k=inputs.sym.parent_k_domain)
-    psi_charge = psi_G[:, :, :charge_ns, :]
     geom_matrix = SweepGeometry(
         mesh=inputs.mesh_xy, fft_grid=grid,
-        ngkmax=int(psi_G.shape[3]), nb=nb,
+        ngkmax=int(psi_G.shape[3]), nb=nb_logical,
         ns=(int(psi_G.shape[2]) if V_T_r is not None
-            else int(psi_charge.shape[2])), nk=nk,
+            else charge_ns), nk=nk,
         cell_volume=float(inputs.wfn.cell_volume))
+    # The sweep projects only the QP carry.  Keep its mesh-legal active
+    # carrier; the full density sphere above remains resident and sharded.
+    psi_matrix = psi_G[:, :geom_matrix.band_axis.carrier, :, :]
+    authenticate_axis(psi_matrix, geom_matrix.band_axis, axis=1,
+                      where='SC exact Hartree active band sphere')
+    psi_charge = psi_matrix[:, :, :charge_ns, :]
     if V_T_r is not None:
         H_pair = sweep_matrix_elements(
-            psi_G,
+            psi_matrix,
             operator=four_current_potential_operator(
                 geom_matrix, V_H_r, V_T_r,
                 charge_nspinor=charge_ns),
@@ -2297,10 +2315,24 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
     if H_transverse is not None:
         H_transverse = unfold_file_wedge_band_operator(
             inputs.sym, H_transverse, trs_rule="conj")
+    # The sweep keeps its mesh-legal carrier by contract.  SCExactHartree
+    # crosses into the physical [b0,b3) carry, whose matrix axes are logical.
+    # Strip by the sweep's receipt on device after the symmetry unfold; both
+    # scalar and current pieces must enter every SC/output seam identically.
+    def physical_hartree(panel, name):
+        for axis in (-2, -1):
+            authenticate_axis(panel, geom_matrix.band_axis, axis=axis,
+                              where=f'SC exact Hartree {name}')
+        return strip_axis(strip_axis(panel, geom_matrix.band_axis, axis=-2),
+                          geom_matrix.band_axis, axis=-1)
+
+    H_scalar = physical_hartree(H_scalar, 'scalar')
+    if H_transverse is not None:
+        H_transverse = physical_hartree(H_transverse, 'transverse')
     return SCExactHartree(
         scalar_dft=H_scalar,
         transverse_dft=H_transverse,
-        efermi_ry=float(e_f))
+        efermi_ry=float(efermi_ry))
 
 
 def _residency_census(named, print_fn) -> None:
@@ -3116,7 +3148,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # The density owner selects raw-parent U/E, averages the fields
         # by typed actions, and unfolds only the completed band matrices.
         exact_hartree_dft = rebuild_hartree_dft_basis(
-            inputs, U_full, E_full)
+            inputs, U_full, wfns_qp.occ,
+            (float(entry_occ_state.mu_ry) if entry_occ_state is not None
+             else float(efermi_ry)))
         from common import sanity as _sanity
         _sanity.check_finite(
             "V_H[SC] scalar", exact_hartree_dft.scalar_dft,

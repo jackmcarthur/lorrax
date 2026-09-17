@@ -65,23 +65,35 @@ def test_unreduced_file_output_keeps_authenticated_file_rows():
 def test_hartree_trivial_view_weights_match_selected_rows(monkeypatch):
     """An IBZ file supplies normalized full-grid weights to a trivial-view rebuild."""
     import pytest
-    from gw import sc_iteration, efermi
+    from gw import sc_iteration, qsgw_density
     source = _source_symmetry()
     view = source.trivial_view()
     wfn = SimpleNamespace(nkpts=2, kweights=np.array([1/3, 2/3]),
-                          symmetry=lambda: source)
+                          symmetry=lambda: source, nspinor=1,
+                          occupation_state_capacity=2, fft_grid=(1, 1, 1),
+                          cell_volume=1.0)
     inputs = SimpleNamespace(wfn=wfn, sym=view, material_class="semiconductor",
-                             meta=SimpleNamespace(nelec=1))
+                             meta=SimpleNamespace(nelec=1),
+                             band_slices=SimpleNamespace(nb_sigma=2,
+                                                         nb_full_logical=2),
+                             wfns_dft=SimpleNamespace(enk=np.zeros((3, 2))),
+                             mesh_xy=Mesh(np.array(jax.devices()[:1]).reshape(1, 1),
+                                          ('x', 'y')),
+                             config=SimpleNamespace(bispinor=False,
+                                                    bispinor_gw=None),
+                             print_fn=lambda _: None)
     monkeypatch.setattr(sc_iteration, "_dft_psi_sphere",
-                        lambda _: (np.zeros((3, 2, 4, 1)), None))
+                        lambda _, **__: (np.zeros((3, 2, 1, 1)), None))
     class ReachedOccupations(Exception):
         pass
-    def check(energies, weights, nelec):
-        assert weights.shape == energies.shape[:1] == (len(view.kirr_fullids),)
+    def check(psi, occ, weights, **_):
+        assert weights.shape == psi.shape[:1] == (len(view.kirr_fullids),)
         np.testing.assert_allclose(weights, np.full(3, 1/3))
         assert np.isclose(weights.sum(), 1.0)
+        np.testing.assert_array_equal(occ, np.ones((3, 2)))
         raise ReachedOccupations
-    monkeypatch.setattr(efermi, "fermi_level_step", check)
+    monkeypatch.setattr(qsgw_density, "rho_from_wfns", check)
     with pytest.raises(ReachedOccupations):
         sc_iteration.rebuild_hartree_dft_basis(
-            inputs, np.broadcast_to(np.eye(2), (3, 2, 2)), np.zeros((3, 2)))
+            inputs, np.broadcast_to(np.eye(2), (3, 2, 2)),
+            np.ones((3, 2)), 0.0)
