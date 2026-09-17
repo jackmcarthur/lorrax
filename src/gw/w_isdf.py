@@ -477,7 +477,7 @@ def _get_chi_fractional_contour_kernel(
 def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
     *, k_unfold_plan=None, layout="face", selected_q=None, pair_mode="retarded",
-    bank_carry=False, ordered=False,
+    bank_carry=False, ordered=False, vertex=False,
 ):
     """Integrate the retarded response using final occupied and unoccupied band weights.
 
@@ -495,6 +495,12 @@ def _get_chi_fractional_contour_kernel_face(
     ``-q`` transposed. Without ``selected_q`` the finished full-grid rows are
     permuted by the q negation instead of gathered. Time-reversal-symmetric
     banks keep the incumbent trace, where the two orientations are equal.
+
+    With ``vertex=True`` each psi argument is ``(bare, vertex_applied)``.
+    The unoccupied Green uses the vertex-applied endpoint carriers; the
+    occupied Green uses bare carriers. Thus the same spin trace computes
+    ``tr[J_A G^> J_B G^<]`` without another FFT or a second producer.
+    Carriers must already be unfolded before applying current vertices.
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
@@ -530,6 +536,9 @@ def _get_chi_fractional_contour_kernel_face(
                 "GATE response_selected_q: got invalid selected_q; want unique "
                 "full-grid indices; why: bank parent rows must be explicit")
     physical = bool(ordered) or pair_mode == "laplace_ordered"
+    if vertex and (not physical or k_unfold_plan is not None):
+        raise ValueError("GATE response_vertex: current carriers require ordered "
+                         "full-k endpoints, with vertices applied after symmetry unfold")
     gather_q = selected_q
     negate_full_q = None
     if physical:
@@ -571,6 +580,8 @@ def _get_chi_fractional_contour_kernel_face(
     rep0 = NamedSharding(mesh_xy, P())
     psi_mun_shard = NamedSharding(mesh_xy, PSI_MUN_SPEC)
     psi_nmu_shard = NamedSharding(mesh_xy, PSI_NMU_SPEC)
+    mun_input = (psi_mun_shard, psi_mun_shard) if vertex else psi_mun_shard
+    nmu_input = (psi_nmu_shard, psi_nmu_shard) if vertex else psi_nmu_shard
 
     # ONE planned GEMM, built here (eagerly, once) and shared by every Gf
     # and Gu build this kernel ever does — mirrors
@@ -589,7 +600,7 @@ def _get_chi_fractional_contour_kernel_face(
         jax.jit,
         in_shardings=(
             rep1, rep0,
-            psi_mun_shard, psi_nmu_shard,
+            mun_input, nmu_input,
             rep2, rep2, rep2, rep0,
         ) + ((selected_shard,) if bank_carry else ()),
         donate_argnums=(8,) if bank_carry else (),
@@ -608,7 +619,9 @@ def _get_chi_fractional_contour_kernel_face(
         *carry,
     ):
         # The caller supplies occ and 1-occ after support masking; do not invert again.
-        n_mu = psi_mun.shape[2]
+        bare_mun, current_mun = psi_mun if vertex else (psi_mun, psi_mun)
+        bare_nmu, current_nmu = psi_nmu if vertex else (psi_nmu, psi_nmu)
+        n_mu = bare_mun.shape[2]
         q_count = nk if selected_q is None else len(selected_q)
         zero = jax.lax.with_sharding_constraint(
             jnp.zeros((q_count, n_mu, n_mu), dtype=jnp.complex128),
@@ -621,14 +634,16 @@ def _get_chi_fractional_contour_kernel_face(
         if bank_carry:
             initial = carry[0]
 
-        def green_k(weight, t, ref):
+        def green_k(weight, t, ref, *, current=False):
+            left = current_mun if current else bare_mun
+            right = current_nmu if current else bare_nmu
             # Incumbent: conj(G(w, t)) = G(conj w, conj t)^T. Physical: G(conj w, conj t).
             if physical:
-                g = build_G_tau(psi_mun, psi_nmu, enk_full, jnp.conj(t), e_ref=ref,
+                g = build_G_tau(left, right, enk_full, jnp.conj(t), e_ref=ref,
                                 band_weight=jnp.conj(weight), layout=layout,
                                 gemm=g_plan, k_unfold_plan=k_unfold_plan)
             else:
-                g = jnp.conj(build_G_tau(psi_mun, psi_nmu, enk_full, t, e_ref=ref,
+                g = jnp.conj(build_G_tau(left, right, enk_full, t, e_ref=ref,
                                          band_weight=weight, layout=layout,
                                          gemm=g_plan, k_unfold_plan=k_unfold_plan))
             return jax.lax.with_sharding_constraint(g, G_shard)
@@ -636,7 +651,7 @@ def _get_chi_fractional_contour_kernel_face(
         def retarded_correlation(time):
             tau = jnp.asarray(1j, dtype=jnp.complex128) * time
             Gf_R = G_fftn(green_k(occ_f, -tau, energy_reference))
-            Gu_R = G_fftn(green_k(occ_u, -tau, energy_reference))
+            Gu_R = G_fftn(green_k(occ_u, -tau, energy_reference, current=True))
             return jax.lax.with_sharding_constraint(
                 jnp.einsum(
                     "Rambn,Rambn->Rmn",
@@ -656,13 +671,13 @@ def _get_chi_fractional_contour_kernel_face(
             energy, so it weights forward + reverse. Each side remains a
             one-particle correlation through the same Green/FFT owner.
             """
-            def green(weight, tau_value, ref):
-                return G_fftn(green_k(weight, tau_value, ref))
+            def green(weight, tau_value, ref, *, current=False):
+                return G_fftn(green_k(weight, tau_value, ref, current=current))
 
             lower_f = green(occ_f[0], -time, energy_reference[0])
-            upper_u = green(occ_u[0], time, energy_reference[1])
+            upper_u = green(occ_u[0], time, energy_reference[1], current=True)
             lower_u = green(occ_f[1], -time, energy_reference[0])
-            upper_f = green(occ_u[1], time, energy_reference[1])
+            upper_f = green(occ_u[1], time, energy_reference[1], current=True)
             forward = jnp.einsum("Rambn,Rambn->Rmn", upper_u,
                                  jnp.conj(lower_f), optimize=True)
             reverse = jnp.einsum("Rambn,Rambn->Rmn", upper_f,
