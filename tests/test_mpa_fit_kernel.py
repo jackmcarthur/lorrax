@@ -128,7 +128,8 @@ def test_leon_companion_construction_matches_independent_numpy_equations():
 
     n = 4
     z = sampling.double_parallel_grid(
-        n, 6.0, material_class="metal", alpha=2, schedule="leon")
+        n, 6.0, material_class="metal", alpha=2, schedule="leon",
+        fermi_dirac_kt=0.005)
     Omega_t, B_t = _si_like_poles(n, omega_hi=2.5)
     w = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
     x = z ** 2
@@ -168,7 +169,8 @@ def test_leon_thiele_construction_matches_independent_yambo_recursion():
 
     n = 4
     z = sampling.double_parallel_grid(
-        n, 6.0, material_class="metal", alpha=1, schedule="leon")
+        n, 6.0, material_class="metal", alpha=1, schedule="leon",
+        fermi_dirac_kt=0.005)
     Omega_t, B_t = _si_like_poles(n, omega_hi=2.5)
     w = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
     x = z ** 2
@@ -205,7 +207,8 @@ def test_leon_thiele_construction_matches_independent_yambo_recursion():
 def test_thiele_exact_recovery_on_published_metal_grid():
     n = 4
     z = sampling.double_parallel_grid(
-        n, 6.0, material_class="metal", alpha=1, schedule="leon")
+        n, 6.0, material_class="metal", alpha=1, schedule="leon",
+        fermi_dirac_kt=0.005)
     Omega_t, B_t = _si_like_poles(n, omega_hi=2.5)
     w = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
     Omega, B, diag = pade_fit.fit_mpa_poles(
@@ -240,13 +243,14 @@ def test_leon_np15_qpps_fractions_are_the_yambo_integer_construction():
 
 
 def test_exact_recovery_metal_grid_alpha2():
-    """The metal protocol: origin shifted to i*1e-5 Ha, alpha = 2."""
+    """The metal protocol: first sample at a Matsubara frequency, alpha = 2."""
 
     n_p = 6
     z = sampling.double_parallel_grid(
-        n_p, 5.0, material_class="metal", alpha=2)
+        n_p, 5.0, material_class="metal", alpha=2, fermi_dirac_kt=0.005)
     assert z[0].real == 0.0
-    assert z[0].imag == pytest.approx(1.0e-5)
+    assert z[0].imag == sampling.metal_matsubara_index(0.005)[1]
+    assert z[0].imag == pytest.approx(2.0 * np.pi * 0.005, rel=1e-15)
     Omega_t, B_t = _si_like_poles(n_p, omega_lo=0.2, omega_hi=3.0)
     W = pade_fit.synthesize_w_samples(Omega_t, B_t, z)
     Omega, B, diag = pade_fit.fit_mpa_poles(W, z, n_p)
@@ -776,15 +780,15 @@ def test_np1_insulator_grid_is_the_gn_probe_pair():
         g_ry, np.array([0.0 + 0.0j, 0.0 + 2.0j], dtype=np.complex128))
 
 
-@pytest.mark.parametrize("material", ["insulator", "metal"])
-def test_nested_double_parallel_grid(material):
+@pytest.mark.parametrize("material,kt", [("insulator", None), ("metal", 0.005)])
+def test_nested_double_parallel_grid(material, kt):
     """The full 2*n_p complex grid is nested, one point added per line."""
 
     for n_p in range(1, 13):
         g0 = sampling.double_parallel_grid(
-            n_p, 4.0, material_class=material)
+            n_p, 4.0, material_class=material, fermi_dirac_kt=kt)
         g1 = sampling.double_parallel_grid(
-            n_p + 1, 4.0, material_class=material)
+            n_p + 1, 4.0, material_class=material, fermi_dirac_kt=kt)
         assert g1.size == g0.size + 2
         for value in g0:
             assert np.any(g1 == value), (
@@ -848,23 +852,26 @@ def test_gate_sampling_refusals():
         sampling.double_parallel_grid(4, 4.0, energy_unit="eV")
     with pytest.raises(ValueError, match="GATE varpi_ordering"):
         sampling.double_parallel_grid(4, 4.0, varpi_near=1.0, varpi_far=0.1)
-    with pytest.raises(ValueError, match="GATE origin_shift_metal_only"):
-        sampling.double_parallel_grid(4, 4.0, origin_shift=1.0e-4)
-    with pytest.raises(ValueError, match="GATE origin_shift_ordering"):
+    with pytest.raises(ValueError, match="GATE fermi_dirac_kt_metal_only"):
+        sampling.double_parallel_grid(4, 4.0, fermi_dirac_kt=0.005)
+    with pytest.raises(ValueError, match="GATE metal_first_sample_needs_kt"):
+        sampling.double_parallel_grid(4, 4.0, material_class="metal")
+    with pytest.raises(ValueError, match="GATE metal_first_sample_needs_kt"):
         sampling.double_parallel_grid(
-            4, 4.0, material_class="metal", origin_shift=0.0)
-    with pytest.raises(ValueError, match="GATE origin_shift_ordering"):
+            4, 4.0, material_class="metal", fermi_dirac_kt=0.0)
+    with pytest.raises(ValueError, match="GATE metal_first_sample_below_near_line"):
         sampling.double_parallel_grid(
-            4, 4.0, material_class="metal", origin_shift=0.1)
+            4, 4.0, material_class="metal", fermi_dirac_kt=0.02)
     # FALSE case for each: the scheduled Si call is accepted.
     assert sampling.double_parallel_grid(8, 4.0).shape == (16,)
-    # FALSE case for the two shift gates: a legal metal shift is taken, and
-    # it is the ONLY sample that moves (the ladder's whole requirement).
-    shifted = sampling.double_parallel_grid(
-        8, 4.0, material_class="metal", origin_shift=1.0e-4)
-    default = sampling.double_parallel_grid(8, 4.0, material_class="metal")
-    assert shifted[0] == 1e-4j and default[0] == 1e-5j
-    np.testing.assert_array_equal(shifted[1:], default[1:])
+    # FALSE case for the kT gates: a metal takes i*nu_n and it is the ONLY
+    # sample that differs from the insulator grid's z = 0.
+    metal = sampling.double_parallel_grid(
+        8, 4.0, material_class="metal", fermi_dirac_kt=0.005)
+    insulator = sampling.double_parallel_grid(8, 4.0)
+    assert metal[0] == 1j * sampling.metal_matsubara_index(0.005)[1]
+    assert insulator[0] == 0.0
+    np.testing.assert_array_equal(metal[1:], insulator[1:])
 
 
 def test_gate_error_vector_shape():
@@ -888,3 +895,22 @@ def test_gate_synthesis_off_pole():
     # FALSE case: a pole with a finite width is off every sample.
     pade_fit.synthesize_w_samples(
         np.array([1.0 - 0.1j]), np.array([1.0 + 0.0j]), z)
+
+
+def test_metal_first_sample_is_the_matsubara_frequency_nearest_half_an_ev():
+    """n >= 1 nearest 0.5 eV: n = 1 when 2 pi kT is above it, larger n at small kT."""
+    from common.units import EV_TO_RYD
+
+    n, nu = sampling.metal_matsubara_index(0.01, energy_unit="Ry")
+    assert n == 1 and nu == pytest.approx(2.0 * np.pi * 0.01, rel=1e-15)
+    n, nu = sampling.metal_matsubara_index(0.001, energy_unit="Ry")
+    assert n == 6 and abs(nu - 0.5 * EV_TO_RYD) <= np.pi * 0.001
+    # Ha and Ry describe the same physical height.
+    n_ha, nu_ha = sampling.metal_matsubara_index(0.0005, energy_unit="Ha")
+    assert n_ha == 6 and nu_ha == pytest.approx(0.5 * nu, rel=1e-14)
+    # The rule the producer builds lands on the same float.
+    from ffi import _services
+    _services.ensure_on_path()
+    import minimax
+    rule = minimax.matsubara_response_rule(1.0 / 0.001, 4.0, (n,), rel_tol=1e-6)
+    assert float(rule["nu_ry"][0]) == nu

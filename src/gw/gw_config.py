@@ -1738,15 +1738,6 @@ _DEFAULTS = {
     "mpa_pole_solver": "loewner",
     "mpa_varpi_near_ry": 0.2,
     "mpa_varpi_far_ry": 2.0,
-    # Height (Ry) of the metal near line's FIRST sample, z_1^1 = i*shift --
-    # the published stability dodge around zero-energy intraband
-    # transitions, NOT a broadening.  Unset (the default) = the published
-    # 1e-5 Ha = 2e-5 Ry constant in ``gw.mpa.sampling._METAL_ORIGIN_SHIFT``,
-    # which is bit-for-bit every grid built before this key existed.  A
-    # METAL-ONLY key: an insulating deck's first sample is z = 0 exactly, so
-    # setting it there is refused rather than ignored.  Ry like every deck
-    # key, and therefore TWICE the Ha value the papers quote.
-    "mpa_metal_origin_shift_ry": None,
     "mpa_pole_batch_size": 4,
     # Optional finalized MPA body/head fit consumed read-only by a one-shot
     # run.  Empty means build screening in this run.
@@ -2383,8 +2374,7 @@ def _resolve_shared_pole_inputs(params):
                    "mpa_overwrite_completed_artifacts"}
     if not head_enabled:
         unused_keys.update({"mpa_n_poles", "mpa_sampling_alpha", "mpa_sampling_schedule",
-            "mpa_pole_solver", "mpa_varpi_near_ry", "mpa_varpi_far_ry",
-            "mpa_metal_origin_shift_ry"})
+            "mpa_pole_solver", "mpa_varpi_near_ry", "mpa_varpi_far_ry"})
     unused = sorted(named.intersection(unused_keys))
     if unused:
         raise ValueError(
@@ -2643,9 +2633,6 @@ def _input_response(
         pole_solver=str(params["mpa_pole_solver"]).strip().lower(),
         varpi_near_ry=float(params["mpa_varpi_near_ry"]),
         varpi_far_ry=float(params["mpa_varpi_far_ry"]),
-        metal_origin_shift_ry=(
-            float(params["mpa_metal_origin_shift_ry"])
-            if params["mpa_metal_origin_shift_ry"] is not None else None),
         pole_batch_size=int(params["mpa_pole_batch_size"]),
         overwrite_completed_artifacts=bool(
             params["mpa_overwrite_completed_artifacts"]),
@@ -4088,9 +4075,6 @@ class MPAConfig:
     pole_solver: str
     varpi_near_ry: float
     varpi_far_ry: float
-    #: Metal near-line origin shift in Ry; ``None`` = the published
-    #: ``sampling._METAL_ORIGIN_SHIFT`` default (2e-5 Ry = 1e-5 Ha).
-    metal_origin_shift_ry: float | None
     pole_batch_size: int
     #: Deliberately destructive opt-in for replacing an already complete MPA
     #: sample store or finalized/certified pole fit.  False is write-once.
@@ -4127,21 +4111,12 @@ class MPAConfig:
         if not (0.0 < self.varpi_near_ry < self.varpi_far_ry):
             raise ValueError(
                 "MPA line heights must satisfy 0 < near < far")
-        if self.metal_origin_shift_ry is not None:
-            if not (0.0 < self.metal_origin_shift_ry < self.varpi_near_ry):
-                raise ValueError(
-                    "mpa_metal_origin_shift_ry must satisfy 0 < shift < "
-                    f"mpa_varpi_near_ry; got shift = "
-                    f"{self.metal_origin_shift_ry!r} Ry against "
-                    f"mpa_varpi_near_ry = {self.varpi_near_ry!r} Ry. The "
-                    "shift dodges the zero-energy intraband pile-up without "
-                    "climbing off the near line it sits on. NOTE the unit: "
-                    "this key is Ry like every deck key, so it is TWICE the "
-                    "Hartree value the multipole papers quote (published "
-                    "default 1e-5 Ha = 2e-5 Ry).")
 
-    def sample_plan(self, omega_m_ry, *, material_class):
-        """Return the configured double-parallel frequency plan in Ry; see docs/architecture/decisions.md."""
+    def sample_plan(self, omega_m_ry, *, material_class, fermi_dirac_kt_ry=None):
+        """Return the configured double-parallel frequency plan in Ry; see docs/architecture/decisions.md.
+
+        A metal passes its Fermi-Dirac ``kT`` (``occ_smearing_width_ry``): its
+        first sample is the Matsubara frequency nearest 0.5 eV."""
         if self.sampling_alpha is None:
             raise RuntimeError(
                 "mpa_sampling_alpha is unresolved; infer the material class "
@@ -4156,7 +4131,7 @@ class MPAConfig:
             schedule=self.sampling_schedule,
             varpi_near=self.varpi_near_ry,
             varpi_far=self.varpi_far_ry,
-            origin_shift=self.metal_origin_shift_ry,
+            fermi_dirac_kt=fermi_dirac_kt_ry,
             energy_unit="Ry",
         )
 
@@ -4430,10 +4405,6 @@ def validate_material_inputs(config, material_class):
             raise ValueError(
                 "integer WFN occupations identify an insulator, which has "
                 "no fixed-N chemical potential; choose vbm or midgap.")
-        if config.mpa.metal_origin_shift_ry is not None:
-            raise ValueError(
-                "mpa_metal_origin_shift_ry is metal-only, but WFN "
-                "occupations identify an insulator; remove the key.")
 
 
 def resolve_mpa_sampling_alpha(config, material_class, *, print_fn=print):

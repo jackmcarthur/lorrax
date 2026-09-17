@@ -402,14 +402,14 @@ def test_plan_refuses_duplicate_roles():
 def test_mpa_plan_is_the_protocol_grid_with_cells_attached():
     """The plan adds the 2x2 to the grid and changes nothing else."""
 
-    for material_class in ("insulator", "metal"):
+    for material_class, kt in (("insulator", None), ("metal", 0.01)):
         for n_p in (4, 8, 11):
             plan = sample_plan.mpa_plan(
                 n_p, 7.0, material_class=material_class,
-                energy_unit="Ry")
+                fermi_dirac_kt=kt, energy_unit="Ry")
             grid = sampling.double_parallel_grid(
                 n_p, 7.0, material_class=material_class,
-                energy_unit="Ry")
+                fermi_dirac_kt=kt, energy_unit="Ry")
             assert np.array_equal(sample_plan.plan_z(plan), grid)
             assert len(sample_plan.plan_points(plan)) == 2 * n_p
 
@@ -424,14 +424,15 @@ def test_mpa_plan_is_the_protocol_grid_with_cells_attached():
     assert [v for v, _ in routes["lines"]] == [0.2, 2.0]
     assert [len(pts) for _, pts in routes["lines"]] == [7, 7]
 
-    # A metal's near-origin sample is IMAG, not static -- the 1e-5 Ha
-    # shift is a real line height and the table must not round it away.
+    # A metal's first sample is IMAG, not static: the Matsubara frequency
+    # nearest 0.5 eV (n = 1 at kT = 0.01 Ry) is a real line height.
     metal = sample_plan.mpa_plan(8, 7.0, material_class="metal",
-                                 energy_unit="Ry")
+                                 fermi_dirac_kt=0.01, energy_unit="Ry")
     first = sample_plan.plan_points(metal)[0]
     assert first["character"] == "imag"
     assert first["family"] == "exponential_sum_imag"
-    assert first["varpi"] == 2.0e-5
+    assert first["varpi"] == sampling.metal_matsubara_index(
+        0.01, energy_unit="Ry")[1]
 
 
 # ---------------------------------------------------------------------------

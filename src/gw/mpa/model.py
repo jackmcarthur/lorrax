@@ -16,7 +16,7 @@ import minimax  # noqa: E402
 from file_io import restart_bundle as _bundle_reader
 from file_io import mpa_store
 from gw import quadrature_log
-from gw.mpa import fit_driver, sample_plan
+from gw.mpa import fit_driver, sample_plan, sampling
 
 
 _CHI = "chi_qmunu_z"
@@ -69,7 +69,11 @@ def _canonical_charge_zeta_identity(receipt, *, source_path):
 
 
 def make_mpa_plan(config, quad, *, material_class):
-    """Build and validate the one frequency plan shared by body and head."""
+    """Build and validate the one frequency plan shared by body and head.
+
+    A metal's first near-line sample is the Matsubara frequency nearest 0.5 eV
+    at the deck's Fermi-Dirac ``kT`` (``occ_smearing_width_ry``).
+    """
     n_p = int(config.mpa.n_poles)
     omega_m = float(quad.x_max)
     plan = sample_plan.mpa_plan(
@@ -78,7 +82,9 @@ def make_mpa_plan(config, quad, *, material_class):
         schedule=config.mpa.sampling_schedule,
         varpi_near=config.mpa.varpi_near_ry,
         varpi_far=config.mpa.varpi_far_ry,
-        origin_shift=config.mpa.metal_origin_shift_ry, energy_unit="Ry")
+        fermi_dirac_kt=(config.occ_smearing_width_ry
+                        if material_class == "metal" else None),
+        energy_unit="Ry")
     sample_plan.refuse_unsupported(plan, delta_max=omega_m)
     return plan
 
@@ -592,11 +598,19 @@ def _solve_wc(
         return tuple(head_samples) if bgw_q0 is not None else None
     for index in range(int(n_z), len(head_response.omegas)):
         if bgw_q0 is not None:
-            # Metallic MPA appends only the exact-static do_G0 sample after
-            # the fit grid.  The Gamma row of the near-line origin sample was
-            # replaced by the same static order-of-limits response above, so
-            # that q=0 head value -- not the literal finite-q response -- is
-            # the one reused here.
+            # The exact-static do_G0 sample appended after the fit grid reuses
+            # the finite-q0 epsilon of sample 0, which is static only when
+            # sample 0 is z = 0.  A metal's first sample is the Matsubara
+            # frequency nearest 0.5 eV, so the reuse would put a dynamic
+            # epsilon into the static head.
+            if z_values is not None and complex(z_values[0]) != 0.0:
+                raise ValueError(
+                    "GATE bgw_q0shift_static_sample: bgw_metal_q0_treatment = "
+                    "bgw_q0shift builds the exact-static (do_G0) head from the "
+                    "finite-q0 epsilon of the first fit sample, but that sample "
+                    f"is z = {complex(z_values[0])!r}, not 0 (a metal's first "
+                    "sample is the Matsubara frequency nearest 0.5 eV). "
+                    "fix: do_G0 = false, or bgw_metal_q0_treatment = exact.")
             from gw.head_correction import bgw_q0shift_head_sample
             head_samples.append(bgw_q0shift_head_sample(
                 bgw_vhead, bgw_epsinv[0], head_response.omegas[index]))
@@ -628,30 +642,6 @@ def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy,
         tile_bytes=tile_bytes, provenance=provenance,
         occupation_state=occupation_state, solve=solve,
         overwrite_incompatible=overwrite_incompatible, finalize=False)
-
-
-def _metal_kminq_rows(sym, q_idx):
-    """Per-wedge-row flat ``k → k−q`` maps for the direct origin sample.
-
-    Row order follows the stored wedge (``sym.q_irr_full_idx`` order); the
-    Gamma row's map must be the identity, which is asserted because it is
-    the one cheap invariant that discriminates a wedge-row/kq-column
-    ordering mismatch.
-    """
-    from common.kq_mapping import kminq_idx_for_iq
-
-    q_idx = np.asarray(q_idx, dtype=np.int64)
-    rows = np.stack([
-        kminq_idx_for_iq(sym, j) for j in range(int(q_idx.size))
-    ])
-    for j in np.flatnonzero(q_idx == 0):
-        if not np.array_equal(
-                rows[j], np.arange(rows.shape[1], dtype=rows.dtype)):
-            raise ValueError(
-                "MPA metal q wedge: the Gamma row's k-q map is not the "
-                "identity, so the stored wedge ordering does not match "
-                "SymMaps.kq_map columns")
-    return rows
 
 
 def _require_metal_occupations(material_class, occupation_state):
@@ -699,8 +689,8 @@ def chi0_orientation_route(material_class: str, *, trs_allowed: bool) -> str:
 def _evaluate_samples(
     wfns, routes, quad, config, meta, mesh_xy, *,
     material_class, sym,
-    energy_reference, occupation_state, write_full, write_wedge,
-    static_gamma_override, gamma_row, kminq_rows, write_reflected=None,
+    energy_reference, occupation_state, write_full,
+    static_gamma_override, write_reflected=None,
     print_fn=print,
 ):
     """Evaluate every plan point through its route's kernel.
@@ -708,15 +698,14 @@ def _evaluate_samples(
     Insulating plans whose measured verdict permits time reversal keep the
     historical kernels on a byte-identical code path.  Broken-TR insulating
     plans use one ordered-orientation contour sweep and obtain its partner by
-    q-negated conjugation.  Metal plans (shifted-origin double-parallel
-    protocol) route the
-    near line's first sample through the exact direct ordered-pair kernel —
-    the damped contour rule at varpi = 2e-5 Ry needs ~1.0e6 nodes
-    (probe record runs/records/metal_mpa_wave1_20260815/I1_origin_probe.md)
-    — and every other point through the fractional contour kernel with the
-    rule bandwidth derived from the occupation supports, not ``quad.x_max``.
-    ``write_full`` takes a full-grid chi (the writer wedges it);
-    ``write_wedge`` takes already-wedge-shaped rows.
+    q-negated conjugation.  Metal plans route the near line's first sample,
+    the bosonic Matsubara frequency ``i nu_n`` nearest 0.5 eV
+    (``sampling.metal_matsubara_index``), through the finite-temperature
+    producer ``compute_chi0_matsubara`` (exact at ``nu_n``, a few tens of
+    nodes), and every other point through the fractional contour kernel with
+    the rule bandwidth derived from the occupation supports, not
+    ``quad.x_max``.  ``write_full`` takes a full-grid chi (the writer wedges
+    it).
     """
     from gw.minimax_config import MinimaxConfig
     from gw.minimax_screening import build_imag_quadrature
@@ -725,7 +714,8 @@ def _evaluate_samples(
         compute_chi0_contour,
         compute_chi0_contour_ordered,
         compute_chi0_contour_fractional,
-        compute_chi0_direct_fractional,
+        compute_chi0_matsubara,
+        matsubara_rule,
         occupation_support_bandwidth,
     )
 
@@ -820,24 +810,34 @@ def _evaluate_samples(
             if ordered:
                 write_reflected(point, chi_reflected)
         elif point["role"].startswith("near"):
-            # Evaluate the literal shifted coordinate.  The shift avoids an
-            # interpolation point at the metal's singular origin; writing a
-            # static divided difference into this nonzero slot instead moved
-            # the real Na response by up to 0.78% at finite q (claim 0385).
-            quadrature_log.record_direct(z=point["z"])
-            chi_w = compute_chi0_direct_fractional(
-                wfns, np.asarray([point["z"]], dtype=np.complex128),
-                meta, mesh_xy, occupation_state=occupation_state,
-                kminq_rows=kminq_rows,
-                nb_logical=(
-                    int(meta.b_id_4_chi_user) - int(wfns.slices.b0)),
-                progress_fn=lambda q_done, q_total, elapsed: print_fn(
-                    "  MPA direct chi0 shifted-origin q row "
-                    f"{q_done}/{q_total} complete in {elapsed:.3f} s"),
-                ordered=metal_physical)
-            if static_gamma_override is not None and gamma_row is not None:
-                chi_w = chi_w.at[gamma_row].set(static_gamma_override[0])
-            write_wedge(point, chi_w)
+            # The first near-line sample is the Matsubara frequency the plan
+            # chose from the deck's kT; the producer evaluates it exactly.
+            # A static Gamma body has no slot on the metal grid (no z = 0).
+            if static_gamma_override is not None:
+                raise ValueError(
+                    "GATE mpa_metal_static_gamma_override: a static Gamma chi "
+                    "body was supplied to a metal MPA plan, whose samples are "
+                    "all at Im z > 0 (the first at a Matsubara frequency); "
+                    "writing a z = 0 value into a nonzero slot is claim 0385's "
+                    "coordinate/value defect. Metal velocity head updates are "
+                    "disabled (owner ruling 2026-09-17).")
+            n, nu = sampling.metal_matsubara_index(
+                occupation_state.smearing_width_ry, energy_unit="Ry")
+            if point["z"] != 1j * nu:
+                raise ValueError(
+                    "GATE mpa_metal_first_sample_matsubara: the plan's first "
+                    f"near-line sample z={point['z']!r} is not i*nu_{n} = "
+                    f"{1j * nu!r} at the occupation state's kT = "
+                    f"{occupation_state.smearing_width_ry!r} Ry; the plan and "
+                    "the occupations were built from different widths.")
+            tol = float(config.minimax_config.target_error)
+            _, _, _, rule = matsubara_rule(
+                wfns, occupation_state, (n,), rel_tol=tol)
+            quadrature_log.record_matsubara(rule)
+            chi = compute_chi0_matsubara(
+                wfns, meta, mesh_xy, occupation_state=occupation_state,
+                nu_indices=(n,), rel_tol=tol, ordered=metal_physical)
+            write_full(point, chi)
         else:
             # Far pure-imaginary point: the fractional contour is cheap at
             # O(1) Ry line heights (31 nodes at varpi=1, tol 1e-6).
@@ -928,8 +928,8 @@ def build_mpa_fit(
     difference the store records is the provenance stamp below.
     """
     # The former blanket metal gate (mpa_metal_evaluator_unavailable) is
-    # discharged: occupation-weighted chi (fractional contour + the finite-q
-    # ordered-pair origin sample) and the weighted Sigma branches landed in Wave 1.
+    # discharged: occupation-weighted chi (fractional contour lines and the
+    # finite-temperature Matsubara first sample) and the weighted Sigma branches.
     # A metal plan still refuses without an OccupationState — here, before
     # any inode exists, and again at the _evaluate_samples seam — and that
     # refusal is now the only gate on the deck path: the driver-level
@@ -1008,20 +1008,11 @@ def build_mpa_fit(
             charge_zeta_identity, source_path=charge_zeta_source_path or os.path.join(
                 root, f"isdf_tensors_{int(meta.n_rmu)}.h5")),
     }
-    # The origin shift is stamped ONLY when the deck declared it: it enters
-    # mpa_store's `extra` channel as the additive attr
-    # ``mpa_prov_metal_origin_shift_ry``, outside _SAMPLING_ORDER and so
-    # outside the ω-grid digest.  A deck that leaves the key unset writes
-    # the byte-identical store it wrote before the key existed, which is
-    # the whole reason this is `extra` and not a sixth sampling field.
     sampling_record = {"protocol": "double_parallel", "varpi": varpi,
                        "n_p": n_p, "alpha": config.mpa.sampling_alpha,
                        "omega_max": omega_m}
     if config.mpa.sampling_schedule != "nested":
         sampling_record["sampling_schedule"] = config.mpa.sampling_schedule
-    if config.mpa.metal_origin_shift_ry is not None:
-        sampling_record["metal_origin_shift_ry"] = float(
-            config.mpa.metal_origin_shift_ry)
     common = dict(
         n_omega=z_all.size, n_q_on_disk=q_idx.size,
         n_mu=meta.n_rmu, n_rmu_logical=meta.n_rmu, tables=tables,
@@ -1067,28 +1058,15 @@ def build_mpa_fit(
             for varpi_i, points in routes["lines"]
             if any(_chi_needed(point) for point in points)),
     }
-    metal = material_class == "metal"
-    kminq_rows = _metal_kminq_rows(sym, q_idx) if metal else None
     static_gamma_override = (
         iteration_head_response.static_chi_body_gamma
         if iteration_head_response is not None else None)
-    gamma_matches = np.flatnonzero(np.asarray(q_idx, np.int64) == 0)
-    gamma_row = int(gamma_matches[0]) if gamma_matches.size == 1 else None
 
     def _write_full(point, chi):
         if not ready[_CHI][int(point["index"])]:
             _write_sample(
                 sample_path, point["index"], chi, q_idx, meta, mesh_xy,
                 z_all.size)
-
-    def _write_wedge(point, chi_wedge):
-        if ready[_CHI][int(point["index"])]:
-            return
-        chi_wedge = _to_store_order(chi_wedge, meta)
-        chi_wedge.block_until_ready()
-        mpa_store.write_w_slab_collective(
-            sample_path, _CHI, point["index"], chi_wedge, mesh_xy=mesh_xy,
-            global_shape=(z_all.size, q_idx.size, meta.n_rmu, meta.n_rmu))
 
     def _write_reflected(point, chi):
         if not ready[_CHI_REFLECTED][int(point["index"])]:
@@ -1102,9 +1080,8 @@ def build_mpa_fit(
         sym=sym,
         energy_reference=energy_reference,
         occupation_state=occupation_state,
-        write_full=_write_full, write_wedge=_write_wedge,
+        write_full=_write_full,
         static_gamma_override=static_gamma_override,
-        gamma_row=gamma_row, kminq_rows=kminq_rows,
         write_reflected=_write_reflected if ordered else None,
         print_fn=print_fn)
 

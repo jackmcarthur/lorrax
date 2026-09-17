@@ -2566,7 +2566,7 @@ def _sc_head_frequency_plan(
                 config, quad, material_class=material_class)
         mpa_z = np.asarray(sample_plan.plan_z(mpa_plan), dtype=np.complex128)
         head_omegas = [complex(value) for value in mpa_z]
-        # The metallic MPA grid starts just above the origin.  Preserve a
+        # The metallic MPA grid starts at a Matsubara frequency.  Preserve a
         # separate exact-static sample for do_G0; it is nonanalytic and must
         # never enter the Loewner sample vector.
         if bool(config.do_G0) and not np.any(mpa_z == 0.0 + 0.0j):
@@ -3377,7 +3377,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 
     # Under mpa_material_class = metal the finite-q body above went through
     # build_mpa_fit(occupation_state=...) — fractional contour lines and the
-    # ordered-pair shifted-origin rows.  Insulating decks keep the historical
+    # Matsubara first sample.  Insulating decks keep the historical
     # valence/conduction cut (occupation_state=None).
 
     # Σ_xc dispatch — mode-orthogonal.  ``write_sigma_omega_h5=False``

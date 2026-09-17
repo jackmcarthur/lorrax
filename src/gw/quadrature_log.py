@@ -53,11 +53,19 @@ def record_line(rule, *, points, sweeps):
     }
 
 
-def record_direct(*, z):
-    """A sample evaluated by the exact ordered-pair scan (no time nodes)."""
-    z = complex(z)
-    _CHI[("direct", z.real, z.imag)] = {
-        "kind": "direct", "omega_ry": z.real, "varpi_ry": z.imag}
+def record_matsubara(rule):
+    """A finite-temperature Matsubara rule (``minimax.matsubara_response_rule``)."""
+    nus = tuple(float(nu) for nu in rule["nu_ry"])
+    certificate = rule.get("certificate", {})
+    _CHI[("matsubara", nus)] = {
+        "kind": "matsubara", "nu_ry": nus,
+        "indices": tuple(int(n) for n in rule["n_indices"]),
+        "beta_ry_inv": float(rule["beta_ry_inv"]),
+        "delta_max_ry": float(rule["delta_max_ry"]),
+        "nodes": int(rule["node_count"]),
+        "target": float(certificate.get("rel_tol", float("nan"))),
+        "certified": certificate.get("status") == "PASS",
+    }
 
 
 def record_sigma_plan(geometry):

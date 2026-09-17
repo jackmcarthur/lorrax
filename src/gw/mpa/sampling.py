@@ -37,14 +37,17 @@ Units
 -----
 The published protocol is quoted in Hartree; LORRAX is Ry-native.  The
 ``energy_unit`` argument selects only the DEFAULTS for the two line
-heights and the metal origin shift.  ``omega_m`` is always in the
-caller's unit and is never converted.  Passing the line heights
-explicitly means the caller owns their units.
+heights and the metal first-sample target.  ``omega_m`` and a metal's
+``fermi_dirac_kt`` are always in the caller's unit and are never converted.
+Passing the line heights explicitly means the caller owns their units.
 """
 
+import math
 from fractions import Fraction
 
 import numpy as np
+
+from common.units import EV_TO_RYD
 
 # The published line heights (metals paper section II C): the near line
 # at varpi_1 = 0.1 Ha and the far line at varpi_2 = 1 Ha.  The Ry column
@@ -52,13 +55,12 @@ import numpy as np
 _VARPI_NEAR = {"Ha": 0.1, "Ry": 0.2}
 _VARPI_FAR = {"Ha": 1.0, "Ry": 2.0}
 
-# The metal origin shift DEFAULT: z_1^1 = i * 1e-5 Ha, a stability dodge
-# around zero-energy intraband transitions -- NOT a physical broadening.
-# The Ry column is the same physical height in LORRAX-native Rydberg, so
-# every Ry entry is TWICE its Ha partner.  Overridable per call through
-# ``double_parallel_grid(origin_shift=...)`` and, from a deck, through
-# ``mpa_metal_origin_shift_ry`` (always Ry, because deck keys are).
-_METAL_ORIGIN_SHIFT = {"Ha": 1.0e-5, "Ry": 2.0e-5}
+# The metal near line's first sample sits at a bosonic Matsubara frequency
+# nu_n = 2 pi n kT, the index n >= 1 chosen nearest this height (0.5 eV).
+# The published protocol shifts it to i*1e-5 Ha instead, where no time rule
+# is affordable (about 1e6 nodes on Na); at nu_n the finite-temperature
+# producer is exact in a few tens of nodes (owner ruling 2026-09-17).
+_METAL_FIRST_SAMPLE_TARGET = {"Ha": 0.25 * EV_TO_RYD, "Ry": 0.5 * EV_TO_RYD}
 
 _MATERIAL_CLASSES = ("insulator", "metal")
 _ENERGY_UNITS = ("Ha", "Ry")
@@ -250,6 +252,28 @@ def partition_omegas(n_p, omega_m, *, alpha=1, schedule="nested"):
     return np.asarray([float(f) ** a * om for f in fracs], dtype=np.float64)
 
 
+def metal_matsubara_index(fermi_dirac_kt, *, energy_unit="Ha"):
+    """Bosonic Matsubara index ``n >= 1`` of the metal near line's first sample.
+
+    ``nu_n = 2 pi n / beta`` with ``beta = 1 / fermi_dirac_kt`` (the caller's
+    unit) nearest ``_METAL_FIRST_SAMPLE_TARGET`` (0.5 eV).  Returns
+    ``(n, nu_n)``; ``nu_n`` uses the arithmetic of
+    ``minimax.matsubara_response_rule`` so the plan coordinate and the
+    producer's frequency are the same float.
+    """
+    kt = float("nan") if fermi_dirac_kt is None else float(fermi_dirac_kt)
+    if not (np.isfinite(kt) and kt > 0.0):
+        raise ValueError(
+            f"GATE metal_first_sample_needs_kt: fermi_dirac_kt={fermi_dirac_kt!r} "
+            "is not a positive Fermi-Dirac kT. FALSE case: a metal plan receives "
+            "the deck's occ_smearing_width_ry (kT, Ry); its first sample is a "
+            "Matsubara frequency 2 pi n kT.")
+    beta = 1.0 / kt
+    target = _METAL_FIRST_SAMPLE_TARGET[energy_unit]
+    n = max(1, int(round(target * beta / (2.0 * math.pi))))
+    return n, 2.0 * math.pi * float(n) / beta
+
+
 def double_parallel_grid(
     n_p,
     omega_m,
@@ -259,7 +283,7 @@ def double_parallel_grid(
     schedule="nested",
     varpi_near=None,
     varpi_far=None,
-    origin_shift=None,
+    fermi_dirac_kt=None,
     energy_unit="Ha",
 ):
     """Return the ``2*n_p`` complex sample points of the DP protocol.
@@ -273,9 +297,12 @@ def double_parallel_grid(
         Largest included transition energy, in the caller's unit.
     material_class
         ``"insulator"`` or ``"metal"``.  Selects the near line's first
-        sample: ``z = 0`` exactly for insulators, ``z = i*1e-5 Ha`` for
-        metals (metals paper section II C -- a stability dodge around
-        zero-energy intraband transitions, not a broadening).
+        sample: ``z = 0`` exactly for insulators; for metals the bosonic
+        Matsubara frequency ``i nu_n`` nearest 0.5 eV
+        (:func:`metal_matsubara_index`).  The metals paper (section II C)
+        shifts it to ``i*1e-5 Ha`` instead; LORRAX does not, because no
+        time rule reaches that height affordably and ``nu_n`` is exact for
+        the finite-temperature producer.
     alpha
         Partition exponent, 1 or 2.  See ``partition_omegas``.
     schedule
@@ -285,15 +312,12 @@ def double_parallel_grid(
         Line heights.  ``None`` takes the published defaults for
         ``energy_unit``: 0.1 and 1 Ha (equivalently 0.2 and 2 Ry).
         Passing them explicitly means the caller owns their units.
-    origin_shift
-        Height of the METAL near line's first sample, ``z_1^1 = i*shift``.
-        Exactly ``varpi_near``'s shape: ``None`` takes the published
-        default for ``energy_unit`` (1e-5 Ha, equivalently 2e-5 Ry), and
-        passing it explicitly means the caller owns its units.  Refused
-        under ``material_class="insulator"``, whose first sample is
-        ``z = 0`` exactly and would silently ignore it, and refused
-        unless ``0 < origin_shift < varpi_near``.  From a deck this is
-        ``mpa_metal_origin_shift_ry``.
+    fermi_dirac_kt
+        A metal's Fermi-Dirac ``kT`` in the caller's unit (from a deck,
+        ``occ_smearing_width_ry``).  Required for ``material_class="metal"``
+        and refused for an insulator, whose first sample is ``z = 0``
+        exactly and would silently ignore it.  The metal first sample
+        ``i nu_n`` must lie strictly below ``varpi_near``.
     energy_unit
         ``"Ha"`` or ``"Ry"``; selects defaults only.
 
@@ -339,22 +363,21 @@ def double_parallel_grid(
             "FALSE case: 0 < varpi_near < varpi_far -- the near line "
             "resolves structure, the far line carries the envelope.")
 
-    shift = (_METAL_ORIGIN_SHIFT[energy_unit] if origin_shift is None
-             else float(origin_shift))
-    if origin_shift is not None and material_class == "insulator":
+    if fermi_dirac_kt is not None and material_class == "insulator":
         raise ValueError(
-            f"GATE origin_shift_metal_only: origin_shift={origin_shift!r} "
+            f"GATE fermi_dirac_kt_metal_only: fermi_dirac_kt={fermi_dirac_kt!r} "
             "was passed with material_class='insulator', whose near line's "
-            "first sample is z = 0 exactly -- the shift would be silently "
-            "ignored. FALSE case: material_class == 'metal', or "
-            "origin_shift is None.")
-    if material_class == "metal" and not (0.0 < shift < vn):
-        raise ValueError(
-            f"GATE origin_shift_ordering: origin_shift={shift!r} is not "
-            f"strictly inside (0, varpi_near={vn!r}) in {energy_unit}. "
-            "FALSE case: 0 < origin_shift < varpi_near -- the shift dodges "
-            "the zero-energy intraband pile-up (a stability dodge, not a "
-            "broadening) without climbing off the near line it sits on.")
+            "first sample is z = 0 exactly -- kT would be silently ignored. "
+            "FALSE case: material_class == 'metal', or fermi_dirac_kt is None.")
+    if material_class == "metal":
+        _, height = metal_matsubara_index(fermi_dirac_kt, energy_unit=energy_unit)
+        if not height < vn:
+            raise ValueError(
+                f"GATE metal_first_sample_below_near_line: the first Matsubara "
+                f"frequency {height!r} ({energy_unit}, kT={fermi_dirac_kt!r}) is "
+                f"not below varpi_near={vn!r}. FALSE case: 2 pi kT < varpi_near "
+                "-- the first sample stays under the near line it anchors; raise "
+                "mpa_varpi_near_ry or lower occ_smearing_width_ry.")
 
     omegas = partition_omegas(
         n, omega_m, alpha=alpha, schedule=schedule)
@@ -363,11 +386,11 @@ def double_parallel_grid(
     far = omegas + 1j * vf
 
     # The near line's first sample is the special one.  Insulators put it
-    # exactly at the origin; metals shift it up the imaginary axis.
+    # exactly at the origin; metals at the Matsubara frequency i nu_n.
     if material_class == "insulator":
         near[0] = 0.0 + 0.0j
     else:
-        near[0] = 1j * shift
+        near[0] = 1j * height
 
     grid = np.concatenate([near, far]).astype(np.complex128)
 

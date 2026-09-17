@@ -91,7 +91,7 @@ def test_sample_writer_stamps_the_canonical_wfn_owner(
     config = SimpleNamespace(
         mpa=SimpleNamespace(
             n_poles=1, sampling_alpha=1, sampling_schedule="nested",
-            metal_origin_shift_ry=None, overwrite_completed_artifacts=False),
+            overwrite_completed_artifacts=False),
         screening=SimpleNamespace(diagrams="w_rpa"),
     )
     with pytest.raises(ReachedSampleAllocation):

@@ -156,8 +156,8 @@ def existing_kernel_rule(point, *, delta_min, delta_max,
     interval requirement is actually imposed.  A caller with a gapless
     spectrum (metals, intraband transitions down to zero) has an
     ``R -> inf`` problem on the shipped routes and no problem at all on
-    the strip -- which is a reason the protocol puts the metal origin
-    sample at ``i*1e-5 Ha`` rather than at 0.
+    the strip -- which is a reason a metal's first sample sits at a
+    Matsubara frequency ``i nu_n`` rather than at 0.
 
     THE SECOND ADAPTATION, on the ``sine_sum`` cell.  Its shipped
     route (``build_real_quadrature``) decomposes

@@ -84,7 +84,8 @@ def test_scalar_companion_selector_stamps_component_diagnostics():
 
     n_p = 4
     z = sampling.double_parallel_grid(
-        n_p, 4.0, material_class="metal", alpha=2, schedule="leon")
+        n_p, 4.0, material_class="metal", alpha=2, schedule="leon",
+        fermi_dirac_kt=0.005)
     omega_ref = np.asarray(
         [0.7 - 0.08j, 1.4 - 0.12j, 2.2 - 0.18j, 3.0 - 0.22j])
     residue_ref = np.asarray(
@@ -108,7 +109,8 @@ def test_scalar_thiele_selector_stamps_yambo_root_backend():
 
     n_p = 4
     z = sampling.double_parallel_grid(
-        n_p, 4.0, material_class="metal", alpha=1, schedule="leon")
+        n_p, 4.0, material_class="metal", alpha=1, schedule="leon",
+        fermi_dirac_kt=0.005)
     omega_ref = np.asarray(
         [0.7 - 0.08j, 1.4 - 0.12j, 2.2 - 0.18j, 3.0 - 0.22j])
     residue_ref = np.asarray(

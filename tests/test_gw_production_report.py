@@ -510,7 +510,10 @@ def test_quadrature_section_reports_chi_and_sigma_rules(tmp_path):
         {"varpi": 0.2, "freq_max": 14.06, "a_dim": 70.3, "n_nodes": 206,
          "n_panels": 9, "kappa0": 0.999, "rel_tol": 1.0e-6},
         points=7, sweeps=2)
-    quadrature_log.record_direct(z=2.0e-5j)
+    quadrature_log.record_matsubara({
+        "nu_ry": [0.0628], "n_indices": [1], "beta_ry_inv": 100.0,
+        "delta_max_ry": 11.01, "node_count": 18,
+        "certificate": {"status": "PASS", "rel_tol": 1.0e-6}})
     eta = 0.25 / RYD_TO_EV
     window = {
         "name": "cond:resonant", "kind": "crossing",
@@ -529,7 +532,8 @@ def test_quadrature_section_reports_chi_and_sigma_rules(tmp_path):
     assert "runtime, UNCERTIFIED" in text
     assert "omega 2i" in text
     assert "206x2" in text and "7 points" in text and "<=1e-06" in text
-    assert "ordered-pair scan" in text
+    assert "matsub" in text and "(n 1)" in text and "finite-T KMS rule" in text
+    assert "ordered-pair scan" not in text
     assert "1 window, 95 (window,tau) pairs" in text
     row = next(line for line in text.splitlines() if "cond:resonant" in line)
     assert "crossing" in row and "-50.0..  +24.0" in row

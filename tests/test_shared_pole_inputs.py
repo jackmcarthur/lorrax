@@ -172,7 +172,7 @@ def test_duplicates_refuse(tmp_path, key):
 @pytest.mark.parametrize('entry', [
     'mpa_n_poles=8', 'mpa_sampling_alpha=1', 'mpa_sampling_schedule=nested',
     'mpa_pole_solver=loewner', 'mpa_varpi_near_ry=.2', 'mpa_varpi_far_ry=2',
-    'mpa_metal_origin_shift_ry=.00002', 'mpa_pole_batch_size=4',
+    'mpa_pole_batch_size=4',
     'mpa_fit_reuse_file=old.h5', 'mpa_overwrite_completed_artifacts=false',
 ])
 def test_unused_elementwise_inputs(tmp_path, entry):

@@ -79,11 +79,10 @@ exactly, not against a tolerance.  Two reasons.  The protocol
 constructs its zeros exactly -- ``sampling.partition_fractions``
 returns ``Fraction(0)`` and ``float(Fraction(0))**alpha * omega_m`` is
 ``0.0`` bit-for-bit -- so there is nothing to round.  And a sample that
-is merely NEAR an axis is analytically ON THE STRIP: the metals
-protocol's own origin shift ``z = i*1e-5 Ha`` is a case in point, and
-it is a genuine ``exponential_sum_imag`` point, not a static one, for
-exactly the reason the papers introduce it.  A tolerance here would
-silently reclassify it.
+is merely NEAR an axis is analytically ON THE STRIP: a metal's first
+sample ``z = i nu_n`` (a Matsubara frequency) is a genuine
+``exponential_sum_imag`` point, not a static one, and a tolerance here
+could silently reclassify a small one.
 """
 
 from ffi import _services
@@ -333,7 +332,7 @@ def mpa_plan(
     schedule="nested",
     varpi_near=None,
     varpi_far=None,
-    origin_shift=None,
+    fermi_dirac_kt=None,
     energy_unit="Ha",
 ):
     """The double-parallel MPA protocol, as a plan.
@@ -349,10 +348,10 @@ def mpa_plan(
     line's first sample is ``z = 0`` -- the ``static`` cell -- and the
     far line's first sample is ``i*varpi_2`` -- the ``imag`` cell;
     every other sample has a nonzero real part and lands on the
-    ``strip``.  For a metal the near line's first sample is
-    ``i*origin_shift`` (default ``i*1e-5 Ha`` = ``i*2e-5 Ry``), which is
-    ``imag`` and not ``static`` at any legal shift, because the shift is
-    strictly positive by ``double_parallel_grid``'s own gate.  That is
+    ``strip``.  For a metal the near line's first sample is the bosonic
+    Matsubara frequency ``i nu_n`` nearest 0.5 eV
+    (``sampling.metal_matsubara_index``), which is ``imag`` and not
+    ``static`` because ``n >= 1``.  That is
     theory-plan section B's "the special pure-imaginary samples ... use
     the existing static and imaginary-axis kernels" read off the table
     instead of hand-listed, and it is why the fourth cell is the only
@@ -363,7 +362,7 @@ def mpa_plan(
         n_p, omega_m, material_class=material_class, alpha=alpha,
         schedule=schedule,
         varpi_near=varpi_near, varpi_far=varpi_far,
-        origin_shift=origin_shift, energy_unit=energy_unit)
+        fermi_dirac_kt=fermi_dirac_kt, energy_unit=energy_unit)
     n = int(n_p)
     pts = tuple(
         sample_point(z, f"{'near' if k < n else 'far'}_{k % n:02d}",

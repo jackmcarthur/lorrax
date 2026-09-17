@@ -103,9 +103,14 @@ _SIGMA_KIND = {
 def _chi_rule_line(row: dict) -> str:
     """One screening rule as a fixed-width report row (energies in Ry)."""
     kind = row["kind"]
-    if kind == "direct":
-        where = f"z {row['omega_ry']:.4g} + {row['varpi_ry']:.3g}i"
-        return f"{kind:<7} {where:<34} {'-':>7}  {'exact':>9}  ordered-pair scan"
+    if kind == "matsubara":
+        nus = ", ".join(f"{nu:.4g}" for nu in row["nu_ry"])
+        idx = ", ".join(str(n) for n in row["indices"])
+        where = f"i nu {nus} (n {idx}), beta {row['beta_ry_inv']:.4g}"
+        return (f"{'matsub':<7} {where:<34} {row['nodes']:>7}  "
+                f"{'<=' + format(row['target'], '.0e'):>9}  "
+                f"finite-T KMS rule, delta {row['delta_max_ry']:.4g}, "
+                f"{'certified' if row['certified'] else 'UNCERTIFIED'}")
     if kind == "line":
         count = row["points"]
         where = (f"varpi {row['varpi_ry']:.4g}, F {row['freq_max_ry']:.4g}, "
