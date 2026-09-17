@@ -41,7 +41,7 @@ going through the ordinary `build_G_tau`-based minimax kernel
    `_get_chi_static_fractional_gamma_kernel` /
    `_get_chi_fractional_q_kernel`, reached through
    `compute_chi0_static_fractional_gamma` /
-   `compute_chi0_static_fractional` / `compute_chi0_direct_fractional`) —
+   `compute_chi0_direct_fractional`) —
    the exact static divided difference `(f_a-f_b)/(E_a-E_b)` (or its dynamic
    generalization `(f_a-f_b)/(E_a-E_b+z)`) is **jointly** a function of BOTH
    band indices' energies and occupations. It does **not** separate into a
@@ -233,9 +233,9 @@ name in `KNOWN_LORRAX_ISSUES.md` rather than a design gap.
 
 ### Dispatch
 
-`compute_chi0_static_fractional_gamma`, `compute_chi0_static_fractional`
-(a thin `z=[0]` wrapper around the next one, unaffected), and
-`compute_chi0_direct_fractional` all dispatch on `wfns.layout`, mirroring
+`compute_chi0_static_fractional_gamma` and
+`compute_chi0_direct_fractional` (whose `z = 0` entry is the finite-`q`
+static row) both dispatch on `wfns.layout`, mirroring
 `_chi_layout_operands`'s established pattern for the ordinary minimax
 kernel. Under `layout='face'` the caller's (possibly narrower than
 `nb_full`) `energies`/`occupations`/`surface_weight` tables are zero-padded

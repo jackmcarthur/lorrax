@@ -145,7 +145,7 @@ def main():
 
     # --- W1: the finite-q static divided-difference row -------------------
     from gw import efermi
-    from gw.w_isdf import compute_chi0_static_fractional
+    from gw.w_isdf import compute_chi0_direct_fractional
 
     mu, width = 0.15, 0.08
     occ_mp1 = np.asarray(jax.device_get(
@@ -165,8 +165,8 @@ def main():
         smearing_width_ry=width)
     kminq = np.stack([[(k - q) % nk for k in range(nk)] for q in range(nk)])
     got_static = np.asarray(multihost_utils.process_allgather(
-        compute_chi0_static_fractional(
-            wfns_mp1, SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
+        compute_chi0_direct_fractional(
+            wfns_mp1, np.asarray([0.0j]), SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
             occupation_state=state, kminq_rows=kminq),
         tiled=True))
 

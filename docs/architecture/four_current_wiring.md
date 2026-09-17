@@ -2095,32 +2095,18 @@ default.  An MP1 overshoot band at a support edge is included, by
 magnitude.  This — not ``quad.x_max`` — sizes the damped-line rule
 bandwidth on metal plans, where the occupied and empty supports overlap.
 
-### `src/gw/w_isdf.py` — `compute_chi0_static_fractional`
-
-Exact static finite-occupation chi0 for every stored q row.
-
-The finite-q generalization of
-:func:`compute_chi0_static_fractional_gamma`: for wedge row j the b
-side of every ordered pair rides at ``k − q_j`` through the caller's
-precomputed flat map ``kminq_rows[j]`` (``common.kq_mapping``), and
-the divided difference ``(f_a(k)−f_b(k−q))/(E_a(k)−E_b(k−q))`` uses
-the analytic MP1 ``−df/dE`` midpoint limit on accidentally degenerate
-pairs.  This is the literal static member of the shared ordered-pair
-evaluator; the metal MPA shifted-origin slot instead calls
-:func:`compute_chi0_direct_fractional` at its stamped nonzero ``z``.
-Returns ``(n_q, n_mu, n_mu)``
-wedge rows in the raw-chi normalization expected by :func:`solve_w`,
-sharded ``P(None, 'x', 'y')``.
-
 ### `src/gw/w_isdf.py` — `compute_chi0_direct_fractional`
 
 Exact finite-occupation chi0 at selected complex frequencies.
 
 This is the ordered-pair escape hatch for isolated points at which the
 damped-contour evaluator is unaffordable.  It shares the static kernel's
-band-pair scan and distributed centroid output.  A zero entry uses the
-MP1 divided-difference limit; every nonzero entry is evaluated at its
-literal complex coordinate.  With one frequency the returned shape is
+band-pair scan and distributed centroid output.  For wedge row j the b
+side of every ordered pair rides at ``k − q_j`` through the caller's flat
+map ``kminq_rows[j]`` (``common.kq_mapping``).  A zero entry is the static
+divided difference ``(f_a(k)−f_b(k−q))/(E_a(k)−E_b(k−q))`` with the
+family's analytic ``−df/dE`` limit on degenerate pairs; every nonzero entry
+is evaluated at its literal complex coordinate.  With one frequency the returned shape is
 ``(n_q,n_mu,n_mu)``; otherwise it is ``(n_z,n_q,n_mu,n_mu)``.
 ``progress_fn``, when supplied, is called as
 ``progress_fn(rows_done, rows_total, elapsed_seconds)`` after each q-row

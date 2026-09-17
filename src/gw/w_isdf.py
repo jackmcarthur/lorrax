@@ -2718,23 +2718,6 @@ def occupation_support_bandwidth(
     return float(np.max(e[:, u_slice]) - np.min(e[:, f_slice]))
 
 
-def compute_chi0_static_fractional(
-    wfns,
-    meta,
-    mesh_xy,
-    *,
-    occupation_state,
-    kminq_rows,
-    nb_logical=None,
-    ordered=False,
-):
-    """Exact static finite-occupation chi0 for every stored q row; see docs/architecture/four_current_wiring.md."""
-    return compute_chi0_direct_fractional(
-        wfns, np.asarray([0.0j], dtype=np.complex128), meta, mesh_xy,
-        occupation_state=occupation_state, kminq_rows=kminq_rows,
-        nb_logical=nb_logical, ordered=ordered)
-
-
 def compute_chi0_direct_fractional(
     wfns,
     z_values,

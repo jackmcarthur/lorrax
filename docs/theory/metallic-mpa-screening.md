@@ -354,7 +354,7 @@ staged low-scaling replacement for that isolated quadratic scan.
 Every stored wedge row of every ordinary dynamic sample is the fractional
 contour kernel; the shifted-origin row is the exact finite-`q` direct-frequency
 ordered-pair response. The
-finite-`q` static kernel (`w_isdf.compute_chi0_static_fractional`) is the
+finite-`q` static kernel (`w_isdf.compute_chi0_direct_fractional` at `z = 0`) is the
 `Gamma` kernel's sibling through one shared tile scan
 (`_static_fractional_pair_scan`): for wedge row `j`, every `b`-side operand
 — both centroid wavefunction copies, energies, occupations, surface weights

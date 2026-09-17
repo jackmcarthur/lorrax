@@ -465,8 +465,8 @@ def test_static_fractional_finite_q_matches_divided_difference():
         f_kn=occ, mu_ry=mu, smearing_family="mp1", smearing_width_ry=width)
     kminq = np.stack([[(k - q) % nk for k in range(nk)] for q in range(nk)])
 
-    got = w_isdf.compute_chi0_static_fractional(
-        wfns, SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
+    got = w_isdf.compute_chi0_direct_fractional(
+        wfns, np.asarray([0.0j]), SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
         occupation_state=state, kminq_rows=kminq)
     got = np.asarray(jax.device_get(got))
     want = _dense_static_finite_q(psi, enk, occ, surface, kminq)
@@ -481,8 +481,8 @@ def test_static_fractional_finite_q_matches_divided_difference():
         np.asarray(jax.device_get(gamma))[0], got[0], rtol=1e-13, atol=1e-13)
 
     with pytest.raises(ValueError, match="static_fractional_needs_mp1"):
-        w_isdf.compute_chi0_static_fractional(
-            wfns, SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
+        w_isdf.compute_chi0_direct_fractional(
+            wfns, np.asarray([0.0j]), SimpleNamespace(nk_tot=nk, n_rmu=nmu), mesh,
             occupation_state=SimpleNamespace(
                 f_kn=occ, mu_ry=mu, smearing_family="fixed",
                 smearing_width_ry=0.0),
