@@ -259,8 +259,13 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     # The constructor owns scratch reads, actual pencil planning and the
     # final writer. It must query its own native workspace at the actual R.
     # W/dW and M1/M3 are distinct keyed datasets in the same scratch file.
-    result = construct_shared_poles(bank, bank, meta, config,
-        mesh_xy=mesh_xy, output=str(root / "model.h5"))
+    if photon:
+        from .shared_pole_sectors import construct_sector_poles
+        result = construct_sector_poles(bank, meta, config,
+            mesh_xy=mesh_xy, output=str(root / "model.h5"))
+    else:
+        result = construct_shared_poles(bank, bank, meta, config,
+            mesh_xy=mesh_xy, output=str(root / "model.h5"))
     with timing.fenced_section("spole.screening_finalize"):
         record("constructor", result)
         header = result["model_header"]

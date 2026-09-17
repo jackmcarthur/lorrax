@@ -87,6 +87,79 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
     return out
 
 
+def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
+    """Build diagonal sector spans with the current map's round program.
+
+    The bank contains W-W_infinity and its ordered moments. CC uses n_C
+    rows, TT uses 3*n_T rows, with the same physical supports and separate
+    directions, reductions and 1.8*n budgets. All retained arrays count
+    against the existing whole-map capacity ledger.
+
+    This entry is deliberately fail-closed at the unresolved signed-photon
+    acceptance boundary. A scalar V-whitened passivity bound cannot be
+    asserted for a signed transverse V. No model is published as accepted
+    while that physics definition is absent.
+    """
+    import jax
+    import numpy as np
+    from pathlib import Path
+    from common import timing
+    from common.collectives import rank0_transaction
+    from file_io.slab_io import SlabIO
+    from file_io.shared_pole_store import validate_shared_pole_bank, _metadata
+    from gw.shared_pole_local import parent_rounds
+    from gw.shared_pole_screening import _json
+    from symmetry_maps import minus_q_parent_partners
+
+    header=validate_shared_pole_bank(bank['path'],expected_identity=bank['identity'],
+                                    mesh_xy=mesh_xy,require_complete=True)
+    recipe=meta.shared_pole_recipe
+    if header['identity'] != bank['identity']:
+        raise ValueError('GATE shared_pole_bank_state: current sector bank identity mismatch')
+    qt,operations=header['qirr'],header['operations']
+    partner,row=minus_q_parent_partners(header['q_irr_full_idx'],qt['irr_idx_q'],
+        qt['sym_idx_q'],kgrid=header['grid'],sym_mats_k=np.asarray(operations['rotation']),
+        antiunitary=np.asarray(operations['antiunitary'],bool),
+        authorized_rows=operations['authorized_rows'])
+    endpoints=[_metadata(meta,table,recipe,bank['identity'],True,basis=basis,sector=sector)
+               for table,basis,sector in zip(bank['sector_tables'],bank['mu_bases'],('CC','TT'))]
+    fit_span=(int(min(recipe['fit_ids'])),int(max(recipe['fit_ids']))+1)
+    receipts=[]
+    for ids,real,slots in parent_rounds(header['n_q_irr'],mesh_xy.size,partner):
+        sectors=[];retained=[]
+        for family,name in enumerate(('CC','TT')):
+            with timing.fenced_section('spole.sector.'+name):
+                with SlabIO(bank['path'],mode='r',mesh=mesh_xy) as io:
+                    exact=read_sector_round(io,meta,bank,header,ids,(family,family),
+                        fields=('M0','M1','M2','M3'),retained=retained)
+                    samples=read_sector_round(io,meta,bank,header,ids,(family,family),
+                        sample_span=fit_span,retained=(*retained,*exact.values()))
+                geometry=dict(components=3 if family else 1,basis=bank['mu_bases'][family],
+                    ids=ids,real=real,header=endpoints[family],partner_parent=partner,
+                    partner_row=row,slots=slots,sym=bank['tables']['sym'],sample_lo=fit_span[0],
+                    sector=name)
+                model=construct_diagonal_sector_round(samples,exact,meta,config,geometry,
+                    mesh_xy=mesh_xy,retained=retained)
+                del samples,exact
+                sectors.append(model)
+                retained.extend(jax.tree.leaves((model['model'],model['signed'],
+                    model['coefficients'],model['infinity'],tuple(s[1:] for s in model['states']))))
+                reduction,zero,_,_=model['diagnostics']
+                counts=np.asarray(model['vectors'][1]).sum(axis=-1).tolist()
+                receipts.append(dict(sector=name,parents=ids[:real],K=counts[:real],
+                    gram_min_relative=np.asarray(reduction['gram_min_relative'])[:real].tolist(),
+                    zero_policy=np.asarray(zero['zero_policy'])[:real].tolist()))
+                path=Path(output).with_name('sector_diagonal_receipt.json')
+                rank0_transaction(path,stage='sector.diagonal_receipt',
+                    write=lambda:path.write_text(_json(dict(identity=bank['identity'],
+                        status='DIAGONAL_SPANS_ONLY',rounds=receipts))+'\n'))
+        # Publishing TT/CT using the scalar positive-V acceptance receipt
+        # would falsely certify a signed operator. Keep the refusal explicit.
+        raise ValueError('GATE shared_pole_sector_acceptance: CC/TT spans constructed; '
+            'signed transverse passivity definition unresolved; no accepted sector stores, '
+            'CT production orchestration or Sigma map published')
+
+
 def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *, mesh_xy,
                                      retained=()):
     """Run the production selection/reduction program for CC or TT.
