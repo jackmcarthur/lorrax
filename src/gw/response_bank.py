@@ -194,7 +194,7 @@ def response_weights(wfns, meta):
     }
 
 
-def prepare_photon_carriers(wfns, wfns_transverse, meta, meta_transverse, *,
+def prepare_photon_carriers(wfns, wfns_transverse, mu_bases, *,
                             mesh_xy, layout):
     """Prepare bare/J-applied photon endpoints for the one response stream.
 
@@ -221,7 +221,7 @@ def prepare_photon_carriers(wfns, wfns_transverse, meta, meta_transverse, *,
         raise ValueError("GATE response_vertex: endpoint occupations disagree")
     nmu_spec, mun_spec = psi_specs(wfns.layout)
     families = []
-    for carrier, metadata in ((left, meta), (right, meta_transverse)):
+    for carrier, basis in zip((left, right), mu_bases):
         plan = carrier.plan
         @partial(shard_map, mesh=mesh_xy, in_specs=(mun_spec, nmu_spec),
                  out_specs=(mun_spec, nmu_spec), check_vma=False)
@@ -229,7 +229,6 @@ def prepare_photon_carriers(wfns, wfns_transverse, meta, meta_transverse, *,
             return (plan.unfold_face(mun, spin_axis=1, mu_axis=2, mesh_axis="x"),
                     plan.unfold_face(nmu, spin_axis=2, mu_axis=3, mesh_axis="y"))
         mun, nmu = jax.jit(unfold)(carrier.psi_mun, carrier.psi_nmu)
-        basis = metadata.mu_basis
         families.append((basis.unpack_axis(mun, 2, spec=mun_spec),
                          basis.unpack_axis(nmu, 3, spec=nmu_spec)))
     endpoints = []
