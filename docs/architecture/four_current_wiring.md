@@ -2047,8 +2047,10 @@ consumer today is the QSGW head's static Γ body
 (``qsgw_head.build_iteration_head_response``): row 0 at ``n = 0`` on the
 map's occupation state, at ``minimax_target_error``.  That route is disabled
 on metals by the 2026-09-17 ruling, and an insulator's MP1 smeared-head state
-refuses here by name.  RPA correlation energy and forces are the intended
-next consumers.
+refuses here by name.  Its second consumer is the MPA metal plan's first
+near-line sample, the Matsubara frequency nearest 0.5 eV
+(``gw.mpa.sampling.metal_matsubara_index``).  RPA correlation energy and
+forces are the intended next consumers.
 
 ### `src/gw/w_isdf.py` — `_occupation_support_slices`
 
@@ -2091,22 +2093,6 @@ one of the two Green's-function supports; it MUST be the same value the
 caller gave ``occupation_support_bandwidth``, or the damped-line rule is
 sized for transitions the band slices no longer contain.
 
-### `src/gw/w_isdf.py` — `_fractional_pair_scan_face._gather_mun`
-
-(nk, s, mu_X_loc, tile) un-conjugated, present on every rank —
-masked-gather + psum('y') from psi_mun's local shard (bands on
-'y').  psi_mun's own axis order (nk, s, mu, n) already matches
-the direct endpoint (nk, s, mu_X, n) -- no reorder needed.
-
-### `src/gw/w_isdf.py` — `_fractional_pair_scan_face._gather_nmu`
-
-(nk, s, mu_Y_loc, tile) un-conjugated, present on every rank —
-masked-gather + psum('x') from psi_nmu's local shard (bands on
-'x'), then a LOCAL (no-comm, bounded-size — this tile is `tile`
-bands wide, not nb_full) axis reorder: psi_nmu stores (nk, n, s,
-mu), band axis SECOND, so the post-gather (nk, tile, s, mu_Y_loc)
-needs one transpose to match the band-last endpoint (nk, s, mu, n) order.
-
 ### `src/gw/w_isdf.py` — `occupation_support_bandwidth`
 
 Largest transition energy over the occupation supports, Ry.
@@ -2118,24 +2104,6 @@ which is why the threshold is an argument here rather than a second
 default.  An MP1 overshoot band at a support edge is included, by
 magnitude.  This — not ``quad.x_max`` — sizes the damped-line rule
 bandwidth on metal plans, where the occupied and empty supports overlap.
-
-### `src/gw/w_isdf.py` — `compute_chi0_direct_fractional`
-
-Exact finite-occupation chi0 at selected nonzero complex frequencies.
-
-This is the ordered-pair evaluator for the MPA metal near-origin sample
-(``z = i·2e-5 Ry``), where a damped-contour rule needs about 10⁶ nodes.  For
-wedge row j the b side of every ordered pair rides at ``k − q_j`` through the
-caller's flat map ``kminq_rows[j]`` (``common.kq_mapping``), and every entry
-is ``(f_a(k)−f_b(k−q))/(E_a(k)−E_b(k−q)+z)`` at its literal coordinate.  A
-zero entry refuses (``GATE direct_fractional_needs_nonzero_z``): static chi0
-is :func:`compute_chi0_matsubara` at ``n = 0``.  The scan sums band pairs
-beside the centroid axis, the TASTE 6 exception this one sample keeps.  With
-one frequency the returned shape is
-``(n_q,n_mu,n_mu)``; otherwise it is ``(n_z,n_q,n_mu,n_mu)``.
-``progress_fn``, when supplied, is called as
-``progress_fn(rows_done, rows_total, elapsed_seconds)`` after each q-row
-result is device-ready.  It changes synchronization only, never values.
 
 ### `src/gw/w_isdf.py` — `precompile_chi0`
 

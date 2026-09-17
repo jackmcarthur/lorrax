@@ -3,10 +3,10 @@
 > 2026-09-06 parent-route update: production minimax and fractional-contour
 > response factories now accept only canonical faces or typed raw parents;
 > their legacy four-copy factories and operand branches are deleted.
-> Both response validations use independent band-pair sums. Since 2026-09-17
-> the static Γ pair kernel and the scan's `z = 0` divided-difference branch are
-> deleted: static χ₀ is `compute_chi0_matsubara` at `n = 0`, and the
-> ordered-pair scan serves only nonzero `z` (the MPA metal near-origin sample).
+> The contour response validation uses an independent band-pair sum. The
+> ordered-pair band scan this note also ported (static Γ, finite-q and
+> finite-z) was deleted on 2026-09-17: static χ₀ and the MPA metal first
+> sample come from `compute_chi0_matsubara`.
 > Historical port descriptions below are retained as derivation context,
 > not as current route-selection instructions; see [decisions](decisions.md).
 
@@ -21,11 +21,11 @@ noted as a second, separate non-consumer of `_build_Gv_Gc`
 `docs/architecture/zeta_fit_face_psi_cct.md`, whose masked-gather + `psum`
 idiom (`isdf.core._z_q_face`) this design reuses on BOTH mesh axes.
 
-## Two physically different kernels, two different ports
+## The kernel
 
-`src/gw/w_isdf.py` carries two chi0 families that read ψ directly instead of
-going through the ordinary `build_G_tau`-based minimax kernel
-(`_get_chi_minimax_kernel`, already ported 2026-08-22):
+`src/gw/w_isdf.py` carries one fractional-occupation chi0 family that reads ψ
+through its own time nodes instead of the ordinary `build_G_tau`-based minimax
+kernel (`_get_chi_minimax_kernel`, already ported 2026-08-22):
 
 1. **The fractional/contour kernel** (`_get_chi_fractional_contour_kernel` /
    `compute_chi0_contour_fractional`) — builds
@@ -38,18 +38,6 @@ going through the ordinary `build_G_tau`-based minimax kernel
    already computes (`G_μν(k) = Σ_n ψ_n(μ)·w_n·ψ*_n(ν)`), which the
    `low_mem_bands` port already ships a `layout='face'` arm for. **This half
    needed no new distributed algorithm** — see "Part A" below.
-
-2. **The ordered-pair kernel** (`_fractional_pair_scan_face`, reached through
-   `_get_chi_fractional_q_kernel_face` / `compute_chi0_direct_fractional`) —
-   the ordered-pair weight `(f_a-f_b)/(E_a-E_b+z)` at nonzero `z` is
-   **jointly** a function of BOTH
-   band indices' energies and occupations. It does **not** separate into a
-   product of a per-`a` and a per-`b` factor (the denominator couples `a`
-   and `b`), so it cannot collapse to a one-particle `build_G_tau`/GEMM
-   contraction — the census's own finding, confirmed here by re-derivation,
-   not merely repeated. **This half needed a genuine new distributed
-   algorithm** — see "Part B" below, the actual "2-D band-pair ring/tile"
-   the census called for.
 
 ## Part A: the fractional/contour kernel — a `build_G_tau` face port
 
@@ -92,152 +80,6 @@ moved to the dispatcher exactly as that first split's own precedent (the
 dispatcher owns `cache_key`/lookup/store; the `_legacy` sibling is a pure,
 UNTOUCHED builder — diff-confirmed against the pre-session source with only
 the caching lines removed).
-
-## Part B: the ordered-pair kernel — the genuine 2-D band-pair algorithm
-
-### Why the naive port is banned, not merely slow
-
-Legacy's `_fractional_pair_scan` receives `psi_x_a`/`psi_x_b`
-(`PSI_XN_SPEC`, μ on X, **bands fully replicated**) and `psi_y_a`/
-`psi_y_b` (`PSI_YN_SPEC`, μ on Y, bands fully replicated), and tiles the
-`O(nb²)` ordered-pair sum with cheap, comm-free `dynamic_slice`s, because
-every rank already holds every band. The obvious face substitute —
-`all_gather('y')` the persistent `psi_mun` once to rebuild a
-band-replicated, μ-on-X-only array — reproduces exactly the LEGACY
-single-axis residency, `2·S/Px` (mu on X, all bands, replicated over Y),
-not the face carrier's `2·S/(Px·Py)`. That is the **√P-class** residency
-the owner's scaling rationale (`reports/gwjax_low_mem_bands_audit_2026-08-22/
-report.md`, "Owner's scaling rationale for the all-P psi requirement")
-explicitly bans for anything resident under `low_mem_bands=true` — the
-exact trap the zeta-fit r-chunk port already hit and solved once
-(`docs/architecture/zeta_fit_face_psi_cct.md`'s r-chunk section). This
-design reuses that solution rather than re-deriving it.
-
-### Why `GemmPlan`/`GemmPlan.local_call` do not apply
-
-Two independent reasons, both structural (checked by reading the contract,
-not by benchmarking a rejected alternative — same standard the r-chunk
-design note held itself to):
-
-1. **The weight is not bilinear in `(a,b)`.** A GEMM computes
-   `Σ_n A(m,n)·B(n,p)` — a contraction that is linear in a SINGLE shared
-   index `n`. The ordered-pair weight `(f_a-f_b)/(E_a-E_b+z)` is a function of the PAIR `(a,b)` that does not
-   factor as `u_a·v_b` for any choice of `u`, `v` (the denominator mixes
-   both indices) — this is a re-derivation, not a repetition, of the
-   census's finding. There is no GEMM whose output is this weighted sum:
-   the weight must be evaluated PER PAIR, which is exactly what the tile
-   scan already does locally under legacy.
-2. **Even where a GEMM shape existed, `GemmPlan.local_call`'s output is the
-   wrong sharding for this consumer.** `zeta_fit_face_psi_cct.md`'s own
-   "why `_z_q_face`'s X-operand reconstruction does not switch to it"
-   section already worked this out for the structurally analogous r-chunk
-   case: a SUMMA GEMM's `D` is genuinely 2-D-sharded (`P(None,'x','y')`);
-   this kernel needs a band-tile PRESENT ON EVERY RANK along one axis
-   while μ stays local on the other — the shape a broadcast/`psum`
-   produces, not a GEMM. The same argument applies here unchanged.
-
-### The chosen mechanism: masked-gather + `psum`, on BOTH mesh axes
-
-`isdf.core._z_q_face` reconstructs a BOUNDED band tile of the μ-on-X form
-from `psi_mun` via a per-position `jnp.take` (clamped, always in-bounds) +
-`jnp.where(owner==rank)` + `jax.lax.psum('y')` — a selective
-broadcast-from-owner, not a resident copy and not a full `all_gather`. This
-design applies the SAME idiom to reconstruct BOTH ψ orientations the
-ordered-pair kernel needs, for a bounded band tile at a time:
-
-```
-_gather_mun(psi_mun_local, g_lo)   -- masked-gather + psum('y')
-    (nk, s, mu_X_loc, tile) un-conjugated, from psi_mun (bands on 'y')
-
-_gather_nmu(psi_nmu_local, g_lo)   -- masked-gather + psum('x'), then
-    a LOCAL (no-comm, bounded-size) axis reorder
-    (nk, s, mu_Y_loc, tile) un-conjugated, from psi_nmu (bands on 'x')
-```
-
-`_gather_mun` needs no reorder: `psi_mun`'s own axis order `(nk, s, μ, n)`
-already matches `PSI_XN_SPEC`'s `(nk, s, μ_X, n)`. `_gather_nmu` does:
-`psi_nmu` stores `(nk, n, s, μ)` (band axis SECOND, not last), so the
-post-gather tile — bounded to `(nk, tile, s, μ_Y_loc)` — gets one
-`jnp.transpose` to `(nk, s, μ_Y_loc, tile)`, matching `PSI_YN_SPEC`'s order.
-This transpose is on an ALREADY-LOCAL, bounded-size array (`tile` bands,
-not `nb_full`) — a register/HBM-local reorder, not a collective; it costs
-nothing communication-wise, unlike the CCT design's discovery that the SAME
-kind of reorder on a FULL μ-extent object was a genuine `μ²`-scale
-transpose (that finding does not apply here because the object being
-reordered here is bounded to `tile`, not `n_rmu`).
-
-Both gathers are IMMUNE to a band tile that overruns the real `nb_full`
-extent by construction (`_z_q_face`'s own documented property): for a
-phantom `global_band >= nb_full`, `owner_y`/`owner_x` computes `>= p_y`/
-`>= p_x`, which no real rank ever equals, so `psum` returns exactly zero —
-no separate `bc_valid` clamp-and-mask is needed here the way `_z_q_face`
-needed one for its `weight_l`/`weight_r` lookup, because THIS design pads
-`energy`/`occupation` with `jnp.pad` (legacy's own
-technique, reused verbatim) rather than indexing a real array at an
-out-of-range position — the padded region is `0.0`, always finite, and its
-contribution is independently zeroed by the pre-existing `nb_logical`
-mask (`ga < nb_logical & gb < nb_logical`, unchanged from legacy) since
-`nb_logical <= nb_full` always holds.
-
-### The physics core is duplicated, not shared — by the tree's own convention
-
-`_fractional_pair_scan_face`'s per-pair weight/density/contribution math
-(the divided-difference weight, the two density contractions, the final
-`zmn` einsum) is the SAME derivation `_fractional_pair_scan` already
-carries, and is INTENTIONALLY re-typed rather than factored into a shared
-helper `_fractional_pair_scan` also calls — mirroring every other
-legacy/face split in this codebase (`_c_q_legacy`/`_c_q_face`,
-`_z_q_legacy`/`_z_q_face`, `_legacy_build_G`/`_face_build_G`): the legacy
-function is FROZEN so it stays diff-confirmably byte-identical, and a
-sibling function carries the face mechanism. `_fractional_pair_scan`
-itself is untouched by this session — confirmed by diff against the
-pre-session source.
-
-### Tiling choice: nested scan (outer reuses "a", inner refetches "b")
-
-The `O(ntiles²)` pair loop is restructured as two nested `lax.scan`s
-(outer over the "a" band tile, inner over "b") rather than legacy's single
-flat scan over `ntiles²` steps, because the two orientations now have
-DIFFERENT costs: a `dynamic_slice` on a resident array is free regardless
-of loop shape, but a masked-gather+`psum` is not, so the shape of the loop
-now matters. The outer scan reconstructs `a`'s two tiles ONCE per outer
-step and reuses them across the whole inner sweep; the inner scan
-reconstructs `b`'s two tiles fresh every step, because a "b" tile is never
-resident for more than one inner iteration. This is the design's actual
-answer to "2-D band-pair ring/tile": communication is bounded to
-`O(ntiles)` for the "a" side and `O(ntiles²)` for the "b" side, and the
-resident working set at any instant is `O(tile)` band-widths on each
-operand — never the `O(nb_full)` a cached single-axis form would need
-(the same "no resident single-axis array, ever" contract the r-chunk fit
-port established).
-
-**Measurement, not assumption, decided against a `ppermute` ring for this
-session.** A genuine systolic ring (rotating each rank's own resident
-`psi_mun`/`psi_nmu` shard around the mesh via `lax.ppermute`, `p_y`/`p_x`
-steps instead of `ntiles` masked-`psum` calls) is a plausible follow-up if
-`ntiles` ever exceeds `p_y`/`p_x` by a large factor at production scale —
-but at the scale this session's own gate and Na-deck harness measure
-(`nb_full` in the tens, `pair_tile=8`, `ntiles` in the single digits, the
-outer×inner product a few dozen `psum` calls total), the masked-gather
-route's cost was negligible against the fit/screening/Sigma stages the
-existing face G-build/CCT ports already accept the SAME mechanism's
-communication cost for (`gw.greens_function_kernel`'s own module docstring:
-"the ~20% end-to-end face overhead ... is the communication price of the
-8× ψ memory reduction, not recoverable by restructuring ψ storage"). A
-`ppermute` ring is NOT implemented this session; if a future large-`nb_full`
-metal deck (hundreds of bands, not the tens this port was gated on) proves
-the `O(ntiles²)` term matters, chasing it is a well-scoped follow-up with a
-name in `KNOWN_LORRAX_ISSUES.md` rather than a design gap.
-
-### Dispatch
-
-`compute_chi0_direct_fractional` dispatches on `wfns.layout` and the raw
-parent carrier, mirroring `_chi_layout_operands`'s established pattern for
-the ordinary minimax kernel. Under `layout='face'` the (possibly narrower
-than `nb_full`) `energies`/`occupations` tables are zero-padded
-up to `nb_full` (harmless: any padded position is `>= nb_logical`, hence
-already excluded by the pre-existing `nb_logical` mask) before the face
-kernel is called with the FULL `psi_mun`/`psi_nmu`.
 
 ## What this does NOT unblock, and why (read before touching the refusal row)
 
@@ -307,29 +149,17 @@ See `claims/0441.md` for exact job ids and artifact paths; summarized here.
   this quantity by name — the sandbox's host FFT FFI backend is
   unavailable (`KNOWN_SANDBOX_ERRORS.md`, 2026-08-22 row) — real CUDA is
   the gate of record for Part A.
-* **Part B (ordered-pair), algebra parity, real 4-rank CUDA AND
-  CPU-emulated** (same JID/step for CUDA; CPU-emulated needs no GPU —
-  `lx run -N 1 -G 0 ...`): the Gamma (`compute_chi0_static_fractional_
-  gamma`) and finite-q/finite-z (`compute_chi0_direct_fractional`,
-  nonzero `z`, the dynamic-weight branch) cases, same occupation table,
-  `nb_logical < e.shape[1] < nb_full` (Gamma) / `nb_logical < nb_full`
-  (direct) — genuinely non-trivial logical windows exercising the
-  zero-pad path. 2/2 cases PASS both ways: real CUDA `max|rel diff|`
-  1.91e-16 (ns1 direct) to 1.59e-16 (ns2 gamma); CPU-emulated 1.14e-16
-  to 2.14e-16, same order.
 * **Instrumented no-single-axis-psi proof**: STRUCTURAL, not merely
   measured — every new face kernel's `shard_map` `in_specs` name only
   `PSI_MUN_SPEC`/`PSI_NMU_SPEC` (both `P(None,·,'x','y')`-shaped, 2-D
   sharded on BOTH mesh axes); no single-axis-shaped array can be
   constructed inside the traced program at all. Confirmed by an
-  AST-level source scan of the four new functions
-  (`_get_chi_fractional_contour_kernel_face`, `_fractional_pair_scan_
-  face`, `_get_chi_static_fractional_gamma_kernel_face`,
-  `_get_chi_fractional_q_kernel_face`): zero occurrences of `psi_xn`/
+  AST-level source scan of the new functions (the contour kernel face, and
+  the three pair-kernel functions since deleted): zero occurrences of `psi_xn`/
   `psi_xr`/`psi_yr`/`psi_yn`/`.xn(`/`.xr(`/`.yr(`/`.yn(` in any of them.
-* **`low_mem_bands=false` bit-identical**: `_fractional_pair_scan`,
-  `_get_chi_static_fractional_gamma_kernel`, `_get_chi_fractional_q_kernel`,
-  and `_get_chi_fractional_contour_kernel_legacy` are diff-confirmed
+* **`low_mem_bands=false` bit-identical** (at the time; legacy bodies since
+  deleted): `_get_chi_fractional_contour_kernel_legacy` and the legacy pair
+  kernels were diff-confirmed
   UNTOUCHED against the pre-session source (`git diff` shows no `-` line
   inside any of their bodies; the contour kernel's extraction into a
   dispatcher+legacy-sibling pair removed only its own cache-management
@@ -359,9 +189,9 @@ See `claims/0441.md` for exact job ids and artifact paths; summarized here.
   occ-weighted electron count (9.000001), width 0.01 Ry (this deck's own
   degauss/2 convention). psi itself is synthetic (see the harness's own
   module docstring for the precise, stated scope — NOT a full `gw_jax`
-  driver run, and why one is structurally unreachable). ALL THREE
-  quantities PASS at machine precision: gamma 4.54e-16, direct 4.39e-16,
-  contour 6.13e-16 (the contour sub-check uses a factorizable `nk=32`
+  driver run, and why one is structurally unreachable). The contour
+  quantity PASSES at machine precision, 6.13e-16 (the since-deleted pair
+  kernel's gamma and direct rows gave 4.54e-16 and 4.39e-16; the contour sub-check uses a factorizable `nk=32`
   `(2,4,4)` grid with real eigenvalues resampled to fill it, since the
   deck's own `nk=29` is IBZ-reduced and prime — stated in the harness's
   own comment). This run is what FOUND the bug above on its first

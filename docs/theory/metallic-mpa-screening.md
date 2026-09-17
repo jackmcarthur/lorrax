@@ -188,34 +188,35 @@ imaginary-time factors `f e^{(E-mu)tau}` and `(1-f) e^{-(E-mu)tau}` lie in
 `(0, 1]` on `[0, beta]`, so there are no two terms to cancel and no divided
 difference: after the transform a pair carries `(f_a-f_b)/(E_a-E_b)`, and a
 degenerate pair carries `beta f (1-f) = -df/dE`.  The metal MPA plan itself
-has no `z = 0` sample (its origin is shifted, 2.3); the static producer's
-consumer is the QSGW head's Γ body (4.1).  The split is: **form A for every
-dynamic sample, the finite-temperature Matsubara sweep for the static row**.
+has no `z = 0` sample (2.1); the static producer's consumer is the QSGW head's
+Γ body (4.1), and the same producer at `n >= 1` evaluates the plan's first
+near-line sample (2.3).
 
 ## 2. Frequency sampling: the metal plan, argued from measurement
 
-### 2.1 The shifted-origin double-parallel plan
+### 2.1 The double-parallel plan with a Matsubara first sample
 
 The metal grid is the insulating double-parallel protocol of
 [Multipole frequency integration](THEORY_mpa_implementation.md) §3 with one
-substitution: the near line's first point moves from the exact `z=0` to
+substitution: the near line's first point moves from the exact `z=0` to the
+bosonic Matsubara frequency nearest 0.5 eV at the deck's Fermi-Dirac `kT`,
 
 $$
-z_0^{(1)}=i\,\varpi_1,\qquad \varpi_1=10^{-5}\ \mathrm{Ha}=2\times10^{-5}\ \mathrm{Ry},
+z_0^{(1)}=i\,\nu_n,\qquad \nu_n=2\pi n\,k_BT,\qquad
+n=\max\bigl(1,\operatorname{round}(0.5\,\mathrm{eV}/2\pi k_BT)\bigr),
 $$
 
-with the far-line origin still `i*varpi_2`. This is Leon et al.'s published
-metals protocol verbatim (PRB 107, 155130 §II C: the shift avoids "numerical
-instabilities due to intra-band transitions with energies close to zero"; it
-is a stability displacement, not a broadening), including the `alpha`
-partition exponent of their Eq. (10): `alpha = 1` (linear) is their Na
-choice and ours; `alpha = 2` concentrates samples near zero and was needed
-for Al and Cu (Cu with `n_p = 15`), both out of scope here. Owners:
-`gw.mpa.sampling.double_parallel_grid` (grid values, material-class
-substitution), `gw.mpa.sample_plan.mpa_plan` (per-point analytic character
-and route). Note the classification consequence: the metal origin is
-`imag`, **not** `static` — the plan's character column is what dispatches it
-(2.3), and the sample-grid geometry itself needed nothing new.
+with the far-line origin still `i*varpi_2`.  Leon et al.'s published metals
+protocol (PRB 107, 155130 §II C) shifts this point to `i*1e-5 Ha` instead, to
+avoid "numerical instabilities due to intra-band transitions with energies
+close to zero".  LORRAX does not use that height: no time rule reaches it
+affordably (2.3), and at `nu_n` the finite-temperature producer is exact.
+The `alpha` partition exponent of their Eq. (10) is kept: `alpha = 1` is
+their Na choice and ours.  Owners: `gw.mpa.sampling.double_parallel_grid`
+and `metal_matsubara_index` (grid values; `kT` is required for a metal and
+refused for an insulator; `nu_n` must lie below `varpi_near`),
+`gw.mpa.sample_plan.mpa_plan` (per-point character and route).  The first
+sample is `imag`, **not** `static`, because `n >= 1`.
 
 ### 2.2 Rule bandwidths come from the occupation supports
 
@@ -246,136 +247,74 @@ identically zero. Metal line calls pass the rule's **positive nodes only** —
 the fractional kernel supplies both Keldysh terms itself (1.1), and applying
 the insulating symmetric `±tau` doubling on top of it would double-count.
 
-### 2.3 The origin row is a measurement, not a preference
+### 2.3 The first near-line sample is a Matsubara point
 
-Both design forks independently expected the contour route to fail at
-`varpi_1`; the plan still demanded the number (SYNTHESIS §"measure before
-building"). The probe
-(`runs/records/metal_mpa_wave1_20260815/I1_origin_probe.md`, rung R1):
+Every metal sample is on the upper half plane, and every one but the first
+is a damped-line contour point (`compute_chi0_contour_fractional`).  The
+first is `compute_chi0_matsubara(nu_indices=(n,))`, dispatched from
+`model._evaluate_samples`, which refuses a plan whose `z` is not `i nu_n` at
+the occupation state's `kT`.  At `n >= 1` the Matsubara value equals the
+retarded response continued to `z = i nu_n` (claim 2416: 6e-11 against the
+stream at `nu_1`, `nu_2` on Na).  No metal point reaches the insulating
+`compute_chi0` or `compute_chi0_contour`; the dispatch census test in
+`tests/test_chi_contour_kernel.py` fails if one does.
 
-| rule request | result |
-|---|---|
-| `damped_line_rule(2e-5 Ry, 4.0 Ry, rel_tol=1e-6)` — the shifted origin over the 48-band Na spectral width | certifies at **1,007,048 nodes**, 28,865 panels, `t_max = 7.2543e5 Ry^-1` |
-| same at `rel_tol = 1e-4` | **655,488 nodes** |
-| far line, `damped_line_rule(1.0 Ry, 4.0 Ry, rel_tol=1e-6)` | **31 nodes**, 1 panel, `t_max = 14.5` |
+The cost decided the height and the evaluator (Na 8×8×8, 896 centroids,
+86 bands, `kT = 0.01 Ry`, live bandwidth 11.0075 Ry, `rel_tol = 1e-6`, P4;
+run 464, claim CHI3COST):
 
-The cost driver is the truncation horizon `t_max ~ log(2/eps)/varpi`, not the
-tolerance — which is why loosening by two decades recovers only a third of
-the nodes. Against the pre-registered threshold ("certifies at `<= 256`
-nodes ⇒ contour permitted for origin rows") the contour route is ~4000×
-over, so the finite-`q` ordered-pair route was built (commit
-`82f81933`) and later corrected to evaluate the declared coordinate literally:
-`w_isdf.compute_chi0_direct_fractional`, dispatched from
-`model._evaluate_samples` for the near line's first point, with the far
-pure-imaginary point and every damped point on
-`compute_chi0_contour_fractional` (the far line is cheap: `O(1)` Ry heights,
-31 nodes). No metal point reaches the insulating `compute_chi0` or
-`compute_chi0_contour`, whose positive-gap split is exactly the assumption a
-metal breaks; the dispatch census test in `tests/test_chi_contour_kernel.py`
-fails if one ever does.
+| evaluator of the first sample | nodes | wall |
+|---|---|---|
+| retired: band-pair scan at `i*2e-5 Ry` (29 wedge q rows) | — | 22.6 s |
+| contour at `i*2e-5 Ry` (48-band Na, `runs/records/metal_mpa_wave1_20260815/I1_origin_probe.md`) | 1,007,048 | — |
+| contour at `i*0.5 eV` | 1521 | 149.9 s |
+| contour at `i nu_1` (0.855 eV) | 895 | 89.2 s |
+| **Matsubara at `i nu_1`** | **18** | **5.5 s** (1.9 s warm) |
 
-The stored finite-`q` value at the shifted-origin slot is now the literal
-`chi0(i*varpi_1)`: the file's ordinate and response describe the same
-analytic function.  The earlier implementation stamped that nonzero ordinate
-but wrote `chi0(0)`.  A direct Na audit found the substitution moved the raw
-response by as much as 0.776% over the 28 nonzero wedge rows (0.221% RMS), so
-the former quadratic estimate was not an accuracy certificate.  At `Gamma`
-the head still overrides the row explicitly with the static order-of-limits
-value (section 4.1); that is a declared head convention, not an accidental
-finite-`q` substitution.
+The contour at `i nu_1` (deck occupation window 0.995) and the Matsubara
+value differ by 3.2e-7 relative Frobenius over all q.  At `kT = 0.001 Ry` the
+index rule picks `n = 6` (0.513 eV) at 26 nodes, so a small `kT` moves the
+index, not the height.
 
-### 2.4 Alternatives considered and rejected, with their numbers
+### 2.4 Alternatives considered and rejected
 
-1. **Shifted origin through the contour.** The 1,007,048-node economics
-   above: ~4000× the pre-registered 256-node ceiling, and four orders beyond
-   the measured 31-node far line, for a single sample. Rejected on the
-   measurement.
-2. **A naive `varpi -> 0` limit of the contour.** Strictly worse:
-   `t_max = log(2/eps)/varpi` diverges, so the node count is unbounded below
-   any fixed tolerance; the probe's `varpi_1` row is already the practical
-   image of this divergence at `1e-5` Ha.
-3. **The exact direct-frequency ordered-pair scan.** This is the selected
-   route for the single origin point.  At Na scale it completed in tens of
-   seconds per P4 arm, returns the distributed centroid matrix directly, and
-   has no quadrature convergence problem.  It remains an isolated-point
-   escape hatch rather than a full-frequency algorithm because its band-pair
-   work is quadratic.
-4. **The separable resolvent-pair static target.** Approximate the smearing
-   function by a rational form `f(E) ≈ sum_j a_j/(E-z_j)`; then
+1. **The published shift through the contour** (`i*1e-5 Ha`): about 10⁶
+   nodes for one sample; the horizon `t_max ~ log(2/eps)/varpi` diverges as
+   `varpi -> 0`.
+2. **A band-pair scan at the published shift**: exact, but it sums band
+   pairs beside the centroid axis (TASTE 6), and the height it served had no
+   physical role.  Deleted 2026-09-17 with its z = 0 divided-difference form.
+3. **A fixed `i*0.5 eV` contour point**: 1521 nodes on Na, 84× the Matsubara
+   point, with no accuracy gain.
+4. **`nu_1` regardless of `kT`**: the height would follow the smearing
+   width, down to the origin for a small `kT`; the nearest-index rule keeps
+   it near 0.5 eV instead.
 
-   $$
-   \frac{f(E)-f(E')}{E-E'}\;\approx\;-\sum_j\frac{a_j}{(E-z_j)(E'-z_j)} ,
-   $$
+### 2.5 The shared-grid contract
 
-   two single-band *resolvent* sums per pole `j` — restoring `N^3` scaling
-   and retaining the `-df/dE` diagonal naturally. This is the staged scaling
-   path behind the same public API, and it is **deliberately not shipped**:
-   the service must be certified for the actual smearing family, width,
-   interval and absolute error before it may replace the exact kernel, and
-   MP1 — sign-changing, non-monotone — cannot borrow a Fermi–Dirac/Matsubara
-   pole certificate. At Na scale the exact tiled kernel is affordable for
-   its single sample per fit (the TASTE-6 ruling with the per-step byte
-   figure is restated in `_fractional_pair_scan_face`'s docstring, which
-   also forbids extending the route to a full dynamic grid).  The static
-   target this item was staged for is now served without a pole fit, by
-   the Fermi-Dirac Matsubara producer at `n = 0` (1.5).
-
-### 2.5 What "optimal given current theory" means
-
-The plan is the optimum of a three-way trade, not a free choice:
-
-- **Node economics.** The only unaffordable row of the certified-rule family
-  is replaced by an exact evaluation that is simultaneously *cheaper* (one
-  tile scan vs `10^6` nodes) and *more accurate* (exact finite-band vs
-  `rel_tol`-certified quadrature). Everything else keeps the cheap rules.
-- **Loewner conditioning.** The origin sample sits four decades below
-  `varpi_near` — the Loewner pencil acquires a near-isolated row, which is
-  the top-ranked fit-health risk (rung R4 sweeps `N_p` in {6,8,10} against
-  the store's `fit_condition`/`condition_max_allowed` guards).  The ordinate
-  must not be tuned by pretending that a static value was measured there.
-  Candidate shifts are instead evaluated literally and accepted only when
-  both the fit gate and the Sigma observable comparison pass. `1e-5` Ha is
-  the published starting point, not an accuracy proof for this deck.
-- **The shared-grid contract.** The scalar head fit must use the *identical*
-  complex grid as the body — `build_mpa_fit` refuses otherwise ("QSGW head
-  and MPA body must use the identical stamped z grid") — because head and
-  body residues are summed inside one `Sigma` and a mismatched grid would
-  fit them to different models of the same screening. So the origin sample
-  cannot be tuned per consumer; one plan serves both, which is precisely why
-  its single problematic row is solved by changing the *evaluator*, not the
-  *geometry*.
-
-Within current theory the certified route is a damped-line family for the
-ordinary samples, one exact direct-frequency origin evaluation, and a Loewner
-fit on `2N_p` shared samples.  The separable resolvent target (2.4.4) is the
-staged low-scaling replacement for that isolated quadratic scan.
+The scalar head fit uses the *identical* complex grid as the body
+(`build_mpa_fit` refuses otherwise), because head and body residues are
+summed inside one `Sigma`.  The shared-pole head
+(`shared_pole_head.shared_pole_head_plan`) reads the same owner, so its
+metal first sample moves with the MPA one.  A BGW q0shift head
+(`bgw_metal_q0_treatment = bgw_q0shift`) that reused sample 0 as its static
+`do_G0` value now refuses by name (`GATE bgw_q0shift_static_sample`), since
+sample 0 is no longer near `z = 0`.
 
 ## 3. The finite-`q` body
 
-Every stored wedge row of every ordinary dynamic sample is the fractional
-contour kernel; the shifted-origin row is the exact finite-`q` direct-frequency
-ordered-pair response (`w_isdf.compute_chi0_direct_fractional`, one tile scan
-`_fractional_pair_scan_face` at literal nonzero `z`; `z = 0` refuses by name).
-For wedge row `j`, every `b`-side operand — both centroid wavefunction copies,
-energies, occupations — is rolled by the caller's flat `k -> k-q_j` map
-(`model._metal_kminq_rows`, which asserts the `Gamma` row's map is the
-identity). The map is replicated and the `psi` k-axis is replicated on this
-mesh, so the gather is rank-local. Cost is the ordered band-pair tile transient
-(`nk*(nmu_x/P_x + nmu_y/P_y)*tile^2*16 B` per rank per step); one sample per
-fit rides it, never a dynamic grid.
+Every stored wedge row of every metal sample is a full-q response: the
+fractional contour kernel on the damped lines and the far imaginary point,
+and the finite-temperature Matsubara producer at the first near-line point
+(2.3).  No metal sample sums band pairs.
 
-The retired static pair kernels (a Γ kernel on a caller-supplied
-tetrahedron surface table, and the finite-`q` `z = 0` entry on the analytic
-`-df/dE`) are replaced by the Matsubara producer, whose degenerate-pair
-weight is the Fermi-Dirac `-df/dE`.  On the Na Fermi-Dirac deck
-(`runs/Na/20` inputs, `kT = 0.01 Ry`) the Γ body from the Matsubara producer
-matches the retired scan with the FD diagonal to `3.5e-7` relative Frobenius
-at `minimax_target_error = 1e-6` (16 nodes); the retired tetrahedron table
-differs from the FD diagonal by `4.2e-3` at Γ, and dropping the diagonal
-altogether moves it by `3.6e-2` (claim 2421).  Gate for the remaining
-scan: `tests/multi_device/fractional_chi_gate.py` checks nonzero-`z` rows for
-both occupation families and both carrier layouts against a dense
-ordered-pair oracle.
+Static χ₀ on fractional occupations comes from the same Matsubara producer
+at `n = 0`.  On the Na Fermi-Dirac deck (`runs/Na/20` inputs,
+`kT = 0.01 Ry`) its Γ body matches the retired band-pair divided difference
+with the FD diagonal to `3.5e-7` relative Frobenius at
+`minimax_target_error = 1e-6` (16 nodes); the retired tetrahedron surface
+table differs from the FD diagonal by `4.2e-3` at Γ, and dropping the
+diagonal moves it by `3.6e-2` (claim 2421).
 
 Dyson, wedge storage, and the bounded column fit are unchanged from the
 insulating pipeline and owned by
@@ -418,9 +357,11 @@ $$
 \kappa_{\mathrm{eff}}^2=-8\pi f_{00}^{\mathrm{eff}} ,
 $$
 
-which also **overrides the `Gamma` row of the body's origin sample**
-(`model._evaluate_samples`, `static_gamma_override`) — the one row where the
-`q`-first order of limits of section 2.3 would be wrong. Measured (claim
+which also overrides the `Gamma` row of the insulating static sample
+(`model._evaluate_samples`, `static_gamma_override`).  A metal plan has no
+`z = 0` sample, so a supplied override refuses there by name
+(`GATE mpa_metal_static_gamma_override`; the velocity head that builds it is
+disabled on metals). Measured (claim
 181, Na 48b): `kappa_TF^2 = 0.708586826 bohr^-2`; the fold correction on
 this deck is relative `2.827e-7` (dynamic-wing tool scope), so
 `kappa_eff^2 = kappa_TF^2` to well inside the value discrepancy of 4.4.
@@ -1198,15 +1139,15 @@ Open, with the reason each is still open:
 
 | statement in this page | evidence |
 |---|---|
-| origin contour rule 1,007,048 nodes; far line 31; thresholds and decision | `runs/records/metal_mpa_wave1_20260815/I1_origin_probe.md`, commit `82f81933` |
-| finite-q static kernel `max_rel 3.720e-16` vs dense oracle; fixture origin-shift `2.556e-5` | same probe record, P=4 gate JID 56986042 |
+| origin contour rule 1,007,048 nodes; far line 31 | `runs/records/metal_mpa_wave1_20260815/I1_origin_probe.md`, commit `82f81933` |
+| first-sample costs: scan 22.6 s, contour 0.5 eV 1521 nodes / 149.9 s, contour `nu_1` 895 / 89.2 s, Matsubara `nu_1` 18 / 5.5 s, 3.2e-7 apart | claim CHI3COST (run 464) |
 | mask-semantics error 1.14/0.72/0.22; permanent `>5e-2` floor | commit `c560065c`, `tests/test_sigma_fermi_split.py` |
 | dynamic head vs BGW: −93.9 meV peak, RMS 2.043e-4, `omega_p` 6.0892 eV, `mu` to 6.2e-7 eV | claim 180 (JID 57005734) |
 | `kappa_TF^2 = 0.7086 bohr^-2`, +12.8% vs BGW, fold 2.8e-7 | claim 181 |
 | five-estimator `N(E_F)` spread; tetrahedron anchor; `O(10%)` absolute-energy cap | claim 182 |
 | velocity-gate failure blocking R4–R6; gate not lifted | claim 183, commit `a5b1002b` |
 | transported-frame re-gate `3.169 -> 1.796`, still refusing | claim 195, commit `1bae7d73` |
-| fit conditioning at the shifted origin; no `n_p` census pathology on Na | claim 196 |
+| fit conditioning at the former `i*2e-5 Ry` origin; no `n_p` census pathology on Na | claim 196 |
 | the 2.7934 eV omega-reference error and its four sites | commits `59d7ea20`, `90b8275d`, `6fe3fcb8`, `cd5b0aa4` |
 | scissor identity law; the all-zero-diagonal wreckage it fixed | commit `bf57701b` |
 | crossing bands in neither scissor fit class; the saturation convention | commits `5b0ced2d`, `8a73e2fe`, `tests/test_scissor_crossing_classes.py` |
