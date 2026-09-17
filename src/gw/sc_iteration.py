@@ -758,28 +758,30 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
                 "shift requires one DFT endpoint; do not choose between "
                 "two chemical potentials.")
         inputs.print_fn(
-            "  SC head occupations: initialized BGW-MP1 state at "
+            "  SC head occupations: initialized fixed-N "
+            f"{occ_state.smearing_family} state at "
             f"mu={occ_state.mu_ry * RYD_TO_EV:.8f} eV "
             f"[occ_hash {occ_state.occ_hash}]")
         if inputs.material_class == "metal":
             # Metal-run startup gate: re-solving on the WFN's OWN stored
             # eigenvalue/weight table must reproduce its stored occupations,
             # or the smearing family/width does not match the deck that made
-            # the WFN.  ``config.occ_broadening_ry`` is the deck's ONE width
-            # and already carries BGW's convention, so QE's 'mp' matches it
-            # at occ_smearing_width_ry = degauss/2 — this gate is what
-            # catches a deck that got that factor wrong.
+            # the WFN.  The family is the declared one -- Fermi-Dirac on every
+            # metal (owner ruling 2026-09-17), which QE's 'fd' matches at
+            # occ_smearing_width_ry = degauss (kBT) -- and
+            # ``config.occ_broadening_ry`` is the deck's ONE width.
             from .efermi import (OccupationState as _OS,
                                  assert_wfn_occupation_consistency)
             from psp.get_DFT_mtxels import spin_degeneracy_factor
             w_ibz = np.asarray(inputs.wfn.kweights, dtype=np.float64)
             w_ibz = w_ibz / w_ibz.sum()
             capacity = float(spin_degeneracy_factor(inputs.wfn))
-            check_state = _OS.solve_mp1(
+            check_state = _OS.solve_smearing(
                 np.asarray(inputs.wfn.energies[0], dtype=np.float64),
                 w_ibz,
                 float(inputs.wfn.num_electrons),
                 inputs.config.occ_broadening_ry,
+                family=_declared_smearing_family(inputs.config),
                 state_capacity=capacity,
                 clamp_tol=float(inputs.config.occupation_clamp_tol))
             deviation = assert_wfn_occupation_consistency(
@@ -815,14 +817,13 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
 def _declared_smearing_family(config):
     """The deck's declared occupation-smearing family, or None.
 
-    ONE SOURCE. The one-shot owner reads exactly this key
-    (``gw.gw_jax._solve_metallic_occupations``), a metal is required to
-    declare ``mp1`` or ``fd`` (``gw_config.validate_material_inputs``) and a
-    shared-pole metal is REFUSED if it declares ``mp1``
-    (``gw_config``: "shared_pole needs a positive spectral measure"). A
-    self-consistent map that solves MP1 regardless builds its bank on the
-    occupations the deck was forced to disclaim, which is the collision
-    this function exists to remove.
+    ONE SOURCE. The one-shot owner reads exactly this field
+    (``gw.gw_jax._oneshot_mpa_occupation_state``).  It is ``"fd"`` on every
+    metal: the parser resolves it from ``occ_smearing_width_ry`` and
+    ``gw_config.validate_material_inputs`` refuses any other family on a
+    metal (owner ruling 2026-09-17).  Every metal occupation solve in the SC
+    map -- the entry state, the WFN startup gate, the density rebuild and the
+    certified-fit replay -- reads it here rather than naming a family.
     """
     family = getattr(config, "occ_smearing_family", None)
     return None if family is None else str(family).strip().lower()
@@ -892,7 +893,17 @@ def _solve_occupation_state(
     width_ry = inputs.config.occ_broadening_ry
     # An insulator declares no family; its smeared-head dial is a broadening
     # quadrature, not an occupation family, and keeps the historical MP1.
-    family = _declared_smearing_family(inputs.config) or "mp1"
+    # A metal always declares Fermi-Dirac (owner ruling 2026-09-17) and is
+    # never given the MP1 fallback.
+    family = _declared_smearing_family(inputs.config)
+    if family is None:
+        if metal:
+            raise ValueError(
+                "GATE metal_occupations_fermi_dirac: the SC map was handed a "
+                "metal with no declared occupation family; want 'fd' from "
+                "occ_smearing_width_ry (gw_config.validate_material_inputs); "
+                "why: a metal is never solved with the MP1 fallback.")
+        family = "mp1"
     mu_ry, occ_logical = solve_smearing_occupations(
         energies[:, :nb_logical],
         kweights,
@@ -944,16 +955,17 @@ def _certified_seed_occupation_state(
     from file_io.restart_bundle import (
         read_occupation_stamps,
     )
-    from .efermi import assert_fixed_n, mp1_occupations
+    from .efermi import assert_fixed_n, fd_occupations, mp1_occupations
 
     stamps = read_occupation_stamps(certified_fit)
     if stamps is None:
         raise ValueError(
             "certified MPA fit reuse has no occupation provenance stamps")
-    if str(stamps["smearing_family"]) != "mp1":
+    family = str(solved_state.smearing_family)
+    if str(stamps["smearing_family"]) != family:
         raise ValueError(
-            "certified metallic MPA fit must carry MP1 occupations; got "
-            f"{stamps['smearing_family']!r}")
+            f"certified metallic MPA fit must carry {family} occupations "
+            f"(the entry state's family); got {stamps['smearing_family']!r}")
 
     energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     nb_logical = int(solved_state.f_kn.shape[1])
@@ -961,14 +973,19 @@ def _certified_seed_occupation_state(
         raise ValueError(
             "certified MPA occupation replay needs the complete logical "
             f"energy ladder ({nb_logical} bands); got {tuple(energies.shape)}")
-    occ_kn = mp1_occupations(
-        energies[:, :nb_logical], float(stamps["mu_ry"]),
-        float(stamps["smearing_width_ry"]),
-        clamp_tol=float(inputs.config.occupation_clamp_tol))
+    if family == "fd":
+        occ_kn = fd_occupations(
+            energies[:, :nb_logical], float(stamps["mu_ry"]),
+            float(stamps["smearing_width_ry"]))
+    else:
+        occ_kn = mp1_occupations(
+            energies[:, :nb_logical], float(stamps["mu_ry"]),
+            float(stamps["smearing_width_ry"]),
+            clamp_tol=float(inputs.config.occupation_clamp_tol))
     replayed = OccupationState(
         f_kn=occ_kn,
         mu_ry=float(stamps["mu_ry"]),
-        smearing_family="mp1",
+        smearing_family=family,
         smearing_width_ry=float(stamps["smearing_width_ry"]),
         n_electrons=float(stamps["occ_nelec"]),
     )
@@ -2169,25 +2186,22 @@ def rebuild_hartree_dft_basis(inputs, U_qp, E_qp_ry) -> SCExactHartree:
     # E stays on the device: both are jit kernels over ``E`` (``gw.efermi``
     # header) and only E_F and the degeneracy flag cross.
     if inputs.material_class == "metal":
-        # Metal ρ: fixed-N MP1 occupations solved on THIS iteration's QP
-        # spectrum (W3 update point).  The step path below cannot represent
-        # a metal (partial fill / degenerate-manifold refusal), and the
-        # constructor owns the fixed-N invariant.
-        width_ev = float(inputs.config.screening.occ_broadening_ev)
-        if width_ev <= 0.0:
-            raise ValueError(
-                "mpa_material_class = metal requires screening occ_broadening "
-                "> 0 to solve fixed-N MP1 occupations for the density; got "
-                f"{width_ev!r} eV.")
-        occ_state = OccupationState.solve_mp1(
+        # Metal ρ: fixed-N occupations of the declared family (Fermi-Dirac
+        # on every metal, owner ruling 2026-09-17) solved on THIS iteration's
+        # QP spectrum (W3 update point), at the deck's ONE width.  The step
+        # path below cannot represent a metal (partial fill /
+        # degenerate-manifold refusal), and the constructor owns the fixed-N
+        # invariant.
+        occ_state = OccupationState.solve_smearing(
             E_qp_ry, kweights, float(inputs.wfn.num_electrons),
             inputs.config.occ_broadening_ry,
+            family=_declared_smearing_family(inputs.config),
             state_capacity=float(spin_degeneracy_factor(inputs.wfn)),
             clamp_tol=float(inputs.config.occupation_clamp_tol))
         e_f = occ_state.mu_ry
         occ = occ_state.f_kn
         inputs.print_fn(
-            "    V_H rebuild: metal MP1 occupations, "
+            f"    V_H rebuild: metal {occ_state.smearing_family} occupations, "
             f"mu={e_f * RYD_TO_EV:.8f} eV [occ_hash {occ_state.occ_hash}]")
     else:
         e_f = fermi_level_step(E_qp_ry, kweights, float(inputs.meta.nelec))
@@ -3615,11 +3629,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         drift = (abs(entry_occ_state.mu_ry - state.occupation_state.mu_ry)
                  if state.occupation_state is not None else float("nan"))
         inputs.print_fn(
-            "    SC occupations: entry-solved BGW-MP1 state, "
+            "    SC occupations: entry-solved fixed-N "
+            f"{entry_occ_state.smearing_family} state, "
             f"mu={entry_occ_state.mu_ry * RYD_TO_EV:.8f} eV, "
             f"|dmu|={drift * RYD_TO_EV:.3e} eV vs previous map input, "
-            f"width={inputs.config.occ_broadening_ry:.10f} Ry "
-            f"(degauss {2.0 * inputs.config.occ_broadening_ry:.10f} Ry), "
+            f"width={inputs.config.occ_broadening_ry:.10f} Ry, "
             f"occ_hash {entry_occ_state.occ_hash}")
 
     # Keep at most one complete MPA screening model on disk.  The current

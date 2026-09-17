@@ -39,7 +39,6 @@ def _config(tmp_path, extra=""):
 
 _METAL_KEYS = (
     "compute_mode = mpa\n"
-    "occ_smearing_family = mp1\n"
     "occ_smearing_width_ry = 0.02\n"
     "fermi_reference = mp1_fixed_n\n"
 )
@@ -251,7 +250,7 @@ def test_time_reversal_broken_insulator_still_takes_the_ordered_route():
 
 def test_metal_without_the_smearing_pair_refuses_by_name(tmp_path):
     config = _config(tmp_path, "compute_mode = mpa\nfermi_reference = mp1_fixed_n\n")
-    with pytest.raises(ValueError, match="occ_smearing_family"):
+    with pytest.raises(ValueError, match="occ_smearing_width_ry"):
         validate_material_inputs(config, "metal")
 
 
@@ -259,7 +258,6 @@ def test_metal_with_a_gap_fermi_reference_refuses_by_name(tmp_path):
     config = _config(
         tmp_path,
         "compute_mode = mpa\n"
-        "occ_smearing_family = mp1\n"
         "occ_smearing_width_ry = 0.02\n")
     with pytest.raises(ValueError, match="mp1_fixed_n"):
         validate_material_inputs(config, "metal")
@@ -272,7 +270,7 @@ def test_sigma_layout_is_not_a_deck_key():
 def test_insulator_with_smearing_keys_refuses_the_off_dial(tmp_path):
     config = _config(
         tmp_path,
-        "occ_smearing_family = mp1\nocc_smearing_width_ry = 0.02\n")
+        "occ_smearing_width_ry = 0.02\n")
     with pytest.raises(ValueError, match="integer WFN occupations"):
         validate_material_inputs(config, "insulator")
 
@@ -283,19 +281,28 @@ def test_insulator_with_mp1_fermi_reference_refuses(tmp_path):
         validate_material_inputs(config, "insulator")
 
 
-def test_uncertified_smearing_family_refuses_by_name(tmp_path):
-    with pytest.raises(ValueError, match=r"supports 'mp1' .* or 'fd' .*got 'fermi_dirac'"):
-        _config(
-            tmp_path,
-            _METAL_KEYS.replace(
-                "occ_smearing_family = mp1",
-                "occ_smearing_family = fermi_dirac"))
+@pytest.mark.parametrize("family", ("mp1", "fd", "fermi_dirac"))
+def test_the_smearing_family_key_refuses_by_name(tmp_path, family):
+    # Owner ruling 2026-09-17: metals are always Fermi-Dirac, so the key has
+    # no choice left and every value, fd included, refuses by name.
+    with pytest.raises(
+            ValueError, match="GATE metal_occupations_fermi_dirac.*REMOVED"):
+        _config(tmp_path, _METAL_KEYS + f"occ_smearing_family = {family}\n")
+
+
+def test_a_metal_with_any_other_family_refuses_at_the_material_door(tmp_path):
+    import dataclasses
+    config = dataclasses.replace(
+        _config(tmp_path, _METAL_KEYS), occ_smearing_family="mp1")
+    with pytest.raises(
+            ValueError, match="GATE metal_occupations_fermi_dirac.*'mp1'"):
+        validate_material_inputs(config, "metal")
 
 
 def test_a_legal_metal_deck_parses_and_carries_the_pair(tmp_path):
     config = _config(tmp_path, _METAL_KEYS)
     validate_material_inputs(config, "metal")
-    assert config.occ_smearing_family == "mp1"
+    assert config.occ_smearing_family == "fd"
     assert config.occ_smearing_width_ry == 0.02
     assert config.sigma.fermi_reference == "mp1_fixed_n"
 

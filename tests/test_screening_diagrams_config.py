@@ -54,7 +54,6 @@ memory_per_device_gb = 4.0
 """
 
 _METAL_KEYS = """\
-occ_smearing_family = mp1
 occ_smearing_width_ry = 0.02
 fermi_reference = mp1_fixed_n
 """
