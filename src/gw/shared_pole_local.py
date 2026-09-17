@@ -153,7 +153,8 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     column), ``points`` complex128 [P, F], ``active`` bool [P, side] (finite
     columns, then the infinity block; k0 and k1 on an odd-moment ordered round,
     none on a finite-state ordered bank), and ``own`` [P], each slot's Gram
-    spectrum length at its own extent, for the receipt.
+    spectrum length at its own extent, for the receipt; ``extents`` [P, 2]
+    carries each finite half and infinity block before round padding.
     """
     import numpy as np
 
@@ -177,17 +178,17 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
                 at += c
     blocks = (2 if odd_moments else 0) if ordered else 1
     tail = np.arange(infinity_width)[None, :] < np.asarray(infinity_counts)[:, None]
-    own = (carriers[:, list(halves[0])].sum(axis=1)
-           + np.asarray([column_extent(int(c)) if blocks else 0 for c in infinity_counts], np.int64))
-    return dict(order=order, points=points, active=np.concatenate((live,) + (tail,) * blocks, axis=1), own=own)
+    finite = carriers[:, list(halves[0])].sum(axis=1)
+    infinity = np.asarray([column_extent(int(c)) if blocks else 0 for c in infinity_counts], np.int64)
+    return dict(order=order, points=points, active=np.concatenate((live,) + (tail,) * blocks, axis=1),
+                own=finite + infinity, extents=np.column_stack((finite, infinity)))
 
 
 def own_extent_receipts(reduction, own):
     """Per-slot receipt rows of a round reduction at each parent's own extent.
 
-    A parent solved at the round extent carries the padding's exact zeros in its
-    ascending normalized Gram spectrum. Its receipt drops that many entries of
-    smallest magnitude, reads ``gram_min_relative`` from what remains, and
+    A parent's own ascending spectrum is followed by exact-zero round padding.
+    Its receipt strips that output padding, reads ``gram_min_relative``, and
     normalizes the metric residual by its own side. ``reduction`` holds host
     arrays [P, ...]; returns one dict of [1, ...] arrays per entry of ``own``.
     """
@@ -196,8 +197,7 @@ def own_extent_receipts(reduction, own):
     rows = []
     for slot, side in enumerate(int(v) for v in own):
         row = {key: value[slot:slot + 1] for key, value in reduction.items()}
-        spectrum = row["gram_spectrum_relative"][0]
-        kept = np.delete(spectrum, np.argsort(np.abs(spectrum), kind="stable")[:spectrum.size - side])
+        kept = row["gram_spectrum_relative"][0, :side]
         row["gram_spectrum_relative"] = kept[None]
         row["gram_min_relative"] = kept[:1]
         row["metric_inverse_root_residual_relative"] = row["metric_inverse_root_residual_fro"] / np.sqrt(side)
@@ -216,27 +216,35 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
     import numpy as np
 
     put = lambda a: _batch_put(mesh_xy, np.asarray(a))
+    extents = [tuple(int(v) for v in row) for row in tables["extents"][:real]]
+    sizes = tuple(sorted(set(extents)))
     program = round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments),
-                            None if keep_budget is None else int(keep_budget))
+                            None if keep_budget is None else int(keep_budget), sizes)
     live = np.arange(len(tables["own"])) < int(real)
-    return program(put(live), put(tables["points"]), put(tables["order"]), put(tables["active"]),
+    dispatch = np.zeros(len(live), np.int32)
+    dispatch[:real] = [sizes.index(size) for size in extents]
+    return program(put(live), put(dispatch), put(tables["points"]), put(tables["order"]), put(tables["active"]),
                    tuple(st[1] for st in states), tuple(st[2] for st in states),
                    tuple(st[3] for st in states), tuple(infinity))
 
 
 @lru_cache(maxsize=None)
-def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget):
+def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, sizes):
     """Pack, assemble, reduce, gate and sort a round of parents, each on its own rank.
 
     One program over batch layout: rank r packs slot r's Q, WQ, dWQ panels by
     ``round_tables``, assembles the even or ordered pencil, reduces it with the
     local eigensolver ``native_eigh``, applies the zero policy, forms the
     retained (even) or original-infinity (ordered, odd moments) moment identity
-    and sorts the poles. A synthetic slot (``live`` False) skips all of it through
+    and sorts the poles. Each parent solves at its own selected extents: large
+    artificial zero blocks can make the native eigensolver return NaNs on a
+    finite Gram. Only outputs acquire round padding. ``sizes`` contains the
+    distinct (finite-half, infinity) extents; the slot dispatch is a runtime
+    operand, so reordering parents reuses the same program. A synthetic slot (``live`` False) skips all of it through
     ``lax.cond``. No array crosses ranks: the models stay in batch layout for
     ``round_checks``; only vectors are gathered.
 
-    Arguments ``(live [P], points, order, active, Qs, WQs, dWQs, infinity)``, all
+    Arguments ``(live [P], dispatch [P], points, order, active, Qs, WQs, dWQs, infinity)``, all
     in batch layout. Returns ``(model, signed, vectors, (reduction, zero,
     retained, permutation))`` in round order: model (b [P, n, side], poles2,
     active) and signed (c, mu, retained; ordered route, else ``()``) in batch
@@ -275,23 +283,58 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget):
             retained = retained_moment_identity(pencil, coefficients, model, selector.astype(jnp.complex128),
                                                 matmul=_mm)
             signed = ()
-        model, permutation = sort_shared_pole_columns(model)
-        return model, signed, (reduction, zero, retained, permutation)
+        return model, signed, (reduction, zero, retained)
 
-    def body(live, points, order, active, qs, os, ds, infinity):
+    def body(live, dispatch, points, order, active, qs, os, ds, infinity):
         def pack(panels):
             return jnp.take(jnp.concatenate(panels, axis=-1), order[0], axis=-1, mode='fill', fill_value=0)
         args = (points, pack(qs), pack(os), pack(ds), infinity, active)
 
-        def skip(args):
-            return jax.tree.map(lambda a: jnp.zeros(a.shape, a.dtype), jax.eval_shape(solve, *args))
-        return jax.lax.cond(live[0], lambda args: solve(*args), skip, args)
+        halves = 2 if ordered else 1
+        blocks = (2 if odd_moments else 0) if ordered else 1
+        finite_width = points.shape[-1] // halves
+        infinity_width = infinity[0].shape[-1]
+        side = active.shape[-1]
 
-    mapped = shard_map(body, mesh=mesh_xy, in_specs=(batch,) * 8, out_specs=batch, check_vma=False)
+        def branch(nf, ni):
+            def run(args):
+                points, q, o, d, infinity, active = args
+                finite = lambda a: jnp.concatenate(
+                    [a[..., k * finite_width:k * finite_width + nf] for k in range(halves)], axis=-1)
+                mask = jnp.concatenate((finite(active[..., :halves * finite_width]), *[
+                    active[..., halves * finite_width + k * infinity_width:
+                           halves * finite_width + k * infinity_width + ni] for k in range(blocks)]), axis=-1)
+                model, signed, diagnostics = solve(finite(points), finite(q), finite(o), finite(d),
+                                                   tuple(a[..., :ni] for a in infinity), mask)
+                pad = side - (halves * nf + blocks * ni)
+                def padded(model, sentinel):
+                    b, poles, kept = model
+                    return (jnp.pad(b, ((0, 0), (0, 0), (0, pad))),
+                            jnp.pad(poles, ((0, 0), (0, pad)), constant_values=sentinel),
+                            jnp.pad(kept, ((0, 0), (0, pad))))
+                model = padded(model, 1)
+                if ordered:
+                    signed = padded(signed, 0)
+                reduction, zero, retained = diagnostics
+                reduction['gram_spectrum_relative'] = jnp.pad(
+                    reduction['gram_spectrum_relative'], ((0, 0), (0, side // halves - nf - ni)))
+                return model, signed, (reduction, zero, retained)
+            return run
+
+        branches = tuple(branch(nf, ni) for nf, ni in sizes)
+        def work(args):
+            return jax.lax.switch(dispatch[0], branches, args)
+        def skip(args):
+            return jax.tree.map(lambda a: jnp.zeros(a.shape, a.dtype), jax.eval_shape(branches[0], args))
+        model, signed, diagnostics = jax.lax.cond(live[0], work, skip, args)
+        model, permutation = sort_shared_pole_columns(model)
+        return model, signed, (*diagnostics, permutation)
+
+    mapped = shard_map(body, mesh=mesh_xy, in_specs=(batch,) * 9, out_specs=batch, check_vma=False)
 
     @jax.jit
-    def execute(live, points, order, active, qs, os, ds, infinity):
-        model, signed, diagnostics = mapped(live, points, order, active, qs, os, ds, infinity)
+    def execute(live, dispatch, points, order, active, qs, os, ds, infinity):
+        model, signed, diagnostics = mapped(live, dispatch, points, order, active, qs, os, ds, infinity)
         return model, signed, _gather(replicated, model[1:]), _gather(replicated, diagnostics)
     return execute
 
