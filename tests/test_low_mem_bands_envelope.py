@@ -117,7 +117,6 @@ memory_per_device_gb = 4.0
 #: occupations and the Sigma cube layout is no longer a deck dial.
 _METAL_KEYS = """\
 compute_mode = mpa
-occ_smearing_family = mp1
 occ_smearing_width_ry = 0.02
 fermi_reference = mp1_fixed_n
 """

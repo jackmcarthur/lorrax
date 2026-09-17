@@ -1907,12 +1907,12 @@ _DEFAULTS = {
     # named spelling with the incumbent as the default, never an inference.
     "band_extrapolation_bracket_scheme": BRACKET_SCHEME_DEFAULT,
     "fermi_reference": "midgap",
-    # DFT occupation smearing of the starting point.  REQUIRED as a pair
-    # when ``mpa_material_class = metal``; refused under insulator.  These
-    # are deck keys because WFN.h5 does NOT carry them: mf_header stores
-    # el/occ/w but no smearing family and no degauss (verified 2026-08-15
-    # on the canonical Na deck's WFN.h5 — zero attrs anywhere in mf_header).
-    "occ_smearing_family": None,
+    # Fermi-Dirac kBT of a metal's occupations, in Ry.  REQUIRED when the
+    # WFN occupations identify a metal; refused on an insulator.  A deck key
+    # because WFN.h5 does NOT carry it: mf_header stores el/occ/w but no
+    # smearing width (verified 2026-08-15 on the canonical Na deck's WFN.h5).
+    # The family is not a key: metals are always Fermi-Dirac (owner ruling
+    # 2026-09-17), and ``occ_smearing_family`` refuses by name.
     "occ_smearing_width_ry": None,
     # Far-tail clamp on the MP1 occupation table, applied AT EVALUATION
     # (inside the fixed-N root), so mu is solved for the clamped table and
@@ -2023,7 +2023,6 @@ _NORMALIZE_STR = {
     "fermi_reference",
     "band_extrapolation_estimator",
     "band_extrapolation_bracket_scheme",
-    "occ_smearing_family",
     "linalg",
     "ppm_invalid_mode",
     "ppm_model",
@@ -2068,10 +2067,6 @@ _NULLABLE_INT = frozenset({
     "number_bands_sigma",
     "nband",
 })
-
-#: Keys whose default is None but whose explicit value is a STRING — the
-#: bare ``default is None`` parser branch is the nullable-float one.
-_NULLABLE_STR = frozenset({"occ_smearing_family"})
 
 #: Reserved slot in the params dict holding the set of deck keys the DECK
 #: named.  Leading underscore because it is not a deck key and must never
@@ -2329,8 +2324,6 @@ def _input_key_type(key, default):
         return bool
     if key in _NULLABLE_INT:
         return int
-    if key in _NULLABLE_STR:
-        return str
     if isinstance(default, bool):
         return bool
     if isinstance(default, int):
@@ -2405,10 +2398,6 @@ def _resolve_shared_pole_inputs(params):
             "want: finite > 0 eV; why: the causal evaluation needs positive broadening")
     if model != "shared_pole":
         return
-    if str(params.get("occ_smearing_family", "")).strip().lower() == "mp1":
-        raise ValueError(
-            "shared_pole needs a positive spectral measure: MP1 occupations "
-            "are non-monotonic; use occ_smearing_family = fd")
     head_enabled = coerce_head_correction(params['head_correction']) is not HeadCorrection.OFF
     unused_keys = {"mpa_pole_batch_size", "mpa_fit_reuse_file",
                    "mpa_overwrite_completed_artifacts"}
@@ -2721,13 +2710,13 @@ def _input_response(
         sigma = _dc_replace(
             sigma, omega_min_ev=float(_patches[0][0]),
             omega_max_ev=float(_patches[-1][1]))
-    _occ_family = params["occ_smearing_family"]
-    _occ_family = (
-        str(_occ_family).strip().lower()
-        if _occ_family is not None else None)
     _occ_width = params["occ_smearing_width_ry"]
     _occ_width = float(_occ_width) if _occ_width is not None else None
-    _validate_occupation_smearing(screening, _occ_family, _occ_width)
+    _validate_occupation_smearing(screening, _occ_width)
+    # The ONE site that names a metal's occupation family: Fermi-Dirac,
+    # always (owner ruling 2026-09-17).  A width declares a metal; the
+    # class itself is confirmed from the WFN at validate_material_inputs.
+    _occ_family = "fd" if _occ_width is not None else None
     return (screening, ppm, mpa, sigma, _occ_family, _occ_width)
 
 
@@ -3114,6 +3103,18 @@ def _report_early_retired_keys(
             "retired; nothing reads a deck value for it.\n"
             "  doc:  docs/input_reference.md, bispinor_gw / "
             "head_correction."
+        )
+    if section.get("occ_smearing_family", fallback=None) is not None:
+        raise ValueError(
+            "GATE metal_occupations_fermi_dirac: input key "
+            "'occ_smearing_family' has been REMOVED (got "
+            f"{section.get('occ_smearing_family')!r}).\n"
+            "  want: no key -- a metal's occupations are always Fermi-Dirac "
+            "(owner ruling 2026-09-17), so the key has no choice left to "
+            "make; Methfessel-Paxton and every other family refuse by name.\n"
+            "  fix:  delete the line; occ_smearing_width_ry (Fermi-Dirac "
+            "kBT, Ry) is the metal's one occupation input.\n"
+            "  doc:  docs/input_reference.md, occ_smearing_width_ry."
         )
     if section.get("hartree_source", fallback=None) is not None:
         raise ValueError(
@@ -4368,22 +4369,12 @@ class BSEConfig:
 _OCC_WIDTH_RTOL = 1.0e-4
 
 
-def _validate_occupation_smearing(screening, family, width_ry):
-    """Validate the occupation-smearing pair without classifying the WFN; see docs/architecture/decisions.md."""
-    if (family is None) != (width_ry is None):
+def _validate_occupation_smearing(screening, width_ry):
+    """Validate the metal occupation width without classifying the WFN; see docs/architecture/decisions.md."""
+    if width_ry is not None and not (np.isfinite(width_ry) and width_ry > 0.0):
         raise ValueError(
-            "occ_smearing_family and occ_smearing_width_ry must be set "
-            "together; WFN.h5 supplies occupations but not their smearing "
-            "family or width.")
-    if family is not None:
-        if family not in ("mp1", "fd"):
-            raise ValueError(
-                "occ_smearing_family supports 'mp1' (Methfessel-Paxton order 1) "
-                f"or 'fd' (Fermi-Dirac); got {family!r}.")
-        if not (np.isfinite(width_ry) and width_ry > 0.0):
-            raise ValueError(
-                "occ_smearing_width_ry must be > 0 for a metal; got "
-                f"{width_ry!r}")
+            "occ_smearing_width_ry (Fermi-Dirac kBT, Ry) must be > 0 for a "
+            f"metal; got {width_ry!r}")
 
     # Cross-key width agreement, checked last so the class-level off-dial
     # refusals above own their own messages.  ``occ_broadening = 0`` is the
@@ -4430,11 +4421,17 @@ def validate_material_inputs(config, material_class):
                 "GATE fractional_occupations_require_mpa: WFN occupations "
                 f"identify a metal, but compute_mode={config.compute_mode.value}; "
                 "use compute_mode=mpa, the occupation-aware path.")
-        if family is None or width_ry is None:
+        if width_ry is None:
             raise ValueError(
-                "metallic WFN occupations require occ_smearing_family=mp1 or fd "
-                "and occ_smearing_width_ry=<BerkeleyGW width in Ry>; WFN.h5 "
-                "does not store that metadata.")
+                "metallic WFN occupations require occ_smearing_width_ry="
+                "<Fermi-Dirac kBT in Ry>; WFN.h5 does not store it.")
+        if family != "fd":
+            raise ValueError(
+                "GATE metal_occupations_fermi_dirac: got occupation family "
+                f"{family!r} on a metal; want 'fd'; why: metallic occupations "
+                "are always Fermi-Dirac (owner ruling 2026-09-17), and "
+                "Methfessel-Paxton or any other family refuses by name; "
+                "doc: docs/input_reference.md, occ_smearing_width_ry.")
         if config.sigma.fermi_reference != "mp1_fixed_n":
             raise ValueError(
                 "metallic WFN occupations require fermi_reference="
@@ -4443,8 +4440,7 @@ def validate_material_inputs(config, material_class):
         if family is not None or width_ry is not None:
             raise ValueError(
                 "integer WFN occupations identify an insulator, so "
-                "occ_smearing_family/occ_smearing_width_ry would be unused; "
-                "remove them.")
+                "occ_smearing_width_ry would be unused; remove it.")
         if config.sigma.fermi_reference == "mp1_fixed_n":
             raise ValueError(
                 "integer WFN occupations identify an insulator, which has "
@@ -4507,17 +4503,14 @@ class LorraxConfig:
     sys_dim: int
     density_self_consistent: bool
     sc_on_ibz: bool
-    #: DFT occupation smearing of the starting point ("mp1" = Methfessel-
-    #: Paxton order 1, the only certified family).  REQUIRED as a pair when
-    #: the loaded WFN occupations identify a metal; refused when they identify
-    #: an insulator.  Deck keys, not derived: WFN.h5's mf_header carries
-    #: el/occ/w but no smearing metadata (see ``_DEFAULTS``).  Shape validated
-    #: by ``_validate_occupation_smearing`` and class validated by
-    #: :func:`validate_material_inputs`.
-    #:
-    #: ``occ_smearing_width_ry`` IS ``occ_broadening`` in Ry — BerkeleyGW's
-    #: convention, MP1 argument ``(E-mu)/(2*width)`` — and therefore HALF
-    #: the QE ``degauss``.  It is the metal path's single width source; see
+    #: A metal's occupation family and width.  The family is ``"fd"`` whenever
+    #: a width is set and ``None`` otherwise, resolved once at parse: metals
+    #: are always Fermi-Dirac (owner ruling 2026-09-17) and the retired
+    #: ``occ_smearing_family`` deck key refuses by name.  The width
+    #: (Fermi-Dirac kBT in Ry, a deck key because WFN.h5 does not carry it) is
+    #: REQUIRED when the loaded WFN occupations identify a metal and refused
+    #: when they identify an insulator (:func:`validate_material_inputs`).
+    #: It is the metal path's single width source; see
     #: :attr:`occ_broadening_ry`.
     occ_smearing_family: str | None
     occ_smearing_width_ry: float | None
