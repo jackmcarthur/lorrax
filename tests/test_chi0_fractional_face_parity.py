@@ -1,6 +1,6 @@
 """Check finite-occupation response with nondivisible band windows and metallic tails.
 
-Both responses are compared with independent NumPy band-pair sums.
+The contour response is compared with an independent NumPy band-pair sum.
 The native four-rank CLI exercises the vendor FFT omitted by CPU workers.
 """
 from __future__ import annotations
@@ -30,24 +30,6 @@ _CASES_BY_NAME = {name: kwargs for name, kwargs in _CASES}
 
 _NB_FULL = 24
 _N_RMU = 4
-_NB_LOGICAL_DIRECT = 19    # < nb_full=24: exercises the mask with no caller-pad
-
-
-def _direct_pairs(psi_x, psi_y, energies, occupations, rows, z, nb):
-    """Evaluate the literal Kubo sum at nonzero z."""
-    import numpy as np
-    out = np.zeros((len(z), len(rows), psi_x.shape[-1], psi_y.shape[-1]), complex)
-    for q, row in enumerate(rows):
-        for k, kmq in enumerate(row):
-            for a in range(nb):
-                for b in range(nb):
-                    de = energies[k, a] - energies[kmq, b]
-                    df = occupations[k, a] - occupations[kmq, b]
-                    dx = np.einsum("sm,sm->m", psi_x[k, a], psi_x[kmq, b].conj())
-                    dy = np.einsum("sn,sn->n", psi_y[k, a], psi_y[kmq, b].conj())
-                    for iz, freq in enumerate(z):
-                        out[iz, q] += df / (de + freq) * np.outer(dx, dy.conj())
-    return out / np.sqrt(len(energies))
 
 
 def _direct_contour(psi_x, psi_y, energies, occupations, times, weights, z, grid):
@@ -86,9 +68,8 @@ def _worker(case_name: str) -> int:
     )
     from gw.w_isdf import (
         compute_chi0_contour_fractional,
-        compute_chi0_direct_fractional,
     )
-    from gw.efermi import OccupationState, mp1_occupations
+    from gw.efermi import mp1_occupations
 
     ns, seed = (_CASES_BY_NAME[case_name]["ns"],
                 _CASES_BY_NAME[case_name]["seed"])
@@ -146,10 +127,6 @@ def _worker(case_name: str) -> int:
         psi_rmu_Y, psi_rmuT_X, enk_full=enk_full, slices=slices,
         mesh_xy=mesh, efermi=None)
 
-    occ_state = OccupationState(
-        f_kn=f_kn, mu_ry=mu, smearing_family="mp1",
-        smearing_width_ry=width, n_electrons=float(np.sum(np.asarray(f_kn))))
-
     from jax.experimental import multihost_utils as _mhu
 
     def _cmp(a, b):
@@ -164,21 +141,6 @@ def _worker(case_name: str) -> int:
                 "max_rel": max_abs / max(ref_scale, 1e-300)}
 
     out = {"case": case_name, "ns": ns}
-
-    psi_x = np.asarray(psi_rmuT_X).conj().transpose(0, 2, 3, 1)
-    psi_y = np.asarray(psi_rmu_Y)
-
-    # ---- Part B, finite-q/finite-z: z != 0, exercises the dynamic branch
-    kminq_rows = np.stack([
-        rng.permutation(nk).astype(np.int32) for _ in range(2)])
-    z_direct = np.asarray([0.03 + 0.01j], dtype=np.complex128)
-    direct_reference = _direct_pairs(
-        psi_x, psi_y, np.asarray(enk_full), np.asarray(f_kn),
-        kminq_rows, z_direct, _NB_LOGICAL_DIRECT)[0]
-    direct_face = jax.block_until_ready(compute_chi0_direct_fractional(
-        wfns_face, z_direct, meta, mesh, occupation_state=occ_state,
-        kminq_rows=kminq_rows, nb_logical=_NB_LOGICAL_DIRECT))
-    out["direct"] = _cmp(direct_reference, direct_face)
 
     # ---- Part A, fractional/contour kernel -----------------------------
     # Needs make_flat_k_fftn -> the FFTW3-ABI HOST FFI backend (the SAME
@@ -244,7 +206,7 @@ def test_fractional_chi0_face_matches_legacy(name, kwargs):
     if "skip" in out:
         pytest.skip(f"fractional chi0 face-layout parity gate: {out['skip']}")
     skipped = []
-    for quantity in ("direct", "contour"):
+    for quantity in ("contour",):
         result = out[quantity]
         if "skip" in result:
             skipped.append(f"{quantity}: {result['skip']}")
@@ -254,8 +216,7 @@ def test_fractional_chi0_face_matches_legacy(name, kwargs):
             f"{quantity} face vs legacy parity FAILED: max relative diff "
             f"{result['max_rel']:.3e} (case {name})")
     if skipped:
-        # direct (this port's own genuinely new mechanism) still
-        # ran and were asserted above; only note the narrower scope.
+        # Only note the narrower scope; a skipped quantity is not a pass.
         print("PARTIAL SCOPE (see stdout, not a pass/fail signal): "
               + "; ".join(skipped))
 
@@ -296,7 +257,7 @@ def _cli_main():
             p0(f"SKIP {name}: {rc['skip']}")
             continue
         case_fail = False
-        for quantity in ("direct", "contour"):
+        for quantity in ("contour",):
             result = rc.get(quantity, {})
             if "skip" in result:
                 p0(f"SKIP {name}/{quantity}: {result['skip']}")

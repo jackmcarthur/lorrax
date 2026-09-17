@@ -1,9 +1,9 @@
-"""Metal chi0 kernels on a time-reversal-broken lattice with fractional occupations: orientation gate.
+"""Metal chi0 contour kernel on a time-reversal-broken lattice with fractional occupations: orientation gate.
 
 A tiny 2-D lattice with complex hoppings (inversion and time reversal both broken, so e_k != e_-k
-and the pair densities are complex) and Fermi-Dirac occupations with mu inside a band.  Both metal
-kernels are evaluated on a CPU 1x1 mesh and compared with the supercell Kubo sum in the stream's
-convention (TRINT B1, validated against Sigma by the Casida plant):
+and the pair densities are complex) and Fermi-Dirac occupations with mu inside a band.  The real-time
+contour kernel is evaluated on a CPU 1x1 mesh and compared with the supercell correlation in the
+stream's convention (TRINT B1, validated against Sigma by the Casida plant):
 
     chi(r, r'; z) = sum_ab (f_a - f_b) / (e_a - e_b + z) conj(rho_ab(r)) rho_ab(r'),  rho_ab = psi_a conj psi_b,
 
@@ -91,17 +91,6 @@ class _Lattice:
                            for i in range(self.n1) for j in range(self.n2)], np.int32)
 
 
-def _kubo(psi_sc, e, f, z):
-    N = psi_sc.shape[-1]
-    X = np.zeros((N, N), complex)
-    states = [(ik, n) for ik in range(e.shape[0]) for n in range(e.shape[1])]
-    for a in states:
-        for b in states:
-            rho = psi_sc[a] * np.conj(psi_sc[b])
-            X += (f[a] - f[b]) / (e[a] - e[b] + z) * np.outer(np.conj(rho), rho)
-    return X
-
-
 def _candidates(lat, per_out):
     out = {}
     for name, sign, transpose in (("FT_q[chi]", +1, False), ("FT_q[chi^T]", +1, True),
@@ -152,24 +141,6 @@ def _setup(real_hopping):
     return lat, e, psi_sc, mu, f
 
 
-def _pair_outputs(lat, e, psi_sc, f, z, ordered):
-    from gw import w_isdf
-    mesh = Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
-    put = lambda a: device_put_process_local(np.asarray(a), NamedSharding(mesh, P()))
-    psi_cell = np.sqrt(lat.nk) * psi_sc[:, :, :lat.ns]
-    psi_mun = put(psi_cell.transpose(0, 2, 1)[:, None, :, :])
-    psi_nmu = put(psi_cell[:, :, None, :])
-    kern = w_isdf._get_chi_fractional_q_kernel_face(mesh, nb_full=lat.ns, nb_logical=lat.ns, pair_tile=2,
-                                                    n_z=z.size, layout="face", ordered=ordered)
-    out = np.zeros((lat.nk, z.size, lat.ns, lat.ns), complex)
-    for iq in range(lat.nk):
-        row = lat.kminq(iq)
-        if ordered:
-            row = np.argsort(row, kind="stable").astype(np.int32)
-        out[iq] = np.asarray(kern(psi_mun, psi_nmu, put(row), put(e), put(f), put(z)))
-    return out
-
-
 def _contour_outputs(lat, e, psi_sc, f, ordered, times, e_ref):
     from gw import w_isdf
     mesh = Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
@@ -184,25 +155,7 @@ def _contour_outputs(lat, e, psi_sc, f, ordered, times, e_ref):
     return np.stack([np.asarray(v) for v in got], axis=1)
 
 
-Z = np.asarray([0.31j, 0.17 + 0.31j, -0.09 + 0.05j])
 TIMES = np.asarray([0.37, 1.13, 2.9])
-
-
-@pytest.mark.parametrize("real_hopping", [False, True], ids=["tr_broken", "trs_control"])
-def test_pair_kernel_orientation(cpu_standins, real_hopping):
-    lat, e, psi_sc, mu, f = _setup(real_hopping)
-    cands = _candidates(lat, [_kubo(psi_sc, e, f, z) for z in Z])
-    incumbent = _pair_outputs(lat, e, psi_sc, f, Z, ordered=False)
-    physical = _pair_outputs(lat, e, psi_sc, f, Z, ordered=True)
-    assert _resid(physical, cands["FT_q[chi]"]) < 1e-12
-    assert _resid(incumbent, cands["FT_q[chi^T]"]) < 1e-12
-    # ordered = incumbent row -q transposed (same products, summed in another order: roundoff).
-    rel = np.linalg.norm(physical - np.swapaxes(incumbent[lat.minus()], -1, -2)) / np.linalg.norm(physical)
-    assert rel < 1e-14
-    if real_hopping:
-        assert _resid(physical, incumbent) < 1e-12
-    else:
-        assert _resid(incumbent, cands["FT_q[chi]"]) > 1e-3
 
 
 @pytest.mark.parametrize("real_hopping", [False, True], ids=["tr_broken", "trs_control"])

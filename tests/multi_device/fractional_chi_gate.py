@@ -58,23 +58,6 @@ def _dense(psi, enk, occ, time, weights, z):
     return out / np.sqrt(float(nk))
 
 
-def _direct(psi, enk, occ, z):
-    """Tiny independent ordered-pair resolvent at nonzero z."""
-    nk, nb, _, nmu = psi.shape
-    out = np.zeros((len(z), nk, nmu, nmu), np.complex128)
-    for q in range(nk):
-        for k in range(nk):
-            kmq = (k-q) % nk
-            for a in range(nb):
-                for b in range(nb):
-                    de = enk[k,a]-enk[kmq,b]
-                    fdiff = occ[k,a]-occ[kmq,b]
-                    M = np.einsum("sm,sm->m",psi[k,a],np.conj(psi[kmq,b]))
-                    for iz, point in enumerate(z):
-                        out[iz,q] += fdiff/(point+de)*np.outer(M,np.conj(M))
-    return out/np.sqrt(float(nk))
-
-
 def main():
     rank = process_rank()
     if process_count() != 4:
@@ -138,47 +121,6 @@ def main():
         )
     if relative > 5.0e-12:
         raise AssertionError("fractional chi dense Kubo mismatch")
-
-    # --- The MPA metal near-origin producer at literal nonzero z -----------
-    # Both occupation families and both carrier layouts against the oracle;
-    # z = 0 refuses by name (static chi0 is compute_chi0_matsubara at n = 0).
-    from gw import efermi
-    from gw.w_isdf import compute_chi0_direct_fractional
-
-    mu, width = 0.15, 0.08
-    occ_mp1 = np.asarray(jax.device_get(
-        efermi.mp1_occupations(enk, mu, width)))
-    occ_fd = 0.5*(1.0-np.tanh((enk-mu)/(2*width)))
-    kminq = np.stack([[(k - q) % nk for k in range(nk)] for q in range(nk)])
-    direct_z = np.asarray([2.0e-5j,0.32+0.18j,0.77+0.24j])
-    family_checks = {}
-    face_wfns = Wavefunctions(
-        psi_mun=_put(psi.transpose(0,2,3,1),mesh,PSI_MUN_SPEC),
-        psi_nmu=_put(psi,mesh,PSI_NMU_SPEC),
-        enk=wfns.enk,occ=wfns.occ,slices=slices,layout="face")
-    meta_direct = SimpleNamespace(nk_tot=nk,n_rmu=nmu,nspinor=ns)
-    for family, occupations in (("mp1",occ_mp1),("fd",occ_fd)):
-        family_state = SimpleNamespace(f_kn=occupations,mu_ry=mu,
-            smearing_family=family,smearing_width_ry=width)
-        expected = _direct(psi,enk,occupations,direct_z)
-        for layout, carrier in (("legacy",wfns),("face",face_wfns)):
-            actual = np.asarray(multihost_utils.process_allgather(
-                compute_chi0_direct_fractional(carrier,direct_z,meta_direct,mesh,
-                    occupation_state=family_state,kminq_rows=kminq),tiled=True))
-            errors = [float(np.max(np.abs(actual[i]-expected[i]))
-                      /np.max(np.abs(expected[i]))) for i in range(len(direct_z))]
-            assert max(errors) < 5e-12,(family,layout,errors)
-            family_checks[family+"_"+layout] = errors
-    try:
-        compute_chi0_direct_fractional(wfns,np.asarray([0j]),meta_direct,mesh,
-            occupation_state=SimpleNamespace(f_kn=occ_fd,mu_ry=mu,
-                smearing_family="fd",smearing_width_ry=width),kminq_rows=kminq)
-    except ValueError as exc:
-        assert "GATE direct_fractional_needs_nonzero_z" in str(exc)
-    else:
-        raise AssertionError("direct fractional chi0 accepted z = 0")
-    if rank == 0:
-        print("[fractional-chi families] "+json.dumps(family_checks),flush=True)
 
     # --- Integer insulator: minimax orientation completion -----------------
     # Flat unit gaps make the one-node (tau=0, alpha=1) inverse exact.  The
@@ -247,10 +189,7 @@ def main():
     if rank == 0 and len(sys.argv) > 1:
         (Path(sys.argv[1])/"receipt.json").write_text(json.dumps(dict(
             status="PASS",job=os.getenv("SLURM_JOB_ID"),step=os.getenv("SLURM_STEP_ID"),
-            contour_relative=relative,static_mp1_relative=rel_s,
-            direct_family_relative=family_checks,fd_derivative_relative=fd_error,
-            fd_derivative_at_mu=at_mu,unsupported_family="REFUSED",
-            integer_relative=rel_i),indent=2))
+            contour_relative=relative,integer_relative=rel_i),indent=2))
     multihost_utils.sync_global_devices("fractional_chi_gate_pass")
 
 

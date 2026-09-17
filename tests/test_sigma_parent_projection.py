@@ -14,9 +14,6 @@ glide, a genuine k reduction, a time-reversed row, SU(2) mixing):
 * Fractional-occupation contour χ0 (``w_isdf.compute_chi0_contour_fractional``)
   on the parents-only bundle equals the full-k face bundle (CPU steps
   without the host FFT FFI report partial scope; run the worker on GPUs).
-* Fractional static-Γ and direct-q pair scans on the parents-only bundle
-  equal the full-k face bundle: each band tile is unfolded from the packed
-  parents inside the scan (``symmetry_maps.unfold_wavefunction_local``).
 * q→0 head wings (``qsgw_head.head_wings_sharded`` and the static wings) on
   the parents-only bundle equal the full-k face bundle: the children are
   streamed one parent star at a time from the packed parents
@@ -280,28 +277,8 @@ def _worker() -> int:
             raise
         frac_contour = "skip: host FFT FFI backend unavailable"
 
-    # The fractional PAIR SCAN (direct q) needs ψ itself at every k: on the
-    # parents-only bundle each band tile is unfolded from the packed parents
-    # inside the scan (symmetry_maps.unfold_wavefunction_local).  No FFT is
-    # involved, so this runs on CPU.
-    from gw.efermi import OccupationState, mp1_negative_derivative
-    from gw.w_isdf import compute_chi0_direct_fractional
+    from gw.efermi import mp1_negative_derivative
     surf = mp1_negative_derivative(enk_j, mu_f, 0.15)
-    kfrac_i = np.rint(kfrac * np.asarray(kgrid)).astype(int)
-    kminq = np.asarray([[2 * ((kfrac_i[k, 0] - kfrac_i[q, 0]) % 2)
-                         + ((kfrac_i[k, 1] - kfrac_i[q, 1]) % 2)
-                         for k in range(nk)] for q in range(nk)], dtype=np.int32)
-    occ_state = OccupationState(
-        f_kn=f_kn, mu_ry=mu_f, smearing_family="mp1", smearing_width_ry=0.15,
-        n_electrons=float(np.sum(np.asarray(f_kn))))
-    z_direct = np.asarray([0.03 + 0.1j, 0.2 + 0.05j])
-    d_full = np.asarray(jax.block_until_ready(compute_chi0_direct_fractional(
-        wfns_full, z_direct, meta, mesh, occupation_state=occ_state,
-        kminq_rows=kminq, nb_logical=nb - 1)))
-    d_par = np.asarray(jax.block_until_ready(compute_chi0_direct_fractional(
-        wfns_par, z_direct, meta, mesh, occupation_state=occ_state,
-        kminq_rows=kminq, nb_logical=nb - 1)))
-    frac_direct = float(np.max(np.abs(d_par - d_full))) / float(np.max(np.abs(d_full)))
     # The q->0 head wings on the parents-only bundle equal the full-k face
     # bundle: the children are streamed one parent star at a time
     # (w_isdf.iter_parent_children_faces) with the velocity read at every k.
@@ -359,7 +336,6 @@ def _worker() -> int:
         "conj_rule_rel_on_unitary_rows": conj_rel_uni,
         "parents_only_bundle_names_full_k_shapes": parents_only_ok,
         "fractional_contour_parents_vs_full_rel": frac_contour,
-        "fractional_direct_q_parents_vs_full_rel": frac_direct,
     }))
     return 0
 
@@ -410,7 +386,6 @@ def test_parent_sigma_route_matches_full_k_and_uses_the_transpose_rule():
     assert out["conj_rule_rel_on_tr_rows"] > 0.1, out
     assert out["parents_only_bundle_names_full_k_shapes"] is True, out
     assert out["sc_rotation_parents_vs_full_rel"] < 1.0e-10, out
-    assert out["fractional_direct_q_parents_vs_full_rel"] < 1.0e-10, out
     assert out["head_wings_parents_vs_full_rel"] < 1.0e-10, out
     assert out["static_head_wings_parents_vs_full_rel"] < 1.0e-10, out
 

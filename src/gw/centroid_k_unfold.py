@@ -101,7 +101,7 @@ class CentroidKUnfoldPlan:
         the parents' k, the owner-local centroid offsets and wraps over the
         COMPLETE packed endpoint, and the spinor representation.  A consumer
         streams children of a packed parent face from these without a full-k
-        face ever being resident (the fractional-occupation pair scans)."""
+        face ever being resident (the parent-star head wing streams)."""
         return dict(
             irr_idx=self.irr_idx, sym_idx=self.sym_idx,
             k_irr_frac=self.k_parent_frac,
