@@ -2012,6 +2012,36 @@ jax.Array or tuple[jax.Array, ...]
     ``n_z`` tuple for several frequencies.  Arrays retain
     ``P(None, 'x', 'y')`` sharding.
 
+### `src/gw/w_isdf.py` — `compute_chi0_matsubara`
+
+chi0(q; i nu_n) at bosonic Matsubara frequencies, finite temperature, from one
+imaginary-time sweep.
+
+Fermi-Dirac occupations only: ``beta = 1 / smearing_width_ry`` of the
+occupation state (no deck key).  Each node builds the one-particle pair
+``l = f e^{(e-mu)tau}`` and ``u = (1-f) e^{-(e-mu)tau}`` in log form; both lie
+in (0, 1] for tau in [0, beta] (KMS), so there is no band mask, no energy
+partition and no subtraction.  The contraction is the gapped kernel's
+(``Gu_R conj(Gl_R)``, pair weight ``f_m (1-f_n) e^{-(e_n-e_m) tau}``), and a
+row accumulates ``-W forward - conj(W) partner`` with ``W`` from
+``minimax.matsubara_response_rule``: the mirrored node ``beta - tau`` of the
+forward orientation is its conjugate partner in R space.  After the transform
+the pair carries ``(f_m - f_n)/(e_m - e_n + i nu_n)`` exactly at the Matsubara
+points, including ``beta f (1-f)`` on degenerate pairs at ``n = 0``.
+
+The gapped producer (:func:`compute_chi0` and its siblings) is the
+``beta -> infinity`` instance with step occupations on the same kernel.
+``vertex`` names the endpoint field; ``"charge"`` is the only one accepted,
+and current carriers enter through the same argument.  ``ordered=True``
+returns ``FT_q[chi]`` (the orientation the retarded stream's ordered mode
+returns); otherwise the incumbent ``FT_q[chi^T]``.  Refusals:
+``GATE chi0_matsubara_needs_fermi_dirac``, ``GATE chi0_matsubara_occupations``
+(table not Fermi-Dirac at the state's ``mu, beta``), ``GATE
+chi0_matsubara_vertex``.  ``gw.shared_pole_recipe.matsubara_indices`` gives a
+tier's index set (``0`` plus a log-spaced ladder up to the bandwidth, count
+from the tier's imaginary-axis rule).  No production consumer yet; RPA
+correlation energy and forces are the intended ones.
+
 ### `src/gw/w_isdf.py` — `_occupation_support_slices`
 
 Smallest contiguous f and (1-f) band supports without truncation.

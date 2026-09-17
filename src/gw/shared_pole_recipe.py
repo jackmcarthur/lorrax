@@ -872,6 +872,41 @@ def parse_support_sites(text):
     return {'line_ev': line, 'imaginary_ev': imaginary, 'text': canonical}
 
 
+def imaginary_sample_count(kappa, tier, recipe=shared_real_pole_v1_r3b):
+    """Tier-owned sample count on a log-spaced imaginary ladder of span ``kappa`` (max/min).
+
+    Production: the rational-approximation count
+    ``max(min_count, round(log(16 kappa^2) log(4/eps) / (2 pi^2)))``; relaxed:
+    the tier's fixed count.  One owner for the shared-pole imaginary ladder and
+    the Matsubara index set.
+    """
+    if tier == 'production':
+        return max(recipe['imaginary_min_count'], round(
+            math.log(16 * kappa**2) * math.log(4 / recipe['imaginary_count_epsilon'])
+            / (2 * math.pi**2)))
+    return recipe[tier]['imaginary_count']
+
+
+def matsubara_indices(beta_ry_inv, bandwidth_ry, tier, recipe=shared_real_pole_v1_r3b):
+    """Bosonic Matsubara indices at this accuracy tier: 0 plus a log-spaced ladder up to the bandwidth.
+
+    ``nu_n = 2 pi n / beta``.  The ladder spans ``nu_1 .. nu_top`` with
+    ``n_top = ceil(bandwidth beta / 2 pi)`` (frequencies above the bandwidth are
+    the exact M1/M3 moment tail) and carries :func:`imaginary_sample_count`
+    distinct indices for span ``kappa = n_top``.  No deck key: beta is the
+    Fermi-Dirac width's inverse and the count is the tier's.
+    """
+    beta, width = float(beta_ry_inv), float(bandwidth_ry)
+    if not (math.isfinite(beta) and beta > 0.0 and math.isfinite(width) and width > 0.0):
+        raise ValueError(
+            f"GATE matsubara_indices: got beta={beta_ry_inv!r}, bandwidth={bandwidth_ry!r}; "
+            "want finite positive values; why: the ladder spans nu_1 .. bandwidth")
+    n_top = max(1, math.ceil(width * beta / (2.0 * math.pi)))
+    count = imaginary_sample_count(float(n_top), tier, recipe) if n_top > 1 else 1
+    positive = np.unique(np.rint(np.geomspace(1.0, float(n_top), max(1, count))).astype(np.int64))
+    return np.concatenate(([0], positive)).astype(np.int64)
+
+
 def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                               support_session=None):
     """Resolve DESIGN §5 from current metadata into scalars and small arrays.
@@ -943,9 +978,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                 if top > edge else [])
         line = np.asarray(low + high + [top], dtype=np.float64)
     kappa = top / umin
-    count = max(recipe['imaginary_min_count'], round(
-        math.log(16 * kappa**2) * math.log(4 / recipe['imaginary_count_epsilon'])
-        / (2 * math.pi**2))) if tier == 'production' else policy['imaginary_count']
+    count = imaginary_sample_count(kappa, tier, recipe)
     imaginary = np.geomspace(umin, umax, count)
     if override is not None:
         # Both ladders are replaced together; height, held fractions, widths,

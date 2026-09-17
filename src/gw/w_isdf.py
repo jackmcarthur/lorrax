@@ -64,8 +64,18 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             layout: str = "face", face_shape=None,
                             right_face_shape=None,
                             vertex_pairs=None,
-                            k_unfold_plan=None):
-    """Build the face or parent minimax response with vertices applied after unfold."""
+                            k_unfold_plan=None,
+                            occupations: str = "step",
+                            ordered: bool = False):
+    """Build the face or parent imaginary-time response with vertices applied after unfold.
+
+    ``occupations="step"`` is the zero-temperature gapped response (masked
+    valence/conduction Green pair, references vmax/cmin); ``"fermi_dirac"``
+    is the finite-temperature Matsubara response (Green pair weighted by the
+    KMS-bounded factors at inverse temperature beta), of which the step case
+    is the beta -> infinity limit.  ``ordered`` (Fermi-Dirac only) returns
+    the physical orientation ``FT_q[chi]``.
+    """
     nkx, nky, nkz = kgrid
     nk = nkx * nky * nkz
     n_out = int(n_out)
@@ -88,10 +98,23 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         vertex_classes = tuple(tuple(v == 0 for v in pair) for pair in vertex_pairs)
         if len(set(vertex_classes)) != 1 or n_out != 1:
             raise ValueError("Vertex outputs must share one family pair and one static rule.")
+    if occupations not in ("step", "fermi_dirac"):
+        raise ValueError(
+            f"_get_chi_minimax_kernel: occupations must be 'step' or 'fermi_dirac', got {occupations!r}")
+    fermi_dirac = occupations == "fermi_dirac"
+    if fermi_dirac and (complex_contour or vertex_pairs is not None):
+        raise ValueError(
+            "GATE chi0_matsubara_kernel_scope: got a Fermi-Dirac kernel with a complex "
+            "contour or vertex pairs; want real Matsubara nodes and the charge vertex; "
+            "why: the finite-temperature vertex columns are not gated yet")
+    if bool(ordered) and not fermi_dirac:
+        raise ValueError("_get_chi_minimax_kernel: ordered is a Fermi-Dirac kernel option")
     cache_key = (_mesh_key(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_classes, (tuple(id(p) for p in k_unfold_plan)
                                if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)))
+    if fermi_dirac:
+        cache_key = cache_key + ("fermi_dirac", bool(ordered))
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -103,13 +126,21 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
         mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
         right_face_shape=right_face_shape,
         vertex_pairs=vertex_pairs,
-        k_unfold_plan=k_unfold_plan, layout=layout)
+        k_unfold_plan=k_unfold_plan, layout=layout,
+        fermi_dirac=fermi_dirac, ordered=bool(ordered))
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
 
 def _contract_chi_vertices(Gv_R, Gc_R, operands, identities, complex_contour):
     """Contract Hermitian endpoint vertices and complete their ordered orientations."""
+    forward, reverse = _contract_chi_orientations(Gv_R, Gc_R, operands, identities)
+    return (forward if complex_contour else
+            _complete_static_vertex_orientations(forward, reverse))
+
+
+def _contract_chi_orientations(Gv_R, Gc_R, operands, identities):
+    """Return the forward contraction and, for non-identity vertices, the reverse one (else ``None``)."""
     from common.gamma_matrices import gamma_double_contract
     left_identity, right_identity = identities
     reverse = None
@@ -133,15 +164,15 @@ def _contract_chi_vertices(Gv_R, Gc_R, operands, identities, complex_contour):
             perm_R=None if left_identity else perm_l,
             phase_R=None if left_identity else phase_l,
             spin_axes=(1, 3))
-    return (forward if complex_contour else
-            _complete_static_vertex_orientations(forward, reverse))
+    return forward, reverse
 
 
 def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                                  face_shape, *, right_face_shape=None,
                                  vertex_pairs=None,
-                                 k_unfold_plan=None, layout="face"):
-    """Build masked valence/conduction Green functions and integrate both response orientations."""
+                                 k_unfold_plan=None, layout="face",
+                                 fermi_dirac=False, ordered=False):
+    """Build the node Green pair (step masks or Fermi-Dirac KMS weights) and integrate both response orientations."""
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
     from .wavefunction_bundle import (
@@ -239,28 +270,69 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             _G_k_shard)
         return jnp.conj(Gv_k), jnp.conj(Gc_k)
 
+    @partial(jax.jit,
+             in_shardings=(_psi_mun_shard, _psi_nmu_shard,
+                            NamedSharding(mesh_xy, _rep2),   # enk
+                            NamedSharding(mesh_xy, _rep2),   # live bands
+                            NamedSharding(mesh_xy, _rep0),   # beta
+                            NamedSharding(mesh_xy, _rep0),   # mu
+                            NamedSharding(mesh_xy, _rep0)),  # tau
+             out_shardings=(_G_k_shard, _G_k_shard))
+    def _build_Gl_Gu(psi_mun_left, psi_nmu_right, enk, live, beta, mu, tau):
+        """Finite-temperature pair: l = f e^{(e-mu)tau}, u = (1-f) e^{-(e-mu)tau}, both in (0, 1] by KMS.
+
+        Evaluated in log form so neither factor overflows at any tau in [0, beta]:
+        log u = -(e-mu) tau - log(1 + e^{-beta(e-mu)}), log l = (e-mu) tau - log(1 + e^{beta(e-mu)}).
+        The pair product l_m u_n = f_m (1-f_n) e^{-(e_n-e_m) tau}.  The incumbent
+        orientation conjugates both factors (the step pair's convention); the
+        physical orientation keeps them and the finish permutes q to -q.
+        """
+        eps = enk - mu
+        zero_t = jnp.zeros((), dtype=jnp.float64)
+        factors = []
+        for log_weight in (eps * tau - jnp.logaddexp(0.0, beta * eps),
+                           -eps * tau - jnp.logaddexp(0.0, -beta * eps)):
+            weight = jnp.where(live, jnp.exp(log_weight), 0.0)
+            green = jax.lax.with_sharding_constraint(
+                build_G_tau(psi_mun_left, psi_nmu_right, enk, zero_t,
+                            band_weight=weight, layout=layout, gemm=g_plan,
+                            k_unfold_plan=k_unfold_plan),
+                _G_k_shard)
+            factors.append(green if ordered else jnp.conj(green))
+        return factors[0], factors[1]
+
+    negate_full_q = None
+    if ordered:
+        coords = np.unravel_index(np.arange(nk), tuple(kgrid))
+        negate_full_q = jnp.asarray(np.ravel_multi_index(
+            tuple((-c) % n for c, n in zip(coords, tuple(kgrid))), tuple(kgrid)))
+
     _nodes_shard = MinimaxNodes(
         t=NamedSharding(mesh_xy, _rep1),
         alpha=NamedSharding(mesh_xy, _rep1 if n_out == 1 else P()),
     )
 
     def _finish_chi(value):
-        return _chi_fftn_local(value)
+        value = _chi_fftn_local(value)
+        # Physical orientation on the full grid: the finished row q is the
+        # transform's row -q (as the retarded stream's ordered finish).
+        return value if negate_full_q is None else jnp.take(value, negate_full_q, axis=0)
 
     identities = ((True, True) if vertex_pairs is None else
                   tuple(v == 0 for v in vertex_pairs[0]))
     n_vertices = 1 if vertex_pairs is None else len(vertex_pairs)
     stack_shard = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
 
-    def _integrate(
-        nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
-        vertex_operands,
-    ):
+    def _integrate(nodes, psi_mun, psi_nmu, green_operands, vertex_operands):
         """One Green/FFT pair per node, shared by every vertex and every weight row.
 
         The accumulator is ``[n_out, n_vertices, nk, mu, mu]``: row ``o`` is
         weight vector ``o`` of ``nodes.alpha`` and column ``v`` is vertex pair
         ``v``.  Scalar charge response is the ``n_vertices = 1`` column.
+        ``green_operands`` is ``(mask_v, mask_c, enk_full, vmax, cmin)`` for the
+        step pair and ``(enk, live, beta, mu)`` for the Fermi-Dirac pair, whose
+        rows accumulate ``W forward + conj(W) partner`` (the mirrored node
+        beta - tau of the forward orientation is its conjugate partner).
         """
         zero = jax.lax.with_sharding_constraint(
             jnp.zeros((n_out, n_vertices, nk, n_rmu_out_left, n_rmu_out_right),
@@ -274,16 +346,30 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             t_scalar, alpha_col = xs
             tau_kernel = (t_scalar if complex_contour else
                           jnp.real(t_scalar).astype(jnp.float64))
-            Gv_k, Gc_k = _build_Gv_Gc(psi_mun, psi_nmu, mask_v, mask_c,
-                                      enk_full, tau_kernel, vmax, cmin)
+            if fermi_dirac:
+                Gv_k, Gc_k = _build_Gl_Gu(psi_mun, psi_nmu, *green_operands, tau_kernel)
+            else:
+                mask_v, mask_c, enk_full, vmax, cmin = green_operands
+                Gv_k, Gc_k = _build_Gv_Gc(psi_mun, psi_nmu, mask_v, mask_c,
+                                          enk_full, tau_kernel, vmax, cmin)
             Gv_R, Gc_R = _Gv_fftn(Gv_k), _Gc_fftn(Gc_k)
 
             def vertex_step(index, acc):
                 operands = None if tables is None else tuple(table[index] for table in tables)
+                previous = jax.lax.dynamic_index_in_dim(acc, index, axis=1, keepdims=False)
+                if fermi_dirac:
+                    forward, reverse = _contract_chi_orientations(
+                        Gv_R, Gc_R, operands, identities)
+                    partner = (jnp.conj(forward) if reverse is None
+                               else jnp.conj(jnp.swapaxes(reverse, -1, -2)))
+                    forward = jax.lax.with_sharding_constraint(forward, _chi_R_shard)
+                    partner = jax.lax.with_sharding_constraint(partner, _chi_R_shard)
+                    value = (previous + alpha_col[:, None, None, None] * forward[None]
+                             + jnp.conj(alpha_col)[:, None, None, None] * partner[None])
+                    return jax.lax.dynamic_update_index_in_dim(acc, value, index, axis=1)
                 chi_tau = _contract_chi_vertices(
                     Gv_R, Gc_R, operands, identities, complex_contour)
                 chi_tau = jax.lax.with_sharding_constraint(chi_tau, _chi_R_shard)
-                previous = jax.lax.dynamic_index_in_dim(acc, index, axis=1, keepdims=False)
                 value = previous + alpha_col[:, None, None, None] * chi_tau[None]
                 return jax.lax.dynamic_update_index_in_dim(acc, value, index, axis=1)
 
@@ -311,10 +397,23 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             vertex_operands,
         ):
             """Share each Green/FFT pair across the ordered vertices of one family class."""
-            final_R = _integrate(nodes, psi_mun, psi_nmu, mask_v, mask_c,
-                                 enk_full, vmax, cmin, vertex_operands)
+            final_R = _integrate(nodes, psi_mun, psi_nmu,
+                                 (mask_v, mask_c, enk_full, vmax, cmin), vertex_operands)
             return tuple(_finish_chi(final_R[0, index]) for index in range(n_vertices))
         return minimax_tau_integrate_chi_vertex
+
+    if fermi_dirac:
+        _fd_in = (_nodes_shard, _psi_mun_shard, _psi_nmu_shard,
+                  NamedSharding(mesh_xy, _rep2), NamedSharding(mesh_xy, _rep2),
+                  NamedSharding(mesh_xy, _rep0), NamedSharding(mesh_xy, _rep0))
+
+        @partial(jax.jit, in_shardings=_fd_in,
+                 out_shardings=tuple(_chi_R_shard for _ in range(n_out)))
+        def matsubara_tau_integrate_chi(nodes, psi_mun, psi_nmu, enk, live, beta, mu):
+            """chi(i nu_o) for every weight row o of one finite-temperature tau sweep."""
+            final_R = _integrate(nodes, psi_mun, psi_nmu, (enk, live, beta, mu), (None,))
+            return tuple(_finish_chi(final_R[index, 0]) for index in range(n_out))
+        return matsubara_tau_integrate_chi
 
     if n_out >= 2:
         @partial(jax.jit, in_shardings=_base_in,
@@ -322,8 +421,8 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
         def minimax_tau_integrate_chi_multi(
             nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
         ):
-            final_R = _integrate(nodes, psi_mun, psi_nmu, mask_v, mask_c,
-                                 enk_full, vmax, cmin, (None,))
+            final_R = _integrate(nodes, psi_mun, psi_nmu,
+                                 (mask_v, mask_c, enk_full, vmax, cmin), (None,))
             return tuple(_finish_chi(final_R[index, 0]) for index in range(n_out))
         return minimax_tau_integrate_chi_multi
 
@@ -332,8 +431,8 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
         nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
     ):
         return _finish_chi(_integrate(
-            nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full,
-            vmax, cmin, (None,))[0, 0])
+            nodes, psi_mun, psi_nmu, (mask_v, mask_c, enk_full, vmax, cmin),
+            (None,))[0, 0])
 
     return minimax_tau_integrate_chi
 
@@ -1345,6 +1444,101 @@ def compute_chi0_contour_ordered(
     )
     reflected = reflected[0] if z.size == 1 else reflected
     return primary, reflected
+
+
+# ----------------------------------------------------------------------------
+# Finite-temperature Matsubara response (Fermi-Dirac occupations).
+# The gapped producer above is its beta -> infinity instance on the same kernel.
+# ----------------------------------------------------------------------------
+
+#: Largest |f_kn - FD(e_kn)| the finite-temperature producer accepts; the Fermi-
+#: Dirac owner never clamps its table, so this is a consistency bound, not a dial.
+MATSUBARA_OCCUPATION_TOLERANCE = 1e-10
+
+#: Endpoint fields the Matsubara producer can contract today.  Current carriers
+#: (CT/TT) enter the same producer through this argument.
+MATSUBARA_VERTICES = ("charge",)
+
+
+def matsubara_rule(wfns, occupation_state, nu_indices, *, rel_tol):
+    """Resolve beta, mu, the live band count and the service tau rule for one occupation state.
+
+    Returns ``(beta, mu, live_stop, rule)``.  ``beta = 1 / smearing_width_ry`` of a
+    Fermi-Dirac state (no deck key); ``live_stop`` is the chi band window end
+    (``slices.cond.stop``); the rule is ``minimax.matsubara_response_rule`` over
+    the live bandwidth.  Refuses any family but Fermi-Dirac and an occupation
+    table that is not Fermi-Dirac at that (mu, beta).
+    """
+    import minimax
+
+    family = getattr(occupation_state, "smearing_family", None)
+    if family != "fd":
+        raise ValueError(
+            "GATE chi0_matsubara_needs_fermi_dirac: the finite-temperature producer "
+            "received a non-Fermi-Dirac occupation state.\n"
+            f"  got:  occupation_state.smearing_family = {family!r}\n"
+            "  want: 'fd' (beta = 1 / occ_smearing_width_ry)\n"
+            "  why:  KMS bounds every tau factor only for Fermi-Dirac occupations; "
+            "Methfessel-Paxton breaks it, and a step table is the gapped producer's beta -> infinity case\n"
+            "  doc:  docs/architecture/four_current_wiring.md")
+    beta = 1.0 / float(occupation_state.smearing_width_ry)
+    mu = float(occupation_state.mu_ry)
+    live_stop = int(wfns.slices.cond.stop)
+    energies = np.asarray(jax.device_get(wfns.enk), dtype=np.float64)[:, :live_stop]
+    occupied = np.asarray(jax.device_get(occupation_state.f_kn), dtype=np.float64)[:, :live_stop]
+    fermi_dirac = np.exp(-np.logaddexp(0.0, beta * (energies - mu)))
+    mismatch = float(np.max(np.abs(occupied - fermi_dirac)))
+    if not mismatch <= MATSUBARA_OCCUPATION_TOLERANCE:
+        raise ValueError(
+            "GATE chi0_matsubara_occupations: the occupation table is not Fermi-Dirac "
+            "at the state's (mu, beta).\n"
+            f"  got:  max|f - FD| = {mismatch!r} over the chi band window\n"
+            f"  want: <= {MATSUBARA_OCCUPATION_TOLERANCE!r}\n"
+            "  why:  the tau factors are rebuilt from energies; a different table would "
+            "describe another state")
+    rule = minimax.matsubara_response_rule(
+        beta, float(energies.max() - energies.min()), nu_indices, rel_tol=rel_tol)
+    return beta, mu, live_stop, rule
+
+
+def compute_chi0_matsubara(wfns, meta, mesh_xy, *, occupation_state, nu_indices,
+                           rel_tol, vertex="charge", ordered=False):
+    """chi0(q; i nu_n) at bosonic Matsubara frequencies from one finite-temperature tau sweep; see docs/architecture/four_current_wiring.md.
+
+    ``nu_n = 2 pi n / beta`` with ``beta = 1 / smearing_width_ry`` of a Fermi-Dirac
+    occupation state.  Every Green factor is KMS-bounded, ``f e^{(e-mu)tau}`` and
+    ``(1-f) e^{-(e-mu)tau}`` in (0, 1] for tau in [0, beta]: no mask, no energy
+    partition, no subtraction, and ``f_m - f_n`` (including the Fermi-surface
+    ``-df/de`` at ``n = 0``) appears only after the transform.  Exact at the
+    Matsubara points only.  ``vertex`` names the endpoint field (``"charge"``
+    today).  ``ordered=True`` returns the physical orientation ``FT_q[chi]``
+    (time reversal measured broken); otherwise the incumbent trace.  Returns
+    one flat-q ``(nq, mu, mu)`` array per index (a tuple for several), sharded
+    ``P(None, 'x', 'y')``.
+    """
+    if vertex not in MATSUBARA_VERTICES:
+        raise ValueError(
+            "GATE chi0_matsubara_vertex: got vertex "
+            f"{vertex!r}; want one of {MATSUBARA_VERTICES}; why: current carriers "
+            "enter this producer once their endpoint fields are gated")
+    beta, mu, live_stop, rule = matsubara_rule(
+        wfns, occupation_state, nu_indices, rel_tol=rel_tol)
+    carrier = wfns.green_parent if wfns.green_parent is not None else wfns
+    weights = -np.asarray(rule["weights"], dtype=np.complex128)
+    n_out = int(weights.shape[0])
+    nodes = MinimaxNodes(
+        t=jnp.asarray(rule["t"], dtype=jnp.complex128),
+        alpha=jnp.asarray(weights[0] if n_out == 1 else weights, dtype=jnp.complex128))
+    ensure_jax_compile_cache()
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    kernel = _get_chi_minimax_kernel(
+        mesh_xy, kgrid, n_out=n_out, occupations="fermi_dirac", ordered=ordered,
+        **_chi_parent_face_kwargs(wfns))
+    values = kernel(
+        nodes, carrier.psi_mun, carrier.psi_nmu, carrier.enk,
+        carrier.band_mask(slice(0, live_stop)),
+        jnp.asarray(beta, dtype=jnp.float64), jnp.asarray(mu, dtype=jnp.float64))
+    return values[0] if n_out == 1 else values
 
 
 def compute_no_pair_dirac_current_block(
