@@ -16,7 +16,7 @@ def run_checks(mesh):
     from jax.sharding import NamedSharding, PartitionSpec as P
     from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
     from gw.shared_pole_sectors import (cross_pencil_block,
-        joint_sector_pencil, reduce_sector_pencil)
+        joint_sector_pencil, reduce_sector_pencil, sector_cauchy_schwarz)
 
     assert jax.process_count() == 4 and mesh.size == 4
     batch = mesh.size
@@ -166,7 +166,18 @@ def run_checks(mesh):
         assert max(error,partner_error)<1e-12,(error,partner_error)
         rows.append(dict(name=f'consumer_components_{left_components}_{right_components}',
                          absolute_error=error,partner_error=partner_error))
-    assert len(rows)==9
+    def cs(c,ct,t):
+        return sector_cauchy_schwarz((c,ct,t),eigh_charge=native,
+                                    eigh_current=native,matmul=mm,gates=gates)
+    cs=jax.jit(shard_map(cs,mesh=mesh,in_specs=(spec,)*3,out_specs=spec,check_vma=False))
+    ct=np.array([[.3,0,0],[0,.4,0]],complex)
+    good=cs(put(np.eye(2,dtype=complex)),put(ct),put(np.eye(3,dtype=complex)))
+    red=cs(put(np.eye(2,dtype=complex)),put(3*ct),put(np.eye(3,dtype=complex)))
+    good_value=float(jnp.max(good['cauchy_schwarz_squared']))
+    red_value=float(jnp.max(red['cauchy_schwarz_squared']))
+    assert abs(good_value-.16)<1e-12 and abs(red_value-1.44)<1e-12
+    rows.append(dict(name='cauchy_schwarz',value=good_value,red_value=red_value))
+    assert len(rows)==10
     return rows
 
 
@@ -181,7 +192,8 @@ def main():
     mesh=resolve_mesh()
     rows=run_checks(mesh)
     rows.extend(run_store_checks(mesh,args.output.parent))
-    result=dict(status='PASS',checks=rows,expected_checks=14,
+    assert len(rows)==17
+    result=dict(status='PASS',checks=rows,expected_checks=17,
                 job=os.environ.get('SLURM_JOB_ID'),step=os.environ.get('SLURM_STEP_ID'),
                 source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
                 scope='P4 sector algebra, factor consumer and bitwise storage; no complete Sigma or production deck')
@@ -212,6 +224,7 @@ def run_store_checks(mesh,root):
                                       workspace_bytes_per_rank=0)
     meta.shared_pole_capacity.live_stages=('fixture_live_bound',)
     canonical,_,poles,counts=fixture._model(meta)
+    headers={}
     for sector in ('CC','TT','CT_C','CT_T'):
         components=3 if sector in ('TT','CT_T') else 1
         factor=np.concatenate([canonical*(1+1j*i) for i in range(components)],axis=2)
@@ -220,7 +233,9 @@ def run_store_checks(mesh,root):
         header=store.write_shared_pole_model(path,
             fixture._device(packed,mesh,P(None,'x',None,'y')),
             fixture._device(poles,mesh,P()),counts,q_span=(0,3),meta=meta,
-            tables=tables,recipe=recipe,receipts=dict(identity=identity),sector=sector)
+            tables=tables,recipe=recipe,receipts=dict(identity=identity),sector=sector,
+            ordered=sector.startswith('CT'))
+        headers[sector]=header
         store.validate_shared_pole_model(path,expected_identity=identity,mesh_xy=mesh,
                                         capacity=meta.shared_pole_capacity)
         with SlabIO(path,mode='r',mesh=mesh) as io:
@@ -230,6 +245,37 @@ def run_store_checks(mesh,root):
             np.testing.assert_array_equal(np.asarray(p),poles)
             np.testing.assert_array_equal(np.asarray(k),counts)
         rows.append(dict(name=f'{sector}_store_roundtrip',bitwise=True,digest=header['digest']))
+    with SlabIO(root/f'CT_C_{suffix}.h5',mode='r',mesh=mesh) as ci, \
+            SlabIO(root/f'CT_T_{suffix}.h5',mode='r',mesh=mesh) as ti:
+        x,y,p,k=store.read_shared_pole_cross_faces((ci,ti),(0,3),meta=meta,
+            headers=(headers['CT_C'],headers['CT_T']),bases=(meta.mu_basis,meta.mu_basis))
+        fixture._assert_local(x,meta.mu_basis.pack_host(canonical,axis=1))
+        fixture._assert_local(y,packed)
+        np.testing.assert_array_equal(np.asarray(p),poles)
+        bad=dict(headers['CT_T'],K=[2,5,2])
+        try:
+            store.read_shared_pole_cross_faces((ci,ti),(0,3),meta=meta,
+                headers=(headers['CT_C'],bad),bases=(meta.mu_basis,meta.mu_basis))
+        except ValueError as error:
+            assert 'disagree on K' in str(error)
+        else:
+            raise AssertionError('mismatched CT poles accepted')
+    rows.append(dict(name='CT_endpoint_pair',bitwise=True,mismatched_census_refused=True))
+    from types import SimpleNamespace
+    from gw.gw_config import (refuse_headless_shared_pole_self_consistency,
+                              QPSolver,HeadCorrection)
+    config=SimpleNamespace(sigma=SimpleNamespace(w_model='shared_pole'),
+        qp_solver=QPSolver.SELF_CONSISTENT,head=SimpleNamespace(correction=HeadCorrection.OFF),
+        bispinor=True,occ_smearing_width_ry=.02)
+    refuse_headless_shared_pole_self_consistency(config)
+    config.bispinor=False
+    try:
+        refuse_headless_shared_pole_self_consistency(config)
+    except ValueError as error:
+        assert 'shared_pole_self_consistent_needs_a_head' in str(error)
+    else:
+        raise AssertionError('scalar headless SC refusal changed')
+    rows.append(dict(name='headless_bispinor_metal_scope',passed=True))
     return rows
 
 

@@ -127,3 +127,37 @@ def reduce_sector_pencil(pencil, *, eigh, matmul, gates):
             jnp.where(active, values, 1), active), dict(
                 diagnostics, gram_valid=valid, gram_min_relative=ratio,
                 retained_metric_positive=corrected, retained_rank=count)
+
+
+def sector_cauchy_schwarz(metrics, *, eigh_charge, eigh_current, matmul, gates):
+    """Report the squared cross norm in a positive sector metric.
+
+    ``metrics=(C,CT,T)`` consists of [b,n_C,n_C], [b,n_C,n_T], and
+    [b,n_T,n_T] Hermitian diagonal metrics and a rectangular cross block,
+    for example the positive spectral moment. Cauchy--Schwarz is
+    ||C^(-1/2) CT T^(-1/2)||_2² <= 1. This is not an inequality on an
+    arbitrary complex-frequency W tile. No input is repaired or replaced.
+    A cross block outside either metric support is reported as infinity.
+    Service eigenplans and the caller's parent-local GEMM own all algebra.
+    """
+    c, cross, t = metrics
+    cutoff = gates["normalized_gram_keep"]["threshold"]
+
+    def inverse_root(a, eigh):
+        values, vectors = eigh(a)
+        keep = values > cutoff * values[:, -1:]
+        scale = keep / jnp.sqrt(jnp.where(keep, values, 1))
+        return (matmul(vectors * scale[:, None, :], vectors, transb="C"),
+                matmul(vectors * keep[:, None, :], vectors, transb="C"),
+                values[:, 0])
+
+    ic, pc, min_c = inverse_root(c, eigh_charge)
+    it, pt, min_t = inverse_root(t, eigh_current)
+    whitened = matmul(ic, matmul(cross, it))
+    eigenvalues, _ = eigh_charge(matmul(whitened, whitened, transb="C"))
+    norm = jnp.linalg.norm(cross, axis=(-2, -1))
+    outside = jnp.linalg.norm(cross-matmul(pc, matmul(cross, pt)), axis=(-2, -1))
+    defect = outside / jnp.maximum(norm, jnp.finfo(norm.dtype).tiny)
+    supported = defect <= gates["retained_subspace_moments"]["threshold"]
+    return dict(cauchy_schwarz_squared=jnp.where(supported, eigenvalues[:, -1], jnp.inf),
+                support_relative=defect, charge_metric_min=min_c, current_metric_min=min_t)

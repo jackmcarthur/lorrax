@@ -242,7 +242,8 @@ def _metadata(meta, tables, recipe, identity, ordered=None, *, basis=None, secto
     bank = ordered is None
     if bank:
         ordered = not bool(sym.trs_allowed)
-    elif bool(sym.trs_allowed) == bool(ordered):
+    elif (bool(sym.trs_allowed) == bool(ordered)
+          and not (ordered and sector in ("CT_C", "CT_T"))):
         _refuse("ordered representation requires authenticated broken TRS" if ordered
                 else "TRS-broken representation is unsupported")
     qt = tables["qirr"].logical(basis.n_logical).canonical()
