@@ -38,48 +38,11 @@ def _fit_roles(recipe):
                 recipe["distinct_id"], recipe["role"], recipe["held"]))]
 
 
-@lru_cache(maxsize=256)
-def _parent_panel_slice(mesh_xy, width):
-    """Slice [b,n,r] direction/action faces without a host or replicated seam."""
-    return jax.jit(
-        lambda arrays, parent: jax.tree.map(
-            lambda a: jax.lax.dynamic_slice_in_dim(a, parent, 1, axis=0)[:, :, :width], arrays),
-        out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
-
-
-
-@lru_cache(maxsize=None)
-def _parent_result_slice(mesh_xy):
-    """Slice a parent's padded factor and scalar receipts in one executable."""
-    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    scalar = NamedSharding(mesh_xy, P())
-    return jax.jit(
-        lambda result, parent: jax.tree.map(
-            lambda a: jax.lax.dynamic_slice_in_dim(a, parent, 1, axis=0), result),
-        out_shardings=((face, scalar, scalar), scalar, scalar, scalar))
-
-
-@lru_cache(maxsize=None)
-def _hermitian_part_kernel(mesh):
-    """Reuse Hermitian projection on current [b,n,n] response faces."""
-    return jax.jit(hermitian_part, out_shardings=NamedSharding(mesh, P(None, 'x', 'y')))
-
-
 @lru_cache(maxsize=None)
 def _public_factor_kernel(mesh):
     """Insert the scalar-spin axis without recreating the executable."""
     return jax.jit(lambda value: value[:, :, None, :],
                    out_shardings=NamedSharding(mesh, P(None, 'x', None, 'y')))
-
-
-@lru_cache(maxsize=None)
-def _stack_model_kernel(mesh):
-    """Stack the current admitted factor/pole/count batch on named layouts."""
-    return jax.jit(
-        lambda parts: tuple(jnp.concatenate([row[i] for row in parts], axis=0)
-                            for i in range(3)),
-        out_shardings=(NamedSharding(mesh, P(None, 'x', None, 'y')),
-                       NamedSharding(mesh, P()), NamedSharding(mesh, P())))
 
 
 @lru_cache(maxsize=None)

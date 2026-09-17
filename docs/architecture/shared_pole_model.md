@@ -19,7 +19,8 @@ and `M_k` the physical high-frequency moments.
 | §4, §5 the two pencils | `gw.shared_pole_pencil` |
 | §4, §6 reduction, paired basis and cut | `gw.shared_pole_reduction` |
 | §6 dedupe, §9 measured gates | `gw.shared_pole_gates` |
-| the chain that calls them, per parent | `gw.shared_pole_constructor` |
+| the chain that calls them, per round of parents | `gw.shared_pole_constructor` |
+| rounds, partner exchange tables, the round program | `gw.shared_pole_local` |
 | §10 the byte model and its ledger rows | `gw.shared_pole_capacity` |
 | §7 the store | `file_io.shared_pole_store` |
 | §8 the Σ consumer | `gw.mpa.sigma` |
@@ -169,9 +170,15 @@ with time reversal: `W Q ∈ span(Q)`. Only the component of `O = W Q` orthogona
 survives, so a time-reversal-symmetric bank adds no partner columns and the ordered model equals the even one at
 equal rank.
 
-**Face layout.** Every `[b, R, R]` block of both pencils is assembled and symmetrized through `distrib_la` face
-blocks (`hermitian_block`, `hermitian_part`, `join_columns`, `on_face`): eager concatenation and `a + a^†` of
-face-sharded operands would come out replicated on every rank.
+**Layout.** The constructor reduces one round of parents at a time, one parent per rank (batch layout
+`P(('x','y'), ...)`): `gw.shared_pole_local.round_program` packs each parent's panels to the round extent
+(`round_tables`; ordered originals and mirrors as two halves of one extent), assembles and reduces its pencil with
+local dense kernels, and sorts its poles, all on that rank; synthetic slots are skipped. A round refuses before it
+runs if eight `[R, R]` blocks and the eigh workspace do not fit one device (`distrib_la.fits_local`). Receipts report
+each parent at its own extent: the round padding's zeros are dropped from the Gram spectrum
+(`own_extent_receipts`). Called on face stacks instead, the same blocks are assembled and symmetrized through
+`distrib_la` face blocks (`hermitian_block`, `hermitian_part`, `join_columns`, `on_face`): eager concatenation and
+`a + a^†` of face-sharded operands would come out replicated on every rank.
 
 ## 7 Store schema
 
@@ -250,9 +257,9 @@ Fast CPU tests (4 host devices where a mesh is needed):
 
 Per rank on an `x × y` mesh with `P = Px Py` and pencil side `R`:
 
-$$ \text{reduction} \approx 16\,\big(14 R^2 + 12 n R\big)/P + 16\cdot 3 n r/P + \text{native eigh workspace}, \tag{SP 17} $$
+$$ \text{reduction} \approx 16\,\big(14 R^2 + 12 n R\big)\,b/P + 16\cdot 3 n r\,b/P + \text{native eigh workspace}, \tag{SP 17} $$
 
 (`shared_pole_capacity.shared_pole_byte_terms`; `ConstructorCapacity` beside it turns those terms into the map
-ledger's rows). Every `[b, R, R]` block stays on the x/y face (§6). The native cuSOLVERMp eigh adds a
+ledger's rows). A round has `b = P`: every rank holds one whole parent (§6). The native cuSOLVERMp eigh adds a
 private operand tile of `n²/P` next to its workspace, which `distrib_la.workspace_bytes_per_rank` includes; a byte
 model without that tile under-counts the measured CrI3 q=1 construction peak (2.140 against 2.907 GiB per rank).

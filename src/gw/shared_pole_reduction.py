@@ -155,6 +155,9 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, ke
     return (b, poles, active), diagnostics, scale[:, :, None] * coefficients
 
 
+ORIENTATION_PAIR_REFUSAL = ("GATE shared_pole_orientation_pair: got: finite columns not in mirrored halves; want: [X(z); X(-z)] on one direction set and paired k0/k1 columns; why: the ordered cut acts in the paired basis")
+
+
 def _paired_member(a, inverse, *, half, finite, n_inf):
     """One pencil member [b,R,R] in the paired basis: its (ww, wv, vv) blocks."""
     def columns(x):
@@ -223,8 +226,9 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     paired = (jnp.all(points[:, half:] == -points[:, :half])
               & jnp.all(active_columns[:, half:finite] == active_columns[:, :half])
               & jnp.all(active_columns[:, finite + n_inf:] == active_columns[:, finite:finite + n_inf]))
-    if not bool(paired):
-        raise ValueError("GATE shared_pole_orientation_pair: got: finite columns not in mirrored halves; want: [X(z); X(-z)] on one direction set and paired k0/k1 columns; why: the ordered cut acts in the paired basis")
+    # Traced (a round program): the caller refuses on diagnostics["orientation_paired"].
+    if not isinstance(paired, jax.core.Tracer) and not bool(paired):
+        raise ValueError(ORIENTATION_PAIR_REFUSAL)
     face = face_sharding(g)
     output_face = face if face_sharding(output) is None else face_sharding(output)
     statics = dict(half=half, finite=finite, n_inf=n_inf)
@@ -328,5 +332,6 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
         "negative_count": jnp.sum(retained & (mu < 0), axis=-1, dtype=jnp.int64),
         "infinite_weight_fraction": infinite,
         "infinite_weight_ok": infinite <= budget,
+        "orientation_paired": jnp.broadcast_to(paired, count.shape),
     }
     return (b, poles2, positive), (c, mu, retained), diagnostics

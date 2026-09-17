@@ -240,134 +240,107 @@ def test_ordered_equals_even_construction_on_time_reversal_symmetric_data():
         assert rel(_signed_value(signed, -z), even) < 1e-12
 
 
-def test_round_selection_pairs_mirrors_on_the_same_directions():
-    """Round selection on a q = -q TR-broken plant (every slot its own partner, identity realization):
-    each mirror X(-node) sits on its original's directions, an imaginary support mirrors on its own
-    sample, the conjugate O panels are the next state's directions, and the production
-    pack/assemble/reduce path reproduces the plant."""
+def _round_setup():
     import jax
-    import jax.numpy as jnp
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from jax.sharding import Mesh, PartitionSpec as P
     from lxkit.testing import require_devices
     import distrib_la as D
     from runtime.padding import padded_axis
-    from shared_pole_round_helpers import round_states
-    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil
-    from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil
-    from gw.shared_pole_local import pack_parent_panels
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     require_devices(4, "cpu")
     mesh = Mesh(np.asarray(jax.devices("cpu")[:4]).reshape(2, 2), ("x", "y"))
-    n = 8
-    plant = _trim(np.random.default_rng(41), 6, n, eps=.4)
-    face = NamedSharding(mesh, P(None, "x", "y"))
-
-    def put(a):
-        a = np.ascontiguousarray(np.asarray(a, np.complex128)[None])
-        return jax.make_array_from_callback(a.shape, face, lambda i: a[i])
-
-    extent = lambda width: padded_axis(width, mesh, name="pair_port",
+    extent = lambda width: padded_axis(width, mesh, name="round_port",
                                        specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
-    ep = D.plan("eigh", mesh, n=n, backend="off", batched_route="batch_reshard")
-    sp = D.plan("eigh", mesh, n=2 * n, backend="off", batched_route="batch_reshard")
-    mm = lambda a, b, **kw: D.matmul(a, b, mesh=mesh, backend="off", batched_route="batch_reshard", **kw)
+    ep = D.plan("eigh", mesh, n=8, backend="off", batched_route="batch_reshard")
+    sp = D.plan("eigh", mesh, n=16, backend="off", batched_route="batch_reshard")
+    return mesh, extent, ep, sp
+
+
+def _round_infinity(mesh, plants, orders):
+    """Infinity panels (Q_inf, M_k Q_inf) of each slot's plant in batch layout, two directions."""
+    from gw.shared_pole_local import _batch_put
+    qi = [np.linalg.eigh(p.moment(1))[1][:, -2:] for p in plants]
+    return tuple(_batch_put(mesh, np.stack([q if k is None else p.moment(k) / 2 @ q for p, q in zip(plants, qi)]))
+                 for k in (None, *orders))
+
+
+def test_round_program_pairs_mirrors_on_parents_of_different_sides():
+    """Round selection and the round program on a q = -q TR-broken round of two parents with
+    different pencil sides (slots 2, 3 synthetic; every slot its own partner, identity realization):
+    each mirror X(-node) sits on its original's directions, an imaginary support mirrors on its own
+    sample, the conjugate O panels are the next state's directions, every real slot is in the paired
+    layout and its signed model reproduces its plant. RED TWIN: unmirrored nodes are refused."""
+    import jax
+    from shared_pole_round_helpers import round_states
+    from gw.shared_pole_local import reduce_round, round_tables
+    mesh, extent, ep, sp = _round_setup()
+    n = 8
+    plants = [_trim(np.random.default_rng(41), 6, n, eps=.4), _trim(np.random.default_rng(42), 3, n, eps=.4)]
+    slot_plants = [plants[0], plants[1], plants[1], plants[1]]
     nodes = [.9 + .35j, 1.7 + .6j, .5j]
     recipe = dict(fit_ids=[0, 1, 2], distinct_id=[0, 1, 2], role=[0, 0, 1], held=[False] * 3,
                   z_ry=[dict(real=v.real, imag=v.imag) for v in nodes], direction_cutoff=1e-3,
                   imaginary_width=4, multiplet_relative_tolerance=1e-6)
     states, counts, roles = round_states(
-        mesh, lambda slot, i: (plant.F(nodes[i]), plant.dF(nodes[i]) / (2 * nodes[i])), recipe,
-        n=n, eig=ep, svd=sp, extent=extent, ordered=True)
+        mesh, lambda slot, i: (slot_plants[slot].F(nodes[i]), slot_plants[slot].dF(nodes[i]) / (2 * nodes[i])),
+        recipe, n=n, eig=ep, svd=sp, extent=extent, ordered=True, real=2, batch=True)
     half = len(states) // 2
     assert len(states) == 12
     for i in range(half):
         assert states[half + i][0] == -states[i][0] and states[half + i][1] is states[i][1]
     assert states[1][1] is states[0][2] and states[3][1] is states[2][2]
     assert all(row.get("mirror") for row in roles[0][half:]) and not any(row.get("mirror") for row in roles[0][:half])
-    qi = np.linalg.eigh(plant.moment(1))[1][:, -2:]
-    infinity = tuple(put(a) for a in (qi, *(plant.moment(k) / 2 @ qi for k in range(4))))
-    packed, _ = pack_parent_panels(states, infinity, counts, [2], mesh_xy=mesh, parent_batch=1, layout="distributed")
-    finite, infinity_p, active, _ = jax.tree.map(lambda a: a[:1], packed)
-    rf = active.shape[-1] - infinity_p[0].shape[-1]
-    active = jnp.concatenate((active, active[:, rf:]), axis=-1)
-    pencil = assemble_ordered_shared_pole_pencil([finite], infinity_p, matmul=mm)
-    _, signed, diag = reduce_ordered_shared_pole_pencil(pencil, active, eigh=ep.batched, matmul=mm, gates=gates)
-    assert bool(diag["gram_valid"][0])
-    c, mu, kept = (np.asarray(a)[0] for a in signed)
-    for zz in ZS:
-        assert rel((c[:, kept] / (zz * mu[kept] - 1)) @ adj(c[:, kept]), plant.F(zz)) < 1e-10
+    infinity = _round_infinity(mesh, slot_plants, range(4))
+    tables = round_tables(counts, [st[1].shape[-1] for st in states], [st[0] for st in states], [2, 2, 0, 0], 2,
+                          column_extent=extent, ordered=True, odd_moments=True)
+    assert tables["own"][0] != tables["own"][1]
+    run = lambda t: reduce_round(states, infinity, t, real=2, mesh_xy=mesh, native_eigh=ep.native_fn,
+                                 ordered=True, odd_moments=True, keep_budget=None)
+    _, signed, (diag, _, _, _) = run(tables)
+    diag = jax.tree.map(np.asarray, diag)
+    assert diag["orientation_paired"][:2].all() and diag["gram_valid"][:2].all()
+    c, mu, kept = (np.asarray(a) for a in signed)
+    for slot, plant in enumerate(plants):
+        cs, ms = c[slot][:, kept[slot]], mu[slot][kept[slot]]
+        for zz in ZS:
+            assert rel((cs / (zz * ms - 1)) @ adj(cs), plant.F(zz)) < 1e-10
+    points = tables["points"].copy()
+    points[:, points.shape[1] // 2:] = points[:, :points.shape[1] // 2]
+    _, _, (bad, _, _, _) = run(dict(tables, points=points))
+    assert not np.asarray(bad["orientation_paired"])[:2].any()
 
 
 def test_dedupe_drops_duplicate_partners_and_equals_even_on_symmetric_data():
     """On a TRS plant the imaginary-role and Re z = 0 partners of W Q lie in span(Q); the dedupe drops them, and the
-    ordered model built through the round selection, pack, assemble and reduce equals the even model at the production
+    ordered model built through the round selection and the round program equals the even model at the production
     cut (the planted analogue of the MoS2 P3 gate)."""
     import jax
-    import jax.numpy as jnp
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-    from lxkit.testing import require_devices
-    import distrib_la as D
-    from runtime.padding import padded_axis
     from shared_pole_round_helpers import round_states
-    from gw.shared_pole_gates import apply_shared_pole_zero_policy
-    from gw.shared_pole_pencil import (assemble_ordered_shared_pole_pencil,
-                                       assemble_shared_pole_pencil)
-    from gw.shared_pole_reduction import (reduce_ordered_shared_pole_pencil,
-                                          reduce_shared_pole_pencil)
-    from gw.shared_pole_local import pack_parent_panels
-    from gw.shared_pole_recipe import (shared_real_pole_gates_ordered_v1 as ordered_gates,
-                                       shared_real_pole_gates_v1_r3b as even_gates)
-    require_devices(4, "cpu")
-    mesh = Mesh(np.asarray(jax.devices("cpu")[:4]).reshape(2, 2), ("x", "y"))
+    from gw.shared_pole_local import reduce_round, round_tables
+    mesh, extent, ep, sp = _round_setup()
     n = 8
     plant = _trim(np.random.default_rng(43), 6, n, eps=0.)
-    face = NamedSharding(mesh, P(None, "x", "y"))
-
-    def put(a):
-        a = np.ascontiguousarray(np.asarray(a, np.complex128)[None])
-        return jax.make_array_from_callback(a.shape, face, lambda i: a[i])
-
-    extent = lambda width: padded_axis(width, mesh, name="dedupe_port",
-                                       specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
-    ep = D.plan("eigh", mesh, n=n, backend="off", batched_route="batch_reshard")
-    sp = D.plan("eigh", mesh, n=2 * n, backend="off", batched_route="batch_reshard")
-    mm = lambda a, b, **kw: D.matmul(a, b, mesh=mesh, backend="off", batched_route="batch_reshard", **kw)
     nodes = [.9 + .35j, 1.7 + .6j, .5j, .35j]
-    roles = [0, 0, 1, 0]
-
-    def recipe(ordered):
-        return dict(fit_ids=list(range(4)), distinct_id=list(range(4)), role=roles, held=[False] * 4,
-                    z_ry=[dict(real=v.real, imag=v.imag) for v in nodes], direction_cutoff=1e-3,
-                    imaginary_width=4, multiplet_relative_tolerance=1e-6)
-
-    qi = np.linalg.eigh(plant.moment(1))[1][:, -2:]
+    recipe = dict(fit_ids=list(range(4)), distinct_id=list(range(4)), role=[0, 0, 1, 0], held=[False] * 4,
+                  z_ry=[dict(real=v.real, imag=v.imag) for v in nodes], direction_cutoff=1e-3,
+                  imaginary_width=4, multiplet_relative_tolerance=1e-6)
     models, ranks = {}, {}
     for label, ordered in (("even", False), ("ordered", True)):
-        states, counts, rows = round_states(
-            mesh, lambda slot, i: (plant.F(nodes[i]), plant.dF(nodes[i]) / (2 * nodes[i])), recipe(ordered),
-            n=n, eig=ep, svd=sp, extent=extent, ordered=ordered)
+        states, counts, _ = round_states(
+            mesh, lambda slot, i: (plant.F(nodes[i]), plant.dF(nodes[i]) / (2 * nodes[i])), recipe,
+            n=n, eig=ep, svd=sp, extent=extent, ordered=ordered, batch=True)
         if ordered:
             assert len(states) == 12
-            infinity = tuple(put(a) for a in (qi, *(plant.moment(k) / 2 @ qi for k in range(4))))
-        else:
-            infinity = tuple(put(a) for a in (qi, plant.moment(1) / 2 @ qi, plant.moment(3) / 2 @ qi))
-        packed, _ = pack_parent_panels(states, infinity, counts, [2], mesh_xy=mesh, parent_batch=1, layout="distributed")
-        finite, infinity_p, active, _ = jax.tree.map(lambda a: a[:1], packed)
-        if ordered:
-            rf = active.shape[-1] - infinity_p[0].shape[-1]
-            active = jnp.concatenate((active, active[:, rf:]), axis=-1)
-            pencil = assemble_ordered_shared_pole_pencil([finite], infinity_p, matmul=mm)
-            model, _, diag = reduce_ordered_shared_pole_pencil(pencil, active, eigh=ep.batched, matmul=mm,
-                                                               gates=ordered_gates)
-            model, _ = apply_shared_pole_zero_policy(model, gates=ordered_gates)
-        else:
-            pencil = assemble_shared_pole_pencil([finite], infinity_p, matmul=mm)
-            model, diag, _ = reduce_shared_pole_pencil(pencil, active, eigh=ep.batched, matmul=mm, gates=even_gates)
-            model, _ = apply_shared_pole_zero_policy(model, gates=even_gates)
+        infinity = _round_infinity(mesh, [plant] * 4, range(4) if ordered else (1, 3))
+        tables = round_tables(counts, [st[1].shape[-1] for st in states], [st[0] for st in states], [2] * 4, 2,
+                              column_extent=extent, ordered=ordered, odd_moments=True)
+        model, _, (diag, zero, _, _) = reduce_round(states, infinity, tables, real=4, mesh_xy=mesh,
+                                                    native_eigh=ep.native_fn, ordered=ordered, odd_moments=True,
+                                                    keep_budget=None)
+        assert bool(np.asarray(zero["zero_policy"]).all())
         b, poles, act = (np.asarray(a)[0] for a in model)
         models[label] = (b[:, act], poles[act])
         ranks[label] = int(np.asarray(diag["retained_rank"])[0])
-    assert ranks["ordered"] == ranks["even"] < pencil[0].shape[-1]
+    assert ranks["ordered"] == ranks["even"] < tables["active"].shape[-1]
     assert models["ordered"][0].shape[-1] == models["even"][0].shape[-1]
     for zz in ZS:
         value = lambda m: (m[0] / (zz**2 - m[1])) @ adj(m[0])

@@ -6,9 +6,6 @@ rows these feed are listed in docs/architecture/shared_pole_model.md section 9.
 
 from __future__ import annotations
 
-from functools import lru_cache, partial
-
-import jax
 import jax.numpy as jnp
 from distrib_la import hermitian_part
 from gw.shared_pole_pencil import _adjoint
@@ -146,55 +143,18 @@ def apply_shared_pole_zero_policy(model, *, gates):
     }
 
 
-@lru_cache(maxsize=None)
-def _factor_column_permutation(mesh):
-    """Stream a joint pole-column permutation through one y tile at a time.
-
-    A global gather of b replicates the complete K axis on each x row.
-    Instead, each y shard circulates its input tile and selects only the
-    columns belonging to its output tile. The scan carries one input tile
-    and one output tile; neither grows with the number of y shards.
-    """
-    from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
-
-    ny = int(mesh.shape["y"])
-    neighbors = tuple((i, (i+1) % ny) for i in range(ny))
-
-    @jax.jit
-    @partial(shard_map, mesh=mesh,
-             in_specs=(P(None, "x", "y"), P(None, "y")),
-             out_specs=P(None, "x", "y"), check_vma=False)
-    def permute(factor, order):
-        width = factor.shape[-1]
-        def visit(carry, _):
-            tile, output, source = carry
-            local = order - source * width
-            selected = jnp.take_along_axis(
-                tile, jnp.clip(local, 0, width-1)[:, None, :], axis=-1)
-            belongs = (local >= 0) & (local < width)
-            output = jnp.where(belongs[:, None, :], selected, output)
-            tile = jax.lax.ppermute(tile, "y", neighbors)
-            return (tile, output, (source-1) % ny), None
-        # unroll=1 (the default): the carry is a whole face tile, so unrolling
-        # would hold one copy per y shard instead of one.
-        (_, output, _), _ = jax.lax.scan(
-            visit, (factor, jnp.zeros_like(factor), jax.lax.axis_index("y")),
-            None, length=ny, unroll=1)
-        return output
-    return permute
-
-
-def sort_shared_pole_columns(model, *, mesh_xy):
+def sort_shared_pole_columns(model):
     """Sort joint active b/Lambda columns, retaining ties and safe padding.
 
-    Returns the same three model arrays and the replicated [b,Kp]
-    permutation. Active entries form a prefix, inactive b is exactly zero,
-    inactive Lambda is 1 Ry**2. Stable sorting preserves equal-pole order.
+    Returns the same three model arrays and the [b,Kp] permutation. Active
+    entries form a prefix, inactive b is exactly zero, inactive Lambda is
+    1 Ry**2. Stable sorting preserves equal-pole order. The factor is taken
+    along its column axis where it lives: the round program sorts each
+    parent on its own rank.
     """
     b, poles, active = model
     order = jnp.argsort(jnp.where(active, poles, jnp.inf), axis=-1, stable=True)
-    b = _factor_column_permutation(mesh_xy)(b, order)
+    b = jnp.take_along_axis(b, order[:, None, :], axis=-1)
     poles = jnp.take_along_axis(poles, order, axis=-1)
     active = jnp.take_along_axis(active, order, axis=-1)
     return (jnp.where(active[:, None, :], b, 0), jnp.where(active, poles, 1), active), order

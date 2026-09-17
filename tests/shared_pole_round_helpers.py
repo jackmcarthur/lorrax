@@ -4,14 +4,15 @@
 matrices for every fitted sample of every mesh rank's slot in batch layout, runs
 ``gw.shared_pole_directions.select_round_states`` over the round, and returns the chosen slot's
 states as [1, n, r] face panels (a conjugate state's direction stays the same object as its O
-panel), its counts [1, A] and role records. Ordered rounds exchange with ``partners`` (default:
-every slot is its own partner, identity realization), which is exact for a q = -q plant.
+panel), its counts [1, A] and role records; ``batch=True`` returns the whole round as selected
+(batch layout, counts [P, A]). Ordered rounds exchange with ``partners`` (default: every slot is
+its own partner, identity realization), which is exact for a q = -q plant.
 """
 import numpy as np
 
 
 def round_states(mesh, sample, recipe, *, n, eig, svd, extent, ordered=False, slot=0, real=None,
-                 partners=None, tables=None):
+                 partners=None, tables=None, batch=False):
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
     from gw.shared_pole_directions import select_round_states
@@ -20,8 +21,8 @@ def round_states(mesh, sample, recipe, *, n, eig, svd, extent, ordered=False, sl
     ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
     fit = [int(i) for i in recipe["fit_ids"]]
     lo, hi = min(fit), max(fit) + 1
-    batch = NamedSharding(mesh, P(("x", "y")))
-    put = lambda a: jax.make_array_from_callback(a.shape, batch, lambda idx: a[idx])
+    layout = NamedSharding(mesh, P(("x", "y")))
+    put = lambda a: jax.make_array_from_callback(a.shape, layout, lambda idx: a[idx])
     w = np.zeros((ranks, hi - lo, n, n), np.complex128)
     d = np.zeros_like(w)
     for r in range(ranks):
@@ -38,6 +39,8 @@ def round_states(mesh, sample, recipe, *, n, eig, svd, extent, ordered=False, sl
         dict(Wc=put(w), dWc_ds=put(d)), recipe, sample_lo=lo, real=ranks if real is None else real,
         mesh_xy=mesh, eigh_plan=eig, svd_plan=svd, column_extent=extent, logical_n=n, ordered=ordered,
         exchange=exchange)
+    if batch:
+        return states, counts, roles
     to_face, take = batch_to_face(mesh), face_rows(mesh, (slot,))
     moved = {}
 

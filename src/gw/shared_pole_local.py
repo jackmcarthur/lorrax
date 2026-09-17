@@ -1,8 +1,9 @@
-"""Bounded q-local execution of the shared-pole pencil owners.
+"""Rounds of shared-pole parents, one parent per mesh rank (batch layout).
 
-Only narrow Q/WQ/dWQ panels enter this boundary. The common staged movement
-puts complete parents on distinct mesh ranks; local dense kernels implement
-the same Hermite/Ritz equations as the distributed constructor.
+The round schedule and its partner table, the packed -q realization, the
+column tables and the one round program that packs, assembles, reduces, gates
+and sorts every parent of a round on its own rank with local dense kernels,
+and the restore of round results to the face.
 """
 from functools import lru_cache
 
@@ -95,9 +96,7 @@ def partner_realization(meta, header, ids, partner_parent, partner_row, *, mesh_
     q(p') . L_s) on the packed rows, so R_s[W] = Phi Pi W Pi^T Phi^*. Host tables
     only; each rank receives its own slot's rows.
     """
-    import jax
     import numpy as np
-    from jax.sharding import NamedSharding, PartitionSpec as P
     from gw.qgrid_symmetry import shared_pole_packed_action
 
     packed, wraps, _ = shared_pole_packed_action(meta, header, mesh_xy=mesh_xy)
@@ -108,256 +107,180 @@ def partner_realization(meta, header, ids, partner_parent, partner_row, *, mesh_
     inverse = np.argsort(alpha, axis=1).astype(np.int32)
     phase = np.exp(2j * np.pi * np.einsum('ri,rmi->rm', q_frac[parents],
                                           np.asarray([wraps[s] for s in rows], np.float64)))
-    batch = NamedSharding(mesh_xy, P(BATCH))
-    put = lambda a: jax.make_array_from_callback(a.shape, batch, lambda idx: a[idx])
-    return put(alpha), put(inverse), put(phase.astype(np.complex128))
+    return (_batch_put(mesh_xy, alpha), _batch_put(mesh_xy, inverse),
+            _batch_put(mesh_xy, phase.astype(np.complex128)))
 
 
-def pack_parent_panels(states, infinity, counts, infinity_counts, *, mesh_xy, parent_batch,
-                       layout):
-    """Compact batched tangential panels into their original pencil columns.
+def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, column_extent, ordered,
+                 odd_moments):
+    """Host column tables of one round: each slot's states packed into its pencil columns.
 
-    ``states`` contains (s,Q,WQ,dWQ), with s scalar Ry² and complex128
-    [b,n,r_a] face panels. ``counts`` is host int [b,A] from spectral cuts;
-    ``infinity_counts`` is host int [b]. Only O(bR) offsets/masks cross to
-    the device. Panels stay face-tiled through the existing y permutation.
-    In the resolved local layout, reused Q objects and WQ partner directions
-    are transported once; a [b,R_f] column map restores them after movement.
-    The distributed layout retains its original complete Q face.
-    Return the finite/infinity/mask/map bundle and original (R_f,r_inf)
-    extents. No physical or native eigensolve dimension changes.
+    ``counts`` int [P, A] retained widths per slot and state, ``widths`` the A
+    panel widths, ``nodes`` the A state nodes (s, or z on the ordered route),
+    ``infinity_counts`` [P] retained infinity widths of the [P, n,
+    ``infinity_width``] infinity panels. A state keeps its carrier
+    ``column_extent(count)`` with the inert tail inside, as a per-parent pack
+    does; each slot is compacted in state order and padded with zero columns to
+    the round extent. An ordered round packs originals (the first A/2 states) and
+    mirrors (the last A/2) as two halves of one extent, so every slot stays in the
+    paired layout [X(z); X(-z)].
+
+    Returns a dict: ``order`` int32 [P, F] (index sum(widths) is the zero
+    column), ``points`` complex128 [P, F], ``active`` bool [P, side] (finite
+    columns, then the infinity block; k0 and k1 on an odd-moment ordered round,
+    none on a finite-state ordered bank), and ``own`` [P], each slot's Gram
+    spectrum length at its own extent, for the receipt.
     """
     import numpy as np
-    from runtime.padding import padded_axis
-    from jax.sharding import PartitionSpec as P
 
-    def extent(width):
-        return padded_axis(int(width), mesh_xy, name="shared_pole_port",
-                           specs=((P('x', 'y'), 0), (P('x', 'y'), 1))).carrier
-    carriers = [[extent(n) for n in row] for row in counts]
-    extents = tuple((sum(row), extent(ni))
-                    for row, ni in zip(carriers, infinity_counts))
-    rf = max(nf for nf, _ in extents)
-    ri = infinity[0].shape[-1]
-    widths = [state[1].shape[-1] for state in states]
-    offsets = np.cumsum([0, *widths[:-1]])
-    # Object identity is the constructor's explicit reuse of the same Q.
-    # Never merge distinct directions using support or numerical equality.
-    if layout not in ("local", "distributed"):
-        raise ValueError(f"unknown shared-pole panel layout: {layout}")
-    sources = []
-    source_for = []
-    output_for = []
-    for i, state in enumerate(states):
-        output_source = next((j for j, previous in enumerate(states[:i])
-                              if layout == "local" and state[1] is previous[2]), None)
-        source = next((j for j in sources if layout == "local"
-                       and state[1] is states[j][1]), i)
-        if source == i and output_source is None:
-            sources.append(i)
-        source_for.append(source)
-        output_for.append(output_source)
-    sources = tuple(sources)
-    unique_widths = [widths[i] for i in sources]
-    unique_offsets = np.cumsum([0, *unique_widths[:-1]])
-    unique_counts = np.asarray([sum(row[i] for i in sources) for row in carriers], np.int32)
-    unique_width = int(max(unique_counts))
-    unique_order = np.empty((len(counts), sum(unique_widths)), np.int32)
-    columns = np.full((len(counts), rf), -1, np.int32)
-    order = np.empty((len(counts), sum(widths)), np.int32)
-    active = np.zeros((len(counts), rf + ri), bool)
-    for q, (row, retained) in enumerate(zip(carriers, counts)):
-        selected = [int(start)+i for start, width in zip(offsets, row)
-                    for i in range(width)]
-        tail = np.ones(sum(widths), bool)
-        tail[selected] = False
-        order[q] = selected + np.flatnonzero(tail).tolist()
-        selected_q = [int(start)+i for start, port in zip(unique_offsets, sources)
-                      for i in range(row[port])]
-        tail_q = np.ones(sum(unique_widths), bool)
-        tail_q[selected_q] = False
-        unique_order[q] = selected_q + np.flatnonzero(tail_q).tolist()
-        packed_offsets = dict(zip(sources, np.cumsum([0, *[row[i] for i in sources[:-1]]])))
-        output_offsets = np.cumsum([0, *row[:-1]])
-        start = 0
-        for port, (width, count) in enumerate(zip(row, retained)):
-            output_source = output_for[port]
-            source = source_for[port] if output_source is None else output_source
-            if (width, count) != (row[source], retained[source]):
-                raise ValueError("identical Q ports must have identical retained counts")
-            if output_source is None:
-                columns[q, start:start+width] = packed_offsets[source] + np.arange(width)
-            else:
-                # -1 is padding; <=-2 addresses an already transported WQ.
-                columns[q, start:start+width] = -2-output_offsets[source]-np.arange(width)
-            active[q, start:start+int(count)] = True
-            start += width
-        active[q, rf:rf+int(infinity_counts[q])] = True
-    packed = _parent_panel_packer(mesh_xy, rf, parent_batch, sources, unique_width)(
-        tuple(states), infinity, order, active,
-        np.asarray([nf for nf, _ in extents], np.int32), unique_order,
-        unique_counts, columns)
-    return packed, extents
+    counts = np.asarray(counts, np.int64)
+    ranks, states = counts.shape
+    offsets = np.concatenate(([0], np.cumsum(widths))).astype(np.int64)
+    carriers = np.asarray([[column_extent(int(c)) for c in row] for row in counts], np.int64)
+    halves = (range(states // 2), range(states // 2, states)) if ordered else (range(states),)
+    extent = max(int(carriers[:, list(half)].sum(axis=1).max()) for half in halves)
+    order = np.full((ranks, extent * len(halves)), offsets[-1], np.int32)
+    points = np.zeros(order.shape, np.complex128)
+    live = np.zeros(order.shape, bool)
+    for r in range(ranks):
+        for k, half in enumerate(halves):
+            at = k * extent
+            for a in half:
+                c = int(carriers[r, a])
+                order[r, at:at + c] = offsets[a] + np.arange(c)
+                points[r, at:at + c] = nodes[a]
+                live[r, at:at + int(counts[r, a])] = True
+                at += c
+    blocks = (2 if odd_moments else 0) if ordered else 1
+    tail = np.arange(infinity_width)[None, :] < np.asarray(infinity_counts)[:, None]
+    own = (carriers[:, list(halves[0])].sum(axis=1)
+           + np.asarray([column_extent(int(c)) if blocks else 0 for c in infinity_counts], np.int64))
+    return dict(order=order, points=points, active=np.concatenate((live,) + (tail,) * blocks, axis=1), own=own)
+
+
+def own_extent_receipts(reduction, own):
+    """Per-slot receipt rows of a round reduction at each parent's own extent.
+
+    A parent solved at the round extent carries the padding's exact zeros in its
+    ascending normalized Gram spectrum. Its receipt drops that many entries of
+    smallest magnitude, reads ``gram_min_relative`` from what remains, and
+    normalizes the metric residual by its own side. ``reduction`` holds host
+    arrays [P, ...]; returns one dict of [1, ...] arrays per entry of ``own``.
+    """
+    import numpy as np
+
+    rows = []
+    for slot, side in enumerate(int(v) for v in own):
+        row = {key: value[slot:slot + 1] for key, value in reduction.items()}
+        spectrum = row["gram_spectrum_relative"][0]
+        kept = np.delete(spectrum, np.argsort(np.abs(spectrum), kind="stable")[:spectrum.size - side])
+        row["gram_spectrum_relative"] = kept[None]
+        row["gram_min_relative"] = kept[:1]
+        row["metric_inverse_root_residual_relative"] = row["metric_inverse_root_residual_fro"] / np.sqrt(side)
+        rows.append(row)
+    return rows
+
+
+def _batch_put(mesh_xy, a):
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    return jax.make_array_from_callback(a.shape, NamedSharding(mesh_xy, P(BATCH)), lambda idx: a[idx])
+
+
+def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordered, odd_moments, keep_budget):
+    """Run ``round_program`` on one round: host tables in, round-order results out."""
+    import numpy as np
+
+    put = lambda a: _batch_put(mesh_xy, np.asarray(a))
+    program = round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments),
+                            None if keep_budget is None else int(keep_budget))
+    live = np.arange(len(tables["own"])) < int(real)
+    return program(put(live), put(tables["points"]), put(tables["order"]), put(tables["active"]),
+                   tuple(st[1] for st in states), tuple(st[2] for st in states),
+                   tuple(st[3] for st in states), tuple(infinity))
 
 
 @lru_cache(maxsize=None)
-def _parent_panel_packer(mesh_xy, finite_width, parent_batch, sources, unique_width):
-    """One batch pack with dynamic column offsets and physical supports."""
+def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget):
+    """Pack, assemble, reduce, gate and sort a round of parents, each on its own rank.
+
+    One program over batch layout: rank r packs slot r's Q, WQ, dWQ panels by
+    ``round_tables``, assembles the even or ordered pencil, reduces it with the
+    local eigensolver ``native_eigh``, applies the zero policy, forms the
+    retained (even) or original-infinity (ordered, odd moments) moment identity
+    and sorts the poles. A synthetic slot (``live`` False) skips all of it through
+    ``lax.cond``. No array crosses ranks until the end: the factors return to the
+    face through the two all_to_alls of ``batch_to_face``, the vectors
+    replicated.
+
+    Arguments ``(live [P], points, order, active, Qs, WQs, dWQs, infinity)``, all
+    in batch layout. Returns ``(model, signed, (reduction, zero, retained,
+    permutation))`` in round order: model (b face [P, n, side], poles2, active),
+    signed (c face, mu, retained) on the ordered route else ``()``.
+    """
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from gw.shared_pole_gates import _factor_column_permutation
-
-    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    scalar = NamedSharding(mesh_xy, P())
-    permute = _factor_column_permutation(mesh_xy)
-
-    @jax.jit
-    def pack(states, infinity, order, active, finite_counts, unique_order,
-             unique_counts, columns):
-        b = states[0][1].shape[0]
-        valid = jnp.arange(finite_width)[None, :] < finite_counts[:, None]
-        points = jnp.concatenate([
-            jnp.full((b, s[1].shape[-1]), s[0], jnp.complex128)
-            for s in states], axis=-1)
-        points = jnp.where(valid, jnp.take_along_axis(points, order, axis=-1)[:, :finite_width], 0)
-        q_valid = jnp.arange(unique_width)[None, :] < unique_counts[:, None]
-        q = jnp.where(q_valid[:, None, :], permute(
-            jnp.concatenate([states[i][1] for i in sources], axis=-1), unique_order)
-            [:, :, :unique_width], 0)
-        panels = tuple(jnp.where(valid[:, None, :], permute(
-            jnp.concatenate([s[i] for s in states], axis=-1), order)[:, :, :finite_width], 0)
-            for i in (2, 3))
-        def pad(value, sharding):
-            if parent_batch > b:
-                value = jnp.concatenate((value, jnp.repeat(value[-1:], parent_batch-b, axis=0)), axis=0)
-            return jax.lax.with_sharding_constraint(value, sharding)
-        finite = (pad(points, scalar), pad(q, face), *(pad(a, face) for a in panels))
-        return finite, tuple(pad(a, face) for a in infinity), pad(active, scalar), pad(columns, scalar)
-    return pack
-
-
-@lru_cache(maxsize=None)
-def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None, keep_budget=None):
-    """Fuse assembly, corrected Ritz reduction and moment gates per parent.
-
-    The callable consumes the output of ``pack_parent_panels``. All matrix
-    inputs are [b,n,r] face tiles. Factors return as [b,n,R] face tiles;
-    poles, masks and gate scalars return replicated. Dense pencil work stays
-    q-local and never crosses the host. ``parent_extents`` gives each padded
-    q row its original finite/infinity widths; native eigensolves use those
-    widths, because padding a dense Gram can defeat solver convergence.
-    Local residency is O(R²+nR) per rank
-    for one parent at a time; callers admit the actual packed batch first.
-    """
-    import jax
-    import jax.numpy as jnp
-    from jax.sharding import PartitionSpec as P
     from common.shard_map import shard_map
-    from common.staged_reshard import face_to_batch_reshard
-    from gw.shared_pole_gates import (apply_shared_pole_zero_policy,
-                                      retained_moment_identity)
-    from gw.shared_pole_pencil import assemble_shared_pole_pencil
-    from gw.shared_pole_reduction import reduce_shared_pole_pencil
-    from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
+    from gw.shared_pole_gates import (apply_shared_pole_zero_policy, ordered_moment_identity,
+                                      retained_moment_identity, sort_shared_pole_columns)
+    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil, assemble_shared_pole_pencil
+    from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil, reduce_shared_pole_pencil
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
 
-    to_batch = face_to_batch_reshard(mesh_xy)
-    qspec = P(('x', 'y'))
+    gates = shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
+    batch, replicated = P(BATCH), NamedSharding(mesh_xy, P())
+    to_face = batch_to_face(mesh_xy)
 
     def mm(a, b, *, transa='N', transb='N'):
-        # Same local dot primitive used by the resolved service's local plan.
-        def transpose(value, trans):
+        def op(value, trans):
             if trans == 'N':
                 return value
             value = jnp.swapaxes(value, -1, -2)
-            return value.conj() if trans == 'C' else value
-        return jnp.matmul(transpose(a, transa), transpose(b, transb))
+            return jnp.conj(value) if trans == 'C' else value
+        return jnp.matmul(op(a, transa), op(b, transb))
 
-    def solve(finite, infinity, active):
-        # The physics owners retain their ordinary leading batch dimension.
-        finite = tuple(a[None] for a in finite)
-        infinity = tuple(a[None] for a in infinity)
-        pencil = assemble_shared_pole_pencil([finite], infinity, matmul=mm)
-        model, reduction, coefficients = reduce_shared_pole_pencil(
-            pencil, active[None], eigh=native_eigh, matmul=mm, gates=gates, keep_budget=keep_budget)
-        model, zero = apply_shared_pole_zero_policy(model, gates=gates)
-        r, ri = pencil[0].shape[-1], infinity[0].shape[-1]
-        selector = (jnp.arange(r)[:, None] == jnp.arange(r-ri, r)[None, :])[None].astype(jnp.complex128)
-        retained = retained_moment_identity(pencil, coefficients, model, selector, matmul=mm)
-        reduction['pencil_side'] = jnp.full((1,), r, jnp.int64)
-        return jax.tree.map(lambda a: a[0], (model, reduction, zero, retained))
+    def solve(points, q, o, d, infinity, active):
+        finite = [(points, q, o, d)]
+        if ordered:
+            pencil = assemble_ordered_shared_pole_pencil(finite, infinity if odd_moments else None, matmul=mm)
+            model, signed, reduction = reduce_ordered_shared_pole_pencil(
+                pencil, active, eigh=native_eigh, matmul=mm, gates=gates, keep_budget=keep_budget)
+            retained = ordered_moment_identity(signed, infinity, matmul=mm) if odd_moments else {}
+            model, zero = apply_shared_pole_zero_policy(model, gates=gates)
+            zero["zero_policy"] = zero["zero_policy"] & reduction["infinite_weight_ok"]
+        else:
+            pencil = assemble_shared_pole_pencil(finite, infinity, matmul=mm)
+            model, reduction, coefficients = reduce_shared_pole_pencil(
+                pencil, active, eigh=native_eigh, matmul=mm, gates=gates, keep_budget=keep_budget)
+            model, zero = apply_shared_pole_zero_policy(model, gates=gates)
+            # E selects the infinity block, the last columns of X.
+            side, width = pencil[0].shape[-1], infinity[0].shape[-1]
+            selector = (jnp.arange(side)[:, None] == jnp.arange(side - width, side)[None, :])[None]
+            retained = retained_moment_identity(pencil, coefficients, model, selector.astype(jnp.complex128),
+                                                matmul=mm)
+            signed = ()
+        model, permutation = sort_shared_pole_columns(model)
+        return model, signed, (reduction, zero, retained, permutation)
 
-    def one(args):
-        finite, infinity, active, index, columns = args
-        # Recreate Q only for this parent. Adjoint partners alias an existing
-        # WQ panel, so no second line-direction block crosses this boundary.
-        q = jnp.where(columns[None, :] >= 0,
-                      jnp.take(finite[1], jnp.maximum(columns, 0), axis=-1),
-                      jnp.where(columns[None, :] <= -2,
-                                jnp.take(finite[2], jnp.maximum(-2-columns, 0), axis=-1), 0))
-        finite = (finite[0], q, finite[2], finite[3])
-        if parent_extents is None:
-            return solve(finite, infinity, active)
-        # cuSolver's native eigh can fail on large artificial zero blocks.
-        # Each branch solves the original selected pencil, including its
-        # original port padding. Only compact outputs acquire q-batch padding.
-        rf, ri = finite[1].shape[-1], infinity[0].shape[-1]
-        def branch(nf, ni):
-            def run(args):
-                f, i, mask = args
-                f = (f[0][:nf], *(a[:, :nf] for a in f[1:]))
-                i = tuple(a[:, :ni] for a in i)
-                mask = jnp.concatenate((mask[:nf], mask[rf:rf+ni]))
-                model, reduction, zero, retained = solve(f, i, mask)
-                b, poles, active = model
-                pad = rf + ri - nf - ni
-                model = (jnp.pad(b, ((0, 0), (0, pad))),
-                         jnp.pad(poles, (0, pad), constant_values=1),
-                         jnp.pad(active, (0, pad)))
-                reduction['gram_spectrum_relative'] = jnp.pad(
-                    reduction['gram_spectrum_relative'], (0, pad))
-                return model, reduction, zero, retained
-            return run
-        # Padded batch rows reuse the same physical-size program while their
-        # panels remain distinct runtime inputs. Do not retrace copied rows.
-        sizes = tuple(dict.fromkeys(parent_extents))
-        branches = tuple(branch(nf, ni) for nf, ni in sizes)
-        if len(sizes) != len(parent_extents):
-            dispatch = jnp.asarray([sizes.index(size) for size in parent_extents], jnp.int32)
-            index = dispatch[index]
-        return jax.lax.switch(index, branches, (finite, infinity, active))
+    def body(live, points, order, active, qs, os, ds, infinity):
+        def pack(panels):
+            return jnp.take(jnp.concatenate(panels, axis=-1), order[0], axis=-1, mode='fill', fill_value=0)
+        args = (points, pack(qs), pack(os), pack(ds), infinity, active)
 
-    mapped = shard_map(lambda f, i, a, q, c: jax.lax.map(one, (f, i, a, q, c)), mesh=mesh_xy,
-                       in_specs=((qspec,)*4, (qspec,)*3, qspec, qspec, qspec),
-                       out_specs=(qspec, qspec, qspec, qspec), check_vma=False)
-    # Explicit inverse movement is needed: a generic batch-to-face reshard
-    # can rematerialize every parent on every device.
-    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
-    def restore(b):
-        if py > 1:
-            b = jax.lax.all_to_all(b, 'y', split_axis=2, concat_axis=0, tiled=True)
-        if px > 1:
-            b = jax.lax.all_to_all(b, 'x', split_axis=1, concat_axis=0, tiled=True)
-        return b
-    restore = shard_map(restore, mesh=mesh_xy, in_specs=qspec,
-                        out_specs=P(None, 'x', 'y'), check_vma=False)
+        def skip(args):
+            return jax.tree.map(lambda a: jnp.zeros(a.shape, a.dtype), jax.eval_shape(solve, *args))
+        return jax.lax.cond(live[0], lambda args: solve(*args), skip, args)
+
+    mapped = shard_map(body, mesh=mesh_xy, in_specs=(batch,) * 8, out_specs=batch, check_vma=False)
 
     @jax.jit
-    def execute(finite, infinity, active, columns):
-        f = (jax.lax.with_sharding_constraint(finite[0], jax.sharding.NamedSharding(mesh_xy, qspec)),
-             *(to_batch(a) for a in finite[1:]))
-        i = tuple(to_batch(a) for a in infinity)
-        active = jax.lax.with_sharding_constraint(active, jax.sharding.NamedSharding(mesh_xy, qspec))
-        indices = jax.lax.with_sharding_constraint(jnp.arange(active.shape[0]),
-                                                   jax.sharding.NamedSharding(mesh_xy, qspec))
-        columns = jax.lax.with_sharding_constraint(columns, jax.sharding.NamedSharding(mesh_xy, qspec))
-        model, reduction, zero, retained = mapped(f, i, active, indices, columns)
-        b, poles, mask = model
-        replicated = jax.sharding.NamedSharding(mesh_xy, P())
-        scalars = jax.tree.map(lambda a: jax.lax.with_sharding_constraint(a, replicated),
-                               (poles, mask, reduction, zero, retained))
-        poles, mask, reduction, zero, retained = scalars
-        return (restore(b), poles, mask), reduction, zero, retained
+    def execute(live, points, order, active, qs, os, ds, infinity):
+        model, signed, diagnostics = mapped(live, points, order, active, qs, os, ds, infinity)
+        gather = lambda tree: jax.tree.map(lambda a: jax.lax.with_sharding_constraint(a, replicated), tree)
+        model = (to_face(model[0]), *gather(model[1:]))
+        signed = (to_face(signed[0]), *gather(signed[1:])) if ordered else ()
+        return model, signed, gather(diagnostics)
     return execute
 
 

@@ -521,7 +521,7 @@ def construction_receipt(measurements=None, *, capacity=None, capacity_entry_sta
 
 def build_construction_row(model, counts, diagnostics, *, span, roles, price,
                            coulomb, native_queries, identity, gates, nspinor,
-                           logical_n, pencil_side, ordered, odd_moments):
+                           logical_n, ordered, odd_moments):
     """Host view of one constructed parent, and the gate rows it measures.
 
     The constructor has finished q: it holds the model, the device diagnostics
@@ -540,14 +540,15 @@ def build_construction_row(model, counts, diagnostics, *, span, roles, price,
     diagnostics : mapping
         ``reduction``, ``zero``, ``passive``, ``retained``, ``moment_defects``
         from the reduction and the gates, and the host ``held``,
-        ``reciprocity`` and ``permutation`` records.
+        ``reciprocity`` and ``permutation`` records. ``reduction`` is at the
+        parent's own extent (``gw.shared_pole_local.own_extent_receipts``).
     price, coulomb, native_queries, identity : mapping / iterable
         The capacity row for this parent, the Coulomb receipt, the constructor's
         native workspace queries, and the current state identity.
     gates : mapping
         The canonical TRS or ordered gate table, already selected by the caller.
-    nspinor, logical_n, pencil_side : int
-        Deck spin count, logical centroid count, and this parent's pencil side.
+    nspinor, logical_n : int
+        Deck spin count and logical centroid count.
     ordered, odd_moments : bool
         The route and whether its bank carried the odd z-moments.
 
@@ -560,13 +561,12 @@ def build_construction_row(model, counts, diagnostics, *, span, roles, price,
     zero, passive = diagnostics["zero"], diagnostics["passive"]
     retained, moment_defects = diagnostics["retained"], diagnostics["moment_defects"]
     held, reciprocity = diagnostics["held"], diagnostics["reciprocity"]
-    r = int(pencil_side)
     row = {"q_span": list(span), "roles": roles,
            "diagnostic_operator": "raw-latent-pole-model",
            "K": np.asarray(counts).tolist(), "J": int(np.unique(np.asarray(poles)[np.asarray(mask)]).size),
            "damping_fraction": 0.0, "capacity": price, "coulomb": coulomb,
            "condition": np.asarray(reduction["gram_condition"]).tolist(),
-           "normalized_gram_spectrum": np.asarray(reduction["gram_spectrum_relative"])[..., :int(reduction.get("pencil_side", [r])[0])].tolist(),
+           "normalized_gram_spectrum": np.asarray(reduction["gram_spectrum_relative"]).tolist(),
            "native_workspace_queries": [dict(op=op, shapes=shapes, bytes_per_rank=value)
                                          for (op, shapes), value in native_queries.items()],
            "retained_moment_relative": {k: np.asarray(v).tolist() for k, v in retained.items()},

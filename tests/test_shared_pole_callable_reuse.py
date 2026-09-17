@@ -1,132 +1,138 @@
-"""Changed physical supports and arrays must remain live through cached packing."""
+"""Round column tables by hand, and one round executable reused across changed inputs.
+
+CPU (pytest, 2x2 host mesh) and P4 (``python test_shared_pole_callable_reuse.py OUT.json``):
+* ``round_tables``: each state keeps its carrier with the inert tail inside, in state order; the zero
+  column fills a slot to the round extent; ordered originals and mirrors pack as two halves of one
+  extent (paired per slot); the infinity block is doubled on an odd-moment ordered round and absent
+  without odd moments; ``own`` is the spectrum length at the slot's own extent;
+* ``own_extent_receipts`` drops exactly the round padding's zeros;
+* ``round_program``: a round with new supports, panels and counts at the same extents runs the same
+  executable; the public-factor and retained-column kernels are reused.
+"""
 from pathlib import Path
 import json
 import os
 import numpy as np
 
 
+def _extent(width):
+    return 2 * ((width + 1) // 2)
+
+
+def check_tables():
+    from gw.shared_pole_local import own_extent_receipts, round_tables
+    counts = np.array([[3, 7], [7, 3], [3, 3], [0, 0]])
+    t = round_tables(counts, (8, 8), (2 + 1j, 3 + 1j), [3, 4, 3, 0], 4, column_extent=_extent,
+                     ordered=False, odd_moments=False)
+    fill = 16
+    assert t["order"].tolist() == [[0, 1, 2, 3, *range(8, 16)], [*range(8), 8, 9, 10, 11],
+                                   [0, 1, 2, 3, 8, 9, 10, 11] + [fill] * 4, [fill] * 12]
+    assert t["points"][0].tolist() == [2 + 1j] * 4 + [3 + 1j] * 8
+    assert t["points"][2, 8:].tolist() == [0] * 4
+    finite = t["active"][:, :12]
+    assert finite[0].tolist() == [True] * 3 + [False] + [True] * 7 + [False]
+    assert finite[2].tolist() == [True] * 3 + [False] + [True] * 3 + [False] * 5 and not finite[3].any()
+    assert t["active"][:, 12:].sum(axis=1).tolist() == [3, 4, 3, 0]
+    assert t["own"].tolist() == [16, 16, 12, 0]
+    paired = np.column_stack((counts, counts))
+    for odd, blocks in ((True, 2), (False, 0)):
+        o = round_tables(paired, (8,) * 4, (1j, 2j, -1j, -2j), [3, 4, 3, 0], 4, column_extent=_extent,
+                         ordered=True, odd_moments=odd)
+        originals, mirrors = o["order"][:, :12], o["order"][:, 12:]
+        assert np.array_equal(mirrors, np.where(originals == 32, 32, originals + 16))
+        assert np.array_equal(o["points"][:, 12:], -o["points"][:, :12])
+        assert np.array_equal(o["active"][:, 12:24], o["active"][:, :12])
+        assert o["active"].shape[-1] == 24 + 4 * blocks
+        if odd:
+            assert np.array_equal(o["active"][:, 24:28], o["active"][:, 28:])
+        assert o["own"].tolist() == ([16, 16, 12, 0] if odd else [12, 12, 8, 0])
+    row, = own_extent_receipts({"gram_spectrum_relative": np.array([[-1e-9, 0, 0, 0, .5, 1]]),
+                                "metric_inverse_root_residual_fro": np.array([2.0])}, [4])
+    assert row["gram_spectrum_relative"].tolist() == [[-1e-9, 0, .5, 1]]
+    assert row["gram_min_relative"].tolist() == [-1e-9]
+    assert row["metric_inverse_root_residual_relative"].tolist() == [1.0]
+
+
 def check_reuse(mesh):
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from gw.shared_pole_local import pack_parent_panels, _parent_panel_packer
-    from gw.shared_pole_directions import (_hermitian_part_kernel,
-                                           _public_factor_kernel,
-                                           _stack_model_kernel)
-    face = NamedSharding(mesh, P(None, 'x', 'y'))
-    def put(value):
-        return jax.make_array_from_callback(value.shape, face, lambda i: value[i])
-    counts = np.array([[3, 7], [7, 3], [3, 3]], np.int64)
-    infinity_counts = np.array([3, 4, 3], np.int64)
-    def panels(scale, support, current_counts=counts):
-        states = []
-        for port in range(2):
-            values = scale * (np.arange(3*8*8).reshape(3,8,8) + 1 + 1000*port).astype(np.complex128)
-            values *= np.arange(8)[None,None,:] < current_counts[:,port,None,None]
-            panel = put(values)
-            states.append((support+port, panel, panel*3, panel*5))
-        inf = put(np.broadcast_to(np.arange(4)[None,None,:] < infinity_counts[:,None,None],
-                                  (3,8,4)).astype(np.complex128)*scale*2)
-        return states, (inf, inf*7, inf*11)
-    kernel = _parent_panel_packer(mesh, 12, 4, (0, 1), 12)
-    assert kernel is _parent_panel_packer(mesh, 12, 4, (0, 1), 12)
-    states, infinity = panels(1., 2+1j)
-    first, extents = pack_parent_panels(states, infinity, counts, infinity_counts,
-                                      mesh_xy=mesh, parent_batch=4, layout="local")
-    jax.block_until_ready(first)
-    before = kernel._cache_size()
-    states2, infinity2 = panels(2., 3+2j)
-    second, _ = pack_parent_panels(states2, infinity2, counts, infinity_counts,
-                                 mesh_xy=mesh, parent_batch=4, layout="local")
-    jax.block_until_ready(second)
-    assert kernel._cache_size() == before
-    assert extents == ((12,4), (12,4), (8,4))
-    # Compare against explicit original per-parent port carriers, including
-    # inactive inter-port columns; a sort of only live columns would fail.
-    for q, widths in enumerate(((4,8), (8,4), (4,4))):
-        expected = jnp.concatenate([state[1][q,:,:width] for state,width in zip(states,widths)], axis=-1)
-        assert float(jnp.max(jnp.abs(first[0][1][q,:,:sum(widths)]-expected))) == 0
-        if sum(widths) < 12:
-            assert float(jnp.max(jnp.abs(first[0][1][q,:,sum(widths):]))) == 0
-    assert float(jnp.max(jnp.abs(first[0][1][3]-first[0][1][2]))) == 0
-    assert float(jnp.max(jnp.abs(second[0][0]-first[0][0]))) > 1
-    assert float(jnp.max(jnp.abs(second[0][1]-2*first[0][1]))) == 0
-    assert float(jnp.max(jnp.abs(second[1][0]-2*first[1][0]))) == 0
-    changed_counts = counts[:, ::-1].copy()
-    changed_states, changed_inf = panels(1., 2+1j, changed_counts)
-    changed, _ = pack_parent_panels(changed_states, changed_inf, changed_counts, infinity_counts,
-                                   mesh_xy=mesh, parent_batch=4, layout="local")
-    jax.block_until_ready(changed)
-    assert kernel._cache_size() == before
-    assert float(jnp.max(jnp.abs(changed[0][1]-first[0][1]))) > 1
-    # A conjugate port shares Q exactly, but its actions and supports differ.
-    # Compare the original distributed-layout pack with compact local input
-    # expanded after the actual staged movement (including ragged tails).
-    from common.staged_reshard import face_to_batch_reshard
-    from common.shard_map import shard_map
-    paired = [*states, (2-1j, states[0][1], states[0][2]*7, states[0][3]*11)]
-    paired_counts = np.column_stack((counts, counts[:, 0]))
-    compact, _ = pack_parent_panels(paired, infinity, paired_counts, infinity_counts,
-                                    mesh_xy=mesh, parent_batch=4, layout="local")
-    full, _ = pack_parent_panels(paired, infinity, paired_counts, infinity_counts,
-                                 mesh_xy=mesh, parent_batch=4, layout="distributed")
-    assert compact[0][1].shape[-1] == 12 and full[0][1].shape[-1] == 20
-    to_batch = face_to_batch_reshard(mesh)
-    qspec = P(('x', 'y'))
-    def expand(q, columns):
-        return jnp.where(columns[:, None, :] >= 0,
-                         jnp.take_along_axis(q, jnp.maximum(columns, 0)[:, None, :], axis=-1), 0)
-    expand = jax.jit(shard_map(expand, mesh=mesh, in_specs=(qspec, qspec),
-                              out_specs=qspec, check_vma=False))
-    expanded = expand(to_batch(compact[0][1]), jax.device_put(compact[3], NamedSharding(mesh, qspec)))
-    original = to_batch(full[0][1])
-    for left, right in zip(expanded.addressable_shards, original.addressable_shards):
-        assert np.asarray(left.data).tobytes() == np.asarray(right.data).tobytes()
-    for left, right in zip(jax.tree.leaves((compact[0][0], compact[0][2:], compact[1:3])),
-                           jax.tree.leaves((full[0][0], full[0][2:], full[1:3]))):
-        for a, b in zip(left.addressable_shards, right.addressable_shards):
-            assert np.asarray(a.data).tobytes() == np.asarray(b.data).tobytes()
-    for factory in (_hermitian_part_kernel,_public_factor_kernel,_stack_model_kernel):
-        assert factory(mesh) is factory(mesh)
-    # Parent identity and spectral counts must remain live without compiling
-    # another executable when only those small metadata values change.
-    from gw.shared_pole_directions import _parent_panel_slice
+    import distrib_la as D
+    from gw.shared_pole_directions import _public_factor_kernel
+    from gw.shared_pole_local import _batch_put, reduce_round, round_program, round_tables
     from distrib_la.polar import _retained_column_kernel
-    panels=put(np.stack([np.full((8,8),i+1,np.complex128) for i in range(3)]))
-    take=_parent_panel_slice(mesh,4)
-    first_parent=take(panels,np.int32(0))
-    jax.block_until_ready(first_parent)
-    parent_specializations=take._cache_size()
-    next_parent=take(panels,np.int32(2))
-    jax.block_until_ready(next_parent)
-    assert take._cache_size()==parent_specializations
-    assert float(jnp.max(jnp.abs(next_parent-3*first_parent)))==0
-    select=_retained_column_kernel(mesh,True,4)
-    counts=jax.device_put(np.array([2,3,4],np.int64),NamedSharding(mesh,P()))
-    first_selection=select(panels,counts)
+    ranks, n = 4, 8
+    rng = np.random.default_rng(88)
+    c = rng.normal(size=(n, 12)) * .3
+    poles = np.linspace(.2, 3., 12)
+    m1, m3 = c @ c.T / 2, (c * poles) @ c.T / 2
+    qi = np.linalg.eigh(m1)[1][:, -2:]
+    infinity = tuple(_batch_put(mesh, np.broadcast_to(a, (ranks,) + a.shape).astype(complex))
+                     for a in (qi, m1 @ qi, m3 @ qi))
+    native = D.plan("eigh", mesh, n=n, backend="off", batched_route="batch_reshard").native_fn
+
+    def round_(nodes, counts, seed):
+        local = np.random.default_rng(seed)
+        states = []
+        for a, s in enumerate(nodes):
+            q = np.linalg.qr(local.normal(size=(ranks, n, n)))[0].astype(complex)
+            q *= np.arange(n)[None, None, :] < counts[:, a, None, None]
+            w, dw = (c / (s - poles)) @ c.T, (-c / (s - poles) ** 2) @ c.T
+            states.append((s, *(_batch_put(mesh, m @ q) for m in (np.eye(n), w, dw))))
+        tables = round_tables(counts, (n,) * len(nodes), nodes, [2] * ranks, 2, column_extent=_extent,
+                              ordered=False, odd_moments=False)
+        return reduce_round(states, infinity, tables, real=ranks, mesh_xy=mesh, native_eigh=native,
+                            ordered=False, odd_moments=False, keep_budget=None)
+
+    program = round_program(mesh, native, False, False, None)
+    first = round_((-.3 + .2j, -.9 + .1j), np.array([[3, 7], [7, 3], [3, 3], [7, 7]]), 1)
+    jax.block_until_ready(first)
+    compiled = program._cache_size()
+    second = round_((-.4 + .3j, -1.1 + .2j), np.array([[7, 3], [3, 7], [3, 3], [8, 7]]), 2)
+    jax.block_until_ready(second)
+    assert program._cache_size() == compiled
+    assert float(jnp.max(jnp.abs(second[0][1] - first[0][1]))) > 0
+    assert _public_factor_kernel(mesh) is _public_factor_kernel(mesh)
+    host = np.stack([np.full((8, 8), k + 1, complex) for k in range(3)])
+    panels = jax.make_array_from_callback(host.shape, NamedSharding(mesh, P(None, 'x', 'y')), lambda i: host[i])
+    select = _retained_column_kernel(mesh, True, 4)
+    counts = jax.device_put(np.array([2, 3, 4], np.int64), NamedSharding(mesh, P()))
+    first_selection = select(panels, counts)
     jax.block_until_ready(first_selection)
-    selection_specializations=select._cache_size()
-    changed_counts=jax.device_put(np.array([4,2,3],np.int64),NamedSharding(mesh,P()))
-    changed_selection=select(panels,changed_counts)
-    jax.block_until_ready(changed_selection)
-    assert select._cache_size()==selection_specializations
-    assert float(jnp.max(jnp.abs(changed_selection-first_selection)))>0
-    for i,count in enumerate((4,2,3)):
-        assert float(jnp.max(jnp.abs(changed_selection[i,:,:count]-(i+1))))==0
-        if count<4:
-            assert float(jnp.max(jnp.abs(changed_selection[i,:,count:])))==0
-    return dict(status='PASS',scope='P4 ragged panel packing, current support/array/parent/count reds, identical signature executable reuse',pack_specializations=before,
-                parent_specializations=parent_specializations,selection_specializations=selection_specializations)
+    selection_specializations = select._cache_size()
+    changed = select(panels, jax.device_put(np.array([4, 2, 3], np.int64), NamedSharding(mesh, P())))
+    jax.block_until_ready(changed)
+    assert select._cache_size() == selection_specializations
+    for i, count in enumerate((4, 2, 3)):
+        assert float(jnp.max(jnp.abs(changed[i, :, :count] - (i + 1)))) == 0
+        if count < 4:
+            assert float(jnp.max(jnp.abs(changed[i, :, count:]))) == 0
+    return dict(status='PASS', scope='round tables by hand; round executable, public-factor and retained-column reuse',
+                round_specializations=compiled, selection_specializations=selection_specializations)
 
 
-if __name__=='__main__':
-    from runtime import initialize_communicator_stack,run_main_and_finalize
+def test_round_tables_and_executable_reuse():
+    import jax
+    from jax.sharding import Mesh
+    from lxkit.testing import require_devices
+    require_devices(4, 'cpu')
+    check_tables()
+    check_reuse(Mesh(np.asarray(jax.devices('cpu')[:4]).reshape(2, 2), ('x', 'y')))
+
+
+if __name__ == '__main__':
+    from runtime import initialize_communicator_stack, run_main_and_finalize
     initialize_communicator_stack(platform='gpu')
+
     def main():
-        import sys,jax
-        from common.collectives import resolve_mesh,barrier
-        assert jax.process_count()==4
-        row=check_reuse(resolve_mesh());row['job_step']=os.environ['SLURM_JOB_ID']+'.'+os.environ['SLURM_STEP_ID']
-        if jax.process_index()==0:Path(sys.argv[1]).write_text(json.dumps(row,indent=2)+'\n')
+        import sys
+        import jax
+        from common.collectives import resolve_mesh, barrier
+        assert jax.process_count() == 4
+        check_tables()
+        row = check_reuse(resolve_mesh())
+        row['job_step'] = os.environ['SLURM_JOB_ID'] + '.' + os.environ['SLURM_STEP_ID']
+        if jax.process_index() == 0:
+            Path(sys.argv[1]).write_text(json.dumps(row, indent=2) + '\n')
         barrier('callable-reuse-gate')
     run_main_and_finalize(main)

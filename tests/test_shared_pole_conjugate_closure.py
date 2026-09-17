@@ -14,7 +14,7 @@ def check(mesh):
     from gw.shared_pole_gates import shared_pole_passivity, shared_pole_reciprocity
     from gw.shared_pole_pencil import assemble_shared_pole_pencil
     from gw.shared_pole_reduction import reduce_shared_pole_pencil
-    from gw.shared_pole_local import pack_parent_panels, local_parent_reducer
+    from gw.shared_pole_local import _batch_put, batch_to_face, face_rows, reduce_round, round_tables
     from gw.shared_pole_recipe import shared_real_pole_gates_v1_r3b as gates
     from runtime.padding import padded_axis
 
@@ -45,22 +45,24 @@ def check(mesh):
         recipe = dict(fit_ids=[0, 1], distinct_id=[0, 1], role=[0, 0],
                       held=[False, False], z_ry=np.sqrt(points), direction_cutoff=.8,
                       multiplet_relative_tolerance=1e-6)
-        states, counts, roles = round_states(
-            mesh, lambda slot, i: sample(points[i]), recipe, n=8, eig=ep, svd=sp, extent=extent)
-        assert states[1][1] is states[0][2] and states[3][1] is states[2][2]
+        ranks = jax.device_count()
+        round_, counts, roles = round_states(
+            mesh, lambda slot, i: sample(points[i]), recipe, n=8, eig=ep, svd=sp, extent=extent, batch=True)
+        assert round_[1][1] is round_[0][2] and round_[3][1] is round_[2][2]
         m1, m3 = c @ adj(c)/2, (c*poles) @ adj(c)/2
         qi = np.linalg.eigh(m1)[1][:, -2:]
         infinity = tuple(put(a) for a in (qi, m1 @ qi, m3 @ qi))
-        packed, extents = pack_parent_panels(
-            states, infinity, counts, [2], mesh_xy=mesh,
-            parent_batch=jax.device_count(), layout='local')
-        full, _ = pack_parent_panels(states, infinity, counts, [2],
-                                     mesh_xy=mesh, parent_batch=jax.device_count(),
-                                     layout='distributed')
-        assert packed[0][1].shape[-1]*2 == full[0][1].shape[-1]
-        model, diagnostics, zero, retained = local_parent_reducer(
-            mesh, ep.native_fn, extents)(*packed)
-        b, t, active = (a[:1] for a in model)
+        tables = round_tables(counts, [st[1].shape[-1] for st in round_], [st[0] for st in round_],
+                              [2] * ranks, 2, column_extent=extent, ordered=False, odd_moments=False)
+        model, _, (diagnostics, zero, retained, _) = reduce_round(
+            round_, tuple(_batch_put(mesh, np.broadcast_to(a, (ranks,) + a.shape).copy())
+                          for a in (qi, m1 @ qi, m3 @ qi)),
+            tables, real=ranks, mesh_xy=mesh, native_eigh=ep.native_fn, ordered=False, odd_moments=False,
+            keep_budget=None)
+        to_face, first = batch_to_face(mesh), face_rows(mesh, (0,))
+        states = [(st[0], *(first(to_face(a)) for a in st[1:])) for st in round_]
+        counts = counts[:1]
+        b, t, active = first(model[0]), model[1][:1], model[2][:1]
         got = mm(b*jnp.where(active, 1/(-.37-t), 0)[:, None, :], b, transb='C')
         reference = put(sample(-.37)[0])
         green = shared_pole_reciprocity(got, reference, gates=gates)
@@ -96,7 +98,8 @@ def check(mesh):
                 old_states.append((s, q, mm(w,q), mm(dw,q)))
         pencil = assemble_shared_pole_pencil(old_states, infinity, matmul=mm)
         ep_old = D.plan('eigh',mesh,n=pencil[0].shape[-1],backend='off',batched_route='batch_reshard')
-        old, _, _ = reduce_shared_pole_pencil(pencil, full[2][:1],
+        old_active = jax.device_put(tables['active'][:1], NamedSharding(mesh, P()))
+        old, _, _ = reduce_shared_pole_pencil(pencil, old_active,
                             eigh=ep_old.batched, matmul=mm, gates=gates)
         ob, ot, om = old
         bad = mm(ob*jnp.where(om, 1/(-.37-ot), 0)[:, None, :], ob, transb='C')
@@ -114,13 +117,11 @@ def check(mesh):
         rows.append(dict(case=case, imaginary_relative=imag,
                          same_q_imaginary_relative=bad_imag, projection_relative=projection,
                          same_q_gates={k: np.asarray(v).tolist() for k, v in red.items()},
-                         pencil_side=extents[0][0]+extents[0][1],
-                         transported_q_columns=packed[0][1].shape[-1],
-                         uncompressed_q_columns=full[0][1].shape[-1],
+                         pencil_side=int(tables['active'].shape[-1]),
                          minimum_pole=float(jnp.min(jnp.where(active,t,jnp.inf))),
                          gates={k:np.asarray(v).tolist() for k,v in green.items()}))
     return dict(status='PASS', rows=rows,
-                scope='P4 production round selection/packing/local reduction; planted real and complex measures; former same-Q red twin')
+                scope='P4 production round selection and round program; planted real and complex measures; former same-Q red twin')
 
 
 def test_conjugate_closure():
