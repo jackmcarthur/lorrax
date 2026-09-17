@@ -1877,6 +1877,14 @@ valence and conduction energies before building the minimax factors.
 Because only differences enter, this is algebraically invariant; the
 knob lets callers align the global zero (e.g. midgap, VBM, CBM).
 
+This is the zero-temperature imaginary-time producer: every node factor
+``e^{-(e_c - e_v) tau}`` is bounded only when the conduction minimum lies
+above the valence maximum.  ``_gap_edges`` refuses ``cmin <= vmax`` with
+``GATE chi0_laplace_needs_gap`` in every gapped wrapper (``compute_chi0``,
+``_multi``, ``_imag_ordered``, ``_contour``, ``_contour_ordered`` and the
+precompile siblings); gapless systems take the fractional-occupation
+routes.
+
 ### `src/gw/w_isdf.py` — `compute_chi0_imag_ordered`
 
 χ₀(q; iω_p) with BOTH particle-hole orientations carrying their own
