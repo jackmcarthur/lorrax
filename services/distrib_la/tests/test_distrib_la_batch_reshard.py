@@ -163,6 +163,35 @@ def test_ragged_route_never_calls_dense_kernel_for_synthetic_rows(
         "synthetic slots reached the expensive branch")
 
 
+def test_ragged_matmul_route_never_multiplies_synthetic_rows(monkeypatch):
+    """Q=5 on P=4 executes five local GEMMs, not Qp=8; a full batch keeps one batched GEMM per rank."""
+    import jax
+    import jax.numpy as jnp
+    import importlib
+    mm = importlib.import_module("distrib_la.matmul")
+
+    mesh = _mesh()
+    rng = np.random.default_rng(8360)
+    calls = []
+    original = jnp.matmul
+
+    def _counted(a, b):
+        jax.debug.callback(lambda _unused: calls.append(int(a.shape[0])), jnp.int32(0))
+        return original(a, b)
+
+    monkeypatch.setattr(jnp, "matmul", _counted)
+    for nb, want in ((5, [1] * 5), (8, [2] * 4)):
+        calls.clear()
+        mm._RESHARD_CACHE.clear()
+        A = rng.standard_normal((nb, 8, 6)) + 1j * rng.standard_normal((nb, 8, 6))
+        B = rng.standard_normal((nb, 10, 6)) + 1j * rng.standard_normal((nb, 10, 6))
+        got = D.matmul(_put(A, mesh), _put(B, mesh), mesh=mesh, transb="C",
+                       backend="off", batched_route=D.ROUTE_BATCH_RESHARD)
+        got.block_until_ready()
+        assert sorted(calls) == want, (nb, calls)
+        assert _rel(got, A @ np.conj(np.swapaxes(B, -1, -2))) < 1e-13
+
+
 def test_dispatch_public_route_does_not_take_the_native_early_return(monkeypatch):
     """The legacy door passes the public route into Plan construction."""
     import jax.numpy as jnp

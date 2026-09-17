@@ -74,8 +74,8 @@ def _close_spectral_cut(values, count, tolerance):
 def _direction_input(W, eig, dilation=False):
     if isinstance(W, jax.core.Tracer):
         raise ValueError("spectral direction selection is an eager construction stage")
-    if W.ndim not in (2, 3) or W.shape[-2] != W.shape[-1]:
-        raise ValueError("spectral directions require a square rank-2 matrix or rank-3 batch")
+    if W.ndim < 2 or W.shape[-2] != W.shape[-1]:
+        raise ValueError("spectral directions require a square rank-2 matrix or a batch of them")
     _validate_dtype(W.dtype)
     if eig.op != 'eigh' or eig.n not in (None, W.shape[-1] * (2 if dilation else 1)):
         raise ValueError("eigh_plan must match the matrix/dilation extent")
@@ -83,6 +83,41 @@ def _direction_input(W, eig, dilation=False):
     if not W.sharding.is_equivalent_to(tile, W.ndim):
         raise ValueError("spectral directions require W already face-tiled over x/y")
     return tile
+
+
+@lru_cache(maxsize=32)
+def _leading_axes_kernel(mesh, leading):
+    """Reshape the leading batch axes of a face stack; the x/y tiles are untouched.
+
+    ``leading=None`` flattens [b0,...,bk,m,m] at P(None,...,'x','y') to one batch
+    at P(None,'x','y'); a tuple restores that leading shape. The leading axes are
+    unsharded and adjacent, so every rank keeps its own tile (a bitcast).
+    """
+    rank = 1 if leading is None else len(leading)
+    tile = NamedSharding(mesh, P(*((None,) * rank), 'x', 'y'))
+    if leading is None:
+        return jax.jit(lambda w: w.reshape((-1,) + w.shape[-2:]), out_shardings=tile)
+    return jax.jit(lambda w: w.reshape(tuple(leading) + w.shape[-2:]), out_shardings=tile)
+
+
+def _nest(values, leading):
+    """Nest a flat per-row tuple as tuples following the leading batch shape."""
+    if len(leading) == 1:
+        return tuple(values)
+    step = int(np.prod(leading[1:]))
+    return tuple(_nest(values[i * step:(i + 1) * step], leading[1:])
+                 for i in range(leading[0]))
+
+
+def _over_leading_axes(select, W, mesh):
+    """Run a rank-3 spectral selection on a rank >= 4 stack and restore its axes.
+
+    Only the eager spectrum cut sees the flattened rows; Q returns with the
+    original leading axes and the per-row spectra as nested tuples.
+    """
+    leading = tuple(int(v) for v in W.shape[:-2])
+    q, values = select(_leading_axes_kernel(mesh, None)(W))
+    return _leading_axes_kernel(mesh, leading)(q), _nest(values, leading)
 
 
 @lru_cache(maxsize=128)
@@ -172,11 +207,18 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         Batched input returns Q[b,m,max(r_padded)] at P(None,'x','y') and
         a tuple of b unpadded sigma[r_q] arrays. Thus every cut/multiplet
         remains independent; the matrix tail of each row is exactly zero.
+        A stack [b0,...,bk,m,m] at P(None,...,'x','y') is one batch of
+        b0*...*bk rows: Q[b0,...,bk,m,max(r_padded)] keeps the leading axes
+        and the spectra nest as tuples in the same order.
     """
     _direction_input(W, eigh_plan, dilation=True)
     tau = _as_rcond(tau)
     if tau is None:
         raise ValueError("tau must be an explicit relative cutoff")
+    if W.ndim > 3:
+        return _over_leading_axes(lambda w: right_singular_vectors(
+            w, tau, eigh_plan=eigh_plan, column_extent=column_extent,
+            multiplet_tol=multiplet_tol), W, eigh_plan.mesh)
     s, v = _direction_svd_kernel(eigh_plan, W.ndim)(W)
     values = np.asarray(s)[..., ::-1].copy()
     if not np.all(np.isfinite(values)):
@@ -193,8 +235,8 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
                          multiplet_tol=1e-6):
     """Return leading Hermitian eigenvectors, including the cut multiplet.
 
-    W[m,m] or W[b,m,m] is Hermitian on its x/y faces; r is the requested
-    physical width for each row. The leading batch is independent.
+    W[m,m], W[b,m,m] or W[b0,...,bk,m,m] is Hermitian on its x/y faces; r is
+    the requested physical width for each row. The leading batch is independent.
     eigh_plan is resolved for m, and column_extent/multiplet_tol and the
     (Q,values) output follow right_singular_vectors. Values retain W's units.
     No Hermitian projection is applied to repair an invalid input.
@@ -203,6 +245,10 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
     r = operator.index(r)
     if not 1 <= r <= W.shape[-1]:
         raise ValueError("r must lie in [1,m]")
+    if W.ndim > 3:
+        return _over_leading_axes(lambda w: leading_eigenvectors(
+            w, r, eigh_plan=eigh_plan, column_extent=column_extent,
+            multiplet_tol=multiplet_tol), W, eigh_plan.mesh)
     if eigh_plan.batched_route == ROUTE_BATCH_RESHARD:
         from distrib_la._batch_reshard import batch_reshard_call
         s, q = batch_reshard_call("checked_eigh", eigh_plan.mesh,

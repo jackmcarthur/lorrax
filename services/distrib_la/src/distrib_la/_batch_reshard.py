@@ -226,6 +226,34 @@ def _dense_real_rows(
     return jax.lax.fori_loop(0, local_nb, _one, out0)
 
 
+def _real_rows(kernel, operands, *, nbatch: int, py: int):
+    """Apply ``kernel`` row by row to the real local batch rows only.
+
+    ``operands`` are whole local matrices ``(local_nb, ., .)`` (``None``
+    entries pass through); ``kernel`` maps one-row slices to one output row.
+    The output of a synthetic row is exact zeros. This is the schedule of
+    :func:`_dense_real_rows` for an arbitrary local kernel, used where the
+    output shape differs from every operand (GEMM).
+    """
+    live = [x for x in operands if x is not None]
+    local_nb = int(live[0].shape[0])
+    device = (jax.lax.axis_index("x") * py + jax.lax.axis_index("y"))
+    first_q = device * local_nb
+    row = lambda i: tuple(None if x is None else jax.lax.dynamic_slice_in_dim(x, i, 1, axis=0)
+                          for x in operands)
+    template = jax.eval_shape(kernel, *row(0))
+    out0 = jnp.zeros((local_nb,) + tuple(template.shape[1:]), dtype=template.dtype)
+
+    def _one(i, out):
+        value = jax.lax.cond(first_q + i < nbatch,
+                             lambda ops: kernel(*ops),
+                             lambda ops: jnp.zeros(template.shape, template.dtype),
+                             row(i))
+        return jax.lax.dynamic_update_slice(out, value, (i,) + (0,) * (out.ndim - 1))
+
+    return jax.lax.fori_loop(0, local_nb, _one, out0)
+
+
 def _replicate_batch_vector(v, *, px: int, py: int):
     """Restore the service's replicated eigenvalue-vector contract."""
     if px * py == 1:

@@ -459,9 +459,13 @@ square mesh; PBLAS supports rectangular grids. `backend='off'` has no
 provider and is therefore legal only with the staged route.
 
 With `batched_route='batch_reshard'`, the service pads a leading batch `B`
-to `Bp = ceil(B/(Px*Py)) * Px*Py`, using zero A, B, and C matrices. Zero is a
-safe synthetic GEMM row and all padded results are discarded. Each operand
-then follows these collectives inside one `shard_map`:
+to `Bp = ceil(B/(Px*Py)) * Px*Py`, using zero A, B, and C matrices. The
+synthetic rows are exchanged but never multiplied: when `Bp > B` each device
+runs its local rows through a scalar `lax.cond` inside a `fori_loop`, the same
+schedule as the staged eigh/cholesky/solve route, and a synthetic row returns
+exact zeros that are discarded. A full batch (`Bp == B`) keeps one batched
+local `jnp.matmul` per device. Each operand then follows these collectives
+inside one `shard_map`:
 
 | stage for a generic `X: (Bp,R,C)` | per-device shape | collective |
 |---|---|---|

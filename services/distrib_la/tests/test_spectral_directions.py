@@ -82,6 +82,62 @@ def test_face_contraction():
     check_faces(mesh)
 
 
+def test_leading_axes_select_like_the_flattened_batch():
+    """[parent, sample, n, n] stacks: one batched call, bitwise equal to the flattened rank-3 call.
+
+    Rows carry unequal retained ranks so the padded carrier and the per-row cuts both matter; the
+    nested spectra follow C order over (parent, sample). RED TWIN: a Fortran-order nesting of the
+    same flat spectra disagrees with the per-row counts.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from lxkit.testing import require_devices
+    import distrib_la as D
+    require_devices(4, 'cpu')
+    mesh = Mesh(np.asarray(jax.devices('cpu')[:4]).reshape(2, 2), ('x', 'y'))
+    rng = np.random.default_rng(1911)
+    b, s, n = 2, 3, 8
+    def unitary():
+        return np.linalg.qr(rng.normal(size=(n, n)) + 1j * rng.normal(size=(n, n)))[0]
+    cuts = np.array([[1, 3, 5], [2, 4, 6]])
+    w = np.empty((b, s, n, n), complex)
+    h = np.empty((b, s, n, n), complex)
+    for i in range(b):
+        for j in range(s):
+            u, v = unitary(), unitary()
+            spectrum = np.where(np.arange(n) < cuts[i, j], 10.0 - np.arange(n), 1e-4 * (1 + np.arange(n)))
+            w[i, j] = (u * spectrum) @ v.conj().T
+            h[i, j] = (v * spectrum) @ v.conj().T
+    def put(a):
+        spec = P(*((None,) * (a.ndim - 2)), 'x', 'y')
+        return jax.make_array_from_callback(a.shape, NamedSharding(mesh, spec), lambda idx: a[idx])
+    extent = lambda r: 2 * ((r + 1) // 2)
+    arms = (('svd', w, lambda a: D.right_singular_vectors(
+                a, 1e-3, eigh_plan=D.plan('eigh', mesh, backend='off', n=2 * n, batched_route='batch_reshard'),
+                column_extent=extent)),
+            ('eigh', h, lambda a: D.leading_eigenvectors(
+                a, 5, eigh_plan=D.plan('eigh', mesh, backend='off', n=n, batched_route='batch_reshard'),
+                column_extent=extent)))
+    for name, matrix, select in arms:
+        q4, values4 = select(put(matrix))
+        q3, values3 = select(put(matrix.reshape(b * s, n, n)))
+        assert q4.shape == (b, s) + q3.shape[1:], (name, q4.shape, q3.shape)
+        assert q4.sharding.is_equivalent_to(NamedSharding(mesh, P(None, None, 'x', 'y')), 4)
+        assert np.array_equal(np.asarray(q4).reshape(q3.shape), np.asarray(q3)), name
+        assert len(values4) == b and all(len(row) == s for row in values4)
+        flat = [np.asarray(v) for row in values4 for v in row]
+        assert all(np.array_equal(a, np.asarray(c)) for a, c in zip(flat, values3)), name
+        counts = [[int(np.asarray(v).size) for v in row] for row in values4]
+        if name == 'svd':
+            assert counts == cuts.tolist(), counts
+            fortran = np.asarray([len(values3[k]) for k in range(b * s)]).reshape(b, s, order='F')
+            assert fortran.tolist() != counts
+        for i in range(b):
+            for j in range(s):
+                assert float(jnp.max(jnp.abs(q4[i, j, :, counts[i][j]:]))) == 0 if counts[i][j] < q4.shape[-1] else True
+
+
 def check_directions_and_gemm(mesh):
     import jax
     import jax.numpy as jnp

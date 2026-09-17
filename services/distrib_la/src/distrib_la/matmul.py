@@ -353,7 +353,8 @@ def _provider_matmul(provider, mesh, A, B, C, *, alpha, beta,
 
 
 def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb):
-    from distrib_la._batch_reshard import _batch_to_face, _face_to_batch
+    from distrib_la._batch_reshard import (_batch_to_face, _face_to_batch,
+                                           _real_rows)
 
     px, py = _mesh_shape(mesh)
     ptotal = px * py
@@ -366,16 +367,7 @@ def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb):
            transa, transb)
     fn = _RESHARD_CACHE.get(key)
     if fn is None:
-        def _body(a, b, c):
-            if pad:
-                a = jnp.pad(a, ((0, pad), (0, 0), (0, 0)))
-                b = jnp.pad(b, ((0, pad), (0, 0), (0, 0)))
-                if c is not None:
-                    c = jnp.pad(c, ((0, pad), (0, 0), (0, 0)))
-            a = _face_to_batch(a, px=px, py=py)
-            b = _face_to_batch(b, px=px, py=py)
-            if c is not None:
-                c = _face_to_batch(c, px=px, py=py)
+        def _gemm(a, b, c):
             if transa != "N":
                 a = jnp.swapaxes(a, -1, -2)
                 if transa == "C":
@@ -387,6 +379,22 @@ def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb):
             d = jnp.asarray(alpha, A.dtype) * jnp.matmul(a, b)
             if c is not None:
                 d = d + jnp.asarray(beta, A.dtype) * c
+            return d
+
+        def _body(a, b, c):
+            if pad:
+                a = jnp.pad(a, ((0, pad), (0, 0), (0, 0)))
+                b = jnp.pad(b, ((0, pad), (0, 0), (0, 0)))
+                if c is not None:
+                    c = jnp.pad(c, ((0, pad), (0, 0), (0, 0)))
+            a = _face_to_batch(a, px=px, py=py)
+            b = _face_to_batch(b, px=px, py=py)
+            if c is not None:
+                c = _face_to_batch(c, px=px, py=py)
+            # Synthetic rows of a ragged batch are exchanged but never multiplied:
+            # the same scalar cond-in-loop skip as the eigh/cholesky/solve route.
+            d = (_real_rows(_gemm, (a, b, c), nbatch=nb, py=py) if pad
+                 else _gemm(a, b, c))
             d = _batch_to_face(d, px=px, py=py)
             return d[:nb]
 
