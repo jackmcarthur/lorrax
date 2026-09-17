@@ -830,7 +830,7 @@ def _evaluate_samples(
                 progress_fn=lambda q_done, q_total, elapsed: print_fn(
                     "  MPA direct chi0 shifted-origin q row "
                     f"{q_done}/{q_total} complete in {elapsed:.3f} s"),
-                ordered=metal_physical, print_fn=print_fn)
+                ordered=metal_physical)
             if static_gamma_override is not None and gamma_row is not None:
                 chi_w = chi_w.at[gamma_row].set(static_gamma_override[0])
             write_wedge(point, chi_w)

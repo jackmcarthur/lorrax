@@ -2273,20 +2273,9 @@ def _fractional_pair_scan_face(
     psi_mun_a, psi_nmu_a, psi_mun_b, psi_nmu_b, energy_a, energy_b,
     occ_a, occ_b, surface_a, surface_b, z_values, *,
     nb_full, nb_logical, tile, unfold_x=None, unfold_y=None, roll_b=None,
-    k_unfold_plan=None, ordered=False, band_cut=None,
+    k_unfold_plan=None, ordered=False,
 ):
     """Stream ordered band-pair tiles from canonical faces with optional typed parent transport.
-
-    Fermi window (``gw.efermi.fermi_energy_partition``).  ``band_cut`` is
-    ``FermiPartition.band_cut_hi``: every band at or above it lies above
-    ``mu + w`` at every k, so a pair with BOTH bands there is same-side and
-    outside the window and its weight ``f_a - f_b`` is below the partition's
-    truncation bound (exactly zero for a clamped MP1 table).  Those tile
-    pairs are skipped: block A runs every ``a`` tile below the cut against
-    every ``b`` tile, block B every ``a`` tile at or above the cut against
-    the ``b`` tiles below it, continuing from block A's accumulator so the
-    accumulation order of the retained tiles is the incumbent one.  Cross-mu
-    pairs are never cut.  ``None`` keeps the full scan bit for bit.
 
     Orientation (same convention as ``_get_chi_fractional_contour_kernel_face``:
     ``FT_q[f](mu,nu) = sum_R f(r_mu, r_nu+R) e^{iq.R}``).  The incumbent trace
@@ -2414,44 +2403,32 @@ def _fractional_pair_scan_face(
 
     zero = jnp.zeros((z.size, nmu_x_loc, nmu_y_loc), dtype=jnp.complex128)
 
-    def _block(acc0, a_steps, b_steps):
-        def _outer(acc, ia_step):
-            ia = ia_step * tile
-            ga = ia + jnp.arange(tile)
-            a_x = _children(_gather_mun(psi_mun_a, ia), unfold_x)
-            a_y = _children(_gather_nmu(psi_nmu_a, ia), unfold_y)
-            ea = jax.lax.dynamic_slice(ea_full, (0, ia), (nk, tile))
-            fa = jax.lax.dynamic_slice(fa_full, (0, ia), (nk, tile))
-            sa = jax.lax.dynamic_slice(sa_full, (0, ia), (nk, tile))
+    def _outer(acc, ia_step):
+        ia = ia_step * tile
+        ga = ia + jnp.arange(tile)
+        a_x = _children(_gather_mun(psi_mun_a, ia), unfold_x)
+        a_y = _children(_gather_nmu(psi_nmu_a, ia), unfold_y)
+        ea = jax.lax.dynamic_slice(ea_full, (0, ia), (nk, tile))
+        fa = jax.lax.dynamic_slice(fa_full, (0, ia), (nk, tile))
+        sa = jax.lax.dynamic_slice(sa_full, (0, ia), (nk, tile))
 
-            def _inner(acc_inner, ib_step):
-                ib = ib_step * tile
-                gb = ib + jnp.arange(tile)
-                b_x = _roll(_children(_gather_mun(psi_mun_b, ib), unfold_x))
-                b_y = _roll(_children(_gather_nmu(psi_nmu_b, ib), unfold_y))
-                eb = jax.lax.dynamic_slice(eb_full, (0, ib), (nk, tile))
-                fb = jax.lax.dynamic_slice(fb_full, (0, ib), (nk, tile))
-                sb = jax.lax.dynamic_slice(sb_full, (0, ib), (nk, tile))
-                contribution = _pair_contribution(
-                    a_x, b_x, a_y, b_y, ea, eb, fa, fb, sa, sb, ga, gb)
-                return acc_inner + contribution, None
+        def _inner(acc_inner, ib_step):
+            ib = ib_step * tile
+            gb = ib + jnp.arange(tile)
+            b_x = _roll(_children(_gather_mun(psi_mun_b, ib), unfold_x))
+            b_y = _roll(_children(_gather_nmu(psi_nmu_b, ib), unfold_y))
+            eb = jax.lax.dynamic_slice(eb_full, (0, ib), (nk, tile))
+            fb = jax.lax.dynamic_slice(fb_full, (0, ib), (nk, tile))
+            sb = jax.lax.dynamic_slice(sb_full, (0, ib), (nk, tile))
+            contribution = _pair_contribution(
+                a_x, b_x, a_y, b_y, ea, eb, fa, fb, sa, sb, ga, gb)
+            return acc_inner + contribution, None
 
-            acc_inner, _ = jax.lax.scan(
-                _inner, jnp.zeros_like(acc), b_steps, unroll=1)
-            return acc + acc_inner, None
+        acc_inner, _ = jax.lax.scan(
+            _inner, jnp.zeros_like(acc), jnp.arange(ntiles), unroll=1)
+        return acc + acc_inner, None
 
-        if a_steps.size == 0 or b_steps.size == 0:
-            return acc0
-        acc, _ = jax.lax.scan(_outer, acc0, a_steps, unroll=1)
-        return acc
-
-    every = jnp.arange(ntiles)
-    if band_cut is None:
-        chi = _block(zero, every, every)
-    else:
-        cut_tiles = min(ntiles, -(-int(band_cut) // tile))   # ceil: cut at or above band_cut
-        chi = _block(zero, jnp.arange(cut_tiles), every)
-        chi = _block(chi, jnp.arange(cut_tiles, ntiles), jnp.arange(cut_tiles))
+    chi, _ = jax.lax.scan(_outer, zero, jnp.arange(ntiles), unroll=1)
     return chi / jnp.sqrt(jnp.asarray(nk, jnp.float64))
 
 
@@ -2614,15 +2591,13 @@ def _get_chi_static_fractional_gamma_kernel_face(
 
 def _get_chi_fractional_q_kernel_face(
     mesh_xy: Mesh, *, nb_full: int, nb_logical: int, pair_tile: int,
-    n_z: int, k_unfold_plan=None, layout="face", ordered=False, band_cut=None,
+    n_z: int, k_unfold_plan=None, layout="face", ordered=False,
 ):
     """Roll the unfolded b endpoint to k−q inside the ordered-pair contraction.
 
     ``ordered=True`` returns the physical orientation ``FT_q[chi]``; the
     caller then passes the ``-q`` row's ``k-q`` map (the ``k+q`` map) as
-    ``kminq_idx`` (:func:`_fractional_pair_scan_face`).  ``band_cut`` is the
-    Fermi window's band cut (``FermiPartition.band_cut_hi``); ``None`` keeps
-    the full pair scan.
+    ``kminq_idx`` (:func:`_fractional_pair_scan_face`).
     """
     from common.shard_map import shard_map
     from common.wfn_layout import psi_specs
@@ -2630,10 +2605,8 @@ def _get_chi_fractional_q_kernel_face(
 
     tile = int(pair_tile)
     ordered = bool(ordered)
-    band_cut = None if band_cut is None else int(band_cut)
     key = ("direct_fractional_q_face", _mesh_key(mesh_xy), int(nb_full),
-           int(nb_logical), tile, int(n_z), id(k_unfold_plan), layout, ordered,
-           band_cut)
+           int(nb_logical), tile, int(n_z), id(k_unfold_plan), layout, ordered)
     hit = _chi_minimax_kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -2650,7 +2623,7 @@ def _get_chi_fractional_q_kernel_face(
                 psi_mun, psi_nmu, psi_mun_b, psi_nmu_b, energies, eb,
                 occupations, fb, surface_weight, sb, z_values,
                 nb_full=nb_full, nb_logical=nb_logical, tile=tile,
-                ordered=ordered, band_cut=band_cut)
+                ordered=ordered)
         in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None), P(None, None),
                     P(None, None), P(None, None), P(None))
     else:
@@ -2671,7 +2644,7 @@ def _get_chi_fractional_q_kernel_face(
                 occupations, fb, surface_weight, sb, z_values,
                 nb_full=nb_full, nb_logical=nb_logical, tile=tile,
                 unfold_x=unfold_x, unfold_y=unfold_y, roll_b=kminq_idx,
-                k_unfold_plan=k_unfold_plan, ordered=ordered, band_cut=band_cut)
+                k_unfold_plan=k_unfold_plan, ordered=ordered)
         in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None), P(None, None),
                     P(None, None), P(None, None), P(None)) + _PARENT_UNFOLD_SPECS
 
@@ -2789,8 +2762,6 @@ def compute_chi0_direct_fractional(
     nb_logical=None,
     progress_fn=None,
     ordered=False,
-    print_fn=None,
-    fermi_window=False,
 ):
     """Exact finite-occupation chi0 at selected complex frequencies; see docs/architecture/four_current_wiring.md.
 
@@ -2800,22 +2771,8 @@ def compute_chi0_direct_fractional(
     the conjugation on the ``mu`` density (:func:`_fractional_pair_scan_face`).
     The incumbent trace, ``FT_q[chi^T]``, is kept bit for bit when
     ``ordered=False``; the two agree under time reversal.
-
-    Fermi window (``fermi_window=True``, OPT-IN; the full pair scan is the
-    default).  For dynamic ``z_values`` (no static point) the pair scan skips
-    the tile block whose bands all lie above ``mu + w`` at every k
-    (``gw.efermi.fermi_energy_partition``): those pairs are same-side and
-    outside the window, and their weights are exactly zero for a clamped
-    MP1 table (below ``e^{-10}`` for Fermi-Dirac).  A static point keeps the
-    full scan because its diagonal limit carries the unclamped ``-df/dE``.
-    The window becomes the default for metals only when (a) the remote
-    Laplace cells have a certified mu-cell rule (today
-    ``minimax.response_laplace_rule`` refuses ``|z| >= delta_lo``, and
-    ``delta_lo -> 0`` at the Fermi surface) and (b) the ferromagnetic Fe deck
-    holds W at the production tier (owner condition, 2026-09-16).
     """
-    from gw.efermi import (fd_negative_derivative, fermi_energy_partition,
-                           mp1_negative_derivative)
+    from gw.efermi import fd_negative_derivative, mp1_negative_derivative
 
     # The occupation owner stamps config.occ_smearing_family onto this
     # current state; use that same family for the zero-z diagonal limit.
@@ -2870,16 +2827,6 @@ def compute_chi0_direct_fractional(
     surface = negative_derivative(
         e, float(occupation_state.mu_ry),
         float(occupation_state.smearing_width_ry))
-    band_cut = None
-    if fermi_window and np.all(z != 0.0):
-        partition = fermi_energy_partition(
-            jax.device_get(e)[:, :nb_log], jax.device_get(f)[:, :nb_log],
-            mu_ry=float(occupation_state.mu_ry),
-            width_ry=float(occupation_state.smearing_width_ry), family=family)
-        band_cut = partition.band_cut_hi
-        if print_fn is not None:
-            print_fn("  MPA direct chi0 " + partition.describe()
-                     + f"; pair scan cut at band {band_cut} of {nb_log}")
     # face: wfns.enk is already (nk, nb_full) -- e/f/surface above are
     # ALREADY at the full loaded extent for this call site (they are
     # wfns.enk/occupation_state.f_kn/its own derivative, not a caller-
@@ -2905,8 +2852,7 @@ def compute_chi0_direct_fractional(
     kernel = _get_chi_fractional_q_kernel_face(
         mesh_xy, nb_full=nb_full, nb_logical=nb_log,
         pair_tile=_STATIC_FRACTIONAL_PAIR_TILE, n_z=z.size,
-        k_unfold_plan=plan, layout=wfns.layout, ordered=ordered,
-        band_cut=band_cut)
+        k_unfold_plan=plan, layout=wfns.layout, ordered=ordered)
     rows = []
     for q_row, row in enumerate(kmq):
         started = time.monotonic()
