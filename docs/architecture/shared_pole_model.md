@@ -279,10 +279,27 @@ refinement preserves the defect, whereas bare V and solved charge ζ already
 have inversion/PH residuals. The common LR+RL normal equations contain a
 smaller input-projector covariance residual that the ill-conditioned fit
 amplifies. Native convolution agrees with the literal unfolded reference.
-This is a diagnosed representation limitation, not a physical instability
-verdict or a licensed symmetry/PSD projection. A same-state literal mirror
-response comparison remains the next causal counterfactual; no production
-mirror construction or acceptance threshold has been changed.
+The same-state literal negative-frequency counterfactual confirms this cause
+(P4 jobs58487264.0/.2): fixed original directions give a finite q1 Gram minimum
+of +3.66838e-12 instead of -1.63007e-6, and the old failing Rayleigh mode becomes
+positive. Neither support magnitudes nor the acceptance threshold changed.
+The full production reduction predicates also pass for this first four-parent
+CC round with the original moments (job58487264.3); no complete model or other
+sector acceptance is inferred from that bounded check.
+This is a representation limitation, not a physical instability verdict or
+a licensed symmetry/PSD projection. The production mirror construction has
+not yet been changed.
+
+The representation-consistent producer path is to retain the required exact
+full-grid -q bare-response rows before spatial compression, apply particle-hole
+conjugation there, and evaluate mirror Dyson systems with the original q's
+same frozen V/contact. It needs authenticated mirror bank outputs consumed by
+the ordered directions owner. The existing frequency support plan can remain
+unchanged: positive and mirror responses share the Green/time stream, while
+additional q/output panels and Dyson systems must be explicitly budgeted.
+For the measured Fe geometry the union of 13 parents and their exact negatives
+contains 22 full-grid rows. This is the proposed source repair, not an
+implemented or accepted full-model path.
 
 Fast CPU tests (4 host devices where a mesh is needed):
 
