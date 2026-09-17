@@ -200,3 +200,68 @@ def test_ordered_bank_carries_odd_moments(tmp_path):
                                        fields=("M0", "M1", "M2", "M3"))
     for name, expected in moments.items():
         assert bool(jnp.all(actual[name] == expected))
+
+
+def test_bank_reads_parent_lists_in_face_and_batch_layout(tmp_path):
+    """Parents by id list, in either layout, carry each parent's own committed values.
+
+    Four parents with distinct values. A contiguous run in batch layout is one read in which
+    each rank reads its own whole rows; a non-contiguous list with repeats (a round's synthetic
+    slots) is one face read per parent stacked in order and moved by the staged exchange.
+    Every leading row must equal that parent's single-parent face read bit for bit, in
+    P(('x','y'), None, ...) or P(None, ..., 'x', 'y') as asked. RED TWIN: the list read in
+    sorted order differs from the requested order.
+    """
+    from symmetry_maps import QirrTables
+    mesh, meta, tables, recipe, identity = _bank_fixture()
+    qt = tables["qirr"]
+    tables = dict(tables, q_irr_full_idx=np.arange(4, dtype=np.int64),
+                  qirr=QirrTables(irr_idx_q=np.arange(27, dtype=np.int32) % 4, sym_idx_q=qt.sym_idx_q,
+                                  q_irr_frac=np.asarray([[0, 0, 0], [1/3, 0, 0], [2/3, 0, 0], [0, 1/3, 0]]),
+                                  sym_perm=qt.sym_perm, L_table=qt.L_table, n_sym_spatial=qt.n_sym_spatial))
+    path = tmp_path / "scratch_lists.h5"
+    header = initialize_shared_pole_bank(
+        path, meta=meta, tables=tables, recipe=recipe, identity=identity, mesh_xy=mesh)
+    nq = header["bank_shape"]["nq"]
+    assert nq == 4
+    for q in range(nq):
+        for sample in range(2):
+            write_shared_pole_bank(
+                path, q_span=(q, q+1), sample_span=(sample, sample+1),
+                Wc=_matrix(meta, mesh, samples=True, value=10*q + sample),
+                dWc_ds=_matrix(meta, mesh, samples=True, value=-10*q - sample),
+                meta=meta, expected_identity=identity, mesh_xy=mesh)
+        header = write_shared_pole_bank(
+            path, q_span=(q, q+1), M1=_matrix(meta, mesh, samples=False, value=100+q),
+            M3=_matrix(meta, mesh, samples=False, value=200+q),
+            meta=meta, expected_identity=identity, mesh_xy=mesh)
+    header = validate_shared_pole_bank(path, expected_identity=identity, mesh_xy=mesh, require_complete=True)
+    fields = ("Wc", "dWc_ds", "M1", "M3")
+    batch = P(('x', 'y'))
+    with SlabIO(path, mode="r", mesh=mesh) as io:
+        single = [read_shared_pole_bank(io, (q, q+1), meta=meta, header=header, sample_span=(0, 2),
+                                        fields=fields) for q in range(nq)]
+        cases = {"span_face": dict(q_span=(0, 4)), "ids_face": dict(q_ids=[3, 1, 1, 0]),
+                 "run_batch": dict(q_ids=[0, 1, 2, 3], partition_spec=batch),
+                 "ids_batch": dict(q_ids=[2, 0, 3, 3], partition_spec=batch)}
+        for label, request in cases.items():
+            got = read_shared_pole_bank(io, meta=meta, header=header, sample_span=(0, 2), fields=fields, **request)
+            ids = request.get("q_ids", list(range(4)))
+            for name in fields:
+                spec = got[name].sharding.spec
+                if "partition_spec" in request:
+                    assert tuple(spec[0]) == ('x', 'y') and all(e is None for e in tuple(spec)[1:]), (label, spec)
+                else:
+                    assert tuple(spec)[-2:] == ('x', 'y'), (label, spec)
+                value = np.asarray(got[name])
+                for row, q in enumerate(ids):
+                    assert np.array_equal(value[row], np.asarray(single[q][name])[0]), (label, name, row)
+            if label == "ids_batch":
+                ordered = read_shared_pole_bank(io, meta=meta, header=header, sample_span=(0, 2), fields=("M1",),
+                                                q_ids=sorted(ids), partition_spec=batch)
+                assert not np.array_equal(np.asarray(ordered["M1"]), np.asarray(got["M1"]))
+        with pytest.raises(ValueError, match="multiple of 4"):
+            read_shared_pole_bank(io, meta=meta, header=header, fields=("M1",), q_ids=[0, 1, 2],
+                                  partition_spec=batch)
+        with pytest.raises(ValueError, match="exactly one of q_span or q_ids"):
+            read_shared_pole_bank(io, (0, 1), meta=meta, header=header, fields=("M1",), q_ids=[0])

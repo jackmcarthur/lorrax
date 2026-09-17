@@ -9,6 +9,7 @@ are collective over the supplied mesh, including validation and publication.
 from __future__ import annotations
 
 import hashlib
+from functools import lru_cache
 import json
 from pathlib import Path
 
@@ -1119,13 +1120,69 @@ def _write_bank_payload(io, header, meta, prepared):
     header["moment_written"] = moment_mask.tolist()
 
 
-def read_shared_pole_bank(io, q_span, *, meta, header, sample_span=None,
-                          fields=("Wc", "dWc_ds")):
+_BATCH_LAYOUT = ("x", "y")
+
+
+def _bank_layout(partition_spec):
+    """Reader layout from the caller's spec: None is the face; P(('x','y'), None, ...) is batch layout."""
+    if partition_spec is None:
+        return "face"
+    spec = tuple(partition_spec)
+    lead = spec[0] if spec else None
+    if (isinstance(lead, (tuple, list)) and tuple(lead) == _BATCH_LAYOUT
+            and all(entry is None for entry in spec[1:])):
+        return "batch"
+    _refuse(f"scratch bank partition_spec must be None (face tiles) or P(('x','y'), None, ...) "
+            f"(batch layout); got {partition_spec}")
+
+
+@lru_cache(maxsize=None)
+def _bank_face_to_batch(mesh, ndim):
+    """Staged face -> batch layout for a [B, ..., mu, nu] bank stack (x then y all_to_all).
+
+    The literal schedule of ``common.staged_reshard.face_to_batch_reshard`` with the
+    face axes last: no arithmetic, bit-exact, no rank ever holds another's whole row.
+    """
+    from common.shard_map import shard_map
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+
+    def body(a):
+        if px > 1:
+            a = jax.lax.all_to_all(a, "x", split_axis=0, concat_axis=ndim - 2, tiled=True)
+        if py > 1:
+            a = jax.lax.all_to_all(a, "y", split_axis=0, concat_axis=ndim - 1, tiled=True)
+        return a
+    return jax.jit(shard_map(body, mesh=mesh, in_specs=P(*((None,) * (ndim - 2)), "x", "y"),
+                             out_specs=P(_BATCH_LAYOUT, *((None,) * (ndim - 1))), check_vma=False))
+
+
+@lru_cache(maxsize=None)
+def _bank_stack_rows(mesh, spec):
+    """Concatenate per-parent reads on the replicated leading axis, pinned to their layout."""
+    return jax.jit(lambda rows: jnp.concatenate(rows, axis=0),
+                   out_shardings=NamedSharding(mesh, spec))
+
+
+def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None,
+                          fields=("Wc", "dWc_ds"), q_ids=None, partition_spec=None):
     """Read committed bounded scratch fields into packed distributed operators.
 
-    Returns a plain dict of complex128 arrays in the writer layouts. Samples
-    require explicit contiguous ``sample_span``; no implicit all-bank read is
-    offered. The caller authenticates ``header`` before opening ``io``.
+    Returns a plain dict of complex128 arrays. Samples require explicit
+    contiguous ``sample_span``; no implicit all-bank read is offered. The
+    caller authenticates ``header`` before opening ``io``.
+
+    Parents are a contiguous ``q_span`` or a list ``q_ids`` (repeats allowed:
+    a round's synthetic slots repeat its last parent); the leading axis of
+    every field follows that order. ``partition_spec`` chooses the layout:
+    ``None`` returns face tiles (``[q, s, mu_X, nu_Y]`` samples,
+    ``[q, mu_X, nu_Y]`` moments); ``P(('x','y'), None, ...)`` returns batch
+    layout, whole matrices on the rank that owns each parent (rank
+    ``x*Py + y`` owns rows ``[r*q/P, (r+1)*q/P)``), for which the number of
+    parents must be a multiple of P. A contiguous ascending run is one
+    collective read in the requested layout: in batch layout each rank reads
+    only its own whole rows. Any other id list is one face read per parent
+    (``[1, ...]``) stacked in order, then moved to batch layout by the staged
+    x-then-y exchange; values are identical either way.
     """
     if header.get("schema") != BANK_SCHEMA:
         _refuse("scratch bank reader schema mismatch")
@@ -1138,7 +1195,22 @@ def read_shared_pole_bank(io, q_span, *, meta, header, sample_span=None,
         _refuse("scratch bank fields must be distinct Wc/dWc_ds/M1/M3 names "
                 "(M0/M2 on a bank with odd moments)")
     shape = header["bank_shape"]
-    q0, q1 = _span(q_span, shape["nq"], "q_span")
+    layout = _bank_layout(partition_spec)
+    if (q_span is None) == (q_ids is None):
+        _refuse("scratch bank read takes exactly one of q_span or q_ids")
+    if q_ids is None:
+        q0, q1 = _span(q_span, shape["nq"], "q_span")
+        ids = list(range(q0, q1))
+    else:
+        ids = [int(v) for v in q_ids]
+        if not ids or any(isinstance(v, (bool, np.bool_)) for v in q_ids) or any(
+                not 0 <= v < shape["nq"] for v in ids):
+            _refuse(f"q_ids out of bounds or empty: {list(q_ids)}, extent {shape['nq']}")
+    contiguous = ids == list(range(ids[0], ids[0] + len(ids)))
+    mesh = meta.mu_basis.mesh_xy
+    ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
+    if layout == "batch" and len(ids) % ranks:
+        _refuse(f"batch-layout bank read needs a multiple of {ranks} parents, got {len(ids)}")
     need_samples = any(name in _BANK_SAMPLE_FIELDS for name in fields)
     if need_samples and sample_span is None:
         _refuse("scratch sample read requires explicit sample_span")
@@ -1151,31 +1223,44 @@ def read_shared_pole_bank(io, q_span, *, meta, header, sample_span=None,
         _refuse("scratch centroid extent mismatch")
     sample_mask = np.asarray(header["sample_written"], dtype=bool)
     moment_mask = np.asarray(header["moment_written"], dtype=bool)
+    unique = sorted(set(ids))
     for name in fields:
-        marked = (sample_mask[q0:q1, a0:a1, _BANK_SAMPLE_FIELDS.index(name)]
+        marked = (sample_mask[unique, a0:a1, _BANK_SAMPLE_FIELDS.index(name)]
                   if name in _BANK_SAMPLE_FIELDS
-                  else moment_mask[q0:q1, _bank_moment_fields(header).index(name)])
+                  else moment_mask[unique, _bank_moment_fields(header).index(name)])
         if not marked.all():
             _refuse(f"scratch bank {name} requested span is incomplete")
     out = {}
     retained = 0
     for name in fields:
         sample = name in _BANK_SAMPLE_FIELDS
-        spec = P(None, None, 'x', 'y') if sample else P(None, 'x', 'y')
-        prefix = (q1-q0, a1-a0) if sample else (q1-q0,)
-        offset = (q0, a0, 0, 0) if sample else (q0, 0, 0)
-        arg, output, temporary = _conversion_bytes(basis,
-            prefix+(basis.n_canonical,basis.n_canonical),spec,unpack=False,operator=True)
-        _admit(ledger,"read_bank_"+name,retained+arg+output,temporary,
-               device_panel=arg,native_host=True,io=io)
-        canonical = io.read_slab(
-            name, shape=prefix + (basis.n_canonical, basis.n_canonical),
-            valid_shape=prefix + (basis.n_logical, basis.n_logical),
-            offset=offset, dtype=np.complex128, partition_spec=spec)
-        out[name] = basis.pack_operator(canonical, spec=spec)
-        out[name].block_until_ready()
-        retained += output
-        del canonical
+        face = P(None, None, 'x', 'y') if sample else P(None, 'x', 'y')
+        spec = face if layout == "face" or not contiguous else (
+            P(_BATCH_LAYOUT, None, None, None) if sample else P(_BATCH_LAYOUT, None, None))
+        runs = [(ids[0], len(ids))] if contiguous else [(q, 1) for q in ids]
+        rows = []
+        for q, count in runs:
+            prefix = (count, a1-a0) if sample else (count,)
+            offset = (q, a0, 0, 0) if sample else (q, 0, 0)
+            arg, output, temporary = _conversion_bytes(basis,
+                prefix+(basis.n_canonical,basis.n_canonical),spec,unpack=False,operator=True)
+            _admit(ledger,"read_bank_"+name,retained+arg+output,temporary,
+                   device_panel=arg,native_host=True,io=io)
+            canonical = io.read_slab(
+                name, shape=prefix + (basis.n_canonical, basis.n_canonical),
+                valid_shape=prefix + (basis.n_logical, basis.n_logical),
+                offset=offset, dtype=np.complex128, partition_spec=spec)
+            row = basis.pack_operator(canonical, spec=spec)
+            row.block_until_ready()
+            retained += output
+            del canonical
+            rows.append(row)
+        value = rows[0] if len(rows) == 1 else _bank_stack_rows(mesh, spec)(tuple(rows))
+        del rows
+        if layout == "batch" and not contiguous:
+            value = _bank_face_to_batch(mesh, value.ndim)(value)
+        value.block_until_ready()
+        out[name] = value
     return out
 
 
