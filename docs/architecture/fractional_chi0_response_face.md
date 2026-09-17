@@ -3,8 +3,10 @@
 > 2026-09-06 parent-route update: production minimax and fractional-contour
 > response factories now accept only canonical faces or typed raw parents;
 > their legacy four-copy factories and operand branches are deleted.
-> All three response validations use independent band-pair sums. Static Γ/direct
-> pair legacy bodies and their public-wrapper branches are also deleted.
+> Both response validations use independent band-pair sums. Since 2026-09-17
+> the static Γ pair kernel and the scan's `z = 0` divided-difference branch are
+> deleted: static χ₀ is `compute_chi0_matsubara` at `n = 0`, and the
+> ordered-pair scan serves only nonzero `z` (the MPA metal near-origin sample).
 > Historical port descriptions below are retained as derivation context,
 > not as current route-selection instructions; see [decisions](decisions.md).
 
@@ -37,13 +39,10 @@ going through the ordinary `build_G_tau`-based minimax kernel
    `low_mem_bands` port already ships a `layout='face'` arm for. **This half
    needed no new distributed algorithm** — see "Part A" below.
 
-2. **The ordered-pair kernel** (`_fractional_pair_scan` and its two callers,
-   `_get_chi_static_fractional_gamma_kernel` /
-   `_get_chi_fractional_q_kernel`, reached through
-   `compute_chi0_static_fractional_gamma` /
-   `compute_chi0_direct_fractional`) —
-   the exact static divided difference `(f_a-f_b)/(E_a-E_b)` (or its dynamic
-   generalization `(f_a-f_b)/(E_a-E_b+z)`) is **jointly** a function of BOTH
+2. **The ordered-pair kernel** (`_fractional_pair_scan_face`, reached through
+   `_get_chi_fractional_q_kernel_face` / `compute_chi0_direct_fractional`) —
+   the ordered-pair weight `(f_a-f_b)/(E_a-E_b+z)` at nonzero `z` is
+   **jointly** a function of BOTH
    band indices' energies and occupations. It does **not** separate into a
    product of a per-`a` and a per-`b` factor (the denominator couples `a`
    and `b`), so it cannot collapse to a one-particle `build_G_tau`/GEMM
@@ -122,8 +121,7 @@ design note held itself to):
 
 1. **The weight is not bilinear in `(a,b)`.** A GEMM computes
    `Σ_n A(m,n)·B(n,p)` — a contraction that is linear in a SINGLE shared
-   index `n`. The ordered-pair weight `(f_a-f_b)/(E_a-E_b+z)` (or its
-   diagonal `-df/dE` limit) is a function of the PAIR `(a,b)` that does not
+   index `n`. The ordered-pair weight `(f_a-f_b)/(E_a-E_b+z)` is a function of the PAIR `(a,b)` that does not
    factor as `u_a·v_b` for any choice of `u`, `v` (the denominator mixes
    both indices) — this is a re-derivation, not a repetition, of the
    census's finding. There is no GEMM whose output is this weighted sum:
@@ -174,7 +172,7 @@ phantom `global_band >= nb_full`, `owner_y`/`owner_x` computes `>= p_y`/
 `>= p_x`, which no real rank ever equals, so `psum` returns exactly zero —
 no separate `bc_valid` clamp-and-mask is needed here the way `_z_q_face`
 needed one for its `weight_l`/`weight_r` lookup, because THIS design pads
-`energy`/`occupation`/`surface_weight` with `jnp.pad` (legacy's own
+`energy`/`occupation` with `jnp.pad` (legacy's own
 technique, reused verbatim) rather than indexing a real array at an
 out-of-range position — the padded region is `0.0`, always finite, and its
 contribution is independently zeroed by the pre-existing `nb_logical`
@@ -233,12 +231,10 @@ name in `KNOWN_LORRAX_ISSUES.md` rather than a design gap.
 
 ### Dispatch
 
-`compute_chi0_static_fractional_gamma` and
-`compute_chi0_direct_fractional` (whose `z = 0` entry is the finite-`q`
-static row) both dispatch on `wfns.layout`, mirroring
-`_chi_layout_operands`'s established pattern for the ordinary minimax
-kernel. Under `layout='face'` the caller's (possibly narrower than
-`nb_full`) `energies`/`occupations`/`surface_weight` tables are zero-padded
+`compute_chi0_direct_fractional` dispatches on `wfns.layout` and the raw
+parent carrier, mirroring `_chi_layout_operands`'s established pattern for
+the ordinary minimax kernel. Under `layout='face'` the (possibly narrower
+than `nb_full`) `energies`/`occupations` tables are zero-padded
 up to `nb_full` (harmless: any padded position is `>= nb_logical`, hence
 already excluded by the pre-existing `nb_logical` mask) before the face
 kernel is called with the FULL `psi_mun`/`psi_nmu`.

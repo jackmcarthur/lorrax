@@ -152,7 +152,7 @@ Our positive-time scan has no windows. The `f(1-f)` weights themselves do the
 exclusion — the same protection, achieved **pointwise** instead of
 structurally, with no window machinery, no valence/conduction list split, and
 no scissors at the Fermi surface: the degenerate limit is not dodged but
-evaluated exactly, by the divided-difference kernel of 1.5. The windowless
+evaluated exactly, by the static producer of 1.5. The windowless
 form also keeps every ordered pair of the exact sum — including same-side
 Fermi-shell pairs, which a disjoint valence-list-times-conduction-list
 structure cannot form — with the exact net weight `f_a - f_b`.
@@ -182,16 +182,15 @@ $$
 \frac{f(E)-f(E')}{E'-E}\;\longrightarrow\;-\frac{df}{dE}
 $$
 
-is finite but reached as `0/0`. The metal plan therefore routes exactly that
-row — and only that row — through the exact divided-difference kernel
-(section 2.3 for the measured decision): `w_isdf._static_fractional_pair_scan`
-forms the **net** `(f_a-f_b)/(E_a-E_b)` per ordered pair tile *before* any
-quadrature exists, with the analytic `-df/dE` midpoint limit on pairs closer
-than floating-point energy resolution. There are no two terms to cancel; the
-kernel is cancellation-free by construction, and it is exact (finite-band),
-not a finite-`eta` contour in disguise. The split is: **form A for every
-dynamic sample, divided difference for the static row** — each form used
-exactly where its conditioning is best.
+is finite but reached as `0/0`. Static χ₀ on fractional occupations has one
+producer, `w_isdf.compute_chi0_matsubara` at `n = 0` (Fermi-Dirac only).  Its
+imaginary-time factors `f e^{(E-mu)tau}` and `(1-f) e^{-(E-mu)tau}` lie in
+`(0, 1]` on `[0, beta]`, so there are no two terms to cancel and no divided
+difference: after the transform a pair carries `(f_a-f_b)/(E_a-E_b)`, and a
+degenerate pair carries `beta f (1-f) = -df/dE`.  The metal MPA plan itself
+has no `z = 0` sample (its origin is shifted, 2.3); the static producer's
+consumer is the QSGW head's Γ body (4.1).  The split is: **form A for every
+dynamic sample, the finite-temperature Matsubara sweep for the static row**.
 
 ## 2. Frequency sampling: the metal plan, argued from measurement
 
@@ -316,8 +315,10 @@ finite-`q` substitution.
    MP1 — sign-changing, non-monotone — cannot borrow a Fermi–Dirac/Matsubara
    pole certificate. At Na scale the exact tiled kernel is affordable for
    its single sample per fit (the TASTE-6 ruling with the per-step byte
-   figure is restated in `_static_fractional_pair_scan`'s docstring, which
-   also forbids extending the route to a full dynamic grid).
+   figure is restated in `_fractional_pair_scan_face`'s docstring, which
+   also forbids extending the route to a full dynamic grid).  The static
+   target this item was staged for is now served without a pole fit, by
+   the Fermi-Dirac Matsubara producer at `n = 0` (1.5).
 
 ### 2.5 What "optimal given current theory" means
 
@@ -353,36 +354,28 @@ staged low-scaling replacement for that isolated quadratic scan.
 
 Every stored wedge row of every ordinary dynamic sample is the fractional
 contour kernel; the shifted-origin row is the exact finite-`q` direct-frequency
-ordered-pair response. The
-finite-`q` static kernel (`w_isdf.compute_chi0_direct_fractional` at `z = 0`) is the
-`Gamma` kernel's sibling through one shared tile scan
-(`_static_fractional_pair_scan`): for wedge row `j`, every `b`-side operand
-— both centroid wavefunction copies, energies, occupations, surface weights
-— is rolled by the caller's flat `k -> k-q_j` map
+ordered-pair response (`w_isdf.compute_chi0_direct_fractional`, one tile scan
+`_fractional_pair_scan_face` at literal nonzero `z`; `z = 0` refuses by name).
+For wedge row `j`, every `b`-side operand — both centroid wavefunction copies,
+energies, occupations — is rolled by the caller's flat `k -> k-q_j` map
 (`model._metal_kminq_rows`, which asserts the `Gamma` row's map is the
 identity). The map is replicated and the `psi` k-axis is replicated on this
-mesh, so the gather is rank-local: no collective is added over the `Gamma`
-kernel. Cost is the ordered band-pair tile transient
-(`nk*(nmu_x/P_x + nmu_y/P_y)*tile^2*16 B` per rank per step); one static
-sample per fit rides it, never a dynamic route.
+mesh, so the gather is rank-local. Cost is the ordered band-pair tile transient
+(`nk*(nmu_x/P_x + nmu_y/P_y)*tile^2*16 B` per rank per step); one sample per
+fit rides it, never a dynamic grid.
 
-One deliberate asymmetry, stated so no one "fixes" it silently: the two
-static kernels use **different diagonal `-df/dE` tables**. The `Gamma` kernel
-(`compute_chi0_static_fractional_gamma`) consumes a caller-supplied surface
-table — the QSGW path supplies periodic-tetrahedron weights
-(`gw.fermi_surface.tetrahedron_delta_weights`), keeping the body diagonal
-consistent with the head's `kappa_TF^2` anchor (4.1). The finite-`q` kernel
-uses the analytic MP1 derivative internally
-(`gw.efermi.mp1_negative_derivative`) and refuses any state whose
-`smearing_family != "mp1"` by name (`GATE static_fractional_needs_mp1`); at
-finite `q` the true diagonal `a=b` pair sits at `k` vs `k-q` and is only
-*accidentally* degenerate, so the analytic midpoint limit is the correct
-regularization there, while the `Gamma` diagonal is a genuine Fermi-surface
-integral for which the tetrahedron table is the anchor (claim 182 for the
-estimator-choice consequences). Off-diagonal pairs use the carried MP1
-occupations in both kernels. Gate: the extended
-`fractional_chi_gate.py` static row measured `max_rel = 3.720e-16` against
-the dense divided-difference oracle over all `q` rows (P=4, JID 56986042).
+The retired static pair kernels (a Γ kernel on a caller-supplied
+tetrahedron surface table, and the finite-`q` `z = 0` entry on the analytic
+`-df/dE`) are replaced by the Matsubara producer, whose degenerate-pair
+weight is the Fermi-Dirac `-df/dE`.  On the Na Fermi-Dirac deck
+(`runs/Na/20` inputs, `kT = 0.01 Ry`) the Γ body from the Matsubara producer
+matches the retired scan with the FD diagonal to `3.5e-7` relative Frobenius
+at `minimax_target_error = 1e-6` (16 nodes); the retired tetrahedron table
+differs from the FD diagonal by `4.2e-3` at Γ, and dropping the diagonal
+altogether moves it by `3.6e-2` (claim CHI3GAMMA).  Gate for the remaining
+scan: `tests/multi_device/fractional_chi_gate.py` checks nonzero-`z` rows for
+both occupation families and both carrier layouts against a dense
+ordered-pair oracle.
 
 Dyson, wedge storage, and the bounded column fit are unchanged from the
 insulating pipeline and owned by
@@ -416,9 +409,9 @@ with `N(E_F)` the periodic-tetrahedron `-df/dE` weight sum
 `fermi_surface.tetrahedron_delta_weights`). The Schur fold then couples the
 scalar to the body: `qsgw_head._fold_static_kappa2` folds
 `f00 = -kappa_TF^2/(8*pi)` through the *static density wings*
-(`static_head_wings_sharded`) and the `Gamma` divided-difference body
-(`IterationHeadResponse.static_chi_body_gamma`, built by
-`compute_chi0_static_fractional_gamma`) via
+(`static_head_wings_sharded`) and the static `Gamma` body
+(`IterationHeadResponse.static_chi_body_gamma`: row 0 of
+`compute_chi0_matsubara` at `n = 0` on the map's occupation state) via
 `head_correction.fold_cartesian_head_wings_sharded`, reporting
 
 $$
