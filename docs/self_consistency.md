@@ -516,6 +516,13 @@ head wings through total W. The head fit is bound to that map's body digest.
 recomputed at the current head frequencies and folded through current W. MPA
 sampling keys configure this scalar head; elementwise-body fit/reuse keys have
 no shared-pole consumer. The shifted finite-q BGW metal head remains unsupported.
+The full head evaluates only the time-reversal-even, N_spinor = 1 Gamma body:
+an ordered (time-reversal-broken) or two-component deck refuses at input
+resolution (`GATE shared_pole_head_ordered`, `GATE shared_pole_head_nspinor`,
+`shared_pole_head.refuse_unsupported_shared_pole_head`), before any bank or
+constructor runs. A one-shot deck on such a system uses `head_correction = off`;
+a self-consistent shared-pole deck has no valid setting there until the signed
+Gamma head lands.
 
 Validation on branch `investigate/shared-pole-sc-quadrature-2026-09-10`:
 P4 Si job58152308.12, using diagnostic Sigma integration and the historical

@@ -357,6 +357,11 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
                + "; using unreduced parents (n_parent = nk) and full q on the same "
                "parent route. Generate orbit-closed centroids with kmeans to restore reduction.")
         sym = sym.trivial_view()
+    # Before any basis, bank or constructor: the full shared-pole head refuses
+    # an ordered or N_spinor != 1 store here, on the final symmetry verdict.
+    from .shared_pole_head import refuse_unsupported_shared_pole_head
+    refuse_unsupported_shared_pole_head(
+        config, trs_allowed=sym.trs_allowed, nspinor=wfn.nspinor)
     centroid_indices = centroid_basis.centroid_indices
     n_rmu = centroid_basis.n_rmu
     tmp_dir = os.path.join(input_dir, "tmp")
