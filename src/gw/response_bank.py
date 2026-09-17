@@ -19,7 +19,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 
-def response_algebra(meta, config, *, mesh_xy, n, ordered=False):
+def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     """Plan physical Dyson samples and exact high-frequency moments.
 
     Parameters
@@ -116,6 +116,43 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False):
     if ordered:
         algebra["moment_convention"] += "; odd M0 (1/z) and M2 (1/z^3), M_k = C_(k+1)/2"
         algebra["units"].update(M0="Ry^2", M2="Ry^4")
+    if photon:
+        @partial(jax.jit, in_shardings=(face, face), out_shardings=face)
+        def infinity(v, contact):
+            # chi(z)=chi_param(z)-contact, so W_inf=(I+V contact)^-1 V.
+            identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), v.shape)
+            return lu.batched(identity + mm(v, contact), v.copy())
+
+        @partial(jax.jit, in_shardings=(face, face, face, face),
+                 out_shardings=(face, face))
+        def samples(v, chi_raw, dchi_raw, contact):
+            # Signed photon Dyson: W=(I-V chi)^-1 V. No square root of V_TT.
+            # dW/ds=W (dchi/ds) W, with no adjoint at complex frequency.
+            chi = pref * chi_raw - contact
+            identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), chi.shape)
+            w = lu.batched(identity - mm(v, chi), v.copy())
+            return w - v, mm(mm(w, pref * dchi_raw), w)
+
+        @partial(jax.jit, in_shardings=(face,) * 6,
+                 out_shardings=(face,) * 5)
+        def moments(v, a0, a1, o0, o1, contact):
+            # W=W_inf + sum C_k/z^k. Dyson recurrence
+            # C_k=W_inf [chi_k W_inf + sum_{i=1}^{k-1} chi_i C_(k-i)].
+            # Bare coefficients are already physically scaled.
+            winf = infinity(v, contact)
+            coefficients = (o0, a0, o1, a1)
+            result = []
+            for k, coefficient in enumerate(coefficients):
+                rhs = mm(coefficient, winf)
+                for i in range(k):
+                    rhs = rhs + mm(coefficients[i], result[k-i-1])
+                result.append(mm(winf, rhs))
+            return (winf - v, *(0.5 * c for c in result))
+
+        algebra["representation"] = "signed packed photon"
+        algebra["constant"] = "W_infinity-V, retained separately from M0..M3"
+        algebra["moment_convention"] = "M_k=C_(k+1)/2 about W_infinity"
+        algebra["units"].update(M0="Ry^2", M2="Ry^4", constant="Ry")
     return samples, moments, algebra
 
 
@@ -157,8 +194,58 @@ def response_weights(wfns, meta):
     }
 
 
+def prepare_photon_carriers(wfns, wfns_transverse, meta, meta_transverse, *,
+                            mesh_xy, layout):
+    """Prepare bare/J-applied photon endpoints for the one response stream.
+
+    Each family is unfolded by its authenticated parent plan before applying
+    ``J=(I,alpha_x,alpha_y,alpha_z)``. Canonical centroid conversion precedes
+    the photon pack. Returned arguments are ``((bare_mun,J_mun),
+    (bare_nmu,J_nmu), energy)``; endpoints have four spin components and
+    ``layout.packed_extent`` centroids, with both face axes distributed.
+    Only linear-size wavefunction carriers are materialized here.
+    """
+    from common.gamma_matrices import gamma_apply, gamma_perm_phase
+    from common.shard_map import shard_map
+    from common.wfn_layout import psi_specs
+    from .photon_layout import pack_photon_faces
+    from .w_isdf import _require_current_chi_endpoints
+
+    left, right = _require_current_chi_endpoints(wfns, wfns_transverse)
+    for name in ("irr_idx", "sym_idx", "k_parent_frac", "spin_action_full"):
+        if not np.array_equal(getattr(left.plan, name), getattr(right.plan, name)):
+            raise ValueError("GATE response_vertex: endpoint parent actions disagree")
+    if not np.array_equal(np.asarray(wfns.enk), np.asarray(wfns_transverse.enk)):
+        raise ValueError("GATE response_vertex: endpoint energies disagree")
+    if not np.array_equal(np.asarray(wfns.occ), np.asarray(wfns_transverse.occ)):
+        raise ValueError("GATE response_vertex: endpoint occupations disagree")
+    nmu_spec, mun_spec = psi_specs(wfns.layout)
+    families = []
+    for carrier, metadata in ((left, meta), (right, meta_transverse)):
+        plan = carrier.plan
+        @partial(shard_map, mesh=mesh_xy, in_specs=(mun_spec, nmu_spec),
+                 out_specs=(mun_spec, nmu_spec), check_vma=False)
+        def unfold(mun, nmu):
+            return (plan.unfold_face(mun, spin_axis=1, mu_axis=2, mesh_axis="x"),
+                    plan.unfold_face(nmu, spin_axis=2, mu_axis=3, mesh_axis="y"))
+        mun, nmu = jax.jit(unfold)(carrier.psi_mun, carrier.psi_nmu)
+        basis = metadata.mu_basis
+        families.append((basis.unpack_axis(mun, 2, spec=mun_spec),
+                         basis.unpack_axis(nmu, 3, spec=nmu_spec)))
+    endpoints = []
+    for index, orientation, spin_axis in ((0, "mun", 1), (1, "nmu", 2)):
+        bare = (families[0][index],) + (families[1][index],) * 3
+        current = tuple(gamma_apply(face, *gamma_perm_phase(A), axis=spin_axis,
+                                    is_identity=A == 0)
+                        for A, face in enumerate(bare))
+        endpoints.append(tuple(pack_photon_faces(faces, layout, mesh_xy,
+            orientation=orientation, wfn_layout=wfns.layout) for faces in (bare, current)))
+    return (*endpoints, wfns.enk)
+
+
 def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
-                    pair_mode="retarded", bank_carry=False, ordered=False):
+                    pair_mode="retarded", bank_carry=False, ordered=False,
+                    vertex=None):
     """Bind the existing one-particle Green/FFT primitive to a q batch.
 
     Returns a jitted kernel and its fixed ψ/energy arguments. Caller supplies
@@ -171,6 +258,16 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
 
     from file_io.shared_pole_store import charge_representation
 
+    if vertex is not None:
+        if pair_mode == "laplace":
+            raise ValueError("GATE response_vertex: photon Laplace cells must retain odd rows")
+        n = int(vertex[0][0].shape[2])
+        kernel = _get_chi_fractional_contour_kernel_face(
+            mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
+            (int(meta.nk_tot), int(wfns.slices.nb_full), n, 4),
+            layout=wfns.layout, selected_q=tuple(q_ids), pair_mode=pair_mode,
+            bank_carry=bank_carry, ordered=True, vertex=True)
+        return kernel, vertex
     if wfns.layout != "face" or not charge_representation(meta):
         raise ValueError("GATE response_representation: got bispinor or legacy "
                          "wavefunctions; want scalar or two-component charge face "
@@ -188,17 +285,18 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
 
 
-def stream_weights(wfns, weights, mesh_xy):
+def stream_weights(wfns, weights, mesh_xy, *, parents=True):
     """Place small band weights and restrict to existing raw parents."""
     from common.collectives import replicate_to_mesh
 
     result = replicate_to_mesh(np.asarray(weights), mesh_xy)
-    if wfns.green_parent is not None:
+    if parents and wfns.green_parent is not None:
         result = wfns.green_parent.plan.parent_rows(result)
     return result
 
 
-def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False):
+def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False,
+                       vertex=None):
     """Compute A0/A1 of scaled chi=A0/s+A1/s² by six correlations.
 
     The binomial coefficients expand ``(E_u-E_f)`` and its cube. Imaginary
@@ -210,17 +308,20 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False):
     from .w_isdf import _w_solve_pref_scalar
 
     energy, f, u, reference, census = response_weights(wfns, meta)
+    ordered = ordered or vertex is not None
+    weights = partial(stream_weights, parents=vertex is None)
     erel = energy - reference
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
-                                    q_ids=q_ids, n_outputs=1, ordered=ordered)
+                                    q_ids=q_ids, n_outputs=1, ordered=ordered,
+                                    vertex=vertex)
     terms = (((-1., 1, 0), (1., 0, 1)),
              ((-1., 3, 0), (3., 2, 1), (-3., 1, 2), (1., 0, 3)))
     totals = []
     for moment_terms in terms:
         total = None
         for coefficient, a, b in moment_terms:
-            weight_f = stream_weights(wfns, f * erel**a, mesh_xy)
-            weight_u = stream_weights(wfns, -1j * u * erel**b, mesh_xy)
+            weight_f = weights(wfns, f * erel**a, mesh_xy)
+            weight_u = weights(wfns, -1j * u * erel**b, mesh_xy)
             args = (jnp.asarray([0.]), jnp.asarray([[1. + 0j]]), *fixed,
                     weight_f.astype(jnp.complex128), weight_u,
                     jnp.asarray(reference))
@@ -237,8 +338,8 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False):
     for moment_terms in (((1., 0, 0),), ((1., 2, 0), (-2., 1, 1), (1., 0, 2))):
         total = None
         for coefficient, a, b in moment_terms:
-            weight_f = stream_weights(wfns, f * erel**a, mesh_xy)
-            weight_u = stream_weights(wfns, u * erel**b, mesh_xy)
+            weight_f = weights(wfns, f * erel**a, mesh_xy)
+            weight_u = weights(wfns, u * erel**b, mesh_xy)
             args = (jnp.asarray([0.]), jnp.asarray([[1. + 0j]]), *fixed,
                     weight_f.astype(jnp.complex128), weight_u.astype(jnp.complex128),
                     jnp.asarray(reference))
@@ -839,6 +940,108 @@ def _ordered_cost_probe(wfns, meta, mesh_xy, qid, tau, projections, lw, uw, refs
                 scope="warm rank-0 wall seconds per remote Laplace node, one q parent, after a synchronized fence")
 
 
+def response_quadrature(wfns, meta, sample_plan, receipt, *, ordered=False):
+    """Plan the same windowed real-time/Laplace rules for charge or photon panels.
+
+    ``sample_plan`` is the existing authenticated support plan. The returned
+    plain dictionary holds only band tables and quadrature rows, no operators.
+    """
+    z = bank_points(sample_plan)
+    energy,f,u,reference,_ = response_weights(wfns,meta)
+    masks,ft,ut,cells,receipt["windows"] = response_windows(energy,f,u,
+        chemical_potential_ry=sample_plan["census"]["mu_ry"],z_ry=z)
+    import minimax
+    bank_rule,laplace_rule = minimax.response_bank_rule,minimax.response_laplace_rule
+    receipt["rule_provider"] = "minimax"
+    middle = energy[masks[1]]
+    delta = float(middle.max()-middle.min())
+    session = getattr(meta, "shared_pole_response_rules", None)
+    # Each one-particle endpoint gets 2 eV: a transition edge gets 4 eV.
+    pad = 4.0/RYD_TO_EV if session is not None else 0.0
+    rule = bank_rule(z,delta,rel_tol=sample_plan["bank_rule_tolerance"],
+        previous=None if session is None else session.get("stream"),
+        domain_pad_ry=pad)
+    if session is not None:
+        session["stream"] = rule
+    t,weights = np.asarray(rule["t"]),np.asarray(rule["h"])
+    phase = np.asarray(rule["projection_value"])
+    derivative = np.asarray(rule["projection_derivative"])
+    receipt["rule"] = {k:v for k,v in rule.items() if k not in ("t","h","projection_value","projection_derivative")}
+    receipt["nodes"] = len(t)
+    remote = []
+    for cell in cells:
+        key = (cell["lower"], cell["upper"])
+        rr = laplace_rule(cell["delta_min_ry"],cell["delta_max_ry"],z,
+            rel_tol=sample_plan["bank_rule_tolerance"],
+            previous=None if session is None else session.get(key),
+            domain_pad_ry=pad,**({"ordered": True} if ordered else {}))
+        if session is not None:
+            session[key] = rr
+        remote.append((cell,rr))
+    receipt["laplace_cells"] = [{**cell,**{k:v for k,v in rr.items()
+        if k not in ("t","projection_value","projection_derivative","coefficient_rows",
+                     "odd_projection_value","odd_projection_derivative")}}
+        for cell,rr in remote]
+    return dict(t=t, phase=phase, derivative=derivative, remote=remote,
+                masks=masks, ft=ft, ut=ut, reference=reference)
+
+
+def integrate_response_panel(wfns, meta, mesh_xy, rules, *, q_ids, sample_span,
+                             execute, receipt, ordered=False, vertex=None):
+    """Integrate an admitted panel through the single Green/FFT stream.
+
+    Returns ``[2*n_sample,n_q,n_mu,n_mu]`` at P(None,None,x,y), value rows
+    followed by d/ds rows. Photon endpoints are prepared once by
+    ``prepare_photon_carriers``. The caller's ``execute`` admits the compiled
+    memory before execution, as in the charge bank.
+    """
+    qids = tuple(q_ids)
+    lo, hi = sample_span
+    a = hi-lo
+    ordered = ordered or vertex is not None
+    n = meta.mu_basis.n_packed if vertex is None else vertex[0][0].shape[2]
+    weights = partial(stream_weights, parents=vertex is None)
+    t, phase, derivative, remote, masks, ft, ut, reference = (
+        rules[k] for k in ("t", "phase", "derivative", "remote", "masks", "ft", "ut", "reference"))
+    kernel,fixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
+        q_ids=tuple(qids),n_outputs=2*a,bank_carry=True,ordered=ordered,vertex=vertex)
+    raw = jax.jit(lambda: jnp.zeros((2*a,len(qids),n,n),jnp.complex128),
+        out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
+    raw = execute(kernel,(jnp.asarray(t),jnp.asarray(np.vstack((phase[lo:hi],derivative[lo:hi]))),
+        *fixed,weights(wfns,ft*masks[1],mesh_xy),
+        weights(wfns,ut*masks[1],mesh_xy),jnp.asarray(reference),raw),"real_time")
+    receipt["correlation_count"] += len(t)
+    # Cell data are dynamic arguments; reuse one compiled owner for
+    # equal-shaped Laplace cells instead of retracing each closure.
+    if remote:
+        lk,lfixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
+            q_ids=tuple(qids),n_outputs=2*a,
+            pair_mode="laplace_ordered" if ordered else "laplace",bank_carry=True,vertex=vertex)
+    for cell,rr in remote:
+        with timing.fenced_section('bank.laplace_arguments'):
+            lower,upper = cell["lower"],cell["upper"]
+            refs = np.asarray(cell["references_ry"])
+            tau = np.asarray(rr["t"])
+            projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]
+            if ordered:
+                # Rows [even value, even ds, odd value, odd ds].
+                projections = np.vstack((projections,
+                    -np.vstack((rr["odd_projection_value"][lo:hi],rr["odd_projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]))
+            lw = np.stack([ft*masks[lower],ut*masks[lower]])
+            uw = np.stack([ut*masks[upper],ft*masks[upper]])
+            # Parent selection applies to the k axis, separately for each role.
+            lw = jnp.stack([weights(wfns,x,mesh_xy) for x in lw])
+            uw = jnp.stack([weights(wfns,x,mesh_xy) for x in uw])
+        if ordered and vertex is None and "ordered_cost_probe" not in receipt:
+            receipt["ordered_cost_probe"] = _ordered_cost_probe(
+                wfns,meta,mesh_xy,int(qids[0]),tau,projections,lw,uw,refs,2*a)
+        raw = execute(lk,(jnp.asarray(tau),jnp.asarray(projections),
+            *lfixed,lw,uw,jnp.asarray(refs),raw),"laplace")
+        del lw,uw
+        receipt["correlation_count"] += 2*len(tau)
+    return raw
+
+
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io):
     """Stage A: one windowed stream per admitted sample batch, all parent faces."""
     with timing.fenced_section('bank.setup'):
@@ -863,42 +1066,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     with timing.fenced_section('bank.window_geometry'):
         samples,_,receipt["algebra"] = response_algebra(meta,config,
             mesh_xy=mesh_xy,n=meta.mu_basis.n_packed)
-        energy,f,u,reference,_ = response_weights(wfns,meta)
-        masks,ft,ut,cells,receipt["windows"] = response_windows(energy,f,u,
-            chemical_potential_ry=sample_plan["census"]["mu_ry"],z_ry=z)
-    with timing.fenced_section('bank.quadrature'):
-        import minimax
-        bank_rule,laplace_rule = minimax.response_bank_rule,minimax.response_laplace_rule
-        receipt["rule_provider"] = "minimax"
-        middle = energy[masks[1]]
-        delta = float(middle.max()-middle.min())
-        session = getattr(meta, "shared_pole_response_rules", None)
-        # Each one-particle endpoint gets 2 eV: a transition edge gets 4 eV.
-        pad = 4.0/RYD_TO_EV if session is not None else 0.0
-        rule = bank_rule(z,delta,rel_tol=sample_plan["bank_rule_tolerance"],
-            previous=None if session is None else session.get("stream"),
-            domain_pad_ry=pad)
-        if session is not None:
-            session["stream"] = rule
-        t,weights = np.asarray(rule["t"]),np.asarray(rule["h"])
-        phase = np.asarray(rule["projection_value"])
-        derivative = np.asarray(rule["projection_derivative"])
-        receipt["rule"] = {k:v for k,v in rule.items() if k not in ("t","h","projection_value","projection_derivative")}
-        receipt["nodes"] = len(t)
-        remote = []
-        for cell in cells:
-            key = (cell["lower"], cell["upper"])
-            rr = laplace_rule(cell["delta_min_ry"],cell["delta_max_ry"],z,
-                rel_tol=sample_plan["bank_rule_tolerance"],
-                previous=None if session is None else session.get(key),
-                domain_pad_ry=pad,**({"ordered": True} if ordered else {}))
-            if session is not None:
-                session[key] = rr
-            remote.append((cell,rr))
-        receipt["laplace_cells"] = [{**cell,**{k:v for k,v in rr.items()
-            if k not in ("t","projection_value","projection_derivative","coefficient_rows",
-                         "odd_projection_value","odd_projection_derivative")}}
-            for cell,rr in remote]
+        rules = response_quadrature(wfns, meta, sample_plan, receipt, ordered=ordered)
+        phase, derivative = rules["phase"], rules["derivative"]
     with timing.fenced_section('bank.capacity_planning_compile'):
         face_bytes = 16*meta.mu_basis.n_packed**2//mesh_xy.size
         # One donated internal [output,q,x,y] carry spans every window. Public
@@ -966,42 +1135,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 ledger.live_stages = ambient
                 name,_ = _reserve(meta,"bank_outputs",2*a*(q1-q0)*face_bytes + headroom)
                 ledger.live_stages = ambient+(name,)
-                kernel,fixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,bank_carry=True,ordered=ordered)
-                raw = jax.jit(lambda: jnp.zeros((2*a,q1-q0,meta.mu_basis.n_packed,meta.mu_basis.n_packed),jnp.complex128),
-                    out_shardings=NamedSharding(mesh_xy,P(None,None,"x","y")))()
-            raw = execute(kernel,(jnp.asarray(t),jnp.asarray(np.vstack((phase[lo:hi],derivative[lo:hi]))),
-                *fixed,stream_weights(wfns,ft*masks[1],mesh_xy),
-                stream_weights(wfns,ut*masks[1],mesh_xy),jnp.asarray(reference),raw),"real_time")
-            receipt["correlation_count"] += len(t)
-            # Cell data are dynamic arguments; reuse one compiled owner for
-            # equal-shaped Laplace cells instead of retracing each closure.
-            if remote:
-                lk,lfixed = response_stream(wfns,meta,mesh_xy=mesh_xy,
-                    q_ids=tuple(qids[q0:q1]),n_outputs=2*a,
-                    pair_mode="laplace_ordered" if ordered else "laplace",bank_carry=True)
-            for cell,rr in remote:
-                with timing.fenced_section('bank.laplace_arguments'):
-                    lower,upper = cell["lower"],cell["upper"]
-                    refs = np.asarray(cell["references_ry"])
-                    tau = np.asarray(rr["t"])
-                    projections = -np.vstack((rr["projection_value"][lo:hi],rr["projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]
-                    if ordered:
-                        # Rows [even value, even ds, odd value, odd ds].
-                        projections = np.vstack((projections,
-                            -np.vstack((rr["odd_projection_value"][lo:hi],rr["odd_projection_derivative"][lo:hi]))*np.exp(-(refs[1]-refs[0])*tau)[None,:]))
-                    lw = np.stack([ft*masks[lower],ut*masks[lower]])
-                    uw = np.stack([ut*masks[upper],ft*masks[upper]])
-                    # Parent selection applies to the k axis, separately for each role.
-                    lw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in lw])
-                    uw = jnp.stack([stream_weights(wfns,x,mesh_xy) for x in uw])
-                if ordered and "ordered_cost_probe" not in receipt:
-                    receipt["ordered_cost_probe"] = _ordered_cost_probe(
-                        wfns,meta,mesh_xy,int(qids[q0]),tau,projections,lw,uw,refs,2*a)
-                raw = execute(lk,(jnp.asarray(tau),jnp.asarray(projections),
-                    *lfixed,lw,uw,jnp.asarray(refs),raw),"laplace")
-                del lw,uw
-                receipt["correlation_count"] += 2*len(tau)
+            raw = integrate_response_panel(wfns, meta, mesh_xy, rules,
+                q_ids=tuple(qids[q0:q1]), sample_span=(lo, hi), execute=execute,
+                receipt=receipt, ordered=ordered)
             for iq in range(q0,q1):
                 span = (iq,iq+1)
                 if np.asarray(header["sample_written"])[iq,lo:hi].all():

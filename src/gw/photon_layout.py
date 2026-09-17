@@ -251,6 +251,60 @@ def pack_photon_operator(
     return packed
 
 
+def pack_photon_faces(faces, layout, mesh_xy, *, orientation, wfn_layout="face"):
+    """Pack C/T1/T2/T3 wavefunction endpoints using the operator ordering.
+
+    Parameters
+    ----------
+    faces : tuple of jax.Array
+        Four complex endpoint faces. ``orientation='mun'`` uses
+        ``[k,spin,mu,band]``; ``'nmu'`` uses ``[k,band,spin,mu]``.
+        Bands retain the layout from ``common.wfn_layout.psi_specs``.
+    layout : PhotonBasisLayout
+        Canonical channel sizes, padding and mesh-interleaved offsets.
+    mesh_xy : Mesh
+        Named square x/y mesh.
+
+    Returns
+    -------
+    jax.Array
+        Same face layout with the centroid axis replaced by packed photons.
+        This packs one-particle carriers only; no quadratic operator is made.
+    """
+    from common.shard_map import shard_map
+    from common.wfn_layout import psi_specs
+
+    layout.assert_mesh(mesh_xy)
+    if orientation not in ("mun", "nmu") or len(faces) != 4:
+        raise ValueError("photon faces require four mun or nmu endpoints")
+    nmu_spec, mun_spec = psi_specs(wfn_layout)
+    axis, mesh_axis, spec = ((2, "x", mun_spec) if orientation == "mun"
+                             else (3, "y", nmu_spec))
+    for channel, face in enumerate(faces):
+        if face.shape[axis] != layout.carrier_extent(channel):
+            raise ValueError("photon face extent differs from its channel layout")
+
+    @partial(shard_map, mesh=mesh_xy, in_specs=(spec,) * 4,
+             out_specs=spec, check_vma=False)
+    def pack(*values):
+        shape = list(values[0].shape)
+        shape[axis] = layout.packed_extent // layout.mesh_side
+        result = jnp.zeros(shape, values[0].dtype)
+        for channel, value in enumerate(values):
+            width = value.shape[axis]
+            valid = (jax.lax.axis_index(mesh_axis) * width + jnp.arange(width)
+                     < layout.logical_extent(channel))
+            mask_shape = [1] * value.ndim
+            mask_shape[axis] = width
+            value = jnp.where(valid.reshape(mask_shape), value, 0)
+            offset = [0] * value.ndim
+            offset[axis] = layout.local_offset(channel)
+            result = jax.lax.dynamic_update_slice(result, value, tuple(offset))
+        return result
+
+    return jax.jit(pack)(*faces)
+
+
 def _view_program(layout, mesh_xy, nq, p_left, p_right):
     key = (_mesh_key(mesh_xy), int(nq), layout.packed_extent,
            int(p_left), int(p_right))

@@ -51,6 +51,54 @@ _PRODUCER_TOKEN = object()
 HALL_SOURCE_NONE = "none: sigma_H = 0 (no static_gauge_hall_file)"
 
 
+def fermi_dirac_current_drude(current_kn_a, occupation_state, *,
+                              state_capacity, cell_volume, kweights):
+    r"""Return the fixed-state body-contact tensor D, not a head update.
+
+    Computes ``D_ab=C/Omega sum_kn w_k (-f'_kn) j_kn,a j_kn,b`` with
+    ``-f'=f(1-f)/kT`` from the authoritative Fermi-Dirac occupation state.
+    For a uniform full grid ``w_k=1/Nk``. The caller builds this once from
+    the initial state and retains it through SC maps.
+
+    Parameters
+    ----------
+    current_kn_a : jax.Array
+        Real diagonal Hermitian-current matrix elements ``[k,band,3]``.
+        Currents use the same units as the paramagnetic TT response.
+        These linear-size tables may be sharded; the tensor is replicated.
+    occupation_state : OccupationState
+        Fixed initial FD occupations and smearing width in Ry.
+    state_capacity : float
+        Physical occupancy per normalized state, from the WFN loader.
+    cell_volume : float
+        Cell volume in bohr cubed.
+    kweights : array_like
+        Normalized full-BZ quadrature weights ``[k]``.
+
+    Returns
+    -------
+    jax.Array
+        Real ``[3,3]`` Drude tensor. No symmetry averaging is performed.
+    """
+    if occupation_state.smearing_family != "fd":
+        raise ValueError("GATE photon_contact_fd: TT metal contact requires FD state")
+    width = float(occupation_state.smearing_width_ry)
+    capacity, volume = float(state_capacity), float(cell_volume)
+    current = jnp.asarray(current_kn_a)
+    f = jnp.asarray(occupation_state.f_kn)
+    weights = np.asarray(kweights, dtype=np.float64)
+    if current.shape != (*f.shape, 3) or jnp.iscomplexobj(current):
+        raise ValueError("GATE photon_contact_current: want real diagonal [k,band,3] currents")
+    if (not np.isfinite([width, capacity, volume]).all()
+            or min(width, capacity, volume) <= 0
+            or weights.shape != (f.shape[0],) or not np.isfinite(weights).all()
+            or np.any(weights < 0) or not np.isclose(weights.sum(), 1, rtol=0, atol=1e-12)):
+        raise ValueError("GATE photon_contact_state: invalid FD scale, volume or k weights")
+    return (capacity / volume) * jnp.einsum(
+        "kn,kna,knb->ab", jnp.asarray(weights)[:, None] * f * (1-f) / width,
+        current, current, optimize=True)
+
+
 def _canonical_wfn_sha256(value) -> str:
     value = str(value).strip()
     if (len(value) != 64
