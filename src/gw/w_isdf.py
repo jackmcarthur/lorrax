@@ -247,67 +247,31 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
     def _finish_chi(value):
         return _chi_fftn_local(value)
 
-    if n_out >= 2:
-        _chi_R_out = tuple(_chi_R_shard for _ in range(n_out))
-
-        @partial(jax.jit,
-                 in_shardings=(_nodes_shard, _psi_mun_shard, _psi_nmu_shard,
-                                NamedSharding(mesh_xy, _rep2),
-                                NamedSharding(mesh_xy, _rep2),
-                                NamedSharding(mesh_xy, _rep2),
-                                NamedSharding(mesh_xy, _rep0),
-                                NamedSharding(mesh_xy, _rep0)),
-                 out_shardings=_chi_R_out,
-                 static_argnums=())
-        def minimax_tau_integrate_chi_multi(
-            nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
-        ):
-            zero = jax.lax.with_sharding_constraint(
-                jnp.zeros((nk, n_rmu_out_left, n_rmu_out_right),
-                          dtype=jnp.complex128),
-                _chi_R_shard)
-            acc0 = tuple(zero for _ in range(n_out))
-
-            def _body(accs, xs):
-                t_scalar, alpha_col = xs
-                tau_kernel = (t_scalar if complex_contour else
-                              jnp.real(t_scalar).astype(jnp.float64))
-                Gv_k, Gc_k = _build_Gv_Gc(psi_mun, psi_nmu, mask_v, mask_c,
-                                          enk_full, tau_kernel, vmax, cmin)
-                Gv_R = _Gv_fftn(Gv_k)
-                Gc_R = _Gc_fftn(Gc_k)
-                chi_tau = jax.lax.with_sharding_constraint(
-                    jnp.einsum('Rambn,Rambn->Rmn',
-                               Gc_R, jnp.conj(Gv_R), optimize=True),
-                    _chi_R_shard)
-                if not complex_contour:
-                    chi_tau = _complete_static_vertex_orientations(chi_tau)
-                return tuple(a + alpha_col[i] * chi_tau
-                             for i, a in enumerate(accs)), None
-
-            final_R, _ = jax.lax.scan(
-                _body, acc0, (nodes.t, jnp.transpose(nodes.alpha)), unroll=1)
-            return tuple(_finish_chi(f) for f in final_R)
-
-        return minimax_tau_integrate_chi_multi
-
     identities = ((True, True) if vertex_pairs is None else
                   tuple(v == 0 for v in vertex_pairs[0]))
     n_vertices = 1 if vertex_pairs is None else len(vertex_pairs)
+    stack_shard = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
 
-    def _single_impl(
+    def _integrate(
         nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
         vertex_operands,
     ):
-        stack_shard = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
+        """One Green/FFT pair per node, shared by every vertex and every weight row.
+
+        The accumulator is ``[n_out, n_vertices, nk, mu, mu]``: row ``o`` is
+        weight vector ``o`` of ``nodes.alpha`` and column ``v`` is vertex pair
+        ``v``.  Scalar charge response is the ``n_vertices = 1`` column.
+        """
         zero = jax.lax.with_sharding_constraint(
-            jnp.zeros((n_vertices, nk, n_rmu_out_left, n_rmu_out_right),
+            jnp.zeros((n_out, n_vertices, nk, n_rmu_out_left, n_rmu_out_right),
                       dtype=jnp.complex128), stack_shard)
         tables = (None if vertex_pairs is None else
                   tuple(jnp.stack(values) for values in zip(*vertex_operands)))
+        alpha_rows = (nodes.alpha[:, None] if n_out == 1
+                      else jnp.transpose(nodes.alpha))
 
         def _body(accumulators, xs):
-            t_scalar, alpha_scalar = xs
+            t_scalar, alpha_col = xs
             tau_kernel = (t_scalar if complex_contour else
                           jnp.real(t_scalar).astype(jnp.float64))
             Gv_k, Gc_k = _build_Gv_Gc(psi_mun, psi_nmu, mask_v, mask_c,
@@ -319,15 +283,15 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                 chi_tau = _contract_chi_vertices(
                     Gv_R, Gc_R, operands, identities, complex_contour)
                 chi_tau = jax.lax.with_sharding_constraint(chi_tau, _chi_R_shard)
-                previous = jax.lax.dynamic_index_in_dim(acc, index, axis=0, keepdims=False)
-                value = previous + alpha_scalar * chi_tau
-                return jax.lax.dynamic_update_index_in_dim(acc, value, index, axis=0)
+                previous = jax.lax.dynamic_index_in_dim(acc, index, axis=1, keepdims=False)
+                value = previous + alpha_col[:, None, None, None] * chi_tau[None]
+                return jax.lax.dynamic_update_index_in_dim(acc, value, index, axis=1)
 
             return jax.lax.fori_loop(0, n_vertices, vertex_step, accumulators, unroll=1), None
 
         final_R, _ = jax.lax.scan(
-            _body, zero, (nodes.t, nodes.alpha), unroll=1)
-        return tuple(_finish_chi(final_R[index]) for index in range(n_vertices))
+            _body, zero, (nodes.t, alpha_rows), unroll=1)
+        return final_R
 
     _base_in = (_nodes_shard, _psi_mun_shard, _psi_nmu_shard,
                 NamedSharding(mesh_xy, _rep2),
@@ -347,17 +311,29 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
             vertex_operands,
         ):
             """Share each Green/FFT pair across the ordered vertices of one family class."""
-            return _single_impl(nodes, psi_mun, psi_nmu, mask_v, mask_c,
-                                enk_full, vmax, cmin, vertex_operands)
+            final_R = _integrate(nodes, psi_mun, psi_nmu, mask_v, mask_c,
+                                 enk_full, vmax, cmin, vertex_operands)
+            return tuple(_finish_chi(final_R[0, index]) for index in range(n_vertices))
         return minimax_tau_integrate_chi_vertex
+
+    if n_out >= 2:
+        @partial(jax.jit, in_shardings=_base_in,
+                 out_shardings=tuple(_chi_R_shard for _ in range(n_out)))
+        def minimax_tau_integrate_chi_multi(
+            nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
+        ):
+            final_R = _integrate(nodes, psi_mun, psi_nmu, mask_v, mask_c,
+                                 enk_full, vmax, cmin, (None,))
+            return tuple(_finish_chi(final_R[index, 0]) for index in range(n_out))
+        return minimax_tau_integrate_chi_multi
 
     @partial(jax.jit, in_shardings=_base_in, out_shardings=_chi_R_shard)
     def minimax_tau_integrate_chi(
         nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin,
     ):
-        return _single_impl(
+        return _finish_chi(_integrate(
             nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full,
-            vmax, cmin, (None,))[0]
+            vmax, cmin, (None,))[0, 0])
 
     return minimax_tau_integrate_chi
 
