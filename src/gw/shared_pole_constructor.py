@@ -256,7 +256,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 extents += (extents[-1],) * (budget.batch_width - len(extents))
             with timing.fenced_section("spole.gram_reduction"):
                 batch_results = local_parent_reducer(
-                    mesh_xy, reduce_eigh.native_fn, extents)(*packed)
+                    mesh_xy, reduce_eigh.native_fn, extents, recipe.get("pole_budget"))(*packed)
                 jax.block_until_ready(batch_results)
                 del packed
                 # Drop selected action panels after the fused boundary. Model
@@ -319,14 +319,16 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                         pencil = assemble_ordered_shared_pole_pencil(states, infinity, matmul=mm)
                         reduce_eigh = budget.eigenplan(pencil[0].shape[-1])
                         model, signed, reduction = reduce_ordered_shared_pole_pencil(
-                            pencil, active_columns, eigh=reduce_eigh.batched, matmul=mm, gates=gates)
+                            pencil, active_columns, eigh=reduce_eigh.batched, matmul=mm, gates=gates,
+                            keep_budget=recipe.get("pole_budget"))
                         ordered_retained = (ordered_moment_identity(signed, infinity, matmul=mm)
                                             if odd_moments else {})
                     else:
                         pencil = assemble_shared_pole_pencil(states, infinity, matmul=mm)
                         reduce_eigh = budget.eigenplan(pencil[0].shape[-1])
                         model, reduction, coefficients = reduce_shared_pole_pencil(
-                            pencil, active_columns, eigh=reduce_eigh.batched, matmul=mm, gates=gates)
+                            pencil, active_columns, eigh=reduce_eigh.batched, matmul=mm, gates=gates,
+                            keep_budget=recipe.get("pole_budget"))
                 else:
                     model, reduction, zero, retained = _parent_result_slice(mesh_xy)(
                         batch_results, np.int32(slot))

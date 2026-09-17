@@ -23,13 +23,8 @@ ROLE_CODES = {"line": 0, "imaginary": 1, "infinity": 2, "held_line": 3, "held_im
 shared_real_pole_v1_r3b = {
     "version": RECIPE_VERSION,
     "height_eta_factor": 4.0,
-    "reference_eta_ev": 0.25,
     "active_depth_ev": 15.0,
     "borderline_depth_ev": 25.0,
-    "line_break_ev": 12.0,
-    "line_low_step_ev": 0.5,
-    "line_spacing_rule": "2*eta below 12 eV, 4*eta above; no material branch",
-    "line_high_step_ev": 1.0,
     "plasma_margin_ev": 3.5,
     "imaginary_floor_max_ev": 16.0,
     "imaginary_count_epsilon": 1.0e-3,
@@ -42,9 +37,14 @@ shared_real_pole_v1_r3b = {
     # bank_rule_tolerance is tier-owned (METAL 2026-09-16): the remote-cell certificate
     # floor on a deep-semicore metal (Fe: even rows 3.4e-9 against 1e-8/4/amp) is a
     # deck property; production keeps 1e-8 bit for bit, relaxed admits 1e-7.
+    # Production sizing (owner ruling 2026-09-17): 18 fitted supports counted as the sparse
+    # n14 rung counts them (line + imaginary; held and the M1/M3 block are extra), line
+    # sites evenly spaced on [0, L]; at most N_mu/16 right singular directions per line
+    # support; at most 1.8 N_mu retained Gram directions, the pole count K per parent.
     "production": {"direction_cutoff": 1.0e-3, "imaginary_width_fraction": 0.25,
                    "infinity_width_fraction": 0.125, "sigma_tolerance": 1.0e-4,
-                   "bank_rule_tolerance": 1.0e-8},
+                   "bank_rule_tolerance": 1.0e-8, "fitted_support_count": 18,
+                   "line_direction_cap_fraction": 0.0625, "pole_budget_fraction": 1.8},
     "relaxed": {"direction_cutoff": 1.0e-2, "imaginary_width_fraction": 0.125,
                 "infinity_width_fraction": 0.0625, "sigma_tolerance": 1.0e-3,
                 "line_count": 8, "imaginary_count": 2,
@@ -950,9 +950,6 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     plasma_ry = 2.0 * math.sqrt(4.0 * math.pi * census['active_electrons']
                                / census['cell_volume_bohr3'])
     top = plasma_ry * RYD_TO_EV + recipe['plasma_margin_ev']
-    scale = eta / recipe['reference_eta_ev']
-    low_step = recipe['line_low_step_ev'] * scale
-    high_step = recipe['line_high_step_ev'] * scale
     umin, umax = max(height, census['gap_ev']), max(recipe['imaginary_floor_max_ev'], top)
     if umin >= umax:
         raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
@@ -967,19 +964,14 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         retained = support_receipt['retained']
         top, umin, umax = (retained['line_top_ev'], retained['u_min_ev'],
                            retained['u_max_ev'])
-    if tier == 'relaxed':
-        line = np.linspace(0.0, top, policy['line_count'])
-    else:
-        edge = min(recipe['line_break_ev'], top)
-        # Each segment has an exact endpoint, included once; no accumulated
-        # stepping error and no thinning to satisfy a historical sample count.
-        low = [i * low_step for i in range(math.ceil(edge / low_step))]
-        high = ([edge + i * high_step for i in range(math.ceil((top-edge)/high_step))]
-                if top > edge else [])
-        line = np.asarray(low + high + [top], dtype=np.float64)
     kappa = top / umin
     count = imaginary_sample_count(kappa, tier, recipe)
     imaginary = np.geomspace(umin, umax, count)
+    if tier == 'relaxed':
+        line = np.linspace(0.0, top, policy['line_count'])
+    else:
+        # The fitted budget less the imaginary ladder, evenly spaced on [0, L] with L once.
+        line = np.linspace(0.0, top, policy['fitted_support_count'] - count)
     if override is not None:
         # Both ladders are replaced together; height, held fractions, widths,
         # zero policy and every gate stay the resolver's own. u_min/u_max/kappa
@@ -1041,8 +1033,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'accuracy_reason': 'resolved geometry has no authenticated matching campaign receipt',
         'eta_ev': eta, 'height_ev': height, 'height_ry': height / RYD_TO_EV,
         'plasma_ev': plasma_ry * RYD_TO_EV, 'plasma_ry': plasma_ry,
-        'top_ev': top, 'spacing_scale': scale, 'low_step_ev': low_step,
-        'high_step_ev': high_step,
+        'top_ev': top,
         'line_ev': line, 'imaginary_ev': imaginary,
         'held_line_ev': held_line, 'held_imaginary_ev': held_imag,
         'u_min_ev': umin, 'u_max_ev': umax, 'kappa': kappa,
@@ -1059,6 +1050,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'n': n, 'direction_cutoff': policy['direction_cutoff'],
         'imaginary_width': math.ceil(n * policy['imaginary_width_fraction']),
         'infinity_width': math.ceil(n * policy['infinity_width_fraction']),
+        'line_direction_cap': (math.ceil(n * policy['line_direction_cap_fraction'])
+                               if 'line_direction_cap_fraction' in policy else None),
+        'pole_budget': (math.ceil(n * policy['pole_budget_fraction'])
+                        if 'pole_budget_fraction' in policy else None),
         'multiplet_relative_tolerance': recipe['multiplet_relative_tolerance'],
         'bank_rule_tolerance': policy['bank_rule_tolerance'],
         'sigma_tolerance': policy['sigma_tolerance'],
@@ -1074,9 +1069,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'support_sites': 'sigma_w_support_sites_ev; "" = the resolver ladder, else explicit line|imaginary eV sites folded into recipe_version/recipe_hash',
         'height': 'h=4*eta', 'eta': 'literal sigma_regularization_ev',
         'plasma': '2*sqrt(4*pi*active_electrons/volume) Ry',
-        'top': 'L=omega_p+3.5 eV', 'spacing': 'eta/0.25',
-        'low_step': '2*eta', 'high_step': '4*eta',
-        'line': '2eta below 12 eV, 4eta above, exact L once; relaxed 8 endpoints',
+        'top': 'L=omega_p+3.5 eV',
+        'line': 'production: 18 fitted supports less the imaginary count, evenly spaced on [0, L]; relaxed 8 endpoints',
+        'line_direction_cap': 'production ceil(n/16) right singular directions per line support (whole multiplets); relaxed none',
+        'pole_budget': 'production ceil(1.8 n) retained Gram directions per parent (largest first); relaxed none',
         'imaginary': 'log-spaced u_min..u_max; round(log(16*(L/u_min)^2)*log(4000)/(2*pi^2)), min2; tier width ceil(f*n)',
         'held_line': 'adjacent-support midpoint nearest 25%/65% L; lower-index tie',
         'held_imaginary': 'geometric midpoint of first/last adjacent imaginary pair',

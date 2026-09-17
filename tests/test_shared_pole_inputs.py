@@ -213,7 +213,10 @@ def test_geometry_padding_charge_and_holds():
     assert r['n']==17 and r['imaginary_width']==5 and r['infinity_width']==3
     assert r['census']['active_electrons']==2
     assert r['census']['borderline_bands']==[0]
-    np.testing.assert_allclose(r['line_ev'],np.r_[np.arange(0,12,.5),np.arange(12,21)])
+    # Production: 18 fitted supports = imaginary ladder + evenly spaced line sites on [0, L].
+    assert r['line_count']+r['imaginary_count']==18
+    np.testing.assert_allclose(r['line_ev'],np.linspace(0,20,18-r['imaginary_count']))
+    assert r['line_direction_cap']==2 and r['pole_budget']==31      # ceil(17/16), ceil(1.8*17)
     assert not set(r['fit_ids']) & set(r['held_ids'])
     assert len(r['role']) == r['unique_evaluations']
     assert r['imaginary_count']==3
@@ -224,11 +227,11 @@ def test_geometry_padding_charge_and_holds():
 
 def test_metal_and_eta_scaling():
     r=resolve(fixture(metal=True,eta=.1,top=10))
-    assert r['height_ev']==.4 and r['low_step_ev']==.2
+    assert r['height_ev']==.4
     assert r['census']['partial_at_mu']
-    assert r['line_ev'][-1]==pytest.approx(10)
+    assert r['line_ev'][-1]==pytest.approx(10) and r['line_ev'][0]==0
     r=resolve(fixture(eta=.1,top=10))
-    assert r['low_step_ev']==.2 and not r['census']['partial_at_mu']
+    assert not r['census']['partial_at_mu']
 
 
 def test_relaxed():
@@ -236,6 +239,7 @@ def test_relaxed():
     assert r['line_count']==8 and r['imaginary_count']==2
     assert r['held_count']==3  # duplicate imaginary held roles share one call
     assert r['imaginary_width']==3 and r['infinity_width']==2
+    assert r['line_direction_cap'] is None and r['pole_budget'] is None
 
 
 def test_inverted_interval():

@@ -198,7 +198,7 @@ def _direction_svd_kernel(eigh_plan, ndim):
 
 
 def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
-                           multiplet_tol=1e-6, real_rows=None):
+                           multiplet_tol=1e-6, real_rows=None, max_rank=None):
     """Return right singular directions with sigma/sigma_max > tau.
 
     Parameters
@@ -225,6 +225,10 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         Batch layout only: entries of the first axis at index >= real_rows
         are synthetic round slots. They are never solved and retain no
         column (count 0, empty spectrum, zero Q).
+    max_rank
+        Optional cap on each row's retained count: the largest singular
+        values above tau, at most max_rank of them, then closed over the
+        multiplet at the boundary (a degenerate multiplet is never split).
 
     Returns
     -------
@@ -248,7 +252,8 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
     if W.ndim > 3:
         return _over_leading_axes(lambda w, rows: right_singular_vectors(
             w, tau, eigh_plan=eigh_plan, column_extent=column_extent,
-            multiplet_tol=multiplet_tol, real_rows=rows), W, eigh_plan.mesh, layout, real_rows)
+            multiplet_tol=multiplet_tol, real_rows=rows, max_rank=max_rank),
+            W, eigh_plan.mesh, layout, real_rows)
     if layout == 'batch':
         from distrib_la._batch_reshard import batch_layout_eigh_call
         s, v = batch_layout_eigh_call("dilation_eigh", eigh_plan.mesh, W, real_rows=real_rows)
@@ -258,8 +263,12 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
     values = np.asarray(s)[..., ::-1].copy()
     if not np.all(np.isfinite(values)):
         raise ValueError("nonfinite singular spectrum")
+    if max_rank is not None and operator.index(max_rank) < 1:
+        raise ValueError("max_rank must be a positive integer")
     def cut(row):
         count = int(np.count_nonzero(row > tau * row[0]))
+        if max_rank is not None:
+            count = min(count, operator.index(max_rank))
         return _close_spectral_cut(row, count, multiplet_tol)
     count = cut(values) if values.ndim == 1 else _real_row_counts(values, cut, real_rows)
     return _retained_columns(v, values, count, mesh=eigh_plan.mesh,

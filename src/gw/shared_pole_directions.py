@@ -161,7 +161,8 @@ def _direction_states(read_sample, recipe, *, eigh_plan, svd_plan, matmul,
                 q_batch, values = distrib_la.right_singular_vectors(
                     w, recipe["direction_cutoff"], eigh_plan=svd_plan,
                     column_extent=column_extent,
-                    multiplet_tol=recipe["multiplet_relative_tolerance"])
+                    multiplet_tol=recipe["multiplet_relative_tolerance"],
+                    max_rank=recipe.get("line_direction_cap"))
             elif kind == "imaginary":
                 width = min(logical_n, max(1, int(recipe["imaginary_width"])))
                 q_batch, values = distrib_la.leading_eigenvectors(

@@ -132,7 +132,7 @@ def _parent_panel_packer(mesh_xy, finite_width, parent_batch, sources, unique_wi
 
 
 @lru_cache(maxsize=None)
-def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
+def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None, keep_budget=None):
     """Fuse assembly, corrected Ritz reduction and moment gates per parent.
 
     The callable consumes the output of ``pack_parent_panels``. All matrix
@@ -173,7 +173,7 @@ def local_parent_reducer(mesh_xy, native_eigh, parent_extents=None):
         infinity = tuple(a[None] for a in infinity)
         pencil = assemble_shared_pole_pencil([finite], infinity, matmul=mm)
         model, reduction, coefficients = reduce_shared_pole_pencil(
-            pencil, active[None], eigh=native_eigh, matmul=mm, gates=gates)
+            pencil, active[None], eigh=native_eigh, matmul=mm, gates=gates, keep_budget=keep_budget)
         model, zero = apply_shared_pole_zero_policy(model, gates=gates)
         r, ri = pencil[0].shape[-1], infinity[0].shape[-1]
         selector = (jnp.arange(r)[:, None] == jnp.arange(r-ri, r)[None, :])[None].astype(jnp.complex128)

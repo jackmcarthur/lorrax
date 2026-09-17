@@ -57,7 +57,14 @@ def _metric_inverse_root(metric, *, matmul, tolerance):
 
 
 
-def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
+def _within_budget(gamma, budget):
+    """The largest ``budget`` entries of each ascending spectrum row (all when None)."""
+    if budget is None:
+        return True
+    return jnp.arange(gamma.shape[-1])[None, :] >= gamma.shape[-1] - int(budget)
+
+
+def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None):
     """Equilibrate the Gram matrix and compute its corrected Ritz model.
 
     Parameters
@@ -74,6 +81,10 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
         Resolved service GEMM with adjoint support.
     gates : mapping
         Canonical ``shared_real_pole_gates_v1_r3b`` table from the input owner.
+    keep_budget : int, optional
+        The recipe's pole budget: at most this many equilibrated-Gram
+        directions survive the keep cut, the largest first. The Ritz step
+        then acts on that subspace, so K <= keep_budget.
 
     Returns
     -------
@@ -106,7 +117,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
     gram_ok = ((largest > 0) & jnp.all(jnp.isfinite(gamma), axis=-1)
                & (ratio >= gates["normalized_gram_validity"]["threshold"]))
     keep = gamma > gates["normalized_gram_keep"]["threshold"] * largest[:, None]
-    keep = keep & (largest[:, None] > 0)
+    keep = keep & (largest[:, None] > 0) & _within_budget(gamma, keep_budget)
     count = jnp.sum(keep, axis=-1, dtype=jnp.int64)
     z = u * (keep / jnp.sqrt(jnp.where(keep, gamma, 1)))[:, None, :]
 
@@ -178,7 +189,7 @@ def _restricted_block(ww, wv, vv):
         (jnp.concatenate((ww, wv), axis=-1), jnp.concatenate((_adjoint(wv), vv), axis=-1)), axis=-2))
 
 
-def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates):
+def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None):
     """Paired-basis Ritz reduction of the particle-hole pencil.
 
     ``pencil=(G,H,O,z)`` from ``assemble_ordered_shared_pole_pencil`` over paired
@@ -198,7 +209,8 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     Galerkin projection with H_r >= 0 and real poles; residues are sign(mu)
     times PSD, negative modes belong to the parent of -q (signed model only).
     |mu| <= keep*max|mu| (poles at infinity) is excluded and its output weight
-    is reported.
+    is reported. ``keep_budget`` caps the H'_vv keep cut at that many
+    directions, the largest first, so K <= keep_budget.
 
     Returns (b [b,n,R], poles2 [b,R], active [b,R]), the signed model
     (c [b,n,R], mu [b,R], retained [b,R]) and device diagnostics.
@@ -237,7 +249,8 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     gamma, u = eigh(hermitian_part(h_vv))
     largest = gamma[:, -1]
     ratio = gamma[:, 0] / jnp.where(largest > 0, largest, 1)
-    keep = (gamma > gates["normalized_gram_keep"]["threshold"] * largest[:, None]) & (largest[:, None] > 0)
+    keep = ((gamma > gates["normalized_gram_keep"]["threshold"] * largest[:, None]) & (largest[:, None] > 0)
+            & _within_budget(gamma, keep_budget))
     count = jnp.sum(keep, axis=-1, dtype=jnp.int64)
     z = u * (keep / jnp.sqrt(jnp.where(keep, gamma, 1)))[:, None, :]
     del u
