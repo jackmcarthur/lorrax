@@ -56,6 +56,16 @@ $$ W_c(z) = \sum_j \mathrm{Re}(c_jc_j^\dagger)\frac{2\Omega_j}{z^2-\Omega_j^2}
 The bank (`gw.response_bank`) samples `W_c` and `∂W_c/∂s` at the recipe's support points and records the
 high-frequency moments. It never forms `W` at a real frequency.
 
+Production uses 18 fitted supports (line plus imaginary), with held supports additional,
+and a retained-pole budget `ceil(1.8 N_mu)`. Line sites follow the band-structure support
+rule in report §IV.B: equal quantiles of the square root of the crossing density,
+broadened at the consumer's η. Delivered states within 5 eV of μ carry offsets from
+−5 to +5 eV in 0.25 eV steps; crossings include levels at every k. The implementation
+is `support_rule_line_sites`; this is distinct from the Si-only sparse n14 greedy search.
+The existing SC support session retains the line-site tuple while its interval stays
+enclosed and rebuilds it on an interval or policy change. Samples and the pole model
+are rebuilt from the current state on every map.
+
 **Real-time stream.** For occupied and unoccupied weights `f`, `u`, the selected-q retarded correlation is
 accumulated on a certified time rule `{t_a, w_a}` (`minimax.response_bank_rule`):
 

@@ -71,8 +71,9 @@ def test_gap_growth_keeps_points_roles_but_rebinds_current_state():
     assert not np.array_equal(current["imaginary_ev"], resolve(args)["imaginary_ev"])
     assert current["support_envelope"]["status"] == "hit"
     assert current["support_envelope"]["epoch"] == 0
-    assert set(session) == {"reference_complete", "key", "envelope", "epoch"}
+    assert set(session) == {"reference_complete", "key", "envelope", "epoch", "line_ev"}
     assert all(isinstance(v, float) for v in session["envelope"].values())
+    assert session["line_ev"] == tuple(first["line_ev"])
 
 
 def test_gap_shrink_expands_once_then_growth_stays_enclosed():

@@ -213,9 +213,11 @@ def test_geometry_padding_charge_and_holds():
     assert r['n']==17 and r['imaginary_width']==5 and r['infinity_width']==3
     assert r['census']['active_electrons']==2
     assert r['census']['borderline_bands']==[0]
-    # Production: 18 fitted supports = imaginary ladder + evenly spaced line sites on [0, L].
+    # Production: 18 fitted supports = imaginary ladder + support-rule line sites. The +/-1 eV
+    # levels cross at every 0.25 eV offset to 5 eV; the farthest is E = 2 + 5 eV against 1 eV.
     assert r['line_count']+r['imaginary_count']==18
-    np.testing.assert_allclose(r['line_ev'],np.linspace(0,20,18-r['imaginary_count']))
+    line=r['line_ev']
+    assert np.all(np.diff(line)>0) and line[0]>=r['height_ev'] and line[-1]==pytest.approx(6.0,abs=.011)
     assert r['line_direction_cap']==2 and r['pole_budget']==31      # ceil(17/16), ceil(1.8*17)
     assert not set(r['fit_ids']) & set(r['held_ids'])
     assert len(r['role']) == r['unique_evaluations']
@@ -229,7 +231,8 @@ def test_metal_and_eta_scaling():
     r=resolve(fixture(metal=True,eta=.1,top=10))
     assert r['height_ev']==.4
     assert r['census']['partial_at_mu']
-    assert r['line_ev'][-1]==pytest.approx(10) and r['line_ev'][0]==0
+    # The farthest crossing is E = 2 + 5 eV against the level at 1 eV.
+    assert r['line_ev'][-1]==pytest.approx(6.0,abs=.011) and r['line_ev'][0]>=r['height_ev']
     r=resolve(fixture(eta=.1,top=10))
     assert not r['census']['partial_at_mu']
 
@@ -273,7 +276,7 @@ def test_flat_role_serialization_and_deduplication():
     assert r['held'].dtype==np.bool_
     assert r['role_codes']==ROLE_CODES==dict(line=0,imaginary=1,infinity=2,held_line=3,held_imaginary=4)
     assert 2 not in r['role']  # no fake infinity bank call
-    assert r['distinct_id'][0]==r['distinct_id'][r['line_count']]
+    # Deduplication of a repeated point is pinned in test_relaxed (shared imaginary held roles).
     assert len(set(r['distinct_id']))==r['unique_evaluations']
     for i in set(r['distinct_id']):
         assert np.unique(r['z_ry'][r['distinct_id']==i]).size==1
