@@ -275,6 +275,18 @@ def test_sc_occupation_solve_honours_the_declared_smearing_family(monkeypatch):
               and node.func.id == "solve_smearing_occupations"]
     assert solves and all(
         any(kw.arg == "family" for kw in call.keywords) for call in solves)
+    # Owner ruling 2026-09-17: the WFN startup gate and the density rebuild
+    # were the last OccupationState.solve_mp1 hard-codes on the SC map.
+    assert not [node for node in ast.walk(tree)
+                if isinstance(node, ast.Attribute) and node.attr == "solve_mp1"], \
+        "the SC map still hard-codes an MP1 OccupationState solve"
+    state_solves = [node for node in ast.walk(tree)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "solve_smearing"]
+    assert len(state_solves) >= 2 and all(
+        any(kw.arg == "family" for kw in call.keywords)
+        for call in state_solves)
 
 
 def test_one_shot_and_sc_read_the_same_deck_key():

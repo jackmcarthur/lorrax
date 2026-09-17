@@ -19,6 +19,9 @@ def _inputs(material_class: str):
             # receive the fixed-N occupation state.
             screening=SimpleNamespace(occ_broadening_ev=0.0),
             occ_broadening_ry=0.01,
+            # A metal config always carries the parse-resolved family.
+            occ_smearing_family=(
+                "fd" if material_class == "metal" else None),
             occupation_clamp_tol=1.0e-12,
         ),
         # The class is DERIVED from the WFN occupations and threaded on the
@@ -43,13 +46,21 @@ def test_head_off_mpa_metal_still_solves_fixed_n_occupations():
     state = _solve_occupation_state(_inputs("metal"), _energies())
     assert state is not None
     assert state.f_kn.shape == (3, 4)
-    assert state.smearing_family == "mp1"
+    assert state.smearing_family == "fd"
     np.testing.assert_allclose(
         np.mean(np.sum(np.asarray(state.f_kn), axis=1)),
         2.0,
         rtol=0.0,
         atol=2.0e-12,
     )
+
+
+def test_a_metal_without_a_declared_family_is_never_solved_as_mp1():
+    import pytest
+    inputs = _inputs("metal")
+    inputs.config.occ_smearing_family = None
+    with pytest.raises(ValueError, match="GATE metal_occupations_fermi_dirac"):
+        _solve_occupation_state(inputs, _energies())
 
 
 def test_head_off_mpa_metal_has_no_surface_table():
