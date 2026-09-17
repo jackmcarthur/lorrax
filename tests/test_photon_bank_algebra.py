@@ -130,3 +130,46 @@ def check_photon_face_packing(mesh):
 def test_photon_face_packing():
     mesh = Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
     check_photon_face_packing(mesh)
+
+
+def check_photon_bank_store(mesh, path):
+    """Full packed sample/derivative/moment/constant roundtrip on P4."""
+    from test_shared_pole_bank import _bank_fixture
+    from test_shared_pole_store import _fixture
+    from gw.photon_layout import PhotonBasisLayout
+    from gw.shared_pole_recipe import CapacityLedger
+    from file_io import shared_pole_store as store
+    from file_io.slab_io import SlabIO
+
+    _, _, _, recipe, _ = _bank_fixture()
+    meta, tables, _, identity = _fixture(mesh)
+    meta.nspinor = 4
+    meta.shared_pole_capacity = CapacityLedger(meta, mesh_xy=mesh)
+    meta.shared_pole_capacity.reserve('fixture', resident_bytes_per_rank=65536, workspace_bytes_per_rank=0)
+    meta.shared_pole_capacity.live_stages = ('fixture',)
+    basis = meta.mu_basis
+    layout = PhotonBasisLayout.from_centroid_extents(basis.n_logical, basis.n_logical, mesh)
+    header = store.initialize_shared_pole_bank(path, meta=meta, tables=tables,
+        recipe=recipe, identity=identity, mesh_xy=mesh, photon_layout=layout, mu_bases=(basis,basis))
+    nq, ns, n = header['bank_shape']['nq'], header['bank_shape']['nsample'], layout.packed_extent
+    def put(a):
+        spec = P(None,None,'x','y') if a.ndim == 4 else P(None,'x','y')
+        return jax.make_array_from_callback(a.shape,NamedSharding(mesh,spec),lambda ix:a[ix])
+    raw = np.arange(nq*ns*n*n).reshape(nq,ns,n,n).astype(complex)*(1+.3j)
+    w, moment = put(raw), put(raw[:,0])
+    header = store.write_shared_pole_bank(path,q_span=(0,nq),sample_span=(0,ns),
+        Wc=w,dWc_ds=2*w,M0=moment,M1=2*moment,M2=3*moment,M3=4*moment,constant=-moment,
+        meta=meta,expected_identity=identity,mesh_xy=mesh)
+    assert header['complete']
+    store.validate_shared_pole_bank(path,expected_identity=identity,mesh_xy=mesh,require_complete=True)
+    with SlabIO(path,mode='r',mesh=mesh) as io:
+        got=store.read_shared_pole_bank(io,(0,nq),meta=meta,header=header,
+            sample_span=(0,ns),fields=('Wc','dWc_ds','M0','M1','M2','M3','constant'))
+    for name, expected in dict(Wc=w,dWc_ds=2*w,M0=moment,M1=2*moment,M2=3*moment,M3=4*moment,constant=-moment).items():
+        assert bool(jnp.all(got[name] == expected)),name
+    # A parent-local constructor reads complete packed matrices on its owner.
+    with SlabIO(path,mode='r',mesh=mesh) as io:
+        got=store.read_shared_pole_bank(io,q_ids=[0,1,2,2],meta=meta,header=header,
+            sample_span=(0,ns),fields=('Wc','constant'),partition_spec=P(('x','y'),None,None,None))
+    from common.collectives import gather_to_host
+    np.testing.assert_array_equal(gather_to_host(got['Wc']),raw[[0,1,2,2]])

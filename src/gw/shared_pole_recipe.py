@@ -752,10 +752,12 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     from file_io.shared_pole_store import charge_representation
     # trs_allowed is recorded, not gated: a measured break selects the ordered
     # bank and model, and consumers that need the even form refuse by name.
-    if not charge_representation(meta) or int(meta.nspin) != 1:
-        raise ValueError("GATE shared_pole_representation: got: collinear-spin or bispinor census; want: nspin=1 with a scalar or two-component charge operator; why: both-endpoint spin action is not yet supported")
+    photon = int(meta.nspinor) == 4 and int(meta.nspinor_wfnfile) == 2
+    if (not charge_representation(meta) and not photon) or int(meta.nspin) != 1:
+        raise ValueError("GATE shared_pole_representation: want one scalar, spinor or authenticated bispinor state")
     capacity = float(state_capacity)
-    if capacity * int(meta.nspinor) != 2.0:
+    physical_spinor = int(meta.nspinor_wfnfile) if photon else int(meta.nspinor)
+    if capacity * physical_spinor != 2.0:
         raise ValueError("GATE shared_pole_census: got: state capacity times Nspinor other than 2; want: authenticated spin-restricted capacity; why: charge normalization")
     val = energies[:, wfns.slices.val]
     cond = energies[:, wfns.slices.cond_all_logical]
