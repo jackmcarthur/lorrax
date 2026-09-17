@@ -67,7 +67,7 @@ def _workspace_details(plan, op, shapes, dtype):
     px, py = int(plan.mesh.shape['x']), int(plan.mesh.shape['y'])
     local = isinstance(plan, Plan) and (plan.is_native or (
         (op != 'eigh' or len(shapes[0]) == 3)
-        and plan.batched_route == ROUTE_BATCH_RESHARD))
+        and plan.route_for(shapes[0], dtype) == ROUTE_BATCH_RESHARD))
     if op == 'eigh':
         if not isinstance(plan, Plan) or plan.op != 'eigh':
             raise ValueError('eigh query requires an eigh Plan')
@@ -88,7 +88,7 @@ def _workspace_details(plan, op, shapes, dtype):
         # A native auto route can execute a whole batch; reserve one
         # vendor workspace/info per member rather than assume serial reuse.
         copies = (shapes[0][0] if local and len(shapes[0]) == 3
-                  and plan.batched_route != ROUTE_BATCH_RESHARD else 1)
+                  and plan.route_for(shapes[0], dtype) != ROUTE_BATCH_RESHARD else 1)
         scratch = copies*(device + (4 if local else 0))
         return dict(device_bytes=scratch, host_bytes=host,
                     vendor_device_bytes=device if local else None,
@@ -171,6 +171,64 @@ def matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend='auto',
     provider = resolve_matmul_backend(backend, mesh, batched_route=route)
     return int(_gemm_workspace_details(mesh, shapes, dtype,
         local=route == ROUTE_BATCH_RESHARD, backend=provider)['device_bytes'])
+
+
+def _local_kernel_workspace(mesh, op, shapes, dtype):
+    """Workspace of the device-local kernel that route (c) runs, per rank.
+
+    eigh: the local vendor query (cuSolverDn syevd) on CUDA; on host meshes the
+    LAPACK ``?heevd``/``?syevd`` optimal workspace, which is a closed formula
+    (complex: lwork = 2n + n^2, lrwork = 1 + 5n + 2n^2, liwork = 3 + 5n; real:
+    lwork = 1 + 6n + 2n^2, liwork = 3 + 5n). gemm: the compiled local batched
+    matmul temporary. One kernel at a time: route (c) solves its local rows in
+    turn when the batch is padded and a batch-layout operand always does.
+    """
+    import jax
+    if op == 'eigh':
+        n = max(s[-1] for s in shapes)
+        if any(d.platform == 'gpu' for d in mesh.devices.flat):
+            return _vendor_query(0, 'eigh', (n,), dtype.str)[0] + 4
+        if dtype.kind == 'c':
+            return 16 * (2*n + n*n) + 8 * (1 + 5*n + 2*n*n) + 4 * (3 + 5*n)
+        return 8 * (1 + 6*n + 2*n*n) + 4 * (3 + 5*n)
+    if op in ('gemm', 'matmul'):
+        return _local_gemm_temp(tuple(shapes[:2]), dtype.str, jax.local_devices()[0])
+    raise ValueError('fits_local op must be eigh or gemm')
+
+
+def fits_local(plan, op, shapes, dtype, budget_bytes) -> bool:
+    """Whether one rank holds the caller's live set and the local kernel's workspace.
+
+    Parameters
+    ----------
+    plan : Plan or GemmPlan
+        Supplies the mesh (platform decides which workspace model applies).
+    op : {'eigh', 'gemm'}
+        The local kernel route (c) or a batch-layout operand runs.
+    shapes : tuple of tuples
+        The caller's whole per-rank live set of dense operands, e.g.
+        ``((local_batch, n, n),) * 2`` for an eigh input and its vectors, or
+        eight ``(1, R, R)`` blocks for a pencil reduction. Complete matrices,
+        not face tiles: this is the fit-on-one-device question.
+    dtype : numpy dtype
+        float64 or complex128.
+    budget_bytes : int
+        Device bytes per rank the caller admits for this stage. Pass a value
+        every rank agrees on (a deck budget), never a per-rank measurement:
+        the answer selects collectives.
+
+    Returns
+    -------
+    bool
+        ``sum(prod(shape)) * itemsize + workspace <= budget_bytes``.
+    """
+    shapes = _shapes(shapes)
+    dtype = np.dtype(dtype)
+    if dtype not in (np.dtype('float64'), np.dtype('complex128')):
+        raise TypeError('fits_local supports float64 and complex128')
+    budget = operator.index(budget_bytes)
+    live = sum(int(np.prod(s)) for s in shapes) * dtype.itemsize
+    return live + int(_local_kernel_workspace(plan.mesh, op, shapes, dtype)) <= budget
 
 
 def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:

@@ -343,6 +343,11 @@ class Plan:
         ``'batch_reshard'``. :attr:`batched_route` is the resolved route.
     donates
         Which positional operands this OP donates — see :data:`DONATES`.
+    budget_bytes
+        Device bytes per rank the caller admits for one batched call, or
+        ``None``. With ``'auto'`` requested and a budget given, the route is
+        decided per stack by capacity (:meth:`route_for`): a stack whose
+        per-rank whole matrices fit runs route (c), otherwise the provider.
     """
 
     op: str
@@ -353,6 +358,7 @@ class Plan:
     in_sharding: NamedSharding | None
     batch_in_sharding: NamedSharding | None
     requested_batched_route: str = BATCHED_ROUTE_DEFAULT
+    budget_bytes: int | None = None
 
     # ---- introspection -------------------------------------------------
     @property
@@ -435,6 +441,33 @@ class Plan:
         if _IMPL[(self.op, self.backend)]["many"] is not None:
             return ROUTE_BACKEND_BATCHED
         return ROUTE_SCAN
+
+    def route_for(self, shape, dtype) -> str:
+        """The route :meth:`batched` takes for one operand stack.
+
+        :attr:`batched_route` is the answer for every stack except one case:
+        ``'auto'`` requested on a provider eigh plan WITH a ``budget_bytes``. Then
+        capacity decides whatever the deck dial said: when the per-rank whole
+        matrices of the stack (``ceil(nb/P)`` of them, input and output) and
+        the local kernel's workspace fit the budget
+        (:func:`distrib_la.workspace.fits_local`), the stack runs route (c);
+        otherwise the provider route. The budget is a caller value every rank
+        shares, so every rank takes the same route.
+        """
+        static = self.batched_route
+        if (self.requested_batched_route != "auto" or self.budget_bytes is None
+                or self.is_native or static == ROUTE_BATCH_RESHARD):
+            return static
+        from distrib_la.workspace import fits_local
+        shape = tuple(int(v) for v in shape)
+        nb = shape[0] if len(shape) == 3 else 1
+        ranks = int(self.mesh.shape["x"]) * int(self.mesh.shape["y"])
+        local = (-(-nb // ranks), shape[-2], shape[-1])
+        live = (local, local) if self.op in ("eigh", "solve_lu") else (local,)
+        if self.op == "eigh" and fits_local(
+                self, "eigh", live, dtype, self.budget_bytes):
+            return ROUTE_BATCH_RESHARD
+        return static
 
     @property
     def native_fn(self) -> Callable:
@@ -534,7 +567,7 @@ class Plan:
         module exists to make once — the same reason there is no
         ``backend=`` on a call and only on :func:`plan`.
         """
-        route = self.batched_route if _route is None else _route
+        route = self.route_for(A.shape, A.dtype) if _route is None else _route
         if route not in BATCHED_ROUTES:
             raise ValueError(
                 f"unknown batched route {route!r} "
@@ -653,7 +686,8 @@ class Plan:
 
 def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
          n: int | None = None,
-         batched_route: str = BATCHED_ROUTE_DEFAULT) -> Plan:
+         batched_route: str = BATCHED_ROUTE_DEFAULT,
+         budget_bytes: int | None = None) -> Plan:
     """Resolve ``op`` on ``mesh_xy`` ONCE and return the callable plan.
 
     Every guard (vocabulary, platform, known-broken combinations,
@@ -684,6 +718,10 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
         runs the device-local native JAX operation. ``'auto'`` explicitly
         requests the backend-batched/scan choice. See
         :attr:`Plan.batched_route`.
+    budget_bytes
+        Optional per-rank device budget for one batched call. With
+        ``batched_route='auto'`` it makes the route a capacity decision per
+        stack (:meth:`Plan.route_for`); ignored otherwise.
 
     There is deliberately NO ``batched=`` flag.  The design sketch carried
     one; it would have changed nothing about resolution (both shardings are
@@ -700,10 +738,15 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
             f"{'|'.join(BATCHED_ROUTE_CHOICES)})")
     resolved = resolve_backend(op, backend, mesh_xy, n=n)
     ffi = resolved != NATIVE
+    if budget_bytes is not None:
+        import operator
+        budget_bytes = operator.index(budget_bytes)
+        if budget_bytes <= 0:
+            raise ValueError(f"budget_bytes must be positive, got {budget_bytes}")
     face = ffi or batched_route == ROUTE_BATCH_RESHARD
     tile = NamedSharding(mesh_xy, P("x", "y")) if face else None
     stack = NamedSharding(mesh_xy, P(None, "x", "y")) if face else None
-    if batched_route == ROUTE_BATCH_RESHARD:
+    if batched_route == ROUTE_BATCH_RESHARD or budget_bytes is not None:
         # Eager plan construction is the legal place for runtime setup; the
         # returned Plan.batched remains trace-safe.
         from distrib_la._collectives import warm_mesh_cliques
@@ -711,4 +754,5 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
     return Plan(op=op, requested=str(backend), backend=resolved,
                 mesh=mesh_xy, n=None if n is None else int(n),
                 in_sharding=tile, batch_in_sharding=stack,
-                requested_batched_route=batched_route)
+                requested_batched_route=batched_route,
+                budget_bytes=budget_bytes)

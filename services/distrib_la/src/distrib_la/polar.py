@@ -71,7 +71,15 @@ def _close_spectral_cut(values, count, tolerance):
     return count
 
 
+def _layout_spec(layout, ndim):
+    """Face ``P(None,...,'x','y')`` or batch layout ``P(('x','y'),None,...)`` for rank ``ndim``."""
+    if layout == 'batch':
+        return P(('x', 'y'), *((None,) * (ndim - 1)))
+    return P(*((None,) * (ndim - 2)), 'x', 'y')
+
+
 def _direction_input(W, eig, dilation=False):
+    """Validate a direction operand; return its layout, ``'face'`` or ``'batch'``."""
     if isinstance(W, jax.core.Tracer):
         raise ValueError("spectral direction selection is an eager construction stage")
     if W.ndim < 2 or W.shape[-2] != W.shape[-1]:
@@ -79,22 +87,26 @@ def _direction_input(W, eig, dilation=False):
     _validate_dtype(W.dtype)
     if eig.op != 'eigh' or eig.n not in (None, W.shape[-1] * (2 if dilation else 1)):
         raise ValueError("eigh_plan must match the matrix/dilation extent")
-    tile = NamedSharding(eig.mesh, P(*((None,) * (W.ndim - 2)), 'x', 'y'))
-    if not W.sharding.is_equivalent_to(tile, W.ndim):
-        raise ValueError("spectral directions require W already face-tiled over x/y")
-    return tile
+    if W.sharding.is_equivalent_to(NamedSharding(eig.mesh, _layout_spec('face', W.ndim)), W.ndim):
+        return 'face'
+    if W.ndim >= 3 and W.sharding.is_equivalent_to(
+            NamedSharding(eig.mesh, _layout_spec('batch', W.ndim)), W.ndim):
+        return 'batch'
+    raise ValueError("spectral directions require W face-tiled over x/y or in batch layout "
+                     "P(('x','y'),None,...)")
 
 
 @lru_cache(maxsize=32)
-def _leading_axes_kernel(mesh, leading):
-    """Reshape the leading batch axes of a face stack; the x/y tiles are untouched.
+def _leading_axes_kernel(mesh, leading, layout='face'):
+    """Reshape the leading batch axes of a stack; each rank keeps its own tile or rows.
 
-    ``leading=None`` flattens [b0,...,bk,m,m] at P(None,...,'x','y') to one batch
-    at P(None,'x','y'); a tuple restores that leading shape. The leading axes are
-    unsharded and adjacent, so every rank keeps its own tile (a bitcast).
+    ``leading=None`` flattens [b0,...,bk,m,m] to one batch; a tuple restores
+    that leading shape. On the face the leading axes are unsharded and
+    adjacent; in batch layout the first axis carries ('x','y') and the rest
+    are unsharded, so every rank keeps whole contiguous rows. A bitcast.
     """
     rank = 1 if leading is None else len(leading)
-    tile = NamedSharding(mesh, P(*((None,) * rank), 'x', 'y'))
+    tile = NamedSharding(mesh, _layout_spec(layout, rank + 2))
     if leading is None:
         return jax.jit(lambda w: w.reshape((-1,) + w.shape[-2:]), out_shardings=tile)
     return jax.jit(lambda w: w.reshape(tuple(leading) + w.shape[-2:]), out_shardings=tile)
@@ -109,21 +121,29 @@ def _nest(values, leading):
                  for i in range(leading[0]))
 
 
-def _over_leading_axes(select, W, mesh):
+def _over_leading_axes(select, W, mesh, layout, real_rows):
     """Run a rank-3 spectral selection on a rank >= 4 stack and restore its axes.
 
     Only the eager spectrum cut sees the flattened rows; Q returns with the
     original leading axes and the per-row spectra as nested tuples.
+    ``real_rows`` counts entries of the FIRST axis and becomes flat rows here.
     """
     leading = tuple(int(v) for v in W.shape[:-2])
-    q, values = select(_leading_axes_kernel(mesh, None)(W))
-    return _leading_axes_kernel(mesh, leading)(q), _nest(values, leading)
+    flat = None if real_rows is None else int(real_rows) * int(np.prod(leading[1:]))
+    q, values = select(_leading_axes_kernel(mesh, None, layout)(W), flat)
+    return _leading_axes_kernel(mesh, leading, layout)(q), _nest(values, leading)
+
+
+def _real_row_counts(values, cut, real_rows):
+    """Per-row retained counts; synthetic rows (index >= real_rows) keep none."""
+    return tuple(cut(row) if real_rows is None or i < real_rows else 0
+                 for i, row in enumerate(values))
 
 
 @lru_cache(maxsize=128)
-def _retained_column_kernel(mesh, batched, extent):
-    """Select a padded face; current per-row counts are runtime mask inputs."""
-    tile = NamedSharding(mesh, P(*((None,) if batched else ()), 'x', 'y'))
+def _retained_column_kernel(mesh, batched, extent, layout='face'):
+    """Select padded columns; current per-row counts are runtime mask inputs."""
+    tile = NamedSharding(mesh, _layout_spec(layout, 3) if batched else P('x', 'y'))
     @jax.jit(out_shardings=tile)
     def select(q, count):
         width = min(extent, q.shape[-1])
@@ -135,13 +155,13 @@ def _retained_column_kernel(mesh, batched, extent):
     return select
 
 
-def _retained_columns(Q, values, count, *, mesh, column_extent):
+def _retained_columns(Q, values, count, *, mesh, column_extent, layout='face'):
     """Select per-row physical columns; return their unpadded spectra."""
     largest = max(count) if isinstance(count, tuple) else count
     extent = operator.index(column_extent(largest))
     if extent < largest or extent < 1 or extent % int(mesh.shape['y']):
         raise ValueError("column_extent must cover the rank and tile mesh y")
-    select = _retained_column_kernel(mesh, isinstance(count, tuple), extent)
+    select = _retained_column_kernel(mesh, isinstance(count, tuple), extent, layout)
     retained = (tuple(row[:n] for row, n in zip(values, count))
                 if isinstance(count, tuple) else values[:count])
     counts = jax.device_put(np.asarray(count, dtype=np.int64), NamedSharding(mesh, P()))
@@ -161,7 +181,8 @@ def _direction_svd_kernel(eigh_plan, ndim):
 
     @jax.jit(out_shardings=(NamedSharding(eigh_plan.mesh, P()), tile))
     def extract(w):
-        if eigh_plan.batched_route == ROUTE_BATCH_RESHARD:
+        stack = w.shape if w.ndim == 3 else (1,) + w.shape
+        if eigh_plan.route_for(stack[:1] + (2 * stack[-2], 2 * stack[-1]), w.dtype) == ROUTE_BATCH_RESHARD:
             from distrib_la._batch_reshard import batch_reshard_call
             # Move W and V; the unchanged 2m eigensystem stays q-local.
             evals, v = batch_reshard_call(
@@ -177,14 +198,17 @@ def _direction_svd_kernel(eigh_plan, ndim):
 
 
 def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
-                           multiplet_tol=1e-6):
+                           multiplet_tol=1e-6, real_rows=None):
     """Return right singular directions with sigma/sigma_max > tau.
 
     Parameters
     ----------
     W
         Square [m,m] or independent [b,m,m] float64/complex128 faces at
-        P('x','y') or P(None,'x','y').
+        P('x','y') or P(None,'x','y'); or a stack in batch layout
+        P(('x','y'),None,None) (b a multiple of Px*Py, whole matrices per
+        rank), which is always served by the rank-local kernel with no
+        movement whatever the plan's route, and returns Q in batch layout.
         Singular values carry W's units; vectors are dimensionless.
     tau
         Finite nonnegative relative cutoff; whole adjacent multiplets at
@@ -197,6 +221,10 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         width, which must tile y. Padding policy belongs to the caller.
     multiplet_tol
         Relative adjacent spectral-gap tolerance, default 1e-6.
+    real_rows
+        Batch layout only: entries of the first axis at index >= real_rows
+        are synthetic round slots. They are never solved and retain no
+        column (count 0, empty spectrum, zero Q).
 
     Returns
     -------
@@ -211,45 +239,58 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         b0*...*bk rows: Q[b0,...,bk,m,max(r_padded)] keeps the leading axes
         and the spectra nest as tuples in the same order.
     """
-    _direction_input(W, eigh_plan, dilation=True)
+    layout = _direction_input(W, eigh_plan, dilation=True)
     tau = _as_rcond(tau)
     if tau is None:
         raise ValueError("tau must be an explicit relative cutoff")
+    if real_rows is not None and layout != 'batch':
+        raise ValueError("real_rows applies to a batch-layout stack only")
     if W.ndim > 3:
-        return _over_leading_axes(lambda w: right_singular_vectors(
+        return _over_leading_axes(lambda w, rows: right_singular_vectors(
             w, tau, eigh_plan=eigh_plan, column_extent=column_extent,
-            multiplet_tol=multiplet_tol), W, eigh_plan.mesh)
-    s, v = _direction_svd_kernel(eigh_plan, W.ndim)(W)
+            multiplet_tol=multiplet_tol, real_rows=rows), W, eigh_plan.mesh, layout, real_rows)
+    if layout == 'batch':
+        from distrib_la._batch_reshard import batch_layout_eigh_call
+        s, v = batch_layout_eigh_call("dilation_eigh", eigh_plan.mesh, W, real_rows=real_rows)
+        s = np.maximum(np.asarray(s)[..., W.shape[-1]:], 0)
+    else:
+        s, v = _direction_svd_kernel(eigh_plan, W.ndim)(W)
     values = np.asarray(s)[..., ::-1].copy()
     if not np.all(np.isfinite(values)):
         raise ValueError("nonfinite singular spectrum")
     def cut(row):
         count = int(np.count_nonzero(row > tau * row[0]))
         return _close_spectral_cut(row, count, multiplet_tol)
-    count = cut(values) if values.ndim == 1 else tuple(cut(row) for row in values)
+    count = cut(values) if values.ndim == 1 else _real_row_counts(values, cut, real_rows)
     return _retained_columns(v, values, count, mesh=eigh_plan.mesh,
-                             column_extent=column_extent)
+                             column_extent=column_extent, layout=layout)
 
 
 def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
-                         multiplet_tol=1e-6):
+                         multiplet_tol=1e-6, real_rows=None):
     """Return leading Hermitian eigenvectors, including the cut multiplet.
 
-    W[m,m], W[b,m,m] or W[b0,...,bk,m,m] is Hermitian on its x/y faces; r is
-    the requested physical width for each row. The leading batch is independent.
-    eigh_plan is resolved for m, and column_extent/multiplet_tol and the
-    (Q,values) output follow right_singular_vectors. Values retain W's units.
-    No Hermitian projection is applied to repair an invalid input.
+    W[m,m], W[b,m,m] or W[b0,...,bk,m,m] is Hermitian on its x/y faces or in
+    batch layout; r is the requested physical width for each row. The leading
+    batch is independent. eigh_plan is resolved for m, and column_extent,
+    multiplet_tol, real_rows and the (Q,values) output follow
+    right_singular_vectors. Values retain W's units. No Hermitian projection
+    is applied to repair an invalid input.
     """
-    _direction_input(W, eigh_plan)
+    layout = _direction_input(W, eigh_plan)
     r = operator.index(r)
     if not 1 <= r <= W.shape[-1]:
         raise ValueError("r must lie in [1,m]")
+    if real_rows is not None and layout != 'batch':
+        raise ValueError("real_rows applies to a batch-layout stack only")
     if W.ndim > 3:
-        return _over_leading_axes(lambda w: leading_eigenvectors(
+        return _over_leading_axes(lambda w, rows: leading_eigenvectors(
             w, r, eigh_plan=eigh_plan, column_extent=column_extent,
-            multiplet_tol=multiplet_tol), W, eigh_plan.mesh)
-    if eigh_plan.batched_route == ROUTE_BATCH_RESHARD:
+            multiplet_tol=multiplet_tol, real_rows=rows), W, eigh_plan.mesh, layout, real_rows)
+    if layout == 'batch':
+        from distrib_la._batch_reshard import batch_layout_eigh_call
+        s, q = batch_layout_eigh_call("checked_eigh", eigh_plan.mesh, W, real_rows=real_rows)
+    elif eigh_plan.route_for(W.shape if W.ndim == 3 else (1,) + W.shape, W.dtype) == ROUTE_BATCH_RESHARD:
         from distrib_la._batch_reshard import batch_reshard_call
         s, q = batch_reshard_call("checked_eigh", eigh_plan.mesh,
                                   (W if W.ndim == 3 else W[None],))
@@ -271,9 +312,9 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
     if not np.all(np.isfinite(values)):
         raise ValueError("leading_eigenvectors requires finite Hermitian W and a finite eigenvalue spectrum")
     count = (_close_spectral_cut(values, r, multiplet_tol) if values.ndim == 1
-             else tuple(_close_spectral_cut(row, r, multiplet_tol) for row in values))
+             else _real_row_counts(values, lambda row: _close_spectral_cut(row, r, multiplet_tol), real_rows))
     return _retained_columns(q, values, count, mesh=eigh_plan.mesh,
-                             column_extent=column_extent)
+                             column_extent=column_extent, layout=layout)
 
 
 def _as_extent(n) -> int:

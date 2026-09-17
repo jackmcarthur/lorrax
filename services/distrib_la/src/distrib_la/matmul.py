@@ -431,6 +431,7 @@ def matmul(
     transb: str = "N",
     backend: str = "auto",
     batched_route: str = BATCHED_ROUTE_DEFAULT,
+    budget_bytes: int | None = None,
 ) -> jax.Array:
     """Compute ``alpha * op(A) @ op(B) + beta * C`` over ``mesh``.
 
@@ -465,6 +466,12 @@ def matmul(
         matrices, runs local JAX GEMM, and returns D through the inverse y
         then x exchanges. Explicit ``'auto'`` calls the resolved distributed
         provider.
+    budget_bytes
+        Optional per-rank device budget. With ``batched_route='auto'`` the
+        route becomes a capacity decision: when one rank's whole local A, B
+        and D matrices (``ceil(batch/P)`` of each) plus the local GEMM
+        temporary fit (:func:`distrib_la.workspace.fits_local`), the staged
+        route runs; otherwise the provider. Pass a value every rank shares.
 
     Returns
     -------
@@ -501,6 +508,17 @@ def matmul(
         raise ValueError("C is required when beta is nonzero")
     out_shape = _validate_operands(A, B, C, transa, transb)
     route = str(batched_route).strip().lower()
+    if route == "auto" and budget_bytes is not None:
+        from distrib_la.workspace import fits_local
+        from types import SimpleNamespace
+        ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
+        nb = int(A.shape[0]) if A.ndim == 3 else 1
+        local = -(-nb // ranks)
+        a = (local,) + _op_shape((int(A.shape[-2]), int(A.shape[-1])), transa)
+        b = (local,) + _op_shape((int(B.shape[-2]), int(B.shape[-1])), transb)
+        d = (local, a[1], b[2])
+        if fits_local(SimpleNamespace(mesh=mesh), "gemm", (a, b, d), A.dtype, budget_bytes):
+            route = ROUTE_BATCH_RESHARD
     provider = resolve_matmul_backend(backend, mesh, batched_route=route)
     px, py = _mesh_shape(mesh)
     m_out, n_out = int(out_shape[-2]), int(out_shape[-1])

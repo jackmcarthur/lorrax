@@ -37,7 +37,7 @@ from jax.sharding import Mesh, PartitionSpec as P
 from distrib_la._shard_map import shard_map
 from distrib_la.resolve import mesh_key
 
-__all__ = ["batch_reshard_call", "validate_batch_reshard_operands"]
+__all__ = ["batch_layout_eigh_call", "batch_reshard_call", "validate_batch_reshard_operands"]
 
 
 _JIT_CACHE: dict = {}
@@ -260,6 +260,77 @@ def _replicate_batch_vector(v, *, px: int, py: int):
         return v
     return jax.lax.all_gather(
         v, ("x", "y"), axis=0, tiled=True)
+
+
+def batch_layout_eigh_call(op: str, mesh: Mesh, A, *, real_rows: int | None = None):
+    """Route (c) without movement, for an operand already in batch layout.
+
+    ``A`` is ``(B, N, N)`` at ``P(('x','y'), None, None)`` with ``B`` a
+    multiple of ``Px*Py``: rank ``x*Py + y`` owns rows
+    ``[rank*B/P, (rank+1)*B/P)`` as whole matrices. Each rank solves its rows
+    one at a time (one matrix, its vectors and the kernel workspace live at
+    once) and skips rows whose global index is ``>= real_rows`` with a scalar
+    ``lax.cond``: their outputs are exact zeros. Eigenvalues return replicated
+    through one ``all_gather``; vectors stay in batch layout. ``op`` is
+    ``eigh``, ``checked_eigh`` or ``dilation_eigh`` (the right singular
+    vectors of ``A``, spectrum of length ``2N``), the same kernels as
+    :func:`batch_reshard_call`, so a batch-layout call equals the face route's
+    local solve row for row.
+    """
+    if op not in ("eigh", "checked_eigh", "dilation_eigh"):
+        raise ValueError(
+            f"batch layout: unsupported op {op!r}; expected eigh|checked_eigh|dilation_eigh")
+    axes = tuple(mesh.axis_names)
+    if "x" not in axes or "y" not in axes:
+        raise ValueError(f"batch layout: expected a mesh with ('x','y'), got {axes!r}")
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    if A.ndim != 3 or int(A.shape[1]) != int(A.shape[2]):
+        raise ValueError(f"batch layout {op}: expected A of shape (B,N,N), got {tuple(A.shape)}")
+    nb, n = int(A.shape[0]), int(A.shape[1])
+    if nb < 1 or nb % (px * py):
+        raise ValueError(
+            f"batch layout {op}: the leading batch B={nb} must be a positive multiple of "
+            f"Px*Py={px * py}; synthetic slots are the caller's (pass real_rows)")
+    nreal = nb if real_rows is None else int(real_rows)
+    if not 1 <= nreal <= nb:
+        raise ValueError(f"batch layout {op}: real_rows={real_rows} outside [1, {nb}]")
+    key = ("batch_layout", op, mesh_key(mesh), nb, n, str(A.dtype), nreal)
+    fn = _JIT_CACHE.get(key)
+    if fn is None:
+        spec = P(("x", "y"), None, None)
+
+        def _body(local):
+            from distrib_la.polar import _dilation_vectors, _hermitian_dilation
+            local_nb = int(local.shape[0])
+            first = (jax.lax.axis_index("x") * py + jax.lax.axis_index("y")) * local_nb
+            width = 2 * n if op == "dilation_eigh" else n
+            w0 = jnp.zeros((local_nb, width), dtype=jnp.real(local).dtype)
+            z0 = jnp.zeros_like(local)
+
+            def _work(a):
+                if op == "dilation_eigh":
+                    values, vectors = jnp.linalg.eigh(_hermitian_dilation(a))
+                    return values, _dilation_vectors(vectors, n)[1]
+                result = _checked_eigh(a) if op == "checked_eigh" else jnp.linalg.eigh(a)
+                return result[0], result[1]
+
+            def _skip(a):
+                return (jnp.zeros((1, width), dtype=jnp.real(a).dtype), jnp.zeros_like(a))
+
+            def _one(i, acc):
+                W, Z = acc
+                a = jax.lax.dynamic_slice_in_dim(local, i, 1, axis=0)
+                w, z = jax.lax.cond(first + i < nreal, _work, _skip, a)
+                return (jax.lax.dynamic_update_slice(W, w, (i, 0)),
+                        jax.lax.dynamic_update_slice(Z, z, (i, 0, 0)))
+
+            W, Z = jax.lax.fori_loop(0, local_nb, _one, (w0, z0))
+            return _replicate_batch_vector(W, px=px, py=py), Z
+
+        fn = jax.jit(shard_map(_body, mesh=mesh, in_specs=(spec,),
+                               out_specs=(P(), spec), check_vma=False))
+        _JIT_CACHE[key] = fn
+    return fn(A)
 
 
 def batch_reshard_call(
