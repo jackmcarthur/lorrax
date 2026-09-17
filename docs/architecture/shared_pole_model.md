@@ -324,8 +324,8 @@ values changes neither the keep cuts nor acceptance.
 
 ### Spatial mirror consistency on approximate input
 
-The ordered mirror construction in `shared_pole_directions.py` combines
-literal same-q samples with `conj(R_s W_partner(z))`. This substitution
+The legacy/non-photon ordered mirror construction in `shared_pole_directions.py`
+combines literal same-q samples with `conj(R_s W_partner(z))`. This substitution
 requires covariance of the **represented** interaction and response under
 the authenticated spatial action, in addition to particle-hole symmetry.
 An approximately covariant fitted interaction need not satisfy this identity
@@ -347,19 +347,28 @@ The full production reduction predicates also pass for this first four-parent
 CC round with the original moments (job58487264.3); no complete model or other
 sector acceptance is inferred from that bounded check.
 This is a representation limitation, not a physical instability verdict or
-a licensed symmetry/PSD projection. The production mirror construction has
-not yet been changed.
+a licensed symmetry/PSD projection.
 
-The representation-consistent producer path is to retain the required exact
+The photon producer now retains the required exact
 full-grid -q bare-response rows before spatial compression, apply particle-hole
 conjugation there, and evaluate mirror Dyson systems with the original q's
-same frozen V/contact. It needs authenticated mirror bank outputs consumed by
-the ordered directions owner. The existing frequency support plan can remain
-unchanged: positive and mirror responses share the Green/time stream, while
+same frozen V/contact. The bank stores `Wc_mirror` and `dWc_mirror_ds` at
+`-conj(z)` under the original support ID; the latter is the derivative with
+respect to that point squared. Header `mirror_mode=literal_same_operator_v1`
+authenticates this capability, and all four sample transaction masks must be
+complete. Legacy banks remain readable as references but the photon sector
+constructor refuses them. The frequency support plan is unchanged: positive
+and mirror responses share the Green/time stream, while
 additional q/output panels and Dyson systems must be explicitly budgeted.
 For the measured Fe geometry the union of 13 parents and their exact negatives
-contains 22 full-grid rows. This is the proposed source repair, not an
-implemented or accepted full-model path.
+contains 22 full-grid rows. The measured production bank uses one panel and
+305.232106 seconds (P4 job58489223.1; sandbox claim2454). Original four-parent
+fit W/dW samples remain bitwise unchanged, while q1 finite Gram becomes
+-5.27541e-12 with the original directions. All13 Fe CC parents pass the
+unchanged production reduction predicates (58489223.3), worst first Gram
+-3.95308e-11. This material check does not cover TT/CT or integrated Sigma.
+The maximum held CC model residuals remain 1.3160% for W and 18.8937% for
+the s derivative; model truncation error is separate from Gram consistency.
 
 Fast CPU tests (4 host devices where a mesh is needed):
 

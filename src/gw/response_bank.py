@@ -1150,7 +1150,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         if literal_mirrors and header.get("mirror_mode") != "literal_same_operator_v1":
             raise ValueError("GATE response_mirror_contract: photon production requires a new literal-mirror bank")
         if literal_mirrors:
-            from symmetry_maps.maps import q_negation_index
+            from symmetry_maps import q_negation_index
             negative = np.asarray(q_negation_index((int(meta.nkx), int(meta.nky), int(meta.nkz))), dtype=np.int64)
             mirror_qids = negative[qids]
             receipt["mirror_contract"] = dict(header["mirror_contract"],

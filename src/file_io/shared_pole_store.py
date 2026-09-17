@@ -1080,7 +1080,7 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
         # One source of truth for the infinity block: the ordered bank itself.
         header["odd_moments"] = True
     if photon_layout is not None:
-        from symmetry_maps.maps import q_negation_index
+        from symmetry_maps import q_negation_index
         neg = np.asarray(q_negation_index(tuple(header["grid"])), dtype=np.int64)
         header.update(mirror_mode="literal_same_operator_v1",
             mirror_contract=dict(frequency="-conj(z_ry)", derivative="d/d((-conj(z_ry))^2)",
@@ -1145,7 +1145,7 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
     if _json(plan) != _json(_bank_plan(header["recipe"])):
         _refuse("scratch bank stale recipe/roles/held map")
     if header.get("mirror_mode") is not None:
-        from symmetry_maps.maps import q_negation_index
+        from symmetry_maps import q_negation_index
         _bank_sample_fields(header)
         contract = header.get("mirror_contract", {})
         q = np.asarray(header["q_irr_full_idx"], dtype=np.int64)
