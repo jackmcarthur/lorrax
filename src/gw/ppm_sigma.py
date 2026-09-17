@@ -972,6 +972,9 @@ def compute_sigma_c_ppm_omega_grid(
         band_brackets=plan.bounds,
         band_counts=plan.counts,
         fixed_quadrature_session=fixed_quadrature_session,
+        # Real PPM poles give a fixed-height denominator line on crossing
+        # windows. The shared planner still keeps its relative tail rules.
+        analytic_line=True,
         print_fn=print_fn)
     sigma_c_kij = result.sigma_c_kij
     if sigma_static_host is not None:

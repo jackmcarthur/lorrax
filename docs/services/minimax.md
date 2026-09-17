@@ -11,7 +11,8 @@ regularized screening rules, MPA causal rules, Sigma denominator boxes,
 shared-pole value/derivative rules and Matsubara response remain separate
 because their certificates answer different questions. The three analytic
 reciprocal constructors are eligible only for exact-match one-dimensional
-targets; none is currently a production dispatch route.
+targets. Sigma PPM's real-pole crossing windows request the damped-line rule;
+its other windows retain their existing box rules.
 `gw.mpa.evaluator` keeps import-compatible aliases for old callers and tests;
 production node selection calls `minimax` directly.
 
@@ -29,7 +30,8 @@ production node selection calls `minimax` directly.
 | `matsubara_response_rule(...)` | Builds a finite-temperature KMS-paired imaginary-time rule. |
 | `augment_odd_laplace(...)` | Adds the odd GN-PPM resolvent channel on the existing even rule's time nodes, refusing a missed sampled gate. |
 | `damped_line_rule(...)` / `damped_rectangle_rule(...)` / `damped_rectangle_gauss_rule(...)` / `damped_rectangle_positive_rule(...)` | Build MPA's positive-time line and rectangle rules. The rectangle constructors retain their respective geometric and error contracts; GW passes scalar bounds and receives time nodes and weights. |
-| `positive_reciprocal(...)` / `odd_reciprocal(...)` / `damped_line_reciprocal(...)` | Experimental analytic constructions for three specific one-dimensional reciprocal domains; none is a general replacement for a production target with a different kernel or error currency. |
+| `positive_reciprocal(...)` / `odd_reciprocal(...)` / `damped_line_reciprocal(...)` | Analytic constructions for three specific one-dimensional reciprocal domains; none is a general replacement for a production target with a different kernel or error currency. |
+| `analytic_line_box_rule(box, eps)` | Converts the normalized fixed-height line rule into Sigma's `sum w exp(i t d)` convention and checks peak-relative error. Accepts only a crossing box with one positive imaginary height. PPM requests it for zero-damping real poles. |
 | offline solver names | Lazily expose table-generation machinery; using them does not make the result a shipped certified rule. |
 
 There is no escape hatch and no shipped-table branch: `serve` computes every
@@ -47,7 +49,7 @@ deck-dependent denominator rectangles use `build_uniform_rule`, while the
 shared-pole W bank needs both response values and derivatives at its current
 complex frequencies. MPA's damped line and rectangle builders also live here;
 `gw.mpa.evaluator` retains only the exact scalar kernel and compatibility
-exports, and `gw.mpa.sigma_windows` calls the service directly. The three experimental reciprocal constructors cover
+exports, and `gw.mpa.sigma_windows` calls the service directly. The three reciprocal constructors cover
 one-dimensional domains only. Keeping these targets distinct prevents an
 apparently shorter API from applying a valid rule to the wrong function.
 
@@ -83,7 +85,7 @@ new continuum-certified table.
 even and odd weights on one node axis. The derivation and limiting identities
 are owned by the [non-Hermitian GN-PPM memo](../dev/notes/DERIVATION_gnppm_nonhermitian.md).
 
-## Experimental reciprocal constructors (not production dispatch)
+## Analytic reciprocal constructors
 
 The lazy package door exposes `positive_reciprocal(R, tolerance)`,
 `odd_reciprocal(A, tolerance)`, and
@@ -97,7 +99,14 @@ The positive rule has positive `strengths` in the stable shifted convention
 `|u|<=bandwidth_over_broadening`; damping is already in the coefficients.
 To approximate physical `1/(x+i*height)` to absolute error `eps`, construct
 with `(span/height, height*eps)` and call `rule.rescaled(height)`.
-No driver is routed to these constructors yet.
+Sigma PPM routes zero-damping crossing denominator lines through
+`analytic_line_box_rule`. The executor receives these times and weights through
+the same window object as the box rule. The service removes damping from the
+line rule's weights because `exp(i t d)` contains it; the Sigma window adapter
+then factors out the deck's `eta` once. Sign-definite tails and finite-height
+rectangles continue to request box rules. The positive and sine constructors
+have no production consumer: screening's regularized HGL/Fermi and
+imaginary-probe kernels are different targets.
 
 The positive constructor prescribes elliptic interpolation abscissae, solves
 their moments in elevated precision, and optionally applies two measured
@@ -114,7 +123,7 @@ comparison and its exact source pin are in the sandbox report
 
 `import minimax` remains NumPy-only. Calling the positive or sine constructor
 loads optional SciPy, and positive construction also needs mpmath (the `solve`
-extra). These are exploratory rules, not catalog entries; the catalog's
+extra). The positive and sine rules remain exploratory, not catalog entries; the catalog's
 provenance and production selection promises remain unchanged.
 
 ## Verification
