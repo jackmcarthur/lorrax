@@ -476,36 +476,26 @@ def bank_points(sample_plan):
     return np.asarray(points, dtype=np.complex128)
 
 
-def response_windows(energy, f, u, *, chemical_potential_ry):
-    """Partition the Run183/188 windowed response into one stream and cells.
+#: Largest Taylor ratio a remote Laplace cell may carry (response_windows).
+#: At rho <= 0.3 ``minimax.response_laplace_rule`` stops at order <= 20 for the
+#: production tolerance 1e-8 and amplifies row errors by (1+rho)/(1-rho) <= 1.86
+#: (value), <= 3.45 (s derivative), so its rows need only ~tol/14; Fe's semicore
+#: cell at rho = 0.72 needs order 76 (budget 64) and rows at ~tol/151.
+REMOTE_RHO_MAX = 0.3
 
-    The campaign window is [-35,40] eV relative to the current chemical
-    potential and its sample-only activity floor is 1e-14. Exact moments do
-    not call this routine. Bounds are extrema over all k/band pairings, so
-    they cover every q without constructing a transition table.
-    """
-    ft = np.where(np.abs(f) >= 1e-14, f, 0.0)
-    ut = np.where(np.abs(u) >= 1e-14, u, 0.0)
-    physical = (f != 0) | (u != 0)
-    ev = (energy - chemical_potential_ry) * RYD_TO_EV
-    masks = [physical & (ev < -35.0),
-             physical & (ev >= -35.0) & (ev <= 40.0),
-             physical & (ev > 40.0)]
-    # A remote diagonal with both sectors occupied cannot be discarded.
-    # Merge it into the resonant stream before constructing any cells.
-    for idx in (0, 2):
-        if np.any(ft * masks[idx]) and np.any(ut * masks[idx]):
-            masks[1] |= masks[idx]
-            masks[idx] = np.zeros_like(masks[idx])
+
+def _window_cells(energy, ft, ut, masks):
+    """Laplace cells (lower, upper) between the partitioned windows."""
     cells = []
     for lower, upper in ((0, 1), (0, 2), (1, 2)):
-        bounds, active = [], 0
+        bounds, active, partner = [], 0, []
         for lw, uw in ((ft, ut), (ut, ft)):
             low = energy[masks[lower] & (lw != 0)]
             high = energy[masks[upper] & (uw != 0)]
             if low.size and high.size:
                 bounds.append((float(high.min()-low.max()),
                                float(high.max()-low.min())))
+                partner.append((float(low.max()), float(high.min())))
                 active += int(low.size * high.size)
         if not bounds:
             continue
@@ -517,12 +507,79 @@ def response_windows(energy, f, u, *, chemical_potential_ry):
         cells.append(dict(lower=lower, upper=upper,
             delta_min_ry=min(v[0] for v in bounds),
             delta_max_ry=max(v[1] for v in bounds),
-            references_ry=refs, active_global_pairs=active))
-    receipt = dict(window_ev_relative_mu=[-35.0, 40.0],
+            references_ry=refs, active_global_pairs=active,
+            nearest_partner_ry=(max(v[0] for v in partner),
+                                min(v[1] for v in partner))))
+    return cells
+
+
+def response_windows(energy, f, u, *, chemical_potential_ry, z_ry):
+    """Partition the Run183/188 windowed response into one stream and cells.
+
+    States split by energy relative to the current chemical potential into
+    lower remote | real-time stream | upper remote windows. The sample-only
+    activity floor is 1e-14. Exact moments do not call this routine. Bounds
+    are extrema over all k/band pairings, so they cover every q without
+    constructing a transition table.
+
+    Edges derive from the bank's own samples ``z_ry`` [sample] (Ry). A cell
+    with transition floor delta_lo is remote only if the Taylor ratio of
+    ``minimax.response_laplace_rule`` at these samples and their smallest
+    eta, rho = max|z**2+eta**2|/(delta_lo**2+eta**2), is at most
+    ``REMOTE_RHO_MAX``; otherwise the remote states nearest the cell's
+    partner window join the real-time stream (the lower remote side for
+    cells (0,1) and (0,2), the upper for (1,2)) and the cells are rebuilt,
+    worst cell first, until every cell passes. This is the repartition the
+    Laplace rule's refusal names. The campaign edges [-35,40] eV are a floor:
+    the stream never narrows below them, so a deck whose cells already pass
+    is partitioned exactly as before.
+    """
+    ft = np.where(np.abs(f) >= 1e-14, f, 0.0)
+    ut = np.where(np.abs(u) >= 1e-14, u, 0.0)
+    physical = (f != 0) | (u != 0)
+    ev = (energy - chemical_potential_ry) * RYD_TO_EV
+    z = np.asarray(z_ry, dtype=np.complex128)
+    eta = float(z.imag.min())
+    reach = float(np.abs(z*z + eta*eta).max())
+    floor = (-35.0, 40.0)
+    edges = list(floor)
+    while True:
+        masks = [physical & (ev < edges[0]),
+                 physical & (ev >= edges[0]) & (ev <= edges[1]),
+                 physical & (ev > edges[1])]
+        # A remote diagonal with both sectors occupied cannot be discarded.
+        # Merge it into the resonant stream before constructing any cells.
+        for idx in (0, 2):
+            if np.any(ft * masks[idx]) and np.any(ut * masks[idx]):
+                masks[1] |= masks[idx]
+                masks[idx] = np.zeros_like(masks[idx])
+        cells = _window_cells(energy, ft, ut, masks)
+        for cell in cells:
+            cell["taylor_rho"] = reach/(cell["delta_min_ry"]**2 + eta*eta)
+        failing = [c for c in cells if c["taylor_rho"] > REMOTE_RHO_MAX]
+        if not failing:
+            break
+        cell = min(failing, key=lambda c: c["delta_min_ry"])
+        delta = np.sqrt(reach/REMOTE_RHO_MAX - eta*eta)
+        side = 0 if cell["lower"] == 0 else 2
+        remote = masks[side] & ((ft != 0) | (ut != 0))
+        if side == 0:
+            move = remote & (energy > cell["nearest_partner_ry"][1] - delta)
+            move |= remote & (energy == energy[remote].max())
+            edges[0] = float(ev[move].min())
+        else:
+            move = remote & (energy < cell["nearest_partner_ry"][0] + delta)
+            move |= remote & (energy == energy[remote].min())
+            edges[1] = float(ev[move].max())
+    receipt = dict(window_ev_relative_mu=[float(v) for v in edges],
         occupation_activity_floor=1e-14,
         discarded_f_mass=float(np.sum(np.abs(f-ft))),
         discarded_u_mass=float(np.sum(np.abs(u-ut))),
-        bound_scope="all active k/band extrema, safe for every q")
+        bound_scope="all active k/band extrema, safe for every q",
+        edge_rule=dict(floor_ev_relative_mu=list(floor), rho_max=REMOTE_RHO_MAX,
+            eta_ry=eta, sample_reach_ry2=reach,
+            derived_edge_binds=[float(v) for v in edges] != list(floor),
+            cell_taylor_rho=[c["taylor_rho"] for c in cells]))
     return masks, ft, ut, cells, receipt
 
 
@@ -808,7 +865,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             mesh_xy=mesh_xy,n=meta.mu_basis.n_packed)
         energy,f,u,reference,_ = response_weights(wfns,meta)
         masks,ft,ut,cells,receipt["windows"] = response_windows(energy,f,u,
-            chemical_potential_ry=sample_plan["census"]["mu_ry"])
+            chemical_potential_ry=sample_plan["census"]["mu_ry"],z_ry=z)
     with timing.fenced_section('bank.quadrature'):
         import minimax
         bank_rule,laplace_rule = minimax.response_bank_rule,minimax.response_laplace_rule
